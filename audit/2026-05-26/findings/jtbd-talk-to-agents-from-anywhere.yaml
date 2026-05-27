@@ -1,0 +1,233 @@
+unit_id: jtbd-talk-to-agents-from-anywhere
+unit_path: reference/talk-to-agents-from-anywhere.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The JTBD is high-level and outcome-focused with no file paths or class names
+  leaked into the text, which is correct for this category. Most claims are
+  aspirational ("Signs it's working") rather than verifiable behavioral
+  contracts, but several map to concrete shipped or partially-shipped
+  implementation points.
+
+  Key findings:
+  1. The "Telegram-only, no second channel" stance aligns fully with vision.md
+     and the codebase — no Slack/Discord/Teams paths exist.
+  2. Long-poll bot model confirmed: gateway.ts uses grammY long-polling, no
+     webhooks.
+  3. Photo/attachment handling is shipped: gateway handles message:photo,
+     message:document, message:voice with download + pass-through.
+  4. "Instant acknowledgment" (eyes reaction on raw arrival) is shipped.
+  5. "Not silent on long work" is handled by silence-poke.ts escalation ladder.
+  6. "Hand off and come back" is partially addressed by handoff-continuity.ts
+     (.handoff-topic sidecar) — context survives restarts.
+  7. "Multiple agents as one fleet" works via Telegram forum topics (topic-manager.ts).
+  8. Two active gaps that the test file explicitly tracks as .skip:
+     a. /vault broker {status,restart} does not exist (broker_unreachable error
+        legitimately punts to host CLI).
+     b. "Phase 4c will wire" stub in gateway.ts:13079 punts swap-slot/add-slot
+        auth actions to host terminal. Tests `it.skip("no string says 'Phase Nx
+        will wire'")` and `it.skip("no string says 'run in terminal'")` reflect
+        these known gaps.
+  9. /agent remove and /agent admin <name> on|off do not exist as bot commands
+     (separate it.skip entries in the test file).
+
+  All anti-patterns section content is outcome-level and not verifiable against
+  code — treated as vision prose, no verdicts needed there.
+
+findings:
+  - claim_id: c1
+    quote: "the chat surface is first-class, not a bolted-on notification channel"
+    loc: L14-L16
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3-L3
+        snippet: "Persistent Telegram gateway — owns the bot connection, polling, all admin"
+      - path: reference/vision.md
+        lines: L128-L128
+        snippet: "A multi-channel bridge | Not Slack, not Discord, not Teams. Telegram, done properly."
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The codebase is entirely Telegram-centric. No Slack/Discord/Teams paths
+      exist in telegram-plugin/ or src/. vision.md explicitly names Telegram as
+      the singular interface. The gateway is a persistent long-poll service, not
+      a bolt-on notification relay.
+
+  - claim_id: c2
+    quote: "Inbound messages feel acknowledged instantly, not 'processing' for ten seconds before anything appears."
+    loc: L29-L30
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L7850-L7897
+        snippet: "F2 fix (#553): fire 👀 reaction on RAW arrival, before the coalesce flush"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts fires a 👀 reaction on raw arrival of the inbound message
+      (line 7850), before the coalesce flush. This is an explicit F2 fix for
+      the "ack before processing" requirement. The test file (tests/jtbd-talk-from-anywhere.test.ts)
+      does not test this directly but the code comment matches the JTBD claim.
+
+  - claim_id: c3
+    quote: "Attachments the user sends (a photo, a file) are treated as real input, not stripped or ignored."
+    loc: L34-L35
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L14386-L14432
+        snippet: "bot.on('message:photo', ...) ... bot.on('message:document', ...)"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts registers handlers for message:photo (downloads best-resolution
+      image, writes to inbox, passes path to handleInbound), message:document
+      (passes file_id + metadata), and message:voice (optional Whisper
+      transcription when voice_in enabled, falls back to envelope text). All
+      three types are treated as real input rather than stripped.
+
+  - claim_id: c4
+    quote: "Notifications tell the user something they actually need to know. They don't fire on every edit, they don't go silent when something important happened."
+    loc: L36-L37
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L4460-L4503
+        snippet: "mid-turn updates pass disable_notification:true ... downgrading disable_notification:false -> true"
+      - path: telegram-plugin/silence-poke.ts
+        lines: L22-L30
+        snippet: "t=300s framework fallback: gateway itself sends a user-visible 'still working...' message. Fires at most once per turn. Pings the device"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Mid-turn stream_reply calls pass disable_notification:true so only the
+      final answer pings the device. silence-poke.ts fires a device-pinging
+      "still working..." fallback at 300s if the model has been silent — this
+      covers the "don't go silent" half. The claim's two parts are both addressed.
+
+  - claim_id: c5
+    quote: "The user can hand off a task, lock the phone, come back an hour later, and pick up where the agent left off without re-explaining."
+    loc: L38-L39
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/handoff-continuity.ts
+        lines: L1-L30
+        snippet: "On session start, the telegram plugin reads .handoff-topic ... On the FIRST assistant reply of the new session the plugin prepends a subtle one-liner: Picked up where we left off, <topic>"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      handoff-continuity.ts reads .handoff-topic (written by the Stop hook
+      summarizer) and prepends a continuity line on the first reply of a new
+      session. .last-turn-summary provides a fallback when the summarizer didn't
+      run. This covers the "pick up where we left off" part. The "without
+      re-explaining" aspect relies on the agent's claude --continue session
+      memory, not just the handoff sidecar — confidence medium because the
+      hand-off only surfaces the last topic, not full context.
+
+  - claim_id: c6
+    quote: "Multiple agents in the same app feel like one fleet, not a drawer of disconnected bots the user has to remember how to address."
+    loc: L40-L41
+    verdict: aligned
+    evidence:
+      - path: src/telegram/topic-manager.ts
+        lines: L144-L179
+        snippet: "Sync forum topics for all agents that have a topic_name. Creates topics that don't exist yet"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      topic-manager.ts creates per-agent forum topics within a single Telegram
+      supergroup, so the user interacts with all agents in one chat via named
+      topics. The /agents command (gateway.ts:10150) and /status command provide
+      a fleet-level view. This implements the "one fleet, not a drawer" claim.
+
+  - claim_id: c7
+    quote: "Drive a real task start-to-finish from a phone, walking, on cellular. The experience should not feel like a compromise."
+    loc: L62-L63
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L13075-L13082
+        snippet: "case 'swap-slot': case 'add-slot': { await ctx.answerCallbackQuery({ text: 'Phase 4c will wire this' }) ... await ctx.reply(`Phase 4c will wire ${action} buttons. Until then, run in terminal: <code>switchroom ${cmd}</code>`"
+      - path: tests/jtbd-talk-from-anywhere.test.ts
+        lines: L186-L193
+        snippet: "it.skip('no string says run in terminal anywhere in the live gateway')"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The UAT prompt "Phone-only session" maps directly to the JTBD's core
+      outcome. However gateway.ts:13079 contains an active code path that
+      replies to auth slot-management callbacks with "Phase 4c will wire this.
+      Until then, run in terminal: switchroom auth use ..." This is a
+      live regression against the JTBD — the user is tethered to a terminal
+      for auth slot operations. The test file explicitly tracks this as a
+      known gap (it.skip at line 186). This requires a product decision, not
+      a doc edit.
+
+  - claim_id: c8
+    quote: "Long-running work with the screen off. Kick off something slow, lock the phone, come back when it's done. The user should know it finished and what it produced."
+    loc: L68-L70
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L22-L36
+        snippet: "t=300s framework fallback: gateway itself sends a user-visible 'still working...' / 'still thinking...' message. Fires at most once per turn. Pings the device (user needs to know)."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The silence-poke escalation ladder ensures the user is pinged when the
+      agent has been silent for 300s. The final answer always pings (disable_notification
+      is false on done=true). The "what it produced" part relies on the model
+      producing a substantive final reply, which is a model behavior not a
+      framework guarantee — confidence medium.
+
+  - claim_id: c9
+    quote: "Send a photo. Attach a picture and ask the agent to act on it. The photo should be usable input, not discarded."
+    loc: L72-L73
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L14386-L14426
+        snippet: "bot.on('message:photo', async ctx => { ... const dlPath = buildAttachmentPath(...) ... writeFileSync(dlPath, buf, ...) return dlPath })"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      Photos are downloaded (best-resolution variant), written to the agent's
+      inbox directory, and the file path is passed to handleInbound as the
+      downloadImage callback. The agent receives the image path as context.
+      This fully implements "usable input, not discarded."
+
+  - claim_id: c10
+    quote: "Dead zone. Lose connectivity mid-task. When it comes back the user should see a sensible state, not a broken thread."
+    loc: L75-L76
+    verdict: vision-only
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3135-L3139
+        snippet: "gateway processes can't race on Telegram's getUpdates long-poll"
+    evidence_strength: weak
+    action: mark-vision
+    confidence: low
+    rationale: |
+      The JTBD claims that after a connectivity dead zone the user sees
+      "a sensible state, not a broken thread." The gateway uses long-polling
+      which naturally resumes on reconnect; Telegram delivers queued messages
+      when connectivity returns. However there is no specific code path that
+      handles the "broken thread" case — no connectivity-loss detector, no
+      in-flight turn recovery message on reconnect. The long-poll resumes
+      but whether the state looks "sensible" to the user depends on what was
+      in-flight. This claim is aspirational and not fully verified against code.
+      Marking as vision-only to surface it for evaluation.
+    proposed_text: |
+      "Dead zone. Lose connectivity mid-task. When it comes back Telegram
+      delivers queued messages and the agent resumes from where it stopped;
+      in-flight turns may show a stale progress state until the next update."

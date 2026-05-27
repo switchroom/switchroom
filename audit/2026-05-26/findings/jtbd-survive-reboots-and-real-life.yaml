@@ -1,0 +1,273 @@
+unit_id: jtbd-survive-reboots-and-real-life
+unit_path: reference/survive-reboots-and-real-life.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  All major claims in this JTBD map to concrete implemented mechanisms.
+  The four anchors from the brief are all present:
+    - SWITCHROOM_PENDING_TURN resume protocol: gateway.ts L960-989 writes
+      .pending-turn.env; start.sh.hbs L397-409 sources and exports it.
+    - Wake-audit sentinel: start.sh.hbs L435 writes .wake-audit-pending on
+      every boot; UAT scenario jtbd-wake-audit-content-dm.test.ts exercises it.
+    - Restart-marker + sweep: boot-reason.ts determines reason (planned/
+      graceful/crash/fresh); boot-card.ts renders crash-recovery row;
+      lifecycle-restart-reason.test.ts pins the contract.
+    - container restart: unless-stopped: compose.ts emits this on all four
+      service types (broker L792, approval-kernel L1022, auth-broker L1114,
+      agent L1339).
+  One minor gap: the "persistent failures surface / stopped trying" claim
+  (Signs L36-37) has partial coverage — the operator-events taxonomy covers
+  quota/credentials/crash but Telegram network give-up after maxRetries
+  (retry-api-call.ts L169) does NOT emit a user-visible message; it just
+  logs to stderr. Confidence is medium on that sub-claim.
+  The JTBD contains no implementation-detail leakage (no file paths, class
+  names, or container names in the user-facing prose).
+findings:
+  - claim_id: c1
+    quote: "After a machine reboot, the fleet comes back on its own. The user doesn't have to kick anything."
+    loc: L29-L30
+    verdict: aligned
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L792, L1022, L1114, L1339
+        snippet: "lines.push(`    restart: unless-stopped`);"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      compose.ts emits `restart: unless-stopped` on all four compose services
+      (broker, kernel, auth-broker, agent). Docker's restart policy brings
+      containers back after host reboot without operator action.
+
+  - claim_id: c2
+    quote: "After an agent crash, the process is respawned and the user is told, with enough detail to know whether the in-flight work survived."
+    loc: L31-L32
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-reason.ts
+        lines: L58-L85
+        snippet: "if (sessionMarker != null) return 'crash'"
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L352-L364
+        snippet: "if (restartReason === 'crash') { ... degradedRows.push(`⚠️ <b>Restart</b>  ${escapeHtml(REASON_LABEL.crash)}${ageStr}`) ... }"
+      - path: telegram-plugin/operator-events.ts
+        lines: L23
+        snippet: "| 'agent-crashed'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      boot-reason.ts classifies gateway boot as 'crash' when a prior
+      session-marker exists (process ran before, no clean shutdown). boot-card.ts
+      renders a visible crash-recovery row with age and a log-tail command.
+      The operator-events taxonomy also includes 'agent-crashed' for a second
+      notification channel.
+
+  - claim_id: c3
+    quote: "Context exhaustion is handled as a named event, not a mysterious refusal. The user understands what happened."
+    loc: L33-L34
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L6811-L6828
+        snippet: "isContextExhaustionText(ev.text) ... bot.api.sendMessage(chatId, '⚠️ <b>Context window full</b> — send <code>/restart</code> to start a fresh session.'"
+      - path: telegram-plugin/context-exhaustion.ts
+        lines: L14-L18
+        snippet: "export const CONTEXT_EXHAUSTION_MARKER = 'Prompt is too long'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The gateway detects context exhaustion (marker text "Prompt is too long"),
+      sends the user a named message with a /restart action hint, and finalizes
+      the turn. Proactive compaction also notifies the user with a "Context
+      compacted" card (gateway.ts L1698-1705) before exhaustion is hit.
+
+  - claim_id: c4
+    quote: "Transient failures (network, tool, upstream) retry sensibly. The user doesn't see flakes they don't need to."
+    loc: L35-L36
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/retry-api-call.ts
+        lines: L1-L25
+        snippet: "| Network error (fetch failed / ECONN…) | exponential backoff retry, 3 attempts |"
+      - path: telegram-plugin/gateway/startup-network-retry.ts
+        lines: L168-L213
+        snippet: "gatewayStartupRetry — bounded exponential-backoff retry for gateway startup network errors"
+      - path: profiles/_base/start.sh.hbs
+        lines: L49-L85
+        snippet: "_switchroom_supervise ... retrying in ${_delay}s (transient deps self-heal; never gives up)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Three distinct retry layers exist: (1) retry-api-call.ts wraps every
+      Telegram API call with exponential backoff on network errors and flood-wait;
+      (2) startup-network-retry.ts handles the boot-time network-not-ready window;
+      (3) start.sh.hbs _switchroom_supervise provides an exponential-backoff
+      supervisor loop that never gives up on transient failures.
+
+  - claim_id: c5
+    quote: "Persistent failures surface. The user is told when a retry loop has stopped trying."
+    loc: L37-L38
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/operator-events.ts
+        lines: L17-L27
+        snippet: "OperatorEventKind: 'credentials-expired' | 'credentials-invalid' | 'credit-exhausted' | 'quota-exhausted' | 'rate-limited' | 'agent-crashed' | 'agent-restarted-unexpectedly'"
+      - path: telegram-plugin/retry-api-call.ts
+        lines: L169
+        snippet: "observer?.onGiveUp?.({ attempts: maxRetries, error: giveUpErr })"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      Persistent failures of the operator-event taxonomy (credentials, quota,
+      crashes) do surface via Telegram. However, the retry-api-call.ts
+      `onGiveUp` callback is observer-only — no user-visible message is sent
+      when the Telegram API call itself gives up after maxRetries; it logs to
+      stderr only. The claim is partially true. The JTBD prose says "The user
+      is told when a retry loop has stopped trying" — this is true for the
+      named operator-event kinds but not explicitly for all retry-give-up
+      paths. Minor drift: coverage is real but not universal. Proposed text:
+      "Persistent named failures (credentials, quota exhaustion, crashes)
+      surface. The user is told with an operator-event card."
+
+  - claim_id: c6
+    quote: "Scheduled work survives a reboot. Jobs that should have fired either fire on return or are explicitly skipped, not silently dropped."
+    loc: L39-L40
+    verdict: aligned
+    evidence:
+      - path: src/agent-scheduler/index.ts
+        lines: L268-L406
+        snippet: |
+          "At-least-once replay: if the container restarted across a scheduled fire,
+          replay it now before the live cron loop starts. Bounded by
+          SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN minutes (default 30)..."
+          "staleSkipped ... notifying user ... [switchroom scheduler notice] While
+          this agent was offline, the following scheduled task(s) had at least one
+          run skipped..."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The agent-scheduler's boot path implements exactly the described
+      behavior: missed fires within the 30-minute replay window are re-run;
+      fires older than the window produce a user-visible notice explicitly
+      listing what was skipped and why. The source code comment at L301-304
+      directly cites the "survive-reboots JTBD" as the requirement.
+
+  - claim_id: c7
+    quote: "The user can ask 'is everything healthy?' and get a real answer."
+    loc: L41
+    verdict: aligned
+    evidence:
+      - path: src/cli/doctor.ts
+        lines: L2448
+        snippet: "export function registerDoctorCommand(program: Command): void {"
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L9919-L10057
+        snippet: "Build the optional audit details surfaced on /status ... /status shows every row (silent-when-healthy)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Both a CLI (`switchroom doctor`) and an in-chat command (`/status`) exist.
+      The /status command runs the full boot-card probe set and renders all rows
+      including healthy ones. The CLI doctor runs a broader check covering auth,
+      vault, docker, scheduler, and agent smoke. Confidence is medium because
+      the actual /status output format and completeness were not read in full.
+
+  - claim_id: c8
+    quote: "Silent death. An agent process that's gone but still appears to be addressable."
+    loc: L44-L45
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/restart-watchdog.ts
+        lines: L1-L20
+        snippet: "polls systemd's NRestarts counter for the agent service and emits agent-restarted-unexpectedly when it ticks up without a corresponding planned-restart marker"
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L525-L548
+        snippet: "probeAgentProcess ... watchAgentProcess — live agent-status loop"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      This anti-pattern is explicitly guarded: the restart-watchdog detects
+      unexpected process restarts and emits an operator event. The boot-card
+      live watch loop (watchAgentProcess) actively polls process state during
+      boot and edits the card when the process goes active/failed.
+
+  - claim_id: c9
+    quote: "Silent resurrection. An agent that came back in a different state than it went down in, without saying so."
+    loc: L46-L47
+    verdict: aligned
+    evidence:
+      - path: profiles/_base/start.sh.hbs
+        lines: L411-L435
+        snippet: |
+          "# Wake audit sentinel ... Every boot drops a .wake-audit-pending sentinel
+          ... The agent's wake-audit protocol instructs it to detect this file at
+          the start of its first turn after boot, run a three-signal check
+          (owed reply / orphan sub-agents / open todos), surface findings to the
+          user"
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L327-L365
+        snippet: "restartReason ... REASON_LABEL ... 'crash': 'crash recovery'"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The wake-audit sentinel + SWITCHROOM_PENDING_TURN protocol together ensure
+      the agent notifies the user of its prior state on next turn. The boot card
+      distinguishes crash vs graceful vs planned. The wake-audit SKILL.md drives
+      the in-session check. Coverage is good; confidence is medium because the
+      actual skill behavior was not read, only the sentinel mechanism.
+
+  - claim_id: c10
+    quote: "Dropping in-flight work on the floor when a process dies, with no mention of what was lost."
+    loc: L50-L51
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L952-L989
+        snippet: |
+          "Stage 4: surface the most-recently-interrupted turn to start.sh as a
+          shell-sourceable env file ... SWITCHROOM_PENDING_TURN=true,
+          SWITCHROOM_PENDING_TURN_KEY, SWITCHROOM_PENDING_CHAT_ID ..."
+      - path: profiles/_base/start.sh.hbs
+        lines: L385-L409
+        snippet: |
+          "if [ -f '$SWITCHROOM_PENDING_TURN_ENV' ]; then . '$SWITCHROOM_PENDING_TURN_ENV'
+          ... export SWITCHROOM_PENDING_TURN ..."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The gateway writes .pending-turn.env atomically (tmp + rename) on every
+      boot when a prior turn was interrupted. start.sh sources this file and
+      exports SWITCHROOM_PENDING_TURN=true plus full chat context to the agent
+      process. The agent's resume protocol then acks the interruption. Work is
+      not silently dropped.
+
+  - claim_id: c11
+    quote: "Recovery that requires the user to read logs. Logs are a debugging aid, not a user experience."
+    loc: L55-L56
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L358-L364
+        snippet: |
+          "const tailCmd = process.env.SWITCHROOM_RUNTIME === 'docker'
+            ? `docker logs --tail 100 switchroom-${...}`
+            : `journalctl --user -u switchroom-${...} -n 100`
+          degradedRows.push(`    ↳ Tail logs: <code>${tailCmd}</code>`)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The crash row in the boot card includes the tail-logs command as an
+      inline ↳ continuation line, consistent with the principle that failures
+      carry their next step. Logs are surfaced in-chat as a step, not required
+      for recovery. This matches the anti-pattern's intent: logs are offered
+      as debugging aid, not the primary recovery path.

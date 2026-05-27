@@ -1,0 +1,351 @@
+unit_id: jtbd-feel-like-a-colleague
+unit_path: reference/feel-like-a-colleague.md
+category: jtbd
+audited_at: 2026-05-26T12:00:00Z
+auditor_notes: |
+  This JTBD is well-anchored to shipped behavior. The core posture
+  requirements (one clarifying question, verify before claiming, match
+  energy, no AI-tells) are implemented in three layered artifacts:
+  profiles/default/CLAUDE.md.hbs, profiles/default/workspace/SOUL.md.hbs,
+  and profiles/_shared/telegram-style.md.hbs, plus the release-controlled
+  fleet invariant TELEGRAM_GUIDANCE constant in src/agents/scaffold.ts.
+
+  The conversational-pacing artefact (reference/conversational-pacing.md)
+  is the companion design doc; it ships the five-beat model as
+  profiles/_shared/telegram-style.md.hbs and src/agents/scaffold.ts
+  TELEGRAM_GUIDANCE. KPIs reference docs/posthog.md which exists and
+  telegram-plugin/runtime-metrics.ts which implements inbound_status_query
+  event capture.
+
+  One JTBD-stale-example finding: the UAT prompt "is the broker running?"
+  implicitly surfaces an infrastructure-named component (vault-broker) to
+  the non-technical user. The UAT prompt belongs in the JTBD as a test
+  harness reference, so this is borderline; verdict is aligned given the
+  UAT section is a dev test guide, not user-facing prose.
+
+  The approval-card behavior described at L47-51 and L132 is implemented
+  in telegram-plugin/permission-title.ts (plain-English descriptions +
+  collapsed card body). Strong evidence.
+
+  Session continuity / handoff briefing behavior (L54-57) is implemented
+  in profiles/default/CLAUDE.md.hbs L116-126, cross-referenced by
+  profiles/_shared/telegram-style.md.hbs L53. Strong evidence.
+
+  Fleet-wide posture consistency claim (L158-161) requires all profiles to
+  carry the same posture floor. The coding profile (profiles/coding/CLAUDE.md.hbs)
+  defers communication style entirely to SOUL.md.hbs and lacks the explicit
+  "ask one question" / "verify mutable facts" behavioral rules present in
+  default/CLAUDE.md.hbs. These rules reach all agents via the fleet
+  invariants file (TELEGRAM_GUIDANCE in src/agents/scaffold.ts), but the
+  coding profile's standalone CLAUDE.md.hbs is thinner than default. This
+  gap is bridged by the invariants mechanism; no action required.
+
+  One structural note: the JTBD mentions "approval card" (L50, L132) using
+  a product-internal term. This is not a path, class name, or container
+  name, so it does not trigger jtbd-too-technical.
+
+findings:
+  - claim_id: c1
+    quote: "asks before assuming, verifies before claiming, defers on irreversible calls"
+    loc: L3-L4
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L37-L41
+        snippet: |
+          "Verify mutable facts before claiming them. Files, git state, clocks,
+          versions, services, processes, package state, the contents of an Edit
+          target: read live. Memory and prior context are not verification sources."
+      - path: profiles/default/workspace/SOUL.md.hbs
+        lines: L18-L19
+        snippet: |
+          "Resourceful first. Check memory, context, files before asking. If
+          genuinely unsure, ask. Don't guess, don't assume."
+      - path: src/agents/scaffold.ts
+        lines: L110-L141
+        snippet: |
+          "TELEGRAM_GUIDANCE constant: 'messaging a capable colleague — not a tool
+          emitting output. Five beats…'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All three layers (default CLAUDE.md.hbs, SOUL.md.hbs, fleet invariant
+      TELEGRAM_GUIDANCE) directly encode the verify-before-claiming and
+      ask-before-assuming posture. Tests at tests/soul-template-vars.test.ts
+      pin SOUL.md.hbs rendering.
+
+  - claim_id: c2
+    quote: "Asks one good question instead of guessing."
+    loc: L32-L35
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L40-L41
+        snippet: |
+          "Non-final turn: use tools to advance, or ask the one clarifying
+          question that unblocks safe progress. One question, not five."
+      - path: profiles/default/workspace/SOUL.md.hbs
+        lines: L27-L29
+        snippet: |
+          "But clarify during planning. Wrong assumptions waste more time
+          than a quick question."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The "one question, not five" constraint is explicit in both the
+      default CLAUDE.md.hbs execution-bias section and the SOUL.md.hbs
+      values section.
+
+  - claim_id: c3
+    quote: "Reads the actual state before claiming anything about it. File contents,
+      current calendar, who's online, what's running."
+    loc: L37-L39
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L37-L39
+        snippet: |
+          "Verify mutable facts before claiming them. Files, git state, clocks,
+          versions, services, processes, package state: read live. Memory and
+          prior context are not verification sources."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Direct one-to-one match between the JTBD claim and the CLAUDE.md.hbs
+      execution-bias rule.
+
+  - claim_id: c4
+    quote: "Knows the leash. Read-only is fine, fires immediately. Mutating
+      cross-agent work, vault keys it doesn't already have, anything that
+      touches another agent's state: it asks via the approval card, names
+      the action plainly, and waits."
+    loc: L48-L51
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/permission-title.ts
+        lines: L30-L68
+        snippet: |
+          "Human-friendly descriptions for switchroom-managed MCP tools…
+          for the approval card. mcp__agent-config__peers_list: 'List the
+          other agents on this instance'"
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L128-L138
+        snippet: |
+          "Every mutating / host verb — update_apply, agent_exec, agent_restart
+          — pauses for an operator approval card in Telegram before it executes:
+          a human must tap approve."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Approval card is implemented in telegram-plugin/permission-title.ts with
+      curated human-readable verb phrases per tool. The admin section of
+      CLAUDE.md.hbs explicitly instructs agents on the approval-wait pattern.
+      Non-admin path redirects to the admin agent.
+
+  - claim_id: c5
+    quote: "Picks up where it left off. Reads the briefing. Knows what was open
+      last session. Doesn't re-ask things the user already said yesterday."
+    loc: L54-L57
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L114-L126
+        snippet: |
+          "Handoff briefing — on a clean shutdown, the Stop hook writes a bounded
+          raw transcript tail of the prior session to .handoff.md. On boot,
+          start.sh injects it into your --append-system-prompt so you can
+          reorient…"
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L53
+        snippet: |
+          "If SWITCHROOM_PENDING_TURN=true is in your environment on boot,
+          invoke the /switchroom-runtime skill before answering."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Session continuity via handoff briefing (.handoff.md), Hindsight
+      auto-recall on every inbound, and SWITCHROOM_PENDING_TURN protocol
+      are all implemented and documented in the shipped scaffold.
+
+  - claim_id: c6
+    quote: "Matches the user's energy. Short reply gets a short reply…
+      Default short. Answer first. Context second. No preamble."
+    loc: L59-L62
+    verdict: aligned
+    evidence:
+      - path: profiles/default/workspace/SOUL.md.hbs
+        lines: L24-L26
+        snippet: |
+          "Default short. Thorough when stakes are high. Answer first, context
+          second. Never bury the lead. No preamble."
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L1-L5
+        snippet: |
+          "replies should feel like one, not a terminal dump or a tracking
+          widget. A good chat partner acknowledges, goes quiet while working,
+          surfaces meaningful updates, and delivers the answer when it's ready."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Energy-matching and concision are encoded in both SOUL.md.hbs (fleet
+      default) and the telegram-style partial. The SOUL.md.hbs "Never"
+      section explicitly bans sycophantic preamble.
+
+  - claim_id: c7
+    quote: "Sounds like a person, not a model. No 'Certainly!' No 'I'd be
+      happy to.' No 'Great question!' No em-dashes."
+    loc: L64-L67
+    verdict: aligned
+    evidence:
+      - path: profiles/default/workspace/SOUL.md.hbs
+        lines: L41-L50
+        snippet: |
+          "Never: Open with 'Certainly!', 'Absolutely!', 'Of course!',
+          'Great question!', 'I'd be happy to'. Use em-dashes. Rewrite
+          with commas, periods, or parentheses."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The canonical AI-tells prohibition list in SOUL.md.hbs matches the
+      JTBD claim item-for-item. The telegram-style partial reinforces this
+      with "For drafts above ~500 chars… invoke the bundled /humanizer skill."
+
+  - claim_id: c8
+    quote: "A second agent in the fleet has the same posture but a different
+      voice. The user doesn't have to relearn how to work with each one."
+    loc: L87-L88
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L180-L204
+        snippet: |
+          "renderFleetInvariants() … TELEGRAM_GUIDANCE … MEMORY_GUIDANCE —
+          release-controlled fleet invariants. Every Switchroom agent reads
+          this via Claude Code native CLAUDE.md discovery."
+      - path: profiles/coding/workspace/SOUL.md.hbs
+        lines: L1-L68
+        snippet: |
+          "SOUL.md.hbs for coding profile contains separate voice/personality
+          while TELEGRAM_GUIDANCE reaches coding agent through fleet invariants."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The posture floor is enforced fleet-wide by the release-controlled
+      fleet invariants (TELEGRAM_GUIDANCE, MEMORY_GUIDANCE constants in
+      scaffold.ts), written to ~/.switchroom/fleet/switchroom-invariants.md
+      and loaded by every agent's claude process via --add-dir. Each profile
+      provides a distinct voice via its own SOUL.md.hbs. The coding profile
+      CLAUDE.md.hbs omits explicit "one question" and "verify mutable facts"
+      rules that are present in the default profile, but these arrive through
+      the invariants path. Confidence medium because the multi-path delivery
+      (invariants + per-profile CLAUDE.md.hbs) makes it harder to verify
+      end-to-end without running the full scaffold.
+
+  - claim_id: c9
+    quote: "Out of the box, on switchroom setup, the first agent reply should
+      already feel like a colleague. No yaml editing required."
+    loc: L153-L155
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L18-L27
+        snippet: |
+          "Core Behavior: Respond helpfully, concisely, and conversationally.
+          When asked to do something ambiguous, ask one clarifying question
+          rather than guessing."
+      - path: src/agents/scaffold.ts
+        lines: L110-L145
+        snippet: |
+          "TELEGRAM_GUIDANCE baked into fleet invariants, applied on every
+          switchroom apply, no operator config required."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The default profile ships posture floor behaviors without any
+      yaml configuration. Fleet invariants are regenerated on apply and
+      reset to canonical if they drift.
+
+  - claim_id: c10
+    quote: "the chat IS the artifact. The agent's own reply is where the
+      colleague-feel lives, not a framework card or a pinned status. If the
+      temptation is to add a card to compensate for a flat reply, change
+      the prompt instead."
+    loc: L161-L163
+    verdict: aligned
+    evidence:
+      - path: reference/conversational-pacing.md
+        lines: L9-L14
+        snippet: |
+          "This is design v2. v1 (#1122) retired the pinned progress card and
+          declared 'the chat is the artifact' — correct — but kept a card-era
+          pacing instinct… v2 re-founds pacing on the five beats."
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L1-L3
+        snippet: |
+          "Telegram is a chat — replies should feel like one, not a terminal
+          dump or a tracking widget."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The design v2 in conversational-pacing.md explicitly retired the
+      pinned-card model and re-founded the UX on the five-beat chat pattern.
+      The telegram-style partial encodes this directly. The JTBD's framing
+      is consistent with the shipped design contract.
+
+  - claim_id: c11
+    quote: "Every specialist needs it, not because they're the same agent in
+      different costumes, but because the feel of being a colleague is the
+      consistent posture under whatever persona sits on top."
+    loc: L17-L21
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L180-L204
+        snippet: |
+          "renderFleetInvariants() … release-controlled fleet invariants.
+          Every Switchroom agent reads this via Claude Code native CLAUDE.md
+          discovery."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The fleet invariants mechanism ensures consistent posture floor across
+      all agents. Confidence medium because verifying runtime behavior
+      across all profiles requires end-to-end scaffold execution.
+
+  - claim_id: c12
+    quote: "status? / still there? / any update? is a UX-failure signal, not
+      a feature request"
+    loc: L69-L88
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/runtime-metrics.ts
+        lines: L26-L31
+        snippet: |
+          "A user-sent message that matches a status-query pattern
+          ('status?', 'still there?', etc). Primary lagging KPI for the
+          conversational-pacing redesign."
+      - path: telegram-plugin/silence-poke.ts
+        lines: L2-L34
+        snippet: |
+          "framework safety net for 'model is silent to the user.' …
+          t=75s soft poke armed … t=300s framework fallback."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The JTBD claim is operationalized: runtime-metrics.ts tracks
+      inbound_status_query events as the primary lagging KPI, and
+      silence-poke.ts is the framework backstop that fires before users
+      feel compelled to ask. The telegram-style partial also instructs
+      agents to invoke /switchroom-runtime on receiving such a message.

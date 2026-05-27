@@ -1,0 +1,359 @@
+unit_id: jtbd-restart-and-know-what-im-running
+unit_path: reference/restart-and-know-what-im-running.md
+category: jtbd
+audited_at: 2026-05-26T10:00:00Z
+auditor_notes: |
+  The boot card (telegram-plugin/gateway/boot-card.ts) is the primary
+  implementation surface. Key design decision from PR #142: the config
+  audit (model, tools, skills, limits, memory bank) was moved OFF the
+  auto-posted boot card and onto the on-demand /status command. The JTBD
+  says the user should see this "without asking", but the shipped design
+  requires asking (/status). The boot card only surfaces: agent name,
+  version, restart reason, auth/account health, quota, and any degraded
+  probes. Model, tools, and "what changed" are NOT proactively posted.
+  The UAT scenario (jtbd-wake-audit-content-dm.test.ts) acknowledges this
+  gap explicitly ("This UAT relaxes to: after restart, the user asks...").
+
+  The dirty-worktree check mentioned in the anchors_hint is a CLI-side
+  guard on `switchroom agent restart` (src/cli/agent.ts parsePorcelainDirty),
+  NOT a boot card surface. It prevents restart from a dirty checkout but
+  does not surface dirty state to Telegram users.
+
+findings:
+  - claim_id: c1
+    quote: "After any restart, the user is told what config is live. Model, tools, skills, memory backend, auth state. No need to ask."
+    loc: L3-L4
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L14-L25
+        snippet: "The session-greeting card written by scaffold.ts (~750 lines of curl + heredoc bash that baked Profile/Tools/Skills/Limits/Channel/Memory at scaffold time and re-posted on every SessionStart). That content moves to the future `/status` command (PR 3)."
+      - path: telegram-plugin/welcome-text.ts
+        lines: L173-L175
+        snippet: "This is the on-demand reincarnation of the SessionStart greeting card deleted in #142 PR 1."
+      - path: telegram-plugin/uat/scenarios/jtbd-wake-audit-content-dm.test.ts
+        lines: L20-L34
+        snippet: "The strictest contract — the JTBD's 'no need to ask' — would require observing a proactive wake-audit message immediately after restart without any user prompt... This UAT relaxes to: after restart, the user asks 'what are you running?'"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The shipped boot card posts only a bare ack line ("agent back up · version")
+      plus degraded-probe rows if any probes fail. Model, tools, skills, and memory
+      backend are NOT surfaced proactively on restart — they were deliberately
+      moved to the on-demand /status command in PR #142. The UAT scenario itself
+      acknowledges the gap ("this version relaxes to the user asking"). The JTBD
+      outcome ("no need to ask") is therefore not currently realized. This is a
+      product design decision requiring operator review, not a doc edit.
+
+  - claim_id: c2
+    quote: "After any restart, the user sees what's running without asking. A brief status, not a wall of logs."
+    loc: L29-L30
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L8-L10
+        snippet: "Default state is a single line: `checkmark agent back up · version`. Probes still run, but only at a settle window (6s by default)..."
+      - path: telegram-plugin/tests/boot-card-render.test.ts
+        lines: L19-L22
+        snippet: "returns one-line ack with default checkmark when no probes and no restart reason"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The boot card delivers a brief status (one line ack), satisfying the
+      "not a wall of logs" half of this claim. However, "what's running"
+      in the JTBD sense (model, tools, skills) is not in the boot card —
+      it requires /status. The "brief status" claim is partially realized
+      but the "sees what's running" claim is not, because the config
+      dimensions the JTBD names (model, tools, skills, memory) are absent
+      from the auto-posted card.
+
+  - claim_id: c3
+    quote: "The user can tell if the model changed, the tools changed, skills were added or removed, or memory is attached."
+    loc: L31-L32
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L244-L235
+        snippet: "PROBE_KEYS: 'account', 'agent', 'gateway', 'quota', 'hindsight', 'scheduler', 'broker', 'kernel', 'skills'"
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L1326-L1412
+        snippet: "probeSkills validates symlink health (dangling = degraded). Does NOT report what skills are loaded when healthy."
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The boot card probes include a Skills probe, but it only surfaces
+      broken/dangling skills (degraded/fail state). When all skills are
+      healthy, the probe row is hidden per the silent-when-healthy contract.
+      Model and tools are not probed at all. The user cannot tell from the
+      boot card what model is live, which tools are enabled, or which skills
+      are loaded — they must run /status to learn these dimensions. This
+      directly contradicts the JTBD's "user can tell" claim.
+
+  - claim_id: c4
+    quote: "Auth state is part of the picture. If the agent can't authenticate right now, the user is told, not left to discover it mid-task."
+    loc: L33-L34
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L141-L205
+        snippet: "probeAccount: if (!acc?.emailAddress) { return { status: 'fail', label: 'Account', detail: 'not signed in', nextStep: '...' } }; token expiry logic surfaces degraded/fail with nextStep."
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L391-L416
+        snippet: "accountRows = renderAuthLine(opts.accounts, agentName, ...) — per-account auth section rendered below probe rows."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The Account probe runs on every boot and surfaces auth failures (not
+      signed in, token expired, token expiring soon) as degraded/fail rows
+      in the boot card. Additionally, per-account auth rows are rendered
+      via renderAuthLine showing quota headroom. Auth state is genuinely
+      part of the boot card picture.
+
+  - claim_id: c5
+    quote: "The summary is in the chat, not hidden in a log or a dashboard. It lands where the user already is."
+    loc: L36-L37
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L558-L606
+        snippet: "startBootCard posts to chatId via bot.sendMessage — the user's Telegram chat."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3678-L3698
+        snippet: "startBootCard(chatId, threadId, botApiForCard, {...}) — wired to the restart-marker chat or resolved boot target."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The boot card is posted directly to the user's Telegram chat (not a
+      log or separate dashboard). The gateway resolves the correct chat from
+      the restart marker and posts there. This anti-pattern (config summaries
+      that live in a dashboard) is explicitly avoided by the implementation.
+
+  - claim_id: c6
+    quote: "If nothing changed, the user still gets a light acknowledgement that the agent is back, so they know the restart actually completed."
+    loc: L38-L39
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L327-L332
+        snippet: "renderBootCard: const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}` ... if (sections.length === 1) return ack"
+      - path: telegram-plugin/tests/boot-card-render.test.ts
+        lines: L19-L22
+        snippet: "returns one-line ack with default checkmark when no probes and no restart reason"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The bare ack line ("agent back up · version") is always posted regardless
+      of probe results. Even an all-green healthy boot produces this one-line
+      acknowledgement. Tests pin this behavior explicitly. This anti-pattern
+      (silent respawn) is avoided.
+
+  - claim_id: c7
+    quote: "The format is consistent restart to restart, so the user's eye learns where to look."
+    loc: L39-L40
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L100-L101
+        snippet: "RestartReason = 'planned' | 'graceful' | 'crash' | 'fresh' — all reasons produce the same ack-line format with only emoji variation."
+      - path: telegram-plugin/tests/boot-card-render.test.ts
+        lines: L25-L36
+        snippet: "uses checkmark for planned and graceful; uses new emoji for fresh starts — same structural shape."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All restart reasons (planned, graceful, crash, fresh) produce the same
+      structural format: ack line + optional degraded rows. The boot path and
+      bridge-reconnect path use the same startBootCard function. The format
+      is consistent across restart causes, matching the anti-pattern avoidance
+      ("different restart surfaces for different causes").
+
+  - claim_id: c8
+    quote: "When something did change, the change is obvious, not buried."
+    loc: L40-L41
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L14-L25
+        snippet: "What's deleted (relative to pre-#142): The session-greeting card written by scaffold.ts that baked Profile/Tools/Skills/Limits/Channel/Memory at scaffold time and re-posted on every SessionStart."
+    evidence_strength: medium
+    action: escalate
+    confidence: medium
+    rationale: |
+      The boot card does not diff config state between restarts. If the model
+      changed, the boot card shows the same ack line as before — the change
+      is not surfaced. The pre-#142 SessionStart card did surface config at
+      restart time (baked at scaffold time); this was deleted in PR #142 in
+      favor of on-demand /status. The "change is obvious" claim is unmet for
+      config-dimension changes. This is a product design decision.
+
+  - claim_id: c9
+    quote: "Silent respawn. Agent comes back and the user has to guess whether it's the same agent with the same config."
+    loc: L45-L46
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L327-L332
+        snippet: "const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}`"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      This is listed as an anti-pattern to avoid. The boot card does prevent
+      silent respawns (the ack line always fires). However, the user CAN still
+      have to guess about config (model, tools, skills) if those changed, since
+      the boot card doesn't surface them. The anti-pattern is partially avoided
+      (restarts are not silent) but the deeper concern (same config vs. changed
+      config) is not fully addressed. Verdict is drift-minor: the anti-pattern
+      is more about silence than config visibility, and silence IS avoided.
+
+  - claim_id: c10
+    quote: "Different restart surfaces for different causes. A crash, a reboot, a reconfigure should all land in the same shape."
+    loc: L53-L54
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L237-L248
+        snippet: "REASON_EMOJI: planned: checkmark, graceful: checkmark, crash: warning, fresh: new. REASON_LABEL: planned, graceful, crash, fresh all produce the same structure."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3656-L3698
+        snippet: "reason = determineRestartReason({...}) — all paths funnel through startBootCard."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All restart types (crash, planned, graceful, fresh boot) go through the
+      same startBootCard path with the same structural output. The emoji and
+      optionally a crash row differ, but the format and location are identical.
+      The anti-pattern is avoided.
+
+  - claim_id: c11
+    quote: "Config change restart. Change the model or tools, reload the agent. The summary should reflect the change, not the old state."
+    loc: L65-L66
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/welcome-text.ts
+        lines: L38-L49
+        snippet: "AgentAudit: tools, toolsDeny, skills, limits, channel, memoryBank — populated in /status response, NOT in boot card."
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L251-L301
+        snippet: "RenderBootCardOpts has no tools, model, skills, or config fields — only version, probes, restartReason."
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The UAT prompt describes a scenario where changing model or tools and
+      reloading should show the change. The boot card does not include model
+      or tools data at all — this UAT scenario would pass only if the user
+      runs /status after the boot card appears. The scenario as written is
+      therefore testing behavior the code does not implement proactively.
+
+  - claim_id: c12
+    quote: "Skill added or removed. Add a skill, restart. The skill should appear in the summary. Remove it, restart, it should disappear."
+    loc: L67-L68
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L1326-L1412
+        snippet: "probeSkills: status ok when all symlinks resolve; detail includes bucketed skill names. But ok rows are SILENT per silent-when-healthy contract."
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L372-L381
+        snippet: "if (r.status === 'ok') continue — healthy probes never render rows."
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The Skills probe does enumerate loaded skills in its detail field when
+      healthy (e.g., "Switchroom: skill1, skill2"). However, the boot card
+      only renders probe rows for degraded/fail probes — a healthy Skills
+      probe is silently dropped. So added/removed skills (when not causing
+      dangling symlinks) will NOT appear in the boot card. This UAT scenario
+      cannot be satisfied by the current implementation.
+
+  - claim_id: c13
+    quote: "Auth failure on restart. Start the agent with broken auth. The surfaced state should say so clearly, not claim ready."
+    loc: L69-L70
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L152-L165
+        snippet: "if (!acc?.emailAddress) { return { status: 'fail', label: 'Account', detail: 'not signed in', nextStep: '...' } }"
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L193-L205
+        snippet: "token expired: status = 'fail'; token expiring: status = 'degraded'. Each with nextStep."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Auth failure scenarios (not signed in, token expired) produce fail/
+      degraded rows with nextStep hints in the boot card. The "claim ready
+      when auth is broken" anti-pattern is explicitly avoided by the Account
+      probe implementation.
+
+  - claim_id: c14
+    quote: "Multiple agents restarted. Bring several specialists back at once. Each should report its own state in its own place, not collapse into one summary."
+    loc: L72-L73
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L557-L560
+        snippet: "startBootCard(chatId, threadId, bot, opts, ...) — per-gateway, per-chat invocation."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3663-L3698
+        snippet: "Each gateway instance posts its own boot card to its own chatId/threadId."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Each agent has its own gateway process with its own Telegram bot, which
+      posts to its own chat topic. Fleet-wide restarts produce one boot card
+      per agent in that agent's own topic. The anti-pattern (collapsing into
+      one summary) is structurally avoided by the per-agent gateway model.
+
+  - claim_id: c15
+    quote: "Memory backend swap. Change the memory backend, restart. The user should see which backend is now attached."
+    loc: L74-L75
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L946-L978
+        snippet: "probeHindsight: returns ok when reachable (detail='reachable'), fail when not. Does not surface bank name unless bankName is passed."
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L372-L381
+        snippet: "if (r.status === 'ok') continue — healthy probes never render rows."
+    evidence_strength: strong
+    action: escalate
+    confidence: medium
+    rationale: |
+      The Hindsight probe shows the bank name suffix in ok state
+      ("reachable · bank=mybank"), but like all ok probes, this row is
+      silently dropped from the boot card. The user cannot see which memory
+      backend is attached from the boot card alone. Changing the memory
+      backend would not visibly change the boot card if both old and new
+      backends are healthy. /status is required to see the memory bank.
+
+  - claim_id: c16
+    quote: "Tool scope change. Narrow or widen a tool allowlist, restart. The user should be able to tell what the agent can and can't do now."
+    loc: L76-L77
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/boot-card.ts
+        lines: L251-L301
+        snippet: "RenderBootCardOpts: no tools or tool-deny fields. The boot card renderer has no concept of tool allowlists."
+      - path: telegram-plugin/welcome-text.ts
+        lines: L38-L42
+        snippet: "AgentAudit: tools, toolsDeny — present in /status AgentAudit type, absent from boot card."
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      Tools and toolsDeny are surfaced in the /status AgentAudit block but
+      are completely absent from the boot card. A tool scope change would
+      produce an identical boot card before and after. This UAT scenario
+      cannot pass with the current implementation.

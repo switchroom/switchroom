@@ -1,0 +1,324 @@
+unit_id: contract-vision
+unit_path: reference/vision.md
+category: contract
+audited_at: 2026-05-26T12:00:00Z
+auditor_notes: |
+  Audited all four outcomes plus the "What it isn't" table.
+  One active code-violates-contract finding: src/host-control/server.ts
+  line 1577 contains a live `claude -p ok` callsite inside the `deep`
+  probe path of the agent_health verb. It is already in the
+  KNOWN_TEMPLATE_GAPS allowlist of tests/bridge-flap-regression-guard.test.ts
+  under tracking issue #1798. The vision is unambiguous that every model
+  call must be the interactive session or an injected turn; the `deep`
+  probe is a direct violation. Escalation is appropriate.
+
+  The OpenAI Whisper usage in telegram-plugin/voice-transcribe.ts is
+  noted separately. The "What it isn't" table row says "A multi-provider
+  orchestrator | No OpenAI, Gemini, Llama, model swapping." The
+  surrounding text ("model swapping") indicates inference orchestration
+  is the constraint, not auxiliary services. Whisper is a transcription
+  helper, not an inference provider replacing Claude. The wording is
+  ambiguous enough to merit a minor text clarification rather than a
+  contract violation.
+
+  Account pooling / auto-failover (vision L93-95: "pool accounts with
+  automatic failover") is implemented via the fleet-wide auto-fallback
+  path (telegram-plugin/fleet-fallback-gate.ts, session-tail.ts) which
+  rotates OAuth slots on quota exhaustion. Claim is aligned.
+
+findings:
+  - claim_id: c1
+    quote: "Every agent runs the unmodified `claude` binary, OAuth straight to Anthropic, the same flow as the desktop. No Agent SDK. No API-key routing. No raw API."
+    loc: L77-L80
+    verdict: aligned
+    evidence:
+      - path: CLAUDE.md
+        lines: L37-L66
+        snippet: "Every agent runs the unmodified `claude` CLI, authenticated with the operator's Pro/Max OAuth credentials. No `ANTHROPIC_API_KEY`, no API keys of any kind, no Claude Agent SDK, no raw Anthropic API..."
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L1-L30
+        snippet: "As of RFC #1620 the codebase has *zero* headless-`claude` spawners at all (the handoff builder and webhook dispatch were both moved off `claude -p`)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      CLAUDE.md encodes this as a hard constraint with CI enforcement via
+      tests/bridge-flap-regression-guard.test.ts. The scan confirms no
+      source file spawns `claude` without `--strict-mcp-config`, and the
+      SDK/API import scan found no `@anthropic-ai/sdk` or raw API usage in
+      src/ or telegram-plugin/. The constraint is architecturally upheld.
+
+  - claim_id: c2
+    quote: "Every model call is the interactive `claude` session, or a turn synthesized into it. Headless `claude -p` is the same CLI, but as of the 2026-06-15 policy it counts as programmatic usage, off the subscription."
+    loc: L86-L90
+    verdict: code-violates-contract
+    evidence:
+      - path: src/host-control/server.ts
+        lines: L1574-L1578
+        snippet: "if (req.args.deep) { PROBES.push({ name: \"auth_live\", cmd: \"timeout 25 claude -p ok >/dev/null 2>&1\", }); }"
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L168-L175
+        snippet: "KNOWN_TEMPLATE_GAPS: { \"src/host-control/server.ts\": \"#1798\" }"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      src/host-control/server.ts line 1577 contains an active `claude -p ok`
+      callsite in the `deep` branch of the agent_health probe. The vision
+      (L86-L90) and CLAUDE.md hard constraint both forbid any `claude -p`
+      callsite as programmatic usage under the 2026-06-15 policy. The code
+      is already acknowledged in KNOWN_TEMPLATE_GAPS with tracking issue
+      #1798 but remains unfixed. Vision is authoritative for contract units;
+      verdict is code-violates-contract. Operator must decide whether to
+      retire the deep probe entirely, replace it with a token-introspect
+      liveness check via the auth-broker, or accept the policy exception.
+
+  - claim_id: c3
+    quote: "No Agent SDK. No API-key routing. No raw API. No credential interception."
+    loc: L78-L81
+    verdict: aligned
+    evidence:
+      - path: src/auth/via-claude.ts
+        lines: L1-L25
+        snippet: "spawn `claude` in a clean tmux pane, dispatch the well-known OAuth flow..."
+      - path: src/auth/accounts.ts
+        lines: L254-L291
+        snippet: "token (e.g. when planning the slot pool)..."
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      No `@anthropic-ai/sdk` imports found anywhere in src/ or
+      telegram-plugin/. Auth flows go through the claude CLI's OAuth path,
+      not a raw API key. The auth broker manages token rotation but never
+      calls the Anthropic API directly. Credential interception would mean
+      proxying the claude CLI's network traffic, which is not present in the
+      codebase.
+
+  - claim_id: c4
+    quote: "A standing team that knows you: specialists, not one generalist. One bot per specialist. Each its own persona, memory, skills, tools, credentials."
+    loc: L52-L63
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L793-L800
+        snippet: "per-agent scaffold dir...SOUL.md per agent...per-agent skills..."
+      - path: src/config/schema.ts
+        lines: L1494-L1510
+        snippet: "per-agent config fields for skills, persona, credentials..."
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The scaffold system generates per-agent SOUL.md (persona), per-agent
+      memory, per-agent credential slots, and per-agent skills. CLAUDE.md's
+      repo layout section confirms profiles/ and skills/ directories plus
+      per-agent config cascade. The multi-agent architecture is thoroughly
+      implemented.
+
+  - claim_id: c5
+    quote: "You hold the leash: controlled, purposeful, never roaming. A specialist sees only the credentials and tools you granted it. It can ask for more. You get an Allow or Deny card in Telegram. Only your tap grants it."
+    loc: L65-L74
+    verdict: aligned
+    evidence:
+      - path: src/vault/approvals/
+        lines: L1-L1
+        snippet: "approval-kernel — per-agent UDS for approval/grant flows"
+      - path: CLAUDE.md
+        lines: L68-L85
+        snippet: "approval-kernel (root, mirror of broker socket model)...per-agent sockets at /run/switchroom/kernel/<agent>/sock"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The approval-kernel service provides the Allow/Deny flow. Vault
+      per-agent socket model ensures a specialist only accesses credentials
+      bound to its socket path (path-as-identity invariant in
+      src/vault/broker/peercred.ts). The architecture enforces the leash
+      constraint structurally.
+
+  - claim_id: c6
+    quote: "No heartbeats. Beck-and-call plus the explicit schedules you set, never a loop of its own."
+    loc: L72-L73
+    verdict: aligned
+    evidence:
+      - path: src/agent-scheduler/index.ts
+        lines: L1-L15
+        snippet: "fires via inject_inbound...cron-driven...no autonomous loop"
+      - path: src/agent-scheduler/index.ts
+        lines: L247-L247
+        snippet: "setInterval(() => { /* idle */ }, 1 << 30);"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The agent-scheduler uses node-cron to fire at operator-defined
+      schedules only, dispatching via inject_inbound to the interactive
+      session. The agent itself has no polling loop — the `setInterval`
+      at line 247 is an idle keep-alive, not a work loop. The "no
+      heartbeats" claim is architecturally correct.
+
+  - claim_id: c7
+    quote: "Always available, in Telegram, done properly: there when you want it. Each specialist is a long-running service. It survives reboots, network drops, your laptop closing."
+    loc: L96-L104
+    verdict: aligned
+    evidence:
+      - path: CLAUDE.md
+        lines: L68-L80
+        snippet: "tini (PID 1) -> start.sh -> tmux server+client -> claude; agent containers use network_mode: host"
+      - path: profiles/_base/start.sh.hbs
+        lines: L1-L1
+        snippet: "start.sh.hbs — the agent entry script template (includes the docker-mode tmux preamble)"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      Docker containers with tini as PID 1 provide service durability. The
+      tmux layer ensures the claude session persists across network drops.
+      Compose restart policies keep agents alive across reboots. The
+      always-available architecture is implemented.
+
+  - claim_id: c8
+    quote: "Switchroom never intercepts auth or inference. The `claude` CLI is the runtime."
+    loc: L126-L126
+    verdict: aligned
+    evidence:
+      - path: src/auth/via-claude.ts
+        lines: L1-L30
+        snippet: "spawn `claude` in a clean tmux pane, dispatch the well-known OAuth flow"
+      - path: CLAUDE.md
+        lines: L44-L52
+        snippet: "Every agent runs the unmodified `claude` CLI...Docker is for distribution and isolation, not a custom runtime around claude"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The claude CLI runs unmodified inside each agent container. Auth
+      flows use the CLI's own OAuth mechanism (the auth broker manages
+      token rotation but does not proxy inference). No inference
+      interception layer exists in the codebase.
+
+  - claim_id: c9
+    quote: "A multi-provider orchestrator | No OpenAI, Gemini, Llama, model swapping."
+    loc: L127-L127
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/voice-transcribe.ts
+        lines: L1-L22
+        snippet: "Voice-message transcription via OpenAI Whisper (#578 spike)...POSTs them to OpenAI's Whisper API."
+      - path: src/config/schema.ts
+        lines: L588-L588
+        snippet: "API key read from ~/.switchroom/openai-api-key (mode 0600). Off by..."
+    evidence_strength: medium
+    action: update-text
+    proposed_text: |
+      "A multi-provider orchestrator | No OpenAI, Gemini, Llama, or model
+      swapping for inference. Auxiliary services (e.g. voice transcription
+      via Whisper) are opt-in helpers, not Claude replacements."
+    confidence: medium
+    rationale: |
+      The voice-transcribe.ts module calls the OpenAI Whisper API for
+      audio transcription (opt-in, off by default). This is not inference
+      orchestration — it does not replace or augment Claude's reasoning.
+      However the "What it isn't" table row reads "No OpenAI, Gemini,
+      Llama, model swapping" which is ambiguous: a reader could reasonably
+      interpret it as a blanket ban on any OpenAI dependency. The
+      surrounding column text "model swapping" signals the constraint is
+      about inference providers, but the left-column label alone is
+      misleading. Minor text clarification is warranted to preserve the
+      intent (no inference orchestration) without misrepresenting the
+      shipped voice-in feature.
+
+  - claim_id: c10
+    quote: "Not Slack, not Discord, not Teams. Telegram, done properly."
+    loc: L128-L128
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L1-L10
+        snippet: "Telegram bot gateway — sole inbound channel"
+      - path: src/cli/telegram.ts
+        lines: L1-L10
+        snippet: "Telegram plugin configuration commands only"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The telegram-plugin is the sole inbound channel implementation. No
+      Slack, Discord, or Teams adapters exist in the codebase. The web/
+      directory provides a local REST API and webhook handler (inbound from
+      external services to the agent), not a chat channel bridge — it routes
+      into the same inject_inbound path.
+
+  - claim_id: c11
+    quote: "Multi-tenant | Single-operator by design."
+    loc: L130-L130
+    verdict: aligned
+    evidence:
+      - path: src/host-control/server.ts
+        lines: L1244-L1244
+        snippet: "Deliberately OUT of scope per operator decision (single-operator single-host posture)"
+      - path: CLAUDE.md
+        lines: L1-L10
+        snippet: "Users run Claude Code agents 24/7 on a Linux box...single-operator by design"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The operator model is single-user by construction: a single
+      ~/.switchroom/ state tree, a single switchroom.yaml, and no
+      multi-tenant auth layer. The host-control server comment explicitly
+      cites "single-operator single-host posture."
+
+  - claim_id: c12
+    quote: "A hosted service | Self-hosted only. Your box, your tokens, your data."
+    loc: L131-L131
+    verdict: aligned
+    evidence:
+      - path: docs/install.md
+        lines: L1-L5
+        snippet: "install on your own Linux host"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      No hosted service, SaaS offering, or cloud-hosted instance exists
+      in the codebase or published infrastructure. The install path
+      is always to an operator-owned Linux box via docker compose.
+
+  - claim_id: c13
+    quote: "Need more throughput, pool accounts with automatic failover. One bill."
+    loc: L93-L95
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/fleet-fallback-gate.ts
+        lines: L1-L5
+        snippet: "Re-entry guard + dedup window for fleet-wide auto-fallback."
+      - path: telegram-plugin/session-tail.ts
+        lines: L462-L475
+        snippet: "fleet auto-fallback...quota hit...exhaustion signal...auto-fallback-eligible"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The fleet-wide auto-fallback path (PR #1329) rotates OAuth slots on
+      quota exhaustion. The auth accounts slot pool (src/auth/accounts.ts)
+      supports multiple accounts per agent. The claim accurately describes
+      the shipped capability.
+
+  - claim_id: c14
+    quote: "The moment a feature reaches for the SDK or the API, it has left switchroom."
+    loc: L83-L84
+    verdict: aligned
+    evidence:
+      - path: CLAUDE.md
+        lines: L37-L66
+        snippet: "Before adding any code path that calls a model: it MUST be the interactive claude session...If you reach for the SDK or the API, stop."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      No `@anthropic-ai/sdk` imports exist in src/ or telegram-plugin/.
+      The bridge-flap regression guard and skill validator both scan for
+      prohibited patterns. CLAUDE.md encodes the constraint with explicit
+      CI enforcement. The code does not reach for the SDK.

@@ -1,0 +1,422 @@
+unit_id: jtbd-share-auth-across-the-fleet
+unit_path: reference/share-auth-across-the-fleet.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The JTBD header block correctly marks this as SHIPPED (RFC H) and warns
+  readers the body is a pre-RFC-H problem statement. That disclaimer is good.
+  Most core architectural claims (broker as sole writer, fanout, CLAUDE_CODE_OAUTH_TOKEN
+  removal, rm refusal) are well-implemented and test-covered.
+
+  Three stale-example findings:
+
+  1. "Signs it's working" bullet 1 cites `switchroom auth enable <account> <agent>`.
+     That verb does not exist. The current surface is `switchroom auth use <label>`
+     (fleet-wide) or `switchroom auth agent override <agent> <label>` (edge case).
+
+  2. Decision 2 describes per-agent `auth.accounts: [work-pro, personal-max]` ordered
+     lists in switchroom.yaml. The shipped schema drops the per-agent accounts list
+     entirely. The current per-agent auth block has only `override:` (an edge-case
+     single-label pin). The ordered preference list at the agent level does not exist;
+     fallback ordering is fleet-wide via `auth.fallback_order`.
+
+  3. The UAT prompt at L265 says `switchroom auth account list`. That command does not
+     exist. The actual commands are `switchroom auth list` and `switchroom auth show`.
+
+  Decision 10 ("No migration shipped") is nuanced: `src/auth/migrate-schema.ts` IS
+  shipped and tested, but it is NOT wired into any production code path (no import of
+  `migrateAuthSchemaFile` outside its own test file). The RFC H doc (docs/rfcs/auth-broker.md
+  L125-128) clarifies that "no migration" means no CLI verb and no compatibility shims,
+  not literally no upgrade algorithm. The schema comments say it runs "on first apply"
+  but `apply.ts` does not import it. This may be an unwired migration — low confidence
+  finding flagged for triage.
+
+findings:
+  - claim_id: c1
+    quote: "The `switchroom-auth-broker` daemon (`src/auth/broker/`) is the sole writer
+      of every `credentials.json`"
+    loc: L9-L10
+    verdict: aligned
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L2-L5
+        snippet: "switchroom-auth-broker server — sole writer of per-agent\n
+          `<agentDir>/.claude/.credentials.json`"
+      - path: src/auth/account-store.ts
+        lines: L20-L21
+        snippet: "The only writer to these files is `switchroom-auth-broker`, except\n
+          during the initial `switchroom auth account add` flow"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The broker server's module-level comment explicitly states "sole writer". The
+      account-store module corroborates. start.sh.hbs (L187-190) defensively unsets
+      CLAUDE_CODE_OAUTH_TOKEN. No other production callsite writes per-agent
+      .credentials.json.
+
+  - claim_id: c2
+    quote: "authentication is per Anthropic account, not per agent; the fleet shares
+      one `auth.active` and quota / fallback state fans out across every consumer in
+      seconds"
+    loc: L10-L12
+    verdict: aligned
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L1026-L1044
+        snippet: "opMarkExhausted ... const rolled = this.fanoutFailoverFor(account)"
+      - path: src/config/schema.ts
+        lines: L2028-L2046
+        snippet: "auth: z.object({ active: z.string() ... fallback_order: z.array(...)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Fleet-wide auth.active is the config key; fanoutFailoverFor fires synchronously
+      within opMarkExhausted so every affected agent's mirror is rewritten before the
+      RPC returns. The schema has auth.active and auth.fallback_order at the top level.
+
+  - claim_id: c3
+    quote: "Operator surface: `switchroom auth add|list|show|use|rotate|rm` (CLI) and
+      `/auth show|use|rotate` (Telegram)"
+    loc: L13-L15
+    verdict: aligned
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L10-L16
+        snippet: "auth add <label> ... auth list ... auth use <label> ... auth rotate
+          ... auth rm <label> ... auth show [<agent>]"
+      - path: telegram-plugin/gateway/auth-command.ts
+        lines: L11-L15
+        snippet: "/auth show [<agent>] ... /auth list ... /auth use <label> ... /auth rotate"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All six CLI verbs and all three Telegram verbs are registered and match the JTBD
+      listing exactly.
+
+  - claim_id: c4
+    quote: "Adding a second, third, or sixth agent to the same Anthropic account does
+      not require any OAuth flow. The user runs `switchroom auth enable <account>
+      <agent>` and the agent comes up authenticated."
+    loc: L62-L63
+    verdict: jtbd-stale-example
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L465-L803
+        snippet: "registered verbs: add, list, use, rotate, rm, show, refresh, agent override,
+          reauth, code, cancel — no 'enable' verb registered"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      `switchroom auth enable <account> <agent>` does not exist. The current operations
+      are: `switchroom auth use <label>` (fleet-wide) or `switchroom auth agent override
+      <agent> <label>` (per-agent edge case). The replacement sentence should read:
+      "The user runs `switchroom auth use <label>` (to set the fleet account) and
+      restarts the agent; no new OAuth flow is needed."
+
+  - claim_id: c5
+    quote: "The user can answer 'which Anthropic accounts am I logged into and which
+      agents use each?' with one command. The answer fits on a screen."
+    loc: L64-L65
+    verdict: aligned
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L717-L745
+        snippet: "`auth show [agent]` command — printAccountsTable + printAgentsTable + printConsumersTable"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `switchroom auth show` (no arg) prints accounts table, agents table, and consumers
+      table. `switchroom auth list` shows accounts only. Both fit on a screen.
+
+  - claim_id: c6
+    quote: "A sub-agent dispatched from a main agent is authenticated against the same
+      account as its parent. The user does nothing to make this happen."
+    loc: L66-L67
+    verdict: aligned
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L1567-L1633
+        snippet: "fanoutAll / fanoutForAgent / mirrorAccountToAgent — writes per-agent
+          .credentials.json on boot"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The broker writes the per-agent .credentials.json mirror that claude reads. Any
+      sub-agent running inside the agent container reads the same file. The claim is
+      directionally true for the sub-agent case, but sub-agent auth behavior depends on
+      how the claude CLI handles sub-agent CLAUDE_CONFIG_DIR inheritance — not audited
+      from this review.
+
+  - claim_id: c7
+    quote: "A cron-launched `claude -p` invocation in an agent's directory uses the
+      same fresh token as that agent's main process. No 401s, no env-var hand-offs."
+    loc: L68-L69
+    verdict: jtbd-stale-example
+    evidence:
+      - path: CLAUDE.md
+        lines: L99-L109
+        snippet: "claude -p (headless/print mode) ... as of the 2026-06-15 policy it
+          is programmatic usage — a separate credit, off subscription limits. Adding a
+          new `claude -p` callsite is a constraint violation"
+      - path: docs/rfcs/eliminate-claude-p.md
+        lines: L1-L5
+        snippet: "RFC for eliminating all claude -p callsites"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      `claude -p` is now forbidden under Anthropic's 2026-06-15 policy (programmatic
+      usage, separate credit, constraint violation per CLAUDE.md). The cron system was
+      refactored in Phase 4 to use inject_inbound (dispatchAsInbound) instead of
+      `claude -p`. The example reinforces the wrong pattern. Replace with: "A
+      cron-scheduled task in an agent's directory fires via inject_inbound and uses the
+      same account as the main process — same broker mirror, no 401s, no env-var
+      hand-offs."
+
+  - claim_id: c8
+    quote: "When an account hits the 5-hour cap, every agent using that account fails
+      over to the next account on its preference list within seconds"
+    loc: L70-L71
+    verdict: drift-minor
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L1592-L1609
+        snippet: "fanoutFailoverFor uses auth.fallback_order (fleet-wide), not a
+          per-agent preference list"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The mechanism is correct (synchronous fanout on mark-exhausted), but "its
+      preference list" implies per-agent ordering. The shipped design uses one
+      fleet-wide `auth.fallback_order`. Replace "the next account on its preference
+      list" with "the next account in `auth.fallback_order`".
+
+  - claim_id: c9
+    quote: "Removing an account is a single explicit action, refused while any agent
+      is still enabled on it."
+    loc: L78-L79
+    verdict: drift-minor
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L1138-L1149
+        snippet: "Refuse to remove if it's the fleet active or any agent's override.
+          Checks auth.active and agents[*].auth.override"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      Removal is refused only when the account is the fleet active OR is pinned via a
+      per-agent override. An agent with no explicit override inherits the fleet active
+      and is indirectly protected by the fleet-active check. However the phrase "while
+      any agent is still enabled on it" suggests a per-agent enabled/disabled tracking
+      which does not exist. Narrow the text to: "refused while it is the fleet active
+      account or the override target for any agent."
+
+  - claim_id: c10
+    quote: "Agents are consumers, not owners. An agent declares an ordered list of
+      accounts it can use, in `switchroom.yaml`: `agents: foo: auth: accounts:
+      [work-pro, personal-max]`"
+    loc: L142-L149
+    verdict: drift-major
+    evidence:
+      - path: src/config/schema.ts
+        lines: L1263-L1280
+        snippet: "per-agent auth block has only `override: string` — no `accounts` array.
+          Schema comment: 'Pre-RFC-H auth.accounts: [...] and auth_label: are migrated
+          in-place on first apply'"
+      - path: src/auth/migrate-schema.ts
+        lines: L1-L26
+        snippet: "in-place YAML upgrade from per-agent auth.accounts to fleet-wide model"
+      - path: docs/auth.md
+        lines: L72-L92
+        snippet: "YAML schema: agents.ziggy: {} (inherits fleet active), agents.klanker.auth.override: work"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      Decision 2's YAML example (`auth.accounts: [work-pro, personal-max]`) is the
+      pre-RFC-H schema. The shipped design replaced per-agent ordered lists with a
+      fleet-wide `auth.active` and a single `auth.fallback_order`. The only per-agent
+      auth field is `override:` (one label, edge-case use). The YAML example in
+      Decision 2 would be migrated away by `migrate-schema.ts` on an existing install.
+      Replace the example with: `agents: foo: {} # inherits fleet active` (common case)
+      or `agents: klanker: auth: override: work # edge case: pin to specific account`.
+
+  - claim_id: c11
+    quote: "`switchroom-auth-broker` is the only writer ... fanout: when an account
+      refreshes, every enabled agent's mirror gets atomically rewritten"
+    loc: L162-L169
+    verdict: aligned
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L1567-L1633
+        snippet: "fanoutAll, fanoutToAffectedAgents, fanoutForAgent, mirrorAccountToAgent
+          — all write atomically via atomicWriteFileSync"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Broker server implements fanout on boot, set-active, refresh tick, and
+      mark-exhausted. All writes go through mirrorAccountToAgent which uses
+      atomicWriteFileSync (tempfile + rename). Strong code evidence.
+
+  - claim_id: c12
+    quote: "Drop `CLAUDE_CODE_OAUTH_TOKEN` injection in `start.sh`. The env var was
+      only useful for the parent claude process and was redundant with the credentials
+      file every other consumer reads."
+    loc: L173-L175
+    verdict: aligned
+    evidence:
+      - path: profiles/_base/start.sh.hbs
+        lines: L187-L190
+        snippet: "# CLAUDE_CODE_OAUTH_TOKEN injection was removed with RFC H
+          (auth-broker). ... unset CLAUDE_CODE_OAUTH_TOKEN"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      start.sh.hbs explicitly unsets the env var. Comment names RFC H as the reason.
+      The pattern exactly matches Decision 5.
+
+  - claim_id: c13
+    quote: "Drop the per-agent slot pool entirely. The `<agentDir>/.claude/accounts/<slot>/`
+      directory tree ... all go away."
+    loc: L177-L181
+    verdict: drift-minor
+    evidence:
+      - path: src/auth/accounts.ts
+        lines: L1-L16
+        snippet: "LEGACY (post-RFC-H) ... This module is legacy per-agent slot scaffolding
+          ... retained for back-compat and migration paths only"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The per-agent slot pool code still exists in `src/auth/accounts.ts` (marked
+      LEGACY). Decision 6 says it "all go away" but the file ships in production for
+      back-compat/migration. The claim is directionally true (it is not the runtime
+      path), but "all go away" overstates the cleanup. The JTBD body is historical
+      anyway (covered by the disclaimer), so no urgent edit needed, but text should
+      note that legacy code is retained for migration-only, not active runtime.
+
+  - claim_id: c14
+    quote: "No migration shipped. This is a new-install design ... no `switchroom auth
+      migrate` verb, no legacy slot-pool code paths kept 'for now,' no compatibility
+      shims."
+    loc: L206-L215
+    verdict: drift-major
+    evidence:
+      - path: src/auth/migrate-schema.ts
+        lines: L1-L56
+        snippet: "In-place YAML upgrade from the pre-RFC-H per-agent auth schema to the
+          RFC H fleet-wide model ... Tested against three fixture shapes"
+      - path: src/config/schema.ts
+        lines: L1278-L1279
+        snippet: "Pre-RFC-H auth.accounts: [...] and auth_label: are migrated in-place
+          on first apply (see src/auth/migrate-schema.ts)"
+      - path: src/auth/accounts.ts
+        lines: L1-L16
+        snippet: "LEGACY (post-RFC-H) ... retained for back-compat and migration paths only"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      Decision 10 says "no migration shipped" but `src/auth/migrate-schema.ts` is a
+      shipped, tested in-place migration algorithm (3 fixture shapes tested). Legacy
+      slot-pool code (`src/auth/accounts.ts`) is explicitly retained for back-compat.
+      The RFC H doc (L125-128) clarifies the intent: no CLI verb, no compatibility
+      shims for new schema shape — not "no upgrade algorithm." The Decision 10 text
+      contradicts what was actually built. NOTE: `migrateAuthSchemaFile` is not
+      imported from any production code path (only in its own test file) — the wiring
+      into `apply` that the schema comments reference appears to be absent. This
+      inconsistency is worth flagging separately but does not change the finding that
+      "no migration shipped" is false.
+
+  - claim_id: c15
+    quote: "The same shape on the CLI and in Telegram. Both surfaces speak 'accounts,'
+      not 'slots.' Telegram's `/auth use work-pro` swaps the agent to that account;
+      `/auth list` shows accounts and which agent is using which."
+    loc: L217-L220
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/auth-command.ts
+        lines: L11-L15
+        snippet: "/auth show ... /auth list ... /auth use <label> ... /auth rotate"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Telegram auth surface matches: `/auth use <label>` and `/auth list` (alias of
+      show) are implemented. The vocabulary is "accounts"/"labels" not "slots".
+
+  - claim_id: c16
+    quote: "Read the output of `switchroom auth account list`. Does it show your
+      accounts and which agents use each, on one screen?"
+    loc: L265-L266
+    verdict: jtbd-stale-example
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L589-L605
+        snippet: "auth.command('list') ... auth.command('show [agent]')"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      `switchroom auth account list` does not exist. The correct commands are
+      `switchroom auth list` (accounts only) and `switchroom auth show` (accounts +
+      agents + consumers). Update the UAT prompt to: "Read the output of `switchroom
+      auth show`. Does it show your accounts and which agents use each, on one screen?"
+
+  - claim_id: c17
+    quote: "Stop `switchroom-auth-broker`. Do agents still respond for the next hour
+      as long as their existing tokens are valid? Restart it. Does it resume refreshes
+      without losing state?"
+    loc: L275-L277
+    verdict: aligned
+    evidence:
+      - path: src/auth/broker/server.ts
+        lines: L98-L104
+        snippet: "REFRESH_INTERVAL_MIN = 1 ... broker refresh loop"
+      - path: reference/share-auth-across-the-fleet.md
+        lines: L197-L203
+        snippet: "Decision 9: broker's death is degraded, not catastrophic. Token
+          lifetime is 8 hours; the broker can be down for hours without a user-visible
+          outage."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The degraded mode claim (agents survive on cached credentials) is structurally
+      true — the broker writes .credentials.json but does not gate reads. No explicit
+      test pins the "broker down, agent still works for 1h" scenario, hence medium
+      confidence. The 8-hour claim comes from RFC H, which cites Anthropic token
+      lifetime.
+
+  - claim_id: c18
+    quote: "Migrate from a per-agent-slot install. Did you have to re-`claude
+      setup-token` any account, or did the existing tokens carry over?"
+    loc: L279-L280
+    verdict: drift-minor
+    evidence:
+      - path: src/auth/migrate-schema.ts
+        lines: L1-L26
+        snippet: "In-place YAML upgrade algorithm; migrates agent auth.accounts lists
+          to fleet-wide auth.active"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      The UAT prompt is reasonable but its context changed: `migrate-schema.ts` exists
+      but is not wired into any production code path. Whether the in-place migration
+      actually runs on apply is unclear (the schema comments say it does; the import
+      graph says it does not). The prompt assumes seamless migration; that assumption
+      may not hold. Low-risk to leave as-is since the JTBD body is marked historical,
+      but it should note that an explicit `switchroom apply` is required to trigger the
+      in-place schema upgrade.

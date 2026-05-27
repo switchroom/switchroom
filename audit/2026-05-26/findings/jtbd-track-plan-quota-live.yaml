@@ -1,0 +1,200 @@
+unit_id: jtbd-track-plan-quota-live
+unit_path: reference/track-plan-quota-live.md
+category: jtbd
+audited_at: 2026-05-26T12:00:00Z
+auditor_notes: |
+  The quota infrastructure is well-built for pull (via /usage and the boot card)
+  and for fatal-state push (credits-watch fires on credit exhaustion). The gap is
+  the middle tier: approaching-cap signals. The JTBD says "approaching a cap
+  produces a visible signal at a point where the user can still act on it," but
+  no such threshold exists in code — there is no proactive notification that fires
+  at e.g. 80% utilization. Similarly, "when the window rolls, the user sees the
+  recovery without having to refresh anything" is not implemented; recovery is
+  only visible on the next /usage poll or agent restart.
+
+  The "one pool, not two" claim and the multiple-window display (5h + 7d) are
+  well-supported. Plan variance is handled by mapPlan() reading billingType from
+  .claude.json without requiring user configuration.
+
+  Key files examined:
+    telegram-plugin/quota-check.ts — fetchQuota, formatQuotaBlock, formatQuotaLine
+    telegram-plugin/credits-watch.ts — fatal-credit push logic
+    telegram-plugin/gateway/boot-probes.ts — probeQuota (pull, at boot)
+    telegram-plugin/gateway/quota-cache.ts — 5-min cache
+    telegram-plugin/gateway/gateway.ts:13652 — /usage command handler
+    telegram-plugin/gateway/gateway.ts:15986-15998 — credits-watch 15-min poll
+    telegram-plugin/model-unavailable.ts — quota-exhausted card on hit
+
+findings:
+  - claim_id: c1
+    quote: "The user can answer 'am I close to my limit?' without stopping what they're doing."
+    loc: L39-L40
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L13652-L13705
+        snippet: "bot.command('usage', async ctx => { ... await switchroomReply(ctx, formatQuotaBlock(result.data), { html: true }) })"
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L856-L942
+        snippet: "export async function probeQuota(...): Promise<ProbeResult> { ... detail: formatQuotaLine(probe.data) }"
+    evidence_strength: medium
+    action: escalate
+    confidence: medium
+    rationale: |
+      Quota is available as a pull surface (/usage command) and in the boot card
+      at restart time. There is no ambient ongoing display — no Telegram message
+      header, no periodic quota-update push, no inline indication during normal
+      use. The user must run /usage or look at the boot card from the last restart.
+      The JTBD stakes ("the user shouldn't need to run a command") are not met for
+      the normal in-session case. This is an outcome-not-realized finding, not a
+      doc edit.
+
+  - claim_id: c2
+    quote: "Approaching a cap produces a visible signal at a point where the user can still act on it."
+    loc: L41-L42
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/credits-watch.ts
+        lines: L38-L43
+        snippet: "const FATAL_REASONS = new Set(['out_of_credits', 'org_level_disabled', 'credits_exhausted', 'extra_usage_disabled'])"
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15986-L15998
+        snippet: "const CREDIT_WATCH_POLL_MS = Number(process.env.SWITCHROOM_CREDIT_WATCH_POLL_MS ?? 15 * 60_000) ... void runCreditWatch()"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      credits-watch (the only proactive push mechanism) fires only on fatal billing
+      transitions (out_of_credits, credits_exhausted, etc.). There is no threshold
+      (e.g. 80% or 90% utilization) that triggers a pre-cap warning. The code
+      explicitly limits notification to "fatal" reasons. A user hitting the wall
+      gets notified only when they are already blocked, not before.
+
+  - claim_id: c3
+    quote: "Hitting a cap produces an honest message. The user knows they're blocked, why, and when they won't be."
+    loc: L43-L44
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/model-unavailable.ts
+        lines: L1-L27
+        snippet: "When a user message hits Claude and the model is unreachable — quota exhausted ... the desired UX is a clean card naming what failed and pointing at the three actions..."
+      - path: telegram-plugin/credits-watch.ts
+        lines: L153-L163
+        snippet: "buildEntryMessage() includes console.anthropic.com link and cachedExtraUsageDisabledReason"
+      - path: telegram-plugin/quota-check.ts
+        lines: L216-L231
+        snippet: "formatResetRelative() returns 'resets in Xh Ym' countdown"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      model-unavailable.ts renders a structured card with reset timing pulled via
+      formatResetRelative(). credits-watch.ts messages include the specific reason
+      and a link to console.anthropic.com. formatQuotaBlock includes reset
+      countdowns for both windows. The cap-hit UX satisfies this claim.
+
+  - claim_id: c4
+    quote: "Usage shown matches reality closely enough that the user trusts it for planning."
+    loc: L45-L46
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/quota-cache.ts
+        lines: L31-L39
+        snippet: "export const DEFAULT_TTL_MS = 5 * 60 * 1000 // 5 min ... export const RATE_LIMIT_TTL_MS = 30 * 1000 // 30 s"
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L856-L942
+        snippet: "probeQuota hits /v1/messages and reads anthropic-ratelimit-unified-* headers"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Quota data comes from live Anthropic rate-limit headers (not computed locally),
+      cached for at most 5 minutes. The data source is the same headers the CLI's
+      /usage panel uses. 5-minute staleness is documented and acceptable for
+      planning purposes. The claim is broadly met.
+
+  - claim_id: c5
+    quote: "Different plans and different limits are handled correctly without the user configuring anything."
+    loc: L47-L48
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L120-L127
+        snippet: "function mapPlan(billingType?: string, hasExtra?: boolean): string { if (billingType === 'stripe_subscription') { return hasExtra ? 'Pro+' : 'Pro' } if (billingType.toLowerCase().includes('max')) return 'Max' }"
+      - path: telegram-plugin/quota-check.ts
+        lines: L112-L132
+        snippet: "parseQuotaHeaders reads 5h and 7d from anthropic-ratelimit-unified-* headers; server returns whichever windows apply to the plan"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Plan type is inferred from .claude.json's billingType field without user
+      configuration. Window data comes from the Anthropic API headers, which reflect
+      the actual plan limits on the server side. No manual plan-configuration step
+      is required.
+
+  - claim_id: c6
+    quote: "The signal scales with the stakes. Background when there's headroom, louder when there isn't."
+    loc: L49-L50
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/credits-watch.ts
+        lines: L38-L43
+        snippet: "FATAL_REASONS = new Set(['out_of_credits', 'org_level_disabled', 'credits_exhausted', 'extra_usage_disabled'])"
+      - path: telegram-plugin/gateway/boot-probes.ts
+        lines: L856-L942
+        snippet: "probeQuota returns ProbeResult with status 'ok' when quota is under limit; no degraded threshold for high utilization"
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The code has two signal levels: (a) quiet/absent when quota is fine and
+      (b) fatal notification when credits are exhausted. There is no middle tier —
+      no "approaching cap" (e.g. 80% utilization) that produces an intermediate
+      signal louder than background but before the wall. The boot-card quota probe
+      shows a row only when status is 'degraded' or 'fail'; high-utilization does
+      not produce degraded status. The graduated signal the JTBD describes is not
+      built.
+
+  - claim_id: c7
+    quote: "When the window rolls, the user sees the recovery without having to refresh anything."
+    loc: L51-L52
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15986-L15998
+        snippet: "CREDIT_WATCH_POLL_MS = 15 * 60_000 ... credits-watch fires only on fatal transitions; recovery path notifies only from fatal -> null"
+      - path: telegram-plugin/credits-watch.ts
+        lines: L116-L124
+        snippet: "Recovery path: last-notified was fatal, current is null/non-fatal. notifies 'credits restored'"
+    evidence_strength: medium
+    action: escalate
+    confidence: medium
+    rationale: |
+      credits-watch does notify on the fatal->healthy transition ("credits restored"),
+      so users who previously hit a full credit block do see recovery. However
+      "window rolls" in the JTBD context refers to the 5h or 7d rolling window
+      resetting during normal usage (not a full credit block) — e.g. a user who
+      was at 95% utilization and was nudged back to 0% when the 5h window rolled.
+      No code watches for this kind of recovery or pushes a notification. The
+      recovery path is pull-only (next /usage or next restart boot card).
+
+  - claim_id: c8
+    quote: "Switchroom deliberately has no programmatic surface: every model call is the interactive claude session ... So there is exactly one pool to track."
+    loc: L28-L35
+    verdict: aligned
+    evidence:
+      - path: src/auth/quota.ts
+        lines: L1-L20
+        snippet: "Hits POST /v1/messages with the Claude CLI's exact OAuth + header shape ... intentionally dependency-free: just fetch, no filesystem, no telegram, no broker"
+      - path: CLAUDE.md
+        lines: L37-L66
+        snippet: "Every agent runs the unmodified claude CLI ... No ANTHROPIC_API_KEY ... no Claude Agent SDK ... no raw Anthropic API"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      CLAUDE.md enforces the single-pool constraint as a hard engineering gate. The
+      quota probe uses the same OAuth + header path as the CLI. No SDK or API key
+      paths exist in the codebase. The JTBD's "one pool" claim accurately reflects
+      both the design intent and the implementation.

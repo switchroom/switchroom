@@ -1,0 +1,253 @@
+unit_id: rfc-docker-multi-container
+unit_path: reference/rfc-docker-multi-container.md
+category: rfc-draft
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The RFC body already contains a "Status — shipped in v0.7" section (L11-L24)
+  that explicitly states the design shipped. The body-level status is accurate
+  and the internal phase notes are largely accurate. However, the YAML frontmatter
+  still says `status: Draft` (L3), which is the root problem this unit was flagged
+  for. Several secondary claims in the body drift from the current codebase:
+  UID range shifted, image count grew, CLI verb changed, compose skeleton includes
+  an obsolete `version: "3.9"` field, gateway topology changed from MCP-child to
+  supervised sidecar, and the watchdog rewrite was officially deferred rather than
+  built. The scheduler section is already correctly annotated as retired.
+findings:
+  - claim_id: c1
+    quote: "status: Draft"
+    loc: L3
+    verdict: rfc-status-wrong
+    evidence:
+      - path: reference/rfc-docker-multi-container.md
+        lines: L11-L24
+        snippet: "## Status — shipped in v0.7\n\nThis RFC is **shipped**. v0.7.0 is\
+          \ the docker-only release: the legacy systemd path was removed..."
+      - path: src/agents/compose.ts
+        lines: L1-L24
+        snippet: "Docker Compose generator — Phase 1a. Turns the cascade-resolved\
+          \ switchroom.yaml into a deterministic docker-compose.yml."
+      - path: docker/Dockerfile.agent
+        lines: L1-L1
+        snippet: "Dockerfile.agent exists — confirms Docker agent image was built"
+    evidence_strength: strong
+    action: update-frontmatter
+    confidence: high
+    rationale: |
+      The RFC body explicitly says "This RFC is shipped" with version reference,
+      PR numbers, and phase statuses. src/agents/compose.ts is a fully implemented
+      compose generator. All Dockerfiles exist under docker/. The frontmatter
+      `status: Draft` is contradicted by the body itself and by the implementation.
+      Change frontmatter to `status: Shipped` (or `status: Historical` if the body
+      is being preserved purely as a design record).
+
+  - claim_id: c2
+    quote: "Four published GHCR images (`switchroom-base`, `switchroom-agent`, `switchroom-broker`, `switchroom-kernel`) — no `docker build` on the operator's host."
+    loc: L19-L21
+    verdict: drift-major
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L354-L356
+        snippet: "return `ghcr.io/switchroom/switchroom-${name}:${imageTag}`;"
+      - path: src/agents/compose.ts
+        lines: L786
+        snippet: "emitImageOrBuild(lines, \"broker\", imageTag, ...)"
+      - path: src/agents/compose.ts
+        lines: L1017
+        snippet: "emitImageOrBuild(lines, \"kernel\", imageTag, ...)"
+      - path: src/agents/compose.ts
+        lines: L1109
+        snippet: "emitImageOrBuild(lines, \"auth-broker\", imageTag, ...)"
+      - path: docker/Dockerfile.hostd
+        lines: L1-L1
+        snippet: "Dockerfile.hostd exists"
+      - path: docker/Dockerfile.auth-broker
+        lines: L1-L1
+        snippet: "Dockerfile.auth-broker exists"
+      - path: docker/Dockerfile.hindsight
+        lines: L1-L1
+        snippet: "Dockerfile.hindsight exists"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The compose generator calls emitImageOrBuild for broker, kernel, auth-broker,
+      and agent. Dockerfiles exist for agent, broker, kernel, auth-broker, hostd,
+      hindsight, and base — seven images, not four. The status block at L19-L21
+      should be updated to reflect the current image set.
+    proposed_replacement: |
+      Replace "Four published GHCR images (`switchroom-base`, `switchroom-agent`,
+      `switchroom-broker`, `switchroom-kernel`)" with "Seven published GHCR images
+      (`switchroom-base`, `switchroom-agent`, `switchroom-broker`, `switchroom-kernel`,
+      `switchroom-auth-broker`, `switchroom-hostd`, `switchroom-hindsight`)"
+
+  - claim_id: c3
+    quote: "Per-agent UIDs are allocated deterministically from the agent name at compose-generation time (e.g. `1100 + stable_hash(agent_name) % 800`, collision-checked across the fleet)."
+    loc: L172-L173
+    verdict: drift-major
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L36-L37
+        snippet: "export const AGENT_UID_MIN = 10001;\nexport const AGENT_UID_MAX\
+          \ = 10999;"
+      - path: src/agents/compose.ts
+        lines: L158-L186
+        snippet: "Allocate a deterministic UID for an agent in [AGENT_UID_MIN, AGENT_UID_MAX]."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The RFC body states UIDs start at 1100 (1100 + hash % 800), but the
+      implementation uses AGENT_UID_MIN=10001, AGENT_UID_MAX=10999. The range
+      and base value are completely different.
+    proposed_replacement: |
+      Replace "e.g. `1100 + stable_hash(agent_name) % 800`" with
+      "range 10001..10999 (`AGENT_UID_MIN`/`AGENT_UID_MAX` in `src/agents/compose.ts`)"
+
+  - claim_id: c4
+    quote: "user: \"1100:1100\"" and "user: \"1101:1101\"" and "user: \"1102:1102\""
+    loc: L166-L169
+    verdict: drift-major
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L36-L37
+        snippet: "export const AGENT_UID_MIN = 10001; export const AGENT_UID_MAX = 10999;"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The per-agent socket directory layout example uses UIDs 1100/1101/1102 which
+      are from the original design. Actual UIDs are in the 10001-10999 range.
+
+  - claim_id: c5
+    quote: "image: ghcr.io/switchroom/agent:0.7.0" and the compose skeleton showing `version: \"3.9\"`
+    loc: L263-L266
+    verdict: drift-major
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L767-L782
+        snippet: "lines.push(\"# generated by switchroom...\"); ... lines.push(`name:\
+          \ switchroom`); lines.push(\"\"); lines.push(`services:`);"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The compose skeleton in the RFC includes `version: "3.9"` which modern
+      Docker Compose (v2+) does not require or emit. The actual compose generator
+      does not emit a `version:` field — it starts directly with `name: switchroom`
+      then `services:`. Also the image tag example `0.7.0` is now stale (`:latest`
+      or a variable tag is used).
+
+  - claim_id: c6
+    quote: "`switchroom reconcile` regenerates this whole file from `switchroom.yaml`"
+    loc: L330
+    verdict: drift-minor
+    evidence:
+      - path: src/agents/compose.ts
+        lines: L767-L770
+        snippet: "lines.push(\"# generated by switchroom — do not edit by hand.\\\
+          n# Manual edits will be overwritten on the next `switchroom agent add`\\\
+          n# (or future `switchroom reconcile`). To customise an agent, edit\\\
+          n# switchroom.yaml and re-run the regenerating command.\");"
+      - path: src/cli/apply.ts
+        lines: L2-L2
+        snippet: "`switchroom apply` — reconcile fleet to switchroom.yaml."
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      The RFC body says "`switchroom reconcile` regenerates this whole file" but the
+      canonical verb is `switchroom apply` (src/cli/apply.ts). The compose generator
+      itself mentions `switchroom reconcile` in its header comment as a future alias,
+      but the actual CLI verb operators use is `switchroom apply`. Minor wording drift.
+    proposed_replacement: |
+      Replace "`switchroom reconcile` regenerates this whole file" with
+      "`switchroom apply` regenerates this whole file"
+
+  - claim_id: c7
+    quote: "The actual shape [...]: tini (PID 1) / tmux (daemonised) / start.sh / claude --continue / MCP child: telegram gateway (telegram-plugin/server.ts)"
+    loc: L141-L149
+    verdict: drift-major
+    evidence:
+      - path: profiles/_base/start.sh.hbs
+        lines: L4-L19
+        snippet: "Under v0.7 docker the container's CMD is start.sh directly under\
+          \ tini [...] the gateway daemon AND autoaccept-poll as supervised sidecars"
+      - path: profiles/_base/start.sh.hbs
+        lines: L104-L108
+        snippet: "_switchroom_supervise gateway /var/log/switchroom/gateway-supervisor.log\
+          \ bun \"$_gateway_bundle\" &"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The RFC process tree shows the telegram gateway as an MCP child of claude (under
+      claude --continue). The actual implementation has the gateway as a supervised
+      sidecar sibling launched before tmux/claude in start.sh, not as an MCP child.
+      CLAUDE.md confirms: "tini → start.sh → (forks gateway + autoaccept-poll +
+      agent-scheduler, then re-execs into tmux)". This is a meaningful architectural
+      difference documented correctly in CLAUDE.md but wrong in this RFC body.
+    proposed_replacement: |
+      Update the process tree to:
+        tini (PID 1) -> start.sh -> (forks gateway sidecar + autoaccept-poll + agent-scheduler) -> exec tmux -> bash -> claude --continue
+
+  - claim_id: c8
+    quote: "Phase 3 — watchdog port [...] Files: `src/watchdog/` from scratch, fixture suite"
+    loc: L494-L535
+    verdict: aligned
+    evidence:
+      - path: reference/rfc-docker-multi-container.md
+        lines: L496-L497
+        snippet: "> **Status (post-v0.6):** DEFERRED / REMOVED in PR #825 — see\
+          \ Status block at top."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The watchdog rewrite section is correctly marked DEFERRED / REMOVED in PR #825.
+      Neither bin/bridge-watchdog.sh (retired per CLAUDE.md status block L13-L14)
+      nor src/watchdog/ (directory does not exist) is present. The RFC correctly
+      notes the phase was dropped; compose healthchecks + restart: unless-stopped
+      replaced the watchdog. No action needed.
+
+  - claim_id: c9
+    quote: "Scheduler architecture [...] singleton scheduler container reading the cascade and dispatching via `docker exec`"
+    loc: L336-L344
+    verdict: aligned
+    evidence:
+      - path: reference/rfc-docker-multi-container.md
+        lines: L336-L344
+        snippet: "> **Retired in PR #893 (Phase 4 cron-fold-in).** The singleton\
+          \ `switchroom-cron` / `switchroom-scheduler` container described below\
+          \ was removed..."
+      - path: src/agents/compose.ts
+        lines: L1094-L1097
+        snippet: "// The singleton switchroom-cron service was removed in Phase 4"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The RFC already has the correct retired annotation. The compose generator
+      confirms at L1094 that the singleton cron service was removed. No action needed.
+
+  - claim_id: c10
+    quote: "Per-agent socket directories [...] klanker/sock mode 0700, owned by uid:gid 1100:1100"
+    loc: L162-L170
+    verdict: drift-major
+    evidence:
+      - path: src/vault/broker/peercred.ts
+        lines: L143
+        snippet: "export function socketPathToAgent(socketPath: string): string | null {"
+      - path: src/agents/compose.ts
+        lines: L36-L37
+        snippet: "export const AGENT_UID_MIN = 10001; export const AGENT_UID_MAX = 10999;"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The `socketPathToAgent()` helper exists as specified, confirming the path-as-identity
+      design shipped. However the example UIDs (1100:1100, 1101:1101) are from the original
+      design and conflict with the actual 10001-10999 range. The socket directory layout
+      concept is correct; only the example UIDs need updating.
+    proposed_replacement: |
+      Replace uid:gid examples 1100:1100 / 1101:1101 / 1102:1102 with
+      the 10001-10999 range, e.g. "uid:gid 10001:10001 (deterministic hash of agent name)"

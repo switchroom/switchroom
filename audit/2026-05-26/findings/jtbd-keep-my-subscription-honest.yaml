@@ -1,0 +1,240 @@
+unit_id: jtbd-keep-my-subscription-honest
+unit_path: reference/keep-my-subscription-honest.md
+category: jtbd
+audited_at: 2026-05-26T10:00:00Z
+auditor_notes: |
+  The JTBD is tightly aligned with the codebase as of the current HEAD. The two
+  historical violations (handoff-summarizer and webhook-dispatch claude -p spawns)
+  were both removed by RFC #1620 workstreams A and B. A CI guard
+  (tests/bridge-flap-regression-guard.test.ts) enforces zero headless-claude
+  spawns going forward. One outstanding known gap: src/host-control/server.ts
+  contains a `claude -p ok` string in the deep-smoke probe (KNOWN_TEMPLATE_GAPS
+  entry referencing #1798 follow-up). The JTBD makes no mention of the OpenAI
+  Whisper voice-transcription feature, which is an opt-in third-party API surface
+  that the Anti-patterns section's "you also need an API key for feature X" item
+  arguably covers. That surface is opt-in and clearly documented in config schema,
+  but the JTBD's own anti-pattern wording and the "No-key refusal" UAT prompt
+  could be read as forbidding it. A minor wording gap, not a product defect.
+  The compliance-attestation.md is well-aligned but references are from April 25,
+  2026 — policy documents should be re-checked periodically.
+findings:
+  - claim_id: c1
+    quote: "every model call is the interactive `claude` session. Cron fires,
+      webhook triggers, and session handoffs are all delivered into that one
+      session as synthesized turns — never a headless `claude -p`, never the
+      SDK, never the raw API."
+    loc: L34-L36
+    verdict: aligned
+    evidence:
+      - path: src/web/webhook-dispatch.ts
+        lines: L17-L24
+        snippet: |
+          "Delivery (since #1620): a match synthesizes an InboundMessage tagged
+          meta.source="webhook" and delivers it via inject_inbound to the agent's
+          gateway socket — the same path cron uses. The webhook turn runs inside
+          the agent's live interactive `claude` session. No `claude -p`"
+      - path: src/agents/handoff-summarizer.ts
+        lines: L16-L25
+        snippet: |
+          "No `claude -p`. Earlier releases shelled out to a headless `claude -p`
+          here to LLM-summarize the transcript. Under Anthropic's 2026-06-15
+          policy a headless `claude -p` is *programmatic* usage ... RFC #1620
+          Workstream B replaced the per-turn summarizer with a pure transcript-
+          extraction helper."
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L20-L46
+        snippet: |
+          "Post-#1620 the codebase has zero headless-`claude` spawners, so we
+          cannot assert 'a spawner exists'... KNOWN_GAPS: {} (currently empty)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      RFC #1620 workstreams A and B shipped (#1625, #1626). Both former callsites
+      (webhook-dispatch spawnAgentOneShot and handoff-summarizer claude -p) are
+      confirmed removed. CI guard in tests/bridge-flap-regression-guard.test.ts
+      enforces the zero-spawner invariant with KNOWN_GAPS empty. JTBD claim
+      is accurate.
+
+  - claim_id: c2
+    quote: "(RFC #1620 removed the last `claude -p`; a CI guard keeps it at zero.
+      The constraint is stated in `reference/vision.md` pillar 3 and enforced as
+      an engineering gate in `CLAUDE.md`.)"
+    loc: L37-L39
+    verdict: aligned
+    evidence:
+      - path: docs/rfcs/eliminate-claude-p.md
+        lines: L1-L6
+        snippet: |
+          "Status: accepted — 2026-05-21 (Workstream A shipped in #1625;
+          Workstream B in #1626)."
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L171-L179
+        snippet: |
+          "KNOWN_TEMPLATE_GAPS: { 'src/host-control/server.ts': '#1798' } — The
+          'deep' doctor auth-live smoke runs `claude -p ok` as a quota-costing
+          check... Opt-in, off by default."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      RFC #1620 status matches the claim. The CI guard exists and is confirmed
+      active. One known gap (src/host-control/server.ts deep smoke) is explicitly
+      tracked under #1798 in the KNOWN_TEMPLATE_GAPS allowlist, so the "kept at
+      zero untracked" invariant holds. The claim is accurate as stated.
+
+  - claim_id: c3
+    quote: "No hidden API billing, no side-door tokens, no asks for extra keys."
+    loc: L3 (frontmatter outcome)
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/voice-transcribe.ts
+        lines: L1-L19
+        snippet: |
+          "Voice-message transcription via OpenAI Whisper (#578 spike)...
+          Pure helper module — runs the API call but takes API key + audio bytes
+          as args."
+      - path: src/config/schema.ts
+        lines: L584-L591
+        snippet: |
+          "Inbound voice-message transcription (#578). When enabled, voice/audio
+          messages from allowlisted users are downloaded, transcribed via the
+          configured provider... API key read from ~/.switchroom/openai-api-key
+          (mode 0600). Off by default — opt-in per agent."
+      - path: src/cli/telegram.ts
+        lines: L158-L164
+        snippet: |
+          "Enable voice-message transcription via OpenAI Whisper. Vault-stores
+          the API key under 'openai/api-key'... --api-key <key>, 'OpenAI API
+          key (sk-...). Stored in the vault, never written to switchroom.yaml.'"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      The OpenAI Whisper voice-transcription feature (#578) is an opt-in third-
+      party API surface requiring an OpenAI API key. It does not affect Anthropic
+      subscription billing, but the "no asks for extra keys" framing in the
+      outcome and the Anti-patterns item ("Asking the user for an API key as
+      'optional' when core features need it") create a tension. Voice
+      transcription is explicitly opt-in and not a "core feature" of the
+      subscription-honest claim, but the JTBD's current wording doesn't carve
+      out this opt-in third-party-service-key pattern. Suggest the frontmatter
+      outcome add a qualifier such as "No hidden API billing, no side-door tokens,
+      no Anthropic API keys — opt-in third-party service keys (e.g. OpenAI
+      Whisper) are stored in the vault and clearly opt-in."
+
+  - claim_id: c4
+    quote: "When the user hits a plan limit, the product says so honestly. It
+      doesn't silently spend elsewhere."
+    loc: L51-L52
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/operator-events.ts
+        lines: L276-L283
+        snippet: |
+          "All account slots are at the usage limit. Switchroom will auto-fallback
+          when another slot is available."
+      - path: telegram-plugin/auto-fallback-fleet.ts
+        lines: L1-L35
+        snippet: |
+          "Fleet-wide auto-fallback (RFC H)... 1. Probe live quota for every
+          account in parallel via the broker... 2. Skip blocked accounts entirely;
+          pick the lowest-utilization healthy candidate. 3. Call client.setActive
+          — same broker verb /auth use uses."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      When a quota limit is hit, the product surfaces a clear user-facing message
+      and switches to another subscriber account slot (if configured). There is no
+      silent billing fallback to API-key usage. The auto-fallback stays within the
+      subscription-slot pool and reports the switch to the user. Behavior matches
+      the claim.
+
+  - claim_id: c5
+    quote: "The compliance posture is documented and the documentation matches
+      the runtime behaviour. A user auditing the product doesn't find surprises."
+    loc: L53-L55
+    verdict: drift-minor
+    evidence:
+      - path: docs/compliance-attestation.md
+        lines: L7-L8
+        snippet: |
+          "Attestation date: 2026-04-25T00:00:00Z (revised; supersedes 2026-04-13).
+          Reviewed against: Anthropic's published documentation and policies as
+          of April 25, 2026"
+      - path: docs/compliance-attestation.md
+        lines: L32-L35
+        snippet: |
+          "Switchroom does not: Intercept, proxy, or modify Claude's inference
+          requests or responses ... Use the Anthropic Agent SDK or direct API
+          access"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      The compliance-attestation.md is dated April 25, 2026. The 2026-06-15
+      Anthropic policy split (interactive vs. programmatic) is described in
+      CLAUDE.md and reference/vision.md but is NOT reflected in
+      docs/compliance-attestation.md, which predates the policy change and makes
+      no mention of the interactive/programmatic split or the RFC #1620 work.
+      A user auditing compliance today would find the attestation document silent
+      on the most current policy distinction. Recommend updating
+      docs/compliance-attestation.md to reference the 2026-06-15 policy,
+      the interactive-vs-programmatic split, and RFC #1620's elimination of all
+      claude -p callsites. The JTBD claim is otherwise accurate — behavior does
+      match documented intent — but the attestation doc itself lags.
+
+  - claim_id: c6
+    quote: "There's no second billing surface the user didn't ask for."
+    loc: L47-L48
+    verdict: aligned
+    evidence:
+      - path: src/host-control/server.ts
+        lines: L1574-L1578
+        snippet: |
+          "if (req.args.deep) { PROBES.push({ name: 'auth_live', cmd: 'timeout 25
+          claude -p ok >/dev/null 2>&1' }); }"
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L171-L179
+        snippet: |
+          "KNOWN_TEMPLATE_GAPS: { 'src/host-control/server.ts': '#1798' } — The
+          'deep' doctor auth-live smoke runs `claude -p ok` as a quota-costing
+          check that the agent's OAuth is live. Opt-in, off by default."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The one remaining `claude -p` callsite (deep auth smoke in
+      src/host-control/server.ts) is explicitly opt-in (requires deep=true),
+      off by default, explicitly tracked as a known compliance gap under issue
+      #1798, and produces no user-visible billing surface — it's a diagnostic
+      tool. The claim "no second billing surface the user didn't ask for" holds
+      because the default doctor/smoke path makes no model call. The #1798
+      follow-up (migrating to token-introspect via auth-broker) would close the
+      last tracked gap entirely.
+
+  - claim_id: c7
+    quote: "A headless `claude -p` or an Agent SDK call anywhere in a code path.
+      Since 2026-06-15 both are *programmatic* usage — they draw the separate
+      Agent-SDK credit, not the subscription."
+    loc: L64-L67
+    verdict: aligned
+    evidence:
+      - path: tests/bridge-flap-regression-guard.test.ts
+        lines: L46-L46
+        snippet: "const KNOWN_GAPS: Record<string, string> = {};"
+      - path: src/auth/broker/server.ts
+        lines: L1-L20
+        snippet: |
+          "switchroom-auth-broker server — sole writer of per-agent
+          .claude/.credentials.json and canonical owner of the OAuth refresh loop
+          for every Anthropic account on the host (RFC H)."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      No Anthropic SDK imports exist in src/ or telegram-plugin/ source. The auth
+      broker manages OAuth tokens for the native claude CLI, not SDK credentials.
+      The KNOWN_GAPS allowlist is empty for the spawn-callsite scan. The anti-
+      pattern description is accurate and matches the engineering constraint.

@@ -1,0 +1,404 @@
+unit_id: jtbd-give-each-agent-its-own-workspace
+unit_path: reference/give-each-agent-its-own-workspace.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The implementation infrastructure (ensureBareClone, ensureAgentWorktree,
+  removeAgentWorktree in src/repos/) is complete and correct as standalone
+  code. The YAML schema for the repos: field is also defined (schema.ts:1592).
+  However, neither ensureBareClone nor ensureAgentWorktree is called anywhere
+  in the production lifecycle paths: scaffoldAgent and reconcileAgent in
+  src/agents/scaffold.ts both import these functions but never invoke them.
+  removeAgentWorktree is imported but also never called. The agent destroy path
+  (src/cli/agent.ts) does not call it either.
+
+  The env-var injection (buildRepoEnvVars, scaffold.ts:1135) is wired and does
+  run during both scaffold and reconcile — it computes the correct paths — but
+  since the worktrees are never provisioned, the exported env vars point to
+  non-existent directories.
+
+  This means every "Signs it's working" scenario in the JTBD describes behavior
+  that does not currently happen. The JTBD reads as a shipped feature; it is
+  a forward-looking design doc with partial implementation wired up but never
+  connected to the lifecycle.
+
+  The "dirty-tree: leave alone, warn" behavior is implemented inside
+  ensureAgentWorktree but is never exercised because the function is never
+  called. The boot-card surface does not have a "dirty since <ts>" row.
+
+  One referenced doc (docs/sub-agents.md) exists. The three other "See also"
+  cross-references (run-a-fleet-of-specialists.md, extend-without-forking.md,
+  survive-reboots-and-real-life.md) were not verified in this audit but are
+  outside scope for this unit.
+
+findings:
+  - claim_id: c1
+    quote: "Adding a switchroom agent that works on a repo automatically gives that
+      agent its own worktree. The user doesn't run `git worktree add`. They don't
+      pick a path. They don't pick a branch."
+    loc: L30-L32
+    verdict: outcome-not-realized
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L246-L253
+        snippet: |
+          import { ensureBareClone, bareClonePath } from "../repos/bare-clone.js";
+          import {
+            ensureAgentWorktree,
+            removeAgentWorktree,
+            ...
+          } from "../repos/agent-worktree.js";
+      - path: src/agents/scaffold.ts
+        lines: L2042-L2983
+        snippet: |
+          export function scaffoldAgent(...) {
+            // ... 900+ lines of scaffold logic ...
+            // ensureAgentWorktree / ensureBareClone are never called
+          }
+      - path: src/agents/scaffold.ts
+        lines: L3640-L4576
+        snippet: |
+          export function reconcileAgent(...) {
+            // ... 900+ lines of reconcile logic ...
+            // ensureAgentWorktree / ensureBareClone are never called
+          }
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      ensureAgentWorktree and ensureBareClone are imported in scaffold.ts but
+      never called in scaffoldAgent or reconcileAgent. The automatic worktree
+      provisioning on agent restart/reconcile that the JTBD describes does not
+      happen. The repos: schema field exists (schema.ts:1592) and the env-var
+      computation runs (buildRepoEnvVars, scaffold.ts:1135), but actual worktree
+      creation is a dead code path. This is a missing feature, not a doc drift.
+
+  - claim_id: c2
+    quote: "Two agents run `bun run build` in the same repo at the same time. Both
+      succeed. Neither's `dist/` clobbers the other's."
+    loc: L33-L34
+    verdict: outcome-not-realized
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L147-L193
+        snippet: |
+          export async function ensureAgentWorktree(...): Promise<WorktreeState> {
+            const worktreePath = agentWorktreePath(agentDir, slug);
+            // Creates <agentDir>/work/<slug>/ as a dedicated worktree
+          }
+    evidence_strength: medium
+    action: escalate
+    confidence: high
+    rationale: |
+      The isolation mechanism (separate worktrees per agent per repo) is
+      implemented in ensureAgentWorktree but the function is never called from
+      the production lifecycle. Without provisioning, two agents would share
+      whatever working tree they have access to — exactly the failure mode the
+      JTBD exists to prevent.
+
+  - claim_id: c3
+    quote: "After a host reboot, each agent comes back to the worktree it left.
+      Uncommitted in-flight work is preserved, not stashed-and-lost."
+    loc: L37-L38
+    verdict: outcome-not-realized
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L196-L208
+        snippet: |
+          if (isWorktreeDirty(worktreePath)) {
+            const sha = headShortSha(worktreePath);
+            process.stderr.write(
+              `[switchroom] repo "${slug}": dirty ... skipping ff-to-main\n`
+            );
+            return { path: ..., branch, dirty: true, dirtyCommit: sha };
+          }
+    evidence_strength: medium
+    action: escalate
+    confidence: high
+    rationale: |
+      The dirty-tree preservation logic exists in ensureAgentWorktree but the
+      function is never called. On reboot, no worktree provisioning or
+      fast-forward step runs, so there is no mechanism that could either
+      preserve or destroy an agent's in-flight work. The promise cannot be
+      verified either way.
+
+  - claim_id: c4
+    quote: "Removing an agent removes its worktrees. The repo's `.git/worktrees/`
+      doesn't accumulate orphans."
+    loc: L39-L40
+    verdict: outcome-not-realized
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L1971-L1977
+        snippet: |
+          if (existsSync(agentDir)) {
+            rmSync(agentDir, { recursive: true, force: true });
+          }
+      - path: src/repos/agent-worktree.ts
+        lines: L250-L305
+        snippet: |
+          export async function removeAgentWorktree(...): Promise<void> {
+            // git worktree remove --force <path>
+            // git branch -D agent/<agentName>/main
+            // git worktree prune
+          }
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The agent destroy command (src/cli/agent.ts:1971) rmSyncs the agentDir but
+      does not call removeAgentWorktree. The function exists in
+      src/repos/agent-worktree.ts but is not imported or called from the destroy
+      path. Orphan .git/worktrees/ entries and per-agent branches would accumulate
+      if worktrees had been provisioned (they are not currently provisioned, but
+      the removal gap is real for any future integration).
+
+  - claim_id: c5
+    quote: "Worktrees are provisioned lazily — on the first `agent restart`/`reconcile`
+      that runs after the repo appears in the agent's manifest, not on every session
+      start."
+    loc: L91-L92
+    verdict: vision-only
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L246-L253
+        snippet: "ensureBareClone and ensureAgentWorktree imported but not called in reconcileAgent"
+    evidence_strength: none
+    action: mark-vision
+    confidence: high
+    rationale: |
+      The lazy provisioning contract is a design decision described accurately
+      in the Decisions section. The code to implement it exists (ensureBareClone
+      + ensureAgentWorktree) and is even imported in scaffold.ts, but the wiring
+      into the reconcile path is absent. This claim should be marked as not-yet-built.
+
+  - claim_id: c6
+    quote: "Per-agent long-lived branch. `agent/<agent-name>/main`, where `<agent-name>`
+      is the agent's id from `switchroom.yaml`."
+    loc: L93-L95
+    verdict: aligned
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L43-L45
+        snippet: |
+          export function agentBranchName(agentName: string): string {
+            return `agent/${agentName}/main`;
+          }
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The branch naming convention is correctly implemented in code.
+      The function is not yet called from production paths, but the convention
+      itself is accurate.
+
+  - claim_id: c7
+    quote: "Discovery via env. `SWITCHROOM_REPO_<NAME_UPPER>=<absolute path>` in the
+      agent's environment."
+    loc: L101-L102
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L1134-L1148
+        snippet: |
+          function buildRepoEnvVars(...): Record<string, string> {
+            const repos = agent.repos;
+            if (!repos) return {};
+            for (const slug of Object.keys(repos)) {
+              const envName = `SWITCHROOM_REPO_${slug.toUpperCase().replace(/-/g, "_")}`;
+              out[envName] = agentWorktreePath(agentDir, slug);
+            }
+          }
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The env-var injection is wired into buildRepoEnvVars and called from both
+      buildWorkspaceContext paths (scaffold and reconcile). The naming convention
+      matches the JTBD exactly. However, the paths injected point to worktrees
+      that are not provisioned, so the env var would reference a non-existent
+      directory at runtime. The claim is structurally aligned but operationally
+      hollow until worktree provisioning is wired up.
+
+  - claim_id: c8
+    quote: "Dirty-tree policy: leave alone, warn. If the worktree has uncommitted
+      changes at session start, the ff-to-main step is skipped. The session resumes
+      on whatever branch the worktree was on. The boot card surfaces
+      \"<repo>: dirty since <ts>\" as a one-line warning."
+    loc: L104-L107
+    verdict: drift-major
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L196-L208
+        snippet: |
+          if (isWorktreeDirty(worktreePath)) {
+            process.stderr.write(`[switchroom] repo "${slug}": dirty ... skipping ff-to-main\n`);
+            return { path: ..., branch, dirty: true, dirtyCommit: sha };
+          }
+    evidence_strength: weak
+    action: update-text
+    confidence: medium
+    rationale: |
+      The dirty-detection and ff-skip logic is implemented in ensureAgentWorktree,
+      and it returns dirty:true with a dirtyCommit field. However, the function is
+      never called (see c1), so the dirty-tree policy never executes. More
+      importantly, the JTBD claims the boot card surfaces a "dirty since <ts>"
+      warning — there is no such line in boot-card.ts or the ProbeResult type;
+      the dirty state is only logged to stderr inside agent-worktree.ts. The boot
+      card claim is inaccurate for what is currently coded even if the function
+      were wired up. Suggested correction: change "The boot card surfaces" to
+      "The reconcile log emits a one-line warning" to match the stderr.write in
+      agent-worktree.ts:200. The larger problem (function not called) is covered
+      by c1 escalation.
+
+  - claim_id: c9
+    quote: "Removal is symmetric. `switchroom agent remove <name>` calls
+      `git worktree remove` for each of the agent's worktrees, then prunes the
+      per-agent branches."
+    loc: L109-L110
+    verdict: drift-major
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L1931-L1981
+        snippet: |
+          agent.command("destroy <name>")
+          // ... only rmSync(agentDir) + stopAgent(name)
+          // removeAgentWorktree not called
+      - path: src/repos/agent-worktree.ts
+        lines: L250-L305
+        snippet: |
+          export async function removeAgentWorktree(...): Promise<void> {
+            // full implementation: git worktree remove + git branch -D + git worktree prune
+          }
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The JTBD calls the command "switchroom agent remove <name>" but the command
+      is actually "switchroom agent destroy <name>". More critically, the destroy
+      command does not call removeAgentWorktree. The function exists and is
+      complete, but it is not imported or called from the CLI destroy path. The
+      bare clone's .git/worktrees/ would accumulate stale entries if worktrees
+      were provisioned. Both the command name discrepancy and the missing call
+      are gaps.
+
+  - claim_id: c10
+    quote: "Lifecycle is part of `agent restart`. Worktree provisioning,
+      ff-when-clean, and stale-branch cleanup happen as part of the
+      `restart = reconcile + restart` contract."
+    loc: L119-L121
+    verdict: vision-only
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L3640-L4576
+        snippet: "reconcileAgent contains no calls to ensureBareClone or ensureAgentWorktree"
+    evidence_strength: strong
+    action: mark-vision
+    confidence: high
+    rationale: |
+      The design decision is precisely documented but not implemented. reconcileAgent
+      does not call ensureBareClone or ensureAgentWorktree at any point in its
+      approximately 940-line body. The lifecycle integration described is the
+      intended design, not the current shipped behavior.
+
+  - claim_id: c11
+    quote: "One worktree per agent x repo. Stable path (`<agent_dir>/work/<repo_slug>/`,
+      where `<agent_dir>` is the agent's switchroom directory and `<repo_slug>` is
+      the kebab-case repo name)."
+    loc: L85-L90
+    verdict: aligned
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L51-L53
+        snippet: |
+          export function agentWorktreePath(agentDir: string, slug: string): string {
+            return join(agentDir, "work", slug);
+          }
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The path convention matches the JTBD exactly. The function is called from
+      buildRepoEnvVars so the env var computation uses the correct path formula.
+
+  - claim_id: c12
+    quote: "The bare/canonical clone lives once per host at
+      `~/.switchroom/repos/<repo_slug>.git` (shared across agents)."
+    loc: L88-L89
+    verdict: aligned
+    evidence:
+      - path: src/repos/bare-clone.ts
+        lines: L22-L24
+        snippet: |
+          export function bareClonePath(slug: string): string {
+            return resolveStatePath(`repos/${slug}.git`);
+          }
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The bare clone path convention matches the JTBD exactly. The function
+      is implemented correctly. It is never called from production paths but
+      the convention documented is what the code would use.
+
+  - claim_id: c13
+    quote: "Sub-agents already get their own worktree per task — that's been the
+      pattern since the worker dispatch story shipped."
+    loc: L23-L24
+    verdict: aligned
+    evidence:
+      - path: docs/sub-agents.md
+        lines: L1-L1
+        snippet: "file exists"
+      - path: src/worktree/claim.ts
+        lines: L1-L1
+        snippet: "file exists (sub-agent worktree claim system)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The sub-agent worktree system (src/worktree/) exists as a separate
+      implementation from the per-main-agent repos: system. The claim that
+      sub-agents already have their own worktree per task is plausible given
+      the worktree/ directory structure, but the mechanism is separate from the
+      repos: system being audited. Confidence medium because full verification
+      of the sub-agent worktree path was not in scope.
+
+  - claim_id: c14
+    quote: "Repos declared in `switchroom.yaml`. An agent's manifest lists the repos
+      it operates on. Worktrees are provisioned only for those. No surprise clones."
+    loc: L97-L99
+    verdict: aligned
+    evidence:
+      - path: src/config/schema.ts
+        lines: L1592-L1623
+        snippet: |
+          repos: z.record(
+            z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
+            z.object({ url: z.string().min(1), branch_default: z.string().optional() })
+          ).optional().describe("Repos this agent operates on...")
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The repos: field in switchroom.yaml is correctly schema-defined, kebab-case
+      slug-keyed, and gated with .optional() so agents without repos: are unaffected.
+      The "no surprise clones" guarantee follows from the opt-in schema design.
+
+  - claim_id: c15
+    quote: "`node_modules` is per-worktree. Bun's content-addressed store makes the
+      disk cost tolerable. Build artifacts are also per-worktree. Don't try to share."
+    loc: L115-L117
+    verdict: vision-only
+    evidence:
+      - path: src/repos/agent-worktree.ts
+        lines: L1-L16
+        snippet: "No node_modules-specific logic in worktree module"
+    evidence_strength: none
+    action: mark-vision
+    confidence: low
+    rationale: |
+      Since worktrees are not currently provisioned, no node_modules isolation
+      is enforced. The claim is a design decision about what the feature will do
+      when built, not a description of current behavior. No code enforces or
+      prevents node_modules sharing between worktrees.

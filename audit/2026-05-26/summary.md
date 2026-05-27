@@ -1,96 +1,82 @@
-# Drift-Audit Summary — 2026-05-26
+# Drift audit -- run pilot-2026-05-26
 
-**Scope:** pilot — 23 units across `reference/` (3 contract, 14 JTBD, 1 artefact-current,
-1 rfc-shipped, 1 rfc-draft, 1 archived, 2 historical)
-**Total findings:** 306 across 23 units
-**Run date:** 2026-05-26
+**Date:** 2026-05-26
+**Scope:** pilot -- 23 units in `reference/` (3 contract, 14 jtbd, 1 artefact-current, 1 rfc-shipped, 1 rfc-draft, 1 archived, 2 historical)
+**Triage date:** 2026-05-27
+**Total findings:** 193 claims across 23 units
 
----
-
-## Verdict distribution (all units)
+## Verdict distribution
 
 | Verdict | Count |
 |---|---|
-| aligned | ~167 |
-| drift-minor | ~46 |
-| drift-major | ~35 |
-| contract-example-stale | 7 |
-| jtbd-stale-example | 10 |
-| outcome-not-realized | 5 |
+| aligned | 113 |
+| drift-minor | 24 |
+| drift-major | 22 |
+| outcome-not-realized | 17 |
 | code-violates-contract | 1 |
-| rfc-status-wrong | 1 |
-| dead-pointer | 5 |
-| disclaimer-stale | 1 |
-| archive-leaks | 4 |
-| vision-only | 11 |
+| contract-example-stale | 6 |
 | jtbd-too-technical | 1 |
+| jtbd-stale-example | 4 |
+| dead-pointer | 7 |
+| archive-leaks | 4 |
+| rfc-status-wrong | 1 |
+| vision-only | 5 |
 
----
+Fix-eligible (drift-minor + drift-major + stale examples + dead-pointer + rfc-status-wrong + archive-leaks): 69 findings -> 10 fix batches
+Escalated (outcome-not-realized + code-violates-contract): 18 escalations + 2 low-confidence flags
 
 ## By category
 
-**contract** (3 units, ~33 findings)
-- `contract-vision`: 11 findings — 10 aligned, 1 code-violates-contract (escalated)
-- `contract-principles`: 14 findings — 4 aligned, 7 contract-example-stale (all update-text), 3 aligned
-- `contract-reference-readme`: 8 findings — 2 aligned, 4 drift-minor/major (update-text), 2 drift-major
+| Category | Units | Total claims | aligned | drift | escalated |
+|---|---|---|---|---|---|
+| contract | 3 | 33 | 21 | 11 | 1 |
+| jtbd | 14 | 134 | 86 | 28 | 20 |
+| artefact-current | 1 | 12 | 10 | 2 | 0 |
+| rfc-shipped | 1 | 12 | 4 | 6 | 0 |
+| rfc-draft | 1 | 10 | 3 | 7 | 0 |
+| archived | 1 | 4 | 3 | 1 | 0 |
+| historical | 2 | 8 | 4 | 2 | 0 |
 
-**jtbd** (14 units, ~195 findings)
-- Roughly 120 aligned; ~40 drift-minor; ~20 drift-major/stale-example; 5 outcome-not-realized; 11 vision-only
+## Top-5 hotspots by non-aligned finding count
 
-**artefact-current** (1 unit, 17 findings)
-- 12 aligned, 4 drift-minor (update-text), 1 drift-minor (PostHog KPI gap)
+1. **jtbd-restart-and-know-what-im-running** (7 non-aligned). 6 outcome-not-realized + 1 drift-minor. PR #142 moved model/tools/skills/memory visibility off the proactive boot card and onto the on-demand `/status` command. The JTBD says "no need to ask" but every config-visibility UAT scenario requires the user to ask.
 
-**rfc-shipped** (1 unit, 12 findings)
-- 4 aligned, 2 drift-minor, 4 drift-major/dead-pointer, 1 low-confidence escalated
+2. **rfc-docker-multi-container** (7 non-aligned). 1 rfc-status-wrong + 6 drift-major. Frontmatter says Draft while the body says shipped (v0.7). Body has stale UIDs (1100-range vs actual 10001-10999), image count (4 vs 7), CLI verb (`reconcile` vs `apply`), process topology (MCP-child vs supervised sidecar), and compose skeleton (`version: "3.9"` vs current output).
 
-**rfc-draft** (1 unit, 14 findings)
-- 5 aligned, 4 drift-minor, 2 drift-major, 1 rfc-status-wrong, 1 dead-pointer, 1 drift-minor
+3. **rfc-sub-agent-visibility** (7 non-aligned). 5 dead-pointer + 1 drift-major + 1 drift-minor. The progress-card-driver.ts was deleted in PR #1122; `progressDriver` is permanently null in gateway.ts. All five ACs describe a deleted mechanism.
 
-**archived** (1 unit, 6 findings)
-- 5 aligned, 1 archive-leaks (fix in `telegram-plugin/uat/assertions.ts`)
+4. **jtbd-give-each-agent-its-own-workspace** (7 non-aligned). 4 outcome-not-realized + 2 drift-major + 1 vision-only. `ensureAgentWorktree` and `ensureBareClone` are imported in scaffold.ts but never called from production lifecycle paths. Every "Signs it's working" scenario describes behavior that cannot happen at runtime.
 
-**historical** (2 units, 17 findings)
-- `historical-prd`: 9 non-aligned (disclaimer-stale, drift-major x5, dead-pointer x2, drift-minor)
-- `historical-onboarding-gap-analysis`: 3 archive-leaks in external referrers (`reference/README.md`, `docs/workspace-files.md`)
-
----
-
-## Top-5 hotspots (most non-aligned findings)
-
-1. **historical-prd** — 9 non-aligned. Plugin default inverted, deployment model inverted, npm package name wrong, `switchroom systemd` verbs unreachable, `template:` → `extends:` rename, `switchroom init --docker` never built.
-2. **rfc-sub-agent-visibility** — 8 non-aligned. `two-zone-card.ts` never created, line numbers dead (file is 1222 lines not 1921+), `hasLiveBackground` replaced by `hasInFlightSubAgents`, fleet cap `cap()` defined but never called by renderer.
-3. **rfc-docker-multi-container** — 8 non-aligned. Frontmatter says Draft when body says shipped v0.7; UID range changed 1100-1899 → 10001-10999; GHCR image count 4 → 7; `switchroom reconcile` → `apply`; `version: "3.9"` removed.
-4. **contract-principles** — 7 contract-example-stale. `auth login` removed (RFC H); three-step upgrade → `switchroom update`; `executive` → `executive-assistant` profile; `defaults.skills_auto` does not exist.
-5. **jtbd-restart-and-know-what-im-running** — 7 non-aligned. Boot card does not surface model/tools/skills/memory on healthy restart (SessionStart greeting deleted PR #142); five UAT examples test behavior that is only in `/status`.
-
----
+5. **contract-principles** (6 non-aligned). All 6 are contract-example-stale. Stale CLI examples: `auth login` (removed), privacy-mode detection (static not dynamic), `vault set` success message, `--profile executive` (should be `executive-assistant`), three-command upgrade (superseded by `switchroom update`), and `defaults.skills_auto` (field does not exist).
 
 ## Recurring themes
 
-- **Auth CLI surface obsoleted by RFC H.** `auth login`, `auth enable`, `auth account add|list` appear in principles.md, fleet-auth JTBD UAT prompts, and RFC H body. All replaced by `auth add / auth use / auth list / auth show`.
-- **`switchroom update` (PR #918) not reflected.** Three-step manual upgrade sequence still described in contract-principles c6, jtbd-idempotent-update-and-restart c1/c10/c13, rfc-docker-multi-container c3. `switchroom update` is now canonical.
-- **`switchroom reconcile` → `switchroom apply`.** RFC docker body uses `reconcile` throughout; shipped verb is `apply`.
-- **Pinned progress card retired #1122 PR3.** Most units handle this correctly, but jtbd-steer-or-queue-mid-flight c10, jtbd-talk-to-agents-from-anywhere c12, and `telegram-plugin/server.ts` L33 still reference the card as current.
-- **Boot card vs /status scope confusion.** jtbd-restart-and-know-what-im-running promises model/tools/skills/memory on restart; moved to /status in PR #142. Multiple UAT examples test behaviors that only live in /status.
-- **Per-agent workspace provisioning not wired end-to-end.** `ensureAgentWorktree` and `ensureBareClone` exist in `src/repos/` but have zero production call sites. Three JTBD claims are outcome-not-realized.
-- **Profile name mismatch.** `executive` vs `executive-assistant` appears in principles.md example and would fail at runtime.
+- **`switchroom update` not reflected.** `jtbd-idempotent-update-and-restart`, `contract-principles:c8`, and `jtbd-share-auth-across-the-fleet` still name the pre-#918 three-command incantation (`apply + docker compose pull + up -d`). Shipped surface is `switchroom update`.
 
----
+- **Stale auth verbs.** Three units cite `auth login`, `auth enable`, or `switchroom auth account list` -- all removed under RFC H. Correct verbs: `auth add`, `auth reauth`, `auth use`, `auth show`.
+
+- **UID range discrepancy in rfc-docker-multi-container.** Four sites in the RFC body cite `1100 + hash % 800`; shipped code uses `AGENT_UID_MIN=10001` / `AGENT_UID_MAX=10999`.
+
+- **Boot card vs. `/status` gap.** PR #142 decision: model/tools/skills/memory-backend moved off the boot card. The JTBD ("no need to ask") is aspirational, not realized. Requires product decision, not a doc edit.
+
+- **Progress card retirement ripple.** `rfc-sub-agent-visibility` has 5 dead-pointers for `progress-card-driver.ts`, `two-zone-card.ts`, and related UAT infrastructure. The card was deleted in #1122 PR3.
+
+- **Quota push gap.** `jtbd-track-plan-quota-live` has 4 outcome-not-realized findings: no threshold-tier warning (only fatal push), no window-roll recovery push, no ambient ongoing display. Current design is pull-only (`/usage`) plus fatal-only push.
+
+- **`ensureAgentWorktree` dead import.** Imported in `scaffold.ts` but never called from `scaffoldAgent` or `reconcileAgent`. The entire `jtbd-give-each-agent-its-own-workspace` outcome is paper-only.
+
+- **Wrong emoji sequence in design artefact and agent prompt.** Both `reference/conversational-pacing.md` and `profiles/_shared/telegram-style.md.hbs` cite `+->+->+->+` as the reaction lifecycle. The code reserves + for 5xx operator-events; the working-state emoji is +. This misinforms the model itself via the prompt template.
+
+- **`reference/PRD.md` deleted.** Was deleted in PR #534. The audit manifest and README still list it as a unit to audit.
 
 ## Coverage notes
 
-- `contract-vision` c8 (OpenAI embeddings + Whisper = external API spend) is medium confidence — escalated.
-- `jtbd-give-each-agent-its-own-workspace` c2/c3/c12 (worktree provisioning) are high-confidence outcome-not-realized — escalated.
-- `jtbd-restart-and-know-what-im-running` c3/c8 (model/tools not surfaced) are high-confidence outcome-not-realized — escalated.
-- `jtbd-track-plan-quota-live` c2/c7 (proactive quota push) are medium-confidence outcome-not-realized — escalated.
-- `rfc-sub-agent-visibility` c11 (AC-4 stuck-render pipeline) has low confidence — escalated.
-- `jtbd-feel-like-a-colleague` c9 (non-technical user cannot tell it's an AI) is vision-only with low evidence — escalated for operator awareness.
+- **`historical-prd`:** `reference/PRD.md` does not exist (deleted PR #534, commit 8bdb86cb). No content audit was possible. This is manifest hygiene only. The manifest entry and `scripts/drift-audit/README.md` table row both need updating.
 
----
+- **`jtbd-give-each-agent-its-own-workspace`:** Three `vision-only` findings (c5, c10, c15) with low confidence on c15. These mark design intent that has code structure but no production wiring.
 
-**Note:** The 23 detailed findings YAML files (`audit/2026-05-26/findings/*.yaml`)
-and the 19 fix-batches (`audit/2026-05-26/fix-batches/*.md`) were lost when the
-working directory was re-oriented to a fresh upstream clone. This summary and
-the `escalations.md` file (with inline recommendations) survived because they
-were read into the orchestrator's conversation context. To recover the findings
-and fix-batches, re-run Phase 1 and Phase 2 from the orchestrator session.
+- **`rfc-sub-agent-visibility`:** Dead-pointer findings reference code only in `node_modules/@switchroom-ai/telegram-plugin/` (published npm snapshot), not the active source tree. The UAT scenario `bg-sub-agent-dispatch-dm.test.ts` tests infrastructure (`expectPinnedCard`) that would fail immediately in a live run.
+
+- **`jtbd-share-auth-across-the-fleet`:** `src/auth/migrate-schema.ts` exists and is tested but is not imported from any production code path. The "first apply" wiring referenced in schema comments appears absent from `apply.ts`. Flagged in escalations as a low-confidence wiring question.
+
+- **`jtbd-talk-to-agents-from-anywhere:c10`:** Dead-zone recovery is `vision-only` with `low` confidence. The long-poll gateway resumes naturally after a connectivity gap, but there is no specific dead-zone detection or recovery message path.

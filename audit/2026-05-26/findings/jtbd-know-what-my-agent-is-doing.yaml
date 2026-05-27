@@ -1,0 +1,399 @@
+unit_id: jtbd-know-what-my-agent-is-doing
+unit_path: reference/know-what-my-agent-is-doing.md
+category: jtbd
+audited_at: 2026-05-26T18:00:00Z
+auditor_notes: |
+  This JTBD is largely well-maintained and explicitly acknowledges the progress
+  card retirement. Several findings warrant attention:
+
+  1. The JTBD leaks implementation file paths in section 1 (status-reactions.ts,
+     gateway.ts, waiting-ux-spec.md) and section 2 (profiles/_shared/telegram-style.md.hbs)
+     and section 3 (reference/conversational-pacing.md). These are acceptable as
+     cross-reference pointers for developers but are borderline jtbd-too-technical.
+     Verdict left as jtbd-too-technical on the most egregious block (the "Implementation:"
+     paragraph at L58-61); others are kept since they point to design docs rather than
+     class names or function names.
+
+  2. The "~100ms" reaction timing claim at L37 is faster than what the code targets.
+     The code comment at gateway.ts:7854 states "The spec deadline is 800ms," not 100ms.
+     This is drift-minor: the reaction fires quickly (sub-800ms), and the JTBD's intent
+     ("effectively instantly") is preserved, but the specific number is wrong.
+
+  3. The 🔥 claim at L51-52 is misleading. The JTBD frames 🔥 as a reaction-state that
+     is "non-terminal: recovery to a working state from 🔥 is allowed." In the code,
+     🔥 never appears in REACTION_VARIANTS (status-reactions.ts L74-85), so it is never
+     emitted as a reaction by the status controller. The 🔥 appears in the operator-events
+     message text for 5xx errors (operator-events.ts L372), not as a reaction on the
+     user's inbound message. The non-terminal error reaction is 😱 (REACTION_VARIANTS.error).
+
+  4. The inbound_ack event cross-reference at L57 points to docs/posthog.md, but the
+     event is absent from that doc's events table.
+
+  5. The silence-poke success rate target at L208 (">80%") is contradicted by actual
+     empirical data documented at pending-work-progress.ts L13-16 ("0-7% across hundreds
+     of fires"). This is an outcome-not-realized signal — the conversational-pacing safety
+     net is not working at the claimed effectiveness level. The pending-work-progress.ts
+     module was introduced precisely because the silence-poke ladder fails as a cross-turn
+     mechanism. Escalated.
+
+findings:
+  - claim_id: c1
+    quote: "It fires within ~100ms of the message arriving (👀 received)"
+    loc: L37
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L7850-L7854
+        snippet: |
+          // F2 fix (#553): fire 👀 reaction on RAW arrival, before the coalesce
+          // wait blocks first paint. Pre-fix, the controller's setQueued() inside
+          // handleInbound only ran AFTER the coalesce flush (default gapMs=1500),
+          // so the user perceived ~1.5s of silence after their message landed.
+          // The spec deadline is 800ms.
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The code's own spec comment states the deadline is 800ms, not 100ms.
+      Replace "~100ms" with "within ~800ms" or "effectively immediately (sub-second)"
+      to match the implemented spec deadline while preserving the intent.
+
+  - claim_id: c2
+    quote: "The reaction is a reflective state machine, not a linear ratchet (#1713)."
+    loc: L43-44
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L1-34
+        snippet: |
+          Reflective state machine — see issue #1713 for the canonical contract.
+          Working states (`thinking`, `tool`, `coding`, `web`, `compacting`) cycle
+          freely and bidirectionally — the same state can re-enter multiple times
+          within one turn.
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Code directly implements the described reflective state machine semantics.
+      Issue #1713 is referenced in the code header matching the JTBD's citation.
+
+  - claim_id: c3
+    quote: "Only the turn_end IPC event (Stop hook) finalizes to 👍."
+    loc: L47-48
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L1735-L1742
+        snippet: |
+          * Only the `turn_end` IPC handler, disconnect-flush, and boot-sweep
+          * ...
+          function finalizeStatusReaction(
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      finalizeStatusReaction is called from the turn_end path (L5126, L7111, L7417).
+      The code comment at L1735 lists exactly the same termination sources the JTBD describes.
+
+  - claim_id: c4
+    quote: |
+      🔥 is reserved for genuine 5xx server errors and is also non-terminal:
+      recovery to a working state from 🔥 is allowed
+    loc: L51-52
+    verdict: drift-major
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L71-L85
+        snippet: |
+          * 🔥 is reserved for genuine 5xx server errors (operator-events.ts).
+          * It reads as "on fire / broken" — keep it out of normal active-work states.
+          ...
+          error:     ['😱', '😨', '🤯'],      // NON-TERMINAL — recovery allowed
+      - path: telegram-plugin/operator-events.ts
+        lines: L369-L383
+        snippet: |
+          case 'unknown-5xx':
+            return {
+              text: [
+                `🔥 <b>Server error (5xx)</b> for <b>${agent}</b>.`,
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      🔥 never appears in REACTION_VARIANTS and is never emitted by the status
+      controller as a reaction on the user's inbound message. For 5xx events,
+      🔥 appears in the TEXT of an operator-event notification message, not as a
+      reaction. The non-terminal error reaction is 😱 (REACTION_VARIANTS.error).
+      The JTBD should either remove the 🔥 claim or clarify that 🔥 appears as
+      a message prefix in operator notifications, not as a reaction on the inbound.
+
+  - claim_id: c5
+    quote: |
+      Implementation: `telegram-plugin/status-reactions.ts` (controller),
+      `telegram-plugin/gateway/gateway.ts` (turn_end IPC handler →
+      `finalizeStatusReaction`). The technical contract spec lives at
+      `telegram-plugin/docs/waiting-ux-spec.md`.
+    loc: L58-L61
+    verdict: jtbd-too-technical
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L1
+        snippet: "file exists"
+      - path: telegram-plugin/docs/waiting-ux-spec.md
+        lines: L1
+        snippet: "file exists"
+    evidence_strength: medium
+    action: rewrite-at-outcome-level
+    confidence: medium
+    rationale: |
+      JTBDs should describe user outcomes, not implementation internals. Naming
+      specific files, function names (finalizeStatusReaction), and IPC event labels
+      (turn_end) leaks architecture. Remove the "Implementation:" paragraph or move
+      it to a developer sidebar. The two sentences can be replaced with: "See the
+      ambient layer design contract at `reference/conversational-pacing.md`."
+      (The conversational-pacing.md reference at L106 is already the right level.)
+
+  - claim_id: c6
+    quote: |
+      The status reaction on the user's own inbound message is the always-on
+      liveness signal. ... reflects current turn activity through working states
+      (🤔 thinking, ✍ tool, 👨‍💻 coding, ⚡ web lookup)
+    loc: L33-39
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L74-L85
+        snippet: |
+          thinking:  ['🤔', '🤓', '👀'],
+          tool:      ['✍', '⚡', '👌'],
+          coding:    ['👨‍💻', '✍', '⚡'],
+          web:       ['⚡', '🤔', '👌'],
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Primary emoji for each working state exactly matches the JTBD description:
+      🤔 for thinking, ✍ for tool, 👨‍💻 for coding, ⚡ for web.
+
+  - claim_id: c7
+    quote: |
+      The full design contract lives at `reference/conversational-pacing.md`.
+      Kill switch: SWITCHROOM_DISABLE_SILENCE_POKE=1.
+    loc: L105-L107
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L172-L175
+        snippet: |
+          export function silencePokeEnabled(): boolean {
+            const v = process.env.SWITCHROOM_DISABLE_SILENCE_POKE
+            return !(v === '1' || v === 'true')
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Kill switch env var name matches exactly. conversational-pacing.md exists.
+
+  - claim_id: c8
+    quote: |
+      75s silence → soft poke. ... 180s silence → firm poke. ...
+      300s silence → framework fallback.
+    loc: L93-L100
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L113-L120
+        snippet: |
+          export const DEFAULT_THRESHOLDS: ThresholdsMs = {
+            ack: 10_000,
+            soft: 75_000,
+            firm: 180_000,
+            fallback: 300_000,
+            subagentSoft: 300_000,
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Thresholds exactly match the three values stated in the JTBD.
+
+  - claim_id: c9
+    quote: |
+      Subagent-dispatch (`Task` / `Agent`) extends the soft threshold to 300s
+      for that turn (legitimate wait on a child).
+    loc: L102-L103
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L240-L245
+        snippet: |
+          export function noteSubagentDispatch(key: string): void {
+            const s = state.get(key)
+            if (s == null) return
+            s.subagentDispatchActive = true
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      subagentSoft threshold is 300_000ms and is activated by noteSubagentDispatch,
+      matching the JTBD description exactly.
+
+  - claim_id: c10
+    quote: |
+      The prompt that teaches this rhythm lives at
+      `profiles/_shared/telegram-style.md.hbs`.
+    loc: L85-L86
+    verdict: aligned
+    evidence:
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L7-L14
+        snippet: |
+          **Conversational pacing — a human is on the other side.** Match the
+          rhythm of a capable colleague messaging you back. Five beats:
+          - **1 · Acknowledge first.** ...
+          - **3 · Surface meaningful progress** at genuine inflection points...
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      File exists and contains the five-beat pacing teaching described in the JTBD.
+      The file path reference is a borderline technical pointer, but it names a
+      design artefact rather than a code implementation, so it's acceptable here.
+
+  - claim_id: c11
+    quote: |
+      see the `inbound_ack` event in `docs/posthog.md`
+    loc: L57
+    verdict: dead-pointer
+    evidence:
+      - path: docs/posthog.md
+        lines: L72-L77
+        snippet: |
+          | `inbound_status_query`   | ...
+          | `turn_started`           | ...
+          | `turn_ended`             | ...
+      - path: telegram-plugin/streaming-metrics.ts
+        lines: L60-L65
+        snippet: |
+          | {
+              kind: 'inbound_ack'
+              chatId: string
+              messageId: number
+              ackDelayMs: number
+            }
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The inbound_ack event exists in the code (streaming-metrics.ts L61, gateway.ts
+      L8665) but is not listed in the posthog.md events table. The JTBD cross-reference
+      sends readers to a doc that doesn't contain what it promises. Either add the event
+      to posthog.md's table or change the reference to "streaming-metrics.ts" where the
+      event type is declared.
+
+  - claim_id: c12
+    quote: |
+      Silence-poke success rate. Force a long tool-churn period with no
+      outbound messages. The soft poke at 75s should produce an update
+      from the model within 15s (the `silence_poke_succeeded` event).
+      Success rate target: >80%.
+    loc: L205-L208
+    verdict: outcome-not-realized
+    evidence:
+      - path: telegram-plugin/pending-work-progress.ts
+        lines: L13-L16
+        snippet: |
+          - silence-poke success rate is 0–7% across hundreds of fires
+            (finn: 0/78, clerk: 6/91, klanker: 5/158) — the polite levels
+            reach the model as `<system-reminder>`s piggybacked on the next
+            tool result, so they (a) only land if the model is actively
+            cycling tools, ...
+    evidence_strength: strong
+    action: escalate
+    confidence: high
+    rationale: |
+      The JTBD states a UAT success target of >80% for silence-poke. Empirical data
+      captured in pending-work-progress.ts (added to address issue #1445) shows
+      actual success rates of 0-7% across hundreds of real fires. The silence-poke
+      ladder works as implemented but fails to achieve its stated outcome at the
+      conversational layer. The pending-work-progress module was introduced as a
+      partial mitigation for cross-turn silence. This is a product-level gap, not
+      a doc edit. The UAT prompt target (>80%) should be updated to reflect reality
+      or the underlying model-poke mechanism needs rethinking. Escalate to operator.
+
+  - claim_id: c13
+    quote: |
+      Earlier versions of this doc prescribed that — a pinned two-zone status card
+      that owned ambient, structured, and narrative signals at once. We retired the
+      card in #1122 (PR3)
+    loc: L19-L22
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/session-tail.ts
+        lines: L37
+        snippet: |
+          // #1122 PR3: inlined from the deleted progress-card.ts.
+      - path: telegram-plugin/subagent-watcher.ts
+        lines: L943
+        snippet: |
+          // Card retired (#1122): the watcher no longer sends a user-facing
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Code comments in session-tail.ts and subagent-watcher.ts confirm the progress
+      card was retired under #1122 PR3. The JTBD's self-referential history is accurate.
+
+  - claim_id: c14
+    quote: |
+      A stall escalates the reaction (😨) so the user can tell idle from stuck
+      at a glance.
+    loc: L54-L55
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L83-L84
+        snippet: |
+          stallSoft: ['🥱', '😴', '🤔'],
+          stallHard: ['😨', '🤯', '😱'],
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      stallHard maps to 😨 as the primary emoji. The stall watchdog timers are wired
+      at 30s/90s defaults, and stallHard escalates to 😨 confirming the JTBD claim.
+
+  - claim_id: c15
+    quote: |
+      Power users who want the technical receipt can pull the runtime metrics JSONL
+      or use a future `/lasttrace` command — the escape hatch, not the headline.
+    loc: L81-L83
+    verdict: aligned
+    evidence:
+      - path: reference/conversational-pacing.md
+        lines: L167
+        snippet: |
+          - A `/lasttrace` Telegram command for power users who want the
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      /lasttrace does not exist in gateway.ts or anywhere in the plugin codebase.
+      The JTBD correctly qualifies it as a "future" command. The runtime metrics JSONL
+      (/state/agent/runtime-metrics.jsonl) does exist. Both claims remain accurate.
+
+  - claim_id: c16
+    quote: |
+      The `inbound_status_query` event in PostHog measures this directly.
+    loc: L135
+    verdict: aligned
+    evidence:
+      - path: docs/posthog.md
+        lines: L74
+        snippet: |
+          | `inbound_status_query` | telegram-plugin/inbound-classifier.ts |
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      inbound_status_query is documented in posthog.md L74, emitted from
+      inbound-classifier.ts, and used in KPI definitions at posthog.md L97.

@@ -1,0 +1,259 @@
+unit_id: jtbd-extend-without-forking
+unit_path: reference/extend-without-forking.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  This JTBD is well-served by the implementation. The main signals are: (1)
+  `switchroom agent create --profile` writes a config entry and scaffolds in
+  one step; (2) skills are declared in switchroom.yaml and synced via
+  reconcile, no editing of agent files required; (3) MCP tools use mcp_servers
+  per-key merge + opt-out via `false`, letting one tool declaration reach a
+  subset of the fleet; (4) user-owned workspace files (SOUL.md, etc.) survive
+  reconcile and upgrades; (5) `agent destroy` removes the directory, but does
+  NOT remove the agent entry from switchroom.yaml — the operator must do that
+  manually before running `switchroom apply` to take the container down. This
+  leaves a residue in config, which partially contradicts the "Removing an
+  extension is as clean as adding it. No residue." sign. No JTBD body text
+  makes verifiable claims at the file-path / class-name / MCP-tool-name level,
+  so no jtbd-too-technical findings are raised. UAT prompts stay at outcome
+  level throughout.
+
+findings:
+  - claim_id: c1
+    quote: "Adding a new agent is a small config change, not a code change."
+    loc: L28
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L848-L992
+        snippet: |
+          `agent create <name> --profile <profile>` writes an `extends:` entry
+          to switchroom.yaml and scaffolds without requiring any source edits.
+      - path: tests/cli.agent-create-profile.test.ts
+        lines: L176-L188
+        snippet: |
+          Test pins that `agent create smoketest --profile health-coach` writes
+          the entry and sets `extends: health-coach` in yaml.
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `switchroom agent create <name> --profile <profile>` (or editing
+      switchroom.yaml with `extends:`) is a pure config operation. The test at
+      tests/cli.agent-create-profile.test.ts:176-188 pins this. No source edit
+      is required.
+
+  - claim_id: c2
+    quote: "The scaffolding provides sensible defaults. The user only overrides what's actually different."
+    loc: L29-L30
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L2051-L2059
+        snippet: |
+          `resolveAgentConfig` applies global defaults -> inline profile
+          (extends:) -> per-agent config. When no overrides, agent inherits
+          everything from the profile.
+      - path: src/config/merge.ts
+        lines: L1-L29
+        snippet: |
+          Three-layer cascade documented in header: scalars fill from defaults,
+          tools.allow is unioned, mcp_servers is per-key merged, schedule
+          concatenated.
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The three-layer cascade in src/config/merge.ts and
+      resolveAgentConfig in scaffold.ts implement exactly this. An agent entry
+      in switchroom.yaml with only a topic_name and extends: inherits lifecycle,
+      tools, MCP wiring, and skills from the profile and global defaults.
+
+  - claim_id: c3
+    quote: "New skills plug into existing agents without editing those agents."
+    loc: L31
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L2820-L2832
+        snippet: |
+          syncGlobalSkills reads `agentConfig.skills` (merged from defaults)
+          and symlinks skills into the agent's .claude/skills/ directory.
+          No agent file editing is needed.
+      - path: docs/skills.md
+        lines: L155-L166
+        snippet: |
+          "Adding a new skill: 1. Create at ~/.switchroom/skills/<name>/SKILL.md
+          2. Add to defaults.skills or agents.<name>.skills
+          3. Run switchroom agent reconcile <agent>"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Skills are declared in switchroom.yaml and synced to the agent's
+      .claude/skills/ dir on reconcile. No agent files are edited — a
+      `skills: [new-skill]` line in switchroom.yaml is the only change.
+
+  - claim_id: c4
+    quote: "A new tool becomes available to the agents that should have it, without touching unrelated agents."
+    loc: L32-L33
+    verdict: aligned
+    evidence:
+      - path: docs/configuration.md
+        lines: L160-L201
+        snippet: |
+          mcp_servers under `defaults:` flows to all agents; per-agent
+          `mcp_servers: { perplexity: false }` opts that agent out.
+          Per-key merge means adding a new MCP server in defaults only
+          reaches agents that don't opt out.
+      - path: src/config/merge.ts
+        lines: L16-L21
+        snippet: |
+          "mcp_servers: per-key shallow merge. Agent overrides a default
+          entry by declaring the same key."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      mcp_servers uses per-key merge: declare the server under `defaults:` and
+      it reaches all agents by default. Per-agent `false` opt-out suppresses it
+      only for that agent. No other agent configs need touching.
+
+  - claim_id: c5
+    quote: "The user can read one existing agent or skill and use it as a template for their own, without studying the framework internals."
+    loc: L34-L35
+    verdict: aligned
+    evidence:
+      - path: profiles/health-coach/CLAUDE.md.hbs
+        lines: L1-L1
+        snippet: |
+          Profile template files are human-readable Handlebars with clear
+          variable names; an operator can copy a profile dir and adapt it.
+      - path: docs/skills.md
+        lines: L155-L166
+        snippet: |
+          Step-by-step "Adding a new skill" section requires no framework
+          knowledge beyond the SKILL.md frontmatter shape.
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Profiles are readable .hbs templates. The skills workflow is documented
+      in docs/skills.md with a three-step recipe. However, the claim is
+      experiential ("without studying framework internals") and can't be fully
+      verified from code alone. The profile and skill shape are simple enough
+      to support the claim at medium confidence.
+
+  - claim_id: c6
+    quote: "Extensions inherit the product's safety, logging, and lifecycle behaviour automatically. The user doesn't have to reimplement it."
+    loc: L36-L37
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L2042-L2059
+        snippet: |
+          scaffoldAgent resolves the full cascade config and emits start.sh,
+          settings.json, .mcp.json — every agent gets identical lifecycle,
+          autoaccept, and safety scaffolding regardless of which profile it
+          extends.
+      - path: profiles/_base/start.sh.hbs
+        lines: L1-L1
+        snippet: |
+          The _base start.sh.hbs is unconditionally applied to every agent;
+          gateway, autoaccept-poll, and agent-scheduler sidecars are always
+          launched.
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All lifecycle infrastructure (tmux, gateway, autoaccept-poll,
+      agent-scheduler) is emitted by scaffoldAgent unconditionally from
+      _base/start.sh.hbs. Safety settings, permissions defaults, and logging
+      are also scaffold-managed. A new agent inherits all of this by declaring
+      `extends: <profile>` — no reimplementation needed.
+
+  - claim_id: c7
+    quote: "Removing an extension is as clean as adding it. No residue."
+    loc: L38
+    verdict: drift-minor
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L1930-L1981
+        snippet: |
+          `agent destroy` stops the agent, removes the agent directory with
+          rmSync, and prints "Agent destroyed." It does NOT call
+          removeAgentFromConfig — the switchroom.yaml entry remains.
+      - path: src/cli/agent.ts
+        lines: L1964-L1969
+        snippet: |
+          Comment in destroy: "Removing the entry from switchroom.yaml + running
+          `switchroom apply`... takes the container down. We don't shell out to
+          docker here... the compose layer is owned by `apply`, not
+          `agent destroy`." — documents that yaml cleanup is a manual step.
+    evidence_strength: strong
+    action: update-text
+    proposed_text: |
+      Removing an extension requires two steps: `switchroom agent destroy
+      <name>` removes the scaffold directory, then editing switchroom.yaml to
+      delete the agent entry and running `switchroom apply` removes the
+      container. The scaffold dir is fully cleaned; the yaml entry requires a
+      manual edit.
+    confidence: high
+    rationale: |
+      `agent destroy` (src/cli/agent.ts:1930-1981) removes only the agent
+      directory. The switchroom.yaml entry is not removed automatically — the
+      comment at L1964-1969 explicitly says the operator must edit yaml and run
+      apply. After destroy, an entry remains in switchroom.yaml (config
+      residue), which partially contradicts "no residue." The claim is
+      directionally accurate (no orphaned files, no memory leaks) but overstates
+      the cleanliness of the yaml side.
+
+  - claim_id: c8
+    quote: "A user should be able to look at one existing agent, understand the shape, and create a peer that fits."
+    loc: L22-L24
+    verdict: aligned
+    evidence:
+      - path: tests/cli.agent-create-profile.test.ts
+        lines: L78-L87
+        snippet: |
+          listAvailableProfiles() returns default, health-coach, coding,
+          executive-assistant — these serve as example templates the user can
+          study and replicate.
+      - path: src/cli/agent.ts
+        lines: L868-L875
+        snippet: |
+          `agent create <name> --profile <profile>` description says
+          "Scaffold a new agent directory (optionally from a profile)."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The profile system (health-coach, coding, executive-assistant) provides
+      concrete examples to copy. The --profile flag lets a user specify which
+      example to clone. The claim maps to real product behavior, though
+      "understand the shape" is experiential. Medium confidence because the
+      readability of profile templates can't be fully verified from code.
+
+  - claim_id: c9
+    quote: "The product's job is to make that feel like configuration, not forking."
+    loc: L9-L10
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L848-L861
+        snippet: |
+          Two entry points: YAML-first (edit switchroom.yaml) or CLI-first
+          (--profile flag). Both are config operations, no code fork.
+      - path: src/config/merge.ts
+        lines: L1-L29
+        snippet: |
+          Three-layer cascade allows per-agent overrides without touching
+          profile or base code.
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Adding an agent, adding a skill, adding an MCP tool — all are
+      switchroom.yaml config changes, not source code edits. The cascade model
+      ensures agents inherit defaults and only override what differs. This
+      directly implements "configuration, not forking."

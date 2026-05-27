@@ -1,0 +1,300 @@
+unit_id: rfc-sub-agent-visibility
+unit_path: reference/sub-agent-visibility-rfc.md
+category: rfc-shipped
+audited_at: 2026-05-26T18:00:00Z
+auditor_notes: |
+  The RFC's own frontmatter acknowledges the card model was superseded by
+  conversational-pacing.md, and the status-card-design.md it was based on is
+  archived. The critical finding is that the entire progress-card-driver
+  (progress-card-driver.ts) was deleted in PR #1122 PR3 and the gateway.ts
+  variable `progressDriver` is permanently null. This means:
+
+  - The two-zone progress card (fleet zone, header phase resolver) is gone.
+  - AC-1 through AC-6 are written against a deleted mechanism.
+  - The UAT scenario bg-sub-agent-dispatch-dm.test.ts exists and the assertions
+    (expectPinnedCard, waitForCardPhase) are live infrastructure, but they test
+    a pinned card that no longer exists. The scenario would fail at the first
+    expectPinnedCard call because no pinned progress card is ever produced.
+  - fleet-state.ts (hasLiveBackground, isBackgroundDispatch, cap) exists but is
+    consumed only by subagent-watcher.ts (sanitiseToolArg only) and tests.
+    The functions hasLiveBackground, cap, and the FleetMember struct are dead code
+    in production.
+
+  The sub-agent visibility problem (the original JTBD) is now addressed via:
+    1. cross-turn pending-progress (pending-work-progress.ts, issue #1445)
+    2. subagent-handback inject (subagent-handback-inbound-builder.ts, issue #1720)
+    3. conversational-pacing.md five-beat model
+
+  The RFC itself notes the card model was superseded and points to
+  conversational-pacing.md. The RFC is not misleading about its own status, but
+  its AC/implementation survey describes code that no longer exists in the active
+  source tree (only in node_modules/@switchroom-ai/telegram-plugin, a published
+  package snapshot).
+
+findings:
+  - claim_id: c1
+    quote: "The frontmatter previously read `rfc — draft, awaiting sign-off`; that
+      is stale. The verification work this RFC proposed **landed**: the UAT
+      scenarios were written and run, and Bugs 1–5 in the changelog table below
+      merged (#1057, #1059, #1060, #1063, #1066)."
+    loc: L13-L15
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/uat/scenarios/bg-sub-agent-dispatch-dm.test.ts
+        lines: L1-L5
+        snippet: "Background sub-agent visibility scenario — closes #709 / #776 / #782 / #788"
+    evidence_strength: medium
+    action: keep
+    confidence: high
+    rationale: |
+      The UAT scenario file exists and its header confirms the TDD work landed.
+      The scenario is not skipped (describe.skip was removed per L98-100). Five
+      bugs merging is consistent with the PR numbers cited. Cannot verify merged
+      PRs directly but the code residue is consistent with the claim.
+
+  - claim_id: c2
+    quote: "Two narrow defects remain open as ordinary tracked follow-ups... Bug 6
+      (bg `sub_agent_turn_end` never fires for some Claude Code bg dispatches →
+      card can stay on 🌀 Background until the heartbeat ceiling) and Bug 7
+      (driver-side parent-tool-use correlation race)."
+    loc: L18-L23
+    verdict: drift-major
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L2976-L2981
+        snippet: "The pinned progress card was deleted in #1122 PR3. The variables
+          below are retained as permanent `null` so the dozens of optional-chained
+          call sites... short-circuit to no-ops at runtime."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15490-L15498
+        snippet: "The pinned progress card was deleted in favour of conversational
+          pacing + the silence-poke safety net."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      Bug 6 and Bug 7 are framed as open follow-ups to a mechanism that no longer
+      exists. The progress-card-driver was deleted in PR #1122 PR3; `progressDriver`
+      is permanently null in gateway.ts. The defer-gate (hasLiveBackground guard),
+      the Background header phase, and the 🌀→✅ flip described in both bugs are
+      moot. The stall-terminal synthesis for Bug 6 is still present in gateway.ts
+      (onStallTerminal at L16106) but `progressDriver?.ingest(...)` no-ops because
+      progressDriver is null — the code was left in place as dead optional-chain.
+      Proposed replacement: "Bug 6 and Bug 7 are moot. The progress-card-driver was
+      deleted in PR #1122 PR3 before these could be fixed. The cross-turn visibility
+      problem they addressed is now handled by pending-work-progress.ts (#1445) and
+      subagent-handback (#1720)."
+
+  - claim_id: c3
+    quote: "`telegram-plugin/progress-card-driver.ts:1855,1921` — driver registers
+      fleet members on `sub_agent_started`, derives bg flag from parent's `Agent`
+      tool_use args (`run_in_background: true` → `cs.backgroundParentToolUseIds`
+      correlation)."
+    loc: L83-L84
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15490-L15498
+        snippet: "Progress card driver (removed #1122 PR3) — The pinned progress card
+          was deleted in favour of conversational pacing."
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      progress-card-driver.ts does not exist in the active telegram-plugin source
+      tree. It is present only in the published npm package snapshot under
+      node_modules/@switchroom-ai/telegram-plugin/. The file was deleted in #1122
+      PR3. The line numbers cited (L1855, L1921) are dead references.
+      `backgroundParentToolUseIds` does not appear anywhere in active source code.
+
+  - claim_id: c4
+    quote: "`telegram-plugin/progress-card-driver.ts:1108` — deferred-completion
+      gate: `if (hasLiveBackground(cs.fleet)) return`. Card stays pinned past parent
+      `turn_end`."
+    loc: L85
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3046
+        snippet: "const progressDriver: any = null"
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      The deferred-completion gate in progress-card-driver.ts:1108 is in a deleted
+      file. `hasLiveBackground` from fleet-state.ts is only imported in tests; no
+      production call site reads it. The gate is effectively absent.
+
+  - claim_id: c5
+    quote: "`telegram-plugin/two-zone-card.ts` — fleet zone renders every member
+      (cap 5 + \"N more\"). Header phase resolver yields 🌀 Background when parent
+      done + fleet still running (PR #1039)."
+    loc: L86-L87
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15490-L15498
+        snippet: "Progress card driver (removed #1122 PR3)"
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      two-zone-card.ts does not exist anywhere in the active source tree (confirmed
+      by find). The two-zone renderer and the fleet zone are deleted. The `cap()`
+      function and `FleetMember` struct in fleet-state.ts are production dead code —
+      only consumed by the deleted driver (and tests). The 🌀 Background header
+      phase still exists in the UAT assertions (assertions.ts:L359) but the actual
+      card renderer that would produce it is gone.
+
+  - claim_id: c6
+    quote: "`telegram-plugin/subagent-watcher.ts` — 1Hz JSONL polling, drives
+      `sub_agent_tool_use` → fleet member's `lastTool`/`lastActivityAt` updates."
+    loc: L88-L89
+    verdict: drift-major
+    evidence:
+      - path: telegram-plugin/subagent-watcher.ts
+        lines: L44
+        snippet: "import { sanitiseToolArg } from './fleet-state.js'"
+    evidence_strength: medium
+    action: update-text
+    confidence: high
+    rationale: |
+      subagent-watcher.ts exists and does 1Hz JSONL polling (confirmed). However,
+      it no longer updates a FleetMember's `lastTool`/`lastActivityAt` fields for
+      the deleted driver. It imports only `sanitiseToolArg` from fleet-state.ts (not
+      FleetMember, not hasLiveBackground). The actual updates go to a SQLite DB
+      (bumpSubagentActivity, recordSubagentStall, etc.) for the subagent-handback
+      and progress paths. The claim's framing ("fleet member's lastTool") describes
+      the deleted driver's data model, not the current one.
+
+  - claim_id: c7
+    quote: "Heartbeat re-flushes the card every N seconds while live, so the elapsed
+      counter ticks."
+    loc: L90
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L15490-L15498
+        snippet: "Progress card driver (removed #1122 PR3)"
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      The pinned progress card heartbeat is deleted with the card. The elapsed
+      counter described here does not exist in the current UI. The current
+      cross-turn surface is `pending-work-progress.ts` which appends " — still
+      working (Nm)" to the anchor reply — no pinned card, no fleet zone, no
+      elapsed counter.
+
+  - claim_id: c8
+    quote: "**AC-4** — *Stuck escalation.* If a fleet member emits no JSONL event
+      for > 60 s, its row glyph flips from ↻ to ⚠ with label `idle <duration>`. If
+      every running member is stuck, header escalates to ⚠ Stalled."
+    loc: L109-L111
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3046
+        snippet: "const progressDriver: any = null"
+      - path: telegram-plugin/subagent-watcher.ts
+        lines: L230-L234
+        snippet: "onStall?: (agentId, idleMs, description) => void — fires when a
+          stall is detected. Wired to progressDriver.onSubAgentStall."
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      The stall detection in subagent-watcher.ts (stallThresholdMs, onStall callback)
+      exists and fires, but `progressDriver?.onSubAgentStall(...)` at gateway.ts:L16087
+      no-ops because progressDriver is null. No visual row glyph or header escalation
+      reaches the user. The stall record writes to the SQLite DB (recordSubagentStall)
+      but there is no current rendering surface that shows it as a card update.
+
+  - claim_id: c9
+    quote: "**AC-5** — *Heavy fleet HTML safety.* 6+ parallel sub-agents — render
+      output is balanced HTML, < 4096 bytes, fleet zone caps at 5 rows + `+ N more`.
+      No `<blockquote>` 400 in the gateway log."
+    loc: L112-L113
+    verdict: dead-pointer
+    evidence:
+      - path: telegram-plugin/fleet-state.ts
+        lines: L157-L164
+        snippet: "export function cap(members, n = 5): { visible, hidden } — sorts
+          and truncates at n members"
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      The fleet zone renderer (two-zone-card.ts) is deleted. The `cap()` function
+      exists in fleet-state.ts but is not called in any production path. The 4096-
+      byte concern and the `+ N more` footer were features of the deleted card.
+      No `blockquote 400` risk exists because no fleet HTML is being sent to Telegram.
+
+  - claim_id: c10
+    quote: "> **Card model superseded.** This RFC reasons about the *two-zone*
+      progress-card model from `reference/status-card-design.md`. That two-zone
+      design has since been **superseded by
+      [`reference/conversational-pacing.md`](conversational-pacing.md)**"
+    loc: L27-L31
+    verdict: aligned
+    evidence:
+      - path: reference/status-card-design.md
+        lines: L1-L6
+        snippet: "status: archived — superseded\nsupersededBy: conversational-pacing.md"
+      - path: reference/conversational-pacing.md
+        lines: L1-L5
+        snippet: "status: design v2 — the five-beat human-feel model (supersedes v1's
+          card-era pacing)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The RFC's own callout box accurately describes the supersession. Both the
+      status-card-design.md (archived, supersededBy frontmatter) and
+      conversational-pacing.md (design v2 status) confirm the stated relationship.
+
+  - claim_id: c11
+    quote: "After Bugs 1–5 merged + the agent image rebuilt + apply re-run, **five
+      of six assertions pass** in the UAT scenario"
+    loc: L288-L293
+    verdict: drift-major
+    evidence:
+      - path: telegram-plugin/uat/scenarios/bg-sub-agent-dispatch-dm.test.ts
+        lines: L67-L100
+        snippet: "STATUS: currently red — surfaces two real production bugs... Both
+          bugs are real and live on `main`."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The UAT scenario's own STATUS comment (L67-L100) says the scenario is
+      currently red with two bugs live on main (Bug 1: orphan correlation,
+      Bug 2: subagent-watcher liveness skip). The RFC's progress log claims 5/6
+      pass after the PR merges, but the scenario file's current state contradicts
+      this. The UAT scenario was unskipped per L98-100 ("Update post-#1105: all
+      five RFC bugs merged. Unskipped here for the next UAT re-run.") but then
+      further bugs were found. Additionally, the scenario infrastructure
+      (expectPinnedCard, waitForCardPhase) tests a pinned progress card that was
+      deleted in PR #1122 — the scenario would fail immediately in a real run
+      even if those gateway-level bugs were fixed.
+
+  - claim_id: c12
+    quote: "Phase 6 fix candidates... option 1 with a longer post-stall window (e.g.
+      5 min) so genuinely-paused workers aren't misreported."
+    loc: L309-L315
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L16095-L16131
+        snippet: "onStallTerminal: (agentId) => { ... progressDriver?.ingest(
+          { kind: 'sub_agent_turn_end', agentId }, ...) }"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      The stall-terminal synthesis (RFC Bug 6 option 1) was implemented in
+      gateway.ts at L16106. However, the `progressDriver?.ingest(...)` call
+      no-ops because progressDriver is null. The synthesis reaches no card and
+      has no user-visible effect. The fix is present structurally but its
+      intended target (the progress card) was deleted before this path could
+      do anything useful. The RFC's open "Bug 6 fix" is therefore moot.

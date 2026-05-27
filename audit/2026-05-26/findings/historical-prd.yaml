@@ -1,0 +1,46 @@
+unit_id: historical-prd
+unit_path: reference/PRD.md
+category: historical
+audited_at: 2026-05-26T08:00:00Z
+auditor_notes: |
+  reference/PRD.md does not exist on disk. It was deliberately deleted
+  in commit 8bdb86cb (PR #534, "docs(design-contract): vision + principles
+  + JTBD index, scrap PRD") — 446 lines removed. The commit message notes:
+  "PRD removed — partially-dated already, and everything load-bearing
+  replaced by the four-doc design contract."
+
+  Because the file is absent, no disclaimer accuracy check is possible
+  and no body claims can be verified. The only actionable findings are
+  the two audit-infrastructure files that still name it as a unit to audit.
+  Neither treats PRD.md as current spec; both are drift-audit tooling that
+  was written before the deletion was noticed.
+
+  No other files in src/, telegram-plugin/, profiles/, skills/, docker/,
+  docs/, or tests/ reference PRD.md.
+
+findings:
+  - claim_id: c1
+    quote: "path: reference/PRD.md"
+    loc: L229
+    verdict: dead-pointer
+    evidence:
+      - path: scripts/drift-audit/manifest.yaml
+        lines: L228-L230
+        snippet: |
+          - id: historical-prd
+            path: reference/PRD.md
+            category: historical
+      - path: scripts/drift-audit/README.md
+        lines: L94
+        snippet: |
+          | `historical` | `reference/PRD.md`, `reference/onboarding-gap-analysis.md` | ...
+    evidence_strength: strong
+    action: delete
+    confidence: high
+    rationale: |
+      reference/PRD.md was deleted in PR #534 (commit 8bdb86cb). Git history
+      confirms: "reference/PRD.md | 446 -------". The manifest entry and the
+      README example row both name a file that no longer exists. The manifest
+      entry for historical-prd should be removed; the README row should drop
+      the PRD.md example (or replace it with onboarding-gap-analysis.md alone,
+      which does still exist).

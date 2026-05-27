@@ -1,0 +1,290 @@
+unit_id: jtbd-remember-across-sessions
+unit_path: reference/remember-across-sessions.md
+category: jtbd
+audited_at: 2026-05-26T00:00:00Z
+auditor_notes: |
+  The JTBD is well-matched to the implemented Hindsight integration in its
+  broad strokes (semantic recall, corrections, cross-session continuity).
+  Three gap areas found:
+
+  1. "Memory decays sensibly" (Signs it's working) — no decay/TTL mechanism
+     exists in the shipped code or vendor scripts. Hindsight stores memories
+     indefinitely. The anti-pattern "Stale preferences don't haunt the user a
+     year later" is aspirational, not implemented. Marked vision-only.
+
+  2. "Deletion" UAT prompt — mcp__hindsight__delete_memory exists and is
+     plumbed into the MEMORY_GUIDANCE fleet invariant in scaffold.ts, so
+     per-memory deletion works in-session. However, the JTBD's "Tell the
+     agent to forget something. Confirm it's gone" framing implies a
+     user-visible acknowledgement path. This is in fact implemented via
+     the "Forget proactively" section in scaffold.ts L163. Marked aligned.
+
+  3. Orphaned Hindsight bank on agent destroy — the JTBD has no direct claim
+     about this, but the anchors_hint calls it out. Code confirms the gap:
+     agent destroy (src/cli/agent.ts:1930-1979) does not call Hindsight to
+     drop the bank. Prior audit (audit/2026-05-26/escalations.md) already
+     captured this as escalation-08. Not a JTBD claim, so not a finding here.
+
+  4. The CLAUDE.md line "Auto-memory is the second-tier source" applies to
+     the operator/developer context (this repo), NOT to deployed agents.
+     Deployed agents have autoMemoryEnabled=false when Hindsight is active
+     (scaffold.ts:2303-2310, 4083-4085). The CLAUDE.md statement is correct
+     in its own context — it describes operator-side Claude Code memory for
+     the switchroom repo itself.
+
+  This JTBD is largely outcome-level with no implementation-specific leakage.
+  The only material gap is the memory-decay claim.
+findings:
+  - claim_id: c1
+    quote: "The agent brings back relevant facts, preferences, decisions, and open threads from past conversations, in the right moment, without the user reminding it."
+    loc: L3-L4
+    verdict: aligned
+    evidence:
+      - path: vendor/hindsight-memory/scripts/recall.py
+        lines: L1-L10
+        snippet: "Auto-recall hook for UserPromptSubmit. [...] Call Hindsight recall API [...] Format memories and output hookSpecificOutput.additionalContext"
+      - path: vendor/hindsight-memory/scripts/recall.py
+        lines: L93
+        snippet: "excluded from the auto-recall block injected on every UserPromptSubmit"
+      - path: vendor/hindsight-memory/hooks/hooks.json
+        lines: L13-L22
+        snippet: "UserPromptSubmit hook calls recall.py with timeout 12"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      recall.py fires as a Claude Code UserPromptSubmit hook on every inbound
+      user message, queries Hindsight, and injects "Relevant memories from past
+      conversations" as additionalContext. The hook is registered in
+      vendor/hindsight-memory/hooks/hooks.json and is wired into every agent
+      scaffold that has Hindsight enabled.
+
+  - claim_id: c2
+    quote: "What comes back is relevant, not a grab-bag. If the agent recalls five things, four of them should be useful."
+    loc: L29-L30
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L137-L140
+        snippet: "DEFAULT_RETAIN_MISSION: Extract user preferences, ongoing projects, recurring commitments, important context, and durable facts that should help across future conversations. Skip one-off chatter and temporary task noise."
+      - path: vendor/hindsight-memory/scripts/recall.py
+        lines: L93
+        snippet: "excluded from the auto-recall block injected on every UserPromptSubmit"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The retain mission (DEFAULT_RETAIN_MISSION) is seeded with explicit
+      instructions to skip chatter, and the recall pipeline filters demoted
+      memories. Relevance is also a quality of the upstream Hindsight service
+      (semantic search). The JTBD outcome is addressed by the mission wording
+      and the demote mechanism, though quality depends on the external service.
+
+  - claim_id: c3
+    quote: "The user can correct a stored fact, and the correction sticks. The agent doesn't reassert the old version later."
+    loc: L31-L32
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L159-L161
+        snippet: "When the user corrects you or contradicts a prior memory, call `delete_memory` on the wrong entry, then `sync_retain` the correction. Acknowledge the correction in one line."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The MEMORY_GUIDANCE fleet invariant (written to every agent via
+      scaffold.ts) instructs the agent to call delete_memory on wrong entries
+      and sync_retain the correction. This is part of the mandatory fleet
+      invariant block, not optional guidance.
+
+  - claim_id: c4
+    quote: "A restart, a compaction, or a new chat window doesn't reset the relationship. The agent picks up roughly where it was."
+    loc: L35-L36
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L114-L127
+        snippet: "Session Continuity: Hindsight memory — auto-recall fires on every inbound user message and surfaces relevant memories from past sessions. Long-term facts, decisions, and mental models live here, not in the transcript."
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L117-L118
+        snippet: "Handoff briefing — on a clean shutdown, the Stop hook writes a bounded raw transcript tail of the prior session to .handoff.md."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Cross-restart persistence is handled by Hindsight recall (fires on every
+      inbound), the handoff briefing (.handoff.md injected by start.sh), and
+      the Telegram message buffer. All three mechanisms are implemented and
+      documented in the default agent template.
+
+  - claim_id: c5
+    quote: "The user can see what the agent believes about them and why. Nothing is hidden in a black box."
+    loc: L38-L39
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L165-L167
+        snippet: "When the user asks 'what do you know about X / me'... use `reflect` to synthesize an answer across the bank. Return it as honest prose, not a raw dump."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The MEMORY_GUIDANCE fleet invariant instructs the agent to use
+      mcp__hindsight__reflect in response to any memory-audit question, returning
+      honest prose. The mcp__hindsight__list_memories and list_mental_models
+      tools are also available per the agent CLAUDE.md.hbs template (L72).
+
+  - claim_id: c6
+    quote: "Memory decays sensibly. Stale preferences don't haunt the user a year later."
+    loc: L40
+    verdict: vision-only
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L1-L738
+        snippet: "No decay/TTL parameter exists in createBank, updateBankMissions, or any Hindsight API call."
+      - path: vendor/hindsight-memory/scripts/recall.py
+        lines: L113-L155
+        snippet: "_cache_ttl_secs() / _cache_lookup — TTL here is a per-session recall-cache (dedup), not memory decay."
+    evidence_strength: none
+    action: mark-vision
+    confidence: high
+    rationale: |
+      No memory decay or TTL mechanism exists in the codebase. Hindsight banks
+      store memories indefinitely. The per-session recall cache (recall.py
+      L113-L155) is a performance dedup, not memory decay. The vault-sweep
+      command can delete individual memories matching vault-secret patterns but
+      is not a general decay mechanism. The demote tag excludes memories from
+      recall but does not delete them. Add a "(not yet built)" qualifier to
+      this bullet — decay is a product aspiration, not a shipped feature.
+
+  - claim_id: c7
+    quote: "Raw transcript dumping as 'memory.' That's storage, not remembering."
+    loc: L45
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L137-L140
+        snippet: "DEFAULT_RETAIN_MISSION: Extract user preferences, ongoing projects, recurring commitments... Skip one-off chatter and temporary task noise."
+      - path: vendor/hindsight-memory/scripts/retain.py
+        lines: L86
+        snippet: "auto-retain disabled, empty transcript, throttled chunk"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The retain pipeline uses an LLM extraction step guided by
+      DEFAULT_RETAIN_MISSION to avoid storing raw transcripts. retain.py fires
+      on every Stop hook with throttling. The anti-pattern is guarded by design.
+
+  - claim_id: c8
+    quote: "Silent forgetting. If an old rule stopped being applied, the user should be able to tell."
+    loc: L48
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L165-L167
+        snippet: "When the user asks 'what do you know about X / me'... use `reflect` to synthesize an answer."
+      - path: src/cli/memory.ts
+        lines: L361-L364
+        snippet: "switchroom memory recall-log [agent] — Show recent auto-recall events (per-turn JSONL log)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Inspection is available both in-session (reflect/list_memories tools) and
+      via operator CLI (switchroom memory recall-log). Demoted memories are
+      excluded from recall but remain in the bank and remain queryable. This
+      addresses the anti-pattern: nothing is silently discarded without the
+      user being able to inspect it.
+
+  - claim_id: c9
+    quote: "Memory the user cannot inspect, correct, or delete."
+    loc: L49
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L152-L168
+        snippet: "MEMORY_GUIDANCE: delete_memory, sync_retain, reflect — all available and plumbed into fleet invariant"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All three operations (inspect via reflect/list_memories, correct via
+      delete_memory+sync_retain, delete via delete_memory) are available as
+      MCP tools listed in the MEMORY_GUIDANCE fleet invariant. The anti-pattern
+      is guarded.
+
+  - claim_id: c10
+    quote: "Per-session memory that resets every chat window. The user is not a different person every time."
+    loc: L50-L51
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L52-L53
+        snippet: "Claude Code's built-in file-based auto-memory is disabled for this agent... There's exactly one memory backend: Hindsight."
+      - path: profiles/_base/settings.json.hbs
+        lines: L26-L27
+        snippet: "\"autoMemoryEnabled\": false (when hindsightEnabled)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Built-in Claude Code auto-memory (which is session-scoped) is disabled
+      when Hindsight is on. Hindsight is a persistent external service. The
+      anti-pattern is prevented by design: autoMemoryEnabled=false in
+      settings.json ensures the session-reset problem doesn't apply.
+
+  - claim_id: c11
+    quote: "Conflating different users, different topics, or different specialists into one undifferentiated memory pool."
+    loc: L53-L54
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L68-L77
+        snippet: "getCollectionForAgent: Falls back to the agent's name if no explicit collection is configured."
+      - path: src/memory/hindsight.ts
+        lines: L80-L89
+        snippet: "isStrictIsolation: Strict agents are excluded from cross-agent reflection."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Each agent gets its own Hindsight bank (collection defaults to agent
+      name). Strict isolation mode prevents cross-agent reflection. The
+      anti-pattern is guarded at the bank-per-agent level. Multi-user
+      isolation (different Telegram users talking to the same agent) depends
+      on Hindsight's internal per-user handling, which is not surfaced by
+      switchroom's code — confidence is medium rather than high.
+
+  - claim_id: c12
+    quote: "Come back a week later and resume a thread. The agent should not need a re-briefing."
+    loc: L60-L62
+    verdict: aligned
+    evidence:
+      - path: profiles/default/CLAUDE.md.hbs
+        lines: L114-L127
+        snippet: "Session Continuity: Handoff briefing injects .handoff.md; Hindsight auto-recall fires on every inbound; Telegram history buffer available via get_recent_messages."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Three mechanisms address the return-after-a-break scenario: handoff
+      briefing (bounded transcript tail injected at boot), Hindsight auto-recall
+      on every inbound message, and the Telegram SQLite history buffer. These
+      are all implemented and wired in the default profile.
+
+  - claim_id: c13
+    quote: "Deletion. Tell the agent to forget something. Confirm it's gone."
+    loc: L66-L67
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L162-L163
+        snippet: "When the user asks you to forget something ('forget that', 'delete X', 'drop what I said about Y'), call `delete_memory` for matching entries and confirm what was removed."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The MEMORY_GUIDANCE fleet invariant (mandatory for all agents) explicitly
+      instructs the agent to call delete_memory and confirm what was removed
+      in response to any forget request. This directly addresses the UAT prompt.

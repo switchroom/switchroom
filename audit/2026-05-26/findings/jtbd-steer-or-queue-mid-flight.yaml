@@ -1,0 +1,219 @@
+unit_id: jtbd-steer-or-queue-mid-flight
+unit_path: reference/steer-or-queue-mid-flight.md
+category: jtbd
+audited_at: 2026-05-26T10:00:00Z
+auditor_notes: |
+  This JTBD was updated on 2026-05-24 (commit 88726983) after a Phase-3
+  audit found the doc lagged the code by ~5 weeks following a 2026-04-17
+  default-flip. The current file correctly describes the live contract.
+  All verifiable claims check out against the code. Three minor points
+  worth noting:
+
+  1. The header note (L60) references commits 4fff90bf + 597a58af.
+     These are not present in the current repo's reachable history (only
+     a distant `ba4fff44` exists). The commits are real but are from a
+     fork/private history not in the canonical switchroom/switchroom
+     remote. The references are informational; no consumer depends on
+     them being resolvable, so this is low-risk.
+
+  2. The "agent self-narrates the classification" claim (L65) is
+     implemented as a prompt instruction in
+     profiles/_shared/telegram-style.md.hbs rather than as a code
+     invariant. The UAT (jtbd-rapid-followup-dm.test.ts) does assert
+     for the narration pattern in test assertions, giving it medium
+     evidence strength.
+
+  3. The "Nothing the user said gets lost ... not to a restart" claim is
+     now realized by the inbound-spool JSONL introduced in #1546/#1549,
+     though the spool's durability guarantee stops at "delivered to
+     registered bridge," not "claude consumed it" — an acknowledged v1
+     limitation documented in inbound-spool.ts. The JTBD makes no
+     finer-grained claim, so it remains aligned.
+
+findings:
+  - claim_id: c1
+    quote: "Queue (default — no marker). Send a follow-up while a turn is in flight; it queues as a new, independent task that runs after the current turn ends."
+    loc: L62
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8647-L8651
+        snippet: "// New default: mid-turn messages are queued unless the user explicitly\n// steers. isSteering is true only when the steer prefix is present.\nisSteering = priorTurnInFlight && isSteerPrefix"
+      - path: telegram-plugin/steering.ts
+        lines: L1-L11
+        snippet: "Telegram messages that arrive while a prior turn is still in\nflight are now queued by default (queued=\"true\"). The user can explicitly\nprefix with `/steer ` or `/s ` to declare steering."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts:8647-8651 sets isSteering=true ONLY when both a prior
+      turn is in flight AND the /steer prefix is present. All other
+      mid-turn inbounds default to queued. The inbound-delivery-gate
+      (inbound-delivery-gate.ts:111-118) then buffers non-steering,
+      non-interrupt mid-turn inbounds until the current turn completes,
+      confirming the "runs after the current turn ends" claim.
+
+  - claim_id: c2
+    quote: "The agent receives the follow-up as a fresh turn with <channel queued=\"true\"> so it knows to start fresh and not carry context from the in-flight work."
+    loc: L62
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8884-L8886
+        snippet: "// queued=\"true\" when mid-turn with no steer prefix (new default), or\n// with explicit /queue or /q prefix (legacy alias).\n...((isQueuedMidTurn || isQueuedPrefix) ? { queued: 'true' } : {}),"
+      - path: telegram-plugin/tests/steering.test.ts
+        lines: L195
+        snippet: "expect(buildChannelMetaAttributes({ queued: true })).toBe(' queued=\"true\"')"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts emits queued: 'true' in the meta dict for all mid-turn
+      non-steering inbounds. Tests in steering.test.ts pin the exact
+      attribute serialisation. The meta dict becomes channel XML
+      attributes via Claude Code's channel notification mechanism.
+
+  - claim_id: c3
+    quote: "Legacy /queue  / /q  prefix is a redundant alias (still works; same outcome)."
+    loc: L62
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/steering.ts
+        lines: L14-L38
+        snippet: "parseQueuePrefix — These are now aliases for the default queued behavior (mid-turn messages default to queued=\"true\"), but the prefix is still accepted so existing muscle-memory and scripts keep working."
+      - path: telegram-plugin/tests/steering.test.ts
+        lines: L17-L84
+        snippet: "describe('parseQueuePrefix', ...) — tests /queue foo, /q foo"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      steering.ts:parseQueuePrefix accepts /queue and /q prefixes,
+      and steering.test.ts has comprehensive tests for both. gateway.ts
+      line 8454 calls parseQueuePrefix and sets isQueuedPrefix=true when
+      matched, and line 8886 includes queued='true' for both the mid-turn
+      default path and the explicit legacy prefix path.
+
+  - claim_id: c4
+    quote: "Steer = /steer  or /s  prefix. Explicit opt-in to course-correct the in-flight task. The agent receives the body with <channel steering=\"true\"> and treats it as an amendment to the current work."
+    loc: L63
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/steering.ts
+        lines: L41-L60
+        snippet: "parseSteerPrefix — /steer  or /s  explicit steer prefix. Mid-turn messages now default to queued=\"true\". To explicitly mark a message as a course-correction..."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8887-L8888
+        snippet: "// steering=\"true\" only when explicit /steer or /s prefix used.\n...(isSteering ? { steering: 'true' } : {}),"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      parseSteerPrefix in steering.ts correctly parses /steer and /s
+      prefixes. gateway.ts line 8651 sets isSteering=true only when the
+      prior turn is in flight AND the steer prefix is present. Line 8888
+      emits steering='true' in the meta dict. The inbound-delivery-gate
+      explicitly exempts steering messages from buffering (line 114:
+      "if (input.isSteering) return 'deliver'") so they reach claude
+      mid-turn as intended.
+
+  - claim_id: c5
+    quote: "Interrupt + new task = !-prefix marker (#575, gateway-side). A message starting with ! SIGINTs the agent, strips the marker, and forwards the body as a fresh turn."
+    loc: L64
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/interrupt-marker.ts
+        lines: L1-L3
+        snippet: "`!`-prefix interrupt marker — closes #575 / part of `reference/steer-or-queue-mid-flight.md`."
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8027-L8105
+        snippet: "1. SIGINT the agent service ... 2. Strip the `!` and forward the body as a fresh turn ... 3. React with ⚡ on the `!` message"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      interrupt-marker.ts implements parseInterruptMarker. gateway.ts
+      lines 8046-8105 implement the three-step behavior: set ⚡ reaction
+      (8054-8056), send SIGINT via tmux send-keys (8069-8079), forward
+      body as fresh turn or send clarifying reply on empty body (8084-8105).
+
+  - claim_id: c6
+    quote: "Empty ! triggers a 'send your replacement instruction now' reply rather than forwarding nothing."
+    loc: L64
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8084-L8101
+        snippet: "if (interrupt.emptyBody) { ... bot.api.sendMessage(chat_id, '⚡ Interrupted. Send your replacement instruction now.' ..."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts line 8084 checks interrupt.emptyBody and sends the
+      exact reply text "⚡ Interrupted. Send your replacement instruction
+      now." then returns early. The claim's description matches the code.
+
+  - claim_id: c7
+    quote: "What the user sees: 🤝 reaction on a /steer message confirms the steer landed mid-turn; ⚡ reaction on a ! message confirms the interrupt landed; queued messages get the normal 👀 (received) reaction"
+    loc: L65
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8655-L8665
+        snippet: "if (isSteering) {\n  void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '🤝' }])...\n} else if (priorTurnInFlight) {\n  void bot.api.setMessageReaction(chat_id, msgId, [{ type: 'emoji', emoji: '👀' }])"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      gateway.ts lines 8655-8665 implement exactly these three reaction
+      paths: 🤝 for steering (line 8658), 👀 for queued mid-turn (line
+      8663), and ⚡ for interrupt (line 8054-8056 in the interrupt block).
+      The fresh-turn path sets 👀 via the StatusReactionController.setQueued()
+      call at line 8712.
+
+  - claim_id: c8
+    quote: "The agent self-narrates the classification at the top of its reply (e.g. _↪️ Treating as steer on the prior task_ or _📥 Queued as a new task_) so the chosen path is visible, not inferred."
+    loc: L65
+    verdict: aligned
+    evidence:
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L32
+        snippet: "Self-narrate the classification. At the top of your reply for any `steering` or `queued` message, include a brief italic one-liner so the user can correct you — e.g. `_↪️ Treating as steer on the prior task_` or `_📥 Queued as a new task_`."
+      - path: telegram-plugin/uat/scenarios/jtbd-rapid-followup-dm.test.ts
+        lines: L58-L61
+        snippet: "const narratesSteer = /↪️|\\bsteer(ing)?\\b|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(txt);"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The self-narration is a prompt instruction in
+      profiles/_shared/telegram-style.md.hbs (line 32), not a code
+      invariant. The UAT (jtbd-rapid-followup-dm.test.ts) asserts for the
+      narration pattern on both the steer and queued paths, giving
+      behavioral coverage. Evidence is medium (no code enforces it; a
+      prompt-following model could omit it) but the claim itself is
+      accurate as a statement of the instructed contract.
+
+  - claim_id: c9
+    quote: "Nothing the user said gets lost. Not to a race, not to an ambiguity, not to a restart."
+    loc: L39
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/inbound-spool.ts
+        lines: L1-L29
+        snippet: "durable, crash-tolerant spool for buffered inbound ... every buffered inbound is also appended to a JSONL spool on the persistent per-agent volume ... On boot the gateway replays un-acked entries back into the in-memory buffer"
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3478-L3504
+        snippet: "const inboundSpool = STATIC ... path: join(STATE_DIR, 'inbound-spool.jsonl') ... telegram gateway: inbound-spool boot-replay re-queued ${replay.length} un-acked inbound (durable-queue, survives restart)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The inbound-spool JSONL (introduced in #1546/#1549) implements
+      durable buffering that survives container restarts. The inbound-
+      delivery-gate prevents race-loss from mid-turn delivery. The spool's
+      own header note acknowledges a v1 limitation: the ack is "delivered
+      to registered bridge" not "consumed by claude", so the guarantee
+      is not end-to-end. The JTBD claim is at the outcome level and does
+      not overstate this boundary. Evidence is medium because the v1
+      limitation exists as a documented gap.

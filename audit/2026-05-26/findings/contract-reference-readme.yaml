@@ -1,0 +1,252 @@
+unit_id: contract-reference-readme
+unit_path: reference/README.md
+category: contract
+audited_at: 2026-05-26T10:00:00Z
+auditor_notes: |
+  Audited all verifiable claims in reference/README.md.
+
+  Key findings summary:
+  1. JTBD count discrepancy: README lists 14 JTBDs; CLAUDE.md states "13 outcome-focused jobs".
+     All 14 files exist on disk. CLAUDE.md is wrong by one.
+  2. All 14 JTBD files exist, have correct job:/outcome:/stakes: frontmatter within the first
+     5 lines, and are grouped under the correct outcome heading. No dead pointers.
+  3. The head -5 reference/*.md trick works for all 14 JTBD files, but the reference/ dir
+     now contains 22 .md files (8 non-JTBD: README, vision, principles, conversational-pacing,
+     onboarding-gap-analysis, rfc-docker-multi-container, status-card-design, sub-agent-visibility-rfc).
+     The command still surfaces all JTBD frontmatter correctly; non-JTBD files simply produce
+     noise headers. The README's "Survey every job in one read" comment is slightly misleading
+     but functionally adequate.
+  4. onboarding-gap-analysis.md README description says "tracks gaps as they close" but the
+     file's own header says "no longer tracks closure" and "is stale". Minor description drift.
+  5. Outcome 4 label: README uses "Always available" (shortened); vision.md uses "Always
+     available, in Telegram, done properly". Minor drift, vision is authoritative.
+  6. idempotent-update-and-restart.md is missing the "Anti-patterns" and "UAT prompts" sections
+     that every other JTBD file has. The README claims all JTBDs have these sections.
+  7. idempotent-update-and-restart.md link description in README is truncated vs the file's job:
+     field (omits "that" and "no manual checks"). Minor wording drift.
+
+findings:
+  - claim_id: c1
+    quote: "Three documents, three questions. Read in this order."
+    loc: L3
+    verdict: aligned
+    evidence:
+      - path: reference/vision.md
+        lines: L1
+        snippet: "# Switchroom: product vision"
+      - path: reference/principles.md
+        lines: L1
+        snippet: "# Switchroom product principles"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Both vision.md and principles.md exist at the stated paths. The table at L5-L9
+      correctly links both and describes their purpose. All three columns (vision, principles,
+      JTBDs) are present and accurate.
+
+  - claim_id: c2
+    quote: "The verdict rule lives in CLAUDE.md (\"Design contract\" section): a change ships only when it advances one of the four outcomes, satisfies its JTBD, and passes all three principle checks."
+    loc: L11-L13
+    verdict: aligned
+    evidence:
+      - path: CLAUDE.md
+        lines: L260-L264
+        snippet: "### Verdict rule\n\nA change ships when it (a) advances one of the four outcomes,\n(b) satisfies its JTBD, and (c) passes all three principle checks."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      CLAUDE.md has a "## Design contract" section (L224) with a "### Verdict rule" subsection
+      (L260) containing exactly this rule. The README's description matches.
+
+  - claim_id: c3
+    quote: "Each JTBD has a three-line frontmatter — job: / outcome: / stakes: — that captures 80% of the doc."
+    loc: L17-L18
+    verdict: aligned
+    evidence:
+      - path: reference/run-a-fleet-of-specialists.md
+        lines: L1-L5
+        snippet: "---\njob: run a fleet of specialists...\noutcome: ...\nstakes: ..."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All 14 JTBD files confirmed to have job:, outcome:, stakes: fields within the first
+      5 lines. The frontmatter is a three-line YAML block in every case.
+
+  - claim_id: c4
+    quote: "# Survey every job in one read:\nhead -5 reference/*.md"
+    loc: L21-L22
+    verdict: drift-minor
+    evidence:
+      - path: reference/
+        lines: L1
+        snippet: "22 .md files total in reference/; 8 are non-JTBD files without job:/outcome:/stakes: frontmatter"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    proposed_text: |
+      Change the comment to: "# Survey every JTBD in one read (also prints headers for non-JTBD docs):"
+      Or alternatively: "head -5 reference/*.md | grep -E '^(==>|job:|outcome:|stakes:)'"
+      to filter out the noise from the 8 non-JTBD .md files also present in the directory.
+    rationale: |
+      The command works — all 14 JTBD frontmatter fields are surfaced. However, reference/
+      now contains 22 .md files, of which 8 (README.md, vision.md, principles.md,
+      conversational-pacing.md, onboarding-gap-analysis.md, rfc-docker-multi-container.md,
+      status-card-design.md, sub-agent-visibility-rfc.md) do not have JTBD frontmatter.
+      The comment "Survey every job" implies all output lines are JTBD jobs, which is slightly
+      misleading. The behavior is still useful but produces noise headers for the 8 non-JTBD files.
+
+  - claim_id: c5
+    quote: "The body's Signs it's working, Anti-patterns, and UAT prompts sections are where the design teeth are"
+    loc: L25-L28
+    verdict: drift-minor
+    evidence:
+      - path: reference/idempotent-update-and-restart.md
+        lines: L30-L141
+        snippet: "## Signs it's working\n...\n## Signs it's not\n...\n## What the user needs from the surface\n...\n## Worked examples"
+    evidence_strength: medium
+    action: update-text
+    confidence: high
+    proposed_text: |
+      Change "The body's Signs it's working, Anti-patterns, and UAT prompts sections" to
+      "Most JTBD bodies have Signs it's working, Anti-patterns, and UAT prompts sections" —
+      or add Anti-patterns and UAT prompts sections to idempotent-update-and-restart.md to
+      bring it into structural conformance with the other 13 JTBDs.
+    rationale: |
+      13 of 14 JTBD files have all three sections (Signs it's working, Anti-patterns, UAT prompts).
+      idempotent-update-and-restart.md has "Signs it's working" and "Signs it's not" but no
+      "Anti-patterns" or "UAT prompts" sections. The README's claim about "the body's ... sections"
+      implies all JTBDs have this structure. The file uses a different structural template.
+
+  - claim_id: c6
+    quote: "outcome-focused jobs, one per file"
+    loc: L9
+    verdict: aligned
+    evidence:
+      - path: reference/
+        lines: L1
+        snippet: "14 JTBD .md files, each containing exactly one job: field"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All 14 JTBD files each contain a single job: field. The "one per file" claim is accurate.
+
+  - claim_id: c7
+    quote: "run-a-fleet-of-specialists.md — run a fleet of specialists, not one generalist ... (14 files listed in grouped JTBD index)"
+    loc: L34-L56
+    verdict: aligned
+    evidence:
+      - path: reference/run-a-fleet-of-specialists.md
+        lines: L2
+        snippet: "job: run a fleet of specialists, not one generalist"
+      - path: reference/talk-to-agents-from-anywhere.md
+        lines: L2
+        snippet: "job: talk to my agents from anywhere"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All 14 JTBD files listed in the README index exist on disk. The link descriptions
+      match the job: field in each file (the one minor truncation in idempotent-update-and-restart
+      is addressed in c10). The groupings under the four outcome headings are correct and
+      consistent with vision.md.
+
+  - claim_id: c8
+    quote: "### A standing team that knows you — *specialists, not one generalist* (5 JTBDs) / ### You hold the leash — *controlled, purposeful, never roaming* (4 JTBDs) / ### Subscription-honest and predictable — *the plan is the ceiling* (2 JTBDs) / ### Always available — *there when you want it* (3 JTBDs)"
+    loc: L32-L56
+    verdict: aligned
+    evidence:
+      - path: reference/vision.md
+        lines: L52-L103
+        snippet: "### 1. A standing team that knows you: *specialists, not one generalist*\n### 2. You hold the leash: *controlled, purposeful, never roaming*\n### 3. Subscription-honest and predictable: *the plan is the ceiling*\n### 4. Always available, in Telegram, done properly: *there when you want it*"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The four outcome groupings and their JTBD membership are correct. All 14 JTBD files
+      are assigned to the right outcome group. The group headings match vision.md's four
+      outcomes (with the minor Outcome 4 label shortening addressed in c9).
+
+  - claim_id: c9
+    quote: "### Always available — *there when you want it*"
+    loc: L52
+    verdict: drift-minor
+    evidence:
+      - path: reference/vision.md
+        lines: L96
+        snippet: "### 4. Always available, in Telegram, done properly: *there when you want it*"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    proposed_text: |
+      "### Always available, in Telegram, done properly — *there when you want it*"
+      to match vision.md exactly. Or leave abbreviated — this is a low-priority cosmetic fix.
+    rationale: |
+      vision.md's outcome 4 header includes "in Telegram, done properly" which the README
+      omits. Since vision.md is authoritative for contract documents, the README's heading
+      is a minor truncation. CLAUDE.md also uses the shortened form (L238), suggesting the
+      shortening is intentional across the codebase, but vision.md remains the source of truth.
+
+  - claim_id: c10
+    quote: "idempotent-update-and-restart.md — update switchroom and trust everything's running the new version"
+    loc: L55
+    verdict: drift-minor
+    evidence:
+      - path: reference/idempotent-update-and-restart.md
+        lines: L2
+        snippet: "job: update switchroom and trust that everything is actually running the new version, no manual checks"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    proposed_text: |
+      "idempotent-update-and-restart.md — update switchroom and trust everything is actually running the new version, no manual checks"
+    rationale: |
+      The README index description truncates the JTBD job: field. The actual job: value is
+      "update switchroom and trust that everything is actually running the new version, no manual checks".
+      The README omits "that", changes "is actually" to just "s", and drops "no manual checks".
+      This is minor wording drift in the index description.
+
+  - claim_id: c11
+    quote: "13 outcome-focused jobs grouped by outcome in reference/README.md" (from CLAUDE.md L249, which README L9 implicitly represents as its own count via the index)"
+    loc: L34-L56
+    verdict: drift-major
+    evidence:
+      - path: reference/README.md
+        lines: L34-L56
+        snippet: "14 JTBD entries across the four outcome groups (5+4+2+3=14)"
+      - path: CLAUDE.md
+        lines: L249
+        snippet: "13 outcome-focused jobs grouped by outcome in reference/README.md."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    proposed_text: |
+      In CLAUDE.md L249: change "13 outcome-focused jobs" to "14 outcome-focused jobs".
+      The fix is in CLAUDE.md, not in reference/README.md, which is the authoritative source.
+    rationale: |
+      reference/README.md lists exactly 14 JTBD entries (5 under outcome 1, 4 under outcome 2,
+      2 under outcome 3, 3 under outcome 4). All 14 corresponding .md files exist on disk.
+      CLAUDE.md at L249 states "13 outcome-focused jobs" which is wrong by one. The README is
+      the authoritative index; CLAUDE.md references it and gets the count wrong.
+
+  - claim_id: c12
+    quote: "onboarding-gap-analysis.md — phased fix plan from a real onboarding session; tracks gaps as they close, not a durable JTBD."
+    loc: L60
+    verdict: drift-minor
+    evidence:
+      - path: reference/onboarding-gap-analysis.md
+        lines: L3-L8
+        snippet: "## Status — historical (last updated 2026-04-25); no longer tracks closure\n\nThis document is a point-in-time analysis, not a live tracker. Despite being indexed as \"tracks gaps as they close,\" it does not track closure and is stale."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    proposed_text: |
+      "onboarding-gap-analysis.md — point-in-time onboarding gap snapshot (2026-04-25); historical, no longer updated. Not a durable JTBD."
+    rationale: |
+      The README describes this file as "tracks gaps as they close" but the file itself declares
+      in its own Status header (L3) that it "no longer tracks closure" and is "stale." The file
+      even notes it was "indexed as 'tracks gaps as they close'" but that description is wrong.
+      The README index description should be updated to match the file's own self-description.

@@ -1,0 +1,317 @@
+unit_id: jtbd-run-a-fleet-of-specialists
+unit_path: reference/run-a-fleet-of-specialists.md
+category: jtbd
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The JTBD is written cleanly at the outcome level with no leaked implementation
+  details -- no file paths, container names, or class names appear. Most claims
+  are well-supported by code. The main gap is the "Remove an agent" UAT prompt:
+  agent destroy does not clean up the Hindsight memory bank, schedule JSONL, or
+  the switchroom.yaml config entry automatically -- the operator must run
+  switchroom apply separately and the bank persists. The JTBD's "Signs it's
+  working" claim that removal is clean ("no orphaned processes or dangling config")
+  is aspirationally true for processes but not for memory banks. This is flagged
+  as drift-minor rather than outcome-not-realized because the core fleet
+  management story (persona, memory per-agent, add flow, parallel operation,
+  fleet visibility) is all realized. The memory cleanup gap is a known rough edge,
+  not a fundamental product failure.
+findings:
+  - claim_id: c1
+    quote: "A fleet of agents, each shaped for a specific part of the user's life,
+      is a workforce. Health coach in the morning, coding assistant for the afternoon,
+      executive assistant for the inbox, each with its own voice, its own history,
+      its own sense of what's in-scope."
+    loc: L9-L14
+    verdict: aligned
+    evidence:
+      - path: profiles/health-coach/CLAUDE.md.hbs
+        lines: L1-L28
+        snippet: "# Agent: {{name}} — Health & Fitness Coach ... Role: health and
+          fitness coaching agent"
+      - path: profiles/coding/CLAUDE.md.hbs
+        lines: L1-L17
+        snippet: "# Agent: {{name}} — Coding Agent ... Role: senior software
+          engineering agent"
+      - path: profiles/executive-assistant/CLAUDE.md.hbs
+        lines: L1-L5
+        snippet: "# Agent: {{name}} — Executive Assistant"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Three distinct built-in profiles ship with differentiated CLAUDE.md and
+      SOUL.md personas. Per-agent bot tokens (schema.ts:990) and per-agent Hindsight
+      banks (getCollectionForAgent in hindsight.ts:71-77) give each agent its own
+      voice, history, and scope. The fleet is a reality, not a demo.
+
+  - claim_id: c2
+    quote: "The user adds an agent the way they add a contact."
+    loc: L17
+    verdict: aligned
+    evidence:
+      - path: src/agents/add-orchestrator.ts
+        lines: L1-L27
+        snippet: "Single CLI verb that takes a new agent from 'I want a bot for X'
+          to 'X is online, paired, with persona seeded' with zero hand-edits to
+          switchroom.yaml, access.json, vault, or systemd."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The `switchroom agent add` wizard (src/agents/add-orchestrator.ts) provides
+      a guided BotFather walkthrough, profile picker, OAuth relay, and DM pairing
+      in a single verb. The code comment explicitly states "zero hand-edits to
+      switchroom.yaml, access.json, vault, or systemd" which matches the "add a
+      contact" framing.
+
+  - claim_id: c3
+    quote: "Each agent has memory that's its own. What the user told the health
+      coach is not leaking into the coding agent."
+    loc: L24-L25
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L71-L88
+        snippet: "getCollectionForAgent ... returns agentConfig?.memory?.collection
+          ?? agentName ... isStrictIsolation ... returns agentConfig?.memory?.isolation
+          === 'strict'"
+      - path: src/config/schema.ts
+        lines: L124-L128
+        snippet: "isolation: z.enum(['default', 'strict']) ... 'strict = never shared
+          cross-agent, default = eligible for reflect'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Each agent defaults to its own named Hindsight bank (agent name is the
+      collection). Strict isolation mode explicitly prevents cross-agent reflection.
+      The per-agent bank is created at scaffold time (hindsight.ts createBank).
+
+  - claim_id: c4
+    quote: "Tools and skills are scoped per agent. The wrong agent doesn't have
+      the wrong power."
+    loc: L35-L36
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L862-L866
+        snippet: "Sync the set of global-skill symlinks in an agent's .claude/skills/
+          directory against the user's declared skills: list"
+      - path: src/config/schema.ts
+        lines: L109
+        snippet: "Allowed tools (use ['all'] for unrestricted)"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Per-agent skills lists are scaffolded from profiles/<name>/skills/ and
+      controlled via switchroom.yaml tools.allow per agent. The MCP pre-approval
+      list is also per-agent (scaffold.ts:2092-2114).
+
+  - claim_id: c5
+    quote: "When a new agent joins the fleet, it feels like a peer, not a bolt-on.
+      It participates in the same lifecycle, the same safety rules, the same
+      interaction surface."
+    loc: L37-L39
+    verdict: aligned
+    evidence:
+      - path: src/agents/add-orchestrator.ts
+        lines: L1-L27
+        snippet: "scaffold (CLAUDE.md, SOUL.md, IDENTITY.md, USER.md, MEMORY.md),
+          systemd unit, MCP servers, and switchroom.yaml entry"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Every agent regardless of profile goes through the same scaffold, compose
+      generation, vault integration, autoaccept, and gateway sidecar stack. The
+      fleet invariants (sandbox guidance, Telegram pacing, memory protocol) are
+      shared via ~/.switchroom/fleet/switchroom-invariants.md loaded for every agent.
+
+  - claim_id: c6
+    quote: "Removing an agent is clean. Its memory, its state, its scheduled work
+      all go with it, with no orphaned processes or dangling config."
+    loc: L40-L41
+    verdict: drift-minor
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L1930-L1979
+        snippet: "command('destroy') ... rmSync(agentDir, { recursive: true, force:
+          true }) ... 'Run switchroom apply after to take the container down'"
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      agent destroy removes the agent directory and stops the process. However:
+      (1) The Hindsight memory bank is NOT deleted -- it persists in the Hindsight
+      service. (2) The switchroom.yaml config entry is NOT automatically removed
+      by agent destroy -- the operator must edit YAML and run switchroom apply.
+      (3) The scheduler JSONL audit file lives inside the agent dir and is removed
+      with it, which is good. The claim "no orphaned processes or dangling config"
+      is partially true (no orphaned processes after apply) but the memory bank
+      is orphaned. The UAT prompt "Remove an agent. Its artefacts, memory, and
+      schedules should all go." (L75) sets an expectation the code does not fully
+      meet. Suggest updating the UAT prompt to note memory bank cleanup is manual.
+
+  - claim_id: c7
+    quote: "The user can describe what each of their agents is for in one sentence.
+      If they can't, the fleet is too blurry."
+    loc: L42-L43
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L710-L778
+        snippet: "command('list') ... description('List all agents with their status')
+          ... headers = ['Name', 'Status', 'Uptime', 'Template', 'Scheduler', 'Topic']"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      switchroom agent list shows each agent with its profile template and topic
+      name, giving the operator a clear fleet overview. The per-agent topic_name
+      and topic_emoji fields in schema.ts further support distinct identity.
+
+  - claim_id: c8
+    quote: "One agent pretending to be multiple by switching tone on command.
+      Personas without separation of memory and scope are cosplay."
+    loc: L47-L48
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L71-L88
+        snippet: "getCollectionForAgent ... per-agent bank ... isStrictIsolation"
+      - path: src/config/schema.ts
+        lines: L124-L128
+        snippet: "strict = never shared cross-agent"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The anti-pattern is clearly not the product's design. Each agent runs in its
+      own container, has its own bank, and its own bot token. There is no shared
+      session model.
+
+  - claim_id: c9
+    quote: "Making adding an agent a project. If it takes more than a few minutes
+      of light config, users won't grow the fleet."
+    loc: L56-L57
+    verdict: aligned
+    evidence:
+      - path: src/agents/add-orchestrator.ts
+        lines: L1-L27
+        snippet: "switchroom agent add n+1 bot wizard ... BotFather walkthrough ...
+          Profile + skill picker ... Pairing block ... Final preflight"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      switchroom agent add provides a fully guided wizard. The code comment
+      explicitly targets "zero hand-edits to switchroom.yaml, access.json, vault,
+      or systemd." This directly avoids the anti-pattern.
+
+  - claim_id: c10
+    quote: "A fleet-management story that lives in docs but not in the product.
+      The user should be able to see the fleet, not just read about how it works."
+    loc: L59-L60
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L710-L790
+        snippet: "command('list') ... List all agents with their status ... headers
+          = ['Name', 'Status', 'Uptime', 'Template', 'Scheduler', 'Topic']"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      switchroom agent list provides a fleet table view in the CLI. The Telegram
+      /status command also surfaces agent state in-channel. The fleet is observable,
+      not just documented.
+
+  - claim_id: c11
+    quote: "Memory isolation. Tell one agent something personal, ask the other
+      about it. It should not know."
+    loc: L68-L69
+    verdict: aligned
+    evidence:
+      - path: src/memory/hindsight.ts
+        lines: L71-L88
+        snippet: "getCollectionForAgent returns agentConfig?.memory?.collection ??
+          agentName ... isStrictIsolation"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Memory isolation is implemented via per-agent Hindsight banks. By default
+      agents cannot see each other's memories (separate collection names). The
+      UAT prompt is realizable with the shipped architecture.
+
+  - claim_id: c12
+    quote: "Scope enforcement. Ask a specialist something clearly outside its
+      remit. It should redirect, not attempt."
+    loc: L70-L71
+    verdict: aligned
+    evidence:
+      - path: profiles/health-coach/CLAUDE.md.hbs
+        lines: L27-L28
+        snippet: "Boundaries: Recommend the user consult a professional for: ...
+          Say it plainly: 'That's outside my lane'"
+      - path: profiles/health-coach/workspace/SOUL.md.hbs
+        lines: L23
+        snippet: "Know your limits ... When something is outside your scope, say
+          so immediately"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Scope enforcement is implemented via profile-specific CLAUDE.md.hbs and
+      SOUL.md.hbs content (boundaries sections). This is prompt-enforced, not
+      architectural -- the SOUL.md boundary field is configurable per agent. The
+      health-coach profile explicitly names the redirect pattern ("That's outside
+      my lane"). Confidence is medium because this is LLM behavior, not a hard
+      technical gate.
+
+  - claim_id: c13
+    quote: "Parallel work. Have two agents doing real work at the same time.
+      Neither should degrade the other's experience."
+    loc: L76-L77
+    verdict: aligned
+    evidence:
+      - path: src/agents/lifecycle.ts
+        lines: L116
+        snippet: "already-running fleet rather than spawning a parallel project"
+      - path: src/agents/compose.ts
+        lines: L1-L5
+        snippet: "generates per-agent containers in a single compose project"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      Each agent runs in its own Docker container with its own process tree and
+      network_mode: host. Parallelism is the design assumption throughout the
+      compose generator and lifecycle code. The web rate-limiter test at
+      src/web/webhook-handler.test.ts:423 specifically tests cross-agent isolation.
+
+  - claim_id: c14
+    quote: "Cross-agent handoff. Need a thing that crosses two specialists. The
+      user should be able to route it without the agents silently reaching into
+      each other."
+    loc: L78-L80
+    verdict: aligned
+    evidence:
+      - path: src/config/schema.ts
+        lines: L1521
+        snippet: "an agent reach into shared dirs ... without ..."
+      - path: src/agent-scheduler/index.ts
+        lines: L23
+        snippet: "under the agent's own bind mount, never shared across agents"
+    evidence_strength: weak
+    action: keep
+    confidence: low
+    rationale: |
+      The architectural isolation (separate containers, separate bind mounts, no
+      shared IPC) prevents silent cross-agent reach. User-mediated handoff via
+      Telegram (routing a message manually) is the intended pattern. No dedicated
+      "handoff" feature was found; this claim is about what does NOT happen
+      (agents do not silently reach into each other) rather than a feature.
+      Evidence is weak because the positive claim (user can route it) is just
+      "use Telegram" -- no special tooling exists for this.
