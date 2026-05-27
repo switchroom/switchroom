@@ -2476,12 +2476,23 @@ export function scaffoldAgent(
     const switchroomCliPath = "/usr/local/bin/switchroom";
     const resolvedConfigPath = DOCKER_CONFIG_PATH;
 
+    // TELEGRAM_STATE_DIR MUST be the in-container view, not derived from
+    // `agentDir` (which is HOME-dependent and differs between host CLI and
+    // in-container CLI). Both writers target the same on-disk .mcp.json via
+    // bind-mount; the file is consumed by the in-container Claude, so the
+    // value must always be the in-container path regardless of where the
+    // writer runs. Pre-fix: host apply wrote `/home/<user>/...`, in-container
+    // reconcile wrote `/state/agent/home/...`, each invocation flipped the
+    // file and the broker's cron-only reconcile saw drift on every
+    // `schedule_add`. See switchroom#1892.
+    const telegramStateDir = `${DOCKER_AGENT_HOME}/.switchroom/agents/${name}/telegram`;
+
     const mcpServers: Record<string, McpServerConfig> = {
       "switchroom-telegram": {
         command: "bun",
         args: ["run", "--cwd", pluginDir, "--shell=bun", "--silent", "start"],
         env: {
-          TELEGRAM_STATE_DIR: join(agentDir, "telegram"),
+          TELEGRAM_STATE_DIR: telegramStateDir,
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
@@ -4427,12 +4438,18 @@ export function reconcileAgent(
     const switchroomCliPath = "/usr/local/bin/switchroom";
     const resolvedConfigPath = DOCKER_CONFIG_PATH;
 
+    // See companion comment + telegramStateDir derivation in scaffoldAgent
+    // (~line 2479). Must match byte-for-byte across both writers or every
+    // cron-only reconcile reports drift on the writer's own output.
+    // switchroom#1892.
+    const telegramStateDir = `${DOCKER_AGENT_HOME}/.switchroom/agents/${name}/telegram`;
+
     const mcpServers: Record<string, McpServerConfig> = {
       "switchroom-telegram": {
         command: "bun",
         args: ["run", "--cwd", pluginDir, "--shell=bun", "--silent", "start"],
         env: {
-          TELEGRAM_STATE_DIR: join(agentDir, "telegram"),
+          TELEGRAM_STATE_DIR: telegramStateDir,
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
