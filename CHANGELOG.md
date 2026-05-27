@@ -1,5 +1,83 @@
 # Changelog
 
+## v0.13.53 — supergroup-mode foundations + parallel-turns deadlock fix
+
+Ships the entire **per-agent Telegram supergroup mode** design
+(`docs/rfcs/supergroup-mode.md`) as a structural foundation: one
+agent can own a whole supergroup with multiple forum topics, and the
+gateway handles per-topic conversation state, queuing, and routing
+correctly. Behavior under existing fleet-shared / DM topologies is
+unchanged — this is additive scaffolding for the new topology.
+
+The headline correctness fix is **PR3b** (#1880): supergroup-mode
+parallel-turns deadlock. Pre-fix, when topic A was processing and
+topic B's user sent a message, B's eager `activeTurnStartedAt[keyB]`
+entry would pin the fleet-wide held-inbound flush gate forever (B
+never reached claude, so no turn_end ever fired for B). The fix
+splits the conflated map into `activeTurnStartedAt` (receipt-side
+timestamp) + `claudeBusyKeys` (delivery-side fleet gate). 340-line
+surgical fix, NOT the originally-planned 5-8 day `currentTurn` →
+`Map` refactor — claude serializes, so the singleton is structurally
+correct; the actual load-bearing piece was the fleet gate.
+
+This release also ships the auth-broker side of the **Microsoft 365
+integration** (RFC #1873 PR 1/5) — Microsoft provider + storage
+landed but not yet user-facing (subsequent PRs ship the refresher
+sidecar, MCP launcher glue, and skills).
+
+Plus the standalone `switchroom status` CLI for fleet/accounts/MCPs
+snapshot (#1853).
+
+### Supergroup mode (10 PRs)
+
+- **PR1 (#1868)** — schema + outbound topic router helper. Pure
+  additive: `channels.telegram.chat_id` / `default_topic_id` /
+  `topic_aliases` fields parse, `resolveOutboundTopic()` helper exists.
+- **PR2 (#1869)** — chat-lock + inbound-coalesce per-(chat,thread)
+  keying. The grammY chat-lock proxy and inbound-coalesce key both
+  canonicalize via `chatKey(chat, thread)`. 429-isolation guardrail
+  test pins the cross-topic API isolation contract.
+- **PR3 (#1870)** — typing indicators + auth-intercept maps
+  per-(chat,thread). Cross-topic clobber closed; pendingAuthAddFlows
+  + pendingReauthFlows re-keyed.
+- **PR3b (#1880)** — supergroup-mode parallel-turns deadlock fix.
+  See headline above. Introduces `claudeBusyKeys: Set<string>` as the
+  delivery-side fleet gate, separate from the receipt-side
+  `activeTurnStartedAt`. 5 new regression tests pin both the pre-fix
+  failure mode AND the post-fix invariants.
+- **PR4a (#1871)** — General-topic strip-1 wrapper. Bot API rejects
+  `message_thread_id=1` (MTProto's General-topic id) on send;
+  `chatLock.wrapBot` strips it transparently. 6 tests.
+- **PR4b-boot (#1874)** — boot card / SessionStart routes via
+  `resolveOutboundTopic({ kind: 'boot' })` for supergroup-owned
+  agents (alerts alias → default_topic_id fallback).
+- **PR4b-cron (#1876)** — per-cron `schedule[].topic` field wired
+  through the in-agent synthesizer. Cascade-aware `resolveChannelTarget`
+  picks supergroup chat_id when set; `resolveEntryThreadId` helper
+  resolves alias → number per entry.
+- **PR4b-compact (#1877)** — proactive-compaction card routing.
+  Generalizes the boot-card helper into `resolveAgentOutboundTopic(event)`
+  so all future emitter wirings are one-line changes.
+- **#1878** — loader-side validation of cron `topic:` aliases.
+  Typos fail fast at config-load with aggregated cross-field error
+  instead of silent fallback at dispatch time.
+- **PR7 (#1872)** — `switchroom telegram topics <chat_id>` discovery
+  CLI. Reads the agent's local SQLite history buffer, surfaces
+  distinct thread_ids with first-message preview, generates a
+  copy-paste-ready `topic_aliases:` YAML snippet.
+
+### Microsoft 365 integration (1 of 5)
+
+- **#1873** — RFC + validation-pass update (#1879).
+- **#1881** — auth-broker Microsoft provider + storage (PR 1/5).
+  Common-tenant Entra app, MSAL device-code flow, broker-only token
+  storage. Subsequent PRs (sidecar refresher v1, MCP launcher glue,
+  skills) build on this foundation.
+
+### Standalone
+
+- **#1853** — `switchroom status` CLI for fleet/accounts/MCPs snapshot.
+
 ## v0.13.52 — agents now know about clone-to-personal (discovery gap)
 
 The plumbing landed in v0.13.45-51, but the doc every agent reads on
