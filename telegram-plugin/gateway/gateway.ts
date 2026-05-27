@@ -1109,6 +1109,41 @@ const outboundDedup = new OutboundDedupCache()
 const chatAvailableReactions = new Map<string, Set<string> | null>()
 const chatProbesInFlight = new Set<string>()
 const activeTurnStartedAt = new Map<string, number>()
+// PR3b parallel-turns: tracks turns claude has ACTUALLY been handed
+// (set after successful sendToAgent, cleared on turn_end), as opposed
+// to activeTurnStartedAt which is set eagerly on inbound receipt to
+// stamp the user-visible turn start time. Under fleet-shared and DM
+// topologies these are equivalent — every received inbound is delivered.
+// Under supergroup-owned (one agent owns the whole supergroup, multiple
+// topics share this gateway process), topic B's inbound that arrives
+// while topic A is processing gets buffered; without this split, keyB
+// stays in activeTurnStartedAt forever (no turn_end ever fires for a
+// turn claude never started), so the fleet-wide "claude is idle" gate
+// at purgeReactionTracking/releaseTurnBufferGate never re-opens — the
+// canonical supergroup-mode deadlock. Fleet gates read claudeBusyKeys;
+// per-key reads (status-query metric, wedge detection, etc.) keep
+// reading activeTurnStartedAt because they want the receipt timestamp.
+const claudeBusyKeys = new Set<string>()
+
+/**
+ * Helper: stamp a claudeBusyKeys entry for an inbound about to be
+ * handed to claude. Pulls the thread id from the top-level field if
+ * present, otherwise falls back to meta.message_thread_id (cron and
+ * vault-synthetic inbounds put it there). chatKey canonicalises
+ * null/undefined/0 to `_` so callers don't need to think about it.
+ */
+function markClaudeBusyForInbound(m: {
+  chatId: string
+  threadId?: number
+  meta?: Record<string, string>
+}): void {
+  let tid: number | null = m.threadId ?? null
+  if (tid == null && m.meta?.message_thread_id != null) {
+    const n = Number(m.meta.message_thread_id)
+    if (Number.isFinite(n)) tid = n
+  }
+  claudeBusyKeys.add(chatKey(m.chatId, tid))
+}
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
@@ -1352,6 +1387,10 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
   activeTurnStartedAt.delete(key)
+  // PR3b: clear the parallel-turns fleet-gate entry. Symmetric with
+  // the markClaudeBusyForInbound on the delivery path. Safe no-op
+  // when the key was never marked (synthetic purge from a sweep).
+  claudeBusyKeys.delete(key)
   // Human-feel UX: stop the turn-long `typing…` indicator started in
   // the turn-start block. `purgeReactionTracking` is the canonical
   // turn-end, so this is the single owner of the stop. (If an abnormal
@@ -1390,7 +1429,13 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // survives us getting killed by our own restart. Fire-and-forget;
   // response to the client was already sent when the restart was
   // scheduled, so nobody is waiting on this.
-  if (activeTurnStartedAt.size === 0) {
+  //
+  // PR3b: gated on `claudeBusyKeys.size`, not `activeTurnStartedAt.size`,
+  // so a buffered topic-B inbound (which had eagerly set its own
+  // activeTurnStartedAt entry in the fresh-turn branch) doesn't pin this
+  // gate forever while claude is genuinely idle. See the claudeBusyKeys
+  // declaration for the supergroup deadlock this fixes.
+  if (claudeBusyKeys.size === 0) {
     // #1556: the deterministic delivery point. claude has just gone
     // idle — flush any inbound held mid-turn so the channel
     // notification lands at the idle prompt and submits as a fresh
@@ -1403,7 +1448,11 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
       const fr = redeliverBufferedInbound(
         pendingInboundBuffer,
         selfAgentForFlush,
-        (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
+        (m) => {
+          const d = ipcServer.sendToAgent(selfAgentForFlush, m)
+          if (d) markClaudeBusyForInbound(m)
+          return d
+        },
         inboundSpool,
       )
       if (fr.redelivered > 0) {
@@ -1471,6 +1520,9 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
 function releaseTurnBufferGate(key: string): void {
   if (!activeTurnStartedAt.has(key)) return
   activeTurnStartedAt.delete(key)
+  // PR3b: keep claudeBusyKeys in sync — same lifecycle as the
+  // activeTurnStartedAt entry it's mirroring here.
+  claudeBusyKeys.delete(key)
   // Shadow trace so the structural turn-end metric still records.
   // outboundEmitted=true is correct here — we only reach this from
   // executeReply AFTER an outbound landed.
@@ -1481,13 +1533,19 @@ function releaseTurnBufferGate(key: string): void {
   // hits zero-active-turns, drain any held inbound. This is the
   // load-bearing wedge fix: the gate that pinned msg 1874+ in
   // test-harness's 13:02 UAT now opens after the reply.
-  if (activeTurnStartedAt.size === 0) {
+  //
+  // PR3b: gated on claudeBusyKeys (see purgeReactionTracking comment).
+  if (claudeBusyKeys.size === 0) {
     const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
     if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
       const fr = redeliverBufferedInbound(
         pendingInboundBuffer,
         selfAgentForFlush,
-        (m) => ipcServer.sendToAgent(selfAgentForFlush, m),
+        (m) => {
+          const d = ipcServer.sendToAgent(selfAgentForFlush, m)
+          if (d) markClaudeBusyForInbound(m)
+          return d
+        },
         inboundSpool,
       )
       if (fr.redelivered > 0) {
@@ -3443,7 +3501,11 @@ silencePoke.startTimer({
     const fbRedeliver = redeliverBufferedInbound(
       pendingInboundBuffer,
       fbSelfAgent,
-      (m) => ipcServer.sendToAgent(fbSelfAgent, m),
+      (m) => {
+        const d = ipcServer.sendToAgent(fbSelfAgent, m)
+        if (d) markClaudeBusyForInbound(m)
+        return d
+      },
       inboundSpool,
     )
     process.stderr.write(
@@ -3771,6 +3833,7 @@ const ipcServer: IpcServer = createIpcServer({
       activeStatusReactions,
       activeReactionMsgIds,
       activeTurnStartedAt,
+      claudeBusyKeys,
       activeDraftStreams,
       activeDraftParseModes,
       clearActiveReactions: () => {
@@ -3966,8 +4029,11 @@ const ipcServer: IpcServer = createIpcServer({
   onScheduleRestart(client: IpcClient, msg: ScheduleRestartMessage) {
     const { agentName } = msg;
 
-    // Check if any turn is currently in flight
-    const turnInFlight = activeTurnStartedAt.size > 0;
+    // Check if any turn is currently in flight.
+    // PR3b: gated on claudeBusyKeys (actually-handed-to-claude turns)
+    // not activeTurnStartedAt (receipt-eager), so a buffered topic-B
+    // inbound doesn't pin this as turnInFlight=true forever.
+    const turnInFlight = claudeBusyKeys.size > 0;
 
     if (!turnInFlight) {
       // No active turn, restart immediately. Cycle both the agent and
@@ -4242,6 +4308,7 @@ const ipcServer: IpcServer = createIpcServer({
       ? msg.inbound.meta.source
       : 'unknown'
     const delivered = ipcServer.sendToAgent(msg.agentName, msg.inbound)
+    if (delivered) markClaudeBusyForInbound(msg.inbound)
     process.stderr.write(
       `telegram gateway: inject_inbound agent=${msg.agentName} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
     )
@@ -4290,11 +4357,16 @@ if (!STATIC) {
       () => {
         // #1556: never drain mid-turn — that re-creates the composer
         // wedge this buffer exists to prevent.
-        if (activeTurnStartedAt.size > 0) return false
+        // PR3b: gated on claudeBusyKeys (see purgeReactionTracking).
+        if (claudeBusyKeys.size > 0) return false
         const c = ipcServer.getClient(selfAgent)
         return c != null && c.isAlive()
       },
-      (m) => ipcServer.sendToAgent(selfAgent, m),
+      (m) => {
+        const d = ipcServer.sendToAgent(selfAgent, m)
+        if (d) markClaudeBusyForInbound(m)
+        return d
+      },
       inboundSpool,
     )
     if (r != null && r.redelivered > 0) {
@@ -8034,7 +8106,16 @@ async function handleInbound(
   // an ack on the buffered path). The snapshot is the minimal precise
   // fix. Phase 2b's state-machine extraction will revisit this
   // structurally.
-  const turnInFlightAtReceipt = activeTurnStartedAt.size > 0
+  // PR3b: gated on claudeBusyKeys (turns claude has been handed) not
+  // activeTurnStartedAt (eager set on receipt). In supergroup mode,
+  // topic A active + topic B inbound arriving: pre-fix, B saw
+  // turnInFlightAtReceipt=true because A's key was in
+  // activeTurnStartedAt, AND B's fresh-turn branch then eagerly set
+  // its OWN key — wedging the gate forever (claude is idle on B but
+  // no turn_end ever fires). With claudeBusyKeys, B sees true (A is
+  // busy) → B is buffered correctly, AND the gate cleanly reopens
+  // when A's turn_end deletes keyA → flush triggers → B delivered.
+  const turnInFlightAtReceipt = claudeBusyKeys.size > 0
 
   const access = result.access
   const from = ctx.from!
@@ -9006,6 +9087,7 @@ async function handleInbound(
   }
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
+  if (delivered) markClaudeBusyForInbound(inboundMsg)
   if (!delivered) {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
     const threadOpts = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
@@ -11929,6 +12011,7 @@ async function performVaultAccessApproval(
     operatorId: senderId,
   })
   const delivered = ipcServer.sendToAgent(pending.agent, synthetic)
+  if (delivered) markClaudeBusyForInbound(synthetic)
   process.stderr.write(
     `telegram gateway: vault_grant_approved injection agent=${pending.agent} ` +
     `key=${pending.key} stage=${stageId} delivered=${delivered}\n`,
@@ -12008,6 +12091,7 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
       operatorId: senderId,
     })
     const denyDelivered = ipcServer.sendToAgent(pending.agent, denyInbound)
+    if (denyDelivered) markClaudeBusyForInbound(denyInbound)
     process.stderr.write(
       `telegram gateway: vault_grant_denied injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${denyDelivered}\n`,
@@ -12158,6 +12242,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       operatorId: senderId,
     })
     const dDelivered = ipcServer.sendToAgent(pending.agent, discardInbound)
+    if (dDelivered) markClaudeBusyForInbound(discardInbound)
     process.stderr.write(
       `telegram gateway: vault_save_discarded injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${dDelivered}\n`,
@@ -12281,6 +12366,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         reason: failReason,
       })
       const fDelivered = ipcServer.sendToAgent(pending.agent, failInbound)
+      if (fDelivered) markClaudeBusyForInbound(failInbound)
       process.stderr.write(
         `telegram gateway: vault_save_failed injection agent=${pending.agent} ` +
         `key=${pending.key} stage=${stageId} delivered=${fDelivered}\n`,
@@ -12310,6 +12396,7 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       operatorId: senderId,
     })
     const okDelivered = ipcServer.sendToAgent(pending.agent, okInbound)
+    if (okDelivered) markClaudeBusyForInbound(okInbound)
     process.stderr.write(
       `telegram gateway: vault_save_completed injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${okDelivered}\n`,
@@ -14308,6 +14395,7 @@ bot.on('callback_query:data', async ctx => {
     // by onClientRegistered) makes the "queued" promise real.
     const selfAgentBtn = process.env.SWITCHROOM_AGENT_NAME ?? ''
     const btnDelivered = ipcServer.sendToAgent(selfAgentBtn, inboundMsg)
+    if (btnDelivered) markClaudeBusyForInbound(inboundMsg)
     if (!btnDelivered) {
       pendingInboundBuffer.push(selfAgentBtn, inboundMsg)
       // No registered bridge — the agent's mid-restart. Tell the user
@@ -15192,6 +15280,7 @@ function flushReactionBatch(batch: ReactionBatch): void {
     meta,
   }
   const delivered = ipcServer.sendToAgent(agentName, inbound)
+  if (delivered) markClaudeBusyForInbound(inbound)
   process.stderr.write(
     `telegram gateway: reactions.dispatch agent=${agentName} chat=${batch.chatId} ` +
     `count=${batch.reactions.length} batched=${batch.batched} delivered=${delivered}\n`,
