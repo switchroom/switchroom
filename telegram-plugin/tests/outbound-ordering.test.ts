@@ -170,6 +170,113 @@ describe('wrapBot — bot.api.* calls auto-lock by first-arg chat id', () => {
     expect(rb.message_id).toBe(20)
   })
 
+  it('SAME chat + DIFFERENT thread sendMessage calls dispatch concurrently (supergroup-mode unblock)', async () => {
+    // PR2 of supergroup-mode: chat-lock moved from chatId-only keying
+    // to (chat, thread) keying. Two topics in the same supergroup must
+    // not artificially serialize at the bot.api layer.
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    const dTopicA = deferred<{ message_id: number }>()
+    const dTopicB = deferred<{ message_id: number }>()
+    const started: string[] = []
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      started.push(`A:${t}`)
+      return dTopicA.promise
+    })
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      started.push(`B:${t}`)
+      return dTopicB.promise
+    })
+
+    // Same chatId "supergrp" but different message_thread_id.
+    const pA = wrapped.api.sendMessage('supergrp', 'planning msg', { message_thread_id: 17 })
+    const pB = wrapped.api.sendMessage('supergrp', 'cron digest', { message_thread_id: 23 })
+    await Promise.resolve(); await Promise.resolve()
+    // BOTH should have started — supergroup-mode parallelism guarantee.
+    expect(started).toEqual(['A:planning msg', 'B:cron digest'])
+
+    // Resolve B first; A's resolution must not delay B's return.
+    dTopicB.resolve({ message_id: 200 })
+    const rB = await pB
+    expect(rB.message_id).toBe(200)
+
+    dTopicA.resolve({ message_id: 100 })
+    const rA = await pA
+    expect(rA.message_id).toBe(100)
+  })
+
+  it('SAME chat + SAME thread sendMessage calls STILL serialize (per-topic ordering preserved)', async () => {
+    // Per-topic message order matters (a reply tied to a message_id
+    // must see that message exist first). The lock must still serialize
+    // within a topic.
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    const dSlow = deferred<{ message_id: number }>()
+    const startOrder: string[] = []
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      startOrder.push(`first:${t}`)
+      const r = await dSlow.promise
+      startOrder.push(`first:end:${t}`)
+      return r
+    })
+    bot.api.sendMessage.mockImplementationOnce(async (_c: string, t: string) => {
+      startOrder.push(`second:${t}`)
+      return { message_id: 2 }
+    })
+
+    const p1 = wrapped.api.sendMessage('supergrp', 'first', { message_thread_id: 17 })
+    const p2 = wrapped.api.sendMessage('supergrp', 'second', { message_thread_id: 17 })
+
+    await Promise.resolve(); await Promise.resolve()
+    // Same thread → second waits for first.
+    expect(startOrder).toEqual(['first:first'])
+
+    dSlow.resolve({ message_id: 1 })
+    await Promise.all([p1, p2])
+    expect(startOrder).toEqual(['first:first', 'first:end:first', 'second:second'])
+  })
+
+  it('a 429 from one topic does NOT stall sends to a different topic in the same chat', async () => {
+    // CPO #8=B guardrail: when grammY's autoRetry transformer backs off
+    // on a 429 in topic A, topic B's sends must keep flowing. This test
+    // pins the contract by simulating a slow/rejecting first call (proxy
+    // for a 429+backoff path) on topic A and asserting topic B doesn't
+    // wait on it.
+    const lock = createChatLock()
+    const bot = createMockBot()
+    const wrapped = lock.wrapBot({ api: bot.api as unknown as Record<string, unknown> }) as unknown as typeof bot
+
+    // Topic A's send hangs (proxy for an in-flight 429-backoff path);
+    // topic B's send must NOT wait on it.
+    const dTopicA = deferred<{ message_id: number }>()
+    const started: string[] = []
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      started.push('topicA:start')
+      return dTopicA.promise
+    })
+    bot.api.sendMessage.mockImplementationOnce(async () => {
+      started.push('topicB:start')
+      return { message_id: 2 }
+    })
+
+    const pA = wrapped.api.sendMessage('supergrp', 'overloaded', { message_thread_id: 17 })
+    const pB = wrapped.api.sendMessage('supergrp', 'unaffected', { message_thread_id: 23 })
+
+    // Topic B should complete WITHOUT waiting on topic A's hang.
+    const rB = await pB
+    expect(rB.message_id).toBe(2)
+    expect(started).toContain('topicB:start')
+
+    // Resolve A so the lock chain drains cleanly.
+    dTopicA.resolve({ message_id: 1 })
+    const rA = await pA
+    expect(rA.message_id).toBe(1)
+  })
+
   it('react (setMessageReaction) queues behind an in-flight reply (sendMessage) to the same chat', async () => {
     const lock = createChatLock()
     const bot = createMockBot()

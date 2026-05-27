@@ -137,11 +137,24 @@ export function createInboundCoalescer<T>(opts: InboundCoalescerOptions<T>): Inb
 }
 
 /**
- * Build a coalesce key from `(chatId, userId)`. Identity-stable across
- * messages from the same sender in the same chat, distinct across
- * different senders so a user-driven reply isn't merged with a sibling
- * message from someone else in a group chat.
+ * Build a coalesce key from `(chatId, threadId, userId)`. Identity-stable
+ * across messages from the same sender in the same chat and topic,
+ * distinct across:
+ *   - different senders (so one user's typing isn't merged with another's)
+ *   - different topics (so a user typing in #planning isn't merged with
+ *     the same user's message in #admin — supergroup-mode invariant,
+ *     CPO decision #9 ratified 2026-05-27)
+ *
+ * `threadId` collapses `null`/`undefined`/`0` to `_` via the same
+ * convention as `chatKey()`. The 1.5s coalesce window is per-topic
+ * intent ("user sends 3 sentences as one thought") — applying it
+ * cross-topic merges genuinely separate conversations.
  */
-export function inboundCoalesceKey(chatId: string, userId: string): string {
-  return `${chatId}:${userId}`
+export function inboundCoalesceKey(
+  chatId: string,
+  threadId: number | null | undefined,
+  userId: string,
+): string {
+  const t = threadId == null || threadId === 0 ? '_' : String(threadId)
+  return `${chatId}:${t}:${userId}`
 }
