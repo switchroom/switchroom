@@ -6975,7 +6975,10 @@ function handleSessionEvent(ev: SessionEvent): void {
         && !isTelegramSurfaceTool(name)
       ) {
         turn.intentSurfaceFired = true
-        const surface = deriveIntentSurface(name, ev.toolInput, ev.precomputedLabel)
+        // `ev.input` is the canonical SessionEvent property
+        // (`telegram-plugin/session-tail.ts:95`). All other tool_use
+        // sites in this file use `ev.input` — keep that consistent.
+        const surface = deriveIntentSurface(name, ev.input, ev.precomputedLabel)
         if (surface.text != null) {
           // Mark the ack-flag synchronously BEFORE the async send so a
           // PreToolUse ack-first hook (#1921) firing concurrently for this
@@ -7003,11 +7006,14 @@ function handleSessionEvent(ev: SessionEvent): void {
                 }),
                 { chat_id: surfaceChat, ...(surfaceThread != null ? { threadId: surfaceThread } : {}), verb: 'intent-surface' },
               )
-              // Count this as an outbound for KPI/silence-poke purposes —
-              // a framework-owned message still tells the user the agent
-              // is alive, so the silence clock should reset.
-              signalTracker.noteOutbound(statusKey(surfaceChat, surfaceThread), Date.now())
-              silencePoke.noteOutbound(statusKey(surfaceChat, surfaceThread), Date.now())
+              // Deliberately NOT calling signalTracker.noteOutbound /
+              // silencePoke.noteOutbound here — framework-owned
+              // ambient messages are not model-author outbounds, so
+              // they should not reset the TTFO clock or short-circuit
+              // the silence-poke ladder. Mirrors the sibling
+              // `onAwarenessPing` handler (silence-poke.ts:169
+              // contract: "Caller must NOT call back into noteOutbound
+              // for this — it's a framework-sourced message").
             } catch (err) {
               process.stderr.write(`telegram gateway: intent-surface send failed: ${err}\n`)
             }
