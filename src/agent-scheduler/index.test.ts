@@ -19,6 +19,7 @@ import type {
 import {
   registerAgentSchedule,
   resolveChannelTarget,
+  resolveEntryThreadId,
   type CronLib,
 } from "./index.js";
 
@@ -233,5 +234,105 @@ describe("resolveChannelTarget", () => {
       agents: {},
     } as unknown as Parameters<typeof resolveChannelTarget>[0];
     expect(resolveChannelTarget(config, "ghost")).toEqual({ chatId: "-100" });
+  });
+
+  // ─── PR4b-cron: supergroup-mode override paths ──────────────────────────
+  it("uses the per-agent supergroup chat_id when set (overrides fleet forum_chat_id)", () => {
+    const config = {
+      telegram: { forum_chat_id: "-1001111111111" },  // fleet, ignored
+      agents: {
+        klanker: {
+          channels: {
+            telegram: {
+              chat_id: "-1002222222222",
+              default_topic_id: 1,
+              topic_aliases: { planning: 17, admin: 31 },
+            },
+          },
+        },
+      },
+    } as unknown as Parameters<typeof resolveChannelTarget>[0];
+    const target = resolveChannelTarget(config, "klanker");
+    expect(target).not.toBeNull();
+    expect(target!.chatId).toBe("-1002222222222");
+    expect(target!.threadId).toBe(1);
+    expect(target!.routerConfig).toEqual({
+      default_topic_id: 1,
+      topic_aliases: { planning: 17, admin: 31 },
+    });
+  });
+
+  it("falls back to fleet forum_chat_id when channels.telegram.chat_id is absent", () => {
+    const config = {
+      telegram: { forum_chat_id: "-1001111111111" },
+      agents: {
+        klanker: {
+          topic_id: 42,
+          channels: { telegram: { /* no chat_id */ } },
+        },
+      },
+    } as unknown as Parameters<typeof resolveChannelTarget>[0];
+    const target = resolveChannelTarget(config, "klanker");
+    expect(target).toEqual({
+      chatId: "-1001111111111",
+      threadId: 42,
+    });
+    expect("routerConfig" in target!).toBe(false);
+  });
+});
+
+describe("resolveEntryThreadId", () => {
+  function makeEntry(topic?: string | number) {
+    return {
+      agent: "klanker",
+      scheduleIndex: 0,
+      cron: "0 8 * * *",
+      prompt: "test",
+      promptKey: "abc",
+      ...(topic !== undefined ? { topic } : {}),
+    };
+  }
+  const SG_CHANNEL = {
+    chatId: "-1002222222222",
+    threadId: 1,
+    routerConfig: {
+      default_topic_id: 1,
+      topic_aliases: { planning: 17, admin: 31 },
+    },
+  };
+  const FLEET_CHANNEL = {
+    chatId: "-1001111111111",
+    threadId: 42,
+  };
+
+  it("resolves a string alias against routerConfig.topic_aliases", () => {
+    expect(resolveEntryThreadId(makeEntry("planning"), SG_CHANNEL)).toBe(17);
+    expect(resolveEntryThreadId(makeEntry("admin"), SG_CHANNEL)).toBe(31);
+  });
+
+  it("passes through a numeric topic ID unchanged", () => {
+    expect(resolveEntryThreadId(makeEntry(99), SG_CHANNEL)).toBe(99);
+  });
+
+  it("falls back to default_topic_id when entry has no topic (supergroup mode)", () => {
+    expect(resolveEntryThreadId(makeEntry(), SG_CHANNEL)).toBe(1);
+  });
+
+  it("falls back to default_topic_id when alias is unknown (supergroup mode)", () => {
+    // Defensive fallback — loader-time validation should reject
+    // unknown aliases, but the helper handles config drift.
+    expect(resolveEntryThreadId(makeEntry("nonexistent"), SG_CHANNEL)).toBe(1);
+  });
+
+  it("returns fleet channel.threadId when no routerConfig (fleet mode)", () => {
+    expect(resolveEntryThreadId(makeEntry(), FLEET_CHANNEL)).toBe(42);
+    // Even with a per-entry topic set, fleet agents have no aliases
+    // to resolve against — return the fleet threadId unchanged.
+    expect(resolveEntryThreadId(makeEntry("planning"), FLEET_CHANNEL)).toBe(42);
+  });
+
+  it("returns undefined when no routerConfig AND no channel threadId (DM agent)", () => {
+    const dmChannel = { chatId: "12345" };
+    expect(resolveEntryThreadId(makeEntry(), dmChannel)).toBeUndefined();
   });
 });

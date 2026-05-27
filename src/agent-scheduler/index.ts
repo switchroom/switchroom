@@ -28,6 +28,8 @@
 
 import { resolve, join } from "node:path";
 import { loadConfig } from "../config/loader.js";
+import { resolveAgentConfig } from "../config/merge.js";
+import { resolveOutboundTopic } from "../telegram/topic-router.js";
 import {
   collectScheduleEntries,
   dispatchAsInbound,
@@ -63,11 +65,18 @@ export interface CronLib {
 /**
  * The fields the in-agent scheduler knows about its target chat at
  * registration time. The forum_chat_id is global (one per fleet);
- * threadId is the agent's own topic in that forum.
+ * threadId is the agent's own topic in that forum (fleet mode) or
+ * the supergroup-owned default fallback.
+ *
+ * `routerConfig` (PR4b-cron of supergroup-mode rollout): when the
+ * agent is in supergroup-owned mode, each per-entry `topic` field
+ * resolves through `resolveOutboundTopic({ kind: 'cron', entryTopic })`.
+ * Unset / undefined for fleet-mode and DM agents — behavior unchanged.
  */
 export interface AgentChannelTarget {
   chatId: string;
   threadId?: number;
+  routerConfig?: { default_topic_id?: number; topic_aliases?: Record<string, number> };
 }
 
 export interface RegisterOptions {
@@ -102,9 +111,10 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       let delivered = false;
       let summary = "";
       try {
+        const threadId = resolveEntryThreadId(entry, opts.channel);
         const result = dispatchAsInbound(
           entry,
-          { chatId: opts.channel.chatId, threadId: opts.channel.threadId, now },
+          { chatId: opts.channel.chatId, threadId, now },
           opts.dispatcher,
         );
         delivered = result.delivered;
@@ -173,14 +183,70 @@ export function resolveChannelTarget(
   config: ReturnType<typeof loadConfig>,
   agentName: string,
 ): AgentChannelTarget | null {
+  const agent = config.agents?.[agentName];
+
+  // Resolve through the cascade only when the agent exists, so a
+  // supergroup-owned override at the per-agent
+  // `channels.telegram.chat_id` level takes precedence over the
+  // fleet `telegram.forum_chat_id`. Missing-agent fall-through to
+  // the fleet-chat lookup preserves the prior leniency contract.
+  const tgChannel = agent
+    ? resolveAgentConfig(config.defaults, config.profiles, agent).channels?.telegram
+    : undefined;
+  const supergroupChatId = tgChannel?.chat_id;
+  const supergroupDefaultTopic = tgChannel?.default_topic_id;
+
+  if (typeof supergroupChatId === "string" && supergroupChatId.length > 0) {
+    // Supergroup-owned mode: agent owns its own supergroup. The
+    // router config carries default_topic_id + topic_aliases so
+    // per-entry `topic` resolves at dispatch time (PR4b-cron).
+    return {
+      chatId: supergroupChatId,
+      ...(typeof supergroupDefaultTopic === "number" ? { threadId: supergroupDefaultTopic } : {}),
+      routerConfig: {
+        ...(typeof supergroupDefaultTopic === "number" ? { default_topic_id: supergroupDefaultTopic } : {}),
+        ...(tgChannel?.topic_aliases ? { topic_aliases: tgChannel.topic_aliases } : {}),
+      },
+    };
+  }
+
+  // Fleet mode (the existing default): one shared forum_chat_id, each
+  // agent assigned a per-agent topic_id.
   const forumChatId = config.telegram?.forum_chat_id;
   if (typeof forumChatId !== "string" || forumChatId.length === 0) return null;
-  const agent = config.agents?.[agentName];
   const threadId = agent?.topic_id;
   return {
     chatId: forumChatId,
     ...(typeof threadId === "number" ? { threadId } : {}),
   };
+}
+
+/**
+ * Resolve the Telegram thread_id to dispatch a synthetic-inbound on.
+ *
+ * - Supergroup-owned agents: the per-entry `topic` field (alias name
+ *   or numeric ID) flows through `resolveOutboundTopic({ kind: 'cron',
+ *   entryTopic })`. Unknown aliases / missing topic field fall back to
+ *   the agent's `default_topic_id` (carried as `channel.threadId`).
+ * - Fleet / DM agents: returns the channel's threadId unchanged
+ *   (the agent's home topic_id in the shared supergroup, or undefined
+ *   for DMs).
+ *
+ * Pure — no I/O. Tested via the topic-router suite plus a small
+ * integration row in this module's tests.
+ */
+export function resolveEntryThreadId(
+  entry: SchedulerEntry,
+  channel: AgentChannelTarget,
+): number | undefined {
+  if (channel.routerConfig) {
+    const routed = resolveOutboundTopic(channel.routerConfig, {
+      kind: "cron",
+      entryTopic: entry.topic,
+    });
+    if (routed !== undefined) return routed;
+  }
+  return channel.threadId;
 }
 
 export async function main(): Promise<void> {
@@ -323,9 +389,10 @@ export async function main(): Promise<void> {
         );
         for (const m of missed) {
           const startedAt = Date.now();
+          const threadId = resolveEntryThreadId(m.entry, channel);
           const result = dispatchAsInbound(
             m.entry,
-            { chatId: channel.chatId, threadId: channel.threadId },
+            { chatId: channel.chatId, threadId },
             dispatcher,
           );
           sink.recordFire({
@@ -368,9 +435,10 @@ export async function main(): Promise<void> {
           promptKey: "skip-notice",
         };
         const startedAt = Date.now();
+        const threadId = resolveEntryThreadId(noticeEntry, channel);
         const result = dispatchAsInbound(
           noticeEntry,
-          { chatId: channel.chatId, threadId: channel.threadId },
+          { chatId: channel.chatId, threadId },
           dispatcher,
         );
         sink.recordFire({
