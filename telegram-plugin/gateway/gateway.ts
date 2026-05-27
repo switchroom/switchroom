@@ -8204,11 +8204,17 @@ async function handleInbound(
   // hygiene). The add-flow intercept comes first because /auth add
   // creates fresh credentials at the broker layer, vs /reauth which
   // mutates an existing agent's slot — different success paths.
-  const pendingAdd = pendingAuthAddFlows.get(chat_id)
+  //
+  // PR3 supergroup-mode: keyed by chatKey(chat, thread) so an OAuth
+  // code pasted into topic A isn't intercepted when topic B has a
+  // separate /auth add flow pending (security: prevents cross-topic
+  // credential mis-attribution).
+  const interceptKey = chatKey(chat_id, messageThreadId) as string
+  const pendingAdd = pendingAuthAddFlows.get(interceptKey)
   if (pendingAdd && looksLikeAuthCode(text)) {
     const elapsed = Date.now() - pendingAdd.startedAt
     if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
-      pendingAuthAddFlows.delete(chat_id)
+      pendingAuthAddFlows.delete(interceptKey)
       try {
         const credentials = await submitAccountAuthCode(pendingAdd, text.trim())
         try {
@@ -8249,15 +8255,15 @@ async function handleInbound(
     // Stale — drop the pending entry but let the message fall through
     // to other intercepts (defensively wipe scratch).
     cancelAccountAuthSession(pendingAdd)
-    pendingAuthAddFlows.delete(chat_id)
+    pendingAuthAddFlows.delete(interceptKey)
   }
 
   // Auth-code intercept
-  const pendingReauth = pendingReauthFlows.get(chat_id)
+  const pendingReauth = pendingReauthFlows.get(interceptKey)
   if (pendingReauth && looksLikeAuthCode(text)) {
     const elapsed = Date.now() - pendingReauth.startedAt
     if (elapsed < REAUTH_INTERCEPT_TTL_MS) {
-      pendingReauthFlows.delete(chat_id)
+      pendingReauthFlows.delete(interceptKey)
       const { result, errorText } = execAuthCode(pendingReauth.agent, text.trim())
       if (errorText) {
         await switchroomReply(ctx, `<b>auth code failed:</b>\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
@@ -8279,7 +8285,7 @@ async function handleInbound(
       redactAuthCodeMessage(bot.api as never, chat_id, msgId ?? null, line => process.stderr.write(line))
       return
     }
-    pendingReauthFlows.delete(chat_id)
+    pendingReauthFlows.delete(interceptKey)
   }
 
   // Vault intercept
@@ -11282,19 +11288,24 @@ bot.command("auth", async ctx => {
       )
       return
     }
+    // PR3 supergroup-mode: key auth-add flows by (chat, thread) so
+    // separate flows in two topics of one supergroup can't collide.
+    // In DM chats message_thread_id is undefined → key collapses to
+    // `chatId:_`, identical to today's behavior.
+    const authAddKey = chatKey(chatId, ctx.message?.message_thread_id ?? null) as string
     if (parsed.kind === 'cancel') {
-      const existing = pendingAuthAddFlows.get(chatId)
+      const existing = pendingAuthAddFlows.get(authAddKey)
       if (!existing) {
         await switchroomReply(ctx, "<i>No pending <code>/auth add</code> flow in this chat.</i>", { html: true })
         return
       }
       cancelAccountAuthSession(existing)
-      pendingAuthAddFlows.delete(chatId)
+      pendingAuthAddFlows.delete(authAddKey)
       await switchroomReply(ctx, "Cancelled.", { html: true })
       return
     }
     // parsed.kind === 'add'
-    if (pendingAuthAddFlows.has(chatId)) {
+    if (pendingAuthAddFlows.has(authAddKey)) {
       await switchroomReply(
         ctx,
         "<i>An <code>/auth add</code> flow is already in progress for this chat. " +
@@ -11305,7 +11316,7 @@ bot.command("auth", async ctx => {
     }
     try {
       const { loginUrl, scratchDir, child } = await startAccountAuthSession(parsed.label)
-      pendingAuthAddFlows.set(chatId, {
+      pendingAuthAddFlows.set(authAddKey, {
         label: parsed.label,
         scratchDir,
         child,
@@ -13069,7 +13080,14 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
         parseMode: 'HTML',
         synthInbound: async () => {
           await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', agent], `auth reauth ${agent}`)
-          pendingReauthFlows.set(String(ctx.chat!.id), { agent, startedAt: Date.now() })
+          // PR3 supergroup-mode: key by (chat, thread) so an OAuth code
+          // pasted into a different topic isn't mistakenly intercepted
+          // as this flow's reauth code.
+          const reauthThreadId = ctx.callbackQuery?.message?.message_thread_id
+          pendingReauthFlows.set(
+            chatKey(String(ctx.chat!.id), reauthThreadId ?? null) as string,
+            { agent, startedAt: Date.now() },
+          )
         },
       })
       return
