@@ -56,9 +56,7 @@ Use this mechanism for: identity, persona, operating rules, safety
 directives, tool docs — anything that doesn't change mid-session.
 
 **The list is currently hardcoded in the switchroom binary.** Adding a
-new stable file requires a code change + release. This is tracked for
-convergence (see [gap analysis](../reference/onboarding-gap-analysis.md)
-gap 4 and gap 8).
+new stable file requires a code change + release.
 
 ### 2. Dynamic UserPromptSubmit hook
 
@@ -200,5 +198,4 @@ rename across the boundary without updating both sides.
 
 - `src/agents/workspace.ts` — loader implementation
 - `src/agents/bootstrap-budget.ts` — budget enforcement
-- `reference/onboarding-gap-analysis.md` — fixes planned for the
-  mechanism-convergence gap
+- `reference/onboarding-gap-analysis.md` — historical motivation for the workspace loader convergence design (point-in-time, 2026-04-25; not a live roadmap)
