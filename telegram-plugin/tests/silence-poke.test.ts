@@ -26,20 +26,27 @@ const ORIGINAL_KILL_SWITCH = process.env.SWITCHROOM_DISABLE_SILENCE_POKE
 interface TestFixtures {
   emitted: SilencePokeMetric[]
   fallbacks: FrameworkFallbackContext[]
+  awarenessPings: FrameworkFallbackContext[]
 }
 
 function setupDeps(opts?: { thresholds?: Partial<typeof DEFAULT_THRESHOLDS> }): TestFixtures {
-  const fixtures: TestFixtures = { emitted: [], fallbacks: [] }
+  const fixtures: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
   __setDepsForTests({
     emitMetric: (e) => fixtures.emitted.push(e),
     onFrameworkFallback: (ctx) => { fixtures.fallbacks.push(ctx) },
+    onAwarenessPing: (ctx) => { fixtures.awarenessPings.push(ctx) },
     // The ack budget (a new poke that fires *earlier* than `soft`) is
     // disabled by default in this fixture so the soft/firm/fallback
     // ladder tests stay isolated from it. The 'ack budget' describe
     // block opts back in with a real value.
+    //
+    // The 60s awarenessPing is also disabled by default so the existing
+    // soft/firm/fallback ladder tests don't see the new sibling event;
+    // the 'awareness ping' describe block opts back in.
     thresholdsMs: {
       ...DEFAULT_THRESHOLDS,
       ack: Number.MAX_SAFE_INTEGER,
+      awarenessPing: Number.MAX_SAFE_INTEGER,
       ...(opts?.thresholds ?? {}),
     },
   })
@@ -733,13 +740,18 @@ describe('silence-poke — independence across turns', () => {
 
 describe('silence-poke — fallback handler errors do not break timer', () => {
   it('continues to function if onFrameworkFallback throws', () => {
-    const fx: TestFixtures = { emitted: [], fallbacks: [] }
+    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => { throw new Error('oh no') },
-      // ack budget out of the way — this test exercises the
+      onAwarenessPing: () => {},
+      // ack + awareness-ping out of the way — this test exercises the
       // soft/firm/fallback ladder under a throwing fallback handler.
-      thresholdsMs: { ...DEFAULT_THRESHOLDS, ack: Number.MAX_SAFE_INTEGER },
+      thresholdsMs: {
+        ...DEFAULT_THRESHOLDS,
+        ack: Number.MAX_SAFE_INTEGER,
+        awarenessPing: Number.MAX_SAFE_INTEGER,
+      },
     })
     startTurn('k', 0)
     expect(() => {
@@ -752,12 +764,17 @@ describe('silence-poke — fallback handler errors do not break timer', () => {
   })
 
   it('continues to function if onFrameworkFallback returns a rejected promise', async () => {
-    const fx: TestFixtures = { emitted: [], fallbacks: [] }
+    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => Promise.reject(new Error('async fail')),
-      // ack budget out of the way — see the throwing-handler test above.
-      thresholdsMs: { ...DEFAULT_THRESHOLDS, ack: Number.MAX_SAFE_INTEGER },
+      onAwarenessPing: () => {},
+      // ack + awareness-ping out of the way — see the throwing-handler test above.
+      thresholdsMs: {
+        ...DEFAULT_THRESHOLDS,
+        ack: Number.MAX_SAFE_INTEGER,
+        awarenessPing: Number.MAX_SAFE_INTEGER,
+      },
     })
     startTurn('k', 0)
     __tickForTests(75_000)
@@ -858,5 +875,98 @@ describe('silence-poke — performance', () => {
     // 1000 turns should tick in well under 50ms — guards against an
     // accidentally-quadratic implementation.
     expect(elapsed).toBeLessThan(50)
+  })
+})
+
+describe('silence-poke — awareness ping (early framework-owned user-visible status)', () => {
+  it('fires once at 60s when no outbound has happened', () => {
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    __tickForTests(59_000)
+    expect(fx.awarenessPings.length).toBe(0)
+    __tickForTests(60_000)
+    expect(fx.awarenessPings.length).toBe(1)
+    expect(fx.awarenessPings[0]!.silenceMs).toBeGreaterThanOrEqual(60_000)
+    expect(fx.emitted.some(e => e.kind === 'awareness_ping_sent')).toBe(true)
+  })
+
+  it('is one-shot per turn — does not re-fire as silence continues', () => {
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    __tickForTests(60_000)
+    __tickForTests(120_000)
+    __tickForTests(180_000)
+    expect(fx.awarenessPings.length).toBe(1)
+  })
+
+  it('is suppressed by an early outbound', () => {
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    noteOutbound('k', 30_000)
+    __tickForTests(90_000)
+    expect(fx.awarenessPings.length).toBe(0)
+  })
+
+  it('is suppressed when subagentDispatchActive is true', () => {
+    // Sub-agent dispatch already widens soft to 300s; the awareness-ping
+    // should also defer so we don't pre-empt the sub-agent's natural
+    // progress signal.
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    noteSubagentDispatch('k')
+    __tickForTests(120_000)
+    expect(fx.awarenessPings.length).toBe(0)
+  })
+
+  it('does NOT advance the soft/firm/fallback ladder', () => {
+    // Awareness ping is a sibling signal; soft/firm/fallback continue
+    // to escalate on their own schedule (and the model-targeted ack-poke
+    // similarly remains independent).
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    __tickForTests(60_000) // awareness fires
+    __tickForTests(75_000) // soft fires
+    __tickForTests(180_000) // firm fires
+    __tickForTests(300_000) // fallback fires
+    expect(fx.awarenessPings.length).toBe(1)
+    expect(fx.fallbacks.length).toBe(1)
+    expect(fx.emitted.filter(e => e.kind === 'silence_poke_fired').map(e => (e as { level: string }).level))
+      .toEqual(['soft', 'firm'])
+    expect(fx.emitted.some(e => e.kind === 'silence_fallback_sent')).toBe(true)
+  })
+
+  it('carries fallbackKind=thinking when a recent thinking event landed', () => {
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    noteThinking('k', 45_000)
+    __tickForTests(60_000)
+    expect(fx.awarenessPings.length).toBe(1)
+    expect(fx.awarenessPings[0]!.fallbackKind).toBe('thinking')
+  })
+
+  it('does not fire if turn ends before the threshold', () => {
+    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
+    startTurn('k', 0)
+    endTurn('k')
+    __tickForTests(120_000)
+    expect(fx.awarenessPings.length).toBe(0)
+  })
+
+  it('handler errors do not break the timer', () => {
+    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
+    __setDepsForTests({
+      emitMetric: (e) => fx.emitted.push(e),
+      onFrameworkFallback: () => {},
+      onAwarenessPing: () => { throw new Error('awareness handler boom') },
+      thresholdsMs: {
+        ...DEFAULT_THRESHOLDS,
+        ack: Number.MAX_SAFE_INTEGER,
+        awarenessPing: 60_000,
+      },
+    })
+    startTurn('k', 0)
+    expect(() => __tickForTests(60_000)).not.toThrow()
+    // Telemetry still emitted
+    expect(fx.emitted.some(e => e.kind === 'awareness_ping_sent')).toBe(true)
   })
 })

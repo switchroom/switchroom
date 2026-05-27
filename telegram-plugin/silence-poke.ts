@@ -80,6 +80,13 @@ export interface SilencePokeState {
    *  the ack nudge is specifically about the *first* outbound, so it
    *  never re-arms even after the model later goes quiet again. */
   ackPokeFired: boolean
+  /** True once the early awareness-ping has fired this turn. One-shot:
+   *  the user only needs one "we know it's slow" cue before the heavier
+   *  300s fallback escalates. Independent of the ack-poke (which targets
+   *  the model via piggyback) — awareness-ping targets the user directly
+   *  via Telegram, so it lands even during pure-thinking or held-inbound
+   *  silences when no tool_result is available to piggyback on. */
+  awarenessPingFired: boolean
   /** Wall-clock ms of last poke fire — used for poke-success latency. */
   lastPokeFiredAt: number | null
   /** #1292: in-flight tool calls keyed by toolUseId. Populated by
@@ -101,6 +108,14 @@ export interface ThresholdsMs {
    *  75s `soft` threshold, which measures silence-since-last-outbound
    *  and is the wrong instrument for "you never said hello." */
   ack: number
+  /** Awareness ping: if NO outbound has landed this many ms after turn
+   *  start, send a framework-owned user-visible "still working…" status
+   *  message directly via Telegram. Sits between the model-targeted ack
+   *  poke (10s) and the 300s framework_fallback. Lands even during pure
+   *  extended-thinking or held-inbound silences when no tool_result is
+   *  available to piggyback the model-targeted pokes onto. One-shot per
+   *  turn — the 300s fallback handles further escalation if still silent. */
+  awarenessPing: number
   soft: number
   firm: number
   fallback: number
@@ -112,6 +127,7 @@ export interface ThresholdsMs {
 
 export const DEFAULT_THRESHOLDS: ThresholdsMs = {
   ack: 10_000,
+  awarenessPing: 60_000,
   soft: 75_000,
   firm: 180_000,
   fallback: 300_000,
@@ -145,6 +161,7 @@ export type SilencePokeMetric =
   | { kind: 'silence_poke_fired'; key: string; level: PokeLevel; silence_ms: number; subagent_wait: boolean }
   | { kind: 'silence_poke_succeeded'; key: string; level: PokeLevel; latency_ms: number }
   | { kind: 'silence_fallback_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
+  | { kind: 'awareness_ping_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
 
 export interface SilencePokeDeps {
   /** Called when the 300s fallback fires. Caller sends the user-visible
@@ -153,6 +170,12 @@ export interface SilencePokeDeps {
    *  not a model-sourced one, and we want pokes to continue (well, no,
    *  fallbackFired ensures only one per turn anyway). */
   onFrameworkFallback: (ctx: FrameworkFallbackContext) => Promise<void> | void
+  /** Called when the awareness ping fires (default 60s). Caller sends
+   *  a user-visible "still working…" message — silent (no device ping),
+   *  framework-owned, one-shot per turn. Reuses the same context shape
+   *  as onFrameworkFallback so the gateway can reuse `formatFrameworkFallbackText`
+   *  and the in-flight-tool enrichment. */
+  onAwarenessPing: (ctx: FrameworkFallbackContext) => Promise<void> | void
   /** Telemetry sink for poke events. */
   emitMetric: (event: SilencePokeMetric) => void
   /** Threshold overrides (tests). */
@@ -188,6 +211,7 @@ export function startTurn(key: string, now: number): void {
     lastThinkingAt: null,
     fallbackFired: false,
     ackPokeFired: false,
+    awarenessPingFired: false,
     lastPokeFiredAt: null,
     inFlightTools: new Map(),
   })
@@ -483,6 +507,64 @@ function tick(now: number): void {
         subagent_wait: s.subagentDispatchActive,
       })
       continue
+    }
+
+    // Awareness ping — framework-owned user-visible status BEFORE the
+    // 300s heavy fallback. Lands at ~60s even when the model is in pure
+    // extended-thinking or the inbound is held (#1892 follow-up), since
+    // it's delivered directly via the gateway → Telegram, not
+    // piggybacked on tool_result. One-shot per turn; suppressed if any
+    // outbound has happened. The 300s fallback is unchanged and
+    // escalates further if silence persists.
+    //
+    // Independent of pokesFired so soft/firm/fallback still escalate on
+    // their own schedule. Independent of ackPokeFired so a long-running
+    // turn that already received the ack-poke (then went silent again)
+    // still gets the user-facing awareness ping.
+    if (
+      !s.awarenessPingFired
+      && s.lastOutboundAt == null
+      && !s.subagentDispatchActive
+      && silence >= thresholds.awarenessPing
+    ) {
+      s.awarenessPingFired = true
+      const { chatId, threadId } = parseKey(key)
+      const recentThinking = s.lastThinkingAt != null
+        && (now - s.lastThinkingAt) < 30_000
+      const fallbackKind: 'working' | 'thinking' = recentThinking ? 'thinking' : 'working'
+      const inFlightTools: ToolSnapshot[] = Array.from(s.inFlightTools.values())
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .map(t => ({
+          name: t.name,
+          label: t.label,
+          durationMs: now - t.startedAt,
+        }))
+      activeDeps.emitMetric({
+        kind: 'awareness_ping_sent',
+        key,
+        fallback_kind: fallbackKind,
+        silence_ms: silence,
+      })
+      try {
+        const ret = activeDeps.onAwarenessPing({
+          key,
+          chatId,
+          threadId,
+          fallbackKind,
+          silenceMs: silence,
+          inFlightTools,
+        })
+        if (ret != null && typeof (ret as Promise<unknown>).then === 'function') {
+          ;(ret as Promise<unknown>).catch(err => {
+            process.stderr.write(`silence-poke: awareness-ping handler rejected: ${err}\n`)
+          })
+        }
+      } catch (err) {
+        process.stderr.write(`silence-poke: awareness-ping handler threw: ${err}\n`)
+      }
+      // Don't `continue` — soft/firm/fallback can still arm in the same tick
+      // if their thresholds have also been crossed. Awareness-ping is a
+      // sibling signal, not part of the ladder.
     }
 
     if (s.pokesFired === 0 && silence >= softThreshold) {

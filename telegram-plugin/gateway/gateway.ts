@@ -3321,6 +3321,43 @@ silencePoke.startTimer({
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
   },
+  onAwarenessPing: async (ctx) => {
+    // Early framework-owned awareness signal (~60s) so the user never
+    // faces a silent chat while the model is busy / held / thinking.
+    // Distinct from the 300s onFrameworkFallback: fires earlier, sends
+    // a SILENT message (disable_notification: true — ambient liveness,
+    // not a device buzz), and is bounded to ONE per turn by the silence-
+    // poke module's `awarenessPingFired` flag. Reuses
+    // `formatFrameworkFallbackText` so the wording stays consistent and
+    // in-flight tools are named when known. If the model has been
+    // silent long enough to cross 300s, the heavier framework_fallback
+    // escalates with a notification.
+    //
+    // Late-fire guard mirrors the framework_fallback handler: skip if
+    // the turn ended cleanly between the silence-poke arming and this
+    // timer-fired handler so we don't talk over a clean response.
+    if (activeTurnStartedAt.get(ctx.key) == null && currentTurn == null) {
+      return
+    }
+    const text = silencePoke.formatFrameworkFallbackText(
+      ctx.fallbackKind,
+      ctx.silenceMs,
+      ctx.inFlightTools,
+    )
+    try {
+      await robustApiCall(
+        () => bot.api.sendMessage(ctx.chatId, text, {
+          ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
+          disable_notification: true,
+        }),
+        { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
+      )
+    } catch (err) {
+      process.stderr.write(
+        `silence-poke awareness-ping sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
+      )
+    }
+  },
   onFrameworkFallback: async (ctx) => {
     // Late-fire short-circuit (2026-05-23 audit finding). The fallback
     // can race a clean turn-end: the model's actual reply lands inside
