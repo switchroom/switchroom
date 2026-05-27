@@ -80,6 +80,7 @@ import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
+import { markAckSent, clearAckSent } from '../ack-flag.js'
 import { isFinalAnswerReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { type SessionEvent } from '../session-tail.js'
@@ -4944,6 +4945,16 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // silence-poke clock so the next poke is measured from this send.
   signalTracker.noteOutbound(statusKey(chat_id, threadId), Date.now())
   silencePoke.noteOutbound(statusKey(chat_id, threadId), Date.now())
+  // Ack-first gate (`reference/conversational-pacing.md` beat 1):
+  // touch the state-dir flag so the ack-first-pretool hook lets
+  // subsequent non-reply tool calls through this turn. Cleared at
+  // turn_started. Best-effort — a write failure shouldn't break
+  // reply, and the hook is kill-switched anyway.
+  try {
+    markAckSent()
+  } catch (err) {
+    process.stderr.write(`telegram gateway: markAckSent failed: ${err}\n`)
+  }
   // #1741 — only clear silent-end state on a plausibly-final reply.
   // An interim ack (disable_notification:true, short text, no done)
   // must NOT clear the state file; otherwise a turn that ends with
@@ -5539,6 +5550,13 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       const sKey = statusKey(streamChatId, streamThreadId)
       signalTracker.noteOutbound(sKey, Date.now())
       silencePoke.noteOutbound(sKey, Date.now())
+      // Ack-first gate: stream_reply's first emit also unlocks subsequent
+      // tool calls. See ack-flag.ts + ack-first-pretool.ts.
+      try {
+        markAckSent()
+      } catch (err) {
+        process.stderr.write(`telegram gateway: markAckSent (stream_reply) failed: ${err}\n`)
+      }
       // #1741 — see executeReply for the rationale: only a plausibly-
       // final stream_reply clears the silent-end state. An interim
       // ack via stream_reply must NOT clear; the Stop hook needs
@@ -9033,6 +9051,12 @@ async function handleInbound(
         // the framework can nudge the model if it goes quiet past the
         // soft / firm thresholds.
         silencePoke.startTurn(statusKey(chat_id, messageThreadId), Date.now())
+        // Ack-first gate (`reference/conversational-pacing.md` beat 1):
+        // wipe the previous turn's marker so the ack-first-pretool hook
+        // re-arms for this fresh turn. The first reply this turn will
+        // re-touch the flag, unlocking subsequent non-reply tool calls.
+        // Best-effort — see ack-flag.ts.
+        clearAckSent()
         // #1445 cross-turn pending-async ambient. A new turn starting
         // (user inbound, synthesised wake, or handback channel) is the
         // signal that the model is about to re-engage — clear any

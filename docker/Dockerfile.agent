@@ -181,6 +181,13 @@ RUN chmod 0755 /opt/switchroom/hooks/ms-365-write-pretool.mjs
 COPY dist/cli/notion-write-pretool.mjs /opt/switchroom/hooks/notion-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/notion-write-pretool.mjs
 
+# ack-first-pretool — enforces the human-feel "ack first" beat
+# (`reference/conversational-pacing.md` beat 1). Blocks non-reply tool
+# calls when no reply has been sent this turn; reply itself always
+# allowed. Reads $TELEGRAM_STATE_DIR/ack-sent.flag (gateway-owned).
+COPY dist/cli/ack-first-pretool.mjs /opt/switchroom/hooks/ack-first-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/ack-first-pretool.mjs
+
 # Advisory skill-shape linter (RFC native-by-default skill authoring,
 # Phase 1). Non-blocking — nudges the model toward a well-formed skill
 # when it writes under .claude/skills/; only the per-skill byte cap is
