@@ -239,6 +239,23 @@ export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{#if (isNumber hindsightRecallMinOverlap)}}
 export HINDSIGHT_RECALL_MIN_OVERLAP={{hindsightRecallMinOverlap}}
 {{/if}}
+# PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
+# parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
+# into retained memory metadata and (b) emit a "Current topic: …" preamble
+# on recall blocks so the model self-scopes. Empty / absent for fleet-shared
+# or DM agents where the supergroup topology isn't in use.
+{{#if hindsightTopicAliasesJsonQ}}
+export HINDSIGHT_TOPIC_ALIASES_JSON={{{hindsightTopicAliasesJsonQ}}}
+{{/if}}
+# PR6 — topic filter mode for cross-topic memory recall. Default
+# "soft-preamble": all topic-tagged memories surface and the model
+# decides relevance via the preamble. "hard-filter": drop memories
+# whose source thread_id differs from the active prompt's thread_id.
+# Operators flip this when instrumentation (the active_thread_id /
+# source_topics fields in recall_log.jsonl) shows binding failures.
+{{#if hindsightTopicFilterMode}}
+export HINDSIGHT_TOPIC_FILTER_MODE={{hindsightTopicFilterMode}}
+{{/if}}
 # Wait for Hindsight API to be reachable before launching Claude, otherwise
 # the MCP server connection fails at startup with "1 MCP server failed".
 HINDSIGHT_WAIT=0

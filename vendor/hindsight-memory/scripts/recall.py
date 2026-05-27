@@ -58,7 +58,7 @@ from lib.content import (
 )
 from lib.daemon import get_api_url
 from lib.directives import fetch_active_directives, format_active_directives_block
-from lib.gateway_ipc import extract_chat_id_from_prompt, update_placeholder
+from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, update_placeholder
 from lib.state import read_state, write_state
 
 LAST_RECALL_STATE = "last_recall.json"
@@ -99,6 +99,70 @@ DEMOTE_TAG_VARIANTS = (
     "no-recall",
 )
 
+# Switchroom PR6 — supergroup-mode topic filter mode.
+#
+# Controls how memories from OTHER topics are surfaced to the model
+# during recall. Default is "soft-preamble": all topic-tagged memories
+# are returned (the model decides relevance via the preamble that names
+# the active topic). "hard-filter" drops any memory whose stored
+# `metadata.thread_id` doesn't match the active prompt's thread_id —
+# the escape hatch if instrumentation shows binding failures (model
+# applying the right memory to the wrong topic).
+#
+# The mode is process-wide via env var. Memories with no thread_id
+# tag (legacy retains pre-PR6, or fleet-shared/DM agents) are NEVER
+# dropped — they pass through both modes regardless of active topic.
+TOPIC_FILTER_MODE_ENV = "HINDSIGHT_TOPIC_FILTER_MODE"
+TOPIC_FILTER_MODES = ("soft-preamble", "hard-filter")
+
+
+def _topic_filter_mode() -> str:
+    raw = os.environ.get(TOPIC_FILTER_MODE_ENV, "").strip().lower()
+    if raw in TOPIC_FILTER_MODES:
+        return raw
+    return "soft-preamble"
+
+
+def _filter_by_active_topic(results: list, active_thread_id: str | None) -> tuple[list, int]:
+    """When hard-filter mode is on AND we know the active thread, drop
+    any memory whose stored metadata.thread_id is set to a different
+    value. Untagged memories pass through unconditionally.
+
+    Returns (filtered_results, dropped_count).
+    """
+    if active_thread_id is None:
+        return results, 0
+    kept: list = []
+    dropped = 0
+    for m in results:
+        meta = m.get("metadata") if isinstance(m, dict) else None
+        if not isinstance(meta, dict):
+            kept.append(m)
+            continue
+        source_thread = meta.get("thread_id")
+        if source_thread is None or str(source_thread) == str(active_thread_id):
+            kept.append(m)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def _summarise_source_topics(results: list) -> dict:
+    """Build a {thread_id: count} summary of recalled memories'
+    source topics. Used for instrumented binding-failure analysis
+    in the recall log.
+    """
+    summary: dict = {}
+    for m in results:
+        meta = m.get("metadata") if isinstance(m, dict) else None
+        if not isinstance(meta, dict):
+            summary["__untagged__"] = summary.get("__untagged__", 0) + 1
+            continue
+        tid = meta.get("thread_id")
+        key = str(tid) if tid is not None else "__no_thread__"
+        summary[key] = summary.get(key, 0) + 1
+    return summary
+
 # Switchroom #432 phase 4.3 — recall telemetry log.
 #
 # Every recall (cache hit or miss) appends a JSONL record to
@@ -123,15 +187,29 @@ def _cache_ttl_secs() -> int:
         return 0
 
 
-def _cache_key(session_id: str, prompt: str, bank_id: str, extra_banks: list) -> str:
+def _cache_key(
+    session_id: str,
+    prompt: str,
+    bank_id: str,
+    extra_banks: list,
+    active_thread_id: str | None = None,
+) -> str:
     """Stable hash for cache keying. Session_id is included so a new
     session always misses, regardless of the TTL setting. Extra banks
-    are sorted so list-order doesn't change the key."""
+    are sorted so list-order doesn't change the key.
+
+    PR6a: `active_thread_id` is included so cross-topic prompts in
+    supergroup mode (same session, same model, same prompt verbatim
+    but different topic) don't collide on the cache. Empty/None
+    collapses to the empty string — backward-compatible for
+    fleet-shared / DM agents where no thread_id is present.
+    """
     parts = [
         session_id or "",
         prompt or "",
         bank_id or "",
         ",".join(sorted(extra_banks or [])),
+        active_thread_id or "",
     ]
     payload = "\x1f".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -458,6 +536,25 @@ def main():
     if placeholder_chat_id:
         update_placeholder(placeholder_chat_id, "📚 recalling memories")
 
+    # PR6a — supergroup-mode topic context for the current turn.
+    # active_thread_id is the message_thread_id from the inbound
+    # envelope, used to (a) key the cache so cross-topic prompts
+    # don't collide, (b) optionally hard-filter memories by source
+    # topic, and (c) log source-vs-active distribution for
+    # binding-failure instrumentation.
+    active_chat_id, active_thread_id = extract_topic_from_prompt(prompt)
+    active_topic_alias = None
+    if active_thread_id is not None:
+        aliases_json = os.environ.get("HINDSIGHT_TOPIC_ALIASES_JSON", "")
+        if aliases_json:
+            try:
+                aliases = json.loads(aliases_json)
+                if isinstance(aliases, dict):
+                    inverse = {str(v): k for k, v in aliases.items()}
+                    active_topic_alias = inverse.get(str(active_thread_id))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
     # Resolve API URL (handles all three connection modes)
     def _dbg(*a):
         debug_log(config, *a)
@@ -483,7 +580,7 @@ def main():
     # Whole-session-scoped, opt-in via HINDSIGHT_RECALL_CACHE_TTL_SECS.
     cache_ttl = _cache_ttl_secs()
     cache_key = (
-        _cache_key(session_id, prompt, bank_id, additional_banks)
+        _cache_key(session_id, prompt, bank_id, additional_banks, active_thread_id)
         if cache_ttl > 0
         else ""
     )
@@ -507,6 +604,13 @@ def main():
                 "demoted_count": 0,
                 "capped": False,
                 "cache_hit": True,
+                # PR6 — record the active topic on cache hits too so the
+                # log is uniformly queryable (cache_key now includes
+                # active_thread_id, so a hit means the prior recall was
+                # for the same topic — no source_topics inferable here).
+                "active_thread_id": active_thread_id,
+                "active_topic_alias": active_topic_alias,
+                "topic_filter_mode": _topic_filter_mode(),
             })
             return
         debug_log(config, f"Recall cache MISS (key={cache_key[:12]}…)")
@@ -612,6 +716,28 @@ def main():
     if demoted_count > 0:
         debug_log(config, f"Filtered {demoted_count} demote-from-recall memories")
 
+    # PR6 — capture source-topic distribution BEFORE optional
+    # hard-filter so we can log the would-have-leaked count for
+    # binding-failure analysis. Computed unconditionally so the
+    # log row carries this for soft-preamble mode too (the
+    # whole point is to instrument binding rate over time).
+    source_topic_summary = _summarise_source_topics(results)
+
+    # PR6b — optional hard topic filter. Default soft-preamble (no-op);
+    # operator flips HINDSIGHT_TOPIC_FILTER_MODE=hard-filter when
+    # binding failures are observed. See _filter_by_active_topic and
+    # the TOPIC_FILTER_MODE_ENV comment block above for design notes.
+    topic_filter_mode = _topic_filter_mode()
+    topic_dropped = 0
+    if topic_filter_mode == "hard-filter":
+        results, topic_dropped = _filter_by_active_topic(results, active_thread_id)
+        if topic_dropped > 0:
+            debug_log(
+                config,
+                f"Topic hard-filter dropped {topic_dropped} cross-topic "
+                f"memories (active_thread_id={active_thread_id})",
+            )
+
     # Switchroom #475 — lexical-overlap relevance gate. Drops memories
     # whose Jaccard overlap with the query is below
     # `recallMinOverlap` (default 0.0 = disabled). Runs after the
@@ -660,9 +786,29 @@ def main():
         memories_formatted = format_memories(results)
         preamble = config.get("recallPromptPreamble", "")
         current_time = format_current_time()
+
+        # PR6 — supergroup-mode topic preamble (neutral tone per
+        # 2026-05-27 product decision). Only added when we know the
+        # active topic AND any of the recalled memories carries a
+        # thread_id tag — i.e. we have something for the model to
+        # be "topic-aware" about. Fleet-shared / DM agents never
+        # see this line.
+        topic_line = ""
+        if active_thread_id is not None and any(
+            isinstance(m.get("metadata"), dict)
+            and m["metadata"].get("thread_id") is not None
+            for m in results
+        ):
+            topic_label = active_topic_alias or f"thread {active_thread_id}"
+            topic_line = (
+                f"Current topic: {topic_label}. Recalled memories are "
+                f"tagged with their source topic.\n"
+            )
+
         memories_block = (
             f"<hindsight_memories>\n"
             f"{preamble}\n"
+            f"{topic_line}"
             f"Current time - {current_time}\n\n"
             f"{memories_formatted}\n"
             f"</hindsight_memories>"
@@ -732,6 +878,20 @@ def main():
             if isinstance(m, dict) and m.get("id")
         ],
         "cache_hit": False,
+        # PR6 — instrumentation for binding-failure analysis.
+        # `active_thread_id`: the current prompt's topic (null on
+        # DM / fleet-shared). `source_topics`: distribution of
+        # source thread_ids in the recall set (before optional
+        # hard-filter). `topic_filter_mode`: "soft-preamble" or
+        # "hard-filter". `topic_dropped`: count dropped by hard
+        # filter. From these fields we can derive the cross-topic
+        # recall rate over time and decide whether to flip to
+        # hard-filter mode based on real data.
+        "active_thread_id": active_thread_id,
+        "active_topic_alias": active_topic_alias,
+        "source_topics": source_topic_summary,
+        "topic_filter_mode": topic_filter_mode,
+        "topic_dropped": topic_dropped,
     })
 
     # Output JSON for Claude Code hook system

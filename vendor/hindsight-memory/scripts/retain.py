@@ -225,6 +225,58 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     for k, v in config.get("retainMetadata", {}).items():
         metadata[k] = _resolve_template(str(v))
 
+    # Switchroom PR6a — topic tagging for supergroup-mode agents.
+    # Scan the messages we're retaining for the latest `<channel
+    # chat_id=... message_thread_id=...>` envelope and stamp the
+    # tuple into metadata. Downstream (recall.py) uses this to log
+    # active-vs-source topic for binding-failure analysis and to
+    # support hard-filter mode when an operator opts in.
+    #
+    # No-op for fleet-shared / DM topology where every inbound from
+    # this agent carries the same chat_id (or no chat envelope at all
+    # for interactive / cron-only sessions) — the metadata is added
+    # but doesn't change behaviour.
+    try:
+        from lib.gateway_ipc import extract_topic_from_prompt
+        topic_chat_id = None
+        topic_thread_id = None
+        # Walk in reverse — most recent user message is the authoritative
+        # "active topic" at retain time.
+        for m in reversed(messages_to_retain):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content")
+            text = content if isinstance(content, str) else (
+                # Claude Code list-content shape: [{type:"text", text:"..."}, ...]
+                next((p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"), "")
+                if isinstance(content, list) else ""
+            )
+            c_id, t_id = extract_topic_from_prompt(text)
+            if c_id is not None:
+                topic_chat_id, topic_thread_id = c_id, t_id
+                break
+        if topic_chat_id is not None:
+            metadata["chat_id"] = topic_chat_id
+            if topic_thread_id is not None:
+                metadata["thread_id"] = topic_thread_id
+                # Resolve alias from operator-injected env map.
+                aliases_json = os.environ.get("HINDSIGHT_TOPIC_ALIASES_JSON", "")
+                if aliases_json:
+                    try:
+                        aliases = json.loads(aliases_json)
+                        # aliases is {alias_name: thread_id_int_or_str}; build
+                        # the inverse lookup once.
+                        if isinstance(aliases, dict):
+                            inverse = {str(v): k for k, v in aliases.items()}
+                            alias = inverse.get(str(topic_thread_id))
+                            if alias:
+                                metadata["topic_alias"] = alias
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass  # malformed env is non-fatal
+    except Exception as e:
+        # Topic tagging is best-effort — never fail a retain over it.
+        debug_log(config, f"Topic tagging skipped: {e}")
+
     debug_log(
         config, f"Retaining to bank '{bank_id}', doc '{document_id}', {message_count} messages, {len(transcript)} chars"
     )

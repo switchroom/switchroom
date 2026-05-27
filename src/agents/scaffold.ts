@@ -1722,6 +1722,13 @@ interface BuildWorkspaceContextArgs {
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
   hindsightRecallMinOverlap: number | undefined;
+  // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
+  // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
+  // numeric thread_ids to human alias names in memory metadata.
+  // Optional filter-mode env injected at scaffold time (default
+  // "soft-preamble" if unset; "hard-filter" to drop cross-topic memories).
+  hindsightTopicAliasesJson?: string;
+  hindsightTopicFilterMode?: string;
 }
 
 /**
@@ -1749,6 +1756,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightTopicAliasesJson,
+    hindsightTopicFilterMode,
   } = args;
   return {
     name,
@@ -1799,6 +1808,13 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    // PR6 — only emit the env-export blocks when we actually have a
+    // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
+    // false-y for fleet-shared / DM agents (the dominant case).
+    hindsightTopicAliasesJsonQ: hindsightTopicAliasesJson
+      ? shellSingleQuote(hindsightTopicAliasesJson)
+      : undefined,
+    hindsightTopicFilterMode,
     switchroomConfigPathQ: switchroomConfigPath
       ? shellSingleQuote(resolve(switchroomConfigPath))
       : undefined,
@@ -2202,6 +2218,25 @@ export function scaffoldAgent(
   // disabled, current behaviour). Set 0.10–0.20 to start filtering.
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
 
+  // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
+  // JSON for retain.py + recall.py to resolve numeric thread_ids to
+  // human alias names. Only emitted for supergroup-owned agents
+  // (channels.telegram.topic_aliases set); fleet-shared / DM agents
+  // get undefined and the env-export blocks no-op via the
+  // {{#if hindsightTopicAliasesJsonQ}} guard.
+  const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
+  const hindsightTopicAliasesJson = topicAliases && Object.keys(topicAliases).length > 0
+    ? JSON.stringify(topicAliases)
+    : undefined;
+  // PR6 — topic filter mode opt-in. Defaults to undefined (the script
+  // falls back to "soft-preamble" internally). Operator sets via
+  // memory.recall.topic_filter_mode in switchroom.yaml when binding
+  // failures are observed; the start.sh.hbs gate emits the env-export
+  // only when set, leaving recall.py to read its own internal default.
+  const hindsightTopicFilterMode = (
+    agentConfig.memory?.recall as { topic_filter_mode?: string } | undefined
+  )?.topic_filter_mode;
+
   // Build the template rendering context via the shared helper so
   // scaffold and reconcile always produce the same shape for workspace
   // template rendering (see buildWorkspaceContext).
@@ -2224,6 +2259,8 @@ export function scaffoldAgent(
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightTopicAliasesJson,
+    hindsightTopicFilterMode,
   });
 
   // --- Create directory structure ---
@@ -3878,6 +3915,15 @@ export function reconcileAgent(
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
+  // PR6 — mirror scaffoldAgent's computation. Both paths feed
+  // buildWorkspaceContext, so the template sees identical shape.
+  const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
+  const hindsightTopicAliasesJson = topicAliases && Object.keys(topicAliases).length > 0
+    ? JSON.stringify(topicAliases)
+    : undefined;
+  const hindsightTopicFilterMode = (
+    agentConfig.memory?.recall as { topic_filter_mode?: string } | undefined
+  )?.topic_filter_mode;
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
   // No existsSync guard: start.sh is a pure function of config+template.
@@ -3914,6 +3960,13 @@ export function reconcileAgent(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      // PR6 — supergroup-mode topic tagging env vars. Same gate as
+      // buildWorkspaceContext: only emit the shell-quoted JSON when
+      // we actually have a topic_aliases map.
+      hindsightTopicAliasesJsonQ: hindsightTopicAliasesJson
+        ? shellSingleQuote(hindsightTopicAliasesJson)
+        : undefined,
+      hindsightTopicFilterMode,
       // Mirror buildWorkspaceContext (#910): host home for the
       // $HOME/.switchroom symlink in start.sh's docker preamble.
       hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
@@ -4512,6 +4565,8 @@ export function reconcileAgent(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      hindsightTopicAliasesJson,
+      hindsightTopicFilterMode,
     });
     // Phase 5 migration: preserve any agent-specific edits to the legacy
     // workspace/AGENTS.md (pre-rename) by renaming it to CLAUDE.md before
