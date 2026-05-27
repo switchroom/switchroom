@@ -307,6 +307,41 @@ export interface RequestDriveApprovalMessage {
 }
 
 /**
+ * RFC #1873 §8 — Microsoft 365 write approval (PR 4).
+ *
+ * Sent by the `ms-365-write-pretool` PreToolUse hook when softeria
+ * tries a gated write tool (OneDrive upload, calendar/mail mutations).
+ * Same shape as `request_drive_approval` but carries the weak-metadata
+ * v1 preview shape (file path / id / size delta / deep link / agent
+ * rationale) rather than Google's full DiffPreviewInput. Structural-
+ * diff preview is RFC §8 v1.5.
+ */
+export interface RequestMs365ApprovalMessage {
+  type: "request_ms365_approval";
+  correlationId: string;
+  agentName: string;
+  /**
+   * Weak-metadata payload — see Ms365WritePreview in
+   * `telegram-plugin/gateway/ms365-write-approval.ts`. Opaque on the
+   * wire; gateway validates via the handler.
+   */
+  preview: Record<string, unknown>;
+  ttlMs?: number;
+}
+
+/**
+ * Gateway → hook response after card is posted (or fails).
+ */
+export interface Ms365ApprovalPostedEvent {
+  type: "ms365_approval_posted";
+  correlationId: string;
+  ok: boolean;
+  requestId?: string;
+  expiresAtMs?: number;
+  reason?: string;
+}
+
+/**
  * hostd config-edit approval — sent by hostd to the caller agent's
  * gateway to render an approval card with the full unified diff in
  * the operator's primary chat. The gateway:
@@ -367,5 +402,6 @@ export type ClientToGateway =
   | UpdatePlaceholderMessage
   | InjectInboundMessage
   | RequestDriveApprovalMessage
+  | RequestMs365ApprovalMessage
   | RequestConfigApprovalMessage
   | RequestConfigFinalizeMessage;

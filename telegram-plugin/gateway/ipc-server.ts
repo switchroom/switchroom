@@ -11,6 +11,7 @@ import type {
   RequestConfigApprovalMessage,
   RequestConfigFinalizeMessage,
   RequestDriveApprovalMessage,
+  RequestMs365ApprovalMessage,
   ScheduleRestartMessage,
   SessionEventForward,
   ToolCallMessage,
@@ -54,6 +55,15 @@ export interface IpcServerOptions {
   onRequestDriveApproval?: (
     client: IpcClient,
     msg: RequestDriveApprovalMessage,
+  ) => Promise<void>;
+  /**
+   * RFC #1873 §8 — Microsoft 365 write approval (PR 4). Same shape as
+   * onRequestDriveApproval but for softeria write tools. Optional;
+   * gateways without M365 integration ignore.
+   */
+  onRequestMs365Approval?: (
+    client: IpcClient,
+    msg: RequestMs365ApprovalMessage,
   ) => Promise<void>;
   /**
    * #1623 — hostd-initiated config-edit approval card. Handler posts
@@ -292,6 +302,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onPtyPartial,
     onInjectInbound,
     onRequestDriveApproval,
+    onRequestMs365Approval,
     onRequestConfigApproval,
     onRequestConfigFinalize,
     log = () => {},
@@ -430,6 +441,38 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
               correlationId: (msg as RequestDriveApprovalMessage).correlationId,
               ok: false,
               reason: "gateway not configured for Drive-write approval",
+            });
+          } catch {
+            /* best effort */
+          }
+        }
+        break;
+      case "request_ms365_approval":
+        if (onRequestMs365Approval) {
+          onRequestMs365Approval(client, msg as RequestMs365ApprovalMessage).catch(
+            (err) => {
+              log(
+                `request_ms365_approval handler threw (client=${client.id}): ${(err as Error).message}`,
+              );
+              try {
+                client.send({
+                  type: "ms365_approval_posted",
+                  correlationId: (msg as RequestMs365ApprovalMessage).correlationId,
+                  ok: false,
+                  reason: `gateway handler error: ${(err as Error).message}`,
+                });
+              } catch {
+                /* best effort */
+              }
+            },
+          );
+        } else {
+          try {
+            client.send({
+              type: "ms365_approval_posted",
+              correlationId: (msg as RequestMs365ApprovalMessage).correlationId,
+              ok: false,
+              reason: "gateway not configured for MS-365 write approval",
             });
           } catch {
             /* best effort */

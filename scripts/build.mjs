@@ -148,6 +148,21 @@ if (hookEscape.changed) {
   console.log(`[build] ASCII-escaped ${hookEscape.nonAsciiCount} non-ASCII code units in dist/cli/drive-write-pretool.mjs`);
 }
 
+// Bundle the ms-365-write-pretool hook — RFC #1873 §8 PR 4. Same
+// pattern as drive-write-pretool: self-contained .mjs the agent
+// container runs via node.
+console.log("[build] bundling src/cli/ms-365-write-pretool.ts -> dist/cli/ms-365-write-pretool.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/ms-365-write-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "ms-365-write-pretool.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const ms365HookOutFile = resolve(outDir, "ms-365-write-pretool.mjs");
+chmodSync(ms365HookOutFile, 0o755);
+const ms365HookEscape = escapeBundleNonAscii(ms365HookOutFile);
+if (ms365HookEscape.changed) {
+  console.log(`[build] ASCII-escaped ${ms365HookEscape.nonAsciiCount} non-ASCII code units in dist/cli/ms-365-write-pretool.mjs`);
+}
+
 // Bundle the skill-validate-pretool hook — RFC native-by-default skill
 // authoring, Phase 1. Same pattern: standalone .mjs the agent container
 // runs via node. It imports the shared validators from src/cli/

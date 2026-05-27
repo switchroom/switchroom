@@ -166,6 +166,12 @@ RUN chmod 0755 /opt/switchroom/autoaccept-poll.js
 COPY dist/cli/drive-write-pretool.mjs /opt/switchroom/hooks/drive-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/drive-write-pretool.mjs
 
+# MS-365 write PreToolUse hook (RFC #1873 §8 PR 4). Mirror of
+# drive-write-pretool — gates softeria's OneDrive/Mail/Calendar write
+# tools behind a Telegram approval card with weak-metadata payload.
+COPY dist/cli/ms-365-write-pretool.mjs /opt/switchroom/hooks/ms-365-write-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/ms-365-write-pretool.mjs
+
 # Advisory skill-shape linter (RFC native-by-default skill authoring,
 # Phase 1). Non-blocking — nudges the model toward a well-formed skill
 # when it writes under .claude/skills/; only the per-skill byte cap is
@@ -191,6 +197,7 @@ COPY docker/security-plugin/.claude-plugin /opt/switchroom/security-plugin/.clau
 COPY docker/security-plugin/hooks/hooks.json /opt/switchroom/security-plugin/hooks/hooks.json
 COPY telegram-plugin/hooks/secret-guard-pretool.mjs /opt/switchroom/security-plugin/hooks/secret-guard-pretool.mjs
 COPY dist/cli/drive-write-pretool.mjs /opt/switchroom/security-plugin/hooks/drive-write-pretool.mjs
+COPY dist/cli/ms-365-write-pretool.mjs /opt/switchroom/security-plugin/hooks/ms-365-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/security-plugin/hooks/*.mjs
 
 # switchroom CLI bundle: the in-container telegram-plugin gateway sidecar

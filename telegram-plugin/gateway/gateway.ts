@@ -265,6 +265,7 @@ import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import { handleRequestDriveApproval } from './drive-write-approval.js'
+import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
 import { createInboundSpool } from './inbound-spool.js'
@@ -4183,6 +4184,64 @@ const ipcServer: IpcServer = createIpcServer({
       buildCard: ({ preview, suggestRequestId }) =>
         buildDiffPreviewCard({ preview, suggestRequestId }),
       log: (m) => process.stderr.write(`telegram gateway: drive-approval — ${m}\n`),
+    })
+  },
+
+  /**
+   * RFC #1873 §8 — MS-365 write approval card. Mirrors
+   * onRequestDriveApproval but with the weak-metadata v1 preview shape
+   * (no diff-preview — just plain text card).
+   */
+  async onRequestMs365Approval(client: IpcClient, msg) {
+    await handleRequestMs365Approval(client, msg, {
+      agentName: getMyAgentName(),
+      loadAllowFrom: () => loadAccess().allowFrom,
+      loadTargetChat: () => {
+        const access = loadAccess()
+        const operator = access.allowFrom[0]
+        if (operator === undefined) return null
+        return { chatId: operator }
+      },
+      registerApproval: async (args) => {
+        const r = await kernelApprovalRequest({
+          agent_unit: args.agent_unit,
+          scope: args.scope,
+          action: args.action,
+          approver_set: args.approver_set,
+          why: args.why,
+          ttl_ms: args.ttl_ms,
+        })
+        if (r === null || r.state === 'rate_limited') return null
+        return {
+          request_id: r.request_id,
+          expires_at_ms: r.expires_at,
+        }
+      },
+      postCard: async (args) => {
+        try {
+          const sent = await robustApiCall(
+            () =>
+              bot.api.sendMessage(args.chatId, args.text, {
+                ...(args.threadId !== undefined
+                  ? { message_thread_id: args.threadId }
+                  : {}),
+                reply_markup: args.replyMarkup as never,
+              }),
+            {
+              chat_id: String(args.chatId),
+              verb: 'ms365-approval-card',
+              ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+            },
+          )
+          return { messageId: (sent as { message_id: number }).message_id }
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: ms365-approval postCard failed: ${(err as Error).message}\n`,
+          )
+          return null
+        }
+      },
+      log: (m) => process.stderr.write(`telegram gateway: ms365-approval — ${m}\n`),
     })
   },
 
