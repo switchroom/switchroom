@@ -9289,10 +9289,26 @@ type SwitchroomReplyMarkup =
 async function switchroomReply(
   ctx: Context,
   text: string,
-  options: { html?: boolean; reply_markup?: SwitchroomReplyMarkup } = {},
+  options: {
+    html?: boolean
+    reply_markup?: SwitchroomReplyMarkup
+    // PR5 — supergroup-mode slash-command smart split (CPO #4).
+    // 'query' (default semantics) follows the originating topic;
+    // 'mutation' and 'heavy' route to admin alias in supergroup mode;
+    // omitted/undefined preserves legacy in-place reply behavior.
+    classification?: 'query' | 'mutation' | 'heavy'
+  } = {},
 ): Promise<void> {
   const chatId = String(ctx.chat!.id)
-  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  const baseThreadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  // PR5 — when caller flagged the reply as mutation/heavy AND we're
+  // in supergroup mode, override the in-place thread with the
+  // admin-alias topic. For 'query' (or non-supergroup), routedOpts
+  // is `{}` and baseThreadId wins → behavior unchanged.
+  const routedOpts = options.classification
+    ? slashCommandReplyOpts(ctx, options.classification)
+    : {}
+  const threadId = routedOpts.message_thread_id ?? baseThreadId
   await ctx.reply(text, {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
@@ -9600,6 +9616,53 @@ function resolveSystemdRunPath(): string | null {
     _systemdRunPath = null
   }
   return _systemdRunPath
+}
+
+/**
+ * PR5 — supergroup-mode slash-command smart split (CPO #4 design).
+ *
+ * Classifies a slash-command response by event class and returns the
+ * `message_thread_id` an outbound reply should target in supergroup
+ * mode, or `undefined` when the agent isn't in supergroup-owned mode
+ * (caller falls through to grammY's default `ctx.reply` which
+ * routes to the originating topic).
+ *
+ * Three classes:
+ *   - `query` (`/help`, `/status`, etc.) — follows the originating
+ *     topic, identical to default `ctx.reply` behaviour.
+ *   - `mutation` (`/restart`, `/update apply`) — admin alias.
+ *   - `heavy` (`/logs`, `/audit`, `/upgradestatus`, `/memory <q>`)
+ *     — admin alias (operational separation per CPO #4).
+ *
+ * Callers spread the returned topic onto their send opts:
+ *
+ *   await ctx.reply(text, {
+ *     ...opts,
+ *     ...slashCommandReplyOpts(ctx, 'heavy'),
+ *   })
+ *
+ * Returns `{}` when no override is needed (non-supergroup, or
+ * helper resolved to the originating topic). Returns
+ * `{ message_thread_id: N }` otherwise.
+ */
+function slashCommandReplyOpts(
+  ctx: Context,
+  classification: 'query' | 'mutation' | 'heavy',
+): { message_thread_id?: number } {
+  const originThreadId = ctx.message?.message_thread_id
+  const event =
+    classification === 'query'
+      ? ({ kind: 'command-query', originThreadId } as const)
+      : classification === 'mutation'
+        ? ({ kind: 'command-mutation' } as const)
+        : ({ kind: 'command-heavy' } as const)
+  const target = resolveAgentOutboundTopic(event)
+  if (target == null) return {}
+  // Avoid the spurious explicit thread_id when it would equal the
+  // implicit-reply destination — keeps the wire identical to default
+  // ctx.reply for the query class in supergroup mode.
+  if (target === originThreadId) return {}
+  return { message_thread_id: target }
 }
 
 /**
@@ -10053,18 +10116,27 @@ async function dispatchShortVerbViaHostd(
   )
 }
 
-async function runSwitchroomCommand(ctx: Context, args: string[], label: string): Promise<void> {
+async function runSwitchroomCommand(
+  ctx: Context,
+  args: string[],
+  label: string,
+  // PR5 — supergroup-mode classification threaded through to
+  // switchroomReply. Default 'query' so existing callers (most
+  // commands) preserve in-place reply behavior. /logs /audit
+  // /upgradestatus /memory pass 'heavy' to route to admin alias.
+  classification: 'query' | 'mutation' | 'heavy' = 'query',
+): Promise<void> {
   try {
     const output = stripAnsi(switchroomExec(args))
     const formatted = formatSwitchroomOutput(output)
-    if (formatted) { await switchroomReply(ctx, preBlock(formatted), { html: true }) }
-    else { await switchroomReply(ctx, `${label}: done (no output)`) }
+    if (formatted) { await switchroomReply(ctx, preBlock(formatted), { html: true, classification }) }
+    else { await switchroomReply(ctx, `${label}: done (no output)`, { classification }) }
   } catch (err: unknown) {
     const error = err as { status?: number; stderr?: string; message?: string }
-    if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
-    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`); return }
+    if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true, classification }); return }
+    if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`, { classification }); return }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true, classification })
   }
 }
 
@@ -11029,7 +11101,9 @@ bot.command('update', async ctx => {
 // /upgrade-status. The /upgrade alias just below redirects.)
 bot.command('upgradestatus', async ctx => {
   if (!isAuthorizedSender(ctx)) return
-  await runSwitchroomCommand(ctx, ['update', '--status'], 'update --status')
+  // PR5 — heavy-output: route to admin alias in supergroup mode
+  // (CPO #4). Fleet-shared / DM agents fall through to in-place reply.
+  await runSwitchroomCommand(ctx, ['update', '--status'], 'update --status', 'heavy')
 })
 // Alias with hyphen — Grammy doesn't allow hyphens in command names
 // (Telegram's slash-command grammar excludes them) but operators are
@@ -11117,7 +11191,8 @@ bot.command('audit', async ctx => {
     )
     return
   }
-  await runSwitchroomCommand(ctx, argv, `hostd audit${argv.length > 2 ? ' …' : ''}`)
+  // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
+  await runSwitchroomCommand(ctx, argv, `hostd audit${argv.length > 2 ? ' …' : ''}`, 'heavy')
 })
 
 // ─── /approve, /deny, /pending ────────────────────────────────────────────
@@ -13899,14 +13974,16 @@ bot.command('logs', async ctx => {
   try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
   const lines = linesArg ? parseInt(linesArg, 10) : 20
   const lineCount = isNaN(lines) || lines < 1 ? 20 : Math.min(lines, 200)
-  await runSwitchroomCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`)
+  // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
+  await runSwitchroomCommand(ctx, ['agent', 'logs', name, '--lines', String(lineCount)], `logs ${name}`, 'heavy')
 })
 
 bot.command('memory', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const query = ctx.match?.trim()
   if (!query) { await switchroomReply(ctx, 'Usage: /memory <search query>'); return }
-  await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search')
+  // PR5 — heavy-output → admin alias in supergroup mode (CPO #4).
+  await runSwitchroomCommand(ctx, ['memory', 'search', query], 'memory search', 'heavy')
 })
 
 bot.command('issues', async ctx => {
