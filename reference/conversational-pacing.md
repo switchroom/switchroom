@@ -25,7 +25,7 @@ the five beats below and removes the contradiction.
 
 | Layer | Purpose | Owns | Implementation |
 |---|---|---|---|
-| Ambient | "Is it alive?" — glance-level liveness | The 👀→🤔→🔥→👍 status reaction on the user's inbound message **and** a continuous `typing…` chat-action held for the whole turn | `telegram-plugin/status-reactions.ts` + `gateway.ts:startTypingLoop` (started at turn-start, stopped by `purgeReactionTracking`) |
+| Ambient | "Is it alive?" — glance-level liveness | The 👀→🤔→✍→👍 status reaction on the user's inbound message **and** a continuous `typing…` chat-action held for the whole turn | `telegram-plugin/status-reactions.ts` + `gateway.ts:startTurnTypingLoop` (started at turn-start, stopped by `purgeReactionTracking`) |
 | Conversational | "What is it doing? What did it find?" — meaningful state changes | The agent's own `reply` calls, paced by the five beats | `profiles/_shared/telegram-style.md.hbs` + the append-prompt block in `scaffold.ts` + `disable_notification` parameter |
 | Safety net | "Why has it gone quiet?" — framework backstop when the model fails to chat | The silence-poke subsystem: 75s/180s/300s ladder | `telegram-plugin/silence-poke.ts` |
 
@@ -79,7 +79,7 @@ of* a real milestone (beats 3–4) is the black box this prevents.
 The framework backstops the model. State per-turn:
 `{ turnStartedAt, lastOutboundAt, pokesFired, pokeArmed, ackPokeFired,
 subagentDispatchActive, lastThinkingAt, fallbackFired,
-lastPokeFiredAt }`. Polled every 5s.
+lastPokeFiredAt, inFlightTools }`. Polled every 5s.
 
 | Threshold | Action | Wire |
 |---|---|---|
