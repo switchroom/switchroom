@@ -110,6 +110,33 @@ unlock Teams/SharePoint/admin tools. Cascade via
 
 ### 4.1 App registration (operator one-time)
 
+**Register a new Entra app for switchroom — don't reuse an existing
+one.** If the operator already has a Microsoft-integrated app
+(personal calendar app, side project, anything), there are two
+load-bearing reasons to register a new one rather than expand the
+existing one:
+
+1. **`signInAudience` is hard to change.** Existing apps are
+   typically `AzureADMyOrg` (single-tenant) or
+   `AzureADMultipleOrgs`. Switchroom needs
+   `AzureADandPersonalMicrosoftAccount` to cover personal MSA +
+   work in one app. The audience-flip is documented as
+   re-registration-required on some surfaces, and once flipped you
+   inherit MSA-specific limitations (no wildcard redirect URIs,
+   reduced configuration freedom).
+2. **Token version + audience drift.** `accessTokenAcceptedVersion`
+   and the `aud` claim can mismatch between what an existing app's
+   resources expect and what switchroom's broker expects. Adding
+   resources to a long-lived app drags compatibility debt that's
+   easy to avoid with a fresh app.
+
+Weaker reasons people cite (and that won't actually bite):
+incremental consent works, scope expansion is supported, redirect
+URIs can be multi-platform on one app. So if the existing app
+*already* has `AzureADandPersonalMicrosoftAccount` audience +
+public-client flows enabled, sharing isn't catastrophic — just
+cluttered. New app is still the cleaner default.
+
 Operator runs `switchroom auth microsoft connect` — a wizard that:
 
 1. Walks the operator through registering a new app in the **Entra
@@ -166,7 +193,18 @@ same tiering as Google's RFC D §3.2:
 
 Switchroom is regularly installed on headless VPSs (see
 `reference_install_validation_loop`); device-code is the right
-default for those hosts. Both flows converge after token acquisition:
+default for those hosts.
+
+**Stale-doc trap worth pre-empting**: Microsoft's older device-code
+page (`learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-acquire-token-device-code-flow`)
+contains the line *"AADSTS90133: Device Code flow is not supported
+under /common or /consumers endpoint"*. This is **outdated** — MSAL.NET
+4.5+ release notes and the MSAL .NET device-code wiki confirm device-
+code works on `/common` + `/consumers` for personal MSA, and every
+community MS-MCP server I surveyed uses this path successfully. The
+RFC's Tier 2 plan stands; the stale doc page just looks alarming.
+
+Both flows converge after token acquisition:
 
 5. Decodes `idTokenClaims.tid`:
    - `tid === "9188040d-6c67-4c5b-b112-36a304b66dad"` → **personal MSA**
@@ -236,7 +274,13 @@ Rationale for the split:
   a personal-use solo founder is not "agent has write access to my
   employer's entire SharePoint." Opt-in via `org_mode`.
 - `Files.ReadWrite.All` is bounded to the user's OneDrive (personal
-  or business) — narrow blast radius, the right default.
+  or business) — narrow blast radius for the personal case, the right
+  default. **Scope-narrowing option worth considering in PR 2 spike**:
+  `Files.ReadWrite` (no `.All`) is also MSA-supported and covers
+  "the signed-in user's files" — which on a personal account IS the
+  user's OneDrive. Dropping the `.All` suffix could lower blast
+  radius further with no functional loss for personal-MSA. Verify
+  via UAT that softeria's tools don't require the `.All` variant.
 - `offline_access` — **mandatory** for long-lived refresh tokens.
   Without it, Microsoft issues access-token-only.
 - `Mail.ReadWrite` (not `Mail.Send`) — agents draft mail; sending
@@ -334,6 +378,17 @@ not env-var-per-call. We can't change that without forking.
 `taylorwilsdon/google_workspace_mcp`'s contract. Then refresh happens
 in-process. Submit upstream PR after v1 ships; if accepted, retire
 the sidecar in v1.5. Carry a fork only if upstream resists.
+
+**Prior art for the refresh-token-in pattern**:
+`jordanburke/microsoft-todo-mcp-server` implements it for the To-Do
+scope set via `MS_TODO_ACCESS_TOKEN` + `MS_TODO_REFRESH_TOKEN` env
+vars; the rotate-and-persist loop at `src/token-manager.ts:100-162`
+is a clean reference for the upstream contribution. (Not drop-in
+usable as-is because scope is hardcoded to To-Do and the client
+shape requires a secret — but the auth-code path against
+`/{tenant}/oauth2/v2.0/token` is the pattern softeria's contribution
+should follow.) Validates that "refresh-token-in single-user" is
+implementable; we're not inventing it, we're generalizing it.
 
 **Sidecar lifecycle**: if softeria child dies, sidecar reaps and the
 whole launcher exits → Claude Code respawns on next tool call. If
@@ -654,7 +709,13 @@ have room.
   pursue MPN verification if/when switchroom goes commercial
 - **Multi-account-per-agent** (one agent talking to ken@personal +
   ken@work simultaneously) — defer; same one-account-per-agent
-  constraint as Google v1
+  constraint as Google v1. **Note for the v1.5 multi-account
+  spike**: softeria has an unresolved
+  [issue #209](https://github.com/softeria/ms-365-mcp-server/issues/209)
+  about admin-consent flow overwriting user tokens that suggests
+  rough edges in its multi-account model. Read the issue before
+  designing switchroom's multi-account-per-agent contract; may
+  drive the upstream fork-or-contribute decision in §5.3.
 - **softeria upstream `--refresh-token-mode` contribution** — v1
   ships our own sidecar refresher (§5.3); upstream contribution is
   v1.5 cleanup
