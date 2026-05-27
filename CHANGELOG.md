@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.13.57 — tool-intent surface: framework lifts model's stream into immediate user awareness
+
+UAT on v0.13.56 confirmed the PreToolUse ack-first gate (#1921) works
+exactly where designed — tool-using prompts produce a fast ack + answer
+split (Read 1.5s, multi-step 11.6s ack-then-answer, disk-usage 7.2s).
+But the gate has two costs:
+
+  - Per-tool node-spawn overhead (~50-100ms)
+  - Forces the model to author an explicit reply ack ("on it — checking")
+    even when the model's own `tool_use` event already carries the intent
+
+Ken's framing: "the gateway could surface some of the models description
+items without forcing the model to send a message using the tool."
+
+This release ships that. New gateway behaviour: when the model emits its
+FIRST non-reply `tool_use` event of a turn AND no reply has happened yet,
+the gateway lifts the model's intent (tool name + input, formatted via
+the existing `toolLabel()` helper) into a brief silent Telegram message:
+
+  - `<i>running:</i> ls -la /var/log`
+  - `<i>reading:</i> os-release`
+  - `<i>searching:</i> "Victoria drink driving"`
+  - `<i>fetching:</i> example.com`
+  - `<i>dispatching:</i> review the auth code`
+
+The model never has to call the reply tool just to ack — the gateway
+pulls the ack content directly from the stream. Italic verb signals
+framework-narrating. One-shot per turn (`turn.intentSurfaceFired`) so
+multi-tool turns don't spam.
+
+Composes with #1921's PreToolUse gate as belt-and-suspenders: whichever
+fires first sets `$TELEGRAM_STATE_DIR/ack-sent.flag` synchronously, the
+other sees it and stays quiet. Either lands an immediate user signal —
+framework voice from the surface, model voice from a gate-forced reply.
+
+The PreToolUse gate stays as the kill-switch fallback for any case the
+gateway-side surface can't fire (Telegram API down, etc.).
+
+Closes the design loop on #1918 for tool-using prompts. Pure-reasoning
+prompts (where the model emits no `tool_use` and just composes an
+answer) still take 10-16s — `thinking` event bodies are redacted by
+Anthropic so the gateway can't surface anything from them. Tracked as
+design space.
+
 ## v0.13.56 — human-feel UX: ack-first gate + awareness ping + telemetry honesty
 
 ### Headline — ack-first PreToolUse gate (#1921)
