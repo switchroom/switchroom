@@ -14,7 +14,7 @@ switchroom-telegram: bun run --cwd /opt/switchroom/telegram-plugin --shell=bun -
 agent-config: /usr/local/bin/switchroom mcp agent-config - ✓ Connected
 hindsight: http://127.0.0.1:18888/mcp/ (HTTP) - ✓ Connected
 gdrive: /usr/local/bin/switchroom drive-mcp-launcher --tier extended - ✓ Connected
-perplexity: /home/kenthompson/.switchroom/mcp-launchers/perplexity-mcp.sh  - ✓ Connected
+perplexity: ~/.switchroom/mcp-launchers/perplexity-mcp.sh  - ✓ Connected
 `;
 
   it("parses all-connected output cleanly", () => {
