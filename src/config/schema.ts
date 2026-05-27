@@ -964,6 +964,90 @@ export const MicrosoftWorkspaceConfigSchema = z
   .optional();
 
 /**
+ * Top-level notion_workspace config block — RFC docs/rfcs/notion-integration.md.
+ *
+ * Centralizes the Notion internal-integration token, the friendly-name →
+ * database UUID map, and the global rate-limit bucket size. Block is
+ * optional — when omitted, no agent gets a notion MCP entry regardless of
+ * per-agent config (the per-agent block is meaningless without the
+ * top-level one).
+ *
+ * Unlike google_workspace/microsoft_workspace which use OAuth-flow
+ * accounts, Notion uses a single long-lived integration token. There is
+ * no per-account concept; there is no `notion_accounts:` analog. The
+ * twin-key ACL is (1) broker ACL on the vault key, (2) per-agent
+ * `databases:` filter in AgentNotionWorkspaceConfigSchema.
+ *
+ * UUID regex is lenient (32 hex with optional dashes) — Notion's wire
+ * format always normalizes to the dashed form on responses but accepts
+ * either on requests, and the operator may paste either.
+ */
+export const NotionWorkspaceConfigSchema = z
+  .object({
+    vault_key: z
+      .string()
+      .min(1)
+      .default("notion/integration-token")
+      .describe(
+        "Vault key holding the Notion internal-integration token. Default " +
+        "`notion/integration-token`. Override only for non-standard vault " +
+        "layouts. The broker's --allow ACL on this key is the authoritative " +
+        "list of which agents may receive the token."
+      ),
+    databases: z
+      .record(
+        z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/, {
+          message:
+            "notion_workspace.databases friendly names must match " +
+            "/^[a-z0-9][a-z0-9_-]{0,62}$/ — lowercase letters, digits, " +
+            "hyphens, underscores. Got: '%s'.",
+        }),
+        z.string().regex(
+          /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/,
+          {
+            message:
+              "notion_workspace.databases values must be Notion database " +
+              "UUIDs (32 hex characters, optional dashes).",
+          }
+        ),
+      )
+      .default({})
+      .describe(
+        "Friendly-name → Notion database UUID map. Operator-managed; agents " +
+        "reference databases by friendly name only — they never see or type " +
+        "UUIDs. Populate via `switchroom notion list-dbs` (PR 4) after " +
+        "vault-putting the integration token and sharing DBs with the " +
+        "integration in Notion's UI."
+      ),
+    mcp_version: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Optional pin for the upstream `@notionhq/notion-mcp-server` npm " +
+        "package version. Default is the build-time `NOTION_MCP_PINNED_VERSION` " +
+        "constant. Override only when reproducing operator-specific bugs."
+      ),
+    rate_limit_rps: z
+      .number()
+      .int()
+      .positive()
+      .max(10)
+      .optional()
+      .describe(
+        "Optional global rate-limit budget in requests per second across all " +
+        "switchroom agents sharing this integration token. Defaults to 3 " +
+        "(Notion's documented public-API limit). Lower it if you also use " +
+        "the integration token from outside switchroom and need to share " +
+        "budget. Higher than 10 is rejected — if you think you need it, " +
+        "your usage probably needs a workspace-tier upgrade with Notion."
+      ),
+  })
+  .optional();
+
+export type NotionWorkspaceConfig = z.infer<typeof NotionWorkspaceConfigSchema>;
+
+/**
  * Per-agent google_workspace override. Currently just narrows the approver
  * set + lets the agent pick a tier different from the top-level default.
  * google_client_id/secret are not per-agent — those live at the top level
@@ -1040,6 +1124,56 @@ export const AgentMicrosoftWorkspaceConfigSchema = z
       ),
   })
   .optional();
+
+/**
+ * Per-agent notion_workspace override — RFC docs/rfcs/notion-integration.md.
+ *
+ * Presence of the block opts the agent IN to Notion access (the launcher
+ * is scaffolded, the `.mcp.json` entry is emitted, the broker grants the
+ * integration token). Absence opts out.
+ *
+ * The optional `databases:` filter narrows which DBs this agent may
+ * read/write. Names must resolve in the top-level
+ * `notion_workspace.databases` map (cross-validated at load time by
+ * `validateNotionWorkspaceConfig`). Empty list `[]` is rejected — same as
+ * "no notion_workspace at all", and the operator's intent is ambiguous;
+ * fail loudly instead of silently denying every tool call.
+ *
+ * Cascade: per-agent `databases` list REPLACES the parent (profile)
+ * list, never concatenates — see RFC §6.5.
+ */
+export const AgentNotionWorkspaceConfigSchema = z
+  .object({
+    databases: z
+      .array(
+        z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/, {
+          message:
+            "notion_workspace.databases entries must be friendly names " +
+            "matching /^[a-z0-9][a-z0-9_-]{0,62}$/ — these must appear as " +
+            "keys in top-level notion_workspace.databases.",
+        }),
+      )
+      .min(1, {
+        message:
+          "notion_workspace.databases must list at least one friendly " +
+          "name. An empty list rejects every Notion tool call — if you " +
+          "want to remove this agent's Notion access, delete the entire " +
+          "notion_workspace block instead.",
+      })
+      .optional()
+      .describe(
+        "Optional per-agent allowlist of database friendly names this " +
+        "agent may read/write. Each name must exist as a key in top-level " +
+        "notion_workspace.databases. Omit the field (or leave it undefined) " +
+        "to grant access to every DB the upstream integration can see — " +
+        "appropriate for an admin/orchestrator agent. Set the list to " +
+        "narrow access for specialist agents."
+      ),
+  })
+  .optional();
+
+export type AgentNotionWorkspaceConfig =
+  z.infer<typeof AgentNotionWorkspaceConfigSchema>;
 
 /**
  * Legacy alias for back-compat with RFC D shipped config. Identical shape
@@ -1780,6 +1914,13 @@ export const AgentSchema = z.object({
     "this agent in its `enabled_for[]`) and optionally overrides org_mode. " +
     "microsoft_client_id/secret are not per-agent.",
   ),
+  notion_workspace: AgentNotionWorkspaceConfigSchema.describe(
+    "RFC docs/rfcs/notion-integration.md. Per-agent Notion access. " +
+    "Presence opts the agent IN (launcher scaffolded, MCP entry emitted, " +
+    "broker grants the integration token). Optional `databases:` filter " +
+    "narrows which DBs this agent may read/write — names must resolve in " +
+    "top-level notion_workspace.databases. Absence opts the agent OUT.",
+  ),
   repos: z
     .record(
       z.string().regex(
@@ -2330,6 +2471,14 @@ export const SwitchroomConfigSchema = z.object({
     "endpoint (defaults to /common for personal MSA + work), and the " +
     "org_mode opt-in for Teams/SharePoint surfaces. Block is optional; " +
     "when omitted the broker does not register the Microsoft provider.",
+  ),
+  notion_workspace: NotionWorkspaceConfigSchema.describe(
+    "RFC docs/rfcs/notion-integration.md. Top-level Notion integration " +
+    "config — vault key for the integration token, friendly-name → " +
+    "database UUID map, optional MCP-package version pin, and optional " +
+    "global rate-limit override (default 3 rps, Notion's documented " +
+    "public-API limit). Block is optional; when omitted no agent gets a " +
+    "Notion MCP entry regardless of per-agent config.",
   ),
   quota: QuotaConfigSchema.optional().describe(
     "Optional weekly/monthly USD spend budgets rendered in the session " +

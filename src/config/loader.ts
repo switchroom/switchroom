@@ -7,6 +7,7 @@ import { SwitchroomConfigSchema, type SwitchroomConfig } from "./schema.js";
 import { resolveDualPath } from "./paths.js";
 import { applyAgentOverlays } from "./overlay-loader.js";
 import { resolveAgentConfig } from "./merge.js";
+import { validateNotionWorkspaceConfig } from "./notion-workspace-acl.js";
 
 export class ConfigError extends Error {
   constructor(
@@ -207,6 +208,19 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
   // otherwise silently fall back to default_topic_id at dispatch time —
   // far worse UX than failing fast at config-load.
   validateAllCronTopicAliases(config, filePath);
+
+  // RFC docs/rfcs/notion-integration.md PR 1: cross-validate per-agent
+  // notion_workspace.databases references against the top-level
+  // notion_workspace.databases friendly-name map. Same rationale as the
+  // cron-topic-alias check above — silent fall-through at runtime is
+  // strictly worse than failing fast at config-load.
+  const notionIssues = validateNotionWorkspaceConfig(config);
+  if (notionIssues.length > 0) {
+    throw new ConfigError(
+      `Invalid notion_workspace configuration in ${filePath}`,
+      notionIssues,
+    );
+  }
 
   return config;
 }
