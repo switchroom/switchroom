@@ -266,10 +266,31 @@ export interface GoogleAddAccountCredentials {
   };
 }
 
+/**
+ * Microsoft-shaped credentials payload for `addAccount`. RFC #1873 PR 2
+ * — client-side TS type matching protocol's `MicrosoftCredentialsSchema`.
+ * Richer than Google's shape: persists tenant + account-type discriminators.
+ */
+export interface MicrosoftAddAccountCredentials {
+  microsoftOauth: {
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+    scope: string;
+    clientId: string;
+    accountEmail: string;
+    tokenType: "Bearer";
+    tenantId: string;
+    accountType: "personal" | "work";
+    homeAccountId: string;
+  };
+}
+
 /** Discriminated union of credentials shapes for `addAccount`. */
 export type AddAccountCredentials =
   | AnthropicAddAccountCredentials
-  | GoogleAddAccountCredentials;
+  | GoogleAddAccountCredentials
+  | MicrosoftAddAccountCredentials;
 
 // ─── Client ───────────────────────────────────────────────────────────────
 
