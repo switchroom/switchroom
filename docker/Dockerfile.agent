@@ -172,6 +172,15 @@ RUN chmod 0755 /opt/switchroom/hooks/drive-write-pretool.mjs
 COPY dist/cli/ms-365-write-pretool.mjs /opt/switchroom/hooks/ms-365-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/ms-365-write-pretool.mjs
 
+# Notion PreToolUse hook (RFC docs/rfcs/notion-integration.md §8 PR 3).
+# Gates `mcp__notion__*` tool calls behind the per-DB allowlist defined
+# in notion_workspace.databases. Also enforces the create_database ban
+# (§6.2 rule 3) and the standalone-page deny (§6.2 rule 2). No approval
+# card in v1 — that's a follow-up PR. The allowlist gate is the
+# load-bearing security primitive.
+COPY dist/cli/notion-write-pretool.mjs /opt/switchroom/hooks/notion-write-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/notion-write-pretool.mjs
+
 # Advisory skill-shape linter (RFC native-by-default skill authoring,
 # Phase 1). Non-blocking — nudges the model toward a well-formed skill
 # when it writes under .claude/skills/; only the per-skill byte cap is
@@ -198,6 +207,7 @@ COPY docker/security-plugin/hooks/hooks.json /opt/switchroom/security-plugin/hoo
 COPY telegram-plugin/hooks/secret-guard-pretool.mjs /opt/switchroom/security-plugin/hooks/secret-guard-pretool.mjs
 COPY dist/cli/drive-write-pretool.mjs /opt/switchroom/security-plugin/hooks/drive-write-pretool.mjs
 COPY dist/cli/ms-365-write-pretool.mjs /opt/switchroom/security-plugin/hooks/ms-365-write-pretool.mjs
+COPY dist/cli/notion-write-pretool.mjs /opt/switchroom/security-plugin/hooks/notion-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/security-plugin/hooks/*.mjs
 
 # switchroom CLI bundle: the in-container telegram-plugin gateway sidecar

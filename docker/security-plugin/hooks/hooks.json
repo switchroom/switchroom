@@ -27,6 +27,15 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/notion-write-pretool.mjs\"",
+            "timeout": 30
+          }
+        ]
       }
     ]
   }

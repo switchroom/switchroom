@@ -163,6 +163,23 @@ if (ms365HookEscape.changed) {
   console.log(`[build] ASCII-escaped ${ms365HookEscape.nonAsciiCount} non-ASCII code units in dist/cli/ms-365-write-pretool.mjs`);
 }
 
+// Bundle the notion-write-pretool hook — RFC docs/rfcs/notion-integration.md
+// §8 PR 3. Same pattern: self-contained .mjs the agent container runs
+// via node. Imports the shared resolver + cache + config-loader from
+// src/notion/ and src/config/ which aren't otherwise available inside
+// the agent image.
+console.log("[build] bundling src/cli/notion-write-pretool.ts -> dist/cli/notion-write-pretool.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/notion-write-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "notion-write-pretool.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const notionHookOutFile = resolve(outDir, "notion-write-pretool.mjs");
+chmodSync(notionHookOutFile, 0o755);
+const notionHookEscape = escapeBundleNonAscii(notionHookOutFile);
+if (notionHookEscape.changed) {
+  console.log(`[build] ASCII-escaped ${notionHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/notion-write-pretool.mjs`);
+}
+
 // Bundle the skill-validate-pretool hook — RFC native-by-default skill
 // authoring, Phase 1. Same pattern: standalone .mjs the agent container
 // runs via node. It imports the shared validators from src/cli/
