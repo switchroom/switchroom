@@ -35,17 +35,18 @@ job.
 
 ### Examples
 
-- ✅ **Good:** `switchroom auth login coach` prints the OAuth URL
-  inline, says *"open this in any browser — tokens save to this agent's
-  CLAUDE_CONFIG_DIR, no other agent is affected,"* and watches for
-  completion.
-- ❌ **Bad:** `switchroom auth login coach` exits with `EAUTH_FAILED`
+- ✅ **Good:** `switchroom auth add default --via-claude` prints the
+  OAuth URL inline, says *"open this in any browser — complete the sign-in
+  and the token saves automatically,"* and watches for completion.
+  For refreshing an existing session: `switchroom auth reauth coach`.
+- ❌ **Bad:** `switchroom auth add` exits with `EAUTH_FAILED`
   and a link to `docs/auth.md`.
 
-- ✅ **Good:** `switchroom setup` detects that the bot's privacy mode is
-  still on and tells the user *"@CoachBot has Privacy Mode enabled — it
-  won't see group messages. Disable it in @BotFather → Bot Settings →
-  Group Privacy → Turn off, then re-run this step."*
+- ✅ **Good:** `switchroom setup` tells the user upfront: *"Before adding
+  your bot to a group, disable Privacy Mode in @BotFather → Bot Settings
+  → Group Privacy → Turn off. This lets the bot see all group messages."*
+  The guidance appears before the step that needs it, not as a post-hoc
+  error.
 - ❌ **Bad:** Setup completes, the bot joins the group, and silently
   ignores messages until the user reads `docs/telegram-plugin.md`.
 
@@ -56,8 +57,9 @@ job.
   to "check the agent logs."
 
 - ✅ **Good:** `switchroom vault set telegram-bot-token` prompts for the
-  value, masks input, confirms encryption, and tells the user *"now
-  reference this in switchroom.yaml as `vault:telegram-bot-token`."*
+  value, masks input, confirms encryption, and prints
+  `+ Secret 'telegram-bot-token' saved`. The user can then reference it
+  in `switchroom.yaml` as `vault:telegram-bot-token`.
 - ❌ **Bad:** `switchroom vault set` succeeds silently and requires the
   user to read `docs/vault.md` to learn the `vault:` reference syntax.
 
@@ -99,23 +101,21 @@ is work. Give them the working thing first. Let them tinker later.
 - ❌ **Bad:** "Configure the MCP servers and silence-poke thresholds
   yourself in `settings.json`." Maximum flexibility, zero defaults.
 
-- ✅ **Good:** `switchroom agent create exec --profile executive`
-  inherits everything from the executive profile and only writes the
-  two-line agent stanza. The cascade fills the rest.
+- ✅ **Good:** `switchroom agent create exec --profile executive-assistant`
+  inherits everything from the executive-assistant profile and only writes
+  the two-line agent stanza. The cascade fills the rest.
 - ❌ **Bad:** Each new agent requires copying ten files of boilerplate
   before it boots.
 
-- ✅ **Good:** The upgrade flow — `switchroom apply` to reconcile,
-  `docker compose pull` to fetch new images, `docker compose up -d
-  --remove-orphans` to roll the fleet — is three lines, idempotent,
-  and the same on every host.
+- ✅ **Good:** The upgrade flow is one command: `switchroom update` pulls
+  new images, reconciles the compose file, rolls the fleet, and runs
+  doctor — idempotent and the same on every host.
 - ❌ **Bad:** "Run `bun run build`, then bounce each container by hand,
   then re-render the compose file, then…"
 
 - ✅ **Good:** Sensible default skills on each profile (health-coach
   ships with `check-in` and `weekly-review`); operator skills
-  (`humanizer`, `buildkite-*`) stay opt-in via
-  `defaults.skills_auto`.
+  (`humanizer`) stay opt-in via `defaults.skills`.
 - ❌ **Bad:** Every agent inherits every bundled skill as dead weight,
   or every agent ships with no skills and tells the user to pick.
 
@@ -141,7 +141,7 @@ asks users to re-learn the product.
 ### Examples
 
 - ✅ **Good:** Every top-level CLI verb is `switchroom <noun> <verb>`
-  — `agent start`, `vault set`, `topics sync`, `auth login`. One
+  — `agent start`, `vault set`, `topics sync`, `auth add`. One
   shape. One file per noun in `src/cli/`.
 - ❌ **Bad:** `switchroom agent start` next to `switchroom
   restart-agent` next to `switchroom start_telegram`.
