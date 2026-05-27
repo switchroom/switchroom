@@ -472,6 +472,138 @@ describe("pollDeviceToken", () => {
 // generatePkcePair
 // ────────────────────────────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────────────────────────────
+// runLoopbackOAuth — full flow integration (ported from drive/oauth.test.ts
+// state-mismatch + happy-path patterns)
+// ────────────────────────────────────────────────────────────────────────
+
+describe("runLoopbackOAuth", () => {
+  it("happy path: opens server, completes consent, exchanges code", async () => {
+    const { runLoopbackOAuth } = await import("./oauth.js");
+    let authUrl = "";
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const params = new URLSearchParams(init?.body as string);
+      // Verify code_verifier was forwarded
+      expect(params.get("code_verifier")).toBeTruthy();
+      expect(params.get("code")).toBe("real-auth-code");
+      return new Response(JSON.stringify({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+
+    const openImpl = async (url: string): Promise<boolean> => {
+      authUrl = url;
+      // Simulate Microsoft redirecting back to the loopback after consent.
+      const parsed = new URL(url);
+      const state = parsed.searchParams.get("state")!;
+      const redirectUri = parsed.searchParams.get("redirect_uri")!;
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("code", "real-auth-code");
+      callback.searchParams.set("state", state);
+      // Microsoft's actual redirect — let it land asynchronously after listen.
+      setTimeout(() => {
+        // Use Node's http.get to hit the loopback callback.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const http = require("node:http") as typeof import("node:http");
+        const req = http.get(callback.toString());
+        req.on("error", () => { /* ignore */ });
+      }, 10);
+      return true;
+    };
+
+    const tokens = await runLoopbackOAuth(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      { fetchImpl: fetcher, openImpl, timeoutMs: 10_000 },
+    );
+    expect(tokens.access_token).toBe("at");
+    expect(tokens.refresh_token).toBe("rt");
+    expect(authUrl).toContain("login.microsoftonline.com");
+  }, 20_000);
+
+  it("rejects state mismatch (CSRF guard)", async () => {
+    const { runLoopbackOAuth } = await import("./oauth.js");
+    const fetcher = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const openImpl = async (url: string): Promise<boolean> => {
+      const parsed = new URL(url);
+      const redirectUri = parsed.searchParams.get("redirect_uri")!;
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("code", "code");
+      callback.searchParams.set("state", "wrong-state");
+      setTimeout(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const http = require("node:http") as typeof import("node:http");
+        const req = http.get(callback.toString());
+        req.on("error", () => { /* ignore */ });
+      }, 10);
+      return true;
+    };
+    await expect(runLoopbackOAuth(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      { fetchImpl: fetcher, openImpl, timeoutMs: 10_000 },
+    )).rejects.toThrow(/state parameter mismatch/);
+  }, 20_000);
+
+  it("rejects callback with no code parameter", async () => {
+    const { runLoopbackOAuth } = await import("./oauth.js");
+    const fetcher = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const openImpl = async (url: string): Promise<boolean> => {
+      const parsed = new URL(url);
+      const redirectUri = parsed.searchParams.get("redirect_uri")!;
+      const state = parsed.searchParams.get("state")!;
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("state", state);
+      // No code param
+      setTimeout(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const http = require("node:http") as typeof import("node:http");
+        const req = http.get(callback.toString());
+        req.on("error", () => { /* ignore */ });
+      }, 10);
+      return true;
+    };
+    await expect(runLoopbackOAuth(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      { fetchImpl: fetcher, openImpl, timeoutMs: 10_000 },
+    )).rejects.toThrow(/missing 'code'/);
+  }, 20_000);
+
+  it("propagates Microsoft error response from callback", async () => {
+    const { runLoopbackOAuth } = await import("./oauth.js");
+    const fetcher = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const openImpl = async (url: string): Promise<boolean> => {
+      const parsed = new URL(url);
+      const redirectUri = parsed.searchParams.get("redirect_uri")!;
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("error", "access_denied");
+      callback.searchParams.set("error_description", "User denied consent");
+      setTimeout(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const http = require("node:http") as typeof import("node:http");
+        const req = http.get(callback.toString());
+        req.on("error", () => { /* ignore */ });
+      }, 10);
+      return true;
+    };
+    await expect(runLoopbackOAuth(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      { fetchImpl: fetcher, openImpl, timeoutMs: 10_000 },
+    )).rejects.toThrow(/access_denied/);
+  }, 20_000);
+
+  it("times out if no callback ever arrives", async () => {
+    const { runLoopbackOAuth } = await import("./oauth.js");
+    const fetcher = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const openImpl = async () => true; // Don't actually call back
+    await expect(runLoopbackOAuth(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      { fetchImpl: fetcher, openImpl, timeoutMs: 200 },
+    )).rejects.toThrow(/timed out/);
+  });
+});
+
 describe("generatePkcePair", () => {
   it("returns a verifier + challenge with non-empty shapes", () => {
     const pair = generatePkcePair();

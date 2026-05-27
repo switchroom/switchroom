@@ -498,45 +498,57 @@ function registerAccountAdd(accountParent: Command): void {
 }
 
 function registerAccountRemove(accountParent: Command): void {
-  accountParent
+  // .alias("rm") to match Google's verb shape.
+  const cmd = accountParent
     .command("remove <account>")
+    .alias("rm")
     .description(
-      "Remove a Microsoft account from the auth-broker. Refused if any agent still enabled — run `auth microsoft disable <account> all` first.",
-    )
-    .action(
-      withConfigError(async (account: string) => {
-        const normalizedAccount = validateAndNormalizeAccountEmail(account);
-        const { brokerCall } = await import("./broker-call.js");
+      "Remove a Microsoft account from the auth-broker AND prune the YAML entry. Refused if any agent still enabled — run `auth microsoft disable <account> all` first.",
+    );
+  cmd.action(
+    withConfigError(async (account: string, _opts: unknown, command) => {
+      const normalizedAccount = validateAndNormalizeAccountEmail(account);
+      const { brokerCall } = await import("./broker-call.js");
 
-        // Refuse if any agent still enabled in YAML
-        const yamlPath = process.env.SWITCHROOM_CONFIG ?? "~/.switchroom/switchroom.yaml";
-        try {
-          const yaml = readFileSync(yamlPath.replace(/^~/, process.env.HOME ?? ""), "utf-8");
-          const enabled = getEnabledAgentsForMicrosoftAccount(yaml, normalizedAccount);
-          if (enabled && enabled.length > 0) {
-            throw new Error(
-              `Account ${normalizedAccount} is still enabled on agents: ${enabled.join(", ")}. ` +
-              `Run 'switchroom auth microsoft disable ${normalizedAccount} all' first.`,
-            );
-          }
-        } catch (e) {
-          if (e instanceof Error && e.message.includes("still enabled")) throw e;
-          // YAML read failure — proceed (broker remove is independent)
-        }
+      // Resolve YAML path via the program (honors --config flag) rather
+      // than hand-rolling ~ expansion. The action callback's `command`
+      // arg is the leaf subcommand; walk up to the top-level program.
+      const program = command.parent?.parent?.parent ?? command;
+      const yamlPath = getConfigPath(program);
+      const before = readFileSync(yamlPath, "utf-8");
+      const enabled = getEnabledAgentsForMicrosoftAccount(before, normalizedAccount);
+      if (enabled && enabled.length > 0) {
+        throw new Error(
+          `Account ${normalizedAccount} is still enabled on agents: ${enabled.join(", ")}. ` +
+          `Run 'switchroom auth microsoft disable ${normalizedAccount} all' first.`,
+        );
+      }
 
-        await brokerCall(async (client) => {
-          await client.rmAccount(normalizedAccount, "microsoft");
-        });
+      await brokerCall(async (client) => {
+        await client.rmAccount(normalizedAccount, "microsoft");
+      });
 
-        console.log();
+      // Prune the dormant YAML entry now that the broker creds are gone.
+      // Idempotent — if the entry was already absent, returns input verbatim.
+      const after = removeMicrosoftAccountEntry(before, normalizedAccount);
+      if (after !== before) writeFileSync(yamlPath, after);
+
+      console.log();
+      console.log(
+        chalk.green(
+          `  ✓ Removed Microsoft account ${chalk.bold(normalizedAccount)} from auth-broker.`,
+        ),
+      );
+      if (after !== before) {
         console.log(
-          chalk.green(
-            `  ✓ Removed Microsoft account ${chalk.bold(normalizedAccount)} from auth-broker.`,
+          chalk.gray(
+            `    pruned dormant entry from microsoft_accounts: in switchroom.yaml`,
           ),
         );
-        console.log();
-      }),
-    );
+      }
+      console.log();
+    }),
+  );
 }
 
 function registerAccountList(accountParent: Command): void {
@@ -652,6 +664,25 @@ function buildMicrosoftCredentials(opts: {
     }
   }
 
+  // Catch typo'd account args: if Microsoft authenticated a different
+  // email than what the operator passed, warn loudly. Easy to miss
+  // otherwise — broker indexes by the passed arg, credentials.json says
+  // the real email, and `enable` on the typo would still "work" but
+  // route to the wrong account. Reviewer ask.
+  if (resolvedEmail.toLowerCase() !== accountEmail.toLowerCase()) {
+    console.warn();
+    console.warn(
+      `  ⚠ Account argument was '${accountEmail}' but Microsoft authenticated as '${resolvedEmail}'.`,
+    );
+    console.warn(
+      `    The broker will index by '${accountEmail}' (what you typed). If this isn't what`,
+    );
+    console.warn(
+      `    you intended (e.g. a typo), 'switchroom auth microsoft account remove ${accountEmail}' to undo.`,
+    );
+    console.warn();
+  }
+
   return {
     microsoftOauth: {
       accessToken: tokens.access_token,
@@ -669,23 +700,39 @@ function buildMicrosoftCredentials(opts: {
 }
 
 /**
- * Read a single visible line — for non-secret prompts. Hidden input
- * version (`readHiddenLine`) lives below.
+ * Read a single hidden line of input (no echo) — for secret prompts
+ * like the vault passphrase. On non-TTY input (CI, piped stdin) falls
+ * back to readline.question for sensible behavior.
  */
 async function readHiddenLine(prompt: string): Promise<string> {
   const readline = await import("node:readline");
+  const stdin = process.stdin as unknown as {
+    isTTY?: boolean;
+    setRawMode?: (raw: boolean) => void;
+  };
+  // Non-TTY: use readline.question — manual data listener + readline
+  // interface fight each other on piped stdin. Matches Google's
+  // auth-google.ts:1063 shape.
+  if (!stdin.isTTY) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    return new Promise<string>((resolve) => {
+      rl.question(prompt, (answer) => {
+        rl.close();
+        resolve(answer);
+      });
+    });
+  }
   return new Promise((resolve, reject) => {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
     });
     const stdout = process.stdout as unknown as { write: (s: string) => void };
-    const stdin = process.stdin as unknown as {
-      isTTY?: boolean;
-      setRawMode?: (raw: boolean) => void;
-    };
     stdout.write(prompt);
-    if (stdin.isTTY && stdin.setRawMode) {
+    if (stdin.setRawMode) {
       stdin.setRawMode(true);
     }
     let line = "";
@@ -743,7 +790,11 @@ export function microsoftClientSetupGuidance(reason: string): string {
     "    switchroom vault set microsoft-oauth-client-id",
     "    switchroom vault set microsoft-oauth-client-secret  # optional",
     "",
-    "  8. Add to ~/.switchroom/switchroom.yaml (top level):",
+    "  8. If your work tenant requires admin consent, your IT admin must",
+    "     grant the requested Graph scopes (Files.ReadWrite.All etc.) at",
+    "     first sign-in. Personal MSA accounts (outlook.com / hotmail.com)",
+    "     don't need this step.",
+    "  9. Add to ~/.switchroom/switchroom.yaml (top level):",
     "",
     "    microsoft_workspace:",
     '      microsoft_client_id: "vault:microsoft-oauth-client-id"',
