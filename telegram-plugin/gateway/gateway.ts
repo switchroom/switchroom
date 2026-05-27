@@ -53,7 +53,11 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { deriveIntentSurface } from '../tool-intent-surface.js'
+import {
+  makeEmptyActivityState,
+  registerAndRender,
+  type ActivityState,
+} from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -1292,15 +1296,33 @@ type CurrentTurn = {
   // Phase 1 of #332: count of tool_use events in the current turn, for
   // the tool_call_count column in the turns registry.
   toolCallCount: number
-  // Tool-intent surface (the human-feel UX follow-up to #1921's
-  // PreToolUse gate). When the model emits its first non-reply tool_use
-  // of a turn AND no outbound has happened yet, the gateway lifts the
-  // tool's already-formed intent (name + input → `toolLabel()`) into a
-  // user-visible "<i>running</i>: ls -la /var/log" message. One-shot
-  // per turn — subsequent tool_use events stay quiet so a multi-tool
-  // turn doesn't spam. The model never has to call reply just to ack;
-  // its own intent stream IS the ack source.
-  intentSurfaceFired: boolean
+  // Tool-activity summary — mirrors Claude Code's native chat-UI
+  // rendering ("Ran 5 commands, read a file"). Counters are
+  // incremented in `case 'tool_use'`; `activityMessageId` holds the
+  // Telegram message id we send/edit so a single message accumulates
+  // the summary in place. Stops updating once `replyCalled` flips —
+  // the model's own reply lands below the summary as the actual
+  // content.
+  //
+  // Parallel-tool-use coalescing (PR #1926 review): modern Claude
+  // emits multiple tool_uses in a tight synchronous loop (e.g. 3
+  // parallel Reads). Without coalescing, each would see
+  // `activityMessageId == null` and fire its own sendMessage,
+  // producing N messages instead of one editable summary. Pattern
+  // mirrors `telegram-plugin/answer-stream.ts`:
+  //   - `activityInFlight` — promise that resolves when the current
+  //     send/edit settles. While set, NEW tool_uses just update
+  //     `activityState` and `activityPendingRender` and return.
+  //   - When the in-flight resolves, it picks the latest
+  //     `activityPendingRender`, fires the next send/edit, and
+  //     repeats until the pending matches the last-sent.
+  // Result: at most one Telegram call in flight at a time; the
+  // final state always lands.
+  toolActivity: ActivityState
+  activityMessageId: number | null
+  activityInFlight: Promise<void> | null
+  activityPendingRender: string | null
+  activityLastSentRender: string | null
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
   // gates on minInitialChars). Materialized and cleared at turn_end.
@@ -6777,6 +6799,71 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
   }
 }
 
+/**
+ * Drain the tool-activity summary's pending render queue. Single-flight
+ * by construction (caller assigns the returned promise to
+ * `turn.activityInFlight`; while set, new tool_uses only update
+ * `turn.activityPendingRender` and return). The drain loops:
+ *
+ *   while pendingRender != lastSentRender:
+ *     fire send (first time) or edit (subsequent) with pendingRender
+ *     update lastSentRender to whatever we just sent
+ *
+ * Two failure modes are tolerated quietly:
+ *   - "message is not modified" (Telegram rejects identical edits) —
+ *     the retry-api-call wrapper already swallows this, but the catch
+ *     here is a belt-and-braces safety net for the bare path
+ *   - send/edit network errors — log and bail; the message is
+ *     best-effort UX, not safety
+ *
+ * The drain holds a reference to `turn`, so a turn-swap mid-drain
+ * doesn't corrupt the next turn's atom — late writes land on the
+ * captured `turn` (already-completed turn, harmless) and the new turn
+ * starts with `activityInFlight=null`.
+ */
+async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
+  try {
+    while (turn.activityPendingRender !== turn.activityLastSentRender) {
+      const target = turn.activityPendingRender
+      if (target == null) break
+      const html = `<i>${target}</i>`
+      const chat = turn.sessionChatId
+      const thread = turn.sessionThreadId
+      try {
+        if (turn.activityMessageId == null) {
+          const sent = await robustApiCall(
+            () => bot.api.sendMessage(chat, html, {
+              ...(thread != null ? { message_thread_id: thread } : {}),
+              parse_mode: 'HTML',
+              disable_notification: true,
+            }),
+            { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.send' },
+          )
+          turn.activityMessageId = sent.message_id
+        } else {
+          const id = turn.activityMessageId
+          await robustApiCall(
+            () => bot.api.editMessageText(chat, id, html, { parse_mode: 'HTML' }),
+            { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.edit' },
+          )
+        }
+        turn.activityLastSentRender = target
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        // retry-api-call swallows "message is not modified" already but
+        // keep the filter for any other layer that surfaces it raw.
+        if (!msg.includes('message is not modified')) {
+          process.stderr.write(`telegram gateway: activity-summary drain failed: ${msg}\n`)
+        }
+        // Mark as sent so we don't infinite-loop on a stuck render.
+        turn.activityLastSentRender = target
+      }
+    }
+  } finally {
+    turn.activityInFlight = null
+  }
+}
+
 function handleSessionEvent(ev: SessionEvent): void {
   switch (ev.kind) {
     case 'enqueue': {
@@ -6842,7 +6929,11 @@ function handleSessionEvent(ev: SessionEvent): void {
           lastAssistantMsgId: null,
           lastAssistantDone: false,
           toolCallCount: 0,
-          intentSurfaceFired: false,
+          toolActivity: makeEmptyActivityState(),
+          activityMessageId: null,
+          activityInFlight: null,
+          activityPendingRender: null,
+          activityLastSentRender: null,
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
@@ -6962,62 +7053,39 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       // Tool-intent surface — companion to the PreToolUse ack-first gate
       // (#1921). On the FIRST non-reply tool_use of a turn AND only when
-      // no outbound has happened yet, the gateway lifts the model's tool
-      // intent (name + input → `toolLabel()`) into a brief framework-voice
-      // status: `<i>running:</i> ls -la /var/log`. The model never has to
-      // call reply just to ack — its own intent stream IS the ack. The
-      // gate continues to fire IN PARALLEL: if it produces a model-voice
-      // ack first (`replyCalled=true`), the surface stays quiet by the
-      // condition below. One-shot per turn.
-      if (
-        !turn.replyCalled
-        && !turn.intentSurfaceFired
-        && !isTelegramSurfaceTool(name)
-      ) {
-        turn.intentSurfaceFired = true
-        // `ev.input` is the canonical SessionEvent property
-        // (`telegram-plugin/session-tail.ts:95`). All other tool_use
-        // sites in this file use `ev.input` — keep that consistent.
-        const surface = deriveIntentSurface(name, ev.input, ev.precomputedLabel)
-        if (surface.text != null) {
-          // Mark the ack-flag synchronously BEFORE the async send so a
-          // PreToolUse ack-first hook (#1921) firing concurrently for this
-          // same tool call sees the flag already present and allows the
-          // tool through. The Telegram send is fire-and-forget; failure
+      // Tool-activity summary — same shape Claude Code natively renders
+      // in its CLI/chat UI ("Ran 5 commands, read a file"). The gateway
+      // accumulates non-reply tool_use events into `turn.toolActivity`
+      // and sends ONE Telegram message that edits in place as more tools
+      // land. Stops editing once the model calls `reply` — the summary
+      // line stays as the final state. No model-side prompting; no per-
+      // tool labels. Just surface what's already in the stream.
+      //
+      // Single-flight coalescing (PR #1926 review): modern Claude emits
+      // multiple tool_uses in a synchronous burst (parallel Reads,
+      // Bashes, etc.). All would otherwise race past the message-id
+      // capture and produce N messages. Pattern mirrors answer-stream:
+      // update `activityPendingRender` synchronously here; a single
+      // worker promise drains the pending state, sending or editing
+      // exactly once at a time and re-running until pending matches
+      // the last-sent. Captures `turn` so a late drain after turn-swap
+      // can't corrupt the next turn's atom.
+      if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
+        const rendered = registerAndRender(turn.toolActivity, name)
+        if (rendered != null) {
+          // Mark the ack-flag synchronously so a PreToolUse hook firing
+          // concurrently for THIS tool call (#1921) sees the flag set
+          // and allows the tool through. The drain runs async; failure
           // is logged but does not block the model.
           try {
             markAckSent()
           } catch (err) {
-            process.stderr.write(`telegram gateway: intent-surface markAckSent failed: ${err}\n`)
+            process.stderr.write(`telegram gateway: activity-summary markAckSent failed: ${err}\n`)
           }
-          const surfaceChat = turn.sessionChatId
-          const surfaceThread = turn.sessionThreadId
-          const surfaceText = surface.text
-          void (async () => {
-            try {
-              await robustApiCall(
-                () => bot.api.sendMessage(surfaceChat, surfaceText, {
-                  ...(surfaceThread != null ? { message_thread_id: surfaceThread } : {}),
-                  parse_mode: 'HTML',
-                  // Framework-narrating beat — silent, ambient, not a
-                  // device buzz. The user is meant to glance and know
-                  // the model is alive + on-task.
-                  disable_notification: true,
-                }),
-                { chat_id: surfaceChat, ...(surfaceThread != null ? { threadId: surfaceThread } : {}), verb: 'intent-surface' },
-              )
-              // Deliberately NOT calling signalTracker.noteOutbound /
-              // silencePoke.noteOutbound here — framework-owned
-              // ambient messages are not model-author outbounds, so
-              // they should not reset the TTFO clock or short-circuit
-              // the silence-poke ladder. Mirrors the sibling
-              // `onAwarenessPing` handler (silence-poke.ts:169
-              // contract: "Caller must NOT call back into noteOutbound
-              // for this — it's a framework-sourced message").
-            } catch (err) {
-              process.stderr.write(`telegram gateway: intent-surface send failed: ${err}\n`)
-            }
-          })()
+          turn.activityPendingRender = rendered
+          if (turn.activityInFlight == null) {
+            turn.activityInFlight = drainActivitySummary(turn)
+          }
         }
       }
       if (!ctrl) return
