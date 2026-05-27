@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.13.54 — schedule_add unblocked + supergroup mode PR4b/5/6 + MS-365 PR3/4/5
+
+### Headline — schedule_add drift fix (#1893, closes #1892)
+
+`schedule_add` via the agent-config MCP was failing on every docker-mode
+agent with `E_RECONCILE_FAILED: non-cron changes surfaced during cron-
+only reconcile: <agentDir>/.mcp.json`. The overlay was rolled back,
+clerk (and any docker-mode agent) couldn't manage scheduled tasks.
+
+Root cause: both `.mcp.json` writers (`scaffoldAgent`, `reconcileAgent`)
+derived `TELEGRAM_STATE_DIR` from runtime `agentDir` — HOME-dependent.
+Host CLI wrote `/home/<user>/...`, in-container CLI wrote
+`/state/agent/home/...` for the same logical agent. Both target the
+same bind-mounted file. Each invocation flipped the on-disk shape; the
+broker's cron-only reconcile bridge detected drift on its own write
+and rolled back the schedule overlay.
+
+Fix: pin `TELEGRAM_STATE_DIR` to `${DOCKER_AGENT_HOME}/.switchroom/
+agents/${name}/telegram` in both writers — environment-independent,
+matching every other path in the framework MCP set. Latent since
+v0.7.x docker cutover, visible whenever a host `switchroom apply`
+runs between in-container reconciles.
+
+Regression test (`tests/scaffold.mcp-json-telegram-state-dir.test.ts`)
+asserts both writers emit the canonical in-container value regardless
+of runtime `agentDir`.
+
+### Supergroup mode (continued)
+
+- **PR4b emitter sweep (#1890)** — operator-event, permission, and
+  approval cards now route via the supergroup helper so they land in
+  the correct topic instead of the default topic when supergroup mode
+  is on.
+- **PR5 (#1891)** — slash-command smart split: heavy-output commands
+  in supergroup mode route to the admin alias topic, keeping query
+  responses in-place. Per-command classification: `query` follows the
+  originating topic; `mutation` and `heavy` route to admin.
+- **PR6 (#1889)** — hindsight topic tagging + filter-mode flag.
+  Memories tagged with the originating topic id; new filter-mode knob
+  controls cross-topic recall scope. Instrumentation added.
+
+### Microsoft 365 integration (RFC #1873, continued)
+
+- **PR3 (#1886)** — `m365-mcp-launcher` CLI verb + scaffold
+  integration; agents with `microsoft_workspace:` declarations now
+  get the launcher wired into `.mcp.json` via `resolveMs365McpEntry`.
+- **PR4 (#1887)** — write-approval hook for MS-365 mutating ops in
+  the telegram-plugin (mirror of the gdrive write-pretool pattern).
+- **PR5 (#1888)** — doctor probes for the Microsoft workspace
+  surface + user-facing docs.
+
 ## v0.13.53 — supergroup-mode foundations + parallel-turns deadlock fix
 
 Ships the entire **per-agent Telegram supergroup mode** design
