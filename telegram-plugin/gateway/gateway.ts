@@ -1357,7 +1357,19 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // abort skips purge, the stray loop self-heals: the next turn on this
   // chat calls `startTurnTypingLoop`, which stops the old interval
   // first.)
-  stopTurnTypingLoop(chatIdOfChatKey(key as _ChatKey))
+  // PR3 supergroup-mode: stop the per-(chat,thread) typing loop, not
+  // the whole chat's. Prefer the ending-turn's session ids (the
+  // canonical turn ownership); fall back to parsing the chatKey
+  // for sibling-purge / restart-cleanup callers that don't have a
+  // Turn handle.
+  if (endingTurn != null) {
+    stopTurnTypingLoop(endingTurn.sessionChatId, endingTurn.sessionThreadId ?? null)
+  } else {
+    const chatId = chatIdOfChatKey(key as _ChatKey)
+    const threadPart = (key as string).slice(chatId.length + 1)
+    const threadId = threadPart === '_' || threadPart === '' ? null : Number(threadPart)
+    stopTurnTypingLoop(chatId, Number.isFinite(threadId) ? threadId : null)
+  }
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
@@ -1875,6 +1887,13 @@ function escapeMarkdownV2(text: string): string {
 }
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
+// All four state maps re-keyed from `chat_id` to `chatKey(chat, thread)`
+// in PR3 of the supergroup-mode rollout. In supergroup mode one agent
+// owns many topics in one chat; chatId-only keying meant topic A's
+// typing indicator died when topic B's tool call ended (last-stop-wins
+// on a shared key). Per-(chat,thread) keying preserves independent
+// typing loops across topics. Callers without thread context pass
+// `null` and behave exactly as before (chatKey collapses null→`_`).
 const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
 // Track pending backoff-retry timers so shutdown and stop can cancel them.
 const typingRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -1903,34 +1922,41 @@ const CHAT_ACTION_WHITELIST = new Set([
 ] as const)
 type ChatAction = typeof CHAT_ACTION_WHITELIST extends Set<infer T> ? T : never
 
-function startTypingLoop(chat_id: string, action: ChatAction = 'typing'): void {
-  stopTypingLoop(chat_id)
+function startTypingLoop(
+  chat_id: string,
+  thread_id: number | null = null,
+  action: ChatAction = 'typing',
+): void {
+  stopTypingLoop(chat_id, thread_id)
+  const key = chatKey(chat_id, thread_id) as string
+  const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
   const send = () => {
-    bot.api.sendChatAction(chat_id, action).then(
+    bot.api.sendChatAction(chat_id, action, sendOpts).then(
       () => { typingBackoffMs = 0 },
       (err) => {
         const msg = err instanceof Error ? err.message : String(err)
         if (msg.includes('401') || msg.includes('Unauthorized')) {
           typingBackoffMs = Math.min(Math.max(typingBackoffMs * 2 || 1000, 1000), TYPING_BACKOFF_MAX)
-          stopTypingLoop(chat_id)
+          stopTypingLoop(chat_id, thread_id)
           const retry = setTimeout(() => {
-            typingRetryTimers.delete(chat_id)
-            startTypingLoop(chat_id, action)
+            typingRetryTimers.delete(key)
+            startTypingLoop(chat_id, thread_id, action)
           }, typingBackoffMs)
-          typingRetryTimers.set(chat_id, retry)
+          typingRetryTimers.set(key, retry)
         }
       },
     )
   }
   send()
-  typingIntervals.set(chat_id, setInterval(send, 4000))
+  typingIntervals.set(key, setInterval(send, 4000))
 }
 
-function stopTypingLoop(chat_id: string): void {
-  const iv = typingIntervals.get(chat_id)
-  if (iv) { clearInterval(iv); typingIntervals.delete(chat_id) }
-  const retry = typingRetryTimers.get(chat_id)
-  if (retry) { clearTimeout(retry); typingRetryTimers.delete(chat_id) }
+function stopTypingLoop(chat_id: string, thread_id: number | null = null): void {
+  const key = chatKey(chat_id, thread_id) as string
+  const iv = typingIntervals.get(key)
+  if (iv) { clearInterval(iv); typingIntervals.delete(key) }
+  const retry = typingRetryTimers.get(key)
+  if (retry) { clearTimeout(retry); typingRetryTimers.delete(key) }
 }
 
 // Turn-level `typing…` indicator. Deliberately a SEPARATE interval map
@@ -1945,18 +1971,21 @@ function stopTypingLoop(chat_id: string): void {
 // sendChatAction is cheap.
 const turnTypingIntervals = new Map<string, ReturnType<typeof setInterval>>()
 
-function startTurnTypingLoop(chat_id: string): void {
-  stopTurnTypingLoop(chat_id)
+function startTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
+  stopTurnTypingLoop(chat_id, thread_id)
+  const key = chatKey(chat_id, thread_id) as string
+  const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
   const send = () => {
-    void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+    void bot.api.sendChatAction(chat_id, 'typing', sendOpts).catch(() => {})
   }
   send()
-  turnTypingIntervals.set(chat_id, setInterval(send, 4000))
+  turnTypingIntervals.set(key, setInterval(send, 4000))
 }
 
-function stopTurnTypingLoop(chat_id: string): void {
-  const iv = turnTypingIntervals.get(chat_id)
-  if (iv) { clearInterval(iv); turnTypingIntervals.delete(chat_id) }
+function stopTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
+  const key = chatKey(chat_id, thread_id) as string
+  const iv = turnTypingIntervals.get(key)
+  if (iv) { clearInterval(iv); turnTypingIntervals.delete(key) }
 }
 
 const typingWrapper = createTypingWrapper({
@@ -4672,7 +4701,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     previewMessageId = null
   }
 
-  startTypingLoop(chat_id)
+  startTypingLoop(chat_id, threadId ?? null)
 
   // #1677 silent-reply auto-edit. Consecutive silent replies within
   // a turn edit a single anchor message instead of stacking new
@@ -4804,7 +4833,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   if (silentAnchorEditDone) {
     // Skip the chunk loop entirely — the anchor edit IS the send.
     // Match the normal exit path: stop typing, then return.
-    stopTypingLoop(chat_id)
+    stopTypingLoop(chat_id, threadId ?? null)
     return {
       content: [
         {
@@ -4921,7 +4950,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     const msg = err instanceof Error ? err.message : String(err)
     throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
   } finally {
-    stopTypingLoop(chat_id)
+    stopTypingLoop(chat_id, threadId ?? null)
   }
 
   // #710: remember per-button agent meta (ack_text / single_use) keyed
@@ -6281,8 +6310,12 @@ async function executeSendTyping(args: Record<string, unknown>): Promise<unknown
     }
     action = rawAction as ChatAction
   }
-  startTypingLoop(stChatId, action)
-  setTimeout(() => stopTypingLoop(stChatId), 30000)
+  // PR3 supergroup-mode: resolve thread from args or fall back to the
+  // last-seen thread for this chat so the indicator lands in the topic
+  // the agent is working in (rather than the chat root).
+  const stThreadId = resolveThreadId(stChatId, args.message_thread_id as string | number | undefined) ?? null
+  startTypingLoop(stChatId, stThreadId, action)
+  setTimeout(() => stopTypingLoop(stChatId, stThreadId), 30000)
   for (const [key, ctrl] of activeStatusReactions.entries()) {
     if (key.startsWith(`${stChatId}:`)) ctrl.setTool()
   }
@@ -6632,7 +6665,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (isTelegramSurfaceTool(name)) return
       ctrl.setTool(name)
       if (ev.toolUseId) {
-        typingWrapper.onToolUse(ev.toolUseId, turn.sessionChatId, name)
+        typingWrapper.onToolUse(ev.toolUseId, turn.sessionChatId, name, turn.sessionThreadId ?? null)
       }
       return
     }
@@ -6875,7 +6908,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       const turn = currentTurn
       if (turn == null) return
       if (!ev.toolUseId) return
-      typingWrapper.onToolUse(ev.toolUseId, turn.sessionChatId, ev.toolName)
+      typingWrapper.onToolUse(ev.toolUseId, turn.sessionChatId, ev.toolName, turn.sessionThreadId ?? null)
       return
     }
     case 'sub_agent_tool_result': {
@@ -8744,7 +8777,10 @@ async function handleInbound(
         // turn-end (`purgeReactionTracking → stopTurnTypingLoop`).
         // Deterministic, framework-owned, no prose — the mechanical
         // ambient layer of the pacing contract.
-        startTurnTypingLoop(chat_id)
+        // PR3 supergroup-mode: pass thread so the indicator lands in
+        // this turn's topic (otherwise topic A's turn-end would kill
+        // topic B's typing indicator on shared chat_id keying).
+        startTurnTypingLoop(chat_id, messageThreadId ?? null)
         // #1122 KPI: emit turn_started so dashboards can compute funnel
         // start counts + correlate to turn_ended for duration / TTFO.
         emitRuntimeMetric({

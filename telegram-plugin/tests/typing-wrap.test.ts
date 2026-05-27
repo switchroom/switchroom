@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createTypingWrapper } from '../typing-wrap.js'
 
 function makeDeps(overrides: { isSurfaceTool?: (name: string) => boolean } = {}) {
-  const startTypingLoop = vi.fn<(chatId: string) => void>()
-  const stopTypingLoop = vi.fn<(chatId: string) => void>()
+  // PR3 supergroup-mode: start/stop now take (chatId, threadId?). The
+  // existing tests cover the chatId-only case (threadId omitted → null);
+  // new tests below pin the per-thread isolation.
+  const startTypingLoop = vi.fn<(chatId: string, threadId?: number | null) => void>()
+  const stopTypingLoop = vi.fn<(chatId: string, threadId?: number | null) => void>()
   const isSurfaceTool =
     overrides.isSurfaceTool ??
     ((name: string) =>
@@ -28,7 +31,7 @@ describe('createTypingWrapper', () => {
     w.onToolUse('t1', 'chat-A', 'Bash')
     // First tool on a fresh chat fires immediately — no timer wait required.
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
-    expect(deps.startTypingLoop).toHaveBeenCalledWith('chat-A')
+    expect(deps.startTypingLoop).toHaveBeenCalledWith('chat-A', null)
   })
 
   it('a parallel second tool on the same chat uses the debounce', () => {
@@ -69,7 +72,7 @@ describe('createTypingWrapper', () => {
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
     w.onToolResult('t1')
     expect(deps.stopTypingLoop).toHaveBeenCalledTimes(1)
-    expect(deps.stopTypingLoop).toHaveBeenCalledWith('chat-A')
+    expect(deps.stopTypingLoop).toHaveBeenCalledWith('chat-A', null)
   })
 
   it('skips surface tools (reply/stream_reply/edit_message/react)', () => {
@@ -93,16 +96,16 @@ describe('createTypingWrapper', () => {
     w.onToolUse('t1', 'chat-A', 'Bash')
     w.onToolUse('t2', 'chat-B', 'Grep')
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
-    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(1, 'chat-A')
-    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(2, 'chat-B')
+    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(1, 'chat-A', null)
+    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(2, 'chat-B', null)
 
     w.onToolResult('t1')
     expect(deps.stopTypingLoop).toHaveBeenCalledTimes(1)
-    expect(deps.stopTypingLoop).toHaveBeenLastCalledWith('chat-A')
+    expect(deps.stopTypingLoop).toHaveBeenLastCalledWith('chat-A', null)
 
     w.onToolResult('t2')
     expect(deps.stopTypingLoop).toHaveBeenCalledTimes(2)
-    expect(deps.stopTypingLoop).toHaveBeenLastCalledWith('chat-B')
+    expect(deps.stopTypingLoop).toHaveBeenLastCalledWith('chat-B', null)
   })
 
   it('drainAll clears pending entries and stops any started loops', () => {
@@ -137,5 +140,59 @@ describe('createTypingWrapper', () => {
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
     vi.advanceTimersByTime(2)
     expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
+  })
+
+  // ─── PR3 supergroup-mode: per-(chat,thread) lane isolation ────────────
+  it('SAME chat + DIFFERENT threads each get their own immediate-fire lane', () => {
+    const deps = makeDeps()
+    const w = createTypingWrapper(deps)
+    // Both are "first tool on lane" — both fire immediately, not debounced.
+    w.onToolUse('t1', 'chat-A', 'Bash', 17)
+    w.onToolUse('t2', 'chat-A', 'Read', 23)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
+    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(1, 'chat-A', 17)
+    expect(deps.startTypingLoop).toHaveBeenNthCalledWith(2, 'chat-A', 23)
+  })
+
+  it('SAME chat + SAME thread STILL uses debounce on the second tool', () => {
+    const deps = makeDeps()
+    const w = createTypingWrapper(deps)
+    w.onToolUse('t1', 'chat-A', 'Bash', 17)
+    w.onToolUse('t2', 'chat-A', 'Read', 17)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(500)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
+  })
+
+  it('stopping topic A does NOT clear topic B\'s lane (the headline bug fix)', () => {
+    // The bug: chatId-only keying meant `activeChats.delete(chatId)`
+    // when topic A's tool ended ALSO marked topic B's lane as inactive,
+    // so topic B's next tool would re-fire immediately (wrong — it's
+    // already typing) and a subsequent stop could mismatch.
+    // Per-(chat,thread) lane keying preserves independence.
+    const deps = makeDeps()
+    const w = createTypingWrapper(deps)
+    w.onToolUse('t1', 'chat-A', 'Bash', 17)   // topic A lane: active
+    w.onToolUse('t2', 'chat-A', 'Read', 23)   // topic B lane: active (independent)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)
+
+    w.onToolResult('t1')  // topic A done
+    expect(deps.stopTypingLoop).toHaveBeenLastCalledWith('chat-A', 17)
+    // Topic B is still active — a third tool on topic B should DEBOUNCE
+    // (lane is still active), not fire immediately.
+    w.onToolUse('t3', 'chat-A', 'Edit', 23)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(2)  // no immediate fire
+    vi.advanceTimersByTime(500)
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(3)
+    expect(deps.startTypingLoop).toHaveBeenLastCalledWith('chat-A', 23)
+  })
+
+  it('treats undefined / null threadId as the same lane (chatKey null/0 collapse)', () => {
+    const deps = makeDeps()
+    const w = createTypingWrapper(deps)
+    w.onToolUse('t1', 'chat-A', 'Bash')           // undefined thread
+    w.onToolUse('t2', 'chat-A', 'Read', null)     // null thread — same lane
+    expect(deps.startTypingLoop).toHaveBeenCalledTimes(1)  // only first fires immediately
+    expect(deps.startTypingLoop).toHaveBeenLastCalledWith('chat-A', null)
   })
 })
