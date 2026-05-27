@@ -112,17 +112,33 @@ export async function decide(
 
   const bare = toolName.slice(TOOL_PREFIX.length);
 
-  // `search` is special-cased BEFORE the regular dispatch — the
-  // dispatcher returns args-malformed for search (it's handled at
-  // response time by the post-filter), but the hook still needs to
-  // gate at call time on whether the agent has notion_workspace at
-  // all. The actual result-filtering happens elsewhere (search-
-  // filter.ts) once the response comes back.
+  // `search` v1 posture: the post-filter (src/notion/search-filter.ts)
+  // is unit-tested but not yet wired into the launcher's stdio bridge
+  // (tracked at https://github.com/switchroom/switchroom/issues/1913).
+  // Until that wire-up lands, allowing search for an agent with a
+  // narrowed `databases:` filter would leak snippets from other DBs
+  // the integration was shared with — the privacy invariant RFC §8.5
+  // promised. The honest v1 gate: block search for filtered agents.
+  //
+  // Admin-shaped agents (no `databases:` filter; access whatever the
+  // upstream integration can see) are unaffected — the filter would
+  // have been a no-op for them anyway.
   if (bare === "search") {
     if (!agentHasNotionWorkspace(deps.agentName, config)) {
       return {
         decision: "block",
         reason: `Agent ${deps.agentName} has no notion_workspace config; Notion tool calls are not permitted.`,
+      };
+    }
+    const filter = config.agents?.[deps.agentName]?.notion_workspace?.databases;
+    if (filter !== undefined && filter.length > 0) {
+      return {
+        decision: "block",
+        reason:
+          `Notion \`search\` is blocked for ${deps.agentName} in v1 because the ` +
+          `per-agent allowlist (notion_workspace.databases: [${filter.join(", ")}]) ` +
+          `cannot yet be enforced on search results. Use \`query_database\` against ` +
+          `your allowed DBs instead. Tracked at switchroom/switchroom#1913.`,
       };
     }
     return { decision: "allow" };

@@ -32,8 +32,23 @@
 
 import type { PageDbCache } from "./page-db-cache.js";
 
-/** Max walk depth before we give up and call it "no-db". */
-export const MAX_WALK_DEPTH = 4;
+/**
+ * Max walk depth before we give up and call it "no-db".
+ *
+ * Raised from 4 → 6 in v0.13.55 follow-up: Notion blocks can nest
+ * deeper than the original budget (column → callout → toggle →
+ * sub-block → page → DB is 5 hops). 4 was an over-aggressive cap
+ * that surfaced as fail-closed denials on legitimately nested
+ * pages. 6 gives margin without unbounding the walk.
+ *
+ * IMPORTANT: when the depth cap is hit, we do NOT cache the result
+ * as `null` (no-db) — caching would poison subsequent lookups for
+ * the same node. Instead we return `no-db` for the current call but
+ * leave the cache untouched so the next lookup re-walks (and may
+ * succeed if the API was transiently slow on the prior call). See
+ * `resolveDbForNode` end-of-walk handling.
+ */
+export const MAX_WALK_DEPTH = 6;
 
 export type ResolutionResult =
   | { kind: "db"; dbId: string; apiCalls: number }
@@ -150,8 +165,13 @@ export async function resolveDbForNode(
     };
   }
 
-  // Hit walk-depth cap — almost certainly the workspace root.
-  cache.set(startId, null);
+  // Hit walk-depth cap. Deny THIS call (fail-closed), but DO NOT
+  // poison the cache with `null`. If we cached `null`, every future
+  // lookup of the same node would short-circuit to no-db forever
+  // — even if the real chain is only one hop deeper than the cap.
+  // Returning `no-db` without writing to cache lets the next call
+  // re-walk fresh (and possibly succeed if MAX_WALK_DEPTH gets
+  // raised, or if the deeper page gets moved closer to its DB).
   return { kind: "no-db", apiCalls };
 }
 

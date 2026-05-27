@@ -51,7 +51,7 @@ export function registerNotionCommand(program: Command): void {
   cmd
     .command("test <agent>")
     .description(
-      "Smoke-test Notion access for an agent. Calls /v1/users/me via the broker and prints the integration's bot user.",
+      "Smoke-test the Notion integration token (does NOT exercise per-agent ACL — use `switchroom doctor` for that). Verifies the agent has notion_workspace configured + the token works against Notion's API. Calls /v1/users/me via the operator-side broker and prints the integration's bot user.",
     )
     .option(
       "--vault-key <key>",
