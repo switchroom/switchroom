@@ -236,7 +236,7 @@ export async function handleRequestMs365Approval(
       correlationId: msg.correlationId,
       ok,
       ...extra,
-    } as unknown as Parameters<IpcClient["send"]>[0]);
+    });
   };
 
   // Cross-agent guard

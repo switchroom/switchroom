@@ -127,6 +127,7 @@ export type GatewayToClient =
   | ToolCallResult
   | ScheduleRestartResult
   | DriveApprovalPostedEvent
+  | Ms365ApprovalPostedEvent
   | ConfigApprovalResolvedEvent;
 
 // === Bridge (Client) -> Gateway messages ===
