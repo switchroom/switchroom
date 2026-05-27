@@ -3429,7 +3429,18 @@ silencePoke.startTimer({
         longest_silent_gap_ms: outboundMetrics.longestOutboundGapMs,
         ended_via: 'framework_fallback',
       })
-      signalTracker.clear(fbKey)
+      // #1892-follow-up: do NOT clear signalTracker state here. When the
+      // model recovers post-fallback (the framework's user-visible
+      // "still working" message is the load-bearing unwedge primitive —
+      // see `project_silence_poke_broken_and_cross_turn_fix`), its late
+      // reply calls fire `signalTracker.noteOutbound(fbKey, ...)`. If
+      // state is already cleared, that's a silent no-op and the late
+      // reply is invisible to outbound_count + ttfo metrics — the
+      // canonical session-end path (silent-marker line 7407 or normal
+      // turn-end line 7502) emits turn_ended a second time, reading
+      // the empty state and reporting outbound_count=0 even though
+      // replies landed. Defer clear to the canonical paths so
+      // post-fallback recoveries are correctly counted.
     }
     // Stamp the turn-DB end row as `timeout` so the wedged turn doesn't
     // stay open until a SIGTERM/restart relabels it (false-negative for
