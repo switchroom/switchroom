@@ -246,7 +246,7 @@ Three checks. A "no" on any one is a redesign, not a follow-up:
 3. **Consistency test** — same CLI shape, cascade, vault syntax, progress card as adjacent features?
 
 **JTBDs — `reference/<job>.md`** — *did it do the user's job?*
-13 outcome-focused jobs grouped by outcome in `reference/README.md`.
+14 outcome-focused jobs grouped by outcome in `reference/README.md`.
 Survey cheaply: `head -5 reference/*.md` reads every `job: / outcome:
 / stakes:` frontmatter in one shot. Read in full only the JTBD(s) the
 change touches.

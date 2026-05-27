@@ -18,12 +18,12 @@ Each JTBD has a three-line frontmatter — `job:` / `outcome:` /
 `stakes:` — that captures 80% of the doc.
 
 ```bash
-# Survey every job in one read:
-head -5 reference/*.md
+# Survey every JTBD in one read (also prints headers for non-JTBD docs):
+head -5 reference/*.md | grep -E '^(==>|job:|outcome:|stakes:)'
 ```
 
-Read a JTBD in full only when your change touches it. The body's
-*Signs it's working*, *Anti-patterns*, and *UAT prompts* sections are
+Read a JTBD in full only when your change touches it. Most JTBD bodies have
+*Signs it's working*, *Anti-patterns*, and *UAT prompts* sections —
 where the design teeth are — open them before designing a UX surface
 that touches the job.
 
@@ -49,12 +49,12 @@ that touches the job.
 - [`keep-my-subscription-honest.md`](keep-my-subscription-honest.md) — keep my subscription the only thing I'm paying for
 - [`share-auth-across-the-fleet.md`](share-auth-across-the-fleet.md) — log into Anthropic once per account, not once per agent
 
-### Always available — *there when you want it*
+### Always available, in Telegram, done properly — *there when you want it*
 
 - [`survive-reboots-and-real-life.md`](survive-reboots-and-real-life.md) — survive reboots and real life
-- [`idempotent-update-and-restart.md`](idempotent-update-and-restart.md) — update switchroom and trust everything's running the new version
+- [`idempotent-update-and-restart.md`](idempotent-update-and-restart.md) — update switchroom and trust that everything is actually running the new version, no manual checks
 - [`talk-to-agents-from-anywhere.md`](talk-to-agents-from-anywhere.md) — talk to my agents from anywhere
 
 ## Working docs (not part of the design contract)
 
-- [`onboarding-gap-analysis.md`](onboarding-gap-analysis.md) — phased fix plan from a real onboarding session; tracks gaps as they close, not a durable JTBD.
+- [`onboarding-gap-analysis.md`](onboarding-gap-analysis.md) — historical point-in-time gap analysis from a 2026-04-25 onboarding session; not a live tracker. Several gaps have shipped; read as motivation context, not current roadmap.
