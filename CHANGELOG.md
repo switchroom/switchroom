@@ -66,17 +66,36 @@ snapshot (#1853).
   distinct thread_ids with first-message preview, generates a
   copy-paste-ready `topic_aliases:` YAML snippet.
 
-### Microsoft 365 integration (1 of 5)
+### Microsoft 365 integration (2 of 5)
 
 - **#1873** — RFC + validation-pass update (#1879).
 - **#1881** — auth-broker Microsoft provider + storage (PR 1/5).
   Common-tenant Entra app, MSAL device-code flow, broker-only token
-  storage. Subsequent PRs (sidecar refresher v1, MCP launcher glue,
-  skills) build on this foundation.
+  storage.
+- **#1882** — `switchroom auth microsoft …` CLI verbs + OAuth flow
+  (PR 2/5). Operator-facing device-code login wired through to the
+  broker storage from PR 1/5. Subsequent PRs (sidecar refresher v1,
+  MCP launcher glue, skills) build on this.
 
 ### Standalone
 
 - **#1853** — `switchroom status` CLI for fleet/accounts/MCPs snapshot.
+
+### PR3b follow-up — orphan sweep (#1884)
+
+Edge-case audit of #1880 found a strictly-new latent leak:
+`claudeBusyKeys` can hold keys that `activeTurnStartedAt` does NOT,
+because synthetic-inbound deliveries (cron via `onInjectInbound`,
+reaction-dispatch, vault grant/deny/etc, button-callback) bypass
+handleInbound's fresh-turn branch. If such a synthetic-delivered
+turn dies without `turn_end`, the existing recovery sweeps
+(disconnect-flush iterating `activeTurnStartedAt.keys()`,
+silence-poke framework-fallback keyed off activeTurnStartedAt) can't
+see the orphan → fleet flush gate wedges. Fix: append
+`claudeBusyKeys.clear()` to `flushOnAgentDisconnect` (same
+justification as the existing dangling-sweep — bridge died, every
+busy key is dead by definition). 3 new regression tests. Folded
+into this release so the leak never ships.
 
 ## v0.13.52 — agents now know about clone-to-personal (discovery gap)
 
