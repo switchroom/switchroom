@@ -53,6 +53,7 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
+import { allocateDraftId } from '../draft-transport.js'
 import {
   makeEmptyActivityState,
   registerAndRender,
@@ -1320,6 +1321,12 @@ type CurrentTurn = {
   // final state always lands.
   toolActivity: ActivityState
   activityMessageId: number | null
+  // Draft-transport id when the activity summary is streamed via
+  // sendMessageDraft (DM-only, no thread). Each call to
+  // sendMessageDraft(chat, draftId, text) REPLACES the draft text —
+  // simpler than send+edit. Cleared by `clearActivitySummary` (which
+  // sends an empty draft) when the model's reply takes over.
+  activityDraftId: number | null
   activityInFlight: Promise<void> | null
   activityPendingRender: string | null
   activityLastSentRender: string | null
@@ -6803,23 +6810,25 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
  * Drain the tool-activity summary's pending render queue. Single-flight
  * by construction (caller assigns the returned promise to
  * `turn.activityInFlight`; while set, new tool_uses only update
- * `turn.activityPendingRender` and return). The drain loops:
+ * `turn.activityPendingRender` and return).
  *
- *   while pendingRender != lastSentRender:
- *     fire send (first time) or edit (subsequent) with pendingRender
- *     update lastSentRender to whatever we just sent
+ * Transport priority (mirrors the existing answer-stream pattern):
  *
- * Two failure modes are tolerated quietly:
- *   - "message is not modified" (Telegram rejects identical edits) —
- *     the retry-api-call wrapper already swallows this, but the catch
- *     here is a belt-and-braces safety net for the bare path
- *   - send/edit network errors — log and bail; the message is
- *     best-effort UX, not safety
+ *   1. DM with no thread AND sendMessageDraft API available →
+ *      DRAFT TRANSPORT. Each call REPLACES the draft text (no
+ *      edit-in-place needed); the user sees a live preview in their
+ *      Telegram compose area as the agent works. When the model's
+ *      reply tool lands, `clearActivitySummary` sends an empty draft
+ *      to wipe it — only the real reply persists.
+ *
+ *   2. Anything else (forum topic, draft API absent) → fall through
+ *      to sendMessage + editMessageText. The activity message is a
+ *      real chat message; `clearActivitySummary` deletes it when the
+ *      reply tool takes over.
  *
  * The drain holds a reference to `turn`, so a turn-swap mid-drain
  * doesn't corrupt the next turn's atom — late writes land on the
- * captured `turn` (already-completed turn, harmless) and the new turn
- * starts with `activityInFlight=null`.
+ * captured `turn` (already-completed turn, harmless).
  */
 async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
   try {
@@ -6829,8 +6838,16 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
       const html = `<i>${target}</i>`
       const chat = turn.sessionChatId
       const thread = turn.sessionThreadId
+      // sendMessageDraft doesn't support forum threads.
+      const useDraft = turn.isDm && thread == null && sendMessageDraftFn != null
       try {
-        if (turn.activityMessageId == null) {
+        if (useDraft) {
+          if (turn.activityDraftId == null) {
+            turn.activityDraftId = allocateDraftId()
+          }
+          const draftId = turn.activityDraftId
+          await sendMessageDraftFn!(chat, draftId, html, undefined)
+        } else if (turn.activityMessageId == null) {
           const sent = await robustApiCall(
             () => bot.api.sendMessage(chat, html, {
               ...(thread != null ? { message_thread_id: thread } : {}),
@@ -6850,8 +6867,6 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
         turn.activityLastSentRender = target
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        // retry-api-call swallows "message is not modified" already but
-        // keep the filter for any other layer that surfaces it raw.
         if (!msg.includes('message is not modified')) {
           process.stderr.write(`telegram gateway: activity-summary drain failed: ${msg}\n`)
         }
@@ -6862,6 +6877,47 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
   } finally {
     turn.activityInFlight = null
   }
+}
+
+/**
+ * Clear the activity summary when the model's reply tool takes over
+ * as the authoritative surface. Awaits any in-flight render so we
+ * don't race a stale write against the clear, then either sends an
+ * empty draft (clears the compose-area preview) or deletes the
+ * persisted message. Idempotent + best-effort — failure stderr-logs
+ * but does not block.
+ *
+ * Called from `case 'tool_use'` the moment we see a Telegram reply
+ * tool fire, so the user sees the real reply land in the same beat
+ * the summary disappears.
+ */
+function clearActivitySummary(turn: CurrentTurn): void {
+  const chat = turn.sessionChatId
+  const thread = turn.sessionThreadId
+  const inFlight = turn.activityInFlight ?? Promise.resolve()
+  void inFlight.then(async () => {
+    if (turn.activityDraftId != null && sendMessageDraftFn != null) {
+      const draftId = turn.activityDraftId
+      turn.activityDraftId = null
+      try {
+        // Empty text → Telegram clears the draft.
+        await sendMessageDraftFn(chat, draftId, '', undefined)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: activity-summary draft-clear failed: ${err}\n`)
+      }
+    } else if (turn.activityMessageId != null) {
+      const id = turn.activityMessageId
+      turn.activityMessageId = null
+      try {
+        await robustApiCall(
+          () => bot.api.deleteMessage(chat, id),
+          { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.delete' },
+        )
+      } catch (err) {
+        process.stderr.write(`telegram gateway: activity-summary delete failed: ${err}\n`)
+      }
+    }
+  })
 }
 
 function handleSessionEvent(ev: SessionEvent): void {
@@ -6931,6 +6987,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           toolCallCount: 0,
           toolActivity: makeEmptyActivityState(),
           activityMessageId: null,
+          activityDraftId: null,
           activityInFlight: null,
           activityPendingRender: null,
           activityLastSentRender: null,
@@ -7045,10 +7102,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Phase tracking removed in #553 PR 5 — phases only fed the
       // placeholder-heartbeat label, which has been retired.
       if (isTelegramReplyTool(name)) {
+        const wasFirstReply = !turn.replyCalled
         turn.replyCalled = true
         if (turn.orphanedReplyTimeoutId != null) {
           clearTimeout(turn.orphanedReplyTimeoutId)
           turn.orphanedReplyTimeoutId = null
+        }
+        // The model's real reply takes over as the authoritative
+        // surface. Clear the activity summary — for drafts, send an
+        // empty draft to wipe the compose-area preview; for persisted
+        // messages, delete. The user sees the real reply land in the
+        // same beat the summary disappears.
+        if (wasFirstReply) {
+          clearActivitySummary(turn)
         }
       }
       // Tool-intent surface — companion to the PreToolUse ack-first gate
