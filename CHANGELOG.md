@@ -1,5 +1,112 @@
 # Changelog
 
+## v0.13.55 — Notion integration (5-PR series)
+
+Adds a Notion provider to switchroom: one operator-owned internal
+integration shared across agents, per-agent database allowlists, and
+a privacy-preserving search filter. Five PRs (#1896, #1897, #1898,
+#1899, #1900) plus the RFC (#1895). ~2900 LOC across schema +
+launcher + broker primitive + PreToolUse hook + DB resolver + LRU
+cache + privacy post-filter + doctor + CLI + docs + bundled skill.
+
+Design lives at `docs/rfcs/notion-integration.md`. Operator setup
+guide at `docs/notion-integration.md`. Config reference at
+`docs/configuration.md` § Notion Workspace.
+
+### Highlights
+
+- **Operator registers once.** Notion → Settings → Integrations →
+  New Internal Integration → copy the secret →
+  `switchroom vault set notion/integration-token --allow clerk,carrie`.
+  Then share the relevant databases with the integration in Notion's
+  UI.
+- **Per-DB allowlist** is the load-bearing per-agent control.
+  `agents.<name>.notion_workspace.databases: [essays]` restricts an
+  agent to a subset of what the upstream integration was shared with.
+  Empty list rejected at config-load.
+- **Mandatory privacy filter on `search`.** carrie searching for a
+  term in clerk's private database returns zero results — page
+  titles and snippets are stripped before the model sees them.
+  Pinned by a regression-gate test at
+  `src/notion/search-filter.test.ts`.
+- **`create_database` and standalone-page writes hard-denied v1.**
+  Create new databases via Notion's UI; agents read/write existing
+  ones only.
+- **Doctor section** with five probes — top-level block, integration
+  token present, DB reference resolvable, vault-ACL aligned (catches
+  the launcher-503-at-runtime case at config-edit time), launcher
+  heartbeat.
+- **Operator CLI** — `switchroom notion list-dbs` prints a
+  ready-to-paste YAML block of friendly-name → UUID mappings (powers
+  the bootstrap order). `switchroom notion test <agent>` smoke-tests
+  the integration token + ACL + network.
+- **Bundled skill** (`skills/notion/SKILL.md`) describes the tool
+  surface, common workflows, v1 limits, and what to do when the
+  allowlist denies a call.
+
+### PR breakdown
+
+- **PR 1 — config schema + per-DB ACL helpers** (#1896) —
+  `NotionWorkspaceConfigSchema` and `AgentNotionWorkspaceConfigSchema`
+  wired into the root and agent schemas. Pure predicates in
+  `src/config/notion-workspace-acl.ts` (`shouldEmitNotionMcp`,
+  `agentCanAccessNotionDB`, `resolveDbNameFromUuid`,
+  `normalizeNotionUuid`) + load-time cross-validator.
+- **PR 2 — MCP launcher + scaffold + broker rate-bucket primitive**
+  (#1897) — hidden `switchroom notion-mcp-launcher` verb fetches the
+  integration token from the vault-broker and execs
+  `@notionhq/notion-mcp-server@1.8.1` (pinned). No refresh loop —
+  Notion's token is long-lived. Scaffold emits the `.mcp.json` entry
+  via `resolveNotionMcpEntry` (mirrors `resolveMs365McpEntry` shape).
+  Pure `NotionRateBucket` class shipped standalone — wire-up to the
+  broker IPC verb defers to a follow-up PR.
+- **PR 3 — allowlist gate + db-resolver + privacy post-filter +
+  PreToolUse hook** (#1898) — LRU page→DB cache, per-tool dispatch +
+  recursion-bounded parent walk, minimal Notion REST client, hook
+  bundled into the image AND the security-plugin's
+  unstrippable-hooks directory. Privacy invariant regression-gated.
+- **PR 4 — doctor probes + operator CLI verbs** (#1899) —
+  `runNotionChecks` mirroring `doctor-microsoft.ts` shape, plus
+  `switchroom notion list-dbs / test <agent>`.
+- **PR 5 — docs + bundled skill + CLI-string corrections** (#1900) —
+  operator setup guide, configuration reference section, bundled
+  skill. Also corrected `vault put` / `vault acl add/remove` strings
+  across the prior merged PRs to the actual `vault set --allow X,Y`
+  CLI verb shape (reviewer-caught regression — operators following
+  the docs would have hit "unknown command").
+
+### Deliberate v1 deferrals
+
+These ship as follow-up PRs after first operator use, not as part of
+v0.13.55:
+
+- **Operator approval cards on writes.** The allowlist IS the security
+  primitive; approval cards are UX. m365/drive pattern adds card
+  surface in a clean follow-up PR on top of the hook.
+- **Hook-side rate-bucket wire-up.** The primitive ships (`PR 2`); the
+  hook makes Notion API calls directly. If production logs show >5%
+  429s, the broker IPC verb gets wired and the hook calls into it.
+- **`notion:rate-bucket-saturation` doctor probe.** Lands with the
+  hook-side bucket wire-up.
+- **`notion:upstream-reachable` doctor probe** (`--deep`-gated).
+  `switchroom notion test <agent>` covers the same surface manually.
+- **UAT scenarios** (`telegram-plugin/uat/scenarios/jtbd-notion-*`).
+  Privacy invariant is already unit-tested; live UAT requires
+  operator-side Notion + per-agent vault setup to be meaningful.
+
+### Migration: existing `personal-notion` skill on clerk
+
+If an agent currently runs a per-agent `personal-notion` skill that
+bundles its own Notion authentication, the bundled `skills/notion`
+shipped in this release supersedes it. To migrate:
+
+1. Set up `notion_workspace:` in switchroom.yaml as above.
+2. Remove the agent's personal skill via the agent's MCP:
+   `skill_remove_personal notion`. The bundled skill is
+   auto-discovered.
+
+See `docs/notion-integration.md` § Migration for the full path.
+
 ## v0.13.54 — schedule_add unblocked + supergroup mode PR4b/5/6 + MS-365 PR3/4/5
 
 ### Headline — schedule_add drift fix (#1893, closes #1892)
