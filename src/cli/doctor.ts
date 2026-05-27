@@ -32,6 +32,7 @@ import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
+import { runNotionChecks } from "./doctor-notion.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
@@ -2579,6 +2580,27 @@ export function registerDoctorCommand(program: Command): void {
           {
             title: "Microsoft 365 (RFC #1873)",
             results: runMicrosoftChecks(config),
+          },
+          {
+            title: "Notion (RFC notion-integration)",
+            results: await runNotionChecks(config, {
+              vaultAclReader: async (key: string) => {
+                try {
+                  const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+                  const result = await getViaBrokerStructured(key);
+                  if (result.kind === "ok") {
+                    return {
+                      kind: "ok",
+                      allow: result.entry.scope?.allow ?? [],
+                    };
+                  }
+                  if (result.kind === "not_found") return { kind: "not_found" };
+                  return { kind: "unreachable", msg: result.msg };
+                } catch (err) {
+                  return { kind: "unreachable", msg: (err as Error).message };
+                }
+              },
+            }),
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
         ];
