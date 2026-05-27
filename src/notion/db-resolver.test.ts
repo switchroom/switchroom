@@ -120,6 +120,23 @@ describe("resolveDbForNode — no-DB outcomes", () => {
     expect(r.kind).toBe("no-db");
     expect(r.apiCalls).toBe(MAX_WALK_DEPTH);
   });
+
+  it("does NOT poison the cache when hitting MAX_WALK_DEPTH", async () => {
+    // The original cap-exhaustion path wrote `null` to the cache,
+    // which would short-circuit every subsequent lookup of the same
+    // node to no-db forever — even if the real chain is just one
+    // hop deeper than the cap. Regression-gate for that fix.
+    const pages: Record<string, { type: "page_id"; page_id: string }> = {};
+    for (let i = 0; i < MAX_WALK_DEPTH + 2; i += 1) {
+      pages[`page-${i}`] = { type: "page_id", page_id: `page-${i + 1}` };
+    }
+    const client = mockClient(pages);
+    const cache = new PageDbCache();
+    await resolveDbForNode("page-0", "page", client, cache);
+    // The starting node MUST NOT be in the cache as null — that's
+    // the poisoning case.
+    expect(cache.get("page-0").kind).toBe("miss");
+  });
 });
 
 describe("resolveDbForNode — cache short-circuit", () => {

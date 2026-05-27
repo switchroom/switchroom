@@ -47,10 +47,12 @@ disallowed database, you'll get a clean block reason naming the DB.
 The Notion MCP exposes the standard set:
 
 - **Search.** `search` finds pages or databases by title/content
-  across what the integration can see. switchroom's PreToolUse hook
-  post-filters results to your allowlist — pages outside it are
-  dropped before they reach you. The response's metadata field
-  indicates how many were filtered.
+  across what the integration can see. **In switchroom v1, `search`
+  is BLOCKED for any agent with a non-empty
+  `notion_workspace.databases:` allowlist** — the post-filter that
+  would strip out-of-allowlist results isn't wired yet. Use
+  `query_database` against your allowed DBs instead. Admin-shaped
+  agents (no per-DB filter) can search normally.
 - **Database queries.** `query_database` runs a filter+sort against
   a database. You need the database's UUID (operator gives these
   via friendly names in `notion_workspace.databases` — ask the
@@ -98,11 +100,13 @@ The Notion MCP exposes the standard set:
 
 ### "Find that thing about X"
 
-1. `search` with the query. Take only the top result unless ambiguous.
-2. The post-filter has already redacted out-of-allowlist results;
-   don't worry about leakage.
-3. If 0 results: try a `query_database` against the most likely DB
-   with a property filter (matches the value).
+1. If you have full search access (no `databases:` filter): `search`
+   with the query, take the top result unless ambiguous.
+2. If `search` is blocked for you (the hook will return a clear
+   message naming the v1 limitation): `query_database` against
+   each of your allowed DBs in turn, with a title-contains or
+   property filter. List your allowed DBs by checking
+   `notion_workspace.databases:` in your config via `config_get`.
 
 ### "Update the page about X"
 

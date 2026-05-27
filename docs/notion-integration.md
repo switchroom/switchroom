@@ -27,12 +27,21 @@ the design rationale.
   Notion's UI; switchroom can read + write existing DBs only.
 - **Standalone-page access.** Pages without a database parent are
   hard-denied. Move them into a database to give agent access.
+- **Search for filtered agents.** If an agent has a non-empty
+  `notion_workspace.databases:` allowlist (e.g. `carrie:
+  notion_workspace: { databases: [essays] }`), the `search` tool is
+  **blocked** for that agent. The privacy-preserving post-filter is
+  shipped as code (`src/notion/search-filter.ts`) but not yet wired
+  into the launcher's stdio bridge, so allowing search would leak
+  snippets from other DBs the integration was shared with.
+  Admin-shaped agents (no `databases:` filter) can still search.
+  Tracked at [switchroom/switchroom#1913](https://github.com/switchroom/switchroom/issues/1913) — the wire-up lifts this restriction.
 - **Operator approval cards on writes.** v1 ships the allowlist
-  primitive; a follow-up PR will add the m365/drive-style approval
-  card on top.
+  primitive; a follow-up adds the m365/drive-style approval card on
+  top. Tracked at [switchroom/switchroom#1914](https://github.com/switchroom/switchroom/issues/1914).
 - **Coordinated rate-limit bucket.** The broker primitive shipped
   but isn't wired into the hook yet — relies on Notion's own 429
-  retry behaviour.
+  retry behaviour. Tracked at [switchroom/switchroom#1915](https://github.com/switchroom/switchroom/issues/1915).
 
 ## Bootstrap order (read this — order matters)
 

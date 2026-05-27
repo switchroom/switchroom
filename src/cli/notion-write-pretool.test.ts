@@ -252,7 +252,25 @@ describe("decide — args-malformed", () => {
 });
 
 describe("decide — search special-case", () => {
-  it("allows search when the agent has notion_workspace", async () => {
+  it("allows search for admin-shaped agents (no databases filter)", async () => {
+    // clerk has notion_workspace: {} — full access. Search is unfiltered
+    // at the upstream-share-list boundary, which is acceptable for admin
+    // agents.
+    const r = await decide(
+      {
+        tool_name: "mcp__notion__search",
+        tool_input: { query: "essays" },
+      },
+      { agentName: "clerk", configLoader: cfg, apiClient: NULL_CLIENT, cache: freshCache() },
+    );
+    expect(r.decision).toBe("allow");
+  });
+
+  it("BLOCKS search for agents with a databases filter (v1 privacy gate)", async () => {
+    // carrie has notion_workspace: { databases: [essays] }. Without the
+    // launcher-side post-filter (tracked at #1913), allowing carrie's
+    // search would leak snippets from other DBs the integration was
+    // shared with. v1 posture: block honestly.
     const r = await decide(
       {
         tool_name: "mcp__notion__search",
@@ -260,7 +278,10 @@ describe("decide — search special-case", () => {
       },
       { agentName: "carrie", configLoader: cfg, apiClient: NULL_CLIENT, cache: freshCache() },
     );
-    expect(r.decision).toBe("allow");
+    expect(r.decision).toBe("block");
+    expect(r.reason).toMatch(/search.*blocked/i);
+    expect(r.reason).toMatch(/query_database/);
+    expect(r.reason).toMatch(/1913/);
   });
 
   it("blocks search when the agent has no notion_workspace", async () => {
