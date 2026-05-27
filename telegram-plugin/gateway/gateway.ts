@@ -1649,7 +1649,15 @@ async function postCompactCard(occ: number, cap: number): Promise<void> {
   try {
     const chatId = loadAccess().allowFrom[0];
     if (!chatId) return;
-    const threadId = chatThreadMap.get(chatId);
+    // PR4b-compact: supergroup-owned agents route the compaction card
+    // into the `alerts` alias topic (or default_topic_id fallback) so
+    // operators see lifecycle/system events in a predictable lane
+    // instead of conversation lanes. Fleet/DM agents fall through to
+    // the existing chatThreadMap last-seen-thread fallback (no
+    // observable change).
+    const threadId =
+      resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+      ?? chatThreadMap.get(chatId);
     const text =
       `🗜️ <b>Context compaction</b>\n` +
       `Working context hit ~${occ.toLocaleString()} tokens ` +
@@ -9260,7 +9268,7 @@ function resolveBootChatId(
   // chat-root. For fleet-mode / DM agents the helper returns undefined
   // → behavior unchanged (lands at chat-root as today). PR4b of
   // supergroup-mode rollout (docs/rfcs/supergroup-mode.md).
-  const supergroupBootTopic = resolveBootCardTopic()
+  const supergroupBootTopic = resolveAgentOutboundTopic({ kind: 'boot' })
 
   // 2. Env var
   const envChat = process.env.SUBAGENT_OWNER_CHAT_ID
@@ -9281,13 +9289,20 @@ function resolveBootChatId(
 }
 
 /**
- * Resolve the supergroup-mode topic for a boot-card outbound, or
+ * Resolve the supergroup-mode topic for an outbound event, or
  * undefined when the agent isn't in supergroup-owned mode. Best-effort
- * — any config-read failure returns undefined and we fall through to
- * today's chat-root behavior. Called only at boot/reconnect (not per
- * turn), so the cost of a fresh config-read is acceptable.
+ * — any config-read failure returns undefined and the caller falls
+ * through to today's behavior. Generic over every OutboundEvent
+ * variant so the same helper backs boot card, compact card, vault,
+ * permission, hostd, and watchdog emitters.
+ *
+ * Called sparingly (boot/reconnect, compaction edges, approval-card
+ * dispatch) — not per turn — so the cost of a fresh config-read per
+ * call is well within budget.
  */
-function resolveBootCardTopic(): number | undefined {
+function resolveAgentOutboundTopic(
+  event: Parameters<typeof resolveOutboundTopicHelper>[1],
+): number | undefined {
   const agentName = process.env.SWITCHROOM_AGENT_NAME
   if (!agentName) return undefined
   try {
@@ -9298,13 +9313,10 @@ function resolveBootCardTopic(): number | undefined {
     const tg = resolved.channels?.telegram
     if (!tg) return undefined
     // The router treats the absence of default_topic_id as
-    // "fleet-mode" and returns undefined for `boot` (the caller's
-    // existing fallback). Only supergroup-owned agents (with
-    // default_topic_id set) get a routed value.
-    return resolveOutboundTopicHelper(
-      tg as _OutboundRouterConfig,
-      { kind: 'boot' },
-    )
+    // "fleet-mode" and returns undefined for ops-lane events (the
+    // caller's existing fallback). Only supergroup-owned agents
+    // (with default_topic_id set) get a routed value.
+    return resolveOutboundTopicHelper(tg as _OutboundRouterConfig, event)
   } catch {
     return undefined
   }
