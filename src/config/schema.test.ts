@@ -754,3 +754,208 @@ describe("TelegramChannelSchema.enabled (offline-dev master switch)", () => {
     expect(result.channels?.telegram?.enabled).toBe(false);
   });
 });
+
+// ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────────
+describe("TelegramChannelSchema supergroup-owned fields", () => {
+  it("accepts a fully-specified supergroup-owned agent block", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({
+        channels: {
+          telegram: {
+            chat_id: "-1001234567890",
+            default_topic_id: 1,
+            topic_aliases: { general: 1, planning: 17, admin: 31, alerts: 41 },
+          },
+        },
+      }),
+    );
+    expect(result.channels?.telegram?.chat_id).toBe("-1001234567890");
+    expect(result.channels?.telegram?.default_topic_id).toBe(1);
+    expect(result.channels?.telegram?.topic_aliases).toEqual({
+      general: 1,
+      planning: 17,
+      admin: 31,
+      alerts: 41,
+    });
+  });
+
+  it("rejects chat_id without default_topic_id (mutual dependency)", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: { telegram: { chat_id: "-1001234567890" } },
+        }),
+      ),
+    ).toThrow(/default_topic_id/);
+  });
+
+  it("rejects default_topic_id without chat_id (mutual dependency)", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: { telegram: { default_topic_id: 1 } },
+        }),
+      ),
+    ).toThrow(/chat_id/);
+  });
+
+  it("rejects topic_aliases without chat_id", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: { telegram: { topic_aliases: { admin: 31 } } },
+        }),
+      ),
+    ).toThrow(/chat_id/);
+  });
+
+  it("rejects a positive chat_id (must be negative supergroup form)", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: {
+            telegram: { chat_id: "1234567890", default_topic_id: 1 },
+          },
+        }),
+      ),
+    ).toThrow(/negative/);
+  });
+
+  it("rejects a non-positive default_topic_id", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: {
+            telegram: { chat_id: "-1001234567890", default_topic_id: 0 },
+          },
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer topic_aliases value", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          channels: {
+            telegram: {
+              chat_id: "-1001234567890",
+              default_topic_id: 1,
+              topic_aliases: { admin: 31.5 },
+            },
+          },
+        }),
+      ),
+    ).toThrow();
+  });
+});
+
+describe("AgentSchema dm_only ↔ supergroup exclusion", () => {
+  it("rejects dm_only:true combined with channels.telegram.chat_id", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          dm_only: true,
+          channels: {
+            telegram: { chat_id: "-1001234567890", default_topic_id: 1 },
+          },
+        }),
+      ),
+    ).toThrow(/dm_only/);
+  });
+
+  it("rejects dm_only:true combined with default_topic_id", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          dm_only: true,
+          channels: { telegram: { default_topic_id: 1 } },
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("rejects dm_only:true combined with topic_aliases", () => {
+    expect(() =>
+      AgentSchema.parse(
+        baseAgentInput({
+          dm_only: true,
+          channels: { telegram: { topic_aliases: { admin: 31 } } },
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("accepts dm_only:true with no supergroup fields (existing DM agent)", () => {
+    const result = AgentSchema.parse(
+      baseAgentInput({ dm_only: true, channels: { telegram: {} } }),
+    );
+    expect(result.dm_only).toBe(true);
+  });
+
+  it("accepts fleet-shared agent unchanged (no supergroup fields)", () => {
+    // The default mode: no chat_id, no default_topic_id, no dm_only.
+    // Backward-compat must hold — schema must accept these unchanged.
+    const result = AgentSchema.parse(baseAgentInput({}));
+    expect(result.channels?.telegram?.chat_id).toBeUndefined();
+    expect(result.channels?.telegram?.default_topic_id).toBeUndefined();
+  });
+});
+
+describe("ScheduleEntrySchema.topic (cron topic override)", () => {
+  it("accepts a string alias", () => {
+    const result = ScheduleEntrySchema.parse({
+      cron: "0 8 * * 1-5",
+      prompt: "Morning digest",
+      topic: "planning",
+    });
+    expect(result.topic).toBe("planning");
+  });
+
+  it("accepts a numeric topic ID", () => {
+    const result = ScheduleEntrySchema.parse({
+      cron: "0 8 * * *",
+      prompt: "Daily check",
+      topic: 17,
+    });
+    expect(result.topic).toBe(17);
+  });
+
+  it("accepts entries without a topic field (backward-compat)", () => {
+    const result = ScheduleEntrySchema.parse({
+      cron: "0 8 * * *",
+      prompt: "Daily check",
+    });
+    expect(result.topic).toBeUndefined();
+  });
+
+  it("rejects an empty-string alias", () => {
+    expect(() =>
+      ScheduleEntrySchema.parse({
+        cron: "0 8 * * *",
+        prompt: "Daily check",
+        topic: "",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a non-positive topic ID", () => {
+    expect(() =>
+      ScheduleEntrySchema.parse({
+        cron: "0 8 * * *",
+        prompt: "Daily check",
+        topic: 0,
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a non-integer topic ID", () => {
+    expect(() =>
+      ScheduleEntrySchema.parse({
+        cron: "0 8 * * *",
+        prompt: "Daily check",
+        topic: 17.5,
+      }),
+    ).toThrow();
+  });
+});

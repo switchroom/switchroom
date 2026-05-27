@@ -88,6 +88,21 @@ export const ScheduleEntrySchema = z.object({
       "anyone with the vault passphrase can read the vault file directly. " +
       "See docs/configuration.md for the full framing.",
     ),
+  topic: z
+    .union([
+      z.string().min(1, "topic alias must be non-empty"),
+      z.number().int().positive("topic ID must be a positive integer"),
+    ])
+    .optional()
+    .describe(
+      "Forum topic this cron fires into when the owning agent is in " +
+      "supergroup-owned mode (channels.telegram.chat_id set). Either a " +
+      "string alias resolved against `topic_aliases` (e.g. \"planning\") " +
+      "or a numeric topic ID. Falls back to the agent's `default_topic_id` " +
+      "when unset. Ignored for agents in fleet-shared or dm_only mode. " +
+      "Alias-resolution happens at config-load — typos surface immediately. " +
+      "See docs/rfcs/supergroup-mode.md.",
+    ),
 });
 
 export const AgentSoulSchema = z
@@ -680,8 +695,68 @@ export const TelegramChannelSchema = z
         "<agent>/telegram/issues.jsonl. " +
         "Cascades from defaults.channels.telegram.webhook_rate_limit.",
       ),
+    // ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────
+    // Per-agent override of the fleet-wide telegram.forum_chat_id.
+    // When set, this agent owns its own supergroup with forum topics
+    // (the new third topology, alongside fleet-shared and dm_only).
+    // Mode is implied by config shape — no separate `mode:` enum.
+    chat_id: z
+      .string()
+      .regex(/^-\d+$/, "supergroup chat_id must be a negative integer as a string (e.g. \"-1001234567890\")")
+      .optional()
+      .describe(
+        "Per-agent supergroup ID — overrides fleet `telegram.forum_chat_id`. " +
+        "When set, requires `default_topic_id`. Negative integer as string. " +
+        "Forbidden when `dm_only: true`. See docs/rfcs/supergroup-mode.md.",
+      ),
+    default_topic_id: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Forum topic ID this agent's automated outbounds default to when " +
+        "no more-specific alias resolves. Required when `chat_id` is set. " +
+        "Telegram's General topic is `id=1` at MTProto but sends omit the " +
+        "field — the outbound wrapper strips `message_thread_id === 1` " +
+        "on send. Forbidden when `dm_only: true`.",
+      ),
+    topic_aliases: z
+      .record(z.string(), z.number().int().positive())
+      .optional()
+      .describe(
+        "Operator-friendly names for forum topic IDs (e.g. " +
+        "`{ general: 1, planning: 17, cron: 23, admin: 31, alerts: 41 }`). " +
+        "Referenced from per-cron `topic:` fields and the outbound router " +
+        "for autonomous events (boot → alerts, hostd → admin, etc.). " +
+        "Cascades per-key through defaults → profile → agent.",
+      ),
   })
-  .optional();
+  .optional()
+  .superRefine((tg, ctx) => {
+    if (!tg) return;
+    if (tg.chat_id != null && tg.default_topic_id == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`channels.telegram.chat_id` requires `default_topic_id` — supergroup-mode agents need a fallback topic for unclassified outbounds.",
+        path: ["default_topic_id"],
+      });
+    }
+    if (tg.default_topic_id != null && tg.chat_id == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`channels.telegram.default_topic_id` requires `chat_id` — default_topic_id is only meaningful when the agent owns its own supergroup.",
+        path: ["chat_id"],
+      });
+    }
+    if (tg.topic_aliases != null && tg.chat_id == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`channels.telegram.topic_aliases` requires `chat_id` — aliases only resolve in supergroup-owned mode.",
+        path: ["topic_aliases"],
+      });
+    }
+  });
 
 export const ChannelsSchema = z
   .object({
@@ -1663,6 +1738,35 @@ export const AgentSchema = z.object({
       cpus: z.number().positive().optional(),
     })
     .optional(),
+}).superRefine((agent, ctx) => {
+  // Supergroup-mode exclusion: dm_only agents have their own bot+chat
+  // and don't participate in forum-topic routing. The three modes
+  // (fleet-shared, dm_only, supergroup-owned) are mutually exclusive.
+  // See docs/rfcs/supergroup-mode.md.
+  if (agent.dm_only !== true) return;
+  const tg = agent.channels?.telegram;
+  if (tg == null) return;
+  if (tg.chat_id != null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "`dm_only: true` forbids `channels.telegram.chat_id` — DM-only agents have their own private chat, not a supergroup.",
+      path: ["channels", "telegram", "chat_id"],
+    });
+  }
+  if (tg.default_topic_id != null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "`dm_only: true` forbids `channels.telegram.default_topic_id` — DMs don't have forum topics.",
+      path: ["channels", "telegram", "default_topic_id"],
+    });
+  }
+  if (tg.topic_aliases != null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "`dm_only: true` forbids `channels.telegram.topic_aliases` — DMs don't have forum topics.",
+      path: ["channels", "telegram", "topic_aliases"],
+    });
+  }
 });
 
 export const TelegramConfigSchema = z.object({
