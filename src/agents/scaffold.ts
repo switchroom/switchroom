@@ -3493,6 +3493,31 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // RFC docs/rfcs/notion-integration.md §8 — gates @notionhq/
+          // notion-mcp-server tools behind the per-DB allowlist + the
+          // create_database ban + the standalone-page deny. Hook
+          // returns block decisions with operator-friendly reasons;
+          // walk-required tools make a Notion API call to resolve the
+          // parent DB before deciding. Read calls also pass through
+          // the allowlist gate (not approval-gated, just allowlisted).
+          // No approval card in v1 — that's a follow-up PR; the
+          // allowlist + create_database ban are the load-bearing
+          // security primitives.
+          matcher: "^mcp__notion__",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:notion-write-pretool",
+                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "notion-write-pretool.mjs")}"`,
+              ),
+              // Notion resolver walks are ≤4 API calls at ~200ms each
+              // (typical), plus search-filter pass. 30s is generous.
+              timeout: 30,
+            },
+          ],
+        },
+        {
           // RFC native-by-default skill authoring, Phase 1 — advisory
           // skill-shape linter. Scoped to file-write tools; the hook
           // itself no-ops unless the target path is under
