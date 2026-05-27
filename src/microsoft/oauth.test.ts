@@ -228,6 +228,247 @@ describe("buildHomeAccountId", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────
+// PR 2 additions — loopback + device-code + tier selection
+// ────────────────────────────────────────────────────────────────────────
+
+describe("selectInitialTier", () => {
+  it("forces tier from SWITCHROOM_MICROSOFT_OAUTH_TIER override", async () => {
+    const { selectInitialTier } = await import("./oauth.js");
+    expect(selectInitialTier({ SWITCHROOM_MICROSOFT_OAUTH_TIER: "device_code" }))
+      .toBe("device_code");
+    expect(selectInitialTier({ SWITCHROOM_MICROSOFT_OAUTH_TIER: "desktop_loopback" }))
+      .toBe("desktop_loopback");
+  });
+
+  it("returns device_code on headless host (SSH, no DISPLAY)", async () => {
+    const { selectInitialTier } = await import("./oauth.js");
+    expect(selectInitialTier({
+      SSH_CONNECTION: "1.2.3.4 4242 5.6.7.8 22",
+    })).toBe("device_code");
+  });
+
+  it("returns desktop_loopback when DISPLAY set + browser available", async () => {
+    const { selectInitialTier } = await import("./oauth.js");
+    expect(selectInitialTier({
+      DISPLAY: ":0",
+      ["SWITCHROOM_MICROSOFT_HAS_BROWSER_OPENER"]: "1",
+    } as Record<string, string>)).toBe("desktop_loopback");
+  });
+
+  it("falls back to device_code when DISPLAY set but no browser opener", async () => {
+    const { selectInitialTier } = await import("./oauth.js");
+    expect(selectInitialTier({
+      DISPLAY: ":0",
+      ["SWITCHROOM_MICROSOFT_HAS_BROWSER_OPENER"]: "0",
+    } as Record<string, string>)).toBe("device_code");
+  });
+});
+
+describe("detectHeadless", () => {
+  it("headless when SSH and no DISPLAY", async () => {
+    const { detectHeadless } = await import("./oauth.js");
+    expect(detectHeadless({ SSH_CONNECTION: "x" })).toBe(true);
+  });
+
+  it("not headless when DISPLAY and no SSH", async () => {
+    const { detectHeadless } = await import("./oauth.js");
+    expect(detectHeadless({ DISPLAY: ":0" })).toBe(false);
+  });
+
+  it("headless when SSH set even with DISPLAY (X-forwarding case)", async () => {
+    const { detectHeadless } = await import("./oauth.js");
+    expect(detectHeadless({ SSH_CONNECTION: "x", DISPLAY: ":0" })).toBe(true);
+  });
+});
+
+describe("buildLoopbackAuthUrl", () => {
+  it("constructs URL with PKCE challenge + state", async () => {
+    const { buildLoopbackAuthUrl } = await import("./oauth.js");
+    const url = buildLoopbackAuthUrl(
+      { client_id: "test-id", scopes: ["User.Read", "Mail.ReadWrite"] },
+      "http://127.0.0.1:8080",
+      "state-xyz",
+      "challenge-abc",
+    );
+    const u = new URL(url);
+    expect(u.hostname).toBe("login.microsoftonline.com");
+    expect(u.pathname).toBe("/common/oauth2/v2.0/authorize");
+    expect(u.searchParams.get("client_id")).toBe("test-id");
+    expect(u.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:8080");
+    expect(u.searchParams.get("response_type")).toBe("code");
+    expect(u.searchParams.get("scope")).toBe("User.Read Mail.ReadWrite");
+    expect(u.searchParams.get("state")).toBe("state-xyz");
+    expect(u.searchParams.get("code_challenge")).toBe("challenge-abc");
+    expect(u.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(u.searchParams.get("prompt")).toBe("select_account");
+  });
+});
+
+describe("exchangeAuthCode", () => {
+  it("posts code + code_verifier to token endpoint", async () => {
+    const { exchangeAuthCode } = await import("./oauth.js");
+    const capture: { body?: string } = {};
+    const fetcher = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capture.body = init?.body as string;
+      return new Response(JSON.stringify({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    await exchangeAuthCode(
+      { client_id: "test-id", scopes: [] },
+      "auth-code-xyz",
+      "http://127.0.0.1:8080",
+      "verifier-xyz",
+      fetcher,
+    );
+    const params = new URLSearchParams(capture.body ?? "");
+    expect(params.get("client_id")).toBe("test-id");
+    expect(params.get("code")).toBe("auth-code-xyz");
+    expect(params.get("grant_type")).toBe("authorization_code");
+    expect(params.get("redirect_uri")).toBe("http://127.0.0.1:8080");
+    expect(params.get("code_verifier")).toBe("verifier-xyz");
+  });
+
+  it("throws on non-2xx response", async () => {
+    const { exchangeAuthCode } = await import("./oauth.js");
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    await expect(exchangeAuthCode(
+      { client_id: "id", scopes: [] },
+      "bad", "http://x", "v", fetcher,
+    )).rejects.toThrow(/token exchange failed \(400\)/);
+  });
+});
+
+describe("requestDeviceCode", () => {
+  it("hits Microsoft's /devicecode endpoint", async () => {
+    const { requestDeviceCode } = await import("./oauth.js");
+    const capture: { url?: string; body?: string } = {};
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      capture.url = typeof input === "string" ? input : input.toString();
+      capture.body = init?.body as string;
+      return new Response(JSON.stringify({
+        device_code: "dc",
+        user_code: "ABCD-1234",
+        verification_uri: "https://microsoft.com/devicelogin",
+        expires_in: 900,
+        interval: 5,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const resp = await requestDeviceCode(
+      { client_id: "test-id", scopes: ["User.Read"] },
+      fetcher,
+    );
+    expect(capture.url).toContain("/devicecode");
+    const params = new URLSearchParams(capture.body ?? "");
+    expect(params.get("client_id")).toBe("test-id");
+    expect(params.get("scope")).toBe("User.Read");
+    expect(resp.user_code).toBe("ABCD-1234");
+  });
+});
+
+describe("pollDeviceToken", () => {
+  it("returns token on success", async () => {
+    const { pollDeviceToken } = await import("./oauth.js");
+    const fetcher = (async () =>
+      new Response(JSON.stringify({
+        access_token: "at",
+        refresh_token: "rt",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    ) as unknown as typeof fetch;
+    const sleepMs = async () => {};
+    const result = await pollDeviceToken(
+      { client_id: "id", scopes: [] },
+      { device_code: "dc", user_code: "AB-12", verification_uri: "x", expires_in: 60, interval: 1 },
+      { fetchImpl: fetcher, sleepMs },
+    );
+    expect(result.access_token).toBe("at");
+  });
+
+  it("retries on authorization_pending", async () => {
+    const { pollDeviceToken } = await import("./oauth.js");
+    let callCount = 0;
+    const fetcher = (async () => {
+      callCount++;
+      if (callCount < 3) {
+        return new Response(JSON.stringify({ error: "authorization_pending" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        access_token: "at",
+        expires_in: 3600,
+        token_type: "Bearer",
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const sleepMs = async () => {};
+    const result = await pollDeviceToken(
+      { client_id: "id", scopes: [] },
+      { device_code: "dc", user_code: "AB", verification_uri: "x", expires_in: 60, interval: 1 },
+      { fetchImpl: fetcher, sleepMs },
+    );
+    expect(callCount).toBe(3);
+    expect(result.access_token).toBe("at");
+  });
+
+  it("throws on authorization_declined", async () => {
+    const { pollDeviceToken } = await import("./oauth.js");
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ error: "authorization_declined" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const sleepMs = async () => {};
+    await expect(pollDeviceToken(
+      { client_id: "id", scopes: [] },
+      { device_code: "dc", user_code: "x", verification_uri: "x", expires_in: 60, interval: 1 },
+      { fetchImpl: fetcher, sleepMs },
+    )).rejects.toThrow(/User denied/);
+  });
+
+  it("throws on expired_token", async () => {
+    const { pollDeviceToken } = await import("./oauth.js");
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ error: "expired_token" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const sleepMs = async () => {};
+    await expect(pollDeviceToken(
+      { client_id: "id", scopes: [] },
+      { device_code: "dc", user_code: "x", verification_uri: "x", expires_in: 60, interval: 1 },
+      { fetchImpl: fetcher, sleepMs },
+    )).rejects.toThrow(/Device code expired/);
+  });
+
+  it("times out if deadline passes", async () => {
+    const { pollDeviceToken } = await import("./oauth.js");
+    const fetcher = (async () =>
+      new Response(JSON.stringify({ error: "authorization_pending" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const sleepMs = async () => {};
+    let nowVal = 1_000_000;
+    const now = () => {
+      nowVal += 30_000;
+      return nowVal;
+    };
+    await expect(pollDeviceToken(
+      { client_id: "id", scopes: [] },
+      { device_code: "dc", user_code: "x", verification_uri: "x", expires_in: 1, interval: 1 },
+      { fetchImpl: fetcher, sleepMs, now },
+    )).rejects.toThrow(/timed out/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
 // generatePkcePair
 // ────────────────────────────────────────────────────────────────────────
 

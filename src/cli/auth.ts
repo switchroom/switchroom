@@ -51,6 +51,7 @@ import {
 } from "../auth/manager.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { registerAuthGoogleSubcommands } from "./auth-google.js";
+import { registerAuthMicrosoftSubcommands } from "./auth-microsoft.js";
 import { setAuthActive } from "./auth-active-yaml.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
 import { statSync } from "node:fs";
@@ -468,6 +469,7 @@ export function registerAuthCommand(program: Command): void {
     .description("Manage OAuth authentication via switchroom-auth-broker (RFC H)");
 
   registerAuthGoogleSubcommands(program, auth);
+  registerAuthMicrosoftSubcommands(program, auth);
 
   // ── auth heal <agent> --json --config-dir <dir> ────────────────────────
   // Minimal surface kept for boot-self-test.sh's structural diagnoser

@@ -992,6 +992,43 @@ export const AgentGoogleWorkspaceConfigSchema = z
   .optional();
 
 /**
+ * Per-agent microsoft_workspace override — RFC #1873.
+ * Pins which Microsoft account this agent uses for the M365 MCP surface.
+ * `microsoft_client_id/secret` are not per-agent (one app reg per
+ * switchroom install).
+ */
+export const AgentMicrosoftWorkspaceConfigSchema = z
+  .object({
+    account: z
+      .string()
+      .regex(/^[^@\s:]+@[^@\s:]+\.[^@\s:]+$/, {
+        message:
+          "microsoft_workspace.account must be a Microsoft account email like " +
+          "'alice@outlook.com' or 'alice@contoso.com' (colons not allowed)",
+      })
+      .transform((v) => v.trim().toLowerCase())
+      .optional()
+      .describe(
+        "RFC #1873: the Microsoft account this agent uses for the M365 MCP. " +
+        "Must be a key in top-level `microsoft_accounts:` with this agent " +
+        "listed in its `enabled_for[]`. Read by the auth-broker " +
+        "(get-credentials, provider=microsoft) and by the scaffold to " +
+        "decide whether to emit the `ms-365` MCP entry. Normalized to " +
+        "lowercase so it matches the microsoft_accounts key (which is " +
+        "also normalized)."
+      ),
+    org_mode: z
+      .boolean()
+      .optional()
+      .describe(
+        "Per-agent org_mode override (RFC #1873 §6.4). When set, replaces " +
+        "the top-level microsoft_workspace.org_mode for this agent. " +
+        "Defaults to top-level value (which defaults to false)."
+      ),
+  })
+  .optional();
+
+/**
  * Legacy alias for back-compat with RFC D shipped config. Identical shape
  * (tier added is fully optional). New code should prefer
  * `AgentGoogleWorkspaceConfigSchema`.
@@ -1723,6 +1760,13 @@ export const AgentSchema = z.object({
     "Mutually exclusive with `drive:` on the same agent (loader fails fast " +
     "if both are set).",
   ),
+  microsoft_workspace: AgentMicrosoftWorkspaceConfigSchema.describe(
+    "RFC #1873 (Microsoft 365 integration). Per-agent Microsoft Workspace " +
+    "override — pins the Microsoft account this agent reads via the " +
+    "auth-broker (must be a key in top-level `microsoft_accounts:` with " +
+    "this agent in its `enabled_for[]`) and optionally overrides org_mode. " +
+    "microsoft_client_id/secret are not per-agent.",
+  ),
   repos: z
     .record(
       z.string().regex(
@@ -2334,6 +2378,33 @@ export const SwitchroomConfigSchema = z.object({
       "auth google enable|disable` (Phase 3); read by the broker on " +
       "every Google slot access. Replaces RFC D's per-agent vault slot " +
       "scope (which can't express 'two agents share one Google account')."
+    ),
+  microsoft_accounts: z
+    .record(
+      z.string()
+        .regex(/^[^@\s:]+@[^@\s:]+\.[^@\s:]+$/, {
+          message: "Account key must be a Microsoft account email like 'alice@outlook.com' or 'alice@contoso.com' (colons not allowed)",
+        })
+        .transform((v) => v.trim().toLowerCase()),
+      z.object({
+        enabled_for: z
+          .array(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,50}$/, {
+            message: "Agent name must match the standard agent-name pattern",
+          }))
+          .describe(
+            "Agent slugs that may read this Microsoft account's broker " +
+            "credentials. Per-agent ACL enforced at the broker; agents " +
+            "still authenticate via socket-path-as-identity, broker just " +
+            "gates the cross-agent token share. Mirrors google_accounts."
+          ),
+      }),
+    )
+    .optional()
+    .describe(
+      "RFC #1873: per-Microsoft-account ACL. Maps account email → list of " +
+      "agents permitted to use that account's broker credentials. Written " +
+      "by `switchroom auth microsoft enable|disable`; read by the broker " +
+      "on get-credentials with provider=microsoft."
     ),
   defaults: AgentDefaultsSchema.describe(
     "Implicit bottom-of-cascade profile applied to every agent before " +
