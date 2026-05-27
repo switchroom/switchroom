@@ -244,6 +244,7 @@ import { handleInjectCommand } from './inject-handler.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
+import { resolveOutboundTopic as resolveOutboundTopicHelper, type TopicRouterConfig as _OutboundRouterConfig } from '../../src/telegram/topic-router.js'
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
@@ -9240,7 +9241,10 @@ function resolveBootChatId(
   marker: { chat_id: string; thread_id: number | null; ack_message_id: number | null; ts: number } | null,
   ageMs?: number,
 ): { chatId: string; threadId: number | undefined; ackMsgId: number | undefined } | null {
-  // 1. Restart marker
+  // 1. Restart marker — operator-initiated; honor where they typed
+  //    /restart. The marker carries the exact chat+thread context; no
+  //    routing override because the user expects to see the boot card
+  //    in the same lane where they invoked the restart.
   if (marker != null && (ageMs == null || ageMs < 5 * 60_000)) {
     return {
       chatId: marker.chat_id,
@@ -9248,9 +9252,19 @@ function resolveBootChatId(
       ackMsgId: marker.ack_message_id ?? undefined,
     }
   }
+
+  // For non-marker paths (spontaneous boot, crash recovery, env var,
+  // history fallback): supergroup-mode agents route the boot card to
+  // the `alerts` alias topic (or default_topic_id fallback) so the
+  // operator sees lifecycle events in a predictable lane instead of
+  // chat-root. For fleet-mode / DM agents the helper returns undefined
+  // → behavior unchanged (lands at chat-root as today). PR4b of
+  // supergroup-mode rollout (docs/rfcs/supergroup-mode.md).
+  const supergroupBootTopic = resolveBootCardTopic()
+
   // 2. Env var
   const envChat = process.env.SUBAGENT_OWNER_CHAT_ID
-  if (envChat) return { chatId: envChat, threadId: undefined, ackMsgId: undefined }
+  if (envChat) return { chatId: envChat, threadId: supergroupBootTopic, ackMsgId: undefined }
   // 3. Most-recent inbound from history
   if (HISTORY_ENABLED) {
     try {
@@ -9258,12 +9272,42 @@ function resolveBootChatId(
       const ownerChatId = access.allowFrom[0]
       if (ownerChatId) {
         const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
-        if (recent.length > 0) return { chatId: ownerChatId, threadId: undefined, ackMsgId: undefined }
+        if (recent.length > 0) return { chatId: ownerChatId, threadId: supergroupBootTopic, ackMsgId: undefined }
       }
     } catch {}
   }
   // 4. No known chat
   return null
+}
+
+/**
+ * Resolve the supergroup-mode topic for a boot-card outbound, or
+ * undefined when the agent isn't in supergroup-owned mode. Best-effort
+ * — any config-read failure returns undefined and we fall through to
+ * today's chat-root behavior. Called only at boot/reconnect (not per
+ * turn), so the cost of a fresh config-read is acceptable.
+ */
+function resolveBootCardTopic(): number | undefined {
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) return undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const rawAgent = cfg.agents?.[agentName]
+    if (!rawAgent) return undefined
+    const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+    const tg = resolved.channels?.telegram
+    if (!tg) return undefined
+    // The router treats the absence of default_topic_id as
+    // "fleet-mode" and returns undefined for `boot` (the caller's
+    // existing fallback). Only supergroup-owned agents (with
+    // default_topic_id set) get a routed value.
+    return resolveOutboundTopicHelper(
+      tg as _OutboundRouterConfig,
+      { kind: 'boot' },
+    )
+  } catch {
+    return undefined
+  }
 }
 
 /**
