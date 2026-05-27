@@ -32,9 +32,9 @@ export const MICROSOFT_OAUTH_BASE =
 
 /**
  * Personal MSA tenant constant — duplicated from
- * `src/auth/broker/protocol.ts` so this module doesn't pull a circular
- * dep on broker types. Microsoft's documented well-known `tid` for
- * all consumer accounts.
+ * `src/auth/broker/protocol.ts:PERSONAL_MSA_TENANT_ID` so this module
+ * doesn't pull a circular dep on broker types. Microsoft's documented
+ * well-known `tid` for all consumer accounts. **Keep both in sync.**
  */
 export const PERSONAL_MSA_TENANT_ID = "9188040d-6c67-4c5b-b112-36a304b66dad";
 

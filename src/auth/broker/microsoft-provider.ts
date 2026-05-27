@@ -109,17 +109,22 @@ export class MicrosoftProvider implements Provider {
 
     const expiresAt = Date.now() + token.expires_in * 1000;
 
-    // Extract tenant + account context. Refresh exchanges don't always
-    // return an id_token (Microsoft includes one when `openid` was in
-    // the original consent's scope set; switchroom v1 always includes
-    // openid, so we expect it here). If id_token is absent or
-    // malformed, fall back to placeholder values — the broker still
-    // has the original credentials.json on disk with the canonical
-    // tenant/account fields from account-add time.
-    let tenantId = "";
-    let accountType: "personal" | "work" = "work";
-    let homeAccountId = "";
-    let accountEmail = req.accountEmail ?? "";
+    // Pull canonical identity fields from id_token claims when present.
+    // **Critical** — Microsoft's v2 endpoint may omit `id_token` on
+    // refresh responses (e.g. under certain scope-narrowing flows, or
+    // if Microsoft changes the response shape). When id_token is
+    // absent or malformed, fall through to `req.priorCredentials` to
+    // preserve the canonical values written at account-add time. The
+    // broker writes `rawCredentials` verbatim — if we returned empty
+    // placeholders the operator's real tenantId/homeAccountId/
+    // accountType would be clobbered. Earlier draft of this provider
+    // had that defect; PR 1 review caught it.
+    const prior = (req.priorCredentials as MicrosoftCredentialsShape | undefined)
+      ?.microsoftOauth;
+    let tenantId = prior?.tenantId ?? "";
+    let accountType: "personal" | "work" = prior?.accountType ?? "work";
+    let homeAccountId = prior?.homeAccountId ?? "";
+    let accountEmail = req.accountEmail ?? prior?.accountEmail ?? "";
     if (token.id_token) {
       const claims = decodeJwtPayloadUnsafe(token.id_token);
       if (claims) {

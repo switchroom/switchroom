@@ -198,7 +198,52 @@ describe("MicrosoftProvider.refresh — success", () => {
     }
   });
 
-  it("handles missing id_token defensively (placeholder fields)", async () => {
+  it("preserves canonical identity fields from priorCredentials when id_token is absent", async () => {
+    const provider = makeProvider(stubFetcher(200, microsoftSuccessBody({
+      idTokenClaims: null,
+    })));
+    const r = await provider.refresh({
+      refreshToken: "old-refresh",
+      accountEmail: "alice@outlook.com",
+      priorCredentials: {
+        microsoftOauth: {
+          accessToken: "old-at",
+          refreshToken: "old-refresh",
+          expiresAt: 1,
+          scope: "openid",
+          clientId: "test-client-id",
+          accountEmail: "alice@outlook.com",
+          tokenType: "Bearer",
+          tenantId: PERSONAL_MSA_TID,
+          accountType: "personal",
+          homeAccountId: `original-oid.${PERSONAL_MSA_TID}`,
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const creds = r.rawCredentials as {
+        microsoftOauth: {
+          tenantId: string;
+          accountType: string;
+          homeAccountId: string;
+          accountEmail: string;
+        };
+      };
+      // Without id_token, fall back to prior — canonical fields
+      // preserved across refresh, not clobbered with empty
+      // placeholders.
+      expect(creds.microsoftOauth.tenantId).toBe(PERSONAL_MSA_TID);
+      expect(creds.microsoftOauth.accountType).toBe("personal");
+      expect(creds.microsoftOauth.homeAccountId).toBe(`original-oid.${PERSONAL_MSA_TID}`);
+      expect(creds.microsoftOauth.accountEmail).toBe("alice@outlook.com");
+    }
+  });
+
+  it("falls back to empty placeholders when both id_token AND priorCredentials are absent", async () => {
+    // Defensive case — should never happen in practice (broker always
+    // passes priorCredentials when refreshing existing accounts), but
+    // verify the safe-default behavior.
     const provider = makeProvider(stubFetcher(200, microsoftSuccessBody({
       idTokenClaims: null,
     })));
@@ -211,10 +256,43 @@ describe("MicrosoftProvider.refresh — success", () => {
       const creds = r.rawCredentials as {
         microsoftOauth: { tenantId: string; accountType: string };
       };
-      // Without id_token we can't discriminate — defaults to "work"
-      // with empty tenantId. Broker has original credentials.json on
-      // disk with the canonical values from account-add time.
       expect(creds.microsoftOauth.tenantId).toBe("");
+      expect(creds.microsoftOauth.accountType).toBe("work");
+    }
+  });
+
+  it("id_token claims override prior credentials (fresh truth wins)", async () => {
+    const WORK_TENANT = "11111111-2222-3333-4444-555555555555";
+    const provider = makeProvider(stubFetcher(200, microsoftSuccessBody({
+      idTokenClaims: {
+        tid: WORK_TENANT,
+        oid: "new-oid",
+        preferred_username: "alice@contoso.com",
+      },
+    })));
+    const r = await provider.refresh({
+      refreshToken: "old-refresh",
+      priorCredentials: {
+        microsoftOauth: {
+          accessToken: "old-at",
+          refreshToken: "old-refresh",
+          expiresAt: 1,
+          scope: "openid",
+          clientId: "test-client-id",
+          accountEmail: "stale@example.com",
+          tokenType: "Bearer",
+          tenantId: PERSONAL_MSA_TID,
+          accountType: "personal",
+          homeAccountId: `old-oid.${PERSONAL_MSA_TID}`,
+        },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const creds = r.rawCredentials as {
+        microsoftOauth: { tenantId: string; accountType: string };
+      };
+      expect(creds.microsoftOauth.tenantId).toBe(WORK_TENANT);
       expect(creds.microsoftOauth.accountType).toBe("work");
     }
   });
