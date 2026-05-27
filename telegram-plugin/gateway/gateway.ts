@@ -3000,8 +3000,18 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     return
   }
 
+  // PR4b emitter sweep: supergroup-mode agents route operator-event
+  // cards (boot crash, restart-watchdog, model-unavailable, etc.) into
+  // the alerts/admin alias topic instead of chat-root. The
+  // 'compact-watchdog' kind covers all system-initiated notifications
+  // — alerts alias → default_topic_id fallback (see router contract).
+  // Fleet-shared / DM agents see `undefined` → no `message_thread_id`
+  // is added to the broadcast opts → behavior unchanged.
+  const opEventTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+
   process.stderr.write(
-    `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)\n`,
+    `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)` +
+      (opEventTopic != null ? ` topic=${opEventTopic}` : '') + '\n',
   )
   for (const chat_id of access.allowFrom) {
     // grammy's Other<...> opts type is generated and stricter than our
@@ -3009,8 +3019,12 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     const opts = {
       parse_mode: 'HTML' as const,
       ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
+      ...(opEventTopic != null ? { message_thread_id: opEventTopic } : {}),
     }
-    // allow-raw-bot-api: operator-event broadcast loop; opts has no message_thread_id
+    // Comment-only context for the reader; the lint marker on the
+    // very next line is what unlocks the raw bot.api call.
+    // Opts now includes message_thread_id when supergroup mode is on.
+    // allow-raw-bot-api: operator-event broadcast loop; topic-aware opts
     void bot.api.sendMessage(chat_id, renderedText, opts as never).catch(e => {
       process.stderr.write(
         `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
@@ -4010,13 +4024,36 @@ const ipcServer: IpcServer = createIpcServer({
         .row()
         .text(`🔁 Always allow ${alwaysRule.label}`, `perm:always:${requestId}`)
     }
+    // PR4b emitter sweep — supergroup-mode permission card routing.
+    // Per CPO #3 the design is "turn-initiated requests follow the
+    // conversation topic; background requests go to admin alias."
+    // Permission requests come from the bridge mid-tool-use, so they
+    // are always turn-initiated in practice — the currently active
+    // turn's sessionThreadId is the originating topic. Fall back to
+    // admin alias when no active turn (cron / background path).
+    // Fleet-shared / DM agents see `undefined` → no
+    // `message_thread_id` is added → behavior unchanged.
+    // currentTurn is the singleton "claude is currently on this turn"
+    // pointer — per Framing 1 / PR3b scope-discovery, claude
+    // serializes so there's exactly one (or zero) active turn at any
+    // moment. When set, the permission request is in-flight for that
+    // turn and follows the originating topic.
+    const activeTurn = currentTurn
+    const permTopic = resolveAgentOutboundTopic({
+      kind: 'permission',
+      turnInitiated: activeTurn != null,
+      originThreadId: activeTurn?.sessionThreadId,
+    })
     for (const chat_id of access.allowFrom) {
       // parse_mode=HTML pairs with formatPermissionCardBody (#1790)
       // so the <b>/<i> tags render as formatting.
-      // allow-raw-bot-api: permission-request keyboard fan-out; reply_markup + parse_mode only, no thread_id
+      // PR4b emitter sweep — opts now optionally carries
+      // message_thread_id when supergroup mode is on.
+      // allow-raw-bot-api: permission-request keyboard fan-out; topic-aware opts
       void bot.api.sendMessage(chat_id, text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
+        ...(permTopic != null ? { message_thread_id: permTopic } : {}),
       }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
       })
@@ -4139,7 +4176,18 @@ const ipcServer: IpcServer = createIpcServer({
         // routing surface (see how /folders posts) — this picks the
         // DM path which is the common case; group-routing follow-up
         // can extend this.
-        return { chatId: operator }
+        // PR4b emitter sweep — supergroup-mode adds an explicit
+        // topic. Drive approval cards follow the originating turn
+        // (operator-initiated tool call), admin alias fallback.
+        const activeTurn = currentTurn
+        const driveTopic = resolveAgentOutboundTopic({
+          kind: 'hostd-approval',
+          originThreadId: activeTurn?.sessionThreadId,
+        })
+        return {
+          chatId: operator,
+          ...(driveTopic != null ? { threadId: driveTopic } : {}),
+        }
       },
       registerApproval: async (args) => {
         const r = await kernelApprovalRequest({
@@ -4200,7 +4248,19 @@ const ipcServer: IpcServer = createIpcServer({
         const access = loadAccess()
         const operator = access.allowFrom[0]
         if (operator === undefined) return null
-        return { chatId: operator }
+        // PR4b emitter sweep — MS365 write approval cards route into
+        // the originating turn's topic in supergroup mode, admin
+        // alias fallback for background cases. Same shape as hostd /
+        // drive approvals below.
+        const activeTurn = currentTurn
+        const ms365Topic = resolveAgentOutboundTopic({
+          kind: 'hostd-approval',
+          originThreadId: activeTurn?.sessionThreadId,
+        })
+        return {
+          chatId: operator,
+          ...(ms365Topic != null ? { threadId: ms365Topic } : {}),
+        }
       },
       registerApproval: async (args) => {
         const r = await kernelApprovalRequest({
@@ -4265,7 +4325,21 @@ const ipcServer: IpcServer = createIpcServer({
         const access = loadAccess()
         const operator = access.allowFrom[0]
         if (operator === undefined) return null
-        return { chatId: operator }
+        // PR4b emitter sweep — hostd config-approval cards are
+        // operator-initiated (someone typed /update apply or tapped
+        // a button). Follow the originating turn when there is one;
+        // admin alias fallback in supergroup mode otherwise. Helper
+        // returns undefined for non-supergroup agents → behavior
+        // unchanged.
+        const activeTurn = currentTurn
+        const cfgTopic = resolveAgentOutboundTopic({
+          kind: 'hostd-approval',
+          originThreadId: activeTurn?.sessionThreadId,
+        })
+        return {
+          chatId: operator,
+          ...(cfgTopic != null ? { threadId: cfgTopic } : {}),
+        }
       },
       buildKeyboard: (requestId) =>
         new InlineKeyboard()
