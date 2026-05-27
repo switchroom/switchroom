@@ -113,6 +113,17 @@ export interface RefreshRequest {
   clientId?: string;
   /** Scope set to request, when the provider re-asserts scopes per refresh. */
   scopes?: string[];
+  /**
+   * Prior on-disk credentials, if any. Microsoft uses this to preserve
+   * canonical identity fields (tenantId, accountType, homeAccountId)
+   * across refreshes — Microsoft's v2 endpoint may omit `id_token` on
+   * refresh responses under certain scope/account combinations, and
+   * without prior creds the provider would clobber canonical values
+   * with empty placeholders. Google + Anthropic ignore this field
+   * (their credential shape doesn't carry identity claims that the
+   * refresh response could fail to return).
+   */
+  priorCredentials?: unknown;
 }
 
 /**

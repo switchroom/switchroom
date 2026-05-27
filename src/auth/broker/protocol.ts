@@ -57,7 +57,7 @@ export const PROTOCOL_VERSION = 1;
  * extend this enum; the broker server validates incoming `provider:`
  * fields against it before dispatching.
  */
-export const ProviderNameSchema = z.enum(["anthropic", "google"]);
+export const ProviderNameSchema = z.enum(["anthropic", "google", "microsoft"]);
 export type ProviderName = z.infer<typeof ProviderNameSchema>;
 
 /**
@@ -168,6 +168,57 @@ export const GoogleCredentialsSchema = z.object({
 export type GoogleCredentialsShape = z.infer<typeof GoogleCredentialsSchema>;
 
 /**
+ * Microsoft-shaped credentials — added by RFC #1873 (Microsoft 365
+ * integration). Stored verbatim under `microsoftOauth: { ... }`.
+ *
+ * Microsoft tokens carry more identity context than Google's because
+ * one OAuth app (`/common` endpoint, `AzureADandPersonalMicrosoftAccount`
+ * audience) can produce tokens for either personal MSA (`tid` =
+ * `9188040d-6c67-4c5b-b112-36a304b66dad`) or work/school tenants.
+ * Switchroom persists the discriminator (`accountType`) + the source
+ * tenant (`tenantId`) + the MSAL-style `homeAccountId` (`<oid>.<tid>`)
+ * alongside the token material so per-account state can be reasoned
+ * about without re-decoding the id_token on every read.
+ *
+ * Refresh tokens rotate every refresh (Microsoft v2 endpoint default);
+ * the broker writes the new RT atomically via `microsoft-storage.ts`
+ * after each successful exchange. Provider returns `newRefreshToken`
+ * on every successful refresh.
+ */
+export const MicrosoftCredentialsSchema = z.object({
+  microsoftOauth: z.object({
+    accessToken: z.string(),
+    refreshToken: z.string(),
+    expiresAt: z.number(),
+    /** Granted scope set, space-separated as Microsoft returns it. */
+    scope: z.string(),
+    /** OAuth client id used to obtain the credentials. */
+    clientId: z.string(),
+    /** preferred_username from id_token (email-shaped for both MSA and work). */
+    accountEmail: z.string(),
+    tokenType: z.literal("Bearer"),
+    /**
+     * `tid` claim from id_token. `9188040d-6c67-4c5b-b112-36a304b66dad`
+     * for personal MSA, a real tenant GUID for work/school.
+     */
+    tenantId: z.string(),
+    /** Derived from tenantId: convenience discriminator. */
+    accountType: z.enum(["personal", "work"]),
+    /** MSAL-style stable account key: `<oid>.<tid>`. */
+    homeAccountId: z.string(),
+  }),
+});
+export type MicrosoftCredentialsShape = z.infer<typeof MicrosoftCredentialsSchema>;
+
+/**
+ * Personal MSA tenant constant. Microsoft's documented well-known tid
+ * for all consumer Microsoft Accounts (outlook.com, hotmail.com,
+ * live.com, Xbox, Skype). Tokens minted for personal accounts always
+ * carry this exact tid; work/school tokens carry their org's tenant GUID.
+ */
+export const PERSONAL_MSA_TENANT_ID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+
+/**
  * Provider-discriminated credentials union. Each variant is the
  * verbatim on-disk shape for that provider. Broker stores credentials
  * pass-through; consumers (CLI, MCP wrapper) introspect.
@@ -175,6 +226,7 @@ export type GoogleCredentialsShape = z.infer<typeof GoogleCredentialsSchema>;
 export const ProviderCredentialsSchema = z.union([
   AnthropicCredentialsSchema,
   GoogleCredentialsSchema,
+  MicrosoftCredentialsSchema,
 ]);
 export type ProviderCredentialsShape = z.infer<typeof ProviderCredentialsSchema>;
 
