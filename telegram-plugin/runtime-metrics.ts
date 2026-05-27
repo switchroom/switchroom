@@ -105,6 +105,23 @@ export type RuntimeMetricEvent =
       silence_ms: number
     }
   /**
+   * Awareness ping (~60s, default): framework-owned user-visible
+   * "still working… / still thinking…" message sent BEFORE the 300s
+   * fallback so the user never faces a silent chat for the full 5
+   * minutes. Silent (no device ping); one-shot per turn; suppressed
+   * by any outbound or sub-agent dispatch. A high rate is the
+   * diagnostic signal that frequent silences exist (held-inbound,
+   * extended-thinking, slow startup), and the rate of the heavier
+   * silence_fallback_sent that still follows tells us how many of
+   * those escalate all the way to 5 min.
+   */
+  | {
+      kind: 'awareness_ping_sent'
+      key: string
+      fallback_kind: 'working' | 'thinking'
+      silence_ms: number
+    }
+  /**
    * #1445 cross-turn pending-async ambient lifecycle. `started` fires
    * when a turn ends with a captured anchor AND a pending Agent/Task/
    * Bash-background dispatch — i.e. the framework will now edit the
