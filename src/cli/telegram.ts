@@ -13,6 +13,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   matchesRule,
   buildGithubContext,
@@ -25,12 +26,17 @@ import { resolvePath, loadConfig } from "../config/loader.js";
 import { createVault, setStringSecret } from "../vault/vault.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { resolveStatePath } from "../config/paths.js";
 import {
   setTelegramFeature,
   removeTelegramFeature,
   addWebhookSource,
   removeWebhookSource,
 } from "./telegram-yaml.js";
+import {
+  formatTopicsTable,
+  type TopicRow,
+} from "../telegram/topics-discover.js";
 
 export function registerTelegramCommand(program: Command): void {
   const tg = program
@@ -43,6 +49,172 @@ export function registerTelegramCommand(program: Command): void {
   registerEnableVerb(tg, program);
   registerDisableVerb(tg, program);
   registerDispatchVerb(tg, program);
+  registerTopicsVerb(tg, program);
+}
+
+// ─── topics (PR7 of supergroup-mode) ────────────────────────────────────────
+
+/**
+ * `switchroom telegram topics <chat_id>` — discover which forum topic IDs
+ * the agent has observed inbound messages from in a given chat. Reads the
+ * local SQLite history buffer (`<agentDir>/telegram/history.db`).
+ *
+ * Onboarding ergonomics for supergroup-mode (docs/rfcs/supergroup-mode.md):
+ * after enabling a forum supergroup, the operator sends one message in
+ * each topic, runs this command, and gets back the numeric thread IDs to
+ * paste under `channels.telegram.topic_aliases`. The command also prints
+ * a copy-paste-ready YAML snippet for the aliases block.
+ */
+function registerTopicsVerb(tg: Command, program: Command): void {
+  tg.command("topics <chat_id>")
+    .description(
+      "Discover forum topic IDs seen in <chat_id> by reading the agent's local SQLite history buffer. Useful for naming aliases when configuring supergroup-mode (channels.telegram.topic_aliases).",
+    )
+    .option("--agent <name>", "Read history from this agent's state dir (required if multiple agents)")
+    .option("--limit <n>", "Max distinct topics to show", "50")
+    .action(
+      withConfigError(async (chatId: string, opts: TopicsDiscoverOpts) => {
+        await runTopicsDiscover(program, chatId, opts);
+      }),
+    );
+}
+
+interface TopicsDiscoverOpts {
+  agent?: string;
+  limit?: string;
+}
+
+async function runTopicsDiscover(
+  program: Command,
+  chatId: string,
+  opts: TopicsDiscoverOpts,
+): Promise<void> {
+  const config = getConfig(program);
+  const agents = Object.keys(config.agents);
+
+  // Resolve agent. With one agent in the config, default to it; otherwise
+  // require --agent so the operator doesn't accidentally read the wrong
+  // history.
+  let agentName = opts.agent;
+  if (!agentName) {
+    if (agents.length === 1) {
+      agentName = agents[0];
+    } else if (agents.length === 0) {
+      fail("No agents in switchroom.yaml. Add at least one to use this command.");
+    } else {
+      fail(
+        `Multiple agents in switchroom.yaml — pass --agent <name> to choose.\n` +
+          `  Options: ${agents.join(", ")}`,
+      );
+    }
+  }
+  if (!config.agents[agentName!]) {
+    fail(`Unknown agent '${agentName}'. Check switchroom.yaml.`);
+  }
+
+  const agentsDir = process.env.SWITCHROOM_AGENTS_DIR ?? resolveStatePath("agents");
+  const dbPath = join(agentsDir, agentName!, "telegram", "history.db");
+  if (!existsSync(dbPath)) {
+    fail(
+      `No history DB at ${dbPath}.\n` +
+        `  The agent may not have received any Telegram messages yet, or it may be offline.\n` +
+        `  Tip: send one message in each topic of the supergroup, then re-run this command.`,
+    );
+  }
+
+  const limit = Number(opts.limit ?? "50");
+  if (!Number.isFinite(limit) || limit <= 0) {
+    fail(`--limit must be a positive integer (got ${opts.limit})`);
+  }
+
+  const rows = readTopicsFromHistory(dbPath, chatId, Math.floor(limit));
+
+  if (rows.length === 0) {
+    console.log(
+      chalk.yellow(
+        `No messages found for chat ${chatId} in agent '${agentName}'s history.\n` +
+          `  Send one message in each topic, then re-run.`,
+      ),
+    );
+    return;
+  }
+
+  console.log(formatTopicsTable(rows, chatId, agentName!));
+}
+
+/**
+ * Read distinct (thread_id, first_message) tuples from the local
+ * SQLite history buffer for the given chat. Bun-only — uses
+ * `import.meta.require('bun:sqlite')` to dodge the vitest test loader
+ * (same pattern as `telegram-plugin/history.ts`).
+ */
+function readTopicsFromHistory(
+  dbPath: string,
+  chatId: string,
+  limit: number,
+): TopicRow[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const metaRequire = (import.meta as any).require;
+  if (typeof metaRequire !== "function") {
+    fail(
+      "`switchroom telegram topics` requires the Bun runtime (history DB uses bun:sqlite). " +
+        "Run via `bun run dev` or via the installed `switchroom` CLI (bun-bundled).",
+    );
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { Database } = metaRequire("bun:sqlite") as { Database: new (path: string, opts?: { create?: boolean }) => any };
+  const db = new Database(dbPath, { create: false });
+  try {
+    // Per-topic aggregate: msg count, first/last seen, plus the FIRST
+    // message text (joined via a correlated subquery so we don't fire
+    // an extra query per row).
+    const aggregateRows = db
+      .prepare(
+        `
+        SELECT
+          thread_id,
+          COUNT(*) AS msg_count,
+          MIN(ts) AS first_ts,
+          MAX(ts) AS last_ts
+        FROM messages
+        WHERE chat_id = ?
+        GROUP BY thread_id
+        ORDER BY first_ts ASC
+        LIMIT ?
+        `,
+      )
+      .all(chatId, limit) as Array<{
+      thread_id: number | null;
+      msg_count: number;
+      first_ts: number;
+      last_ts: number;
+    }>;
+
+    // Fetch the first-message text per (chat, thread, ts). SQLite's
+    // `thread_id IS NULL` distinguishes the null row from numeric ids.
+    const firstStmt = db.prepare(
+      `SELECT text, role FROM messages
+       WHERE chat_id = ? AND ts = ?
+       AND (thread_id IS NULL AND ? IS NULL OR thread_id = ?)
+       ORDER BY message_id ASC LIMIT 1`,
+    );
+
+    return aggregateRows.map((r) => {
+      const first = firstStmt.get(chatId, r.first_ts, r.thread_id, r.thread_id) as
+        | { text: string; role: string }
+        | undefined;
+      return {
+        thread_id: r.thread_id,
+        msg_count: r.msg_count,
+        first_ts: r.first_ts,
+        last_ts: r.last_ts,
+        first_text: first?.text ?? null,
+        first_role: first?.role ?? null,
+      };
+    });
+  } finally {
+    db.close();
+  }
 }
 
 // ─── status ──────────────────────────────────────────────────────────────────
