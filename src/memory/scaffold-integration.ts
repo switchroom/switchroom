@@ -116,6 +116,34 @@ export const MICROSOFT_WORKSPACE_MCP_PINNED_VERSION = "0.113.0";
 /** npm package name for the pinned spawn. */
 export const MICROSOFT_WORKSPACE_MCP_PACKAGE = "@softeria/ms-365-mcp-server";
 
+/**
+ * Pinned `@notionhq/notion-mcp-server` version — RFC
+ * docs/rfcs/notion-integration.md PR 2.
+ *
+ * Notion ships its MCP server as an npm package; pinning by semver
+ * version (same discipline as softeria). Bumping discipline: pin to a
+ * tagged release that passes the docker pin-smoke test (PR 5 UAT).
+ *
+ * Notion's integration token is long-lived (no OAuth refresh), so the
+ * launcher does NOT carry a refresh loop — it spawns the MCP server
+ * once with `NOTION_TOKEN` in env and bridges stdio for the lifetime
+ * of the parent process.
+ *
+ * Operator override path: `notion_workspace.mcp_version: "<semver>"`
+ * in switchroom.yaml.
+ */
+export const NOTION_MCP_PINNED_VERSION = "1.8.1";
+
+/** npm package name for the pinned spawn. */
+export const NOTION_MCP_PACKAGE = "@notionhq/notion-mcp-server";
+
+/**
+ * The env var Notion's MCP server reads at startup to receive the
+ * integration token. Confirmed via the package's README and
+ * `src/index.ts` of @notionhq/notion-mcp-server@1.8.x.
+ */
+export const NOTION_TOKEN_ENV = "NOTION_TOKEN";
+
 export interface GdriveMcpEntryOptions {
   /**
    * Which upstream `--tool-tier` to expose. When `undefined` (the Phase 1
@@ -223,6 +251,36 @@ export function getMs365McpSettingsEntry(
     value: {
       command: switchroomCliPath,
       args: ["m365-mcp-launcher", ...orgArgs],
+    },
+  };
+}
+
+/**
+ * MCP server entry for the Notion launcher — RFC
+ * docs/rfcs/notion-integration.md PR 2.
+ *
+ * Spawns `<switchroom> notion-mcp-launcher` which in turn fetches the
+ * integration token from the vault-broker and execs
+ * `@notionhq/notion-mcp-server`. No refresh loop — Notion's
+ * integration token is long-lived.
+ *
+ * Tool surface restrictions (create_database denied, standalone-page
+ * writes denied) are enforced by the PreToolUse hook in PR 3, NOT by
+ * filtering the MCP's tool list. The hook's allowlist gate sees every
+ * tool call and rejects per RFC §8.1.
+ */
+export function getNotionMcpSettingsEntry(
+  switchroomCliPath: string,
+  options: { mcpVersion?: string; vaultKey?: string } = {},
+): { key: string; value: McpServerConfig } {
+  const args: string[] = ["notion-mcp-launcher"];
+  if (options.vaultKey) args.push("--vault-key", options.vaultKey);
+  if (options.mcpVersion) args.push("--mcp-version", options.mcpVersion);
+  return {
+    key: "notion",
+    value: {
+      command: switchroomCliPath,
+      args,
     },
   };
 }

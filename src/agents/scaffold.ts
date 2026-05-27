@@ -225,9 +225,11 @@ import {
   getBuiltinDefaultMcpEntries,
   getGdriveMcpSettingsEntry,
   getMs365McpSettingsEntry,
+  getNotionMcpSettingsEntry,
 } from "../memory/scaffold-integration.js";
 import { shouldEmitGdriveMcp } from "../config/google-workspace-acl.js";
 import { shouldEmitMs365Mcp } from "../config/microsoft-workspace-acl.js";
+import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
@@ -2102,6 +2104,53 @@ export function resolveMs365McpEntry(
   return entry;
 }
 
+/**
+ * RFC docs/rfcs/notion-integration.md PR 2 — resolve the per-agent
+ * `notion` MCP entry.
+ *
+ * Mirrors `resolveMs365McpEntry` shape. Gate: NOT hard opt-out +
+ * `shouldEmitNotionMcp` returns true (top-level `notion_workspace:`
+ * exists AND the agent has a `notion_workspace:` block — even an
+ * empty one, which counts as "this agent wants Notion with no DB
+ * restriction").
+ *
+ * Returns null when the entry must not be emitted.
+ *
+ * Notion has no per-account concept (one integration = one workspace),
+ * so the launcher only needs:
+ *   - SWITCHROOM_AGENT_NAME (for vault-broker peercred identity)
+ *   - SWITCHROOM_VAULT_BROKER_SOCK (to fetch the integration token)
+ *   - SWITCHROOM_CONFIG (so the launcher can read config-level
+ *     overrides — vault_key, mcp_version)
+ */
+export function resolveNotionMcpEntry(
+  agentName: string,
+  agentConfig: AgentConfig,
+  switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig } | null {
+  if ((agentConfig.mcp_servers ?? {})["notion"] === false) return null;
+  if (!switchroomConfig) return null;
+  if (!shouldEmitNotionMcp(agentName, switchroomConfig)) return null;
+
+  const vaultKey =
+    switchroomConfig.notion_workspace?.vault_key ?? "notion/integration-token";
+  const mcpVersion = switchroomConfig.notion_workspace?.mcp_version;
+  const entry = getNotionMcpSettingsEntry(DOCKER_SWITCHROOM_CLI_PATH, {
+    vaultKey,
+    mcpVersion,
+  });
+  // Mirror m365/gdrive env-threading shape. The launcher needs vault-
+  // broker reach (token fetch) and the standard switchroom env block.
+  entry.value.env = {
+    SWITCHROOM_CONFIG: DOCKER_CONFIG_PATH,
+    SWITCHROOM_AGENT_NAME: agentName,
+    SWITCHROOM_CONTAINER: "1",
+    SWITCHROOM_VAULT_BROKER_SOCK: DOCKER_VAULT_BROKER_SOCKET,
+    HOME: DOCKER_AGENT_HOME,
+  };
+  return entry;
+}
+
 export function scaffoldAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -2380,6 +2429,10 @@ export function scaffoldAgent(
         if (ms365 && !settings.mcpServers[ms365.key]) {
           settings.mcpServers[ms365.key] = ms365.value;
         }
+        const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
+        if (notion && !settings.mcpServers[notion.key]) {
+          settings.mcpServers[notion.key] = notion.value;
+        }
       }
 
       // Hindsight memory plugin install (replaces our old shell hook).
@@ -2545,6 +2598,10 @@ export function scaffoldAgent(
       const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
       if (ms365) {
         mcpServers[ms365.key] = ms365.value;
+      }
+      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
+      if (notion) {
+        mcpServers[notion.key] = notion.value;
       }
     }
 
@@ -4193,6 +4250,12 @@ export function reconcileAgent(
       } else {
         delete mcpServers["ms-365"];
       }
+      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
+      if (notion) {
+        mcpServers[notion.key] = notion.value;
+      } else {
+        delete mcpServers["notion"];
+      }
     }
 
     // User-defined extras from switchroom.yaml agents.<name>.mcp_servers.
@@ -4506,6 +4569,10 @@ export function reconcileAgent(
       const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
       if (ms365) {
         mcpServers[ms365.key] = ms365.value;
+      }
+      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
+      if (notion) {
+        mcpServers[notion.key] = notion.value;
       }
     }
 
