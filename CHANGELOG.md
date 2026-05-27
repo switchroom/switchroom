@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.13.58 — activity summary: Claude Code-style live-updating draft in Telegram
+
+Two PRs land the design Ken sketched in #1926/#1927:
+
+### #1926 — batched activity summary
+
+Replaces the per-tool intent labels from v0.13.57 with a single
+Claude Code-style summary line — `Ran 5 commands, read a file`,
+`Edited a file, read a file, ran a command` — that accumulates as
+the agent works. Same chronological phrasing Claude Code's chat UI
+and CLI use natively. Single-flight coalescing: a burst of N
+parallel `tool_use` events (modern Sonnet/Opus emits these
+routinely) produces ONE message edited in place, not N spam
+messages. Counters per verb class (read/edited/created/ran/searched/
+fetched/dispatched/noted/used), first-occurrence ordering, singular/
+plural-aware.
+
+### #1927 — draft transport + clear-on-reply
+
+Streams the summary via Telegram's `sendMessageDraft` API in DMs
+(the same primitive the answer-stream uses for live previews).
+Each call REPLACES the draft text — natural fit for the burst
+coalescer. The user sees a live preview in their compose area as
+the agent works; when the model's reply tool fires, the gateway
+sends an empty draft to clear the preview and the real reply
+lands clean. Falls back to send+edit+delete on forum topics and
+hosts without the draft API.
+
+Net steady-state UX:
+  - User sends a question
+  - Compose-area preview: *Read a file*
+  - Preview updates: *Read 2 files, ran a command*
+  - Preview clears, model's reply lands
+
+No persistent intermediate status messages. No model-side prompting.
+No PreToolUse blocking in the common path. The previous primitives
+(ack-first gate, awareness ping, silence-poke ladder) remain as
+safety nets but the steady state no longer leans on them.
+
 ## v0.13.57 — tool-intent surface: framework lifts model's stream into immediate user awareness
 
 UAT on v0.13.56 confirmed the PreToolUse ack-first gate (#1921) works
