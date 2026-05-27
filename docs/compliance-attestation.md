@@ -4,7 +4,7 @@
 
 Switchroom is a multi-agent orchestration tool for Claude Code. This document provides a point-in-time attestation that Switchroom's architecture is designed to comply with Anthropic's terms of service and usage policies for Claude Code.
 
-**Attestation date:** 2026-04-25T00:00:00Z (revised; supersedes 2026-04-13)
+**Attestation date:** 2026-04-25T00:00:00Z (revised; supersedes 2026-04-13; see addendum for 2026-06-15 policy update)
 **Model used for analysis:** Claude Opus 4.7
 **Reviewed against:** Anthropic's published documentation and policies as of April 25, 2026
 
@@ -187,6 +187,23 @@ At no point does any Switchroom component sit between Claude Code and Anthropic'
 | Legal and Compliance | https://code.claude.com/docs/en/legal-and-compliance | 2026-04-25 |
 | MCP | https://code.claude.com/docs/en/mcp | 2026-04-25 |
 | Plugins | https://code.claude.com/docs/en/plugins | 2026-04-25 |
+
+## Addendum: 2026-06-15 Anthropic Policy Split
+
+As of **2026-06-15** Anthropic distinguishes two usage modes for Claude Code:
+
+- **Interactive usage** (the `claude` CLI in a terminal session) draws the Pro/Max subscription as before.
+- **Programmatic usage** (headless `claude -p` / the Agent SDK / the raw Anthropic API) draws a separate Agent-SDK credit, off the subscription.
+
+**Switchroom's position after the split:**
+
+Switchroom routes every model call through the interactive `claude` session. Cron fires, webhook triggers, and session handoffs are all delivered as synthesized turns into that session — never as headless invocations. RFC #1620 removed the last `claude -p` callsites from the codebase; a CI guard (`tests/bridge-flap-regression-guard.test.ts`) enforces `--strict-mcp-config` on any headless spawn and keeps the count at zero.
+
+**One tracked exception:** the host-control deep-probe path (`src/host-control/server.ts`) contains a single opt-in diagnostic invocation that is off by default (issue #1798 tracks its removal). Operators who require zero programmatic usage should confirm this probe is disabled in their configuration.
+
+The `reference/keep-my-subscription-honest.md` JTBD and `reference/vision.md` pillar 3 document the constraint; `CLAUDE.md` enforces it as an engineering gate. This attestation was written before the 2026-06-15 split and should be re-reviewed against the final published policy once stable.
+
+---
 
 ## Limitations of This Attestation
 

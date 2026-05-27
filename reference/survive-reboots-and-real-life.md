@@ -33,8 +33,10 @@ is the bug.
   refusal. The user understands what happened.
 - Transient failures (network, tool, upstream) retry sensibly. The user
   doesn't see flakes they don't need to.
-- Persistent failures surface. The user is told when a retry loop has
-  stopped trying.
+- Persistent named failures (credentials, quota exhaustion, crashes)
+  surface. The user is told with an operator-event card. Note: the
+  Telegram API retry-giveup path currently logs to stderr only and
+  does not send a user-visible message.
 - Scheduled work survives a reboot. Jobs that should have fired either
   fire on return or are explicitly skipped, not silently dropped.
 - The user can ask "is everything healthy?" and get a real answer.
