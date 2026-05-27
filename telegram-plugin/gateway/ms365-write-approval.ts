@@ -113,9 +113,15 @@ export interface Ms365ApprovalHandlerDeps {
     replyMarkup: unknown;
   }) => Promise<{ messageId: number } | null>;
   /**
-   * Build the inline keyboard. Defaults to a 2-button [✅ Approve]
-   * [🚫 Deny] using callback_data `ms365:<requestId>:approve|deny` —
-   * gateway's main button-handler will route these to the kernel.
+   * Build the inline keyboard. Defaults to 2-button [✅ Approve]
+   * [🚫 Deny] using callback_data `apv:<requestId>:once|deny` — the
+   * SAME shape Drive uses. The existing gateway `apv:` handler at
+   * `gateway.ts:handleApprovalCallback` consumes the kernel state
+   * machine generically (no provider awareness). Reused on purpose:
+   * provider-namespaced callback_data would silently drop button
+   * taps because there's no `ms365:` branch in the dispatcher.
+   * Reviewer of PR 4 caught this — the original `ms365:` prefix was
+   * an unwired dead end.
    */
   buildKeyboard?: (requestId: string) => unknown;
   log?: (msg: string) => void;
@@ -129,11 +135,17 @@ const MAX_TTL_MS = 30 * 60 * 1000;
 const MIN_TTL_MS = 30 * 1000;
 
 function defaultKeyboard(requestId: string): unknown {
+  // `apv:<requestId>:once` is the kernel-generic approval shape used
+  // by Drive's diff-preview cards. The existing `apv:` dispatch
+  // branch at gateway.ts:14149 routes the kernel consume + record
+  // for any provider. Mirroring `apv:` keeps the M365 cards wired
+  // through the same well-tested approval state machine instead of a
+  // new provider-namespaced one with its own bug surface.
   return {
     inline_keyboard: [
       [
-        { text: "✅ Approve", callback_data: `ms365:${requestId}:approve` },
-        { text: "🚫 Deny", callback_data: `ms365:${requestId}:deny` },
+        { text: "✅ Approve", callback_data: `apv:${requestId}:once` },
+        { text: "🚫 Deny", callback_data: `apv:${requestId}:deny` },
       ],
     ],
   };

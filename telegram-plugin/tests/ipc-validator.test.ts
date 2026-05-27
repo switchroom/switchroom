@@ -271,4 +271,65 @@ describe('validateClientMessage', () => {
       expect(validateClientMessage({ type: 'heartbeat' })).toBe(false)
     })
   })
+
+  describe('request_ms365_approval (RFC #1873 §8 PR 4)', () => {
+    const valid = {
+      type: 'request_ms365_approval',
+      correlationId: 'abc123',
+      agentName: 'clerk',
+      preview: { agentName: 'clerk', toolName: 'mcp__ms-365__upload-file-content' },
+      ttlMs: 300000,
+    }
+
+    it('accepts a valid request_ms365_approval', () => {
+      expect(validateClientMessage(valid)).toBe(true)
+    })
+
+    it('accepts when ttlMs is omitted (handler uses default)', () => {
+      const { ttlMs: _, ...without } = valid
+      expect(validateClientMessage(without)).toBe(true)
+    })
+
+    it('rejects missing correlationId', () => {
+      const { correlationId: _, ...m } = valid
+      expect(validateClientMessage(m)).toBe(false)
+    })
+
+    it('rejects empty correlationId', () => {
+      expect(validateClientMessage({ ...valid, correlationId: '' })).toBe(false)
+    })
+
+    it('rejects oversized correlationId (>64 chars)', () => {
+      expect(validateClientMessage({ ...valid, correlationId: 'x'.repeat(65) })).toBe(false)
+    })
+
+    it('rejects missing agentName', () => {
+      const { agentName: _, ...m } = valid
+      expect(validateClientMessage(m)).toBe(false)
+    })
+
+    it('rejects malformed agentName (caps, spaces)', () => {
+      expect(validateClientMessage({ ...valid, agentName: 'NOT-LOWER' })).toBe(false)
+      expect(validateClientMessage({ ...valid, agentName: 'has space' })).toBe(false)
+    })
+
+    it('rejects null / non-object preview', () => {
+      expect(validateClientMessage({ ...valid, preview: null })).toBe(false)
+      expect(validateClientMessage({ ...valid, preview: 'string' })).toBe(false)
+      expect(validateClientMessage({ ...valid, preview: 42 })).toBe(false)
+    })
+
+    it('rejects negative ttlMs', () => {
+      expect(validateClientMessage({ ...valid, ttlMs: -1 })).toBe(false)
+    })
+
+    it('rejects non-finite ttlMs', () => {
+      expect(validateClientMessage({ ...valid, ttlMs: Infinity })).toBe(false)
+      expect(validateClientMessage({ ...valid, ttlMs: NaN })).toBe(false)
+    })
+
+    it('rejects non-number ttlMs', () => {
+      expect(validateClientMessage({ ...valid, ttlMs: '300000' })).toBe(false)
+    })
+  })
 })

@@ -283,6 +283,22 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
           || (m.ttlMs as number) < 0)) return false;
       return true;
     }
+    case "request_ms365_approval": {
+      // RFC #1873 §8 PR 4. Same wire-shape gate as Drive — gateway
+      // routes on the outer fields; the inner `preview` is opaque
+      // and re-validated by `validateMs365Preview()` downstream.
+      if (typeof m.correlationId !== "string"
+        || (m.correlationId as string).length === 0
+        || (m.correlationId as string).length > 64) return false;
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.preview !== "object" || m.preview === null) return false;
+      if (m.ttlMs !== undefined
+        && (typeof m.ttlMs !== "number"
+          || !Number.isFinite(m.ttlMs)
+          || (m.ttlMs as number) < 0)) return false;
+      return true;
+    }
     default:
       return false;
   }

@@ -187,9 +187,11 @@ export function extractMs365Preview(
       break;
     }
   }
-  // For inline base64-encoded content, derive size from the encoded string length
+  // For inline base64-encoded content, derive size from the encoded
+  // string length. Approximate (off by 0/1/2 bytes depending on `=`
+  // padding) — accurate enough for the operator's card. Surfaced as
+  // "approx N bytes" downstream if we ever care to be exact.
   if (sizeBytesAfter === undefined && typeof o.content === "string") {
-    // base64 → bytes: roughly (length * 3) / 4 minus padding
     const len = (o.content as string).length;
     sizeBytesAfter = Math.floor((len * 3) / 4);
   }
@@ -241,7 +243,6 @@ async function sendGatewayRequest(
     });
     conn.on("data", (chunk) => {
       buf += chunk.toString("utf8");
-      const idx = buf.indexOf("\n");
       while (true) {
         const lineEnd = buf.indexOf("\n");
         if (lineEnd === -1) break;

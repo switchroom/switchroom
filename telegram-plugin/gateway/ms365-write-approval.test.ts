@@ -300,13 +300,15 @@ describe("handleRequestMs365Approval", () => {
     expect(registerSpy.mock.calls[0][0].ttl_ms).toBe(5 * 60 * 1000);
   });
 
-  it("includes the inline-keyboard with ms365:<requestId>:approve|deny callback data", async () => {
+  it("emits apv:<requestId>:once|deny callback data (kernel-generic, NOT a ms365: dead-end)", async () => {
     const { deps, postCardSpy, client } = makeDeps();
     await handleRequestMs365Approval(client as unknown as IpcClient, makeMsg(), deps);
     const kb = postCardSpy.mock.calls[0][0].replyMarkup as {
       inline_keyboard: Array<Array<{ callback_data: string }>>;
     };
-    expect(kb.inline_keyboard[0][0].callback_data).toMatch(/^ms365:.+:approve$/);
-    expect(kb.inline_keyboard[0][1].callback_data).toMatch(/^ms365:.+:deny$/);
+    // MUST be `apv:` so the existing gateway dispatcher handles taps.
+    // Provider-namespaced `ms365:` would silently drop button taps.
+    expect(kb.inline_keyboard[0][0].callback_data).toMatch(/^apv:.+:once$/);
+    expect(kb.inline_keyboard[0][1].callback_data).toMatch(/^apv:.+:deny$/);
   });
 });
