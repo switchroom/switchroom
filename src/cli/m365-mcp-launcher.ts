@@ -30,9 +30,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Command } from "commander";
 
 import {
@@ -136,6 +135,7 @@ export function writeRefreshHeartbeat(
 ): void {
   const path = heartbeatPath(agentName);
   try {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(data, null, 2), { mode: 0o644 });
   } catch {
     // Heartbeat is observability-only; never fail the launcher because
@@ -143,8 +143,26 @@ export function writeRefreshHeartbeat(
   }
 }
 
+/**
+ * Heartbeat path — in-container at `/state/agent/m365-launcher.heartbeat.json`.
+ *
+ * **Critical**: PR 5's doctor probe runs ON THE HOST (`switchroom doctor`).
+ * `/state/agent/` is bind-mounted to `~/.switchroom/agents/<name>/`
+ * by compose.ts, so the host can read this file directly without
+ * `docker exec` — parallel to how `scheduler.jsonl` surfaces. Path
+ * deliberately NOT `/tmp` (container-local tmpfs, invisible to host
+ * doctor).
+ *
+ * Test override: if `SWITCHROOM_M365_HEARTBEAT_DIR` is set, write
+ * there instead. Lets tests use a per-test tmpdir without poking
+ * `/state/agent/`.
+ */
 export function heartbeatPath(agentName: string): string {
-  return join(tmpdir(), `m365-launcher-${agentName}.heartbeat.json`);
+  const override = process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  if (override) {
+    return join(override, `m365-launcher-${agentName}.heartbeat.json`);
+  }
+  return "/state/agent/m365-launcher.heartbeat.json";
 }
 
 /**
@@ -191,7 +209,14 @@ async function killChild(
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   return new Promise<void>((resolve) => {
-    const onExit = () => resolve();
+    let killTimer: NodeJS.Timeout | null = null;
+    const onExit = () => {
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = null;
+      }
+      resolve();
+    };
     child.once("exit", onExit);
     try {
       child.kill("SIGTERM");
@@ -199,7 +224,7 @@ async function killChild(
       resolve();
       return;
     }
-    setTimeout(() => {
+    killTimer = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
         try {
           child.kill("SIGKILL");
@@ -234,8 +259,20 @@ export async function runMs365McpLauncher(
   let currentChild: ChildProcess | null = null;
   let teardownStdio: (() => void) | null = null;
   let refreshTimer: NodeJS.Timeout | null = null;
-  let exitCode: number | null = null;
   let restartingForRefresh = false;
+  let resolveLauncher: ((code: number) => void) | null = null;
+
+  const exitLauncher = (code: number): void => {
+    if (refreshTimer) {
+      clearTimer(refreshTimer);
+      refreshTimer = null;
+    }
+    if (resolveLauncher) {
+      const r = resolveLauncher;
+      resolveLauncher = null;
+      r(code);
+    }
+  };
 
   const launchChild = (accessToken: string): ChildProcess => {
     const env = buildSofteriaEnv(accessToken);
@@ -253,8 +290,7 @@ export async function runMs365McpLauncher(
       // Unexpected child exit — propagate up to claude.
       const resolved = code ?? (signal ? 128 : 0);
       log(`m365-launcher: softeria exited unexpectedly code=${resolved} signal=${signal}`);
-      exitCode = resolved;
-      if (refreshTimer) clearTimer(refreshTimer);
+      exitLauncher(resolved);
     });
     return child;
   };
@@ -273,15 +309,44 @@ export async function runMs365McpLauncher(
     refreshTimer = setTimer(async () => {
       try {
         log("m365-launcher: refreshing token + restarting softeria");
+        // Order matters: set the flag BEFORE awaiting fetchCreds. If
+        // we awaited first and the child happened to die during the
+        // await, the exit handler would treat it as unexpected and
+        // propagate a non-zero exit — wrong for a controlled refresh.
         restartingForRefresh = true;
+        // Pause incoming stdin so bytes intended for the current
+        // softeria child don't EPIPE into a closing stdin during the
+        // SIGTERM→SIGKILL grace window. Resumed after wireStdio
+        // attaches to the new child below.
+        try {
+          process.stdin.pause();
+        } catch {
+          /* ignore */
+        }
         const fresh = await rt.fetchCreds();
         if (currentChild) {
           await killChild(currentChild);
         }
         restartingForRefresh = false;
         currentChild = launchChild(fresh.accessToken);
+        try {
+          process.stdin.resume();
+        } catch {
+          /* ignore */
+        }
         scheduleRefresh(fresh.expiresAt);
       } catch (err) {
+        // CRITICAL: reset the flag FIRST. If fetchCreds threw, the
+        // existing child is still alive — if it later exits on its
+        // own (network drop, OOM, etc.) the exit handler must
+        // propagate that as an unexpected exit, not silently swallow
+        // it as "expected refresh". Bug found by PR 3 R1 reviewer.
+        restartingForRefresh = false;
+        try {
+          process.stdin.resume();
+        } catch {
+          /* ignore */
+        }
         const msg = err instanceof Error ? err.message : String(err);
         log(`m365-launcher: refresh failed — ${msg}`);
         // Don't tear down softeria — the existing token may still have
@@ -306,10 +371,9 @@ export async function runMs365McpLauncher(
   currentChild = launchChild(initial.accessToken);
   scheduleRefresh(initial.expiresAt);
 
-  // Parent signal forwarding
+  // Parent signal forwarding — kill child + resolve immediately.
   const onSignal = (signal: NodeJS.Signals) => {
     log(`m365-launcher: received ${signal}, shutting down`);
-    if (refreshTimer) clearTimer(refreshTimer);
     if (currentChild) {
       try {
         currentChild.kill(signal);
@@ -317,21 +381,19 @@ export async function runMs365McpLauncher(
         /* ignore */
       }
     }
+    // Resolve with conventional signal exit code (128 + sig#); 143 for
+    // SIGTERM, 130 for SIGINT.
+    const sigCode = signal === "SIGTERM" ? 143 : signal === "SIGINT" ? 130 : 0;
+    exitLauncher(sigCode);
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
-  // Wait for the launcher to be told to exit (either softeria died or
-  // a signal was received).
+  // Wait for the launcher to be told to exit. Resolved by either:
+  //   - child exit handler (unexpected softeria death)
+  //   - SIGINT/SIGTERM handler
   return new Promise<number>((resolve) => {
-    const tick = () => {
-      if (exitCode !== null) {
-        resolve(exitCode);
-        return;
-      }
-      setTimeout(tick, 500);
-    };
-    tick();
+    resolveLauncher = resolve;
   });
 }
 

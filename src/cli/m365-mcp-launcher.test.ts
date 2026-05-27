@@ -116,10 +116,18 @@ describe("computeRefreshDelayMs", () => {
 
 describe("heartbeat", () => {
   const agent = "test-agent-hb";
-  const path = heartbeatPath(agent);
+  let hbDir: string;
+  let path: string;
+
+  beforeEach(() => {
+    hbDir = `/tmp/m365-hb-test-${process.pid}-${Date.now()}-${Math.random()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    path = heartbeatPath(agent);
+  });
 
   afterEach(() => {
-    if (existsSync(path)) rmSync(path);
+    if (existsSync(hbDir)) rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   });
 
   it("writes a heartbeat file at the canonical path", () => {
@@ -135,9 +143,15 @@ describe("heartbeat", () => {
     expect(parsed.expiresAtMs).toBe(3_000);
   });
 
-  it("heartbeatPath uses os.tmpdir + agent name", () => {
+  it("default heartbeatPath is /state/agent/ (in-container, host-readable via bind mount)", () => {
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
     const p = heartbeatPath("alice");
-    expect(p).toContain("m365-launcher-alice.heartbeat.json");
+    expect(p).toBe("/state/agent/m365-launcher.heartbeat.json");
+  });
+
+  it("SWITCHROOM_M365_HEARTBEAT_DIR override works for tests", () => {
+    expect(heartbeatPath("alice")).toContain(hbDir);
+    expect(heartbeatPath("alice")).toContain("m365-launcher-alice.heartbeat.json");
   });
 
   it("write failure does not throw (observability-only)", () => {
@@ -266,7 +280,9 @@ describe("runMs365McpLauncher", () => {
   });
 
   it("writes a heartbeat after scheduling refresh", async () => {
+    const hbDir = `/tmp/m365-test-hb-${process.pid}-${Date.now()}`;
     process.env.SWITCHROOM_AGENT_NAME = "test-launcher-heartbeat";
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
     const child = makeFakeChild();
     const promise = runMs365McpLauncher(
       {},
@@ -285,10 +301,114 @@ describe("runMs365McpLauncher", () => {
     await new Promise((r) => setImmediate(r));
     const path = heartbeatPath("test-launcher-heartbeat");
     expect(existsSync(path)).toBe(true);
-    rmSync(path);
+    rmSync(hbDir, { recursive: true, force: true });
     child.exitCode = 0;
     child.emit("exit", 0, null);
     await promise;
     delete process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+
+  it("refresh-tick callback fires: kills old child, spawns new with fresh token", async () => {
+    const hbDir = `/tmp/m365-test-refresh-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const child1 = makeFakeChild();
+    const child2 = makeFakeChild();
+    let spawnCount = 0;
+    const spawnedTokens: string[] = [];
+    let savedRefreshCb: (() => void) | null = null;
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => ({
+          accessToken: `at-${++spawnCount}`,
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        }),
+        spawnSofteria: (env) => {
+          spawnedTokens.push(env[SOFTERIA_TOKEN_ENV] as string);
+          return spawnCount === 1
+            ? (child1 as unknown as import("node:child_process").ChildProcess)
+            : (child2 as unknown as import("node:child_process").ChildProcess);
+        },
+        setTimer: ((cb: () => void, _ms: number) => {
+          // Capture the first call's callback (the refresh tick); leave
+          // any later setTimer calls as no-ops.
+          if (!savedRefreshCb) savedRefreshCb = cb;
+          return setTimeout(() => {}, 0);
+        }) as typeof setTimeout,
+        log: () => {},
+      },
+    );
+
+    // Wait for initial spawn + scheduling
+    await new Promise((r) => setImmediate(r));
+    expect(spawnedTokens[0]).toBe("at-1");
+    expect(savedRefreshCb).not.toBeNull();
+
+    // Fire the refresh tick. This will:
+    //   1. mint at-2 from fetchCreds
+    //   2. await killChild(child1) — child1.kill() schedules an exit event
+    //   3. spawn child2 with at-2
+    savedRefreshCb!();
+    // Let kill + respawn complete
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(spawnedTokens.length).toBe(2);
+    expect(spawnedTokens[1]).toBe("at-2");
+
+    // Cleanup — child2 dies "unexpectedly" so the launcher resolves
+    child2.exitCode = 0;
+    child2.emit("exit", 0, null);
+    const code = await promise;
+    expect(code).toBe(0);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
+  });
+
+  it("refresh failure does NOT leak restartingForRefresh flag (PR3 R1 bug)", async () => {
+    const hbDir = `/tmp/m365-test-leak-${process.pid}-${Date.now()}`;
+    process.env.SWITCHROOM_M365_HEARTBEAT_DIR = hbDir;
+    const child1 = makeFakeChild();
+    let fetchCount = 0;
+    let savedRefreshCb: (() => void) | null = null;
+
+    const promise = runMs365McpLauncher(
+      {},
+      {
+        fetchCreds: async () => {
+          fetchCount++;
+          if (fetchCount === 1) {
+            return { accessToken: "at-1", expiresAt: Date.now() + 60 * 60 * 1000 };
+          }
+          // Second call (refresh tick) fails
+          throw new Error("broker transient failure");
+        },
+        spawnSofteria: () =>
+          child1 as unknown as import("node:child_process").ChildProcess,
+        setTimer: ((cb: () => void, _ms: number) => {
+          if (!savedRefreshCb) savedRefreshCb = cb;
+          return setTimeout(() => {}, 0);
+        }) as typeof setTimeout,
+        log: () => {},
+      },
+    );
+
+    await new Promise((r) => setImmediate(r));
+
+    // Fire refresh — fetchCreds will throw
+    savedRefreshCb!();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // After refresh failure, simulate the child dying on its own
+    // (e.g. network drop). The launcher MUST propagate this as
+    // unexpected — if the flag leaked, the launcher would swallow
+    // the exit silently.
+    child1.exitCode = 137;
+    child1.emit("exit", 137, null);
+    const code = await promise;
+    expect(code).toBe(137);
+    rmSync(hbDir, { recursive: true, force: true });
+    delete process.env.SWITCHROOM_M365_HEARTBEAT_DIR;
   });
 });

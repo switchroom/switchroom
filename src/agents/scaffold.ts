@@ -2071,14 +2071,16 @@ export function resolveMs365McpEntry(
     DOCKER_SWITCHROOM_CLI_PATH,
     orgMode ? { orgMode: true } : {},
   );
-  // Same env-threading shape as gdrive — Claude Code spawns MCPs with
-  // a sanitized env, so the launcher gets nothing unless we thread it.
+  // Env-threading shape, minus vault-broker (the m365 launcher only
+  // talks to the auth-broker — no vault calls for client_secret yet
+  // because that gates per-agent vault ACL which isn't wired in PR 3).
+  // If a future PR teaches the launcher to resolve `vault:` refs for
+  // client_secret directly, re-add SWITCHROOM_VAULT_BROKER_SOCK here.
   entry.value.env = {
     SWITCHROOM_CONFIG: DOCKER_CONFIG_PATH,
     SWITCHROOM_AGENT_NAME: agentName,
     SWITCHROOM_CONTAINER: "1",
     SWITCHROOM_AUTH_BROKER_SOCKET: DOCKER_AUTH_BROKER_SOCKET,
-    SWITCHROOM_VAULT_BROKER_SOCK: DOCKER_VAULT_BROKER_SOCKET,
     HOME: DOCKER_AGENT_HOME,
   };
   return entry;
