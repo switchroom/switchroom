@@ -3368,6 +3368,26 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // RFC #1873 §8 — gates softeria write tools (OneDrive upload,
+          // mail/calendar mutations) behind a Telegram approval card.
+          // Mirror of the drive-write-pretool above. Matcher is scoped
+          // to the ms-365 MCP server key emitted by resolveMs365McpEntry
+          // in PR 3. The hook's GATED_MS365_WRITE_TOOLS set further
+          // filters to only write verbs (uploads + create/update/delete
+          // for calendar/mail) — read-only tools pass through unchanged.
+          matcher: "^mcp__ms-365__",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:ms-365-write-pretool",
+                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "ms-365-write-pretool.mjs")}"`,
+              ),
+              timeout: 5 * 60 + 30,
+            },
+          ],
+        },
+        {
           // RFC native-by-default skill authoring, Phase 1 — advisory
           // skill-shape linter. Scoped to file-write tools; the hook
           // itself no-ops unless the target path is under

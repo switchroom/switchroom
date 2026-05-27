@@ -11,6 +11,7 @@ import type {
   RequestConfigApprovalMessage,
   RequestConfigFinalizeMessage,
   RequestDriveApprovalMessage,
+  RequestMs365ApprovalMessage,
   ScheduleRestartMessage,
   SessionEventForward,
   ToolCallMessage,
@@ -54,6 +55,15 @@ export interface IpcServerOptions {
   onRequestDriveApproval?: (
     client: IpcClient,
     msg: RequestDriveApprovalMessage,
+  ) => Promise<void>;
+  /**
+   * RFC #1873 §8 — Microsoft 365 write approval (PR 4). Same shape as
+   * onRequestDriveApproval but for softeria write tools. Optional;
+   * gateways without M365 integration ignore.
+   */
+  onRequestMs365Approval?: (
+    client: IpcClient,
+    msg: RequestMs365ApprovalMessage,
   ) => Promise<void>;
   /**
    * #1623 — hostd-initiated config-edit approval card. Handler posts
@@ -273,6 +283,22 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
           || (m.ttlMs as number) < 0)) return false;
       return true;
     }
+    case "request_ms365_approval": {
+      // RFC #1873 §8 PR 4. Same wire-shape gate as Drive — gateway
+      // routes on the outer fields; the inner `preview` is opaque
+      // and re-validated by `validateMs365Preview()` downstream.
+      if (typeof m.correlationId !== "string"
+        || (m.correlationId as string).length === 0
+        || (m.correlationId as string).length > 64) return false;
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.preview !== "object" || m.preview === null) return false;
+      if (m.ttlMs !== undefined
+        && (typeof m.ttlMs !== "number"
+          || !Number.isFinite(m.ttlMs)
+          || (m.ttlMs as number) < 0)) return false;
+      return true;
+    }
     default:
       return false;
   }
@@ -292,6 +318,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onPtyPartial,
     onInjectInbound,
     onRequestDriveApproval,
+    onRequestMs365Approval,
     onRequestConfigApproval,
     onRequestConfigFinalize,
     log = () => {},
@@ -430,6 +457,38 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
               correlationId: (msg as RequestDriveApprovalMessage).correlationId,
               ok: false,
               reason: "gateway not configured for Drive-write approval",
+            });
+          } catch {
+            /* best effort */
+          }
+        }
+        break;
+      case "request_ms365_approval":
+        if (onRequestMs365Approval) {
+          onRequestMs365Approval(client, msg as RequestMs365ApprovalMessage).catch(
+            (err) => {
+              log(
+                `request_ms365_approval handler threw (client=${client.id}): ${(err as Error).message}`,
+              );
+              try {
+                client.send({
+                  type: "ms365_approval_posted",
+                  correlationId: (msg as RequestMs365ApprovalMessage).correlationId,
+                  ok: false,
+                  reason: `gateway handler error: ${(err as Error).message}`,
+                });
+              } catch {
+                /* best effort */
+              }
+            },
+          );
+        } else {
+          try {
+            client.send({
+              type: "ms365_approval_posted",
+              correlationId: (msg as RequestMs365ApprovalMessage).correlationId,
+              ok: false,
+              reason: "gateway not configured for MS-365 write approval",
             });
           } catch {
             /* best effort */
