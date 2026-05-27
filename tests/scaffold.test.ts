@@ -558,8 +558,10 @@ describe("scaffoldAgent", () => {
     expect(mcpJson.mcpServers).toBeDefined();
     expect(mcpJson.mcpServers["switchroom-telegram"]).toBeDefined();
     expect(mcpJson.mcpServers["switchroom-telegram"].command).toBe("bun");
+    // #1892: TELEGRAM_STATE_DIR is hardcoded to the in-container view so
+    // host CLI and in-container CLI writes don't flip the on-disk file.
     expect(mcpJson.mcpServers["switchroom-telegram"].env.TELEGRAM_STATE_DIR).toBe(
-      join(result.agentDir, "telegram"),
+      "/state/agent/home/.switchroom/agents/fork-agent/telegram",
     );
     expect(mcpJson.mcpServers["switchroom-telegram"].env.SWITCHROOM_CONFIG).toBe(
       "/state/config/switchroom.yaml",
