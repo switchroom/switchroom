@@ -53,6 +53,7 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
+import { deriveIntentSurface } from '../tool-intent-surface.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -1291,6 +1292,15 @@ type CurrentTurn = {
   // Phase 1 of #332: count of tool_use events in the current turn, for
   // the tool_call_count column in the turns registry.
   toolCallCount: number
+  // Tool-intent surface (the human-feel UX follow-up to #1921's
+  // PreToolUse gate). When the model emits its first non-reply tool_use
+  // of a turn AND no outbound has happened yet, the gateway lifts the
+  // tool's already-formed intent (name + input → `toolLabel()`) into a
+  // user-visible "<i>running</i>: ls -la /var/log" message. One-shot
+  // per turn — subsequent tool_use events stay quiet so a multi-tool
+  // turn doesn't spam. The model never has to call reply just to ack;
+  // its own intent stream IS the ack source.
+  intentSurfaceFired: boolean
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
   // gates on minInitialChars). Materialized and cleared at turn_end.
@@ -6832,6 +6842,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           lastAssistantMsgId: null,
           lastAssistantDone: false,
           toolCallCount: 0,
+          intentSurfaceFired: false,
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
@@ -6947,6 +6958,60 @@ function handleSessionEvent(ev: SessionEvent): void {
         if (turn.orphanedReplyTimeoutId != null) {
           clearTimeout(turn.orphanedReplyTimeoutId)
           turn.orphanedReplyTimeoutId = null
+        }
+      }
+      // Tool-intent surface — companion to the PreToolUse ack-first gate
+      // (#1921). On the FIRST non-reply tool_use of a turn AND only when
+      // no outbound has happened yet, the gateway lifts the model's tool
+      // intent (name + input → `toolLabel()`) into a brief framework-voice
+      // status: `<i>running:</i> ls -la /var/log`. The model never has to
+      // call reply just to ack — its own intent stream IS the ack. The
+      // gate continues to fire IN PARALLEL: if it produces a model-voice
+      // ack first (`replyCalled=true`), the surface stays quiet by the
+      // condition below. One-shot per turn.
+      if (
+        !turn.replyCalled
+        && !turn.intentSurfaceFired
+        && !isTelegramSurfaceTool(name)
+      ) {
+        turn.intentSurfaceFired = true
+        const surface = deriveIntentSurface(name, ev.toolInput, ev.precomputedLabel)
+        if (surface.text != null) {
+          // Mark the ack-flag synchronously BEFORE the async send so a
+          // PreToolUse ack-first hook (#1921) firing concurrently for this
+          // same tool call sees the flag already present and allows the
+          // tool through. The Telegram send is fire-and-forget; failure
+          // is logged but does not block the model.
+          try {
+            markAckSent()
+          } catch (err) {
+            process.stderr.write(`telegram gateway: intent-surface markAckSent failed: ${err}\n`)
+          }
+          const surfaceChat = turn.sessionChatId
+          const surfaceThread = turn.sessionThreadId
+          const surfaceText = surface.text
+          void (async () => {
+            try {
+              await robustApiCall(
+                () => bot.api.sendMessage(surfaceChat, surfaceText, {
+                  ...(surfaceThread != null ? { message_thread_id: surfaceThread } : {}),
+                  parse_mode: 'HTML',
+                  // Framework-narrating beat — silent, ambient, not a
+                  // device buzz. The user is meant to glance and know
+                  // the model is alive + on-task.
+                  disable_notification: true,
+                }),
+                { chat_id: surfaceChat, ...(surfaceThread != null ? { threadId: surfaceThread } : {}), verb: 'intent-surface' },
+              )
+              // Count this as an outbound for KPI/silence-poke purposes —
+              // a framework-owned message still tells the user the agent
+              // is alive, so the silence clock should reset.
+              signalTracker.noteOutbound(statusKey(surfaceChat, surfaceThread), Date.now())
+              silencePoke.noteOutbound(statusKey(surfaceChat, surfaceThread), Date.now())
+            } catch (err) {
+              process.stderr.write(`telegram gateway: intent-surface send failed: ${err}\n`)
+            }
+          })()
         }
       }
       if (!ctrl) return
