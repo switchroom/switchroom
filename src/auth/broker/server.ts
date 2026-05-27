@@ -51,6 +51,7 @@ import {
 } from "../account-refresh.js";
 import { AnthropicProvider } from "./anthropic-provider.js";
 import { GoogleProvider } from "./google-provider.js";
+import { MicrosoftProvider } from "./microsoft-provider.js";
 import {
   googleAccountExists,
   listGoogleAccounts,
@@ -311,6 +312,20 @@ export class AuthBroker {
         new GoogleProvider({
           clientId: googleClientId,
           clientSecret: googleClientSecret,
+          fetcher: opts.fetcher as typeof fetch | undefined,
+        }),
+      );
+    }
+    // RFC #1873 — Microsoft provider registers only when the
+    // microsoft_workspace block exists with a client id. client_secret is
+    // optional (public-client apps don't need one), so only client_id
+    // gates registration.
+    const microsoftClientId = config.microsoft_workspace?.microsoft_client_id;
+    if (microsoftClientId !== undefined) {
+      this.providers.register(
+        new MicrosoftProvider({
+          clientId: microsoftClientId,
+          clientSecret: config.microsoft_workspace?.microsoft_client_secret,
           fetcher: opts.fetcher as typeof fetch | undefined,
         }),
       );

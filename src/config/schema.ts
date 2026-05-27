@@ -892,6 +892,65 @@ export const GoogleWorkspaceConfigSchema = z
 export const DriveConfigSchema = GoogleWorkspaceConfigSchema;
 
 /**
+ * Top-level microsoft_workspace config block — RFC #1873 (Microsoft 365
+ * integration). Centralizes Microsoft OAuth client credentials and the
+ * org-mode opt-in.
+ *
+ * Block is optional — when omitted, the broker simply doesn't register
+ * the Microsoft provider, and any agent with `microsoft_workspace:` config
+ * gets a clear "MS not configured" error.
+ *
+ * The OAuth app is a single multi-tenant Entra registration with
+ * `signInAudience: AzureADandPersonalMicrosoftAccount` — one operator
+ * registration covers both personal MSA and M365 work accounts via the
+ * `/common` authority endpoint (per RFC §4.1).
+ */
+export const MicrosoftWorkspaceConfigSchema = z
+  .object({
+    microsoft_client_id: z
+      .string()
+      .min(1)
+      .describe(
+        "Microsoft OAuth application (client) ID from Entra portal " +
+        "(literal string or vault reference e.g. " +
+        "'vault:microsoft-oauth-client-id')."
+      ),
+    microsoft_client_secret: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Microsoft OAuth client secret. Optional — public-client apps " +
+        "(Mobile + Desktop platform with 'Allow public client flows' " +
+        "enabled) work without a secret; confidential clients pass " +
+        "one. Either literal or vault reference e.g. " +
+        "'vault:microsoft-oauth-client-secret'."
+      ),
+    authority: z
+      .string()
+      .url()
+      .optional()
+      .describe(
+        "Microsoft authority endpoint. Defaults to " +
+        "'https://login.microsoftonline.com/common' which accepts both " +
+        "personal MSA and work/school tenants. Override only for " +
+        "single-tenant deployments."
+      ),
+    org_mode: z
+      .boolean()
+      .optional()
+      .describe(
+        "Opt-in to Teams + SharePoint surfaces (RFC §6.4). When true, " +
+        "the v1 scope set adds Sites.ReadWrite.All AND the launcher " +
+        "spawns softeria with --org-mode. Defaults to false — personal " +
+        "MSA + standard work surfaces only. Flipping for an existing " +
+        "consented account requires re-running 'auth microsoft account " +
+        "add --replace' to consent the additional scope."
+      ),
+  })
+  .optional();
+
+/**
  * Per-agent google_workspace override. Currently just narrows the approver
  * set + lets the agent pick a tier different from the top-level default.
  * google_client_id/secret are not per-agent — those live at the top level
@@ -2207,6 +2266,13 @@ export const SwitchroomConfigSchema = z.object({
     "OAuth client credentials, approver allowlist, and tier knob (`core` " +
     "| `extended` | `complete`, default `core`). Mutually exclusive with " +
     "`drive:` at the top level (loader fails fast if both are set).",
+  ),
+  microsoft_workspace: MicrosoftWorkspaceConfigSchema.describe(
+    "RFC #1873 (Microsoft 365 integration). Top-level Microsoft Workspace " +
+    "configuration — OAuth client credentials (Entra app), authority " +
+    "endpoint (defaults to /common for personal MSA + work), and the " +
+    "org_mode opt-in for Teams/SharePoint surfaces. Block is optional; " +
+    "when omitted the broker does not register the Microsoft provider.",
   ),
   quota: QuotaConfigSchema.optional().describe(
     "Optional weekly/monthly USD spend budgets rendered in the session " +
