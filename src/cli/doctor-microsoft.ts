@@ -282,6 +282,15 @@ function checkLauncherHeartbeat(
 export function computeMicrosoftEnabledAgents(
   config: SwitchroomConfig,
 ): string[] {
+  // Implicit normalization invariant: both `microsoft_workspace.account`
+  // (per-agent) and the `microsoft_accounts` map keys are transformed
+  // via `.trim().toLowerCase()` at schema parse time (src/config/schema.ts
+  // AgentMicrosoftWorkspaceConfigSchema + microsoft_accounts record
+  // key validator). So a raw === comparison here is safe — both sides
+  // are already canonicalized when the config reaches us. If that schema
+  // invariant ever weakens, route through `shouldEmitMs365Mcp` from
+  // `src/config/microsoft-workspace-acl.ts` (which re-normalizes
+  // defensively) to keep this in sync with the scaffold gate.
   const accounts = config.microsoft_accounts ?? {};
   return Object.keys(config.agents ?? {}).filter((name) => {
     const acct = agentMicrosoftAccount(config, name);

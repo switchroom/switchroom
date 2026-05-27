@@ -14,8 +14,9 @@ your subscription. (RFC #1873.)
 
 ```bash
 # 0. One-time per install — register your Entra OAuth app.
-#    Walkthrough at the bottom of this doc (no interactive wizard yet;
-#    `auth microsoft account add` prints the full guidance on first error).
+#    See "Prerequisite — Entra app registration" section below (no
+#    interactive wizard yet; `auth microsoft account add` prints the
+#    full guidance on first error).
 
 # 1. Connect a Microsoft account to the auth-broker.
 #    <account> is the Microsoft EMAIL, not a label.
