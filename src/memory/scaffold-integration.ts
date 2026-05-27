@@ -94,6 +94,28 @@ export type GdriveMcpTier = "core" | "extended" | "complete";
 export const GOOGLE_WORKSPACE_MCP_PINNED_SHA =
   "9d69115b63e6bc2ef0d4b5d7a3b962396382b44c";
 
+/**
+ * Pinned softeria/ms-365-mcp-server version — RFC #1873 PR 3.
+ *
+ * Use `npx -y ms-365-mcp-server@<version>` to spawn; pinning by npm
+ * version (vs Google's SHA pinning) because softeria publishes
+ * semantic releases to npm. Bumping discipline: pin to a tagged
+ * release that has passed the docker pin-smoke test (PR 5 UAT).
+ *
+ * Why softeria — see RFC §3 and the 2026-05-27 validation pass: it's
+ * the only candidate with stdio + Node + personal MSA + 200+ tools
+ * + active maintenance + MIT license. BYOT mode is access-token-only
+ * (no refresh-token-in mode in the M365 ecosystem yet) — the
+ * launcher handles refresh internally.
+ *
+ * Exported as the single source of truth so the scaffold MCP entry
+ * and the in-container `m365-mcp-launcher` reference identical bits.
+ */
+export const MICROSOFT_WORKSPACE_MCP_PINNED_VERSION = "0.113.0";
+
+/** npm package name for the pinned spawn. */
+export const MICROSOFT_WORKSPACE_MCP_PACKAGE = "@softeria/ms-365-mcp-server";
+
 export interface GdriveMcpEntryOptions {
   /**
    * Which upstream `--tool-tier` to expose. When `undefined` (the Phase 1
@@ -167,6 +189,40 @@ export function getGdriveMcpSettingsEntry(
     value: {
       command: switchroomCliPath,
       args: ["drive-mcp-launcher", ...tierArgs],
+    },
+  };
+}
+
+export interface Ms365McpEntryOptions {
+  /**
+   * Whether to pass `--org-mode` to softeria, lighting up Teams/SharePoint
+   * tools. Resolved by `resolveMs365McpEntry` from per-agent or top-level
+   * `microsoft_workspace.org_mode` (per-agent wins). The launcher also
+   * re-reads from config at spawn time — threading it here just makes the
+   * resolved choice visible in settings.json.
+   */
+  orgMode?: boolean;
+}
+
+/**
+ * MCP server entry for the Microsoft 365 launcher — RFC #1873 PR 3.
+ *
+ * Spawns `<switchroom> m365-mcp-launcher [--org-mode]` which in turn
+ * acquires a fresh access token from the auth-broker and execs the
+ * pinned softeria `ms-365-mcp-server`. The launcher handles refresh
+ * internally (combined launcher+refresher, simpler than the RFC's
+ * two-process design).
+ */
+export function getMs365McpSettingsEntry(
+  switchroomCliPath: string,
+  options: Ms365McpEntryOptions = {},
+): { key: string; value: McpServerConfig } {
+  const orgArgs = options.orgMode ? ["--org-mode"] : [];
+  return {
+    key: "ms-365",
+    value: {
+      command: switchroomCliPath,
+      args: ["m365-mcp-launcher", ...orgArgs],
     },
   };
 }
