@@ -273,12 +273,12 @@ export function registerNotionMcpLauncherCommand(program: Command): void {
             }
             if (result.kind === "not_found") {
               throw new Error(
-                `vault key ${key} is missing. Run \`switchroom vault put ${key}\` on the host to populate it.`,
+                `vault key ${key} is missing. Run \`switchroom vault set ${key}\` on the host to populate it.`,
               );
             }
             if (result.kind === "denied") {
               throw new Error(
-                `vault-broker denied access to ${key}: ${result.msg}. Re-run \`switchroom vault acl add ${key} <agent>\` on the host.`,
+                `vault-broker denied access to ${key}: ${result.msg}. Re-run \`switchroom vault set ${key} --allow <comma-separated-agents>\` on the host including this agent.`,
               );
             }
             if (result.entry.kind !== "string") {

@@ -56,6 +56,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
 | `google_workspace` | deep merge | Google Drive/Docs/Sheets/Calendar integration. `google_client_id` / `google_client_secret` are install-wide (top level only); `tier` + `approvers` cascade per-agent. See § Google Workspace below. |
+| `notion_workspace` | deep merge top-level; per-agent `databases:` list REPLACES (does not concatenate) | Notion integration. Top-level `vault_key` + `databases:` map cascade via deep merge so a profile can add a DB without clobbering top-level entries. The per-agent `databases:` allowlist is **override** — an agent's list replaces the parent's, so a specialist agent inheriting a profile can narrow to fewer DBs. See § Notion Workspace below and [notion-integration.md](notion-integration.md). |
 
 ## Built-in MCP Servers
 
@@ -628,6 +629,76 @@ You typically want both. Without `add_dirs:`, claude's Read/Edit
 tools will reject the path as outside the working set even though
 the file is there. Without `bind_mounts:`, the path doesn't exist in
 the sandbox and `add_dirs:` is a no-op.
+
+## Notion Workspace (`notion_workspace:`)
+
+The Notion integration (`docs/rfcs/notion-integration.md`) is configured
+with one top-level block + one per-agent block. Unlike
+`google_workspace` / `microsoft_workspace`, there's no per-account
+concept — one integration token = one Notion workspace.
+
+```yaml
+notion_workspace:
+  # vault key holding the integration token (default shown).
+  vault_key: notion/integration-token
+
+  # friendly-name → Notion-DB-UUID map. Source of truth for the fleet.
+  # Populate with `switchroom notion list-dbs` after putting the
+  # integration token in the vault.
+  databases:
+    essays: "a1b2c3d4-e5f6-7890-1234-567890abcdef"
+    tasks:  "b2c3d4e5-f6a7-8901-2345-67890abcdef0"
+
+  # OPTIONAL — pin a non-default @notionhq/notion-mcp-server version.
+  # mcp_version: 1.8.1
+
+  # OPTIONAL — global rate-limit budget (rps), shared across all agents.
+  # Defaults to 3 (Notion's documented public-API limit). Lower it if
+  # you also use the integration token from outside switchroom.
+  # rate_limit_rps: 3
+```
+
+Per-agent grant:
+
+```yaml
+agents:
+  clerk:
+    notion_workspace: {}              # full access (within upstream-shared set)
+  carrie:
+    notion_workspace:
+      databases: [essays]             # restrict to essays DB only
+```
+
+| Field | Cascade mode | Notes |
+|---|---|---|
+| `notion_workspace.vault_key` | override | Top-level only; per-agent override not supported. |
+| `notion_workspace.databases` (top-level map) | deep merge | Profile-level entries merge with top-level. |
+| `agents.<name>.notion_workspace.databases` (list) | **override** | Per-agent list REPLACES the parent (profile) list, not concatenate — so a specialist agent inheriting a profile can narrow access. |
+| `notion_workspace.mcp_version` | override | Top-level only. |
+| `notion_workspace.rate_limit_rps` | override | Top-level only. |
+
+The `notion_workspace` per-agent block has two valid shapes:
+
+- `notion_workspace: {}` — opt in, full access (within whatever the
+  upstream integration was shared with in Notion's UI).
+- `notion_workspace: { databases: [name, …] }` — opt in, restricted.
+  Names must resolve in top-level `notion_workspace.databases`; an
+  empty list `[]` is rejected at config-load time.
+
+Absent: agent has no Notion access (no MCP entry scaffolded, no
+broker grant, no hook installed).
+
+### Per-agent ACL (vault key + YAML config)
+
+The broker ACL on `notion/integration-token` (set via
+`switchroom vault set notion/integration-token --allow <agent1>,<agent2>`) AND the agent's
+`notion_workspace:` YAML config must agree. Drift is caught by the
+doctor probe `notion:vault-acl-aligned` (RFC §9). If you add an agent
+to one without the other, the launcher fails 503 at runtime; doctor
+surfaces this at config-edit time.
+
+Setup walkthrough:
+[`docs/notion-integration.md`](notion-integration.md).
 
 ## Minimal Example
 
