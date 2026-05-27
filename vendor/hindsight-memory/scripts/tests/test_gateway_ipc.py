@@ -25,9 +25,51 @@ if SCRIPTS_DIR not in sys.path:
 
 from lib.gateway_ipc import (  # noqa: E402
     extract_chat_id_from_prompt,
+    extract_topic_from_prompt,
     gateway_socket_path,
     update_placeholder,
 )
+
+
+class ExtractTopicTests(unittest.TestCase):
+    """PR6a — (chat_id, message_thread_id) extraction for supergroup mode."""
+
+    def test_dm_returns_chat_id_thread_none(self):
+        # DM and fleet-shared envelopes carry chat_id only.
+        prompt = '<channel source="switchroom-telegram" chat_id="12345">hi</channel>'
+        self.assertEqual(extract_topic_from_prompt(prompt), ("12345", None))
+
+    def test_supergroup_topic_returns_both(self):
+        prompt = (
+            '<channel source="switchroom-telegram" '
+            'chat_id="-1001234" message_thread_id="17">hi</channel>'
+        )
+        self.assertEqual(extract_topic_from_prompt(prompt), ("-1001234", "17"))
+
+    def test_attribute_order_independent(self):
+        prompt = (
+            '<channel message_thread_id="42" chat_id="999" '
+            'source="x">hi</channel>'
+        )
+        self.assertEqual(extract_topic_from_prompt(prompt), ("999", "42"))
+
+    def test_single_quoted_thread_id(self):
+        prompt = "<channel chat_id='1' message_thread_id='7'>hi</channel>"
+        self.assertEqual(extract_topic_from_prompt(prompt), ("1", "7"))
+
+    def test_no_channel_envelope_returns_none_pair(self):
+        self.assertEqual(extract_topic_from_prompt("plain prompt"), (None, None))
+
+    def test_empty_thread_id_collapses_to_none(self):
+        # Defensive against malformed envelopes that include the attribute
+        # but with no value.
+        prompt = '<channel chat_id="1" message_thread_id="">hi</channel>'
+        self.assertEqual(extract_topic_from_prompt(prompt), ("1", None))
+
+    def test_only_inspects_first_kb(self):
+        # Pad BEFORE the envelope; both chat_id AND thread_id should be lost.
+        prompt = ("x" * 2000) + '<channel chat_id="1" message_thread_id="7">hi</channel>'
+        self.assertEqual(extract_topic_from_prompt(prompt), (None, None))
 
 
 class ExtractChatIdTests(unittest.TestCase):

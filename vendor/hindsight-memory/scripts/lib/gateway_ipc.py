@@ -54,6 +54,41 @@ def extract_chat_id_from_prompt(prompt: str) -> Optional[str]:
     return chat_id or None
 
 
+# Switchroom PR6a — extract topic context (chat_id + message_thread_id)
+# from the `<channel ...>` envelope. message_thread_id is present only
+# when the inbound came from a forum topic in a supergroup; for DMs and
+# fleet-shared groups it's absent. Topic alias resolution is the
+# caller's responsibility (env-injected JSON map of thread_id → alias).
+_THREAD_ID_RE = re.compile(
+    r"<channel\b[^>]*\bmessage_thread_id=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def extract_topic_from_prompt(
+    prompt: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Pull (chat_id, message_thread_id) out of the channel envelope.
+
+    Returns ``(None, None)`` when the prompt isn't channel-wrapped.
+    Returns ``(chat_id, None)`` for DMs / non-forum chats where
+    `message_thread_id` is absent.
+
+    Both values are strings (mirroring the wire format — Telegram
+    thread_ids are numeric but we keep them as strings for cache-key
+    stability and config-map lookups).
+    """
+    chat_id = extract_chat_id_from_prompt(prompt)
+    if chat_id is None:
+        return None, None
+    head = prompt[:1024] if isinstance(prompt, str) else ""
+    tmatch = _THREAD_ID_RE.search(head)
+    thread_id = tmatch.group(1).strip() if tmatch else None
+    if thread_id == "":
+        thread_id = None
+    return chat_id, thread_id
+
+
 def gateway_socket_path() -> Optional[str]:
     """Resolve the gateway socket path for the current agent.
 

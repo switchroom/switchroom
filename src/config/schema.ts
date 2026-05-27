@@ -186,6 +186,19 @@ export const AgentMemorySchema = z
             "current behaviour). Try 0.10–0.20 to start; observe the " +
             "`overlap_dropped` field via `switchroom memory recall-log`.",
           ),
+        topic_filter_mode: z
+          .enum(["soft-preamble", "hard-filter"])
+          .optional()
+          .describe(
+            "Supergroup-mode cross-topic memory behaviour. Default " +
+            "(unset) → soft-preamble: recall returns memories from all " +
+            "topics, and a 'Current topic: …' preamble tells the model " +
+            "to self-scope. hard-filter: drop any recalled memory whose " +
+            "metadata.thread_id differs from the active inbound's topic. " +
+            "Flip to hard-filter when the recall_log shows binding " +
+            "failures (model surfacing the right memory but applying " +
+            "it to the wrong topic).",
+          ),
       })
       .optional()
       .describe("Auto-recall tuning knobs"),
