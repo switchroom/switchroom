@@ -59,23 +59,25 @@ class of bugs goes away.
 ## Signs it's working
 
 - Adding a second, third, or sixth agent to the same Anthropic account
-  does not require any OAuth flow. The user runs `switchroom auth enable
-  <account> <agent>` and the agent comes up authenticated.
+  does not require any OAuth flow. The user runs `switchroom auth use
+  <label>` (to set the fleet account) and restarts the agent; no new
+  OAuth flow is needed.
 - The user can answer "which Anthropic accounts am I logged into and
   which agents use each?" with one command. The answer fits on a screen.
 - A sub-agent dispatched from a main agent is authenticated against the
   same account as its parent. The user does nothing to make this happen.
-- A cron-launched `claude -p` invocation in an agent's directory uses
-  the same fresh token as that agent's main process. No 401s, no env-var
-  hand-offs.
+- A cron-scheduled task fires through the agent's session and uses the
+  same account as the main process — same broker-managed credential, no
+  401s, no env-var hand-offs.
 - When an account hits the 5-hour cap, every agent using that account
-  fails over to the next account on its preference list within seconds —
-  not on each agent's next inbound message individually.
+  fails over to the next account in the fleet fallback order within
+  seconds — not on each agent's next inbound message individually.
 - An agent's auth state survives a 24h+ idle gap. The next message after
   a long quiet doesn't 401, because the broker kept the credential file
   fresh whether the agent was awake or not.
-- Removing an account is a single explicit action, refused while any
-  agent is still enabled on it. No orphaned tokens left behind.
+- Removing an account is a single explicit action, refused while it is
+  the fleet active account or the override target for any agent. No
+  orphaned tokens left behind.
 - The user can audit "which agent is using which account right now" and
   the answer matches what the agent's own claude process reports. No
   divergence between switchroom's view and reality.
@@ -104,11 +106,11 @@ class of bugs goes away.
   using account A are rate-limited. Tracking it per-agent means each
   agent re-discovers the wall independently and the fallback is
   uncoordinated.
-- **Account creation as a side effect of `auth login <agent>`.** That
-  conflates "I'm setting up my Anthropic account" with "I'm wiring this
-  agent to an existing account." The two operations should be distinct
-  verbs at the CLI surface. (Today's `switchroom auth login <agent>`
-  does both, and the cost is the per-agent OAuth flow.)
+- **Account creation as a side effect of a per-agent login command.**
+  That conflates "I'm setting up my Anthropic account" with "I'm wiring
+  this agent to an existing account." The two operations should be
+  distinct verbs at the CLI surface. (The old `switchroom auth login
+  <agent>` did both, and the cost was the per-agent OAuth flow.)
 - **Silent token sharing across accounts.** If the user has two
   Anthropic accounts (work + personal), the product must keep them
   visibly separate. Don't fall through one to the other on quota
@@ -134,23 +136,26 @@ user doesn't have to:
    user-chosen label (`work-pro`, `personal-max`), an email, a
    subscription type, and one canonical `.credentials.json`. Stored at
    `~/.switchroom/accounts/<label>/`. An account is created by
-   `switchroom auth account add <label>` (which runs `claude
-   setup-token` once and stores the result globally). It is removed by
-   `switchroom auth account rm <label>`, refused while agents are
-   enabled on it.
+   `switchroom auth add <label>` (which runs a one-time OAuth flow and
+   stores the result globally). It is removed by `switchroom auth rm
+   <label>`, refused while it is the fleet active or an agent override
+   target.
 
-2. **Agents are consumers, not owners.** An agent declares an ordered
-   list of accounts it can use, in `switchroom.yaml`:
+2. **Agents are consumers, not owners.** Agents inherit the fleet-wide
+   active account by default; no per-agent config is needed for the
+   common case. An edge-case override looks like:
 
    ```yaml
    agents:
-     foo:
+     foo: {}                       # inherits fleet active (common case)
+     klanker:
        auth:
-         accounts: [work-pro, personal-max]   # priority order
+         override: work            # pinned to a specific account
    ```
 
-   The first non-quota-exhausted account in the list is the agent's
-   active account. The list also drives auto-fallback.
+   Fallback ordering is fleet-wide (`auth.fallback_order`), not
+   per-agent. (The pre-RFC-H `auth.accounts: [...]` per-agent list is
+   migrated away automatically on `switchroom apply`.)
 
 3. **`<agentDir>/.claude/.credentials.json` is a passive mirror.** It
    is a copy of the active account's canonical credentials, refreshed
@@ -178,8 +183,9 @@ user doesn't have to:
    `<agentDir>/.claude/accounts/<slot>/` directory tree, the `active`
    marker, the `.oauth-token` file, the legacy mirror, and the slot-name
    validation primitives all go away. Their job is replaced by the
-   ordered `auth.accounts` list in `switchroom.yaml` plus the broker's
-   single-mirror semantics.
+   fleet-wide active account plus the broker's single-mirror semantics.
+   (The legacy per-agent slot-pool module is retained for back-compat
+   and migration paths only; it is not the active runtime path.)
 
 7. **Ephemeral consumers (one-shot crons, ad-hoc workers) talk to the
    broker.** A small Unix-socket IPC, same shape as the vault-broker
@@ -203,16 +209,15 @@ user doesn't have to:
    restart, the broker re-syncs from the global account files (source
    of truth) and resumes the loop.
 
-10. **No migration shipped.** This is a new-install design. Existing
-    deployments stay on the per-agent slot model until the operator
-    manually moves them across (one-shot, not a supported CLI flow).
-    The product ships clean: no `switchroom auth migrate` verb, no
-    legacy slot-pool code paths kept "for now," no compatibility
-    shims. The cost is that the operator who is upgrading a live fleet
-    has to delete the per-agent `accounts/<slot>/` directories and
-    re-run `switchroom auth account add` + `enable` themselves. That
-    cost is paid by a small number of people (the early operators) so
-    that the design surface stays clean for everyone after.
+10. **No migration CLI verb shipped.** There is no `switchroom auth
+    migrate` command. However, an in-place YAML upgrade algorithm runs
+    automatically on `switchroom apply`, converting the old per-agent
+    `auth.accounts: [...]` list shape into the current `override:`
+    key where appropriate. The legacy per-agent slot-pool code is
+    retained for back-compat during migration. Operators upgrading a
+    live fleet do not need to manually delete per-agent slot directories;
+    `switchroom apply` handles the schema migration. The design surface
+    is clean for all new installs from day one.
 
 11. **The same shape on the CLI and in Telegram.** Both surfaces speak
     "accounts," not "slots." Telegram's `/auth use work-pro` swaps the
@@ -223,16 +228,13 @@ user doesn't have to:
 
 12. **First-run does the right thing automatically.** A first-time user
     runs `switchroom setup`, picks an agent, and is taken through one
-    OAuth flow that creates a `default` account *and* enables it on the
-    new agent in the same gesture. The two-verb model
-    (`account add` + `enable`) is the deliberate shape for the second,
-    third, and Nth agent — not a regression of the first one. The
-    legacy `switchroom auth login <agent>` verb stays as an alias that
-    does account-create-if-absent + enable, with a one-line nudge in
-    its help text pointing users at `auth account` once they have more
-    than one agent. The fast path is one command for the common case;
-    the explicit verbs surface only when the user actually has multiple
-    accounts or agents to compose.
+    OAuth flow that creates a `default` account *and* sets it as the
+    fleet active in the same gesture. The two-verb model
+    (`auth add` + `auth use`) is the deliberate shape for the second,
+    third, and Nth account — not a regression of the first one.
+    The fast path is one command for the common case; the explicit verbs
+    surface only when the user actually has multiple accounts or agents
+    to compose.
 
 ## What this enables
 
@@ -243,8 +245,8 @@ user doesn't have to:
 - Quota events on a shared account propagate in seconds. The first
   agent's 429 is the last agent's 429, not the first of N independent
   rediscoveries.
-- Sub-agents, Stop hooks, handoff summarizers, and cron-launched `claude
-  -p` work the same way the main agent does — they all read the same
+- Sub-agents, Stop hooks, handoff summarizers, and cron-scheduled tasks
+  work the same way the main agent does — they all read the same
   refreshed credentials file. No subprocess-fork auth bugs.
 - An agent that has been quiet for a week is still authenticated when
   the user pings it on Sunday morning. The broker kept its file fresh.
@@ -262,24 +264,25 @@ Use these to evaluate whether an implementation truly delivers the job:
 - "Add a second agent that uses an Anthropic account you already have
   set up. Did you have to do anything beyond editing `switchroom.yaml`
   and running one CLI command?"
-- "Read the output of `switchroom auth account list`. Does it show your
-  accounts and which agents use each, on one screen?"
+- "Read the output of `switchroom auth show`. Does it show your accounts
+  and which agents use each, on one screen?"
 - "Have one agent's main turn dispatch a sub-agent that itself spawns a
   Stop-hook subprocess. Did all three pick up the same fresh token
   without re-authenticating?"
-- "Run a cron-scheduled `claude -p` task in one of your agents'
-  directories. Did it succeed without 401, with no env-var fiddling?"
+- "Run a cron-scheduled task in one of your agents' sessions. Did it
+  succeed without 401, with no env-var fiddling?"
 - "Drive one Anthropic account to its 5-hour cap. Did every other agent
   using that account fall over to its next preferred account within
   seconds?"
 - "Stop `switchroom-auth-broker`. Do agents still respond for the next
   hour as long as their existing tokens are valid? Restart it. Does it
   resume refreshes without losing state?"
-- "Migrate from a per-agent-slot install. Did you have to re-`claude
-  setup-token` any account, or did the existing tokens carry over?"
-- "Try to remove an account that's still enabled on an agent. Did the
-  CLI refuse with a clear message naming the agents you'd need to
-  disable first?"
+- "Migrate from a per-agent-slot install. Run `switchroom apply` first
+  (it performs the in-place schema upgrade). Did you have to
+  re-authenticate any account, or did the existing tokens carry over?"
+- "Try to remove an account that is still the fleet active or an agent
+  override target. Did the CLI refuse with a clear message telling you
+  what to change first?"
 
 ## See also
 
