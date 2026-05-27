@@ -273,6 +273,14 @@ Broker owns `~/.switchroom/state/auth-broker/microsoft/<account>/`:
 Mode 0600 on both files. Atomic writes (write-temp-then-rename).
 Owner is the auth-broker UID.
 
+**Only the broker holds the MSAL `PublicClientApplication` instance.**
+Agents never instantiate MSAL directly — they IPC to the broker for
+access tokens (mirrors Google's per-call `get_credentials` pattern).
+This is load-bearing for cache integrity: two MSAL instances writing
+the same `cache.json` would race on refresh-token rotation under
+concurrent agent activity, and atomic-write only protects against
+torn writes, not last-writer-wins clobber of a newer RT.
+
 **No machine-encryption v1** (matches current Google posture — RFC G
 §4.4 deferred broker-side vault encryption). Cache is filesystem-
 permissioned. Defer to RFC G's eventual broker-encryption proposal
@@ -447,12 +455,12 @@ yesterday's meeting"]
  finds "Q3-Strategy.docx" in /Documents/Strategy]
    ↓
 [clerk downloads: mcp__ms365__download-bytes →
- writes /workspace/Q3-Strategy.docx]
+ writes /state/agent/workspace/Q3-Strategy.docx]
    ↓
 [clerk invokes docx skill: "edit Q3-Strategy.docx, append section
  'Meeting notes 2026-05-27' with these bullets..."]
    ↓
-[skill manipulates DOCX XML, writes back to /workspace/Q3-Strategy.docx]
+[skill manipulates DOCX XML, writes back to /state/agent/workspace/Q3-Strategy.docx]
    ↓
 [clerk uploads: mcp__ms365__upload-file-content ...
  → INTERCEPTED by PreToolUse hook
@@ -531,6 +539,10 @@ Add to `switchroom doctor`:
   broker can call `/me/drive/root/children` against an MSA token
   (some Graph endpoints silently no-op on consumer tokens; this
   smoke catches the class)
+- `microsoft:sidecar-refresher-alive` (per agent with MS enabled) —
+  refresher PID present + last-refresh timestamp within `expiresAt
+  - 5min` window. If sidecar dies silently, this catches it before
+  the next 401 storm reaches the operator.
 
 ## 10. Implementation plan
 
