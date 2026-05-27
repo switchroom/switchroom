@@ -128,6 +128,48 @@ describe("register + formatSummary — Claude Code-style summary", () => {
   });
 });
 
+describe("parallel-tool-use coalescing — render only reflects accumulated state", () => {
+  it("synchronous burst of N tool_uses produces the right summary at each step", () => {
+    // Modern Claude emits parallel tool_uses in a tight sync loop. The
+    // gateway calls register() N times before any async drain runs.
+    // After N registers, the rendered string should reflect ALL of them
+    // — so when the drain fires once with the latest pendingRender, the
+    // sent text is correct and complete.
+    const s = makeEmptyActivityState();
+    register(s, "Read");
+    register(s, "Read");
+    register(s, "Read");
+    register(s, "Bash");
+    register(s, "Bash");
+    expect(formatSummary(s)).toBe("Read 3 files, ran 2 commands");
+  });
+
+  it("ordering is preserved across a chronological burst", () => {
+    const s = makeEmptyActivityState();
+    // Simulates: Bash, then Read, then Bash, then Read, then Edit
+    register(s, "Bash");
+    register(s, "Read");
+    register(s, "Bash");
+    register(s, "Read");
+    register(s, "Edit");
+    // Bash was first, then Read, then Edit. Counts: bash 2, read 2, edit 1.
+    expect(formatSummary(s)).toBe(
+      "Ran 2 commands, read 2 files, edited a file",
+    );
+  });
+
+  it("registerAndRender returns null on user-facing tools (no race contribution)", () => {
+    const s = makeEmptyActivityState();
+    register(s, "Read");
+    // A reply tool fires concurrently — should not enter the activity state.
+    expect(
+      registerAndRender(s, "mcp__switchroom-telegram__reply"),
+    ).toBeNull();
+    // State still reflects only the Read.
+    expect(formatSummary(s)).toBe("Read a file");
+  });
+});
+
 describe("registerAndRender — ergonomic full-pipeline call", () => {
   it("returns the updated rendered text on a real tool (chronological)", () => {
     const s = makeEmptyActivityState();

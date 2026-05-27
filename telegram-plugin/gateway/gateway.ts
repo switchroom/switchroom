@@ -1303,8 +1303,26 @@ type CurrentTurn = {
   // the summary in place. Stops updating once `replyCalled` flips —
   // the model's own reply lands below the summary as the actual
   // content.
+  //
+  // Parallel-tool-use coalescing (PR #1926 review): modern Claude
+  // emits multiple tool_uses in a tight synchronous loop (e.g. 3
+  // parallel Reads). Without coalescing, each would see
+  // `activityMessageId == null` and fire its own sendMessage,
+  // producing N messages instead of one editable summary. Pattern
+  // mirrors `telegram-plugin/answer-stream.ts`:
+  //   - `activityInFlight` — promise that resolves when the current
+  //     send/edit settles. While set, NEW tool_uses just update
+  //     `activityState` and `activityPendingRender` and return.
+  //   - When the in-flight resolves, it picks the latest
+  //     `activityPendingRender`, fires the next send/edit, and
+  //     repeats until the pending matches the last-sent.
+  // Result: at most one Telegram call in flight at a time; the
+  // final state always lands.
   toolActivity: ActivityState
   activityMessageId: number | null
+  activityInFlight: Promise<void> | null
+  activityPendingRender: string | null
+  activityLastSentRender: string | null
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
   // gates on minInitialChars). Materialized and cleared at turn_end.
@@ -6781,6 +6799,71 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
   }
 }
 
+/**
+ * Drain the tool-activity summary's pending render queue. Single-flight
+ * by construction (caller assigns the returned promise to
+ * `turn.activityInFlight`; while set, new tool_uses only update
+ * `turn.activityPendingRender` and return). The drain loops:
+ *
+ *   while pendingRender != lastSentRender:
+ *     fire send (first time) or edit (subsequent) with pendingRender
+ *     update lastSentRender to whatever we just sent
+ *
+ * Two failure modes are tolerated quietly:
+ *   - "message is not modified" (Telegram rejects identical edits) —
+ *     the retry-api-call wrapper already swallows this, but the catch
+ *     here is a belt-and-braces safety net for the bare path
+ *   - send/edit network errors — log and bail; the message is
+ *     best-effort UX, not safety
+ *
+ * The drain holds a reference to `turn`, so a turn-swap mid-drain
+ * doesn't corrupt the next turn's atom — late writes land on the
+ * captured `turn` (already-completed turn, harmless) and the new turn
+ * starts with `activityInFlight=null`.
+ */
+async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
+  try {
+    while (turn.activityPendingRender !== turn.activityLastSentRender) {
+      const target = turn.activityPendingRender
+      if (target == null) break
+      const html = `<i>${target}</i>`
+      const chat = turn.sessionChatId
+      const thread = turn.sessionThreadId
+      try {
+        if (turn.activityMessageId == null) {
+          const sent = await robustApiCall(
+            () => bot.api.sendMessage(chat, html, {
+              ...(thread != null ? { message_thread_id: thread } : {}),
+              parse_mode: 'HTML',
+              disable_notification: true,
+            }),
+            { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.send' },
+          )
+          turn.activityMessageId = sent.message_id
+        } else {
+          const id = turn.activityMessageId
+          await robustApiCall(
+            () => bot.api.editMessageText(chat, id, html, { parse_mode: 'HTML' }),
+            { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.edit' },
+          )
+        }
+        turn.activityLastSentRender = target
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        // retry-api-call swallows "message is not modified" already but
+        // keep the filter for any other layer that surfaces it raw.
+        if (!msg.includes('message is not modified')) {
+          process.stderr.write(`telegram gateway: activity-summary drain failed: ${msg}\n`)
+        }
+        // Mark as sent so we don't infinite-loop on a stuck render.
+        turn.activityLastSentRender = target
+      }
+    }
+  } finally {
+    turn.activityInFlight = null
+  }
+}
+
 function handleSessionEvent(ev: SessionEvent): void {
   switch (ev.kind) {
     case 'enqueue': {
@@ -6848,6 +6931,9 @@ function handleSessionEvent(ev: SessionEvent): void {
           toolCallCount: 0,
           toolActivity: makeEmptyActivityState(),
           activityMessageId: null,
+          activityInFlight: null,
+          activityPendingRender: null,
+          activityLastSentRender: null,
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
@@ -6974,62 +7060,31 @@ function handleSessionEvent(ev: SessionEvent): void {
       // land. Stops editing once the model calls `reply` — the summary
       // line stays as the final state. No model-side prompting; no per-
       // tool labels. Just surface what's already in the stream.
+      //
+      // Single-flight coalescing (PR #1926 review): modern Claude emits
+      // multiple tool_uses in a synchronous burst (parallel Reads,
+      // Bashes, etc.). All would otherwise race past the message-id
+      // capture and produce N messages. Pattern mirrors answer-stream:
+      // update `activityPendingRender` synchronously here; a single
+      // worker promise drains the pending state, sending or editing
+      // exactly once at a time and re-running until pending matches
+      // the last-sent. Captures `turn` so a late drain after turn-swap
+      // can't corrupt the next turn's atom.
       if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
         const rendered = registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
           // Mark the ack-flag synchronously so a PreToolUse hook firing
           // concurrently for THIS tool call (#1921) sees the flag set
-          // and allows the tool through. The send/edit is async; failure
+          // and allows the tool through. The drain runs async; failure
           // is logged but does not block the model.
           try {
             markAckSent()
           } catch (err) {
             process.stderr.write(`telegram gateway: activity-summary markAckSent failed: ${err}\n`)
           }
-          const summaryChat = turn.sessionChatId
-          const summaryThread = turn.sessionThreadId
-          const existingMessageId = turn.activityMessageId
-          const html = `<i>${rendered}</i>`
-          if (existingMessageId == null) {
-            // First non-reply tool — send a fresh silent message.
-            void (async () => {
-              try {
-                const sent = await robustApiCall(
-                  () => bot.api.sendMessage(summaryChat, html, {
-                    ...(summaryThread != null ? { message_thread_id: summaryThread } : {}),
-                    parse_mode: 'HTML',
-                    disable_notification: true,
-                  }),
-                  { chat_id: summaryChat, ...(summaryThread != null ? { threadId: summaryThread } : {}), verb: 'activity-summary.send' },
-                )
-                turn.activityMessageId = sent.message_id
-              } catch (err) {
-                process.stderr.write(`telegram gateway: activity-summary send failed: ${err}\n`)
-              }
-            })()
-          } else {
-            // Subsequent tool_use — edit the existing message with the
-            // updated summary. Telegram drops no-op edits cleanly; the
-            // robustApiCall wrapper handles rate-limit retries.
-            const targetMessageId = existingMessageId
-            void (async () => {
-              try {
-                await robustApiCall(
-                  () => bot.api.editMessageText(summaryChat, targetMessageId, html, {
-                    parse_mode: 'HTML',
-                  }),
-                  { chat_id: summaryChat, ...(summaryThread != null ? { threadId: summaryThread } : {}), verb: 'activity-summary.edit' },
-                )
-              } catch (err) {
-                // editMessageText fails with "message is not modified" if
-                // the text matches the existing — benign, skip the log
-                // noise. Anything else logs.
-                const msg = err instanceof Error ? err.message : String(err)
-                if (!msg.includes('message is not modified')) {
-                  process.stderr.write(`telegram gateway: activity-summary edit failed: ${msg}\n`)
-                }
-              }
-            })()
+          turn.activityPendingRender = rendered
+          if (turn.activityInFlight == null) {
+            turn.activityInFlight = drainActivitySummary(turn)
           }
         }
       }
