@@ -29,6 +29,16 @@ export interface SchedulerEntry {
   prompt: string;
   /** SHA-256 prefix of prompt — stable, non-reversible audit key. */
   promptKey: string;
+  /**
+   * Per-entry Telegram topic override (PR4b of supergroup-mode rollout).
+   * Either a string alias defined in the agent's
+   * `channels.telegram.topic_aliases` (e.g. "planning"), or a numeric
+   * thread_id. Consumed by the in-agent scheduler's dispatch path via
+   * `resolveOutboundTopic({ kind: 'cron', entryTopic })`. Undefined for
+   * fleet-mode / DM agents and for supergroup-mode entries that want
+   * the default_topic_id.
+   */
+  topic?: string | number;
 }
 
 /**
@@ -65,6 +75,9 @@ export function collectScheduleEntries(
         cron: entry.cron,
         prompt: entry.prompt,
         promptKey: createHash("sha256").update(entry.prompt).digest("hex").slice(0, 12),
+        // Propagate the per-entry topic override (PR1 schema field).
+        // Resolved at dispatch time via resolveOutboundTopic().
+        ...(entry.topic !== undefined ? { topic: entry.topic } : {}),
       });
     }
   }
