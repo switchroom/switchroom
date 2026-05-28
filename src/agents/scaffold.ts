@@ -2151,6 +2151,74 @@ export function resolveNotionMcpEntry(
   return entry;
 }
 
+/**
+ * Registry of MCP-server integrations resolved by scaffold + reconcile.
+ *
+ * Each entry pairs the `resolve` predicate with two keys: `emitKey`
+ * (the mcpServers key the resolver returns when it emits an entry —
+ * matches the integration's settings.json key) and `retractionKey`
+ * (the literal mcpServers key to `delete` at the reconcile site when
+ * resolve returns null). They are equal today for every integration,
+ * but kept as separate fields so a future integration whose
+ * opt-out key differs from its emit key can't silently drift.
+ *
+ * **Iteration order is part of the contract.** The order here
+ * determines which integration's entry lands first at every call
+ * site; that matters at Site 2 (.mcp.json framework-wins), where a
+ * later user-spread can override but two integrations colliding on
+ * the same key would have the last-wins ordering pinned here. Today
+ * no two integrations share a key — but the order is still load-
+ * bearing for the tests that pin precedence semantics
+ * (`tests/scaffold.integration-registry.test.ts`).
+ *
+ * Adding a new integration: append one entry here + define the
+ * `resolve` function above. The 4 mcpServers-assembly sites in
+ * `scaffold.ts` (and the reconcile-side equivalents) pick it up
+ * automatically.
+ *
+ * @see `tests/scaffold.integration-registry.test.ts` for the
+ * regression-gate tests pinning each site's conflict policy.
+ */
+export interface IntegrationMcpResolver {
+  /** Display label for diagnostics. */
+  label: string;
+  /** The mcpServers key the resolver emits — also the user-facing opt-out key (`mcp_servers.<key>: false`). */
+  emitKey: string;
+  /**
+   * The literal mcpServers key to `delete` at Site 3 (settings.json
+   * reconcile) when resolve returns null. Kept separate from
+   * emitKey so a future opt-out-key vs emit-key drift can't silently
+   * break retraction.
+   */
+  retractionKey: string;
+  resolve: (
+    name: string,
+    agentConfig: AgentConfig,
+    switchroomConfig: SwitchroomConfig | undefined,
+  ) => { key: string; value: McpServerConfig } | null;
+}
+
+export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
+  {
+    label: "Google Workspace",
+    emitKey: "gdrive",
+    retractionKey: "gdrive",
+    resolve: resolveGdriveMcpEntry,
+  },
+  {
+    label: "Microsoft 365",
+    emitKey: "ms-365",
+    retractionKey: "ms-365",
+    resolve: resolveMs365McpEntry,
+  },
+  {
+    label: "Notion",
+    emitKey: "notion",
+    retractionKey: "notion",
+    resolve: resolveNotionMcpEntry,
+  },
+];
+
 export function scaffoldAgent(
   name: string,
   agentConfigRaw: AgentConfig,
@@ -2420,18 +2488,14 @@ export function scaffoldAgent(
       // `mcp_servers: { gdrive: false }` hard opt-out. A user-declared
       // `gdrive` entry (already in settings.mcpServers) wins, same as the
       // built-in defaults above.
-      {
-        const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
-        if (gdrive && !settings.mcpServers[gdrive.key]) {
-          settings.mcpServers[gdrive.key] = gdrive.value;
-        }
-        const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
-        if (ms365 && !settings.mcpServers[ms365.key]) {
-          settings.mcpServers[ms365.key] = ms365.value;
-        }
-        const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
-        if (notion && !settings.mcpServers[notion.key]) {
-          settings.mcpServers[notion.key] = notion.value;
+      // Site 1 — user-wins precedence: a user-declared mcp_servers
+      // entry already in settings.mcpServers takes priority. Registry
+      // iteration preserves the gdrive → ms-365 → notion order from
+      // INTEGRATION_MCP_RESOLVERS.
+      for (const integration of INTEGRATION_MCP_RESOLVERS) {
+        const entry = integration.resolve(name, agentConfig, switchroomConfig);
+        if (entry && !settings.mcpServers[entry.key]) {
+          settings.mcpServers[entry.key] = entry.value;
         }
       }
 
@@ -2591,17 +2655,15 @@ export function scaffoldAgent(
     // loads for switchroom-telegram-plugin agents — see the block
     // comment at the top of this branch. Same shared broker-ACL gate.
     if (switchroomConfig) {
-      const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
-      if (gdrive) {
-        mcpServers[gdrive.key] = gdrive.value;
-      }
-      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
-      if (ms365) {
-        mcpServers[ms365.key] = ms365.value;
-      }
-      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
-      if (notion) {
-        mcpServers[notion.key] = notion.value;
+      // Site 2 — framework-wins on first write; subsequent user
+      // spread (below) wins on key collision. Order preserved from
+      // INTEGRATION_MCP_RESOLVERS so two integrations never silently
+      // disagree on precedence between sites.
+      for (const integration of INTEGRATION_MCP_RESOLVERS) {
+        const entry = integration.resolve(name, agentConfig, switchroomConfig);
+        if (entry) {
+          mcpServers[entry.key] = entry.value;
+        }
       }
     }
 
@@ -4283,27 +4345,18 @@ export function reconcileAgent(
     // google_workspace.account / google_accounts.enabled_for[] in
     // switchroom.yaml adds or retracts the entry on the next reconcile.
     {
-      const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
-      if (gdrive) {
-        mcpServers[gdrive.key] = gdrive.value;
-      } else {
-        // Retraction: if the agent lost authorization (account removed
-        // from enabled_for[], or opt-out flipped), drop any stale entry
-        // so reconcile is the source of truth — mirrors how the #235
-        // switchroom-mcp retraction works.
-        delete mcpServers["gdrive"];
-      }
-      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
-      if (ms365) {
-        mcpServers[ms365.key] = ms365.value;
-      } else {
-        delete mcpServers["ms-365"];
-      }
-      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
-      if (notion) {
-        mcpServers[notion.key] = notion.value;
-      } else {
-        delete mcpServers["notion"];
+      // Site 3 — settings.json reconcile: emit-or-retract. Retraction
+      // is keyed off `integration.retractionKey` (a separate field from
+      // `emitKey`), so a future integration whose opt-out key differs
+      // from its emit key cannot silently drift between emit and
+      // retract paths. Mirrors how #235 switchroom-mcp retraction works.
+      for (const integration of INTEGRATION_MCP_RESOLVERS) {
+        const entry = integration.resolve(name, agentConfig, switchroomConfig);
+        if (entry) {
+          mcpServers[entry.key] = entry.value;
+        } else {
+          delete mcpServers[integration.retractionKey];
+        }
       }
     }
 
@@ -4611,17 +4664,14 @@ export function reconcileAgent(
     // simply isn't re-added (no explicit delete needed). Same shared
     // broker-ACL gate as scaffoldAgent / settings paths.
     {
-      const gdrive = resolveGdriveMcpEntry(name, agentConfig, switchroomConfig);
-      if (gdrive) {
-        mcpServers[gdrive.key] = gdrive.value;
-      }
-      const ms365 = resolveMs365McpEntry(name, agentConfig, switchroomConfig);
-      if (ms365) {
-        mcpServers[ms365.key] = ms365.value;
-      }
-      const notion = resolveNotionMcpEntry(name, agentConfig, switchroomConfig);
-      if (notion) {
-        mcpServers[notion.key] = notion.value;
+      // Site 4 — .mcp.json reconcile: emit-only. mcpServers is rebuilt
+      // fresh from the hardcoded set each reconcile, so a retracted
+      // entry simply isn't re-added (no explicit delete needed).
+      for (const integration of INTEGRATION_MCP_RESOLVERS) {
+        const entry = integration.resolve(name, agentConfig, switchroomConfig);
+        if (entry) {
+          mcpServers[entry.key] = entry.value;
+        }
       }
     }
 
