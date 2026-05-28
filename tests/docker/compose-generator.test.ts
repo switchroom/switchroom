@@ -780,6 +780,62 @@ describe("generateCompose", () => {
     }
   });
 
+  it("emits webkite binary + cloakbrowser + config mounts when present", async () => {
+    // Webkite binary is private-beta + operator-staged; cloakbrowser
+    // chromium is shared across the fleet via a host bind mount; the
+    // optional config.toml is operator-tunable defaults. All three are
+    // existsSync-guarded — docker compose `up` hard-fails on a missing
+    // `:ro` source.
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-webkite-present-"));
+    try {
+      mkdirSync(join(tmp, ".switchroom", "bin"), { recursive: true });
+      writeFileSync(join(tmp, ".switchroom", "bin", "webkite"), "#!/bin/sh\n");
+      mkdirSync(join(tmp, ".cloakbrowser", "chromium-1"), { recursive: true });
+      mkdirSync(join(tmp, ".switchroom", "webkite"), { recursive: true });
+      writeFileSync(join(tmp, ".switchroom", "webkite", "config.toml"), "");
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).toContain(
+        `${tmp}/.switchroom/bin/webkite:/usr/local/bin/webkite:ro`,
+      );
+      expect(out).toContain(
+        `${tmp}/.cloakbrowser:/state/agent/home/.cloakbrowser:ro`,
+      );
+      expect(out).toContain(
+        `${tmp}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,
+      );
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("omits webkite + cloakbrowser mounts when host sources are absent", async () => {
+    // Mirrors the skills/credentials guard — a fresh install without
+    // the webkite binary staged or cloakbrowser installed should still
+    // produce valid compose. Webkite degrades gracefully (no MCP
+    // server resolves on first call — model gets a clear error).
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmp = mkdtempSync(join(tmpdir(), "compose-webkite-absent-"));
+    try {
+      const out = generateCompose({
+        config: makeConfig({ a: {} }),
+        homeDir: tmp,
+      });
+      expect(out).not.toContain(`/.switchroom/bin/webkite:`);
+      expect(out).not.toContain(`/.cloakbrowser:`);
+      expect(out).not.toContain(`/.switchroom/webkite/config.toml:`);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("emits top-level project name 'switchroom' for collision protection", () => {
     // Belt-and-braces vs Coolify-managed (or other) compose stacks on
     // the same host. Pinning name: at file scope means

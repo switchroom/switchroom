@@ -120,6 +120,33 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
  && python3 -m playwright install chromium
 
+# Cloakbrowser — the local stealth Chromium driver used by webkite's
+# `webkite mcp` MCP server to fetch bot-gated sites. The webkite binary
+# itself is mounted from the operator's host (private beta — not
+# baked or committed); cloakbrowser is public OSS so we bake the
+# Python tool here. The 700MB chromium binary it spawns is shared
+# across the fleet via a host bind mount of `~/.cloakbrowser/` (see
+# compose.ts), NOT baked into the image.
+#
+# Why bake instead of per-agent install: a pipx venv has shebang lines
+# pointing at the venv's own python interpreter. If we mounted the
+# operator's pipx venv from the host, the shebang's interpreter path
+# might not exist inside the container (or, worse, point at a host
+# python with mismatched glibc). Baking gives every agent an identical,
+# image-deterministic install rooted at a stable absolute path.
+#
+# PIPX_HOME=/opt/cloakbrowser keeps the venv at a fixed image path so
+# the per-agent HOME at runtime can't shadow it. PIPX_BIN_DIR puts the
+# `cloakbrowser` shim on the system PATH. Same rare-changed bake zone
+# as playwright above so a typical src-only PR doesn't re-pay the
+# ~30s pipx install.
+ENV CLOAKBROWSER_PIPX_HOME=/opt/cloakbrowser
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pipx \
+ && rm -rf /var/lib/apt/lists/* \
+ && PIPX_HOME=${CLOAKBROWSER_PIPX_HOME} PIPX_BIN_DIR=/usr/local/bin \
+    pipx install cloakbrowser
+
 # Phase 2 cron-fold-in: the in-agent scheduler's node-cron runtime dep.
 # Bundle is built by scripts/build.mjs with --external node-cron, so the
 # image must provide it. node-cron is pure JS (no native compilation),

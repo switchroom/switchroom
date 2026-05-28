@@ -35,7 +35,12 @@ import { INTEGRATION_MCP_RESOLVERS } from "../src/agents/scaffold.js";
 describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
   it("contains exactly the three shipped integrations in order", () => {
     const labels = INTEGRATION_MCP_RESOLVERS.map((i) => i.label);
-    expect(labels).toEqual(["Google Workspace", "Microsoft 365", "Notion"]);
+    expect(labels).toEqual([
+      "Google Workspace",
+      "Microsoft 365",
+      "Notion",
+      "Webkite",
+    ]);
   });
 
   it("each entry has matching emitKey and retractionKey (today's invariant)", () => {
@@ -64,20 +69,52 @@ describe("INTEGRATION_MCP_RESOLVERS — registry shape", () => {
     expect(keys).toContain("gdrive");
     expect(keys).toContain("ms-365");
     expect(keys).toContain("notion");
+    expect(keys).toContain("webkite");
   });
 
   it("each resolver is callable and accepts the (name, agentConfig, switchroomConfig) shape", () => {
-    // Call each with a minimal disable config — they should all
-    // return null without throwing. Smoke-test that the registry's
-    // type contract isn't broken.
+    // Call each with a minimal disable config + per-server opt-out so
+    // every resolver returns null. Webkite is fleet-default (no opt-in
+    // gate) so the opt-out flag is required for it to return null —
+    // gdrive/m365/notion gate on their workspace blocks which are
+    // absent here, so they return null without the flag either way.
+    const optOutAll = {
+      mcp_servers: { gdrive: false, "ms-365": false, notion: false, webkite: false },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
     for (const integration of INTEGRATION_MCP_RESOLVERS) {
       const result = integration.resolve(
         "test-agent",
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        {} as any,
+        optOutAll,
         undefined,
       );
       expect(result).toBeNull();
     }
+  });
+
+  it("webkite resolver emits the canonical entry when not opted out", () => {
+    const webkite = INTEGRATION_MCP_RESOLVERS.find((i) => i.emitKey === "webkite");
+    expect(webkite).toBeDefined();
+    const result = webkite!.resolve(
+      "test-agent",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {} as any,
+      undefined,
+    );
+    expect(result).toEqual({
+      key: "webkite",
+      value: { command: "webkite", args: ["mcp"] },
+    });
+  });
+
+  it("webkite resolver returns null when the agent opts out", () => {
+    const webkite = INTEGRATION_MCP_RESOLVERS.find((i) => i.emitKey === "webkite");
+    const result = webkite!.resolve(
+      "test-agent",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { mcp_servers: { webkite: false } } as any,
+      undefined,
+    );
+    expect(result).toBeNull();
   });
 });

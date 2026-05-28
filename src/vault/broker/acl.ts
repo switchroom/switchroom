@@ -41,6 +41,35 @@ import type { PeerInfo } from "./peercred.js";
 import type { VaultEntryScope } from "../vault.js";
 import { isGoogleClientCredentialKeyForAgent } from "../../config/google-workspace-acl.js";
 
+/**
+ * Canonical vault keys webkite reads when running as an in-agent MCP.
+ * Mirrors `WEBKITE_VAULT_KEYS` in profiles/_base/start.sh.hbs (the
+ * shell loop that fetches them at agent boot and exports as env
+ * vars). Kept in sync by the test pins at `src/vault/broker/acl.test.ts`
+ * (canonical-3 allow + opt-out deny + non-canonical deny cases) and
+ * `tests/scaffold.integration-registry.test.ts` (resolver shape).
+ */
+const WEBKITE_VAULT_KEYS = new Set<string>([
+  "webkite/cloudflare-account-id",
+  "webkite/cloudflare-api-token",
+  "webkite/firecrawl-api-key",
+]);
+
+/**
+ * Webkite is fleet-default — every agent reads these keys unless the
+ * agent explicitly opted out via `mcp_servers.webkite: false`. Same
+ * "framework-emits-entry-AND-ACL" shape as the gdrive client-secret
+ * special case (see acl.ts: isGoogleClientCredentialKeyForAgent).
+ */
+function isWebkiteCredentialKeyForAgent(
+  agentConfig: { mcp_servers?: Record<string, unknown> } | undefined,
+  key: string,
+): boolean {
+  if (!WEBKITE_VAULT_KEYS.has(key)) return false;
+  if ((agentConfig?.mcp_servers ?? {})["webkite"] === false) return false;
+  return true;
+}
+
 export interface AclAllow {
   allow: true;
 }
@@ -289,6 +318,26 @@ export function checkAclByAgent(
   // whether to emit the entry at all, so broker and scaffold can never
   // disagree. See config/google-workspace-acl.ts.
   if (isGoogleClientCredentialKeyForAgent(config, agentName, key)) {
+    return { allow: true };
+  }
+
+  // Webkite credentials — `webkite/cloudflare-account-id`,
+  // `webkite/cloudflare-api-token`, `webkite/firecrawl-api-key`.
+  //
+  // Webkite is a fleet-default MCP scaffolded by
+  // `resolveWebkiteMcpEntry` (src/agents/scaffold.ts) — every agent
+  // gets it unless it opts out via `mcp_servers.webkite: false`. Same
+  // shape as the gdrive client-secret special-case above: the
+  // framework EMITS the entry, so the framework must EMIT the broker
+  // ACL too (operator yaml never sees the webkite entry, so the
+  // `effectiveMcp` cascade path below can't find it).
+  //
+  // Gated on per-agent opt-out so an explicitly-disabled webkite
+  // agent can't read these keys. The keys themselves are operator-
+  // populated by `switchroom vault set webkite/*` — when absent, the
+  // broker returns UNKNOWN_KEY and webkite gracefully falls back to
+  // cloakbrowser-only (which is fine for non-bot-gated sites).
+  if (isWebkiteCredentialKeyForAgent(agentConfig, key)) {
     return { allow: true };
   }
 

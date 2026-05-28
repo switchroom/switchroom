@@ -396,7 +396,12 @@ describe("scaffoldAgent", () => {
     // #235: switchroom-mcp deprecated — mcp__switchroom__* is no longer
     // pre-approved (the underlying server is removed).
     expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
-    expect(settings.permissions.deny).toEqual(["bash"]);
+    // Webkite is fleet-default (scaffold.ts:WEBKITE_FLEET_DENY_TOOLS) —
+    // the native WebFetch / WebSearch tools are denied so the model
+    // reaches for the webkite_* MCP tools instead. Per-agent
+    // `mcp_servers.webkite: false` opts both webkite AND this deny
+    // out together.
+    expect(settings.permissions.deny).toEqual(["bash", "WebFetch", "WebSearch"]);
     expect(settings.permissions.defaultMode).toBeUndefined();
   });
 

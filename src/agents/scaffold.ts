@@ -168,6 +168,54 @@ When the user asks "what do you know about X / me", "what do you remember about 
 Don't wait for a slash command. Don't ask permission. Memory work is table stakes, like a colleague who takes notes and remembers.`;
 
 /**
+ * The web-fetch contract. One of the fleet invariant blocks. The
+ * native WebFetch / WebSearch tools are disabled at the cascade
+ * level (`scaffold.ts:WEBKITE_FLEET_DENY_TOOLS`); webkite is wired
+ * in via `.mcp.json` and runs as a stdio MCP server with 12 tools.
+ *
+ * Cloudflare / Firecrawl credentials are pre-fetched from the vault
+ * by start.sh.hbs at boot — webkite picks them up via env and uses
+ * cloud render as a fallback when local cloakbrowser can't fetch a
+ * bot-gated site. No agent setup required.
+ */
+const WEB_FETCH_GUIDANCE = `## Fetching from the web
+
+The native \`WebFetch\` and \`WebSearch\` tools are disabled in this
+fleet. Use the \`webkite_*\` MCP tools instead — they're already
+wired up and authenticated.
+
+The 12 tools webkite exposes cover what you actually need:
+
+- \`webkite_read\` — fetch a URL and get clean article text or
+  markdown. The everyday "read this page" tool. Pass several URLs
+  to read them in one call.
+- \`webkite_search\` — web search; returns URLs + snippets. Use
+  before \`webkite_read\` when you don't already have the URL.
+- \`webkite_extract\` — pull specific fields from one page via a
+  JSON Schema you supply. Use when you want structured data, not
+  prose.
+- \`webkite_crawl\` — walk a site from a seed URL. Higher-cost than
+  \`read\` or \`map\` — reserve for "harvest everything under this
+  section."
+- \`webkite_map\` — list a site's URLs from its sitemap, no page
+  content. Cheap. Use when you only need URLs.
+- \`webkite_clip\` — save a page snapshot (Obsidian, file, or
+  screenshot).
+- session / cookie / diagnostics helpers.
+
+**Why this exists:** the fleet ships with a stealth Chromium
+(cloakbrowser) baked in for bot-gated sites the native fetcher can't
+touch, plus Cloudflare/Firecrawl fallback when local render fails.
+\`webkite_*\` Just Works — don't try to shell out to \`curl\` or
+\`wget\` as a fallback; if webkite can't fetch a URL, neither can
+they.
+
+If you genuinely need WebFetch back for one agent (e.g. a workflow
+that depends on its specific output shape), set \`mcp_servers.webkite:
+false\` in that agent's switchroom.yaml block — webkite goes away
+and the native tools come back together.`;
+
+/**
  * Canonical rendering of the fleet invariants file written to
  * `~/.switchroom/fleet/switchroom-invariants.md`. Apply checksums
  * this against the on-disk file and restores on drift. Operators
@@ -199,6 +247,8 @@ export function renderFleetInvariants(): string {
     TELEGRAM_GUIDANCE,
     "",
     MEMORY_GUIDANCE,
+    "",
+    WEB_FETCH_GUIDANCE,
     "",
   ].join("\n");
 }
@@ -663,6 +713,21 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
   // otherwise stall on an approval).
   "Skill",
 ];
+
+/**
+ * Fleet-baseline deny list seeded into every agent's settings.json
+ * `permissions.deny` unless the agent has opted out of webkite. The
+ * model still has full web-fetch capability — via the webkite_*
+ * MCP tools — but the native WebFetch / WebSearch tools are off so
+ * the model reaches for webkite by default. Webkite is operator-
+ * mounted (private beta binary) and pre-credentialed via the vault-
+ * broker; the model doesn't need to know about any of that.
+ *
+ * Opt-out: per-agent `mcp_servers.webkite: false` skips the deny too
+ * — the agent gets native WebFetch back. (Documented behavior — if
+ * you turn off webkite, you keep WebFetch.)
+ */
+const WEBKITE_FLEET_DENY_TOOLS = ["WebFetch", "WebSearch"];
 
 /**
  * Switchroom-shipped default model + thinking effort for main agents.
@@ -1772,7 +1837,12 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     user: (agentConfig as unknown as { user?: unknown }).user,
     agentConfig,
     tools,
-    toolsDeny: tools.deny ?? [],
+    toolsDeny: dedupe([
+      ...(tools.deny ?? []),
+      ...(agentConfig.mcp_servers?.["webkite"] === false
+        ? []
+        : WEBKITE_FLEET_DENY_TOOLS),
+    ]),
     permissionAllow,
     defaultModeAcceptEdits: hasAllWildcard,
     memory: agentConfig.memory,
@@ -2198,6 +2268,50 @@ export interface IntegrationMcpResolver {
   ) => { key: string; value: McpServerConfig } | null;
 }
 
+/**
+ * Resolve the per-agent `webkite` MCP entry.
+ *
+ * Unlike gdrive/ms-365/notion, webkite has no top-level switchroom.yaml
+ * config block to gate on — it's a fleet-default capability that swaps
+ * in for the native WebFetch/WebSearch tools (disabled at the cascade
+ * level — see defaults `disallowed_tools`). The only gate is the
+ * per-agent opt-out (`mcp_servers.webkite: false`).
+ *
+ * Distribution model (see docker/Dockerfile.agent + compose.ts):
+ *   - `webkite` binary: operator-mounted from `~/.switchroom/bin/webkite`
+ *     onto the in-container PATH at `/usr/local/bin/webkite`. The
+ *     binary itself is a private-beta release that never lives in this
+ *     repo or the agent image.
+ *   - cloakbrowser Python tool: baked into the agent image at
+ *     `/opt/cloakbrowser` (public OSS, no constraint violation).
+ *   - cloakbrowser Chromium: operator-mounted from `~/.cloakbrowser/`
+ *     so the whole fleet shares one ~700MB install.
+ *
+ * Credential injection: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
+ * FIRECRAWL_API_KEY are fetched from the vault-broker by start.sh.hbs
+ * at agent boot and exported into the agent process env. Claude
+ * inherits them on `exec claude`, so the `webkite mcp` child process
+ * sees them via env inheritance. No per-server env block needed here —
+ * unlike gdrive/m365 (which spawn through a launcher that talks to the
+ * auth-broker), webkite's env-from-vault is one-shot at boot.
+ *
+ * Returns null when the entry must not be emitted.
+ */
+export function resolveWebkiteMcpEntry(
+  _agentName: string,
+  agentConfig: AgentConfig,
+  _switchroomConfig: SwitchroomConfig | undefined,
+): { key: string; value: McpServerConfig } | null {
+  if ((agentConfig.mcp_servers ?? {})["webkite"] === false) return null;
+  return {
+    key: "webkite",
+    value: {
+      command: "webkite",
+      args: ["mcp"],
+    },
+  };
+}
+
 export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
   {
     label: "Google Workspace",
@@ -2216,6 +2330,12 @@ export const INTEGRATION_MCP_RESOLVERS: readonly IntegrationMcpResolver[] = [
     emitKey: "notion",
     retractionKey: "notion",
     resolve: resolveNotionMcpEntry,
+  },
+  {
+    label: "Webkite",
+    emitKey: "webkite",
+    retractionKey: "webkite",
+    resolve: resolveWebkiteMcpEntry,
   },
 ];
 
@@ -4071,7 +4191,12 @@ export function reconcileAgent(
     ...AGENT_CONFIG_MCP_TOOLS,
     ...HOSTD_MCP_TOOLS,
   ]);
-  const desiredDeny = tools.deny ?? [];
+  const desiredDeny = dedupe([
+    ...(tools.deny ?? []),
+    ...(agentConfig.mcp_servers?.["webkite"] === false
+      ? []
+      : WEBKITE_FLEET_DENY_TOOLS),
+  ]);
 
   // Resolve topic ID for the start.sh template and session greeting
   let topicId = agentConfig.topic_id;
