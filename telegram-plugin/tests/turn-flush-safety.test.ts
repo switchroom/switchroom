@@ -52,7 +52,7 @@ describe('isCompositeSilentNoise — Stop-hook re-prompt leak backstop', () => {
 describe('decideTurnFlush — composite silent noise is skipped, not leaked', () => {
   it('skips "Sent.\\nNO_REPLY\\nNO_REPLY" (the live clerk/test-harness leak)', () => {
     const d = decideTurnFlush({
-      chatId: '8248703757',
+      chatId: '12345',
       replyCalled: false,
       capturedText: ['Sent.', 'NO_REPLY', 'NO_REPLY'],
     })
@@ -60,7 +60,7 @@ describe('decideTurnFlush — composite silent noise is skipped, not leaked', ()
   })
   it('still flushes genuine trailing answer text', () => {
     const d = decideTurnFlush({
-      chatId: '8248703757',
+      chatId: '12345',
       replyCalled: false,
       capturedText: ['The page summarises three news stories.'],
     })
