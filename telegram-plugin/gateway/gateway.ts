@@ -15286,25 +15286,56 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     let grantOk = false
+    let grantFailReason = ''
     try {
       // --no-restart: settings.json gets the new entry on the next
       // reconcile but we don't bounce the agent mid-turn. Operator
       // can restart manually if they want this rule live in this
       // session; otherwise it kicks in next session.
       switchroomExec(['agent', 'grant', agentName, rule.rule, '--no-restart'])
-      grantOk = true
-      process.stderr.write(
-        `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
-      )
+      // Verify the rule actually landed in the resolved config — guards
+      // against config-location-drift (gateway edited a yaml that isn't
+      // the durable source-of-truth, or the grant was a no-op). One
+      // fresh config read; cheap since this is a rare operator tap.
+      try {
+        const cfg = loadSwitchroomConfig()
+        const rawAgent = cfg.agents?.[agentName]
+        if (rawAgent) {
+          const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+          const allowList: string[] = (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
+          if (allowList.includes(rule.rule)) {
+            grantOk = true
+            process.stderr.write(
+              `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
+            )
+          } else {
+            grantFailReason = `rule "${rule.rule}" not found in resolved tools.allow after write — config location may have drifted`
+            process.stderr.write(
+              `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
+            )
+          }
+        } else {
+          grantFailReason = `agent "${agentName}" not found in config after write`
+          process.stderr.write(
+            `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
+          )
+        }
+      } catch (verifyErr) {
+        grantFailReason = `config re-read failed: ${(verifyErr as Error).message}`
+        process.stderr.write(
+          `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
+        )
+      }
     } catch (err) {
-      process.stderr.write(`telegram gateway: always-allow grant failed: ${(err as Error).message}\n`)
+      grantFailReason = (err as Error).message
+      process.stderr.write(`telegram gateway: always-allow grant failed: ${grantFailReason}\n`)
     }
 
     pendingPermissions.delete(request_id)
 
     const ackText = grantOk
       ? `🔁 Always allow ${rule.label} for ${agentName}`
-      : `✅ Allowed (always-allow yaml edit failed; check gateway log)`
+      : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`
     // HTML-escape baseText — `ctx.callbackQuery.message.text` returns
     // entities-stripped plain UTF-8, so raw `<`/`>`/`&` in the
     // expanded permission card's `description` or `input_preview`
@@ -15317,7 +15348,7 @@ bot.on('callback_query:data', async ctx => {
       : ''
     const editLabel = grantOk
       ? `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — restart agent for full effect`
-      : `✅ <b>Allowed</b> (always-allow rule edit failed; see logs)`
+      : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`
     // #1150 audit: route through finalizeCallback so the keyboard
     // strips alongside the status-line edit. Pre-fix this called
     // editMessageText without `reply_markup` so the Allow/Deny/Always
