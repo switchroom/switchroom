@@ -31,6 +31,7 @@ import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
+import { runWebkiteChecks } from "./doctor-webkite.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
@@ -2603,6 +2604,7 @@ export function registerDoctorCommand(program: Command): void {
             }),
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
+          { title: "Webkite", results: runWebkiteChecks(config) },
         ];
 
         // Repo Hygiene (#1072): only when doctor runs from a switchroom
