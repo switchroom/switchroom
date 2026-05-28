@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.13.63 — Debian trixie base (glibc 2.41) + fail-safe webkite deny
+
+Unblocks the v0.13.62 webkite rollout. The v0.13.62 canary caught the
+webkite MCP binary requiring **GLIBC_2.39**, which the Debian bookworm
+base (glibc 2.36) can't satisfy — webkite was dead-on-arrival
+in-container. Two coupled fixes:
+
+**Base bookworm → trixie.** `docker/Dockerfile.base` FROM
+`node:22-bookworm-slim` → `node:22-trixie-slim` (digest-pinned, sec
+WS9-F4 reviewed bump). glibc 2.36 → 2.41, python 3.11 → 3.13. This is
+the base for the whole fleet (agents + broker + kernel + auth-broker +
+hostd). `docker/Dockerfile.hostd`'s docker-CLI apt suite bumped
+bookworm → trixie (Docker publishes a trixie suite).
+
+Validated in a built agent image before ship: webkite 0.4.0 runs,
+cloakbrowser detected (12 MCP tools), claude CLI 2.1.153 runs, bun
+gateway bundle loads, all 22 hindsight scripts compile AND
+session_start/end + recall execute rc=0 on python 3.13, playwright
+python binding imports, tmux/sqlite3/rg/fd/jq/pandoc/ffmpeg all run.
+CI's build-base + 5 build-dependents confirm the trixie base builds
+cleanly fleet-wide.
+
+**Fail-safe WebFetch deny.** The fleet-default WebFetch/WebSearch deny
+now applies only when a webkite binary is actually staged
+(`webkiteBinaryAvailable`: probes `~/.switchroom/bin/webkite` OR the
+in-container `/usr/local/bin/webkite`, override via
+`SWITCHROOM_WEBKITE_BINARY`). A degraded install — binary missing,
+operator hasn't run setup, or a glibc-incompatible build pulled —
+keeps native WebFetch as a safety net instead of going dark on web
+access. Exactly the failure mode the v0.13.62 canary hit; this makes
+the whole feature fail-safe. Both scaffold + reconcile deny sites
+route through the new `webkiteDenyForAgent` helper.
+
+(#1944)
+
 ## v0.13.62 — webkite fleet-default + activity-summary draft UX fixes
 
 Two PRs.
