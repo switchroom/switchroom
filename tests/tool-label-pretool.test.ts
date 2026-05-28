@@ -228,16 +228,39 @@ describe("tool-label-pretool.mjs", () => {
     }
   });
 
-  it("suppressed tools (Bash, Task, Agent, TodoWrite, send_typing, sync_retain, exotic mcp__) emit nothing", () => {
+  it("Bash / Task / Agent / TodoWrite / ToolSearch now emit labels (draft-mirror real-time source)", () => {
+    // Previously suppressed (deferred to the JSONL description path). Since
+    // the draft-mirror drives off this sidecar in real time, they must be
+    // labelled here too. Bash/Task use the model-authored description.
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ["Bash", { command: "ls -la", description: "List workspace" }, "List workspace"],
+      ["Bash", { command: "ls" }, "Running a command"], // no description → safe fallback
+      ["Task", { description: "Review the migration", prompt: "y" }, "Delegating: Review the migration"],
+      ["Agent", { description: "Audit deps", prompt: "y" }, "Delegating: Audit deps"],
+      ["TodoWrite", { todos: [] }, "Updating the plan"],
+      ["ToolSearch", { query: "x" }, "Finding the right tool"],
+    ];
+    cases.forEach(([tool, input, expected], idx) => {
+      // Unique session per case so the per-session sidecar file isn't
+      // shared/accumulated across iterations. `run()` reads the sidecar
+      // via its 3rd arg, so it must match the payload's session_id.
+      const sess = `sess-${idx}`;
+      const r = run(
+        { session_id: sess, tool_use_id: `t-${tool}-${idx}`, tool_name: tool, tool_input: input },
+        stateDir,
+        sess,
+      );
+      expect(r.status).toBe(0);
+      expect(r.sidecarLines, `${tool} should emit a sidecar label`).toHaveLength(1);
+      expect(r.sidecarLines[0].label).toBe(expected);
+    });
+  });
+
+  it("genuinely-suppressed tools (send_typing, sync_retain, exotic mcp__) still emit nothing", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
-      ["Bash", { command: "ls" }],
-      ["Task", { description: "x", prompt: "y" }],
-      ["Agent", { description: "x", prompt: "y" }],
-      ["TodoWrite", { todos: [] }],
       ["mcp__switchroom-telegram__send_typing", {}],
       ["mcp__hindsight__sync_retain", {}],
       ["mcp__some-other-server__random_tool", { foo: "bar" }],
-      ["ToolSearch", {}],
     ];
     for (const [tool, input] of cases) {
       const r = run(
@@ -247,7 +270,6 @@ describe("tool-label-pretool.mjs", () => {
       expect(r.status).toBe(0);
       expect(r.stdout).toBe("");
     }
-    // No sidecar file at all should have been created (no labels emitted).
     const files = readdirSync(stateDir).filter((f) => f.startsWith("tool-labels-"));
     expect(files).toHaveLength(0);
   });

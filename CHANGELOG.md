@@ -1,6 +1,39 @@
 # Changelog
 
-## v0.14.2 — draft-mirror Phase 2: accumulating activity feed
+## v0.14.3 — draft-mirror determinism (real-time sidecar) + pacing fixes
+
+### draft-mirror: real-time via PreToolUse sidecar (#1963)
+
+Makes the draft-mirror deterministic regardless of when the unmodified
+`claude` CLI flushes its session transcript. Still behind
+`SWITCHROOM_DRAFT_MIRROR` (default OFF; flag-off byte-identical).
+
+The draft previously sourced from the lazily-flushed session JSONL, so
+on fast/clustered-tool turns the tool_use rows weren't on disk until
+~turn-end and the instant reply IPC suppressed the feed (zero draft
+even on a 42s turn). It now sources from the **PreToolUse hook
+sidecar**, written synchronously at tool-call time (flush-independent):
+the hook labels every tool, the sidecar is created+subscribed eagerly
+on session-attach, and a new real-time `tool_label` event drives the
+draft — not gated on `replyCalled`, cleared at `turn_end` so a mid-turn
+reply can't wipe it.
+
+### pacing + fuzz (#1962)
+
+Turn-pacing directive discourages the trailing `"Done."`/`"Sent."` the
+model emits after its answer. Conversational-pacing fuzz de-staled:
+`sleep`→`python3 time.sleep` (Claude Code's bash sandbox blocks
+standalone `sleep`), and the CC-2 assertion tolerates a trailing
+confirmation. Fuzz went 9→4 failing (remaining are reaction-observation
++ long-wait-ceiling edge cases, not regressions).
+
+### other
+
+- PR3b: turn-in-flight gate cut over to the delivery state machine
+  (#1961). Docs: stale `claude -p` reference fix (#1960), drift-audit
+  phase-4 report (#1959).
+
+
 
 Phase 2 of the draft-mirror (#1957), still behind `SWITCHROOM_DRAFT_MIRROR`
 (**default OFF**; flag-off behavior byte-identical to v0.14.1).
