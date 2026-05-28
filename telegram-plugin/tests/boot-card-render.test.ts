@@ -364,3 +364,96 @@ describe('renderBootCard — resolved / snooze rendering', () => {
     expect(out).toContain('✅ <b>Broker</b>  resolved')
   })
 })
+
+// ── Config-change row rendering (E3) ─────────────────────────────────────────
+
+describe('renderBootCard — configChanges rows', () => {
+  it('silent when configChanges is absent', () => {
+    const out = renderBootCard({ agentName: 'k', version: 'v' })
+    expect(out).toBe('✅ <b>k</b> back up · v')
+    expect(out).not.toContain('Config')
+  })
+
+  it('silent when configChanges is empty array', () => {
+    const out = renderBootCard({ agentName: 'k', version: 'v', configChanges: [] })
+    expect(out).toBe('✅ <b>k</b> back up · v')
+    expect(out).not.toContain('Config')
+  })
+
+  it('renders a model-change row when model changed', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      configChanges: [{ field: 'model', from: 'claude-opus-4', to: 'claude-sonnet-4-5' }],
+    })
+    expect(out).toContain('⚙️ <b>Config</b>')
+    expect(out).toContain('claude-opus-4')
+    expect(out).toContain('claude-sonnet-4-5')
+    expect(out).toContain('→')
+  })
+
+  it('renders a coarse tools-changed row for tools diff', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      configChanges: [{ field: 'tools', from: 'aaa', to: 'bbb' }],
+    })
+    expect(out).toContain('tools allowlist changed')
+    expect(out).toContain('/status')
+    expect(out).not.toContain('aaa')
+    expect(out).not.toContain('bbb')
+  })
+
+  it('renders a coarse skills-changed row for skills diff', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      configChanges: [{ field: 'skills', from: 'ccc', to: 'ddd' }],
+    })
+    expect(out).toContain('skills changed')
+    expect(out).toContain('/status')
+  })
+
+  it('renders multiple config-change rows (all four fields)', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      configChanges: [
+        { field: 'model', from: 'claude-opus-4', to: 'claude-sonnet-4-5' },
+        { field: 'tools', from: 'abc', to: 'def' },
+        { field: 'skills', from: 'ghi', to: 'jkl' },
+        { field: 'memoryBackend', from: 'finn', to: 'finn-v2' },
+      ],
+    })
+    const lines = out.split('\n')
+    // Should have more than 1 line (ack + separator + config rows).
+    expect(lines.length).toBeGreaterThan(2)
+    expect(out).toContain('claude-opus-4')
+    expect(out).toContain('tools allowlist changed')
+    expect(out).toContain('skills changed')
+    expect(out).toContain('finn')
+    expect(out).toContain('finn-v2')
+  })
+
+  it('config-change rows appear after probe rows', () => {
+    const out = renderBootCard({
+      agentName: 'k',
+      version: 'v',
+      probes: {
+        broker: { status: 'fail', label: 'Broker', detail: 'socket missing' },
+      },
+      configChanges: [{ field: 'model', from: 'a', to: 'b' }],
+    })
+    const brokerIdx = out.indexOf('Broker')
+    const configIdx = out.indexOf('Config')
+    expect(brokerIdx).toBeGreaterThan(-1)
+    expect(configIdx).toBeGreaterThan(-1)
+    expect(configIdx).toBeGreaterThan(brokerIdx)
+  })
+
+  it('bare ack still returned when configChanges fires but produces only empty rows (defensive)', () => {
+    // Edge: empty configChanges array passed → should not produce rows.
+    const out = renderBootCard({ agentName: 'k', version: 'v', configChanges: [] })
+    expect(out).toBe('✅ <b>k</b> back up · v')
+  })
+})

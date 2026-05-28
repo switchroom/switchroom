@@ -3906,11 +3906,12 @@ const ipcServer: IpcServer = createIpcServer({
           const updateOutcomeLine = (() => {
             try { return maybeRenderUpdateAnnouncement() ?? undefined } catch { return undefined }
           })()
+          const resolvedAgentDirForCard = agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp')
           startBootCard(chatId, threadId, botApiForCard, {
             agentName: agentDisplayName,
             agentSlug,
             version: formatBootVersion(),
-            agentDir: agentDir ?? (process.env.TELEGRAM_STATE_DIR ? require('path').dirname(process.env.TELEGRAM_STATE_DIR) : '/tmp'),
+            agentDir: resolvedAgentDirForCard,
             gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
             restartReason: reason,
             restartAgeMs: markerAgeMs,
@@ -3919,6 +3920,7 @@ const ipcServer: IpcServer = createIpcServer({
             probeQuotaViaBroker: (t) => probeQuotaForBootCard(agentSlug, t),
             tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
             dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
+            configSnapshotPath: join(resolvedAgentDirForCard, '.config-snapshot.json'),
             ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
           }, ackMsgId).then(handle => {
             activeBootCard = handle
@@ -16826,11 +16828,12 @@ void (async () => {
                     const updateOutcomeLine = (() => {
                       try { return maybeRenderUpdateAnnouncement() ?? undefined } catch { return undefined }
                     })()
+                    const resolvedAgentDirForBootCard = agentDir ?? join(homedir(), '.switchroom', 'agents', agentSlug)
                     const handle = await startBootCard(chatId, threadId, botApiForCard, {
                       agentName: agentDisplayName,
                       agentSlug,
                       version: formatBootVersion(),
-                      agentDir: agentDir ?? join(homedir(), '.switchroom', 'agents', agentSlug),
+                      agentDir: resolvedAgentDirForBootCard,
                       gatewayInfo: { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS },
                       restartReason: reason,
                       restartAgeMs: markerAgeMs,
@@ -16839,6 +16842,7 @@ void (async () => {
                       probeQuotaViaBroker: (t) => probeQuotaForBootCard(agentSlug, t),
                       tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
                       dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
+                      configSnapshotPath: join(resolvedAgentDirForBootCard, '.config-snapshot.json'),
                       ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
                     }, ackMsgId)
                     activeBootCard = handle
