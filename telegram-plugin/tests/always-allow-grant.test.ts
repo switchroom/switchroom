@@ -102,21 +102,24 @@ describe('always-allow handler — post-write verification', () => {
     expect(resolveIdx).toBeGreaterThan(execIdx)
   })
 
-  it('checks allowList.includes(rule.rule) after the reload', () => {
-    expect(alwaysBlock).toContain('allowList.includes(rule.rule)')
+  it('calls isRulePersisted(allowList, rule.rule) after the reload', () => {
+    // The handler delegates the membership check to the extracted pure
+    // helper so the behavioral test in always-allow-persist.test.ts can
+    // cover the same code path.
+    expect(alwaysBlock).toContain('isRulePersisted(allowList, rule.rule)')
   })
 
-  it('sets grantOk=true only when the rule IS present in the reloaded config', () => {
-    // grantOk=true must be inside the `if (allowList.includes(rule.rule))`
-    // branch, not unconditionally after switchroomExec.
-    const allowListIdx = alwaysBlock.indexOf('allowList.includes(rule.rule)')
-    const grantOkIdx = alwaysBlock.indexOf('grantOk = true', allowListIdx)
-    expect(allowListIdx).toBeGreaterThan(-1)
-    expect(grantOkIdx).toBeGreaterThan(allowListIdx)
-    // Confirm it does NOT appear before the includes check (i.e., not
-    // unconditionally on switchroomExec success as in the old code).
-    const grantOkBeforeCheck = alwaysBlock.indexOf('grantOk = true')
-    expect(grantOkBeforeCheck).toBeGreaterThanOrEqual(allowListIdx)
+  it('sets grantOk=true only when isRulePersisted returns true', () => {
+    // grantOk=true must be inside the `if (isRulePersisted(...))` branch,
+    // not unconditionally after switchroomExec.
+    const persistIdx = alwaysBlock.indexOf('isRulePersisted(allowList, rule.rule)')
+    const grantOkIdx = alwaysBlock.indexOf('grantOk = true', persistIdx)
+    expect(persistIdx).toBeGreaterThan(-1)
+    expect(grantOkIdx).toBeGreaterThan(persistIdx)
+    // Confirm grantOk=true does NOT appear before the persistence check
+    // (i.e., not unconditionally on switchroomExec success as in the old code).
+    const grantOkFirst = alwaysBlock.indexOf('grantOk = true')
+    expect(grantOkFirst).toBeGreaterThanOrEqual(persistIdx)
   })
 
   it('logs a VERIFY FAILED message when the rule is absent after the write', () => {

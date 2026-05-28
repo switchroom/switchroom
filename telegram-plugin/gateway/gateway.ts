@@ -368,7 +368,7 @@ import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
 import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
-import { resolveAlwaysAllowRule } from '../permission-rule.js'
+import { resolveAlwaysAllowRule, isRulePersisted } from '../permission-rule.js'
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
@@ -15303,7 +15303,7 @@ bot.on('callback_query:data', async ctx => {
         if (rawAgent) {
           const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
           const allowList: string[] = (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
-          if (allowList.includes(rule.rule)) {
+          if (isRulePersisted(allowList, rule.rule)) {
             grantOk = true
             process.stderr.write(
               `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
