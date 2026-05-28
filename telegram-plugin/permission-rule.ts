@@ -133,6 +133,28 @@ function skillBasenameFromPath(input: Record<string, unknown>): string | null {
 }
 
 /**
+ * Verify that a grant actually landed in the resolved `tools.allow` list.
+ *
+ * Called by the `perm:always:*` handler after `switchroom agent grant`
+ * returns to guard against silently-failed or misdirected yaml writes.
+ * Extracted as a pure helper so it can be unit-tested without a full
+ * Grammy + switchroomExec harness.
+ *
+ * @param resolvedAllow  The `tools.allow` array from `resolveAgentConfig`
+ *                       for the target agent (pass `[]` when absent/undefined).
+ * @param ruleRule       The rule string produced by `resolveAlwaysAllowRule`
+ *                       (e.g. `"Skill(garmin)"`, `"Bash"`, `"mcp__x__y"`).
+ * @returns `true` when the rule is present (grant confirmed), `false` when
+ *          absent (grant failed / config location drifted).
+ */
+export function isRulePersisted(
+  resolvedAllow: readonly string[],
+  ruleRule: string,
+): boolean {
+  return resolvedAllow.includes(ruleRule);
+}
+
+/**
  * Inverse of `resolveAlwaysAllowRule` — does a stored allow-rule cover a
  * fresh `permission_request`? Used by the bridge's session-scoped
  * always-allow cache (issue #1138) to short-circuit prompts when the
