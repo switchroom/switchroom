@@ -85,7 +85,7 @@ assistant — running (2h 14m)
   model: claude-sonnet-4-6  collection: general
 
 dev — running (45m)
-  model: claude-opus-4-7  collection: coding
+  model: claude-opus-4-8  collection: coding
 
 coach — stopped
   last run: 3 days ago

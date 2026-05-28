@@ -248,7 +248,7 @@ agents:
   #   topic_emoji: "💻"
   #   bot_token: "vault:telegram-dev-bot-token"     # its own bot
   #   extends: coder                      # inherits from inline profile above
-  #   model: claude-opus-4-7              # override defaults.model for this agent
+  #   model: claude-opus-4-8              # override defaults.model for this agent
   #   memory:
   #     collection: coding
   #   cli_args: ["--effort", "high"]      # escape hatch: extra exec claude flags
