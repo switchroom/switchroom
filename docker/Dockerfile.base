@@ -2,7 +2,7 @@
 # switchroom/base — shared image for agent / broker / kernel / scheduler.
 #
 # Multi-arch: declare TARGETARCH so buildx (linux/amd64 + linux/arm64) picks
-# the right artifacts. node:22-bookworm-slim has both arches upstream; tini
+# the right artifacts. node:22-trixie-slim has both arches upstream; tini
 # and tmux are arch-portable from Debian repos.
 #
 # The claude CLI is installed via npm — the upstream package ships a thin
@@ -10,12 +10,18 @@
 # ARG TARGETARCH is informational here (logged at build time for forensics).
 ARG TARGETARCH=amd64
 
-# sec WS9-F4 (#1418): pinned by digest. The mutable `:22-bookworm-slim`
+# sec WS9-F4 (#1418): pinned by digest. The mutable `:22-trixie-slim`
 # tag is the base for the WHOLE fleet (incl. the root singletons); an
 # upstream tag repoint would flow into published images undetected.
 # Tag retained for readability + Dependabot `docker` ecosystem, which
 # raises digest bumps as reviewed PRs (.github/dependabot.yml).
-FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732
+#
+# Debian 13 (trixie) — glibc 2.41, python 3.13. Bumped from bookworm
+# (glibc 2.36, python 3.11) so binaries built against a modern glibc
+# floor run in-container — the webkite MCP binary requires GLIBC_2.39,
+# which bookworm's 2.36 can't satisfy (caught by the v0.13.62 canary
+# before fleet rollout). Trixie's 2.41 clears it with headroom.
+FROM node:22-trixie-slim@sha256:e637ac91fb4f2f40761d217c5d48c41a05edf0b65eb9c34e72c27cce55af9e65
 
 ARG TARGETARCH
 RUN echo "switchroom/base building for arch=${TARGETARCH}" >&2

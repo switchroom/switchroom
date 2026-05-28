@@ -1003,7 +1003,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   }
   // /etc/machine-id passthrough — required so the broker can derive
   // the same machine-bound key the host's `enable-auto-unlock` used
-  // to seal the auto-unlock blob. The agent base image (node:22-bookworm-slim)
+  // to seal the auto-unlock blob. The agent base image (node:22-trixie-slim)
   // ships without /etc/machine-id; without this mount the broker
   // errors out "Cannot derive machine-bound key: neither /etc/machine-id
   // nor /var/lib/dbus/machine-id is readable" and falls back to

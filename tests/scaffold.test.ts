@@ -381,28 +381,65 @@ describe("scaffoldAgent", () => {
     expect(access.groups["-1001234567890"].requireMention).toBe(false);
   });
 
-  it("generates settings.json with tool permissions", () => {
-    const config = makeAgentConfig({
-      tools: { allow: ["calendar", "notion"], deny: ["bash"] },
-    });
-    const result = scaffoldAgent("tools-agent", config, tmpDir, telegramConfig);
-    const settings = JSON.parse(
-      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
-    );
+  it("generates settings.json with tool permissions (webkite staged → WebFetch denied)", () => {
+    // Simulate the webkite binary being staged so the fail-safe gate
+    // (webkiteBinaryAvailable) trips and the deny applies. Point the
+    // override env at a real file under tmpDir.
+    const fakeWebkite = join(tmpDir, "webkite-bin");
+    writeFileSync(fakeWebkite, "#!/bin/sh\n");
+    const prev = process.env.SWITCHROOM_WEBKITE_BINARY;
+    process.env.SWITCHROOM_WEBKITE_BINARY = fakeWebkite;
+    try {
+      const config = makeAgentConfig({
+        tools: { allow: ["calendar", "notion"], deny: ["bash"] },
+      });
+      const result = scaffoldAgent("tools-agent", config, tmpDir, telegramConfig);
+      const settings = JSON.parse(
+        readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+      );
 
-    // User-declared tools end up on the allowlist
-    expect(settings.permissions.allow).toContain("calendar");
-    expect(settings.permissions.allow).toContain("notion");
-    // #235: switchroom-mcp deprecated — mcp__switchroom__* is no longer
-    // pre-approved (the underlying server is removed).
-    expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
-    // Webkite is fleet-default (scaffold.ts:WEBKITE_FLEET_DENY_TOOLS) —
-    // the native WebFetch / WebSearch tools are denied so the model
-    // reaches for the webkite_* MCP tools instead. Per-agent
-    // `mcp_servers.webkite: false` opts both webkite AND this deny
-    // out together.
-    expect(settings.permissions.deny).toEqual(["bash", "WebFetch", "WebSearch"]);
-    expect(settings.permissions.defaultMode).toBeUndefined();
+      // User-declared tools end up on the allowlist
+      expect(settings.permissions.allow).toContain("calendar");
+      expect(settings.permissions.allow).toContain("notion");
+      // #235: switchroom-mcp deprecated — mcp__switchroom__* is no longer
+      // pre-approved (the underlying server is removed).
+      expect(settings.permissions.allow).not.toContain("mcp__switchroom__*");
+      // Webkite is fleet-default (scaffold.ts:WEBKITE_FLEET_DENY_TOOLS) —
+      // the native WebFetch / WebSearch tools are denied so the model
+      // reaches for the webkite_* MCP tools instead. Per-agent
+      // `mcp_servers.webkite: false` opts both webkite AND this deny
+      // out together.
+      expect(settings.permissions.deny).toEqual(["bash", "WebFetch", "WebSearch"]);
+      expect(settings.permissions.defaultMode).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
+      else process.env.SWITCHROOM_WEBKITE_BINARY = prev;
+    }
+  });
+
+  it("fail-safe: webkite binary ABSENT → native WebFetch/WebSearch kept", () => {
+    // The fleet-default deny is gated on a webkite binary actually
+    // being staged (webkiteBinaryAvailable). When it's absent — fresh
+    // install, operator hasn't run setup, or a glibc-incompatible
+    // build was pulled — the agent must KEEP native WebFetch as a
+    // safety net rather than losing web access entirely. Point the
+    // override at a path that does not exist.
+    const prev = process.env.SWITCHROOM_WEBKITE_BINARY;
+    process.env.SWITCHROOM_WEBKITE_BINARY = join(tmpDir, "does-not-exist-webkite");
+    try {
+      const config = makeAgentConfig({
+        tools: { allow: ["calendar"], deny: ["bash"] },
+      });
+      const result = scaffoldAgent("nofetch-agent", config, tmpDir, telegramConfig);
+      const settings = JSON.parse(
+        readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+      );
+      // Only the user-declared deny — no WebFetch/WebSearch strip.
+      expect(settings.permissions.deny).toEqual(["bash"]);
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
+      else process.env.SWITCHROOM_WEBKITE_BINARY = prev;
+    }
   });
 
   // #1400 apex-chain link 1: the hostd MCP server exposes mutating /
