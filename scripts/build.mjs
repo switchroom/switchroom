@@ -163,25 +163,6 @@ if (ms365HookEscape.changed) {
   console.log(`[build] ASCII-escaped ${ms365HookEscape.nonAsciiCount} non-ASCII code units in dist/cli/ms-365-write-pretool.mjs`);
 }
 
-// Bundle the ack-first-pretool hook — enforces the human-feel "ack
-// first" beat. Reads $TELEGRAM_STATE_DIR/ack-sent.flag (touched by
-// the gateway at first reply, cleared at turn_started); blocks any
-// non-reply tool call when the flag is absent. Standalone self-
-// contained .mjs — pure decide() with a tiny runHook() wrapper, no
-// switchroom-side imports needed beyond node:fs/node:path so the
-// bundle stays small and fail-open by construction.
-console.log("[build] bundling src/cli/ack-first-pretool.ts -> dist/cli/ack-first-pretool.mjs");
-execSync(
-  `bun build ${JSON.stringify(resolve(root, "src/cli/ack-first-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "ack-first-pretool.mjs"))} --target node`,
-  { stdio: "inherit", cwd: root }
-);
-const ackHookOutFile = resolve(outDir, "ack-first-pretool.mjs");
-chmodSync(ackHookOutFile, 0o755);
-const ackHookEscape = escapeBundleNonAscii(ackHookOutFile);
-if (ackHookEscape.changed) {
-  console.log(`[build] ASCII-escaped ${ackHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/ack-first-pretool.mjs`);
-}
-
 // Bundle the notion-write-pretool hook — RFC docs/rfcs/notion-integration.md
 // §8 PR 3. Same pattern: self-contained .mjs the agent container runs
 // via node. Imports the shared resolver + cache + config-loader from
