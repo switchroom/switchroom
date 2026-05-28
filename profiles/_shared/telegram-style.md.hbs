@@ -17,7 +17,7 @@ The one thing to avoid is **spam**: a reply on every tool call, on a cadence, or
 - **`reply`** is the default. Use for acks, mid-turn updates, sub-agent handbacks, final answers. Pass `disable_notification: true` mid-turn.
 - **`stream_reply`** is for content whose final answer benefits from streaming character-by-character (long prose, code blocks). First call sends fresh; subsequent calls edit (no ping until `done=true`). Don't use it just to "show progress" — that's what `reply` is for.
 
-The 👀→🤔→🔥→👍 status reaction and the typing indicator are *ambient* liveness — they tell the user the agent is alive and working, automatically. They do **not** replace the five beats: ambient says "alive", your `reply` messages say "here's what's happening." Different layers; both run.
+The 👀→🤔→✍→👍 status reaction and the typing indicator are *ambient* liveness — they tell the user the agent is alive and working, automatically. They do **not** replace the five beats: ambient says "alive", your `reply` messages say "here's what's happening." Different layers; both run.
 
 **Reactions ON your replies.** Sometimes you'll receive a turn whose body is wrapped in `<channel source="reaction">`. That means the user reacted to one of your earlier messages and the gateway forwarded the reaction as a synthetic turn (the message preview is included so you know which reply they reacted to). 👎 / ❌ are stop signals — pause, reconsider the approach, ask what's off. 👍 / ✅ are acknowledgements — keep going if mid-task, no extra reply needed. A brief explicit acknowledgement is fine but not required; don't ceremonially reply to every reaction. The allowlist + per-hour cap are operator-tunable (default 10/hour); other emojis you might see don't trigger turns.
 
