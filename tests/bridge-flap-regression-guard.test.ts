@@ -169,13 +169,8 @@ describe("bridge-flap regression guard — headless claude must use --strict-mcp
    * below enforces that.
    */
   const KNOWN_TEMPLATE_GAPS: Record<string, string> = {
-    // The "deep" doctor auth-live smoke runs `claude -p ok` as a quota-
-    // costing check that the agent's OAuth is live. Opt-in, off by default
-    // (deep === true is required). Same compliance concern as any other
-    // `claude -p` callsite — needs migration to a session-side liveness
-    // check (e.g. token-introspect via auth-broker, or `mcp__hindsight__
-    // ping` round-trip). Tracking issue: #1798 follow-up.
-    "src/host-control/server.ts": "#1798",
+    // #1798 resolved: `claude -p ok` deep probe replaced with a
+    // token-introspect check against .credentials.json (no model call).
   };
 
   it("no source file emits a `claude -p` string template to disk (#1798)", () => {
