@@ -71,6 +71,7 @@ Emitted from inside each agent container by the telegram-plugin gateway.
 
 | Event                    | Source                                                                                  | Key properties                                                                                                              |
 |--------------------------|-----------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| `inbound_ack`            | [telegram-plugin/streaming-metrics.ts](../telegram-plugin/streaming-metrics.ts)          | `chat_id`, `message_id`, `thread_id`, `ack_ms` — fired when the 👀 reaction lands; measures time-to-ack from message receipt |
 | `inbound_status_query`   | [telegram-plugin/inbound-classifier.ts](../telegram-plugin/inbound-classifier.ts)        | `chat_id`, `message_id`, `thread_id`, `text_length`, `prior_turn_in_flight`, `seconds_since_turn_start`                     |
 | `turn_started`           | [telegram-plugin/gateway/gateway.ts](../telegram-plugin/gateway/gateway.ts) (fresh-turn) | `chat_id`, `message_id`, `thread_id`, `inbound_classified_as_status_query`                                                  |
 | `turn_ended`             | [telegram-plugin/gateway/gateway.ts](../telegram-plugin/gateway/gateway.ts) (turn_end)   | `chat_id`, `thread_id`, `duration_ms`, `ttfo_ms`, `outbound_count`, `longest_silent_gap_ms`, `ended_via`                    |
