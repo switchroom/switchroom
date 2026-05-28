@@ -5,7 +5,73 @@ import {
   formatSummary,
   registerAndRender,
   verbForTool,
+  describeToolUse,
 } from "../tool-activity-summary.js";
+
+describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
+  it("Bash uses the model-authored description verbatim, never the command", () => {
+    expect(
+      describeToolUse("Bash", { command: "ls -la /tmp", description: "List workspace" }),
+    ).toBe("List workspace");
+    // No description → safe generic, still never the raw command.
+    expect(describeToolUse("Bash", { command: "grep -r foo ." })).toBe("Running a command");
+  });
+
+  it("Read/Edit/Write render the file basename, not the full path", () => {
+    expect(describeToolUse("Read", { file_path: "/home/ken/code/switchroom/gateway.ts" })).toBe(
+      "Reading gateway.ts",
+    );
+    expect(describeToolUse("Edit", { file_path: "/a/b/CLAUDE.md" })).toBe("Editing CLAUDE.md");
+    expect(describeToolUse("Write", { file_path: "notes.txt" })).toBe("Writing notes.txt");
+    expect(describeToolUse("Read", {})).toBe("Reading a file");
+  });
+
+  it("Grep/Glob show the pattern; WebFetch shows the hostname", () => {
+    expect(describeToolUse("Grep", { pattern: "TODO" })).toBe("Searching for TODO");
+    expect(describeToolUse("WebFetch", { url: "https://www.example.com/path?q=1" })).toBe(
+      "Reading example.com",
+    );
+    expect(describeToolUse("WebSearch", { query: "best running shoes" })).toBe(
+      "Searching the web for best running shoes",
+    );
+  });
+
+  it("Task/Agent surface the sub-agent task description", () => {
+    expect(describeToolUse("Task", { description: "Review the migration" })).toBe(
+      "Delegating: Review the migration",
+    );
+  });
+
+  it("domain MCP tools render human-meaningful labels (no jargon)", () => {
+    expect(describeToolUse("mcp__hindsight__reflect", { query: "x" })).toBe("Searching memory");
+    expect(describeToolUse("mcp__hindsight__retain", {})).toBe("Saving to memory");
+    expect(describeToolUse("mcp__claude_ai_Google_Calendar__list_events", {})).toBe(
+      "Checking your calendar",
+    );
+    expect(describeToolUse("mcp__claude_ai_Gmail__search", {})).toBe("Checking your email");
+    expect(describeToolUse("mcp__claude_ai_Google_Drive__search_files", {})).toBe(
+      "Looking through your files",
+    );
+    expect(describeToolUse("mcp__claude_ai_Notion__notion-search", {})).toBe("Checking your notes");
+  });
+
+  it("surface tools (reply/stream_reply) return null — never mirrored", () => {
+    expect(describeToolUse("mcp__switchroom-telegram__reply", { text: "hi" })).toBeNull();
+    expect(describeToolUse("mcp__switchroom-telegram__stream_reply", {})).toBeNull();
+  });
+
+  it("unknown MCP tool prefers a model-authored field, else humanizes the name", () => {
+    expect(describeToolUse("mcp__acme__do_thing", { description: "Fetched the report" })).toBe(
+      "Fetched the report",
+    );
+    expect(describeToolUse("mcp__acme__do_thing", {})).toBe("Using do thing");
+  });
+
+  it("unknown built-in falls back to a generic working line, never raw syntax", () => {
+    expect(describeToolUse("SomeFutureTool", {})).toBe("Working…");
+    expect(describeToolUse("", {})).toBeNull();
+  });
+});
 
 describe("verbForTool — tool name → past-tense verb", () => {
   it("maps standard CLI tools to readable verbs", () => {
