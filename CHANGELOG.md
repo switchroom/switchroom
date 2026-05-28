@@ -1,5 +1,134 @@
 # Changelog
 
+## v0.13.62 — webkite fleet-default + activity-summary draft UX fixes
+
+Two PRs.
+
+### PR A — webkite fleet-default web fetcher (#1941)
+
+Wires **webkite** as a 4th fleet-default integration MCP, replacing
+native `WebFetch` / `WebSearch` on every agent. Webkite spawns a
+local stealth Chromium (cloakbrowser) for bot-gated sites and falls
+back to Cloudflare/Firecrawl cloud render when configured. The
+model gets 12 typed tools (`webkite_read`, `webkite_search`,
+`webkite_extract`, `webkite_crawl`, `webkite_map`, …) instead of
+shelling out — cleaner DX, structured outputs, and one fleet-wide
+authentication path.
+
+**Distribution model.** Deliberately split across three lanes so the
+private-beta webkite binary never lives in this repo or our images:
+
+- **`webkite` binary** (private beta) — operator stages at
+  `~/.switchroom/bin/webkite`; compose RO-mounts to in-container
+  PATH. existsSync-guarded: fleet works in degraded "no-webkite" mode
+  if absent. Never committed.
+- **Cloakbrowser Python tool** (public OSS) — baked into
+  `docker/Dockerfile.agent` via pipx at `/opt/cloakbrowser`.
+- **Stealth Chromium binary** (~700MB) — operator-installed once at
+  `~/.cloakbrowser/`, RO bind-mounted into every agent's HOME so the
+  whole fleet shares one install instead of N copies.
+- **Cloudflare/Firecrawl creds** — operator-vaulted at
+  `webkite/cloudflare-account-id`, `webkite/cloudflare-api-token`,
+  `webkite/firecrawl-api-key`. start.sh fetches via the vault-broker
+  at boot and exports into the agent env so the `webkite mcp` child
+  inherits them.
+
+**Cascade.** `INTEGRATION_MCP_RESOLVERS` gets a 4th entry that always
+emits unless an agent opts out via `mcp_servers.webkite: false`.
+Settings.json `permissions.deny` baseline-seeds `[WebFetch,
+WebSearch]` fleet-wide — opt-out re-enables the native tools
+together with re-enabling webkite (all-or-nothing). The
+`WEB_FETCH_GUIDANCE` block joins the three existing fleet invariant
+blocks (sandbox / telegram / memory) so every agent reads "use
+`webkite_*`" via Claude Code's native CLAUDE.md discovery.
+
+**Broker.** `isWebkiteCredentialKeyForAgent` joins the existing
+`isGoogleClientCredentialKeyForAgent` special-case at
+`src/vault/broker/acl.ts`: framework-emitted MCP entries get
+framework-emitted broker ACL so operators never have to maintain
+`--allow` lists on the 3 canonical webkite keys. Gated on per-agent
+opt-out — disabled-webkite agents still can't read the keys.
+
+**Operator one-time setup:**
+
+```
+cp /path/to/webkite ~/.switchroom/bin/webkite && chmod +x ~/.switchroom/bin/webkite
+XDG_DATA_HOME=~/.switchroom/webkite-share webkite setup --yes cloakbrowser
+switchroom vault set webkite/cloudflare-account-id
+switchroom vault set webkite/cloudflare-api-token
+switchroom update
+```
+
+Ten new tests across four files (`scaffold.integration-registry.test`,
+`docker/compose-generator.test`, `docker/dockerfile-agent-bakes.test`,
+`broker/acl.test`) pin the registry shape, the existsSync mount
+guards, the pipx bake, and the three new ACL cases (default allow,
+opt-out denies, non-canonical webkite/* still denied).
+
+(#1941)
+
+### PR B — activity-summary draft UX fixes (#1942)
+
+Three user-visible bugs in the activity-summary draft path that
+landed alongside Option B (v0.13.59/60). Live-observed on clerk
+post-v0.13.61 (screenshot evidence).
+
+**1. Literal `<i>` HTML tags in DM drafts.**
+`gateway.ts:drainActivitySummary` sent `<i>${summary}</i>` to
+`sendMessageDraft` without `parse_mode='HTML'`, so Telegram rendered
+the angle brackets literally — user saw `<i>Ran a command,
+dispatched a sub-agent</i>` instead of italicized text. The sibling
+sendMessage and editMessageText branches in the same function
+already pass HTML; the draft branch was the outlier. Wrapper
+signature extended to accept the option; the drain callsite passes
+it. `clearActivitySummary`'s empty-text draft still passes no
+parse_mode (correct — empty text needs none).
+
+**2. "Used 2 tools" generic fallback for recognised MCP tools.**
+`tool-activity-summary.ts:verbForTool` mapped only the standard
+built-in tools (Read, Bash, Grep, …) to specific past-tense verbs;
+everything else — including `mcp__hindsight__reflect`,
+`mcp__google-workspace__*`, claude.ai integrations — fell through to
+the generic `"used"` verb → "Used 2 tools". The pre-tool hook
+label table (`hooks/tool-label-pretool.mjs`) already maps these to
+nice strings like `"Searching memory"`; the activity-summary
+builder was unaware. Now:
+
+- `mcp__hindsight__recall|reflect` → "searched" → "ran a search"
+- `mcp__hindsight__retain|update_memory|sync_retain` → new `"saved"`
+  verb → "saved a memory"
+- `mcp__google-workspace__*` and claude.ai variants: read-shaped
+  (search/list/query/read/get/fetch/download) → "searched";
+  write-shaped (create/update/write/send/move/copy/duplicate) →
+  "edited"
+- `mcp__notion__*` / `mcp__claude_ai_Notion__notion-*`: same split
+
+Unrecognised future MCP tools still fall through to `"used"` — the
+generic fallback is the right answer for unknown tools.
+
+Also fixes the MCP-name regex: `[^_]+` → `(.+?)` (lazy match) so
+server names with underscores (`claude_ai_Gmail`,
+`claude_ai_Google_Drive`) parse correctly, and lowercases the
+server segment so mixed-case claude.ai names match.
+
+**3. Raw `mcp__server__tool` leaking into silence-poke fallback.**
+`silence-poke.ts:formatFrameworkFallbackText` concatenated both the
+raw tool name AND the human label:
+`running mcp__hindsight__reflect Searching memory for 46s`. Now when
+an MCP-shaped name (`^mcp__`) has a label, drop the name and lead
+with the label: `Searching memory for 46s`. Built-in tool names
+(Grep, Read, Bash) are already human-readable so they keep the
+prior `running ${name} ${label}` shape — regression-guarded by a
+new test.
+
+### Test plan
+- tool-activity-summary.test.ts: 21 pass (2 updated, 1 added)
+- silence-poke.test.ts: 70 pass (3 added)
+- tsc / plugin-references / bot-api-wrapping lints clean
+- Full vitest: 8027/8027 pass
+
+(#1942)
+
 ## v0.13.61 — turn-pacing v3: stop telling the model to ack
 
 Live UX regression observed on clerk 2026-05-28 after Option B rolled
