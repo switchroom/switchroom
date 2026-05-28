@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.13.61 — turn-pacing v3: stop telling the model to ack
+
+Live UX regression observed on clerk 2026-05-28 after Option B rolled
+(v0.13.59/60): user saw multiple persistent "on it…" / "good question
+— one sec" / "let me dig in" chat messages preceding every tool-using
+turn's actual answer. The PreToolUse gate was correctly stripped in
+v0.13.59 — but the prompt-side `turn-pacing` UserPromptSubmit
+directive still told the model to call reply with an ack BEFORE any
+other tool call. The model was complying. Net: same chat clutter,
+prompt-driven instead of hook-driven.
+
+This release rewrites the directive (v3). Tells the model:
+  - NOT to call reply with placeholder acks ("on it" et al.)
+  - The framework already surfaces activity via the compose-area
+    draft preview (#1926, #1927)
+  - Reply only with substantive content: actual answers, real
+    questions, real mid-work milestones / pivots
+  - Trivial one-sentence answers still go via reply (they ARE the
+    answer)
+
+Single-file scaffold.ts change, no code paths. 266/266 scaffold tests
+pass.
+
+The 5-min framework_fallback wedges observed in the same session are
+extended-thinking turns — model goes silent internally with no
+tool_use / no text. Different problem class (#1918), structural
+ceiling, not addressed here.
+
 ## v0.13.60 — delete dead ack-first gate code (cleanup)
 
 Hygiene follow-up to v0.13.59. After ~1 hour of UAT confirmed no
