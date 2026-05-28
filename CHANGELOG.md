@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.14.5 — first-turn-after-restart fix (session-tail replays in-flight enqueue)
+
+### session-tail: replay an in-flight turn's enqueue on first attach (#1971)
+
+The first turn after **every agent restart** silently lost its
+`currentTurn`, so the **progress card, draft-mirror, and silence-poke**
+were all dead for that turn (the reply still landed; the per-turn UI did
+not). A pre-existing latent gap, surfaced while validating the
+draft-mirror.
+
+Root cause: the gateway sets `currentTurn` only from the `enqueue`
+session event (the sole event carrying the chatId). The bridge's
+session-tail emits `enqueue` when it reads the transcript's
+`queue-operation enqueue` line — but on first attach it seeks to EOF
+("only new events"). When the agent restarts mid-turn, or processes a
+spooled inbound during boot, that enqueue line is written *before* the
+tail attaches, so seek-to-EOF skips it → no `enqueue` → `currentTurn`
+never set.
+
+Fix: `computeFirstAttachCursor` does a bounded (1 MiB) tail scan on first
+attach and, if it finds an in-flight turn (the last `enqueue` with no
+`turn_duration` after it), replays from that enqueue's offset so the turn
+gets its `currentTurn`. Completed turns still seek to EOF — no history
+replay; re-attach (sub-agent file flips) is unchanged. Validated with
+runtime instrumentation on the test-harness canary (cold turn:
+`currentTurn=false` throughout → no draft; warm turn: `currentTurn=true`
+→ accumulating HTML draft) plus 5 deterministic unit tests.
+
+This also confirms the v0.14.3/v0.14.4 draft-mirror works correctly in
+steady state — the only failing case was this first-post-restart turn.
+
 ## v0.14.4 — draft-mirror determinism fix (sidecar subscribe race) + CI/doctor
 
 ### draft-mirror: replay sidecar history to late subscribers (#1969)
