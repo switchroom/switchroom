@@ -12,15 +12,12 @@ relates: #709 #776 #782 #788 #64 #757
 The frontmatter previously read `rfc — draft, awaiting sign-off`; that
 is stale. The verification work this RFC proposed **landed**: the UAT
 scenarios were written and run, and Bugs 1–5 in the changelog table
-below merged (#1057, #1059, #1060, #1063, #1066). Five of six
-acceptance assertions pass. Treat this RFC as **closed** — its purpose
-(prove the background-dispatch path with a regression-locked test) is
-done. Two narrow defects remain open as ordinary tracked follow-ups,
-**not** as RFC-blocking work: Bug 6 (bg `sub_agent_turn_end` never
-fires for some Claude Code bg dispatches → card can stay on 🌀
-Background until the heartbeat ceiling) and Bug 7 (driver-side
-parent-tool-use correlation race). They have their own diagnoses in
-§"Bug 6 diagnosis" below.
+below merged (#1057, #1059, #1060, #1063, #1066). Treat this RFC as
+**closed** — its purpose (prove the background-dispatch path with a
+regression-locked test) is done. Bug 6 and Bug 7 are moot. The
+progress-card-driver was deleted in PR #1122 PR3 before these could be
+fixed. The cross-turn visibility problem they addressed is now handled
+by pending-work-progress.ts (#1445) and subagent-handback (#1720).
 
 > **Card model superseded.** This RFC reasons about the *two-zone*
 > progress-card model from `reference/status-card-design.md`. That
@@ -80,11 +77,7 @@ One root cause family, four symptom reports. Treat as one epic.
 What's already wired (verified by reading on `main` 2026-05-12):
 
 - `telegram-plugin/fleet-state.ts` — `FleetMember` with `isBackgroundDispatch` flag (line 48). `hasLiveBackground(fleet)` predicate.
-- `telegram-plugin/progress-card-driver.ts:1855,1921` — driver registers fleet members on `sub_agent_started`, derives bg flag from parent's `Agent` tool_use args (`run_in_background: true` → `cs.backgroundParentToolUseIds` correlation).
-- `telegram-plugin/progress-card-driver.ts:1108` — deferred-completion gate: `if (hasLiveBackground(cs.fleet)) return`. Card stays pinned past parent `turn_end`.
-- `telegram-plugin/two-zone-card.ts` — fleet zone renders every member (cap 5 + "N more"). Header phase resolver yields 🌀 Background when parent done + fleet still running (PR #1039).
-- `telegram-plugin/subagent-watcher.ts` — 1Hz JSONL polling, drives `sub_agent_tool_use` → fleet member's `lastTool`/`lastActivityAt` updates.
-- Heartbeat re-flushes the card every N seconds while live, so the elapsed counter ticks.
+- `telegram-plugin/subagent-watcher.ts` — 1Hz JSONL polling. Writes sub-agent activity to a SQLite DB (`bumpSubagentActivity`, `recordSubagentStall`); used by subagent-handback and pending-work-progress paths. No longer drives a FleetMember data model (that belonged to the deleted progress-card-driver).
 
 What's NOT wired (the missing piece this RFC closes):
 
@@ -106,9 +99,9 @@ Numbered ACs — each maps 1:1 to a UAT scenario in §Scenarios:
 
 - **AC-3** — *Live activity.* While the bg sub-agent is running, the card edits MUST land at ≥ 1 edit per 30 s wall-clock as the worker fires tools — i.e. the elapsed counter visibly advances and the fleet row's `last activity` age stays fresh.
 
-- **AC-4** — *Stuck escalation.* If a fleet member emits no JSONL event for > 60 s, its row glyph flips from ↻ to ⚠ with label `idle <duration>`. If every running member is stuck, header escalates to ⚠ Stalled. Any subsequent JSONL event de-escalates.
+- **AC-4** — *Stuck escalation.* [Moot — the progress card that would have rendered these glyphs was deleted in PR #1122 PR3. Stall detection still fires in `subagent-watcher.ts` but has no user-visible rendering surface. See issue #1445 for the cross-turn replacement.]
 
-- **AC-5** — *Heavy fleet HTML safety.* 6+ parallel sub-agents — render output is balanced HTML, < 4096 bytes, fleet zone caps at 5 rows + `+ N more`. No `<blockquote>` 400 in the gateway log.
+- **AC-5** — *Heavy fleet HTML safety.* [Moot — the fleet zone renderer (`two-zone-card.ts`) was deleted in PR #1122 PR3. No fleet HTML is currently sent to Telegram.]
 
 - **AC-6** — *Originating-turn pinning.* If a new parent turn starts while a bg sub-agent from the prior turn is still running, the prior turn's card stays pinned and live-updating. The new turn gets its own card. Cards do not get cross-wired.
 
@@ -283,14 +276,7 @@ The TDD scenario from Phase 2 (`bg-sub-agent-dispatch-dm.test.ts`) ran end-to-en
 | 6 | bg sub-agent's `sub_agent_turn_end` never fires → defer-gate never releases → card stuck on 🌀 Background until 30-min heartbeat ceiling | — | **open** |
 | 7 | Driver-side `cs.backgroundParentToolUseIds.has(parentToolUseId)` returns false at `sub_agent_started` time despite tool_use adding it earlier in the same turn → fleet member stays `status: 'running'` instead of `'background'` | — | **open** |
 
-After Bugs 1–5 merged + the agent image rebuilt + apply re-run, **five of six assertions pass** in the UAT scenario:
-
-- ✅ AC-1: card stays pinned past parent reply.
-- ✅ AC-2 negative: header is 🌀 Background (not ✅ Done) while bg runs.
-- ✅ AC-3: card body changes within 6s heartbeat tick.
-- ✅ Correlation: log shows `correlated=yes parentToolUseId=…` instead of pre-fix `correlated=orphan pendingSpawns=0`.
-- ❌ AC-2 positive: card never reaches ✅ Done within 120 s of bg finishing.
-- ⚠ Side-finding: `correlated=1 orphans=0 background=0` — fleet member registered correlated but NOT as background.
+The UAT scenario (`bg-sub-agent-dispatch-dm.test.ts`) tests a pinned progress card that was deleted in PR #1122 PR3. The scenario's `expectPinnedCard`/`waitForCardPhase` assertions would fail immediately in a live run because no pinned card is ever produced. The scenario file documents this as currently red.
 
 ### Bug 6 diagnosis
 
@@ -307,6 +293,8 @@ The watcher saw the bg worker's JSONL, backfilled the DB-row link (Bug 2's fix w
 The hypothesis: Claude Code's bg `Agent` dispatches write a JSONL that doesn't end with a `sub_agent_turn_end` line — the worker's last line is just the final `sub_agent_tool_result` (or analogous), then the file stops growing. The watcher's terminal-detection logic in `telegram-plugin/subagent-watcher.ts:498` only flips state to `'done'` when it sees an explicit `sub_agent_turn_end` event in the JSONL. With no such line, the worker is forever "running" from the gateway's view; only the 30-min `maxIdleMs` heartbeat ceiling eventually force-closes the card.
 
 Phase 6 fix candidates:
+
+Note: the stall-terminal synthesis (Bug 6 option 1) was wired into `gateway.ts` (`onStallTerminal`) but `progressDriver?.ingest(...)` no-ops because `progressDriver` is null. This fix path has no user-visible effect and the open "Bug 6" question is moot.
 
 1. **Watcher infers `sub_agent_turn_end` from stall + JSONL-not-growing.** Simplest. After the stall escalation already fires at 60 s, add a follow-up timer (e.g. 30 s post-stall) that synthesises a `sub_agent_turn_end` event for the gateway. Risk: false-positive completion if Claude Code's bg dispatch was genuinely paused and not done.
 2. **Watcher reads the bg dispatch's terminal record from a sibling file** (e.g. `<agentId>.result.json` if Claude Code writes one). Need to verify the on-disk shape Claude Code uses for bg completion.
@@ -329,9 +317,11 @@ Alternative quick fix: derive `isBackgroundDispatch` from the *reducer's* state 
 
 ## Where to pick up next session
 
-1. Reproduce: `bun test telegram-plugin/uat/scenarios/bg-sub-agent-dispatch-dm.test.ts` (after `sed -i 's/describe.skip(/describe(/' …` on the file). Verifies 5/6 still passing.
-2. Bug 6: read a recent bg worker's terminal JSONL; confirm no `sub_agent_turn_end` line is written. Implement option 1 (post-stall terminal synthesis).
-3. Bug 7: deploy the diagnostic stderr patch, capture one bg-dispatch run, read the trace. Pick fix based on what the Set actually contains. Most likely: derive bg-flag from `pendingAgentSpawn.runInBackground` so the driver doesn't need its own Set at all.
-4. When AC-2-positive goes green: drop the `.skip` in the UAT scenario, close #709 / #776 / #782 / #788 with a link to the now-passing test.
+Note: the progress-card-driver was deleted in PR #1122 PR3. The steps below are preserved as historical context but the Bug 6 / Bug 7 fix paths are moot. Cross-turn visibility is now handled by `pending-work-progress.ts` (#1445) and subagent-handback (#1720).
+
+1. ~~Reproduce: `bun test telegram-plugin/uat/scenarios/bg-sub-agent-dispatch-dm.test.ts` (after `sed -i 's/describe.skip(/describe(/' …` on the file). Verifies 5/6 still passing.~~ (Moot — scenario tests deleted card infrastructure, will fail immediately.)
+2. ~~Bug 6: read a recent bg worker's terminal JSONL; confirm no `sub_agent_turn_end` line is written. Implement option 1 (post-stall terminal synthesis).~~ (Moot — see Bug 6 note above.)
+3. ~~Bug 7: deploy the diagnostic stderr patch, capture one bg-dispatch run, read the trace. Pick fix based on what the Set actually contains. Most likely: derive bg-flag from `pendingAgentSpawn.runInBackground` so the driver doesn't need its own Set at all.~~ (Moot — `progress-card-driver` deleted.)
+4. ~~When AC-2-positive goes green: drop the `.skip` in the UAT scenario, close #709 / #776 / #782 / #788 with a link to the now-passing test.~~ (Moot.)
 
 TDD inverts that: red test → minimum diff to green → test locks the contract. The 2026-05-07 incident is the test we never wrote.
