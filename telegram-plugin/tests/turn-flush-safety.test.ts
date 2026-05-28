@@ -17,8 +17,56 @@ import { describe, it, expect } from 'vitest'
 import {
   decideTurnFlush,
   isSilentFlushMarker,
+  isCompositeSilentNoise,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
+
+describe('isCompositeSilentNoise — Stop-hook re-prompt leak backstop', () => {
+  it('suppresses the observed leak "Sent.\\nNO_REPLY\\nNO_REPLY"', () => {
+    expect(isCompositeSilentNoise('Sent.\nNO_REPLY\nNO_REPLY')).toBe(true)
+  })
+  it('suppresses repeated bare markers and marker+confirmation variants', () => {
+    expect(isCompositeSilentNoise('NO_REPLY\nNO_REPLY')).toBe(true)
+    expect(isCompositeSilentNoise('Done\nNO_REPLY')).toBe(true)
+    expect(isCompositeSilentNoise('NO_REPLY\nHEARTBEAT_OK')).toBe(true)
+  })
+  it('requires at least one real marker — standalone confirmations still flush', () => {
+    // Conservative: no NO_REPLY/HEARTBEAT_OK present → NOT suppressed here,
+    // so we never silently drop a turn that wasn\'t already signalling silence.
+    expect(isCompositeSilentNoise('Sent.')).toBe(false)
+    expect(isCompositeSilentNoise('Done.\nOK')).toBe(false)
+  })
+  it('does NOT suppress real content glued to a marker', () => {
+    expect(
+      isCompositeSilentNoise('Here is the summary of the page.\nNO_REPLY'),
+    ).toBe(false)
+    expect(isCompositeSilentNoise('NO_REPLY\nThe answer is 42.')).toBe(false)
+  })
+  it('handles non-strings / empty safely', () => {
+    expect(isCompositeSilentNoise(undefined)).toBe(false)
+    expect(isCompositeSilentNoise('')).toBe(false)
+    expect(isCompositeSilentNoise('   \n  ')).toBe(false)
+  })
+})
+
+describe('decideTurnFlush — composite silent noise is skipped, not leaked', () => {
+  it('skips "Sent.\\nNO_REPLY\\nNO_REPLY" (the live clerk/test-harness leak)', () => {
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: ['Sent.', 'NO_REPLY', 'NO_REPLY'],
+    })
+    expect(d).toEqual({ kind: 'skip', reason: 'silent-marker' })
+  })
+  it('still flushes genuine trailing answer text', () => {
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: ['The page summarises three news stories.'],
+    })
+    expect(d.kind).toBe('flush')
+  })
+})
 
 describe('decideTurnFlush', () => {
   it('(a) does NOT flush when the reply tool was called', () => {

@@ -50,6 +50,48 @@ export function isSilentFlushMarker(text: string | undefined): boolean {
   return SILENT_MARKERS.has(trimmed.toUpperCase())
 }
 
+// Trivial end-of-turn confirmations the model emits as terminal text after
+// calling reply (e.g. "Sent." once the reply tool returns). On their own
+// they're harmless; the danger is when they're glued to silent markers
+// across Stop-hook re-prompt cycles into a composite blob like
+// "Sent.\nNO_REPLY\nNO_REPLY" — which `isSilentFlushMarker` can't match
+// (multi-line, over the length guard) so it leaks to chat. See
+// `isCompositeSilentNoise`.
+const TRIVIAL_CONFIRMATIONS = new Set(['SENT', 'DONE', 'OK', 'OKAY', 'ACK'])
+
+function isTrivialConfirmationLine(line: string): boolean {
+  let t = line.trim()
+  if (t.length === 0 || t.length > 8) return false
+  if (/\W$/.test(t)) t = t.slice(0, -1) // strip a single trailing punct ("Sent.")
+  return TRIVIAL_CONFIRMATIONS.has(t.toUpperCase())
+}
+
+/**
+ * Recognise a multi-line composite that is *entirely* silent noise — every
+ * non-empty line is a silent marker (NO_REPLY / HEARTBEAT_OK) or a trivial
+ * confirmation ("Sent."), AND at least one line is a real silent marker.
+ *
+ * Backstop for the Stop-hook re-prompt leak: the model replies cleanly,
+ * emits a terminal "Sent.", gets re-prompted by the silent-end Stop hook,
+ * answers "NO_REPLY" one or more times, and the accumulated `capturedText`
+ * ("Sent.\nNO_REPLY\nNO_REPLY") flushes as a visible message because
+ * `isSilentFlushMarker` only matches a single sentinel. Requiring ≥1 hard
+ * marker keeps this conservative — a standalone "Sent." (no NO_REPLY) is NOT
+ * suppressed here, so we never silently drop a turn that wasn't already
+ * signalling "nothing to add".
+ */
+export function isCompositeSilentNoise(text: string | undefined): boolean {
+  if (typeof text !== 'string') return false
+  const lines = text
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+  if (lines.length === 0) return false
+  const hasMarker = lines.some(l => isSilentFlushMarker(l))
+  if (!hasMarker) return false
+  return lines.every(l => isSilentFlushMarker(l) || isTrivialConfirmationLine(l))
+}
+
 export type FlushDecision =
   | { kind: 'flush'; text: string }
   | { kind: 'skip'; reason: FlushSkipReason }
@@ -115,6 +157,11 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   const joined = input.capturedText.join('\n').trim()
   if (joined.length === 0) return { kind: 'skip', reason: 'empty-text' }
   if (isSilentFlushMarker(joined)) return { kind: 'skip', reason: 'silent-marker' }
+  // Composite silent noise — e.g. "Sent.\nNO_REPLY\nNO_REPLY" accumulated
+  // across Stop-hook re-prompt cycles. The single-sentinel check above
+  // misses it (multi-line, over the length guard); without this the blob
+  // leaks to chat as a visible message.
+  if (isCompositeSilentNoise(joined)) return { kind: 'skip', reason: 'silent-marker' }
   return { kind: 'flush', text: joined }
 }
 
