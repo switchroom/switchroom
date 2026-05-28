@@ -57,8 +57,18 @@ import {
   applyAndSave as saveBootIssueCache,
   type ProbeDiffMap,
 } from './boot-issue-cache.js'
+import {
+  loadSnapshot as loadConfigSnapshot,
+  persistSnapshot as persistConfigSnapshot,
+  captureConfigSnapshot,
+  diffSnapshots as diffConfigSnapshots,
+  renderConfigChangeDim,
+  type ConfigSnapshot,
+  type ConfigDiff,
+} from './config-snapshot.js'
 import { join } from 'path'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
+import { resolveAgentConfig as _resolveAgentConfig } from '../../src/config/merge.js'
 
 // ─── Persona name resolution ─────────────────────────────────────────────────
 
@@ -298,6 +308,16 @@ export interface RenderBootCardOpts {
    *  the operator sees what happened with the update that triggered
    *  this boot without trawling the audit log. */
   updateOutcomeLine?: string
+  /**
+   * Config-change dimensions detected since the previous boot.
+   * One row per changed field (model, tools, skills, memory backend).
+   * Empty array / undefined = no config changes → section is silent,
+   * preserving the "silent-when-healthy" boot card contract.
+   *
+   * Computed by diffing the current config snapshot against the
+   * persisted snapshot from the prior boot. See `config-snapshot.ts`.
+   */
+  configChanges?: ConfigDiff
 }
 
 /**
@@ -403,6 +423,17 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     ? renderAuthLine(opts.accounts, agentName, (opts.now ?? new Date()).getTime())
     : []
 
+  // Config-change rows (E3: boot card surfaces config changes since last boot).
+  // Only rendered when the diff is non-empty — silent on identical boots.
+  // Each changed dimension gets its own row; model and memory backend show
+  // verbatim before/after; tools and skills show a coarse hash-diff hint.
+  const configChangeRows: string[] = []
+  if (opts.configChanges && opts.configChanges.length > 0) {
+    for (const dim of opts.configChanges) {
+      configChangeRows.push(renderConfigChangeDim(dim))
+    }
+  }
+
   const sections: string[] = [ack]
   if (degradedRows.length > 0) sections.push('', ...degradedRows)
   if (accountRows.length > 0) sections.push('', ...accountRows)
@@ -411,6 +442,9 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     // sections array so the join('\n') below renders the multi-line
     // failure-with-recovery hint cleanly.
     sections.push('', ...opts.updateOutcomeLine.split('\n'))
+  }
+  if (configChangeRows.length > 0) {
+    sections.push('', ...configChangeRows)
   }
   if (sections.length === 1) return ack
   return sections.join('\n')
@@ -520,6 +554,20 @@ export interface RunProbesOpts {
    *  failure body with a recovery hint. Append-only — never replaces
    *  the existing ack/probe sections. */
   updateOutcomeLine?: string
+  /**
+   * Path to the per-agent config snapshot file.  When set, the post-settle
+   * render diffs the current resolved config against the persisted snapshot
+   * from the prior boot and appends a row per changed dimension (model,
+   * tools allowlist, skills, memory backend).
+   *
+   * Omit to disable config-change detection entirely (legacy behaviour /
+   * test harnesses that don't need it).
+   *
+   * Typically `<agentDir>/.config-snapshot.json`.  Must be provided
+   * alongside `agentName` — the capture function reads `agentName` to
+   * resolve the default memory collection label.
+   */
+  configSnapshotPath?: string
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -670,6 +718,53 @@ export async function startBootCard(
           }
         }
 
+        // Config-snapshot diff (E3): compare this boot's resolved config
+        // against the snapshot persisted on the previous boot. Fires once
+        // per gateway lifetime — read up-front, write on the way out.
+        // Silent on first boot (no prior snapshot) and on identical boots.
+        let configChanges: ConfigDiff = []
+        if (opts.configSnapshotPath) {
+          try {
+            const agentSlug = opts.agentSlug ?? opts.agentName
+            const agentName = process.env.SWITCHROOM_AGENT_NAME ?? agentSlug
+            let currentCfg: ConfigSnapshot | undefined
+            try {
+              const loaded = _loadSwitchroomConfig()
+              const rawAgent = loaded.agents?.[agentName] ?? {}
+              const resolved = _resolveAgentConfig(loaded.defaults, loaded.profiles, rawAgent)
+              currentCfg = captureConfigSnapshot({
+                agentName,
+                model: resolved.model,
+                toolsAllow: resolved.tools?.allow,
+                skills: resolved.skills,
+                memoryCollection: resolved.memory?.collection,
+              })
+            } catch {
+              // Config unreadable (test env, no switchroom.yaml) — skip diff.
+            }
+            if (currentCfg != null) {
+              const previousSnapshot = loadConfigSnapshot(opts.configSnapshotPath)
+              configChanges = diffConfigSnapshots(currentCfg, previousSnapshot)
+              // Persist unconditionally so the next boot always has a
+              // fresh baseline. A failed persist is non-fatal.
+              persistConfigSnapshot(opts.configSnapshotPath, currentCfg)
+              if (configChanges.length > 0) {
+                logger(
+                  `telegram gateway: boot-card: config-snapshot diff detected ${configChanges.length} change(s): ${
+                    configChanges.map(d => d.field).join(', ')
+                  }\n`,
+                )
+              }
+            }
+          } catch (snapErr: unknown) {
+            logger(
+              `telegram gateway: boot-card: config-snapshot diff failed: ${
+                (snapErr as Error)?.message ?? String(snapErr)
+              }\n`,
+            )
+          }
+        }
+
         // Render with current probe state and edit if anything changed.
         let currentText = renderBootCard({
           agentName: opts.agentName,
@@ -682,6 +777,7 @@ export async function startBootCard(
           ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
           ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
           ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
+          ...(configChanges.length > 0 ? { configChanges } : {}),
         })
 
         if (currentText !== ackText) {
@@ -734,6 +830,10 @@ export async function startBootCard(
             ...(resolvedRows.length > 0 ? { resolvedRows } : {}),
             ...(snoozeRows.length > 0 ? { snoozeRows } : {}),
             ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
+            // Config-change rows are stable for the lifetime of this card
+            // (computed once in Phase 1). Pass them through unchanged so
+            // the live-agent-status edits keep the config-diff rows.
+            ...(configChanges.length > 0 ? { configChanges } : {}),
           })
 
           if (updatedText === currentText) continue
