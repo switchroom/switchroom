@@ -1,0 +1,365 @@
+unit_id: jtbd-idempotent-update-and-restart
+unit_path: reference/idempotent-update-and-restart.md
+category: jtbd
+audited_at: 2026-05-26T10:00:00Z
+auditor_notes: |
+  Key structural finding: the JTBD was written before `switchroom update` existed
+  (PR #918). The JTBD describes the upgrade flow as three separate commands
+  (`switchroom apply` + `docker compose pull` + `docker compose up -d
+  --remove-orphans`). The shipped CLI wraps all of that (plus hostd refresh,
+  skill sync, and doctor) into a single `switchroom update` verb. Every place
+  the JTBD says "the upgrade flow" names the old three-command incantation.
+  This is drift-minor in many claims (behavior correct, surface description
+  stale) and drift-major in the "Signs it's working" section where it explicitly
+  names that three-command set as the canonical surface.
+
+  The "stale dependency" worked example (L141-L149) says doctor compares the
+  host claude against "the version baked into the running agent image." The
+  implementation compares host claude against `dependencies.json` (the
+  manifest), not by querying the container image. The practical outcome is
+  similar but the mechanism is materially different from the description.
+  No code path does a `docker exec ... claude --version` to read the in-image
+  version.
+
+  The `switchroom update` command already includes `refresh-hostd` (pull +
+  recreate the hostd daemon container) and `sync-bundled-skills` steps,
+  bringing the actual fleet of pieces updated in one command beyond what
+  the JTBD's frontmatter outcome lists ("CLI, agent containers, broker,
+  kernel, scheduler, MCP servers, memory backend" — missing: hostd, skills
+  pool).
+
+  Session continuity / escape hatch: the schema has `session_continuity.resume_mode`
+  with a `"none"` value (completely fresh every time) and `enabled: false`.
+  This is the escape hatch the JTBD calls for. It is present and documented
+  in the schema. `docs/architecture.md` and `docs/session-optimization.md`
+  document it. The JTBD itself does not name this config option, which is
+  acceptable at outcome level but worth noting.
+
+findings:
+  - claim_id: c1
+    quote: "After the upgrade flow finishes (`switchroom apply` + `docker compose pull` + `docker compose up -d --remove-orphans`), the entire stack — CLI, agent containers, broker, kernel, scheduler, MCP servers, memory backend — is at the version switchroom declared and tested as a unit."
+    loc: L3
+    verdict: drift-major
+    evidence:
+      - path: src/cli/update.ts
+        lines: L1-L36
+        snippet: "`switchroom update` wraps pull-images, apply-config, refresh-hostd, sync-bundled-skills, stamp-restart-marker, recreate-containers, and doctor into one command (PR #918). The three-command incantation in the JTBD is the pre-#918 flow."
+      - path: src/cli/update.ts
+        lines: L296-L338
+        snippet: "refresh-hostd step: pulls latest hostd image + recreates the daemon container (separate compose project). hostd is not mentioned in the JTBD's stack list."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The canonical upgrade surface since PR #918 is `switchroom update`, not
+      the three-command incantation. The JTBD frontmatter outcome names the
+      stale command sequence. The stack list also omits hostd (refresh-hostd
+      step) and the skills pool (sync-bundled-skills step). The outcome
+      description should name `switchroom update` as the command and add hostd
+      to the stack list. Proposed replacement for the frontmatter `outcome:`
+      field: "After running `switchroom update`, the entire stack — CLI, agent
+      containers, broker, kernel, scheduler, hostd, MCP servers, bundled skills,
+      memory backend — is at the version switchroom declared and tested as a unit.
+      After any restart, the agent comes back with fresh code, fresh MCP servers,
+      fresh settings, and intact context. The user does not lose their thread."
+
+  - claim_id: c2
+    quote: "The user runs the upgrade flow (`switchroom apply` + `docker compose pull` + `docker compose up -d --remove-orphans`)."
+    loc: L9-L11
+    verdict: drift-major
+    evidence:
+      - path: src/cli/update.ts
+        lines: L882-L944
+        snippet: "registerUpdateCommand registers `switchroom update` as the canonical single-step upgrade command, described as 'pull images, refresh scaffolds, recreate containers. Wraps the full pull && apply && up -d flow.'"
+      - path: CLAUDE.md
+        lines: L749-L760
+        snippet: "### Operator update — `switchroom update` ... switchroom update  # pull images + apply + recreate + doctor"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      The body of the JTBD still opens with the three-command incantation that
+      predates `switchroom update`. The shipped surface is a single command.
+      The entire opening paragraph should be rewritten to describe
+      `switchroom update` as the primary flow, with the underlying mechanics
+      (pull, apply, up -d) mentioned as what it orchestrates.
+
+  - claim_id: c3
+    quote: "switchroom is a release, not a moving target. A version of switchroom pins a tested matrix of agent / broker / kernel / scheduler images, the claude CLI baked into the agent image, playwright/mcp, hindsight, and every other moving piece."
+    loc: L22-L28
+    verdict: aligned
+    evidence:
+      - path: dependencies.json
+        lines: L1-L18
+        snippet: "Manifest pins switchroom_version, bun, node, claude CLI, playwright_mcp, hindsight.backend/client, vault_broker.protocol."
+      - path: src/manifest.ts
+        lines: L1-L8
+        snippet: "Pinned dependency manifest (BOM)... records the exact versions that were tested together so that `switchroom doctor` can detect when installed versions have drifted."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The BOM concept is fully implemented via `dependencies.json` and
+      `src/manifest.ts`. The manifest pins the exact versions tested together.
+      Minor note: "scheduler images" (Dockerfile.scheduler was retired in Phase 4)
+      — the scheduler is now in-container as a sibling process, not a separate
+      image. But at the JTBD level "scheduler images" can be read broadly as
+      the agent image that contains the scheduler bundle, so no correction needed
+      at outcome level.
+
+  - claim_id: c4
+    quote: "The version reported by the CLI matches the version actually loaded into every running process. `switchroom doctor` confirms with a green check."
+    loc: L37-L38
+    verdict: drift-minor
+    evidence:
+      - path: src/cli/doctor.ts
+        lines: L2380-L2418
+        snippet: "checkManifestDrift returns ok check with status 'ok' (green glyph) when all versions match, and drift items with status 'fail'/'warn' when they don't. The status ok glyph is chalk.green('checkmark')."
+      - path: src/cli/doctor-status.ts
+        lines: L29-L42
+        snippet: "statusGlyph('ok') returns chalk.green('checkmark'). The doctor renders per-check status glyphs, not a single fleet-level green."
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      Doctor does emit green checkmarks per passing check. However, the claim
+      implies a single "fleet is consistent" green check, whereas the actual
+      doctor runs ~20 sections and emits per-check status. The phrase "confirms
+      with a green check" is close enough to be minor drift rather than major,
+      but "no failures reported by `switchroom doctor`" would be more accurate
+      than "confirms with a green check."
+
+  - claim_id: c5
+    quote: "A user can re-run `switchroom apply` + `docker compose up -d` and `switchroom agent restart` any number of times, in any order, and end up in the same valid state every time."
+    loc: L39-L42
+    verdict: drift-minor
+    evidence:
+      - path: src/cli/update.ts
+        lines: L448-L465
+        snippet: "recreate-containers step runs `docker compose up -d --remove-orphans`. Comment: 'Up-d is cheap and idempotent — if nothing changed it's a no-op (#923 reviewer feedback).'"
+      - path: src/cli/apply.ts
+        lines: L627-L640
+        snippet: "runApply: 'Ordering matters: scaffold first (so compose-generation sees a well-formed agents directory), compose write second.' apply is idempotent."
+    evidence_strength: strong
+    action: update-text
+    confidence: medium
+    rationale: |
+      The idempotency claim is correct. The surface reference is stale: the
+      JTBD names `switchroom apply` + `docker compose up -d` as the canonical
+      form, while the shipped single-command equivalent is `switchroom update`
+      (which also wraps `switchroom agent restart` via reconcile). The fix is
+      to acknowledge `switchroom update` as the idempotent form, with
+      `switchroom apply` + `docker compose up -d` as an equivalent sub-flow
+      operators can still run directly.
+
+  - claim_id: c6
+    quote: "After a restart, the agent's first response demonstrates it knows what was happening — references the user's last message, today's calendar, an in-flight task — without being prompted."
+    loc: L43-L45
+    verdict: aligned
+    evidence:
+      - path: src/cli/handoff.ts
+        lines: L1-L103
+        snippet: "`switchroom handoff <agent>` builds `.handoff.md` and `.handoff-topic` sidecars from the most recent session JSONL. Invoked by the Stop hook and start.sh lazy fallback."
+      - path: src/config/schema.ts
+        lines: L364-L407
+        snippet: "SessionContinuitySchema with resume_mode 'handoff' (default) assembles briefing from recent Telegram messages, Hindsight recall, and today's daily memory file."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The session continuity / handoff briefing feature is implemented and
+      ships by default (resume_mode defaults to 'handoff' as of PR #362).
+      The briefing includes recent messages and Hindsight recall. The claim
+      is accurate at outcome level.
+
+  - claim_id: c7
+    quote: "After a restart, every MCP server that the agent's `settings.json` declares is actually loaded."
+    loc: L46-L48
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L1192-L1202
+        snippet: "scaffold writes settings.json including mcp_servers entries (minus opt-outs). reconcileAgent re-renders settings.json before each restart."
+      - path: src/cli/agent.ts
+        lines: L500-L560
+        snippet: "reconcileAndRestartAgent: reconcile runs before restart. 'Why reconcile before every restart? Restart was historically a pure restart ... across restarts and silently rotted.'"
+    evidence_strength: strong
+    action: keep
+    confidence: medium
+    rationale: |
+      Reconcile before restart ensures settings.json is current at boot.
+      Whether every MCP server *successfully* loads at runtime depends on
+      the MCP process lifecycle (npx stalls, crashes) which is outside
+      switchroom's control. The JTBD "Signs it's not" section already
+      acknowledges MCP server failures (L81-L84). At the surface level the
+      claim is about settings being current, which is well-implemented.
+
+  - claim_id: c8
+    quote: "Drift between declared and installed versions is surfaced loudly. If someone manually upgrades claude CLI or bun outside `switchroom update`, `switchroom doctor` flags it before it causes a confusing bug."
+    loc: L53-L55
+    verdict: aligned
+    evidence:
+      - path: src/manifest.ts
+        lines: L257-L297
+        snippet: "detectDrift probes bun, node, and claude CLI versions and compares against the manifest. Major-version mismatch sets ok:false. Minor/patch drift is also reported."
+      - path: src/cli/doctor.ts
+        lines: L2369-L2418
+        snippet: "checkManifestDrift returns fail/warn results for each drift item with a fix message: 'Update <component> to match the manifest, or re-run switchroom update'."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The manifest-drift check in doctor is fully implemented. Drift on
+      required components (bun, node, claude CLI) produces fail-level results.
+      The claim is accurate.
+
+  - claim_id: c9
+    quote: "A small, fixed set of commands (`switchroom apply`, `docker compose pull`, `docker compose up -d --remove-orphans`) that do the right thing for the whole stack."
+    loc: L88-L90
+    verdict: drift-major
+    evidence:
+      - path: src/cli/update.ts
+        lines: L882-L888
+        snippet: "`switchroom update` description: 'Update switchroom on this host: pull images, refresh scaffolds, recreate containers. Wraps the full pull && apply && up -d flow.' This is the single command that does what the JTBD names as 3 commands."
+      - path: CLAUDE.md
+        lines: L749-L760
+        snippet: "`switchroom update` is the shipped single-command upgrade surface. The three-command incantation is never surfaced to operators except as 'what update wraps.'"
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      This is the surface-definition sentence in "What the user needs from the
+      surface." The shipped answer to this need is `switchroom update` (one
+      command). The JTBD should name `switchroom update` here, with the
+      individual steps noted as the underlying mechanics. Proposed replacement:
+      "A single command (`switchroom update`) that does the right thing for
+      the whole stack — pull new images, refresh scaffolds, recreate
+      containers, and run a post-bounce doctor sweep. Operators who want
+      finer control can still run `switchroom apply`, `docker compose pull`,
+      and `docker compose up -d --remove-orphans` individually."
+
+  - claim_id: c10
+    quote: "A way to see what's pinned for the current switchroom version, and what's actually installed, and any drift."
+    loc: L95-L97
+    verdict: aligned
+    evidence:
+      - path: src/cli/update.ts
+        lines: L564-L760
+        snippet: "`switchroom update --status` provides read-only snapshot: CLI version, image digest + pull time, container creation time per service."
+      - path: src/cli/doctor.ts
+        lines: L2369-L2418
+        snippet: "checkManifestDrift surfaces declared vs installed versions for all pinned components."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Two surfaces cover this need: `switchroom update --status` (image/container
+      ages) and `switchroom doctor` (manifest drift). Both are implemented.
+
+  - claim_id: c11
+    quote: "Continuity that doesn't depend on the underlying claude session surviving across restarts. Resume should be a feature of the switchroom layer (memory + handoff briefing + recent-message replay), not a side effect of `claude --continue` happening to succeed."
+    loc: L99-L103
+    verdict: aligned
+    evidence:
+      - path: src/config/schema.ts
+        lines: L383-L394
+        snippet: "resume_mode 'handoff' (default): 'never passes --continue; a fresh Claude starts each restart and reads a briefing assembled from recent Telegram messages, Hindsight recall, and today's daily memory file.'"
+      - path: src/cli/handoff.ts
+        lines: L1-L30
+        snippet: "handoff command builds .handoff.md from session JSONL; invoked by Stop hook. Pure + deterministic. No claude -p (RFC #1620)."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The default resume_mode is 'handoff' as of PR #362, explicitly implementing
+      this JTBD need. The briefing mechanism (handoff-summarizer.js, Stop hook,
+      start.sh lazy fallback) is independent of claude --continue.
+
+  - claim_id: c12
+    quote: "An escape hatch for opting out of automatic resume — useful when the user explicitly wants a clean slate, or when the prior session got into a confused state."
+    loc: L104-L106
+    verdict: aligned
+    evidence:
+      - path: src/config/schema.ts
+        lines: L383-L406
+        snippet: "resume_mode enum includes 'none': 'starts completely fresh every time.' Also session_continuity.enabled: false as a master switch."
+      - path: docs/architecture.md
+        lines: L64-L64
+        snippet: "The /reset and /new Telegram commands write a .force-fresh-session marker that start.sh consumes once to force a cold boot regardless of resume_mode."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The escape hatch exists at two levels: config (resume_mode: none or
+      enabled: false) for permanent opt-out, and /reset or /new Telegram
+      commands for one-shot clean slate. Both are implemented.
+
+  - claim_id: c13
+    quote: "Pull fetches the matched set of GHCR images at the new release tag; the rolling `up -d` replaces each agent + scheduler + broker container in turn."
+    loc: L113-L117
+    verdict: drift-minor
+    evidence:
+      - path: src/cli/update.ts
+        lines: L229-L243
+        snippet: "pull-images step: `docker compose -p switchroom -f <composePath> pull`. This pulls all compose services at once, not per-container."
+      - path: src/agents/compose.ts
+        lines: L1-L10
+        snippet: "compose.ts generates docker-compose.yml for the whole fleet under compose project 'switchroom'."
+    evidence_strength: medium
+    action: update-text
+    confidence: medium
+    rationale: |
+      "Rolling `up -d` replaces each agent + scheduler + broker container in
+      turn" — docker compose up -d does recreate on a per-service basis, but
+      it's not strictly serial ("rolling" suggests sequential). The scheduler
+      is now in-container (not a separate container), so "each agent + scheduler
+      + broker" misstates the container topology. The fix is to note that
+      `up -d --remove-orphans` recreates services whose image or compose config
+      changed, and that the in-container scheduler (not a separate container)
+      boots as a sibling process inside each agent.
+
+  - claim_id: c14
+    quote: "The user enables a new MCP server in `switchroom.yaml` and runs `switchroom agent reconcile`. The reconcile re-renders the agent's `settings.json` and restarts the agent."
+    loc: L133-L137
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L497-L560
+        snippet: "reconcileAndRestartAgent: reconcile re-renders per-agent files (settings.json, start.sh, .mcp.json), then restarts. reconcileAgent is called before every restart."
+      - path: src/cli/agent-reconcile.test.ts
+        lines: L1-L10
+        snippet: "Tests for reconcile verb exist."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `switchroom agent reconcile` is a real verb that re-renders settings.json
+      and (via reconcileAndRestartAgent) restarts the agent. The claim is
+      accurate.
+
+  - claim_id: c15
+    quote: "`switchroom doctor` detects the host's claude is far behind the version baked into the running agent image, flags the drift as informational, and offers a one-liner to upgrade the host CLI."
+    loc: L145-L149
+    verdict: drift-minor
+    evidence:
+      - path: src/manifest.ts
+        lines: L162-L172
+        snippet: "probeClaudeVersion() probes `claude --version` from the host PATH. detectDrift compares against manifest.claude.cli (from dependencies.json)."
+      - path: src/cli/doctor.ts
+        lines: L2391-L2416
+        snippet: "drift items for claude CLI: status 'fail' on major mismatch, 'warn' on minor. fix: 'Update <component> to match the manifest, or re-run switchroom update'. No one-liner to upgrade the host CLI specifically."
+    evidence_strength: strong
+    action: update-text
+    confidence: high
+    rationale: |
+      Two inaccuracies: (1) doctor compares host claude against `dependencies.json`
+      (the pinned manifest) — not against "the version baked into the running
+      agent image." No code path reads the claude version from inside a container.
+      (2) The drift item's `fix` message is "Update <component> to match the
+      manifest, or re-run `switchroom update`" — not a one-liner to upgrade
+      the host CLI specifically. The example should say doctor compares the
+      host claude version against the manifest's declared version and flags
+      drift; the fix message points at `switchroom update`. Proposed replacement:
+      "`switchroom doctor` detects that the host's claude version differs from
+      the version declared in the current switchroom manifest, flags the drift,
+      and tells the user to run `switchroom update` to realign."

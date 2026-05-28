@@ -1,0 +1,238 @@
+# drift-audit manifest
+#
+# Each unit is one file an audit agent will review. The pilot run
+# covers the 23 files in reference/ — the design contract surface
+# the operator flagged as drifting fastest.
+#
+# Schema (see scripts/drift-audit/schema/finding.schema.yaml for the
+# Phase 1 output schema):
+#
+#   id            kebab-case id, used as the findings filename
+#   path          repo-relative path to the file being audited
+#   category      one of: jtbd | contract | artefact-current
+#                          | rfc-shipped | rfc-draft | archived
+#                          | historical | docs | src-comments
+#   anchors_hint  optional: prose hint to the audit agent about which
+#                 claims are most worth verifying. The agent still
+#                 surveys the full file.
+
+run: pilot-2026-05-26
+scope: reference/ only (23 units)
+notes: |
+  Post-pilot, add units under docs/ (~15) and src/<module>/ comment
+  sweeps (~15). Use the same schema.
+
+units:
+
+  # ── Design contract (3) ────────────────────────────────────────
+  # Vision-authoritative. Audit checks whether code/JTBDs/docs
+  # contradict the contract, not the other way round. Any code-vs-
+  # contract conflict escalates.
+
+  - id: contract-vision
+    path: reference/vision.md
+    category: contract
+    anchors_hint: |
+      The four outcomes; "not a harness or wrapper"; "no API key, no
+      Agent SDK, no raw API"; the "What it isn't" table. Verify each
+      against shipped code: are there any code paths that violate the
+      stated constraints (e.g. claude -p callsites, SDK imports, second
+      channels)?
+
+  - id: contract-principles
+    path: reference/principles.md
+    category: contract
+    anchors_hint: |
+      The three checks (docs / defaults / consistency) and the "chat
+      IS the artifact" sub-principle. Examples cite specific CLI
+      verbs and behaviors — verify each example still reflects
+      shipped behavior. Are there ✅ examples that have regressed?
+
+  - id: contract-reference-readme
+    path: reference/README.md
+    category: contract
+    anchors_hint: |
+      The index table and JTBD groupings. Verify every JTBD listed
+      still exists and is still grouped under the right outcome.
+      Verify the "Use this directory cheaply" head-5 trick still
+      works for every JTBD (frontmatter present and structured).
+      Note: CLAUDE.md claims "13 outcome-focused jobs" but this README
+      appears to list 14 — verify the count and the discrepancy.
+
+  # ── JTBDs (14) ─────────────────────────────────────────────────
+  # Outcome-focused. Code is authoritative for whether the outcome
+  # is realized. JTBDs MUST stay non-technical — flag implementation
+  # leakage as too-technical drift.
+
+  - id: jtbd-run-a-fleet-of-specialists
+    path: reference/run-a-fleet-of-specialists.md
+    category: jtbd
+    anchors_hint: |
+      Outcome: one bot per specialist, persona/scope/memory/boundaries.
+      Verify against profiles/, src/agents/, telegram-plugin/
+      (per-agent token, per-agent topic).
+
+  - id: jtbd-feel-like-a-colleague
+    path: reference/feel-like-a-colleague.md
+    category: jtbd
+    anchors_hint: |
+      Asks before assuming, verifies before claiming, defers on
+      irreversible calls, matches user's energy. Verify against
+      profiles/_base/CLAUDE.md.hbs prompt, conversational-pacing
+      behavior, approval-kernel gating.
+
+  - id: jtbd-give-each-agent-its-own-workspace
+    path: reference/give-each-agent-its-own-workspace.md
+    category: jtbd
+    anchors_hint: |
+      Each agent has isolated working tree, switchroom owns lifecycle.
+      Verify against src/agents/workspace bootstrap, scaffold.ts,
+      docker per-agent UID model.
+
+  - id: jtbd-remember-across-sessions
+    path: reference/remember-across-sessions.md
+    category: jtbd
+    anchors_hint: |
+      Hindsight integration, mental model carries across restarts.
+      Verify against src/memory/, the Hindsight plugin wiring, the
+      claim in CLAUDE.md that "file-based MEMORY.md auto-memory is
+      disabled in favour of Hindsight."
+
+  - id: jtbd-extend-without-forking
+    path: reference/extend-without-forking.md
+    category: jtbd
+    anchors_hint: |
+      Configure, not edit. Verify against profiles/ (CLAUDE.md.hbs +
+      SOUL.md.hbs templates), config cascade (src/config/merge.ts),
+      `switchroom agent create --profile` path.
+
+  - id: jtbd-know-what-my-agent-is-doing
+    path: reference/know-what-my-agent-is-doing.md
+    category: jtbd
+    anchors_hint: |
+      Plain-language state, never silent. Verify against the
+      conversational pacing implementation (telegram-plugin/
+      stream-reply-handler.ts, card-format.ts) and the silence-poke
+      safety net. Note: the pinned progress card was retired in #1122
+      — JTBD must not still describe it as the mechanism.
+
+  - id: jtbd-restart-and-know-what-im-running
+    path: reference/restart-and-know-what-im-running.md
+    category: jtbd
+    anchors_hint: |
+      Boot/restart greeting that tells the user what's live. Verify
+      against the post-restart boot card flow, the wake-audit, and
+      `/upgradestatus`.
+
+  - id: jtbd-track-plan-quota-live
+    path: reference/track-plan-quota-live.md
+    category: jtbd
+    anchors_hint: |
+      Live quota visibility without a dashboard. Verify against the
+      auth-broker quota tracking, the fallback_order behavior, and
+      whatever surface communicates quota state to the user.
+
+  - id: jtbd-steer-or-queue-mid-flight
+    path: reference/steer-or-queue-mid-flight.md
+    category: jtbd
+    anchors_hint: |
+      Correction vs new task disambiguation. Verify against the Steer
+      button implementation and the inbound-classification logic in
+      the telegram-plugin gateway.
+
+  - id: jtbd-keep-my-subscription-honest
+    path: reference/keep-my-subscription-honest.md
+    category: jtbd
+    anchors_hint: |
+      Pro/Max OAuth only, no API/SDK. Verify against compliance-
+      attestation.md, the CLAUDE.md "Hard constraint" section, and
+      grep for any claude -p / ANTHROPIC_API_KEY / SDK callsites that
+      would contradict this.
+
+  - id: jtbd-share-auth-across-the-fleet
+    path: reference/share-auth-across-the-fleet.md
+    category: jtbd
+    anchors_hint: |
+      One login per account, not per agent. Verify against the
+      auth-broker as sole credentials writer, the fanout model, and
+      the `switchroom auth add/use` flow.
+
+  - id: jtbd-survive-reboots-and-real-life
+    path: reference/survive-reboots-and-real-life.md
+    category: jtbd
+    anchors_hint: |
+      Clean resume after crash, no silent loss. Verify against
+      SWITCHROOM_PENDING_TURN resume protocol, wake-audit, restart-
+      marker + sweep, container `restart: unless-stopped`.
+
+  - id: jtbd-idempotent-update-and-restart
+    path: reference/idempotent-update-and-restart.md
+    category: jtbd
+    anchors_hint: |
+      `switchroom apply` + `docker compose up` produces a coherent
+      version. Verify against switchroom-hostd, the operator restart-
+      marker, the "Code != runtime" section of CLAUDE.md.
+
+  - id: jtbd-talk-to-agents-from-anywhere
+    path: reference/talk-to-agents-from-anywhere.md
+    category: jtbd
+    anchors_hint: |
+      Phone-first. Verify against the Telegram-only model (no Slack/
+      Discord/Teams), the long-poll bot model, the no-second-channel
+      stance in vision.md.
+
+  # ── Artefact (current) (1) ─────────────────────────────────────
+  - id: artefact-conversational-pacing
+    path: reference/conversational-pacing.md
+    category: artefact-current
+    anchors_hint: |
+      The five-beat human-feel model. Verify against the actual
+      pacing implementation in telegram-plugin/ (stream-reply-handler,
+      silence-poke timers). Specifically check that the v2 model
+      describes what ships today, not the v1 card-era model it
+      superseded.
+
+  # ── RFC: shipped (1) ───────────────────────────────────────────
+  - id: rfc-sub-agent-visibility
+    path: reference/sub-agent-visibility-rfc.md
+    category: rfc-shipped
+    anchors_hint: |
+      Frontmatter says "shipped (closed) — TDD verification landed."
+      Verify the RFC's described mechanism (live fleet block, sub-
+      agent rows) still matches what telegram-plugin ships. Verify
+      the 2 narrow follow-ups noted as tracked are either still
+      tracked or closed.
+
+  # ── RFC: draft (1) ─────────────────────────────────────────────
+  - id: rfc-docker-multi-container
+    path: reference/rfc-docker-multi-container.md
+    category: rfc-draft
+    anchors_hint: |
+      Frontmatter says Draft. But CLAUDE.md describes a fully-shipped
+      docker multi-container architecture as the current runtime
+      (v0.7+). If the RFC's design is what shipped, it should be
+      promoted from Draft to shipped/superseded; if not, document the
+      delta. Likely needs status frontmatter update.
+
+  # ── Archived (1) ───────────────────────────────────────────────
+  - id: archived-status-card-design
+    path: reference/status-card-design.md
+    category: archived
+    anchors_hint: |
+      Frontmatter says archived, supersededBy conversational-pacing.md.
+      Confirm nothing in current code/docs/JTBDs still treats this as
+      the active design. The pinned progress card was retired in
+      #1122 — verify no other artefact contradicts the archival.
+
+  # ── Historical (1) ─────────────────────────────────────────────
+  # Note: a previous draft of this manifest listed `reference/PRD.md`
+  # as a unit. That file was deleted in PR #534 (commit 8bdb86cb)
+  # before the audit infra landed, so the unit was removed.
+  - id: historical-onboarding-gap-analysis
+    path: reference/onboarding-gap-analysis.md
+    category: historical
+    anchors_hint: |
+      Frontmatter status says historical (last updated 2026-04-25);
+      no longer tracks closure. Verify the document still reads as
+      point-in-time, not as a live tracker. Verify nothing else in
+      the repo links to it as if it were current.

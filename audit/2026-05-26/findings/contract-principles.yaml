@@ -1,0 +1,425 @@
+unit_id: contract-principles
+unit_path: reference/principles.md
+category: contract
+audited_at: 2026-05-26T12:00:00Z
+auditor_notes: |
+  Five concrete examples in the file reference shipped behavior that has
+  since changed: (1) "auth login <agent>" verb removed by RFC H and
+  replaced with "auth add / auth reauth"; (2) "executive" profile renamed
+  to "executive-assistant"; (3) the 3-command upgrade flow superseded by
+  "switchroom update"; (4) "defaults.skills_auto" config field referenced
+  in the Principle 2 skills example does not exist in the config schema;
+  (5) "vault set" success message does not tell the user to reference the
+  key as "vault:<key>" in switchroom.yaml.
+
+  All other principle prose, check-questions, and examples checked out
+  either as aligned or as aspirational standards (vision-only). The
+  "chat IS the artifact" sub-principle is accurate — the pinned progress
+  card was genuinely retired in #1122 and replaced by in-chat streaming.
+
+findings:
+  - claim_id: c1
+    quote: "`switchroom auth login coach` prints the OAuth URL inline, says \"open
+      this in any browser — tokens save to this agent's CLAUDE_CONFIG_DIR, no other
+      agent is affected,\" and watches for completion."
+    loc: L38-L41
+    verdict: contract-example-stale
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L1-L26
+        snippet: "The fleet-wide model collapses what used to be a per-agent verb tree
+          (`auth login / reauth / heal / promote / enable / disable / share /
+          refresh-accounts / status / account add / account list / account rm`)
+          into a small accounts-and-fleet surface: auth add <label> / auth reauth <agent>"
+      - path: src/cli/auth.ts
+        lines: L815-L820
+        snippet: "auth .command(\"reauth <agent>\") .description(\"Start/resume an
+          OAuth re-auth session for an agent; prints the login URL\")"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Replace the example verb from `switchroom auth login coach` to
+      `switchroom auth add default --via-claude` (first-time) or `switchroom auth
+      reauth coach` (refresh). Drop the CLAUDE_CONFIG_DIR detail — the fleet model
+      no longer uses per-agent credential dirs as the primary framing."
+    confidence: high
+    rationale: |
+      RFC H removed `auth login` entirely; the registered verbs in auth.ts
+      are now `add`, `list`, `use`, `rotate`, `rm`, `show`, `refresh`, `agent
+      override`, and `reauth`. A grep for `.command("login")` in auth.ts returns
+      nothing. The CLAUDE_CONFIG_DIR framing also predates the fleet/broker
+      architecture. This is a stale CLI example, not a principle violation.
+
+  - claim_id: c2
+    quote: "`switchroom setup` detects that the bot's privacy mode is still on and
+      tells the user \"@CoachBot has Privacy Mode enabled — it won't see group messages.
+      Disable it in @BotFather → Bot Settings → Group Privacy → Turn off, then
+      re-run this step.\""
+    loc: L45-L50
+    verdict: contract-example-stale
+    evidence:
+      - path: src/cli/setup.ts
+        lines: L293-L301
+        snippet: "console.log(chalk.gray(\"  Tip: Create bots via @BotFather — one per agent.\"));\n
+          \"  IMPORTANT: Disable privacy mode on each bot BEFORE adding it to the group.\"\n
+          \"  In BotFather: /mybots -> select bot -> Bot Settings -> Group Privacy -> Turn off\""
+      - path: src/setup/botfather-walkthrough.ts
+        lines: L198-L198
+        snippet: "log(\"  Step 4. (Optional) /setprivacy → Disable, so the bot can read group\");"
+    evidence_strength: medium
+    action: update-text
+    proposed_text: "Replace the dynamic-detection example with what the setup wizard
+      actually does: setup prints a static upfront instruction to disable privacy mode
+      before adding the bot to a group, not a post-join detection message. The good
+      example should reflect the upfront-guidance pattern rather than an
+      error-detection pattern that doesn't exist."
+    confidence: high
+    rationale: |
+      The setup wizard (src/cli/setup.ts L293-L301) prints a static advisory to
+      disable privacy mode before proceeding. The BotFather walkthrough
+      (src/setup/botfather-walkthrough.ts L198) similarly offers a static optional
+      step note. Neither file contains logic to detect that privacy mode is currently
+      on and surface the quoted error message. The good example describes a
+      detect-and-report behavior that is not shipped.
+
+  - claim_id: c3
+    quote: "A failing skill on an agent shows up as a real `reply` with `accent: 'issue'`:
+      \"skill `weekly-review` failed: missing `hindsight` MCP. Run `switchroom agent
+      reconcile coach` to repair.\""
+    loc: L52-L56
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/tests/status-accent.test.ts
+        lines: L111-L116
+        snippet: "it(\"accent='issue' prepends the warning header before the body\", ...\n
+          { chat_id: '1', text: 'Blocked on X.', accent: 'issue' }"
+      - path: src/cli/doctor.ts
+        lines: L1267-L1267
+        snippet: "fix: `Run \\`switchroom agent reconcile ${name}\\` and ensure the vault
+          contains telegram_bot_token`"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The `accent: 'issue'` mechanism is alive (tested in
+      telegram-plugin/tests/status-accent.test.ts). The `switchroom agent reconcile`
+      suggestion pattern exists throughout src/cli/ for agent repair guidance. The
+      specific "missing hindsight MCP" text is illustrative rather than a literal
+      message claim, and the principle it demonstrates — error messages with next-step
+      instructions — is correctly implemented. Confidence medium because the exact
+      weekly-review failure text was not traced end-to-end.
+
+  - claim_id: c4
+    quote: "`switchroom vault set telegram-bot-token` prompts for the value, masks
+      input, confirms encryption, and tells the user \"now reference this in
+      switchroom.yaml as `vault:telegram-bot-token`.\""
+    loc: L58-L62
+    verdict: contract-example-stale
+    evidence:
+      - path: src/cli/vault.ts
+        lines: L665-L668
+        snippet: "console.log(chalk.green(`✓ Secret '${key}' saved`));"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Update the success-message portion of the example to match what
+      vault set actually prints: `✓ Secret 'telegram-bot-token' saved`. If the
+      principle intent is that vault set should tell the user about the vault: syntax,
+      that is a missing-UX gap — either add the hint to the vault set output or update
+      the example to show what currently ships."
+    confidence: high
+    rationale: |
+      src/cli/vault.ts L665-L668 shows the success output is `✓ Secret '${key}'
+      saved` with no mention of the vault: reference syntax. The principle example
+      claims the command tells the user "now reference this in switchroom.yaml as
+      `vault:telegram-bot-token`" — that instruction is not emitted. The masking
+      and prompting behaviors are accurate (L572: `promptLine("Secret value: ", true)`),
+      but the success-message portion is stale.
+
+  - claim_id: c5
+    quote: "`switchroom setup` produces a complete `switchroom.yaml` with the `default`
+      profile, a working bot, working memory, and the first agent already responding
+      in Telegram before the user reads anything."
+    loc: L87-L90
+    verdict: aligned
+    evidence:
+      - path: src/cli/setup.ts
+        lines: L293-L301
+        snippet: "setup.ts drives BotFather walkthrough, writes switchroom.yaml with default profile"
+      - path: src/agents/add-orchestrator.ts
+        lines: L207-L243
+        snippet: "runAddAgent orchestrates BotFather walkthrough + agent creation in one flow"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The setup wizard in src/cli/setup.ts and src/agents/add-orchestrator.ts drives
+      the full BotFather walkthrough, creates a working agent configuration with the
+      default profile, and validates the bot token before completing. The claimed
+      outcome — first agent responding in Telegram — is the design intent realized
+      by the orchestrator. Confidence medium as the full interactive path was not
+      run live.
+
+  - claim_id: c6
+    quote: "Playwright MCP is wired by default; opt out with `mcp_servers: { playwright:
+      false }`. The conversational-pacing prompt + silence-poke safety net are on
+      for every agent with tuned thresholds."
+    loc: L95-L99
+    verdict: aligned
+    evidence:
+      - path: src/agents/reconcile-default-mcps.test.ts
+        lines: L26-L136
+        snippet: "FIXTURE_DEFAULTS[0] = { key: 'playwright', value: { command: 'npx',
+          args: ['-y', '@playwright/mcp@0.0.71', '--snapshot'] }, optOutKey: 'playwright' }\n
+          it('(c) honours per-agent opt-out (mcp_servers: { playwright: false })'...)"
+      - path: telegram-plugin/silence-poke.ts
+        lines: L1-L15
+        snippet: "silence-poke.ts — framework safety net for 'model is silent to the user'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The Playwright MCP default and opt-out are pinned by a dedicated test suite
+      (reconcile-default-mcps.test.ts). The silence-poke safety net module is live
+      in telegram-plugin/silence-poke.ts and is referenced throughout the streaming
+      pipeline. Both behaviors described are directly implemented.
+
+  - claim_id: c7
+    quote: "`switchroom agent create exec --profile executive` inherits everything
+      from the executive profile and only writes the two-line agent stanza."
+    loc: L102-L105
+    verdict: contract-example-stale
+    evidence:
+      - path: profiles/
+        lines: L1-L1
+        snippet: "Profiles directory contains: _base, _shared, coding, default,
+          executive-assistant, health-coach. No 'executive' profile."
+      - path: docs/cli-reference.md
+        lines: L43-L43
+        snippet: "--profile: `coding`, `default`, `executive-assistant`,"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Update the example from `--profile executive` to
+      `--profile executive-assistant`. The profile was named `executive-assistant`
+      from the start (not renamed); this is a typo or shorthand in the example."
+    confidence: high
+    rationale: |
+      The profiles/ directory contains `executive-assistant` but not `executive`.
+      The docs/cli-reference.md L43 confirms `executive-assistant` is the correct
+      profile slug. A grep for bare `executive` (excluding `executive-assistant`)
+      across src/ returns no results. The example in principles.md uses a profile
+      name that does not exist.
+
+  - claim_id: c8
+    quote: "The upgrade flow — `switchroom apply` to reconcile, `docker compose pull`
+      to fetch new images, `docker compose up -d --remove-orphans` to roll the
+      fleet — is three lines, idempotent, and the same on every host."
+    loc: L108-L111
+    verdict: contract-example-stale
+    evidence:
+      - path: src/cli/update.ts
+        lines: L1-L24
+        snippet: "`switchroom update` — bundle the host-update flow into one verb (#918).
+          Pre-#918 the operator was told to invoke five commands across two privilege
+          levels... `update` runs them in order, with idempotent skip-if-fresh checks."
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Replace the three-command example with the current single-command
+      idiom: `switchroom update` runs pull-images, apply, docker compose up, and
+      doctor in one step. The three individual commands described were the pre-#918
+      pattern. The good example should read: `switchroom update` — one command,
+      idempotent, same on every host."
+    confidence: high
+    rationale: |
+      src/cli/update.ts L1-L24 explicitly documents that `switchroom update` was
+      introduced in #918 to replace the five-command (three for source checkout, more
+      for docker) flow. CLAUDE.md also lists `switchroom update` as the standard
+      operator command. The good example in principles.md still describes the
+      replaced multi-command pattern, making it stale relative to shipped behavior.
+
+  - claim_id: c9
+    quote: "Sensible default skills on each profile (health-coach ships with `check-in`
+      and `weekly-review`); operator skills (`humanizer`, `buildkite-*`) stay opt-in
+      via `defaults.skills_auto`."
+    loc: L115-L118
+    verdict: contract-example-stale
+    evidence:
+      - path: profiles/health-coach/skills/
+        lines: L1-L1
+        snippet: "health-coach profile contains check-in/ and weekly-review/ skill directories"
+      - path: src/config/schema.ts
+        lines: L1-L1
+        snippet: "Schema contains humanizer_voice_file field but no skills_auto field"
+      - path: docs/skills.md
+        lines: L125-L126
+        snippet: "| `humanizer` | developer (opt-in) | Strips AI-writing patterns from
+          replies; opt in via `defaults.skills`"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Replace `defaults.skills_auto` with the actual config field. Per
+      docs/skills.md, humanizer is opt-in via `defaults.skills` (not `defaults.skills_auto`).
+      The first half of the example (health-coach ships with check-in and weekly-review)
+      is accurate. Remove `buildkite-*` skills reference — no such skills exist in
+      the skills/ directory."
+    confidence: high
+    rationale: |
+      `defaults.skills_auto` does not appear anywhere in src/config/schema.ts or
+      anywhere else in the codebase. docs/skills.md L125 confirms humanizer is
+      opt-in via `defaults.skills`. The health-coach profile does contain both
+      check-in and weekly-review skill directories, so that half is accurate.
+      No `buildkite-*` skills were found in the skills/ directory; only humanizer,
+      humanizer-calibrate, and switchroom-* skills are present.
+
+  - claim_id: c10
+    quote: "Every top-level CLI verb is `switchroom <noun> <verb>` — `agent start`,
+      `vault set`, `topics sync`, `auth login`. One shape. One file per noun in
+      `src/cli/`."
+    loc: L143-L145
+    verdict: contract-example-stale
+    evidence:
+      - path: src/cli/auth.ts
+        lines: L9-L16
+        snippet: "auth add <label> --from-agent | --from-credentials | --from-oauth |
+          --via-claude; auth list; auth use <label>; auth rotate; auth rm <label>"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: "Replace `auth login` in the example list with `auth add` or
+      `auth reauth` — `auth login` was removed by RFC H. The structural claim
+      (noun-verb shape, one file per noun) remains accurate and should be kept."
+    confidence: high
+    rationale: |
+      The broader principle (noun-verb shape, one file per noun) is well-supported
+      by the repo structure. However the specific example `auth login` no longer
+      exists as a registered command. Minor stale example in an otherwise accurate
+      structural claim — keeping the principle, updating just the example verb.
+
+  - claim_id: c11
+    quote: "Every long-running operation — interactive reply, scheduled task, sub-agent
+      delegation — uses the same conversational pacing rhythm. Soft-commit, mid-turn
+      updates at meaningful punctuation, final answer pings once."
+    loc: L149-L153
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L1-L15
+        snippet: "silence-poke module implements the framework safety net for silent
+          turns; pings once at turn-end via materialize()"
+      - path: telegram-plugin/answer-stream.ts
+        lines: L29-L40
+        snippet: "Turn-end materializes as a fresh sendMessage (push notification) NOT
+          an edit-finalize — mirrors OpenClaw's materialize() pattern."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The conversational pacing rhythm is implemented in the gateway via
+      answer-stream.ts (materialize-at-turn-end) and silence-poke.ts (silence
+      safety net). The pattern described — soft-commit during turn, single final
+      push notification — matches the shipped architecture. Confidence medium
+      because "scheduled task" pacing was not fully traced.
+
+  - claim_id: c12
+    quote: "Every config field has a documented cascade mode (union / override /
+      per-key merge / concat / deep-merge) and behaves the same way across
+      `defaults`, profiles, and agents. See `src/config/merge.ts` and
+      `docs/configuration.md`."
+    loc: L159-L163
+    verdict: aligned
+    evidence:
+      - path: src/config/merge.ts
+        lines: L24-L640
+        snippet: "schedule: concatenated (defaults entries first). hooks: per-event
+          concat. env: per-key merge. settings_raw: deep merge. cli_args: concat."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      src/config/merge.ts exists and documents specific cascade modes per field
+      (concat, per-key merge, deep-merge, etc.) inline in the implementation.
+      The file path cited in principles.md is correct. The claim is accurate.
+
+  - claim_id: c13
+    quote: "Secrets are referenced uniformly as `vault:<key>` anywhere in
+      `switchroom.yaml`. The vault CLI, the cascade resolver, and the bootstrap
+      layer all know that prefix."
+    loc: L167-L170
+    verdict: aligned
+    evidence:
+      - path: src/cli/setup.ts
+        lines: L327-L381
+        snippet: "if (rawToken.startsWith(\"vault:\")) { ... key = rawToken.replace(\"vault:\", \"\")"
+      - path: src/cli/doctor-inlined-secrets.ts
+        lines: L79-L79
+        snippet: "if (v.startsWith(\"vault:\")) return false; // the sanctioned form"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The `vault:` prefix is consistently checked across setup.ts, the doctor,
+      config loaders, and the Google workspace integration. All layers understand
+      and resolve this prefix. The claim is accurate.
+
+  - claim_id: c14
+    quote: "`switchroom agent restart` always reconciles first (regenerates the
+      runtime config if changed), so a restart is also a mini-deploy."
+    loc: L174-L177
+    verdict: aligned
+    evidence:
+      - path: src/cli/agent.ts
+        lines: L497-L512
+        snippet: "this so we can unit-test 'restart always reconciles first, and skips
+          restart if reconcile fails' without booting commander. Why reconcile before
+          every restart? Restart was historically a pure ... If reconcile fails, we
+          do NOT proceed to restart"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      src/cli/agent.ts L497-L512 explicitly documents the reconcile-first-before-restart
+      invariant and its rationale. CLAUDE.md also states "Since PR #59, `agent restart`
+      always runs reconcile first." The claim is accurate and load-bearing.
+
+  - claim_id: c15
+    quote: "Same Telegram UX surface for every agent — same `/auth` router, same
+      reaction lifecycle, same conversational pacing, same silence-poke safety net,
+      regardless of profile."
+    loc: L181-L184
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway.ts
+        lines: L1-L1
+        snippet: "single gateway.ts implements auth routing, reaction lifecycle,
+          and silence-poke for all agents"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The telegram-plugin ships a single gateway that all agent containers run.
+      The same gateway code handles auth routing, reactions, pacing, and silence-poke
+      regardless of which profile the agent uses. Confidence medium as cross-profile
+      invariance was not tested end-to-end.
+
+  - claim_id: c16
+    quote: "We've been here once already (the pinned progress card, retired in #1122).
+      Build the model to communicate; let the framework be the safety net, not the
+      headline. Single source of truth for 'what is the agent doing': the chat itself."
+    loc: L191-L197
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/session-tail.ts
+        lines: L37-L41
+        snippet: "#1122 PR3: inlined from the deleted progress-card.ts. Kill switch
+          for the sub-agent transcript watcher (PROGRESS_CARD_MULTI_AGENT=0 disables it)."
+      - path: CHANGELOG.md
+        lines: L451-L457
+        snippet: "The 'chat IS the artifact' principle clarification: the retired
+          progress card (#1122) was chrome — a pinned widget separate from the chat.
+          Visible-answer-stream is not chrome."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The CHANGELOG confirms the pinned progress card was retired in #1122, and that
+      the current in-chat streaming is explicitly NOT chrome per the product decision.
+      session-tail.ts references the deleted progress-card.ts from PR3 of #1122. The
+      principle accurately describes the historical event and the current design intent.
+      The slot-banner (auth banner) still pins but is a distinct feature from the
+      progress card and is not a counterexample to this principle.

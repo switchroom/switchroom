@@ -1,0 +1,277 @@
+unit_id: artefact-conversational-pacing
+unit_path: reference/conversational-pacing.md
+category: artefact-current
+audited_at: 2026-05-26T20:00:00Z
+auditor_notes: |
+  Two substantive findings:
+
+  1. The reaction emoji sequence `👀→🤔→🔥→👍` is stated in both the artefact
+     (L28) and `profiles/_shared/telegram-style.md.hbs` (L20). The code
+     (`telegram-plugin/status-reactions.ts` L71) explicitly reserves 🔥 for
+     genuine 5xx server errors via `operator-events.ts` and keeps it OUT of the
+     normal lifecycle. The working-state emoji for active tool use is `✍` (the
+     `tool`/`coding`/`web` states). The artefact and the agent prompt template
+     are both wrong on this point.
+
+  2. The Ambient layer implementation pointer cites `gateway.ts:startTypingLoop`
+     as the turn-long typing indicator. The function that owns the turn-level
+     typing loop (started at turn-start, stopped by `purgeReactionTracking`) is
+     `startTurnTypingLoop` — a separate function and a separate interval map
+     (`turnTypingIntervals`). `startTypingLoop` is the reply-handler and
+     typing-wrapper function that mid-turn replies stop freely. This is a minor
+     pointer error in the table.
+
+  The five-beat model, silence-poke ladder thresholds, state struct fields
+  (except the omission of `inFlightTools`), subagent-dispatch override, thinking
+  detection, kill switch, KPI event names, PostHog dashboard name, PostToolUse
+  synthesis nudge for foreground subagents, and background `subagent_handback`
+  channel are all verified against the implementation.
+
+findings:
+  - claim_id: c1
+    quote: "The 👀→🤔→🔥→👍 status reaction on the user's inbound message and a continuous `typing…` chat-action held for the whole turn"
+    loc: L28
+    verdict: drift-major
+    evidence:
+      - path: telegram-plugin/status-reactions.ts
+        lines: L49-L85
+        snippet: "🔥 is reserved for genuine 5xx server errors (operator-events.ts). It reads as 'on fire / broken' — keep it out of normal active-work states. ... tool: ['✍', '⚡', '👌'], coding: ['👨‍💻', '✍', '⚡'], web: ['⚡', '🤔', '👌']"
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L20
+        snippet: "The 👀→🤔→🔥→👍 status reaction and the typing indicator are ambient liveness"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: |
+      Replace `👀→🤔→🔥→👍` with `👀→🤔→✍→👍` in the artefact table (L28).
+      The working state is `✍` (from the `tool`/`coding`/`web` reaction states);
+      🔥 is reserved for 5xx server errors in `operator-events.ts` and never
+      appears in a normal turn. The same fix is needed in
+      `profiles/_shared/telegram-style.md.hbs` L20.
+    confidence: high
+    rationale: |
+      `status-reactions.ts` L71 explicitly states "🔥 is reserved for genuine
+      5xx server errors (operator-events.ts). It reads as 'on fire / broken' —
+      keep it out of normal active-work states." The `REACTION_VARIANTS` map
+      confirms the working states (`tool`, `coding`, `web`) map to `✍`/`⚡`/
+      `👨‍💻`. The same wrong sequence `👀→🤔→🔥→👍` also appears in
+      `profiles/_shared/telegram-style.md.hbs` L20 — the agent prompt that
+      teaches this to the model — so it is misinforming the model about the
+      reaction lifecycle as well.
+
+  - claim_id: c2
+    quote: "`telegram-plugin/status-reactions.ts` + `gateway.ts:startTypingLoop` (started at turn-start, stopped by `purgeReactionTracking`)"
+    loc: L28
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L1936-L1960
+        snippet: "Turn-level `typing…` indicator. Deliberately a SEPARATE interval map from `typingIntervals`... only `stopTurnTypingLoop` (called at the canonical turn-end) clears it... function startTurnTypingLoop(chat_id: string): void"
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L8734-L8743
+        snippet: "startTurnTypingLoop(chat_id)"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: |
+      Change `gateway.ts:startTypingLoop` to `gateway.ts:startTurnTypingLoop`
+      in the Ambient row of the Three Layers table. The turn-level typing loop
+      (started at turn-start, stopped by `purgeReactionTracking`) is managed by
+      `startTurnTypingLoop` / `stopTurnTypingLoop` using a dedicated
+      `turnTypingIntervals` map. `startTypingLoop` is the reply-handler and
+      typing-wrapper function that mid-turn replies freely start and stop.
+    confidence: high
+    rationale: |
+      `gateway.ts` L1936-1944 documents the deliberate separation: a dedicated
+      `turnTypingIntervals` map is immune to mid-turn `stopTypingLoop` calls
+      because only `stopTurnTypingLoop` (called from `purgeReactionTracking`
+      L1360) clears it. The turn-start callsite at L8743 calls
+      `startTurnTypingLoop`. The name `startTypingLoop` in the artefact points
+      at the wrong function.
+
+  - claim_id: c3
+    quote: "Five beats: 1. Acknowledge first... 2. Go quiet and work... 3. Surface meaningful progress... 4. Hand back delegations with synthesis... 5. Deliver the answer"
+    loc: L40-L69
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L110-L145
+        snippet: "TELEGRAM_GUIDANCE constant listing all five beats verbatim, injected into every agent's CLAUDE.md"
+      - path: profiles/_shared/telegram-style.md.hbs
+        lines: L7-L13
+        snippet: "Five beats: 1 Acknowledge first... 2 Then go quiet... 3 Surface meaningful progress... 4 Hand back delegations... 5 Deliver the answer"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The five-beat model is implemented in two places: the `TELEGRAM_GUIDANCE`
+      TypeScript constant in `scaffold.ts` (L110-145) which is baked into every
+      agent's CLAUDE.md, and `profiles/_shared/telegram-style.md.hbs` which is
+      the hbs template. Both match the artefact description in structure and
+      substance.
+
+  - claim_id: c4
+    quote: "A PostToolUse hook nudges the synthesis; a *background* worker finishes after the turn ends, so the gateway wakes the agent with a `<channel source=\"subagent_handback\">` turn"
+    loc: L63-L66
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/hooks/subagent-tracker-posttool.mjs
+        lines: L253-L302
+        snippet: "emitForegroundHandbackNudge() — Beat 4 of conversational pacing. A foreground sub-agent's PostToolUse fires at real completion, mid-parent-turn, with its result in tool_response — nudge the parent to synthesise a user-facing handback."
+      - path: telegram-plugin/gateway/subagent-handback-inbound-builder.ts
+        lines: L1-L30
+        snippet: "Pure builder for the synthetic `subagent_handback` inbound the gateway wakes... wraps it as `<channel source=\"subagent_handback\">`"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      Both halves of beat 4 are implemented. Foreground half: `subagent-tracker-
+      posttool.mjs` L286-302 emits a `hookSpecificOutput.additionalContext` nudge
+      at PostToolUse when the subagent completes and is not a background agent.
+      Background half: `subagent-handback-inbound-builder.ts` builds the synthetic
+      `<channel source="subagent_handback">` turn the gateway injects.
+
+  - claim_id: c5
+    quote: "Silence-poke ladder: 10s ack, 75s soft, 180s firm, 300s fallback. Polled every 5s."
+    loc: L86-L89
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L113-L122
+        snippet: "export const DEFAULT_THRESHOLDS: ThresholdsMs = { ack: 10_000, soft: 75_000, firm: 180_000, fallback: 300_000, subagentSoft: 300_000, pokeSuccessWindowMs: 15_000 }"
+      - path: telegram-plugin/silence-poke.ts
+        lines: L122
+        snippet: "export const DEFAULT_POLL_INTERVAL_MS = 5_000"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `DEFAULT_THRESHOLDS` in `silence-poke.ts` matches every threshold in the
+      artefact exactly. `DEFAULT_POLL_INTERVAL_MS = 5_000` confirms the 5s poll
+      interval. No discrepancy.
+
+  - claim_id: c6
+    quote: "State per-turn: `{ turnStartedAt, lastOutboundAt, pokesFired, pokeArmed, ackPokeFired, subagentDispatchActive, lastThinkingAt, fallbackFired, lastPokeFiredAt }`"
+    loc: L80-L81
+    verdict: drift-minor
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L64-L95
+        snippet: "export interface SilencePokeState { turnStartedAt, lastOutboundAt, pokesFired, pokeArmed, subagentDispatchActive, lastThinkingAt, fallbackFired, ackPokeFired, lastPokeFiredAt, inFlightTools: Map<string, {...}> }"
+    evidence_strength: strong
+    action: update-text
+    proposed_text: |
+      Add `inFlightTools` to the state struct listing: `{ turnStartedAt,
+      lastOutboundAt, pokesFired, pokeArmed, ackPokeFired, subagentDispatchActive,
+      lastThinkingAt, fallbackFired, lastPokeFiredAt, inFlightTools }`. This field
+      was added in issue #1292 to power the tool-aware fallback message wording.
+    confidence: high
+    rationale: |
+      `SilencePokeState` in `silence-poke.ts` L64-95 has all the fields listed
+      in the artefact plus `inFlightTools: Map<string, { name, startedAt, label }>`,
+      added in issue #1292 for the tool-aware 300s fallback message. The artefact's
+      state listing is accurate but incomplete; it omits this field.
+
+  - claim_id: c7
+    quote: "Subagent-dispatch override: when the session stream emits a `tool_use` for `Task` or `Agent`, the soft threshold extends to 300s for that turn"
+    loc: L103-L108
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L97-L110
+        snippet: "subagentSoft: number — Soft threshold when subagentDispatchActive=true. ... subagentSoft: 300_000"
+      - path: telegram-plugin/silence-poke.ts
+        lines: L456-L460
+        snippet: "const softThreshold = s.subagentDispatchActive ? thresholds.subagentSoft : thresholds.soft"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `DEFAULT_THRESHOLDS.subagentSoft = 300_000` and the `tick()` function at
+      L456-460 selects the extended threshold when `subagentDispatchActive` is
+      true. The flag-persistence-on-outbound behavior (not cleared on outbound,
+      only on `endTurn`) is also confirmed at `noteOutbound` L224-229.
+
+  - claim_id: c8
+    quote: "Thinking detection: session stream `kind: 'thinking'` events update `lastThinkingAt`. If the framework fallback fires within 30s of a thinking event, wording switches to 'still thinking…'."
+    loc: L111-L112
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L516-L522
+        snippet: "const recentThinking = s.lastThinkingAt != null && (now - s.lastThinkingAt) < 30_000; const fallbackKind: 'working' | 'thinking' = recentThinking ? 'thinking' : 'working'"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `tick()` at L516-522 in `silence-poke.ts` implements the exact 30s window
+      check and `fallbackKind` selection described. `noteThinking()` at L251-255
+      updates `lastThinkingAt` from calling code.
+
+  - claim_id: c9
+    quote: "Kill switch: `SWITCHROOM_DISABLE_SILENCE_POKE=1` disables the whole subsystem."
+    loc: L124-L126
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L172-L175
+        snippet: "export function silencePokeEnabled(): boolean { const v = process.env.SWITCHROOM_DISABLE_SILENCE_POKE; return !(v === '1' || v === 'true') }"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `silencePokeEnabled()` in `silence-poke.ts` checks the env var. `startTurn`
+      and `startTimer` both short-circuit on `!silencePokeEnabled()`. Matches
+      the artefact description exactly.
+
+  - claim_id: c10
+    quote: "KPIs: Status-query rate (`inbound_status_query`), Outbound silence p95 (`turn_ended.longest_silent_gap_ms`), TTFO p95 (`turn_ended.ttfo_ms`), Silence-poke success rate (`silence_poke_succeeded / silence_poke_fired`), Framework fallback rate (`silence_fallback_sent / turn_ended`)"
+    loc: L133-L139
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/runtime-metrics.ts
+        lines: L29-L106
+        snippet: "kind: 'inbound_status_query' ... kind: 'turn_ended' ... ttfo_ms, longest_silent_gap_ms ... kind: 'silence_poke_fired' ... kind: 'silence_poke_succeeded' ... kind: 'silence_fallback_sent'"
+      - path: docs/posthog.md
+        lines: L68-L99
+        snippet: "Switchroom Runtime dashboard ... turn_ended.longest_silent_gap_ms ... turn_ended.ttfo_ms"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      All five KPI event names match exactly between the artefact and
+      `runtime-metrics.ts`. The `Switchroom Runtime` dashboard name is confirmed
+      in `docs/posthog.md` L68.
+
+  - claim_id: c11
+    quote: "Armed pending drain on the next tool result, or null... `silence-poke.ts → consumeArmedPoke()` drained at `gateway.ts:onToolCall` chokepoint"
+    loc: L87
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/gateway/gateway.ts
+        lines: L3764-L3773
+        snippet: "async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> { ... const reminder = silencePoke.consumeArmedPoke()"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `gateway.ts` L3764 defines `onToolCall` and L3773 calls
+      `silencePoke.consumeArmedPoke()`. This is the correct chokepoint. Matches
+      the artefact's description of the drain mechanism.
+
+  - claim_id: c12
+    quote: "Wording is load-bearing. Exact strings live in `silence-poke.ts:formatPokeText`."
+    loc: L114-L115
+    verdict: aligned
+    evidence:
+      - path: telegram-plugin/silence-poke.ts
+        lines: L354-L380
+        snippet: "export function formatPokeText(level: PokeLevel): string { if (level === 'ack') { ... } if (level === 'soft') { ... } return ..."
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      `formatPokeText` exists at L354-380 with the three level branches (ack,
+      soft, firm). The wording in the artefact description matches the
+      implementation's two stated principles: the "skip if finishing soon"
+      language is present in the `soft` branch, and the `formatFrameworkFallbackText`
+      function at L398-426 implements the `(no update from agent in N min)`
+      parenthetical where N is derived from `silenceMs`.

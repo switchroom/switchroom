@@ -1,0 +1,97 @@
+unit_id: archived-status-card-design
+unit_path: reference/status-card-design.md
+category: archived
+audited_at: 2026-05-26T00:00:00Z
+auditor_notes: |
+  The file is a 6-line stub with correct archived frontmatter
+  (status: archived — superseded, supersededBy: conversational-pacing.md).
+  Three external referrers were found:
+
+  1. CHANGELOG.md:6025 — historical release entry. Treats as history, not current.
+  2. reference/sub-agent-visibility-rfc.md — multiple lines. The RFC itself
+     carries a prominent "Card model superseded" callout box (L25-33) explicitly
+     directing readers to conversational-pacing.md. Not treating it as current.
+  3. telegram-plugin/uat/assertions.ts:343 — inline JSDoc comment citing
+     "status-card-design.md §Header" as the source for emoji marker semantics.
+     The comment also references "telegram-plugin/progress-card.ts" which does
+     NOT exist. This comment reads as though the archived doc is the authority
+     on current card-phase markers, and points to a non-existent source file.
+     This is the only referrer that may mislead a reader.
+
+  conversational-pacing.md exists at reference/conversational-pacing.md.
+  The supersession target is valid.
+
+findings:
+  - claim_id: c1
+    quote: "The pinned two-zone progress card was retired in #1122 (PR3, 2026-05-12) in favour of conversational pacing + a silence-poke safety net."
+    loc: L9-L11
+    verdict: aligned
+    evidence:
+      - path: reference/conversational-pacing.md
+        lines: L1-L1
+        snippet: "file exists, is the live design contract"
+      - path: reference/sub-agent-visibility-rfc.md
+        lines: L25-L33
+        snippet: "Card model superseded. This RFC reasons about the two-zone progress-card model from reference/status-card-design.md. That two-zone design has since been superseded by reference/conversational-pacing.md, and reference/status-card-design.md is archived."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      The supersession claim is corroborated by the existence of
+      conversational-pacing.md and the explicit callout in
+      sub-agent-visibility-rfc.md. PR #1122 was not independently verified
+      (no git tag or test reference checked), so confidence stays medium.
+
+  - claim_id: c2
+    quote: "See conversational-pacing.md for the design contract that replaces it."
+    loc: L11-L12
+    verdict: aligned
+    evidence:
+      - path: reference/conversational-pacing.md
+        lines: L1-L1
+        snippet: "file exists at reference/conversational-pacing.md"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The target file exists. The link is valid.
+
+  - claim_id: c3
+    quote: "This stub is kept so historical links resolve; the v2 spec lived here."
+    loc: L14-L14
+    verdict: aligned
+    evidence:
+      - path: CHANGELOG.md
+        lines: L6025-L6026
+        snippet: "design doc at reference/status-card-design.md (#661, #667)"
+      - path: reference/sub-agent-visibility-rfc.md
+        lines: L4-L4
+        snippet: "supersedes: nothing (extends reference/status-card-design.md with TDD verification)"
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      At least two historical documents link to this path. Keeping the stub
+      so those links resolve is the stated purpose and it is served.
+
+  - claim_id: c4
+    quote: "(implicit) telegram-plugin/uat/assertions.ts cites status-card-design.md §Header as the authority for current emoji phase markers"
+    loc: L1-L5
+    verdict: archive-leaks
+    evidence:
+      - path: telegram-plugin/uat/assertions.ts
+        lines: L343-L343
+        snippet: "fleet still running, see #862 / status-card-design.md §Header"
+    evidence_strength: medium
+    action: fix-referrer
+    confidence: medium
+    rationale: |
+      The JSDoc in assertions.ts:343 directs readers to "status-card-design.md
+      §Header" for the emoji marker spec. That section no longer exists — the
+      file is a 6-line stub with no §Header section — and the referenced
+      progress-card.ts implementation file also does not exist. The comment
+      treats the archived doc as the authoritative source for live card-phase
+      detection semantics rather than conversational-pacing.md or the actual
+      current implementation. Fix is in assertions.ts:343: update the citation
+      to reference conversational-pacing.md (or the current card implementation)
+      instead of the archived file.

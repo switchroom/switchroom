@@ -1,0 +1,176 @@
+unit_id: historical-onboarding-gap-analysis
+unit_path: reference/onboarding-gap-analysis.md
+category: historical
+audited_at: 2026-05-26T14:00:00Z
+auditor_notes: |
+  The document carries a correct historical disclaimer at the top (L1-L13),
+  explicitly stating it is a point-in-time snapshot and should not be read
+  as current state. The disclaimer is accurate.
+
+  The main hygiene concern is four referrers that point at this document
+  without surfacing the historical caveat to the reader:
+
+  1. reference/README.md L60 — describes it as "tracks gaps as they close"
+     which contradicts the disclaimer inside the document itself ("does not
+     track closure").
+  2. docs/workspace-files.md L60-L61 — links it as the active tracker for
+     a gap that has not yet shipped ("this is tracked for convergence").
+  3. docs/workspace-files.md L203 — calls it "fixes planned for the
+     mechanism-convergence gap" — present-tense, implies current roadmap.
+  4. src/agents/status.ts L16 — uses it as a rationale comment in shipped
+     code ("the gap this closes"), which is fine — it is a historical
+     citation and the gap is closed; no reader confusion expected here.
+  5. src/agents/scaffold.ts L2887 — same pattern, historical citation in
+     a comment next to the fix; gap 1 is closed; low-confusion risk.
+
+  Gaps shipped so far (from code evidence): gap 1 (auto-create bank —
+  scaffold.ts:2887+), gap 3 (switchroom agent status — status.ts). Gaps
+  4/8 (workspace loader convergence) are still open — the two file lists
+  remain hardcoded in workspace.ts (L94, L108). Gap 6 (Telegram pairing),
+  gap 5 (corpus bootstrap), gap 2 (readiness gate), gap 7 (empty
+  templates), B2 (per-agent dynamic list), C1, C2 — not confirmed as
+  shipped from code review; treated as open or unknown.
+
+  The document itself does not need editing (the disclaimer is honest and
+  the content is read-only historical). The action required is in the three
+  referrers that treat it as a live tracker.
+
+findings:
+  - claim_id: c1
+    quote: "This document is a point-in-time analysis, not a live tracker. Despite being indexed as 'tracks gaps as they close,' it does not track closure and is stale."
+    loc: L4-L13
+    verdict: aligned
+    evidence:
+      - path: reference/onboarding-gap-analysis.md
+        lines: L1-L13
+        snippet: "## Status — historical (last updated 2026-04-25); no longer tracks closure"
+    evidence_strength: strong
+    action: keep
+    confidence: high
+    rationale: |
+      The disclaimer at the top of the document accurately describes its
+      status. It is appropriately labelled historical and explicitly
+      instructs readers not to use it as current state. No change needed
+      to the document itself.
+
+  - claim_id: c2
+    quote: "tracks gaps as they close, not a durable JTBD"
+    loc: L60
+    verdict: archive-leaks
+    evidence:
+      - path: reference/README.md
+        lines: L60
+        snippet: "onboarding-gap-analysis.md — phased fix plan from a real onboarding session; tracks gaps as they close, not a durable JTBD."
+    evidence_strength: strong
+    action: fix-referrer
+    referrer:
+      path: reference/README.md
+      lines: L60
+    confidence: high
+    rationale: |
+      reference/README.md describes the document as "tracks gaps as they
+      close" — but the document's own disclaimer (L4-L8) explicitly states
+      it does NOT track closure and is stale. The referrer description
+      contradicts the disclaimer, leading a reader to expect current status
+      that is not there. The description should be updated to signal the
+      historical nature, e.g. "historical point-in-time gap analysis from
+      2026-04-25 onboarding session; some gaps have since shipped."
+    proposed_text: |
+      `onboarding-gap-analysis.md` — historical point-in-time gap analysis
+      from a 2026-04-25 onboarding session; not a live tracker. Several
+      gaps have shipped; read as motivation context, not current roadmap.
+
+  - claim_id: c3
+    quote: "The list is currently hardcoded in the switchroom binary. Adding a new stable file requires a code change + release. This is tracked for convergence (see gap analysis gap 4 and gap 8)."
+    loc: L58-L61
+    verdict: archive-leaks
+    evidence:
+      - path: docs/workspace-files.md
+        lines: L58-L61
+        snippet: "This is tracked for convergence (see [gap analysis](../reference/onboarding-gap-analysis.md) gap 4 and gap 8)."
+      - path: src/agents/workspace.ts
+        lines: L94-L108
+        snippet: "STABLE_BOOTSTRAP_FILENAMES ... DYNAMIC_BOOTSTRAP_FILENAMES (still hardcoded arrays)"
+    evidence_strength: medium
+    action: fix-referrer
+    referrer:
+      path: docs/workspace-files.md
+      lines: L58-L61
+    confidence: medium
+    rationale: |
+      docs/workspace-files.md links the gap analysis as the active
+      tracking location for the workspace loader convergence work. The
+      hardcoded list issue is real and unshipped (workspace.ts L94, L108
+      still shows hardcoded arrays), but the gap-analysis document is not
+      a tracker — it is historical. The link gives the reader a dead-end.
+      The referrer should either remove the link or note it as historical
+      motivation, and if the gap is still open, point to an active issue
+      or RFC instead.
+    proposed_text: |
+      Remove the "(see gap analysis ...)" link. If an active tracking
+      location exists (issue or RFC), link that instead. The gap analysis
+      is historical and does not track closure.
+
+  - claim_id: c4
+    quote: "reference/onboarding-gap-analysis.md — fixes planned for the mechanism-convergence gap"
+    loc: L203
+    verdict: archive-leaks
+    evidence:
+      - path: docs/workspace-files.md
+        lines: L199-L204
+        snippet: "- reference/onboarding-gap-analysis.md — fixes planned for the mechanism-convergence gap"
+    evidence_strength: strong
+    action: fix-referrer
+    referrer:
+      path: docs/workspace-files.md
+      lines: L203
+    confidence: high
+    rationale: |
+      The "Related" section of docs/workspace-files.md describes the gap
+      analysis as "fixes planned for the mechanism-convergence gap" —
+      present tense, implying active roadmap. The document carries a
+      disclaimer saying it is not a live tracker. A reader following this
+      link expecting planned fixes will find a stale snapshot. Either
+      remove the entry or replace with a note that it is historical
+      context ("historical motivation for the convergence design").
+    proposed_text: |
+      `reference/onboarding-gap-analysis.md` — historical motivation for
+      the workspace loader convergence design (point-in-time, 2026-04-25;
+      not a live roadmap).
+
+  - claim_id: c5
+    quote: "See reference/onboarding-gap-analysis.md §3 for the gap this closes."
+    loc: L16
+    verdict: aligned
+    evidence:
+      - path: src/agents/status.ts
+        lines: L14-L17
+        snippet: "See reference/onboarding-gap-analysis.md §3 for the gap this closes."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      This is a JSDoc comment in src/agents/status.ts citing the gap
+      analysis as retrospective motivation for a gap that has been closed
+      (status.ts implements gap 3 — "switchroom agent status"). The comment
+      uses past tense ("the gap this closes") and is accurate as a
+      historical citation. No reader confusion is expected; the comment is
+      an explanation, not a navigation pointer to a live tracker.
+
+  - claim_id: c6
+    quote: "See reference/onboarding-gap-analysis.md §1 ... create_bank is a no-op if the bank already exists."
+    loc: L2887
+    verdict: aligned
+    evidence:
+      - path: src/agents/scaffold.ts
+        lines: L2885-L2891
+        snippet: "(see reference/onboarding-gap-analysis.md §1). create_bank is a no-op if the bank already exists."
+    evidence_strength: medium
+    action: keep
+    confidence: medium
+    rationale: |
+      src/agents/scaffold.ts cites the gap analysis as historical
+      motivation for the auto-create bank logic. Gap 1 (auto-create
+      Hindsight bank on agent create) is confirmed shipped by this code.
+      The comment is a correct retrospective citation, not a forward
+      pointer. No action needed.
