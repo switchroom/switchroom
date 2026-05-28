@@ -1235,8 +1235,9 @@ export class HostdServer {
    * `skip`; the verb itself is always `completed` when it ran (a
    * failing probe is a *finding* the caller renders, not a
    * verb-dispatch failure — same posture as the doctor verb). `deep`
-   * adds a real, quota-costing `claude -p` auth smoke; the default
-   * makes NO model call.
+   * adds an auth-liveness check that reads the agent's stored OAuth
+   * credential and verifies it is present and unexpired; it makes NO
+   * model call (the default path makes no model call either).
    */
   /**
    * `config_propose_edit` — full apply path (#1623 / RFC §3.3-3.4).
