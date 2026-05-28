@@ -87,7 +87,12 @@ export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
       } catch {
         continue
       }
-      if (!row || typeof row.tool_use_id !== 'string' || typeof row.label !== 'string') continue
+      if (
+        !row ||
+        typeof row.tool_use_id !== 'string' ||
+        typeof row.label !== 'string' ||
+        typeof row.tool_name !== 'string'
+      ) continue
       // First write wins — sidecar lines are append-only and we don't
       // expect duplicates, but if one lands we keep the earliest.
       if (labels.has(row.tool_use_id)) continue
