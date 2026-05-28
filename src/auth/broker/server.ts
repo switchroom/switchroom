@@ -128,6 +128,32 @@ interface QuotaState {
   [label: string]: QuotaEntry;
 }
 
+/**
+ * Per-account cached utilization snapshot, written after each successful
+ * `opProbeQuota` call. Consumed by `opListState` so callers (quota-watch
+ * loop) can classify account health without triggering a live probe.
+ * In-memory only — intentionally not persisted. The cache populates from
+ * `/auth`, auto-fallback, and boot-card probes; on broker restart it is
+ * empty until the next such event (watchers treat absent entries as
+ * "unknown" and skip — acceptable cold-start gap).
+ */
+interface LastQuotaEntry {
+  fiveHourUtilizationPct: number;
+  sevenDayUtilizationPct: number;
+  /** ISO string so the in-memory shape is JSON-friendly (no Date objects). */
+  fiveHourResetAt: string | null;
+  sevenDayResetAt: string | null;
+  representativeClaim: string | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
+  /** Unix ms when this snapshot was captured. */
+  capturedAt: number;
+}
+
+interface LastQuotaCache {
+  [label: string]: LastQuotaEntry;
+}
+
 interface ShaIndex {
   [label: string]: string;
 }
@@ -249,6 +275,8 @@ export class AuthBroker {
 
   // In-memory state mirrored to disk.
   private quota: QuotaState = {};
+  /** In-memory utilization cache (not persisted). Populated by opProbeQuota. */
+  private lastQuotaCache: LastQuotaCache = {};
   private shaIndex: ShaIndex = {};
   private thresholdViolations: ThresholdViolations = {};
   /** Last `expiresAt` the broker wrote per label — drives threshold-violation. */
@@ -885,6 +913,7 @@ export class AuthBroker {
       const meta = readAccountMeta(label, this.home);
       const q = this.quota[label];
       const exhausted = q !== undefined && q.exhausted_until > this.now();
+      const lq = this.lastQuotaCache[label];
       return {
         label,
         expiresAt: creds?.claudeAiOauth?.expiresAt,
@@ -892,6 +921,9 @@ export class AuthBroker {
         exhausted_until: q?.exhausted_until,
         threshold_violations: this.thresholdViolations[label] ?? 0,
         last_refreshed_at: meta?.lastRefreshedAt,
+        // Cached utilization snapshot from the most recent probeQuota call.
+        // null when no probe has been run since broker start.
+        last_quota: lq ?? null,
       };
     });
     const agents = Object.entries(this.config.agents ?? {}).map(([name, agent]) => {
@@ -1002,6 +1034,21 @@ export class AuthBroker {
           ok: result.ok,
           error: result.ok ? undefined : result.reason,
         });
+        // Cache the utilization snapshot for listState consumers (quota-watch
+        // loop). Only update on success — a failed probe should not evict a
+        // valid previous snapshot.
+        if (result.ok) {
+          this.lastQuotaCache[label] = {
+            fiveHourUtilizationPct: result.data.fiveHourUtilizationPct,
+            sevenDayUtilizationPct: result.data.sevenDayUtilizationPct,
+            fiveHourResetAt: result.data.fiveHourResetAt?.toISOString() ?? null,
+            sevenDayResetAt: result.data.sevenDayResetAt?.toISOString() ?? null,
+            representativeClaim: result.data.representativeClaim,
+            overageStatus: result.data.overageStatus,
+            overageDisabledReason: result.data.overageDisabledReason,
+            capturedAt: this.now(),
+          };
+        }
         return { label, result };
       }),
     );
