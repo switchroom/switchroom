@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.14.4 — draft-mirror determinism fix (sidecar subscribe race) + CI/doctor
+
+### draft-mirror: replay sidecar history to late subscribers (#1969)
+
+The headline fix. v0.14.3's real-time sidecar (#1963) had a
+subscribe-after-drain ordering bug that silently lost the entire
+activity feed on exactly the turns it was built for, so the draft never
+streamed. Found by live validation on the test-harness canary: a 28s
+clustered-tool turn wrote a fully-populated sidecar
+(`Bash`/`Read`/`ToolSearch` labels) yet produced **zero** `tool_label`
+events and **no** `sendMessageDraft`.
+
+Root cause: `createToolLabelSidecar` does an initial drain (`poll()`) in
+its constructor, but the gateway's `ensureSidecar` wires `onLabel` only
+*after* construction (`create → set → onLabel`). On a fast/clustered
+turn — or any resumed/flipped session where the hook already wrote
+labels — the initial drain consumes every row into the read offset with
+an empty subscriber set, and the subscriber that attaches microseconds
+later receives nothing.
+
+Fix: buffer every ingested row (`label` + `tool_name`) in an ordered
+`seen` log and replay it to each subscriber when it attaches via
+`onLabel`, then register for future rows. Single-threaded, so each row
+reaches the callback exactly once regardless of subscribe timing — the
+sidecar is now deterministic no matter when the gateway subscribes
+relative to the hook's writes. Still behind `SWITCHROOM_DRAFT_MIRROR`
+(default OFF).
+
+### other
+
+- CI: docker-images now uses a GHCR registry cache instead of the flaky
+  `type=gha` cache, fixing the recurring SAS-token-expiry / stalled-blob
+  build failures on the heavy agent image (#1965 / #1968).
+- gateway: a failed always-allow grant is now surfaced loudly and the
+  grant is verified persisted before proceeding (#1967).
+- doctor: new probe asserting approval-kernel DB durability —
+  `allow_always` grants survive a container recreate (#1966).
+
 ## v0.14.3 — draft-mirror determinism (real-time sidecar) + pacing fixes
 
 ### draft-mirror: real-time via PreToolUse sidecar (#1963)
