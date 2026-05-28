@@ -1,0 +1,108 @@
+unit_id: misc-jtbd-small-drift-fixes
+unit_path: multiple (give-each-agent, run-a-fleet, extend-without-forking, remember-across-sessions, survive-reboots-and-real-life, vision, talk-to-agents-from-anywhere, keep-my-subscription-honest, docs/compliance-attestation.md, telegram-plugin/uat/assertions.ts)
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: misc-jtbd-small-drift-fixes
+auditor_notes: |
+  All 11 findings in this batch verified resolved across 10 files.
+  The webhook-handler.ts JSDoc comment at L93 still contains "spawn one-shot
+  claude -p turns" — this is a stale JSDoc in a type-only struct definition
+  that was not part of any fix-batch. The dispatch module (webhook-dispatch.ts)
+  correctly uses inject_inbound. Flagged as a new drift item below.
+findings:
+  - claim_id: jtbd-give-each-agent-its-own-workspace:c8
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      reference/give-each-agent-its-own-workspace.md L107 now reads
+      "reconcile log emits a one-line warning to stderr." The inaccurate
+      "boot card surfaces" claim is gone.
+  - claim_id: jtbd-give-each-agent-its-own-workspace:c9
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L108-109 now reads "switchroom agent destroy <name> removes the
+      agent's scaffold directory. Note: worktree cleanup is not currently
+      wired into the destroy path." Both the command-name error and the
+      misleading symmetric-removal claim are corrected.
+  - claim_id: jtbd-run-a-fleet-of-specialists:c6
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      reference/run-a-fleet-of-specialists.md L42-43 now reads "The
+      Hindsight memory bank persists and requires manual cleanup via that
+      service. The agent's entry in switchroom.yaml also requires a manual
+      edit." The "no dangling config" overstatement is qualified.
+  - claim_id: jtbd-extend-without-forking:c7
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      reference/extend-without-forking.md L38 now reads "Removing an
+      extension takes two steps: running `switchroom agent destroy <name>`
+      removes the scaffold directory..." with the manual YAML edit noted.
+  - claim_id: jtbd-remember-across-sessions:c6
+    original_verdict: vision-only
+    reverify_verdict: aligned
+    note: >
+      reference/remember-across-sessions.md L40-41 now reads "Memory
+      decays sensibly (not yet built — Hindsight banks currently store
+      memories indefinitely; the demote tag excludes entries from recall
+      but does not delete them)." Mark-vision applied.
+  - claim_id: jtbd-survive-reboots-and-real-life:c5
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      reference/survive-reboots-and-real-life.md L37-38 now reads "The
+      Telegram API retry-giveup path currently logs to stderr only and
+      does not send a user-visible message." Coverage qualification added.
+  - claim_id: contract-vision:c9
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      reference/vision.md L127 now reads "No OpenAI, Gemini, Llama, or
+      model swapping for inference. Auxiliary services (e.g. voice
+      transcription via Whisper) are opt-in helpers, not Claude replacements."
+  - claim_id: jtbd-talk-to-agents-from-anywhere:c10
+    original_verdict: vision-only
+    reverify_verdict: aligned
+    note: >
+      reference/talk-to-agents-from-anywhere.md L74-77 now includes
+      "(No specific dead-zone recovery code exists; this relies on
+      Telegram's natural message delivery on reconnect)." Mark-vision
+      applied.
+  - claim_id: archived-status-card-design:c4
+    original_verdict: archive-leaks
+    reverify_verdict: aligned
+    note: >
+      telegram-plugin/uat/assertions.ts L342-343 now reads "see #862 /
+      reference/conversational-pacing.md" — the stale status-card-design.md
+      reference replaced with the active artefact.
+  - claim_id: jtbd-keep-my-subscription-honest:c3
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      Frontmatter outcome now reads "No hidden API billing, no side-door
+      tokens, no Anthropic API keys. Opt-in third-party service keys
+      (e.g. OpenAI Whisper for voice transcription) are stored in the
+      vault and clearly opt-in."
+  - claim_id: jtbd-keep-my-subscription-honest:c5
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      docs/compliance-attestation.md now has an addendum section at L191-204
+      covering the 2026-06-15 Anthropic policy split, RFC #1620, the CI guard,
+      and the one tracked exception (#1798, now resolved). Dated addendum
+      supersedes the original 2026-04-25 attestation for this policy area.
+new_drift:
+  - claim_id: new-1
+    file: src/web/webhook-handler.ts
+    loc: L93
+    verdict: drift-minor
+    note: >
+      JSDoc in the WebhookHandlerOpts type still reads "matching ones spawn
+      one-shot `claude -p` turns." The dispatch module (webhook-dispatch.ts)
+      correctly uses inject_inbound and explicitly calls out that claude -p
+      is prohibited. The JSDoc is stale and misleading but not a live
+      callsite. Action: update-text in the JSDoc to read "matching ones
+      deliver a synthesized turn to the agent via inject_inbound IPC."
+    confidence: high

@@ -1,0 +1,40 @@
+unit_id: jtbd-know-what-my-agent-is-doing
+unit_path: reference/know-what-my-agent-is-doing.md
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: jtbd-know-what-agent-is-doing-fixes
+auditor_notes: |
+  Four originally non-aligned findings addressed. Three fully resolved.
+  c11 (dead-pointer to inbound_ack in posthog.md) is resolved: the row was
+  added to docs/posthog.md. The c4 emoji fix (fire emoji claim) is resolved —
+  the fire emoji is correctly described as a non-terminal error reaction (not
+  a status-reaction-on-inbound), aligned with shipped behavior.
+  The jtbd-too-technical c5 paragraph was replaced with an outcome-level pointer.
+findings:
+  - claim_id: c1
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L34-35 now reads "fires within ~800ms of the message arriving (received,
+      sub-second)." The ~100ms figure is gone.
+  - claim_id: c4
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      The fire emoji claim was corrected. L51 now reads "the non-terminal error
+      reaction: recovery to a working state from that reaction is allowed."
+      The framing of fire as a status reaction on inbound message is gone.
+  - claim_id: c5
+    original_verdict: jtbd-too-technical
+    reverify_verdict: aligned
+    note: >
+      The "Implementation:" paragraph with finalizeStatusReaction and turn_end
+      IPC labels is gone. Replaced with "See the ambient layer design contract
+      at reference/conversational-pacing.md." (L58-59).
+  - claim_id: c11
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      docs/posthog.md now has an inbound_ack row in the events table (L74)
+      pointing to telegram-plugin/streaming-metrics.ts. The reference in the
+      JTBD (L55) now resolves correctly.

@@ -1,0 +1,80 @@
+unit_id: rfc-sub-agent-visibility
+unit_path: reference/sub-agent-visibility-rfc.md
+category: rfc-shipped
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: rfc-sub-agent-visibility-prune-dead-pointers
+auditor_notes: |
+  All ten originally non-aligned findings resolved. Dead pointers removed or
+  replaced with moot notes; drift-major sections updated to reflect the
+  progress-card-driver deletion in PR #1122 PR3; subagent-watcher.ts
+  description updated to reflect SQLite DB path (not FleetMember model);
+  UAT scenario note corrected to acknowledge currently-red status.
+findings:
+  - claim_id: c2
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L17-20 now reads "Bug 6 and Bug 7 are moot. The progress-card-driver
+      was deleted in PR #1122 PR3 before these could be fixed." Cross-turn
+      replacement (pending-work-progress.ts, subagent-handback) named.
+  - claim_id: c3
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      The line "progress-card-driver.ts:1855,1921" is gone from the
+      implementation pointers section (L78-80 now covers subagent-watcher
+      correctly).
+  - claim_id: c4
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      The "progress-card-driver.ts:1108" deferred-completion gate line
+      is gone.
+  - claim_id: c5
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      The "telegram-plugin/two-zone-card.ts" line is gone from the
+      implementation pointers section.
+  - claim_id: c6
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L80 now reads "Writes sub-agent activity to a SQLite DB; used by
+      subagent-handback and pending-work-progress paths. No longer drives
+      a FleetMember data model." Correct current behavior.
+  - claim_id: c7
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      The "Heartbeat re-flushes the card every N seconds" line is gone.
+      Current cross-turn surface (pending-work-progress.ts) is referenced.
+  - claim_id: c8
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      AC-4 L102 now reads "[Moot — the progress card that would have rendered
+      these glyphs was deleted in PR #1122 PR3...]". Dead AC replaced with
+      moot note.
+  - claim_id: c9
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      AC-5 L104 now reads "[Moot — the fleet zone renderer (two-zone-card.ts)
+      was deleted in PR #1122 PR3. No fleet HTML is currently sent to Telegram.]"
+  - claim_id: c11
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L279 now reads: "The UAT scenario tests a pinned progress card that was
+      deleted in PR #1122 PR3. The scenario's expectPinnedCard assertions would
+      fail immediately... The scenario file documents this as currently red."
+      The claim that "5/6 pass" is gone.
+  - claim_id: c12
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L297 now reads "Note: the stall-terminal synthesis (Bug 6 option 1) was
+      wired into gateway.ts but progressDriver?.ingest(...) no-ops because
+      progressDriver is null. This fix path has no user-visible effect and the
+      open 'Bug 6' question is moot."

@@ -1,0 +1,49 @@
+unit_id: jtbd-idempotent-update-and-restart
+unit_path: reference/idempotent-update-and-restart.md
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: jtbd-idempotent-update-switchroom-update
+auditor_notes: |
+  All six originally non-aligned findings resolved. The file's frontmatter outcome,
+  opening body, idempotency section, surface-definition sentence, scheduler topology
+  claim, and doctor behavior description are all updated in the merged file.
+findings:
+  - claim_id: c1
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Frontmatter outcome now names "After running `switchroom update`" and lists
+      hostd and bundled skills in the stack. Old three-command incantation gone.
+  - claim_id: c2
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Body opening paragraph now reads "The user runs `switchroom update`" with
+      the three sub-commands described as internal mechanics.
+  - claim_id: c5
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L43-44 now acknowledges switchroom update as the idempotent form; the three
+      individual commands are framed as finer-control alternatives.
+  - claim_id: c9
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Surface-definition sentence (L93-95) now reads "A single command
+      (`switchroom update`) that does the right thing for the whole stack."
+  - claim_id: c13
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L121-122 now reads "The scheduler runs as an in-container sibling
+      process — it comes up with the agent container, not as a separate
+      service to manage." Correct topology.
+  - claim_id: c15
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L150-152 now reads "doctor detects that the host's claude version
+      differs from the version declared in the current switchroom manifest,
+      flags the drift, and tells the user to run `switchroom update` to realign."
+      Both inaccuracies (wrong comparand, wrong fix message) corrected.

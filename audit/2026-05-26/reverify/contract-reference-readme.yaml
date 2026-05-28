@@ -1,0 +1,50 @@
+unit_id: contract-reference-readme
+unit_path: reference/README.md
+category: contract
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: reference-readme-index-corrections
+auditor_notes: |
+  All six originally non-aligned findings resolved: survey command comment
+  updated, "Most JTBD bodies" qualifier added, outcome title matches vision.md,
+  idempotent-update description matches job: field, CLAUDE.md count corrected
+  to 14, and onboarding-gap-analysis description changed from live-tracker to
+  historical.
+findings:
+  - claim_id: c4
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L21-22 now reads "# Survey every JTBD in one read (also prints headers
+      for non-JTBD docs):" with grep filter. Comment accurately reflects mixed output.
+  - claim_id: c5
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L25-26 now reads "Most JTBD bodies have Signs it's working, Anti-patterns,
+      and UAT prompts sections" — qualifier added for the one JTBD that lacks them.
+  - claim_id: c9
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L52 now reads "Always available, in Telegram, done properly — there when
+      you want it" — matches reference/vision.md L96 exactly.
+  - claim_id: c10
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L55 now matches the job: field exactly: "update switchroom and trust that
+      everything is actually running the new version, no manual checks".
+  - claim_id: c11
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      CLAUDE.md L249 now reads "14 outcome-focused jobs". The stale "13" count
+      is corrected.
+  - claim_id: c12
+    original_verdict: archive-leaks
+    reverify_verdict: aligned
+    note: >
+      reference/README.md L60 now reads "historical point-in-time gap analysis
+      from a 2026-04-25 onboarding session; not a live tracker." Contradicts the
+      prior "tracks gaps as they close" description that conflicted with the
+      document's own disclaimer.

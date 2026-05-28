@@ -1,0 +1,26 @@
+unit_id: artefact-conversational-pacing
+unit_path: reference/conversational-pacing.md
+category: artefact-current
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: conversational-pacing-emoji-fix
+auditor_notes: |
+  All three originally non-aligned findings resolved. The emoji sequence,
+  function name, and state struct listing are all updated in the merged file.
+  telegram-style.md.hbs also carries the corrected emoji sequence.
+findings:
+  - claim_id: c1
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Correct emoji sequence (no fire emoji) now in conversational-pacing.md L28
+      and profiles/_shared/telegram-style.md.hbs L20. Confirmed by reading both files.
+  - claim_id: c2
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L28 now reads "gateway.ts:startTurnTypingLoop" — the correct function name.
+  - claim_id: c6
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L82 now lists "inFlightTools" in the state struct. Full listing confirmed.

@@ -1,0 +1,34 @@
+unit_id: code-escalation-E2
+unit_path: src/agents/scaffold.ts + src/cli/agent.ts
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+escalation_ref: E2 (jtbd-give-each-agent-its-own-workspace: c1-c4, c9, c10)
+auditor_notes: |
+  The original outcome-not-realized findings for workspace worktree provisioning
+  are resolved. reconcileAgent in scaffold.ts now calls ensureBareClone and
+  ensureAgentWorktree for each repos: entry (L4325-4329). The destroy path in
+  agent.ts now calls removeAgentWorktree for each repos: entry before wiping
+  the agent directory (L1986-1990).
+
+  The JTBD doc claims in give-each-agent c8 and c9 (doc drift, not escalation)
+  were addressed in the misc-jtbd-small-drift-fixes batch and are confirmed
+  aligned in that reverify file.
+findings:
+  - claim_id: c1-c4
+    original_verdict: outcome-not-realized
+    reverify_verdict: aligned
+    note: >
+      src/agents/scaffold.ts L4320-4336: reconcileAgent now calls
+      ensureBareClone(slug, entry.url) then ensureAgentWorktree(name, slug,
+      clonePath, agentDir) for each repos: entry. Both functions are
+      idempotent; network failures are non-fatal (logged and continued).
+      The "worktrees are provisioned automatically on reconcile" outcome
+      is now realized.
+  - claim_id: c9
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      src/cli/agent.ts L1973-1991: destroy path now calls removeAgentWorktree
+      for each repos: entry in the resolved agent config. Symmetric removal
+      is now wired (though non-fatal on error). The command name is also
+      correct: "destroy", not "remove".

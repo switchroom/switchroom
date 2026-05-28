@@ -1,0 +1,17 @@
+unit_id: historical-prd
+unit_path: reference/PRD.md
+category: historical
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: manifest-hygiene
+auditor_notes: |
+  The dead-pointer was the manifest unit itself pointing at a deleted file.
+  The unit was removed from the manifest. Verified by reading manifest.yaml.
+findings:
+  - claim_id: c1
+    original_verdict: dead-pointer
+    reverify_verdict: aligned
+    note: >
+      scripts/drift-audit/manifest.yaml no longer contains a "historical-prd"
+      unit. A comment at L228-231 records the deletion with the PR reference.
+      scripts/drift-audit/README.md no longer references reference/PRD.md in
+      the historical category examples row.
