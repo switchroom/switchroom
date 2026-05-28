@@ -46,6 +46,7 @@ import { homedir } from "node:os";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 import type { CheckStatus } from "./doctor-status.js";
+import { checkIntegrationScaffoldWiring } from "./doctor-scaffold-wiring.js";
 
 export interface CheckResult {
   name: string;
@@ -320,6 +321,18 @@ export async function runNotionChecks(
   if (notionAgents.length > 0 && config.notion_workspace) {
     results.push(...(await checkVaultAclAligned(config, notionAgents, d)));
     results.push(...checkLauncherHeartbeat(notionAgents, d));
+    results.push(
+      ...checkIntegrationScaffoldWiring({
+        label: "notion",
+        mcpKey: "notion",
+        agents: notionAgents,
+        agentsDir: d.agentsDir,
+        deps: {
+          existsSync: d.existsSync,
+          readFileSync: (path: string) => d.readFileSync(path, "utf-8"),
+        },
+      }),
+    );
   }
 
   return results;

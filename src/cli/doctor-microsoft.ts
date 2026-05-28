@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 import type { CheckStatus } from "./doctor-status.js";
+import { checkIntegrationScaffoldWiring } from "./doctor-scaffold-wiring.js";
 
 export interface CheckResult {
   name: string;
@@ -325,6 +326,18 @@ export function runMicrosoftChecks(
   const msAgents = computeMicrosoftEnabledAgents(config);
   results.push(...checkOAuthClient(config, msAgents.length > 0));
   results.push(...checkLauncherHeartbeat(msAgents, d));
+  results.push(
+    ...checkIntegrationScaffoldWiring({
+      label: "microsoft",
+      mcpKey: "ms-365",
+      agents: msAgents,
+      agentsDir: d.agentsDir,
+      deps: {
+        existsSync: d.existsSync,
+        readFileSync: (path: string) => d.readFileSync(path, "utf-8"),
+      },
+    }),
+  );
 
   return results;
 }
