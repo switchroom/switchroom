@@ -31,11 +31,14 @@ export function bareClonePath(slug: string): string {
  *
  * Idempotent — safe to call on every reconcile.
  *
+ * Synchronous: uses execFileSync internally; exported as a sync function
+ * so that callers (reconcileAgent) do not need to become async.
+ *
  * @param slug   Kebab-case repo key from switchroom.yaml (e.g. "switchroom-web")
  * @param url    Git remote URL (used verbatim; never auto-derived)
  * @returns      Absolute path to the bare clone directory
  */
-export async function ensureBareClone(slug: string, url: string): Promise<string> {
+export function ensureBareClone(slug: string, url: string): string {
   const reposDir = resolveStatePath("repos");
   mkdirSync(reposDir, { recursive: true });
 

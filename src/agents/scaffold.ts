@@ -247,13 +247,10 @@ import {
   createMinimalClaudeConfig,
   loadUserConfig,
 } from "../setup/onboarding.js";
-import { ensureBareClone, bareClonePath } from "../repos/bare-clone.js";
+import { ensureBareClone } from "../repos/bare-clone.js";
 import {
   ensureAgentWorktree,
-  removeAgentWorktree,
-  listAgentWorktrees,
   agentWorktreePath,
-  type WorktreeState,
 } from "../repos/agent-worktree.js";
 
 export interface ScaffoldResult {
@@ -4041,6 +4038,26 @@ export function reconcileAgent(
   const hindsightTopicFilterMode = (
     agentConfig.memory?.recall as { topic_filter_mode?: string } | undefined
   )?.topic_filter_mode;
+
+  // --- Provision worktrees for repos: entries ---
+  // Runs on every reconcile so the paths injected as SWITCHROOM_REPO_<SLUG>
+  // env vars in start.sh actually exist on disk. Both functions are
+  // idempotent: first call creates; subsequent calls fetch + ff-only merge
+  // (or skip when dirty). Network failures in ensureBareClone are non-fatal
+  // (logged and continued) so an unreachable remote does not block reconcile.
+  if (agentConfig.repos) {
+    for (const [slug, entry] of Object.entries(agentConfig.repos)) {
+      try {
+        const clonePath = ensureBareClone(slug, entry.url);
+        ensureAgentWorktree(name, slug, clonePath, agentDir);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `[switchroom] repo "${slug}": provisioning failed (continuing): ${msg}\n`,
+        );
+      }
+    }
+  }
 
   // --- Reconcile start.sh (purely template-driven, safe to overwrite) ---
   // No existsSync guard: start.sh is a pure function of config+template.
