@@ -1,6 +1,56 @@
 # Changelog
 
-## v0.13.65 — webkite pre-approval (first web fetch no longer wedges)
+## v0.14.0 — friendly activity mirror + webkite doctor
+
+Minor bump marking the **human-friendly activity** line: the agent's
+"what am I doing" signal is now rendered from the model's own
+plain-English descriptions, not developer tool jargon. Bundles two
+merged PRs on top of the v0.13.x human-feel arc (fast-ack, turn-pacing
+v4, draft-mirror Phase 1).
+
+### Draft-mirror: friendly tool_use rendering (#1951)
+
+Still behind `SWITCHROOM_DRAFT_MIRROR` (**default OFF**; flag-off
+behavior is byte-identical to v0.13.65). The flag-on canary on
+test-harness falsified the original Phase 1 premise (stream
+`assistant.text` prose into the draft): on a normal tool turn the
+model emits *no* interstitial prose — it goes `thinking` (redacted) →
+`tool_use` → `reply`, so the prose draft was empty.
+
+The real human-friendly signal lives in **`tool_use.input`, authored
+by the model** — verified against a live session JSONL (1360 Bash
+calls): `Bash.description` ("List workspace", never `ls -la`),
+`Read`/`Edit`/`Write` file basename, `Grep` pattern, `Task`
+description, `WebFetch` hostname, plus domain labels for hindsight
+("Searching memory"), calendar, email, drive, notes. This is exactly
+why Claude Code's own UI reads friendly — the model writes the
+descriptions; the Bash tool *requires* one.
+
+New `describeToolUse(name, input)` (`telegram-plugin/tool-activity-summary.ts`)
+renders each tool_use as a present-tense, human-friendly line —
+model-authored description, then domain label, then humanized name;
+**never raw shell/query syntax**. Option A: uniform across code and
+non-code agents — a health coach sees "Searching memory" / "Checking
+your calendar"; a code agent sees "Editing gateway.ts" / the model's
+own Bash description. Streams the latest action into the ephemeral
+compose-area draft, clears on reply.
+
+The prior Phase 1 `assistant.text`→draft transport flip is reverted
+(that lane keeps visible-answer-stream). `drainActivitySummary` now
+HTML-escapes content before the `<i>` wrap (the #1942 literal-tag bug
+class — file names / descriptions can carry `<`, `>`, `&`). Design in
+`docs/rfcs/draft-mirror-preview.md` (PIVOT section). Ships dormant;
+the test-harness canary gates any default flip.
+
+### Webkite doctor health section (#1953)
+
+`switchroom doctor` gains a webkite section: binary architecture
+check, cloakbrowser presence, and per-agent `.mcp.json` scaffold
+wiring — so the webkite fleet-default integration (v0.13.62) is
+observable from the standard health sweep instead of silently
+degrading.
+
+
 
 Fixes the webkite rollout's last gap. The webkite MCP server was wired
 into every agent's `.mcp.json` and native WebFetch/WebSearch were
