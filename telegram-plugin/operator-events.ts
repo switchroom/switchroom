@@ -257,16 +257,12 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         text: [
           `💳 <b>Credit balance too low</b> for <b>${agent}</b>.`,
           detail ? `<i>${detail}</i>` : '',
-          `Swap to another account slot or add a new one.`,
+          `Use <code>/auth use &lt;label&gt;</code> to switch account slot or <code>/auth add</code> to add one.`,
         ]
           .filter(Boolean)
           .join('\n'),
         keyboard: {
           inline_keyboard: [
-            [
-              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${encodeURIComponent(ev.agent)}` },
-              { text: '➕ Add slot', callback_data: `op:add-slot:${encodeURIComponent(ev.agent)}` },
-            ],
             [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
@@ -280,16 +276,12 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         text: [
           `⚠️ <b>Quota exhausted</b> for <b>${agent}</b>.`,
           detail ? `<i>${detail}</i>` : '',
-          `All account slots are at the usage limit. Switchroom will auto-fallback when another slot is available.`,
+          `All account slots are at the usage limit. Switchroom will auto-fallback when another slot is available. Use <code>/auth use &lt;label&gt;</code> to switch manually.`,
         ]
           .filter(Boolean)
           .join('\n'),
         keyboard: {
           inline_keyboard: [
-            [
-              { text: '🔄 Swap slot', callback_data: `op:swap-slot:${encodeURIComponent(ev.agent)}` },
-              { text: '➕ Add slot', callback_data: `op:add-slot:${encodeURIComponent(ev.agent)}` },
-            ],
             [{ text: '⏳ Wait', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },

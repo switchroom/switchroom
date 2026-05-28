@@ -183,19 +183,18 @@ describe("JTBD/talk-from-anywhere — no live code path tells the operator to le
     return src;
   }
 
-  it.skip("no string says 'run in terminal' anywhere in the live gateway", () => {
-    // Today (gateway.ts:8980): "Phase 4c will wire ${action} buttons.
-    // Until then, run in terminal: switchroom auth use ..."
-    //
-    // Anti-pattern: tells the operator the product is incomplete AND
-    // shoves them to the desktop. Two failures in one sentence.
+  it("no string says 'run in terminal' anywhere in the live gateway", () => {
+    // The Phase 4c stub at gateway.ts said "run in terminal: switchroom auth use ..."
+    // That stub has been removed (E5). Text commands /auth use and /auth add
+    // are the supported surface; no terminal redirect should appear.
     expect(gatewaySrcWithoutAllowedPunts()).not.toMatch(/run in terminal/i);
   });
 
-  it.skip("no string says 'Phase Nx will wire …' as a feature stub", () => {
+  it("no string says 'Phase Nx will wire …' as a feature stub", () => {
     // Principle 2 (defaults test): "Does this work with zero
     // configuration?" Stub callbacks that promise future work fail.
     // Either ship the button or remove the button.
+    // The Phase 4c swap-slot/add-slot stub has been removed (E5).
     expect(gatewaySrcWithoutAllowedPunts()).not.toMatch(/Phase \d[a-z]? will wire/i);
   });
 
@@ -264,10 +263,14 @@ describe("JTBD/talk-from-anywhere — every fleet-mutation has a Telegram-native
     expect(gatewaySrc).toMatch(/bot\.command\(['"]agent[-_ ]?admin['"]/);
   });
 
-  it.skip("/auth slot management is fully wired (no Phase 4c stub)", () => {
-    // Vision outcome 3: subscription-honest. Operator manages auth
-    // slots; switching the active slot today requires SSH.
+  it("/auth slot management has no terminal-redirect buttons (E5 regression guard)", () => {
+    // The vestigial swap-slot / add-slot inline-keyboard buttons have been
+    // removed (E5). The supported path is /auth use <label> and /auth add.
+    // Guard against re-introducing stub buttons that tell the operator to
+    // use the terminal.
     expect(gatewaySrc).not.toMatch(/Phase 4c will wire/);
+    expect(gatewaySrc).not.toMatch(/swap-slot/);
+    expect(gatewaySrc).not.toMatch(/add-slot/);
   });
 
   it.skip("/vault broker {status,restart} — operator can recover a dead broker", () => {

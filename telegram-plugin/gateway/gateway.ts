@@ -12333,8 +12333,7 @@ function resolveAgentDirForName(agent: string): string | null {
  *   restart   — systemctl --user restart switchroom-<agent>
  *   reauth    — delegate to runSwitchroomAuthCommand (same flow as /auth reauth)
  *   logs      — post last 30 lines of journalctl for the agent
- *   swap-slot, add-slot — Phase 4c will wire these; for now toast with the
- *                         equivalent CLI command for the user to run manually.
+ *   slot management buttons — removed (E5); use /auth use or /auth add instead.
  */
 /**
  * Issue #44: handle taps on the deferred-secret card's inline buttons.
@@ -13963,15 +13962,6 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
       }
       return
     }
-    case 'swap-slot':
-    case 'add-slot': {
-      await ctx.answerCallbackQuery({ text: 'Phase 4c will wire this' }).catch(() => {})
-      const cmd = action === 'swap-slot' ? `auth use ${agent} <slot-name>` : `auth add ${agent}`
-      await ctx.reply(`Phase 4c will wire ${action} buttons. Until then, run in terminal: <code>switchroom ${cmd}</code>`, {
-        parse_mode: 'HTML',
-      })
-      return
-    }
     default: {
       await ctx.answerCallbackQuery({ text: `Unknown action: ${action}` }).catch(() => {})
       return
@@ -14866,7 +14856,7 @@ bot.on('callback_query:data', async ctx => {
 
   // op:<action>:<encoded-agent> callbacks from operator-events.ts
   // renderOperatorEvent(). Agent name is URL-encoded at emit (issue #24).
-  // Actions: dismiss, restart, reauth, swap-slot, add-slot, logs.
+  // Actions: dismiss, restart, reauth, logs.
   if (data.startsWith('op:')) {
     await handleOperatorEventCallback(ctx, data)
     return

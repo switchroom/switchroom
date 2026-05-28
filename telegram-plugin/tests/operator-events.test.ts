@@ -177,23 +177,29 @@ describe('renderOperatorEvent — credentials-invalid', () => {
 })
 
 describe('renderOperatorEvent — credit-exhausted', () => {
-  it('offers swap + add slot buttons', () => {
+  it('shows credit balance text with /auth use hint and no stub buttons (E5)', () => {
     const { text, keyboard } = renderOperatorEvent(makeEvent('credit-exhausted'))
     expect(text).toContain('Credit balance')
+    expect(text).toContain('/auth use')
     const buttons = keyboard.inline_keyboard.flat()
-    expect(buttons.some(b => b.callback_data?.includes('swap-slot'))).toBe(true)
-    expect(buttons.some(b => b.callback_data?.includes('add-slot'))).toBe(true)
+    // swap-slot and add-slot buttons removed (E5 — they redirected to terminal)
+    expect(buttons.some(b => b.callback_data?.includes('swap-slot'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('add-slot'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('dismiss'))).toBe(true)
   })
 })
 
 describe('renderOperatorEvent — quota-exhausted', () => {
-  it('renders quota text + swap/add buttons', () => {
+  it('renders quota text with /auth use hint and no stub buttons (E5)', () => {
     const { text, keyboard } = renderOperatorEvent(makeEvent('quota-exhausted'))
     expect(text).toContain('Quota exhausted')
     expect(text).toContain('<b>gymbro</b>')
+    expect(text).toContain('/auth use')
     const buttons = keyboard.inline_keyboard.flat()
-    expect(buttons.some(b => b.callback_data?.includes('swap-slot'))).toBe(true)
-    expect(buttons.some(b => b.callback_data?.includes('add-slot'))).toBe(true)
+    // swap-slot and add-slot buttons removed (E5 — they redirected to terminal)
+    expect(buttons.some(b => b.callback_data?.includes('swap-slot'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('add-slot'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('dismiss'))).toBe(true)
   })
 
   it('contains auto-fallback slot info in detail when provided', () => {
