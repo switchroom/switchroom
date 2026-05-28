@@ -18,6 +18,7 @@ import { createPublicKey, createPrivateKey } from "node:crypto";
 import { listSecrets, getStringSecret } from "../vault/vault.js";
 import { resolveAgentsDir, resolvePath } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { assessThinkingEffortRisk } from "../config/thinking-effort-risk.js";
 import { resolveStatePath, LEGACY_STATE_DIR } from "../config/paths.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
@@ -440,6 +441,35 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
       foundSubagents.length > 0
         ? undefined
         : "Add defaults.subagents to switchroom.yaml to enable Sonnet/Haiku delegation. See docs/sub-agents.md for the worker/researcher/reviewer pattern.",
+  });
+
+  // Adaptive-thinking effort guard (#1978). Opus 4.x + thinking_effort
+  // above the `low` floor can 400 on thinking blocks when work runs
+  // through concurrent sub-agents (an upstream claude CLI merge bug).
+  // Resolve each agent's effective model + effort and flag the combo so
+  // an operator sees it at `doctor`/`apply` time, not as silent 400s.
+  const effortRisks: string[] = [];
+  for (const [name, agentConfig] of Object.entries(config.agents)) {
+    const resolved = resolveAgentConfig(
+      config.defaults,
+      config.profiles,
+      agentConfig,
+    );
+    if (assessThinkingEffortRisk(resolved.model, resolved.thinking_effort).risky) {
+      effortRisks.push(name);
+    }
+  }
+  results.push({
+    name: "thinking_effort × adaptive model",
+    status: effortRisks.length > 0 ? "warn" : "ok",
+    detail:
+      effortRisks.length > 0
+        ? `${effortRisks.length} agent(s) on Opus 4.x with thinking_effort > low: ${effortRisks.join(", ")}`
+        : "no risky model/effort combos",
+    fix:
+      effortRisks.length > 0
+        ? "Pin `thinking_effort: low` for Opus 4.x agents — medium+ can 400 on 'thinking blocks cannot be modified' with concurrent sub-agents (issue #1978). Removing the field is NOT a fix (Opus 4.8 defaults effort=high when unset)."
+        : undefined,
   });
 
   return results;

@@ -25,6 +25,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | Field | Cascade | Description |
 |-------|---------|-------------|
 | `model` | override | Claude model (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`). Haiku is the default for the handoff summarizer; agents typically use opus or sonnet. |
+| `thinking_effort` | override | Adaptive-thinking effort passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`). Defaults to `low` when unset. **On Opus 4.x keep this at `low`** — `medium`+ emits thinking blocks that the bundled claude CLI can mis-merge under concurrent sub-agents, causing `400 'thinking blocks cannot be modified'` (issue #1978). `switchroom doctor` warns on the risky combo. Removing the field does *not* help: Opus 4.8 defaults `effort=high` when `--effort` is omitted. |
 | `extends` | — | Named profile to inherit from |
 | `tools.allow` / `tools.deny` | union | Tool permissions |
 | `soul` | per-field (**seed-time only**) | Agent persona (name, style, boundaries). Cascades per-field, but **only at first scaffold** — it seeds `workspace/SOUL.md`, which is then user-owned (see [Persona & SOUL.md ownership](#persona--soulmd-ownership)). Editing `soul:` later does **not** change an agent whose SOUL.md already exists. |
