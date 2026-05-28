@@ -307,6 +307,25 @@ describe("scaffoldAgent", () => {
     expect(startSh).toContain("--permission-mode bypassPermissions");
   });
 
+  it("reconcile pre-approves webkite MCP tools in permissions.allow", () => {
+    // The live `switchroom apply` path reconciles EXISTING agents
+    // (reconcileAgent), not scaffoldAgent. This pins that the reconcile
+    // desiredAllow also carries mcp__webkite__* — the path that actually
+    // runs on every restart/apply for a deployed fleet.
+    const config = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "webkite-reconcile": config },
+    } as SwitchroomConfig;
+    scaffoldAgent("webkite-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("webkite-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    const settings = JSON.parse(
+      readFileSync(join(tmpDir, "webkite-reconcile", ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toContain("mcp__webkite__*");
+  });
+
   it("reconcile re-renders start.sh with fallback_model flag", () => {
     const config = makeAgentConfig({ fallback_model: "sonnet" });
     const switchroomConfig: SwitchroomConfig = {
@@ -415,6 +434,63 @@ describe("scaffoldAgent", () => {
       if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
       else process.env.SWITCHROOM_WEBKITE_BINARY = prev;
     }
+  });
+
+  it("webkite MCP tools are pre-approved in permissions.allow (no first-use prompt)", () => {
+    // Webkite replaces native WebFetch — the first "read this URL" is a
+    // guaranteed, common turn. If webkite_* tools aren't pre-approved,
+    // that call wedges on a Claude Code permission prompt. Pre-approval
+    // is gated only on the per-agent opt-out (NOT on binary presence),
+    // matching when the MCP entry is emitted.
+    const config = makeAgentConfig({});
+    const result = scaffoldAgent("webkite-allow-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toContain("mcp__webkite__*");
+    expect(settings.permissions.allow).toContain("mcp__webkite");
+  });
+
+  it("re-seeds webkite pre-approval into an EXISTING agent's allow (merge path)", () => {
+    // The bug this guards: `switchroom apply` on a deployed (existing)
+    // agent hits writeIfMissing — which SKIPS the settings.json template
+    // — then the MCP-merge block re-seeds allow. Pre-fix that block only
+    // re-seeded agent-config + hostd, so webkite never reached existing
+    // agents' allow and every deployed agent's first webkite_* call
+    // wedged on a permission prompt (caught live on the v0.13.63 fleet).
+    const config = makeAgentConfig({});
+    // First scaffold creates settings.json (fresh path — has webkite).
+    const result = scaffoldAgent("wk-existing", config, tmpDir, telegramConfig, {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "wk-existing": config },
+    } as SwitchroomConfig);
+    const settingsPath = join(result.agentDir, ".claude", "settings.json");
+    // Simulate a PRE-webkite deployed agent: strip webkite from allow.
+    const s1 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    s1.permissions.allow = s1.permissions.allow.filter(
+      (x: string) => !x.includes("webkite"),
+    );
+    writeFileSync(settingsPath, JSON.stringify(s1, null, 2));
+    expect(JSON.parse(readFileSync(settingsPath, "utf-8")).permissions.allow)
+      .not.toContain("mcp__webkite__*");
+    // Re-scaffold (existing-agent merge path) must re-seed webkite.
+    scaffoldAgent("wk-existing", config, tmpDir, telegramConfig, {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "wk-existing": config },
+    } as SwitchroomConfig);
+    const s2 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(s2.permissions.allow).toContain("mcp__webkite__*");
+  });
+
+  it("webkite opt-out removes the pre-approval too", () => {
+    const config = makeAgentConfig({ mcp_servers: { webkite: false } } as Partial<AgentConfig>);
+    const result = scaffoldAgent("webkite-optout-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).not.toContain("mcp__webkite__*");
   });
 
   it("fail-safe: webkite binary ABSENT → native WebFetch/WebSearch kept", () => {

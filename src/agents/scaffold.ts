@@ -660,6 +660,24 @@ const HOSTD_MCP_TOOLS = [
 ];
 
 /**
+ * Pre-approved MCP tool names for the fleet-default `webkite` server
+ * (wired by resolveWebkiteMcpEntry unless the agent opts out). Without
+ * these in the allow list, the FIRST time the model reaches for any
+ * webkite_* tool — i.e. the first "read this URL for me" — Claude Code
+ * blocks on a permission prompt the operator must approve via Telegram,
+ * wedging the turn. Since webkite REPLACES native WebFetch/WebSearch
+ * (those are denied), that first web fetch is guaranteed and common, so
+ * an un-approved webkite is effectively a broken web-fetch capability.
+ * Wildcard covers all 13 webkite tools (read/search/extract/crawl/map/
+ * clip/session/diagnose/…) and any future additions without a re-bump.
+ * Same shape + rationale as AGENT_CONFIG_MCP_TOOLS above.
+ */
+const WEBKITE_MCP_TOOLS = [
+  "mcp__webkite",
+  "mcp__webkite__*",
+];
+
+/**
  * Legacy `mcp__switchroom__*` permission tokens that pre-#235 agents have
  * baked into their `settings.permissions.allow`. The switchroom-mcp server
  * is deprecated (#235) — its 4 tools were dormant (zero callers) and the
@@ -2476,6 +2494,13 @@ export function scaffoldAgent(
     // (daemon-side gates remain the real security boundary).
     ...AGENT_CONFIG_MCP_TOOLS,
     ...HOSTD_MCP_TOOLS,
+    // Webkite is fleet-default (resolveWebkiteMcpEntry) unless the agent
+    // opts out. Pre-approve its tools so the first web fetch doesn't
+    // wedge on a permission prompt — webkite IS the web-fetch path now
+    // (native WebFetch/WebSearch are denied). Gated on the same opt-out
+    // as the MCP entry emission, so a webkite-disabled agent doesn't
+    // carry dangling pre-approvals.
+    ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
   ]);
 
   // Compute Hindsight plugin context for the start.sh + settings.json
@@ -2621,7 +2646,17 @@ export function scaffoldAgent(
         ? settings.permissions.allow
         : []
       ).filter((p: string) => !LEGACY_HOSTD_BLANKET_TOKENS.includes(p));
-      for (const t of [...AGENT_CONFIG_MCP_TOOLS, ...HOSTD_MCP_TOOLS]) {
+      // Webkite is fleet-default; re-seed its tools into EXISTING agents'
+      // allow on apply (writeIfMissing above skips the template for
+      // existing agents, so the fresh permissionAllow never lands). This
+      // is the existing-agent twin of the permissionAllow webkite spread.
+      // Without it, every deployed agent's first webkite_* call wedges on
+      // a permission prompt even though .mcp.json wires webkite (the merge
+      // at the INTEGRATION_MCP_RESOLVERS loop below). Gated on the same
+      // opt-out as the MCP entry emission.
+      const webkiteAllowTools =
+        agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS;
+      for (const t of [...AGENT_CONFIG_MCP_TOOLS, ...HOSTD_MCP_TOOLS, ...webkiteAllowTools]) {
         if (!allow.includes(t)) allow.push(t);
       }
       settings.permissions.allow = allow;
@@ -4246,6 +4281,7 @@ export function reconcileAgent(
     // MCP servers so first-use doesn't wedge on a permission prompt.
     ...AGENT_CONFIG_MCP_TOOLS,
     ...HOSTD_MCP_TOOLS,
+    ...(agentConfig.mcp_servers?.["webkite"] === false ? [] : WEBKITE_MCP_TOOLS),
   ]);
   const desiredDeny = dedupe([
     ...(tools.deny ?? []),
