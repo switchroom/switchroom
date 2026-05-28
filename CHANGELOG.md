@@ -1,6 +1,42 @@
 # Changelog
 
-## v0.13.63 — Debian trixie base (glibc 2.41) + fail-safe webkite deny
+## v0.13.64 — turn-pacing v4 (greetings) + draft-mirror preview Phase 1
+
+Two changes, both about the "what is my agent doing / does it answer
+me" feel.
+
+### turn-pacing v4 — always reply to a direct message (#1946)
+
+v0.13.61's v3 directive ("don't ack, only reply with substantive
+content") over-corrected: the model began classifying bare social
+messages — "hi", "hey", "you there?" — as not-substantive and ending
+the turn with NO_REPLY, leaving a direct human message unanswered
+(live clerk regression 2026-05-28: a plain "hi" sat silent for 300s
+and only replied via the framework fallback). v4 leads with "ALWAYS
+reply to a direct message" + an explicit greeting/thanks/question
+carve-out, then keeps the no-placeholder-ack rule that killed the
+"on it" spam. Single-string scaffold.ts change; the directive lives
+in host-generated settings.json (no image dependency). New UAT gate
+`greeting-reply-dm.test.ts` — bare "hi" → reply in ~16s (was:
+NO_REPLY → 300s framework fallback).
+
+### draft-mirror preview Phase 1 — flag-gated (#1947)
+
+First step of the draft-mirror RFC (`docs/rfcs/draft-mirror-preview.md`):
+stream the model's prose narration into the ephemeral compose-area
+draft as a live "what's it doing" preview that clears when the reply
+lands — reply stays the canonical committed answer. Behind
+`SWITCHROOM_DRAFT_MIRROR` (**default OFF — zero behavior change** until
+explicitly enabled). When on, narration routes to `sendMessageDraft`
+and the activity-summary tool-count draft is suppressed to avoid
+colliding on the single per-chat draft slot. No-reply delivery is
+owned by turn-flush (not answer-stream materialize, which is dead on
+the draft-only path). Vision-evolution of `know-what-my-agent-is-doing`
+(model's own words, ephemeral) — not the retired #1122 persistent card.
+Ships dormant; the flag-on canary on test-harness gates any default
+flip (Phase 3).
+
+
 
 Unblocks the v0.13.62 webkite rollout. The v0.13.62 canary caught the
 webkite MCP binary requiring **GLIBC_2.39**, which the Debian bookworm
