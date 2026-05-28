@@ -6,6 +6,9 @@ import {
   registerAndRender,
   verbForTool,
   describeToolUse,
+  appendActivityLine,
+  renderActivityFeed,
+  MIRROR_MAX_LINES,
 } from "../tool-activity-summary.js";
 
 describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
@@ -281,5 +284,47 @@ describe("registerAndRender — ergonomic full-pipeline call", () => {
     ).toBeNull();
     // State unchanged
     expect(s.firstToolName).toBeNull();
+  });
+});
+
+describe("appendActivityLine + renderActivityFeed — accumulating draft feed", () => {
+  it("accumulates distinct actions chronologically (newest last)", () => {
+    const lines: string[] = [];
+    expect(appendActivityLine(lines, "Read", { file_path: "a/gateway.ts" })).toBe(
+      "· Reading gateway.ts",
+    );
+    expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
+      "· Reading gateway.ts\n· Searching memory",
+    );
+    expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
+      "· Reading gateway.ts\n· Searching memory\n· List workspace",
+    );
+  });
+
+  it("collapses consecutive exact-duplicate lines", () => {
+    const lines: string[] = [];
+    appendActivityLine(lines, "Read", { file_path: "a.ts" });
+    appendActivityLine(lines, "Read", { file_path: "a.ts" }); // dup → collapsed
+    expect(lines).toEqual(["Reading a.ts"]);
+  });
+
+  it("returns null (no feed update) for surface tools", () => {
+    const lines: string[] = [];
+    expect(appendActivityLine(lines, "mcp__switchroom-telegram__reply", { text: "hi" })).toBeNull();
+    expect(lines).toEqual([]);
+  });
+
+  it("caps to the last MIRROR_MAX_LINES with a '+N earlier' header", () => {
+    const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
+    const out = renderActivityFeed(lines)!;
+    expect(out.startsWith("· +3 earlier…\n")).toBe(true);
+    // Only the last 6 actions are shown.
+    expect(out).toContain("· Action 4");
+    expect(out).toContain("· Action 9");
+    expect(out).not.toContain("· Action 3\n");
+  });
+
+  it("renderActivityFeed returns null on empty", () => {
+    expect(renderActivityFeed([])).toBeNull();
   });
 });

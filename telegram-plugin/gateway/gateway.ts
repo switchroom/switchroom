@@ -58,6 +58,7 @@ import {
   makeEmptyActivityState,
   registerAndRender,
   describeToolUse,
+  appendActivityLine,
   type ActivityState,
 } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -1338,6 +1339,11 @@ type CurrentTurn = {
   activityInFlight: Promise<void> | null
   activityPendingRender: string | null
   activityLastSentRender: string | null
+  // Draft-mirror Phase 2: accumulating friendly-action feed for this turn
+  // (DRAFT_MIRROR only). Each non-surface tool_use appends a line via
+  // `appendActivityLine`; the feed renders as a capped chronological list
+  // in the ephemeral draft and clears on reply. Reset per turn.
+  mirrorLines: string[]
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
   // gates on minInitialChars). Materialized and cleared at turn_end.
@@ -7001,6 +7007,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityInFlight: null,
           activityPendingRender: null,
           activityLastSentRender: null,
+          mirrorLines: [],
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
@@ -7146,11 +7153,12 @@ function handleSessionEvent(ev: SessionEvent): void {
       // exactly once at a time and re-running until pending matches
       // the last-sent. Captures `turn` so a late drain after turn-swap
       // can't corrupt the next turn's atom.
-      // DRAFT_MIRROR (RFC draft-mirror-preview): render each tool_use as a
-      // human-friendly line in the live preview, using the model-authored
-      // descriptive field (Bash.description, Read/Edit file basename,
-      // hindsight→"Searching memory", etc. — see describeToolUse). Latest
-      // action wins (the draft shows "doing X" live), clears on reply.
+      // DRAFT_MIRROR (RFC draft-mirror-preview): accumulate each tool_use
+      // into a human-friendly running feed in the live preview, using the
+      // model-authored descriptive field (Bash.description, Read/Edit file
+      // basename, hindsight→"Searching memory", etc. — see describeToolUse
+      // / appendActivityLine). The draft shows the turn's actions as a
+      // capped chronological list (Claude Code-style), clears on reply.
       // Never surfaces raw shell/query syntax — option A, uniform across
       // code + non-code agents.
       //
@@ -7159,7 +7167,7 @@ function handleSessionEvent(ev: SessionEvent): void {
       // pre-draft-mirror behavior.
       if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
         const rendered = DRAFT_MIRROR_ENABLED
-          ? describeToolUse(name, ev.input)
+          ? appendActivityLine(turn.mirrorLines, name, ev.input)
           : registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
           turn.activityPendingRender = rendered
