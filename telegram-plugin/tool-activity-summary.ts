@@ -335,3 +335,50 @@ export function describeToolUse(
       return "Working…";
   }
 }
+
+// ─── Accumulating activity feed (draft-mirror Phase 2) ──────────────────────
+//
+// Phase 1 showed only the latest action; this accumulates the turn's actions
+// into a running feed — like Claude Code's own UI — streamed into the
+// ephemeral draft and cleared on reply. Chronological (oldest first, newest
+// last), consecutive exact-duplicates collapsed, capped to the most recent
+// MIRROR_MAX_LINES with a "+N earlier" header so a heavy turn stays readable
+// inside Telegram's compose-area draft.
+
+export const MIRROR_MAX_LINES = 6;
+
+/**
+ * Append a tool_use's friendly line to the running feed (mutates `lines`)
+ * and return the rendered draft body — or null when the tool is a surface
+ * tool / produced no line (caller skips the draft update).
+ *
+ * Dedups only consecutive identical lines (e.g. a burst of parallel Reads of
+ * the same file) so distinct actions are all preserved.
+ */
+export function appendActivityLine(
+  lines: string[],
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): string | null {
+  const line = describeToolUse(toolName, input);
+  if (line == null) return null;
+  if (lines.length === 0 || lines[lines.length - 1] !== line) {
+    lines.push(line);
+  }
+  return renderActivityFeed(lines);
+}
+
+/**
+ * Render the accumulated feed as a plain-text block (one action per line).
+ * The caller HTML-escapes + wraps it for Telegram. Returns null when empty.
+ *
+ * Newest-last chronological order; capped to the last MIRROR_MAX_LINES with a
+ * dim "+N earlier" header when the turn ran longer.
+ */
+export function renderActivityFeed(lines: string[]): string | null {
+  if (lines.length === 0) return null;
+  const shown = lines.slice(-MIRROR_MAX_LINES);
+  const hidden = lines.length - shown.length;
+  const body = shown.map((l) => `· ${l}`).join("\n");
+  return hidden > 0 ? `· +${hidden} earlier…\n${body}` : body;
+}
