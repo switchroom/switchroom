@@ -83,6 +83,42 @@ describe('tool-label-sidecar', () => {
     s.stop()
   })
 
+  it('replays pre-existing rows to a subscriber that attaches after construction', () => {
+    // Regression: the gateway's session-tail constructs the sidecar (which
+    // does an initial drain of the file) and only THEN wires `onLabel`. On a
+    // fast/clustered turn — or a resumed/flipped session — the hook has
+    // already written labels, so the initial drain consumed them with an
+    // empty subscriber set. Before the replay fix the late subscriber got
+    // nothing, so the real-time draft-mirror never fired (every label lost).
+    const sessionId = 'sess-replay'
+    const f = join(stateDir, `tool-labels-${sessionId}.jsonl`)
+    writeFileSync(
+      f,
+      JSON.stringify({ ts: 1, tool_use_id: 'A', agent_id: 'g', label: 'Reading foo.ts', tool_name: 'Read' }) + '\n' +
+      JSON.stringify({ ts: 2, tool_use_id: 'B', agent_id: 'g', label: 'List workspace', tool_name: 'Bash' }) + '\n',
+    )
+    const sched = makeManualScheduler()
+    const s = createToolLabelSidecar({ stateDir, sessionId, scheduler: sched })
+    // Subscribe AFTER construction (the real ensureSidecar ordering).
+    const seen: Array<[string, string, string]> = []
+    s.onLabel((id, label, toolName) => seen.push([id, label, toolName]))
+    expect(seen).toEqual([
+      ['A', 'Reading foo.ts', 'Read'],
+      ['B', 'List workspace', 'Bash'],
+    ])
+
+    // And a row appended afterwards still reaches the subscriber exactly once
+    // (no double-emit of the replayed rows).
+    appendFileSync(f, JSON.stringify({ ts: 3, tool_use_id: 'C', agent_id: 'g', label: 'Searching memory', tool_name: 'mcp__hindsight__recall' }) + '\n')
+    s.poll()
+    expect(seen).toEqual([
+      ['A', 'Reading foo.ts', 'Read'],
+      ['B', 'List workspace', 'Bash'],
+      ['C', 'Searching memory', 'mcp__hindsight__recall'],
+    ])
+    s.stop()
+  })
+
   it('ignores malformed JSON lines', () => {
     const sessionId = 'sess4'
     const sched = makeManualScheduler()

@@ -66,6 +66,14 @@ export interface SidecarOptions {
 export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
   const path = join(opts.stateDir, `tool-labels-${opts.sessionId}.jsonl`)
   const labels = new Map<string, string>()
+  // Ordered log of every row ingested so far (label + tool_name), used to
+  // replay history to a subscriber that attaches AFTER rows were already
+  // read. Without this, a sidecar whose file is already populated when
+  // `onLabel` is wired (fast/clustered turns, resumed/flipped sessions —
+  // the gateway's `ensureSidecar` subscribes *after* construction's initial
+  // drain) would silently lose every pre-existing label, breaking the
+  // real-time draft-mirror determinism the sidecar exists to provide.
+  const seen: Array<{ toolUseId: string; label: string; toolName: string }> = []
   const subscribers = new Set<(toolUseId: string, label: string, toolName: string) => void>()
   let offset = 0
   let stopped = false
@@ -97,6 +105,7 @@ export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
       // expect duplicates, but if one lands we keep the earliest.
       if (labels.has(row.tool_use_id)) continue
       labels.set(row.tool_use_id, row.label)
+      seen.push({ toolUseId: row.tool_use_id, label: row.label, toolName: row.tool_name })
       for (const cb of subscribers) {
         try { cb(row.tool_use_id, row.label, row.tool_name) } catch { /* ignore */ }
       }
@@ -134,6 +143,15 @@ export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
       return labels.get(toolUseId)
     },
     onLabel(cb) {
+      // Replay rows already ingested before this subscriber attached, then
+      // register for future rows. Single-threaded: no row can be ingested
+      // between the replay loop and the add, so each row reaches `cb`
+      // exactly once. This is what makes the draft-mirror deterministic
+      // regardless of when the gateway subscribes relative to the hook's
+      // writes (see the `seen` declaration above).
+      for (const r of seen) {
+        try { cb(r.toolUseId, r.label, r.toolName) } catch { /* ignore */ }
+      }
       subscribers.add(cb)
       return () => subscribers.delete(cb)
     },
