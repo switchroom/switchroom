@@ -82,7 +82,7 @@ export interface AnswerStreamConfig {
     chatId: string,
     draftId: number,
     text: string,
-    params?: { message_thread_id?: number },
+    params?: { message_thread_id?: number; parse_mode?: 'HTML' },
   ) => Promise<unknown>
   sendMessage: (
     chatId: string,

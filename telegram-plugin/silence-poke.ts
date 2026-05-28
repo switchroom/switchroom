@@ -433,6 +433,15 @@ export function formatFrameworkFallbackText(
   //   running Grep "foo" for 4m (no update from agent in 5 min)
   //   running Grep "foo" + 2 more (4m) (no update from agent in 5 min)
   //   running Grep (no label) for 4m (no update from agent in 5 min)
+  //
+  // Raw MCP tool names (`mcp__server__tool`) are technical identifiers
+  // and look like a leak when surfaced to a user. When the tool name
+  // matches that shape AND a human-friendly label is available, drop
+  // the raw name and lead with the label instead:
+  //   Searching memory for 4m (no update from agent in 5 min)
+  // Built-in tool names (Grep, Read, Bash) stay as-is — they ARE
+  // human-readable, and the label is supplementary detail (e.g. the
+  // search pattern) that reads naturally after the verb.
   if (inFlightTools.length > 0) {
     const longest = inFlightTools[0]!
     const dur = formatDurationShort(longest.durationMs)
@@ -442,6 +451,13 @@ export function formatFrameworkFallbackText(
     const more = inFlightTools.length > 1
       ? ` + ${inFlightTools.length - 1} more`
       : ''
+    const isMcpRawName = /^mcp__/.test(longest.name)
+    if (isMcpRawName && labelTail !== '') {
+      // Label-only: "Searching memory for 4m (…)". Drop the raw
+      // `mcp__server__tool` and the leading "running" because the
+      // label already reads as a gerund phrase.
+      return `${truncateLabel(longest.label!)}${more} for ${dur} ${suffix}`
+    }
     return `running ${longest.name}${labelTail}${more} for ${dur} ${suffix}`
   }
   return fallbackKind === 'thinking'
