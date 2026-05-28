@@ -96,3 +96,34 @@ describe("Dockerfile.agent Playwright provisioning", () => {
     expect(dockerfile).not.toMatch(/playwright@[\^~]/);
   });
 });
+
+/**
+ * Cloakbrowser — the local stealth Chromium driver used by webkite's
+ * `webkite mcp` stdio MCP. The webkite binary itself is operator-
+ * mounted (private beta); cloakbrowser's Python tool is baked here
+ * because (a) it's public OSS and (b) baking-in avoids a fragile
+ * per-agent pipx install in the boot path.
+ *
+ * The 700MB Chromium binary cloakbrowser spawns is NOT baked — it's
+ * shared across the fleet via a host bind mount of `~/.cloakbrowser/`
+ * (see src/agents/compose.ts).
+ */
+describe("Dockerfile.agent webkite/cloakbrowser provisioning", () => {
+  it("apt-installs pipx (the package manager cloakbrowser ships through)", () => {
+    expect(dockerfile).toMatch(
+      /apt-get\s+install[^\n]*\bpipx\b/,
+    );
+  });
+
+  it("pipx-installs cloakbrowser at a stable image-path PIPX_HOME", () => {
+    // PIPX_HOME must be a deterministic image path (not user $HOME, which
+    // the per-agent compose mount would shadow at runtime).
+    expect(dockerfile).toMatch(
+      /PIPX_HOME=\$\{CLOAKBROWSER_PIPX_HOME\}\s+PIPX_BIN_DIR=\/usr\/local\/bin\s+\\?\s*\n?\s*pipx\s+install\s+cloakbrowser/,
+    );
+  });
+
+  it("CLOAKBROWSER_PIPX_HOME is an absolute /opt path (not under HOME)", () => {
+    expect(dockerfile).toMatch(/ENV\s+CLOAKBROWSER_PIPX_HOME=\/opt\//);
+  });
+});

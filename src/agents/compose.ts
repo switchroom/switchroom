@@ -1808,6 +1808,39 @@ function emitAgentService(
       `      - ${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:${homePrefix}/.switchroom-config/agents/${a.name}/personal-skills:rw`,
     );
   }
+  // webkite binary + cloakbrowser shared Chromium (#TBD). The webkite
+  // binary is a private-beta release that lives on the operator's host
+  // only (`~/.switchroom/bin/webkite`), never committed to this repo or
+  // baked into the agent image. Mount it on the in-container PATH so
+  // every agent can spawn `webkite mcp` (the stdio MCP server) without
+  // any per-agent install. existsSync-guarded because dev installs
+  // without webkite staged should not hard-fail compose `up`.
+  //
+  // Cloakbrowser's stealth Chromium (~700MB extracted) lives at the
+  // operator's `~/.cloakbrowser/` (cloakbrowser hardcodes that path).
+  // Mounted RO at the per-agent HOME so cloakbrowser's runtime lookup
+  // (`$HOME/.cloakbrowser/chromium-*/chrome`) resolves to the shared
+  // operator install — one ~700MB copy on disk instead of N. The
+  // cloakbrowser pipx tool itself is baked into the agent image
+  // (Dockerfile.agent) so the venv shebang lines resolve in-container.
+  if (existsSync(`${hostHomeForChecks}/.switchroom/bin/webkite`)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/bin/webkite:/usr/local/bin/webkite:ro`,
+    );
+  }
+  if (existsSync(`${hostHomeForChecks}/.cloakbrowser`)) {
+    lines.push(
+      `      - ${homePrefix}/.cloakbrowser:/state/agent/home/.cloakbrowser:ro`,
+    );
+  }
+  // Operator-authored shared webkite config (e.g. defaults.format,
+  // proxy rotation file). Optional — agents work fine without it,
+  // using webkite's built-in defaults.
+  if (existsSync(`${hostHomeForChecks}/.switchroom/webkite/config.toml`)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,
+    );
+  }
   // Bundled-skills pool: mount at the same absolute host path so the
   // symlinks created by reconcileAgentDefaultSkills (which target the
   // source-repo or npm-package skills/ dir — e.g.

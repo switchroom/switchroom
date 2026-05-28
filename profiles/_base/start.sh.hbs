@@ -598,6 +598,29 @@ if [ -d "$SR_FLEET_DIR" ]; then
   SR_FLEET_ARG="--add-dir $SR_FLEET_DIR"
 fi
 
+# Webkite credential pre-auth — fetch Cloudflare + Firecrawl creds from
+# the vault-broker at boot and export into the agent process env so
+# `webkite mcp` (spawned by claude with sanitized env per .mcp.json)
+# inherits them via the agent's env on `exec claude`. Best-effort: a
+# missing key falls webkite back to cloakbrowser-only (no cloud render),
+# which still works for most sites. The broker enforces the per-key
+# ACL — if the operator hasn't `--allow`ed this agent on the key, the
+# get returns empty and webkite stays cloakbrowser-only.
+if command -v switchroom >/dev/null 2>&1; then
+  for sr_wk_pair in \
+    "CLOUDFLARE_ACCOUNT_ID:webkite/cloudflare-account-id" \
+    "CLOUDFLARE_API_TOKEN:webkite/cloudflare-api-token" \
+    "FIRECRAWL_API_KEY:webkite/firecrawl-api-key"; do
+    sr_wk_env="${sr_wk_pair%%:*}"
+    sr_wk_key="${sr_wk_pair##*:}"
+    sr_wk_val="$(switchroom vault get "$sr_wk_key" 2>/dev/null || true)"
+    if [ -n "$sr_wk_val" ]; then
+      export "$sr_wk_env=$sr_wk_val"
+    fi
+  done
+  unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
+fi
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
   exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}

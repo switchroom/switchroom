@@ -310,6 +310,59 @@ describe("ACL: socket-path-as-identity (Phase 2a)", () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────
+// Webkite — fleet-default credential ACL (framework-emits-entry-AND-ACL)
+// ────────────────────────────────────────────────────────────────────────
+
+describe("ACL: webkite credential keys (fleet-default)", () => {
+  const WEBKITE_KEYS = [
+    "webkite/cloudflare-account-id",
+    "webkite/cloudflare-api-token",
+    "webkite/firecrawl-api-key",
+  ];
+
+  it("allows every webkite key by default — agent did not opt out", () => {
+    const config = makeConfig({
+      alice: [{ cron: "0 8 * * *", prompt: "hi", secrets: ["unrelated"] }],
+    });
+    for (const key of WEBKITE_KEYS) {
+      const r = checkAclByAgent(config, "alice", key);
+      expect(r.allow, `expected ${key} allowed for alice`).toBe(true);
+    }
+  });
+
+  it("denies webkite keys when the agent opted out via mcp_servers.webkite: false", () => {
+    const config = {
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: { path: "~/.switchroom/vault.enc" },
+      agents: {
+        alice: {
+          topic_name: "alice",
+          schedule: [],
+          mcp_servers: { webkite: false },
+        },
+      },
+    } as unknown as Parameters<typeof checkAclByAgent>[0];
+    for (const key of WEBKITE_KEYS) {
+      const r = checkAclByAgent(config, "alice", key);
+      expect(r.allow, `expected ${key} denied for opted-out alice`).toBe(false);
+    }
+  });
+
+  it("does not allow arbitrary webkite/* keys — only the canonical 3", () => {
+    const config = makeConfig({
+      alice: [{ cron: "0 8 * * *", prompt: "hi", secrets: [] }],
+    });
+    // A speculatively-shaped key that LOOKS like a webkite cred but
+    // isn't on the canonical allowlist must still be denied (so a
+    // future `webkite/private-thing` operator-put isn't silently
+    // exposed to every agent without a deliberate ACL).
+    const r = checkAclByAgent(config, "alice", "webkite/not-a-real-key");
+    expect(r.allow).toBe(false);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
 // RFC G Phase 2 — google: slot ACL via google_accounts[].enabled_for[]
 // ────────────────────────────────────────────────────────────────────────
 
