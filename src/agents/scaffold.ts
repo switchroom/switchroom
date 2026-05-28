@@ -3739,25 +3739,49 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   // --- Switchroom-owned UserPromptSubmit hooks ---
   const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
-  // Per-turn pacing directive (conversational-pacing v2). Injected
-  // adjacent to the user's message every turn so "acknowledge first"
-  // is salient AT TURN TIME — not one buried sub-bullet in a 32KB
-  // CLAUDE.md the model has to recall. This is the load-bearing fix:
-  // a UserPromptSubmit hook's stdout lands right next to the prompt.
+  // Per-turn pacing directive — v3 (conversational-pacing for Option B,
+  // v0.13.61).
+  //
+  // Why v3 replaces v2 ("ack first"): in v0.13.59 the PreToolUse ack-
+  // first gate was stripped in favor of the activity-summary draft
+  // transport (#1926/#1927), which surfaces "Read 2 files, ran a
+  // command" in the user's Telegram compose area as you work. The v2
+  // directive kept telling the model to call reply with an ack BEFORE
+  // doing work, so the model kept doing exactly that — persistent
+  // "on it…" chat messages piled up alongside the answers. Two-three
+  // persistent messages per turn instead of one. Live UX regression
+  // observed on clerk 2026-05-28: "Hello?" → "Here, what's up?";
+  // "Find restaurant recommendations" → "on it — digging up the Hobart
+  // list" → "Found the list…" → "good — let me pin down the date" →
+  // "Sunday is Jun 7…" → "on it — pulling the Mona thread" → … (six
+  // persistent messages for one turn of work).
+  //
+  // v3: tell the model NOT to ack. The framework already shows the
+  // user activity via the compose-area draft. Reply only with
+  // substantive content — actual answers, real questions, or genuine
+  // milestones / pivots. Trivial single-sentence answers still go via
+  // reply (they ARE the answer, not an ack).
   const turnPacingDirective =
-    '<turn-pacing>You are messaging a human in a chat. FIRST action ' +
-    'this turn: unless your whole reply is a single short sentence you ' +
-    'can send right now, call the reply tool with a brief ' +
-    'acknowledgement in your own voice (disable_notification true) — ' +
-    'examples: "on it", "good question — one sec", "let me dig in" — ' +
-    'BEFORE any other tool call and BEFORE composing the full answer. ' +
-    'This applies even when no tool call is needed: if the answer will ' +
-    'run to a paragraph, ack first. It is a real beat, not filler — ' +
-    'the line between a colleague and a black box. Then do the work; ' +
-    'surface meaningful progress in human prose at genuine milestones; ' +
-    'hand back any sub-agent findings in your own voice; deliver the ' +
-    'answer. Do not acknowledge a trivial one-liner, and never ' +
-    'acknowledge twice.</turn-pacing>';
+    '<turn-pacing>You are messaging a human via Telegram. The framework ' +
+    'automatically shows the user a live preview in their compose area as ' +
+    'you work — they see "Read a file", "Ran 2 commands", etc. as your ' +
+    'tool_use events stream. You do NOT need to ack manually.\n\n' +
+    'Do NOT call the reply tool with placeholder acks like "on it", ' +
+    '"good question — one sec", "let me dig in", "checking now", etc. ' +
+    'Those add chat clutter on top of the activity preview the user is ' +
+    'already seeing. The activity preview clears the moment you send a ' +
+    'real reply.\n\n' +
+    'Call reply only when you have something substantive to deliver:\n' +
+    '  - The actual answer (any length — short or long)\n' +
+    '  - A genuine question back to the user\n' +
+    '  - A real mid-work milestone or pivot that changes what the user ' +
+    'should expect (e.g. "halfway through — found an unexpected issue, ' +
+    'want me to continue?"). Not "still working".\n\n' +
+    'For trivial one-sentence answers: just reply with the answer. The ' +
+    'reply IS the answer, not an ack.\n\n' +
+    'For complex tool-driven work: go straight to the tools. The compose-' +
+    'area preview is the ambient liveness signal. Reply once you have ' +
+    'the answer or a real reason to break in.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
