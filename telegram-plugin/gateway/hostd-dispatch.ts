@@ -94,13 +94,14 @@ export function hostdWillBeUsed(agentName: string): boolean {
 export async function tryHostdDispatch(
   agentName: string,
   req: HostdRequest,
+  timeoutMs = 5000,
 ): Promise<HostdResponse | "not-configured"> {
   if (!isHostdEnabled()) return "not-configured";
   const sockPath = hostdSocketPath(agentName);
   if (!existsSync(sockPath)) return "not-configured";
   try {
     return await hostdRequest(
-      { socketPath: sockPath, timeoutMs: 5000 },
+      { socketPath: sockPath, timeoutMs },
       req,
     );
   } catch (err) {

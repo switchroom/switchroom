@@ -64,6 +64,28 @@ export interface ConfigApprovalHandlerDeps {
     content: string;
   }) => Promise<void>;
   log?: (msg: string) => void;
+  /**
+   * Single-tap correlation auto-resolve (#1977, security-critical).
+   *
+   * The durable "🔁 Always allow" flow has the gateway itself call
+   * hostd's `config_propose_edit`. hostd then calls BACK to the gateway
+   * asking for operator approval — but the operator already tapped the
+   * permission card, so posting a SECOND approval card would be a
+   * confusing double-tap.
+   *
+   * When this hook returns `'approve'`, the handler resolves the
+   * request immediately WITHOUT posting a card, creating a pending
+   * entry, or arming a timer. Returning `null` (the default / no-hook
+   * behaviour) falls through to the normal operator-approval card —
+   * which is what ANY uncorrelated edit (e.g. an agent-forged config
+   * change) gets, preserving the human-in-the-loop control.
+   *
+   * Forge-resistance lives in the caller's implementation: it must
+   * require the rule the diff *adds* to match a rule the gateway just
+   * queued, so a forged edit touching any other field finds no
+   * correlation and gets a real card.
+   */
+  tryAutoResolve?: (msg: RequestConfigApprovalMessage) => "approve" | null;
 }
 
 /**
@@ -209,6 +231,20 @@ export async function handleRequestConfigApproval(
       `gateway serves '${deps.agentName}', not '${msg.agentName}'`,
       "dispatch_failure",
     );
+    return;
+  }
+
+  // Single-tap correlation (#1977): if THIS edit was initiated by the
+  // gateway itself in response to an operator tap on the permission
+  // card, auto-approve without posting a second card. Forge-resistance
+  // is the caller's job — it correlates on the rule the diff adds. Any
+  // uncorrelated (e.g. agent-forged) edit returns null here and falls
+  // through to the real operator-approval card below.
+  if (deps.tryAutoResolve?.(msg) === "approve") {
+    deps.log?.(
+      `config_approval_auto_resolved requestId=${msg.requestId} agent=${msg.agentName} (operator-tapped always-allow correlation)`,
+    );
+    reply("approve");
     return;
   }
 
