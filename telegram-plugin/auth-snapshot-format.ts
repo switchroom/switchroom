@@ -19,7 +19,7 @@
  */
 
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
-import type { AccountState, ListStateData } from '../src/auth/broker/client.js';
+import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
 
 // ── shared types ─────────────────────────────────────────────────────
 
@@ -609,4 +609,50 @@ export function buildSnapshotsFromState(
     });
   }
   return out;
+}
+
+/**
+ * Convert a broker-side `LastQuotaSnapshot` (dates as ISO strings) into a
+ * `QuotaUtilization` (dates as `Date | null`). Returns null when the
+ * input snapshot is absent or null (no probe has run since broker start).
+ *
+ * Used by the quota-watch loop to build `AccountSnapshot[]` from cached
+ * broker state without triggering a live Anthropic network call.
+ */
+export function reviveLastQuota(snap: LastQuotaSnapshot | null | undefined): QuotaUtilization | null {
+  if (!snap) return null;
+  return {
+    fiveHourUtilizationPct: snap.fiveHourUtilizationPct,
+    sevenDayUtilizationPct: snap.sevenDayUtilizationPct,
+    fiveHourResetAt: snap.fiveHourResetAt ? new Date(snap.fiveHourResetAt) : null,
+    sevenDayResetAt: snap.sevenDayResetAt ? new Date(snap.sevenDayResetAt) : null,
+    representativeClaim: snap.representativeClaim,
+    overageStatus: snap.overageStatus,
+    overageDisabledReason: snap.overageDisabledReason,
+  };
+}
+
+/**
+ * Build AccountSnapshot[] from broker listState using only the
+ * broker's in-memory last_quota cache — no live Anthropic probe.
+ * Accounts with no cached snapshot will have `quota: null`, causing
+ * `classifyHealth` to return 'unknown' and the quota-watch loop to skip them.
+ *
+ * This is the cheap classification path for the 15-minute poll loop.
+ * The live probeQuota path (`buildSnapshotsFromState`) is reserved for
+ * user-initiated /auth commands and notification body enrichment.
+ */
+export function buildSnapshotsFromCachedState(
+  state: ListStateData,
+): AccountSnapshot[] {
+  return state.accounts.map((acc) => {
+    const lq = acc.last_quota ?? null;
+    return {
+      label: acc.label,
+      isActive: acc.label === state.active,
+      quota: reviveLastQuota(lq),
+      quotaError: lq ? undefined : 'no cached quota (no probe since broker start)',
+      expiresAtMs: acc.expiresAt,
+    };
+  });
 }

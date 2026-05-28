@@ -137,6 +137,26 @@ export interface GetCredentialsData {
   expiresAt?: number;
 }
 
+/**
+ * Cached utilization snapshot attached to each AccountState when the
+ * broker has a recent probe result. Populated by opProbeQuota (in-memory
+ * on the broker). `null` when no probe has run since broker start.
+ * Dates are serialised as ISO strings over NDJSON.
+ */
+export interface LastQuotaSnapshot {
+  fiveHourUtilizationPct: number;
+  sevenDayUtilizationPct: number;
+  /** ISO 8601 string, or null when the server didn't return a reset time. */
+  fiveHourResetAt: string | null;
+  /** ISO 8601 string, or null when the server didn't return a reset time. */
+  sevenDayResetAt: string | null;
+  representativeClaim: string | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
+  /** Unix ms when this snapshot was captured by the broker. */
+  capturedAt: number;
+}
+
 export interface AccountState {
   label: string;
   expiresAt?: number;
@@ -144,6 +164,13 @@ export interface AccountState {
   exhausted_until?: number;
   threshold_violations?: number;
   last_refreshed_at?: number;
+  /**
+   * Most recent utilization snapshot from a probeQuota call.
+   * Absent or null when the broker has not probed this account since its last
+   * start. Consumers (quota-watch loop) use this for health classification
+   * without triggering a live network call.
+   */
+  last_quota?: LastQuotaSnapshot | null;
 }
 
 export interface AgentState {

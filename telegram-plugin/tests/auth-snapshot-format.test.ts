@@ -15,11 +15,13 @@ import {
   renderFallbackAnnouncement,
   buildSnapshotKeyboard,
   buildSnapshotsFromState,
+  buildSnapshotsFromCachedState,
+  reviveLastQuota,
   THROTTLING_THRESHOLD_PCT,
   type AccountSnapshot,
 } from '../auth-snapshot-format.js';
 import type { QuotaUtilization } from '../quota-check.js';
-import type { ListStateData } from '../../src/auth/broker/client.js';
+import type { LastQuotaSnapshot, ListStateData } from '../../src/auth/broker/client.js';
 
 // Frozen "now" for all reset-time math. Friday May 15 2026 10:53 AM Melbourne
 // = 2026-05-15T00:53:00Z. Reset epochs in fixtures are in seconds.
@@ -403,6 +405,136 @@ describe('buildSnapshotsFromState', () => {
     expect(snaps[0]!.quota?.fiveHourUtilizationPct).toBe(5);
     expect(snaps[2]!.quota).toBeNull();
     expect(snaps[2]!.quotaError).toBe('HTTP 401');
+  });
+});
+
+// ── reviveLastQuota ──────────────────────────────────────────────────
+
+describe('reviveLastQuota', () => {
+  it('returns null for null input', () => {
+    expect(reviveLastQuota(null)).toBeNull();
+  });
+
+  it('returns null for undefined input', () => {
+    expect(reviveLastQuota(undefined)).toBeNull();
+  });
+
+  it('converts ISO-string dates to Date objects', () => {
+    const isoFive = '2026-05-15T06:00:00.000Z';
+    const isoSeven = '2026-05-22T06:00:00.000Z';
+    const lq: LastQuotaSnapshot = {
+      fiveHourUtilizationPct: 45,
+      sevenDayUtilizationPct: 72,
+      fiveHourResetAt: isoFive,
+      sevenDayResetAt: isoSeven,
+      representativeClaim: 'five_hour',
+      overageStatus: 'allowed',
+      overageDisabledReason: null,
+      capturedAt: Date.now(),
+    };
+    const q = reviveLastQuota(lq);
+    expect(q).not.toBeNull();
+    expect(q!.fiveHourUtilizationPct).toBe(45);
+    expect(q!.sevenDayUtilizationPct).toBe(72);
+    expect(q!.fiveHourResetAt).toBeInstanceOf(Date);
+    expect(q!.fiveHourResetAt!.toISOString()).toBe(isoFive);
+    expect(q!.sevenDayResetAt).toBeInstanceOf(Date);
+    expect(q!.sevenDayResetAt!.toISOString()).toBe(isoSeven);
+    expect(q!.representativeClaim).toBe('five_hour');
+    expect(q!.overageStatus).toBe('allowed');
+    expect(q!.overageDisabledReason).toBeNull();
+  });
+
+  it('passes through null dates as null', () => {
+    const lq: LastQuotaSnapshot = {
+      fiveHourUtilizationPct: 20,
+      sevenDayUtilizationPct: 30,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+      capturedAt: Date.now(),
+    };
+    const q = reviveLastQuota(lq);
+    expect(q!.fiveHourResetAt).toBeNull();
+    expect(q!.sevenDayResetAt).toBeNull();
+  });
+});
+
+// ── buildSnapshotsFromCachedState ────────────────────────────────────
+
+describe('buildSnapshotsFromCachedState', () => {
+  function makeLastQuota(fivePct: number, sevenPct: number): LastQuotaSnapshot {
+    return {
+      fiveHourUtilizationPct: fivePct,
+      sevenDayUtilizationPct: sevenPct,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
+      overageStatus: null,
+      overageDisabledReason: null,
+      capturedAt: Date.now(),
+    };
+  }
+
+  it('produces quota=null for accounts with no cached snapshot', () => {
+    const state: ListStateData = {
+      active: 'a@x',
+      fallback_order: [],
+      accounts: [{ label: 'a@x', exhausted: false, last_quota: null }],
+      agents: [],
+      consumers: [],
+    };
+    const snaps = buildSnapshotsFromCachedState(state);
+    expect(snaps[0]!.quota).toBeNull();
+    // classifyHealth on this snap returns 'unknown'
+    expect(snaps[0]!.quotaError).toContain('no cached quota');
+  });
+
+  it('revives cached utilization into Date-bearing QuotaUtilization', () => {
+    const state: ListStateData = {
+      active: 'b@x',
+      fallback_order: [],
+      accounts: [
+        { label: 'a@x', exhausted: false, last_quota: makeLastQuota(20, 30) },
+        { label: 'b@x', exhausted: false, last_quota: makeLastQuota(85, 40) },
+      ],
+      agents: [],
+      consumers: [],
+    };
+    const snaps = buildSnapshotsFromCachedState(state);
+    expect(snaps[0]!.quota?.fiveHourUtilizationPct).toBe(20);
+    expect(snaps[1]!.quota?.sevenDayUtilizationPct).toBe(40);
+    expect(snaps[1]!.isActive).toBe(true);
+  });
+
+  it('classifyHealth correctly classifies cached throttling account (≥80% threshold)', () => {
+    const state: ListStateData = {
+      active: 'a@x',
+      fallback_order: [],
+      accounts: [
+        { label: 'a@x', exhausted: false, last_quota: makeLastQuota(85, 40) },
+      ],
+      agents: [],
+      consumers: [],
+    };
+    const snaps = buildSnapshotsFromCachedState(state);
+    // With cached 85% 5h utilization, classifyHealth should return 'throttling'
+    expect(classifyHealth(snaps[0]!)).toBe('throttling');
+  });
+
+  it('treats absent last_quota (undefined) the same as null', () => {
+    const state: ListStateData = {
+      active: 'a@x',
+      fallback_order: [],
+      // last_quota absent — simulates old broker version / cold broker start
+      accounts: [{ label: 'a@x', exhausted: false }],
+      agents: [],
+      consumers: [],
+    };
+    const snaps = buildSnapshotsFromCachedState(state);
+    expect(snaps[0]!.quota).toBeNull();
   });
 });
 

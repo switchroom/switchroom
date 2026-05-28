@@ -1336,6 +1336,61 @@ describe("AuthBroker — probe-quota", () => {
       broker.stop();
     }
   });
+
+  it("probe-quota populates last_quota cache — subsequent list-state includes utilization (no re-probe needed)", async () => {
+    // Regression guard for the E4 quota-watch blocker: after any probeQuota
+    // call, list-state must return last_quota so the quota-watch loop can
+    // classify health without making a new live Anthropic network call.
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", agents: { ziggy: {} } });
+    seedAccount(h, "default", { expiresAt: 9_999_999_999_999 });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, _init?: RequestInit): Promise<Response> => {
+      return new Response("ok", {
+        status: 200,
+        headers: {
+          "anthropic-ratelimit-unified-5h-utilization": "0.82",
+          "anthropic-ratelimit-unified-7d-utilization": "0.45",
+        },
+      });
+    }) as typeof fetch;
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    const client = new AuthBrokerClient({ socket: join(h.socketRoot, "ziggy", "sock") });
+    try {
+      await broker.start();
+
+      // Before any probe: list-state should have last_quota=null for "default".
+      const beforeState = await client.listState();
+      const beforeAccount = beforeState.accounts.find((a) => a.label === "default");
+      expect(beforeAccount?.last_quota ?? null).toBeNull();
+
+      // Run a probe.
+      await client.probeQuota(["default"]);
+
+      // After probe: list-state must now carry last_quota with cached utilization.
+      const afterState = await client.listState();
+      const afterAccount = afterState.accounts.find((a) => a.label === "default");
+      expect(afterAccount?.last_quota).not.toBeNull();
+      expect(afterAccount?.last_quota?.fiveHourUtilizationPct).toBeCloseTo(82, 1);
+      expect(afterAccount?.last_quota?.sevenDayUtilizationPct).toBeCloseTo(45, 1);
+      // Dates are ISO strings on the wire (not Date objects — NDJSON has no Date).
+      // null because the stub response didn't include reset headers.
+      expect(afterAccount?.last_quota?.fiveHourResetAt).toBeNull();
+      expect(afterAccount?.last_quota?.sevenDayResetAt).toBeNull();
+      expect(typeof afterAccount?.last_quota?.capturedAt).toBe("number");
+    } finally {
+      globalThis.fetch = origFetch;
+      await client.close();
+      broker.stop();
+    }
+  });
 });
 
 describe("AuthBroker — drift detection", () => {

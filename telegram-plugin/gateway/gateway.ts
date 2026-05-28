@@ -380,7 +380,7 @@ import {
   patchQuotaWatchState,
   emptyAccountState,
 } from '../quota-watch.js'
-import { buildSnapshotsFromState } from '../auth-snapshot-format.js'
+import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
 import {
   writeTurnActiveMarker,
   touchTurnActiveMarker,
@@ -11860,23 +11860,40 @@ async function runCreditWatch(): Promise<void> {
 }
 
 /**
- * Quota threshold-tier push loop body (#E4). Reads the broker's cached
- * quota state for all accounts in the pool, classifies each via
- * classifyHealth, and fires one Telegram message per healthy ↔ throttling
- * transition (edge-triggered, not level-triggered). Does NOT fire on
- * healthy → blocked or blocked → healthy — credits-watch.ts owns those.
+ * Quota threshold-tier push loop body (#E4). Reads the broker's in-memory
+ * cached utilization (populated by previous probeQuota calls from /auth,
+ * auto-fallback, and boot cards) via `listState.accounts[].last_quota`.
+ * Classifies each account via classifyHealth, and fires one Telegram message
+ * per healthy ↔ throttling transition (edge-triggered, not level-triggered).
+ * Does NOT fire on healthy → blocked or blocked → healthy — credits-watch.ts
+ * owns those.
  *
- * Cheap on the happy path: only calls broker `listState` (local IPC) +
- * `probeQuota` (once per account that needs fresh data for a notification
- * body). State persists across restarts via `<stateDir>/quota-watch.json`.
+ * Probe discipline:
+ *   - Steady-state polls: ONE broker `listState` IPC call only (no network).
+ *   - Accounts with no cached snapshot (null last_quota): skipped silently
+ *     (classifyHealth returns 'unknown'). Cache populates from /auth, boot
+ *     card, and auto-fallback probes in normal use.
+ *   - State transition detected: ONE targeted `probeQuota` call for ONLY the
+ *     crossing account, immediately before sending the notification, to get
+ *     fresh numbers for the message body. All other steady-state accounts
+ *     are not probed.
  *
+ * This replaces the previous implementation that called probeQuota for ALL
+ * accounts unconditionally on every 15-minute poll (~768 live Anthropic
+ * network calls/day for an 8-account fleet). The corrected version makes
+ * 0 network calls on steady-state polls and at most 1 call per crossing
+ * event (which is also when we need to notify the user anyway).
+ *
+ * State persists across restarts via `<stateDir>/quota-watch.json`.
  * Mirrors runCreditWatch's structure and notification routing.
  */
 async function runQuotaWatch(): Promise<void> {
   const agentName = getMyAgentName()
   const stateDir = STATE_DIR
 
-  // Read broker state (all accounts + their cached quota data).
+  // Read broker state. The listState response now includes last_quota
+  // per account — the broker's in-memory cache from previous probeQuota
+  // calls. This is a local IPC call: no network, no Anthropic contact.
   const brokerClient = await getAuthBrokerClient(agentName)
   if (!brokerClient) {
     process.stderr.write('telegram gateway: quota-watch: broker client unavailable — skipping\n')
@@ -11895,54 +11912,96 @@ async function runQuotaWatch(): Promise<void> {
     return // No accounts — nothing to watch.
   }
 
+  // Build AccountSnapshot[] from cached broker state only — no live probe.
+  // Accounts with null last_quota produce quota=null snapshots; classifyHealth
+  // returns 'unknown'; evaluateQuotaWatchAccount skips — no false alarms.
+  const snapshots = buildSnapshotsFromCachedState(listStateData)
+
   // Load persisted per-account state.
   let watchState = loadQuotaWatchState(stateDir)
   const now = Date.now()
   const access = loadAccess()
 
-  // Build snapshots from cached quota data. The broker's `listState`
-  // response does NOT include live quota — we need a quick probe for
-  // any accounts where we're about to send a notification. For the
-  // initial classification pass, build snapshots with null quota so
-  // classifyHealth returns 'unknown' (no data yet); we then probe only
-  // the accounts whose transition needs a notification.
-  //
-  // Strategy: do a cheap pre-check using the broker exhausted flag to
-  // detect obvious blocked cases (skip those), then probe the remaining
-  // accounts in a single batched call.
+  // First pass: evaluate all accounts against cached state. Collect
+  // labels that need a live probe (i.e. accounts with a detected transition
+  // that we're about to notify about). We probe those to get fresh
+  // utilization numbers for the notification body — not for classification.
+  const pendingTransitions: Array<{
+    accountLabel: string
+    snapIndex: number
+    decision: ReturnType<typeof evaluateQuotaWatchAccount>
+  }> = []
 
-  const labels = listStateData.accounts.map(a => a.label)
-  let probeData: Awaited<ReturnType<typeof brokerClient.probeQuota>> | null = null
-  try {
-    probeData = await brokerClient.probeQuota(labels, 8000)
-  } catch (err) {
-    process.stderr.write(`telegram gateway: quota-watch: probeQuota failed: ${err}\n`)
-    // Fall through with null probeData — snapshots will have quota=null,
-    // classifyHealth returns 'unknown', evaluateQuotaWatchAccount skips.
-  }
-
-  // Build AccountSnapshot[] from listState + probe results.
-  const quotaResults = probeData
-    ? probeData.results.map(r => r.result)
-    : listStateData.accounts.map(() => ({ ok: false as const, reason: 'probe unavailable' }))
-  const snapshots = buildSnapshotsFromState(listStateData, quotaResults)
-
-  // Evaluate each account and collect notifications.
-  const notifications: Array<{ message: string; accountLabel: string }> = []
-  let mutatedState = watchState
+  const labelToSnapIndex = new Map<string, number>(
+    snapshots.map((s, i) => [s.label, i]),
+  )
 
   for (const snap of snapshots) {
-    const prev = mutatedState[snap.label] ?? emptyAccountState()
+    const prev = watchState[snap.label] ?? emptyAccountState()
     const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now })
-    if (decision.kind === 'skip') {
-      continue
+    if (decision.kind !== 'skip') {
+      pendingTransitions.push({
+        accountLabel: snap.label,
+        snapIndex: labelToSnapIndex.get(snap.label) ?? -1,
+        decision,
+      })
     }
-    notifications.push({ message: decision.message, accountLabel: snap.label })
-    mutatedState = patchQuotaWatchState(mutatedState, snap.label, decision.newAccountState)
+  }
+
+  if (pendingTransitions.length === 0) {
+    return // Steady-state: no notifications, no probes, no state write.
+  }
+
+  // Transition detected: probe ONLY the crossing accounts to get fresh
+  // numbers for the notification message bodies. One batched RPC for all
+  // crossing accounts (typically 1, rarely 2+).
+  const crossingLabels = pendingTransitions.map(t => t.accountLabel)
+  let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]['result']>()
+  try {
+    const probeData = await brokerClient.probeQuota(crossingLabels, 8000)
+    for (const entry of probeData.results) {
+      freshProbeMap.set(entry.label, entry.result)
+    }
+  } catch (err) {
+    // Probe failed — still send notifications using cached data.
+    // Don't abort: the user should know about the threshold crossing
+    // even if the message body shows slightly stale numbers.
+    process.stderr.write(`telegram gateway: quota-watch: probe for crossing accounts failed: ${err}\n`)
+  }
+
+  // Build final notifications, enriching the snapshot with fresh probe
+  // data where available.
+  let mutatedState = watchState
+  const notifications: Array<{ message: string; accountLabel: string }> = []
+
+  for (const { accountLabel, snapIndex, decision } of pendingTransitions) {
+    // Re-evaluate with fresh probe data to get an accurate message body.
+    // If the fresh probe succeeded, replace the snap's quota with live data.
+    const freshResult = freshProbeMap.get(accountLabel)
+    let enrichedDecision = decision
+    if (freshResult && freshResult.ok && snapIndex >= 0) {
+      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data }
+      const prev = watchState[accountLabel] ?? emptyAccountState()
+      const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now })
+      // If the fresh probe still shows the same transition, use the
+      // enriched message. If it no longer shows a transition (e.g. the
+      // account recovered in the 100ms between listState and probe),
+      // fall through to skip this notification.
+      if (re.kind === 'notify' && re.transition === decision.transition) {
+        enrichedDecision = re
+      } else if (re.kind === 'skip') {
+        // State normalised by the time of the probe — don't notify.
+        continue
+      }
+    }
+
+    if (enrichedDecision.kind !== 'notify') continue
+    notifications.push({ message: enrichedDecision.message, accountLabel })
+    mutatedState = patchQuotaWatchState(mutatedState, accountLabel, enrichedDecision.newAccountState)
   }
 
   if (notifications.length === 0) {
-    return // Nothing to send.
+    return // All transitions resolved by the time of the live probe.
   }
 
   // Send all notifications (one message per crossing account).
