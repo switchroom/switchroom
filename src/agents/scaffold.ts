@@ -3518,30 +3518,6 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          // Ack-first enforcement (`reference/conversational-pacing.md`
-          // beat 1). UAT (2026-05-28 jtbd-fast-ack-dm) showed the
-          // advisory prompt + silence-poke ack-poke combination delivered
-          // a real fast ack on only 1 of 8 non-trivial prompts; this
-          // hook is the framework's structural lever to make the beat
-          // happen every time. Reads `$TELEGRAM_STATE_DIR/ack-sent.flag`
-          // (gateway-owned — touched at first reply, cleared at
-          // turn_started). Reply tools are unconditionally allowed; the
-          // hook decides internally so a single registration covers
-          // every other tool name. Kill-switched via
-          // SWITCHROOM_DISABLE_ACK_FIRST_GATE=1 on the agent env.
-          hooks: [
-            {
-              type: "command",
-              command: wrap(
-                "hook:ack-first-pretool",
-                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "ack-first-pretool.mjs")}"`,
-              ),
-              // Tiny hook (one existsSync + stdin parse). 5s is generous.
-              timeout: 5,
-            },
-          ],
-        },
-        {
           // RFC native-by-default skill authoring, Phase 1 — advisory
           // skill-shape linter. Scoped to file-write tools; the hook
           // itself no-ops unless the target path is under
