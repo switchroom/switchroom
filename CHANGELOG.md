@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.14.6 — allowed_tools/disallowed_tools cascade from defaults (#1973)
+
+Fixes a silent double no-op: `defaults.allowed_tools` (and
+`disallowed_tools`) in switchroom.yaml was stripped at parse (the
+fields weren't in `AgentDefaultsSchema`) **and** dropped at merge (no
+cascade clause in `mergeAgentConfig`). An operator setting a
+fleet-wide granular tool policy in `defaults` — e.g. pre-approving an
+operator-defined MCP server's tools with
+`allowed_tools: [mcp__perplexity, mcp__perplexity__*]` so agents stop
+prompting on every first tool call — saw it silently ignored.
+
+Root cause: `allowed_tools`/`disallowed_tools` are agent-only fields
+(defined inline in `AgentSchema`, #199) and `AgentSchema` deliberately
+does not spread `profileFields`, so they were never mirrored into the
+defaults/profile levels (same convention `resources` follows).
+
+Fix (3 parts):
+- `schema.ts`: mirror both fields into `profileFields` so
+  `AgentDefaultsSchema` + `ProfileSchema` accept them.
+- `merge.ts`: cascade both in `mergeAgentConfig` — union, dedup-
+  preserving-order (defaults first), mirroring `extra_stable_files`.
+  Union (not REPLACE) so an agent's granular grants EXTEND the fleet
+  policy; `disallowed_tools` / `tools.deny` remain the denial path.
+- `merge.test.ts`: 6 cases (defaults-only cascade, union, dedup-order,
+  agent-only, neither, disallowed_tools mirror).
+
+Operator note: this is a HOST-CLI fix (the cascade runs at
+`switchroom apply` time when start.sh is rendered). Activating a
+`defaults.allowed_tools` policy needs `switchroom apply` + an agent
+restart after upgrading the host CLI — no new agent image required.
+
+Risk: low. The cascade clause only fires when a layer sets the field;
+existing agent-only `allowed_tools` configs are unchanged, and
+settings.json `permissions.allow` (built from `tools.allow`) is
+untouched.
+
 ## v0.14.5 — first-turn-after-restart fix (session-tail replays in-flight enqueue)
 
 ### session-tail: replay an in-flight turn's enqueue on first attach (#1971)
