@@ -22,7 +22,50 @@ activity-summary is framework-authored progress chrome — the model's
 machinery, not its voice. Extended-thinking turns also read as dead
 air at the *message* level (only the 🤔 reaction reflects them).
 
-## Design intent (the call this RFC implements)
+## PIVOT (2026-05-28, after the canary): render the tool_use stream, not prose
+
+The original design below proposed streaming the model's interstitial
+`assistant.text` prose into the draft. **The flag-on canary on
+test-harness falsified that premise.** On a normal tool turn the model
+emits *no* interstitial prose — it goes `thinking` (redacted, no text)
+→ `tool_use` → `reply`. Routing `assistant.text` to the draft just
+produced an empty preview.
+
+The real human-friendly signal — verified against a live session JSONL
+(1360 Bash calls etc.) — lives in **`tool_use.input`, authored by the
+model**:
+
+| Tool | Field | Example |
+|---|---|---|
+| Bash | `input.description` | "List workspace" (never `ls -la`) |
+| Read/Edit/Write | `input.file_path` (basename) | "Reading gateway.ts" |
+| Grep/Glob | `input.pattern` | |
+| Task/Agent | `input.description` | the sub-agent's task |
+| WebFetch | `input.url` (hostname) | "Reading example.com" |
+| hindsight | (label) | "Searching memory" |
+
+This is exactly why Claude Code's own UI reads friendly: the Bash tool
+*requires* a plain-English `description`, and Read/Edit/Write carry the
+filename. There is never a raw `grep`/`jq`/`ls` to surface.
+
+**Revised design intent:** render each `tool_use` as a human-friendly,
+present-tense line via `describeToolUse` (`tool-activity-summary.ts`) —
+model-authored description, then a domain label, then a humanized name;
+never raw shell/query syntax — and stream the latest line into the
+**ephemeral compose-area draft**, clearing on `reply`. **Option A:
+uniform across code + non-code agents** — a health coach sees
+"Searching memory" / "Checking your calendar"; a code agent sees
+"Editing gateway.ts" / the model's Bash description. The `reply` tool
+stays the canonical, formatted, pinged, persistent answer.
+
+`assistant.text` keeps its existing visible-answer-stream home (it
+rarely fires, but when the model *does* narrate, those are its own
+words → fine as a visible message). The draft-mirror no longer touches
+that lane.
+
+---
+
+## Original design intent (superseded by the PIVOT above)
 
 Mirror the **model's narration** — its summaries / descriptions /
 thinking-style commentary — into the **ephemeral compose-area draft**,

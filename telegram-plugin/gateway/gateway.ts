@@ -57,6 +57,7 @@ import { allocateDraftId } from '../draft-transport.js'
 import {
   makeEmptyActivityState,
   registerAndRender,
+  describeToolUse,
   type ActivityState,
 } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -6837,7 +6838,12 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
     while (turn.activityPendingRender !== turn.activityLastSentRender) {
       const target = turn.activityPendingRender
       if (target == null) break
-      const html = `<i>${target}</i>`
+      // Escape before wrapping in <i> + parse_mode HTML. The legacy
+      // verb-count summaries were safe ASCII, but the draft-mirror's
+      // describeToolUse content (file names, Bash descriptions, search
+      // queries) can contain <, >, & — which would break HTML parsing
+      // and surface literal tags (the exact #1942 bug class).
+      const html = `<i>${escapeHtmlForTg(target)}</i>`
       const chat = turn.sessionChatId
       const thread = turn.sessionThreadId
       // sendMessageDraft doesn't support forum threads.
@@ -7130,14 +7136,21 @@ function handleSessionEvent(ev: SessionEvent): void {
       // exactly once at a time and re-running until pending matches
       // the last-sent. Captures `turn` so a late drain after turn-swap
       // can't corrupt the next turn's atom.
-      // DRAFT_MIRROR (RFC draft-mirror-preview, Phase 1): the model's
-      // prose narration owns the single per-chat draft slot. Suppress
-      // the activity-summary tool-count draft so the two don't collide
-      // (Telegram shows one draft per chat — the later write clobbers
-      // the earlier). The activity-summary code stays intact for the
-      // kill-switch path; it's retired for good only in Phase 4.
-      if (!DRAFT_MIRROR_ENABLED && !turn.replyCalled && !isTelegramSurfaceTool(name)) {
-        const rendered = registerAndRender(turn.toolActivity, name)
+      // DRAFT_MIRROR (RFC draft-mirror-preview): render each tool_use as a
+      // human-friendly line in the live preview, using the model-authored
+      // descriptive field (Bash.description, Read/Edit file basename,
+      // hindsight→"Searching memory", etc. — see describeToolUse). Latest
+      // action wins (the draft shows "doing X" live), clears on reply.
+      // Never surfaces raw shell/query syntax — option A, uniform across
+      // code + non-code agents.
+      //
+      // Flag OFF (default): the legacy generic verb-count summary
+      // ("Ran 5 commands") via registerAndRender — byte-identical to
+      // pre-draft-mirror behavior.
+      if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
+        const rendered = DRAFT_MIRROR_ENABLED
+          ? describeToolUse(name, ev.input)
+          : registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
           turn.activityPendingRender = rendered
           if (turn.activityInFlight == null) {
@@ -7185,19 +7198,19 @@ function handleSessionEvent(ev: SessionEvent): void {
             isPrivateChat: turn.isDm,
             threadId: turn.sessionThreadId,
             // Transport selection:
-            // - DRAFT_MIRROR (RFC draft-mirror-preview, Phase 1): force
-            //   the ephemeral compose-area draft so narration is a
-            //   clears-on-reply preview. Wins over visible-answer-stream.
-            //   No-reply delivery is owned by turn-flush, not materialize.
-            // - else #869-Phase1 visible-answer-stream: omit the draft
-            //   API so the lane edits a user-visible chat-timeline
-            //   message (minInitialChars:1 opens it on the first chunk).
-            // - else legacy: draft transport.
-            ...(DRAFT_MIRROR_ENABLED
-              ? { sendMessageDraft: sendMessageDraftFn }
-              : ANSWER_STREAM_VISIBLE_ENABLED
-                ? { minInitialChars: 1 }
-                : { sendMessageDraft: sendMessageDraftFn }),
+            // #869-Phase1 visible-answer-stream: omit the draft API so
+            // the lane edits a user-visible chat-timeline message
+            // (minInitialChars:1 opens it on the first chunk). The
+            // draft-mirror does NOT touch this lane — the canary proved
+            // the model emits almost no interstitial assistant.text
+            // (it thinks→tool→reply), so routing it to the draft just
+            // emptied the preview. The draft-mirror instead renders the
+            // tool_use stream (case 'tool_use' above) where the real
+            // signal lives. assistant.text keeps its visible-message
+            // home; the reply tool stays the canonical answer.
+            ...(ANSWER_STREAM_VISIBLE_ENABLED
+              ? { minInitialChars: 1 }
+              : { sendMessageDraft: sendMessageDraftFn }),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted

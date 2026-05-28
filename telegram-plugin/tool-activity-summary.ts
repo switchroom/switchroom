@@ -198,3 +198,140 @@ export function registerAndRender(
   if (!changed) return null;
   return formatSummary(state);
 }
+
+// ─── Friendly per-tool rendering (draft-mirror, RFC draft-mirror-preview) ───
+//
+// Claude Code's own UI reads human-friendly because the model AUTHORS the
+// descriptive text inside each tool_use.input — verified against a real
+// session JSONL (1360 Bash calls etc.):
+//   Bash         → input.description   ("Get CLAUDE.md size and recent history")
+//   Read         → input.file_path     (basename → "Reading CLAUDE.md")
+//   Edit/Write   → input.file_path     (basename)
+//   Grep/Glob    → input.pattern
+//   Task/Agent   → input.description   (the sub-agent's task)
+//   WebFetch     → input.url           (hostname → "Reading example.com")
+//   hindsight    → friendly label      ("Searching memory")
+// There is never a raw `grep`/`jq`/`ls` to surface — only the model's own
+// plain-English description or a domain label. This is the signal the
+// draft-mirror renders (option A: uniform across code + non-code agents).
+
+/** Strip a path to its basename for display. */
+function baseName(p: unknown): string | null {
+  if (typeof p !== "string" || p.length === 0) return null;
+  const parts = p.split("/").filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : p;
+}
+
+/** Extract a bare hostname from a URL for display (no scheme/path). */
+function hostName(u: unknown): string | null {
+  if (typeof u !== "string" || u.length === 0) return null;
+  try {
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return u.replace(/^https?:\/\//, "").split("/")[0] || null;
+  }
+}
+
+function clip(s: unknown, n: number): string | null {
+  if (typeof s !== "string") return null;
+  const t = s.trim();
+  if (t.length === 0) return null;
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+/**
+ * Render a single tool_use into a human-friendly, present-tense activity
+ * line for the live draft preview — or null when the tool should NOT be
+ * surfaced (the Telegram-plugin surface tools, which ARE the conversation).
+ *
+ * Leads with the model-authored descriptive field per the map above; falls
+ * back to a domain label, then to a humanized tool name. Never emits raw
+ * shell/query syntax.
+ */
+export function describeToolUse(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): string | null {
+  if (!toolName) return null;
+  const inp = input ?? {};
+
+  const mcpMatch = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  if (mcpMatch) {
+    const server = mcpMatch[1].toLowerCase();
+    const tool = mcpMatch[2].toLowerCase();
+    // Surface tools ARE the conversation — never mirror them.
+    if (server === "switchroom-telegram") return null;
+    if (server === "hindsight") {
+      if (tool === "recall" || tool === "reflect") return "Searching memory";
+      if (tool === "retain" || tool === "update_memory" || tool === "sync_retain")
+        return "Saving to memory";
+      return "Working with memory";
+    }
+    if (
+      server === "google-workspace" ||
+      server === "claude_ai_google_calendar"
+    ) {
+      return "Checking your calendar";
+    }
+    if (server === "claude_ai_gmail") return "Checking your email";
+    if (server === "claude_ai_google_drive") return "Looking through your files";
+    if (server === "notion" || server === "claude_ai_notion") {
+      return "Checking your notes";
+    }
+    // Unknown MCP tool: prefer a model-authored field, else a humanized name.
+    const desc = clip(inp.description, 60) ?? clip(inp.query, 50) ?? clip(inp.title, 50);
+    if (desc) return desc;
+    return "Using " + tool.replace(/[-_]+/g, " ");
+  }
+
+  switch (toolName) {
+    case "Bash": {
+      // The model writes a plain-English description for every command.
+      return clip(inp.description, 70) ?? "Running a command";
+    }
+    case "BashOutput":
+    case "KillShell":
+      return "Managing a background command";
+    case "Read": {
+      const f = baseName(inp.file_path);
+      return f ? `Reading ${f}` : "Reading a file";
+    }
+    case "Edit":
+    case "MultiEdit":
+    case "NotebookEdit": {
+      const f = baseName(inp.file_path) ?? baseName(inp.notebook_path);
+      return f ? `Editing ${f}` : "Editing a file";
+    }
+    case "Write": {
+      const f = baseName(inp.file_path);
+      return f ? `Writing ${f}` : "Writing a file";
+    }
+    case "Grep":
+    case "Glob": {
+      const p = clip(inp.pattern, 40);
+      return p ? `Searching for ${p}` : "Searching files";
+    }
+    case "WebFetch": {
+      const h = hostName(inp.url);
+      return h ? `Reading ${h}` : "Reading a web page";
+    }
+    case "WebSearch": {
+      const q = clip(inp.query, 50);
+      return q ? `Searching the web for ${q}` : "Searching the web";
+    }
+    case "Task":
+    case "Agent": {
+      const d = clip(inp.description, 60);
+      return d ? `Delegating: ${d}` : "Delegating to a sub-agent";
+    }
+    case "TodoWrite":
+    case "TaskCreate":
+    case "TaskUpdate":
+    case "TaskList":
+      return "Updating the plan";
+    case "ToolSearch":
+      return "Finding the right tool";
+    default:
+      return "Working…";
+  }
+}
