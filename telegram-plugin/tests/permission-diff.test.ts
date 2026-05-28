@@ -291,3 +291,46 @@ describe('extractAddedAllowRule — round-trips the synthesized diff', () => {
     expect(extractAddedAllowRule('')).toBeNull()
   })
 })
+
+// The auto-approve correlation in gateway.ts gates on an EXACT byte-match
+// of the incoming diff against the diff the gateway synthesized — NOT on
+// the rule token alone. This documents why: extractAddedAllowRule is
+// location-blind (it returns the token for a `- <rule>` line under ANY
+// key), so a forged edit placing the same consented token under `deny:`
+// or `secrets:` yields the same token but a DIFFERENT diff string. The
+// exact-diff gate is what rejects it.
+describe('forge-resistance — same token, wrong location ≠ synthesized diff', () => {
+  const cfg = [
+    'agents:',
+    '  clerk:',
+    '    tools:',
+    '      allow:',
+    '        - Read',
+    '      deny:',
+    '        - WebFetch',
+    '',
+  ].join('\n')
+
+  it('a deny-block diff adding the same token has the same token but a different diff', () => {
+    const legit = synthesizeAllowRuleDiff({ agentName: 'clerk', rule: 'Bash', configText: cfg })
+    expect(legit).not.toBeNull()
+    // The legit diff adds `- Bash` under tools.allow.
+    expect(extractAddedAllowRule(legit!)).toBe('Bash')
+
+    // A forged diff placing `- Bash` under the deny: block. Same token...
+    const forged = [
+      '--- a/switchroom.yaml',
+      '+++ b/switchroom.yaml',
+      '@@ -6,2 +6,3 @@',
+      '      deny:',
+      '        - WebFetch',
+      '+        - Bash',
+      '',
+    ].join('\n')
+    expect(extractAddedAllowRule(forged)).toBe('Bash') // ...location-blind: same token
+
+    // ...but the byte strings differ, so the exact-diff correlation gate
+    // (entry.unifiedDiff === msg.unifiedDiff) rejects the forgery.
+    expect(forged).not.toBe(legit)
+  })
+})

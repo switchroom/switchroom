@@ -2294,7 +2294,7 @@ const PERMISSION_TTL_MS = 10 * 60_000
 // other field finds no entry and falls through to a real operator card.
 // Single-shot (deleted on match) + 30s TTL sweep so a stale correlation
 // can't be replayed.
-const pendingAlwaysAllowCorrelations = new Map<string, { agentName: string; rule: string; createdAt: number }>()
+const pendingAlwaysAllowCorrelations = new Map<string, { agentName: string; rule: string; unifiedDiff: string; createdAt: number }>()
 const ALWAYS_ALLOW_CORRELATION_TTL_MS = 30_000
 function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
   for (const [key, entry] of pendingAlwaysAllowCorrelations) {
@@ -4602,11 +4602,19 @@ const ipcServer: IpcServer = createIpcServer({
       // finds no entry and falls through to a real operator card.
       tryAutoResolve: (msg) => {
         sweepStaleAlwaysAllowCorrelations()
+        // `extractAddedAllowRule` only locates a CANDIDATE entry by the
+        // rule token — it is shape-based, not YAML-location-aware, so it
+        // is NOT the security gate. The gate is an EXACT byte-match of
+        // the incoming diff against the diff the gateway itself
+        // synthesized and queued. A forged config_propose_edit (the same
+        // consented token placed under `deny:`/`secrets:`, a different
+        // field, or any other byte difference) won't match → falls
+        // through to a real operator approval card.
         const added = extractAddedAllowRule(msg.unifiedDiff)
         if (!added) return null
         const key = `${msg.agentName}::${added}`
         const entry = pendingAlwaysAllowCorrelations.get(key)
-        if (entry) {
+        if (entry && entry.unifiedDiff === msg.unifiedDiff) {
           pendingAlwaysAllowCorrelations.delete(key)
           return 'approve'
         }
@@ -15381,7 +15389,7 @@ bot.on('callback_query:data', async ctx => {
       } else {
         // Pre-register the single-tap correlation so hostd's callback
         // (request_config_approval) auto-approves WITHOUT a second card.
-        pendingAlwaysAllowCorrelations.set(correlationKey, { agentName, rule: rule.rule, createdAt: Date.now() })
+        pendingAlwaysAllowCorrelations.set(correlationKey, { agentName, rule: rule.rule, unifiedDiff, createdAt: Date.now() })
         const req: HostdRequest = {
           v: 1,
           op: 'config_propose_edit',
