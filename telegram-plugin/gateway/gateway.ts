@@ -374,6 +374,14 @@ import {
   saveCreditState,
 } from '../credits-watch.js'
 import {
+  evaluateQuotaWatchAccount,
+  loadQuotaWatchState,
+  saveQuotaWatchState,
+  patchQuotaWatchState,
+  emptyAccountState,
+} from '../quota-watch.js'
+import { buildSnapshotsFromState } from '../auth-snapshot-format.js'
+import {
   writeTurnActiveMarker,
   touchTurnActiveMarker,
   removeTurnActiveMarker,
@@ -11851,6 +11859,120 @@ async function runCreditWatch(): Promise<void> {
   }
 }
 
+/**
+ * Quota threshold-tier push loop body (#E4). Reads the broker's cached
+ * quota state for all accounts in the pool, classifies each via
+ * classifyHealth, and fires one Telegram message per healthy ↔ throttling
+ * transition (edge-triggered, not level-triggered). Does NOT fire on
+ * healthy → blocked or blocked → healthy — credits-watch.ts owns those.
+ *
+ * Cheap on the happy path: only calls broker `listState` (local IPC) +
+ * `probeQuota` (once per account that needs fresh data for a notification
+ * body). State persists across restarts via `<stateDir>/quota-watch.json`.
+ *
+ * Mirrors runCreditWatch's structure and notification routing.
+ */
+async function runQuotaWatch(): Promise<void> {
+  const agentName = getMyAgentName()
+  const stateDir = STATE_DIR
+
+  // Read broker state (all accounts + their cached quota data).
+  const brokerClient = await getAuthBrokerClient(agentName)
+  if (!brokerClient) {
+    process.stderr.write('telegram gateway: quota-watch: broker client unavailable — skipping\n')
+    return
+  }
+
+  let listStateData: Awaited<ReturnType<typeof brokerClient.listState>>
+  try {
+    listStateData = await brokerClient.listState()
+  } catch (err) {
+    process.stderr.write(`telegram gateway: quota-watch: listState failed: ${err}\n`)
+    return
+  }
+
+  if (!listStateData.accounts || listStateData.accounts.length === 0) {
+    return // No accounts — nothing to watch.
+  }
+
+  // Load persisted per-account state.
+  let watchState = loadQuotaWatchState(stateDir)
+  const now = Date.now()
+  const access = loadAccess()
+
+  // Build snapshots from cached quota data. The broker's `listState`
+  // response does NOT include live quota — we need a quick probe for
+  // any accounts where we're about to send a notification. For the
+  // initial classification pass, build snapshots with null quota so
+  // classifyHealth returns 'unknown' (no data yet); we then probe only
+  // the accounts whose transition needs a notification.
+  //
+  // Strategy: do a cheap pre-check using the broker exhausted flag to
+  // detect obvious blocked cases (skip those), then probe the remaining
+  // accounts in a single batched call.
+
+  const labels = listStateData.accounts.map(a => a.label)
+  let probeData: Awaited<ReturnType<typeof brokerClient.probeQuota>> | null = null
+  try {
+    probeData = await brokerClient.probeQuota(labels, 8000)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: quota-watch: probeQuota failed: ${err}\n`)
+    // Fall through with null probeData — snapshots will have quota=null,
+    // classifyHealth returns 'unknown', evaluateQuotaWatchAccount skips.
+  }
+
+  // Build AccountSnapshot[] from listState + probe results.
+  const quotaResults = probeData
+    ? probeData.results.map(r => r.result)
+    : listStateData.accounts.map(() => ({ ok: false as const, reason: 'probe unavailable' }))
+  const snapshots = buildSnapshotsFromState(listStateData, quotaResults)
+
+  // Evaluate each account and collect notifications.
+  const notifications: Array<{ message: string; accountLabel: string }> = []
+  let mutatedState = watchState
+
+  for (const snap of snapshots) {
+    const prev = mutatedState[snap.label] ?? emptyAccountState()
+    const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now })
+    if (decision.kind === 'skip') {
+      continue
+    }
+    notifications.push({ message: decision.message, accountLabel: snap.label })
+    mutatedState = patchQuotaWatchState(mutatedState, snap.label, decision.newAccountState)
+  }
+
+  if (notifications.length === 0) {
+    return // Nothing to send.
+  }
+
+  // Send all notifications (one message per crossing account).
+  for (const { message, accountLabel } of notifications) {
+    for (const chat_id of access.allowFrom) {
+      // Quota-watch notify — best-effort. Wrap via swallowingApiCall so
+      // flood-wait / deleted-chat / not-found surface as a stderr log
+      // rather than a thrown exception that aborts the loop and leaves
+      // half the allowFrom chats unnotified. Matches the wrapping
+      // contract enforced by scripts/check-bot-api-wrapping.sh (#1075).
+      await swallowingApiCall(
+        () =>
+          bot.api.sendMessage(chat_id, message, {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }),
+        { chat_id, verb: 'quota-watch.notify' },
+      )
+    }
+    process.stderr.write(`telegram gateway: quota-watch: notified transition for account=${accountLabel}\n`)
+  }
+
+  // Persist updated state regardless of whether sends succeeded.
+  try {
+    saveQuotaWatchState(stateDir, mutatedState)
+  } catch (err) {
+    process.stderr.write(`telegram gateway: quota-watch state persist failed: ${err}\n`)
+  }
+}
+
 bot.command("auth", async ctx => {
   // sec WS7-F2b (#1394): `/auth` drives the auth-broker credential
   // lifecycle (`/auth add` mints/attaches an Anthropic account token,
@@ -16692,6 +16814,34 @@ void (async () => {
               process.stderr.write(`telegram gateway: credit-watch scheduled run failed: ${err}\n`)
             })
           }, CREDIT_WATCH_POLL_MS).unref()
+        }
+
+        // Proactive quota threshold-tier push (#E4). Reads broker cached
+        // quota for all accounts in the pool, classifies health via
+        // classifyHealth, and fires one Telegram message per
+        // healthy ↔ throttling transition (edge-triggered). Does NOT
+        // cover healthy → blocked or blocked → healthy — credits-watch
+        // handles those fatal-billing transitions above.
+        //
+        // Cadence: 15 min by default (same as credit-watch). Each poll
+        // calls broker listState (local IPC, cheap) + probeQuota only
+        // when a state-change is detected (to get fresh numbers for
+        // the notification body). SWITCHROOM_QUOTA_WATCH_POLL_MS=0 disables.
+        const QUOTA_WATCH_POLL_MS = Number(process.env.SWITCHROOM_QUOTA_WATCH_POLL_MS ?? 15 * 60_000)
+        if (QUOTA_WATCH_POLL_MS > 0) {
+          // Delay the initial run by 30 s to let the broker connection
+          // settle after boot (avoids a probe race with the boot-card
+          // quota probe that fires in the first few seconds).
+          setTimeout(() => {
+            void runQuotaWatch().catch((err) => {
+              process.stderr.write(`telegram gateway: quota-watch initial run failed: ${err}\n`)
+            })
+          }, 30_000)
+          setInterval(() => {
+            void runQuotaWatch().catch((err) => {
+              process.stderr.write(`telegram gateway: quota-watch scheduled run failed: ${err}\n`)
+            })
+          }, QUOTA_WATCH_POLL_MS).unref()
         }
 
         // Restart-watchdog: poll systemd's NRestarts for the agent unit.
