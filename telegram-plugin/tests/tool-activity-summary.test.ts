@@ -32,9 +32,25 @@ describe("verbForTool — tool name → past-tense verb", () => {
     expect(verbForTool("mcp__switchroom-telegram__react")).toBeNull();
   });
 
-  it("returns 'used' for unknown / non-switchroom MCP tools", () => {
-    expect(verbForTool("mcp__google-workspace__list_files")).toBe("used");
-    expect(verbForTool("mcp__notion__query_database")).toBe("used");
+  it("maps recognised MCP tools (hindsight, google-workspace, notion) to specific verbs", () => {
+    // hindsight: recall/reflect → searched, retain/update_memory → saved
+    expect(verbForTool("mcp__hindsight__reflect")).toBe("searched");
+    expect(verbForTool("mcp__hindsight__recall")).toBe("searched");
+    expect(verbForTool("mcp__hindsight__retain")).toBe("saved");
+    expect(verbForTool("mcp__hindsight__update_memory")).toBe("saved");
+    // google-workspace / claude.ai variants: read-shaped → searched, write-shaped → edited
+    expect(verbForTool("mcp__google-workspace__list_files")).toBe("searched");
+    expect(verbForTool("mcp__claude_ai_Gmail__search_messages")).toBe("searched");
+    expect(verbForTool("mcp__google-workspace__create_file")).toBe("edited");
+    expect(verbForTool("mcp__claude_ai_Google_Drive__download_file_content")).toBe("searched");
+    // notion: query/get → searched, create/update → edited
+    expect(verbForTool("mcp__notion__query_database")).toBe("searched");
+    expect(verbForTool("mcp__claude_ai_Notion__notion-search")).toBe("searched");
+    expect(verbForTool("mcp__claude_ai_Notion__notion-update-page")).toBe("edited");
+  });
+
+  it("returns 'used' for genuinely unknown MCP / future tools (generic fallback)", () => {
+    expect(verbForTool("mcp__random-third-party__do_thing")).toBe("used");
     expect(verbForTool("SomeFutureUnknownTool")).toBe("used");
   });
 
@@ -112,12 +128,24 @@ describe("register + formatSummary — Claude Code-style summary", () => {
     expect(formatSummary(s)).toBeNull(); // nothing tracked
   });
 
-  it("includes generic 'used' for unknown MCP tools", () => {
+  it("includes generic 'used' for genuinely-unknown MCP tools (fallback)", () => {
     const s = makeEmptyActivityState();
-    register(s, "mcp__google-workspace__list_files");
+    register(s, "mcp__random-third-party__do_thing");
     expect(formatSummary(s)).toBe("Used a tool");
-    register(s, "mcp__google-workspace__create_file");
+    register(s, "mcp__another-unknown-server__something_else");
     expect(formatSummary(s)).toBe("Used 2 tools");
+  });
+
+  it("maps recognised MCP tools to natural-language summaries (no generic 'Used N tools')", () => {
+    // hindsight search shows up as 'searched' (memory)
+    const s = makeEmptyActivityState();
+    register(s, "mcp__hindsight__reflect");
+    expect(formatSummary(s)).toBe("Ran a search");
+    register(s, "mcp__hindsight__reflect");
+    expect(formatSummary(s)).toBe("Ran 2 searches");
+    // hindsight retain shows up as 'saved a memory'
+    register(s, "mcp__hindsight__retain");
+    expect(formatSummary(s)).toBe("Ran 2 searches, saved a memory");
   });
 
   it("tracks firstToolName for forensic / telemetry use", () => {

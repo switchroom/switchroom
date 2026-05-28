@@ -638,7 +638,7 @@ const GRAMMY_VERSION: string = (() => {
   }
 })()
 const sendMessageDraftFn: (
-  (chatId: string, draftId: number, text: string, params?: { message_thread_id?: number }) => Promise<unknown>
+  (chatId: string, draftId: number, text: string, params?: { message_thread_id?: number; parse_mode?: 'HTML' }) => Promise<unknown>
 ) | undefined =
   typeof _rawSendMessageDraft === 'function'
     ? (chatId, draftId, text, params) =>
@@ -6828,7 +6828,7 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
             turn.activityDraftId = allocateDraftId()
           }
           const draftId = turn.activityDraftId
-          await sendMessageDraftFn!(chat, draftId, html, undefined)
+          await sendMessageDraftFn!(chat, draftId, html, { parse_mode: 'HTML' })
         } else if (turn.activityMessageId == null) {
           const sent = await robustApiCall(
             () => bot.api.sendMessage(chat, html, {

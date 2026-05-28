@@ -533,6 +533,43 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     )
   })
 
+  it('raw mcp__ tool name with a human label drops the technical name and leads with the label', () => {
+    // mcp__hindsight__reflect is the internal MCP identifier — looks
+    // like a leak when surfaced to a user. The label table emits
+    // "Searching memory" for it (see hooks/tool-label-pretool.mjs);
+    // the fallback message should lead with the label, not concatenate
+    // both.
+    const text = formatFrameworkFallbackText('working', 305_000, [
+      { name: 'mcp__hindsight__reflect', label: 'Searching memory', durationMs: 305_000 },
+    ])
+    expect(text).toBe(
+      'Searching memory for 5m (no update from agent in 5 min)',
+    )
+  })
+
+  it('raw mcp__ tool name with NO label falls back to the bare name (no leak-but-no-better-option)', () => {
+    // If the label table doesn't recognise an MCP tool, we have nothing
+    // better to show than the raw name. Better honest-ugly than silent.
+    const text = formatFrameworkFallbackText('working', 305_000, [
+      { name: 'mcp__some-third-party__do_thing', label: null, durationMs: 305_000 },
+    ])
+    expect(text).toBe(
+      'running mcp__some-third-party__do_thing for 5m (no update from agent in 5 min)',
+    )
+  })
+
+  it('built-in tool (Grep) with a label keeps the prior "running Name label" shape — name is already human-readable', () => {
+    // Regression guard: don't accidentally drop the built-in tool name
+    // when generalising the MCP rule. "Grep" is human-readable; the
+    // label ("foo") is supplementary detail like the search pattern.
+    const text = formatFrameworkFallbackText('working', 305_000, [
+      { name: 'Grep', label: 'foo', durationMs: 305_000 },
+    ])
+    expect(text).toBe(
+      'running Grep foo for 5m (no update from agent in 5 min)',
+    )
+  })
+
   it('empty inFlightTools falls back to the base "still working" wording', () => {
     expect(
       formatFrameworkFallbackText('working', 305_000, []),

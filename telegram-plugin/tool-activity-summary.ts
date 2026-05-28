@@ -40,6 +40,7 @@ export type ActivityVerb =
   | "fetched"
   | "dispatched"
   | "noted"
+  | "saved" // memory-retain class (hindsight, etc.) — distinct from "noted" (TodoWrite)
   | "used"; // generic fallback
 
 /** Object form so `register()` can mutate; pure functions inside the
@@ -66,10 +67,44 @@ export function makeEmptyActivityState(): ActivityState {
  *  like reply/stream_reply) return null — the caller skips them. */
 export function verbForTool(toolName: string): ActivityVerb | null {
   if (!toolName) return null;
-  const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(toolName);
+  // Lazy match on the server segment so names containing underscores
+  // (e.g. `mcp__claude_ai_Gmail__search`) parse as
+  //   server="claude_ai_Gmail", tool="search"
+  // instead of the prior `[^_]+` which stopped at the first inner `_`.
+  const mcpMatch = /^mcp__(.+?)__(.+)$/.exec(toolName);
   // Skip user-facing Telegram-plugin tools entirely — those ARE the
   // surface, never to be summarised.
   if (mcpMatch && mcpMatch[1] === "switchroom-telegram") return null;
+
+  // MCP allowlist — map common MCP tools to specific verbs so the summary
+  // reads as "Searched memory" or "Read 2 files" instead of the generic
+  // fallback "Used 2 tools". Tools NOT on this list fall through to the
+  // generic "used" verb, which is still better than nothing for one-offs
+  // but hurts on heavy MCP turns. Mirrors the label table in
+  // `telegram-plugin/hooks/tool-label-pretool.mjs` — keep them in sync.
+  if (mcpMatch) {
+    // Case-insensitive match — claude.ai prefixes use mixed-case
+    // server names ("claude_ai_Gmail", "claude_ai_Google_Drive") so we
+    // lowercase both sides before comparing.
+    const server = mcpMatch[1].toLowerCase();
+    const mcpTool = mcpMatch[2].toLowerCase();
+    if (server === "hindsight") {
+      if (mcpTool === "recall" || mcpTool === "reflect") return "searched";
+      if (mcpTool === "retain" || mcpTool === "update_memory" || mcpTool === "sync_retain") return "saved";
+    }
+    if (server === "google-workspace" || server === "claude_ai_google_drive" || server === "claude_ai_gmail" || server === "claude_ai_google_calendar") {
+      if (/^(search|list|query|read|get|fetch|download)/i.test(mcpTool)) return "searched";
+      if (/^(create|update|write|send|move|copy|duplicate)/i.test(mcpTool)) return "edited";
+    }
+    if (server === "notion" || server === "claude_ai_notion") {
+      // claude.ai Notion exposes tools as `notion-search`, `notion-update-page`,
+      // etc. Strip the redundant `notion-` prefix before matching the verb.
+      const action = mcpTool.replace(/^notion-/, "");
+      if (/^(search|fetch|query|get|read)/i.test(action)) return "searched";
+      if (/^(create|update|move|duplicate|comment)/i.test(action)) return "edited";
+    }
+  }
+
   const suffix = (mcpMatch ? mcpMatch[2] : toolName).toLowerCase();
   switch (suffix) {
     case "read":
@@ -128,6 +163,7 @@ const VERB_PHRASE: Record<ActivityVerb, VerbPhrase> = {
   fetched: { singular: "fetched a URL", plural: "fetched $N URLs" },
   dispatched: { singular: "dispatched a sub-agent", plural: "dispatched $N sub-agents" },
   noted: { singular: "updated the todo list", plural: "updated the todo list ($N edits)" },
+  saved: { singular: "saved a memory", plural: "saved $N memories" },
   used: { singular: "used a tool", plural: "used $N tools" },
 };
 
