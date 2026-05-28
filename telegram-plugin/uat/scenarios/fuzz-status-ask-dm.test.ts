@@ -215,9 +215,13 @@ const CC2_CASES: readonly CC2Case[] = [
   },
   {
     name: "long-running with planned check-ins",
+    // Use python time.sleep, NOT the `sleep` command — Claude Code's bash
+    // sandbox blocks standalone `sleep` ("foreground sleep is sandboxed
+    // away"), which made this case un-runnable (agent replied instantly).
     prompt:
-      "Run `bash` with `sleep 5 && echo step1`, send a brief update, " +
-      "then `sleep 5 && echo step2`, send another brief update, then " +
+      "Run `bash` with `python3 -c 'import time; time.sleep(5)'` then echo " +
+      "step1, send a brief update, then `python3 -c 'import time; " +
+      "time.sleep(5)'` then echo step2, send another brief update, then " +
       "send a final 'done' as your answer.",
   },
 ];
@@ -262,12 +266,27 @@ async function assertMidTurnSilent(
     )
     .join("\n");
 
-  const last = collected[collected.length - 1];
-  expect(last.silent, `final answer was silent — won't ping. Trail:\n${trail}`).toBe(
-    false,
-  );
+  // The model habitually emits a trailing trivial confirmation ("Done.",
+  // "Sent.", "OK") as a separate SILENT message AFTER its real pinged
+  // answer. That's pacing noise (the turn-pacing directive discourages
+  // it), not the final answer — so don't treat it as the
+  // "final-answer-must-ping" target. Find the last SUBSTANTIVE message
+  // and assert that one pinged; trailing trivial confirmations are
+  // ignored for this invariant (they're correctly silent anyway).
+  const TRIVIAL_TAIL = /^(done|sent|ok|okay|ack|got it|hope (that|this) helps)\b[.! ]*$/i;
+  const isTrivial = (m: ObservedMessage) => TRIVIAL_TAIL.test(m.text.trim());
+  let finalIdx = collected.length - 1;
+  while (finalIdx > 0 && isTrivial(collected[finalIdx])) finalIdx--;
+  const finalAnswer = collected[finalIdx];
+  expect(
+    finalAnswer.silent,
+    `final substantive answer was silent — won't ping. Trail:\n${trail}`,
+  ).toBe(false);
 
-  const midTurn = collected.slice(0, -1);
+  // Everything BEFORE the final substantive answer must be silent
+  // (mid-turn updates ping-free). Trailing trivial confirmations after
+  // it are already silent and are not "mid-turn" — exclude them too.
+  const midTurn = collected.slice(0, finalIdx);
   const loudMidTurn = midTurn.filter((m) => !m.silent);
   expect(
     loudMidTurn.length,
@@ -334,12 +353,19 @@ async function assertSilencePokeFires(
   // Single bash call so the poke piggybacks the single tool result.
   // Without the explicit "no replies" instruction the model might
   // soft-commit; that resets the silence clock but a single >75s
-  // sleep still pushes post-commit silence past the threshold.
+  // wait still pushes post-commit silence past the threshold.
+  //
+  // Use python time.sleep, NOT the `sleep` command — Claude Code's bash
+  // sandbox blocks standalone `sleep` ("foreground sleep is sandboxed
+  // away to prevent burning cache windows"), so a `sleep 80` prompt made
+  // the agent reply instantly instead of going silent, breaking this
+  // case. python3 time.sleep is a genuine foreground wait the sandbox
+  // doesn't special-case.
   const prompt =
-    `Run exactly one Bash tool call: \`sleep ${sleepSeconds}\`. Do NOT ` +
-    `send any reply before the sleep completes — no soft commit, no ` +
-    `mid-turn updates. When the sleep returns, send one brief 'done' ` +
-    `reply.`;
+    `Run exactly one Bash tool call: \`python3 -c 'import time; ` +
+    `time.sleep(${sleepSeconds})'\`. Do NOT send any reply before it ` +
+    `completes — no soft commit, no mid-turn updates. When it returns, ` +
+    `send one brief 'done' reply.`;
 
   await scenario.sendDM(prompt);
 
