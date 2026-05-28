@@ -90,8 +90,11 @@ export interface WebhookHandlerArgs {
   /**
    * Optional dispatch rules from `channels.telegram.webhook_dispatch`.
    * When present, verified events are evaluated against the rules and
-   * matching ones spawn one-shot `claude -p` turns. Passed through to
-   * the dispatch evaluator; the ingest path itself does not consume it.
+   * matching ones are delivered as synthesized `inject_inbound` turns to
+   * the agent's interactive `claude` session (never headless `claude -p`,
+   * which is programmatic usage under Anthropic's 2026-06-15 policy).
+   * Passed through to the dispatch evaluator; the ingest path itself does
+   * not consume it.
    */
   dispatchConfig?: WebhookDispatchConfig
 }
