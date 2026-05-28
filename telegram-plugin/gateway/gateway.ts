@@ -11979,6 +11979,10 @@ async function runQuotaWatch(): Promise<void> {
     // If the fresh probe succeeded, replace the snap's quota with live data.
     const freshResult = freshProbeMap.get(accountLabel)
     let enrichedDecision = decision
+    // pendingTransitions only ever holds notify decisions (pushed under
+    // `decision.kind !== 'skip'`). Narrow explicitly so `decision.transition`
+    // type-checks below; this continue never fires at runtime.
+    if (decision.kind !== 'notify') continue
     if (freshResult && freshResult.ok && snapIndex >= 0) {
       const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data }
       const prev = watchState[accountLabel] ?? emptyAccountState()
