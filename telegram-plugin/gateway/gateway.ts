@@ -3192,6 +3192,26 @@ const ANSWER_STREAM_VISIBLE_ENABLED = (() => {
   if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false
   return true
 })()
+
+// Draft-mirror preview (RFC docs/rfcs/draft-mirror-preview.md), Phase 1.
+// When enabled, the model's prose narration streams into the ephemeral
+// compose-area draft (sendMessageDraft) instead of a visible real
+// message — a live "what's it doing" preview that clears when the
+// reply lands. Default OFF (canary flag). When on it (a) forces the
+// answer-stream onto draft transport regardless of
+// ANSWER_STREAM_VISIBLE_ENABLED, and (b) suppresses the activity-summary
+// tool-count draft so the two don't collide on the single per-chat
+// draft slot. Delivery on a no-reply turn is owned by turn-flush
+// (decideTurnFlush → capturedText fresh send), NOT answer-stream
+// materialize() — which is dead on the draft-only path (streamMsgId
+// stays null, so its turn-end gate is false). Kill switch:
+// SWITCHROOM_DRAFT_MIRROR unset/0/false/off/no.
+const DRAFT_MIRROR_ENABLED = (() => {
+  const raw = process.env.SWITCHROOM_DRAFT_MIRROR
+  if (raw == null) return false
+  const v = raw.trim().toLowerCase()
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no')
+})()
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const progressDriver: any = null
 const unpinProgressCardForChat: ((chatId: string, threadId: number | undefined) => void) | null = null
@@ -7110,7 +7130,13 @@ function handleSessionEvent(ev: SessionEvent): void {
       // exactly once at a time and re-running until pending matches
       // the last-sent. Captures `turn` so a late drain after turn-swap
       // can't corrupt the next turn's atom.
-      if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
+      // DRAFT_MIRROR (RFC draft-mirror-preview, Phase 1): the model's
+      // prose narration owns the single per-chat draft slot. Suppress
+      // the activity-summary tool-count draft so the two don't collide
+      // (Telegram shows one draft per chat — the later write clobbers
+      // the earlier). The activity-summary code stays intact for the
+      // kill-switch path; it's retired for good only in Phase 4.
+      if (!DRAFT_MIRROR_ENABLED && !turn.replyCalled && !isTelegramSurfaceTool(name)) {
         const rendered = registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
           turn.activityPendingRender = rendered
@@ -7158,13 +7184,20 @@ function handleSessionEvent(ev: SessionEvent): void {
             chatId: turn.sessionChatId,
             isPrivateChat: turn.isDm,
             threadId: turn.sessionThreadId,
-            // #869-Phase1 visible-answer-stream: omit the draft API so
-            // the lane uses the real sendMessage / editMessageText path
-            // and edits a user-visible chat-timeline message instead
-            // of the invisible compose-box draft.
-            ...(ANSWER_STREAM_VISIBLE_ENABLED
-              ? { minInitialChars: 1 }
-              : { sendMessageDraft: sendMessageDraftFn }),
+            // Transport selection:
+            // - DRAFT_MIRROR (RFC draft-mirror-preview, Phase 1): force
+            //   the ephemeral compose-area draft so narration is a
+            //   clears-on-reply preview. Wins over visible-answer-stream.
+            //   No-reply delivery is owned by turn-flush, not materialize.
+            // - else #869-Phase1 visible-answer-stream: omit the draft
+            //   API so the lane edits a user-visible chat-timeline
+            //   message (minInitialChars:1 opens it on the first chunk).
+            // - else legacy: draft transport.
+            ...(DRAFT_MIRROR_ENABLED
+              ? { sendMessageDraft: sendMessageDraftFn }
+              : ANSWER_STREAM_VISIBLE_ENABLED
+                ? { minInitialChars: 1 }
+                : { sendMessageDraft: sendMessageDraftFn }),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
