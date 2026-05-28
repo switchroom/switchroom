@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.13.60 — delete dead ack-first gate code (cleanup)
+
+Hygiene follow-up to v0.13.59. After ~1 hour of UAT confirmed no
+regressions from de-registering the PreToolUse `ack-first-pretool`
+gate, this release deletes the orphaned source + bundled .mjs +
+Dockerfile.agent COPY + scripts/build.mjs bundle invocation.
+
+452 lines deleted, 0 added.
+
+No behavioral change. The strip work happened in v0.13.59 (#1934);
+v0.13.60 just removes the now-unreachable files.
+
 ## v0.13.59 — strip the ack-first PreToolUse gate; draft transport owns the beat
 
 Removes the PreToolUse `ack-first-pretool` gate (shipped v0.13.56,
