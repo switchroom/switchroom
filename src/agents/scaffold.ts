@@ -3989,7 +3989,12 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     'compose-area preview is the ambient liveness signal), then reply ' +
     'once with the answer or a genuine mid-work pivot ("halfway ' +
     'through — found an unexpected issue, want me to continue?"). Not ' +
-    '"still working".</turn-pacing>';
+    '"still working".\n\n' +
+    'Do NOT send a trailing confirmation after your answer — no "Done.", ' +
+    '"Sent.", "Hope that helps." as a separate message once you have ' +
+    'already replied. Your answer is the last thing the user should ' +
+    'see; a follow-up "Done." is dead-air clutter (and the user\'s ' +
+    'device already pinged on the answer). Stop after the answer.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
