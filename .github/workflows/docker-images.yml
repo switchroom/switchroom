@@ -127,8 +127,18 @@ jobs:
           platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.tags.outputs.tags }}
           push: ${{ github.event_name != 'pull_request' }}
-          cache-from: type=gha,scope=base
-          cache-to: type=gha,mode=max,scope=base
+          # Cache via GHCR registry, not type=gha (#1965). The GHA
+          # Azure-blob backend restores each layer behind a short-lived
+          # SAS token; on the heavy images' large layers that token
+          # expired / the blob restore stalled mid-copy and HARD-FAILED
+          # the build (fatal "failed to compute cache key: failed to
+          # copy"). GHCR registry cache has no SAS token to expire,
+          # restores over the same path the images already publish to,
+          # and a miss is a non-fatal cold build. cache-to is gated to
+          # non-PR events: fork PRs have no GHCR write token, and a
+          # failed cache export would break the required build check.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-base:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-base:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
           # sec WS9-F3 (#1418): signed build provenance + SBOM so an
           # operator's `switchroom update` pull can verify the image
           # was built by THIS pipeline from THIS source (SLSA-style).
@@ -226,8 +236,15 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
             BASE_IMAGE=${{ steps.tags.outputs.base }}
-          cache-from: type=gha,scope=${{ matrix.image.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+          # GHCR registry cache, not type=gha — #1965. `agent` (Chromium/
+          # webkite/playwright, 143MB layers) is the worst hit: its layers
+          # outran the GHA Azure-blob SAS token / stalled mid-restore and
+          # hard-failed the build, blocking releases. Registry cache has no
+          # SAS expiry; a miss degrades to a cold build. cache-to gated to
+          # non-PR (fork PRs can't write GHCR; export failure would break
+          # the required check). Per-image :buildcache tag, mode=max.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name) || '' }}
           # sec WS9-F3 (#1418): provenance + SBOM on every fleet image.
           provenance: mode=max
           sbom: true
@@ -280,8 +297,9 @@ jobs:
           platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.tags.outputs.tags }}
           push: ${{ github.event_name != 'pull_request' }}
-          cache-from: type=gha,scope=hindsight
-          cache-to: type=gha,mode=max,scope=hindsight
+          # GHCR registry cache, not type=gha — #1965 (see build-base).
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-hindsight:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-hindsight:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
           # sec WS9-F3 (#1418): provenance + SBOM on the hindsight image too.
           provenance: mode=max
           sbom: true
