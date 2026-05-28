@@ -10,6 +10,8 @@ import { isHindsightEnabled } from "../memory/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift } from "../agents/scaffold.js";
+import { bareClonePath } from "../repos/bare-clone.js";
+import { removeAgentWorktree } from "../repos/agent-worktree.js";
 import { listAvailableProfiles } from "../agents/profiles.js";
 import {
   startAgent,
@@ -1967,6 +1969,31 @@ export function registerAgentCommand(program: Command): void {
         // down. We don't shell out to docker here — the operator may be
         // on a non-Docker fleet, and either way the compose layer is
         // owned by `apply`, not `agent destroy`.
+
+        // Remove worktrees for repos: entries before wiping the agent dir.
+        // resolveAgentConfig applies the cascade so repos: from profiles/defaults
+        // is also respected. Non-fatal: a failed worktree removal is logged and
+        // skipped — the agentDir rmSync below will clean up any leftover files.
+        const rawAgentConfig = config.agents[name];
+        if (rawAgentConfig) {
+          const resolvedAgentConfig = resolveAgentConfig(
+            config.defaults,
+            config.profiles,
+            rawAgentConfig,
+          );
+          if (resolvedAgentConfig.repos) {
+            for (const slug of Object.keys(resolvedAgentConfig.repos)) {
+              try {
+                removeAgentWorktree(name, slug, bareClonePath(slug), agentDir);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                process.stderr.write(
+                  `[switchroom] repo "${slug}": worktree removal failed (continuing): ${msg}\n`,
+                );
+              }
+            }
+          }
+        }
 
         // Remove agent directory
         if (existsSync(agentDir)) {

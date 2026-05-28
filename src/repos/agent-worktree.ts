@@ -139,17 +139,20 @@ function resolveDefaultBranch(bareClonePath: string): string {
  *   3. Subsequent calls (dirty worktree): leaves the worktree unchanged,
  *      returns dirty: true.
  *
+ * Synchronous: uses execFileSync internally; exported as a sync function
+ * so that callers (reconcileAgent) do not need to become async.
+ *
  * @param agentName      Agent identifier (e.g. "clerk")
  * @param slug           Repo slug (e.g. "switchroom-web")
  * @param bareClonePath  Absolute path to the bare clone directory
  * @param agentDir       Agent directory (e.g. ~/.switchroom/agents/clerk)
  */
-export async function ensureAgentWorktree(
+export function ensureAgentWorktree(
   agentName: string,
   slug: string,
   bareClonePath: string,
   agentDir: string,
-): Promise<WorktreeState> {
+): WorktreeState {
   const worktreePath = agentWorktreePath(agentDir, slug);
   const branch = agentBranchName(agentName);
   const defaultBranch = resolveDefaultBranch(bareClonePath);
@@ -246,13 +249,16 @@ export async function ensureAgentWorktree(
  *   2. `git branch -D agent/<agentName>/main` from the bare clone.
  *
  * Idempotent — safe to call even when the worktree or branch is absent.
+ *
+ * Synchronous: uses execFileSync internally; exported as a sync function
+ * so that callers do not need to become async.
  */
-export async function removeAgentWorktree(
+export function removeAgentWorktree(
   agentName: string,
   slug: string,
   bareClonePath: string,
   agentDir: string,
-): Promise<void> {
+): void {
   const worktreePath = agentWorktreePath(agentDir, slug);
   const branch = agentBranchName(agentName);
 
