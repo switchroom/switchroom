@@ -1,6 +1,50 @@
 # Changelog
 
-## v0.14.0 — friendly activity mirror + webkite doctor
+## v0.14.1 — NO_REPLY-leak fix + accumulated fleet improvements
+
+Bundles the composite-silent-noise leak fix with the parallel work that
+merged to main since v0.14.0. Released off the main tip per the
+merge-to-main-on-green model; each PR below was reviewed + CI-passed
+independently.
+
+### Gateway / UX
+
+- **Suppress composite silent-noise leak (#1955).** After a clean
+  reply, the model would emit a trailing `Sent.`, get re-prompted by
+  the silent-end Stop hook, answer `NO_REPLY` once or twice, and the
+  accumulated `Sent.\nNO_REPLY\nNO_REPLY` blob leaked to chat as a
+  visible message (once per turn). Root cause: `isSilentFlushMarker`
+  only matched a *single* sentinel; the multi-line composite exceeded
+  the length guard. New `isCompositeSilentNoise` suppresses a blob
+  whose lines are all silent markers / trivial confirmations with ≥1
+  real marker present (conservative — never drops genuine answer text).
+- **Proactive quota threshold push (#1931).** The gateway pushes a
+  heads-up when usage crosses 80% of the window.
+- **Remove auth-slot buttons that redirect to terminal (#1930).** Drops
+  inline buttons whose only action was to send the user to a terminal
+  flow that doesn't apply on the docker install.
+- **Boot-card surfaces config changes since last boot (#1933).** The
+  post-restart boot card now diffs config and lists what changed.
+
+### Fleet / lifecycle
+
+- **Worktree provisioning wired into reconcile + destroy (#1932).**
+- **hostd: replace the `claude -p` deep probe with an auth-broker token
+  check (#1929).** Removes a compliance-sensitive `claude -p` callsite
+  in favour of a direct broker token introspection — aligns with the
+  Claude-native / no-`claude -p` constraint.
+
+### Docs
+
+- Drift-audit refresh batch (#1902–1912): JTBD/principle/reference
+  alignment, conversational-pacing emoji sequence, RFC promotions,
+  posthog event tightening. No runtime impact.
+
+(v0.14.0's friendly activity mirror (#1951) + webkite doctor (#1953)
+are carried forward — v0.14.0 was tagged but never rolled to the fleet;
+v0.14.1 is the first fleet rollout of the 0.14 line.)
+
+
 
 Minor bump marking the **human-friendly activity** line: the agent's
 "what am I doing" signal is now rendered from the model's own
