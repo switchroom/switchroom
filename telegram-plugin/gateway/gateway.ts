@@ -59,6 +59,7 @@ import {
   registerAndRender,
   describeToolUse,
   appendActivityLine,
+  appendActivityLabel,
   type ActivityState,
 } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -7195,7 +7196,12 @@ function handleSessionEvent(ev: SessionEvent): void {
         // empty draft to wipe the compose-area preview; for persisted
         // messages, delete. The user sees the real reply land in the
         // same beat the summary disappears.
-        if (wasFirstReply) {
+        // Legacy (flag-off): the activity summary clears on the first
+        // reply — it was a one-shot "what I did" line. DRAFT_MIRROR keeps
+        // the live feed running through mid-turn replies and clears it at
+        // turn_end instead, so an early reply doesn't wipe the stream
+        // (the fast-turn determinism fix).
+        if (wasFirstReply && !DRAFT_MIRROR_ENABLED) {
           clearActivitySummary(turn)
         }
       }
@@ -7218,22 +7224,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       // exactly once at a time and re-running until pending matches
       // the last-sent. Captures `turn` so a late drain after turn-swap
       // can't corrupt the next turn's atom.
-      // DRAFT_MIRROR (RFC draft-mirror-preview): accumulate each tool_use
-      // into a human-friendly running feed in the live preview, using the
-      // model-authored descriptive field (Bash.description, Read/Edit file
-      // basename, hindsight→"Searching memory", etc. — see describeToolUse
-      // / appendActivityLine). The draft shows the turn's actions as a
-      // capped chronological list (Claude Code-style), clears on reply.
-      // Never surfaces raw shell/query syntax — option A, uniform across
-      // code + non-code agents.
-      //
       // Flag OFF (default): the legacy generic verb-count summary
       // ("Ran 5 commands") via registerAndRender — byte-identical to
-      // pre-draft-mirror behavior.
-      if (!turn.replyCalled && !isTelegramSurfaceTool(name)) {
-        const rendered = DRAFT_MIRROR_ENABLED
-          ? appendActivityLine(turn.mirrorLines, name, ev.input)
-          : registerAndRender(turn.toolActivity, name)
+      // pre-draft-mirror behavior, cleared on first reply.
+      //
+      // DRAFT_MIRROR: the draft is NOT driven from this (flush-gated)
+      // tool_use event — it's driven by the real-time `tool_label` event
+      // (PreToolUse sidecar, fires at tool-call time regardless of when
+      // claude flushes the transcript). See `case 'tool_label'`. That's
+      // the determinism fix: on a fast/clustered-tool turn the JSONL
+      // tool_use rows aren't on disk until ~turn-end, so sourcing the
+      // draft here lost the feed; the sidecar is flush-independent.
+      if (!DRAFT_MIRROR_ENABLED && !turn.replyCalled && !isTelegramSurfaceTool(name)) {
+        const rendered = registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
           turn.activityPendingRender = rendered
           if (turn.activityInFlight == null) {
@@ -7246,6 +7249,31 @@ function handleSessionEvent(ev: SessionEvent): void {
       ctrl.setTool(name)
       if (ev.toolUseId) {
         typingWrapper.onToolUse(ev.toolUseId, turn.sessionChatId, name, turn.sessionThreadId ?? null)
+      }
+      return
+    }
+    case 'tool_label': {
+      // DRAFT_MIRROR real-time driver. The PreToolUse hook wrote this
+      // label synchronously at tool-call time; the sidecar surfaced it
+      // here (~250ms) independent of the transcript flush. Accumulate it
+      // into the live feed and update the ephemeral draft — this is what
+      // makes the draft deterministic on fast/clustered-tool turns where
+      // the JSONL tool_use rows arrive too late.
+      if (!DRAFT_MIRROR_ENABLED) return
+      const turn = currentTurn
+      if (turn == null) return
+      // Surface tools (reply/stream_reply/react) are the conversation, not
+      // activity — the hook labels them ("Replying"), so filter by name.
+      if (isTelegramSurfaceTool(ev.toolName)) return
+      // Unlike the legacy tool_use path, do NOT gate on replyCalled — the
+      // whole point is to show activity even when a reply raced ahead of
+      // the (lagged) transcript. The feed clears at turn_end.
+      const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
+      if (rendered != null) {
+        turn.activityPendingRender = rendered
+        if (turn.activityInFlight == null) {
+          turn.activityInFlight = drainActivitySummary(turn)
+        }
       }
       return
     }
@@ -7518,6 +7546,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (turn?.orphanedReplyTimeoutId != null) {
         clearTimeout(turn.orphanedReplyTimeoutId)
         turn.orphanedReplyTimeoutId = null
+      }
+      // DRAFT_MIRROR: the live activity feed runs through the whole turn
+      // (it is NOT cleared on the first reply, unlike the legacy summary)
+      // so an early/mid-turn reply can't wipe it. Clear it here, at the
+      // real end of the turn — the ephemeral compose-area draft goes away
+      // once the work is actually done.
+      if (DRAFT_MIRROR_ENABLED && turn != null) {
+        clearActivitySummary(turn)
       }
       // #549 fix — flush any pending preamble BEFORE the answer stream is
       // nulled below. Text emitted immediately before turn_end (no tool

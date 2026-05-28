@@ -382,3 +382,21 @@ export function renderActivityFeed(lines: string[]): string | null {
   const body = shown.map((l) => `· ${l}`).join("\n");
   return hidden > 0 ? `· +${hidden} earlier…\n${body}` : body;
 }
+
+/**
+ * Like appendActivityLine, but for a pre-computed label (from the
+ * real-time PreToolUse sidecar / `tool_label` event) — the hook already
+ * rendered the friendly text, so we skip describeToolUse. Returns the
+ * rendered feed, or null when the label is empty.
+ */
+export function appendActivityLabel(
+  lines: string[],
+  label: string | undefined,
+): string | null {
+  const l = (label ?? "").trim();
+  if (l.length === 0) return null;
+  if (lines.length === 0 || lines[lines.length - 1] !== l) {
+    lines.push(l);
+  }
+  return renderActivityFeed(lines);
+}

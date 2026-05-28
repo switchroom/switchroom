@@ -74,15 +74,24 @@ function urlHostPath(u) {
 export function computeLabel(toolName, input) {
   const i = input ?? {}
 
-  // Tools whose labels are already handled elsewhere — emit nothing so
-  // the existing description / TodoWrite / sub-agent paths win.
+  // Bash / Task / ToolSearch / TodoWrite: previously emitted nothing
+  // (deferred to the session-JSONL description path). The draft-mirror
+  // now drives off THIS sidecar in real time (flush-independent), so we
+  // must label them here too — otherwise the most common tool (Bash)
+  // never reaches the live draft. Uses the model-authored `description`
+  // for Bash/Task, matching the gateway's describeToolUse rendering.
   switch (toolName) {
     case 'Bash':
+      return clip(String(i.description ?? ''), 70).trim() || 'Running a command'
     case 'Task':
-    case 'Agent':
+    case 'Agent': {
+      const d = clip(String(i.description ?? ''), 60).trim()
+      return d ? `Delegating: ${d}` : 'Delegating to a sub-agent'
+    }
     case 'TodoWrite':
+      return 'Updating the plan'
     case 'ToolSearch':
-      return null
+      return 'Finding the right tool'
   }
 
   // Built-in rule table.
