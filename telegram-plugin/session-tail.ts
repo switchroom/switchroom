@@ -93,6 +93,11 @@ export type SessionEvent =
   | { kind: 'dequeue' }
   | { kind: 'thinking' }
   | { kind: 'tool_use'; toolName: string; toolUseId?: string | null; input?: Record<string, unknown>; precomputedLabel?: string }
+  // Real-time tool label from the PreToolUse-hook sidecar — fires when the
+  // hook writes the label (synchronous at tool-call time), independent of
+  // the lazily-flushed transcript. The draft-mirror drives off THIS, not
+  // the flush-gated `tool_use`, so activity streams deterministically.
+  | { kind: 'tool_label'; toolUseId: string; label: string; toolName: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
   | { kind: 'turn_end'; durationMs: number }
@@ -639,6 +644,13 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
     try {
       const s = createToolLabelSidecar({ stateDir: stateDirForSidecar, sessionId })
       sidecars.set(sessionId, s)
+      // Real-time draft-mirror source: emit a `tool_label` event the moment
+      // the hook writes a label (flush-independent), so the gateway can
+      // stream the activity feed without waiting on the transcript flush.
+      // Subscribed once per sidecar (this is the only creation site).
+      s.onLabel((toolUseId, label, toolName) => {
+        rawOnEvent({ kind: 'tool_label', toolUseId, label, toolName })
+      })
       return s
     } catch (err) {
       log?.(`session-tail: sidecar create failed: ${(err as Error).message}`)
@@ -775,6 +787,12 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       }
       log?.(`session-tail: attached to ${file} (cursor=${cursor})`)
     }
+    // Eagerly create + subscribe the PreToolUse sidecar for this session
+    // NOW (on attach), not lazily on the first JSONL tool_use — otherwise
+    // the real-time `tool_label` source wouldn't exist until a flush-gated
+    // tool_use arrived, re-introducing the very lag the sidecar avoids.
+    const attachSid = sessionIdForFile(file)
+    if (attachSid) ensureSidecar(attachSid)
     try {
       watcher = watch(file, () => readNew())
     } catch (err) {

@@ -40,8 +40,11 @@ export interface ToolLabelRow {
 export interface ToolLabelSidecar {
   /** Synchronous label lookup. */
   getLabel(toolUseId: string): string | undefined
-  /** Subscribe to "label arrived" notifications. */
-  onLabel(cb: (toolUseId: string, label: string) => void): () => void
+  /** Subscribe to "label arrived" notifications. Fires once per new
+   *  sidecar line, in real time (~pollMs after the hook's appendFileSync),
+   *  independent of when the claude transcript flushes. `toolName` lets
+   *  subscribers filter surface tools (reply/react) from a live feed. */
+  onLabel(cb: (toolUseId: string, label: string, toolName: string) => void): () => void
   /** Force a re-poll (tests). */
   poll(): void
   /** Stop polling and release resources. */
@@ -63,7 +66,7 @@ export interface SidecarOptions {
 export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
   const path = join(opts.stateDir, `tool-labels-${opts.sessionId}.jsonl`)
   const labels = new Map<string, string>()
-  const subscribers = new Set<(toolUseId: string, label: string) => void>()
+  const subscribers = new Set<(toolUseId: string, label: string, toolName: string) => void>()
   let offset = 0
   let stopped = false
 
@@ -90,7 +93,7 @@ export function createToolLabelSidecar(opts: SidecarOptions): ToolLabelSidecar {
       if (labels.has(row.tool_use_id)) continue
       labels.set(row.tool_use_id, row.label)
       for (const cb of subscribers) {
-        try { cb(row.tool_use_id, row.label) } catch { /* ignore */ }
+        try { cb(row.tool_use_id, row.label, row.tool_name) } catch { /* ignore */ }
       }
     }
   }

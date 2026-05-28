@@ -7,6 +7,7 @@ import {
   verbForTool,
   describeToolUse,
   appendActivityLine,
+  appendActivityLabel,
   renderActivityFeed,
   MIRROR_MAX_LINES,
 } from "../tool-activity-summary.js";
@@ -326,5 +327,23 @@ describe("appendActivityLine + renderActivityFeed — accumulating draft feed", 
 
   it("renderActivityFeed returns null on empty", () => {
     expect(renderActivityFeed([])).toBeNull();
+  });
+});
+
+describe("appendActivityLabel — precomputed label feed (tool_label path)", () => {
+  it("accumulates precomputed labels, dedups consecutive, ignores empty", () => {
+    const lines: string[] = [];
+    expect(appendActivityLabel(lines, "Searching memory")).toBe("· Searching memory");
+    expect(appendActivityLabel(lines, "List workspace")).toBe(
+      "· Searching memory\n· List workspace",
+    );
+    // consecutive dup collapses
+    appendActivityLabel(lines, "List workspace");
+    expect(lines).toEqual(["Searching memory", "List workspace"]);
+    // empty / whitespace → null, no push
+    expect(appendActivityLabel(lines, "")).toBeNull();
+    expect(appendActivityLabel(lines, "   ")).toBeNull();
+    expect(appendActivityLabel(lines, undefined)).toBeNull();
+    expect(lines.length).toBe(2);
   });
 });
