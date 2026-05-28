@@ -604,6 +604,66 @@ export interface SessionTailHandle {
 }
 
 /**
+ * Byte offset to seek to on the FIRST attach to a session transcript.
+ *
+ * Normally EOF — we only want NEW events, not replayed history. But if the
+ * agent restarted MID-TURN (the bridge's session-tail starts only after
+ * claude has already written this turn's `queue-operation enqueue` line),
+ * a plain seek-to-EOF skips that enqueue. `enqueue` is the ONLY event that
+ * carries the chatId and that sets the gateway's `currentTurn`, so missing
+ * it leaves the first post-restart turn with no currentTurn — killing the
+ * progress card, draft-mirror, and silence-poke for that turn.
+ *
+ * Fix: in a bounded tail scan, find the last `enqueue` that has NO
+ * `turn_duration` (turn_end) after it — an in-flight turn — and return its
+ * line offset so it (and the turn's subsequent events) replay. A completed
+ * turn (a `turn_duration` follows the enqueue) returns EOF: no replay.
+ */
+export function computeFirstAttachCursor(file: string, size: number): number {
+  const SCAN_CAP = 1024 * 1024 // bound the tail read at 1 MiB
+  const scanStart = Math.max(0, size - SCAN_CAP)
+  let buf: Buffer
+  try {
+    const fd = openSync(file, 'r')
+    try {
+      buf = Buffer.allocUnsafe(size - scanStart)
+      readSync(fd, buf, 0, buf.length, scanStart)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return size
+  }
+  let lastEnqueueOffset = -1
+  let turnEndedAfterEnqueue = false
+  let lineStart = 0
+  // If the scan didn't start at byte 0, the first line is a partial — skip it.
+  let skipPartial = scanStart > 0
+  for (let i = 0; i <= buf.length; i++) {
+    if (i !== buf.length && buf[i] !== 0x0a) continue
+    if (skipPartial) {
+      skipPartial = false
+    } else if (i > lineStart) {
+      const line = buf.toString('utf8', lineStart, i)
+      if (
+        line.includes('"type":"queue-operation"') &&
+        line.includes('"operation":"enqueue"')
+      ) {
+        lastEnqueueOffset = scanStart + lineStart
+        turnEndedAfterEnqueue = false
+      } else if (lastEnqueueOffset >= 0 && line.includes('"subtype":"turn_duration"')) {
+        turnEndedAfterEnqueue = true
+      }
+    }
+    lineStart = i + 1
+  }
+  if (lastEnqueueOffset >= 0 && !turnEndedAfterEnqueue) {
+    return lastEnqueueOffset
+  }
+  return size
+}
+
+/**
  * Start tailing the active Claude Code session file. The tailer:
  *  1. Polls the projects dir for the most recent .jsonl
  *  2. Opens it, seeks to current end (only NEW events are reported), and
@@ -778,14 +838,20 @@ export function startSessionTail(config: SessionTailConfig): SessionTailHandle {
       log?.(`session-tail: re-attached to ${file} (cursor=${cursor}, restored)`)
     } else {
       // First attach to this file — seek to current end so we only see
-      // new events, not history.
+      // new events, EXCEPT replay from an in-flight turn's enqueue if the
+      // agent restarted mid-turn (see firstAttachCursor).
       pendingPartial = ''
       try {
-        cursor = statSync(file).size
+        const size = statSync(file).size
+        cursor = computeFirstAttachCursor(file, size)
+        if (cursor < size) {
+          log?.(`session-tail: attached to ${file} (cursor=${cursor}, replaying in-flight turn from offset; size=${size})`)
+        } else {
+          log?.(`session-tail: attached to ${file} (cursor=${cursor})`)
+        }
       } catch {
         cursor = 0
       }
-      log?.(`session-tail: attached to ${file} (cursor=${cursor})`)
     }
     // Eagerly create + subscribe the PreToolUse sidecar for this session
     // NOW (on attach), not lazily on the first JSONL tool_use — otherwise
