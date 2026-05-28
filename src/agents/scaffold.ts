@@ -3925,32 +3925,39 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
   // "Sunday is Jun 7…" → "on it — pulling the Mona thread" → … (six
   // persistent messages for one turn of work).
   //
-  // v3: tell the model NOT to ack. The framework already shows the
-  // user activity via the compose-area draft. Reply only with
-  // substantive content — actual answers, real questions, or genuine
-  // milestones / pivots. Trivial single-sentence answers still go via
-  // reply (they ARE the answer, not an ack).
+  // v4: v3 ("don't ack") over-corrected — the model started classifying
+  // bare social messages ("hi", "you there?") as "not substantive" and
+  // ending the turn with NO_REPLY, leaving a direct human message
+  // unanswered (clerk regression 2026-05-28). The anti-ack rule was only
+  // ever about not sending *placeholder acks before doing work* — never
+  // about suppressing a reply to a message that expects one. v4 leads
+  // with "ALWAYS reply to a direct message" + an explicit greeting
+  // carve-out, then keeps the no-placeholder-ack rule.
   const turnPacingDirective =
     '<turn-pacing>You are messaging a human via Telegram. The framework ' +
     'automatically shows the user a live preview in their compose area as ' +
     'you work — they see "Read a file", "Ran 2 commands", etc. as your ' +
     'tool_use events stream. You do NOT need to ack manually.\n\n' +
-    'Do NOT call the reply tool with placeholder acks like "on it", ' +
-    '"good question — one sec", "let me dig in", "checking now", etc. ' +
-    'Those add chat clutter on top of the activity preview the user is ' +
-    'already seeing. The activity preview clears the moment you send a ' +
-    'real reply.\n\n' +
-    'Call reply only when you have something substantive to deliver:\n' +
-    '  - The actual answer (any length — short or long)\n' +
-    '  - A genuine question back to the user\n' +
-    '  - A real mid-work milestone or pivot that changes what the user ' +
-    'should expect (e.g. "halfway through — found an unexpected issue, ' +
-    'want me to continue?"). Not "still working".\n\n' +
-    'For trivial one-sentence answers: just reply with the answer. The ' +
-    'reply IS the answer, not an ack.\n\n' +
-    'For complex tool-driven work: go straight to the tools. The compose-' +
-    'area preview is the ambient liveness signal. Reply once you have ' +
-    'the answer or a real reason to break in.</turn-pacing>';
+    'ALWAYS reply to a message the user sends you. A direct message ' +
+    'expects a response: a greeting ("hi", "hey", "you there?") gets a ' +
+    'greeting back; a thanks gets a brief acknowledgement; a question ' +
+    'gets an answer. NEVER end a turn with NO_REPLY when the user has ' +
+    'just sent you something — NO_REPLY is only for genuine non-prompts ' +
+    '(a system-synthesized event you have already fully handled).\n\n' +
+    'What you should NOT do is send a placeholder ack BEFORE doing the ' +
+    'work — no "on it", "good question — one sec", "let me dig in", ' +
+    '"checking now". Those add chat clutter on top of the activity ' +
+    'preview the user already sees, and the preview clears the moment ' +
+    'your real reply lands. Do not ack-then-answer; just answer.\n\n' +
+    'So:\n' +
+    '  - Trivial / social message → reply once, briefly, in your voice. ' +
+    'The reply IS the response.\n' +
+    '  - Question with a short answer → just reply with the answer.\n' +
+    '  - Complex tool-driven work → go straight to the tools (the ' +
+    'compose-area preview is the ambient liveness signal), then reply ' +
+    'once with the answer or a genuine mid-work pivot ("halfway ' +
+    'through — found an unexpected issue, want me to continue?"). Not ' +
+    '"still working".</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
