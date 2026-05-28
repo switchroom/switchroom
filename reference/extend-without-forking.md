@@ -35,7 +35,7 @@ The product grows with them.
   for their own, without studying the framework internals.
 - Extensions inherit the product's safety, logging, and lifecycle
   behaviour automatically. The user doesn't have to reimplement it.
-- Removing an extension is as clean as adding it. No residue.
+- Removing an extension takes two steps: running `switchroom agent destroy <name>` removes the scaffold directory, then editing `switchroom.yaml` to delete the agent entry and running `switchroom apply` removes the container. The scaffold directory is fully cleaned; the config entry requires a manual edit.
 
 ## Anti-patterns: don't build this
 
@@ -66,8 +66,10 @@ The product grows with them.
   reference and build a peer. It should slot in without surprises.
 - **Upgrade survival.** Upgrade the product. User-added agents, skills,
   and tools should keep working.
-- **Clean removal.** Delete a user extension. Nothing should be left
-  behind in config, memory, or runtime.
+- **Clean removal.** Delete a user extension. The scaffold directory
+  should be gone after `switchroom agent destroy`. Confirm what manual
+  steps remain for config and memory cleanup — the UAT should reflect
+  current reality, not the ideal.
 - **Non-trivial extension.** Build something that exercises an
   intermediate capability. The documentation should cover it, not just
   the toy case.

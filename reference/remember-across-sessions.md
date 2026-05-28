@@ -37,8 +37,10 @@ Memory the user can't inspect is memory the user won't trust.
   relationship. The agent picks up roughly where it was.
 - The user can see what the agent believes about them and why. Nothing
   is hidden in a black box.
-- Memory decays sensibly. Stale preferences don't haunt the user a year
-  later.
+- Memory decays sensibly (not yet built — Hindsight banks currently
+  store memories indefinitely; the demote tag excludes entries from
+  recall but does not delete them). Stale preferences don't haunt the
+  user a year later.
 
 ## Anti-patterns: don't build this
 

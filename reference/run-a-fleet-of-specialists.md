@@ -37,8 +37,11 @@ not be second-guessing the user's sleep data. Separation is the point.
 - When a new agent joins the fleet, it feels like a peer, not a bolt-on.
   It participates in the same lifecycle, the same safety rules, the same
   interaction surface.
-- Removing an agent is clean. Its memory, its state, its scheduled work
-  all go with it, with no orphaned processes or dangling config.
+- Removing an agent takes down its container and clears its state
+  directory and scheduled work. The memory bank in the Hindsight
+  service persists and requires manual cleanup via that service. The
+  agent's entry in `switchroom.yaml` also requires a manual edit before
+  `switchroom apply` will remove the container.
 - The user can describe what each of their agents is for in one sentence.
   If they can't, the fleet is too blurry.
 

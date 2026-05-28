@@ -103,11 +103,12 @@ doesn't have to:
    reference repos by env, not by hardcoded path.
 6. **Dirty-tree policy: leave alone, warn.** If the worktree has
    uncommitted changes at session start, the ff-to-main step is skipped.
-   The session resumes on whatever branch the worktree was on. The boot
-   card surfaces "<repo>: dirty since <ts>" as a one-line warning.
-7. **Removal is symmetric.** `switchroom agent remove <name>` calls
-   `git worktree remove` for each of the agent's worktrees, then prunes
-   the per-agent branches. The host's `.git/worktrees/` stays clean.
+   The session resumes on whatever branch the worktree was on. The
+   reconcile log emits a one-line warning to stderr.
+7. **Removal.** `switchroom agent destroy <name>` removes the agent's
+   scaffold directory. Note: worktree cleanup is not currently wired into
+   the destroy path — orphan worktree directories are not automatically
+   removed. The host's `.git/worktrees/` requires manual pruning for now.
 8. **Sub-agents nest off the parent worktree.** Existing pattern. A
    worker dispatched by an agent on
    `<agent_dir>/work/switchroom/` creates its task worktree off
@@ -143,8 +144,10 @@ Use these to evaluate whether an implementation truly delivers the job:
   unexpected state?"
 - "Reboot the host while one agent has uncommitted work in its
   worktree. After reboot, is the work still there, on the same branch?"
-- "Remove an agent that owns worktrees on three different repos. Did
-  any orphan branches or directories survive?"
+- "Remove an agent that owns worktrees on three different repos. Check
+  whether any orphan directories remain — worktree cleanup is not yet
+  automatic; this UAT prompt verifies what the current state actually
+  is, not what it should be."
 - "Read your agent's SOUL.md and skills. Do any of them hardcode an
   absolute path to a repo? They shouldn't — they should use the env."
 

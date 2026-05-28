@@ -1,6 +1,6 @@
 ---
 job: keep my subscription the only thing I'm paying for
-outcome: The agents run on the user's Claude Pro or Max subscription, transparently and compliantly. No hidden API billing, no side-door tokens, no asks for extra keys.
+outcome: The agents run on the user's Claude Pro or Max subscription, transparently and compliantly. No hidden API billing, no side-door tokens, no Anthropic API keys. Opt-in third-party service keys (e.g. OpenAI Whisper for voice transcription) are stored in the vault and clearly opt-in.
 stakes: If the product quietly routes to paid API or mixes billing models, the user loses trust and the product loses its licence to operate.
 ---
 
@@ -65,8 +65,11 @@ subscription is the only thing I'm paying for" stays literally true.
   Since 2026-06-15 both are *programmatic* usage — they draw the
   separate Agent-SDK credit, not the subscription, and silently split
   the billing model. Route the work through the interactive session.
-- Asking the user for an API key as "optional" when core features need
-  it. Either the subscription supports the feature, or it doesn't.
+- Asking the user for an API key when core features need it. Either the
+  subscription supports the feature, or it doesn't. Opt-in auxiliary
+  features (e.g. voice transcription via a third-party service) that
+  require a separate key must be clearly labelled as extensions — not
+  implied to be subscription-native.
 - Proxying subscription auth through the product in a way that bends
   the terms.
 - Feature marketing that implies subscription support when the real

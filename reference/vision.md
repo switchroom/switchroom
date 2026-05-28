@@ -124,7 +124,7 @@ hidden.
 | Not… | Because… |
 |---|---|
 | A harness or wrapper | Switchroom never intercepts auth or inference. The `claude` CLI is the runtime. |
-| A multi-provider orchestrator | No OpenAI, Gemini, Llama, model swapping. |
+| A multi-provider orchestrator | No OpenAI, Gemini, Llama, or model swapping for inference. Auxiliary services (e.g. voice transcription via Whisper) are opt-in helpers, not Claude replacements. |
 | A multi-channel bridge | Not Slack, not Discord, not Teams. Telegram, done properly. |
 | An autonomous agent | No heartbeats. Beck-and-call plus explicit schedules, on your leash. |
 | Multi-tenant | Single-operator by design. |

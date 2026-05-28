@@ -71,7 +71,10 @@ experience should benefit from that discipline, not be diminished by it.
   photo should be usable input, not discarded.
 - **Noisy day.** Run several tasks across the morning. The user should not
   end the day with a muted chat because the agent over-notified.
-- **Dead zone.** Lose connectivity mid-task. When it comes back the user
-  should see a sensible state, not a broken thread.
+- **Dead zone.** Lose connectivity mid-task. When it comes back,
+  Telegram delivers queued messages and the agent resumes from where it
+  stopped; in-flight turns may show a stale progress state until the
+  next update. (No specific dead-zone recovery code exists; this relies
+  on Telegram's natural message delivery on reconnect.)
 - **One-handed correction.** Spot the agent going the wrong way while
   holding a coffee. A short reply should be enough to course-correct.
