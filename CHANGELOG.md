@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.14.7 — cite Claude Opus 4.8 as the current flagship model (#1975)
+
+Docs refresh: Opus 4.8 (released 2026-05-28) supersedes 4.7 as
+Anthropic's most capable model. Example/reference model IDs across the
+docs and copyable examples now cite `claude-opus-4-8`:
+`docs/architecture.md`, `docs/cli-reference.md`, `docs/configuration.md`,
+`docs/session-optimization.md`, `examples/switchroom.yaml`, and the
+`switchroom-status` skill sample output.
+
+No code change — the config schema accepts any model string and
+switchroom passes `--model` straight through to the unmodified `claude`
+CLI. Historical records (compliance-attestation analysis attribution,
+RFC authorship lines) intentionally keep their 4.7 reference since they
+document which model actually did that work.
+
+Operator note: when pinning Opus 4.8, keep `thinking_effort` at the
+`low` floor. Higher effort levels emit `thinking`/`redacted_thinking`
+blocks that the claude CLI can reject ("thinking blocks ... cannot be
+modified") once framework-side message rewriting touches the assistant
+turn; omitting `thinking_effort` is worse, not better, because 4.8
+defaults `effort=high` when unset.
+
 ## v0.14.6 — allowed_tools/disallowed_tools cascade from defaults (#1973)
 
 Fixes a silent double no-op: `defaults.allowed_tools` (and
