@@ -286,7 +286,7 @@ import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 // should do. Behavior unchanged in this PR — the imperative code below
 // still runs everything. PR 3 will cut over to executing the machine's
 // effects.
-import { shadowEmit } from './inbound-delivery-machine-shadow.js'
+import { shadowEmit, isMachineInTurn, isDeliveryCutoverEnabled } from './inbound-delivery-machine-shadow.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-dispatch.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
@@ -1161,6 +1161,24 @@ function markClaudeBusyForInbound(m: {
   }
   claudeBusyKeys.add(chatKey(m.chatId, tid))
 }
+
+/**
+ * Authoritative "is a turn in flight?" for every gate that previously
+ * read `claudeBusyKeys.size`. PR 3b cutover (extends PR 3a's bridgeUp
+ * dispatch): when the delivery state machine is authoritative
+ * (`SWITCHROOM_DELIVERY_MACHINE_CUTOVER` on + shadow on) the answer is
+ * its single-`activeTurn` global state, which — unlike the
+ * per-delivery `claudeBusyKeys` set — cannot accumulate orphan keys and
+ * wedge the gate "in-flight forever" (the gymbro/clerk 5-min dangle,
+ * 2026-05-28). Kill-switch off → exact legacy claudeBusyKeys behaviour.
+ *
+ * NOT for the inbound-receipt gate (line ~8551): that must snapshot the
+ * machine state BEFORE the inbound event advances it, or a fresh-turn
+ * message self-blocks. See the snapshot at the inbound handler.
+ */
+function turnInFlightForGate(): boolean {
+  return isDeliveryCutoverEnabled() ? isMachineInTurn() : claudeBusyKeys.size > 0
+}
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
@@ -1490,7 +1508,11 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // activeTurnStartedAt entry in the fresh-turn branch) doesn't pin this
   // gate forever while claude is genuinely idle. See the claudeBusyKeys
   // declaration for the supergroup deadlock this fixes.
-  if (claudeBusyKeys.size === 0) {
+  // PR3b-cutover: `turnInFlightForGate()` reads the delivery machine
+  // when the cutover kill-switch is on; the turnEnd event was emitted
+  // just above (purgeReactionTracking head), so the machine is already
+  // idle here.
+  if (!turnInFlightForGate()) {
     // #1556: the deterministic delivery point. claude has just gone
     // idle — flush any inbound held mid-turn so the channel
     // notification lands at the idle prompt and submits as a fresh
@@ -1590,7 +1612,9 @@ function releaseTurnBufferGate(key: string): void {
   // test-harness's 13:02 UAT now opens after the reply.
   //
   // PR3b: gated on claudeBusyKeys (see purgeReactionTracking comment).
-  if (claudeBusyKeys.size === 0) {
+  // PR3b-cutover: turnEnd was emitted just above (releaseTurnBufferGate
+  // head), so the machine is already idle when the cutover gate reads.
+  if (!turnInFlightForGate()) {
     const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
     if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
       const fr = redeliverBufferedInbound(
@@ -3656,6 +3680,23 @@ silencePoke.startTimer({
   },
 })
 
+// PR3b-cutover: drive the delivery machine's TTL `tick`. The machine
+// expires any turn whose `turnStartedAt` is older than TURN_TTL_MS
+// (5 min) and drops global state back to idle — its structural
+// equivalent of the imperative silence-poke framework-fallback. This
+// is the load-bearing safety net for the cutover gate: even if a
+// `turnEnd` event is somehow missed (the dangle class), the machine
+// self-heals at TTL instead of pinning the gate "in-flight forever".
+// shadowEmit only advances state + logs the predicted effects; we
+// deliberately do NOT execute the machine's firePoke here (the
+// imperative silence-poke still owns the user-facing ping), so there
+// is no double-poke. unref so the interval never holds the process.
+const DELIVERY_MACHINE_TICK_MS = 30_000
+const _deliveryMachineTick = setInterval(() => {
+  shadowEmit({ kind: 'tick', now: Date.now() })
+}, DELIVERY_MACHINE_TICK_MS)
+_deliveryMachineTick.unref?.()
+
 // #1445 cross-turn pending-async ambient. When a turn ends after the
 // model dispatched background async work (Agent / Task / Bash run-in-
 // background) and the model has stopped speaking, keep editing the
@@ -4195,7 +4236,8 @@ const ipcServer: IpcServer = createIpcServer({
     // PR3b: gated on claudeBusyKeys (actually-handed-to-claude turns)
     // not activeTurnStartedAt (receipt-eager), so a buffered topic-B
     // inbound doesn't pin this as turnInFlight=true forever.
-    const turnInFlight = claudeBusyKeys.size > 0;
+    // PR3b-cutover: reads the delivery machine when the kill-switch is on.
+    const turnInFlight = turnInFlightForGate();
 
     if (!turnInFlight) {
       // No active turn, restart immediately. Cycle both the agent and
@@ -4615,7 +4657,8 @@ if (!STATIC) {
         // #1556: never drain mid-turn — that re-creates the composer
         // wedge this buffer exists to prevent.
         // PR3b: gated on claudeBusyKeys (see purgeReactionTracking).
-        if (claudeBusyKeys.size > 0) return false
+        // PR3b-cutover: reads the delivery machine when the kill-switch is on.
+        if (turnInFlightForGate()) return false
         const c = ipcServer.getClient(selfAgent)
         return c != null && c.isAlive()
       },
@@ -5020,6 +5063,11 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // silence-poke clock so the next poke is measured from this send.
   signalTracker.noteOutbound(statusKey(chat_id, threadId), Date.now())
   silencePoke.noteOutbound(statusKey(chat_id, threadId), Date.now())
+  // PR3b-cutover: feed lastOutboundAt to the delivery machine so its
+  // TTL `tick` suppresses the fallback for a long-but-active turn
+  // (model streaming past 5 min) — parity with silencePoke's own
+  // suppression, so the cutover gate doesn't clear a live turn.
+  shadowEmit({ kind: 'modelOutbound', key: statusKey(chat_id, threadId) as _ChatKey, at: Date.now() })
   // #1741 — only clear silent-end state on a plausibly-final reply.
   // An interim ack (disable_notification:true, short text, no done)
   // must NOT clear the state file; otherwise a turn that ends with
@@ -5615,6 +5663,9 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       const sKey = statusKey(streamChatId, streamThreadId)
       signalTracker.noteOutbound(sKey, Date.now())
       silencePoke.noteOutbound(sKey, Date.now())
+      // PR3b-cutover: feed lastOutboundAt to the delivery machine (see
+      // executeReply) so its TTL tick suppresses an active-turn fallback.
+      shadowEmit({ kind: 'modelOutbound', key: sKey as _ChatKey, at: Date.now() })
       // #1741 — see executeReply for the rationale: only a plausibly-
       // final stream_reply clears the silent-end state. An interim
       // ack via stream_reply must NOT clear; the Stop hook needs
@@ -7012,6 +7063,20 @@ function handleSessionEvent(ev: SessionEvent): void {
           isDm: isDmChatId(ev.chatId),
         }
         currentTurn = next
+        // PR3b-cutover: feed the authoritative turn-start to the delivery
+        // machine. `enqueue` fires for EVERY turn atom regardless of
+        // source — inbound, cron, subagent-handback, vault-resume,
+        // restart-marker — so it is the single chokepoint that captures
+        // the non-inbound turns the machine's own `inbound` event never
+        // sees (those bypass handleInbound). Without it the machine reads
+        // idle during a cron/handback turn and the gate would mis-deliver
+        // a concurrent inbound mid-turn (the #1556 composer wedge).
+        // Idempotent when already in_turn (turnStart only sets perKey).
+        shadowEmit({
+          kind: 'turnStart',
+          key: statusKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : undefined) as _ChatKey,
+          at: startedAt,
+        })
         // #549 fix — fresh turn, reset preamble-suppression state.
         preambleSuppressor.reset()
         // Reset the silent-end retry budget for this chat. The stored
@@ -8505,6 +8570,14 @@ async function handleInbound(
   // vs mid-turn — its decision will be visible in the gw-trace shadow
   // line emitted to stderr.
   const _shadowKey = statusKey(ctx.chat?.id != null ? String(ctx.chat.id) : '0', ctx.message?.message_thread_id) as _ChatKey
+  // PR3b-cutover: snapshot the machine's in-turn state BEFORE the
+  // inbound event advances it. A fresh-turn inbound transitions the
+  // machine idle→in_turn; reading after the emit would see THIS
+  // message's own just-started turn and self-block it (the same
+  // self-block hazard the claudeBusyKeys snapshot below guards). When
+  // the kill-switch is off this is null and the gate uses the legacy
+  // claudeBusyKeys read.
+  const machineInTurnAtReceipt = isDeliveryCutoverEnabled() ? isMachineInTurn() : null
   shadowEmit({
     kind: 'inbound',
     key: _shadowKey,
@@ -8556,7 +8629,12 @@ async function handleInbound(
   // no turn_end ever fires). With claudeBusyKeys, B sees true (A is
   // busy) → B is buffered correctly, AND the gate cleanly reopens
   // when A's turn_end deletes keyA → flush triggers → B delivered.
-  const turnInFlightAtReceipt = claudeBusyKeys.size > 0
+  // PR3b-cutover: prefer the machine snapshot taken before the inbound
+  // event advanced it (machineInTurnAtReceipt); null when the
+  // kill-switch is off, in which case the legacy claudeBusyKeys read
+  // stands. Both are "was a turn in flight at receipt", not a live
+  // post-this-inbound read — see machineInTurnAtReceipt's comment.
+  const turnInFlightAtReceipt = machineInTurnAtReceipt ?? (claudeBusyKeys.size > 0)
 
   const access = result.access
   const from = ctx.from!

@@ -43,6 +43,39 @@ import {
 let state: State = initialState()
 const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_SHADOW !== '0'
 
+// Phase 2b PR 3 — STAGED CUTOVER. When enabled, the gateway's
+// "is a turn in flight?" gate reads this machine's global state
+// instead of the PR3b `claudeBusyKeys` set. The machine tracks ONE
+// `activeTurn` (single bridge) plus TTL `tick` expiry, so — unlike a
+// per-delivery key set — it cannot accumulate orphan keys and wedge
+// the gate "in-flight forever" (the gymbro/clerk 5-min dangle of
+// 2026-05-28). Scope is the turn-in-flight GATE only; the poke ladder
+// and perm-verdict effects stay imperative for a follow-up PR.
+//
+// Kill switch: `SWITCHROOM_DELIVERY_MACHINE_CUTOVER=0` reverts every
+// gate to the legacy claudeBusyKeys read (zero behaviour change).
+// Requires shadow mode ON — with shadow off the machine state is
+// frozen and must NOT be read as authoritative.
+const cutoverEnabled = enabled && process.env.SWITCHROOM_DELIVERY_MACHINE_CUTOVER !== '0'
+
+/**
+ * True when the kill-switch leaves the delivery machine authoritative
+ * for the turn-in-flight gate. Gateway gate sites branch on this.
+ */
+export function isDeliveryCutoverEnabled(): boolean {
+  return cutoverEnabled
+}
+
+/**
+ * Authoritative "is a turn currently in flight?" read for the gate.
+ * Maps the machine's global state to the boolean the legacy
+ * `claudeBusyKeys.size > 0` gate produced. `bridge_dead` and
+ * `bridge_alive_idle` are both "not in flight".
+ */
+export function isMachineInTurn(): boolean {
+  return state.global.kind === 'bridge_alive_in_turn'
+}
+
 /**
  * Run an event through the state machine in shadow mode. The machine
  * state advances, the predicted effects are LOGGED, but no I/O fires.
