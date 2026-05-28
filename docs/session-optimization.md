@@ -48,7 +48,7 @@ Route implementation work to cheaper models via sub-agents:
 
 ```yaml
 defaults:
-  model: claude-opus-4-7
+  model: claude-opus-4-8
   subagents:
     worker:
       model: sonnet
@@ -73,7 +73,7 @@ Claude Code auto-compacts late in the context window (roughly 80–85% full — 
 - **CLAUDE.md is sacred** — never compacted, always in the system prompt.
 - **Hindsight is the safety net** — anything compaction loses can be recalled from the memory bank.
 
-On the 1M context window (Opus 4.7), most conversations never reach native auto-compaction in a single session.
+On the 1M context window (Opus 4.8), most conversations never reach native auto-compaction in a single session.
 
 ### Proactive compaction (`session.max_context_tokens`)
 

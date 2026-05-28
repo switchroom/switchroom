@@ -33,7 +33,7 @@ The container's entrypoint is the agent's `start.sh`, run as PID 1's child under
 exec claude \
   --dangerously-load-development-channels server:switchroom-telegram \
   --plugin-dir ~/.switchroom/agents/<agent>/plugins \
-  --model claude-opus-4-7 \
+  --model claude-opus-4-8 \
   --append-system-prompt "$(switchroom workspace render <agent> --stable)"
 ```
 
