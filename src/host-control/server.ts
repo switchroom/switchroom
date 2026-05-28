@@ -1572,9 +1572,30 @@ export class HostdServer {
       { name: "state", cmd: "test -w /state/agent" },
     ];
     if (req.args.deep) {
+      // Token-introspect probe: parse .credentials.json in-container and
+      // verify the OAuth access token is present (correct format) and
+      // non-expired. No model call — no programmatic usage. Replaces the
+      // former `claude -p ok` check which was a compliance violation under
+      // Anthropic's 2026-06-15 policy (programmatic usage, off subscription).
+      // Closes #1798.
       PROBES.push({
         name: "auth_live",
-        cmd: "timeout 25 claude -p ok >/dev/null 2>&1",
+        // python3 is already used by the `mcp` probe above so it is
+        // guaranteed available. The script exits 0 only when:
+        //   1. .credentials.json exists and is valid JSON
+        //   2. claudeAiOauth.accessToken matches sk-ant-oat\d+- prefix
+        //   3. claudeAiOauth.expiresAt is absent OR in the future (ms epoch)
+        // Single-quoted around the python body so shell passes it verbatim.
+        // Nothing is printed — exit code is the only signal; no token value
+        // can leak into the hostd response or operator audit log.
+        cmd:
+          "python3 -c 'import json,sys,time,re;" +
+          'c=json.load(open("/state/agent/.claude/.credentials.json"));' +
+          'o=c.get("claudeAiOauth",{});' +
+          't=o.get("accessToken","");' +
+          'sys.exit(0 if re.match(r"sk-ant-oat\\d+-",t)' +
+          ' and ("expiresAt" not in o or o["expiresAt"]>time.time()*1000)' +
+          " else 1)'",
       });
     }
 

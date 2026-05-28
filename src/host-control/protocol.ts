@@ -231,10 +231,12 @@ export const DoctorRequestSchema = z.object({
  * (auth creds present, scheduler block + sidecar, .mcp.json /
  * .claude.json valid, bot-token present, /state writable). Every
  * probe returns only a boolean/state — NEVER a secret value. `deep`
- * opts into a real, quota-costing `claude -p` auth smoke; the default
- * makes NO model call (subscription-honest). Self-target is allowed;
- * cross-agent requires admin (mirrors agent_logs/agent_exec). The
- * doctor CLI (operator socket) + Telegram /doctor consume this to
+ * opts into an additional `auth_live` probe that parses the in-container
+ * `.credentials.json` and verifies the OAuth token format and expiry —
+ * no model call, no programmatic usage (subscription-honest). The
+ * default (deep absent/false) still makes NO model call. Self-target is
+ * allowed; cross-agent requires admin (mirrors agent_logs/agent_exec).
+ * The doctor CLI (operator socket) + Telegram /doctor consume this to
  * upgrade the WS6-F2 host-unverifiable `skip` rows to real ok/fail;
  * a down container / unreachable hostd degrades to skip, never fail.
  */
