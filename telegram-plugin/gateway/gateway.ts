@@ -252,7 +252,7 @@ import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/i
 import { handleInjectCommand } from './inject-handler.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
-import { loadConfig as loadSwitchroomConfig } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
+import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
 import { resolveOutboundTopic as resolveOutboundTopicHelper, type TopicRouterConfig as _OutboundRouterConfig } from '../../src/telegram/topic-router.js'
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
@@ -369,6 +369,7 @@ import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
 import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
 import { resolveAlwaysAllowRule, isRulePersisted } from '../permission-rule.js'
+import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
@@ -2281,6 +2282,27 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
 const PERMISSION_TTL_MS = 10 * 60_000
+
+// #1977 — single-tap correlation for the durable "🔁 Always allow"
+// flow. When the gateway dispatches a `config_propose_edit` to hostd in
+// response to an operator tap, hostd calls BACK asking for operator
+// approval. We pre-register the (agent, rule) pair here keyed
+// `${agentName}::${rule}` so that callback auto-approves WITHOUT a
+// second card. Forge-resistance: the auto-resolve match requires the
+// rule the inbound diff ADDS (via extractAddedAllowRule) to equal a
+// rule the gateway itself just queued — a forged edit touching any
+// other field finds no entry and falls through to a real operator card.
+// Single-shot (deleted on match) + 30s TTL sweep so a stale correlation
+// can't be replayed.
+const pendingAlwaysAllowCorrelations = new Map<string, { agentName: string; rule: string; createdAt: number }>()
+const ALWAYS_ALLOW_CORRELATION_TTL_MS = 30_000
+function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
+  for (const [key, entry] of pendingAlwaysAllowCorrelations) {
+    if (now - entry.createdAt > ALWAYS_ALLOW_CORRELATION_TTL_MS) {
+      pendingAlwaysAllowCorrelations.delete(key)
+    }
+  }
+}
 
 // `ask_user` MCP tool — open prompts awaiting a user button-tap.
 // Keyed by askId (8 hex chars from generateAskId). Each entry holds
@@ -4572,6 +4594,24 @@ const ipcServer: IpcServer = createIpcServer({
       },
       log: (m) =>
         process.stderr.write(`telegram gateway: config-approval — ${m}\n`),
+      // #1977 single-tap correlation: auto-approve a config edit the
+      // gateway itself just queued in response to an operator tap on
+      // the "🔁 Always allow" permission card. Forge-resistant — the
+      // match requires the rule the diff ADDS to equal a rule the
+      // gateway queued; an agent-forged edit touching any other field
+      // finds no entry and falls through to a real operator card.
+      tryAutoResolve: (msg) => {
+        sweepStaleAlwaysAllowCorrelations()
+        const added = extractAddedAllowRule(msg.unifiedDiff)
+        if (!added) return null
+        const key = `${msg.agentName}::${added}`
+        const entry = pendingAlwaysAllowCorrelations.get(key)
+        if (entry) {
+          pendingAlwaysAllowCorrelations.delete(key)
+          return 'approve'
+        }
+        return null
+      },
     })
   },
 
@@ -15266,13 +15306,20 @@ bot.on('callback_query:data', async ctx => {
   }
 
   if (behavior === 'always') {
-    // "🔁 Always allow" — write the resolved rule into the agent's
-    // tools.allow in switchroom.yaml via the existing `agent grant`
-    // CLI verb, then approve the in-flight request. Reconcile updates
-    // settings.json so future SESSIONS skip the popup; the in-flight
-    // turn already has its settings.json loaded so the rule won't
-    // suppress later prompts on this same turn — operator restarts
-    // the agent if they want full immediate effect.
+    // "🔁 Always allow" (#1977) — persist the resolved rule into the
+    // agent's tools.allow in the DURABLE host config. The old path
+    // shelled `switchroom agent grant` which wrote
+    // /state/config/switchroom.yaml — but that path is bind-mounted
+    // READ-ONLY into agent containers, so the write silently no-op'd.
+    // Durable host-config writes only land via the host-side hostd
+    // daemon's `config_propose_edit` flow. We:
+    //   1. dispatch the in-flight Allow verdict IMMEDIATELY (turn must
+    //      not block on the host round-trip);
+    //   2. if hostd is not-configured → fall back to the legacy
+    //      `agent grant` + verify path (honest messaging only);
+    //   3. otherwise synthesize a unified diff adding the rule to the
+    //      agent's tools.allow and send it to hostd, awaiting the
+    //      apply+reconcile result.
     const details = pendingPermissions.get(request_id)
     if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
     const rule = resolveAlwaysAllowRule(details.tool_name, details.input_preview)
@@ -15285,57 +15332,143 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Always-allow needs SWITCHROOM_AGENT_NAME — gateway is misconfigured.' }).catch(() => {})
       return
     }
-    let grantOk = false
-    let grantFailReason = ''
-    try {
-      // --no-restart: settings.json gets the new entry on the next
-      // reconcile but we don't bounce the agent mid-turn. Operator
-      // can restart manually if they want this rule live in this
-      // session; otherwise it kicks in next session.
-      switchroomExec(['agent', 'grant', agentName, rule.rule, '--no-restart'])
-      // Verify the rule actually landed in the resolved config — guards
-      // against config-location-drift (gateway edited a yaml that isn't
-      // the durable source-of-truth, or the grant was a no-op). One
-      // fresh config read; cheap since this is a rare operator tap.
-      try {
-        const cfg = loadSwitchroomConfig()
-        const rawAgent = cfg.agents?.[agentName]
-        if (rawAgent) {
-          const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
-          const allowList: string[] = (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
-          if (isRulePersisted(allowList, rule.rule)) {
-            grantOk = true
-            process.stderr.write(
-              `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
-            )
-          } else {
-            grantFailReason = `rule "${rule.rule}" not found in resolved tools.allow after write — config location may have drifted`
-            process.stderr.write(
-              `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
-            )
-          }
-        } else {
-          grantFailReason = `agent "${agentName}" not found in config after write`
-          process.stderr.write(
-            `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
-          )
-        }
-      } catch (verifyErr) {
-        grantFailReason = `config re-read failed: ${(verifyErr as Error).message}`
-        process.stderr.write(
-          `telegram gateway: always-allow VERIFY FAILED: ${grantFailReason} (request_id=${request_id})\n`,
-        )
-      }
-    } catch (err) {
-      grantFailReason = (err as Error).message
-      process.stderr.write(`telegram gateway: always-allow grant failed: ${grantFailReason}\n`)
-    }
 
     pendingPermissions.delete(request_id)
 
-    const ackText = grantOk
-      ? `🔁 Always allow ${rule.label} for ${agentName}`
-      : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`
+    // (2) Dispatch the in-flight permission verdict IMMEDIATELY — before
+    // any host round-trip — so the turn never blocks on persistence.
+    // We carry the resolved `rule` so the bridge caches it for the rest
+    // of the session and auto-allows matching tool calls from sub-agents
+    // (Task tool) + the parent without re-popping the prompt (#1138).
+    // The rule is safe to cache regardless of whether the *durable*
+    // write later succeeds — it's the operator's explicit intent.
+    dispatchPermissionVerdict({
+      type: 'permission',
+      requestId: request_id,
+      behavior: 'allow',
+      rule: rule.rule,
+    })
+
+    // (3) Decide the persistence path. tryHostdDispatch returns
+    // "not-configured" when host_control is disabled or the per-agent
+    // socket is absent → legacy fallback.
+    let durable = false
+    let legacy = false
+    let failReason = ''
+    let editLockHint = false
+
+    const configEditDisabled = (msg: string): boolean =>
+      msg.includes('E_CONFIG_EDIT_DISABLED')
+
+    const unifiedDiff = (() => {
+      try {
+        const cfgPath = process.env.SWITCHROOM_CONFIG ?? SWITCHROOM_CONFIG ?? findSwitchroomConfigFile()
+        const raw = readFileSync(cfgPath, 'utf8')
+        return synthesizeAllowRuleDiff({ agentName, rule: rule.rule, configText: raw })
+      } catch (err) {
+        process.stderr.write(`telegram gateway: always-allow diff synth failed: ${(err as Error).message}\n`)
+        return null
+      }
+    })()
+
+    const correlationKey = `${agentName}::${rule.rule}`
+    try {
+      if (unifiedDiff == null) {
+        // Could not locate the agent block / read config → fall back to
+        // the legacy grant path; its own verify will produce honest
+        // messaging.
+        legacy = true
+      } else {
+        // Pre-register the single-tap correlation so hostd's callback
+        // (request_config_approval) auto-approves WITHOUT a second card.
+        pendingAlwaysAllowCorrelations.set(correlationKey, { agentName, rule: rule.rule, createdAt: Date.now() })
+        const req: HostdRequest = {
+          v: 1,
+          op: 'config_propose_edit',
+          request_id: hostdRequestId('gw-always-allow'),
+          args: {
+            unified_diff: unifiedDiff,
+            reason: `Operator 'always allow' for ${rule.label}`,
+            target_path: '/state/config/switchroom.yaml',
+          },
+        }
+        // config_propose_edit blocks on validate→approve→apply→reconcile,
+        // so allow ~60s (well past the default 5s).
+        const resp = await tryHostdDispatch(agentName, req, 60_000)
+        if (resp === 'not-configured') {
+          warnLegacySpawnIfHostdDisabled('always-allow')
+          legacy = true
+        } else if (resp.result === 'completed') {
+          durable = true
+          process.stderr.write(
+            `telegram gateway: always-allow durable via hostd rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
+          )
+        } else {
+          failReason = resp.error ?? `hostd ${resp.result}`
+          if (configEditDisabled(failReason)) editLockHint = true
+          process.stderr.write(
+            `telegram gateway: always-allow hostd FAILED: ${failReason} (request_id=${request_id})\n`,
+          )
+        }
+      }
+
+      if (legacy) {
+        // Legacy not-configured fallback — keep TODAY's behaviour:
+        // shell `agent grant` (writes the host yaml only when the
+        // gateway has a writable path) + verify the rule actually
+        // landed. Honest messaging: "saved (legacy path)" on verify,
+        // else the "did NOT save" warning.
+        try {
+          switchroomExec(['agent', 'grant', agentName, rule.rule, '--no-restart'])
+          try {
+            const cfg = loadSwitchroomConfig()
+            const rawAgent = cfg.agents?.[agentName]
+            if (rawAgent) {
+              const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+              const allowList: string[] = (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
+              if (isRulePersisted(allowList, rule.rule)) {
+                durable = true // legacy path verified — durable on this host shape
+                process.stderr.write(
+                  `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} via legacy grant (request_id=${request_id})\n`,
+                )
+              } else {
+                failReason = `rule "${rule.rule}" not found in resolved tools.allow after write — config location may have drifted`
+                process.stderr.write(
+                  `telegram gateway: always-allow VERIFY FAILED: ${failReason} (request_id=${request_id})\n`,
+                )
+              }
+            } else {
+              failReason = `agent "${agentName}" not found in config after write`
+              process.stderr.write(
+                `telegram gateway: always-allow VERIFY FAILED: ${failReason} (request_id=${request_id})\n`,
+              )
+            }
+          } catch (verifyErr) {
+            failReason = `config re-read failed: ${(verifyErr as Error).message}`
+            process.stderr.write(
+              `telegram gateway: always-allow VERIFY FAILED: ${failReason} (request_id=${request_id})\n`,
+            )
+          }
+        } catch (err) {
+          failReason = (err as Error).message
+          process.stderr.write(`telegram gateway: always-allow grant failed: ${failReason}\n`)
+        }
+      }
+    } finally {
+      // Single-shot correlation — drop it whether or not it was
+      // consumed by hostd's callback, so it can never be replayed.
+      pendingAlwaysAllowCorrelations.delete(correlationKey)
+    }
+
+    const ok = durable
+    const legacyNote = legacy && durable
+    const ackText = ok
+      ? (legacyNote
+          ? `🔁 Always allow ${rule.label} for ${agentName} (legacy path)`
+          : `🔁 Always allow ${rule.label} for ${agentName}`)
+      : (editLockHint
+          ? `⚠️ Allowed for now — config edits are locked. Enable hostd.config_edit_enabled.`
+          : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`)
     // HTML-escape baseText — `ctx.callbackQuery.message.text` returns
     // entities-stripped plain UTF-8, so raw `<`/`>`/`&` in the
     // expanded permission card's `description` or `input_preview`
@@ -15346,37 +15479,22 @@ bot.on('callback_query:data', async ctx => {
     const baseText = sourceMsg && 'text' in sourceMsg && sourceMsg.text
       ? escapeHtmlForTg(sourceMsg.text)
       : ''
-    const editLabel = grantOk
-      ? `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — restart agent for full effect`
-      : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`
+    const editLabel = ok
+      ? (legacyNote
+          ? `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — saved (legacy path); restart agent for full effect`
+          : `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — saved; restart agent for full effect`)
+      : (editLockHint
+          ? `⚠️ <b>Allowed for now — "always" did NOT save.</b> Config edits are locked; enable <code>hostd.config_edit_enabled</code>.`
+          : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`)
     // #1150 audit: route through finalizeCallback so the keyboard
-    // strips alongside the status-line edit. Pre-fix this called
-    // editMessageText without `reply_markup` so the Allow/Deny/Always
-    // buttons stayed tappable after the decision — re-tap would re-
-    // fire the permission broadcast.
+    // strips alongside the status-line edit. The in-flight verdict was
+    // ALREADY dispatched above (independently of this host round-trip)
+    // so the turn never blocked — finalizeCallback here only edits the
+    // card; no synthInbound (would double-fire the verdict).
     await finalizeCallback(ctx, {
       ackText: ackText.slice(0, 200),
       newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
       parseMode: 'HTML',
-      // Forward approval for the in-flight request regardless — even
-      // if the yaml edit failed, the operator clearly meant "yes" so
-      // we honour the immediate decision and surface the failure as
-      // a hint in the chat.
-      //
-      // #1138: also carry the resolved `rule` so the bridge can cache
-      // it for the rest of the session and auto-allow matching tool
-      // calls from sub-agents (Task tool) and the parent without
-      // re-popping the prompt. Only set when the yaml edit succeeded —
-      // otherwise the rule may be unsafe to honour at scale and we
-      // fall back to single-use allow.
-      synthInbound: () => {
-        dispatchPermissionVerdict({
-          type: 'permission',
-          requestId: request_id,
-          behavior: 'allow',
-          ...(grantOk ? { rule: rule.rule } : {}),
-        })
-      },
     })
     return
   }
