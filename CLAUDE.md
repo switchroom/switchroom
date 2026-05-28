@@ -391,6 +391,25 @@ Required-check tuning is a **Ruleset** edit (classic
 (preserve other rules + `bypass_actors: []` + `enforcement: active`).
 A new gating workflow needs explicit ruleset update.
 
+**Image build cache = GHCR registry, NOT `type=gha`** (#1965). The
+`docker-images` build steps cache via
+`type=registry,ref=ghcr.io/<owner>/switchroom-<img>:buildcache`
+(`mode=max,image-manifest=true,oci-mediatypes=true`). `type=gha` was
+dropped because its Azure-blob backend restores each layer behind a
+short-lived SAS token; on the heavy `agent` image (Chromium/webkite,
+143MB layers) the token expired / the blob restore stalled mid-copy and
+**hard-failed the build** (`failed to compute cache key: failed to
+copy`), repeatedly blocking releases. Registry cache has no SAS expiry,
+restores over the same GHCR path the images publish to, and a miss is a
+non-fatal cold build. **`cache-to` is gated to non-PR events** — fork
+PRs have no GHCR write token, so an export there would fail the
+required `build-dependents` check and block every merge; PRs read the
+last main build's `:buildcache` (the packages are public) and never
+write. The `:buildcache` tags are mode=max (all layers) and overwrite
+in place per push, so they don't accumulate. If a registry cache ever
+misbehaves, the recovery lever is still `workflow_dispatch` re-trigger
+(no `gh cache delete` needed — there is no GHA cache to poison).
+
 ## Conventions
 
 - **Language:** TypeScript, ES modules, Node ≥ 20.11. Strict TS config.
