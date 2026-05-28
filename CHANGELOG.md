@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.13.59 — strip the ack-first PreToolUse gate; draft transport owns the beat
+
+Removes the PreToolUse `ack-first-pretool` gate (shipped v0.13.56,
+#1921). The activity-summary draft transport (#1926/#1927, shipped
+v0.13.58) is now the user-facing ack lane: ephemeral preview in the
+compose area that updates as tools fire, clears when the model's
+reply lands.
+
+Per-turn UX shift:
+  - Before: `[user msg]` → `[bot]: on it — checking` (persistent ack
+    message) → `[bot]: <full answer>`
+  - After: `[user msg]` → draft preview *Read a file* (compose area,
+    updates in place) → preview clears, `[bot]: <full answer>`
+
+One persistent message per turn. Activity visible only as ephemeral
+compose preview. Chat history is just the answers.
+
+Pre-flight UAT on kill-switched test-harness (2026-05-28):
+  - Fast-ack 8-prompt fuzz: **8/8 PASS**, **5/8 hit <8s vision**
+    (vs 1/8 with gate ON across all prior versions)
+  - Trivial DM: **8.6s** TTFO (vs 11s with gate ON — gate added
+    ~50-100ms node-spawn overhead per tool call)
+  - Gate-validation: 5/8 PASS, same as gate ON; failures are model-
+    side pure-reasoning ceiling, not regressions
+
+Safety nets that stay intact:
+  - Activity summary + draft transport (#1926/#1927) — the new lane
+  - 60s awareness ping (#1920) — backstop for >60s wedges
+  - Silence-poke ladder + 300s framework_fallback — last-resort wedge
+    breaker
+  - Telemetry post-fallback fix (#1919) — honest outbound_count
+  - Turn-pacing UserPromptSubmit hook — soft prompting (no enforcement)
+  - Voice scrubber, over-ping safety net, etc.
+
+The (now-dead) `src/cli/ack-first-pretool.ts` source + bundled
+`.mjs` + `telegram-plugin/ack-flag.ts` helpers are still on disk;
+deleted in v0.13.60 after fleet-wide UAT confirms this release.
+
 ## v0.13.58 — activity summary: Claude Code-style live-updating draft in Telegram
 
 Two PRs land the design Ken sketched in #1926/#1927:
