@@ -1,6 +1,34 @@
 # Changelog
 
-## v0.14.1 — NO_REPLY-leak fix + accumulated fleet improvements
+## v0.14.2 — draft-mirror Phase 2: accumulating activity feed
+
+Phase 2 of the draft-mirror (#1957), still behind `SWITCHROOM_DRAFT_MIRROR`
+(**default OFF**; flag-off behavior byte-identical to v0.14.1).
+
+Phase 1 showed only the latest action in the compose-area draft; Phase 2
+accumulates the turn's actions into a running, Claude-Code-style feed:
+
+```
+· Reading gateway.ts
+· Searching memory
+· List workspace
+```
+
+- `appendActivityLine` / `renderActivityFeed` (`tool-activity-summary.ts`)
+  — chronological (newest last), `· ` bullets, consecutive exact-duplicate
+  lines collapsed, capped to the last 6 with a `· +N earlier…` header so a
+  heavy turn stays readable in the draft.
+- Each line is still the model-authored friendly description from Phase 1
+  (Bash.description, file basenames, "Searching memory", etc.) — never raw
+  shell/query syntax.
+- Telegram formatting: the feed is HTML-escaped before the `<i>…</i>` wrap
+  (parse_mode HTML), so filenames/queries carrying `<`/`>`/`&` can't break
+  parsing; newlines render as line breaks.
+
+Flag-off path unchanged (the legacy verb-count summary). Ships dormant;
+test-harness canary gates any default flip.
+
+
 
 Bundles the composite-silent-noise leak fix with the parallel work that
 merged to main since v0.14.0. Released off the main tip per the
