@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.13.65 — webkite pre-approval (first web fetch no longer wedges)
+
+Fixes the webkite rollout's last gap. The webkite MCP server was wired
+into every agent's `.mcp.json` and native WebFetch/WebSearch were
+denied — but the `webkite_*` tools were never pre-approved in
+`settings.json` `permissions.allow`. So the first "read this URL" turn
+hit a Claude Code permission prompt and wedged (observed live on the
+v0.13.63 fleet: "agent is requesting the skill/mcp").
+
+Root cause was subtle: `switchroom apply` on a deployed (existing)
+agent hits `writeIfMissing` — skipping the settings.json template —
+then an MCP-merge block re-seeds `permissions.allow`. That block only
+re-seeded `agent-config` + `hostd`, so webkite never reached existing
+agents. Fresh-scaffold unit tests passed while the deployed fleet still
+prompted.
+
+`WEBKITE_MCP_TOOLS` (`mcp__webkite`, `mcp__webkite__*`) is now
+pre-approved at all three allow-seed sites — fresh scaffold, reconcile,
+AND the existing-agent merge loop — gated on the `mcp_servers.webkite:
+false` opt-out. New regression test covers the existing-agent merge
+path specifically; new UAT `jtbd-webkite-read-dm` DMs a JS-rendered SPA
+URL without naming webkite and asserts the agent returns the JS-gated
+content (webkite chosen unprompted + cloakbrowser renders JS + no
+wedge). Live-validated: the agent returned the Einstein quote from
+`quotes.toscrape.com/js/` in 49s.
+
+(#1949)
+
 ## v0.13.64 — turn-pacing v4 (greetings) + draft-mirror preview Phase 1
 
 Two changes, both about the "what is my agent doing / does it answer
