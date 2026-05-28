@@ -30,6 +30,7 @@ import {
   probeBindMountInode,
   formatBindMountResult,
   probeBrokerUnlocked,
+  probeKernelDbDurability,
   type BindMountStatResult,
   type BrokerStatResult,
 } from "./doctor-vault-broker-durability.js";
@@ -183,5 +184,97 @@ describe("probeBrokerUnlocked — runtime state, not just config", () => {
       statusProbe: () => null,
     });
     expect(r.status).toBe("skip");
+  });
+});
+
+describe("probeKernelDbDurability — approval-kernel approvals bind mount", () => {
+  // The probe targets the directory (/state/approvals host<->container)
+  // rather than the kernel.db file, because kernel.db is created lazily
+  // on the first allow_always decision. Directory inode equality is the
+  // robust signal that the compose bind mount is wired correctly.
+
+  const home = "/home/operator";
+
+  it("ok when host dir and kernel dir inodes match (mount wired)", () => {
+    const r = probeKernelDbDurability(home, {
+      statHost: () => ({ ino: 55555n, size: 4096 }),
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "55555",
+        size: 4096,
+      }),
+    });
+    expect(r.status).toBe("ok");
+    expect(r.name).toContain("approval-kernel");
+    expect(r.name).toContain("allow_always");
+    expect(r.detail).toContain("allow_always decisions persist");
+  });
+
+  it("fail when inodes differ (mount not wired — the ephemerality regression)", () => {
+    // Different inode means the kernel is operating on an ephemeral
+    // container-local directory — the regression class this probe catches.
+    const r = probeKernelDbDurability(home, {
+      statHost: () => ({ ino: 11111n, size: 4096 }),
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "99999",
+        size: 4096,
+      }),
+    });
+    expect(r.status).toBe("fail");
+    expect(r.detail).toContain("ephemeral");
+    expect(r.detail).toContain("allow_always");
+    // Remediation hint must name the fix: apply + kernel recreate.
+    expect(r.fix).toContain("switchroom apply");
+    expect(r.fix).toContain("approval-kernel");
+  });
+
+  it("skip when kernel container is not running (empty fleet, not broken)", () => {
+    const r = probeKernelDbDurability(home, {
+      statHost: () => ({ ino: 1n, size: 4096 }),
+      statBroker: (): BrokerStatResult => ({ kind: "broker-unreachable" }),
+    });
+    expect(r.status).toBe("skip");
+    expect(r.detail).toContain("approval-kernel");
+    expect(r.detail).toContain("unreachable");
+  });
+
+  it("warn when host approvals directory is absent (apply hasn't run yet)", () => {
+    // host-missing → warn, not fail. Directory is pre-created by
+    // `switchroom apply`; missing means apply hasn't run on this install yet.
+    const r = probeKernelDbDurability(home, {
+      statHost: () => null,
+      statBroker: (): BrokerStatResult => ({
+        kind: "ok-with-stat",
+        ino: "1",
+        size: 4096,
+      }),
+    });
+    expect(r.status).toBe("warn");
+    expect(r.fix).toContain("switchroom apply");
+  });
+
+  it("warn on transient docker exec error (no false fail)", () => {
+    // broker-stat-failed degrades to warn, not fail — no false alarms
+    // when docker exec has a transient error.
+    const r = probeKernelDbDurability(home, {
+      statHost: () => ({ ino: 1n, size: 4096 }),
+      statBroker: (): BrokerStatResult => ({
+        kind: "broker-stat-failed",
+        msg: "permission denied",
+      }),
+    });
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("approval-kernel stat failed");
+    expect(r.detail).toContain("permission denied");
+  });
+
+  it("probe name clearly identifies the allow_always durability concern", () => {
+    const r = probeKernelDbDurability(home, {
+      statHost: () => ({ ino: 1n, size: 4096 }),
+      statBroker: (): BrokerStatResult => ({ kind: "broker-unreachable" }),
+    });
+    expect(r.name).toContain("approval-kernel");
+    expect(r.name).toContain("allow_always");
   });
 });

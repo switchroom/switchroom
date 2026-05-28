@@ -157,10 +157,29 @@ function spawnDockerStat(p: string): {
   stderr: string;
   error: Error | null;
 } {
+  return spawnDockerStatForContainer("switchroom-vault-broker", p);
+}
+
+/**
+ * Run `docker exec <containerName> stat -c '%i %s' <p>` and return the
+ * raw result. Extracted so multiple probes can target different containers
+ * without duplicating the exec + error-shape logic.
+ *
+ * @internal exported for testing
+ */
+export function spawnDockerStatForContainer(
+  containerName: string,
+  p: string,
+): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error: Error | null;
+} {
   try {
     const stdout = execFileSync(
       "docker",
-      ["exec", "switchroom-vault-broker", "stat", "-c", "%i %s", p],
+      ["exec", containerName, "stat", "-c", "%i %s", p],
       { stdio: ["ignore", "pipe", "pipe"], timeout: 3000, encoding: "utf8" },
     );
     return { status: 0, stdout, stderr: "", error: null };
@@ -312,6 +331,7 @@ export function runVaultBrokerDurabilityChecks(
   opts?: {
     inodeProbe?: typeof probeBindMountInode;
     statusProbe?: Parameters<typeof probeBrokerUnlocked>[0];
+    kernelStatBroker?: (p: string) => BrokerStatResult;
   },
 ): CheckResult[] {
   const home = homedir();
@@ -348,7 +368,113 @@ export function runVaultBrokerDurabilityChecks(
         "/root/.switchroom/vault-audit.log",
       ),
     ),
+    probeKernelDbDurability(home, {
+      statBroker: opts?.kernelStatBroker,
+    }),
   ];
+}
+
+/**
+ * Probe whether the approval-kernel's `/state/approvals` directory is
+ * backed by the host bind mount (`~/.switchroom/approvals`).
+ *
+ * We probe the **directory** inode rather than the `kernel.db` file
+ * because `kernel.db` is created lazily on the first `allow_always`
+ * decision — an empty fleet would false-positive "ephemeral" on a
+ * file-only probe. Directory inode equality is the durable signal
+ * that the compose bind mount is wired correctly.
+ *
+ * If the kernel container is not running, this returns `skip` rather
+ * than `fail`, matching the behaviour of the broker probes above.
+ *
+ * @internal exported for testing
+ */
+export function probeKernelDbDurability(
+  home: string,
+  opts?: {
+    statBroker?: (p: string) => BrokerStatResult;
+    statHost?: (p: string) => { ino: bigint; size: number } | null;
+  },
+): CheckResult {
+  const hostDir = join(home, ".switchroom", "approvals");
+  const containerDir = "/state/approvals";
+  const name = "approval-kernel: approvals bind mount (allow_always durability)";
+
+  const kernelStat = opts?.statBroker ?? defaultKernelStatBroker;
+
+  const result = probeBindMountInode(hostDir, containerDir, {
+    statBroker: kernelStat,
+    statHost: opts?.statHost,
+  });
+
+  if (result.kind === "ok") {
+    return {
+      name,
+      status: "ok",
+      detail: `${hostDir} == ${containerDir} (same inode) — allow_always decisions persist across kernel recreate`,
+    };
+  }
+  if (result.kind === "host-missing") {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `host directory ${hostDir} missing — \`switchroom apply\` pre-creates it on greenfield`,
+      fix: "Run `switchroom apply` to pre-create the host approvals directory",
+    };
+  }
+  if (result.kind === "broker-unreachable") {
+    return {
+      name,
+      status: "skip",
+      detail: "approval-kernel container unreachable — bind mount unverified",
+    };
+  }
+  if (result.kind === "broker-stat-failed") {
+    return {
+      name,
+      status: "warn",
+      detail: `approval-kernel stat failed: ${result.msg}`,
+    };
+  }
+  // mismatch: the kernel is operating on an ephemeral container-local
+  // directory — allow_always decisions are lost on every container recreate.
+  return {
+    name,
+    status: "fail",
+    detail:
+      `inode mismatch — approval-kernel \`/state/approvals\` is NOT backed by the host bind mount. ` +
+      `host inode=${result.hostInode} size=${result.hostSize}; ` +
+      `kernel inode=${result.brokerInode} size=${result.brokerSize}. ` +
+      `The kernel is writing kernel.db to an ephemeral container-local directory; ` +
+      `all allow_always decisions are lost on every container recreate (e.g. after \`switchroom update\`).`,
+    fix:
+      "Run `switchroom apply` to regenerate compose with the " +
+      "`~/.switchroom/approvals:/state/approvals` bind mount, then " +
+      "`docker compose -p switchroom up -d approval-kernel` to recreate the kernel container.",
+  };
+}
+
+function defaultKernelStatBroker(p: string): BrokerStatResult {
+  const r = spawnDockerStatForContainer("switchroom-approval-kernel", p);
+  if (r.error || r.status === null) return { kind: "broker-unreachable" };
+  if (r.status !== 0) {
+    if (r.status >= 125) return { kind: "broker-unreachable" };
+    return {
+      kind: "broker-stat-failed",
+      msg: r.stderr?.trim() || `exit ${r.status}`,
+    };
+  }
+  const out = r.stdout.trim();
+  const [inoStr, sizeStr] = out.split(/\s+/);
+  const size = Number(sizeStr);
+  if (!inoStr || !Number.isFinite(size)) {
+    return {
+      kind: "broker-stat-failed",
+      msg: `unparseable stat output: ${out}`,
+    };
+  }
+  return { kind: "ok-with-stat", ino: inoStr, size };
 }
 
 function probeAutoUnlockBlob(home: string): CheckResult {
