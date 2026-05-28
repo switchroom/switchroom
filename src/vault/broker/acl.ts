@@ -45,8 +45,9 @@ import { isGoogleClientCredentialKeyForAgent } from "../../config/google-workspa
  * Canonical vault keys webkite reads when running as an in-agent MCP.
  * Mirrors `WEBKITE_VAULT_KEYS` in profiles/_base/start.sh.hbs (the
  * shell loop that fetches them at agent boot and exports as env
- * vars). Kept in sync by the test pin at
- * `tests/scaffold.webkite-mcp-resolver.test.ts`.
+ * vars). Kept in sync by the test pins at `src/vault/broker/acl.test.ts`
+ * (canonical-3 allow + opt-out deny + non-canonical deny cases) and
+ * `tests/scaffold.integration-registry.test.ts` (resolver shape).
  */
 const WEBKITE_VAULT_KEYS = new Set<string>([
   "webkite/cloudflare-account-id",
