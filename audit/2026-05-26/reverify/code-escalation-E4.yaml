@@ -1,0 +1,25 @@
+unit_id: code-escalation-E4
+unit_path: telegram-plugin/quota-watch.ts + telegram-plugin/auth-snapshot-format.ts + telegram-plugin/gateway/gateway.ts
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+escalation_ref: E4 (jtbd-track-plan-quota-live: c1, c2, c6, c7)
+auditor_notes: |
+  The original outcome-not-realized findings for proactive quota notification
+  are resolved. quota-watch.ts exists (10736 bytes). gateway.ts imports
+  runQuotaWatch at L382 and calls it at L16904. The reviewer-blocker (live
+  probe on every poll) is confirmed fixed: gateway.ts L11931 uses
+  buildSnapshotsFromCachedState (defined in auth-snapshot-format.ts L645),
+  not a live probeQuota call. The design comment at quota-watch.ts L29-34
+  explicitly states "probeQuota is only called on state-change... On no-change
+  polls, only listState is called" — consistent with the cached-state approach.
+findings:
+  - claim_id: c1-c2-c6-c7
+    original_verdict: outcome-not-realized
+    reverify_verdict: aligned
+    note: >
+      telegram-plugin/quota-watch.ts exists and is wired. gateway.ts L11931
+      calls buildSnapshotsFromCachedState(listStateData) — the broker's in-memory
+      last_quota cache, a local IPC call with no network. probeQuota is called
+      only when a state transition is detected and a notification will be sent.
+      The steady-state poll path (no transition) makes zero Anthropic network
+      calls. The reviewer blocker (#1931) is confirmed resolved.

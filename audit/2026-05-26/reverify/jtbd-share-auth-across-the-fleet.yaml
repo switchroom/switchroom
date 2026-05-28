@@ -1,0 +1,71 @@
+unit_id: jtbd-share-auth-across-the-fleet
+unit_path: reference/share-auth-across-the-fleet.md
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: jtbd-share-auth-stale-examples
+auditor_notes: |
+  All nine originally non-aligned findings resolved. Auth verbs corrected,
+  claude -p example replaced with inject_inbound pattern, fallback_order
+  named explicitly, remove refusal updated, YAML examples corrected, all-go-away
+  overstated claim qualified, no-migration false claim corrected, auth show
+  UAT command fixed, and migration UAT note added.
+findings:
+  - claim_id: c4
+    original_verdict: jtbd-stale-example
+    reverify_verdict: aligned
+    note: >
+      "Signs it's working" now reads "The user runs `switchroom auth use <label>`
+      (to set the fleet account) and restarts the agent; no new OAuth flow is needed."
+      The non-existent `auth enable` verb is gone.
+  - claim_id: c7
+    original_verdict: jtbd-stale-example
+    reverify_verdict: aligned
+    note: >
+      The `claude -p` cron example is replaced: "A cron-scheduled task fires
+      through the agent's session and uses the same account as the main process
+      — same broker-managed credential, no 401s, no env-var hand-offs."
+  - claim_id: c8
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      "next account in the fleet fallback order" — fallback_order named explicitly.
+      "its preference list" (implying per-agent) is gone.
+  - claim_id: c9
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L79 now reads "refused while it is the fleet active account or the override
+      target for any agent." Per-agent "enabled on" tracking wording gone.
+  - claim_id: c10
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Decision 2 YAML example now shows "foo: {}" and "klanker: auth: override:
+      work" patterns. The stale auth.accounts: [...] per-agent list example
+      is gone; migration path noted.
+  - claim_id: c13
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L187 now reads "The legacy per-agent slot-pool module is retained for
+      back-compat." The "all go away" overstatement is qualified.
+  - claim_id: c14
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Decision 10 now distinguishes "no CLI migration verb" from "no migration
+      algorithm." The false claim "no migration shipped" is replaced; both
+      migrate-schema.ts and the retained accounts.ts are acknowledged.
+  - claim_id: c16
+    original_verdict: jtbd-stale-example
+    reverify_verdict: aligned
+    note: >
+      UAT prompt now reads "`switchroom auth show`." The non-existent
+      `auth account list` is gone.
+  - claim_id: c18
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      UAT prompt now instructs "Run `switchroom apply` first (it performs
+      the in-place schema upgrade)." The ambiguity about migration trigger
+      is resolved.

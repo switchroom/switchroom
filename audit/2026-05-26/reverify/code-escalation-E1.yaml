@@ -1,0 +1,29 @@
+unit_id: code-escalation-E1
+unit_path: src/host-control/server.ts (and contract-vision:c2)
+category: contract
+reverified_at: 2026-05-28T00:00:00Z
+escalation_ref: E1 (contract-vision:c2)
+auditor_notes: |
+  The original code-violates-contract finding (claude -p ok deep probe in
+  src/host-control/server.ts:1577) is resolved. The deep probe now uses a
+  Python-based token-introspect check against .credentials.json — no model
+  call, no programmatic usage. Issue #1798 is closed.
+
+  The bridge-flap-regression-guard.test.ts KNOWN_TEMPLATE_GAPS map no longer
+  has an active #1798 entry — the comment records the resolution but the entry
+  itself is empty (no paths allowlisted), meaning the guard is fully tightened.
+
+  No live claude -p callsites found in src/. All references to "claude -p"
+  in src/ are either: (a) comments explaining why it is forbidden, (b) test
+  fixtures verifying the prohibition, or (c) JSDoc in webhook-handler.ts L93
+  (stale comment, not a live callsite — flagged in misc-jtbd-small-drift-fixes
+  new_drift item).
+findings:
+  - claim_id: c2
+    original_verdict: code-violates-contract
+    reverify_verdict: aligned
+    note: >
+      src/host-control/server.ts L1575-1600: deep probe now uses python3
+      to introspect .credentials.json. Comment at L1579 explicitly states
+      "No model call — no programmatic usage." The prior "claude -p ok"
+      cmd is gone. KNOWN_TEMPLATE_GAPS is empty — no active gaps.

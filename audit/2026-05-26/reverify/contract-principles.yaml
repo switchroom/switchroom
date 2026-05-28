@@ -1,0 +1,55 @@
+unit_id: contract-principles
+unit_path: reference/principles.md
+category: contract
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: principles-stale-examples
+auditor_notes: |
+  All seven originally non-aligned contract-example-stale findings resolved.
+  Auth verb, privacy-mode example, vault success message, profile slug, upgrade
+  command, skills config field, and consistency-test verb list all updated.
+findings:
+  - claim_id: c1
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L38-41 now shows "switchroom auth add default --via-claude" and
+      "switchroom auth reauth coach". The non-existent `auth login` is gone.
+  - claim_id: c2
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      Privacy-mode example now shows static upfront guidance ("Before adding
+      your bot to a group, disable Privacy Mode in @BotFather..."), not a
+      dynamic detect-and-report path that was never shipped.
+  - claim_id: c4
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L61-62 now reads "+ Secret 'telegram-bot-token' saved. The user can
+      then reference it in switchroom.yaml as vault:telegram-bot-token."
+      Matches actual output + adds the vault: syntax hint inline.
+  - claim_id: c7
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L104 now reads "--profile executive-assistant". The incorrect
+      "--profile executive" slug is gone.
+  - claim_id: c8
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L110 now reads "The upgrade flow is one command: `switchroom update`
+      pulls new images, applies config, recreates containers, and runs a
+      post-bounce doctor sweep." The three-command pattern replaced.
+  - claim_id: c9
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L118 now reads "via `defaults.skills`". The non-existent
+      `defaults.skills_auto` field and `buildkite-*` reference are gone.
+  - claim_id: c10
+    original_verdict: contract-example-stale
+    reverify_verdict: aligned
+    note: >
+      L144 now lists "auth add" instead of "auth login" in the consistency
+      test example. Structural noun-verb claim remains correct.

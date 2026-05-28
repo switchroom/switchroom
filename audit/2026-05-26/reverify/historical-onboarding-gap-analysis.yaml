@@ -1,0 +1,26 @@
+unit_id: historical-onboarding-gap-analysis
+unit_path: reference/onboarding-gap-analysis.md
+category: historical
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: docs-onboarding-referrer-fix + reference-readme-index-corrections
+auditor_notes: |
+  Three archive-leaks findings addressed across two batches. All resolved.
+findings:
+  - claim_id: c2
+    original_verdict: archive-leaks
+    reverify_verdict: aligned
+    note: >
+      reference/README.md L60 now reads "historical point-in-time gap analysis
+      from a 2026-04-25 onboarding session; not a live tracker." Confirmed.
+  - claim_id: c3
+    original_verdict: archive-leaks
+    reverify_verdict: aligned
+    note: >
+      docs/workspace-files.md L58-61 — the "(see gap analysis gap 4 and gap 8)"
+      link is gone. No gap-analysis reference remains in the hardcoded-list paragraph.
+  - claim_id: c4
+    original_verdict: archive-leaks
+    reverify_verdict: aligned
+    note: >
+      docs/workspace-files.md Related section (L199-204) now reads "historical
+      motivation... point-in-time, 2026-04-25; not a live roadmap." Confirmed.

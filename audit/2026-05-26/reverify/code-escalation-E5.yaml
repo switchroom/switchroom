@@ -1,0 +1,29 @@
+unit_id: code-escalation-E5
+unit_path: telegram-plugin/gateway/gateway.ts + telegram-plugin/operator-events.ts
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+escalation_ref: E5 (jtbd-talk-to-agents-from-anywhere:c7)
+auditor_notes: |
+  The original outcome-not-realized finding (auth slot management redirected
+  users to terminal, "Phase 4c will wire this") is resolved. swap-slot and
+  add-slot button render and callback handlers are gone from gateway.ts and
+  operator-events.ts. The "run in terminal" / "Phase 4c will wire" strings
+  are absent (the two Phase 4c mentions in the codebase are unrelated: one
+  covers Anthropic API error forwarding in bridge.ts L644, and one covers
+  IPC validation in a test file). The auth:use:<label> callback handler
+  (gateway.ts L13980-14020) is intact and working.
+
+  The operator-events tests confirm the removal: tests/operator-events.test.ts
+  L185-201 explicitly asserts that swap-slot and add-slot buttons are absent
+  from auth-event rendered output.
+findings:
+  - claim_id: c7
+    original_verdict: outcome-not-realized
+    reverify_verdict: aligned
+    note: >
+      grep for "swap-slot" and "add-slot" in telegram-plugin/ finds only test
+      assertions confirming their removal (operator-events.test.ts L186-201).
+      No render callsite or callback handler for these buttons exists in
+      production code. The auth:use:<label> handler at gateway.ts L13983
+      works as the fleet-wide swap path. The "Phase 4c will wire this" comment
+      is gone; the feature is wired.

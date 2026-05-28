@@ -1,0 +1,23 @@
+unit_id: code-escalation-E3
+unit_path: telegram-plugin/gateway/config-snapshot.ts + boot-card.ts + gateway.ts
+category: jtbd
+reverified_at: 2026-05-28T00:00:00Z
+escalation_ref: E3 (jtbd-restart-and-know-what-im-running: c1-c3, c8, c11, c12, c15-c16)
+auditor_notes: |
+  The original outcome-not-realized findings for boot card visibility are
+  resolved. config-snapshot.ts exists at telegram-plugin/gateway/config-snapshot.ts
+  (10405 bytes). boot-card.ts imports ConfigDiff from config-snapshot.js and
+  has a configChanges field in RenderBootCardOpts (L317-320, L431-435).
+  gateway.ts passes configSnapshotPath to the boot card at two callsites
+  (L3923 and L16835): "<agentDir>/.config-snapshot.json".
+findings:
+  - claim_id: c1-c3-c8-c11-c12-c15-c16
+    original_verdict: outcome-not-realized
+    reverify_verdict: aligned
+    note: >
+      telegram-plugin/gateway/config-snapshot.ts exists and is wired:
+      boot-card.ts L68 imports from config-snapshot.js; RenderBootCardOpts
+      L320 has configChanges?: ConfigDiff; gateway.ts L3923 and L16835
+      pass configSnapshotPath pointing at <agentDir>/.config-snapshot.json.
+      The diff-on-boot path is in place. The boot card now renders config
+      changes detected since the prior snapshot.

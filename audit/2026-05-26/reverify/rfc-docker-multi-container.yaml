@@ -1,0 +1,57 @@
+unit_id: rfc-docker-multi-container
+unit_path: reference/rfc-docker-multi-container.md
+category: rfc-shipped
+reverified_at: 2026-05-28T00:00:00Z
+fix_batch: rfc-docker-promote-and-correct
+auditor_notes: |
+  All seven originally non-aligned findings resolved. Status promoted to Shipped,
+  image count corrected to seven, UID range corrected to 10001-10999, UID examples
+  in socket layout updated, compose skeleton version: field removed and tag updated,
+  reconcile verb corrected to apply, and process tree updated to show gateway as
+  supervised sidecar (not MCP child).
+findings:
+  - claim_id: c1
+    original_verdict: rfc-status-wrong
+    reverify_verdict: aligned
+    note: >
+      Frontmatter now reads "status: Shipped". The "Draft" status that
+      contradicted the body is gone.
+  - claim_id: c2
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L20-23 now reads "Seven published GHCR images" and lists
+      switchroom-auth-broker, switchroom-hostd, switchroom-hindsight
+      alongside the original four.
+  - claim_id: c3
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L180 now reads "allocated deterministically in the range 10001..10999
+      (AGENT_UID_MIN/AGENT_UID_MAX in src/agents/compose.ts)." The bogus
+      "1100 + stable_hash(agent_name) % 800" formula is gone.
+  - claim_id: c4
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Socket directory layout examples now show uid:gid 10001:10001 range.
+      The illustrative sequential 1100/1101/1102 values are gone.
+  - claim_id: c5
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      L270 compose skeleton starts with "name: switchroom" then "services:" —
+      no version: "3.9" field. Image tag examples use :latest / variables.
+  - claim_id: c6
+    original_verdict: drift-minor
+    reverify_verdict: aligned
+    note: >
+      L338 now reads "`switchroom apply` regenerates this whole file".
+      The stale `switchroom reconcile` verb is gone.
+  - claim_id: c7
+    original_verdict: drift-major
+    reverify_verdict: aligned
+    note: >
+      Process tree (L144-155) now shows gateway as a supervised sidecar
+      sibling launched before tmux via _switchroom_supervise, not as an
+      MCP child of claude. Matches profiles/_base/start.sh.hbs and CLAUDE.md.
