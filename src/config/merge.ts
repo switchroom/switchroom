@@ -586,6 +586,34 @@ export function mergeAgentConfig(
     ];
   }
 
+  // --- allowed_tools / disallowed_tools: union, dedup-preserving-order
+  //     (defaults first) ---
+  //
+  // Both feed Claude Code's --allowedTools / --disallowedTools flags
+  // (#199). Before this clause `mergeAgentConfig` copied an explicit
+  // scalar/array field list and silently omitted these two, so
+  // `defaults.allowed_tools` was accepted by the schema but never
+  // reached the agent's `exec claude` invocation — a silent no-op that
+  // looked like it should work (e.g. fleet-wide pre-approval of an
+  // operator-defined MCP server's tools like `mcp__perplexity__*`).
+  // Union+dedup (not concat) because these are permission PATTERNS, not
+  // repeatable CLI flags: a default grant + an identical agent grant is
+  // redundant, and the agent layer EXTENDS the fleet policy rather than
+  // replacing it. Dedup preserves first-seen order (defaults before
+  // agent-specific entries).
+  if (defaults.allowed_tools || merged.allowed_tools) {
+    merged.allowed_tools = dedupe([
+      ...(defaults.allowed_tools ?? []),
+      ...(merged.allowed_tools ?? []),
+    ]);
+  }
+  if (defaults.disallowed_tools || merged.disallowed_tools) {
+    merged.disallowed_tools = dedupe([
+      ...(defaults.disallowed_tools ?? []),
+      ...(merged.disallowed_tools ?? []),
+    ]);
+  }
+
   // --- extra_stable_files: union, dedup-preserving-order (defaults first) ---
   //
   // Follows the same pattern as `skills`: defaults provide the base list,

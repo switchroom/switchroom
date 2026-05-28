@@ -1511,6 +1511,30 @@ const profileFields = {
       "Opt-in flags for experimental / legacy behaviours. Cascades through " +
       "defaults → profile → per-agent.",
     ),
+  // Mirror of AgentSchema.allowed_tools / disallowed_tools — repeated
+  // here (AgentSchema does not spread profileFields, same as
+  // `resources`) so the fields are accepted at the defaults + profile
+  // levels and cascade to agents via mergeAgentConfig. Without these,
+  // `defaults.allowed_tools` was stripped at parse (unknown key) AND
+  // dropped at merge — a silent double no-op. See #199 + the
+  // allowed_tools/disallowed_tools cascade clause in merge.ts.
+  allowed_tools: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Granular tool allowlist passed verbatim to Claude Code's --allowedTools " +
+      "flag. Cascades defaults → profile → per-agent (union, dedup). Supports " +
+      "patterns like 'Bash(git *)' or 'mcp__perplexity__*' that the coarse " +
+      "`tools.allow` field can't express. See #199."
+    ),
+  disallowed_tools: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Granular tool denylist passed verbatim to Claude Code's --disallowedTools " +
+      "flag. Cascades defaults → profile → per-agent (union, dedup). Same pattern " +
+      "syntax as allowed_tools (e.g. 'Bash(rm *)'). See #199."
+    ),
 };
 
 /**
