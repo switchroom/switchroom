@@ -1,6 +1,34 @@
 # Changelog
 
-## v0.13.65 — webkite pre-approval (first web fetch no longer wedges)
+## v0.13.66 — draft-mirror: friendly tool_use rendering (flag-gated)
+
+Draft-mirror pivot (#1951), still behind `SWITCHROOM_DRAFT_MIRROR`
+(**default OFF**). The flag-on canary proved the model emits almost no
+interstitial `assistant.text` on a normal tool turn (it goes thinking
+→ tool_use → reply), so streaming prose to the draft produced an empty
+preview. The real human-friendly signal lives in `tool_use.input`,
+authored by the model — verified against a live session JSONL:
+`Bash.description` ("List workspace", never `ls -la`),
+`Read`/`Edit`/`Write` file basename, `Grep` pattern, `Task`
+description, `WebFetch` hostname, plus domain labels for hindsight
+("Searching memory"), calendar, email, drive, notes.
+
+New `describeToolUse(name, input)` renders each tool_use as a
+present-tense, human-friendly line — model-authored description, then
+domain label, then humanized name; never raw shell/query syntax.
+Option A (uniform across code + non-code agents): a health coach sees
+"Searching memory" / "Checking your calendar"; a code agent sees
+"Editing gateway.ts" / the model's own Bash description. Streams the
+latest action into the ephemeral compose-area draft, clears on reply.
+The `assistant.text`→draft transport flip from the prior Phase 1 is
+reverted (that lane keeps visible-answer-stream). `drainActivitySummary`
+now HTML-escapes content before the `<i>` wrap (#1942 bug class).
+
+Flag-off behavior is byte-identical to v0.13.65 (the legacy generic
+verb-count summary via `registerAndRender`). Ships dormant; the
+test-harness canary gates any default flip.
+
+
 
 Fixes the webkite rollout's last gap. The webkite MCP server was wired
 into every agent's `.mcp.json` and native WebFetch/WebSearch were
