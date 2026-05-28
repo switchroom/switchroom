@@ -730,6 +730,57 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
 const WEBKITE_FLEET_DENY_TOOLS = ["WebFetch", "WebSearch"];
 
 /**
+ * In-container PATH location of the operator-mounted webkite binary
+ * (compose.ts mounts `~/.switchroom/bin/webkite` here). Host-side
+ * staging path is `~/.switchroom/bin/webkite`.
+ */
+const WEBKITE_BINARY_CONTAINER_PATH = "/usr/local/bin/webkite";
+
+/**
+ * Fail-safe gate for the WebFetch/WebSearch deny: only strip the
+ * native tools when a webkite binary is actually staged, so a
+ * degraded install (binary missing, glibc-incompatible build pulled,
+ * operator hasn't run the one-time setup yet) keeps native WebFetch
+ * as a safety net instead of going dark on web access entirely.
+ *
+ * Checks BOTH contexts scaffold/reconcile can run in:
+ *   - host apply  → `~/.switchroom/bin/webkite` (operator staging path)
+ *   - in-container reconcile → `/usr/local/bin/webkite` (compose mount)
+ *
+ * This is deliberately a presence check, not a runnability check — we
+ * can't exec the binary at scaffold time across both contexts. A
+ * present-but-broken binary still trips the deny; the doctor probe
+ * (follow-up) is where runnability gets surfaced. Presence alone
+ * closes the dominant failure mode: operator simply hasn't staged it.
+ *
+ * `SWITCHROOM_WEBKITE_BINARY` env overrides the probe path entirely —
+ * a real operator knob for a non-standard webkite location, and the
+ * deterministic seam tests use (point it at a tmp file to simulate
+ * "staged", at a bogus path to simulate "absent").
+ */
+function webkiteBinaryAvailable(): boolean {
+  const override = process.env.SWITCHROOM_WEBKITE_BINARY;
+  if (override !== undefined && override !== "") {
+    return existsSync(override);
+  }
+  return (
+    existsSync(join(homedir(), ".switchroom", "bin", "webkite")) ||
+    existsSync(WEBKITE_BINARY_CONTAINER_PATH)
+  );
+}
+
+/**
+ * Resolve the effective WebFetch/WebSearch deny for an agent.
+ * Applied only when webkite is BOTH not-opted-out AND actually
+ * staged (the fail-safe gate above).
+ */
+function webkiteDenyForAgent(agentConfig: AgentConfig): string[] {
+  if (agentConfig.mcp_servers?.["webkite"] === false) return [];
+  if (!webkiteBinaryAvailable()) return [];
+  return WEBKITE_FLEET_DENY_TOOLS;
+}
+
+/**
  * Switchroom-shipped default model + thinking effort for main agents.
  *
  * Sonnet 4.6 + effort=low is the right starting point for the
@@ -1839,9 +1890,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     tools,
     toolsDeny: dedupe([
       ...(tools.deny ?? []),
-      ...(agentConfig.mcp_servers?.["webkite"] === false
-        ? []
-        : WEBKITE_FLEET_DENY_TOOLS),
+      ...webkiteDenyForAgent(agentConfig),
     ]),
     permissionAllow,
     defaultModeAcceptEdits: hasAllWildcard,
@@ -4193,9 +4242,7 @@ export function reconcileAgent(
   ]);
   const desiredDeny = dedupe([
     ...(tools.deny ?? []),
-    ...(agentConfig.mcp_servers?.["webkite"] === false
-      ? []
-      : WEBKITE_FLEET_DENY_TOOLS),
+    ...webkiteDenyForAgent(agentConfig),
   ]);
 
   // Resolve topic ID for the start.sh template and session greeting
