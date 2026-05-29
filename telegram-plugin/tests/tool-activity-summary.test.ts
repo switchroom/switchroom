@@ -288,17 +288,17 @@ describe("registerAndRender — ergonomic full-pipeline call", () => {
   });
 });
 
-describe("appendActivityLine + renderActivityFeed — accumulating draft feed", () => {
-  it("accumulates distinct actions chronologically (newest last)", () => {
+describe("appendActivityLine + renderActivityFeed — accumulating activity feed", () => {
+  it("accumulates distinct actions chronologically (newest = current → bold, earlier = done ✓ italic)", () => {
     const lines: string[] = [];
     expect(appendActivityLine(lines, "Read", { file_path: "a/gateway.ts" })).toBe(
-      "· Reading gateway.ts",
+      "<b>→ Reading gateway.ts</b>",
     );
     expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
-      "· Reading gateway.ts\n· Searching memory",
+      "<i>✓ Reading gateway.ts</i>\n<b>→ Searching memory</b>",
     );
     expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
-      "· Reading gateway.ts\n· Searching memory\n· List workspace",
+      "<i>✓ Reading gateway.ts</i>\n<i>✓ Searching memory</i>\n<b>→ List workspace</b>",
     );
   });
 
@@ -315,14 +315,26 @@ describe("appendActivityLine + renderActivityFeed — accumulating draft feed", 
     expect(lines).toEqual([]);
   });
 
-  it("caps to the last MIRROR_MAX_LINES with a '+N earlier' header", () => {
+  it("caps to the last MIRROR_MAX_LINES with a '✓ +N earlier…' header", () => {
     const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines)!;
-    expect(out.startsWith("· +3 earlier…\n")).toBe(true);
-    // Only the last 6 actions are shown.
-    expect(out).toContain("· Action 4");
-    expect(out).toContain("· Action 9");
-    expect(out).not.toContain("· Action 3\n");
+    expect(out.startsWith("<i>✓ +3 earlier…</i>\n")).toBe(true);
+    // Only the last 6 actions are shown; the oldest 3 are collapsed.
+    expect(out).toContain("<i>✓ Action 4</i>");
+    expect(out).not.toContain("Action 3");
+    // The newest action is the in-progress step (bold →); the rest are done (✓).
+    expect(out).toContain("<b>→ Action 9</b>");
+    expect(out).toContain("<i>✓ Action 8</i>");
+    expect(out).not.toContain("<b>→ Action 8</b>");
+  });
+
+  it("HTML-escapes &, <, > in action text (no double-escaping by callers)", () => {
+    const out = renderActivityFeed(["Running <foo> & <bar>"])!;
+    expect(out).toBe("<b>→ Running &lt;foo&gt; &amp; &lt;bar&gt;</b>");
+  });
+
+  it("renders a single line as the current (bold →) step", () => {
+    expect(renderActivityFeed(["Reading a.ts"])).toBe("<b>→ Reading a.ts</b>");
   });
 
   it("renderActivityFeed returns null on empty", () => {
@@ -333,9 +345,9 @@ describe("appendActivityLine + renderActivityFeed — accumulating draft feed", 
 describe("appendActivityLabel — precomputed label feed (tool_label path)", () => {
   it("accumulates precomputed labels, dedups consecutive, ignores empty", () => {
     const lines: string[] = [];
-    expect(appendActivityLabel(lines, "Searching memory")).toBe("· Searching memory");
+    expect(appendActivityLabel(lines, "Searching memory")).toBe("<b>→ Searching memory</b>");
     expect(appendActivityLabel(lines, "List workspace")).toBe(
-      "· Searching memory\n· List workspace",
+      "<i>✓ Searching memory</i>\n<b>→ List workspace</b>",
     );
     // consecutive dup collapses
     appendActivityLabel(lines, "List workspace");

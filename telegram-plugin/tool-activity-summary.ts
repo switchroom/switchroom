@@ -338,19 +338,18 @@ export function describeToolUse(
 
 // ─── Accumulating activity feed (draft-mirror Phase 2) ──────────────────────
 //
-// Phase 1 showed only the latest action; this accumulates the turn's actions
-// into a running feed — like Claude Code's own UI — streamed into the
-// ephemeral draft and cleared on reply. Chronological (oldest first, newest
-// last), consecutive exact-duplicates collapsed, capped to the most recent
-// MIRROR_MAX_LINES with a "+N earlier" header so a heavy turn stays readable
-// inside Telegram's compose-area draft.
+// Accumulates the turn's actions into a running feed — like Claude Code's
+// own UI — rendered into one Telegram message that edits in place and is
+// cleared on reply. Chronological (oldest first, newest last), consecutive
+// exact-duplicates collapsed, capped to the most recent MIRROR_MAX_LINES
+// with a "+N earlier" header so a heavy turn stays readable.
 
 export const MIRROR_MAX_LINES = 6;
 
 /**
  * Append a tool_use's friendly line to the running feed (mutates `lines`)
- * and return the rendered draft body — or null when the tool is a surface
- * tool / produced no line (caller skips the draft update).
+ * and return the rendered feed (ready Telegram HTML) — or null when the
+ * tool is a surface tool / produced no line (caller skips the update).
  *
  * Dedups only consecutive identical lines (e.g. a burst of parallel Reads of
  * the same file) so distinct actions are all preserved.
@@ -368,19 +367,32 @@ export function appendActivityLine(
   return renderActivityFeed(lines);
 }
 
+/** Minimal HTML escape for Telegram parse_mode=HTML (matches the gateway's). */
+function escapeFeedHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /**
- * Render the accumulated feed as a plain-text block (one action per line).
- * The caller HTML-escapes + wraps it for Telegram. Returns null when empty.
- *
- * Newest-last chronological order; capped to the last MIRROR_MAX_LINES with a
- * dim "+N earlier" header when the turn ran longer.
+ * Render the accumulated feed as ready Telegram HTML — one action per line,
+ * newest last. The current (newest) step is bold with a `→`; finished steps
+ * are italic with a `✓`. Capped to the last MIRROR_MAX_LINES with a dim
+ * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
+ * Callers send the result verbatim — do NOT re-escape or re-wrap it.
  */
 export function renderActivityFeed(lines: string[]): string | null {
   if (lines.length === 0) return null;
   const shown = lines.slice(-MIRROR_MAX_LINES);
   const hidden = lines.length - shown.length;
-  const body = shown.map((l) => `· ${l}`).join("\n");
-  return hidden > 0 ? `· +${hidden} earlier…\n${body}` : body;
+  const out: string[] = [];
+  if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`);
+  const lastIdx = shown.length - 1;
+  // Newest line = in-progress step (bold, →); earlier = done (italic, ✓).
+  // Returns ready Telegram HTML — callers must NOT re-escape or re-wrap it.
+  shown.forEach((l, i) => {
+    const esc = escapeFeedHtml(l);
+    out.push(i === lastIdx ? `<b>→ ${esc}</b>` : `<i>✓ ${esc}</i>`);
+  });
+  return out.join("\n");
 }
 
 /**
