@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.14.10 — Docker-native GitHub webhook ingest (#1986)
+
+Fixes GitHub webhook delivery on Docker installs. Since the
+systemd→Docker migration, agent state dirs are owned by the per-agent
+container UID, so the host-user web receiver could no longer write
+`<agentDir>/telegram/webhook-events.jsonl` (EACCES → HTTP 500 → GitHub
+marking the hook broken). A second latent gap: the webhook dispatch
+helper had no production caller, so even a successful write never woke
+the agent.
+
+This release adds an opt-in path (`channels.telegram.webhook_via_gateway`,
+**off by default**) that routes webhook ingest through the per-agent
+**gateway** — which runs as the agent's container UID and already owns
+that state dir. The gateway binds a dedicated peercred-gated
+`webhook.sock` (allowing only the agent's own UID and the host operator
+UID, conveyed via the new `SWITCHROOM_WEBHOOK_RECEIVER_UID` compose
+env); the host web receiver becomes a thin stateless verify + render +
+forward, mapping the gateway's response to the right HTTP status so
+GitHub's retry semantics are preserved (202 ok / 200 deduped / 500
+error / 503 unreachable). Dispatch is wired in-process through the same
+`inject_inbound` synthesized-turn path cron uses — no new model
+callsite. The whole gateway-side path is behind a defensive boot guard
+that can never crash the gateway, and `resolveChannelTarget` was
+extracted into a node-cron-free leaf so the gateway bundle stays lean.
+Implements `docs/rfcs/webhook-via-gateway-socket.md`. When the flag is
+unset, the existing receiver path is byte-for-byte unchanged.
+
 ## v0.14.9 — activity feed is the unconditional default (#1984)
 
 The live tool-activity feed (#1982) is now **on for every agent by
