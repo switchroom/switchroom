@@ -1,16 +1,24 @@
 /**
  * Structural contract tests for the durable "🔁 Always allow" handler
- * in gateway.ts (the `behavior === 'always'` branch of the perm:
- * callback dispatcher), reworked for #1977.
+ * in gateway.ts, reworked for #1977 and the scoped-card split.
+ *
+ * The "Always…" flow is now TWO callback steps:
+ *   - `behavior === 'always' | 'back'` — swaps the action row for the
+ *     scope sub-menu (and back). Dispatches NO verdict and touches NO
+ *     host config; it only edits the keyboard.
+ *   - `behavior === 'asn' | 'asb'` — the operator picked a scope
+ *     (narrow / broad). THIS is where the verdict fires and the durable
+ *     persistence round-trip runs.
  *
  * Why structural: the handler lives inside a Grammy callback closure
  * that's not exported. Full-function invocation would require a complete
  * Grammy + hostd + switchroomExec harness. The behavioural pieces are
- * covered by the pure-function tests (permission-diff.test.ts) and the
- * correlation handler tests (always-allow-correlation.test.ts); this
- * file pins the source-level invariants of the orchestration block.
+ * covered by the pure-function tests (permission-diff.test.ts,
+ * permission-rule.test.ts) and the correlation handler tests
+ * (always-allow-correlation.test.ts); this file pins the source-level
+ * invariants of the orchestration block.
  *
- * Post-#1977 contract:
+ * Post-#1977 contract (now on the scope-commit `asn`/`asb` block):
  *   1. The in-flight Allow verdict fires IMMEDIATELY (before awaiting
  *      hostd) so the turn never blocks on host-config persistence.
  *   2. Durable persistence goes through hostd's `config_propose_edit`
@@ -19,9 +27,6 @@
  *      not-configured fallback ONLY (not the primary path), and it
  *      still verifies via isRulePersisted with honest messaging.
  *   4. Failure text never falsely claims durable success.
- *
- * Slicing strategy: we extract the `if (behavior === 'always') {` block
- * from gateway.ts and run string assertions against that slice only.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -34,110 +39,137 @@ const gatewaySrc = readFileSync(
 )
 
 /**
- * Extract the `behavior === 'always'` block from the perm: callback
- * dispatcher. The slice runs from the `if (behavior === 'always')` guard
- * up to (but not including) the next top-level `// Forward permission`
+ * Extract the scope-commit block (`behavior === 'asn' || behavior ===
+ * 'asb'`) from the perm: callback dispatcher. The slice runs from that
+ * guard up to (but not including) the `// Forward permission decision`
  * comment which opens the allow/deny branch.
  */
-function sliceAlwaysBlock(): string {
-  const start = gatewaySrc.indexOf("if (behavior === 'always')")
+function sliceCommitBlock(): string {
+  const start = gatewaySrc.indexOf("if (behavior === 'asn' || behavior === 'asb')")
   const end = gatewaySrc.indexOf('// Forward permission decision to connected bridges', start)
   if (start === -1 || end === -1) return ''
   return gatewaySrc.slice(start, end)
 }
 
-const alwaysBlock = sliceAlwaysBlock()
+/**
+ * Extract the keyboard-toggle block (`behavior === 'always' || behavior
+ * === 'back'`), which must NOT dispatch a verdict.
+ */
+function sliceToggleBlock(): string {
+  const start = gatewaySrc.indexOf("if (behavior === 'always' || behavior === 'back')")
+  const end = gatewaySrc.indexOf("if (behavior === 'asn' || behavior === 'asb')", start)
+  if (start === -1 || end === -1) return ''
+  return gatewaySrc.slice(start, end)
+}
 
-describe('always-allow handler — immediate verdict dispatch (turn must not block)', () => {
+const commitBlock = sliceCommitBlock()
+const toggleBlock = sliceToggleBlock()
+
+describe('always-allow — keyboard toggle block (no side effects)', () => {
+  it('exists and only edits the reply markup', () => {
+    expect(toggleBlock).not.toBe('')
+    expect(toggleBlock).toContain('editMessageReplyMarkup')
+  })
+
+  it('dispatches NO verdict and runs NO host round-trip', () => {
+    expect(toggleBlock).not.toContain('dispatchPermissionVerdict(')
+    expect(toggleBlock).not.toContain('tryHostdDispatch(')
+  })
+
+  it('surfaces the scope choice only now (specific + broad-with-⚠️)', () => {
+    expect(toggleBlock).toContain('choices.broad.buttonLabel')
+    expect(toggleBlock).toContain('⚠️')
+    expect(toggleBlock).toContain('perm:asn:')
+    expect(toggleBlock).toContain('perm:asb:')
+  })
+})
+
+describe('scope-commit — immediate verdict dispatch (turn must not block)', () => {
   it('dispatches the permission verdict BEFORE the hostd await', () => {
-    const verdictIdx = alwaysBlock.indexOf('dispatchPermissionVerdict({')
-    const hostdAwaitIdx = alwaysBlock.indexOf('await tryHostdDispatch(')
+    const verdictIdx = commitBlock.indexOf('dispatchPermissionVerdict({')
+    const hostdAwaitIdx = commitBlock.indexOf('await tryHostdDispatch(')
     expect(verdictIdx).toBeGreaterThan(-1)
     expect(hostdAwaitIdx).toBeGreaterThan(-1)
-    // The verdict fires first — independent of the durable persistence
-    // round-trip.
     expect(verdictIdx).toBeLessThan(hostdAwaitIdx)
   })
 
-  it('carries the resolved rule on the verdict so the bridge caches it', () => {
-    expect(alwaysBlock).toContain("behavior: 'allow'")
-    expect(alwaysBlock).toContain('rule: rule.rule')
+  it('carries the chosen scope rule on the verdict so the bridge caches it', () => {
+    expect(commitBlock).toContain("behavior: 'allow'")
+    expect(commitBlock).toContain('rule: chosen.rule')
+  })
+
+  it('resolves the chosen scope from the tapped button (asn=narrow, asb=broad)', () => {
+    expect(commitBlock).toContain('resolveScopedAllowChoices(')
+    expect(commitBlock).toContain("behavior === 'asn' ? (choices.specific ?? choices.broad) : choices.broad")
   })
 
   it('does NOT pass a synthInbound to finalizeCallback (verdict already fired)', () => {
-    // The verdict is dispatched directly above; finalizeCallback only
-    // edits the card. A synthInbound here would double-fire.
-    const finalizeIdx = alwaysBlock.indexOf('await finalizeCallback(ctx, {')
-    const after = alwaysBlock.slice(finalizeIdx)
+    const finalizeIdx = commitBlock.indexOf('await finalizeCallback(ctx, {')
+    const after = commitBlock.slice(finalizeIdx)
     expect(finalizeIdx).toBeGreaterThan(-1)
     expect(after).not.toContain('synthInbound')
   })
 })
 
-describe('always-allow handler — durable hostd persistence', () => {
+describe('scope-commit — durable hostd persistence', () => {
   it('synthesizes a unified diff from the raw config text', () => {
-    expect(alwaysBlock).toContain('synthesizeAllowRuleDiff({')
-    expect(alwaysBlock).toContain("op: 'config_propose_edit'")
+    expect(commitBlock).toContain('synthesizeAllowRuleDiff({')
+    expect(commitBlock).toContain("op: 'config_propose_edit'")
   })
 
   it('reads the RAW config bytes (readFileSync), not the parsed config', () => {
-    // The diff context lines must byte-match the on-disk file, so we
-    // read literal bytes rather than re-serialising loadSwitchroomConfig.
-    expect(alwaysBlock).toContain('readFileSync(')
+    expect(commitBlock).toContain('readFileSync(')
   })
 
   it('passes a long timeout to tryHostdDispatch (apply+reconcile blocks)', () => {
-    expect(alwaysBlock).toContain('await tryHostdDispatch(agentName, req, 60_000)')
+    expect(commitBlock).toContain('await tryHostdDispatch(agentName, req, 60_000)')
   })
 
   it('registers + cleans up the single-tap correlation entry', () => {
-    expect(alwaysBlock).toContain('pendingAlwaysAllowCorrelations.set(correlationKey')
-    // Cleanup in a finally so it can never be replayed.
-    const finallyIdx = alwaysBlock.indexOf('} finally {')
-    const deleteIdx = alwaysBlock.indexOf('pendingAlwaysAllowCorrelations.delete(correlationKey)', finallyIdx)
+    expect(commitBlock).toContain('pendingAlwaysAllowCorrelations.set(correlationKey')
+    const finallyIdx = commitBlock.indexOf('} finally {')
+    const deleteIdx = commitBlock.indexOf('pendingAlwaysAllowCorrelations.delete(correlationKey)', finallyIdx)
     expect(finallyIdx).toBeGreaterThan(-1)
     expect(deleteIdx).toBeGreaterThan(finallyIdx)
   })
 
   it('treats E_CONFIG_EDIT_DISABLED specially (no legacy fallback, points at the flag)', () => {
-    expect(alwaysBlock).toContain('E_CONFIG_EDIT_DISABLED')
-    expect(alwaysBlock).toContain('hostd.config_edit_enabled')
+    expect(commitBlock).toContain('E_CONFIG_EDIT_DISABLED')
+    expect(commitBlock).toContain('hostd.config_edit_enabled')
   })
 })
 
-describe('always-allow handler — legacy fallback ONLY when hostd not-configured', () => {
+describe('scope-commit — legacy fallback ONLY when hostd not-configured', () => {
   it('falls back to switchroom agent grant only on not-configured', () => {
-    const notConfiguredIdx = alwaysBlock.indexOf("resp === 'not-configured'")
-    const grantIdx = alwaysBlock.indexOf("switchroomExec(['agent', 'grant'")
+    const notConfiguredIdx = commitBlock.indexOf("resp === 'not-configured'")
+    const grantIdx = commitBlock.indexOf("switchroomExec(['agent', 'grant'")
     expect(notConfiguredIdx).toBeGreaterThan(-1)
     expect(grantIdx).toBeGreaterThan(-1)
-    // The grant shellout lives AFTER the not-configured branch sets
-    // legacy=true (i.e. it is the fallback, not the primary path).
     expect(grantIdx).toBeGreaterThan(notConfiguredIdx)
   })
 
   it('emits the legacy-spawn deprecation warning on the not-configured path', () => {
-    expect(alwaysBlock).toContain("warnLegacySpawnIfHostdDisabled('always-allow')")
+    expect(commitBlock).toContain("warnLegacySpawnIfHostdDisabled('always-allow')")
   })
 
   it('verifies the legacy write landed via isRulePersisted', () => {
-    expect(alwaysBlock).toContain('isRulePersisted(allowList, rule.rule)')
-    expect(alwaysBlock).toContain('resolveAgentConfig(')
+    expect(commitBlock).toContain('isRulePersisted(allowList, chosen.rule)')
+    expect(commitBlock).toContain('resolveAgentConfig(')
   })
 
   it('legacy success messaging is honest about being the legacy path', () => {
-    expect(alwaysBlock).toContain('(legacy path)')
+    expect(commitBlock).toContain('(legacy path)')
   })
 })
 
-describe('always-allow handler — loud failure invariants', () => {
+describe('scope-commit — loud failure invariants', () => {
   it('failure text uses the ⚠️ warning marker, never a false ✅ success', () => {
-    expect(alwaysBlock).toContain('did NOT save')
-    expect(alwaysBlock).not.toContain('✅ Allowed (always-allow yaml edit failed')
+    expect(commitBlock).toContain('did NOT save')
+    expect(commitBlock).not.toContain('✅ Allowed (always-allow yaml edit failed')
   })
 
   it('captures a failure reason for the gateway log', () => {
-    expect(alwaysBlock).toContain('failReason')
-    expect(alwaysBlock).toContain('(err as Error).message')
+    expect(commitBlock).toContain('failReason')
+    expect(commitBlock).toContain('(err as Error).message')
   })
 })

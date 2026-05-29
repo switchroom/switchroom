@@ -23,7 +23,14 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { isRulePersisted, resolveAlwaysAllowRule } from '../permission-rule.js'
+import { isRulePersisted, resolveScopedAllowChoices } from '../permission-rule.js'
+
+/** The rule the handler dispatches when the operator taps a scope button. */
+const specificRule = (tool: string, input: string | undefined): string => {
+  const choices = resolveScopedAllowChoices(tool, input)
+  expect(choices).not.toBeNull()
+  return (choices!.specific ?? choices!.broad).rule
+}
 
 // ---------------------------------------------------------------------------
 // Core behavioral invariants
@@ -69,56 +76,50 @@ describe('isRulePersisted — success path', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Round-trip: resolveAlwaysAllowRule → isRulePersisted
-// Simulates the full handler flow: resolve the rule from a permission_request,
-// "grant" it (allow-list contains the resolved rule.rule), then verify.
+// Round-trip: resolveScopedAllowChoices → isRulePersisted
+// Simulates the full handler flow: resolve the scope the operator tapped,
+// "grant" it (allow-list contains the resolved rule), then verify.
 // Guards against normalization divergence between the value the handler
-// resolves and the value `agent grant` writes + the config reader returns.
+// dispatches and the value `agent grant`/hostd writes + the config reader
+// returns.
 // ---------------------------------------------------------------------------
 
 describe('rule round-trip through isRulePersisted', () => {
-  it('Skill tool: resolved rule persists correctly', () => {
-    const rule = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'garmin' }))
-    expect(rule).not.toBeNull()
-    // Simulate: allow-list now contains the rule that `agent grant` wrote.
-    expect(isRulePersisted([rule!.rule], rule!.rule)).toBe(true)
+  it('Skill tool: the specific (this-skill) rule persists correctly', () => {
+    const rule = specificRule('Skill', JSON.stringify({ skill: 'garmin' }))
     // Confirm the written form is `Skill(garmin)` — not a bare `Skill`.
-    expect(rule!.rule).toBe('Skill(garmin)')
+    expect(rule).toBe('Skill(garmin)')
+    expect(isRulePersisted([rule], rule)).toBe(true)
   })
 
   it('Skill tool: absent rule is detected', () => {
-    const rule = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'garmin' }))
-    expect(rule).not.toBeNull()
+    const rule = specificRule('Skill', JSON.stringify({ skill: 'garmin' }))
     // allow-list was not updated (silent grant failure).
-    expect(isRulePersisted([], rule!.rule)).toBe(false)
-    expect(isRulePersisted(['Skill'], rule!.rule)).toBe(false)
+    expect(isRulePersisted([], rule)).toBe(false)
+    expect(isRulePersisted(['Skill'], rule)).toBe(false)
   })
 
-  it('Bash tool: round-trips correctly', () => {
-    const rule = resolveAlwaysAllowRule('Bash', undefined)
-    expect(rule).not.toBeNull()
-    expect(rule!.rule).toBe('Bash')
-    expect(isRulePersisted(['Bash', 'Read'], rule!.rule)).toBe(true)
-    expect(isRulePersisted(['Read'], rule!.rule)).toBe(false)
+  it('Bash tool: the broad (any-command) rule round-trips correctly', () => {
+    const rule = resolveScopedAllowChoices('Bash', undefined)!.broad.rule
+    expect(rule).toBe('Bash')
+    expect(isRulePersisted(['Bash', 'Read'], rule)).toBe(true)
+    expect(isRulePersisted(['Read'], rule)).toBe(false)
   })
 
-  it('MCP tool: round-trips with exact namespaced form', () => {
+  it('MCP tool: the specific (this-action) rule round-trips with exact form', () => {
     const toolName = 'mcp__garmin__list_activities'
-    const rule = resolveAlwaysAllowRule(toolName, undefined)
-    expect(rule).not.toBeNull()
-    expect(rule!.rule).toBe(toolName)
-    expect(isRulePersisted([toolName], rule!.rule)).toBe(true)
-    expect(isRulePersisted(['mcp__garmin__read_activity'], rule!.rule)).toBe(false)
+    const rule = specificRule(toolName, undefined)
+    expect(rule).toBe(toolName)
+    expect(isRulePersisted([toolName], rule)).toBe(true)
+    expect(isRulePersisted(['mcp__garmin__read_activity'], rule)).toBe(false)
   })
 
   it('multiple Skill tools do not cross-contaminate', () => {
-    const garmin = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'garmin' }))
-    const mail = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail' }))
-    expect(garmin).not.toBeNull()
-    expect(mail).not.toBeNull()
+    const garmin = specificRule('Skill', JSON.stringify({ skill: 'garmin' }))
+    const mail = specificRule('Skill', JSON.stringify({ skill: 'mail' }))
     // Allow-list only has garmin's rule.
-    const allowList = [garmin!.rule]
-    expect(isRulePersisted(allowList, garmin!.rule)).toBe(true)
-    expect(isRulePersisted(allowList, mail!.rule)).toBe(false)
+    const allowList = [garmin]
+    expect(isRulePersisted(allowList, garmin)).toBe(true)
+    expect(isRulePersisted(allowList, mail)).toBe(false)
   })
 })

@@ -32,8 +32,10 @@ export interface PermissionEvent {
    * tapped "Always allow" still hit the popup, because Claude Code reads
    * `.claude/settings.json` once at boot.
    *
-   * Format matches `resolveAlwaysAllowRule`'s output: bare tool name
-   * (`Edit`), `Skill(<name>)`, or `mcp__<server>__<tool>`.
+   * Format matches `resolveScopedAllowChoices`' output: bare tool name
+   * (`Edit`), scoped (`Edit(<path>)` / `Bash(<tok>:*)` / `Skill(<name>)`),
+   * exact MCP tool (`mcp__<server>__<tool>`), or server wildcard
+   * (`mcp__<server>__*`).
    */
   rule?: string;
 }

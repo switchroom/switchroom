@@ -1,228 +1,111 @@
+/**
+ * Tests for the human-readable permission card text (#186, #1790, and
+ * the scoped-card work). Three surfaces:
+ *   - `naturalAction` — the verb-phrase after "wants to" (no tool ids).
+ *   - `formatPermissionCardBody` — the collapsed-view card body.
+ *   - `describeGrant` — the after-the-fact confirmation, phrased from
+ *     the *scope the operator chose*.
+ */
+
 import { describe, test, expect } from 'vitest'
-import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
+import {
+  naturalAction,
+  describeGrant,
+  formatPermissionCardBody,
+} from '../permission-title.js'
+import type { ScopeOption } from '../permission-rule.js'
 
-describe('summarizeToolForTitle (#186)', () => {
-  test('Skill: surfaces the skill name in brackets', () => {
-    const input = JSON.stringify({ skill: 'mail' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
+const opt = (rule: string): ScopeOption => ({ rule, buttonLabel: 'x', broad: false })
+
+describe('naturalAction — built-in tools', () => {
+  test('file tools surface the basename', () => {
+    const input = JSON.stringify({ file_path: '/a/b/server.ts' })
+    expect(naturalAction('Edit', input)).toBe('edit: server.ts')
+    expect(naturalAction('Write', input)).toBe('write: server.ts')
+    expect(naturalAction('Read', input)).toBe('read: server.ts')
   })
 
-  test('Bash: truncates long commands', () => {
-    const input = JSON.stringify({
-      command: 'find /var/log -name "*.log" -mtime -1 -exec gzip {} \\;',
-    })
-    const out = summarizeToolForTitle('Bash', input)
-    expect(out.startsWith('Bash: ')).toBe(true)
-    expect(out.length).toBeLessThanOrEqual(60)
-    expect(out.endsWith('…')).toBe(true)
+  test('file tools fall back to a generic phrase without a path', () => {
+    expect(naturalAction('Edit', undefined)).toBe('edit files')
+    expect(naturalAction('Write', JSON.stringify({ x: 1 }))).toBe('write files')
   })
 
-  test('Read/Edit/Write: shows basename only', () => {
-    const input = JSON.stringify({ file_path: '/long/absolute/path/to/server.ts' })
-    expect(summarizeToolForTitle('Read', input)).toBe('Read: server.ts')
-    expect(summarizeToolForTitle('Edit', input)).toBe('Edit: server.ts')
-    expect(summarizeToolForTitle('Write', input)).toBe('Write: server.ts')
+  test('Bash surfaces a truncated command', () => {
+    const out = naturalAction('Bash', JSON.stringify({ command: 'ls /tmp' }))
+    expect(out).toBe('run: ls /tmp')
   })
 
-  test('Glob/Grep: surfaces the pattern', () => {
-    const input = JSON.stringify({ pattern: '**/*.ts' })
-    expect(summarizeToolForTitle('Glob', input)).toBe('Glob: **/*.ts')
-    expect(summarizeToolForTitle('Grep', input)).toBe('Grep: **/*.ts')
+  test('Bash collapses whitespace and truncates long commands', () => {
+    const long = naturalAction(
+      'Bash',
+      JSON.stringify({ command: 'find /var/log -name "*.log" -mtime -1 -exec gzip {} \\;' }),
+    )
+    expect(long.startsWith('run: ')).toBe(true)
+    expect(long.endsWith('…')).toBe(true)
   })
 
-  test('WebFetch: surfaces the URL', () => {
-    const input = JSON.stringify({ url: 'https://example.com/some/page' })
-    expect(summarizeToolForTitle('WebFetch', input)).toBe(
-      'WebFetch: https://example.com/some/page',
+  test('Skill names the skill', () => {
+    expect(naturalAction('Skill', JSON.stringify({ skill: 'mail' }))).toBe('use the mail skill')
+    expect(naturalAction('Skill', undefined)).toBe('use a skill')
+  })
+
+  test('search / fetch tools surface their query or url', () => {
+    expect(naturalAction('Grep', JSON.stringify({ pattern: '**/*.ts' }))).toBe('search files for: **/*.ts')
+    expect(naturalAction('WebSearch', JSON.stringify({ query: 'tide times' }))).toBe('search the web for: tide times')
+    expect(naturalAction('WebFetch', JSON.stringify({ url: 'https://x.com' }))).toBe('fetch a web page: https://x.com')
+  })
+
+  test('agent-ish tools read as plain phrases', () => {
+    expect(naturalAction('Task', undefined)).toBe('dispatch a sub-agent')
+    expect(naturalAction('TodoWrite', undefined)).toBe('update its task list')
+    expect(naturalAction('ExitPlanMode', undefined)).toBe('exit plan mode')
+  })
+
+  test('unknown tool falls back to "use <name>"', () => {
+    expect(naturalAction('SomeCustomTool', undefined)).toBe('use SomeCustomTool')
+  })
+})
+
+describe('naturalAction — MCP tools', () => {
+  test('curated internal tool reads as a bare verb-phrase', () => {
+    expect(naturalAction('mcp__agent-config__skill_list', undefined)).toBe(
+      'list its own installed skills',
     )
   })
 
-  test('falls back to bare toolName for unrecognised tools', () => {
-    expect(summarizeToolForTitle('SomeCustomTool', JSON.stringify({ x: 1 }))).toBe(
-      'SomeCustomTool',
-    )
+  test('curated external tool gets a "(Server)" tag', () => {
+    expect(naturalAction('mcp__perplexity__search', undefined)).toBe('search the web (Perplexity)')
   })
 
-  test('falls back to bare toolName when input_preview is malformed', () => {
-    expect(summarizeToolForTitle('Skill', 'not-json')).toBe('Skill')
-    expect(summarizeToolForTitle('Skill', '')).toBe('Skill')
-    expect(summarizeToolForTitle('Skill', undefined)).toBe('Skill')
+  test('uncurated internal tool de-snakes the verb', () => {
+    expect(naturalAction('mcp__hostd__do_thing', undefined)).toBe('do thing')
   })
 
-  test('falls back to bare toolName for non-Skill tools when expected key is missing', () => {
-    const input = JSON.stringify({ unrelated: 'x' })
-    // Bash has no first-arg fallback (its only identifying field is command).
-    expect(summarizeToolForTitle('Bash', input)).toBe('Bash')
-  })
-
-  // #1790 — the prior contract was "fall back to bare toolName when no
-  // skill-name key matched"; that produced operator-hostile cards like
-  // `🔐 Permission: Skill` with zero context. The Skill summarizer now
-  // tries `command`, then a first-scalar-arg hint, before giving up.
-  test('Skill: when no skill-name key matches, falls back to command field (#1790)', () => {
-    const input = JSON.stringify({ command: 'gen calendar event' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill: gen calendar event')
-  })
-
-  test('Skill: when no skill-name and no command, surfaces the first scalar arg (#1790)', () => {
-    const input = JSON.stringify({ unrelated: 'x' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (unrelated: x)')
-  })
-
-  test('Skill: skips routing-only keys when surfacing first scalar arg (#1790)', () => {
-    // chat_id / message_thread_id / request_id never help an operator
-    // decide; the helper skips them and finds the next useful field.
-    const input = JSON.stringify({
-      chat_id: '12345',
-      message_thread_id: '42',
-      topic: 'morning summary',
-    })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (topic: morning summary)')
-  })
-
-  test('Bash: collapses internal whitespace before truncating', () => {
-    const input = JSON.stringify({
-      command: 'echo  \t  hello\nworld',
-    })
-    expect(summarizeToolForTitle('Bash', input)).toBe('Bash: echo hello world')
-  })
-
-  test('NotebookEdit: prefers notebook_path when file_path absent', () => {
-    const input = JSON.stringify({ notebook_path: '/work/analysis.ipynb' })
-    expect(summarizeToolForTitle('NotebookEdit', input)).toBe(
-      'NotebookEdit: analysis.ipynb',
-    )
-  })
-
-  // Skill-name fallbacks — the user reported a `🔐 Permission: Skill`
-  // popup with no brackets. Pre-fix only `input.skill` was checked;
-  // these tests pin the wider field set so the skill name lands in
-  // brackets even when Claude Code passes the input in a different
-  // shape.
-  test('Skill: falls back to skill_name field', () => {
-    const input = JSON.stringify({ skill_name: 'calendar' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (calendar)')
-  })
-
-  test('Skill: falls back to skillName field', () => {
-    const input = JSON.stringify({ skillName: 'garmin' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (garmin)')
-  })
-
-  test('Skill: falls back to bare name field', () => {
-    const input = JSON.stringify({ name: 'home-assistant' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (home-assistant)')
-  })
-
-  test('Skill: lifts basename out of a path field', () => {
-    const input = JSON.stringify({ path: 'skills/coolify/SKILL.md' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (coolify)')
-  })
-
-  test('Skill: lifts basename out of a skill_path directory', () => {
-    const input = JSON.stringify({ skill_path: '/x/.switchroom/skills/mail' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
-  })
-
-  test('Skill: original `skill` field still wins when multiple are present', () => {
-    const input = JSON.stringify({ skill: 'mail', name: 'wrong' })
-    expect(summarizeToolForTitle('Skill', input)).toBe('Skill (mail)')
-  })
-
-  test('MCP curated: agent-config tools render as human verb-phrases (#1215)', () => {
-    expect(summarizeToolForTitle('mcp__agent-config__skill_list', undefined)).toBe(
-      'List its own installed skills',
-    )
-    expect(summarizeToolForTitle('mcp__agent-config__cron_list', undefined)).toBe(
-      'List its own scheduled tasks',
-    )
-    expect(summarizeToolForTitle('mcp__agent-config__peers_list', undefined)).toBe(
-      'List the other agents on this instance',
-    )
-  })
-
-  test('MCP curated: hostd tools render as human verb-phrases (#1215)', () => {
-    expect(summarizeToolForTitle('mcp__hostd__agent_logs', undefined)).toBe(
-      "Read another agent's container logs",
-    )
-    expect(summarizeToolForTitle('mcp__hostd__agent_exec', undefined)).toBe(
-      'Run a read-only inspection inside another agent',
-    )
-  })
-
-  test('MCP fallback: unknown mcp tool renders as `<server>: <verb with spaces>`', () => {
-    expect(summarizeToolForTitle('mcp__some-server__do_thing', undefined)).toBe(
-      'some-server: do thing',
-    )
-  })
-
-  test('MCP malformed: bare mcp__ prefix without __<server>__<verb> shape is left alone', () => {
-    expect(summarizeToolForTitle('mcp__bad', undefined)).toBe('mcp__bad')
-  })
-
-  // #1790 — append a `(key: value)` hint when an MCP tool's preview
-  // carries a scalar arg. Gives operators context on curated and
-  // uncurated MCP tools alike without an expand tap.
-  test('MCP curated tool appends first-arg hint when input_preview present (#1790)', () => {
-    const input = JSON.stringify({ key: 'coolify/api-token' })
-    expect(summarizeToolForTitle('mcp__agent-config__config_get', input)).toBe(
-      'Read its own merged config (key: coolify/api-token)',
-    )
-  })
-
-  test('MCP uncurated tool appends first-arg hint (#1790)', () => {
-    const input = JSON.stringify({ folder_id: 'abc123' })
-    expect(summarizeToolForTitle('mcp__google-workspace__list_files', input)).toBe(
-      'google-workspace: list files (folder_id: abc123)',
-    )
-  })
-
-  test('MCP arg hint skips routing-only keys (#1790)', () => {
-    const input = JSON.stringify({ chat_id: '12345', query: 'budget Q3' })
-    expect(summarizeToolForTitle('mcp__hindsight__recall', input)).toBe(
-      'Recall relevant memories (query: budget Q3)',
+  test('uncurated external tool de-snakes and tags the server', () => {
+    expect(naturalAction('mcp__google-workspace__list_files', undefined)).toBe(
+      'list files (Google Workspace)',
     )
   })
 })
 
-// ──────────────────────────────────────────────────────────────────────
-// #1790 — formatPermissionCardBody: multi-line collapsed-view body
-// for approval cards. Mirrors the vault_request_access card layout.
-// ──────────────────────────────────────────────────────────────────────
-
-describe('formatPermissionCardBody (#1790)', () => {
-  test('renders agent · summary, then a why-line, when both are present', () => {
+describe('formatPermissionCardBody', () => {
+  test('renders "<Agent> wants to <action>" + why line', () => {
     const body = formatPermissionCardBody({
-      toolName: 'Skill',
-      inputPreview: JSON.stringify({ skill: 'mail' }),
-      description: 'Compose the morning brief',
-      agentName: 'clerk',
-    })
-    expect(body).toBe(
-      [
-        '🔐 <b>clerk</b> · Skill (mail)',
-        'why: <i>Compose the morning brief</i>',
-      ].join('\n'),
-    )
-  })
-
-  test('renders "why: <i>not provided</i>" when description is missing', () => {
-    const body = formatPermissionCardBody({
-      toolName: 'Bash',
-      inputPreview: JSON.stringify({ command: 'ls /tmp' }),
-      description: undefined,
+      toolName: 'Edit',
+      inputPreview: JSON.stringify({ file_path: '/work/supplement-log.md' }),
+      description: 'logging today\'s lifts',
       agentName: 'gymbro',
     })
     expect(body).toBe(
-      ['🔐 <b>gymbro</b> · Bash: ls /tmp', 'why: <i>not provided</i>'].join('\n'),
+      ['🔐 <b>Gymbro</b> wants to edit: supplement-log.md', 'why: <i>logging today\'s lifts</i>'].join('\n'),
     )
   })
 
-  test('renders "not provided" when description is whitespace-only', () => {
+  test('shows "not provided" when description is missing or whitespace', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp' }),
-      description: '   \n  ',
+      description: '   \n ',
       agentName: 'gymbro',
     })
     expect(body).toContain('why: <i>not provided</i>')
@@ -235,10 +118,10 @@ describe('formatPermissionCardBody (#1790)', () => {
       description: 'do the thing',
       agentName: null,
     })
-    expect(body).toBe(['🔐 Skill (mail)', 'why: <i>do the thing</i>'].join('\n'))
+    expect(body).toBe(['🔐 Use the mail skill', 'why: <i>do the thing</i>'].join('\n'))
   })
 
-  test('HTML-escapes < > & in agentName / summary / description', () => {
+  test('HTML-escapes <, >, & in agentName / action / description', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'echo "a < b && c > d"' }),
@@ -248,28 +131,22 @@ describe('formatPermissionCardBody (#1790)', () => {
     expect(body).toContain('&lt;test&gt;')
     expect(body).toContain('&amp;')
     expect(body).not.toContain('<test>')
-    // The literal "<i>not provided</i>" and "<b>...</b>" wrapping tags
-    // around legitimate fields must survive untouched — only the
-    // user-supplied content is escaped.
     expect(body).toContain('<b>')
     expect(body).toContain('<i>')
   })
 
   test('truncates a very long description with an ellipsis', () => {
-    const longWhy = 'x'.repeat(500)
     const body = formatPermissionCardBody({
       toolName: 'Skill',
       inputPreview: JSON.stringify({ skill: 'mail' }),
-      description: longWhy,
+      description: 'x'.repeat(500),
       agentName: 'clerk',
     })
-    // 240-char ceiling + trailing ellipsis
     expect(body).toContain('xxxx…</i>')
-    // First line still intact
-    expect(body.split('\n')[0]).toBe('🔐 <b>clerk</b> · Skill (mail)')
+    expect(body.split('\n')[0]).toBe('🔐 <b>Clerk</b> wants to use the mail skill')
   })
 
-  test('collapses internal whitespace in description so the layout stays one-line', () => {
+  test('collapses internal whitespace in the description', () => {
     const body = formatPermissionCardBody({
       toolName: 'Skill',
       inputPreview: JSON.stringify({ skill: 'mail' }),
@@ -277,5 +154,42 @@ describe('formatPermissionCardBody (#1790)', () => {
       agentName: 'clerk',
     })
     expect(body).toContain('why: <i>first second paragraph</i>')
+  })
+})
+
+describe('describeGrant — phrased from the chosen scope', () => {
+  test('MCP server wildcard → "use any <Server> tool"', () => {
+    expect(describeGrant('mcp__perplexity__search', undefined, opt('mcp__perplexity__*'))).toBe(
+      'use any Perplexity tool',
+    )
+  })
+
+  test('scoped file rule → "edit <basename>"', () => {
+    expect(describeGrant('Edit', undefined, opt('Edit(/work/supplement-log.md)'))).toBe(
+      'edit supplement-log.md',
+    )
+    expect(describeGrant('Read', undefined, opt('Read(/a/b/notes.md)'))).toBe('read notes.md')
+  })
+
+  test('scoped Bash rule → "run <tok> commands"', () => {
+    expect(describeGrant('Bash', undefined, opt('Bash(npm:*)'))).toBe('run npm commands')
+  })
+
+  test('scoped Skill rule → "use the <name> skill"', () => {
+    expect(describeGrant('Skill', undefined, opt('Skill(mail)'))).toBe('use the mail skill')
+  })
+
+  test('bare category rules read as "any" grants', () => {
+    expect(describeGrant('Edit', undefined, opt('Edit'))).toBe('edit any file')
+    expect(describeGrant('Write', undefined, opt('Write'))).toBe('write any file')
+    expect(describeGrant('Read', undefined, opt('Read'))).toBe('read any file')
+    expect(describeGrant('Bash', undefined, opt('Bash'))).toBe('run any command')
+    expect(describeGrant('Skill', undefined, opt('Skill'))).toBe('use any skill')
+  })
+
+  test('exact MCP tool grant falls back to the natural action', () => {
+    expect(describeGrant('mcp__perplexity__search', undefined, opt('mcp__perplexity__search'))).toBe(
+      'search the web (Perplexity)',
+    )
   })
 })
