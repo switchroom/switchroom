@@ -1,5 +1,22 @@
 # Changelog
 
+## unreleased — activity feed is the unconditional default (#1984)
+
+The live tool-activity feed (#1982) is now **on for every agent by
+default**. The `SWITCHROOM_DRAFT_MIRROR` env flag and its kill-switch
+are removed: the flag existed to guard the *earlier* draft-slot design
+that contended with the answer-stream, and #1982 already moved the feed
+onto a separate in-place edited message (reply-quoted), so there is
+nothing left for the kill-switch to protect. New agents and fresh
+installs get the feed with zero config.
+
+The deprecated legacy verb-count summary lane ("Ran 5 commands" —
+`register`/`formatSummary`/`registerAndRender`/`verbForTool`) is deleted;
+the feed renderers (`appendActivityLabel`/`renderActivityFeed` et al.)
+remain. The feed is driven by the real-time PreToolUse `tool_label`
+sidecar event, clears on the first reply (hand-off) and again at
+turn_end (no-reply safety net).
+
 ## v0.14.8 — pin claude CLI to the thinking-block-fix build; durable approvals; activity feed
 
 Bundles the claude-CLI thinking-block-400 fix, two reliability fixes
