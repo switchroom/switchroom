@@ -7294,9 +7294,15 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
-      // Unlike the legacy tool_use path, do NOT gate on replyCalled — the
-      // whole point is to show activity even when a reply raced ahead of
-      // the (lagged) transcript. The feed clears at turn_end.
+      // Stop feeding once the reply has landed. The first reply is the
+      // hand-off: `clearActivitySummary` deletes the feed so the answer is
+      // the authoritative surface (the validated clean hand-off). Without
+      // this gate a tool called after the reply would re-`sendMessage` a
+      // fresh feed message below the answer — a delete-then-resend flicker.
+      // Safe ordering: `tool_label` is real-time (PreToolUse, ~250ms) while
+      // `replyCalled` is set from the lagged reply tool_use, so a genuinely
+      // pre-reply label virtually always arrives before the flag flips.
+      if (turn.replyCalled) return
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
         turn.activityPendingRender = rendered
@@ -7576,11 +7582,12 @@ function handleSessionEvent(ev: SessionEvent): void {
         clearTimeout(turn.orphanedReplyTimeoutId)
         turn.orphanedReplyTimeoutId = null
       }
-      // DRAFT_MIRROR: the live activity feed runs through the whole turn
-      // (it is NOT cleared on the first reply, unlike the legacy summary)
-      // so an early/mid-turn reply can't wipe it. Clear it here, at the
-      // real end of the turn — the ephemeral compose-area draft goes away
-      // once the work is actually done.
+      // DRAFT_MIRROR: clear the activity feed at the real end of the turn.
+      // This is the no-reply safety net — a turn that ends without ever
+      // calling reply (the answer is delivered by turn-flush / silent-end)
+      // still has its feed removed. On a normal turn the feed was already
+      // cleared at the first reply (the hand-off); clearActivitySummary is
+      // idempotent, so the second call is a no-op.
       if (DRAFT_MIRROR_ENABLED && turn != null) {
         clearActivitySummary(turn)
       }
