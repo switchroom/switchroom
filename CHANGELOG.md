@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.14.12 — Web service container (dashboard + webhook receiver) (#1992)
+
+Phase 3 of the Docker-native webhook work. Packages the `switchroom web`
+server — the dashboard **and** the GitHub-webhook receiver — as an
+image-pinned container (`switchroom-web`) in its own compose project,
+replacing the legacy `switchroom-web.service` systemd unit that ran the
+server straight off the shared source checkout. That arrangement was
+fragile: another agent's worktree activity could delete the hoisted root
+`node_modules` out from under the long-lived process, crash-looping the
+next restart on ENOENT. Pinning it to an image makes it immune to repo
+churn and brings the last systemd holdout in line with the rest of the
+fleet.
+
+New `switchroom webd <install|status|uninstall>` lifecycle (mirrors
+`switchroom hostd`). Three load-bearing properties of the compose shape,
+each forced by what the web service is:
+
+- **`network_mode: host`** — the server must own host loopback
+  `127.0.0.1:8080`, where the cloudflared tunnel (webhooks) and
+  `tailscale serve` (dashboard) both reach it; the dashboard CSRF gate
+  trusts the `Tailscale-User-Login` header only on loopback (PR #1380).
+- **runs as the operator uid** — the receiver's forward to each agent's
+  `webhook.sock` is peercred-gated to `{agent uid, operator uid}`; any
+  other uid is silently `503`'d. `webd install` refuses to write a
+  root-uid compose so the silent-breakage class can't recur.
+- **no docker socket, no added caps, `no-new-privileges`** — minimal
+  surface for the one internet-facing component.
+
+`switchroom update` refreshes the container only when the new
+`web_service.managed` flag is `true` (**default off**), so existing
+systemd-mode installs are not surprised by a container takeover of
+loopback `:8080`. The systemd unit is intentionally left in place —
+cutover is a deliberate manual step, and rollback is seconds. See
+`docs/webhook-ingest.md` § Deployment.
+
 ## v0.14.11 — Cloudflare-only webhook edge lock (#1989)
 
 Phase 2 of the Docker-native webhook work. Adds a per-agent opt-in
