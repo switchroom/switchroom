@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.14 — Handoff banner flag actually works on docker (#1997)
+
+`session_continuity.show_handoff_line: false` is meant to suppress the
+visible `↩️ Picked up where we left off …` line on the first reply after
+a restart. It has been a **silent no-op on every docker agent since
+v0.7**: the value reaches the agent only through start.sh, and the
+gateway — the sole consumer — is forked in the docker preamble's *outer*
+pass, *before* the export ran (the export lived in the inner tmux pass).
+The forked gateway never inherited the var, so the flag did nothing.
+
+The export now sits ahead of the runtime branch (still gated on
+`handoffEnabled`), so it covers the docker outer fork pass, the inner
+tmux pass, and the v0.6 non-docker path alike — mirroring the existing
+`TELEGRAM_STATE_DIR` hoist that solved the identical fork-ordering
+problem. A regression test pins the export ahead of the gateway fork and
+to exactly one occurrence. Serves **you-hold-the-leash**: a documented
+config field that silently does nothing erodes trust in the cascade.
+
 ## v0.14.13 — Readable, durable permission grants (#1994, #1995)
 
 Reworks the Telegram tool-approval card so a non-technical operator can
