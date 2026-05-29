@@ -723,6 +723,20 @@ export const TelegramChannelSchema = z
         "webhook_dispatch. Off by default for back-compat with host-runtime " +
         "installs. See docs/rfcs/webhook-via-gateway-socket.md.",
       ),
+    webhook_require_edge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Cloudflare-only edge lock: require the X-Switchroom-Edge header " +
+        "(injected by a Cloudflare Transform Rule on hooks.switchroom.ai) to " +
+        "match the operator's edge secret at ~/.switchroom/webhook-edge-secret " +
+        "before any HMAC verification; reject 403 otherwise. Proves the " +
+        "request entered through our Cloudflare edge — the per-agent HMAC " +
+        "alone can't (it proves body provenance, not network path). Stacks " +
+        "on the GitHub-IP WAF + per-agent HMAC. Fail-closed: when required " +
+        "but the secret file is missing/empty every request is rejected. Off " +
+        "by default. See docs/rfcs/webhook-cloudflare-edge-lock.md.",
+      ),
     // ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────
     // Per-agent override of the fleet-wide telegram.forum_chat_id.
     // When set, this agent owns its own supergroup with forum topics

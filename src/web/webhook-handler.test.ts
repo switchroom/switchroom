@@ -592,3 +592,83 @@ describe('handleWebhookIngest — viaGateway forward', () => {
     expect(result.status).toBe(503)
   })
 })
+
+describe('handleWebhookIngest — Cloudflare edge lock (requireEdge)', () => {
+  const EDGE = 'edge-shared-secret'
+
+  function withEdge(h: Headers, value?: string): Headers {
+    if (value !== undefined) h.set('x-switchroom-edge', value)
+    return h
+  }
+
+  it('matching edge header → proceeds to record (202)', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = withEdge(makeGithubHeaders(body, 'edge-ok'), EDGE)
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: true, edgeSecret: EDGE },
+      baseDeps(resolveAgentDir, 1000, { dedupStore: makeDedupStore(), rateLimiter: makeRateLimiter() }),
+    )
+    expect(result.status).toBe(202)
+  })
+
+  it('missing edge header → 403 before any HMAC work', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'edge-missing') // no x-switchroom-edge
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: true, edgeSecret: EDGE },
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(403)
+    expect(JSON.parse(result.body)).toMatchObject({ ok: false, error: 'forbidden' })
+  })
+
+  it('wrong edge header → 403', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = withEdge(makeGithubHeaders(body, 'edge-wrong'), 'not-the-secret')
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: true, edgeSecret: EDGE },
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(403)
+  })
+
+  it('fail-closed: requireEdge but edgeSecret null → 403 even with a header present', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = withEdge(makeGithubHeaders(body, 'edge-noconf'), EDGE)
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: true, edgeSecret: null },
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(403)
+  })
+
+  it('flag off: edge header ignored entirely, normal flow (202) even with no edge secret', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'edge-off')
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: false, edgeSecret: null },
+      baseDeps(resolveAgentDir, 1000, { dedupStore: makeDedupStore(), rateLimiter: makeRateLimiter() }),
+    )
+    expect(result.status).toBe(202)
+  })
+
+  it('edge gate runs before signature check: valid edge + bad HMAC → 401 (not 403)', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody()
+    const headers = new Headers()
+    headers.set('x-hub-signature-256', 'sha256=' + 'deadbeef'.repeat(8))
+    headers.set('x-github-delivery', 'edge-order')
+    headers.set('x-github-event', 'pull_request')
+    withEdge(headers, EDGE)
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), requireEdge: true, edgeSecret: EDGE },
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(401)
+  })
+})
