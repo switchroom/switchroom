@@ -183,6 +183,29 @@ export PATH="$HOME/.bun/bin:$PATH"
 # all land in these paths; survival across container restart is via the
 # /state/agent bind mount (HOME=/state/agent/home).
 export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"
+# claude is delivered ONLY by the agent image (/usr/local, root-owned,
+# version-pinned, rebuilt deliberately via `switchroom update`). The
+# persistent-HOME dirs above precede /usr/local/bin on PATH so agents
+# can install their own npm/pip tools — but that same precedence means
+# a stray `claude` in the writable, state-persisted npm prefix would
+# silently SHADOW the image's, surviving every restart and drifting the
+# fleet off the tested binary (this bit test-harness with a months-old
+# self-installed 2.1.139). DISABLE_AUTOUPDATER=1 stops claude's own
+# self-update, but can't undo a pre-existing or manual drop. So prune
+# any user-local claude at boot — narrowly, by name, leaving every
+# other user-installed package intact — guaranteeing `claude` always
+# resolves to the image binary. Idempotent; no-op when clean.
+for _stray_claude in \
+  "$HOME/.npm-global/bin/claude" \
+  "$HOME/.local/bin/claude" \
+  "$HOME/bin/claude"; do
+  if [ -e "$_stray_claude" ] || [ -L "$_stray_claude" ]; then
+    echo "start.sh: pruning user-local claude shadow at $_stray_claude (image binary is authoritative)" >&2
+    rm -f "$_stray_claude"
+  fi
+done
+rm -rf "$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code" 2>/dev/null || true
+unset _stray_claude
 export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
 # CLAUDE_CODE_OAUTH_TOKEN injection was removed with RFC H (auth-broker).
 # Claude reads .credentials.json directly; the broker is the sole writer

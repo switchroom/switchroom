@@ -82,6 +82,36 @@ describe("scaffoldAgent: start.sh content-aware regeneration (#879)", () => {
     expect(second.created).toContain(startShPath);
   });
 
+  it("prunes any user-local claude shadow at boot so the image binary is authoritative", () => {
+    const name = "pinned-agent";
+    const config = makeAgentConfig();
+    const switchroomConfig = makeSwitchroomConfig(name, config);
+
+    const res = scaffoldAgent(name, config, tmpDir, telegramConfig, switchroomConfig);
+    const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
+
+    // The persistent-HOME dirs precede /usr/local/bin on PATH (so agents
+    // can install their own npm/pip tools), which means a stray claude in
+    // the writable, state-persisted npm prefix would otherwise shadow the
+    // version-pinned image binary across every restart. start.sh must
+    // remove a user-local claude — by name, leaving other packages intact.
+    expect(startSh).toContain("$HOME/.npm-global/bin/claude");
+    expect(startSh).toContain("$HOME/.local/bin/claude");
+    expect(startSh).toContain("$HOME/bin/claude");
+    expect(startSh).toContain(
+      "$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code",
+    );
+    // The prune must come BEFORE claude is launched (start.sh later
+    // execs into tmux→bash→claude), i.e. before the CLAUDE_CONFIG_DIR
+    // export that anchors the runtime block.
+    expect(startSh.indexOf("pruning user-local claude shadow")).toBeGreaterThan(
+      0,
+    );
+    expect(startSh.indexOf("pruning user-local claude shadow")).toBeLessThan(
+      startSh.indexOf('export CLAUDE_CONFIG_DIR='),
+    );
+  });
+
   it("does NOT rewrite an existing start.sh when content already matches the template", () => {
     const name = "stable-agent";
     const config = makeAgentConfig();
