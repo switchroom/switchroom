@@ -1,9 +1,21 @@
 # RFC: Draft-stream mirror preview (model narration, ephemeral) + reply as commit
 
-**Status:** Draft
+**Status:** Implemented — flag retired
 **Author:** (agent, on behalf of operator)
 **Date:** 2026-05-28
 **Touches:** `telegram-plugin/gateway/gateway.ts`, `telegram-plugin/answer-stream.ts`, `telegram-plugin/tool-activity-summary.ts`, `telegram-plugin/session-tail.ts`
+
+> **Update (2026-05-29):** shipped as the real-time activity feed (#1982,
+> driven by the PreToolUse `tool_label` sidecar — see the PIVOT below).
+> The feed is now the **unconditional default**: the
+> `SWITCHROOM_DRAFT_MIRROR` env flag and its kill-switch (Phasing /
+> Kill-switch sections below) have been **removed**, and the legacy
+> verb-count activity-summary lane ("Ran 5 commands", Phase 4) is
+> **deleted**. The feed clears on first reply (hand-off) and at turn_end
+> (no-reply safety net); it rides an edited message, not the compose-area
+> draft, so it no longer contends with the answer-stream for the draft
+> slot. The phasing/kill-switch text below is retained as historical
+> design record only.
 
 ## Problem
 
