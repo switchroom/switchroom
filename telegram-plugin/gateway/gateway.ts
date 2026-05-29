@@ -361,8 +361,8 @@ import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
-import { summarizeToolForTitle, formatPermissionCardBody } from '../permission-title.js'
-import { resolveAlwaysAllowRule, isRulePersisted } from '../permission-rule.js'
+import { formatPermissionCardBody, describeGrant } from '../permission-title.js'
+import { resolveScopedAllowChoices, isRulePersisted } from '../permission-rule.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
   readClaudeJsonOverage,
@@ -3773,6 +3773,21 @@ const pendingPermissionBuffer = createPendingPermissionBuffer()
  * pre-2747 TTL sweep can reference it; ipcServer/pendingPermissionBuffer
  * are resolved at call-time, after module init.)
  */
+/**
+ * The default permission-card action row: ❌ Deny · ✅ Allow once ·
+ * 🔁 Always… (the last only when a meaningful always-rule exists).
+ * Tapping "🔁 Always…" swaps this row for the scope sub-menu; "← Back"
+ * rebuilds this row. callback_data stays tiny (verb + 5-char id) so we
+ * never approach Telegram's 64-byte ceiling.
+ */
+function buildPermissionActionRow(requestId: string, showAlways: boolean): InlineKeyboard {
+  const kb = new InlineKeyboard()
+    .text('❌ Deny', `perm:deny:${requestId}`)
+    .text('✅ Allow once', `perm:allow:${requestId}`)
+  if (showAlways) kb.text('🔁 Always…', `perm:always:${requestId}`)
+  return kb
+}
+
 function dispatchPermissionVerdict(ev: PermissionEvent): void {
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
   const delivered = ipcServer.sendToAgent(selfAgent, ev)
@@ -4106,37 +4121,25 @@ const ipcServer: IpcServer = createIpcServer({
     const { requestId, toolName, description, inputPreview } = msg
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     const access = loadAccess()
-    // #1790 — multi-line collapsed body so the operator can see what
-    // is being requested and why without tapping "See more". Mirrors
-    // the `vault_request_access` card layout (the gold standard).
-    // The detail (expanded `tool_name` / pretty `input_preview`)
-    // still surfaces on the See-more tap; this is the
-    // collapsed-view fix only. Sent with parse_mode=HTML below.
+    // Natural-language card body — a plain sentence ("Gymbro wants to
+    // edit: supplement-log.md" + a why-line), never a raw tool id.
+    // The operator sees what is being requested and why at a glance.
+    // Mirrors the `vault_request_access` card layout. Sent with
+    // parse_mode=HTML below.
     const text = formatPermissionCardBody({
       toolName,
       inputPreview,
       description,
       agentName: _client.agentName,
     })
-    // Build the keyboard. The "🔁 Always" button only appears when we
-    // can synthesize a meaningful allow-rule for this tool — for an
-    // unknown tool we'd write a useless rule (or worse, a rule that
-    // expanded to too much). resolveAlwaysAllowRule returns null in
-    // that case and we fall back to the legacy 3-button layout.
-    const alwaysRule = resolveAlwaysAllowRule(toolName, inputPreview)
-    const keyboard = new InlineKeyboard()
-      .text('See more', `perm:more:${requestId}`)
-      .text('✅ Allow', `perm:allow:${requestId}`)
-      .text('❌ Deny', `perm:deny:${requestId}`)
-    if (alwaysRule != null) {
-      // Second row — full-width label like "🔁 Always allow Skill(mail)"
-      // so the operator sees exactly what rule they're whitelisting
-      // before tapping. Truncate at Telegram's 64-byte callback_data
-      // ceiling defensively (long MCP tool names can push past it).
-      keyboard
-        .row()
-        .text(`🔁 Always allow ${alwaysRule.label}`, `perm:always:${requestId}`)
-    }
+    // Compact action row: ❌ Deny · ✅ Allow once · 🔁 Always… — the
+    // scope of an "always" grant stays hidden until the operator taps
+    // "🔁 Always…", which swaps the row for a scope choice (this file /
+    // any file ⚠️). The "🔁 Always…" button only appears when we can
+    // synthesize a meaningful rule for this tool; unknown tools get the
+    // two-button row only.
+    const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
+    const keyboard = buildPermissionActionRow(requestId, showAlways)
     // PR4b emitter sweep — supergroup-mode permission card routing.
     // Per CPO #3 the design is "turn-initiated requests follow the
     // conversation topic; background requests go to admin alias."
@@ -14871,7 +14874,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
 }
 
 // ─── Inline-button handler (permissions) ──────────────────────────────────
-// Handles `perm:(allow|deny|more):<id>` — permission request buttons
+// Handles `perm:(allow|deny|always|asn|asb|back):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
@@ -15246,33 +15249,40 @@ bot.on('callback_query:data', async ctx => {
   }
 
   // Permission request buttons.
-  const m = /^perm:(allow|deny|more|always):([a-km-z]{5})$/.exec(data)
+  const m = /^perm:(allow|deny|always|asn|asb|back):([a-km-z]{5})$/.exec(data)
   if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   if (!access.allowFrom.includes(senderId)) { await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {}); return }
   const [, behavior, request_id] = m
 
-  if (behavior === 'more') {
+  // "🔁 Always…" / "← Back" — toggle between the default action row and
+  // the scope sub-menu. Neither dispatches a verdict; the scope is only
+  // committed when the operator taps a scope button (asn / asb).
+  if (behavior === 'always' || behavior === 'back') {
     const details = pendingPermissions.get(request_id)
     if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
-    const { tool_name, description, input_preview } = details
-    let prettyInput: string
-    try { prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2) } catch { prettyInput = input_preview }
-    const expanded = `🔐 Permission: ${tool_name}\n\ntool_name: ${tool_name}\ndescription: ${description}\ninput_preview:\n${prettyInput}`
-    const expandedRule = resolveAlwaysAllowRule(tool_name, input_preview)
-    const expandedKeyboard = new InlineKeyboard()
-      .text('✅ Allow', `perm:allow:${request_id}`)
-      .text('❌ Deny', `perm:deny:${request_id}`)
-    if (expandedRule != null) {
-      expandedKeyboard.row().text(`🔁 Always allow ${expandedRule.label}`, `perm:always:${request_id}`)
+    let keyboard: InlineKeyboard
+    if (behavior === 'back') {
+      keyboard = buildPermissionActionRow(request_id, true)
+    } else {
+      const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
+      if (choices == null) {
+        await ctx.answerCallbackQuery({ text: 'No always-allow rule for this tool.' }).catch(() => {})
+        return
+      }
+      // Scope row: ← Back · [this thing] · [any thing] ⚠️ — the ⚠️
+      // rides on the broad option only. Scope stays hidden until now.
+      keyboard = new InlineKeyboard().text('← Back', `perm:back:${request_id}`)
+      if (choices.specific) keyboard.text(choices.specific.buttonLabel, `perm:asn:${request_id}`)
+      keyboard.text(`${choices.broad.buttonLabel} ⚠️`, `perm:asb:${request_id}`)
     }
-    await ctx.editMessageText(expanded, { reply_markup: expandedKeyboard }).catch(() => {})
+    await ctx.editMessageReplyMarkup({ reply_markup: keyboard }).catch(() => {})
     await ctx.answerCallbackQuery().catch(() => {})
     return
   }
 
-  if (behavior === 'always') {
+  if (behavior === 'asn' || behavior === 'asb') {
     // "🔁 Always allow" (#1977) — persist the resolved rule into the
     // agent's tools.allow in the DURABLE host config. The old path
     // shelled `switchroom agent grant` which wrote
@@ -15289,11 +15299,15 @@ bot.on('callback_query:data', async ctx => {
     //      apply+reconcile result.
     const details = pendingPermissions.get(request_id)
     if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
-    const rule = resolveAlwaysAllowRule(details.tool_name, details.input_preview)
-    if (rule == null) {
+    const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
+    if (choices == null) {
       await ctx.answerCallbackQuery({ text: 'Cannot synthesize an always-allow rule for this tool.' }).catch(() => {})
       return
     }
+    // asn → the narrow/specific scope (falls back to broad when the tool
+    // has no sub-scope); asb → the broad, whole-category scope.
+    const chosen = behavior === 'asn' ? (choices.specific ?? choices.broad) : choices.broad
+    const grantPhrase = describeGrant(details.tool_name, details.input_preview, chosen)
     const agentName = process.env.SWITCHROOM_AGENT_NAME
     if (!agentName) {
       await ctx.answerCallbackQuery({ text: 'Always-allow needs SWITCHROOM_AGENT_NAME — gateway is misconfigured.' }).catch(() => {})
@@ -15304,7 +15318,7 @@ bot.on('callback_query:data', async ctx => {
 
     // (2) Dispatch the in-flight permission verdict IMMEDIATELY — before
     // any host round-trip — so the turn never blocks on persistence.
-    // We carry the resolved `rule` so the bridge caches it for the rest
+    // We carry the chosen `rule` so the bridge caches it for the rest
     // of the session and auto-allows matching tool calls from sub-agents
     // (Task tool) + the parent without re-popping the prompt (#1138).
     // The rule is safe to cache regardless of whether the *durable*
@@ -15313,7 +15327,7 @@ bot.on('callback_query:data', async ctx => {
       type: 'permission',
       requestId: request_id,
       behavior: 'allow',
-      rule: rule.rule,
+      rule: chosen.rule,
     })
 
     // (3) Decide the persistence path. tryHostdDispatch returns
@@ -15331,14 +15345,14 @@ bot.on('callback_query:data', async ctx => {
       try {
         const cfgPath = process.env.SWITCHROOM_CONFIG ?? SWITCHROOM_CONFIG ?? findSwitchroomConfigFile()
         const raw = readFileSync(cfgPath, 'utf8')
-        return synthesizeAllowRuleDiff({ agentName, rule: rule.rule, configText: raw })
+        return synthesizeAllowRuleDiff({ agentName, rule: chosen.rule, configText: raw })
       } catch (err) {
         process.stderr.write(`telegram gateway: always-allow diff synth failed: ${(err as Error).message}\n`)
         return null
       }
     })()
 
-    const correlationKey = `${agentName}::${rule.rule}`
+    const correlationKey = `${agentName}::${chosen.rule}`
     try {
       if (unifiedDiff == null) {
         // Could not locate the agent block / read config → fall back to
@@ -15348,14 +15362,14 @@ bot.on('callback_query:data', async ctx => {
       } else {
         // Pre-register the single-tap correlation so hostd's callback
         // (request_config_approval) auto-approves WITHOUT a second card.
-        pendingAlwaysAllowCorrelations.set(correlationKey, { agentName, rule: rule.rule, unifiedDiff, createdAt: Date.now() })
+        pendingAlwaysAllowCorrelations.set(correlationKey, { agentName, rule: chosen.rule, unifiedDiff, createdAt: Date.now() })
         const req: HostdRequest = {
           v: 1,
           op: 'config_propose_edit',
           request_id: hostdRequestId('gw-always-allow'),
           args: {
             unified_diff: unifiedDiff,
-            reason: `Operator 'always allow' for ${rule.label}`,
+            reason: `Operator 'always allow': ${agentName} can ${grantPhrase}`,
             target_path: '/state/config/switchroom.yaml',
           },
         }
@@ -15368,7 +15382,7 @@ bot.on('callback_query:data', async ctx => {
         } else if (resp.result === 'completed') {
           durable = true
           process.stderr.write(
-            `telegram gateway: always-allow durable via hostd rule="${rule.rule}" agent=${agentName} (request_id=${request_id})\n`,
+            `telegram gateway: always-allow durable via hostd rule="${chosen.rule}" agent=${agentName} (request_id=${request_id})\n`,
           )
         } else {
           failReason = resp.error ?? `hostd ${resp.result}`
@@ -15386,20 +15400,20 @@ bot.on('callback_query:data', async ctx => {
         // landed. Honest messaging: "saved (legacy path)" on verify,
         // else the "did NOT save" warning.
         try {
-          switchroomExec(['agent', 'grant', agentName, rule.rule, '--no-restart'])
+          switchroomExec(['agent', 'grant', agentName, chosen.rule, '--no-restart'])
           try {
             const cfg = loadSwitchroomConfig()
             const rawAgent = cfg.agents?.[agentName]
             if (rawAgent) {
               const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
               const allowList: string[] = (resolved as { tools?: { allow?: string[] } }).tools?.allow ?? []
-              if (isRulePersisted(allowList, rule.rule)) {
+              if (isRulePersisted(allowList, chosen.rule)) {
                 durable = true // legacy path verified — durable on this host shape
                 process.stderr.write(
-                  `telegram gateway: always-allow added rule="${rule.rule}" agent=${agentName} via legacy grant (request_id=${request_id})\n`,
+                  `telegram gateway: always-allow added rule="${chosen.rule}" agent=${agentName} via legacy grant (request_id=${request_id})\n`,
                 )
               } else {
-                failReason = `rule "${rule.rule}" not found in resolved tools.allow after write — config location may have drifted`
+                failReason = `rule "${chosen.rule}" not found in resolved tools.allow after write — config location may have drifted`
                 process.stderr.write(
                   `telegram gateway: always-allow VERIFY FAILED: ${failReason} (request_id=${request_id})\n`,
                 )
@@ -15431,8 +15445,8 @@ bot.on('callback_query:data', async ctx => {
     const legacyNote = legacy && durable
     const ackText = ok
       ? (legacyNote
-          ? `🔁 Always allow ${rule.label} for ${agentName} (legacy path)`
-          : `🔁 Always allow ${rule.label} for ${agentName}`)
+          ? `✅ Saved. ${agentName} can now ${grantPhrase} without asking (legacy path).`
+          : `✅ Saved. ${agentName} can now ${grantPhrase} without asking.`)
       : (editLockHint
           ? `⚠️ Allowed for now — config edits are locked. Enable hostd.config_edit_enabled.`
           : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`)
@@ -15448,8 +15462,8 @@ bot.on('callback_query:data', async ctx => {
       : ''
     const editLabel = ok
       ? (legacyNote
-          ? `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — saved (legacy path); restart agent for full effect`
-          : `🔁 <b>Always allow ${escapeHtmlForTg(rule.label)}</b> for ${escapeHtmlForTg(agentName)} — saved; restart agent for full effect`)
+          ? `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking (legacy path); restart agent for full effect`
+          : `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking; restart agent for full effect`)
       : (editLockHint
           ? `⚠️ <b>Allowed for now — "always" did NOT save.</b> Config edits are locked; enable <code>hostd.config_edit_enabled</code>.`
           : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`)
@@ -15469,13 +15483,11 @@ bot.on('callback_query:data', async ctx => {
   // Forward permission decision to connected bridges
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  // HTML-escape the source text — same hazard as the `always` and
-  // recent-denial paths above. The original permission card was
-  // posted with plain text (`gateway.ts:2828` — `🔐 Permission:
-  // <toolName>`), but the expanded form via `behavior === 'more'`
-  // (this same handler, line ~11471) appends claude-supplied
-  // `description` and `input_preview` strings that frequently contain
-  // raw `<`/`>`/`&` (shell commands, JSON nested in JSON, etc). Mixing
+  // HTML-escape the source text — same hazard as the scope-commit and
+  // recent-denial paths above. The permission card body
+  // (formatPermissionCardBody) appends claude-supplied `description`
+  // and `input_preview` strings that frequently contain raw
+  // `<`/`>`/`&` (shell commands, JSON nested in JSON, etc). Mixing
   // a plain-text edit with `parseMode: 'HTML'` is the safe direction:
   // escaped baseText round-trips visually as plain text; the appended
   // status line carries our chosen styling cleanly.

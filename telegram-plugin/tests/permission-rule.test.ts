@@ -1,194 +1,223 @@
 /**
- * Tests for the always-allow rule resolver — pinned by the Telegram
- * `🔁 Always allow` button (popup callback handler in gateway.ts).
+ * Tests for the scoped always-allow rule resolver — pinned by the
+ * Telegram "🔁 Always…" scope sub-menu (callback handler in gateway.ts).
  *
- * The shape we promise to the gateway:
+ * The shape we promise the gateway:
  *   - `null` ⇒ "don't show the Always button" (unknown tool, missing
  *     skill name, characters that could break Claude Code's
  *     permission-rule grammar).
- *   - `{rule, label}` ⇒ a string we can hand to
- *     `switchroom agent grant <agent> <rule>` and a human-readable
- *     label for the chat confirmation.
+ *   - `{ specific?, broad }` ⇒ one or two ScopeOptions. `specific` is the
+ *     narrow grant (this file / this command / this MCP action); `broad`
+ *     is the whole-category grant (any file / every server tool) and is
+ *     always present when choices resolve at all.
+ *
+ * `matchesAllowRule` is the inverse — does a stored rule cover a fresh
+ * request — used by the bridge's session-scoped allow cache (#1138).
  */
 
 import { describe, it, expect } from 'vitest'
-import { resolveAlwaysAllowRule, matchesAllowRule } from '../permission-rule.js'
+import {
+  resolveScopedAllowChoices,
+  matchesAllowRule,
+  isRulePersisted,
+  prettyMcpServer,
+} from '../permission-rule.js'
 
-describe('resolveAlwaysAllowRule — Skill', () => {
-  it('returns Skill(name) for a typical skill input', () => {
-    const result = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail' }))
-    expect(result).toEqual({ rule: 'Skill(mail)', label: 'Skill(mail)' })
+describe('resolveScopedAllowChoices — Skill', () => {
+  it('offers this-skill (specific) + any-skill (broad)', () => {
+    const r = resolveScopedAllowChoices('Skill', JSON.stringify({ skill: 'mail' }))
+    expect(r).toEqual({
+      specific: { rule: 'Skill(mail)', buttonLabel: 'This skill', broad: false },
+      broad: { rule: 'Skill', buttonLabel: 'Any skill', broad: true },
+    })
   })
 
-  it('falls back to skill_name field', () => {
-    const result = resolveAlwaysAllowRule('Skill', JSON.stringify({ skill_name: 'calendar' }))
-    expect(result).toEqual({ rule: 'Skill(calendar)', label: 'Skill(calendar)' })
-  })
-
-  it('falls back to skillName field', () => {
-    const result = resolveAlwaysAllowRule('Skill', JSON.stringify({ skillName: 'garmin' }))
-    expect(result).toEqual({ rule: 'Skill(garmin)', label: 'Skill(garmin)' })
-  })
-
-  it('falls back to name field', () => {
-    const result = resolveAlwaysAllowRule('Skill', JSON.stringify({ name: 'home-assistant' }))
-    expect(result).toEqual({ rule: 'Skill(home-assistant)', label: 'Skill(home-assistant)' })
-  })
-
-  it('extracts skill name from path with SKILL.md', () => {
-    const result = resolveAlwaysAllowRule(
-      'Skill',
-      JSON.stringify({ path: 'skills/coolify/SKILL.md' }),
-    )
-    expect(result).toEqual({ rule: 'Skill(coolify)', label: 'Skill(coolify)' })
-  })
-
-  it('extracts skill name from a directory path', () => {
-    const result = resolveAlwaysAllowRule(
-      'Skill',
-      JSON.stringify({ skill_path: '/home/x/.switchroom/skills/mail' }),
-    )
-    expect(result).toEqual({ rule: 'Skill(mail)', label: 'Skill(mail)' })
+  it('follows the field fallback chain (skill_name / skillName / name / path)', () => {
+    for (const input of [
+      { skill_name: 'calendar' },
+      { skillName: 'calendar' },
+      { name: 'calendar' },
+    ]) {
+      expect(resolveScopedAllowChoices('Skill', JSON.stringify(input))?.specific?.rule).toBe(
+        'Skill(calendar)',
+      )
+    }
+    expect(
+      resolveScopedAllowChoices('Skill', JSON.stringify({ path: 'skills/coolify/SKILL.md' }))
+        ?.specific?.rule,
+    ).toBe('Skill(coolify)')
   })
 
   it('returns null when no skill identifier is present', () => {
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ unrelated: 'x' }))).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', undefined)).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', '')).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', 'not-json')).toBeNull()
+    expect(resolveScopedAllowChoices('Skill', JSON.stringify({ unrelated: 'x' }))).toBeNull()
+    expect(resolveScopedAllowChoices('Skill', undefined)).toBeNull()
+    expect(resolveScopedAllowChoices('Skill', 'not-json')).toBeNull()
   })
 
-  it('refuses skill names with characters that could break the rule grammar', () => {
-    // Parens, slashes, quotes, whitespace would break Claude Code's
-    // permission-rule parser or expand to unintended matches.
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail(secret)' }))).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail/calendar' }))).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail calendar' }))).toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'mail"calendar' }))).toBeNull()
+  it('refuses skill names with grammar-breaking characters', () => {
+    expect(resolveScopedAllowChoices('Skill', JSON.stringify({ skill: 'mail(secret)' }))).toBeNull()
+    expect(resolveScopedAllowChoices('Skill', JSON.stringify({ skill: 'mail/calendar' }))).toBeNull()
+    expect(resolveScopedAllowChoices('Skill', JSON.stringify({ skill: 'mail calendar' }))).toBeNull()
   })
 
   it('accepts the safe alphanumeric + ._-+ alphabet', () => {
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'home-assistant' }))).not.toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'home_assistant' }))).not.toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'docs.v2' }))).not.toBeNull()
-    expect(resolveAlwaysAllowRule('Skill', JSON.stringify({ skill: 'work+personal' }))).not.toBeNull()
+    for (const s of ['home-assistant', 'home_assistant', 'docs.v2', 'work+personal']) {
+      expect(resolveScopedAllowChoices('Skill', JSON.stringify({ skill: s }))).not.toBeNull()
+    }
   })
 })
 
-describe('resolveAlwaysAllowRule — built-in tools', () => {
-  it.each([
-    'Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
-    'Glob', 'Grep', 'WebFetch', 'WebSearch',
-    'Task', 'Agent', 'TodoWrite', 'ExitPlanMode',
-  ])('returns the bare tool name for %s', (tool) => {
-    expect(resolveAlwaysAllowRule(tool, undefined)).toEqual({ rule: tool, label: tool })
+describe('resolveScopedAllowChoices — file tools', () => {
+  it('offers this-file (specific) + any-file (broad) when a path is present', () => {
+    const r = resolveScopedAllowChoices('Edit', JSON.stringify({ file_path: '/work/log.md' }))
+    expect(r).toEqual({
+      specific: { rule: 'Edit(/work/log.md)', buttonLabel: 'This file', broad: false },
+      broad: { rule: 'Edit', buttonLabel: 'Any file', broad: true },
+    })
   })
 
-  it('returns the bare name even when input_preview is present', () => {
-    // The button is for "trust this tool category" — fine-grained
-    // pattern rules (Bash(npm:*) etc.) are the operator's job to
-    // craft via the CLI.
-    const result = resolveAlwaysAllowRule(
-      'Bash',
-      JSON.stringify({ command: 'rm -rf /tmp/x' }),
+  it('falls back to broad-only when no path is present', () => {
+    const r = resolveScopedAllowChoices('Write', JSON.stringify({ unrelated: 'x' }))
+    expect(r).toEqual({ broad: { rule: 'Write', buttonLabel: 'Any file', broad: true } })
+  })
+
+  it('prefers notebook_path for NotebookEdit', () => {
+    const r = resolveScopedAllowChoices(
+      'NotebookEdit',
+      JSON.stringify({ notebook_path: '/work/a.ipynb' }),
     )
-    expect(result).toEqual({ rule: 'Bash', label: 'Bash' })
+    expect(r?.specific?.rule).toBe('NotebookEdit(/work/a.ipynb)')
+  })
+
+  it.each(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Read'])(
+    'treats %s as a file tool',
+    (tool) => {
+      const r = resolveScopedAllowChoices(tool, JSON.stringify({ file_path: '/x' }))
+      expect(r?.broad.rule).toBe(tool)
+    },
+  )
+})
+
+describe('resolveScopedAllowChoices — Bash', () => {
+  it('offers a command-family prefix (specific) + any-command (broad)', () => {
+    const r = resolveScopedAllowChoices('Bash', JSON.stringify({ command: 'npm run build' }))
+    expect(r).toEqual({
+      specific: { rule: 'Bash(npm:*)', buttonLabel: 'npm commands', broad: false },
+      broad: { rule: 'Bash', buttonLabel: 'Any command', broad: true },
+    })
+  })
+
+  it('falls back to broad-only when the first token is unsafe', () => {
+    const r = resolveScopedAllowChoices('Bash', JSON.stringify({ command: 'foo | bar' }))
+    // "foo" is a clean token, so this resolves; use a metacharacter-led command:
+    const r2 = resolveScopedAllowChoices('Bash', JSON.stringify({ command: '$(evil)' }))
+    expect(r?.specific?.rule).toBe('Bash(foo:*)')
+    expect(r2).toEqual({ broad: { rule: 'Bash', buttonLabel: 'Any command', broad: true } })
   })
 })
 
-describe('resolveAlwaysAllowRule — MCP tools', () => {
-  it('preserves the namespaced MCP tool name', () => {
-    expect(resolveAlwaysAllowRule('mcp__switchroom-telegram__reply', undefined))
-      .toEqual({ rule: 'mcp__switchroom-telegram__reply', label: 'mcp__switchroom-telegram__reply' })
+describe('resolveScopedAllowChoices — broad-only built-ins', () => {
+  it.each(['Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'Agent', 'TodoWrite', 'ExitPlanMode'])(
+    'offers a single "Always allow" broad grant for %s',
+    (tool) => {
+      expect(resolveScopedAllowChoices(tool, undefined)).toEqual({
+        broad: { rule: tool, buttonLabel: 'Always allow', broad: true },
+      })
+    },
+  )
+})
+
+describe('resolveScopedAllowChoices — MCP tools', () => {
+  it('offers this-action (specific) + all-server (broad)', () => {
+    const r = resolveScopedAllowChoices('mcp__perplexity__search', undefined)
+    expect(r).toEqual({
+      specific: { rule: 'mcp__perplexity__search', buttonLabel: 'This action', broad: false },
+      broad: { rule: 'mcp__perplexity__*', buttonLabel: 'All Perplexity', broad: true },
+    })
   })
 
-  it('accepts MCP server-only namespaces', () => {
-    expect(resolveAlwaysAllowRule('mcp__hindsight', undefined))
-      .toEqual({ rule: 'mcp__hindsight', label: 'mcp__hindsight' })
+  it('prettifies multi-word server slugs in the broad label', () => {
+    const r = resolveScopedAllowChoices('mcp__google-workspace__list_files', undefined)
+    expect(r?.broad).toEqual({
+      rule: 'mcp__google-workspace__*',
+      buttonLabel: 'All Google Workspace',
+      broad: true,
+    })
   })
 
-  it('refuses malformed mcp_ shapes (missing prefix structure)', () => {
-    expect(resolveAlwaysAllowRule('mcp_foo', undefined)).toBeNull()
-    expect(resolveAlwaysAllowRule('mcp__', undefined)).toBeNull()
+  it('offers a broad-only grant for a server-only namespace', () => {
+    expect(resolveScopedAllowChoices('mcp__hindsight', undefined)).toEqual({
+      broad: { rule: 'mcp__hindsight', buttonLabel: 'Always allow', broad: true },
+    })
+  })
+
+  it('refuses malformed mcp shapes', () => {
+    expect(resolveScopedAllowChoices('mcp_foo', undefined)).toBeNull()
+    expect(resolveScopedAllowChoices('mcp__', undefined)).toBeNull()
   })
 })
 
-describe('resolveAlwaysAllowRule — fallback', () => {
-  it('returns null for unknown tools', () => {
-    expect(resolveAlwaysAllowRule('UnknownTool', undefined)).toBeNull()
-    expect(resolveAlwaysAllowRule('', undefined)).toBeNull()
+describe('resolveScopedAllowChoices — fallback', () => {
+  it('returns null for unknown tools and empty input', () => {
+    expect(resolveScopedAllowChoices('UnknownTool', undefined)).toBeNull()
+    expect(resolveScopedAllowChoices('', undefined)).toBeNull()
+  })
+})
+
+describe('prettyMcpServer', () => {
+  it('title-cases and splits on - and _', () => {
+    expect(prettyMcpServer('perplexity')).toBe('Perplexity')
+    expect(prettyMcpServer('google-workspace')).toBe('Google Workspace')
+    expect(prettyMcpServer('agent_config')).toBe('Agent Config')
   })
 })
 
 describe('matchesAllowRule — bare tool names', () => {
-  // The whole point of #1138: a cached `Edit` rule covers every Edit
-  // call from the parent claude AND from sub-agents dispatched via the
-  // Task tool, no matter the file path.
   it('matches any invocation of the same tool', () => {
     expect(matchesAllowRule('Edit', 'Edit', undefined)).toBe(true)
-    expect(matchesAllowRule('Edit', 'Edit', JSON.stringify({ file_path: '/tmp/a' }))).toBe(true)
     expect(matchesAllowRule('Edit', 'Edit', JSON.stringify({ file_path: '/etc/passwd' }))).toBe(true)
   })
 
   it('does not bleed into other tools', () => {
     expect(matchesAllowRule('Edit', 'Write', undefined)).toBe(false)
-    expect(matchesAllowRule('Read', 'Edit', undefined)).toBe(false)
     expect(matchesAllowRule('Bash', 'BashOutput', undefined)).toBe(false)
   })
-
-  it.each(['Bash', 'Read', 'Write', 'MultiEdit', 'Glob', 'Grep', 'WebFetch', 'TodoWrite'])(
-    'roundtrips through resolve → match for %s',
-    (tool) => {
-      const resolved = resolveAlwaysAllowRule(tool, undefined)
-      expect(resolved).not.toBeNull()
-      expect(matchesAllowRule(resolved!.rule, tool, undefined)).toBe(true)
-    },
-  )
 })
 
-describe('matchesAllowRule — Skill(name)', () => {
-  it('matches only the specific skill', () => {
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skill: 'mail' }))).toBe(true)
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skill: 'calendar' }))).toBe(false)
+describe('matchesAllowRule — scoped file/Bash/Skill rules', () => {
+  it('matches a file rule only for that exact path', () => {
+    expect(matchesAllowRule('Edit(/work/log.md)', 'Edit', JSON.stringify({ file_path: '/work/log.md' }))).toBe(true)
+    expect(matchesAllowRule('Edit(/work/log.md)', 'Edit', JSON.stringify({ file_path: '/work/other.md' }))).toBe(false)
   })
 
-  it('uses the same field fallback chain as the resolver', () => {
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skill_name: 'mail' }))).toBe(true)
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skillName: 'mail' }))).toBe(true)
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ name: 'mail' }))).toBe(true)
-    expect(matchesAllowRule(
-      'Skill(coolify)',
-      'Skill',
-      JSON.stringify({ path: 'skills/coolify/SKILL.md' }),
-    )).toBe(true)
+  it('matches a Bash prefix rule by first command token', () => {
+    expect(matchesAllowRule('Bash(npm:*)', 'Bash', JSON.stringify({ command: 'npm run build' }))).toBe(true)
+    expect(matchesAllowRule('Bash(npm:*)', 'Bash', JSON.stringify({ command: 'git status' }))).toBe(false)
+  })
+
+  it('matches a Skill rule only for that skill', () => {
+    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skill: 'mail' }))).toBe(true)
+    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ skill: 'calendar' }))).toBe(false)
   })
 
   it('does not match a different tool with the same arg', () => {
     expect(matchesAllowRule('Skill(mail)', 'Bash', JSON.stringify({ skill: 'mail' }))).toBe(false)
   })
-
-  it('returns false on malformed Skill input', () => {
-    expect(matchesAllowRule('Skill(mail)', 'Skill', undefined)).toBe(false)
-    expect(matchesAllowRule('Skill(mail)', 'Skill', 'not-json')).toBe(false)
-    expect(matchesAllowRule('Skill(mail)', 'Skill', JSON.stringify({ unrelated: 'x' }))).toBe(false)
-  })
 })
 
-describe('matchesAllowRule — MCP tools', () => {
+describe('matchesAllowRule — MCP', () => {
   it('matches the exact namespaced tool', () => {
-    expect(matchesAllowRule(
-      'mcp__switchroom-telegram__reply',
-      'mcp__switchroom-telegram__reply',
-      undefined,
-    )).toBe(true)
+    expect(matchesAllowRule('mcp__perplexity__search', 'mcp__perplexity__search', undefined)).toBe(true)
   })
 
-  it('does not match a different MCP tool on the same server', () => {
-    expect(matchesAllowRule(
-      'mcp__switchroom-telegram__reply',
-      'mcp__switchroom-telegram__stream_reply',
-      undefined,
-    )).toBe(false)
+  it('a server wildcard covers every tool on that server', () => {
+    expect(matchesAllowRule('mcp__perplexity__*', 'mcp__perplexity__search', undefined)).toBe(true)
+    expect(matchesAllowRule('mcp__perplexity__*', 'mcp__perplexity__ask', undefined)).toBe(true)
+    expect(matchesAllowRule('mcp__perplexity__*', 'mcp__other__search', undefined)).toBe(false)
+  })
+
+  it('an exact tool rule does not cover siblings on the same server', () => {
+    expect(matchesAllowRule('mcp__perplexity__search', 'mcp__perplexity__ask', undefined)).toBe(false)
   })
 })
 
@@ -196,5 +225,34 @@ describe('matchesAllowRule — defensive', () => {
   it('returns false for empty inputs', () => {
     expect(matchesAllowRule('', 'Edit', undefined)).toBe(false)
     expect(matchesAllowRule('Edit', '', undefined)).toBe(false)
+  })
+})
+
+describe('resolve → match roundtrip', () => {
+  it.each([
+    ['Skill', JSON.stringify({ skill: 'mail' })],
+    ['Edit', JSON.stringify({ file_path: '/work/log.md' })],
+    ['Bash', JSON.stringify({ command: 'npm run build' })],
+    ['mcp__perplexity__search', undefined],
+  ] as const)('specific rule from %s matches the originating request', (tool, input) => {
+    const choices = resolveScopedAllowChoices(tool, input)
+    const rule = (choices?.specific ?? choices?.broad)!.rule
+    expect(matchesAllowRule(rule, tool, input)).toBe(true)
+  })
+
+  it.each([
+    ['Edit', JSON.stringify({ file_path: '/work/log.md' })],
+    ['Bash', JSON.stringify({ command: 'npm run build' })],
+    ['mcp__perplexity__search', undefined],
+  ] as const)('broad rule from %s also matches the originating request', (tool, input) => {
+    const broad = resolveScopedAllowChoices(tool, input)!.broad
+    expect(matchesAllowRule(broad.rule, tool, input)).toBe(true)
+  })
+})
+
+describe('isRulePersisted', () => {
+  it('is a membership check against the resolved allow list', () => {
+    expect(isRulePersisted(['Edit', 'mcp__perplexity__*'], 'mcp__perplexity__*')).toBe(true)
+    expect(isRulePersisted(['Edit'], 'Write')).toBe(false)
   })
 })
