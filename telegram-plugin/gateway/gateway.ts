@@ -14874,7 +14874,7 @@ async function registerSwitchroomBotCommands(): Promise<void> {
 }
 
 // ─── Inline-button handler (permissions) ──────────────────────────────────
-// Handles `perm:(allow|deny|more):<id>` — permission request buttons
+// Handles `perm:(allow|deny|always|asn|asb|back):<id>` — permission request buttons
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
 
