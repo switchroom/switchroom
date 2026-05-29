@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — activity feed is the unconditional default (#1984)
+## v0.14.9 — activity feed is the unconditional default (#1984)
 
 The live tool-activity feed (#1982) is now **on for every agent by
 default**. The `SWITCHROOM_DRAFT_MIRROR` env flag and its kill-switch
