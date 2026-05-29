@@ -1643,28 +1643,34 @@ function emitAgentService(
         `      - ${homePrefix}/.switchroom/host-control-audit.log:/state/agent/home/.switchroom/host-control-audit.log:ro`,
       );
     }
-    // Host-control daemon socket (#1164 follow-up — RFC C).
-    // ADMIN-ONLY and gated on `host_control.enabled: true`. The
-    // daemon (a systemd user unit on the host) binds the per-agent
-    // socket at `~/.switchroom/hostd/<name>/sock`, chowns it to the
-    // agent UID, and the agent connects via the in-container path
-    // `/run/switchroom/hostd/<name>/sock`. Same bind-mount shape
-    // the broker uses; identity comes from the host-side bind
-    // path so the agent can't forge it.
-    //
-    // No singleton container in Phase 1 (the daemon lives outside
-    // compose); only the per-agent volume here. The agent end is
-    // the directory, not the file, so the daemon can bind the
-    // socket inside it after starting. existsSync guard on the
-    // directory: if the daemon hasn't run yet, the directory will
-    // be missing — compose `up` would hard-fail on a missing :ro
-    // source. We bind read-write so the daemon can chown the
-    // socket file from the host side; the agent only connects.
-    if (hostControlEnabled && existsSync(`${hostHomeForChecks}/.switchroom/hostd/${a.name}`)) {
-      lines.push(
-        `      - ${homePrefix}/.switchroom/hostd/${a.name}:/run/switchroom/hostd/${a.name}`,
-      );
-    }
+  }
+  // Host-control daemon socket (#1164 follow-up — RFC C).
+  // Mounted for EVERY agent (gated only on `host_control.enabled:
+  // true`), NOT just admin agents — that's why it lives outside the
+  // `a.admin === true` block above: binding a socket ≠ granting admin.
+  // Every privileged verb is still gated server-side in hostd's
+  // `checkGate`; the one verb a non-admin agent can reach is a
+  // self-scoped `config_propose_edit` (it may only widen its OWN
+  // `tools.allow`) so "🔁 Always allow" persists for the whole fleet,
+  // not just the 3 admin agents. The daemon binds the per-agent socket
+  // at `~/.switchroom/hostd/<name>/sock`, chowns it to the agent UID,
+  // and the agent connects via the in-container path
+  // `/run/switchroom/hostd/<name>/sock`. Same bind-mount shape the
+  // broker uses; identity comes from the host-side bind path so the
+  // agent can't forge it.
+  //
+  // No singleton container in Phase 1 (the daemon lives outside
+  // compose); only the per-agent volume here. The agent end is the
+  // directory, not the file, so the daemon can bind the socket inside
+  // it after starting. existsSync guard on the directory: if the
+  // daemon hasn't run yet, the directory will be missing — compose
+  // `up` would hard-fail on a missing source. We bind read-write so
+  // the daemon can chown the socket file from the host side; the agent
+  // only connects.
+  if (hostControlEnabled && existsSync(`${hostHomeForChecks}/.switchroom/hostd/${a.name}`)) {
+    lines.push(
+      `      - ${homePrefix}/.switchroom/hostd/${a.name}:/run/switchroom/hostd/${a.name}`,
+    );
   }
   // Operator-declared extra bind-mounts (#1164). ADMIN-ONLY: emitting
   // anything for a non-admin agent is a hard error — bind_mounts is the
