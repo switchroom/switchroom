@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.14.11 — Cloudflare-only webhook edge lock (#1989)
+
+Phase 2 of the Docker-native webhook work. Adds a per-agent opt-in
+`channels.telegram.webhook_require_edge` (**off by default**). When set,
+every webhook request must carry an `X-Switchroom-Edge` header matching
+the operator's secret at `~/.switchroom/webhook-edge-secret` — injected
+by a Cloudflare Transform Rule on `hooks.switchroom.ai` — *before* any
+HMAC verification runs, or it is rejected `403`.
+
+The per-agent HMAC proves *who signed the body*, not *which network path
+the request took*. This closes the gap where anyone reaching the tunnel
+origin directly (or an SSRF from a co-located service) bypasses the
+GitHub-IP WAF: the edge header proves "this request entered through our
+Cloudflare edge", which nothing else on the request can. It **stacks on**
+the existing WAF + per-agent HMAC — it replaces neither.
+
+**Fail-closed**: when an agent requires the lock but the secret file is
+missing or empty, every request is rejected — a misconfigured control
+denies, it never falls open. The gate runs before the HMAC work so a
+non-edge request is cheaply denied and never consumes a signature
+verification, and the `403` body leaks no detail (the reason goes only
+to the operator log). Receiver-side only — no gateway, compose, or
+agent-image change, and orthogonal to `webhook_via_gateway`. When the
+flag is unset the existing receiver path is byte-for-byte unchanged.
+Implements `docs/rfcs/webhook-cloudflare-edge-lock.md`.
+
 ## v0.14.10 — Docker-native GitHub webhook ingest (#1986)
 
 Fixes GitHub webhook delivery on Docker installs. Since the
