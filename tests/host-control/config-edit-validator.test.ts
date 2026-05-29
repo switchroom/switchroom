@@ -147,6 +147,20 @@ describe("assertSelfScopedAllowEdit — non-admin always-allow boundary", () => 
     expect(r.ok).toBe(false);
   });
 
+  it("REJECTS escalating the caller's own agent to admin: true", () => {
+    const before = base();
+    const after = base("    admin: true\n");
+    const r = assertSelfScopedAllowEdit(before, after, "gymbro");
+    expect(r.ok).toBe(false);
+  });
+
+  it("REJECTS removing a deny rule from the caller's own agent", () => {
+    const before = base("    tools:\n      deny:\n        - Bash\n");
+    const after = base("    tools:\n      deny: []\n");
+    const r = assertSelfScopedAllowEdit(before, after, "gymbro");
+    expect(r.ok).toBe(false);
+  });
+
   it("denies (does not throw) on unparseable config", () => {
     const r = assertSelfScopedAllowEdit(": : :\n  - [", "agents: {}\n", "gymbro");
     expect(r.ok).toBe(false);
