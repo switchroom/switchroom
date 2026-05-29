@@ -52,6 +52,7 @@ import {
 } from './webhook-verify.js'
 import type { WebhookDispatchConfig } from './webhook-dispatch.js'
 import { forwardToGateway, type WebhookForwardResponse } from './webhook-ingest-client.js'
+import { EDGE_HEADER, verifyEdgeHeader } from './webhook-edge.js'
 
 export interface WebhookConfig {
   /** Per-source secrets, declared in vault under
@@ -112,6 +113,22 @@ export interface WebhookHandlerArgs {
    * append, and dispatch. See docs/rfcs/webhook-via-gateway-socket.md.
    */
   viaGateway?: boolean
+  /**
+   * Cloudflare-only edge lock (channels.telegram.webhook_require_edge).
+   * When true, the request MUST carry the `X-Switchroom-Edge` header
+   * matching `edgeSecret` (injected by a Cloudflare Transform Rule on the
+   * edge) or it is rejected 403 before any HMAC work. Fail-closed: if the
+   * lock is required but `edgeSecret` is null (secret file missing), every
+   * request is rejected. Off by default. See
+   * docs/rfcs/webhook-cloudflare-edge-lock.md.
+   */
+  requireEdge?: boolean
+  /**
+   * The expected edge secret, loaded by the route from
+   * `~/.switchroom/webhook-edge-secret`. null when the file is
+   * missing/empty — combined with `requireEdge: true` this fails closed.
+   */
+  edgeSecret?: string | null
 }
 
 export interface WebhookHandlerResult {
@@ -342,6 +359,21 @@ export async function handleWebhookIngest(
   if (!args.allowedSources.includes(source)) {
     log(`webhook-ingest: agent='${args.agent}' source='${source}' rejected: source not in agent's webhook_sources allowlist\n`)
     return jsonReply(403, { ok: false, error: 'source not allowed for this agent' })
+  }
+
+  // ── Cloudflare edge lock (fail-closed) ────────────────────────────────────
+  // Proves the request entered through our Cloudflare edge (Transform Rule
+  // injects X-Switchroom-Edge). Stacks on the GitHub-IP WAF + per-agent HMAC.
+  // Runs before the HMAC work so a non-edge request is cheaply rejected and
+  // never reaches signature verification. A required-but-unconfigured lock
+  // (edgeSecret null) rejects everything rather than silently falling open.
+  if (args.requireEdge) {
+    const presented = args.headers.get(EDGE_HEADER)
+    if (!verifyEdgeHeader(presented, args.edgeSecret ?? null)) {
+      const why = !args.edgeSecret ? 'edge secret not configured (fail-closed)' : 'edge header missing/mismatch'
+      log(`webhook-ingest: agent='${args.agent}' source='${source}' rejected: ${why}\n`)
+      return jsonReply(403, { ok: false, error: 'forbidden' })
+    }
   }
 
   const secret = args.config.secrets[source]

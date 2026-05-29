@@ -34,6 +34,7 @@ import {
   handleGetApprovals,
 } from "./api.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
+import { loadEdgeSecret } from "./webhook-edge.js";
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html",
@@ -280,6 +281,13 @@ async function handleWebhookRoute(
   const allSecrets = loadWebhookSecrets();
   const agentSecrets = allSecrets[agent] ?? {};
 
+  // Cloudflare-only edge lock (Phase 2). Per-agent opt-in; the secret
+  // itself is endpoint-global (one file guards the whole receiver). Loaded
+  // lazily only when the agent requires it; null when the file is
+  // missing/empty, which fails closed inside the handler.
+  const requireEdge = agentConfig?.channels?.telegram?.webhook_require_edge === true;
+  const edgeSecret = requireEdge ? loadEdgeSecret() : null;
+
   let bodyBuf: Uint8Array;
   try {
     bodyBuf = new Uint8Array(await req.arrayBuffer());
@@ -303,6 +311,8 @@ async function handleWebhookRoute(
       // Docker-runtime: forward to the agent's gateway instead of writing
       // the per-agent-UID-owned dir as the host operator UID (EACCES 500).
       viaGateway: agentConfig?.channels?.telegram?.webhook_via_gateway === true,
+      requireEdge,
+      edgeSecret,
     },
     {},
   );
