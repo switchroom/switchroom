@@ -27,11 +27,29 @@ the five beats below and removes the contradiction.
 |---|---|---|---|
 | Ambient | "Is it alive?" — glance-level liveness | The 👀→🤔→✍→👍 status reaction on the user's inbound message **and** a continuous `typing…` chat-action held for the whole turn | `telegram-plugin/status-reactions.ts` + `gateway.ts:startTurnTypingLoop` (started at turn-start, stopped by `purgeReactionTracking`) |
 | Conversational | "What is it doing? What did it find?" — meaningful state changes | The agent's own `reply` calls, paced by the five beats | `profiles/_shared/telegram-style.md.hbs` + the append-prompt block in `scaffold.ts` + `disable_notification` parameter |
-| Safety net | "Why has it gone quiet?" — framework backstop when the model fails to chat | The silence-poke subsystem: 75s/180s/300s ladder | `telegram-plugin/silence-poke.ts` |
+| Safety net | "Is this turn dead?" — framework backstop that unwedges a genuinely stuck turn | The silence-poke subsystem: a single 300s fallback that sends one user-visible message **and** unwedges the turn | `telegram-plugin/silence-poke.ts` |
 
 These are priorities. Ambient is always on. Conversational does the
-heavy lifting. Safety net only fires when the model isn't doing its
-job.
+heavy lifting. Safety net only fires when a turn is genuinely stuck.
+
+> **What the safety net used to be (and why it shrank).** Earlier
+> versions of this layer ran a model-targeted *nudge ladder* — an ack
+> poke at 10s, a soft poke at 75s, a firm poke at 180s, each appended
+> as a `<system-reminder>` to the next tool result — plus a 60s
+> user-visible *awareness ping*. They were retired (the nudge-ladder
+> retirement PR) for two reasons. (1) **They didn't work by their own
+> KPI:** the `silence_poke_succeeded / silence_poke_fired` rate sat at
+> 0–7% across the fleet against a >80% target — a `<system-reminder>`
+> on a tool result can't reliably make the model stop and talk. (2)
+> **The job moved.** The live-updating reply/draft (the thinking-lane
+> draft that edits in place, see beat-1/beat-3 below and the
+> `sendMessageDraft` transport) now carries the acknowledgement and
+> progress beats natively — the user watches the message compose itself
+> rather than waiting for a framework nudge to provoke one. A timer-
+> fired "still working" nudge on top of that is the exact cadence-based
+> update the Anti-patterns section bans. What remains is the one thing
+> the draft genuinely can't do: break a turn that has wedged with no
+> output at all. That's the 300s fallback.
 
 ## The five beats (the prompt teaches this)
 
@@ -74,52 +92,44 @@ human, never a flood. Going quiet *during* focused work (beat 2) is
 correct; going quiet *instead of* acknowledging (beat 1) or *instead
 of* a real milestone (beats 3–4) is the black box this prevents.
 
-## Silence-poke ladder
+## Silence-poke fallback
 
-The framework backstops the model. State per-turn:
-`{ turnStartedAt, lastOutboundAt, pokesFired, pokeArmed, ackPokeFired,
-subagentDispatchActive, lastThinkingAt, fallbackFired,
-lastPokeFiredAt, inFlightTools }`. Polled every 5s.
+The framework backstops the model with **one timer** — no ladder. State
+per-turn: `{ turnStartedAt, lastOutboundAt, lastThinkingAt,
+fallbackFired, inFlightTools }`. Polled every 5s.
 
 | Threshold | Action | Wire |
 |---|---|---|
-| 10s | **Ack poke** armed — *only* when nothing has been sent this turn yet (`lastOutboundAt == null`). Nudges the model to send its own short verbal acknowledgement. One-shot per turn (`ackPokeFired`). | Same mechanism as soft/firm |
-| 75s | Soft poke armed. `<system-reminder>` block appended to next tool result. | `silence-poke.ts → consumeArmedPoke()` drained at `gateway.ts:onToolCall` chokepoint |
-| 180s | Firm poke armed (stronger wording). | Same mechanism |
-| 300s | Framework fallback: gateway sends a user-visible *"still working… (no update from agent in N min)"* or *"still thinking…"*. Pings. | `silencePoke.startTimer.onFrameworkFallback` callback |
+| 300s | Framework fallback: gateway sends a user-visible *"still working… (no update from agent in N min)"* or *"still thinking…"* **and** unwedges the turn (clears `activeTurnStartedAt`, nulls `currentTurn`, drains buffered inbound). Pings once. | `silencePoke.startTimer.onFrameworkFallback` callback |
 
-**Ack budget (10s).** A person answers in a beat; the framework
-enforces that baseline. The ack poke measures *"have you said
-anything at all this turn"* (`lastOutboundAt == null`) — distinct
-from soft/firm, which measure silence-*since-last-outbound*. It sits
-**outside** the `pokesFired` ladder: a turn that still never acks
-escalates soft → firm → fallback on exactly the same schedule. The
-framework owns the *beat*; the model authors the words (see the
-"Open with an acknowledgement" bullet in
-`profiles/_shared/telegram-style.md.hbs`). Ack-poke *success* is not
-metered — the `silence_poke_fired level=ack` rate is the signal:
-how often the model had to be nudged.
-
-**Subagent-dispatch override:** when the session stream emits a
-`tool_use` for `Task` or `Agent`, the soft threshold extends to 300s
-for that turn (a parent narrating "spinning up @reviewer" then waiting
-shouldn't get poked at 75s — the wait is legitimate). The flag
-persists until `endTurn` so subsequent narration outbound messages
-don't reset the extended threshold.
+The fallback fires purely on the silence clock — `now -
+(lastOutboundAt ?? turnStartedAt) >= 300s` — and once per turn
+(`fallbackFired`). It is **not a nudge**: it does not append a
+`<system-reminder>` hoping the model will speak; it speaks *for* the
+framework and breaks the wedge. That unwedge is the one job the
+live-updating draft genuinely can't do (a turn that produced no
+output at all has no draft to watch), which is why this single beat
+survived the nudge-ladder retirement (see the blockquote under "Three
+layers"). Any outbound — including the draft's first edit — resets the
+clock, so a turn that's visibly composing never trips it.
 
 **Thinking detection:** session stream `kind: 'thinking'` events
 update `lastThinkingAt`. If the framework fallback fires within 30s
 of a thinking event, wording switches to *"still thinking…"*.
 
+**Tool-aware enrichment (#1292):** the gateway tracks in-flight tools
+in `inFlightTools` (`noteToolStart` / `noteToolEnd` / `noteToolLabel`
+off the session stream). When the fallback fires, it names the
+longest-running tool — *"running Grep \"foo\" for 4m"* — instead of
+the generic string. Tool churn enriches the *text* only; it never
+moves the 300s timing.
+
 **Wording is load-bearing.** Exact strings live in
-`silence-poke.ts:formatPokeText`. Two principles:
-1. The soft poke text says "skip the update if you're about to
-   finish within seconds" — without it, the model will dutifully send
-   "still working" 5 seconds before the answer lands.
-2. The framework fallback parenthetical *"(no update from agent in N
-   min)"* is honest — distinguishes from "the agent said something"
-   so users learn to trust real agent messages. N is derived from
-   `ctx.silenceMs`, not hard-coded.
+`silence-poke.ts:formatFrameworkFallbackText`. The parenthetical
+*"(no update from agent in N min)"* is honest — it distinguishes the
+framework speaking from "the agent said something", so users learn to
+trust real agent messages. N is derived from `ctx.silenceMs`, not
+hard-coded.
 
 **Kill switch:** `SWITCHROOM_DISABLE_SILENCE_POKE=1` disables the
 whole subsystem. The conversational-pacing prompt still applies; only
@@ -135,11 +145,13 @@ the runtime-metrics events documented in `docs/posthog.md`:
 | **Status-query rate** (primary lagging) | `inbound_status_query` | <0.5% of inbound | Every fire = JTBD failure |
 | **Outbound silence p95** (primary leading) | `turn_ended.longest_silent_gap_ms` for `duration_ms > 30000` | <120s | Above this, users start asking |
 | **TTFO p95** | `turn_ended.ttfo_ms` for `outbound_count > 0` | <30s | The opening ack (beat 1) should land fast |
-| **Silence-poke success rate** | `silence_poke_succeeded / silence_poke_fired` | >80% | Below = prompt-engineering broken |
 | **Framework fallback rate** | `silence_fallback_sent / turn_ended` | <5 per 1000 | Above = model is failing, fundamentally |
 
-A `Switchroom Runtime` PostHog dashboard tracks all five. Wire-up
-documented in `docs/posthog.md`.
+A `Switchroom Runtime` PostHog dashboard tracks these four. Wire-up
+documented in `docs/posthog.md`. (The retired
+`silence_poke_succeeded / silence_poke_fired` ratio is gone — the
+nudge ladder it measured no longer exists; the surviving fallback is
+metered only by its *fire* rate, which is meant to stay near zero.)
 
 ## Anti-patterns (don't reintroduce)
 

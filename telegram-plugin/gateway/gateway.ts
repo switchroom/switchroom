@@ -3407,11 +3407,13 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
 }
 
 // #1122: framework safety-net for "model is silent to the user for >5min."
-// Starts a single setInterval poll that walks active turns and arms
-// soft/firm poke reminders piggybacked on the next tool result. At 300s
-// the framework itself sends a user-visible "still working… / still
-// thinking…" message. Honours SWITCHROOM_DISABLE_SILENCE_POKE=1 kill
-// switch (no-op if set).
+// Starts a single setInterval poll that walks active turns; at 300s of
+// silence the framework itself sends a user-visible "still working… /
+// still thinking…" message AND unwedges the turn. The model-targeted
+// nudge ladder (ack/soft/firm) and the 60s awareness ping were retired
+// once the live-updating reply/draft took over the pacing job — only
+// this single unwedge fallback remains. Honours
+// SWITCHROOM_DISABLE_SILENCE_POKE=1 kill switch (no-op if set).
 // Set when this gateway dispatches an `update_apply` to hostd that
 // returns `started`; cleared when the dispatch poll resolves (terminal
 // / not-configured / timeout). While set, the framework silence
@@ -3424,43 +3426,6 @@ silencePoke.startTimer({
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
-  },
-  onAwarenessPing: async (ctx) => {
-    // Early framework-owned awareness signal (~60s) so the user never
-    // faces a silent chat while the model is busy / held / thinking.
-    // Distinct from the 300s onFrameworkFallback: fires earlier, sends
-    // a SILENT message (disable_notification: true — ambient liveness,
-    // not a device buzz), and is bounded to ONE per turn by the silence-
-    // poke module's `awarenessPingFired` flag. Reuses
-    // `formatFrameworkFallbackText` so the wording stays consistent and
-    // in-flight tools are named when known. If the model has been
-    // silent long enough to cross 300s, the heavier framework_fallback
-    // escalates with a notification.
-    //
-    // Late-fire guard mirrors the framework_fallback handler: skip if
-    // the turn ended cleanly between the silence-poke arming and this
-    // timer-fired handler so we don't talk over a clean response.
-    if (activeTurnStartedAt.get(ctx.key) == null && currentTurn == null) {
-      return
-    }
-    const text = silencePoke.formatFrameworkFallbackText(
-      ctx.fallbackKind,
-      ctx.silenceMs,
-      ctx.inFlightTools,
-    )
-    try {
-      await robustApiCall(
-        () => bot.api.sendMessage(ctx.chatId, text, {
-          ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
-          disable_notification: true,
-        }),
-        { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
-      )
-    } catch (err) {
-      process.stderr.write(
-        `silence-poke awareness-ping sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
-      )
-    }
   },
   onFrameworkFallback: async (ctx) => {
     // Late-fire short-circuit (2026-05-23 audit finding). The fallback
@@ -4052,25 +4017,6 @@ const ipcServer: IpcServer = createIpcServer({
     process.stderr.write(`telegram gateway: ipc: tool_call tool=${msg.tool} agent=${client.agentName ?? '-'} clientId=${client.id ?? '-'} callId=${msg.id}\n`)
     try {
       const result = await executeToolCall(msg.tool, msg.args)
-      // #1122 silence-poke chokepoint: piggyback any armed poke onto the
-      // tool result's content text. The model sees the [silence-poke]
-      // system-reminder block as part of the next conversational turn.
-      // No-op when nothing is armed (the common case) — cost is one
-      // map iteration over <=N active turns (typically 1).
-      const reminder = silencePoke.consumeArmedPoke()
-      if (reminder != null && result != null && typeof result === 'object') {
-        const r = result as { content?: Array<{ type: string; text: string }> }
-        if (Array.isArray(r.content) && r.content.length > 0 && r.content[0]!.type === 'text') {
-          r.content[0]!.text = `${r.content[0]!.text}\n\n<system-reminder>\n${reminder}\n</system-reminder>`
-        } else {
-          // Tool result didn't carry a text block to wrap — re-shape so
-          // the reminder still reaches the model.
-          r.content = [
-            ...(Array.isArray(r.content) ? r.content : []),
-            { type: 'text', text: `<system-reminder>\n${reminder}\n</system-reminder>` },
-          ]
-        }
-      }
       return { type: 'tool_call_result', id: msg.id, success: true, result }
     } catch (err) {
       return {
@@ -4094,17 +4040,13 @@ const ipcServer: IpcServer = createIpcServer({
     progressDriver?.ingest(ev, chatHint, threadHint)
     handleSessionEvent(ev)
     // #1122 silence-poke: surface activity signals from the session
-    // stream so the fallback message wording is honest and so
-    // subagent-dispatch waits don't fire spurious soft pokes.
+    // stream so the 300s framework-fallback message wording is honest
+    // (thinking vs working, plus the longest-running in-flight tool).
     if (currentTurn != null) {
       const key = statusKey(currentTurn.sessionChatId, currentTurn.sessionThreadId)
       if (ev.kind === 'thinking') {
         silencePoke.noteThinking(key, Date.now())
       } else if (ev.kind === 'tool_use') {
-        if (ev.toolName === 'Task' || ev.toolName === 'Agent') {
-          // Built-in claude sub-agent dispatch — extends soft threshold to 5min.
-          silencePoke.noteSubagentDispatch(key)
-        }
         // #1292: track in-flight tool calls so the 300s framework
         // fallback message can name the actual observable (e.g.
         // "running Grep \"foo\" for 4m") instead of the dishonest

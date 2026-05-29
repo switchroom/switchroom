@@ -19,7 +19,6 @@
 import { existsSync, mkdirSync, appendFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { captureEvent } from './analytics-posthog.js'
-import type { PokeLevel } from './silence-poke.js'
 
 export type RuntimeMetricEvent =
   /**
@@ -63,60 +62,17 @@ export type RuntimeMetricEvent =
       ended_via: 'reply' | 'stream_reply_done' | 'silent' | 'forced' | 'framework_fallback'
     }
   /**
-   * Framework safety-net: a silence-poke was armed. `ack` is the early
-   * (~10s) ack-budget poke — the model has sent NOTHING this turn and is
-   * leaving the user on a silent chat. `soft` (75s) / `firm` (180s) are
-   * the silence-since-last-outbound ladder. The system-reminder appended
-   * to the next tool result nudges the model to send an update. Doubles
-   * as a design-health signal — if these fire frequently, the
-   * conversational-pacing prompt isn't doing its job.
-   */
-  | {
-      kind: 'silence_poke_fired'
-      key: string
-      level: PokeLevel
-      silence_ms: number
-      subagent_wait: boolean
-    }
-  /**
-   * The model sent an outbound message within the success window
-   * (default 15s) after a poke fired. Pair with `silence_poke_fired`
-   * to compute success rate — the design target is >80%. (`ack`-level
-   * success is not currently emitted — the ack poke sits outside the
-   * `pokesFired` ladder noteOutbound measures against; the type admits
-   * `ack` only so the silence-poke metric union stays assignable.)
-   */
-  | {
-      kind: 'silence_poke_succeeded'
-      key: string
-      level: PokeLevel
-      latency_ms: number
-    }
-  /**
-   * Last-resort: 5 minutes silent, the framework itself sent a
-   * user-visible "still working… / still thinking…" message. Should
-   * be rare (target <5 per 1000 turns); a high rate means the model
-   * is genuinely stuck or the soft/firm pokes aren't being honoured.
+   * Last-resort safety net: 5 minutes silent, the framework itself sent
+   * a user-visible "still working… / still thinking…" message AND
+   * unwedged the turn (cleared activeTurnStartedAt, nulled currentTurn,
+   * drained buffered inbound). Should be rare (target <5 per 1000 turns);
+   * a high rate means turns are genuinely getting stuck. This is the only
+   * remaining framework safety-net signal — the model-targeted nudge
+   * ladder (ack/soft/firm) and the 60s awareness ping were retired once
+   * the live-updating reply/draft took over the pacing job.
    */
   | {
       kind: 'silence_fallback_sent'
-      key: string
-      fallback_kind: 'working' | 'thinking'
-      silence_ms: number
-    }
-  /**
-   * Awareness ping (~60s, default): framework-owned user-visible
-   * "still working… / still thinking…" message sent BEFORE the 300s
-   * fallback so the user never faces a silent chat for the full 5
-   * minutes. Silent (no device ping); one-shot per turn; suppressed
-   * by any outbound or sub-agent dispatch. A high rate is the
-   * diagnostic signal that frequent silences exist (held-inbound,
-   * extended-thinking, slow startup), and the rate of the heavier
-   * silence_fallback_sent that still follows tells us how many of
-   * those escalate all the way to 5 min.
-   */
-  | {
-      kind: 'awareness_ping_sent'
       key: string
       fallback_kind: 'working' | 'thinking'
       silence_ms: number

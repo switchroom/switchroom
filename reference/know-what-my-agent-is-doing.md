@@ -82,22 +82,24 @@ escape hatch, not the headline.
 The prompt that teaches this rhythm lives at
 `profiles/_shared/telegram-style.md.hbs`.
 
-## 3. Safety net — silence-poke + framework fallback
+## 3. Safety net — the 300s framework fallback
 
-The model is the chat partner; the framework catches it when it
-falls silent. Two clocks, three thresholds:
+The model is the chat partner; the framework catches it only when it
+falls *completely* silent. One clock, one threshold:
 
-- **75s silence → soft poke.** A `<system-reminder>` block is
-  piggybacked on the next tool result nudging the model to send a
-  one-liner update. Model-decided wording.
-- **180s silence → firm poke.** Stronger reminder if the soft poke
-  didn't land.
 - **300s silence → framework fallback.** The gateway itself sends a
   user-visible *"still working… (no update from agent in N min)"* or
-  *"still thinking…"*. Fires at most once per turn. Pings the device.
+  *"still thinking…"* **and** unwedges the turn (clears the turn state,
+  drains buffered inbound). Fires at most once per turn. Pings once.
 
-Subagent-dispatch (`Task` / `Agent`) extends the soft threshold to
-300s for that turn (legitimate wait on a child).
+That's the whole net. The earlier model-targeted nudge ladder (an ack
+poke at 10s, soft at 75s, firm at 180s) and the 60s user-visible
+awareness ping were **retired** — the live-updating reply/draft now
+carries the acknowledgement and progress beats natively (the user
+watches the message compose itself), so a timer-fired nudge on top of
+it was redundant noise. What the draft genuinely *can't* do is break a
+turn that wedged with no output at all; that's the one job the 300s
+fallback keeps.
 
 The full design contract lives at
 `reference/conversational-pacing.md`. Kill switch:
@@ -176,9 +178,11 @@ experience, not just the reply.
   ("spinning up @reviewer") and summarises when the child reports back.
 - **Parallel work in one chat.** Fire two tasks close together in
   different contexts. Each should get its own legible thread of replies.
-- **Genuine stall.** Force a long stall. Reaction escalates to 😨.
-  The silence-poke arms at 75s; if the model is alive, it sends a
-  brief update. At 300s the framework fallback fires.
+- **Genuine stall.** Force a long stall with no output at all.
+  Reaction escalates to 😨. At 300s the framework fallback fires a
+  user-visible message and unwedges the turn. (A turn that's visibly
+  composing a draft should never reach this — any outbound, including
+  the draft's first edit, resets the clock.)
 - **Failure path.** Force a recoverable failure (e.g. running out of
   context). The user should get a real explanation in a `reply` with
   `accent: 'issue'`, not silence.
@@ -199,7 +203,8 @@ experience, not just the reply.
 - **Soft-commit threshold.** Ask for something that obviously will take
   >15s. The first reply should be a one-liner ("on it, back in a few")
   not the immediate answer attempt.
-- **Silence-poke success rate.** Force a long tool-churn period with no
-  outbound messages. The soft poke at 75s should produce an update
-  from the model within 15s (the `silence_poke_succeeded` event).
-  Success rate target: >80%.
+- **Framework-fallback rarity.** Force a long tool-churn period. The
+  live-updating draft should keep the user oriented the whole time, so
+  the 300s framework fallback should *not* fire (`silence_fallback_sent`
+  stays near zero). A fallback firing on a turn that was visibly
+  composing is the regression signal.

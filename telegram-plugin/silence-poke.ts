@@ -1,49 +1,44 @@
 /**
- * silence-poke.ts — framework safety net for "model is silent to the user."
+ * silence-poke.ts — framework safety net for a genuinely wedged turn.
  *
- * Background (issue #1122): we're moving away from a pinned progress card
- * to a conversational shape where the chat itself is the artifact. The
- * progress card was implicitly doing one useful job — covering for a
- * model that doesn't know how to say "still working." This module is the
- * explicit replacement: when the model has been silent past a threshold,
- * we nudge it (or, as a last resort, send a framework message ourselves).
+ * Scope (post-#1981-era retirement): this module is now ONLY the
+ * last-resort unwedge. The conversational pacing the user actually sees
+ * — the acknowledgement beat, the "still going" progress updates — is
+ * owned by the live-updating reply/draft (the chat IS the artifact) and
+ * by the model's own `reply`/`stream_reply` calls, not by framework
+ * nudges. The earlier model-targeted nudge ladder (ack at 10s, soft at
+ * 75s, firm at 180s) and the 60s user-visible awareness ping were
+ * retired: their success rate was 0-7% by the design's own KPI, and they
+ * duplicated a job the draft thinking-lane now does natively. See
+ * `reference/conversational-pacing.md` § Safety net.
  *
- * Two clocks (this module owns ONE of them; the other is the legacy
- * idle stall in status-reactions.ts and is unrelated):
+ * What remains: ONE silence clock and ONE terminal action.
  *
  *   silence clock = now - lastOutboundAt   (or turnStartedAt if no outbound yet)
  *
  * Outbound = a fresh `reply` or `stream_reply` first-emit. Reactions,
- * edits, and tool churn DO NOT reset the silence clock — that's the
- * whole point. The model could be ripping through 20 tool calls and
- * still be "silent" to the user.
+ * edits, and tool churn DO NOT reset the silence clock — the model could
+ * be ripping through 20 tool calls and still be "silent" to the user.
  *
- * Escalation ladder per turn:
+ * Terminal action, once per turn:
  *
  *   t=0       startTurn() — silence clock starts at turnStartedAt
- *   t=75s     soft poke armed — appended to next tool result as a
- *             <system-reminder> nudging the model to send an update
- *   t=180s    firm poke armed (stronger wording) if no outbound landed
- *   t=300s    framework fallback: gateway itself sends a user-visible
- *             "still working… / still thinking…" message. Fires at most
- *             once per turn. Pings the device (user needs to know).
+ *   t=300s    framework fallback: the gateway sends a user-visible
+ *             "still working… / still thinking…" message AND unwedges the
+ *             turn (clears activeTurnStartedAt, nulls currentTurn, drains
+ *             buffered inbound, purges stale turn state). This is the
+ *             load-bearing unwedge primitive — NOT a nudge — that keeps a
+ *             dead turn from pinning the conversation forever.
  *
- * Subagent-dispatch override: when the model dispatches a sub-agent
- * (`Task(...)`, `@worker` etc), the soft threshold extends to 300s for
- * that turn — the model is legitimately waiting on a child, no point
- * poking it to narrate the wait. Firm/fallback thresholds unchanged.
- *
- * Wired into the gateway at the central tool-result chokepoint
- * (`gateway.ts:onToolCall`) so the poke text piggybacks the next tool
- * result back to claude. MCP doesn't allow mid-generation injection;
- * tool results are the only synchronous moment we own the wire.
+ * The fallback message is enriched with in-flight tool context so it
+ * reads honestly ("running Grep \"foo\" for 4m") instead of a generic
+ * "still working…" when the agent is clearly busy — #1292. Tool churn
+ * enriches the TEXT only, never the timing.
  *
  * Kill switch: SWITCHROOM_DISABLE_SILENCE_POKE=1 disables the whole
- * subsystem (no timers, no injection, no fallback). The conversational
- * pacing prompt still applies; only the framework safety net is off.
+ * subsystem (no timer, no fallback, no unwedge). The conversational
+ * pacing prompt + draft still apply; only the framework safety net is off.
  */
-
-export type PokeLevel = 'ack' | 'soft' | 'firm'
 
 /** #1292: snapshot of an in-flight tool call, surfaced in the 300s
  * framework-fallback message so the user sees the actual observable
@@ -66,29 +61,10 @@ export interface SilencePokeState {
   turnStartedAt: number
   /** Wall-clock ms of last outbound message, or null. */
   lastOutboundAt: number | null
-  /** 0 = none, 1 = soft fired, 2 = firm fired, 3 = fallback fired. */
-  pokesFired: 0 | 1 | 2 | 3
-  /** Armed pending drain on the next tool result, or null. */
-  pokeArmed: { level: PokeLevel } | null
-  /** When true, soft threshold extends to subagentSoft (default 300s). */
-  subagentDispatchActive: boolean
   /** Wall-clock ms of last `thinking` session event, or null. */
   lastThinkingAt: number | null
   /** True once the 300s framework fallback has fired this turn. */
   fallbackFired: boolean
-  /** True once the early ack-budget poke has fired this turn. One-shot:
-   *  the ack nudge is specifically about the *first* outbound, so it
-   *  never re-arms even after the model later goes quiet again. */
-  ackPokeFired: boolean
-  /** True once the early awareness-ping has fired this turn. One-shot:
-   *  the user only needs one "we know it's slow" cue before the heavier
-   *  300s fallback escalates. Independent of the ack-poke (which targets
-   *  the model via piggyback) — awareness-ping targets the user directly
-   *  via Telegram, so it lands even during pure-thinking or held-inbound
-   *  silences when no tool_result is available to piggyback on. */
-  awarenessPingFired: boolean
-  /** Wall-clock ms of last poke fire — used for poke-success latency. */
-  lastPokeFiredAt: number | null
   /** #1292: in-flight tool calls keyed by toolUseId. Populated by
    * `noteToolStart` on every parent-agent `tool_use` event the gateway
    * sees and drained by `noteToolEnd` on the matching `tool_result`.
@@ -102,37 +78,13 @@ export interface SilencePokeState {
 }
 
 export interface ThresholdsMs {
-  /** Ack budget: if NO outbound at all has landed this many ms after
-   *  turn start, arm an 'ack' poke. This is the framework enforcing the
-   *  human-baseline "acknowledge within a beat" — far tighter than the
-   *  75s `soft` threshold, which measures silence-since-last-outbound
-   *  and is the wrong instrument for "you never said hello." */
-  ack: number
-  /** Awareness ping: if NO outbound has landed this many ms after turn
-   *  start, send a framework-owned user-visible "still working…" status
-   *  message directly via Telegram. Sits between the model-targeted ack
-   *  poke (10s) and the 300s framework_fallback. Lands even during pure
-   *  extended-thinking or held-inbound silences when no tool_result is
-   *  available to piggyback the model-targeted pokes onto. One-shot per
-   *  turn — the 300s fallback handles further escalation if still silent. */
-  awarenessPing: number
-  soft: number
-  firm: number
+  /** Silence (since last outbound, or turn start) after which the
+   *  framework sends the user-visible fallback AND unwedges the turn. */
   fallback: number
-  /** Soft threshold when subagentDispatchActive=true. */
-  subagentSoft: number
-  /** How long after a poke we still count an outbound as a "success." */
-  pokeSuccessWindowMs: number
 }
 
 export const DEFAULT_THRESHOLDS: ThresholdsMs = {
-  ack: 10_000,
-  awarenessPing: 60_000,
-  soft: 75_000,
-  firm: 180_000,
   fallback: 300_000,
-  subagentSoft: 300_000,
-  pokeSuccessWindowMs: 15_000,
 }
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
@@ -158,25 +110,13 @@ export interface FrameworkFallbackContext {
 }
 
 export type SilencePokeMetric =
-  | { kind: 'silence_poke_fired'; key: string; level: PokeLevel; silence_ms: number; subagent_wait: boolean }
-  | { kind: 'silence_poke_succeeded'; key: string; level: PokeLevel; latency_ms: number }
   | { kind: 'silence_fallback_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
-  | { kind: 'awareness_ping_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
 
 export interface SilencePokeDeps {
   /** Called when the 300s fallback fires. Caller sends the user-visible
-   *  message + ensures it pings the device. Caller must NOT call back
-   *  into noteOutbound for this — it's a framework-sourced message,
-   *  not a model-sourced one, and we want pokes to continue (well, no,
-   *  fallbackFired ensures only one per turn anyway). */
+   *  message + ensures it pings the device, then unwedges the turn. */
   onFrameworkFallback: (ctx: FrameworkFallbackContext) => Promise<void> | void
-  /** Called when the awareness ping fires (default 60s). Caller sends
-   *  a user-visible "still working…" message — silent (no device ping),
-   *  framework-owned, one-shot per turn. Reuses the same context shape
-   *  as onFrameworkFallback so the gateway can reuse `formatFrameworkFallbackText`
-   *  and the in-flight-tool enrichment. */
-  onAwarenessPing: (ctx: FrameworkFallbackContext) => Promise<void> | void
-  /** Telemetry sink for poke events. */
+  /** Telemetry sink for the fallback event. */
   emitMetric: (event: SilencePokeMetric) => void
   /** Threshold overrides (tests). */
   thresholdsMs?: ThresholdsMs
@@ -205,67 +145,22 @@ export function startTurn(key: string, now: number): void {
   state.set(key, {
     turnStartedAt: now,
     lastOutboundAt: null,
-    pokesFired: 0,
-    pokeArmed: null,
-    subagentDispatchActive: false,
     lastThinkingAt: null,
     fallbackFired: false,
-    ackPokeFired: false,
-    awarenessPingFired: false,
-    lastPokeFiredAt: null,
     inFlightTools: new Map(),
   })
 }
 
 /**
  * Record a fresh user-visible outbound message (reply or stream_reply
- * first-emit). Resets the silence clock + the escalation counter. If a
- * poke fired recently, emit a `silence_poke_succeeded` metric.
+ * first-emit). Resets the silence clock so the 300s fallback is measured
+ * from the most recent thing the user actually saw.
  */
 export function noteOutbound(key: string, now: number): void {
   const s = state.get(key)
   if (s == null) return
-  // Success measurement: if a poke fired within the success window and
-  // an outbound just landed, count it as a successful poke.
-  const thresholds = activeDeps?.thresholdsMs ?? DEFAULT_THRESHOLDS
-  if (
-    s.lastPokeFiredAt != null
-    && (now - s.lastPokeFiredAt) <= thresholds.pokeSuccessWindowMs
-    && activeDeps != null
-    && s.pokesFired >= 1
-    && s.pokesFired <= 2
-  ) {
-    activeDeps.emitMetric({
-      kind: 'silence_poke_succeeded',
-      key,
-      level: s.pokesFired === 1 ? 'soft' : 'firm',
-      latency_ms: now - s.lastPokeFiredAt,
-    })
-  }
   s.lastOutboundAt = now
-  s.pokesFired = 0
-  s.pokeArmed = null
-  // Intentionally DO NOT clear `subagentDispatchActive` here. The
-  // model's `reply` narrating the dispatch ("spinning up @reviewer")
-  // is itself the outbound that resets the silence clock — clearing
-  // the flag would defeat the extended-threshold guarantee for the
-  // wait that follows. The flag persists until endTurn(). Fixes the
-  // non-blocking note from PR2 review (#1125).
-  s.lastPokeFiredAt = null
   s.fallbackFired = false
-}
-
-/**
- * Note that the model dispatched a sub-agent (Task tool, @worker, etc).
- * Extends the soft threshold for THIS turn. The flag persists until
- * endTurn() — subsequent outbound messages within the turn keep the
- * extended threshold, which is the correct shape for the dispatch
- * narrate → wait → child-result → summarise sequence.
- */
-export function noteSubagentDispatch(key: string): void {
-  const s = state.get(key)
-  if (s == null) return
-  s.subagentDispatchActive = true
 }
 
 /**
@@ -344,70 +239,16 @@ export function noteToolLabel(
   entry.label = label
 }
 
-/**
- * Drain any armed poke for ANY active turn and return the system-reminder
- * text to append. Returns null if nothing is armed.
- *
- * Called at the gateway's tool-result chokepoint; the appended reminder
- * piggybacks the result back to claude. Drains the flag immediately so
- * the next tool result doesn't double-inject.
- *
- * Iterates all keys because the tool result doesn't carry which turn it
- * belongs to. In practice the gateway has ≤1 active turn at a time, but
- * the code handles multi-turn correctly: each turn's poke text is
- * appended once (and never appears in another turn's tool result, since
- * we drain by mutating the matched state).
- */
-export function consumeArmedPoke(): string | null {
-  for (const s of state.values()) {
-    if (s.pokeArmed != null) {
-      const level = s.pokeArmed.level
-      s.pokeArmed = null
-      return formatPokeText(level)
-    }
-  }
-  return null
-}
-
 /** End a turn — drop state. Idempotent. */
 export function endTurn(key: string): void {
   state.delete(key)
-}
-
-/** Verbatim poke text. Wording is load-bearing — see issue #1122 design. */
-export function formatPokeText(level: PokeLevel): string {
-  if (level === 'ack') {
-    return (
-      "[silence-poke] You haven't sent the user anything yet this turn — "
-      + 'they are looking at a silent chat. Send a short, human one-line '
-      + 'acknowledgement now via `reply` (e.g. "on it — checking"), in your '
-      + "persona's voice, before you do any more work. A good colleague "
-      + "answers in a beat; don't leave the message hanging while you think. "
-      + 'If the full answer is genuinely seconds away, send that instead.'
-    )
-  }
-  if (level === 'soft') {
-    return (
-      "[silence-poke] You've been silent to the user for 75s. If you're "
-      + "still working on this, send one short conversational reply — e.g. "
-      + "\"still going, working through X\" — so they know you're alive. "
-      + "Keep it brief; don't restate the task. If you're about to finish "
-      + 'within the next few seconds, skip the update.'
-    )
-  }
-  return (
-    "[silence-poke] 3 minutes silent. Please send an update now — what "
-    + "you're working on, or whether you're stuck. If something is taking "
-    + 'unusually long (slow tool, network, waiting on a sub-agent), say so '
-    + 'explicitly.'
-  )
 }
 
 /**
  * Verbatim framework-fallback text — the user-visible "still working / still
  * thinking" message the gateway sends at the 300s threshold when the model
  * hasn't broken its own silence. Wording is load-bearing (see
- * `reference/conversational-pacing.md` § Silence-poke ladder). Two principles:
+ * `reference/conversational-pacing.md` § Safety net). Two principles:
  *
  *   1. The parenthetical `(no update from agent in N min)` is honest —
  *      distinguishes from "the agent said something" so users learn to trust
@@ -485,8 +326,10 @@ function truncateLabel(label: string): string {
 }
 
 /**
- * Internal tick — iterates active states, arms pokes or fires fallback.
- * Exported as __tickForTests so suite can step the clock deterministically.
+ * Internal tick — iterates active states and fires the 300s framework
+ * fallback (which the gateway turns into a user-visible message + an
+ * unwedge). Exported as __tickForTests so the suite can step the clock
+ * deterministically.
  */
 function tick(now: number): void {
   if (activeDeps == null) return
@@ -495,125 +338,9 @@ function tick(now: number): void {
     const zeroAt = s.lastOutboundAt ?? s.turnStartedAt
     const silence = now - zeroAt
     if (silence < 0) continue
-    const softThreshold = s.subagentDispatchActive
-      ? thresholds.subagentSoft
-      : thresholds.soft
 
-    // Ack budget — the framework enforcing the human-baseline "answer
-    // in a beat." Fires once, only when NOTHING has been sent this turn
-    // (`lastOutboundAt == null`), well before the 75s `soft` threshold.
-    // `soft` measures silence-since-last-outbound and is the wrong
-    // instrument for "you never acknowledged me." Independent of the
-    // soft/firm/fallback ladder: if the model never acks, it still
-    // escalates soft → firm → fallback on schedule after this.
-    if (
-      !s.ackPokeFired
-      && s.lastOutboundAt == null
-      && s.pokesFired === 0
-      && silence >= thresholds.ack
-    ) {
-      s.pokeArmed = { level: 'ack' }
-      s.ackPokeFired = true
-      s.lastPokeFiredAt = now
-      activeDeps.emitMetric({
-        kind: 'silence_poke_fired',
-        key,
-        level: 'ack',
-        silence_ms: silence,
-        subagent_wait: s.subagentDispatchActive,
-      })
-      continue
-    }
-
-    // Awareness ping — framework-owned user-visible status BEFORE the
-    // 300s heavy fallback. Lands at ~60s even when the model is in pure
-    // extended-thinking or the inbound is held (#1892 follow-up), since
-    // it's delivered directly via the gateway → Telegram, not
-    // piggybacked on tool_result. One-shot per turn; suppressed if any
-    // outbound has happened. The 300s fallback is unchanged and
-    // escalates further if silence persists.
-    //
-    // Independent of pokesFired so soft/firm/fallback still escalate on
-    // their own schedule. Independent of ackPokeFired so a long-running
-    // turn that already received the ack-poke (then went silent again)
-    // still gets the user-facing awareness ping.
-    if (
-      !s.awarenessPingFired
-      && s.lastOutboundAt == null
-      && !s.subagentDispatchActive
-      && silence >= thresholds.awarenessPing
-    ) {
-      s.awarenessPingFired = true
-      const { chatId, threadId } = parseKey(key)
-      const recentThinking = s.lastThinkingAt != null
-        && (now - s.lastThinkingAt) < 30_000
-      const fallbackKind: 'working' | 'thinking' = recentThinking ? 'thinking' : 'working'
-      const inFlightTools: ToolSnapshot[] = Array.from(s.inFlightTools.values())
-        .sort((a, b) => a.startedAt - b.startedAt)
-        .map(t => ({
-          name: t.name,
-          label: t.label,
-          durationMs: now - t.startedAt,
-        }))
-      activeDeps.emitMetric({
-        kind: 'awareness_ping_sent',
-        key,
-        fallback_kind: fallbackKind,
-        silence_ms: silence,
-      })
-      try {
-        const ret = activeDeps.onAwarenessPing({
-          key,
-          chatId,
-          threadId,
-          fallbackKind,
-          silenceMs: silence,
-          inFlightTools,
-        })
-        if (ret != null && typeof (ret as Promise<unknown>).then === 'function') {
-          ;(ret as Promise<unknown>).catch(err => {
-            process.stderr.write(`silence-poke: awareness-ping handler rejected: ${err}\n`)
-          })
-        }
-      } catch (err) {
-        process.stderr.write(`silence-poke: awareness-ping handler threw: ${err}\n`)
-      }
-      // Don't `continue` — soft/firm/fallback can still arm in the same tick
-      // if their thresholds have also been crossed. Awareness-ping is a
-      // sibling signal, not part of the ladder.
-    }
-
-    if (s.pokesFired === 0 && silence >= softThreshold) {
-      s.pokeArmed = { level: 'soft' }
-      s.pokesFired = 1
-      s.lastPokeFiredAt = now
-      activeDeps.emitMetric({
-        kind: 'silence_poke_fired',
-        key,
-        level: 'soft',
-        silence_ms: silence,
-        subagent_wait: s.subagentDispatchActive,
-      })
-      continue
-    }
-
-    if (s.pokesFired === 1 && silence >= thresholds.firm) {
-      s.pokeArmed = { level: 'firm' }
-      s.pokesFired = 2
-      s.lastPokeFiredAt = now
-      activeDeps.emitMetric({
-        kind: 'silence_poke_fired',
-        key,
-        level: 'firm',
-        silence_ms: silence,
-        subagent_wait: s.subagentDispatchActive,
-      })
-      continue
-    }
-
-    if (s.pokesFired === 2 && !s.fallbackFired && silence >= thresholds.fallback) {
+    if (!s.fallbackFired && silence >= thresholds.fallback) {
       s.fallbackFired = true
-      s.pokesFired = 3
       const { chatId, threadId } = parseKey(key)
       const recentThinking = s.lastThinkingAt != null
         && (now - s.lastThinkingAt) < 30_000
