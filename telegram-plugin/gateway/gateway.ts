@@ -53,7 +53,6 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { allocateDraftId } from '../draft-transport.js'
 import {
   makeEmptyActivityState,
   registerAndRender,
@@ -1275,6 +1274,11 @@ const progressUpdateTurnCount = new Map<string, number>()
 type CurrentTurn = {
   sessionChatId: string
   sessionThreadId: number | undefined
+  // Inbound message id this turn answers. Anchors the activity feed's
+  // native reply-quote (reply_parameters) so the user's question renders
+  // as a quoted header on the feed message. Null for synthesized turns
+  // (cron/handback) that have no originating inbound message.
+  sourceMessageId: number | null
   startedAt: number
   gatewayReceiveAt: number
   replyCalled: boolean
@@ -1350,19 +1354,14 @@ type CurrentTurn = {
   // final state always lands.
   toolActivity: ActivityState
   activityMessageId: number | null
-  // Draft-transport id when the activity summary is streamed via
-  // sendMessageDraft (DM-only, no thread). Each call to
-  // sendMessageDraft(chat, draftId, text) REPLACES the draft text —
-  // simpler than send+edit. Cleared by `clearActivitySummary` (which
-  // sends an empty draft) when the model's reply takes over.
-  activityDraftId: number | null
   activityInFlight: Promise<void> | null
   activityPendingRender: string | null
   activityLastSentRender: string | null
-  // Draft-mirror Phase 2: accumulating friendly-action feed for this turn
-  // (DRAFT_MIRROR only). Each non-surface tool_use appends a line via
-  // `appendActivityLine`; the feed renders as a capped chronological list
-  // in the ephemeral draft and clears on reply. Reset per turn.
+  // Accumulating friendly-action feed for this turn (DRAFT_MIRROR only).
+  // Each non-surface tool_use appends a line via `appendActivityLine`; the
+  // feed renders (via `renderActivityFeed`) as a capped chronological list
+  // into the in-place edited activity message and clears on reply. Reset
+  // per turn.
   mirrorLines: string[]
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
@@ -3255,18 +3254,18 @@ const ANSWER_STREAM_VISIBLE_ENABLED = (() => {
   return true
 })()
 
-// Draft-mirror preview (RFC docs/rfcs/draft-mirror-preview.md), Phase 1.
-// When enabled, the model's prose narration streams into the ephemeral
-// compose-area draft (sendMessageDraft) instead of a visible real
-// message — a live "what's it doing" preview that clears when the
-// reply lands. Default OFF (canary flag). When on it (a) forces the
-// answer-stream onto draft transport regardless of
-// ANSWER_STREAM_VISIBLE_ENABLED, and (b) suppresses the activity-summary
-// tool-count draft so the two don't collide on the single per-chat
-// draft slot. Delivery on a no-reply turn is owned by turn-flush
-// (decideTurnFlush → capturedText fresh send), NOT answer-stream
-// materialize() — which is dead on the draft-only path (streamMsgId
-// stays null, so its turn-end gate is false). Kill switch:
+// Activity-feed flag (RFC docs/rfcs/draft-mirror-preview.md). When enabled,
+// the gateway streams a live "what it's doing" tool-activity feed for the
+// turn. The PreToolUse sidecar emits a `tool_label` per tool call (flush-
+// independent, so it stays real-time on fast/clustered-tool turns); each
+// label appends to `turn.mirrorLines`, and `renderActivityFeed` renders the
+// capped list into an in-place EDITED message (sendMessage + editMessageText)
+// anchored as a native reply-quote to the user's question. The feed clears on
+// the first reply (hand-off to the answer) and again at turn_end (the no-reply
+// safety net). It does NOT touch the answer-stream's draft/visible lane — the
+// two render on separate surfaces, so they never collide. (The env name is
+// historical: an earlier design mirrored into the compose-area draft; the feed
+// is now a normal edited message.) Default OFF (canary). Kill switch:
 // SWITCHROOM_DRAFT_MIRROR unset/0/false/off/no.
 const DRAFT_MIRROR_ENABLED = (() => {
   const raw = process.env.SWITCHROOM_DRAFT_MIRROR
@@ -6931,19 +6930,12 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
  * `turn.activityInFlight`; while set, new tool_uses only update
  * `turn.activityPendingRender` and return).
  *
- * Transport priority (mirrors the existing answer-stream pattern):
- *
- *   1. DM with no thread AND sendMessageDraft API available →
- *      DRAFT TRANSPORT. Each call REPLACES the draft text (no
- *      edit-in-place needed); the user sees a live preview in their
- *      Telegram compose area as the agent works. When the model's
- *      reply tool lands, `clearActivitySummary` sends an empty draft
- *      to wipe it — only the real reply persists.
- *
- *   2. Anything else (forum topic, draft API absent) → fall through
- *      to sendMessage + editMessageText. The activity message is a
- *      real chat message; `clearActivitySummary` deletes it when the
- *      reply tool takes over.
+ * Transport: a single in-place edited message. The first render does
+ * `sendMessage` (capturing `turn.activityMessageId`); subsequent renders
+ * `editMessageText` that id, so the summary accumulates in place without
+ * retyping the whole block. `clearActivitySummary` deletes the message
+ * when the reply tool takes over. Works in DMs, groups, and forum topics
+ * alike (forum topics pass message_thread_id).
  *
  * The drain holds a reference to `turn`, so a turn-swap mid-drain
  * doesn't corrupt the next turn's atom — late writes land on the
@@ -6954,29 +6946,33 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
     while (turn.activityPendingRender !== turn.activityLastSentRender) {
       const target = turn.activityPendingRender
       if (target == null) break
-      // Escape before wrapping in <i> + parse_mode HTML. The legacy
-      // verb-count summaries were safe ASCII, but the draft-mirror's
-      // describeToolUse content (file names, Bash descriptions, search
-      // queries) can contain <, >, & — which would break HTML parsing
-      // and surface literal tags (the exact #1942 bug class).
-      const html = `<i>${escapeHtmlForTg(target)}</i>`
+      // Two mutually-exclusive producers feed `activityPendingRender`
+      // (gated on DRAFT_MIRROR_ENABLED in handleSessionEvent):
+      //  - feed ON: `renderActivityFeed` already emitted ready Telegram HTML
+      //    with per-line markup (<b>→ current</b> / <i>✓ done</i>) and escaped
+      //    each label's <,>,& itself (#1942 class) — send verbatim, do NOT
+      //    re-escape or re-wrap (double-escaping would surface literal tags).
+      //  - feed OFF: the legacy verb-count summary is plain text — escape and
+      //    wrap in a single <i>.
+      const html = DRAFT_MIRROR_ENABLED ? target : `<i>${escapeHtmlForTg(target)}</i>`
       const chat = turn.sessionChatId
       const thread = turn.sessionThreadId
-      // sendMessageDraft doesn't support forum threads.
-      const useDraft = turn.isDm && thread == null && sendMessageDraftFn != null
+      // Native reply-quote: anchor the feed message to the user's question so
+      // it renders as a quoted header (reply_parameters renders on a real
+      // message; edits preserve it). Feed-only — the legacy summary is left
+      // visually unchanged. allow_sending_without_reply so a deleted source
+      // can't drop the send.
+      const replyAnchor = DRAFT_MIRROR_ENABLED && turn.sourceMessageId != null
+        ? { reply_parameters: { message_id: turn.sourceMessageId, allow_sending_without_reply: true } }
+        : {}
       try {
-        if (useDraft) {
-          if (turn.activityDraftId == null) {
-            turn.activityDraftId = allocateDraftId()
-          }
-          const draftId = turn.activityDraftId
-          await sendMessageDraftFn!(chat, draftId, html, { parse_mode: 'HTML' })
-        } else if (turn.activityMessageId == null) {
+        if (turn.activityMessageId == null) {
           const sent = await robustApiCall(
             () => bot.api.sendMessage(chat, html, {
               ...(thread != null ? { message_thread_id: thread } : {}),
               parse_mode: 'HTML',
               disable_notification: true,
+              ...replyAnchor,
             }),
             { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.send' },
           )
@@ -7006,30 +7002,20 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
 /**
  * Clear the activity summary when the model's reply tool takes over
  * as the authoritative surface. Awaits any in-flight render so we
- * don't race a stale write against the clear, then either sends an
- * empty draft (clears the compose-area preview) or deletes the
- * persisted message. Idempotent + best-effort — failure stderr-logs
- * but does not block.
+ * don't race a stale write against the clear, then deletes the activity
+ * message. Idempotent + best-effort — failure stderr-logs but does not
+ * block.
  *
- * Called from `case 'tool_use'` the moment we see a Telegram reply
- * tool fire, so the user sees the real reply land in the same beat
- * the summary disappears.
+ * Called on the first reply (hand-off to the answer) and again at
+ * turn_end (the no-reply safety net), so the user sees the real reply
+ * land in the same beat the summary disappears.
  */
 function clearActivitySummary(turn: CurrentTurn): void {
   const chat = turn.sessionChatId
   const thread = turn.sessionThreadId
   const inFlight = turn.activityInFlight ?? Promise.resolve()
   void inFlight.then(async () => {
-    if (turn.activityDraftId != null && sendMessageDraftFn != null) {
-      const draftId = turn.activityDraftId
-      turn.activityDraftId = null
-      try {
-        // Empty text → Telegram clears the draft.
-        await sendMessageDraftFn(chat, draftId, '', undefined)
-      } catch (err) {
-        process.stderr.write(`telegram gateway: activity-summary draft-clear failed: ${err}\n`)
-      }
-    } else if (turn.activityMessageId != null) {
+    if (turn.activityMessageId != null) {
       const id = turn.activityMessageId
       turn.activityMessageId = null
       try {
@@ -7088,6 +7074,9 @@ function handleSessionEvent(ev: SessionEvent): void {
         const next: CurrentTurn = {
           sessionChatId: ev.chatId,
           sessionThreadId: ev.threadId != null ? Number(ev.threadId) : undefined,
+          sourceMessageId: ev.messageId != null && /^\d+$/.test(ev.messageId)
+            ? Number(ev.messageId)
+            : null,
           startedAt,
           gatewayReceiveAt: startedAt,
           replyCalled: false,
@@ -7103,7 +7092,6 @@ function handleSessionEvent(ev: SessionEvent): void {
           toolCallCount: 0,
           toolActivity: makeEmptyActivityState(),
           activityMessageId: null,
-          activityDraftId: null,
           activityInFlight: null,
           activityPendingRender: null,
           activityLastSentRender: null,
@@ -7240,21 +7228,14 @@ function handleSessionEvent(ev: SessionEvent): void {
           turn.orphanedReplyTimeoutId = null
         }
         // The model's real reply takes over as the authoritative
-        // surface. Clear the activity summary — for drafts, send an
-        // empty draft to wipe the compose-area preview; for persisted
-        // messages, delete. The user sees the real reply land in the
-        // same beat the summary disappears.
-        // Legacy (flag-off): the activity summary clears on the first
-        // reply — it was a one-shot "what I did" line. DRAFT_MIRROR keeps
-        // the live feed running through mid-turn replies and clears it at
-        // turn_end instead, so an early reply doesn't wipe the stream
-        // (the fast-turn determinism fix).
-        if (wasFirstReply && !DRAFT_MIRROR_ENABLED) {
+        // surface, so delete the activity summary message — the user
+        // sees the real reply land in the same beat the summary
+        // disappears. Applies to both producers (legacy verb-count and
+        // the DRAFT_MIRROR feed); turn_end is the no-reply safety net.
+        if (wasFirstReply) {
           clearActivitySummary(turn)
         }
       }
-      // Tool-intent surface — companion to the PreToolUse ack-first gate
-      // (#1921). On the FIRST non-reply tool_use of a turn AND only when
       // Tool-activity summary — same shape Claude Code natively renders
       // in its CLI/chat UI ("Ran 5 commands, read a file"). The gateway
       // accumulates non-reply tool_use events into `turn.toolActivity`
@@ -7272,17 +7253,17 @@ function handleSessionEvent(ev: SessionEvent): void {
       // exactly once at a time and re-running until pending matches
       // the last-sent. Captures `turn` so a late drain after turn-swap
       // can't corrupt the next turn's atom.
-      // Flag OFF (default): the legacy generic verb-count summary
-      // ("Ran 5 commands") via registerAndRender — byte-identical to
-      // pre-draft-mirror behavior, cleared on first reply.
       //
-      // DRAFT_MIRROR: the draft is NOT driven from this (flush-gated)
-      // tool_use event — it's driven by the real-time `tool_label` event
-      // (PreToolUse sidecar, fires at tool-call time regardless of when
-      // claude flushes the transcript). See `case 'tool_label'`. That's
-      // the determinism fix: on a fast/clustered-tool turn the JSONL
-      // tool_use rows aren't on disk until ~turn-end, so sourcing the
-      // draft here lost the feed; the sidecar is flush-independent.
+      // This (flush-gated) tool_use path drives the summary ONLY when
+      // DRAFT_MIRROR is OFF: the legacy generic verb-count summary
+      // ("Ran 5 commands") via registerAndRender. When DRAFT_MIRROR is
+      // ON the summary is instead driven by the real-time `tool_label`
+      // event (PreToolUse sidecar, fires at tool-call time regardless of
+      // when claude flushes the transcript) — see `case 'tool_label'`.
+      // That's the determinism fix: on a fast/clustered-tool turn the
+      // JSONL tool_use rows aren't on disk until ~turn-end, so sourcing
+      // the feed here lost it; the sidecar is flush-independent. Both
+      // producers feed `activityPendingRender` and clear on first reply.
       if (!DRAFT_MIRROR_ENABLED && !turn.replyCalled && !isTelegramSurfaceTool(name)) {
         const rendered = registerAndRender(turn.toolActivity, name)
         if (rendered != null) {
@@ -7304,18 +7285,24 @@ function handleSessionEvent(ev: SessionEvent): void {
       // DRAFT_MIRROR real-time driver. The PreToolUse hook wrote this
       // label synchronously at tool-call time; the sidecar surfaced it
       // here (~250ms) independent of the transcript flush. Accumulate it
-      // into the live feed and update the ephemeral draft — this is what
-      // makes the draft deterministic on fast/clustered-tool turns where
-      // the JSONL tool_use rows arrive too late.
+      // into the live feed and edit the activity message in place — this
+      // is what makes the feed deterministic on fast/clustered-tool turns
+      // where the JSONL tool_use rows arrive too late.
       if (!DRAFT_MIRROR_ENABLED) return
       const turn = currentTurn
       if (turn == null) return
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
-      // Unlike the legacy tool_use path, do NOT gate on replyCalled — the
-      // whole point is to show activity even when a reply raced ahead of
-      // the (lagged) transcript. The feed clears at turn_end.
+      // Stop feeding once the reply has landed. The first reply is the
+      // hand-off: `clearActivitySummary` deletes the feed so the answer is
+      // the authoritative surface (the validated clean hand-off). Without
+      // this gate a tool called after the reply would re-`sendMessage` a
+      // fresh feed message below the answer — a delete-then-resend flicker.
+      // Safe ordering: `tool_label` is real-time (PreToolUse, ~250ms) while
+      // `replyCalled` is set from the lagged reply tool_use, so a genuinely
+      // pre-reply label virtually always arrives before the flag flips.
+      if (turn.replyCalled) return
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
         turn.activityPendingRender = rendered
@@ -7595,11 +7582,12 @@ function handleSessionEvent(ev: SessionEvent): void {
         clearTimeout(turn.orphanedReplyTimeoutId)
         turn.orphanedReplyTimeoutId = null
       }
-      // DRAFT_MIRROR: the live activity feed runs through the whole turn
-      // (it is NOT cleared on the first reply, unlike the legacy summary)
-      // so an early/mid-turn reply can't wipe it. Clear it here, at the
-      // real end of the turn — the ephemeral compose-area draft goes away
-      // once the work is actually done.
+      // DRAFT_MIRROR: clear the activity feed at the real end of the turn.
+      // This is the no-reply safety net — a turn that ends without ever
+      // calling reply (the answer is delivered by turn-flush / silent-end)
+      // still has its feed removed. On a normal turn the feed was already
+      // cleared at the first reply (the hand-off); clearActivitySummary is
+      // idempotent, so the second call is a no-op.
       if (DRAFT_MIRROR_ENABLED && turn != null) {
         clearActivitySummary(turn)
       }
@@ -15544,7 +15532,9 @@ bot.on('callback_query:data', async ctx => {
 })
 
 // ─── Inbound message handlers ─────────────────────────────────────────────
-bot.on('message:text', async ctx => { await handleInboundCoalesced(ctx, ctx.message.text, undefined) })
+bot.on('message:text', async ctx => {
+  await handleInboundCoalesced(ctx, ctx.message.text, undefined)
+})
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
