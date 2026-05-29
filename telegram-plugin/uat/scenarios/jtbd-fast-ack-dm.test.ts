@@ -6,14 +6,18 @@
  *
  * A person you message answers in a beat — "got it", "on it, checking
  * now" — before the work is done. PR #1633 made that opening
- * acknowledgement a *guarantee*, split across two layers:
+ * acknowledgement a *guarantee*; the enforcement has since moved off
+ * the silence-poke subsystem entirely:
  *
  *   - the conversational-pacing prompt teaches the model to open with
  *     a short human one-liner unless the real answer lands in a second
  *     or two;
- *   - the silence-poke subsystem *enforces* it — a ~10s ack-budget
- *     poke fires when nothing at all has been sent this turn, nudging
- *     the model to acknowledge before it does more work.
+ *   - the live-updating reply/draft carries the acknowledgement beat
+ *     natively — the user watches the message begin to compose itself,
+ *     which IS the sign of life. The old ~10s ack-budget poke (a
+ *     model-targeted nudge) was retired along with the rest of the
+ *     nudge ladder; only the 300s framework fallback remains, and that
+ *     is a wedge-breaker, not an ack mechanism.
  *
  * This UAT drives a FUZZY set of non-trivial prompt shapes — research,
  * multi-step compute, open-ended advice, code, reflective asks. Every
@@ -25,15 +29,11 @@
  *
  *   - **Hard contract:** the first outbound lands within `ACK_HARD_MS`
  *     for every prompt. This is a tight *latency target*, not a
- *     framework guarantee. The silence-poke ack rung is a *nudge*
- *     piggybacked on the model's next tool result (`consumeArmedPoke`
- *     drained at the gateway tool-result chokepoint) — not a
- *     framework-composed send. It helps the model along, but a
- *     pure-reasoning prompt that issues no tool call never drains the
- *     nudge, so the bound ultimately depends on model latency. It
- *     still has teeth: pre-#1633 a slow prompt's first outbound was
- *     the full answer, often 30-60s out, so 20s cleanly separates the
- *     fixed behaviour from a regression. A failure here means the
+ *     framework guarantee — the bound ultimately depends on model
+ *     latency and on the pacing prompt + draft transport doing their
+ *     job. It still has teeth: pre-#1633 a slow prompt's first outbound
+ *     was the full answer, often 30-60s out, so 20s cleanly separates
+ *     the fixed behaviour from a regression. A failure here means the
  *     agent left the user on a silent chat — a real pacing defect.
  *   - **Vision target (soft, per-case forensic):** the first outbound
  *     lands within `ACK_VISION_MS` and is short — a genuine
@@ -65,12 +65,11 @@ const AGENT = "test-harness";
 // A tight latency target — well above a healthy self-ack (~3-8s on a
 // warm agent) and well below the pre-#1633 silent-then-dump regression
 // (30-60s). Model-dependent, not a framework guarantee (see header
-// doc), so it carries generous headroom for mtcute polling jitter and
-// for a model that leans on the ack-poke nudge instead of self-acking.
+// doc), so it carries generous headroom for mtcute polling jitter.
 const ACK_HARD_MS = 20_000;
 
-// Vision target: the model self-acknowledges in a beat, fast enough
-// that the ack-poke nudge never has to come into it.
+// Vision target: the model self-acknowledges in a beat — the draft
+// begins composing fast enough that the user never feels a gap.
 const ACK_VISION_MS = 8_000;
 
 // A first outbound at or under this length reads as an acknowledgement
@@ -173,15 +172,14 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
             throw new Error(
               `[ack] ${tc.name}: TTFO=${ttfo}ms exceeds the hard `
               + `contract ${ACK_HARD_MS}ms — the user sat on a silent `
-              + `chat. The fast-ack path (pacing prompt + ack-poke `
-              + `nudge) is not delivering. First outbound: `
+              + `chat. The fast-ack path (pacing prompt + live draft) `
+              + `is not delivering. First outbound: `
               + `${JSON.stringify(firstOutbound.text.slice(0, 200))}`,
             );
           }
           expect(ttfo).toBeLessThan(ACK_HARD_MS);
 
-          // Forensic, soft: did the model self-acknowledge in a beat,
-          // or did it only get there with the ack-poke nudge?
+          // Forensic, soft: did the model self-acknowledge in a beat?
           const looksLikeAck = len <= ACK_LEN_CEILING;
           if (ttfo < ACK_VISION_MS && looksLikeAck) {
             console.log(
@@ -198,8 +196,8 @@ describe("uat: guaranteed fast acknowledgement — fuzzy prompt shapes", () => {
             );
           } else {
             // Passed the hard contract but slower than the vision
-            // target — the canary for the model needing the ack-poke
-            // nudge instead of acknowledging promptly on its own.
+            // target — the canary for the model not acknowledging
+            // promptly on its own (draft slow to start composing).
             console.warn(
               `[ack] ${tc.name}: TTFO=${ttfo}ms (vision target `
               + `<${ACK_VISION_MS}ms), ${len} chars`

@@ -1,16 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   startTurn,
   noteOutbound,
-  noteSubagentDispatch,
   noteThinking,
   noteToolStart,
   noteToolEnd,
   noteToolLabel,
-  consumeArmedPoke,
   endTurn,
   silencePokeEnabled,
-  formatPokeText,
   formatFrameworkFallbackText,
   __tickForTests,
   __setDepsForTests,
@@ -26,27 +23,15 @@ const ORIGINAL_KILL_SWITCH = process.env.SWITCHROOM_DISABLE_SILENCE_POKE
 interface TestFixtures {
   emitted: SilencePokeMetric[]
   fallbacks: FrameworkFallbackContext[]
-  awarenessPings: FrameworkFallbackContext[]
 }
 
 function setupDeps(opts?: { thresholds?: Partial<typeof DEFAULT_THRESHOLDS> }): TestFixtures {
-  const fixtures: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
+  const fixtures: TestFixtures = { emitted: [], fallbacks: [] }
   __setDepsForTests({
     emitMetric: (e) => fixtures.emitted.push(e),
     onFrameworkFallback: (ctx) => { fixtures.fallbacks.push(ctx) },
-    onAwarenessPing: (ctx) => { fixtures.awarenessPings.push(ctx) },
-    // The ack budget (a new poke that fires *earlier* than `soft`) is
-    // disabled by default in this fixture so the soft/firm/fallback
-    // ladder tests stay isolated from it. The 'ack budget' describe
-    // block opts back in with a real value.
-    //
-    // The 60s awarenessPing is also disabled by default so the existing
-    // soft/firm/fallback ladder tests don't see the new sibling event;
-    // the 'awareness ping' describe block opts back in.
     thresholdsMs: {
       ...DEFAULT_THRESHOLDS,
-      ack: Number.MAX_SAFE_INTEGER,
-      awarenessPing: Number.MAX_SAFE_INTEGER,
       ...(opts?.thresholds ?? {}),
     },
   })
@@ -85,44 +70,24 @@ describe('silence-poke — kill switch', () => {
   })
 })
 
-describe('silence-poke — escalation ladder', () => {
-  it('soft poke fires at 75s', () => {
+// Post-retirement: the model-targeted nudge ladder (ack/soft/firm) and
+// the 60s awareness ping are gone. The ONLY framework action left is the
+// 300s fallback, which the gateway turns into a user-visible "still
+// working…" message AND an unwedge. These tests pin that single terminal
+// action.
+describe('silence-poke — framework fallback (the only remaining action)', () => {
+  it('does not fire before the 300s threshold', () => {
     const fx = setupDeps()
     startTurn('chat:0', 0)
-
-    __tickForTests(70_000) // before threshold
-    expect(consumeArmedPoke()).toBeNull()
+    __tickForTests(120_000)
+    __tickForTests(299_000)
+    expect(fx.fallbacks).toHaveLength(0)
     expect(fx.emitted).toHaveLength(0)
-
-    __tickForTests(75_000) // at threshold
-    expect(fx.emitted).toEqual([
-      expect.objectContaining({ kind: 'silence_poke_fired', level: 'soft', subagent_wait: false }),
-    ])
-    const text = consumeArmedPoke()
-    expect(text).toContain('[silence-poke]')
-    expect(text).toContain('75s')
   })
 
-  it('firm poke fires at 180s after soft', () => {
-    const fx = setupDeps()
-    startTurn('chat:0', 0)
-    __tickForTests(75_000)
-    consumeArmedPoke() // drain the soft
-    __tickForTests(180_000)
-    expect(fx.emitted.map((e) => e.kind)).toEqual([
-      'silence_poke_fired',
-      'silence_poke_fired',
-    ])
-    expect(fx.emitted[1]).toMatchObject({ level: 'firm' })
-    const firm = consumeArmedPoke()
-    expect(firm).toContain('3 minutes silent')
-  })
-
-  it('framework fallback fires at 300s with kind=working when no thinking signal', () => {
+  it('fires at 300s with kind=working when no thinking signal', () => {
     const fx = setupDeps()
     startTurn('chatX:42', 0)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(300_000)
     expect(fx.fallbacks).toEqual([
       expect.objectContaining({ chatId: 'chatX', threadId: 42, fallbackKind: 'working' }),
@@ -130,23 +95,19 @@ describe('silence-poke — escalation ladder', () => {
     expect(fx.emitted.at(-1)).toMatchObject({ kind: 'silence_fallback_sent', fallback_kind: 'working' })
   })
 
-  it('framework fallback fires with kind=thinking if a thinking event landed within 30s', () => {
+  it('fires with kind=thinking if a thinking event landed within 30s', () => {
     const fx = setupDeps()
     startTurn('c:0', 0)
     noteThinking('c:0', 280_000)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(300_000)
     expect(fx.fallbacks).toEqual([
       expect.objectContaining({ fallbackKind: 'thinking' }),
     ])
   })
 
-  it('framework fallback fires at most once per turn', () => {
+  it('fires at most once per turn', () => {
     const fx = setupDeps()
     startTurn('c:0', 0)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(300_000)
     __tickForTests(450_000) // continued silence
     __tickForTests(600_000)
@@ -154,245 +115,17 @@ describe('silence-poke — escalation ladder', () => {
   })
 })
 
-// PR1 (human-feel UX epic): the ack budget. A person you message
-// answers in a beat — the framework enforces that baseline by arming an
-// 'ack' poke if NOTHING has been sent within `thresholds.ack` of turn
-// start. It is a one-shot nudge (the model still authors every word),
-// deliberately OUTSIDE the soft/firm/fallback `pokesFired` ladder: if
-// the model never acks, the ladder still escalates on its own schedule.
-// See `reference/conversational-pacing.md` and the "Open with an
-// acknowledgement" bullet in `profiles/_shared/telegram-style.md.hbs`.
-//
-// NB: `setupDeps` disables the ack budget by default (ack = MAX_SAFE);
-// every test here opts back in with a real `ack` threshold.
-describe('silence-poke — ack budget (PR1 human-feel UX)', () => {
-  it('arms an ack poke at the ack threshold when nothing has been sent', () => {
-    const fx = setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('chat:0', 0)
-
-    __tickForTests(9_000) // before the ack budget
-    expect(consumeArmedPoke()).toBeNull()
-    expect(fx.emitted).toHaveLength(0)
-
-    __tickForTests(10_000) // at the ack budget
-    expect(fx.emitted).toEqual([
-      expect.objectContaining({ kind: 'silence_poke_fired', level: 'ack' }),
-    ])
-    const text = consumeArmedPoke()
-    expect(text).toContain('[silence-poke]')
-    expect(text).toContain('reply')
-  })
-
-  it('does NOT arm an ack poke if an outbound landed before the budget', () => {
-    const fx = setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('chat:0', 0)
-    noteOutbound('chat:0', 3_000) // model acked fast — inside the budget
-    __tickForTests(10_000)
-    __tickForTests(20_000)
-    expect(consumeArmedPoke()).toBeNull()
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'ack'),
-    ).toHaveLength(0)
-  })
-
-  it('is one-shot — never re-arms even if the model goes quiet again', () => {
-    const fx = setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('chat:0', 0)
-    __tickForTests(10_000)         // ack fires
-    consumeArmedPoke()             // drain it
-    noteOutbound('chat:0', 12_000) // model finally acks
-    // The model goes quiet again. The ack poke is specifically about the
-    // FIRST outbound — it must not fire twice. A later silence is the
-    // soft poke's job, not the ack budget's.
-    __tickForTests(40_000)
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'ack'),
-    ).toHaveLength(1)
-  })
-
-  it('ackPokeFired resets across turns even when endTurn was skipped (CC-5 invariant)', () => {
-    // Mirrors the subagentDispatchActive CC-5 guard: `ackPokeFired` is a
-    // turn-scoped one-shot flag, and the only thing that keeps it from
-    // leaking into the next turn (when an abnormal abort skips endTurn)
-    // is startTurn's unconditional state overwrite. Pin that here so a
-    // future read-modify-write refactor of startTurn fails loud.
-    setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('k', 0)
-    __tickForTests(10_000) // ack fires
-    expect(__getStateForTests('k')?.ackPokeFired).toBe(true)
-    // Turn 2 in the same key, no endTurn — startTurn MUST clear the flag.
-    startTurn('k', 1_000_000)
-    expect(__getStateForTests('k')?.ackPokeFired).toBe(false)
-  })
-
-  it('does not advance the ladder — soft still requires a full 75s of silence', () => {
-    // The ack poke is deliberately outside `pokesFired`. After it fires,
-    // a soft poke must still wait the normal 75s.
-    const fx = setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('chat:0', 0)
-    __tickForTests(10_000) // ack
-    consumeArmedPoke()
-    __tickForTests(70_000) // 70s total — under the 75s soft threshold
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'soft'),
-    ).toHaveLength(0)
-    __tickForTests(75_000)
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired' && e.level === 'soft'),
-    ).toHaveLength(1)
-  })
-
-  it('still escalates ack -> soft -> firm -> fallback on a turn that never acks', () => {
-    const fx = setupDeps({ thresholds: { ack: 10_000 } })
-    startTurn('chat:0', 0)
-    __tickForTests(10_000)  // ack
-    consumeArmedPoke()
-    __tickForTests(75_000)  // soft
-    consumeArmedPoke()
-    __tickForTests(180_000) // firm
-    consumeArmedPoke()
-    __tickForTests(300_000) // fallback
-    const trail = fx.emitted.map((e) =>
-      e.kind === 'silence_poke_fired'
-        ? `poke:${e.level}`
-        : e.kind === 'silence_fallback_sent'
-          ? `fallback:${e.fallback_kind}`
-          : e.kind,
-    )
-    expect(trail).toEqual([
-      'poke:ack',
-      'poke:soft',
-      'poke:firm',
-      'fallback:working',
-    ])
-  })
-
-  it('formatPokeText("ack") nudges for a human acknowledgement via reply', () => {
-    const text = formatPokeText('ack')
-    expect(text).toContain('[silence-poke]')
-    expect(text.toLowerCase()).toContain('acknowledg')
-    expect(text).toContain('reply')
-  })
-})
-
-describe('silence-poke — outbound resets clock + success measurement', () => {
-  it('noteOutbound resets the silence clock', () => {
-    setupDeps()
-    startTurn('k', 0)
-    noteOutbound('k', 50_000)
-    __tickForTests(120_000) // 70s after outbound — under 75s soft threshold
-    expect(consumeArmedPoke()).toBeNull()
-  })
-
-  it('emits silence_poke_succeeded when outbound lands within success window after a poke', () => {
+describe('silence-poke — outbound resets the silence clock', () => {
+  it('noteOutbound pushes the fallback measurement to the last outbound', () => {
     const fx = setupDeps()
     startTurn('k', 0)
-    __tickForTests(75_000) // soft poke armed
-    noteOutbound('k', 80_000) // 5s later — within 15s success window
-    expect(fx.emitted.map((e) => e.kind)).toContain('silence_poke_succeeded')
-    const success = fx.emitted.find((e) => e.kind === 'silence_poke_succeeded')!
-    expect(success).toMatchObject({ level: 'soft', latency_ms: 5_000 })
-  })
-
-  it('does NOT emit silence_poke_succeeded if outbound is later than the success window', () => {
-    const fx = setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000)
-    noteOutbound('k', 95_000) // 20s later — outside 15s window
-    expect(fx.emitted.filter((e) => e.kind === 'silence_poke_succeeded')).toHaveLength(0)
-  })
-
-  it('outbound resets pokesFired so the next 75s silence can re-arm', () => {
-    const fx = setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000) // soft fires
-    noteOutbound('k', 100_000) // reset
-    __tickForTests(180_000) // 80s since outbound — under threshold
-    __tickForTests(180_000 + 50_000) // would be 130s if not reset; still no fire because clock zero = 100_000, so silence = 130s
-    // Actually 230 - 100 = 130s past outbound, > 75s soft threshold:
-    expect(fx.emitted.filter((e) => e.kind === 'silence_poke_fired')).toHaveLength(2)
-    expect(fx.emitted.filter((e) => e.kind === 'silence_poke_fired').at(-1)).toMatchObject({ level: 'soft' })
-  })
-})
-
-describe('silence-poke — subagent dispatch extension', () => {
-  it('extends soft threshold to 300s when noteSubagentDispatch was called', () => {
-    const fx = setupDeps()
-    startTurn('k', 0)
-    noteSubagentDispatch('k')
-    __tickForTests(120_000) // past 75s but under 300s subagent threshold
-    expect(fx.emitted).toHaveLength(0)
+    noteOutbound('k', 250_000)
+    // 300s from turn start, but only 50s since the outbound — no fire.
     __tickForTests(300_000)
-    expect(fx.emitted).toHaveLength(1)
-    expect(fx.emitted[0]).toMatchObject({ level: 'soft', subagent_wait: true })
-  })
-
-  it('subagent flag PERSISTS through narrating outbound (PR4 fix)', () => {
-    // Reviewer note from PR2 #1125 — the parent's "spinning up @reviewer"
-    // narration is the outbound that opens the wait. Clearing the
-    // subagent flag at that moment would defeat the extended-threshold
-    // guarantee for the wait that follows. The flag must persist until
-    // endTurn().
-    const fx = setupDeps()
-    startTurn('k', 0)
-    noteSubagentDispatch('k')
-    noteOutbound('k', 60_000) // parent narrates "spinning up @reviewer"
-    // Subagent wait continues. With the flag persistent, soft threshold
-    // is still 300s, so a 90s gap should NOT fire.
-    __tickForTests(60_000 + 90_000)
-    expect(fx.emitted.filter((e) => e.kind === 'silence_poke_fired')).toHaveLength(0)
-    // At 300s past the outbound, the soft poke fires (subagent wait
-    // is genuinely long).
-    __tickForTests(60_000 + 300_000)
-    expect(fx.emitted.filter((e) => e.kind === 'silence_poke_fired')).toHaveLength(1)
-    expect(fx.emitted[0]).toMatchObject({ level: 'soft', subagent_wait: true })
-  })
-
-  it('subagent flag clears on endTurn', () => {
-    setupDeps()
-    startTurn('k', 0)
-    noteSubagentDispatch('k')
-    // Take snapshot
-    const before = __getStateForTests('k')
-    expect(before?.subagentDispatchActive).toBe(true)
-    endTurn('k')
-    expect(__getStateForTests('k')).toBeUndefined()
-  })
-
-  // CC-5 defensive invariant (`docs/status-ask-cause-classes.md`):
-  // the original catalog claim was that `subagentDispatchActive` can
-  // leak across turns if `endTurn` is skipped (turn dies abnormally,
-  // gateway crashes between turn_end signal and cleanup). Investigation
-  // shows the claim doesn't hold — `startTurn` calls `state.set(key, ...)`
-  // unconditionally with `subagentDispatchActive: false`, so the next
-  // turn's startTurn wipes any stale flag.
-  //
-  // We're pinning that invariant here as a regression guard. If a future
-  // refactor changes `startTurn` to a read-modify-write (merge instead
-  // of overwrite), this test breaks immediately. Keeps the catalog's
-  // worry productive: even though it's not currently a bug, the
-  // invariant that makes it not-a-bug is now load-bearing.
-  it('startTurn overwrites stale subagentDispatchActive when endTurn was skipped (CC-5 invariant)', () => {
-    const fx = setupDeps()
-    // Turn 1: dispatch a subagent, then SKIP endTurn (simulating an
-    // abnormal abort path — context-exhaustion, gateway crash mid-turn,
-    // etc).
-    startTurn('k', 0)
-    noteSubagentDispatch('k')
-    expect(__getStateForTests('k')?.subagentDispatchActive).toBe(true)
-
-    // Turn 2 in the same key: startTurn MUST clear the flag.
-    startTurn('k', 1_000_000)
-    expect(__getStateForTests('k')?.subagentDispatchActive).toBe(false)
-
-    // Verify the soft poke fires at the normal 75s threshold, not at
-    // the extended 300s subagentSoft threshold. If the flag had leaked,
-    // ticking at 75s after the new turn start would find subagentSoft
-    // active and skip the fire.
-    __tickForTests(1_000_000 + 75_000)
-    const fired = fx.emitted.filter((e) => e.kind === 'silence_poke_fired')
-    expect(fired).toHaveLength(1)
-    expect(fired[0]).toMatchObject({ level: 'soft', subagent_wait: false })
+    expect(fx.fallbacks).toHaveLength(0)
+    // 300s after the outbound — now it fires.
+    __tickForTests(550_000)
+    expect(fx.fallbacks).toHaveLength(1)
   })
 })
 
@@ -406,24 +139,16 @@ describe('silence-poke — subagent dispatch extension', () => {
 // contradicts the gateway's earlier "⚠️ Context window full" / etc.
 //
 // Surfaced during CC-5 investigation (`docs/status-ask-cause-classes.md`).
-// The fix lives in the gateway (context-exhaust path adds the
-// endTurn call); these tests pin the invariant at the silence-poke
-// level so the contract is verifiable in isolation of the gateway.
 describe('silence-poke — abnormal turn-end invariants (CC-5 follow-up)', () => {
   it('endTurn before the 300s fallback threshold prevents the fallback from firing', () => {
     const fx = setupDeps()
     startTurn('k', 0)
-    // Soft + firm pokes arm; turn is alive and the model could still
-    // recover.
-    __tickForTests(75_000)
-    __tickForTests(180_000)
+    __tickForTests(180_000) // turn alive; model could still recover
     // Gateway aborts the turn at t=250s (context exhaust, wedge,
-    // crash teardown — any abnormal bail). The contract: endTurn
-    // gets called BEFORE the 300s threshold.
+    // crash teardown — any abnormal bail) BEFORE the 300s threshold.
     endTurn('k')
-    // Five minutes total elapse from the original turn start. If
-    // endTurn left the state in the Map, the framework fallback
-    // would fire here. The contract is: it MUST NOT.
+    // Five minutes total elapse. If endTurn left the state in the Map,
+    // the framework fallback would fire here. The contract: it MUST NOT.
     __tickForTests(300_000)
     expect(fx.fallbacks).toHaveLength(0)
     expect(
@@ -431,47 +156,22 @@ describe('silence-poke — abnormal turn-end invariants (CC-5 follow-up)', () =>
     ).toHaveLength(0)
   })
 
-  it('endTurn after a soft poke fired does not later emit a stale fallback', () => {
-    const fx = setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000) // soft fires
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired'),
-    ).toHaveLength(1)
-    // Turn aborts well before firm/fallback thresholds.
-    endTurn('k')
-    __tickForTests(180_000)
-    __tickForTests(300_000)
-    // No firm, no fallback after the turn-abort.
-    expect(
-      fx.emitted.filter((e) => e.kind === 'silence_poke_fired'),
-    ).toHaveLength(1) // unchanged: only the original soft
-    expect(fx.fallbacks).toHaveLength(0)
-  })
-
   // #1289: the flush-backstop turn-end branch in the gateway (the path
   // taken when the agent emits assistant text but never calls the reply
   // tool) was retrofitted in #1067 to null `currentTurn` early but never
-  // had `silencePoke.endTurn` added — leaving state2 populated so the
+  // had `silencePoke.endTurn` added — leaving state populated so the
   // 300s framework fallback fired after the gateway already flushed the
-  // captured prose and considered the turn over. Pin the contract at
-  // the silence-poke level: a turn that records an outbound (the
-  // flushed message) and then calls endTurn must not later fire a
-  // fallback even if 300s elapses from the original turn start.
+  // captured prose and considered the turn over. Pin the contract: a
+  // turn that records an outbound (the flushed message) and then calls
+  // endTurn must not later fire a fallback even if 300s elapses from the
+  // original turn start.
   it('#1289: flush-backstop turn-end (outbound + endTurn) suppresses the 300s fallback', () => {
     const fx = setupDeps()
     startTurn('k', 0)
-    // Some time passes while the agent generates prose without calling
-    // the reply tool. No soft/firm armed yet.
     __tickForTests(60_000)
-    // Gateway turn-flush fires: captured text is sent as an outbound,
-    // then the flush branch nulls currentTurn AND (post-fix) calls
-    // signalTracker.clear + silencePoke.endTurn.
     noteOutbound('k', 60_000)
     endTurn('k')
-    // 300s elapses from the original turn start. Pre-fix: the framework
-    // fallback fired here. Post-fix: the state is drained, no fallback.
-    __tickForTests(240_000)
+    __tickForTests(360_000)
     expect(fx.fallbacks).toHaveLength(0)
     expect(
       fx.emitted.filter((e) => e.kind === 'silence_fallback_sent'),
@@ -493,8 +193,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     const fx = setupDeps()
     startTurn('k', 0)
     noteToolStart('k', 'T1', 'Grep', 'foo', 30_000)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(305_000)
     expect(fx.fallbacks).toHaveLength(1)
     const ctx = fx.fallbacks[0]!
@@ -548,8 +246,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
   })
 
   it('raw mcp__ tool name with NO label falls back to the bare name (no leak-but-no-better-option)', () => {
-    // If the label table doesn't recognise an MCP tool, we have nothing
-    // better to show than the raw name. Better honest-ugly than silent.
     const text = formatFrameworkFallbackText('working', 305_000, [
       { name: 'mcp__some-third-party__do_thing', label: null, durationMs: 305_000 },
     ])
@@ -559,9 +255,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
   })
 
   it('built-in tool (Grep) with a label keeps the prior "running Name label" shape — name is already human-readable', () => {
-    // Regression guard: don't accidentally drop the built-in tool name
-    // when generalising the MCP rule. "Grep" is human-readable; the
-    // label ("foo") is supplementary detail like the search pattern.
     const text = formatFrameworkFallbackText('working', 305_000, [
       { name: 'Grep', label: 'foo', durationMs: 305_000 },
     ])
@@ -577,7 +270,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     expect(
       formatFrameworkFallbackText('thinking', 305_000, []),
     ).toBe('still thinking… (no update from agent in 5 min)')
-    // No third arg → same as empty array.
     expect(
       formatFrameworkFallbackText('working', 305_000),
     ).toBe('still working… (no update from agent in 5 min)')
@@ -596,8 +288,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     startTurn('k', 0)
     noteToolStart('k', 'T1', 'Grep', 'foo', 30_000)
     noteToolEnd('k', 'T1', 200_000)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(305_000)
     expect(fx.fallbacks).toHaveLength(1)
     expect(fx.fallbacks[0]!.inFlightTools).toHaveLength(0)
@@ -608,8 +298,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     startTurn('k', 0)
     noteToolStart('k', 'T1', 'Grep', null, 30_000)
     noteToolLabel('k', 'T1', '"refined-from-sidecar"')
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(305_000)
     expect(fx.fallbacks[0]!.inFlightTools[0]!.label).toBe('"refined-from-sidecar"')
   })
@@ -620,7 +308,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     noteToolStart('k', 'T1', 'Grep', 'foo', 30_000)
     expect(__getStateForTests('k')!.inFlightTools.size).toBe(1)
     endTurn('k')
-    // A fresh turn under the same key has an empty map.
     startTurn('k', 1_000_000)
     expect(__getStateForTests('k')!.inFlightTools.size).toBe(0)
   })
@@ -632,8 +319,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     noteToolStart('k', 'T-late', 'Read', 'recent.ts', 250_000)
     noteToolStart('k', 'T-early', 'Grep', '"oldest"', 20_000)
     noteToolStart('k', 'T-mid', 'Bash', null, 100_000)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(305_000)
     const snap = fx.fallbacks[0]!.inFlightTools
     expect(snap.map(t => t.name)).toEqual(['Grep', 'Bash', 'Read'])
@@ -642,7 +327,7 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
   it('tool churn does NOT reset the silence clock (header invariant preserved)', () => {
     // The whole point of #1292 (b) over (a) is that we enrich the
     // fallback TEXT, never the timing. Tool activity must not delay
-    // or suppress the soft/firm/fallback escalation ladder.
+    // or suppress the 300s fallback.
     const fx = setupDeps()
     startTurn('k', 0)
     // A constant stream of tool churn through the entire 5min window —
@@ -651,35 +336,17 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
       noteToolStart('k', `T-${t}`, 'Grep', 'foo', t)
       noteToolEnd('k', `T-${t}`, t + 500)
     }
-    __tickForTests(75_000) // soft
-    __tickForTests(180_000) // firm
-    __tickForTests(305_000) // fallback
-    expect(
-      fx.emitted.filter(e => e.kind === 'silence_poke_fired'),
-    ).toHaveLength(2)
+    __tickForTests(305_000)
     expect(fx.fallbacks).toHaveLength(1)
   })
 
-  it('Task tool sets subagentDispatchActive AND populates inFlightTools', () => {
-    // Two flags are independent: the soft-threshold extension still
-    // works for sub-agent waits (existing behaviour), AND the fallback
-    // message names the Task tool as the actual observable.
+  it('Task tool populates inFlightTools so the fallback names it as the observable', () => {
     const fx = setupDeps()
     startTurn('k', 0)
-    // Gateway calls both for a Task tool_use (mirrors the wiring at
-    // gateway.ts onSessionEvent).
-    noteSubagentDispatch('k')
+    // Gateway calls noteToolStart for a Task tool_use (mirrors the
+    // wiring at gateway.ts onSessionEvent).
     noteToolStart('k', 'T1', 'Task', 'spinning up @researcher', 10_000)
-    // Soft threshold extends to 300s under subagent — so no soft poke
-    // fires at 75s and no firm fires at 180s (firm requires pokesFired===1,
-    // i.e. soft must fire first). Once we cross the 300s subagent-soft,
-    // soft fires; each tick fires one level via the `continue` in tick(),
-    // so we need three ticks to walk soft → firm → fallback.
-    __tickForTests(75_000)   // suppressed by subagent
-    __tickForTests(180_000)  // still suppressed
-    __tickForTests(305_000)  // soft fires (subagent soft = 300s)
-    __tickForTests(305_001)  // firm fires
-    __tickForTests(305_002)  // fallback fires
+    __tickForTests(305_000)
     expect(fx.fallbacks).toHaveLength(1)
     const snap = fx.fallbacks[0]!.inFlightTools
     expect(snap[0]!.name).toBe('Task')
@@ -688,7 +355,6 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
 
   it('noteToolStart on an unknown key is a no-op (no crash, no state)', () => {
     setupDeps()
-    // No startTurn first — silence-poke ignores the call.
     noteToolStart('k-never-started', 'T1', 'Grep', 'foo', 30_000)
     expect(__getStateForTests('k-never-started')).toBeUndefined()
   })
@@ -714,35 +380,8 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     const text = formatFrameworkFallbackText('working', 305_000, [
       { name: 'Grep', label: longLabel, durationMs: 305_000 },
     ])
-    // 60-char cap (with trailing ellipsis) — verify clipping without
-    // pinning exact bytes.
     expect(text.length).toBeLessThan(120)
     expect(text).toContain('…')
-  })
-})
-
-describe('silence-poke — consumeArmedPoke draining', () => {
-  it('drains the armed flag so the next call returns null', () => {
-    setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000)
-    expect(consumeArmedPoke()).not.toBeNull()
-    expect(consumeArmedPoke()).toBeNull()
-  })
-
-  it('returns null when nothing is armed', () => {
-    setupDeps()
-    startTurn('k', 0)
-    expect(consumeArmedPoke()).toBeNull()
-  })
-
-  it('returns the matching level text', () => {
-    setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000)
-    expect(consumeArmedPoke()).toContain('75s')
-    __tickForTests(180_000)
-    expect(consumeArmedPoke()).toContain('3 minutes')
   })
 })
 
@@ -766,104 +405,50 @@ describe('silence-poke — independence across turns', () => {
     const fx = setupDeps()
     startTurn('a:0', 0)
     startTurn('b:0', 0)
-    noteOutbound('a:0', 50_000)
-    __tickForTests(75_000)
-    // a's clock was reset to 50_000, silence=25s — no fire.
-    // b's clock is still at 0, silence=75s — soft fires.
-    expect(fx.emitted).toHaveLength(1)
-    expect(fx.emitted[0]).toMatchObject({ key: 'b:0', level: 'soft' })
+    noteOutbound('a:0', 250_000)
+    __tickForTests(300_000)
+    // a's clock was reset to 250_000 (silence=50s) — no fire.
+    // b's clock is still at 0 (silence=300s) — fallback fires.
+    expect(fx.fallbacks).toHaveLength(1)
+    expect(fx.fallbacks[0]).toMatchObject({ key: 'b:0' })
   })
 })
 
 describe('silence-poke — fallback handler errors do not break timer', () => {
   it('continues to function if onFrameworkFallback throws', () => {
-    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
+    const fx: TestFixtures = { emitted: [], fallbacks: [] }
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => { throw new Error('oh no') },
-      onAwarenessPing: () => {},
-      // ack + awareness-ping out of the way — this test exercises the
-      // soft/firm/fallback ladder under a throwing fallback handler.
-      thresholdsMs: {
-        ...DEFAULT_THRESHOLDS,
-        ack: Number.MAX_SAFE_INTEGER,
-        awarenessPing: Number.MAX_SAFE_INTEGER,
-      },
+      thresholdsMs: { ...DEFAULT_THRESHOLDS },
     })
     startTurn('k', 0)
     expect(() => {
-      __tickForTests(75_000)
-      __tickForTests(180_000)
       __tickForTests(300_000)
     }).not.toThrow()
-    // Telemetry still emitted
     expect(fx.emitted.some((e) => e.kind === 'silence_fallback_sent')).toBe(true)
   })
 
   it('continues to function if onFrameworkFallback returns a rejected promise', async () => {
-    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
+    const fx: TestFixtures = { emitted: [], fallbacks: [] }
     __setDepsForTests({
       emitMetric: (e) => fx.emitted.push(e),
       onFrameworkFallback: () => Promise.reject(new Error('async fail')),
-      onAwarenessPing: () => {},
-      // ack + awareness-ping out of the way — see the throwing-handler test above.
-      thresholdsMs: {
-        ...DEFAULT_THRESHOLDS,
-        ack: Number.MAX_SAFE_INTEGER,
-        awarenessPing: Number.MAX_SAFE_INTEGER,
-      },
+      thresholdsMs: { ...DEFAULT_THRESHOLDS },
     })
     startTurn('k', 0)
-    __tickForTests(75_000)
-    __tickForTests(180_000)
     __tickForTests(300_000)
-    // Allow microtasks for the rejection-catch to fire
     await new Promise((r) => setTimeout(r, 0))
     expect(fx.emitted.some((e) => e.kind === 'silence_fallback_sent')).toBe(true)
   })
 })
 
-describe('silence-poke — system reminder text', () => {
-  it('soft poke text references the 75s threshold and contains the system-reminder marker', () => {
-    setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000)
-    const text = consumeArmedPoke()
-    expect(text).toContain('[silence-poke]')
-    expect(text).toContain('75s')
-    expect(text).toContain('about to finish')
-  })
-
-  it('firm poke text references the 3-minute threshold', () => {
-    setupDeps()
-    startTurn('k', 0)
-    __tickForTests(75_000)
-    consumeArmedPoke()
-    __tickForTests(180_000)
-    const text = consumeArmedPoke()
-    expect(text).toContain('3 minutes')
-    expect(text).toContain('stuck')
-  })
-})
-
 // CC-4 from `docs/status-ask-cause-classes.md`: wording is load-bearing
-// (`reference/conversational-pacing.md` § Silence-poke ladder). Snapshot
-// the exact strings here so a refactor that drops a key phrase fails
-// loud at test time. If you genuinely need to change the wording,
-// update the snapshot AND the design doc together.
+// (`reference/conversational-pacing.md` § Safety net). Snapshot the exact
+// strings here so a refactor that drops a key phrase fails loud at test
+// time. If you genuinely need to change the wording, update the snapshot
+// AND the design doc together.
 describe('silence-poke — wording snapshots (CC-4)', () => {
-  it('soft poke text is unchanged', () => {
-    expect(formatPokeText('soft')).toMatchInlineSnapshot(
-      `"[silence-poke] You've been silent to the user for 75s. If you're still working on this, send one short conversational reply — e.g. "still going, working through X" — so they know you're alive. Keep it brief; don't restate the task. If you're about to finish within the next few seconds, skip the update."`,
-    )
-  })
-
-  it('firm poke text is unchanged', () => {
-    expect(formatPokeText('firm')).toMatchInlineSnapshot(
-      `"[silence-poke] 3 minutes silent. Please send an update now — what you're working on, or whether you're stuck. If something is taking unusually long (slow tool, network, waiting on a sub-agent), say so explicitly."`,
-    )
-  })
-
   it('framework fallback — working at 300s', () => {
     expect(formatFrameworkFallbackText('working', 300_000)).toMatchInlineSnapshot(
       `"still working… (no update from agent in 5 min)"`,
@@ -877,9 +462,6 @@ describe('silence-poke — wording snapshots (CC-4)', () => {
   })
 
   it('framework fallback — minutes derived from silenceMs, not hard-coded', () => {
-    // The "N min" suffix MUST track ctx.silenceMs so the wording stays
-    // honest if the 300s threshold is tuned. If a refactor accidentally
-    // hard-codes "5 min", these cases break.
     expect(formatFrameworkFallbackText('working', 360_000)).toBe(
       'still working… (no update from agent in 6 min)',
     )
@@ -889,8 +471,6 @@ describe('silence-poke — wording snapshots (CC-4)', () => {
   })
 
   it('framework fallback — minutes floor at 1 even when silenceMs is small', () => {
-    // Defensive: a future caller might invoke with sub-minute silenceMs.
-    // Rendering "0 min" reads as nonsense; floor at 1.
     expect(formatFrameworkFallbackText('working', 30_000)).toBe(
       'still working… (no update from agent in 1 min)',
     )
@@ -907,103 +487,8 @@ describe('silence-poke — performance', () => {
       startTurn(`chat${i}:0`, 0)
     }
     const start = performance.now()
-    __tickForTests(75_000)
+    __tickForTests(75_000) // under fallback threshold — pure iteration cost
     const elapsed = performance.now() - start
-    // 1000 turns should tick in well under 50ms — guards against an
-    // accidentally-quadratic implementation.
     expect(elapsed).toBeLessThan(50)
-  })
-})
-
-describe('silence-poke — awareness ping (early framework-owned user-visible status)', () => {
-  it('fires once at 60s when no outbound has happened', () => {
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    __tickForTests(59_000)
-    expect(fx.awarenessPings.length).toBe(0)
-    __tickForTests(60_000)
-    expect(fx.awarenessPings.length).toBe(1)
-    expect(fx.awarenessPings[0]!.silenceMs).toBeGreaterThanOrEqual(60_000)
-    expect(fx.emitted.some(e => e.kind === 'awareness_ping_sent')).toBe(true)
-  })
-
-  it('is one-shot per turn — does not re-fire as silence continues', () => {
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    __tickForTests(60_000)
-    __tickForTests(120_000)
-    __tickForTests(180_000)
-    expect(fx.awarenessPings.length).toBe(1)
-  })
-
-  it('is suppressed by an early outbound', () => {
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    noteOutbound('k', 30_000)
-    __tickForTests(90_000)
-    expect(fx.awarenessPings.length).toBe(0)
-  })
-
-  it('is suppressed when subagentDispatchActive is true', () => {
-    // Sub-agent dispatch already widens soft to 300s; the awareness-ping
-    // should also defer so we don't pre-empt the sub-agent's natural
-    // progress signal.
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    noteSubagentDispatch('k')
-    __tickForTests(120_000)
-    expect(fx.awarenessPings.length).toBe(0)
-  })
-
-  it('does NOT advance the soft/firm/fallback ladder', () => {
-    // Awareness ping is a sibling signal; soft/firm/fallback continue
-    // to escalate on their own schedule (and the model-targeted ack-poke
-    // similarly remains independent).
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    __tickForTests(60_000) // awareness fires
-    __tickForTests(75_000) // soft fires
-    __tickForTests(180_000) // firm fires
-    __tickForTests(300_000) // fallback fires
-    expect(fx.awarenessPings.length).toBe(1)
-    expect(fx.fallbacks.length).toBe(1)
-    expect(fx.emitted.filter(e => e.kind === 'silence_poke_fired').map(e => (e as { level: string }).level))
-      .toEqual(['soft', 'firm'])
-    expect(fx.emitted.some(e => e.kind === 'silence_fallback_sent')).toBe(true)
-  })
-
-  it('carries fallbackKind=thinking when a recent thinking event landed', () => {
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    noteThinking('k', 45_000)
-    __tickForTests(60_000)
-    expect(fx.awarenessPings.length).toBe(1)
-    expect(fx.awarenessPings[0]!.fallbackKind).toBe('thinking')
-  })
-
-  it('does not fire if turn ends before the threshold', () => {
-    const fx = setupDeps({ thresholds: { awarenessPing: 60_000 } })
-    startTurn('k', 0)
-    endTurn('k')
-    __tickForTests(120_000)
-    expect(fx.awarenessPings.length).toBe(0)
-  })
-
-  it('handler errors do not break the timer', () => {
-    const fx: TestFixtures = { emitted: [], fallbacks: [], awarenessPings: [] }
-    __setDepsForTests({
-      emitMetric: (e) => fx.emitted.push(e),
-      onFrameworkFallback: () => {},
-      onAwarenessPing: () => { throw new Error('awareness handler boom') },
-      thresholdsMs: {
-        ...DEFAULT_THRESHOLDS,
-        ack: Number.MAX_SAFE_INTEGER,
-        awarenessPing: 60_000,
-      },
-    })
-    startTurn('k', 0)
-    expect(() => __tickForTests(60_000)).not.toThrow()
-    // Telemetry still emitted
-    expect(fx.emitted.some(e => e.kind === 'awareness_ping_sent')).toBe(true)
   })
 })

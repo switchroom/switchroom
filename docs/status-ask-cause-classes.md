@@ -1,5 +1,20 @@
 # Status-ask rate → zero — cause-class catalog
 
+> **Retirement note (2026-05-29).** The L3 silence-poke *ladder* this
+> catalog was written against no longer exists. The model-targeted
+> nudges (ack at 10s, soft at 75s, firm at 180s) and the 60s
+> user-visible awareness ping were retired once the live-updating
+> reply/draft took over the acknowledgement + progress beats — see
+> `reference/conversational-pacing.md` for the current design. Only the
+> **300s framework fallback + unwedge** survives. Consequently the
+> cause classes that describe the ladder are now historical: **CC-3**
+> (soft poke wire path) and **CC-5** (`subagentDispatchActive` leak)
+> describe mechanisms that have been deleted, and the soft/firm halves
+> of **CC-4** are moot — only the 300s wording still applies. The
+> dated progress log and final report below are left intact as an
+> accurate record of the 2026-05-13 work; read them as history, not as
+> current state.
+
 **Goal** (week of 2026-05-13): drive `inbound_status_query` to zero by closing the gaps between the conversational-pacing redesign (#1122) and what is actually exercised by tests.
 
 The JTBD anti-signal lives in `reference/know-what-my-agent-is-doing.md` § "Signs it's working":
@@ -12,7 +27,7 @@ PostHog tracks this as `inbound_status_query` (primary lagging KPI). The classif
 |---|---|---|
 | L1 Ambient | 👀→🤔→🔥→👍 reaction lifecycle on the user's inbound | `telegram-plugin/status-reactions.ts` |
 | L2 Conversational | Paced `reply` calls + `disable_notification` mid-turn | `profiles/_shared/telegram-style.md.hbs` |
-| L3 Safety net | 75s/180s/300s silence-poke + framework fallback | `telegram-plugin/silence-poke.ts` |
+| L3 Safety net | 300s framework fallback + unwedge (the 75s/180s nudge ladder was retired — see banner) | `telegram-plugin/silence-poke.ts` |
 
 Every cause class below is a way the three layers can fail in production *without breaking any current test*. The catalog is what informs the PR series.
 
