@@ -38,6 +38,7 @@ import { registerSkillSearchCommand } from "./skill-search.js";
 import { registerAgentConfigMcpCommand } from "./mcp-agent-config.js";
 import { registerHostdMcpCommand } from "./mcp-hostd.js";
 import { registerHostdCommand } from "./hostd.js";
+import { registerWebdCommand } from "./webd.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -100,3 +101,4 @@ registerSkillSearchCommand(program);
 registerAgentConfigMcpCommand(program);
 registerHostdMcpCommand(program);
 registerHostdCommand(program);
+registerWebdCommand(program);

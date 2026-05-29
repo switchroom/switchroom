@@ -169,6 +169,7 @@ jobs:
           - { name: kernel,       file: docker/Dockerfile.kernel }
           - { name: hostd,        file: docker/Dockerfile.hostd }
           - { name: auth-broker,  file: docker/Dockerfile.auth-broker }
+          - { name: web,          file: docker/Dockerfile.web }
           # hindsight is NOT here — it has its own `build-hindsight`
           # job (PR #1310) that runs in parallel with build-base
           # because Dockerfile.hindsight extends upstream

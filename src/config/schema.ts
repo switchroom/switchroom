@@ -2349,6 +2349,32 @@ export const HostControlConfigSchema = z.object({
 });
 
 /**
+ * Web-service (dashboard + GitHub-webhook receiver) container config.
+ * Phase 3 of the webhook Docker-native migration: the web server used
+ * to run as a systemd unit straight off the shared source checkout;
+ * `switchroom webd install` packages it as an image-pinned container in
+ * its own compose project (`switchroom-web`).
+ */
+export const WebServiceConfigSchema = z.object({
+  managed: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Whether `switchroom update` refreshes the web-service container " +
+      "(dashboard + GitHub-webhook receiver) via `switchroom webd " +
+      "install`. Default: false — existing installs run the web server " +
+      "as the legacy `switchroom-web.service` systemd unit and must not " +
+      "be surprised by a container takeover of host loopback 127.0.0.1:" +
+      "8080 mid-update. Set true ONLY after cutting over to the " +
+      "container (stop+disable the systemd unit, `switchroom webd " +
+      "install`). The container runs in its own compose project " +
+      "(`switchroom-web`), separate from the agent fleet, with " +
+      "network_mode: host so it keeps owning loopback:8080 for the " +
+      "cloudflared tunnel + tailscale serve consumers.",
+    ),
+});
+
+/**
  * hostd verb-level knobs (separate from `host_control:` which gates
  * the daemon itself).
  *
@@ -2548,6 +2574,13 @@ export const SwitchroomConfigSchema = z.object({
     "from `host_control:` which governs whether the daemon runs at " +
     "all. Currently scopes the opt-in flag and rate cap for the new " +
     "`config_propose_edit` verb (PR 1a — disabled by default).",
+  ),
+  web_service: WebServiceConfigSchema.default({}).describe(
+    "Web-service container (dashboard + GitHub-webhook receiver) config. " +
+    "Defaults to managed=false so existing systemd-mode installs are " +
+    "untouched. Set managed: true after cutting over to the " +
+    "`switchroom-web` container — then `switchroom update` keeps it " +
+    "refreshed. See `switchroom webd install`.",
   ),
   google_accounts: z
     .record(

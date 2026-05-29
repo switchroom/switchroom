@@ -288,3 +288,17 @@ health summary); a follow-up may rename it to `drift` or fold it into
   runs refresh hostd automatically, so the manual `install` path is
   the fallback for debugging a stuck daemon. *Grounded in:*
   `src/cli/hostd.ts`.
+- **`switchroom webd <install|status|uninstall>`** manages
+  `switchroom-web`, the dashboard + GitHub-webhook receiver container.
+  `install` writes `~/.switchroom/web/docker-compose.yml` and brings the
+  container up in its own compose project (separate from the agent fleet
+  by design), `network_mode: host` so it keeps owning host loopback
+  `127.0.0.1:8080` for the cloudflared tunnel + `tailscale serve`
+  consumers, running as the operator uid so its webhook forwards pass
+  each agent gateway's peercred ACL; `status` shows container state;
+  `uninstall` stops it but leaves the compose file for re-install.
+  Replaces the legacy `switchroom-web.service` systemd unit. `switchroom
+  update` refreshes it only when `web_service.managed: true` is set in
+  `switchroom.yaml` (default off — existing systemd installs are
+  untouched). See `docs/webhook-ingest.md` § Deployment. *Grounded in:*
+  `src/cli/webd.ts`.

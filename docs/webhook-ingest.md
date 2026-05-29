@@ -65,6 +65,39 @@ Tell the agent (or have it know via CLAUDE.md) to `cat` or `tail` this file when
 - Source unknown → 400.
 - Verification fails → 401 with a generic body, but the operator log line carries the specific reason for debugging.
 
+## Deployment — the receiver container
+
+The webhook receiver is the GitHub-webhook half of the `switchroom web`
+server (the other half is the dashboard). It can run two ways:
+
+- **Legacy (systemd):** `switchroom-web.service` runs the server straight
+  off the source checkout. Fragile — another agent's worktree activity
+  can delete the shared `node_modules` out from under the long-lived
+  process, crash-looping the next restart on ENOENT.
+
+- **Container (preferred):** `switchroom webd install` packages it as an
+  image-pinned container in its own compose project (`switchroom-web`),
+  separate from the agent fleet so the fleet's `compose up -d
+  --remove-orphans` cycle can't recreate it mid-request. Three load-
+  bearing properties of the compose shape (`src/cli/webd.ts`):
+  - `network_mode: host` — the server must own host loopback
+    `127.0.0.1:8080`, where the cloudflared tunnel (webhooks) and
+    `tailscale serve` (dashboard) both reach it. The dashboard CSRF gate
+    trusts the `Tailscale-User-Login` header only on loopback (PR #1380),
+    which only host networking preserves.
+  - runs as the **operator uid** — the receiver's forward to each agent's
+    `webhook.sock` is peercred-gated to `{agent uid,
+    SWITCHROOM_WEBHOOK_RECEIVER_UID = operator uid}`. Any other uid → 503.
+  - **no docker socket, no added caps** — minimal surface for the one
+    internet-facing component.
+
+  Manage it with `switchroom webd <install|status|uninstall>`. Cutover
+  from systemd: bring the container up, verify, then `systemctl --user
+  stop && disable switchroom-web.service`. To keep the container refreshed
+  by `switchroom update`, set `web_service.managed: true` in
+  `switchroom.yaml` (default `false`, so existing systemd installs are
+  untouched).
+
 ## Out of scope
 
 - Auto-posting to Telegram. Today the user has to ask the agent ("anything new from GitHub?"). Auto-post requires bot-token resolution + topic mapping; future PR.
