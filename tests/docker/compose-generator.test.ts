@@ -1085,6 +1085,24 @@ describe("generateCompose", () => {
     expect(block).not.toContain("SWITCHROOM_AUTH_BROKER_OPERATOR_UID");
   });
 
+  // The agent container's gateway webhook ingest server peercred-gates its
+  // dedicated webhook.sock to the host operator UID. The generator surfaces
+  // that UID into the agent env so the gateway knows which peer to trust.
+  it("emits SWITCHROOM_WEBHOOK_RECEIVER_UID on the agent when operatorUid is set", () => {
+    const out = generateCompose({
+      config: makeConfig({ a: {} }),
+      operatorUid: 1000,
+    });
+    const block = /agent-a:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).toMatch(/SWITCHROOM_WEBHOOK_RECEIVER_UID:\s*"1000"/);
+  });
+
+  it("omits SWITCHROOM_WEBHOOK_RECEIVER_UID when operatorUid is not set (back-compat)", () => {
+    const out = generateCompose({ config: makeConfig({ a: {} }) });
+    const block = /agent-a:[\s\S]*?(?=\n  [a-z])/.exec(out)?.[0] ?? "";
+    expect(block).not.toContain("SWITCHROOM_WEBHOOK_RECEIVER_UID");
+  });
+
   // The approval-kernel mirrors the same operator-socket bind so
   // host-side `approvalList` (the web dashboard) can read decision
   // metadata. SWITCHROOM_KERNEL_OPERATOR_UID enables the kernel's

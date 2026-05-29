@@ -144,6 +144,9 @@ export default defineConfig({
       "**/telegram-plugin/tests/boot-card-reason-to-render.test.ts",
       // boot-version-string.test.ts (#1170) imports bun:test — run via test:bun.
       "**/telegram-plugin/tests/boot-version-string.test.ts",
+      // webhook-ingest-server.test.ts imports bun:test + exercises the
+      // bun:ffi SO_PEERCRED gate (null under node) — run via test:bun.
+      "**/telegram-plugin/gateway/webhook-ingest-server.test.ts",
       "**/telegram-plugin/tests/progress-update.test.ts",
       "**/telegram-plugin/tests/quota-cache.test.ts",
       "**/telegram-plugin/tests/silent-reply-guard.test.ts",

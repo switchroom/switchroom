@@ -708,6 +708,21 @@ export const TelegramChannelSchema = z
         "<agent>/telegram/issues.jsonl. " +
         "Cascades from defaults.channels.telegram.webhook_rate_limit.",
       ),
+    webhook_via_gateway: z
+      .boolean()
+      .optional()
+      .describe(
+        "Route verified webhook events to the agent's in-container gateway " +
+        "over a peercred-gated UDS (<agent>/telegram/webhook.sock) instead " +
+        "of having the host-side web receiver write the agent dir directly. " +
+        "Required under the Docker runtime: the receiver runs as the host " +
+        "operator UID and cannot write the per-agent-UID-owned agent dir " +
+        "(EACCES 500) nor connect the gateway socket. When true the gateway " +
+        "(running as the agent UID) becomes the sole writer of " +
+        "webhook-events.jsonl + dedup/cooldown state and also fires " +
+        "webhook_dispatch. Off by default for back-compat with host-runtime " +
+        "installs. See docs/rfcs/webhook-via-gateway-socket.md.",
+      ),
     // ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────
     // Per-agent override of the fleet-wide telegram.forum_chat_id.
     // When set, this agent owns its own supergroup with forum topics

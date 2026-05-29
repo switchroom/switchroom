@@ -51,6 +51,7 @@ import {
   type WebhookSource,
 } from './webhook-verify.js'
 import type { WebhookDispatchConfig } from './webhook-dispatch.js'
+import { forwardToGateway, type WebhookForwardResponse } from './webhook-ingest-client.js'
 
 export interface WebhookConfig {
   /** Per-source secrets, declared in vault under
@@ -73,6 +74,11 @@ export interface WebhookHandlerDeps {
   dedupStore?: DedupStore
   /** Injectable rate limiter (for testing). Falls back to module-global. */
   rateLimiter?: RateLimiter
+  /**
+   * Override the gateway-forward transport (tests). Production connects to
+   * the agent's `webhook.sock`. Only consulted when `args.viaGateway`.
+   */
+  forwardFn?: typeof forwardToGateway
 }
 
 export interface WebhookHandlerArgs {
@@ -97,6 +103,15 @@ export interface WebhookHandlerArgs {
    * not consume it.
    */
   dispatchConfig?: WebhookDispatchConfig
+  /**
+   * Docker-runtime mode (channels.telegram.webhook_via_gateway). When true,
+   * the receiver does NOT write the agent dir (it can't — the host operator
+   * UID lacks write to the per-agent-UID-owned dir). Instead it forwards the
+   * verified + rendered event to the agent's in-container gateway over
+   * `<agent>/telegram/webhook.sock`; the gateway owns dedup, the jsonl
+   * append, and dispatch. See docs/rfcs/webhook-via-gateway-socket.md.
+   */
+  viaGateway?: boolean
 }
 
 export interface WebhookHandlerResult {
@@ -165,7 +180,7 @@ function saveDedupFile(path: string, deliveries: Record<string, number>, now: nu
 /** In-memory cache of per-agent deliveries, backed by disk. */
 const agentDedupCache = new Map<string, Record<string, number>>()
 
-function createFileDedupStore(resolveAgentDir: (agent: string) => string): DedupStore {
+export function createFileDedupStore(resolveAgentDir: (agent: string) => string): DedupStore {
   return {
     check(agent: string, deliveryId: string, now: number): number | undefined {
       const telegramDir = join(resolveAgentDir(agent), 'telegram')
@@ -350,7 +365,10 @@ export async function handleWebhookIngest(
   }
 
   // ── Dedup check (github only — generic has no delivery ID) ────────────────
-  if (source === 'github') {
+  // Skipped in viaGateway mode: dedup state lives in the agent dir, which
+  // only the gateway (agent UID) can write, so the gateway owns dedup. The
+  // delivery id is forwarded for it to dedup against.
+  if (source === 'github' && !args.viaGateway) {
     const deliveryId = args.headers.get('x-github-delivery')
     if (deliveryId) {
       const originalTs = dedupStore.check(args.agent, deliveryId, now)
@@ -369,10 +387,16 @@ export async function handleWebhookIngest(
   const rpm = args.config.rateLimit?.rpm
   const retryAfter = rpm !== undefined ? rateLimiter.check(args.agent, source, rpm, now) : null
   if (retryAfter !== null) {
-    const agentDir = resolveAgentDir(args.agent)
-    const telegramDir = join(agentDir, 'telegram')
-    if (shouldWriteThrottleIssue(args.agent, source, now)) {
-      writeThrottleIssue(args.agent, source, now, telegramDir, log)
+    // The issues.jsonl breadcrumb writes the agent dir — only possible
+    // when the receiver owns it (host-runtime). In viaGateway mode the
+    // operator UID can't write there, so we skip the breadcrumb (the 429
+    // + log still signal the throttle).
+    if (!args.viaGateway) {
+      const agentDir = resolveAgentDir(args.agent)
+      const telegramDir = join(agentDir, 'telegram')
+      if (shouldWriteThrottleIssue(args.agent, source, now)) {
+        writeThrottleIssue(args.agent, source, now, telegramDir, log)
+      }
     }
     log(`webhook-ingest: agent='${args.agent}' source='${source}' rate limited retry-after=${retryAfter}s\n`)
     return jsonReply(
@@ -400,6 +424,50 @@ export async function handleWebhookIngest(
   const rendered = source === 'github'
     ? renderGithubEvent(eventType, payload)
     : renderGenericEvent(args.source, payload)
+
+  // ── viaGateway: forward to the in-container gateway (agent UID) ───────────
+  // The gateway owns dedup + the jsonl append + dispatch; the receiver is
+  // stateless here. This is the Docker-runtime path: the host operator UID
+  // can't write the per-agent-UID-owned agent dir.
+  if (args.viaGateway) {
+    const socketPath = join(resolveAgentDir(args.agent), 'telegram', 'webhook.sock')
+    const forward = deps.forwardFn ?? forwardToGateway
+    const deliveryId = source === 'github'
+      ? (args.headers.get('x-github-delivery') ?? undefined)
+      : undefined
+    let resp: WebhookForwardResponse | null
+    try {
+      resp = await forward(socketPath, {
+        agent: args.agent,
+        source,
+        event_type: eventType,
+        ts: now,
+        rendered_text: rendered.text,
+        payload,
+        ...(deliveryId ? { delivery_id: deliveryId } : {}),
+      })
+    } catch (err) {
+      log(`webhook-ingest: agent='${args.agent}' source='${source}' gateway forward threw: ${(err as Error).message}\n`)
+      resp = null
+    }
+    if (resp === null) {
+      // Gateway unreachable (socket missing / not listening / timeout).
+      // 503 so GitHub retries rather than marking the hook permanently
+      // broken; distinct from a gateway-side write error (500).
+      log(`webhook-ingest: agent='${args.agent}' source='${source}' gateway unreachable\n`)
+      return jsonReply(503, { ok: false, error: 'gateway unavailable' })
+    }
+    if (resp.status === 'error') {
+      log(`webhook-ingest: agent='${args.agent}' source='${source}' gateway error: ${resp.error ?? 'unknown'}\n`)
+      return jsonReply(500, { ok: false, error: 'gateway record failed' })
+    }
+    if (resp.status === 'deduped') {
+      log(`webhook-ingest: agent='${args.agent}' source='${source}' deduped (gateway) ts=${resp.ts}\n`)
+      return jsonReply(200, { ok: true, deduped: true, ts: resp.ts })
+    }
+    log(`webhook-ingest: agent='${args.agent}' source='${source}' event='${eventType}' recorded via gateway ts=${resp.ts}\n`)
+    return jsonReply(202, { ok: true, recorded: true, ts: resp.ts })
+  }
 
   // Write the verified event to the agent's webhook log.
   const agentDir = resolveAgentDir(args.agent)
