@@ -26,6 +26,21 @@
 # `src/agents/lifecycle.ts:attachAgent` expect — the contract is the
 # same one v0.6 systemd has always honored, just enforced inside the
 # container instead of by the host's user systemd manager.
+
+{{#if handoffEnabled}}
+# The telegram-plugin gateway reads SWITCHROOM_HANDOFF_SHOW_LINE to
+# decide whether to prepend the visible "↩️ Picked up where we left
+# off …" line on the first reply after a restart. It MUST be exported
+# *before* the gateway is forked in the docker preamble below (and
+# before the tmux re-exec), otherwise the gateway — the sole consumer —
+# never inherits it and session_continuity.show_handoff_line:false
+# silently no-ops on every docker agent. Living here, ahead of the
+# runtime branch, covers docker (both the outer fork pass and the inner
+# tmux pass) and the v0.6 non-docker path in one place. Gated on
+# handoffEnabled so a handoff-disabled agent emits no handoff env at all.
+export SWITCHROOM_HANDOFF_SHOW_LINE={{#if handoffShowLine}}true{{else}}false{{/if}}
+{{/if}}
+
 if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" ]; then
   # Hoist TELEGRAM_STATE_DIR up here so the gateway daemon (forked
   # below) finds gateway.sock / gateway.pid.json / history.db at the
@@ -510,9 +525,8 @@ if [ ! -s "$HANDOFF_FILE" ]; then
     timeout 5 handoff-briefing.sh 2>/dev/null || true
   fi
 fi
-# Telegram plugin reads this to decide whether to prepend the visible
-# "↩️ Picked up where we left off — <topic>" line on the first reply.
-export SWITCHROOM_HANDOFF_SHOW_LINE={{#if handoffShowLine}}true{{else}}false{{/if}}
+# SWITCHROOM_HANDOFF_SHOW_LINE is exported near the top of this script
+# (ahead of the docker preamble) so the gateway sidecar inherits it.
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 # Inject .handoff-briefing.md first (assembled from live sources), then
 # .handoff.md (raw transcript tail from the Stop hook). If both
