@@ -134,9 +134,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
  && apt-get install -y --no-install-recommends gh \
  && gh --version >&2
 
-# Pin claude CLI version in the base image so every agent / scheduler
-# container resolves the SAME bundle. The version floats with the
-# upstream tag at image-build time; agents do NOT install claude.
+# Pin claude CLI to an EXACT version in the base image so every agent /
+# scheduler container resolves the SAME, auditable bundle — the built
+# image is deterministic, not "whatever @latest resolved at build time."
+# Bumping the CLI is therefore an explicit, reviewable one-line change
+# here (see #1978). Agents do NOT install claude.
 # Fail-fast: if the npm install or the resulting binary is broken we
 # want the image build to die here, not produce a base that ships
 # downstream and explodes at agent boot. Previously this had a
@@ -145,12 +147,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # CACHE_BUST is wired through from the workflow as
 # `${{ github.run_attempt }}` — fresh pushes to main (attempt=1) hit
 # the cache for fast turnaround, but a `gh run rerun` (attempt=2+)
-# changes the layer hash and forces a fresh `npm install` that re-
-# resolves `@latest` from the registry. Without this, buildkit's
-# `cache-from: type=gha,scope=base` reuses the prior layer even on
-# rerun and the version stays stuck at whatever first cached it.
-# Default `default` so local `docker build` (no build-arg) still
-# works deterministically.
+# changes the layer hash and forces a fresh `npm install`. With an
+# exact pin the re-resolve always yields the same version; CACHE_BUST
+# still matters for the other layers in this stage. Default `default`
+# so local `docker build` (no build-arg) works deterministically.
 ARG CACHE_BUST=default
 # Cache the npm download dir so a CACHE_BUST-driven re-run only pays the
 # version-resolve + install cost, not the ~30s re-download. /root/.npm is
@@ -158,7 +158,7 @@ ARG CACHE_BUST=default
 # bumps.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     echo "cache-bust=${CACHE_BUST}" > /dev/null \
- && npm install -g @anthropic-ai/claude-code@latest \
+ && npm install -g @anthropic-ai/claude-code@2.1.156 \
  && claude --version >&2
 
 # Phase 1b: install bun. The broker server (src/vault/broker/server.ts)

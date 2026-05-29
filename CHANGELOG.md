@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.14.8 — pin claude CLI to the thinking-block-fix build; durable approvals; activity feed
+
+Bundles the claude-CLI thinking-block-400 fix, two reliability fixes
+that merged to `main` since v0.14.7, and the flag-gated activity feed.
+
+### Claude CLI pinned to `@2.1.156` (the 400-fix build)
+
+`docker/Dockerfile.base` and `docker/Dockerfile.hindsight` now install
+`@anthropic-ai/claude-code@2.1.156` (was `@latest`). 2.1.156 proactively
+strips stale `thinking`/`redacted_thinking` blocks before re-sending the
+assistant turn, which fixes the `400 "thinking blocks ... cannot be
+modified"` failures that hit Opus 4.x agents under concurrent sub-agent
+dispatch (see #1978). Hard-pinning makes the built image deterministic
+and auditable — a CLI bump is now an explicit, reviewable one-line
+change rather than "whatever `@latest` resolved at build time."
+
+The hindsight image is pinned to the same version so the memory
+provider runs the identical claude bundle as the agent containers —
+a version skew there could reintroduce the thinking-block class of
+failures on memory reflection.
+
+### PR — durable always-allow approvals (#1979 / #1977)
+
+Approval grants marked always-allow are now persisted durably via
+hostd `config_propose_edit` instead of living only in process memory,
+so they survive a gateway/agent restart.
+
+### PR — doctor flags risky `thinking_effort` × adaptive-model combos (#1980 / #1978)
+
+`switchroom doctor` now warns when an Opus 4.x agent is configured with
+`thinking_effort` above the `low` floor — the combination that triggers
+the thinking-block 400s above. Sonnet is explicitly exempt (it runs
+higher effort fine in practice — avoids false alarms).
+
+### PR — pin claude to the image binary, prune user-local shadows (#1981)
+
+`start.sh` now resolves `claude` to the image-baked
+`/usr/local/bin/claude` and prunes any user-local `claude` install
+shadowing it on `PATH`, so an agent always runs the audited, pinned CLI
+bundle rather than a stale per-HOME copy.
+
+### PR — activity feed via in-place edited message + reply-quote (#1982)
+
+The live tool-activity feed (`SWITCHROOM_DRAFT_MIRROR`, **default OFF**)
+now renders through a single `sendMessage` that is then repeatedly
+`editMessageText`-ed in place, reply-quoting the originating message,
+instead of the old compose-draft transport that conflicted with the
+answer-stream over Telegram's single draft slot. Dormant unless the
+flag is enabled.
+
 ## v0.14.7 — cite Claude Opus 4.8 as the current flagship model (#1975)
 
 Docs refresh: Opus 4.8 (released 2026-05-28) supersedes 4.7 as
