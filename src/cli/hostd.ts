@@ -103,7 +103,7 @@ services:
       - no-new-privileges:true
     volumes:
       # Bind-mounts the entire ~/.switchroom dir so the daemon can:
-      #   - create ~/.switchroom/hostd/<agent>/sock per admin agent
+      #   - create ~/.switchroom/hostd/<agent>/sock per agent
       #   - append to ~/.switchroom/host-control-audit.log
       - ${hostHome}/.switchroom:/host-home/.switchroom:rw
       # ~/.switchroom/switchroom.yaml is a symlink on many operator
@@ -192,14 +192,12 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
     );
   }
 
-  const adminAgents = Object.entries(cfg.agents ?? {})
-    .filter(([, a]) => a?.admin === true)
-    .map(([name]) => name);
-  if (adminAgents.length === 0) {
+  const allAgents = Object.keys(cfg.agents ?? {});
+  if (allAgents.length === 0) {
     console.error(
       chalk.yellow(
-        "No admin-flagged agents in switchroom.yaml. The daemon binds one socket per admin agent — with none, it will exit on startup.\n" +
-          "Set \`admin: true\` on at least one agent (typically the test runner or a dedicated operator agent).",
+        "No agents in switchroom.yaml. The daemon binds one socket per agent — with none, it will exit on startup.\n" +
+          "Add at least one agent before installing hostd.",
       ),
     );
   }
@@ -228,9 +226,17 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
 
   writeFileSync(composePath, yaml, "utf8");
   console.log(chalk.green(`  ✓ Wrote ${composePath}`));
+  const adminAgents = Object.entries(cfg.agents ?? {})
+    .filter(([, a]) => a?.admin === true)
+    .map(([name]) => name);
   console.log(
     chalk.dim(
-      `    admin agents: ${adminAgents.length === 0 ? "(none)" : adminAgents.join(", ")}`,
+      `    agents served (one socket each): ${allAgents.length === 0 ? "(none)" : allAgents.join(", ")}`,
+    ),
+  );
+  console.log(
+    chalk.dim(
+      `    admin agents (full config-edit verbs): ${adminAgents.length === 0 ? "(none)" : adminAgents.join(", ")}`,
     ),
   );
 

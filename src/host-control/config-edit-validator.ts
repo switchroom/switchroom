@@ -41,6 +41,7 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, isAbsolute, normalize } from "node:path";
 import { spawnSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import {
   parseDocument,
   isAlias,
@@ -479,4 +480,114 @@ export function validateConfigEdit(
   const leakErr = secretLeakGuard(beforeData, parsedAfter.data);
   if (leakErr) return leakErr;
   return { ok: true, postApplyContent: applied.after };
+}
+
+export type SelfScopeResult = { ok: true } | { ok: false; detail: string };
+
+/**
+ * Authorize a NON-admin `config_propose_edit` against the self-scope
+ * contract: a non-admin agent may persist its own "🔁 Always allow"
+ * grants, and nothing else. Concretely, the only field the edit may
+ * change is `agents.<caller>.tools.allow`, and it may only GROW it
+ * (additive — no silent removal of an existing rule, no reorder that
+ * drops entries). Every other byte of the config must be byte-for-byte
+ * (structurally) identical before vs. after.
+ *
+ * This is the server-side half of the forge-resistant always-allow
+ * path: the #1977 operator-tap correlation proves a human approved the
+ * grant; this check proves the grant can ONLY widen the caller's own
+ * allow-list. Binding a hostd socket for every agent (see
+ * `main.ts`) is therefore safe — a non-admin socket cannot escalate
+ * because this gate rejects any edit that touches another agent, a
+ * different field, the cascade defaults, or the caller's non-`allow`
+ * settings.
+ *
+ * Pure: parses both YAML blobs, no IO. Returns `{ ok: false }` (deny,
+ * not throw) on any parse failure so the caller stays on the safe side.
+ *
+ * @param beforeContent  Live config bytes (pre-apply).
+ * @param afterContent   Post-apply config bytes (validator's
+ *                       `postApplyContent`).
+ * @param caller         The non-admin agent name proposing the edit.
+ */
+export function assertSelfScopedAllowEdit(
+  beforeContent: string,
+  afterContent: string,
+  caller: string,
+): SelfScopeResult {
+  let before: Record<string, unknown>;
+  let after: Record<string, unknown>;
+  try {
+    before = toObject(parseDocument(beforeContent, { merge: false, strict: false }).toJS());
+    after = toObject(parseDocument(afterContent, { merge: false, strict: false }).toJS());
+  } catch (e) {
+    return { ok: false, detail: `self-scope: config did not parse (${(e as Error).message})` };
+  }
+
+  // 1. Additive-only on the caller's own allow-list: every rule that
+  //    existed before must still be present after. (Adding rules is the
+  //    whole point; dropping one isn't an escalation but it isn't a
+  //    "🔁 Always allow" tap either — keep the contract tight.)
+  const beforeAllow = readCallerAllow(before, caller);
+  const afterAllow = readCallerAllow(after, caller);
+  for (const rule of beforeAllow) {
+    if (!afterAllow.includes(rule)) {
+      return {
+        ok: false,
+        detail: `self-scope: edit removes existing allow rule "${rule}" from agents.${caller}.tools.allow`,
+      };
+    }
+  }
+
+  // 2. Nothing else changed: strip agents.<caller>.tools.allow from both
+  //    sides (identically) and require deep structural equality of the
+  //    remainder. Stripping the whole sub-path — collapsing an emptied
+  //    `tools` object — handles the case where the edit CREATES
+  //    `tools:`/`allow:` that didn't exist before.
+  const beforeStripped = stripCallerAllow(before, caller);
+  const afterStripped = stripCallerAllow(after, caller);
+  if (!isDeepStrictEqual(beforeStripped, afterStripped)) {
+    return {
+      ok: false,
+      detail:
+        `self-scope: edit changes config outside agents.${caller}.tools.allow ` +
+        `(a non-admin agent may only widen its own allow-list)`,
+    };
+  }
+  return { ok: true };
+}
+
+function toObject(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {};
+}
+
+function readCallerAllow(cfg: Record<string, unknown>, caller: string): string[] {
+  const agents = cfg.agents;
+  if (!agents || typeof agents !== "object") return [];
+  const agent = (agents as Record<string, unknown>)[caller];
+  if (!agent || typeof agent !== "object") return [];
+  const tools = (agent as Record<string, unknown>).tools;
+  if (!tools || typeof tools !== "object") return [];
+  const allow = (tools as Record<string, unknown>).allow;
+  return Array.isArray(allow) ? allow.filter((x): x is string => typeof x === "string") : [];
+}
+
+function stripCallerAllow(
+  cfg: Record<string, unknown>,
+  caller: string,
+): Record<string, unknown> {
+  const clone = structuredClone(cfg);
+  const agents = clone.agents;
+  if (!agents || typeof agents !== "object") return clone;
+  const agent = (agents as Record<string, unknown>)[caller];
+  if (!agent || typeof agent !== "object") return clone;
+  const tools = (agent as Record<string, unknown>).tools;
+  if (!tools || typeof tools !== "object") return clone;
+  delete (tools as Record<string, unknown>).allow;
+  if (Object.keys(tools as Record<string, unknown>).length === 0) {
+    delete (agent as Record<string, unknown>).tools;
+  }
+  return clone;
 }

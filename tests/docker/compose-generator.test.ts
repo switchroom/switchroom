@@ -1968,9 +1968,13 @@ describe("agent bind_mounts (#1164)", () => {
 });
 
 describe("host-control daemon bind mount (RFC C Phase 1)", () => {
-  // Admin agents get an extra per-agent UDS bind mount when
+  // EVERY agent gets a per-agent UDS bind mount when
   // host_control.enabled is true AND the host-side directory
   // exists (compose `up` hard-fails on missing bind sources).
+  // Binding a socket ≠ granting admin: the socket is mounted for
+  // admin and non-admin agents alike so "🔁 Always allow" can persist
+  // fleet-wide via the self-scoped config_propose_edit path; every
+  // privileged verb is still gated server-side in hostd's checkGate.
   // Since RFC C Phase 2 default-flip the schema defaults `enabled`
   // to true, so the bind mount appears when the block is absent.
 
@@ -2016,7 +2020,7 @@ describe("host-control daemon bind mount (RFC C Phase 1)", () => {
     }
   });
 
-  it("does NOT emit the hostd bind mount on non-admin agents even when enabled", async () => {
+  it("DOES emit the hostd bind mount on non-admin agents when enabled (binding a socket ≠ admin)", async () => {
     const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
@@ -2030,7 +2034,9 @@ describe("host-control daemon bind mount (RFC C Phase 1)", () => {
         ),
         homeDir: tmp,
       });
-      expect(out).not.toMatch(
+      // Non-admin bob gets the socket so its operator-tapped
+      // "🔁 Always allow" grants persist via self-scoped config_propose_edit.
+      expect(out).toMatch(
         /agent-bob:[\s\S]*?\.switchroom\/hostd\/bob:\/run\/switchroom\/hostd\/bob/,
       );
     } finally {
@@ -2038,13 +2044,14 @@ describe("host-control daemon bind mount (RFC C Phase 1)", () => {
     }
   });
 
-  it("emits the hostd bind mount when admin AND enabled AND host dir exists", async () => {
+  it("emits the hostd bind mount for both admin and non-admin agents when enabled AND host dir exists", async () => {
     const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const tmp = mkdtempSync(join(tmpdir(), "hostd-mount-on-"));
     try {
       mkdirSync(join(tmp, ".switchroom/hostd/klanker"), { recursive: true });
+      mkdirSync(join(tmp, ".switchroom/hostd/bob"), { recursive: true });
       const out = generateCompose({
         config: makeConfig(
           { klanker: { admin: true }, bob: {} },
@@ -2057,9 +2064,11 @@ describe("host-control daemon bind mount (RFC C Phase 1)", () => {
           `agent-klanker:[\\s\\S]*?${tmp.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}/\\.switchroom/hostd/klanker:/run/switchroom/hostd/klanker(?!:)`,
         ),
       );
-      // bob (non-admin) does not get the mount even on the same fleet.
-      expect(out).not.toMatch(
-        /agent-bob:[\s\S]*?\.switchroom\/hostd\/bob:/,
+      // bob (non-admin) gets the mount on the same fleet too.
+      expect(out).toMatch(
+        new RegExp(
+          `agent-bob:[\\s\\S]*?${tmp.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}/\\.switchroom/hostd/bob:/run/switchroom/hostd/bob(?!:)`,
+        ),
       );
     } finally {
       rmSync(tmp, { recursive: true, force: true });

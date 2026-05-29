@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostdServer } from "../../src/host-control/server.js";
@@ -161,16 +161,86 @@ describe("hostd config_propose_edit — PR 1a gates (still live)", () => {
     expect(resp.error).toMatch(/^E_CONFIG_EDIT_DISABLED/);
   });
 
-  it("denies non-admin callers before reading the flag", async () => {
+  it("denies a non-admin caller's NON-self-scoped edit with E_NOT_SELF_SCOPED", async () => {
+    // Non-admin callers are now ADMITTED to config_propose_edit (every
+    // agent gets a hostd socket) but confined to widening their OWN
+    // tools.allow. This diff changes agents.bob.model — bob's own
+    // block, but NOT tools.allow — so it's rejected as not-self-scoped.
+    writeFileSync(configPath, BOB_CONFIG);
     server = makeServer({ configEditEnabled: true, configPath });
     await server.start();
+    const notAllowDiff =
+      "--- a/switchroom.yaml\n" +
+      "+++ b/switchroom.yaml\n" +
+      "@@ -7,3 +7,3 @@\n" +
+      "   bob:\n" +
+      '     topic_name: "Bob"\n' +
+      '-    model: "claude-opus-4-8"\n' +
+      '+    model: "claude-haiku-4-5"\n';
     const resp = await send({
       sockOwner: "bob",
-      unified_diff: TINY_DIFF,
+      unified_diff: notAllowDiff,
       request_id: "cpe-3",
     });
     expect(resp.result).toBe("denied");
-    expect(resp.error).toMatch(/requires admin: true/);
+    expect(resp.error).toMatch(/^E_NOT_SELF_SCOPED/);
+    expect(resp.error).toMatch(/agents\.bob\.tools\.allow/);
+  });
+});
+
+// Shared by the self-scope tests: bob exists as a non-admin agent with
+// one anchor field (model) so the always-allow diff has stable context.
+const BOB_CONFIG =
+  "switchroom:\n" +
+  "  version: 1\n" +
+  "telegram:\n" +
+  '  bot_token: "x"\n' +
+  '  forum_chat_id: "1"\n' +
+  "agents:\n" +
+  "  bob:\n" +
+  '    topic_name: "Bob"\n' +
+  '    model: "claude-opus-4-8"\n';
+
+describe("hostd config_propose_edit — non-admin self-scoped always-allow", () => {
+  // Adds a rule to agents.bob.tools.allow — the "🔁 Always allow" path.
+  const SELF_SCOPED_DIFF =
+    "--- a/switchroom.yaml\n" +
+    "+++ b/switchroom.yaml\n" +
+    "@@ -7,3 +7,6 @@\n" +
+    "   bob:\n" +
+    '     topic_name: "Bob"\n' +
+    '     model: "claude-opus-4-8"\n' +
+    "+    tools:\n" +
+    "+      allow:\n" +
+    "+        - mcp__perplexity__search\n";
+
+  it("admits the non-admin caller and applies after operator approval", async () => {
+    writeFileSync(configPath, BOB_CONFIG);
+    const { gw, finalizeCalls, requests } = stubGateway("approve");
+    let reconcileInvocations = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      generateApprovalId: () => "feedface",
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "applied ok", stderr: "" };
+      },
+    });
+    await server.start();
+    const resp = await send({
+      sockOwner: "bob",
+      unified_diff: SELF_SCOPED_DIFF,
+      request_id: "ss-1",
+    });
+    expect(resp.result).toBe("completed");
+    expect(requests.length).toBe(1);
+    expect(requests[0]!.agentName).toBe("bob");
+    expect(finalizeCalls).toEqual([{ outcome: "applied" }]);
+    const live = readFileSync(configPath, "utf8");
+    expect(live).toContain("mcp__perplexity__search");
+    expect(reconcileInvocations).toBe(1);
   });
 });
 

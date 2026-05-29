@@ -44,16 +44,21 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // Bind a per-agent UDS for EVERY agent, not just admin-flagged ones.
+  // The socket is identity (path-as-identity, forge-resistant); binding
+  // it does NOT grant admin — every privileged verb is still gated in
+  // `checkGate`. The one verb a non-admin agent can reach is a
+  // self-scoped `config_propose_edit` (operator-tapped, single-shot)
+  // that adds rules to its OWN `tools.allow` so "🔁 Always allow"
+  // persists for the whole fleet, not only the 3 admin agents.
   const agentUids: Record<string, number> = {};
-  for (const [name, agent] of Object.entries(config.agents)) {
-    if (agent.admin === true) {
-      agentUids[name] = allocateAgentUid(name);
-    }
+  for (const name of Object.keys(config.agents)) {
+    agentUids[name] = allocateAgentUid(name);
   }
 
   if (Object.keys(agentUids).length === 0) {
     process.stderr.write(
-      "hostd: no admin-flagged agents — nothing to serve. Set `admin: true` on at least one agent.\n",
+      "hostd: no agents configured — nothing to serve.\n",
     );
     process.exit(2);
   }

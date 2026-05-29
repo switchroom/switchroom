@@ -52,7 +52,10 @@ import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
-import { validateConfigEdit } from "./config-edit-validator.js";
+import {
+  validateConfigEdit,
+  assertSelfScopedAllowEdit,
+} from "./config-edit-validator.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
@@ -777,15 +780,18 @@ export class HostdServer {
           ? null
           : `doctor requires admin: true on caller "${caller.name}"`;
       case "config_propose_edit":
-        // Admin-only at the wire layer. The verb proposes mutations to
-        // the central switchroom.yaml — strictly broader blast radius
-        // than per-agent operations. The handler still returns
-        // E_CONFIG_EDIT_DISABLED when the operator hasn't opted in,
-        // but we refuse non-admin callers before that check so an
-        // un-admin'd peer can't even probe the feature flag state.
-        return callerAdmin
-          ? null
-          : `config_propose_edit requires admin: true on caller "${caller.name}"`;
+        // Admin callers may propose ANY edit to the central
+        // switchroom.yaml. Non-admin callers are admitted here but
+        // confined to a SELF-SCOPED edit: `handleConfigProposeEdit`
+        // runs `assertSelfScopedAllowEdit` after validation and rejects
+        // anything that touches more than the caller's own
+        // `agents.<caller>.tools.allow`. This is the one privileged
+        // verb a non-admin agent can reach — it's what makes
+        // "🔁 Always allow" persist for the whole fleet (operator-tapped,
+        // single-shot, #1977 correlation), not just the 3 admin agents.
+        // Binding a socket ≠ granting admin: the self-scope check is the
+        // enforced boundary, not this gate.
+        return null;
     }
   }
 
@@ -1286,6 +1292,37 @@ export class HostdServer {
         .caller(caller.kind === "agent" ? "agent" : "operator")
         .agentName(caller.kind === "agent" ? caller.name : undefined)
         .build(req.request_id, Date.now() - started);
+    }
+    // ── Self-scope gate (non-admin callers) ─────────────────────────
+    // checkGate admits non-admin agents to this verb; this is the
+    // enforced boundary. A non-admin agent may only widen its OWN
+    // `agents.<caller>.tools.allow` — the "🔁 Always allow" persistence
+    // path. Operators and admin agents skip the check (full trust).
+    if (caller.kind === "agent" && this.opts.config.agents[caller.name]?.admin !== true) {
+      let beforeContent: string;
+      try {
+        beforeContent = readFileSync(configPath, "utf-8");
+      } catch {
+        beforeContent = "";
+      }
+      const scope = assertSelfScopedAllowEdit(
+        beforeContent,
+        verdict.postApplyContent,
+        caller.name,
+      );
+      if (!scope.ok) {
+        return err("E_NOT_SELF_SCOPED", scope.detail)
+          .why(
+            "non-admin agents may only add rules to their own " +
+              "agents.<self>.tools.allow via config_propose_edit",
+          )
+          .fixBadInput("unified_diff")
+          .op("config_propose_edit")
+          .caller("agent")
+          .agentName(caller.name)
+          .asDenied()
+          .build(req.request_id, Date.now() - started);
+      }
     }
     // ── Approval card ───────────────────────────────────────────────
     if (!this.opts.approvalGateway) {
