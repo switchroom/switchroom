@@ -36,7 +36,7 @@ import {
 import type { InboundMessageWire } from '../scheduler/dispatch.js'
 import { loadConfig as loadSwitchroomConfig } from '../config/loader.js'
 import { resolveAgentConfig } from '../config/merge.js'
-import { resolveChannelTarget } from '../agent-scheduler/index.js'
+import { resolveChannelTarget } from '../agent-scheduler/channel-target.js'
 
 /**
  * One forwarded webhook event. Mirrors the record the legacy receiver
