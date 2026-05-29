@@ -1,0 +1,77 @@
+# switchroom/web — dashboard + GitHub-webhook receiver container (Phase 3).
+#
+# Replaces the `switchroom-web.service` systemd unit that ran the web
+# server straight off the shared source checkout
+# (`bun bin/switchroom.ts web`). That arrangement was fragile: any other
+# agent's worktree activity could delete the hoisted root node_modules
+# out from under the long-lived process, so the NEXT restart crash-looped
+# on ENOENT even though the code was unchanged. Pinning the receiver to an
+# image makes it immune to repo churn and brings the last systemd holdout
+# in line with the rest of the fleet (vault-broker, kernel, hostd, agents
+# are all containers).
+#
+# What this container runs:
+#   `switchroom web --port 8080 --bind 127.0.0.1`
+#   - The web dashboard (served from /opt/switchroom/dist/cli/ui).
+#   - The GitHub-webhook receiver (POST /webhook/:agent/:source), which —
+#     when an agent has channels.telegram.webhook_via_gateway: true —
+#     forwards verified+rendered events to that agent's in-container
+#     gateway over ~/.switchroom/agents/<agent>/telegram/webhook.sock.
+#
+# Why host networking (set in the compose file, not here):
+#   Two host-side consumers reach the server on 127.0.0.1:8080 and that
+#   address must NOT change:
+#     - cloudflared tunnel (hooks.switchroom.ai → 127.0.0.1:8080) for
+#       GitHub webhooks.
+#     - `tailscale serve` proxies the tailnet host → http://127.0.0.1:8080
+#       for the dashboard (the CSRF origin gate trusts the
+#       Tailscale-User-Login header from loopback, PR #1380).
+#   network_mode: host makes the container's 127.0.0.1 the host loopback,
+#   so both keep working with zero Cloudflare/Tailscale reconfiguration.
+#
+# Why uid = operator (set via `user:` in the compose file, not here):
+#   The webhook.sock the receiver connects to is peercred-gated by the
+#   agent's gateway to {agent's own uid, SWITCHROOM_WEBHOOK_RECEIVER_UID}
+#   (telegram-plugin/gateway/gateway.ts), and SWITCHROOM_WEBHOOK_RECEIVER_UID
+#   is set by the compose generator to the operator uid
+#   (src/agents/compose.ts). Run as any other uid and every forward gets
+#   503'd. The operator uid also owns ~/.switchroom, so file reads (config,
+#   secrets, edge-secret, web-token) work.
+#
+# Deliberately minimal attack surface — this is the one internet-facing
+# component: NO docker socket, NO extra capabilities, no-new-privileges.
+# It does NOT bake profiles/ or vendor/ (those are apply-path assets; the
+# web server never runs `apply`).
+
+ARG BASE_IMAGE=switchroom/base:latest
+FROM ${BASE_IMAGE}
+
+ARG TARGETARCH=amd64
+RUN echo "switchroom/web building for arch=${TARGETARCH}" >&2
+
+# Home dir for the operator-uid runtime user. The real ~/.switchroom is
+# bind-mounted over /host-home/.switchroom at runtime (see compose), so
+# this is just the mountpoint.
+RUN install -d -m 0755 /host-home /host-home/.switchroom
+
+# The CLI bundle (carries the `web` verb + webhook handlers) and the
+# dashboard static assets. server.ts resolves the UI via
+# resolve(import.meta.dirname, "ui") → /opt/switchroom/dist/cli/ui, so the
+# assets MUST sit beside the bundle.
+COPY dist/cli/switchroom.js /opt/switchroom/dist/cli/switchroom.js
+COPY dist/cli/ui/ /opt/switchroom/dist/cli/ui/
+
+# Wrapper so `switchroom` on PATH resolves to the bundled CLI under bun.
+# bun (not node): the bundle imports bun-specific modules (Bun.serve,
+# bun:sqlite, …) marked external by scripts/build.mjs; node throws
+# ERR_UNSUPPORTED_ESM_URL_SCHEME. Mirrors the hostd/broker images.
+RUN printf '#!/bin/sh\nexec bun /opt/switchroom/dist/cli/switchroom.js "$@"\n' \
+    > /usr/local/bin/switchroom \
+ && chmod 0755 /usr/local/bin/switchroom
+
+# Non-root default; the compose file pins `user:` to the operator uid.
+USER 1000:1000
+
+# tini for clean SIGTERM forwarding to the bun process on `docker stop`.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["switchroom", "web", "--port", "8080", "--bind", "127.0.0.1"]

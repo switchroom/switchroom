@@ -80,6 +80,9 @@ interface UpdateOptions {
   /** Test seam — override `host_control.enabled` detection for the
    *  `refresh-hostd` step instead of reading from switchroom.yaml. */
   hostControlEnabled?: boolean;
+  /** Test seam — override `web_service.managed` detection for the
+   *  `refresh-web` step instead of reading from switchroom.yaml. */
+  webServiceManaged?: boolean;
   /** One-shot release-channel override (mirrors `apply --channel`). */
   channel?: "dev" | "rc" | "latest";
   /** One-shot release-pin override (mirrors `apply --pin`). Mutually
@@ -334,6 +337,47 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
     run: () => {
       const r = runner(process.execPath, [scriptPath, "hostd", "install"]);
       if (r.status !== 0) throw new Error("switchroom hostd install failed");
+    },
+  });
+
+  // refresh-web: pull the latest web-service image and recreate the
+  // container. Same isolation rationale as refresh-hostd — the web
+  // service runs in its own compose project (`switchroom-web`), so the
+  // agent fleet's pull-images step never touches it and an operator
+  // who ran `switchroom update` after a web change would otherwise be
+  // left on a stale dashboard/webhook receiver. This step folds the
+  // refresh into the update, mirroring refresh-hostd exactly.
+  //
+  // OPT-IN: skipped unless web_service.managed is true. The default is
+  // false because existing installs run the web server as the legacy
+  // `switchroom-web.service` systemd unit — pulling up the container
+  // unprompted would fight the unit for host loopback 127.0.0.1:8080.
+  // Operators flip managed: true only after cutting over (stop+disable
+  // the unit, `switchroom webd install`). Also skipped on --skip-images.
+  let webServiceManaged: boolean;
+  if (typeof opts.webServiceManaged === "boolean") {
+    webServiceManaged = opts.webServiceManaged;
+  } else {
+    try {
+      webServiceManaged = loadConfig().web_service?.managed === true;
+    } catch {
+      // Best-effort: skip rather than fail the whole update if config
+      // can't be loaded.
+      webServiceManaged = false;
+    }
+  }
+  steps.push({
+    name: "refresh-web",
+    description:
+      "switchroom webd install — pull latest web-service image + recreate the dashboard/webhook container (separate compose project)",
+    skipReason: !webServiceManaged
+      ? "web_service.managed is not true — web container not in use (legacy systemd unit)"
+      : opts.skipImages
+        ? "--skip-images flag set"
+        : undefined,
+    run: () => {
+      const r = runner(process.execPath, [scriptPath, "webd", "install"]);
+      if (r.status !== 0) throw new Error("switchroom webd install failed");
     },
   });
 

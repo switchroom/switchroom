@@ -26,16 +26,21 @@ function fakeRunner() {
 }
 
 describe("planUpdate", () => {
-  it("produces 7 steps in default mode (no --rebuild)", () => {
+  it("produces 8 steps in default mode (no --rebuild)", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-plan-"));
     try {
       const composePath = join(tmp, "docker-compose.yml");
       writeFileSync(composePath, "services: {}\n");
-      const steps = planUpdate({ composePath, hostControlEnabled: false });
+      const steps = planUpdate({
+        composePath,
+        hostControlEnabled: false,
+        webServiceManaged: false,
+      });
       expect(steps.map((s) => s.name)).toEqual([
         "pull-images",
         "apply-config",
         "refresh-hostd",
+        "refresh-web",
         "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
@@ -104,12 +109,18 @@ describe("planUpdate", () => {
     try {
       const composePath = join(tmp, "docker-compose.yml");
       writeFileSync(composePath, "services: {}\n");
-      const steps = planUpdate({ composePath, rebuild: true, hostControlEnabled: false });
+      const steps = planUpdate({
+        composePath,
+        rebuild: true,
+        hostControlEnabled: false,
+        webServiceManaged: false,
+      });
       expect(steps.map((s) => s.name)).toEqual([
         "pull-images",
         "rebuild-source",
         "apply-config",
         "refresh-hostd",
+        "refresh-web",
         "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
@@ -338,6 +349,61 @@ describe("planUpdate", () => {
         runner: runner.fn,
       });
       expect(() => refresh.run()).toThrow(/switchroom hostd install failed/);
+    });
+  });
+
+  // refresh-web: Phase 3 — the web service lives in a separate compose
+  // project (switchroom-web) and is opt-in (web_service.managed) so
+  // existing systemd-mode installs aren't surprised.
+  describe("refresh-web step", () => {
+    function planFor(opts: Parameters<typeof planUpdate>[0]) {
+      const tmp = mkdtempSync(join(tmpdir(), "update-web-"));
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const steps = planUpdate({ composePath, ...opts });
+      const refresh = steps.find((s) => s.name === "refresh-web")!;
+      rmSync(tmp, { recursive: true, force: true });
+      return { steps, refresh };
+    }
+
+    it("runs (no skipReason) when web_service.managed is true and --skip-images is not set", () => {
+      const { refresh } = planFor({ webServiceManaged: true });
+      expect(refresh.skipReason).toBeUndefined();
+    });
+
+    it("skips with a clear reason when web_service.managed is false (default — legacy systemd unit)", () => {
+      const { refresh } = planFor({ webServiceManaged: false });
+      expect(refresh.skipReason).toMatch(/web_service\.managed is not true/);
+    });
+
+    it("skips when --skip-images is set even with web_service.managed enabled", () => {
+      const { refresh } = planFor({
+        webServiceManaged: true,
+        skipImages: true,
+      });
+      expect(refresh.skipReason).toMatch(/--skip-images/);
+    });
+
+    it("invokes `switchroom webd install` via re-exec when run()", () => {
+      const runner = fakeRunner();
+      const { refresh } = planFor({
+        webServiceManaged: true,
+        runner: runner.fn,
+      });
+      refresh.run();
+      expect(runner.calls).toHaveLength(1);
+      const call = runner.calls[0]!;
+      expect(call.args.slice(-2)).toEqual(["webd", "install"]);
+    });
+
+    it("throws if webd install exits non-zero", () => {
+      const runner = fakeRunner();
+      runner.setNextStatus(1);
+      const { refresh } = planFor({
+        webServiceManaged: true,
+        runner: runner.fn,
+      });
+      expect(() => refresh.run()).toThrow(/switchroom webd install failed/);
     });
   });
 
