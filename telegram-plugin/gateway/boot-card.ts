@@ -625,17 +625,21 @@ export async function startBootCard(
     ...(opts.updateOutcomeLine ? { updateOutcomeLine: opts.updateOutcomeLine } : {}),
   })
 
-  // Silence the notification for operator-initiated redeploys. A
-  // routine `switchroom update` should land in the chat as a record
-  // but not buzz every user's phone — every agent posts a card, so
-  // a fleet update with N agents produces N notifications otherwise.
-  // We key on the reason-text prefix `operator:` (today only
-  // `operator: switchroom update` writes this) so user-initiated
-  // restarts (`user: /restart from chat`, `cli: switchroom restart`)
-  // and unplanned events (crash, fresh, planned-marker) keep their
-  // normal notification behaviour — the user explicitly asked for
-  // those, or they need to know something went wrong.
-  const silentBootCard = opts.restartReasonDetail?.startsWith('operator:') === true
+  // Boot cards are ALWAYS delivered silently (no Telegram
+  // notification). They land in the chat as a record — the operator
+  // can scroll up to see "✅ <agent> back up · vX.Y.Z" — but they
+  // never buzz a phone. Rationale: every agent posts a card on every
+  // restart, so a fleet redeploy of N agents produced N notifications;
+  // even a single user `/restart` or a crash-recovery is a status
+  // record, not something that should pull attention. Operator
+  // decision (2026-05-29): silence them all, unconditionally.
+  //
+  // Previously this was keyed on the `operator:` reason-detail prefix
+  // (only routine `switchroom update` was silent); user `/restart`,
+  // `cli: switchroom restart` rollouts, crashes, and fresh boots all
+  // still notified. That distinction is gone — the card is the record,
+  // the chat is where you look, and nothing here warrants a push.
+  const silentBootCard = true
 
   let messageId: number
   try {

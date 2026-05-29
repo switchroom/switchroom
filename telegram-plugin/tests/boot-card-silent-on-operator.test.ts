@@ -1,21 +1,22 @@
 /**
- * Pin the contract: the boot card silences its Telegram notification
- * (passes `disable_notification: true` to `sendMessage`) iff the
- * restart marker's `reason` text starts with `"operator:"`.
+ * Pin the contract: the boot card ALWAYS silences its Telegram
+ * notification (passes `disable_notification: true` to `sendMessage`),
+ * regardless of what triggered the restart.
  *
  * Background: every agent in the fleet posts a boot card after a
- * `switchroom update`. Without this gate the operator gets N push
- * notifications for one planned redeploy — once-per-agent on every
- * routine update. User-initiated restarts (`/restart` from chat,
- * `cli: switchroom restart`) and unplanned events (crash, fresh) still
- * notify because the user asked for them or needs to know something
- * went wrong.
+ * restart. A boot card is a status RECORD ("✅ <agent> back up ·
+ * vX.Y.Z") that lands in the chat for scroll-back — it is never
+ * something that should buzz a phone. A fleet redeploy of N agents
+ * would otherwise produce N push notifications; even a single user
+ * `/restart` or a crash-recovery is a record, not an alert.
  *
- * The toggle is keyed on the reason TEXT (`opts.restartReasonDetail`),
- * not the RestartReason enum, because the enum collapses all
- * marker-bearing restarts into `'graceful'` — losing the operator-vs-
- * user distinction. The reason text is the source of truth for who
- * triggered the restart.
+ * History: this used to be keyed on the `operator:` reason-detail
+ * prefix — only routine `switchroom update` was silent, while user
+ * `/restart`, `cli: switchroom restart` rollouts, crashes, and fresh
+ * boots all still notified. Operator decision (2026-05-29): silence
+ * them all, unconditionally. These cases now assert the inverse of
+ * what they originally pinned, across every reason path, so a future
+ * regression that re-introduces a notifying boot card is caught.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -54,50 +55,46 @@ function mkOpts(overrides: { restartReasonDetail?: string; restartReason?: 'plan
   }
 }
 
-describe('boot card — silent-on-operator-reason', () => {
-  it('passes disable_notification: true when restartReasonDetail starts with "operator:"', async () => {
+describe('boot card — always silent (no Telegram notification)', () => {
+  it('silences operator-initiated redeploys (operator: switchroom update)', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReasonDetail: 'operator: switchroom update' }))
     expect(sends).toHaveLength(1)
     expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 
-  it('omits disable_notification when restartReasonDetail starts with "user:"', async () => {
+  it('silences user-initiated restarts (user: /restart from chat)', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReasonDetail: 'user: /restart from chat' }))
     expect(sends).toHaveLength(1)
-    expect(sends[0]!.opts.disable_notification).toBeUndefined()
+    expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 
-  it('omits disable_notification when restartReasonDetail starts with "cli:"', async () => {
+  it('silences cli rollouts (cli: switchroom restart)', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReasonDetail: 'cli: switchroom restart' }))
     expect(sends).toHaveLength(1)
-    expect(sends[0]!.opts.disable_notification).toBeUndefined()
+    expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 
-  it('omits disable_notification when restartReasonDetail is undefined (crash / fresh path)', async () => {
+  it('silences crash / fresh boots (restartReasonDetail undefined)', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReason: 'crash' }))
     expect(sends).toHaveLength(1)
-    expect(sends[0]!.opts.disable_notification).toBeUndefined()
+    expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 
-  it('omits disable_notification when restartReasonDetail is empty string', async () => {
+  it('silences when restartReasonDetail is empty string', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReasonDetail: '' }))
     expect(sends).toHaveLength(1)
-    expect(sends[0]!.opts.disable_notification).toBeUndefined()
+    expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 
-  it('matches the "operator:" prefix exactly — "operator-ish" should NOT silence', async () => {
-    // Defence against future operator-side reasons that don't actually
-    // want silent — confirms we're matching the prefix-with-colon shape,
-    // not a fuzzy contains.
+  it('silences any other reason shape too (no notifying path remains)', async () => {
     const { bot, sends } = makeCapturingBot()
     await startBootCard('chat1', undefined, bot, mkOpts({ restartReasonDetail: 'operator-ish: rolled over' }))
     expect(sends).toHaveLength(1)
-    // 'operator-ish:' does NOT start with 'operator:' so still notifies.
-    expect(sends[0]!.opts.disable_notification).toBeUndefined()
+    expect(sends[0]!.opts.disable_notification).toBe(true)
   })
 })
