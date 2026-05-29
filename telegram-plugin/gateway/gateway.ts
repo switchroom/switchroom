@@ -263,6 +263,8 @@ import { formatUpdateStatusLine } from './update-status-line.js'
 import type { HostdRequest } from '../../src/host-control/protocol.js'
 import type { AgentAudit } from '../welcome-text.js'
 import { shouldSweepChatAtBoot } from './boot-sweep-filter.js'
+import { startWebhookIngestServer } from './webhook-ingest-server.js'
+import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
 import { createIpcServer, type IpcClient, type IpcServer } from './ipc-server.js'
 import { handleRequestDriveApproval } from './drive-write-approval.js'
@@ -4651,6 +4653,89 @@ const ipcServer: IpcServer = createIpcServer({
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
 })
+
+// ─── Webhook ingest server (RFC webhook-via-gateway-socket) ───────────────
+// Under the Docker runtime the host-side web receiver runs as the operator
+// UID and cannot write this agent's UID-owned dir (EACCES 500) nor connect
+// gateway.sock. When `channels.telegram.webhook_via_gateway` is set, the
+// receiver instead forwards verified+rendered events here over a dedicated
+// peercred-gated UDS; this gateway (agent UID) owns the jsonl append,
+// dedup, and dispatch firing. Wrapped so any failure is best-effort and can
+// NEVER crash gateway boot (which would take the agent down).
+;(() => {
+  try {
+    const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    if (!selfAgent) return
+
+    let viaGateway = false
+    try {
+      const cfg = loadSwitchroomConfig()
+      const raw = cfg.agents?.[selfAgent]
+      viaGateway = raw
+        ? resolveAgentConfig(cfg.defaults, cfg.profiles, raw).channels?.telegram
+            ?.webhook_via_gateway === true
+        : false
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: webhook-ingest config probe failed: ${(err as Error).message}\n`,
+      )
+    }
+    if (!viaGateway) return
+
+    // Allowed peer UIDs: the agent's own UID (self-connections) + the
+    // operator/receiver UID emitted into the env by the compose generator
+    // (SWITCHROOM_WEBHOOK_RECEIVER_UID == operatorUid). Fail-closed: if the
+    // receiver UID is unset, only self can connect → receiver gets 503,
+    // surfacing the misconfiguration instead of silently accepting any UID.
+    const allowedUids: number[] = []
+    const ownUid = typeof process.getuid === 'function' ? process.getuid() : null
+    if (ownUid !== null) allowedUids.push(ownUid)
+    const receiverUidRaw = process.env.SWITCHROOM_WEBHOOK_RECEIVER_UID
+    const receiverUid = receiverUidRaw ? Number(receiverUidRaw) : NaN
+    if (Number.isInteger(receiverUid)) allowedUids.push(receiverUid)
+
+    const socketPath = join(STATE_DIR, 'webhook.sock')
+
+    // In-process delivery of a synthesized webhook turn — the same
+    // sendToAgent + buffer-on-failure primitive onInjectInbound uses, so a
+    // webhook fire landing mid bridge-reconnect is buffered, not dropped.
+    const webhookInject = (agentName: string, inbound: unknown): boolean => {
+      // The wire record is a structural mirror of the bridge's
+      // InboundMessage (same cast the scheduler's ipcDispatcher uses).
+      const msg = inbound as InboundMessage
+      const delivered = ipcServer.sendToAgent(agentName, msg)
+      if (delivered) markClaudeBusyForInbound(msg)
+      else pendingInboundBuffer.push(agentName, msg)
+      return delivered
+    }
+
+    startWebhookIngestServer({
+      socketPath,
+      allowedUids,
+      log: (s) => process.stderr.write(`telegram gateway: ${s}`),
+      onRecord: (req) =>
+        recordWebhookEvent(
+          {
+            agent: selfAgent,
+            source: req.source,
+            event_type: req.event_type,
+            ts: req.ts,
+            rendered_text: req.rendered_text,
+            payload: req.payload,
+            ...(req.delivery_id ? { delivery_id: req.delivery_id } : {}),
+          },
+          {
+            inject: webhookInject,
+            log: (s) => process.stderr.write(`telegram gateway: ${s}`),
+          },
+        ),
+    })
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: webhook-ingest server start failed (non-fatal): ${(err as Error).message}\n`,
+    )
+  }
+})()
 
 // ─── Opportunistic idle-drain of pendingInboundBuffer ─────────────────────
 // pendingInboundBuffer otherwise drains only on (a) bridge re-register

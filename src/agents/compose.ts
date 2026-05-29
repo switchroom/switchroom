@@ -1223,6 +1223,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       },
       bundledSkillsPoolDir,
       hostControlEnabled,
+      opts.operatorUid,
     );
   }
 
@@ -1294,6 +1295,7 @@ function emitAgentService(
   posthog: PosthogRuntimeEnv,
   bundledSkillsPoolDir: string,
   hostControlEnabled: boolean,
+  operatorUid: number | undefined,
 ): void {
   lines.push(`  agent-${a.name}:`);
   emitImageOrBuild(lines, "agent", imageTag, buildMode, buildContext);
@@ -1568,6 +1570,17 @@ function emitAgentService(
     // agent UID from connecting (#1021). #1021 Design B moves the
     // gate into the broker; the agent-side env/mount are no longer
     // needed.
+  }
+  // SWITCHROOM_WEBHOOK_RECEIVER_UID: the host operator UID, used by the
+  // gateway's webhook ingest server (channels.telegram.webhook_via_gateway)
+  // to peercred-gate the dedicated webhook.sock — only this UID (the host
+  // web receiver) and the agent's own UID may inject webhook turns. Same
+  // operatorUid the broker/kernel/auth-broker operator sockets use; emitted
+  // unconditionally when known so enabling the flag needs no re-apply of a
+  // different shape. Absent ⇒ gateway allows only self → receiver 503s,
+  // surfacing the misconfiguration. See docs/rfcs/webhook-via-gateway-socket.md.
+  if (operatorUid !== undefined) {
+    env.SWITCHROOM_WEBHOOK_RECEIVER_UID = String(operatorUid);
   }
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —

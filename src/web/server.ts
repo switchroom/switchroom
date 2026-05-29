@@ -300,6 +300,9 @@ async function handleWebhookRoute(
       config: { secrets: agentSecrets as Partial<Record<"github" | "generic", string>> },
       agentExists: agentConfig !== undefined,
       dispatchConfig: agentConfig?.channels?.telegram?.webhook_dispatch,
+      // Docker-runtime: forward to the agent's gateway instead of writing
+      // the per-agent-UID-owned dir as the host operator UID (EACCES 500).
+      viaGateway: agentConfig?.channels?.telegram?.webhook_via_gateway === true,
     },
     {},
   );

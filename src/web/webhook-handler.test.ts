@@ -19,6 +19,10 @@ import {
   type DedupStore,
   type RateLimiter,
 } from './webhook-handler.js'
+import type {
+  WebhookForwardRequest,
+  WebhookForwardResponse,
+} from './webhook-ingest-client.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -481,5 +485,110 @@ describe('per-source rate limiting', () => {
       baseDeps(resolveAgentDir, nowMs, { rateLimiter, dedupStore }),
     )
     expect(result.status).toBe(429)
+  })
+})
+
+// ─── viaGateway forward path (Docker runtime) ──────────────────────────────────
+// When channels.telegram.webhook_via_gateway is true, the receiver verifies +
+// renders the event but does NOT write the agent dir; it forwards to the
+// in-container gateway over webhook.sock and maps the gateway's response to an
+// HTTP status. See docs/rfcs/webhook-via-gateway-socket.md.
+describe('handleWebhookIngest — viaGateway forward', () => {
+  /** A forwardFn spy matching `typeof forwardToGateway`. */
+  function makeForward(
+    resp: WebhookForwardResponse | null,
+  ): {
+    fn: WebhookHandlerDeps['forwardFn']
+    calls: Array<{ socketPath: string; req: WebhookForwardRequest }>
+  } {
+    const calls: Array<{ socketPath: string; req: WebhookForwardRequest }> = []
+    const fn = async (socketPath: string, req: WebhookForwardRequest) => {
+      calls.push({ socketPath, req })
+      return resp
+    }
+    return { fn, calls }
+  }
+
+  it('forwards the verified event and returns 202 on gateway ok', async () => {
+    const { resolveAgentDir, root } = makeTmpResolveAgentDir()
+    const { fn, calls } = makeForward({ status: 'ok', ts: 123, dispatched: 1 })
+    const body = makeBody({ action: 'opened', number: 9 })
+    const headers = makeGithubHeaders(body, 'fwd-1')
+
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), viaGateway: true },
+      baseDeps(resolveAgentDir, 123, { forwardFn: fn }),
+    )
+
+    expect(result.status).toBe(202)
+    expect(JSON.parse(result.body)).toMatchObject({ ok: true, recorded: true })
+    // The receiver must NOT write the agent dir in viaGateway mode.
+    expect(existsSync(join(root, 'myagent', 'telegram', 'webhook-events.jsonl'))).toBe(false)
+    // Forward targets the per-agent webhook.sock and carries the delivery id.
+    expect(calls).toHaveLength(1)
+    expect(calls[0].socketPath).toBe(join(root, 'myagent', 'telegram', 'webhook.sock'))
+    expect(calls[0].req.delivery_id).toBe('fwd-1')
+    expect(calls[0].req.event_type).toBe('pull_request')
+  })
+
+  it('returns 200 deduped when the gateway reports a duplicate', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const { fn } = makeForward({ status: 'deduped', ts: 100 })
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'fwd-2')
+
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), viaGateway: true },
+      baseDeps(resolveAgentDir, 200, { forwardFn: fn }),
+    )
+
+    expect(result.status).toBe(200)
+    expect(JSON.parse(result.body)).toMatchObject({ ok: true, deduped: true, ts: 100 })
+  })
+
+  it('returns 500 when the gateway reports a record error', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const { fn } = makeForward({ status: 'error', error: 'write failed' })
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'fwd-3')
+
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), viaGateway: true },
+      baseDeps(resolveAgentDir, 300, { forwardFn: fn }),
+    )
+
+    expect(result.status).toBe(500)
+    expect(JSON.parse(result.body).ok).toBe(false)
+  })
+
+  it('returns 503 when the gateway is unreachable (forward null)', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const { fn } = makeForward(null)
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'fwd-4')
+
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), viaGateway: true },
+      baseDeps(resolveAgentDir, 400, { forwardFn: fn }),
+    )
+
+    expect(result.status).toBe(503)
+    expect(JSON.parse(result.body).ok).toBe(false)
+  })
+
+  it('returns 503 when the forward transport throws', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const throwingFn: WebhookHandlerDeps['forwardFn'] = async () => {
+      throw new Error('boom')
+    }
+    const body = makeBody()
+    const headers = makeGithubHeaders(body, 'fwd-5')
+
+    const result = await handleWebhookIngest(
+      { ...baseArgs(body, headers), viaGateway: true },
+      baseDeps(resolveAgentDir, 500, { forwardFn: throwingFn }),
+    )
+
+    expect(result.status).toBe(503)
   })
 })
