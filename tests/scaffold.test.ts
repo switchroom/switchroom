@@ -1218,6 +1218,38 @@ describe("scaffoldAgent — docker-mode tmux supervisor preamble (v0.7.5)", () =
     expect(gatewayForkIdx).toBeGreaterThan(stateDirIdx);
   });
 
+  it("exports SWITCHROOM_HANDOFF_SHOW_LINE before the gateway fork so the sidecar inherits it", () => {
+    // The gateway is the SOLE consumer of SWITCHROOM_HANDOFF_SHOW_LINE
+    // — it decides whether to prepend the visible "↩️ Picked up where
+    // we left off …" line on the first reply after a restart. The
+    // gateway is forked in the docker preamble, so the export MUST
+    // precede that fork. Before this fix the export lived in the inner
+    // tmux pass (after the fork), so the gateway never inherited it and
+    // session_continuity.show_handoff_line:false silently no-oped on
+    // every docker agent.
+    const config = makeAgentConfig({
+      topic_id: 1,
+      session_continuity: { show_handoff_line: false },
+    });
+    const result = scaffoldAgent("hilda", config, tmpDir, telegramConfig);
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=false");
+    const lines = startSh.split("\n");
+    const exportIdx = lines.findIndex((l) =>
+      l.includes("export SWITCHROOM_HANDOFF_SHOW_LINE="),
+    );
+    const gatewayForkIdx = lines.findIndex((l) =>
+      l.includes("_switchroom_supervise gateway"),
+    );
+    expect(exportIdx).toBeGreaterThan(0);
+    expect(gatewayForkIdx).toBeGreaterThan(exportIdx);
+    // Exactly one export — no stale late-pass duplicate left behind.
+    const exportCount = lines.filter((l) =>
+      l.includes("export SWITCHROOM_HANDOFF_SHOW_LINE="),
+    ).length;
+    expect(exportCount).toBe(1);
+  });
+
   it("supervisor backs off exponentially and never permanently gives up (RFC J Phase 2)", () => {
     // The old "10 restarts in 60s -> give up forever" turned a
     // routine broker recreate (which relocks the dockerized broker)
