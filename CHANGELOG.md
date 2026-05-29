@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.14.13 — Readable, durable permission grants (#1994, #1995)
+
+Reworks the Telegram tool-approval card so a non-technical operator can
+read it, and makes "always allow" both *persist* for every agent and
+*express its grant scope* before the operator commits it. Two pillars of
+the vision met at once: **you hold the leash** (control is legible and
+trustworthy) and a **standing team that knows you** (grants survive
+restarts without re-prompting).
+
+### PR A — always-allow persists for every agent (#1994)
+
+Tapping "🔁 Always allow" used to write durably only for the three
+admin-flagged agents; for everyone else the rule was cached for the
+session and then forgotten at the next restart ("Allowed for now —
+'always' did NOT save"). The durable write only lands via the host-side
+`switchroom-hostd` daemon's `config_propose_edit` flow, and only admin
+agents had a hostd socket bound.
+
+Now **every** agent gets a per-agent hostd socket (path-as-identity,
+forge-resistant), but binding a socket does **not** grant admin. Exactly
+one self-scoped verb is opened to non-admin agents: a
+`config_propose_edit` that may only add rules to *its own*
+`agents.<self>.tools.allow`. Server-side `assertSelfScopedAllowEdit`
+enforces additive-only + own-allow-list-only (deep-equal after stripping
+the caller's own allow list); any edit that touches another agent, flips
+`admin`, or removes a deny is rejected `E_NOT_SELF_SCOPED`. Every other
+hostd verb stays admin-gated.
+
+### PR B — human-readable scoped permission card (#1995)
+
+The card no longer shows raw tool identifiers like
+`mcp__perplexity__search` or `Edit:`. It reads as a plain sentence —
+`🔐 Gymbro wants to edit: supplement-log.md` with a `why:` line — and
+the action row is compact: `❌ Deny · ✅ Allow once · 🔁 Always…`.
+
+Tapping **🔁 Always…** swaps the row for a scope choice —
+`← Back · This file · Any file ⚠️` — so the breadth of an always-grant
+is visible *before* it is committed; the ⚠️ rides the broadest option
+only. After a grant lands, the confirmation is phrased from the chosen
+scope ("gymbro can now edit supplement-log.md without asking" /
+"…use any Perplexity tool…"). The session-scoped allow cache (#1138)
+now understands the scoped rule forms (`Edit(path)`, `Bash(tok:*)`,
+`Skill(name)`, `mcp__server__*`) so sub-agent tool calls still
+short-circuit the prompt.
+
 ## v0.14.12 — Web service container (dashboard + webhook receiver) (#1992)
 
 Phase 3 of the Docker-native webhook work. Packages the `switchroom web`
