@@ -1954,6 +1954,24 @@ function paintStatusReactionError(chatId: string, threadId: number | undefined):
   ctrl.setError()
 }
 
+/**
+ * Flip the current turn's status reaction off 🙏 (awaiting-approval) back
+ * to a working glyph once a permission verdict has been dispatched. The
+ * turn was suspended *inside* the bridge's permission call, so `currentTurn`
+ * still points at it; the verdict un-parks claude and it resumes the SAME
+ * turn. `setThinking()` re-arms the stall watchdog that `setAwaiting()`
+ * suspended, so a genuine post-approval hang still promotes to 🥱/😨, and
+ * it is replaced by the real tool glyph (✍/⚡) as soon as the resumed turn
+ * fires its next PreToolUse. Non-terminal — 👍 still waits for `turn_end`.
+ */
+function resumeReactionAfterVerdict(): void {
+  const turn = currentTurn
+  if (turn == null) return
+  activeStatusReactions
+    .get(statusKey(turn.sessionChatId, turn.sessionThreadId))
+    ?.setThinking()
+}
+
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
   if (explicit != null) return Number(explicit)
   return chatThreadMap.get(chat_id)
@@ -2876,6 +2894,9 @@ const pendingStateReaper = setInterval(() => {
       // dispatchPermissionVerdict so it's buffered+redelivered too if
       // the bridge is also offline at sweep time.
       dispatchPermissionVerdict({ type: 'permission', requestId: k, behavior: 'deny' })
+      // The auto-deny un-parks the suspended turn — flip 🙏 → working so
+      // it doesn't sit on the awaiting glyph (or stall) after the timeout.
+      resumeReactionAfterVerdict()
       process.stderr.write(
         `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
         `tool=${v.tool_name} (no operator response in ` +
@@ -4226,6 +4247,16 @@ const ipcServer: IpcServer = createIpcServer({
       }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
       })
+    }
+    // Park the turn's status reaction on 🙏 (awaiting your tap) and
+    // suspend the stall watchdog — a turn blocked on the operator is not
+    // stalled, so it must not degrade to 🥱/😨 while the card sits
+    // unanswered. The verdict path (`resumeReactionAfterVerdict`) flips it
+    // back to a working state the instant you tap.
+    if (activeTurn != null) {
+      activeStatusReactions
+        .get(statusKey(activeTurn.sessionChatId, activeTurn.sessionThreadId))
+        ?.setAwaiting()
     }
   },
 
@@ -11759,6 +11790,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   }
   // Forward to connected bridges — same IPC the button handler uses.
   dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
+  resumeReactionAfterVerdict()
   pendingPermissions.delete(request_id)
   process.stderr.write(
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
@@ -15409,6 +15441,10 @@ bot.on('callback_query:data', async ctx => {
       behavior: 'allow',
       rule: chosen.rule,
     })
+    // The turn resumes now (independent of the host persistence round-trip
+    // below). Un-park 🙏 → working immediately so the operator sees the
+    // agent continue while hostd writes the durable rule.
+    resumeReactionAfterVerdict()
 
     // (3) Decide the persistence path. tryHostdDispatch returns
     // "not-configured" when host_control is disabled or the per-agent
@@ -15562,7 +15598,16 @@ bot.on('callback_query:data', async ctx => {
 
   // Forward permission decision to connected bridges
   pendingPermissions.delete(request_id)
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  // Deterministic "▶️ resuming…" beat (framework-posted, not model text):
+  // the verdict un-parks the suspended turn, so confirm to the operator
+  // that the agent received it and is continuing — closing the "is it
+  // working or did my tap do nothing?" gap. Allow and deny both resume the
+  // turn (deny just hands claude a refusal it then handles).
+  const resumeAgent = process.env.SWITCHROOM_AGENT_NAME
+  const resumeBeat = resumeAgent
+    ? `▶️ ${escapeHtmlForTg(resumeAgent)} resuming…`
+    : '▶️ resuming…'
+  const label = `${behavior === 'allow' ? '✅ Allowed' : '❌ Denied'} · ${resumeBeat}`
   // HTML-escape the source text — same hazard as the scope-commit and
   // recent-denial paths above. The permission card body
   // (formatPermissionCardBody) appends claude-supplied `description`
@@ -15590,6 +15635,9 @@ bot.on('callback_query:data', async ctx => {
         requestId: request_id,
         behavior: behavior as 'allow' | 'deny',
       })
+      // Un-park the status reaction: 🙏 → working, re-arming the stall
+      // watchdog that setAwaiting() suspended.
+      resumeReactionAfterVerdict()
     },
   })
 })

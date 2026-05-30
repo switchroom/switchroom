@@ -341,6 +341,75 @@ describe('StatusReactionController', () => {
     expect(calls).toEqual(['👀'])
   })
 
+  // setAwaiting(): park on 🙏 while a permission card waits for the
+  // operator. A turn blocked on a human is NOT stalled, so the watchdog
+  // must stay quiet — but it re-arms once the verdict resumes work.
+  describe('setAwaiting() — park on a human permission decision', () => {
+    it('emits 🙏 immediately (bypasses debounce)', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      await flush()
+      ctrl.setAwaiting()
+      await flush()
+      expect(calls).toEqual(['👀', '🙏'])
+    })
+
+    it('suppresses stall promotion (no 🥱/😨) while the card sits unanswered', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.setTool('Bash') // working: 👨‍💻
+      vi.advanceTimersByTime(3500)
+      await flush()
+      ctrl.setAwaiting()
+      await flush()
+      // Well past both stall thresholds — awaiting must not yawn or panic.
+      vi.advanceTimersByTime(120000)
+      await flush()
+      expect(calls).not.toContain('🥱')
+      expect(calls).not.toContain('😨')
+      expect(calls[calls.length - 1]).toBe('🙏')
+    })
+
+    it('re-arms the stall watchdog once a working transition resumes the turn', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      await flush()
+      ctrl.setAwaiting()
+      await flush()
+      vi.advanceTimersByTime(120000) // long human wait — no stall
+      await flush()
+      expect(calls).toEqual(['👀', '🙏'])
+
+      // Verdict dispatched → gateway calls setThinking() to un-park.
+      ctrl.setThinking()
+      vi.advanceTimersByTime(3500)
+      await flush()
+      expect(calls).toEqual(['👀', '🙏', '🤔'])
+
+      // A genuine post-approval hang must still promote to 🥱 — the
+      // watchdog was re-armed by the resuming transition.
+      vi.advanceTimersByTime(30000)
+      await flush()
+      expect(calls).toContain('🥱')
+    })
+
+    it('is a no-op after finalize (cannot resurrect a finished controller)', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.finalize('done')
+      await flush()
+      const snapshot = [...calls]
+      ctrl.setAwaiting()
+      vi.advanceTimersByTime(5000)
+      await flush()
+      expect(calls).toEqual(snapshot)
+    })
+  })
+
   // hold(): freeze on a WORKING glyph while background sub-agent workers
   // outlive the parent turn, deferring the terminal 👍 (worker-reaction fix).
   describe('hold() — defer 👍 while a background worker runs', () => {

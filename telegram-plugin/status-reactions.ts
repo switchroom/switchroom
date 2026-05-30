@@ -53,6 +53,7 @@ export type ReactionState =
   | 'web'
   | 'tool'
   | 'compacting'
+  | 'awaiting'
   | 'done'
   | 'error'
   | 'stallSoft'
@@ -78,6 +79,7 @@ export const REACTION_VARIANTS: Record<ReactionState, string[]> = {
   coding:    ['👨‍💻', '✍', '⚡'],     // WORKING: writing / running code
   web:       ['⚡', '🤔', '👌'],      // WORKING: lookup in motion
   compacting:['✍', '🤔', '👀'],
+  awaiting:  ['🙏', '🤔', '👀'],      // BLOCKED ON HUMAN: parked on a permission card
   done:      ['👍', '💯', '🎉'],      // FINISHED: turn_end fired
   error:     ['😱', '😨', '🤯'],      // NON-TERMINAL — recovery allowed
   stallSoft: ['🥱', '😴', '🤔'],
@@ -178,6 +180,22 @@ export class StatusReactionController {
   /** ✍ — context compaction in progress. Debounced, non-terminal, bidirectional. */
   setCompacting(): void {
     this.scheduleState('compacting')
+  }
+
+  /**
+   * 🙏 — the turn is parked on a human decision (a permission card is
+   * waiting for the operator to tap Allow/Deny). Immediate, non-terminal,
+   * and crucially SUSPENDS the stall watchdog: a turn blocked on the
+   * operator is not stalled, so it must NOT promote to 🥱/😨 while the
+   * card sits unanswered. The next working transition (setTool /
+   * setThinking, fired when the verdict resumes the turn) re-arms the
+   * watchdog normally. Bypasses debounce so 🙏 lands as soon as the card
+   * is posted.
+   */
+  setAwaiting(): void {
+    if (this.finished) return
+    this.scheduleState('awaiting', { immediate: true, skipStallReset: true })
+    this.clearStallTimers()
   }
 
   /**
