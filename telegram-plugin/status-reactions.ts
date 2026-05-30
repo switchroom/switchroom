@@ -141,6 +141,7 @@ export class StatusReactionController {
   private stallSoftTimer: ReturnType<typeof setTimeout> | null = null
   private stallHardTimer: ReturnType<typeof setTimeout> | null = null
   private finished = false
+  private held = false
   private readonly debounceMs: number
   private readonly stallSoftMs: number
   private readonly stallHardMs: number
@@ -219,8 +220,36 @@ export class StatusReactionController {
   cancel(): void {
     if (this.finished) return
     this.finished = true
+    this.held = false
     this.clearDebounceTimer()
     this.clearStallTimers()
+  }
+
+  /**
+   * Freeze the controller in a WORKING state pending out-of-turn
+   * background work — sub-agent workers that are still running after the
+   * parent's `turn_end` fired. Painting the terminal 👍 here would read
+   * as "done / nothing happening" while the worker keeps going; instead
+   * we hold a working glyph (✍️/⚡) and let the gateway call `finalize()`
+   * once the last worker completes.
+   *
+   * Non-terminal: the controller stays live, so `finalize()` still works
+   * afterward. Suppresses stall promotion (🥱/😨) for the held window —
+   * the parent turn isn't stalled, a worker is legitimately busy, and the
+   * sub-agent watcher owns its own stall detection. Promotes a non-working
+   * current state (👀 read-receipt / 🤔 thinking) to an explicit working
+   * glyph so the user can tell work is ongoing.
+   */
+  hold(): void {
+    if (this.finished) return
+    this.held = true
+    this.clearStallTimers()
+    const working = this.resolveEmoji('tool')
+    if (working != null && working !== this.currentEmoji && working !== this.pendingEmoji) {
+      this.clearDebounceTimer()
+      this.pendingEmoji = working
+      this.enqueue(working)
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────
@@ -256,6 +285,7 @@ export class StatusReactionController {
   private finishWithState(state: ReactionState): void {
     if (this.finished) return
     this.finished = true
+    this.held = false
     this.clearStallTimers()
     // F1 fix (#553): if a non-terminal reaction is sitting in the
     // debounce window when the turn ends, flush it BEFORE the terminal
@@ -311,7 +341,7 @@ export class StatusReactionController {
 
   private resetStallTimers(): void {
     this.clearStallTimers()
-    if (this.finished) return
+    if (this.finished || this.held) return
     this.stallSoftTimer = setTimeout(() => {
       this.stallSoftTimer = null
       // Don't reset the stall timers when the stall transition itself fires —

@@ -340,4 +340,83 @@ describe('StatusReactionController', () => {
     await flush()
     expect(calls).toEqual(['👀'])
   })
+
+  // hold(): freeze on a WORKING glyph while background sub-agent workers
+  // outlive the parent turn, deferring the terminal 👍 (worker-reaction fix).
+  describe('hold() — defer 👍 while a background worker runs', () => {
+    it('suppresses stall promotion (no 🥱/😨) while held', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.setTool('Bash') // working: 👨‍💻
+      vi.advanceTimersByTime(3500)
+      await flush()
+
+      ctrl.hold()
+      await flush()
+      // Well past both stall thresholds — held must not yawn or panic.
+      vi.advanceTimersByTime(120000)
+      await flush()
+      expect(calls).not.toContain('🥱')
+      expect(calls).not.toContain('😨')
+    })
+
+    it('promotes a read/thinking glyph to a working glyph on hold', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued() // 👀 (read-receipt)
+      await flush()
+      expect(calls).toEqual(['👀'])
+
+      ctrl.hold() // should paint an explicit WORKING glyph (✍️)
+      await flush()
+      expect(calls[calls.length - 1]).toBe('✍')
+    })
+
+    it('finalize() still terminates to 👍 after hold (deferred terminal)', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.setTool() // ✍
+      vi.advanceTimersByTime(3500)
+      await flush()
+
+      ctrl.hold()
+      await flush()
+      // Worker runs for a while, then completes → gateway finalizes.
+      vi.advanceTimersByTime(60000)
+      await flush()
+      ctrl.finalize('done')
+      await flush()
+      expect(calls[calls.length - 1]).toBe('👍')
+    })
+
+    it('does not double-paint when already on a working glyph', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.setTool() // ✍
+      vi.advanceTimersByTime(3500)
+      await flush()
+      const before = calls.length
+
+      ctrl.hold() // already on ✍ → no new emit
+      await flush()
+      expect(calls.length).toBe(before)
+    })
+
+    it('hold() after finalize is a no-op (cannot resurrect a finished controller)', async () => {
+      const { emit, calls } = makeEmitter()
+      const ctrl = new StatusReactionController(emit)
+      ctrl.setQueued()
+      ctrl.finalize('done')
+      await flush()
+      const snapshot = [...calls]
+
+      ctrl.hold()
+      vi.advanceTimersByTime(120000)
+      await flush()
+      expect(calls).toEqual(snapshot)
+    })
+  })
 })
