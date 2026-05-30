@@ -17396,21 +17396,6 @@ void (async () => {
                 // handback gating below, so it must run before any early
                 // return. Cheap no-op when nothing is deferred.
                 deferredDoneReactions.promote()
-                // #PR2 live worker-feed: force the terminal recap edit on
-                // the worker's live message. No-op when no message was ever
-                // posted (trivial workers stay silent; handback covers them).
-                // 'orphan' is a stale boot row, not a fresh completion — map
-                // it to 'done' so an already-posted message still finalizes.
-                if (workerFeedEnabled) {
-                  void workerActivityFeed.finish(agentId, {
-                    description,
-                    lastTool: null,
-                    toolCount,
-                    latestSummary: resultText,
-                    elapsedMs: durationMs,
-                    state: outcome === 'failed' ? 'failed' : 'done',
-                  })
-                }
                 // IO: resolve the fleet chat id and the background flag.
                 // The DECISION (gating + inbound build) is delegated to
                 // the pure `decideSubagentHandback` so it is unit-tested
@@ -17418,6 +17403,10 @@ void (async () => {
                 // `subagent-handback-decision.test.ts`.
                 let fleetChatId = ''
                 let isBackground = false
+                // Dispatch-time task description from the registry row —
+                // see the onProgress note; used for the feed's terminal recap
+                // header so it matches the running header ("· <real task>").
+                let dispatchDesc = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
@@ -17433,10 +17422,28 @@ void (async () => {
                 if (turnsDb != null) {
                   try {
                     const row = turnsDb
-                      .prepare('SELECT background FROM subagents WHERE jsonl_agent_id = ?')
-                      .get(agentId) as { background: number } | undefined
-                    if (row != null) isBackground = row.background === 1
+                      .prepare('SELECT background, description FROM subagents WHERE jsonl_agent_id = ?')
+                      .get(agentId) as { background: number; description: string | null } | undefined
+                    if (row != null) {
+                      isBackground = row.background === 1
+                      dispatchDesc = row.description ?? ''
+                    }
                   } catch { /* best-effort */ }
+                }
+                // #PR2 live worker-feed: force the terminal recap edit on
+                // the worker's live message. No-op when no message was ever
+                // posted (trivial workers stay silent; handback covers them).
+                // 'orphan' is a stale boot row, not a fresh completion — map
+                // it to 'done' so an already-posted message still finalizes.
+                if (workerFeedEnabled) {
+                  void workerActivityFeed.finish(agentId, {
+                    description: dispatchDesc || description,
+                    lastTool: null,
+                    toolCount,
+                    latestSummary: resultText,
+                    elapsedMs: durationMs,
+                    state: outcome === 'failed' ? 'failed' : 'done',
+                  })
                 }
 
                 const decision = decideSubagentHandback({
@@ -17511,6 +17518,11 @@ void (async () => {
               onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount }) => {
                 let fleetChatId = ''
                 let isBackground = false
+                // The watcher's `description` is its 'sub-agent' default (it
+                // never reassigns it from the worker jsonl). The dispatch-time
+                // task description lives in the registry row — prefer it so the
+                // feed header reads "🔧 Worker · <real task>" not "· sub-agent".
+                let dispatchDesc = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
@@ -17523,9 +17535,12 @@ void (async () => {
                 if (turnsDb != null) {
                   try {
                     const row = turnsDb
-                      .prepare('SELECT background FROM subagents WHERE jsonl_agent_id = ?')
-                      .get(agentId) as { background: number } | undefined
-                    if (row != null) isBackground = row.background === 1
+                      .prepare('SELECT background, description FROM subagents WHERE jsonl_agent_id = ?')
+                      .get(agentId) as { background: number; description: string | null } | undefined
+                    if (row != null) {
+                      isBackground = row.background === 1
+                      dispatchDesc = row.description ?? ''
+                    }
                   } catch { /* best-effort */ }
                 }
                 if (!isBackground) return // skip overhead for foreground
@@ -17541,7 +17556,7 @@ void (async () => {
                     agentId,
                     fleetChatId || (loadAccess().allowFrom[0] ?? ''),
                     {
-                      description,
+                      description: dispatchDesc || description,
                       lastTool,
                       toolCount,
                       latestSummary,
