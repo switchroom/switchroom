@@ -305,6 +305,11 @@ export interface SubagentWatcherConfig {
     elapsedMs: number
     prevBucketIdx: number | null
     setBucketIdx: (b: number) => void
+    /** Most recent tool the worker invoked, or null if none yet. Feeds
+     *  the live worker-activity feed (#PR2); the bucket relay ignores it. */
+    lastTool: { name: string; sanitisedArg: string } | null
+    /** Tool-use count observed so far. */
+    toolCount: number
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -522,6 +527,12 @@ export function readSubTail(
     elapsedMs: number
     prevBucketIdx: number | null
     setBucketIdx: (b: number) => void
+    /** Most recent tool the worker invoked (name + sanitised arg), or
+     *  null if no tool_use has been observed yet. For the live
+     *  worker-activity feed (#PR2) — the legacy bucket relay ignores it. */
+    lastTool: { name: string; sanitisedArg: string } | null
+    /** Tool-use count observed so far. */
+    toolCount: number
   }) => void,
 ): void {
   try {
@@ -675,6 +686,8 @@ export function readSubTail(
                 setBucketIdx: (b: number) => {
                   entry.lastProgressBucketIdx = b
                 },
+                lastTool: entry.lastTool,
+                toolCount: entry.toolCount,
               })
             } catch (cbErr) {
               log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
