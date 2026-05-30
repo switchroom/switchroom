@@ -418,7 +418,8 @@ import {
   findMostRecentInterruptedTurn,
   findRecentTurnsForChat,
 } from '../registry/turns-schema.js'
-import { applySubagentsSchema } from '../registry/subagents-schema.js'
+import { applySubagentsSchema, getSubagentByJsonlId } from '../registry/subagents-schema.js'
+import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import { formatIdleFooter } from '../idle-footer.js'
 import { resolveCallingSubagent } from './resolve-calling-subagent.js'
 
@@ -17402,11 +17403,6 @@ void (async () => {
                 // independent of the gateway — see
                 // `subagent-handback-decision.test.ts`.
                 let fleetChatId = ''
-                let isBackground = false
-                // Dispatch-time task description from the registry row —
-                // see the onProgress note; used for the feed's terminal recap
-                // header so it matches the running header ("· <real task>").
-                let dispatchDesc = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
@@ -17419,17 +17415,18 @@ void (async () => {
                   // peek failures are non-fatal — fall through to the
                   // owner-chat fallback inside decideSubagentHandback.
                 }
+                // Background flag + feed header description, both derived from
+                // the registry row via the pure resolveWorkerFeedDispatch
+                // (worker-feed-dispatch.ts, pinned by its test). Best-effort:
+                // a DB hiccup keeps the watcher's generic label rather than
+                // throwing out of the terminal handler.
+                let dispatch: WorkerFeedDispatch = resolveWorkerFeedDispatch(null, description)
                 if (turnsDb != null) {
                   try {
-                    const row = turnsDb
-                      .prepare('SELECT background, description FROM subagents WHERE jsonl_agent_id = ?')
-                      .get(agentId) as { background: number; description: string | null } | undefined
-                    if (row != null) {
-                      isBackground = row.background === 1
-                      dispatchDesc = row.description ?? ''
-                    }
+                    dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description)
                   } catch { /* best-effort */ }
                 }
+                const isBackground = dispatch.isBackground
                 // #PR2 live worker-feed: force the terminal recap edit on
                 // the worker's live message. No-op when no message was ever
                 // posted (trivial workers stay silent; handback covers them).
@@ -17437,7 +17434,7 @@ void (async () => {
                 // it to 'done' so an already-posted message still finalizes.
                 if (workerFeedEnabled) {
                   void workerActivityFeed.finish(agentId, {
-                    description: dispatchDesc || description,
+                    description: dispatch.feedDescription,
                     lastTool: null,
                     toolCount,
                     latestSummary: resultText,
@@ -17517,12 +17514,6 @@ void (async () => {
               // lives in the `onFinish` block just above.
               onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount }) => {
                 let fleetChatId = ''
-                let isBackground = false
-                // The watcher's `description` is its 'sub-agent' default (it
-                // never reassigns it from the worker jsonl). The dispatch-time
-                // task description lives in the registry row — prefer it so the
-                // feed header reads "🔧 Worker · <real task>" not "· sub-agent".
-                let dispatchDesc = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
                   for (const f of fleets) {
@@ -17532,17 +17523,18 @@ void (async () => {
                     }
                   }
                 } catch { /* peek failures non-fatal */ }
+                // The watcher's `description` is its 'sub-agent' default (it
+                // never reassigns it from the worker jsonl). The dispatch-time
+                // task description lives in the registry row — resolveWorkerFeedDispatch
+                // prefers it so the header reads "🔧 Worker · <real task>" not
+                // "· sub-agent" (worker-feed-dispatch.ts, pinned by its test).
+                let dispatch: WorkerFeedDispatch = resolveWorkerFeedDispatch(null, description)
                 if (turnsDb != null) {
                   try {
-                    const row = turnsDb
-                      .prepare('SELECT background, description FROM subagents WHERE jsonl_agent_id = ?')
-                      .get(agentId) as { background: number; description: string | null } | undefined
-                    if (row != null) {
-                      isBackground = row.background === 1
-                      dispatchDesc = row.description ?? ''
-                    }
+                    dispatch = resolveWorkerFeedDispatch(getSubagentByJsonlId(turnsDb, agentId), description)
                   } catch { /* best-effort */ }
                 }
+                const isBackground = dispatch.isBackground
                 if (!isBackground) return // skip overhead for foreground
 
                 // #PR2 live worker-feed: when ON, the worker's live chat
@@ -17556,7 +17548,7 @@ void (async () => {
                     agentId,
                     fleetChatId || (loadAccess().allowFrom[0] ?? ''),
                     {
-                      description: dispatchDesc || description,
+                      description: dispatch.feedDescription,
                       lastTool,
                       toolCount,
                       latestSummary,

@@ -826,6 +826,17 @@ JTBDs — see "Design contract" above.)
 - **Config resolution** → `src/config/merge.ts` + `docs/configuration.md`.
 - **Progress card** → `telegram-plugin/stream-reply-handler.ts` +
   `telegram-plugin/card-format.ts` + `docs/telegram-plugin.md`.
+- **Background worker-activity feed** (flag
+  `SWITCHROOM_WORKER_ACTIVITY_FEED`, default off) → live edit-in-place
+  message per `run_in_background` sub-agent. Render in
+  `telegram-plugin/worker-activity-feed.ts`; wired in
+  `telegram-plugin/gateway/gateway.ts` `onProgress`/`onFinish`. The feed
+  header's real task description comes from the registry `subagents`
+  row via `telegram-plugin/gateway/worker-feed-dispatch.ts`
+  (`resolveWorkerFeedDispatch`, pinned by `worker-feed-dispatch.test.ts`)
+  — the watcher only carries a generic `'sub-agent'` placeholder, so do
+  NOT source the header from `subagent-watcher.ts`. E2E gate:
+  `telegram-plugin/uat/scenarios/jtbd-worker-activity-feed-dm.test.ts`.
 - **Auth** → `src/auth/accounts.ts` (slots) + `src/auth/manager.ts`
   (OAuth). Telegram `/auth` routing: `telegram-plugin/auth-slot-parser.ts`.
 - **Runtime inspection** → `switchroom debug turn <agent>` (prompt

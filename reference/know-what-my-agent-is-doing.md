@@ -72,6 +72,18 @@ competent chat partner does this naturally:
 - **Sub-agent narration** in chat: *"spinning up @reviewer to look at
   this"* → *"@reviewer says: ship it, one nit on the logging."* Fleet
   visibility is a story the conversation tells.
+- **Background workers** are the one case the parent turn *can't*
+  narrate — a `run_in_background` sub-agent decouples, so when the
+  parent turn closes a long worker would read as silence. The
+  **worker-activity feed** (flag `SWITCHROOM_WORKER_ACTIVITY_FEED`,
+  default off) closes that gap: one regular Telegram message per
+  background worker, edited in place as work happens — current tool +
+  short summary + elapsed, headed by the real dispatch task
+  (*"🔧 Worker · <task>"*) — finalizing with a tool-count + duration
+  recap (*"✅ Worker done · …"*). Same "live, growing message" shape as
+  the agent's own answer, not a separate card. The turn's 👍 also holds
+  until the last background worker finishes, so the reaction never
+  implies done while a worker is still grinding.
 - **The final answer** as a fresh `reply` (pings once).
 
 A user scrolling back a week later reads a real conversation, not a
