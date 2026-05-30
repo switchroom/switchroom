@@ -236,6 +236,16 @@ describe('createWorkerActivityFeed', () => {
     expect(feed.has('w1')).toBe(true)
   })
 
+  it('skips entirely when chatId is empty (owner DM unconfigured)', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock })
+    await feed.update('w1', '', view())
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.has('w1')).toBe(false)
+    expect(feed.size).toBe(0)
+  })
+
   it('forwards threadId as message_thread_id on send', async () => {
     const bot = makeFakeBot()
     let clock = 10_000

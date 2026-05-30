@@ -272,6 +272,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       return handles.size
     },
     update(agentId, chatId, view, threadId) {
+      // No chat to post to (owner DM unconfigured) — don't create a
+      // handle that would retry a failing send('') every tick.
+      if (chatId.length === 0) return Promise.resolve()
       let h = handles.get(agentId)
       if (h == null) {
         h = {
