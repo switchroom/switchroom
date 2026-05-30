@@ -400,6 +400,37 @@ describe("scaffoldAgent", () => {
     expect(access.groups["-1001234567890"].requireMention).toBe(false);
   });
 
+  it("projects channels.telegram.coalesce.window_ms into access.coalescingGapMs", () => {
+    const config = makeAgentConfig({
+      channels: { telegram: { coalesce: { window_ms: 1200 } } },
+    });
+    const result = scaffoldAgent("coalesce-agent", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect(access.coalescingGapMs).toBe(1200);
+  });
+
+  it("projects window_ms: 0 (coalescing disabled) — not dropped as falsy", () => {
+    const config = makeAgentConfig({
+      channels: { telegram: { coalesce: { window_ms: 0 } } },
+    });
+    const result = scaffoldAgent("coalesce-off", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect(access.coalescingGapMs).toBe(0);
+  });
+
+  it("omits coalescingGapMs entirely when no coalesce config is set", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("coalesce-default", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect("coalescingGapMs" in access).toBe(false);
+  });
+
   it("generates settings.json with tool permissions (webkite staged → WebFetch denied)", () => {
     // Simulate the webkite binary being staged so the fail-safe gate
     // (webkiteBinaryAvailable) trips and the deny applies. Point the

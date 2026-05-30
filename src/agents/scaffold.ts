@@ -5341,6 +5341,14 @@ function buildAccessJson(
   if (tg?.telegraph) {
     access.telegraph = tg.telegraph;
   }
+  // Inbound coalescing window. Projected into the long-standing
+  // `coalescingGapMs` access field the gateway already reads per-message
+  // (createInboundCoalescer gapMs callback) so config-driven tuning takes
+  // effect at the next message after a scaffold+restart. Cascades from
+  // defaults.channels.telegram.coalesce.window_ms.
+  if (typeof tg?.coalesce?.window_ms === "number") {
+    access.coalescingGapMs = tg.coalesce.window_ms;
+  }
 
   return JSON.stringify(access, null, 2) + "\n";
 }

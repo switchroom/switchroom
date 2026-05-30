@@ -63,6 +63,7 @@ user thinking they steered when they actually queued, or vice versa.
 - **Steer** = `/steer ` or `/s ` prefix. Explicit opt-in to course-correct the in-flight task. The agent receives the body with `<channel steering="true">` and treats it as an amendment to the current work.
 - **Interrupt + new task** = `!`-prefix marker (#575, gateway-side). A message starting with `!` SIGINTs the agent, strips the marker, and forwards the body as a fresh turn. Empty `!` triggers a "send your replacement instruction now" reply rather than forwarding nothing. The CLAUDE.md template tells the agent the rule so it can teach the user when asked.
 - **What the user sees**: 🤝 reaction on a `/steer` message confirms the steer landed mid-turn; ⚡ reaction on a `!` message confirms the interrupt landed; queued messages get the normal 👀 (received) reaction since they're a fresh turn from the agent's perspective. The agent self-narrates the classification at the top of its reply (e.g. `_↪️ Treating as steer on the prior task_` or `_📥 Queued as a new task_`) so the chosen path is visible, not inferred.
+- **Inbound coalescing** (default-on, `channels.telegram.coalesce.window_ms`, default 500ms). Before any of the above classification runs, consecutive messages from the same sender+topic within the window are merged into one turn. This is what makes a forwarded burst — or a long paste Telegram split into several messages — count as a single thought instead of N fragments racing the turn boundary. If part of a burst lands while a turn is already in flight (so the rest is buffered), the buffered fragments re-merge on drain rather than fanning out into separate queued turns. The window is sub-second and the 👀 ack fires on the first message, so coalescing is invisible to the user.
 
 ## UAT prompts
 
@@ -77,6 +78,10 @@ user thinking they steered when they actually queued, or vice versa.
   not pick up hallucinated context from the first.
 - **Rapid-fire follow-ups.** Send several messages while one task is
   running. None should be lost.
+- **Forwarded burst / split paste.** Forward 3–4 messages at once (or
+  paste a long block Telegram splits into several). The agent should
+  answer them as ONE turn with shared context, not reply to each
+  fragment separately.
 - **Unsafe interrupt point.** Send a steer while the agent is mid-tool-call.
   The amendment should take effect at a safe boundary, not corrupt
   the tool call.

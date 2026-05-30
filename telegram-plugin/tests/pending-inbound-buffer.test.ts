@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, planBufferedRedelivery, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 
 function inbound(source: string, ts = Date.now()): InboundMessage {
@@ -21,6 +21,35 @@ function inbound(source: string, ts = Date.now()): InboundMessage {
     text: `synthetic ${source}`,
     meta: { source },
   }
+}
+
+/** An ordinary Telegram user message — NO meta.source, so it's mergeable. */
+function userMsg(
+  opts: {
+    text: string
+    chatId?: string
+    threadId?: number
+    userId?: number
+    ts?: number
+    imagePath?: string
+    attachment?: InboundMessage['attachment']
+  },
+): InboundMessage {
+  const ts = opts.ts ?? Date.now()
+  const m: InboundMessage = {
+    type: 'inbound',
+    chatId: opts.chatId ?? 'c1',
+    messageId: ts,
+    user: 'alice',
+    userId: opts.userId ?? 42,
+    ts,
+    text: opts.text,
+    meta: {},
+  }
+  if (opts.threadId != null) m.threadId = opts.threadId
+  if (opts.imagePath != null) m.imagePath = opts.imagePath
+  if (opts.attachment != null) m.attachment = opts.attachment
+  return m
 }
 
 describe('pending-inbound-buffer', () => {
@@ -311,5 +340,260 @@ describe('durable-spool integration (finn/carrie lost-on-restart fix)', () => {
       redelivered: 1,
       rebuffered: 0,
     })
+  })
+})
+
+describe('planBufferedRedelivery — merge-on-drain (forwarded-burst across a turn boundary)', () => {
+  it('passes a single message through unchanged (run of one)', () => {
+    const a = userMsg({ text: 'solo', ts: 1 })
+    const plan = planBufferedRedelivery([a])
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.merged).toBe(a) // identity preserved, no synthetic copy
+    expect(plan[0]!.originals).toEqual([a])
+  })
+
+  it('merges consecutive same-sender user messages into one turn (texts joined by \\n)', () => {
+    const a = userMsg({ text: 'first', ts: 1 })
+    const b = userMsg({ text: 'second', ts: 2 })
+    const c = userMsg({ text: 'third', ts: 3 })
+    const plan = planBufferedRedelivery([a, b, c])
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.merged.text).toBe('first\nsecond\nthird')
+    expect(plan[0]!.originals).toEqual([a, b, c]) // all three acked/rebuffered together
+  })
+
+  it('anchors the merged turn on the LAST message identity/meta', () => {
+    const a = userMsg({ text: 'first', ts: 10 })
+    const b = userMsg({ text: 'second', ts: 20 })
+    const plan = planBufferedRedelivery([a, b])
+    expect(plan[0]!.merged.messageId).toBe(20)
+    expect(plan[0]!.merged.ts).toBe(20)
+  })
+
+  it('NEVER merges a system inbound — meta.source isolates the #1150 wake-up class', () => {
+    const u1 = userMsg({ text: 'hi', ts: 1 })
+    const grant = inbound('vault_grant_approved', 2)
+    const u2 = userMsg({ text: 'there', ts: 3 })
+    const plan = planBufferedRedelivery([u1, grant, u2])
+    // The grant breaks the run; nothing merges across it.
+    expect(plan.map((p) => p.merged.text)).toEqual([
+      'hi',
+      'synthetic vault_grant_approved',
+      'there',
+    ])
+    expect(plan.every((p) => p.originals.length === 1)).toBe(true)
+  })
+
+  it('does not merge across different senders', () => {
+    const a = userMsg({ text: 'from-alice', userId: 1, ts: 1 })
+    const b = userMsg({ text: 'from-bob', userId: 2, ts: 2 })
+    const plan = planBufferedRedelivery([a, b])
+    expect(plan).toHaveLength(2)
+  })
+
+  it('does not merge across different topics (threadId)', () => {
+    const a = userMsg({ text: 'planning', threadId: 7, ts: 1 })
+    const b = userMsg({ text: 'admin', threadId: 9, ts: 2 })
+    const plan = planBufferedRedelivery([a, b])
+    expect(plan).toHaveLength(2)
+  })
+
+  it('does not merge across different chats', () => {
+    const a = userMsg({ text: 'dm', chatId: 'cA', ts: 1 })
+    const b = userMsg({ text: 'group', chatId: 'cB', ts: 2 })
+    const plan = planBufferedRedelivery([a, b])
+    expect(plan).toHaveLength(2)
+  })
+
+  it('carries a single attachment along even when it is NOT the last message', () => {
+    const photo = userMsg({ text: 'look', ts: 1, imagePath: '/tmp/p.jpg' })
+    const txt = userMsg({ text: 'at this', ts: 2 })
+    const plan = planBufferedRedelivery([photo, txt])
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.merged.text).toBe('look\nat this')
+    expect(plan[0]!.merged.imagePath).toBe('/tmp/p.jpg')
+  })
+
+  it('carries a single document attachment from the entry that owns it', () => {
+    const txt = userMsg({ text: 'here', ts: 1 })
+    const doc = userMsg({
+      text: '',
+      ts: 2,
+      attachment: { fileId: 'F1', mimeType: 'application/pdf', fileName: 'r.pdf' },
+    })
+    const plan = planBufferedRedelivery([txt, doc])
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.merged.attachment).toEqual({
+      fileId: 'F1',
+      mimeType: 'application/pdf',
+      fileName: 'r.pdf',
+    })
+  })
+
+  it('splits a run rather than putting two attachments in one turn (no silent media loss)', () => {
+    const p1 = userMsg({ text: 'one', ts: 1, imagePath: '/tmp/a.jpg' })
+    const p2 = userMsg({ text: 'two', ts: 2, imagePath: '/tmp/b.jpg' })
+    const plan = planBufferedRedelivery([p1, p2])
+    expect(plan).toHaveLength(2)
+    expect(plan[0]!.merged.imagePath).toBe('/tmp/a.jpg')
+    expect(plan[1]!.merged.imagePath).toBe('/tmp/b.jpg')
+  })
+
+  it('a leading text then media then text → text+media merge, then a fresh run', () => {
+    const t1 = userMsg({ text: 'intro', ts: 1 })
+    const p = userMsg({ text: 'pic', ts: 2, imagePath: '/tmp/p.jpg' })
+    const t2 = userMsg({ text: 'caption', ts: 3 })
+    const plan = planBufferedRedelivery([t1, p, t2])
+    // All three share one attachment max → single merged turn.
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.merged.text).toBe('intro\npic\ncaption')
+    expect(plan[0]!.merged.imagePath).toBe('/tmp/p.jpg')
+  })
+
+  it('preserves the run total — sum of originals equals input length (lossless)', () => {
+    const msgs = [
+      userMsg({ text: 'a', ts: 1 }),
+      userMsg({ text: 'b', ts: 2 }),
+      inbound('cron', 3),
+      userMsg({ text: 'c', ts: 4 }),
+    ]
+    const plan = planBufferedRedelivery(msgs)
+    const total = plan.reduce((n, p) => n + p.originals.length, 0)
+    expect(total).toBe(msgs.length)
+  })
+
+  it('end-to-end: redeliverBufferedInbound fans a 3-message burst into ONE send', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('ziggy', userMsg({ text: 'part 1', ts: 1 }))
+    buf.push('ziggy', userMsg({ text: 'part 2', ts: 2 }))
+    buf.push('ziggy', userMsg({ text: 'part 3', ts: 3 }))
+    const sent: string[] = []
+    const r = redeliverBufferedInbound(buf, 'ziggy', (m) => {
+      sent.push(m.text)
+      return true
+    })
+    expect(sent).toEqual(['part 1\npart 2\npart 3']) // ONE turn, not three
+    expect(r).toEqual({ drained: 3, redelivered: 3, rebuffered: 0 })
+    expect(buf.depth('ziggy')).toBe(0)
+  })
+
+  it('end-to-end: a failed send re-buffers ALL originals of the merged run (lossless)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('ziggy', userMsg({ text: 'part 1', ts: 1 }))
+    buf.push('ziggy', userMsg({ text: 'part 2', ts: 2 }))
+    const r = redeliverBufferedInbound(buf, 'ziggy', () => false)
+    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2 })
+    expect(buf.depth('ziggy')).toBe(2) // both originals back, nothing lost
+    expect(buf.drain('ziggy').map((m) => m.text)).toEqual(['part 1', 'part 2'])
+  })
+})
+
+describe('planBufferedRedelivery — seeded fuzz over random burst schedules', () => {
+  // Tiny deterministic PRNG (mulberry32) so failures reproduce from the seed.
+  function rng(seed: number): () => number {
+    let s = seed >>> 0
+    return () => {
+      s |= 0
+      s = (s + 0x6d2b79f5) | 0
+      let t = Math.imul(s ^ (s >>> 15), 1 | s)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+  }
+
+  const SOURCES = ['vault_grant_approved', 'cron', 'reaction', 'approval', 'handback']
+
+  function randomSchedule(rand: () => number): InboundMessage[] {
+    const n = 1 + Math.floor(rand() * 12)
+    const out: InboundMessage[] = []
+    for (let i = 0; i < n; i++) {
+      const roll = rand()
+      if (roll < 0.3) {
+        // system inbound (has meta.source) — never mergeable
+        out.push(inbound(SOURCES[Math.floor(rand() * SOURCES.length)]!, i + 1))
+      } else {
+        // user message: random sender/topic/chat, sometimes media
+        const hasImg = rand() < 0.2
+        const hasDoc = !hasImg && rand() < 0.15
+        out.push(
+          userMsg({
+            text: `m${i}`,
+            ts: i + 1,
+            chatId: rand() < 0.5 ? 'cA' : 'cB',
+            userId: rand() < 0.5 ? 1 : 2,
+            threadId: rand() < 0.4 ? (rand() < 0.5 ? 7 : 9) : undefined,
+            imagePath: hasImg ? `/tmp/img${i}.jpg` : undefined,
+            attachment: hasDoc
+              ? { fileId: `F${i}`, mimeType: 'application/pdf' }
+              : undefined,
+          }),
+        )
+      }
+    }
+    return out
+  }
+
+  function hasMedia(m: InboundMessage): boolean {
+    return m.imagePath != null || m.attachment != null
+  }
+  function isSystem(m: InboundMessage): boolean {
+    return m.meta != null && m.meta.source != null
+  }
+
+  it('holds all invariants across 5000 random schedules', () => {
+    const rand = rng(0xC0FFEE)
+    for (let iter = 0; iter < 5000; iter++) {
+      const pending = randomSchedule(rand)
+      const plan = planBufferedRedelivery(pending)
+
+      // 1. Lossless + order-preserving: flattening originals reproduces input.
+      const flat = plan.flatMap((p) => p.originals)
+      expect(flat).toEqual(pending)
+
+      // 2. Count is conserved.
+      expect(flat.length).toBe(pending.length)
+
+      for (const { merged, originals } of plan) {
+        // 3. A multi-message run never carries >1 attachment.
+        const mediaCount = originals.filter(hasMedia).length
+        expect(mediaCount).toBeLessThanOrEqual(1)
+
+        // 4. A system inbound is NEVER part of a multi-message run, and is
+        //    never silently mutated (passes through by identity).
+        if (originals.length > 1) {
+          expect(originals.every((m) => !isSystem(m))).toBe(true)
+        } else {
+          expect(merged).toBe(originals[0])
+        }
+
+        // 5. Every message in a merged run shares the same (chat, thread, user).
+        if (originals.length > 1) {
+          const k = (m: InboundMessage) =>
+            `${m.chatId}|${m.threadId ?? null}|${m.userId}`
+          expect(new Set(originals.map(k)).size).toBe(1)
+          // text is the \n-join of the run in order
+          expect(merged.text).toBe(originals.map((m) => m.text).join('\n'))
+          // the single attachment (if any) comes from the owning entry
+          const owner = originals.find(hasMedia)
+          expect(merged.imagePath).toBe(owner?.imagePath)
+          expect(merged.attachment).toEqual(owner?.attachment)
+        }
+      }
+    }
+  })
+
+  it('redeliver counts always satisfy drained == redelivered + rebuffered (5000 schedules)', () => {
+    const rand = rng(0x5EED)
+    for (let iter = 0; iter < 5000; iter++) {
+      const pending = randomSchedule(rand)
+      const buf = createPendingInboundBuffer({ log: () => {} })
+      for (const m of pending) buf.push('fuzz', m)
+      // Randomly succeed/fail each send to exercise both branches.
+      const r = redeliverBufferedInbound(buf, 'fuzz', () => rand() < 0.5)
+      expect(r.drained).toBe(pending.length)
+      expect(r.redelivered + r.rebuffered).toBe(r.drained)
+      // Whatever didn't deliver is still buffered (nothing lost).
+      expect(buf.depth('fuzz')).toBe(r.rebuffered)
+    }
   })
 })

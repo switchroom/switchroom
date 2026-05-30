@@ -641,6 +641,31 @@ export const TelegramChannelSchema = z
         "Cascades from defaults.channels.telegram.telegraph. " +
         "(Migrated from per-agent root in #596.)"
       ),
+    coalesce: z
+      .object({
+        window_ms: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Sliding-window (ms) for merging consecutive inbound messages from " +
+            "the same sender+topic into ONE Claude turn. Each new message resets " +
+            "the timer; the turn starts once the sender pauses for this long. " +
+            "Catches forwarded bursts, pasted text the Telegram client split " +
+            "into several messages, and mixed text+media forwards. Default 500. " +
+            "Set 0 to disable (every message becomes its own turn). Raise for " +
+            "users who think in multiple short messages; the trade-off is the " +
+            "single-message turn start is delayed by this much (the 👀 ack still " +
+            "fires immediately, so perceived latency is unchanged)."
+          ),
+      })
+      .optional()
+      .describe(
+        "Inbound coalescing — how the gateway groups rapid consecutive messages " +
+        "into a single turn so a forwarded album or split paste doesn't fan out " +
+        "into N separate turns. Cascades from defaults.channels.telegram.coalesce."
+      ),
     webhook_sources: z
       .array(z.enum(["github", "generic"]))
       .optional()

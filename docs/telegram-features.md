@@ -1,8 +1,9 @@
 # Telegram features
 
-Three opt-in features tune how an agent talks on Telegram. All three
-land under `channels.telegram.*` in `switchroom.yaml` and cascade
-through the standard defaults → profile → agent layering.
+Several features tune how an agent talks on Telegram. They all land
+under `channels.telegram.*` in `switchroom.yaml` and cascade through
+the standard defaults → profile → agent layering. The first three are
+opt-in; inbound coalescing is default-on.
 
 The `switchroom telegram` CLI verb is the supported way to turn each
 one on. Hand-editing `switchroom.yaml` works too — the CLI just edits
@@ -62,6 +63,42 @@ itself still runs through your Pro/Max subscription.
 switchroom telegram enable voice-in --agent gymbro --api-key sk-...
 # stores the key in the vault, sets channels.telegram.voice_in.enabled
 ```
+
+## Inbound coalescing
+
+**What:** consecutive inbound messages from the same sender in the same
+topic are buffered for a short sliding window and merged into ONE Claude
+turn. When you forward a handful of messages at once, or paste a long
+block of text that Telegram silently splits into several messages, the
+agent sees them as a single shared-context turn instead of replying to
+each fragment in isolation.
+
+**Why:** a forwarded burst is usually one thought. Without coalescing
+the agent answers message 1 before messages 2–4 have even arrived, so
+it reasons with partial context and fires several disjoint replies.
+
+**Default-on, no setup.** This runs at the default 500ms window with
+zero config. The 👀 acknowledgement still fires the moment your first
+message lands, so the wait for the window to close is invisible.
+
+**Tune it** (yaml only — no CLI verb):
+
+```yaml
+channels:
+  telegram:
+    coalesce:
+      window_ms: 500   # default; raise for slower forwards, 0 to disable
+```
+
+Cascades through defaults → profile → agent like every other
+`channels.telegram.*` knob. `window_ms: 0` disables coalescing (each
+message becomes its own turn). Takes effect on the next message after
+`switchroom apply` + agent restart.
+
+**Scope (v1):** a coalesced turn carries the merged text plus at most
+one attachment. A second photo/document — or an album — starts a fresh
+turn rather than dropping the extra media, so nothing is silently lost.
+Full multi-attachment / album grouping is a follow-up.
 
 ## Webhook ingest
 

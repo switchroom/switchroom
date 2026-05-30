@@ -53,6 +53,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `channels.telegram.deferred_completion_timeout_ms` | override | Progress-card: force-close timeout (ms) after parent `turn_end` while sub-agents are still running (default 180000) |
 | `channels.telegram.sub_agent_tick_interval_ms` | override | Progress-card: elapsed-counter tick interval (ms) while a sub-agent is running (default 10000) |
 | `channels.telegram.edit_budget_threshold` | override | Progress-card: card-edit budget per minute before throttled mode (default 18) |
+| `channels.telegram.coalesce.window_ms` | override | Sliding-window (ms) for merging consecutive inbound messages from the same sender+topic into ONE Claude turn. A forwarded burst or a long paste that Telegram splits across several messages arrives as a single shared-context turn instead of N rapid-fire turns. Each new message resets the timer. Default `500`. Set `0` to disable coalescing (each message is its own turn). The 👀 acknowledgement still fires immediately, so perceived latency is unchanged. |
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |

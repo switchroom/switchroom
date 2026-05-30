@@ -2997,10 +2997,12 @@ type AttachmentMeta = {
 // `ctx` must be the *latest* message's context (latest message_id, etc.) so
 // the merge function picks the last entry's ctx.
 //
-// Image/attachment-bearing messages bypass the coalescer entirely (see
-// handleInboundCoalesced), so those fields stay optional and unused on the
-// coalesce path; preserved for future use if we ever want to coalesce
-// image+text bursts.
+// A single attachment-bearing message may ride along in a coalesce window
+// (so a [text][photo] forward becomes one turn). The handleInboundCoalesced
+// guards ensure AT MOST ONE attachment per window — albums (media_group_id)
+// and a second attachment both bypass to their own turn — so the single
+// `downloadImage`/`attachment` slot is never silently overwritten. Folding a
+// whole album into one multi-attachment turn is the A2 follow-on.
 type CoalescePayload = {
   text: string
   ctx: Context
@@ -3008,24 +3010,36 @@ type CoalescePayload = {
   attachment?: AttachmentMeta
 }
 
+// Coalesce keys whose open window already holds an attachment-bearing entry.
+// A second attachment for the same key bypasses coalescing (see
+// handleInboundCoalesced) so the single-attachment merge can't drop a photo.
+// Cleared on flush (below) and on the synchronous bypass path.
+const bufferedAttachmentKeys = new Set<string>()
+
 const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
-  // Read per-call from the access file so `/access set-coalesce N` takes
-  // effect on the next message without restarting the gateway.
+  // Read per-call from the access file so an operator-tuned
+  // channels.telegram.coalesce.window_ms (projected to coalescingGapMs by
+  // scaffold) takes effect on the next message after apply+restart.
   //
   // Default lowered 1500 → 500 in #553 PR 3 to shrink the gateway-side
-  // contribution to first-real-text latency. Operators can still tune
-  // higher via `/access set-coalesce N` or the access file.
+  // contribution to first-real-text latency.
   gapMs: () => loadAccess().coalescingGapMs ?? 500,
   merge: (entries) => {
     const last = entries[entries.length - 1]
+    // At most one entry carries an attachment (guarded upstream), so pick
+    // whichever entry has it rather than blindly taking `last` — a
+    // [photo][text] burst keeps its image even though the last entry is
+    // text-only.
+    const withAttachment = entries.find((e) => e.downloadImage != null || e.attachment != null)
     return {
       text: entries.map((e) => e.text).join('\n'),
       ctx: last.ctx,
-      downloadImage: last.downloadImage,
-      attachment: last.attachment,
+      downloadImage: withAttachment?.downloadImage,
+      attachment: withAttachment?.attachment,
     }
   },
-  onFlush: (_key, merged) => {
+  onFlush: (key, merged) => {
+    bufferedAttachmentKeys.delete(key)
     void handleInbound(merged.ctx, merged.text, merged.downloadImage, merged.attachment)
   },
 })
@@ -8534,23 +8548,45 @@ async function handleInboundCoalesced(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
-  // Image/attachment-bearing messages bypass coalescing — preserves the
-  // legacy invariant that media never gets merged with sibling text.
-  if (downloadImage || attachment) return handleInbound(ctx, text, downloadImage, attachment)
-
-  // `!`-prefix interrupt (#575) ALSO bypasses coalescing. If we let an
+  // `!`-prefix interrupt (#575) bypasses coalescing. If we let an
   // interrupt sit in the coalesce window, an earlier non-`!` message
   // arriving in the same window would prepend itself and the marker
   // would no longer be at position 0 — handleInbound's parser would
   // miss it and the user's interrupt would silently get merged into a
   // normal turn. Bypass to handleInbound directly so the marker
-  // stays at the start of the text.
+  // stays at the start of the text. Checked first so a `!`-prefixed
+  // media caption still interrupts.
   if (parseInterruptMarker(text).isInterrupt) {
-    return handleInbound(ctx, text, undefined, undefined)
+    return handleInbound(ctx, text, downloadImage, attachment)
+  }
+
+  const hasAttachment = downloadImage != null || attachment != null
+
+  // Albums (media_group_id) are NOT coalesced in A1 — each part keeps its
+  // own turn exactly as before. The single-attachment merge can carry only
+  // one image, so folding a 3-photo album into one turn requires the
+  // multi-attachment inbound payload (the A2 follow-on). Bypass to preserve
+  // current per-part behavior and avoid dropping sibling photos.
+  if (hasAttachment && ctx.message?.media_group_id != null) {
+    return handleInbound(ctx, text, downloadImage, attachment)
   }
 
   const from = ctx.from
   if (!from) return
+
+  // A second attachment landing in an already-open window would clobber the
+  // first under the single-attachment merge. Bypass it to its own turn so no
+  // media is silently dropped; A2's multi-attachment payload lifts this.
+  if (hasAttachment) {
+    const probeKey = inboundCoalesceKey(
+      String(ctx.chat!.id),
+      ctx.message?.message_thread_id,
+      String(from.id),
+    )
+    if (bufferedAttachmentKeys.has(probeKey)) {
+      return handleInbound(ctx, text, downloadImage, attachment)
+    }
+  }
 
   // F2 fix (#553): fire 👀 reaction on RAW arrival, before the coalesce
   // wait blocks first paint. Pre-fix, the controller's setQueued() inside
@@ -8581,7 +8617,12 @@ async function handleInboundCoalesced(
     String(from.id),
   )
   const result = inboundCoalescer.enqueue(key, { text, ctx, downloadImage, attachment })
-  if (result.bypass) return handleInbound(ctx, text, undefined, undefined)
+  // Coalescing disabled (window <= 0): flush immediately, preserving any
+  // media this message carried.
+  if (result.bypass) return handleInbound(ctx, text, downloadImage, attachment)
+  // Mark the open window as holding an attachment so a second attachment for
+  // this key bypasses rather than clobbers (cleared in onFlush).
+  if (hasAttachment) bufferedAttachmentKeys.add(key)
 }
 
 /**
@@ -15560,7 +15601,7 @@ bot.on('message:text', async ctx => {
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
-  await handleInbound(ctx, caption, async () => {
+  await handleInboundCoalesced(ctx, caption, async () => {
     const photos = ctx.message.photo
     const best = photos[photos.length - 1]
     try {
@@ -15603,7 +15644,7 @@ bot.on('message:photo', async ctx => {
 bot.on('message:document', async ctx => {
   const doc = ctx.message.document
   const name = safeName(doc.file_name)
-  await handleInbound(ctx, ctx.message.caption ?? `(document: ${name ?? 'file'})`, undefined, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
+  await handleInboundCoalesced(ctx, ctx.message.caption ?? `(document: ${name ?? 'file'})`, undefined, { kind: 'document', file_id: doc.file_id, size: doc.file_size, mime: doc.mime_type, name })
 })
 
 bot.on('message:voice', async ctx => {
@@ -15626,7 +15667,7 @@ bot.on('message:voice', async ctx => {
       const text = ctx.message.caption
         ? `${ctx.message.caption}\n\n[voice transcript] ${transcript}`
         : `[voice transcript] ${transcript}`
-      await handleInbound(ctx, text, undefined, {
+      await handleInboundCoalesced(ctx, text, undefined, {
         kind: 'voice',
         file_id: voice.file_id,
         size: voice.file_size,
@@ -15636,7 +15677,7 @@ bot.on('message:voice', async ctx => {
     }
     // Fall through to the legacy path on transcription failure.
   }
-  await handleInbound(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
+  await handleInboundCoalesced(ctx, ctx.message.caption ?? '(voice message)', undefined, { kind: 'voice', file_id: voice.file_id, size: voice.file_size, mime: voice.mime_type })
 })
 
 /**
@@ -15728,17 +15769,17 @@ async function maybeTranscribeVoice(
 bot.on('message:audio', async ctx => {
   const audio = ctx.message.audio
   const name = safeName(audio.file_name)
-  await handleInbound(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
+  await handleInboundCoalesced(ctx, ctx.message.caption ?? `(audio: ${safeName(audio.title) ?? name ?? 'audio'})`, undefined, { kind: 'audio', file_id: audio.file_id, size: audio.file_size, mime: audio.mime_type, name })
 })
 
 bot.on('message:video', async ctx => {
   const video = ctx.message.video
-  await handleInbound(ctx, ctx.message.caption ?? '(video)', undefined, { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
+  await handleInboundCoalesced(ctx, ctx.message.caption ?? '(video)', undefined, { kind: 'video', file_id: video.file_id, size: video.file_size, mime: video.mime_type, name: safeName(video.file_name) })
 })
 
 bot.on('message:video_note', async ctx => {
   const vn = ctx.message.video_note
-  await handleInbound(ctx, '(video note)', undefined, { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
+  await handleInboundCoalesced(ctx, '(video note)', undefined, { kind: 'video_note', file_id: vn.file_id, size: vn.file_size })
 })
 
 bot.on('message:sticker', async ctx => {
@@ -15753,7 +15794,7 @@ bot.on('message:sticker', async ctx => {
   if (sticker.emoji) parts.push(sticker.emoji)
   if (sticker.set_name) parts.push(`from "${sticker.set_name}"`)
   const text = parts.length > 0 ? `(sticker — ${parts.join(' ')})` : '(sticker)'
-  await handleInbound(ctx, text, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
+  await handleInboundCoalesced(ctx, text, undefined, { kind: 'sticker', file_id: sticker.file_id, size: sticker.file_size })
 })
 
 bot.on('message:animation', async ctx => {
@@ -15766,7 +15807,7 @@ bot.on('message:animation', async ctx => {
   const animation = ctx.message.animation
   const caption = ctx.message.caption
   const text = caption ? `(gif) ${caption}` : '(gif)'
-  await handleInbound(ctx, text, undefined, {
+  await handleInboundCoalesced(ctx, text, undefined, {
     kind: 'animation',
     file_id: animation.file_id,
     size: animation.file_size,

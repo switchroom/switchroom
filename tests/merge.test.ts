@@ -588,6 +588,26 @@ describe("mergeAgentConfig channels block", () => {
     const result = mergeAgentConfig({ model: "opus" }, baseAgent());
     expect(result.channels).toBeUndefined();
   });
+
+  it("flows defaults.channels.telegram.coalesce.window_ms to an agent that omits it", () => {
+    const defaults: AgentDefaults = {
+      channels: { telegram: { coalesce: { window_ms: 750 } } },
+    };
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.channels?.telegram?.coalesce?.window_ms).toBe(750);
+  });
+
+  it("lets an agent override the coalesce window from defaults", () => {
+    const defaults: AgentDefaults = {
+      channels: { telegram: { coalesce: { window_ms: 750 } } },
+    };
+    const agent = baseAgent({
+      channels: { telegram: { coalesce: { window_ms: 0 } } },
+    });
+    const result = mergeAgentConfig(defaults, agent);
+    // window_ms: 0 (disable) must win over the inherited 750, not be dropped.
+    expect(result.channels?.telegram?.coalesce?.window_ms).toBe(0);
+  });
 });
 
 describe("mergeAgentConfig deprecated Telegram fields (#596)", () => {
