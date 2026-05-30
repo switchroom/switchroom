@@ -41,6 +41,29 @@ The plugin automatically reacts to the user's inbound message with a lifecycle p
 
 Stall watchdogs promote to 🥱 (30s idle) then 😨 (90s) so the user always knows the agent is alive. Tool-specific reactions show what the agent is doing (👨‍💻 for bash/edit, ⚡ for web search/fetch).
 
+### Background worker activity feed
+
+When an agent dispatches a sub-agent with `run_in_background: true`, that worker decouples from the parent turn — once the turn ends, a long-running worker would read as silence with nothing surfacing its progress. The worker-activity feed closes that gap.
+
+While the flag `SWITCHROOM_WORKER_ACTIVITY_FEED` is set (default **off**), the gateway posts **one regular Telegram message per background worker and edits it in place** as work happens:
+
+```
+🔧 Worker · Crawl the repo for dead code
+⚡ Bash rg --files (4 tools · 00:21)
+  ↳ Scanning src/ for unreferenced exports.
+```
+
+The header carries the **real dispatch task** (the `description` passed to the `Agent` tool), not a generic "sub-agent" label — it's read from the per-agent registry's `subagents` row. The message updates with the current tool, a running tool count, elapsed time, and a one-line summary, then finalizes to a terminal recap on completion:
+
+```
+✅ Worker done · Crawl the repo for dead code
+20 tools · 01:36
+```
+
+(Failures finalize to `⚠️ Worker failed · …`.) It's the same "live, growing message" shape the agent's own answer uses — not a separate pinned card. Independently, the turn's 👍 (done) reaction is **held** while any background worker is still running, so the reaction never implies the work finished while a worker is still grinding.
+
+The feed is off by default and is intended for agents that routinely fan out background work. Enable it per-agent by setting `SWITCHROOM_WORKER_ACTIVITY_FEED=1` in the agent's gateway environment.
+
 ### Message history
 
 A local SQLite database records every inbound and outbound message. After a Claude Code restart, the agent can call `get_recent_messages` to recover context instead of asking "what were we doing?". History survives process restarts and session resets.
@@ -175,3 +198,4 @@ The switchroom fork reads additional env vars from `start.sh`:
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |
+| `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (opt-in) | `1` enables the background worker-activity feed (default off). See "Background worker activity feed" above |

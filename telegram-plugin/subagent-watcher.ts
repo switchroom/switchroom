@@ -73,7 +73,13 @@ export interface WorkerEntry {
   readonly agentId: string
   /** File path of the JSONL. */
   readonly filePath: string
-  /** Short description — from the sub-agent's first text/narrative line. */
+  /**
+   * Generic 'sub-agent' placeholder — the watcher deliberately does NOT
+   * reassign this from the worker jsonl (see the init at construction and
+   * the "Do NOT overwrite" note in the line-handler). The real dispatch-time
+   * task description lives in the registry `subagents` row; the gateway reads
+   * it there via resolveWorkerFeedDispatch for the worker-feed header.
+   */
   description: string
   /** Current lifecycle state. */
   state: WorkerState
@@ -864,6 +870,9 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     const entry: WorkerEntry = {
       agentId,
       filePath,
+      // Generic placeholder only — never overwritten from the jsonl. The
+      // gateway substitutes the real registry description for the worker
+      // feed (resolveWorkerFeedDispatch). See the WorkerEntry.description doc.
       description: 'sub-agent',
       state: 'running',
       dispatchedAt: n,
