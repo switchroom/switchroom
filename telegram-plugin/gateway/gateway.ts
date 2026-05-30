@@ -52,6 +52,7 @@ import {
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
+import { DeferredDoneReactions } from '../reaction-defer.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -1100,14 +1101,14 @@ const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number
 // worker was still running when the parent's `turn_end` fired. Painting 👍
 // then would read as "done / nothing happening" while the worker keeps
 // going. The controller is `hold()`-frozen on a working glyph; the entry
-// is promoted to 👍 by `promoteDeferredDoneReactions` when the watcher's
-// `onFinish` reports the last worker complete. Keyed by statusKey; the
-// stored controller instance guards against a newer turn superseding the
-// held one (promote no-ops if `activeStatusReactions[key] !== ctrl`).
-const deferredDoneReactions = new Map<
-  string,
-  { chatId: string; threadId: number | undefined; ctrl: StatusReactionController }
->()
+// is promoted to 👍 by `deferredDoneReactions.promote()` (wired to the
+// watcher's `onFinish`) when the last worker completes. See
+// `reaction-defer.ts` for the promote/purge interaction the unit tests pin.
+const deferredDoneReactions = new DeferredDoneReactions<StatusReactionController>({
+  countRunningWorkers: () => countRunningWorkers(),
+  getActive: (key) => activeStatusReactions.get(key),
+  purge: (key) => purgeReactionTracking(key),
+})
 
 // #546 — outbound content-dedup window. PR #599 introduced the four read
 // sites (`outboundDedup.check` / `.record` in executeReply, executeStreamReply,
@@ -1912,22 +1913,12 @@ function finalizeStatusReaction(
   if (!ctrl) return
   // Don't paint the terminal 👍 while a background sub-agent worker is
   // still running — it reads as "done / nothing happening" even though
-  // the text said work continues. Hold the working glyph (✍️/⚡) and
-  // defer the terminal until the last worker finishes
-  // (`promoteDeferredDoneReactions`, fired from the watcher's onFinish).
-  // Errors are terminal regardless: a failed/aborted turn shouldn't wait
-  // on a worker.
-  if (reason === 'done' && countRunningWorkers() > 0) {
-    ctrl.hold()
-    deferredDoneReactions.set(key, { chatId, threadId, ctrl })
-    // Race guard: a worker may have transitioned to done between the
-    // count above and this registration, having already fired onFinish
-    // before the deferred entry existed. Re-check and promote now so the
-    // held reaction can't hang on a 👍 that will never come.
-    if (countRunningWorkers() === 0) promoteDeferredDoneReactions()
-    return
-  }
-  deferredDoneReactions.delete(key)
+  // the text said work continues. `tryDefer` holds the working glyph
+  // (✍️/⚡) and registers the controller; the watcher's onFinish promotes
+  // it to 👍 once the last worker completes. Errors are terminal
+  // regardless: a failed/aborted turn shouldn't wait on a worker.
+  if (reason === 'done' && deferredDoneReactions.tryDefer(key, ctrl)) return
+  deferredDoneReactions.drop(key)
   ctrl.finalize(reason)
   purgeReactionTracking(key)
 }
@@ -1946,25 +1937,6 @@ function countRunningWorkers(): number {
     if (e.state === 'running' && !e.historical) n++
   }
   return n
-}
-
-/**
- * Promote any deferred-done reactions to the terminal 👍 once no workers
- * remain running. Called from the watcher's `onFinish`. Instance-guarded:
- * if a newer turn replaced the held controller for that key, the deferred
- * entry is simply dropped (the new turn owns the reaction now).
- */
-function promoteDeferredDoneReactions(): void {
-  if (deferredDoneReactions.size === 0) return
-  if (countRunningWorkers() > 0) return
-  for (const [key, { ctrl }] of deferredDoneReactions) {
-    const live = activeStatusReactions.get(key)
-    if (live != null && live === ctrl) {
-      live.finalize('done')
-      purgeReactionTracking(key)
-    }
-  }
-  deferredDoneReactions.clear()
 }
 
 /**
@@ -17383,7 +17355,7 @@ void (async () => {
                 // promote to 👍 iff none remain running. Independent of the
                 // handback gating below, so it must run before any early
                 // return. Cheap no-op when nothing is deferred.
-                promoteDeferredDoneReactions()
+                deferredDoneReactions.promote()
                 // IO: resolve the fleet chat id and the background flag.
                 // The DECISION (gating + inbound build) is delegated to
                 // the pure `decideSubagentHandback` so it is unit-tested
