@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.17 — Worker-feed hardening: regression pin + docs/comment sweep (#2004)
+
+Hardening pass on the v0.14.15/16 worker-activity feed — no behaviour
+change, all default-off.
+
+The real-task-description wiring shipped in #2002 (feed header renders
+`🔧 Worker · <real task>` from the `subagents` registry row) had no fast
+test pinning it — only the slow, non-gating mtcute UAT. A refactor could
+have silently swapped it back to the watcher's generic `'sub-agent'`
+placeholder and CI would stay green. This release closes that gap:
+
+- New DB-free pure helper `resolveWorkerFeedDispatch(sub, watcherDescription)`
+  (`telegram-plugin/gateway/worker-feed-dispatch.ts`) returns
+  `{ isBackground, feedDescription }`, preferring a non-empty registry
+  description and falling back to the watcher label on null/empty.
+  Pinned by `worker-feed-dispatch.test.ts` (6 cases, runs under both
+  vitest and bun).
+- `gateway.ts` `onProgress`/`onFinish` now route the registry read
+  through the typed `getSubagentByJsonlId` helper + `resolveWorkerFeedDispatch`,
+  replacing two copies of inlined raw SQL — behaviour-preserving,
+  reviewer-confirmed equivalent.
+- Swept the stale `subagent-watcher.ts` comment that implied
+  `WorkerEntry.description` carries the real task name (it's a fixed
+  `'sub-agent'` placeholder, never reassigned) — it now points readers
+  at `resolveWorkerFeedDispatch`.
+- Updated JTBD (`reference/know-what-my-agent-is-doing.md`), user docs
+  (`docs/telegram-plugin.md` + env-var table), and agent guidance
+  (`CLAUDE.md`).
+
 ## v0.14.16 — Worker-feed real task description + live UAT (#2002)
 
 Follow-up polish to the v0.14.15 worker-activity feed. The feed header
