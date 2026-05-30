@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.16 — Worker-feed real task description + live UAT (#2002)
+
+Follow-up polish to the v0.14.15 worker-activity feed. The feed header
+rendered `🔧 Worker · sub-agent` because `entry.description` was never
+reassigned from its init default — the real dispatch description was
+sitting unused in the registry DB. The gateway now reads the real
+description from the `subagents` registry row in both the live
+(`onProgress`) and terminal (`onFinish`) paths, so the feed renders
+`🔧 Worker · <real task>` (e.g. `🔧 Worker · Background ten-step
+worker`). The `onFinish` restructure moves the feed `finish()` call
+after the registry query while keeping `deferredDoneReactions.promote()`
+unconditionally first — behaviour-preserving, reviewer-confirmed.
+
+Also lands the end-to-end mtcute UAT scenario
+(`jtbd-worker-activity-feed-dm`) that dispatches a real background
+worker and asserts the full feed lifecycle: first paint (`🔧 Worker`),
+in-place edit while work is in flight, and terminal recap (`✅ Worker
+done · … / N tools`). The UAT worker is paced (~10 short narrated steps,
+~2s jsonl gaps) to stay under the test-harness stall window
+(`SWITCHROOM_SUBAGENT_STALL_MS=5000`) so it runs to real completion
+instead of tripping a synthesized terminal turn_end mid-flight. Feed
+stays default-off (`SWITCHROOM_WORKER_ACTIVITY_FEED`).
+
 ## v0.14.15 — Background-worker visibility (#1999, #2000)
 
 A *background* sub-agent (`run_in_background: true`) decouples from the
