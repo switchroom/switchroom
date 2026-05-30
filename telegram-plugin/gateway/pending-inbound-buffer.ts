@@ -91,26 +91,117 @@ export function redeliverBufferedInbound(
   const pending = buffer.drain(agent)
   let redelivered = 0
   let rebuffered = 0
-  for (const msg of pending) {
+  // Collapse consecutive same-sender Telegram user messages into one turn
+  // (see planBufferedRedelivery) so a forwarded burst that spanned a turn
+  // boundary doesn't fan out into N sequential replies. System inbounds
+  // (vault grants, approvals, cron, handbacks — anything with meta.source)
+  // are never merged and are delivered individually exactly as before.
+  for (const { merged, originals } of planBufferedRedelivery(pending)) {
     let delivered = false
     try {
-      delivered = send(msg)
+      delivered = send(merged)
     } catch {
       delivered = false
     }
     if (delivered) {
-      redelivered++
       // Confirmed delivery to a live registered bridge → the durable
-      // promise is kept; tombstone the spool entry so it is NOT
-      // boot-replayed again. A miss leaves it spooled (re-pushed below
-      // AND still live in the spool) for the next drain / escalation.
-      spool?.ack(msg)
+      // promise is kept; tombstone EVERY original's spool entry so none is
+      // boot-replayed again. The merged message isn't itself spooled — the
+      // originals are, so we ack by original identity.
+      for (const o of originals) spool?.ack(o)
+      redelivered += originals.length
     } else {
-      buffer.push(agent, msg)
-      rebuffered++
+      // Re-buffer the originals (not the merged synthetic) so the spool
+      // identity is preserved and the next drain re-merges them losslessly.
+      for (const o of originals) buffer.push(agent, o)
+      rebuffered += originals.length
     }
   }
   return { drained: pending.length, redelivered, rebuffered }
+}
+
+/** True when `msg` is an ordinary Telegram user message eligible to be
+ *  merged with adjacent siblings. System inbounds (cron, vault grants,
+ *  approvals, subagent handbacks, warmup, reaction triggers) all tag a
+ *  `meta.source`; the user-message inbound built in gateway.ts sets none.
+ *  Restricting to source-less inbounds keeps merge-on-drain away from the
+ *  #1150 wake-up class entirely. */
+function isMergeableUserInbound(msg: InboundMessage): boolean {
+  return msg.type === 'inbound' && (msg.meta == null || msg.meta.source == null)
+}
+
+function inboundHasMedia(msg: InboundMessage): boolean {
+  return msg.imagePath != null || msg.attachment != null
+}
+
+/**
+ * Plan how a drained buffer is re-delivered. Walks `pending` in arrival
+ * order and groups runs of consecutive messages that:
+ *   - are both ordinary Telegram user messages (no meta.source), AND
+ *   - share the same (chatId, threadId, userId), AND
+ *   - would not put two attachments in one turn (A1 carries a single
+ *     attachment; a second media starts a new run so nothing is dropped).
+ *
+ * Each run collapses to one merged InboundMessage (texts joined by '\n',
+ * the run's single attachment carried, the LAST message's identity/meta
+ * kept as the turn anchor). A run of one passes through unchanged. The
+ * returned `originals` preserve spool identity for ack / re-buffer.
+ *
+ * Pure + deterministic so it can be exhaustively fuzzed.
+ */
+export function planBufferedRedelivery(
+  pending: InboundMessage[],
+): { merged: InboundMessage; originals: InboundMessage[] }[] {
+  const out: { merged: InboundMessage; originals: InboundMessage[] }[] = []
+  let run: InboundMessage[] = []
+  let runHasMedia = false
+
+  const sameTarget = (a: InboundMessage, b: InboundMessage): boolean =>
+    a.chatId === b.chatId &&
+    (a.threadId ?? null) === (b.threadId ?? null) &&
+    a.userId === b.userId
+
+  const flush = (): void => {
+    if (run.length === 0) return
+    out.push({ merged: run.length === 1 ? run[0]! : mergeRun(run), originals: run })
+    run = []
+    runHasMedia = false
+  }
+
+  for (const msg of pending) {
+    const msgHasMedia = inboundHasMedia(msg)
+    const canJoin =
+      run.length > 0 &&
+      isMergeableUserInbound(msg) &&
+      isMergeableUserInbound(run[run.length - 1]!) &&
+      sameTarget(run[run.length - 1]!, msg) &&
+      !(runHasMedia && msgHasMedia)
+    if (!canJoin) flush()
+    run.push(msg)
+    runHasMedia = runHasMedia || msgHasMedia
+  }
+  flush()
+  return out
+}
+
+/** Collapse a >1 run into a single turn. The newest message anchors the
+ *  turn (its messageId/ts/user/meta); texts join in arrival order; the
+ *  single attachment (if any) rides along from whichever message carried
+ *  it. Caller guarantees the run is mergeable + has at most one media. */
+function mergeRun(run: InboundMessage[]): InboundMessage {
+  const last = run[run.length - 1]!
+  const mediaEntry = run.find(inboundHasMedia)
+  const merged: InboundMessage = {
+    ...last,
+    text: run.map((m) => m.text).join('\n'),
+  }
+  // Re-seat the single attachment/imagePath from the entry that owns it
+  // (which may not be `last`), or strip them if the run is text-only.
+  delete merged.imagePath
+  delete merged.attachment
+  if (mediaEntry?.imagePath != null) merged.imagePath = mediaEntry.imagePath
+  if (mediaEntry?.attachment != null) merged.attachment = mediaEntry.attachment
+  return merged
 }
 
 /**

@@ -34,10 +34,11 @@ export interface InboundCoalescerOptions<T> {
    * `{ bypass: true }` and the caller should flush immediately).
    *
    * Pass a function (`() => number`) instead of a number when the
-   * window is config-driven and the operator can change it at runtime
-   * — gateway.ts reads it per-call from the access file so a
-   * `/access set-coalesce 500` takes effect on the next message
-   * without restarting the gateway.
+   * window is config-driven: gateway.ts reads it per-call from the
+   * access file (projected there from
+   * `channels.telegram.coalesce.window_ms` by the scaffold) so an
+   * operator-tuned window takes effect on the next message after
+   * apply + restart.
    */
   gapMs: number | (() => number)
   /**
@@ -146,9 +147,9 @@ export function createInboundCoalescer<T>(opts: InboundCoalescerOptions<T>): Inb
  *     CPO decision #9 ratified 2026-05-27)
  *
  * `threadId` collapses `null`/`undefined`/`0` to `_` via the same
- * convention as `chatKey()`. The 1.5s coalesce window is per-topic
- * intent ("user sends 3 sentences as one thought") — applying it
- * cross-topic merges genuinely separate conversations.
+ * convention as `chatKey()`. The coalesce window (default 500ms) is
+ * per-topic intent ("user sends 3 sentences as one thought") — applying
+ * it cross-topic merges genuinely separate conversations.
  */
 export function inboundCoalesceKey(
   chatId: string,

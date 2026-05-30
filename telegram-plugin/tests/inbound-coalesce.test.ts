@@ -140,4 +140,25 @@ describe('createInboundCoalescer', () => {
     expect(flushed).toEqual([])
     expect(c.size()).toBe(0)
   })
+
+  it('hands merge ALL entries in arrival order so the attachment can ride from a non-last entry', () => {
+    // The gateway merge picks the single attachment via entries.find(...),
+    // NOT entries[last]. Pin that the coalescer preserves arrival order and
+    // passes every buffered entry, so a [photo][text] burst keeps the photo.
+    interface MediaPayload { text: string; attachment?: string }
+    const mediaMerge = (entries: MediaPayload[]): MediaPayload => ({
+      text: entries.map((e) => e.text).join('\n'),
+      attachment: entries.find((e) => e.attachment != null)?.attachment,
+    })
+    const flushed: MediaPayload[] = []
+    const c = createInboundCoalescer<MediaPayload>({
+      gapMs: 1500,
+      merge: mediaMerge,
+      onFlush: (_key, merged) => flushed.push(merged),
+    })
+    c.enqueue('c1:u1', { text: 'look', attachment: 'photo-1' }) // media FIRST
+    c.enqueue('c1:u1', { text: 'at this' })                     // text second
+    vi.advanceTimersByTime(1500)
+    expect(flushed).toEqual([{ text: 'look\nat this', attachment: 'photo-1' }])
+  })
 })
