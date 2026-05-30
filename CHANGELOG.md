@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.14.18 — Inbound burst coalescing + scannable status replies
+
+### Coalesce forwarded / split-paste bursts into one turn (#2007)
+
+Forwarding several Telegram messages — or pasting a long block Telegram
+splits across messages — made Claude reply to each fragment as its own
+turn, reasoning with partial context. Media handlers now route through
+`handleInboundCoalesced` (with three guards that keep album / multi-
+attachment behaviour identical to today — at most one attachment per
+flush, no silent drops), and a new pure `planBufferedRedelivery`
+collapses consecutive same-`(chat,thread,user)` source-less inbounds on
+buffer drain. System inbounds (vault grants, approvals, cron, handbacks)
+never merge. New cascade knob `channels.telegram.coalesce.window_ms`
+(default 500ms, `0` disables); the 👀 ack still fires on the first
+message so perceived latency is unchanged.
+
+### Visual hierarchy for multi-section status replies (#2008)
+
+Agents posted "where things stand" / worker-dispatch updates as emoji-
+prefixed plain-text lines with no bold and no blank-line spacing, so
+every line carried equal weight and the message read as a flat wall on
+mobile. The markdown→HTML converter can't enrich what the model never
+marks up — so this is a prompt-guidance fix in
+`profiles/_shared/telegram-style.md.hbs`, not a converter change. It
+relaxes the "bold sparingly / no headings" rule **only for multi-section
+messages**: bold the section label on its own line (`**✅ Done**`,
+`**🔲 Remaining**`, `**Next**`) with one blank line between sections.
+Short conversational replies stay minimal — hierarchy is reserved for
+grouped updates, keeping inside the "chat is the artifact, not a
+dashboard" principle.
+
 ## v0.14.17 — Worker-feed hardening: regression pin + docs/comment sweep (#2004)
 
 Hardening pass on the v0.14.15/16 worker-activity feed — no behaviour
