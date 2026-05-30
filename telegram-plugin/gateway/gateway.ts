@@ -53,6 +53,7 @@ import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
+import { createWorkerActivityFeed } from '../worker-activity-feed.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -17256,6 +17257,45 @@ void (async () => {
         if (streamMode === 'checklist') {
           const watcherAgentDir = resolveAgentDirFromEnv()
           if (watcherAgentDir != null) {
+            // #PR2 — live worker-activity feed. A *background* sub-agent
+            // decouples from the parent turn, so when the turn ends nothing
+            // surfaces its ongoing jsonl activity and a long worker reads as
+            // silence. This feed posts ONE regular chat message per worker
+            // and edits it in place as work happens (current tool + elapsed),
+            // finalizing on completion — the same "live, growing message"
+            // shape the main agent's answer uses, NOT card chrome (the pinned
+            // card was deleted in #1126). Flag-gated; when ON it also
+            // supersedes the coarse 5-min bucket relay below to avoid
+            // double-surfacing the same progress beat.
+            const workerFeedEnabled = process.env.SWITCHROOM_WORKER_ACTIVITY_FEED === '1'
+            const workerActivityFeed = createWorkerActivityFeed({
+              bot: {
+                sendMessage: async (cid, text, sendOpts) => {
+                  const sent = await robustApiCall(
+                    () =>
+                      lockedBot.api.sendMessage(
+                        cid,
+                        text,
+                        sendOpts as Parameters<typeof lockedBot.api.sendMessage>[2],
+                      ),
+                    { chat_id: cid, verb: 'worker-feed' },
+                  )
+                  return sent as { message_id: number }
+                },
+                editMessageText: (cid, mid, text, editOpts) =>
+                  robustApiCall(
+                    () =>
+                      lockedBot.api.editMessageText(
+                        cid,
+                        mid,
+                        text,
+                        editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
+                      ),
+                    { chat_id: cid, verb: 'worker-feed' },
+                  ),
+              },
+              log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
+            })
             subagentWatcher = startSubagentWatcher({
               agentDir: watcherAgentDir,
               // Issue #1116 (Bug A): restrict project-dir enumeration to
@@ -17348,7 +17388,7 @@ void (async () => {
               // Gated to background completions: foreground sub-agents
               // need nothing here, and 'orphan' is a stale historical-at-
               // boot row, not a fresh completion the user is waiting on.
-              onFinish: ({ agentId, outcome, description, resultText }) => {
+              onFinish: ({ agentId, outcome, description, resultText, toolCount, durationMs }) => {
                 // Reaction promotion: if the parent turn already ended
                 // with this (or another) worker still running, its 👍 was
                 // deferred (held on ✍️/⚡). Now that a worker finished,
@@ -17356,6 +17396,21 @@ void (async () => {
                 // handback gating below, so it must run before any early
                 // return. Cheap no-op when nothing is deferred.
                 deferredDoneReactions.promote()
+                // #PR2 live worker-feed: force the terminal recap edit on
+                // the worker's live message. No-op when no message was ever
+                // posted (trivial workers stay silent; handback covers them).
+                // 'orphan' is a stale boot row, not a fresh completion — map
+                // it to 'done' so an already-posted message still finalizes.
+                if (workerFeedEnabled) {
+                  void workerActivityFeed.finish(agentId, {
+                    description,
+                    lastTool: null,
+                    toolCount,
+                    latestSummary: resultText,
+                    elapsedMs: durationMs,
+                    state: outcome === 'failed' ? 'failed' : 'done',
+                  })
+                }
                 // IO: resolve the fleet chat id and the background flag.
                 // The DECISION (gating + inbound build) is delegated to
                 // the pure `decideSubagentHandback` so it is unit-tested
@@ -17453,7 +17508,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount }) => {
                 let fleetChatId = ''
                 let isBackground = false
                 try {
@@ -17474,6 +17529,28 @@ void (async () => {
                   } catch { /* best-effort */ }
                 }
                 if (!isBackground) return // skip overhead for foreground
+
+                // #PR2 live worker-feed: when ON, the worker's live chat
+                // message owns the progress beat. Push a running cue and
+                // return BEFORE the legacy bucket relay so the same activity
+                // isn't double-surfaced (in-message edit + injected
+                // "still working" inbound turn). Chat = owner DM, since the
+                // pinned-card fleet is gone and every agent is DM-shaped.
+                if (workerFeedEnabled) {
+                  void workerActivityFeed.update(
+                    agentId,
+                    fleetChatId || (loadAccess().allowFrom[0] ?? ''),
+                    {
+                      description,
+                      lastTool,
+                      toolCount,
+                      latestSummary,
+                      elapsedMs,
+                      state: 'running',
+                    },
+                  )
+                  return
+                }
 
                 const decision = decideSubagentProgress({
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
