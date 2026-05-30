@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.14.15 — Background-worker visibility (#1999, #2000)
+
+A *background* sub-agent (`run_in_background: true`) decouples from the
+parent turn. Two gaps made a dispatched background worker read as
+**silence** once its parent turn ended — exactly the JTBD
+**you-hold-the-leash** awareness gap an operator hit watching a worker
+go quiet. This release closes both.
+
+### PR A — hold 👍 until the last background worker finishes (#1999)
+
+When a turn ended with a background worker still running, the reply got
+its terminal 👍 (done) reaction immediately — implying the work was
+finished while the worker was still grinding away. The 👍 is now
+*deferred* while any background worker for the turn is still running:
+the reply holds the working reaction (✍️/⚡) instead, and promotes to 👍
+only once the last worker terminates. A worker finishing promotes iff
+none remain running, so multi-worker turns settle correctly.
+
+### PR B — live worker-activity feed (#2000, flag-gated)
+
+New `SWITCHROOM_WORKER_ACTIVITY_FEED` surface (default **off**): while a
+background worker runs, the gateway posts **one regular Telegram message
+per worker and edits it in place** as work happens — current tool +
+short summary + elapsed — finalizing with a tool-count + duration recap
+on completion. This is the same "live, growing message" shape the main
+agent's answer uses, *not* card chrome (the pinned progress card was
+deleted in #1126; "Chat IS the artifact" bars re-adding widgets).
+
+The feed is watcher-driven (so it keeps surfacing activity after the
+parent turn ends), background-gated, first-paint-delayed (trivial
+sub-second workers stay silent — the handback reply covers them),
+edit-throttled + body-deduped, and resilient to 429s and message_id
+drift. When the flag is on it supersedes the coarse 5-min progress
+bucket relay to avoid double-surfacing the same beat. Modeled on
+`issues-card.ts` (pure render + injected bot API); 17 unit tests under
+both vitest and bun.
+
 ## v0.14.14 — Handoff banner flag actually works on docker (#1997)
 
 `session_continuity.show_handoff_line: false` is meant to suppress the
