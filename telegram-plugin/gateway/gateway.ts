@@ -8955,6 +8955,7 @@ async function handleInbound(
       requestId: request_id,
       behavior,
     })
+    resumeReactionAfterVerdict()
     if (msgId != null) {
       const emoji = behavior === 'allow' ? '✅' : '❌'
       void bot.api.setMessageReaction(chat_id, msgId, [
