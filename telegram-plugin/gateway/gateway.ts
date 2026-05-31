@@ -303,6 +303,10 @@ import {
   decideSubagentProgress,
   DEFAULT_PROGRESS_INTERVAL_MS,
 } from './subagent-progress-inbound-builder.js'
+import {
+  shouldRenderForegroundProgress,
+  foregroundFinishAction,
+} from './foreground-nesting.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import type {
   ToolCallMessage,
@@ -17843,16 +17847,26 @@ void (async () => {
                   // tool result, so there's no handback to deliver. Reaction
                   // promotion already ran above.
                   const turn = currentTurn
-                  if (
-                    turn != null &&
-                    turn.foregroundSubAgents.delete(agentId) &&
-                    !turn.replyCalled
-                  ) {
-                    const rendered = composeTurnActivity(turn)
-                    if (rendered != null) {
-                      turn.activityPendingRender = rendered
-                      if (turn.activityInFlight == null) {
-                        turn.activityInFlight = drainActivitySummary(turn)
+                  const removed = turn != null && turn.foregroundSubAgents.delete(agentId)
+                  if (turn != null && removed) {
+                    const action = foregroundFinishAction({
+                      removed,
+                      replyCalled: turn.replyCalled,
+                      remainingForeground: turn.foregroundSubAgents.size,
+                    })
+                    if (action === 'handoff-clear') {
+                      // Post-ack: the last foreground sub-agent finished and
+                      // the parent will now produce its answer inline. Hand
+                      // the re-opened feed off to the answer, mirroring the
+                      // first-reply clear (turn_end is the safety net).
+                      clearActivitySummary(turn)
+                    } else if (action === 'recompose') {
+                      const rendered = composeTurnActivity(turn)
+                      if (rendered != null) {
+                        turn.activityPendingRender = rendered
+                        if (turn.activityInFlight == null) {
+                          turn.activityInFlight = drainActivitySummary(turn)
+                        }
                       }
                     }
                   }
@@ -17972,9 +17986,17 @@ void (async () => {
                   // activity draft rather than a separate worker message. Pure
                   // jsonl-tail → render (no model call), inside the
                   // subscription-honest boundary.
-                  if (!foregroundNestingEnabled) return // kill-switch: skip overhead
                   const turn = currentTurn
-                  if (turn == null || turn.replyCalled) return
+                  if (turn == null) return
+                  // Render regardless of `replyCalled` — a foreground Task
+                  // blocks the parent, so any reply seen while it runs is an
+                  // interim ack, never the final answer. Gating on replyCalled
+                  // (pre-#2032) made ack-first turns show zero live foreground
+                  // activity. Kill-switch lives in the predicate.
+                  if (!shouldRenderForegroundProgress({
+                    nestingEnabled: foregroundNestingEnabled,
+                    replyCalled: turn.replyCalled,
+                  })) return
                   const child = latestSummary.trim().slice(0, 120)
                   if (child.length === 0) return
                   let narrative = turn.foregroundSubAgents.get(agentId)
