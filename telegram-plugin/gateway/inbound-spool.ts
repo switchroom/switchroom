@@ -79,6 +79,21 @@ export function spoolId(msg: InboundMessage): string {
   ) {
     return `s:progress:${msg.meta.subagent_jsonl_id}:${msg.meta.bucket_idx}`
   }
+  // Boot-resume inbounds (honest-restart-resume): deterministic per
+  // interrupted turn so a multi-restart sequence (operator restarts again
+  // before the agent drains the first resume) collapses to ONE resume of
+  // a given turn instead of stacking N. Keyed on the synthetic messageId
+  // (=ts, fresh every boot) would re-fire each boot; the turn_key is the
+  // stable identity. Both resume sources share the namespace because a
+  // given turn can only be one or the other.
+  if (
+    (msg.meta?.source === 'resume_interrupted' ||
+      msg.meta?.source === 'resume_watchdog_timeout') &&
+    typeof msg.meta?.resume_turn_key === 'string' &&
+    msg.meta.resume_turn_key.length > 0
+  ) {
+    return `s:resume:${msg.meta.resume_turn_key}`
+  }
   if (typeof msg.messageId === 'number' && msg.messageId > 0) {
     return `m:${msg.chatId}:${msg.messageId}`
   }

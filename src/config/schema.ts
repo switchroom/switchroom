@@ -378,14 +378,10 @@ export const SessionSchema = z
  * Session-handoff continuity. Fresh sessions start with a clean context
  * window; to avoid losing "where were we?" between sessions, a Stop hook
  * summarizes the previous session into a compact briefing that the next
- * start.sh injects via --append-system-prompt. The telegram plugin also
- * prepends a one-shot "↩️ Picked up where we left off — <topic>" line to
- * the first assistant reply of the new session.
+ * start.sh injects via --append-system-prompt.
  *
  *   - enabled: master switch. When false, no Stop hook is installed and
  *     start.sh skips all handoff logic.
- *   - show_handoff_line: if false, the plugin still gets the briefing in
- *     its system prompt but suppresses the user-visible continuity line.
  *   - max_turns_in_briefing: hard cap on how many recent user/assistant
  *     turn pairs are fed to the summarizer. Bounds cost and latency.
  */
@@ -395,13 +391,6 @@ export const SessionContinuitySchema = z
       .boolean()
       .optional()
       .describe("Master switch for the session-handoff briefing (default true)."),
-    show_handoff_line: z
-      .boolean()
-      .optional()
-      .describe(
-        "Whether the telegram plugin prepends a visible '↩️ Picked up…' " +
-        "line to the first assistant reply after a restart (default true).",
-      ),
     max_turns_in_briefing: z
       .number()
       .int()

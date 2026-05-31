@@ -27,20 +27,6 @@
 # same one v0.6 systemd has always honored, just enforced inside the
 # container instead of by the host's user systemd manager.
 
-{{#if handoffEnabled}}
-# The telegram-plugin gateway reads SWITCHROOM_HANDOFF_SHOW_LINE to
-# decide whether to prepend the visible "↩️ Picked up where we left
-# off …" line on the first reply after a restart. It MUST be exported
-# *before* the gateway is forked in the docker preamble below (and
-# before the tmux re-exec), otherwise the gateway — the sole consumer —
-# never inherits it and session_continuity.show_handoff_line:false
-# silently no-ops on every docker agent. Living here, ahead of the
-# runtime branch, covers docker (both the outer fork pass and the inner
-# tmux pass) and the v0.6 non-docker path in one place. Gated on
-# handoffEnabled so a handoff-disabled agent emits no handoff env at all.
-export SWITCHROOM_HANDOFF_SHOW_LINE={{#if handoffShowLine}}true{{else}}false{{/if}}
-{{/if}}
-
 if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" ]; then
   # Hoist TELEGRAM_STATE_DIR up here so the gateway daemon (forked
   # below) finds gateway.sock / gateway.pid.json / history.db at the
@@ -441,14 +427,16 @@ export SWITCHROOM_PRIOR_SESSION_EPOCH
 #
 # The gateway writes <agentDir>/.pending-turn.env on boot if the previous
 # shutdown left an interrupted turn (ended_via='restart' / 'sigterm' /
-# 'timeout' or never closed at all). Source it here so the agent process
-# inherits SWITCHROOM_PENDING_TURN=true plus chat/thread/last-user-msg
-# context. The agent's resume protocol (per-agent CLAUDE.md) reads these
-# and decides whether to ack the interruption + ask for direction or
-# silently continue.
+# 'timeout' or never closed at all). These vars are now PASSIVE forensic
+# context only — the actual wake-and-resume is driven by a synthesized
+# inbound the gateway injects (<channel source="resume_interrupted"> or
+# "resume_watchdog_timeout">), not by the agent polling these vars. They
+# stay exported so the wake-audit / "why did you restart" protocols
+# (skills/switchroom-runtime) can read what was in flight without
+# re-deriving it. SWITCHROOM_PENDING_INTERRUPT_REASON carries the boot
+# classifier's idle snapshot for a 'timeout'-killed turn.
 #
-# Consume the file (rm) so it only applies to ONE boot — multi-restart
-# scenarios shouldn't re-fire the resume prompt repeatedly.
+# Consume the file (rm) so it only applies to ONE boot.
 SWITCHROOM_PENDING_TURN_ENV="{{agentDir}}/.pending-turn.env"
 if [ -f "$SWITCHROOM_PENDING_TURN_ENV" ]; then
   # shellcheck disable=SC1090
@@ -460,7 +448,8 @@ if [ -f "$SWITCHROOM_PENDING_TURN_ENV" ]; then
          SWITCHROOM_PENDING_THREAD_ID \
          SWITCHROOM_PENDING_USER_MSG_ID \
          SWITCHROOM_PENDING_ENDED_VIA \
-         SWITCHROOM_PENDING_STARTED_AT
+         SWITCHROOM_PENDING_STARTED_AT \
+         SWITCHROOM_PENDING_INTERRUPT_REASON
 fi
 
 # --- Wake audit sentinel ---
@@ -525,8 +514,6 @@ if [ ! -s "$HANDOFF_FILE" ]; then
     timeout 5 handoff-briefing.sh 2>/dev/null || true
   fi
 fi
-# SWITCHROOM_HANDOFF_SHOW_LINE is exported near the top of this script
-# (ahead of the docker preamble) so the gateway sidecar inherits it.
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}
 # Inject .handoff-briefing.md first (assembled from live sources), then
 # .handoff.md (raw transcript tail from the Stop hook). If both

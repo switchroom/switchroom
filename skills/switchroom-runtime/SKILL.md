@@ -56,29 +56,19 @@ This skill holds the runtime protocols that fire on specific boot signals or use
 
 ## Resume protocol — interrupted turns
 
-**Trigger:** the env var `SWITCHROOM_PENDING_TURN=true` is set when your session boots. The previous gateway died mid-turn (SIGTERM, restart, or a crash that bypassed the SIGTERM handler) and the user's last message was likely never fully answered. The accompanying env vars tell you what was in flight:
+**You do not poll for this.** When your previous turn was interrupted, the gateway wakes you on its own at boot by injecting a synthesized inbound — it arrives as your first turn, tagged `<channel source="resume_interrupted">` or `<channel source="resume_watchdog_timeout">`. The inbound text carries the specifics (elapsed time, the original request, tool-call count); this section is the *why* behind the two shapes so you handle each correctly. The policy is decided by how the prior turn ended, not by you.
 
-- `SWITCHROOM_PENDING_CHAT_ID` — the chat the interrupted turn belonged to
-- `SWITCHROOM_PENDING_THREAD_ID` — the forum topic id (empty if not a forum)
-- `SWITCHROOM_PENDING_USER_MSG_ID` — the inbound message_id that started the turn (you can quote-reply to it for context)
-- `SWITCHROOM_PENDING_ENDED_VIA` — `restart` (user ran `switchroom agent restart`), `sigterm` (systemd/manual kill), `timeout` (watchdog), or `unknown` (crash before stamp)
-- `SWITCHROOM_PENDING_STARTED_AT` — unix-ms when the turn started
+**Branch 1 — `resume_interrupted` (clean mid-flight interrupt).** The turn was cut off by an operator `switchroom agent restart`, a SIGTERM, or a crash before the turn could finish — it was *making progress*, just stopped short. **Resume it. Do not ask whether to.** In your first message, briefly tell the user you're picking the work back up and roughly how long ago it was interrupted (the inbound gives you the elapsed framing, e.g. "~3h ago"), then carry the actual task through to completion. The user has no way to know you remember — the one-line "resuming the X you asked ~3h ago" is what closes that gap. Only if you genuinely can't tell what the work was (no Hindsight, no handoff briefing, empty original prompt) do you say so and ask.
 
-**Your first action on a `SWITCHROOM_PENDING_TURN=true` boot must be to acknowledge the gap and confirm direction.** Don't silently pick up where you left off. The user has no way to know whether you remember what you were doing. Use `reply` with `accent: 'issue'` to make it obvious. Quote-reply to `SWITCHROOM_PENDING_USER_MSG_ID` so the original message is in view. Sample wording (adapt to the situation):
+**Branch 2 — `resume_watchdog_timeout` (hang-watchdog kill).** The turn made *no observable progress* for the full hang window (default 5 min) and was killed as a wedge. **Do NOT silently resume it — it may hang the same way.** Instead, tell the user plainly what happened: that your last turn was killed after ~N minutes of no progress, and roughly what it was doing (the inbound carries the idle duration and tool-call count). Then ask whether they want you to retry it or take a different angle. Report **only the honest cause** — no observable progress for that long — don't speculate about a deeper root cause you can't actually see from a boot record. Use `reply` with `accent: 'issue'` so the report is visually distinct.
 
-> ⚠️ Issue
->
-> I was killed mid-turn. Looks like my previous shutdown was via `<endedVia>`. Don't have full context on what I'd already done. Want me to: (a) start over from your last message, (b) summarize what I think was in flight and continue, or (c) drop it and move on?
-
-The env vars are one-shot (start.sh deletes the file after sourcing), so this prompt only fires on the immediately-following session, not every restart afterward. If you genuinely don't remember anything useful about the prior turn (Hindsight didn't catch it, no handoff briefing landed), say so explicitly rather than guessing.
-
-If `SWITCHROOM_PENDING_TURN` is unset or empty, do nothing special: the previous turn ended cleanly.
+The `SWITCHROOM_PENDING_*` env vars (`_CHAT_ID`, `_THREAD_ID`, `_USER_MSG_ID`, `_ENDED_VIA`, `_STARTED_AT`, `_INTERRUPT_REASON`) are one-shot passive context for the wake-audit and "why did you restart" protocols below — they are NOT the resume trigger and you don't need to act on them directly.
 
 ---
 
 ## Wake audit — every fresh boot
 
-**Trigger:** the sentinel file `$TELEGRAM_STATE_DIR/.wake-audit-pending` exists. `start.sh` drops it on every process boot. On your first turn after a fresh boot, before answering whatever the user just sent, gate-check then run the audit. This complements the resume protocol above: `SWITCHROOM_PENDING_TURN` covers "killed mid-turn"; the wake audit covers "anything else owed since last seen."
+**Trigger:** the sentinel file `$TELEGRAM_STATE_DIR/.wake-audit-pending` exists. `start.sh` drops it on every process boot. On your first turn after a fresh boot, before answering whatever the user just sent, gate-check then run the audit. This complements the resume protocol above: the injected `resume_interrupted` / `resume_watchdog_timeout` inbound covers "killed mid-turn"; the wake audit covers "anything else owed since last seen."
 
 **Conversation-aware dedup.** start.sh re-writes the sentinel on every process boot, including `--continue` respawns triggered by watchdog/bridge restarts. To avoid re-firing an already-handled audit on the same conversation, gate by `$TELEGRAM_STATE_DIR/.wake-audit-last-completed`:
 
@@ -149,7 +139,7 @@ The gateway treats a Telegram message starting with `!` (single bang, not `!!` o
 
 If the user sends `! actually never mind, do X instead`, you'll boot up and see `actually never mind, do X instead` with no record of what you were doing before. That's intentional.
 
-Doubled `!!` (typo / emphasis) reaches you verbatim. Empty `!` gets a "Send your replacement instruction now" reply from the gateway and never reaches you. The interrupt wakes a fresh `SWITCHROOM_PENDING_TURN` cycle, so the resume protocol above will fire on the next turn. Keep that pairing in mind when acknowledging.
+Doubled `!!` (typo / emphasis) reaches you verbatim. Empty `!` gets a "Send your replacement instruction now" reply from the gateway and never reaches you. The interrupt is in-process — the gateway keeps running and delivers the remainder as a fresh turn immediately — so it does NOT trigger the boot-resume path (that fires only on a real restart). The turn you were running is simply abandoned in favour of the new instruction.
 
 ---
 

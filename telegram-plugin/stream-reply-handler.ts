@@ -8,7 +8,7 @@
  *
  * Contract:
  *   - First call for a chat+thread: creates a stream via
- *     createStreamController, optionally prepending a handoff prefix.
+ *     createStreamController.
  *   - Subsequent calls: reuse the existing stream, push the new text.
  *   - `done=true`: finalize, delete the map entry, fire status-reaction
  *     completion, and (if history enabled) record the final message.
@@ -171,8 +171,6 @@ export interface StreamReplyDeps {
   escapeMarkdownV2: (text: string) => string
   /** Whitespace repair applied to the raw caller text. */
   repairEscapedWhitespace: (text: string) => string
-  /** Resolves the handoff prefix for a first-chunk stream. Empty string if none. */
-  takeHandoffPrefix: (format: 'html' | 'markdownv2' | 'text') => string
   /** Validates the chat id against the access list. Throws on deny. */
   assertAllowedChat: (chatId: string) => void
   /** Resolves the effective thread id (explicit, last-inbound, or undefined). */
@@ -444,14 +442,6 @@ export async function handleStreamReply(
     done,
     streamExisted,
   })
-
-  // First chunk of a session: consume any pending handoff prefix.
-  if (!stream) {
-    const prefix = deps.takeHandoffPrefix(
-      format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
-    )
-    if (prefix.length > 0) effectiveText = prefix + effectiveText
-  }
 
   if (!stream) {
     // Resolve the effective quote-reply target. Explicit `reply_to` wins;

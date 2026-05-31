@@ -88,7 +88,6 @@ function setup(opts: { progressCardActive?: boolean } = {}): Fixture {
       markdownToHtml: (t) => `<b>${t}</b>`, // stream_reply: bold
       escapeMarkdownV2: (t) => t,
       repairEscapedWhitespace: (t) => t,
-      takeHandoffPrefix: () => '',
       assertAllowedChat: () => {},
       resolveThreadId: () => undefined,
       disableLinkPreview: true,

@@ -28,11 +28,12 @@
  *     updated_at            INTEGER NOT NULL
  *
  * Boot-time usage:
- *   On every gateway boot, call `markOrphanedAsRestarted(db)` immediately
- *   after opening the DB. Any turn with `ended_at IS NULL` was killed
- *   mid-flight (SIGKILL, OOM, power loss) — it never got a chance to write
- *   a clean-shutdown marker. Stage 3 of simplify-restart will wire this up
- *   from the gateway entry point.
+ *   On every gateway boot, call `markOrphanedWithTimeoutClassification(db, …)`
+ *   immediately after opening the DB. Any turn with `ended_at IS NULL` was
+ *   killed mid-flight (SIGKILL, OOM, power loss, operator restart) — it never
+ *   got a chance to write a clean-shutdown marker. The classifier stamps the
+ *   in-flight turn `'timeout'` when its hang-marker is stale and `'restart'`
+ *   otherwise; the gateway then resumes or reports accordingly.
  */
 
 import { chmodSync, mkdirSync } from 'fs'
@@ -98,6 +99,15 @@ export interface Turn {
   user_prompt_preview: string | null
   assistant_reply_preview: string | null
   tool_call_count: number | null
+  /**
+   * Forensic snapshot persisted by the boot-time classifier when a turn is
+   * stamped `ended_via='timeout'` (the hang-watchdog window elapsed with no
+   * tool progress). Carries the idle duration so a *later* boot can rebuild
+   * the watchdog-report inbound after the on-disk turn-active marker — the
+   * only live source of the idle age — has already been swept. Null for
+   * cleanly-restarted (`'restart'`) orphans.
+   */
+  interrupt_reason: string | null
   created_at: number
   updated_at: number
 }
@@ -137,6 +147,7 @@ const SCHEMA_SQL = `
     user_prompt_preview     TEXT,
     assistant_reply_preview TEXT,
     tool_call_count         INTEGER,
+    interrupt_reason        TEXT,
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
   );
@@ -151,13 +162,21 @@ const PHASE1_MIGRATIONS = [
   `ALTER TABLE turns ADD COLUMN tool_call_count INTEGER`,
 ]
 
+// Column added for honest-restart-resume. Persists the idle snapshot the
+// boot classifier captures when stamping a turn 'timeout' (see
+// `markOrphanedWithTimeoutClassification`).
+const PHASE2_MIGRATIONS = [
+  `ALTER TABLE turns ADD COLUMN interrupt_reason TEXT`,
+]
+
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
   db.exec(SCHEMA_SQL)
-  // Run migrations for Phase 1 columns. SQLite doesn't support
-  // "ADD COLUMN IF NOT EXISTS", so we swallow the "duplicate column" error.
-  for (const sql of PHASE1_MIGRATIONS) {
+  // Run migrations. SQLite doesn't support "ADD COLUMN IF NOT EXISTS", so
+  // we swallow the "duplicate column" error to stay idempotent on
+  // pre-existing registry.db files.
+  for (const sql of [...PHASE1_MIGRATIONS, ...PHASE2_MIGRATIONS]) {
     try {
       db.exec(sql)
     } catch (err) {
@@ -225,6 +244,7 @@ interface RawTurnRow {
   user_prompt_preview: string | null
   assistant_reply_preview: string | null
   tool_call_count: number | null
+  interrupt_reason: string | null
   created_at: number
   updated_at: number
 }
@@ -244,6 +264,7 @@ function mapRow(row: RawTurnRow): Turn {
     user_prompt_preview: row.user_prompt_preview,
     assistant_reply_preview: row.assistant_reply_preview,
     tool_call_count: row.tool_call_count,
+    interrupt_reason: row.interrupt_reason,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -283,7 +304,7 @@ export function recordTurnStart(db: SqliteDatabase, args: RecordTurnStartArgs): 
  * tool-call count.
  *
  * No-ops gracefully if `turnKey` is not found (turn may have already been
- * swept by `markOrphanedAsRestarted` on a prior boot).
+ * swept by `markOrphanedWithTimeoutClassification` on a prior boot).
  */
 export function recordTurnEnd(db: SqliteDatabase, args: RecordTurnEndArgs): void {
   const now = Date.now()
@@ -327,27 +348,96 @@ export function findOrphanedTurns(db: SqliteDatabase, chatId: string): Turn[] {
   return rows.map(mapRow)
 }
 
+export interface OrphanClassifyOpts {
+  /**
+   * `turnKey` from the on-disk `turn-active.json` marker — the single
+   * in-flight turn the hang-watchdog tracks. Null when no marker is
+   * present at boot (the previous process exited cleanly between turns).
+   */
+  markerTurnKey?: string | null
+  /**
+   * Age in ms of the `turn-active.json` marker's mtime at boot, or null
+   * when no marker is present. The marker's mtime is bumped on every
+   * tool_use, so this is "ms since the last observable progress" of the
+   * in-flight turn.
+   */
+  markerAgeMs?: number | null
+  /**
+   * Hang-watchdog threshold in ms (`TURN_HANG_SECS * 1000`, default
+   * 300_000). A marker older than this means the in-flight turn made no
+   * tool progress for at least the watchdog window — i.e. it was (or,
+   * under Docker where the watchdog is disabled, *would have been*)
+   * killed as a hang rather than cleanly restarted. That distinction is
+   * the whole point: a hung turn is reported, a live one is resumed.
+   */
+  hangThresholdMs: number
+  /**
+   * Opaque snapshot persisted to `interrupt_reason` for the
+   * timeout-classified turn so a later boot can rebuild the watchdog
+   * report after the marker has been swept.
+   */
+  reasonSnapshot?: string | null
+  /** Injectable clock for tests. */
+  now?: number
+}
+
+export interface OrphanClassifyResult {
+  /** Total rows stamped (timeout + restart). */
+  reaped: number
+  /** turn_key stamped 'timeout', or null if none qualified as a hang. */
+  timeoutTurnKey: string | null
+}
+
 /**
- * Boot-time reaper. Sweeps ALL turns (across all chats) that have
- * `ended_at IS NULL` and stamps them with `ended_via = 'restart'` and
- * `ended_at = now()`.
+ * Boot-time reaper + classifier. Sweeps ALL turns with `ended_at IS NULL`
+ * (killed mid-flight: SIGKILL / OOM / hard reboot / operator restart) and
+ * stamps an `ended_via`:
  *
- * Call this once, immediately after `openTurnsDb`, before any new turns
- * are recorded for the current boot. That way the current boot's turns
- * are cleanly separable from orphans inherited from the prior process.
+ *   - the in-flight turn (matched by `markerTurnKey`) is stamped
+ *     `'timeout'` IFF its marker is older than `hangThresholdMs` — it
+ *     stalled with no tool progress for the full watchdog window, so it's
+ *     reported-not-resumed; its `interrupt_reason` carries `reasonSnapshot`.
+ *   - every other open turn (and the in-flight one when it was making
+ *     progress) is stamped `'restart'` — a clean interrupt, eligible for
+ *     blanket resume.
  *
- * Returns the number of rows updated.
+ * Call this once immediately after `openTurnsDb`, BEFORE any new turns are
+ * recorded for the current boot, and BEFORE the turn-active marker is
+ * swept (the classifier needs the marker's mtime).
  */
-export function markOrphanedAsRestarted(db: SqliteDatabase): number {
-  const now = Date.now()
-  const result = db.prepare(`
+export function markOrphanedWithTimeoutClassification(
+  db: SqliteDatabase,
+  opts: OrphanClassifyOpts,
+): OrphanClassifyResult {
+  const now = opts.now ?? Date.now()
+  const isHang =
+    opts.markerAgeMs != null &&
+    opts.markerAgeMs >= opts.hangThresholdMs &&
+    opts.markerTurnKey != null &&
+    opts.markerTurnKey.length > 0
+
+  let timeoutTurnKey: string | null = null
+  if (isHang) {
+    const r = db.prepare(`
+      UPDATE turns
+      SET ended_at         = ?,
+          ended_via        = 'timeout',
+          interrupt_reason = ?,
+          updated_at       = ?
+      WHERE turn_key = ? AND ended_at IS NULL
+    `).run(now, opts.reasonSnapshot ?? null, now, opts.markerTurnKey) as { changes: number }
+    if (r.changes > 0) timeoutTurnKey = opts.markerTurnKey ?? null
+  }
+
+  const rest = db.prepare(`
     UPDATE turns
     SET ended_at   = ?,
         ended_via  = 'restart',
         updated_at = ?
     WHERE ended_at IS NULL
   `).run(now, now) as { changes: number }
-  return result.changes
+
+  return { reaped: (timeoutTurnKey ? 1 : 0) + rest.changes, timeoutTurnKey }
 }
 
 /**
@@ -392,26 +482,41 @@ export function listTurnsForAgent(
   return rows.map(mapRow)
 }
 
+/** ended_via values that mean "this turn did not finish on its own". */
+const INTERRUPTED_VIA: ReadonlySet<TurnEndedVia> = new Set<TurnEndedVia>([
+  'restart',
+  'sigterm',
+  'timeout',
+  'unknown',
+])
+
 /**
- * Find the single most-recently-started turn that ended via an interrupt
- * (`'restart'` | `'sigterm'` | `'timeout'`) OR is still open
- * (`ended_at IS NULL`). Used by Stage 4 to surface "you had pending work"
- * to the agent on cold start.
+ * Return the single most-recently-started turn IFF it was interrupted
+ * (`ended_at IS NULL`, or `ended_via` in {restart, sigterm, timeout,
+ * unknown}). Returns null when the latest turn ended cleanly (`'stop'`)
+ * or there are no turns at all.
  *
- * Returns null if no such turn exists (clean boot — last turn ended 'stop').
+ * This is the resume gate. Keying on the *latest* turn (not "latest
+ * interrupted turn anywhere in history") is deliberate: once the agent
+ * resumes and that follow-up turn ends `'stop'`, the latest turn is clean
+ * and this returns null — so a completed resume is never re-fired on the
+ * next restart. The older `findMostRecentInterruptedTurn` had the inverse
+ * bug: a clean latest turn didn't shadow a stale interrupted one, so it
+ * would resurface already-handled work indefinitely.
  *
- * Note on ordering: we use `started_at DESC` (not `updated_at`) so the
- * boot-time reaper (which mass-stamps orphans with the SAME `ended_at` /
- * `updated_at`) doesn't reorder them; the temporal "last turn" is what
- * the user remembers, and that's `started_at`.
+ * Ordering uses `started_at DESC` (not `updated_at`) so the boot reaper,
+ * which mass-stamps orphans with identical timestamps, can't reorder the
+ * temporal "last turn" the user actually remembers.
  */
-export function findMostRecentInterruptedTurn(db: SqliteDatabase): Turn | null {
+export function findLatestTurnIfInterrupted(db: SqliteDatabase): Turn | null {
   const row = db.prepare(`
     SELECT * FROM turns
-    WHERE ended_at IS NULL
-       OR ended_via IN ('restart', 'sigterm', 'timeout')
     ORDER BY started_at DESC
     LIMIT 1
   `).get() as RawTurnRow | undefined
-  return row ? mapRow(row) : null
+  if (!row) return null
+  const turn = mapRow(row)
+  if (turn.ended_at == null) return turn
+  if (turn.ended_via != null && INTERRUPTED_VIA.has(turn.ended_via)) return turn
+  return null
 }
