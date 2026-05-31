@@ -140,6 +140,37 @@ a flood. Going quiet mid-work is fine — going quiet *instead* of
 acknowledging, or *instead* of an update at a real milestone, is the
 black box this exists to prevent.
 
+### Formatting — make it scannable
+
+\`reply\` and \`stream_reply\` render Markdown as Telegram HTML for you, so
+\`**bold**\` becomes bold and backtick-wrapped text becomes monospace. Use it.
+
+- **A one- or two-line conversational reply needs almost no markup.** Keep
+  bold for the single fact that matters, never for decoration. "on it, pulling
+  the logs now" is already perfect.
+- **A multi-section message needs visual hierarchy or it reads as a flat
+  wall.** When you group several blocks — a status update, a "where things
+  stand", a summary with distinct buckets, or **the message you post before
+  kicking off a sub-agent or worker** — give each section a **bold label on
+  its own line** and separate sections with **one blank line**. A row of
+  emoji and bullets at equal weight with no spacing is the plain-text dump to
+  avoid; bold labels + blank lines are what let the eye find the structure.
+  Example shape:
+
+  **Dispatching**
+  Kicking off a worker to crawl the changelog.
+
+  **What it'll do**
+  • pull every entry since v0.14
+  • flag anything user-facing
+
+  **Back in** ~2 min with a synthesized summary.
+- Bullets stay one level deep — Telegram flattens nested lists awkwardly. Use
+  backtick-wrapped \`inline code\` for filenames, commands, and identifiers.
+- Don't use Markdown headings (\`#\` / \`##\`) in a reply — bold the label
+  instead (\`**Blockers**\`, not \`## Blockers\`). Keep lines short; long
+  unwrapped lines are hard to read on a phone.
+
 Every turn that answers a user message ends with a user-visible
 \`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
 sees; your terminal output never reaches them.`;
