@@ -2511,6 +2511,25 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(out).toContain("Operator action");
   });
 
+  it("renderFleetInvariants() teaches scannable formatting for multi-section replies", async () => {
+    // D2: the live Telegram guidance is the TELEGRAM_GUIDANCE constant
+    // rendered here (NOT profiles/_shared/telegram-style.md.hbs, which is
+    // orphaned). Agents were posting flat plain-text emoji dumps before
+    // kicking off sub-agents/workers. The formatting block tells them to
+    // give multi-section messages bold labels + blank-line spacing, while
+    // keeping conversational one-liners minimal.
+    const { renderFleetInvariants } = await import("../src/agents/scaffold.js");
+    const out = renderFleetInvariants();
+    expect(out).toContain("### Formatting — make it scannable");
+    expect(out).toContain("reads as a flat");
+    expect(out).toContain("one blank line");
+    // The specific D2 complaint: dispatch/worker-kickoff messages.
+    expect(out).toContain("the message you post before");
+    expect(out).toContain("**Dispatching**");
+    // Keep the conversational-minimal half of the guidance too.
+    expect(out).toContain("conversational reply needs almost no markup");
+  });
+
   it("scaffoldAgent no longer appends the sandbox primer to system_prompt_append (moved to fleet invariants)", () => {
     // Post-#1850 the sandbox primer is in `~/.switchroom/fleet/switchroom-invariants.md`,
     // not in `--append-system-prompt`. This test guards against
