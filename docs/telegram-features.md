@@ -87,7 +87,8 @@ message lands, so the wait for the window to close is invisible.
 channels:
   telegram:
     coalesce:
-      window_ms: 500   # default; raise for slower forwards, 0 to disable
+      window_ms: 500       # default; raise for slower forwards, 0 to disable
+      max_attachments: 1   # default; raise to fold albums/multi-image bursts
 ```
 
 Cascades through defaults → profile → agent like every other
@@ -95,10 +96,17 @@ Cascades through defaults → profile → agent like every other
 message becomes its own turn). Takes effect on the next message after
 `switchroom apply` + agent restart.
 
-**Scope (v1):** a coalesced turn carries the merged text plus at most
-one attachment. A second photo/document — or an album — starts a fresh
-turn rather than dropping the extra media, so nothing is silently lost.
-Full multi-attachment / album grouping is a follow-up.
+**Attachments.** A coalesced turn carries the merged text plus up to
+`max_attachments` media items. At the default of `1`, a second
+photo/document — or an album (`media_group_id`) — starts a fresh turn
+rather than dropping the extra media, so nothing is silently lost
+(the historical single-attachment behaviour). Raise `max_attachments`
+to fold a forwarded album or a text+multi-image burst into one turn:
+the agent then sees the primary attachment in the usual `image_path` /
+`attachment_file_id` fields plus numbered siblings (`image_path_2`,
+`attachment_file_id_2`, …) and an `attachment_count`. Attachments past
+the cap spill into the next turn. Each attachment is downloaded before
+the turn starts, so a high cap on a slow link delays turn start.
 
 ## Webhook ingest
 

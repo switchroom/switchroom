@@ -54,6 +54,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `channels.telegram.sub_agent_tick_interval_ms` | override | Progress-card: elapsed-counter tick interval (ms) while a sub-agent is running (default 10000) |
 | `channels.telegram.edit_budget_threshold` | override | Progress-card: card-edit budget per minute before throttled mode (default 18) |
 | `channels.telegram.coalesce.window_ms` | override | Sliding-window (ms) for merging consecutive inbound messages from the same sender+topic into ONE Claude turn. A forwarded burst or a long paste that Telegram splits across several messages arrives as a single shared-context turn instead of N rapid-fire turns. Each new message resets the timer. Default `500`. Set `0` to disable coalescing (each message is its own turn). The 👀 acknowledgement still fires immediately, so perceived latency is unchanged. |
+| `channels.telegram.coalesce.max_attachments` | override | Max media attachments folded into one coalesced turn. Default `1` (single-attachment behaviour — a second photo/document or an album starts its own turn). Raise to fold a forwarded album or a text+multi-image burst into one turn; the agent sees numbered fields (`image_path_2`, `attachment_file_id_2`, …) plus `attachment_count`. Attachments past the cap spill into the next turn. |
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |

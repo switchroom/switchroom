@@ -659,6 +659,22 @@ export const TelegramChannelSchema = z
             "single-message turn start is delayed by this much (the 👀 ack still " +
             "fires immediately, so perceived latency is unchanged)."
           ),
+        max_attachments: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Maximum number of media attachments carried into ONE coalesced " +
+            "Claude turn. Default 1 — a second photo/document/voice within the " +
+            "coalesce window (or an album / media_group_id) starts its own turn, " +
+            "preserving the historical single-attachment behaviour. Raise to let " +
+            "a forwarded album or a text+multi-image burst arrive as one turn; " +
+            "the agent then sees numbered attachment fields (image_path, " +
+            "image_path_2, …). Excess attachments beyond the cap spill into the " +
+            "next turn. Each attachment is downloaded, so a high cap on a slow " +
+            "link delays turn start."
+          ),
       })
       .optional()
       .describe(

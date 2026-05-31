@@ -51,6 +51,7 @@ import {
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
+import { splitCoalescedAttachments, buildExtraAttachmentMeta } from './coalesce-attachments.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed } from '../worker-activity-feed.js'
@@ -770,6 +771,10 @@ type Access = {
   parseMode?: 'html' | 'markdownv2' | 'text'
   disableLinkPreview?: boolean
   coalescingGapMs?: number
+  /** A2: max media attachments folded into one coalesced turn. Default 1
+   *  (single-attachment behaviour). Projected from
+   *  channels.telegram.coalesce.max_attachments by scaffold. */
+  coalesceMaxAttachments?: number
   statusReactions?: boolean
   historyEnabled?: boolean
   historyRetentionDays?: number
@@ -868,6 +873,7 @@ function readAccessFile(): Access {
       parseMode: parsed.parseMode,
       disableLinkPreview: parsed.disableLinkPreview,
       coalescingGapMs: parsed.coalescingGapMs,
+      coalesceMaxAttachments: parsed.coalesceMaxAttachments,
       statusReactions: parsed.statusReactions,
       historyEnabled: parsed.historyEnabled,
       historyRetentionDays: parsed.historyRetentionDays,
@@ -3014,28 +3020,43 @@ type AttachmentMeta = {
   name?: string
 }
 
+// One attachment slot carried by a coalesced message — primary or extra.
+type CoalesceAttachment = {
+  downloadImage?: () => Promise<string | undefined>
+  attachment?: AttachmentMeta
+}
+
 // CoalescePayload is what the InboundCoalescer carries per buffered message.
 // `ctx` must be the *latest* message's context (latest message_id, etc.) so
 // the merge function picks the last entry's ctx.
 //
-// A single attachment-bearing message may ride along in a coalesce window
-// (so a [text][photo] forward becomes one turn). The handleInboundCoalesced
-// guards ensure AT MOST ONE attachment per window — albums (media_group_id)
-// and a second attachment both bypass to their own turn — so the single
-// `downloadImage`/`attachment` slot is never silently overwritten. Folding a
-// whole album into one multi-attachment turn is the A2 follow-on.
+// Each inbound Telegram message carries at most one attachment, so an enqueued
+// payload sets at most `downloadImage`/`attachment`. The merge collects every
+// attachment-bearing entry in the window (up to coalesce.max_attachments): the
+// first becomes the primary `downloadImage`/`attachment`, the rest ride along
+// in `extraAttachments` (A2). When the cap is 1 (default), the
+// handleInboundCoalesced guards still bypass a second attachment / album part
+// to its own turn, so the single-attachment behaviour is byte-for-byte
+// preserved.
 type CoalescePayload = {
   text: string
   ctx: Context
   downloadImage?: () => Promise<string | undefined>
   attachment?: AttachmentMeta
+  // Set only by `merge`: the 2nd..Nth attachments folded into this turn.
+  extraAttachments?: CoalesceAttachment[]
 }
 
-// Coalesce keys whose open window already holds an attachment-bearing entry.
-// A second attachment for the same key bypasses coalescing (see
-// handleInboundCoalesced) so the single-attachment merge can't drop a photo.
-// Cleared on flush (below) and on the synchronous bypass path.
-const bufferedAttachmentKeys = new Set<string>()
+// Count of attachment-bearing entries currently buffered per coalesce key.
+// A new attachment for a key whose count has reached the per-agent cap
+// (coalesce.max_attachments, default 1) bypasses coalescing (see
+// handleInboundCoalesced) so no media is dropped past the cap. Cleared on
+// flush (below) and on the synchronous bypass path.
+const bufferedAttachmentKeys = new Map<string, number>()
+
+function coalesceMaxAttachments(): number {
+  return Math.max(1, loadAccess().coalesceMaxAttachments ?? 1)
+}
 
 const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
   // Read per-call from the access file so an operator-tuned
@@ -3047,21 +3068,36 @@ const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
   gapMs: () => loadAccess().coalescingGapMs ?? 500,
   merge: (entries) => {
     const last = entries[entries.length - 1]
-    // At most one entry carries an attachment (guarded upstream), so pick
-    // whichever entry has it rather than blindly taking `last` — a
-    // [photo][text] burst keeps its image even though the last entry is
-    // text-only.
-    const withAttachment = entries.find((e) => e.downloadImage != null || e.attachment != null)
+    // Collect every attachment-bearing entry in arrival order. The first is
+    // the primary (unsuffixed image_path/attachment_* meta); the remainder,
+    // capped at max_attachments, become numbered extras. A [photo][text]
+    // burst keeps its image even though the last entry is text-only.
+    const { primary, extras } = splitCoalescedAttachments(
+      entries,
+      (e) => e.downloadImage != null || e.attachment != null,
+      coalesceMaxAttachments(),
+    )
     return {
-      text: entries.map((e) => e.text).join('\n'),
+      // Drop empty texts (e.g. caption-less album parts) so the join doesn't
+      // emit blank lines between attachments.
+      text: entries.map((e) => e.text).filter((t) => t.length > 0).join('\n'),
       ctx: last.ctx,
-      downloadImage: withAttachment?.downloadImage,
-      attachment: withAttachment?.attachment,
+      downloadImage: primary?.downloadImage,
+      attachment: primary?.attachment,
+      extraAttachments: extras.length > 0
+        ? extras.map((e) => ({ downloadImage: e.downloadImage, attachment: e.attachment }))
+        : undefined,
     }
   },
   onFlush: (key, merged) => {
     bufferedAttachmentKeys.delete(key)
-    void handleInbound(merged.ctx, merged.text, merged.downloadImage, merged.attachment)
+    void handleInbound(
+      merged.ctx,
+      merged.text,
+      merged.downloadImage,
+      merged.attachment,
+      merged.extraAttachments,
+    )
   },
 })
 
@@ -8592,29 +8628,31 @@ async function handleInboundCoalesced(
   }
 
   const hasAttachment = downloadImage != null || attachment != null
+  const maxAttachments = coalesceMaxAttachments()
 
-  // Albums (media_group_id) are NOT coalesced in A1 — each part keeps its
-  // own turn exactly as before. The single-attachment merge can carry only
-  // one image, so folding a 3-photo album into one turn requires the
-  // multi-attachment inbound payload (the A2 follow-on). Bypass to preserve
-  // current per-part behavior and avoid dropping sibling photos.
-  if (hasAttachment && ctx.message?.media_group_id != null) {
+  // Albums (media_group_id): coalesce only when the cap allows >1 attachment
+  // (A2). At the default cap of 1 each album part keeps its own turn exactly
+  // as before — the single-attachment merge can't carry sibling photos, so
+  // bypassing avoids dropping them. With a raised cap the parts share the
+  // coalesce key and fold into one multi-attachment turn (the cap-overflow
+  // bypass below catches parts past the cap).
+  if (hasAttachment && ctx.message?.media_group_id != null && maxAttachments <= 1) {
     return handleInbound(ctx, text, downloadImage, attachment)
   }
 
   const from = ctx.from
   if (!from) return
 
-  // A second attachment landing in an already-open window would clobber the
-  // first under the single-attachment merge. Bypass it to its own turn so no
-  // media is silently dropped; A2's multi-attachment payload lifts this.
+  // An attachment past the per-agent cap would be dropped by the capped merge.
+  // Bypass it to its own turn so no media is silently lost. At the default
+  // cap of 1 this fires on the SECOND attachment, preserving A1 behaviour.
   if (hasAttachment) {
     const probeKey = inboundCoalesceKey(
       String(ctx.chat!.id),
       ctx.message?.message_thread_id,
       String(from.id),
     )
-    if (bufferedAttachmentKeys.has(probeKey)) {
+    if ((bufferedAttachmentKeys.get(probeKey) ?? 0) >= maxAttachments) {
       return handleInbound(ctx, text, downloadImage, attachment)
     }
   }
@@ -8651,9 +8689,10 @@ async function handleInboundCoalesced(
   // Coalescing disabled (window <= 0): flush immediately, preserving any
   // media this message carried.
   if (result.bypass) return handleInbound(ctx, text, downloadImage, attachment)
-  // Mark the open window as holding an attachment so a second attachment for
-  // this key bypasses rather than clobbers (cleared in onFlush).
-  if (hasAttachment) bufferedAttachmentKeys.add(key)
+  // Count the open window's attachments so a third+ (or second, at the
+  // default cap) bypasses rather than overflows the capped merge (cleared
+  // in onFlush).
+  if (hasAttachment) bufferedAttachmentKeys.set(key, (bufferedAttachmentKeys.get(key) ?? 0) + 1)
 }
 
 /**
@@ -8690,6 +8729,10 @@ async function handleInbound(
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
+  // A2: 2nd..Nth attachments folded into this coalesced turn. Each is
+  // resolved (photos downloaded) and surfaced as numbered meta fields
+  // (image_path_2, attachment_file_id_2, …) alongside the primary.
+  extraAttachments?: CoalesceAttachment[],
 ): Promise<void> {
   const isTopicMessage = ctx.message?.is_topic_message ?? false
   const messageThreadId = ctx.message?.message_thread_id
@@ -9605,6 +9648,25 @@ async function handleInbound(
 
   const imagePath = downloadImage ? await downloadImage() : undefined
 
+  // A2: resolve the extra attachments (2nd..Nth in a coalesced multi-media
+  // burst). Photos are downloaded the same way as the primary; documents/
+  // voice carry only attachment metadata (the agent fetches them via
+  // download_attachment). Numbered meta fields below let the agent see each.
+  const extraResolved: Array<{ imagePath?: string; attachment?: AttachmentMeta }> = []
+  if (extraAttachments && extraAttachments.length > 0) {
+    for (const ex of extraAttachments) {
+      const exImagePath = ex.downloadImage ? await ex.downloadImage() : undefined
+      extraResolved.push({ imagePath: exImagePath, attachment: ex.attachment })
+    }
+  }
+  // Flatten the numbered meta fields once so the InboundMessage literal can
+  // spread them. Primary is "1" (unsuffixed); extras start at "_2".
+  const extraMeta = buildExtraAttachmentMeta(extraResolved)
+  // Total attachment count (primary + extras) so the agent knows how many to
+  // expect without probing for numbered fields. Only emitted when >1.
+  const primaryHasAttachment = imagePath != null || attachment != null
+  const attachmentCount = (primaryHasAttachment ? 1 : 0) + extraResolved.length
+
   // Telegram-native reply context (issue #119). Same pattern as server.ts:
   // `replyToText` is raw (for SQLite); `replyToTextEscaped` is XML-escaped
   // (for channel meta).
@@ -9714,6 +9776,10 @@ async function handleInbound(
         ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
         ...(attachment.name ? { attachment_name: attachment.name } : {}),
       } : {}),
+      // A2: numbered fields for the 2nd..Nth attachment + a total count so
+      // the agent reads every item in a coalesced multi-media burst.
+      ...(attachmentCount > 1 ? { attachment_count: String(attachmentCount) } : {}),
+      ...extraMeta,
     },
   }
 
