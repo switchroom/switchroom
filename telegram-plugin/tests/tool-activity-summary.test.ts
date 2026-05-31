@@ -4,7 +4,9 @@ import {
   appendActivityLine,
   appendActivityLabel,
   renderActivityFeed,
+  renderActivityFeedWithNested,
   MIRROR_MAX_LINES,
+  NESTED_MAX_LINES,
 } from "../tool-activity-summary.js";
 
 describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
@@ -141,5 +143,47 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
     expect(appendActivityLabel(lines, "   ")).toBeNull();
     expect(appendActivityLabel(lines, undefined)).toBeNull();
     expect(lines.length).toBe(2);
+  });
+});
+
+describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A)", () => {
+  it("with no child lines, is identical to the flat feed", () => {
+    const lines = ["Searching memory", "Delegating: review the migration"];
+    expect(renderActivityFeedWithNested(lines, [])).toBe(renderActivityFeed(lines));
+    // whitespace-only children also collapse to the flat feed
+    expect(renderActivityFeedWithNested(lines, ["  ", ""])).toBe(renderActivityFeed(lines));
+  });
+
+  it("done-styles ALL parent lines and nests the child block (newest = bold →)", () => {
+    const parent = ["Searching memory", "Delegating: review the migration"];
+    const child = ["Reading schema.ts", "Looking for foreign keys"];
+    const out = renderActivityFeedWithNested(parent, child)!;
+    // Parent is blocked at the Task tool → none of its lines is the live step.
+    expect(out).toContain("<i>✓ Searching memory</i>");
+    expect(out).toContain("<i>✓ Delegating: review the migration</i>");
+    expect(out).not.toContain("<b>→ Delegating");
+    // The live → step is the newest nested child line; earlier child = italic.
+    expect(out).toContain("   ↳ <i>Reading schema.ts</i>");
+    expect(out).toContain("   ↳ <b>→ Looking for foreign keys</b>");
+  });
+
+  it("caps the nested block to NESTED_MAX_LINES with a '↳ +N earlier…' header", () => {
+    const child = Array.from({ length: NESTED_MAX_LINES + 3 }, (_, i) => `step ${i + 1}`);
+    const out = renderActivityFeedWithNested(["Delegating: x"], child)!;
+    expect(out).toContain("   ↳ <i>+3 earlier…</i>");
+    // newest nested line is the live → step
+    expect(out).toContain(`   ↳ <b>→ step ${NESTED_MAX_LINES + 3}</b>`);
+    // the oldest (collapsed) lines are not rendered verbatim
+    expect(out).not.toContain("step 1<");
+  });
+
+  it("renders the child block even when the parent feed is empty", () => {
+    const out = renderActivityFeedWithNested([], ["Reading a.ts"]);
+    expect(out).toBe("   ↳ <b>→ Reading a.ts</b>");
+  });
+
+  it("HTML-escapes nested child text", () => {
+    const out = renderActivityFeedWithNested(["Delegating: x"], ["touch <a> & <b>"])!;
+    expect(out).toContain("   ↳ <b>→ touch &lt;a&gt; &amp; &lt;b&gt;</b>");
   });
 });
