@@ -663,8 +663,10 @@ export class Driver {
   ): Promise<{ messageIds: number[] }> {
     const c = this.requireClient();
     const replyTo = opts?.replyTo ?? opts?.messageThreadId;
+    // mtcute reads a bare string as a file_id/URL; the `file:` scheme is
+    // what forces an upload from local disk (see normalize-input-media).
     const medias = photoPaths.map((p, i) =>
-      InputMedia.photo(p, i === 0 && caption ? { caption } : undefined),
+      InputMedia.photo(`file:${p}`, i === 0 && caption ? { caption } : undefined),
     );
     const sent = await c.sendMediaGroup(
       chatId,
