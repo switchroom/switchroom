@@ -53,19 +53,23 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { spinUp } from "../harness.js";
-import { isWorkerFeedMessage } from "../assertions.js";
+import { isActivityFeedMessage, isWorkerFeedMessage } from "../assertions.js";
 import type { ObservedMessage } from "../driver.js";
 
 const AGENT = "test-harness";
 
-// The worker-activity feed (#2000) is default-on fleet-wide since
-// v0.14.19, so a stray background sub-agent can post a `🔧 Worker · …`
-// message into this DM. A bare `/\S/` matcher would latch onto that feed
-// paint instead of the agent's reply — failing the verbatim-token check
-// against feed text, not a real memory miss. Match the first non-empty
-// bot reply that ISN'T the feed.
+// Two classes of bot message are NOT the agent's reply and must be
+// skipped, or a bare `/\S/` matcher latches onto them and the
+// verbatim-token check fails against noise instead of catching a real
+// memory miss:
+//   1. The worker-activity feed (#2000, default-on since v0.14.19) — a
+//      stray background sub-agent posts `🔧 Worker · …` into this DM.
+//   2. The tool-activity feed — on a turn that uses tools (memory recall
+//      does), `→ Finding the right tool` paints as its own message before
+//      the real answer lands.
+// Match the first non-empty bot reply that is neither.
 const isReply = (m: ObservedMessage): boolean =>
-  /\S/.test(m.text) && !isWorkerFeedMessage(m);
+  /\S/.test(m.text) && !isWorkerFeedMessage(m) && !isActivityFeedMessage(m);
 
 const RESTART_BUDGET_MS = 90_000;
 const CAPTURE_REPLY_BUDGET_MS = 60_000;

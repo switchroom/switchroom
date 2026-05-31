@@ -35,6 +35,35 @@ export function isWorkerFeedMessage(m: ObservedMessage): boolean {
   return WORKER_FEED_RE.test(m.text);
 }
 
+/**
+ * A single tool-activity-feed line as rendered by
+ * `renderActivityFeed` (telegram-plugin/tool-activity-summary.ts): the
+ * in-progress step is `→ <label>`, finished steps are `✓ <label>`, and a
+ * long turn gets a `✓ +N earlier…` header. Telegram strips the bold/italic
+ * wrapping, so the observed text is just the marker glyph + label.
+ */
+const ACTIVITY_FEED_LINE_RE = /^[→✓]\s/u;
+
+/**
+ * True when `m` is the live tool-activity feed (the one-message list of
+ * "what the agent is doing this turn") rather than the agent's reply. A
+ * message qualifies only when EVERY non-empty line is an activity line —
+ * so a real reply that merely contains an arrow is never misclassified.
+ *
+ * Recall/reply scenarios must skip this in addition to
+ * {@link isWorkerFeedMessage}: on a turn that uses tools, the feed paints
+ * `→ Finding the right tool` as its own bot message before the real answer
+ * lands, and an `expectMessage(/\S/)` would otherwise latch onto it.
+ */
+export function isActivityFeedMessage(m: ObservedMessage): boolean {
+  const lines = m.text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (lines.length === 0) return false;
+  return lines.every((l) => ACTIVITY_FEED_LINE_RE.test(l));
+}
+
 export interface PollOptions {
   /** Hard deadline; the predicate must resolve truthy before this. */
   timeout: number;
