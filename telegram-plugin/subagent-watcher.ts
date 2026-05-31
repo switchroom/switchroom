@@ -40,7 +40,7 @@ import {
 } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
-import { projectSubagentLine, sanitizeCwdToProjectName } from './session-tail.js'
+import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows } from './registry/subagents-schema.js'
@@ -142,6 +142,21 @@ export interface WorkerEntry {
    * dead, the file is just left over from a prior session.
    */
   historical: boolean
+  /**
+   * True once a TERMINAL error line — a model API failure / quota
+   * exhaustion / crash, NOT an in-flight retry or a routine tool-level
+   * `is_error` result — has been observed in this worker's own
+   * transcript. Drives the `failed` terminal outcome so the handback
+   * tells the user the delegated work did NOT complete, instead of
+   * dressing a dead worker up as `completed`. Classified by
+   * `detectErrorInTranscriptLine` (the same gate the operator-event
+   * path uses), so transient mid-retry errors are excluded.
+   */
+  errored?: boolean
+  /** Human-readable detail from the terminal error line, surfaced in the
+   *  failed handback's "what it reported before failing" slot when the
+   *  worker left no narrative result of its own. */
+  errorDetail?: string
 }
 
 export interface SubagentWatcherConfig {
@@ -611,6 +626,20 @@ export function readSubTail(
     const startState = { hasEmittedStart: tail.hasEmittedStart }
     for (const line of lines) {
       if (!line) continue
+      // Gap 2 (failure honesty): a terminal error line in the worker's
+      // OWN transcript — a model API failure, quota exhaustion, or crash —
+      // means the worker FAILED, not finished. Reuse the operator-event
+      // classifier: `terminal:true` excludes in-flight retries (a 529 mid-
+      // backoff is `terminal:false`), and tool-level `is_error` results
+      // never reach here (they parse as `sub_agent_tool_result`, which is
+      // routine mid-run noise, not a worker death). The flag persists on
+      // the entry; the terminal transition (real turn_end OR stall
+      // synthesis) reads it to emit `failed` instead of `completed`.
+      const errInfo = detectErrorInTranscriptLine(line)
+      if (errInfo?.terminal) {
+        entry.errored = true
+        if (errInfo.detail) entry.errorDetail = errInfo.detail.slice(0, SUBAGENT_RESULT_TEXT_MAX)
+      }
       const events = projectSubagentLine(line, entry.agentId, startState)
       for (const ev of events) {
         const idleSecBeforeBump = Math.round((now - entry.lastActivityAt) / 1000)
@@ -716,7 +745,10 @@ export function readSubTail(
                   recordSubagentEnd(db, {
                     id: rowRef.id,
                     endedAt: now,
-                    status: 'completed',
+                    // Gap 2: keep the audit row honest — a worker that hit a
+                    // terminal transcript error is `failed`, matching the
+                    // handback outcome computed in maybySendStateTransition.
+                    status: entry.errored ? 'failed' : 'completed',
                   })
                 }
               } catch (dbErr) {
@@ -917,6 +949,34 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       log?.(`subagent-watcher: description updated for ${agentId}: ${desc}`)
     }, fs, log, db, parentStateDir, config.onUnstall, undefined, config.onProgress)
 
+    // Gap 1 (restart survival): a file still RUNNING at boot is a LIVE
+    // worker that predates this watcher — typically one dispatched in a
+    // prior gateway life and still in-flight across a restart / fleet
+    // rollout, NOT a stale already-finished file. `historical` must
+    // suppress replay only for done-at-boot files; an in-flight-at-boot
+    // worker the user is still waiting on must get full live treatment:
+    // progress nudges, the stall-synthesis safety net (checkStalls skips
+    // historical entries), and a real `completed`/`failed` handback rather
+    // than a dropped `orphan`. Promote it to a live entry here. (A file
+    // already `done` at boot stays historical and is short-circuited just
+    // below — it finished before this session.)
+    if (isHistorical && entry.state === 'running') {
+      entry.historical = false
+      log?.(`subagent-watcher: ${agentId} was in-flight at boot — promoting to live (predates watcher; user still awaiting handback)`)
+      // The prior gateway life's registration normally linked
+      // jsonl_agent_id already, but re-run the backfill idempotently in
+      // case that life crashed before the link persisted — the handback's
+      // isBackground lookup is keyed on jsonl_agent_id, and an unlinked row
+      // would mis-resolve the worker as foreground and drop the handback.
+      if (db != null) {
+        try {
+          backfillJsonlAgentId(db, filePath, agentId, log)
+        } catch (err) {
+          log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
+        }
+      }
+    }
+
     // If the JSONL already contained a turn_end at registration time
     // (file written-then-watched), fire the state-transition + completion
     // notification now. Otherwise the FSWatcher callback handles it on
@@ -980,11 +1040,22 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
           config.onFinish({
             agentId,
             state: entry.state,
-            outcome: entry.historical ? 'orphan' : 'completed',
+            // Gap 2: a terminal error observed in the transcript wins over
+            // the completed/orphan classification — a worker that crashed
+            // is `failed`, even if it later wrote a turn_end or aged into
+            // stall synthesis. `orphan` remains for genuinely stale
+            // done-at-boot rows (which never reach this path; see
+            // registerAgent's short-circuit + Gap 1 promotion).
+            outcome: entry.errored ? 'failed' : entry.historical ? 'orphan' : 'completed',
             toolCount: entry.toolCount,
             durationMs: nowFn() - entry.dispatchedAt,
             description: entry.description,
-            resultText: entry.lastResultText,
+            // For a failure, fall back to the error detail when the worker
+            // left no narrative of its own — so the handback's "what it
+            // reported before failing" slot is never empty on a crash.
+            resultText: entry.errored
+              ? entry.lastResultText || entry.errorDetail || ''
+              : entry.lastResultText,
           })
         } catch (cbErr) {
           log?.(`subagent-watcher: onFinish callback error ${agentId}: ${(cbErr as Error).message}`)
@@ -1151,7 +1222,10 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
             recordSubagentEnd(db, {
               id: rowRef.id,
               endedAt: n,
-              status: 'completed',
+              // Gap 2: a worker that hit a terminal transcript error before
+              // going silent is `failed`, not `completed` — keep the audit
+              // row consistent with the handback outcome.
+              status: entry.errored ? 'failed' : 'completed',
             })
           }
         } catch (dbErr) {

@@ -693,18 +693,21 @@ describe('startSubagentWatcher', () => {
     h.watcher.stop()
   })
 
-  it('suppresses stall notifications for historical entries', () => {
-    // Historical entries (file existed at watcher boot) must NOT fire
-    // stall notifications. The sub-agent process is long dead; the file
-    // is just left over from a prior session. With many historicals
-    // present at restart, firing stalls for each would flood the chat.
+  it('suppresses stall notifications for historical (done-at-boot) entries', () => {
+    // A worker that already FINISHED before the watcher booted (turn_end
+    // present in the file) stays historical and must NOT fire stall
+    // notifications. With months of finished session history present at
+    // restart, firing stalls for each would flood the chat. NOTE: a worker
+    // still RUNNING at boot is a different case — Gap 1 promotes it to live
+    // so it DOES get the stall safety net (it's an in-flight worker the
+    // user is still awaiting), covered in subagent-watcher-handback-gaps.
     const agentDir = '/home/user/.switchroom/agents/myagent'
     const projectsRoot = `${agentDir}/.claude/projects`
     const projectDir = `${projectsRoot}/myproject`
     const sessionDir = `${projectDir}/session-abc123`
     const subagentsDir = `${sessionDir}/subagents`
     const jsonlPath = `${subagentsDir}/agent-deadbeef.jsonl`
-    const content = buildJSONL(subAgentUserMsg('Old task'))
+    const content = buildJSONL(subAgentUserMsg('Old task'), subAgentTurnDuration())
 
     const h = makeHarness({
       agentDir,
@@ -809,12 +812,15 @@ describe('startSubagentWatcher', () => {
 
   describe('historical-vs-active filter', () => {
     /**
-     * Pre-existing JSONL files at watcher boot are tagged historical=true.
-     * Stalls and completion notifications are gated on !historical so a
-     * restart with months of session history doesn't flood the chat.
+     * Pre-existing FINISHED (done-at-boot) JSONL files are tagged
+     * historical=true. Stalls and completion notifications are gated on
+     * !historical so a restart with months of session history doesn't
+     * flood the chat. (A still-RUNNING file at boot is promoted to live by
+     * Gap 1 — see subagent-watcher-handback-gaps — so it must carry a
+     * turn_end here to stay historical.)
      */
 
-    it('pre-existing JSONL files at startup are tagged historical', () => {
+    it('pre-existing done-at-boot JSONL files are tagged historical', () => {
       const agentDir = '/home/user/.switchroom/agents/myagent'
       const projectsRoot = `${agentDir}/.claude/projects`
       const projectDir = `${projectsRoot}/myproject`
@@ -823,7 +829,7 @@ describe('startSubagentWatcher', () => {
       const jsonlA = `${subagentsDir}/agent-hist-aaaa.jsonl`
       const jsonlB = `${subagentsDir}/agent-hist-bbbb.jsonl`
 
-      const content = buildJSONL(subAgentUserMsg('Old task'))
+      const content = buildJSONL(subAgentUserMsg('Old task'), subAgentTurnDuration())
 
       const h = makeHarness({
         agentDir,
@@ -895,10 +901,12 @@ describe('startSubagentWatcher', () => {
     })
 
     it('pre-existing in-flight agent that finishes after restart fires completion', () => {
-      // Historical at boot. Then writes turn_end. Completion notification
-      // still fires for the state transition (the file was in-flight at
-      // boot, so the transition is meaningful even if the entry is tagged
-      // historical for stall-suppression purposes).
+      // Running at boot → Gap 1 promotes it to live (historical=false),
+      // because it's an in-flight worker the user is still awaiting across
+      // the restart. When it then writes turn_end, the completion
+      // notification fires for the state transition. (The deeper handback
+      // outcome — completed, not the dropped `orphan` — is covered in
+      // subagent-watcher-handback-gaps.)
       const agentDir = '/home/user/.switchroom/agents/myagent'
       const projectsRoot = `${agentDir}/.claude/projects`
       const projectDir = `${projectsRoot}/myproject`
