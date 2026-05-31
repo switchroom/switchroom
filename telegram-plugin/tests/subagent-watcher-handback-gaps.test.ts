@@ -80,6 +80,14 @@ function makeHarness(opts: {
   stallThresholdMs?: number
   silentStallTerminalMs?: number
   rescanMs?: number
+  /** How long ago (ms) the boot file was last written, i.e. its mtime is
+   *  `currentTime - bootFileAgeMs` at registration. Default 0 (fresh, so the
+   *  freshness gate promotes it). Set large to simulate a dead prior-session
+   *  worker that must NOT be promoted. */
+  bootFileAgeMs?: number
+  /** Kill-switch passthrough; default true (promotion enabled). */
+  bootPromoteEnabled?: boolean
+  inflightPromoteMaxAgeMs?: number
 }): Harness {
   const {
     agentId = 'gap-agent',
@@ -87,6 +95,9 @@ function makeHarness(opts: {
     stallThresholdMs = 60_000,
     silentStallTerminalMs = 300_000,
     rescanMs = 500,
+    bootFileAgeMs = 0,
+    bootPromoteEnabled = true,
+    inflightPromoteMaxAgeMs,
   } = opts
 
   let currentTime = 1000
@@ -104,6 +115,10 @@ function makeHarness(opts: {
 
   const fileContents = new Map<string, Buffer>()
   fileContents.set(jsonlPath, Buffer.from(buildJSONL(...bootLines), 'utf-8'))
+  // Per-file mtime (ms). The boot file's last write is `bootFileAgeMs` in the
+  // past; appends bump it to currentTime. The freshness gate reads this.
+  const fileMtimes = new Map<string, number>()
+  fileMtimes.set(jsonlPath, 1000 - bootFileAgeMs)
 
   let lastOpenedPath: string | null = null
   const mockFs = {
@@ -121,7 +136,7 @@ function makeHarness(opts: {
       if (ps === subagentsDir) return [`agent-${agentId}.jsonl`]
       return []
     }) as unknown as typeof fs.readdirSync,
-    statSync: ((p: fs.PathLike) => ({ size: fileContents.get(String(p))?.length ?? 0 }) as fs.Stats) as typeof fs.statSync,
+    statSync: ((p: fs.PathLike) => ({ size: fileContents.get(String(p))?.length ?? 0, mtimeMs: fileMtimes.get(String(p)) ?? currentTime }) as fs.Stats) as typeof fs.statSync,
     openSync: ((p: fs.PathLike) => {
       lastOpenedPath = String(p)
       return 42
@@ -153,6 +168,8 @@ function makeHarness(opts: {
     silentSynthesisStallThresholdMs: stallThresholdMs,
     silentStallTerminalMs,
     rescanMs,
+    bootPromoteEnabled,
+    ...(inflightPromoteMaxAgeMs != null ? { inflightPromoteMaxAgeMs } : {}),
     onStallTerminal: (id) => stallTerminalCalls.push({ agentId: id }),
     onFinish: ({ agentId: id, outcome, resultText }) =>
       finishCalls.push({ agentId: id, outcome, resultText }),
@@ -186,6 +203,7 @@ function makeHarness(opts: {
     const cur = fileContents.get(jsonlPath) ?? Buffer.alloc(0)
     const more = buildJSONL(...lines)
     fileContents.set(jsonlPath, Buffer.concat([cur, Buffer.from(more, 'utf-8')]))
+    fileMtimes.set(jsonlPath, currentTime)
   }
 
   return { stallTerminalCalls, finishCalls, logs, advance, watcher, fileContents, jsonlPath, append }
@@ -242,6 +260,75 @@ describe('Gap 1 — background worker in-flight across a gateway restart', () =>
     h.advance(600_000) // well past any stall window
     expect(h.finishCalls).toHaveLength(0)
     expect(h.stallTerminalCalls).toHaveLength(0)
+  })
+})
+
+describe('Gap 1 freshness gate — v0.14.24 stale-replay regression', () => {
+  // The v0.14.23 regression: promoting EVERY running-at-boot file replayed
+  // weeks-old dead prior-session workers as handbacks (often `failed`, from
+  // old error lines) on every boot, spamming the whole fleet. The gate
+  // promotes only files whose last write is recent.
+
+  it('a STALE running-at-boot worker (weeks-old mtime) is NOT promoted — no handback, no stall', () => {
+    const h = makeHarness({
+      agentId: 'gap1-stale-running',
+      bootLines: [subAgentUserMsg('bg task from weeks ago')], // running: no turn_end
+      bootFileAgeMs: 21 * 24 * 60 * 60_000, // 21 days old — clearly dead
+      silentStallTerminalMs: 120_000,
+    })
+
+    h.advance(600)
+    h.advance(600_000) // far past every stall/synthesis window
+    expect(h.finishCalls).toHaveLength(0) // pre-fix: a spurious (often failed) handback
+    expect(h.stallTerminalCalls).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('stale') && l.includes('leaving historical'))).toBe(true)
+  })
+
+  it('a FRESH running-at-boot worker (recent mtime) IS still promoted and hands back', () => {
+    // Preserve the genuine Gap 1 fix: a worker in-flight across a restart
+    // (wrote moments before the bounce) must still get promoted + handed back.
+    const h = makeHarness({
+      agentId: 'gap1-fresh-running',
+      bootLines: [subAgentUserMsg('bg task')],
+      bootFileAgeMs: 30_000, // 30s old — in-flight across a quick restart
+    })
+
+    h.append(subAgentText('Finished the migration'), subAgentTurnEnd())
+    h.advance(600)
+
+    expect(h.finishCalls).toHaveLength(1)
+    expect(h.finishCalls[0].outcome).toBe('completed')
+    expect(h.logs.some((l) => l.includes('promoting to live'))).toBe(true)
+  })
+
+  it('kill-switch (bootPromoteEnabled=false) suppresses even a fresh running-at-boot worker', () => {
+    const h = makeHarness({
+      agentId: 'gap1-killswitch',
+      bootLines: [subAgentUserMsg('bg task')],
+      bootFileAgeMs: 5_000, // fresh — would normally promote
+      bootPromoteEnabled: false,
+      silentStallTerminalMs: 120_000,
+    })
+
+    h.advance(600)
+    h.advance(600_000)
+    expect(h.finishCalls).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('promotion disabled'))).toBe(true)
+  })
+
+  it('a worker just past the freshness window is NOT promoted (boundary)', () => {
+    const h = makeHarness({
+      agentId: 'gap1-boundary',
+      bootLines: [subAgentUserMsg('bg task')],
+      inflightPromoteMaxAgeMs: 60_000, // 60s window
+      bootFileAgeMs: 90_000, // 90s old → just stale
+      silentStallTerminalMs: 120_000,
+    })
+
+    h.advance(600)
+    h.advance(600_000)
+    expect(h.finishCalls).toHaveLength(0)
+    expect(h.logs.some((l) => l.includes('stale'))).toBe(true)
   })
 })
 
