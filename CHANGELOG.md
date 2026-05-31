@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.14.22 — Foreground sub-agent visibility + self-resuming interrupted turns
+
+Two visibility/reliability features land on top of the v0.14.21 worker
+feed, closing the next gap in the "you hold the leash — awareness +
+control" outcome.
+
+### PR — foreground sub-agent steps nest in the parent's live draft (#2027)
+
+Background workers got a live `🔧 Worker` feed in v0.14.21. This release
+closes the **foreground** sub-agent blindspot — the larger, more common
+case. A foreground sub-agent (`Task`/`Agent` with no `run_in_background`)
+runs inside the parent's turn, and previously surfaced only as the
+parent's `→ Delegating: <desc>` line plus a ticking timer — zero internal
+detail.
+
+Now its live narrative **nests under the parent's own activity feed**: the
+parent's lines render done (`✓`) while it's blocked at the Task tool, and
+the sub-agent's recent steps render as an indented `↳` block with the
+newest as the in-progress `→` step. The block collapses when the
+sub-agent finishes (its result returns inline as the Task tool result).
+
+This edits the same activity-summary message the existing tool-label feed
+owns — not the compose draft — so there's no answer-stream contention.
+Pure jsonl-tail → render: no model call, inside the subscription-honest
+boundary. ON by default; `SWITCHROOM_FOREGROUND_SUBAGENT_NESTING=0`
+disables only the nesting (the parent's own feed is unaffected).
+Background workers are unchanged.
+
+### PR — agents wake and resume interrupted turns on their own (#2026)
+
+Agents now detect a turn that was interrupted (restart / crash mid-turn)
+and resume it on their own rather than leaving the user hanging.
+
 ## v0.14.21 — Inbound coalescing + worker feed + safe-boundary interrupt, on by default
 
 v0.14.20 shipped the inbound-coalescing / worker-visibility series
