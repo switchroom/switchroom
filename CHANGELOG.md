@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.23 — git-lfs in the base agent image
+
+### PR — add git-lfs to the base agent image (#2030)
+
+Agent containers shipped without a `git-lfs` binary, so any repo an agent
+clones that tracks large assets via LFS (images, video, SQLite DBs) would
+materialise those files as 130-byte pointer stubs rather than the real
+content — and a naive `git add`/commit would push the raw pointer or, with
+the smudge filter unconfigured, the raw binary. Agents working with a media
+or content library (e.g. a marketing agent reusing historical social posts,
+photos, and video) had no usable path to the actual bytes.
+
+`docker/Dockerfile.base` now installs `git-lfs` and runs
+`git lfs install --system --skip-repo`, registering the LFS smudge/clean
+filters in `/etc/gitconfig` so they apply to every per-agent `HOME` (a
+`--global` install wouldn't persist, since each agent boots a fresh home).
+`tests/docker/e2e.test.ts` gains `git-lfs` to the Tier-1 binary-presence
+loop and a new assertion that the system-wide smudge filter resolves to
+`git-lfs smudge`.
+
+This is a base-image change: it reaches the fleet on the next image build +
+rollout. No CLI/runtime behaviour changes.
+
 ## v0.14.22 — Foreground sub-agent visibility + self-resuming interrupted turns
 
 Two visibility/reliability features land on top of the v0.14.21 worker
