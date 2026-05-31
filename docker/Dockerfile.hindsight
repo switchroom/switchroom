@@ -30,7 +30,7 @@
 # sec WS9-F4 (#1418): pinned by digest — third-party mutable `:latest`
 # from another org; an upstream repoint would otherwise flow into the
 # published hindsight image undetected. Dependabot tracks bumps.
-FROM ghcr.io/vectorize-io/hindsight:latest@sha256:f0f9e9a73d6aedde9eaf4010ab604c3e015494e494318b26f1011144856b8112
+FROM ghcr.io/vectorize-io/hindsight:latest@sha256:e82b2c051784affa73243108c06402655043999e362bb3b7226b4da1000e1660
 
 USER root
 
