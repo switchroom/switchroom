@@ -39,6 +39,7 @@ import {
   ToolFlightTracker,
   decideInterruptTiming,
   resolveInterruptMaxWaitMs,
+  resolveSafeBoundaryEnabled,
 } from './interrupt-defer.js'
 import {
   resolveStickerSendArgs,
@@ -56,10 +57,14 @@ import {
 } from '../telegraph.js'
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
-import { splitCoalescedAttachments, buildExtraAttachmentMeta } from './coalesce-attachments.js'
+import {
+  splitCoalescedAttachments,
+  buildExtraAttachmentMeta,
+  resolveCoalesceMaxAttachments,
+} from './coalesce-attachments.js'
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
-import { createWorkerActivityFeed } from '../worker-activity-feed.js'
+import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -776,14 +781,15 @@ type Access = {
   parseMode?: 'html' | 'markdownv2' | 'text'
   disableLinkPreview?: boolean
   coalescingGapMs?: number
-  /** A2: max media attachments folded into one coalesced turn. Default 1
-   *  (single-attachment behaviour). Projected from
+  /** A2: max media attachments folded into one coalesced turn. Default 10
+   *  (a full Telegram album / forwarded burst arrives as one turn). Set 1 to
+   *  restore single-attachment behaviour. Projected from
    *  channels.telegram.coalesce.max_attachments by scaffold. */
   coalesceMaxAttachments?: number
-  /** Problem B: when true, a `!` interrupt that lands mid-tool-call is
-   *  deferred until the in-flight tool finishes (bounded by
-   *  interruptMaxWaitMs) before SIGINT + resume. Default false (fire
-   *  synchronously). Projected from channels.telegram.interrupt.safe_boundary. */
+  /** Problem B: when true (the default), a `!` interrupt that lands
+   *  mid-tool-call is deferred until the in-flight tool finishes (bounded by
+   *  interruptMaxWaitMs) before SIGINT + resume. Set false to fire
+   *  synchronously. Projected from channels.telegram.interrupt.safe_boundary. */
   interruptSafeBoundary?: boolean
   /** Upper bound (ms) to wait for a safe boundary before firing a deferred
    *  interrupt anyway. Default 8000. Projected from
@@ -3137,13 +3143,13 @@ type CoalescePayload = {
 
 // Count of attachment-bearing entries currently buffered per coalesce key.
 // A new attachment for a key whose count has reached the per-agent cap
-// (coalesce.max_attachments, default 1) bypasses coalescing (see
+// (coalesce.max_attachments, default 10) bypasses coalescing (see
 // handleInboundCoalesced) so no media is dropped past the cap. Cleared on
 // flush (below) and on the synchronous bypass path.
 const bufferedAttachmentKeys = new Map<string, number>()
 
 function coalesceMaxAttachments(): number {
-  return Math.max(1, loadAccess().coalesceMaxAttachments ?? 1)
+  return resolveCoalesceMaxAttachments(loadAccess().coalesceMaxAttachments)
 }
 
 const inboundCoalescer = createInboundCoalescer<CoalescePayload>({
@@ -8998,7 +9004,7 @@ async function handleInbound(
     deferInterrupt =
       !interrupt.emptyBody &&
       decideInterruptTiming({
-        safeBoundaryEnabled: access.interruptSafeBoundary === true,
+        safeBoundaryEnabled: resolveSafeBoundaryEnabled(access.interruptSafeBoundary),
         midToolCall: toolFlightTracker.isMidToolCall(),
       }) === 'defer'
     process.stderr.write(
@@ -17565,10 +17571,11 @@ void (async () => {
             // and edits it in place as work happens (current tool + elapsed),
             // finalizing on completion — the same "live, growing message"
             // shape the main agent's answer uses, NOT card chrome (the pinned
-            // card was deleted in #1126). Flag-gated; when ON it also
+            // card was deleted in #1126). On by default (set
+            // SWITCHROOM_WORKER_ACTIVITY_FEED=0 to disable); when ON it also
             // supersedes the coarse 5-min bucket relay below to avoid
             // double-surfacing the same progress beat.
-            const workerFeedEnabled = process.env.SWITCHROOM_WORKER_ACTIVITY_FEED === '1'
+            const workerFeedEnabled = isWorkerActivityFeedEnabled(process.env.SWITCHROOM_WORKER_ACTIVITY_FEED)
             const workerActivityFeed = createWorkerActivityFeed({
               bot: {
                 sendMessage: async (cid, text, sendOpts) => {
