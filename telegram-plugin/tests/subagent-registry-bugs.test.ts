@@ -624,13 +624,17 @@ describe('Bug 3 — stalled-row sweeper: watcher must call recordSubagentStall i
     h.watcher.stop()
   })
 
-  it('does not call stall for historical entries (pre-existing at boot)', () => {
+  it('does not call stall for historical (done-at-boot) entries', () => {
+    // A worker that already FINISHED before boot (turn_end present) stays
+    // historical and must not write stall rows. A still-RUNNING file at
+    // boot is a different case — Gap 1 promotes it to live so it DOES get
+    // the stall safety net (covered in subagent-watcher-handback-gaps).
     const agentDir = '/home/user/.switchroom/agents/myagent'
     const subagentsDir = `${agentDir}/.claude/projects/p1/session-abc/subagents`
     const jsonlStem = 'hist-agent'
     const toolUseId = 'toolu_hist001'
     const jsonlPath = `${subagentsDir}/agent-${jsonlStem}.jsonl`
-    const content = buildJSONL(subAgentUserMsg('Old task'))
+    const content = buildJSONL(subAgentUserMsg('Old task'), subAgentTurnDuration())
 
     const db = makeInMemoryDb({
       [toolUseId]: { id: toolUseId, jsonl_agent_id: jsonlStem, status: 'running' },
@@ -648,7 +652,7 @@ describe('Bug 3 — stalled-row sweeper: watcher must call recordSubagentStall i
       db,
     })
 
-    // Do NOT flip historical — entry is historical by default (file at boot)
+    // Done-at-boot → stays historical (not promoted); no stall write fires.
     h.advance(65_000)
 
     const stallDbCalls = db._calls.filter(
