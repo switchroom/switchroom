@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.14.20 — Inbound bursts + a live worker feed that reads like the agent
+
+This release lands the four-PR inbound-coalescing / worker-visibility
+series. Every new behaviour is **default-off or flag-gated**, so the
+release rolls out with zero behaviour change until opted in.
+
+### PR A — forwarded-burst UAT scenario (#2014)
+
+A real-mtcute UAT scenario that pins the v0.14.18 inbound-coalescing
+behaviour end-to-end: a rapid forwarded burst of messages from one
+sender merges into a single Claude turn rather than firing a reply per
+fragment. Test-only; no runtime change.
+
+### PR B — A2 multi-attachment / album inbound coalescing (#2015)
+
+`channels.telegram.coalesce.max_attachments` (default **1** — unchanged
+behaviour) can now be raised to fold a forwarded album (`media_group_id`)
+or a text+multi-image burst into one turn. The agent sees the primary
+attachment in the usual `image_path` / `attachment_file_id` fields plus
+numbered siblings (`image_path_2`, …) and an `attachment_count`.
+Attachments past the cap spill into the next turn (nothing is dropped).
+At the default cap of 1 the historical single-attachment behaviour is
+preserved exactly.
+
+### PR C — deferred safe-boundary `!` interrupt (#2016)
+
+`channels.telegram.interrupt.safe_boundary` (default **false**) defers a
+`!`-prefix interrupt that arrives **mid-tool-call** to a clean boundary
+(the in-flight tool's `tool_result`, or turn end) instead of SIGINT-ing
+the agent partway through a `Write`/`Bash`. Acked immediately with ⚡;
+`max_wait_ms` (default 8000) caps the wait so a long tool never ghosts
+the interrupt. A bare `!` (halt-now) and an empty body always fire
+immediately. Rapid repeated `!` while one is parked coalesce into a
+single interrupt carrying the latest body. Off by default — existing
+fire-immediately behaviour is unchanged.
+
+### PR D — growing worker-activity feed narrative (#2009)
+
+The live worker-activity feed (the edit-in-place message that surfaces a
+*background* sub-agent's progress, behind `SWITCHROOM_WORKER_ACTIVITY_FEED`)
+now **grows** a block of `↳` narrative lines — reading like the main
+agent's live answer — instead of collapsing each tick onto a single
+replaced line. Lines are deduped against the preceding line and capped to
+the last 6; accumulation happens before the throttle/cooldown/first-paint
+gates so a line is never lost. The hard limit stands: during a single
+long tool the watcher emits no narrative, so the feed legitimately holds
+(event-granular surfacing, not token smoothing).
+
 ## v0.14.19 — Scannable replies, for real + resuming-beat across gates
 
 ### Scannable formatting reaches agents via the live carrier (#2012)
