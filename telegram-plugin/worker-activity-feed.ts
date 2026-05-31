@@ -46,6 +46,14 @@ export interface WorkerActivityView {
   toolCount: number
   /** The worker's latest narrative line, if any (already capped upstream). */
   latestSummary: string
+  /**
+   * Accumulated narrative lines, oldest→newest, already deduped + capped by
+   * the feed manager. When present and non-empty, the render grows a block
+   * of `↳` lines (mirroring the main agent's live answer) instead of
+   * collapsing to the single `latestSummary` line. Absent/empty → the
+   * single-line fallback (back-compat for direct render callers).
+   */
+  narrativeLines?: string[]
   /** Wall-clock since dispatch, ms. */
   elapsedMs: number
   state: WorkerActivityState
@@ -68,6 +76,13 @@ export interface BotApiForWorkerFeed {
 const DESC_MAX = 80
 const TOOL_ARG_MAX = 64
 const SUMMARY_MAX = 100
+/**
+ * How many trailing narrative lines the live feed keeps visible. The feed
+ * grows like the main agent's answer but can't grow unbounded — Telegram
+ * caps message length and a wall of stale lines buries the live one. Six
+ * keeps recent context without dominating the chat.
+ */
+const NARRATIVE_MAX_LINES = 6
 
 /**
  * Render the worker-activity message body as Telegram HTML.
@@ -105,10 +120,23 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
     activity = `<i>starting… (${elapsed})</i>`
   }
 
-  const summary = v.latestSummary.trim()
   const lines = [header, activity]
-  if (summary.length > 0) {
-    lines.push(`  ↳ <i>${escapeHtml(truncate(summary, SUMMARY_MAX))}</i>`)
+
+  // Growing narrative block when the manager has accumulated lines; the feed
+  // reads like the main agent's live answer rather than a single replaced
+  // status line. Fall back to the single latestSummary line otherwise.
+  const narrative = (v.narrativeLines ?? [])
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  if (narrative.length > 0) {
+    for (const line of narrative) {
+      lines.push(`  ↳ <i>${escapeHtml(truncate(line, SUMMARY_MAX))}</i>`)
+    }
+  } else {
+    const summary = v.latestSummary.trim()
+    if (summary.length > 0) {
+      lines.push(`  ↳ <i>${escapeHtml(truncate(summary, SUMMARY_MAX))}</i>`)
+    }
   }
   return lines.join('\n')
 }
@@ -142,6 +170,12 @@ interface WorkerHandle {
   lastBody: string | null
   lastEditAt: number
   cooldownUntil: number
+  /**
+   * Accumulated narrative lines (oldest→newest), deduped against the
+   * immediately-preceding line and capped to NARRATIVE_MAX_LINES. Grows the
+   * live render so the feed reads like the main agent's answer.
+   */
+  narrative: string[]
   /** Per-worker serialization chain so ticks can't interleave sends. */
   chain: Promise<void>
 }
@@ -203,9 +237,24 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     log(`worker-feed: ${label} 429 — backing off ${retryAfter}s`)
   }
 
+  function accumulateNarrative(h: WorkerHandle, view: WorkerActivityView): void {
+    const line = view.latestSummary.trim()
+    if (line.length === 0) return
+    // Dedup against the immediately-preceding line — the watcher re-emits the
+    // same narrative across ticks while a tool runs; we only grow on change.
+    if (h.narrative[h.narrative.length - 1] === line) return
+    h.narrative.push(line)
+    if (h.narrative.length > NARRATIVE_MAX_LINES) {
+      h.narrative.splice(0, h.narrative.length - NARRATIVE_MAX_LINES)
+    }
+  }
+
   async function doUpdate(h: WorkerHandle, view: WorkerActivityView): Promise<void> {
+    // Accumulate before any gate so a throttled/cooled-down tick still grows
+    // the narrative — the line surfaces on the next edit that does fire.
+    accumulateNarrative(h, view)
     if (nowFn() < h.cooldownUntil) return
-    const body = renderWorkerActivity(view)
+    const body = renderWorkerActivity({ ...view, narrativeLines: h.narrative })
 
     // First paint: hold off until the worker has run long enough to be
     // worth a message; trivial workers stay silent (handback covers them).
@@ -284,6 +333,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           lastBody: null,
           lastEditAt: 0,
           cooldownUntil: 0,
+          narrative: [],
           chain: Promise.resolve(),
         }
         handles.set(agentId, h)

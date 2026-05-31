@@ -92,6 +92,42 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain('⚠️ <b>Worker failed</b>')
   })
 
+  it('grows a narrative block when narrativeLines is present', () => {
+    const out = renderWorkerActivity(
+      view({
+        latestSummary: 'newest only — should be ignored',
+        narrativeLines: ['read the brief', 'scanned vendor A', 'scanned vendor B'],
+      }),
+    )
+    expect(out).toContain('↳ <i>read the brief</i>')
+    expect(out).toContain('↳ <i>scanned vendor A</i>')
+    expect(out).toContain('↳ <i>scanned vendor B</i>')
+    // The single-line latestSummary fallback is NOT used when a block is present.
+    expect(out).not.toContain('newest only')
+    // Three narrative lines → three ↳ lines.
+    expect(out.match(/↳/g) ?? []).toHaveLength(3)
+  })
+
+  it('falls back to latestSummary when narrativeLines is empty', () => {
+    const out = renderWorkerActivity(view({ narrativeLines: [], latestSummary: 'one line' }))
+    expect(out).toContain('↳ <i>one line</i>')
+    expect(out.match(/↳/g) ?? []).toHaveLength(1)
+  })
+
+  it('drops blank narrative lines from the block', () => {
+    const out = renderWorkerActivity(
+      view({ narrativeLines: ['kept', '   ', 'also kept'] }),
+    )
+    expect(out).toContain('↳ <i>kept</i>')
+    expect(out).toContain('↳ <i>also kept</i>')
+    expect(out.match(/↳/g) ?? []).toHaveLength(2)
+  })
+
+  it('escapes HTML inside narrative lines', () => {
+    const out = renderWorkerActivity(view({ narrativeLines: ['a <b>x</b> & y'] }))
+    expect(out).toContain('a &lt;b&gt;x&lt;/b&gt; &amp; y')
+  })
+
   it('escapes HTML in description, tool, arg, and summary', () => {
     const out = renderWorkerActivity(
       view({
@@ -244,6 +280,83 @@ describe('createWorkerActivityFeed', () => {
     expect(bot.sent).toHaveLength(0)
     expect(feed.has('w1')).toBe(false)
     expect(feed.size).toBe(0)
+  })
+
+  it('accumulates distinct narrative lines into a growing block across ticks', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'read the brief' }))
+    expect(bot.sent).toHaveLength(1)
+    expect(bot.sent[0].text).toContain('↳ <i>read the brief</i>')
+
+    clock = 11_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'scanned vendor A' }))
+    clock = 12_000
+    await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'scanned vendor B' }))
+
+    const last = bot.edits.at(-1)!
+    expect(last.text).toContain('↳ <i>read the brief</i>')
+    expect(last.text).toContain('↳ <i>scanned vendor A</i>')
+    expect(last.text).toContain('↳ <i>scanned vendor B</i>')
+    expect(last.text.match(/↳/g) ?? []).toHaveLength(3)
+  })
+
+  it('dedups a repeated narrative line so the block does not duplicate', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'same line' }))
+    // Repeated narrative but a changed tool count → body differs, edit fires,
+    // but the narrative block must not gain a duplicate line.
+    clock = 11_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'same line' }))
+
+    const last = bot.edits.at(-1)!
+    expect(last.text.match(/↳/g) ?? []).toHaveLength(1)
+  })
+
+  it('caps the narrative block to the last 6 lines', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    for (let i = 1; i <= 9; i++) {
+      clock += 1000
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
+    }
+
+    const last = bot.edits.at(-1)!
+    expect(last.text.match(/↳/g) ?? []).toHaveLength(6)
+    // Oldest lines evicted; newest retained.
+    expect(last.text).not.toContain('line 1')
+    expect(last.text).not.toContain('line 3')
+    expect(last.text).toContain('line 4')
+    expect(last.text).toContain('line 9')
+  })
+
+  it('grows the narrative even while throttled (line surfaces on next edit)', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 2500 })
+
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'line A' }))
+    expect(bot.sent).toHaveLength(1)
+
+    // Throttled tick — no edit, but the line must still be accumulated.
+    clock = 11_000
+    await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'line B' }))
+    expect(bot.edits).toHaveLength(0)
+
+    // Past the throttle — the edit now carries BOTH lines.
+    clock = 13_000
+    await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'line C' }))
+    const last = bot.edits.at(-1)!
+    expect(last.text).toContain('↳ <i>line A</i>')
+    expect(last.text).toContain('↳ <i>line B</i>')
+    expect(last.text).toContain('↳ <i>line C</i>')
   })
 
   it('forwards threadId as message_thread_id on send', async () => {
