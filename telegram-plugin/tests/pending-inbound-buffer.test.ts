@@ -450,6 +450,42 @@ describe('planBufferedRedelivery — merge-on-drain (forwarded-burst across a tu
     expect(plan[0]!.merged.imagePath).toBe('/tmp/p.jpg')
   })
 
+  it('splices attachment meta from the media entry when it is NOT the anchor (A2 numbered fields survive)', () => {
+    // A coalesced multi-attachment message buffered, then a text-only
+    // follow-up. mergeRun anchors on `last` (the text), whose meta has no
+    // attachment fields — so the owning entry's image_path + numbered
+    // siblings + attachment_count must be spliced into the merged meta or
+    // the agent would never see the photos.
+    const photo = userMsg({ text: 'look', ts: 1, imagePath: '/tmp/a.jpg' })
+    photo.meta = {
+      image_path: '/tmp/a.jpg',
+      image_path_2: '/tmp/b.jpg',
+      attachment_count: '2',
+      user: 'alice',
+    }
+    const txt = userMsg({ text: 'at these', ts: 2 })
+    txt.meta = { user: 'alice' }
+    const plan = planBufferedRedelivery([photo, txt])
+    expect(plan).toHaveLength(1)
+    const meta = plan[0]!.merged.meta
+    expect(meta.image_path).toBe('/tmp/a.jpg')
+    expect(meta.image_path_2).toBe('/tmp/b.jpg')
+    expect(meta.attachment_count).toBe('2')
+    // Top-level primary still re-seated for inboundHasMedia detection.
+    expect(plan[0]!.merged.imagePath).toBe('/tmp/a.jpg')
+  })
+
+  it('does not need a meta splice when the media entry IS the anchor', () => {
+    const txt = userMsg({ text: 'intro', ts: 1 })
+    txt.meta = { user: 'alice' }
+    const photo = userMsg({ text: 'pic', ts: 2, imagePath: '/tmp/p.jpg' })
+    photo.meta = { image_path: '/tmp/p.jpg', user: 'alice' }
+    const plan = planBufferedRedelivery([txt, photo])
+    expect(plan).toHaveLength(1)
+    // Anchor is the photo, so its meta is inherited verbatim.
+    expect(plan[0]!.merged.meta.image_path).toBe('/tmp/p.jpg')
+  })
+
   it('preserves the run total — sum of originals equals input length (lossless)', () => {
     const msgs = [
       userMsg({ text: 'a', ts: 1 }),

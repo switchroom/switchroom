@@ -135,9 +135,11 @@ Default chunk limit: 4000 characters (configurable via `textChunkLimit` in `acce
 
 Rapid consecutive messages from the same user/chat are buffered and combined into a single delivery (joined with `\n`). The buffer flushes after `coalescingGapMs` milliseconds of silence (default: 500ms — lowered from 1500ms in #553 PR 3 to shrink the silent gap before the agent's first text lands).
 
-This prevents fragmented context when users send multi-line thoughts across several quick messages. Non-text messages (photos, documents, etc.) bypass coalescing.
+This prevents fragmented context when users send multi-line thoughts across several quick messages. A single attachment (one photo or document) rides along in the same window, so a `[text][photo]` forward becomes one turn.
 
-Set `coalescingGapMs` to `0` in `access.json` to disable.
+By default only **one** attachment folds into a coalesced turn — a second attachment, or an album (`media_group_id`), starts its own turn. Raise `coalesceMaxAttachments` to fold a forwarded album or a text+multi-image burst into a single turn; the agent then sees numbered fields (`image_path_2`, `attachment_file_id_2`, …) plus an `attachment_count`. Attachments past the cap spill into the next turn.
+
+Set `coalescingGapMs` to `0` in `access.json` to disable coalescing entirely.
 
 ### Typing indicator auto-refresh
 
@@ -169,7 +171,8 @@ Link previews are disabled by default in outbound messages. Control via:
   "textChunkLimit": 4000,
   "parseMode": "html",
   "disableLinkPreview": true,
-  "coalescingGapMs": 500
+  "coalescingGapMs": 500,
+  "coalesceMaxAttachments": 1
 }
 ```
 
@@ -179,6 +182,7 @@ Link previews are disabled by default in outbound messages. Control via:
 | `parseMode` | `"html"` \| `"markdownv2"` \| `"text"` | `"html"` | Default parse mode for outbound messages |
 | `disableLinkPreview` | boolean | `true` | Disable link preview thumbnails |
 | `coalescingGapMs` | number | 500 | Debounce gap for inbound message coalescing (0 = disabled) |
+| `coalesceMaxAttachments` | number | 1 | Max attachments folded into one coalesced turn (>1 = albums/multi-image bursts arrive as a single turn with numbered fields) |
 
 ### Read receipt indicator
 

@@ -184,10 +184,16 @@ export function planBufferedRedelivery(
   return out
 }
 
+/** Meta keys that describe an attachment — the primary (image_path,
+ *  attachment_*) plus the A2 numbered siblings (image_path_2,
+ *  attachment_file_id_2, …) and attachment_count. */
+const ATTACHMENT_META_RE = /^(image_path|attachment_)/
+
 /** Collapse a >1 run into a single turn. The newest message anchors the
  *  turn (its messageId/ts/user/meta); texts join in arrival order; the
- *  single attachment (if any) rides along from whichever message carried
- *  it. Caller guarantees the run is mergeable + has at most one media. */
+ *  attachment(s) (if any) ride along from whichever message carried them.
+ *  Caller guarantees the run is mergeable + has at most one media-bearing
+ *  entry. */
 function mergeRun(run: InboundMessage[]): InboundMessage {
   const last = run[run.length - 1]!
   const mediaEntry = run.find(inboundHasMedia)
@@ -195,10 +201,21 @@ function mergeRun(run: InboundMessage[]): InboundMessage {
     ...last,
     text: run.map((m) => m.text).join('\n'),
   }
-  // Re-seat the single attachment/imagePath from the entry that owns it
-  // (which may not be `last`), or strip them if the run is text-only.
+  // Re-seat the attachment/imagePath from the entry that owns it (which may
+  // not be `last`), or strip them if the run is text-only.
   delete merged.imagePath
   delete merged.attachment
+  if (mediaEntry != null && mediaEntry !== last) {
+    // The media-bearing entry isn't the anchor, so `last.meta` lacks the
+    // attachment fields the agent reads (image_path / attachment_* and the
+    // A2 numbered siblings). Splice the owning entry's attachment meta keys
+    // into the merged meta so the agent still sees every attachment.
+    const splicedMeta: Record<string, string> = { ...merged.meta }
+    for (const [k, v] of Object.entries(mediaEntry.meta)) {
+      if (ATTACHMENT_META_RE.test(k)) splicedMeta[k] = v
+    }
+    merged.meta = splicedMeta
+  }
   if (mediaEntry?.imagePath != null) merged.imagePath = mediaEntry.imagePath
   if (mediaEntry?.attachment != null) merged.attachment = mediaEntry.attachment
   return merged

@@ -5380,6 +5380,13 @@ function buildAccessJson(
   if (typeof tg?.coalesce?.window_ms === "number") {
     access.coalescingGapMs = tg.coalesce.window_ms;
   }
+  // Max attachments merged into one coalesced turn (A2). Default 1 keeps the
+  // historical single-attachment behaviour; the gateway reads this per-message
+  // to decide whether a second media item / album extends the current turn or
+  // starts its own. Cascades from defaults.channels.telegram.coalesce.max_attachments.
+  if (typeof tg?.coalesce?.max_attachments === "number") {
+    access.coalesceMaxAttachments = tg.coalesce.max_attachments;
+  }
 
   return JSON.stringify(access, null, 2) + "\n";
 }
