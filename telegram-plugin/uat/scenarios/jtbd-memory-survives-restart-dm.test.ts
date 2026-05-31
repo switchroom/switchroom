@@ -53,8 +53,19 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { spinUp } from "../harness.js";
+import { isWorkerFeedMessage } from "../assertions.js";
+import type { ObservedMessage } from "../driver.js";
 
 const AGENT = "test-harness";
+
+// The worker-activity feed (#2000) is default-on fleet-wide since
+// v0.14.19, so a stray background sub-agent can post a `🔧 Worker · …`
+// message into this DM. A bare `/\S/` matcher would latch onto that feed
+// paint instead of the agent's reply — failing the verbatim-token check
+// against feed text, not a real memory miss. Match the first non-empty
+// bot reply that ISN'T the feed.
+const isReply = (m: ObservedMessage): boolean =>
+  /\S/.test(m.text) && !isWorkerFeedMessage(m);
 
 const RESTART_BUDGET_MS = 90_000;
 const CAPTURE_REPLY_BUDGET_MS = 60_000;
@@ -139,7 +150,7 @@ const sudoOk = canShellSudo();
             `(This is a memory-survival UAT — store it via hindsight.)`,
           );
 
-          const captureReply = await sc1.expectMessage(/\S/, {
+          const captureReply = await sc1.expectMessage(isReply, {
             from: "bot",
             timeout: CAPTURE_REPLY_BUDGET_MS,
           });
@@ -180,7 +191,7 @@ const sudoOk = canShellSudo();
             `Reply with the token only, no extra text.`,
           );
 
-          const recallReply = await sc2.expectMessage(/\S/, {
+          const recallReply = await sc2.expectMessage(isReply, {
             from: "bot",
             timeout: RECALL_REPLY_BUDGET_MS + 5_000,
           });

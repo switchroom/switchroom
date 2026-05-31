@@ -11,6 +11,30 @@
 
 import type { Driver, ObservedMessage, ObservedReaction } from "./driver.js";
 
+/**
+ * Canonical shape of a worker-activity-feed message (#2000) as rendered
+ * in Telegram: a running header `🔧 Worker · …` that edits in place and
+ * finalizes to `✅ Worker done · …` / `⚠️ Worker failed · …`. The feed is
+ * default-on fleet-wide as of v0.14.19, so background sub-agent activity
+ * now surfaces as its own bot message in any chat — including DMs whose
+ * scenario only cares about the agent's conversational reply.
+ *
+ * Single source of truth; the worker-feed scenario asserts against this,
+ * and recall/reply scenarios exclude it via {@link isWorkerFeedMessage}.
+ */
+export const WORKER_FEED_RE = /🔧\s*Worker|✅\s*Worker done|⚠️\s*Worker failed|Worker (?:done|failed)/i;
+
+/**
+ * True when `m` is a worker-activity-feed message rather than the agent's
+ * own reply. Use it to skip feed noise when matching for a turn's actual
+ * answer — without it, an `expectMessage(/\S/)` can latch onto the feed's
+ * first paint and miss (or mis-time) the real reply. See #2000 / the
+ * memory-survives-restart recall scenario.
+ */
+export function isWorkerFeedMessage(m: ObservedMessage): boolean {
+  return WORKER_FEED_RE.test(m.text);
+}
+
 export interface PollOptions {
   /** Hard deadline; the predicate must resolve truthy before this. */
   timeout: number;
