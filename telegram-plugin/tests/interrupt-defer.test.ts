@@ -15,6 +15,7 @@ import {
   ToolFlightTracker,
   decideInterruptTiming,
   resolveInterruptMaxWaitMs,
+  resolveSafeBoundaryEnabled,
   DEFAULT_INTERRUPT_MAX_WAIT_MS,
 } from '../gateway/interrupt-defer.js'
 
@@ -116,6 +117,18 @@ describe('decideInterruptTiming', () => {
     expect(
       decideInterruptTiming({ safeBoundaryEnabled: false, midToolCall: false }),
     ).toBe('fire-now')
+  })
+})
+
+describe('resolveSafeBoundaryEnabled (default ON)', () => {
+  it('defaults to true when unset', () => {
+    expect(resolveSafeBoundaryEnabled(undefined)).toBe(true)
+  })
+  it('stays true when explicitly true', () => {
+    expect(resolveSafeBoundaryEnabled(true)).toBe(true)
+  })
+  it('only an explicit false opts out', () => {
+    expect(resolveSafeBoundaryEnabled(false)).toBe(false)
   })
 })
 

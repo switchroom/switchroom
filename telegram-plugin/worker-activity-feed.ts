@@ -25,14 +25,20 @@
  *   - 429 cooldown + message_id drift resilience (re-post on stale edit),
  *   - a forced terminal edit on `finish` regardless of throttle.
  *
- * The feed is gated to BACKGROUND workers and lives behind the
- * `SWITCHROOM_WORKER_ACTIVITY_FEED` flag — see the gateway wiring. The
- * watcher already drives the cues (it polls the worker jsonl directly,
- * so it keeps firing after the parent turn ends), which is why the feed
- * is fed from watcher callbacks rather than the bridge event stream.
+ * The feed is gated to BACKGROUND workers and is ON by default; set
+ * `SWITCHROOM_WORKER_ACTIVITY_FEED=0` to disable it — see the gateway
+ * wiring. The watcher already drives the cues (it polls the worker jsonl
+ * directly, so it keeps firing after the parent turn ends), which is why
+ * the feed is fed from watcher callbacks rather than the bridge event stream.
  */
 
 import { escapeHtml, formatDuration, truncate } from './card-format.js'
+
+/** Worker-activity feed is ON by default; an operator opts out with
+ *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
+export function isWorkerActivityFeedEnabled(envVal: string | undefined): boolean {
+  return envVal !== '0'
+}
 
 export type WorkerActivityState = 'running' | 'done' | 'failed'
 

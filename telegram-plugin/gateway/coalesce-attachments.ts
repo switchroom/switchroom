@@ -36,6 +36,15 @@ export interface ResolvedExtraAttachment {
  * `maxAttachments` is floored at 1 — a cap of 0 or negative would strip the
  * primary, silently dropping the only attachment.
  */
+/** Default attachments folded into one coalesced turn: a full Telegram album
+ *  (media_group caps at 10). Floored at 1 so the only attachment is never
+ *  stripped. Set channels.telegram.coalesce.max_attachments to override. */
+export const DEFAULT_MAX_ATTACHMENTS = 10
+
+export function resolveCoalesceMaxAttachments(configured: number | undefined): number {
+  return Math.max(1, configured ?? DEFAULT_MAX_ATTACHMENTS)
+}
+
 export function splitCoalescedAttachments<T>(
   entries: T[],
   hasAttachment: (e: T) => boolean,

@@ -2,21 +2,39 @@
  * Unit tests for the A2 multi-attachment helpers
  * (telegram-plugin/gateway/coalesce-attachments.ts).
  *
- * These pin the two pure pieces of the multi-attachment fold-in that live
+ * These pin the pure pieces of the multi-attachment fold-in that live
  * outside gateway.ts so they can be exercised without loadAccess()/IPC:
- *   1. splitCoalescedAttachments — primary + capped extras, arrival order.
- *   2. buildExtraAttachmentMeta — numbered meta fields starting at _2.
+ *   1. resolveCoalesceMaxAttachments — the runtime cap default (10).
+ *   2. splitCoalescedAttachments — primary + capped extras, arrival order.
+ *   3. buildExtraAttachmentMeta — numbered meta fields starting at _2.
  *
- * The default cap (1) MUST reproduce the historical single-attachment shape:
- * primary only, no extras, no numbered meta.
+ * A cap of 1 reproduces the historical single-attachment shape: primary
+ * only, no extras, no numbered meta.
  */
 
 import { describe, expect, it } from 'vitest'
 import {
   splitCoalescedAttachments,
   buildExtraAttachmentMeta,
+  resolveCoalesceMaxAttachments,
+  DEFAULT_MAX_ATTACHMENTS,
   type ResolvedExtraAttachment,
 } from '../gateway/coalesce-attachments.js'
+
+describe('resolveCoalesceMaxAttachments (default 10 = full album)', () => {
+  it('defaults to 10 when unset', () => {
+    expect(resolveCoalesceMaxAttachments(undefined)).toBe(10)
+    expect(DEFAULT_MAX_ATTACHMENTS).toBe(10)
+  })
+  it('honours an explicit operator cap', () => {
+    expect(resolveCoalesceMaxAttachments(1)).toBe(1)
+    expect(resolveCoalesceMaxAttachments(25)).toBe(25)
+  })
+  it('floors a 0 / negative cap at 1 (never strips the only attachment)', () => {
+    expect(resolveCoalesceMaxAttachments(0)).toBe(1)
+    expect(resolveCoalesceMaxAttachments(-5)).toBe(1)
+  })
+})
 
 interface Entry {
   text: string
@@ -26,7 +44,7 @@ interface Entry {
 const has = (e: Entry): boolean => e.att != null
 
 describe('splitCoalescedAttachments', () => {
-  it('default cap 1: keeps only the first attachment as primary, no extras', () => {
+  it('cap 1: keeps only the first attachment as primary, no extras', () => {
     const entries: Entry[] = [
       { text: 'a', att: 'photo-1' },
       { text: 'b', att: 'photo-2' },

@@ -666,14 +666,13 @@ export const TelegramChannelSchema = z
           .optional()
           .describe(
             "Maximum number of media attachments carried into ONE coalesced " +
-            "Claude turn. Default 1 — a second photo/document/voice within the " +
-            "coalesce window (or an album / media_group_id) starts its own turn, " +
-            "preserving the historical single-attachment behaviour. Raise to let " +
-            "a forwarded album or a text+multi-image burst arrive as one turn; " +
-            "the agent then sees numbered attachment fields (image_path, " +
-            "image_path_2, …). Excess attachments beyond the cap spill into the " +
-            "next turn. Each attachment is downloaded, so a high cap on a slow " +
-            "link delays turn start."
+            "Claude turn. Default 10 — a full Telegram album (media_group caps " +
+            "at 10) or a text+multi-image forwarded burst arrives as a single " +
+            "turn; the agent sees numbered attachment fields (image_path, " +
+            "image_path_2, …). Set 1 to restore the historical " +
+            "single-attachment-per-turn behaviour. Excess attachments beyond " +
+            "the cap spill into the next turn. Each attachment is downloaded, " +
+            "so a high cap on a slow link delays turn start."
           ),
       })
       .optional()
@@ -688,15 +687,15 @@ export const TelegramChannelSchema = z
           .boolean()
           .optional()
           .describe(
-            "When true, a `!`-prefix interrupt that arrives while the agent is " +
-            "mid-tool-call is DEFERRED: the SIGINT and the replacement turn wait " +
-            "until the in-flight tool call finishes (a clean boundary) instead of " +
-            "C-c'ing the agent mid-write/mid-bash. If no tool is in flight the " +
-            "interrupt still fires immediately. Bounded by max_wait_ms so a long " +
-            "tool never strands the user. Default false — the interrupt fires " +
-            "synchronously the moment `!` is received (historical behaviour). " +
-            "Rapid repeated `!` while one is pending coalesce into a single " +
-            "deferred interrupt carrying the latest body."
+            "When true (the default), a `!`-prefix interrupt that arrives while " +
+            "the agent is mid-tool-call is DEFERRED: the SIGINT and the " +
+            "replacement turn wait until the in-flight tool call finishes (a " +
+            "clean boundary) instead of C-c'ing the agent mid-write/mid-bash. If " +
+            "no tool is in flight the interrupt still fires immediately. Bounded " +
+            "by max_wait_ms so a long tool never strands the user. Set false to " +
+            "fire synchronously the moment `!` is received (historical " +
+            "behaviour). Rapid repeated `!` while one is pending coalesce into a " +
+            "single deferred interrupt carrying the latest body."
           ),
         max_wait_ms: z
           .number()

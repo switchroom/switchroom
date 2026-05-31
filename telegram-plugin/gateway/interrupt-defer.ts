@@ -98,3 +98,9 @@ export function resolveInterruptMaxWaitMs(configured: number | undefined): numbe
   if (typeof configured === 'number' && configured > 0) return configured
   return DEFAULT_INTERRUPT_MAX_WAIT_MS
 }
+
+/** safe_boundary defaults ON: a `!` mid-tool-call is deferred to a clean
+ *  boundary unless the operator explicitly sets it false. */
+export function resolveSafeBoundaryEnabled(configured: boolean | undefined): boolean {
+  return configured !== false
+}

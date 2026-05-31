@@ -2,9 +2,23 @@ import { describe, it, expect } from 'vitest'
 import {
   renderWorkerActivity,
   createWorkerActivityFeed,
+  isWorkerActivityFeedEnabled,
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
+
+describe('isWorkerActivityFeedEnabled (default ON)', () => {
+  it('defaults to true when the env var is unset', () => {
+    expect(isWorkerActivityFeedEnabled(undefined)).toBe(true)
+  })
+  it('stays on for any value other than "0"', () => {
+    expect(isWorkerActivityFeedEnabled('1')).toBe(true)
+    expect(isWorkerActivityFeedEnabled('')).toBe(true)
+  })
+  it('only "0" disables it', () => {
+    expect(isWorkerActivityFeedEnabled('0')).toBe(false)
+  })
+})
 
 function view(partial: Partial<WorkerActivityView> = {}): WorkerActivityView {
   return {
