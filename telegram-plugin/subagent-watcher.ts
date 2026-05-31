@@ -209,6 +209,23 @@ export interface SubagentWatcherConfig {
    */
   silentStallTerminalMs?: number
   /**
+   * Freshness window (ms) for promoting a running-at-boot worker file to
+   * live. A file whose last write (mtime) is older than this is treated as
+   * a dead prior-session worker and stays historical/suppressed, NOT
+   * promoted. Default 15 min (DEFAULT_INFLIGHT_PROMOTE_MAX_AGE_MS); env
+   * override `SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS`. Guards the v0.14.23
+   * stale-handback replay regression.
+   */
+  inflightPromoteMaxAgeMs?: number
+  /**
+   * Kill-switch for the boot-scan promotion path. When false, a
+   * running-at-boot worker is never promoted — the watcher reverts to the
+   * pre-v0.14.23 behaviour of leaving every boot-scan file historical
+   * (suppressed). Default true; env `SWITCHROOM_SUBAGENT_BOOT_PROMOTE=0`
+   * disables it fleet-wide without a code change (emergency lever).
+   */
+  bootPromoteEnabled?: boolean
+  /**
    * Reaper TTL (ms): background rows in `status='running'` whose
    * `last_activity_at` (or `started_at` if liveness never wrote) is older
    * than this are transitioned to `status='stalled'` with a result_summary
@@ -381,6 +398,29 @@ const DEFAULT_SILENT_SYNTHESIS_STALL_THRESHOLD_MS = 300_000
  * ceiling that closed-out cards used to wait on.
  */
 const DEFAULT_SILENT_STALL_TERMINAL_MS = 300_000
+
+/**
+ * Freshness window for the boot-scan "in-flight at boot → promote to
+ * live" path. A worker file still in `running` state at boot is only
+ * promoted (un-suppressed) if its last write (file mtime) is within this
+ * window of now. The signal cleanly separates the two populations:
+ *
+ *  - A worker genuinely in-flight across a restart / fleet rollout was
+ *    writing right up until the container was recreated, so its mtime is
+ *    seconds-to-minutes before the new gateway boots — well inside the
+ *    window. The user is still awaiting it; promote it.
+ *  - A worker that died in a PRIOR session without writing a terminal
+ *    `turn_end` is also `running` in the file, but its mtime is hours-to-
+ *    weeks old. These accumulate by the dozen-to-hundred in a long-lived
+ *    agent's subagents dir. Promoting them replays stale handbacks
+ *    (often `failed`, from old error lines) on every boot — the v0.14.23
+ *    regression. Leave them historical/suppressed, exactly as before.
+ *
+ * 15 min is generous for any plausible restart gap (container recreate +
+ * image pull) yet far below the staleness of a dead prior-session file.
+ * Override with `SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS`.
+ */
+const DEFAULT_INFLIGHT_PROMOTE_MAX_AGE_MS = 15 * 60_000
 
 /**
  * Cap on the result text retained per sub-agent (`entry.lastResultText`)
@@ -810,6 +850,14 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     config.silentStallTerminalMs
     ?? parseEnvMs('SWITCHROOM_SUBAGENT_STALL_TERMINAL_MS')
     ?? DEFAULT_SILENT_STALL_TERMINAL_MS
+  const inflightPromoteMaxAgeMs =
+    config.inflightPromoteMaxAgeMs
+    ?? parseEnvMs('SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS')
+    ?? DEFAULT_INFLIGHT_PROMOTE_MAX_AGE_MS
+  // Kill-switch: not parseEnvMs (which rejects `0`) — an explicit `=0`
+  // here MUST disable promotion (revert to pre-v0.14.23 suppression).
+  const bootPromoteEnabled =
+    config.bootPromoteEnabled ?? (process.env.SWITCHROOM_SUBAGENT_BOOT_PROMOTE !== '0')
   const reaperTtlMs = config.reaperTtlMs ?? DEFAULT_REAPER_TTL_MS
   const reaperIntervalMs = config.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS
   const rescanMs = config.rescanMs ?? DEFAULT_RESCAN_MS
@@ -961,18 +1009,40 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
     // already `done` at boot stays historical and is short-circuited just
     // below — it finished before this session.)
     if (isHistorical && entry.state === 'running') {
-      entry.historical = false
-      log?.(`subagent-watcher: ${agentId} was in-flight at boot — promoting to live (predates watcher; user still awaiting handback)`)
-      // The prior gateway life's registration normally linked
-      // jsonl_agent_id already, but re-run the backfill idempotently in
-      // case that life crashed before the link persisted — the handback's
-      // isBackground lookup is keyed on jsonl_agent_id, and an unlinked row
-      // would mis-resolve the worker as foreground and drop the handback.
-      if (db != null) {
-        try {
-          backfillJsonlAgentId(db, filePath, agentId, log)
-        } catch (err) {
-          log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
+      // Freshness gate (v0.14.24): only promote a file whose LAST WRITE is
+      // recent. A genuinely in-flight-across-a-restart worker was writing
+      // until the container was recreated (mtime seconds-to-minutes old); a
+      // dead prior-session worker that never wrote a terminal turn_end is
+      // also `running` but hours-to-weeks stale. Promoting the latter
+      // replayed stale `failed` handbacks on every boot (the v0.14.23
+      // fleet-wide regression). Unreadable mtime → treat as stale (suppress
+      // rather than risk re-spamming). The kill-switch reverts to pre-fix
+      // suppression entirely.
+      let fileAgeMs = Infinity
+      try {
+        const st = fs.statSync(filePath)
+        if (typeof st.mtimeMs === 'number') fileAgeMs = n - st.mtimeMs
+      } catch {
+        /* unreadable → Infinity → treated as stale below */
+      }
+      if (!bootPromoteEnabled) {
+        log?.(`subagent-watcher: ${agentId} running at boot but promotion disabled (SWITCHROOM_SUBAGENT_BOOT_PROMOTE=0) — leaving historical`)
+      } else if (fileAgeMs > inflightPromoteMaxAgeMs) {
+        log?.(`subagent-watcher: ${agentId} running at boot but stale (last write ${Math.round(fileAgeMs / 1000)}s ago > ${Math.round(inflightPromoteMaxAgeMs / 1000)}s) — leaving historical (dead prior-session worker, not in-flight)`)
+      } else {
+        entry.historical = false
+        log?.(`subagent-watcher: ${agentId} was in-flight at boot — promoting to live (last write ${Math.round(fileAgeMs / 1000)}s ago; user still awaiting handback)`)
+        // The prior gateway life's registration normally linked
+        // jsonl_agent_id already, but re-run the backfill idempotently in
+        // case that life crashed before the link persisted — the handback's
+        // isBackground lookup is keyed on jsonl_agent_id, and an unlinked row
+        // would mis-resolve the worker as foreground and drop the handback.
+        if (db != null) {
+          try {
+            backfillJsonlAgentId(db, filePath, agentId, log)
+          } catch (err) {
+            log?.(`subagent-watcher: backfill error for ${agentId}: ${(err as Error).message}`)
+          }
         }
       }
     }
