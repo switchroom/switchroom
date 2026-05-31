@@ -10,7 +10,7 @@
  *   - resolveInterruptMaxWaitMs never yields a non-positive / forever wait.
  */
 
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import {
   ToolFlightTracker,
   decideInterruptTiming,
