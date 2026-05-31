@@ -293,7 +293,7 @@ describe.skipIf(!dockerOk || !allImagesPresent)(
       expect(r.stdout).toContain("OK");
     });
 
-    it("base image has Tier 1 tools on PATH (gh, ripgrep, fd, jq, pip, git, less, nano)", () => {
+    it("base image has Tier 1 tools on PATH (gh, ripgrep, fd, jq, pip, git, git-lfs, less, nano)", () => {
       // Pin the Tier 1 list — anything missing here is a regression in
       // docker/Dockerfile.base. These are the tools Claude reaches for
       // in the first 10 turns of a typical session; failing to install
@@ -303,12 +303,29 @@ describe.skipIf(!dockerOk || !allImagesPresent)(
         "docker",
         [
           "run", "--rm", ...LABELS_ARGV, "--entrypoint", "sh", IMAGES.base, "-c",
-          'for c in gh rg fd jq pip3 git less nano dig ping nc tree file; do command -v "$c" || echo "MISSING:$c"; done',
+          'for c in gh rg fd jq pip3 git git-lfs less nano dig ping nc tree file; do command -v "$c" || echo "MISSING:$c"; done',
         ],
         { encoding: "utf8" },
       );
       expect(r.status, `stderr=${r.stderr}`).toBe(0);
       expect(r.stdout).not.toMatch(/^MISSING:/m);
+    });
+
+    it("base image registers git-lfs smudge/clean filters system-wide", () => {
+      // `git lfs install --system` in Dockerfile.base must have written the
+      // filter.lfs.* config to /etc/gitconfig so an agent cloning an
+      // LFS-tracked repo materialises real binaries, not pointer stubs —
+      // even with a fresh per-agent HOME and no repo-local `git lfs install`.
+      const r = spawnSync(
+        "docker",
+        [
+          "run", "--rm", ...LABELS_ARGV, "--entrypoint", "sh", IMAGES.base, "-c",
+          "git config --system --get filter.lfs.smudge",
+        ],
+        { encoding: "utf8" },
+      );
+      expect(r.status, `stderr=${r.stderr}`).toBe(0);
+      expect(r.stdout).toMatch(/git-lfs smudge/);
     });
 
     it("agent image with cap_drop=ALL blocks mount (mount -t tmpfs → EPERM)", () => {

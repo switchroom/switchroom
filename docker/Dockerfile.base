@@ -36,6 +36,12 @@ RUN echo "switchroom/base building for arch=${TARGETARCH}" >&2
 #   tmux       — agent supervisor surface (#725)
 #   bash, ca-certificates, procps — shell + TLS trust + ps
 #   git        — claude tool calls + agent workflows
+#   git-lfs    — large-asset repos (e.g. social-content backups with
+#                photos/videos tracked via LFS). Without it `git clone`/
+#                `pull` leave LFS files as ~130-byte pointer stubs instead
+#                of the real binaries. `git lfs install --system` (below)
+#                registers the smudge/clean filters image-wide so every
+#                agent's clones materialise LFS blobs.
 #   sqlite3    — kernel.db / scheduler.db / hindsight inspection
 #   openssh-client — claude bundle expects ssh-keygen
 #   curl       — also used by the bun installer below; keep above bun
@@ -88,6 +94,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       procps \
       psmisc \
       git \
+      git-lfs \
       sqlite3 \
       openssh-client \
       curl \
@@ -114,7 +121,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       dnsutils \
       iputils-ping \
       netcat-openbsd \
- && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+ && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+ && git lfs install --system --skip-repo
 
 # GitHub CLI (`gh`) — promoted to Tier 1 because `gh auth login` is
 # table stakes once Layer 1's persistent HOME makes the credentials
