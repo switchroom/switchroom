@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.19 — Scannable replies, for real + resuming-beat across gates
+
+### Scannable formatting reaches agents via the live carrier (#2012)
+
+v0.14.18's #2008 added multi-section formatting guidance to
+`profiles/_shared/telegram-style.md.hbs` — but that fragment is **orphaned
+dead code**: no template uses `{{> telegram-style}}` anymore (the fleet
+moved its "Lane 1" invariants out of per-agent `CLAUDE.md` into the
+release-controlled `~/.switchroom/fleet/switchroom-invariants.md`). So the
+guidance never reached a single agent. This adds a **"Formatting — make it
+scannable"** subsection to the live carrier — the `TELEGRAM_GUIDANCE`
+constant in `src/agents/scaffold.ts`, rendered by `renderFleetInvariants()`
+and loaded by every agent via `--add-dir ~/.switchroom/fleet`. Conversational
+one-liners stay minimal; multi-section messages (status updates, summaries,
+and the message posted **before kicking off a sub-agent/worker**) get a bold
+label on each section's own line plus blank-line spacing. Takes effect
+fleet-wide on apply + restart.
+
+### Resuming beat + awaiting-reaction across permission gates (#2011)
+
+Carried in from upstream/main — permission-gate flows now emit a resuming
+beat and preserve the awaiting-reaction state across the gate.
+
 ## v0.14.18 — Inbound burst coalescing + scannable status replies
 
 ### Coalesce forwarded / split-paste bursts into one turn (#2007)
