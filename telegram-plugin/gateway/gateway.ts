@@ -66,7 +66,7 @@ import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { appendActivityLabel } from '../tool-activity-summary.js'
+import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -1474,6 +1474,13 @@ type CurrentTurn = {
   // (via `renderActivityFeed`) as a capped chronological list into the
   // in-place edited activity message and clears on reply. Reset per turn.
   mirrorLines: string[]
+  // Model A — foreground sub-agent nesting. A foreground sub-agent (Task/Agent
+  // with no run_in_background) runs INSIDE this turn while the parent blocks at
+  // the Task tool, so its live steps nest under the parent's activity feed
+  // rather than a separate message. Keyed by jsonl agent id; value = the
+  // sub-agent's accumulated narrative lines (oldest→newest, deduped + capped).
+  // Background workers are NOT here — they get the standalone worker feed.
+  foregroundSubAgents: Map<string, string[]>
   // Issue #195 — answer-lane streaming. Lazily created on the first text
   // event of a turn (once enough text has accumulated, the stream itself
   // gates on minInitialChars). Materialized and cleared at turn_end.
@@ -7223,6 +7230,27 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
   }
 }
 
+/** Accumulation cap for a foreground sub-agent's nested narrative lines.
+ *  Slightly larger than NESTED_MAX_LINES so the render's "↳ +N earlier…"
+ *  header is meaningful without growing unbounded on a long sub-agent. */
+const FOREGROUND_SUBAGENT_ACCUM_MAX = 12
+
+/**
+ * Render this turn's activity feed, nesting any active foreground sub-agent's
+ * narrative beneath the parent's own steps (Model A). With no active
+ * foreground sub-agent this is exactly the flat feed. Multiple concurrent
+ * foreground sub-agents (rare — parallel Task dispatch) flatten in insertion
+ * order; the single-sub-agent common case nests precisely under its
+ * Delegating line.
+ */
+function composeTurnActivity(turn: CurrentTurn): string | null {
+  const childLines: string[] = []
+  for (const narrative of turn.foregroundSubAgents.values()) {
+    childLines.push(...narrative)
+  }
+  return renderActivityFeedWithNested(turn.mirrorLines, childLines)
+}
+
 /**
  * Drain the tool-activity summary's pending render queue. Single-flight
  * by construction (caller assigns the returned promise to
@@ -7389,6 +7417,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityPendingRender: null,
           activityLastSentRender: null,
           mirrorLines: [],
+          foregroundSubAgents: new Map(),
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
@@ -7566,7 +7595,10 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (turn.replyCalled) return
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
-        turn.activityPendingRender = rendered
+        // Recompose so any active foreground sub-agent's nested block (Model A)
+        // is preserved when the parent appends its own step. composeTurnActivity
+        // == the flat render when no foreground sub-agent is active.
+        turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
         if (turn.activityInFlight == null) {
           turn.activityInFlight = drainActivitySummary(turn)
         }
@@ -17640,6 +17672,12 @@ void (async () => {
             // supersedes the coarse 5-min bucket relay below to avoid
             // double-surfacing the same progress beat.
             const workerFeedEnabled = isWorkerActivityFeedEnabled(process.env.SWITCHROOM_WORKER_ACTIVITY_FEED)
+            // Model A — foreground sub-agent nesting in the parent's live
+            // activity draft. ON by default; this edits the SAME activity-
+            // summary message the tool_label feed already owns (not the
+            // compose draft, so no answer-stream contention). The kill-switch
+            // disables only the nesting; the parent's own feed is unaffected.
+            const foregroundNestingEnabled = process.env.SWITCHROOM_FOREGROUND_SUBAGENT_NESTING !== '0'
             const workerActivityFeed = createWorkerActivityFeed({
               bot: {
                 sendMessage: async (cid, text, sendOpts) => {
@@ -17798,6 +17836,28 @@ void (async () => {
                   } catch { /* best-effort */ }
                 }
                 const isBackground = dispatch.isBackground
+                if (!isBackground) {
+                  // Model A — a foreground sub-agent finished. Collapse its
+                  // nested child block from the parent's activity draft; the
+                  // parent resumes and its result returns inline as the Task
+                  // tool result, so there's no handback to deliver. Reaction
+                  // promotion already ran above.
+                  const turn = currentTurn
+                  if (
+                    turn != null &&
+                    turn.foregroundSubAgents.delete(agentId) &&
+                    !turn.replyCalled
+                  ) {
+                    const rendered = composeTurnActivity(turn)
+                    if (rendered != null) {
+                      turn.activityPendingRender = rendered
+                      if (turn.activityInFlight == null) {
+                        turn.activityInFlight = drainActivitySummary(turn)
+                      }
+                    }
+                  }
+                  return
+                }
                 // #PR2 live worker-feed: force the terminal recap edit on
                 // the worker's live message. No-op when no message was ever
                 // posted (trivial workers stay silent; handback covers them).
@@ -17906,7 +17966,39 @@ void (async () => {
                   } catch { /* best-effort */ }
                 }
                 const isBackground = dispatch.isBackground
-                if (!isBackground) return // skip overhead for foreground
+                if (!isBackground) {
+                  // Model A — a foreground sub-agent runs inside the parent's
+                  // turn, so its live narrative nests under the parent's
+                  // activity draft rather than a separate worker message. Pure
+                  // jsonl-tail → render (no model call), inside the
+                  // subscription-honest boundary.
+                  if (!foregroundNestingEnabled) return // kill-switch: skip overhead
+                  const turn = currentTurn
+                  if (turn == null || turn.replyCalled) return
+                  const child = latestSummary.trim().slice(0, 120)
+                  if (child.length === 0) return
+                  let narrative = turn.foregroundSubAgents.get(agentId)
+                  if (narrative == null) {
+                    narrative = []
+                    turn.foregroundSubAgents.set(agentId, narrative)
+                  }
+                  // Dedup against the immediately-preceding line — the watcher
+                  // re-emits the same narrative across ticks while a tool runs.
+                  if (narrative[narrative.length - 1] !== child) {
+                    narrative.push(child)
+                    if (narrative.length > FOREGROUND_SUBAGENT_ACCUM_MAX) {
+                      narrative.splice(0, narrative.length - FOREGROUND_SUBAGENT_ACCUM_MAX)
+                    }
+                  }
+                  const rendered = composeTurnActivity(turn)
+                  if (rendered != null) {
+                    turn.activityPendingRender = rendered
+                    if (turn.activityInFlight == null) {
+                      turn.activityInFlight = drainActivitySummary(turn)
+                    }
+                  }
+                  return
+                }
 
                 // #PR2 live worker-feed: when ON, the worker's live chat
                 // message owns the progress beat. Push a running cue and

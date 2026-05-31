@@ -216,6 +216,61 @@ export function renderActivityFeed(lines: string[]): string | null {
   return out.join("\n");
 }
 
+// ─── Foreground sub-agent nesting (Model A) ─────────────────────────────────
+//
+// A foreground sub-agent (Task/Agent with no `run_in_background`) runs INSIDE
+// the parent's turn — the parent is blocked at the Task tool until it returns.
+// Rather than a separate message, its live steps nest under the parent's own
+// activity feed: the gold-standard main-turn visibility applied one level
+// down. The parent's lines render as done (the parent handed off; it isn't
+// the active worker), and the sub-agent's recent narrative lines render as an
+// indented `↳` block with the newest as the in-progress `→` step.
+
+/** Trailing nested child lines kept visible (Telegram length + readability). */
+export const NESTED_MAX_LINES = 4;
+/** Hard cap on a single nested narrative line. */
+const NESTED_LINE_MAX = 90;
+/** Indent marker for a nested sub-agent step. */
+const NESTED_PREFIX = "   ↳ ";
+
+/**
+ * Render the parent activity feed with an active foreground sub-agent's steps
+ * nested beneath it. When `childLines` is empty this is identical to
+ * `renderActivityFeed(lines)`. Otherwise the parent's own lines are all
+ * done-styled (`✓` italic) — the live `→` step lives in the nested block —
+ * and the child block is indented, newest = bold `→`, earlier = italic, with
+ * a `↳ +N earlier…` header when it overflows. Returns ready Telegram HTML
+ * (callers must NOT re-escape) or null when there is nothing to show.
+ */
+export function renderActivityFeedWithNested(
+  lines: string[],
+  childLines: string[],
+): string | null {
+  const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
+  if (children.length === 0) return renderActivityFeed(lines);
+
+  const out: string[] = [];
+  const shownParent = lines.slice(-MIRROR_MAX_LINES);
+  const hiddenParent = lines.length - shownParent.length;
+  if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`);
+  for (const l of shownParent) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
+
+  const shownChild = children.slice(-NESTED_MAX_LINES);
+  const hiddenChild = children.length - shownChild.length;
+  if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`);
+  const lastChildIdx = shownChild.length - 1;
+  shownChild.forEach((l, i) => {
+    const t = l.length > NESTED_LINE_MAX ? l.slice(0, NESTED_LINE_MAX - 1) + "…" : l;
+    const esc = escapeFeedHtml(t);
+    out.push(
+      i === lastChildIdx
+        ? `${NESTED_PREFIX}<b>→ ${esc}</b>`
+        : `${NESTED_PREFIX}<i>${esc}</i>`,
+    );
+  });
+  return out.length > 0 ? out.join("\n") : null;
+}
+
 /**
  * Like appendActivityLine, but for a pre-computed label (from the
  * real-time PreToolUse sidecar / `tool_label` event) — the hook already
