@@ -110,7 +110,6 @@ describe("scaffoldAgent", () => {
     // merges it into --append-system-prompt; plugin reads .handoff-topic.
     expect(startSh).toContain(".handoff.md");
     expect(startSh).toContain("switchroom handoff");
-    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=true");
     expect(startSh).not.toContain("TELEGRAM_TOPIC_ID");
     // SWITCHROOM_AGENT_NAME is the canonical "which agent am I" identifier the
     // telegram-plugin reads to detect self-restart commands. Must be set.
@@ -1280,38 +1279,6 @@ describe("scaffoldAgent — docker-mode tmux supervisor preamble (v0.7.5)", () =
     );
     expect(stateDirIdx).toBeGreaterThan(0);
     expect(gatewayForkIdx).toBeGreaterThan(stateDirIdx);
-  });
-
-  it("exports SWITCHROOM_HANDOFF_SHOW_LINE before the gateway fork so the sidecar inherits it", () => {
-    // The gateway is the SOLE consumer of SWITCHROOM_HANDOFF_SHOW_LINE
-    // — it decides whether to prepend the visible "↩️ Picked up where
-    // we left off …" line on the first reply after a restart. The
-    // gateway is forked in the docker preamble, so the export MUST
-    // precede that fork. Before this fix the export lived in the inner
-    // tmux pass (after the fork), so the gateway never inherited it and
-    // session_continuity.show_handoff_line:false silently no-oped on
-    // every docker agent.
-    const config = makeAgentConfig({
-      topic_id: 1,
-      session_continuity: { show_handoff_line: false },
-    });
-    const result = scaffoldAgent("hilda", config, tmpDir, telegramConfig);
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=false");
-    const lines = startSh.split("\n");
-    const exportIdx = lines.findIndex((l) =>
-      l.includes("export SWITCHROOM_HANDOFF_SHOW_LINE="),
-    );
-    const gatewayForkIdx = lines.findIndex((l) =>
-      l.includes("_switchroom_supervise gateway"),
-    );
-    expect(exportIdx).toBeGreaterThan(0);
-    expect(gatewayForkIdx).toBeGreaterThan(exportIdx);
-    // Exactly one export — no stale late-pass duplicate left behind.
-    const exportCount = lines.filter((l) =>
-      l.includes("export SWITCHROOM_HANDOFF_SHOW_LINE="),
-    ).length;
-    expect(exportCount).toBe(1);
   });
 
   it("supervisor backs off exponentially and never permanently gives up (RFC J Phase 2)", () => {
@@ -3758,22 +3725,7 @@ describe("session freshness in start.sh", () => {
     // exists so the elif is dead code but inert. The real signal that
     // handoff is disabled is the absence of the handoff-briefing block
     // and its exported env var.
-    expect(startSh).not.toContain("SWITCHROOM_HANDOFF_SHOW_LINE");
     expect(startSh).not.toContain("HANDOFF_FILE=");
-  });
-
-  it("threads show_handoff_line=false through to start.sh env", () => {
-    const agentConfig = makeAgentConfig({
-      session_continuity: { show_handoff_line: false },
-    });
-    const result = scaffoldAgent(
-      "no-line-agent",
-      agentConfig,
-      tmpDir,
-      telegramConfig,
-    );
-    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("SWITCHROOM_HANDOFF_SHOW_LINE=false");
   });
 
 });

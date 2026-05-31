@@ -2051,7 +2051,6 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
     sessionMaxTurns: agentConfig.session?.max_turns,
     handoffEnabled: agentConfig.session_continuity?.enabled !== false,
-    handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
     resumeMode: agentConfig.session_continuity?.resume_mode ?? "handoff",
     resumeMaxBytes:
       agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,
@@ -4473,7 +4472,6 @@ export function reconcileAgent(
       sessionMaxIdleSecs: parseDurationToSeconds(agentConfig.session?.max_idle),
       sessionMaxTurns: agentConfig.session?.max_turns,
       handoffEnabled: agentConfig.session_continuity?.enabled !== false,
-      handoffShowLine: agentConfig.session_continuity?.show_handoff_line !== false,
       resumeMode: agentConfig.session_continuity?.resume_mode ?? "handoff",
       resumeMaxBytes:
         agentConfig.session_continuity?.resume_max_bytes ?? 2_000_000,

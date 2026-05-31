@@ -7,9 +7,6 @@
  * server.ts directly.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 
 import {
   parseQueuePrefix,
@@ -17,11 +14,6 @@ import {
   formatPriorAssistantPreview,
   buildChannelMetaAttributes,
 } from '../steering.js'
-import {
-  consumeHandoffTopic,
-  formatHandoffLine,
-  HANDOFF_TOPIC_FILENAME,
-} from '../handoff-continuity.js'
 
 // ---- harness (copy of e2e.test.ts's — intentional; tests stay isolated) ----
 
@@ -210,24 +202,6 @@ describe('Race: reply tool claims PTY preview suppression gate', () => {
     }
     expect(ptyPartialEmit('c1', 42)).toBe(false)
     expect(ptyPartialEmit('c1')).toBe(true) // different key (no thread)
-  })
-})
-
-describe('Race: handoff topic consumed once, second reply no-ops', () => {
-  let tmp: string
-  beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), 'handoff-race-'))
-  })
-  afterEach(() => {
-    rmSync(tmp, { recursive: true, force: true })
-  })
-
-  it('topic consumed on first reply; second reply sees null', () => {
-    writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'topic\n', 'utf8')
-    const first = consumeHandoffTopic(tmp)
-    expect(first).toBe('topic')
-    const second = consumeHandoffTopic(tmp)
-    expect(second).toBeNull()
   })
 })
 

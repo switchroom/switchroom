@@ -35,7 +35,6 @@ function makeDeps(
     markdownToHtml: (t) => `<b>${t}</b>`,
     escapeMarkdownV2: (t) => `\\${t}\\`,
     repairEscapedWhitespace: (t) => t,
-    takeHandoffPrefix: () => '',
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
@@ -102,29 +101,6 @@ describe('handleStreamReply', () => {
 
     expect(bot.api.sendMessage.mock.calls[0][1]).toBe('plain')
     expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
-  })
-
-  it('prepends handoff prefix on first chunk only', async () => {
-    const state = makeState()
-    const deps = makeDeps(bot, {
-      takeHandoffPrefix: vi.fn<(fmt: string) => string>(() => '↩️ '),
-    })
-
-    // First call: prefix applied
-    const p1 = handleStreamReply({ chat_id: '1', text: 'first' }, state, deps)
-    await microtaskFlush()
-    await p1
-    // Prefix is prepended AFTER format rendering (it's already format-safe
-    // because takeHandoffPrefix takes the format tag).
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('↩️ <b>first</b>')
-
-    // Second call: handoff not consumed again
-    vi.advanceTimersByTime(1000)
-    const p2 = handleStreamReply({ chat_id: '1', text: 'second' }, state, deps)
-    await microtaskFlush()
-    await p2
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>second</b>')
-    expect(deps.takeHandoffPrefix).toHaveBeenCalledTimes(1)
   })
 
   it('throws when text exceeds 4096 (no silent id:pending)', async () => {

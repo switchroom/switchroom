@@ -10,7 +10,7 @@
  * of this test file and brittle w.r.t. upstream churn.
  *
  * Instead, following the existing project convention
- * (see steering.test.ts, handoff-continuity.test.ts), we exercise each
+ * (see steering.test.ts), we exercise each
  * specified scenario through the same pure helper modules that server.ts
  * calls. Where a scenario lives inside server.ts's in-memory state
  * (activeTurnStartedAt, activeStatusReactions, suppressPtyPreview), we
@@ -18,23 +18,13 @@
  * server.ts uses. The helpers and the state shape are the contract —
  * if they don't regress, the integrated behaviour doesn't regress.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 
 import {
   parseQueuePrefix,
   formatPriorAssistantPreview,
   buildChannelMetaAttributes,
 } from '../steering.js'
-import {
-  consumeHandoffTopic,
-  readHandoffTopic,
-  formatHandoffLine,
-  shouldShowHandoffLine,
-  HANDOFF_TOPIC_FILENAME,
-} from '../handoff-continuity.js'
 import {
   isContextExhaustionText,
   shouldArmOrphanedReplyTimeout,
@@ -64,7 +54,6 @@ interface PluginState {
   currentSessionChatId: string | null
   currentSessionThreadId: number | undefined
   currentTurnStartedAt: number
-  handoffTopicUsed: boolean
 }
 
 function freshState(): PluginState {
@@ -75,7 +64,6 @@ function freshState(): PluginState {
     currentSessionChatId: null,
     currentSessionThreadId: undefined,
     currentTurnStartedAt: 0,
-    handoffTopicUsed: false,
   }
 }
 
@@ -268,69 +256,6 @@ describe('E2E: turn lifecycle cleanup', () => {
     simulateControllerError(s, 'c1')
     expect(s.activeStatusReactions.has(statusKey('c1'))).toBe(false)
     expect(s.activeTurnStartedAt.has(statusKey('c1'))).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Handoff continuity
-// ---------------------------------------------------------------------------
-
-describe('E2E: handoff continuity', () => {
-  let tmp: string
-  const priorEnv = { ...process.env }
-
-  beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), 'handoff-e2e-'))
-  })
-
-  afterEach(() => {
-    rmSync(tmp, { recursive: true, force: true })
-    process.env = { ...priorEnv }
-  })
-
-  it('bootstrap with sidecar + show-line=true → first reply prepends the line', () => {
-    writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'shipped the feature\n', 'utf8')
-    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = 'true'
-    expect(shouldShowHandoffLine()).toBe(true)
-    const topic = consumeHandoffTopic(tmp)
-    expect(topic).toBe('shipped the feature')
-    const line = formatHandoffLine(topic!, 'html')
-    expect(line).toContain('shipped the feature')
-    expect(line).toMatch(/^<i>/)
-  })
-
-  it('bootstrap with sidecar + show-line=false → no prefix', () => {
-    writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'x\n', 'utf8')
-    process.env.SWITCHROOM_HANDOFF_SHOW_LINE = 'false'
-    expect(shouldShowHandoffLine()).toBe(false)
-  })
-
-  it('bootstrap with no sidecar → no prefix', () => {
-    expect(readHandoffTopic(tmp)).toBeNull()
-    expect(consumeHandoffTopic(tmp)).toBeNull()
-  })
-
-  it('consuming topic is one-shot — second call returns null + sidecar deleted', () => {
-    writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 'topic\n', 'utf8')
-    expect(consumeHandoffTopic(tmp)).toBe('topic')
-    expect(existsSync(join(tmp, HANDOFF_TOPIC_FILENAME))).toBe(false)
-    expect(consumeHandoffTopic(tmp)).toBeNull()
-  })
-
-  it('stream_reply: once topic consumed, subsequent stream chunks do not re-prefix', () => {
-    // Model: the plugin tracks handoffTopicUsed after first reply/stream_reply
-    // use. The second and later stream edits on the same stream read the flag
-    // and skip prepending.
-    writeFileSync(join(tmp, HANDOFF_TOPIC_FILENAME), 't\n', 'utf8')
-    const s = freshState()
-    expect(s.handoffTopicUsed).toBe(false)
-    // first chunk
-    const topic = consumeHandoffTopic(tmp)
-    expect(topic).toBe('t')
-    s.handoffTopicUsed = true
-    // simulate next chunk arriving — should not consume
-    expect(consumeHandoffTopic(tmp)).toBeNull()
-    expect(s.handoffTopicUsed).toBe(true)
   })
 })
 

@@ -31,7 +31,6 @@ function makeDeps(bot: FakeBot, overrides?: Partial<StreamReplyDeps>): StreamRep
     markdownToHtml: (t) => realMarkdownToHtml(t),
     escapeMarkdownV2: (t) => `ESC(${t})`,
     repairEscapedWhitespace: (t) => t,
-    takeHandoffPrefix: () => '',
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,

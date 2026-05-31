@@ -210,14 +210,7 @@ import {
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
 // #1122 PR3: turn-flush-prose-recovery removed with the progress card.
-import {
-  resolveAgentDirFromEnv,
-  consumeHandoffTopic,
-  shouldShowHandoffLine,
-  formatHandoffLine,
-  writeLastTurnSummary,
-  type HandoffFormat,
-} from '../handoff-continuity.js'
+import { resolveAgentDirFromEnv } from '../agent-dir.js'
 import {
   addActiveReaction,
   removeActiveReaction,
@@ -396,6 +389,7 @@ import {
   touchTurnActiveMarker,
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
+  TURN_ACTIVE_MARKER_FILE,
 } from './turn-active-marker.js'
 import {
   VERSION,
@@ -423,12 +417,17 @@ import {
 import { resolveVaultApprovalPosture } from '../vault-approval-posture.js'
 import {
   openTurnsDb,
-  markOrphanedAsRestarted,
+  markOrphanedWithTimeoutClassification,
   recordTurnStart,
   recordTurnEnd,
-  findMostRecentInterruptedTurn,
+  findLatestTurnIfInterrupted,
   findRecentTurnsForChat,
 } from '../registry/turns-schema.js'
+import {
+  buildResumeInterruptedInbound,
+  buildResumeWatchdogReportInbound,
+  selectResumeBuilder,
+} from './resume-inbound-builder.js'
 import { applySubagentsSchema, getSubagentByJsonlId } from '../registry/subagents-schema.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import { formatIdleFooter } from '../idle-footer.js'
@@ -969,13 +968,26 @@ if (HISTORY_ENABLED) {
   }
 }
 
-// ─── Turn-tracking registry (Stage 3a of simplify-restart, Phase 0 of #250) ─
-// On boot, open the per-agent registry.db and stamp any rows that never got
-// an ended_at as ended_via='restart'. Those are turns where the previous
-// gateway died mid-flight (SIGKILL / OOM / hard reboot — any path that
-// skipped the SIGTERM handler). Stages 3b/3c will populate new rows during
-// turn enqueue/end and on graceful shutdown; Stage 4 reads on cold start.
+// ─── Turn-tracking registry + honest-restart-resume ────────────────────────
+// On boot, open the per-agent registry.db and reap any turn that never got an
+// ended_at — those were killed mid-flight (operator restart, SIGKILL, OOM,
+// hard reboot). The reaper CLASSIFIES each orphan from the on-disk
+// turn-active marker's age:
+//   - marker older than the hang-watchdog window → 'timeout' (the turn
+//     stalled with no tool progress; report it, don't blindly resume).
+//   - otherwise → 'restart' (a clean interrupt; resume it).
+// Then, if the LATEST turn was interrupted, we build a synthetic resume /
+// report inbound and (further down, once the inbound spool exists) inject it
+// so the agent wakes on its own and either picks the work back up or tells
+// the user why it stopped — no human nudge required.
+//
+// The classifier MUST read the marker before the boot-cleanup sweep removes
+// it (the sweep runs much later, in the bridge-registration path). This block
+// runs at module top, so the marker is still present here.
 let turnsDb: ReturnType<typeof openTurnsDb> | null = null
+// Stashed here; pushed to the spool once it's constructed below. The spool's
+// turn_key-keyed dedup makes a re-stash across multiple restarts a no-op.
+let bootResumeInbound: { agent: string; msg: InboundMessage } | null = null
 try {
   // STATE_DIR is `<agentDir>/telegram` in production. openTurnsDb expects
   // the parent (agent dir) and joins `telegram/registry.db` itself.
@@ -987,23 +999,88 @@ try {
   // schema; subagents lives alongside in registry.db. Idempotent — safe on
   // pre-existing DBs (handles the jsonl_agent_id column migration).
   applySubagentsSchema(turnsDb)
-  const reaped = markOrphanedAsRestarted(turnsDb)
+
+  // Read the turn-active marker (the in-flight turn the watchdog tracks)
+  // BEFORE classifying — its mtime is "ms since last tool progress" and its
+  // payload carries the in-flight turn_key.
+  let markerTurnKey: string | null = null
+  let markerAgeMs: number | null = null
+  try {
+    const markerPath = join(STATE_DIR, TURN_ACTIVE_MARKER_FILE)
+    if (existsSync(markerPath)) {
+      const st = statSync(markerPath)
+      markerAgeMs = Date.now() - st.mtimeMs
+      try {
+        const payload = JSON.parse(readFileSync(markerPath, 'utf8')) as { turnKey?: unknown }
+        if (typeof payload.turnKey === 'string' && payload.turnKey.length > 0) {
+          markerTurnKey = payload.turnKey
+        }
+      } catch { /* unreadable/torn marker — age alone still classifies */ }
+    }
+  } catch { /* stat failure — treat as no marker (plain restart) */ }
+
+  // TURN_HANG_SECS is the watchdog's hang threshold (default 300s); the
+  // classifier uses the same signal so "would the watchdog have killed it"
+  // is answered identically whether or not the watchdog is live (it's
+  // disabled under Docker, but the staleness judgement still holds).
+  const hangSecs = Number(process.env.TURN_HANG_SECS)
+  const hangThresholdMs = (Number.isFinite(hangSecs) && hangSecs > 0 ? hangSecs : 300) * 1000
+  const reasonSnapshot =
+    markerAgeMs != null ? JSON.stringify({ idleMs: Math.round(markerAgeMs) }) : null
+
+  const { reaped, timeoutTurnKey } = markOrphanedWithTimeoutClassification(turnsDb, {
+    markerTurnKey,
+    markerAgeMs,
+    hangThresholdMs,
+    reasonSnapshot,
+  })
   if (reaped > 0) {
-    process.stderr.write(`telegram gateway: turn-registry boot-reaper stamped ${reaped} orphaned turn(s) as ended_via='restart'\n`)
+    process.stderr.write(
+      `telegram gateway: turn-registry boot-reaper stamped ${reaped} orphaned turn(s)` +
+      `${timeoutTurnKey ? ` (turnKey=${timeoutTurnKey} as 'timeout', markerAgeMs=${markerAgeMs})` : " as 'restart'"}\n`,
+    )
   } else {
     process.stderr.write(`telegram gateway: turn-registry initialized at ${join(agentDir, 'telegram', 'registry.db')}\n`)
   }
 
-  // Stage 4: surface the most-recently-interrupted turn to start.sh as a
-  // shell-sourceable env file. The agent's start.sh reads this on next
-  // boot, exports the env vars to the spawned `claude` process, and
-  // deletes the file (one-shot — only ever applies to the immediately
-  // following session). If there's no interrupted turn (clean previous
-  // shutdown), we delete any stale file so the resume protocol doesn't
-  // mis-fire.
+  // Build the boot resume/report inbound for the LATEST turn if it was
+  // interrupted. selectResumeBuilder owns the resume-vs-report policy.
+  const pending = findLatestTurnIfInterrupted(turnsDb)
+  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  if (pending != null && selfAgent) {
+    const kind = selectResumeBuilder(pending.ended_via)
+    if (kind === 'resume') {
+      bootResumeInbound = { agent: selfAgent, msg: buildResumeInterruptedInbound({ turn: pending }) }
+    } else if (kind === 'report') {
+      // idleMs: this boot's measured marker age if it just classified this
+      // turn; otherwise recover it from the persisted interrupt_reason (a
+      // later boot, marker already swept); else fall back to total runtime.
+      let idleMs = pending.turn_key === timeoutTurnKey && markerAgeMs != null ? markerAgeMs : null
+      if (idleMs == null && pending.interrupt_reason) {
+        try {
+          const parsed = JSON.parse(pending.interrupt_reason) as { idleMs?: unknown }
+          if (typeof parsed.idleMs === 'number' && Number.isFinite(parsed.idleMs)) idleMs = parsed.idleMs
+        } catch { /* malformed snapshot — fall through */ }
+      }
+      if (idleMs == null) idleMs = Math.max(0, Date.now() - pending.started_at)
+      bootResumeInbound = {
+        agent: selfAgent,
+        msg: buildResumeWatchdogReportInbound({ turn: pending, idleMs }),
+      }
+    }
+    if (bootResumeInbound != null) {
+      process.stderr.write(
+        `telegram gateway: boot-resume queued kind=${kind} turnKey=${pending.turn_key} ` +
+        `endedVia=${pending.ended_via ?? 'open'} chat=${pending.chat_id}\n`,
+      )
+    }
+  }
+
+  // Diagnostic env file (one-shot, sourced by start.sh) — kept for the
+  // wake-audit context. The injected inbound above is the real wake signal;
+  // these vars are passive context only.
   const pendingEnvPath = join(agentDir, '.pending-turn.env')
   try {
-    const pending = findMostRecentInterruptedTurn(turnsDb)
     if (pending != null) {
       const lines = [
         `SWITCHROOM_PENDING_TURN=true`,
@@ -1013,14 +1090,12 @@ try {
         pending.last_user_msg_id != null ? `SWITCHROOM_PENDING_USER_MSG_ID=${pending.last_user_msg_id}` : `SWITCHROOM_PENDING_USER_MSG_ID=`,
         `SWITCHROOM_PENDING_ENDED_VIA=${pending.ended_via ?? 'unknown'}`,
         `SWITCHROOM_PENDING_STARTED_AT=${pending.started_at}`,
+        pending.interrupt_reason != null ? `SWITCHROOM_PENDING_INTERRUPT_REASON=${pending.interrupt_reason}` : `SWITCHROOM_PENDING_INTERRUPT_REASON=`,
       ]
       // Atomic write: tmp + rename. Without this, a crash mid-write
       // (power loss, OOM, panic) leaves a truncated `.pending-turn.env`
       // that start.sh `source`s — partial SWITCHROOM_PENDING_* vars
-      // half-trigger the resume protocol with incomplete context, or
-      // a malformed line breaks shell parsing inside the source.
-      // Same pattern used by the access-file write a few hundred lines
-      // above and by src/issues/store.ts.
+      // or a malformed line break shell parsing inside the source.
       const pendingEnvTmp = `${pendingEnvPath}.tmp-${process.pid}`
       writeFileSync(pendingEnvTmp, lines.join('\n') + '\n', { mode: 0o600 })
       renameSync(pendingEnvTmp, pendingEnvPath)
@@ -1030,7 +1105,7 @@ try {
       process.stderr.write(`telegram gateway: pending-turn env cleared (clean previous shutdown)\n`)
     }
   } catch (err) {
-    process.stderr.write(`telegram gateway: pending-turn env write failed (${(err as Error).message}) — resume protocol may not fire\n`)
+    process.stderr.write(`telegram gateway: pending-turn env write failed (${(err as Error).message})\n`)
   }
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
@@ -2127,23 +2202,6 @@ function probeAvailableReactions(chatId: string): void {
       chatProbesInFlight.delete(chatId)
     }
   })()
-}
-
-// ─── Handoff continuity ───────────────────────────────────────────────────
-let pendingHandoffTopic: string | null = null
-
-function initHandoffContinuity(): void {
-  if (!shouldShowHandoffLine()) { pendingHandoffTopic = null; return }
-  const agentDir = resolveAgentDirFromEnv()
-  if (agentDir == null) { pendingHandoffTopic = null; return }
-  pendingHandoffTopic = consumeHandoffTopic(agentDir)
-}
-
-function takeHandoffPrefix(format: HandoffFormat): string {
-  if (pendingHandoffTopic == null) return ''
-  const line = formatHandoffLine(pendingHandoffTopic, format)
-  pendingHandoffTopic = null
-  return line
 }
 
 // ─── Text chunking ────────────────────────────────────────────────────────
@@ -3942,6 +4000,21 @@ const inboundSpool = STATIC
       },
     })
 const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
+// Honest-restart-resume: inject the boot resume/report inbound built by the
+// registry classifier above. When the spool exists we only PUT it (the
+// boot-replay loop below pulls it into the in-memory buffer exactly once via
+// liveEntries — pushing here too would double-queue). The turn_key-keyed
+// spoolId makes this a no-op if a prior restart already queued the same turn
+// and it hasn't been delivered yet — so a multi-restart sequence resumes a
+// given turn once, not N times. When there's no spool (STATIC mode) push
+// straight to the in-memory buffer.
+if (bootResumeInbound != null) {
+  if (inboundSpool != null) {
+    inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)
+  } else {
+    pendingInboundBuffer.push(bootResumeInbound.agent, bootResumeInbound.msg)
+  }
+}
 // Boot-replay: re-queue every un-acked spooled inbound into the
 // in-memory buffer so the existing drain triggers (onClientRegistered
 // / silence-poke #1546 / idle-drain #1549) deliver them. push →
@@ -5249,13 +5322,6 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     effectiveText = text
   }
 
-  {
-    const prefix = takeHandoffPrefix(
-      format === 'html' ? 'html' : format === 'markdownv2' ? 'markdownv2' : 'text',
-    )
-    if (prefix.length > 0) effectiveText = prefix + effectiveText
-  }
-
   assertAllowedChat(chat_id)
 
   let threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
@@ -5989,7 +6055,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       markdownToHtml,
       escapeMarkdownV2,
       repairEscapedWhitespace,
-      takeHandoffPrefix,
       assertAllowedChat,
       resolveThreadId,
       disableLinkPreview: access.disableLinkPreview !== false,
@@ -8508,7 +8573,6 @@ function handlePtyActivity(text: string): void {
       markdownToHtml,
       escapeMarkdownV2,
       repairEscapedWhitespace,
-      takeHandoffPrefix: () => '',
       assertAllowedChat,
       resolveThreadId,
       disableLinkPreview: access.disableLinkPreview !== false,
@@ -16982,7 +17046,6 @@ process.on('SIGINT', () => void shutdown('SIGINT'))
 
 
 // ─── Startup ──────────────────────────────────────────────────────────────
-initHandoffContinuity()
 
 // Top-level error handlers route through shutdown() so the startup lock is
 // released cleanly. Without this, a top-level throw would leave the lock

@@ -106,6 +106,51 @@ describe('spoolId — stable dedup key', () => {
     // messageId > 0 → legacy m:<chat>:<msgId> still wins.
     expect(a).toBe('m:c1:555')
   })
+  // honest-restart-resume: a boot-resume inbound is minted with a fresh
+  // ts/messageId every boot, so without a turn-keyed id an operator who
+  // restarts twice before the agent drains the first resume would stack
+  // N resumes of the same turn. Keying on resume_turn_key collapses them.
+  it('resume_interrupted → s:resume:<turn_key>, stable across boots (fresh ts/messageId)', () => {
+    const a = spoolId(
+      msg({
+        messageId: 1700_000_000_000,
+        ts: 1700_000_000_000,
+        meta: { source: 'resume_interrupted', resume_turn_key: '12345:11' },
+      }),
+    )
+    const b = spoolId(
+      msg({
+        messageId: 1700_000_999_999,
+        ts: 1700_000_999_999,
+        meta: { source: 'resume_interrupted', resume_turn_key: '12345:11' },
+      }),
+    )
+    expect(a).toBe('s:resume:12345:11')
+    expect(b).toBe(a)
+  })
+  it('resume_watchdog_timeout shares the s:resume namespace (one turn is one or the other)', () => {
+    const interrupted = spoolId(
+      msg({ messageId: 0, meta: { source: 'resume_interrupted', resume_turn_key: 'k:1' } }),
+    )
+    const timeout = spoolId(
+      msg({ messageId: 0, meta: { source: 'resume_watchdog_timeout', resume_turn_key: 'k:1' } }),
+    )
+    expect(timeout).toBe('s:resume:k:1')
+    expect(timeout).toBe(interrupted)
+  })
+  it('resume inbounds for distinct turns stay distinct', () => {
+    const a = spoolId(
+      msg({ messageId: 0, meta: { source: 'resume_interrupted', resume_turn_key: 'k:1' } }),
+    )
+    const b = spoolId(
+      msg({ messageId: 0, meta: { source: 'resume_interrupted', resume_turn_key: 'k:2' } }),
+    )
+    expect(a).not.toBe(b)
+  })
+  it('resume source without a turn_key falls back to legacy id (no crash)', () => {
+    const a = spoolId(msg({ messageId: 777, meta: { source: 'resume_interrupted' }, ts: 100 }))
+    expect(a).toBe('m:c1:777')
+  })
 })
 
 describe('inbound-spool — subagent_handback dedup across restart re-build (#1719)', () => {

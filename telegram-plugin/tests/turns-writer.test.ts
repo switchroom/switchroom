@@ -5,7 +5,7 @@
  *   1. Clean turn: insert + finalize → row has ended_via='stop', non-null
  *      ended_at, correct previews.
  *   2. Mid-turn restart: insert without finalize, simulate gateway boot via
- *      markOrphanedAsRestarted → row has ended_via='restart'.
+ *      markOrphanedWithTimeoutClassification → row has ended_via='restart'.
  *   3. Multiple concurrent turns same chat: each row has a unique turn_key,
  *      no cross-contamination.
  *   4. tool_call_count increments correctly for N tool_use events.
@@ -20,8 +20,18 @@ import {
   openTurnsDbInMemory,
   recordTurnStart,
   recordTurnEnd,
-  markOrphanedAsRestarted,
+  markOrphanedWithTimeoutClassification,
 } from '../registry/turns-schema.js'
+
+// The boot reaper as the gateway calls it between turns (no live hang
+// marker) — every open turn is a clean 'restart' interrupt.
+function reapAsRestart(db: Parameters<typeof recordTurnEnd>[0]) {
+  return markOrphanedWithTimeoutClassification(db, {
+    markerTurnKey: null,
+    markerAgeMs: null,
+    hangThresholdMs: 300_000,
+  })
+}
 
 // ---------------------------------------------------------------------------
 // 1. Clean turn
@@ -110,7 +120,7 @@ describe('clean turn (Phase 1 #332)', () => {
 // ---------------------------------------------------------------------------
 
 describe('mid-turn restart (Phase 1 #332)', () => {
-  it('insert without finalize, then markOrphanedAsRestarted → ended_via=restart', () => {
+  it('insert without finalize, then reaper → ended_via=restart', () => {
     const db = openTurnsDbInMemory()
 
     recordTurnStart(db, {
@@ -120,8 +130,8 @@ describe('mid-turn restart (Phase 1 #332)', () => {
     })
 
     // Simulate gateway boot reaper (same path as the real gateway boot).
-    const swept = markOrphanedAsRestarted(db)
-    expect(swept).toBe(1)
+    const swept = reapAsRestart(db)
+    expect(swept.reaped).toBe(1)
 
     const row = db
       .prepare('SELECT ended_via, ended_at FROM turns WHERE turn_key = ?')
@@ -141,7 +151,7 @@ describe('mid-turn restart (Phase 1 #332)', () => {
     recordTurnEnd(db, { turnKey: 'chat2:_:2001', endedVia: 'stop' })
     recordTurnStart(db, { turnKey: 'chat2:_:2002', chatId: 'chat2' })
 
-    markOrphanedAsRestarted(db)
+    reapAsRestart(db)
 
     const clean = db
       .prepare('SELECT ended_via FROM turns WHERE turn_key = ?')

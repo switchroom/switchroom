@@ -437,7 +437,6 @@ describe('wrapBot + handleStreamReply + reply ordering', () => {
       markdownToHtml: (t) => t,
       escapeMarkdownV2: (t) => t,
       repairEscapedWhitespace: (t) => t,
-      takeHandoffPrefix: () => '',
       assertAllowedChat: () => {},
       resolveThreadId: () => undefined,
       disableLinkPreview: true,

@@ -407,7 +407,6 @@ function makeActivityDeps(
     markdownToHtml: (t) => t,
     escapeMarkdownV2: (t) => t,
     repairEscapedWhitespace: (t) => t,
-    takeHandoffPrefix: () => '',
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
