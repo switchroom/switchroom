@@ -647,6 +647,34 @@ export class Driver {
   }
 
   /**
+   * Send a photo album (Telegram media_group) — multiple photos posted as
+   * one group, the way a forwarded album or a multi-image paste arrives.
+   * Exercises the gateway's A2 multi-attachment coalescing: with
+   * coalesce.max_attachments default 10, the whole album folds into ONE
+   * Claude turn (the agent sees image_path, image_path_2, …). The optional
+   * caption rides on the first item, matching Telegram client behaviour.
+   * Returns every sent message id (one per album item).
+   */
+  async sendAlbum(
+    chatId: number,
+    photoPaths: string[],
+    caption?: string,
+    opts?: SendTextOptions,
+  ): Promise<{ messageIds: number[] }> {
+    const c = this.requireClient();
+    const replyTo = opts?.replyTo ?? opts?.messageThreadId;
+    const medias = photoPaths.map((p, i) =>
+      InputMedia.photo(p, i === 0 && caption ? { caption } : undefined),
+    );
+    const sent = await c.sendMediaGroup(
+      chatId,
+      medias,
+      replyTo ? { replyTo } : undefined,
+    );
+    return { messageIds: sent.map((m) => m.id) };
+  }
+
+  /**
    * Send or remove an emoji reaction on a target message. Used by the
    * UAT reaction-trigger scenario (#1074) to exercise the gateway's
    * MessageReactionUpdated handler — the driver reacts to a bot reply,
