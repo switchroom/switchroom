@@ -8733,11 +8733,11 @@ async function handleInboundCoalesced(
   const maxAttachments = coalesceMaxAttachments()
 
   // Albums (media_group_id): coalesce only when the cap allows >1 attachment
-  // (A2). At the default cap of 1 each album part keeps its own turn exactly
-  // as before — the single-attachment merge can't carry sibling photos, so
-  // bypassing avoids dropping them. With a raised cap the parts share the
-  // coalesce key and fold into one multi-attachment turn (the cap-overflow
-  // bypass below catches parts past the cap).
+  // (A2). At the default cap of 10 the parts share the coalesce key and fold
+  // into one multi-attachment turn (the cap-overflow bypass below catches
+  // parts past the cap). With the cap lowered to 1 each album part keeps its
+  // own turn — the single-attachment merge can't carry sibling photos, so
+  // bypassing avoids dropping them.
   if (hasAttachment && ctx.message?.media_group_id != null && maxAttachments <= 1) {
     return handleInbound(ctx, text, downloadImage, attachment)
   }
@@ -8747,7 +8747,8 @@ async function handleInboundCoalesced(
 
   // An attachment past the per-agent cap would be dropped by the capped merge.
   // Bypass it to its own turn so no media is silently lost. At the default
-  // cap of 1 this fires on the SECOND attachment, preserving A1 behaviour.
+  // cap of 10 this fires on the 11th attachment; with the cap lowered to 1 it
+  // fires on the SECOND, preserving A1 behaviour.
   if (hasAttachment) {
     const probeKey = inboundCoalesceKey(
       String(ctx.chat!.id),
@@ -8791,9 +8792,9 @@ async function handleInboundCoalesced(
   // Coalescing disabled (window <= 0): flush immediately, preserving any
   // media this message carried.
   if (result.bypass) return handleInbound(ctx, text, downloadImage, attachment)
-  // Count the open window's attachments so a third+ (or second, at the
-  // default cap) bypasses rather than overflows the capped merge (cleared
-  // in onFlush).
+  // Count the open window's attachments so any part past the cap (the 11th
+  // at the default cap of 10, or the second when lowered to 1) bypasses
+  // rather than overflows the capped merge (cleared in onFlush).
   if (hasAttachment) bufferedAttachmentKeys.set(key, (bufferedAttachmentKeys.get(key) ?? 0) + 1)
 }
 
