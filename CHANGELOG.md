@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.14.21 — Inbound coalescing + worker feed + safe-boundary interrupt, on by default
+
+v0.14.20 shipped the inbound-coalescing / worker-visibility series
+default-off so it could roll out with zero behaviour change. This
+release **flips all three behaviours on by default** — they are now the
+standard experience, not an opt-in — and adds the end-to-end UAT gate
+that was missing for the album path.
+
+Each default lives in a single pure resolver (mirroring the existing
+`resolveInterruptMaxWaitMs` seam) and is pinned by a unit test, so the
+default can't silently regress. Operators can still set the config field
+explicitly to restore the old behaviour.
+
+### PR A — flip the three defaults on (#2021)
+
+- **Album / multi-attachment coalescing** —
+  `channels.telegram.coalesce.max_attachments` now defaults to **10** (a
+  full Telegram album) instead of 1. A forwarded album or text+multi-image
+  burst folds into a single Claude turn: the agent sees the primary
+  attachment plus numbered siblings (`image_path_2`, …) and an
+  `attachment_count`. Attachments past the cap still spill into the next
+  turn (nothing is dropped). Set `max_attachments: 1` to restore the old
+  one-image-per-turn behaviour.
+- **Deferred safe-boundary `!` interrupt** —
+  `channels.telegram.interrupt.safe_boundary` now defaults to **true**. A
+  `!`-prefix interrupt that arrives mid-tool-call defers to a clean
+  boundary (the in-flight tool's `tool_result`, or turn end) instead of
+  SIGINT-ing the agent partway through a `Write`/`Bash`. Acked immediately
+  with ⚡; `max_wait_ms` (default 8000, unchanged) caps the wait. A bare
+  `!` (halt-now) and an empty body still fire immediately. Set
+  `safe_boundary: false` to restore fire-immediately-always.
+- **Worker-activity feed** — the live background-worker feed
+  (`SWITCHROOM_WORKER_ACTIVITY_FEED`) is now **on unless explicitly set to
+  `0`**, rather than requiring `=1`. (It was already enabled fleet-wide;
+  this makes the default match the rollout.)
+
+### PR B — album-coalescing end-to-end UAT gate (#2023)
+
+The album path had unit + fuzz coverage but no end-to-end gate, and the
+mtcute UAT driver couldn't even send a `media_group`. This adds
+`driver.sendAlbum()`, three committed JPEG fixtures, and
+`jtbd-album-coalescing-dm.test.ts` — which sends a real 3-photo album and
+asserts the agent reports seeing **3** images in one turn (a
+non-coalescing gateway answers 1). The matcher anchors on a distinctive
+`IMAGECOUNT=<n>` token and drains to the final reply, so the now-default-on
+worker feed and progress-card timers can't collide with the count.
+Test-only; doubles as the rollout canary.
+
+### PR C — memory-recall matcher skips the worker feed (#2020, #2022)
+
+Two test-only follow-ups so the memory-survives-restart recall scenario
+ignores worker-feed messages (now default-on) when matching for the
+agent's own reply, instead of latching onto the feed's first paint.
+
 ## v0.14.20 — Inbound bursts + a live worker feed that reads like the agent
 
 This release lands the four-PR inbound-coalescing / worker-visibility
