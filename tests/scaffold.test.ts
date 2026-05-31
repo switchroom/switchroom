@@ -431,6 +431,39 @@ describe("scaffoldAgent", () => {
     expect("coalescingGapMs" in access).toBe(false);
   });
 
+  it("projects channels.telegram.interrupt into access (safe_boundary + max_wait_ms)", () => {
+    const config = makeAgentConfig({
+      channels: { telegram: { interrupt: { safe_boundary: true, max_wait_ms: 5000 } } },
+    });
+    const result = scaffoldAgent("interrupt-agent", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect(access.interruptSafeBoundary).toBe(true);
+    expect(access.interruptMaxWaitMs).toBe(5000);
+  });
+
+  it("projects interrupt.safe_boundary: false — not dropped as falsy", () => {
+    const config = makeAgentConfig({
+      channels: { telegram: { interrupt: { safe_boundary: false } } },
+    });
+    const result = scaffoldAgent("interrupt-off", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect(access.interruptSafeBoundary).toBe(false);
+  });
+
+  it("omits interrupt fields entirely when no interrupt config is set", () => {
+    const config = makeAgentConfig();
+    const result = scaffoldAgent("interrupt-default", config, tmpDir, telegramConfig);
+    const access = JSON.parse(
+      readFileSync(join(result.agentDir, "telegram", "access.json"), "utf-8"),
+    );
+    expect("interruptSafeBoundary" in access).toBe(false);
+    expect("interruptMaxWaitMs" in access).toBe(false);
+  });
+
   it("generates settings.json with tool permissions (webkite staged → WebFetch denied)", () => {
     // Simulate the webkite binary being staged so the fail-safe gate
     // (webkiteBinaryAvailable) trips and the deny applies. Point the

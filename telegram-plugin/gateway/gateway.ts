@@ -36,6 +36,11 @@ import {
 } from '../ask-user.js'
 import { parseInterruptMarker } from '../interrupt-marker.js'
 import {
+  ToolFlightTracker,
+  decideInterruptTiming,
+  resolveInterruptMaxWaitMs,
+} from './interrupt-defer.js'
+import {
   resolveStickerSendArgs,
   resolveGifSendArgs,
   type StickerSendArgs,
@@ -775,6 +780,15 @@ type Access = {
    *  (single-attachment behaviour). Projected from
    *  channels.telegram.coalesce.max_attachments by scaffold. */
   coalesceMaxAttachments?: number
+  /** Problem B: when true, a `!` interrupt that lands mid-tool-call is
+   *  deferred until the in-flight tool finishes (bounded by
+   *  interruptMaxWaitMs) before SIGINT + resume. Default false (fire
+   *  synchronously). Projected from channels.telegram.interrupt.safe_boundary. */
+  interruptSafeBoundary?: boolean
+  /** Upper bound (ms) to wait for a safe boundary before firing a deferred
+   *  interrupt anyway. Default 8000. Projected from
+   *  channels.telegram.interrupt.max_wait_ms. */
+  interruptMaxWaitMs?: number
   statusReactions?: boolean
   historyEnabled?: boolean
   historyRetentionDays?: number
@@ -874,6 +888,8 @@ function readAccessFile(): Access {
       disableLinkPreview: parsed.disableLinkPreview,
       coalescingGapMs: parsed.coalescingGapMs,
       coalesceMaxAttachments: parsed.coalesceMaxAttachments,
+      interruptSafeBoundary: parsed.interruptSafeBoundary,
+      interruptMaxWaitMs: parsed.interruptMaxWaitMs,
       statusReactions: parsed.statusReactions,
       historyEnabled: parsed.historyEnabled,
       historyRetentionDays: parsed.historyRetentionDays,
@@ -1385,6 +1401,78 @@ type CurrentTurn = {
 }
 
 let currentTurn: CurrentTurn | null = null
+
+// Problem B — deferred safe-boundary interrupt.
+//
+// `toolFlightTracker` mirrors the session-event stream to know whether a
+// top-level tool call is open right now (an unsafe point to SIGINT). When the
+// `interrupt.safe_boundary` flag is on and a `!` lands mid-tool-call, we don't
+// fire the SIGINT — we stash the fully-built replacement inbound here and fire
+// it (SIGINT + deliver) at the next clean boundary (tool_result drains the
+// last open tool, or turn_end), or when the max-wait timer expires. Rapid
+// repeated `!` while one is pending coalesce: the latest body replaces the
+// stashed inbound, the original deadline is preserved (bounded wait).
+const toolFlightTracker = new ToolFlightTracker()
+
+interface PendingDeferredInterrupt {
+  agentName: string
+  inboundMsg: InboundMessage
+  chatId: string
+  msgId: number | null
+  threadId: number | undefined
+  registeredAt: number
+  deadlineTimer: ReturnType<typeof setTimeout>
+}
+let pendingDeferredInterrupt: PendingDeferredInterrupt | null = null
+
+/**
+ * Fire a stashed deferred interrupt: SIGINT the (now safely-bounded) turn via
+ * tmux, then deliver the replacement body as a fresh inbound — the same two
+ * primitives the synchronous `!` path uses, just gated on a clean boundary.
+ * Idempotent: nulls the slot and clears the timer before doing any work so a
+ * boundary event and the timeout can't double-fire.
+ */
+async function fireDeferredInterrupt(reason: 'boundary' | 'timeout'): Promise<void> {
+  const pending = pendingDeferredInterrupt
+  if (pending == null) return
+  pendingDeferredInterrupt = null
+  clearTimeout(pending.deadlineTimer)
+
+  const waitedMs = Date.now() - pending.registeredAt
+  process.stderr.write(
+    `telegram gateway: deferred-interrupt firing reason=${reason} agent=${pending.agentName} ` +
+    `chat=${pending.chatId} waited_ms=${waitedMs} in_flight=${toolFlightTracker.inFlightCount()}\n`,
+  )
+
+  try {
+    const { sendAgentInterrupt } = await import('../../src/agents/tmux.js')
+    const r = sendAgentInterrupt({ agentName: pending.agentName })
+    if ('ok' in r) {
+      process.stderr.write(
+        `telegram gateway: deferred-interrupt SIGINT delivered via tmux send-keys agent=${pending.agentName}\n`,
+      )
+    } else {
+      process.stderr.write(
+        `telegram gateway: deferred-interrupt SIGINT via tmux failed agent=${pending.agentName}: ${r.error}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: deferred-interrupt SIGINT failed: ${(err as Error).message}\n`)
+  }
+
+  // Deliver the replacement body as a fresh turn to the freshly-killed
+  // bridge — same sendToAgent + buffer-on-miss primitive the synchronous
+  // interrupt carve-out uses at the handleInbound delivery site.
+  const delivered = ipcServer.sendToAgent(pending.agentName, pending.inboundMsg)
+  if (delivered) {
+    markClaudeBusyForInbound(pending.inboundMsg)
+  } else {
+    pendingInboundBuffer.push(pending.agentName, pending.inboundMsg)
+    process.stderr.write(
+      `telegram gateway: deferred-interrupt body buffered (bridge miss) agent=${pending.agentName} chat=${pending.chatId}\n`,
+    )
+  }
+}
 
 // #549 fix — preamble suppression for the answer-stream path.
 //
@@ -4164,6 +4252,14 @@ const ipcServer: IpcServer = createIpcServer({
     const threadHint = msg.threadId != null ? String(msg.threadId) : undefined
     progressDriver?.ingest(ev, chatHint, threadHint)
     handleSessionEvent(ev)
+    // Problem B: keep the deferred-interrupt boundary tracker in lockstep with
+    // the session stream (tool_use opens, tool_result/turn_end close). If a `!`
+    // interrupt is parked waiting for a clean boundary and this event drains
+    // the last in-flight tool, fire it now rather than waiting out the timer.
+    toolFlightTracker.onEvent(ev)
+    if (pendingDeferredInterrupt != null && !toolFlightTracker.isMidToolCall()) {
+      void fireDeferredInterrupt('boundary')
+    }
     // #1122 silence-poke: surface activity signals from the session
     // stream so the 300s framework-fallback message wording is honest
     // (thinking vs working, plus the longest-running in-flight tool).
@@ -8890,18 +8986,32 @@ async function handleInbound(
   // unauthorized senders never reach this code (gate() above).
   // Interrupt requires the same trust as sending a normal message.
   const interrupt = parseInterruptMarker(text)
+  // Problem B: defer this `!`'s SIGINT to a safe boundary instead of firing it
+  // synchronously below. Set only when the `interrupt.safe_boundary` flag is on
+  // AND a top-level tool call is in flight AND the body is non-empty (an empty
+  // `!` is an explicit halt-now and stays immediate). When set, we skip the
+  // synchronous SIGINT here and stash the built inbound at the delivery site.
+  let deferInterrupt = false
   if (interrupt.isInterrupt) {
     const agentName = process.env.SWITCHROOM_AGENT_NAME
+    const access = loadAccess()
+    deferInterrupt =
+      !interrupt.emptyBody &&
+      decideInterruptTiming({
+        safeBoundaryEnabled: access.interruptSafeBoundary === true,
+        midToolCall: toolFlightTracker.isMidToolCall(),
+      }) === 'defer'
     process.stderr.write(
       `telegram gateway: interrupt-marker received chat_id=${chat_id} agent=${agentName ?? '-'} ` +
-      `body_len=${interrupt.body.length} empty=${interrupt.emptyBody}\n`,
+      `body_len=${interrupt.body.length} empty=${interrupt.emptyBody} defer=${deferInterrupt} ` +
+      `in_flight=${toolFlightTracker.inFlightCount()}\n`,
     )
     if (msgId != null) {
       void bot.api.setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: '⚡' as ReactionTypeEmoji['emoji'] },
       ]).catch(() => {})
     }
-    if (agentName) {
+    if (agentName && !deferInterrupt) {
       try {
         // The gateway runs INSIDE the agent container in docker mode,
         // so calling `interruptAgent` (which probes `docker inspect`
@@ -9811,6 +9921,40 @@ async function handleInbound(
   // line ~7357 already populated the Map for THIS inbound's turn;
   // reading the live size here would self-block (see the comment on
   // turnInFlightAtReceipt for the wedge symptom this fixes).
+  // Problem B: a deferred `!` interrupt. The synchronous SIGINT was skipped
+  // above (a tool was in flight) — claude is still working. Don't deliver the
+  // replacement body now (it would race the live tool); stash the fully-built
+  // inbound and let `fireDeferredInterrupt` SIGINT + deliver at the next clean
+  // boundary, or when the max-wait timer expires. Rapid repeated `!` coalesce:
+  // the latest body replaces the stashed inbound, the original deadline holds
+  // so the wait stays bounded.
+  if (deferInterrupt) {
+    const selfAgentDefer = process.env.SWITCHROOM_AGENT_NAME ?? ''
+    if (pendingDeferredInterrupt != null) {
+      pendingDeferredInterrupt.inboundMsg = inboundMsg
+      pendingDeferredInterrupt.msgId = msgId ?? null
+      process.stderr.write(
+        `telegram gateway: deferred-interrupt coalesced (replacing pending body) agent=${selfAgentDefer} chat=${chat_id} msg=${msgId ?? '-'}\n`,
+      )
+    } else {
+      const maxWaitMs = resolveInterruptMaxWaitMs(loadAccess().interruptMaxWaitMs)
+      pendingDeferredInterrupt = {
+        agentName: selfAgentDefer,
+        inboundMsg,
+        chatId: chat_id,
+        msgId: msgId ?? null,
+        threadId: messageThreadId ?? undefined,
+        registeredAt: Date.now(),
+        deadlineTimer: setTimeout(() => { void fireDeferredInterrupt('timeout') }, maxWaitMs),
+      }
+      process.stderr.write(
+        `telegram gateway: deferred-interrupt parked agent=${selfAgentDefer} chat=${chat_id} ` +
+        `msg=${msgId ?? '-'} max_wait_ms=${maxWaitMs} in_flight=${toolFlightTracker.inFlightCount()}\n`,
+      )
+    }
+    return
+  }
+
   if (
     decideInboundDelivery({
       turnInFlight: turnInFlightAtReceipt,

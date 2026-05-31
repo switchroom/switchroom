@@ -5387,6 +5387,18 @@ function buildAccessJson(
   if (typeof tg?.coalesce?.max_attachments === "number") {
     access.coalesceMaxAttachments = tg.coalesce.max_attachments;
   }
+  // Deferred-interrupt safe-boundary (Problem B). Default-off: when unset the
+  // gateway fires a `!` interrupt synchronously (historical behaviour). When
+  // true, a `!` that lands mid-tool-call waits for the in-flight tool to
+  // finish (bounded by interruptMaxWaitMs) before SIGINT + resume. The gateway
+  // reads both per-message via loadAccess(). Cascades from
+  // defaults.channels.telegram.interrupt.
+  if (typeof tg?.interrupt?.safe_boundary === "boolean") {
+    access.interruptSafeBoundary = tg.interrupt.safe_boundary;
+  }
+  if (typeof tg?.interrupt?.max_wait_ms === "number") {
+    access.interruptMaxWaitMs = tg.interrupt.max_wait_ms;
+  }
 
   return JSON.stringify(access, null, 2) + "\n";
 }

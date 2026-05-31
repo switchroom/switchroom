@@ -108,6 +108,35 @@ the agent then sees the primary attachment in the usual `image_path` /
 the cap spill into the next turn. Each attachment is downloaded before
 the turn starts, so a high cap on a slow link delays turn start.
 
+## Interrupt timing — safe-boundary `!`
+
+A `!`-prefix message interrupts the agent: it SIGINTs the in-flight turn
+and resumes with the replacement body as a fresh turn. By default the
+SIGINT fires the instant `!` is received — which can land **mid-tool-call**
+and `C-c` the agent partway through a `Write` or a `Bash`.
+
+Turn this on to defer the interrupt to a clean boundary:
+
+```yaml
+channels:
+  telegram:
+    interrupt:
+      safe_boundary: true    # default false; defer `!` until the in-flight tool finishes
+      max_wait_ms: 8000      # default; cap the wait so a long tool never ghosts you
+```
+
+When `safe_boundary` is on and a `!`-with-body arrives while a tool call
+is open, the gateway parks the interrupt (acked immediately with ⚡),
+waits for the tool to finish (`tool_result`) or the turn to end, then
+fires the SIGINT and delivers your replacement. If no tool is in flight
+the interrupt fires immediately — the deferral only kicks in at the
+unsafe moment. A bare `!` (halt-now, no replacement text) always fires
+immediately. Rapid repeated `!` while one is parked coalesce into a
+single interrupt carrying the latest body. The `max_wait_ms` cap fires
+the interrupt anyway if no boundary arrives in time. Cascades like every
+other `channels.telegram.*` knob; takes effect after `switchroom apply`
++ agent restart.
+
 ## Webhook ingest
 
 **What:** an external service (e.g. GitHub) POSTs events to

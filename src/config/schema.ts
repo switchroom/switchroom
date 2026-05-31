@@ -682,6 +682,41 @@ export const TelegramChannelSchema = z
         "into a single turn so a forwarded album or split paste doesn't fan out " +
         "into N separate turns. Cascades from defaults.channels.telegram.coalesce."
       ),
+    interrupt: z
+      .object({
+        safe_boundary: z
+          .boolean()
+          .optional()
+          .describe(
+            "When true, a `!`-prefix interrupt that arrives while the agent is " +
+            "mid-tool-call is DEFERRED: the SIGINT and the replacement turn wait " +
+            "until the in-flight tool call finishes (a clean boundary) instead of " +
+            "C-c'ing the agent mid-write/mid-bash. If no tool is in flight the " +
+            "interrupt still fires immediately. Bounded by max_wait_ms so a long " +
+            "tool never strands the user. Default false — the interrupt fires " +
+            "synchronously the moment `!` is received (historical behaviour). " +
+            "Rapid repeated `!` while one is pending coalesce into a single " +
+            "deferred interrupt carrying the latest body."
+          ),
+        max_wait_ms: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Upper bound (ms) the gateway waits for a safe boundary before firing " +
+            "a deferred `!` interrupt anyway. Only consulted when safe_boundary is " +
+            "true. Default 8000. Keep it short — the user explicitly asked to " +
+            "interrupt, so a long in-flight tool shouldn't ghost them; the cap " +
+            "trades a tiny risk of a mid-tool C-c for a guaranteed response."
+          ),
+      })
+      .optional()
+      .describe(
+        "Interrupt timing — how a `!`-prefix interrupt behaves when it lands " +
+        "mid-tool-call. Off by default (fire immediately). Cascades from " +
+        "defaults.channels.telegram.interrupt."
+      ),
     webhook_sources: z
       .array(z.enum(["github", "generic"]))
       .optional()
