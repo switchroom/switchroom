@@ -1,6 +1,57 @@
 # Changelog
 
-## v0.14.23 — git-lfs in the base agent image
+## v0.14.24 — Age-bound the boot-promotion (stale-handback hotfix)
+
+### PR — age-bound the boot-promotion so stale dead workers don't replay (#2032)
+
+Hotfix for a regression introduced by #2029 (shipped in v0.14.23). That
+change promoted **every** background-worker JSONL that was still in a
+`running` state at boot to live (`historical = false`), on the assumption
+that "running at boot = an in-flight worker whose handback the user is
+still awaiting across a restart." But a worker process that died in a
+prior session without writing its terminal `turn_end` line *also* sits
+permanently in `running` state, and these dead files accumulate by the
+hundred in a long-lived agent's `subagents/` directory. On the v0.14.23
+fleet rollout, every agent's boot scan promoted all of them and replayed
+weeks-old handbacks — many `failed`, from long-stale error lines — as
+fresh inbounds. Result: a fleet-wide spam of stale "worker failed"
+messages.
+
+The promotion is now gated on **file freshness**. At boot we only promote
+a `running` file to live if its mtime is within
+`inflightPromoteMaxAgeMs` (default **15 minutes**) — comfortably above a
+container-recreate + image-pull gap, far below the weeks-old staleness of
+a dead prior-session worker. Stale files take the "leaving historical"
+branch: no handback **and** no stall-synthesis (the historical guard in
+`checkStalls` already suppresses both). `entry.lastActivityAt` /
+`dispatchedAt` are both stamped `now` at boot registration and so carry no
+freshness signal — `fs.statSync(filePath).mtimeMs` is the only reliable
+per-file boot-time freshness signal, and is what the gate reads.
+
+A kill-switch ships alongside: `SWITCHROOM_SUBAGENT_BOOT_PROMOTE=0`
+disables boot-promotion entirely (every `running`-at-boot file stays
+historical), and `SWITCHROOM_SUBAGENT_INFLIGHT_MAX_AGE_MS` overrides the
+window. The fixed boot scan suppresses the stale files, so the rollout
+that carries this fix is itself clean.
+
+## v0.14.23 — git-lfs in the base agent image; background-worker handback gaps
+
+### PR — close two background-worker handback gaps (#2029)
+
+Two gaps in the background-worker handback path. **Gap 1:** a worker that
+was genuinely in-flight when the agent restarted was treated as
+`historical` by the boot scan and its handback was silently dropped, so a
+user who dispatched a long background task and then triggered (or rode
+through) a restart never got woken when it finished. The boot scan now
+promotes a `running`-at-boot worker to live so its `onFinish` handback
+fires. **Gap 2:** a worker that finished in a `failed` state produced the
+same generic "Worker done" handback as a success, giving the agent no
+signal to tell the user the task errored. The handback now carries an
+`errored` flag + `errorDetail`, and the outcome is rendered as
+`failed` / `orphan` / `completed`.
+
+> Note: Gap 1's unconditional promotion caused a stale-replay regression
+> on long-lived agents — see v0.14.24 (#2032) for the age-bound fix.
 
 ### PR — add git-lfs to the base agent image (#2030)
 
