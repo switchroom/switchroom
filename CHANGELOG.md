@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.14.31 — Broader secret coverage + inbound reliability
+
+A "stop missing secrets" upgrade (GitHub-scanner-style detection) plus two
+inbound-path reliability fixes.
+
+### Secret detection — two-part coverage upgrade
+
+- **High-precision provider ruleset (#2054).** ~30 curated, prefix-anchored
+  provider patterns (Stripe, SendGrid, GitLab, Hugging Face, Twilio,
+  DigitalOcean, Doppler, Linear, Shopify, Square, New Relic, Notion,
+  PlanetScale, Supabase, Atlassian, Dropbox, Databricks, Grafana, PyPI,
+  AWS-STS, GCP-OAuth, …) merged into the shared `detectSecrets` engine, so
+  they protect the inbound gate, the outbound mask, and the issues pipeline
+  at once. Prefixed-only → near-zero false positives (load-bearing: the
+  inbound gate auto-deletes on a high-confidence hit). Baked as TS (the
+  bundler doesn't ship the vendored `.toml`).
+- **Generic bare-high-entropy fallback (#2059).** The long-tail detector
+  for standalone tokens no prefix/KV rule matches (the Sanctum class).
+  Emitted at `ambiguous` confidence — it drives the inbound "stash to vault
+  or ignore?" ASK, and is excluded from `redact()` so it never masks agent
+  replies. Gate: charset `[A-Za-z0-9]` (separators excluded so identifiers
+  break up) + ≥1 digit + ≥18 distinct chars, which excludes hex/SHA/UUID/
+  digit-runs and dense CamelCase/snake_case identifiers by construction.
+
+### Inbound reliability
+
+- **Idle-session composer wedge (#2039).** Clear the claude TUI composer
+  (`tmux send-keys C-u C-a C-k`) before delivering an inbound, so stranded
+  typed-ahead text can't strand a fresh prompt. Soft-fails to delivery;
+  no-op on the happy path; orthogonal to the Telegram draft/answer-stream.
+- **NO_REPLY sentinel leak on cron turns (#2056).** Three guarded layers
+  (Stop-hook scan with a cron-scoped carve-out, gateway flush-gate skip,
+  PreToolUse reply guard) stop a `NO_REPLY`/`HEARTBEAT_OK` sentinel from
+  leaking into chat when a cron turn ends in `prose\nNO_REPLY`.
+
 ## v0.14.30 — "message me anytime" on the worker ticker
 
 After an agent delegates to a background worker and ends its turn, the
