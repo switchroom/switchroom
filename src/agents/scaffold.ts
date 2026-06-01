@@ -792,6 +792,31 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
 const WEBKITE_FLEET_DENY_TOOLS = ["WebFetch", "WebSearch"];
 
 /**
+ * Fleet-baseline deny for blocking interactive TUI tools.
+ *
+ * `AskUserQuestion` renders a *blocking* full-screen multiple-choice
+ * selector inside claude's TUI ("❯ 1. … · Enter to select · ↑/↓ to
+ * navigate · Esc to cancel"). Every switchroom agent is driven from
+ * Telegram with no human at the terminal, so that selector blocks
+ * forever — claude waits on a keystroke that never comes, the turn
+ * never completes, and queued inbounds pile up behind it until the
+ * agent looks mute (real incident: klanker wedged this way 2026-06-01,
+ * recovered only by a manual tmux `Esc`).
+ *
+ * Denying the tool is the root-cause fix, not a workaround: a denied
+ * `AskUserQuestion` does NOT crash the turn — claude degrades gracefully
+ * and asks the same question as plain text, which is exactly what we
+ * want (the question reaches the operator over Telegram instead of
+ * stalling at an invisible TUI).
+ *
+ * Unconditional (no per-agent opt-out knob): there is no fleet scenario
+ * where a headless, Telegram-driven agent benefits from a blocking
+ * terminal selector. A power-user who genuinely needs it can still
+ * re-enable via the `settings_raw` deep-merge escape hatch.
+ */
+const INTERACTIVE_TUI_FLEET_DENY_TOOLS = ["AskUserQuestion"];
+
+/**
  * In-container PATH location of the operator-mounted webkite binary
  * (compose.ts mounts `~/.switchroom/bin/webkite` here). Host-side
  * staging path is `~/.switchroom/bin/webkite`.
@@ -1953,6 +1978,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     toolsDeny: dedupe([
       ...(tools.deny ?? []),
       ...webkiteDenyForAgent(agentConfig),
+      ...INTERACTIVE_TUI_FLEET_DENY_TOOLS,
     ]),
     permissionAllow,
     defaultModeAcceptEdits: hasAllWildcard,
@@ -2703,6 +2729,22 @@ export function scaffoldAgent(
         if (!allow.includes(t)) allow.push(t);
       }
       settings.permissions.allow = allow;
+
+      // Fleet-baseline interactive-TUI deny must also re-seed into EXISTING
+      // agents on `switchroom apply` — writeIfMissing above skips the
+      // settings.json template for existing agents, so the fresh-path deny
+      // (buildWorkspaceContext.toolsDeny) never lands on a deployed agent.
+      // Additive so any user-declared or webkite denies already present are
+      // preserved. Without this, a deployed agent keeps rendering the
+      // blocking AskUserQuestion selector until it next goes through the
+      // reconcileAgent path. See INTERACTIVE_TUI_FLEET_DENY_TOOLS.
+      const deny: string[] = Array.isArray(settings.permissions.deny)
+        ? settings.permissions.deny
+        : [];
+      for (const t of INTERACTIVE_TUI_FLEET_DENY_TOOLS) {
+        if (!deny.includes(t)) deny.push(t);
+      }
+      settings.permissions.deny = deny;
 
       // #235: actively retract the legacy switchroom-mcp entry on reconcile
       // so existing agents stop spawning the dormant child process. The 4
@@ -4351,6 +4393,7 @@ export function reconcileAgent(
   const desiredDeny = dedupe([
     ...(tools.deny ?? []),
     ...webkiteDenyForAgent(agentConfig),
+    ...INTERACTIVE_TUI_FLEET_DENY_TOOLS,
   ]);
 
   // Resolve topic ID for the start.sh template and session greeting
