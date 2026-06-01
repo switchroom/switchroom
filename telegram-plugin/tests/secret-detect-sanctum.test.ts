@@ -56,6 +56,24 @@ describe('laravel/coolify sanctum token detection', () => {
     expect(hits.find((d) => d.rule_id === 'laravel_sanctum_token')?.matched_text).toBe(longTok)
   })
 
+  it('catches a token mid-sentence and masks only the token', () => {
+    const out = redact(`use ${SANCTUM} when deploying, ok?`)
+    expect(out).not.toContain(SANCTUM)
+    expect(out).toContain('use ')
+    expect(out).toContain(' when deploying, ok?')
+  })
+
+  it('catches multiple tokens in one message (redact right-to-left loop)', () => {
+    const second = `88|${'mK2pR7vT4x'.repeat(4)}` // distinct <id>|<40 base62>
+    const detected = detectSecrets(`old ${SANCTUM} new ${second}`)
+      .filter((d) => d.rule_id === 'laravel_sanctum_token')
+    expect(detected).toHaveLength(2)
+    const out = redact(`old ${SANCTUM} new ${second}`)
+    expect(out).not.toContain(SANCTUM)
+    expect(out).not.toContain(second)
+    expect(out).not.toContain(BODY40)
+  })
+
   describe('false-positive guards', () => {
     it('does NOT match a pipe-joined value under the 40-char floor', () => {
       const short = `1|${'abcDEF123'}` // 9 chars after the pipe
