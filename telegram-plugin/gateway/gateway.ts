@@ -10085,6 +10085,33 @@ async function handleInbound(
     return
   }
 
+  // Pre-send composer clear (the marko wedge). The inbound is about to be
+  // delivered as an MCP `notifications/claude/channel` notification, which
+  // the unmodified CLI appends into its composer and auto-submits ONLY when
+  // the composer is empty + idle. The #1556 gate above guarantees idle, but
+  // NOT empty: stale typed-ahead / ghost text stranded in the composer
+  // (observed live on agent `marko`: "Yes, go ahead on both") makes the
+  // appended inbound fail to submit and silently swallows every subsequent
+  // queued inbound until a hard restart. Wipe the composer first so the
+  // notification lands at a clean line. Soft-fail by contract — a clear
+  // failure (no tmux session under legacy_pty, socket missing, timeout)
+  // must NEVER block delivery; log and proceed.
+  if (selfAgent) {
+    try {
+      const { clearAgentComposer } = await import('../../src/agents/tmux.js')
+      const cleared = clearAgentComposer({ agentName: selfAgent })
+      if ('error' in cleared) {
+        process.stderr.write(
+          `telegram gateway: pre-send composer-clear soft-failed agent=${selfAgent}: ${cleared.error} — delivering anyway\n`,
+        )
+      }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: pre-send composer-clear threw agent=${selfAgent}: ${(err as Error).message} — delivering anyway\n`,
+      )
+    }
+  }
+
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
   if (delivered) markClaudeBusyForInbound(inboundMsg)
   if (!delivered) {
