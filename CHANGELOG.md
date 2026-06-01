@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.14.29 — Worker cards finish, the 👍 waits for them
+
+Two bugs in the native Telegram background-worker progress card (shipped
+v0.14.27): once a background `Agent` worker finished, the parent agent's
+done-reaction fired prematurely on the original request, and the worker
+card hung at `running` for ~9 minutes before terminalising. Both are now
+bound to authoritative completion signals.
+
+### Worker completion (#2051)
+
+- **Authoritative early terminal.** A background worker's JSONL on claude
+  ≥2.1.156 never writes the `system/turn_duration` line the card relied on
+  for `sub_agent_turn_end`, so the card only terminalised via the ~9-minute
+  silent-stall synthesis. The session-tail projector now emits
+  `sub_agent_turn_end` the moment the worker's final assistant message
+  carries `stop_reason === 'end_turn'` — emitted after the summary text so
+  the card renders the result, and a no-op if a later real `turn_duration`
+  arrives (the watcher's handler is guarded on `state === 'running'`).
+- **Deferred 👍 reads the dispatch-time DB, not the lagging registry.** The
+  done-reaction gate counted running workers from the file-discovery
+  in-memory registry, which lags dispatch by a poll/fswatch tick. With the
+  ack-first pattern (reply "On it" → dispatch worker → end turn), the
+  parent turn-end fired before the worker was registered → count 0 → the
+  👍 promoted immediately on an incomplete request. The gate now reads the
+  registry DB, where `recordSubagentStart` inserts the row the instant the
+  `Agent` tool_use fires (before turn-end).
+- **`stalled` rows don't wedge the gate.** `countRunningBackgroundSubagents`
+  counts `status = 'running'` only. A `stalled` row is the reaper's sink for
+  an orphaned dispatch (row inserted, JSONL never linked) and is never
+  terminalised — counting it would hold the 👍 forever. A live-but-quiet
+  worker reaches `completed` via the watcher's terminal paths long before
+  the 1h reaper, and a stalled row that genuinely resumes is flipped back to
+  `running`, so excluding `stalled` never releases the 👍 on a merely-paused
+  worker.
+
 ## v0.14.28 — Secrets never leave the box in plaintext
 
 A secret-handling hardening release. A live Coolify/Laravel Sanctum API
