@@ -44,6 +44,38 @@ const FINAL_ANSWER_MIN_CHARS = 200
 const SILENT_MARKER_RE = /^(NO_REPLY|HEARTBEAT_OK)[\s.!?]*$/i
 
 /**
+ * True when `text`'s final non-empty line is a bare silent marker
+ * (NO_REPLY / HEARTBEAT_OK + optional trailing punctuation), regardless
+ * of what precedes it. Closes #2053: a turn that emits prose then a
+ * trailing bare `NO_REPLY` line is the model explicitly signalling
+ * "intentionally silent". The anchored `SILENT_MARKER_RE` only matches
+ * when the ENTIRE trimmed output is the bare marker, so prose+NO_REPLY
+ * slipped through → the hook blocked → nag loop → sentinel leak.
+ *
+ * Approximately mirrors `turn-flush-safety.ts:endsWithSilentMarker` (TS
+ * gateway side). NOT byte-identical: this .mjs uses `SILENT_MARKER_RE`
+ * directly (no length cap, unlimited trailing punctuation), whereas the
+ * TS side delegates to `isSilentFlushMarker` (length-capped, single
+ * trailing punct). This side is intentionally the more permissive of the
+ * two; the divergence is benign in direction — both suppress the common
+ * `prose\nNO_REPLY` shape, and the extra leniency here only ever
+ * suppresses MORE (never leaks, never wrongly silences a user-awaited
+ * reply, which is gated separately).
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function endsWithSilentMarker(text) {
+  if (typeof text !== 'string') return false
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+  if (lines.length === 0) return false
+  return SILENT_MARKER_RE.test(lines[lines.length - 1])
+}
+
+/**
  * Predicate ported from `telegram-plugin/final-answer-detect.ts:78-83`.
  * Kept in this .mjs so the hook is fully self-contained (no TS import).
  * If the TS file ever diverges, the test fixture below (T14) catches it.
@@ -69,13 +101,15 @@ export function isFinalAnswerReply({ text, disableNotification, done }) {
  * @returns {{ chatId: string | null, threadId: number | null }}
  */
 function parseChannelEnvelope(content) {
-  if (typeof content !== 'string') return { chatId: null, threadId: null }
+  if (typeof content !== 'string') return { chatId: null, threadId: null, source: null }
   const chatMatch = content.match(/chat_id="([^"]+)"/)
   const threadMatch = content.match(/message_thread_id="([^"]+)"/)
+  const sourceMatch = content.match(/<channel[^>]*\bsource="([^"]+)"/)
   const threadRaw = threadMatch ? Number(threadMatch[1]) : NaN
   return {
     chatId: chatMatch ? chatMatch[1] : null,
     threadId: Number.isFinite(threadRaw) && threadRaw !== 0 ? threadRaw : null,
+    source: sourceMatch ? sourceMatch[1] : null,
   }
 }
 
@@ -128,7 +162,7 @@ export function scanTurnForFinalReply(jsonl) {
 
   // 1. Walk backward to most-recent queue-operation/enqueue.
   let startIdx = -1
-  let envelope = { chatId: null, threadId: null }
+  let envelope = { chatId: null, threadId: null, source: null }
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]
     if (!line || line[0] !== '{') continue
@@ -159,15 +193,27 @@ export function scanTurnForFinalReply(jsonl) {
     const content = obj?.message?.content
     if (!Array.isArray(content)) continue
     for (const c of content) {
+      // Plain assistant text carve-out (#2053): a turn that ends with a
+      // trailing bare NO_REPLY / HEARTBEAT_OK line — emitted as plain
+      // transcript text, NOT through the reply tool — is the model
+      // explicitly signalling "intentionally silent". The anchored
+      // SILENT_MARKER_RE below only fires when the ENTIRE reply-tool
+      // text is the bare marker, so a plain-text prose+NO_REPLY turn
+      // matched nothing here → block → nag → sentinel leak. Treat a
+      // trailing-marker text block as a valid silent end.
+      if (c?.type === 'text' && endsWithSilentMarker(String(c.text ?? ''))) {
+        return { decided: 'allow', reason: 'silent-marker-text' }
+      }
       if (c?.type !== 'tool_use') continue
       if (!REPLY_TOOLS.has(c.name)) continue
       const input = c.input ?? {}
       const text = String(input.text ?? '')
       // Silent-marker carve-out: the operator explicitly signaled
       // "intentionally silent" (cron HEARTBEAT_OK, model-driven
-      // NO_REPLY). Don't block — same posture as the gateway's
-      // silent-marker suppression at gateway.ts:6692.
-      if (SILENT_MARKER_RE.test(text.trim())) {
+      // NO_REPLY). Accept both the whole-text bare marker and the
+      // prose+trailing-marker shape (#2053). Same posture as the
+      // gateway's silent-marker suppression at gateway.ts:6692.
+      if (SILENT_MARKER_RE.test(text.trim()) || endsWithSilentMarker(text)) {
         return { decided: 'allow', reason: 'silent-marker' }
       }
       if (isFinalAnswerReply({
@@ -178,6 +224,16 @@ export function scanTurnForFinalReply(jsonl) {
         return { decided: 'allow', reason: 'final-reply' }
       }
     }
+  }
+
+  // Cron-fired turns (#2053): a scheduled turn that produced no
+  // qualifying reply is NOT a delivery failure the user is waiting on —
+  // nagging it only pushes the model to escape the loop by shoving a
+  // NO_REPLY sentinel through the reply tool, which leaks to chat. A
+  // cron turn that genuinely needs to speak will have called reply
+  // (caught above); otherwise let it end silently.
+  if (envelope.source === 'cron') {
+    return { decided: 'allow', reason: 'cron-source' }
   }
 
   const block = { decided: 'block', reason: 'no-final-reply' }

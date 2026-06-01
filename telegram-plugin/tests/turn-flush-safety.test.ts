@@ -18,6 +18,7 @@ import {
   decideTurnFlush,
   isSilentFlushMarker,
   isCompositeSilentNoise,
+  endsWithSilentMarker,
   isTurnFlushSafetyEnabled,
 } from '../turn-flush-safety.js'
 
@@ -63,6 +64,46 @@ describe('decideTurnFlush — composite silent noise is skipped, not leaked', ()
       chatId: '12345',
       replyCalled: false,
       capturedText: ['The page summarises three news stories.'],
+    })
+    expect(d.kind).toBe('flush')
+  })
+})
+
+describe('endsWithSilentMarker — prose+trailing-sentinel recognition (#2053)', () => {
+  it('recognises prose followed by a trailing bare NO_REPLY line', () => {
+    expect(endsWithSilentMarker('Nothing actionable in the digest.\nNO_REPLY')).toBe(true)
+    expect(endsWithSilentMarker('Build is green.\nHEARTBEAT_OK')).toBe(true)
+  })
+  it('tolerates a single trailing punctuation on the marker', () => {
+    expect(endsWithSilentMarker('done.\nNO_REPLY.')).toBe(true)
+  })
+  it('does NOT match when real content follows the marker', () => {
+    expect(endsWithSilentMarker('NO_REPLY\nThe answer is 42.')).toBe(false)
+  })
+  it('does NOT match a marker mentioned inside genuine prose', () => {
+    expect(endsWithSilentMarker('reply with exactly NO_REPLY when nothing to add')).toBe(false)
+  })
+  it('handles non-strings / empty safely', () => {
+    expect(endsWithSilentMarker(undefined)).toBe(false)
+    expect(endsWithSilentMarker('')).toBe(false)
+    expect(endsWithSilentMarker('  \n  ')).toBe(false)
+  })
+})
+
+describe('decideTurnFlush — prose+trailing-sentinel is suppressed, not leaked (#2053)', () => {
+  it('skips a cron-style "prose\\nNO_REPLY" blob (the #2053 leak)', () => {
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: ['Reviewed the overnight digest — nothing needs your attention.', 'NO_REPLY'],
+    })
+    expect(d).toEqual({ kind: 'skip', reason: 'silent-marker' })
+  })
+  it('still flushes a real answer whose last line is NOT a sentinel', () => {
+    const d = decideTurnFlush({
+      chatId: '12345',
+      replyCalled: false,
+      capturedText: ['Here is the summary.', 'Three stories, all low priority.'],
     })
     expect(d.kind).toBe('flush')
   })

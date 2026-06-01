@@ -92,6 +92,42 @@ export function isCompositeSilentNoise(text: string | undefined): boolean {
   return lines.every(l => isSilentFlushMarker(l) || isTrivialConfirmationLine(l))
 }
 
+/**
+ * Recognise output whose final non-empty line is a bare silent marker
+ * (NO_REPLY / HEARTBEAT_OK, with the same single-trailing-punctuation
+ * tolerance as `isSilentFlushMarker`), regardless of what precedes it.
+ *
+ * This closes #2053: a turn (commonly a cron turn) that emits prose
+ * followed by a bare `NO_REPLY` line — e.g.
+ *   "Nothing actionable in today's digest.\nNO_REPLY"
+ * — is the model explicitly signalling "intentionally silent". The
+ * single-line `isSilentFlushMarker` misses it (multi-line, over the
+ * length guard) and `isCompositeSilentNoise` misses it too (the prose
+ * line is neither a marker nor a trivial confirmation), so the blob
+ * would otherwise flush to chat WITH the sentinel text appended.
+ *
+ * The trailing-marker line itself is the explicit silence signal — when
+ * the model deliberately terminates with NO_REPLY it means "do not
+ * deliver this turn", so we suppress the whole blob rather than strip
+ * the sentinel and flush the prose. Stripping-and-flushing would defeat
+ * the model's intent (it chose silence) and re-introduce the exact
+ * surprise-message problem the flush safety net was built to avoid.
+ *
+ * Requires the LAST line to be the marker — a marker buried mid-output
+ * with real content after it (e.g. "NO_REPLY\nThe answer is 42.") is
+ * NOT suppressed, because the trailing content is the model's actual
+ * message.
+ */
+export function endsWithSilentMarker(text: string | undefined): boolean {
+  if (typeof text !== 'string') return false
+  const lines = text
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+  if (lines.length === 0) return false
+  return isSilentFlushMarker(lines[lines.length - 1])
+}
+
 export type FlushDecision =
   | { kind: 'flush'; text: string }
   | { kind: 'skip'; reason: FlushSkipReason }
@@ -162,6 +198,11 @@ export function decideTurnFlush(input: FlushDecisionInput): FlushDecision {
   // misses it (multi-line, over the length guard); without this the blob
   // leaks to chat as a visible message.
   if (isCompositeSilentNoise(joined)) return { kind: 'skip', reason: 'silent-marker' }
+  // Prose followed by a trailing bare NO_REPLY / HEARTBEAT_OK line (#2053).
+  // The model wrote content but explicitly terminated with the silence
+  // sentinel — treat the whole turn as intentionally silent rather than
+  // flush the prose with the sentinel glued on.
+  if (endsWithSilentMarker(joined)) return { kind: 'skip', reason: 'silent-marker' }
   return { kind: 'flush', text: joined }
 }
 

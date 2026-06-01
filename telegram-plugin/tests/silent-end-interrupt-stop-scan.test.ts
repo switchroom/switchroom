@@ -22,6 +22,7 @@ import { describe, it, expect } from 'vitest'
 import {
   scanTurnForFinalReply,
   isFinalAnswerReply,
+  endsWithSilentMarker,
 } from '../hooks/silent-end-scan.mjs'
 
 // ── Fixture builders ────────────────────────────────────────────────
@@ -30,6 +31,13 @@ const ENQUEUE = JSON.stringify({
   type: 'queue-operation',
   operation: 'enqueue',
   content: '<channel source="switchroom-telegram" chat_id="111" message_id="42">hi</channel>',
+})
+
+// Cron-fired turn: the enqueue envelope carries `source="cron"` (#2053).
+const ENQUEUE_CRON = JSON.stringify({
+  type: 'queue-operation',
+  operation: 'enqueue',
+  content: '<channel source="cron" chat_id="111" message_thread_id="7">Time for the digest</channel>',
 })
 
 function assistantToolUse(name: string, input: Record<string, unknown>, opts: { isSidechain?: boolean } = {}) {
@@ -308,6 +316,116 @@ describe('scanTurnForFinalReply — malformed input tolerance', () => {
       ENQUEUE,
       JSON.stringify({ type: 'assistant', message: { content: null } }),
       JSON.stringify({ type: 'assistant', message: { content: 'a string somehow' } }),
+    )
+    expect(scanTurnForFinalReply(text).decided).toBe('block')
+  })
+})
+
+// ── #2053 — endsWithSilentMarker helper ─────────────────────────────
+
+describe('endsWithSilentMarker (#2053)', () => {
+  it('bare marker (whole string) → true', () => {
+    expect(endsWithSilentMarker('NO_REPLY')).toBe(true)
+    expect(endsWithSilentMarker('HEARTBEAT_OK')).toBe(true)
+  })
+  it('prose then trailing bare NO_REPLY → true', () => {
+    expect(endsWithSilentMarker('Nothing actionable in the digest today.\nNO_REPLY')).toBe(true)
+    expect(endsWithSilentMarker('Long\nmulti-line\nsummary.\nHEARTBEAT_OK')).toBe(true)
+  })
+  it('trailing marker with stray punctuation → true', () => {
+    expect(endsWithSilentMarker('done reviewing.\nNO_REPLY.')).toBe(true)
+  })
+  it('marker buried mid-output with real content after → false', () => {
+    expect(endsWithSilentMarker('NO_REPLY\nThe answer is 42.')).toBe(false)
+  })
+  // Documents the intentional divergence from the TS-side helper: this
+  // .mjs uses SILENT_MARKER_RE directly (unlimited trailing punctuation),
+  // whereas turn-flush-safety.ts delegates to the length-capped,
+  // single-punct isSilentFlushMarker. This side is deliberately the more
+  // permissive of the two — extra leniency only ever suppresses more.
+  it('trailing marker with multiple punctuation chars → true (more permissive than TS side)', () => {
+    expect(endsWithSilentMarker('all quiet.\nNO_REPLY...')).toBe(true)
+    expect(endsWithSilentMarker('NO_REPLY!!!')).toBe(true)
+    expect(endsWithSilentMarker('NO_REPLY?!')).toBe(true)
+  })
+  it('genuine prose mentioning NO_REPLY as a substring → false', () => {
+    expect(endsWithSilentMarker('reply with exactly NO_REPLY if there is nothing to add')).toBe(false)
+  })
+  it('non-strings / empty → false', () => {
+    expect(endsWithSilentMarker(undefined)).toBe(false)
+    expect(endsWithSilentMarker('')).toBe(false)
+    expect(endsWithSilentMarker('   \n  ')).toBe(false)
+  })
+})
+
+// ── #2053 — prose-then-trailing-NO_REPLY recognised as silent ───────
+
+describe('scanTurnForFinalReply — trailing NO_REPLY is a valid silent end (#2053)', () => {
+  it('(a) plain assistant TEXT ending with a trailing bare NO_REPLY → allow', () => {
+    // The exact #2053 leak shape: the model wrote prose then a bare
+    // NO_REPLY as plain transcript text (NOT through the reply tool).
+    // Pre-fix this matched nothing → block → nag → sentinel leak.
+    const text = jsonl(
+      ENQUEUE,
+      assistantText("Reviewed the overnight digest — nothing needs your attention.\nNO_REPLY"),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('silent-marker-text')
+  })
+
+  it('reply-tool payload of prose+trailing NO_REPLY → allow (silent-marker)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'Checked the build — all green.\nNO_REPLY',
+        disable_notification: true,
+      }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('silent-marker')
+  })
+
+  it('plain text NOT ending with a marker → still block', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('Here is my real answer that I forgot to send via the reply tool.'),
+    )
+    expect(scanTurnForFinalReply(text).decided).toBe('block')
+  })
+})
+
+// ── #2053 — cron-source turns skip the nag ──────────────────────────
+
+describe('scanTurnForFinalReply — cron-source turns skip the nag (#2053)', () => {
+  it('(b) cron turn with no qualifying reply → allow (cron-source), not block', () => {
+    const text = jsonl(
+      ENQUEUE_CRON,
+      assistantText('Ran the scheduled check. Nothing to report.'),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('cron-source')
+  })
+
+  it('cron turn that DID send a real reply → allow (final-reply), reply still wins', () => {
+    const text = jsonl(
+      ENQUEUE_CRON,
+      assistantToolUse('mcp__switchroom-telegram__reply', {
+        text: 'Daily digest: 3 PRs merged, 1 incident.',
+        disable_notification: false,
+      }),
+    )
+    const r = scanTurnForFinalReply(text)
+    expect(r.decided).toBe('allow')
+    expect(r.reason).toBe('final-reply')
+  })
+
+  it('non-cron (telegram) turn with no reply → still blocks (cron carve-out scoped)', () => {
+    const text = jsonl(
+      ENQUEUE,
+      assistantText('I forgot to send my answer.'),
     )
     expect(scanTurnForFinalReply(text).decided).toBe('block')
   })
