@@ -50,7 +50,16 @@ export function redact(text: string): string {
   const urlScrubbed = redactUrls(text)
 
   // Step 2 — token shape detection over the URL-scrubbed text.
-  const hits: Detection[] = detectSecrets(urlScrubbed)
+  // EXCLUDE the generic high-entropy fallback: it is a low-precision
+  // "looks like a secret" signal (it flags dense technical identifiers —
+  // CamelCase class names, snake_case symbols, npm paths, slugs — as well
+  // as real tokens). It exists to drive the inbound "stash to vault or
+  // ignore?" ASK prompt, NOT to silently mask. Letting it into redact()
+  // would corrupt agent replies (the outbound mask) and stored messages.
+  // Only prefix/structured (high) + the contextual kv_entropy hits mask.
+  const hits: Detection[] = detectSecrets(urlScrubbed).filter(
+    (h) => h.rule_id !== 'generic_high_entropy',
+  )
   if (hits.length === 0) return urlScrubbed
 
   // Apply replacements right-to-left so byte offsets stay valid.

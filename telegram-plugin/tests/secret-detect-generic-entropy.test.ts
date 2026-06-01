@@ -62,6 +62,17 @@ describe('generic high-entropy detector', () => {
       ['a long digit run', '123456789012345678901234567890'],
       ['plain prose', 'the quick brown fox jumps over the lazy dog repeatedly today'],
       ['a file path', '/usr/local/lib/python3.11/site-packages/somepackage/internal/module.py'],
+      // Dense technical identifiers — the FP shapes the reviewer flagged.
+      // CamelCase-no-digit → killed by the digit requirement; separator
+      // styles (snake/kebab/npm/slug) → broken into sub-28 runs by the
+      // charset (no `_ - / .`).
+      ['a CamelCase class name', 'AbstractSingletonProxyFactoryBeanGenerator'],
+      ['a snake_case symbol', 'get_user_profile_by_organization_identifier'],
+      ['a kebab-case slug', 'how-to-configure-kubernetes-ingress-with-cert-manager'],
+      ['an npm package path', '@babel/plugin-transform-modules-commonjs'],
+      ['a CSS class string (has a digit)', 'flex-row-justify-between-items-center-gap-4'],
+      ['a long CamelCase phrase', 'TheQuickBrownFoxJumpsOverTheLazyDogToday'],
+      ['a 32-char base62 with NO digit', 'AbcdefGhijkLmnopQrstuVwxyzABCDEFG'],
     ]
     for (const [label, text] of BENIGN) {
       it(`${label} does not flag generic_high_entropy`, () => {

@@ -180,24 +180,28 @@ function dedupeRaw(raw: RawHit[]): RawHit[] {
 }
 
 /**
- * Drop hits fully contained inside another hit. Keeps the outer (typically
- * broader / higher-signal) hit — e.g. a JWT match wholly inside an
- * Authorization Bearer match keeps the Bearer.
+ * Drop an AMBIGUOUS hit that is fully contained inside another (larger)
+ * hit — e.g. a `generic_high_entropy` sub-span sitting inside a recognized
+ * high token, or inside an Authorization Bearer match. Narrow by design:
+ * it never drops a high-confidence hit and never touches high-vs-high
+ * overlaps, so it can't suppress a real detection — it only removes the
+ * redundant low-precision sub-spans the generic fallback can emit.
  */
 function dropOverlaps(hits: RawHit[]): RawHit[] {
-  const sorted = [...hits].sort((a, b) => (a.end - a.start) - (b.end - b.start))
-  const out: RawHit[] = []
-  for (const h of sorted) {
-    const contained = out.some(
-      (existing) =>
-        existing !== h &&
-        existing.start <= h.start &&
-        existing.end >= h.end &&
-        !(existing.start === h.start && existing.end === h.end),
-    )
-    if (!contained) out.push(h)
-  }
-  // Re-sort by start offset for deterministic downstream handling.
+  const out = hits.filter(
+    (h) =>
+      !(
+        h.confidence === 'ambiguous' &&
+        hits.some(
+          (o) =>
+            o !== h &&
+            o.start <= h.start &&
+            o.end >= h.end &&
+            !(o.start === h.start && o.end === h.end),
+        )
+      ),
+  )
+  // Sort by start offset for deterministic downstream handling.
   out.sort((a, b) => a.start - b.start || a.end - b.end)
   return out
 }
