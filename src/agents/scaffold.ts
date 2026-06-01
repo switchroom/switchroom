@@ -263,6 +263,31 @@ false\` in that agent's switchroom.yaml block — webkite goes away
 and the native tools come back together.`;
 
 /**
+ * Vault key discovery. One of the fleet invariant blocks. Stops the
+ * single most common vault failure: an agent GUESSING a secret's key
+ * name (\`postiz/api-key\`) when it already holds the real one
+ * (\`marko/postiz-api-key\`), then burning an operator approval on a
+ * \`vault_request_access\` for a key that doesn't exist.
+ * See SANDBOX_GUIDANCE above for the constant-vs-\`.hbs\` rationale.
+ */
+const VAULT_GUIDANCE = `## Secrets in the vault — discover, don't guess
+
+Your API keys and credentials live in the Switchroom vault. For normal
+MCP-tool work they're injected by the launchers and you never touch the
+raw values. When a task needs a secret directly (a direct API call an
+MCP tool has no verb for), read it with \`switchroom vault get <key>\`.
+
+**Never guess a key name.** Run \`switchroom vault list\` to see the
+exact keys you already hold — they're usually namespaced \`<you>/...\`
+(e.g. \`marko/postiz-api-key\`, not \`postiz/api-key\`). Use the real
+name from that list.
+
+Only call the \`vault_request_access\` MCP tool — which pings the
+operator for a Telegram approval — for a key you've **confirmed via
+\`vault list\` you don't already have.** Requesting access to a guessed
+or already-held key wastes the operator's tap and fails.`;
+
+/**
  * Canonical rendering of the fleet invariants file written to
  * `~/.switchroom/fleet/switchroom-invariants.md`. Apply checksums
  * this against the on-disk file and restores on drift. Operators
@@ -296,6 +321,8 @@ export function renderFleetInvariants(): string {
     MEMORY_GUIDANCE,
     "",
     WEB_FETCH_GUIDANCE,
+    "",
+    VAULT_GUIDANCE,
     "",
   ].join("\n");
 }
