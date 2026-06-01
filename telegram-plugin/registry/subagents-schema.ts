@@ -371,14 +371,25 @@ export function getSubagentByJsonlId(db: SqliteDatabase, jsonlAgentId: string): 
  * snapshotting the file-discovery registry (which lags dispatch by a poll/fswatch
  * tick and so missed just-dispatched workers — the premature-👍 race).
  *
- * `stalled` counts as still-running: a stalled worker isn't done. Genuinely
- * dead rows are swept to a terminal status by the reaper (`reapStuckRunning`),
- * so this can't get wedged above zero forever.
+ * Counts `running` ONLY — `stalled` is deliberately excluded. `stalled` is NOT
+ * a terminal status: the reaper (`reapStuckRunningRows`) transitions a row to
+ * `stalled`, never to `completed`/`failed`. A genuinely-orphaned background row
+ * — one INSERTed at dispatch whose JSONL was never linked, so no activity ever
+ * bumped it and the in-memory silent-stall synthesis never terminalised it —
+ * sits in `stalled` indefinitely (the 1h reaper TTL is the only thing that
+ * moves it off `running`). Counting `stalled` would wedge the deferred 👍 above
+ * zero forever for that row (`reaction-defer.ts` `promote()` bails while the
+ * count is > 0). A live-but-quiet worker, by contrast, is driven to `completed`
+ * by the watcher's terminal paths (end_turn signal OR silent-stall synthesis,
+ * both call `recordSubagentEnd`) long before the 1h reaper, and a stalled row
+ * that genuinely resumes is flipped back to `running` by `recordSubagentResume`
+ * — so excluding `stalled` never releases the 👍 on a worker that's merely
+ * paused rather than dead.
  */
 export function countRunningBackgroundSubagents(db: SqliteDatabase): number {
   const row = db
     .prepare(
-      "SELECT count(*) AS n FROM subagents WHERE background = 1 AND status IN ('running', 'stalled')",
+      "SELECT count(*) AS n FROM subagents WHERE background = 1 AND status = 'running'",
     )
     .get() as { n: number } | undefined
   return row?.n ?? 0

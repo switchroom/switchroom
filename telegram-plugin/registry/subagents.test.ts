@@ -199,10 +199,46 @@ describe('countRunningBackgroundSubagents', () => {
     db.close()
   })
 
-  it('still counts a stalled worker (stalled is not done)', () => {
+  it('does NOT count a stalled worker — stalled is the reaper sink, never terminalised', () => {
+    // A `stalled` row is NOT terminal and is NOT actively running. The only
+    // way a background row reaches `stalled` is the 1h reaper firing on a row
+    // that never linked a JSONL (no activity bumps, no silent-stall synthesis
+    // to drive it to `completed`) — i.e. an orphaned/dead dispatch. Counting it
+    // would wedge the deferred 👍 above zero forever (promote() bails while the
+    // count is > 0). A live-but-quiet worker terminalises to `completed` long
+    // before the reaper, so `stalled` always means "dead" here.
     const db = openFreshSubagentsDbInMemory()
     recordSubagentStart(db, { id: 'bg-2', background: true, startedAt: 1000 })
     recordSubagentStall(db, { id: 'bg-2', stalledAt: 1500 })
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
+    db.close()
+  })
+
+  it('a row reaped to stalled does not keep the gate above zero (permanent-👍-hold regression guard)', () => {
+    // Regression guard for the orphaned-dispatch wedge: dispatch inserts a
+    // `running` row, the JSONL never links, and the reaper transitions it to
+    // `stalled`. The deferred-👍 gate must read zero so promote() can fire —
+    // counting the reaped row would hold the 👍 forever.
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'bg-orphan', background: true, startedAt: 1000 })
+    expect(countRunningBackgroundSubagents(db)).toBe(1)
+    const result = reapStuckRunningRows(db, { ttlMs: 500, now: 5000 })
+    expect(result.reaped).toBe(1)
+    expect(getSubagent(db, 'bg-orphan')!.status).toBe('stalled')
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
+    db.close()
+  })
+
+  it('re-counts a stalled worker that resumes — recordSubagentResume flips it back to running', () => {
+    // A worker that's merely paused (not dead) and resumes JSONL activity is
+    // flipped stalled → running by recordSubagentResume, so the gate holds the
+    // 👍 again. Excluding `stalled` from the count never releases the 👍 on a
+    // worker that's only paused.
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'bg-resume', background: true, startedAt: 1000 })
+    recordSubagentStall(db, { id: 'bg-resume', stalledAt: 1500 })
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
+    recordSubagentResume(db, { id: 'bg-resume', resumedAt: 2000 })
     expect(countRunningBackgroundSubagents(db)).toBe(1)
     db.close()
   })
