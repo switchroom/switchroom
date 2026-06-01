@@ -105,12 +105,18 @@ describe("broker mint_grant attest_via_posture", () => {
   let audit: AuditEntry[] = [];
   let prevNonLinuxFlag: string | undefined;
   let prevNodeEnv: string | undefined;
+  let prevReqOpFlag: string | undefined;
 
   beforeEach(() => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
     process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
     prevNodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = "test";
+    // Hard-boundary mint gate (RFC vault-approval-hard-boundary) is default
+    // OFF; ensure it's off for every test except the one that opts in, so
+    // the existing posture happy-path stays green (proves backward-compat).
+    prevReqOpFlag = process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
+    delete process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-mint-posture-"));
     socketPath = path.join(tmpDir, "test.sock");
     audit = [];
@@ -124,6 +130,8 @@ describe("broker mint_grant attest_via_posture", () => {
     else process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
     if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prevNodeEnv;
+    if (prevReqOpFlag === undefined) delete process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
+    else process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT = prevReqOpFlag;
   });
 
   function makeBroker(opts: {
@@ -179,6 +187,47 @@ describe("broker mint_grant attest_via_posture", () => {
       (e) => e.op === "mint_grant" && e.result === "allowed:posture-attested" && e.method === "posture",
     );
     expect(allowed, "audit row with method=posture must be written when the gate accepts").toBeDefined();
+  });
+
+  // ── Hard-boundary gate (RFC vault-approval-hard-boundary) ──────────────
+  // With SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT=1, a posture-attested mint
+  // (forgeable — claude shares the per-agent socket) must reference an
+  // operator-verified kernel decision (origin='operator'). Without one →
+  // DENIED. (The positive path — a real origin='operator' decision lets the
+  // mint through — is unit-tested via isOperatorVerifiedDecision in
+  // approval-origin.test.ts and is exercised end-to-end in PR ② once the
+  // host verifier produces such decisions.)
+  it("flag ON + no operator-verified decision → DENIED (posture alone is forgeable)", async () => {
+    process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT = "1";
+    broker = makeBroker({
+      config: makeTelegramIdConfig(),
+      passphrase: "broker-pass",
+      agentName: "uat-agent",
+    });
+    await broker.start(socketPath, undefined, undefined);
+    const resp = await rpc(socketPath, {
+      v: 1,
+      op: "mint_grant",
+      agent: "uat-agent",
+      keys: ["k1"],
+      ttl_seconds: 3600,
+      attest_via_posture: true,
+      // no decision_id → no operator-verified approval → must be denied
+    } as BrokerRequest);
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) expect(resp.code).toBe("DENIED");
+    expect(
+      audit.find(
+        (e) =>
+          e.op === "mint_grant" &&
+          /denied:posture-mint-needs-operator-verified-decision/.test(e.result),
+      ),
+      "the forgeable posture mint must be refused when the gate is on",
+    ).toBeDefined();
+    expect(
+      audit.find((e) => e.result === "allowed:posture-attested"),
+      "must NOT reach the posture-attested allow when the gate denies",
+    ).toBeUndefined();
   });
 
   // ── Gate 1: telegram-id-not-enabled ─────────────────────────────────────

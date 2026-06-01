@@ -65,6 +65,8 @@ export interface DecisionRow {
   last_used_at: number | null;
   revoked_at: number | null;
   revoke_reason: string | null;
+  /** 'agent' (forgeable, default) | 'operator' (host-verified). See origin column. */
+  origin: "agent" | "operator";
 }
 
 /**
@@ -132,6 +134,9 @@ function rowToDecision(row: Record<string, unknown>): DecisionRow {
     last_used_at: (row.last_used_at as number | null) ?? null,
     revoked_at: (row.revoked_at as number | null) ?? null,
     revoke_reason: (row.revoke_reason as string | null) ?? null,
+    origin: (row.origin as "agent" | "operator" | null) === "operator"
+      ? "operator"
+      : "agent",
   };
 }
 
@@ -442,6 +447,14 @@ export interface RecordDecisionInput {
   approver_set: string[];      // current allowFrom (canonicalized inside)
   granted_by_user_id: number;  // Telegram user_id of approver
   ttl_ms?: number;             // for allow_ttl; ignored otherwise
+  /**
+   * Provenance of the operator-authorization. MUST be set by the SERVER from
+   * the connection identity, never from a wire payload — 'operator' is only
+   * legitimate on the host-side verifier's claude-unreachable channel.
+   * Defaults to 'agent' (forgeable, not trusted by the broker mint gate).
+   * See RFC vault-approval-hard-boundary + approval_decisions.origin.
+   */
+  origin?: "agent" | "operator";
 }
 
 export function recordDecision(
@@ -458,8 +471,8 @@ export function recordDecision(
     `INSERT INTO approval_decisions
        (id, agent_unit, scope, action, decision,
         ttl_expires_at, granted_at, granted_by_user_id,
-        approver_set_canonical, last_used_at, revoked_at, revoke_reason)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+        approver_set_canonical, last_used_at, revoked_at, revoke_reason, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`,
     [
       id,
       input.nonce.agent_unit,
@@ -470,6 +483,7 @@ export function recordDecision(
       now,
       input.granted_by_user_id,
       canonical,
+      input.origin ?? "agent",
     ],
   );
 
@@ -529,6 +543,8 @@ export function consumeAndRecord(
     approver_set: string[];
     granted_by_user_id: number;
     ttl_ms?: number;
+    /** Server-set provenance — see RecordDecisionInput.origin. Default 'agent'. */
+    origin?: "agent" | "operator";
   },
   now: number = Date.now(),
 ): { consumed: false } | { consumed: true; decision_id: string; nonce: NonceRow } {
@@ -545,6 +561,7 @@ export function consumeAndRecord(
         approver_set: input.approver_set,
         granted_by_user_id: input.granted_by_user_id,
         ttl_ms: input.ttl_ms,
+        origin: input.origin,
       },
       now,
     );
@@ -628,6 +645,32 @@ export function getDecision(db: Database, id: string): DecisionRow | null {
     )
     .get(id);
   return row ? rowToDecision(row) : null;
+}
+
+/**
+ * Is `dec` proof that an OPERATOR verified this grant for `agent_unit`?
+ * The broker's hard-boundary mint gate (RFC vault-approval-hard-boundary)
+ * uses this to decide whether a posture-attested mint is backed by a real
+ * operator tap. True iff the decision exists, was recorded with
+ * `origin='operator'` (host-side verifier — claude can't produce this),
+ * belongs to this agent, is an allow-mode, not revoked, and not expired.
+ * Pure — unit-tested directly; fails closed on null / any missing condition.
+ */
+export function isOperatorVerifiedDecision(
+  dec: DecisionRow | null,
+  agent_unit: string,
+  now: number = Date.now(),
+): boolean {
+  return (
+    dec !== null &&
+    dec.origin === "operator" &&
+    dec.agent_unit === agent_unit &&
+    dec.revoked_at === null &&
+    (dec.decision === "allow_once" ||
+      dec.decision === "allow_always" ||
+      dec.decision === "allow_ttl") &&
+    (dec.ttl_expires_at === null || dec.ttl_expires_at > now)
+  );
 }
 
 /** Get a pending/recently-consumed nonce (for callback handlers). */

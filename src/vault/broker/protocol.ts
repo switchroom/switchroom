@@ -188,6 +188,17 @@ export const MintGrantRequestSchema = z.object({
    * accidentally double-attest a call.
    */
   attest_via_posture: z.boolean().optional(),
+  /**
+   * Operator-verified approval decision id (RFC vault-approval-hard-boundary).
+   * `attest_via_posture` alone is forgeable — claude shares the per-agent
+   * socket. When the broker config requires it
+   * (`SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT`), a posture-attested mint
+   * must reference a kernel decision recorded with `origin='operator'` (by
+   * the host-side approval verifier, on a channel claude cannot reach).
+   * Optional on the wire — the gate is flag-gated and default-OFF until the
+   * verifier ships, so today this field is unused.
+   */
+  decision_id: z.string().optional(),
 });
 
 export const ListGrantsRequestSchema = z.object({

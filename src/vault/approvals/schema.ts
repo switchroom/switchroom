@@ -45,9 +45,28 @@ export function migrateApprovalSchema(db: Database): void {
       approver_set_canonical   TEXT NOT NULL,
       last_used_at             INTEGER,
       revoked_at               INTEGER,
-      revoke_reason            TEXT
+      revoke_reason            TEXT,
+      -- Provenance of the operator-authorization (RFC vault-approval-hard-
+      -- boundary). 'agent': recorded on a per-agent socket — claude shares
+      -- that socket, so it is FORGEABLE and must NOT be trusted as proof an
+      -- operator tapped. 'operator': recorded via the host-side verifier on a
+      -- claude-unreachable channel — the only value the broker's mint gate
+      -- trusts. Default 'agent' (fail-closed for the new gate).
+      origin                   TEXT NOT NULL DEFAULT 'agent'
     )
   `);
+
+  // Idempotent add-column for DBs created before `origin` existed. SQLite
+  // ALTER ADD COLUMN throws if the column is already present, so guard on
+  // PRAGMA table_info (the CREATE above only fires on a truly fresh DB).
+  const decisionCols = db
+    .query("PRAGMA table_info(approval_decisions)")
+    .all() as Array<{ name: string }>;
+  if (!decisionCols.some((c) => c.name === "origin")) {
+    db.run(
+      `ALTER TABLE approval_decisions ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`,
+    );
+  }
 
   db.run(`
     CREATE INDEX IF NOT EXISTS approval_decisions_lookup
