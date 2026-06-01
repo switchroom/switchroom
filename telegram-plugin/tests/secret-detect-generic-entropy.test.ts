@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { detectSecrets } from '../secret-detect/index.js'
 import { scanGenericSecrets, GENERIC_MIN_DISTINCT } from '../secret-detect/generic-entropy.js'
+import { redact } from '../secret-detect/redact.js'
 
 /**
  * Generic bare-high-entropy fallback (#1) — the long-tail detector for
@@ -23,6 +24,15 @@ describe('generic high-entropy detector', () => {
     expect(hit).toBeDefined()
     expect(hit!.matched_text).toBe(HIGH_ENTROPY)
     expect(hit!.confidence).toBe('ambiguous') // asks, never auto-deletes
+  })
+
+  it('redact() does NOT mask a generic-flagged token (the #2059 outbound-corruption regression)', () => {
+    // HIGH_ENTROPY flags as generic_high_entropy (ambiguous). redact() — the
+    // chokepoint for the outbound reply mask + history + issues — must leave
+    // it intact; masking it would corrupt agent replies. This is the exact
+    // BLOCK that shipped to review; pin it.
+    const text = `use ${HIGH_ENTROPY} for the deploy`
+    expect(redact(text)).toBe(text)
   })
 
   it('respects the distinct-char floor (repetitive long strings do not flag)', () => {
