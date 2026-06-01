@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.34 — Operator-set standing vault grant (#2067)
+
+Adds `agents.<name>.secrets[]` — an **operator-set standing vault grant**
+the broker honours for an agent **independent of any cron or MCP server**.
+Cascades UNION across `defaults → profile → agent`.
+
+Until now an agent's access to a vault key could only be granted by welding
+it to a specific cron's `schedule[].secrets[]` or an `mcp_servers[].secrets`.
+Skill-based credentials an agent needs **both interactively and in its own
+agent-managed schedules** (e.g. a calendar/mail skill reading an OAuth token
+via `switchroom vault get`) had no clean home — the grant leaked in only via
+a cron, tangling *what the agent may access* with *when it runs*. The
+standing grant separates them: it is the home for "what it may access", so
+an agent's schedules can move to agent-managed overlays (which deliberately
+cannot carry `secrets:`) and still work.
+
+**Operator-only by design** — agents cannot edit `switchroom.yaml` or
+self-grant (`reference/vision.md` outcome 2, *"you hold the leash; only your
+tap grants it"*). A standing grant *is* the tap, expressed as config. Purely
+additive: an agent with no `secrets:` is unaffected. Broker-enforced in
+`src/vault/broker/acl.ts`. See `docs/configuration.md` § "Standing vault
+grants".
+
 ## v0.14.33 — Blocking-TUI wedge fix (AskUserQuestion deny + wedge-watchdog)
 
 Closes a wedge class where claude's **blocking interactive TUI selectors**
