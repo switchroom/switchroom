@@ -248,6 +248,54 @@ export function describeGrant(
   }
 }
 
+/**
+ * Agent-voiced "I got your verdict and I'm continuing" message, posted as
+ * a *distinct* Telegram message the instant the operator answers a
+ * permission card (allow / deny / always / slash / free-text). The card
+ * edit + status reaction are easy to miss — a reaction lands on the turn's
+ * triggering message far up the chat, and the card footnote is a one-liner
+ * the operator scrolls past — so this is the legible signal that the tap
+ * landed and names the work being (re)started.
+ *
+ * Mirrors `formatPermissionCardBody`'s style ("🔐 <b>Gymbro</b> wants to
+ * edit: log.md" → "▶️ <b>Gymbro</b> — got it, continuing: edit: log.md").
+ * `action` is a phrase from {@link naturalAction} (already operator-facing,
+ * no tool ids). Output is HTML-escaped for `parse_mode: 'HTML'`.
+ *
+ * `timeoutMinutes` marks the TTL auto-deny variant (no operator tapped —
+ * the request aged out) so the wording reflects "no answer" rather than a
+ * deliberate denial.
+ */
+export function formatPermissionResumeMessage(opts: {
+  agentName: string | null;
+  behavior: "allow" | "deny";
+  action: string;
+  timeoutMinutes?: number;
+}): string {
+  const who =
+    opts.agentName && opts.agentName.length > 0
+      ? `<b>${escapeTgHtml(capFirst(opts.agentName))}</b>`
+      : `<b>Agent</b>`;
+  const act = (opts.action ?? "").trim();
+  const hasAction = act.length > 0;
+
+  if (opts.behavior === "allow") {
+    return hasAction
+      ? `▶️ ${who} — got it, continuing: <i>${escapeTgHtml(act)}</i>`
+      : `▶️ ${who} — got it, back to work.`;
+  }
+
+  // deny
+  if (opts.timeoutMinutes != null) {
+    return hasAction
+      ? `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it (<i>${escapeTgHtml(act)}</i>).`
+      : `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it.`;
+  }
+  return hasAction
+    ? `🚫 ${who} — noted, I won't ${escapeTgHtml(lowerFirst(act))}. Continuing without it.`
+    : `🚫 ${who} — noted, continuing without it.`;
+}
+
 function resolveSkillName(input: Record<string, unknown>): string | null {
   return (
     readString(input, "skill") ??
