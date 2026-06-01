@@ -28,6 +28,7 @@ import {
   resolveBrokerSocketPath,
   readVaultTokenFile,
 } from "../vault/broker/client.js";
+import { suggestVaultKeys } from "./vault-key-suggest.js";
 import { registerVaultBrokerCommand } from "./vault-broker.js";
 import { registerVaultDoctorCommand } from "./vault-doctor.js";
 import { registerVaultAuditCommand } from "./vault-audit.js";
@@ -102,6 +103,7 @@ function refuseSandboxDirectAccess(verbHint: string): never {
 function recoveryHint(
   situation: "denied" | "locked" | "unreachable",
   key?: string,
+  suggestions?: string[],
 ): string {
   if (!isSandboxContext()) {
     const keyArg = key ? ` ${key}` : "";
@@ -110,15 +112,36 @@ function recoveryHint(
   // Inside an agent. The vault.enc file isn't mounted; `--no-broker`
   // can't work. Tell the agent what *can* work.
   switch (situation) {
-    case "denied":
+    case "denied": {
+      // A denied get is usually a GUESSED key name, not a real missing
+      // grant. Steer the agent to the keys it ALREADY holds before it
+      // mints a grant for a name that may not exist. `vault list` /
+      // suggestions come first; `vault_request_access` is last resort.
+      const named = key ? `'${key}'` : "this key";
+      if (suggestions && suggestions.length > 0) {
+        return (
+          `Hint: you have no grant for ${named} — that key may not even exist. ` +
+          `You ALREADY have access to similar keys: ${suggestions.join(", ")}. ` +
+          `Try \`switchroom vault get <one-of-those>\` instead. ` +
+          `Run \`switchroom vault list\` to see every key you hold. ` +
+          `Only call the \`vault_request_access\` MCP tool for a key you've ` +
+          `confirmed (via \`vault list\`) you don't already have. ` +
+          `Do NOT retry with --no-broker — the vault file is not mounted ` +
+          `into agent containers.`
+        );
+      }
       return (
-        `Hint: this agent has no grant for ${key ? `'${key}'` : "this key"}. ` +
-        `Call the \`vault_request_access\` MCP tool ` +
+        `Hint: this agent has no grant for ${named}. ` +
+        `FIRST run \`switchroom vault list\` to see the keys you already hold — ` +
+        `the real name often differs from a guessed one (it's usually ` +
+        `namespaced \`<you>/...\`). ` +
+        `If you genuinely lack it, call the \`vault_request_access\` MCP tool ` +
         `(key=${key ? `'${key}'` : "'<key>'"}, scope='read') ` +
         `to ask the operator for access via a Telegram approval card. ` +
         `Do NOT retry with --no-broker — the vault file is not mounted ` +
         `into agent containers.`
       );
+    }
     case "locked":
       return (
         `Hint: the broker is locked. Ask the operator to unlock it ` +
@@ -875,12 +898,25 @@ export function registerVaultCommand(program: Command): void {
               );
               // fall through to direct-decrypt block below
             } else {
+              // A denied get is almost always a GUESSED key name. The
+              // broker `list` op returns exactly the keys THIS agent can
+              // read (no info leak beyond `switchroom vault list`), so we
+              // look up near-matches and steer the agent to a key it
+              // already holds instead of minting a grant for a name that
+              // may not exist. Best-effort — never let it mask the denial.
+              let suggestions: string[] = [];
+              try {
+                const myKeys = await listViaBroker(brokerOpts);
+                if (myKeys && key) suggestions = suggestVaultKeys(key, myKeys);
+              } catch {
+                /* suggestions are advisory; ignore lookup failures */
+              }
               // Write a VAULT-BROKER-DENIED prefix so scripts/agents that
               // capture stdout/stderr can grep for it even when the full
               // message isn't surfaced in their UI.
               process.stderr.write(
                 `VAULT-BROKER-DENIED [${result.code}]: ${result.msg}\n` +
-                `${recoveryHint("denied", key)}\n`
+                `${recoveryHint("denied", key, suggestions)}\n`
               );
               writeVaultDeniedEnvelope(key, result.code, result.msg);
               process.exit(2);

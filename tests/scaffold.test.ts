@@ -2571,6 +2571,19 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(out).toContain("Operator action");
   });
 
+  it("renderFleetInvariants() tells agents to discover vault keys, not guess", async () => {
+    // Stops the most common vault failure: an agent guessing a key name
+    // (`postiz/api-key`) when it already holds `marko/postiz-api-key`,
+    // then burning an operator approval on a request for a non-existent
+    // key. Companion to the self-correcting denied-hint in vault.ts.
+    const { renderFleetInvariants } = await import("../src/agents/scaffold.js");
+    const out = renderFleetInvariants();
+    expect(out).toContain("Secrets in the vault");
+    expect(out).toContain("switchroom vault list");
+    expect(out).toContain("Never guess a key name");
+    expect(out).toContain("vault_request_access");
+  });
+
   it("renderFleetInvariants() teaches scannable formatting for multi-section replies", async () => {
     // D2: the live Telegram guidance is the TELEGRAM_GUIDANCE constant
     // rendered here (NOT profiles/_shared/telegram-style.md.hbs, which is
