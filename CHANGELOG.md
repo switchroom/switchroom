@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.14.25 — Surface foreground sub-agent activity after the ack
+
+### PR — surface foreground sub-agent activity after the ack-first reply (#2034)
+
+Fixes the foreground sub-agent visibility blindspot: a FOREGROUND
+sub-agent (`Agent`/`Task` *without* `run_in_background`) runs inline in
+the parent turn and its live steps were meant to nest into the parent's
+activity-summary feed (the #2027 "Model A" nesting). But every render
+path bailed on `turn.replyCalled`, and the framework's ack-first pattern
+replies "On it…" **first** and then delegates — so the sub-agent always
+ran with `replyCalled` already true and **nothing ever painted**. #2027
+only tested the pure renderer, so the regression shipped silently (the
+"marko's researcher showed no Telegram activity" report).
+
+The render gate no longer depends on `replyCalled`. The decision is
+extracted into a pure, tested seam (`gateway/foreground-nesting.ts`):
+`shouldRenderForegroundProgress` keys only on the kill-switch
+(`SWITCHROOM_FOREGROUND_SUBAGENT_NESTING`, default on), and
+`foregroundFinishAction` drives the post-ack hand-off (clear the feed
+when the last foreground sub-agent finishes, recompose while others run).
+Because a foreground `Task` blocks the parent, any `replyCalled` seen
+while it runs is necessarily an interim ack, never the final answer — so
+surfacing the nested narrative post-ack is always correct.
+
+Classification is task-agnostic: foreground vs. background keys solely on
+`run_in_background` in the PreToolUse tracker hook, never on
+`subagent_type`. A generic sub-agent narrates the same as a researcher.
+
+### PR — UAT for foreground sub-agent activity nesting (#2035)
+
+Adds the mtcute UAT (`jtbd-foreground-subagent-activity-dm.test.ts`) that
+exercises the fix end-to-end: forces the ack-first shape, dispatches a
+FOREGROUND general-purpose sub-agent that narrates eight paced steps, and
+asserts the activity-summary feed message carrying the nested marker
+("↳") surfaces **after** the ack and advances in place. Plus a unit
+regression guard (`foreground-nesting.test.ts`) pinning the
+`replyCalled`-independence directly, so the blindspot can't return
+silently.
+
 ## v0.14.24 — Age-bound the boot-promotion (stale-handback hotfix)
 
 ### PR — age-bound the boot-promotion so stale dead workers don't replay (#2032)
