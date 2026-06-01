@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.14.28 — Secrets never leave the box in plaintext
+
+A secret-handling hardening release. A live Coolify/Laravel Sanctum API
+token (`<id>|<token>`) a user pasted into chat was not redacted and
+persisted in plaintext (token since revoked). This release closes the gap
+in both directions and removes the reason an agent would ever ask for a
+paste.
+
+### Secret detection + redaction (#2043, #2046)
+
+- **Sanctum/Coolify pattern.** Added a `laravel_sanctum_token` rule
+  (`\d+\|[A-Za-z0-9]{40,}`, high-confidence) to the shared `detectSecrets`
+  engine, so the inbound gate, the `redact()` mask, and the issues
+  pipeline all cover the `<id>|<token>` shape uniformly. Diagnosis: the
+  inbound gate already detects at ingest, fail-closed, before persistence
+  — the leak was pure pattern coverage, not a bypass.
+- **Both-direction storage redaction.** `redact()` now masks at the
+  `history.ts` persistence chokepoint (`recordInbound` / `recordOutbound` /
+  `recordEdit`), so no detected secret lands in the message store in
+  either direction. `redact()` moved into the plugin (src re-exports).
+- **Outbound transport redaction.** Agent-authored text is masked before
+  it reaches Telegram or the stderr preview — at the entry of `reply`,
+  `stream_reply`, `edit_message`, and the turn-flush backstop. Mutates in
+  place like the voice scrub, keeping answer-stream diffing consistent.
+
+### Agent-requested secrets — secure save-card (#2045)
+
+- **`request_secret` tool.** Agents must never ask a user to paste a
+  secret into chat. When an agent needs a credential that isn't in the
+  vault, it calls `request_secret(key, reason)`; the operator gets a
+  `[Provide securely]` card, sends the value once, and the gateway deletes
+  the message + writes it straight to the vault. The raw value is never
+  recorded, logged, or returned to the agent — it only ever sees
+  `vault:<key>`. Third sibling of `vault_request_save` / `vault_request_access`.
+- `TELEGRAM_GUIDANCE` updated: agents are told to use `request_secret` /
+  `vault_request_save` / `vault_request_access` and never request a chat
+  paste.
+
+### Also
+
+- Agent-voiced "continuing" message on permission verdicts (#2048).
+
 ## v0.14.27 — Native Telegram worker card (#2041)
 
 The background-worker card (the live, edit-in-place card a
