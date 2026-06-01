@@ -333,7 +333,9 @@ describe("Principles/consistency — every operator approval card uses the same 
     // /auth snapshot Format 2 PR re-introduced inline-keyboard
     // buttons (auth:use:<label>, auth:refresh) — handled by
     // handleAuthDashboardCallback at the dispatcher.
-    const expectedPrefixes = ["vrs", "vra", "vrd", "vd", "vg", "op", "auth"];
+    // `vsp:` added in #2045 (request_secret secure save-card) — handled by
+    // handleSecretRequestCallback at the dispatcher.
+    const expectedPrefixes = ["vrs", "vra", "vrd", "vd", "vg", "op", "auth", "vsp"];
     for (const p of expectedPrefixes) {
       expect(
         gatewaySrc,

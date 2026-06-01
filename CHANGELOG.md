@@ -41,6 +41,9 @@ paste.
 ### Also
 
 - Agent-voiced "continuing" message on permission verdicts (#2048).
+- Worker card no longer leaks raw `##` Markdown / multi-line steps (#2050).
+- Guard-test fix: `vsp:` callback prefix documented in the dispatcher
+  consistency check (follow-up to #2045).
 
 ## v0.14.27 — Native Telegram worker card (#2041)
 
