@@ -491,7 +491,15 @@ describe("scaffoldAgent", () => {
       // reaches for the webkite_* MCP tools instead. Per-agent
       // `mcp_servers.webkite: false` opts both webkite AND this deny
       // out together.
-      expect(settings.permissions.deny).toEqual(["bash", "WebFetch", "WebSearch"]);
+      // "AskUserQuestion" is the unconditional fleet-baseline interactive-TUI
+      // deny (scaffold.ts:INTERACTIVE_TUI_FLEET_DENY_TOOLS), appended after the
+      // webkite strip.
+      expect(settings.permissions.deny).toEqual([
+        "bash",
+        "WebFetch",
+        "WebSearch",
+        "AskUserQuestion",
+      ]);
       expect(settings.permissions.defaultMode).toBeUndefined();
     } finally {
       if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
@@ -573,12 +581,60 @@ describe("scaffoldAgent", () => {
       const settings = JSON.parse(
         readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
       );
-      // Only the user-declared deny — no WebFetch/WebSearch strip.
-      expect(settings.permissions.deny).toEqual(["bash"]);
+      // No WebFetch/WebSearch strip — but the AskUserQuestion fleet-baseline
+      // deny is unconditional (independent of webkite), so it still lands.
+      expect(settings.permissions.deny).toEqual(["bash", "AskUserQuestion"]);
     } finally {
       if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
       else process.env.SWITCHROOM_WEBKITE_BINARY = prev;
     }
+  });
+
+  it("AskUserQuestion is denied fleet-wide regardless of webkite presence", () => {
+    // The blocking interactive-TUI selector wedges a headless,
+    // Telegram-driven agent (no human at the terminal to answer it).
+    // Denying it forces claude's graceful plain-text fallback. This deny
+    // is unconditional — it must land whether or not webkite is staged
+    // and with no per-agent config opting into it.
+    const prev = process.env.SWITCHROOM_WEBKITE_BINARY;
+    process.env.SWITCHROOM_WEBKITE_BINARY = join(tmpDir, "no-webkite-here");
+    try {
+      const config = makeAgentConfig({}); // no tools.deny, webkite absent
+      const result = scaffoldAgent("askq-agent", config, tmpDir, telegramConfig);
+      const settings = JSON.parse(
+        readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+      );
+      expect(settings.permissions.deny).toContain("AskUserQuestion");
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_WEBKITE_BINARY;
+      else process.env.SWITCHROOM_WEBKITE_BINARY = prev;
+    }
+  });
+
+  it("reconcile re-seeds AskUserQuestion deny into an EXISTING agent", () => {
+    // Mirrors the webkite re-seed guard: a deployed agent that predates
+    // this deny must converge on it at the next `switchroom apply`
+    // (reconcile rewrites settings.permissions.deny wholesale).
+    const config = makeAgentConfig({});
+    const cfg = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "askq-existing": config },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent("askq-existing", config, tmpDir, telegramConfig, cfg);
+    const settingsPath = join(result.agentDir, ".claude", "settings.json");
+    // Simulate a pre-deny deployed agent: strip AskUserQuestion from deny.
+    const s1 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    s1.permissions.deny = (s1.permissions.deny as string[]).filter(
+      (x) => x !== "AskUserQuestion",
+    );
+    writeFileSync(settingsPath, JSON.stringify(s1, null, 2));
+    expect(JSON.parse(readFileSync(settingsPath, "utf-8")).permissions.deny)
+      .not.toContain("AskUserQuestion");
+    // Re-scaffold (existing-agent reconcile path) must re-seed it.
+    scaffoldAgent("askq-existing", config, tmpDir, telegramConfig, cfg);
+    const s2 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(s2.permissions.deny).toContain("AskUserQuestion");
   });
 
   // #1400 apex-chain link 1: the hostd MCP server exposes mutating /
