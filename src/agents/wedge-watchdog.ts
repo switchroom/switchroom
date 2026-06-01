@@ -170,7 +170,15 @@ export async function runWedgeWatchdog(
               (stableCount * pollIntervalMs) / 1000
             }s) — no human to answer it`,
         );
-        send(opts.agentName, ["Escape"]);
+        try {
+          send(opts.agentName, ["Escape"]);
+        } catch (err) {
+          // sendKeys is contracted to soft-fail (returns boolean), but the
+          // never-throw sidecar contract must hold even for a custom seam.
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          );
+        }
         fires++;
         cooldownUntil = now() + cooldownMs;
         // Reset so we require a fresh stability streak before firing again.

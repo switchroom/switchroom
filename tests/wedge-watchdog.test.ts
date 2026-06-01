@@ -209,4 +209,25 @@ describe("runWedgeWatchdog", () => {
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });
+
+  it("soft-fails when send throws (counts the fire, no throw)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await runWedgeWatchdog({
+      agentName: "a",
+      stabilityThreshold: 1,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 1,
+      capture: captureSeq([WEDGE_SCREEN]),
+      send: () => {
+        throw new Error("tmux: send-keys failed");
+      },
+    });
+    // The fire is attempted (and counted) but the throw is swallowed so the
+    // sidecar loop survives.
+    expect(res.fires).toBe(1);
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
 });
