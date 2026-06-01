@@ -60,10 +60,11 @@ export interface WorkerActivityView {
   latestSummary: string
   /**
    * Accumulated narrative lines, oldest→newest, already deduped + capped by
-   * the feed manager. When present and non-empty, the render grows a block
-   * of `↳` lines (mirroring the main agent's live answer) instead of
-   * collapsing to the single `latestSummary` line. Absent/empty → the
-   * single-line fallback (back-compat for direct render callers).
+   * the feed manager. When present and non-empty, the render grows a `✓`/`→`
+   * step feed (prior steps done, newest in-progress — mirroring the main
+   * agent's activity card) instead of collapsing to the single `latestSummary`
+   * line. Absent/empty → the single-line fallback (back-compat for direct
+   * render callers).
    */
   narrativeLines?: string[]
   /** Wall-clock since dispatch, ms. */

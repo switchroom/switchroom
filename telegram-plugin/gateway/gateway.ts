@@ -17971,7 +17971,7 @@ void (async () => {
                 // The watcher's `description` is its 'sub-agent' default (it
                 // never reassigns it from the worker jsonl). The dispatch-time
                 // task description lives in the registry row — resolveWorkerFeedDispatch
-                // prefers it so the header reads "🔧 Worker · <real task>" not
+                // prefers it so the header reads "🛠 Worker · <real task>" not
                 // "· sub-agent" (worker-feed-dispatch.ts, pinned by its test).
                 let dispatch: WorkerFeedDispatch = resolveWorkerFeedDispatch(null, description)
                 if (turnsDb != null) {

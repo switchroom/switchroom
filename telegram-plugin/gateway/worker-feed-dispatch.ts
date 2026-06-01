@@ -5,7 +5,7 @@ export interface WorkerFeedDispatch {
   isBackground: boolean
   /**
    * The human-readable task to render in the feed header
-   * ("🔧 Worker · <feedDescription>").
+   * ("🛠 Worker · <feedDescription>").
    */
   feedDescription: string
 }
