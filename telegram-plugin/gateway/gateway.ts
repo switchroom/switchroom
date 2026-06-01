@@ -427,6 +427,7 @@ import {
   recordTurnEnd,
   findLatestTurnIfInterrupted,
   findRecentTurnsForChat,
+  getTurnByKey,
 } from '../registry/turns-schema.js'
 import {
   buildResumeInterruptedInbound,
@@ -1115,6 +1116,41 @@ try {
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
   turnsDb = null
+}
+
+/**
+ * Resolve the chat/thread a background sub-agent was dispatched from, so
+ * its live worker card + handback route back to the originating
+ * conversation (group / forum topic) instead of the operator DM.
+ *
+ * Walks jsonl_agent_id → `subagents.parent_turn_key` →
+ * `turns.chat_id`/`thread_id`. Returns null on any miss so the caller
+ * keeps its existing `allowFrom[0]` DM fallback — best-effort, never
+ * throws out of the worker-card hot path. This restores the chat context
+ * the pinned-card fleet used to carry before it was removed in #1122
+ * (progressDriver is permanently null, so the old fleet lookup always
+ * yielded the DM for a Task dispatched from a group/topic).
+ */
+function resolveSubagentOriginChat(
+  agentId: string,
+): { chatId: string; threadId?: number } | null {
+  if (turnsDb == null) return null
+  try {
+    const sub = getSubagentByJsonlId(turnsDb, agentId)
+    if (sub?.parent_turn_key == null) return null
+    const turn = getTurnByKey(turnsDb, sub.parent_turn_key)
+    if (turn == null || turn.chat_id.length === 0) return null
+    const threadNum =
+      turn.thread_id != null && turn.thread_id.length > 0
+        ? Number(turn.thread_id)
+        : NaN
+    return {
+      chatId: turn.chat_id,
+      threadId: Number.isFinite(threadNum) ? threadNum : undefined,
+    }
+  } catch {
+    return null
+  }
 }
 
 // ─── Periodic history reaper (#1073) ──────────────────────────────────────
@@ -18371,11 +18407,15 @@ void (async () => {
                   handbackEnvValue: process.env.SWITCHROOM_SUBAGENT_HANDBACK,
                   outcome,
                   isBackground,
-                  fleetChatId,
-                  // Owner-chat fallback: if the progress-driver fleet
-                  // entry was already cleaned up, route to the owner
-                  // chat. Every switchroom fleet agent is DM-shaped, so
-                  // allowFrom[0] is the conversation that dispatched.
+                  // Route the handback (the worker's result → a synthesized
+                  // turn) back to the conversation the Task was dispatched
+                  // from, so the result lands where the user asked — not the
+                  // agent's DM. Falls back to fleetChatId/ownerChatId.
+                  fleetChatId: resolveSubagentOriginChat(agentId)?.chatId || fleetChatId,
+                  // Owner-chat fallback: if the parent-turn chat can't be
+                  // resolved, route to the owner chat. Every switchroom fleet
+                  // agent is DM-shaped, so allowFrom[0] is the conversation
+                  // that dispatched.
                   ownerChatId: loadAccess().allowFrom[0] ?? '',
                   taskDescription: description,
                   resultText,
@@ -18505,12 +18545,16 @@ void (async () => {
                 // message owns the progress beat. Push a running cue and
                 // return BEFORE the legacy bucket relay so the same activity
                 // isn't double-surfaced (in-message edit + injected
-                // "still working" inbound turn). Chat = owner DM, since the
-                // pinned-card fleet is gone and every agent is DM-shaped.
+                // "still working" inbound turn). Route to the conversation
+                // the Task was dispatched from (group / forum topic) via the
+                // parent turn; fall back to the owner DM when that can't be
+                // resolved (the pinned-card fleet that used to carry the chat
+                // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
+                  const origin = resolveSubagentOriginChat(agentId)
                   void workerActivityFeed.update(
                     agentId,
-                    fleetChatId || (loadAccess().allowFrom[0] ?? ''),
+                    origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
                     {
                       description: dispatch.feedDescription,
                       lastTool,
@@ -18519,6 +18563,7 @@ void (async () => {
                       elapsedMs,
                       state: 'running',
                     },
+                    origin?.threadId,
                   )
                   return
                 }
@@ -18526,7 +18571,9 @@ void (async () => {
                 const decision = decideSubagentProgress({
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
                   isBackground,
-                  fleetChatId,
+                  // Prefer the conversation the Task was dispatched from over
+                  // the owner DM (see resolveSubagentOriginChat).
+                  fleetChatId: resolveSubagentOriginChat(agentId)?.chatId || fleetChatId,
                   ownerChatId: loadAccess().allowFrom[0] ?? '',
                   subagentJsonlId: agentId,
                   taskDescription: description,

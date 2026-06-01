@@ -348,6 +348,24 @@ export function findOrphanedTurns(db: SqliteDatabase, chatId: string): Turn[] {
   return rows.map(mapRow)
 }
 
+/**
+ * Fetch a single turn by its primary key, or null if absent.
+ *
+ * Used to recover the chat/thread a background sub-agent was dispatched
+ * from: `subagents.parent_turn_key` is an FK-by-convention to
+ * `turns.turn_key`, so this resolves the originating conversation
+ * (chat_id + thread_id) for a worker card / handback. Without it the
+ * worker feed falls back to the operator DM (the pinned-card fleet that
+ * used to carry the chat was removed in #1122), so a Task dispatched from
+ * a group/topic posted its progress to the agent's DM instead.
+ */
+export function getTurnByKey(db: SqliteDatabase, turnKey: string): Turn | null {
+  const row = db
+    .prepare(`SELECT * FROM turns WHERE turn_key = ?`)
+    .get(turnKey) as RawTurnRow | undefined
+  return row ? mapRow(row) : null
+}
+
 export interface OrphanClassifyOpts {
   /**
    * `turnKey` from the on-disk `turn-active.json` marker — the single
