@@ -1449,6 +1449,26 @@ const profileFields = {
     })
     .optional(),
   schedule: z.array(ScheduleEntrySchema).optional(),
+  secrets: z
+    .array(
+      z
+        .string()
+        .regex(
+          /^[a-zA-Z0-9_\-/]+$/,
+          "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes",
+        ),
+    )
+    .optional()
+    .describe(
+      "Operator-granted STANDING vault keys this agent may read via the " +
+      "broker — independent of any cron or MCP server. Use when an agent " +
+      "needs a credential both interactively and in its own (agent-managed) " +
+      "schedules, so the grant lives with the agent rather than welded to a " +
+      "specific cron's `secrets[]`. OPERATOR-SET ONLY: agents cannot edit " +
+      "switchroom.yaml or self-grant (reference/vision.md outcome 2 — 'you " +
+      "hold the leash; only your tap grants it'). Exact key names. Cascades " +
+      "UNION across defaults -> profile -> agent (see docs/configuration.md).",
+    ),
   reactions: ReactionsSchema,
   model: z
     .string()
@@ -1800,6 +1820,20 @@ export const AgentSchema = z.object({
   tools: AgentToolsSchema,
   memory: AgentMemorySchema,
   schedule: z.array(ScheduleEntrySchema).default([]),
+  // Mirror of profileFields.secrets — must be repeated here because
+  // AgentSchema does not spread profileFields (same pattern as `resources`
+  // below). Operator-set STANDING vault grant; see profileFields.secrets
+  // for the full doc + the broker enforcement in src/vault/broker/acl.ts.
+  secrets: z
+    .array(
+      z
+        .string()
+        .regex(
+          /^[a-zA-Z0-9_\-/]+$/,
+          "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes",
+        ),
+    )
+    .optional(),
   reactions: ReactionsSchema,
   model: z
     .string()

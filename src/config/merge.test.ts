@@ -114,3 +114,25 @@ describe("mergeAgentConfig — allowed_tools / disallowed_tools cascade", () => 
     expect(result.disallowed_tools).toEqual(["WebFetch", "Bash(rm *)"]);
   });
 });
+
+describe("mergeAgentConfig — secrets (operator standing grant) cascade", () => {
+  it("unions defaults + agent secrets (defaults first, dedup)", () => {
+    const defaults = { secrets: ["shared/key"] } as AgentDefaults;
+    const agent = baseAgent({
+      secrets: ["microsoft/token", "shared/key"],
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.secrets).toEqual(["shared/key", "microsoft/token"]);
+  });
+
+  it("uses agent secrets when defaults absent", () => {
+    const agent = baseAgent({ secrets: ["compass/creds"] } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    expect(result.secrets).toEqual(["compass/creds"]);
+  });
+
+  it("leaves secrets undefined when neither layer sets it", () => {
+    const result = mergeAgentConfig({} as AgentDefaults, baseAgent({}));
+    expect(result.secrets).toBeUndefined();
+  });
+});

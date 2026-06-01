@@ -33,6 +33,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `hooks` | per-event concat | Claude Code lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SessionEnd) |
 | `env` | per-key | Environment variables for start.sh |
 | `mcp_servers` | per-key | Additional MCP server configurations. Set a key to `false` to suppress a built-in default (e.g. `playwright: false`) |
+| `secrets` | union | **Operator-set** standing vault grant: vault keys this agent may read via the broker, independent of any cron or MCP server. Use for credentials an agent needs both interactively and in its own (agent-managed) schedules. Agents cannot self-grant — this is operator-only by design ([vision.md](../reference/vision.md) outcome 2). See [§ Standing vault grants](#standing-vault-grants-agentsnamesecrets). |
 | `system_prompt_append` | concatenate | Appended to the system prompt via `--append-system-prompt` |
 | `skills` | union | Named skills from the global skills pool (`switchroom.skills_dir`) |
 | `bundled_skills` | per-key | Opt-out map for switchroom's bundled-default skills. Set a key to `false` to suppress (e.g. `pdf: false`). See [docs/skills.md](./skills.md). |
@@ -203,6 +204,40 @@ agents:
     mcp_servers:
       perplexity: false   # this agent doesn't get perplexity (or its vault grant)
 ```
+
+### Standing vault grants — `agents.<name>.secrets`
+
+`mcp_servers[].secrets` ties a grant to an MCP server, and a cron's
+`schedule[].secrets` ties it to one schedule entry. When an agent needs a
+vault key **independent of any server or cron** — typically a skill the
+agent runs both interactively *and* in its own (agent-managed) schedules
+(e.g. a calendar/mail skill that reads an OAuth token via `switchroom vault
+get`) — declare a **standing grant**:
+
+```yaml
+agents:
+  clerk:
+    # Vault keys clerk may read via the broker, always — not welded to a
+    # specific cron or MCP server. Cascades UNION across defaults → profile
+    # → agent. Exact key names.
+    secrets:
+      - microsoft/ken-tokens
+      - microsoft/azure-app
+      - compass/credentials
+```
+
+This is the clean home for "**what this agent may access**", separate from
+"**when it runs**". With it in place, the agent's schedules can be moved to
+agent-managed overlays (which deliberately **cannot** carry `secrets:`) and
+still work, because the standing grant covers the keys.
+
+**Operator-only, by design.** Agents cannot edit `switchroom.yaml` and
+cannot self-grant — only the operator sets `secrets:`. This is
+[vision.md](../reference/vision.md) outcome 2 ("you hold the leash; only
+your tap grants it"): a standing grant *is* the tap, expressed as config.
+Grant another agent's or operator-owned secret only after a deliberate
+decision; never as a way to let an agent reach for credentials it wasn't
+given. Enforced by the vault-broker in `src/vault/broker/acl.ts`.
 
 The `false` opt-out drops the ACL grant too — the broker won't serve `perplexity/api-key` to an agent that disabled the MCP.
 
