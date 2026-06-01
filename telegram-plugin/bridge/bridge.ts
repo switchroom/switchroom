@@ -438,6 +438,21 @@ const TOOL_SCHEMAS = [
       required: ['chat_id', 'key'],
     },
   },
+  {
+    name: 'request_secret',
+    description:
+      'Ask the operator to PROVIDE a secret you do not have, securely — NEVER ask the user to paste a token/key/password as a normal chat message. Use this when you need a credential that is not in the vault (a `vault:<key>` reference is missing/empty, or you know an upcoming task needs one you lack). Renders a Telegram card with [Provide securely] [Decline]; on tap, the operator sends the value once and the gateway DELETES their message instantly and writes it straight to the vault — the raw value is never echoed back to you. You receive only `vault:<key>`. This is the sibling of `vault_request_save` (use that when the user already handed YOU a value to store) and `vault_request_access` (use that when the key exists but you lack read access). After firing this tool, END YOUR TURN cleanly — a fresh inbound message arrives once the operator provides (or declines) the secret. Do NOT call this for keys you already have, and do NOT spam (one open request per key; the operator sees every card).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat to render the card in (use the chat_id of the user message that triggered the workflow).' },
+        key: { type: 'string', description: 'Vault key to store the provided secret under. Use lowercase namespaced snake_case, e.g. `coolify/api-token`.' },
+        reason: { type: 'string', description: 'REQUIRED in practice — one-line human-readable rationale rendered on the card (e.g. "to trigger a redeploy on Coolify"). Omitting it makes the operator more likely to Decline.' },
+        message_thread_id: { type: 'string', description: 'Forum topic thread ID. Auto-applied from the last inbound message if not specified.' },
+      },
+      required: ['chat_id', 'key'],
+    },
+  },
 ]
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_SCHEMAS }))

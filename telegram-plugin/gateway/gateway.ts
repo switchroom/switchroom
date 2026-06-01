@@ -5080,6 +5080,7 @@ const ALLOWED_TOOLS = new Set([
   'send_sticker', 'send_gif',
   'vault_request_save',
   'vault_request_access',
+  'request_secret',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -5123,6 +5124,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeVaultRequestSave(args)
     case 'vault_request_access':
       return executeVaultRequestAccess(args)
+    case 'request_secret':
+      return executeRequestSecret(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -6775,6 +6778,281 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
       },
     ],
   }
+}
+
+// ─── #2045 request_secret — agent asks the operator to PROVIDE a secret ───
+//
+// The third member of the agent-vault tool family. `vault_request_save`
+// = agent HAS a value and asks to save it; `vault_request_access` = agent
+// needs read access to an existing key; `request_secret` = agent needs a
+// value it does NOT have. The operator provides it through a secure card:
+// they tap [Provide securely], send the value once, and the gateway deletes
+// the message instantly + writes it straight to the vault. The raw value is
+// never recorded to history, never logged, never returned to the agent —
+// the agent only ever references `vault:<key>`. This removes the reason an
+// agent would ever ask a user to paste a secret as a normal chat message.
+interface PendingSecretRequest {
+  agent: string
+  chat_id: string
+  key: string
+  reason?: string
+  staged_at: number
+  card_message_id?: number
+}
+// stageId -> request (lives until tapped or TTL).
+const pendingSecretRequests = new Map<string, PendingSecretRequest>()
+// chat_id -> the armed capture: the operator's NEXT message in this chat is
+// the value for `key`. Set when [Provide securely] is tapped.
+interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number }
+const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
+const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
+const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
+
+function sweepSecretRequests(): void {
+  const now = Date.now()
+  for (const [k, v] of pendingSecretRequests) {
+    if (now - v.staged_at > PENDING_SECRET_REQUEST_TTL_MS) pendingSecretRequests.delete(k)
+  }
+  for (const [k, v] of armedSecretCaptures) {
+    if (now - v.armed_at > ARMED_SECRET_CAPTURE_TTL_MS) armedSecretCaptures.delete(k)
+  }
+}
+
+function buildSecretRequestKeyboard(stageId: string): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🔐 Provide securely', callback_data: `vsp:provide:${stageId}` },
+        { text: '🚫 Decline', callback_data: `vsp:decline:${stageId}` },
+      ],
+    ],
+  }
+}
+
+function renderSecretRequestCard(req: PendingSecretRequest): string {
+  const lines: string[] = [
+    `🔒 <b>${escapeHtmlForTg(req.agent)}</b> needs a secret:`,
+    `<code>${escapeHtmlForTg(req.key)}</code>`,
+  ]
+  if (req.reason) lines.push(`<i>${escapeHtmlForTg(req.reason)}</i>`)
+  lines.push(
+    '',
+    'Tap <b>Provide securely</b>, then send the value as your next message. I’ll delete it instantly and store it in the vault — it is never shown in chat or to the agent.',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * `request_secret` tool — agent surfaces a card asking the operator to
+ * provide a missing secret. No `value` arg: the value arrives via secure
+ * capture (the operator's next message after they tap [Provide securely]).
+ */
+async function executeRequestSecret(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const chat_id = args.chat_id as string
+  if (!chat_id) throw new Error('request_secret: chat_id is required')
+  const key = args.key as string
+  if (!key || typeof key !== 'string') throw new Error('request_secret: key is required')
+  const reason = typeof args.reason === 'string' ? args.reason : undefined
+  assertAllowedChat(chat_id)
+  if (!VAULT_KEY_REGEX.test(key)) {
+    throw new Error(`request_secret: key must match ${VAULT_KEY_REGEX_LABEL}`)
+  }
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME || 'agent'
+
+  // Dedupe: one open request per (chat, key). Drop any prior stage for
+  // the same target so the operator never sees stacked cards.
+  for (const [sid, p] of pendingSecretRequests) {
+    if (p.chat_id === chat_id && p.key === key) pendingSecretRequests.delete(sid)
+  }
+
+  const stageId = randomBytes(4).toString('hex')
+  const pending: PendingSecretRequest = { agent: agentSlug, chat_id, key, reason, staged_at: Date.now() }
+  pendingSecretRequests.set(stageId, pending)
+  sweepSecretRequests()
+
+  const text = renderSecretRequestCard(pending)
+  const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  const sent = await retryWithThreadFallback<{ message_id: number }>(
+    robustApiCall,
+    (tid) =>
+      lockedBot.api.sendMessage(chat_id, text, {
+        parse_mode: 'HTML',
+        reply_markup: buildSecretRequestKeyboard(stageId),
+        ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
+      }),
+    { threadId, chat_id, verb: 'request_secret.card' },
+  )
+  pending.card_message_id = sent.message_id
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `request_secret: card sent (stage_id=${stageId}, key=${key}). END YOUR TURN now and wait — a fresh inbound message arrives once the operator provides (or declines) the secret. Do NOT ask them to paste it as a normal message; the card handles it securely.`,
+      },
+    ],
+  }
+}
+
+/**
+ * Write a provided secret to the vault. Mirrors the vrs:save write branch:
+ * posture-attested broker put under telegram-id mode (no passphrase), else
+ * the cached-passphrase CLI path. Returns the same {ok, output} shape.
+ */
+async function writeRequestedSecret(key: string, value: string, chat_id: string): Promise<{ ok: boolean; output: string }> {
+  if (VAULT_APPROVAL_AUTH_MODE === 'telegram-id') {
+    return await defaultVaultWritePosture(key, value)
+  }
+  const cached = vaultPassphraseCache.get(chat_id)
+  if (!cached || cached.expiresAt <= Date.now()) {
+    return { ok: false, output: 'VAULT-LOCKED: run /vault unlock once in this chat, then have the agent re-request.' }
+  }
+  return defaultVaultWrite(key, value, cached.passphrase)
+}
+
+/**
+ * Secure value capture. Called early in handleInbound: if this chat is
+ * armed (operator tapped [Provide securely]), the inbound message IS the
+ * secret value. Delete it, write to the vault under the requested key, tell
+ * the agent it's available, and STOP — never record / log / forward the raw
+ * value. Returns true if it consumed the message (caller must return).
+ */
+async function captureProvidedSecret(
+  ctx: Context,
+  chat_id: string,
+  msgId: number | undefined,
+  value: string,
+): Promise<boolean> {
+  const armed = armedSecretCaptures.get(chat_id)
+  if (!armed || Date.now() - armed.armed_at > ARMED_SECRET_CAPTURE_TTL_MS) {
+    if (armed) armedSecretCaptures.delete(chat_id)
+    return false
+  }
+  armedSecretCaptures.delete(chat_id)
+  const pending = pendingSecretRequests.get(armed.stageId)
+  pendingSecretRequests.delete(armed.stageId)
+
+  // Delete the raw message FIRST — surfaces a warning if it fails.
+  if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'provided secret value')
+
+  const write = await writeRequestedSecret(armed.key, value, chat_id)
+  if (!write.ok) {
+    const parsed = parseVaultCliError(write.output)
+    const rendered = renderVaultCliError(parsed, { verb: 'save', key: armed.key })
+    const body = rendered.suppressRaw ? rendered.html : `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>`
+    await switchroomReply(ctx, `${body}\n\n<i>The secret was NOT saved. The agent can re-request with <code>request_secret</code>.</i>`, { html: true })
+    return true
+  }
+
+  await switchroomReply(
+    ctx,
+    `✅ saved as <code>vault:${escapeHtmlForTg(armed.key)}</code> (masked: <code>${escapeHtmlForTg(maskToken(value))}</code>). The agent can now reference it.`,
+    { html: true },
+  )
+
+  // Resume the requesting agent with a synthetic inbound — mirrors the
+  // vault_grant_approved injection. The value is NOT included; only the key.
+  const ts = Date.now()
+  const synthetic: InboundMessage = {
+    type: 'inbound',
+    chatId: chat_id,
+    messageId: ts,
+    user: 'vault-broker',
+    userId: 0,
+    ts,
+    text:
+      `✅ Operator provided the secret you requested. It is saved as ` +
+      `\`vault:${armed.key}\` — reference it the usual way. Resume the task ` +
+      `that was waiting on this credential. Do NOT ask the operator to paste it.`,
+    meta: {
+      source: 'secret_provided',
+      agent: armed.agent,
+      key: armed.key,
+      stage_id: armed.stageId,
+    },
+  }
+  const delivered = ipcServer.sendToAgent(armed.agent, synthetic)
+  if (delivered) markClaudeBusyForInbound(synthetic)
+  else pendingInboundBuffer.push(armed.agent, synthetic)
+  process.stderr.write(
+    `telegram gateway: secret_provided injection agent=${armed.agent} key=${armed.key} stage=${armed.stageId} delivered=${delivered}\n`,
+  )
+  return true
+}
+
+/**
+ * `vsp:` callbacks — agent-requested-secret card.
+ *   vsp:provide:<stageId>  — arm capture: operator's next message is the value
+ *   vsp:decline:<stageId>  — drop the request; tell the agent it was declined
+ */
+async function handleSecretRequestCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parts = data.split(':')
+  const action = parts[1]
+  const stageId = parts[2] ?? ''
+  const pending = pendingSecretRequests.get(stageId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: 'This request expired.' }).catch(() => {})
+    return
+  }
+
+  if (action === 'provide') {
+    armedSecretCaptures.set(pending.chat_id, {
+      key: pending.key,
+      agent: pending.agent,
+      stageId,
+      armed_at: Date.now(),
+    })
+    await ctx.answerCallbackQuery({ text: 'Send the value now — it auto-deletes.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(
+          pending.chat_id,
+          pending.card_message_id,
+          `🔐 Send the value for <code>${escapeHtmlForTg(pending.key)}</code> as your next message. I’ll delete it instantly and store it in the vault.`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  if (action === 'decline') {
+    pendingSecretRequests.delete(stageId)
+    armedSecretCaptures.delete(pending.chat_id)
+    await ctx.answerCallbackQuery({ text: 'Declined.' }).catch(() => {})
+    if (pending.card_message_id != null) {
+      await ctx.api
+        .editMessageText(pending.chat_id, pending.card_message_id, `🚫 Declined — <code>${escapeHtmlForTg(pending.key)}</code> not provided.`, {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    }
+    // Tell the agent so it stops waiting.
+    const ts = Date.now()
+    const synthetic: InboundMessage = {
+      type: 'inbound',
+      chatId: pending.chat_id,
+      messageId: ts,
+      user: 'vault-broker',
+      userId: 0,
+      ts,
+      text: `🚫 Operator declined your request for \`vault:${pending.key}\`. Proceed without it or ask how they'd like to handle the task.`,
+      meta: { source: 'secret_declined', agent: pending.agent, key: pending.key, stage_id: stageId },
+    }
+    const delivered = ipcServer.sendToAgent(pending.agent, synthetic)
+    if (delivered) markClaudeBusyForInbound(synthetic)
+    else pendingInboundBuffer.push(pending.agent, synthetic)
+    return
+  }
+
+  await ctx.answerCallbackQuery().catch(() => {})
 }
 
 /**
@@ -9524,6 +9802,17 @@ async function handleInbound(
   const parsedQueue = isSteerPrefix ? { queued: false, body: parsedSteer.body } : parseQueuePrefix(text)
   const isQueuedPrefix = parsedQueue.queued
   let effectiveText = isSteerPrefix ? parsedSteer.body : (isQueuedPrefix ? parsedQueue.body : text)
+
+  // --- #2045 provided-secret capture ---
+  // If this chat is armed (operator tapped [Provide securely] on a
+  // request_secret card), THIS message is the secret value: delete it,
+  // write it to the vault, resume the agent, and STOP. Runs before secret
+  // detection, recordInbound, and the IPC broadcast so the raw value is
+  // never recorded, logged, or forwarded.
+  if (armedSecretCaptures.has(chat_id)) {
+    const consumed = await captureProvidedSecret(ctx, chat_id, msgId ?? undefined, effectiveText)
+    if (consumed) return
+  }
 
   // --- Secret detection + vault-scrub ---
   // If the user pasted a secret, intercept BEFORE we record to history or
@@ -15479,6 +15768,14 @@ bot.on('callback_query:data', async ctx => {
   // vra:deny:<stageId>    — refuse, edit card to denied
   if (data.startsWith('vra:')) {
     await handleVaultRequestAccessCallback(ctx, data)
+    return
+  }
+
+  // #2045: agent-requested-secret card.
+  //   vsp:provide:<stageId> — arm capture; operator's next message is the value
+  //   vsp:decline:<stageId> — drop the request, notify the agent
+  if (data.startsWith('vsp:')) {
+    await handleSecretRequestCallback(ctx, data)
     return
   }
 
