@@ -25,6 +25,7 @@
  */
 import { ALL_PATTERNS } from './patterns.js'
 import { scanKeyValue, type RawHit } from './kv-scanner.js'
+import { scanGenericSecrets } from './generic-entropy.js'
 import { shannonEntropy } from './entropy.js'
 import { chunk } from './chunker.js'
 import { isSuppressed } from './suppressor.js'
@@ -118,6 +119,14 @@ export function detectSecrets(text: string): Detection[] {
     for (const h of kvHits) {
       raw.push({ ...h, start: h.start + win.offset, end: h.end + win.offset })
     }
+    // Generic bare-high-entropy fallback (ambiguous). Catches standalone
+    // tokens no prefix/KV rule matched. dropOverlaps/dedupeRaw below prefer
+    // a high-confidence pattern hit over a generic one on the same range,
+    // so a recognized token isn't double-flagged.
+    const genHits = scanGenericSecrets(win.text)
+    for (const h of genHits) {
+      raw.push({ ...h, start: h.start + win.offset, end: h.end + win.offset })
+    }
   }
 
   // Dedupe by range + rule. If two rules hit the same range, prefer the
@@ -171,24 +180,28 @@ function dedupeRaw(raw: RawHit[]): RawHit[] {
 }
 
 /**
- * Drop hits fully contained inside another hit. Keeps the outer (typically
- * broader / higher-signal) hit — e.g. a JWT match wholly inside an
- * Authorization Bearer match keeps the Bearer.
+ * Drop an AMBIGUOUS hit that is fully contained inside another (larger)
+ * hit — e.g. a `generic_high_entropy` sub-span sitting inside a recognized
+ * high token, or inside an Authorization Bearer match. Narrow by design:
+ * it never drops a high-confidence hit and never touches high-vs-high
+ * overlaps, so it can't suppress a real detection — it only removes the
+ * redundant low-precision sub-spans the generic fallback can emit.
  */
 function dropOverlaps(hits: RawHit[]): RawHit[] {
-  const sorted = [...hits].sort((a, b) => (a.end - a.start) - (b.end - b.start))
-  const out: RawHit[] = []
-  for (const h of sorted) {
-    const contained = out.some(
-      (existing) =>
-        existing !== h &&
-        existing.start <= h.start &&
-        existing.end >= h.end &&
-        !(existing.start === h.start && existing.end === h.end),
-    )
-    if (!contained) out.push(h)
-  }
-  // Re-sort by start offset for deterministic downstream handling.
+  const out = hits.filter(
+    (h) =>
+      !(
+        h.confidence === 'ambiguous' &&
+        hits.some(
+          (o) =>
+            o !== h &&
+            o.start <= h.start &&
+            o.end >= h.end &&
+            !(o.start === h.start && o.end === h.end),
+        )
+      ),
+  )
+  // Sort by start offset for deterministic downstream handling.
   out.sort((a, b) => a.start - b.start || a.end - b.end)
   return out
 }
@@ -217,16 +230,22 @@ export async function detectSecretsAsync(text: string): Promise<Detection[]> {
     import('./secretlint-source.js').then((m) => m.detectViaSecretlint(text)),
   ])
 
-  // Merge with range-based dedupe. Vendored first wins on exact ties.
+  // Merge with range-based dedupe. On an exact-range tie, prefer the
+  // higher-confidence detection (else vendored-first). This matters since
+  // the vendored generic high-entropy fallback emits `ambiguous` — without
+  // the confidence tie-break it would shadow a Secretlint `high` provider
+  // hit on the same span and silently downgrade it (mirrors the sync
+  // dedupeRaw's high-over-ambiguous rule).
   const seen = new Map<string, Detection>()
-  for (const d of vendored) {
+  const consider = (d: Detection): void => {
     const key = `${d.start}:${d.end}`
-    if (!seen.has(key)) seen.set(key, d)
+    const existing = seen.get(key)
+    if (!existing || (existing.confidence === 'ambiguous' && d.confidence === 'high')) {
+      seen.set(key, d)
+    }
   }
-  for (const d of viaSecretlint) {
-    const key = `${d.start}:${d.end}`
-    if (!seen.has(key)) seen.set(key, d)
-  }
+  for (const d of vendored) consider(d)
+  for (const d of viaSecretlint) consider(d)
 
   // Re-derive slugs against the merged set (Secretlint and vendored each
   // had independent `existing` sets; we coalesce here).
