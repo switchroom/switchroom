@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.14.30 — "message me anytime" on the worker ticker
+
+After an agent delegates to a background worker and ends its turn, the
+ambient cross-turn ticker edits the agent's last reply in place every 60s
+with a `— still working (Nm)` suffix. That silent ticker read as *"agent
+is unresponsive"* — so the user waited instead of messaging, even though
+the agent was reachable the whole time (a background-worker dispatch never
+sets `turnInFlight`, so an inbound user message is delivered as a fresh
+turn, never buffered or raced against the handback).
+
+The gap was signaling, not capability. The fix is copy.
+
+### Reachability suffix (#2057)
+
+- The ticker suffix becomes `— still working (Nm) · message me anytime,
+  I'll keep you posted`, telling the user they can reach in at any moment
+  while the worker runs.
+- Pure render/copy change — no new dispatch path, no model call, no typing
+  churn. Edited in place every 60s exactly as before (jsonl-tail → render
+  only), so it stays inside the subscription boundary. The suffix stays
+  plain-text-safe under HTML parse_mode (no `<`, `>`, `&`).
+- `SUFFIX_RE` (the strip-before-reappend guard) made backward-compatible
+  — the new reachability clause is optional so an in-flight anchor carrying
+  a pre-upgrade suffix is still stripped on the next edit during a rolling
+  fleet upgrade.
+
 ## v0.14.29 — Worker cards finish, the 👍 waits for them
 
 Two bugs in the native Telegram background-worker progress card (shipped
