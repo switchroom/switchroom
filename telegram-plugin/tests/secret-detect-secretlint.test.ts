@@ -80,14 +80,18 @@ describe('detectSecretsAsync merge', () => {
     expect(slackHits[0]!.rule_id).toBe('slack_token')
   })
 
-  it('adds Secretlint-only hits for providers the vendored list misses', async () => {
-    // Shopify is covered by Secretlint preset-recommend but not by our
-    // vendored ANCHORED_PATTERNS.
+  it('detects a Shopify token via the async (Secretlint-augmented) path', async () => {
+    // Shopify is now ALSO a vendored PROVIDER_PATTERN (shopify_shared_secret),
+    // so on this span the merge prefers the vendored high hit over the
+    // Secretlint one — both are valid Shopify classifications. Secretlint
+    // remains the fallback for the long tail of providers we don't vendor;
+    // this asserts the async path still detects + classifies the token.
     const text = 'SHOPIFY=shpss_1234567890abcdef1234567890abcdef and go'
     const hits = await detectSecretsAsync(text)
     const shopify = hits.find((h) => h.matched_text.startsWith('shpss_'))
     expect(shopify).toBeDefined()
-    expect(shopify!.rule_id).toMatch(/secretlint_shopify/)
+    expect(shopify!.rule_id).toMatch(/shopify/)
+    expect(shopify!.confidence).toBe('high')
   })
 
   it('produces unique slugs across the merged detection list', async () => {
