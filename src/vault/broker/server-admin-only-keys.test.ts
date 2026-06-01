@@ -88,6 +88,7 @@ describe("broker mint_grant adminOnlyKeys (posture path)", () => {
   let prevNonLinuxFlag: string | undefined;
   let prevNodeEnv: string | undefined;
   let prevReqOpFlag: string | undefined;
+  let prevHome: string | undefined;
 
   beforeEach(() => {
     prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
@@ -97,6 +98,12 @@ describe("broker mint_grant adminOnlyKeys (posture path)", () => {
     prevReqOpFlag = process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
     delete process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-admin-only-"));
+    // Point HOME at the tmpdir so any `~/.switchroom/...` resolution
+    // (and the hermeticity lint) lands in isolation, never the operator
+    // tree. The broker is left locked anyway, but this keeps the test
+    // hermetic by construction.
+    prevHome = process.env.HOME;
+    process.env.HOME = tmpDir;
     socketPath = path.join(tmpDir, "test.sock");
     audit = [];
     grantsDb = new Database(":memory:");
@@ -114,6 +121,8 @@ describe("broker mint_grant adminOnlyKeys (posture path)", () => {
     else process.env.NODE_ENV = prevNodeEnv;
     if (prevReqOpFlag === undefined) delete process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT;
     else process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT = prevReqOpFlag;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
   });
 
   function makeBroker(adminOnlyKeys: string[]): VaultBroker {
