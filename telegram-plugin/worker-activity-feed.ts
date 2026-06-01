@@ -32,7 +32,13 @@
  * the feed is fed from watcher callbacks rather than the bridge event stream.
  */
 
-import { escapeHtml, formatDuration, truncate } from './card-format.js'
+import {
+  cleanWorkerResultParagraph,
+  escapeHtml,
+  formatDuration,
+  stripMarkdown,
+  truncate,
+} from './card-format.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -80,8 +86,10 @@ export interface BotApiForWorkerFeed {
 }
 
 const DESC_MAX = 80
-const TOOL_ARG_MAX = 64
-const SUMMARY_MAX = 100
+const STEP_MAX = 100
+const RESULT_MAX = 320
+/** Subtle horizontal rule between the running feed and the finished result. */
+const RULE = '─────'
 /**
  * How many trailing narrative lines the live feed keeps visible. The feed
  * grows like the main agent's answer but can't grow unbounded — Telegram
@@ -91,57 +99,83 @@ const SUMMARY_MAX = 100
 const NARRATIVE_MAX_LINES = 6
 
 /**
- * Render the worker-activity message body as Telegram HTML.
+ * Append the accumulated step feed to `lines`, mirroring the main agent's
+ * activity card (`renderActivityFeed`): prior steps render done (`✓`, italic),
+ * the newest renders in-progress (`→`, bold) unless `allDone`, and an overflow
+ * header (`✓ +N earlier…`) appears when the feed exceeds NARRATIVE_MAX_LINES.
+ * `steps` are already cleaned + escaped HTML.
+ */
+function appendStepFeed(lines: string[], steps: string[], allDone: boolean): void {
+  if (steps.length === 0) return
+  const shown = steps.slice(-NARRATIVE_MAX_LINES)
+  const hidden = steps.length - shown.length
+  if (hidden > 0) lines.push(`<i>✓ +${hidden} earlier…</i>`)
+  const lastIdx = shown.length - 1
+  shown.forEach((s, i) => {
+    lines.push(!allDone && i === lastIdx ? `<b>→ ${s}</b>` : `<i>✓ ${s}</i>`)
+  })
+}
+
+/**
+ * Render the worker-activity message body as native Telegram HTML, matching
+ * the main agent's activity card (`renderActivityFeed` in
+ * tool-activity-summary.ts): a `🛠 Worker · <desc>` header, a one-line status,
+ * then a `✓`/`→` step feed. Worker narration is authored as Markdown, so every
+ * text fragment is run through `stripMarkdown` before escaping — without it the
+ * raw `**`/`` ` ``/`---` leak through as literal characters (the "half-done"
+ * look we're fixing).
  *
  * Layout (running):
- *   🔧 <b>Worker</b> · <i>{description}</i>
- *   ⚡ <code>{tool}</code> {arg} <i>({n} tools · {elapsed})</i>
- *     ↳ <i>{latest summary}</i>
+ *   🛠 <b>Worker</b> · <i>{description}</i>
+ *   <i>running · {elapsed} · {n} tools</i>
+ *   <i>✓ {earlier step}</i>
+ *   <b>→ {newest step}</b>
  *
- * Terminal collapses the activity line to a tool-count + duration recap:
- *   ✅ <b>Worker done</b> · <i>{description}</i>
- *   <i>{n} tools · {elapsed}</i>
+ * Layout (finished): the feed renders all-done, then a rule + cleaned result:
+ *   🛠 <b>Worker</b> · <i>{description}</i>
+ *   <i>finished · completed · {n} tools · {elapsed}</i>
+ *   <i>✓ {step}</i>
+ *   ─────
+ *   ✅ <i>{cleaned result paragraph}</i>
  */
 export function renderWorkerActivity(v: WorkerActivityView): string {
-  const desc = truncate(v.description.trim() || 'background task', DESC_MAX)
+  const desc = truncate(stripMarkdown(v.description).trim() || 'background task', DESC_MAX)
   const elapsed = formatDuration(v.elapsedMs)
   const toolWord = v.toolCount === 1 ? 'tool' : 'tools'
+  const header = `🛠 <b>Worker</b> · <i>${escapeHtml(desc)}</i>`
+  const finished = v.state === 'done' || v.state === 'failed'
 
-  if (v.state === 'done' || v.state === 'failed') {
-    const head =
-      v.state === 'done'
-        ? `✅ <b>Worker done</b> · <i>${escapeHtml(desc)}</i>`
-        : `⚠️ <b>Worker failed</b> · <i>${escapeHtml(desc)}</i>`
-    return `${head}\n<i>${v.toolCount} ${toolWord} · ${elapsed}</i>`
-  }
-
-  const header = `🔧 <b>Worker</b> · <i>${escapeHtml(desc)}</i>`
-
-  let activity: string
-  if (v.lastTool != null) {
-    const arg = v.lastTool.sanitisedArg.trim()
-    const argPart = arg.length > 0 ? ` ${escapeHtml(truncate(arg, TOOL_ARG_MAX))}` : ''
-    activity = `⚡ <code>${escapeHtml(v.lastTool.name)}</code>${argPart} <i>(${v.toolCount} ${toolWord} · ${elapsed})</i>`
-  } else {
-    activity = `<i>starting… (${elapsed})</i>`
-  }
-
-  const lines = [header, activity]
-
-  // Growing narrative block when the manager has accumulated lines; the feed
-  // reads like the main agent's live answer rather than a single replaced
-  // status line. Fall back to the single latestSummary line otherwise.
-  const narrative = (v.narrativeLines ?? [])
-    .map((s) => s.trim())
+  const steps = (v.narrativeLines ?? [])
+    .map((s) => stripMarkdown(s))
     .filter((s) => s.length > 0)
-  if (narrative.length > 0) {
-    for (const line of narrative) {
-      lines.push(`  ↳ <i>${escapeHtml(truncate(line, SUMMARY_MAX))}</i>`)
+    .map((s) => escapeHtml(truncate(s, STEP_MAX)))
+
+  if (finished) {
+    const verb = v.state === 'done' ? 'completed' : 'failed'
+    const lines = [header, `<i>finished · ${verb} · ${v.toolCount} ${toolWord} · ${elapsed}</i>`]
+    appendStepFeed(lines, steps, true)
+    // On terminal, latestSummary carries the worker's final result text
+    // (gateway onFinish), distinct from the running narrative steps.
+    const result = cleanWorkerResultParagraph(v.latestSummary)
+    if (result.length > 0) {
+      const emoji = v.state === 'done' ? '✅' : '⚠️'
+      lines.push(RULE)
+      lines.push(`${emoji} <i>${escapeHtml(truncate(result, RESULT_MAX))}</i>`)
     }
+    return lines.join('\n')
+  }
+
+  const lines = [header, `<i>running · ${elapsed} · ${v.toolCount} ${toolWord}</i>`]
+  if (steps.length > 0) {
+    appendStepFeed(lines, steps, false)
   } else {
-    const summary = v.latestSummary.trim()
+    // Back-compat for direct render callers that pass only latestSummary;
+    // the manager always supplies narrativeLines.
+    const summary = stripMarkdown(v.latestSummary)
     if (summary.length > 0) {
-      lines.push(`  ↳ <i>${escapeHtml(truncate(summary, SUMMARY_MAX))}</i>`)
+      lines.push(`<b>→ ${escapeHtml(truncate(summary, STEP_MAX))}</b>`)
+    } else {
+      lines.push('<i>starting…</i>')
     }
   }
   return lines.join('\n')
@@ -307,7 +341,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       // message is left at its last running render — stale but harmless.
       return
     }
-    const body = renderWorkerActivity(view)
+    const body = renderWorkerActivity({ ...view, narrativeLines: h.narrative })
     if (body === h.lastBody) return
     try {
       await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))

@@ -69,72 +69,122 @@ function makeFakeBot(): FakeBot {
 // ─── renderWorkerActivity (pure) ─────────────────────────────────────────────
 
 describe('renderWorkerActivity', () => {
-  it('renders running header + tool activity line + summary', () => {
+  /** Count of step-feed bullets (`✓` done + `→` in-progress) in a body. */
+  const stepCount = (s: string) => (s.match(/[✓→]/g) ?? []).length
+
+  it('renders the native header + running status + step feed', () => {
     const out = renderWorkerActivity(view())
-    expect(out).toContain('🔧 <b>Worker</b> · <i>research competitors</i>')
-    expect(out).toContain('⚡ <code>Bash</code> grep -r pricing')
-    expect(out).toContain('(3 tools · ')
-    expect(out).toContain('↳ <i>scanning vendor pages</i>')
-  })
-
-  it('shows a "starting…" line when no tool has run yet', () => {
-    const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
-    expect(out).toContain('🔧 <b>Worker</b>')
-    expect(out).toContain('starting…')
+    expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
+    expect(out).toContain('running · ')
+    expect(out).toContain('3 tools')
+    // No narrativeLines → the latestSummary surfaces as the newest `→` step.
+    expect(out).toContain('<b>→ scanning vendor pages</b>')
+    // The old tool/arg chrome is gone.
     expect(out).not.toContain('⚡')
+    expect(out).not.toContain('<code>')
   })
 
-  it('omits the summary line when latestSummary is blank', () => {
+  it('shows a "starting…" line when no step has run yet', () => {
+    const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
+    expect(out).toContain('🛠 <b>Worker</b>')
+    expect(out).toContain('starting…')
+    expect(out).not.toContain('→')
+  })
+
+  it('falls back to starting… when the summary is blank', () => {
     const out = renderWorkerActivity(view({ latestSummary: '   ' }))
-    expect(out).not.toContain('↳')
+    expect(out).toContain('starting…')
+    expect(stepCount(out)).toBe(0)
   })
 
   it('uses singular "tool" for a single tool call', () => {
     const out = renderWorkerActivity(view({ toolCount: 1 }))
-    expect(out).toContain('(1 tool · ')
+    expect(out).toContain('1 tool')
+    expect(out).not.toContain('1 tools')
   })
 
-  it('renders a done terminal recap', () => {
-    const out = renderWorkerActivity(view({ state: 'done', toolCount: 5 }))
-    expect(out).toContain('✅ <b>Worker done</b> · <i>research competitors</i>')
-    expect(out).toContain('5 tools · ')
-    expect(out).not.toContain('⚡')
+  it('renders a done terminal recap with a rule + cleaned result', () => {
+    const out = renderWorkerActivity(
+      view({ state: 'done', toolCount: 5, latestSummary: 'PR #21 opened' }),
+    )
+    expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
+    expect(out).toContain('finished · completed · 5 tools · ')
+    expect(out).toContain('─────')
+    expect(out).toContain('✅ <i>PR #21 opened</i>')
   })
 
   it('renders a failed terminal recap', () => {
-    const out = renderWorkerActivity(view({ state: 'failed' }))
-    expect(out).toContain('⚠️ <b>Worker failed</b>')
+    const out = renderWorkerActivity(view({ state: 'failed', latestSummary: 'blew up' }))
+    expect(out).toContain('finished · failed · ')
+    expect(out).toContain('⚠️ <i>blew up</i>')
   })
 
-  it('grows a narrative block when narrativeLines is present', () => {
+  it('omits the rule + result line when the terminal result is empty', () => {
+    const out = renderWorkerActivity(view({ state: 'done', latestSummary: '   ' }))
+    expect(out).toContain('finished · completed · ')
+    expect(out).not.toContain('─────')
+  })
+
+  it('grows a step feed when narrativeLines is present (prior ✓, newest →)', () => {
     const out = renderWorkerActivity(
       view({
         latestSummary: 'newest only — should be ignored',
         narrativeLines: ['read the brief', 'scanned vendor A', 'scanned vendor B'],
       }),
     )
-    expect(out).toContain('↳ <i>read the brief</i>')
-    expect(out).toContain('↳ <i>scanned vendor A</i>')
-    expect(out).toContain('↳ <i>scanned vendor B</i>')
+    expect(out).toContain('<i>✓ read the brief</i>')
+    expect(out).toContain('<i>✓ scanned vendor A</i>')
+    expect(out).toContain('<b>→ scanned vendor B</b>')
     // The single-line latestSummary fallback is NOT used when a block is present.
     expect(out).not.toContain('newest only')
-    // Three narrative lines → three ↳ lines.
-    expect(out.match(/↳/g) ?? []).toHaveLength(3)
+    expect(stepCount(out)).toBe(3)
   })
 
   it('falls back to latestSummary when narrativeLines is empty', () => {
     const out = renderWorkerActivity(view({ narrativeLines: [], latestSummary: 'one line' }))
-    expect(out).toContain('↳ <i>one line</i>')
-    expect(out.match(/↳/g) ?? []).toHaveLength(1)
+    expect(out).toContain('<b>→ one line</b>')
+    expect(stepCount(out)).toBe(1)
   })
 
-  it('drops blank narrative lines from the block', () => {
-    const out = renderWorkerActivity(
-      view({ narrativeLines: ['kept', '   ', 'also kept'] }),
+  it('drops blank narrative lines from the feed', () => {
+    const out = renderWorkerActivity(view({ narrativeLines: ['kept', '   ', 'also kept'] }))
+    expect(out).toContain('<i>✓ kept</i>')
+    expect(out).toContain('<b>→ also kept</b>')
+    expect(stepCount(out)).toBe(2)
+  })
+
+  it('shows an overflow header when the feed exceeds the cap', () => {
+    const lines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines: lines }))
+    expect(out).toContain('<i>✓ +3 earlier…</i>')
+    expect(out).not.toContain('step 1')
+    expect(out).toContain('<i>✓ step 4</i>')
+    expect(out).toContain('<b>→ step 9</b>')
+    // 6 visible step lines (the overflow header is not itself a step).
+    expect(out.match(/step \d/g) ?? []).toHaveLength(6)
+  })
+
+  it('strips Markdown markup from narrative + description + result', () => {
+    const running = renderWorkerActivity(
+      view({
+        description: '**Build** the `sync`',
+        narrativeLines: ['- ran the **full** suite', '`git push`'],
+      }),
     )
-    expect(out).toContain('↳ <i>kept</i>')
-    expect(out).toContain('↳ <i>also kept</i>')
-    expect(out.match(/↳/g) ?? []).toHaveLength(2)
+    expect(running).toContain('🛠 <b>Worker</b> · <i>Build the sync</i>')
+    expect(running).toContain('ran the full suite')
+    expect(running).toContain('git push')
+    expect(running).not.toContain('**')
+    expect(running).not.toContain('`')
+
+    const done = renderWorkerActivity(
+      view({ state: 'done', latestSummary: '## Done\n\n**PR #21** opened\n\n---\n`merged`' }),
+    )
+    expect(done).toContain('Done PR #21 opened merged')
+    expect(done).not.toContain('**')
+    expect(done).not.toContain('`')
+    // The card's own divider is the box-drawing rule, never a raw `---`.
+    expect(done).not.toMatch(/(^|\n)\s*-{3,}\s*(\n|$)/)
   })
 
   it('escapes HTML inside narrative lines', () => {
@@ -142,17 +192,11 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain('a &lt;b&gt;x&lt;/b&gt; &amp; y')
   })
 
-  it('escapes HTML in description, tool, arg, and summary', () => {
+  it('escapes HTML in description and summary', () => {
     const out = renderWorkerActivity(
-      view({
-        description: 'a <b>bold</b> task',
-        lastTool: { name: 'Ba<sh', sanitisedArg: 'x & y' },
-        latestSummary: 'a > b',
-      }),
+      view({ description: 'a <b>bold</b> task', latestSummary: 'a > b' }),
     )
     expect(out).toContain('a &lt;b&gt;bold&lt;/b&gt; task')
-    expect(out).toContain('Ba&lt;sh')
-    expect(out).toContain('x &amp; y')
     expect(out).toContain('a &gt; b')
   })
 })
@@ -206,7 +250,7 @@ describe('createWorkerActivityFeed', () => {
     clock = 13_000 // +3000 since last edit > 2500
     await feed.update('w1', 'chat', view({ toolCount: 3 }))
     expect(bot.edits).toHaveLength(1)
-    expect(bot.edits[0].text).toContain('(3 tools · ')
+    expect(bot.edits[0].text).toContain('3 tools')
   })
 
   it('forces a terminal edit on finish, skipping the throttle', async () => {
@@ -219,7 +263,7 @@ describe('createWorkerActivityFeed', () => {
     clock = 10_500 // well within the throttle window
     await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
     expect(bot.edits).toHaveLength(1)
-    expect(bot.edits[0].text).toContain('✅ <b>Worker done</b>')
+    expect(bot.edits[0].text).toContain('finished · completed · 5 tools')
     // finish forgets the worker.
     expect(feed.has('w1')).toBe(false)
     expect(feed.size).toBe(0)
@@ -303,7 +347,7 @@ describe('createWorkerActivityFeed', () => {
 
     await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'read the brief' }))
     expect(bot.sent).toHaveLength(1)
-    expect(bot.sent[0].text).toContain('↳ <i>read the brief</i>')
+    expect(bot.sent[0].text).toContain('<b>→ read the brief</b>')
 
     clock = 11_000
     await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'scanned vendor A' }))
@@ -311,10 +355,10 @@ describe('createWorkerActivityFeed', () => {
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'scanned vendor B' }))
 
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('↳ <i>read the brief</i>')
-    expect(last.text).toContain('↳ <i>scanned vendor A</i>')
-    expect(last.text).toContain('↳ <i>scanned vendor B</i>')
-    expect(last.text.match(/↳/g) ?? []).toHaveLength(3)
+    expect(last.text).toContain('<i>✓ read the brief</i>')
+    expect(last.text).toContain('<i>✓ scanned vendor A</i>')
+    expect(last.text).toContain('<b>→ scanned vendor B</b>')
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(3)
   })
 
   it('dedups a repeated narrative line so the block does not duplicate', async () => {
@@ -329,7 +373,7 @@ describe('createWorkerActivityFeed', () => {
     await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'same line' }))
 
     const last = bot.edits.at(-1)!
-    expect(last.text.match(/↳/g) ?? []).toHaveLength(1)
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(1)
   })
 
   it('caps the narrative block to the last 6 lines', async () => {
@@ -343,7 +387,7 @@ describe('createWorkerActivityFeed', () => {
     }
 
     const last = bot.edits.at(-1)!
-    expect(last.text.match(/↳/g) ?? []).toHaveLength(6)
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(6)
     // Oldest lines evicted; newest retained.
     expect(last.text).not.toContain('line 1')
     expect(last.text).not.toContain('line 3')
@@ -368,9 +412,9 @@ describe('createWorkerActivityFeed', () => {
     clock = 13_000
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'line C' }))
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('↳ <i>line A</i>')
-    expect(last.text).toContain('↳ <i>line B</i>')
-    expect(last.text).toContain('↳ <i>line C</i>')
+    expect(last.text).toContain('<i>✓ line A</i>')
+    expect(last.text).toContain('<i>✓ line B</i>')
+    expect(last.text).toContain('<b>→ line C</b>')
   })
 
   it('forwards threadId as message_thread_id on send', async () => {

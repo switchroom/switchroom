@@ -60,3 +60,65 @@ export function escapeHtml(s: string): string {
 export function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
+
+/**
+ * Strip Markdown markup from a single line, leaving plain prose.
+ *
+ * Worker narration is authored as Markdown — the model writes `**bold**`,
+ * `` `code` ``, `- bullets`, `# headings`. The status cards render Telegram
+ * HTML, which does NOT interpret Markdown, so an unstripped `**` shows up as
+ * two literal asterisks (the #94-class "half-done" look). Strip the markup
+ * here so the card reads as clean prose.
+ *
+ * Run this BEFORE `truncate` + `escapeHtml`: clean → measure → escape. (The
+ * stripper never touches `<`/`>`/`&`, so escaping stays the last step.)
+ */
+export function stripMarkdown(s: string): string {
+  let out = s;
+  // Inline + leftover code spans → bare text.
+  out = out.replace(/`+/g, '');
+  // Links / images: [text](url) and ![alt](url) → the label.
+  out = out.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1');
+  // Paired bold / emphasis runs (longest marker first).
+  out = out.replace(/\*\*(.+?)\*\*/g, '$1');
+  out = out.replace(/__(.+?)__/g, '$1');
+  out = out.replace(/\*(.+?)\*/g, '$1');
+  out = out.replace(/(?<![A-Za-z0-9])_(.+?)_(?![A-Za-z0-9])/g, '$1');
+  // Leading block markup: heading, blockquote, bullet, ordered item.
+  out = out.replace(/^\s{0,3}#{1,6}\s+/, '');
+  out = out.replace(/^\s{0,3}>\s?/, '');
+  out = out.replace(/^\s{0,3}[-*+]\s+/, '');
+  out = out.replace(/^\s{0,3}\d+[.)]\s+/, '');
+  // Residual unpaired bold markers (a lone `*` is left alone so `3 * 4`
+  // survives; only the doubled form is markup-by-construction).
+  out = out.replace(/\*\*/g, '');
+  return out.trim();
+}
+
+/** True for a whole-line horizontal rule: `---`, `___`, `***` (3+ of one). */
+function isRuleLine(s: string): boolean {
+  return /^\s*([-_*])\1{2,}\s*$/.test(s);
+}
+
+/**
+ * Clean a worker's multi-line result/narration into a single plain-text
+ * paragraph for a card's finished body. Drops fenced code blocks and
+ * horizontal rules, strips per-line Markdown, then space-joins what's left.
+ * Output is plain text — the caller still truncates + escapes before
+ * interpolating into HTML.
+ */
+export function cleanWorkerResultParagraph(s: string): string {
+  const kept: string[] = [];
+  let inFence = false;
+  for (const raw of s.split('\n')) {
+    if (/^\s*```/.test(raw)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    if (isRuleLine(raw)) continue;
+    const cleaned = stripMarkdown(raw);
+    if (cleaned.length > 0) kept.push(cleaned);
+  }
+  return kept.join(' ').replace(/\s+/g, ' ').trim();
+}
