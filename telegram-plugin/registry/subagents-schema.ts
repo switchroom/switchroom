@@ -361,6 +361,30 @@ export function getSubagentByJsonlId(db: SqliteDatabase, jsonlAgentId: string): 
 }
 
 /**
+ * Count background subagents that have not yet reached a terminal state.
+ *
+ * This is the dispatch-time source of truth for "is a background worker still
+ * running" — the row is INSERTed with `status='running'` by `recordSubagentStart`
+ * the moment the parent's `Agent` tool_use fires (keyed on the `toolu_…` id),
+ * which is BEFORE the parent's turn ends. The deferred-done-reaction gate reads
+ * this so it holds the 👍 the instant a worker is dispatched, rather than
+ * snapshotting the file-discovery registry (which lags dispatch by a poll/fswatch
+ * tick and so missed just-dispatched workers — the premature-👍 race).
+ *
+ * `stalled` counts as still-running: a stalled worker isn't done. Genuinely
+ * dead rows are swept to a terminal status by the reaper (`reapStuckRunning`),
+ * so this can't get wedged above zero forever.
+ */
+export function countRunningBackgroundSubagents(db: SqliteDatabase): number {
+  const row = db
+    .prepare(
+      "SELECT count(*) AS n FROM subagents WHERE background = 1 AND status IN ('running', 'stalled')",
+    )
+    .get() as { n: number } | undefined
+  return row?.n ?? 0
+}
+
+/**
  * Record that a subagent has reached a terminal state (completed or failed).
  * Sets `ended_at`, `status`, and optionally `result_summary`.
  *

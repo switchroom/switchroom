@@ -390,6 +390,21 @@ export function projectSubagentLine(
         events.push({ kind: 'sub_agent_text', agentId, text })
       }
     }
+    // Authoritative early terminal: a background `Agent` worker's JSONL on
+    // claude ≥2.1.156 never writes the `system/turn_duration` line below, so
+    // the watcher used to only learn the worker finished via the ~5-min
+    // silent-stall synthesis net — leaving the card stuck "running" and the
+    // deferred 👍 held for minutes after the work was actually done. The
+    // worker DOES write a final assistant message with
+    // `stop_reason: 'end_turn'` (a tool-using turn is `'tool_use'` and keeps
+    // going), so treat that as the terminal signal. Emitted AFTER the content
+    // events so the final text/preamble still renders; the watcher's turn_end
+    // handler is guarded on `state === 'running'`, so a later real
+    // turn_duration line is a no-op.
+    const stopReason = message?.stop_reason as string | undefined
+    if (stopReason === 'end_turn') {
+      events.push({ kind: 'sub_agent_turn_end', agentId })
+    }
     return events
   }
 

@@ -28,6 +28,7 @@ import {
   bumpSubagentActivity,
   getSubagent,
   reapStuckRunningRows,
+  countRunningBackgroundSubagents,
 } from './subagents-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -178,6 +179,47 @@ describe('recordSubagentStart + recordSubagentEnd happy path', () => {
     recordSubagentStart(db, { id: 'sa-bg', background: true, startedAt: 5000 })
     const row = getSubagent(db, 'sa-bg')
     expect(row!.background).toBe(true)
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// countRunningBackgroundSubagents — the dispatch-time gate for the
+// deferred-done 👍 reaction. A row counts as "still running" the instant
+// recordSubagentStart inserts it (status='running'), closing the
+// file-discovery registration race that promoted the 👍 prematurely.
+// ---------------------------------------------------------------------------
+
+describe('countRunningBackgroundSubagents', () => {
+  it('counts a background worker the moment it starts (before any terminal)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
+    recordSubagentStart(db, { id: 'bg-1', background: true, startedAt: 1000 })
+    expect(countRunningBackgroundSubagents(db)).toBe(1)
+    db.close()
+  })
+
+  it('still counts a stalled worker (stalled is not done)', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'bg-2', background: true, startedAt: 1000 })
+    recordSubagentStall(db, { id: 'bg-2', stalledAt: 1500 })
+    expect(countRunningBackgroundSubagents(db)).toBe(1)
+    db.close()
+  })
+
+  it('drops to zero once the worker reaches a terminal status', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'bg-3', background: true, startedAt: 1000 })
+    expect(countRunningBackgroundSubagents(db)).toBe(1)
+    recordSubagentEnd(db, { id: 'bg-3', endedAt: 2000, status: 'completed' })
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
+    db.close()
+  })
+
+  it('ignores foreground subagents — only background workers gate the reaction', () => {
+    const db = openFreshSubagentsDbInMemory()
+    recordSubagentStart(db, { id: 'fg-1', background: false, startedAt: 1000 })
+    expect(countRunningBackgroundSubagents(db)).toBe(0)
     db.close()
   })
 })
