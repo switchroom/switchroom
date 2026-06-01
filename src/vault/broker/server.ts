@@ -63,6 +63,8 @@ import {
   revokeDecision as kernelRevokeDecision,
   listDecisions as kernelListDecisions,
   recordDecision as kernelRecordDecision,
+  getDecision as kernelGetDecision,
+  isOperatorVerifiedDecision,
   getNonce as kernelGetNonce,
   countPendingNonces,
   computeRetryAfterMs,
@@ -2073,6 +2075,44 @@ export class VaultBroker {
           });
           socket.write(encodeResponse(errorResponse("LOCKED", "Broker is locked")));
           return;
+        }
+        // Hard-boundary gate (RFC vault-approval-hard-boundary) — flag-gated,
+        // default OFF. Posture attestation alone is FORGEABLE: claude shares
+        // this per-agent socket with the gateway, so it can self-mint. When
+        // the flag is on, a posture-attested MINT must reference a kernel
+        // decision recorded with origin='operator' — i.e. verified by the
+        // host-side approval verifier on a channel claude cannot reach (a
+        // per-agent-socket decision is origin='agent' → rejected here).
+        // Default-off until the host verifier ships (PR ②); off ⇒ unchanged.
+        if (
+          req.op === "mint_grant" &&
+          process.env.SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT === "1"
+        ) {
+          const decisionId = (req as { decision_id?: string }).decision_id;
+          const dec =
+            decisionId != null && decisionId !== ""
+              ? kernelGetDecision(this.grantsDb, decisionId)
+              : null;
+          if (!isOperatorVerifiedDecision(dec, agentName ?? "")) {
+            writeAudit({
+              ts: new Date().toISOString(),
+              op: req.op,
+              caller: auditCaller,
+              pid: auditPid,
+              cgroup: auditCgroup,
+              result: "denied:posture-mint-needs-operator-verified-decision",
+            });
+            socket.write(
+              encodeResponse(
+                errorResponse(
+                  "DENIED",
+                  "posture-attested mint requires an operator-verified approval " +
+                    "(host-side tap); none referenced. See RFC vault-approval-hard-boundary.",
+                ),
+              ),
+            );
+            return;
+          }
         }
         mintPostureAttested = true;
         writeAudit({
