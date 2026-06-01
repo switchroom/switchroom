@@ -355,6 +355,7 @@ import { defaultVaultWrite, defaultVaultList, defaultVaultWritePosture } from '.
 import { parseVaultCliError, renderVaultCliError } from '../secret-detect/vault-error.js'
 import { recentDenialsFromAuditLog, type RecentDenial } from './recent-denials.js'
 import { detectSecrets } from '../secret-detect/index.js'
+import { redact } from '../secret-detect/redact.js'
 import { classifyAdminGate } from '../admin-commands/index.js'
 import {
   startSubagentWatcher,
@@ -5170,6 +5171,32 @@ async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ 
   return { content: [{ type: 'text', text: `checklist updated (id: ${message_id})` }] }
 }
 
+/**
+ * Outbound secret scrub (#2044). The agent is trusted, but it can still
+ * echo a secret it read from a file, env, or a not-yet-vaulted value into
+ * a reply — and outbound text had no redaction at all. This masks any
+ * detected secret in agent-authored text BEFORE it is logged (the stderr
+ * previews), forwarded (sent to Telegram), or stored (recordOutbound).
+ *
+ * It runs the SAME `detectSecrets` engine as the inbound gate, so a
+ * pattern added once (e.g. the Sanctum `<id>|<token>` shape, #2043) covers
+ * both directions. Applied at the entry of every agent-free-text tool
+ * (reply / stream_reply / edit_message), mutating the text in place so all
+ * downstream consumers — voice scrub, dedup key, chunker, answer-stream
+ * diffing, history record — see the masked value. This is the same
+ * in-place-mutation contract the voice scrub already relies on, which
+ * keeps the answer-stream's incremental edit diffing consistent (it always
+ * compares redacted-against-redacted).
+ */
+function redactOutboundText(text: string, site: string): string {
+  const masked = redact(text)
+  if (masked !== text) {
+    // Never log the secret — only that a mask fired, and where.
+    process.stderr.write(`telegram gateway: outbound secret masked site=${site}\n`)
+  }
+  return masked
+}
+
 async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
   // #1664 — pin the turn this reply belongs to at entry. The
   // finalAnswerDelivered write near the end of this function runs after
@@ -5183,6 +5210,11 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
   let text = repairEscapedWhitespace(rawText)
+  // Outbound secret scrub (#2044): mask any secret the agent echoed BEFORE
+  // the stderr preview below, the dedup key, the send, and the history
+  // record. Mutates `text` so every downstream consumer sees the masked
+  // value, exactly like the voice scrub that follows.
+  text = redactOutboundText(text, 'reply')
   // Voice scrub (#1683): replace em / en dashes with commas / periods.
   // Runs BEFORE outboundDedup so retries see the scrubbed key, and
   // BEFORE markdownToHtml so code-block content is correctly parked
@@ -5934,6 +5966,12 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
+
+  // Outbound secret scrub (#2044): mask before the dedup key, the draft
+  // stream sends, and the history record. stream_reply carries the FULL
+  // text-so-far on every call, so redacting each call keeps the answer-
+  // stream's incremental diffing comparing redacted-against-redacted.
+  args.text = redactOutboundText(args.text as string, 'stream_reply')
 
   // Voice scrub (PR #1683 follow-up). Modern Claude on the fleet
   // uses the answer-stream / draft-stream path for multi-paragraph
@@ -6991,6 +7029,9 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   const editConfigMode = editAccess.parseMode ?? 'html'
   const editFormat = (args.format as string | undefined) ?? editConfigMode
   let editRawText = repairEscapedWhitespace(args.text as string)
+  // Outbound secret scrub (#2044): an edit must not re-introduce a raw
+  // secret into a live bubble or the history row. Mask before scrub/send.
+  editRawText = redactOutboundText(editRawText, 'edit_message')
   // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
   // are how silent-anchor and progress-update mutate already-sent
   // bubbles, so without this an edit can re-introduce dashes the
