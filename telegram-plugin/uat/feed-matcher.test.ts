@@ -13,17 +13,23 @@ const feed = (text: string) => ({ text }) as Parameters<typeof isWorkerFeedMessa
 
 describe("isWorkerFeedMessage", () => {
   it("matches the running feed header", () => {
-    expect(isWorkerFeedMessage(feed("🔧 Worker · crawling changelog · 0:12"))).toBe(true);
+    expect(isWorkerFeedMessage(feed("🛠 Worker · crawling changelog"))).toBe(true);
+    expect(
+      isWorkerFeedMessage(feed("🛠 Worker · crawling changelog\nrunning · 00:12 · 4 tools")),
+    ).toBe(true);
   });
 
-  it("matches the terminal done/failed recaps", () => {
-    expect(isWorkerFeedMessage(feed("✅ Worker done · 10 tools · 1:03"))).toBe(true);
-    expect(isWorkerFeedMessage(feed("⚠️ Worker failed · 3 tools"))).toBe(true);
+  it("matches the terminal finished status (completed/failed)", () => {
+    expect(
+      isWorkerFeedMessage(feed("🛠 Worker · crawl\nfinished · completed · 10 tools · 01:03")),
+    ).toBe(true);
+    expect(
+      isWorkerFeedMessage(feed("🛠 Worker · crawl\nfinished · failed · 3 tools · 00:08")),
+    ).toBe(true);
   });
 
-  it("matches a done/failed header even without the leading emoji", () => {
-    expect(isWorkerFeedMessage(feed("Worker done · 2 tools"))).toBe(true);
-    expect(isWorkerFeedMessage(feed("Worker failed mid-step"))).toBe(true);
+  it("matches the finished status even on its own line (header-stripped edge)", () => {
+    expect(isWorkerFeedMessage(feed("finished · completed · 2 tools · 00:30"))).toBe(true);
   });
 
   it("does NOT match an ordinary agent reply", () => {
@@ -40,7 +46,7 @@ describe("isWorkerFeedMessage", () => {
   });
 
   it("exposes the regex for scenarios that assert on the feed directly", () => {
-    expect(WORKER_FEED_RE.test("🔧 Worker · x")).toBe(true);
+    expect(WORKER_FEED_RE.test("🛠 Worker · x")).toBe(true);
   });
 });
 

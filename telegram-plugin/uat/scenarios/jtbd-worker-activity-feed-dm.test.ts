@@ -12,12 +12,14 @@
  * sleep/echo work, so it narrates between tools and the feed can paint
  * + edit), then asserts:
  *
- *   1. a worker-feed message appears (🔧 Worker · …), distinct from the
+ *   1. a worker-feed message appears (🛠 Worker · …), distinct from the
  *      parent's ack reply — proving background activity surfaces after
  *      the parent turn closed;
  *   2. the message edits in place while work is in flight (body changes
  *      across a window) — proving it's live, not a one-shot post;
- *   3. it finalizes to the terminal recap (✅ Worker done · … / N tools).
+ *   3. it finalizes to the terminal recap (finished · completed · N tools);
+ *   4. the native card never leaks raw Markdown (no `**`, backticks, or
+ *      ASCII `---` rule) — the #94-class regression guard.
  *
  * It logs every observed body so a human can read the real rendered UX.
  *
@@ -53,10 +55,11 @@ const BG_DISPATCH_PROMPT =
   `brief reply saying you've kicked off the background worker so I can ` +
   `watch its progress.`;
 
-// The feed header rendered in Telegram: "🔧 Worker · <desc>" (running)
-// or "✅ Worker done · …" / "⚠️ Worker failed · …" (terminal).
-const WORKER_FEED_RE = /🔧\s*Worker|Worker done|Worker failed|⚡/i;
-const WORKER_DONE_RE = /✅\s*Worker done|⚠️\s*Worker failed/i;
+// The feed header rendered in Telegram: "🛠 Worker · <desc>" with a
+// "running · …" status (running) or "finished · completed/failed · …"
+// (terminal).
+const WORKER_FEED_RE = /🛠\s*Worker|running\s*·|finished\s*·/i;
+const WORKER_DONE_RE = /finished\s*·\s*(completed|failed)/i;
 
 describe("uat: live worker-activity feed (#2000)", () => {
   it(
@@ -116,6 +119,14 @@ describe("uat: live worker-activity feed (#2000)", () => {
         expect(doneText!).toMatch(/tools?|tool ·/i);
         // Did the body actually move between first paint and terminal?
         expect(doneText).not.toBe(before);
+        // #94-class regression guard: the native card strips worker Markdown,
+        // so the rendered body must never carry raw `**`, backticks, or an
+        // ASCII `---` rule (the finished divider is the box-drawing `─────`).
+        expect(doneText!, "raw ** leaked into the card").not.toMatch(/\*\*/);
+        expect(doneText!, "raw backtick leaked into the card").not.toContain("`");
+        expect(doneText!, "raw --- rule leaked into the card").not.toMatch(
+          /(^|\n)\s*-{3,}\s*(\n|$)/,
+        );
       } finally {
         await sc.tearDown();
       }
