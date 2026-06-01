@@ -429,11 +429,41 @@ export function checkAclByAgent(
     }
   }
 
+  // Operator-set STANDING grant — agents.<name>.secrets[] (cascaded
+  // defaults -> profile -> agent, UNION). The clean home for "what this
+  // agent may access", decoupled from a specific cron's schedule[].secrets[]
+  // (which welds access to one schedule entry) and from MCP-server secrets.
+  // Operator-controlled: agents cannot edit switchroom.yaml or self-grant
+  // (reference/vision.md outcome 2 — "you hold the leash; only your tap
+  // grants it"). Read directly from raw yaml here, same as the mcp_servers
+  // cascade above, because the broker doesn't run the full merge pipeline
+  // per request.
+  const cfgSecrets = config as {
+    defaults?: { secrets?: unknown };
+    profiles?: Record<string, { secrets?: unknown }>;
+  };
+  const profileSecrets =
+    profileName != null && profileName.length > 0
+      ? cfgSecrets.profiles?.[profileName]?.secrets
+      : undefined;
+  const standingSecrets: string[] = [
+    ...(Array.isArray(cfgSecrets.defaults?.secrets)
+      ? (cfgSecrets.defaults!.secrets as string[])
+      : []),
+    ...(Array.isArray(profileSecrets) ? (profileSecrets as string[]) : []),
+    ...(Array.isArray((agentConfig as { secrets?: unknown }).secrets)
+      ? ((agentConfig as { secrets?: string[] }).secrets as string[])
+      : []),
+  ];
+  if (standingSecrets.includes(key)) {
+    return { allow: true };
+  }
+
   const schedule = agentConfig.schedule ?? [];
   if (schedule.length === 0) {
     return {
       allow: false,
-      reason: `agent '${agentName}' has no schedule entries declaring 'secrets' and no mcp_servers.*.secrets[] declaring '${key}'; nothing is broker-accessible`,
+      reason: `agent '${agentName}' has no schedule entries declaring 'secrets', no mcp_servers.*.secrets[], and no agents.${agentName}.secrets[] standing grant declaring '${key}'; nothing is broker-accessible`,
     };
   }
 

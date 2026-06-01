@@ -343,6 +343,18 @@ export function mergeAgentConfig(
     };
   }
 
+  // --- secrets: union (operator-set STANDING vault grant; defaults first) ---
+  // Cascades like tools.allow so a profile can grant a baseline set and an
+  // agent adds more. Operator-only — agents cannot self-grant. The broker
+  // (acl.ts) reads the SAME union directly from raw yaml; this keeps the
+  // merged-config view consistent for anything else that reads it.
+  if (defaults.secrets || merged.secrets) {
+    merged.secrets = dedupe([
+      ...(defaults.secrets ?? []),
+      ...(merged.secrets ?? []),
+    ]);
+  }
+
   // --- soul: shallow field merge, agent wins ---
   //
   // A default soul can provide a fallback persona ("warm, concise") that

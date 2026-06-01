@@ -1019,3 +1019,73 @@ describe("ACL: user-declared MCP-server secrets", () => {
     expect(checkAclByAgent(config, "gymbro", "perplexity/api-key").allow).toBe(false);
   });
 });
+
+describe("ACL: operator-set standing grant (agents.<name>.secrets[])", () => {
+  const cfg = (extra: Record<string, unknown>): SwitchroomConfig =>
+    ({
+      switchroom: { version: 1 },
+      telegram: { bot_token: "t", forum_chat_id: "1" },
+      vault: {
+        path: "~/.switchroom/vault.enc",
+        broker: { socket: "s", enabled: true },
+      },
+      ...extra,
+    }) as unknown as SwitchroomConfig;
+
+  it("grants a key in the agent's standing secrets even with no schedule", () => {
+    const config = cfg({
+      agents: { alice: { topic_name: "alice", secrets: ["microsoft/token"] } },
+    });
+    expect(checkAclByAgent(config, "alice", "microsoft/token").allow).toBe(true);
+  });
+
+  it("denies a key not in the standing grant (no schedule, no mcp)", () => {
+    const config = cfg({
+      agents: { alice: { topic_name: "alice", secrets: ["microsoft/token"] } },
+    });
+    const r = checkAclByAgent(config, "alice", "compass/creds");
+    expect(r.allow).toBe(false);
+    if (!r.allow) expect(r.reason).toContain("standing grant");
+  });
+
+  it("cascades from defaults.secrets", () => {
+    const config = cfg({
+      defaults: { secrets: ["shared/key"] },
+      agents: { alice: { topic_name: "alice" } },
+    });
+    expect(checkAclByAgent(config, "alice", "shared/key").allow).toBe(true);
+  });
+
+  it("cascades from the agent's profile.secrets via extends", () => {
+    const config = cfg({
+      profiles: { base: { secrets: ["profile/key"] } },
+      agents: { alice: { topic_name: "alice", extends: "base" } },
+    });
+    expect(checkAclByAgent(config, "alice", "profile/key").allow).toBe(true);
+  });
+
+  it("unions defaults + profile + agent (all three readable)", () => {
+    const config = cfg({
+      defaults: { secrets: ["d/key"] },
+      profiles: { base: { secrets: ["p/key"] } },
+      agents: {
+        alice: { topic_name: "alice", extends: "base", secrets: ["a/key"] },
+      },
+    });
+    expect(checkAclByAgent(config, "alice", "d/key").allow).toBe(true);
+    expect(checkAclByAgent(config, "alice", "p/key").allow).toBe(true);
+    expect(checkAclByAgent(config, "alice", "a/key").allow).toBe(true);
+    expect(checkAclByAgent(config, "alice", "x/key").allow).toBe(false);
+  });
+
+  it("is per-agent — alice's standing grant is not readable by bob", () => {
+    const config = cfg({
+      agents: {
+        alice: { topic_name: "alice", secrets: ["alice/key"] },
+        bob: { topic_name: "bob", secrets: ["bob/key"] },
+      },
+    });
+    expect(checkAclByAgent(config, "bob", "alice/key").allow).toBe(false);
+    expect(checkAclByAgent(config, "alice", "alice/key").allow).toBe(true);
+  });
+});
