@@ -111,6 +111,31 @@ provides it through a secure card and you reference it as `vault:<key>`."**
 This is what actually prevents the incident class; the tool + card are the
 mechanism it points at.
 
+### 4.5 This is the THIRD member of an existing tool family
+
+The gateway already ships two agent-initiated vault tools (issue #969 P1a / #1012):
+
+- **`vault_request_save(chat_id, key, value, …)`** — the agent **has** a
+  value and asks the operator to approve saving it (`executeVaultRequestSave`,
+  `PendingVaultRequestSave`, `vrs:` callbacks, `renderVaultRequestSaveCard`).
+- **`vault_request_access(chat_id, key, scope, …)`** — the agent hits
+  `VAULT-BROKER-DENIED` and asks the operator to grant it read/write access
+  to an existing key (`vra:` callbacks).
+
+`request_secret` is the **missing third case**: the agent needs a value it
+does **not** have. It is `vault_request_save` *minus the `value` arg* — the
+value arrives from the operator via secure capture instead of from the
+agent. It reuses the same staging map shape, card/keyboard rendering, slug
+validation (`VAULT_KEY_REGEX`), and the on-tap vault write
+(`defaultVaultWritePosture` / `defaultVaultWrite`). New callback prefix
+`vsp:` (vault-secret-provide), mirroring `vrs:`.
+
+**This resolves §6.1:** the access grant is NOT new work — after the value
+is saved, the requesting agent gets read access through the *existing*
+`vault_request_access` flow (or the operator's `mcp_servers[].secrets[]`).
+`request_secret` can optionally chain into it, but it doesn't reimplement
+granting.
+
 ## 5. Why this is low-risk to build
 
 Every piece already exists and is battle-tested:
