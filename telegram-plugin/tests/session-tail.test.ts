@@ -492,6 +492,49 @@ describe('projectSubagentLine', () => {
     expect(events).toEqual([{ kind: 'sub_agent_turn_end', agentId: 'X' }])
   })
 
+  it('emits sub_agent_turn_end after the text when the final assistant message stop_reason is end_turn', () => {
+    // Background `Agent` workers (claude ≥2.1.156) never write the
+    // system/turn_duration line, only a final assistant message with
+    // stop_reason 'end_turn'. That IS the authoritative completion signal —
+    // without treating it as terminal the card hung "running" until the
+    // ~5-min stall-synthesis net fired (the screenshot bug).
+    const st = { hasEmittedStart: true }
+    const events = projectSubagentLine(
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'Done. Fixed the bug.' }],
+        },
+      }),
+      'X',
+      st,
+    )
+    // Text first (so the final summary still renders), turn_end last.
+    expect(events).toEqual([
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Done. Fixed the bug.' },
+      { kind: 'sub_agent_turn_end', agentId: 'X' },
+    ])
+  })
+
+  it('does NOT emit sub_agent_turn_end for a tool-using assistant message (stop_reason tool_use)', () => {
+    // A mid-run assistant message that calls a tool has stop_reason 'tool_use'
+    // and keeps going — it must not be mistaken for completion.
+    const st = { hasEmittedStart: true }
+    const events = projectSubagentLine(
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          stop_reason: 'tool_use',
+          content: [{ type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } }],
+        },
+      }),
+      'X',
+      st,
+    )
+    expect(events.some((e) => e.kind === 'sub_agent_turn_end')).toBe(false)
+  })
+
   it('skips malformed lines silently', () => {
     const st = { hasEmittedStart: false }
     expect(projectSubagentLine('{not-json', 'X', st)).toEqual([])

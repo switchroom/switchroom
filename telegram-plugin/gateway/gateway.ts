@@ -2119,6 +2119,13 @@ function finalizeStatusReaction(
  * fired its `done`/`failed` onFinish no longer counts here.
  */
 function countRunningWorkers(): number {
+  // Prefer the dispatch-time DB count: a background worker's row is INSERTed
+  // `status='running'` when its `Agent` tool_use fires, i.e. BEFORE the parent
+  // turn ends. The registry below is populated by on-disk file discovery, which
+  // lags dispatch by a poll/fswatch tick — so a just-dispatched worker was
+  // invisible to the deferred-done gate and the 👍 promoted prematurely.
+  const dbCount = subagentWatcher?.countRunningBackgroundWorkers?.()
+  if (dbCount != null) return dbCount
   const reg = subagentWatcher?.getRegistry()
   if (reg == null) return 0
   let n = 0

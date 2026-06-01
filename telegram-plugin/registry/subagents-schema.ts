@@ -361,6 +361,41 @@ export function getSubagentByJsonlId(db: SqliteDatabase, jsonlAgentId: string): 
 }
 
 /**
+ * Count background subagents that have not yet reached a terminal state.
+ *
+ * This is the dispatch-time source of truth for "is a background worker still
+ * running" — the row is INSERTed with `status='running'` by `recordSubagentStart`
+ * the moment the parent's `Agent` tool_use fires (keyed on the `toolu_…` id),
+ * which is BEFORE the parent's turn ends. The deferred-done-reaction gate reads
+ * this so it holds the 👍 the instant a worker is dispatched, rather than
+ * snapshotting the file-discovery registry (which lags dispatch by a poll/fswatch
+ * tick and so missed just-dispatched workers — the premature-👍 race).
+ *
+ * Counts `running` ONLY — `stalled` is deliberately excluded. `stalled` is NOT
+ * a terminal status: the reaper (`reapStuckRunningRows`) transitions a row to
+ * `stalled`, never to `completed`/`failed`. A genuinely-orphaned background row
+ * — one INSERTed at dispatch whose JSONL was never linked, so no activity ever
+ * bumped it and the in-memory silent-stall synthesis never terminalised it —
+ * sits in `stalled` indefinitely (the 1h reaper TTL is the only thing that
+ * moves it off `running`). Counting `stalled` would wedge the deferred 👍 above
+ * zero forever for that row (`reaction-defer.ts` `promote()` bails while the
+ * count is > 0). A live-but-quiet worker, by contrast, is driven to `completed`
+ * by the watcher's terminal paths (end_turn signal OR silent-stall synthesis,
+ * both call `recordSubagentEnd`) long before the 1h reaper, and a stalled row
+ * that genuinely resumes is flipped back to `running` by `recordSubagentResume`
+ * — so excluding `stalled` never releases the 👍 on a worker that's merely
+ * paused rather than dead.
+ */
+export function countRunningBackgroundSubagents(db: SqliteDatabase): number {
+  const row = db
+    .prepare(
+      "SELECT count(*) AS n FROM subagents WHERE background = 1 AND status = 'running'",
+    )
+    .get() as { n: number } | undefined
+  return row?.n ?? 0
+}
+
+/**
  * Record that a subagent has reached a terminal state (completed or failed).
  * Sets `ended_at`, `status`, and optionally `result_summary`.
  *

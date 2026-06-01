@@ -43,7 +43,7 @@ import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
 import { escapeHtml, truncate } from './card-format.js'
-import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows } from './registry/subagents-schema.js'
+import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -377,6 +377,13 @@ export interface SubagentWatcherHandle {
   stop(): void
   /** Snapshot of current registry for tests/inspection. */
   getRegistry(): ReadonlyMap<string, WorkerEntry>
+  /**
+   * Count background workers still in flight, read from the dispatch-time DB
+   * (not the file-discovery registry). Returns null when no DB is wired so the
+   * caller can fall back to the registry snapshot. Drives the deferred-done
+   * reaction gate — see `countRunningBackgroundSubagents`.
+   */
+  countRunningBackgroundWorkers(): number | null
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -1497,6 +1504,17 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
 
     getRegistry(): ReadonlyMap<string, WorkerEntry> {
       return registry
+    },
+
+    countRunningBackgroundWorkers(): number | null {
+      if (db == null) return null
+      try {
+        return countRunningBackgroundSubagents(db)
+      } catch {
+        // A torn/locked DB read must not wedge the reaction gate — fall back
+        // to the registry snapshot by returning null.
+        return null
+      }
     },
   }
 }
