@@ -22,6 +22,12 @@
  * This guard fails loudly if any `dispatchPermissionVerdict(...)`
  * callsite is not paired with a `resumeReactionAfterVerdict()` within a
  * few lines — i.e. a new (or refactored) verdict path drops the resume.
+ *
+ * Same pin applies to `postPermissionResumeMessage(...)`: the distinct
+ * agent-voiced "got it, continuing: <work>" message is the legible signal
+ * the operator actually sees (the reaction lands on a far-up message; the
+ * card edit is a one-liner). It rides the exact same 5-paths-drift hazard,
+ * so every verdict path must post it too.
  */
 
 import { describe, it, expect } from 'vitest'
@@ -82,5 +88,34 @@ describe('permission verdict → resume reaction wiring', () => {
     expect(/function\s+resumeReactionAfterVerdict\s*\(/.test(GATEWAY_SRC)).toBe(
       true,
     )
+  })
+
+  // postPermissionResumeMessage rides ~1–2 lines after resumeReactionAfterVerdict
+  // on every path, so it can sit a touch further from the dispatch than the
+  // resume call — give it a little more headroom.
+  const POST_WINDOW = 20
+
+  it('every dispatchPermissionVerdict() callsite posts the agent-voiced resume message via postPermissionResumeMessage()', () => {
+    const unpaired: number[] = []
+    for (const idx of dispatchCallsites) {
+      const window = LINES.slice(idx, idx + POST_WINDOW + 1).join('\n')
+      if (!/\bpostPermissionResumeMessage\s*\(/.test(window)) {
+        unpaired.push(idx + 1)
+      }
+    }
+    expect(
+      unpaired,
+      `dispatchPermissionVerdict() at gateway.ts line(s) ` +
+        `${unpaired.join(', ')} has no postPermissionResumeMessage() within ` +
+        `${POST_WINDOW} lines — that verdict path resumes the turn silently, ` +
+        `so the operator never gets the "got it, continuing: <work>" message. ` +
+        `Add the post call next to resumeReactionAfterVerdict() (see sibling paths).`,
+    ).toEqual([])
+  })
+
+  it('the resume-message helper still exists', () => {
+    expect(
+      /function\s+postPermissionResumeMessage\s*\(/.test(GATEWAY_SRC),
+    ).toBe(true)
   })
 })

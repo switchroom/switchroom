@@ -372,7 +372,7 @@ import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
-import { formatPermissionCardBody, describeGrant } from '../permission-title.js'
+import { formatPermissionCardBody, describeGrant, naturalAction, formatPermissionResumeMessage } from '../permission-title.js'
 import { resolveScopedAllowChoices, isRulePersisted } from '../permission-rule.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
@@ -2159,6 +2159,60 @@ function resumeReactionAfterVerdict(): void {
     ?.setThinking()
 }
 
+/**
+ * Post the agent-voiced "got your verdict — continuing" message the
+ * instant the operator answers a permission card. Travels right beside
+ * `resumeReactionAfterVerdict()` at every operator-driven verdict site so
+ * the legible signal (a distinct message naming the work) can't drift away
+ * from the reaction flip — the same 5-paths-drift hazard #2019 guards.
+ *
+ * The card edit + 🙏→working reaction are easy to miss (a reaction lands on
+ * the turn's triggering message far up the chat; the card footnote is a
+ * one-liner). This message is the thing the operator actually sees.
+ *
+ * Posts to the suspended turn's chat/thread (`currentTurn` still points at
+ * it mid-gate — the same controller `resumeReactionAfterVerdict` addresses)
+ * so it lands in the conversation the gate belongs to; falls back to the
+ * configured operator chats when there's no active turn (e.g. a swept turn
+ * at TTL-sweep time). Kill-switch: `SWITCHROOM_RESUME_MSG=0`.
+ */
+function postPermissionResumeMessage(opts: {
+  behavior: 'allow' | 'deny'
+  action: string
+  timeoutMinutes?: number
+}): void {
+  if (process.env.SWITCHROOM_RESUME_MSG === '0') return
+  const text = formatPermissionResumeMessage({
+    agentName: process.env.SWITCHROOM_AGENT_NAME ?? null,
+    behavior: opts.behavior,
+    action: opts.action,
+    timeoutMinutes: opts.timeoutMinutes,
+  })
+  const turn = currentTurn
+  const targets: Array<{ chatId: string; threadId: number | undefined }> =
+    turn != null
+      ? [{ chatId: turn.sessionChatId, threadId: turn.sessionThreadId }]
+      : loadAccess().allowFrom.map(chatId => ({
+          chatId,
+          threadId: resolveAgentOutboundTopic({
+            kind: 'permission',
+            turnInitiated: false,
+            originThreadId: undefined,
+          }),
+        }))
+  for (const { chatId, threadId } of targets) {
+    // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send
+    void swallowingApiCall(
+      () =>
+        bot.api.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: chatId, verb: 'permission-resume', ...(threadId != null ? { threadId } : {}) },
+    )
+  }
+}
+
 function resolveThreadId(chat_id: string, explicit?: string | number | null): number | undefined {
   if (explicit != null) return Number(explicit)
   return chatThreadMap.get(chat_id)
@@ -3067,6 +3121,11 @@ const pendingStateReaper = setInterval(() => {
       // The auto-deny un-parks the suspended turn — flip 🙏 → working so
       // it doesn't sit on the awaiting glyph (or stall) after the timeout.
       resumeReactionAfterVerdict()
+      postPermissionResumeMessage({
+        behavior: 'deny',
+        action: naturalAction(v.tool_name, v.input_preview),
+        timeoutMinutes: Math.round(PERMISSION_TTL_MS / 60000),
+      })
       process.stderr.write(
         `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
         `tool=${v.tool_name} (no operator response in ` +
@@ -9265,6 +9324,11 @@ async function handleInbound(
       behavior,
     })
     resumeReactionAfterVerdict()
+    const ftDetails = pendingPermissions.get(request_id)
+    postPermissionResumeMessage({
+      behavior,
+      action: ftDetails ? naturalAction(ftDetails.tool_name, ftDetails.input_preview) : '',
+    })
     if (msgId != null) {
       const emoji = behavior === 'allow' ? '✅' : '❌'
       void bot.api.setMessageReaction(chat_id, msgId, [
@@ -12158,6 +12222,10 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   // Forward to connected bridges — same IPC the button handler uses.
   dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
   resumeReactionAfterVerdict()
+  postPermissionResumeMessage({
+    behavior,
+    action: naturalAction(details.tool_name, details.input_preview),
+  })
   pendingPermissions.delete(request_id)
   process.stderr.write(
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
@@ -15812,6 +15880,10 @@ bot.on('callback_query:data', async ctx => {
     // below). Un-park 🙏 → working immediately so the operator sees the
     // agent continue while hostd writes the durable rule.
     resumeReactionAfterVerdict()
+    postPermissionResumeMessage({
+      behavior: 'allow',
+      action: naturalAction(details.tool_name, details.input_preview),
+    })
 
     // (3) Decide the persistence path. tryHostdDispatch returns
     // "not-configured" when host_control is disabled or the per-agent
@@ -15963,18 +16035,20 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // Forward permission decision to connected bridges
+  // Forward permission decision to connected bridges. Capture the work
+  // phrase BEFORE deleting the pending entry — postPermissionResumeMessage
+  // (fired in synthInbound below) names the resumed work.
+  const resumeAction = (() => {
+    const d = pendingPermissions.get(request_id)
+    return d ? naturalAction(d.tool_name, d.input_preview) : ''
+  })()
   pendingPermissions.delete(request_id)
-  // Deterministic "▶️ resuming…" beat (framework-posted, not model text):
-  // the verdict un-parks the suspended turn, so confirm to the operator
-  // that the agent received it and is continuing — closing the "is it
-  // working or did my tap do nothing?" gap. Allow and deny both resume the
-  // turn (deny just hands claude a refusal it then handles).
-  const resumeAgent = process.env.SWITCHROOM_AGENT_NAME
-  const resumeBeat = resumeAgent
-    ? `▶️ ${escapeHtmlForTg(resumeAgent)} resuming…`
-    : '▶️ resuming…'
-  const label = `${behavior === 'allow' ? '✅ Allowed' : '❌ Denied'} · ${resumeBeat}`
+  // The card collapses to a plain verdict label. The distinct agent-voiced
+  // "got it, continuing: …" message (posted on resume below) now carries
+  // the "is it working or did my tap do nothing?" signal the old
+  // `▶️ resuming…` card footnote used to — and names the work, which the
+  // footnote never did. Keeps the card terse and the resume legible.
+  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   // HTML-escape the source text — same hazard as the scope-commit and
   // recent-denial paths above. The permission card body
   // (formatPermissionCardBody) appends claude-supplied `description`
@@ -16005,6 +16079,10 @@ bot.on('callback_query:data', async ctx => {
       // Un-park the status reaction: 🙏 → working, re-arming the stall
       // watchdog that setAwaiting() suspended.
       resumeReactionAfterVerdict()
+      postPermissionResumeMessage({
+        behavior: behavior as 'allow' | 'deny',
+        action: resumeAction,
+      })
     },
   })
 })

@@ -12,6 +12,7 @@ import {
   naturalAction,
   describeGrant,
   formatPermissionCardBody,
+  formatPermissionResumeMessage,
 } from '../permission-title.js'
 import type { ScopeOption } from '../permission-rule.js'
 
@@ -191,5 +192,72 @@ describe('describeGrant — phrased from the chosen scope', () => {
     expect(describeGrant('mcp__perplexity__search', undefined, opt('mcp__perplexity__search'))).toBe(
       'search the web (Perplexity)',
     )
+  })
+})
+
+describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
+  test('allow names the work it is resuming', () => {
+    expect(
+      formatPermissionResumeMessage({
+        agentName: 'gymbro',
+        behavior: 'allow',
+        action: 'edit: supplement-log.md',
+      }),
+    ).toBe('▶️ <b>Gymbro</b> — got it, continuing: <i>edit: supplement-log.md</i>')
+  })
+
+  test('deny names what it will skip, lower-cased inline', () => {
+    expect(
+      formatPermissionResumeMessage({
+        agentName: 'ziggy',
+        behavior: 'deny',
+        action: 'Search the web',
+      }),
+    ).toBe("🚫 <b>Ziggy</b> — noted, I won't search the web. Continuing without it.")
+  })
+
+  test('TTL auto-deny variant reads as a timeout, not a tap', () => {
+    expect(
+      formatPermissionResumeMessage({
+        agentName: 'finn',
+        behavior: 'deny',
+        action: 'run: deploy.sh',
+        timeoutMinutes: 5,
+      }),
+    ).toBe('🚫 <b>Finn</b> — no answer in 5m, continuing without it (<i>run: deploy.sh</i>).')
+  })
+
+  test('HTML-escapes a hostile action phrase (no raw </>& injection)', () => {
+    const out = formatPermissionResumeMessage({
+      agentName: 'clerk',
+      behavior: 'allow',
+      action: 'run: echo <b>&"pwned"</b>',
+    })
+    expect(out).toContain('&lt;b&gt;&amp;')
+    expect(out).not.toContain('<b>&"pwned"')
+  })
+
+  test('cap-first on the agent name', () => {
+    const out = formatPermissionResumeMessage({
+      agentName: 'lawgpt',
+      behavior: 'allow',
+      action: 'read: contract.pdf',
+    })
+    expect(out).toContain('<b>Lawgpt</b>')
+  })
+
+  test('empty action falls back to a generic continue (no dangling phrase)', () => {
+    expect(
+      formatPermissionResumeMessage({ agentName: 'carrie', behavior: 'allow', action: '' }),
+    ).toBe('▶️ <b>Carrie</b> — got it, back to work.')
+    expect(
+      formatPermissionResumeMessage({ agentName: 'carrie', behavior: 'deny', action: '   ' }),
+    ).toBe('🚫 <b>Carrie</b> — noted, continuing without it.')
+  })
+
+  test('null agent name degrades to a neutral "Agent" label', () => {
+    expect(
+      formatPermissionResumeMessage({ agentName: null, behavior: 'allow', action: 'edit: x.md' }),
+    ).toBe('▶️ <b>Agent</b> — got it, continuing: <i>edit: x.md</i>')
   })
 })
