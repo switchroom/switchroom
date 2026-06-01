@@ -20,6 +20,7 @@ import {
   recordTurnStart,
   recordTurnEnd,
   findRecentTurnsForChat,
+  getTurnByKey,
 } from './turns-schema.js'
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,39 @@ describe('findRecentTurnsForChat', () => {
     const done = rows.find(r => r.turn_key === 'turn_done')
     expect(running?.ended_at).toBeNull()
     expect(typeof done?.ended_at).toBe('number')
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// getTurnByKey — recover the dispatch chat/thread for a sub-agent's parent
+// turn (subagents.parent_turn_key -> turns.turn_key). Without this the
+// worker card / handback fall back to the operator DM (#worker-card-routing).
+// ---------------------------------------------------------------------------
+
+describe('getTurnByKey', () => {
+  it('returns null when the turn key does not exist', () => {
+    const db = openTurnsDbInMemory()
+    expect(getTurnByKey(db, 'nope')).toBeNull()
+    db.close()
+  })
+
+  it('recovers chat_id + thread_id for a group/topic turn', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'g:11', chatId: '-1001234567890', threadId: '42' })
+    const turn = getTurnByKey(db, 'g:11')
+    expect(turn?.turn_key).toBe('g:11')
+    expect(turn?.chat_id).toBe('-1001234567890')
+    expect(turn?.thread_id).toBe('42')
+    db.close()
+  })
+
+  it('recovers chat_id with null thread_id for a plain group/DM turn', () => {
+    const db = openTurnsDbInMemory()
+    recordTurnStart(db, { turnKey: 'dm:7', chatId: '12345' })
+    const turn = getTurnByKey(db, 'dm:7')
+    expect(turn?.chat_id).toBe('12345')
+    expect(turn?.thread_id).toBeNull()
     db.close()
   })
 })
