@@ -27,6 +27,7 @@
 
 import { chmodSync, mkdirSync } from 'fs'
 import { join } from 'path'
+import { redact } from './secret-detect/redact.js'
 
 /**
  * `bun:sqlite` is a Bun built-in — Vite/Node loaders can't resolve it
@@ -300,6 +301,10 @@ export function recordInbound(args: RecordInboundArgs): void {
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text)
     VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL, ?, ?)
   `)
+  // Defense-in-depth: never persist a detected secret to the message store.
+  // The inbound gate (server.ts handleInbound) already deletes + vaults a
+  // high-confidence hit before reaching here, so for caught secrets this is
+  // a no-op; it's the backstop for any shape the gate's pattern set misses.
   stmt.run(
     args.chat_id,
     args.thread_id ?? null,
@@ -307,10 +312,10 @@ export function recordInbound(args: RecordInboundArgs): void {
     args.user ?? null,
     args.user_id ?? null,
     args.ts,
-    args.text,
+    redact(args.text),
     args.attachment_kind ?? null,
     args.reply_to_message_id ?? null,
-    args.reply_to_text ?? null,
+    args.reply_to_text != null ? redact(args.reply_to_text) : (args.reply_to_text ?? null),
   )
 }
 
@@ -356,9 +361,14 @@ export function recordOutbound(args: RecordOutboundArgs): void {
       )
     }
   }) as (...args: unknown[]) => unknown)
+  // Outbound redaction: the agent→user direction has no other secret
+  // scrub, so this is the chokepoint that keeps an agent-echoed secret out
+  // of the message store (e.g. an agent quoting a token it read from a file
+  // or a not-yet-vaulted value). Masks the secret bytes in place; the
+  // surrounding reply text is preserved.
   const rows: Array<[number, string, string | null]> = args.message_ids.map((id, i) => [
     id,
-    args.texts[i] ?? '',
+    redact(args.texts[i] ?? ''),
     args.attachment_kinds?.[i] ?? null,
   ])
   tx(rows)
@@ -387,7 +397,9 @@ export function recordEdit(args: RecordEditArgs): void {
          SET text = ?
        WHERE chat_id = ? AND message_id = ?
     `)
-    .run(args.text, args.chat_id, args.message_id)
+    // Same outbound chokepoint as recordOutbound — an edit must not
+    // reintroduce a raw secret into the stored row.
+    .run(redact(args.text), args.chat_id, args.message_id)
 }
 
 export interface RecordReactionArgs {

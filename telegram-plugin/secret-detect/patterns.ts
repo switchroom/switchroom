@@ -54,6 +54,14 @@ export const ANCHORED_PATTERNS: PatternDef[] = [
   // Telegram bot tokens: with "bot" prefix or bare ID:token.
   { rule_id: 'telegram_bot_token_prefixed', regex: /\bbot(\d{6,}:[A-Za-z0-9_-]{20,})\b/g, captureIndex: 1, slugHint: 'telegram_bot_token' },
   { rule_id: 'telegram_bot_token', regex: /\b(\d{6,}:[A-Za-z0-9_-]{20,})\b/g, captureIndex: 1, slugHint: 'telegram_bot_token' },
+  // Laravel Sanctum / Coolify personal-access tokens. Shape: `<id>|<token>`
+  // where <id> is the integer PK and <token> is `Str::random(40)` — 40 base62
+  // chars. The `|` separator is what distinguishes this from a Telegram
+  // `id:token` (colon) or a JWT. Length floor 40 (the Sanctum default) keeps
+  // this off short pipe-joined chat like `1|foo` or markdown table cells.
+  // Incident 2026-06-01: a live `17|<40-char>` Coolify token pasted by a user
+  // slipped every existing pattern and persisted in plaintext.
+  { rule_id: 'laravel_sanctum_token', regex: /\b(\d+\|[A-Za-z0-9]{40,})\b/g, captureIndex: 1, slugHint: 'api_token' },
   { rule_id: 'aws_access_key', regex: /\b(AKIA[0-9A-Z]{16})\b/g, captureIndex: 1, slugHint: 'aws_access_key' },
   { rule_id: 'jwt', regex: /\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, captureIndex: 1, slugHint: 'jwt' },
 ]
