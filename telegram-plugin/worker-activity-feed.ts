@@ -147,7 +147,10 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
   const finished = v.state === 'done' || v.state === 'failed'
 
   const steps = (v.narrativeLines ?? [])
-    .map((s) => stripMarkdown(s))
+    // A narrative entry can itself be multi-line (e.g. a worker's final
+    // "Done.\n\n## Summary\n…"). Collapse to one visual line so a step
+    // slot stays single-line after the per-line markdown strip.
+    .map((s) => stripMarkdown(s).replace(/\s+/g, ' ').trim())
     .filter((s) => s.length > 0)
     .map((s) => escapeHtml(truncate(s, STEP_MAX)))
 
@@ -172,7 +175,7 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
   } else {
     // Back-compat for direct render callers that pass only latestSummary;
     // the manager always supplies narrativeLines.
-    const summary = stripMarkdown(v.latestSummary)
+    const summary = stripMarkdown(v.latestSummary).replace(/\s+/g, ' ').trim()
     if (summary.length > 0) {
       lines.push(`<b>→ ${escapeHtml(truncate(summary, STEP_MAX))}</b>`)
     } else {

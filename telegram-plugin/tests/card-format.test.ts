@@ -27,6 +27,22 @@ describe('stripMarkdown', () => {
     expect(stripMarkdown('2) second')).toBe('second')
   })
 
+  it('strips leading block markup on EVERY line, not just the string start', () => {
+    // The screenshot regression: a worker summary that opens with prose
+    // ("Done.") then a `## Summary` heading mid-string. Without the `gm`
+    // flags the heading marker leaked into the rendered card.
+    const headed = stripMarkdown('Done.\n\n## Summary\n\nFixed the bug')
+    expect(headed).not.toContain('##')
+    expect(headed).toContain('Done.')
+    expect(headed).toContain('Summary')
+    expect(headed).toContain('Fixed the bug')
+
+    const mixed = stripMarkdown('intro\n> quoted\n- item')
+    expect(mixed).not.toMatch(/(^|\n)\s*[>\-*]/)
+    expect(mixed).toContain('quoted')
+    expect(mixed).toContain('item')
+  })
+
   it('reduces a link to its label', () => {
     expect(stripMarkdown('see [the PR](https://x/y) here')).toBe('see the PR here')
   })
