@@ -85,10 +85,13 @@ export function stripMarkdown(s: string): string {
   out = out.replace(/\*(.+?)\*/g, '$1');
   out = out.replace(/(?<![A-Za-z0-9])_(.+?)_(?![A-Za-z0-9])/g, '$1');
   // Leading block markup: heading, blockquote, bullet, ordered item.
-  out = out.replace(/^\s{0,3}#{1,6}\s+/, '');
-  out = out.replace(/^\s{0,3}>\s?/, '');
-  out = out.replace(/^\s{0,3}[-*+]\s+/, '');
-  out = out.replace(/^\s{0,3}\d+[.)]\s+/, '');
+  // `gm` so the markers are stripped on EVERY line, not just the string
+  // start — a multi-line summary like "Done.\n\n## Summary\n…" must not
+  // leak a raw `## Summary` when rendered as a single card step.
+  out = out.replace(/^\s{0,3}#{1,6}\s+/gm, '');
+  out = out.replace(/^\s{0,3}>\s?/gm, '');
+  out = out.replace(/^\s{0,3}[-*+]\s+/gm, '');
+  out = out.replace(/^\s{0,3}\d+[.)]\s+/gm, '');
   // Residual unpaired bold markers (a lone `*` is left alone so `3 * 4`
   // survives; only the doubled form is markup-by-construction).
   out = out.replace(/\*\*/g, '');

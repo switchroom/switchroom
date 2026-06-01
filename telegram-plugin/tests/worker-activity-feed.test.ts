@@ -187,6 +187,21 @@ describe('renderWorkerActivity', () => {
     expect(done).not.toMatch(/(^|\n)\s*-{3,}\s*(\n|$)/)
   })
 
+  it('renders a multi-line narrative entry as one clean step (no raw ## leak)', () => {
+    // Screenshot regression: a running-card step whose narrative entry is
+    // itself multi-line ("Done.\n\n## Summary\n…"). The heading marker must
+    // not leak and the step must collapse to a single visual line.
+    const out = renderWorkerActivity(
+      view({
+        narrativeLines: ['Done.\n\n## Summary\n\nFixed the bug where a bad password logged you out'],
+        latestSummary: '',
+      }),
+    )
+    expect(out).not.toContain('## Summary')
+    expect(out).not.toContain('\n\n')
+    expect(out).toContain('Done. Summary Fixed the bug where a bad password logged you out')
+  })
+
   it('escapes HTML inside narrative lines', () => {
     const out = renderWorkerActivity(view({ narrativeLines: ['a <b>x</b> & y'] }))
     expect(out).toContain('a &lt;b&gt;x&lt;/b&gt; &amp; y')
