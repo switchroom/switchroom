@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.14.33 — Blocking-TUI wedge fix (AskUserQuestion deny + wedge-watchdog)
+
+Closes a wedge class where claude's **blocking interactive TUI selectors**
+(the `AskUserQuestion` / `ExitPlanMode` class — a full-screen
+multiple-choice list with the footer "❯ 1. … · Enter to select · ↑/↓ to
+navigate · Esc to cancel") freeze a **headless** agent forever. With no
+human at the terminal the selector blocks indefinitely: the turn never
+completes, queued Telegram inbounds pile up, and the agent looks **mute**
+(real incident: klanker, 2026-06-01, recovered only by a manual tmux `Esc`).
+
+Two defensive layers:
+
+### Layer 1 — deny `AskUserQuestion` fleet-wide (#2064)
+
+`AskUserQuestion` is now an unconditional fleet-baseline deny
+(`INTERACTIVE_TUI_FLEET_DENY_TOOLS` in `src/agents/scaffold.ts`), wired into
+the fresh-scaffold `toolsDeny`, the `reconcileAgent` `desiredDeny`, AND the
+existing-agent merge branch in `scaffoldAgent` (the `switchroom apply`
+convergence path). A denied `AskUserQuestion` does **not** crash the turn —
+claude degrades gracefully and asks the same question as **plain text**,
+which reaches the operator over Telegram. A one-off power-user need can
+re-enable via the `settings_raw` deep-merge escape hatch.
+
+### Layer 2 — continuous mid-session wedge-watchdog (#2065)
+
+Defense-in-depth for blocking selectors Layer 1's deny can't reach (a
+`settings_raw` override, a not-yet-reconciled agent, a future selector tool,
+or `ExitPlanMode`). The `autoaccept-poll` sidecar now runs two phases in one
+process: the existing boot phase, then a continuous `runWedgeWatchdog` that
+polls the pane and dismisses a **stable** blocking selector with `Esc`
+(which claude treats as "user declined" — non-destructive).
+
+Conservative by design — false positives (Esc into a *live* turn) are worse
+than false negatives. Fires only on **all three** of: a strict footer
+signature (same-line "Esc…cancel" AND a select/navigate affordance — rejects
+the working footer "esc to interrupt" and the idle REPL footer);
+byte-identical stability across N consecutive polls (default 3 @ 5s ≈ 15s
+confirmed-stuck — a working pane's spinner/timer changes between polls); and
+a post-fire cooldown (default 60s). Defers to first-run prompts (those want
+Enter) and soft-fails throughout. Kill-switch: `SWITCHROOM_WEDGE_WATCHDOG=0`
+restores legacy boot-only behaviour.
+
 ## v0.14.32 — Background worker card routes to the dispatch chat (#2061)
 
 Fixes a routing bug where a background sub-agent's live worker card
