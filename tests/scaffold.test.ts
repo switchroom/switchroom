@@ -611,10 +611,14 @@ describe("scaffoldAgent", () => {
     }
   });
 
-  it("reconcile re-seeds AskUserQuestion deny into an EXISTING agent", () => {
-    // Mirrors the webkite re-seed guard: a deployed agent that predates
-    // this deny must converge on it at the next `switchroom apply`
-    // (reconcile rewrites settings.permissions.deny wholesale).
+  it("scaffoldAgent re-seeds AskUserQuestion deny into an EXISTING agent (apply path)", () => {
+    // Mirrors the webkite allow re-seed guard. A deployed agent that
+    // predates this deny must converge on it at the next `switchroom
+    // apply`, which calls scaffoldAgent — whose existing-agent merge
+    // branch additively re-seeds settings.permissions.deny (writeIfMissing
+    // skips the template for existing agents, so the fresh-path deny never
+    // lands). This is the convergence path that matters for live agents;
+    // the reconcileAgent path shares the same dedupe spread.
     const config = makeAgentConfig({});
     const cfg = {
       switchroom: { version: 1, agents_dir: tmpDir },
