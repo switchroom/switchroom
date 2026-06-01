@@ -81,7 +81,8 @@ interface TrailEntry {
   text: string;
 }
 
-const SUFFIX_RE = /\n\n— still working \(\d+m\)$/;
+const SUFFIX_RE =
+  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/;
 
 function pad(s: string, n: number): string {
   return s.length >= n ? s : s + " ".repeat(n - s.length);

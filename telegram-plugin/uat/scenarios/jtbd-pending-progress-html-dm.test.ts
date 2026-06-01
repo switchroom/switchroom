@@ -40,7 +40,8 @@ const PROMPT =
   `the bash, send that one HTML reply, end your turn. When it finishes ` +
   `much later, reply with the single word "done".`;
 
-const SUFFIX_RE = /\n\n— still working \(\d+m\)$/;
+const SUFFIX_RE =
+  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/;
 
 describe("uat: pending-progress edit preserves HTML formatting (#1698 regression gate)", () => {
   it(

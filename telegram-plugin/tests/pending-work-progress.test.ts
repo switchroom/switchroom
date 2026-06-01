@@ -139,7 +139,7 @@ describe('pending-work-progress', () => {
     expect(cap.edits).toHaveLength(1)
     expect(cap.edits[0].messageId).toBe(100)
     expect(cap.edits[0].newText).toBe(
-      'Background sleep running; awaiting completion.\n\n— still working (1m)',
+      "Background sleep running; awaiting completion.\n\n— still working (1m) · message me anytime, I'll keep you posted",
     )
 
     // Tick at 3 intervals total — second edit, "3m".
@@ -148,7 +148,7 @@ describe('pending-work-progress', () => {
     await flush()
     expect(cap.edits).toHaveLength(2)
     expect(cap.edits[1].newText).toBe(
-      'Background sleep running; awaiting completion.\n\n— still working (3m)',
+      "Background sleep running; awaiting completion.\n\n— still working (3m) · message me anytime, I'll keep you posted",
     )
   })
 
@@ -168,7 +168,25 @@ describe('pending-work-progress', () => {
     await flush()
     // The new edit should be based on 'worker dispatched' alone.
     expect(cap.edits[0].newText).toBe(
-      'worker dispatched\n\n— still working (1m)',
+      "worker dispatched\n\n— still working (1m) · message me anytime, I'll keep you posted",
+    )
+  })
+
+  it('strips a prior NEW-shape suffix (with reachability clause) too', async () => {
+    const cap = setup()
+    startTurn(KEY)
+    noteAsyncDispatch(KEY)
+    noteOutbound(KEY, {
+      messageId: 100,
+      text:
+        "worker dispatched\n\n— still working (12m) · message me anytime, I'll keep you posted",
+    })
+    noteTurnEnd(KEY)
+    cap.now = EDIT_INTERVAL_MS
+    __tickForTests(cap.now)
+    await flush()
+    expect(cap.edits[0].newText).toBe(
+      "worker dispatched\n\n— still working (1m) · message me anytime, I'll keep you posted",
     )
   })
 
@@ -338,7 +356,7 @@ describe('pending-work-progress', () => {
     expect(cap.edits).toHaveLength(1)
     expect(cap.edits[0].parseMode).toBe('HTML')
     expect(cap.edits[0].newText).toBe(
-      '<b>Worker back.</b> Both blockers fixed.\n\n— still working (1m)',
+      "<b>Worker back.</b> Both blockers fixed.\n\n— still working (1m) · message me anytime, I'll keep you posted",
     )
   })
 

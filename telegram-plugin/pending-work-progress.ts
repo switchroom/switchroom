@@ -35,7 +35,11 @@
  *   turn_end with pending+anchor → activate the timer for the key
  *   tick (every 5s, edit every  → editMessageText against the anchor
  *     EDIT_INTERVAL_MS)            appending/refreshing the suffix
- *                                  " — still working (Nm)"
+ *                                  " — still working (Nm) · message me
+ *                                  anytime, I'll keep you posted"
+ *                                  (the reachability clause signals the
+ *                                  agent is still listening while a
+ *                                  background worker runs — issue PR3)
  *   inbound user message        → clear (user re-engaged or moved on)
  *   subagent_handback inject    → clear (model about to re-engage)
  *   MAX_LIFETIME_MS budget cap  → clear (give up; 30 min default)
@@ -70,10 +74,13 @@ export const TELEGRAM_MSG_CAP = 4000
 /**
  * Regex matching the suffix we append. Used to strip a prior suffix
  * before appending the next one. The (\d+) covers "1m" / "12m" / etc.
+ * The reachability clause is optional so anchors carrying a pre-v0.14.30
+ * suffix (no clause) are still stripped during a rolling upgrade.
  * Kept anchored to end-of-string so it only matches OUR suffix, not
  * something the model happened to write.
  */
-const SUFFIX_RE = /\n\n— still working \(\d+m\)$/
+const SUFFIX_RE =
+  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/
 
 export interface PendingProgressEditCtx {
   chatId: string
@@ -380,7 +387,7 @@ function tick(now: number): void {
     // user-visible counter reads honestly (we only edit at intervals
     // ≥ EDIT_INTERVAL_MS = 60s).
     const minutes = Math.max(1, Math.round(elapsed / 60_000))
-    const suffix = `\n\n— still working (${minutes}m)`
+    const suffix = `\n\n— still working (${minutes}m) · message me anytime, I'll keep you posted`
     const newText = s.anchorOriginalText + suffix
 
     if (newText.length > TELEGRAM_MSG_CAP) {
