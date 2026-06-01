@@ -118,6 +118,65 @@ export const STRUCTURED_PATTERNS: PatternDef[] = [
 ]
 
 /**
- * Concatenated registry — anchored first, then structured.
+ * High-precision PREFIXED provider patterns (gitleaks/secret-scanner style).
+ *
+ * Every rule here has a distinctive literal prefix + length, so false
+ * positives on ordinary chat/code are near-zero — which is load-bearing,
+ * because the inbound gate DELETES a message on a high-confidence hit.
+ * We deliberately keep ONLY prefix-anchored rules here; a generic
+ * "any high-entropy string" detector (the bare-token gap that let the
+ * Sanctum `<id>|<token>` slip) is intentionally NOT here — that's a
+ * separate, ambiguous-routed change so it can't auto-delete on a guess.
+ *
+ * Baked as TS (not loaded from the vendored gitleaks.toml at runtime):
+ * the bundler inlines secret-detect into dist/server.js + gateway.js and
+ * does NOT ship the .toml alongside, so a runtime `loadGitleaksPatterns()`
+ * would silently resolve to nothing in the agent image. TS entries flow
+ * through ALL_PATTERNS into the shared detectSecrets engine, so they
+ * protect the inbound gate, the outbound mask, AND the issues pipeline.
+ *
+ * Provider prefixes already in ANCHORED_PATTERNS (sk-ant-, sk-, ghp_,
+ * github_pat_, AKIA, AIza, xox*, gsk_, pplx-, npm_, telegram id:token, jwt)
+ * are intentionally omitted to avoid duplicate hits.
  */
-export const ALL_PATTERNS: PatternDef[] = [...ANCHORED_PATTERNS, ...STRUCTURED_PATTERNS]
+export const PROVIDER_PATTERNS: PatternDef[] = [
+  { rule_id: 'slack_webhook', regex: /(https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9_/]+)/g, captureIndex: 1, slugHint: 'slack_webhook' },
+  { rule_id: 'stripe_live_secret', regex: /\b(sk_live_[A-Za-z0-9]{24,})\b/g, captureIndex: 1, slugHint: 'stripe_key' },
+  { rule_id: 'stripe_restricted', regex: /\b(rk_live_[A-Za-z0-9]{24,})\b/g, captureIndex: 1, slugHint: 'stripe_key' },
+  { rule_id: 'sendgrid_api_key', regex: /\b(SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})\b/g, captureIndex: 1, slugHint: 'sendgrid_key' },
+  { rule_id: 'gitlab_pat', regex: /\b(glpat-[A-Za-z0-9_-]{20})\b/g, captureIndex: 1, slugHint: 'gitlab_pat' },
+  { rule_id: 'huggingface_token', regex: /\b(hf_[A-Za-z0-9]{34,})\b/g, captureIndex: 1, slugHint: 'huggingface_token' },
+  // (openai sk-proj-/sk-svcacct- are already covered by the anchored
+  //  `openai_api_key` sk- rule — no separate entry needed.)
+  { rule_id: 'twilio_api_key', regex: /\b(SK[0-9a-f]{32})\b/g, captureIndex: 1, slugHint: 'twilio_api_key' },
+  { rule_id: 'mailgun_key', regex: /\b(key-[0-9a-f]{32})\b/g, captureIndex: 1, slugHint: 'mailgun_key' },
+  { rule_id: 'mailchimp_key', regex: /\b([0-9a-f]{32}-us[0-9]{1,2})\b/g, captureIndex: 1, slugHint: 'mailchimp_key' },
+  { rule_id: 'digitalocean_pat', regex: /\b(dop_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },
+  { rule_id: 'digitalocean_oauth', regex: /\b(doo_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },
+  { rule_id: 'digitalocean_refresh', regex: /\b(dor_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },
+  { rule_id: 'doppler_token', regex: /\b(dp\.(?:pt|st|ct|sa|scim|audit)\.[A-Za-z0-9]{40,44})\b/g, captureIndex: 1, slugHint: 'doppler_token' },
+  { rule_id: 'linear_api_key', regex: /\b(lin_api_[A-Za-z0-9]{40})\b/g, captureIndex: 1, slugHint: 'linear_api_key' },
+  { rule_id: 'shopify_access_token', regex: /\b(shpat_[a-fA-F0-9]{32})\b/g, captureIndex: 1, slugHint: 'shopify_token' },
+  { rule_id: 'shopify_shared_secret', regex: /\b(shpss_[a-fA-F0-9]{32})\b/g, captureIndex: 1, slugHint: 'shopify_token' },
+  { rule_id: 'shopify_private_app', regex: /\b(shppa_[a-fA-F0-9]{32})\b/g, captureIndex: 1, slugHint: 'shopify_token' },
+  { rule_id: 'square_access_token', regex: /\b(sq0atp-[A-Za-z0-9_-]{22})\b/g, captureIndex: 1, slugHint: 'square_token' },
+  { rule_id: 'square_oauth_secret', regex: /\b(sq0csp-[A-Za-z0-9_-]{43})\b/g, captureIndex: 1, slugHint: 'square_token' },
+  { rule_id: 'newrelic_key', regex: /\b(NRAK-[A-Z0-9]{27})\b/g, captureIndex: 1, slugHint: 'newrelic_key' },
+  { rule_id: 'notion_token', regex: /\b(ntn_[A-Za-z0-9]{46})\b/g, captureIndex: 1, slugHint: 'notion_token' },
+  { rule_id: 'planetscale_password', regex: /\b(pscale_pw_[A-Za-z0-9_.-]{43})\b/g, captureIndex: 1, slugHint: 'planetscale_token' },
+  { rule_id: 'planetscale_token', regex: /\b(pscale_tkn_[A-Za-z0-9_.-]{43})\b/g, captureIndex: 1, slugHint: 'planetscale_token' },
+  { rule_id: 'supabase_service_key', regex: /\b(sbp_[a-f0-9]{40})\b/g, captureIndex: 1, slugHint: 'supabase_key' },
+  { rule_id: 'atlassian_token', regex: /\b(ATATT[A-Za-z0-9_\-=]{20,})\b/g, captureIndex: 1, slugHint: 'atlassian_token' },
+  { rule_id: 'dropbox_token', regex: /\b(sl\.[A-Za-z0-9_-]{130,})/g, captureIndex: 1, slugHint: 'dropbox_token' },
+  { rule_id: 'databricks_token', regex: /\b(dapi[a-f0-9]{32})\b/g, captureIndex: 1, slugHint: 'databricks_token' },
+  { rule_id: 'grafana_service_account', regex: /\b(glsa_[A-Za-z0-9]{32}_[a-fA-F0-9]{8})\b/g, captureIndex: 1, slugHint: 'grafana_token' },
+  { rule_id: 'pypi_token', regex: /\b(pypi-AgEIcHlwaS[A-Za-z0-9_-]{50,})/g, captureIndex: 1, slugHint: 'pypi_token' },
+  { rule_id: 'aws_temp_access_key', regex: /\b(ASIA[0-9A-Z]{16})\b/g, captureIndex: 1, slugHint: 'aws_access_key' },
+  { rule_id: 'gcp_oauth_token', regex: /\b(ya29\.[A-Za-z0-9_-]{30,})/g, captureIndex: 1, slugHint: 'gcp_oauth_token' },
+]
+
+/**
+ * Concatenated registry — anchored + provider prefixes first (high
+ * precision), then structured.
+ */
+export const ALL_PATTERNS: PatternDef[] = [...ANCHORED_PATTERNS, ...PROVIDER_PATTERNS, ...STRUCTURED_PATTERNS]
