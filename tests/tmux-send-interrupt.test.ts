@@ -7,7 +7,7 @@ vi.mock("node:child_process", () => {
 });
 
 import { execFileSync } from "node:child_process";
-import { sendAgentInterrupt } from "../src/agents/tmux.js";
+import { sendAgentInterrupt, clearAgentComposer } from "../src/agents/tmux.js";
 
 const mockedExec = execFileSync as unknown as ReturnType<typeof vi.fn>;
 
@@ -96,5 +96,65 @@ describe("sendAgentInterrupt", () => {
     });
     expect("error" in result).toBe(true);
     expect(mockedExec).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("clearAgentComposer", () => {
+  beforeEach(() => {
+    mockedExec.mockReset();
+  });
+
+  it("returns {ok:true} on happy path", () => {
+    mockedExec.mockReturnValue(Buffer.from(""));
+    const result = clearAgentComposer({ agentName: "klanker" });
+    expect(result).toEqual({ ok: true });
+    expect(mockedExec).toHaveBeenCalledTimes(1);
+  });
+
+  it("issues send-keys C-u C-a C-k against the right pane/socket", () => {
+    mockedExec.mockReturnValue(Buffer.from(""));
+    clearAgentComposer({ agentName: "klanker" });
+    const [bin, args] = mockedExec.mock.calls[0]!;
+    expect(bin).toBe("tmux");
+    expect(args).toEqual([
+      "-L",
+      "switchroom-klanker",
+      "send-keys",
+      "-t",
+      "klanker",
+      "C-u",
+      "C-a",
+      "C-k",
+    ]);
+  });
+
+  it("uses a 3s timeout on the exec call", () => {
+    mockedExec.mockReturnValue(Buffer.from(""));
+    clearAgentComposer({ agentName: "klanker" });
+    const opts = mockedExec.mock.calls[0]![2] as { timeout?: number };
+    expect(opts?.timeout).toBe(3000);
+  });
+
+  it("soft-fails (returns {error}) when there is no tmux session — e.g. legacy_pty — without throwing", () => {
+    // An agent under experimental.legacy_pty=true has no tmux session, so
+    // tmux send-keys errors with "no server running". The helper must
+    // swallow that into {error} so the caller proceeds with delivery.
+    mockedExec.mockImplementation(() => {
+      throw new Error("no server running on /tmp/tmux-1000/switchroom-x");
+    });
+    const result = clearAgentComposer({ agentName: "x" });
+    expect("error" in result).toBe(true);
+    if (!("error" in result)) return;
+    expect(result.error).toMatch(/no server running/);
+  });
+
+  it("returns {error} on timeout-style failure without throwing", () => {
+    mockedExec.mockImplementation(() => {
+      const err = new Error("ETIMEDOUT") as Error & { code?: string };
+      err.code = "ETIMEDOUT";
+      throw err;
+    });
+    const result = clearAgentComposer({ agentName: "x" });
+    expect("error" in result).toBe(true);
   });
 });

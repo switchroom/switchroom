@@ -182,6 +182,62 @@ export function sendAgentInterrupt(opts: SendInterruptOptions): SendInterruptRes
   return { error: lastError ?? "tmux send-keys C-c failed" };
 }
 
+export interface ClearComposerOptions {
+  agentName: string;
+}
+
+export type ClearComposerResult = { ok: true } | { error: string };
+
+/**
+ * Wipe any stranded typed-ahead / ghost text out of the agent's claude TUI
+ * composer via `tmux send-keys`, BEFORE an inbound channel notification is
+ * delivered.
+ *
+ * ## Why this exists (the marko wedge)
+ *
+ * Inbound Telegram messages reach the agent's claude session as an MCP
+ * `notifications/claude/channel` notification (NOT via send-keys). The
+ * unmodified CLI appends that text into its input composer and auto-submits
+ * ONLY when the composer is empty and idle. The #1556 inbound-delivery-gate
+ * defers delivery until `turnInFlight === false`, but it ASSUMES idle ⇒
+ * empty composer. That assumption breaks when stale typed-ahead text is
+ * stranded in the composer and was never submitted (observed live on agent
+ * `marko`: the literal text "Yes, go ahead on both" sat in the composer).
+ * The appended inbound then fails to submit cleanly and the session silently
+ * swallows every subsequent queued inbound until a hard container restart.
+ *
+ * Nothing else clears the composer, so we do it here: `C-u` (kill from
+ * cursor to line start) plus belt-and-suspenders `C-a` (move to start) and
+ * `C-k` (kill to line end) wipe the whole line regardless of cursor
+ * position. On an already-empty composer (the happy path) these are no-ops.
+ *
+ * ## Soft-fail contract
+ *
+ * Returns `{ error }` on any tmux failure (no session — e.g. an agent under
+ * `experimental.legacy_pty=true` has no tmux session, socket missing,
+ * timeout, exec error). Never throws. Callers MUST proceed with delivery
+ * regardless — a clear failure must never block an inbound.
+ */
+export function clearAgentComposer(opts: ClearComposerOptions): ClearComposerResult {
+  const { agentName } = opts;
+  const socket = `switchroom-${agentName}`;
+  // C-u: kill to line start. C-a C-k: move to start, kill to line end.
+  // Together they wipe the composer line regardless of cursor position.
+  const args = ["-L", socket, "send-keys", "-t", agentName, "C-u", "C-a", "C-k"];
+
+  try {
+    execFileSync("tmux", args, {
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true };
+  } catch (err) {
+    const msg = `tmux send-keys composer-clear failed: ${(err as Error).message}`;
+    console.error(`[tmux-composer-clear] ${agentName}: ${msg}`);
+    return { error: msg };
+  }
+}
+
 function sleepSync(ms: number): void {
   // Atomics.wait on a fresh SharedArrayBuffer is a portable synchronous
   // sleep — keeps the helper self-contained and testable without forcing
