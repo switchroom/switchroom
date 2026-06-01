@@ -314,7 +314,6 @@ export function formatConfigApprovalDenyError(
   return `E_DENIED: operator denied config_propose_edit${suffix} (approval_id=${approvalId})`;
 }
 
-/** Best-effort tmp-file cleanup — swallowed errors. */
 /**
  * Write `content` to an existing file **in place**, preserving its inode.
  *
