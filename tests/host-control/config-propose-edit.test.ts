@@ -14,7 +14,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  chmodSync,
+  statSync,
+  rmSync,
+} from "node:fs";
+import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HostdServer } from "../../src/host-control/server.js";
@@ -708,4 +716,118 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     // Genuine server fault — no actionable fix hint.
     expect(resp.error_envelope?.fix).toBeUndefined();
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Bind-mount-safe write (EBUSY fix). /state/config/switchroom.yaml is
+// itself an individual read-only bind-mount SOURCE mounted into every
+// agent container. The old apply path wrote `<file>.tmp` then
+// `rename(tmp, configPath)` — but you cannot rename() OVER an active
+// bind-mount source/target: the kernel returns EBUSY. The fix writes
+// in place (truncate + write the live inode) for both the forward apply
+// and the rollback restore, so the inode is preserved and the mounts
+// stay valid. These tests pin that behaviour: a rename-based writer
+// would change the inode (and reset the mode to the umask default),
+// failing the assertions below; the in-place writer preserves both.
+// ─────────────────────────────────────────────────────────────────────
+describe("hostd config_propose_edit — bind-mount-safe in-place write", () => {
+  it("preserves the target inode + mode across a successful apply (no rename-over-target)", async () => {
+    const { gw, finalizeCalls } = stubGateway("approve");
+    // A distinctive non-default mode the rename path would not reproduce.
+    chmodSync(configPath, 0o600);
+    const inoBefore = statSync(configPath).ino;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => ({ exit_code: 0, stdout: "ok", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ip-1" });
+    expect(resp.result).toBe("completed");
+    expect(finalizeCalls).toEqual([{ outcome: "applied" }]);
+    // Content updated …
+    expect(readFile(configPath, "utf8")).toContain(
+      "# touched by apply-path test",
+    );
+    const st = statSync(configPath);
+    // … but the inode is the SAME (rename would have allocated a new one).
+    expect(st.ino).toBe(inoBefore);
+    // … and the mode is preserved (rename would reset to the umask default).
+    expect(st.mode & 0o777).toBe(0o600);
+  });
+
+  it("rollback restores via in-place write — inode preserved, snapshot restored", async () => {
+    const { gw, finalizeCalls } = stubGateway("approve");
+    chmodSync(configPath, 0o600);
+    const inoBefore = statSync(configPath).ino;
+    const snapshotBefore = readFile(configPath, "utf8");
+    const reconcileExitCodes = [1, 0]; // first fails → rollback, recovery ok
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => {
+        const ec = reconcileExitCodes.shift() ?? 0;
+        return {
+          exit_code: ec,
+          stdout: ec === 0 ? "ok" : "",
+          stderr: ec === 0 ? "" : "reconcile boom",
+        };
+      },
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ip-2" });
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/^E_RECONCILE_FAILED_ROLLED_BACK/);
+    // Snapshot restored byte-for-byte …
+    expect(readFile(configPath, "utf8")).toBe(snapshotBefore);
+    const st = statSync(configPath);
+    // … via in-place write: same inode, same mode.
+    expect(st.ino).toBe(inoBefore);
+    expect(st.mode & 0o777).toBe(0o600);
+    expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
+  });
+
+  // The real-world repro: the config path is itself a bind-mount target.
+  // `mount --bind` needs root + Linux, so this is gated. On a matching
+  // host it proves the EBUSY class is actually defeated end-to-end — a
+  // rename-over-target here would throw EBUSY and fail the apply.
+  const canBindMount =
+    process.platform === "linux" &&
+    typeof process.getuid === "function" &&
+    process.getuid() === 0;
+  it.skipIf(!canBindMount)(
+    "applies over a file that is itself a bind-mount target (EBUSY repro)",
+    async () => {
+      const { gw } = stubGateway("approve");
+      // backing.yaml holds the real bytes; configPath is an empty file we
+      // bind-mount the backing over, so configPath becomes a mount target.
+      const backing = join(tmp, "backing.yaml");
+      writeFileSync(backing, VALID_BASE_YAML);
+      // configPath already exists (beforeEach) — bind backing over it.
+      execSync(`mount --bind ${backing} ${configPath}`);
+      try {
+        server = makeServer({
+          configEditEnabled: true,
+          configPath,
+          approvalGateway: gw,
+          runReconcile: async () => ({
+            exit_code: 0,
+            stdout: "ok",
+            stderr: "",
+          }),
+        });
+        await server.start();
+        const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ip-3" });
+        // The whole point: in-place write succeeds where rename → EBUSY.
+        expect(resp.result).toBe("completed");
+        expect(readFile(configPath, "utf8")).toContain(
+          "# touched by apply-path test",
+        );
+      } finally {
+        execSync(`umount ${configPath}`);
+      }
+    },
+  );
 });
