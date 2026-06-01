@@ -116,19 +116,19 @@ describe('getTurnByKey', () => {
 
   it('recovers chat_id + thread_id for a group/topic turn', () => {
     const db = openTurnsDbInMemory()
-    recordTurnStart(db, { turnKey: 'g:11', chatId: '-1003852747971', threadId: '42' })
+    recordTurnStart(db, { turnKey: 'g:11', chatId: '-1001234567890', threadId: '42' })
     const turn = getTurnByKey(db, 'g:11')
     expect(turn?.turn_key).toBe('g:11')
-    expect(turn?.chat_id).toBe('-1003852747971')
+    expect(turn?.chat_id).toBe('-1001234567890')
     expect(turn?.thread_id).toBe('42')
     db.close()
   })
 
   it('recovers chat_id with null thread_id for a plain group/DM turn', () => {
     const db = openTurnsDbInMemory()
-    recordTurnStart(db, { turnKey: 'dm:7', chatId: '8248703757' })
+    recordTurnStart(db, { turnKey: 'dm:7', chatId: '12345' })
     const turn = getTurnByKey(db, 'dm:7')
-    expect(turn?.chat_id).toBe('8248703757')
+    expect(turn?.chat_id).toBe('12345')
     expect(turn?.thread_id).toBeNull()
     db.close()
   })
