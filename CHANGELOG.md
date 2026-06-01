@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.14.36 — Admin-only vault credentials (#2073)
+
+Mark sensitive vault keys that may be granted **only by the admin
+operator** (`access.allowFrom[0]`) and **only with the vault passphrase**
+— never via posture attestation, even under the `approvalAuth:
+telegram-id` single-factor fleet default.
+
+```yaml
+vault:
+  broker:
+    adminOnlyKeys:
+      - stripe/*               # whole namespace (exact names or `*` globs)
+      - microsoft/ken-tokens
+```
+
+For any key matching `adminOnlyKeys`:
+
+- **Only the admin operator may approve a grant.** The admin is the first
+  entry in `access.allowFrom` (the owner). A grant-approval tap from any
+  other allowFrom member is rejected — the card stays open for the owner.
+- **It is always minted with the operator passphrase, never posture.**
+  Even when the fleet default is `telegram-id` (no passphrase prompt for
+  normal grants), approving an admin-only key prompts for the vault
+  passphrase. The broker **refuses** to mint an admin-only key via posture
+  attestation, so an agent — even one on `postureMintAgents` — cannot
+  self-grant it. (`claude` shares the gateway's per-agent broker socket
+  and can forge a Telegram tap, but it does not have the passphrase.)
+  Posture may **retain** an admin-only key the agent already holds across
+  a union re-mint, but never **add** a new one.
+
+Enforced at two layers: the broker (`mint_grant` posture path,
+surface-independent — also blocks an agent crafting raw broker protocol)
+and the gateway (the `vra:approve` handler). Default `adminOnlyKeys: []`
+is a no-op — existing behaviour is unchanged. Takes effect on broker +
+gateway restart (no ACL hot-reload). See `docs/vault.md` § "Admin-only
+credentials".
+
 ## v0.14.35 — Stop agents guessing vault key names (#2071, #2070)
 
 ### Stop agents guessing vault keys (#2071)
