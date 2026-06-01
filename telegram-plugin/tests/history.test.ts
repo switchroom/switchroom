@@ -362,3 +362,62 @@ describe('getRecentOutboundCount (backstop dedup helper)', () => {
     expect(getRecentOutboundCount('-200', 2)).toBe(1)
   })
 })
+
+describe('secret redaction at persistence (both directions)', () => {
+  beforeEach(() => initHistory(stateDir, 30))
+
+  // Built by concatenation so the source never holds a contiguous
+  // secret-shaped literal (repo Push Protection / no-pii lint).
+  const SANCTUM = `19|${'qP4mN7rT2v'.repeat(4)}` // <id>|<40 base62> (Sanctum/Coolify)
+  const GH_PAT = `ghp_${'A1b2C3d4E5'.repeat(3)}` // ghp_<30 base62>
+
+  it('masks a user-pasted secret before it is stored (inbound)', () => {
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 1,
+      user: 'alice',
+      user_id: '111',
+      ts: 1000,
+      text: `the new coolify token is ${SANCTUM}, save it`,
+    })
+    const text = query({ chat_id: '-100' })[0]!.text as string
+    expect(text).not.toContain(SANCTUM)
+    expect(text).toContain('[REDACTED')
+    expect(text).toContain('the new coolify token is') // surrounding prose preserved
+  })
+
+  it('masks a secret echoed by the agent before it is stored (outbound)', () => {
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [2],
+      texts: [`sure — your key is ${GH_PAT}, keep it safe`],
+      ts: 2000,
+    })
+    const text = query({ chat_id: '-100' })[0]!.text as string
+    expect(text).not.toContain(GH_PAT)
+    expect(text).toContain('[REDACTED')
+  })
+
+  it('masks a secret introduced by an edit', () => {
+    recordOutbound({ chat_id: '-100', thread_id: null, message_ids: [3], texts: ['placeholder'], ts: 3000 })
+    recordEdit({ chat_id: '-100', message_id: 3, text: `token: ${SANCTUM}` })
+    const text = query({ chat_id: '-100' })[0]!.text as string
+    expect(text).not.toContain(SANCTUM)
+    expect(text).toContain('[REDACTED')
+  })
+
+  it('leaves ordinary prose untouched', () => {
+    recordInbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_id: 4,
+      user: 'a',
+      user_id: '1',
+      ts: 4000,
+      text: 'hello, how are you?',
+    })
+    expect(query({ chat_id: '-100' })[0]!.text).toBe('hello, how are you?')
+  })
+})
