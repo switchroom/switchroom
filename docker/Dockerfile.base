@@ -166,7 +166,7 @@ ARG CACHE_BUST=default
 # bumps.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     echo "cache-bust=${CACHE_BUST}" > /dev/null \
- && npm install -g @anthropic-ai/claude-code@2.1.156 \
+ && npm install -g @anthropic-ai/claude-code@2.1.159 \
  && claude --version >&2
 
 # Phase 1b: install bun. The broker server (src/vault/broker/server.ts)
