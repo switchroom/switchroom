@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.32 — Background worker card routes to the dispatch chat (#2061)
+
+Fixes a routing bug where a background sub-agent's live worker card
+("🛠 Worker · &lt;task&gt; running …") and its completion handback were
+always posted to the operator **DM**, even when the Task was dispatched
+from a group or forum topic. So asking an agent to do background work *in
+a group* sent all the progress and the result to its DM instead of where
+you asked.
+
+Root cause: the worker-card chat came from the pinned-card "fleet" lookup,
+which was removed in #1122 (`progressDriver` is now permanently `null`), so
+every path fell back to the operator DM and the dispatch chat was never
+recoverable. The fix recovers the originating conversation from the
+per-agent registry (`sub-agent → parent_turn_key → turns.chat_id/thread_id`)
+and routes the worker card (chat **and** forum topic), the legacy progress
+envelope, and the handback there. Best-effort with the existing DM fallback
+preserved, so **DM-only agents are unaffected** (a registry miss is exactly
+today's behaviour).
+
+Known follow-up: the handback reply carries the chat but not the topic, so
+on a true **forum-topic** group the result lands in the General topic;
+plain groups and DMs are fully fixed.
+
 ## v0.14.31 — Broader secret coverage + inbound reliability
 
 A "stop missing secrets" upgrade (GitHub-scanner-style detection) plus two
