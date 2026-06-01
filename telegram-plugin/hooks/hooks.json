@@ -11,6 +11,15 @@
         ]
       },
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sentinel-reply-guard-pretool.mjs\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "^(Agent|Task)$",
         "hooks": [
           {

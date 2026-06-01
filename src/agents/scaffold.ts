@@ -3739,6 +3739,23 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // #2053 defense-in-depth: drop a reply/stream_reply call whose
+          // payload is only the silent sentinel (NO_REPLY/HEARTBEAT_OK),
+          // so the sentinel can never reach chat regardless of any
+          // nag-loop behaviour. No matcher — the hook self-filters by
+          // tool_name (like secret-guard above).
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:sentinel-reply-guard-pretool",
+                `node "${join(DOCKER_HOOKS_PATH, "sentinel-reply-guard-pretool.mjs")}"`,
+              ),
+              timeout: 5,
+            },
+          ],
+        },
+        {
           // Claude Code's hook matcher is a regex. Cover both the legacy
           // 'Agent' and newer 'Task' tool names — same dispatch
           // semantics, only the name varies by Claude Code version. The
