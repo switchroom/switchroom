@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.27 — Native Telegram worker card (#2041)
+
+The background-worker card (the live, edit-in-place card a
+`run_in_background: true` sub-agent gets) now renders as clean Telegram
+HTML that matches the normal activity card, instead of leaking raw
+model-authored Markdown.
+
+Before, `renderWorkerActivity` HTML-escaped the model's text but never
+stripped Markdown, so `**bold**`, backticks, and `---` rules rendered as
+literal characters in Telegram — the card looked half-finished and
+off-style versus the framework's other cards.
+
+Now:
+
+- A shared `stripMarkdown` + `cleanWorkerResultParagraph` pair in
+  `telegram-plugin/card-format.ts` removes emphasis, inline code, links,
+  headings, list/quote markers, horizontal rules, and code fences before
+  the text is escaped and placed into the card.
+- The card body is a `✓` / `→` step feed (newest step bold-arrowed,
+  prior steps checked, older steps collapsed into a `+N earlier…`
+  overflow line) — the same visual grammar as the foreground
+  tool-activity summary.
+- The terminal card shows a `finished · completed|failed · N tools ·
+  MM:SS` line, a divider rule, and a cleaned one-paragraph result with a
+  `✅`/`⚠️` lead.
+
+No behavior change to dispatch, throttling, or the
+`SWITCHROOM_WORKER_ACTIVITY_FEED` flag — this is presentation only.
+
 ## v0.14.26 — Bump bundled claude CLI to 2.1.159
 
 Moves the hard-pinned `@anthropic-ai/claude-code` from **2.1.156** to
