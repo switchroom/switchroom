@@ -111,10 +111,15 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
     echo "[start.sh] channels.telegram.enabled=false — skipping gateway sidecar" >&2
   fi
 
-  # 2) autoaccept-poll — first-run TUI prompt dispatcher. Single-shot
-  #    by design (exits cleanly after idle-timeout once prompts have
-  #    fired); the supervisor's exponential backoff keeps a flaky
-  #    autoaccept from busy-looping.
+  # 2) autoaccept-poll — first-run TUI prompt dispatcher, then continuous
+  #    wedge-watchdog. Two phases in one process: a one-shot boot phase
+  #    dispatches the first-run prompts and returns after idle-timeout,
+  #    then the process stays alive running the wedge-watchdog (dismisses a
+  #    stuck blocking modal selector mid-session — the AskUserQuestion /
+  #    ExitPlanMode class — with Esc). So it is NORMALLY long-lived; the
+  #    supervisor only respawns it if it crashes/exits, and its backoff
+  #    keeps a flaky run from busy-looping. Set SWITCHROOM_WEDGE_WATCHDOG=0
+  #    to restore the legacy boot-only single-shot behaviour.
   if [ -f /opt/switchroom/autoaccept-poll.js ] && command -v bun >/dev/null 2>&1; then
     _switchroom_supervise autoaccept /var/log/switchroom/autoaccept.log \
       bun /opt/switchroom/autoaccept-poll.js "{{name}}" &
