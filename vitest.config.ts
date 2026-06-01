@@ -103,6 +103,9 @@ export default defineConfig({
       "**/src/vault/broker/server-mint-grant-passphrase-attest.test.ts",
       // mint_grant posture-attestation suite (#1115 follow-up) — bun:sqlite.
       "**/src/vault/broker/server-mint-grant-posture-attest.test.ts",
+      // admin-only-keys posture-enforcement suite — bun:sqlite (pre-seeds
+      // a grants DB to exercise retain-but-not-add). Run via test:bun.
+      "**/src/vault/broker/server-admin-only-keys.test.ts",
       "**/src/vault/broker/client-token.test.ts",
       "**/src/vault/broker/server-unlock.test.ts",
       "**/src/vault/broker/server-per-agent-unlock.test.ts",

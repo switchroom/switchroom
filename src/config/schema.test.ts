@@ -108,6 +108,7 @@ describe("VaultConfigSchema.broker", () => {
       autoUnlockCredentialPath: "~/.switchroom/vault-auto-unlock",
       approvalAuth: "passphrase",
       postureMintAgents: [],
+      adminOnlyKeys: [],
     });
   });
 
