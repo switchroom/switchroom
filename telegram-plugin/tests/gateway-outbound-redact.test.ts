@@ -61,6 +61,15 @@ describe('gateway outbound secret-scrub — structural wiring', () => {
     expect(scrubIdx).toBeGreaterThan(redactIdx)
   })
 
+  it('turn-flush backstop: scrubs the model terminal prose before send', () => {
+    // Turn-flush delivers the model's answer when it skipped reply/stream_reply
+    // — arbitrary agent free-text that hits the wire + stderr preview.
+    const redactIdx = src.indexOf(`redactOutboundText(capturedText, 'turn_flush')`)
+    const scrubSiteIdx = src.indexOf(`site: 'turn_flush'`)
+    expect(redactIdx).toBeGreaterThan(0)
+    expect(scrubSiteIdx).toBeGreaterThan(redactIdx) // mask BEFORE the voice scrub + send
+  })
+
   it('does not log the secret value when a mask fires', () => {
     const idx = src.indexOf('function redactOutboundText(')
     const body = src.slice(idx, idx + 400)

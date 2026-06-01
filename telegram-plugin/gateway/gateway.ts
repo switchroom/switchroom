@@ -8211,6 +8211,14 @@ function handleSessionEvent(ev: SessionEvent): void {
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
 
+        // Outbound secret scrub (#2044). Turn-flush delivers the model's
+        // terminal answer prose when it skipped reply/stream_reply — that
+        // is arbitrary agent free-text, sent via sendMessage/editMessageText
+        // and previewed to stderr below, so it needs the same mask as the
+        // three reply tools. Mirror the voice scrub: mask before the send,
+        // the preview, and recordOutbound.
+        capturedText = redactOutboundText(capturedText, 'turn_flush')
+
         // Voice scrub (PR #1683 follow-up). Turn-flush is the path
         // that fires when the model emits raw transcript text WITHOUT
         // calling reply / stream_reply. That captured text bypasses
