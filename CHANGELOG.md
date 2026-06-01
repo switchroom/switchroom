@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.14.35 — Stop agents guessing vault key names (#2071, #2070)
+
+### Stop agents guessing vault keys (#2071)
+
+Agents have no innate knowledge of their own vault key names, so they
+**guess** — e.g. `postiz/api-key` when the real, already-granted key is
+namespaced `marko/postiz-api-key`. The old denied-hint then steered them
+straight to the `vault_request_access` MCP tool, **burning an operator
+approval tap on a key that doesn't exist** (live incident: marko,
+2026-06-02).
+
+Two fleet-wide fixes:
+
+- **Self-correcting denied error.** On a broker-denied `switchroom vault
+  get <key>` inside an agent, the CLI now looks up the keys the agent
+  **actually holds** (broker `list` op — the same disclosure as
+  `switchroom vault list`, no info leak) and surfaces the closest
+  near-matches. The hint leads with *"you already have access to `<real
+  key>` — use that"* and *"run `vault list`"*, demoting
+  `vault_request_access` to a confirmed last resort. The machine-readable
+  `ERROR-ENVELOPE:` line is unchanged, so structured consumers are
+  unaffected. Pure, unit-tested token-overlap ranker
+  (`src/cli/vault-key-suggest.ts`).
+- **Proactive fleet guidance.** A new `VAULT_GUIDANCE` block in the fleet
+  invariants teaches every agent up front: read with `vault get`, **never
+  guess**, `vault list` shows your real `<you>/...` keys, only
+  `vault_request_access` for a key you've confirmed you lack.
+
+### Flag-gated operator-verified mint gate (#2070, inert by default)
+
+Foundation for the vault-approval hard boundary (RFC #2069). Adds an
+`origin` column to `approval_decisions` (server-set `'agent'`/`'operator'`,
+no wire path) + a pure `isOperatorVerifiedDecision()` predicate + a broker
+mint gate behind `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT` (**default
+off — inert**). No behaviour change until a future PR flips the flag; this
+release only lays the seam.
+
 ## v0.14.34 — Operator-set standing vault grant (#2067)
 
 Adds `agents.<name>.secrets[]` — an **operator-set standing vault grant**
