@@ -40,7 +40,7 @@ USER root
 # hindsight memory provider runs the identical claude bundle as the agent
 # containers — a version skew here could reintroduce the thinking-block /
 # thinking-effort class of failures on memory reflection (see #1978).
-RUN npm install -g @anthropic-ai/claude-code@2.1.156 \
+RUN npm install -g @anthropic-ai/claude-code@2.1.159 \
  && claude --version >&2
 
 # Install claude-agent-sdk into the same venv the hindsight API runs from.

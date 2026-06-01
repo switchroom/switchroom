@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.14.26 — Bump bundled claude CLI to 2.1.159
+
+Moves the hard-pinned `@anthropic-ai/claude-code` from **2.1.156** to
+**2.1.159** in both images that bundle it (`docker/Dockerfile.base`, used
+by every agent, and `docker/Dockerfile.hindsight`, used by the memory
+provider). 2.1.156 was pinned in v0.14.8 as the build that fixed the
+Opus 4.8 "thinking block cannot be modified" 400 under low reasoning
+effort (#1978); the 2.1.157–2.1.159 changelogs contain no revert of that
+fix and no breaking changes affecting switchroom's MCP / hooks / session
+path. The bump is gated on a live-turn canary (test-harness, Opus 4.8 at
+low effort) confirming the 400 does not return before fleet rollout.
+2.1.157 also auto-loads `.claude/skills` without a marketplace and
+hardens managed-settings MCP allow/deny parsing.
+
 ## v0.14.25 — Surface foreground sub-agent activity after the ack
 
 ### PR — surface foreground sub-agent activity after the ack-first reply (#2034)
