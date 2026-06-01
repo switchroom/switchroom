@@ -150,7 +150,10 @@ export const PROVIDER_PATTERNS: PatternDef[] = [
   //  `openai_api_key` sk- rule — no separate entry needed.)
   { rule_id: 'twilio_api_key', regex: /\b(SK[0-9a-f]{32})\b/g, captureIndex: 1, slugHint: 'twilio_api_key' },
   { rule_id: 'mailgun_key', regex: /\b(key-[0-9a-f]{32})\b/g, captureIndex: 1, slugHint: 'mailgun_key' },
-  { rule_id: 'mailchimp_key', regex: /\b([0-9a-f]{32}-us[0-9]{1,2})\b/g, captureIndex: 1, slugHint: 'mailchimp_key' },
+  // (mailchimp keys are `<32-hex>-us<N>` with NO distinctive prefix — that
+  //  collides with md5 hashes / ETags followed by `-usN` and would auto-delete
+  //  benign messages. Deferred to the planned generic high-entropy detector,
+  //  which asks instead of auto-deleting. Review #2054.)
   { rule_id: 'digitalocean_pat', regex: /\b(dop_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },
   { rule_id: 'digitalocean_oauth', regex: /\b(doo_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },
   { rule_id: 'digitalocean_refresh', regex: /\b(dor_v1_[a-f0-9]{64})\b/g, captureIndex: 1, slugHint: 'digitalocean_token' },

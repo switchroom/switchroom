@@ -55,6 +55,10 @@ describe('high-precision provider patterns', () => {
     const BENIGN: Array<[string, string]> = [
       ['a UUID', '550e8400-e29b-41d4-a716-446655440000'],
       ['a git SHA', 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0'],
+      // MD5 split so the SOURCE never holds a contiguous `<32hex>-usN`
+      // (which is the Mailchimp shape — GitHub Push Protection flags it).
+      ['a bare md5 hash', 'checksum ' + ('d41d8cd98f00b204' + 'e9800998ecf8427e') + ' ok'],
+      ['an md5 + -usN (mailchimp look-alike, must NOT auto-delete)', 'ETag ' + ('d41d8cd98f00b204' + 'e9800998ecf8427e') + '-us' + '1 cached'],
       ['plain prose', 'the quick brown fox jumps over the lazy dog 12 times'],
       ['a base64 data blob', 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAA'],
       ['a hex color + number', 'background #ff00aa width 1024px margin 32'],
