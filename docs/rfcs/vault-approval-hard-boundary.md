@@ -153,3 +153,41 @@ generalize the `origin='operator'` gate to the apv: enforcing flip.
    honest framing) while Phase 2 is built — or wait for the hard boundary?
 3. **Scope of Phase 2** — vault grants only first (recommended), or bundle
    the apv: MCP-approval generalization?
+
+## Decision record (2026-06-02)
+
+**Verdict: stand on the soft boundary for now.** The existing Telegram `from.id`
+tap *is* the real auth and covers every realistic case; the residual gap (an
+adversarial `claude` crafting raw broker protocol to bypass the gateway) is out
+of scope per `docs/vault.md`'s stated threat model ("claude is your semi-trusted
+tool; the ACL is misconfiguration protection, not a security boundary").
+
+**Option B (uid-split gateway) was researched and is the HEAVIEST option, not the
+lightest.** Making the gateway's existing `from.id` check claude-unbypassable
+needs the gateway to run at a uid `claude` can't impersonate. Today `claude` and
+the gateway share **one uid in one container** (`compose.ts` allocates a single
+uid per agent; `start.sh.hbs` forks the gateway and `exec claude` as that uid).
+The broker authorizes by **socket bind-path**, not connecting uid, and the
+per-agent socket is chowned to that one uid. So B requires **either a separate
+per-agent gateway container OR running agent containers as root** (uid-drop) —
+both re-architect the load-bearing co-located runtime (tmux / autoaccept /
+bridge; CLAUDE.md: "the tmux layer is load-bearing").
+
+**Invasiveness ranking of the hard options:** dedicated approval bot (lightest —
+additive, host-side, no runtime change) < host-relay (moderate — Telegram I/O
+host-side) < **uid-split gateway (heaviest — separate container / root)**. The
+"use existing auth, no bot" framing sounds lightest but, made unbypassable,
+lands on the most invasive change.
+
+**What ships / stands:**
+- **PR ① (#2070, merged):** `approval_decisions.origin` + flag-gated broker mint
+  gate, **inert** (`SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT` default off).
+  Kept — it is the ready enforcement seam if the trust model changes or the
+  gateway is split out for other reasons (B then comes nearly free).
+- **No** host verifier, approval bot, or gateway uid-split built.
+- **Optional belt-and-suspenders (deferred):** the broker key-ACL constraint on
+  posture-mint (only keys the agent already holds; new grants need the operator
+  passphrase). Closes casual + cross-agent self-grant with no new components.
+
+**Revisit when:** the gateway is split into its own container for other reasons,
+or the trust model changes (less-trusted agents, multi-user, untrusted skills).
