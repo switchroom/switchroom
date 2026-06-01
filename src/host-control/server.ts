@@ -33,7 +33,11 @@ import {
   writeFileSync,
   renameSync,
   mkdirSync,
-  unlinkSync,
+  openSync,
+  ftruncateSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { randomUUID, randomBytes } from "node:crypto";
@@ -311,11 +315,59 @@ export function formatConfigApprovalDenyError(
 }
 
 /** Best-effort tmp-file cleanup — swallowed errors. */
-function unlinkSyncBestEffort(path: string): void {
+/**
+ * Write `content` to an existing file **in place**, preserving its inode.
+ *
+ * The obvious atomic-write strategy — write a sibling `<path>.tmp` then
+ * `rename()` it over the target — is structurally broken for
+ * switchroom.yaml. That file is itself an individual read-only bind-mount
+ * source: it is bind-mounted into every agent container. `rename()` over a
+ * path that is an active bind-mount source returns `EBUSY` ("resource busy
+ * or locked"), so the swap never lands. (Confirmed via /proc/mounts:
+ * `/dev/nvme0n1p2 /state/config/switchroom.yaml ext4 ro,relatime`.)
+ *
+ * Instead we open the existing file `O_RDWR` (no create, no rename),
+ * truncate it, write the new bytes, and `fsync()`. The inode is preserved,
+ * so every bind mount stays valid and the kernel never sees a rename over a
+ * busy dentry. `O_RDWR` (mode `"r+"`) also preserves the file's existing
+ * mode and owner — we never re-create it.
+ *
+ * Tradeoff — non-atomic: a crash between truncate and the final write could
+ * leave a partial file. Callers mitigate by (a) snapshotting the prior
+ * content for rollback, (b) `fsync` here, and (c) re-validating immediately
+ * after (the reconcile run rejects a malformed config and triggers
+ * rollback). A short post-write read-back length check below catches a
+ * truncated write before reconcile even starts.
+ *
+ * @throws the underlying fs error (e.g. `EROFS`/`EACCES` if the mount is
+ *   read-only at the hostd vantage, `ENOENT` if the target does not exist).
+ */
+function writeFileInPlacePreservingInode(
+  targetPath: string,
+  content: string,
+): void {
+  const buf = Buffer.from(content, "utf-8");
+  // "r+" = O_RDWR, fails if the file is missing, never truncates/creates on
+  // open — so mode/owner are untouched and we operate on the live inode.
+  const fd = openSync(targetPath, "r+");
   try {
-    unlinkSync(path);
-  } catch {
-    /* noop */
+    ftruncateSync(fd, 0);
+    let off = 0;
+    while (off < buf.length) {
+      off += writeSync(fd, buf, off, buf.length - off, off);
+    }
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  // Immediate re-validate: confirm the bytes actually landed at full
+  // length before the caller hands off to reconcile. Cheap insurance
+  // against a silently short write leaving a truncated config.
+  const readBack = readFileSync(targetPath);
+  if (readBack.length !== buf.length) {
+    throw new Error(
+      `in-place write short: wrote ${buf.length} bytes but read back ${readBack.length}`,
+    );
   }
 }
 
@@ -1425,18 +1477,24 @@ export class HostdServer {
         );
       }
       const postApply = verdict.postApplyContent;
-      // Atomic write: `<path>.tmp` → rename.
-      const tmp = configPath + ".tmp";
+      // In-place write preserving the inode (bind-mount safe). The old
+      // `<path>.tmp` → rename() swap returned EBUSY here because
+      // switchroom.yaml is itself a read-only bind-mount source mounted
+      // into every agent container — see writeFileInPlacePreservingInode.
       try {
-        writeFileSync(tmp, postApply);
-        renameSync(tmp, configPath);
+        writeFileInPlacePreservingInode(configPath, postApply);
       } catch (e) {
-        // Pre-write or rename failed — try to clean up tmp; live
-        // file is untouched so no rollback needed.
-        unlinkSyncBestEffort(tmp);
+        // Write failed before any bytes were flushed, OR mid-write. We
+        // hold the snapshot, so restore it in place to be safe rather
+        // than assume the live file is untouched.
+        try {
+          writeFileInPlacePreservingInode(configPath, snapshot);
+        } catch {
+          /* best-effort restore; original error is the one that matters */
+        }
         await approval.finalize({
           outcome: "reconcile_failed_rolled_back",
-          detail: `atomic write failed: ${(e as Error).message}`,
+          detail: `in-place write failed: ${(e as Error).message}`,
         });
         return this.reconcileFailedRolledBack(
           `write failed: ${(e as Error).message}`,
@@ -1463,10 +1521,11 @@ export class HostdServer {
         };
       }
       // ── Reconcile failed → rollback to snapshot, re-run reconcile.
+      // Same in-place write (not rename) so the rollback path is also
+      // bind-mount safe.
       let rollbackDetail = "";
       try {
-        writeFileSync(tmp, snapshot);
-        renameSync(tmp, configPath);
+        writeFileInPlacePreservingInode(configPath, snapshot);
       } catch (e) {
         rollbackDetail = `snapshot restore failed: ${(e as Error).message}`;
         await approval.finalize({
