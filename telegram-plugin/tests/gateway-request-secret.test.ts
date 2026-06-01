@@ -51,7 +51,7 @@ describe('request_secret — gateway wiring', () => {
   it('the capture deletes the raw message and writes to the vault, then returns', () => {
     const idx = gw.indexOf('async function captureProvidedSecret(')
     expect(idx).toBeGreaterThan(0)
-    const body = gw.slice(idx, idx + 2200)
+    const body = gw.slice(idx, idx + 3600)
     // delete the raw message before anything else
     expect(body).toMatch(/deleteSensitiveMessage\(chat_id, msgId/)
     // write via the posture/passphrase helper
@@ -60,7 +60,7 @@ describe('request_secret — gateway wiring', () => {
 
   it('the agent-resume inbound carries the key but NOT the value', () => {
     const idx = gw.indexOf('async function captureProvidedSecret(')
-    const body = gw.slice(idx, idx + 2200)
+    const body = gw.slice(idx, idx + 3600)
     const syntheticIdx = body.indexOf("source: 'secret_provided'")
     expect(syntheticIdx).toBeGreaterThan(0)
     // The synthetic text references vault:<key>, never the raw `value`.

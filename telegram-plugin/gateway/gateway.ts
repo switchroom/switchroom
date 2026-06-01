@@ -6941,6 +6941,22 @@ async function captureProvidedSecret(
     const rendered = renderVaultCliError(parsed, { verb: 'save', key: armed.key })
     const body = rendered.suppressRaw ? rendered.html : `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>`
     await switchroomReply(ctx, `${body}\n\n<i>The secret was NOT saved. The agent can re-request with <code>request_secret</code>.</i>`, { html: true })
+    // Wake the agent too (review #2047 finding #3): it ended its turn
+    // waiting for a synthetic inbound; without this it stalls silently.
+    const fts = Date.now()
+    const failMsg: InboundMessage = {
+      type: 'inbound',
+      chatId: chat_id,
+      messageId: fts,
+      user: 'vault-broker',
+      userId: 0,
+      ts: fts,
+      text: `⚠️ The secret you requested for \`vault:${armed.key}\` could NOT be saved (vault write failed). Do not assume it is available; tell the operator or try request_secret again.`,
+      meta: { source: 'secret_provide_failed', agent: armed.agent, key: armed.key, stage_id: armed.stageId },
+    }
+    const fdelivered = ipcServer.sendToAgent(armed.agent, failMsg)
+    if (fdelivered) markClaudeBusyForInbound(failMsg)
+    else pendingInboundBuffer.push(armed.agent, failMsg)
     return true
   }
 
@@ -7014,7 +7030,7 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `🔐 Send the value for <code>${escapeHtmlForTg(pending.key)}</code> as your next message. I’ll delete it instantly and store it in the vault.`,
+          `🔐 Send the value for <code>${escapeHtmlForTg(pending.key)}</code> as your next message — a single message, exactly as-is (don't add other text). I’ll delete it instantly and store it in the vault.`,
           { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
@@ -9810,7 +9826,12 @@ async function handleInbound(
   // detection, recordInbound, and the IPC broadcast so the raw value is
   // never recorded, logged, or forwarded.
   if (armedSecretCaptures.has(chat_id)) {
-    const consumed = await captureProvidedSecret(ctx, chat_id, msgId ?? undefined, effectiveText)
+    // Capture the RAW message text, not effectiveText — the secret value
+    // must be vaulted verbatim, without the steer/queue prefix-stripping or
+    // trim that effectiveText applies (review #2047 finding #1). A
+    // credential that legitimately starts with `/s` or has surrounding
+    // whitespace would otherwise be mangled.
+    const consumed = await captureProvidedSecret(ctx, chat_id, msgId ?? undefined, text)
     if (consumed) return
   }
 
