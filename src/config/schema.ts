@@ -2288,6 +2288,21 @@ export const VaultConfigSchema = z.object({
           "works as before. Each entry is an agent slug exactly as it appears " +
           "under `agents:` in this config."
         ),
+      adminOnlyKeys: z
+        .array(z.string().min(1))
+        .default([])
+        .describe(
+          "Vault keys held to a higher approval bar: only the admin operator " +
+          "(`access.allowFrom[0]`) may approve a grant for them, and they can " +
+          "NEVER be minted via posture attestation — granting one requires the " +
+          "operator passphrase (so an agent, even one on `postureMintAgents`, " +
+          "cannot self-grant it). Entries are exact key names or `*` globs, " +
+          "e.g. `stripe/*`, `*/oauth-token`, `microsoft/ken-tokens` (`*` matches " +
+          "any run of characters incl. `/`; case-sensitive). Default `[]` — no " +
+          "key is admin-only. Posture may RETAIN an admin-only key across a " +
+          "union re-mint but never ADD one. Takes effect on broker + gateway " +
+          "restart (broker has no ACL hot-reload)."
+        ),
     })
     .default({})
     .superRefine((broker, ctx) => {

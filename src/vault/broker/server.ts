@@ -55,6 +55,7 @@ import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log
 import { safeVaultPath } from "./test-isolation-guard.js";
 import { Database } from "bun:sqlite";
 import { mintGrant, validateGrant, validateGrantForWrite, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
+import { adminOnlyKeysBeingAdded } from "../admin-only-keys.js";
 import { openGrantsDb } from "../grants-db.js";
 import {
   requestApproval as kernelRequestApproval,
@@ -2063,6 +2064,52 @@ export class VaultBroker {
             ),
           );
           return;
+        }
+        // Admin-only keys (`vault.broker.adminOnlyKeys`) can never be
+        // ADDED via posture attestation — posture is agent-forgeable
+        // (claude shares this per-agent socket), so a posture-minted
+        // admin-only key would defeat the "operator passphrase required"
+        // contract. Posture may RETAIN an admin-only key the agent
+        // already holds (the gateway unions a new key with the agent's
+        // existing grant keys, so a previously passphrase-granted
+        // admin-only key legitimately reappears) but never ADD a new
+        // one. Adding requires the passphrase path. Surface-independent:
+        // this also blocks an agent crafting raw mint_grant protocol.
+        if (req.op === "mint_grant") {
+          const adminOnly = this.config?.vault?.broker?.adminOnlyKeys ?? [];
+          if (adminOnly.length > 0) {
+            const requested = [
+              ...((req as { keys?: string[] }).keys ?? []),
+              ...((req as { write_keys?: string[] }).write_keys ?? []),
+            ];
+            // The agent's current active (non-revoked, non-expired) key
+            // set — both read and write — is what posture may retain.
+            const nowSec = Math.floor(Date.now() / 1000);
+            const existingKeys = listGrants(this.grantsDb, agentName)
+              .filter((g) => g.expires_at === null || g.expires_at > nowSec)
+              .flatMap((g) => [...(g.key_allow ?? []), ...(g.write_allow ?? [])]);
+            const blocked = adminOnlyKeysBeingAdded(requested, existingKeys, adminOnly);
+            if (blocked.length > 0) {
+              writeAudit({
+                ts: new Date().toISOString(),
+                op: req.op,
+                caller: auditCaller,
+                pid: auditPid,
+                cgroup: auditCgroup,
+                result: "denied:posture-mint-admin-only-key",
+              });
+              socket.write(
+                encodeResponse(
+                  errorResponse(
+                    "DENIED",
+                    `admin-only credential(s) ${blocked.join(", ")} cannot be minted via posture ` +
+                    `attestation — they require the operator passphrase (vault.broker.adminOnlyKeys)`,
+                  ),
+                ),
+              );
+              return;
+            }
+          }
         }
         if (this.passphrase === null) {
           writeAudit({

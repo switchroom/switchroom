@@ -420,6 +420,7 @@ import {
   approvalRecord,
 } from '../../src/vault/approvals/client.js'
 import { resolveVaultApprovalPosture } from '../vault-approval-posture.js'
+import { matchesAdminOnlyKey } from '../../src/vault/admin-only-keys.js'
 import {
   openTurnsDb,
   markOrphanedWithTimeoutClassification,
@@ -2690,6 +2691,15 @@ const VAULT_PASSPHRASE_TTL_MS = 30 * 60 * 1000
  */
 let VAULT_APPROVAL_AUTH_MODE: 'passphrase' | 'telegram-id' = 'passphrase'
 
+/**
+ * Admin-only vault keys (`vault.broker.adminOnlyKeys`). A grant for one
+ * of these may be approved ONLY by the admin operator
+ * (`access.allowFrom[0]`) and is always minted via the operator
+ * passphrase — never posture, even under telegram-id mode (the broker
+ * enforces the same rule). Cached at boot alongside the posture mode.
+ */
+let ADMIN_ONLY_KEYS: string[] = []
+
 export function initVaultApprovalPosture(): void {
   let cfg: ReturnType<typeof loadSwitchroomConfig>
   try {
@@ -2720,6 +2730,13 @@ export function initVaultApprovalPosture(): void {
     process.stderr.write(
       `telegram gateway: vault approval posture = telegram-id ` +
         `(single-factor — broker mediates attestation via attest_via_posture)\n`,
+    )
+  }
+  ADMIN_ONLY_KEYS = cfg.vault?.broker?.adminOnlyKeys ?? []
+  if (ADMIN_ONLY_KEYS.length > 0) {
+    process.stderr.write(
+      `telegram gateway: ${ADMIN_ONLY_KEYS.length} admin-only vault key pattern(s) ` +
+        `— grants approved by allowFrom[0] + operator passphrase only\n`,
     )
   }
 }
@@ -13851,11 +13868,31 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
   }
 
   if (action === 'approve') {
+    // Admin-only credentials (`vault.broker.adminOnlyKeys`) are held to a
+    // higher bar: ONLY the admin operator (allowFrom[0]) may approve, and
+    // the grant must be minted with the operator passphrase — never
+    // posture, even under telegram-id mode (the broker enforces the same
+    // rule, so a posture mint would just be rejected). So for an
+    // admin-only key we (a) reject taps from any non-admin allowFrom
+    // member, and (b) skip the telegram-id posture branch below, falling
+    // through to the passphrase-prompt path. The card + buttons stay
+    // intact on a non-admin tap so the admin can still approve.
+    const isAdminOnly = matchesAdminOnlyKey(pending.key, ADMIN_ONLY_KEYS)
+    if (isAdminOnly && senderId !== access.allowFrom[0]) {
+      await ctx
+        .answerCallbackQuery({
+          text: '🔒 Admin-only credential — only the owner can approve this.',
+        })
+        .catch(() => {})
+      return
+    }
+
     // Posture: telegram-id (opt-in single-factor). The broker is
     // auto-unlocked and we silently hold the passphrase in memory; skip
     // the passphrase-cache lookup + prompt entirely and mint directly.
     // Allowlist check above already attested the operator's Telegram ID.
-    if (VAULT_APPROVAL_AUTH_MODE === 'telegram-id') {
+    // Admin-only keys are excluded — they take the passphrase path below.
+    if (!isAdminOnly && VAULT_APPROVAL_AUTH_MODE === 'telegram-id') {
       const username = ctx.from?.username ?? ctx.from?.first_name ?? `id=${senderId}`
       if (pending.card_message_id != null) {
         await ctx.api
@@ -13920,6 +13957,9 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
           pending.card_message_id,
           joiningBatch
             ? `🔐 <b>Queued behind an earlier card.</b> Type your passphrase as your next message — it covers <b>${items.length}</b> pending approvals in this chat (one entry mints all grants, no re-type per card).`
+            : isAdminOnly
+            ? `🔒 <b>Admin-only credential.</b> <code>${escapeHtmlForTg(pending.key)}</code> requires your vault passphrase to grant — reply with it as your next message and we'll mint the grant for <b>${escapeHtmlForTg(pending.agent)}</b>, then delete the passphrase message.\n\n` +
+              `<i>The passphrase is what proves it's you: an agent can never mint this key on its own.</i>`
             : `🔐 <b>Vault is locked.</b> Reply with your passphrase as your next message — we'll unlock, mint the grant for <b>${escapeHtmlForTg(pending.agent)}</b>, and delete the passphrase message in one step.\n\n` +
               `<i>Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches.</i>`,
           { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },

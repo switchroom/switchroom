@@ -163,6 +163,53 @@ before the per-key scope is consulted.
 
 ---
 
+## Admin-only credentials
+
+Some credentials are sensitive enough that you want them approved **only by
+you** — not by another operator you've added to `allowFrom`, and never by an
+agent on a silent auto-mint path. List them under `vault.broker.adminOnlyKeys`:
+
+```yaml
+vault:
+  broker:
+    approvalAuth: telegram-id      # fleet default (single-factor)
+    adminOnlyKeys:
+      - stripe/*                   # whole namespace
+      - microsoft/ken-tokens       # exact key
+      - billing-api-key
+```
+
+Entries are exact key names or `*` globs (`*` matches any run of characters,
+including `/`; matching is case-sensitive). For any key that matches:
+
+- **Only the admin operator may approve it.** The admin is the first entry in
+  `access.allowFrom` (the owner). A grant-approval tap from any other allowFrom
+  member is rejected — the card stays open for the owner.
+- **It is always minted with your vault passphrase, never posture.** Even when
+  the fleet default is `approvalAuth: telegram-id` (single-factor, no passphrase
+  prompt for normal grants), approving an admin-only key prompts you to reply
+  with the vault passphrase. The broker **refuses** to mint an admin-only key
+  via posture attestation, so an agent — even one on `postureMintAgents` —
+  cannot self-grant it. The passphrase is the unforgeable proof that it's you:
+  `claude` shares the gateway's broker socket and can forge a Telegram tap, but
+  it does not have the passphrase.
+
+Posture may **retain** an admin-only key the agent already holds (the gateway
+unions a newly-approved key with the agent's existing grant when it re-mints) —
+it just can't **add** a new one without the passphrase.
+
+> Heads-up under auto-unlock: with `approvalAuth: telegram-id` you normally
+> never type the passphrase. Admin-only keys are the exception — approving one
+> requires the passphrase you set when the vault was created. If you've
+> forgotten it, grant the key on the host instead:
+> `switchroom vault grant <agent> --keys <key> --duration 30d`.
+
+`adminOnlyKeys` takes effect on **broker + gateway restart** (the broker has no
+ACL hot-reload — `switchroom apply` then restart, or
+`docker compose -p switchroom restart vault-broker`).
+
+---
+
 ## Telegram `/vault` commands
 
 Agents with the switchroom Telegram plugin expose these commands at runtime:
