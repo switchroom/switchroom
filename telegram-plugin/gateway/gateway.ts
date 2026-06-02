@@ -5577,7 +5577,21 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 
   assertAllowedChat(chat_id)
 
-  let threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
+  // Thread resolution precedence: (1) an explicit message_thread_id the
+  // model passed, else (2) THIS turn's own originating topic
+  // (turn-pinned, #1664), else (3) the chat's last-seen topic
+  // (chatThreadMap). Preferring the turn's own thread over the chat
+  // last-seen heuristic fixes synthetic turns (subagent handback/progress,
+  // cron) — whose topic the model is never told and which never write
+  // chatThreadMap — and is strictly more correct under multi-topic
+  // concurrency (a reply lands in the topic the turn came from, not
+  // whichever topic most recently received a message). DM: both are
+  // undefined → unchanged.
+  let threadId = resolveThreadId(
+    chat_id,
+    (args.message_thread_id as string | undefined) ??
+      (turn?.sessionThreadId != null ? turn.sessionThreadId : undefined),
+  )
 
   if (reply_to == null && quoteOptIn && HISTORY_ENABLED) {
     try {
@@ -18581,6 +18595,7 @@ void (async () => {
                   })
                 }
 
+                const handbackOrigin = resolveSubagentOriginChat(agentId)
                 const decision = decideSubagentHandback({
                   handbackEnvValue: process.env.SWITCHROOM_SUBAGENT_HANDBACK,
                   outcome,
@@ -18589,11 +18604,18 @@ void (async () => {
                   // turn) back to the conversation the Task was dispatched
                   // from, so the result lands where the user asked — not the
                   // agent's DM. Falls back to fleetChatId/ownerChatId.
-                  fleetChatId: resolveSubagentOriginChat(agentId)?.chatId || fleetChatId,
+                  fleetChatId: handbackOrigin?.chatId || fleetChatId,
+                  // Supergroup topic the Task was dispatched from. Plumbed
+                  // through so the handback turn (and the model's in-voice
+                  // "here's what the worker found" reply) land in the
+                  // originating topic — not the chat's last-seen topic.
+                  // Applied only when the origin chat resolved (DM fallback
+                  // is topic-less).
+                  ...(handbackOrigin?.threadId != null
+                    ? { originThreadId: handbackOrigin.threadId }
+                    : {}),
                   // Owner-chat fallback: if the parent-turn chat can't be
-                  // resolved, route to the owner chat. Every switchroom fleet
-                  // agent is DM-shaped, so allowFrom[0] is the conversation
-                  // that dispatched.
+                  // resolved, route to the owner chat.
                   ownerChatId: loadAccess().allowFrom[0] ?? '',
                   taskDescription: description,
                   resultText,
@@ -18746,12 +18768,18 @@ void (async () => {
                   return
                 }
 
+                const progressOrigin = resolveSubagentOriginChat(agentId)
                 const decision = decideSubagentProgress({
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
                   isBackground,
                   // Prefer the conversation the Task was dispatched from over
                   // the owner DM (see resolveSubagentOriginChat).
-                  fleetChatId: resolveSubagentOriginChat(agentId)?.chatId || fleetChatId,
+                  fleetChatId: progressOrigin?.chatId || fleetChatId,
+                  // Carry the dispatching topic so the progress wake lands in
+                  // it (applied only when the origin chat resolved).
+                  ...(progressOrigin?.threadId != null
+                    ? { originThreadId: progressOrigin.threadId }
+                    : {}),
                   ownerChatId: loadAccess().allowFrom[0] ?? '',
                   subagentJsonlId: agentId,
                   taskDescription: description,
@@ -18769,10 +18797,11 @@ void (async () => {
                 // model is about to compose an explicit in-voice
                 // progress line — letting the "— still working (Nm)"
                 // edit fire in parallel would double-surface the
-                // signal. Progress envelopes target the chat level
-                // (no thread id), matching how the inbound lands.
+                // signal. Key the clear on the topic the envelope lands
+                // in (origin thread) so the right lane is yielded in a
+                // supergroup; chat-level for DM-shaped agents.
                 pendingProgress.clearPending(
-                  statusKey(decision.chatId, undefined),
+                  statusKey(decision.chatId, progressOrigin?.threadId),
                   'progress',
                 )
                 process.stderr.write(
