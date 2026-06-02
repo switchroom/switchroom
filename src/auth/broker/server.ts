@@ -60,8 +60,16 @@ import {
   validateGoogleAccountLabel,
   writeGoogleAccountCredentials,
 } from "./google-storage.js";
+import {
+  listMicrosoftAccounts,
+  microsoftAccountExists,
+  readMicrosoftAccountCredentials,
+  removeMicrosoftAccount,
+  validateMicrosoftAccountLabel,
+  writeMicrosoftAccountCredentials,
+} from "./microsoft-storage.js";
 import { ProviderRegistry, type ProviderName } from "./provider.js";
-import type { GoogleCredentialsShape } from "./protocol.js";
+import type { GoogleCredentialsShape, MicrosoftCredentialsShape } from "./protocol.js";
 import {
   accountCredentialsPath,
   accountDir,
@@ -660,6 +668,10 @@ export class AuthBroker {
             await this.opGoogleGetCredentials(socket, reqId, identity);
             break;
           }
+          if (provider === "microsoft") {
+            await this.opMicrosoftGetCredentials(socket, reqId, identity);
+            break;
+          }
           socket.write(
             encodeError(
               reqId,
@@ -787,6 +799,21 @@ export class AuthBroker {
             );
             break;
           }
+          // Microsoft: writes to broker's own state dir under
+          // `~/.switchroom/state/auth-broker/microsoft/<account>/`,
+          // mirroring the Google shape (RFC #1873).
+          if (provider === "microsoft") {
+            const microsoftCreds = req.credentials as MicrosoftCredentialsShape;
+            await this.opMicrosoftAddAccount(
+              socket,
+              reqId,
+              identity,
+              req.label,
+              microsoftCreds,
+              req.replace ?? false,
+            );
+            break;
+          }
           // Unreachable today (registry has() rejects unknown
           // providers above), but defensive.
           socket.write(
@@ -818,6 +845,10 @@ export class AuthBroker {
             await this.opGoogleRmAccount(socket, reqId, identity, req.label);
             break;
           }
+          if (provider === "microsoft") {
+            await this.opMicrosoftRmAccount(socket, reqId, identity, req.label);
+            break;
+          }
           socket.write(
             encodeError(
               reqId,
@@ -832,6 +863,9 @@ export class AuthBroker {
           break;
         case "list-google-accounts":
           await this.opListGoogleAccounts(socket, reqId, identity);
+          break;
+        case "list-microsoft-accounts":
+          await this.opListMicrosoftAccounts(socket, reqId, identity);
           break;
         case "probe-quota":
           await this.opProbeQuota(
@@ -1410,6 +1444,189 @@ export class AuthBroker {
     socket.write(encodeSuccess(id, { label }));
   }
 
+  /**
+   * RFC #1873 — Microsoft get-credentials. Mirrors
+   * `opGoogleGetCredentials`: per-agent only, account derived from the
+   * agent's `microsoft_workspace.account` selector (never the wire —
+   * path-as-identity), ACL gated on
+   * `microsoft_accounts.<account>.enabled_for[]`, credentials read from
+   * the broker's own state dir.
+   */
+  private async opMicrosoftGetCredentials(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+  ): Promise<void> {
+    if (identity.kind !== "agent") {
+      socket.write(
+        encodeError(
+          id,
+          "INVALID_ARGS",
+          `Microsoft get-credentials is per-agent only (caller kind '${identity.kind}' not supported); use the agent's per-agent socket bind`,
+        ),
+      );
+      return;
+    }
+    const agentName = identity.name;
+    const agent = (this.config.agents ?? {})[agentName] as
+      | { microsoft_workspace?: { account?: string } }
+      | undefined;
+    const account = agent?.microsoft_workspace?.account;
+    if (!account) {
+      this.audit({ op: "get-credentials", identity, ok: false, error: "no-microsoft-account-configured" });
+      socket.write(
+        encodeError(
+          id,
+          "ACCOUNT_NOT_FOUND",
+          `agent '${agentName}' has no microsoft_workspace.account configured in switchroom.yaml`,
+        ),
+      );
+      return;
+    }
+    // ACL: agent must be in microsoft_accounts.<account>.enabled_for[].
+    const ma = (this.config as { microsoft_accounts?: Record<string, { enabled_for?: string[] }> })
+      .microsoft_accounts;
+    const enabledFor = ma?.[account]?.enabled_for ?? [];
+    if (!enabledFor.includes(agentName)) {
+      this.audit({ op: "get-credentials", identity, account, ok: false, error: "acl-deny" });
+      socket.write(
+        encodeError(
+          id,
+          "FORBIDDEN",
+          `agent '${agentName}' not in microsoft_accounts['${account}'].enabled_for[] — operator must run \`switchroom auth microsoft enable ${account} ${agentName}\``,
+        ),
+      );
+      return;
+    }
+    // Storage read.
+    const creds = readMicrosoftAccountCredentials(this.stateDir, account);
+    if (!creds) {
+      this.audit({ op: "get-credentials", identity, account, ok: false, error: "missing-credentials" });
+      socket.write(
+        encodeError(
+          id,
+          "ACCOUNT_NOT_FOUND",
+          `no Microsoft credentials for account '${account}' — operator must run \`switchroom auth microsoft account add ${account}\``,
+        ),
+      );
+      return;
+    }
+    const expiresAt = creds.microsoftOauth?.expiresAt;
+    this.audit({ op: "get-credentials", identity, account, ok: true });
+    socket.write(encodeSuccess(id, { account, credentials: creds, expiresAt }));
+  }
+
+  private async opMicrosoftAddAccount(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+    label: string,
+    credentials: MicrosoftCredentialsShape,
+    replace: boolean,
+  ): Promise<void> {
+    if (!this.isAdmin(identity)) {
+      this.audit({ op: "add-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.respondForbidden(socket, id, "add-account requires admin");
+      return;
+    }
+    // Defense-in-depth path-traversal guard (same posture as Google).
+    try {
+      validateMicrosoftAccountLabel(label);
+    } catch (err) {
+      socket.write(encodeError(id, "INVALID_ARGS", (err as Error).message));
+      return;
+    }
+    if (microsoftAccountExists(this.stateDir, label) && !replace) {
+      this.audit({ op: "add-account", identity, account: label, ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
+      socket.write(encodeError(id, "ACCOUNT_ALREADY_EXISTS", `microsoft account '${label}' already exists; pass replace:true to overwrite`));
+      return;
+    }
+    try {
+      writeMicrosoftAccountCredentials(this.stateDir, label, credentials);
+    } catch (err) {
+      socket.write(encodeError(id, "INTERNAL", (err as Error).message));
+      return;
+    }
+    const expiresAt = credentials.microsoftOauth?.expiresAt;
+    this.audit({ op: "add-account", identity, account: label, ok: true, replace });
+    socket.write(encodeSuccess(id, { label, expiresAt }));
+  }
+
+  /**
+   * RFC #1873 — Microsoft rm-account. Refuses to remove while the
+   * account is in `microsoft_accounts.<label>.enabled_for[]` (an agent
+   * still depends on the credential). Operator must
+   * `auth microsoft disable <label> all` first.
+   */
+  private async opMicrosoftRmAccount(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+    label: string,
+  ): Promise<void> {
+    if (!this.isAdmin(identity)) {
+      this.audit({ op: "rm-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.respondForbidden(socket, id, "rm-account requires admin");
+      return;
+    }
+    try {
+      validateMicrosoftAccountLabel(label);
+    } catch (err) {
+      socket.write(encodeError(id, "INVALID_ARGS", (err as Error).message));
+      return;
+    }
+    if (!microsoftAccountExists(this.stateDir, label)) {
+      socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `microsoft account '${label}' not found`));
+      return;
+    }
+    // Refuse if any agent is still enabled on this account.
+    const ma = (this.config as { microsoft_accounts?: Record<string, { enabled_for?: string[] }> }).microsoft_accounts;
+    const enabledFor = ma?.[label]?.enabled_for ?? [];
+    if (enabledFor.length > 0) {
+      socket.write(encodeError(id, "INVALID_ARGS", `microsoft account '${label}' is still enabled for agents: ${enabledFor.join(", ")}. Run \`auth microsoft disable ${label} all\` first.`));
+      return;
+    }
+    try {
+      removeMicrosoftAccount(this.stateDir, label);
+    } catch (err) {
+      socket.write(encodeError(id, "INTERNAL", (err as Error).message));
+      return;
+    }
+    this.audit({ op: "rm-account", identity, account: label, ok: true });
+    socket.write(encodeSuccess(id, { label }));
+  }
+
+  /**
+   * RFC #1873 — Microsoft account inventory. Mirror of
+   * `opListGoogleAccounts`: no ACL (same posture as `list-state`), never
+   * returns the refresh/access tokens, just the metadata an operator
+   * needs to confirm `auth microsoft list` (YAML) matches what the
+   * broker actually holds. Also surfaces accountType so the operator can
+   * tell a personal MSA from a work/school account at a glance.
+   */
+  private async opListMicrosoftAccounts(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+  ): Promise<void> {
+    const accounts = listMicrosoftAccounts(this.stateDir)
+      .map((account) => {
+        const creds = readMicrosoftAccountCredentials(this.stateDir, account);
+        if (!creds) return null;
+        return {
+          account,
+          expiresAt: creds.microsoftOauth.expiresAt,
+          scope: creds.microsoftOauth.scope,
+          clientId: creds.microsoftOauth.clientId,
+          accountType: creds.microsoftOauth.accountType,
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      .sort((a, b) => a.account.localeCompare(b.account));
+    this.audit({ op: "list-microsoft-accounts", identity, ok: true });
+    socket.write(encodeSuccess(id, { accounts }));
+  }
+
   private async opSetOverride(
     socket: net.Socket,
     id: string,
@@ -1463,6 +1680,23 @@ export class AuthBroker {
         } catch (err) {
           this.logErr(
             `refresh-tick google:${account}: ${(err as Error).message}`,
+          );
+        }
+      }
+    }
+    // RFC #1873 — also walk Microsoft accounts. Same no-op-if-unregistered
+    // guard as Google; keeps the on-disk access token fresh for the
+    // m365-mcp-launcher (which pulls via get-credentials({provider:
+    // "microsoft"})). Microsoft rotates the refresh token on every
+    // exchange, so refreshOneMicrosoftAccount persists the new RT
+    // atomically — see microsoft-storage.ts.
+    if (this.providers.has("microsoft")) {
+      for (const account of listMicrosoftAccounts(this.stateDir)) {
+        try {
+          await this.refreshOneMicrosoftAccount(account, /*force*/ false);
+        } catch (err) {
+          this.logErr(
+            `refresh-tick microsoft:${account}: ${(err as Error).message}`,
           );
         }
       }
@@ -1533,6 +1767,72 @@ export class AuthBroker {
       const newCreds = result.rawCredentials as GoogleCredentialsShape;
       // Provider returned the rawCredentials shape verbatim; persist.
       writeGoogleAccountCredentials(this.stateDir, account, newCreds);
+      return { kind: "refreshed", newExpiresAt: result.expiresAt };
+    } finally {
+      this.refreshInFlight.delete(leaseKey);
+    }
+  }
+
+  /**
+   * Pre-emptively refresh one Microsoft account's access token if it's
+   * within REFRESH_THRESHOLD_MS of expiry. Mirrors
+   * `refreshOneGoogleAccount` — same lease pattern, threshold, and
+   * outcome discriminant — but talks to MicrosoftProvider and writes
+   * back via `writeMicrosoftAccountCredentials`.
+   *
+   * **Microsoft-specific**: the provider needs `priorCredentials` to
+   * preserve canonical identity fields (tenantId / accountType /
+   * homeAccountId / accountEmail) when Microsoft's v2 `/token` omits
+   * `id_token` on a refresh response — without it the provider would
+   * clobber those with empty placeholders (see microsoft-provider.ts).
+   * Google's path doesn't pass this because its credential shape carries
+   * no identity claims a refresh could fail to return.
+   */
+  private async refreshOneMicrosoftAccount(
+    account: string,
+    force: boolean,
+  ): Promise<
+    | { kind: "noop" }
+    | { kind: "refreshed"; newExpiresAt: number }
+    | { kind: "failed"; error: string }
+  > {
+    // Namespaced lease key so Microsoft `alice@outlook.com` can't
+    // collide with an Anthropic/Google account named the same.
+    const leaseKey = `microsoft:${account}`;
+    if (this.refreshInFlight.has(leaseKey)) return { kind: "noop" };
+
+    const credsBefore = readMicrosoftAccountCredentials(this.stateDir, account);
+    if (!credsBefore) {
+      // Account vanished between listMicrosoftAccounts() and now — noop.
+      return { kind: "noop" };
+    }
+    const provider = this.providers.lookup("microsoft");
+    const onDiskExpires = provider.extractExpiresAt(credsBefore);
+    if (!force) {
+      const remaining = (onDiskExpires ?? 0) - this.now();
+      if (onDiskExpires !== undefined && remaining > REFRESH_THRESHOLD_MS) {
+        return { kind: "noop" };
+      }
+    }
+
+    this.refreshInFlight.add(leaseKey);
+    try {
+      const refreshToken = credsBefore.microsoftOauth.refreshToken;
+      const result = await provider.refresh({
+        refreshToken,
+        accountEmail: account,
+        clientId: credsBefore.microsoftOauth.clientId,
+        priorCredentials: credsBefore,
+      });
+      if (!result.ok) {
+        // Leave on-disk credentials untouched on failure — a transient
+        // network error may resolve next tick, and on invalid_grant the
+        // operator must re-OAuth (the launcher's get-credentials call
+        // surfaces a clean error to the consumer when it next reads).
+        return { kind: "failed", error: `${result.kind}: ${result.detail}` };
+      }
+      const newCreds = result.rawCredentials as MicrosoftCredentialsShape;
+      writeMicrosoftAccountCredentials(this.stateDir, account, newCreds);
       return { kind: "refreshed", newExpiresAt: result.expiresAt };
     } finally {
       this.refreshInFlight.delete(leaseKey);

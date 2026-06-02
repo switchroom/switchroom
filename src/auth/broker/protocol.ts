@@ -295,6 +295,19 @@ export const ListGoogleAccountsRequestSchema = z.object({
 });
 
 /**
+ * RFC #1873 — Microsoft account inventory. Mirror of
+ * `list-google-accounts`: returns credential metadata only (account,
+ * expiry, scope, clientId, accountType) — never the refresh/access
+ * tokens. Powers `switchroom auth microsoft account list` so an
+ * operator can confirm the YAML ACL matches what the broker holds.
+ */
+export const ListMicrosoftAccountsRequestSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  op: z.literal("list-microsoft-accounts"),
+  id: z.string().min(1),
+});
+
+/**
  * Probe live Anthropic quota for a set of accounts. The broker reads
  * each account's stored accessToken from `~/.switchroom/accounts/
  * <label>/credentials.json` (its source of truth, only the broker has
@@ -338,6 +351,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   RmAccountRequestSchema,
   SetOverrideRequestSchema,
   ListGoogleAccountsRequestSchema,
+  ListMicrosoftAccountsRequestSchema,
   ProbeQuotaRequestSchema,
 ]);
 
@@ -424,6 +438,24 @@ export const GoogleAccountStateSchema = z.object({
 
 export const ListGoogleAccountsDataSchema = z.object({
   accounts: z.array(GoogleAccountStateSchema),
+});
+
+/**
+ * Per-Microsoft-account inventory entry returned by
+ * `list-microsoft-accounts`. Like Google's, excludes refresh + access
+ * tokens; adds `accountType` so a personal MSA is distinguishable from
+ * a work/school account in the listing.
+ */
+export const MicrosoftAccountStateSchema = z.object({
+  account: z.string(),
+  expiresAt: z.number(),
+  scope: z.string(),
+  clientId: z.string(),
+  accountType: z.enum(["personal", "work"]),
+});
+
+export const ListMicrosoftAccountsDataSchema = z.object({
+  accounts: z.array(MicrosoftAccountStateSchema),
 });
 
 // ─── Response envelope ─────────────────────────────────────────────────────
