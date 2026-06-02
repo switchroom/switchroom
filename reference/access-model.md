@@ -49,18 +49,29 @@ an agent must never escalate to lives behind a _different_ uid.**
 - **Agent → another agent's data, sockets, credentials** — different
   uid → OS-enforced. Not reachable, full stop.
 - **Agent → its own authorization** (tools, MCP servers, vault grants)
-  — operator-owned config, bind-mounted **read-only**. The agent reads
-  its sandbox; it cannot rewrite it.
+  — the authoritative source is operator-owned `switchroom.yaml`,
+  bind-mounted **read-only**. The agent's own scaffold files
+  (`settings.json`, `.mcp.json`) are writable by it, but they are
+  **regenerated from `switchroom.yaml` on every reconcile/restart**, so a
+  self-edit doesn't survive — and the one sanctioned self-edit path
+  (`config_propose_edit`) is **server-validated additive-to-self behind
+  an operator tap**. The agent reads its sandbox; it cannot durably
+  rewrite it.
 - **Agent → host / fleet control** — `hostd` is a separate daemon →
   admin-gated.
 
-The only place an agent shares a uid is with **its own gateway**, and
-everything reachable there is *already inside that agent's
-operator-granted scope*. Minting a scoped token from a credential you
-were already granted is **not** escalation — it's using what you have.
-So the same-uid softness never crosses into "things it shouldn't have";
-those are all behind the uid boundary. This is why the model needs no
-cryptographic proofing of the agent↔gateway channel.
+The only place an agent shares a uid is with **its own gateway**. By
+default that softness is inert: minting a scoped credential goes through
+the operator (`vault.broker.approvalAuth: passphrase`, the default), so
+the agent self-mints nothing. The agent↔gateway channel only becomes
+forgeable if the operator **opts in** to single-factor posture mint for a
+named agent (`approvalAuth: telegram-id` **and** adding the agent to
+`vault.broker.postureMintAgents` — both default-off). Even then it's
+bounded: `adminOnlyKeys` claws the sensitive keys back to
+**passphrase-only**, which a same-uid agent still can't satisfy. So the
+same-uid surface is an operator opt-in gated by a factor the agent lacks
+— not an open door — which is why the model needs no cryptographic
+proofing of the agent↔gateway channel.
 
 ## Three tiers, three minimal mechanisms
 
@@ -69,7 +80,7 @@ requires.
 
 | Tier | What | Enforcement |
 |---|---|---|
-| **Sandbox** | tools, MCP servers, standing credentials the operator declared | Operator-owned, read-only config. Agent works freely inside it, **no prompts.** |
+| **Sandbox** | tools, MCP servers, standing credentials the operator declared | Authoritative `switchroom.yaml` is operator-owned + read-only; scaffold files regenerate from it on reconcile. Agent works freely inside it, **no prompts.** |
 | **Ad-hoc** | something not in the sandbox | One **honest** approval card → the operator's Telegram tap. `callback_query.from.id` is Telegram-authenticated; an agent cannot fake it. |
 | **Crown jewels** | irreversible actions, admin credentials | Operator **passphrase** — a secret the agent structurally never holds. The only tier above a tap. |
 
