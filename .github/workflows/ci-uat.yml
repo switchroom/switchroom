@@ -117,3 +117,14 @@ jobs:
         # gate. Keep them separate; operators run both during UAT.
         working-directory: telegram-plugin
         run: bun run test:uat jtbd-always-on-after-restart
+
+      - name: UAT reliable-delivery regression (rapid-fire no-drop)
+        if: steps.secrets.outputs.ok == 'true'
+        # Fires back-to-back messages at the turn-completion boundary and
+        # asserts every one gets its own reply — the regression gate for the
+        # deliver-until-acked queue (#2089), which replaced fire-and-forget
+        # delivery that stranded inbounds in the composer and dropped them at
+        # the 300s silence-poke. Driver-only (no sudo), but kept in its own
+        # step so a flake can't stall the fuzz pool.
+        working-directory: telegram-plugin
+        run: bun run test:uat inbound-no-drop
