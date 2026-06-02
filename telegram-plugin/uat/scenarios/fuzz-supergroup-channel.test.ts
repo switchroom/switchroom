@@ -20,7 +20,7 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { spinUp } from "../harness.js";
-import { expectMessage } from "../assertions.js";
+import { expectMessage, isWorkerFeedMessage, isActivityFeedMessage } from "../assertions.js";
 
 const AGENT = "test-harness";
 const SUPERGROUP_ID = Number.parseInt(process.env.SWITCHROOM_UAT_CHAT_ID ?? "", 10);
@@ -74,19 +74,16 @@ describe("uat: supergroup human-style fuzz — JTBD invariants in a channel", ()
       console.warn("[uat] SWITCHROOM_UAT_CHAT_ID unset — skipping supergroup fuzz");
       return;
     }
-    // One-time probe: can the driver post to the configured chat? (Forum
-    // supergroup + member.) If not, mark all cases skipped instead of red.
+    // One-time NON-INTRUSIVE probe: is the configured chat a resolvable
+    // forum supergroup the driver is in? (Sends nothing — no junk message
+    // left in the operator's group.) If not, mark all cases skipped.
     const sc = await spinUp({ agent: AGENT, settleMs: 0 });
     try {
       await sc.driver.primeDialogs();
-      const probe = await sc.driver
-        .sendText(SUPERGROUP_ID, "🧪 channel-fuzz probe (ignore)")
-        .then(() => true)
-        .catch((err: unknown) => {
-          console.warn(`[uat] supergroup ${SUPERGROUP_ID} not postable (${(err as Error).message}) — skipping fuzz`);
-          return false;
-        });
-      postable = probe;
+      postable = await sc.driver.canResolve(SUPERGROUP_ID);
+      if (!postable) {
+        console.warn(`[uat] supergroup ${SUPERGROUP_ID} not resolvable — skipping fuzz`);
+      }
       driverUserId = sc.driverUserId;
     } finally {
       await sc.tearDown();
@@ -103,7 +100,10 @@ describe("uat: supergroup human-style fuzz — JTBD invariants in a channel", ()
         const reply = await expectMessage(
           sc.driver,
           SUPERGROUP_ID,
-          (m) => m.text.trim().length > 0,
+          // The conversational reply — NOT a live worker/activity feed
+          // message (those also land in the topic on tool-using turns;
+          // the JTBD floor is about the answer, not the status surface).
+          (m) => m.text.trim().length > 0 && !isWorkerFeedMessage(m) && !isActivityFeedMessage(m),
           { timeout: TIMEOUT_MS, senderFilter: { notUserId: driverUserId } },
         );
 

@@ -60,28 +60,26 @@ describe("uat: supergroup channel reply", () => {
       // username). Requires the driver account to be a group member.
       await sc.driver.primeDialogs();
 
-      // Unique nonce so the matcher can't latch onto an unrelated message
-      // already in the group.
-      const nonce = `sgproof-${Date.now().toString(36)}`;
-      try {
-        await sc.driver.sendText(
-          SUPERGROUP_ID,
-          `You're being tested in a group. Reply in this group with exactly this token and nothing else: ${nonce}`,
-        );
-      } catch (err) {
-        // The configured chat isn't a resolvable forum supergroup the
-        // driver can post to (e.g. it's still a BASIC group, or the driver
-        // account isn't a member). Skip rather than red — the supergroup
-        // wiring is an operator setup step (uat/SETUP.md §2), not a code
-        // regression. The unit thread-assertions (PR #2098) still guard the
-        // routing logic.
+      // Non-intrusive postability check (sends nothing). Skips — rather
+      // than reds — when the chat isn't a resolvable forum supergroup the
+      // driver is in (e.g. still a BASIC group, or not a member). The
+      // wiring is an operator setup step (uat/SETUP.md §2), and the
+      // topic-routing logic is pinned by the unit thread-assertions (#2098).
+      if (!(await sc.driver.canResolve(SUPERGROUP_ID))) {
         console.warn(
-          `[uat] supergroup ${SUPERGROUP_ID} not postable (${(err as Error).message}) ` +
-            `— skipping. Ensure it's a forum supergroup (Topics enabled) and the ` +
-            `driver account is a member.`,
+          `[uat] supergroup ${SUPERGROUP_ID} not resolvable — skipping. Ensure ` +
+            `it's a forum supergroup (Topics enabled) and the driver is a member.`,
         );
         return;
       }
+
+      // Unique nonce so the matcher can't latch onto an unrelated message
+      // already in the group.
+      const nonce = `sgproof-${Date.now().toString(36)}`;
+      await sc.driver.sendText(
+        SUPERGROUP_ID,
+        `You're being tested in a group. Reply in this group with exactly this token and nothing else: ${nonce}`,
+      );
 
       const reply = await expectMessage(
         sc.driver,

@@ -178,6 +178,25 @@ export class Driver {
     }
   }
 
+  /**
+   * True if `chatId` is resolvable (its access_hash is known) — i.e. a
+   * peer the account can address. Call after {@link primeDialogs}.
+   * Non-intrusive: sends nothing. A forum supergroup the driver account
+   * is in resolves true; a chat referenced by a wrong/foreign marked id
+   * (e.g. a BASIC group given a supergroup-style `-100…` id, or a chat
+   * the driver isn't a member of) resolves false. Used to skip supergroup
+   * scenarios cleanly when the test forum isn't wired.
+   */
+  async canResolve(chatId: number): Promise<boolean> {
+    const c = this.requireClient();
+    try {
+      await c.resolvePeer(chatId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async sendText(
     chatId: number,
     text: string,
