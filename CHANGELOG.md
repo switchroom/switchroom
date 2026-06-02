@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.14.37 — Background-worker visibility fixes (#2075, #2076)
+
+Two fixes to how a delegated background worker is surfaced back to the
+Telegram conversation it was launched from.
+
+### PR A — promote a mis-recorded foreground worker to background (#2075)
+
+When an agent delegates with `run_in_background: true`, Claude Code
+sometimes reports the dispatch to the PreToolUse hook *without* the
+background flag, so the registry row is recorded as `background=0`. The
+PostToolUse hook then took the foreground path — terminalizing the row
+and emitting a "hand back to me" nudge — even though the worker was
+still running detached. The worker's live activity never reached
+Telegram.
+
+The PostToolUse hook now trusts Claude Code's async-launch
+acknowledgement (`"Async agent launched successfully … working in the
+background … agentId: …"`) over the pretool's input flag: on that ACK
+it **promotes** the row to `background=1`, takes the non-terminalizing
+background path, and suppresses the foreground handback nudge. The
+worker stays visible through its own activity feed.
+
+### PR B — backfill `parent_turn_key` at jsonl-link time (#2076)
+
+A sub-agent row's `parent_turn_key` is the only link back to the
+originating Telegram conversation (chat + topic). The PreToolUse hook
+can't know it — Claude Code's payload carries the `claude` session id,
+never the gateway-minted Telegram turn_key — so the row is recorded
+with `parent_turn_key = NULL` and the worker card defaulted to the
+operator DM instead of the group/topic the work was requested in.
+
+The gateway now backfills `parent_turn_key` when it links a worker's
+JSONL stem to its registry row (`backfillJsonlAgentId`), resolving it
+from the turn whose `[started_at, ended_at]` window contained the
+sub-agent's dispatch. Because turns are processed serially per agent,
+exactly one turn window contains any given dispatch instant — and the
+resolution stays correct even for a background worker that **outlives**
+its parent turn (it attributes to the containing turn, not whichever
+turn happens to be active at link time). The existing
+`parent_turn_key IS NULL` guard means an already-populated value is
+never overwritten.
+
 ## v0.14.36 — Admin-only vault credentials (#2073)
 
 Mark sensitive vault keys that may be granted **only by the admin
