@@ -42,6 +42,7 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
+import { describeToolUse } from './tool-activity-summary.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
@@ -348,6 +349,13 @@ export interface SubagentWatcherConfig {
     lastTool: { name: string; sanitisedArg: string } | null
     /** Tool-use count observed so far. */
     toolCount: number
+    /** Friendly display line for THIS tick. Set on `sub_agent_tool_use`
+     *  events to a `describeToolUse` label ("Reading X", "Running a
+     *  command") so a foreground sub-agent that runs tools without
+     *  emitting prose still surfaces its steps in the parent's nested
+     *  feed. Undefined on `sub_agent_text` ticks — the gateway falls back
+     *  to `latestSummary` (the narrative line), preserving prior behavior. */
+    progressLine?: string
   }) => void
   /** `Date.now` override for tests. */
   now?: () => number
@@ -645,6 +653,9 @@ export function readSubTail(
     lastTool: { name: string; sanitisedArg: string } | null
     /** Tool-use count observed so far. */
     toolCount: number
+    /** Friendly display line for THIS tick (set on tool ticks; see the
+     *  SubagentWatcherConfig.onProgress doc). */
+    progressLine?: string
   }) => void,
 ): void {
   try {
@@ -780,6 +791,39 @@ export function readSubTail(
           entry.lastTool = {
             name: ev.toolName,
             sanitisedArg: sanitiseToolArg(ev.toolName, ev.input ?? {}),
+          }
+          // Surface a tool-step progress cue. A foreground sub-agent that
+          // runs tools WITHOUT emitting prose (e.g. a researcher reading
+          // files) previously produced no onProgress tick at all — only
+          // `sub_agent_text` fired it — so its steps never nested under the
+          // parent's activity feed (the named foreground blindspot). Fire
+          // here too, carrying a friendly `describeToolUse` label as
+          // `progressLine` so the gateway can render "Reading X" / "Running
+          // a command" the same way the main-turn feed does. `latestSummary`
+          // stays the worker's narrative result (never polluted with tool
+          // labels — the handback payload depends on it). Pure jsonl-tail →
+          // render, no model call.
+          if (onProgress != null && entry.state === 'running' && !entry.historical) {
+            const toolLine = describeToolUse(ev.toolName, ev.input ?? {})
+            if (toolLine != null && toolLine.length > 0) {
+              try {
+                onProgress({
+                  agentId: entry.agentId,
+                  description: entry.description,
+                  latestSummary: entry.lastResultText,
+                  elapsedMs: now - entry.dispatchedAt,
+                  prevBucketIdx: entry.lastProgressBucketIdx,
+                  setBucketIdx: (b: number) => {
+                    entry.lastProgressBucketIdx = b
+                  },
+                  lastTool: entry.lastTool,
+                  toolCount: entry.toolCount,
+                  progressLine: toolLine,
+                })
+              } catch (cbErr) {
+                log?.(`subagent-watcher: onProgress (tool) callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+              }
+            }
           }
         } else if (ev.kind === 'sub_agent_text') {
           // Do NOT overwrite description with narrative text — description is
