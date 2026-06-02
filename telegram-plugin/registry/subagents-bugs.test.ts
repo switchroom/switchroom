@@ -401,10 +401,38 @@ function writeTurnActiveMarker(turnKey: string, chatId = '12345', threadId: stri
   )
 }
 
+/**
+ * Seed a turns row so the hook's phantom-turn_key guard (it only stamps a
+ * marker turn_key that actually has a turns row) is satisfied. In production
+ * the gateway writes this row via recordTurnStart at turn-start.
+ */
+function seedTurn(turnKey: string, chatId = '12345', threadId: string | null = null) {
+  const { Database } = require('bun:sqlite') as {
+    Database: new (path: string) => {
+      prepare(sql: string): { run(...p: unknown[]): unknown }
+      exec(sql: string): void
+      close(): void
+    }
+  }
+  const db = new Database(dbPath)
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS turns (
+      turn_key TEXT PRIMARY KEY, chat_id TEXT, thread_id TEXT,
+      started_at INTEGER, ended_at INTEGER, created_at INTEGER, updated_at INTEGER
+    )`,
+  )
+  const now = Date.now()
+  db.prepare(
+    'INSERT OR IGNORE INTO turns (turn_key, chat_id, thread_id, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(turnKey, chatId, threadId, now, now, now)
+  db.close()
+}
+
 describe('Bug 5 — parent_turn_key stamped from the turn-active marker', () => {
   it('stamps parent_turn_key = marker.turnKey when a turn is active', () => {
     // Supergroup forum-topic turn_key (chat:thread:startedAt).
     const turnKey = '-1003831053471:4:1780370238492'
+    seedTurn(turnKey, '-1003831053471', '4')
     writeTurnActiveMarker(turnKey, '-1003831053471', '4')
 
     const event = {
@@ -423,6 +451,31 @@ describe('Bug 5 — parent_turn_key stamped from the turn-active marker', () => 
 
     expect(row).toBeDefined()
     expect(row!.parent_turn_key).toBe(turnKey)
+  })
+
+  it('downgrades to NULL when the marker names a turn_key with no turns row (phantom-marker guard)', () => {
+    // The gateway writes the marker even if recordTurnStart's INSERT failed, so
+    // a marker can point at a turn_key with no row. Stamping it would mis-route
+    // the worker card AND block the watcher backfill (NULL guard). The hook must
+    // verify the row exists and fall back to NULL.
+    seedTurn('12345:_:1780000000000') // a DIFFERENT, real turn exists…
+    writeTurnActiveMarker('12345:_:9999999999999') // …but the marker names a phantom.
+
+    const event = {
+      session_id: 'sess-phantom',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_phantom001',
+      tool_input: { description: 'Task', run_in_background: false },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT parent_turn_key FROM subagents WHERE id = ?').get('toolu_phantom001') as
+      | { parent_turn_key: string | null }
+      | undefined
+    expect(row).toBeDefined()
+    expect(row!.parent_turn_key).toBeNull()
   })
 
   it('writes parent_turn_key=NULL when no turn is active (gateway backfill fallback)', () => {

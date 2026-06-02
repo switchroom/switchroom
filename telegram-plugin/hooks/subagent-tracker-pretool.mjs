@@ -191,6 +191,24 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
           db.exec('ALTER TABLE subagents ADD COLUMN jsonl_agent_id TEXT')
           db.exec('CREATE INDEX IF NOT EXISTS subagents_jsonl_id ON subagents(jsonl_agent_id)')
         }
+        // Verify the marker-derived parent_turn_key (snapParams[2]) actually has
+        // a row in the turns table before trusting it. The gateway writes the
+        // turn-active marker even when recordTurnStart's INSERT failed (the two
+        // writes have independent failure surfaces), so a marker can name a
+        // turn_key with no turns row. Stamping that phantom key would route the
+        // worker card to the operator DM AND block the watcher's NULL-guarded
+        // window backfill from recovering it. Downgrade to NULL so the backfill
+        // stays eligible — this also defends against a stale/corrupted marker.
+        if (snapParams[2] != null) {
+          let turnRow = null
+          try {
+            turnRow = db.prepare('SELECT 1 FROM turns WHERE turn_key = ? LIMIT 1').get(snapParams[2])
+          } catch {
+            // turns table may not exist yet on a brand-new agent — treat as no row.
+            turnRow = null
+          }
+          if (turnRow == null) snapParams[2] = null
+        }
         db.prepare(snapInsertSql).run(...snapParams)
         db.close()
         done(null)
@@ -202,6 +220,12 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
   }
 
   // sqlite3 CLI fallback — two non-blocking spawns sequenced via callbacks.
+  // This legacy path (neither node:sqlite nor bun:sqlite available) can't
+  // cheaply verify the marker's turn_key against the turns table, so drop
+  // parent_turn_key and let the gateway's window backfill attribute it.
+  // Production agents use node:sqlite; bun test uses bun:sqlite — both take
+  // the verified path above.
+  params[2] = null
   spawnSql(dbPath, SCHEMA_SQL.replace(/\n\s+/g, ' '), (err) => {
     if (err) { done(err); return }
     spawnSql(dbPath, fillPlaceholders(INSERT_SQL.trim(), params), done)

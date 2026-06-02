@@ -196,19 +196,27 @@ function toolResponseText(toolResponse) {
  *      contain it.
  *   2. Structural backstop: the background-status phrase "working in the
  *      background" + an agentId token. Survives a reworded launch verb.
- *   3. Drift-tolerant: the `agentId: <stem>` token — the FUNCTIONAL, most
- *      stable part of the ACK (the parent later references the worker by this
- *      id, so it is far less likely to be reworded than the surrounding prose)
- *      — paired with a launch/background/async/dispatch context word. This
- *      survives BOTH prose phrases (tiers 1 & 2) changing in the same bump.
- *      The context-word requirement keeps a genuine foreground report that
- *      merely mentions "agentId" in passing from tripping it.
+ *   3. Drift-tolerant STRUCTURAL match: `agentId: <stem>` as a bare identifier
+ *      on its OWN LINE — the functional, most wording-stable core of the ACK
+ *      (the parent references the worker by this id). claude-code emits it on
+ *      its own line; a foreground report that merely names an agent id embeds
+ *      it mid-sentence ("the agentId is X is managing …"), which the own-line
+ *      anchor rejects. Paired with a launch/background/async/dispatch/notify
+ *      context word so it can't trip on a foreground report that happens to
+ *      print a bare id on its own line. This survives BOTH prose phrases
+ *      (tiers 1 & 2) rewording in the same bump.
  *
  * If all three miss, promotion degrades to the pretool's input-derived flag —
  * still correct whenever the model DID pass run_in_background, never worse than
  * before. The exact ACK contract is pinned by drift-variant tests in
  * subagent-tracker-hooks.test.ts ("async-launch ACK contract"); when bumping
  * the pinned claude-code version, re-verify the live ACK against those.
+ *
+ * Known residual (accepted): an ACK reword that BOTH drops the own-line id
+ * form AND removes every context word degrades to the pretool flag; a
+ * foreground report that prints a bare `agentId: <id>` on its own line next to
+ * a launch/background word would false-promote. Both are narrow; the own-line
+ * + context-word conjunction is the balance point. Re-verify on a pin bump.
  *
  * ACK contract verified against claude-code 2.1.156 (the fleet pin):
  *   "Async agent launched successfully.\n
@@ -221,7 +229,12 @@ function isAsyncLaunchAck(toolResponse) {
   if (!t) return false
   if (t.includes('async agent launched')) return true
   if (t.includes('working in the background') && t.includes('agentid')) return true
-  if (/agentid:\s*\S/.test(t) && /\b(background|launch|dispatch|async)/.test(t)) return true
+  // Tier 3 — own-line `agentid: <bare-stem>` + a context word (leading \b so
+  // reworded/derived forms like "launched"/"dispatching"/"notified" still
+  // count). `m` flag anchors $ to line end so a mid-sentence id is rejected.
+  if (/agentid:\s*[a-z0-9][\w-]*\s*$/m.test(t) && /\b(background|launch|dispatch|async|notif)/.test(t)) {
+    return true
+  }
   return false
 }
 

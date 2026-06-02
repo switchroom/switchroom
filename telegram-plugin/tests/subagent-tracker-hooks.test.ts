@@ -403,6 +403,58 @@ describe('subagent-tracker-posttool', () => {
     expect(row?.background).toBe(0)
     expect(row?.status).toBe('completed')
   })
+
+  it('does NOT promote a foreground orchestrator narrative that embeds an agentId mid-sentence', () => {
+    // The #2085-review false-positive: a coordinator agent reporting on other
+    // agents. The agentId is mid-sentence (not on its own line), so tier 3's
+    // own-line anchor rejects it even though "background"/"dispatching" appear.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-orch',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_orch1',
+      tool_input: { subagent_type: 'worker', description: 'Coordinator', run_in_background: false },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_orch1',
+      tool_response: { result: 'agentId: coord-x is managing background work and dispatching checks.', is_error: false },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db.prepare('SELECT background, status FROM subagents WHERE id = ?').get('toolu_orch1') as
+      | { background: number; status: string }
+      | undefined
+    expect(row?.background).toBe(0)
+    expect(row?.status).toBe('completed')
+  })
+
+  it('does NOT promote an own-line agentId with no launch/background context word (boundary)', () => {
+    // Documents the accepted tier-3 boundary: an own-line bare agentId alone
+    // (no background/launch/dispatch/async/notify word) is not enough to
+    // promote — guards a foreground report that prints an id on its own line.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-bound',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_bound1',
+      tool_input: { subagent_type: 'worker', description: 'Infra', run_in_background: false },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_bound1',
+      tool_response: { content: [{ type: 'text', text: 'Created the worker.\nagentId: svc-99\nIt is ready.' }] },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db.prepare('SELECT background, status FROM subagents WHERE id = ?').get('toolu_bound1') as
+      | { background: number; status: string }
+      | undefined
+    expect(row?.background).toBe(0)
+    expect(row?.status).toBe('completed')
+  })
 })
 
 describe('agent-dir resolution (RFC §Bug 2)', () => {
