@@ -55,8 +55,15 @@ describe("uat: rapid follow-ups — steering vs queued classification", () => {
           (m) => {
             const txt = m.text;
             const mentionsMd5 = /\bmd5\b/i.test(txt);
+            // Steer narration: the agent acknowledges amending the in-flight
+            // task. Accept the phrasings the model actually uses — including
+            // "Switched to MD5 per your update/follow-up" (the 2026-06-02
+            // canary reply that the old regex wrongly rejected). Anchored on
+            // "per your <qualifier>" / continuation language so it stays
+            // distinct from the QUEUED path (a fresh answer with no such
+            // course-correction narration).
             const narratesSteer =
-              /↪️|\bsteer(ing)?\b|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(
+              /↪️|\bsteer(ing)?\b|switch(?:ed|ing)? to \w+ per your (?:update|follow-?up|guidance|request|steer)|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(
                 txt,
               );
             return mentionsMd5 && narratesSteer;
