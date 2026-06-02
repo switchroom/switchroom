@@ -286,6 +286,7 @@ import {
   ackDelivery,
   sweep as sweepDeliveryQueue,
   forgetDelivery,
+  shouldTrackDelivery,
   type PendingDelivery,
 } from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
@@ -10670,8 +10671,10 @@ async function handleInbound(
     const busyKey = markClaudeBusyForInbound(inboundMsg)
     // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
     // lands, the message stranded in the composer and the sweep re-delivers
-    // it. See inbound-delivery-confirm.ts.
-    if (DELIVERY_CONFIRM_ENABLED) {
+    // it. Track ONLY fresh-turn messages (not steering / `!` interrupt) —
+    // those amend the running turn and never emit `enqueue`, so tracking them
+    // would re-deliver forever. See shouldTrackDelivery (inbound-delivery-confirm.ts).
+    if (DELIVERY_CONFIRM_ENABLED && shouldTrackDelivery({ isSteering, isInterrupt: interrupt.isInterrupt })) {
       trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now())
     }
   }

@@ -1,6 +1,23 @@
 # Changelog
 
-## v0.14.40 — Reliable inbound delivery: deliver-until-acked
+## unreleased — Delivery-confirm: don't track steering/interrupt (re-deliver-loop fix)
+
+Follow-up hardening to v0.14.40's deliver-until-acked queue. That change
+tracked **every** delivered inbound for an `enqueue` ack — including
+`/steer` and `!`-interrupt messages. But those are delivered mid-turn to
+*amend the running turn* and never emit a fresh `enqueue`, so they were
+never acked and the 5s sweep re-delivered them (duplicate turns / a
+re-delivery loop). An adversarial stress-test of the v0.14.40 fix caught
+this before it bit in anger (the canary's steer test had passed only by
+ack-timing luck).
+
+- **Track only fresh-turn deliveries.** `shouldTrackDelivery` gates
+  tracking to non-steering, non-interrupt inbounds — exactly the messages
+  the #1556 buffer-gate holds-then-delivers, which are the ones that
+  produce an `enqueue` to ack against. Steering/interrupt are the gate's
+  carve-outs and are now equally exempt from the delivery-confirm queue.
+  Pure helper + unit tests pin the invariant. Also removes the only
+  realistic source of unbounded queue growth (never-acking entries).
 
 Telegram inbounds reach claude as an MCP channel notification that the
 unmodified CLI appends to its TUI composer and auto-submits only when the

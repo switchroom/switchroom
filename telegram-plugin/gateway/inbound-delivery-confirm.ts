@@ -94,3 +94,23 @@ export function sweep<M>(
 export function forgetDelivery<M>(q: DeliveryQueue<M>, key: string): void {
   q.pending.delete(key)
 }
+
+/**
+ * Should this delivered inbound be tracked for ack/re-delivery?
+ *
+ * ONLY fresh-turn messages — the ones the #1556 buffer-gate holds until claude
+ * is idle, then delivers — produce a fresh `enqueue` session-event, which is
+ * the ack that clears tracking. Steering (`/steer`) and `!` interrupt inbounds
+ * are the gate's *carve-outs*: they're delivered mid-turn to AMEND the running
+ * turn, so they do NOT start a fresh turn and never emit `enqueue`. Tracking
+ * them would leave an entry that is never acked → the sweep re-delivers it
+ * indefinitely (duplicate turns). So mirror the gate's carve-outs here: track a
+ * delivery iff it is neither steering nor interrupt — i.e. exactly the messages
+ * that produce an `enqueue` to ack against.
+ */
+export function shouldTrackDelivery(input: {
+  isSteering: boolean
+  isInterrupt: boolean
+}): boolean {
+  return !input.isSteering && !input.isInterrupt
+}
