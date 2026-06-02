@@ -153,3 +153,53 @@ describe('backfillJsonlAgentId — parent_turn_key resolution', () => {
     expect(row?.parent_turn_key == null).toBe(true)
   })
 })
+
+// ─── #2081: overlapping windows + hook-stamped value precedence ───────────────
+// The backfill is now only a FALLBACK — the PreToolUse hook stamps
+// parent_turn_key from the live turn-active marker at dispatch
+// (subagent-tracker-pretool.mjs readActiveTurnKey). These tests pin the two
+// guarantees that make the hook fix correct end-to-end.
+describe('backfillJsonlAgentId — overlapping windows / hook precedence (#2081)', () => {
+  it('does NOT overwrite a hook-stamped parent_turn_key, even when overlapping windows would resolve differently', () => {
+    // Supergroup: two forum topics under one chat with OVERLAPPING windows.
+    // Topic A (thread 4) started first and is still open; topic B (thread 7)
+    // started later. A sub-agent dispatched at 1500 falls inside BOTH windows.
+    insertTurn({ turnKey: '-100:4:1000', chatId: '-100', threadId: '4', startedAt: 1000, endedAt: null })
+    insertTurn({ turnKey: '-100:7:1400', chatId: '-100', threadId: '7', startedAt: 1400, endedAt: null })
+
+    // The hook already stamped the CORRECT parent (topic A) from the marker.
+    insertSub({
+      id: 'toolu_overlap',
+      agentType: 'worker',
+      description: 'Topic-A worker',
+      startedAt: 1500,
+      parentTurnKey: '-100:4:1000',
+    })
+
+    const jsonlPath = writeMeta('worker', 'Topic-A worker')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_overlap')
+
+    const row = readSub('toolu_overlap')
+    expect(row?.jsonl_agent_id).toBe('agentstem_overlap')
+    // The IS NULL guard means the hook's correct value survives — NOT the
+    // window query's ORDER BY started_at DESC pick (which would be topic B).
+    expect(row?.parent_turn_key).toBe('-100:4:1000')
+  })
+
+  it('fallback window-match (NULL parent) picks the latest-started overlapping turn — the documented fallback limitation', () => {
+    // When the hook left parent_turn_key NULL (no active marker at dispatch),
+    // the backfill falls back to the started_at window match. With overlapping
+    // windows it resolves to the latest-started containing turn. This is a
+    // best-effort fallback for the no-marker case — the hook path above is the
+    // correct primary. Pinned here so the fallback behaviour is explicit.
+    insertTurn({ turnKey: '-100:4:1000', chatId: '-100', threadId: '4', startedAt: 1000, endedAt: null })
+    insertTurn({ turnKey: '-100:7:1400', chatId: '-100', threadId: '7', startedAt: 1400, endedAt: null })
+    insertSub({ id: 'toolu_fallback', agentType: 'worker', description: 'No-marker worker', startedAt: 1500 })
+
+    const jsonlPath = writeMeta('worker', 'No-marker worker')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_fallback')
+
+    const row = readSub('toolu_fallback')
+    expect(row?.parent_turn_key).toBe('-100:7:1400')
+  })
+})

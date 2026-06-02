@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { spawnSync } from 'child_process'
@@ -385,26 +385,62 @@ describe('Bug 4 — result_summary always NULL (hook integration)', () => {
   })
 })
 
-// ─── Bug 5 — parent_turn_key always NULL ─────────────────────────────────────
+// ─── Bug 5 — parent_turn_key stamped from the live turn-active marker ─────────
+// (#2081 / #2083) The PreToolUse hook reads <telegramDir>/turn-active.json —
+// the gateway-written marker for the turn whose tool call is dispatching this
+// sub-agent — and stamps parent_turn_key = marker.turnKey at INSERT. This
+// captures the EXACT active turn (no started_at time-window reconstruction at
+// jsonl-link time), so it can't mis-attribute under overlapping turn windows
+// (#2081) and works even for sub-agents whose JSONL never links (#2083).
 
-describe('Bug 5 — parent_turn_key backfilled by gateway, not the hook', () => {
-  it('pretool writes parent_turn_key=NULL even when event.turn_id is present', () => {
-    // Claude Code's PreToolUse payload carries its own session id, never the
-    // gateway-minted Telegram turn_key (a chat+topic+turn key) the `turns`
-    // table is keyed on. `event.turn_id` — even if a future CLI populated it —
-    // would not match a `turns.turn_key`, so the hook intentionally writes
-    // NULL and lets the gateway backfill parent_turn_key from the sub-agent's
-    // started_at at jsonl-link time (subagent-watcher.ts backfillJsonlAgentId).
-    // Writing a bogus value here would defeat that backfill's
-    // `parent_turn_key IS NULL` guard.
+/** Write the gateway's turn-active marker into the agent's telegram dir. */
+function writeTurnActiveMarker(turnKey: string, chatId = '12345', threadId: string | null = null) {
+  writeFileSync(
+    join(agentDir, 'telegram', 'turn-active.json'),
+    JSON.stringify({ turnKey, chatId, threadId, startedAt: Date.now() }, null, 2) + '\n',
+  )
+}
+
+/**
+ * Seed a turns row so the hook's phantom-turn_key guard (it only stamps a
+ * marker turn_key that actually has a turns row) is satisfied. In production
+ * the gateway writes this row via recordTurnStart at turn-start.
+ */
+function seedTurn(turnKey: string, chatId = '12345', threadId: string | null = null) {
+  const { Database } = require('bun:sqlite') as {
+    Database: new (path: string) => {
+      prepare(sql: string): { run(...p: unknown[]): unknown }
+      exec(sql: string): void
+      close(): void
+    }
+  }
+  const db = new Database(dbPath)
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS turns (
+      turn_key TEXT PRIMARY KEY, chat_id TEXT, thread_id TEXT,
+      started_at INTEGER, ended_at INTEGER, created_at INTEGER, updated_at INTEGER
+    )`,
+  )
+  const now = Date.now()
+  db.prepare(
+    'INSERT OR IGNORE INTO turns (turn_key, chat_id, thread_id, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(turnKey, chatId, threadId, now, now, now)
+  db.close()
+}
+
+describe('Bug 5 — parent_turn_key stamped from the turn-active marker', () => {
+  it('stamps parent_turn_key = marker.turnKey when a turn is active', () => {
+    // Supergroup forum-topic turn_key (chat:thread:startedAt).
+    const turnKey = '-1003831053471:4:1780370238492'
+    seedTurn(turnKey, '-1003831053471', '4')
+    writeTurnActiveMarker(turnKey, '-1003831053471', '4')
+
     const event = {
       session_id: 'sess-turnkey',
-      turn_id: 'turn-abc-001',
       tool_name: 'Agent',
       tool_use_id: 'toolu_turnkey001',
       tool_input: { description: 'Task with turn context', run_in_background: false },
     }
-
     const result = runHook(PRETOOL_SCRIPT, event)
     expect(result.status).toBe(0)
 
@@ -414,18 +450,43 @@ describe('Bug 5 — parent_turn_key backfilled by gateway, not the hook', () => 
       | undefined
 
     expect(row).toBeDefined()
-    // The hook never trusts event.turn_id — gateway backfill owns this column.
+    expect(row!.parent_turn_key).toBe(turnKey)
+  })
+
+  it('downgrades to NULL when the marker names a turn_key with no turns row (phantom-marker guard)', () => {
+    // The gateway writes the marker even if recordTurnStart's INSERT failed, so
+    // a marker can point at a turn_key with no row. Stamping it would mis-route
+    // the worker card AND block the watcher backfill (NULL guard). The hook must
+    // verify the row exists and fall back to NULL.
+    seedTurn('12345:_:1780000000000') // a DIFFERENT, real turn exists…
+    writeTurnActiveMarker('12345:_:9999999999999') // …but the marker names a phantom.
+
+    const event = {
+      session_id: 'sess-phantom',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_phantom001',
+      tool_input: { description: 'Task', run_in_background: false },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT parent_turn_key FROM subagents WHERE id = ?').get('toolu_phantom001') as
+      | { parent_turn_key: string | null }
+      | undefined
+    expect(row).toBeDefined()
     expect(row!.parent_turn_key).toBeNull()
   })
 
-  it('pretool stores parent_turn_key as NULL when turn_id absent (no regression)', () => {
+  it('writes parent_turn_key=NULL when no turn is active (gateway backfill fallback)', () => {
+    // No marker written → no active turn → hook leaves NULL and the gateway's
+    // started_at backfill remains the fallback (today's behaviour).
     const event = {
       session_id: 'sess-noturnkey',
       tool_name: 'Agent',
       tool_use_id: 'toolu_noturn001',
       tool_input: { description: 'Task without turn context', run_in_background: false },
     }
-
     runHook(PRETOOL_SCRIPT, event)
 
     const db = openDb()
@@ -434,7 +495,47 @@ describe('Bug 5 — parent_turn_key backfilled by gateway, not the hook', () => 
       | undefined
 
     expect(row).toBeDefined()
-    // When no turn_id in event, parent_turn_key should be NULL — no crash
+    expect(row!.parent_turn_key).toBeNull()
+  })
+
+  it('ignores event.turn_id — only the marker is authoritative', () => {
+    // A future CLI populating event.turn_id must NOT be trusted: it is Claude
+    // Code's session turn, never a gateway turns.turn_key. With no marker the
+    // result is NULL regardless of turn_id.
+    const event = {
+      session_id: 'sess-turnid-only',
+      turn_id: 'turn-abc-001',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_turnid001',
+      tool_input: { description: 'Task', run_in_background: false },
+    }
+    runHook(PRETOOL_SCRIPT, event)
+
+    const db = openDb()
+    const row = db.prepare('SELECT parent_turn_key FROM subagents WHERE id = ?').get('toolu_turnid001') as
+      | { parent_turn_key: string | null }
+      | undefined
+
+    expect(row).toBeDefined()
+    expect(row!.parent_turn_key).toBeNull()
+  })
+
+  it('a malformed marker degrades to NULL (never crashes the dispatch)', () => {
+    writeFileSync(join(agentDir, 'telegram', 'turn-active.json'), '{ not valid json')
+    const event = {
+      session_id: 'sess-badmarker',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_badmarker001',
+      tool_input: { description: 'Task', run_in_background: false },
+    }
+    const result = runHook(PRETOOL_SCRIPT, event)
+    expect(result.status).toBe(0)
+
+    const db = openDb()
+    const row = db.prepare('SELECT parent_turn_key FROM subagents WHERE id = ?').get('toolu_badmarker001') as
+      | { parent_turn_key: string | null }
+      | undefined
+    expect(row).toBeDefined()
     expect(row!.parent_turn_key).toBeNull()
   })
 

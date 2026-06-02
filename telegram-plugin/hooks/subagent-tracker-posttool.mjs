@@ -188,18 +188,53 @@ function toolResponseText(toolResponse) {
  * parent turn, so the pretool recorded background=0 and the worker card never
  * fired). We therefore trust this ACK over the pretool's input-derived flag.
  *
- * Anchored on the specific "async agent launched" phrase (a foreground
- * sub-agent's final report is extremely unlikely to contain it), with a
- * structural backstop ("working in the background" + an agentId token) in case
- * the launch-verb wording drifts. A major wording change degrades to the
- * pretool flag — still correct whenever the model DID pass run_in_background,
- * never worse than before.
+ * Three tiers, widest-stable-signal last, so a Claude Code wording change has
+ * to defeat ALL of them before promotion silently regresses (#2084):
+ *
+ *   1. The canonical ACK phrase "async agent launched" — the exact current
+ *      claude-code wording. A foreground report is extremely unlikely to
+ *      contain it.
+ *   2. Structural backstop: the background-status phrase "working in the
+ *      background" + an agentId token. Survives a reworded launch verb.
+ *   3. Drift-tolerant STRUCTURAL match: `agentId: <stem>` as a bare identifier
+ *      on its OWN LINE — the functional, most wording-stable core of the ACK
+ *      (the parent references the worker by this id). claude-code emits it on
+ *      its own line; a foreground report that merely names an agent id embeds
+ *      it mid-sentence ("the agentId is X is managing …"), which the own-line
+ *      anchor rejects. Paired with a launch/background/async/dispatch/notify
+ *      context word so it can't trip on a foreground report that happens to
+ *      print a bare id on its own line. This survives BOTH prose phrases
+ *      (tiers 1 & 2) rewording in the same bump.
+ *
+ * If all three miss, promotion degrades to the pretool's input-derived flag —
+ * still correct whenever the model DID pass run_in_background, never worse than
+ * before. The exact ACK contract is pinned by drift-variant tests in
+ * subagent-tracker-hooks.test.ts ("async-launch ACK contract"); when bumping
+ * the pinned claude-code version, re-verify the live ACK against those.
+ *
+ * Known residual (accepted): an ACK reword that BOTH drops the own-line id
+ * form AND removes every context word degrades to the pretool flag; a
+ * foreground report that prints a bare `agentId: <id>` on its own line next to
+ * a launch/background word would false-promote. Both are narrow; the own-line
+ * + context-word conjunction is the balance point. Re-verify on a pin bump.
+ *
+ * ACK contract verified against claude-code 2.1.156 (the fleet pin):
+ *   "Async agent launched successfully.\n
+ *    agentId: <stem>\n
+ *    The agent is working in the background. You will be notified
+ *    automatically when it completes."
  */
 function isAsyncLaunchAck(toolResponse) {
   const t = toolResponseText(toolResponse).toLowerCase()
   if (!t) return false
   if (t.includes('async agent launched')) return true
   if (t.includes('working in the background') && t.includes('agentid')) return true
+  // Tier 3 — own-line `agentid: <bare-stem>` + a context word (leading \b so
+  // reworded/derived forms like "launched"/"dispatching"/"notified" still
+  // count). `m` flag anchors $ to line end so a mid-sentence id is rejected.
+  if (/agentid:\s*[a-z0-9][\w-]*\s*$/m.test(t) && /\b(background|launch|dispatch|async|notif)/.test(t)) {
+    return true
+  }
   return false
 }
 
