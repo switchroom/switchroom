@@ -119,6 +119,7 @@ The agent relays this to the user in plain language. This satisfies the *survive
 | `prompt` | Yes | — | The prompt that becomes the synthesized turn's text |
 | `model` | No | — | **Deprecated / ignored.** Pre-v0.8 the singleton scheduler ran each task as an isolated `claude -p` and could set `--model` per task. Post cron-fold-in the fire runs in the agent's existing session, so it always uses the **agent's** configured model. Accepted only so old configs keep validating; set the model at the agent level. |
 | `secrets` | No | `[]` | Vault keys this task may read. Operator-config only — rejected on agent-authored overlays. See [configuration.md#vault-broker-linux-only](configuration.md#vault-broker-linux-only) |
+| `topic` | No | agent's `default_topic_id` | **Supergroup-owned agents only.** The forum topic this cron fires into — a string alias resolved against `channels.telegram.topic_aliases`, or a raw numeric `message_thread_id`. Falls back to `default_topic_id` (General) when unset. Ignored for `fleet-shared` / `dm_only` agents. See [Targeting a forum topic](#targeting-a-forum-topic-supergroup-owned-agents). |
 
 ### Cron expression examples
 
@@ -129,6 +130,57 @@ The agent relays this to the user in plain language. This satisfies the *survive
 | `0 20 * * 0` | Sundays at 8:00 PM |
 | `0 9,17 * * *` | 9:00 AM and 5:00 PM daily |
 | `0 */3 * * *` | Every 3 hours |
+
+### Targeting a forum topic (supergroup-owned agents)
+
+When an agent owns a Telegram supergroup (`channels.telegram.chat_id` is
+set — the [supergroup-owned topology](rfcs/supergroup-easy-defaults.md)),
+each schedule entry can choose **which forum topic** it posts into via the
+per-entry `topic:` field. Without it, cron output lands in the agent's
+`default_topic_id` (General, topic `1`).
+
+Name your topics once under `channels.telegram.topic_aliases` (a
+map of `alias → numeric thread_id`), then reference them by alias from any
+cron entry. Aliases are resolved at config load, so a typo fails
+`switchroom apply` immediately rather than silently mis-routing at fire
+time. You can also pass a raw numeric `message_thread_id` instead of an
+alias.
+
+```yaml
+agents:
+  marko:
+    channels:
+      telegram:
+        chat_id: "-1003831053471"      # the supergroup marko owns
+        default_topic_id: 1            # General — where untargeted crons land
+        topic_aliases:
+          meta: 3                      # "Meta Campaigns"
+          crm: 4                       # "CRM (Brevo)"
+    schedule:
+      - cron: "0 8 * * 1-5"
+        prompt: "Morning Meta campaign pacing check — flag any ad set off target."
+        topic: meta                    # alias → posts into the Meta Campaigns topic
+      - cron: "0 9 * * 1"
+        prompt: "Weekly CRM digest: new Brevo contacts and list growth."
+        topic: crm                     # alias → CRM (Brevo)
+      - cron: "30 17 * * 5"
+        prompt: "Wrap-up: anything for next week?"
+        topic: 7                       # a raw thread_id also works
+      - cron: "0 7 * * *"
+        prompt: "Daily standup."
+        # no topic → lands in General (default_topic_id)
+```
+
+**Finding a topic's `thread_id`:** open the topic in Telegram and the
+`message_thread_id` is the trailing number in a message link
+(`t.me/c/<chat>/<thread_id>/<msg>`), or read it from an inbound message
+the agent has already received in that topic. The topic the operator calls
+"General" is always thread `1`.
+
+Resolution precedence (highest first): per-entry numeric `topic:` →
+per-entry alias `topic:` (looked up in `topic_aliases`) → the agent's
+`default_topic_id`. An unknown alias defends to `default_topic_id` at fire
+time, but config-load validation should reject it before then.
 
 ## How cron tasks deliver to Telegram
 
