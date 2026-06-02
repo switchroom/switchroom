@@ -4,6 +4,7 @@ import {
   ackDelivery,
   createDeliveryQueue,
   forgetDelivery,
+  shouldTrackDelivery,
   sweep,
   trackDelivery,
   type DeliveryQueue,
@@ -105,5 +106,24 @@ describe('inbound-delivery-confirm (reliable deliver-until-acked queue)', () => 
     forgetDelivery(q, 'chat:_')
     expect(q.pending.size).toBe(0)
     expect(sweep(q, 999_999, TIMEOUT)).toHaveLength(0)
+  })
+})
+
+// Regression for the steer/interrupt re-delivery loop: steering and `!`
+// interrupt inbounds amend the running turn and never emit `enqueue`, so they
+// must NOT be tracked (else the sweep re-delivers them forever). Only
+// fresh-turn messages — which DO enqueue — are tracked.
+describe('shouldTrackDelivery — only fresh-turn messages are tracked', () => {
+  it('tracks a normal (non-steering, non-interrupt) message', () => {
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false })).toBe(true)
+  })
+  it('does NOT track a /steer message (amends the turn — never acks)', () => {
+    expect(shouldTrackDelivery({ isSteering: true, isInterrupt: false })).toBe(false)
+  })
+  it('does NOT track a ! interrupt message (amends the turn — never acks)', () => {
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: true })).toBe(false)
+  })
+  it('does NOT track when both flags set (defensive)', () => {
+    expect(shouldTrackDelivery({ isSteering: true, isInterrupt: true })).toBe(false)
   })
 })
