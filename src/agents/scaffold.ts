@@ -4,6 +4,7 @@ import {
   writeFileSync,
   appendFileSync,
   readFileSync,
+  renameSync,
   chmodSync,
   symlinkSync,
   copyFileSync,
@@ -3248,6 +3249,18 @@ export function scaffoldAgent(
     skipped,
     0o600,
   );
+  // access.json is writeIfMissing (the gateway owns it at runtime for
+  // pairing), so a supergroup added to switchroom.yaml AFTER first scaffold
+  // would never register — the gateway silently drops its messages as
+  // `group_unknown` (the marko case). Reconcile the CONFIGURED group in
+  // idempotently so "set chat_id in config → the agent answers there" is the
+  // zero-config default (principles 1 + 2), preserving runtime-added
+  // allowFrom / pairings / other groups and any operator policy override.
+  reconcileConfiguredGroup(
+    join(agentDir, "telegram", "access.json"),
+    agentConfig,
+    telegramConfig,
+  );
 
   // --- Sub-agent definitions (.claude/agents/<name>.md) ---
   //
@@ -5410,6 +5423,60 @@ function rerenderWithFingerprint(
   // post-apply summary reflects that the file was rewritten rather
   // than silently absent from both columns.
   created.push(filePath);
+}
+
+/**
+ * Idempotently reconcile the agent's CONFIGURED supergroup/forum chat into an
+ * existing `access.json`'s `groups`. Called on every reconcile (apply,
+ * agent restart) AFTER the writeIfMissing above.
+ *
+ * Why: `access.json` is writeIfMissing — the gateway owns it at runtime
+ * (pairing, operator policy edits). So a supergroup added to switchroom.yaml
+ * after the agent was first scaffolded never lands in `groups`, and the
+ * gateway drops every message from it as `group_unknown` (the marko case).
+ * This closes that gap so the supergroup easy-path is zero-config.
+ *
+ * Strictly additive + non-destructive:
+ *  - only ADDS the configured group if absent — never rewrites an existing
+ *    group's policy (so an operator's `requireMention: true` / topic edits
+ *    survive),
+ *  - preserves `allowFrom`, pairings, other groups, and every other field,
+ *  - no-op for dm_only agents and when no real forum chat is in scope.
+ *
+ * Smart default for a newly-registered group: `requireMention: false` — a
+ * supergroup the agent OWNS is a dedicated working room, so it answers every
+ * message (override to `true` for a shared channel).
+ */
+export function reconcileConfiguredGroup(
+  accessPath: string,
+  agentConfig: AgentConfig,
+  telegramConfig: TelegramConfig,
+): void {
+  if (!existsSync(accessPath)) return; // fresh agent — buildAccessJson handled it
+  const forumChatId = telegramConfig.forum_chat_id;
+  const hasRealForumChat = forumChatId !== "" && forumChatId !== "0";
+  if (agentConfig.dm_only || !hasRealForumChat) return;
+
+  let access: Record<string, unknown>;
+  try {
+    access = JSON.parse(readFileSync(accessPath, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return; // malformed runtime file — leave it for the gateway/operator
+  }
+  const groups = (access.groups ??= {}) as Record<string, unknown>;
+  if (groups[forumChatId] !== undefined) return; // already registered — preserve operator policy
+
+  const allowFrom = Array.isArray(access.allowFrom) ? access.allowFrom : [];
+  groups[forumChatId] = { requireMention: false, allowFrom };
+  const tmp = accessPath + ".tmp";
+  writeFileSync(tmp, JSON.stringify(access, null, 2) + "\n", { mode: 0o600 });
+  renameSync(tmp, accessPath);
+  console.log(
+    chalk.green(
+      `  registered supergroup ${forumChatId} in access.json ` +
+      `(responds to all topics; requireMention=false)`,
+    ),
+  );
 }
 
 function buildAccessJson(
