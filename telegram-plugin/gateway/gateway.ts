@@ -6190,6 +6190,16 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
+  // Thread precedence (matches executeReply): when the model passes no
+  // explicit message_thread_id, fall back to THIS turn's originating
+  // topic before handleStreamReply's chatThreadMap last-seen heuristic.
+  // Injecting here threads every downstream consumer consistently — the
+  // dedup key, the voice-scrub metric, the draft transport, and the send
+  // — so a streamed handback/synthetic-turn reply lands in the right
+  // supergroup topic. DM: sessionThreadId undefined → unchanged.
+  if (args.message_thread_id == null && turn?.sessionThreadId != null) {
+    args.message_thread_id = String(turn.sessionThreadId)
+  }
 
   // Outbound secret scrub (#2044): mask before the dedup key, the draft
   // stream sends, and the history record. stream_reply carries the FULL
