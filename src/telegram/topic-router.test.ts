@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveOutboundTopic,
+  topicForRecipient,
   validateCronTopicAliases,
   type OutboundEvent,
   type TopicRouterConfig,
@@ -293,5 +294,34 @@ describe("validateCronTopicAliases", () => {
       { cron: "0 8 * * *", topic: "planning" },
     ]);
     expect(errors).toHaveLength(1);
+  });
+});
+
+// The marko brevo wedge (2026-06-02): approval/permission cards fan out to the
+// operator's allowFrom (DMs), but the resolved topic is only valid in the
+// agent's supergroup. Attaching it to a DM → 400 "message thread not found" →
+// card never arrives → auto-deny → the agent wedges on the open prompt.
+describe("topicForRecipient — only the owning supergroup gets the thread id", () => {
+  const SUPERGROUP = "-1001234567890";
+  const DM = "12345";
+  const TOPIC = 3;
+
+  it("attaches the topic when the recipient IS the agent's supergroup", () => {
+    expect(topicForRecipient({ recipientChatId: SUPERGROUP, resolvedTopic: TOPIC, supergroupChatId: SUPERGROUP })).toBe(TOPIC);
+  });
+  it("drops the topic for an operator DM recipient (the wedge fix)", () => {
+    expect(topicForRecipient({ recipientChatId: DM, resolvedTopic: TOPIC, supergroupChatId: SUPERGROUP })).toBeUndefined();
+  });
+  it("drops the topic for a different supergroup than the owning one", () => {
+    expect(topicForRecipient({ recipientChatId: "-1009876543210", resolvedTopic: TOPIC, supergroupChatId: SUPERGROUP })).toBeUndefined();
+  });
+  it("returns undefined when there is no resolved topic", () => {
+    expect(topicForRecipient({ recipientChatId: SUPERGROUP, resolvedTopic: undefined, supergroupChatId: SUPERGROUP })).toBeUndefined();
+  });
+  it("returns undefined when the agent isn't in supergroup mode (no supergroup chat id)", () => {
+    expect(topicForRecipient({ recipientChatId: DM, resolvedTopic: TOPIC, supergroupChatId: undefined })).toBeUndefined();
+  });
+  it("matches string and numeric chat ids equivalently", () => {
+    expect(topicForRecipient({ recipientChatId: -1001234567890, resolvedTopic: TOPIC, supergroupChatId: "-1001234567890" })).toBe(TOPIC);
   });
 });
