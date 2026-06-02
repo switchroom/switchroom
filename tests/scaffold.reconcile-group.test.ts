@@ -14,8 +14,12 @@ import type { AgentConfig, TelegramConfig } from "../src/config/schema.js";
  */
 
 const SG = "-1003831053471";
+const FLEET_FORUM = "-1003852747971"; // a DIFFERENT chat — the shared fleet forum
 const agent = (overrides: Partial<AgentConfig> = {}): AgentConfig =>
   ({ extends: "default", ...overrides } as unknown as AgentConfig);
+// supergroup-owned: per-agent channels.telegram.chat_id override (the prod shape)
+const ownedAgent = (chat_id: string, overrides: Partial<AgentConfig> = {}): AgentConfig =>
+  ({ extends: "default", channels: { telegram: { chat_id } }, ...overrides } as unknown as AgentConfig);
 const tg = (forum_chat_id: string): TelegramConfig =>
   ({ forum_chat_id } as unknown as TelegramConfig);
 
@@ -36,6 +40,24 @@ describe("reconcileConfiguredGroup", () => {
     reconcileConfiguredGroup(accessPath, agent(), tg(SG));
     const a = readAccess();
     expect(a.groups[SG]).toEqual({ requireMention: false, allowFrom: ["111", "222"] });
+  });
+
+  it("registers the per-agent chat_id OVERRIDE, not the fleet forum_chat_id (the marko case)", () => {
+    // supergroup-owned: channels.telegram.chat_id (SG) must win over the
+    // shared fleet forum (FLEET_FORUM). Registering the fleet chat would
+    // both miss marko's owned group AND re-introduce the #1002 boot-probe
+    // 404 against a chat the bot isn't a member of.
+    writeAccess({ dmPolicy: "allowlist", allowFrom: ["111"] });
+    reconcileConfiguredGroup(accessPath, ownedAgent(SG), tg(FLEET_FORUM));
+    const a = readAccess();
+    expect(a.groups[SG]).toEqual({ requireMention: false, allowFrom: ["111"] });
+    expect(a.groups[FLEET_FORUM]).toBeUndefined();
+  });
+
+  it("registers the owned chat even with no fleet forum_chat_id at all", () => {
+    writeAccess({ dmPolicy: "allowlist", allowFrom: ["111"] });
+    reconcileConfiguredGroup(accessPath, ownedAgent(SG), tg(""));
+    expect(readAccess().groups[SG]).toEqual({ requireMention: false, allowFrom: ["111"] });
   });
 
   it("preserves existing allowFrom, OTHER groups, and runtime fields (pairings)", () => {

@@ -5447,13 +5447,31 @@ function rerenderWithFingerprint(
  * supergroup the agent OWNS is a dedicated working room, so it answers every
  * message (override to `true` for a shared channel).
  */
+/**
+ * Effective supergroup chat for an agent. The per-agent
+ * `channels.telegram.chat_id` override (supergroup-owned topology) wins
+ * over the fleet-wide `telegram.forum_chat_id` (fleet-shared topology).
+ * Mirrors resolveAgentChannelTarget in
+ * `src/agent-scheduler/channel-target.ts` — same precedence so the access
+ * list, the cron router, and the gateway all agree on which chat the
+ * agent owns. (`agentConfig` is already cascade-resolved by the caller.)
+ */
+function resolveAgentForumChatId(
+  agentConfig: AgentConfig,
+  telegramConfig: TelegramConfig,
+): string {
+  const override = agentConfig.channels?.telegram?.chat_id;
+  if (typeof override === "string" && override.length > 0) return override;
+  return telegramConfig.forum_chat_id ?? "";
+}
+
 export function reconcileConfiguredGroup(
   accessPath: string,
   agentConfig: AgentConfig,
   telegramConfig: TelegramConfig,
 ): void {
   if (!existsSync(accessPath)) return; // fresh agent — buildAccessJson handled it
-  const forumChatId = telegramConfig.forum_chat_id;
+  const forumChatId = resolveAgentForumChatId(agentConfig, telegramConfig);
   const hasRealForumChat = forumChatId !== "" && forumChatId !== "0";
   if (agentConfig.dm_only || !hasRealForumChat) return;
 
@@ -5513,7 +5531,13 @@ function buildAccessJson(
   // `switchroom agent add --topology dm` emits when no real forum
   // chat is in scope, and the bug surfaced as a spurious 404 on every
   // fresh DM-topology agent.
-  const forumChatId = telegramConfig.forum_chat_id;
+  //
+  // Supergroup-owned agents carry their chat at the per-agent
+  // `channels.telegram.chat_id` override, which wins over the fleet
+  // `forum_chat_id` — resolve the effective chat so a fresh
+  // supergroup-owned agent registers the chat it actually owns, not the
+  // shared fleet forum.
+  const forumChatId = resolveAgentForumChatId(agentConfig, telegramConfig);
   const hasRealForumChat = forumChatId !== "" && forumChatId !== "0";
   if (!agentConfig.dm_only && hasRealForumChat) {
     access.groups = {
