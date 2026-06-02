@@ -156,6 +156,28 @@ export class Driver {
     this.client = null;
   }
 
+  /**
+   * Populate the local peer cache with the account's dialogs so a
+   * supergroup referenced by its marked id (e.g. `-100…`) becomes
+   * resolvable. The driver runs on `MemoryStorage`, which starts EMPTY
+   * every connect — a bot username resolves on demand (server lookup),
+   * but a supergroup with no public username has no resolution path
+   * until mtcute has seen it via the dialog list (which carries the
+   * channel's `access_hash`). Call this once before sending to /
+   * observing a supergroup. Best-effort: drains up to `limit` dialogs.
+   * Requires the driver account to be a MEMBER of the supergroup — if a
+   * later `sendText` still throws "Peer … not found in local cache",
+   * the account isn't in the group.
+   */
+  async primeDialogs(limit = 200): Promise<void> {
+    const c = this.requireClient();
+    let seen = 0;
+    for await (const _dialog of c.iterDialogs({ limit })) {
+      void _dialog; // draining caches each peer's access_hash as a side effect
+      if (++seen >= limit) break;
+    }
+  }
+
   async sendText(
     chatId: number,
     text: string,
