@@ -1337,7 +1337,12 @@ function markClaudeBusyForInbound(m: {
 // silence-poke swallowed). Kill switch: SWITCHROOM_INBOUND_DELIVERY_CONFIRM=0
 // → legacy fire-and-forget. See inbound-delivery-confirm.ts.
 const DELIVERY_CONFIRM_ENABLED = process.env.SWITCHROOM_INBOUND_DELIVERY_CONFIRM !== '0'
-const DELIVERY_CONFIRM_TIMEOUT_MS = 15_000
+// How long to wait for claude's `enqueue` ack before treating a delivery as
+// stranded and re-delivering. Generous by default — claude acks within ~1s of
+// a clean delivery, so 15s won't false-positive on a healthy turn. Tunable
+// (env) for tests/forensics; a too-low value re-delivers healthy slow turns
+// (duplicate turn), which is why the default is comfortably above ack latency.
+const DELIVERY_CONFIRM_TIMEOUT_MS = Number(process.env.SWITCHROOM_INBOUND_DELIVERY_TIMEOUT_MS) || 15_000
 const DELIVERY_CONFIRM_SWEEP_MS = 5_000
 const deliveryQueue = createDeliveryQueue<InboundMessage>()
 
