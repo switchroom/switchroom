@@ -62,6 +62,10 @@ export const DEFAULT_PROGRESS_INTERVAL_MS = 5 * 60 * 1000
 export interface SubagentProgressContext {
   /** Telegram chat the work was dispatched from. */
   chatId: string
+  /** Supergroup topic (message_thread_id) the work was dispatched from,
+   *  so the progress wake-up turn and the model's reply land in the
+   *  originating topic. Omitted for DM-shaped chats. */
+  threadId?: number
   /** JSONL-derived sub-agent id (stable per Claude Code spawn). Pinned
    *  into the spool id so envelopes for the same worker dedup across
    *  buckets cleanly and survive gateway restarts. */
@@ -125,6 +129,7 @@ export function buildSubagentProgressInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chatId,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts, // synthetic — no Telegram message id exists
     user: 'subagent-watcher',
     userId: 0,
@@ -132,6 +137,7 @@ export function buildSubagentProgressInbound(opts: {
     text,
     meta: {
       source: 'subagent_progress',
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       subagent_jsonl_id: opts.ctx.subagentJsonlId,
       bucket_idx: String(opts.ctx.bucketIdx),
       expiresAt: String(expiresAt),
@@ -155,6 +161,10 @@ export interface SubagentProgressDecisionInput {
   fleetChatId: string
   /** Owner chat fallback (access.json allowFrom[0]); '' if none. */
   ownerChatId: string
+  /** Supergroup topic the work was dispatched from. Applied ONLY when
+   *  `fleetChatId` resolved (the origin chat won); the DM fallback is
+   *  topic-less. */
+  originThreadId?: number
   subagentJsonlId: string
   taskDescription: string
   latestSummary: string
@@ -240,9 +250,12 @@ export function decideSubagentProgress(
   if (input.lastBucketIdx != null && bucketIdx <= input.lastBucketIdx) {
     return { deliver: false, reason: 'bucket-already-fired' }
   }
+  const threadId =
+    input.fleetChatId && input.originThreadId != null ? input.originThreadId : undefined
   const inbound = buildSubagentProgressInbound({
     ctx: {
       chatId,
+      ...(threadId != null ? { threadId } : {}),
       subagentJsonlId: input.subagentJsonlId,
       taskDescription: input.taskDescription,
       latestSummary: input.latestSummary,

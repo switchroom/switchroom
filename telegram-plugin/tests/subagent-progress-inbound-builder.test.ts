@@ -158,6 +158,42 @@ describe('buildSubagentProgressInbound', () => {
     })
     expect(spoolId(bucket1)).not.toBe(spoolId(bucket2))
   })
+
+  // Supergroup topic routing (#status-channel-routing).
+  it('carries top-level threadId AND meta.message_thread_id when ctx.threadId is set', () => {
+    const inbound = buildSubagentProgressInbound({
+      ctx: {
+        chatId: '-100999',
+        threadId: 7,
+        subagentJsonlId: 'jsonl-abc',
+        taskDescription: 'x',
+        latestSummary: 'still going',
+        elapsedMs: 7 * 60 * 1000,
+        bucketIdx: 1,
+        progressIntervalMs: INTERVAL_MS,
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.threadId).toBe(7)
+    expect(inbound.meta.message_thread_id).toBe('7')
+  })
+
+  it('omits both thread carriers when ctx.threadId is absent (DM-shaped chat)', () => {
+    const inbound = buildSubagentProgressInbound({
+      ctx: {
+        chatId: '12345',
+        subagentJsonlId: 'jsonl-abc',
+        taskDescription: 'x',
+        latestSummary: 'y',
+        elapsedMs: 7 * 60 * 1000,
+        bucketIdx: 1,
+        progressIntervalMs: INTERVAL_MS,
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.threadId).toBeUndefined()
+    expect(inbound.meta.message_thread_id).toBeUndefined()
+  })
 })
 
 describe('isEnvFlagOn — bool env parser', () => {
@@ -265,5 +301,25 @@ describe('decideSubagentProgress', () => {
     const d = decideSubagentProgress(baseInput({ subagentJsonlId: '' }))
     expect(d.deliver).toBe(false)
     if (!d.deliver) expect(d.reason).toBe('missing-jsonl-id')
+  })
+
+  // Supergroup topic routing (#status-channel-routing).
+  it('threads to the origin topic when the origin (fleet) chat won', () => {
+    const d = decideSubagentProgress(baseInput({ fleetChatId: '-100abc', originThreadId: 7 }))
+    expect(d.deliver).toBe(true)
+    if (d.deliver) {
+      expect(d.inbound.threadId).toBe(7)
+      expect(d.inbound.meta.message_thread_id).toBe('7')
+    }
+  })
+
+  it('does NOT thread when falling back to the owner DM', () => {
+    const d = decideSubagentProgress(baseInput({ fleetChatId: '', originThreadId: 7 }))
+    expect(d.deliver).toBe(true)
+    if (d.deliver) {
+      expect(d.chatId).toBe('999')
+      expect(d.inbound.threadId).toBeUndefined()
+      expect(d.inbound.meta.message_thread_id).toBeUndefined()
+    }
   })
 })

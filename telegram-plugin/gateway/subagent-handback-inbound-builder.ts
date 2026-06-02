@@ -40,6 +40,12 @@ export interface SubagentHandbackContext {
   /** Telegram chat the work was dispatched from — the synthesized
    *  handback turn lands here so it stays with the conversation. */
   chatId: string
+  /** Supergroup topic (message_thread_id) the work was dispatched from.
+   *  Carried so the synthesized handback turn — and the model's
+   *  in-voice "here's what the worker found" reply — land in the
+   *  originating topic, not the chat's last-seen topic. Omitted for
+   *  DM-shaped chats (no topics). See `gateway.ts:resolveSubagentOriginChat`. */
+  threadId?: number
   /** Dispatch-time task description (the sub-agent's `description`). */
   taskDescription: string
   /** The worker's final result text — its last narrative emission
@@ -98,6 +104,9 @@ export function buildSubagentHandbackInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chatId,
+    // Top-level threadId → the enqueued turn's sessionThreadId, so the
+    // handback turn's live activity feed routes to the originating topic.
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts, // synthetic — no Telegram message id exists
     user: 'subagent-watcher',
     userId: 0,
@@ -106,6 +115,10 @@ export function buildSubagentHandbackInbound(opts: {
     meta: {
       source: 'subagent_handback',
       outcome: opts.ctx.outcome,
+      // meta.message_thread_id is the model-visible channel attribute
+      // (mirrors the real-inbound shape) so the model's reply targets
+      // the dispatching topic. Mirrors gateway.ts:10557.
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       ...(opts.ctx.jsonlAgentId ? { subagent_jsonl_id: opts.ctx.jsonlAgentId } : {}),
     },
   }
@@ -135,6 +148,10 @@ export interface SubagentHandbackDecisionInput {
   fleetChatId: string
   /** Owner chat fallback (access.json allowFrom[0]); '' if none. */
   ownerChatId: string
+  /** Supergroup topic the work was dispatched from (from the parent
+   *  turn). Applied ONLY when `fleetChatId` resolved (the origin chat
+   *  won) — the `ownerChatId` DM fallback has no topic. */
+  originThreadId?: number
   taskDescription: string
   resultText: string
   /** JSONL filename stem for this Claude Code spawn — forwarded into
@@ -185,9 +202,14 @@ export function decideSubagentHandback(
   if (!chatId) {
     return { deliver: false, reason: 'no-chat' }
   }
+  // Thread only when the origin chat (fleetChatId) won — the ownerChatId
+  // DM fallback is topic-less, so a stray thread id would mis-address it.
+  const threadId =
+    input.fleetChatId && input.originThreadId != null ? input.originThreadId : undefined
   const inbound = buildSubagentHandbackInbound({
     ctx: {
       chatId,
+      ...(threadId != null ? { threadId } : {}),
       taskDescription: input.taskDescription,
       resultText: input.resultText,
       outcome: input.outcome,

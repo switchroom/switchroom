@@ -109,4 +109,36 @@ describe('decideSubagentHandback', () => {
       expect(d.inbound.text).toContain('Applied 3 migrations')
     }
   })
+
+  // Supergroup topic routing (#status-channel-routing).
+  it('threads the inbound to the origin topic when the origin (fleet) chat won', () => {
+    const d = decideSubagentHandback({ ...base, fleetChatId: '-100777', originThreadId: 42 })
+    expect(d.deliver).toBe(true)
+    if (d.deliver) {
+      expect(d.chatId).toBe('-100777')
+      expect(d.inbound.threadId).toBe(42)
+      expect(d.inbound.meta.message_thread_id).toBe('42')
+    }
+  })
+
+  it('does NOT thread when falling back to the owner DM (topic-less)', () => {
+    // fleetChatId empty → owner DM wins; a stray originThreadId must not
+    // be applied to a DM chat that has no topics.
+    const d = decideSubagentHandback({ ...base, fleetChatId: '', originThreadId: 42 })
+    expect(d.deliver).toBe(true)
+    if (d.deliver) {
+      expect(d.chatId).toBe('999')
+      expect(d.inbound.threadId).toBeUndefined()
+      expect(d.inbound.meta.message_thread_id).toBeUndefined()
+    }
+  })
+
+  it('omits thread carriers when no originThreadId is supplied (DM-shaped agent)', () => {
+    const d = decideSubagentHandback({ ...base, fleetChatId: '777' })
+    expect(d.deliver).toBe(true)
+    if (d.deliver) {
+      expect(d.inbound.threadId).toBeUndefined()
+      expect(d.inbound.meta.message_thread_id).toBeUndefined()
+    }
+  })
 })

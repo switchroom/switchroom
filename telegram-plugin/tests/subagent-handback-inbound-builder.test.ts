@@ -124,4 +124,39 @@ describe('buildSubagentHandbackInbound', () => {
     })
     expect(inbound.text).toContain('(no description)')
   })
+
+  // Supergroup topic routing (#status-channel-routing). The handback turn
+  // and the model's in-voice reply must land in the topic the work was
+  // dispatched from — not the chat's last-seen topic. The carriers are the
+  // top-level threadId (→ turn.sessionThreadId, routes the activity feed)
+  // and meta.message_thread_id (the model-visible channel attribute,
+  // mirrors the real-inbound shape at gateway.ts:10557).
+  it('carries top-level threadId AND meta.message_thread_id when ctx.threadId is set', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: {
+        chatId: '-1001234567890',
+        threadId: 42,
+        taskDescription: 'Research competitors',
+        resultText: 'Found 3 relevant comps.',
+        outcome: 'completed',
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.threadId).toBe(42)
+    expect(inbound.meta.message_thread_id).toBe('42')
+  })
+
+  it('omits both thread carriers when ctx.threadId is absent (DM-shaped chat)', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: {
+        chatId: '12345',
+        taskDescription: 'x',
+        resultText: 'y',
+        outcome: 'completed',
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.threadId).toBeUndefined()
+    expect(inbound.meta.message_thread_id).toBeUndefined()
+  })
 })
