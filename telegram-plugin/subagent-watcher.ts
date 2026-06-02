@@ -560,8 +560,9 @@ export function backfillJsonlAgentId(
   log?.(`subagent-watcher: backfill linked ${agentId} → ${candidate.id}`)
 
   // Backfill parent_turn_key (gateway-side). The PreToolUse hook can't know
-  // the Telegram turn_key (chat_id:msg_id) — it only sees Claude Code's
-  // session id — so the row was inserted with parent_turn_key=NULL. Resolve
+  // the gateway-minted Telegram turn_key (a chat+topic+turn key) — it only
+  // sees Claude Code's session id — so the row was inserted with
+  // parent_turn_key=NULL. Resolve
   // it now from the turn whose [started_at, ended_at] window contained the
   // sub-agent's dispatch (its started_at). Keying on the historical
   // started_at, NOT "the turn active now", is what makes this correct for a
