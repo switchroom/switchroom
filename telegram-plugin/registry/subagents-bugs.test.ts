@@ -387,8 +387,16 @@ describe('Bug 4 — result_summary always NULL (hook integration)', () => {
 
 // ─── Bug 5 — parent_turn_key always NULL ─────────────────────────────────────
 
-describe('Bug 5 — parent_turn_key always NULL (hook integration)', () => {
-  it('pretool stores parent_turn_key from event.turn_id', () => {
+describe('Bug 5 — parent_turn_key backfilled by gateway, not the hook', () => {
+  it('pretool writes parent_turn_key=NULL even when event.turn_id is present', () => {
+    // Claude Code's PreToolUse payload carries its own session id, never the
+    // gateway-minted Telegram turn_key (a chat+topic+turn key) the `turns`
+    // table is keyed on. `event.turn_id` — even if a future CLI populated it —
+    // would not match a `turns.turn_key`, so the hook intentionally writes
+    // NULL and lets the gateway backfill parent_turn_key from the sub-agent's
+    // started_at at jsonl-link time (subagent-watcher.ts backfillJsonlAgentId).
+    // Writing a bogus value here would defeat that backfill's
+    // `parent_turn_key IS NULL` guard.
     const event = {
       session_id: 'sess-turnkey',
       turn_id: 'turn-abc-001',
@@ -406,8 +414,8 @@ describe('Bug 5 — parent_turn_key always NULL (hook integration)', () => {
       | undefined
 
     expect(row).toBeDefined()
-    // After fix: parent_turn_key should be populated from event.turn_id
-    expect(row!.parent_turn_key).toBe('turn-abc-001')
+    // The hook never trusts event.turn_id — gateway backfill owns this column.
+    expect(row!.parent_turn_key).toBeNull()
   })
 
   it('pretool stores parent_turn_key as NULL when turn_id absent (no regression)', () => {

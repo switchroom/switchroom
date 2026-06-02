@@ -508,7 +508,10 @@ interface FsLike {
  *   - Row already linked to a different agentId: SQL `WHERE jsonl_agent_id IS
  *     NULL` skips it. Re-runs are safe.
  */
-function backfillJsonlAgentId(
+// Exported for unit-testing the parent_turn_key backfill (telegram-plugin/
+// tests/subagent-watcher-parent-turn-key.test.ts). Not intended for
+// consumption by other modules.
+export function backfillJsonlAgentId(
   db: SubagentLivenessDb,
   jsonlPath: string,
   agentId: string,
@@ -555,6 +558,47 @@ function backfillJsonlAgentId(
     .prepare('UPDATE subagents SET jsonl_agent_id = ? WHERE id = ?')
     .run(agentId, candidate.id)
   log?.(`subagent-watcher: backfill linked ${agentId} → ${candidate.id}`)
+
+  // Backfill parent_turn_key (gateway-side). The PreToolUse hook can't know
+  // the gateway-minted Telegram turn_key (a chat+topic+turn key) — it only
+  // sees Claude Code's session id — so the row was inserted with
+  // parent_turn_key=NULL. Resolve
+  // it now from the turn whose [started_at, ended_at] window contained the
+  // sub-agent's dispatch (its started_at). Keying on the historical
+  // started_at, NOT "the turn active now", is what makes this correct for a
+  // background worker that outlives its parent turn: the turn may have already
+  // ended by link time, but the containment match still finds it. Turns are
+  // processed serially per agent, so at most one window contains a given
+  // instant; the ORDER BY ... DESC LIMIT 1 is just a defensive tie-break.
+  //
+  // Without this, resolveSubagentOriginChat() returns null and the live
+  // worker card + handback fall back to the operator DM instead of the
+  // originating group/forum-topic, and resolveCallingSubagent()'s turn-scoped
+  // heuristic (WHERE parent_turn_key = ?) can never see the row. Best-effort:
+  // any failure leaves parent_turn_key NULL (today's behaviour) and never
+  // throws out of the watcher poll loop.
+  try {
+    const linkedRow = db
+      .prepare('SELECT started_at, parent_turn_key FROM subagents WHERE id = ?')
+      .get(candidate.id) as { started_at: number; parent_turn_key: string | null } | null
+    if (linkedRow != null && linkedRow.parent_turn_key == null) {
+      const turn = db
+        .prepare(
+          `SELECT turn_key FROM turns
+           WHERE started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+           ORDER BY started_at DESC LIMIT 1`,
+        )
+        .get(linkedRow.started_at, linkedRow.started_at) as { turn_key: string } | null
+      if (turn?.turn_key != null) {
+        db
+          .prepare('UPDATE subagents SET parent_turn_key = ? WHERE id = ?')
+          .run(turn.turn_key, candidate.id)
+        log?.(`subagent-watcher: backfill parent_turn_key ${candidate.id} → ${turn.turn_key}`)
+      }
+    }
+  } catch (err) {
+    log?.(`subagent-watcher: parent_turn_key backfill skipped for ${candidate.id} — ${(err as Error).message}`)
+  }
 }
 
 // Exported for unit-testing the ENOENT/EACCES deregister path

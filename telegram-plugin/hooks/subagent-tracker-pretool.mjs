@@ -262,7 +262,17 @@ function main() {
     {
       id: event.tool_use_id ?? null,
       parentSessionId: event.session_id ?? null,
-      parentTurnKey: event.turn_id ?? null,
+      // parent_turn_key is intentionally NULL here. Claude Code's PreToolUse
+      // payload carries its own session id, not the gateway-minted Telegram
+      // turn_key (a chat+topic+turn key) the `turns` table is keyed on —
+      // `event.turn_id` is always undefined, and even if a future CLI
+      // populated it, it would not match a `turns.turn_key`. The gateway
+      // resolves parent_turn_key from the
+      // sub-agent's started_at at jsonl-link time (subagent-watcher.ts
+      // backfillJsonlAgentId), which works even after the parent turn ends.
+      // Writing a bogus value here would defeat that backfill's
+      // `parent_turn_key IS NULL` guard.
+      parentTurnKey: null,
       agentType: input.subagent_type ?? null,
       description: input.description ?? null,
       background: input.run_in_background === true ? 1 : 0,
