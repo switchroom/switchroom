@@ -373,6 +373,7 @@ describe('startSubagentWatcher', () => {
     function startWatcherSync(opts: {
       agentDir: string
       onFinish?: Parameters<typeof startSubagentWatcher>[0]['onFinish']
+      onProgress?: Parameters<typeof startSubagentWatcher>[0]['onProgress']
     }): {
       notifications: string[]
       poll: () => void
@@ -392,6 +393,7 @@ describe('startSubagentWatcher', () => {
           notifications.push(`✓ Worker done: ${info.description}`)
           opts.onFinish?.(info)
         },
+        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
         stallThresholdMs: 60_000,
         rescanMs: 500,
         now: () => Date.now(),
@@ -475,6 +477,46 @@ describe('startSubagentWatcher', () => {
       const entry = h.watcher.getRegistry().get('deadbeef')
       expect(entry).toBeDefined()
       expect(entry?.toolCount).toBe(3)
+    })
+
+    it('fires onProgress with a friendly tool-step progressLine on a tool_use tick (foreground visibility)', () => {
+      // A foreground sub-agent that runs tools WITHOUT emitting prose used
+      // to fire no onProgress cue at all — only `sub_agent_text` did — so
+      // its steps never nested under the parent's activity feed (the named
+      // foreground blindspot). The tool_use branch now fires onProgress
+      // carrying a `describeToolUse` label so the gateway can render
+      // "Reading X" the same way the main-turn feed does.
+      const progress: Array<{ progressLine?: string; toolCount: number; latestSummary: string }> = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, toolCount, latestSummary }) => {
+          progress.push({ progressLine, toolCount, latestSummary })
+        },
+      })
+      // Register running, post-boot (same pattern as the onFinish test).
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Research the competitors')))
+      h.poll()
+      expect(h.watcher.getRegistry().get('deadbeef')?.state).toBe('running')
+
+      // The sub-agent reads a file — a tool_use with no accompanying prose.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Read', id: 'r1', input: { file_path: '/x/CLAUDE.md' } }] },
+      }))
+      h.poll()
+
+      const toolTick = progress.find((p) => p.progressLine != null)
+      expect(toolTick).toBeDefined()
+      // Friendly label, matching the main-turn activity feed's renderer.
+      expect(toolTick?.progressLine).toBe('Reading CLAUDE.md')
+      // latestSummary stays the (empty) narrative result — never polluted
+      // with the tool label, so the handback payload is unaffected.
+      expect(toolTick?.latestSummary).toBe('')
     })
 
     it('captures the full last narrative line into lastResultText (handback)', () => {

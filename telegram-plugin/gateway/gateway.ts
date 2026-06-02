@@ -18736,7 +18736,7 @@ void (async () => {
               // suppresses stale-after-restart delivery (a 4-h-old
               // "still working (5m)" would be a lie). Sweep on handback
               // lives in the `onFinish` block just above.
-              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount }) => {
+              onProgress: ({ agentId, description, latestSummary, elapsedMs, prevBucketIdx, setBucketIdx, lastTool, toolCount, progressLine }) => {
                 let fleetChatId = ''
                 try {
                   const fleets = progressDriver?.peekAllFleets() ?? []
@@ -18776,7 +18776,15 @@ void (async () => {
                     nestingEnabled: foregroundNestingEnabled,
                     replyCalled: turn.replyCalled,
                   })) return
-                  const child = latestSummary.trim().slice(0, 120)
+                  // Prefer the tick's own display line: `progressLine` (a
+                  // friendly tool-step label) on tool ticks, else the
+                  // worker's narrative (`latestSummary`) on text ticks. This
+                  // lets a foreground sub-agent that runs tools without
+                  // emitting prose still nest its steps under the parent
+                  // feed (the foreground blindspot) — mirroring the
+                  // main-turn activity feed, which surfaces both tool labels
+                  // and prose.
+                  const child = (progressLine ?? latestSummary).trim().slice(0, 120)
                   if (child.length === 0) return
                   let narrative = turn.foregroundSubAgents.get(agentId)
                   if (narrative == null) {
