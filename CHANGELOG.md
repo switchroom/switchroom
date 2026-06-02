@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — Reliable inbound delivery: deliver-until-acked
+## v0.14.40 — Reliable inbound delivery: deliver-until-acked
 
 Telegram inbounds reach claude as an MCP channel notification that the
 unmodified CLI appends to its TUI composer and auto-submits only when the
