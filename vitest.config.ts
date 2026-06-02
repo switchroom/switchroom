@@ -182,6 +182,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/idle-footer-wiring.test.ts",
       // subagent-tracker-hooks.test.ts uses bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/tests/subagent-tracker-hooks.test.ts",
+      // subagent-watcher-parent-turn-key.test.ts uses bun:sqlite + bun:test — run via test:bun.
+      "**/telegram-plugin/tests/subagent-watcher-parent-turn-key.test.ts",
       // subagents-bugs.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/registry/subagents-bugs.test.ts",
       // subagents-schema-init-order.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
