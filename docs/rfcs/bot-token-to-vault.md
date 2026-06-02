@@ -1,8 +1,16 @@
 # RFC A: Complete the bot-token-to-vault migration
 
-Status: Draft v2
+Status: Draft v2 — **hygiene, not a boundary (2026-06-02)**
 Author: klanker (sub-agent draft)
 Date: 2026-05-06
+
+> **Scope note (2026-06-02).** Worth doing as **hygiene** — one revocation
+> surface, no plaintext token `cat`-able on disk. But per
+> [`reference/access-model.md`](../../reference/access-model.md) it is
+> **not** a security boundary: a same-uid agent is out of scope by
+> construction, so vaulting the token does not "stop the agent reading
+> it." Don't frame this migration as closing a forgery hole; frame it as
+> consolidating secrets. The approval model does not depend on it.
 
 ## 1. Summary
 

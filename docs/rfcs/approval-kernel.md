@@ -1,10 +1,24 @@
 # RFC B: Unified human-approval kernel
 
-Status: Draft v4
+Status: Draft v4 — **partially shipped; hard-boundary direction descoped for single-tenant (2026-06-02)**
 Author: klanker (sub-agent draft)
 Date: 2026-05-06
 
-Prerequisite: **RFC A — Bot token to vault** (`docs/rfcs/bot-token-to-vault.md`) must land first. Without it the kernel's trust chain has a hole — an agent that can read the bot token can post fake approval cards.
+> **Scope note (2026-06-02).** The kernel, nonce/scope binding, per-agent
+> socket ACL, and `apv:` callback flow are shipped. The "hard boundary"
+> direction this RFC anticipates — making the agent↔gateway channel
+> unforgeable against a **same-uid** actor (a host-side operator verifier
+> setting `origin='operator'`, flipping
+> `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT=1`, and the second-bot idea
+> floated alongside it) — is **descoped for the single-tenant deployment**
+> switchroom targets. Same-uid is out of scope by construction
+> (`docs/vault.md`), so that machinery defends a threat this product
+> doesn't have, at real cost. The authorization contract that supersedes
+> the hard-boundary framing is [`reference/access-model.md`](../../reference/access-model.md);
+> the mint flag stays **off** by default. Reopen only if the deployment
+> model changes (untrusted agents / multi-operator / hostile network).
+
+Prerequisite: **RFC A — Bot token to vault** (`docs/rfcs/bot-token-to-vault.md`). Keeping the token in the vault rather than plaintext `.env` is still worthwhile hygiene (one revocation surface, no casual read); it is **not** relied on as a security boundary against a same-uid agent per the access model.
 
 ## 1. Summary
 

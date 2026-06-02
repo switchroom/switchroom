@@ -7,6 +7,7 @@ Three documents, three questions. Read in this order.
 | [`vision.md`](vision.md) | *Should we build this?* — the four outcomes, who it's for, what it isn't |
 | [`principles.md`](principles.md) | *Did we build it well?* — three PR checks (docs / defaults / consistency) |
 | JTBDs (below) | *Did it do the user's job?* — outcome-focused jobs, one per file |
+| [`access-model.md`](access-model.md) | *Can an agent escalate past what the operator gave it?* — the single-tenant authorization contract; read before any change that grants, checks, or prompts for access |
 
 The verdict rule lives in `CLAUDE.md` ("Design contract" section): a
 change ships only when it advances one of the four outcomes, satisfies
