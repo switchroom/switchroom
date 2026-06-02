@@ -156,6 +156,53 @@ function extractResultSummary(toolResponse) {
   return str.slice(0, 200) || null
 }
 
+/**
+ * Extract the full text of a PostToolUse tool_response (untruncated).
+ * Mirrors extractResultSummary's shape handling but returns the whole
+ * string so callers can pattern-match on it.
+ */
+function toolResponseText(toolResponse) {
+  if (!toolResponse) return ''
+  if (Array.isArray(toolResponse.content)) {
+    return toolResponse.content
+      .filter((c) => c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string')
+      .map((c) => c.text)
+      .join('\n')
+  }
+  if (typeof toolResponse.result === 'string') return toolResponse.result
+  if (typeof toolResponse.output === 'string') return toolResponse.output
+  if (typeof toolResponse === 'string') return toolResponse
+  return ''
+}
+
+/**
+ * Detect Claude Code's async-launch ACK in a PostToolUse tool_response.
+ *
+ * A `run_in_background` Agent/Task returns IMMEDIATELY with an
+ * acknowledgement ("Async agent launched successfully … The agent is working
+ * in the background …"), NOT the sub-agent's final result. This ACK is the
+ * authoritative, uniform signal that the dispatch was a background one — it is
+ * present even when Claude Code omits `run_in_background` from the tool_input
+ * the PREtool hook sees (observed on claude-code 2.1.159: a worker whose
+ * tool_input lacked the flag still returned this ACK and ran ~3 min past the
+ * parent turn, so the pretool recorded background=0 and the worker card never
+ * fired). We therefore trust this ACK over the pretool's input-derived flag.
+ *
+ * Anchored on the specific "async agent launched" phrase (a foreground
+ * sub-agent's final report is extremely unlikely to contain it), with a
+ * structural backstop ("working in the background" + an agentId token) in case
+ * the launch-verb wording drifts. A major wording change degrades to the
+ * pretool flag — still correct whenever the model DID pass run_in_background,
+ * never worse than before.
+ */
+function isAsyncLaunchAck(toolResponse) {
+  const t = toolResponseText(toolResponse).toLowerCase()
+  if (!t) return false
+  if (t.includes('async agent launched')) return true
+  if (t.includes('working in the background') && t.includes('agentid')) return true
+  return false
+}
+
 // ---------------------------------------------------------------------------
 // DB write
 // ---------------------------------------------------------------------------
@@ -172,9 +219,18 @@ function extractResultSummary(toolResponse) {
  * recordSubagentEnd (driven by the JSONL turn_end event) remains the
  * authoritative end-of-life signal.
  *
+ * Mis-recorded background (DB background = 0 but `asyncLaunch` is true):
+ * Claude Code returned the async-launch ACK even though run_in_background was
+ * absent from the tool_input the pretool saw, so the row was wrongly recorded
+ * foreground. PROMOTE it to background = 1 and take the background path — do
+ * NOT terminalize, because the worker is still running (the ACK is a launch,
+ * not a completion). This is the authoritative correction that makes the
+ * gateway's worker-feed card fire (onProgress re-reads `background` per tick)
+ * AND prevents the premature `completed` the foreground path would write.
+ *
  * The done(err | null) callback is invoked after all DB operations complete.
  */
-function updateRow(dbPath, { id, status, resultSummary, now }, done) {
+function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done) {
   // SQL to read the background flag so we can choose the right update path.
   const SELECT_SQL = `SELECT background FROM subagents WHERE id = ?`
 
@@ -194,12 +250,22 @@ function updateRow(dbPath, { id, status, resultSummary, now }, done) {
       AND status NOT IN ('completed', 'failed')
   `
 
+  // Promote a mis-recorded foreground row to background (sets background = 1),
+  // bumping activity but NOT terminalizing — same shape as BACKGROUND_SQL.
+  const PROMOTE_BACKGROUND_SQL = `
+    UPDATE subagents
+    SET background = 1, result_summary = COALESCE(?, result_summary), last_activity_at = ?
+    WHERE id = ?
+      AND status NOT IN ('completed', 'failed')
+  `
+
   // Snapshot all values used inside closures before setImmediate fires.
   const snapDbPath = dbPath
   const snapId = id
   const snapStatus = status
   const snapResultSummary = resultSummary
   const snapNow = now
+  const snapAsyncLaunch = asyncLaunch === true
 
   // Resolve a synchronous SQLite binding (node:sqlite under Node 22+,
   // bun:sqlite under bun, else null → CLI fallback). See helper docs.
@@ -216,6 +282,8 @@ function updateRow(dbPath, { id, status, resultSummary, now }, done) {
         const isBackground = row != null && row.background === 1
         if (isBackground) {
           db.prepare(BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
+        } else if (snapAsyncLaunch) {
+          db.prepare(PROMOTE_BACKGROUND_SQL).run(snapResultSummary, snapNow, snapId)
         } else {
           db.prepare(FOREGROUND_SQL).run(snapNow, snapStatus, snapResultSummary, snapNow, snapId)
         }
@@ -237,6 +305,12 @@ function updateRow(dbPath, { id, status, resultSummary, now }, done) {
       spawnSql(
         snapDbPath,
         fillPlaceholders(BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
+        done,
+      )
+    } else if (snapAsyncLaunch) {
+      spawnSql(
+        snapDbPath,
+        fillPlaceholders(PROMOTE_BACKGROUND_SQL.trim(), [snapResultSummary, snapNow, snapId]),
         done,
       )
     } else {
@@ -345,16 +419,26 @@ function main() {
 
   const toolResponse = event.tool_response ?? null
 
+  // Authoritative background signal: Claude Code's async-launch ACK. Trusted
+  // over the pretool's input-derived flag (which is missing whenever the
+  // model/runtime omits run_in_background from tool_input — see
+  // isAsyncLaunchAck). Gates both the nudge below and the promote path in
+  // updateRow.
+  const asyncLaunch = isAsyncLaunchAck(toolResponse)
+
   // conversational-pacing beat 4 (foreground half). A foreground
   // sub-agent's PostToolUse fires at real completion, mid-parent-turn,
   // with its result in tool_response — nudge the parent to synthesise a
   // user-facing handback. Background sub-agents are gated OUT: their
   // PostToolUse fires on the launch ACK (BACKGROUND_SQL leaves status
   // untouched for that reason), and their handback is driven by the
-  // gateway's subagent-watcher onFinish path instead. Fail-silent: an
-  // unknown background flag (null) skips the nudge.
+  // gateway's subagent-watcher onFinish path instead. A launch ACK is also
+  // gated out via `!asyncLaunch` — at this point the DB flag may still read 0
+  // (updateRow promotes it on the next tick), so the ACK is the reliable
+  // tell. Fail-silent: an unknown background flag (null) skips the nudge.
   if (
     process.env.SWITCHROOM_SUBAGENT_HANDBACK !== '0'
+    && !asyncLaunch
     && detectStatus(toolResponse) === 'completed'
     && readBackgroundFlagSync(dbPath, id) === 0
   ) {
@@ -368,6 +452,7 @@ function main() {
       status: detectStatus(toolResponse),
       resultSummary: extractResultSummary(toolResponse),
       now: Date.now(),
+      asyncLaunch,
     },
     (err) => {
       if (err) {

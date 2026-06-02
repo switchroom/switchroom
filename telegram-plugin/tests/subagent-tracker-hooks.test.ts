@@ -271,6 +271,79 @@ describe('subagent-tracker-posttool', () => {
     expect(postResult.status).toBe(0)
     expect(postResult.stdout).not.toContain('additionalContext')
   })
+
+  // The async-launch ACK is Claude Code's verbatim immediate return for a
+  // run_in_background Agent/Task dispatch. The posttool trusts it over the
+  // pretool's input-derived background flag, which is missing whenever the
+  // runtime omits run_in_background from the tool_input the pretool saw
+  // (observed on claude-code 2.1.159 — the clerk worker that never surfaced).
+  const ASYNC_LAUNCH_ACK =
+    'Async agent launched successfully.\n'
+    + 'agentId: go-live-sync-a176dc93\n'
+    + 'The agent is working in the background. You will be notified '
+    + 'automatically when it completes.'
+
+  it('promotes a mis-recorded foreground row to background from the launch ACK', () => {
+    // Pretool sees NO run_in_background key (the production bug) → records
+    // background=0, status=running.
+    const preResult = runHook(PRETOOL_SCRIPT, {
+      session_id: 's-promote',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_promote1',
+      tool_input: { subagent_type: 'worker', description: 'Go-live sync' },
+    })
+    expect(preResult.status).toBe(0)
+
+    const db = openDb()
+    const before = db.prepare('SELECT background, status FROM subagents WHERE id = ?').get('toolu_promote1') as
+      | { background: number; status: string }
+      | undefined
+    expect(before?.background).toBe(0)
+    expect(before?.status).toBe('running')
+
+    // Posttool receives the async-launch ACK → promote to background, do NOT
+    // terminalize, and do NOT emit a foreground handback nudge.
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_promote1',
+      tool_response: { content: [{ type: 'text', text: ASYNC_LAUNCH_ACK }] },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+
+    const after = db.prepare('SELECT background, status, ended_at FROM subagents WHERE id = ?').get('toolu_promote1') as
+      | { background: number; status: string; ended_at: number | null }
+      | undefined
+    expect(after?.background).toBe(1)
+    expect(after?.status).toBe('running')
+    expect(after?.ended_at == null).toBe(true)
+  })
+
+  it('still terminalizes a genuine foreground completion (no false promote)', () => {
+    // A real foreground sub-agent whose final report happens to mention
+    // "background" must NOT be mistaken for a launch ACK — the promote path
+    // only fires on the specific async-launch phrasing.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-noflip',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_noflip1',
+      tool_input: { subagent_type: 'worker', description: 'Real foreground task', run_in_background: false },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_noflip1',
+      tool_response: { result: 'Done. The feature now runs as a background job.', is_error: false },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db.prepare('SELECT background, status FROM subagents WHERE id = ?').get('toolu_noflip1') as
+      | { background: number; status: string }
+      | undefined
+    expect(row?.background).toBe(0)
+    expect(row?.status).toBe('completed')
+  })
 })
 
 describe('agent-dir resolution (RFC §Bug 2)', () => {
