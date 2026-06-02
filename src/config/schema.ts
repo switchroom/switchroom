@@ -822,7 +822,9 @@ export const TelegramChannelSchema = z
       .optional()
       .describe(
         "Forum topic ID this agent's automated outbounds default to when " +
-        "no more-specific alias resolves. Required when `chat_id` is set. " +
+        "no more-specific alias resolves. Defaults to General (topic 1) when " +
+        "`chat_id` is set and this is omitted — set it only to pin a different " +
+        "fallback topic. " +
         "Telegram's General topic is `id=1` at MTProto but sends omit the " +
         "field — the outbound wrapper strips `message_thread_id === 1` " +
         "on send. Forbidden when `dm_only: true`.",
@@ -841,13 +843,9 @@ export const TelegramChannelSchema = z
   .optional()
   .superRefine((tg, ctx) => {
     if (!tg) return;
-    if (tg.chat_id != null && tg.default_topic_id == null) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "`channels.telegram.chat_id` requires `default_topic_id` — supergroup-mode agents need a fallback topic for unclassified outbounds.",
-        path: ["default_topic_id"],
-      });
-    }
+    // Smart default (P2): `chat_id` no longer *requires* `default_topic_id`
+    // — it falls back to General below. We only reject the reverse
+    // (default_topic_id without chat_id) which is meaningless.
     if (tg.default_topic_id != null && tg.chat_id == null) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -862,6 +860,17 @@ export const TelegramChannelSchema = z
         path: ["topic_aliases"],
       });
     }
+  })
+  .transform((tg) => {
+    // Smart default: a supergroup-owned agent (chat_id set) that doesn't pin
+    // a default topic falls back to General (topic 1 — the outbound wrapper
+    // strips thread_id===1 on send). Keeps the easy path zero-config (P2):
+    // the operator sets only `chat_id` and the agent answers, with proactive
+    // posts defaulting to General.
+    if (tg && tg.chat_id != null && tg.default_topic_id == null) {
+      return { ...tg, default_topic_id: 1 };
+    }
+    return tg;
   });
 
 export const ChannelsSchema = z

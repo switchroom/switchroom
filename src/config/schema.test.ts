@@ -19,8 +19,30 @@ import {
   GoogleWorkspaceTierSchema,
   ScheduleEntrySchema,
   SwitchroomConfigSchema,
+  TelegramChannelSchema,
   VaultConfigSchema,
 } from "./schema.js";
+
+describe("TelegramChannelSchema — supergroup smart defaults", () => {
+  it("defaults default_topic_id to General (1) when chat_id is set and it is omitted", () => {
+    const r = TelegramChannelSchema.parse({ chat_id: "-1003831053471" });
+    expect(r?.default_topic_id).toBe(1);
+  });
+
+  it("preserves an explicit default_topic_id", () => {
+    const r = TelegramChannelSchema.parse({ chat_id: "-1003831053471", default_topic_id: 17 });
+    expect(r?.default_topic_id).toBe(17);
+  });
+
+  it("does NOT inject default_topic_id when there is no chat_id", () => {
+    const r = TelegramChannelSchema.parse({ bot_token: "vault:x" });
+    expect(r?.default_topic_id).toBeUndefined();
+  });
+
+  it("still rejects default_topic_id without chat_id (meaningless)", () => {
+    expect(() => TelegramChannelSchema.parse({ default_topic_id: 5 })).toThrow();
+  });
+});
 
 describe("ScheduleEntrySchema.secrets", () => {
   it("accepts a list of valid vault key names", () => {
@@ -780,14 +802,13 @@ describe("TelegramChannelSchema supergroup-owned fields", () => {
     });
   });
 
-  it("rejects chat_id without default_topic_id (mutual dependency)", () => {
-    expect(() =>
-      AgentSchema.parse(
-        baseAgentInput({
-          channels: { telegram: { chat_id: "-1001234567890" } },
-        }),
-      ),
-    ).toThrow(/default_topic_id/);
+  it("defaults default_topic_id to General (1) when chat_id is set alone (smart default, was an error pre-#supergroup-easy-defaults)", () => {
+    const parsed = AgentSchema.parse(
+      baseAgentInput({
+        channels: { telegram: { chat_id: "-1001234567890" } },
+      }),
+    );
+    expect(parsed.channels?.telegram?.default_topic_id).toBe(1);
   });
 
   it("rejects default_topic_id without chat_id (mutual dependency)", () => {
