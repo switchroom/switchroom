@@ -109,6 +109,47 @@ describe('inbound-delivery-confirm (reliable deliver-until-acked queue)', () => 
   })
 })
 
+// Regression for the cross-source ACK collision (silent drop): `enqueue` fires
+// for EVERY turn start regardless of source. A synthetic-source turn (cron /
+// resume / vault / reaction) that shares the chatKey of a real user message
+// still waiting to land would, with a key-only ack, clear — and silently drop
+// — that user message. The ack must match on the tracked message id.
+describe('ackDelivery — message-id-matched (cross-source false-ack guard)', () => {
+  it('acks when the enqueue message id matches the tracked one', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg' }, 0, '5001')
+    expect(ackDelivery(q, 'chat:_', '5001')).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+
+  it('does NOT ack when a different (synthetic-source) turn enqueues under the same key', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg' }, 0, '5001')
+    // a cron / resume turn for the same chat enqueues first, with its own id
+    expect(ackDelivery(q, 'chat:_', '1716123456789')).toBe(false)
+    // the user message is still tracked — it strands → gets re-delivered, not dropped
+    expect(q.pending.size).toBe(1)
+    expect(sweep(q, 15_000, TIMEOUT)).toHaveLength(1)
+    // and its own enqueue (matching id) later acks it cleanly
+    expect(ackDelivery(q, 'chat:_', '5001')).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+
+  it('does NOT ack when the enqueue carries no message id but the tracked one has one', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'real user msg' }, 0, '5001')
+    expect(ackDelivery(q, 'chat:_', null)).toBe(false)
+    expect(q.pending.size).toBe(1)
+  })
+
+  it('falls back to key-only ack when no message id was recorded (legacy/defensive)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'x' }, 0) // no messageId
+    expect(ackDelivery(q, 'chat:_', '5001')).toBe(true)
+    expect(q.pending.size).toBe(0)
+  })
+})
+
 // Regression for the steer/interrupt re-delivery loop: steering and `!`
 // interrupt inbounds amend the running turn and never emit `enqueue`, so they
 // must NOT be tracked (else the sweep re-delivers them forever). Only
@@ -125,5 +166,15 @@ describe('shouldTrackDelivery — only fresh-turn messages are tracked', () => {
   })
   it('does NOT track when both flags set (defensive)', () => {
     expect(shouldTrackDelivery({ isSteering: true, isInterrupt: true })).toBe(false)
+  })
+  it('does NOT track a synthetic (meta.source) inbound — cron/resume/vault/reaction enqueue under their own semantics', () => {
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false, hasSource: true })).toBe(false)
+  })
+  it('does NOT track an empty-body message (e.g. `/queue` with no text) — never enqueues, would re-deliver forever', () => {
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false, effectiveText: '' })).toBe(false)
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false, effectiveText: '   ' })).toBe(false)
+  })
+  it('tracks a normal message when effectiveText is provided and non-empty', () => {
+    expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false, effectiveText: 'draft the email' })).toBe(true)
   })
 })

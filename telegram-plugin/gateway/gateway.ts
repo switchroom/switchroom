@@ -1343,7 +1343,15 @@ const DELIVERY_CONFIRM_ENABLED = process.env.SWITCHROOM_INBOUND_DELIVERY_CONFIRM
 // a clean delivery, so 15s won't false-positive on a healthy turn. Tunable
 // (env) for tests/forensics; a too-low value re-delivers healthy slow turns
 // (duplicate turn), which is why the default is comfortably above ack latency.
-const DELIVERY_CONFIRM_TIMEOUT_MS = Number(process.env.SWITCHROOM_INBOUND_DELIVERY_TIMEOUT_MS) || 15_000
+const _deliveryTimeoutRaw = process.env.SWITCHROOM_INBOUND_DELIVERY_TIMEOUT_MS
+const _deliveryTimeoutParsed =
+  _deliveryTimeoutRaw != null && _deliveryTimeoutRaw !== '' ? Number(_deliveryTimeoutRaw) : 15_000
+// Clamp to a positive, finite value: a negative / zero / NaN env override would
+// make the sweep treat every tracked entry as stranded and re-deliver every
+// cycle forever (a self-inflicted re-delivery loop). To disable the feature,
+// use SWITCHROOM_INBOUND_DELIVERY_CONFIRM=0, not a degenerate timeout.
+const DELIVERY_CONFIRM_TIMEOUT_MS =
+  Number.isFinite(_deliveryTimeoutParsed) && _deliveryTimeoutParsed > 0 ? _deliveryTimeoutParsed : 15_000
 const DELIVERY_CONFIRM_SWEEP_MS = 5_000
 const deliveryQueue = createDeliveryQueue<InboundMessage>()
 
@@ -4107,7 +4115,16 @@ async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Pro
     if (selfAgent) clearAgentComposer({ agentName: selfAgent })
   } catch { /* best-effort; re-deliver regardless */ }
   const ok = ipcServer.sendToAgent(selfAgent, p.inbound)
-  if (!ok) {
+  if (ok) {
+    // Keep the #1556 gate coherent with the re-sent delivery, and survive an
+    // ack that raced the `await import` above: only `enqueue` clears tracking,
+    // so if a concurrent ack removed the entry, re-affirm it — never drop.
+    // Both ops are idempotent.
+    markClaudeBusyForInbound(p.inbound)
+    if (!deliveryQueue.pending.has(p.key)) {
+      trackDelivery(deliveryQueue, p.key, p.inbound, Date.now(), p.messageId)
+    }
+  } else {
     // Bridge offline between attempts — hand off to the offline buffer
     // (bridgeUp drains it) and stop tracking here; the spool owns it now.
     pendingInboundBuffer.push(selfAgent, p.inbound)
@@ -4116,6 +4133,16 @@ async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Pro
 }
 const _deliveryConfirmSweep = setInterval(() => {
   if (!DELIVERY_CONFIRM_ENABLED) return
+  // Re-deliver ONLY when claude is genuinely idle. `currentTurn` is set solely
+  // by the enqueue session-event and nulled at turn-end, so `currentTurn != null`
+  // means a real turn is in flight — re-clearing the composer + re-sending now
+  // would clobber it (the exact mid-turn wedge this queue exists to prevent). A
+  // pending permission / ask_user prompt is likewise a live interaction. Defer:
+  // leave the entry pending (it isn't acked) so the next idle sweep retries.
+  // NB: claudeBusyKeys (turnInFlightForGate) is set EAGERLY at delivery and
+  // stays set through a strand, so it is NOT a usable "idle" signal here.
+  if (currentTurn != null) return
+  if (pendingPermissions.size > 0 || pendingAskUser.size > 0) return
   for (const p of sweepDeliveryQueue(deliveryQueue, Date.now(), DELIVERY_CONFIRM_TIMEOUT_MS)) {
     void redeliverStrandedInbound(p)
   }
@@ -7946,9 +7973,14 @@ function handleSessionEvent(ev: SessionEvent): void {
         // re-delivery. `enqueue` carries the same chat/thread the inbound was
         // keyed on, so the key matches.
         if (DELIVERY_CONFIRM_ENABLED) {
+          // Match on the source message id: `enqueue` fires for EVERY turn
+          // start (cron / subagent-handback / vault-resume / restart-marker
+          // too — see comment below), so a key-only ack would let a synthetic
+          // turn clear a real user message still waiting under the same key.
           ackDelivery(
             deliveryQueue,
             chatKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : null),
+            ev.messageId,
           )
         }
         // PR3b-cutover: feed the authoritative turn-start to the delivery
@@ -10671,15 +10703,40 @@ async function handleInbound(
     const busyKey = markClaudeBusyForInbound(inboundMsg)
     // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
     // lands, the message stranded in the composer and the sweep re-delivers
-    // it. Track ONLY fresh-turn messages (not steering / `!` interrupt) —
-    // those amend the running turn and never emit `enqueue`, so tracking them
-    // would re-deliver forever. See shouldTrackDelivery (inbound-delivery-confirm.ts).
-    if (DELIVERY_CONFIRM_ENABLED && shouldTrackDelivery({ isSteering, isInterrupt: interrupt.isInterrupt })) {
-      trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now())
+    // it. Track ONLY messages that produce an `enqueue` to ack against —
+    // shouldTrackDelivery excludes steering / `!` interrupt (amend the running
+    // turn), synthetic (meta.source) inbounds, and empty bodies, all of which
+    // never enqueue and would re-deliver forever. The tracked messageId lets
+    // the ack match only THIS message's enqueue (not a synthetic turn sharing
+    // the key). See shouldTrackDelivery / ackDelivery (inbound-delivery-confirm.ts).
+    if (
+      DELIVERY_CONFIRM_ENABLED &&
+      shouldTrackDelivery({
+        isSteering,
+        isInterrupt: interrupt.isInterrupt,
+        hasSource: inboundMsg.meta?.source != null,
+        effectiveText,
+      })
+    ) {
+      trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now(), String(inboundMsg.messageId))
     }
   }
   if (!delivered) {
-    pendingInboundBuffer.push(selfAgent, inboundMsg)
+    // Only persist fresh user turns to the durable spool. Steering / `!`
+    // interrupt / empty bodies are mid-turn amendments or no-ops that would
+    // arrive orphaned if replayed as a fresh turn after a restart — drop them
+    // (the restart notice below tells the user to re-send). Mirrors the
+    // tracking + #1556-gate carve-outs.
+    if (
+      shouldTrackDelivery({
+        isSteering,
+        isInterrupt: interrupt.isInterrupt,
+        hasSource: inboundMsg.meta?.source != null,
+        effectiveText,
+      })
+    ) {
+      pendingInboundBuffer.push(selfAgent, inboundMsg)
+    }
     const threadOpts = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
     // #1075: thread-id-bearing — swallow via robustApiCall so a deleted
     // topic doesn't crash the gateway. Fire-and-forget; the inbound is

@@ -35,6 +35,14 @@ export interface PendingDelivery<M> {
   readonly key: string
   /** The exact inbound to re-send until claude acks it. */
   readonly inbound: M
+  /**
+   * Source message id of the tracked inbound (stringified Telegram
+   * `message_id`), or null if unknown. The `enqueue` ack matches on THIS so a
+   * synthetic-source turn (cron / resume / vault / reaction) that shares the
+   * chatKey can't false-ack — and silently drop — a real user message still
+   * waiting to land. See ackDelivery.
+   */
+  readonly messageId: string | null
   /** When the latest delivery attempt was made (unix-ms). */
   lastAttemptAt: number
 }
@@ -51,22 +59,44 @@ export function createDeliveryQueue<M>(): DeliveryQueue<M> {
  * Track a freshly-delivered inbound, awaiting claude's `enqueue` ack.
  * Overwrites any prior pending for the key — the #1556 gate serialises per
  * key, so a later inbound supersedes an earlier un-acked one for that key.
+ * `messageId` (stringified Telegram message_id) lets the ack match only the
+ * enqueue that belongs to THIS message; pass null when unknown.
  */
 export function trackDelivery<M>(
   q: DeliveryQueue<M>,
   key: string,
   inbound: M,
   now: number,
+  messageId: string | null = null,
 ): void {
-  q.pending.set(key, { key, inbound, lastAttemptAt: now })
+  q.pending.set(key, { key, inbound, messageId, lastAttemptAt: now })
 }
 
 /**
- * Ack a delivery — call from the `enqueue` session-event (claude started the
- * turn, so the message landed). Returns true if a pending entry was cleared.
+ * Ack a delivery — call from the `enqueue` session-event (claude started a
+ * turn). `enqueue` fires for EVERY turn start regardless of source (user
+ * inbound, cron, subagent-handback, vault-resume, restart-marker), so acking
+ * purely by chatKey would let a synthetic-source turn clear — and thus
+ * silently drop — a real user message still waiting under the same key. So
+ * ack ONLY when the enqueue's source message id matches the tracked one.
+ *
+ * Matching rule: if we recorded a messageId for the pending entry, require the
+ * enqueue's `enqueueMessageId` to equal it. If we never recorded one (legacy /
+ * defensive null), fall back to key-only ack. Returns true if an entry was
+ * cleared.
  */
-export function ackDelivery<M>(q: DeliveryQueue<M>, key: string): boolean {
-  return q.pending.delete(key)
+export function ackDelivery<M>(
+  q: DeliveryQueue<M>,
+  key: string,
+  enqueueMessageId: string | null = null,
+): boolean {
+  const entry = q.pending.get(key)
+  if (!entry) return false
+  // A different message started this turn — don't ack ours (it may still be
+  // waiting to land; the sweep will re-deliver it if it stranded).
+  if (entry.messageId != null && entry.messageId !== enqueueMessageId) return false
+  q.pending.delete(key)
+  return true
 }
 
 /**
@@ -98,19 +128,33 @@ export function forgetDelivery<M>(q: DeliveryQueue<M>, key: string): void {
 /**
  * Should this delivered inbound be tracked for ack/re-delivery?
  *
- * ONLY fresh-turn messages — the ones the #1556 buffer-gate holds until claude
- * is idle, then delivers — produce a fresh `enqueue` session-event, which is
- * the ack that clears tracking. Steering (`/steer`) and `!` interrupt inbounds
- * are the gate's *carve-outs*: they're delivered mid-turn to AMEND the running
- * turn, so they do NOT start a fresh turn and never emit `enqueue`. Tracking
- * them would leave an entry that is never acked → the sweep re-delivers it
- * indefinitely (duplicate turns). So mirror the gate's carve-outs here: track a
- * delivery iff it is neither steering nor interrupt — i.e. exactly the messages
- * that produce an `enqueue` to ack against.
+ * Track a delivery iff it is a fresh user turn that will produce exactly one
+ * `enqueue` to ack against. Everything that does NOT enqueue must be excluded,
+ * or the sweep re-delivers it forever (re-clearing the composer every cycle):
+ *
+ *   - `isSteering` / `isInterrupt` — the #1556 gate's carve-outs: delivered
+ *     mid-turn to AMEND the running turn, so they never start a fresh turn and
+ *     never emit `enqueue`.
+ *   - `hasSource` — synthetic inbounds (cron / vault-resume / subagent-handback
+ *     / reaction) carry a `meta.source`; they enqueue under their own semantics
+ *     and must never be tracked as if they were a queued user turn.
+ *   - empty `effectiveText` — an empty body (e.g. `/queue` with no text) is
+ *     silently dropped by claude's auto-submit and never enqueues, so tracking
+ *     it is a pure re-delivery loop (a self-inflicted DoS on the queue).
+ *
+ * Mirror the gate's carve-outs here so tracking is exactly the set of messages
+ * that produce an `enqueue`.
  */
 export function shouldTrackDelivery(input: {
   isSteering: boolean
   isInterrupt: boolean
+  hasSource?: boolean
+  effectiveText?: string
 }): boolean {
-  return !input.isSteering && !input.isInterrupt
+  if (input.isSteering || input.isInterrupt) return false
+  if (input.hasSource) return false
+  // Gate on empty text only when the caller actually provided it (undefined =
+  // "not supplied", left untracked-gated so existing callers keep their behaviour).
+  if (input.effectiveText !== undefined && input.effectiveText.trim().length === 0) return false
+  return true
 }
