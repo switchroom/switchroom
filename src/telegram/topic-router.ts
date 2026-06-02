@@ -139,6 +139,32 @@ export function resolveOutboundTopic(
 }
 
 /**
+ * Decide the `message_thread_id` to attach when an approval / permission card
+ * is sent to a SPECIFIC recipient chat.
+ *
+ * A forum topic id (what {@link resolveOutboundTopic} returns) is valid ONLY
+ * inside the agent's own supergroup (`channels.telegram.chat_id`). The approval
+ * emitters, however, fan out to the operator's `allowFrom` chats — which are
+ * normally **DMs**, and DMs have no topics. Attaching a topic id to a DM makes
+ * Telegram reject the send with `400 Bad Request: message thread not found`, so
+ * the card never arrives, the request auto-denies at its TTL, and the agent
+ * wedges on the still-open prompt (the `marko` brevo incident, 2026-06-02).
+ *
+ * So attach the resolved topic ONLY to the recipient that actually owns it —
+ * the agent's supergroup chat — and send thread-less to everyone else.
+ * Returns `undefined` (no `message_thread_id`) for any non-owning recipient.
+ */
+export function topicForRecipient(args: {
+  recipientChatId: string | number;
+  resolvedTopic: number | undefined;
+  supergroupChatId: string | number | undefined;
+}): number | undefined {
+  const { recipientChatId, resolvedTopic, supergroupChatId } = args;
+  if (resolvedTopic == null || supergroupChatId == null) return undefined;
+  return String(recipientChatId) === String(supergroupChatId) ? resolvedTopic : undefined;
+}
+
+/**
  * Validate that every per-cron `topic:` field in `schedule[]` is
  * resolvable — either a numeric topic ID (always accepted) or a
  * string alias defined in `topic_aliases`.

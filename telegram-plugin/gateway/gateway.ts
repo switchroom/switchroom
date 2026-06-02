@@ -251,7 +251,7 @@ import { handleInjectCommand } from './inject-handler.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
-import { resolveOutboundTopic as resolveOutboundTopicHelper, type TopicRouterConfig as _OutboundRouterConfig } from '../../src/telegram/topic-router.js'
+import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, type TopicRouterConfig as _OutboundRouterConfig } from '../../src/telegram/topic-router.js'
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
@@ -2273,14 +2273,20 @@ function postPermissionResumeMessage(opts: {
   const targets: Array<{ chatId: string; threadId: number | undefined }> =
     turn != null
       ? [{ chatId: turn.sessionChatId, threadId: turn.sessionThreadId }]
-      : loadAccess().allowFrom.map(chatId => ({
-          chatId,
-          threadId: resolveAgentOutboundTopic({
+      : (() => {
+          const sg = resolveAgentSupergroupChatId()
+          const topic = resolveAgentOutboundTopic({
             kind: 'permission',
             turnInitiated: false,
             originThreadId: undefined,
-          }),
-        }))
+          })
+          // allowFrom is normally operator DMs — attach the topic only to a
+          // recipient that owns it (the supergroup), never a DM (marko wedge).
+          return loadAccess().allowFrom.map(chatId => ({
+            chatId,
+            threadId: topicForRecipient({ recipientChatId: chatId, resolvedTopic: topic, supergroupChatId: sg }),
+          }))
+        })()
   for (const { chatId, threadId } of targets) {
     // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send
     void swallowingApiCall(
@@ -4664,16 +4670,20 @@ const ipcServer: IpcServer = createIpcServer({
       turnInitiated: activeTurn != null,
       originThreadId: activeTurn?.sessionThreadId,
     })
+    const permSupergroup = resolveAgentSupergroupChatId()
     for (const chat_id of access.allowFrom) {
       // parse_mode=HTML pairs with formatPermissionCardBody (#1790)
       // so the <b>/<i> tags render as formatting.
-      // PR4b emitter sweep — opts now optionally carries
-      // message_thread_id when supergroup mode is on.
+      // The resolved topic is valid only in the agent's supergroup — attach
+      // it ONLY when this recipient IS that supergroup. allowFrom DMs get the
+      // card thread-less; attaching a topic to a DM yields 400 "message thread
+      // not found" → card never arrives → auto-deny → wedge (marko 2026-06-02).
+      const permThread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: permTopic, supergroupChatId: permSupergroup })
       // allow-raw-bot-api: permission-request keyboard fan-out; topic-aware opts
       void bot.api.sendMessage(chat_id, text, {
         parse_mode: 'HTML',
         reply_markup: keyboard,
-        ...(permTopic != null ? { message_thread_id: permTopic } : {}),
+        ...(permThread != null ? { message_thread_id: permThread } : {}),
       }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
       })
@@ -4811,9 +4821,15 @@ const ipcServer: IpcServer = createIpcServer({
         // topic. Drive approval cards follow the originating turn
         // (operator-initiated tool call), admin alias fallback.
         const activeTurn = currentTurn
-        const driveTopic = resolveAgentOutboundTopic({
-          kind: 'hostd-approval',
-          originThreadId: activeTurn?.sessionThreadId,
+        // Attach the topic only when `operator` IS the agent's supergroup —
+        // operator DMs have no topics (marko brevo wedge, 2026-06-02).
+        const driveTopic = topicForRecipient({
+          recipientChatId: operator,
+          resolvedTopic: resolveAgentOutboundTopic({
+            kind: 'hostd-approval',
+            originThreadId: activeTurn?.sessionThreadId,
+          }),
+          supergroupChatId: resolveAgentSupergroupChatId(),
         })
         return {
           chatId: operator,
@@ -4884,9 +4900,14 @@ const ipcServer: IpcServer = createIpcServer({
         // alias fallback for background cases. Same shape as hostd /
         // drive approvals below.
         const activeTurn = currentTurn
-        const ms365Topic = resolveAgentOutboundTopic({
-          kind: 'hostd-approval',
-          originThreadId: activeTurn?.sessionThreadId,
+        // Topic valid only in the agent's supergroup — never on the operator DM.
+        const ms365Topic = topicForRecipient({
+          recipientChatId: operator,
+          resolvedTopic: resolveAgentOutboundTopic({
+            kind: 'hostd-approval',
+            originThreadId: activeTurn?.sessionThreadId,
+          }),
+          supergroupChatId: resolveAgentSupergroupChatId(),
         })
         return {
           chatId: operator,
@@ -4963,9 +4984,14 @@ const ipcServer: IpcServer = createIpcServer({
         // returns undefined for non-supergroup agents → behavior
         // unchanged.
         const activeTurn = currentTurn
-        const cfgTopic = resolveAgentOutboundTopic({
-          kind: 'hostd-approval',
-          originThreadId: activeTurn?.sessionThreadId,
+        // Topic valid only in the agent's supergroup — never on the operator DM.
+        const cfgTopic = topicForRecipient({
+          recipientChatId: operator,
+          resolvedTopic: resolveAgentOutboundTopic({
+            kind: 'hostd-approval',
+            originThreadId: activeTurn?.sessionThreadId,
+          }),
+          supergroupChatId: resolveAgentSupergroupChatId(),
         })
         return {
           chatId: operator,
@@ -11062,6 +11088,30 @@ function resolveAgentOutboundTopic(
     // caller's existing fallback). Only supergroup-owned agents
     // (with default_topic_id set) get a routed value.
     return resolveOutboundTopicHelper(tg as _OutboundRouterConfig, event)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The agent's supergroup chat id (`channels.telegram.chat_id`) when it is in
+ * supergroup-owned mode, else undefined. A forum topic id resolved by
+ * {@link resolveAgentOutboundTopic} is valid ONLY in this chat — used by
+ * {@link topicForRecipient} to decide whether an approval/permission card sent
+ * to a given recipient (operator DMs vs the supergroup itself) may carry a
+ * `message_thread_id`. Attaching a topic to a DM is the marko brevo wedge
+ * (2026-06-02): the card fails with "message thread not found" and auto-denies.
+ */
+function resolveAgentSupergroupChatId(): string | undefined {
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) return undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const rawAgent = cfg.agents?.[agentName]
+    if (!rawAgent) return undefined
+    const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+    const tg = resolved.channels?.telegram as { chat_id?: string | number } | undefined
+    return tg?.chat_id != null ? String(tg.chat_id) : undefined
   } catch {
     return undefined
   }
