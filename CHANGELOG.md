@@ -1,5 +1,28 @@
 # Changelog
 
+## unreleased — Reliable inbound delivery: deliver-until-acked
+
+Telegram inbounds reach claude as an MCP channel notification that the
+unmodified CLI appends to its TUI composer and auto-submits only when the
+composer is empty + idle. When a message arrives as the prior turn is
+finalizing, the auto-submit races turn-completion and the text **strands
+unsubmitted** — claude never starts the turn, so the gateway sat
+"typing…" until the 300s silence-poke **dropped the message**. Observed
+recurring on `marko` (supergroup forum topics and DMs alike); the #1556
+delivery gate + #2039 composer-clear narrowed the window but didn't close
+it because delivery was never *acknowledged*.
+
+- **Delivery is now acked by `enqueue`, not by `sendToAgent`.** A
+  delivered inbound is tracked in a small per-key queue until claude
+  actually starts the turn (the `enqueue` session-event — the one signal
+  that claude truly picked the message up). If it isn't acked within 15s
+  it stranded: the gateway re-clears the composer and re-delivers it, and
+  keeps re-delivering until claude acks. The message is **never dropped**.
+  Bridge-offline re-sends hand off to the existing persistent offline
+  buffer. Kill switch: `SWITCHROOM_INBOUND_DELIVERY_CONFIRM=0` restores
+  the legacy fire-and-forget path. New pure module
+  `inbound-delivery-confirm.ts` with full unit coverage.
+
 ## v0.14.39 — Sub-agent attribution stamped at dispatch (#2081, #2083, #2084)
 
 Make a sub-agent's parent turn **ground truth captured at dispatch**

@@ -280,6 +280,14 @@ import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } f
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
+import {
+  createDeliveryQueue,
+  trackDelivery,
+  ackDelivery,
+  sweep as sweepDeliveryQueue,
+  forgetDelivery,
+  type PendingDelivery,
+} from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
 import { chatKey, chatKeyWithSuffix, chatIdOfChatKey } from './chat-key.js'
 // Phase 2b PR 2 — shadow mode. Each event-site below calls shadowEmit()
@@ -1309,14 +1317,34 @@ function markClaudeBusyForInbound(m: {
   chatId: string
   threadId?: number
   meta?: Record<string, string>
-}): void {
+}): string {
   let tid: number | null = m.threadId ?? null
   if (tid == null && m.meta?.message_thread_id != null) {
     const n = Number(m.meta.message_thread_id)
     if (Number.isFinite(n)) tid = n
   }
-  claudeBusyKeys.add(chatKey(m.chatId, tid))
+  const key = chatKey(m.chatId, tid)
+  claudeBusyKeys.add(key)
+  return key
 }
+
+// ─── Reliable inbound delivery: deliver-until-acked (the marko drop-wedge) ─
+// A delivered inbound is ACKED only by the `enqueue` session-event (claude
+// actually started the turn) — NOT by sendToAgent returning true. Until
+// acked, the message stays queued; if it didn't land within the timeout it
+// stranded in claude's composer, so we re-deliver it. Re-deliver forever
+// until acked — never drop (vs the old fire-and-forget that the 300s
+// silence-poke swallowed). Kill switch: SWITCHROOM_INBOUND_DELIVERY_CONFIRM=0
+// → legacy fire-and-forget. See inbound-delivery-confirm.ts.
+const DELIVERY_CONFIRM_ENABLED = process.env.SWITCHROOM_INBOUND_DELIVERY_CONFIRM !== '0'
+// How long to wait for claude's `enqueue` ack before treating a delivery as
+// stranded and re-delivering. Generous by default — claude acks within ~1s of
+// a clean delivery, so 15s won't false-positive on a healthy turn. Tunable
+// (env) for tests/forensics; a too-low value re-delivers healthy slow turns
+// (duplicate turn), which is why the default is comfortably above ack latency.
+const DELIVERY_CONFIRM_TIMEOUT_MS = Number(process.env.SWITCHROOM_INBOUND_DELIVERY_TIMEOUT_MS) || 15_000
+const DELIVERY_CONFIRM_SWEEP_MS = 5_000
+const deliveryQueue = createDeliveryQueue<InboundMessage>()
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -4060,6 +4088,38 @@ const _deliveryMachineTick = setInterval(() => {
   shadowEmit({ kind: 'tick', now: Date.now() })
 }, DELIVERY_MACHINE_TICK_MS)
 _deliveryMachineTick.unref?.()
+
+// Re-deliver stranded inbounds until claude acks (the marko drop-wedge).
+// Every few seconds, re-send any inbound that was handed to claude but never
+// acked by an `enqueue` — it stranded unsubmitted in the composer. Re-clear
+// the composer so the re-sent notification lands on a clean line, then
+// re-send. Reuses the same delivery primitives; the message is never dropped.
+// (Refs ipcServer / pendingInboundBuffer declared below — resolved at fire
+// time, after module init.) unref so the interval never holds the process.
+async function redeliverStrandedInbound(p: PendingDelivery<InboundMessage>): Promise<void> {
+  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  process.stderr.write(
+    `telegram gateway: inbound strand (no enqueue ack) key=${p.key} — re-clearing composer + re-delivering\n`,
+  )
+  try {
+    const { clearAgentComposer } = await import('../../src/agents/tmux.js')
+    if (selfAgent) clearAgentComposer({ agentName: selfAgent })
+  } catch { /* best-effort; re-deliver regardless */ }
+  const ok = ipcServer.sendToAgent(selfAgent, p.inbound)
+  if (!ok) {
+    // Bridge offline between attempts — hand off to the offline buffer
+    // (bridgeUp drains it) and stop tracking here; the spool owns it now.
+    pendingInboundBuffer.push(selfAgent, p.inbound)
+    forgetDelivery(deliveryQueue, p.key)
+  }
+}
+const _deliveryConfirmSweep = setInterval(() => {
+  if (!DELIVERY_CONFIRM_ENABLED) return
+  for (const p of sweepDeliveryQueue(deliveryQueue, Date.now(), DELIVERY_CONFIRM_TIMEOUT_MS)) {
+    void redeliverStrandedInbound(p)
+  }
+}, DELIVERY_CONFIRM_SWEEP_MS)
+_deliveryConfirmSweep.unref?.()
 
 // #1445 cross-turn pending-async ambient. When a turn ends after the
 // model dispatched background async work (Agent / Task / Bash run-in-
@@ -7880,6 +7940,16 @@ function handleSessionEvent(ev: SessionEvent): void {
           isDm: isDmChatId(ev.chatId),
         }
         currentTurn = next
+        // Ack inbound delivery (the marko drop-wedge): claude actually started
+        // this turn, so its delivered inbound landed — stop tracking it for
+        // re-delivery. `enqueue` carries the same chat/thread the inbound was
+        // keyed on, so the key matches.
+        if (DELIVERY_CONFIRM_ENABLED) {
+          ackDelivery(
+            deliveryQueue,
+            chatKey(ev.chatId, ev.threadId != null ? Number(ev.threadId) : null),
+          )
+        }
         // PR3b-cutover: feed the authoritative turn-start to the delivery
         // machine. `enqueue` fires for EVERY turn atom regardless of
         // source — inbound, cron, subagent-handback, vault-resume,
@@ -10596,7 +10666,15 @@ async function handleInbound(
   }
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
-  if (delivered) markClaudeBusyForInbound(inboundMsg)
+  if (delivered) {
+    const busyKey = markClaudeBusyForInbound(inboundMsg)
+    // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
+    // lands, the message stranded in the composer and the sweep re-delivers
+    // it. See inbound-delivery-confirm.ts.
+    if (DELIVERY_CONFIRM_ENABLED) {
+      trackDelivery(deliveryQueue, busyKey, inboundMsg, Date.now())
+    }
+  }
   if (!delivered) {
     pendingInboundBuffer.push(selfAgent, inboundMsg)
     const threadOpts = messageThreadId != null ? { message_thread_id: messageThreadId } : {}
