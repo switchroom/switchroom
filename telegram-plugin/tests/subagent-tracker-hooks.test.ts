@@ -344,6 +344,65 @@ describe('subagent-tracker-posttool', () => {
     expect(row?.background).toBe(0)
     expect(row?.status).toBe('completed')
   })
+
+  // ─── async-launch ACK contract — drift tolerance (#2084) ────────────────────
+  // Tier 3 of isAsyncLaunchAck keys on the functional `agentId: <stem>` token
+  // (the most wording-stable part of the ACK) so promotion survives a
+  // claude-code bump that rewords BOTH the launch verb AND the "working in the
+  // background" phrase. The context-word requirement keeps it from tripping on
+  // a foreground report that merely mentions an agentId.
+  it('promotes on reworded ACK prose when the agentId token + a context word survive', () => {
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-drift',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_drift1',
+      tool_input: { subagent_type: 'worker', description: 'Drifted ACK' },
+    })
+    // Neither "async agent launched" nor "working in the background" — a
+    // hypothetical reworded ACK — but the agentId token + "background" remain.
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_drift1',
+      tool_response: {
+        content: [{ type: 'text', text: 'Background worker started.\nagentId: drift-7f3a91\nYou will be notified when it finishes.' }],
+      },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).not.toContain('additionalContext')
+
+    const db = openDb()
+    const row = db.prepare('SELECT background, status, ended_at FROM subagents WHERE id = ?').get('toolu_drift1') as
+      | { background: number; status: string; ended_at: number | null }
+      | undefined
+    expect(row?.background).toBe(1)
+    expect(row?.status).toBe('running')
+    expect(row?.ended_at == null).toBe(true)
+  })
+
+  it('does NOT promote when an agentId token appears without any launch/background context word', () => {
+    // A genuine foreground report mentioning an agentId in passing — no
+    // launch/background/async/dispatch word — must terminalize, not promote.
+    runHook(PRETOOL_SCRIPT, {
+      session_id: 's-falsepos',
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_falsepos1',
+      tool_input: { subagent_type: 'worker', description: 'Foreground lookup', run_in_background: false },
+    })
+    const postResult = runHook(POSTTOOL_SCRIPT, {
+      tool_name: 'Agent',
+      tool_use_id: 'toolu_falsepos1',
+      tool_response: { result: 'Done. Verified the record; agentId: svc-42 is valid and active.', is_error: false },
+    })
+    expect(postResult.status).toBe(0)
+    expect(postResult.stdout).toContain('additionalContext')
+
+    const db = openDb()
+    const row = db.prepare('SELECT background, status FROM subagents WHERE id = ?').get('toolu_falsepos1') as
+      | { background: number; status: string }
+      | undefined
+    expect(row?.background).toBe(0)
+    expect(row?.status).toBe('completed')
+  })
 })
 
 describe('agent-dir resolution (RFC §Bug 2)', () => {

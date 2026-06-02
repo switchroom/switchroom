@@ -209,6 +209,53 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
 }
 
 // ---------------------------------------------------------------------------
+// Active-turn resolution (the parent_turn_key the row belongs to)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the gateway's turn-active marker to learn the turn_key of the turn that
+ * is active *right now* — the turn whose tool call is dispatching this
+ * sub-agent. The gateway writes `<TELEGRAM_STATE_DIR>/turn-active.json`
+ * synchronously at turn-start (gateway/turn-active-marker.ts), keyed
+ * `{turnKey, chatId, threadId, startedAt}`, and removes it at turn-complete.
+ * `telegramDir` here resolves to that same `TELEGRAM_STATE_DIR` in production
+ * (verified: identical inode to the registry.db dir), so the marker is a
+ * sibling of registry.db.
+ *
+ * Stamping parent_turn_key from this marker at INSERT time — instead of
+ * leaving it NULL for the gateway to reconstruct from a started_at time-window
+ * at jsonl-link time — fixes two bugs:
+ *   - #2081: the time-window backfill mis-attributes when turn windows overlap
+ *     (supergroup forum topics multiplex many concurrent turns under one
+ *     chat_id; `ended_at` is unreliable/batch-swept). The live marker is the
+ *     ground truth for "which turn dispatched this", so there is nothing to
+ *     reconstruct and no overlap to disambiguate.
+ *   - #2083: the backfill only runs when a sub-agent's JSONL links; ~8% never
+ *     link and were never attributed. Stamping at INSERT is independent of
+ *     linking.
+ *
+ * `turnKey` equals `turns.turn_key` (both minted by chatKeyWithSuffix at
+ * turn-start), so resolveSubagentOriginChat()'s getTurnByKey() finds the exact
+ * (chat_id, thread_id) and routes the worker card to the originating topic.
+ *
+ * Best-effort: if no turn is active (no marker — e.g. a sub-agent dispatched
+ * outside a turn) or the marker is unreadable/malformed, return null and let
+ * the gateway's started_at backfill remain the fallback (today's behaviour).
+ * Never throws; never blocks the tool call.
+ */
+function readActiveTurnKey(telegramDir) {
+  try {
+    // Mirrors TURN_ACTIVE_MARKER_FILE in gateway/turn-active-marker.ts.
+    const raw = readFileSync(join(telegramDir, 'turn-active.json'), 'utf8')
+    const marker = JSON.parse(raw)
+    const turnKey = marker?.turnKey
+    return typeof turnKey === 'string' && turnKey.length > 0 ? turnKey : null
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -257,22 +304,22 @@ function main() {
   }
 
   const input = event.tool_input ?? {}
+  // Resolve parent_turn_key from the live turn-active marker (the turn whose
+  // tool call is dispatching this sub-agent). Claude Code's PreToolUse payload
+  // carries only its own session id, never the gateway-minted Telegram turn_key
+  // — but the gateway writes that turn_key to <telegramDir>/turn-active.json
+  // for the duration of the turn, so we read it directly here. Stamping it at
+  // INSERT (vs leaving NULL for the gateway's started_at time-window backfill)
+  // fixes overlapping-window mis-attribution (#2081) and attributes sub-agents
+  // whose JSONL never links (#2083). NULL when no turn is active → the gateway
+  // backfill remains the fallback. See readActiveTurnKey().
+  const parentTurnKey = readActiveTurnKey(telegramDir)
   writeRow(
     dbPath,
     {
       id: event.tool_use_id ?? null,
       parentSessionId: event.session_id ?? null,
-      // parent_turn_key is intentionally NULL here. Claude Code's PreToolUse
-      // payload carries its own session id, not the gateway-minted Telegram
-      // turn_key (a chat+topic+turn key) the `turns` table is keyed on —
-      // `event.turn_id` is always undefined, and even if a future CLI
-      // populated it, it would not match a `turns.turn_key`. The gateway
-      // resolves parent_turn_key from the
-      // sub-agent's started_at at jsonl-link time (subagent-watcher.ts
-      // backfillJsonlAgentId), which works even after the parent turn ends.
-      // Writing a bogus value here would defeat that backfill's
-      // `parent_turn_key IS NULL` guard.
-      parentTurnKey: null,
+      parentTurnKey,
       agentType: input.subagent_type ?? null,
       description: input.description ?? null,
       background: input.run_in_background === true ? 1 : 0,

@@ -1,5 +1,42 @@
 # Changelog
 
+## unreleased — Sub-agent attribution stamped at dispatch (#2081, #2083, #2084)
+
+Make a sub-agent's parent turn **ground truth captured at dispatch**
+instead of reconstructed after the fact — fixing wrong-topic worker-card
+pins in supergroups and hardening background-worker detection.
+
+- **`parent_turn_key` stamped from the live turn-active marker (#2081,
+  #2083).** The PreToolUse hook now reads the gateway's
+  `<telegramDir>/turn-active.json` marker — the turn whose tool call is
+  dispatching this sub-agent — and writes `parent_turn_key =
+  marker.turnKey` at INSERT. Previously the column was left NULL and the
+  gateway reconstructed it at jsonl-link time from a `started_at`
+  time-window match. That match assumed "at most one turn window
+  contains a given instant", which is false in supergroups: forum topics
+  multiplex many concurrent turns under one `chat_id` and `ended_at` is
+  unreliable (batch-swept), so the window query could attribute a
+  sub-agent to the **wrong topic** (proven on marko) and pin its worker
+  card to the wrong conversation (#2081). Stamping the exact turn_key at
+  dispatch removes the reconstruction entirely. It also attributes
+  sub-agents whose JSONL never links (~8% — the backfill only ran on
+  link), which were previously never attributed (#2083). The gateway
+  window-match remains a best-effort fallback for the no-active-turn
+  case; the hook's value always wins (the backfill's `IS NULL` guard).
+- **Async-launch detection hardened (#2084).** `isAsyncLaunchAck` gains
+  a third, drift-tolerant tier keyed on the functional `agentId: <stem>`
+  token (the most wording-stable part of Claude Code's async-launch ACK)
+  paired with a launch/background/async/dispatch context word, so a CLI
+  bump that rewords BOTH prose phrases no longer silently regresses
+  background-worker promotion. The exact ACK contract (verified against
+  the pinned claude-code 2.1.156) is now pinned by drift-variant tests.
+- **Turn `ended_at` lifecycle (#2082):** the overlap mis-attribution it
+  caused is eliminated above (attribution no longer depends on
+  `ended_at`). The residual orphan open turns are a symptom of the
+  not-yet-done supergroup `currentTurn → Map` refactor and self-heal at
+  boot; tracked there rather than risking the turn-end/resume/watchdog
+  couplings here.
+
 ## v0.14.38 — Supergroup zero-config easy-mode (#2077)
 
 Make the **supergroup-owned topology zero-config easy mode**: point an

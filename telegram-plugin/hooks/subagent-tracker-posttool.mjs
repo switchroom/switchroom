@@ -188,18 +188,40 @@ function toolResponseText(toolResponse) {
  * parent turn, so the pretool recorded background=0 and the worker card never
  * fired). We therefore trust this ACK over the pretool's input-derived flag.
  *
- * Anchored on the specific "async agent launched" phrase (a foreground
- * sub-agent's final report is extremely unlikely to contain it), with a
- * structural backstop ("working in the background" + an agentId token) in case
- * the launch-verb wording drifts. A major wording change degrades to the
- * pretool flag — still correct whenever the model DID pass run_in_background,
- * never worse than before.
+ * Three tiers, widest-stable-signal last, so a Claude Code wording change has
+ * to defeat ALL of them before promotion silently regresses (#2084):
+ *
+ *   1. The canonical ACK phrase "async agent launched" — the exact current
+ *      claude-code wording. A foreground report is extremely unlikely to
+ *      contain it.
+ *   2. Structural backstop: the background-status phrase "working in the
+ *      background" + an agentId token. Survives a reworded launch verb.
+ *   3. Drift-tolerant: the `agentId: <stem>` token — the FUNCTIONAL, most
+ *      stable part of the ACK (the parent later references the worker by this
+ *      id, so it is far less likely to be reworded than the surrounding prose)
+ *      — paired with a launch/background/async/dispatch context word. This
+ *      survives BOTH prose phrases (tiers 1 & 2) changing in the same bump.
+ *      The context-word requirement keeps a genuine foreground report that
+ *      merely mentions "agentId" in passing from tripping it.
+ *
+ * If all three miss, promotion degrades to the pretool's input-derived flag —
+ * still correct whenever the model DID pass run_in_background, never worse than
+ * before. The exact ACK contract is pinned by drift-variant tests in
+ * subagent-tracker-hooks.test.ts ("async-launch ACK contract"); when bumping
+ * the pinned claude-code version, re-verify the live ACK against those.
+ *
+ * ACK contract verified against claude-code 2.1.156 (the fleet pin):
+ *   "Async agent launched successfully.\n
+ *    agentId: <stem>\n
+ *    The agent is working in the background. You will be notified
+ *    automatically when it completes."
  */
 function isAsyncLaunchAck(toolResponse) {
   const t = toolResponseText(toolResponse).toLowerCase()
   if (!t) return false
   if (t.includes('async agent launched')) return true
   if (t.includes('working in the background') && t.includes('agentid')) return true
+  if (/agentid:\s*\S/.test(t) && /\b(background|launch|dispatch|async)/.test(t)) return true
   return false
 }
 
