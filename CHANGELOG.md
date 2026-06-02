@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.14.38 — Supergroup zero-config easy-mode (#2077)
+
+Make the **supergroup-owned topology zero-config easy mode**: point an
+agent at a Telegram supergroup and it answers **everywhere, all topics
+(including ones created later), with DMs still served** — no
+hand-editing `access.json`, no picking a default topic.
+
+This came out of enabling marko in a working group, which required
+discovering the silent `group_unknown` drop, knowing `access.json` is
+`writeIfMissing`, hand-merging the group, and hand-picking
+`default_topic_id` — all toil that fails principles 1
+(teach-itself) and 2 (batteries-included).
+
+- **Config-driven group registration.** `reconcileConfiguredGroup`
+  idempotently merges the agent's configured supergroup into
+  `access.json` on every reconcile — strictly additive: adds the group
+  only if absent; preserves `allowFrom`, pairings, other groups, and
+  any operator policy override (e.g. `requireMention: true`). Closes
+  the `writeIfMissing` gap that made a supergroup added *after* first
+  scaffold never register. Smart default for a newly-added group:
+  `requireMention: false` (a room the agent owns answers every
+  message), all topics (the gate is per-group, not per-topic).
+- **Effective-chat resolution.** Both the reconcile and the
+  fresh-scaffold access-list paths now resolve the per-agent
+  `channels.telegram.chat_id` override *ahead of* the fleet
+  `telegram.forum_chat_id` — same precedence as the cron router — so
+  the access list, scheduler, and gateway all agree on which chat the
+  agent owns.
+- **`default_topic_id` defaults to General (1).** Setting `chat_id` no
+  longer *requires* `default_topic_id`; it falls back to General (the
+  outbound wrapper strips `thread_id === 1` on send). Pin a different
+  fallback only if you want one.
+
+Net easy path is one config line —
+`channels.telegram.chat_id: "<supergroup-id>"`. Mention-only,
+per-topic deny, and a pinned default topic remain opt-*in*. Leash
+unchanged: this only affects which messages the agent *reads* in a
+group it owns; actions still gate through Allow/Deny + `allowFrom`.
+RFC: `docs/rfcs/supergroup-easy-defaults.md` (scopes the phase-2 CLI
+`--topology supergroup` on-ramp + the in-Telegram "enable this group?"
+nudge).
+
 ## v0.14.37 — Background-worker visibility fixes (#2075, #2076)
 
 Two fixes to how a delegated background worker is surfaced back to the
