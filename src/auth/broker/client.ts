@@ -263,6 +263,19 @@ export interface ListGoogleAccountsData {
   accounts: GoogleAccountState[];
 }
 
+/** Per-account inventory entry returned by `listMicrosoftAccounts()`. */
+export interface MicrosoftAccountState {
+  account: string;
+  expiresAt: number;
+  scope: string;
+  clientId: string;
+  accountType: "personal" | "work";
+}
+
+export interface ListMicrosoftAccountsData {
+  accounts: MicrosoftAccountState[];
+}
+
 /** Anthropic-shaped credentials payload for `addAccount`. */
 export interface AnthropicAddAccountCredentials {
   claudeAiOauth: {
@@ -395,6 +408,15 @@ export class AuthBrokerClient {
       op: "list-google-accounts",
     });
     return data as ListGoogleAccountsData;
+  }
+
+  async listMicrosoftAccounts(): Promise<ListMicrosoftAccountsData> {
+    const data = await this.send({
+      v: PROTOCOL_VERSION,
+      id: randomUUID(),
+      op: "list-microsoft-accounts",
+    });
+    return data as ListMicrosoftAccountsData;
   }
 
   /**

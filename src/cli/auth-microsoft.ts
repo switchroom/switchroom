@@ -559,22 +559,76 @@ function registerAccountList(accountParent: Command): void {
     )
     .option("--json", "Emit raw JSON")
     .action(
-      withConfigError(async (_opts: { json?: boolean }) => {
-        // Phase 2 follow-up — needs a `list-microsoft-accounts` broker op
-        // (mirror of `list-google-accounts`). For now, fall back to
-        // pointing at the YAML view.
+      withConfigError(async (opts: { json?: boolean }) => {
+        const { brokerCall } = await import("./broker-call.js");
+        const data = await brokerCall(async (client) =>
+          client.listMicrosoftAccounts(),
+        );
+
+        if (opts.json) {
+          console.log(JSON.stringify(data, null, 2));
+          return;
+        }
+
         console.log();
+        if (data.accounts.length === 0) {
+          console.log(chalk.gray("  No Microsoft accounts stored in broker."));
+          console.log(
+            `  Add one: ${chalk.bold("switchroom auth microsoft account add <email>")}`,
+          );
+          console.log();
+          return;
+        }
+
+        const accountColWidth = Math.max(
+          ...data.accounts.map((a) => a.account.length),
+          "ACCOUNT".length,
+        );
+        const typeColWidth = "TYPE".length + 4;
+        const expiresColWidth = "EXPIRES".length + 2;
         console.log(
-          chalk.yellow(
-            "  Broker-side listing for Microsoft accounts is a follow-up (needs a list-microsoft-accounts wire op).",
-          ),
+          `${pad("ACCOUNT", accountColWidth)}  ${pad("TYPE", typeColWidth)}  ${pad("EXPIRES", expiresColWidth)}  SCOPE`,
         );
         console.log(
-          `  For now, see the YAML matrix: ${chalk.bold("switchroom auth microsoft list")}`,
+          `${pad("-".repeat(7), accountColWidth)}  ${pad("-".repeat(4), typeColWidth)}  ${pad("-".repeat(7), expiresColWidth)}  ${"-".repeat(5)}`,
         );
+        const now = Date.now();
+        for (const a of data.accounts) {
+          const expiresLabel = formatMicrosoftExpiry(a.expiresAt - now);
+          // Compress Graph scope display — drop the noisy openid/profile/
+          // email/offline_access scaffolding scopes; keep the resource
+          // scopes (Mail/Files/Calendars) that tell the operator what the
+          // account can actually do.
+          const scopes = a.scope
+            .split(" ")
+            .filter(
+              (s) =>
+                s.length > 0 &&
+                !["openid", "profile", "email", "offline_access"].includes(s),
+            )
+            .join(", ");
+          console.log(
+            `${pad(a.account, accountColWidth)}  ${pad(a.accountType, typeColWidth)}  ${pad(expiresLabel, expiresColWidth)}  ${scopes}`,
+          );
+        }
         console.log();
       }),
     );
+}
+
+/**
+ * Format a millisecond duration as a short relative time. Negative
+ * durations render as "expired" — the broker's refresh-tick keeps
+ * stored creds fresh, so this should be rare for a live account.
+ */
+function formatMicrosoftExpiry(remainingMs: number): string {
+  if (remainingMs <= 0) return chalk.red("expired");
+  const minutes = Math.round(remainingMs / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  return `${days}d`;
 }
 
 // ────────────────────────────────────────────────────────────────────────
