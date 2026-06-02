@@ -1,23 +1,57 @@
 # Changelog
 
-## unreleased — Delivery-confirm: don't track steering/interrupt (re-deliver-loop fix)
+## v0.14.41 — Delivery-path hardening: steer-loop fix + 6 audit findings (#2092, #2093)
 
-Follow-up hardening to v0.14.40's deliver-until-acked queue. That change
-tracked **every** delivered inbound for an `enqueue` ack — including
-`/steer` and `!`-interrupt messages. But those are delivered mid-turn to
-*amend the running turn* and never emit a fresh `enqueue`, so they were
-never acked and the 5s sweep re-delivered them (duplicate turns / a
-re-delivery loop). An adversarial stress-test of the v0.14.40 fix caught
-this before it bit in anger (the canary's steer test had passed only by
-ack-timing luck).
+Two rounds of follow-up hardening to v0.14.40's deliver-until-acked queue —
+the second from an exhaustive adversarial audit of the whole inbound→reply
+path. The queue closed the marko 300s-drop wedge, but its re-delivery sweep
+had been bolted on without inheriting the protections the fresh-inbound path
+earned over 15+ prior wedge fixes.
 
-- **Track only fresh-turn deliveries.** `shouldTrackDelivery` gates
-  tracking to non-steering, non-interrupt inbounds — exactly the messages
-  the #1556 buffer-gate holds-then-delivers, which are the ones that
-  produce an `enqueue` to ack against. Steering/interrupt are the gate's
-  carve-outs and are now equally exempt from the delivery-confirm queue.
-  Pure helper + unit tests pin the invariant. Also removes the only
-  realistic source of unbounded queue growth (never-acking entries).
+- **Don't track steering/interrupt deliveries (#2092).** v0.14.40 tracked
+  **every** delivered inbound for an `enqueue` ack — including `/steer` and
+  `!`-interrupt messages. Those are delivered mid-turn to *amend the running
+  turn* and never emit a fresh `enqueue`, so they were never acked and the 5s
+  sweep re-delivered them forever (duplicate turns / a re-delivery loop).
+  `shouldTrackDelivery` now gates tracking to non-steering, non-interrupt
+  inbounds — exactly the messages the #1556 buffer-gate holds-then-delivers,
+  which are the ones that produce an `enqueue` to ack against. Also removes
+  the only realistic source of unbounded queue growth. An adversarial
+  stress-test caught this before it bit in anger (the canary's steer test had
+  passed only by ack-timing luck).
+
+- **Six further queue-correctness fixes (#2093).** An 8-lens adversarial audit
+  (each finding independently verified) found the re-delivery sweep was *more*
+  failure-prone than the drop it replaced for several reachable states. Fixed:
+    1. **Mid-turn re-delivery** re-creating the very wedge the queue prevents —
+       the sweep now re-delivers only when claude is genuinely idle
+       (`currentTurn == null`, the enqueue-confirmed signal; *not*
+       `claudeBusyKeys`, which is set eagerly at delivery and stays set through
+       a strand) and not during a pending permission / ask_user prompt.
+    2. **Cross-source ACK collision (silent drop)** — `enqueue` fires for every
+       turn start (cron / subagent-handback / vault-resume / restart-marker), so
+       a key-only ack let a synthetic turn clear — and drop — a real user
+       message waiting under the same key. The ack now matches the tracked
+       message id.
+    3. **Empty-body re-delivery loop** — an empty `/queue` body never enqueues,
+       so tracking it re-delivered every cycle forever (a self-inflicted DoS);
+       now carved out, along with synthetic (`meta.source`) inbounds.
+    4. **Negative / NaN env timeout** → infinite re-delivery; the timeout
+       override is clamped to a positive, finite value.
+    5. **Orphaned replay of steer/interrupt** — one that failed delivery while
+       the bridge was offline was persisted to the durable spool and replayed as
+       a fresh orphaned turn after restart; now carved out.
+    6. **Re-delivery ack-race** — a successful re-send now re-marks busy and
+       re-affirms tracking, so only `enqueue` ever clears tracking.
+  Lower-reachability / structurally-separate follow-ups (turn_end gate-wedge
+  backstop, drain-path tracking centralization, reaction-flush gate, bridge
+  dedup) are tracked in #2094.
+
+- **Test + docs (#2091, #2087).** Wired the no-drop rapid-fire UAT into
+  `ci-uat` and fixed a flaky `/steer` narration assertion; added
+  `reference/access-model.md` (single-tenant security contract).
+
+## v0.14.40 — Reliable inbound delivery: deliver-until-acked (#2089)
 
 Telegram inbounds reach claude as an MCP channel notification that the
 unmodified CLI appends to its TUI composer and auto-submits only when the
