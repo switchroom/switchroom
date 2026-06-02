@@ -56,14 +56,16 @@ describe("uat: rapid follow-ups — steering vs queued classification", () => {
             const txt = m.text;
             const mentionsMd5 = /\bmd5\b/i.test(txt);
             // Steer narration: the agent acknowledges amending the in-flight
-            // task. Accept the phrasings the model actually uses — including
-            // "Switched to MD5 per your update/follow-up" (the 2026-06-02
-            // canary reply that the old regex wrongly rejected). Anchored on
-            // "per your <qualifier>" / continuation language so it stays
-            // distinct from the QUEUED path (a fresh answer with no such
-            // course-correction narration).
+            // task. Accept the phrasings the model actually uses — "Switched
+            // to MD5 per your update/follow-up" (2026-06-02 canary) AND
+            // "Switched to MD5 as you asked" (2026-06-03 canary) — i.e. a
+            // "switch(ed) to <algo>" acknowledgement qualified by EITHER
+            // "per your <qualifier>" OR "as (you) asked/requested/...". The
+            // qualifier keeps it distinct from the QUEUED path (a fresh answer
+            // with no such course-correction narration — the queued test uses
+            // its own /queued|new task/ matcher, so broadening here is safe).
             const narratesSteer =
-              /↪️|\bsteer(ing)?\b|switch(?:ed|ing)? to \w+ per your (?:update|follow-?up|guidance|request|steer)|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(
+              /↪️|\bsteer(ing)?\b|switch(?:ed|ing)? to \w+ (?:per your (?:update|follow-?up|guidance|request|steer)|as (?:you )?(?:asked|requested|instructed|wanted|said))|continuing the (prior|original|in-flight) task|amendment|course[- ]correct/i.test(
                 txt,
               );
             return mentionsMd5 && narratesSteer;
