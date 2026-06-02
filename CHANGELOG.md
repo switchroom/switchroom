@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.14.42 — Approval cards reach the operator from supergroup topics (#2096)
+
+A HIGH-RISK approval / permission card (e.g. a Brevo `POST`, or a Drive /
+MS-365 / hostd-config write) that an agent raised from **inside a supergroup
+topic** was undeliverable to the operator — so the request auto-denied after
+its 10-minute TTL and the agent sat at the still-open prompt, **wedged**,
+unable to do anything else (no replies, no topic status reports). Observed
+live on `marko`: a Panorama "Winter Special" Brevo EDM approval looping
+`permission_request send … 400 message thread not found` → `auto-deny
+tool=mcp__brevo__post`.
+
+- **Don't attach a supergroup topic id to a DM approval card.** The "PR4b
+  emitter sweep" routed every approval card's `message_thread_id` from the
+  originating turn's forum topic — but that topic id is valid **only in the
+  agent's supergroup**, while the cards fan out to the operator's `allowFrom`
+  chats, which are normally DMs. A DM `sendMessage` carrying a
+  `message_thread_id` is rejected by Telegram (`400 message thread not
+  found`), so the card never arrived. A new pure `topicForRecipient` guard
+  attaches the resolved topic **only** to the recipient that owns it (the
+  agent's `channels.telegram.chat_id`) and sends operator DMs thread-less.
+  Applied at all five affected emitters (permission, drive, MS-365, config,
+  the no-turn permission re-emit). Fire-and-forget informational broadcasts
+  (boot / compact-watchdog) were intentionally left alone — they swallow a
+  thread-not-found as a benign no-op and have no TTL to auto-deny. Pinned by
+  six focused `topic-router` unit tests.
+
 ## v0.14.41 — Delivery-path hardening: steer-loop fix + 6 audit findings (#2092, #2093)
 
 Two rounds of follow-up hardening to v0.14.40's deliver-until-acked queue —
