@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — Sub-agent attribution stamped at dispatch (#2081, #2083, #2084)
+## v0.14.39 — Sub-agent attribution stamped at dispatch (#2081, #2083, #2084)
 
 Make a sub-agent's parent turn **ground truth captured at dispatch**
 instead of reconstructed after the fact — fixing wrong-topic worker-card
