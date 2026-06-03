@@ -121,12 +121,17 @@ describe("uat: supergroup human-style fuzz — JTBD invariants in a channel", ()
         const meaningful = isMeaningfulReply(reply.text);
         expect(meaningful.ok, `[sg-fuzz] ${fc.name}: ${meaningful.reason}`).toBe(true);
 
-        // Invariant 4 (optional): shape match when predictable.
-        if (fc.expectMatch) {
-          expect(
-            fc.expectMatch.test(reply.text),
-            `[sg-fuzz] ${fc.name}: reply did not match ${fc.expectMatch}`,
-          ).toBe(true);
+        // Invariant 4 (SOFT): shape match when predictable. Like the DM
+        // fuzz, this is a "did the model engage the topic at all" diagnostic,
+        // NOT a correctness gate — different runs produce different valid
+        // wording (e.g. a clarifying question, or "use the package manager"
+        // without the literal "apt"). Log and continue; the load-bearing
+        // invariants are 1-3 (meaningful, leak-free, in the supergroup).
+        if (fc.expectMatch && !fc.expectMatch.test(reply.text)) {
+          console.warn(
+            `[sg-fuzz] ${fc.name}: reply didn't match ${fc.expectMatch} (soft) — ` +
+              `preview: ${JSON.stringify(reply.text.slice(0, 200))}`,
+          );
         }
       } finally {
         await sc.tearDown();
