@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.14.51 — A resumed turn recovers the full original request (#2126)
+
+- **Restart-resume no longer loses the tail of a long request (#2126).** A turn
+  resumed after a restart only saw a truncated preview of what you'd asked: the
+  registry stores the first ~200 characters of the message, and the resume
+  wake-up sliced that again to 160 — so instructions near the end of a long,
+  detailed task were silently dropped, and the agent resumed only the part it
+  could still see. The full message was always on disk (the per-chat history
+  buffer stores it verbatim and survives restarts), the resume just never went
+  back for it. Now the resume wake-up includes the full stored preview and tells
+  the agent to pull its complete original message (and surrounding context) from
+  recent history before continuing — so it picks the *whole* task back up, not a
+  clipped version. No behaviour change for short requests.
+
+- Also lands the permanent restart/resume UAT regression gates (#2125,
+  dev-only test infra).
+
 ## v0.14.50 — Resumed turns get a progress card + survive a not-ready restart (#2122)
 
 When an agent restarts mid-work, the boot-resume wake-up (the synthetic message
