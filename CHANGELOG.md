@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.14.54 — The "what it's doing" status stays as a record (#2132)
+
+- **The live activity/status feed now stays in the chat by default (#2132).**
+  The in-place "what it's doing" message (Reading X, Searching the web for Y,
+  …) used to be **deleted** the moment the final answer landed. On trivial
+  turns that produced a visible post-then-delete flicker, and it threw away a
+  useful "what I just did" trail. It now **stays**: when the answer lands the
+  message is finalized in place — every step marked done (`✓`), no frozen
+  "→ in-progress" arrow — and left beside the reply as a record. No
+  post-then-delete. Opt back into deletion per agent with
+  `channels.telegram.clear_status_on_completion: true`. Config-only change;
+  takes effect on restart.
+
 ## v0.14.53 — Answers post promptly after long tasks (#2130)
 
 - **No more ~30-second blank after a long task (#2130).** Agents sometimes
