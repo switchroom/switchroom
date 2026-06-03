@@ -256,11 +256,14 @@ describe("tool-label-pretool.mjs", () => {
     });
   });
 
-  it("genuinely-suppressed tools (send_typing, sync_retain, exotic mcp__) still emit nothing", () => {
+  it("genuinely-suppressed tools (send_typing, sync_retain) still emit nothing", () => {
+    // NOTE (#2111): an "exotic" mcp__ tool is NO LONGER suppressed — operator
+    // MCP servers (perplexity, webkite, …) now get a generic label so research
+    // turns surface in the live activity feed. Only the surface/control tools
+    // below stay silent.
     const cases: Array<[string, Record<string, unknown>]> = [
       ["mcp__switchroom-telegram__send_typing", {}],
       ["mcp__hindsight__sync_retain", {}],
-      ["mcp__some-other-server__random_tool", { foo: "bar" }],
     ];
     for (const [tool, input] of cases) {
       const r = run(
@@ -272,6 +275,28 @@ describe("tool-label-pretool.mjs", () => {
     }
     const files = readdirSync(stateDir).filter((f) => f.startsWith("tool-labels-"));
     expect(files).toHaveLength(0);
+  });
+
+  it("operator MCP tools now emit a generic label (#2111 — research visibility)", () => {
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ["mcp__perplexity__perplexity_search", { query: "hobart forecast" }, "Searching the web for hobart forecast"],
+      ["mcp__webkite__webkite_read", { url: "https://bom.gov.au/tas" }, "Reading bom.gov.au/tas"],
+      ["mcp__gdrive__search", {}, "Looking through your files"],
+      ["mcp__acme__fetch_invoices", {}, "Using fetch invoices"],
+    ];
+    cases.forEach(([tool, input, expected], idx) => {
+      // Unique session per case so the per-session sidecar file isn't
+      // shared/accumulated across iterations (same idiom as the test above).
+      const sess = `sess-mcp-${idx}`;
+      const r = run(
+        { session_id: sess, tool_use_id: `t-${tool}-${idx}`, tool_name: tool, tool_input: input },
+        stateDir,
+        sess,
+      );
+      expect(r.status).toBe(0);
+      expect(r.sidecarLines, `${tool} should emit a sidecar label`).toHaveLength(1);
+      expect(r.sidecarLines[0].label).toBe(expected);
+    });
   });
 
   it("missing TELEGRAM_STATE_DIR → silent skip, exit 0", () => {
