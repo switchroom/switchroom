@@ -30,8 +30,8 @@ afterEach(() => {
 
 describe('bootCardChatKey', () => {
   it('keys a DM (no topic) distinctly from a supergroup topic', () => {
-    expect(bootCardChatKey('8248703757', undefined)).toBe('8248703757:')
-    expect(bootCardChatKey('-1003831053471', 4)).toBe('-1003831053471:4')
+    expect(bootCardChatKey('12345', undefined)).toBe('12345:')
+    expect(bootCardChatKey('-1001234567890', 4)).toBe('-1001234567890:4')
     // Different topics in the same supergroup are distinct cards.
     expect(bootCardChatKey('-100', 3)).not.toBe(bootCardChatKey('-100', 4))
   })
