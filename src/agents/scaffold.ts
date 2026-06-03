@@ -1357,6 +1357,12 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.edit_budget_threshold !== undefined) {
     out.SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD = String(tg.edit_budget_threshold);
   }
+  // Whether to DELETE the activity/status feed when the final answer lands.
+  // Default (unset) = keep it as a record; only emit the env when explicitly
+  // set so the gateway's default-off parse owns the unset case.
+  if (tg.clear_status_on_completion !== undefined) {
+    out.SWITCHROOM_TG_CLEAR_STATUS_ON_COMPLETION = tg.clear_status_on_completion ? "1" : "0";
+  }
   return out;
 }
 

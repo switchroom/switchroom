@@ -494,6 +494,17 @@ export const TelegramChannelSchema = z
         "message transport (groups/forums). Override per-agent if a " +
         "particular agent needs snappier or quieter streaming."
       ),
+    clear_status_on_completion: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, the live activity/status feed (the in-place 'what it's " +
+        "doing' message — Reading X, Searching the web for Y, …) is DELETED " +
+        "when the turn's final answer lands, so only the reply remains. " +
+        "Default false: the status message is left in the chat as a record " +
+        "(its last step marked done) — no post-then-delete. Per-agent " +
+        "override; cascades defaults → profile → agent (per-key)."
+      ),
     hotReloadStable: z
       .boolean()
       .optional()
