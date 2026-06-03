@@ -7,6 +7,7 @@ import {
   noteToolEnd,
   noteToolLabel,
   endTurn,
+  silenceMsForKey,
   silencePokeEnabled,
   formatFrameworkFallbackText,
   __tickForTests,
@@ -358,6 +359,21 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     }
     __tickForTests(305_000)
     expect(fx.fallbacks).toHaveLength(1)
+  })
+
+  it('silenceMsForKey reports silence from last outbound (or turn start), null when unknown', () => {
+    setupDeps()
+    startTurn('k', 1_000)
+    // No outbound yet → silence measured from turnStartedAt.
+    expect(silenceMsForKey('k', 1_000 + 120_000)).toBe(120_000)
+    noteOutbound('k', 1_000 + 50_000)
+    // After an outbound → silence measured from lastOutboundAt.
+    expect(silenceMsForKey('k', 1_000 + 120_000)).toBe(70_000)
+    // Unknown key / ended turn → null (used by the sibling purge to treat a
+    // dangling key as stale).
+    expect(silenceMsForKey('never-started', 999_999)).toBeNull()
+    endTurn('k')
+    expect(silenceMsForKey('k', 999_999)).toBeNull()
   })
 
   it('Task tool populates inFlightTools so the fallback names it as the observable', () => {

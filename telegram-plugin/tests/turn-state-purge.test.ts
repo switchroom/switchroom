@@ -106,4 +106,32 @@ describe('purgeStaleTurnsForChat', () => {
     expect(r.purged.sort()).toEqual(['123:7', '123:_'])
     expect([...map.keys()]).toEqual(['999:_']) // multi-chat safety preserved
   })
+
+  // #2 supergroup sibling-topic fix: one agent owns the supergroup, so all
+  // forum topics share the chatId. A 300s poke on topic A must NOT purge a
+  // LIVE sibling topic B's turn state — only siblings that are themselves stale.
+  it('isStale predicate spares live sibling topics (the supergroup fix)', () => {
+    const purged: string[] = []
+    const live = new Set(['-100:7']) // topic 7 is actively mid-turn
+    const r = purgeStaleTurnsForChat(
+      '-100',
+      ['-100:4', '-100:7', '999:_'],
+      (k) => purged.push(k),
+      (k) => !live.has(k), // stale iff not live
+    )
+    expect(r.purged).toEqual(['-100:4']) // only the stale topic purged
+    expect(purged).toEqual(['-100:4']) // live topic 7 + other chat untouched
+  })
+
+  it('isStale=false for every sibling purges nothing (all topics live)', () => {
+    const purged: string[] = []
+    purgeStaleTurnsForChat('-100', ['-100:4', '-100:7'], (k) => purged.push(k), () => false)
+    expect(purged).toEqual([])
+  })
+
+  it('default isStale (omitted) purges every chatId match — back-compat', () => {
+    const purged: string[] = []
+    const r = purgeStaleTurnsForChat('123', ['123:_', '123:7', '999:_'], (k) => purged.push(k))
+    expect(r.purged.sort()).toEqual(['123:7', '123:_'])
+  })
 })

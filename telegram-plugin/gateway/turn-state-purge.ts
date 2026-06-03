@@ -50,6 +50,19 @@ export function purgeStaleTurnsForChat(
   chatId: string,
   keys: Iterable<string>,
   purger: (key: string) => void,
+  /**
+   * Per-sibling staleness gate. A sibling key for `chatId` is purged only when
+   * this returns true. CRITICAL for one-agent-owns-supergroup: all of an
+   * agent's forum topics share the SAME chatId, so a chatId-only match would
+   * purge a LIVE sibling topic's reaction controller + typing loop when ANOTHER
+   * topic's 300s silence-poke fires (the gymbro/klanker wedge class). The
+   * caller passes a predicate true only for siblings themselves silent ≥ the
+   * fallback threshold (their own poke would also fire) — preserving the #1556
+   * dangling-key cleanup while sparing live siblings. Defaults to always-stale
+   * for back-compat (DM / single-topic callers, where every sibling is
+   * genuinely dangling).
+   */
+  isStale: (key: string) => boolean = () => true,
 ): PurgeStaleTurnsResult {
   if (!chatId) return { purged: [] }
   const purged: string[] = []
@@ -64,6 +77,7 @@ export function purgeStaleTurnsForChat(
     if (sep < 0) continue // malformed / non-statusKey shape — skip
     const keyChat = key.slice(0, sep)
     if (keyChat !== chatId) continue
+    if (!isStale(key)) continue // live sibling topic — leave its turn state intact
     purger(key)
     purged.push(key)
   }
