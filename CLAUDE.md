@@ -755,6 +755,55 @@ lifecycle changes):
 - `jtbd-memory-survives-restart-dm` — memory persistence across restart.
 - Any feature-specific scenario.
 
+**Supergroup / channel UAT (status-routing work — required).** Every
+status surface (background worker feed, sub-agent handback/progress,
+foreground sub-agent nesting, fuzzy replies) MUST be proven in BOTH a DM
+AND a forum supergroup — historically the whole suite was DM-only, which
+hid every channel-routing bug (handback landing in the wrong topic, etc.,
+the v0.14.43 fixes). Channel scenarios are named `jtbd-<job>-channel` /
+`fuzz-<job>-channel` and live beside their `-dm` twins. They **self-skip
+green** when `SWITCHROOM_UAT_CHAT_ID` is unset or the chat isn't a
+postable forum supergroup, so they never red an unwired host (uat/** is
+excluded from gating CI anyway). To run them live:
+
+1. **The test group MUST be a forum supergroup with Topics enabled —
+   NOT a basic group.** A basic group (`inputPeerChat`) has no forum
+   topics, so topic-routing can't be exercised; its Bot-API id is
+   `-<id>` (no `-100`). Telegram → group → Settings → enable **Topics**
+   migrates a basic group to a supergroup and mints a NEW `-100…` id.
+   (Symptom of a basic group: mtcute resolves it as `inputPeerChat` and
+   `resolvePeer(-100…)` throws "Peer not found".)
+2. **Capture the real chat_id from the bot side, not by eyeballing.**
+   The test bot (`TELEGRAM_TEST_BOT_USERNAME`, == test-harness's bot)
+   must be a group member/admin AND the driver account a member. Post
+   any message in the group, then read test-harness's gateway log:
+   `inbound dropped reason=group_unknown chat_id=-100… chat_type=supergroup`
+   — that `-100…` is the id (the bot logs unknown-group inbounds even
+   before the group is wired). `docker exec switchroom-test-harness sh -lc
+   'grep group_unknown /var/log/switchroom/gateway-supervisor.log | tail'`.
+3. **Wire test-harness supergroup-owned** (mirrors marko): under its
+   `channels.telegram` in `~/.switchroom/switchroom.yaml` add
+   `chat_id: "-100…"` + `default_topic_id: 1`, then `switchroom apply`
+   and `agent restart test-harness --wait --force`. It still serves DMs.
+4. Set `SWITCHROOM_UAT_CHAT_ID=-100…` in the repo-root `.env`
+   (`load-env.ts` loads it; the scenarios read it).
+5. Run: `bun run --cwd telegram-plugin test:uat supergroup` (+ the
+   `*-channel` names). Each asserts `chatId === supergroup` — the
+   parity proof that status lands in the channel, not the DM.
+
+**mtcute caveat (load-bearing):** this repo's mtcute has **no
+forum-topic create/enumerate API**, so channel scenarios use the
+supergroup's **General topic** — they prove DM-vs-channel routing but
+NOT "correct topic among many." That finer routing is pinned by the
+gateway **unit thread-assertions** (e.g. the handback/progress builder
+tests). The driver runs on `MemoryStorage` (empty peer cache each
+connect), so a username-less supergroup marked-id isn't resolvable until
+`driver.primeDialogs()` runs; use `driver.canResolve(chatId)` to
+skip-guard. mtcute also CANNOT observe drafts or reactions — the
+activity/worker feeds are real `sendMessage`/`editMessageText` (observable),
+but draft-transport and reaction surfaces must be checked via the gateway
+log, not mtcute.
+
 **Canary discipline.** Always: (1) pin **test-harness** to the new
 version (`switchroom update --pin vX.Y.Z` — note: fleet-wide today,
 so accept the bounce or use a feature flag to keep new code dormant);
