@@ -179,4 +179,23 @@ describe('selectResumeBuilder', () => {
       expect(selectResumeBuilder(endedVia)).toBe(expected)
     })
   }
+
+  // 3h staleness failsafe (operator spec, 2026-06-03).
+  const MAX = 10_800_000 // 3h
+  it('downgrades a fresh resume to report when older than maxAgeMs (no auto-resume of stale work)', () => {
+    expect(selectResumeBuilder('restart', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe('report')
+    expect(selectResumeBuilder(null, { ageMs: MAX + 60_000, maxAgeMs: MAX })).toBe('report')
+  })
+  it('keeps resume when within maxAgeMs', () => {
+    expect(selectResumeBuilder('restart', { ageMs: MAX - 1, maxAgeMs: MAX })).toBe('resume')
+    expect(selectResumeBuilder('sigterm', { ageMs: 1000, maxAgeMs: MAX })).toBe('resume')
+  })
+  it('age cap never UPGRADES — report/null stay as-is regardless of age', () => {
+    expect(selectResumeBuilder('timeout', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe('report')
+    expect(selectResumeBuilder('stop', { ageMs: MAX + 1, maxAgeMs: MAX })).toBe(null)
+  })
+  it('legacy behaviour preserved when age/maxAge omitted (blanket resume)', () => {
+    expect(selectResumeBuilder('restart')).toBe('resume')
+    expect(selectResumeBuilder('restart', { ageMs: MAX + 1 })).toBe('resume') // needs BOTH to cap
+  })
 })

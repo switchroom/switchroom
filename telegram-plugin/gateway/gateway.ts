@@ -1064,7 +1064,19 @@ try {
   const pending = findLatestTurnIfInterrupted(turnsDb)
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
   if (pending != null && selfAgent) {
-    const kind = selectResumeBuilder(pending.ended_via)
+    // 3h staleness failsafe (operator spec, 2026-06-03): never AUTO-resume
+    // interrupted work older than RESUME_MAX_AGE_MS — selectResumeBuilder
+    // downgrades a stale 'resume' to the passive 'report' so the user is told
+    // ("I was working on X ~Nh ago") but nothing replays unprompted. Env
+    // override SWITCHROOM_RESUME_MAX_AGE_MS (ms); set very high to disable.
+    const RESUME_MAX_AGE_MS = (() => {
+      const v = Number(process.env.SWITCHROOM_RESUME_MAX_AGE_MS)
+      return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h
+    })()
+    const kind = selectResumeBuilder(pending.ended_via, {
+      ageMs: Math.max(0, Date.now() - pending.started_at),
+      maxAgeMs: RESUME_MAX_AGE_MS,
+    })
     if (kind === 'resume') {
       bootResumeInbound = { agent: selfAgent, msg: buildResumeInterruptedInbound({ turn: pending }) }
     } else if (kind === 'report') {
@@ -1801,6 +1813,7 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
           return d
         },
         inboundSpool,
+        trackRedeliveredInbound,
       )
       if (fr.redelivered > 0) {
         process.stderr.write(
@@ -1896,6 +1909,7 @@ function releaseTurnBufferGate(key: string): void {
           return d
         },
         inboundSpool,
+        trackRedeliveredInbound,
       )
       if (fr.redelivered > 0) {
         process.stderr.write(
@@ -4110,6 +4124,7 @@ silencePoke.startTimer({
         return d
       },
       inboundSpool,
+      trackRedeliveredInbound,
     )
     process.stderr.write(
       `telegram gateway: silence-poke framework-fallback ended wedged turn ` +
@@ -4138,6 +4153,45 @@ const _deliveryMachineTick = setInterval(() => {
   shadowEmit({ kind: 'tick', now: Date.now() })
 }, DELIVERY_MACHINE_TICK_MS)
 _deliveryMachineTick.unref?.()
+
+// Enrol a buffer-redelivered inbound in the deliver-until-acked queue so the
+// existing sweep re-delivers it until claude's `enqueue` ack lands. Wired into
+// EVERY redelivery path (bridgeUp drain, silence-poke fallback, flap/reply-gate
+// flushes) — `send` returning true only means the bytes reached the bridge, NOT
+// that claude consumed them. Right after a restart (esp. a slow MCP boot) the
+// inject can hit a not-ready session and be silently dropped, and nothing
+// retried it: the clerk 2026-06-03 lost-message incident. Mirrors the
+// live-delivery tracking at the handleInbound site (chatKey + messageId), so
+// DMs and supergroup forum topics are handled identically. Only real user
+// inbounds are tracked — shouldTrackDelivery excludes steer/interrupt/
+// synthetic-source/empty, which never produce an `enqueue` and would otherwise
+// re-deliver forever.
+function trackRedeliveredInbound(merged: InboundMessage): void {
+  if (!DELIVERY_CONFIRM_ENABLED) return
+  if (
+    !shouldTrackDelivery({
+      isSteering: false,
+      isInterrupt: false,
+      // Synthetic inbounds (cron / vault / handback / resume) carry a source
+      // and are NOT tracked here — they enqueue under their own semantics, and
+      // (for the resume synthetics) tracking them safely first needs the
+      // resume builder to emit meta.message_id so the deliver-until-acked ack
+      // matches its enqueue. Tracked separately as a follow-up (see PR notes).
+      hasSource: merged.meta?.source != null,
+      effectiveText: merged.text,
+    })
+  ) {
+    return
+  }
+  const key = chatKey(merged.chatId, merged.threadId != null ? Number(merged.threadId) : null)
+  trackDelivery(
+    deliveryQueue,
+    key,
+    merged,
+    Date.now(),
+    merged.messageId != null ? String(merged.messageId) : null,
+  )
+}
 
 // Re-deliver stranded inbounds until claude acks (the marko drop-wedge).
 // Every few seconds, re-send any inbound that was handed to claude but never
@@ -4376,6 +4430,11 @@ const ipcServer: IpcServer = createIpcServer({
           inboundSpool: inboundSpool ?? null,
           pendingPermissionBuffer,
           client,
+          // Enrol each drained user inbound in the deliver-until-acked queue
+          // so the 5s sweep re-delivers until claude's `enqueue` ack lands —
+          // a socket-write into a still-booting session is NOT consumption
+          // (clerk lost-message incident, 2026-06-03).
+          onUserInboundDelivered: trackRedeliveredInbound,
         })
       } else {
         // Kill-switch fallback: imperative drain (parity with pre-cutover

@@ -220,6 +220,33 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
     expect(calls).toBe(0)
   })
 
+  // onDelivered: the deliver-until-acked enrol hook (clerk lost-message
+  // incident 2026-06-03). A socket-write "success" is not proof claude
+  // consumed it; the caller uses onDelivered to enrol the redelivered inbound
+  // in the deliver-until-acked queue so the sweep re-delivers until `enqueue`.
+  it('calls onDelivered for each CONFIRMED-delivered group (per merged identity)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    buf.push('klanker', inbound('cron', 2)) // source-tagged → its own group
+    const delivered: number[] = []
+    const r = redeliverBufferedInbound(buf, 'klanker', () => true, undefined, (merged) => {
+      delivered.push(merged.messageId as number)
+    })
+    expect(r.redelivered).toBe(2)
+    expect(delivered).toEqual([1, 2]) // fired once per group, carrying the merged identity
+  })
+
+  it('does NOT call onDelivered for a group that failed to send (re-buffered, not enrolled)', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} })
+    buf.push('klanker', inbound('user', 1))
+    const delivered: number[] = []
+    const r = redeliverBufferedInbound(buf, 'klanker', () => false, undefined, (m) =>
+      delivered.push(m.messageId as number),
+    )
+    expect(r.rebuffered).toBe(1)
+    expect(delivered).toEqual([]) // never enrolled — buffer/spool still own it
+  })
+
   it('only touches the named agent', () => {
     const buf = createPendingInboundBuffer({ log: () => {} })
     buf.push('klanker', inbound('user', 1))

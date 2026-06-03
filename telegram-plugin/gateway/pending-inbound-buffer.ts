@@ -87,6 +87,14 @@ export function redeliverBufferedInbound(
   agent: string,
   send: (msg: InboundMessage) => boolean,
   spool?: InboundSpool,
+  // Called once per merged group on CONFIRMED delivery (after spool.ack).
+  // The caller uses it to enrol the redelivered inbound in the
+  // deliver-until-acked queue (`trackDelivery`) so it is re-sent until
+  // claude's `enqueue` ack lands — closing the restart boot-race where a
+  // socket-write "succeeds" into a not-ready session and the message is
+  // silently dropped (clerk 2026-06-03). `send` returning true only means
+  // the bytes reached the bridge, NOT that claude consumed them.
+  onDelivered?: (merged: InboundMessage, originals: InboundMessage[]) => void,
 ): { drained: number; redelivered: number; rebuffered: number } {
   const pending = buffer.drain(agent)
   let redelivered = 0
@@ -110,6 +118,10 @@ export function redeliverBufferedInbound(
       // originals are, so we ack by original identity.
       for (const o of originals) spool?.ack(o)
       redelivered += originals.length
+      // Enrol in the deliver-until-acked queue (caller's hook). A bare
+      // socket-write success is NOT proof claude consumed it; the queue's
+      // sweep re-delivers until the `enqueue` ack lands.
+      onDelivered?.(merged, originals)
     } else {
       // Re-buffer the originals (not the merged synthetic) so the spool
       // identity is preserved and the next drain re-merges them losslessly.
