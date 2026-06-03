@@ -19,9 +19,20 @@
 
 import { basename } from "node:path";
 import { prettyMcpServer, type ScopeOption } from "./permission-rule.js";
+import { redact } from "./secret-detect/redact.js";
 
 const COMMAND_TITLE_MAX = 48;
 const DESCRIPTION_LINE_MAX = 240;
+
+/** HTTP methods the generic REST-wrapper MCP tools (brevo/meta/postiz/… via
+ *  rest-server.mjs) expose as verbs — uppercased on the card so the operator
+ *  reads "POST /smtp/email" as an API write, not "post". */
+const HTTP_VERBS = new Set(["get", "post", "put", "patch", "delete", "head"]);
+/** Keys that, on a REST-style MCP input, name the resource/endpoint. */
+const RESOURCE_KEYS = ["path", "endpoint", "url", "resource", "route"];
+const ARG_SUMMARY_MAX_KEYS = 4; // how many payload keys to surface on the card
+const ARG_VALUE_MAX = 40; // per-value truncation in the arg-summary line
+const ARG_SUMMARY_LINE_MAX = 180; // total cap for the arg-summary line
 
 /**
  * Human verb-phrases for switchroom-managed MCP tools. The raw
@@ -104,6 +115,14 @@ export function formatPermissionCardBody(opts: {
       : `why: <i>not provided</i>`,
   );
 
+  // Third line (REST-wrapper MCP writes only): a redaction-safe summary of
+  // the payload so the operator can see WHAT is being sent, not just the
+  // endpoint — e.g. "↳ to: lisa@…, subject: Priority access…".
+  const argSummary = mcpArgSummary(opts.toolName, opts.inputPreview);
+  if (argSummary) {
+    lines.push(`↳ <i>${escapeTgHtml(argSummary)}</i>`);
+  }
+
   return lines.join("\n");
 }
 
@@ -171,7 +190,6 @@ function naturalMcpAction(
   toolName: string,
   input: Record<string, unknown> | null,
 ): string {
-  void input;
   const parts = toolName.split("__");
   const server = parts.length >= 2 ? parts[1]! : "";
   const curated = MCP_TOOL_DESCRIPTIONS[toolName];
@@ -183,11 +201,86 @@ function naturalMcpAction(
   }
   if (parts.length >= 3) {
     const verb = parts.slice(2).join("__").replace(/_/g, " ");
+    // External REST-wrapper tools (brevo/meta/postiz/…) take a `path`. Name
+    // the endpoint so "post (Brevo)" becomes "POST /smtp/email (Brevo)" —
+    // the operator can see WHICH resource is being written, not just that
+    // *something* is. Internal servers + tools without a resource key keep
+    // the plain verb phrasing.
+    if (!INTERNAL_MCP_SERVERS.has(server)) {
+      const resourcePhrase = restResourcePhrase(server, verb, input);
+      if (resourcePhrase) return resourcePhrase;
+    }
     return INTERNAL_MCP_SERVERS.has(server)
       ? verb
       : `${verb} (${prettyMcpServer(server)})`;
   }
   return `use ${toolName}`;
+}
+
+/**
+ * For a REST-wrapper MCP call ({ path, body?, query? }), build the action
+ * phrase "<VERB> <path> (<Server>)" — e.g. "POST /smtp/email (Brevo)". The
+ * path is redaction-passed + length-capped before display. Returns null
+ * when the input carries no recognizable resource key (caller falls back to
+ * the plain verb phrasing).
+ */
+function restResourcePhrase(
+  server: string,
+  verb: string,
+  input: Record<string, unknown> | null,
+): string | null {
+  if (!input) return null;
+  let path: string | null = null;
+  for (const key of RESOURCE_KEYS) {
+    path = readString(input, key);
+    if (path) break;
+  }
+  if (!path) return null;
+  const v = HTTP_VERBS.has(verb.toLowerCase()) ? verb.toUpperCase() : verb;
+  const shownPath = truncate(redact(path), COMMAND_TITLE_MAX);
+  return `${v} ${shownPath} (${prettyMcpServer(server)})`;
+}
+
+/**
+ * A compact, redaction-safe one-line summary of a REST-wrapper MCP call's
+ * payload ({ body } for writes, { query } for reads) — the third card line.
+ * Shows up to {@link ARG_SUMMARY_MAX_KEYS} payload keys with short, masked
+ * scalar values ("to: lisa@…, subject: Priority access…"); nested
+ * objects/arrays surface as the bare key name (no value dump — avoids
+ * leaking PII/secrets and oversized blobs). Every value passes through
+ * `redact()` so an API key in the payload is masked, never surfaced.
+ * Returns null when there's nothing meaningful to show.
+ */
+function mcpArgSummary(
+  toolName: string,
+  inputPreview: string | undefined,
+): string | null {
+  if (!toolName.startsWith("mcp__")) return null;
+  const input = parseInput(inputPreview);
+  if (!input) return null;
+  const payload = input.body ?? input.query;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(payload as Record<string, unknown>)) {
+    if (parts.length >= ARG_SUMMARY_MAX_KEYS) {
+      parts.push("…");
+      break;
+    }
+    if (value == null) continue;
+    if (typeof value === "object") {
+      parts.push(key); // nested object/array → key name only, never dumped
+      continue;
+    }
+    const shown = truncate(redact(String(value)), ARG_VALUE_MAX);
+    parts.push(`${key}: ${shown}`);
+  }
+  if (parts.length === 0) return null;
+  const joined = parts.join(", ");
+  return joined.length > ARG_SUMMARY_LINE_MAX
+    ? joined.slice(0, ARG_SUMMARY_LINE_MAX - 1) + "…"
+    : joined;
 }
 
 /**

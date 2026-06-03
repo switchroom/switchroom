@@ -87,6 +87,35 @@ describe('naturalAction — MCP tools', () => {
       'list files (Google Workspace)',
     )
   })
+
+  // Clarity fix: REST-wrapper MCP tools (brevo/meta/postiz via rest-server.mjs)
+  // take a `path` — surface it so "post (Brevo)" becomes "POST /smtp/email
+  // (Brevo)" and the operator can see WHICH endpoint is being written.
+  test('REST-wrapper write names the endpoint with an uppercased HTTP verb', () => {
+    expect(
+      naturalAction('mcp__brevo__post', JSON.stringify({ path: '/smtp/email', body: { to: 'x' } })),
+    ).toBe('POST /smtp/email (Brevo)')
+    expect(
+      naturalAction('mcp__brevo__put', JSON.stringify({ path: '/contacts/123', body: {} })),
+    ).toBe('PUT /contacts/123 (Brevo)')
+  })
+
+  test('REST-wrapper read surfaces the path too', () => {
+    expect(
+      naturalAction('mcp__brevo__get', JSON.stringify({ path: '/contacts', query: { limit: 10 } })),
+    ).toBe('GET /contacts (Brevo)')
+  })
+
+  test('falls back to the plain verb phrase when there is no resource key', () => {
+    // No path → today's behavior, unchanged (defensive for unknown shapes).
+    expect(naturalAction('mcp__brevo__post', undefined)).toBe('post (Brevo)')
+    expect(naturalAction('mcp__brevo__post', JSON.stringify({ foo: 1 }))).toBe('post (Brevo)')
+  })
+
+  test('internal REST-ish tool is NOT endpoint-enriched (stays a bare verb)', () => {
+    // hostd is internal → no "(Server)" tag, no path enrichment.
+    expect(naturalAction('mcp__hostd__do_thing', JSON.stringify({ path: '/x' }))).toBe('do thing')
+  })
 })
 
 describe('formatPermissionCardBody', () => {
@@ -155,6 +184,56 @@ describe('formatPermissionCardBody', () => {
       agentName: 'clerk',
     })
     expect(body).toContain('why: <i>first second paragraph</i>')
+  })
+
+  // Clarity fix: the card gains a third "↳" line summarizing the REST
+  // payload so the operator can see WHAT is being written, not just the
+  // endpoint. Values are redaction-passed + truncated; nested objects show
+  // as a bare key name.
+  test('REST write card: endpoint in the title + a payload summary line', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__brevo__post',
+      inputPreview: JSON.stringify({
+        path: '/smtp/email',
+        body: { subject: 'Priority access', templateId: 12, to: [{ email: 'lisa@example.com' }] },
+      }),
+      description: 'HIGH RISK: write to the brevo API (POST).',
+      agentName: 'marko',
+    })
+    const lines = body.split('\n')
+    expect(lines[0]).toBe('🔐 <b>Marko</b> wants to POST /smtp/email (Brevo)')
+    expect(lines[1]).toBe('why: <i>HIGH RISK: write to the brevo API (POST).</i>')
+    // Third line: scalar keys show value; the nested `to` array shows key-only.
+    expect(lines[2]).toContain('↳')
+    expect(lines[2]).toContain('subject: Priority access')
+    expect(lines[2]).toContain('templateId: 12')
+    expect(lines[2]).toContain('to') // key-only, not the email object dumped
+    expect(lines[2]).not.toContain('lisa@example.com')
+  })
+
+  test('no payload → no third line (DM / non-REST cards unchanged)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Edit',
+      inputPreview: JSON.stringify({ file_path: '/a/b.md' }),
+      description: 'edit it',
+      agentName: 'clerk',
+    })
+    expect(body.split('\n')).toHaveLength(2)
+    expect(body).not.toContain('↳')
+  })
+
+  test('redaction is load-bearing: a token in the payload is masked, never shown', () => {
+    // Build the fake token at runtime so the source file never holds a
+    // contiguous token literal (repo push-protection rule).
+    const fakeToken = 'sk-ant-' + 'api03-' + 'A'.repeat(48)
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__brevo__post',
+      inputPreview: JSON.stringify({ path: '/contacts', body: { apiKey: fakeToken, name: 'Lisa' } }),
+      description: 'create a contact',
+      agentName: 'marko',
+    })
+    expect(body).not.toContain(fakeToken)
+    expect(body).toContain('name: Lisa') // benign value still surfaces
   })
 })
 
