@@ -4445,6 +4445,10 @@ const ipcServer: IpcServer = createIpcServer({
           try {
             client.send(msg)
             inboundSpool?.ack(msg)
+            // Same enrol as the cutover drain path: a socket-write success is
+            // not proof claude consumed it — enrol so the sweep re-delivers
+            // until `enqueue` (clerk lost-message incident, 2026-06-03).
+            trackRedeliveredInbound(msg)
           } catch (err) {
             process.stderr.write(
               `telegram gateway: pending-inbound drain failed agent=${client.agentName} ` +
@@ -5362,6 +5366,7 @@ if (!STATIC) {
         return d
       },
       inboundSpool,
+      trackRedeliveredInbound,
     )
     if (r != null && r.redelivered > 0) {
       process.stderr.write(

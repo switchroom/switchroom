@@ -270,11 +270,15 @@ export function idleDrainTick(
   isBridgeAlive: () => boolean,
   send: (msg: InboundMessage) => boolean,
   spool?: InboundSpool,
+  // Forwarded to redeliverBufferedInbound so the post-flap-settle drain also
+  // enrols redelivered inbounds in the deliver-until-acked queue (parity with
+  // the bridgeUp drain — clerk lost-message incident, 2026-06-03).
+  onDelivered?: (merged: InboundMessage, originals: InboundMessage[]) => void,
 ): { drained: number; redelivered: number; rebuffered: number } | null {
   if (!agent) return null
   if (buffer.depth(agent) === 0) return null
   if (!isBridgeAlive()) return null
-  return redeliverBufferedInbound(buffer, agent, send, spool)
+  return redeliverBufferedInbound(buffer, agent, send, spool, onDelivered)
 }
 
 export function createPendingInboundBuffer(
