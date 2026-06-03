@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.14.46 — Supergroup credential-resume routing + setup discoverability (#2114, #2115)
+
+Two supergroup-mode follow-ups from a DM-hardcoding audit: credential
+approvals now resume in the topic you were working in, and supergroup mode
+is discoverable at setup time instead of hand-edit-only.
+
+- **Vault grant / save / secret outcomes route back to the work topic
+  (#2114).** When an agent fired `vault_request_access`,
+  `vault_request_save`, or `request_secret` from inside a forum topic, the
+  synthetic wake-up inbound the gateway injects after you tap
+  Approve / Save / Provide carried no thread — so the resumed turn's reply
+  landed in **General** instead of the topic the work lives in. All eight
+  outcome inbounds (`vault_grant_approved/denied`,
+  `vault_save_completed/failed/discarded`,
+  `secret_provided/provide_failed/declined`) now carry the originating
+  topic both top-level (`threadId`, for the per-topic delivery keying) and
+  in `meta.message_thread_id` (which session-tail re-extracts to route the
+  reply) — the same two-carrier pattern cron inbounds use. Purely additive:
+  DM / non-topic requests are unchanged.
+
+- **Supergroup mode is discoverable at setup (#2115).** Supergroup mode
+  (one agent owns a Telegram forum supergroup, routing its work into
+  per-topic threads) was real but hand-edit-only — no wizard step, an aside
+  in `scheduling.md`, no example block. Now `switchroom setup` offers an
+  **optional, skip-by-default** "Supergroup mode" step that writes
+  `channels.telegram.chat_id` for you (the schema smart-defaults the rest);
+  `examples/switchroom.yaml` carries a commented per-agent block; and a new
+  `docs/supergroup-mode.md` guide (linked from the docs index) covers
+  finding your chat_id + topic ids, the config, and the gotchas. The
+  zero-config DM path is untouched.
+
 ## v0.14.45 — Operator MCP tools surface in the live activity feed (#2111)
 
 A turn driven by operator-configured MCP tools (perplexity, webkite, …) —
