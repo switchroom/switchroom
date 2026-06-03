@@ -2241,6 +2241,47 @@ function resumeReactionAfterVerdict(): void {
 }
 
 /**
+ * The recipient set for a permission card (the initial Approve/Deny card
+ * AND the post-verdict resume message — they MUST route identically, so
+ * both go through this one helper).
+ *
+ * Turn-initiated (the normal case — a permission gate fires mid-tool-use
+ * with an active turn): send to the ORIGINATING chat+thread. For a
+ * supergroup-owned agent working in a forum topic that is the supergroup +
+ * the topic, so the card lands IN the topic the operator asked from (e.g.
+ * marko's "CRM (Brevo)" topic) — not the operator's DM. For a DM agent the
+ * originating chat IS the operator's DM (thread-less), unchanged.
+ *
+ * No active turn (cron / background / a swept turn at TTL): fall back to the
+ * configured operator DMs (`allowFrom`), thread-stripped via
+ * `topicForRecipient` so a DM never gets a `message_thread_id` (the 400
+ * "message thread not found" → auto-deny wedge, #2096).
+ *
+ * Before this helper the INITIAL card emitter iterated `allowFrom`
+ * unconditionally, so a supergroup card could only ever reach operator DMs —
+ * the topic chat id is never in `allowFrom`. The resume message already
+ * routed correctly; the card now matches it (marko, 2026-06-03).
+ */
+function resolvePermissionCardTargets(): Array<{ chatId: string; threadId: number | undefined }> {
+  const turn = currentTurn
+  if (turn != null) {
+    return [{ chatId: turn.sessionChatId, threadId: turn.sessionThreadId }]
+  }
+  const sg = resolveAgentSupergroupChatId()
+  const topic = resolveAgentOutboundTopic({
+    kind: 'permission',
+    turnInitiated: false,
+    originThreadId: undefined,
+  })
+  // allowFrom is normally operator DMs — attach the topic only to a
+  // recipient that owns it (the supergroup), never a DM (marko wedge).
+  return loadAccess().allowFrom.map(chatId => ({
+    chatId,
+    threadId: topicForRecipient({ recipientChatId: chatId, resolvedTopic: topic, supergroupChatId: sg }),
+  }))
+}
+
+/**
  * Post the agent-voiced "got your verdict — continuing" message the
  * instant the operator answers a permission card. Travels right beside
  * `resumeReactionAfterVerdict()` at every operator-driven verdict site so
@@ -2269,24 +2310,7 @@ function postPermissionResumeMessage(opts: {
     action: opts.action,
     timeoutMinutes: opts.timeoutMinutes,
   })
-  const turn = currentTurn
-  const targets: Array<{ chatId: string; threadId: number | undefined }> =
-    turn != null
-      ? [{ chatId: turn.sessionChatId, threadId: turn.sessionThreadId }]
-      : (() => {
-          const sg = resolveAgentSupergroupChatId()
-          const topic = resolveAgentOutboundTopic({
-            kind: 'permission',
-            turnInitiated: false,
-            originThreadId: undefined,
-          })
-          // allowFrom is normally operator DMs — attach the topic only to a
-          // recipient that owns it (the supergroup), never a DM (marko wedge).
-          return loadAccess().allowFrom.map(chatId => ({
-            chatId,
-            threadId: topicForRecipient({ recipientChatId: chatId, resolvedTopic: topic, supergroupChatId: sg }),
-          }))
-        })()
+  const targets = resolvePermissionCardTargets()
   for (const { chatId, threadId } of targets) {
     // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send
     void swallowingApiCall(
@@ -4665,7 +4689,6 @@ const ipcServer: IpcServer = createIpcServer({
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
-    const access = loadAccess()
     // Natural-language card body — a plain sentence ("Gymbro wants to
     // edit: supplement-log.md" + a why-line), never a raw tool id.
     // The operator sees what is being requested and why at a glance.
@@ -4685,42 +4708,34 @@ const ipcServer: IpcServer = createIpcServer({
     // two-button row only.
     const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
     const keyboard = buildPermissionActionRow(requestId, showAlways)
-    // PR4b emitter sweep — supergroup-mode permission card routing.
-    // Per CPO #3 the design is "turn-initiated requests follow the
-    // conversation topic; background requests go to admin alias."
-    // Permission requests come from the bridge mid-tool-use, so they
-    // are always turn-initiated in practice — the currently active
-    // turn's sessionThreadId is the originating topic. Fall back to
-    // admin alias when no active turn (cron / background path).
-    // Fleet-shared / DM agents see `undefined` → no
-    // `message_thread_id` is added → behavior unchanged.
-    // currentTurn is the singleton "claude is currently on this turn"
-    // pointer — per Framing 1 / PR3b scope-discovery, claude
-    // serializes so there's exactly one (or zero) active turn at any
-    // moment. When set, the permission request is in-flight for that
-    // turn and follows the originating topic.
+    // Route the card to the SAME place the post-verdict resume message
+    // lands (resolvePermissionCardTargets): the ORIGINATING chat+topic when
+    // there's an active turn — so a supergroup agent's card appears IN the
+    // topic the operator asked from (marko's "CRM (Brevo)"), not the
+    // operator DM — else the configured operator DMs, thread-stripped. The
+    // old code iterated `allowFrom` unconditionally, so a supergroup card
+    // could only ever reach operator DMs (the topic chat id is never in
+    // `allowFrom`) (marko, 2026-06-03).
     const activeTurn = currentTurn
-    const permTopic = resolveAgentOutboundTopic({
-      kind: 'permission',
-      turnInitiated: activeTurn != null,
-      originThreadId: activeTurn?.sessionThreadId,
-    })
-    const permSupergroup = resolveAgentSupergroupChatId()
-    for (const chat_id of access.allowFrom) {
-      // parse_mode=HTML pairs with formatPermissionCardBody (#1790)
-      // so the <b>/<i> tags render as formatting.
-      // The resolved topic is valid only in the agent's supergroup — attach
-      // it ONLY when this recipient IS that supergroup. allowFrom DMs get the
-      // card thread-less; attaching a topic to a DM yields 400 "message thread
-      // not found" → card never arrives → auto-deny → wedge (marko 2026-06-02).
-      const permThread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: permTopic, supergroupChatId: permSupergroup })
-      // allow-raw-bot-api: permission-request keyboard fan-out; topic-aware opts
-      void bot.api.sendMessage(chat_id, text, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-        ...(permThread != null ? { message_thread_id: permThread } : {}),
-      }).catch(e => {
-        process.stderr.write(`telegram gateway: permission_request send to ${chat_id} failed: ${e}\n`)
+    const targets = resolvePermissionCardTargets()
+    for (const { chatId, threadId } of targets) {
+      // parse_mode=HTML pairs with formatPermissionCardBody (#1790) so the
+      // <b>/<i> tags render. retryWithThreadFallback: if the topic was
+      // deleted/recreated (stale thread id → 400 "message thread not
+      // found"), re-send thread-less into the main chat so the card still
+      // ARRIVES rather than vanishing → 10-min TTL auto-deny → wedge.
+      // allow-raw-bot-api: wrapped in retryWithThreadFallback (retry policy); topic-aware send
+      void retryWithThreadFallback<{ message_id: number }>(
+        robustApiCall,
+        (tid) =>
+          bot.api.sendMessage(chatId, text, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard,
+            ...(tid != null ? { message_thread_id: tid } : {}),
+          }),
+        { threadId, chat_id: chatId, verb: 'permission_request' },
+      ).catch(e => {
+        process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
       })
     }
     // Park the turn's status reaction on 🙏 (awaiting your tap) and
