@@ -44,6 +44,21 @@ describe("TelegramChannelSchema — supergroup smart defaults", () => {
   });
 });
 
+describe("TelegramChannelSchema.clear_status_on_completion", () => {
+  it("accepts true / false and round-trips the boolean", () => {
+    expect(TelegramChannelSchema.parse({ clear_status_on_completion: true })?.clear_status_on_completion).toBe(true);
+    expect(TelegramChannelSchema.parse({ clear_status_on_completion: false })?.clear_status_on_completion).toBe(false);
+  });
+
+  it("is optional — unset stays undefined (gateway default-off owns it)", () => {
+    expect(TelegramChannelSchema.parse({ bot_token: "vault:x" })?.clear_status_on_completion).toBeUndefined();
+  });
+
+  it("rejects a non-boolean", () => {
+    expect(() => TelegramChannelSchema.parse({ clear_status_on_completion: "yes" })).toThrow();
+  });
+});
+
 describe("ScheduleEntrySchema.secrets", () => {
   it("accepts a list of valid vault key names", () => {
     const result = ScheduleEntrySchema.parse({

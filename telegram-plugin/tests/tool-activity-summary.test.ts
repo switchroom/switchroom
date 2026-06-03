@@ -126,6 +126,26 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   it("renderActivityFeed returns null on empty", () => {
     expect(renderActivityFeed([])).toBeNull();
   });
+
+  // final=true: the persisted "status stays" terminal render — the feed is
+  // left in the chat when clear_status_on_completion=false, so the newest line
+  // must read done (✓), not a frozen "→ in-progress".
+  it("final=true renders the newest line as done (✓), not in-progress (→)", () => {
+    const lines = ["Reading a.ts", "Searching memory", "Running a command"];
+    const out = renderActivityFeed(lines, true)!;
+    expect(out).toBe(
+      "<i>✓ Reading a.ts</i>\n<i>✓ Searching memory</i>\n<i>✓ Running a command</i>",
+    );
+    expect(out).not.toContain("→"); // no in-progress arrow anywhere
+  });
+
+  it("final=true on a single line is also done (✓)", () => {
+    expect(renderActivityFeed(["Reading a.ts"], true)).toBe("<i>✓ Reading a.ts</i>");
+  });
+
+  it("final defaults false (live render keeps the → in-progress newest line)", () => {
+    expect(renderActivityFeed(["Reading a.ts"])).toBe("<b>→ Reading a.ts</b>");
+  });
 });
 
 describe("appendActivityLabel — precomputed label feed (tool_label path)", () => {
@@ -185,5 +205,21 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   it("HTML-escapes nested child text", () => {
     const out = renderActivityFeedWithNested(["Delegating: x"], ["touch <a> & <b>"])!;
     expect(out).toContain("   ↳ <b>→ touch &lt;a&gt; &amp; &lt;b&gt;</b>");
+  });
+
+  it("final=true: the nested newest step renders done (✓), not in-progress (→)", () => {
+    const out = renderActivityFeedWithNested(
+      ["Delegating: x"],
+      ["Reading schema.ts", "Looking for foreign keys"],
+      true,
+    )!;
+    expect(out).toContain("   ↳ <i>Looking for foreign keys</i>"); // newest now italic done
+    expect(out).not.toContain("→"); // no in-progress arrow in the finalized feed
+  });
+
+  it("final=true with no children delegates to the finalized flat render", () => {
+    expect(renderActivityFeedWithNested(["Reading a.ts"], [], true)).toBe(
+      "<i>✓ Reading a.ts</i>",
+    );
   });
 });

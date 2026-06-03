@@ -3767,6 +3767,19 @@ const ANSWER_STREAM_VISIBLE_ENABLED = parseVisibleAnswerStreamEnabled(
   process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM,
 )
 
+// Whether to DELETE the activity/status feed when the final answer lands.
+// Default OFF (2026-06-04, operator request): the status message stays in the
+// chat as a record (finalized to an all-done render) instead of being deleted
+// — no post-then-delete flicker. Opt IN per agent via
+// channels.telegram.clear_status_on_completion: true (→ this env). See the
+// clearActivitySummary doc-comment.
+const CLEAR_STATUS_ON_COMPLETION = (() => {
+  const raw = process.env.SWITCHROOM_TG_CLEAR_STATUS_ON_COMPLETION
+  if (raw == null) return false
+  const v = raw.trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes'
+})()
+
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
 // call (flush-independent, so it stays real-time on fast/clustered-tool
@@ -8015,12 +8028,12 @@ const FOREGROUND_SUBAGENT_ACCUM_MAX = 12
  * order; the single-sub-agent common case nests precisely under its
  * Delegating line.
  */
-function composeTurnActivity(turn: CurrentTurn): string | null {
+function composeTurnActivity(turn: CurrentTurn, final = false): string | null {
   const childLines: string[] = []
   for (const narrative of turn.foregroundSubAgents.values()) {
     childLines.push(...narrative)
   }
-  return renderActivityFeedWithNested(turn.mirrorLines, childLines)
+  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final)
 }
 
 /**
@@ -8094,24 +8107,30 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
 }
 
 /**
- * Clear the activity summary when the model's reply tool takes over
- * as the authoritative surface. Awaits any in-flight render so we
- * don't race a stale write against the clear, then deletes the activity
- * message. Idempotent + best-effort — failure stderr-logs but does not
- * block.
+ * Reconcile the activity summary when the model's reply tool takes over as the
+ * authoritative surface. Awaits any in-flight render so we don't race a stale
+ * write, then EITHER:
+ *   - FINALIZE (default, CLEAR_STATUS_ON_COMPLETION=false): edit the message to
+ *     a terminal all-done render (no "→ in-progress" line) and stop tracking it
+ *     — the status stays in the chat as a record beside the reply. No delete.
+ *   - DELETE (CLEAR_STATUS_ON_COMPLETION=true, opt-in via
+ *     channels.telegram.clear_status_on_completion): remove the message so only
+ *     the reply remains (the pre-2026-06 behaviour).
+ * Idempotent + best-effort — failures stderr-log but don't block.
  *
- * Called on the first reply (hand-off to the answer) and again at
- * turn_end (the no-reply safety net), so the user sees the real reply
- * land in the same beat the summary disappears.
+ * Called on the first reply (hand-off) and again at turn_end (no-reply safety
+ * net); finalize edits are idempotent (a 'message is not modified' on the
+ * second call is swallowed).
  */
 function clearActivitySummary(turn: CurrentTurn): void {
   const chat = turn.sessionChatId
   const thread = turn.sessionThreadId
   const inFlight = turn.activityInFlight ?? Promise.resolve()
   void inFlight.then(async () => {
-    if (turn.activityMessageId != null) {
-      const id = turn.activityMessageId
-      turn.activityMessageId = null
+    if (turn.activityMessageId == null) return
+    const id = turn.activityMessageId
+    turn.activityMessageId = null
+    if (CLEAR_STATUS_ON_COMPLETION) {
       try {
         await robustApiCall(
           () => bot.api.deleteMessage(chat, id),
@@ -8119,6 +8138,22 @@ function clearActivitySummary(turn: CurrentTurn): void {
         )
       } catch (err) {
         process.stderr.write(`telegram gateway: activity-summary delete failed: ${err}\n`)
+      }
+      return
+    }
+    // Default: leave the status message as a record, edited to a terminal
+    // all-done state so it doesn't freeze on a misleading "→ in-progress" line.
+    const finalHtml = composeTurnActivity(turn, true)
+    if (finalHtml == null) return
+    try {
+      await robustApiCall(
+        () => bot.api.editMessageText(chat, id, finalHtml, { parse_mode: 'HTML' }),
+        { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.finalize' },
+      )
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!msg.includes('message is not modified')) {
+        process.stderr.write(`telegram gateway: activity-summary finalize failed: ${msg}\n`)
       }
     }
   })
