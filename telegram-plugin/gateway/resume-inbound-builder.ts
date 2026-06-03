@@ -172,9 +172,25 @@ export function buildResumeWatchdogReportInbound(
  */
 export function selectResumeBuilder(
   endedVia: TurnEndedVia | null,
+  // 3h staleness failsafe (operator spec, 2026-06-03): when the interrupted
+  // turn is older than `maxAgeMs`, an AUTO-resume is downgraded to the passive
+  // `report` — silently re-injecting hours-old work could act on long-stale
+  // context (a tax figure, a "send it" the user has moved on from). Pass both
+  // to enable; omit (default) keeps the legacy blanket-resume behaviour.
+  opts?: { ageMs?: number; maxAgeMs?: number },
 ): 'resume' | 'report' | null {
-  if (endedVia === 'timeout') return 'report'
-  if (endedVia === 'restart' || endedVia === 'sigterm' || endedVia === 'unknown') return 'resume'
-  if (endedVia == null) return 'resume' // still-open at boot = killed mid-flight
-  return null
+  let kind: 'resume' | 'report' | null
+  if (endedVia === 'timeout') kind = 'report'
+  else if (endedVia === 'restart' || endedVia === 'sigterm' || endedVia === 'unknown') kind = 'resume'
+  else if (endedVia == null) kind = 'resume' // still-open at boot = killed mid-flight
+  else kind = null
+  if (
+    kind === 'resume' &&
+    opts?.ageMs != null &&
+    opts?.maxAgeMs != null &&
+    opts.ageMs > opts.maxAgeMs
+  ) {
+    return 'report' // too old to safely auto-resume — passive notice only
+  }
+  return kind
 }

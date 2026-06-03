@@ -45,6 +45,15 @@ export interface DispatchCtx {
   readonly client?: IpcClient
   /** Optional log sink — default stderr. Test hook. */
   readonly log?: (line: string) => void
+  /**
+   * Optional: enrol a drained+redelivered inbound in the deliver-until-acked
+   * queue. The bridgeUp drain's socket-write "success" is NOT proof claude
+   * consumed the message — right after a restart (esp. with a slow MCP boot)
+   * the inject can hit a not-ready session and be dropped. Wiring this makes
+   * the existing 5s sweep re-deliver until claude's `enqueue` ack lands.
+   * (clerk lost-message incident, 2026-06-03.)
+   */
+  readonly onUserInboundDelivered?: (merged: InboundMessage) => void
 }
 
 const enabled = process.env.SWITCHROOM_DELIVERY_MACHINE_CUTOVER !== '0'
@@ -103,6 +112,9 @@ function dispatchOne(effect: Effect, ctx: DispatchCtx): void {
         ctx.selfAgent,
         send,
         ctx.inboundSpool ?? undefined,
+        ctx.onUserInboundDelivered
+          ? (merged) => ctx.onUserInboundDelivered!(merged)
+          : undefined,
       )
       if (result.drained > 0) {
         log(
