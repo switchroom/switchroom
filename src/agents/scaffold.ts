@@ -4139,7 +4139,15 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     '"Sent.", "Hope that helps." as a separate message once you have ' +
     'already replied. Your answer is the last thing the user should ' +
     'see; a follow-up "Done." is dead-air clutter (and the user\'s ' +
-    'device already pinged on the answer). Stop after the answer.</turn-pacing>';
+    'device already pinged on the answer). Stop after the answer.\n\n' +
+    'CRITICAL: "answer" means a call to the reply tool ' +
+    '(mcp__switchroom-telegram__reply, or stream_reply with done=true). ' +
+    'Your terminal/transcript text is NEVER delivered to Telegram — the ' +
+    'user sees only what you send through the reply tool. After a long ' +
+    'tool sequence (scheduling, multi-step research, sub-agent handback), ' +
+    'do not let your closing narration stand as the answer: end the turn ' +
+    'by passing that narration to the reply tool. No reply tool call = the ' +
+    'user got nothing, however much text you wrote.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [
