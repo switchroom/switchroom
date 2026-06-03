@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.14.48 — Don't lose a message sent while an agent is restarting (#2117)
+
+A DM (or supergroup-topic message) sent while an agent was mid-restart could
+vanish: the operator saw "your message is queued…" → "still working… (5 min)"
+→ silence, with nothing ever answered. Hit twice in one day on clerk/KenGPT
+during fleet rollouts. This release closes the root cause.
+
+- **Restart-redelivered inbounds now enroll in the deliver-until-acked queue
+  (#2117).** When an agent restarts, buffered/spooled inbounds are redelivered
+  to the new process — but `bridge registered` only means the IPC socket is
+  up, not that the `claude` session is ready to receive. If Hindsight (or any
+  MCP server) is slow to come up, the redelivered inject hit a still-booting
+  session and was silently dropped; `claude` wrote no `enqueue`, so the
+  framework's 300s silence-poke ended a phantom turn (`drained_buffered=0/0`)
+  and the message — already drained from the buffer and tombstoned in the
+  spool — was gone with nothing retrying it. The live (non-restart) path
+  already guards against exactly this with a 5s deliver-until-acked sweep
+  (gated on `currentTurn == null`), but the restart-drain paths acked on a
+  bare socket-write and never enrolled. They now do: every drain→deliver path
+  (bridge-up dispatch, kill-switch fallback, idle-drain, silence-poke
+  fallback, both flap flushes) re-tracks the redelivered inbound, keyed per
+  `(chat, thread)` so **DMs and supergroup forum topics recover identically**.
+  It re-delivers every 5s until `claude` finishes booting and actually
+  consumes it. Steering/interrupt/synthetic-source inbounds are excluded, so
+  nothing can re-deliver forever. Rides the existing
+  `SWITCHROOM_INBOUND_DELIVERY_CONFIRM` kill switch.
+
+- **A mid-flight turn cut off by restart no longer auto-resumes if it's stale
+  (#2117).** Boot-resume of an interrupted turn now has a 3-hour failsafe: a
+  turn older than `SWITCHROOM_RESUME_MAX_AGE_MS` (default 3h) downgrades from
+  a silent auto-resume to a passive "your last turn was interrupted" notice,
+  so the agent never silently acts on hours-stale context (a number, a "send
+  it" the user has moved on from). Fresh interrupts resume as before.
+
 ## v0.14.47 — Permission cards route to the work topic + name the operation (#2118)
 
 A high-risk permission approval card raised by a supergroup-owned agent now
