@@ -94,6 +94,22 @@ describe('StatusReactionController', () => {
     expect(calls).toEqual(['👀'])
   })
 
+  it('isAwaiting() tracks the awaiting-approval state (for the honest silence-poke copy)', async () => {
+    const { emit } = makeEmitter()
+    const ctrl = new StatusReactionController(emit)
+    expect(ctrl.isAwaiting()).toBe(false)
+    ctrl.setAwaiting()
+    expect(ctrl.isAwaiting()).toBe(true)
+    // The verdict resume (setThinking) un-parks → no longer awaiting.
+    ctrl.setThinking()
+    expect(ctrl.isAwaiting()).toBe(false)
+    // Re-park, then finish → isAwaiting is false once the turn ends.
+    ctrl.setAwaiting()
+    expect(ctrl.isAwaiting()).toBe(true)
+    ctrl.finalize()
+    expect(ctrl.isAwaiting()).toBe(false)
+  })
+
   it('setThinking is debounced by 3500ms (#1713)', async () => {
     const { emit, calls } = makeEmitter()
     const ctrl = new StatusReactionController(emit)

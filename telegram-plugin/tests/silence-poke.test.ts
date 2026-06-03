@@ -275,6 +275,26 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     ).toBe('still working… (no update from agent in 5 min)')
   })
 
+  it('blockedOnApproval names the real blocker instead of the dishonest "still working…"', () => {
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [], true),
+    ).toBe('waiting for your approval — tap Approve or Deny on the card above (5 min)')
+  })
+
+  it('blockedOnApproval takes precedence over an in-flight tool (a tool awaiting approval is not "running")', () => {
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'Bash', label: 'rm -rf build', durationMs: 305_000 },
+      ], true),
+    ).toBe('waiting for your approval — tap Approve or Deny on the card above (5 min)')
+  })
+
+  it('blockedOnApproval=false keeps the existing wording (default, back-compat)', () => {
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [], false),
+    ).toBe('still working… (no update from agent in 5 min)')
+  })
+
   it('tool-aware wording wins over "thinking" — the actual observable beats the inferred kind', () => {
     const text = formatFrameworkFallbackText('thinking', 305_000, [
       { name: 'Grep', label: '"foo"', durationMs: 305_000 },

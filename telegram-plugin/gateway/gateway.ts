@@ -3912,10 +3912,18 @@ silencePoke.startTimer({
       // (CC-4 in `docs/status-ask-cause-classes.md`). Derives "N min" suffix
       // from `ctx.silenceMs` so the wording stays honest if the 300s
       // threshold is tuned.
+      // Honesty: if the turn is parked on an approval card (the dominant
+      // benign "wedge" class — claude is alive, waiting on the operator's
+      // tap), say so instead of "still working…". The reaction controller
+      // already tracks this (setAwaiting on the permission-request park).
+      const blockedOnApproval = activeStatusReactions
+        .get(statusKey(ctx.chatId, ctx.threadId))
+        ?.isAwaiting() ?? false
       text = silencePoke.formatFrameworkFallbackText(
         ctx.fallbackKind,
         ctx.silenceMs,
         ctx.inFlightTools,
+        blockedOnApproval,
       )
     }
     try {

@@ -264,8 +264,17 @@ export function formatFrameworkFallbackText(
   fallbackKind: 'working' | 'thinking',
   silenceMs: number,
   inFlightTools: ToolSnapshot[] = [],
+  blockedOnApproval = false,
 ): string {
   const minutes = Math.max(1, Math.round(silenceMs / 60_000))
+  // The turn isn't stalled — it's parked on an approval card waiting for YOUR
+  // tap (the dominant live "wedge" class is benign approval-latency, not a
+  // hang). Saying "still working…" here actively lies; name the real blocker so
+  // the operator knows the ball is in their court. Takes precedence over the
+  // in-flight-tool framing (a tool awaiting approval isn't "running").
+  if (blockedOnApproval) {
+    return `waiting for your approval — tap Approve or Deny on the card above (${minutes} min)`
+  }
   const suffix = `(no update from agent in ${minutes} min)`
   // #1292 case (a): tools in flight. Name the longest-running one
   // (entry[0] — caller pre-sorts by startedAt ascending). Avoid the
