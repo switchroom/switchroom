@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.14.47 — Permission cards route to the work topic + name the operation (#2118)
+
+A high-risk permission approval card raised by a supergroup-owned agent now
+appears IN the forum topic the operator asked from, and says what it's about
+to do — two operator-reported defects on marko's Brevo approvals.
+
+- **The Approve/Deny card follows the conversation into its topic (#2118).**
+  The initial card emitter sent to the operator's DM (`access.allowFrom`) —
+  and a supergroup's chat id is never in that list, so a card raised from
+  the "CRM (Brevo)" topic could only ever land in the DM, not the topic the
+  work lives in. (The post-verdict "continuing…" resume message already
+  routed correctly; the card didn't.) The card and the resume now route
+  through one shared helper — turn-initiated → the originating chat+topic;
+  no active turn → operator DMs, thread-stripped — so they can't drift. The
+  card send is wrapped in the thread-fallback retry, so a deleted/recreated
+  topic re-sends thread-less into the main chat instead of vanishing into
+  the 10-minute auto-deny. DM agents are unchanged.
+
+- **The card names the operation, not just the verb (#2118).** "post
+  (Brevo)" / "put (Brevo)" gave no idea WHAT was being written. The
+  REST-wrapper integrations (Brevo / Meta / Postiz) take `{ path, body }`,
+  so the card now reads "POST /smtp/email (Brevo)" with a third line
+  summarizing the payload ("↳ subject: …, templateId: 12, to"). Every value
+  passes the secret-redaction filter (a token in the body is masked), is
+  length-capped, and nested objects show as the bare key name — never a data
+  dump. Falls back to the old phrasing for unrecognized input shapes.
+
 ## v0.14.46 — Supergroup credential-resume routing + setup discoverability (#2114, #2115)
 
 Two supergroup-mode follow-ups from a DM-hardcoding audit: credential
