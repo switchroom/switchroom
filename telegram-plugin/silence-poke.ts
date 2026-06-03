@@ -245,6 +245,23 @@ export function endTurn(key: string): void {
 }
 
 /**
+ * Current silence duration (ms) for a key — `now - (lastOutboundAt ??
+ * turnStartedAt)`, the same clock `tick()` uses to decide the 300s fallback —
+ * or null when no turn state exists for the key. Lets the sibling-topic purge
+ * distinguish a STALE/wedged sibling (silent ≥ the fallback threshold, so its
+ * own poke would also fire) from a LIVE one mid-turn (recent outbound, low
+ * silence), so a silence-poke on one supergroup topic doesn't purge a live
+ * sibling topic's reaction controller + typing loop. NB: this is silence, NOT
+ * turn-start age — a long but actively-narrating turn has low silence and must
+ * not be treated as stale.
+ */
+export function silenceMsForKey(key: string, now: number): number | null {
+  const s = state.get(key)
+  if (s == null) return null
+  return now - (s.lastOutboundAt ?? s.turnStartedAt)
+}
+
+/**
  * Verbatim framework-fallback text — the user-visible "still working / still
  * thinking" message the gateway sends at the 300s threshold when the model
  * hasn't broken its own silence. Wording is load-bearing (see

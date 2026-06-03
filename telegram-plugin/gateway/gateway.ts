@@ -4041,16 +4041,29 @@ silencePoke.startTimer({
     // SAME chat (different threads, or a `null` vs `undefined`-thread
     // variant left over from a normal turn-end path that nulled
     // currentTurn without invoking purgeReactionTracking — the
-    // gymbro/klanker held-mid-turn symptom, 2026-05-20). Any sibling
-    // for fbChatId is by definition stale when THIS fallback fires
-    // (the chat has been silent ≥5 min); sweep them via the same
-    // purger. Multi-chat-safe — only touches keys for fbChatId, so
+    // gymbro/klanker held-mid-turn symptom, 2026-05-20); sweep them via
+    // the same purger. Multi-chat-safe — only touches keys for fbChatId, so
     // #1546's intentional cross-chat safety guard is preserved.
+    //
+    // BUT a sibling is NOT "by definition stale": in one-agent-owns-supergroup
+    // every forum topic shares fbChatId, so a chatId-only sweep would purge a
+    // LIVE sibling topic's reaction controller + typing loop when THIS topic's
+    // poke fires. Gate each sibling on its OWN silence clock — purge only those
+    // also silent ≥ the fallback threshold (their own poke would fire too),
+    // sparing topics that are actively mid-turn. Use silence, not turn-start
+    // age, so a long-but-narrating turn isn't mistaken for stale.
     // See turn-state-purge.ts.
+    const fbNow = Date.now()
     const fbExtraPurge = purgeStaleTurnsForChat(
       fbChatId,
       activeTurnStartedAt.keys(),
       purgeReactionTracking,
+      (siblingKey) => {
+        if (siblingKey === fbKey) return true // the firing key is genuinely stale
+        const sib = silencePoke.silenceMsForKey(siblingKey, fbNow)
+        // No silence-poke state → dangling (turn ended, key not purged) → stale.
+        return sib == null || sib >= silencePoke.DEFAULT_THRESHOLDS.fallback
+      },
     )
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
