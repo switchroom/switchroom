@@ -158,3 +158,29 @@ export function shouldTrackDelivery(input: {
   if (input.effectiveText !== undefined && input.effectiveText.trim().length === 0) return false
   return true
 }
+
+/**
+ * The ONE synthetic-source inbound that IS safe to enrol in the
+ * deliver-until-acked queue: the boot-resume synthetic
+ * (`meta.source === 'resume_interrupted'`). A restart can drop it into a
+ * not-ready (slow MCP boot) session exactly like a user inbound, leaving the
+ * interrupted work silently un-resumed — so it needs the same re-delivery
+ * backstop. It is safe to track ONLY when it carries BOTH:
+ *   - `meta.chat_id` — so the gateway's enqueue handler (gated on `ev.chatId`)
+ *     builds a currentTurn AND fires `ackDelivery` for it; and
+ *   - `meta.message_id` — so the enqueue's id round-trips and `ackDelivery`
+ *     matches THIS synthetic, stopping the sweep (no re-deliver-forever storm).
+ * Every other synthetic (cron / vault / handback / the watchdog `report`) omits
+ * `meta.message_id` and stays excluded by `shouldTrackDelivery`'s `hasSource`
+ * gate. We require message_id here (chat_id is implied by the ack mechanics);
+ * without a round-trippable id, tracking would storm.
+ */
+export function isTrackableResumeSynthetic(
+  meta: Record<string, string> | undefined,
+): boolean {
+  return (
+    meta?.source === 'resume_interrupted' &&
+    meta.message_id != null &&
+    meta.message_id !== ''
+  )
+}

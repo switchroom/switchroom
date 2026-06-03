@@ -287,6 +287,7 @@ import {
   sweep as sweepDeliveryQueue,
   forgetDelivery,
   shouldTrackDelivery,
+  isTrackableResumeSynthetic,
   type PendingDelivery,
 } from './inbound-delivery-confirm.js'
 import { createPendingPermissionBuffer } from './pending-permission-decisions.js'
@@ -4212,15 +4213,17 @@ _deliveryMachineTick.unref?.()
 // re-deliver forever.
 function trackRedeliveredInbound(merged: InboundMessage): void {
   if (!DELIVERY_CONFIRM_ENABLED) return
+  // The boot-resume synthetic ('resume_interrupted') is the ONE synthetic we DO
+  // enrol: a restart can drop it into a not-ready session exactly like a user
+  // inbound, leaving the interrupted work silently un-resumed. Safe iff it
+  // carries the chat_id + message_id that make its enqueue ack-able — see
+  // isTrackableResumeSynthetic. Every other synthetic stays excluded below.
+  const isTrackableResume = isTrackableResumeSynthetic(merged.meta)
   if (
+    !isTrackableResume &&
     !shouldTrackDelivery({
       isSteering: false,
       isInterrupt: false,
-      // Synthetic inbounds (cron / vault / handback / resume) carry a source
-      // and are NOT tracked here — they enqueue under their own semantics, and
-      // (for the resume synthetics) tracking them safely first needs the
-      // resume builder to emit meta.message_id so the deliver-until-acked ack
-      // matches its enqueue. Tracked separately as a follow-up (see PR notes).
       hasSource: merged.meta?.source != null,
       effectiveText: merged.text,
     })

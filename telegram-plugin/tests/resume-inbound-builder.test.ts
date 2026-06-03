@@ -124,6 +124,27 @@ describe('buildResumeInterruptedInbound', () => {
     const msg = buildResumeInterruptedInbound({ turn: makeTurn({ thread_id: null }) })
     expect(msg.threadId).toBeUndefined()
   })
+
+  // Origin routing + ack-ability (the resume-deliver hardening). meta.chat_id
+  // makes the gateway build a currentTurn (progress card + silence-poke) and
+  // fire ackDelivery; meta.message_id round-trips so the deliver-until-acked
+  // queue can ack THIS synthetic by its own enqueue id (no re-deliver storm).
+  it('carries origin chat_id + message_id in meta (DM)', () => {
+    const turn = makeTurn({ chat_id: '12345', thread_id: null })
+    const msg = buildResumeInterruptedInbound({ turn, nowMs: 1_700_000_000_000 })
+    expect(msg.meta.chat_id).toBe('12345')
+    expect(msg.meta.message_id).toBe('1700000000000')
+    expect(msg.messageId).toBe(1_700_000_000_000)
+    expect(msg.meta.message_thread_id).toBeUndefined()
+  })
+
+  it('carries message_thread_id in meta for a forum topic (supergroup routing)', () => {
+    const turn = makeTurn({ chat_id: '-1001234567890', thread_id: '42' })
+    const msg = buildResumeInterruptedInbound({ turn })
+    expect(msg.meta.chat_id).toBe('-1001234567890')
+    expect(msg.meta.message_thread_id).toBe('42')
+    expect(msg.threadId).toBe(42)
+  })
 })
 
 describe('buildResumeWatchdogReportInbound', () => {
@@ -162,6 +183,18 @@ describe('buildResumeWatchdogReportInbound', () => {
     const turn = makeTurn({ ended_via: 'timeout', tool_call_count: 0 })
     const msg = buildResumeWatchdogReportInbound({ turn, idleMs: 300_000 })
     expect(msg.text).not.toContain('tool call')
+  })
+
+  // The report turn ALSO gets origin routing (currentTurn + topic) — a "your
+  // last turn was interrupted" notice should land in the topic the work lived
+  // in — but it is NOT deliver-until-acked tracked, so it carries NO
+  // message_id (only the 'resume_interrupted' builder does, gating tracking).
+  it('carries origin chat_id + message_thread_id but NO message_id (report is untracked)', () => {
+    const turn = makeTurn({ ended_via: 'timeout', chat_id: '-1001234567890', thread_id: '42' })
+    const msg = buildResumeWatchdogReportInbound({ turn, idleMs: 300_000 })
+    expect(msg.meta.chat_id).toBe('-1001234567890')
+    expect(msg.meta.message_thread_id).toBe('42')
+    expect(msg.meta.message_id).toBeUndefined()
   })
 })
 

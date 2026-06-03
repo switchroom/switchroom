@@ -78,14 +78,33 @@ function promptClause(turn: Turn): string {
 export function buildResumeInterruptedInbound(ctx: ResumeInboundContext): InboundMessage {
   const ts = ctx.nowMs ?? Date.now()
   const elapsed = humanizeElapsed(ts - ctx.turn.started_at)
+  const threadId = threadIdNum(ctx.turn)
   const meta: Record<string, string> = {
     source: 'resume_interrupted',
+    // Carry the originating chat/topic as model-visible channel attributes
+    // (mirrors the real-inbound + subagent_handback shapes — see
+    // gateway.ts:10753 and subagent-handback-inbound-builder.ts:115-121).
+    // Without meta.chat_id the enqueue's channel XML has no chat_id, so the
+    // gateway's enqueue handler (gateway.ts `if (ev.chatId)`) never builds a
+    // currentTurn for the resume turn — meaning no progress card, no
+    // silence-poke protection, and the reply falling back to the agent's
+    // default chat instead of the topic the interrupted work lived in.
+    chat_id: ctx.turn.chat_id,
+    ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
+    // message_id rounds-trips the fabricated `ts` through the enqueue's
+    // channel XML so the deliver-until-acked queue can ack THIS synthetic by
+    // its own enqueue id (gateway trackRedeliveredInbound carve-in). It is
+    // never used as a Telegram reply_to: the model's reply tool quotes the
+    // real prior user message via getLatestInboundMessageId (role='user',
+    // synthetics aren't in history), and the activity feed anchors with
+    // allow_sending_without_reply. Required so tracking the resume can ack and
+    // never re-delivers forever.
+    message_id: String(ts),
     resume_turn_key: ctx.turn.turn_key,
     interrupted_via: ctx.turn.ended_via ?? 'restart',
     started_at: String(ctx.turn.started_at),
   }
   if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
-  const threadId = threadIdNum(ctx.turn)
   return {
     type: 'inbound',
     chatId: ctx.turn.chat_id,
@@ -127,8 +146,15 @@ export function buildResumeWatchdogReportInbound(
     ctx.turn.tool_call_count != null && ctx.turn.tool_call_count > 0
       ? ` You'd run ${ctx.turn.tool_call_count} tool call${ctx.turn.tool_call_count === 1 ? '' : 's'} before it stalled.`
       : ''
+  const threadId = threadIdNum(ctx.turn)
   const meta: Record<string, string> = {
     source: 'resume_watchdog_timeout',
+    // Origin chat/topic as channel attributes so the report turn gets a
+    // currentTurn (progress card + silence-poke) and the "your last turn was
+    // interrupted" notice lands in the topic the work lived in, not the
+    // agent's default chat. Same rationale as buildResumeInterruptedInbound.
+    chat_id: ctx.turn.chat_id,
+    ...(threadId != null ? { message_thread_id: String(threadId) } : {}),
     resume_turn_key: ctx.turn.turn_key,
     interrupted_via: 'timeout',
     idle_ms: String(ctx.idleMs),
@@ -136,7 +162,6 @@ export function buildResumeWatchdogReportInbound(
   }
   if (ctx.turn.tool_call_count != null) meta.tool_call_count = String(ctx.turn.tool_call_count)
   if (ctx.turn.user_prompt_preview) meta.original_prompt = ctx.turn.user_prompt_preview
-  const threadId = threadIdNum(ctx.turn)
   return {
     type: 'inbound',
     chatId: ctx.turn.chat_id,

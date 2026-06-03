@@ -4,6 +4,7 @@ import {
   ackDelivery,
   createDeliveryQueue,
   forgetDelivery,
+  isTrackableResumeSynthetic,
   shouldTrackDelivery,
   sweep,
   trackDelivery,
@@ -176,5 +177,65 @@ describe('shouldTrackDelivery — only fresh-turn messages are tracked', () => {
   })
   it('tracks a normal message when effectiveText is provided and non-empty', () => {
     expect(shouldTrackDelivery({ isSteering: false, isInterrupt: false, effectiveText: 'draft the email' })).toBe(true)
+  })
+})
+
+// The boot-resume synthetic is the one synthetic ENROLLED for re-delivery (so a
+// restart can't silently drop the "pick up your interrupted work" wake into a
+// not-ready session). It is safe ONLY because it carries a round-trippable
+// message_id that its own enqueue acks — without that it would re-deliver
+// forever (the storm the hasSource exclusion otherwise prevents).
+describe('isTrackableResumeSynthetic — resume carve-in to the deliver-until-acked queue', () => {
+  it('tracks a resume_interrupted synthetic that carries a message_id', () => {
+    expect(isTrackableResumeSynthetic({ source: 'resume_interrupted', message_id: '1700000000000' })).toBe(true)
+  })
+  it('does NOT track a resume_interrupted WITHOUT a message_id (would never ack → storm)', () => {
+    expect(isTrackableResumeSynthetic({ source: 'resume_interrupted' })).toBe(false)
+    expect(isTrackableResumeSynthetic({ source: 'resume_interrupted', message_id: '' })).toBe(false)
+  })
+  it('does NOT track the watchdog report (untracked by design) even though it carries chat_id', () => {
+    expect(isTrackableResumeSynthetic({ source: 'resume_watchdog_timeout', chat_id: '123' })).toBe(false)
+  })
+  it('does NOT track other synthetics (cron / vault / handback) even if they somehow had a message_id', () => {
+    expect(isTrackableResumeSynthetic({ source: 'cron', message_id: '1' })).toBe(false)
+    expect(isTrackableResumeSynthetic({ source: 'subagent_handback', message_id: '1' })).toBe(false)
+    expect(isTrackableResumeSynthetic({ source: 'vault_grant_approved', message_id: '1' })).toBe(false)
+  })
+  it('does NOT track a real (no source) inbound here — that path is shouldTrackDelivery', () => {
+    expect(isTrackableResumeSynthetic({ chat_id: '1', message_id: '2' })).toBe(false)
+    expect(isTrackableResumeSynthetic(undefined)).toBe(false)
+  })
+})
+
+// End-to-end queue contract for the resume synthetic: tracked by its fabricated
+// id, acked by its OWN enqueue (which round-trips the same id), and — crucially
+// — it can never re-deliver forever (the storm the original deferral feared).
+describe('resume synthetic: tracked, acked by own enqueue, never storms', () => {
+  const RESUME_ID = '1700000000000' // String(ts), the fabricated message_id
+  it('acks when its own enqueue arrives with the matching id (no storm)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'resume…' }, 1_000, RESUME_ID)
+    // The resume turn starts → enqueue fires carrying the round-tripped id.
+    expect(ackDelivery(q, 'chat:_', RESUME_ID)).toBe(true)
+    expect(q.pending.size).toBe(0)
+    // Never re-delivered after the ack — bounded, not a forever loop.
+    expect(sweep(q, 1_000 + 999_999, TIMEOUT)).toHaveLength(0)
+  })
+  it('strands then re-delivers until acked (rescues a drop into a not-ready session)', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'resume…' }, 1_000, RESUME_ID)
+    // Dropped into a not-ready session: no enqueue within the timeout → re-deliver.
+    const stranded = sweep(q, 1_000 + TIMEOUT + 1, TIMEOUT)
+    expect(stranded).toHaveLength(1)
+    expect(stranded[0]!.messageId).toBe(RESUME_ID)
+    // Once claude is ready, its enqueue acks it and the loop stops.
+    expect(ackDelivery(q, 'chat:_', RESUME_ID)).toBe(true)
+    expect(sweep(q, 1_000 + TIMEOUT * 10, TIMEOUT)).toHaveLength(0)
+  })
+  it('a DIFFERENT enqueue id (e.g. a racing real user msg) does NOT false-ack the resume', () => {
+    const q = fresh()
+    trackDelivery(q, 'chat:_', { text: 'resume…' }, 1_000, RESUME_ID)
+    expect(ackDelivery(q, 'chat:_', '999')).toBe(false) // not our id
+    expect(q.pending.size).toBe(1) // still pending, will re-deliver
   })
 })
