@@ -222,4 +222,30 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       "<i>✓ Reading a.ts</i>",
     );
   });
+
+  // Pins the invariant the gateway's foreground handoff-clear path relies on:
+  // on an ack-first turn the parent feed is empty (mirrorLines=[]) and the only
+  // content is the foreground sub-agent's nested narrative. The finalized
+  // render MUST be captured WHILE that narrative is present — once the gateway
+  // removes the finished sub-agent from the map, the render collapses to null
+  // and the finalize would be skipped, freezing the last live "→" line. This is
+  // exactly why clearActivitySummary takes a pre-delete finalHtmlOverride.
+  describe("foreground handoff-clear: capture-before-delete invariant", () => {
+    it("ack-first (empty parent) + child present → non-null all-done render (✓, no →)", () => {
+      const out = renderActivityFeedWithNested(
+        [],
+        ["Sleep 2 for step 8", "Step 8 done; final echo", "All eight steps completed"],
+        true,
+      );
+      expect(out).not.toBeNull();
+      expect(out).not.toContain("→");
+      expect(out).toContain("All eight steps completed");
+    });
+
+    it("ack-first (empty parent) + child REMOVED → null (the emptied-feed skip the gateway must avoid)", () => {
+      // After foregroundSubAgents.delete(agentId), the parent has nothing left
+      // to render on an ack-first turn → null → finalize would no-op.
+      expect(renderActivityFeedWithNested([], [], true)).toBeNull();
+    });
+  });
 });
