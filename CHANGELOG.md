@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.14.45 — Operator MCP tools surface in the live activity feed (#2111)
+
+A turn driven by operator-configured MCP tools (perplexity, webkite, …) —
+e.g. a research request — showed **no activity feed at all**, only a typing
+dot + the 👀 reaction, so it read as "I can't see what it's doing" (operator
+report; confirmed in the session JSONL: `perplexity_ask` ×2, `perplexity_search`,
+`webkite_read` ×3 over 73s, with **zero `tool_label` events**).
+
+- **The PreToolUse label hook allowlisted only the built-in MCP servers.**
+  `tool-label-pretool.mjs` `computeLabel` emitted labels for
+  switchroom-telegram + hindsight and returned `null` for every other
+  `mcp__*` tool. The live activity feed is driven off this sidecar, so
+  research tools produced nothing — even though the gateway's own
+  `describeToolUse` already had a generic MCP fallback. Now the hook has the
+  same fallback: friendly per-server labels (perplexity → "Searching the web
+  for …", webkite → "Reading <host>", gdrive/gmail/notion/calendar), else a
+  model-authored field (`description`/`query`/`title`), else a humanized tool
+  name ("Using <tool>"). switchroom-telegram surface/control tools stay
+  suppressed (they ARE the conversation). MCP-driven research now narrates its
+  steps live — in DMs and supergroups.
+
 ## v0.14.44 — Status honesty + post-ack feed + supergroup sibling-topic fix (#2107, #2108, #2109)
 
 Three fixes from a turn-wedge root-cause investigation — the recurring 300s
