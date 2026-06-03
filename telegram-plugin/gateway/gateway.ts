@@ -5736,10 +5736,16 @@ if (!STATIC) {
     // queued message ends either delivered or visibly retracted.
     inboundSpool?.sweepEscalations((e) => {
       const chat = e.msg.chatId
-      const threadOpts =
+      const escThread =
         typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
-          ? { message_thread_id: Number(e.msg.meta.threadId) }
-          : {}
+          ? Number(e.msg.meta.threadId)
+          : undefined
+      const threadOpts = escThread != null ? { message_thread_id: escThread } : {}
+      // Reap any "Queued — replying in #X" placeholder for this topic first:
+      // the message is being declared undeliverable, so the queued-status must
+      // not dangle beside the "couldn't deliver" notice (idempotent best-effort;
+      // a normal turn-start/turn-end reaps far sooner — this is the 15-min edge).
+      reapQueuedStatus(chat, escThread)
       void swallowingApiCall(
         () =>
           bot.api.sendMessage(
