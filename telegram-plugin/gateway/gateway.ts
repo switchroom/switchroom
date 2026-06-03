@@ -2913,6 +2913,10 @@ interface PendingVaultRequestSave {
   chat_id: string
   /** Card message id (filled in after we send the card). */
   card_message_id?: number
+  /** Supergroup forum topic the agent was working in when it requested the
+   *  save — carried into the save-outcome inbound so the resumed reply lands
+   *  back in that topic, not General. */
+  threadId?: number
   /** Currently-suggested slug; may be renamed by the user. */
   key: string
   /** Storage shape — 'string' (default) or 'binary'. */
@@ -2954,6 +2958,10 @@ interface PendingVaultRequestAccess {
   chat_id: string
   /** Card message id (filled in after we send the card). */
   card_message_id?: number
+  /** Supergroup forum topic the agent was working in when it requested (the
+   *  card's originating thread). Carried into the grant-outcome inbound so the
+   *  resumed reply lands back in that topic, not General. */
+  threadId?: number
   /** Vault key the agent wants to read. */
   key: string
   /** 'read' (default) or 'write'. */
@@ -7080,6 +7088,8 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
   // crashing the tool call.
   const text = renderVaultRequestSaveCard(pending, agentSlug)
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  // Remember the agent's working topic so the save-outcome inbound resumes in it.
+  if (threadId != null) pending.threadId = threadId
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
     (tid) =>
@@ -7120,12 +7130,16 @@ interface PendingSecretRequest {
   reason?: string
   staged_at: number
   card_message_id?: number
+  /** Supergroup forum topic the agent was working in — carried into the
+   *  provide/decline/fail outcome inbounds so the resumed reply lands back
+   *  in that topic, not General. */
+  threadId?: number
 }
 // stageId -> request (lives until tapped or TTL).
 const pendingSecretRequests = new Map<string, PendingSecretRequest>()
 // chat_id -> the armed capture: the operator's NEXT message in this chat is
 // the value for `key`. Set when [Provide securely] is tapped.
-interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number }
+interface ArmedSecretCapture { key: string; agent: string; stageId: string; armed_at: number; threadId?: number }
 const armedSecretCaptures = new Map<string, ArmedSecretCapture>()
 const PENDING_SECRET_REQUEST_TTL_MS = 30 * 60_000 // card lifetime
 const ARMED_SECRET_CAPTURE_TTL_MS = 10 * 60_000   // window to send the value after tapping
@@ -7194,6 +7208,8 @@ async function executeRequestSecret(args: Record<string, unknown>): Promise<{ co
 
   const text = renderSecretRequestCard(pending)
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  // Remember the agent's working topic so the provide/decline/fail inbound resumes in it.
+  if (threadId != null) pending.threadId = threadId
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
     (tid) =>
@@ -7269,12 +7285,19 @@ async function captureProvidedSecret(
     const failMsg: InboundMessage = {
       type: 'inbound',
       chatId: chat_id,
+      ...(armed.threadId != null ? { threadId: armed.threadId } : {}),
       messageId: fts,
       user: 'vault-broker',
       userId: 0,
       ts: fts,
       text: `⚠️ The secret you requested for \`vault:${armed.key}\` could NOT be saved (vault write failed). Do not assume it is available; tell the operator or try request_secret again.`,
-      meta: { source: 'secret_provide_failed', agent: armed.agent, key: armed.key, stage_id: armed.stageId },
+      meta: {
+        source: 'secret_provide_failed',
+        agent: armed.agent,
+        ...(armed.threadId != null ? { message_thread_id: String(armed.threadId) } : {}),
+        key: armed.key,
+        stage_id: armed.stageId,
+      },
     }
     const fdelivered = ipcServer.sendToAgent(armed.agent, failMsg)
     if (fdelivered) markClaudeBusyForInbound(failMsg)
@@ -7294,6 +7317,7 @@ async function captureProvidedSecret(
   const synthetic: InboundMessage = {
     type: 'inbound',
     chatId: chat_id,
+    ...(armed.threadId != null ? { threadId: armed.threadId } : {}),
     messageId: ts,
     user: 'vault-broker',
     userId: 0,
@@ -7305,6 +7329,7 @@ async function captureProvidedSecret(
     meta: {
       source: 'secret_provided',
       agent: armed.agent,
+      ...(armed.threadId != null ? { message_thread_id: String(armed.threadId) } : {}),
       key: armed.key,
       stage_id: armed.stageId,
     },
@@ -7345,6 +7370,7 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
       agent: pending.agent,
       stageId,
       armed_at: Date.now(),
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
     })
     await ctx.answerCallbackQuery({ text: 'Send the value now — it auto-deletes.' }).catch(() => {})
     if (pending.card_message_id != null) {
@@ -7377,12 +7403,19 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
     const synthetic: InboundMessage = {
       type: 'inbound',
       chatId: pending.chat_id,
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
       messageId: ts,
       user: 'vault-broker',
       userId: 0,
       ts,
       text: `🚫 Operator declined your request for \`vault:${pending.key}\`. Proceed without it or ask how they'd like to handle the task.`,
-      meta: { source: 'secret_declined', agent: pending.agent, key: pending.key, stage_id: stageId },
+      meta: {
+        source: 'secret_declined',
+        agent: pending.agent,
+        ...(pending.threadId != null ? { message_thread_id: String(pending.threadId) } : {}),
+        key: pending.key,
+        stage_id: stageId,
+      },
     }
     const delivered = ipcServer.sendToAgent(pending.agent, synthetic)
     if (delivered) markClaudeBusyForInbound(synthetic)
@@ -7530,6 +7563,8 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
 
   const text = renderVaultRequestAccessCard(pending)
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+  // Remember the agent's working topic so the grant-outcome inbound resumes in it.
+  if (threadId != null) pending.threadId = threadId
   // #1075: deleted-topic safe — fall back to main chat.
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
@@ -14023,6 +14058,7 @@ async function performVaultAccessApproval(
       scope: pending.scope,
       chat_id: pending.chat_id,
       ttl_seconds: pending.ttl_seconds,
+      ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
     },
     grantId: id,
     stageId,
@@ -14104,6 +14140,7 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
         scope: pending.scope,
         chat_id: pending.chat_id,
         ttl_seconds: pending.ttl_seconds,
+        ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
       },
       stageId,
       operatorId: senderId,
@@ -14278,7 +14315,12 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
     // tool returned "waiting for operator", the turn ended, and a
     // Discard left the agent silently idle forever.
     const discardInbound = buildVaultSaveDiscardedInbound({
-      ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+      ctx: {
+        agent: pending.agent,
+        key: pending.key,
+        chat_id: pending.chat_id,
+        ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      },
       stageId,
       operatorId: senderId,
     })
@@ -14401,7 +14443,12 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       const failReason =
         (write.output || 'vault write error').split('\n')[0]!.slice(0, 200)
       const failInbound = buildVaultSaveFailedInbound({
-        ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+        ctx: {
+          agent: pending.agent,
+          key: pending.key,
+          chat_id: pending.chat_id,
+          ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+        },
         stageId,
         operatorId: senderId,
         reason: failReason,
@@ -14432,7 +14479,12 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
     // task that was blocked on this credential (symmetric with the
     // vra: approve path; buffered if the bridge is mid-reconnect).
     const okInbound = buildVaultSaveCompletedInbound({
-      ctx: { agent: pending.agent, key: pending.key, chat_id: pending.chat_id },
+      ctx: {
+        agent: pending.agent,
+        key: pending.key,
+        chat_id: pending.chat_id,
+        ...(pending.threadId != null ? { threadId: pending.threadId } : {}),
+      },
       stageId,
       operatorId: senderId,
     })

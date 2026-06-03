@@ -34,6 +34,10 @@ export interface VaultGrantInboundContext {
   chat_id: string
   /** Seconds. For approved grants; ignored for deny. */
   ttl_seconds: number
+  /** Supergroup forum topic (message_thread_id) the agent was working in
+   *  when it requested the credential — so the resumed turn's reply lands
+   *  back in that topic, not General. Undefined for DM / non-topic requests. */
+  threadId?: number
 }
 
 /**
@@ -62,6 +66,7 @@ export function buildVaultGrantApprovedInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chat_id,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts, // synthetic — no Telegram message id exists
     user: 'vault-broker',
     userId: 0,
@@ -76,6 +81,7 @@ export function buildVaultGrantApprovedInbound(opts: {
     meta: {
       source: 'vault_grant_approved',
       agent: opts.ctx.agent,
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       key: opts.ctx.key,
       scope: opts.ctx.scope,
       grant_id: opts.grantId,
@@ -103,6 +109,7 @@ export function buildVaultGrantDeniedInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chat_id,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts,
     user: 'vault-broker',
     userId: 0,
@@ -116,6 +123,7 @@ export function buildVaultGrantDeniedInbound(opts: {
     meta: {
       source: 'vault_grant_denied',
       agent: opts.ctx.agent,
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       key: opts.ctx.key,
       scope: opts.ctx.scope,
       stage_id: opts.stageId,
@@ -133,6 +141,9 @@ export interface VaultSaveInboundContext {
   /** Telegram chat the save card lived in — keeps the synthesized
    *  resume-turn associated with the originating conversation. */
   chat_id: string
+  /** Supergroup forum topic the agent was working in when it requested the
+   *  save — so the resumed reply lands in that topic, not General. */
+  threadId?: number
 }
 
 /**
@@ -154,6 +165,7 @@ export function buildVaultSaveCompletedInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chat_id,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts,
     user: 'vault-broker',
     userId: 0,
@@ -165,6 +177,7 @@ export function buildVaultSaveCompletedInbound(opts: {
     meta: {
       source: 'vault_save_completed',
       agent: opts.ctx.agent,
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       key: opts.ctx.key,
       stage_id: opts.stageId,
       operator_id: opts.operatorId,
@@ -187,6 +200,7 @@ export function buildVaultSaveFailedInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chat_id,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts,
     user: 'vault-broker',
     userId: 0,
@@ -200,6 +214,7 @@ export function buildVaultSaveFailedInbound(opts: {
     meta: {
       source: 'vault_save_failed',
       agent: opts.ctx.agent,
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       key: opts.ctx.key,
       stage_id: opts.stageId,
       operator_id: opts.operatorId,
@@ -221,6 +236,7 @@ export function buildVaultSaveDiscardedInbound(opts: {
   return {
     type: 'inbound',
     chatId: opts.ctx.chat_id,
+    ...(opts.ctx.threadId != null ? { threadId: opts.ctx.threadId } : {}),
     messageId: ts,
     user: 'vault-broker',
     userId: 0,
@@ -234,6 +250,7 @@ export function buildVaultSaveDiscardedInbound(opts: {
     meta: {
       source: 'vault_save_discarded',
       agent: opts.ctx.agent,
+      ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       key: opts.ctx.key,
       stage_id: opts.stageId,
       operator_id: opts.operatorId,
