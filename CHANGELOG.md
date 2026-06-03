@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.52 — No more unformatted-then-deleted reply flash (#2128)
+
+Every reply used to flash an unformatted message that was then deleted and
+replaced by the formatted one — in DMs and supergroup topics alike. Root
+cause: the "visible answer-stream" posted a preliminary chat message seeded
+with the model's RAW markdown and streamed edits into it; when the model
+called the reply tool (≈every turn) the reply posted a SEPARATE formatted
+message and the stream RETRACTED (deleted) its preliminary. In supergroup
+topics it also mis-routed (preliminary → General, reply → topic).
+
+It delivered ~none of its intended "watch it type" value: Telegram
+rate-limits message edits to ~1/second, and the model emits almost no
+interstitial text (it thinks → tool → reply), so the preliminary was a
+near-empty bubble (observed: 5–13 byte edits) that flashed and vanished.
+
+Fix: the visible answer-stream now defaults **OFF**
+(`SWITCHROOM_VISIBLE_ANSWER_STREAM=1` to opt back in per agent). The answer
+lane uses the invisible compose-box draft (DMs) or stays fully suppressed
+(supergroup topics, where drafts aren't supported), so the reply tool's
+message is the single, canonical, properly-formatted one — no preliminary,
+no delete. The live "what it's doing" signal is unchanged (activity feed +
+"…typing" indicator).
+
 ## v0.14.51 — A resumed turn recovers the full original request (#2126)
 
 - **Restart-resume no longer loses the tail of a long request (#2126).** A turn
