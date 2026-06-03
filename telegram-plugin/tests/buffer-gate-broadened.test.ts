@@ -68,7 +68,12 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
   }
 
   it('declares a narrow `releaseTurnBufferGate` helper (not the full purgeReactionTracking)', () => {
-    expect(gatewaySrc).toMatch(/function releaseTurnBufferGate\(key: string\): void/)
+    // Multitopic component 1: the signature now also accepts an optional
+    // `endingTurn` so the serialize-until-replied drain gate can read its
+    // finalAnswerDelivered flag. The narrow-helper contract is unchanged.
+    expect(gatewaySrc).toMatch(
+      /function releaseTurnBufferGate\(key: string, endingTurn\?: CurrentTurn\): void/,
+    )
     // The helper docstring must explain WHY split from
     // purgeReactionTracking — future readers need to know.
     const doc = fnDocstring()
@@ -79,7 +84,10 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
   it('releaseTurnBufferGate ONLY clears activeTurnStartedAt + flushes; does NOT touch activeStatusReactions', () => {
     const body = fnBody()
     expect(body).toMatch(/activeTurnStartedAt\.delete\(key\)/)
-    expect(body).toMatch(/pendingInboundBuffer/)
+    // The drain is now routed through the shared `drainBufferedIfAllowed`
+    // helper (multitopic component 1), which owns the pendingInboundBuffer
+    // flush + the serialize-until-replied gate.
+    expect(body).toMatch(/drainBufferedIfAllowed\(/)
     // Critical regression guard: the helper must NOT touch the
     // reaction controller, else #1713's bidirectional ladder
     // collapses to 👍 mid-turn.
@@ -100,11 +108,12 @@ describe('buffer-gate release decoupled from final-answer classification', () =>
     // emits the 👍 reaction on the final-answer happy path).
     expect(slice).toMatch(/isFinalAnswerReply\(/)
     expect(slice).toMatch(/finalizeStatusReaction\(/)
-    // The new unconditional buffer-gate release must ALSO be
-    // present and must be OUTSIDE the isFinalAnswerReply branch
-    // (so trivial-prompt non-notification replies still release
-    // the gate).
-    expect(slice).toMatch(/releaseTurnBufferGate\(statusKey\(chat_id, threadId\)\)/)
+    // The unconditional buffer-gate release must ALSO be present and
+    // must be OUTSIDE the isFinalAnswerReply branch (so trivial-prompt
+    // non-notification replies still release the gate). Multitopic
+    // component 1: the call now passes the turn so the serialize gate
+    // can read finalAnswerDelivered.
+    expect(slice).toMatch(/releaseTurnBufferGate\(statusKey\(chat_id, threadId\), turn \?\? undefined\)/)
     // Structural check: the release must appear AFTER the
     // isFinalAnswerReply block's closing brace but BEFORE the
     // post-send block ends. Easiest pin: it must NOT be inside the
