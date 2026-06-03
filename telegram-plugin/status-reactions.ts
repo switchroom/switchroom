@@ -144,6 +144,10 @@ export class StatusReactionController {
   private stallHardTimer: ReturnType<typeof setTimeout> | null = null
   private finished = false
   private held = false
+  // True while parked on the awaiting-approval state (🙏): the turn is blocked
+  // on the operator's tap, not stalled. Read by the silence-poke fallback so it
+  // says "waiting for your approval" instead of the dishonest "still working…".
+  private awaitingApproval = false
   private readonly debounceMs: number
   private readonly stallSoftMs: number
   private readonly stallHardMs: number
@@ -272,11 +276,21 @@ export class StatusReactionController {
 
   // ──────────────────────────────────────────────────────────────────────
 
+  /** True while the turn is parked awaiting the operator's approval tap (🙏).
+   *  The silence-poke fallback reads this to phrase its 300s message honestly
+   *  ("waiting for your approval") instead of "still working…". */
+  isAwaiting(): boolean {
+    return this.awaitingApproval && !this.finished
+  }
+
   private scheduleState(
     state: ReactionState,
     opts: { immediate?: boolean; skipStallReset?: boolean } = {},
   ): void {
     if (this.finished) return
+    // Track the awaiting-approval state for isAwaiting(). Any non-awaiting
+    // state transition (setThinking/setTool/… on verdict resume) clears it.
+    this.awaitingApproval = state === 'awaiting'
     const emoji = this.resolveEmoji(state)
     if (emoji == null) {
       if (!opts.skipStallReset) this.resetStallTimers()
