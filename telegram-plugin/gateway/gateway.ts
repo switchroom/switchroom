@@ -8467,8 +8467,18 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
  * Called on the first reply (hand-off) and again at turn_end (no-reply safety
  * net); finalize edits are idempotent (a 'message is not modified' on the
  * second call is swallowed).
+ *
+ * `finalHtmlOverride` (finalize path only): a render captured by the caller
+ * BEFORE it tore down turn state the finalize render depends on. The
+ * foreground handoff-clear path passes this — it deletes the just-finished
+ * sub-agent's narrative right after this call, so the async
+ * `composeTurnActivity(turn, true)` below would see an emptied feed (and, on
+ * ack-first turns, empty `mirrorLines`), render null, and skip the finalize —
+ * freezing the last live "→ in-progress" line. The captured render keeps the
+ * persisted record reading done (✓). Omitted → compute it here (the common
+ * reply/turn_end callers, where state is stable).
  */
-function clearActivitySummary(turn: CurrentTurn): void {
+function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | null): void {
   const chat = turn.sessionChatId
   const thread = turn.sessionThreadId
   const inFlight = turn.activityInFlight ?? Promise.resolve()
@@ -8489,7 +8499,8 @@ function clearActivitySummary(turn: CurrentTurn): void {
     }
     // Default: leave the status message as a record, edited to a terminal
     // all-done state so it doesn't freeze on a misleading "→ in-progress" line.
-    const finalHtml = composeTurnActivity(turn, true)
+    const finalHtml =
+      finalHtmlOverride !== undefined ? finalHtmlOverride : composeTurnActivity(turn, true)
     if (finalHtml == null) return
     try {
       await robustApiCall(
@@ -19278,20 +19289,32 @@ void (async () => {
                   // tool result, so there's no handback to deliver. Reaction
                   // promotion already ran above.
                   const turn = currentTurn
-                  const removed = turn != null && turn.foregroundSubAgents.delete(agentId)
-                  if (turn != null && removed) {
+                  // has()-then-delete (not delete-up-front): the handoff-clear
+                  // branch must render the finished sub-agent's steps as done
+                  // WHILE its narrative is still in the map, then remove it.
+                  if (turn != null && turn.foregroundSubAgents.has(agentId)) {
                     const action = foregroundFinishAction({
-                      removed,
+                      removed: true,
                       replyCalled: turn.replyCalled,
-                      remainingForeground: turn.foregroundSubAgents.size,
+                      // size AFTER this agent's impending removal
+                      remainingForeground: turn.foregroundSubAgents.size - 1,
                     })
                     if (action === 'handoff-clear') {
                       // Post-ack: the last foreground sub-agent finished and
                       // the parent will now produce its answer inline. Hand
                       // the re-opened feed off to the answer, mirroring the
-                      // first-reply clear (turn_end is the safety net).
-                      clearActivitySummary(turn)
+                      // first-reply clear (turn_end is the safety net). Capture
+                      // the finalized render (child steps done ✓) BEFORE the
+                      // delete, then pass it so the persisted record doesn't
+                      // freeze on a stale "→ in-progress" line (the emptied-feed
+                      // skip — see clearActivitySummary's finalHtmlOverride doc).
+                      const finalHtml = composeTurnActivity(turn, true)
+                      turn.foregroundSubAgents.delete(agentId)
+                      clearActivitySummary(turn, finalHtml)
                     } else if (action === 'recompose') {
+                      // Collapse the finished sub-agent's block: delete first,
+                      // then render WITHOUT it (live feed keeps its → step).
+                      turn.foregroundSubAgents.delete(agentId)
                       const rendered = composeTurnActivity(turn)
                       if (rendered != null) {
                         turn.activityPendingRender = rendered
