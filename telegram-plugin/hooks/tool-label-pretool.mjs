@@ -133,8 +133,9 @@ export function computeLabel(toolName, input) {
     }
   }
 
-  // MCP allowlist.
+  // MCP tools.
   if (typeof toolName === 'string' && toolName.startsWith('mcp__')) {
+    // Explicit labels / suppressions for the built-in servers.
     switch (toolName) {
       case 'mcp__switchroom-telegram__reply':
       case 'mcp__switchroom-telegram__stream_reply':
@@ -150,15 +151,46 @@ export function computeLabel(toolName, input) {
         return 'Searching memory'
       case 'mcp__hindsight__retain':
         return 'Saving memory'
-      // Explicit suppressions — return null so we don't emit a sidecar
-      // line at all. (Falling through to the default below produces the
-      // same effect, but listing these makes the intent obvious.)
+      // Explicit suppressions — return null so we don't emit a sidecar line.
       case 'mcp__switchroom-telegram__send_typing':
       case 'mcp__hindsight__sync_retain':
         return null
     }
-    // Any other mcp__* tool: not on the allowlist, no label.
-    return null
+    // Generic fallback for ANY other MCP tool (operator-configured servers
+    // — perplexity, webkite, gdrive, notion, …). These previously returned
+    // null → invisible in the live activity feed, so a research turn driven
+    // entirely by MCP tools read as pure silence (only a typing dot + the
+    // 👀 reaction) — the "I can't see what it's doing" report. Mirror the
+    // gateway's describeToolUse: friendly per-server labels, else a
+    // model-authored field, else a humanized tool name. NEVER label
+    // switchroom-telegram surface/control tools (they ARE the conversation).
+    const m = /^mcp__(.+?)__(.+)$/.exec(toolName)
+    if (!m) return null
+    const server = m[1].toLowerCase()
+    const tool = m[2].toLowerCase()
+    if (server === 'switchroom-telegram') return null
+    if (server === 'hindsight') return 'Working with memory'
+    if (server === 'google-workspace' || server === 'claude_ai_google_calendar')
+      return 'Checking your calendar'
+    if (server === 'claude_ai_gmail') return 'Checking your email'
+    if (server === 'claude_ai_google_drive' || server === 'gdrive')
+      return 'Looking through your files'
+    if (server === 'notion' || server === 'claude_ai_notion') return 'Checking your notes'
+    if (server === 'perplexity') {
+      const q = clip(String(i.query ?? i.description ?? ''), 60).trim()
+      return q ? `Searching the web for ${q}` : 'Searching the web'
+    }
+    if (server === 'webkite') {
+      const u = clip(urlHostPath(i.url ?? ''), 60).trim()
+      return u ? `Reading ${u}` : 'Reading the web'
+    }
+    // Unknown MCP server: prefer a model-authored field, else humanized tool.
+    const desc =
+      clip(String(i.description ?? ''), 60).trim() ||
+      clip(String(i.query ?? ''), 50).trim() ||
+      clip(String(i.title ?? ''), 50).trim()
+    if (desc) return desc
+    return `Using ${tool.replace(/[-_]+/g, ' ')}`
   }
 
   return null
