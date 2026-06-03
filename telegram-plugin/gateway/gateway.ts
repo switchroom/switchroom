@@ -8154,17 +8154,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Phase tracking removed in #553 PR 5 — phases only fed the
       // placeholder-heartbeat label, which has been retired.
       if (isTelegramReplyTool(name)) {
-        const wasFirstReply = !turn.replyCalled
         turn.replyCalled = true
         if (turn.orphanedReplyTimeoutId != null) {
           clearTimeout(turn.orphanedReplyTimeoutId)
           turn.orphanedReplyTimeoutId = null
         }
-        // The model's real reply takes over as the authoritative
-        // surface, so delete the activity feed message — the user
-        // sees the real reply land in the same beat the feed
-        // disappears. turn_end is the no-reply safety net.
-        if (wasFirstReply) {
+        // Delete the activity feed only when the FINAL answer has landed —
+        // NOT on an ack-first interim reply ("On it"). Gating on the first
+        // reply deleted the feed on the ack, so the post-ack work
+        // (sub-agents/tools) rendered into nothing — the "agent went silent
+        // after On it" gap. `finalAnswerDelivered` is set by executeReply
+        // (isFinalAnswerReply) before this tool_use event fires; turn_end
+        // (below) clears unconditionally as the idempotent no-reply / race net.
+        if (turn.finalAnswerDelivered) {
           clearActivitySummary(turn)
         }
       }
@@ -8195,15 +8197,16 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
-      // Stop feeding once the reply has landed. The first reply is the
-      // hand-off: `clearActivitySummary` deletes the feed so the answer is
-      // the authoritative surface (the validated clean hand-off). Without
-      // this gate a tool called after the reply would re-`sendMessage` a
-      // fresh feed message below the answer — a delete-then-resend flicker.
+      // Stop feeding once the FINAL answer has landed — the hand-off where
+      // `clearActivitySummary` deletes the feed so the answer is the
+      // authoritative surface. Gating on `replyCalled` (any reply) killed the
+      // feed on an ack-first interim "On it", so the post-ack work had no live
+      // surface; gate on `finalAnswerDelivered` so the feed keeps narrating
+      // between the ack and the real answer. Without this a tool called after
+      // the FINAL answer would re-`sendMessage` a fresh feed below it (flicker).
       // Safe ordering: `tool_label` is real-time (PreToolUse, ~250ms) while
-      // `replyCalled` is set from the lagged reply tool_use, so a genuinely
-      // pre-reply label virtually always arrives before the flag flips.
-      if (turn.replyCalled) return
+      // `finalAnswerDelivered` is set from executeReply on the final answer.
+      if (turn.finalAnswerDelivered) return
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
         // Recompose so any active foreground sub-agent's nested block (Model A)
