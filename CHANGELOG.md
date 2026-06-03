@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.14.53 — Answers post promptly after long tasks (#2130)
+
+- **No more ~30-second blank after a long task (#2130).** Agents sometimes
+  finished a turn with the answer written as plain transcript text and never
+  called the reply tool — and since Telegram only shows what's sent through the
+  reply tool, the answer only appeared ~30s later when the gateway's backstop
+  flushed it. It read as "the agent went quiet / isn't posting updates," most
+  often after long multi-step jobs (e.g. scheduling a batch of social posts).
+  Measured at 15–40% of turns across the fleet. The per-turn pacing guidance now
+  explicitly binds "answer" to a reply-tool call — so the agent delivers its
+  result through the reply tool instead of leaving it as transcript text the
+  backstop has to rescue. Greetings and genuine non-prompts still correctly send
+  nothing. Prompt-only change; takes effect on restart.
+
 ## v0.14.52 — No more unformatted-then-deleted reply flash (#2128)
 
 Every reply used to flash an unformatted message that was then deleted and
