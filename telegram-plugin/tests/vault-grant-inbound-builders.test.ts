@@ -16,7 +16,11 @@ import { describe, it, expect } from 'vitest'
 import {
   buildVaultGrantApprovedInbound,
   buildVaultGrantDeniedInbound,
+  buildVaultSaveCompletedInbound,
+  buildVaultSaveFailedInbound,
+  buildVaultSaveDiscardedInbound,
   type VaultGrantInboundContext,
+  type VaultSaveInboundContext,
 } from '../gateway/vault-grant-inbound-builders.js'
 
 const FIXED_NOW = 1_700_000_000_000
@@ -223,4 +227,84 @@ describe('approve vs deny shape invariants', () => {
     expect(String(approve.meta?.source)).toMatch(/^vault_grant_approved$/)
     expect(String(deny.meta?.source)).toMatch(/^vault_grant_denied$/)
   })
+})
+
+// ── Supergroup topic routing (gap #2) ──────────────────────────────────────
+//
+// When the agent requested the credential from inside a forum topic, the
+// grant/save-outcome inbound must carry that topic so the resumed turn's
+// reply lands back in it — not General. The carrier is two-fold and BOTH
+// halves are load-bearing:
+//   - top-level `threadId` → the gateway's per-topic busy-key / deliver-
+//     until-acked keying (markClaudeBusyForInbound reads it).
+//   - `meta.message_thread_id` (stringified) → rendered into the
+//     `<channel message_thread_id="…">` XML, which session-tail's
+//     parseChannelMeta re-extracts to set currentTurn.sessionThreadId, which
+//     the reply tool defaults to. Drop either and the reply mis-routes.
+//
+// DM / non-topic requests must leave BOTH absent (an empty-string or 0
+// thread is a Telegram 400 "message thread not found").
+describe('grant/save outcome topic routing', () => {
+  const SAVE_CTX: VaultSaveInboundContext = {
+    agent: 'marko',
+    key: 'brevo/api-key',
+    chat_id: '-1001234567890',
+  }
+  const THREAD = 4242
+
+  const grantBuilders = [
+    {
+      name: 'approved',
+      build: (ctx: VaultGrantInboundContext) =>
+        buildVaultGrantApprovedInbound({ ctx, grantId: 'vg_x', stageId: 's', operatorId: '1' }),
+    },
+    {
+      name: 'denied',
+      build: (ctx: VaultGrantInboundContext) =>
+        buildVaultGrantDeniedInbound({ ctx, stageId: 's', operatorId: '1' }),
+    },
+  ]
+  const saveBuilders = [
+    {
+      name: 'save-completed',
+      build: (ctx: VaultSaveInboundContext) =>
+        buildVaultSaveCompletedInbound({ ctx, stageId: 's', operatorId: '1' }),
+    },
+    {
+      name: 'save-failed',
+      build: (ctx: VaultSaveInboundContext) =>
+        buildVaultSaveFailedInbound({ ctx, stageId: 's', operatorId: '1', reason: 'disk full' }),
+    },
+    {
+      name: 'save-discarded',
+      build: (ctx: VaultSaveInboundContext) =>
+        buildVaultSaveDiscardedInbound({ ctx, stageId: 's', operatorId: '1' }),
+    },
+  ]
+
+  for (const { name, build } of grantBuilders) {
+    it(`${name}: threadId set → top-level threadId + meta.message_thread_id (stringified)`, () => {
+      const msg = build({ ...CTX_READ, threadId: THREAD })
+      expect(msg.threadId).toBe(THREAD)
+      expect(msg.meta?.message_thread_id).toBe(String(THREAD))
+    })
+    it(`${name}: threadId absent → both omitted (DM stays thread-less)`, () => {
+      const msg = build(CTX_READ)
+      expect(msg.threadId).toBeUndefined()
+      expect(msg.meta?.message_thread_id).toBeUndefined()
+    })
+  }
+
+  for (const { name, build } of saveBuilders) {
+    it(`${name}: threadId set → top-level threadId + meta.message_thread_id (stringified)`, () => {
+      const msg = build({ ...SAVE_CTX, threadId: THREAD })
+      expect(msg.threadId).toBe(THREAD)
+      expect(msg.meta?.message_thread_id).toBe(String(THREAD))
+    })
+    it(`${name}: threadId absent → both omitted (DM stays thread-less)`, () => {
+      const msg = build(SAVE_CTX)
+      expect(msg.threadId).toBeUndefined()
+      expect(msg.meta?.message_thread_id).toBeUndefined()
+    })
+  }
 })
