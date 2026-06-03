@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.55 — Telegram channel config knobs reach the gateway on docker (#2135)
+
+- **`channels.telegram.*` env knobs now actually take effect on docker
+  agents (#2135).** start.sh forks the Telegram gateway daemon in its outer
+  pass, then re-execs into a tmux inner pass for the agent. The
+  `channels.telegram.*` knobs the gateway reads from its environment
+  (stream throttle, edit budget, and the new
+  `clear_status_on_completion` from v0.14.54) were exported only in the
+  inner pass — *after* the gateway had already forked — so the daemon never
+  saw them and every such knob silently fell back to its default. They're
+  now exported before the gateway fork. No fleet behaviour change today (no
+  agent sets one of these knobs); this makes them functional for anyone who
+  does — including `clear_status_on_completion: true` to opt back into
+  deleting the live status feed on completion. Takes effect on restart.
+
 ## v0.14.54 — The "what it's doing" status stays as a record (#2132)
 
 - **The live activity/status feed now stays in the chat by default (#2132).**
