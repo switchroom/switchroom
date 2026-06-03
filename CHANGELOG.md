@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.50 — Resumed turns get a progress card + survive a not-ready restart (#2122)
+
+When an agent restarts mid-work, the boot-resume wake-up (the synthetic message
+that makes it pick up the interrupted task without being re-prompted) is now a
+first-class turn and can't be silently dropped.
+
+- **Resumed turns show progress and route to the right place (#2122).** The
+  boot-resume synthetics carried only `meta.source` — no `chat_id` / topic. The
+  gateway builds a turn's `currentTurn` (progress card, silence-poke hang
+  protection, reply routing) only when the enqueue carries a `chat_id`, and the
+  channel attributes are rendered from `meta` alone. So a resumed turn ran with
+  **no progress card and no silence-poke**, and on a supergroup agent its reply
+  fell back to the default chat instead of the topic the interrupted work lived
+  in. Both resume builders now carry `chat_id` + `message_thread_id` in meta
+  (the same shape real inbounds and sub-agent handbacks already use), so a
+  resumed/report turn shows live progress, is hang-protected, and answers in the
+  originating chat/topic.
+
+- **The resume wake survives a not-ready restart (#2122).** The resume synthetic
+  is buffered and redelivered on bridge-up exactly like a user inbound, but it
+  was excluded from the deliver-until-acked queue — so a restart that dropped it
+  into a still-booting (slow MCP) session silently failed to pick the work back
+  up (the resume-side of the v0.14.48 lost-message race). The `resume_interrupted`
+  synthetic now also carries a `message_id`, letting it enrol in the queue and
+  re-deliver until claude consumes it, keyed and id-matched so it can never
+  re-deliver forever. The watchdog "report" stays untracked; every other
+  synthetic (cron / vault / handback) is unchanged. Rides the existing
+  `SWITCHROOM_INBOUND_DELIVERY_CONFIRM` kill switch.
+
 ## v0.14.49 — Reboot cards edit in place → zero notification (#2121)
 
 Agent reboot "back up" cards already arrived silently (no sound/banner,
