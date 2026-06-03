@@ -96,6 +96,7 @@ import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
+import { parseVisibleAnswerStreamEnabled } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
   shouldSuppressToolActivity,
@@ -3738,23 +3739,33 @@ const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 // the cross-turn pending-progress system (#1445/#1669) is the
 // canonical surface and DOES ping at the appropriate boundaries.
 //
-// 2026-05-25: default flipped ON after fleet-log audit showed
-// framework-fallback rate at ~19% of inbounds (target per
-// `reference/conversational-pacing.md`: <0.5%). Streaming the
-// model's text events live into the chat closes the
-// catastrophic-UX failure mode at the lane-of-first-defense level.
-// Aligned with the "chat IS the artifact" sub-principle (the user
-// sees a normal chat message that grows — no chrome, no parallel
-// widget). Override with SWITCHROOM_VISIBLE_ANSWER_STREAM=0 to
-// disable, e.g. for an agent that needs the legacy draft-only
-// behaviour during debugging.
-const ANSWER_STREAM_VISIBLE_ENABLED = (() => {
-  const raw = process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM
-  if (raw == null) return true
-  const v = raw.trim().toLowerCase()
-  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false
-  return true
-})()
+// 2026-05-25: default flipped ON after a fleet-log audit showed a ~19%
+// framework-fallback ("still working…") rate — the visible stream gave an
+// immediate in-timeline signal that suppressed the silence-poke.
+//
+// 2026-06-03: default flipped back OFF (operator request). In practice the
+// visible stream delivered ~none of its intended benefit while imposing a
+// jarring cost:
+//   - Telegram rate-limits editMessageText to roughly once/second, so real
+//     "watch it type" streaming is impossible; and the model emits almost no
+//     interstitial assistant.text (it thinks → tool → reply), so the
+//     preliminary was a near-empty bubble (observed: 5–13 byte edits).
+//   - On every turn where the model calls the reply tool (≈always), the reply
+//     posts a SEPARATE canonical message and the stream RETRACTS (deletes) its
+//     preliminary — the user sees a raw bubble appear then vanish, replaced by
+//     the formatted reply. In supergroup topics it also mis-routed (preliminary
+//     → General, reply → topic). Net: an unformatted flash + a delete, no
+//     streaming value.
+// The anti-silence role the visible stream once filled is now covered by the
+// live ACTIVITY FEED (tool-use streaming, below), the "…typing" chat-action
+// loop, and `thinking_effort: low` (fast tool-less turns) — so off-by-default
+// no longer regresses the framework-fallback rate. With the flag off the lane
+// uses the invisible compose-box draft (the original default, #1664-compatible)
+// and the reply tool is the single canonical, formatted message.
+// Opt back IN per agent with SWITCHROOM_VISIBLE_ANSWER_STREAM=1.
+const ANSWER_STREAM_VISIBLE_ENABLED = parseVisibleAnswerStreamEnabled(
+  process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM,
+)
 
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
