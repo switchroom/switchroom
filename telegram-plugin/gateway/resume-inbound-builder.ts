@@ -66,9 +66,12 @@ function threadIdNum(turn: Turn): number | undefined {
 function promptClause(turn: Turn): string {
   const p = turn.user_prompt_preview?.trim()
   if (!p) return ''
-  // Quote-trim so a long preview doesn't bloat the channel body.
-  const snippet = p.length > 160 ? p.slice(0, 160) + '…' : p
-  return ` The request was: "${snippet}".`
+  // The stored preview is already capped at the first ~200 chars of the user
+  // message (TURN_PREVIEW_MAX). Include it verbatim as a hint — do NOT
+  // re-truncate (the old 160-char slice dropped instructions that lived in the
+  // tail of a longer request). The FULL original is recovered via
+  // get_recent_messages; the resume body tells the model to do that.
+  return ` The start of the request was: "${p}".`
 }
 
 /**
@@ -117,12 +120,18 @@ export function buildResumeInterruptedInbound(ctx: ResumeInboundContext): Inboun
       `You just restarted. Your previous turn was interrupted ${elapsed} ago, ` +
       `before it finished — it was cut off by a restart, not completed.` +
       promptClause(ctx.turn) +
-      ` Pick that work back up now and continue it through to completion. ` +
-      `In your first message, briefly let the user know you're resuming what ` +
-      `was interrupted (mention roughly how long ago in plain language) so ` +
-      `they're not left wondering — then carry on with the actual task. Do ` +
-      `not ask whether to resume; just resume. If you genuinely can't tell ` +
-      `what the work was, say so and ask.`,
+      ` That quoted text is only the first ~200 characters of the original ` +
+      `request, and you've lost your in-memory context across the restart — so ` +
+      `BEFORE you continue, call get_recent_messages for this chat to read your ` +
+      `full original message and the surrounding conversation, so you resume the ` +
+      `COMPLETE task (including any instructions in the tail of a long request), ` +
+      `not just the truncated preview. Then pick that work back up and carry it ` +
+      `through to completion. In your first message, briefly let the user know ` +
+      `you're resuming what was interrupted (mention roughly how long ago in ` +
+      `plain language) so they're not left wondering — then carry on with the ` +
+      `actual task. Do not ask whether to resume; just resume. If even after ` +
+      `reading the recent messages you genuinely can't tell what the work was, ` +
+      `say so and ask.`,
     meta,
   }
 }

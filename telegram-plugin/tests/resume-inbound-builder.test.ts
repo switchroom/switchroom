@@ -106,12 +106,22 @@ describe('buildResumeInterruptedInbound', () => {
     expect(msg.meta.original_prompt).toBe('refactor the auth module')
   })
 
-  it('truncates a long prompt preview in the body', () => {
-    const long = 'x'.repeat(300)
-    const turn = makeTurn({ user_prompt_preview: long })
-    const msg = buildResumeInterruptedInbound({ turn })
-    expect(msg.text).toContain('…')
-    expect(msg.text).not.toContain('x'.repeat(200))
+  it('includes the FULL stored preview in the body (no double-truncation below the 200-char storage cap)', () => {
+    // The turns table already caps the preview at ~200 chars (TURN_PREVIEW_MAX);
+    // the builder must NOT slice it shorter (the old 160-char cut dropped detail
+    // from the tail of a longer request). A 180-char preview must appear in full.
+    const preview = "step 1 do X; step 2 do Y; step 3 do Z; " + "d".repeat(141) // 180 chars
+    expect(preview.length).toBe(180)
+    const msg = buildResumeInterruptedInbound({ turn: makeTurn({ user_prompt_preview: preview }) })
+    expect(msg.text).toContain(preview) // verbatim, not sliced to 160
+    expect(msg.meta.original_prompt).toBe(preview)
+  })
+
+  it('tells the resumed turn to recover the FULL original via get_recent_messages', () => {
+    const msg = buildResumeInterruptedInbound({ turn: makeTurn({ user_prompt_preview: 'short task' }) })
+    expect(msg.text).toContain('get_recent_messages')
+    // Frames the quoted preview as partial so the model knows to fetch the rest.
+    expect(msg.text).toMatch(/first ~200 characters|start of the request/i)
   })
 
   it('routes to the forum thread when thread_id is numeric', () => {
