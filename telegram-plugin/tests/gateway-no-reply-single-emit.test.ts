@@ -68,6 +68,41 @@ describe('#656 — answer-stream retract() at turn_end emits nothing', () => {
     expect(deleteMessage).not.toHaveBeenCalled()
   })
 
+  // Visible-answer-stream OFF (default since 2026-06-03): the gateway passes
+  // minInitialChars=MAX_SAFE_INTEGER so a SUPERGROUP turn (message transport —
+  // draft is unsupported in forum topics) NEVER opens a visible preview, no
+  // matter how much interstitial assistant.text streams. This is the full fix
+  // for the marko-General unformatted-flash (the DM path is already covered by
+  // draft transport). Without it, message transport opens at the 50-char gate
+  // and retract() then deletes it.
+  it('flag-off supergroup: huge minInitialChars never opens a message even past the 50-char gate', async () => {
+    const sendMessage = vi.fn(async () => ({ message_id: nextMessageId++ }))
+    const editMessageText = vi.fn(async () => {})
+    const deleteMessage = vi.fn(async () => {})
+
+    const stream = createAnswerStream({
+      chatId: 'supergroup-topic',
+      isPrivateChat: false, // supergroup → message transport (no draft)
+      threadId: 4,
+      minInitialChars: Number.MAX_SAFE_INTEGER,
+      throttleMs: 250,
+      sendMessage: sendMessage as never,
+      editMessageText: editMessageText as never,
+      deleteMessage: deleteMessage as never,
+    })
+
+    // Feed 200 chars — well past the default 50-char open gate.
+    stream.update('x'.repeat(200))
+    vi.advanceTimersByTime(1000)
+    await flushMicrotasks()
+    expect(sendMessage).not.toHaveBeenCalled() // never opened a preview
+    expect(editMessageText).not.toHaveBeenCalled()
+
+    await stream.retract()
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(deleteMessage).not.toHaveBeenCalled() // nothing to delete → no flash
+  })
+
   it('retract after a preliminary send: deletes the prelim, no fresh sendMessage', async () => {
     const THROTTLE = 1000
     const sendMessage = vi.fn(async () => ({ message_id: nextMessageId++ }))

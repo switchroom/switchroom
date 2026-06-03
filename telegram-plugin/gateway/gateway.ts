@@ -8437,9 +8437,19 @@ function handleSessionEvent(ev: SessionEvent): void {
             // tool_use stream (case 'tool_use' above) where the real
             // signal lives. assistant.text keeps its visible-message
             // home; the reply tool stays the canonical answer.
+            // Flag OFF (default): use the compose-box draft for DMs, and set
+            // minInitialChars effectively-infinite so the lane NEVER opens a
+            // visible chat message. This matters in supergroup TOPICS, where
+            // draft transport is unsupported (gateway.ts:6422) so the lane
+            // would otherwise fall to message transport and post a visible
+            // preview once interstitial text passed the default 50-char gate
+            // — which retract() then deletes (the unformatted flash, marko
+            // General). With the gate unreachable the only posted message is
+            // the canonical reply. (The gate is bypassed for DM draft
+            // transport, so DM draft streaming is unaffected.)
             ...(ANSWER_STREAM_VISIBLE_ENABLED
               ? { minInitialChars: 1 }
-              : { sendMessageDraft: sendMessageDraftFn }),
+              : { sendMessageDraft: sendMessageDraftFn, minInitialChars: Number.MAX_SAFE_INTEGER }),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
