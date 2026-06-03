@@ -34,6 +34,7 @@ operators jump to **Operating**; contributors and reviewers use
 | [status-ask-cause-classes.md](status-ask-cause-classes.md) | Cause-class catalog for driving the status-ask rate to zero. |
 | [session-optimization.md](session-optimization.md) | Managing context/tokens in long-running agents. |
 | [sub-agents.md](sub-agents.md) | Sub-agent delegation ("Opus plans, Sonnet implements"). |
+| [supergroup-mode.md](supergroup-mode.md) | One agent owns a Telegram forum supergroup, routing work into per-topic threads (opt-in). |
 | [google-workspace.md](google-workspace.md) | Agents reading Google Docs/Sheets/Slides/folders. |
 | [webhook-ingest.md](webhook-ingest.md) | Pushing external events into a specific agent's log. |
 | [posthog.md](posthog.md) | Telemetry: product analytics + error tracking via PostHog. |
