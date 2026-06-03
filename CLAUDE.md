@@ -753,6 +753,16 @@ lifecycle changes):
 - `jtbd-always-on-after-restart-dm` — first message after restart
   ≤60s (5-min wedge regression gate).
 - `jtbd-memory-survives-restart-dm` — memory persistence across restart.
+- `jtbd-message-during-restart-dm` / `-channel` — a message sent
+  *during* the restart boot window is still answered (v0.14.48 / #2117
+  lost-message gate; sends DURING boot, unlike always-on which sends
+  after). Set `SWITCHROOM_UAT_BOOT_SEND_DELAY_MS=6000` to land it deep
+  enough in the not-ready window to exercise the strand-rescue sweep.
+- `jtbd-interrupted-turn-resumes-dm` — a turn interrupted by a restart
+  is resumed (and the resume turn completes, not silently dropped)
+  (v0.14.50 / #2122 gate). Asserts the resume *framing*, not an
+  end-token (the resume synthetic only carries the first ~160 chars of
+  the original prompt).
 - Any feature-specific scenario.
 
 **Supergroup / channel UAT (status-routing work — required).** Every
