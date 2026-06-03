@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.14.44 — Status honesty + post-ack feed + supergroup sibling-topic fix (#2107, #2108, #2109)
+
+Three fixes from a turn-wedge root-cause investigation — the recurring 300s
+"turn-wedges" turned out to be mostly a *benign* approval-latency artifact plus
+two status-surface gaps.
+
+- **Silence-poke tells the truth when you're the blocker (#2107).** The 300s
+  framework-fallback said *"still working… (no update in 5 min)"* even when the
+  turn was parked on an approval card waiting for your tap — the dominant live
+  wedge class (claude alive, blocked on a permission prompt, self-recovering
+  the instant you answer). It now says *"waiting for your approval — tap
+  Approve or Deny on the card above (N min)"* when the reaction controller is in
+  its awaiting-approval state. Pure copy/branch; the 300s self-recovery is
+  unchanged.
+
+- **The activity feed survives an ack-first reply (#2108).** Ack-first ("On it"
+  → then delegate/work) is the live fleet pattern, but the feed was deleted on
+  the *first* reply, so the post-ack sub-agent/tool work rendered into nothing
+  ("agent went silent after On it"). The feed lifecycle now gates on
+  `finalAnswerDelivered` instead of the first reply, so it keeps narrating
+  between the ack and the real answer. turn_end's unconditional clear stays as
+  the idempotent net.
+
+- **A live supergroup topic isn't purged when another times out (#2109).** The
+  silence-poke's sibling-key sweep matched on chatId only — and in
+  one-agent-owns-supergroup every forum topic shares the chatId, so a 300s poke
+  on topic A purged a LIVE sibling topic B's reaction controller + typing loop.
+  Each sibling is now gated on its OWN silence clock (purge only if itself
+  silent ≥ the fallback threshold, or dangling) — preserving the #1556
+  dangling-key cleanup while sparing live topics. Uses silence, not turn-start
+  age, so a long-but-narrating turn isn't mistaken for stale.
+
 ## v0.14.43 — Sub-agent status reaches users in channels, not just DMs (#2098–#2102)
 
 Status from delegated work — background workers, foreground sub-agents,
