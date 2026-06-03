@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.14.43 — Sub-agent status reaches users in channels, not just DMs (#2098–#2102)
+
+Status from delegated work — background workers, foreground sub-agents,
+researchers — was reliable in DMs but **mis-routed or invisible in Telegram
+supergroups**, the operator's "must work in channels" gap. A 9-lens audit
+found two root causes: synthesized sub-agent inbounds were *born thread-blind*,
+and a foreground sub-agent's tool steps never surfaced. This release fixes both
+and adds the first real-Telegram **supergroup UAT** coverage (every prior
+scenario was DM-only).
+
+- **Sub-agent handback / progress route to the dispatching topic (#2098).**
+  When a background worker finished, the agent's in-voice "here's what I found"
+  handback (and mid-flight progress wake-ups) landed in the chat's *last-seen*
+  topic instead of the topic the work was dispatched from — reading as silence
+  in the topic the user was watching. `resolveSubagentOriginChat` already
+  resolved the origin topic, but the handback/progress callsites took only
+  `.chatId` and dropped `.threadId`, and the inbound builders had no thread
+  carrier. Now both builders carry the origin topic (top-level `threadId` +
+  `meta.message_thread_id`, mirroring the real-inbound shape), applied only
+  when the origin chat resolved (the owner-DM fallback stays topic-less). And
+  `executeReply` / `executeStreamReply` now prefer **this turn's own
+  originating topic** over the chat's last-seen-topic heuristic when the model
+  passes no explicit `message_thread_id` — strictly more correct under
+  multi-topic concurrency; DM behavior unchanged. Pure jsonl-tail → render,
+  no model call. 24 new builder/decision thread-assertions.
+
+- **Foreground sub-agents nest TOOL steps, not just prose (#2099).** A
+  foreground sub-agent (Task/Agent, no `run_in_background`) that ran tools
+  *without narrating* — a researcher reading files, a worker running commands —
+  surfaced nothing in the parent turn's nested `↳` activity block: the watcher
+  fired `onProgress` only on `sub_agent_text` (prose), never on
+  `sub_agent_tool_use`. Now it fires on tool events too, carrying a friendly
+  `describeToolUse` label ("Reading X", "Running a command") — the same
+  renderer the main-turn feed uses — so foreground steps read identically. The
+  worker's narrative result (`latestSummary`, the beat-4 handback payload) is
+  never polluted with tool labels.
+
+- **Supergroup channel UAT + driver dialog priming (#2101).** First
+  real-Telegram coverage in a forum supergroup: `jtbd-supergroup-reply-channel`
+  (agent replies inside the supergroup, not the DM) and
+  `fuzz-supergroup-channel` (realistic inbounds → meaningful, leak-free replies
+  land in the topic). New `driver.primeDialogs()` / `driver.canResolve()`
+  prime the mtcute MemoryStorage peer cache so a username-less supergroup
+  resolves. Both self-skip green when no test supergroup is wired.
+
+- **UAT fuzz: jailbreak-resistance false-positive fixed (#2102) + steer
+  narration accepted (#2100).** The fuzz jailbreak check matched the trigger
+  word *anywhere*, mis-flagging a correct refusal that quoted the bait as a
+  surrender; it now only flags genuine persona-adoption. #2100 accepts
+  "switched to X as you asked" steer narration.
+
 ## v0.14.42 — Approval cards reach the operator from supergroup topics (#2096)
 
 A HIGH-RISK approval / permission card (e.g. a Brevo `POST`, or a Drive /
