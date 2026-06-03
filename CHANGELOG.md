@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.56 — Two questions in two topics get two answers, each in its own topic (#2137)
+
+- **Per-topic reply routing for multi-topic supergroups (#2137).** Asking an
+  agent two questions in two different forum topics back-to-back could land
+  *both* answers in one topic (and leave the other unanswered). An agent is one
+  Claude session and can only reply sequentially — but each question must be
+  answered in its own topic. Two root causes: a buffered cross-topic message
+  drained the moment a turn ended even if that turn hadn't replied yet (orphaning
+  its answer into the next topic), and a late reply was attributed to whichever
+  topic's turn was active at reply time. Now: a queued cross-topic message is
+  held until the current topic's turn actually delivers its reply (with a bounded
+  ~2.5s escape hatch so a no-reply turn can never wedge the queue), every reply
+  is pinned to the topic its turn originated from, and the waiting topic shows a
+  self-clearing "Queued — replying in #X" status. DMs and single-topic chats are
+  unchanged. All behind kill-switches (`SWITCHROOM_SERIALIZE_UNTIL_REPLIED`,
+  `SWITCHROOM_SERIALIZE_NOREPLY_DRAIN_MS`, `SWITCHROOM_TURN_ORIGIN_ROUTING`,
+  `SWITCHROOM_TOPIC_FRAMING`, `SWITCHROOM_QUEUED_STATUS_UX`).
+
 ## v0.14.55 — Telegram channel config knobs reach the gateway on docker (#2135)
 
 - **`channels.telegram.*` env knobs now actually take effect on docker
