@@ -67,6 +67,7 @@ import {
   type ConfigDiff,
 } from './config-snapshot.js'
 import { join } from 'path'
+import { bootCardChatKey, loadBootCardMsgId, saveBootCardMsgId } from './boot-card-msgid.js'
 import { loadConfig as _loadSwitchroomConfig } from '../../src/config/loader.js'
 import { resolveAgentConfig as _resolveAgentConfig } from '../../src/config/merge.js'
 
@@ -134,6 +135,21 @@ export interface BotApiForBootCard {
     text: string,
     opts?: Record<string, unknown>,
   ): Promise<unknown>
+  /**
+   * Like `editMessageText`, but reports whether the target message still
+   * exists rather than swallowing a "message to edit not found" the way the
+   * shared retry policy does (retry-api-call.ts) — the boot path needs to
+   * know so it can fall back to a fresh send when the prior card was deleted.
+   * `'edited'` = the edit landed (or content was identical → message exists);
+   * `'gone'` = the message is missing (or any other error → send fresh).
+   * Optional so existing callers/tests without it fall back to always-send.
+   */
+  editMessageTextStrict?(
+    chatId: string,
+    messageId: number,
+    text: string,
+    opts?: Record<string, unknown>,
+  ): Promise<'edited' | 'gone'>
 }
 
 export interface BootCardHandle {
@@ -568,6 +584,17 @@ export interface RunProbesOpts {
    * resolve the default memory collection label.
    */
   configSnapshotPath?: string
+  /**
+   * Cross-reboot store for the boot card's Telegram message id (JSON,
+   * typically `<agentDir>/.boot-card-msgid.json`). When set AND the bot
+   * supports `editMessageTextStrict`, a routine reboot (no `ackMessageId`)
+   * EDITS the prior boot card in place instead of sending a new one — edits
+   * never bump the unread badge, so reboots produce zero notification
+   * (operator request 2026-06-03). Falls back to a fresh silent send when
+   * there's no prior card or it was deleted. Omit to keep the always-send
+   * behaviour.
+   */
+  bootCardStatePath?: string
 }
 
 /** Run all six probes concurrently with their own per-probe timeouts.
@@ -641,20 +668,60 @@ export async function startBootCard(
   // the chat is where you look, and nothing here warrants a push.
   const silentBootCard = true
 
-  let messageId: number
-  try {
-    const sent = await bot.sendMessage(chatId, ackText, {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      ...(threadId != null ? { message_thread_id: threadId } : {}),
-      ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
-      ...(silentBootCard ? { disable_notification: true } : {}),
-    })
-    messageId = sent.message_id
-    logger(`telegram gateway: boot-card: posted msgId=${messageId} chatId=${chatId} reason=${opts.restartReason ?? '-'} reason_detail=${opts.restartReasonDetail ?? '-'} silent=${silentBootCard}\n`)
-  } catch (err: unknown) {
-    logger(`telegram gateway: boot-card: failed to post ack: ${(err as Error)?.message ?? String(err)}\n`)
-    return { messageId: -1, complete: () => {} }
+  // Edit-in-place to produce ZERO notification (operator request 2026-06-03).
+  // A sent message always bumps the unread badge — `disable_notification`
+  // only kills the sound/banner. So for a ROUTINE reboot (no `ackMessageId`:
+  // operator update / cli rollout / crash / fresh) we EDIT the prior boot
+  // card in place — edits never touch the badge — instead of sending a new
+  // one. We only do this when the bot can tell us the prior message still
+  // exists (`editMessageTextStrict`); if it's gone, or this is a
+  // Telegram-initiated `/restart` (ackMessageId set — the operator asked and
+  // is watching, and the card should reply to their command), we fall back to
+  // a fresh silent send.
+  const chatKey = bootCardChatKey(chatId, threadId)
+  const reuseId =
+    ackMessageId == null && opts.bootCardStatePath != null && bot.editMessageTextStrict != null
+      ? loadBootCardMsgId(opts.bootCardStatePath, chatKey)
+      : null
+
+  let messageId = -1
+  if (reuseId != null && bot.editMessageTextStrict != null) {
+    try {
+      const outcome = await bot.editMessageTextStrict(chatId, reuseId, ackText, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      })
+      if (outcome === 'edited') {
+        messageId = reuseId
+        logger(`telegram gateway: boot-card: reused msgId=${messageId} chatId=${chatId} reason=${opts.restartReason ?? '-'} reason_detail=${opts.restartReasonDetail ?? '-'} edit_in_place=true notify=none\n`)
+      }
+    } catch (err: unknown) {
+      logger(`telegram gateway: boot-card: edit-in-place probe failed (${(err as Error)?.message ?? String(err)}) — sending fresh\n`)
+    }
+  }
+
+  if (messageId < 0) {
+    try {
+      const sent = await bot.sendMessage(chatId, ackText, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+        ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
+        ...(silentBootCard ? { disable_notification: true } : {}),
+      })
+      messageId = sent.message_id
+      logger(`telegram gateway: boot-card: posted msgId=${messageId} chatId=${chatId} reason=${opts.restartReason ?? '-'} reason_detail=${opts.restartReasonDetail ?? '-'} silent=${silentBootCard}\n`)
+    } catch (err: unknown) {
+      logger(`telegram gateway: boot-card: failed to post ack: ${(err as Error)?.message ?? String(err)}\n`)
+      return { messageId: -1, complete: () => {} }
+    }
+  }
+
+  // Remember this card's id so the NEXT reboot can edit it in place (no
+  // notification). Idempotent on reuse; non-fatal on write failure.
+  if (opts.bootCardStatePath != null && messageId > 0) {
+    saveBootCardMsgId(opts.bootCardStatePath, chatKey, messageId)
   }
 
   // Determine the live window for agent-service status updates. Callers
