@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.14.57 — The left-behind status feed reads "done", not stuck mid-step (#2139)
+
+- **The persisted "what it's doing" feed now finalizes cleanly after a
+  delegated step (#2139).** Since v0.14.54 the live status feed stays in the
+  chat as a record, finalized to all-done (`✓`). One path missed that: when
+  the agent acked ("On it") and then handed a step to a foreground sub-agent,
+  the feed froze on its last `→ in-progress` line instead of `✓` once the
+  sub-agent finished — the sub-agent's steps were cleared from the feed a beat
+  before the finalize ran, leaving nothing to mark done. The finalize now
+  captures the done-state *before* clearing, so those turns read complete like
+  every other turn. Cosmetic only (the message always persisted); takes effect
+  on restart.
+
 ## v0.14.56 — Two questions in two topics get two answers, each in its own topic (#2137)
 
 - **Per-topic reply routing for multi-topic supergroups (#2137).** Asking an
