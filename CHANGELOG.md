@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.14.49 — Reboot cards edit in place → zero notification (#2121)
+
+Agent reboot "back up" cards already arrived silently (no sound/banner,
+`disable_notification: true`), but a freshly *sent* message still bumps the
+unread badge — and the Telegram Bot API has no flag to suppress that. So a
+routine reboot now **edits the prior boot card in place** instead of sending
+a new one; edits never touch the badge, so reboots are truly notification-
+free.
+
+- **Routine reboots (operator update / cli rollout / crash / fresh boot)**
+  reuse the prior boot card: the gateway persists its message id per
+  (chat, topic) under the agent's state dir and edits that message on the
+  next boot. The first boot after upgrading still sends one card (to
+  establish the message it'll reuse); every reboot after that is a silent
+  in-place edit → no sound, no banner, no badge.
+- **Telegram-initiated `/restart`** still sends a fresh card that replies to
+  your command — you asked and you're watching, so it should land at the
+  bottom of the chat.
+- Safe fallback: if the prior card was deleted, or on first boot, it sends a
+  fresh (silent) card. A new `editMessageTextStrict` distinguishes
+  "message gone" from a landed edit so the card is never silently lost.
+
+Trade-off: the chat shows each agent's CURRENT status (one card, updated)
+rather than a scroll-back of every past reboot.
+
 ## v0.14.48 — Don't lose a message sent while an agent is restarting (#2117)
 
 A DM (or supergroup-topic message) sent while an agent was mid-restart could
