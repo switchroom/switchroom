@@ -4689,7 +4689,6 @@ const ipcServer: IpcServer = createIpcServer({
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
-    const access = loadAccess()
     // Natural-language card body — a plain sentence ("Gymbro wants to
     // edit: supplement-log.md" + a why-line), never a raw tool id.
     // The operator sees what is being requested and why at a glance.

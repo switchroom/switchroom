@@ -256,6 +256,12 @@ function mcpArgSummary(
   inputPreview: string | undefined,
 ): string | null {
   if (!toolName.startsWith("mcp__")) return null;
+  // Internal servers (agent-config / hostd / hindsight / telegram) use flat
+  // input schemas, not the REST `body`/`query` convention — and we don't
+  // endpoint-enrich their title line either, so keep the summary line off
+  // them too (redact() still runs, so this is intent-match, not a leak fix).
+  const server = toolName.split("__")[1] ?? "";
+  if (INTERNAL_MCP_SERVERS.has(server)) return null;
   const input = parseInput(inputPreview);
   if (!input) return null;
   const payload = input.body ?? input.query;
