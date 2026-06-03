@@ -285,3 +285,29 @@ agents:
   #   admin: true
   #   system_prompt_append: |
   #     You are the fleet admin agent. Always respond concisely.
+
+  # ── Supergroup mode (advanced, opt-in) ───────────────────────────
+  # By default every agent DMs you privately. Supergroup mode instead
+  # has ONE agent OWN a Telegram forum supergroup: its replies and its
+  # automated events (boot, alerts, cron, approvals) route into per-
+  # topic threads inside that one group, so a busy agent's work stays
+  # organised by subject instead of flooding a single DM.
+  #
+  # `switchroom setup` offers this as an optional step, or add it by
+  # hand below. Setting `chat_id` is the minimum — `default_topic_id`
+  # auto-defaults to General (topic 1). Create the forum supergroup in
+  # Telegram first, add the bot as an admin, and find the numeric id
+  # (the digits after t.me/c/ in a message link, written as -100…).
+  # Full guide: docs/supergroup-mode.md.
+  #
+  # social:
+  #   topic_name: "Social"
+  #   bot_token: "vault:telegram-social-bot-token"   # its own bot
+  #   channels:
+  #     telegram:
+  #       chat_id: "-1001234567890"   # the forum supergroup this agent owns
+  #       default_topic_id: 1         # fallback topic (1 = General); optional
+  #       topic_aliases:              # name → topic id, for cron + ops routing
+  #         alerts: 12                # boot / watchdog / compaction events
+  #         admin: 7                  # vault / permission / mutation events
+  #         planning: 3

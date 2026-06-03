@@ -45,6 +45,10 @@ import {
 } from "../setup/prompt.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { insertVaultBrokerApprovalAuth } from "./setup-posture-rewrite.js";
+import {
+  isValidSupergroupChatId,
+  setAgentSupergroupChatId,
+} from "./supergroup-setup-yaml.js";
 
 const STEP_PENDING = chalk.gray("○");
 const STEP_ACTIVE = chalk.blue("->");
@@ -103,11 +107,14 @@ export function registerSetupCommand(program: Command): void {
           saveUserConfig(userId);
         }
 
-        // ── Step 4: (group/forum setup retired in v0.7) ──────────
-        // Per-agent bot DM-only is the default. Sentinel "0" lands in
-        // scaffolded access.json wherever a forum chat ID was previously
-        // stored; the schema still requires `telegram.forum_chat_id`,
-        // and existing configs that set a real one continue to work.
+        // ── Step 4: Supergroup mode (optional) ───────────────────
+        // Per-agent bot DM-only is still the default. This optional step
+        // lets ONE agent own a Telegram forum supergroup by writing
+        // `agents.<name>.channels.telegram.chat_id`. Skipped by default
+        // (one keystroke) so the zero-config DM path is untouched. The
+        // fleet-wide `telegram.forum_chat_id` sentinel "0" below is the
+        // legacy DM-only marker, unrelated to per-agent supergroup mode.
+        await stepSupergroupMode(agentBots, switchroomConfigPath, nonInteractive);
         const forumChatId = "0";
 
         // ── Step 5: Create topics ────────────────────────────────
@@ -590,10 +597,142 @@ async function stepDmPairing(
   }
 }
 
-// ─── Step 4: retired in v0.7 ─────────────────────────────────────────────────
-// Forum/group setup prompts were removed when per-agent bot DM-only became
-// the default. Existing configs with a real `telegram.forum_chat_id` keep
-// working; new setups land sentinel "0" via `stepScaffoldAgents` below.
+// ─── Step 4: Supergroup mode (optional) ──────────────────────────────────────
+//
+// DM-only is the default and stays one keystroke away (the prompt defaults to
+// "no"). This step exists for discoverability: an operator setting up should
+// learn supergroup mode is available and be able to flip a single agent into
+// it without hand-editing YAML or hunting through docs. It writes only
+// `agents.<name>.channels.telegram.chat_id` — the schema smart-defaults
+// `default_topic_id` to General — and points at docs/supergroup-mode.md
+// for the richer knobs (default_topic_id, topic_aliases, ops-lane routing).
+const SUPERGROUP_DOC = "docs/supergroup-mode.md";
+
+async function stepSupergroupMode(
+  agentBots: Record<string, BotTokenInfo>,
+  configPath: string,
+  nonInteractive: boolean,
+): Promise<void> {
+  stepHeader(4, "Supergroup mode (optional)", STEP_ACTIVE);
+
+  if (nonInteractive) {
+    console.log(
+      chalk.gray(
+        `  ${STEP_DONE} Skipped (DM-only default). To have one agent own a forum`,
+      ),
+    );
+    console.log(chalk.gray(`     supergroup, see ${SUPERGROUP_DOC}.`));
+    return;
+  }
+
+  console.log(
+    chalk.gray(
+      "  Most setups stay DM-only — each agent DMs you privately. Supergroup",
+    ),
+  );
+  console.log(
+    chalk.gray(
+      "  mode instead has ONE agent own a Telegram forum supergroup and route",
+    ),
+  );
+  console.log(
+    chalk.gray("  its replies + automated events into per-topic threads. Opt-in."),
+  );
+
+  const want = await askYesNo(
+    "  Configure an agent to own a forum supergroup now?",
+    false,
+  );
+  if (!want) {
+    console.log(
+      chalk.gray(`  ${STEP_DONE} Staying DM-only. Enable later via ${SUPERGROUP_DOC}.`),
+    );
+    return;
+  }
+
+  const agentNames = Object.keys(agentBots);
+  if (agentNames.length === 0) {
+    console.log(
+      chalk.yellow(`  No agents configured yet — skipping. See ${SUPERGROUP_DOC}.`),
+    );
+    return;
+  }
+  const agent =
+    agentNames.length === 1
+      ? agentNames[0]
+      : await askChoice("  Which agent owns the supergroup?", agentNames);
+
+  console.log(
+    chalk.gray(
+      "  First create the forum supergroup in Telegram (a group with Topics",
+    ),
+  );
+  console.log(
+    chalk.gray(
+      "  enabled) and add the agent's bot as an admin. Its id is the digits in",
+    ),
+  );
+  console.log(
+    chalk.gray(
+      "  a message link t.me/c/<id>/… written as a negative -100… number.",
+    ),
+  );
+
+  const chatId = await ask(
+    "  Supergroup chat_id (e.g. -1001234567890, or Enter to skip)",
+  );
+  if (!chatId) {
+    console.log(
+      chalk.gray(`  ${STEP_DONE} Skipped — no chat_id entered. See ${SUPERGROUP_DOC}.`),
+    );
+    return;
+  }
+  if (!isValidSupergroupChatId(chatId)) {
+    console.log(
+      chalk.yellow(
+        `  "${chatId}" isn't a valid supergroup id (need a negative integer like`,
+      ),
+    );
+    console.log(
+      chalk.yellow(`  -1001234567890). Add it by hand later — ${SUPERGROUP_DOC}.`),
+    );
+    return;
+  }
+
+  try {
+    const fs = await import("node:fs");
+    const { atomicWriteFileSync } = await import("../util/atomic.js");
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const after = setAgentSupergroupChatId(raw, agent, chatId);
+    let mode = 0o644;
+    try {
+      mode = fs.statSync(configPath).mode & 0o777;
+    } catch {
+      /* default */
+    }
+    atomicWriteFileSync(configPath, after, mode);
+    console.log(
+      chalk.green(
+        `  ${STEP_DONE} ${agent} now owns supergroup ${chatId} — replies + ops route to its topics.`,
+      ),
+    );
+    console.log(
+      chalk.gray(
+        "     Fallback topic defaults to General (1). Add default_topic_id /",
+      ),
+    );
+    console.log(
+      chalk.gray(
+        `     topic_aliases by hand — ${SUPERGROUP_DOC}. Run \`switchroom apply\` to activate.`,
+      ),
+    );
+  } catch (err) {
+    console.log(
+      chalk.yellow(`  Could not write chat_id: ${(err as Error).message}`),
+    );
+    console.log(chalk.gray(`  Add it by hand — see ${SUPERGROUP_DOC}.`));
+  }
+}
 
 // ─── Step 5: Create Topics ───────────────────────────────────────────────────
 
