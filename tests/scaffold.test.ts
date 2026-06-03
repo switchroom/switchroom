@@ -2464,6 +2464,44 @@ describe("scaffoldAgent with global defaults cascade", () => {
     ]);
   });
 
+  it("turn-pacing directive ties the answer to the reply tool", () => {
+    // Regression for the orphaned-reply visibility defect: the model
+    // (esp. marko on long Postiz tasks) ended turns with plain transcript
+    // text and no reply tool call, so the 30s orphaned-reply backstop had
+    // to flush late. The turn-pacing directive previously said "just
+    // answer" / "Stop after the answer" without binding "answer" to the
+    // reply tool — the model satisfied it by writing terminal text. This
+    // assertion pins the explicit reply-tool requirement so the guidance
+    // can't silently regress. The directive is passed verbatim into a
+    // printf hook command, so it appears literally in settings.json.
+    const agentConfig = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "pacing-agent": agentConfig },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "pacing-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const pacingHook = (settings.hooks.UserPromptSubmit as Array<{
+      hooks: Array<{ command: string }>;
+    }>)
+      .flatMap((g) => g.hooks)
+      .find((h) => h.command.includes("turn-pacing"));
+    expect(pacingHook).toBeDefined();
+    const cmd = pacingHook!.command;
+    expect(cmd).toContain("mcp__switchroom-telegram__reply");
+    expect(cmd).toMatch(/terminal\/transcript text is NEVER delivered/);
+    expect(cmd).toMatch(/No reply tool call = the user got nothing/);
+  });
+
   it("unions defaults.hooks with per-agent hooks", () => {
     const agentConfig = makeAgentConfig({
       hooks: {
