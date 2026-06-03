@@ -9,7 +9,7 @@
  * is connected, inbound LLM messages get a "⏳ Agent is restarting…" reply.
  */
 
-import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, GrammyError, InlineKeyboard, InputFile, type Context, type Api } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
@@ -2603,6 +2603,26 @@ function wrapBootCardApi(
           ),
         opts(cid),
       ) as Promise<unknown>,
+    // Strict edit for the boot-card edit-in-place probe: distinguishes
+    // "message gone" (→ 'gone', caller sends fresh) from a landed/identical
+    // edit (→ 'edited'). robustApiCall SWALLOWS "message to edit not found"
+    // to undefined (retry-api-call.ts), so this can't go through it — a
+    // deliberate single-attempt raw edit that classifies the error itself.
+    editMessageTextStrict: async (cid, mid, text, editOpts) => {
+      type EditOpts = Parameters<Api['editMessageText']>[3]
+      try {
+        // allow-raw-bot-api: boot-card edit-in-place probe — must detect a deleted target, which the shared retry policy swallows.
+        await lockedBot.api.editMessageText(cid, mid, text, editOpts as EditOpts)
+        return 'edited'
+      } catch (err) {
+        const desc =
+          err instanceof GrammyError ? err.description : err instanceof Error ? err.message : String(err)
+        // Content identical → message still exists; reuse it.
+        if (typeof desc === 'string' && desc.toLowerCase().includes('not modified')) return 'edited'
+        // Not found, or any other error → fall back to a fresh silent send.
+        return 'gone'
+      }
+    },
   }
 }
 
@@ -4578,6 +4598,7 @@ const ipcServer: IpcServer = createIpcServer({
             tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
             dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
             configSnapshotPath: join(resolvedAgentDirForCard, '.config-snapshot.json'),
+            bootCardStatePath: join(resolvedAgentDirForCard, '.boot-card-msgid.json'),
             ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
           }, ackMsgId).then(handle => {
             activeBootCard = handle
@@ -18469,6 +18490,7 @@ void (async () => {
                       tmuxSupervisor: process.env.SWITCHROOM_TMUX_SUPERVISOR === '1',
                       dockerMode: process.env.SWITCHROOM_RUNTIME === 'docker',
                       configSnapshotPath: join(resolvedAgentDirForBootCard, '.config-snapshot.json'),
+                      bootCardStatePath: join(resolvedAgentDirForBootCard, '.boot-card-msgid.json'),
                       ...(updateOutcomeLine ? { updateOutcomeLine } : {}),
                     }, ackMsgId)
                     activeBootCard = handle
