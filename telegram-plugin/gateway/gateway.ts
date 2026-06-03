@@ -3537,18 +3537,24 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // Fleet-shared / DM agents see `undefined` → no `message_thread_id`
   // is added to the broadcast opts → behavior unchanged.
   const opEventTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+  const opEventSupergroup = resolveAgentSupergroupChatId()
 
   process.stderr.write(
     `telegram gateway: operator-event posting agent=${agent} kind=${kind} to ${access.allowFrom.length} chat(s)` +
       (opEventTopic != null ? ` topic=${opEventTopic}` : '') + '\n',
   )
   for (const chat_id of access.allowFrom) {
+    // The resolved topic is valid ONLY in the agent's supergroup — attaching
+    // it to an operator DM recipient yields 400 "message thread not found" and
+    // the event silently fails to deliver (the marko #2096 class). Guard it:
+    // DM recipients get a thread-less send; the supergroup owner gets the lane.
+    const opEventThread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: opEventTopic, supergroupChatId: opEventSupergroup })
     // grammy's Other<...> opts type is generated and stricter than our
     // call shape; runtime accepts both. Cast through unknown.
     const opts = {
       parse_mode: 'HTML' as const,
       ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
-      ...(opEventTopic != null ? { message_thread_id: opEventTopic } : {}),
+      ...(opEventThread != null ? { message_thread_id: opEventThread } : {}),
     }
     // Comment-only context for the reader; the lint marker on the
     // very next line is what unlocks the raw bot.api call.
@@ -10159,7 +10165,14 @@ async function handleInbound(
     // No staged entry to act on — fall through to normal handling.
   }
 
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Typing indicator in the ORIGINATING topic — on a supergroup-topic inbound,
+  // an un-threaded sendChatAction shows "typing" in General, not the topic the
+  // user is in. messageThreadId is the inbound's thread (undefined in a DM).
+  void bot.api.sendChatAction(
+    chat_id,
+    'typing',
+    messageThreadId != null ? { message_thread_id: messageThreadId } : {},
+  ).catch(() => {})
 
   // Parse explicit prefixes first. `/steer ` / `/s ` opts IN to steering;
   // `/queue ` / `/q ` are legacy aliases that opt in to the new default (queued).
@@ -11088,10 +11101,14 @@ function resolveBootChatId(
   // → behavior unchanged (lands at chat-root as today). PR4b of
   // supergroup-mode rollout (docs/rfcs/supergroup-mode.md).
   const supergroupBootTopic = resolveAgentOutboundTopic({ kind: 'boot' })
+  const bootSupergroup = resolveAgentSupergroupChatId()
+  // The boot topic is valid only in the agent's supergroup — attach it per
+  // recipient so a DM owner doesn't 400 (marko #2096 class); the supergroup
+  // owner gets the boot/alerts lane, a DM gets a thread-less boot card.
 
   // 2. Env var
   const envChat = process.env.SUBAGENT_OWNER_CHAT_ID
-  if (envChat) return { chatId: envChat, threadId: supergroupBootTopic, ackMsgId: undefined }
+  if (envChat) return { chatId: envChat, threadId: topicForRecipient({ recipientChatId: envChat, resolvedTopic: supergroupBootTopic, supergroupChatId: bootSupergroup }), ackMsgId: undefined }
   // 3. Most-recent inbound from history
   if (HISTORY_ENABLED) {
     try {
@@ -11099,7 +11116,7 @@ function resolveBootChatId(
       const ownerChatId = access.allowFrom[0]
       if (ownerChatId) {
         const recent = queryHistory({ chat_id: ownerChatId, limit: 1 })
-        if (recent.length > 0) return { chatId: ownerChatId, threadId: supergroupBootTopic, ackMsgId: undefined }
+        if (recent.length > 0) return { chatId: ownerChatId, threadId: topicForRecipient({ recipientChatId: ownerChatId, resolvedTopic: supergroupBootTopic, supergroupChatId: bootSupergroup }), ackMsgId: undefined }
       }
     } catch {}
   }
