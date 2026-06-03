@@ -33,6 +33,24 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   # same path the rest of start.sh + the MCP sidecar expects.
   export TELEGRAM_STATE_DIR="{{agentDir}}/telegram"
 
+  # Gateway-consumed env MUST be exported HERE, before the gateway fork
+  # below. The gateway daemon reads channels.telegram.* knobs (and any
+  # agent env) from process.env at startup — e.g. SWITCHROOM_TG_STREAM_
+  # THROTTLE_MS, SWITCHROOM_TG_EDIT_BUDGET_THRESHOLD,
+  # SWITCHROOM_TG_CLEAR_STATUS_ON_COMPLETION. The inner tmux pass
+  # re-exports the SAME user-env block below for claude, because tmux
+  # does not reliably propagate arbitrary env across the
+  # re-exec. Without this hoist these vars only ever reach the inner
+  # (claude) pass and the already-forked gateway never sees them — every
+  # channels.telegram env knob silently defaults on docker agents (the
+  # start.sh env-fork landmine, same class as #1997 /
+  # SWITCHROOM_HANDOFF_SHOW_LINE). Pinned by the scaffold-order test
+  # asserting these exports precede the gateway-fork line.
+{{#if userEnvQuoted}}
+{{#each userEnvQuoted}}  export {{@key}}={{{this}}}
+{{/each}}
+{{/if}}
+
   # Tiny in-process supervisor: runs cmd in a respawn loop with
   # exponential backoff (1→2→4…→60s cap) and NEVER permanently gives
   # up. Rationale (RFC J / install-validation 2026-05-17): the
