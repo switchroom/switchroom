@@ -1,0 +1,131 @@
+/**
+ * Multitopic reply-routing — gateway/bridge wiring guards.
+ *
+ * The gateway IIFE is too entangled to instantiate in-process, so these
+ * are source-level assertions (the same pattern buffer-gate-broadened.test
+ * and reply-terminal-reaction.test use). They pin the load-bearing wiring
+ * of components 3 (turn-origin routing), 4 (topic framing), and 5 (queued-
+ * status UX) so a future refactor that drops a hook trips here.
+ */
+
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const gatewaySrc = readFileSync(
+  resolve(__dirname, '..', 'gateway', 'gateway.ts'),
+  'utf-8',
+)
+const bridgeSrc = readFileSync(
+  resolve(__dirname, '..', 'bridge', 'bridge.ts'),
+  'utf-8',
+)
+
+describe('component 3 — turn-origin reply routing', () => {
+  it('CurrentTurn carries a turnId, and the enqueue handler initialises it', () => {
+    expect(gatewaySrc).toMatch(/turnId: string/)
+    expect(gatewaySrc).toMatch(/const turnId\s*=\s*\n?\s*deriveTurnId\(/)
+    expect(gatewaySrc).toMatch(/rememberRecentTurn\(next\)/)
+  })
+
+  it('the inbound meta stamps origin_turn_id derived from chat/thread/messageId', () => {
+    expect(gatewaySrc).toMatch(/const originTurnId = deriveTurnId\(chat_id, messageThreadId \?\? null, msgId\)/)
+    expect(gatewaySrc).toMatch(/origin_turn_id: originTurnId/)
+  })
+
+  it('deriveTurnId is stable across inbound-build and enqueue (message-id based)', () => {
+    // The id must be derivable identically at both sites — keyed on
+    // chat/thread/messageId, NOT the not-yet-known startedAt.
+    const fn = gatewaySrc.split('function deriveTurnId')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).toMatch(/chatKey\(chatId, threadId \?\? null\)/)
+    expect(fn).toMatch(/messageId/)
+  })
+
+  it('executeReply resolves the answer thread via the origin turn, not the live currentTurn', () => {
+    const fn = gatewaySrc.split('async function executeReply')[1]?.split('\nasync function ')[0] ?? ''
+    expect(fn).toMatch(/TURN_ORIGIN_ROUTING_ENABLED/)
+    expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
+    expect(fn).toMatch(/resolveAnswerThreadId\(/)
+  })
+
+  it('executeStreamReply resolves the answer thread via the origin turn too', () => {
+    const fn = gatewaySrc.split('async function executeStreamReply')[1]?.split('\nasync function ')[0] ?? ''
+    expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
+    expect(fn).toMatch(/resolveAnswerThreadId\(/)
+  })
+
+  it('the reply + stream_reply tool schemas expose origin_turn_id to the model', () => {
+    const occurrences = bridgeSrc.match(/origin_turn_id: \{ type: 'string'/g) ?? []
+    expect(occurrences.length).toBe(2) // reply + stream_reply
+  })
+
+  it('recentTurnsById is a BOUNDED registry (cannot grow unbounded)', () => {
+    expect(gatewaySrc).toMatch(/RECENT_TURNS_MAX/)
+    expect(gatewaySrc).toMatch(/recentTurnsById\.delete\(oldest\)/)
+  })
+})
+
+describe('component 4 — per-turn topic framing', () => {
+  it('the gateway stamps a topic_scope directive for forum-topic inbounds (kill-switched)', () => {
+    expect(gatewaySrc).toMatch(/TOPIC_FRAMING_ENABLED/)
+    expect(gatewaySrc).toMatch(/topic_scope: topicScope/)
+    // Only for topic inbounds — DMs get nothing.
+    expect(gatewaySrc).toMatch(/TOPIC_FRAMING_ENABLED && messageThreadId != null/)
+  })
+
+  it('the bridge instructions frame each channel message as the current topic', () => {
+    expect(bridgeSrc).toMatch(/answer ONLY this message/)
+    expect(bridgeSrc).toMatch(/do not also answer a pending message from another topic/i)
+  })
+})
+
+describe('component 5 — queued-status UX (delete-on-answer)', () => {
+  it('a queuedStatusMsgIds map tracks the placeholder per buffered topic', () => {
+    expect(gatewaySrc).toMatch(/const queuedStatusMsgIds = new Map/)
+  })
+
+  it('Hook A posts a queued status into the buffered message own topic (cross-topic only, kill-switched)', () => {
+    expect(gatewaySrc).toMatch(/postQueuedStatus\(chat_id, messageThreadId, inFlightThread\)/)
+    // Suppressed for DMs and same-topic.
+    expect(gatewaySrc).toMatch(/!isDmChatId\(chat_id\) &&/)
+    expect(gatewaySrc).toMatch(/messageThreadId !== inFlightThread/)
+  })
+
+  it('Hook B promotes the placeholder to "On it" when the buffered turn starts', () => {
+    expect(gatewaySrc).toMatch(/promoteQueuedStatus\(ev\.chatId, enqThreadIdNum\)/)
+  })
+
+  it('Hook C reaps the placeholder on the answer (executeReply / stream)', () => {
+    const reapCalls = gatewaySrc.match(/reapQueuedStatus\(/g) ?? []
+    // definition + executeReply + executeStreamReply + purge cleanup (2 branches)
+    expect(reapCalls.length).toBeGreaterThanOrEqual(4)
+  })
+
+  it('purgeReactionTracking reaps the placeholder on abnormal turn-end (defense-in-depth)', () => {
+    const fn = gatewaySrc.split('function purgeReactionTracking')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).toMatch(/reapQueuedStatus\(/)
+    // Reap sits alongside the activeReactionMsgIds cleanup.
+    expect(fn).toMatch(/activeReactionMsgIds\.delete\(key\)/)
+  })
+
+  it('all queued-status sends/edits/deletes go through the swallowing wrapper (carry thread)', () => {
+    for (const helper of ['postQueuedStatus', 'promoteQueuedStatus', 'reapQueuedStatus']) {
+      const fn = gatewaySrc.split(`function ${helper}`)[1]?.split('\nfunction ')[0] ?? ''
+      expect(fn).toMatch(/swallowingApiCall\(/)
+    }
+  })
+})
+
+describe('kill switches — all five default ON, each independently disableable', () => {
+  it('declares the three named kill switches + the two component switches', () => {
+    expect(gatewaySrc).toMatch(/SWITCHROOM_SERIALIZE_UNTIL_REPLIED !== '0'/)
+    expect(gatewaySrc).toMatch(/SWITCHROOM_SERIALIZE_NOREPLY_DRAIN_MS/)
+    expect(gatewaySrc).toMatch(/SWITCHROOM_QUEUED_STATUS_UX !== '0'/)
+    expect(gatewaySrc).toMatch(/SWITCHROOM_TURN_ORIGIN_ROUTING !== '0'/)
+    expect(gatewaySrc).toMatch(/SWITCHROOM_TOPIC_FRAMING !== '0'/)
+  })
+
+  it('the no-reply drain ms default is 2500 and clamped positive', () => {
+    expect(gatewaySrc).toMatch(/SERIALIZE_NOREPLY_DRAIN_MS\s*=\s*\n?\s*Number\.isFinite\([^)]*\)\s*&&[^?]*\?\s*[^:]*:\s*2_500/)
+  })
+})

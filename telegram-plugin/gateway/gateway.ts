@@ -281,6 +281,8 @@ import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } f
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
+import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
+import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
   trackDelivery,
@@ -1267,6 +1269,14 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 const chatThreadMap = new Map<string, number>()
 const activeStatusReactions = new Map<string, StatusReactionController>()
 const activeReactionMsgIds = new Map<string, { chatId: string; messageId: number }>()
+// Component 5 (queued-status UX). When a cross-topic inbound buffers behind
+// an in-flight turn in another topic, we post ONE self-updating status into
+// the buffered message's OWN topic ("Queued — replying in <other topic>
+// first" → "On it — replying now" → deleted when the answer lands). Keyed
+// by chatKey(chat_id, bufferedThread). Delete-on-answer: never a dangling
+// placeholder. Reaped on answer (executeReply/stream), on turn-flush, and
+// in purgeReactionTracking cleanup so an abnormal turn-end can't strand it.
+const queuedStatusMsgIds = new Map<string, { chatId: string; threadId: number; messageId: number }>()
 // Reactions whose terminal 👍 is deferred because a background sub-agent
 // worker was still running when the parent's `turn_end` fired. Painting 👍
 // then would read as "done / nothing happening" while the worker keeps
@@ -1368,6 +1378,47 @@ const DELIVERY_CONFIRM_TIMEOUT_MS =
   Number.isFinite(_deliveryTimeoutParsed) && _deliveryTimeoutParsed > 0 ? _deliveryTimeoutParsed : 15_000
 const DELIVERY_CONFIRM_SWEEP_MS = 5_000
 const deliveryQueue = createDeliveryQueue<InboundMessage>()
+
+// ─── Serialize-until-replied (multitopic reply-routing) ───────────────────
+// Component 1 (deliver-before-drain gate). A buffered cross-topic inbound
+// drains ONLY after the just-ended turn delivered its reply to its own
+// thread — see `serialize-drain-gate.ts` for the full rationale (the
+// Brevo→Meta wrong-topic bug). Kill switch off (=0) → legacy behaviour:
+// drain on the bare turn-end signal.
+const SERIALIZE_UNTIL_REPLIED_ENABLED =
+  process.env.SWITCHROOM_SERIALIZE_UNTIL_REPLIED !== '0'
+// Component 2 (bounded no-reply escape hatch). A turn that legitimately
+// ends with NO reply (handback ack, NO_REPLY marker, silent-end) sets
+// finalAnswerDelivered=false and would block the serialize gate forever.
+// When such a turn ends with a buffered inbound waiting, arm a short
+// bounded timer that force-drains regardless. The 300s silence-poke
+// unwedge fallback remains the long-stop. Tunable for tests/forensics;
+// clamped to a positive finite value (a degenerate override would either
+// drain instantly — defeating serialization — or, if negative, be
+// rejected). To disable the serialize feature entirely use
+// SWITCHROOM_SERIALIZE_UNTIL_REPLIED=0, not a degenerate timeout.
+const _noReplyDrainRaw = process.env.SWITCHROOM_SERIALIZE_NOREPLY_DRAIN_MS
+const _noReplyDrainParsed =
+  _noReplyDrainRaw != null && _noReplyDrainRaw !== '' ? Number(_noReplyDrainRaw) : 2_500
+const SERIALIZE_NOREPLY_DRAIN_MS =
+  Number.isFinite(_noReplyDrainParsed) && _noReplyDrainParsed > 0 ? _noReplyDrainParsed : 2_500
+// Component 3 (turn-origin reply routing). Resolve an answer's thread from
+// the turn that OWNS the reply (matched by origin_turn_id), not the live
+// currentTurn if it has flipped. Kill switch off (=0) → legacy turn-pinned
+// behaviour (#1664: thread from the live currentTurn capture).
+const TURN_ORIGIN_ROUTING_ENABLED =
+  process.env.SWITCHROOM_TURN_ORIGIN_ROUTING !== '0'
+// Component 4 (per-turn topic framing). Add a one-line directive to the
+// channel meta + bridge instructions telling the model to answer ONLY the
+// current message's topic. Kill switch off (=0) → no framing field.
+const TOPIC_FRAMING_ENABLED =
+  process.env.SWITCHROOM_TOPIC_FRAMING !== '0'
+// Component 5 (queued-status UX). Post a self-updating "Queued — replying
+// in <other topic> first" status into a cross-topic buffered message's own
+// topic, then edit→delete it as the turn progresses. Kill switch off (=0)
+// → no placeholder (the 👀 ack reaction still fires). Delete-on-answer.
+const QUEUED_STATUS_UX_ENABLED =
+  process.env.SWITCHROOM_QUEUED_STATUS_UX !== '0'
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -1524,7 +1575,22 @@ type CurrentTurn = {
   silentAnchorText: string
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
+  // Component 3 (turn-origin reply routing). A stable per-turn identity,
+  // `${registryKey-or-chatKey}#${startedAt}`, assigned when the turn
+  // starts and stamped into the inbound meta (`origin_turn_id`) so a reply
+  // can be matched back to the turn that OWNS it — even after `currentTurn`
+  // has flipped to a successor. Recently-ended turns are retained in
+  // `recentTurnsById` so a late reply (the Brevo answer landing 42s after
+  // turn-end, when currentTurn already points at Meta) routes to its
+  // origin thread instead of the live (wrong) turn's thread.
+  turnId: string
   registryKey: string | null
+  // Component 2 (bounded no-reply escape hatch). When a turn ends with
+  // finalAnswerDelivered=false AND a buffered cross-topic inbound is
+  // waiting, this timer force-drains after SERIALIZE_NOREPLY_DRAIN_MS so
+  // the queue can never wedge on a legitimately silent turn. Armed in
+  // `endCurrentTurnAtomic`, cleared if the turn delivers first.
+  noReplyDrainTimer: ReturnType<typeof setTimeout> | null
   // Last assistant outbound message id for the current turn — populated
   // on reply / stream_reply emit, captured into recordTurnEnd. Stage 4
   // reads this on resume to thread-jump back to the in-flight conversation.
@@ -1582,6 +1648,134 @@ type CurrentTurn = {
 }
 
 let currentTurn: CurrentTurn | null = null
+
+// Component 3 (turn-origin reply routing). Recently-ended turns retained
+// by `turnId` so a LATE reply (the Brevo answer landing ~42s after
+// turn-end, after `currentTurn` has flipped to the Meta turn) can still
+// resolve its ORIGIN turn's thread instead of the live successor's. Bug:
+// `executeReply` captured `const turn = currentTurn` at entry and, when
+// the model omitted message_thread_id, routed to `turn.sessionThreadId`
+// — the flipped turn's thread. Pinning by origin turnId closes that.
+// Bounded LRU (insertion-ordered Map) so it can't grow unbounded across
+// a long-lived supergroup session.
+const RECENT_TURNS_MAX = 32
+const recentTurnsById = new Map<string, CurrentTurn>()
+function rememberRecentTurn(turn: CurrentTurn): void {
+  recentTurnsById.set(turn.turnId, turn)
+  while (recentTurnsById.size > RECENT_TURNS_MAX) {
+    const oldest = recentTurnsById.keys().next().value
+    if (oldest === undefined) break
+    recentTurnsById.delete(oldest)
+  }
+}
+/**
+ * Component 3 — derive the stable per-turn identity from the chat, thread,
+ * and originating message id. Stamped into the inbound meta at build time
+ * (`origin_turn_id`) AND reconstructed at enqueue time from the same three
+ * values, so the id stamped on the message the model reads matches the id
+ * on the turn the gateway started for it. Using the message id (not the
+ * not-yet-known startedAt) is what lets the two sites agree. Returns null
+ * when there is no message id (synthetic / cron / handback turns have no
+ * originating inbound — they never need origin routing, the live turn IS
+ * the origin).
+ */
+function deriveTurnId(
+  chatId: string,
+  threadId: number | null | undefined,
+  messageId: string | number | null | undefined,
+): string | null {
+  if (messageId == null || messageId === '' || String(messageId) === '0') return null
+  return `${chatKey(chatId, threadId ?? null)}#${messageId}`
+}
+
+/**
+ * Component 3 — resolve the turn that OWNS a reply by its `origin_turn_id`
+ * (the meta field the model echoes back from the channel tag). Checks the
+ * live turn first, then the recently-ended registry. Returns null when the
+ * id is absent or unknown (a model that didn't echo it, or a turn evicted
+ * from the bounded registry) — callers then fall back to the existing
+ * turn-pinned / chatThreadMap precedence.
+ */
+function findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null {
+  if (originTurnId == null || originTurnId === '') return null
+  if (currentTurn != null && currentTurn.turnId === originTurnId) return currentTurn
+  return recentTurnsById.get(originTurnId) ?? null
+}
+
+/**
+ * Component 5 — post a "Queued — replying in another topic first" status
+ * into a cross-topic buffered message's OWN topic. Fire-and-forget through
+ * the swallowing wrapper (carries message_thread_id so it lands in the
+ * right topic). Suppressed for DMs and same-topic queues by the CALLER.
+ * Records the sent message id keyed by chatKey(chatId, bufferedThread) for
+ * the later edit (Hook B) / delete (Hook C / reap).
+ */
+function postQueuedStatus(chatId: string, bufferedThread: number, inFlightThread: number | undefined): void {
+  if (!QUEUED_STATUS_UX_ENABLED) return
+  const key = statusKey(chatId, bufferedThread)
+  // Idempotent: a second buffered message in the same topic re-uses the
+  // existing placeholder (don't stack).
+  if (queuedStatusMsgIds.has(key)) return
+  const otherTopic = inFlightThread != null ? `another topic` : `another conversation`
+  const text = `⏳ Queued — replying in ${otherTopic} first, then I'll get to this.`
+  void (async () => {
+    const sent = await swallowingApiCall(
+      () =>
+        bot.api.sendMessage(chatId, text, { message_thread_id: bufferedThread }),
+      { chat_id: chatId, verb: 'queued-status.post', threadId: bufferedThread },
+    )
+    const messageId = (sent as { message_id?: number } | undefined)?.message_id
+    if (typeof messageId !== 'number') return
+    // Re-check after the await: the turn may have already started and
+    // edited/deleted via Hook B/C in the gap. If the key is now occupied
+    // by a different placeholder, delete this orphan; otherwise record it.
+    if (queuedStatusMsgIds.has(key)) {
+      void swallowingApiCall(
+        () => bot.api.deleteMessage(chatId, messageId),
+        { chat_id: chatId, verb: 'queued-status.post-race-cleanup', threadId: bufferedThread },
+      )
+      return
+    }
+    queuedStatusMsgIds.set(key, { chatId, threadId: bufferedThread, messageId })
+  })()
+}
+
+/**
+ * Component 5 (Hook B) — the buffered message's turn just STARTED. Edit the
+ * queued placeholder in its topic to "On it — replying now." Best-effort.
+ */
+function promoteQueuedStatus(chatId: string, thread: number | undefined): void {
+  if (!QUEUED_STATUS_UX_ENABLED) return
+  if (thread == null) return
+  const key = statusKey(chatId, thread)
+  const entry = queuedStatusMsgIds.get(key)
+  if (entry == null) return
+  // editMessageText targets a specific message id, which already implies
+  // its thread — grammy's typed signature has no message_thread_id (the
+  // swallowingApiCall opts still carry threadId for the deleted-topic
+  // fallback policy).
+  void swallowingApiCall(
+    () =>
+      bot.api.editMessageText(chatId, entry.messageId, '✍️ On it — replying now.', {}),
+    { chat_id: chatId, verb: 'queued-status.promote', threadId: thread },
+  )
+}
+
+/**
+ * Component 5 (Hook C / reap) — the answer landed (or the turn ended
+ * abnormally). Delete the queued placeholder and drop the map entry so the
+ * topic shows the real answer, never a stale "Queued" line. Idempotent.
+ */
+function reapQueuedStatus(chatId: string, thread: number | undefined): void {
+  const key = statusKey(chatId, thread ?? null)
+  const entry = queuedStatusMsgIds.get(key)
+  if (entry == null) return
+  queuedStatusMsgIds.delete(key)
+  void swallowingApiCall(
+    () => bot.api.deleteMessage(chatId, entry.messageId),
+    { chat_id: chatId, verb: 'queued-status.reap', ...(entry.threadId != null ? { threadId: entry.threadId } : {}) },
+  )
+}
 
 // Problem B — deferred safe-boundary interrupt.
 //
@@ -1722,6 +1916,105 @@ function streamKey(chatId: string, threadId?: number | null): string {
   return chatKey(chatId, threadId)
 }
 
+/**
+ * Component 1 — deliver-before-drain. The single chokepoint that both
+ * turn-end drain sites (`purgeReactionTracking`, `releaseTurnBufferGate`)
+ * route through. Drains the pending-inbound buffer ONLY when
+ * `mayDrainBufferedInbound` says so: claude is idle AND (the
+ * serialize-until-replied kill switch is off, OR there is no ending-turn
+ * handle, OR the ending turn delivered its final answer). A no-reply turn
+ * (finalAnswerDelivered=false) deliberately does NOT drain here — the
+ * bounded escape-hatch timer in `endCurrentTurnAtomic` covers that
+ * liveness case. The 300s silence-poke fallback (`redeliverBufferedInbound`
+ * called directly, bypassing this gate) remains the long-stop.
+ */
+function performBufferDrain(reason: string): void {
+  const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  if (pendingInboundBuffer.depth(selfAgentForFlush) <= 0) return
+  const fr = redeliverBufferedInbound(
+    pendingInboundBuffer,
+    selfAgentForFlush,
+    (m) => {
+      const d = ipcServer.sendToAgent(selfAgentForFlush, m)
+      if (d) markClaudeBusyForInbound(m)
+      return d
+    },
+    inboundSpool,
+    trackRedeliveredInbound,
+  )
+  if (fr.redelivered > 0) {
+    process.stderr.write(
+      `telegram gateway: ${reason} flushed ${fr.redelivered}/${fr.drained} ` +
+      `held inbound for ${selfAgentForFlush}` +
+      `${fr.rebuffered > 0 ? ` (${fr.rebuffered} re-buffered)` : ''}\n`,
+    )
+  }
+}
+
+function drainBufferedIfAllowed(endingTurn: CurrentTurn | undefined, reason: string): void {
+  if (
+    !mayDrainBufferedInbound({
+      turnInFlight: turnInFlightForGate(),
+      endingTurnFinalAnswerDelivered: endingTurn?.finalAnswerDelivered ?? null,
+      enabled: SERIALIZE_UNTIL_REPLIED_ENABLED,
+    })
+  ) {
+    return
+  }
+  performBufferDrain(reason)
+}
+
+/**
+ * Component 2 — bounded no-reply escape hatch (THE liveness guarantee).
+ *
+ * A turn that legitimately ends with NO reply (handback ack, NO_REPLY /
+ * HEARTBEAT_OK marker, silent-end, greeting already handled) sets
+ * `finalAnswerDelivered=false`. Under component 1's serialize gate that
+ * turn would block `drainBufferedIfAllowed` FOREVER — and the 300s
+ * silence-poke is disarmed for these silent-end turns, so without this
+ * timer a queued cross-topic message would never be released (a permanent
+ * wedge). This timer is the bounded force-drain: SERIALIZE_NOREPLY_DRAIN_MS
+ * (default 2500ms) after such a turn ends with a buffered inbound waiting,
+ * drain unconditionally — the serialize gate's delivered-check is bypassed
+ * because the turn ended for real with no reply coming. The drain still
+ * respects `turnInFlightForGate()` indirectly: if a new turn started in the
+ * window (e.g. the 300s fallback or another path drained first), the buffer
+ * is already empty so `performBufferDrain` is a depth-checked no-op.
+ *
+ * Liveness proof: a no-reply turn followed by a queued cross-topic message
+ * releases within SERIALIZE_NOREPLY_DRAIN_MS. The 300s silence-poke
+ * unwedge fallback (`redeliverBufferedInbound` at the silence-poke
+ * framework-fallback, called directly) remains the independent long-stop.
+ */
+function armNoReplyDrainTimer(turn: CurrentTurn): void {
+  const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  // Pure guard (shared with the test): arm only for a no-reply turn that
+  // has a buffered inbound waiting, and only when the feature is enabled.
+  if (
+    !shouldArmNoReplyDrain({
+      enabled: SERIALIZE_UNTIL_REPLIED_ENABLED,
+      finalAnswerDelivered: turn.finalAnswerDelivered,
+      bufferedDepth: pendingInboundBuffer.depth(selfAgent),
+    })
+  ) {
+    return
+  }
+  // Idempotent: clear any prior timer for this turn before re-arming.
+  if (turn.noReplyDrainTimer != null) {
+    clearTimeout(turn.noReplyDrainTimer)
+    turn.noReplyDrainTimer = null
+  }
+  turn.noReplyDrainTimer = setTimeout(() => {
+    turn.noReplyDrainTimer = null
+    process.stderr.write(
+      `telegram gateway: no-reply bounded drain (${SERIALIZE_NOREPLY_DRAIN_MS}ms) — ` +
+      `turn ${turn.turnId} ended without a reply; force-draining buffered inbound\n`,
+    )
+    performBufferDrain('no-reply-bounded-drain')
+  }, SERIALIZE_NOREPLY_DRAIN_MS)
+  turn.noReplyDrainTimer.unref?.()
+}
+
 function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // Phase 2b: turn end. The key was registered via setTurnStarted when
   // the inbound arrived; purge is the canonical turn-end signal.
@@ -1744,6 +2037,20 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   activeStatusReactions.delete(key)
   activeReactionMsgIds.delete(key)
   activeTurnStartedAt.delete(key)
+  // Component 5 (reap) — defense-in-depth. The happy path deletes the
+  // queued-status placeholder on the answer (executeReply / stream /
+  // turn-flush). This catches the abnormal turn-end (silent-marker, wedge,
+  // sibling purge) so a stale "Queued"/"On it" line can never dangle in
+  // the topic. Idempotent: a no-op when already reaped. Prefer the ending
+  // turn's session ids (canonical ownership); else parse the chatKey.
+  if (endingTurn != null) {
+    reapQueuedStatus(endingTurn.sessionChatId, endingTurn.sessionThreadId)
+  } else {
+    const pqChatId = chatIdOfChatKey(key as _ChatKey)
+    const pqThreadPart = (key as string).slice(pqChatId.length + 1)
+    const pqThread = pqThreadPart === '_' || pqThreadPart === '' ? null : Number(pqThreadPart)
+    reapQueuedStatus(pqChatId, Number.isFinite(pqThread) ? (pqThread as number) : undefined)
+  }
   // PR3b: clear the parallel-turns fleet-gate entry. Symmetric with
   // the markClaudeBusyForInbound on the delivery path. Safe no-op
   // when the key was never marked (synthetic purge from a sweep).
@@ -1796,36 +2103,21 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // when the cutover kill-switch is on; the turnEnd event was emitted
   // just above (purgeReactionTracking head), so the machine is already
   // idle here.
-  if (!turnInFlightForGate()) {
-    // #1556: the deterministic delivery point. claude has just gone
-    // idle — flush any inbound held mid-turn so the channel
-    // notification lands at the idle prompt and submits as a fresh
-    // turn (instead of stranding in the composer, the lawgpt wedge).
-    // Zero-churn: depth check first, no work on the common empty path.
-    // Lossless: redeliver re-buffers any per-message miss (bridge
-    // mid-reconnect), which onClientRegistered then drains.
-    const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
-    if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
-      const fr = redeliverBufferedInbound(
-        pendingInboundBuffer,
-        selfAgentForFlush,
-        (m) => {
-          const d = ipcServer.sendToAgent(selfAgentForFlush, m)
-          if (d) markClaudeBusyForInbound(m)
-          return d
-        },
-        inboundSpool,
-        trackRedeliveredInbound,
-      )
-      if (fr.redelivered > 0) {
-        process.stderr.write(
-          `telegram gateway: turn-complete flushed ${fr.redelivered}/${fr.drained} ` +
-          `held inbound for ${selfAgentForFlush}` +
-          `${fr.rebuffered > 0 ? ` (${fr.rebuffered} re-buffered)` : ''}\n`,
-        )
-      }
-    }
+  // #1556: the deterministic delivery point. claude has just gone idle —
+  // flush any inbound held mid-turn so the channel notification lands at
+  // the idle prompt and submits as a fresh turn (instead of stranding in
+  // the composer, the lawgpt wedge). Component 1 (deliver-before-drain):
+  // routed through `drainBufferedIfAllowed`, which additionally gates on
+  // the ending turn having delivered its reply so a buffered cross-topic
+  // message can't drain ahead of the just-ended turn's late reply (the
+  // Brevo→Meta wrong-topic bug). Zero-churn: the helper depth-checks
+  // first. Lossless: redeliver re-buffers any per-message miss.
+  drainBufferedIfAllowed(endingTurn, 'turn-complete')
 
+  // Restart / compaction stay on the bare turn-end signal (NOT the
+  // serialize gate): a pending self-restart or proactive compaction must
+  // fire when claude is idle regardless of whether the last turn replied.
+  if (!turnInFlightForGate()) {
     if (pendingRestarts.size > 0) {
       for (const [agentName, _timestamp] of pendingRestarts.entries()) {
         triggerSelfRestart(agentName, 'turn-complete-pending-restart');
@@ -1879,7 +2171,7 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
  * `executeReply`'s post-send block and by tests via source-level
  * pinning in `vault-approval-posture.test.ts` / wedge-guard suites.
  */
-function releaseTurnBufferGate(key: string): void {
+function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
   if (!activeTurnStartedAt.has(key)) return
   activeTurnStartedAt.delete(key)
   // PR3b: keep claudeBusyKeys in sync — same lifecycle as the
@@ -1890,38 +2182,21 @@ function releaseTurnBufferGate(key: string): void {
   // executeReply AFTER an outbound landed.
   shadowEmit({ kind: 'turnEnd', key: key as _ChatKey, at: Date.now(), outboundEmitted: true })
 
-  // Mirror the deterministic-delivery flush from
-  // `purgeReactionTracking` (gateway.ts:1376-1399). When the fleet
-  // hits zero-active-turns, drain any held inbound. This is the
-  // load-bearing wedge fix: the gate that pinned msg 1874+ in
+  // Mirror the deterministic-delivery flush from `purgeReactionTracking`.
+  // When the fleet hits zero-active-turns, drain any held inbound. This is
+  // the load-bearing wedge fix: the gate that pinned msg 1874+ in
   // test-harness's 13:02 UAT now opens after the reply.
   //
-  // PR3b: gated on claudeBusyKeys (see purgeReactionTracking comment).
-  // PR3b-cutover: turnEnd was emitted just above (releaseTurnBufferGate
-  // head), so the machine is already idle when the cutover gate reads.
-  if (!turnInFlightForGate()) {
-    const selfAgentForFlush = process.env.SWITCHROOM_AGENT_NAME ?? ''
-    if (pendingInboundBuffer.depth(selfAgentForFlush) > 0) {
-      const fr = redeliverBufferedInbound(
-        pendingInboundBuffer,
-        selfAgentForFlush,
-        (m) => {
-          const d = ipcServer.sendToAgent(selfAgentForFlush, m)
-          if (d) markClaudeBusyForInbound(m)
-          return d
-        },
-        inboundSpool,
-        trackRedeliveredInbound,
-      )
-      if (fr.redelivered > 0) {
-        process.stderr.write(
-          `telegram gateway: reply-released-gate flushed ${fr.redelivered}/${fr.drained} ` +
-          `held inbound for ${selfAgentForFlush}` +
-          `${fr.rebuffered > 0 ? ` (${fr.rebuffered} re-buffered)` : ''}\n`,
-        )
-      }
-    }
-  }
+  // Component 1 (deliver-before-drain): routed through the shared
+  // `drainBufferedIfAllowed`. `releaseTurnBufferGate` is called on EVERY
+  // reply finalize — interim ack AND final answer. The serialize gate
+  // checks `endingTurn.finalAnswerDelivered`, so an INTERIM ack ("On it")
+  // does NOT drain the cross-topic buffer (its turn hasn't delivered its
+  // real answer yet); only the final-answer reply releases it. That is
+  // exactly the serialize-until-replied contract. When the kill switch is
+  // off, or no turn handle is threaded, the helper falls back to the
+  // legacy drain-on-idle behaviour.
+  drainBufferedIfAllowed(endingTurn, 'reply-released-gate')
 }
 
 /**
@@ -1947,12 +2222,27 @@ function releaseTurnBufferGate(key: string): void {
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
   if (currentTurn !== turn) return
   currentTurn = null
+  // Component 2 — clear any prior no-reply drain timer for this turn; a
+  // fresh end re-evaluates below. (Idempotent — null when never armed.)
+  if (turn.noReplyDrainTimer != null) {
+    clearTimeout(turn.noReplyDrainTimer)
+    turn.noReplyDrainTimer = null
+  }
   // Pass `turn` so purgeReactionTracking sees the authoritative
   // replyCalled flag even though we just nulled module-scope
   // currentTurn. Without this, the shadow trace's outboundEmitted
   // would be false on every replied turn (the dominant happy path),
   // producing strictly worse data than the blind `true` it replaced.
+  // Component 1: purgeReactionTracking runs the serialize-gated drain —
+  // it drains only if this turn delivered its final answer.
   purgeReactionTracking(statusKey(turn.sessionChatId, turn.sessionThreadId), turn)
+  // Component 2 — bounded no-reply escape hatch. If this turn ended
+  // WITHOUT delivering (finalAnswerDelivered=false) the serialize gate
+  // above did NOT drain. Arm the bounded timer so a queued cross-topic
+  // message still releases within SERIALIZE_NOREPLY_DRAIN_MS instead of
+  // wedging forever. No-op when this turn delivered, when nothing is
+  // buffered, or when the serialize feature is off.
+  armNoReplyDrainTimer(turn)
 }
 
 /**
@@ -5446,10 +5736,16 @@ if (!STATIC) {
     // queued message ends either delivered or visibly retracted.
     inboundSpool?.sweepEscalations((e) => {
       const chat = e.msg.chatId
-      const threadOpts =
+      const escThread =
         typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
-          ? { message_thread_id: Number(e.msg.meta.threadId) }
-          : {}
+          ? Number(e.msg.meta.threadId)
+          : undefined
+      const threadOpts = escThread != null ? { message_thread_id: escThread } : {}
+      // Reap any "Queued — replying in #X" placeholder for this topic first:
+      // the message is being declared undeliverable, so the queued-status must
+      // not dangle beside the "couldn't deliver" notice (idempotent best-effort;
+      // a normal turn-start/turn-end reaps far sooner — this is the 15-min edge).
+      reapQueuedStatus(chat, escThread)
       void swallowingApiCall(
         () =>
           bot.api.sendMessage(
@@ -5765,21 +6061,34 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
 
   assertAllowedChat(chat_id)
 
-  // Thread resolution precedence: (1) an explicit message_thread_id the
-  // model passed, else (2) THIS turn's own originating topic
-  // (turn-pinned, #1664), else (3) the chat's last-seen topic
-  // (chatThreadMap). Preferring the turn's own thread over the chat
-  // last-seen heuristic fixes synthetic turns (subagent handback/progress,
-  // cron) — whose topic the model is never told and which never write
-  // chatThreadMap — and is strictly more correct under multi-topic
-  // concurrency (a reply lands in the topic the turn came from, not
-  // whichever topic most recently received a message). DM: both are
-  // undefined → unchanged.
-  let threadId = resolveThreadId(
-    chat_id,
-    (args.message_thread_id as string | undefined) ??
-      (turn?.sessionThreadId != null ? turn.sessionThreadId : undefined),
-  )
+  // Thread resolution precedence (ANSWER path, component 3 — turn-origin
+  // routing): (1) explicit message_thread_id the model passed; else
+  // (2) the ORIGIN turn's thread — the turn that OWNS this reply, matched
+  // by origin_turn_id (the meta field the model echoes back). This is
+  // authoritative even after `currentTurn` has flipped to a successor (the
+  // Brevo→Meta late-reply bug). Else (3) the live turn's thread (legacy
+  // #1664 fallback when no origin turn is resolvable). Answer paths
+  // DELIBERATELY do NOT fall through to chatThreadMap last-seen — that
+  // heuristic is what mis-routed a late reply to whichever topic most
+  // recently received a message. DM: every tier is undefined → unchanged.
+  // Kill switch off → exact legacy resolveThreadId precedence.
+  let threadId: number | undefined
+  if (TURN_ORIGIN_ROUTING_ENABLED) {
+    const explicit = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+    threadId = resolveAnswerThreadId({
+      explicitThreadId: Number.isFinite(explicit as number) ? (explicit as number) : undefined,
+      originResolved: originTurn != null,
+      originThreadId: originTurn?.sessionThreadId,
+      liveThreadId: turn?.sessionThreadId,
+    })
+  } else {
+    threadId = resolveThreadId(
+      chat_id,
+      (args.message_thread_id as string | undefined) ??
+        (turn?.sessionThreadId != null ? turn.sessionThreadId : undefined),
+    )
+  }
 
   if (reply_to == null && quoteOptIn && HISTORY_ENABLED) {
     try {
@@ -6360,7 +6669,19 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     // bidirectional ladder + the steer-vs-queue logic at
     // gateway.ts:8322 which reads `activeStatusReactions`). Only
     // the buffer gate flips.
-    releaseTurnBufferGate(statusKey(chat_id, threadId))
+    //
+    // Component 1: pass the turn so the serialize gate sees this turn's
+    // `finalAnswerDelivered` (set just above for final-answer replies).
+    // An interim ack leaves it false → the cross-topic buffer does NOT
+    // drain yet; the real answer's reply releases it.
+    releaseTurnBufferGate(statusKey(chat_id, threadId), turn ?? undefined)
+    // Component 5: the final answer landed — reap the queued-status
+    // placeholder for THIS turn's topic. Key on the turn's own session
+    // thread (where the placeholder was posted / promoted), not the
+    // answer's possibly-overridden threadId.
+    if (turn?.finalAnswerDelivered === true) {
+      reapQueuedStatus(turn.sessionChatId, turn.sessionThreadId)
+    }
   }
 
   process.stderr.write(`telegram channel: reply: finalized chatId=${chat_id} messageIds=[${sentIds.join(',')}] chunks=${chunks.length}\n`)
@@ -6378,15 +6699,31 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
-  // Thread precedence (matches executeReply): when the model passes no
-  // explicit message_thread_id, fall back to THIS turn's originating
-  // topic before handleStreamReply's chatThreadMap last-seen heuristic.
-  // Injecting here threads every downstream consumer consistently — the
-  // dedup key, the voice-scrub metric, the draft transport, and the send
-  // — so a streamed handback/synthetic-turn reply lands in the right
-  // supergroup topic. DM: sessionThreadId undefined → unchanged.
-  if (args.message_thread_id == null && turn?.sessionThreadId != null) {
-    args.message_thread_id = String(turn.sessionThreadId)
+  // Thread precedence (matches executeReply; component 3 — turn-origin
+  // routing): when the model passes no explicit message_thread_id, inject
+  // the ORIGIN turn's thread (matched by origin_turn_id) — authoritative
+  // even after currentTurn flips — falling back to the live turn's thread
+  // when no origin is resolvable (legacy #1664). Injecting into
+  // args.message_thread_id threads every downstream consumer consistently
+  // (dedup key, voice-scrub metric, draft transport, the send), so a
+  // streamed handback/synthetic-turn reply lands in the right supergroup
+  // topic and a late stream-reply can't be stolen by a successor turn. DM:
+  // every tier undefined → unchanged. Kill switch off → legacy live-turn
+  // injection only.
+  if (args.message_thread_id == null) {
+    let injected: number | undefined
+    if (TURN_ORIGIN_ROUTING_ENABLED) {
+      const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+      injected = resolveAnswerThreadId({
+        explicitThreadId: undefined,
+        originResolved: originTurn != null,
+        originThreadId: originTurn?.sessionThreadId,
+        liveThreadId: turn?.sessionThreadId,
+      })
+    } else {
+      injected = turn?.sessionThreadId
+    }
+    if (injected != null) args.message_thread_id = String(injected)
   }
 
   // Outbound secret scrub (#2044): mask before the dedup key, the draft
@@ -6674,7 +7011,16 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   {
     const sChat = args.chat_id as string
     const sThread = resolveThreadId(sChat, args.message_thread_id as string | undefined)
-    releaseTurnBufferGate(statusKey(sChat, sThread))
+    // Component 1: pass the turn (finalAnswerDelivered set above for a
+    // final stream emit). Interim stream chunks leave it false → no
+    // cross-topic drain until the done=true / substantive emit lands.
+    releaseTurnBufferGate(statusKey(sChat, sThread), turn ?? undefined)
+    // Component 5: reap the queued-status placeholder for THIS turn's
+    // topic once the final answer landed. Key on the turn's own session
+    // thread (where the placeholder lives), not the answer's resolved one.
+    if (turn?.finalAnswerDelivered === true) {
+      reapQueuedStatus(turn.sessionChatId, turn.sessionThreadId)
+    }
   }
   return { content: [{ type: 'text', text: `${result.status} (id: ${result.messageId ?? 'pending'})` }] }
 }
@@ -8200,9 +8546,19 @@ function handleSessionEvent(ev: SessionEvent): void {
         // handler captures `const turn = currentTurn` at entry, so a
         // captured-then-awaited read can't reattribute to the new turn.
         const startedAt = Date.now()
+        // Component 3 — stable per-turn identity. For a real inbound this
+        // matches the `origin_turn_id` stamped into the inbound meta at
+        // build time (same chat/thread/messageId). Synthetic turns (cron /
+        // handback — no messageId) get a unique startedAt-based fallback id
+        // that no reply will ever echo, so they correctly fall through to
+        // the live-turn routing in resolveAnswerThreadId.
+        const enqThreadIdNum = ev.threadId != null ? Number(ev.threadId) : undefined
+        const turnId =
+          deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
+          ?? `${chatKey(ev.chatId, enqThreadIdNum ?? null)}#synthetic-${startedAt}`
         const next: CurrentTurn = {
           sessionChatId: ev.chatId,
-          sessionThreadId: ev.threadId != null ? Number(ev.threadId) : undefined,
+          sessionThreadId: enqThreadIdNum,
           sourceMessageId: ev.messageId != null && /^\d+$/.test(ev.messageId)
             ? Number(ev.messageId)
             : null,
@@ -8215,7 +8571,9 @@ function handleSessionEvent(ev: SessionEvent): void {
           silentAnchorText: '',
           capturedText: [],
           orphanedReplyTimeoutId: null,
+          turnId,
           registryKey: null,
+          noReplyDrainTimer: null,
           lastAssistantMsgId: null,
           lastAssistantDone: false,
           toolCallCount: 0,
@@ -8229,6 +8587,14 @@ function handleSessionEvent(ev: SessionEvent): void {
           isDm: isDmChatId(ev.chatId),
         }
         currentTurn = next
+        // Component 3 — retain in the bounded recently-ended registry so a
+        // LATE reply (landing after currentTurn flips to a successor) can
+        // still resolve THIS turn's origin thread by its turnId.
+        rememberRecentTurn(next)
+        // Component 5 (Hook B) — this turn's topic had a queued placeholder
+        // from Hook A; promote it to "On it — replying now." (deleted later
+        // when the answer lands). No-op when there's no placeholder / DM.
+        promoteQueuedStatus(ev.chatId, enqThreadIdNum)
         // Ack inbound delivery (the marko drop-wedge): claude actually started
         // this turn, so its delivered inbound landed — stop tracking it for
         // re-delivery. `enqueue` carries the same chat/thread the inbound was
@@ -8997,6 +9363,13 @@ function handleSessionEvent(ev: SessionEvent): void {
 
       if (flushDecision.kind === 'flush') {
         let capturedText = flushDecision.text
+        // Component 3 — origin-thread backstop. `chatId`/`threadId` are
+        // captured from the turn atom (turn.sessionChatId/sessionThreadId)
+        // at the top of this turn_end handler, NOT from the live
+        // currentTurn and NEVER from chatThreadMap. So the turn-flush
+        // answer always lands in the thread the turn originated from, even
+        // if currentTurn has flipped — the same guarantee the reply path
+        // gets via origin_turn_id.
         const backstopChatId = chatId
         const backstopThreadId = threadId
         const backstopCtrl = ctrl
@@ -10812,6 +11185,21 @@ async function handleInbound(
   }
 
   // Dispatch to connected bridge via IPC
+  // Component 3 — stable origin turn id stamped into the meta the model
+  // reads, so a reply can echo it back (origin_turn_id) and the gateway
+  // can route the answer to the turn that owns it even after currentTurn
+  // flips. Derived from chat/thread/messageId, matching the turnId the
+  // enqueue handler computes for the turn this inbound starts.
+  const originTurnId = deriveTurnId(chat_id, messageThreadId ?? null, msgId)
+  // Component 4 — per-turn topic framing. In a forum supergroup a queued
+  // cross-topic message could tempt the model to also answer a pending
+  // question from another topic. A one-line directive (only for topic
+  // inbounds, only when framing is enabled) pins the model to THIS
+  // message's topic. DMs / non-topic chats get nothing.
+  const topicScope =
+    TOPIC_FRAMING_ENABLED && messageThreadId != null
+      ? 'This message belongs to the current topic only — answer ONLY this question, in this topic. Do not also answer a pending message from another topic.'
+      : undefined
   const inboundMsg: InboundMessage = {
     type: 'inbound',
     chatId: chat_id,
@@ -10836,6 +11224,14 @@ async function handleInbound(
       user_id: String(from.id),
       ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
       ...(messageThreadId != null ? { message_thread_id: String(messageThreadId) } : {}),
+      // Component 3 — origin turn id. The model is told to pass this back
+      // as origin_turn_id on the reply so the answer routes to the topic
+      // this message came from (turn-origin routing). The reply tool also
+      // resolves it from the live/recent turn registry, so a model that
+      // omits it still routes correctly via the live-turn fallback.
+      ...(originTurnId != null ? { origin_turn_id: originTurnId } : {}),
+      // Component 4 — per-turn topic-scope directive (supergroup topics).
+      ...(topicScope != null ? { topic_scope: topicScope } : {}),
       ...(imagePath ? { image_path: imagePath } : {}),
       // Telegram-native reply context (issue #119). When set, the user
       // long-pressed a prior message and chose "Reply" — the agent should
@@ -10949,6 +11345,21 @@ async function handleInbound(
       `telegram gateway: inbound held mid-turn agent=${selfAgent} ` +
       `chat=${chat_id} msg=${msgId ?? '-'} — will flush on turn-complete\n`,
     )
+    // Component 5 (Hook A) — queued-status UX. When this buffered inbound
+    // is in a DIFFERENT forum topic than the in-flight turn, the user in
+    // that topic otherwise sees only a 👀 reaction (or nothing). Post one
+    // self-updating status into the buffered message's OWN topic so they
+    // know they're queued. Suppressed for DMs (no topics) and same-topic
+    // queues (the in-flight turn's own card already covers them).
+    const inFlightThread = currentTurn?.sessionThreadId
+    if (
+      QUEUED_STATUS_UX_ENABLED &&
+      !isDmChatId(chat_id) &&
+      messageThreadId != null &&
+      messageThreadId !== inFlightThread
+    ) {
+      postQueuedStatus(chat_id, messageThreadId, inFlightThread)
+    }
     return
   }
 
