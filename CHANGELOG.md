@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.14.63 — Obligation: stop false nudges on slow turns + interrupt cleanup; mid-turn auto-classify (shadow)
+
+- **Obligation escalate-grace window (#2156).** Fuzz testing found the ledger
+  fired a false "⚠️ I may have missed this" on a slow / background-worker /
+  multi-segment turn: the turn ends (the in-flight gate clears) before its
+  trailing answer's reply lands, and the 5s sweep escalated in that gap. The
+  sweep now waits a grace window (default 45s, `SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS=0`
+  to disable) after a turn ends without a final answer before re-presenting/
+  escalating — so the trailing answer's close has a beat to fire. The genuine
+  drop (a thread that never gets an answer) still escalates after grace expires.
+  Proven by folding the grace path into the 3000-schedule determinism
+  enumeration (grace delays, never prevents a terminal).
+- **Interrupt cancels its obligation (#2157).** An `!` interrupt SIGINT-kills the
+  in-flight turn, which doesn't reliably emit turn_end, so its obligation
+  survived and the sweep later re-asked a question the user *explicitly
+  cancelled*. The interrupt now closes that turn's obligation (queued siblings
+  untouched).
+- **Mid-turn auto-classify, shadow mode (#2158).** Groundwork toward steering/
+  queuing by intent instead of explicit `/steer` `/q` prefixes: a deterministic,
+  model-free classifier (topic-vs-active-turn + reply-recency). Behind
+  `SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW` (default OFF) it only LOGS what it
+  would decide — behaviour is unchanged — to gather data before any auto-steer
+  ever acts.
+
 ## v0.14.62 — Obligation ledger: close the hang-wedge (#2152)
 
 - **Obligation-ledger determinism completion (#2152), still behind the flag.** A
