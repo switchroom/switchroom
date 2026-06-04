@@ -289,6 +289,7 @@ import {
   obligationEscalationText,
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
+import { withDeadline } from './with-deadline.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -1411,6 +1412,17 @@ const OBLIGATION_SWEEP_MS = 5_000
 // attempts the gateway closes best-effort (loud log): the user is genuinely
 // unreachable, so a bounded give-up beats an infinite/poison loop.
 const OBLIGATION_ESCALATE_MAX = 3
+// Deadline for a single escalation send. grammy/fetch impose NO request timeout,
+// and the in-flight guard (obligationEscalateInFlight) is cleared only in the
+// send's `.finally` — which never runs if the send hangs. Without a bound, one
+// stalled send leaks the in-flight flag forever and the obligation is stuck OPEN
+// (never re-escalated, never closed) — the sole liveness hole a total proof
+// found. Racing the send against this deadline makes the wait bounded BY
+// CONSTRUCTION (see with-deadline.ts): the chain always settles, `.finally`
+// always clears the flag, and a hang becomes a bounded reject that feeds the
+// bounded escalate ladder to a terminal. 45s comfortably exceeds robustApiCall's
+// 3-attempt network backoff so a legitimate slow send isn't cut short.
+const OBLIGATION_ESCALATE_SEND_DEADLINE_MS = 45_000
 // Durable snapshot of the open obligation set on the persistent per-agent
 // volume (STATE_DIR = /state/agent/telegram in prod). Closes the restart hole:
 // the in-memory ledger alone empties on restart and the spool's boot-replay
@@ -4890,16 +4902,39 @@ const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
 // OPEN via meta.source; reuses tested delivery). Bounded: after maxRepresents,
 // escalate to ONE operator-visible "did I miss this?" and close — no loop.
 // No-op unless the flag is on; gated on the same idle predicate as the drains.
+// DETERMINISM (closed-form, not sampled). The obligation ledger itself
+// (obligation-ledger.ts) is a finite FSM with a total transition function and a
+// strictly-decreasing measure μ = (REPRESENT_MAX - representCount) +
+// (ESCALATE_MAX - escalateAttempts): every markRepresented/markEscalateAttempt
+// decreases μ, both terms are bounded below, and at the floor the only move is
+// close → terminal. So on the FSM, every OPEN reaches answered | escalation-
+// delivered | bounded give-up (no cycle re-increments a counter). This sweep is
+// the FSM's driver; its termination rests on three liveness facts, all bounded:
+//   (1) the 5s setInterval keeps firing;
+//   (2) the gate (turnInFlightForGate) opens — claudeBusyKeys is cleared at
+//       turn-end (purgeReactionTracking / releaseTurnBufferGate), on bridge
+//       disconnect (disconnect-flush.ts), and by the 300s silence-poke watchdog;
+//   (3) the escalation send settles — bounded BY CONSTRUCTION via withDeadline
+//       below (grammy has no request timeout, so an unbounded send was the one
+//       way an obligation could get stuck OPEN forever — now closed).
+// The only residual liveness assumption is the bridge eventually reconnecting /
+// the process restarting, which the entire gateway's inbound delivery already
+// depends on and which durable spool + boot-replay make self-healing.
 function obligationSweep(): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
   if (!obligationLedger.hasOpen()) return
   if (turnInFlightForGate()) return // a turn is running — let it finish/answer
   const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
-  if (pendingInboundBuffer.depth(agent) > 0) return // existing drain runs first; avoids double-present
   const decision = obligationLedger.decideAtIdle()
   const o = decision.obligation
   if (decision.action === 'none' || o == null) return
   if (decision.action === 'represent') {
+    // Re-present goes through the bridge → buffer. Only the represent path is
+    // gated on an empty buffer (let the existing drain run first, avoid
+    // double-presenting). Escalation below is NOT gated on the buffer — it is a
+    // direct Telegram send, independent of the bridge, so a represent stranded
+    // behind a dead bridge can never block the operator nudge.
+    if (pendingInboundBuffer.depth(agent) > 0) return
     pendingInboundBuffer.push(agent, buildObligationRepresentInbound(o, Date.now()))
     const attempt = obligationLedger.markRepresented(o.originTurnId)
     process.stderr.write(
@@ -4925,13 +4960,22 @@ function obligationSweep(): void {
   // retryWithThreadFallback: a stale/renumbered topic returns THREAD_NOT_FOUND;
   // retry WITHOUT the thread so the nudge still lands in the chat (the #2096
   // pattern) instead of being permanently undeliverable to a dead topic.
-  void retryWithThreadFallback(
-    robustApiCall,
-    (tid) =>
-      bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
-        ...(tid != null ? { message_thread_id: tid } : {}),
-      }),
-    { threadId: o.threadId, chat_id: o.chatId, verb: 'obligation.escalate' },
+  // withDeadline: grammy/fetch impose no request timeout and `.finally` (which
+  // clears the in-flight flag) only runs on settle — so a hung send would leak
+  // the flag forever and wedge this obligation OPEN. Racing against a deadline
+  // guarantees the chain settles, the flag always clears, and a hang becomes a
+  // bounded reject handled exactly like any other failed attempt.
+  void withDeadline(
+    retryWithThreadFallback(
+      robustApiCall,
+      (tid) =>
+        bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
+          ...(tid != null ? { message_thread_id: tid } : {}),
+        }),
+      { threadId: o.threadId, chat_id: o.chatId, verb: 'obligation.escalate' },
+    ),
+    OBLIGATION_ESCALATE_SEND_DEADLINE_MS,
+    'obligation escalation send timed out',
   )
     .then(() => {
       obligationLedger.close(escId)
