@@ -234,3 +234,81 @@ describe("ObligationLedger — durability hooks + escalate-attempt counter", () 
     expect(L.size()).toBe(1);
   });
 });
+
+describe("ObligationLedger — escalate-grace window (over-escalation fix)", () => {
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text: "x", openedAt };
+  }
+
+  it("no opts (or graceMs<=0) → pre-grace behaviour: acts immediately", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteTurnEnded("c:3#1", 5000); // a turn just ended
+    expect(L.decideAtIdle().action).toBe("represent"); // no grace → act now
+    expect(L.decideAtIdle({ now: 5001, graceMs: 0 }).action).toBe("represent"); // graceMs 0 → off
+  });
+
+  it("skips an obligation whose turn ended < graceMs ago (the trailing-answer window)", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteTurnEnded("c:3#1", 5000);
+    // 30s after turn-end, grace 45s → still within grace → wait (none)
+    expect(L.decideAtIdle({ now: 35000, graceMs: 45000 }).action).toBe("none");
+    // 46s after turn-end → out of grace → act
+    expect(L.decideAtIdle({ now: 51000, graceMs: 45000 }).action).toBe("represent");
+  });
+
+  it("an obligation that never had a turn end (still-queued) is always eligible — no trailing answer to wait for", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000)); // no noteTurnEnded
+    expect(L.decideAtIdle({ now: 1001, graceMs: 45000 }).action).toBe("represent");
+  });
+
+  it("picks the oldest ELIGIBLE: a newer in-grace obligation does not block an older out-of-grace one", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000)); // older
+    L.openIfAbsent(input("c:3#2", 2000)); // newer
+    L.noteTurnEnded("c:3#1", 5000); // older's turn ended at 5000 (out of grace by now)
+    L.noteTurnEnded("c:3#2", 60000); // newer's turn ended at 60000 (in grace)
+    const d = L.decideAtIdle({ now: 70000, graceMs: 45000 });
+    // older (#1) ended 65s ago → eligible; newer (#2) ended 10s ago → in grace.
+    // pick oldest eligible = #1.
+    expect(d.action).toBe("represent");
+    expect(d.obligation?.originTurnId).toBe("c:3#1");
+  });
+
+  it("returns none when EVERY open obligation is within grace", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.openIfAbsent(input("c:3#2", 2000));
+    L.noteTurnEnded("c:3#1", 60000);
+    L.noteTurnEnded("c:3#2", 61000);
+    expect(L.decideAtIdle({ now: 65000, graceMs: 45000 }).action).toBe("none");
+  });
+
+  it("noteTurnEnded is a no-op for an unknown/closed obligation and persists when it applies", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000)); // persist #1
+    L.noteTurnEnded("nope", 5000); // unknown → no persist
+    expect(snapshots.length).toBe(1);
+    L.noteTurnEnded("c:3#1", 5000); // applies → persist
+    expect(snapshots.length).toBe(2);
+    expect(snapshots[1][0].lastTurnEndedAt).toBe(5000);
+  });
+
+  it("grace still terminates the ladder: represent → escalate once each is out of grace", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    // turn 0 ended at 1000; out of grace by t=50000
+    L.noteTurnEnded("c:3#1", 1000);
+    expect(L.decideAtIdle({ now: 50000, graceMs: 45000 }).action).toBe("represent");
+    L.markRepresented("c:3#1");
+    L.noteTurnEnded("c:3#1", 50000); // re-present turn ended
+    expect(L.decideAtIdle({ now: 96000, graceMs: 45000 }).action).toBe("represent");
+    L.markRepresented("c:3#1");
+    L.noteTurnEnded("c:3#1", 96000);
+    // representCount now 2 == max → escalate (once out of grace)
+    expect(L.decideAtIdle({ now: 142000, graceMs: 45000 }).action).toBe("escalate");
+  });
+});

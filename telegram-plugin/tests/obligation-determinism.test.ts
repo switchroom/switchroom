@@ -89,12 +89,18 @@ interface Sim {
   steps: number;
 }
 
-function runSchedule(msgs: Msg[], seed: number): Sim {
+function runSchedule(msgs: Msg[], seed: number, graceMs = 0): Sim {
   const PATH = "/state/agent/telegram/obligations.json";
   const store = memStore();
   let ledger = new ObligationLedger(MAX_REPRESENTS, {
     onChange: (snap) => persistObligations(PATH, store.fs, snap),
   });
+  // Virtual monotonic clock (only meaningful when graceMs>0). Advances every
+  // step by more than one sweep tick so the grace window deterministically
+  // expires within the step budget — proving grace DELAYS but never PREVENTS a
+  // terminal (no livelock).
+  let clock = 1_000_000;
+  const SWEEP_TICK = 5_000;
   const r = rng(seed);
 
   const pending = [...msgs]; // not yet received
@@ -109,11 +115,18 @@ function runSchedule(msgs: Msg[], seed: number): Sim {
   };
 
   // Run one turn for an obligation; close if the model answers on this attempt.
+  // If it does NOT answer and grace is on, stamp the turn-end clock (mirrors the
+  // gateway's endCurrentTurnAtomic !finalAnswerDelivered branch) so the next
+  // decideAtIdle({now, graceMs}) waits out the grace before re-presenting.
   const deliverTurn = (id: string) => {
     const had = (turnsHad.get(id) ?? 0);
     const attemptIndex = had; // 0-based
     turnsHad.set(id, had + 1);
-    if (byId.get(id)!.answerOnAttempt === attemptIndex) close(id, "answered");
+    if (byId.get(id)!.answerOnAttempt === attemptIndex) {
+      close(id, "answered");
+    } else if (graceMs > 0 && ledger.isOpen(id)) {
+      ledger.noteTurnEnded(id, clock);
+    }
   };
 
   const ESC_IN_FLIGHT = new Set<string>(); // mirrors the gateway's concurrency guard (no-op in a sync model)
@@ -139,7 +152,14 @@ function runSchedule(msgs: Msg[], seed: number): Sim {
       });
       deliverTurn(m.id); // original turn (attempt 0)
     } else if (open) {
-      const decision = ledger.decideAtIdle();
+      const decision =
+        graceMs > 0 ? ledger.decideAtIdle({ now: clock, graceMs }) : ledger.decideAtIdle();
+      if (decision.action === "none") {
+        // Every open obligation is within its grace window — the sweep waits.
+        // Advance the clock so grace deterministically expires; no livelock.
+        clock += SWEEP_TICK;
+        continue;
+      }
       const o = decision.obligation as Obligation;
       // INVARIANT (no double-ask): a terminated obligation must never resurface.
       expect(terminals.has(o.originTurnId)).toBe(false);
@@ -169,6 +189,9 @@ function runSchedule(msgs: Msg[], seed: number): Sim {
       });
       ledger.hydrate(loadObligations(PATH, store.fs));
     }
+    // Advance the virtual clock every step so any stamped grace window
+    // deterministically expires within the step budget.
+    clock += SWEEP_TICK;
   }
 
   return { terminals, steps };
@@ -214,6 +237,43 @@ describe("obligation determinism — every inbound reaches a terminal, no silent
           expect(t).toBe("escalation-delivered");
         } else {
           // never answered, escalation permanently undeliverable → bounded give-up
+          expect(t).toBe("escalation-give-up");
+        }
+      }
+    }
+  });
+
+  it("holds across 3000 schedules WITH the escalate-grace window on (grace delays, never prevents a terminal)", () => {
+    const ANSWER = [0, 1, 2, 3, 99];
+    const ESCFAIL = [0, 1, 2, 3, 5];
+    const GRACE_MS = 45_000;
+    for (let seed = 1; seed <= 3000; seed++) {
+      const r = rng(seed * 7919);
+      const n = 1 + Math.floor(r() * 5);
+      const msgs: Msg[] = [];
+      for (let i = 0; i < n; i++) {
+        const msgId = seed * 100 + i;
+        msgs.push({
+          id: `c:3#${msgId}`,
+          msgId,
+          answerOnAttempt: pick(ANSWER, r),
+          escalateFailsFor: pick(ESCFAIL, r),
+        });
+      }
+      // Same enumeration as the no-grace proof, but the ledger now runs the grace
+      // path: every non-answering turn stamps noteTurnEnded and the sweep waits
+      // out the window before acting. The terminal each message reaches must be
+      // IDENTICAL to the no-grace run — grace only delays.
+      const { terminals, steps } = runSchedule(msgs, seed * 104729, GRACE_MS);
+      expect(steps).toBeLessThan(10_000); // still terminates (no grace livelock)
+      for (const m of msgs) {
+        const t = terminals.get(m.id);
+        expect(t, `grace seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
+        if (m.answerOnAttempt <= MAX_REPRESENTS) {
+          expect(t).toBe("answered");
+        } else if (m.escalateFailsFor < ESCALATE_MAX) {
+          expect(t).toBe("escalation-delivered");
+        } else {
           expect(t).toBe("escalation-give-up");
         }
       }
