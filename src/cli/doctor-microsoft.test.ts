@@ -126,22 +126,25 @@ describe("runMicrosoftChecks — OAuth client", () => {
     expect(oauth?.detail).toContain("public-client");
   });
 
-  it("missing microsoft_workspace block → fail with setup guidance", () => {
+  it("missing microsoft_workspace block → ok (uses shipped default app)", () => {
+    // A default Microsoft OAuth app ships, so omitting the block is the
+    // normal zero-config case — not a failure. The broker resolves the
+    // default client_id.
     const cfg = baseConfig();
     delete cfg.microsoft_workspace;
     const results = runMicrosoftChecks(cfg, defaultMockDeps());
     const oauth = results.find((r) => r.name === "microsoft:oauth-client-configured");
-    expect(oauth?.status).toBe("fail");
-    expect(oauth?.fix).toContain("switchroom auth microsoft account add");
+    expect(oauth?.status).toBe("ok");
+    expect(oauth?.detail).toContain("shipped default");
   });
 
-  it("empty client_id → fail with Entra registration guidance", () => {
+  it("empty client_id → ok (falls back to shipped default app)", () => {
     const cfg = baseConfig();
     cfg.microsoft_workspace!.microsoft_client_id = "";
     const results = runMicrosoftChecks(cfg, defaultMockDeps());
     const oauth = results.find((r) => r.name === "microsoft:oauth-client-configured");
-    expect(oauth?.status).toBe("fail");
-    expect(oauth?.fix).toContain("entra.microsoft.com");
+    expect(oauth?.status).toBe("ok");
+    expect(oauth?.detail).toContain("shipped default");
   });
 
   it("skips OAuth check entirely when no agents enabled (just YAML in setup)", () => {

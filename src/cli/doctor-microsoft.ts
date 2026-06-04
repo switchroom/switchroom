@@ -157,25 +157,17 @@ function checkOAuthClient(
   if (!anyAgentEnabled) return [];
 
   const mw = config.microsoft_workspace;
-  if (!mw) {
+  // A shipped default Microsoft OAuth app means "no block" / "empty
+  // client_id" is the normal zero-config case, not a failure — the
+  // broker resolves the default. Only a BYO app (operator-supplied
+  // client_id) is reported as such.
+  if (!mw || !clientValuePresent(mw.microsoft_client_id)) {
     return [
       {
         name: "microsoft:oauth-client-configured",
-        status: "fail",
+        status: "ok",
         detail:
-          "agents have microsoft_workspace.account set but the top-level microsoft_workspace: block is missing",
-        fix: "Add a microsoft_workspace block with microsoft_client_id (and optionally microsoft_client_secret) to switchroom.yaml. See `switchroom auth microsoft account add` error output for the full walkthrough.",
-      },
-    ];
-  }
-  if (!clientValuePresent(mw.microsoft_client_id)) {
-    return [
-      {
-        name: "microsoft:oauth-client-configured",
-        status: "fail",
-        detail:
-          "microsoft_workspace block present but microsoft_client_id is empty",
-        fix: "Register an Entra app at https://entra.microsoft.com → App registrations → New. Copy the Application (client) ID and vault it: `switchroom vault set microsoft-oauth-client-id`.",
+          "using switchroom's shipped default Microsoft OAuth app (no BYO app configured)",
       },
     ];
   }

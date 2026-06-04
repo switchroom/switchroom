@@ -334,6 +334,46 @@ describe("AuthBroker — Microsoft get-credentials op", () => {
 
     broker.stop();
   });
+
+  it("serves credentials with NO microsoft_workspace block — the shipped default registers the provider", async () => {
+    // Out-of-box: even without a microsoft_workspace: block, the broker
+    // registers MicrosoftProvider via the shipped default client_id, so
+    // get-credentials for an enabled agent succeeds end-to-end.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      agents: { ziggy: { microsoft_workspace: { account: "lisa@outlook.com" } } },
+      microsoftAccounts: { "lisa@outlook.com": { enabled_for: ["ziggy"] } },
+      withProvider: false, // NO microsoft_workspace block at all
+    });
+    seedMicrosoftAccount(h, "lisa@outlook.com", {
+      expiresAt: Date.now() + 3600_000,
+      accessToken: "at-lisa-default",
+    });
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    const resp = (await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1,
+      id: "ms-default",
+      op: "get-credentials",
+      provider: "microsoft",
+    })) as {
+      ok: true;
+      data: { account: string; credentials: MicrosoftCredentialsShape };
+    };
+
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("lisa@outlook.com");
+    expect(resp.data.credentials.microsoftOauth.accessToken).toBe("at-lisa-default");
+
+    broker.stop();
+  });
 });
 
 describe("AuthBroker — Microsoft add-account / rm-account ops", () => {
@@ -651,7 +691,12 @@ describe("AuthBroker — Microsoft refresh-tick", () => {
     broker.stop();
   });
 
-  it("is a no-op when microsoft_workspace config is absent (provider not registered)", async () => {
+  it("refreshes even with NO microsoft_workspace block — the shipped default registers the provider", async () => {
+    // Out-of-box behavior change: a default Microsoft public client_id
+    // ships, so the broker registers MicrosoftProvider unconditionally
+    // (resolveMicrosoftClientId falls back to the default). A near-expiry
+    // account is therefore refreshed even when the operator never added
+    // a microsoft_workspace: block.
     const h = makeHarness();
     const config = makeConfig(h, { agents: {}, withProvider: false });
     seedMicrosoftAccount(h, "alice@outlook.com", {
@@ -669,7 +714,8 @@ describe("AuthBroker — Microsoft refresh-tick", () => {
     await broker.start();
     await broker._tick();
 
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("login.microsoftonline.com/common/oauth2/v2.0/token");
     broker.stop();
   });
 });

@@ -31,6 +31,7 @@ import {
   removeMicrosoftAccountEntry,
 } from "./microsoft-accounts-yaml.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
+import { resolveMicrosoftClientId } from "../auth/default-oauth-clients.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 export function registerAuthMicrosoftSubcommands(
@@ -286,28 +287,29 @@ function registerAccountAdd(accountParent: Command): void {
           ]);
 
           const config = loadConfig();
+          // microsoft_workspace is optional — when absent, the shipped
+          // default Microsoft app is used (zero-config out-of-box).
           const mw = config.microsoft_workspace;
-          if (!mw) {
-            throw new Error(
-              microsoftClientSetupGuidance(
-                "switchroom.yaml has no `microsoft_workspace:` block, so there is no Microsoft OAuth app to connect accounts against.",
-              ),
-            );
-          }
 
-          let clientIdRaw =
-            process.env.SWITCHROOM_MICROSOFT_CLIENT_ID ?? mw.microsoft_client_id;
+          // Precedence: env → operator config → shipped default.
+          const resolvedClientId = resolveMicrosoftClientId(
+            mw?.microsoft_client_id,
+          );
+          let clientIdRaw = resolvedClientId.clientId;
           let clientSecretRaw =
             process.env.SWITCHROOM_MICROSOFT_CLIENT_SECRET ??
-            mw.microsoft_client_secret;
-          if (!clientIdRaw) {
-            throw new Error(
-              microsoftClientSetupGuidance(
-                "The `microsoft_workspace:` block is present but `microsoft_client_id` is empty.",
+            mw?.microsoft_client_secret;
+          // client_secret optional — public-client apps don't need one.
+          if (resolvedClientId.source === "default") {
+            console.error(
+              chalk.gray(
+                "  Using switchroom's shipped Microsoft OAuth app (zero-config).\n" +
+                "  To use your own Entra app instead, set " +
+                "microsoft_workspace.microsoft_client_id in switchroom.yaml\n" +
+                "  (or the SWITCHROOM_MICROSOFT_CLIENT_ID env var).",
               ),
             );
           }
-          // client_secret optional — public-client apps don't need one.
 
           const needsVault =
             isVaultReference(clientIdRaw) ||
@@ -385,7 +387,7 @@ function registerAccountAdd(accountParent: Command): void {
             }
           }
 
-          const orgMode = opts["orgMode"] ?? mw.org_mode ?? false;
+          const orgMode = opts["orgMode"] ?? mw?.org_mode ?? false;
           const scopes = selectMicrosoftScopes(orgMode);
           const oauthCfg = {
             client_id: clientIdRaw,
@@ -818,49 +820,4 @@ async function readHiddenLine(prompt: string): Promise<string> {
     };
     process.stdin.on("data", onData);
   });
-}
-
-export function microsoftClientSetupGuidance(reason: string): string {
-  return [
-    reason,
-    "",
-    "Switchroom ships no shared Microsoft OAuth app — register your own.",
-    "One-time per install:",
-    "",
-    "  1. Go to https://entra.microsoft.com → App registrations → New",
-    "     registration",
-    "  2. Supported account types: 'Accounts in any organizational",
-    "     directory AND personal Microsoft accounts' (multi-tenant + MSA)",
-    "  3. Redirect URI: platform 'Mobile and desktop applications',",
-    "     value `http://localhost` (port-agnostic; Microsoft ignores port",
-    "     for loopback URIs)",
-    "  4. Authentication → Advanced settings → 'Allow public client",
-    "     flows': Yes (enables device-code on personal MSA)",
-    "  5. Copy the Application (client) ID from the Overview page",
-    "  6. Optional: create a client secret in 'Certificates & secrets'",
-    "     (skip if using public-client flow only)",
-    "  7. Vault the credentials:",
-    "",
-    "    switchroom vault set microsoft-oauth-client-id",
-    "    switchroom vault set microsoft-oauth-client-secret  # optional",
-    "",
-    "  8. If your work tenant requires admin consent, your IT admin must",
-    "     grant the requested Graph scopes (Files.ReadWrite.All etc.) at",
-    "     first sign-in. Personal MSA accounts (outlook.com / hotmail.com)",
-    "     don't need this step.",
-    "  9. Add to ~/.switchroom/switchroom.yaml (top level):",
-    "",
-    "    microsoft_workspace:",
-    '      microsoft_client_id: "vault:microsoft-oauth-client-id"',
-    '      microsoft_client_secret: "vault:microsoft-oauth-client-secret"  # omit if public-client',
-    "      authority: https://login.microsoftonline.com/common",
-    "      org_mode: false",
-    "",
-    "Env vars SWITCHROOM_MICROSOFT_CLIENT_ID / _SECRET override the block",
-    "for one-off debugging.",
-    "",
-    "Full walkthrough: docs/microsoft-workspace.md (PR 5 will land this).",
-    "Don't reuse an existing Entra app — see RFC §4.1 (signInAudience",
-    "mismatch + token-version drift make app sharing brittle).",
-  ].join("\n");
 }
