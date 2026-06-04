@@ -2354,6 +2354,21 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
   if (currentTurn !== turn) return
   currentTurn = null
+  // PR2 obligation-ledger CLOSE-at-turn-end. Close the ended turn's obligation
+  // when it delivered a final answer. finalAnswerDelivered is the right signal
+  // HERE (not isSubstantiveFinalReply at reply-time): a SHORT genuine answer
+  // ("4") is final-but-not-substantive, so the reply-time substantive-close
+  // missed it → it looked unanswered → the idle sweep double-asked every short
+  // turn (canary, v0.14.59). At turn_end the #2141 logic has already demoted a
+  // bare interim ack to non-final, so finalAnswerDelivered===true means GENUINELY
+  // answered. This runs before the next idle sweep, so a short answer closes
+  // cleanly (no double-ask); an ack-then-ghost / no-reply turn ends with
+  // finalAnswerDelivered===false → stays open → re-presented (the intended
+  // catch). close() is a no-op for synthetic turns (turnId not in the ledger).
+  // No-op when the flag is off.
+  if (OBLIGATION_LEDGER_ENABLED && turn.finalAnswerDelivered) {
+    obligationLedger.close(turn.turnId)
+  }
   // Component 2 — clear any prior no-reply drain timer for this turn; a
   // fresh end re-evaluates below. (Idempotent — null when never armed.)
   if (turn.noReplyDrainTimer != null) {
