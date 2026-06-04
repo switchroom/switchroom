@@ -44,6 +44,17 @@ export interface Obligation {
    *  can't loop forever — and, because it is part of the durable snapshot,
    *  can't become a boot-surviving poison record either. */
   escalateAttempts?: number
+  /** Wall-clock ms the most recent turn handling THIS obligation ended (stamped
+   *  at turn_end via noteTurnEnded). Drives the escalate-grace window: a slow /
+   *  background-worker / multi-segment turn ends (the in-flight gate clears)
+   *  before its trailing answer's reply lands, and the sweep would otherwise
+   *  re-present/escalate in that gap — a false "I may have missed this" on a
+   *  message that's actively being answered (fuzz-confirmed on v0.14.62). The
+   *  decision waits `graceMs` after this stamp before acting, so the trailing
+   *  answer's close has a beat to fire. Bounded: each re-present is itself a turn
+   *  that re-stamps this once, and representCount is capped, so the ladder still
+   *  terminates. Durable (part of the snapshot) so the grace survives restart. */
+  lastTurnEndedAt?: number
 }
 
 /** What the gateway should do for the oldest open obligation at an idle boundary. */
@@ -162,17 +173,48 @@ export class ObligationLedger {
    * does not mutate. The caller performs the side effect then calls
    * markRepresented / close accordingly.
    *
-   *  - 'none'      → no open obligation; the agent may idle.
+   *  - 'none'      → no open obligation (or all open ones are within their
+   *                  escalate-grace window); the agent may idle.
    *  - 'represent' → re-present `obligation` as a fresh must-answer turn.
    *  - 'escalate'  → it has already been re-presented maxRepresents times; send
    *                  ONE operator-visible "did I miss this?" and close it
    *                  (caller calls close) rather than loop forever.
+   *
+   * GRACE WINDOW (opts.graceMs > 0): an obligation whose handling turn ended less
+   * than `graceMs` ago is SKIPPED — its trailing answer may still be in flight
+   * (a worker / long-think / multi-segment turn ends the in-flight gate before
+   * the reply lands). We pick the oldest obligation that is OUT of grace, so a
+   * genuinely-stale one is still acted on while a freshly-ended one waits. Pure
+   * (clock injected via opts.now, mirroring the builder convention). With no opts
+   * (or graceMs<=0) this is the pre-grace behaviour exactly.
    */
-  decideAtIdle(): LedgerDecision {
-    const o = this.oldest()
+  decideAtIdle(opts?: { now: number; graceMs: number }): LedgerDecision {
+    const o =
+      opts != null && opts.graceMs > 0 ? this.oldestEligible(opts.now, opts.graceMs) : this.oldest()
     if (o === undefined) return { action: 'none' }
     if (o.representCount >= this.maxRepresents) return { action: 'escalate', obligation: o }
     return { action: 'represent', obligation: o }
+  }
+
+  /** The oldest open obligation whose handling turn ended at least `graceMs` ago
+   *  (or never ended — a still-queued obligation has no lastTurnEndedAt and is
+   *  always eligible; it can't have a trailing answer in flight). */
+  private oldestEligible(now: number, graceMs: number): Obligation | undefined {
+    let best: Obligation | undefined
+    for (const o of this.open.values()) {
+      if (o.lastTurnEndedAt != null && now - o.lastTurnEndedAt < graceMs) continue // within grace
+      if (best === undefined || o.openedAt < best.openedAt) best = o
+    }
+    return best
+  }
+
+  /** Stamp that the most recent turn handling `originTurnId` just ended (drives
+   *  the escalate-grace window). No-op if the obligation isn't open. Persists. */
+  noteTurnEnded(originTurnId: string, ts: number): void {
+    const o = this.open.get(originTurnId)
+    if (o === undefined) return
+    o.lastTurnEndedAt = ts
+    this.persist()
   }
 
   /**

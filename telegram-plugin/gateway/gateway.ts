@@ -1423,6 +1423,22 @@ const OBLIGATION_ESCALATE_MAX = 3
 // bounded escalate ladder to a terminal. 45s comfortably exceeds robustApiCall's
 // 3-attempt network backoff so a legitimate slow send isn't cut short.
 const OBLIGATION_ESCALATE_SEND_DEADLINE_MS = 45_000
+// Escalate-grace window. A slow / background-worker / multi-segment turn ends
+// (the in-flight gate clears) BEFORE its trailing answer's reply lands, and the
+// 5s sweep would re-present/escalate in that gap — a false "⚠️ I may have missed
+// this" on a message that's actively being answered (fuzz-confirmed on v0.14.62:
+// ~14% of marko's no-reply turn-ends had the answer in flight). An obligation
+// whose handling turn ended < this ago is skipped by decideAtIdle, giving the
+// trailing answer's close a beat to fire. Bounded: each re-present is itself a
+// turn that re-stamps once, representCount is capped → the ladder still
+// terminates. 45s > the observed "answer lands within ~60s, usually <40s" gap.
+// Kill switch: SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS=0 → pre-grace behaviour.
+const OBLIGATION_ESCALATE_GRACE_MS = (() => {
+  const raw = process.env.SWITCHROOM_OBLIGATION_ESCALATE_GRACE_MS
+  if (raw == null || raw === '') return 45_000
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 45_000
+})()
 // Durable snapshot of the open obligation set on the persistent per-agent
 // volume (STATE_DIR = /state/agent/telegram in prod). Closes the restart hole:
 // the in-memory ledger alone empties on restart and the spool's boot-replay
@@ -2426,8 +2442,17 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // finalAnswerDelivered===false → stays open → re-presented (the intended
   // catch). close() is a no-op for synthetic turns (turnId not in the ledger).
   // No-op when the flag is off.
-  if (OBLIGATION_LEDGER_ENABLED && turn.finalAnswerDelivered) {
-    obligationLedger.close(turn.turnId)
+  if (OBLIGATION_LEDGER_ENABLED) {
+    if (turn.finalAnswerDelivered) {
+      obligationLedger.close(turn.turnId)
+    } else {
+      // Turn ended WITHOUT a final answer. If this turn was handling an open
+      // obligation, stamp its grace clock so the idle sweep waits before
+      // re-presenting/escalating — a slow/worker answer may still be in flight
+      // (the over-escalation fix). No-op when turn.turnId isn't an open
+      // obligation (synthetic / already-closed turn).
+      obligationLedger.noteTurnEnded(turn.turnId, Date.now())
+    }
   }
   // Component 2 — clear any prior no-reply drain timer for this turn; a
   // fresh end re-evaluates below. (Idempotent — null when never armed.)
@@ -4925,7 +4950,13 @@ function obligationSweep(): void {
   if (!obligationLedger.hasOpen()) return
   if (turnInFlightForGate()) return // a turn is running — let it finish/answer
   const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
-  const decision = obligationLedger.decideAtIdle()
+  // Grace window: skip an obligation whose handling turn ended < grace ago — its
+  // trailing slow/worker answer may still be landing (over-escalation fix).
+  const decision = obligationLedger.decideAtIdle(
+    OBLIGATION_ESCALATE_GRACE_MS > 0
+      ? { now: Date.now(), graceMs: OBLIGATION_ESCALATE_GRACE_MS }
+      : undefined,
+  )
   const o = decision.obligation
   if (decision.action === 'none' || o == null) return
   if (decision.action === 'represent') {
