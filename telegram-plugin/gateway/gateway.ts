@@ -1431,6 +1431,25 @@ const QUEUED_STATUS_UX_ENABLED =
 const FEED_REOPEN_AFTER_ACK_ENABLED =
   process.env.SWITCHROOM_FEED_REOPEN_AFTER_ACK !== '0'
 
+// Activity-feed heartbeat (PR1). The feed is pull-only — it only re-renders on
+// a tool_label event, so a long single step that emits no new label leaves the
+// feed frozen on "→ doing X" for tens of seconds (the marko ~26s freeze). The
+// heartbeat re-renders the live feed every FEED_HEARTBEAT_TICK_MS with a
+// climbing " · Ns" elapsed on the in-progress line, but only once the current
+// step has run >= FEED_HEARTBEAT_MIN_STALE_MS (so a normally-advancing feed is
+// untouched). Kill switch: SWITCHROOM_FEED_HEARTBEAT=0. Default on.
+const FEED_HEARTBEAT_ENABLED = process.env.SWITCHROOM_FEED_HEARTBEAT !== '0'
+const FEED_HEARTBEAT_TICK_MS = 6_000
+const FEED_HEARTBEAT_MIN_STALE_MS = 6_000
+
+/** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
+function formatFeedElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m${(s % 60).toString().padStart(2, '0')}s`
+}
+
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
  * read `claudeBusyKeys.size`. PR 3b cutover (extends PR 3a's bridgeUp
@@ -1653,6 +1672,12 @@ type CurrentTurn = {
   activityInFlight: Promise<void> | null
   activityPendingRender: string | null
   activityLastSentRender: string | null
+  // Wall-clock anchor for the newest in-progress feed step — set each time a
+  // tool_label re-renders the feed. The heartbeat (`feedHeartbeatTick`) reads
+  // it to show a climbing " · Ns" elapsed on the live line so a long single
+  // step that emits no new label doesn't read as frozen (the feed is otherwise
+  // pull-only). undefined until the first label of the turn renders.
+  lastToolLabelAt?: number
   // Accumulating friendly-action feed for this turn. Each non-surface
   // tool_label appends a line via `appendActivityLabel`; the feed renders
   // (via `renderActivityFeed`) as a capped chronological list into the
@@ -8496,6 +8521,35 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
 }
 
 /**
+ * Heartbeat tick (PR1): keep the live activity feed visibly advancing during a
+ * long single step that emits no new tool_label. Re-renders the feed with a
+ * climbing " · Ns" elapsed on the in-progress line through the SAME single-flight
+ * drain path the tool_label handler uses (no separate transport, no race). Pure
+ * no-op unless there is a live in-flight feed whose newest step has gone stale.
+ * Skips once the final answer landed (the feed is handing off) and after the
+ * turn ends (activityMessageId nulled by clearActivitySummary). Deterministic +
+ * framework-owned — never depends on the model.
+ */
+function feedHeartbeatTick(): void {
+  const turn = currentTurn
+  if (turn == null) return
+  if (turn.activityMessageId == null) return // no live feed yet / already cleared
+  if (turn.finalAnswerDelivered) return // feed handed off to the answer
+  if (turn.lastToolLabelAt == null) return // feed not driven by a labelled step
+  const elapsed = Date.now() - turn.lastToolLabelAt
+  if (elapsed < FEED_HEARTBEAT_MIN_STALE_MS) return // step is fresh; feed advancing normally
+  const rendered = composeTurnActivity(turn, false, ` · ${formatFeedElapsed(elapsed)}`)
+  if (rendered == null) return
+  turn.activityPendingRender = rendered
+  if (turn.activityInFlight == null) {
+    turn.activityInFlight = drainActivitySummary(turn)
+  }
+}
+if (!STATIC && FEED_HEARTBEAT_ENABLED) {
+  setInterval(feedHeartbeatTick, FEED_HEARTBEAT_TICK_MS).unref()
+}
+
+/**
  * Reconcile the activity summary when the model's reply tool takes over as the
  * authoritative surface. Awaits any in-flight render so we don't race a stale
  * write, then EITHER:
@@ -8887,6 +8941,10 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
+        // A new tool label = a new live step → re-anchor the heartbeat clock so
+        // the " · Ns" elapsed restarts from this step (and the feed itself just
+        // advanced, so it isn't stale).
+        turn.lastToolLabelAt = Date.now()
         // Recompose so any active foreground sub-agent's nested block (Model A)
         // is preserved when the parent appends its own step. composeTurnActivity
         // == the flat render when no foreground sub-agent is active.
