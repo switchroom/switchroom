@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.62 — Obligation ledger: close the hang-wedge (#2152)
+
+- **Obligation-ledger determinism completion (#2152), still behind the flag.** A
+  total state-machine proof (every reachable state × every input event, not a
+  sampled test) found the one liveness hole a property test structurally can't
+  reach: the escalation send is fire-and-forget and clears its in-flight guard
+  only in a `.finally`, which runs only if the send *settles* — and grammy/fetch
+  impose no request timeout, so a stalled send never settled, leaking the guard
+  forever and wedging the obligation OPEN (never re-presented, escalated, or
+  closed). Fixed by racing the send against a 45s deadline (`withDeadline`) so
+  the chain always settles, the guard always clears, and a hang becomes a bounded
+  reject feeding the bounded escalate ladder to a terminal. Also decoupled
+  escalation from the buffered-represent gate — escalation is a direct Telegram
+  send, so a represent stranded behind a dead bridge no longer blocks the
+  operator nudge. The determinism argument (finite FSM + strictly-decreasing
+  measure) is now recorded with the code; the property test is demoted to a
+  regression guard. Remains behind `SWITCHROOM_OBLIGATION_LEDGER`.
+
 ## v0.14.61 — Obligation ledger: deterministic across restart + escalation (#2149)
 
 - **Obligation-ledger determinism fix (#2149), still shipped OFF.** An
