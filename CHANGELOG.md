@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.59 — Live status never freezes; groundwork so a message can't be silently dropped
+
+- **The "what it's doing" status no longer freezes on a long step (#2143).**
+  The activity feed only redrew when the agent started a *new* tool, so a long
+  single step (a 25-30s data pull, a long think) left it stuck on "→ doing X"
+  for tens of seconds and read as ghosting. It now ticks a live elapsed
+  (`→ Pulling Meta data · 18s`) every few seconds while a step runs, so you can
+  always see it's alive. Kill switch `SWITCHROOM_FEED_HEARTBEAT=0`.
+- **Delivery-obligation ledger — the deterministic fix for silently-dropped
+  messages, shipped OFF (#2145).** When you send several messages close together
+  in different topics, the agent (single-threaded) could finish one and silently
+  lose another it had "set aside." This adds the missing guarantee: every inbound
+  is an obligation that stays open until the framework observes a real answer to
+  *it* — re-presented until answered, never discharged by the agent merely saying
+  it'll get to it. Lands **disabled** (`SWITCHROOM_OBLIGATION_LEDGER`, default
+  off) so it's inert until canary-proven on the multi-topic case, then enabled
+  per-agent.
+
 ## v0.14.58 — Agents keep showing status after an "on it" (#2141)
 
 - **The live activity feed survives an ack-first turn (#2141).** When an agent
