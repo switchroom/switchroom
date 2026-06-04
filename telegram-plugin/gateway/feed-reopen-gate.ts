@@ -22,14 +22,36 @@
  * ## The decision
  *
  * A new tool label after `finalAnswerDelivered` means the earlier "final"
- * reply was actually an interim ACK — the turn has NOT delivered its final
- * answer if it is still doing tool work. So reclassify: re-open the feed.
- * The caller then resets `turn.finalAnswerDelivered = false` and
+ * reply MIGHT have been an interim ACK — the turn has NOT delivered its
+ * final answer if it is still doing tool work. So reclassify: re-open the
+ * feed. The caller then resets `turn.finalAnswerDelivered = false` and
  * `turn.activityMessageId = null` (so a FRESH feed message opens below the
  * ack) and proceeds with the normal append + drain. When the model later
  * sends its REAL final answer, `executeReply` / `stream_reply` re-set
  * `finalAnswerDelivered = true` via `isFinalAnswerReply` and the feed gates
  * off correctly again.
+ *
+ * ## ACK-ONLY refinement
+ *
+ * `finalAnswerDelivered` latches true for BOTH a short pinging ack AND a
+ * substantive final answer — `isFinalAnswerReply` treats any pinging reply
+ * as "final". So reopening unconditionally is HARMFUL after a *genuine*
+ * final answer: routine post-answer housekeeping (a memory write /
+ * TodoWrite / Bash — none of these are surface tools, so they reach the
+ * tool_label handler) fires a tool label → an unconditional reopen would
+ * reset `finalAnswerDelivered=false` → the turn-end silent-end re-prompt
+ * (`if (turn.finalAnswerDelivered === false)`, NOT gated on zero-outbound)
+ * would FIRE → the agent re-delivers a DUPLICATE / garbled answer. Agents
+ * routinely write memory after answering, so this would be frequent.
+ *
+ * The fix: reopen ONLY when the prior reply that set `finalAnswerDelivered`
+ * was a SHORT ACK, not a substantive answer. The caller tracks this on the
+ * turn as `finalAnswerSubstantive` (set via `isSubstantiveFinalReply` at
+ * every site that sets `finalAnswerDelivered = true`). Reopen iff
+ * `finalAnswerDelivered && !finalAnswerSubstantive`. When the prior final
+ * was substantive, drop the label (legacy gate) — no reopen, no reset — so
+ * the silent-end re-prompt and the #2137 drain both see the genuine final
+ * correctly.
  *
  * ## Interactions (the reset is correct for all three consumers)
  *
@@ -58,6 +80,13 @@ export interface FeedReopenInput {
    *  is set true by the ack reply (it pinged or was ≥200 chars), even
    *  though the model is still working. */
   finalAnswerDelivered: boolean
+  /** Whether the reply that set `finalAnswerDelivered` was a *substantive*
+   *  final answer (stream `done`, or ≥200 chars) as opposed to a short
+   *  pinging interim ACK (`turn.finalAnswerSubstantive`, set via
+   *  `isSubstantiveFinalReply`). Only a short ACK should re-open the feed:
+   *  reopening after a genuine final answer + post-answer housekeeping
+   *  would spuriously trip the silent-end re-prompt → duplicate answer. */
+  finalAnswerSubstantive: boolean
   /** Kill-switch state. When false the reopen behaviour is OFF and a tool
    *  label after `finalAnswerDelivered` is dropped (legacy). */
   enabled: boolean
@@ -70,13 +99,18 @@ export interface FeedReopenInput {
  *
  * - !finalAnswerDelivered → false: the feed was never gated off; the normal
  *   append/drain path applies (no reopen needed).
+ * - finalAnswerDelivered && finalAnswerSubstantive → false: the prior final
+ *   was a genuine answer (not an ack). Post-answer housekeeping tool work
+ *   must NOT reopen — keep the legacy gate so the silent-end re-prompt and
+ *   the #2137 drain see the delivered final correctly.
  * - finalAnswerDelivered && !enabled (kill switch off) → false: legacy
  *   behaviour, the label is dropped by the caller.
- * - finalAnswerDelivered && enabled → true: the "final" reply was an
- *   interim ack; re-open the feed.
+ * - finalAnswerDelivered && !finalAnswerSubstantive && enabled → true: the
+ *   "final" reply was a short interim ack; re-open the feed.
  */
 export function shouldReopenFeedAfterAck(input: FeedReopenInput): boolean {
   if (!input.finalAnswerDelivered) return false
+  if (input.finalAnswerSubstantive) return false
   return input.enabled === true
 }
 
@@ -101,7 +135,8 @@ export interface FeedReopenOutcome {
 /**
  * Pure. The complete tool_label decision for a turn already marked
  * finalAnswerDelivered. Mirrors exactly what the gateway handler does:
- *  - reopen disabled / not applicable → drop the label (legacy `return`).
+ *  - reopen disabled / substantive final / not applicable → drop the label
+ *    (legacy `return`); the genuine final answer's gate is preserved.
  *  - reopen → reclassify the interim ack: finalAnswerDelivered back to
  *    false (the turn has NOT delivered its final answer while still doing
  *    tool work), activityMessageId cleared so a FRESH feed message opens

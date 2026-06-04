@@ -16,7 +16,11 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { isFinalAnswerReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
+import {
+  isFinalAnswerReply,
+  isSubstantiveFinalReply,
+  FINAL_ANSWER_MIN_CHARS,
+} from '../final-answer-detect.js'
 
 describe('isFinalAnswerReply — #1664 final-answer classification', () => {
   it('classifies a notification-bearing reply as the final answer', () => {
@@ -85,5 +89,67 @@ describe('isFinalAnswerReply — #1664 final-answer classification', () => {
     // Guards the constant against silent drift — the value is referenced
     // in the CurrentTurn doc-comment and the Stop-hook rationale.
     expect(FINAL_ANSWER_MIN_CHARS).toBe(200)
+  })
+})
+
+describe('isSubstantiveFinalReply — feed-reopen ACK-ONLY distinction', () => {
+  // isSubstantiveFinalReply is isFinalAnswerReply MINUS the ping-only path.
+  // It tells "genuine final answer" (stream-done or ≥200 chars) apart from
+  // "final only because it pinged" (a short interim ack). The feed-reopen
+  // gate reopens only when finalAnswerDelivered && !substantive, so a real
+  // answer + post-answer housekeeping does NOT spuriously reopen / trip the
+  // silent-end re-prompt.
+
+  it('stream_reply done=true → substantive (closes the stream = the answer)', () => {
+    expect(
+      isSubstantiveFinalReply({ text: 'ok', disableNotification: true, done: true }),
+    ).toBe(true)
+  })
+
+  it('a reply at/over the length backstop → substantive', () => {
+    expect(
+      isSubstantiveFinalReply({
+        text: 'x'.repeat(FINAL_ANSWER_MIN_CHARS),
+        disableNotification: true,
+      }),
+    ).toBe(true)
+    // One under the threshold, silent → not substantive.
+    expect(
+      isSubstantiveFinalReply({
+        text: 'x'.repeat(FINAL_ANSWER_MIN_CHARS - 1),
+        disableNotification: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('a short PINGING reply is final but NOT substantive (the ack case)', () => {
+    // The crux: isFinalAnswerReply says true (it pings), but this is the
+    // ack the feed-reopen gate must treat as reopen-eligible — NOT a real
+    // answer. So isSubstantiveFinalReply must say false.
+    expect(
+      isFinalAnswerReply({ text: 'on it, checking Brevo…', disableNotification: false }),
+    ).toBe(true)
+    expect(
+      isSubstantiveFinalReply({ text: 'on it, checking Brevo…', disableNotification: false }),
+    ).toBe(false)
+  })
+
+  it('a short SILENT interim reply is neither final nor substantive', () => {
+    expect(
+      isFinalAnswerReply({ text: 'thinking…', disableNotification: true }),
+    ).toBe(false)
+    expect(
+      isSubstantiveFinalReply({ text: 'thinking…', disableNotification: true }),
+    ).toBe(false)
+  })
+
+  it('a long reply is substantive regardless of the ping flag', () => {
+    const longText = 'x'.repeat(FINAL_ANSWER_MIN_CHARS)
+    expect(
+      isSubstantiveFinalReply({ text: longText, disableNotification: false }),
+    ).toBe(true)
+    expect(
+      isSubstantiveFinalReply({ text: longText, disableNotification: true }),
+    ).toBe(true)
   })
 })
