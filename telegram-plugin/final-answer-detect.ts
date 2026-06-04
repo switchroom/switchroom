@@ -81,3 +81,37 @@ export function isFinalAnswerReply(input: FinalAnswerReplyInput): boolean {
   if (input.text.length >= FINAL_ANSWER_MIN_CHARS) return true
   return false
 }
+
+/**
+ * Pure predicate: was this reply a *substantive* final answer (as opposed
+ * to a reply that is only "final" because it pinged)? `true` if EITHER:
+ *
+ *   - `done === true` — a `stream_reply` terminal call closing the stream.
+ *   - `text.length >= FINAL_ANSWER_MIN_CHARS` — a substantive-length answer.
+ *
+ * This is `isFinalAnswerReply` MINUS the notification-only path. The
+ * distinction matters for the feed-reopen-after-ack gate
+ * (`feed-reopen-gate.ts`): a *short pinging* reply ("on it, checking
+ * Brevo…") is classified final by `isFinalAnswerReply` (because it pings)
+ * yet is NOT substantive — it is an interim ACK. Only such an ack should
+ * cause the live activity feed to re-open when post-ack tool work arrives.
+ *
+ * A genuine final answer (long, or a stream `done: true`) followed by
+ * routine post-answer housekeeping (a memory write / TodoWrite / Bash —
+ * none of which are surface tools, so they reach the tool_label handler)
+ * must NOT re-open the feed and must NOT reset `finalAnswerDelivered`,
+ * otherwise the silent-end re-prompt would spuriously fire and the agent
+ * would re-deliver a duplicate / garbled answer.
+ *
+ * Residual: a reply that is genuinely the final answer yet is BOTH short
+ * (<200 chars) AND pinging (e.g. "Done!") is indistinguishable here from
+ * an ack, so post-answer housekeeping after it still re-opens the feed.
+ * That is much rarer than the housekeeping-after-long-answer case this
+ * predicate protects, and is kill-switchable via
+ * `SWITCHROOM_FEED_REOPEN_AFTER_ACK=0`.
+ */
+export function isSubstantiveFinalReply(input: FinalAnswerReplyInput): boolean {
+  if (input.done === true) return true
+  if (input.text.length >= FINAL_ANSWER_MIN_CHARS) return true
+  return false
+}

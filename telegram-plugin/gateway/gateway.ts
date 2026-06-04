@@ -94,7 +94,7 @@ import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
-import { isFinalAnswerReply } from '../final-answer-detect.js'
+import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { parseVisibleAnswerStreamEnabled } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
@@ -282,6 +282,7 @@ import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
+import { decideFeedReopen } from './feed-reopen-gate.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -1419,6 +1420,16 @@ const TOPIC_FRAMING_ENABLED =
 // → no placeholder (the 👀 ack reaction still fires). Delete-on-answer.
 const QUEUED_STATUS_UX_ENABLED =
   process.env.SWITCHROOM_QUEUED_STATUS_UX !== '0'
+// Feed-reopen-after-ack. When a tool label arrives for a turn already
+// marked finalAnswerDelivered, the model is still WORKING — so the earlier
+// "final" reply was an interim ACK (an ack-first reply pings or runs ≥200
+// chars, both of which isFinalAnswerReply classifies as final). Re-open the
+// live activity feed for the post-ack work instead of dropping the label.
+// Kill switch off (=0) → legacy behaviour: the label is dropped and the
+// post-ack feed stays dark. See `feed-reopen-gate.ts` for the rationale and
+// the finalAnswerDelivered-consumer interactions.
+const FEED_REOPEN_AFTER_ACK_ENABLED =
+  process.env.SWITCHROOM_FEED_REOPEN_AFTER_ACK !== '0'
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -1552,6 +1563,20 @@ type CurrentTurn = {
   // even though `replyCalled` is true — the #1664 case where the real answer
   // ended up as plain transcript text rendered into an ephemeral draft.
   finalAnswerDelivered: boolean
+  // Feed-reopen-after-ack refinement — whether the reply that set
+  // `finalAnswerDelivered` was a *substantive* final answer (stream
+  // `done`, or ≥200 chars) as opposed to a short pinging interim ACK.
+  // Set via `isSubstantiveFinalReply` at every site that sets
+  // `finalAnswerDelivered = true`. The tool_label handler re-opens the
+  // live activity feed ONLY when `finalAnswerDelivered && !finalAnswer-
+  // Substantive` (the prior "final" was an ack). After a genuine final
+  // answer this stays true, so routine post-answer housekeeping (memory
+  // write / TodoWrite / Bash — non-surface tools that reach the handler)
+  // does NOT reopen and does NOT reset `finalAnswerDelivered`, which would
+  // otherwise spuriously trip the silent-end re-prompt → duplicate answer.
+  // Reset to false on every fresh-turn enqueue alongside
+  // `finalAnswerDelivered`.
+  finalAnswerSubstantive: boolean
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -6305,6 +6330,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             })
           ) {
             turn.finalAnswerDelivered = true
+            // Feed-reopen refinement: a substantive merged silent-anchor
+            // answer must NOT re-open the feed on post-answer housekeeping.
+            turn.finalAnswerSubstantive = isSubstantiveFinalReply({
+              text: decision.mergedText,
+              disableNotification,
+            })
           }
           outboundDedup.record(
             chat_id,
@@ -6644,6 +6675,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     // end re-prompt from spuriously firing on a delivered final.
     if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification })) {
       turn.finalAnswerDelivered = true
+      // Feed-reopen refinement: track whether this final was substantive
+      // (≥200 chars or stream-done — not a short pinging ack) so post-answer
+      // housekeeping tool work does NOT re-open the feed / trip silent-end.
+      turn.finalAnswerSubstantive = isSubstantiveFinalReply({ text: rawText, disableNotification })
       // #1728: release the buffer gate + emit terminal 👍. Mid-turn
       // acks bypass this branch and remain non-events for the
       // reaction (preserves #1713). The full turn-state teardown
@@ -6987,6 +7022,14 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     })
   ) {
     turn.finalAnswerDelivered = true
+    // Feed-reopen refinement: a stream_reply done=true (or a ≥200-char
+    // chunk) is substantive; a short pinging non-done chunk is an ack. Only
+    // the latter should re-open the feed on subsequent post-answer work.
+    turn.finalAnswerSubstantive = isSubstantiveFinalReply({
+      text: (args.text as string | undefined) ?? '',
+      disableNotification: args.disable_notification === true,
+      done: args.done === true,
+    })
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
     // If a stream's first emit was ack-shaped (disable_notification:true,
@@ -8577,6 +8620,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           gatewayReceiveAt: startedAt,
           replyCalled: false,
           finalAnswerDelivered: false,
+          finalAnswerSubstantive: false,
           firstPingAt: null,
           silentAnchorMessageId: null,
           silentAnchorText: '',
@@ -8794,7 +8838,53 @@ function handleSessionEvent(ev: SessionEvent): void {
       // the FINAL answer would re-`sendMessage` a fresh feed below it (flicker).
       // Safe ordering: `tool_label` is real-time (PreToolUse, ~250ms) while
       // `finalAnswerDelivered` is set from executeReply on the final answer.
-      if (turn.finalAnswerDelivered) return
+      //
+      // Feed-reopen-after-ack: a tool label here means the model is STILL
+      // working. If the turn was already marked finalAnswerDelivered, the
+      // "final" reply MIGHT have been an interim ACK ("on it, checking
+      // Brevo…" pings, classified final by isFinalAnswerReply), so the
+      // post-ack work had no live feed — the gate above dropped every label.
+      //
+      // ACK-ONLY refinement: finalAnswerDelivered latches true for BOTH a
+      // short pinging ack AND a substantive answer. Reopening unconditionally
+      // is harmful after a GENUINE final answer — routine post-answer
+      // housekeeping (memory write / TodoWrite / Bash; non-surface tools that
+      // reach here) would reset finalAnswerDelivered=false and trip the
+      // silent-end re-prompt (NOT zero-outbound gated) → duplicate answer. So
+      // reopen ONLY when the prior final was a short ack
+      // (finalAnswerSubstantive=false). When it was substantive, drop the
+      // label (legacy gate) so the genuine final stays delivered.
+      //
+      // On reopen: reclassify the interim ack — the turn has NOT delivered its
+      // final answer while still doing tool work. Reset the flag and clear
+      // activityMessageId so a FRESH feed message opens below the ack, then
+      // proceed normally. When the model's REAL final answer lands,
+      // executeReply / stream_reply re-set finalAnswerDelivered=true (and
+      // finalAnswerSubstantive) and the feed gates off again. The reset keeps
+      // the #2137 serialize gate HOLDING the next topic mid-work (next-topic
+      // liveness is the bounded no-reply timer's job) and lets the silent-end
+      // re-prompt fire if the turn ends on only an ack.
+      // Kill switch SWITCHROOM_FEED_REOPEN_AFTER_ACK=0 → legacy `return`.
+      if (turn.finalAnswerDelivered) {
+        // decideFeedReopen returns dropLabel (legacy return) or the reset
+        // deltas: finalAnswerDelivered→false (the turn has NOT delivered its
+        // final answer while still doing tool work), activityMessageId→null
+        // (a FRESH feed message opens below the ack), activityLastSentRender
+        // →null (so the drain loop's `pending !== lastSent` guard never
+        // mistakes the fresh render for the ack's finalized one and skips it).
+        const reopen = decideFeedReopen({
+          finalAnswerDelivered: turn.finalAnswerDelivered,
+          // ACK-ONLY: reopen only when the prior final was a short ack, not a
+          // substantive answer — otherwise post-answer housekeeping would
+          // reset finalAnswerDelivered and trip the silent-end re-prompt.
+          finalAnswerSubstantive: turn.finalAnswerSubstantive,
+          enabled: FEED_REOPEN_AFTER_ACK_ENABLED,
+        })
+        if (reopen.dropLabel) return
+        turn.finalAnswerDelivered = reopen.reset!.finalAnswerDelivered
+        turn.activityMessageId = reopen.reset!.activityMessageId
+        turn.activityLastSentRender = reopen.reset!.activityLastSentRender
+      }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
         // Recompose so any active foreground sub-agent's nested block (Model A)
@@ -9148,6 +9238,11 @@ function handleSessionEvent(ev: SessionEvent): void {
           turn.answerStream = null
           streamFinalizedAsAnswer = true
           turn.finalAnswerDelivered = true
+          // Feed-reopen refinement: the stream is being finalized as the
+          // turn's answer (the model's terminal text), i.e. done=true by
+          // construction → substantive. Post-answer housekeeping must NOT
+          // re-open the feed.
+          turn.finalAnswerSubstantive = true
           // Capture the old streamed message_id BEFORE materialize so
           // we can delete it after the fresh ping send. materialize()
           // overwrites `streamMsgId` internally with the new send's id;
@@ -9424,6 +9519,12 @@ function handleSessionEvent(ev: SessionEvent): void {
         // it keeps the captured `turn` atom internally consistent for any
         // future reader.)
         turn.finalAnswerDelivered = true
+        // Feed-reopen refinement: turn-flush delivers the model's terminal
+        // transcript text as the genuine answer (not an ack). Default to
+        // substantive so a late tool label does NOT re-open the feed / trip
+        // the silent-end re-prompt. (Belt-and-braces, like the set above —
+        // this branch returns before any further tool_label can arrive.)
+        turn.finalAnswerSubstantive = true
 
         // #654 deterministic double-message fix. Hand off the pinned
         // progress card BEFORE state reset so the driver doesn't keep
