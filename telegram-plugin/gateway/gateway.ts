@@ -1400,9 +1400,12 @@ const deliveryQueue = createDeliveryQueue<InboundMessage>()
 // re-presented (bounded) until it closes, so a message the model read but never
 // answered (the marko 715 drop) cannot be silently lost. ADDITIVE + flagged: it
 // runs ALONGSIDE the existing acks/spool/buffer (PR3 retires the redundant
-// pieces). Default OFF — the canary turns it on (713/715 interleave UAT) before
-// any fleet activation. When off, every hook below is a no-op → zero change.
-const OBLIGATION_LEDGER_ENABLED = process.env.SWITCHROOM_OBLIGATION_LEDGER === '1'
+// pieces). DEFAULT ON (graduated from canary 2026-06-04 after the hang-fix
+// (#2152, total-proof), the escalate-grace (#2156, kills the fuzz-found
+// over-escalation), and interrupt-cancel (#2157) — proven on marko (supergroup)
+// + test-harness for days with 0 false cards). Kill switch:
+// SWITCHROOM_OBLIGATION_LEDGER=0 → every hook below is a no-op → zero change.
+const OBLIGATION_LEDGER_ENABLED = process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0'
 const OBLIGATION_REPRESENT_MAX = 2
 const OBLIGATION_SWEEP_MS = 5_000
 // Bound on escalation SEND attempts. The escalation now closes only AFTER a
@@ -1449,8 +1452,10 @@ const OBLIGATION_ESCALATE_GRACE_MS = (() => {
 // ms_since_out) but the behaviour is UNCHANGED (still queue) — to gather the
 // real-world distribution (how often mid-turn messages are same-topic
 // continuations vs cross-topic, and the recency spread) before any action flips
-// on. Default OFF → zero overhead. The action windows below stay 0 in shadow.
-const AUTOCLASSIFY_MIDTURN_SHADOW = process.env.SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW === '1'
+// on. DEFAULT ON fleet-wide (data-gathering: zero behaviour change — only logs +
+// a bounded recency map). This is a TEMPORARY default; when auto-steer ships it
+// supersedes shadow. Kill switch: SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW=0.
+const AUTOCLASSIFY_MIDTURN_SHADOW = process.env.SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW !== '0'
 // Per-(chat,thread) wall-clock ms of the agent's LAST visible output — the
 // recency clock the classifier uses (NOT turn age: a long actively-narrating
 // worker turn must not read "stale"). Stamped beside signalTracker.noteOutbound.
