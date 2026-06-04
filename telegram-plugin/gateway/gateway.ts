@@ -142,6 +142,7 @@ import {
   resolveRetentionDays as resolveRegistryRetentionDays,
 } from '../registry/reaper.js'
 import { parseQueuePrefix, parseSteerPrefix, formatPriorAssistantPreview, formatReplyToText } from '../steering.js'
+import { autoClassifyMidTurnInbound } from './auto-classify-mid-turn.js'
 import {
   renderOperatorEvent,
   shouldEmitOperatorEvent,
@@ -1439,6 +1440,31 @@ const OBLIGATION_ESCALATE_GRACE_MS = (() => {
   const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? n : 45_000
 })()
+
+// ─── Mid-turn auto-classify (steer-vs-queue), SHADOW mode ─────────────────────
+// Today a no-prefix mid-turn message always QUEUES. autoClassifyMidTurnInbound
+// (auto-classify-mid-turn.ts) is the basis for a smarter default using
+// topic-vs-active-turn + reply-recency. Phase 1 ships SHADOW-ONLY: when this
+// flag is on we COMPUTE + LOG what we'd decide (decision/reason/same_topic/
+// ms_since_out) but the behaviour is UNCHANGED (still queue) — to gather the
+// real-world distribution (how often mid-turn messages are same-topic
+// continuations vs cross-topic, and the recency spread) before any action flips
+// on. Default OFF → zero overhead. The action windows below stay 0 in shadow.
+const AUTOCLASSIFY_MIDTURN_SHADOW = process.env.SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW === '1'
+// Per-(chat,thread) wall-clock ms of the agent's LAST visible output — the
+// recency clock the classifier uses (NOT turn age: a long actively-narrating
+// worker turn must not read "stale"). Stamped beside signalTracker.noteOutbound.
+// LRU-bounded so a long-lived gateway with many topics can't grow unboundedly.
+const lastAgentOutputAt = new Map<string, number>()
+const LAST_OUTPUT_MAX_KEYS = 512
+function noteAgentOutputAt(key: string, ts: number): void {
+  lastAgentOutputAt.delete(key) // re-insert → most-recently-used at the tail
+  lastAgentOutputAt.set(key, ts)
+  if (lastAgentOutputAt.size > LAST_OUTPUT_MAX_KEYS) {
+    const oldest = lastAgentOutputAt.keys().next().value
+    if (oldest !== undefined) lastAgentOutputAt.delete(oldest)
+  }
+}
 // Durable snapshot of the open obligation set on the persistent per-agent
 // volume (STATE_DIR = /state/agent/telegram in prod). Closes the restart hole:
 // the in-memory ledger alone empties on restart and the spool's boot-replay
@@ -6537,6 +6563,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // silence-poke clock so the next poke is measured from this send.
   signalTracker.noteOutbound(statusKey(chat_id, threadId), Date.now())
   silencePoke.noteOutbound(statusKey(chat_id, threadId), Date.now())
+  // Mid-turn auto-classify recency clock: the agent just produced visible output
+  // in this chat/thread (cross-turn, unlike silencePoke's per-turn lastOutboundAt).
+  // Only maintained when the shadow flag is on → truly zero overhead by default.
+  if (AUTOCLASSIFY_MIDTURN_SHADOW) noteAgentOutputAt(statusKey(chat_id, threadId), Date.now())
   // PR3b-cutover: feed lastOutboundAt to the delivery machine so its
   // TTL `tick` suppresses the fallback for a long-but-active turn
   // (model streaming past 5 min) — parity with silencePoke's own
@@ -11450,6 +11480,33 @@ async function handleInbound(
     // it's false so the message goes through as queued="true".)
     isSteering = priorTurnInFlight && isSteerPrefix
     if (priorTurnInFlight) priorTurnStartedAt = activeTurnStartedAt.get(key)
+
+    // Mid-turn auto-classify SHADOW: compute what a topic+recency classifier
+    // WOULD decide and log it — behaviour is UNCHANGED (isSteering above is
+    // untouched). Gathers the real-world distribution (same-topic continuation
+    // vs cross-topic, recency spread) to tune auto-steer before it ever acts.
+    // No-op unless the shadow flag is on AND a turn is in flight (the only case
+    // a steer-vs-queue decision is meaningful).
+    if (AUTOCLASSIFY_MIDTURN_SHADOW && priorTurnInFlight) {
+      const lastOut = lastAgentOutputAt.get(key)
+      const msSinceOut = lastOut != null ? Date.now() - lastOut : null
+      const shadow = autoClassifyMidTurnInbound({
+        isSteerPrefix,
+        isQueuePrefix: isQueuedPrefix,
+        priorTurnInFlight,
+        isDm: isDmChatId(chat_id),
+        incomingThreadId: messageThreadId ?? null,
+        activeTurnThreadId: currentTurn?.sessionThreadId ?? null,
+        msSinceLastAgentOutput: msSinceOut,
+        dmSteerWindowMs: 0, // DM auto-steer stays off (the April regime)
+        topicSteerWindowMs: 8_000, // candidate window — what we're tuning
+      })
+      process.stderr.write(
+        `telegram gateway: autoclassify-shadow chat_id=${chat_id} ` +
+        `would=${shadow.decision} reason=${shadow.reason} same_topic=${shadow.sameTopic ?? '-'} ` +
+        `ms_since_out=${msSinceOut ?? '-'} actual=${isSteering ? 'steer' : 'queue'}\n`,
+      )
+    }
 
     if (access.statusReactions !== false) {
       if (isSteering) {
