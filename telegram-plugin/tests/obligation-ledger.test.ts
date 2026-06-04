@@ -225,6 +225,20 @@ describe("ObligationLedger — durability hooks + escalate-attempt counter", () 
     expect(L.decideAtIdle().action).toBe("escalate");
   });
 
+  it("interrupt-cancel semantics: closing the in-flight turn's obligation removes it from the sweep, sibling untouched", () => {
+    // Mirrors cancelInterruptedObligation: an `!` interrupt SIGINT-kills the
+    // in-flight turn and closes its obligation, so the sweep can't later
+    // re-present/escalate the question the user explicitly redirected away from.
+    // A queued SIBLING obligation must survive.
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#700", 1000)); // the in-flight turn's message
+    L.openIfAbsent(input("c:3#701", 1001)); // a queued sibling
+    expect(L.close("c:3#700")).toBe(true); // interrupt cancels the in-flight one
+    expect(L.isOpen("c:3#700")).toBe(false);
+    expect(L.decideAtIdle().obligation?.originTurnId).toBe("c:3#701"); // sibling still actionable
+    expect(L.close("c:3#700")).toBe(false); // re-close / unknown is a safe no-op
+  });
+
   it("hydrate skips malformed rows", () => {
     const L = new ObligationLedger();
     L.hydrate([

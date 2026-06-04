@@ -1999,6 +1999,29 @@ let pendingDeferredInterrupt: PendingDeferredInterrupt | null = null
  * Idempotent: nulls the slot and clears the timer before doing any work so a
  * boundary event and the timeout can't double-fire.
  */
+/**
+ * An `!` interrupt SIGINT-kills the in-flight turn. That turn was handling a
+ * user message with an open obligation, and the killed turn does NOT reliably
+ * emit turn_end (so endCurrentTurnAtomic never closes it) — so without this the
+ * obligation survives and the idle sweep later re-presents/escalates "you have
+ * an earlier message you never answered" for a question the user EXPLICITLY
+ * cancelled. An interrupt is a deliberate redirect, so closing that obligation
+ * is the correct terminal (the user chose to interrupt; they can re-ask). Only
+ * the interrupted turn's OWN obligation is closed — queued siblings (other open
+ * obligations) are untouched. No-op when the flag is off, no turn is in flight,
+ * or the turn isn't a tracked obligation (synthetic / already closed).
+ */
+function cancelInterruptedObligation(): void {
+  if (!OBLIGATION_LEDGER_ENABLED) return
+  const turn = currentTurn
+  if (turn == null) return
+  if (obligationLedger.close(turn.turnId)) {
+    process.stderr.write(
+      `telegram gateway: obligation cancelled by interrupt origin=${turn.turnId}\n`,
+    )
+  }
+}
+
 async function fireDeferredInterrupt(reason: 'boundary' | 'timeout'): Promise<void> {
   const pending = pendingDeferredInterrupt
   if (pending == null) return
@@ -2026,6 +2049,10 @@ async function fireDeferredInterrupt(reason: 'boundary' | 'timeout'): Promise<vo
   } catch (err) {
     process.stderr.write(`telegram gateway: deferred-interrupt SIGINT failed: ${(err as Error).message}\n`)
   }
+
+  // The SIGINT just killed the in-flight turn — cancel its obligation so the
+  // interrupted (user-redirected) question isn't re-presented/escalated later.
+  cancelInterruptedObligation()
 
   // Deliver the replacement body as a fresh turn to the freshly-killed
   // bridge — same sendToAgent + buffer-on-miss primitive the synchronous
@@ -10784,6 +10811,9 @@ async function handleInbound(
       } catch (err) {
         process.stderr.write(`telegram gateway: interrupt-marker SIGINT failed: ${(err as Error).message}\n`)
       }
+      // The SIGINT just killed the in-flight turn — cancel its obligation so the
+      // interrupted (user-redirected) question isn't re-presented/escalated later.
+      cancelInterruptedObligation()
     }
     if (interrupt.emptyBody) {
       // #1075: thread-id-bearing — route through swallowingApiCall so
