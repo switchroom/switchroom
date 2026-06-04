@@ -299,6 +299,37 @@ describe("tool-label-pretool.mjs", () => {
     });
   });
 
+  it("object-valued MCP input fields never render '[object Object]' (Brevo CRM bug)", () => {
+    // An operator-configured MCP server (e.g. Brevo) may pass an OBJECT
+    // in query / description / title — a filter, a payload, etc. The old
+    // `String(i.query ?? '')` coercion turned that into the literal
+    // "[object Object]" on the live activity feed (marko Meta Campaigns
+    // thread, 2026-06-05). Object fields must be ignored so the label
+    // falls through to the humanized tool name.
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      // query is an object → fall through to "Using <tool>"
+      ["mcp__brevo__get_contacts", { query: { listIds: [3], limit: 50 } }, "Using get contacts"],
+      // description is an object → fall through
+      ["mcp__brevo__send_email", { description: { to: "x@y.z" } }, "Using send email"],
+      // title is an object, but a sibling string description wins
+      ["mcp__brevo__get_report", { title: { a: 1 }, description: "Day 0 pricelist report" }, "Day 0 pricelist report"],
+      // array-valued field → also ignored, not "[object Object]" / commas
+      ["mcp__acme__bulk", { query: ["a", "b"] }, "Using bulk"],
+    ];
+    cases.forEach(([tool, input, expected], idx) => {
+      const sess = `sess-objobj-${idx}`;
+      const r = run(
+        { session_id: sess, tool_use_id: `t-${tool}-${idx}`, tool_name: tool, tool_input: input },
+        stateDir,
+        sess,
+      );
+      expect(r.status).toBe(0);
+      expect(r.sidecarLines, `${tool} should emit a sidecar label`).toHaveLength(1);
+      expect(r.sidecarLines[0].label).toBe(expected);
+      expect(r.sidecarLines[0].label).not.toContain("[object Object]");
+    });
+  });
+
   it("missing TELEGRAM_STATE_DIR → silent skip, exit 0", () => {
     const r = run(
       {
