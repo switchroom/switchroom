@@ -7,30 +7,30 @@ import {
 } from "../gateway/obligation-store.js";
 
 /**
- * DETERMINISM PROOF (by exhaustive simulation, not live observation).
+ * REGRESSION GUARD — not the proof.
  *
- * The operator's requirement: be confident — by reasoning — that EVERY real
- * inbound reaches answered-or-escalated for ANY model behaviour and ANY timing,
- * including across a restart, with no silent drop and no double-ask of a message
- * that WAS answered.
+ * The actual determinism argument is closed-form and lives WITH the code: the
+ * ledger is a finite FSM with a total transition function and a strictly-
+ * decreasing measure μ = (REPRESENT_MAX - representCount) + (ESCALATE_MAX -
+ * escalateAttempts) ⇒ every OPEN reaches a terminal (see the proof comment on
+ * obligationSweep in gateway.ts and the ledger methods in obligation-ledger.ts).
+ * A total state-machine proof also found — and a fix closed — the one liveness
+ * hole this kind of SAMPLING test structurally cannot reach: a hung escalation
+ * send leaking the in-flight flag (now bounded by withDeadline; guarded by
+ * with-deadline.test.ts). The lesson stands: a random-schedule test only
+ * exercises the behaviours its model encodes; it is evidence, never the proof.
  *
- * This drives the REAL ObligationLedger + the REAL durable snapshot store
- * (obligation-store, over an in-memory fs whose rename is atomic) through a
- * faithful model of the gateway's obligation lifecycle:
- *
- *   OPEN     — on receipt (handleInbound, idempotent).
- *   close    — at turn_end iff the turn delivered a final answer (finalAnswerDelivered).
- *   represent— idle sweep, bounded by maxRepresents, drives a fresh must-answer turn.
- *   escalate — ladder exhausted: send the operator nudge; close ONLY after it
- *              lands; a transient send failure stays OPEN and retries; a permanent
- *              one is bounded (OBLIGATION_ESCALATE_MAX) → close best-effort.
- *   restart  — fresh ledger hydrated from the durable snapshot (counters intact).
- *
- * Over thousands of random schedules it asserts the invariant holds and the
- * engine always terminates (no infinite loop). The COALESCED PARTIAL-ANSWER
- * residual is deliberately NOT modelled — it is the one honest hard limit (a
- * turn-keyed ledger cannot see "answered half" without parsing model prose) and
- * is mitigated by coalescing policy, not the ledger.
+ * What this file still earns its keep doing: drive the REAL ObligationLedger +
+ * REAL durable snapshot store over many random {model-behaviour × timing ×
+ * restart} schedules to catch a regression that breaks the FSM invariant
+ * (no silent drop, no double-ask of an answered message, bounded termination).
+ * It models the lifecycle SYNCHRONOUSLY (open at receipt; close at turn_end on a
+ * delivered answer; bounded represent→escalate; restart = hydrate from snapshot)
+ * — so it does NOT and cannot cover async/coupling liveness (hung send, gate
+ * never opening, drain wedging); those are proven/bounded in the code, not here.
+ * The coalesced PARTIAL-ANSWER residual is also out of model — the one honest
+ * hard limit (a turn-keyed ledger can't see "answered half" without parsing the
+ * model's prose), mitigated by coalescing policy, not the ledger.
  */
 
 // Mirrors the gateway constants under test.
