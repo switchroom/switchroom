@@ -282,6 +282,7 @@ import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
+import { decideFeedReopen } from './feed-reopen-gate.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -1419,6 +1420,16 @@ const TOPIC_FRAMING_ENABLED =
 // → no placeholder (the 👀 ack reaction still fires). Delete-on-answer.
 const QUEUED_STATUS_UX_ENABLED =
   process.env.SWITCHROOM_QUEUED_STATUS_UX !== '0'
+// Feed-reopen-after-ack. When a tool label arrives for a turn already
+// marked finalAnswerDelivered, the model is still WORKING — so the earlier
+// "final" reply was an interim ACK (an ack-first reply pings or runs ≥200
+// chars, both of which isFinalAnswerReply classifies as final). Re-open the
+// live activity feed for the post-ack work instead of dropping the label.
+// Kill switch off (=0) → legacy behaviour: the label is dropped and the
+// post-ack feed stays dark. See `feed-reopen-gate.ts` for the rationale and
+// the finalAnswerDelivered-consumer interactions.
+const FEED_REOPEN_AFTER_ACK_ENABLED =
+  process.env.SWITCHROOM_FEED_REOPEN_AFTER_ACK !== '0'
 
 /**
  * Authoritative "is a turn in flight?" for every gate that previously
@@ -8794,7 +8805,37 @@ function handleSessionEvent(ev: SessionEvent): void {
       // the FINAL answer would re-`sendMessage` a fresh feed below it (flicker).
       // Safe ordering: `tool_label` is real-time (PreToolUse, ~250ms) while
       // `finalAnswerDelivered` is set from executeReply on the final answer.
-      if (turn.finalAnswerDelivered) return
+      //
+      // Feed-reopen-after-ack: a tool label here means the model is STILL
+      // working. If the turn was already marked finalAnswerDelivered, the
+      // "final" reply was an interim ACK ("on it, checking Brevo…" pings or
+      // runs ≥200 chars, both classified final by isFinalAnswerReply), so the
+      // post-ack work had no live feed — the gate above dropped every label.
+      // Reclassify: the turn has NOT delivered its final answer if it is still
+      // doing tool work. Reset the flag and clear activityMessageId so a FRESH
+      // feed message opens below the ack, then proceed normally. When the
+      // model's REAL final answer lands, executeReply / stream_reply re-set
+      // finalAnswerDelivered=true via isFinalAnswerReply and the feed gates off
+      // again. The reset keeps the #2137 serialize gate HOLDING the next topic
+      // mid-work (next-topic liveness is the bounded no-reply timer's job) and
+      // lets the silent-end re-prompt fire if the turn ends on only an ack.
+      // Kill switch SWITCHROOM_FEED_REOPEN_AFTER_ACK=0 → legacy `return`.
+      if (turn.finalAnswerDelivered) {
+        // decideFeedReopen returns dropLabel (legacy return) or the reset
+        // deltas: finalAnswerDelivered→false (the turn has NOT delivered its
+        // final answer while still doing tool work), activityMessageId→null
+        // (a FRESH feed message opens below the ack), activityLastSentRender
+        // →null (so the drain loop's `pending !== lastSent` guard never
+        // mistakes the fresh render for the ack's finalized one and skips it).
+        const reopen = decideFeedReopen({
+          finalAnswerDelivered: turn.finalAnswerDelivered,
+          enabled: FEED_REOPEN_AFTER_ACK_ENABLED,
+        })
+        if (reopen.dropLabel) return
+        turn.finalAnswerDelivered = reopen.reset!.finalAnswerDelivered
+        turn.activityMessageId = reopen.reset!.activityMessageId
+        turn.activityLastSentRender = reopen.reset!.activityLastSentRender
+      }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
         // Recompose so any active foreground sub-agent's nested block (Model A)
