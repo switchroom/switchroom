@@ -38,6 +38,12 @@ export interface Obligation {
   readonly openedAt: number
   /** How many times it has been re-presented (0 on first open). */
   representCount: number
+  /** How many times the operator-escalation send has been ATTEMPTED (0 until
+   *  the represent ladder is exhausted). Bounds escalation so a permanently-
+   *  undeliverable nudge (dead/renumbered topic → Telegram 400, blocked bot)
+   *  can't loop forever — and, because it is part of the durable snapshot,
+   *  can't become a boot-surviving poison record either. */
+  escalateAttempts?: number
 }
 
 /** What the gateway should do for the oldest open obligation at an idle boundary. */
@@ -57,14 +63,33 @@ export interface ObligationInput {
   openedAt: number
 }
 
+/** Side-effect hooks the gateway injects. Kept out of the pure decision logic
+ *  so the ledger stays unit-testable (a capturing `onChange` in tests). */
+export interface ObligationLedgerHooks {
+  /** Called after EVERY state mutation (open/close/represent/escalate-attempt)
+   *  with the full open snapshot, so the gateway can durably persist it. NOT
+   *  called by hydrate() — that IS the restoration of persisted state. */
+  onChange?: (snapshot: Obligation[]) => void
+}
+
 export class ObligationLedger {
   private readonly open = new Map<string, Obligation>()
 
   /**
    * @param maxRepresents max re-presentations before escalating to an
    *   operator-visible nudge instead of re-asking again. Default 2.
+   * @param hooks optional side-effect hooks (durable persistence). Omitted in
+   *   pure unit tests; the gateway wires `onChange` to the snapshot store.
    */
-  constructor(private readonly maxRepresents = 2) {}
+  constructor(
+    private readonly maxRepresents = 2,
+    private readonly hooks: ObligationLedgerHooks = {},
+  ) {}
+
+  /** Persist the current open set via the injected hook (no-op if unwired). */
+  private persist(): void {
+    this.hooks.onChange?.(this.list())
+  }
 
   /**
    * Open an obligation if not already tracked. Idempotent on originTurnId — a
@@ -75,13 +100,33 @@ export class ObligationLedger {
   openIfAbsent(input: ObligationInput): boolean {
     if (this.open.has(input.originTurnId)) return false
     this.open.set(input.originTurnId, { ...input, representCount: 0 })
+    this.persist()
     return true
   }
 
   /** Close by origin id. Returns true if an obligation was open and is now closed. */
   close(originTurnId: string | null | undefined): boolean {
     if (originTurnId == null) return false
-    return this.open.delete(originTurnId)
+    const closed = this.open.delete(originTurnId)
+    if (closed) this.persist()
+    return closed
+  }
+
+  /**
+   * Re-populate from a persisted snapshot at boot — the restart-durability seam.
+   * Open obligations (with their representCount + escalateAttempts intact)
+   * survive a gateway/container restart, so the next idle sweep re-presents or
+   * re-escalates them rather than silently losing a delivered-but-unanswered
+   * message. Replaces current contents; does NOT fire onChange (this state is
+   * already what's on disk). Tolerates a malformed snapshot (skips bad rows).
+   */
+  hydrate(snapshot: readonly Obligation[]): void {
+    this.open.clear()
+    for (const o of snapshot) {
+      if (o != null && typeof o.originTurnId === 'string' && o.originTurnId.length > 0) {
+        this.open.set(o.originTurnId, { ...o })
+      }
+    }
   }
 
   isOpen(originTurnId: string): boolean {
@@ -156,7 +201,25 @@ export class ObligationLedger {
     const o = this.open.get(originTurnId)
     if (o === undefined) return 0
     o.representCount += 1
+    this.persist()
     return o.representCount
+  }
+
+  /**
+   * Record an operator-escalation SEND attempt (bumps escalateAttempts).
+   * Returns the new count. The gateway calls this immediately before each
+   * escalation send and uses the count to bound retries: a transient send
+   * failure leaves the obligation OPEN and is retried next sweep, but after
+   * the bound the gateway closes best-effort so a permanently-undeliverable
+   * nudge can neither loop forever nor (now that the count is durable) re-enter
+   * the loop on every boot.
+   */
+  markEscalateAttempt(originTurnId: string): number {
+    const o = this.open.get(originTurnId)
+    if (o === undefined) return 0
+    o.escalateAttempts = (o.escalateAttempts ?? 0) + 1
+    this.persist()
+    return o.escalateAttempts
   }
 }
 

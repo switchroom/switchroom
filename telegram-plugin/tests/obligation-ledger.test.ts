@@ -165,3 +165,72 @@ describe("buildObligationRepresentInbound", () => {
     expect(obligationEscalationText(ob)).toMatch(/re-?send/i);
   });
 });
+
+describe("ObligationLedger — durability hooks + escalate-attempt counter", () => {
+  function input(id: string, openedAt: number, text = "do the thing") {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text, openedAt };
+  }
+
+  it("fires onChange after every mutation with the full open snapshot", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000)); // open
+    L.openIfAbsent(input("c:3#2", 1001)); // open
+    L.markRepresented("c:3#1"); // represent
+    L.markEscalateAttempt("c:3#1"); // escalate-attempt
+    L.close("c:3#1"); // close
+    // open, open, represent, escalate-attempt, close = 5 mutations.
+    expect(snapshots.length).toBe(5);
+    expect(snapshots[1].map((o) => o.originTurnId).sort()).toEqual(["c:3#1", "c:3#2"]);
+    // last snapshot reflects the close.
+    expect(snapshots[4].map((o) => o.originTurnId)).toEqual(["c:3#2"]);
+  });
+
+  it("does NOT fire onChange for an idempotent (already-open) openIfAbsent", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    expect(L.openIfAbsent(input("c:3#1", 1000))).toBe(true);
+    expect(L.openIfAbsent(input("c:3#1", 9999))).toBe(false); // dup
+    expect(snapshots.length).toBe(1);
+  });
+
+  it("does NOT fire onChange for a close of an unknown id", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    expect(L.close("nope")).toBe(false);
+    expect(snapshots.length).toBe(0);
+  });
+
+  it("markEscalateAttempt increments per call and persists", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000));
+    expect(L.markEscalateAttempt("c:3#1")).toBe(1);
+    expect(L.markEscalateAttempt("c:3#1")).toBe(2);
+    expect(L.list()[0].escalateAttempts).toBe(2);
+    expect(L.markEscalateAttempt("missing")).toBe(0);
+  });
+
+  it("hydrate restores the open set WITH counters and does not fire onChange", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.hydrate([
+      { originTurnId: "c:3#715", chatId: "-100123", threadId: 3, messageId: 715, text: "x", openedAt: 1000, representCount: 2, escalateAttempts: 1 },
+    ]);
+    expect(snapshots.length).toBe(0); // hydrate is restoration, not a mutation
+    expect(L.isOpen("c:3#715")).toBe(true);
+    expect(L.list()[0].representCount).toBe(2);
+    expect(L.list()[0].escalateAttempts).toBe(1);
+    // a represented obligation at/over max decides 'escalate', preserving count across restart
+    expect(L.decideAtIdle().action).toBe("escalate");
+  });
+
+  it("hydrate skips malformed rows", () => {
+    const L = new ObligationLedger();
+    L.hydrate([
+      { originTurnId: "c:3#1", chatId: "-100123", messageId: 1, text: "x", openedAt: 1000, representCount: 0 },
+      { originTurnId: "", chatId: "x", messageId: 0, text: "", openedAt: 0, representCount: 0 } as Obligation,
+    ]);
+    expect(L.size()).toBe(1);
+  });
+});

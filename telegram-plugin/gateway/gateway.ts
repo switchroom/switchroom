@@ -283,6 +283,7 @@ import {
   buildObligationRepresentInbound,
   obligationEscalationText,
 } from './obligation-ledger.js'
+import { loadObligations, persistObligations } from './obligation-store.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -1397,7 +1398,49 @@ const deliveryQueue = createDeliveryQueue<InboundMessage>()
 const OBLIGATION_LEDGER_ENABLED = process.env.SWITCHROOM_OBLIGATION_LEDGER === '1'
 const OBLIGATION_REPRESENT_MAX = 2
 const OBLIGATION_SWEEP_MS = 5_000
-const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX)
+// Bound on escalation SEND attempts. The escalation now closes only AFTER a
+// successful send (a transient failure stays OPEN and retries next sweep), so a
+// PERMANENTLY-undeliverable nudge (dead/renumbered topic → Telegram 400 even
+// after thread-fallback, blocked bot) would loop forever — and, with the
+// durable snapshot, re-enter that loop on every boot. After this many failed
+// attempts the gateway closes best-effort (loud log): the user is genuinely
+// unreachable, so a bounded give-up beats an infinite/poison loop.
+const OBLIGATION_ESCALATE_MAX = 3
+// Durable snapshot of the open obligation set on the persistent per-agent
+// volume (STATE_DIR = /state/agent/telegram in prod). Closes the restart hole:
+// the in-memory ledger alone empties on restart and the spool's boot-replay
+// bypasses handleInbound (where obligations OPEN), so a delivered-but-unanswered
+// message used to lose its obligation across a restart. onChange persists every
+// mutation; boot hydrate (below) restores OPEN/ESCALATING with representCount +
+// escalateAttempts intact. STATIC mode (no runtime) and flag-off both skip disk.
+const OBLIGATION_STORE_PATH = join(STATE_DIR, 'obligations.json')
+const obligationStoreFs = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
+}
+const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX, {
+  onChange:
+    STATIC || !OBLIGATION_LEDGER_ENABLED
+      ? undefined
+      : (snapshot) => persistObligations(OBLIGATION_STORE_PATH, obligationStoreFs, snapshot),
+})
+if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
+  // Restart-durability: re-open obligations that were OPEN/ESCALATING when the
+  // gateway last ran. The very next idle sweep re-presents or re-escalates them.
+  const restored = loadObligations(OBLIGATION_STORE_PATH, obligationStoreFs)
+  if (restored.length > 0) {
+    obligationLedger.hydrate(restored)
+    process.stderr.write(
+      `telegram gateway: obligation-ledger hydrated ${restored.length} open obligation(s) from ${OBLIGATION_STORE_PATH}\n`,
+    )
+  }
+}
+// Origin ids with an escalation send IN FLIGHT — prevents the 5s sweep from
+// firing a second concurrent send for the same obligation while the first is
+// still awaiting (an escalation that takes >5s, or repeated failures).
+const obligationEscalateInFlight = new Set<string>()
 
 // ─── Serialize-until-replied (multitopic reply-routing) ───────────────────
 // Component 1 (deliver-before-drain gate). A buffered cross-topic inbound
@@ -4848,20 +4891,53 @@ function obligationSweep(): void {
     )
     return
   }
-  // escalate — close FIRST so the loop ends even if the send fails.
-  obligationLedger.close(o.originTurnId)
+  // escalate — re-present ladder exhausted. Send ONE operator-visible nudge and
+  // close the obligation ONLY AFTER it actually lands. This inverts the old
+  // close-before-send (which silently dropped the terminal whenever the send
+  // failed): the close is now itself an observable terminal. A transient send
+  // failure leaves the obligation OPEN → retried next sweep; a PERMANENT one
+  // (dead topic even after thread-fallback, blocked bot) is bounded by
+  // OBLIGATION_ESCALATE_MAX → close best-effort (the user is unreachable, so a
+  // bounded give-up beats an infinite loop / a boot-surviving poison record).
+  if (obligationEscalateInFlight.has(o.originTurnId)) return // a send is already awaiting
+  const escId = o.originTurnId
+  const attempt = obligationLedger.markEscalateAttempt(escId)
+  obligationEscalateInFlight.add(escId)
   process.stderr.write(
-    `telegram gateway: obligation escalated (exhausted ${OBLIGATION_REPRESENT_MAX} re-presents) origin=${o.originTurnId}\n`,
+    `telegram gateway: obligation escalating (exhausted ${OBLIGATION_REPRESENT_MAX} re-presents) origin=${escId} attempt=${attempt}/${OBLIGATION_ESCALATE_MAX}\n`,
   )
-  void robustApiCall(
-    () =>
+  // retryWithThreadFallback: a stale/renumbered topic returns THREAD_NOT_FOUND;
+  // retry WITHOUT the thread so the nudge still lands in the chat (the #2096
+  // pattern) instead of being permanently undeliverable to a dead topic.
+  void retryWithThreadFallback(
+    robustApiCall,
+    (tid) =>
       bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
-        ...(o.threadId != null ? { message_thread_id: o.threadId } : {}),
+        ...(tid != null ? { message_thread_id: tid } : {}),
       }),
-    { chat_id: o.chatId, ...(o.threadId != null ? { threadId: o.threadId } : {}), verb: 'obligation.escalate' },
-  ).catch((err) => {
-    process.stderr.write(`telegram gateway: obligation escalation send failed: ${err}\n`)
-  })
+    { threadId: o.threadId, chat_id: o.chatId, verb: 'obligation.escalate' },
+  )
+    .then(() => {
+      obligationLedger.close(escId)
+      process.stderr.write(
+        `telegram gateway: obligation escalation delivered + closed origin=${escId}\n`,
+      )
+    })
+    .catch((err) => {
+      if (attempt >= OBLIGATION_ESCALATE_MAX) {
+        obligationLedger.close(escId)
+        process.stderr.write(
+          `telegram gateway: obligation escalation PERMANENTLY undeliverable after ${attempt} attempts — closing best-effort origin=${escId}: ${err}\n`,
+        )
+      } else {
+        process.stderr.write(
+          `telegram gateway: obligation escalation send failed (attempt ${attempt}/${OBLIGATION_ESCALATE_MAX}), retrying next sweep origin=${escId}: ${err}\n`,
+        )
+      }
+    })
+    .finally(() => {
+      obligationEscalateInFlight.delete(escId)
+    })
 }
 if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
   setInterval(obligationSweep, OBLIGATION_SWEEP_MS).unref()
