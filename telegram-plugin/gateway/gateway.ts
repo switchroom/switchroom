@@ -289,7 +289,7 @@ import {
   obligationEscalationText,
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
-import { withDeadline } from './with-deadline.js'
+import { driveEscalation } from './escalation-drive.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -4950,54 +4950,30 @@ function obligationSweep(): void {
   // (dead topic even after thread-fallback, blocked bot) is bounded by
   // OBLIGATION_ESCALATE_MAX → close best-effort (the user is unreachable, so a
   // bounded give-up beats an infinite loop / a boot-surviving poison record).
-  if (obligationEscalateInFlight.has(o.originTurnId)) return // a send is already awaiting
-  const escId = o.originTurnId
-  const attempt = obligationLedger.markEscalateAttempt(escId)
-  obligationEscalateInFlight.add(escId)
-  process.stderr.write(
-    `telegram gateway: obligation escalating (exhausted ${OBLIGATION_REPRESENT_MAX} re-presents) origin=${escId} attempt=${attempt}/${OBLIGATION_ESCALATE_MAX}\n`,
-  )
-  // retryWithThreadFallback: a stale/renumbered topic returns THREAD_NOT_FOUND;
-  // retry WITHOUT the thread so the nudge still lands in the chat (the #2096
-  // pattern) instead of being permanently undeliverable to a dead topic.
-  // withDeadline: grammy/fetch impose no request timeout and `.finally` (which
-  // clears the in-flight flag) only runs on settle — so a hung send would leak
-  // the flag forever and wedge this obligation OPEN. Racing against a deadline
-  // guarantees the chain settles, the flag always clears, and a hang becomes a
-  // bounded reject handled exactly like any other failed attempt.
-  void withDeadline(
-    retryWithThreadFallback(
-      robustApiCall,
-      (tid) =>
-        bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
-          ...(tid != null ? { message_thread_id: tid } : {}),
-        }),
-      { threadId: o.threadId, chat_id: o.chatId, verb: 'obligation.escalate' },
-    ),
-    OBLIGATION_ESCALATE_SEND_DEADLINE_MS,
-    'obligation escalation send timed out',
-  )
-    .then(() => {
-      obligationLedger.close(escId)
-      process.stderr.write(
-        `telegram gateway: obligation escalation delivered + closed origin=${escId}\n`,
-      )
-    })
-    .catch((err) => {
-      if (attempt >= OBLIGATION_ESCALATE_MAX) {
-        obligationLedger.close(escId)
-        process.stderr.write(
-          `telegram gateway: obligation escalation PERMANENTLY undeliverable after ${attempt} attempts — closing best-effort origin=${escId}: ${err}\n`,
-        )
-      } else {
-        process.stderr.write(
-          `telegram gateway: obligation escalation send failed (attempt ${attempt}/${OBLIGATION_ESCALATE_MAX}), retrying next sweep origin=${escId}: ${err}\n`,
-        )
-      }
-    })
-    .finally(() => {
-      obligationEscalateInFlight.delete(escId)
-    })
+  // Drive one escalation attempt. The send is a direct Telegram nudge
+  // (retryWithThreadFallback: a stale/renumbered topic → THREAD_NOT_FOUND retries
+  // thread-less, the #2096 pattern). driveEscalation guards against concurrent
+  // sends, bounds the send with withDeadline (so a hung send can't leak the
+  // in-flight flag and wedge the obligation OPEN), closes only after a successful
+  // send, and bounds permanent failures to a best-effort close. Extracted so the
+  // hang → bounded → terminal path is executable in escalation-drive.test.ts —
+  // the path neither mtcute (can't hang Telegram) nor a synchronous test reaches.
+  void driveEscalation({
+    escId: o.originTurnId,
+    inFlight: obligationEscalateInFlight,
+    ledger: obligationLedger,
+    send: () =>
+      retryWithThreadFallback(
+        robustApiCall,
+        (tid) =>
+          bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
+            ...(tid != null ? { message_thread_id: tid } : {}),
+          }),
+        { threadId: o.threadId, chat_id: o.chatId, verb: 'obligation.escalate' },
+      ),
+    maxAttempts: OBLIGATION_ESCALATE_MAX,
+    deadlineMs: OBLIGATION_ESCALATE_SEND_DEADLINE_MS,
+  })
 }
 if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
   setInterval(obligationSweep, OBLIGATION_SWEEP_MS).unref()
