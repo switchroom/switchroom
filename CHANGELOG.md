@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.14.61 — Obligation ledger: deterministic across restart + escalation (#2149)
+
+- **Obligation-ledger determinism fix (#2149), still shipped OFF.** An
+  end-to-end determinism audit (by reasoning, not live observation) found the
+  ledger (`SWITCHROOM_OBLIGATION_LEDGER`, default off) held for every model
+  behaviour on a single obligation but leaked in two places — both now closed:
+  - **Escalation no longer silently drops.** The idle sweep closed the
+    obligation *before* sending the operator nudge, so a send failure lost the
+    terminal entirely. It now sends via `retryWithThreadFallback` (a
+    dead/renumbered topic retries thread-less — the #2096 pattern) and closes
+    only *after* the send lands; a transient failure stays OPEN and retries, a
+    permanent one is bounded (then closes best-effort) — never an infinite or
+    boot-surviving loop. A concurrency guard prevents overlapping sends.
+  - **Obligations survive a restart.** The in-memory ledger emptied on every
+    gateway/container restart, and the spool's boot-replay bypasses the open
+    site, so a delivered-but-unanswered message used to lose its obligation
+    across a restart. A durable per-agent snapshot (atomic write-tmp + rename)
+    now restores open obligations — with their re-present and escalation
+    counters intact — on boot.
+  - Proven by a property test over 3000 random `{model-behaviour × timing ×
+    restart}` schedules: every inbound reaches answered-or-escalated, no silent
+    loss, no double-ask, bounded termination. The "coalesce double-ask" the
+    audit first flagged was refuted in code (an obligation opens once per
+    coalesced group). Remains behind the flag (default off; on test-harness).
+
 ## v0.14.60 — Obligation ledger: close on answer at turn-end (#2147)
 
 - **Obligation-ledger correctness fix (#2147), still shipped OFF.** The ledger
