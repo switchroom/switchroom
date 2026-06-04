@@ -36,6 +36,26 @@ function readStdin() {
 }
 
 /**
+ * Coerce a tool-input field to display text WITHOUT the `[object Object]`
+ * trap. Only primitives carry a meaningful label: strings pass through,
+ * numbers/booleans stringify cleanly. Objects and arrays return '' so the
+ * caller falls through to its next fallback (a sibling field, or the
+ * humanized tool name) instead of surfacing literal "[object Object]".
+ *
+ * This guards the MCP-tool path in particular: an operator-configured
+ * server (e.g. Brevo CRM) may pass a filter/query OBJECT in `query` /
+ * `description` / `title`, and the old `String(i.query ?? '')` coercion
+ * rendered that as "[object Object]" on the live activity feed. The
+ * renderer's own `clip()` already rejects non-strings; this mirrors that
+ * contract at the hook so the bad value never reaches the sidecar JSONL.
+ */
+function asText(v) {
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  return ''
+}
+
+/**
  * One-line, length-bounded escape of a value for inclusion in a label.
  * Newlines collapsed, very long strings truncated with an ellipsis.
  */
@@ -82,10 +102,10 @@ export function computeLabel(toolName, input) {
   // for Bash/Task, matching the gateway's describeToolUse rendering.
   switch (toolName) {
     case 'Bash':
-      return clip(String(i.description ?? ''), 70).trim() || 'Running a command'
+      return clip(asText(i.description), 70).trim() || 'Running a command'
     case 'Task':
     case 'Agent': {
-      const d = clip(String(i.description ?? ''), 60).trim()
+      const d = clip(asText(i.description), 60).trim()
       return d ? `Delegating: ${d}` : 'Delegating to a sub-agent'
     }
     case 'TodoWrite':
@@ -103,16 +123,16 @@ export function computeLabel(toolName, input) {
     case 'Write':
       return `Writing ${clip(safeBasename(i.file_path))}`.trim()
     case 'Grep': {
-      const path = i.path ? clip(String(i.path), 40) : '.'
-      const pat = clip(String(i.pattern ?? ''), 40)
+      const path = i.path ? clip(asText(i.path), 40) : '.'
+      const pat = clip(asText(i.pattern), 40)
       return `Searching ${path} for ${pat}`
     }
     case 'Glob':
-      return `Finding files matching ${clip(String(i.pattern ?? ''), 60)}`
+      return `Finding files matching ${clip(asText(i.pattern), 60)}`
     case 'WebFetch':
       return `Fetching ${clip(urlHostPath(i.url), 60)}`
     case 'WebSearch':
-      return `Searching the web for ${clip(String(i.query ?? ''), 60)}`
+      return `Searching the web for ${clip(asText(i.query), 60)}`
     case 'NotebookEdit':
       return `Editing notebook ${clip(safeBasename(i.notebook_path))}`
     case 'BashOutput':
@@ -128,7 +148,7 @@ export function computeLabel(toolName, input) {
       // sidecar JSONL and recover which skill fired per turn —
       // the progress card path that used to surface this was retired
       // when `progressDriver` was nulled out in #1122 PR3.
-      const slug = clip(String(i.skill ?? ''), 64)
+      const slug = clip(asText(i.skill), 64)
       return slug ? `Running skill ${slug}` : null
     }
   }
@@ -141,7 +161,7 @@ export function computeLabel(toolName, input) {
       case 'mcp__switchroom-telegram__stream_reply':
         return 'Replying'
       case 'mcp__switchroom-telegram__react': {
-        const emoji = clip(String(i.emoji ?? ''), 8)
+        const emoji = clip(asText(i.emoji), 8)
         return emoji ? `Reacting ${emoji}` : 'Reacting'
       }
       case 'mcp__switchroom-telegram__get_recent_messages':
@@ -177,7 +197,7 @@ export function computeLabel(toolName, input) {
       return 'Looking through your files'
     if (server === 'notion' || server === 'claude_ai_notion') return 'Checking your notes'
     if (server === 'perplexity') {
-      const q = clip(String(i.query ?? i.description ?? ''), 60).trim()
+      const q = clip(asText(i.query) || asText(i.description), 60).trim()
       return q ? `Searching the web for ${q}` : 'Searching the web'
     }
     if (server === 'webkite') {
@@ -186,9 +206,9 @@ export function computeLabel(toolName, input) {
     }
     // Unknown MCP server: prefer a model-authored field, else humanized tool.
     const desc =
-      clip(String(i.description ?? ''), 60).trim() ||
-      clip(String(i.query ?? ''), 50).trim() ||
-      clip(String(i.title ?? ''), 50).trim()
+      clip(asText(i.description), 60).trim() ||
+      clip(asText(i.query), 50).trim() ||
+      clip(asText(i.title), 50).trim()
     if (desc) return desc
     return `Using ${tool.replace(/[-_]+/g, ' ')}`
   }
