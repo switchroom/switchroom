@@ -200,7 +200,11 @@ function escapeFeedHtml(s: string): string {
  * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
  * Callers send the result verbatim — do NOT re-escape or re-wrap it.
  */
-export function renderActivityFeed(lines: string[], final = false): string | null {
+export function renderActivityFeed(
+  lines: string[],
+  final = false,
+  liveSuffix = "",
+): string | null {
   if (lines.length === 0) return null;
   const shown = lines.slice(-MIRROR_MAX_LINES);
   const hidden = lines.length - shown.length;
@@ -210,10 +214,14 @@ export function renderActivityFeed(lines: string[], final = false): string | nul
   // Newest line = in-progress step (bold, →); earlier = done (italic, ✓).
   // `final` (turn complete, feed left as a record): ALL lines render done (✓)
   // so the persisted message doesn't freeze on a misleading "→ in-progress".
+  // `liveSuffix` (heartbeat): appended INSIDE the newest in-progress line only
+  // (e.g. " · 18s") so the feed visibly advances during a long single step that
+  // emits no new tool label — the feed is otherwise pull-only and freezes.
+  // Caller passes framework-generated, HTML-safe text; never final + suffix.
   // Returns ready Telegram HTML — callers must NOT re-escape or re-wrap it.
   shown.forEach((l, i) => {
     const esc = escapeFeedHtml(l);
-    out.push(i === lastIdx && !final ? `<b>→ ${esc}</b>` : `<i>✓ ${esc}</i>`);
+    out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`);
   });
   return out.join("\n");
 }
@@ -248,9 +256,10 @@ export function renderActivityFeedWithNested(
   lines: string[],
   childLines: string[],
   final = false,
+  liveSuffix = "",
 ): string | null {
   const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
-  if (children.length === 0) return renderActivityFeed(lines, final);
+  if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix);
 
   const out: string[] = [];
   const shownParent = lines.slice(-MIRROR_MAX_LINES);
@@ -264,12 +273,13 @@ export function renderActivityFeedWithNested(
   const lastChildIdx = shownChild.length - 1;
   // `final`: the nested newest step also renders done (✓) so the left-behind
   // feed reads as completed, not stuck on a "→ in-progress" child step.
+  // `liveSuffix` (heartbeat): appended to the nested newest in-progress step.
   shownChild.forEach((l, i) => {
     const t = l.length > NESTED_LINE_MAX ? l.slice(0, NESTED_LINE_MAX - 1) + "…" : l;
     const esc = escapeFeedHtml(t);
     out.push(
       i === lastChildIdx && !final
-        ? `${NESTED_PREFIX}<b>→ ${esc}</b>`
+        ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
         : `${NESTED_PREFIX}<i>${esc}</i>`,
     );
   });

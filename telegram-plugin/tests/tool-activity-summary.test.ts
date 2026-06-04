@@ -146,6 +146,33 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   it("final defaults false (live render keeps the → in-progress newest line)", () => {
     expect(renderActivityFeed(["Reading a.ts"])).toBe("<b>→ Reading a.ts</b>");
   });
+
+  // liveSuffix (PR1 heartbeat): appended INSIDE the newest in-progress line so a
+  // long single step visibly advances ("→ Pulling Meta data · 18s") even though
+  // the feed is pull-only and no new tool label arrived.
+  describe("liveSuffix (heartbeat)", () => {
+    it("appends the suffix to the newest in-progress line only", () => {
+      expect(renderActivityFeed(["Reading a.ts", "Running a command"], false, " · 18s")).toBe(
+        "<i>✓ Reading a.ts</i>\n<b>→ Running a command · 18s</b>",
+      );
+    });
+    it("single live line gets the suffix", () => {
+      expect(renderActivityFeed(["Pulling Meta data"], false, " · 1m05s")).toBe(
+        "<b>→ Pulling Meta data · 1m05s</b>",
+      );
+    });
+    it("final=true ignores the suffix (a finalized record never ticks)", () => {
+      const out = renderActivityFeed(["Reading a.ts", "Running a command"], true, " · 18s")!;
+      expect(out).not.toContain("·");
+      expect(out).not.toContain("→");
+      expect(out).toBe("<i>✓ Reading a.ts</i>\n<i>✓ Running a command</i>");
+    });
+    it("default empty suffix is byte-identical to no suffix", () => {
+      expect(renderActivityFeed(["Reading a.ts"], false, "")).toBe(
+        renderActivityFeed(["Reading a.ts"]),
+      );
+    });
+  });
 });
 
 describe("appendActivityLabel — precomputed label feed (tool_label path)", () => {
@@ -220,6 +247,23 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   it("final=true with no children delegates to the finalized flat render", () => {
     expect(renderActivityFeedWithNested(["Reading a.ts"], [], true)).toBe(
       "<i>✓ Reading a.ts</i>",
+    );
+  });
+
+  it("liveSuffix (heartbeat) lands on the nested newest in-progress step", () => {
+    const out = renderActivityFeedWithNested(
+      ["Delegating: x"],
+      ["Reading schema.ts", "Looking for foreign keys"],
+      false,
+      " · 22s",
+    )!;
+    expect(out).toContain("   ↳ <b>→ Looking for foreign keys · 22s</b>");
+    expect(out).not.toContain("Reading schema.ts · "); // only the newest line ticks
+  });
+
+  it("liveSuffix passes through to the flat render when there are no children", () => {
+    expect(renderActivityFeedWithNested(["Reading a.ts"], [], false, " · 9s")).toBe(
+      "<b>→ Reading a.ts · 9s</b>",
     );
   });
 
