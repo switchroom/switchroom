@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.14.58 — Agents keep showing status after an "on it" (#2141)
+
+- **The live activity feed survives an ack-first turn (#2141).** When an agent
+  replied "on it…" and then did the actual work, the live "what I'm doing" feed
+  went dark for the work — most visible in a supergroup work topic, where you'd
+  see the ack and the final answer but nothing in between. Cause: the interim
+  ack was classified as the turn's final answer (any reply that pings or runs
+  ≥200 chars), which gates the feed off. Now, if the agent keeps doing tool work
+  after such an ack, the feed re-opens and narrates that work — but only for a
+  genuine short ack, never after a real final answer (so post-answer housekeeping
+  like a memory write doesn't re-open a feed or cause a duplicate reply). Behind
+  `SWITCHROOM_FEED_REOPEN_AFTER_ACK` (default on).
+
 ## v0.14.57 — The left-behind status feed reads "done", not stuck mid-step (#2139)
 
 - **The persisted "what it's doing" feed now finalizes cleanly after a
