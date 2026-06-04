@@ -1036,10 +1036,13 @@ export const MicrosoftWorkspaceConfigSchema = z
     microsoft_client_id: z
       .string()
       .min(1)
+      .optional()
       .describe(
         "Microsoft OAuth application (client) ID from Entra portal " +
         "(literal string or vault reference e.g. " +
-        "'vault:microsoft-oauth-client-id')."
+        "'vault:microsoft-oauth-client-id'). OPTIONAL — omit it to use " +
+        "switchroom's shipped default Microsoft app (zero-config). " +
+        "Set it only to bring your own Entra app (BYO)."
       ),
     microsoft_client_secret: z
       .string()

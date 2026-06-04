@@ -52,6 +52,7 @@ import {
 import { AnthropicProvider } from "./anthropic-provider.js";
 import { GoogleProvider } from "./google-provider.js";
 import { MicrosoftProvider } from "./microsoft-provider.js";
+import { resolveMicrosoftClientId } from "../default-oauth-clients.js";
 import {
   googleAccountExists,
   listGoogleAccounts,
@@ -352,20 +353,23 @@ export class AuthBroker {
         }),
       );
     }
-    // RFC #1873 — Microsoft provider registers only when the
-    // microsoft_workspace block exists with a client id. client_secret is
-    // optional (public-client apps don't need one), so only client_id
-    // gates registration.
-    const microsoftClientId = config.microsoft_workspace?.microsoft_client_id;
-    if (microsoftClientId !== undefined) {
-      this.providers.register(
-        new MicrosoftProvider({
-          clientId: microsoftClientId,
-          clientSecret: config.microsoft_workspace?.microsoft_client_secret,
-          fetcher: opts.fetcher as typeof fetch | undefined,
-        }),
-      );
-    }
+    // RFC #1873 / out-of-box — the Microsoft provider always registers.
+    // A shipped default public client_id makes Microsoft available with
+    // zero config; operators override via
+    // microsoft_workspace.microsoft_client_id (resolveMicrosoftClientId
+    // encodes env → config → default). Registering unconditionally is
+    // safe: with no Microsoft accounts on disk the refresh tick is a
+    // no-op and get-credentials returns ACCOUNT_NOT_FOUND. client_secret
+    // stays optional — the default app is a public client (no secret).
+    this.providers.register(
+      new MicrosoftProvider({
+        clientId: resolveMicrosoftClientId(
+          config.microsoft_workspace?.microsoft_client_id,
+        ).clientId,
+        clientSecret: config.microsoft_workspace?.microsoft_client_secret,
+        fetcher: opts.fetcher as typeof fetch | undefined,
+      }),
+    );
 
     this.assertConfigConsistent(config);
   }
