@@ -8442,12 +8442,12 @@ const FOREGROUND_SUBAGENT_ACCUM_MAX = 12
  * order; the single-sub-agent common case nests precisely under its
  * Delegating line.
  */
-function composeTurnActivity(turn: CurrentTurn, final = false): string | null {
+function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''): string | null {
   const childLines: string[] = []
   for (const narrative of turn.foregroundSubAgents.values()) {
     childLines.push(...narrative)
   }
-  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final)
+  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix)
 }
 
 /**
