@@ -11,6 +11,7 @@
  */
 
 import { AuthBrokerClient as BrokerClient, type AddAccountCredentials } from '../../src/auth/broker/client.js'
+import type { ProviderName } from '../../src/auth/broker/protocol.js'
 import type { AuthBrokerClient } from './auth-command.js'
 
 /**
@@ -56,21 +57,30 @@ export async function getAuthBrokerClient(
 }
 
 /**
- * Add an account via the broker. Used exclusively by the `/auth add`
- * chat flow — the narrow {@link AuthBrokerClient} surface in
- * `auth-command.ts` deliberately omits `addAccount` because the verb
- * is gateway-routed (not handler-routed). Constructs and closes a
- * one-shot {@link BrokerClient} so the gateway doesn't need a
- * long-lived handle just for this verb.
+ * Add an account via the broker. Used by the `/auth add` chat flow
+ * (Anthropic) and the `/connect microsoft` device-code flow — the narrow
+ * {@link AuthBrokerClient} surface in `auth-command.ts` deliberately
+ * omits `addAccount` because the verb is gateway-routed (not
+ * handler-routed). Constructs and closes a one-shot {@link BrokerClient}
+ * so the gateway doesn't need a long-lived handle just for this verb.
+ *
+ * `provider` defaults to Anthropic (back-compat with the `/auth add`
+ * caller, which omits it). The device-code flow passes `"microsoft"`
+ * with a `MicrosoftAddAccountCredentials` payload.
  */
 export async function addAccountViaBroker(
   label: string,
   credentials: AddAccountCredentials,
-  opts: { replace?: boolean } = {},
+  opts: { replace?: boolean; provider?: ProviderName } = {},
 ): Promise<{ label: string; expiresAt?: number }> {
   const broker = new BrokerClient()
   try {
-    return await broker.addAccount(label, credentials, opts.replace)
+    return await broker.addAccount(
+      label,
+      credentials,
+      opts.replace,
+      opts.provider,
+    )
   } finally {
     await broker.close()
   }

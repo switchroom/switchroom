@@ -32,6 +32,9 @@ import {
 } from "./microsoft-accounts-yaml.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { resolveMicrosoftClientId } from "../auth/default-oauth-clients.js";
+import { selectMicrosoftScopes } from "../microsoft/scopes.js";
+import { buildMicrosoftCredentials as buildMicrosoftCredentialsCore } from "../microsoft/credentials.js";
+import type { MicrosoftCredentialsShape } from "../auth/broker/protocol.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 export function registerAuthMicrosoftSubcommands(
@@ -229,26 +232,6 @@ function registerList(microsoftParent: Command, program: Command): void {
  * MSA + standard work surfaces. `org_mode: true` opts in to SharePoint
  * (and softeria's --org-mode for Teams tools at PR 3 time).
  */
-const SCOPE_SET_DEFAULT = [
-  "openid",
-  "profile",
-  "email",
-  "offline_access",
-  "User.Read",
-  "Mail.ReadWrite",
-  "Calendars.ReadWrite",
-  "Files.ReadWrite.All",
-];
-
-const SCOPE_SET_ORG_MODE = [
-  ...SCOPE_SET_DEFAULT,
-  "Sites.ReadWrite.All",
-];
-
-function selectMicrosoftScopes(orgMode: boolean): string[] {
-  return orgMode ? SCOPE_SET_ORG_MODE : SCOPE_SET_DEFAULT;
-}
-
 function registerAccountAdd(accountParent: Command): void {
   accountParent
     .command("add <account>")
@@ -691,68 +674,27 @@ function buildMicrosoftCredentials(opts: {
   clientId: string;
   accountEmail: string;
   fallbackScope: string;
-}): import("../auth/broker/protocol.js").MicrosoftCredentialsShape {
-  const { tokens, clientId, accountEmail, fallbackScope } = opts;
+}): MicrosoftCredentialsShape {
+  // Shared, side-effect-free core (also used by the Telegram device-code
+  // connect flow). The CLI keeps its loud requested-vs-authenticated
+  // email mismatch warning here so the operator catches a typo'd arg.
+  const built = buildMicrosoftCredentialsCore(opts);
 
-  // Lazy module-level import to keep CLI startup snappy.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { decodeJwtPayloadUnsafe, classifyAccountType, buildHomeAccountId } =
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    require("../microsoft/oauth.js") as typeof import("../microsoft/oauth.js");
-
-  let tenantId = "";
-  let accountType: "personal" | "work" = "work";
-  let homeAccountId = "";
-  let resolvedEmail = accountEmail;
-
-  if (tokens.id_token) {
-    const claims = decodeJwtPayloadUnsafe(tokens.id_token);
-    if (claims) {
-      if (typeof claims.tid === "string") tenantId = claims.tid;
-      if (tenantId) accountType = classifyAccountType(tenantId);
-      const home = buildHomeAccountId(claims);
-      if (home) homeAccountId = home;
-      if (typeof claims.preferred_username === "string") {
-        resolvedEmail = claims.preferred_username.toLowerCase();
-      } else if (typeof claims.email === "string") {
-        resolvedEmail = claims.email.toLowerCase();
-      }
-    }
-  }
-
-  // Catch typo'd account args: if Microsoft authenticated a different
-  // email than what the operator passed, warn loudly. Easy to miss
-  // otherwise — broker indexes by the passed arg, credentials.json says
-  // the real email, and `enable` on the typo would still "work" but
-  // route to the wrong account. Reviewer ask.
-  if (resolvedEmail.toLowerCase() !== accountEmail.toLowerCase()) {
+  if (built.emailMismatch) {
     console.warn();
     console.warn(
-      `  ⚠ Account argument was '${accountEmail}' but Microsoft authenticated as '${resolvedEmail}'.`,
+      `  ⚠ Account argument was '${opts.accountEmail}' but Microsoft authenticated as '${built.resolvedEmail}'.`,
     );
     console.warn(
-      `    The broker will index by '${accountEmail}' (what you typed). If this isn't what`,
+      `    The broker will index by '${opts.accountEmail}' (what you typed). If this isn't what`,
     );
     console.warn(
-      `    you intended (e.g. a typo), 'switchroom auth microsoft account remove ${accountEmail}' to undo.`,
+      `    you intended (e.g. a typo), 'switchroom auth microsoft account remove ${opts.accountEmail}' to undo.`,
     );
     console.warn();
   }
 
-  return {
-    microsoftOauth: {
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token ?? "",
-      expiresAt: Date.now() + tokens.expires_in * 1000,
-      scope: tokens.scope ?? fallbackScope,
-      clientId,
-      accountEmail: resolvedEmail,
-      tokenType: "Bearer",
-      tenantId,
-      accountType,
-      homeAccountId,
-    },
-  };
+  return built.credentials;
 }
 
 /**
