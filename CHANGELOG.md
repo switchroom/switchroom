@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.14.60 — Obligation ledger: close on answer at turn-end (#2147)
+
+- **Obligation-ledger correctness fix (#2147), still shipped OFF.** The ledger
+  (v0.14.59, default off) closed an obligation only on a *substantive* reply
+  (≥200 chars), so a short genuine answer ("4") read as unanswered and the idle
+  sweep re-asked it — a double-ask on every short turn (caught in canary, never
+  fleet-exposed). It now also closes the obligation at turn-end when the turn
+  delivered a final answer (`finalAnswerDelivered`, which post-v0.14.58 is true
+  only for a genuine answer, not a bare "on it" ack) — so short answers close
+  cleanly while ack-then-ghost / no-reply turns still re-present. Remains behind
+  `SWITCHROOM_OBLIGATION_LEDGER` (default off); enabled per-agent after canary.
+
 ## v0.14.59 — Live status never freezes; groundwork so a message can't be silently dropped
 
 - **The "what it's doing" status no longer freezes on a long step (#2143).**
