@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.64 — Obligation ledger graduates to default-on fleet-wide (#2160)
+
+- **Obligation ledger is now ON by default** for every agent. After days of
+  canary on marko (supergroup — the hardest multi-topic case) and test-harness
+  with the full hardening — the hang-wedge fix (#2152), the escalate-grace
+  window (#2156, which killed the fuzz-found over-escalation), and
+  interrupt-cancel (#2157) — and 0 false cards, the no-drop guarantee graduates
+  from opt-in to the fleet default. A message the agent reads but never answers
+  is re-presented (bounded) then escalated, so it can't be silently lost.
+  **Kill switch: `SWITCHROOM_OBLIGATION_LEDGER=0`** restores the prior behaviour.
+- **Mid-turn auto-classify shadow is now on by default** — fleet-wide
+  data-gathering with zero behaviour change (logs the would-be steer/queue
+  decision + maintains a bounded recency map), to inform the eventual auto-steer
+  default. **Kill switch: `SWITCHROOM_AUTOCLASSIFY_MIDTURN_SHADOW=0`.**
+
 ## v0.14.63 — Obligation: stop false nudges on slow turns + interrupt cleanup; mid-turn auto-classify (shadow)
 
 - **Obligation escalate-grace window (#2156).** Fuzz testing found the ledger
