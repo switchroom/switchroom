@@ -278,6 +278,11 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
+import {
+  ObligationLedger,
+  buildObligationRepresentInbound,
+  obligationEscalationText,
+} from './obligation-ledger.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -1380,6 +1385,20 @@ const DELIVERY_CONFIRM_TIMEOUT_MS =
 const DELIVERY_CONFIRM_SWEEP_MS = 5_000
 const deliveryQueue = createDeliveryQueue<InboundMessage>()
 
+// ─── Deterministic delivery-obligation ledger (systems-analysis PR2) ──────────
+// An inbound is an OBLIGATION (keyed origin_turn_id) that is OPEN at receipt and
+// CLOSED only by an observable substantive reply resolving to that origin —
+// never the model's words. An open obligation that survives a turn boundary is
+// re-presented (bounded) until it closes, so a message the model read but never
+// answered (the marko 715 drop) cannot be silently lost. ADDITIVE + flagged: it
+// runs ALONGSIDE the existing acks/spool/buffer (PR3 retires the redundant
+// pieces). Default OFF — the canary turns it on (713/715 interleave UAT) before
+// any fleet activation. When off, every hook below is a no-op → zero change.
+const OBLIGATION_LEDGER_ENABLED = process.env.SWITCHROOM_OBLIGATION_LEDGER === '1'
+const OBLIGATION_REPRESENT_MAX = 2
+const OBLIGATION_SWEEP_MS = 5_000
+const obligationLedger = new ObligationLedger(OBLIGATION_REPRESENT_MAX)
+
 // ─── Serialize-until-replied (multitopic reply-routing) ───────────────────
 // Component 1 (deliver-before-drain gate). A buffered cross-topic inbound
 // drains ONLY after the just-ended turn delivered its reply to its own
@@ -1750,6 +1769,69 @@ function findTurnByOriginId(originTurnId: string | null | undefined): CurrentTur
   if (originTurnId == null || originTurnId === '') return null
   if (currentTurn != null && currentTurn.turnId === originTurnId) return currentTurn
   return recentTurnsById.get(originTurnId) ?? null
+}
+
+/**
+ * PR2 obligation-ledger CLOSE. Called when a SUBSTANTIVE final answer lands
+ * (not a bare interim ack — using finalAnswerSubstantive, the #2141 signal): the
+ * obligation discharged is the one for the SAME origin the answer routes to
+ * (origin_turn_id the model echoed, else the live turn). So 713's reply closes
+ * 713's obligation even after currentTurn flipped to 715, and 715 stays open
+ * until ITS own substantive answer. An ack does NOT close (so ack-then-ghost is
+ * re-presented, not re-dropped). turn.turnId === the obligation's origin id
+ * (both deriveTurnId(chat,thread,messageId) of the same inbound). No-op unless
+ * the flag is on. NOTE residual: a genuinely SHORT answer (<200 chars, not a
+ * stream-done) reads as non-substantive and won't close → a bounded re-ask
+ * (≤2) then one operator-visible nudge — the accepted double-ask tradeoff,
+ * measured in the canary.
+ */
+function closeObligationOnSubstantiveReply(
+  args: Record<string, unknown>,
+  liveTurn: CurrentTurn | null | undefined,
+): void {
+  if (!OBLIGATION_LEDGER_ENABLED) return
+  const echoed = findTurnByOriginId(args.origin_turn_id as string | undefined)
+  const target = obligationLedger.resolveCloseTarget(echoed?.turnId, liveTurn?.turnId)
+  if (target != null) obligationLedger.close(target)
+}
+
+/**
+ * PR2 obligation-ledger OPEN. Track a fresh user inbound as an unanswered
+ * obligation the moment it is received — called BEFORE the buffer-until-idle /
+ * deliver split so a mid-turn cross-topic inbound (the 715 case: buffered while
+ * another turn runs) is tracked too. Drain paths re-deliver buffered inbounds
+ * via sendToAgent (NOT through handleInbound), so handleInbound is the ONLY
+ * point that sees every fresh inbound — opening here is mandatory for both
+ * branches. Same gate as delivery-tracking (real user turns only; synthetic /
+ * steering / `!` interrupt / empty excluded — they have no origin id / need no
+ * answer; deriveTurnId null-guards them). Idempotent → opening at buffer-time
+ * and any later delivery is safe. No-op unless the flag is on.
+ */
+function openObligationFromInbound(
+  inboundMsg: InboundMessage,
+  gate: { isSteering: boolean; isInterrupt: boolean; effectiveText: string },
+): void {
+  if (!OBLIGATION_LEDGER_ENABLED) return
+  if (
+    !shouldTrackDelivery({
+      isSteering: gate.isSteering,
+      isInterrupt: gate.isInterrupt,
+      hasSource: inboundMsg.meta?.source != null,
+      effectiveText: gate.effectiveText,
+    })
+  ) {
+    return
+  }
+  const oid = deriveTurnId(inboundMsg.chatId, inboundMsg.threadId, inboundMsg.messageId)
+  if (oid == null) return
+  obligationLedger.openIfAbsent({
+    originTurnId: oid,
+    chatId: inboundMsg.chatId,
+    threadId: inboundMsg.threadId,
+    messageId: inboundMsg.messageId,
+    text: inboundMsg.text ?? '',
+    openedAt: Date.now(),
+  })
 }
 
 /**
@@ -4725,6 +4807,51 @@ const inboundSpool = STATIC
       },
     })
 const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
+
+// PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
+// CLEAN idle: no turn in flight AND the inbound buffer is empty — so the
+// existing buffer-drain has already had its turn and anything still OPEN is
+// "delivered but never answered" (the 715 gap). Re-present by pushing a
+// synthetic must-answer inbound through the SAME buffer→drain path (idempotent
+// OPEN via meta.source; reuses tested delivery). Bounded: after maxRepresents,
+// escalate to ONE operator-visible "did I miss this?" and close — no loop.
+// No-op unless the flag is on; gated on the same idle predicate as the drains.
+function obligationSweep(): void {
+  if (!OBLIGATION_LEDGER_ENABLED) return
+  if (!obligationLedger.hasOpen()) return
+  if (turnInFlightForGate()) return // a turn is running — let it finish/answer
+  const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  if (pendingInboundBuffer.depth(agent) > 0) return // existing drain runs first; avoids double-present
+  const decision = obligationLedger.decideAtIdle()
+  const o = decision.obligation
+  if (decision.action === 'none' || o == null) return
+  if (decision.action === 'represent') {
+    pendingInboundBuffer.push(agent, buildObligationRepresentInbound(o, Date.now()))
+    const attempt = obligationLedger.markRepresented(o.originTurnId)
+    process.stderr.write(
+      `telegram gateway: obligation re-presented origin=${o.originTurnId} attempt=${attempt}/${OBLIGATION_REPRESENT_MAX}\n`,
+    )
+    return
+  }
+  // escalate — close FIRST so the loop ends even if the send fails.
+  obligationLedger.close(o.originTurnId)
+  process.stderr.write(
+    `telegram gateway: obligation escalated (exhausted ${OBLIGATION_REPRESENT_MAX} re-presents) origin=${o.originTurnId}\n`,
+  )
+  void robustApiCall(
+    () =>
+      bot.api.sendMessage(o.chatId, obligationEscalationText(o), {
+        ...(o.threadId != null ? { message_thread_id: o.threadId } : {}),
+      }),
+    { chat_id: o.chatId, ...(o.threadId != null ? { threadId: o.threadId } : {}), verb: 'obligation.escalate' },
+  ).catch((err) => {
+    process.stderr.write(`telegram gateway: obligation escalation send failed: ${err}\n`)
+  })
+}
+if (!STATIC && OBLIGATION_LEDGER_ENABLED) {
+  setInterval(obligationSweep, OBLIGATION_SWEEP_MS).unref()
+}
+
 // Honest-restart-resume: inject the boot resume/report inbound built by the
 // registry classifier above. When the spool exists we only PUT it (the
 // boot-replay loop below pulls it into the in-memory buffer exactly once via
@@ -6361,6 +6488,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
               text: decision.mergedText,
               disableNotification,
             })
+            if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
           }
           outboundDedup.record(
             chat_id,
@@ -6711,6 +6839,9 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // the `turn_end` handler when it lands; this only fires the
       // observable side effects that #1718 deferred unconditionally.
       finalizeStatusReaction(chat_id, threadId, 'done')
+      // PR2: close this origin's obligation on a SUBSTANTIVE final answer
+      // (after finalize so the reaction guard test's anchor window is stable).
+      if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
     }
     // v0.13.30 follow-up — release the buffer gate on EVERY reply
     // finalize, not just on `isFinalAnswerReply`. The narrow
@@ -7055,6 +7186,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       disableNotification: args.disable_notification === true,
       done: args.done === true,
     })
+    if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
     // If a stream's first emit was ack-shaped (disable_notification:true,
@@ -11494,6 +11626,15 @@ async function handleInbound(
     }
     return
   }
+
+  // PR2 obligation-ledger OPEN — BEFORE the buffer-until-idle / deliver split so
+  // a mid-turn cross-topic inbound (the 715 case) is tracked whether it is
+  // buffered or delivered now. Idempotent + gated; no-op when the flag is off.
+  openObligationFromInbound(inboundMsg, {
+    isSteering,
+    isInterrupt: interrupt.isInterrupt,
+    effectiveText,
+  })
 
   if (
     decideInboundDelivery({
