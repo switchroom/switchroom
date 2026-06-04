@@ -116,6 +116,11 @@ import {
 import type { AuthBrokerClient } from './auth-command.js'
 import type { ListStateData } from './auth-line.js'
 import { getAuthBrokerClient, addAccountViaBroker } from './auth-broker-client.js'
+import {
+  pendingMicrosoftConnectFlows,
+  startMicrosoftConnect,
+  runMicrosoftConnectPoll,
+} from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
 import {
@@ -3697,6 +3702,15 @@ const pendingStateReaper = setInterval(() => {
     if (now - v.startedAt > REAUTH_INTERCEPT_TTL_MS) {
       cancelAccountAuthSession(v)
       pendingAuthAddFlows.delete(k)
+    }
+  }
+  // Microsoft connect flows self-expire at the device code's own expiry
+  // (~15 min) — sweep past that + grace so an abandoned card doesn't pin
+  // its key. Setting cancelled makes any still-running poll bail.
+  for (const [k, v] of pendingMicrosoftConnectFlows) {
+    if (now - v.startedAt > v.device.expires_in * 1000 + 30_000) {
+      v.cancelled = true
+      pendingMicrosoftConnectFlows.delete(k)
     }
   }
   for (const [k, v] of awaitingAuthCodeAt) {
@@ -14309,6 +14323,200 @@ async function runQuotaWatch(): Promise<void> {
   }
 }
 
+/**
+ * Edit a Microsoft connect card from the BACKGROUND device-code poll
+ * (no `ctx` — we hold the chat+message id). Wrapped in robustApiCall;
+ * swallows failures (a deleted card / closed topic must not crash the
+ * poll). RFC #1873 Phase 2.
+ */
+async function editMicrosoftConnectCard(
+  chatId: number | string,
+  messageId: number,
+  html: string,
+): Promise<void> {
+  await robustApiCall(
+    // allow-raw-bot-api: background connect-card edit by message id (no thread_id; not the reply chunk loop)
+    () => bot.api.editMessageText(chatId, messageId, html, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    }),
+    { chat_id: String(chatId), verb: 'microsoftConnectCard' },
+  ).catch(() => {})
+}
+
+/**
+ * Background half of `/connect microsoft`: poll Microsoft for consent,
+ * register the account with the broker, then edit the card to the
+ * outcome. Fire-and-forget from the command handler.
+ */
+async function finalizeMicrosoftConnect(key: string): Promise<void> {
+  const flow = pendingMicrosoftConnectFlows.get(key)
+  if (!flow) return
+  const agentName = getMyAgentName()
+  const result = await runMicrosoftConnectPoll(flow)
+  // A `/connect cancel` (command or button) between consent and write
+  // already edited the card and dropped the entry — don't clobber it.
+  if (result.kind === 'cancelled' || !pendingMicrosoftConnectFlows.has(key)) {
+    pendingMicrosoftConnectFlows.delete(key)
+    return
+  }
+  pendingMicrosoftConnectFlows.delete(key)
+
+  let html: string
+  if (result.kind === 'connected') {
+    html =
+      `✅ <b>Connected</b> <code>${escapeHtmlForTg(result.account)}</code> ` +
+      `(${result.accountType}).\n\n` +
+      `To let <b>${escapeHtmlForTg(agentName)}</b> use it, run on the host:\n` +
+      `<code>switchroom auth microsoft enable ${escapeHtmlForTg(result.account)} ${escapeHtmlForTg(agentName)}</code>\n` +
+      `then restart ${escapeHtmlForTg(agentName)}.`
+  } else if (result.kind === 'no-refresh-token') {
+    html =
+      `⚠ Microsoft returned no refresh token (the account would expire in ~1h), ` +
+      `so it was not registered. Try <code>/connect microsoft</code> again, or ` +
+      `connect from the host CLI.`
+  } else {
+    html =
+      `❌ <b>Connect failed:</b> ${escapeHtmlForTg(result.message)}\n\n` +
+      `<i>Work/school accounts can't use the phone flow at /common — connect those ` +
+      `from the host: <code>switchroom auth microsoft account add &lt;email&gt;</code>.</i>`
+  }
+  await editMicrosoftConnectCard(flow.cardChatId, flow.cardMessageId, html)
+}
+
+/**
+ * `/connect microsoft` — Telegram-native device-code connect for a
+ * Microsoft account (RFC #1873 Phase 2). The user signs in on their
+ * phone; we register the account with the auth-broker (shipped default
+ * app unless the operator BYO'd one). Admin-gated like `/auth add`.
+ * `/connect cancel` aborts a pending flow. Google stays host-CLI.
+ */
+bot.command('connect', async ctx => {
+  const arg = String(ctx.match ?? '').trim().toLowerCase()
+  const chatId = String(ctx.chat?.id ?? '')
+  const key = chatKey(chatId, ctx.message?.message_thread_id ?? null) as string
+
+  // Admin gate — same source as /auth add and /restart (agent's own
+  // `admin: true`). The broker also enforces server-side on add-account.
+  let isAdmin = false
+  try {
+    const cfg = loadSwitchroomConfig()
+    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean }> })
+      ?.agents?.[getMyAgentName()]
+    isAdmin = me?.admin === true
+  } catch { /* non-admin is the safe default */ }
+  if (!isAuthAdmin({ isAdmin })) {
+    await switchroomReply(
+      ctx,
+      `<b>Not authorized.</b> <code>/connect</code> is admin-only ` +
+        `(set <code>admin: true</code> on this agent in switchroom.yaml).`,
+      { html: true },
+    )
+    return
+  }
+
+  if (arg === 'cancel') {
+    const existing = pendingMicrosoftConnectFlows.get(key)
+    if (!existing) {
+      await switchroomReply(ctx, '<i>No pending connect flow in this chat.</i>', { html: true })
+      return
+    }
+    existing.cancelled = true
+    pendingMicrosoftConnectFlows.delete(key)
+    await switchroomReply(ctx, 'Cancelled.', { html: true })
+    return
+  }
+
+  if (arg !== '' && arg !== 'microsoft' && arg !== 'ms') {
+    await switchroomReply(
+      ctx,
+      `<b>Usage:</b> <code>/connect microsoft</code> to link a Microsoft account ` +
+        `(Outlook / Office 365), or <code>/connect cancel</code>.\n` +
+        `<i>Google accounts are connected from the host CLI.</i>`,
+      { html: true },
+    )
+    return
+  }
+
+  if (pendingMicrosoftConnectFlows.has(key)) {
+    await switchroomReply(
+      ctx,
+      '<i>A Microsoft connect flow is already in progress here. Finish it on your phone, ' +
+        'or send <code>/connect cancel</code>.</i>',
+      { html: true },
+    )
+    return
+  }
+
+  let configClientId: string | undefined
+  let orgMode = false
+  try {
+    const cfg = loadSwitchroomConfig() as unknown as {
+      microsoft_workspace?: { microsoft_client_id?: string; org_mode?: boolean }
+    }
+    configClientId = cfg?.microsoft_workspace?.microsoft_client_id
+    orgMode = cfg?.microsoft_workspace?.org_mode === true
+  } catch { /* fall back to the shipped default */ }
+
+  const started = await startMicrosoftConnect({ configClientId, orgMode })
+  if (started.kind === 'byo-vault') {
+    await switchroomReply(
+      ctx,
+      `<b>Can't connect from chat:</b> this install uses a vaulted custom Microsoft ` +
+        `app (<code>${escapeHtmlForTg(started.ref)}</code>) only the host CLI can read. ` +
+        `Run <code>switchroom auth microsoft account add &lt;email&gt;</code> on the host.`,
+      { html: true },
+    )
+    return
+  }
+  if (started.kind === 'error') {
+    await switchroomReply(
+      ctx,
+      `<b>/connect failed:</b> ${escapeHtmlForTg(started.message)}`,
+      { html: true },
+    )
+    return
+  }
+
+  const appNote =
+    started.source === 'default'
+      ? "<i>Using switchroom's shipped Microsoft app.</i>"
+      : '<i>Using your configured Microsoft app.</i>'
+  const keyboard = new InlineKeyboard()
+    .url('🔐 Sign in to Microsoft', started.device.verification_uri)
+    .row()
+    .text('✖ Cancel', `cn:cancel:${key}`)
+  const sent = await ctx.reply(
+    `🔗 <b>Connect a Microsoft account</b>\n\n` +
+      `1. Tap <b>Sign in to Microsoft</b> below.\n` +
+      `2. Enter this code: <code>${escapeHtmlForTg(started.device.user_code)}</code>\n` +
+      `3. Approve the requested permissions (Mail, Calendar, Files).\n\n` +
+      `I'll confirm here once it's connected (within ~15 min).\n${appNote}`,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard,
+      ...(ctx.message?.message_thread_id != null
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : {}),
+    },
+  )
+
+  pendingMicrosoftConnectFlows.set(key, {
+    initiatedBy: String(ctx.from?.id ?? ''),
+    cardChatId: ctx.chat!.id,
+    cardMessageId: sent.message_id,
+    device: started.device,
+    clientId: started.clientId,
+    scopes: started.scopes,
+    startedAt: Date.now(),
+    cancelled: false,
+  })
+
+  // Background: poll Microsoft, register the account, edit the card.
+  void finalizeMicrosoftConnect(key)
+})
+
 bot.command("auth", async ctx => {
   // sec WS7-F2b (#1394): `/auth` drives the auth-broker credential
   // lifecycle (`/auth add` mints/attaches an Anthropic account token,
@@ -17051,6 +17259,37 @@ bot.on('callback_query:data', async ctx => {
   // existing CLI invocations plus dashboard refresh.
   if (data.startsWith('auth:')) {
     await handleAuthDashboardCallback(ctx)
+    return
+  }
+
+  // `cn:cancel:<key>` — cancel a pending Microsoft connect flow (the
+  // Cancel button on the /connect card). RFC #1873 Phase 2.
+  if (data.startsWith('cn:')) {
+    const access = loadAccess()
+    const senderId = String(ctx.from?.id ?? '')
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' })
+      return
+    }
+    const rest = data.slice('cn:'.length)
+    const sep = rest.indexOf(':')
+    const action = sep >= 0 ? rest.slice(0, sep) : rest
+    const flowKey = sep >= 0 ? rest.slice(sep + 1) : ''
+    if (action === 'cancel') {
+      const pending = pendingMicrosoftConnectFlows.get(flowKey)
+      if (pending) {
+        pending.cancelled = true
+        pendingMicrosoftConnectFlows.delete(flowKey)
+      }
+      await ctx.answerCallbackQuery({ text: 'Connect cancelled.' })
+      await ctx
+        .editMessageText('Microsoft connect cancelled.', {
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    } else {
+      await ctx.answerCallbackQuery()
+    }
     return
   }
 
