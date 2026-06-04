@@ -89,6 +89,38 @@ describe("ObligationLedger", () => {
     const L = new ObligationLedger();
     expect(L.markRepresented("nope")).toBe(0);
   });
+
+  describe("resolveCloseTarget — deterministic, holds for any model behavior", () => {
+    it("an echoed origin is authoritative (closes exactly that)", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:635#713", 1000));
+      L.openIfAbsent(input("c:3#715", 1100));
+      // model echoed 713 while live turn is 715 → close 713, NOT the live turn
+      expect(L.resolveCloseTarget("c:635#713", "c:3#715")).toBe("c:635#713");
+    });
+
+    it("no echo + exactly ONE open → close the live turn (unambiguous)", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:3#715", 1100));
+      expect(L.resolveCloseTarget(undefined, "c:3#715")).toBe("c:3#715");
+    });
+
+    it("no echo + MULTIPLE open → close NOTHING (never wrong-close/drop)", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:635#713", 1000));
+      L.openIfAbsent(input("c:3#715", 1100));
+      // the marko race: 713's un-echoed reply lands while currentTurn=715.
+      // Closing 715 would silently drop it → resolveCloseTarget refuses.
+      expect(L.resolveCloseTarget(undefined, "c:3#715")).toBeNull();
+      expect(L.isOpen("c:3#715")).toBe(true); // 715 stays open → re-presented
+    });
+
+    it("no echo + live turn not an open obligation → null", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:3#715", 1100));
+      expect(L.resolveCloseTarget(undefined, "c:9#999")).toBeNull();
+    });
+  });
 });
 
 describe("buildObligationRepresentInbound", () => {

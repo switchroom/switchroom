@@ -130,6 +130,27 @@ export class ObligationLedger {
     return { action: 'represent', obligation: o }
   }
 
+  /**
+   * Decide which obligation a substantive reply discharges — DETERMINISTICALLY,
+   * holding for any model behavior:
+   *  - `echoedTurnId` (the model echoed origin_turn_id back) → authoritative;
+   *    close exactly that (a no-op via close() if it isn't actually open).
+   *  - else, close the live turn's obligation ONLY when UNAMBIGUOUS — exactly
+   *    one obligation open. With >1 open and no echo we cannot tell which one
+   *    the reply answered; closing the live turn's would silently drop the other
+   *    (713's un-echoed reply landing while currentTurn=715 must NOT close 715).
+   *    So we close nothing → the real target stays open and is re-presented (a
+   *    bounded double-ask), never wrong-closed. Returns the id to close, or null.
+   */
+  resolveCloseTarget(
+    echoedTurnId: string | null | undefined,
+    liveTurnId: string | null | undefined,
+  ): string | null {
+    if (echoedTurnId != null) return echoedTurnId
+    if (liveTurnId != null && this.open.size === 1 && this.open.has(liveTurnId)) return liveTurnId
+    return null
+  }
+
   /** Record that an obligation was just re-presented (bumps representCount). */
   markRepresented(originTurnId: string): number {
     const o = this.open.get(originTurnId)

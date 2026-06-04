@@ -1765,9 +1765,48 @@ function closeObligationOnSubstantiveReply(
   liveTurn: CurrentTurn | null | undefined,
 ): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
-  const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined) ?? liveTurn
-  const oid = originTurn?.turnId
-  if (oid != null) obligationLedger.close(oid)
+  const echoed = findTurnByOriginId(args.origin_turn_id as string | undefined)
+  const target = obligationLedger.resolveCloseTarget(echoed?.turnId, liveTurn?.turnId)
+  if (target != null) obligationLedger.close(target)
+}
+
+/**
+ * PR2 obligation-ledger OPEN. Track a fresh user inbound as an unanswered
+ * obligation the moment it is received — called BEFORE the buffer-until-idle /
+ * deliver split so a mid-turn cross-topic inbound (the 715 case: buffered while
+ * another turn runs) is tracked too. Drain paths re-deliver buffered inbounds
+ * via sendToAgent (NOT through handleInbound), so handleInbound is the ONLY
+ * point that sees every fresh inbound — opening here is mandatory for both
+ * branches. Same gate as delivery-tracking (real user turns only; synthetic /
+ * steering / `!` interrupt / empty excluded — they have no origin id / need no
+ * answer; deriveTurnId null-guards them). Idempotent → opening at buffer-time
+ * and any later delivery is safe. No-op unless the flag is on.
+ */
+function openObligationFromInbound(
+  inboundMsg: InboundMessage,
+  gate: { isSteering: boolean; isInterrupt: boolean; effectiveText: string },
+): void {
+  if (!OBLIGATION_LEDGER_ENABLED) return
+  if (
+    !shouldTrackDelivery({
+      isSteering: gate.isSteering,
+      isInterrupt: gate.isInterrupt,
+      hasSource: inboundMsg.meta?.source != null,
+      effectiveText: gate.effectiveText,
+    })
+  ) {
+    return
+  }
+  const oid = deriveTurnId(inboundMsg.chatId, inboundMsg.threadId, inboundMsg.messageId)
+  if (oid == null) return
+  obligationLedger.openIfAbsent({
+    originTurnId: oid,
+    chatId: inboundMsg.chatId,
+    threadId: inboundMsg.threadId,
+    messageId: inboundMsg.messageId,
+    text: inboundMsg.text ?? '',
+    openedAt: Date.now(),
+  })
 }
 
 /**
@@ -11530,6 +11569,15 @@ async function handleInbound(
     return
   }
 
+  // PR2 obligation-ledger OPEN — BEFORE the buffer-until-idle / deliver split so
+  // a mid-turn cross-topic inbound (the 715 case) is tracked whether it is
+  // buffered or delivered now. Idempotent + gated; no-op when the flag is off.
+  openObligationFromInbound(inboundMsg, {
+    isSteering,
+    isInterrupt: interrupt.isInterrupt,
+    effectiveText,
+  })
+
   if (
     decideInboundDelivery({
       turnInFlight: turnInFlightAtReceipt,
@@ -11596,35 +11644,6 @@ async function handleInbound(
   }
 
   const delivered = ipcServer.sendToAgent(selfAgent, inboundMsg)
-  // PR2 obligation-ledger OPEN. Track this inbound as an unanswered obligation
-  // the moment it is received (delivered-now OR buffered), keyed by its
-  // origin_turn_id. Same gate as delivery-tracking: real user turns only
-  // (steering / `!` interrupt / synthetic-source / empty excluded — they have
-  // no origin id / never need an answer). deriveTurnId returns null for those,
-  // a second guard. Idempotent (buffer-then-redeliver opens once). CLOSED only
-  // by a substantive reply resolving to this origin (executeReply); re-presented
-  // at idle until then (obligationSweep). No-op unless the flag is on.
-  if (
-    OBLIGATION_LEDGER_ENABLED &&
-    shouldTrackDelivery({
-      isSteering,
-      isInterrupt: interrupt.isInterrupt,
-      hasSource: inboundMsg.meta?.source != null,
-      effectiveText,
-    })
-  ) {
-    const oid = deriveTurnId(inboundMsg.chatId, inboundMsg.threadId, inboundMsg.messageId)
-    if (oid != null) {
-      obligationLedger.openIfAbsent({
-        originTurnId: oid,
-        chatId: inboundMsg.chatId,
-        threadId: inboundMsg.threadId,
-        messageId: inboundMsg.messageId,
-        text: inboundMsg.text ?? '',
-        openedAt: Date.now(),
-      })
-    }
-  }
   if (delivered) {
     const busyKey = markClaudeBusyForInbound(inboundMsg)
     // Track until claude acks via `enqueue` (the marko drop-wedge): if no ack
