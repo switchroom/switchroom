@@ -3704,17 +3704,19 @@ const pendingStateReaper = setInterval(() => {
       pendingAuthAddFlows.delete(k)
     }
   }
+  for (const [k, v] of awaitingAuthCodeAt) {
+    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
+  }
   // Microsoft connect flows self-expire at the device code's own expiry
   // (~15 min) — sweep past that + grace so an abandoned card doesn't pin
-  // its key. Setting cancelled makes any still-running poll bail.
+  // its key. Setting cancelled makes any still-running poll bail. Placed
+  // AFTER the OAuth-code cluster above, which secret-detect-oauth-code.
+  // test.ts pins as contiguous within the first 800 chars of the reaper.
   for (const [k, v] of pendingMicrosoftConnectFlows) {
     if (now - v.startedAt > v.device.expires_in * 1000 + 30_000) {
       v.cancelled = true
       pendingMicrosoftConnectFlows.delete(k)
     }
-  }
-  for (const [k, v] of awaitingAuthCodeAt) {
-    if (now - v > AUTH_CODE_CONTEXT_TTL_MS) awaitingAuthCodeAt.delete(k)
   }
   // Auth-refresh throttle entries decay quickly (5s window); sweep
   // anything older than 60s so abandoned snapshot messages don't pin
@@ -14392,12 +14394,38 @@ async function finalizeMicrosoftConnect(key: string): Promise<void> {
  * `/connect cancel` aborts a pending flow. Google stays host-CLI.
  */
 bot.command('connect', async ctx => {
+  // Credential-plane admin is OPERATOR-PRIVATE (WS7-F2 / #1408), exactly
+  // like `/auth`: honor `/connect` ONLY in a private chat from a strict
+  // `access.allowFrom` sender — never the group-permissive
+  // `isAuthorizedSender` (an empty group `allowFrom` = allow-all, so a
+  // forum member could otherwise bind THEIR OWN Microsoft account as the
+  // agent's credential). The agent-`admin:true` flag check below is
+  // orthogonal and the broker enforces it server-side on add-account.
+  const senderId = String(ctx.from?.id ?? '')
+  const operatorPrivate =
+    ctx.chat?.type === 'private' && loadAccess().allowFrom.includes(senderId)
+  if (!operatorPrivate) {
+    if (ctx.chat?.type !== 'private') {
+      process.stderr.write(
+        `telegram gateway: /connect refused (not operator-private) agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} chat=${ctx.chat?.type ?? '?'} sender=${senderId}\n`,
+      )
+      await switchroomReply(
+        ctx,
+        `⚠️ <code>/connect</code> links account credentials — it is <b>operator-private</b>. ` +
+          `Send it as a direct message to me from your operator account (a private chat where ` +
+          `your Telegram ID is on the access allowlist), not in a group or forum.`,
+        { html: true },
+      ).catch(() => {})
+    }
+    return
+  }
+
   const arg = String(ctx.match ?? '').trim().toLowerCase()
   const chatId = String(ctx.chat?.id ?? '')
   const key = chatKey(chatId, ctx.message?.message_thread_id ?? null) as string
 
-  // Admin gate — same source as /auth add and /restart (agent's own
-  // `admin: true`). The broker also enforces server-side on add-account.
+  // Agent-`admin:true` gate (orthogonal to operator-private above; same
+  // source as /auth + the broker's server-side add-account enforcement).
   let isAdmin = false
   try {
     const cfg = loadSwitchroomConfig()
@@ -14408,8 +14436,8 @@ bot.command('connect', async ctx => {
   if (!isAuthAdmin({ isAdmin })) {
     await switchroomReply(
       ctx,
-      `<b>Not authorized.</b> <code>/connect</code> is admin-only ` +
-        `(set <code>admin: true</code> on this agent in switchroom.yaml).`,
+      `<b>Not authorized.</b> <code>/connect</code> requires this agent to have ` +
+        `<code>admin: true</code> in switchroom.yaml.`,
       { html: true },
     )
     return

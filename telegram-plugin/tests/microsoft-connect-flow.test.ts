@@ -166,4 +166,20 @@ describe('runMicrosoftConnectPoll', () => {
     expect(res.kind).toBe('failed')
     if (res.kind === 'failed') expect(res.message).toContain('AADSTS9001023')
   })
+
+  it('failed: refuses to register when Microsoft returns no id_token (no account identity)', async () => {
+    let added = false
+    const res = await runMicrosoftConnectPoll(flow, {
+      // Has a refresh token but no id_token → no resolvable email to key
+      // the broker account by; must NOT register a label-less account.
+      pollDeviceToken: async () => tokens({ id_token: undefined }),
+      addAccount: async () => {
+        added = true
+        return { label: 'x' }
+      },
+    })
+    expect(res.kind).toBe('failed')
+    if (res.kind === 'failed') expect(res.message).toContain('account identity')
+    expect(added).toBe(false)
+  })
 })
