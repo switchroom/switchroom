@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.71 — Fleet-wide fact-grounding + anti-AI-tell voice (#2180)
+
+Two agent behaviors, fleet-wide.
+
+**Fact-grounding.** Agents asserted volatile facts (CRM numbers, status,
+prices) from stale memory/training instead of validating against a live
+source. A `GROUND BEFORE YOU ASSERT` block now rides the per-turn
+directive (so it reaches every agent, including custom-CLAUDE.md ones,
+fresh each turn): any fact that can change must come from a source the
+agent checked *this turn*; memory is a lead to verify, not a citation;
+"let me check" beats a confident wrong number. Ordering-phrased
+("pull it this turn, then state it") rather than a weaker "verify" nudge.
+
+**Anti-AI-tell voice.** Two layers:
+
+- *Prompt* — a `VOICE` line in the same directive: no sycophancy openers,
+  no AI-tell filler, lead with the answer, disagree plainly.
+- *Deterministic* — the gateway `scrubVoice` (which already strips em/en
+  dashes on every outbound reply) now also strips a **leading** sycophancy
+  opener ("You're absolutely right", "Great catch", "Exactly right", ...)
+  and recapitalizes. Conservative by construction: only at message start,
+  only the pure-affirmation set, only when a clause separator and real
+  content follow (a standalone ack survives; "Spot on the map..." is left
+  alone). Mid-sentence hype stays with the prompt layer. Kill switch
+  unchanged: `SWITCHROOM_DISABLE_VOICE_SCRUB`.
+
+A fuzzy MTCute UAT (`fuzz-voice-scrub-dm`) drives real inbounds engineered
+to bait both tells and asserts neither reaches the user.
+
 ## v0.14.70 — Stop the answer-stream flash (#2178)
 
 Fixes the recurring "unformatted message appears, then a formatted one, then the
