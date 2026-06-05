@@ -98,7 +98,7 @@ import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
-import { parseVisibleAnswerStreamEnabled } from '../answer-stream-flag.js'
+import { parseVisibleAnswerStreamEnabled, parseDraftLaneRetiredEnabled } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
   shouldSuppressToolActivity,
@@ -678,6 +678,14 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
 
+// Draft-answer-lane retirement (2026-06-05): default RETIRED so the live answer
+// lane uses a real, mtcute-observable message instead of the invisible
+// compose-box draft. Declared HERE (above the boot-probe block) because
+// `sendMessageDraftFn` below reads it — keep it above its first use to avoid a
+// temporal-dead-zone ReferenceError at boot. Kill switch
+// SWITCHROOM_DRAFT_ANSWER_LANE=0 restores the legacy draft.
+const DRAFT_ANSWER_LANE_RETIRED = parseDraftLaneRetiredEnabled(process.env.SWITCHROOM_DRAFT_ANSWER_LANE)
+
 // ─── sendMessageDraft boot probe ──────────────────────────────────────────
 // grammY 1.x exposes all Telegram Bot API methods through bot.api.raw.
 // bot.api.sendMessageDraft (the typed wrapper) takes chat_id as number, but
@@ -695,7 +703,11 @@ const GRAMMY_VERSION: string = (() => {
 const sendMessageDraftFn: (
   (chatId: string, draftId: number, text: string, params?: { message_thread_id?: number; parse_mode?: 'HTML' }) => Promise<unknown>
 ) | undefined =
-  typeof _rawSendMessageDraft === 'function'
+  // When the draft lane is retired (default), force this undefined so BOTH
+  // consumers (the answer-stream config + the stream_reply handler) drop the
+  // draft transport and fall back to visible message transport — the single
+  // chokepoint for the retirement.
+  !DRAFT_ANSWER_LANE_RETIRED && typeof _rawSendMessageDraft === 'function'
     ? (chatId, draftId, text, params) =>
         (_rawSendMessageDraft as (args: Record<string, unknown>) => Promise<unknown>)({
           chat_id: Number(chatId),
@@ -9545,7 +9557,13 @@ function handleSessionEvent(ev: SessionEvent): void {
             // General). With the gate unreachable the only posted message is
             // the canonical reply. (The gate is bypassed for DM draft
             // transport, so DM draft streaming is unaffected.)
-            ...(ANSWER_STREAM_VISIBLE_ENABLED
+            // Draft retired (default) OR visible explicitly on → a real
+            // edit-in-place message (minInitialChars:1, no draft): observable by
+            // the UAT and the onMetric silence-liveness reset fires on visible
+            // sends in DMs AND supergroups. Legacy draft only when the kill
+            // switch re-enables it (DRAFT_ANSWER_LANE_RETIRED=false), which also
+            // restores sendMessageDraftFn above.
+            ...(ANSWER_STREAM_VISIBLE_ENABLED || DRAFT_ANSWER_LANE_RETIRED
               ? { minInitialChars: 1 }
               : { sendMessageDraft: sendMessageDraftFn, minInitialChars: Number.MAX_SAFE_INTEGER }),
             // #1075: route through robustApiCall so flood-wait,
@@ -9835,7 +9853,13 @@ function handleSessionEvent(ev: SessionEvent): void {
         const streamedMsgId = stream.messageId()
         const streamedFinalText = turn.capturedText.join('').trim()
         if (
-          ANSWER_STREAM_VISIBLE_ENABLED
+          // Broadened for draft retirement: a text-only no-reply turn that
+          // streamed a VISIBLE preview must materialize a pinged final answer +
+          // delete the preview. Without this, the retired-default path would
+          // fall into the else-branch retract() and delete the user's only copy
+          // of the answer (a lost-answer bug). The reply-tool branch still hits
+          // retract() → single canonical formatted reply, no flash.
+          (ANSWER_STREAM_VISIBLE_ENABLED || DRAFT_ANSWER_LANE_RETIRED)
           && !turn.replyCalled
           && streamedMsgId != null
           && streamedFinalText.length > 0
@@ -20565,7 +20589,7 @@ void (async () => {
         }
       }
 
-      process.stderr.write(`telegram gateway: answer-stream draft transport=${sendMessageDraftFn != null ? 'available' : 'unavailable'} grammy=${GRAMMY_VERSION}\n`)
+      process.stderr.write(`telegram gateway: answer-stream lane=${DRAFT_ANSWER_LANE_RETIRED ? 'visible(draft-retired)' : (ANSWER_STREAM_VISIBLE_ENABLED ? 'visible' : 'draft')} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot, {
         runner: {

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { parseVisibleAnswerStreamEnabled } from '../answer-stream-flag.js'
+import { parseVisibleAnswerStreamEnabled, parseDraftLaneRetiredEnabled } from '../answer-stream-flag.js'
 
 describe('parseVisibleAnswerStreamEnabled — default OFF, opt-in', () => {
   it('defaults OFF when unset', () => {
@@ -22,6 +22,24 @@ describe('parseVisibleAnswerStreamEnabled — default OFF, opt-in', () => {
   it('opts IN only on explicit truthy values (case/space-insensitive)', () => {
     for (const v of ['1', 'true', 'on', 'yes', ' TRUE ', 'On', 'YES']) {
       expect(parseVisibleAnswerStreamEnabled(v)).toBe(true)
+    }
+  })
+})
+
+describe('parseDraftLaneRetiredEnabled — default RETIRED (2026-06-05), kill-switch off', () => {
+  it('defaults to RETIRED (true) when unset — the draft lane is gone by default', () => {
+    expect(parseDraftLaneRetiredEnabled(undefined)).toBe(true)
+  })
+
+  it('stays RETIRED for any non-disable value (including unrecognized)', () => {
+    for (const v of ['1', 'true', 'on', 'yes', '', '   ', 'whatever', 'retired']) {
+      expect(parseDraftLaneRetiredEnabled(v)).toBe(true)
+    }
+  })
+
+  it('restores the legacy draft (false) ONLY on an explicit disable (case/space-insensitive)', () => {
+    for (const v of ['0', 'false', 'off', 'no', ' FALSE ', 'Off', 'NO']) {
+      expect(parseDraftLaneRetiredEnabled(v)).toBe(false)
     }
   })
 })
