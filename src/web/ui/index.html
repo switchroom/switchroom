@@ -409,7 +409,7 @@
     <button id="tab-agents" onclick="switchTab('agents')">Agents</button>
     <button id="tab-accounts" onclick="switchTab('accounts')">Accounts</button>
     <button id="tab-system" onclick="switchTab('system')">System</button>
-    <button id="tab-google" onclick="switchTab('google')">Google</button>
+    <button id="tab-connections" onclick="switchTab('connections')">Connections</button>
     <button id="tab-schedule" onclick="switchTab('schedule')">Schedule</button>
     <button id="tab-approvals" onclick="switchTab('approvals')">Approvals</button>
   </nav>
@@ -419,7 +419,7 @@
     <div id="agents" style="display:none" class="loading">Loading agents...</div>
     <div id="accounts" style="display:none"></div>
     <div id="system" style="display:none"></div>
-    <div id="google" style="display:none"></div>
+    <div id="connections" style="display:none"></div>
     <div id="schedule" style="display:none"></div>
     <div id="approvals" style="display:none"></div>
   </main>
@@ -493,14 +493,17 @@
       }
     }
 
-    async function fetchGoogleAccounts() {
+    async function fetchConnections() {
       try {
-        const res = await fetch(`${API}/api/google-accounts`, { headers: authHeaders() });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        renderGoogleAccounts(await res.json());
+        const [google, microsoft, notion] = await Promise.all([
+          fetch(`${API}/api/google-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
+          fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
+          fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }).then(r => r.ok ? r.json() : { configured: false, databases: [] }),
+        ]);
+        renderConnections({ google, microsoft, notion });
         clearError();
       } catch (err) {
-        showError(`Failed to fetch Google accounts: ${err.message}`);
+        showError(`Failed to fetch connections: ${err.message}`);
       }
     }
 
@@ -527,7 +530,7 @@
     }
 
     function switchTab(tab) {
-      const tabs = ['summary', 'agents', 'accounts', 'system', 'google', 'schedule', 'approvals'];
+      const tabs = ['summary', 'agents', 'accounts', 'system', 'connections', 'schedule', 'approvals'];
       for (const t of tabs) {
         document.getElementById(`tab-${t}`).classList.toggle('active', tab === t);
         document.getElementById(t).style.display = tab === t ? '' : 'none';
@@ -535,7 +538,7 @@
       if (tab === 'summary') fetchSummary();
       if (tab === 'accounts') fetchAccounts();
       if (tab === 'system') fetchSystemHealth();
-      if (tab === 'google') fetchGoogleAccounts();
+      if (tab === 'connections') fetchConnections();
       if (tab === 'schedule') fetchSchedule();
       if (tab === 'approvals') fetchApprovals();
     }
@@ -988,37 +991,99 @@
       return String(ts).replace('T', ' ').replace(/\.\d+Z?$/, '').replace(/Z$/, '');
     }
 
-    function renderGoogleAccounts(rows) {
-      const container = document.getElementById('google');
-      if (!rows || rows.length === 0) {
-        container.innerHTML = '<div class="loading">No Google accounts. Add one under <code>google_accounts:</code> in switchroom.yaml and run <code>switchroom auth google account add</code>.</div>';
-        return;
-      }
-      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
-      const cards = rows.map(a => {
-        const expires = a.expiresAt ? formatTimestamp(a.expiresAt) : dim('—');
-        const scope = a.scope ? escapeHtml(a.scope) : dim('broker offline');
-        const known = a.brokerKnown
-          ? '<span class="usage-pill primary">slot present</span>'
-          : '<span style="color:var(--yellow)">config-only (no broker slot)</span>';
-        const acl = (a.enabledFor && a.enabledFor.length)
-          ? a.enabledFor.map(escapeHtml).join(', ')
-          : dim('no agents enabled');
-        return `
-        <div class="account-card">
-          <div class="account-card-header">
-            <div class="account-label">${escapeHtml(a.account)}</div>
-            <span style="margin-left:auto">${known}</span>
-          </div>
-          <div class="account-usage"><label style="color:var(--text-dim);opacity:.7">Enabled for: </label>${acl}</div>
-          <div class="card-meta" style="padding:0">
-            <div class="meta-item"><label>Expires </label><span>${expires}</span></div>
-            <div class="meta-item" title="${a.scope ? escapeHtml(a.scope) : ''}"><label>Scope </label><span>${a.scope ? escapeHtml(a.scope.split(' ').length + ' scope(s)') : dim('—')}</span></div>
-            <div class="meta-item"><label>Client </label><span>${a.clientId ? escapeHtml(a.clientId.slice(0, 16) + '…') : dim('—')}</span></div>
-          </div>
+    const _dimC = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
+
+    // One OAuth-account card (Google or Microsoft — same shape; Microsoft
+    // adds an account-type pill).
+    function renderOAuthAccountCard(a, opts) {
+      const expires = a.expiresAt ? formatTimestamp(a.expiresAt) : _dimC('—');
+      const known = a.brokerKnown
+        ? '<span class="usage-pill primary">slot present</span>'
+        : '<span style="color:var(--yellow)">config-only (no broker slot)</span>';
+      const acl = (a.enabledFor && a.enabledFor.length)
+        ? a.enabledFor.map(escapeHtml).join(', ')
+        : _dimC('no agents enabled');
+      const typePill = (opts && opts.showType && a.accountType)
+        ? `<span class="usage-pill" style="margin-left:.4rem">${escapeHtml(a.accountType)}</span>`
+        : '';
+      return `
+      <div class="account-card">
+        <div class="account-card-header">
+          <div class="account-label">${escapeHtml(a.account)}${typePill}</div>
+          <span style="margin-left:auto">${known}</span>
+        </div>
+        <div class="account-usage"><label style="color:var(--text-dim);opacity:.7">Enabled for: </label>${acl}</div>
+        <div class="card-meta" style="padding:0">
+          <div class="meta-item"><label>Expires </label><span>${expires}</span></div>
+          <div class="meta-item" title="${a.scope ? escapeHtml(a.scope) : ''}"><label>Scope </label><span>${a.scope ? escapeHtml(a.scope.split(' ').length + ' scope(s)') : _dimC('—')}</span></div>
+          <div class="meta-item"><label>Client </label><span>${a.clientId ? escapeHtml(a.clientId.slice(0, 16) + '…') : _dimC('—')}</span></div>
+        </div>
+      </div>`;
+    }
+
+    function _connectionSection(title, emptyHtml, cardsHtml) {
+      return `
+        <div style="margin-bottom:1.5rem">
+          <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">${title}</h3>
+          ${cardsHtml ? `<div class="accounts-grid">${cardsHtml}</div>` : `<div class="loading" style="padding:.8rem">${emptyHtml}</div>`}
         </div>`;
-      }).join('');
-      container.innerHTML = `<div class="accounts-grid">${cards}</div>`;
+    }
+
+    // Unified external-connections view: Google + Microsoft accounts and
+    // the Notion workspace, each showing which agents have access.
+    function renderConnections(data) {
+      const container = document.getElementById('connections');
+      const google = data.google || [];
+      const microsoft = data.microsoft || [];
+      const notion = data.notion || { configured: false, databases: [] };
+
+      const googleSection = _connectionSection(
+        'Google',
+        'No Google accounts. Add one under <code>google_accounts:</code> and run <code>switchroom auth google account add</code>.',
+        google.map(a => renderOAuthAccountCard(a, { showType: false })).join(''),
+      );
+
+      const microsoftSection = _connectionSection(
+        'Microsoft 365',
+        'No Microsoft accounts. Connect one from Telegram with <code>/connect microsoft</code> (admin DM), or <code>switchroom auth microsoft account add</code>.',
+        microsoft.map(a => renderOAuthAccountCard(a, { showType: true })).join(''),
+      );
+
+      let notionCards = '';
+      if (notion.configured) {
+        notionCards = (notion.databases || []).map(db => {
+          const acl = (db.enabledFor && db.enabledFor.length)
+            ? db.enabledFor.map(escapeHtml).join(', ')
+            : _dimC('no agents enabled');
+          return `
+          <div class="account-card">
+            <div class="account-card-header">
+              <div class="account-label">${escapeHtml(db.name)}</div>
+              <span style="margin-left:auto" class="usage-pill">database</span>
+            </div>
+            <div class="account-usage"><label style="color:var(--text-dim);opacity:.7">Enabled for: </label>${acl}</div>
+            <div class="card-meta" style="padding:0">
+              <div class="meta-item"><label>DB id </label><span>${escapeHtml(db.id.slice(0, 12))}…</span></div>
+            </div>
+          </div>`;
+        }).join('');
+      }
+      const notionTitle = 'Notion' + (notion.configured && notion.vaultKey ? ` <span style="text-transform:none;font-weight:400">· token <code>${escapeHtml(notion.vaultKey)}</code></span>` : '');
+      const fullAccessBanner = (notion.fullAccessAgents && notion.fullAccessAgents.length)
+        ? `<div style="margin:0 0 .6rem;font-size:.85rem;color:var(--text-dim)">Full access (all databases): ${notion.fullAccessAgents.map(escapeHtml).join(', ')}</div>`
+        : '';
+      const notionBody = notionCards
+        ? `<div class="accounts-grid">${notionCards}</div>`
+        : `<div class="loading" style="padding:.8rem">${notion.configured
+            ? 'Notion configured but no databases declared. Add them under <code>notion_workspace.databases:</code>.'
+            : 'Notion not configured. See <code>docs/notion-integration.md</code>.'}</div>`;
+      const notionSection = `
+        <div style="margin-bottom:1.5rem">
+          <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">${notionTitle}</h3>
+          ${fullAccessBanner}${notionBody}
+        </div>`;
+
+      container.innerHTML = googleSection + microsoftSection + notionSection;
     }
 
     function renderSchedule(data) {

@@ -34,6 +34,10 @@ import type { ApprovalDecisionMeta } from "../vault/broker/protocol.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import {
+  agentCanAccessNotionDB,
+  shouldEmitNotionMcp,
+} from "../config/notion-workspace-acl.js";
 import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import {
   AuthBrokerError,
@@ -681,6 +685,164 @@ export async function handleGetGoogleAccounts(
     });
   }
   return out;
+}
+
+export interface MicrosoftAccountDashboardInfo {
+  account: string;
+  expiresAt: number | null;
+  scope: string | null;
+  clientId: string | null;
+  /** "personal" (outlook.com/hotmail MSA) or "work" (M365 tenant). */
+  accountType: "personal" | "work" | null;
+  /** Agents allowed to use this account (config ACL). */
+  enabledFor: string[];
+  /** false when the broker couldn't confirm the slot exists. */
+  brokerKnown: boolean;
+}
+
+/**
+ * Microsoft account inventory for the dashboard — mirrors
+ * {@link handleGetGoogleAccounts} (RFC #1873). Unions the config ACL
+ * (`microsoft_accounts.<email>.enabled_for[]`) with the broker's
+ * live credential inventory (`listMicrosoftAccounts`), so an account
+ * present in only one source is still visible. Degrades gracefully when
+ * the broker is unreachable (ACL renders, live fields null).
+ */
+export async function handleGetMicrosoftAccounts(
+  config: SwitchroomConfig,
+): Promise<MicrosoftAccountDashboardInfo[]> {
+  const live = new Map<
+    string,
+    {
+      expiresAt: number;
+      scope: string;
+      clientId: string;
+      accountType: "personal" | "work";
+    }
+  >();
+  try {
+    await withAuthBrokerClient(async (client) => {
+      const data = await client.listMicrosoftAccounts();
+      for (const a of data.accounts) {
+        live.set(a.account.toLowerCase(), {
+          expiresAt: a.expiresAt,
+          scope: a.scope,
+          clientId: a.clientId,
+          accountType: a.accountType,
+        });
+      }
+    });
+  } catch (err) {
+    if (!(err instanceof AuthBrokerUnreachableError)) throw err;
+    // Degraded: ACL still renders from config; live fields stay null.
+  }
+  const cfgAccounts =
+    (config as { microsoft_accounts?: Record<string, { enabled_for?: string[] }> })
+      .microsoft_accounts ?? {};
+  const keys = new Set<string>([
+    ...Object.keys(cfgAccounts).map((k) => k.toLowerCase()),
+    ...live.keys(),
+  ]);
+  const out: MicrosoftAccountDashboardInfo[] = [];
+  for (const key of [...keys].sort()) {
+    const cfg = cfgAccounts[key];
+    const l = live.get(key);
+    out.push({
+      account: key,
+      expiresAt: l?.expiresAt ?? null,
+      scope: l?.scope ?? null,
+      clientId: l?.clientId ?? null,
+      accountType: l?.accountType ?? null,
+      enabledFor: cfg?.enabled_for ? [...cfg.enabled_for].sort() : [],
+      brokerKnown: l != null,
+    });
+  }
+  return out;
+}
+
+export interface NotionDatabaseInfo {
+  /** Friendly name operators/agents reference. */
+  name: string;
+  /** Notion database UUID. */
+  id: string;
+  /** Agents whose notion_workspace.databases grants this DB. */
+  enabledFor: string[];
+}
+
+export interface NotionWorkspaceDashboard {
+  /** True when a top-level notion_workspace block is configured. */
+  configured: boolean;
+  /** Vault key holding the integration token (not the token itself). */
+  vaultKey: string | null;
+  /** Declared friendly-name → id databases with their agent grants. */
+  databases: NotionDatabaseInfo[];
+  /**
+   * Agents with UNRESTRICTED Notion access (a `notion_workspace:` block
+   * with no `databases` filter → every DB the integration can see). They
+   * also appear in each database's `enabledFor`, but are surfaced here
+   * so the UI can render "full access" once instead of in every row.
+   */
+  fullAccessAgents: string[];
+}
+
+/**
+ * Notion workspace view for the dashboard. Unlike Google/Microsoft,
+ * Notion has no per-account concept (one operator-owned internal
+ * integration token); access is per-DATABASE via each agent's
+ * `notion_workspace.databases` friendly-name list — OR unrestricted when
+ * an agent has a `notion_workspace:` block with no `databases` filter.
+ * This surfaces the declared databases and, for each, which agents are
+ * granted it — the "which agents can reach Notion (and which DBs)"
+ * answer. Per-DB grants are computed via the canonical
+ * `agentCanAccessNotionDB` so the dashboard exactly matches runtime
+ * authorization (including the empty-filter = full-access case). The
+ * token itself never leaves the vault and is never returned here.
+ */
+export function handleGetNotionWorkspace(
+  config: SwitchroomConfig,
+): NotionWorkspaceDashboard {
+  const nw = (
+    config as {
+      notion_workspace?: { vault_key?: string; databases?: Record<string, string> };
+    }
+  ).notion_workspace;
+  if (!nw) {
+    return { configured: false, vaultKey: null, databases: [], fullAccessAgents: [] };
+  }
+  const declared = nw.databases ?? {};
+  const agentNames = Object.keys(config.agents ?? {});
+
+  const databases: NotionDatabaseInfo[] = Object.entries(declared)
+    .map(([name, id]) => {
+      // Canonical ACL — credits both explicit-filter and full-access
+      // (no-filter) agents, exactly as runtime authorization does.
+      const enabledFor = agentNames
+        .filter((n) => agentCanAccessNotionDB(config, n, id))
+        .sort();
+      return { name, id, enabledFor };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  // Full-access agents: a notion_workspace block present (gate) with no
+  // databases filter. These reach every DB the integration can see.
+  const agentsRaw = (config.agents ?? {}) as Record<
+    string,
+    { notion_workspace?: { databases?: string[] } }
+  >;
+  const fullAccessAgents = agentNames
+    .filter((n) => {
+      if (!shouldEmitNotionMcp(n, config)) return false;
+      const dbs = agentsRaw[n]?.notion_workspace?.databases;
+      return dbs === undefined || dbs.length === 0;
+    })
+    .sort();
+
+  return {
+    configured: true,
+    vaultKey: nw.vault_key ?? null,
+    databases,
+    fullAccessAgents,
+  };
 }
 
 /**
