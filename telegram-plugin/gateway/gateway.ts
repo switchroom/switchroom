@@ -9673,13 +9673,27 @@ function handleSessionEvent(ev: SessionEvent): void {
             // General). With the gate unreachable the only posted message is
             // the canonical reply. (The gate is bypassed for DM draft
             // transport, so DM draft streaming is unaffected.)
-            // Draft retired (default) OR visible explicitly on → a real
-            // edit-in-place message (minInitialChars:1, no draft): observable by
-            // the UAT and the onMetric silence-liveness reset fires on visible
-            // sends in DMs AND supergroups. Legacy draft only when the kill
-            // switch re-enables it (DRAFT_ANSWER_LANE_RETIRED=false), which also
-            // restores sendMessageDraftFn above.
-            ...(ANSWER_STREAM_VISIBLE_ENABLED || DRAFT_ANSWER_LANE_RETIRED
+            // VISIBLE preview gating decoupled from the draft-transport flag
+            // (2026-06-05 flash regression fix). The visible flag ALONE decides
+            // whether a user-visible preview opens; DRAFT_ANSWER_LANE_RETIRED
+            // controls only the TRANSPORT (whether sendMessageDraftFn exists).
+            // The earlier `|| DRAFT_ANSWER_LANE_RETIRED` here meant retiring the
+            // draft (the default since v0.14.68) silently forced minInitialChars:1
+            // → a visible preliminary opened on every streaming turn and was then
+            // retracted (deleted) when the reply tool fired — the exact "raw bubble
+            // appears, formatted reply lands, raw bubble vanishes" flash that
+            // turning the visible stream OFF (v0.14.52) was meant to remove. So
+            // v0.14.68 silently undid v0.14.52 fleet-wide. Now:
+            //   - VISIBLE on (opt-in) → minInitialChars:1, a real edit-in-place
+            //     preview (observable by UAT, silence-liveness reset on its sends).
+            //   - VISIBLE off (default) → minInitialChars:MAX so NO visible preview
+            //     ever opens; the reply tool is the single canonical formatted
+            //     message (no flash). With the draft retired (default) there is no
+            //     transport either, so the lane stays dormant; with the kill switch
+            //     DRAFT_ANSWER_LANE=0 the legacy compose-box draft transport is
+            //     restored (sendMessageDraftFn defined above, gate bypassed for DM
+            //     draft so #1664 DM draft streaming is unaffected).
+            ...(ANSWER_STREAM_VISIBLE_ENABLED
               ? { minInitialChars: 1 }
               : { sendMessageDraft: sendMessageDraftFn, minInitialChars: Number.MAX_SAFE_INTEGER }),
             // #1075: route through robustApiCall so flood-wait,
@@ -9969,13 +9983,18 @@ function handleSessionEvent(ev: SessionEvent): void {
         const streamedMsgId = stream.messageId()
         const streamedFinalText = turn.capturedText.join('').trim()
         if (
-          // Broadened for draft retirement: a text-only no-reply turn that
-          // streamed a VISIBLE preview must materialize a pinged final answer +
-          // delete the preview. Without this, the retired-default path would
-          // fall into the else-branch retract() and delete the user's only copy
-          // of the answer (a lost-answer bug). The reply-tool branch still hits
-          // retract() → single canonical formatted reply, no flash.
-          (ANSWER_STREAM_VISIBLE_ENABLED || DRAFT_ANSWER_LANE_RETIRED)
+          // Only when a VISIBLE preview actually opened (visible flag on): a
+          // text-only no-reply turn that streamed a visible preview must
+          // materialize a pinged final answer + delete the preview, NOT fall into
+          // the else-branch retract() which would delete the user's only copy of
+          // the answer (a lost-answer bug). Gated on the visible flag alone (the
+          // flash-regression decoupling): with the visible stream OFF (default)
+          // no preview opens (minInitialChars:MAX), so streamedMsgId is null and
+          // this branch is unreachable — the no-reply answer is delivered by the
+          // turn-flush backstop below instead, the pre-v0.14.68 path. The
+          // reply-tool branch hits retract() on a non-opened lane (a no-op), so
+          // there is no preliminary to flash.
+          ANSWER_STREAM_VISIBLE_ENABLED
           && !turn.replyCalled
           && streamedMsgId != null
           && streamedFinalText.length > 0
@@ -20705,7 +20724,15 @@ void (async () => {
         }
       }
 
-      process.stderr.write(`telegram gateway: answer-stream lane=${DRAFT_ANSWER_LANE_RETIRED ? 'visible(draft-retired)' : (ANSWER_STREAM_VISIBLE_ENABLED ? 'visible' : 'draft')} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} grammy=${GRAMMY_VERSION}\n`)
+      // Lane state (post flash-decouple): VISIBLE only when the visible flag is
+      // on; otherwise 'draft' if the draft transport is available, else 'dormant'
+      // (draft retired + visible off = the default: no preview, reply tool is the
+      // only message). The old label wrongly reported 'visible(draft-retired)' for
+      // the dormant default, masking the flash regression.
+      const answerLaneState = ANSWER_STREAM_VISIBLE_ENABLED
+        ? 'visible'
+        : (sendMessageDraftFn != null ? 'draft' : 'dormant')
+      process.stderr.write(`telegram gateway: answer-stream lane=${answerLaneState} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} visible=${ANSWER_STREAM_VISIBLE_ENABLED} draftRetired=${DRAFT_ANSWER_LANE_RETIRED} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot, {
         runner: {
