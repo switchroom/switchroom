@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   startTurn,
   noteOutbound,
+  noteProduction,
   noteThinking,
   noteToolStart,
   noteToolEnd,
@@ -133,6 +134,47 @@ describe('silence-poke — outbound resets the silence clock', () => {
     // 300s after the outbound — now it fires.
     __tickForTests(550_000)
     expect(fx.fallbacks).toHaveLength(1)
+  })
+})
+
+// Production-liveness (2026-06-05): an activity-feed render or draft update is
+// the agent visibly working — it resets the silence clock so a long
+// tool/composition turn isn't torn down mid-work.
+describe('silence-poke — noteProduction resets the silence clock', () => {
+  it('a feed/draft render at 250s pushes the fallback measurement to it', () => {
+    const fx = setupDeps()
+    startTurn('k', 0)
+    noteProduction('k', 250_000)
+    __tickForTests(300_000) // 50s since production — no fire
+    expect(fx.fallbacks).toHaveLength(0)
+    __tickForTests(550_000) // 300s since production — fires
+    expect(fx.fallbacks).toHaveLength(1)
+  })
+
+  it('repeated production every 60s keeps a long turn alive indefinitely', () => {
+    const fx = setupDeps()
+    startTurn('k', 0)
+    for (let t = 60_000; t <= 600_000; t += 60_000) {
+      noteProduction('k', t)
+      __tickForTests(t)
+    }
+    // 10 min of steady feed/draft renders — never torn down.
+    expect(fx.fallbacks).toHaveLength(0)
+  })
+
+  it('production STOPS → the fallback fires 300s after the last render (genuine wedge)', () => {
+    const fx = setupDeps()
+    startTurn('k', 0)
+    noteProduction('k', 100_000) // last render at 100s, then silence
+    __tickForTests(390_000) // 290s since last render — no fire
+    expect(fx.fallbacks).toHaveLength(0)
+    __tickForTests(401_000) // 301s since last render — fires
+    expect(fx.fallbacks).toHaveLength(1)
+  })
+
+  it('is a no-op for an unknown key (no turn state)', () => {
+    setupDeps()
+    expect(() => noteProduction('nope', 1_000)).not.toThrow()
   })
 })
 
