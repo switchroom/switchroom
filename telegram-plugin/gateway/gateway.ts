@@ -98,7 +98,7 @@ import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
-import { parseVisibleAnswerStreamEnabled, parseDraftLaneRetiredEnabled } from '../answer-stream-flag.js'
+import { parseVisibleAnswerStreamEnabled, parseDraftLaneRetiredEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
   shouldSuppressToolActivity,
@@ -4589,6 +4589,16 @@ const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 const ANSWER_STREAM_VISIBLE_ENABLED = parseVisibleAnswerStreamEnabled(
   process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM,
 )
+// Single source of truth for the answer-lane behaviour (flash-decouple,
+// 2026-06-05). The visible preview gates on the visible flag ALONE; the draft
+// flag controls only the transport. Resolved here once and consulted at the
+// createAnswerStream config, the materialize-as-answer guard, and the boot log,
+// so all three can never drift back into the `visible || retired` conflation
+// that re-opened the flash. Total-enumerated in answer-stream-flag.test.ts.
+const ANSWER_LANE = resolveAnswerLaneConfig({
+  visibleEnabled: ANSWER_STREAM_VISIBLE_ENABLED,
+  draftFnAvailable: sendMessageDraftFn != null,
+})
 
 // Whether to DELETE the activity/status feed when the final answer lands.
 // Default OFF (2026-06-04, operator request): the status message stays in the
@@ -9693,9 +9703,9 @@ function handleSessionEvent(ev: SessionEvent): void {
             //     DRAFT_ANSWER_LANE=0 the legacy compose-box draft transport is
             //     restored (sendMessageDraftFn defined above, gate bypassed for DM
             //     draft so #1664 DM draft streaming is unaffected).
-            ...(ANSWER_STREAM_VISIBLE_ENABLED
-              ? { minInitialChars: 1 }
-              : { sendMessageDraft: sendMessageDraftFn, minInitialChars: Number.MAX_SAFE_INTEGER }),
+            ...(ANSWER_LANE.usesDraftTransport
+              ? { sendMessageDraft: sendMessageDraftFn, minInitialChars: ANSWER_LANE.minInitialChars }
+              : { minInitialChars: ANSWER_LANE.minInitialChars }),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
@@ -9994,7 +10004,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           // turn-flush backstop below instead, the pre-v0.14.68 path. The
           // reply-tool branch hits retract() on a non-opened lane (a no-op), so
           // there is no preliminary to flash.
-          ANSWER_STREAM_VISIBLE_ENABLED
+          ANSWER_LANE.opensVisiblePreview
           && !turn.replyCalled
           && streamedMsgId != null
           && streamedFinalText.length > 0
@@ -20725,14 +20735,12 @@ void (async () => {
       }
 
       // Lane state (post flash-decouple): VISIBLE only when the visible flag is
-      // on; otherwise 'draft' if the draft transport is available, else 'dormant'
-      // (draft retired + visible off = the default: no preview, reply tool is the
-      // only message). The old label wrongly reported 'visible(draft-retired)' for
-      // the dormant default, masking the flash regression.
-      const answerLaneState = ANSWER_STREAM_VISIBLE_ENABLED
-        ? 'visible'
-        : (sendMessageDraftFn != null ? 'draft' : 'dormant')
-      process.stderr.write(`telegram gateway: answer-stream lane=${answerLaneState} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} visible=${ANSWER_STREAM_VISIBLE_ENABLED} draftRetired=${DRAFT_ANSWER_LANE_RETIRED} grammy=${GRAMMY_VERSION}\n`)
+      // Lane state from the single-source-of-truth resolver: 'visible' (preview
+      // on), 'draft' (compose-box transport), or 'dormant' (the default: no
+      // preview, no draft — reply tool is the only message). The old label
+      // wrongly reported 'visible(draft-retired)' for the dormant default, which
+      // masked the flash regression.
+      process.stderr.write(`telegram gateway: answer-stream lane=${ANSWER_LANE.state} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} visible=${ANSWER_STREAM_VISIBLE_ENABLED} draftRetired=${DRAFT_ANSWER_LANE_RETIRED} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot, {
         runner: {

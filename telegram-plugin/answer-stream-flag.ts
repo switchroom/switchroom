@@ -35,3 +35,72 @@ export function parseDraftLaneRetiredEnabled(raw: string | undefined): boolean {
   const v = raw.trim().toLowerCase()
   return !(v === '0' || v === 'false' || v === 'off' || v === 'no')
 }
+
+/**
+ * `minInitialChars` sentinel meaning "never open a visible chat-timeline
+ * preview" — mirrors the `Number.MAX_SAFE_INTEGER` gate the createAnswerStream
+ * call site uses so the lane stays silent.
+ */
+export const ANSWER_LANE_NEVER_OPENS = Number.MAX_SAFE_INTEGER
+
+export type AnswerLaneState = 'visible' | 'draft' | 'dormant'
+
+export interface AnswerLaneConfig {
+  /** `minInitialChars` for createAnswerStream: `1` opens a visible preview on
+   *  the first text chunk; `ANSWER_LANE_NEVER_OPENS` suppresses it. */
+  minInitialChars: number
+  /** Whether the lane streams to the invisible compose-box draft transport. */
+  usesDraftTransport: boolean
+  /** Whether a USER-VISIBLE chat-timeline preview opens — i.e. the surface that
+   *  flashed (raw preview → formatted reply → preview deleted). This is THE
+   *  regression invariant: it must equal `visibleEnabled`, never depend on the
+   *  draft flag. */
+  opensVisiblePreview: boolean
+  /** Label for the boot log. */
+  state: AnswerLaneState
+}
+
+/**
+ * Resolve the answer-lane config from the two INDEPENDENT inputs.
+ *
+ * The visible PREVIEW (the flash surface) is gated on `visibleEnabled` ALONE;
+ * draft retirement controls only the TRANSPORT (whether `sendMessageDraft` is
+ * available). Conflating them was the v0.14.68 regression: retiring the draft
+ * (the default) forced a visible preview that flashed on every streaming turn,
+ * re-opening the flash v0.14.52 had removed. The load-bearing invariant —
+ * `opensVisiblePreview === visibleEnabled` for EVERY `draftFnAvailable` — is
+ * what this function exists to make total-enumerable (the gateway IIFE is not).
+ *
+ *   visibleEnabled                       → 'visible'  (preview opens, minChars 1)
+ *   !visible, draft transport available  → 'draft'    (no preview; draft renders)
+ *   !visible, no draft transport         → 'dormant'  (no preview, no draft:
+ *                                                       the reply tool is the
+ *                                                       only message — the default)
+ */
+export function resolveAnswerLaneConfig(input: {
+  visibleEnabled: boolean
+  draftFnAvailable: boolean
+}): AnswerLaneConfig {
+  if (input.visibleEnabled) {
+    return {
+      minInitialChars: 1,
+      usesDraftTransport: false,
+      opensVisiblePreview: true,
+      state: 'visible',
+    }
+  }
+  if (input.draftFnAvailable) {
+    return {
+      minInitialChars: ANSWER_LANE_NEVER_OPENS,
+      usesDraftTransport: true,
+      opensVisiblePreview: false,
+      state: 'draft',
+    }
+  }
+  return {
+    minInitialChars: ANSWER_LANE_NEVER_OPENS,
+    usesDraftTransport: false,
+    opensVisiblePreview: false,
+    state: 'dormant',
+  }
+}

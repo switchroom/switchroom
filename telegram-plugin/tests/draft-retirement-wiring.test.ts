@@ -38,26 +38,34 @@ describe('answer-lane wiring (draft retirement + flash decoupling)', () => {
     expect(firstUseIdx).toBeGreaterThan(declIdx)
   })
 
-  it('FLASH GUARD: the VISIBLE preview gates on the visible flag ALONE, never on the draft-retired flag', () => {
-    // The minInitialChars:1 (visible-preview) branch must be selected by
-    // ANSWER_STREAM_VISIBLE_ENABLED only. Conflating it with the retired-draft
-    // default is what re-opened the flash fleet-wide.
-    expect(gatewaySrc).toMatch(/\.\.\.\(ANSWER_STREAM_VISIBLE_ENABLED\s*\n?\s*\?\s*\{ minInitialChars: 1 \}/)
+  it('the lane behaviour is resolved by the single-source-of-truth pure function', () => {
+    // The flag→config decision lives in resolveAnswerLaneConfig (total-enumerated
+    // in answer-stream-flag.test.ts); the gateway delegates so the three use-sites
+    // can never drift apart.
+    expect(gatewaySrc).toMatch(/const ANSWER_LANE = resolveAnswerLaneConfig\(\{/)
+    expect(gatewaySrc).toMatch(/visibleEnabled: ANSWER_STREAM_VISIBLE_ENABLED/)
+    expect(gatewaySrc).toMatch(/draftFnAvailable: sendMessageDraftFn != null/)
+  })
+
+  it('FLASH GUARD: the createAnswerStream config is driven by ANSWER_LANE (preview gated on the visible flag alone)', () => {
+    // The minInitialChars / draft-transport choice comes from the resolved lane,
+    // never from a `visible || retired` inline conflation.
+    expect(gatewaySrc).toMatch(/\.\.\.\(ANSWER_LANE\.usesDraftTransport/)
+    expect(gatewaySrc).toMatch(/minInitialChars: ANSWER_LANE\.minInitialChars/)
   })
 
   it('FLASH GUARD: the visible-OR-retired conflation is GONE everywhere (it pinned the flash)', () => {
     // No answer-lane path may re-introduce `VISIBLE || RETIRED` — that is the
-    // exact regression this fix removes. Asserted globally so neither the config
-    // branch nor the materialize-as-answer guard can quietly bring it back.
+    // exact regression this fix removes.
     expect(gatewaySrc).not.toMatch(/ANSWER_STREAM_VISIBLE_ENABLED \|\| DRAFT_ANSWER_LANE_RETIRED/)
   })
 
-  it('LOST-ANSWER GUARD: materialize-as-answer gates on the visible flag alone (only fires when a preview actually opened)', () => {
+  it('LOST-ANSWER GUARD: materialize-as-answer gates on ANSWER_LANE.opensVisiblePreview (only fires when a preview actually opened)', () => {
     // A text-only no-reply turn materializes (ping + keep) ONLY when a visible
-    // preview opened (visible flag on). With visible off the lane never opens
-    // (minInitialChars:MAX) so this branch is unreachable and the answer is
-    // delivered by turn-flush instead — never retracted away.
-    expect(gatewaySrc).toMatch(/\n\s*ANSWER_STREAM_VISIBLE_ENABLED\s*\n\s*&& !turn\.replyCalled/)
+    // preview opened. With visible off the lane is dormant (minInitialChars:MAX),
+    // so this branch is unreachable and the answer is delivered by turn-flush
+    // instead — never retracted away.
+    expect(gatewaySrc).toMatch(/\n\s*ANSWER_LANE\.opensVisiblePreview\s*\n\s*&& !turn\.replyCalled/)
   })
 
   it('LOST-ANSWER GUARD: turn-flush is skipped ONLY when the stream finalized as the answer (so dormant-lane no-reply turns still flush)', () => {
