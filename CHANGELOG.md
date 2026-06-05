@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.14.69 — Deterministic answer-routing: prove the core, recover origin, alarm the residual (#2176 + #2175)
+
+Forum-supergroup answer/topic routing was **conditionally deterministic** —
+correct only when the model echoes `origin_turn_id` (precedence tier 2). A
+finite-FSM proof (total enumeration of the pure resolver + adversarial trace of
+the routing FSM that feeds it) found the load-bearing hole and this release
+proves the core, recovers what the framework owns, and surfaces the rest.
+
+### #2176 — prove determinism, recover origin without the model echo
+
+When the model omits `origin_turn_id` **and** `currentTurn` has flipped to a
+successor topic (reachable by construction via the 2.5s no-reply escape-hatch
+drain or the 300s silence-poke), a reply fell to the live successor's thread =
+**wrong topic**, silently. Three pieces:
+
+1. **Prove the deterministic core.** `answer-thread-resolve.test.ts` is promoted
+   from 9 sampled cases to a **total enumeration** over the whole 64-input
+   space — totality, determinism, no-fabrication, the precedence decision
+   table, and the by-construction invariants, notably **INV-2 origin
+   flip-immunity**: once origin is resolved, the result is independent of the
+   live thread for *every* combination, so a `currentTurn` flip cannot steal a
+   resolved origin. (A reviewer mutation-test confirmed the proof catches a
+   tier-swap regression — it is not a self-rubber-stamp.)
+2. **Recover origin without the model echo.** When the model quotes a message
+   (`reply_to`), that id is a *framework-owned* anchor: a new chat-scoped
+   source-message reverse index (evicted in lock-step with `recentTurnsById`)
+   maps it back to the owning turn. Origin resolves as `echo ?? quoted` — echo
+   stays authoritative; the quote is strictly additive and resolves the actual
+   origin turn, never the live successor. Kill switch
+   `SWITCHROOM_FRAMEWORK_ORIGIN_ROUTING`.
+3. **Alarm the irreducible residual.** A bare no-echo, no-quote late reply is
+   genuinely model-dependent — `MISROUTE_RISK(no-echo→live-successor)` telemetry
+   now surfaces that case instead of silently mis-routing it. Observability
+   only; routing unchanged.
+
+### #2175 — multi-topic + cross-surface ordering stress; UNROUTED false-alarm fix
+
+New supergroup UAT stress scenarios (multi-topic back-to-back, cross-surface
+ordering) and a fix for the `UNROUTED` telemetry false-alarm that fired on every
+legitimate General-topic reply (now gated on `ownerTurn == null`).
+
 ## v0.14.68 — Testable live answer surface: retire the compose-box draft (#2173 + #2172)
 
 ### #2173 — retire the invisible compose-box draft
