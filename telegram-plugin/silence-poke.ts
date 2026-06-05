@@ -197,6 +197,31 @@ export function noteOutbound(key: string, now: number): void {
 }
 
 /**
+ * Record observable PRODUCTION that isn't a final reply — an activity-feed
+ * render (`→/✓` edit-in-place message) or an answer-stream draft update. Resets
+ * the silence clock exactly like a reply.
+ *
+ * Why this exists (2026-06-05): the header's "only a real reply counts; tool
+ * churn / the model ripping through 20 tool calls is still SILENT to the user"
+ * rule predates the live activity feed (#2162) and the compose draft. Those
+ * surfaces ARE user-visible now, so a turn actively rendering them is NOT
+ * silent — yet the 300s fallback (which nulls `currentTurn` and kills the very
+ * feed/draft the user is watching) still fired on a long tool/composition turn,
+ * darkening the live status mid-work. Counting production as liveness makes the
+ * fallback fire only on GENUINE silence (no reply, no feed, no draft, no tool
+ * events for the window) — a real wedge. A wedged agent produces nothing
+ * observable, so its clock is never reset and it still recovers.
+ *
+ * No-op when the kill switch is on or the key has no turn.
+ */
+export function noteProduction(key: string, now: number): void {
+  const s = state.get(key)
+  if (s == null) return
+  s.lastOutboundAt = now
+  s.fallbackFired = false
+}
+
+/**
  * Record a `thinking` session event. Used to pick "still thinking…" vs
  * "still working…" wording for the 300s framework fallback.
  */

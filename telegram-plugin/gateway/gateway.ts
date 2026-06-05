@@ -4679,6 +4679,12 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
 const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '1'
+// Production-liveness (2026-06-05 UAT finding). Count an activity-feed render or
+// an answer-stream draft update as liveness for the silence clock, so a long
+// tool/composition turn that's visibly producing doesn't trip the 300s fallback
+// and null currentTurn mid-work. Default ON; SWITCHROOM_SILENCE_LIVENESS_PRODUCTION=0
+// restores the legacy "only a real reply resets the clock" behaviour.
+const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PRODUCTION !== '0'
 
 silencePoke.startTimer({
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS },
@@ -4895,7 +4901,16 @@ silencePoke.startTimer({
     // returns null and the regular teardown short-circuits. Without
     // this, the late event would re-emit `turn_ended` AND clobber
     // whatever fresh turn the next inbound started.
-    if (turnMatchesFallback && currentTurn === wedgedTurn) currentTurn = null
+    if (turnMatchesFallback && currentTurn === wedgedTurn && wedgedTurn != null) {
+      // Status-surface observability: emit the lifecycle CLEAR for the
+      // silence-poke teardown so a fallback-nulled turn has a turn-lifecycle
+      // line like every other clear path (the framework-fallback line below is
+      // its own format — this makes the dark-out greppable in the same shape).
+      process.stderr.write(
+        `telegram gateway: ${formatTurnLifecycle('clear', 'silence_fallback', wedgedTurn, Date.now())}\n`,
+      )
+      currentTurn = null
+    }
     // Best-effort: clear any pending silent-end marker so the Stop hook
     // doesn't double-block when claude eventually exits the wedged turn.
     try {
@@ -8997,6 +9012,13 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
           )
         }
         turn.activityLastSentRender = target
+        // Production-liveness: the live activity feed just rendered (send/edit) —
+        // the agent is visibly working, so reset the silence-poke clock. Without
+        // this, a long tool turn whose feed keeps updating still tripped the 300s
+        // fallback and nulled currentTurn, killing the very feed the user watches.
+        if (SILENCE_LIVENESS_PRODUCTION) {
+          silencePoke.noteProduction(statusKey(chat, thread), Date.now())
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (!msg.includes('message is not modified')) {
@@ -9618,6 +9640,15 @@ function handleSessionEvent(ev: SessionEvent): void {
                   statusKey(turn.sessionChatId, turn.sessionThreadId),
                   Date.now(),
                 )
+                // Production-liveness: a draft update is the agent visibly
+                // composing — reset the silence-poke clock so a long
+                // compose-only turn (no tools, no reply yet) isn't torn down.
+                if (SILENCE_LIVENESS_PRODUCTION) {
+                  silencePoke.noteProduction(
+                    statusKey(turn.sessionChatId, turn.sessionThreadId),
+                    Date.now(),
+                  )
+                }
               }
             },
             // #646 — wire the shared outboundDedup into the answer-stream
