@@ -440,3 +440,64 @@ describe('createWorkerActivityFeed', () => {
     expect(bot.sent[0].opts?.message_thread_id).toBe(42)
   })
 })
+
+// ─── log sink: success-path observability ────────────────────────────────────
+// Before this, the feed only logged on FAILURE, so a feed that rendered fine
+// was invisible in the gateway log — the exact gap that made the marko
+// status-dark incident hard to triage. Assert paint/edit/finish each emit a
+// structured, greppable line naming the worker, chat, thread, and message id.
+describe('createWorkerActivityFeed — log sink', () => {
+  it('logs paint on first send, edit on each in-place update, and finish on terminal', async () => {
+    const bot = makeFakeBot()
+    const logs: string[] = []
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      log: (m) => logs.push(m),
+    })
+
+    await feed.update('w-research', 'chat-9', view({ toolCount: 1, latestSummary: 'first' }), 7)
+    clock = 11_000
+    await feed.update('w-research', 'chat-9', view({ toolCount: 2, latestSummary: 'second' }), 7)
+    clock = 12_000
+    await feed.finish('w-research', view({ state: 'done', toolCount: 2 }))
+
+    const paint = logs.find((l) => l.startsWith('worker-feed: paint'))
+    const edit = logs.find((l) => l.startsWith('worker-feed: edit'))
+    const finish = logs.find((l) => l.startsWith('worker-feed: finish'))
+
+    expect(paint).toBeDefined()
+    expect(paint).toContain('agent=w-research')
+    expect(paint).toContain('chat=chat-9')
+    expect(paint).toContain('thread=7')
+    expect(paint).toMatch(/msgId=\d+/)
+    expect(paint).toMatch(/bytes=\d+/)
+
+    expect(edit).toBeDefined()
+    expect(edit).toContain('agent=w-research')
+
+    expect(finish).toBeDefined()
+    expect(finish).toContain('state=done')
+  })
+
+  it('renders thread=- in the log line when no forum topic is set', async () => {
+    const bot = makeFakeBot()
+    const logs: string[] = []
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, log: (m) => logs.push(m) })
+    await feed.update('w1', 'chat', view()) // no threadId
+    expect(logs.find((l) => l.startsWith('worker-feed: paint'))).toContain('thread=-')
+  })
+
+  it('does not log a paint when the worker stays below firstPaintMin (still silent)', async () => {
+    const bot = makeFakeBot()
+    const logs: string[] = []
+    let clock = 0
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, firstPaintMinMs: 8000, log: (m) => logs.push(m) })
+    clock = 3000
+    await feed.update('w1', 'chat', view({ elapsedMs: 3000 }))
+    expect(logs.some((l) => l.startsWith('worker-feed: paint'))).toBe(false)
+  })
+})
