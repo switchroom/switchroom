@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.67 — Status stays live through long work (#2169 + #2168)
+
+Closes the last status-dark case, found by the new real-work UAT: a long turn
+that is visibly producing — the activity feed editing in place, or the compose
+draft updating — still tripped the 300s silence-poke fallback and nulled the
+live status mid-work. Fix A (#2164) only deferred while a tracked tool was in
+flight; it didn't count feed/draft renders.
+
+### #2169 — count feed/draft activity as liveness
+
+The silence clock now resets on **model-driven** observable production (a new
+activity-feed step, or an answer-stream draft update), so the 300s fallback
+fires only on **genuine** silence — no reply, no feed, no draft, no tool events
+for the window. Critically, the reset is wired ONLY to model-driven sites: an
+adversarial review caught a first revision that reset on every feed render,
+including the framework's model-independent 6s heartbeat (climbing-elapsed),
+which would have pinned a hung-but-connected turn forever (the #1556 wedge) —
+that path is now structurally guarded against. Default ON; kill switch
+`SWITCHROOM_SILENCE_LIVENESS_PRODUCTION=0`. Plus a `turn-lifecycle clear
+reason=silence_fallback` telemetry line so a fallback-nulled turn is greppable
+like every other clear.
+
+### #2168 — real-work UAT coverage + a reply-route telemetry fix
+
+New UAT scenarios send human-style prompts that trigger genuine work (multi-tool,
+research, sub-agents, background workers) in DM and channel, asserting the status
+surface + answer land correctly — the coverage that surfaced the bug above. Also
+fixes the `reply-route` marker spuriously tagging every DM reply `recovered`.
+
 ## v0.14.66 — Late replies land in their own topic (#2166)
 
 Follow-up to the v0.14.65 status work, from a live marko triage: in a forum
