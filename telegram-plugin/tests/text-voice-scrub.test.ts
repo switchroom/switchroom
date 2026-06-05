@@ -226,6 +226,27 @@ describe('scrubVoice — leading sycophancy openers', () => {
     expect(r.openersStripped).toBe(0)
   })
 
+  it('does NOT over-strip when the phrase is a literal sentence start (no separator)', () => {
+    // The affirmation must be followed by a separator/end, not a bare
+    // space into more words — otherwise "Spot on the map..." loses "Spot
+    // on". These are real sentences, not detachable affirmations.
+    for (const s of [
+      'Spot on the map shows three sites.',
+      'Good catch basin overflow is the root cause.',
+      'Exactly right now, the count is 3.',
+      'Absolutely right turns are banned on that road.',
+    ]) {
+      const r = scrubVoice(s)
+      expect(r.scrubbed, s).toBe(s)
+      expect(r.openersStripped, s).toBe(0)
+    }
+  })
+
+  it('still strips when a separator follows (comma / period / dash)', () => {
+    expect(scrubVoice('Spot on, the value is 5.').scrubbed).toBe('The value is 5.')
+    expect(scrubVoice('Good catch. Fixed it.').scrubbed).toBe('Fixed it.')
+  })
+
   it('does not touch an opener-like phrase inside code', () => {
     const r = scrubVoice('`spot on` is the variable name. Here is the value.')
     expect(r.scrubbed).toContain('`spot on`')

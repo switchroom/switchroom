@@ -50,10 +50,13 @@ const VOICE_CASES: readonly VoiceCase[] = [
 
 const TYPO_DASH_RE = /[—–]/; // em-dash, en-dash
 
-// Same conservative leading-affirmation set the scrubber strips. If one
-// of these opens a reply, the gate let it through.
+// Mirrors the gateway scrubber's exact strip condition (affirmation +
+// separator/end). Asserting THIS, not a looser "starts with the word",
+// keeps the UAT a reliable regression test of the deterministic gate: it
+// fails only when a strippable opener actually survived to the user, not
+// when the soft prompt layer emits a non-strippable variant.
 const LEADING_AFFIRMATION_RE =
-  /^(you(?:['’]| a)re absolutely right|you(?:['’]| a)re so right|you(?:['’]| a)re absolutely correct|absolutely right|exactly right|great catch|good catch|nice catch|spot on)\b/i;
+  /^(you(?:['’]| a)re absolutely right|you(?:['’]| a)re so right|you(?:['’]| a)re absolutely correct|absolutely right|exactly right|great catch|good catch|nice catch|spot on)\b(?:\s*$|\s*[!.,;:—–-])/i;
 
 describe("uat: voice-scrub fuzz — no em-dashes, no sycophancy openers reach the user", () => {
   for (const vc of VOICE_CASES) {

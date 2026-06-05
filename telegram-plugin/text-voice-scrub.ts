@@ -91,9 +91,17 @@ function enabled(): boolean {
  * "you're right that X") and "great/good question" (overlaps the
  * legitimate short-ack pattern). Kept to phrases whose only content is
  * the affirmation itself. Apostrophe matches straight or curly.
+ *
+ * The affirmation must be followed by end-of-string OR a clause/sentence
+ * separator (punctuation, possibly with surrounding whitespace) — NOT a
+ * bare space into more words. This is what stops over-strips like
+ * "Spot on the map shows...", "Good catch basin overflow...", "Exactly
+ * right now, the count is 3" — there the phrase is a literal sentence
+ * start, not a detachable affirmation. "Spot on, the value is 5" (comma)
+ * still strips.
  */
 const LEADING_AFFIRMATION_RE =
-  /^(\s*)(you(?:['’]| a)re absolutely right|you(?:['’]| a)re so right|you(?:['’]| a)re absolutely correct|absolutely right|exactly right|great catch|good catch|nice catch|spot on)\b[\s!.,;:—–-]*/i
+  /^(\s*)(you(?:['’]| a)re absolutely right|you(?:['’]| a)re so right|you(?:['’]| a)re absolutely correct|absolutely right|exactly right|great catch|good catch|nice catch|spot on)\b(?:\s*$|\s*[!.,;:—–-][\s!.,;:—–-]*)/i
 
 /**
  * Strip a single leading affirmation opener and recapitalize the next
