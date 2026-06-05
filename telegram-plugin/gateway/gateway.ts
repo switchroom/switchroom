@@ -4579,7 +4579,27 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
 // incident fix. In-memory only; a gateway recreate naturally resets it.
 let inFlightUpdate: { requestId: string; startedAt: number } | null = null
 
+// Fix A — silence-fallback tuning (status-surface darkening, 2026-06-05). A long
+// quiet tool stretch (foreground sub-agent / big research) crossed the 300s
+// fallback and nulled currentTurn, darkening the live activity feed mid-work.
+//   SWITCHROOM_SILENCE_FALLBACK_MS         — base threshold (default 300000)
+//   SWITCHROOM_SILENCE_FALLBACK_HARD_MS    — hard ceiling for the in-flight-tool
+//                                            defer (default 900000 = 15min)
+//   SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1 — enable the defer (default OFF;
+//                                            canary on marko against #2162 telemetry)
+function parsePositiveMsEnv(name: string, fallbackMs: number): number {
+  const raw = process.env[name]
+  if (raw == null || raw === '') return fallbackMs
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallbackMs
+}
+const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
+const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
+const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '1'
+
 silencePoke.startTimer({
+  thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS },
+  deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
