@@ -1888,6 +1888,83 @@ function findTurnByOriginId(originTurnId: string | null | undefined): CurrentTur
   return recentTurnsById.get(originTurnId) ?? null
 }
 
+// Late-reply topic recovery (2026-06-05 marko triage). Default ON; kill switch
+// SWITCHROOM_LATE_REPLY_TOPIC_RECOVERY=0 restores the legacy behaviour (a late
+// reply with no echoed origin and no live turn defaults to General).
+const LATE_REPLY_TOPIC_RECOVERY_ENABLED =
+  process.env.SWITCHROOM_LATE_REPLY_TOPIC_RECOVERY !== '0'
+
+/**
+ * The most-recently-started turn for a chat from the bounded recently-ended
+ * registry — the deterministic fallback for a LATE answer reply when the model
+ * echoed no `origin_turn_id` and `currentTurn` has already cleared. Iterates in
+ * insertion order so the last match is the most recent turn for that chat.
+ * Returns null when the chat has no remembered turn (so the caller keeps the
+ * legacy result). NB: this is the chat's own most-recent TURN, not the
+ * `chatThreadMap` last-seen-any-message heuristic that caused the wrong-topic
+ * bug — a late reply almost always belongs to the turn that just ended.
+ */
+function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
+  let latest: CurrentTurn | null = null
+  for (const t of recentTurnsById.values()) {
+    if (t.sessionChatId === chatId) latest = t
+  }
+  return latest
+}
+
+/**
+ * Resolve the answer-reply thread AND emit `reply-route` telemetry. The
+ * 2026-06-05 triage showed reply routing was the blind spot: `reply: invoked`
+ * logged only chat + char count, so a late reply landing in the wrong topic was
+ * invisible without hand-correlating raw tg-post threads against turn-lifecycle
+ * timestamps. This wrapper logs, per reply: which precedence tier won (`via`),
+ * the resolved thread, the origin turn + its thread, and whether the reply was
+ * late (turn already ended). `via=recovered` marks a late reply this fix saved
+ * from General; `UNROUTED` flags a supergroup reply that still resolved to no
+ * topic (the residual gap to watch).
+ */
+function resolveAnswerThreadWithLog(
+  chatId: string,
+  explicitThreadId: number | undefined,
+  originTurn: CurrentTurn | null,
+  liveTurn: CurrentTurn | null,
+  surface: 'reply' | 'stream_reply',
+): number | undefined {
+  const recovered =
+    LATE_REPLY_TOPIC_RECOVERY_ENABLED &&
+    explicitThreadId == null &&
+    originTurn == null &&
+    liveTurn?.sessionThreadId == null
+      ? findLatestEndedTurnForChat(chatId)
+      : null
+  const threadId = resolveAnswerThreadId({
+    explicitThreadId,
+    originResolved: originTurn != null,
+    originThreadId: originTurn?.sessionThreadId,
+    liveThreadId: liveTurn?.sessionThreadId,
+    lastEndedResolvedForChat: recovered != null,
+    lastEndedThreadIdForChat: recovered?.sessionThreadId,
+  })
+  const via =
+    explicitThreadId != null ? 'explicit'
+    : originTurn != null ? 'origin'
+    : liveTurn?.sessionThreadId != null ? 'live'
+    : recovered != null ? 'recovered'
+    : 'none'
+  const ownerTurn = originTurn ?? recovered ?? liveTurn
+  const isSupergroup = chatId.startsWith('-100')
+  const unrouted = isSupergroup && threadId == null
+  process.stderr.write(
+    `telegram gateway: reply-route surface=${surface} chat=${chatId} ` +
+      `resolved_thread=${threadId ?? '-'} via=${via} late=${liveTurn == null} ` +
+      `originTurn=${ownerTurn?.turnId ?? '-'} origin_thread=${ownerTurn?.sessionThreadId ?? '-'}` +
+      (via === 'recovered' ? ' RECOVERED' : '') +
+      (unrouted ? ' UNROUTED(supergroup→no-topic)' : '') +
+      '\n',
+  )
+  return threadId
+}
+
 /**
  * PR2 obligation-ledger CLOSE. Called when a SUBSTANTIVE final answer lands
  * (not a bare interim ack — using finalAnswerSubstantive, the #2141 signal): the
@@ -6522,12 +6599,13 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   if (TURN_ORIGIN_ROUTING_ENABLED) {
     const explicit = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
-    threadId = resolveAnswerThreadId({
-      explicitThreadId: Number.isFinite(explicit as number) ? (explicit as number) : undefined,
-      originResolved: originTurn != null,
-      originThreadId: originTurn?.sessionThreadId,
-      liveThreadId: turn?.sessionThreadId,
-    })
+    threadId = resolveAnswerThreadWithLog(
+      chat_id,
+      Number.isFinite(explicit as number) ? (explicit as number) : undefined,
+      originTurn,
+      turn,
+      'reply',
+    )
   } else {
     threadId = resolveThreadId(
       chat_id,
@@ -7178,12 +7256,13 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     let injected: number | undefined
     if (TURN_ORIGIN_ROUTING_ENABLED) {
       const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
-      injected = resolveAnswerThreadId({
-        explicitThreadId: undefined,
-        originResolved: originTurn != null,
-        originThreadId: originTurn?.sessionThreadId,
-        liveThreadId: turn?.sessionThreadId,
-      })
+      injected = resolveAnswerThreadWithLog(
+        String(args.chat_id),
+        undefined,
+        originTurn,
+        turn,
+        'stream_reply',
+      )
     } else {
       injected = turn?.sessionThreadId
     }

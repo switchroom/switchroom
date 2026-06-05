@@ -45,13 +45,15 @@ describe('component 3 — turn-origin reply routing', () => {
     const fn = gatewaySrc.split('async function executeReply')[1]?.split('\nasync function ')[0] ?? ''
     expect(fn).toMatch(/TURN_ORIGIN_ROUTING_ENABLED/)
     expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
-    expect(fn).toMatch(/resolveAnswerThreadId\(/)
+    // The resolution + reply-route telemetry go through resolveAnswerThreadWithLog,
+    // which calls the pure resolveAnswerThreadId internally (incl. tier-4 recovery).
+    expect(fn).toMatch(/resolveAnswerThread\w*\(/)
   })
 
   it('executeStreamReply resolves the answer thread via the origin turn too', () => {
     const fn = gatewaySrc.split('async function executeStreamReply')[1]?.split('\nasync function ')[0] ?? ''
     expect(fn).toMatch(/findTurnByOriginId\(args\.origin_turn_id/)
-    expect(fn).toMatch(/resolveAnswerThreadId\(/)
+    expect(fn).toMatch(/resolveAnswerThread\w*\(/)
   })
 
   it('the reply + stream_reply tool schemas expose origin_turn_id to the model', () => {
