@@ -9012,13 +9012,6 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
           )
         }
         turn.activityLastSentRender = target
-        // Production-liveness: the live activity feed just rendered (send/edit) —
-        // the agent is visibly working, so reset the silence-poke clock. Without
-        // this, a long tool turn whose feed keeps updating still tripped the 300s
-        // fallback and nulled currentTurn, killing the very feed the user watches.
-        if (SILENCE_LIVENESS_PRODUCTION) {
-          silencePoke.noteProduction(statusKey(chat, thread), Date.now())
-        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (!msg.includes('message is not modified')) {
@@ -9480,6 +9473,16 @@ function handleSessionEvent(ev: SessionEvent): void {
         // the " · Ns" elapsed restarts from this step (and the feed itself just
         // advanced, so it isn't stale).
         turn.lastToolLabelAt = Date.now()
+        // Production-liveness: a NEW model-driven activity label is genuine
+        // liveness (the model emitted a new step), so reset the silence-poke
+        // clock — this is the safe site, NOT drainActivitySummary, because the
+        // framework feedHeartbeatTick also drains (climbing-elapsed re-renders)
+        // and would falsely reset the clock forever on a hung-mid-tool turn,
+        // reintroducing the #1556 dangling-turn wedge. Only the model emitting a
+        // fresh label reaches here.
+        if (SILENCE_LIVENESS_PRODUCTION && currentTurn === turn) {
+          silencePoke.noteProduction(statusKey(turn.sessionChatId, turn.sessionThreadId), Date.now())
+        }
         // Recompose so any active foreground sub-agent's nested block (Model A)
         // is preserved when the parent appends its own step. composeTurnActivity
         // == the flat render when no foreground sub-agent is active.
