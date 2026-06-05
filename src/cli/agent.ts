@@ -27,6 +27,7 @@ import {
   getAgentLogs,
   writeRestartReasonMarker,
   buildCliRestartReason,
+  reconcileSingletonImages,
 } from "../agents/lifecycle.js";
 import { COMMIT_SHA as BUILD_COMMIT } from "../build-info.js";
 import { usesSwitchroomTelegramPlugin, resolveAgentConfig } from "../config/merge.js";
@@ -1178,6 +1179,32 @@ export function registerAgentCommand(program: Command): void {
           }
 
           let sawAbort = false;
+
+          // Self-heal stale singletons before bouncing agents. The
+          // staggered-rollout recipe (apply → per-agent `agent restart`)
+          // regenerates the compose with new image tags but its
+          // `up -d --no-deps agent-<name>` never recreates the brokers,
+          // so a pin bump can strand the singletons on an old image
+          // (real incident: auth-broker 42 versions stale → /connect
+          // microsoft failed). This is drift-aware: a no-op when the
+          // running images already match the pin. Best-effort — a
+          // recreate failure is logged, never blocks the agent restart.
+          try {
+            const recon = reconcileSingletonImages((m) => console.error(chalk.gray(`  ${m}`)));
+            if (recon.recreated.length > 0) {
+              console.error(
+                chalk.cyan(
+                  `  ↻ Recreated stale singleton(s) to the pinned image: ${recon.recreated.join(", ")}`,
+                ),
+              );
+            }
+          } catch (err) {
+            console.error(
+              chalk.yellow(
+                `  ⚠ singleton reconcile skipped: ${err instanceof Error ? err.message : String(err)}`,
+              ),
+            );
+          }
 
           for (const n of names) {
             if (!config.agents[n]) {
