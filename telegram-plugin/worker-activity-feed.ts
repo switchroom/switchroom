@@ -208,6 +208,8 @@ export interface WorkerActivityFeedOpts {
 }
 
 interface WorkerHandle {
+  /** jsonl agent id — carried so success/failure log lines can name the worker. */
+  agentId: string
   chatId: string
   threadId?: number
   messageId: number | null
@@ -309,6 +311,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
         h.messageId = sent.message_id
         h.lastBody = body
         h.lastEditAt = nowFn()
+        log(
+          `worker-feed: paint agent=${h.agentId} chat=${h.chatId} ` +
+            `thread=${h.threadId ?? '-'} msgId=${h.messageId} bytes=${body.length}`,
+        )
       } catch (err) {
         noteRateLimited(h, err, 'send')
         log(`worker-feed: send failed: ${(err as Error).message}`)
@@ -324,6 +330,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
       h.lastBody = body
       h.lastEditAt = nowFn()
+      log(
+        `worker-feed: edit agent=${h.agentId} chat=${h.chatId} ` +
+          `thread=${h.threadId ?? '-'} msgId=${h.messageId} bytes=${body.length}`,
+      )
     } catch (err) {
       noteRateLimited(h, err, 'edit')
       // Stale message_id (manually deleted / edit window gone). Re-post
@@ -351,6 +361,10 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       await opts.bot.editMessageText(h.chatId, h.messageId, body, sendOptsFor(h))
       h.lastBody = body
       h.lastEditAt = nowFn()
+      log(
+        `worker-feed: finish agent=${h.agentId} chat=${h.chatId} ` +
+          `thread=${h.threadId ?? '-'} msgId=${h.messageId} state=${view.state} bytes=${body.length}`,
+      )
     } catch (err) {
       noteRateLimited(h, err, 'finish')
       log(`worker-feed: finish edit failed: ${(err as Error).message}`)
@@ -371,6 +385,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
       let h = handles.get(agentId)
       if (h == null) {
         h = {
+          agentId,
           chatId,
           threadId,
           messageId: null,

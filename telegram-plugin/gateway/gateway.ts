@@ -65,6 +65,7 @@ import {
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
+import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -1798,6 +1799,14 @@ type CurrentTurn = {
   activityInFlight: Promise<void> | null
   activityPendingRender: string | null
   activityLastSentRender: string | null
+  // Status-surface observability. `activityEverOpened` is sticky-true once the
+  // feed posts its first message — unlike `activityMessageId`, it is NOT nulled
+  // by `clearActivitySummary`, so the turn-end DEGRADED check can tell "feed
+  // never opened" (the resume-400 signature) from "feed finalized + cleared".
+  // `activityDrainFailures` counts real activity-feed send/edit failures this
+  // turn (429s + "message is not modified" excluded). Both reset per turn.
+  activityEverOpened: boolean
+  activityDrainFailures: number
   // Wall-clock anchor for the newest in-progress feed step — set each time a
   // tool_label re-renders the feed. The heartbeat (`feedHeartbeatTick`) reads
   // it to show a climbing " · Ns" elapsed on the live line so a long single
@@ -2488,6 +2497,20 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
   if (currentTurn !== turn) return
   currentTurn = null
+  // Status-surface observability: one line at every turn CLEAR (with how far
+  // the turn got), plus a DEGRADED warning when the turn did tool work but the
+  // live feed never opened because its sends failed (the resume-400 signature).
+  process.stderr.write(
+    `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, Date.now())}\n`,
+  )
+  const degraded = detectStatusSurfaceDegraded(turn)
+  if (degraded != null) {
+    process.stderr.write(
+      `telegram gateway: status-surface DEGRADED reason=${degraded.reason} ` +
+        `turnId=${turn.turnId} chat=${turn.sessionChatId} ` +
+        `thread=${turn.sessionThreadId ?? '-'} ${degraded.detail}\n`,
+    )
+  }
   // PR2 obligation-ledger CLOSE-at-turn-end. Close the ended turn's obligation
   // when it delivered a final answer. finalAnswerDelivered is the right signal
   // HERE (not isSubstantiveFinalReply at reply-time): a SHORT genuine answer
@@ -8850,6 +8873,7 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
             { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.send' },
           )
           turn.activityMessageId = sent.message_id
+          turn.activityEverOpened = true
         } else {
           const id = turn.activityMessageId
           await robustApiCall(
@@ -8861,7 +8885,18 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (!msg.includes('message is not modified')) {
-          process.stderr.write(`telegram gateway: activity-summary drain failed: ${msg}\n`)
+          turn.activityDrainFailures += 1
+          // Surface the failing anchor + topic: the resume-400 bug fed a
+          // fabricated 13-digit message_id as the reply anchor here, so every
+          // send 400'd and the feed never opened. Logging the anchor +
+          // everOpened makes a feed-blanking send self-explanatory (and the
+          // turn-end DEGRADED line aggregates it).
+          process.stderr.write(
+            `telegram gateway: activity-summary drain failed: ${msg} ` +
+              `(chat=${chat} thread=${thread ?? '-'} ` +
+              `replyAnchor=${turn.sourceMessageId ?? 'none'} ` +
+              `everOpened=${turn.activityEverOpened} failures=${turn.activityDrainFailures})\n`,
+          )
         }
         // Mark as sent so we don't infinite-loop on a stuck render.
         turn.activityLastSentRender = target
@@ -9042,12 +9077,19 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityInFlight: null,
           activityPendingRender: null,
           activityLastSentRender: null,
+          activityEverOpened: false,
+          activityDrainFailures: 0,
           mirrorLines: [],
           foregroundSubAgents: new Map(),
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
         }
         currentTurn = next
+        // Status-surface observability: one line at every turn SET so a later
+        // dark card is traceable to which turn/topic key it belonged to.
+        process.stderr.write(
+          `telegram gateway: ${formatTurnLifecycle('set', 'enqueue', next, startedAt)}\n`,
+        )
         // Component 3 — retain in the bounded recently-ended registry so a
         // LATE reply (landing after currentTurn flips to a successor) can
         // still resolve THIS turn's origin thread by its turnId.
