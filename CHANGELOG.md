@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.14.68 — Testable live answer surface: retire the compose-box draft (#2173 + #2172)
+
+### #2173 — retire the invisible compose-box draft
+
+The live answer-stream rendered to the **compose-box draft** (`sendMessageDraft`),
+which the mtcute UAT harness cannot observe — so the live answer surface was
+**untestable** (the source of the recurring `botMsgs=0` confusion in triage).
+It's now a **visible edit-in-place message** (`sendMessage` + `editMessageText`):
+fully observable, and the #2169 silence-liveness reset on it now fires on visible
+sends in **DMs and supergroups** (supergroups had no answer-lane reset before).
+Default = draft retired; kill switch `SWITCHROOM_DRAFT_ANSWER_LANE=0` restores the
+legacy draft. The flash that originally drove the draft is bounded by model
+behaviour — on the common think→tool→reply turn the lane never opens; reply-tool
+turns keep a single canonical formatted reply.
+
+### #2172 — Connections dashboard tab
+
+Web dashboard tab surfacing Google + Microsoft + Notion connection visibility.
+
 ## v0.14.67 — Status stays live through long work (#2169 + #2168)
 
 Closes the last status-dark case, found by the new real-work UAT: a long turn
