@@ -16,3 +16,22 @@ export function parseVisibleAnswerStreamEnabled(raw: string | undefined): boolea
   const v = raw.trim().toLowerCase()
   return v === '1' || v === 'true' || v === 'on' || v === 'yes'
 }
+
+/**
+ * Draft-answer-lane retirement (2026-06-05). The compose-box draft transport
+ * (`sendMessageDraft`) is invisible to the mtcute UAT harness, so the live
+ * answer-stream surface couldn't be tested. Retired by DEFAULT: the answer lane
+ * now opens a real, observable edit-in-place message instead of the compose-box
+ * draft (and the onMetric silence-liveness reset from #2169 now fires on visible
+ * sends in BOTH DMs and supergroups, not just DM drafts). Kill switch
+ * `SWITCHROOM_DRAFT_ANSWER_LANE=0` (also false/off/no) restores the legacy
+ * invisible draft.
+ *
+ * Returns true when the draft lane is RETIRED (the default — env unset or any
+ * truthy value); false only for an explicit disable of the retirement.
+ */
+export function parseDraftLaneRetiredEnabled(raw: string | undefined): boolean {
+  if (raw == null) return true
+  const v = raw.trim().toLowerCase()
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no')
+}
