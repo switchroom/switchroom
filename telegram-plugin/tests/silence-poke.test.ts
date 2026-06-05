@@ -26,7 +26,10 @@ interface TestFixtures {
   fallbacks: FrameworkFallbackContext[]
 }
 
-function setupDeps(opts?: { thresholds?: Partial<typeof DEFAULT_THRESHOLDS> }): TestFixtures {
+function setupDeps(opts?: {
+  thresholds?: Partial<typeof DEFAULT_THRESHOLDS> & { fallbackHardCeiling?: number }
+  deferFallbackWhileToolInFlight?: boolean
+}): TestFixtures {
   const fixtures: TestFixtures = { emitted: [], fallbacks: [] }
   __setDepsForTests({
     emitMetric: (e) => fixtures.emitted.push(e),
@@ -35,6 +38,9 @@ function setupDeps(opts?: { thresholds?: Partial<typeof DEFAULT_THRESHOLDS> }): 
       ...DEFAULT_THRESHOLDS,
       ...(opts?.thresholds ?? {}),
     },
+    ...(opts?.deferFallbackWhileToolInFlight != null
+      ? { deferFallbackWhileToolInFlight: opts.deferFallbackWhileToolInFlight }
+      : {}),
   })
   return fixtures
 }
@@ -526,5 +532,67 @@ describe('silence-poke — performance', () => {
     __tickForTests(75_000) // under fallback threshold — pure iteration cost
     const elapsed = performance.now() - start
     expect(elapsed).toBeLessThan(50)
+  })
+})
+
+// ─── Fix A: defer the unwedge while a parent tool is genuinely in flight ──────
+// A long quiet tool stretch (foreground sub-agent / big research) crossed the
+// 300s fallback and nulled currentTurn, darkening the live activity feed
+// mid-work. The opt-in defer keeps the turn alive while a tool is in flight,
+// bounded by a hard ceiling so a hung-mid-tool turn still unwedges.
+describe('silence-poke — Fix A: in-flight-tool defer', () => {
+  it('legacy default (defer OFF): fires at 300s even with a tool in flight', () => {
+    const f = setupDeps() // deferFallbackWhileToolInFlight unset → off
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'long audit', 10_000)
+    __tickForTests(300_000)
+    expect(f.fallbacks).toHaveLength(1) // unchanged legacy behaviour
+  })
+
+  it('defer ON: does NOT fire at 300s while a tool is in flight', () => {
+    const f = setupDeps({ deferFallbackWhileToolInFlight: true, thresholds: { fallbackHardCeiling: 900_000 } })
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'long audit', 10_000)
+    __tickForTests(300_000)
+    __tickForTests(450_000) // still working, tool still in flight
+    expect(f.fallbacks).toHaveLength(0) // deferred — the live feed stays alive
+  })
+
+  it('defer ON: fires once the tool ends and the turn stays silent past threshold', () => {
+    const f = setupDeps({ deferFallbackWhileToolInFlight: true, thresholds: { fallbackHardCeiling: 900_000 } })
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', null, 10_000)
+    __tickForTests(300_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred while in flight
+    noteToolEnd('c:0', 't1', 400_000) // tool completes, no reply follows
+    __tickForTests(400_001) // silence (from turn start) already well past 300s
+    expect(f.fallbacks).toHaveLength(1) // now unwedges promptly
+  })
+
+  it('defer ON: fires at the hard ceiling even with a tool still in flight (hung-mid-tool)', () => {
+    const f = setupDeps({ deferFallbackWhileToolInFlight: true, thresholds: { fallbackHardCeiling: 900_000 } })
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', 'wedged tool', 10_000)
+    __tickForTests(300_000)
+    expect(f.fallbacks).toHaveLength(0) // deferred
+    __tickForTests(900_000) // crosses the hard ceiling
+    expect(f.fallbacks).toHaveLength(1) // bounded — still unwedges
+  })
+
+  it('defer ON: a turn with NO in-flight tool fires at the base threshold (genuine silence)', () => {
+    const f = setupDeps({ deferFallbackWhileToolInFlight: true, thresholds: { fallbackHardCeiling: 900_000 } })
+    startTurn('c:0', 0)
+    // no tool ever started — genuinely silent/wedged
+    __tickForTests(300_000)
+    expect(f.fallbacks).toHaveLength(1) // unaffected by the defer
+  })
+
+  it('defer ON without a hard ceiling: defers indefinitely while the tool stays in flight', () => {
+    const f = setupDeps({ deferFallbackWhileToolInFlight: true }) // no fallbackHardCeiling → Infinity
+    startTurn('c:0', 0)
+    noteToolStart('c:0', 't1', 'Bash', null, 10_000)
+    __tickForTests(300_000)
+    __tickForTests(3_600_000) // an hour in
+    expect(f.fallbacks).toHaveLength(0)
   })
 })

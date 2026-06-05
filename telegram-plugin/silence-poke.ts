@@ -20,6 +20,14 @@
  * edits, and tool churn DO NOT reset the silence clock — the model could
  * be ripping through 20 tool calls and still be "silent" to the user.
  *
+ * Fix A caveat (opt-in, `deferFallbackWhileToolInFlight`): tool churn still
+ * doesn't reset the *clock*, but when the threshold is crossed WITH a parent
+ * tool genuinely in flight, the terminal unwedge is DEFERRED (not skipped) up to
+ * `fallbackHardCeiling`. Since #2162 the live activity feed renders that tool
+ * work, so the "still silent to the user" premise no longer holds while a tool
+ * is visibly running; nulling `currentTurn` there would darken the very feed the
+ * user is watching. A turn with no in-flight tool is unaffected.
+ *
  * Terminal action, once per turn:
  *
  *   t=0       startTurn() — silence clock starts at turnStartedAt
@@ -81,6 +89,16 @@ export interface ThresholdsMs {
   /** Silence (since last outbound, or turn start) after which the
    *  framework sends the user-visible fallback AND unwedges the turn. */
   fallback: number
+  /**
+   * Fix A — hard ceiling for the in-flight-tool defer. When
+   * `deferFallbackWhileToolInFlight` is on, the fallback is held back while a
+   * parent tool is genuinely in flight (the agent is demonstrably working and
+   * the live activity feed is showing it). This bounds that defer: once silence
+   * crosses the ceiling the fallback fires REGARDLESS of an in-flight tool, so a
+   * hung-mid-tool turn can't pin the conversation forever. Ignored unless the
+   * defer is on; defaults to no ceiling (Infinity) when omitted.
+   */
+  fallbackHardCeiling?: number
 }
 
 export const DEFAULT_THRESHOLDS: ThresholdsMs = {
@@ -122,6 +140,21 @@ export interface SilencePokeDeps {
   thresholdsMs?: ThresholdsMs
   /** Poll interval (tests). */
   pollIntervalMs?: number
+  /**
+   * Fix A — when true, the 300s framework fallback is DEFERRED while a parent
+   * tool is genuinely in flight (`inFlightTools` non-empty): the agent is
+   * demonstrably working, and since #2162 the live activity feed shows that
+   * work, so nulling `currentTurn` (which the fallback does) would darken a feed
+   * the user is actively watching. The defer is bounded by
+   * `thresholdsMs.fallbackHardCeiling` so a hung-mid-tool turn still unwedges; a
+   * turn with NO in-flight tool fires at the base threshold exactly as before.
+   * Default false (legacy behaviour) — enable per-agent to canary.
+   *
+   * A crashed agent is recovered independently by the bridge-disconnect sweep
+   * (`onDanglingTurnsSwept`), so deferring here does not reintroduce the #1556
+   * dangling-turn wedge for the crash case.
+   */
+  deferFallbackWhileToolInFlight?: boolean
 }
 
 const state = new Map<string, SilencePokeState>()
@@ -366,6 +399,20 @@ function tick(now: number): void {
     if (silence < 0) continue
 
     if (!s.fallbackFired && silence >= thresholds.fallback) {
+      // Fix A: defer the unwedge while a parent tool is genuinely in flight —
+      // the agent is demonstrably working and the live activity feed is showing
+      // it, so firing here (which nulls currentTurn) would darken that feed
+      // mid-work. Bounded by the hard ceiling so a hung-mid-tool turn still
+      // unwedges. `continue` WITHOUT setting fallbackFired so the next tick
+      // re-checks — once the tool ends and the turn stays silent past the base
+      // threshold, or the ceiling is crossed, it fires normally.
+      if (
+        activeDeps.deferFallbackWhileToolInFlight === true &&
+        s.inFlightTools.size > 0 &&
+        silence < (thresholds.fallbackHardCeiling ?? Number.POSITIVE_INFINITY)
+      ) {
+        continue
+      }
       s.fallbackFired = true
       const { chatId, threadId } = parseKey(key)
       const recentThinking = s.lastThinkingAt != null
