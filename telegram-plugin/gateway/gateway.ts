@@ -1932,8 +1932,10 @@ function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
  * timestamps. This wrapper logs, per reply: which precedence tier won (`via`),
  * the resolved thread, the origin turn + its thread, and whether the reply was
  * late (turn already ended). `via=recovered` marks a late reply this fix saved
- * from General; `UNROUTED` flags a supergroup reply that still resolved to no
- * topic (the residual gap to watch).
+ * from General; `UNROUTED` flags a supergroup reply that resolved to no topic
+ * with NO owner turn to attribute it to (genuinely lost — the residual gap to
+ * watch). A General-topic turn legitimately has no thread, so its replies are
+ * NOT flagged.
  */
 function resolveAnswerThreadWithLog(
   chatId: string,
@@ -1971,7 +1973,12 @@ function resolveAnswerThreadWithLog(
     : 'none'
   const ownerTurn = originTurn ?? recovered ?? liveTurn
   const isSupergroup = chatId.startsWith('-100')
-  const unrouted = isSupergroup && threadId == null
+  // UNROUTED = a supergroup reply that resolved to NO topic with NO owner turn
+  // to attribute it to (genuinely lost). A General-topic turn legitimately has
+  // no thread, so a reply owned by it resolving to `-` is CORRECT, not lost —
+  // gate on `ownerTurn == null` so General replies don't false-alarm (found by
+  // the multi-topic UAT stress, 2026-06-05).
+  const unrouted = isSupergroup && threadId == null && ownerTurn == null
   process.stderr.write(
     `telegram gateway: reply-route surface=${surface} chat=${chatId} ` +
       `resolved_thread=${threadId ?? '-'} via=${via} late=${liveTurn == null} ` +
