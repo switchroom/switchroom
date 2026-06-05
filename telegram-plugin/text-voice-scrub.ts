@@ -12,13 +12,22 @@
  * owns enforcement, soft instructions fail under load. Make the
  * framework do it.
  *
- * Scope. Em / en dashes only. The wider "AI-tell phrase denylist"
- * (smoking gun, by design, etc.) was scoped OUT after data showed
- * those phrases land in <0.5% of fleet messages and substituting
- * them risks semantic loss. Em-dash → comma/period is a pure
- * mechanical transform with no semantic loss when the surrounding
- * text is whitespace-separated prose, and a no-op when the dash
- * is inside code or a URL.
+ * Scope. Two mechanical transforms, both semantically safe:
+ *   1. Em / en dashes -> comma/period/hyphen. Pure transform with no
+ *      semantic loss on whitespace-separated prose; a no-op inside code
+ *      or a URL.
+ *   2. Leading sycophancy openers ("You're absolutely right", "Great
+ *      catch", "Exactly right") -> deleted, next word recapitalized. A
+ *      leading pure-affirmation clause carries near-zero meaning, so
+ *      removing it strips the AI-tell without touching the substance.
+ *      Conservative by construction: only at the very start, only the
+ *      known affirmation set, only when real content follows (a
+ *      standalone "You're absolutely right!" ack is left intact).
+ *
+ * Still scoped OUT: the wider mid-sentence "AI-tell phrase denylist"
+ * (smoking gun, delve, etc.). Substituting those mid-clause risks
+ * semantic loss, so they stay with the prompt-side voice guidance
+ * (the turn-pacing VOICE directive), not this mechanical gate.
  *
  * Pipeline integration. Apply BEFORE markdownToHtml so the scrub
  * runs on the original model text, not on rendered HTML where
@@ -46,10 +55,17 @@ export interface VoiceScrubResult {
   /** The scrubbed text. Equal to input when no replacements made or
    *  when the kill switch is set. */
   scrubbed: string
-  /** Count of dash replacements made across the whole input. Surfaces
-   *  to the runtime-metrics fan-out so the cadence dashboard can track
-   *  fleet-wide voice-scrub rate over time. */
+  /** TOTAL voice changes across the whole input = dash replacements +
+   *  leading-affirmation strips. Callers gate on `replaced > 0` to decide
+   *  whether to apply `scrubbed`, so this MUST count every change (an
+   *  opener-only strip with zero dashes still needs `replaced > 0`).
+   *  Surfaces to the runtime-metrics fan-out as the fleet voice-scrub
+   *  rate. */
   replaced: number
+  /** Breakdown: leading sycophancy openers stripped (subset of
+   *  `replaced`). Lets the dashboard separate opener-strips from dash
+   *  fixes. */
+  openersStripped: number
 }
 
 const NULL = '\x00'
@@ -64,6 +80,44 @@ const URL_RE = /https?:\/\/\S+/g
 function enabled(): boolean {
   const v = process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
   return !(v === '1' || v === 'true')
+}
+
+/**
+ * Leading sycophancy/affirmation openers. Matched ONLY at the very start
+ * of the message, ONLY this known pure-filler set, and the trailing
+ * punctuation/separators (incl. em/en dash) are consumed with it.
+ *
+ * Deliberately excludes bare "you're right" (often load-bearing, e.g.
+ * "you're right that X") and "great/good question" (overlaps the
+ * legitimate short-ack pattern). Kept to phrases whose only content is
+ * the affirmation itself. Apostrophe matches straight or curly.
+ *
+ * The affirmation must be followed by end-of-string OR a clause/sentence
+ * separator (punctuation, possibly with surrounding whitespace) — NOT a
+ * bare space into more words. This is what stops over-strips like
+ * "Spot on the map shows...", "Good catch basin overflow...", "Exactly
+ * right now, the count is 3" — there the phrase is a literal sentence
+ * start, not a detachable affirmation. "Spot on, the value is 5" (comma)
+ * still strips.
+ */
+const LEADING_AFFIRMATION_RE =
+  /^(\s*)(you(?:['’]| a)re absolutely right|you(?:['’]| a)re so right|you(?:['’]| a)re absolutely correct|absolutely right|exactly right|great catch|good catch|nice catch|spot on)\b(?:\s*$|\s*[!.,;:—–-][\s!.,;:—–-]*)/i
+
+/**
+ * Strip a single leading affirmation opener and recapitalize the next
+ * word. No-op (count 0) when there's no match, or when stripping would
+ * leave no substantive content (a standalone affirmation ack survives).
+ */
+function stripLeadingAffirmation(text: string): { out: string; count: number } {
+  const m = LEADING_AFFIRMATION_RE.exec(text)
+  if (!m) return { out: text, count: 0 }
+  const leadingWs = m[1] ?? ''
+  const rest = text.slice(m[0].length)
+  if (rest.trim().length === 0) return { out: text, count: 0 }
+  // Recapitalize the first alphabetic char of the remainder so the new
+  // opening word reads as a sentence start.
+  const recapped = rest.replace(/^(\s*)([a-z])/, (_m, ws: string, ch: string) => ws + ch.toUpperCase())
+  return { out: leadingWs + recapped, count: 1 }
 }
 
 /**
@@ -179,8 +233,13 @@ function replaceDashes(text: string): { out: string; replaced: number } {
 }
 
 /**
- * Public entry: scrub em / en dashes from outbound text while
- * preserving dashes inside code and URLs.
+ * Public entry: strip a leading sycophancy opener and scrub em/en dashes
+ * from outbound text, preserving anything inside code and URLs.
+ *
+ * Order: park code/URLs -> strip leading affirmation -> replace dashes ->
+ * restore. The opener strip runs on parked text so it can never touch a
+ * code region, and before the dash pass so a dash trailing the opener is
+ * consumed by the strip rather than converted.
  *
  * Pure: no IO, no module-scope state, deterministic. Kill switch is
  * checked per call so an operator can flip it via env var without a
@@ -188,12 +247,14 @@ function replaceDashes(text: string): { out: string; replaced: number } {
  */
 export function scrubVoice(text: string): VoiceScrubResult {
   if (!enabled() || text.length === 0) {
-    return { scrubbed: text, replaced: 0 }
+    return { scrubbed: text, replaced: 0, openersStripped: 0 }
   }
   const { parked, parts } = park(text)
-  const { out, replaced } = replaceDashes(parked)
-  if (replaced === 0) {
-    return { scrubbed: text, replaced: 0 }
+  const opener = stripLeadingAffirmation(parked)
+  const { out, replaced } = replaceDashes(opener.out)
+  const total = replaced + opener.count
+  if (total === 0) {
+    return { scrubbed: text, replaced: 0, openersStripped: 0 }
   }
-  return { scrubbed: restore(out, parts), replaced }
+  return { scrubbed: restore(out, parts), replaced: total, openersStripped: opener.count }
 }

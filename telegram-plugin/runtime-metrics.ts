@@ -124,7 +124,7 @@ export type RuntimeMetricEvent =
    * losing ground; a per-agent spike is prompt drift on that agent.
    *
    *   chatKey   → `<chatId>:<threadIdOrEmpty>` (statusKey shape)
-   *   replaced  → count of dashes rewritten in this single message
+   *   replaced  → total voice changes in this message (dash rewrites + leading-affirmation strips)
    *   site      → which reply path saw the scrub (executeReply / edit / answer-stream)
    */
   | {

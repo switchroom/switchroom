@@ -2502,6 +2502,42 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(cmd).toMatch(/No reply tool call = the user got nothing/);
   });
 
+  it("turn-pacing directive carries the grounding + voice contract (fleet-wide)", () => {
+    // Grounding: agents must validate volatile facts from a live source
+    // this turn, not assert from memory/training (the stale-fact failure).
+    // Voice: no sycophancy openers / AI-tell filler. Both ride the
+    // per-turn directive so they reach EVERY agent (incl. custom-CLAUDE.md
+    // agents) fresh each turn, not just the static fleet-invariants file.
+    const agentConfig = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "ground-agent": agentConfig },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "ground-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const cmd = (settings.hooks.UserPromptSubmit as Array<{
+      hooks: Array<{ command: string }>;
+    }>)
+      .flatMap((g) => g.hooks)
+      .find((h) => h.command.includes("turn-pacing"))!.command;
+    // Grounding contract
+    expect(cmd).toMatch(/GROUND BEFORE YOU ASSERT/);
+    expect(cmd).toMatch(/checked\s+THIS turn/);
+    expect(cmd).toMatch(/leads to verify, not sources/);
+    // Voice contract
+    expect(cmd).toMatch(/VOICE: write like a sharp colleague/);
+    expect(cmd).toMatch(/Do not open with affirmation/);
+  });
+
   it("unions defaults.hooks with per-agent hooks", () => {
     const agentConfig = makeAgentConfig({
       hooks: {

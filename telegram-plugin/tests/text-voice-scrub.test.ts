@@ -172,3 +172,92 @@ describe('scrubVoice — em / en dash replacement', () => {
     })
   })
 })
+
+describe('scrubVoice — leading sycophancy openers', () => {
+  beforeEach(() => {
+    delete process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
+  })
+  afterEach(() => {
+    delete process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
+  })
+
+  it('strips a leading "You\'re absolutely right" and recapitalizes', () => {
+    const r = scrubVoice("You're absolutely right, the build is broken.")
+    expect(r.scrubbed).toBe('The build is broken.')
+    expect(r.openersStripped).toBe(1)
+    expect(r.replaced).toBeGreaterThan(0) // total counts the opener
+  })
+
+  it('strips the affirmation even when only an opener changed (no dashes)', () => {
+    // Regression: the gateway gates on `replaced > 0`; an opener-only
+    // strip MUST still report replaced > 0 or the scrub is discarded.
+    const r = scrubVoice('Great catch! I fixed the off-by-one.')
+    expect(r.scrubbed).toBe('I fixed the off-by-one.')
+    expect(r.replaced).toBe(1)
+    expect(r.openersStripped).toBe(1)
+  })
+
+  it('consumes a trailing em-dash after the opener (no leftover dash)', () => {
+    const r = scrubVoice('Exactly right — the token had expired.')
+    expect(r.scrubbed).toBe('The token had expired.')
+    expect(r.openersStripped).toBe(1)
+  })
+
+  it('handles curly apostrophe and "you are" form', () => {
+    expect(scrubVoice('You’re absolutely right. Done.').scrubbed).toBe('Done.')
+    expect(scrubVoice('You are absolutely right, done.').scrubbed).toBe('Done.')
+  })
+
+  it('leaves a standalone affirmation ack intact (no content follows)', () => {
+    const r = scrubVoice("You're absolutely right!")
+    expect(r.scrubbed).toBe("You're absolutely right!")
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('does NOT strip bare "you\'re right" (often load-bearing)', () => {
+    const r = scrubVoice("You're right that the config drifted.")
+    expect(r.scrubbed).toBe("You're right that the config drifted.")
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('does NOT strip an affirmation mid-message', () => {
+    const r = scrubVoice('I checked the logs. Great catch on the typo.')
+    expect(r.scrubbed).toBe('I checked the logs. Great catch on the typo.')
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('does NOT over-strip when the phrase is a literal sentence start (no separator)', () => {
+    // The affirmation must be followed by a separator/end, not a bare
+    // space into more words — otherwise "Spot on the map..." loses "Spot
+    // on". These are real sentences, not detachable affirmations.
+    for (const s of [
+      'Spot on the map shows three sites.',
+      'Good catch basin overflow is the root cause.',
+      'Exactly right now, the count is 3.',
+      'Absolutely right turns are banned on that road.',
+    ]) {
+      const r = scrubVoice(s)
+      expect(r.scrubbed, s).toBe(s)
+      expect(r.openersStripped, s).toBe(0)
+    }
+  })
+
+  it('still strips when a separator follows (comma / period / dash)', () => {
+    expect(scrubVoice('Spot on, the value is 5.').scrubbed).toBe('The value is 5.')
+    expect(scrubVoice('Good catch. Fixed it.').scrubbed).toBe('Fixed it.')
+  })
+
+  it('does not touch an opener-like phrase inside code', () => {
+    const r = scrubVoice('`spot on` is the variable name. Here is the value.')
+    expect(r.scrubbed).toContain('`spot on`')
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('kill switch disables opener strip too', () => {
+    process.env.SWITCHROOM_DISABLE_VOICE_SCRUB = '1'
+    const r = scrubVoice("You're absolutely right, the build is broken.")
+    expect(r.scrubbed).toBe("You're absolutely right, the build is broken.")
+    expect(r.replaced).toBe(0)
+    expect(r.openersStripped).toBe(0)
+  })
+})
