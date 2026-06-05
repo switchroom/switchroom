@@ -4153,7 +4153,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     'tool sequence (scheduling, multi-step research, sub-agent handback), ' +
     'do not let your closing narration stand as the answer: end the turn ' +
     'by passing that narration to the reply tool. No reply tool call = the ' +
-    'user got nothing, however much text you wrote.</turn-pacing>';
+    'user got nothing, however much text you wrote. Call the reply tool as ' +
+    'your FIRST action when you have the answer — do not write it out as ' +
+    'transcript text first and call reply afterward: a framework backstop ' +
+    'flushes unsent text after a delay and then your real reply lands late ' +
+    'and out of order.</turn-pacing>';
   const switchroomUserPromptSubmit: Array<Record<string, unknown>> = [
     ...(useHotReloadStable
       ? [

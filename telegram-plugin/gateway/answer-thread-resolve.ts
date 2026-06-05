@@ -26,10 +26,14 @@
  *   3. Else the LIVE turn's thread — but ONLY when the live turn IS the
  *      origin turn (no flip happened) OR no origin turn could be resolved
  *      at all (origin id absent/unknown; legacy / pre-stamp path).
- *   4. Else (origin resolved AND it differs from the live turn) we pin to
- *      the origin thread and explicitly DO NOT fall through to the chat's
- *      last-seen `chatThreadMap` thread. For answer surfaces the chat
- *      last-seen heuristic is exactly what produced the wrong-topic bug.
+ *   4. Else (no explicit, no origin echoed, no live turn) — a LATE reply that
+ *      fired after its turn already ended (the orphaned-reply backstop case) —
+ *      recover the origin topic from the most-recently-ended turn for this
+ *      chat. Without this, such a reply defaults to the main chat (General in a
+ *      supergroup) and its answer vanishes from the topic the user is reading
+ *      (the 2026-06-05 marko triage). Still NOT the `chatThreadMap` last-seen
+ *      heuristic — the recovered turn is the chat's own most-recent turn, not
+ *      whichever topic last received any message.
  *
  * The `chatThreadMap` last-seen fallback is preserved for NON-answer
  * surfaces (`send_typing`, `forward_message`, `progress_update`) by NOT
@@ -53,6 +57,20 @@ export interface AnswerThreadInput {
    *  (no live turn, or a DM live turn). The legacy (#1664) fallback when
    *  no origin turn is resolvable. */
   liveThreadId?: number | undefined
+  /**
+   * Late-reply topic recovery (2026-06-05). Thread of the most-recently-ended
+   * turn for THIS chat (from `recentTurnsById`), used as a deterministic
+   * fallback when the model echoed no `origin_turn_id` AND there is no live
+   * turn — the late-reply-after-turn-end case. Without it, a reply that fires
+   * after the orphaned-reply backstop closed its turn defaults to the main chat
+   * (General topic in a supergroup), so its answer vanishes from the topic the
+   * user is reading. Only consulted at tier (4); a DM origin yields undefined,
+   * which is correct.
+   */
+  lastEndedThreadIdForChat?: number | undefined
+  /** Whether a recently-ended turn exists for this chat — distinguishes
+   *  "ended turn exists, DM (thread undefined)" from "no ended turn at all". */
+  lastEndedResolvedForChat?: boolean
 }
 
 /**
@@ -75,5 +93,13 @@ export function resolveAnswerThreadId(input: AnswerThreadInput): number | undefi
   if (input.originResolved) return input.originThreadId
   // (3) no origin resolved (legacy / pre-stamp / evicted) → fall back to
   //     the live turn's thread, the existing turn-pinned behaviour (#1664).
+  if (input.liveThreadId != null) return input.liveThreadId
+  // (4) no explicit, no origin echoed, no live turn — a LATE reply that fired
+  //     after its turn already ended (the orphaned-reply backstop case).
+  //     Recover the origin topic from the most-recently-ended turn for this
+  //     chat so the answer lands in the topic it belongs to instead of
+  //     defaulting to the main chat (General). When no ended turn is known,
+  //     fall through to liveThreadId (undefined) — the legacy result.
+  if (input.lastEndedResolvedForChat) return input.lastEndedThreadIdForChat
   return input.liveThreadId
 }
