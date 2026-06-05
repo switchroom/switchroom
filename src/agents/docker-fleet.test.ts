@@ -84,7 +84,7 @@ describe("bringUpAgentService", () => {
     });
   });
 
-  it("recreates broker + kernel then brings up agent — three compose calls in fixed order (#1017)", () => {
+  it("recreates broker + kernel + auth-broker then brings up agent — four compose calls in fixed order (#1017)", () => {
     const home = mkdtempSync(join(tmpdir(), "docker-fleet-"));
     (execFileSync as any).mockReturnValue(Buffer.from(""));
 
@@ -96,11 +96,12 @@ describe("bringUpAgentService", () => {
       stdio: "ignore",
     });
 
-    // Order matters: the two singletons must be recreated BEFORE the
-    // new agent comes online so their per-agent socket-dir mounts
-    // include the new agent's subdir. See #1017 for the bug this
-    // ordering fixes.
-    expect(execFileSync).toHaveBeenCalledTimes(3);
+    // Order matters: all THREE singletons (vault-broker, approval-kernel,
+    // switchroom-auth-broker) must be recreated BEFORE the new agent comes
+    // online so their per-agent socket-dir mounts include the new agent's
+    // subdir. See #1017 for the bug this ordering fixes. auth-broker was
+    // added to close the same gap for OAuth-credential sockets.
+    expect(execFileSync).toHaveBeenCalledTimes(4);
     const composePath = resolve(home, "compose", "docker-compose.yml");
     const callArgs = (execFileSync as any).mock.calls.map(
       (c: [string, string[], unknown]) => c[1],
@@ -126,6 +127,16 @@ describe("bringUpAgentService", () => {
       "approval-kernel",
     ]);
     expect(callArgs[2]).toEqual([
+      "compose",
+      "-f",
+      composePath,
+      "up",
+      "-d",
+      "--no-deps",
+      "--force-recreate",
+      "switchroom-auth-broker",
+    ]);
+    expect(callArgs[3]).toEqual([
       "compose",
       "-f",
       composePath,
