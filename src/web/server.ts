@@ -30,6 +30,8 @@ import {
   handleUseAccount,
   handleGetSystemHealth,
   handleGetGoogleAccounts,
+  handleGetMicrosoftAccounts,
+  handleGetNotionWorkspace,
   handleGetSchedule,
   handleGetApprovals,
 } from "./api.js";
@@ -377,6 +379,16 @@ function parseRoute(
     return { handler: "getGoogleAccounts", params: {} };
   }
 
+  // GET /api/microsoft-accounts
+  if (method === "GET" && pathname === "/api/microsoft-accounts") {
+    return { handler: "getMicrosoftAccounts", params: {} };
+  }
+
+  // GET /api/notion-workspace
+  if (method === "GET" && pathname === "/api/notion-workspace") {
+    return { handler: "getNotionWorkspace", params: {} };
+  }
+
   // GET /api/schedule
   if (method === "GET" && pathname === "/api/schedule") {
     return { handler: "getSchedule", params: {} };
@@ -578,6 +590,13 @@ export function startWebServer(
           case "getGoogleAccounts":
             return (async () =>
               jsonResponse(await handleGetGoogleAccounts(config)))();
+
+          case "getMicrosoftAccounts":
+            return (async () =>
+              jsonResponse(await handleGetMicrosoftAccounts(config)))();
+
+          case "getNotionWorkspace":
+            return jsonResponse(handleGetNotionWorkspace(config));
 
           case "getSchedule":
             return jsonResponse(handleGetSchedule(config));
