@@ -755,12 +755,12 @@ describe("handleGetNotionWorkspace", () => {
       ...mockConfig,
       notion_workspace: {
         vault_key: "notion/integration-token",
-        databases: { crm: "uuid-crm-1234", hr: "uuid-hr-5678" },
+        databases: { crm: "11111111-1111-1111-1111-111111111111", hr: "22222222-2222-2222-2222-222222222222" },
       },
       agents: {
         marko: { notion_workspace: { databases: ["crm"] } },
         clerk: { notion_workspace: { databases: ["crm", "hr"] } },
-        ziggy: {},
+        ziggy: {}, // no notion_workspace block → no access at all
       },
     } as unknown as SwitchroomConfig;
     const out = handleGetNotionWorkspace(cfg);
@@ -769,8 +769,55 @@ describe("handleGetNotionWorkspace", () => {
     const byName = Object.fromEntries(out.databases.map((d) => [d.name, d]));
     expect(byName.crm.enabledFor).toEqual(["clerk", "marko"]);
     expect(byName.hr.enabledFor).toEqual(["clerk"]);
-    // The token itself is never returned — only the vault key reference.
-    expect(JSON.stringify(out)).not.toContain("token-value");
+    // ziggy (no notion_workspace block) reaches nothing.
+    expect(out.fullAccessAgents).toEqual([]);
+  });
+
+  it("credits a no-filter agent (notion_workspace:{}) as full-access on EVERY database", () => {
+    // The bug the reviewer caught: an admin/orchestrator agent with an
+    // empty notion_workspace block has full access per the runtime ACL,
+    // but the naive enabledFor scan missed it.
+    const cfg = {
+      ...mockConfig,
+      notion_workspace: {
+        vault_key: "notion/integration-token",
+        databases: { crm: "11111111-1111-1111-1111-111111111111", hr: "22222222-2222-2222-2222-222222222222" },
+      },
+      agents: {
+        orchestrator: { notion_workspace: {} }, // no databases filter → ALL
+        scoped: { notion_workspace: { databases: ["crm"] } },
+      },
+    } as unknown as SwitchroomConfig;
+    const out = handleGetNotionWorkspace(cfg);
+    const byName = Object.fromEntries(out.databases.map((d) => [d.name, d]));
+    // orchestrator appears on BOTH databases; scoped only on crm.
+    expect(byName.crm.enabledFor).toEqual(["orchestrator", "scoped"]);
+    expect(byName.hr.enabledFor).toEqual(["orchestrator"]);
+    // ...and is surfaced as a full-access agent for the UI.
+    expect(out.fullAccessAgents).toEqual(["orchestrator"]);
+  });
+
+  it("never returns the Notion token, only its vault key reference", () => {
+    const cfg = {
+      ...mockConfig,
+      notion_workspace: {
+        vault_key: "notion/integration-token",
+        databases: { crm: "11111111-1111-1111-1111-111111111111" },
+      },
+      agents: { marko: { notion_workspace: { databases: ["crm"] } } },
+    } as unknown as SwitchroomConfig;
+    const out = handleGetNotionWorkspace(cfg);
+    // The shape exposes vault_key (a reference) but no token field at all.
+    expect(out.vaultKey).toBe("notion/integration-token");
+    const serialized = JSON.stringify(out);
+    expect(serialized).not.toMatch(/secret|token["']?\s*:/i);
+    // Only the declared keys exist — no token-bearing field leaked in.
+    expect(Object.keys(out).sort()).toEqual([
+      "configured",
+      "databases",
+      "fullAccessAgents",
+      "vaultKey",
+    ]);
   });
 });
 

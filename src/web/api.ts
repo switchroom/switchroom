@@ -34,6 +34,10 @@ import type { ApprovalDecisionMeta } from "../vault/broker/protocol.js";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import {
+  agentCanAccessNotionDB,
+  shouldEmitNotionMcp,
+} from "../config/notion-workspace-acl.js";
 import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import {
   AuthBrokerError,
@@ -772,16 +776,27 @@ export interface NotionWorkspaceDashboard {
   vaultKey: string | null;
   /** Declared friendly-name → id databases with their agent grants. */
   databases: NotionDatabaseInfo[];
+  /**
+   * Agents with UNRESTRICTED Notion access (a `notion_workspace:` block
+   * with no `databases` filter → every DB the integration can see). They
+   * also appear in each database's `enabledFor`, but are surfaced here
+   * so the UI can render "full access" once instead of in every row.
+   */
+  fullAccessAgents: string[];
 }
 
 /**
  * Notion workspace view for the dashboard. Unlike Google/Microsoft,
  * Notion has no per-account concept (one operator-owned internal
  * integration token); access is per-DATABASE via each agent's
- * `notion_workspace.databases` friendly-name list. This surfaces the
- * declared databases and, for each, which agents are granted it — the
- * "which agents can reach Notion (and which DBs)" answer. The token
- * itself never leaves the vault and is never returned here.
+ * `notion_workspace.databases` friendly-name list — OR unrestricted when
+ * an agent has a `notion_workspace:` block with no `databases` filter.
+ * This surfaces the declared databases and, for each, which agents are
+ * granted it — the "which agents can reach Notion (and which DBs)"
+ * answer. Per-DB grants are computed via the canonical
+ * `agentCanAccessNotionDB` so the dashboard exactly matches runtime
+ * authorization (including the empty-filter = full-access case). The
+ * token itself never leaves the vault and is never returned here.
  */
 export function handleGetNotionWorkspace(
   config: SwitchroomConfig,
@@ -792,27 +807,41 @@ export function handleGetNotionWorkspace(
     }
   ).notion_workspace;
   if (!nw) {
-    return { configured: false, vaultKey: null, databases: [] };
+    return { configured: false, vaultKey: null, databases: [], fullAccessAgents: [] };
   }
   const declared = nw.databases ?? {};
-  // Index agent grants: agent → set of friendly DB names it may use.
-  const agents = (config.agents ?? {}) as Record<
-    string,
-    { notion_workspace?: { databases?: string[] } }
-  >;
+  const agentNames = Object.keys(config.agents ?? {});
+
   const databases: NotionDatabaseInfo[] = Object.entries(declared)
     .map(([name, id]) => {
-      const enabledFor = Object.entries(agents)
-        .filter(([, a]) => (a.notion_workspace?.databases ?? []).includes(name))
-        .map(([n]) => n)
+      // Canonical ACL — credits both explicit-filter and full-access
+      // (no-filter) agents, exactly as runtime authorization does.
+      const enabledFor = agentNames
+        .filter((n) => agentCanAccessNotionDB(config, n, id))
         .sort();
       return { name, id, enabledFor };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+
+  // Full-access agents: a notion_workspace block present (gate) with no
+  // databases filter. These reach every DB the integration can see.
+  const agentsRaw = (config.agents ?? {}) as Record<
+    string,
+    { notion_workspace?: { databases?: string[] } }
+  >;
+  const fullAccessAgents = agentNames
+    .filter((n) => {
+      if (!shouldEmitNotionMcp(n, config)) return false;
+      const dbs = agentsRaw[n]?.notion_workspace?.databases;
+      return dbs === undefined || dbs.length === 0;
+    })
+    .sort();
+
   return {
     configured: true,
     vaultKey: nw.vault_key ?? null,
     databases,
+    fullAccessAgents,
   };
 }
 

@@ -1068,13 +1068,20 @@
           </div>`;
         }).join('');
       }
-      const notionSection = _connectionSection(
-        'Notion' + (notion.configured && notion.vaultKey ? ` <span style="text-transform:none;font-weight:400">· token <code>${escapeHtml(notion.vaultKey)}</code></span>` : ''),
-        notion.configured
-          ? 'Notion configured but no databases declared. Add them under <code>notion_workspace.databases:</code>.'
-          : 'Notion not configured. See <code>docs/notion-integration.md</code>.',
-        notionCards,
-      );
+      const notionTitle = 'Notion' + (notion.configured && notion.vaultKey ? ` <span style="text-transform:none;font-weight:400">· token <code>${escapeHtml(notion.vaultKey)}</code></span>` : '');
+      const fullAccessBanner = (notion.fullAccessAgents && notion.fullAccessAgents.length)
+        ? `<div style="margin:0 0 .6rem;font-size:.85rem;color:var(--text-dim)">Full access (all databases): ${notion.fullAccessAgents.map(escapeHtml).join(', ')}</div>`
+        : '';
+      const notionBody = notionCards
+        ? `<div class="accounts-grid">${notionCards}</div>`
+        : `<div class="loading" style="padding:.8rem">${notion.configured
+            ? 'Notion configured but no databases declared. Add them under <code>notion_workspace.databases:</code>.'
+            : 'Notion not configured. See <code>docs/notion-integration.md</code>.'}</div>`;
+      const notionSection = `
+        <div style="margin-bottom:1.5rem">
+          <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">${notionTitle}</h3>
+          ${fullAccessBanner}${notionBody}
+        </div>`;
 
       container.innerHTML = googleSection + microsoftSection + notionSection;
     }
