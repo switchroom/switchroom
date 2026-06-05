@@ -8,6 +8,10 @@ import { resolveAgentConfig } from "../config/merge.js";
 import { loadConfig } from "../config/loader.js";
 import { sendAgentInterrupt } from "./tmux.js";
 import { resolveSwitchroomHome } from "./docker-fleet.js";
+import {
+  reconcileSingletons,
+  type ReconcileResult,
+} from "./singleton-reconcile.js";
 
 /**
  * Resolve the per-agent gateway clean-shutdown marker path.
@@ -131,10 +135,26 @@ function serviceKey(name: string): string {
  * Resolve the compose file path. Allows `SWITCHROOM_COMPOSE_FILE` to
  * override for tests / non-default installs.
  */
-function composeFilePath(): string {
+export function composeFilePath(): string {
   const override = process.env.SWITCHROOM_COMPOSE_FILE;
   if (override && override.length > 0) return override;
   return resolve(resolveSwitchroomHome(), "compose", "docker-compose.yml");
+}
+
+/**
+ * Recreate any singleton (vault-broker / approval-kernel /
+ * switchroom-auth-broker) whose running image drifted from the
+ * compose-pinned image. Best-effort, drift-aware (a no-op when in sync),
+ * and safe to call before a per-agent restart loop so the documented
+ * staggered-rollout recipe self-heals stale singletons after a pin bump
+ * (see `singleton-reconcile.ts` for the incident this closes). Recreates
+ * the brokers FIRST (this runs before the agent loop) so agents reconnect
+ * to fresh singletons.
+ */
+export function reconcileSingletonImages(
+  log?: (msg: string) => void,
+): ReconcileResult {
+  return reconcileSingletons({ composeFile: composeFilePath(), log });
 }
 
 /**

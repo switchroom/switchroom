@@ -24,9 +24,23 @@
 
 import { readFileSync } from "node:fs";
 import { allocateAgentUid, describeAgents } from "../agents/compose.js";
+import {
+  detectSingletonDrift,
+  type SingletonReconcileDeps,
+} from "../agents/singleton-reconcile.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 import type { CheckStatus } from "./doctor-status.js";
+
+/** Extract the `:tag` from an image ref for compact drift messages. */
+function imageTagOf(ref: string | null): string {
+  if (!ref) return "<absent>";
+  const at = ref.lastIndexOf("@"); // strip digest if present
+  const base = at >= 0 ? ref.slice(0, at) : ref;
+  const colon = base.lastIndexOf(":");
+  const slash = base.lastIndexOf("/");
+  return colon > slash ? base.slice(colon + 1) : ref;
+}
 
 export interface CheckResult {
   name: string;
@@ -214,6 +228,47 @@ export function checkDockerfileUserAlignment(
 }
 
 /**
+ * Detect singletons (vault-broker / approval-kernel /
+ * switchroom-auth-broker) running an image older than the
+ * compose-pinned one. This is the check that would have caught the
+ * 2026-06-05 incident (auth-broker 42 versions stale → /connect
+ * microsoft failed) before a feature broke. Reads running images via
+ * `docker inspect`; degrades to "ok" if docker is unreachable (running
+ * resolves to null → not flagged). The `inspectImage` dep is injectable
+ * for tests.
+ */
+export function checkSingletonImageDrift(
+  composeYaml: string,
+  deps?: Pick<SingletonReconcileDeps, "inspectImage">,
+): CheckResult {
+  const drift = detectSingletonDrift({
+    composeFile: "(in-memory)",
+    readCompose: () => composeYaml,
+    inspectImage: deps?.inspectImage,
+  });
+  // Only flag singletons that are RUNNING a stale image; an absent
+  // container is "down", which the per-singleton health checks own.
+  const stale = drift.filter((d) => d.needsRecreate && d.running !== null);
+  if (stale.length === 0) {
+    return {
+      name: "singleton image drift",
+      status: "ok",
+      detail: "vault-broker / approval-kernel / auth-broker match the pinned image",
+    };
+  }
+  return {
+    name: "singleton image drift",
+    status: "warn",
+    detail:
+      "singleton(s) running an image older than the pin: " +
+      stale
+        .map((d) => `${d.service} ${imageTagOf(d.running)}≠${imageTagOf(d.pinned)}`)
+        .join(", "),
+    fix: "Recreate them — `switchroom agent restart <any-agent>` now self-heals stale singletons, or `switchroom update` (whole-project recreate).",
+  };
+}
+
+/**
  * Aggregate runner — call from doctor.ts. Always returns an array so
  * the section renders consistently.
  */
@@ -235,6 +290,7 @@ export function runDockerChecks(args: {
   out.push(checkAgentCaps(args.config));
   if (args.composeYaml) {
     out.push(checkAgentSocketMounts(args.composeYaml));
+    out.push(checkSingletonImageDrift(args.composeYaml));
     if (args.dockerfileAgent) {
       out.push(checkDockerfileUserAlignment(args.composeYaml, args.dockerfileAgent));
     }

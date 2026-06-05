@@ -8,6 +8,7 @@ import {
   checkAgentSocketMounts,
   checkAgentCaps,
   checkDockerfileUserAlignment,
+  checkSingletonImageDrift,
   runDockerChecks,
 } from "../../src/cli/doctor-docker.js";
 import { generateCompose, allocateAgentUid } from "../../src/agents/compose.js";
@@ -164,5 +165,61 @@ describe("runDockerChecks", () => {
     const r = runDockerChecks({ config: makeConfig({ a: {} }), active: true });
     const composeCheck = r.find((c) => c.name === "compose file present");
     expect(composeCheck?.status).toBe("warn");
+  });
+});
+
+describe("checkSingletonImageDrift", () => {
+  const COMPOSE = `
+services:
+  vault-broker:
+    image: ghcr.io/switchroom/switchroom-broker:v0.14.66
+  approval-kernel:
+    image: ghcr.io/switchroom/switchroom-kernel:v0.14.66
+  switchroom-auth-broker:
+    image: ghcr.io/switchroom/switchroom-auth-broker:v0.14.66
+`;
+
+  it("ok when every singleton matches the pinned image", () => {
+    const r = checkSingletonImageDrift(COMPOSE, {
+      inspectImage: (c) =>
+        ({
+          "switchroom-vault-broker": "ghcr.io/switchroom/switchroom-broker:v0.14.66",
+          "switchroom-approval-kernel": "ghcr.io/switchroom/switchroom-kernel:v0.14.66",
+          "switchroom-auth-broker": "ghcr.io/switchroom/switchroom-auth-broker:v0.14.66",
+        })[c] ?? null,
+    });
+    expect(r.status).toBe("ok");
+  });
+
+  it("warns and names the stale singleton + tags (the live incident)", () => {
+    const r = checkSingletonImageDrift(COMPOSE, {
+      inspectImage: (c) =>
+        c === "switchroom-auth-broker"
+          ? "ghcr.io/switchroom/switchroom-auth-broker:v0.14.24"
+          : ({
+              "switchroom-vault-broker": "ghcr.io/switchroom/switchroom-broker:v0.14.66",
+              "switchroom-approval-kernel": "ghcr.io/switchroom/switchroom-kernel:v0.14.66",
+            })[c] ?? null,
+    });
+    expect(r.status).toBe("warn");
+    expect(r.detail).toContain("switchroom-auth-broker");
+    expect(r.detail).toContain("v0.14.24");
+    expect(r.detail).toContain("v0.14.66");
+    expect(r.fix).toContain("agent restart");
+  });
+
+  it("ok (degrades gracefully) when docker is unreachable — running resolves null", () => {
+    const r = checkSingletonImageDrift(COMPOSE, { inspectImage: () => null });
+    // Absent containers are "down" (owned by health checks), not "drift".
+    expect(r.status).toBe("ok");
+  });
+
+  it("is wired into runDockerChecks when compose is present", () => {
+    const out = runDockerChecks({
+      config: makeConfig({ a: {} }),
+      composeYaml: COMPOSE,
+      active: true,
+    });
+    expect(out.some((c) => c.name === "singleton image drift")).toBe(true);
   });
 });

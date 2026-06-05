@@ -139,8 +139,14 @@ export function bringUpAgentService(
   // but the broker never binds the matching socket, so every vault
   // operation from the new agent fails with `VAULT-BROKER-DENIED:
   // broker not running` (#1017). `--no-deps` keeps us from recursively
-  // bouncing other agents (only the broker + kernel are touched).
-  for (const svc of ["vault-broker", "approval-kernel"] as const) {
+  // bouncing other agents (only the singletons are touched).
+  // switchroom-auth-broker is included alongside vault-broker +
+  // approval-kernel: it has the same per-agent socket-dir enumeration
+  // (#1017), so a newly-added agent's /run/switchroom/auth-broker/<agent>
+  // socket isn't bound until the auth-broker is recreated — omitting it
+  // strands the new agent's OAuth-credential reads the same way the
+  // vault-broker omission once stranded vault reads.
+  for (const svc of ["vault-broker", "approval-kernel", "switchroom-auth-broker"] as const) {
     execFileSync(
       dockerBin,
       [
