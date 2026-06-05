@@ -6,6 +6,7 @@ import {
   DRAFT_METHOD_UNAVAILABLE_RE,
   DRAFT_CHAT_UNSUPPORTED_RE,
 } from '../answer-stream.js'
+import { resolveAnswerLaneConfig, ANSWER_LANE_NEVER_OPENS } from '../answer-stream-flag.js'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -90,6 +91,35 @@ describe('answer-stream — minInitialChars threshold', () => {
     // 200 chars < 400 threshold
     stream.update('x'.repeat(200))
     vi.advanceTimersByTime(1000)
+    await flushMicrotasks()
+
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(editMessageText).not.toHaveBeenCalled()
+  })
+
+  it('FLASH REGRESSION: the DORMANT config (visible off, draft retired) sends NOTHING, even for a full answer', async () => {
+    // End-to-end proof that the resolved default config produces no visible
+    // preview → nothing to retract → no flash. Wires the ACTUAL resolver output
+    // (not a hand-picked threshold) into the stream.
+    const lane = resolveAnswerLaneConfig({ visibleEnabled: false, draftFnAvailable: false })
+    expect(lane.state).toBe('dormant')
+    expect(lane.minInitialChars).toBe(ANSWER_LANE_NEVER_OPENS)
+
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      isPrivateChat: false,
+      minInitialChars: lane.minInitialChars,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+      // no sendMessageDraft — dormant lane has no transport
+    })
+
+    // A realistic full answer — 2000 chars, far above any normal threshold.
+    stream.update('The answer is '.repeat(150))
+    vi.advanceTimersByTime(5000)
     await flushMicrotasks()
 
     expect(sendMessage).not.toHaveBeenCalled()
