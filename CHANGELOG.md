@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.14.66 — Late replies land in their own topic (#2166)
+
+Follow-up to the v0.14.65 status work, from a live marko triage: in a forum
+supergroup, a reply that fired *after* the orphaned-reply backstop ended its
+turn lost its topic and landed in **General** — so the answer vanished from the
+topic the user was reading (an out-of-order / "missing message" feel). Routing
+had depended on the model echoing `origin_turn_id`, which it does
+inconsistently.
+
+- **Deterministic late-reply topic recovery.** New precedence tier in the
+  answer-thread resolver: when there's no explicit thread, no echoed origin,
+  AND no live turn, recover the origin topic from the most-recently-ended turn
+  for that chat. No model echo required. Kill switch:
+  `SWITCHROOM_LATE_REPLY_TOPIC_RECOVERY=0`.
+- **`reply-route` telemetry.** One log line per answer reply — which precedence
+  tier won, the resolved thread, the origin turn, and whether the reply was
+  late — with `RECOVERED` (a late reply saved from General) and `UNROUTED` (a
+  supergroup reply that still resolved to no topic) markers. The reply-routing
+  blind spot the triage exposed is now a one-line grep.
+- **Turn-pacing directive** reinforced: call the reply tool as the first action
+  when you have the answer, so the backstop never has to flush late.
+
 ## v0.14.65 — Live status surface: stop the dark feed (#2162 + #2163 + #2164)
 
 Fixes the "status went dark" incident (marko, supergroup): the live progress
