@@ -67,6 +67,51 @@ describe('component 3 — turn-origin reply routing', () => {
   })
 })
 
+describe('framework-owned origin recovery (determinism residual, 2026-06-05)', () => {
+  it('a source-message reverse index is populated at enqueue and EVICTED in parity with recentTurnsById', () => {
+    expect(gatewaySrc).toMatch(/const recentTurnIdBySourceMessageId = new Map<number, string>\(\)/)
+    // Populated inside rememberRecentTurn from the turn's sourceMessageId.
+    const fn = gatewaySrc.split('function rememberRecentTurn')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).toMatch(/recentTurnIdBySourceMessageId\.set\(turn\.sourceMessageId, turn\.turnId\)/)
+    // Eviction parity: the reverse entry is dropped when its turn is evicted —
+    // so the index cannot outgrow the bounded RECENT_TURNS_MAX registry.
+    expect(fn).toMatch(/recentTurnIdBySourceMessageId\.delete\(evicted\.sourceMessageId\)/)
+  })
+
+  it('both reply paths recover origin from the quoted message_id when the model omits the echo', () => {
+    for (const name of ['executeReply', 'executeStreamReply']) {
+      const fn = gatewaySrc.split(new RegExp(`async function ${name}`))[1]?.split('\nasync function ')[0] ?? ''
+      // Echo first (authoritative), quoted message_id as the framework fallback.
+      expect(fn).toMatch(/const echoedTurn = findTurnByOriginId\(args\.origin_turn_id/)
+      // Quoted lookup is CHAT-SCOPED (cross-chat message-id collision guard).
+      expect(fn).toMatch(/findTurnByQuotedMessageId\([^,]+, args\.reply_to\)/)
+      expect(fn).toMatch(/echoedTurn \?\? quotedTurn/)
+    }
+  })
+
+  it('findTurnByQuotedMessageId is gated on the kill switch and resolves a real turn (never the live successor)', () => {
+    const fn = gatewaySrc.split('function findTurnByQuotedMessageId')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).toMatch(/FRAMEWORK_ORIGIN_ROUTING_ENABLED/)
+    expect(fn).toMatch(/recentTurnIdBySourceMessageId\.get\(mid\)/)
+    expect(fn).toMatch(/recentTurnsById\.get\(owner\)/)
+    // Cross-chat collision guard: the resolved turn must belong to this chat.
+    expect(fn).toMatch(/turn\.sessionChatId !== chatId/)
+  })
+
+  it('the irreducible no-echo residual is ALARMED (MISROUTE_RISK), never silently mis-routed', () => {
+    expect(gatewaySrc).toMatch(/MISROUTE_RISK\(no-echo→live-successor\)/)
+    expect(gatewaySrc).toMatch(/function hasDifferentThreadedRecentTurn/)
+    // The alarm is observability-only: it fires on via=live with a different
+    // recent topic, and does NOT change the resolved thread.
+    expect(gatewaySrc).toMatch(/const misrouteRisk =/)
+    expect(gatewaySrc).toMatch(/via === 'quoted' \? ' QUOTED\(framework-origin\)' : ''/)
+  })
+
+  it('the kill switch defaults ON and is independent of TURN_ORIGIN_ROUTING', () => {
+    expect(gatewaySrc).toMatch(/SWITCHROOM_FRAMEWORK_ORIGIN_ROUTING !== '0'/)
+  })
+})
+
 describe('component 4 — per-turn topic framing', () => {
   it('the gateway stamps a topic_scope directive for forum-topic inbounds (kill-switched)', () => {
     expect(gatewaySrc).toMatch(/TOPIC_FRAMING_ENABLED/)
