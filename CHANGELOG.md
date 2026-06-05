@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.14.65 — Live status surface: stop the dark feed (#2162 + #2163 + #2164)
+
+Fixes the "status went dark" incident (marko, supergroup): the live progress
+card / activity feed / worker feed going dark while the agent kept working.
+Diagnosed to two latent, version-independent bugs plus a DM thread-leak — not a
+regression in any recent release. Three PRs ship together.
+
+### PR #2162 — instrument the live status-surface lane for triage
+
+The lane was nearly silent in the logs, which is why a one-line bug needed a
+deep investigation. Additive logging, no behaviour change:
+
+- A `turn-lifecycle` line at every `currentTurn` set (enqueue) and clear
+  (turn-end) — turnId, topic key, tool count, feed state, age, reason.
+- A `status-surface DEGRADED` line at turn-end when a turn did tool work but the
+  live feed never opened because its sends failed.
+- Worker-activity feed now logs `paint`/`edit`/`finish` on **success** (it
+  previously logged only failures, so a healthy worker feed was invisible).
+
+### PR #2163 — stop two always-failing status sends
+
+- **Resume-turn dark feed:** synthetic boot-resume inbounds fabricate a
+  `message_id` from `Date.now()` (~1.78e13). That was used as the activity-feed
+  reply anchor — 829× over Telegram's 2³¹ max — so **every** feed send on the
+  first turn after a restart 400'd and the live feed was dark the whole turn.
+  The enqueue guard now rejects out-of-range ids as anchors (the feed posts
+  unanchored); the deliver-until-acked tracking is unaffected.
+- **Compaction-notice DM thread-leak:** the proactive `/compact` notice attached
+  the agent's supergroup topic id to operator-DM sends → `400 message thread not
+  found` → the notice silently vanished. Now guarded with `topicForRecipient`,
+  matching the sibling operator-event / drive / ms365 sends.
+
+### PR #2164 — keep the live feed alive during long in-flight tool work
+
+The 300s silence-poke fallback nulls `currentTurn` (which drives the live feed)
+when there's been no model reply for 5 min — so a long quiet tool stretch (a
+foreground sub-agent, a big research pass) darkened the feed mid-work. With the
+live activity feed (#2162-era) now showing tool progress, an actively-working
+turn is no longer silent to the user. The fallback now **defers** while a parent
+tool is genuinely in flight, bounded by a hard ceiling so a hung-mid-tool turn
+still unwedges; a turn with no in-flight tool, and crash recovery, are
+unchanged. **Enabled fleet-wide in this release**
+(`SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1`; unset to disable). Tunable:
+`SWITCHROOM_SILENCE_FALLBACK_MS` (300000), `SWITCHROOM_SILENCE_FALLBACK_HARD_MS`
+(900000).
+
 ## v0.14.64 — Obligation ledger graduates to default-on fleet-wide (#2160)
 
 - **Obligation ledger is now ON by default** for every agent. After days of
