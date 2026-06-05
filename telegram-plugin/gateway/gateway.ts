@@ -66,6 +66,7 @@ import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
+import { parseSourceMessageId } from './source-message-id.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -2681,9 +2682,18 @@ async function postCompactCard(occ: number, cap: number): Promise<void> {
     // instead of conversation lanes. Fleet/DM agents fall through to
     // the existing chatThreadMap last-seen-thread fallback (no
     // observable change).
-    const threadId =
-      resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
-      ?? chatThreadMap.get(chatId);
+    // The compact-watchdog topic is valid ONLY in the agent's supergroup;
+    // attaching it to an operator DM recipient 400s "message thread not found"
+    // and the notice silently vanishes (the marko #2096 class — proactiveCompact
+    // was the one operator-send still missing this guard, 2026-06-05). DM
+    // recipients get a thread-less send; the supergroup owner keeps the lane.
+    const threadId = topicForRecipient({
+      recipientChatId: chatId,
+      resolvedTopic:
+        resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+        ?? chatThreadMap.get(chatId),
+      supergroupChatId: resolveAgentSupergroupChatId(),
+    });
     const text =
       `🗜️ <b>Context compaction</b>\n` +
       `Working context hit ~${occ.toLocaleString()} tokens ` +
@@ -9054,9 +9064,13 @@ function handleSessionEvent(ev: SessionEvent): void {
         const next: CurrentTurn = {
           sessionChatId: ev.chatId,
           sessionThreadId: enqThreadIdNum,
-          sourceMessageId: ev.messageId != null && /^\d+$/.test(ev.messageId)
-            ? Number(ev.messageId)
-            : null,
+          // Accept the inbound id as a reply anchor only when it is a plausible
+          // Telegram message id. Synthetic boot-resume inbounds fabricate a
+          // 13-digit Date.now() message_id (for ack-tracking); if that reached
+          // the activity-feed reply anchor it 400'd every feed send and darkened
+          // the live feed for the whole resume turn (2026-06-05). The ack-queue
+          // still keys on ev.messageId independently — only the anchor is gated.
+          sourceMessageId: parseSourceMessageId(ev.messageId),
           startedAt,
           gatewayReceiveAt: startedAt,
           replyCalled: false,
