@@ -1549,6 +1549,18 @@ const SERIALIZE_NOREPLY_DRAIN_MS =
 // behaviour (#1664: thread from the live currentTurn capture).
 const TURN_ORIGIN_ROUTING_ENABLED =
   process.env.SWITCHROOM_TURN_ORIGIN_ROUTING !== '0'
+// Framework-owned origin recovery (2026-06-05 determinism pass). The origin
+// signal that survives a currentTurn flip (tier 2) travels through the MODEL
+// (it echoes `origin_turn_id`). When the model OMITS it, routing falls to the
+// live turn — the wrong topic if currentTurn flipped (HOLE a). The model rarely
+// passes `reply_to` explicitly, but WHEN it quotes a specific earlier message
+// that message_id is a FRAMEWORK-owned anchor: reverse-index it to the turn
+// that owns it and recover the origin without the model echo. Strictly
+// additive — it only fires when the echo is absent AND a quote is present, and
+// resolves to the ACTUAL origin turn (never the live successor), so it cannot
+// mask a misroute. Kill switch off (=0) → echo-only origin (today's behaviour).
+const FRAMEWORK_ORIGIN_ROUTING_ENABLED =
+  process.env.SWITCHROOM_FRAMEWORK_ORIGIN_ROUTING !== '0'
 // Component 4 (per-turn topic framing). Add a one-line directive to the
 // channel meta + bridge instructions telling the model to answer ONLY the
 // current message's topic. Kill switch off (=0) → no framing field.
@@ -1858,13 +1870,56 @@ let currentTurn: CurrentTurn | null = null
 // a long-lived supergroup session.
 const RECENT_TURNS_MAX = 32
 const recentTurnsById = new Map<string, CurrentTurn>()
+// Framework-owned origin recovery: reverse-index from an inbound's source
+// message_id to the turnId that owns it, so a reply that QUOTES a specific
+// message (args.reply_to) resolves its origin turn deterministically — a
+// real message_id the framework stamped, never a model-asserted thread.
+// Evicted in lock-step with recentTurnsById so it can't outgrow it.
+const recentTurnIdBySourceMessageId = new Map<number, string>()
 function rememberRecentTurn(turn: CurrentTurn): void {
   recentTurnsById.set(turn.turnId, turn)
+  if (turn.sourceMessageId != null) {
+    recentTurnIdBySourceMessageId.set(turn.sourceMessageId, turn.turnId)
+  }
   while (recentTurnsById.size > RECENT_TURNS_MAX) {
     const oldest = recentTurnsById.keys().next().value
     if (oldest === undefined) break
+    const evicted = recentTurnsById.get(oldest)
     recentTurnsById.delete(oldest)
+    // Drop the reverse-index entry for the evicted turn (only when it still
+    // points at THIS turn — a newer turn may have reused the same message id).
+    if (evicted?.sourceMessageId != null &&
+        recentTurnIdBySourceMessageId.get(evicted.sourceMessageId) === oldest) {
+      recentTurnIdBySourceMessageId.delete(evicted.sourceMessageId)
+    }
   }
+}
+
+/**
+ * Framework-owned origin recovery (kill switch SWITCHROOM_FRAMEWORK_ORIGIN_ROUTING).
+ * Resolve the turn that owns a reply from the message_id it QUOTES (args.reply_to),
+ * via the source-message reverse index. Returns null when disabled, when reply_to
+ * is absent/non-numeric, or when no turn owns that message id (evicted / unknown).
+ * Deterministic: a real framework-stamped message_id → its turn, with no model
+ * thread assertion and no dependence on the live currentTurn.
+ *
+ * SCOPED to `chatId`: Telegram numbers message ids PER CHAT, so the same numeric
+ * id exists in a DM and a supergroup. The reverse index is keyed by id alone, so
+ * the resolved turn MUST be confirmed to belong to this reply's chat — otherwise
+ * a reply quoting its own id could inherit another chat's thread (a cross-chat
+ * leak). On a chat mismatch we return null (decline to recover → fall through to
+ * the live-turn behaviour), never a wrong-chat thread.
+ */
+function findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null {
+  if (!FRAMEWORK_ORIGIN_ROUTING_ENABLED) return null
+  if (replyTo == null) return null
+  const mid = Number(replyTo)
+  if (!Number.isFinite(mid)) return null
+  const owner = recentTurnIdBySourceMessageId.get(mid)
+  if (owner == null) return null
+  const turn = recentTurnsById.get(owner) ?? null
+  if (turn == null || turn.sessionChatId !== chatId) return null
+  return turn
 }
 /**
  * Component 3 — derive the stable per-turn identity from the chat, thread,
@@ -1932,15 +1987,26 @@ function findLatestEndedTurnForChat(chatId: string): CurrentTurn | null {
  * timestamps. This wrapper logs, per reply: which precedence tier won (`via`),
  * the resolved thread, the origin turn + its thread, and whether the reply was
  * late (turn already ended). `via=recovered` marks a late reply this fix saved
- * from General; `UNROUTED` flags a supergroup reply that resolved to no topic
- * with NO owner turn to attribute it to (genuinely lost — the residual gap to
- * watch). A General-topic turn legitimately has no thread, so its replies are
- * NOT flagged.
+ * from General; `via=quoted` marks an origin recovered from the framework-owned
+ * quoted message_id (no model echo); `UNROUTED` flags a supergroup reply that
+ * resolved to no topic with NO owner turn to attribute it to (genuinely lost).
+ * `MISROUTE_RISK` flags the irreducible determinism residual: a no-echo,
+ * no-quote reply that fell to the LIVE turn while a DIFFERENT topic recently had
+ * a turn — the framework cannot tell which topic the bare reply answers, so the
+ * routing MIGHT be wrong (HOLE a). It is observability only (the reply still
+ * routes to the live turn) — it makes the one case that is genuinely
+ * model-dependent visible instead of silently mis-routed. A General-topic turn
+ * legitimately has no thread, so its replies are NOT UNROUTED-flagged.
+ *
+ * `originVia` distinguishes how the origin turn was resolved: 'echo' (model
+ * echoed origin_turn_id), 'quoted' (framework recovered it from args.reply_to),
+ * or null (no origin turn). It only affects the `via` label, never the routing.
  */
 function resolveAnswerThreadWithLog(
   chatId: string,
   explicitThreadId: number | undefined,
   originTurn: CurrentTurn | null,
+  originVia: 'echo' | 'quoted' | null,
   liveTurn: CurrentTurn | null,
   surface: 'reply' | 'stream_reply',
 ): number | undefined {
@@ -1967,7 +2033,7 @@ function resolveAnswerThreadWithLog(
   })
   const via =
     explicitThreadId != null ? 'explicit'
-    : originTurn != null ? 'origin'
+    : originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
     : liveTurn?.sessionThreadId != null ? 'live'
     : recovered != null ? 'recovered'
     : 'none'
@@ -1979,15 +2045,46 @@ function resolveAnswerThreadWithLog(
   // gate on `ownerTurn == null` so General replies don't false-alarm (found by
   // the multi-topic UAT stress, 2026-06-05).
   const unrouted = isSupergroup && threadId == null && ownerTurn == null
+  // MISROUTE_RISK = the irreducible determinism residual (HOLE a). A no-echo,
+  // no-quote reply fell to the LIVE turn (via=live), but a DIFFERENT topic
+  // recently had a turn for this chat — so this bare reply MIGHT belong to that
+  // other topic and we cannot tell without the model's echo. Observability only;
+  // routing is unchanged. This is the one case framework state cannot
+  // disambiguate, surfaced instead of silently mis-routed.
+  const misrouteRisk =
+    isSupergroup &&
+    via === 'live' &&
+    hasDifferentThreadedRecentTurn(chatId, liveTurn?.sessionThreadId)
   process.stderr.write(
     `telegram gateway: reply-route surface=${surface} chat=${chatId} ` +
       `resolved_thread=${threadId ?? '-'} via=${via} late=${liveTurn == null} ` +
       `originTurn=${ownerTurn?.turnId ?? '-'} origin_thread=${ownerTurn?.sessionThreadId ?? '-'}` +
       (via === 'recovered' ? ' RECOVERED' : '') +
+      (via === 'quoted' ? ' QUOTED(framework-origin)' : '') +
       (unrouted ? ' UNROUTED(supergroup→no-topic)' : '') +
+      (misrouteRisk ? ' MISROUTE_RISK(no-echo→live-successor)' : '') +
       '\n',
   )
   return threadId
+}
+
+/**
+ * Determinism-residual detector (HOLE a observability). True when a DIFFERENT
+ * forum topic recently had a turn for this chat than the live turn's thread —
+ * i.e. a currentTurn flip plausibly happened, so a no-echo / no-quote reply
+ * routed to the live turn MIGHT belong to the other topic. Scans the bounded
+ * recently-ended registry; cheap (≤32 entries). Used only to ALARM, never to
+ * route.
+ */
+function hasDifferentThreadedRecentTurn(
+  chatId: string,
+  liveThreadId: number | undefined,
+): boolean {
+  const live = liveThreadId ?? null
+  for (const t of recentTurnsById.values()) {
+    if (t.sessionChatId === chatId && (t.sessionThreadId ?? null) !== live) return true
+  }
+  return false
 }
 
 /**
@@ -6638,11 +6735,17 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   let threadId: number | undefined
   if (TURN_ORIGIN_ROUTING_ENABLED) {
     const explicit = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-    const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+    // Origin precedence: model echo first (authoritative), then the
+    // framework-owned quoted message_id (deterministic, no model thread
+    // assertion) as a fallback when the model omitted the echo.
+    const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+    const quotedTurn = echoedTurn == null ? findTurnByQuotedMessageId(chat_id, args.reply_to) : null
+    const originTurn = echoedTurn ?? quotedTurn
     threadId = resolveAnswerThreadWithLog(
       chat_id,
       Number.isFinite(explicit as number) ? (explicit as number) : undefined,
       originTurn,
+      originTurn == null ? null : echoedTurn != null ? 'echo' : 'quoted',
       turn,
       'reply',
     )
@@ -7295,11 +7398,17 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   if (args.message_thread_id == null) {
     let injected: number | undefined
     if (TURN_ORIGIN_ROUTING_ENABLED) {
-      const originTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+      // Origin precedence: model echo first, then the framework-owned quoted
+      // message_id as a deterministic fallback (mirrors executeReply).
+      const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+      const quotedTurn =
+        echoedTurn == null ? findTurnByQuotedMessageId(String(args.chat_id), args.reply_to) : null
+      const originTurn = echoedTurn ?? quotedTurn
       injected = resolveAnswerThreadWithLog(
         String(args.chat_id),
         undefined,
         originTurn,
+        originTurn == null ? null : echoedTurn != null ? 'echo' : 'quoted',
         turn,
         'stream_reply',
       )
