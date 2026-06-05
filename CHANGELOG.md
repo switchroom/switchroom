@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.14.70 — Stop the answer-stream flash (#2178)
+
+Fixes the recurring "unformatted message appears, then a formatted one, then the
+unformatted one is deleted" flash users saw on most turns — a fleet-wide
+regression where one fix silently undid another.
+
+The flash is the **visible answer-stream**: a raw preview the agent posts as it
+streams, retracted (deleted) when the formatted `reply` tool fires. v0.14.52
+turned that surface OFF by default *specifically to remove this flash*. v0.14.68
+retired the invisible compose-box draft transport but wired the preview-open
+condition as `(ANSWER_STREAM_VISIBLE_ENABLED || DRAFT_ANSWER_LANE_RETIRED)` — and
+the draft is retired by default, so a visible preview opened on every streaming
+turn and got retracted. v0.14.68 re-opened the flash v0.14.52 removed, fleet-wide.
+
+The fix decouples the two flags: the visible preview gates on
+`SWITCHROOM_VISIBLE_ANSWER_STREAM` alone; draft retirement controls only the
+transport. With defaults the answer-stream lane is **dormant** — no preview, no
+draft → the `reply` tool is the single formatted message → no flash. No-reply
+text-only answers still deliver via the turn-flush backstop.
+
+The flag→config decision is extracted into a pure function
+(`resolveAnswerLaneConfig`) the gateway delegates to, and is proved by total
+enumeration (all 4 flag combos + the invariant `opensVisiblePreview ===
+visibleEnabled`) plus an end-to-end test (the dormant config sends nothing for a
+full answer). Adversarially verified across the lost-answer, opt-in-visible, and
+draft-kill-switch paths.
+
 ## v0.14.69 — Deterministic answer-routing: prove the core, recover origin, alarm the residual (#2176 + #2175)
 
 Forum-supergroup answer/topic routing was **conditionally deterministic** —
