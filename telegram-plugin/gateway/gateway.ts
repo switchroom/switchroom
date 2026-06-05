@@ -1930,11 +1930,17 @@ function resolveAnswerThreadWithLog(
   liveTurn: CurrentTurn | null,
   surface: 'reply' | 'stream_reply',
 ): number | undefined {
+  // Recover ONLY for a genuinely LATE reply — no live turn at all. Gating on
+  // `liveTurn?.sessionThreadId == null` (the original) also fired for a
+  // threadless DM that still had a live turn, marking every DM reply
+  // `via=recovered`/RECOVERED in the telemetry (routing result unchanged —
+  // DM → undefined — but it drowned the real supergroup recoveries the marker
+  // exists to surface). `liveTurn == null` is the precise late-reply condition.
   const recovered =
     LATE_REPLY_TOPIC_RECOVERY_ENABLED &&
     explicitThreadId == null &&
     originTurn == null &&
-    liveTurn?.sessionThreadId == null
+    liveTurn == null
       ? findLatestEndedTurnForChat(chatId)
       : null
   const threadId = resolveAnswerThreadId({
