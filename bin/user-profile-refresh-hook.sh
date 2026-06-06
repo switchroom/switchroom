@@ -18,21 +18,45 @@ if [ -f "$MARKER" ]; then
 fi
 # Fire-and-forget refresh via MCP. Timeout bounded by Claude Code hook.
 # Output nothing on success or failure; errors are surfaced via doctor.
+#
+# Two bugs this fixes (2026-06-07):
+#  1. The Hindsight server is STATELESS (HINDSIGHT_API_MCP_STATELESS=true) and
+#     returns NO mcp-session-id header, so the old code's `[ -n "$SESSION" ]`
+#     gate was ALWAYS false → the refresh NEVER fired. Stateless MCP needs no
+#     session — drop the gate (mirrors src/memory/hindsight.ts, which tolerates
+#     a missing session id).
+#  2. refresh_mental_model takes `mental_model_id` (a UUID), NOT `name`. Passing
+#     `name` returns isError "Missing required argument: mental_model_id". So we
+#     list_mental_models, resolve the `user-profile` model's id, then refresh
+#     by id.
 {
-  # JSON-RPC flow: initialize → tools/call refresh_mental_model
-  SESSION=$(curl -sS -X POST "$API_URL/mcp/" \
+  # initialize (no session id needed on the stateless server).
+  curl -sS -X POST "$API_URL/mcp/" \
     -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -H "X-Bank-Id: $BANK_ID" -D /tmp/mm-refresh-$$.headers \
+    -H "X-Bank-Id: $BANK_ID" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mm-refresh","version":"0.1"}}}' \
-    -m 3 -o /dev/null 2>/dev/null && grep -i mcp-session-id /tmp/mm-refresh-$$.headers | cut -d' ' -f2 | tr -d '\r\n')
-  if [ -n "$SESSION" ]; then
+    -m 3 -o /dev/null 2>/dev/null || true
+
+  # Resolve the user-profile mental model's id (refresh is by id, not name).
+  # list_mental_models returns the items as a JSON STRING nested in
+  # .result.structuredContent.result, so parse with jq (fromjson). The agent
+  # image ships jq; if it's somehow absent, MM_ID stays empty → skip (the next
+  # Stop fires it again; fire-and-forget, no wedge).
+  MM_ID=$(curl -sS -X POST "$API_URL/mcp/" \
+    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -H "X-Bank-Id: $BANK_ID" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_mental_models","arguments":{}}}' \
+    -m 5 2>/dev/null \
+    | grep '^data:' | sed 's/^data: //' \
+    | jq -r '.result.structuredContent.result | fromjson | .items[] | select(.name=="user-profile") | .id' 2>/dev/null | head -1)
+
+  if [ -n "$MM_ID" ]; then
     curl -sS -X POST "$API_URL/mcp/" \
       -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-      -H "X-Bank-Id: $BANK_ID" -H "mcp-session-id: $SESSION" \
-      -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"refresh_mental_model","arguments":{"name":"user-profile"}}}' \
+      -H "X-Bank-Id: $BANK_ID" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"refresh_mental_model\",\"arguments\":{\"mental_model_id\":\"$MM_ID\"}}}" \
       -m 5 -o /dev/null 2>/dev/null || true
   fi
-  rm -f /tmp/mm-refresh-$$.headers 2>/dev/null || true
   date +%s > "$MARKER"
 } &
 exit 0

@@ -375,7 +375,16 @@ export async function ensureUserProfileMentalModel(
           name: "create_mental_model",
           arguments: {
             name: "user-profile",
-            query: "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
+            // The server's create_mental_model argument is `source_query`, not
+            // `query` (an upstream rename). Passing `query` returns HTTP 200
+            // with isError:true "Missing required argument: source_query" — and
+            // because the old code only checked `createResponse.ok` (HTTP
+            // status), it reported {ok:true} while creating NOTHING. That broke
+            // the user-profile mental model fleet-wide (the "knows you" feature):
+            // banks had zero mental models despite "ready". Fixed: correct arg +
+            // the isError check below.
+            source_query:
+              "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
             types: ["world", "experience"],
           },
         },
@@ -387,6 +396,23 @@ export async function ensureUserProfileMentalModel(
 
     if (!createResponse.ok) {
       return { ok: false, reason: `Create MM HTTP ${createResponse.status}` };
+    }
+
+    // Check the MCP result envelope — a tools/call can return HTTP 200 with
+    // isError:true (e.g. a missing/renamed argument). Don't report success on
+    // an error, or the next `ensureUserProfileMentalModel` keeps "creating" a
+    // model that never lands.
+    try {
+      const created = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(createResponse);
+      if (created.result?.isError === true) {
+        const msg = created.result.content?.[0]?.text ?? "create returned isError";
+        return { ok: false, reason: msg };
+      }
+    } catch {
+      // Unparseable body — treat HTTP 200 as success (legacy) rather than fail
+      // a working create on a parse hiccup.
     }
 
     return { ok: true };
