@@ -940,6 +940,50 @@ microsoft_accounts: {}
   it("returns 'unknown' for an unrecognized requestId", () => {
     expect(handleGetConnectionAccessStatus("nope").state).toBe("unknown");
   });
+
+  it("disabling from account A does NOT clear a pin that points at account B", () => {
+    // marko is pinned to B AND (inconsistently) listed in A's ACL.
+    // Disabling marko from A must remove it from A's enabled_for but
+    // leave the B pin intact — never revoke unrelated access.
+    const yaml = `switchroom:
+  version: 1
+  agents_dir: ~/.switchroom/agents
+telegram:
+  bot_token: x
+  forum_chat_id: "-1001234"
+agents:
+  marko:
+    extends: default
+    topic_name: Marko
+    microsoft_workspace:
+      account: b@outlook.com
+microsoft_accounts:
+  a@outlook.com:
+    enabled_for:
+      - marko
+  b@outlook.com:
+    enabled_for:
+      - marko
+`;
+    writeFileSync(cfgPath, yaml);
+    let capturedAfter = "";
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "a@outlook.com", agent: "marko", action: "disable" },
+      {
+        socketPath: "/fake/sock",
+        generateDiff: (_before, after) => { capturedAfter = after; return "@@ d @@"; },
+        propose: async () => ({ state: "applied" }),
+      },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.changed).toBe(true);
+    // The pin to B survives; only A's ACL entry is dropped.
+    expect(capturedAfter).toContain("account: b@outlook.com");
+    const aBlock = capturedAfter.slice(capturedAfter.indexOf("a@outlook.com"));
+    expect(aBlock.slice(0, aBlock.indexOf("b@outlook.com"))).not.toContain("- marko");
+  });
 });
 
 describe("handleGetSchedule", () => {
