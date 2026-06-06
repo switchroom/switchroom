@@ -1,10 +1,17 @@
 /**
  * Tests for the fleet-wide auto-fallback planner. Pure-data —
- * no broker UDS, no Telegram bot. The injected `setActive` is a
- * vi.fn we assert on.
+ * no broker UDS, no Telegram bot.
+ *
+ * Contract change (fix/auto-fallback-non-admin): the swap now goes through
+ * the broker's NON-ADMIN `mark-exhausted` verb via the injected `failover()`
+ * dep, which returns the account the broker rolled TO (`rolledTo`). Target
+ * SELECTION moved to the broker (`nextHealthyAccount`, fallback_order order —
+ * what /auth rotate uses); this module no longer picks, it announces whatever
+ * the broker rolled to. The old admin-gated `setActive` dep is gone — that
+ * gate is exactly why a non-admin agent that 429'd could never self-heal.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { runFleetAutoFallback, pickFallbackTarget } from '../auto-fallback-fleet.js';
+import { runFleetAutoFallback } from '../auto-fallback-fleet.js';
 import type { QuotaResult, QuotaUtilization } from '../quota-check.js';
 import type { ListStateData } from '../../src/auth/broker/client.js';
 
@@ -38,38 +45,35 @@ function state(active: string, accounts: string[]): ListStateData {
 }
 
 describe('runFleetAutoFallback', () => {
-  it('switches to the lowest-utilization healthy account via broker.setActive', async () => {
-    const setActive = vi.fn(async (label: string) => ({
-      active: label,
-      fanned: ['alice', 'bob'],
-    }));
+  it('swaps via the non-admin failover() and announces the broker’s rolledTo', async () => {
+    // The broker (mark-exhausted → nextHealthyAccount) chose you@x.
+    const failover = vi.fn(async () => ({ rolledTo: 'you@x', rolled: ['alice', 'bob'] }));
     const out = await runFleetAutoFallback({
       state: state('ken@x', ['ken@x', 'me@x', 'you@x']),
       quotas: [
-        // ken: just blew 5h
+        // ken: just blew 5h (the trigger)
         qOk({
           fiveHourUtilizationPct: 100,
           fiveHourResetAt: new Date('2026-05-15T05:50:00Z'),
           representativeClaim: 'five_hour',
         }),
-        // me: dead on 7d for 2 days
+        // me: dead on 7d
         qOk({
           sevenDayUtilizationPct: 100,
           sevenDayResetAt: new Date('2026-05-17T10:00:00Z'),
           representativeClaim: 'seven_day',
         }),
-        // you: healthy 5h/7d
+        // you: healthy — the rolled-to account, used for the headroom line
         qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
       ],
-      setActive,
+      failover,
       triggerAgent: 'carrie',
       now: NOW,
       tz: 'UTC',
     });
 
     expect(out.kind).toBe('switched');
-    expect(setActive).toHaveBeenCalledTimes(1);
-    expect(setActive).toHaveBeenCalledWith('you@x');
+    expect(failover).toHaveBeenCalledTimes(1);
     if (out.kind === 'switched') {
       expect(out.oldLabel).toBe('ken@x');
       expect(out.newLabel).toBe('you@x');
@@ -79,8 +83,8 @@ describe('runFleetAutoFallback', () => {
     }
   });
 
-  it('returns all-blocked WITHOUT calling setActive when every alternative is blocked', async () => {
-    const setActive = vi.fn();
+  it('returns all-blocked when the broker reports rolledTo=null (nowhere to roll)', async () => {
+    const failover = vi.fn(async () => ({ rolledTo: null, rolled: [] }));
     const out = await runFleetAutoFallback({
       state: state('ken@x', ['ken@x', 'me@x']),
       quotas: [
@@ -95,117 +99,77 @@ describe('runFleetAutoFallback', () => {
           representativeClaim: 'seven_day',
         }),
       ],
-      setActive,
+      failover,
       triggerAgent: 'carrie',
       now: NOW,
       tz: 'UTC',
     });
 
     expect(out.kind).toBe('all-blocked');
-    expect(setActive).not.toHaveBeenCalled();
+    // failover IS called even on all-blocked — marking the active exhausted is
+    // correct (consumers/telemetry); there was just nowhere to roll.
+    expect(failover).toHaveBeenCalledTimes(1);
     if (out.kind === 'all-blocked') {
       expect(out.announcement).toContain('All accounts blocked');
       expect(out.announcement).toContain('/auth add');
     }
   });
 
-  it('idempotency: skips swap when active probes healthy (stale event)', async () => {
-    const setActive = vi.fn();
+  it('idempotency: skips the swap WITHOUT calling failover when active probes healthy', async () => {
+    const failover = vi.fn();
     const out = await runFleetAutoFallback({
       state: state('ken@x', ['ken@x', 'you@x']),
       quotas: [
         qOk({ fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10 }),
         qOk({ fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10 }),
       ],
-      setActive,
+      failover,
       triggerAgent: 'carrie',
       now: NOW,
       tz: 'UTC',
     });
 
     expect(out.kind).toBe('no-eligible-target');
-    expect(setActive).not.toHaveBeenCalled();
+    expect(failover).not.toHaveBeenCalled();
     expect(out.announcement).toContain('skipped');
     expect(out.announcement).toContain('Stale event?');
   });
 
-  it('returns no-old-active when broker has no active account (corrupt state)', async () => {
-    const setActive = vi.fn();
+  it('returns no-old-active (no failover) when broker has no active account', async () => {
+    const failover = vi.fn();
     const out = await runFleetAutoFallback({
       state: { active: '', fallback_order: [], accounts: [], agents: [], consumers: [] },
       quotas: [],
-      setActive,
+      failover,
       triggerAgent: 'carrie',
       now: NOW,
       tz: 'UTC',
     });
 
     expect(out.kind).toBe('no-old-active');
-    expect(setActive).not.toHaveBeenCalled();
+    expect(failover).not.toHaveBeenCalled();
   });
 
-  it('falls back to a throttling alternative when no healthy one exists', async () => {
-    const setActive = vi.fn(async (label: string) => ({ active: label, fanned: [] }));
+  it('announces even when the live probe of the active account failed (broker still rolled)', async () => {
+    // Probe failure for the active account → oldQuota null, but the broker
+    // (authoritative exhaustion state) still rolled. We must still announce.
+    const failover = vi.fn(async () => ({ rolledTo: 'you@x', rolled: ['alice'] }));
     const out = await runFleetAutoFallback({
       state: state('ken@x', ['ken@x', 'you@x']),
       quotas: [
-        qOk({
-          fiveHourUtilizationPct: 100,
-          fiveHourResetAt: new Date('2026-05-15T05:50:00Z'),
-          representativeClaim: 'five_hour',
-        }),
-        // you throttling at 85% but not blocked
-        qOk({ fiveHourUtilizationPct: 85, sevenDayUtilizationPct: 20 }),
-      ],
-      setActive,
-      triggerAgent: 'carrie',
-      now: NOW,
-      tz: 'UTC',
-    });
-
-    expect(out.kind).toBe('switched');
-    expect(setActive).toHaveBeenCalledWith('you@x');
-    if (out.kind === 'switched') {
-      expect(out.announcement).toContain('near limit — watch this');
-    }
-  });
-
-  it('skips unknown-health (probe failed) when picking a target', async () => {
-    const setActive = vi.fn(async (label: string) => ({ active: label, fanned: [] }));
-    const out = await runFleetAutoFallback({
-      state: state('ken@x', ['ken@x', 'broken@x', 'you@x']),
-      quotas: [
-        qOk({ fiveHourUtilizationPct: 100, fiveHourResetAt: new Date('2026-05-15T05:50:00Z') }),
-        { ok: false, reason: 'HTTP 401' },
+        { ok: false, reason: 'HTTP 401' }, // active probe failed → unknown health (not 'healthy', so we proceed)
         qOk({ fiveHourUtilizationPct: 5 }),
       ],
-      setActive,
+      failover,
       triggerAgent: 'carrie',
       now: NOW,
       tz: 'UTC',
     });
 
     expect(out.kind).toBe('switched');
-    expect(setActive).toHaveBeenCalledWith('you@x');
-  });
-});
-
-describe('pickFallbackTarget', () => {
-  it('prefers lower-5h-utilization healthy account', () => {
-    const snaps = [
-      { label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) },
-      { label: 'low@x', isActive: false, quota: quota({ fiveHourUtilizationPct: 5 }) },
-      { label: 'med@x', isActive: false, quota: quota({ fiveHourUtilizationPct: 30 }) },
-    ];
-    const target = pickFallbackTarget(snaps);
-    expect(target?.label).toBe('low@x');
-  });
-
-  it('returns null when only blocked alternatives exist', () => {
-    const snaps = [
-      { label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) },
-      { label: 'b@x', isActive: false, quota: quota({ sevenDayUtilizationPct: 100 }) },
-    ];
-    expect(pickFallbackTarget(snaps)).toBeNull();
+    expect(failover).toHaveBeenCalledTimes(1);
+    if (out.kind === 'switched') {
+      expect(out.newLabel).toBe('you@x');
+    }
   });
 });

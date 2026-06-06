@@ -1190,8 +1190,13 @@ export class AuthBroker {
     this.persistQuota();
     // Fan out next-fallback creds to every agent whose active account is `account`.
     const rolled = this.fanoutFailoverFor(account);
+    // The account the fleet rolled TO — same selection the fanout used. Lets a
+    // non-admin caller (the agent that just 429'd, via auto-fallback) report an
+    // accurate "switched to <X>" without a follow-up admin set-active. `null`
+    // when every fallback_order entry is also exhausted (genuine all-blocked).
+    const rolledTo = this.nextHealthyAccount(account, this.config.auth?.fallback_order ?? []);
     this.audit({ op: "mark-exhausted", identity, account, ok: true });
-    socket.write(encodeSuccess(id, { account, rolled }));
+    socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
   }
 
   private async opRefreshAccount(

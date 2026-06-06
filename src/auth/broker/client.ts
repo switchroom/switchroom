@@ -230,6 +230,10 @@ export interface ProbeQuotaData {
 export interface MarkExhaustedData {
   account: string;
   rolled: string[];
+  /** The account the fleet rolled TO (next non-exhausted in fallback_order),
+   *  or null when every fallback is also exhausted. Added so a non-admin
+   *  caller can announce an accurate swap target without an admin set-active. */
+  rolledTo?: string | null;
 }
 
 export interface RefreshAccountData {

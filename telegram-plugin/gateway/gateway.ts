@@ -14644,7 +14644,18 @@ async function doFireFleetAutoFallback(triggerAgent: string): Promise<boolean> {
     const outcome = await runFleetAutoFallback({
       state,
       quotas,
-      setActive: (label) => client.setActive(label),
+      // Non-admin swap: mark-exhausted derives the account from THIS agent's
+      // own identity and rolls the fleet to the next fallback. Replaces the
+      // admin-gated client.setActive(), which 403'd ("set-active requires
+      // admin") for every non-admin agent — i.e. the whole production fleet —
+      // so auto-fallback only ever worked when an admin agent happened to be
+      // the one that 429'd. The manual /auth button stays on set-active (the
+      // operator is explicitly choosing, and is admin); only this automatic
+      // path moves to the non-admin verb.
+      failover: async () => {
+        const r = await client.markExhausted()
+        return { rolledTo: r.rolledTo ?? null, rolled: r.rolled }
+      },
       triggerAgent,
       tz,
     })
