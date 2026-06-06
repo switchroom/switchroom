@@ -1,7 +1,30 @@
 import { describe, it, expect, vi } from "vitest";
 import { ensureUserProfileMentalModel } from "../src/memory/hindsight.js";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+describe("user-profile-refresh-hook.sh — refresh actually fires (source guards)", () => {
+  const hook = readFileSync(
+    resolve(__dirname, "..", "bin", "user-profile-refresh-hook.sh"),
+    "utf-8",
+  );
+
+  it("does NOT gate the refresh on a session id (the stateless server returns none)", () => {
+    // The old `if [ -n "$SESSION" ]` gate meant the refresh never fired on the
+    // stateless server. The gate must be gone.
+    expect(hook).not.toMatch(/if \[ -n "\$SESSION" \]/);
+    expect(hook).not.toMatch(/mcp-session-id: \$SESSION/);
+  });
+
+  it("refreshes by mental_model_id (resolved via list), not by name", () => {
+    // refresh_mental_model requires mental_model_id, not name.
+    expect(hook).toMatch(/list_mental_models/);
+    expect(hook).toMatch(/select\(\.name=="user-profile"\) \| \.id/);
+    expect(hook).toMatch(/mental_model_id\\?":\\?"\$MM_ID/);
+    // The old name-based refresh call must be gone.
+    expect(hook).not.toMatch(/refresh_mental_model[^}]*name\\?":\\?"user-profile/);
+  });
+});
 
 describe("ensureUserProfileMentalModel", () => {
   it("creates mental model when list returns empty", async () => {
@@ -28,13 +51,39 @@ describe("ensureUserProfileMentalModel", () => {
     expect(result).toEqual({ ok: true });
     expect(mockFetch).toHaveBeenCalledTimes(3);
 
-    // Verify create_mental_model was called
+    // Verify create_mental_model was called with the CORRECT arg name. The
+    // server's argument is `source_query`, not `query` (an upstream rename) —
+    // passing `query` returns isError "Missing required argument: source_query"
+    // and creates nothing.
     const createCall = mockFetch.mock.calls[2];
     const createBody = JSON.parse(createCall[1].body);
     expect(createBody.params.name).toBe("create_mental_model");
     expect(createBody.params.arguments.name).toBe("user-profile");
-    expect(createBody.params.arguments.query).toContain("key facts, preferences");
+    expect(createBody.params.arguments.source_query).toContain("key facts, preferences");
+    expect(createBody.params.arguments.query).toBeUndefined();
     expect(createBody.params.arguments.types).toEqual(["world", "experience"]);
+  });
+
+  it("HONEST FAILURE: returns ok:false when create returns isError (not a silent ok:true)", async () => {
+    // The old code only checked HTTP status and reported ok:true even when the
+    // server rejected the create (isError) — so "User-profile Mental Model
+    // ready" printed while the bank stayed empty. The isError envelope must
+    // surface as ok:false.
+    const errorBody =
+      'data: {"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"Missing required argument: source_query"}]}}\n';
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, headers: new Map(), text: async () => "" } as any) // initialize
+      .mockResolvedValueOnce({ ok: true, text: async () => 'data: {"result":{"content":[{"text":"{\\"items\\":[]}"}]}}\n' } as any) // list (empty)
+      .mockResolvedValueOnce({ ok: true, text: async () => errorBody } as any); // create → isError
+
+    const result = await ensureUserProfileMentalModel(
+      "http://test.local/mcp/",
+      "test-bank",
+      { fetchImpl: mockFetch as any }
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/source_query/);
   });
 
   it("returns success when MM already exists (idempotent)", async () => {
