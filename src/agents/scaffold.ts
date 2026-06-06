@@ -1520,6 +1520,13 @@ function seedWorkspaceBootstrapFiles(params: {
   created: string[];
   skipped: string[];
   rewrittenWithBackup: string[];
+  /**
+   * When false (agent `memory.file: false`), do NOT seed the curated
+   * workspace MEMORY.md. Hindsight-native agents carry memory in the bank
+   * (directives + mental models + retained facts), so seeding the file
+   * here would re-create it after a migration delete. Defaults to seeding.
+   */
+  seedMemoryFile?: boolean;
 }): void {
   const profileWorkspaceDir = join(params.profilePath, "workspace");
   if (!existsSync(profileWorkspaceDir)) {
@@ -1542,6 +1549,14 @@ function seedWorkspaceBootstrapFiles(params: {
         continue;
       }
       if (entry === ".gitkeep") continue; // presence-only marker, ignore
+      // Hindsight-native gate: skip the curated MEMORY.md when the agent
+      // opted out of file memory (memory.file: false). Covers both the
+      // `.hbs` template and a plain MEMORY.md. Without this, a reconcile
+      // would re-seed the file after a migration delete.
+      if (params.seedMemoryFile === false && relPath.replace(/\.hbs$/, "") === "MEMORY.md") {
+        params.skipped.push(join(agentWorkspaceDir, "MEMORY.md"));
+        continue;
+      }
       if (entry.endsWith(".hbs")) {
         const destRel = relPath.replace(/\.hbs$/, "");
         const destPath = join(agentWorkspaceDir, destRel);
@@ -3130,6 +3145,7 @@ export function scaffoldAgent(
     created,
     skipped,
     rewrittenWithBackup,
+    seedMemoryFile: agentConfig.memory?.file !== false,
   });
   ensureClaudeMdSymlinks(phase5WorkspaceDir, created);
 

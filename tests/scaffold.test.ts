@@ -1150,6 +1150,35 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "AGENTS.md.hbs"))).toBe(false);
   });
 
+  it("memory.file: false gates the workspace MEMORY.md seed (hindsight-native), leaving siblings intact", () => {
+    const config = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
+    const result = scaffoldAgent("hindsight-native-agent", config, tmpDir, telegramConfig);
+    const workspaceDir = join(result.agentDir, "workspace");
+
+    // The curated MEMORY.md must NOT be seeded — so a migration delete sticks
+    // across reconcile instead of being re-created as an empty template.
+    expect(existsSync(join(workspaceDir, "MEMORY.md"))).toBe(false);
+
+    // Every OTHER bootstrap file is unaffected by the gate.
+    expect(existsSync(join(workspaceDir, "USER.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "IDENTITY.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "SOUL.md"))).toBe(true);
+
+    // Default (file omitted) still seeds MEMORY.md — gate is opt-in only.
+    const def = scaffoldAgent("file-default-agent", makeAgentConfig({}), tmpDir, telegramConfig);
+    expect(existsSync(join(def.agentDir, "workspace", "MEMORY.md"))).toBe(true);
+  });
+
+  it("memory.file: false survives reconcile — MEMORY.md is not re-seeded", () => {
+    const config = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
+    const r1 = scaffoldAgent("native-reconcile-agent", config, tmpDir, telegramConfig);
+    const memPath = join(r1.agentDir, "workspace", "MEMORY.md");
+    expect(existsSync(memPath)).toBe(false);
+    // Re-scaffold (reconcile) must not bring it back.
+    scaffoldAgent("native-reconcile-agent", config, tmpDir, telegramConfig);
+    expect(existsSync(memPath)).toBe(false);
+  });
+
   it("start.sh respects session_continuity.resume_mode in the generated script", () => {
     // handoff is now the default (no explicit resume_mode in config)
     const defaultResult = scaffoldAgent(
