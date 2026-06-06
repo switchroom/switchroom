@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.14.79 — Hindsight: user-profile MM existence check by name, not substring (#2205)
+
+Completes the v0.14.78 user-profile mental-model repair. The "already exists?"
+check in `ensureUserProfileMentalModel` did a naive substring match
+(`includes("user-profile")`) on the list-response blob, so it false-positived
+whenever another model's name / query / content contained that substring — and
+skipped creation, reporting "ready" while the bank had no real user-profile
+model. Found live on the v0.14.78 rollout (lawgpt's Lisa-focused models; clerk's
+shared `assistant` bank). Fixed to match by exact item name.
+
 ## v0.14.78 — Hindsight: repair the user-profile mental model + phantom-caller honesty (#2203 + #2201)
 
 Two hindsight correctness fixes surfaced by the context-token audit, both in the
