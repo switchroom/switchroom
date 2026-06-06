@@ -66,7 +66,8 @@ export function classifyExtractionLogs(logs: string): CheckResult {
   // What hindsight's OWN logs show when fact-extraction `claude` calls fail
   // (quota/429, auth, or model error): the provider logs an "error result" and
   // extraction yields 0 facts. The literal "429"/"weekly limit" string lives in
-  // the `claude -p` envelope, not hindsight's logs — so match the provider error.
+  // the headless-CLI result envelope, not hindsight's logs — so match the
+  // provider error instead.
   const llmError = /Claude Code returned an error result|claude_code_llm[\s\S]{0,80}error|Fact extraction failed|Content extraction failed/i.test(logs);
   const quotaHint = /weekly limit|api_error_status["':\s]+429|\b429\b|hit your[\s\S]{0,24}limit/i.test(logs);
   const zeroFacts = (logs.match(/Extract facts:\s*0 facts/gi) ?? []).length;
@@ -93,8 +94,8 @@ export function classifyExtractionLogs(logs: string): CheckResult {
         "exhausted or its OAuth broke. Repoint it to an account with quota in " +
         "switchroom.yaml, then `docker restart switchroom-auth-broker` and " +
         "`docker restart switchroom-hindsight` (single-file config mount needs " +
-        "the broker restart to re-read). Confirm with a `claude -p` inside the " +
-        "container.",
+        "the broker restart to re-read). Confirm with a headless `claude` run " +
+        "inside the container.",
     };
   }
   if (zeroFacts >= 3 && okFacts === 0) {
