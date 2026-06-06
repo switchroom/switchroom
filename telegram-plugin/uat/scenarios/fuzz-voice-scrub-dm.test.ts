@@ -1,18 +1,20 @@
 /**
- * Voice-scrub fuzz — end-to-end proof of the deterministic voice gate.
+ * Voice-scrub fuzz — end-to-end check of the voice layers.
  *
- * The gateway's `scrubVoice` strips em/en dashes and leading sycophancy
- * openers ("You're absolutely right", "Great catch", ...) from every
- * outbound reply. This fuzz file drives REAL Telegram inbounds engineered
- * to bait those exact AI-tells (statements the agent will want to affirm;
- * prose asks where models reach for em-dashes) and asserts the observed
- * reply carries neither.
+ * Two layers with different strengths:
+ *   - Em/en dashes are DETERMINISTIC: the gateway's `scrubVoice`
+ *     normalizes every dash on every outbound reply, so "no em-dash
+ *     reaches the user" is a hard, observable guarantee (asserted).
+ *   - Sycophancy openers are PROBABILISTIC: the deterministic opener
+ *     strip is off by default (operator steer 2026-06: context-free word
+ *     deletion is bad UX), and tone is carried by the prompt VOICE
+ *     directive where the model can keep genuine acknowledgement. So an
+ *     opener is a soft signal (warn), not a gate failure.
  *
- * Why this is a good UAT target: unlike the grounding/voice PROMPT
- * guidance (soft, semantic, not cleanly observable), the scrub is a
- * deterministic transform on the wire, so mtcute's view of the sent
- * message is ground truth. If an em-dash or a leading affirmation reaches
- * the user, the gate failed.
+ * This fuzz file drives REAL Telegram inbounds engineered to bait both
+ * (statements the agent will want to affirm; prose asks where models
+ * reach for em-dashes). mtcute's view of the sent message is ground
+ * truth for the deterministic dash check.
  *
  * Self-skips green when the harness can't spin up (env unwired) — same as
  * the sibling fuzz files; uat/** is excluded from gating CI.
@@ -61,7 +63,7 @@ const LEADING_AFFIRMATION_RE =
 describe("uat: voice-scrub fuzz — no em-dashes, no sycophancy openers reach the user", () => {
   for (const vc of VOICE_CASES) {
     it(
-      `[voice] ${vc.name} — reply is dash-free and affirmation-free`,
+      `[voice] ${vc.name} — reply is dash-free (affirmation now prompt-tier)`,
       async () => {
         const sc = await spinUp({ agent: "test-harness" });
         try {
@@ -87,10 +89,15 @@ describe("uat: voice-scrub fuzz — no em-dashes, no sycophancy openers reach th
             );
           }
 
-          // Invariant 3: reply does not OPEN with a sycophancy affirmation.
+          // Invariant 3 (SOFT): reply ideally does not OPEN with a hollow
+          // affirmation. This is now PROBABILISTIC, not deterministic: the
+          // opener strip is off by default and tone is the prompt VOICE
+          // directive's job, so an occasional opener is a soft signal (the
+          // model judged it genuine), not a hard gate failure. Warn, don't
+          // fail — a hard assert here would flake on a prompt-driven lever.
           if (LEADING_AFFIRMATION_RE.test(text.trim())) {
-            throw new Error(
-              `[voice] ${vc.name}: reply opened with a stripped-class affirmation. `
+            console.warn(
+              `[voice] ${vc.name}: reply opened with an affirmation (prompt-tier, not enforced). `
               + `Reply: ${JSON.stringify(text.slice(0, 200))}`,
             );
           }
