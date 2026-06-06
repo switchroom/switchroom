@@ -286,7 +286,18 @@ name from that list.
 Only call the \`vault_request_access\` MCP tool — which pings the
 operator for a Telegram approval — for a key you've **confirmed via
 \`vault list\` you don't already have.** Requesting access to a guessed
-or already-held key wastes the operator's tap and fails.`;
+or already-held key wastes the operator's tap and fails.
+
+**Never put a secret's value — or a \`vault:<key>\` placeholder — in a
+tool call.** Tool arguments are sent to the underlying API verbatim;
+nothing resolves a \`vault:\` reference for them. A real secret never
+needs to appear in a tool call — the launcher injects it into the
+tool's environment for you. A value you genuinely must pass literally
+(an account or customer ID) is a public identifier, not a secret, and
+belongs in plain config, not the vault. If a tool call is **blocked for
+containing a vaulted secret**, report that exact block message to the
+operator and stop — don't theorise about auth or tokens; it just means
+a stored value reached a tool argument.`;
 
 /**
  * Canonical rendering of the fleet invariants file written to
