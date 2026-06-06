@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.73 — Persona owns presentation; drop the self-disclosure guardrail (#2184)
+
+Removes the "be honest about being a switchroom agent / not a custom
+model" directive from the default agent template. A persona that has to
+out itself as "an AI running Claude" is less of a colleague, which works
+against the product's first outcome (a standing team that feels like real
+people). The agent keeps the factual self-knowledge it needs to operate
+(it is a switchroom agent in a container); how it presents itself to
+people is now explicitly the persona's call (`SOUL.md`).
+
+First step of the agent-context architecture rework: the customize layer
+(persona) owns presentation, with no removable "must disclose" rule
+layered on top. Propagates fleet-wide on reconcile (the agent CLAUDE.md
+regenerates from the template).
+
 ## v0.14.72 — Voice: prompt-first tone, no context-free word deletion (#2182)
 
 Rebalances agent voice enforcement away from a hook that deletes words and
