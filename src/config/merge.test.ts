@@ -49,6 +49,21 @@ describe("mergeAgentConfig — release cascade", () => {
   });
 });
 
+describe("mergeAgentConfig — memory.file cascade (fleet-default hindsight-native)", () => {
+  it("an agent inherits defaults.memory.file:false when it sets no memory.file", () => {
+    const defaults = { memory: { file: false } } as AgentDefaults;
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.memory?.file).toBe(false);
+  });
+
+  it("a per-agent memory.file:true opts back in over the fleet default", () => {
+    const defaults = { memory: { file: false } } as AgentDefaults;
+    const agent = baseAgent({ memory: { collection: "x", file: true } } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.memory?.file).toBe(true);
+  });
+});
+
 describe("mergeAgentConfig — allowed_tools / disallowed_tools cascade", () => {
   it("cascades defaults.allowed_tools when the agent sets none (the silent-no-op bug)", () => {
     const defaults = {
