@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.14.75 — Hindsight memory: durable shm fix + hindsight-native file gate
+
+Foundation for converging agent memory onto Hindsight as the single
+backend (retiring the parallel curated `MEMORY.md`).
+
+### Durable shm fix (#2190)
+
+The `switchroom-hindsight` container launched with no `--shm-size`, so it
+got Docker's 64MB default `/dev/shm`. Its embedded PostgreSQL needs far
+more (~533MB+ for shared query/sort segments), so every such allocation
+failed with `could not resize shared memory segment ... No space left on
+device` — taking down **all** memory writes fleet-wide. Adds
+`HINDSIGHT_DEFAULT_SHM_SIZE=2g` to both the `docker run` and compose launch
+paths so a future recreate can't regress to the broken default.
+
+### `memory.file` gate (#2191)
+
+Adds a per-agent `memory.file` boolean (default `true` = no change). When
+`false`, the scaffold stops seeding the curated `workspace/MEMORY.md` on
+**both** the scaffold and reconcile paths — so once an agent's memory is
+migrated into Hindsight and the file deleted, the delete sticks across
+`agent restart` / `apply` instead of being re-seeded as an empty template.
+This is the mechanism for the hindsight-native migration; the per-turn
+loader already tolerates an absent file.
+
 ## v0.14.74 — Two-file persona (switchroom baseline + operator override); dead-carrier cleanup (#2188)
 
 **Persona two-file.** Adds `SOUL.default.md`, a small switchroom-owned
