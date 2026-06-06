@@ -65,6 +65,11 @@ import {
   type ProposeOutcome,
 } from "./hostd-config-propose.js";
 import { randomUUID } from "node:crypto";
+import {
+  startMicrosoftConnect,
+  runMicrosoftConnectPoll,
+  type MicrosoftConnectDeps,
+} from "./microsoft-connect.js";
 import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import {
   AuthBrokerError,
@@ -916,6 +921,129 @@ export function handleGetConnectionAccessStatus(
 /** Test-only reset. */
 export function __resetConnectionAccessStatuses(): void {
   connectionAccessStatuses.clear();
+}
+
+// ─── In-browser Microsoft connect (device-code) ───────────────────────────
+
+export type MicrosoftConnectStatus =
+  | { state: "pending"; startedAt: number; userCode: string; verificationUri: string; expiresInSec: number }
+  | { state: "connected"; startedAt: number; account: string; accountType: "personal" | "work" }
+  | { state: "failed"; startedAt: number; reason: string };
+
+const microsoftConnectStatuses = new Map<string, MicrosoftConnectStatus>();
+
+function reapMicrosoftConnects(now = Date.now()): void {
+  for (const [id, s] of microsoftConnectStatuses) {
+    // Settled entries > 30 min, or pending entries past their device-code
+    // expiry + grace, are dropped.
+    const ttl = s.state === "pending" ? s.expiresInSec * 1000 + 60_000 : 30 * 60_000;
+    if (now - s.startedAt > ttl) microsoftConnectStatuses.delete(id);
+  }
+}
+
+export interface StartConnectResult {
+  ok: boolean;
+  error?: string;
+  requestId?: string;
+  userCode?: string;
+  verificationUri?: string;
+  expiresInSec?: number;
+}
+
+/**
+ * Start an in-browser Microsoft connect (device-code). Returns the short
+ * code + verification URL for the operator to complete on Microsoft's
+ * site; polls for consent in the background and registers the account
+ * with the broker on success. Poll {@link handleGetMicrosoftConnectStatus}.
+ *
+ * `deps` is injectable for tests (device-code + poll + addAccount).
+ */
+export async function handleStartMicrosoftConnect(
+  config: SwitchroomConfig,
+  deps: MicrosoftConnectDeps = {},
+): Promise<StartConnectResult> {
+  const now = deps.now ?? Date.now;
+  const configClientId = (
+    config as { microsoft_workspace?: { microsoft_client_id?: string; org_mode?: boolean } }
+  ).microsoft_workspace?.microsoft_client_id;
+  const orgMode =
+    deps.orgMode ??
+    (config as { microsoft_workspace?: { org_mode?: boolean } }).microsoft_workspace?.org_mode === true;
+
+  const started = await startMicrosoftConnect({ ...deps, configClientId, orgMode });
+  if (started.kind === "byo-vault") {
+    return {
+      ok: false,
+      error:
+        `This install uses a vaulted custom Microsoft app (${started.ref}) the dashboard can't read. ` +
+        `Connect from the host: switchroom auth microsoft account add <email>.`,
+    };
+  }
+  if (started.kind === "error") {
+    return { ok: false, error: started.message };
+  }
+
+  const requestId = randomUUID();
+  microsoftConnectStatuses.set(requestId, {
+    state: "pending",
+    startedAt: now(),
+    userCode: started.device.user_code,
+    verificationUri: started.device.verification_uri,
+    expiresInSec: started.device.expires_in,
+  });
+  reapMicrosoftConnects(now());
+
+  // Background: poll Microsoft → register the account → record the outcome.
+  void runMicrosoftConnectPoll(
+    { device: started.device, clientId: started.clientId, scopes: started.scopes },
+    deps,
+  )
+    .then((res) => {
+      const startedAt = microsoftConnectStatuses.get(requestId)?.startedAt ?? now();
+      if (res.state === "connected") {
+        microsoftConnectStatuses.set(requestId, {
+          state: "connected",
+          startedAt,
+          account: res.account,
+          accountType: res.accountType,
+        });
+        void captureEvent("microsoft_connect", { outcome: "connected", source: "web_api" });
+      } else {
+        const reason =
+          res.state === "no-refresh-token"
+            ? "Microsoft returned no refresh token (account would expire in ~1h)."
+            : res.message;
+        microsoftConnectStatuses.set(requestId, { state: "failed", startedAt, reason });
+      }
+    })
+    .catch((err) => {
+      const startedAt = microsoftConnectStatuses.get(requestId)?.startedAt ?? now();
+      microsoftConnectStatuses.set(requestId, {
+        state: "failed",
+        startedAt,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      void captureException(err, { action: "microsoft_connect" });
+    });
+
+  return {
+    ok: true,
+    requestId,
+    userCode: started.device.user_code,
+    verificationUri: started.device.verification_uri,
+    expiresInSec: started.device.expires_in,
+  };
+}
+
+export function handleGetMicrosoftConnectStatus(
+  requestId: string,
+): MicrosoftConnectStatus | { state: "unknown" } {
+  return microsoftConnectStatuses.get(requestId) ?? { state: "unknown" };
+}
+
+/** Test-only reset. */
+export function __resetMicrosoftConnectStatuses(): void {
+  microsoftConnectStatuses.clear();
 }
 
 /**
