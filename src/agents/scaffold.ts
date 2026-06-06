@@ -199,16 +199,16 @@ sees; your terminal output never reaches them.`;
  */
 const MEMORY_GUIDANCE = `## Memory — proactive, conversational
 
-You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_memory\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.
+You have Hindsight tools: \`mcp__hindsight__sync_retain\`, \`mcp__hindsight__delete_document\`, \`mcp__hindsight__recall\`, \`mcp__hindsight__reflect\`. Use them without being asked.
 
 ### Retain proactively
 When the user shares a fact, preference, decision, or plan worth keeping across sessions, call \`sync_retain\` in the same turn. Briefly acknowledge in your reply ("got it, April 2nd anniversary"). Don't narrate the tool call. Skip small talk and transient tool output, the auto-retain hook handles conversation-level signal.
 
 ### Correct proactively
-When the user corrects you or contradicts a prior memory, call \`delete_memory\` on the wrong entry, then \`sync_retain\` the correction. Acknowledge the correction in one line ("noted, Alice not Bob").
+When the user corrects you or contradicts a prior memory, call \`delete_document\` on the wrong entry, then \`sync_retain\` the correction. Acknowledge the correction in one line ("noted, Alice not Bob").
 
 ### Forget proactively
-When the user asks you to forget something ("forget that", "delete X", "drop what I said about Y"), call \`delete_memory\` for matching entries and confirm what was removed.
+When the user asks you to forget something ("forget that", "delete X", "drop what I said about Y"), call \`delete_document\` for matching entries and confirm what was removed.
 
 ### Inspect proactively
 When the user asks "what do you know about X / me", "what do you remember about Y", or any memory audit, use \`reflect\` to synthesize an answer across the bank. Return it as honest prose, not a raw dump. If the bank has little on the topic, say so.

@@ -55,7 +55,12 @@ describe("Memory prompt guidance (post-#1850)", () => {
     expect(out).toContain("### Forget proactively");
     expect(out).toContain("### Inspect proactively");
     expect(out).toContain("mcp__hindsight__sync_retain");
-    expect(out).toContain("mcp__hindsight__delete_memory");
+    // The delete tool is `delete_document` (the real server tool). The prior
+    // guidance + this assertion named `delete_memory`, which the hindsight
+    // server REJECTS ("Unknown tool") — agents' forget/correct flows silently
+    // failed. Guard the corrected name.
+    expect(out).toContain("mcp__hindsight__delete_document");
+    expect(out).not.toContain("mcp__hindsight__delete_memory");
     expect(out).toContain("mcp__hindsight__recall");
     expect(out).toContain("mcp__hindsight__reflect");
   });
