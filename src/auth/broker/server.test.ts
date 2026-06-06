@@ -295,6 +295,86 @@ describe("AuthBroker — get-credentials", () => {
   });
 });
 
+describe("AuthBroker — consumer failover on quota exhaustion", () => {
+  it("serves a consumer its pinned account while healthy", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("secondary");
+    broker.stop();
+  });
+
+  it("fails a consumer over to fallback_order when its pinned account is exhausted", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+      agents: { marker: { auth: { override: "secondary" } } },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+    // An agent ON the pinned account reports it exhausted (the same signal the
+    // fleet already raises) → broker marks `secondary` exhausted.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    // The consumer (pinned to secondary) now fails over to the healthy default.
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("default");
+    broker.stop();
+  });
+
+  it("keeps the pinned account when no healthy fallback exists (retry beats nothing)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+      agents: { marker: { auth: { override: "secondary" } } },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    // fallback_order only lists the (now-exhausted) pinned account → no healthy
+    // alternative → stay pinned rather than serve nothing.
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("secondary");
+    broker.stop();
+  });
+});
+
 describe("AuthBroker — admin gating", () => {
   it("forbids set-active from a non-admin agent", async () => {
     const h = makeHarness();

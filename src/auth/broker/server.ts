@@ -907,13 +907,43 @@ export class AuthBroker {
     if (identity.kind === "operator") return auth.active ?? null;
     if (identity.kind === "consumer") {
       const c = (auth.consumers ?? []).find((x) => x.name === identity.name);
-      return c?.account ?? null;
+      // Consumers (e.g. hindsight) are pinned to a dedicated account for quota
+      // isolation. But a pinned account that quota-exhausts would leave the
+      // consumer dead — agents avoid this because they ride the swappable
+      // `auth.active`. Give consumers the same resilience: when the pinned
+      // account is marked exhausted (by an agent sharing it, or a quota probe),
+      // fail over to the first healthy account in `fallback_order`. Propagates
+      // via the consumer's background cred-refresh loop. Availability beats
+      // isolation while the pinned account is down; it reverts automatically
+      // once the exhaustion window passes.
+      return this.consumerAccountWithFailover(c?.account ?? null);
     }
     // agent
     const agent = (this.config.agents ?? {})[identity.name];
     const override = agent?.auth?.override;
     if (override) return override;
     return auth.active ?? null;
+  }
+
+  /** True if `account` is currently within a mark-exhausted window. */
+  private isAccountExhausted(account: string): boolean {
+    const q = this.quota[account];
+    return q !== undefined && q.exhausted_until > this.now();
+  }
+
+  /**
+   * A consumer's pinned account, unless it's exhausted — then the first
+   * non-exhausted account in `fallback_order` that has stored credentials.
+   * Falls back to the pinned account if no healthy alternative exists (better
+   * to retry the pinned one than serve nothing).
+   */
+  private consumerAccountWithFailover(pinned: string | null): string | null {
+    if (!pinned || !this.isAccountExhausted(pinned)) return pinned;
+    for (const cand of this.config.auth?.fallback_order ?? []) {
+      if (cand === pinned || this.isAccountExhausted(cand)) continue;
+      if (readAccountCredentials(cand, this.home)) return cand;
+    }
+    return pinned;
   }
 
   /* ─── Op handlers ───────────────────────────────────────────── */
