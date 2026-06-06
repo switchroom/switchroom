@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.14.77 — Context-token optimization: tool-search + cleanup (#2198 + #2199 + #2197)
+
+From the 2026-06 context audit (per-turn floor ~63k tok ≈ 32% of a 200k window;
+the MCP tool-schema surface ~31k tok — larger than all authored prompt text).
+
+### #2198 — enable Claude Code tool-search (defer the ~31k-token MCP surface)
+
+Sets `ENABLE_TOOL_SEARCH=auto` on every agent so the unmodified `claude` CLI
+DEFERS (lazy-loads) MCP tool schemas — surfaced by name, full JSON fetched only
+when a tool is called — reclaiming ~25–29k tok of window. `alwaysLoad:true`
+pins the load-bearing framework servers (switchroom-telegram reply/
+get_recent_messages/react, hindsight recall, agent-config) so they never defer;
+the heavy integration servers (webkite/perplexity/marketing) defer = the win.
+Kill switch `SWITCHROOM_DISABLE_TOOL_SEARCH=1`; mode override
+`SWITCHROOM_TOOL_SEARCH_MODE`.
+
+### #2199 — context hygiene
+
+- **Memory-prose contradiction removed:** the workspace operating protocol told
+  agents to maintain `MEMORY.md` + daily files, contradicting the cwd CLAUDE.md
+  + invariants ("Hindsight is your single backend"). Now defers to hindsight.
+- **delete_memory → delete_document:** agents were told to call a hindsight tool
+  that doesn't exist (the real one is `delete_document`) — forget/correct flows
+  silently failed. Fixed. (The broader tool-allowlist trim was deferred: a global
+  allowlist would break host-side mental-model/vault-sweep ops, and the token win
+  is already captured by tool-search.)
+- **`debug turn` per-turn-floor accounting:** fixed the SOUL double-count, added
+  the --add-dir fleet invariants + the MCP tool surface, `/3.7` token estimate,
+  and a "Per-turn FLOOR" total (was understated ~3x).
+
+### #2197 — vault secret-guard message + doctor check for IDs-as-secrets
+
 ## v0.14.76 — Hindsight: consumer quota-failover + fleet-default file gate
 
 ### Consumer quota-failover (#2194)
