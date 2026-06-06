@@ -33,7 +33,10 @@ export function getHindsightSettingsEntry(
   const collection = getCollectionForAgent(agentName, config);
   const mcpConfig = generateHindsightMcpConfig(collection, memoryConfig);
 
-  return { key: "hindsight", value: mcpConfig };
+  // Keep hindsight's tools loaded under tool search — recall/reflect/retain
+  // are framework memory tools the agent is told to use proactively; deferring
+  // them would add a ToolSearch round-trip to every memory write.
+  return { key: "hindsight", value: { ...mcpConfig, alwaysLoad: true } };
 }
 
 /**

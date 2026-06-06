@@ -1413,6 +1413,31 @@ function buildHumanizerEnvVars(
 }
 
 /**
+ * Claude Code tool-search env. Defers (lazy-loads) MCP tool schemas so the
+ * heavy per-agent integration servers (webkite/perplexity/marketing — ~31k
+ * tokens of schema) stop occupying the context window every turn; the model
+ * fetches a schema only when it actually calls that tool. The load-bearing
+ * framework servers (switchroom-telegram, hindsight, agent-config) carry
+ * `alwaysLoad: true` in .mcp.json so reply/get_recent_messages/recall never
+ * defer (no per-turn ToolSearch round-trip).
+ *
+ * Default value `auto` (self-gating: claude only defers once the tool surface
+ * exceeds ~10% of the window, which every agent's does — a small-surface agent
+ * is left untouched). Override per fleet via SWITCHROOM_TOOL_SEARCH_MODE
+ * (e.g. `true` to force always-defer, `auto:N` for an N% threshold). Kill
+ * switch SWITCHROOM_DISABLE_TOOL_SEARCH=1 omits the var entirely → claude
+ * loads all tools (today's behaviour). A per-agent `env: {ENABLE_TOOL_SEARCH}`
+ * in switchroom.yaml still wins (spread after this in the env builder).
+ *
+ * Consumed by claude (inner start.sh pass), not the gateway, so the
+ * env-before-gateway-fork landmine does not constrain placement.
+ */
+export function buildToolSearchEnvVars(): Record<string, string> {
+  if (process.env.SWITCHROOM_DISABLE_TOOL_SEARCH === "1") return {};
+  return { ENABLE_TOOL_SEARCH: process.env.SWITCHROOM_TOOL_SEARCH_MODE ?? "auto" };
+}
+
+/**
  * Top-level settings.json keys that switchroom's scaffold/reconcile
  * pipeline owns and rebuilds on every run. When the settings_raw
  * escape hatch injects additional top-level keys (e.g. `effort`,
@@ -2107,6 +2132,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       : undefined,
     userEnvQuoted: (() => {
       const combined = {
+        ...buildToolSearchEnvVars(),
         ...channelsToEnv(agentConfig),
         ...(agentConfig.env ?? {}),
         ...buildRepoEnvVars(name, agentDir, agentConfig),
@@ -2970,6 +2996,11 @@ export function scaffoldAgent(
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
+        // LOAD-BEARING under tool search: reply / stream_reply /
+        // get_recent_messages / react must never defer, or every turn pays a
+        // ToolSearch round-trip before it can answer (the orphaned-reply
+        // failure class). Pin them loaded.
+        alwaysLoad: true,
       },
       // Read-only agent-config broker. Exposes 4 tools (config_get,
       // cron_list, skill_list, audit_tail) that re-exec the switchroom
@@ -2982,6 +3013,8 @@ export function scaffoldAgent(
           SWITCHROOM_AGENT_NAME: name,
           SWITCHROOM_CONFIG: resolvedConfigPath,
         },
+        // Framework read-only server (4 tools) — keep loaded under tool search.
+        alwaysLoad: true,
       },
     };
 
@@ -4611,6 +4644,7 @@ export function reconcileAgent(
         : undefined,
       userEnvQuoted: (() => {
         const combined = {
+          ...buildToolSearchEnvVars(),
           ...channelsToEnv(agentConfig),
           ...(agentConfig.env ?? {}),
           ...buildRepoEnvVars(name, agentDir, agentConfig),
@@ -5071,6 +5105,11 @@ export function reconcileAgent(
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
         },
+        // LOAD-BEARING under tool search: reply / stream_reply /
+        // get_recent_messages / react must never defer, or every turn pays a
+        // ToolSearch round-trip before it can answer (the orphaned-reply
+        // failure class). Pin them loaded.
+        alwaysLoad: true,
       },
       // Read-only agent-config broker. Exposes 4 tools (config_get,
       // cron_list, skill_list, audit_tail) that re-exec the switchroom
@@ -5083,6 +5122,8 @@ export function reconcileAgent(
           SWITCHROOM_AGENT_NAME: name,
           SWITCHROOM_CONFIG: resolvedConfigPath,
         },
+        // Framework read-only server (4 tools) — keep loaded under tool search.
+        alwaysLoad: true,
       },
     };
 

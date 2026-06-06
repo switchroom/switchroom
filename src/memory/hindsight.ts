@@ -7,6 +7,18 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  /**
+   * Claude Code tool-search escape hatch. When `ENABLE_TOOL_SEARCH` is on,
+   * the CLI defers (lazy-loads) every MCP server's tool schemas by default;
+   * `alwaysLoad: true` pins THIS server's tools to stay loaded so the model
+   * can call them without a ToolSearch round-trip. Set on the load-bearing
+   * framework servers (switchroom-telegram reply/get_recent_messages,
+   * hindsight, agent-config); the heavy per-agent integration servers
+   * (webkite/perplexity/marketing) deliberately omit it so they defer.
+   * Claude Code reads `config.alwaysLoad` (CLI ≥2.1.x); harmless/ignored when
+   * tool search is off or on older CLIs.
+   */
+  alwaysLoad?: boolean;
 }
 
 /**
