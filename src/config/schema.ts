@@ -1471,6 +1471,10 @@ const profileFields = {
     .object({
       collection: z.string().optional(),
       auto_recall: z.boolean().optional(),
+      // Mirror of AgentMemorySchema.file — accepted at the defaults/profile tier
+      // too, so `defaults.memory.file: false` makes the whole fleet (and future
+      // agents) hindsight-native by default, with per-agent `file: true` opt-in.
+      file: z.boolean().optional(),
       isolation: z.enum(["default", "strict"]).optional(),
       recall: z
         .object({
