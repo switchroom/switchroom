@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.14.78 — Hindsight: repair the user-profile mental model + phantom-caller honesty (#2203 + #2201)
+
+Two hindsight correctness fixes surfaced by the context-token audit, both in the
+`isError`-not-checked bug class (a hindsight `tools/call` returns HTTP 200 with an
+error envelope; code that checks only the HTTP status reports false success).
+
+### #2203 — repair the user-profile mental model ("an agent that knows you")
+
+The whole user-profile mental-model feature was **non-functional fleet-wide** — an
+upstream hindsight argument rename, silently swallowed:
+
+- **Creation:** `create_mental_model`'s arg is `source_query`, not `query`. Passing
+  `query` returned `isError "Missing required argument: source_query"`, but the code
+  only checked the HTTP status → reported success while creating nothing. Every
+  agent's bank had **zero** mental models despite scaffold printing "ready". Fixed
+  (`source_query` + an `isError` check).
+- **Stop-hook refresh** (`bin/user-profile-refresh-hook.sh`): the stateless server
+  returns no `mcp-session-id`, but the hook gated the refresh on one → it never
+  fired; and `refresh_mental_model` takes `mental_model_id`, not `name`. The hook
+  now resolves the id via `list_mental_models` and refreshes by id.
+
+After upgrade, a `switchroom apply` re-runs the (now-fixed) creation to populate the
+user-profile mental model for every agent.
+
+### #2201 — phantom-caller honesty + hindsight tool-allowlist deferral
+
+`vault-sweep` (`delete_memory`) and `addMemoryTag` (`update_memory`) called
+non-existent hindsight tools and silently reported success; both now fail honestly.
+The MCP tool-surface allowlist was evaluated and **deliberately not shipped** (a
+3-hunt audit found it would filter the shared singleton with a ~16-tool minimum and
+the token win is already captured by tool-search) — recorded in
+`src/setup/hindsight.ts`. (Separate open issue #2202: vault-sweep's secret-scrub has
+no working delete path and needs a document-granularity rework.)
+
 ## v0.14.77 — Context-token optimization: tool-search + cleanup (#2198 + #2199 + #2197)
 
 From the 2026-06 context audit (per-turn floor ~63k tok ≈ 32% of a 200k window;
