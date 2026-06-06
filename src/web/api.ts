@@ -38,6 +38,33 @@ import {
   agentCanAccessNotionDB,
   shouldEmitNotionMcp,
 } from "../config/notion-workspace-acl.js";
+import {
+  enableAgentsOnGoogleAccount,
+  disableAgentsOnGoogleAccount,
+} from "../cli/google-accounts-yaml.js";
+import {
+  enableAgentsOnMicrosoftAccount,
+  disableAgentsOnMicrosoftAccount,
+} from "../cli/microsoft-accounts-yaml.js";
+import {
+  setAgentWorkspaceAccount,
+  clearAgentWorkspaceAccount,
+  getAgentWorkspaceAccount,
+  type WorkspaceProvider,
+} from "../config/agent-workspace-account.js";
+import {
+  planConfigEdit,
+  composeTransforms,
+  ConfigPlanError,
+  type YamlTransform,
+} from "./config-edit-plan.js";
+import { generateUnifiedDiff } from "./config-diff.js";
+import {
+  proposeConfigEditViaHostd,
+  resolveHostdOperatorSocket,
+  type ProposeOutcome,
+} from "./hostd-config-propose.js";
+import { randomUUID } from "node:crypto";
 import { getAccountInfos, type AccountInfo } from "../auth/account-store.js";
 import {
   AuthBrokerError,
@@ -843,6 +870,195 @@ export function handleGetNotionWorkspace(
     databases,
     fullAccessAgents,
   };
+}
+
+export type ConnectionAccessStatus =
+  | { state: "pending"; startedAt: number }
+  | { state: "applied"; startedAt: number; restartAgent: string }
+  | { state: "denied"; startedAt: number; reason: string }
+  | { state: "error"; startedAt: number; reason: string };
+
+export interface SetAccessResult {
+  ok: boolean;
+  error?: string;
+  /** False when nothing would change (already in that state) — no proposal raised. */
+  changed?: boolean;
+  /** Poll handle for the approval outcome (present when a proposal was raised). */
+  requestId?: string;
+  /** True when a Telegram Allow/Deny card was raised and is awaiting the tap. */
+  pendingApproval?: boolean;
+}
+
+/**
+ * In-flight + recently-settled connection-access proposals, keyed by a
+ * server-generated requestId. The dashboard POSTs, gets a requestId, and
+ * polls {@link handleGetConnectionAccessStatus} until the operator taps
+ * Allow/Deny in Telegram. Bounded by a reaper (see
+ * reapConnectionAccessStatuses).
+ */
+const connectionAccessStatuses = new Map<string, ConnectionAccessStatus>();
+
+/** Drop settled entries older than 30 min so the map can't grow without bound. */
+export function reapConnectionAccessStatuses(now = Date.now()): void {
+  for (const [id, s] of connectionAccessStatuses) {
+    if (s.state !== "pending" && now - s.startedAt > 30 * 60_000) {
+      connectionAccessStatuses.delete(id);
+    }
+  }
+}
+
+export function handleGetConnectionAccessStatus(
+  requestId: string,
+): ConnectionAccessStatus | { state: "unknown" } {
+  return connectionAccessStatuses.get(requestId) ?? { state: "unknown" };
+}
+
+/** Test-only reset. */
+export function __resetConnectionAccessStatuses(): void {
+  connectionAccessStatuses.clear();
+}
+
+/**
+ * Propose granting/revoking an agent's access to a Google/Microsoft
+ * account from the dashboard. SECURITY: the dashboard does NOT write
+ * config — that would be self-elevation (an agent on host networking can
+ * forge the dashboard's loopback auth). Instead this computes the edit
+ * (the enabled_for ACL + the per-agent workspace.account selector — the
+ * broker needs both), turns it into a unified diff, and proposes it to
+ * hostd over the operator socket. hostd raises a Telegram Allow/Deny card
+ * and is the sole writer — nothing changes without the operator's tap.
+ *
+ * Returns a requestId the dashboard polls; the actual approval resolves
+ * asynchronously (hostd blocks on the human tap up to 10 min, so we run
+ * the proposal in the background and never hang the HTTP POST). When the
+ * edit would be a no-op, returns `changed:false` with no card raised.
+ *
+ * `deps` is injectable for tests (diff generation + the hostd send).
+ */
+export function handleSetConnectionAccess(
+  configPath: string,
+  config: SwitchroomConfig,
+  args: { provider: string; account: string; agent: string; action: string },
+  deps: {
+    socketPath?: string | null;
+    propose?: (reqId: string, diff: string, reason: string) => Promise<ProposeOutcome>;
+    generateDiff?: (before: string, after: string) => string;
+    now?: () => number;
+  } = {},
+): SetAccessResult {
+  const provider = args.provider as WorkspaceProvider;
+  if (provider !== "google" && provider !== "microsoft") {
+    return { ok: false, error: `unsupported provider '${args.provider}' (google|microsoft)` };
+  }
+  if (args.action !== "enable" && args.action !== "disable") {
+    return { ok: false, error: `action must be 'enable' or 'disable'` };
+  }
+  const agent = args.agent;
+  if (!agent || !config.agents?.[agent]) {
+    return { ok: false, error: `unknown agent '${agent}'` };
+  }
+  const account = String(args.account ?? "").trim().toLowerCase();
+  if (!/^[^@\s:]+@[^@\s:]+\.[^@\s:]+$/.test(account)) {
+    return { ok: false, error: `invalid account email '${args.account}'` };
+  }
+
+  const enableAcl =
+    provider === "google" ? enableAgentsOnGoogleAccount : enableAgentsOnMicrosoftAccount;
+  const disableAcl =
+    provider === "google" ? disableAgentsOnGoogleAccount : disableAgentsOnMicrosoftAccount;
+
+  let transform: YamlTransform;
+  if (args.action === "enable") {
+    transform = composeTransforms(
+      (y) => enableAcl(y, account, [agent]),
+      (y) => setAgentWorkspaceAccount(y, provider, agent, account),
+    );
+  } else {
+    transform = composeTransforms(
+      (y) => disableAcl(y, account, [agent]),
+      // Only clear the per-agent pin if it actually points at THIS
+      // account — never disturb a pin to a different account.
+      (y) =>
+        getAgentWorkspaceAccount(y, provider, agent) === account
+          ? clearAgentWorkspaceAccount(y, provider, agent)
+          : y,
+    );
+  }
+
+  // 1. Compute + schema-validate the edit (no write). Reject a broken
+  //    edit before bothering the operator with a card.
+  let plan;
+  try {
+    plan = planConfigEdit(configPath, transform);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof ConfigPlanError ? err.message : (err as Error).message,
+    };
+  }
+  if (!plan.changed) {
+    return { ok: true, changed: false };
+  }
+
+  // 2. Need hostd to write it (the sole writer + the approval card).
+  const socketPath = deps.socketPath !== undefined ? deps.socketPath : resolveHostdOperatorSocket();
+  if (!socketPath) {
+    return {
+      ok: false,
+      error:
+        "hostd operator socket not found — credential grants require hostd (the Telegram approval path). " +
+        "Ensure host_control is enabled and the switchroom-web container mounts ~/.switchroom.",
+    };
+  }
+
+  // 3. Build the diff and fire the proposal in the BACKGROUND (hostd
+  //    blocks on the operator's tap; the POST must return immediately).
+  let diff: string;
+  try {
+    diff = (deps.generateDiff ?? generateUnifiedDiff)(plan.before, plan.after);
+  } catch (err) {
+    return { ok: false, error: `could not build config diff: ${(err as Error).message}` };
+  }
+
+  const now = deps.now ?? Date.now;
+  const requestId = randomUUID();
+  const reason = `dashboard: ${args.action} ${agent} on ${account} (${provider})`;
+  connectionAccessStatuses.set(requestId, { state: "pending", startedAt: now() });
+  reapConnectionAccessStatuses(now());
+
+  const propose =
+    deps.propose ??
+    ((reqId, d, r) =>
+      proposeConfigEditViaHostd({ requestId: reqId, unifiedDiff: d, reason: r, socketPath }));
+
+  void propose(requestId, diff, reason)
+    .then((outcome) => {
+      const startedAt = connectionAccessStatuses.get(requestId)?.startedAt ?? now();
+      if (outcome.state === "applied") {
+        connectionAccessStatuses.set(requestId, { state: "applied", startedAt, restartAgent: agent });
+      } else if (outcome.state === "denied") {
+        connectionAccessStatuses.set(requestId, { state: "denied", startedAt, reason: outcome.reason });
+      } else {
+        connectionAccessStatuses.set(requestId, { state: "error", startedAt, reason: outcome.reason });
+      }
+      void captureEvent("connection_access", {
+        provider,
+        action: args.action,
+        outcome: outcome.state,
+        source: "web_api",
+      });
+    })
+    .catch((err) => {
+      const startedAt = connectionAccessStatuses.get(requestId)?.startedAt ?? now();
+      connectionAccessStatuses.set(requestId, {
+        state: "error",
+        startedAt,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      void captureException(err, { action: "connection_access", provider });
+    });
+
+  return { ok: true, changed: true, requestId, pendingApproval: true };
 }
 
 /**

@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { loadConfig } from "../config/loader.js";
 import { containerName } from "../agents/lifecycle.js";
 import {
   handleGetAgents,
@@ -31,6 +32,8 @@ import {
   handleGetSystemHealth,
   handleGetGoogleAccounts,
   handleGetMicrosoftAccounts,
+  handleSetConnectionAccess,
+  handleGetConnectionAccessStatus,
   handleGetNotionWorkspace,
   handleGetSchedule,
   handleGetApprovals,
@@ -404,6 +407,24 @@ function parseRoute(
     return { handler: "getAccounts", params: {} };
   }
 
+  // POST /api/connections/access
+  //   body: { provider, account, agent, action: "enable" | "disable" }
+  // PROPOSE granting/revoking an agent's access to a Google/Microsoft
+  // account. Does NOT write config — raises a Telegram Allow/Deny card via
+  // hostd (the sole writer). Returns a requestId to poll.
+  if (method === "POST" && pathname === "/api/connections/access") {
+    return { handler: "setConnectionAccess", params: {} };
+  }
+
+  // GET /api/connections/access/:requestId — poll the approval outcome.
+  const accessStatusMatch = pathname.match(/^\/api\/connections\/access\/([^/]+)$/);
+  if (method === "GET" && accessStatusMatch) {
+    return {
+      handler: "getConnectionAccessStatus",
+      params: { requestId: decodeURIComponent(accessStatusMatch[1]) },
+    };
+  }
+
   // POST /api/auth/use
   //   body: { account: string }
   // Replaces the pre-RFC-H `/api/accounts/:label/promote` endpoint. The
@@ -446,6 +467,20 @@ export function startWebServer(
   // Resolve symlinks once at startup so the traversal check compares real paths.
   const uiDir = existsSync(uiDirRaw) ? realpathSync(uiDirRaw) : uiDirRaw;
   const token = resolveWebToken();
+
+  // The connection views + the access-mutation endpoint must reflect the
+  // CURRENT switchroom.yaml — the startup `config` goes stale the moment
+  // the dashboard writes an ACL change. Re-read fresh from disk per
+  // request (cheap, and only for the config-derived connection routes);
+  // fall back to the startup config if the path is unset or a load fails.
+  const freshConfig = (): SwitchroomConfig => {
+    if (!configPath) return config;
+    try {
+      return loadConfig(configPath);
+    } catch {
+      return config;
+    }
+  };
 
   // Loopback-only when binding to a localhost address; any other bind address
   // (including 0.0.0.0) is considered a deliberate network-exposure opt-in.
@@ -589,14 +624,14 @@ export function startWebServer(
 
           case "getGoogleAccounts":
             return (async () =>
-              jsonResponse(await handleGetGoogleAccounts(config)))();
+              jsonResponse(await handleGetGoogleAccounts(freshConfig())))();
 
           case "getMicrosoftAccounts":
             return (async () =>
-              jsonResponse(await handleGetMicrosoftAccounts(config)))();
+              jsonResponse(await handleGetMicrosoftAccounts(freshConfig())))();
 
           case "getNotionWorkspace":
-            return jsonResponse(handleGetNotionWorkspace(config));
+            return jsonResponse(handleGetNotionWorkspace(freshConfig()));
 
           case "getSchedule":
             return jsonResponse(handleGetSchedule(config));
@@ -630,6 +665,40 @@ export function startWebServer(
               return jsonResponse(result);
             })();
           }
+
+          case "setConnectionAccess": {
+            return (async () => {
+              if (!configPath) {
+                return jsonResponse(
+                  { ok: false, error: "config path not available to the web server" },
+                  500,
+                );
+              }
+              let body: {
+                provider?: string;
+                account?: string;
+                agent?: string;
+                action?: string;
+              };
+              try {
+                body = (await req.json()) as typeof body;
+              } catch {
+                return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+              }
+              const result = handleSetConnectionAccess(configPath, freshConfig(), {
+                provider: String(body.provider ?? ""),
+                account: String(body.account ?? ""),
+                agent: String(body.agent ?? ""),
+                action: String(body.action ?? ""),
+              });
+              return jsonResponse(result, result.ok ? 200 : 400);
+            })();
+          }
+
+          case "getConnectionAccessStatus":
+            return jsonResponse(
+              handleGetConnectionAccessStatus(route.params.requestId),
+            );
 
           case "refreshQuota": {
             return (async () => {
