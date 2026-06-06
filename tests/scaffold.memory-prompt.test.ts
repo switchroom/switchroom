@@ -137,4 +137,28 @@ describe("Memory prompt guidance (post-#1850)", () => {
     // input. Confirms the init-vs-reconcile drift fix held.
     expect(reconcileStartSh).toBe(scaffoldStartSh);
   });
+
+  it("the seeded workspace AGENTS.md/CLAUDE.md has NO file-memory contradiction (hindsight-only)", () => {
+    // Regression: the workspace operating protocol told agents to maintain
+    // MEMORY.md + memory/ daily files, directly contradicting the cwd CLAUDE.md
+    // + fleet invariants ("hindsight is your single backend"). Agents got
+    // opposite memory instructions every turn. The workspace doc now defers to
+    // hindsight and the cwd CLAUDE.md.
+    const agentConfig: AgentConfig = {
+      channels: { telegram: { plugin: "switchroom" } },
+      memory: { collection: "test-agent" },
+    };
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    const ws = join(tmpDir, "test-agent", "workspace", "CLAUDE.md");
+    expect(existsSync(ws)).toBe(true);
+    const doc = readFileSync(ws, "utf-8");
+    // The contradictory file-memory prose must be gone.
+    expect(doc).not.toMatch(/MEMORY\.md is your long-term memory/);
+    expect(doc).not.toMatch(/memory\/YYYY-MM-DD/);
+    expect(doc).not.toMatch(/## Memory discipline/);
+    expect(doc).not.toMatch(/memory_search.+memory_get/);
+    // And it must point at hindsight instead.
+    expect(doc).toMatch(/Hindsight/);
+    expect(doc).toMatch(/mcp__hindsight__recall/);
+  });
 });
