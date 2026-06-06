@@ -99,6 +99,9 @@ import {
   handleSetConnectionAccess,
   handleGetConnectionAccessStatus,
   __resetConnectionAccessStatuses,
+  handleStartMicrosoftConnect,
+  handleGetMicrosoftConnectStatus,
+  __resetMicrosoftConnectStatuses,
   handleGetApprovals,
   handleRefreshAccountsQuota,
   __resetQuotaCacheForTests,
@@ -983,6 +986,85 @@ microsoft_accounts:
     expect(capturedAfter).toContain("account: b@outlook.com");
     const aBlock = capturedAfter.slice(capturedAfter.indexOf("a@outlook.com"));
     expect(aBlock.slice(0, aBlock.indexOf("b@outlook.com"))).not.toContain("- marko");
+  });
+});
+
+describe("handleStartMicrosoftConnect (in-browser device-code)", () => {
+  const PERSONAL_MSA_TID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+  const DEVICE = {
+    device_code: "dc",
+    user_code: "WXYZ-1234",
+    verification_uri: "https://microsoft.com/devicelogin",
+    expires_in: 900,
+    interval: 5,
+  };
+  const fakeIdToken = (p: Record<string, unknown>) => {
+    const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    return `${b64({ alg: "none" })}.${b64(p)}.sig`;
+  };
+  const okTokens = {
+    access_token: "at",
+    refresh_token: "rt",
+    expires_in: 3600,
+    token_type: "Bearer",
+    scope: "Mail.ReadWrite",
+    id_token: fakeIdToken({ tid: PERSONAL_MSA_TID, oid: "o1", preferred_username: "lisa@outlook.com" }),
+  };
+  const cfg = mockConfig as unknown as SwitchroomConfig;
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => __resetMicrosoftConnectStatuses());
+
+  it("returns the device code + URL immediately and registers on consent", async () => {
+    const added: string[] = [];
+    const res = await handleStartMicrosoftConnect(cfg, {
+      requestDeviceCode: async () => DEVICE,
+      pollDeviceToken: async () => okTokens as never,
+      addAccount: async (label) => { added.push(label); return {}; },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.userCode).toBe("WXYZ-1234");
+    expect(res.verificationUri).toContain("devicelogin");
+    expect(res.requestId).toBeTruthy();
+    // Pending until the background poll resolves.
+    const before = handleGetMicrosoftConnectStatus(res.requestId!);
+    expect(before.state).toMatch(/pending|connected/);
+    await flush();
+    const after = handleGetMicrosoftConnectStatus(res.requestId!);
+    expect(after.state).toBe("connected");
+    if (after.state === "connected") expect(after.account).toBe("lisa@outlook.com");
+    expect(added).toEqual(["lisa@outlook.com"]);
+  });
+
+  it("surfaces a poll failure via the status endpoint (account NOT registered)", async () => {
+    let added = false;
+    const res = await handleStartMicrosoftConnect(cfg, {
+      requestDeviceCode: async () => DEVICE,
+      pollDeviceToken: async () => { throw new Error("expired_token"); },
+      addAccount: async () => { added = true; return {}; },
+    });
+    expect(res.ok).toBe(true);
+    await flush();
+    const st = handleGetMicrosoftConnectStatus(res.requestId!);
+    expect(st.state).toBe("failed");
+    if (st.state === "failed") expect(st.reason).toContain("expired_token");
+    expect(added).toBe(false);
+  });
+
+  it("refuses a vaulted BYO Microsoft client (points at the host CLI)", async () => {
+    const byoCfg = {
+      ...mockConfig,
+      microsoft_workspace: { microsoft_client_id: "vault:ms-id" },
+    } as unknown as SwitchroomConfig;
+    const res = await handleStartMicrosoftConnect(byoCfg, {
+      requestDeviceCode: async () => DEVICE,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("host");
+  });
+
+  it("returns 'unknown' for an unrecognized connect requestId", () => {
+    expect(handleGetMicrosoftConnectStatus("nope").state).toBe("unknown");
   });
 });
 

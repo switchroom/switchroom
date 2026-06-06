@@ -559,6 +559,51 @@
       }
     }
 
+    // Start an in-browser Microsoft connect: show the device code + link,
+    // then poll until the operator completes sign-in on Microsoft's site.
+    async function connectMicrosoft() {
+      const card = document.getElementById('ms-connect-card');
+      const show = (html) => { if (card) card.innerHTML = html; };
+      show('<div class="loading" style="padding:.8rem">Starting…</div>');
+      try {
+        const res = await fetch(`${API}/api/connections/microsoft/connect`, { method: 'POST', headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok || !data.ok) { show(''); showError(data.error || `HTTP ${res.status}`); return; }
+        const url = data.verificationUri, code = data.userCode;
+        show(`<div class="account-card" style="border-color:var(--accent)">
+            <div class="account-card-header"><div class="account-label">Connect a Microsoft account</div></div>
+            <div style="padding:.3rem 0;line-height:1.7">
+              1. Open <a href="${escapeHtml(url)}" target="_blank" rel="noopener" style="color:var(--accent)">${escapeHtml(url)}</a><br>
+              2. Enter code: <code style="font-size:1.15rem;letter-spacing:.08em">${escapeHtml(code)}</code><br>
+              3. Approve the requested permissions (Mail, Calendar, Files).
+            </div>
+            <div id="ms-connect-status" style="color:var(--text-dim);margin-top:.3rem">Waiting for sign-in… (this card expires in ~15 min)</div>
+          </div>`);
+        const statusEl = () => document.getElementById('ms-connect-status');
+        const started = Date.now();
+        const poll = async () => {
+          const sres = await fetch(`${API}/api/connections/microsoft/connect/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
+          const s = sres.ok ? await sres.json() : { state: 'failed', reason: `HTTP ${sres.status}` };
+          if (s.state === 'pending') {
+            if (Date.now() - started > ((data.expiresInSec || 900) * 1000 + 30000)) { const e = statusEl(); if (e) e.textContent = 'Expired — click Connect to try again.'; return; }
+            setTimeout(poll, 3000);
+            return;
+          }
+          if (s.state === 'connected') {
+            show(`<div class="loading" style="padding:.8rem;color:var(--green)">✓ Connected ${escapeHtml(s.account)} (${escapeHtml(s.accountType)}). Use the access toggles below to grant an agent.</div>`);
+            fetchConnections();
+          } else {
+            show('');
+            showError(s.reason || 'connect failed');
+          }
+        };
+        setTimeout(poll, 3000);
+      } catch (err) {
+        show('');
+        showError(err.message);
+      }
+    }
+
     async function fetchSchedule() {
       try {
         const res = await fetch(`${API}/api/schedule`, { headers: authHeaders() });
@@ -1115,11 +1160,18 @@
         google.map(a => renderOAuthAccountCard(a, { showType: false, provider: 'google', agentNames })).join(''),
       );
 
-      const microsoftSection = _connectionSection(
-        'Microsoft 365',
-        'No Microsoft accounts. Connect one from Telegram with <code>/connect microsoft</code> (admin DM), or <code>switchroom auth microsoft account add</code>.',
-        microsoft.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join(''),
-      );
+      const msCards = microsoft.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join('');
+      const microsoftSection = `
+        <div style="margin-bottom:1.5rem">
+          <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">
+            Microsoft 365
+            <button onclick="connectMicrosoft()" class="usage-pill primary" style="margin-left:.6rem;cursor:pointer;border:none;text-transform:none;font-weight:600">+ Connect a Microsoft account</button>
+          </h3>
+          <div id="ms-connect-card"></div>
+          ${msCards
+            ? `<div class="accounts-grid">${msCards}</div>`
+            : `<div class="loading" style="padding:.8rem">No Microsoft accounts yet — click <b>Connect a Microsoft account</b> above (or <code>/connect microsoft</code> from Telegram).</div>`}
+        </div>`;
 
       let notionCards = '';
       if (notion.configured) {

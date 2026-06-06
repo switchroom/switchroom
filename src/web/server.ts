@@ -34,6 +34,8 @@ import {
   handleGetMicrosoftAccounts,
   handleSetConnectionAccess,
   handleGetConnectionAccessStatus,
+  handleStartMicrosoftConnect,
+  handleGetMicrosoftConnectStatus,
   handleGetNotionWorkspace,
   handleGetSchedule,
   handleGetApprovals,
@@ -425,6 +427,21 @@ function parseRoute(
     };
   }
 
+  // POST /api/connections/microsoft/connect — start an in-browser
+  // device-code connect; returns a user code + verification URL to poll.
+  if (method === "POST" && pathname === "/api/connections/microsoft/connect") {
+    return { handler: "startMicrosoftConnect", params: {} };
+  }
+
+  // GET /api/connections/microsoft/connect/:requestId — poll the connect.
+  const msConnectMatch = pathname.match(/^\/api\/connections\/microsoft\/connect\/([^/]+)$/);
+  if (method === "GET" && msConnectMatch) {
+    return {
+      handler: "getMicrosoftConnectStatus",
+      params: { requestId: decodeURIComponent(msConnectMatch[1]) },
+    };
+  }
+
   // POST /api/auth/use
   //   body: { account: string }
   // Replaces the pre-RFC-H `/api/accounts/:label/promote` endpoint. The
@@ -698,6 +715,17 @@ export function startWebServer(
           case "getConnectionAccessStatus":
             return jsonResponse(
               handleGetConnectionAccessStatus(route.params.requestId),
+            );
+
+          case "startMicrosoftConnect":
+            return (async () => {
+              const result = await handleStartMicrosoftConnect(freshConfig());
+              return jsonResponse(result, result.ok ? 200 : 400);
+            })();
+
+          case "getMicrosoftConnectStatus":
+            return jsonResponse(
+              handleGetMicrosoftConnectStatus(route.params.requestId),
             );
 
           case "refreshQuota": {
