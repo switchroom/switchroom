@@ -1169,13 +1169,31 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(def.agentDir, "workspace", "MEMORY.md"))).toBe(true);
   });
 
-  it("memory.file: false survives reconcile — MEMORY.md is not re-seeded", () => {
-    const config = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
-    const r1 = scaffoldAgent("native-reconcile-agent", config, tmpDir, telegramConfig);
-    const memPath = join(r1.agentDir, "workspace", "MEMORY.md");
-    expect(existsSync(memPath)).toBe(false);
-    // Re-scaffold (reconcile) must not bring it back.
-    scaffoldAgent("native-reconcile-agent", config, tmpDir, telegramConfig);
+  it("memory.file: false makes a deleted MEMORY.md stick across reconcile (the migration scenario)", () => {
+    // 1. Normal agent — MEMORY.md is seeded.
+    const normal = makeAgentConfig({});
+    const normalSc: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "mig-agent": normal },
+    } as SwitchroomConfig;
+    const r = scaffoldAgent("mig-agent", normal, tmpDir, telegramConfig, normalSc);
+    const memPath = join(r.agentDir, "workspace", "MEMORY.md");
+    expect(existsSync(memPath)).toBe(true);
+
+    // 2. Migrate: operator deletes the file and flips memory.file: false.
+    rmSync(memPath);
+    const migrated = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
+    const migratedSc: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "mig-agent": migrated },
+    } as SwitchroomConfig;
+
+    // 3. reconcile() is the path that runs on every `agent restart` / `apply`.
+    //    It MUST NOT re-seed the deleted file — otherwise the migration never
+    //    sticks. (This fails against an ungated reconcile call site.)
+    reconcileAgent("mig-agent", migrated, tmpDir, telegramConfig, migratedSc);
     expect(existsSync(memPath)).toBe(false);
   });
 

@@ -5217,6 +5217,10 @@ export function reconcileAgent(
       created: changes,
       skipped: [],
       rewrittenWithBackup: changes,
+      // Hindsight-native gate must hold on the RECONCILE path too — this is
+      // what runs on every `agent restart` / `apply`, so without it a deleted
+      // MEMORY.md would be re-seeded here and the migration would not stick.
+      seedMemoryFile: agentConfig.memory?.file !== false,
     });
     ensureClaudeMdSymlinks(reconcileWorkspaceDir, changes);
   }
