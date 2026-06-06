@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.74 — Two-file persona (switchroom baseline + operator override); dead-carrier cleanup (#2188)
+
+**Persona two-file.** Adds `SOUL.default.md`, a small switchroom-owned
+baseline persona composed *before* the operator's `SOUL.md` so the
+operator's persona wins by recency. The baseline is restored from the
+release template on every reconcile (so improvements propagate), while
+`SOUL.md` stays seed-once and is never clobbered. This is the "switchroom
+default + operator customization, merged" split for persona: the default
+is overridable (it is persona, not a guardrail). Operator-owned agent
+state was first versioned in `~/.switchroom-config`, so the change is fully
+rollback-able.
+
+**Carrier cleanup.** Removes the dead `_shared/telegram-style.md.hbs`
+fragment (no profile rendered it; its "status? = UX-failure signal"
+guidance lives in the `switchroom-runtime` skill). Closes the
+edit-a-dead-carrier-for-zero-effect trap for that fragment.
+
+
 ## v0.14.73 — Persona owns presentation; drop the self-disclosure guardrail (#2184)
 
 Removes the "be honest about being a switchroom agent / not a custom
