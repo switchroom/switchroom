@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.14.76 — Hindsight: consumer quota-failover + fleet-default file gate
+
+### Consumer quota-failover (#2194)
+
+Agents survive a quota-exhausted account because they ride the swappable
+`auth.active`; consumers (hindsight) were pinned to their account
+unconditionally, so a quota-exhausted pinned account left hindsight dead
+(retains accepted, 0 facts extracted) — the 2026-06-06 outage. The
+auth-broker now fails a consumer over to the first healthy account in
+`fallback_order` when its pinned account is within a mark-exhausted window,
+reverting automatically once the window passes. Reuses the existing
+exhaustion state + fallback_order; propagates via hindsight's existing
+cred-refresh loop. Serving (get-credentials) is failover-aware; attribution
+(mark-exhausted) stays raw, so a consumer can never mismark a healthy
+account.
+
+### Fleet-default file gate (#2195)
+
+`memory.file` is now accepted at the defaults tier, so a single
+`defaults.memory.file: false` makes the whole fleet — and future agents —
+hindsight-native by default, with per-agent `memory.file: true` opt-in.
+
 ## v0.14.75 — Hindsight memory: durable shm fix + hindsight-native file gate
 
 Foundation for converging agent memory onto Hindsight as the single
