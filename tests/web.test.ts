@@ -96,6 +96,9 @@ import {
   handleGetSchedule,
   handleGetAccounts,
   handleUseAccount,
+  handleSetConnectionAccess,
+  handleGetConnectionAccessStatus,
+  __resetConnectionAccessStatuses,
   handleGetApprovals,
   handleRefreshAccountsQuota,
   __resetQuotaCacheForTests,
@@ -112,7 +115,7 @@ import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { getHindsightStatus, isHindsightRunning } from "../src/setup/hindsight.js";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SwitchroomConfig } from "../src/config/schema.js";
@@ -818,6 +821,168 @@ describe("handleGetNotionWorkspace", () => {
       "fullAccessAgents",
       "vaultKey",
     ]);
+  });
+});
+
+describe("handleSetConnectionAccess (hostd-routed, approval-gated)", () => {
+  const VALID_YAML = `switchroom:
+  version: 1
+  agents_dir: ~/.switchroom/agents
+telegram:
+  bot_token: x
+  forum_chat_id: "-1001234"
+agents:
+  marko:
+    extends: default
+    topic_name: Marko
+microsoft_accounts: {}
+`;
+  const cfg = {
+    ...mockConfig,
+    agents: { marko: { extends: "default" } },
+  } as unknown as SwitchroomConfig;
+
+  let tmp: string;
+  let cfgPath: string;
+  beforeEach(() => {
+    __resetConnectionAccessStatuses();
+    tmp = mkdtempSync(join(tmpdir(), "conn-access-"));
+    cfgPath = join(tmp, "switchroom.yaml");
+    writeFileSync(cfgPath, VALID_YAML);
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it("rejects bad provider / unknown agent / invalid email without proposing", () => {
+    expect(handleSetConnectionAccess(cfgPath, cfg, { provider: "slack", account: "a@b.com", agent: "marko", action: "enable" }).ok).toBe(false);
+    expect(handleSetConnectionAccess(cfgPath, cfg, { provider: "microsoft", account: "a@b.com", agent: "ghost", action: "enable" }).ok).toBe(false);
+    expect(handleSetConnectionAccess(cfgPath, cfg, { provider: "microsoft", account: "not-an-email", agent: "marko", action: "enable" }).ok).toBe(false);
+  });
+
+  it("returns changed:false (no card) when disabling an already-absent grant", () => {
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "lisa@outlook.com", agent: "marko", action: "disable" },
+      { socketPath: "/fake/sock", propose: async () => ({ state: "applied" }) },
+    );
+    expect(res).toMatchObject({ ok: true, changed: false });
+    expect(res.requestId).toBeUndefined();
+  });
+
+  it("does NOT write the config — it proposes via hostd and polls to applied", async () => {
+    const calls: Array<{ reqId: string; diff: string; reason: string }> = [];
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "lisa@outlook.com", agent: "marko", action: "enable" },
+      {
+        socketPath: "/fake/operator/sock",
+        // node:child_process is globally mocked in this suite, so inject a
+        // diff stub instead of the real git generator (covered separately
+        // in config-diff.test.ts). The stub sees the computed before/after.
+        generateDiff: (before, after) =>
+          `--- a/switchroom.yaml\n+++ b/switchroom.yaml\n@@ @@\nDIFF(${after.includes("lisa@outlook.com") ? "has-account" : "no-account"})`,
+        propose: async (reqId, diff, reason) => {
+          calls.push({ reqId, diff, reason });
+          return { state: "applied" };
+        },
+      },
+    );
+    expect(res).toMatchObject({ ok: true, changed: true, pendingApproval: true });
+    expect(res.requestId).toBeTruthy();
+    // The config file on disk is UNCHANGED (hostd would write it; here propose is faked).
+    expect(readFileSync(cfgPath, "utf-8")).toBe(VALID_YAML);
+    // The proposal carries the computed diff + a descriptive reason.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].diff).toContain("has-account");
+    expect(calls[0].reason).toContain("enable marko");
+
+    // Initially pending; after the background propose resolves → applied.
+    expect(handleGetConnectionAccessStatus(res.requestId!).state).toMatch(/pending|applied/);
+    await flush();
+    const st = handleGetConnectionAccessStatus(res.requestId!);
+    expect(st.state).toBe("applied");
+    if (st.state === "applied") expect(st.restartAgent).toBe("marko");
+  });
+
+  it("surfaces an operator denial via the status poll", async () => {
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "lisa@outlook.com", agent: "marko", action: "enable" },
+      {
+        socketPath: "/fake/sock",
+        generateDiff: () => "--- a/x\n+++ b/x\n@@ @@\n+y",
+        propose: async () => ({ state: "denied", reason: "operator denied" }),
+      },
+    );
+    await flush();
+    const st = handleGetConnectionAccessStatus(res.requestId!);
+    expect(st.state).toBe("denied");
+    if (st.state === "denied") expect(st.reason).toContain("denied");
+  });
+
+  it("fails clearly when hostd is unreachable (no socket)", () => {
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "lisa@outlook.com", agent: "marko", action: "enable" },
+      { socketPath: null },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("hostd");
+  });
+
+  it("returns 'unknown' for an unrecognized requestId", () => {
+    expect(handleGetConnectionAccessStatus("nope").state).toBe("unknown");
+  });
+
+  it("disabling from account A does NOT clear a pin that points at account B", () => {
+    // marko is pinned to B AND (inconsistently) listed in A's ACL.
+    // Disabling marko from A must remove it from A's enabled_for but
+    // leave the B pin intact — never revoke unrelated access.
+    const yaml = `switchroom:
+  version: 1
+  agents_dir: ~/.switchroom/agents
+telegram:
+  bot_token: x
+  forum_chat_id: "-1001234"
+agents:
+  marko:
+    extends: default
+    topic_name: Marko
+    microsoft_workspace:
+      account: b@outlook.com
+microsoft_accounts:
+  a@outlook.com:
+    enabled_for:
+      - marko
+  b@outlook.com:
+    enabled_for:
+      - marko
+`;
+    writeFileSync(cfgPath, yaml);
+    let capturedAfter = "";
+    const res = handleSetConnectionAccess(
+      cfgPath,
+      cfg,
+      { provider: "microsoft", account: "a@outlook.com", agent: "marko", action: "disable" },
+      {
+        socketPath: "/fake/sock",
+        generateDiff: (_before, after) => { capturedAfter = after; return "@@ d @@"; },
+        propose: async () => ({ state: "applied" }),
+      },
+    );
+    expect(res.ok).toBe(true);
+    expect(res.changed).toBe(true);
+    // The pin to B survives; only A's ACL entry is dropped.
+    expect(capturedAfter).toContain("account: b@outlook.com");
+    const aBlock = capturedAfter.slice(capturedAfter.indexOf("a@outlook.com"));
+    expect(aBlock.slice(0, aBlock.indexOf("b@outlook.com"))).not.toContain("- marko");
   });
 });
 

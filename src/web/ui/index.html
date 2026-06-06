@@ -495,15 +495,67 @@
 
     async function fetchConnections() {
       try {
-        const [google, microsoft, notion] = await Promise.all([
+        const [google, microsoft, notion, agents] = await Promise.all([
           fetch(`${API}/api/google-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
           fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
           fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }).then(r => r.ok ? r.json() : { configured: false, databases: [] }),
+          fetch(`${API}/api/agents`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
         ]);
-        renderConnections({ google, microsoft, notion });
+        const agentNames = (agents || []).map(a => a.name).sort();
+        renderConnections({ google, microsoft, notion, agentNames });
         clearError();
       } catch (err) {
         showError(`Failed to fetch connections: ${err.message}`);
+      }
+    }
+
+    // Toggle an agent's access to an account. POSTs a proposal → hostd
+    // raises a Telegram Allow/Deny card → we poll the outcome. Nothing
+    // changes until the operator taps Allow on their phone (the leash).
+    async function toggleAccess(provider, account, agent, enable, btnId) {
+      const btn = document.getElementById(btnId);
+      const setLabel = (txt, dim) => { if (btn) { btn.textContent = txt; btn.style.opacity = dim ? '.6' : '1'; } };
+      setLabel('proposing…', true);
+      try {
+        const res = await fetch(`${API}/api/connections/access`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ provider, account, agent, action: enable ? 'enable' : 'disable' }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) { setLabel('error', false); showError(data.error || `HTTP ${res.status}`); return; }
+        if (data.changed === false) { setLabel(enable ? 'enabled' : 'disabled', false); return; }
+        if (!data.requestId) { setLabel('done', false); fetchConnections(); return; }
+        setLabel('check Telegram → approve', true);
+        // Poll the approval outcome (operator has up to ~10 min to tap).
+        const started = Date.now();
+        const poll = async () => {
+          const sres = await fetch(`${API}/api/connections/access/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
+          const s = sres.ok ? await sres.json() : { state: 'error', reason: `HTTP ${sres.status}` };
+          if (s.state === 'pending') {
+            if (Date.now() - started > 11 * 60 * 1000) { setLabel('timed out', false); return; }
+            setTimeout(poll, 2500);
+            return;
+          }
+          if (s.state === 'applied') {
+            setLabel('✓ approved', false);
+            showError('');
+            // Restart suggestion: the agent loads the MCP at boot.
+            if (s.restartAgent && confirm(`Approved. Restart ${s.restartAgent} now so it picks up the change?`)) {
+              await fetch(`${API}/api/agents/${encodeURIComponent(s.restartAgent)}/restart`, { method: 'POST', headers: authHeaders() }).catch(() => {});
+            }
+            fetchConnections();
+          } else if (s.state === 'denied') {
+            setLabel('denied', false);
+          } else {
+            setLabel('error', false);
+            showError(s.reason || 'proposal failed');
+          }
+        };
+        setTimeout(poll, 2000);
+      } catch (err) {
+        setLabel('error', false);
+        showError(err.message);
       }
     }
 
@@ -993,9 +1045,14 @@
 
     const _dimC = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
 
+    let _accessBtnSeq = 0;
+
     // One OAuth-account card (Google or Microsoft — same shape; Microsoft
-    // adds an account-type pill).
+    // adds an account-type pill). When agentNames is supplied, renders a
+    // per-agent "manage access" row (enable/disable → Telegram approval).
     function renderOAuthAccountCard(a, opts) {
+      const provider = (opts && opts.provider) || '';
+      const agentNames = (opts && opts.agentNames) || [];
       const expires = a.expiresAt ? formatTimestamp(a.expiresAt) : _dimC('—');
       const known = a.brokerKnown
         ? '<span class="usage-pill primary">slot present</span>'
@@ -1005,6 +1062,19 @@
         : _dimC('no agents enabled');
       const typePill = (opts && opts.showType && a.accountType)
         ? `<span class="usage-pill" style="margin-left:.4rem">${escapeHtml(a.accountType)}</span>`
+        : '';
+      const enabledSet = new Set(a.enabledFor || []);
+      const manage = (agentNames.length && provider)
+        ? `<div class="account-usage" style="margin-top:.5rem">
+             <label style="color:var(--text-dim);opacity:.7;display:block;margin-bottom:.3rem">Manage access (approve on Telegram):</label>
+             ${agentNames.map(name => {
+               const on = enabledSet.has(name);
+               const btnId = `acc-${++_accessBtnSeq}`;
+               const accJs = JSON.stringify(a.account), nameJs = JSON.stringify(name), provJs = JSON.stringify(provider);
+               return `<button id="${btnId}" class="usage-pill ${on ? 'primary' : ''}" style="margin:.15rem;cursor:pointer;border:none"
+                 onclick='toggleAccess(${provJs}, ${accJs}, ${nameJs}, ${!on}, "${btnId}")'>${on ? '✓ ' : '+ '}${escapeHtml(name)}</button>`;
+             }).join('')}
+           </div>`
         : '';
       return `
       <div class="account-card">
@@ -1018,6 +1088,7 @@
           <div class="meta-item" title="${a.scope ? escapeHtml(a.scope) : ''}"><label>Scope </label><span>${a.scope ? escapeHtml(a.scope.split(' ').length + ' scope(s)') : _dimC('—')}</span></div>
           <div class="meta-item"><label>Client </label><span>${a.clientId ? escapeHtml(a.clientId.slice(0, 16) + '…') : _dimC('—')}</span></div>
         </div>
+        ${manage}
       </div>`;
     }
 
@@ -1036,17 +1107,18 @@
       const google = data.google || [];
       const microsoft = data.microsoft || [];
       const notion = data.notion || { configured: false, databases: [] };
+      const agentNames = data.agentNames || [];
 
       const googleSection = _connectionSection(
         'Google',
         'No Google accounts. Add one under <code>google_accounts:</code> and run <code>switchroom auth google account add</code>.',
-        google.map(a => renderOAuthAccountCard(a, { showType: false })).join(''),
+        google.map(a => renderOAuthAccountCard(a, { showType: false, provider: 'google', agentNames })).join(''),
       );
 
       const microsoftSection = _connectionSection(
         'Microsoft 365',
         'No Microsoft accounts. Connect one from Telegram with <code>/connect microsoft</code> (admin DM), or <code>switchroom auth microsoft account add</code>.',
-        microsoft.map(a => renderOAuthAccountCard(a, { showType: true })).join(''),
+        microsoft.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join(''),
       );
 
       let notionCards = '';
