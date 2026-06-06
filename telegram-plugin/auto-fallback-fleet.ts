@@ -40,7 +40,6 @@ import {
   renderFallbackAnnouncement,
   classifyHealth,
   buildSnapshotsFromState,
-  type AccountSnapshot,
 } from './auth-snapshot-format.js';
 
 export type FleetFallbackOutcome =
@@ -52,10 +51,12 @@ export type FleetFallbackOutcome =
       /** Quota for the OLD account at the moment of failure — caller
        *  may persist this as the broker's `quota.json` so the next
        *  /auth render reflects the freshly-known exhaustion without
-       *  another probe. */
-      oldQuota: QuotaUtilization;
-      /** Quota for the new active account, useful for caller logging. */
-      newQuota: QuotaUtilization;
+       *  another probe. Null when the live probe failed but the broker
+       *  rolled anyway (it owns the authoritative exhaustion state). */
+      oldQuota: QuotaUtilization | null;
+      /** Quota for the new active account, useful for caller logging.
+       *  Null when the rolled-to account had no successful probe. */
+      newQuota: QuotaUtilization | null;
     }
   | {
       kind: 'all-blocked';
@@ -82,8 +83,15 @@ export interface FleetFallbackDeps {
    *  Get via `client.probeQuota(state.accounts.map(a => a.label))`
    *  and map the response back to per-account results (#1336). */
   quotas: QuotaResult[];
-  /** Broker `setActive` invoker. Returns the result for logging. */
-  setActive: (label: string) => Promise<{ active: string; fanned: string[] }>;
+  /** Non-admin failover invoker — the broker's `mark-exhausted` verb. Marks
+   *  the triggering agent's (exhausted) account and rolls every agent on it to
+   *  the next non-exhausted `fallback_order` account, returning that target as
+   *  `rolledTo` (null when every fallback is also exhausted). This is what lets
+   *  auto-fallback work from ANY agent — `set-active` (the admin verb the manual
+   *  /auth button uses) is gated to admin agents, so a non-admin agent that
+   *  429'd could never self-heal. mark-exhausted derives the account from the
+   *  caller's own identity, so it needs no admin. */
+  failover: () => Promise<{ rolledTo: string | null; rolled: string[] }>;
   /** Agent that triggered this fallback (for the announcement byline). */
   triggerAgent: string;
   /** Operator timezone for absolute reset times in the announcement. */
@@ -131,10 +139,18 @@ export async function runFleetAutoFallback(
     };
   }
 
-  const target = pickFallbackTarget(snapshots);
-  if (!target) {
-    // All-blocked path: no eligible target. Still notify the user with
-    // earliest-reset info via the announcement formatter.
+  // Execute the non-admin swap. The broker marks the triggering agent's
+  // (exhausted) account and rolls the fleet to the next non-exhausted
+  // fallback_order account, returning it as `rolledTo`. We trust the broker's
+  // choice (same `nextHealthyAccount` selection /auth rotate uses) rather than
+  // picking here, so the announcement matches what actually happened. Caller
+  // catches and surfaces failures — we don't double-wrap.
+  const { rolledTo } = await deps.failover();
+
+  if (!rolledTo) {
+    // All-blocked path: the broker found no non-exhausted fallback. The active
+    // account IS now marked exhausted (good for consumers/telemetry), but there
+    // was nowhere to roll. Notify with earliest-reset info.
     return {
       kind: 'all-blocked',
       oldLabel: oldSnap.label,
@@ -151,22 +167,22 @@ export async function runFleetAutoFallback(
     };
   }
 
-  // Execute the broker swap. Caller catches and surfaces the failure
-  // — we don't double-wrap.
-  await deps.setActive(target.label);
+  // Quota for the rolled-to account, looked up from the same probe snapshots
+  // (the broker chose by fallback_order, which may differ from the
+  // lowest-utilization heuristic — the announcement reflects the real target).
+  const newQuota = snapshots.find((s) => s.label === rolledTo)?.quota ?? null;
 
   return {
     kind: 'switched',
     oldLabel: oldSnap.label,
-    newLabel: target.label,
-    oldQuota: oldSnap.quota!, // non-null: only `unknown` health gets here through
-    // the no-target branch, never the switched one
-    newQuota: target.quota!,
+    newLabel: rolledTo,
+    oldQuota: oldSnap.quota,
+    newQuota,
     announcement: renderFallbackAnnouncement({
       oldLabel: oldSnap.label,
       oldQuota: oldSnap.quota,
-      newLabel: target.label,
-      newQuota: target.quota,
+      newLabel: rolledTo,
+      newQuota,
       triggerAgent: deps.triggerAgent,
       tz,
       now,
@@ -174,40 +190,12 @@ export async function runFleetAutoFallback(
   };
 }
 
-/**
- * Pick the best non-active fallback target. Selection order:
- *   1. Healthy accounts, sorted by lowest 5h utilization (most
- *      runway).
- *   2. If no healthy alternative, throttling accounts sorted by
- *      lowest binding-window utilization (least worst).
- *   3. Skip blocked + unknown entirely — never recommend a switch
- *      into a wall, never bet on creds we couldn't probe.
- *
- * Returns null when no eligible target exists.
- */
-export function pickFallbackTarget(
-  snapshots: AccountSnapshot[],
-): AccountSnapshot | null {
-  const candidates = snapshots
-    .filter((s) => !s.isActive && s.quota != null)
-    .map((s) => ({ snap: s, health: classifyHealth(s) }));
-
-  const healthy = candidates
-    .filter((c) => c.health === 'healthy')
-    .sort((a, b) => a.snap.quota!.fiveHourUtilizationPct - b.snap.quota!.fiveHourUtilizationPct);
-  if (healthy.length > 0) return healthy[0]!.snap;
-
-  const throttling = candidates
-    .filter((c) => c.health === 'throttling')
-    .sort((a, b) => maxWindow(a.snap.quota!) - maxWindow(b.snap.quota!));
-  if (throttling.length > 0) return throttling[0]!.snap;
-
-  return null;
-}
-
-function maxWindow(q: QuotaUtilization): number {
-  return Math.max(q.fiveHourUtilizationPct, q.sevenDayUtilizationPct);
-}
+// NOTE: target SELECTION now lives in the broker (`nextHealthyAccount`,
+// fallback_order order — the same selection /auth rotate uses). This module
+// no longer picks a target; it calls the non-admin `failover()` (mark-exhausted)
+// and announces whatever the broker rolled to. A second, divergent selector
+// here (the old lowest-utilization `pickFallbackTarget`) was removed so there's
+// one authoritative chooser.
 
 function pctSummary(q: QuotaUtilization | null): string {
   if (!q) return 'no probe';

@@ -496,18 +496,54 @@ describe("AuthBroker — mark-exhausted", () => {
     });
     await broker.start();
     const until = Date.now() + 60_000;
+    // ziggy is NOT an admin agent (admin_agents is unset here) — yet
+    // mark-exhausted succeeds. This is the whole point of routing auto-fallback
+    // through mark-exhausted instead of the admin-gated set-active: the agent
+    // that just 429'd can self-heal the fleet without being admin.
     const resp = await rpc(join(h.socketRoot, "ziggy", "sock"), {
       v: 1, id: "1", op: "mark-exhausted", until,
-    }) as { ok: boolean; data: { account: string; rolled: string[] } };
+    }) as { ok: boolean; data: { account: string; rolled: string[]; rolledTo: string | null } };
     expect(resp.ok).toBe(true);
     expect(resp.data.account).toBe("default");
     expect(resp.data.rolled).toContain("ziggy");
+    // rolledTo names the account the fleet rolled to (next non-exhausted in
+    // fallback_order) so a non-admin caller can announce an accurate swap.
+    expect(resp.data.rolledTo).toBe("secondary");
     // Persisted to disk
     const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
     expect(quota["default"].exhausted_until).toBe(until);
     // Agent mirror now holds the secondary account creds.
     const mirror = readFileSync(join(h.agentsDir, "ziggy", ".claude", ".credentials.json"), "utf-8");
     expect(mirror).toContain("at-secondary");
+    broker.stop();
+  });
+
+  it("returns rolledTo=null when there is no other account to roll to", async () => {
+    // fallback_order has only the (now-exhausted) active account → nowhere to
+    // roll → rolledTo null, rolled empty. The gateway maps this to the
+    // all-blocked announcement.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default"],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    await broker.start();
+    const resp = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    }) as { ok: boolean; data: { account: string; rolled: string[]; rolledTo: string | null } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("default");
+    expect(resp.data.rolledTo).toBeNull();
+    expect(resp.data.rolled).toEqual([]);
     broker.stop();
   });
 });

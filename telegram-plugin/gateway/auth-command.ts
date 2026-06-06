@@ -214,6 +214,14 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
 export interface AuthBrokerClient {
   listState(): Promise<ListStateData>
   setActive(label: string): Promise<{ active: string; fanned: string[] }>
+  /**
+   * Non-admin failover (broker `mark-exhausted`). Marks the CALLER's own
+   * account exhausted and rolls every agent on it to the next non-exhausted
+   * `fallback_order` account, returned as `rolledTo` (null when none). Unlike
+   * `setActive` this needs no admin — the account is derived from the caller's
+   * identity — so auto-fallback works from any agent.
+   */
+  markExhausted(until?: number): Promise<{ account: string; rolled: string[]; rolledTo?: string | null }>
   rmAccount(label: string): Promise<{ label: string }>
   refreshAccount(label: string): Promise<{ account: string; expiresAt?: number }>
   setOverride(

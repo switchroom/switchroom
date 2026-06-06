@@ -27,6 +27,7 @@ export function createAuthBrokerClient(): {
   const client: AuthBrokerClient = {
     listState: () => broker.listState(),
     setActive: (label: string) => broker.setActive(label),
+    markExhausted: (until?: number) => broker.markExhausted(until),
     rmAccount: (label: string) => broker.rmAccount(label),
     refreshAccount: (label: string) => broker.refreshAccount(label),
     setOverride: (agent: string, account: string | null) =>

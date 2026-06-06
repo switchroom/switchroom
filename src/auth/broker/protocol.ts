@@ -402,6 +402,10 @@ export const SetActiveDataSchema = z.object({
 export const MarkExhaustedDataSchema = z.object({
   account: z.string(),
   rolled: z.array(z.string()),
+  // The account the fleet rolled TO (next non-exhausted in fallback_order),
+  // or null when every fallback is also exhausted. Lets a non-admin caller
+  // (auto-fallback) announce an accurate target without an admin set-active.
+  rolledTo: z.string().nullable().optional(),
 });
 
 export const RefreshAccountDataSchema = z.object({
