@@ -373,6 +373,47 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
     expect(resp.data.account).toBe("secondary");
     broker.stop();
   });
+
+  it("a consumer's mark-exhausted attributes to its PINNED account, never the failover view", async () => {
+    // Invariant (schema.ts): mark-exhausted from a consumer only affects ITS
+    // account. Failover must NOT leak into attribution — else a consumer being
+    // SERVED a failover account could mark that healthy account exhausted and
+    // cascade the fleet off it. This test fails if get-credentials' failover
+    // view bleeds into mark-exhausted.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+      agents: { marker: { auth: { override: "secondary" } } },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+    // Exhaust secondary (via an agent on it) → consumer failover is now active.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    // Confirm failover is live: the consumer is being SERVED the healthy default.
+    const served = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { data: { account: string } };
+    expect(served.data.account).toBe("default");
+    // The consumer reports exhaustion. It must mark its PINNED account
+    // (secondary), NOT the served failover account (default).
+    await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "3", op: "mark-exhausted", until: Date.now() + 120_000,
+    });
+    // default must remain healthy — the consumer cannot poison the failover account.
+    const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
+    expect((quota["default"]?.exhausted_until ?? 0) > Date.now()).toBe(false);
+    expect(quota["secondary"].exhausted_until > Date.now()).toBe(true);
+    broker.stop();
+  });
 });
 
 describe("AuthBroker — admin gating", () => {
