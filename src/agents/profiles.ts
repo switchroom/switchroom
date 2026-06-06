@@ -171,7 +171,7 @@ Handlebars.registerHelper("isNumber", (value: unknown) => {
 // The _shared/ directory is underscore-prefixed (like _base/) and is not
 // listed by listAvailableProfiles() — it's framework-internal.
 const SHARED_FRAGMENTS_DIR = resolve(PROFILES_ROOT, "_shared");
-const SHARED_FRAGMENTS = ["telegram-style", "vault-protocol", "agent-self-service"] as const;
+const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service"] as const;
 for (const name of SHARED_FRAGMENTS) {
   const fragPath = join(SHARED_FRAGMENTS_DIR, `${name}.md.hbs`);
   if (existsSync(fragPath)) {
@@ -181,10 +181,9 @@ for (const name of SHARED_FRAGMENTS) {
 
 /**
  * Render the vault-protocol fragment standalone for unconditional
- * append to every agent's CLAUDE.md. Unlike `telegram-style` (which
- * profiles opt into via `{{> telegram-style}}`), vault-protocol is
- * load-bearing safety guidance — every agent gets it, regardless of
- * whether their profile template remembered to include the partial.
+ * append to every agent's CLAUDE.md. vault-protocol is load-bearing
+ * safety guidance — every agent gets it, regardless of whether their
+ * profile template remembered to include a partial.
  *
  * Returns the rendered Markdown, or an empty string if the fragment
  * file is missing (e.g. partial install).

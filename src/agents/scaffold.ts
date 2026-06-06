@@ -1545,6 +1545,25 @@ function seedWorkspaceBootstrapFiles(params: {
       if (entry.endsWith(".hbs")) {
         const destRel = relPath.replace(/\.hbs$/, "");
         const destPath = join(agentWorkspaceDir, destRel);
+        // SOUL.default.md is switchroom-OWNED, not user-owned: restore it
+        // from the current profile template on every reconcile (overwrite
+        // when changed) so baseline-persona improvements propagate
+        // fleet-wide. The operator never edits it — their persona lives in
+        // SOUL.md (seed-once below), which is composed AFTER it in the
+        // stable bootstrap and therefore takes precedence. No sidecar
+        // fold and no backup: there are no operator edits to preserve.
+        if (destRel === "SOUL.default.md") {
+          const rendered = renderTemplate(srcPath, params.context);
+          const existed = existsSync(destPath);
+          const current = existed ? readFileSync(destPath, "utf8") : null;
+          if (current !== rendered) {
+            writeFileSync(destPath, rendered);
+            params.created.push(destPath);
+          } else {
+            params.skipped.push(destPath);
+          }
+          continue;
+        }
         const renderFn = (): string => {
           // SOUL.md goes through the shared renderSoulMd path (folds in
           // the SOUL.custom.md sidecar at seed time). Post-seed the file
