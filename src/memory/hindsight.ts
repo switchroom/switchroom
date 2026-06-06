@@ -346,14 +346,26 @@ export async function ensureUserProfileMentalModel(
         const listData = await parseSseOrJson<{
           result?: { content?: Array<{ text?: string }> };
         }>(listResponse);
+        // The list payload is a JSON STRING of {items:[{name,...}]}. The old
+        // existence check did a naive substring `models.includes("user-profile")`
+        // on that whole blob — which FALSE-POSITIVED whenever ANOTHER mental
+        // model's name / source_query / content merely contained the substring
+        // "user-profile" (e.g. lawgpt's Lisa-focused models, or a sibling
+        // "User Profile" model). That made `ensureUserProfileMentalModel` skip
+        // creation and report "ready" while the bank had NO user-profile model.
+        // Match by exact item NAME instead.
         const models = listData.result?.content?.[0]?.text;
-        if (models && typeof models === "string" && models.includes("user-profile")) {
-          return { ok: true }; // Already exists
+        if (models && typeof models === "string") {
+          const parsed = JSON.parse(models) as { items?: Array<{ name?: string }> };
+          const items = Array.isArray(parsed?.items) ? parsed.items : [];
+          if (items.some((m) => m?.name === "user-profile")) {
+            return { ok: true }; // Already exists (by exact name)
+          }
         }
       } catch {
-        // Parse failed (not SSE and not JSON). Fall through to create attempt;
-        // if the MM already exists, create will return an idempotent error
-        // we also swallow below.
+        // Parse failed (not SSE / not the expected JSON shape). Fall through to
+        // the create attempt; if the MM already exists, create returns an
+        // idempotent error we swallow below.
       }
     }
 
