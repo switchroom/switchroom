@@ -2533,9 +2533,13 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(cmd).toMatch(/GROUND BEFORE YOU ASSERT/);
     expect(cmd).toMatch(/checked\s+THIS turn/);
     expect(cmd).toMatch(/leads to verify, not sources/);
-    // Voice contract
+    // Voice contract (context-aware: skip hollow openers, keep genuine
+    // acknowledgement; plain punctuation). Tone is prompt-driven; the
+    // deterministic opener strip is off by default.
     expect(cmd).toMatch(/VOICE: write like a sharp colleague/);
-    expect(cmd).toMatch(/Do not open with affirmation/);
+    expect(cmd).toMatch(/Skip the hollow openers/);
+    expect(cmd).toMatch(/Genuine acknowledgement is fine/);
+    expect(cmd).toMatch(/plain punctuation/);
   });
 
   it("unions defaults.hooks with per-agent hooks", () => {

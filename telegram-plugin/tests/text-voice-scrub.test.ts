@@ -173,12 +173,17 @@ describe('scrubVoice — em / en dash replacement', () => {
   })
 })
 
-describe('scrubVoice — leading sycophancy openers', () => {
+describe('scrubVoice — leading sycophancy openers (opt-in backstop)', () => {
+  // The opener strip is OFF by default (tone is the prompt's job); these
+  // tests opt it in to exercise the mechanism that remains available via
+  // SWITCHROOM_VOICE_STRIP_OPENERS=1.
   beforeEach(() => {
     delete process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
+    process.env.SWITCHROOM_VOICE_STRIP_OPENERS = '1'
   })
   afterEach(() => {
     delete process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
+    delete process.env.SWITCHROOM_VOICE_STRIP_OPENERS
   })
 
   it('strips a leading "You\'re absolutely right" and recapitalizes', () => {
@@ -259,5 +264,45 @@ describe('scrubVoice — leading sycophancy openers', () => {
     expect(r.scrubbed).toBe("You're absolutely right, the build is broken.")
     expect(r.replaced).toBe(0)
     expect(r.openersStripped).toBe(0)
+  })
+})
+
+describe('scrubVoice — opener strip is OFF by default (prompt carries tone)', () => {
+  // No SWITCHROOM_VOICE_STRIP_OPENERS set: the deterministic layer must
+  // NOT delete words. Em-dash normalization (punctuation, no content
+  // removed) still runs. Tone is the prompt VOICE directive's job.
+  beforeEach(() => {
+    delete process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
+    delete process.env.SWITCHROOM_VOICE_STRIP_OPENERS
+  })
+  afterEach(() => {
+    delete process.env.SWITCHROOM_VOICE_STRIP_OPENERS
+  })
+
+  it('does NOT strip a leading affirmation by default', () => {
+    const r = scrubVoice("You're absolutely right, the build is broken.")
+    expect(r.scrubbed).toBe("You're absolutely right, the build is broken.")
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('does NOT strip "Great catch" by default', () => {
+    const r = scrubVoice('Great catch! Fixed it.')
+    expect(r.scrubbed).toBe('Great catch! Fixed it.')
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('STILL normalizes em-dashes by default (punctuation, no content removed)', () => {
+    const r = scrubVoice('on it — checking the calendar')
+    expect(r.scrubbed).toBe('on it, checking the calendar')
+    expect(r.replaced).toBe(1)
+    expect(r.openersStripped).toBe(0)
+  })
+
+  it('an affirmation opener with an em-dash keeps the words, fixes only the dash', () => {
+    const r = scrubVoice('Exactly right — the token had expired.')
+    // Opener preserved; the em-dash after it becomes a comma.
+    expect(r.scrubbed).toBe('Exactly right, the token had expired.')
+    expect(r.openersStripped).toBe(0)
+    expect(r.replaced).toBe(1)
   })
 })

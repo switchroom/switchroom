@@ -12,22 +12,27 @@
  * owns enforcement, soft instructions fail under load. Make the
  * framework do it.
  *
- * Scope. Two mechanical transforms, both semantically safe:
- *   1. Em / en dashes -> comma/period/hyphen. Pure transform with no
- *      semantic loss on whitespace-separated prose; a no-op inside code
- *      or a URL.
- *   2. Leading sycophancy openers ("You're absolutely right", "Great
- *      catch", "Exactly right") -> deleted, next word recapitalized. A
- *      leading pure-affirmation clause carries near-zero meaning, so
- *      removing it strips the AI-tell without touching the substance.
- *      Conservative by construction: only at the very start, only the
- *      known affirmation set, only when real content follows (a
- *      standalone "You're absolutely right!" ack is left intact).
+ * Scope. By default ONE mechanical transform, the only one that removes
+ * no content:
+ *   1. Em / en dashes -> comma/period/hyphen. Pure punctuation
+ *      substitution, no semantic loss on whitespace-separated prose; a
+ *      no-op inside code or a URL. Kept deterministic because prompt-only
+ *      guidance was measured to fail at it (em-dashes in 73% of replies
+ *      despite the SOUL rule).
  *
- * Still scoped OUT: the wider mid-sentence "AI-tell phrase denylist"
+ * OPT-IN, off by default:
+ *   2. Leading sycophancy openers ("You're absolutely right", "Great
+ *      catch") -> deleted + recapitalized. This one removes WORDS, and a
+ *      context-free hook can strip a sincere "good catch, that was my
+ *      bug" along with the hollow kind. Per operator steer (2026-06),
+ *      tone is carried by the prompt VOICE directive (where the model has
+ *      context to keep genuine acknowledgement and drop only the empty
+ *      reflexive praise), not by blind deletion here. Re-enable the
+ *      backstop with `SWITCHROOM_VOICE_STRIP_OPENERS=1`.
+ *
+ * Always scoped OUT: the wider mid-sentence "AI-tell phrase denylist"
  * (smoking gun, delve, etc.). Substituting those mid-clause risks
- * semantic loss, so they stay with the prompt-side voice guidance
- * (the turn-pacing VOICE directive), not this mechanical gate.
+ * semantic loss, so they stay with the prompt-side voice guidance.
  *
  * Pipeline integration. Apply BEFORE markdownToHtml so the scrub
  * runs on the original model text, not on rendered HTML where
@@ -80,6 +85,25 @@ const URL_RE = /https?:\/\/\S+/g
 function enabled(): boolean {
   const v = process.env.SWITCHROOM_DISABLE_VOICE_SCRUB
   return !(v === '1' || v === 'true')
+}
+
+/**
+ * Leading-affirmation stripping is OPT-IN and OFF by default.
+ *
+ * Rationale (operator steer, 2026-06): tone should be carried by the
+ * prompt (the VOICE directive), where the model has context to keep a
+ * genuine acknowledgement and drop only the hollow reflexive kind.
+ * Deleting an opener in a context-free hook is bad UX: it can strip a
+ * sincere "good catch, that was my bug" along with the empty praise.
+ * So the deterministic layer no longer removes WORDS by default; it
+ * only normalizes em/en dashes (a punctuation substitution that removes
+ * no content, and that prompt-only guidance was measured to fail at).
+ * Set `SWITCHROOM_VOICE_STRIP_OPENERS=1` to re-enable the deterministic
+ * opener strip as a backstop.
+ */
+function openerStripEnabled(): boolean {
+  const v = process.env.SWITCHROOM_VOICE_STRIP_OPENERS
+  return v === '1' || v === 'true'
 }
 
 /**
@@ -250,7 +274,13 @@ export function scrubVoice(text: string): VoiceScrubResult {
     return { scrubbed: text, replaced: 0, openersStripped: 0 }
   }
   const { parked, parts } = park(text)
-  const opener = stripLeadingAffirmation(parked)
+  // Opener strip is opt-in (default off) — see openerStripEnabled(). By
+  // default the deterministic layer removes no words; only em/en dashes
+  // are normalized below, and tone is left to the prompt's VOICE
+  // directive where the model can judge genuine vs hollow.
+  const opener = openerStripEnabled()
+    ? stripLeadingAffirmation(parked)
+    : { out: parked, count: 0 }
   const { out, replaced } = replaceDashes(opener.out)
   const total = replaced + opener.count
   if (total === 0) {
