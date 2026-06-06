@@ -900,7 +900,14 @@ export class AuthBroker {
     socket.write(encodeError(id, "FORBIDDEN", why));
   }
 
-  /** Resolve the account a caller is bound to (used by get-credentials / mark-exhausted). */
+  /**
+   * The account a caller is PINNED/BOUND to — the raw, attribution-true
+   * resolution. This is what `mark-exhausted` must use: the exhaustion signal
+   * has to attribute to the account the caller actually owns, never a failover
+   * view (otherwise a consumer could mark a healthy fallback account exhausted
+   * and cascade the fleet off it). For SERVING credentials, use
+   * `servingAccount`, which layers consumer failover on top.
+   */
   private callerAccount(identity: Identity): string | null {
     const auth = this.config.auth;
     if (!auth) return null;
@@ -916,6 +923,47 @@ export class AuthBroker {
     return auth.active ?? null;
   }
 
+  /**
+   * The account to SERVE credentials for. Same as `callerAccount`, except a
+   * consumer (e.g. hindsight) whose pinned account is quota-exhausted fails
+   * over to the first healthy account in `fallback_order`.
+   *
+   * Consumers are pinned to a dedicated account for quota isolation, but a
+   * pinned account that exhausts would otherwise leave the consumer dead —
+   * agents avoid this because they ride the swappable `auth.active`. Failover
+   * gives consumers the same resilience; it reverts automatically once the
+   * exhaustion window passes, and propagates via the consumer's background
+   * cred-refresh loop. Failover applies ONLY to the serving path — never to
+   * attribution (`callerAccount`) — so a consumer can never mismark the wrong
+   * account exhausted.
+   */
+  private servingAccount(identity: Identity): string | null {
+    const account = this.callerAccount(identity);
+    if (identity.kind !== "consumer") return account;
+    return this.consumerAccountWithFailover(account);
+  }
+
+  /** True if `account` is currently within a mark-exhausted window. */
+  private isAccountExhausted(account: string): boolean {
+    const q = this.quota[account];
+    return q !== undefined && q.exhausted_until > this.now();
+  }
+
+  /**
+   * A consumer's pinned account, unless it's exhausted — then the first
+   * non-exhausted account in `fallback_order` that has stored credentials.
+   * Falls back to the pinned account if no healthy alternative exists (better
+   * to retry the pinned one than serve nothing).
+   */
+  private consumerAccountWithFailover(pinned: string | null): string | null {
+    if (!pinned || !this.isAccountExhausted(pinned)) return pinned;
+    for (const cand of this.config.auth?.fallback_order ?? []) {
+      if (cand === pinned || this.isAccountExhausted(cand)) continue;
+      if (readAccountCredentials(cand, this.home)) return cand;
+    }
+    return pinned;
+  }
+
   /* ─── Op handlers ───────────────────────────────────────────── */
 
   private async opGetCredentials(
@@ -923,7 +971,9 @@ export class AuthBroker {
     id: string,
     identity: Identity,
   ): Promise<void> {
-    const account = this.callerAccount(identity);
+    // Serving path → failover-aware (a consumer's exhausted pinned account
+    // fails over). mark-exhausted stays on the raw callerAccount for attribution.
+    const account = this.servingAccount(identity);
     if (!account) {
       this.audit({ op: "get-credentials", identity, ok: false, error: "no-active-account" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
