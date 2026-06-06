@@ -28,6 +28,7 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled } from "../memory/hindsight.js";
+import { checkHindsightContainerHealth } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -1006,6 +1007,12 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // the legacy env-leak probe (the OpenAI-key shape it watched for
   // is no longer in use).
   results.push(checkHindsightConsumer(config));
+
+  // Backend health (#outage 2026-06-06): reachability over MCP is NOT enough —
+  // the container can be up and serving MCP while every write silently fails
+  // (shm exhaustion or OAuth quota 429). These surface both from the local
+  // container's shm config + recent logs; no-ops on a remote/dockerless setup.
+  results.push(...checkHindsightContainerHealth());
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {
