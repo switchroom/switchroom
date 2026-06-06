@@ -49,6 +49,39 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(result.agentDir, "start.sh"))).toBe(true);
   });
 
+  it("seeds a switchroom-owned SOUL.default.md baseline that is RESTORED (not seed-once)", () => {
+    const config = makeAgentConfig({});
+    const r1 = scaffoldAgent("persona-agent", config, tmpDir, telegramConfig);
+    const soulDefault = join(r1.agentDir, "workspace", "SOUL.default.md");
+    // Created with the switchroom baseline.
+    expect(existsSync(soulDefault)).toBe(true);
+    const baseline = readFileSync(soulDefault, "utf-8");
+    expect(baseline).toContain("Baseline");
+    expect(baseline).toContain("capable teammate");
+    expect(baseline).toMatch(/SOUL\.md.*(overrides|precedence|below)/i);
+
+    // switchroom-OWNED: tampering is restored on reconcile (unlike the
+    // operator-owned SOUL.md, which is seed-once / never overwritten).
+    writeFileSync(soulDefault, "tampered");
+    const soulMd = join(r1.agentDir, "workspace", "SOUL.md");
+    const operatorPersona = "# My hand-tuned persona\nI am unmistakably custom.";
+    writeFileSync(soulMd, operatorPersona);
+    scaffoldAgent("persona-agent", config, tmpDir, telegramConfig);
+    // Default restored:
+    expect(readFileSync(soulDefault, "utf-8")).toContain("capable teammate");
+    expect(readFileSync(soulDefault, "utf-8")).not.toBe("tampered");
+    // Operator persona preserved (seed-once, never clobbered):
+    expect(readFileSync(soulMd, "utf-8")).toBe(operatorPersona);
+  });
+
+  it("composes SOUL.default before the operator SOUL in the stable bootstrap", async () => {
+    const { STABLE_BOOTSTRAP_FILENAMES } = await import("../src/agents/workspace.js");
+    const di = STABLE_BOOTSTRAP_FILENAMES.indexOf("SOUL.default.md");
+    const si = STABLE_BOOTSTRAP_FILENAMES.indexOf("SOUL.md");
+    expect(di).toBeGreaterThanOrEqual(0);
+    expect(si).toBeGreaterThan(di); // operator SOUL after the default → wins by recency
+  });
+
   it("renders CLAUDE.md with agent name (Phase 2: persona moved to SOUL.md)", () => {
     const config = makeAgentConfig({
       soul: {

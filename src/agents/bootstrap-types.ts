@@ -13,6 +13,15 @@
  */
 
 export const DEFAULT_AGENTS_FILENAME = "AGENTS.md";
+/**
+ * switchroom-owned baseline persona. Composed BEFORE the operator's
+ * SOUL.md in the stable bootstrap so the operator's persona takes
+ * precedence (recency). switchroom restores this on every reconcile, so
+ * baseline improvements propagate without clobbering the operator's
+ * SOUL.md. This is the "switchroom default + operator override" split for
+ * persona — the default is overridable (it is persona, not a guardrail).
+ */
+export const DEFAULT_SOUL_DEFAULT_FILENAME = "SOUL.default.md";
 export const DEFAULT_SOUL_FILENAME = "SOUL.md";
 export const DEFAULT_TOOLS_FILENAME = "TOOLS.md";
 export const DEFAULT_IDENTITY_FILENAME = "IDENTITY.md";
@@ -23,6 +32,7 @@ export const DEFAULT_MEMORY_FILENAME = "MEMORY.md";
 
 export type WorkspaceBootstrapFileName =
   | typeof DEFAULT_AGENTS_FILENAME
+  | typeof DEFAULT_SOUL_DEFAULT_FILENAME
   | typeof DEFAULT_SOUL_FILENAME
   | typeof DEFAULT_TOOLS_FILENAME
   | typeof DEFAULT_IDENTITY_FILENAME

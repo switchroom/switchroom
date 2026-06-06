@@ -195,25 +195,22 @@ describe("renderProfileClaudeTemplate", () => {
   });
 });
 
-describe("telegram-style partial — status? RCA-offer guidance (#162)", () => {
-  // PR #1178 hoisted the inline RCA-flow mechanics (JTBD link, /file-bug
-  // wiring, auto-file anti-pattern, offer-then-confirm flow) out of this
-  // partial into the `switchroom-runtime` skill, so the partial stays
-  // small and the procedural detail lives where the model can fetch it
-  // on demand. The partial's job is now (a) name the UX-failure signal,
-  // (b) route to the skill. The detailed mechanics are pinned against
-  // the skill below.
+describe("status? RCA-offer guidance lives in the switchroom-runtime skill (#162)", () => {
+  // The legacy `_shared/telegram-style.md.hbs` partial was retired
+  // (dead carrier: no profile rendered it; its content moved to the
+  // fleet invariants + this skill). The "status? = UX-failure signal"
+  // guidance and the RCA-offer mechanics now live in the
+  // `switchroom-runtime` skill, fetched on demand. Pinned here.
 
-  it("instructs the agent to treat 'status?' as a UX-failure signal and routes to /switchroom-runtime", () => {
+  it("switchroom-runtime skill carries the status? UX-failure signal + RCA-offer mechanics", () => {
     const REPO_ROOT = resolve(__dirname, "..", "..");
-    const partial = readFileSync(
-      join(REPO_ROOT, "profiles", "_shared", "telegram-style.md.hbs"),
+    const skill = readFileSync(
+      join(REPO_ROOT, "skills", "switchroom-runtime", "SKILL.md"),
       "utf-8",
     );
-    expect(partial).toContain("status?");
-    expect(partial).toContain("UX-failure signal");
-    // Routes to the runtime skill instead of inlining the offer-RCA flow.
-    expect(partial).toContain("/switchroom-runtime");
+    // The UX-failure signal the retired partial used to name.
+    expect(skill).toContain("status?");
+    expect(skill).toContain("UX-failure signal");
   });
 
   it("switchroom-runtime skill carries the RCA-offer mechanics moved from the partial", () => {
