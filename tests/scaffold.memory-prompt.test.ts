@@ -55,7 +55,12 @@ describe("Memory prompt guidance (post-#1850)", () => {
     expect(out).toContain("### Forget proactively");
     expect(out).toContain("### Inspect proactively");
     expect(out).toContain("mcp__hindsight__sync_retain");
-    expect(out).toContain("mcp__hindsight__delete_memory");
+    // The delete tool is `delete_document` (the real server tool). The prior
+    // guidance + this assertion named `delete_memory`, which the hindsight
+    // server REJECTS ("Unknown tool") — agents' forget/correct flows silently
+    // failed. Guard the corrected name.
+    expect(out).toContain("mcp__hindsight__delete_document");
+    expect(out).not.toContain("mcp__hindsight__delete_memory");
     expect(out).toContain("mcp__hindsight__recall");
     expect(out).toContain("mcp__hindsight__reflect");
   });
@@ -136,5 +141,29 @@ describe("Memory prompt guidance (post-#1850)", () => {
     // reconcileAgent should produce identical start.sh for the same
     // input. Confirms the init-vs-reconcile drift fix held.
     expect(reconcileStartSh).toBe(scaffoldStartSh);
+  });
+
+  it("the seeded workspace AGENTS.md/CLAUDE.md has NO file-memory contradiction (hindsight-only)", () => {
+    // Regression: the workspace operating protocol told agents to maintain
+    // MEMORY.md + memory/ daily files, directly contradicting the cwd CLAUDE.md
+    // + fleet invariants ("hindsight is your single backend"). Agents got
+    // opposite memory instructions every turn. The workspace doc now defers to
+    // hindsight and the cwd CLAUDE.md.
+    const agentConfig: AgentConfig = {
+      channels: { telegram: { plugin: "switchroom" } },
+      memory: { collection: "test-agent" },
+    };
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, switchroomConfig);
+    const ws = join(tmpDir, "test-agent", "workspace", "CLAUDE.md");
+    expect(existsSync(ws)).toBe(true);
+    const doc = readFileSync(ws, "utf-8");
+    // The contradictory file-memory prose must be gone.
+    expect(doc).not.toMatch(/MEMORY\.md is your long-term memory/);
+    expect(doc).not.toMatch(/memory\/YYYY-MM-DD/);
+    expect(doc).not.toMatch(/## Memory discipline/);
+    expect(doc).not.toMatch(/memory_search.+memory_get/);
+    // And it must point at hindsight instead.
+    expect(doc).toMatch(/Hindsight/);
+    expect(doc).toMatch(/mcp__hindsight__recall/);
   });
 });

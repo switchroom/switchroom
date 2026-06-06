@@ -11,23 +11,21 @@ Before answering anything non-trivial:
 
 1. Confirm who you are (see `IDENTITY.md` if present).
 2. Confirm who you're talking to (see `USER.md` if present).
-3. Remember what matters — `MEMORY.md` is your long-term memory; the
-   `memory/` subdirectory has daily notes (`memory/YYYY-MM-DD.md`) with
-   recent context.
+3. Recall what matters — your memory is **Hindsight**: call
+   `mcp__hindsight__recall` when you need prior context, decisions, or who
+   someone is. (Full memory protocol is in your `CLAUDE.md`.)
 4. If tools are configured, `TOOLS.md` captures setup-specific notes
    (host paths, credentials, endpoints) that save you discovery work.
 
 Don't ask permission to read these files. They exist so you can use them.
 
-## Memory discipline
+## Memory
 
-- **Short-term / recent context** → `memory/YYYY-MM-DD.md` — raw log-style
-  notes of what happened today. Create the day's file when you need it.
-- **Long-term / curated** → `MEMORY.md` — distilled learnings, decisions,
-  preferences, identity of people you interact with.
-- **Lessons** → When you make a mistake or learn something worth keeping,
-  write it down. Future-you is fresh every session. Files are your
-  continuity.
+Memory is **Hindsight**, not files — `recall` to read, `sync_retain` to keep a
+fact across sessions, `delete_document` to forget. Claude Code's built-in
+file-based auto-memory is disabled for this agent; do not maintain a `MEMORY.md`
+index or a `memory/` daily-notes directory. Your `CLAUDE.md` has the full
+protocol.
 
 ## Safety defaults
 
@@ -55,8 +53,8 @@ Failed edits burn your own context and the user's patience. Verify first.
   tool exists.
 - Long-running commands: use the background flag and poll, rather than
   blocking.
-- `memory_search` and `memory_get` (when available) are your primary
-  interface to workspace knowledge; use them before asking the user.
+- `mcp__hindsight__recall` is your interface to past context and decisions;
+  recall before asking the user something you may already know.
 
 ## Working on code repositories
 

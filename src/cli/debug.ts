@@ -25,8 +25,37 @@ function formatBytes(bytes: number): string {
   return `${bytes.toLocaleString()} bytes`;
 }
 
-function estimateTokens(bytes: number): number {
-  return Math.round(bytes / 4);
+export function estimateTokens(bytes: number): number {
+  // ~3.7 chars/token for switchroom's mixed prose+markdown prompts (the ratio
+  // used by the 2026-06 context audit). The Claude tokenizer is not public and
+  // the API count_tokens endpoint is off-limits (compliance), so this is an
+  // estimate (±~15%), not an exact count.
+  return Math.round(bytes / 3.7);
+}
+
+/**
+ * Sum the per-server tool-schema BYTES from a cached MCP tools snapshot, if one
+ * exists. The dominant per-turn cost (the audit: ~31k tok across ~10 servers)
+ * is the MCP tool-schema surface, which `debug turn` historically omitted —
+ * understating the true floor ~3x. We do NOT spawn the servers here (that would
+ * touch live processes from a read-only command); we count the server ENTRIES
+ * in .mcp.json and annotate the surface as estimated/unmeasured unless a
+ * captured snapshot is present. Returns server names for the annotation.
+ */
+export function readMcpServerNames(agentDir: string): string[] | null {
+  const mcpPath = join(agentDir, ".mcp.json");
+  if (!existsSync(mcpPath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(mcpPath, "utf-8")) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    return Object.keys(parsed.mcpServers ?? {});
+  } catch {
+    // .mcp.json is 0600 agent-private (it can carry per-server env/paths), so
+    // a running agent's file is unreadable from the operator account. Signal
+    // null (unknown) rather than a misleading 0.
+    return null;
+  }
 }
 
 function sha256(content: string): string {
@@ -371,37 +400,79 @@ export function registerDebugCommand(program: Command): void {
           baseSystemPromptAppend.length;
         const perSessionBytes = handoffContent.length;
         const claudeMdBytes = claudeMdContent.length;
+        // SOUL.md is ALREADY inside stableResult.concatenated (it is one of the
+        // STABLE_BOOTSTRAP_FILENAMES), so it must NOT be added to the total
+        // again — the prior code double-counted it. Shown below as an
+        // informational sub-line only.
         const soulMdBytes = soulMdContent.length;
         const perTurnBytes = dynamicResult.concatenated.length;
         const userBytes = userMessage?.text.length ?? 0;
+
+        // --add-dir fleet invariants (switchroom-invariants.md + fleet/CLAUDE.md)
+        // are loaded on EVERY turn via the --add-dir flag but were omitted here.
+        const fleetDir = join(agentsDir, "..", "fleet");
+        const fleetInvPath = join(fleetDir, "switchroom-invariants.md");
+        const fleetClaudePath = join(fleetDir, "CLAUDE.md");
+        const fleetInvBytes = existsSync(fleetInvPath)
+          ? readFileSync(fleetInvPath, "utf-8").length
+          : 0;
+        const fleetClaudeBytes = existsSync(fleetClaudePath)
+          ? readFileSync(fleetClaudePath, "utf-8").length
+          : 0;
+        const fleetBytes = fleetInvBytes + fleetClaudeBytes;
+
         const totalBytes =
           stableBytes +
           perSessionBytes +
           claudeMdBytes +
-          soulMdBytes +
+          fleetBytes +
           perTurnBytes +
           userBytes;
 
         console.log(
-          `Stable prefix:     ${formatBytes(stableBytes).padEnd(20)} (cache-hot)`,
+          `Stable prefix:     ${formatBytes(stableBytes).padEnd(20)} (cache-hot; includes SOUL.md ${soulMdBytes.toLocaleString()}B)`,
         );
         console.log(
           `Per-session:       ${formatBytes(perSessionBytes).padEnd(20)} (cache-warm until next session)`,
         );
         console.log(
-          `CLAUDE.md:         ${formatBytes(claudeMdBytes).padEnd(20)}`,
+          `CLAUDE.md (cwd):   ${formatBytes(claudeMdBytes).padEnd(20)} (cache-hot)`,
         );
         console.log(
-          `SOUL.md:           ${formatBytes(soulMdBytes).padEnd(20)}`,
+          `Fleet invariants:  ${formatBytes(fleetBytes).padEnd(20)} (--add-dir, cache-hot)`,
         );
         console.log(
-          `Per-turn:          ${formatBytes(perTurnBytes).padEnd(20)} (never cached)`,
+          `Per-turn:          ${formatBytes(perTurnBytes).padEnd(20)} (never cached — the real per-turn $ cost)`,
         );
         console.log(
           `User message:      ${formatBytes(userBytes).padEnd(20)}`,
         );
         console.log(
-          `Total:             ${formatBytes(totalBytes).padEnd(20)} (~${estimateTokens(totalBytes).toLocaleString()} tokens est.)`,
+          `Authored text:     ${formatBytes(totalBytes).padEnd(20)} (~${estimateTokens(totalBytes).toLocaleString()} tokens est.)`,
+        );
+
+        // The MCP tool-schema surface is the DOMINANT per-turn cost (audit:
+        // ~31k tok across ~10 servers, larger than all authored text) but is
+        // not measured inline — it lives in the claude-CLI tools[] prefix, not
+        // these files. With tool search (ENABLE_TOOL_SEARCH) the heavy servers
+        // defer, so this surface mostly leaves the window.
+        const mcpServers = readMcpServerNames(agentDir);
+        const mcpCount = mcpServers?.length ?? null;
+        const mcpEstK = mcpCount != null ? mcpCount * 3 : null;
+        const mcpLabel =
+          mcpCount != null
+            ? `${mcpCount} servers`
+            : "(unreadable — agent-private .mcp.json)";
+        const mcpEstLabel = mcpEstK != null ? `~${mcpEstK.toLocaleString()}k tok` : "~30k tok (audit est.)";
+        console.log(
+          `MCP tool surface:  ${mcpLabel.padEnd(20)} (NOT counted above; ~3k tok/server ≈ ${mcpEstLabel} — deferred under tool search)`,
+        );
+        if (mcpServers && mcpServers.length > 0) {
+          console.log(`                   [${mcpServers.join(", ")}]`);
+        }
+        const floorMcp = mcpEstK != null ? `~${mcpEstK.toLocaleString()}k` : "~30k";
+        console.log(
+          `Per-turn FLOOR:    ${`~${estimateTokens(totalBytes).toLocaleString()} + ${floorMcp} MCP + ~13k CLI-base`.padEnd(20)} tokens est. (before the user msg, recall, or tool results)`,
         );
 
         const stableCacheInput =
