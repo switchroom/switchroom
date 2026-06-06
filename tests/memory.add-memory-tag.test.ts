@@ -28,6 +28,36 @@ describe("DEMOTE_FROM_RECALL_TAG", () => {
 });
 
 describe("addMemoryTag — happy path", () => {
+  it("HONEST FAILURE: returns ok:false when the server rejects update_memory with isError (not a silent ok:true)", async () => {
+    // The live server has no `update_memory` tool → HTTP 200 + an MCP error
+    // envelope. The prior code only checked HTTP status and reported ok:true,
+    // so `memory demote` lied. Now the isError body must surface as ok:false.
+    const errorBody =
+      'event: message\n' +
+      'data: {"jsonrpc":"2.0","id":2,"result":{"isError":true,"content":[{"type":"text","text":"Unknown tool: \'update_memory\'"}]}}\n';
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        headers: new Map([["mcp-session-id", "test-session"]]),
+      } as any)
+      .mockResolvedValueOnce({
+        ok: true,
+        text: async () => errorBody,
+      } as any);
+
+    const result = await addMemoryTag(
+      "http://test.local/mcp/",
+      "clerk",
+      "mem-abc123",
+      DEMOTE_FROM_RECALL_TAG,
+      { fetchImpl: mockFetch as any, timeoutMs: 5000 },
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/Unknown tool.*update_memory/);
+  });
+
   it("calls update_memory with add_tags after MCP initialize", async () => {
     const mockFetch = vi
       .fn()

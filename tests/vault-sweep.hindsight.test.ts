@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import {
   sweepHindsightBank,
   getBanksToSweep,
@@ -160,5 +162,38 @@ describe('getBanksToSweep', () => {
   it('returns [] when config is undefined or has no agents', () => {
     expect(getBanksToSweep(undefined)).toEqual([])
     expect(getBanksToSweep({ switchroom: { version: 1 }, agents: {} } as unknown as SwitchroomConfig)).toEqual([])
+  })
+})
+
+describe('deleteMemory — honest failure, no phantom tool call, no silent lie', () => {
+  const src = readFileSync(resolve(__dirname, '..', 'src', 'cli', 'vault-sweep.ts'), 'utf-8')
+
+  it('does NOT call any single-memory delete tool (delete_memory is phantom; a memory id is not a document_id)', () => {
+    // Proven live: delete_memory is not a real tool, and delete_document(id)
+    // targets a non-existent document (get_document(memoryId) → not found), so
+    // it would silently no-op the scrub. The real client must NOT emit either.
+    expect(src).not.toMatch(/callTool\([^)]*'delete_memory'/)
+    expect(src).not.toMatch(/callTool\([^)]*'delete_document'/)
+  })
+
+  it('throws an explicit "no single-memory delete API" error so the scrub fails loudly', () => {
+    expect(src).toMatch(/hindsight exposes no single-memory delete API/)
+  })
+
+  it('the sweep surfaces undeletable matches (deleted stays below matched, with a reason)', async () => {
+    // A real (throwing) client → matches found but deleted=0, reason warned.
+    const throwing: HindsightMcpClient = {
+      async listMemories() {
+        return { items: [{ id: 'm1', text: `leak ${SK}` }], total: 1 }
+      },
+      async deleteMemory() {
+        throw new Error('hindsight exposes no single-memory delete API …')
+      },
+    }
+    const report = await sweepHindsightBank(throwing, 'bank-a', [{ key: 'K', value: SK }], {
+      dryRun: false,
+    })
+    expect(report.matched).toHaveLength(1)
+    expect(report.deleted).toBe(0) // honest: matched 1, deleted 0 — not a false success
   })
 })
