@@ -194,10 +194,19 @@ async function main() {
   }
   const hit = scanToolInput(toolInput, vaultValues)
   if (hit) {
+    // The reason is read by the model. It must be CORRECT and actionable:
+    // earlier versions said "reference it as vault:<key> instead", which
+    // suggested a `vault:` resolver that does not exist for tool arguments
+    // — sending agents (and operators) chasing a phantom mechanism. State
+    // the two real resolutions instead, and do NOT imply a resolver.
     process.stdout.write(
       JSON.stringify({
         decision: 'block',
-        reason: `tool_input contains a vaulted secret — reference it as vault:${hit.key} instead`,
+        reason:
+          `Blocked: this tool input contains the value of vault secret '${hit.key}'. ` +
+          `Secrets must never appear in a tool call. ` +
+          `If '${hit.key}' is a real secret, do not pass it as an argument — the launcher injects it into the tool's environment, so you never type it. ` +
+          `If '${hit.key}' is actually a public identifier (e.g. an account or customer ID that must appear in the call), it should not be in the vault — ask the operator to move it to plain config.`,
       }),
     )
     process.exit(0)

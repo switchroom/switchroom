@@ -30,6 +30,28 @@ const SENSITIVE_KEY_RE =
   /oauth(?![a-zA-Z])|token(?![a-zA-Z])|secret(?![a-zA-Z])|api[-_]?key(?![a-zA-Z])|password(?![a-zA-Z])/i;
 
 /**
+ * True when a vault VALUE looks like a public identifier — digits, optionally
+ * grouped with spaces or dashes (account/customer IDs, phone numbers, numeric
+ * handles) — rather than a high-entropy secret.
+ *
+ * These are the values an agent often must pass *literally* in a tool call,
+ * at which point the secret-guard PreToolUse hook blocks them: that hook
+ * matches stored vault values verbatim and cannot tell a public ID from a
+ * token. Such a value almost never belongs in the vault — it belongs in
+ * plain config. We bound the length so a long all-numeric secret (rare) does
+ * not trip the heuristic, and require >= 8 digits so we only flag values the
+ * hook would actually guard (its MIN_VALUE_LENGTH_TO_GUARD is 8).
+ */
+export function looksLikeIdentifierValue(value: string): boolean {
+  const v = value.trim();
+  if (v.length < 8 || v.length > 24) return false;
+  // Only digits and group separators (space / dash), digit-bounded.
+  if (!/^[0-9][0-9 -]*[0-9]$/.test(v)) return false;
+  const digitCount = v.replace(/[^0-9]/g, "").length;
+  return digitCount >= 8;
+}
+
+/**
  * Input shape for analyseVaultHealth.
  *
  * All fields are optional so callers can provide only what they have
@@ -45,6 +67,13 @@ export interface VaultHealthInput {
     {
       /** Per-entry scope, if set. */
       scope?: { allow?: string[]; deny?: string[] };
+      /**
+       * True when the entry's VALUE looks like a public identifier (digits,
+       * optionally dash/space-grouped) rather than a secret. Computed by the
+       * CLI via looksLikeIdentifierValue() so raw values never enter this
+       * pure layer. Drives the identifier-stored-as-secret warning.
+       */
+      looksLikeIdentifier?: boolean;
     }
   >;
 
@@ -139,6 +168,28 @@ export function analyseVaultHealth(input: VaultHealthInput): Diagnostic[] {
         message:
           `${unscopedSensitive.length} sensitive-looking key(s) have no per-key ACL:\n${keyList}`,
         fix: "Consider `switchroom vault set <key> --allow <agent>` to restrict access",
+      });
+    }
+
+    // ── Public identifiers stored as secrets ─────────────────────────
+    // A value that looks like an account/customer ID, not a token. If an
+    // agent must pass it in a tool call, the secret-guard PreToolUse hook
+    // blocks it (it matches stored values verbatim and can't tell a public
+    // ID from a secret) — so such values belong in plain config, not here.
+    const identifierKeys: string[] = [];
+    for (const [keyName, entry] of Object.entries(input.vaultKeys)) {
+      if (entry.looksLikeIdentifier) identifierKeys.push(keyName);
+    }
+
+    if (identifierKeys.length > 0) {
+      const keyList = identifierKeys.map((k) => `  ${k}`).join("\n");
+      diagnostics.push({
+        level: "warn",
+        check: "identifier-stored-as-secret",
+        message:
+          `${identifierKeys.length} vault key(s) hold an identifier-like value (digits only):\n${keyList}\n` +
+          `If an agent must pass one of these in a tool call, the secret-guard hook will block it — it cannot tell a public ID from a secret.`,
+        fix: "If the value is a public identifier (account/customer ID), remove it from the vault and pass it as plain config (e.g. hardcode it in the MCP launcher). If it is genuinely secret, ignore this.",
       });
     }
 

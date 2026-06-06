@@ -19,7 +19,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync } from "node:fs";
-import { analyseVaultHealth, type Diagnostic, type DiagnosticLevel } from "../vault/doctor.js";
+import { analyseVaultHealth, looksLikeIdentifierValue, type Diagnostic, type DiagnosticLevel } from "../vault/doctor.js";
 import { openVault, VaultError } from "../vault/vault.js";
 import { loadConfig, resolvePath } from "../config/loader.js";
 import { statusViaBroker, resolveBrokerSocketPath } from "../vault/broker/client.js";
@@ -91,7 +91,10 @@ export function registerVaultDoctorCommand(vault: Command, program: Command): vo
       // ── Open vault (if passphrase available) ───────────────────────
       const passphrase = process.env.SWITCHROOM_VAULT_PASSPHRASE;
       let vaultKeys:
-        | Record<string, { scope?: { allow?: string[]; deny?: string[] } }>
+        | Record<
+            string,
+            { scope?: { allow?: string[]; deny?: string[] }; looksLikeIdentifier?: boolean }
+          >
         | undefined = undefined;
 
       if (passphrase && existsSync(vaultPath)) {
@@ -104,6 +107,12 @@ export function registerVaultDoctorCommand(vault: Command, program: Command): vo
                 "scope" in entry && entry.scope
                   ? (entry.scope as { allow?: string[]; deny?: string[] })
                   : undefined,
+              // Shape-check the value here so the raw secret never enters the
+              // pure analysis layer — only the boolean classification does.
+              looksLikeIdentifier:
+                entry.kind === "string"
+                  ? looksLikeIdentifierValue(entry.value)
+                  : false,
             };
           }
         } catch (err) {

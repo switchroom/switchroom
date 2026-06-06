@@ -132,7 +132,13 @@ describe('secret-guard-pretool.mjs (broker-direct)', () => {
     })
     expect(r.status).toBe(0)
     expect(r.stdout).toContain('"decision":"block"')
-    expect(r.stdout).toContain('vault:gh-token')
+    // The reason must name the offending key and explain the real fix.
+    expect(r.stdout).toContain('gh-token')
+    expect(r.stdout).toContain('Secrets must never appear in a tool call')
+    // It must NOT resurrect the old, misleading "reference it as vault:<key>"
+    // suggestion — there is no vault: resolver for tool arguments, and that
+    // advice sent agents down a dead end (see the hook's block-reason note).
+    expect(r.stdout).not.toContain('reference it as vault:')
   })
 
   it('allows when tool_input contains no vaulted value', async () => {
