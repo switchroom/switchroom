@@ -86,19 +86,15 @@ describe("ensureUserProfileMentalModel", () => {
     if (!result.ok) expect(result.reason).toMatch(/source_query/);
   });
 
-  it("returns success when MM already exists (idempotent)", async () => {
+  it("returns success when MM already exists (idempotent) — matched by exact name", async () => {
+    // The list payload is a JSON string of {items:[{name,...}]}. An item NAMED
+    // user-profile means it exists → skip create.
+    const listBody = JSON.stringify({
+      result: { content: [{ text: JSON.stringify({ items: [{ name: "user-profile" }, { name: "Active Projects" }] }) }] },
+    });
     const mockFetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        headers: new Map([["mcp-session-id", "test-session"]]),
-        json: async () => ({}),
-        text: async () => JSON.stringify({}),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ result: { content: [{ text: "user-profile\nother-model" }] } }),
-        text: async () => JSON.stringify({ result: { content: [{ text: "user-profile\nother-model" }] } }),
-      } as any);
+      .mockResolvedValueOnce({ ok: true, headers: new Map(), text: async () => "" } as any) // init
+      .mockResolvedValueOnce({ ok: true, text: async () => `data: ${listBody}\n` } as any); // list (has user-profile)
 
     const result = await ensureUserProfileMentalModel(
       "http://test.local/mcp/",
@@ -107,7 +103,32 @@ describe("ensureUserProfileMentalModel", () => {
     );
 
     expect(result).toEqual({ ok: true });
-    expect(mockFetch).toHaveBeenCalledTimes(2); // Only init + list, no create
+    expect(mockFetch).toHaveBeenCalledTimes(2); // init + list, NO create
+  });
+
+  it("FALSE-POSITIVE GUARD: creates when no item is NAMED user-profile, even if another model mentions the substring", async () => {
+    // The old substring check skipped creation whenever ANY model's name/query/
+    // content contained "user-profile" — leaving banks (e.g. lawgpt's
+    // Lisa-focused models) without a real user-profile model. Match by name.
+    const listBody = JSON.stringify({
+      result: { content: [{ text: JSON.stringify({ items: [
+        { name: "Lisa Profile", source_query: "what to know about the user-profile of Lisa" },
+        { name: "User Profile" },
+      ] }) }] },
+    });
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, headers: new Map(), text: async () => "" } as any) // init
+      .mockResolvedValueOnce({ ok: true, text: async () => `data: ${listBody}\n` } as any) // list (substring present, no exact name)
+      .mockResolvedValueOnce({ ok: true, text: async () => 'data: {"result":{"isError":false}}\n' } as any); // create
+
+    const result = await ensureUserProfileMentalModel(
+      "http://test.local/mcp/",
+      "lawgpt",
+      { fetchImpl: mockFetch as any }
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(mockFetch).toHaveBeenCalledTimes(3); // init + list + CREATE (not skipped)
   });
 
   it("returns error when Hindsight unreachable", async () => {
