@@ -136,6 +136,16 @@ export const AgentMemorySchema = z
       .boolean()
       .default(true)
       .describe("Auto-search memories before each response"),
+    file: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Maintain a curated workspace MEMORY.md file (seeded once, " +
+        "auto-loaded every turn). Set false for hindsight-only memory: " +
+        "the file is not seeded or re-created, so once migrated into " +
+        "Hindsight and deleted it stays gone. Recall + directives carry " +
+        "the memory instead. Cascade: override (per-agent wins over default)."
+      ),
     isolation: z
       .enum(["default", "strict"])
       .default("default")

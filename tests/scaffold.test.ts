@@ -1150,6 +1150,53 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "AGENTS.md.hbs"))).toBe(false);
   });
 
+  it("memory.file: false gates the workspace MEMORY.md seed (hindsight-native), leaving siblings intact", () => {
+    const config = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
+    const result = scaffoldAgent("hindsight-native-agent", config, tmpDir, telegramConfig);
+    const workspaceDir = join(result.agentDir, "workspace");
+
+    // The curated MEMORY.md must NOT be seeded — so a migration delete sticks
+    // across reconcile instead of being re-created as an empty template.
+    expect(existsSync(join(workspaceDir, "MEMORY.md"))).toBe(false);
+
+    // Every OTHER bootstrap file is unaffected by the gate.
+    expect(existsSync(join(workspaceDir, "USER.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "IDENTITY.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "SOUL.md"))).toBe(true);
+
+    // Default (file omitted) still seeds MEMORY.md — gate is opt-in only.
+    const def = scaffoldAgent("file-default-agent", makeAgentConfig({}), tmpDir, telegramConfig);
+    expect(existsSync(join(def.agentDir, "workspace", "MEMORY.md"))).toBe(true);
+  });
+
+  it("memory.file: false makes a deleted MEMORY.md stick across reconcile (the migration scenario)", () => {
+    // 1. Normal agent — MEMORY.md is seeded.
+    const normal = makeAgentConfig({});
+    const normalSc: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "mig-agent": normal },
+    } as SwitchroomConfig;
+    const r = scaffoldAgent("mig-agent", normal, tmpDir, telegramConfig, normalSc);
+    const memPath = join(r.agentDir, "workspace", "MEMORY.md");
+    expect(existsSync(memPath)).toBe(true);
+
+    // 2. Migrate: operator deletes the file and flips memory.file: false.
+    rmSync(memPath);
+    const migrated = makeAgentConfig({ memory: { file: false } as AgentConfig["memory"] });
+    const migratedSc: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "mig-agent": migrated },
+    } as SwitchroomConfig;
+
+    // 3. reconcile() is the path that runs on every `agent restart` / `apply`.
+    //    It MUST NOT re-seed the deleted file — otherwise the migration never
+    //    sticks. (This fails against an ungated reconcile call site.)
+    reconcileAgent("mig-agent", migrated, tmpDir, telegramConfig, migratedSc);
+    expect(existsSync(memPath)).toBe(false);
+  });
+
   it("start.sh respects session_continuity.resume_mode in the generated script", () => {
     // handoff is now the default (no explicit resume_mode in config)
     const defaultResult = scaffoldAgent(
