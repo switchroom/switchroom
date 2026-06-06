@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.14.72 — Voice: prompt-first tone, no context-free word deletion (#2182)
+
+Rebalances agent voice enforcement away from a hook that deletes words and
+toward the prompt, where the model has the context to keep a genuine
+acknowledgement and drop only the hollow kind. Context-free deletion is
+bad UX: a blind hook can strip a sincere "good catch, that was my bug"
+along with the empty praise.
+
+- **The sycophancy-opener strip is now opt-in, OFF by default**
+  (`SWITCHROOM_VOICE_STRIP_OPENERS=1` re-enables it as a backstop). By
+  default the deterministic layer removes no words.
+- **Em-dash normalization stays deterministic.** It substitutes
+  punctuation, removes no content, and prompt-only guidance was measured
+  to fail at it (em-dashes in 73% of replies despite the SOUL rule). The
+  prompt now also asks for plain punctuation so both layers agree.
+- **The turn-pacing VOICE directive is now context-aware:** skip the
+  hollow openers and AI-tell filler, but genuine acknowledgement that
+  adds something is fine. Tone lives in the prompt, where the model can
+  judge genuine versus reflexive.
+
+Net: the AI-tell that is pure punctuation (em-dash) stays a safe
+deterministic backstop; the AI-tell that is about judgment and context
+(sycophancy, tone) is the prompt's job.
+
 ## v0.14.71 — Fleet-wide fact-grounding + anti-AI-tell voice (#2180)
 
 Two agent behaviors, fleet-wide.
