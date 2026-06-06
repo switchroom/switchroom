@@ -180,6 +180,21 @@ export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "2g";
 export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
 
 /**
+ * `/dev/shm` size for the hindsight container.
+ *
+ * Hindsight's embedded PostgreSQL allocates large shared-memory segments
+ * for parallel query workers / large sorts (observed: a single segment
+ * request of ~533MB). Docker's DEFAULT shm is only 64MB, so without this
+ * flag every such allocation fails with `could not resize shared memory
+ * segment ... No space left on device` and ALL memory writes/queries die
+ * (2026-06-06 fleet outage). 2g gives comfortable headroom over the
+ * observed peak while staying well under `HINDSIGHT_DEFAULT_MEM_LIMIT`
+ * (4g) so shm can't starve the app. Applies to BOTH the standalone
+ * `docker run` path and the compose snippet below — keep them in sync.
+ */
+export const HINDSIGHT_DEFAULT_SHM_SIZE = "2g";
+
+/**
  * Check if a TCP port is free for binding on 127.0.0.1.
  * Returns true if free, false if something is already listening.
  */
@@ -330,6 +345,10 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     `--memory=${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `--memory-reservation=${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `--pids-limit=${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
+    // PostgreSQL needs far more than Docker's 64MB default shm (see
+    // HINDSIGHT_DEFAULT_SHM_SIZE) or all writes/queries fail with
+    // "No space left on device". Keep in sync with the compose snippet.
+    `--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`,
     "-p", `127.0.0.1:${apiPort}:8888`,
     "-p", `127.0.0.1:${uiPort}:9999`,
     "-v", "switchroom-hindsight-data:/home/hindsight/.pg0",
@@ -424,6 +443,9 @@ export function generateHindsightComposeSnippet(): string {
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
+    // PostgreSQL shm — see HINDSIGHT_DEFAULT_SHM_SIZE. Without this the
+    // container gets Docker's 64MB default and all writes/queries fail.
+    `    shm_size: ${HINDSIGHT_DEFAULT_SHM_SIZE}`,
     "    volumes:",
     "      - switchroom-hindsight-data:/home/hindsight/.pg0",
     `      - ${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,

@@ -21,6 +21,7 @@ import {
   HINDSIGHT_DEFAULT_UID,
   HINDSIGHT_BROKER_SOCK_VOLUME,
   HINDSIGHT_IMAGE,
+  HINDSIGHT_DEFAULT_SHM_SIZE,
 } from "../../src/setup/hindsight.js";
 
 const mockedExec = execFileSync as unknown as ReturnType<typeof vi.fn>;
@@ -89,6 +90,18 @@ describe("hindsight broker-fed mode (#1245)", () => {
       }
     }
     expect(found).toBe(true);
+  });
+
+  it("passes --shm-size so PostgreSQL doesn't fail on Docker's 64MB default shm (2026-06-06 outage)", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    // Single-token form: `--shm-size=2g`.
+    expect(args).toContain(`--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`);
+    // And the default must be larger than Docker's 64MB so the bug can't
+    // silently regress to the broken default.
+    const m = /^(\d+)g$/.exec(HINDSIGHT_DEFAULT_SHM_SIZE);
+    expect(m, "HINDSIGHT_DEFAULT_SHM_SIZE should be N gigabytes").not.toBeNull();
+    expect(Number(m![1])).toBeGreaterThanOrEqual(1);
   });
 
   it("sets HINDSIGHT_API_LLM_PROVIDER=claude-code (subscription-honest path)", () => {
@@ -209,6 +222,13 @@ describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
     expect(tmpfsLine).toMatch(/uid=11000\b/);
     expect(tmpfsLine).toMatch(/gid=11000\b/);
     expect(tmpfsLine).toMatch(/mode=0700\b/);
+  });
+
+  it("emits shm_size so the compose path matches the docker-run shm fix (2026-06-06 outage)", async () => {
+    const { generateHindsightComposeSnippet, HINDSIGHT_DEFAULT_SHM_SIZE: shm } =
+      await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet();
+    expect(snippet).toMatch(new RegExp(`shm_size:\\s*${shm}\\b`));
   });
 });
 
