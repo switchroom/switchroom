@@ -696,12 +696,18 @@ export async function addMemoryTag(
       ? { "mcp-session-id": sessionId }
       : {};
 
-    // Step 2: call update_memory with `add_tags` to append (rather than
-    // replace) the tag. Hindsight's update_memory accepts an `add_tags`
-    // list per the MCP tool schema; if the deployment is older and only
-    // accepts `tags` (replace), the tool call returns ok but the tag
-    // may overwrite. Operators on stale deployments should bump the
-    // plugin (#438 Tier 1).
+    // Step 2: call update_memory with `add_tags` to append the tag.
+    //
+    // HONEST-FAILURE note (2026-06-07 audit): the live hindsight server has NO
+    // `update_memory` tool — it returns HTTP 200 with an MCP error envelope
+    // `{result:{isError:true, content:[{text:"Unknown tool: 'update_memory'"}]}}`.
+    // The prior code only checked `toolResponse.ok` (the HTTP status), so it
+    // returned `{ok:true}` and `switchroom memory demote` reported success while
+    // tagging nothing. We now inspect `result.isError` so the call fails
+    // honestly here AND stays forward-compatible: if a future hindsight build
+    // adds `update_memory`/`add_tags` it just works. (There is no single-memory
+    // tag path on the current MCP or REST surface; restoring demote needs a
+    // document-granularity rework — tracked separately.)
     const timeout2 = setTimeout(() => controller.abort(), timeoutMs);
     const toolResponse = await fetchImpl(`${apiUrl}`, {
       method: "POST",
@@ -731,6 +737,21 @@ export async function addMemoryTag(
 
     if (!toolResponse.ok) {
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    // Check the MCP result envelope — a tools/call can return HTTP 200 with
+    // isError:true (e.g. "Unknown tool"). Don't report success on an error.
+    try {
+      const parsed = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(toolResponse);
+      if (parsed.result?.isError === true) {
+        const msg = parsed.result.content?.[0]?.text ?? "tool returned isError";
+        return { ok: false, reason: msg };
+      }
+    } catch {
+      // Body unparseable — treat HTTP-200 as success (legacy behaviour) rather
+      // than fail a working call on a parse hiccup.
     }
 
     return { ok: true };

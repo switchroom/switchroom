@@ -256,9 +256,27 @@ export function makeHttpHindsightClient(
       })) as { items: HindsightMemory[]; total: number }
       return { items: res.items ?? [], total: res.total ?? 0 }
     },
-    async deleteMemory(bankId, memoryId) {
-      const sid = await initSession(bankId)
-      await callTool(bankId, sid, 'delete_memory', { bank_id: bankId, memory_id: memoryId })
+    async deleteMemory(_bankId, _memoryId) {
+      // HONEST FAILURE (2026-06-07 security audit). The vault secret-scrub
+      // cannot delete a single matched memory on this hindsight server, and
+      // pretending otherwise is dangerous — it would report leaked secrets as
+      // "scrubbed" while leaving them in the bank. Proven live:
+      //   • there is NO `delete_memory` MCP tool (the original call — phantom);
+      //   • `delete_document(document_id)` IS real but a `list_memories` item's
+      //     `id` is a MEMORY-UNIT id, not a document_id: get_memory(id) → OK,
+      //     get_document(id) → "Document not found", so it deletes nothing;
+      //   • there is no by-id single-memory-unit delete on the MCP or REST
+      //     surface (REST has whole-document delete + collection-clear only).
+      // So we FAIL LOUDLY: the sweep reports matches it could not remove, and
+      // the operator redacts manually (bank UI) or clears the bank. Restoring
+      // an actual scrub needs a document-granularity rework (resolve each match
+      // to its document_id, DELETE the document, accepting clean siblings die)
+      // — tracked separately; out of scope for the context-token work.
+      throw new Error(
+        'hindsight exposes no single-memory delete API (delete_memory is not a ' +
+          'real tool; a memory id is not a document_id) — matched secrets cannot ' +
+          'be auto-scrubbed; redact manually via the bank UI',
+      )
     },
   }
 }
@@ -306,12 +324,23 @@ export async function sweepHindsightBank(
 
   let deleted = 0
   if (!opts.dryRun) {
+    let warnedOnce = false
     for (const m of matched) {
       try {
         await client.deleteMemory(bankId, m.id)
         deleted++
-      } catch {
-        /* best-effort; keep trying the rest */
+      } catch (err) {
+        // Surface WHY a matched secret could not be deleted (once) instead of
+        // swallowing it — a vault scrub that finds leaked secrets but cannot
+        // remove them must say so, or the operator wrongly believes the bank is
+        // clean. `deleted` stays below `matched.length`, and the reason prints.
+        if (!warnedOnce) {
+          warnedOnce = true
+          process.stderr.write(
+            `vault-sweep: ${matched.length} secret(s) matched in bank '${bankId}' but ` +
+              `could NOT be auto-deleted: ${(err as Error).message}\n`,
+          )
+        }
       }
     }
   }

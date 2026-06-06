@@ -100,24 +100,41 @@ export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-4-6";
 export const HINDSIGHT_DEFAULT_MCP_STATELESS = true;
 
 /**
- * NOTE on trimming the hindsight MCP tool surface (29 advertised tools).
+ * DEFER the hindsight MCP tool-surface allowlist (29 advertised tools) — the
+ * 2026-06-07 adversarial audit (3 independent host-caller hunts) found it is
+ * high-blast-radius for ~no net benefit. Recorded so we don't re-attempt it.
  *
  * The server DOES support a global allowlist (`HINDSIGHT_API_MCP_ENABLED_TOOLS`,
- * config.py:1665 — comma-separated, filters both tools/list and invocation),
- * and an agent only uses ~5 (recall/reflect/sync_retain/retain/delete_document).
- * BUT the filter is GLOBAL across banks, and switchroom's own HOST-SIDE code
- * (this file + src/memory/hindsight.ts + src/cli/vault-sweep.ts) calls a broad
- * set on the SAME agent banks — create_bank, create_mental_model,
- * list_mental_models, update_bank, create_directive, list_memories — so a
- * 5-tool allowlist would silently break mental-model setup and the vault-sweep
- * memory scrub. A safe allowlist needs a COMPLETE host-caller audit first
- * (which also surfaced two phantom callers: vault-sweep calls a non-existent
- * `delete_memory`, hindsight.ts calls a non-existent `update_memory`).
+ * config.py:1665 — comma-separated, filters BOTH tools/list and invocation,
+ * GLOBALLY across all banks). But "trim to ~5" is unsafe: the agent and
+ * switchroom's host code legitimately reach a BROAD set on the same banks:
+ *   • agent (model-invoked via MEMORY_GUIDANCE + the fleet CLAUDE.md): recall,
+ *     reflect, sync_retain, retain, delete_document, AND — instructed in EVERY
+ *     agent's CLAUDE.md (profiles/default/CLAUDE.md.hbs:70-72) — create_directive,
+ *     list_directives, delete_directive, refresh_mental_model, update_mental_model;
+ *   • host setup (src/memory/hindsight.ts): create_bank, create_mental_model,
+ *     list_mental_models, update_bank;
+ *   • host (src/agents/status.ts): list_banks; (src/cli/vault-sweep.ts): list_memories;
+ *   • an agent Stop hook (bin/user-profile-refresh-hook.sh): refresh_mental_model.
+ * The minimum SAFE allowlist is therefore ~16 of 29 — and the audit found TWO
+ * callers a first-pass grep missed (refresh_mental_model, create_directive), so
+ * a too-narrow list would SILENTLY break a model-instructed capability across
+ * the whole fleet (the allowlist filters the SHARED singleton). Completeness
+ * can't be guaranteed cheaply, and a miss is a silent fleet-wide degradation.
  *
- * Deferred intentionally: the token win the allowlist would buy is already
- * captured by Claude Code tool-search (#2198), which defers all 29 schemas out
- * of the AGENT's context regardless of the advertised count. Revisit as a
- * focused follow-up that audits + fixes the host callers, then trims.
+ * And the token win is already captured: Claude Code tool-search (#2198) defers
+ * all 29 schemas out of the AGENT's context regardless of the advertised count,
+ * so the allowlist would only shave the tool-search-OFF fallback path (~5-6k tok
+ * at 16/29) — not worth the blast radius. NOT shipping it.
+ *
+ * The two PHANTOM callers the audit surfaced WERE fixed (real bugs, independent
+ * of the allowlist): vault-sweep's `delete_memory` (no such tool; a memory id is
+ * not a document_id either — proven live) and hindsight.ts addMemoryTag's
+ * `update_memory` (no such tool) now FAIL HONESTLY instead of silently
+ * reporting success. SEPARATE security follow-up still open: vault-sweep's
+ * secret-scrub has no working single-memory delete path AND hard-throws on the
+ * stateless server at vault-sweep.ts:194 — it needs a document-granularity
+ * rework to actually scrub, not just fail loudly.
  */
 
 /**
