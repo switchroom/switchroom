@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.80 — Auto-fallback works for non-admin agents (#2206)
+
+Anthropic-account auto-failover never worked for the production fleet. On a
+quota 429 the gateway called the broker's **admin-gated `set-active`**, but it
+runs as the agent that hit the wall — almost always a non-admin agent — so the
+broker rejected it with `set-active requires admin` and no swap happened. It
+only succeeded when an admin agent (klanker/carrie/test-harness) happened to be
+the one to exhaust. The operator had been working around it by hand, tapping the
+`/auth` card's switch button (which works only because that button inherits
+admin from the admin bot it's tapped on).
+
+Auto-fallback now routes through the broker's existing **non-admin**
+`mark-exhausted` verb: it derives the account from the caller's own identity,
+marks it exhausted, and rolls every agent on it to the next non-exhausted
+`fallback_order` account — exactly what `/auth rotate` does, just automatic and
+from any agent. `mark-exhausted` additively returns `rolledTo` so a non-admin
+caller can announce an accurate swap. Target selection now lives solely in the
+broker's `nextHealthyAccount` (removed the divergent gateway-side
+lowest-utilization picker). Manual `/auth use` / `/auth rotate` / the card button
+stay on `set-active` (operator is explicitly choosing, and is admin) — only the
+automatic path changed. Agents pick up the rolled credentials on claude's next
+refresh, matching the manual button (no restart added).
+
 ## v0.14.79 — Hindsight: user-profile MM existence check by name, not substring (#2205)
 
 Completes the v0.14.78 user-profile mental-model repair. The "already exists?"
