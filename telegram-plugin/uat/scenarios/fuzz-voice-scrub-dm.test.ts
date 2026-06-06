@@ -63,7 +63,7 @@ const LEADING_AFFIRMATION_RE =
 describe("uat: voice-scrub fuzz — no em-dashes, no sycophancy openers reach the user", () => {
   for (const vc of VOICE_CASES) {
     it(
-      `[voice] ${vc.name} — reply is dash-free and affirmation-free`,
+      `[voice] ${vc.name} — reply is dash-free (affirmation now prompt-tier)`,
       async () => {
         const sc = await spinUp({ agent: "test-harness" });
         try {
