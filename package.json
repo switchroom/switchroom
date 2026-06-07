@@ -1,6 +1,6 @@
 {
   "name": "switchroom",
-  "version": "0.14.81",
+  "version": "0.14.82",
   "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys.",
   "type": "module",
   "bin": {
