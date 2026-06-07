@@ -12,6 +12,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   evaluateQuotaWatchAccount,
+  evaluateFleetAllExhausted,
   loadQuotaWatchState,
   saveQuotaWatchState,
   patchQuotaWatchState,
@@ -362,5 +363,76 @@ describe("patchQuotaWatchState", () => {
     };
     patchQuotaWatchState(current, "bob@example.com", { lastNotifiedHealth: null, lastNotifiedAt: 0 });
     expect(current["bob@example.com"]).toBeUndefined();
+  });
+});
+
+describe("evaluateFleetAllExhausted", () => {
+  const notAlerting = { lastNotifiedHealth: null, lastNotifiedAt: 0 };
+  const alerting = { lastNotifiedHealth: "throttling" as const, lastNotifiedAt: 1000 };
+
+  it("notifies (entered) when every account is exhausted and we weren't alerting", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, exhausted_until: 5_000 },
+        { label: "b", exhausted: true, exhausted_until: 9_000 },
+      ],
+      prev: notAlerting,
+      now: 1_000,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind === "notify") {
+      expect(d.transition).toBe("entered");
+      expect(d.newState.lastNotifiedHealth).toBe("throttling");
+      expect(d.message).toContain("All accounts exhausted");
+      // earliest reset is the 5_000 one
+      expect(d.message).toContain("Earliest reset");
+    }
+  });
+
+  it("skips (still) when all exhausted and already alerting — no re-spam", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [{ label: "a", exhausted: true }, { label: "b", exhausted: true }],
+      prev: alerting,
+      now: 2_000,
+    });
+    expect(d.kind).toBe("skip");
+  });
+
+  it("notifies (recovered) when one account frees after we were alerting", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [{ label: "a", exhausted: false }, { label: "b", exhausted: true }],
+      prev: alerting,
+      now: 3_000,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind === "notify") {
+      expect(d.transition).toBe("recovered");
+      expect(d.newState.lastNotifiedHealth).toBe("healthy");
+      expect(d.message).toContain("Fleet recovered");
+      expect(d.message).toContain("a"); // names the healthy account
+    }
+  });
+
+  it("skips (not-all) when some account is healthy and we weren't alerting", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [{ label: "a", exhausted: false }, { label: "b", exhausted: true }],
+      prev: notAlerting,
+      now: 4_000,
+    });
+    expect(d.kind).toBe("skip");
+  });
+
+  it("never alerts on an empty fleet", () => {
+    expect(evaluateFleetAllExhausted({ accounts: [], prev: notAlerting, now: 1 }).kind).toBe("skip");
+  });
+
+  it("shows reset-unknown when no exhausted_until is present", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [{ label: "a", exhausted: true }],
+      prev: notAlerting,
+      now: 1_000,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind === "notify") expect(d.message).toContain("Reset time unknown");
   });
 });

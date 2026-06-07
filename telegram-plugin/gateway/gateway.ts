@@ -412,6 +412,8 @@ import {
 } from '../credits-watch.js'
 import {
   evaluateQuotaWatchAccount,
+  evaluateFleetAllExhausted,
+  FLEET_ALL_EXHAUSTED_KEY,
   loadQuotaWatchState,
   saveQuotaWatchState,
   patchQuotaWatchState,
@@ -14804,6 +14806,44 @@ async function runQuotaWatch(): Promise<void> {
   let watchState = loadQuotaWatchState(stateDir)
   const now = Date.now()
   const access = loadAccess()
+
+  // Fleet-wide all-exhausted check FIRST — must run before the per-account
+  // early-return below. When every account is exhausted, the per-account loop
+  // produces only 'blocked' skips → pendingTransitions empty → early return;
+  // so this fleet-level alert (the one the trigger-based all-blocked card
+  // misses during quiet periods / for the consumer+cron paths) would never
+  // fire if placed after. Authoritative source: broker `exhausted` flags.
+  {
+    const fleetPrev = watchState[FLEET_ALL_EXHAUSTED_KEY] ?? emptyAccountState()
+    const fleetDecision = evaluateFleetAllExhausted({
+      accounts: listStateData.accounts,
+      prev: fleetPrev,
+      now,
+    })
+    if (fleetDecision.kind === 'notify') {
+      for (const chat_id of access.allowFrom) {
+        await swallowingApiCall(
+          () =>
+            bot.api.sendMessage(chat_id, fleetDecision.message, {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+            }),
+          { chat_id, verb: 'quota-watch.fleet-all-exhausted' },
+        )
+      }
+      // Persist immediately — the per-account early-return path below would
+      // otherwise drop this flag change (edge-trigger would re-fire next poll).
+      watchState = patchQuotaWatchState(watchState, FLEET_ALL_EXHAUSTED_KEY, fleetDecision.newState)
+      try {
+        saveQuotaWatchState(stateDir, watchState)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: quota-watch: fleet-state save failed: ${err}\n`)
+      }
+      process.stderr.write(
+        `telegram gateway: quota-watch: fleet all-exhausted ${fleetDecision.transition}\n`,
+      )
+    }
+  }
 
   // First pass: evaluate all accounts against cached state. Collect
   // labels that need a live probe (i.e. accounts with a detected transition
