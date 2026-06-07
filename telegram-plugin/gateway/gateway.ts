@@ -14687,10 +14687,12 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       // operator is explicitly choosing, and is admin); only this automatic
       // path moves to the non-admin verb.
       failover: async () => {
-        // The 429 inference path passes no `until` (broker ~5h default). The
-        // rate-limit-MENU path (quota_wall_detected) passes the parsed WEEKLY
-        // reset, so the walled account isn't re-probed (and re-wedged) within
-        // the 5h default while it's weekly-capped.
+        // BOTH paths now pass a resolved `untilMs` via resolveExhaustUntil
+        // (never undefined): the rate-limit-MENU path threads the parsed weekly
+        // reset, and the 429 inference path threads parseResetTime's value or
+        // the +7d floor when it's a weekly wall it can't parse. So a
+        // weekly-capped account is never re-probed (and re-wedged) within the
+        // broker's ~5h default.
         const r = await client.markExhausted(untilMs)
         return { rolledTo: r.rolledTo ?? null, rolled: r.rolled }
       },
