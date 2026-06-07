@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import {
@@ -10,10 +10,9 @@ import {
   containerName,
 } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
-import { getCollectionForAgent } from "../memory/hindsight.js";
+import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
 import {
   getHindsightStatus,
-  isHindsightRunning,
 } from "../setup/hindsight.js";
 import {
   defaultAuditLogPath,
@@ -98,9 +97,30 @@ export interface AgentInfo {
   memoryCollection: string;
 }
 
+/**
+ * Docker-free agent-liveness check for the web container: an agent's gateway
+ * touches `<agentsDir>/<name>/telegram/.bridge-alive` every ~5s (bridge
+ * heartbeat). A mtime within `maxAgeMs` means the gateway is live. Returns
+ * false on any error (missing file / unreadable) — i.e. treat as not-alive.
+ */
+export function agentBridgeAlive(
+  agentsDir: string,
+  name: string,
+  maxAgeMs = 30_000,
+  now: number = Date.now(),
+): boolean {
+  try {
+    const f = resolve(agentsDir, name, "telegram", ".bridge-alive");
+    return now - statSync(f).mtimeMs <= maxAgeMs;
+  } catch {
+    return false;
+  }
+}
+
 export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
   const statuses = getAllAgentStatuses(config);
   const authStatuses = getAllAuthStatuses(config);
+  const agentsDir = resolveAgentsDir(config);
   const agents: AgentInfo[] = [];
 
   for (const [name, agentConfig] of Object.entries(config.agents)) {
@@ -112,9 +132,22 @@ export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
     // `auth.active`. No more per-agent fallback list.
     const primaryAccount = resolved.auth?.override ?? config.auth?.active;
 
+    // `getAllAgentStatuses` derives `active` from `docker ps`, which throws in
+    // the dockerless web container → every agent reads "inactive". Fall back to
+    // the gateway's `.bridge-alive` heartbeat (touched every ~5s; web mounts
+    // the agents dir): a fresh mtime means the gateway is live. Only used when
+    // the docker signal isn't already "active", so docker-context callers are
+    // unchanged.
+    const active =
+      status?.active === "active"
+        ? "active"
+        : agentBridgeAlive(agentsDir, name)
+          ? "active"
+          : (status?.active ?? "unknown");
+
     agents.push({
       name,
-      active: status?.active ?? "unknown",
+      active,
       uptime: status?.uptime ?? null,
       memory: status?.memory ?? null,
       extends: agentConfig.extends ?? "default",
@@ -590,6 +623,7 @@ function inspectEnv(
 }
 
 export async function handleGetSystemHealth(
+  config?: SwitchroomConfig,
   home?: string,
 ): Promise<SystemHealth> {
   // ── auth-broker ──────────────────────────────────────────────────
@@ -615,25 +649,38 @@ export async function handleGetSystemHealth(
   }
 
   // ── hindsight ────────────────────────────────────────────────────
-  const containerStatus = getHindsightStatus();
-  const running = isHindsightRunning();
-  const env = running
-    ? inspectEnv("switchroom-hindsight", [
-        "HINDSIGHT_API_LLM_MODEL",
-        "HINDSIGHT_API_LLM_PROVIDER",
-        "HINDSIGHT_API_MCP_STATELESS",
-      ])
-    : {
-        HINDSIGHT_API_LLM_MODEL: null,
-        HINDSIGHT_API_LLM_PROVIDER: null,
-        HINDSIGHT_API_MCP_STATELESS: null,
-      };
+  // "running" must come from an HTTP probe, NOT `docker ps`: the web
+  // container is dockerless by design (no socket mounted), so the docker
+  // helpers below throw and would falsely report hindsight DOWN even when it
+  // is serving. The web reaches hindsight over host networking, so probe its
+  // MCP endpoint — which also tests that it's actually *serving*, not merely
+  // that a container exists. The docker-based fields (containerStatus, env)
+  // stay best-effort: populated when docker IS available (CLI/host context),
+  // null in the web container — but they no longer gate the running dot.
+  const memoryUrl =
+    (config?.memory?.config?.url as string | undefined) ??
+    "http://127.0.0.1:18888/mcp/";
+  let running = false;
+  try {
+    running = (await probeHindsight(memoryUrl)).ok;
+  } catch {
+    running = false;
+  }
+  const containerStatus = getHindsightStatus(); // null without docker
+  const env = inspectEnv("switchroom-hindsight", [
+    "HINDSIGHT_API_LLM_MODEL",
+    "HINDSIGHT_API_LLM_PROVIDER",
+    "HINDSIGHT_API_MCP_STATELESS",
+  ]); // all null without docker — fine, the dot comes from `running`
   const statelessRaw = env.HINDSIGHT_API_MCP_STATELESS;
   const hindsight: SystemHealth["hindsight"] = {
     containerStatus,
     running,
     model: env.HINDSIGHT_API_LLM_MODEL,
-    provider: env.HINDSIGHT_API_LLM_PROVIDER,
+    // Fall back to the configured provider when docker inspect is unavailable.
+    provider:
+      env.HINDSIGHT_API_LLM_PROVIDER ??
+      ((config?.memory?.config?.provider as string | undefined) ?? null),
     mcpStateless:
       statelessRaw == null ? null : statelessRaw.toLowerCase() === "true",
   };

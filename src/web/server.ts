@@ -637,7 +637,7 @@ export function startWebServer(
           }
 
           case "getSystemHealth":
-            return (async () => jsonResponse(await handleGetSystemHealth()))();
+            return (async () => jsonResponse(await handleGetSystemHealth(config)))();
 
           case "getGoogleAccounts":
             return (async () =>
