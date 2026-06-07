@@ -64,7 +64,8 @@ const KNOWN_CREDIT_REASONS = [
 /**
  * Resolve the active fatal-reason set. Empty by default (subscription-only);
  * if `SWITCHROOM_CREDITS_WATCH_FATAL_REASONS` is set, parse it as a
- * comma-separated list (unknown tokens ignored). `*` opts in all known reasons.
+ * comma-separated list (tokens kept verbatim — an unknown token is harmless,
+ * it simply never matches a real reason value). `*` opts in all known reasons.
  */
 export function resolveCreditWatchFatalReasons(env: NodeJS.ProcessEnv): Set<string> {
   const raw = env.SWITCHROOM_CREDITS_WATCH_FATAL_REASONS;
