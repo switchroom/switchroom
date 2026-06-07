@@ -42,6 +42,10 @@ import { dirname, join, resolve } from "node:path";
 import { allocateAgentUid } from "../../agents/compose.js";
 import { resolveAgentsDir } from "../../config/loader.js";
 import { fetchQuota, type QuotaResult } from "../quota.js";
+import {
+  quotaIndicatesExhaustion,
+  resolveConsumerProbeIntervalMs,
+} from "./consumer-quota-sensor.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../../util/atomic.js";
 import {
@@ -201,6 +205,9 @@ export interface AuthBrokerOptions {
    * never sets this; the entry point reads from disk.
    */
   _testConfig?: SwitchroomConfig;
+  /** Test-only: replace the quota fetcher so the consumer-probe sensor (and
+   *  probe-quota) can be driven without real api.anthropic.com calls. */
+  _testFetchQuota?: typeof fetchQuota;
 }
 
 /* ───────────────────────── Helpers ───────────────────────── */
@@ -264,6 +271,11 @@ export class AuthBroker {
   private config: SwitchroomConfig;
   private listeners = new Map<string, Listener>();
   private refreshTimer: NodeJS.Timeout | null = null;
+  /** Periodic probe of consumer-pinned accounts → auto mark-exhausted. See
+   *  consumer-quota-sensor.ts. Null when disabled or no consumers. */
+  private consumerProbeTimer: NodeJS.Timeout | null = null;
+  /** Quota fetcher — injectable for tests via opts._testFetchQuota. */
+  private fetchQuotaImpl: typeof fetchQuota;
   private stateDir: string;
   private socketRoot: string;
   private home: string | undefined;
@@ -310,6 +322,7 @@ export class AuthBroker {
     this.now = opts.now ?? nowMs;
     this.operatorUid = opts.operatorUid;
     this.fetcher = opts.fetcher;
+    this.fetchQuotaImpl = opts._testFetchQuota ?? fetchQuota;
     this.stateDir =
       opts.stateDir ?? resolve(this.homeRoot(), ".switchroom", "state", "auth-broker");
     this.socketRoot = opts.socketRoot ?? AUTH_BROKER_ROOT;
@@ -410,6 +423,23 @@ export class AuthBroker {
         });
       }, REFRESH_TICK_INTERVAL_MS);
       this.refreshTimer.unref();
+
+      // Consumer-account quota sensor — periodically probe accounts pinned by
+      // a consumer (e.g. hindsight) and auto mark-exhausted, so a consumer on
+      // a dedicated account no agent shares still fails over (its
+      // serving-failover is wired but otherwise never triggers). Only armed
+      // when enabled AND there is at least one consumer; a no-consumer fleet
+      // pays nothing. See consumer-quota-sensor.ts.
+      const probeMs = resolveConsumerProbeIntervalMs(process.env);
+      const hasConsumers = (this.config.auth?.consumers ?? []).length > 0;
+      if (probeMs > 0 && hasConsumers) {
+        this.consumerProbeTimer = setInterval(() => {
+          this.consumerQuotaProbeTick().catch((err) => {
+            this.logErr(`consumer-quota-probe threw: ${(err as Error).message}`);
+          });
+        }, probeMs);
+        this.consumerProbeTimer.unref();
+      }
     }
 
     // Boot fanout — write per-agent .credentials.json mirrors for every
@@ -448,6 +478,10 @@ export class AuthBroker {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
+    }
+    if (this.consumerProbeTimer) {
+      clearInterval(this.consumerProbeTimer);
+      this.consumerProbeTimer = null;
     }
     for (const [sock, lis] of this.listeners) {
       try { lis.server.close(); } catch { /* ignore */ }
@@ -1114,7 +1148,7 @@ export class AuthBroker {
           this.audit({ op: "probe-quota", identity, account: label, ok: false, error: "missing-credentials" });
           return { label, result };
         }
-        const result = await fetchQuota({ accessToken: token, timeoutMs });
+        const result = await this.fetchQuotaImpl({ accessToken: token, timeoutMs });
         this.audit({
           op: "probe-quota",
           identity,
@@ -1141,6 +1175,48 @@ export class AuthBroker {
       }),
     );
     socket.write(encodeSuccess(id, { results }));
+  }
+
+  /**
+   * Consumer-account quota sensor tick. Probes every account pinned by a
+   * consumer and, when a probe shows a hard wall, marks it exhausted so the
+   * consumer's serving-failover (consumerAccountWithFailover) kicks in. This
+   * is the missing TRIGGER for a consumer (e.g. hindsight) on a dedicated
+   * account that no agent shares — nothing else ever raises mark-exhausted for
+   * it. Public for tests (driven directly via the `_testFetchQuota` seam).
+   *
+   * Sets `exhausted_until` to the probe's real reset time so it expires
+   * race-free (no explicit clear). A FAILED probe is a no-op (never fail a
+   * consumer over on a transient probe error). Never throws into the timer.
+   */
+  async consumerQuotaProbeTick(): Promise<void> {
+    const accounts = Array.from(
+      new Set((this.config.auth?.consumers ?? []).map((c) => c.account)),
+    );
+    for (const label of accounts) {
+      const creds = readAccountCredentials(label, this.home);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (!token) continue; // no creds → nothing to probe (don't mark)
+      let result: QuotaResult;
+      try {
+        result = await this.fetchQuotaImpl({ accessToken: token });
+      } catch (err) {
+        this.logErr(`consumer-quota-probe ${label}: ${(err as Error).message}`);
+        continue;
+      }
+      const decision = quotaIndicatesExhaustion(result);
+      if (!decision.exhausted) continue;
+      const exhaustedUntil = decision.until ?? this.now() + MARK_EXHAUSTED_DEFAULT_MS;
+      // Idempotent: skip the write/persist if already marked at/past this reset.
+      const existing = this.quota[label]?.exhausted_until;
+      if (existing !== undefined && existing >= exhaustedUntil) continue;
+      this.quota[label] = { exhausted_until: exhaustedUntil };
+      this.persistQuota();
+      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, ok: true });
+      process.stdout.write(
+        `auth-broker: consumer-quota-sensor marked ${label} exhausted until ${new Date(exhaustedUntil).toISOString()} — consumer(s) fail over\n`,
+      );
+    }
   }
 
   private async opSetActive(
