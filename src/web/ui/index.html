@@ -559,16 +559,42 @@
       }
     }
 
+    // Guards a second click from starting a second device-code flow (each
+    // start makes Microsoft send a sign-in email → the "2 emails" bug).
+    let msConnecting = false;
+
+    // The set of Microsoft account emails currently known to the broker.
+    // Used as a resilience baseline: the connect status lives only in the web
+    // process's memory, so if that process restarts mid-connect the status
+    // reads 'unknown' even when the token WAS stored. Diffing this list tells
+    // us the account really connected regardless of the lost status.
+    async function fetchMicrosoftAccountEmails() {
+      try {
+        const r = await fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() });
+        if (!r.ok) return new Set();
+        const list = await r.json();
+        return new Set((list || []).filter(a => a.brokerKnown).map(a => String(a.account).toLowerCase()));
+      } catch { return new Set(); }
+    }
+
     // Start an in-browser Microsoft connect: show the device code + link,
     // then poll until the operator completes sign-in on Microsoft's site.
     async function connectMicrosoft() {
+      if (msConnecting) return;              // double-submit guard
+      msConnecting = true;
+      const btn = document.getElementById('ms-connect-btn');
+      if (btn) btn.disabled = true;
+      const done = () => { msConnecting = false; const b = document.getElementById('ms-connect-btn'); if (b) b.disabled = false; };
       const card = document.getElementById('ms-connect-card');
       const show = (html) => { if (card) card.innerHTML = html; };
       show('<div class="loading" style="padding:.8rem">Starting…</div>');
+      // Snapshot already-connected accounts BEFORE starting, for the
+      // restart-resilient terminal check below.
+      const before = await fetchMicrosoftAccountEmails();
       try {
         const res = await fetch(`${API}/api/connections/microsoft/connect`, { method: 'POST', headers: authHeaders() });
         const data = await res.json();
-        if (!res.ok || !data.ok) { show(''); showError(data.error || `HTTP ${res.status}`); return; }
+        if (!res.ok || !data.ok) { show(''); showError(data.error || `HTTP ${res.status}`); done(); return; }
         const url = data.verificationUri, code = data.userCode;
         show(`<div class="account-card" style="border-color:var(--accent)">
             <div class="account-card-header"><div class="account-label">Connect a Microsoft account</div></div>
@@ -580,27 +606,58 @@
             <div id="ms-connect-status" style="color:var(--text-dim);margin-top:.3rem">Waiting for sign-in… (this card expires in ~15 min)</div>
           </div>`);
         const statusEl = () => document.getElementById('ms-connect-status');
-        const started = Date.now();
+        const deadline = Date.now() + ((data.expiresInSec || 900) * 1000 + 30000);
+        const showConnected = (label) => {
+          show(`<div class="loading" style="padding:.8rem;color:var(--green)">✓ Connected ${escapeHtml(label)}. Use the access toggles below to grant an agent.</div>`);
+          fetchConnections();
+        };
+        // On any non-'connected' terminal state ('failed' or 'unknown'),
+        // re-check the broker's actual account list before declaring failure:
+        // a new account appearing means the connect really succeeded (e.g. the
+        // status was lost to a web restart). Only error if nothing new landed.
+        // Limitations (acceptable — the in-memory 'connected' state is the
+        // primary signal; this is only the lost-status fallback): a concurrent
+        // connect of a DIFFERENT account in another tab/CLI could be mistaken
+        // for this one; and re-connecting an ALREADY-known account (token
+        // refresh) shows no new account so falls through to the error.
+        const settleNonConnected = async (reason) => {
+          const after = await fetchMicrosoftAccountEmails();
+          const fresh = [...after].find(a => !before.has(a));
+          if (fresh) { showConnected(fresh); } else { show(''); showError(reason || 'connect failed'); }
+          done();
+        };
         const poll = async () => {
-          const sres = await fetch(`${API}/api/connections/microsoft/connect/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
-          const s = sres.ok ? await sres.json() : { state: 'failed', reason: `HTTP ${sres.status}` };
+          let s;
+          try {
+            const sres = await fetch(`${API}/api/connections/microsoft/connect/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
+            s = sres.ok ? await sres.json() : { state: 'failed', reason: `HTTP ${sres.status}` };
+          } catch {
+            // Transient fetch failure — most likely the web process restarting
+            // mid-connect (the exact case this flow must survive). Don't die
+            // (that would strand msConnecting=true and lock the button): keep
+            // polling until the device-code deadline, then settle via the
+            // broker re-check (which recovers a token stored before the restart).
+            if (Date.now() > deadline) { await settleNonConnected('connection lost'); return; }
+            setTimeout(poll, 3000);
+            return;
+          }
           if (s.state === 'pending') {
-            if (Date.now() - started > ((data.expiresInSec || 900) * 1000 + 30000)) { const e = statusEl(); if (e) e.textContent = 'Expired — click Connect to try again.'; return; }
+            if (Date.now() > deadline) { const e = statusEl(); if (e) e.textContent = 'Expired — click Connect to try again.'; done(); return; }
             setTimeout(poll, 3000);
             return;
           }
           if (s.state === 'connected') {
-            show(`<div class="loading" style="padding:.8rem;color:var(--green)">✓ Connected ${escapeHtml(s.account)} (${escapeHtml(s.accountType)}). Use the access toggles below to grant an agent.</div>`);
-            fetchConnections();
+            showConnected(`${s.account} (${s.accountType})`);
+            done();
           } else {
-            show('');
-            showError(s.reason || 'connect failed');
+            await settleNonConnected(s.reason);
           }
         };
         setTimeout(poll, 3000);
       } catch (err) {
         show('');
         showError(err.message);
+        done();
       }
     }
 
@@ -1165,7 +1222,7 @@
         <div style="margin-bottom:1.5rem">
           <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">
             Microsoft 365
-            <button onclick="connectMicrosoft()" class="usage-pill primary" style="margin-left:.6rem;cursor:pointer;border:none;text-transform:none;font-weight:600">+ Connect a Microsoft account</button>
+            <button id="ms-connect-btn" onclick="connectMicrosoft()" class="usage-pill primary" style="margin-left:.6rem;cursor:pointer;border:none;text-transform:none;font-weight:600">+ Connect a Microsoft account</button>
           </h3>
           <div id="ms-connect-card"></div>
           ${msCards
