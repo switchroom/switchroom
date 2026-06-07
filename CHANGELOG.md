@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.14.85 — Stop false "out of pre-paid credits" alarms (subscription-only) (#2220)
+
+Agents were posting "⚠️ out of pre-paid credits — cron tasks and inbound
+replies will fail" cards. False alarm: the card came from credits-watch reading
+`cachedExtraUsageDisabledReason` from `.claude.json` — a flag that is always
+"why the optional pay-as-you-go EXTRA USAGE layer is disabled." switchroom is
+subscription-only by design (compliance pillar 3), so extra-usage-off is the
+expected, desired state; none of its values indicate a real failure, and the
+card's "buy credits" advice contradicts the subscription-honest model.
+
+credits-watch now defaults to silent on these flags (`DEFAULT_CREDIT_FATAL_REASONS`
+empty). Genuine exhaustion is already covered: an account's subscription window
+exhausting → fleet auto-fallback (v0.14.80); the whole fleet exhausting → the
+all-exhausted alert (v0.14.83). Operators who actually run pay-as-you-go can opt
+the alarm back in via `SWITCHROOM_CREDITS_WATCH_FATAL_REASONS` (comma list, or
+`*`). The transition machinery is unchanged — only the default policy of which
+reasons are fatal (now none). Reversible via env.
+
 ## v0.14.84 — Auto-recover the rate-limit (weekly-quota) TUI wedge (#2218)
 
 Closes the last failover blind spot. The claude CLI's WEEKLY quota wall surfaces
