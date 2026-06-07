@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.14.84 — Auto-recover the rate-limit (weekly-quota) TUI wedge (#2218)
+
+Closes the last failover blind spot. The claude CLI's WEEKLY quota wall surfaces
+as an interactive `/rate-limit-options` menu, NOT a stderr 429 — so the gateway
+never saw it, `markExhausted` was never called, and none of the v0.14.80-83
+failover/alert machinery engaged. A headless agent then sat silently dead on a
+menu no human would answer (real incident: finn, wedged for hours). The generic
+wedge-watchdog missed it too (the menu footer lacks the "to select/navigate/↑↓"
+affordance its signature requires).
+
+The wedge-watchdog now detects the menu (a strict two-anchor signature, behind
+the same stability gate), signals the gateway over a new `quota_wall_detected`
+IPC verb, and the gateway triggers the EXISTING `fireFleetAutoFallback` —
+threading the parsed weekly reset as `markExhausted`'s `until` (with a +7d
+fallback when unparsed, so the ~5h default can't un-exhaust a weekly wall and
+re-wedge). The existing chain then rolls to a fallback subscription account, or
+fires #2215's all-exhausted operator alert. The menu is parked with `Esc` only.
+
+Compliance (pillar 3): recovery is ONLY subscription-account failover or a
+graceful Esc-park — a unit test asserts the detector can never emit a keystroke
+that selects "Switch to usage credits" (off-subscription) or "Upgrade your plan".
+Kill switch `SWITCHROOM_RATE_LIMIT_DETECT=0`.
+
 ## v0.14.83 — Fleet-wide all-exhausted operator alert (#2215)
 
 Observability capstone to the failover trilogy. The trigger-based all-blocked
