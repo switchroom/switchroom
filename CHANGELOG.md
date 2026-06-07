@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.14.89 — Bump bundled claude CLI 2.1.159 → 2.1.168 (#2230)
+
+Bumps the bundled Claude CLI core runtime from 2.1.159 (pinned since v0.14.26)
+to 2.1.168 (latest), across every image — base (→ agent / broker / kernel /
+auth-broker / hostd) and hindsight, kept in lockstep per the #1978 thinking-block
+invariant.
+
+Relevant upstream changes (2.1.160–168): background-agent worktree crash-loop +
+overnight-history fixes; rate-limit/auth/transport errors now surface
+immediately (helps the gateway's quota detection → failover); hook outputs can
+return additionalContext; configurable model fallbacks in interactive sessions.
+Canaried on test-harness — verified injected/cron turns still deliver under the
+2.1.166 cross-session-messaging hardening — before fleet roll.
+
 ## v0.14.88 — File delivery: `switchroom deliver-file` (OneDrive + Google Drive)
 
 Agents can now hand the user a file they can actually open, instead of a
