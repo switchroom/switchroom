@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.88 — File delivery: `switchroom deliver-file` (OneDrive + Google Drive)
+
+Agents can now hand the user a file they can actually open, instead of a
+local container path the user can't reach.
+
+### `deliver-file` verb (#2225, #2228)
+
+`switchroom deliver-file <path>` uploads a file the agent produced into the
+user's `Switchroom/<agent>/` folder on their connected drive and prints a
+shareable link. The agent runs it and replies with the link. Switchroom owns
+the destination + upload, so it bypasses the per-write approval gate (writes
+only ever land in the agent's own delivery folder). Picks the first connected
+drive — **OneDrive** or **Google Drive** — using the broker's fresh access
+token. Share-link scope is configurable via `SWITCHROOM_DELIVER_LINK_SCOPE`.
+OneDrive path canary-proven; Google handles files up to 5 MB (resumable for
+larger is a follow-up).
+
+### Delivery guidance (#2224)
+
+A fleet-invariant prompt block tells agents to deliver files (via the `reply`
+tool's `files:` attachment for ≤50 MB, or `deliver-file` for keepables) and
+never hand back a local container path.
+
+### Fix: deliver-file one-shot hang (#2228)
+
+The verb delivered the file and printed the link but didn't exit — the
+auth-broker client kept a socket open. Closed it; the process now exits
+cleanly.
+
 ## v0.14.87 — `auth schedule` quota view + `deliver-file` (#2226, #2225)
 
 **`switchroom auth schedule` (#2226).** A new per-account quota view that
