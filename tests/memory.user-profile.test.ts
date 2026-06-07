@@ -61,7 +61,9 @@ describe("ensureUserProfileMentalModel", () => {
     expect(createBody.params.arguments.name).toBe("user-profile");
     expect(createBody.params.arguments.source_query).toContain("key facts, preferences");
     expect(createBody.params.arguments.query).toBeUndefined();
-    expect(createBody.params.arguments.types).toEqual(["world", "experience"]);
+    // `types` is NOT sent — it is not in create_mental_model's schema, so the
+    // server would silently drop it (caught by memory.hindsight-contract.fixture).
+    expect(createBody.params.arguments.types).toBeUndefined();
   });
 
   it("HONEST FAILURE: returns ok:false when create returns isError (not a silent ok:true)", async () => {

@@ -1,0 +1,295 @@
+{
+  "_meta": {
+    "captured_from": "http://127.0.0.1:18888/mcp/",
+    "server": "switchroom-hindsight",
+    "captured_at": "2026-06-07",
+    "count": 29
+  },
+  "tools": {
+    "cancel_operation": {
+      "required": [
+        "operation_id"
+      ],
+      "props": [
+        "bank_id",
+        "operation_id"
+      ]
+    },
+    "clear_memories": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "type"
+      ]
+    },
+    "create_bank": {
+      "required": [
+        "bank_id"
+      ],
+      "props": [
+        "bank_id",
+        "mission",
+        "name"
+      ]
+    },
+    "create_directive": {
+      "required": [
+        "content",
+        "name"
+      ],
+      "props": [
+        "bank_id",
+        "content",
+        "is_active",
+        "name",
+        "priority",
+        "tags"
+      ]
+    },
+    "create_mental_model": {
+      "required": [
+        "name",
+        "source_query"
+      ],
+      "props": [
+        "bank_id",
+        "max_tokens",
+        "mental_model_id",
+        "name",
+        "source_query",
+        "tags",
+        "trigger_refresh_after_consolidation"
+      ]
+    },
+    "delete_bank": {
+      "required": [],
+      "props": [
+        "bank_id"
+      ]
+    },
+    "delete_directive": {
+      "required": [
+        "directive_id"
+      ],
+      "props": [
+        "bank_id",
+        "directive_id"
+      ]
+    },
+    "delete_document": {
+      "required": [
+        "document_id"
+      ],
+      "props": [
+        "bank_id",
+        "document_id"
+      ]
+    },
+    "delete_mental_model": {
+      "required": [
+        "mental_model_id"
+      ],
+      "props": [
+        "bank_id",
+        "mental_model_id"
+      ]
+    },
+    "get_bank": {
+      "required": [],
+      "props": [
+        "bank_id"
+      ]
+    },
+    "get_bank_stats": {
+      "required": [],
+      "props": [
+        "bank_id"
+      ]
+    },
+    "get_document": {
+      "required": [
+        "document_id"
+      ],
+      "props": [
+        "bank_id",
+        "document_id"
+      ]
+    },
+    "get_memory": {
+      "required": [
+        "memory_id"
+      ],
+      "props": [
+        "bank_id",
+        "memory_id"
+      ]
+    },
+    "get_mental_model": {
+      "required": [
+        "mental_model_id"
+      ],
+      "props": [
+        "bank_id",
+        "detail",
+        "mental_model_id"
+      ]
+    },
+    "get_operation": {
+      "required": [
+        "operation_id"
+      ],
+      "props": [
+        "bank_id",
+        "operation_id"
+      ]
+    },
+    "list_banks": {
+      "required": [],
+      "props": []
+    },
+    "list_directives": {
+      "required": [],
+      "props": [
+        "active_only",
+        "bank_id",
+        "tags"
+      ]
+    },
+    "list_documents": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "limit",
+        "q"
+      ]
+    },
+    "list_memories": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "limit",
+        "offset",
+        "q",
+        "type"
+      ]
+    },
+    "list_mental_models": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "detail",
+        "tags"
+      ]
+    },
+    "list_operations": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "limit",
+        "status"
+      ]
+    },
+    "list_tags": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "limit",
+        "q"
+      ]
+    },
+    "recall": {
+      "required": [
+        "query"
+      ],
+      "props": [
+        "bank_id",
+        "budget",
+        "max_tokens",
+        "query",
+        "query_timestamp",
+        "tag_groups",
+        "tags",
+        "tags_match",
+        "types"
+      ]
+    },
+    "reflect": {
+      "required": [
+        "query"
+      ],
+      "props": [
+        "bank_id",
+        "budget",
+        "context",
+        "max_tokens",
+        "query",
+        "response_schema",
+        "tags",
+        "tags_match"
+      ]
+    },
+    "refresh_mental_model": {
+      "required": [
+        "mental_model_id"
+      ],
+      "props": [
+        "bank_id",
+        "mental_model_id"
+      ]
+    },
+    "retain": {
+      "required": [
+        "content"
+      ],
+      "props": [
+        "bank_id",
+        "content",
+        "context",
+        "document_id",
+        "metadata",
+        "strategy",
+        "tags",
+        "timestamp",
+        "update_mode"
+      ]
+    },
+    "sync_retain": {
+      "required": [
+        "content"
+      ],
+      "props": [
+        "bank_id",
+        "content",
+        "context",
+        "document_id",
+        "metadata",
+        "strategy",
+        "tags",
+        "timestamp"
+      ]
+    },
+    "update_bank": {
+      "required": [],
+      "props": [
+        "bank_id",
+        "config_updates",
+        "mission",
+        "name"
+      ]
+    },
+    "update_mental_model": {
+      "required": [
+        "mental_model_id"
+      ],
+      "props": [
+        "bank_id",
+        "max_tokens",
+        "mental_model_id",
+        "name",
+        "source_query",
+        "tags",
+        "trigger_refresh_after_consolidation"
+      ]
+    }
+  }
+}

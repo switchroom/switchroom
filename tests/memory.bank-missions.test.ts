@@ -78,14 +78,16 @@ describe("updateBankMissions", () => {
     const toolBody = JSON.parse(toolCall[1].body);
     expect(toolBody.method).toBe("tools/call");
     expect(toolBody.params.name).toBe("update_bank");
+    // retain_mission is NOT a top-level update_bank arg (the server silently
+    // drops it) — it is a config field routed through config_updates.
     expect(toolBody.params.arguments).toEqual({
       bank_id: "test-bank",
       mission: "Test bank mission",
-      retain_mission: "Test retain mission",
+      config_updates: { retain_mission: "Test retain mission" },
     });
   });
 
-  it("omits retain_mission when only bank_mission is set", async () => {
+  it("omits config_updates when only bank_mission is set (no retain_mission)", async () => {
     const mockFetch = vi.fn()
       .mockResolvedValueOnce({
         ok: true,
@@ -107,7 +109,6 @@ describe("updateBankMissions", () => {
     expect(toolBody.params.arguments).toEqual({
       bank_id: "test-bank",
       mission: "Only bank mission",
-      retain_mission: undefined,
     });
   });
 

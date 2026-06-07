@@ -397,7 +397,12 @@ export async function ensureUserProfileMentalModel(
             // the isError check below.
             source_query:
               "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
-            types: ["world", "experience"],
+            // NOTE: do NOT send `types` — create_mental_model's schema does not
+            // accept it (props: name, source_query, mental_model_id, tags,
+            // max_tokens, trigger_refresh_after_consolidation, bank_id), so the
+            // server SILENTLY DROPS it (isError stays false). The mental model
+            // draws across fact types from its source_query regardless. Adding a
+            // schema-unknown arg back here reds memory.hindsight-contract.fixture.
           },
         },
       }),
@@ -543,6 +548,21 @@ export async function createBank(
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
     }
 
+    // Check the MCP result envelope — a tools/call returns HTTP 200 with
+    // isError:true on a renamed/unknown arg (the source_query class). Without
+    // this, a future bank_id rename would report success while creating no bank.
+    try {
+      const created = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(toolResponse);
+      if (created.result?.isError === true) {
+        return { ok: false, reason: created.result.content?.[0]?.text ?? "create_bank returned isError" };
+      }
+    } catch {
+      // Unparseable body — treat HTTP 200 as success (legacy) rather than fail a
+      // working create on a parse hiccup.
+    }
+
     return { ok: true };
   } catch (err) {
     if ((err as Error).name === "AbortError") {
@@ -642,10 +662,17 @@ export async function updateBankMissions(
         method: "tools/call",
         params: {
           name: "update_bank",
+          // `update_bank` accepts top-level `mission` (the bank mission) but
+          // NOT a top-level `retain_mission` — that is a CONFIG field and must
+          // go through `config_updates` (verified live: the server SILENTLY
+          // DROPPED a top-level retain_mission, so the retain-steering half of
+          // every mission update was a live no-op). Route it correctly.
           arguments: {
             bank_id: bankId,
-            mission: missions.bank_mission,
-            retain_mission: missions.retain_mission,
+            ...(missions.bank_mission != null ? { mission: missions.bank_mission } : {}),
+            ...(missions.retain_mission != null
+              ? { config_updates: { retain_mission: missions.retain_mission } }
+              : {}),
           },
         },
       }),
@@ -656,6 +683,20 @@ export async function updateBankMissions(
 
     if (!toolResponse.ok) {
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    // Check the MCP result envelope — HTTP 200 + isError:true on a renamed/
+    // unknown arg. Without this, a future arg rename would report success while
+    // updating nothing.
+    try {
+      const updated = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(toolResponse);
+      if (updated.result?.isError === true) {
+        return { ok: false, reason: updated.result.content?.[0]?.text ?? "update_bank returned isError" };
+      }
+    } catch {
+      // Unparseable body — treat HTTP 200 as success (legacy).
     }
 
     return { ok: true };
