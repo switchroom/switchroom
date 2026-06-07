@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.14.82 — Cron quota preflight: defer + retry instead of firing into a wall (#2212)
+
+The last of the three account-failover gaps. A cron fires through the
+persistent claude session (no `claude -p` — off-subscription, banned by the
+compliance pillar), which holds one account for its lifetime. When the fleet
+was fully quota-walled, a scheduled fire 429'd and the run was **silently
+lost** — and because the scheduler's audit is delivery-based, it recorded
+`exit_code=0` "success". A failed cron looked successful.
+
+The scheduler now runs a quota preflight before each fire: when EVERY account
+is exhausted (dispatch is futile), it DEFERS — records `exit_code=-2`
+(deferred, distinct from delivered/gateway-down, so the truth is in the audit,
+not a false success) and bounded-retries (default 3 attempts, 1m/3m/5m
+backoff). With at least one healthy account it dispatches normally (the fleet
+serves a healthy account via failover). Operator-confirmed: crons have no hard
+deadlines, so worst case a deferred cron runs when the window resets (≤5h) —
+no forced restart. Fails open (any broker/gate error → dispatch); retries
+cancelled on shutdown; replay still treats only `exit_code=0` as "ran", so a
+deferred fire lost across a restart is eligible for boot replay. Kill switch
+`SWITCHROOM_DISABLE_CRON_QUOTA_PREFLIGHT=1`.
+
+Completes the failover trilogy: agents (v0.14.80), consumers/hindsight
+(v0.14.81), crons (this release).
+
 ## v0.14.81 — Consumer-quota sensor: hindsight (and any dedicated-account consumer) fails over (#2209)
 
 Closes the gap v0.14.80 left open. Hindsight is a consumer pinned to a dedicated
