@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.14.87 — `auth schedule` quota view + `deliver-file` (#2226, #2225)
+
+**`switchroom auth schedule` (#2226).** A new per-account quota view that
+separates the 5-hour rolling window from the 7-day weekly window — the thing
+`auth list`/`auth show` hide by collapsing quota into a single "soonest reset"
+column. Per account it shows pool role (active / fallback rank / excluded),
+5h % + reset, weekly % + reset DAY, and a STATE that distinguishes `healthy` /
+`5h-walled` / `weekly-walled`. This surfaces the staggered weekly schedule
+(each subscription's weekly limit resets on a fixed, different day-of-week) so
+you can see at a glance which account has weekly headroom. A maxed weekly
+window (≥99.5%) is classified `weekly-walled` with the weekly reset as the
+horizon even when the exhaustion ledger points at a sooner 5h reset, so a
+weekly-capped account isn't mislabelled as recovering in minutes. Defaults to a
+live probe (the broker's existing `probe-quota` op — one tiny header-only call
+per account; `--cached` skips it, `--json` dumps raw state).
+
+**`switchroom deliver-file` (#2225).** Uploads a file to `Switchroom/<agent>`
+and returns a link (OneDrive), so agents deliver files instead of handing back
+an in-container path.
+
 ## v0.14.86 — Durably hold weekly-quota auto-fallback (clerk wedge) (#2222)
 
 Follow-up to v0.14.84. Agent `clerk` went silently dead on the same
