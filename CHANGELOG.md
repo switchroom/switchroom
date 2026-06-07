@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.14.81 — Consumer-quota sensor: hindsight (and any dedicated-account consumer) fails over (#2209)
+
+Closes the gap v0.14.80 left open. Hindsight is a consumer pinned to a dedicated
+Anthropic account kept out of `fallback_order` for quota isolation. Its
+serving-failover is wired (#2194), but the exhaustion state it keys off
+(`this.quota`) is only set by `mark-exhausted` — which agents raise on a 429.
+An account no agent shares has nobody to raise it, so the failover never
+triggered and hindsight sat dead on an exhausted account (the 2026-06-06
+outage); the broker had no quota-probe loop.
+
+Adds a broker-side sensor that periodically probes consumer-pinned accounts and
+auto-marks exhaustion when a probe shows a hard wall (≥99.5% on the binding
+window), so the consumer's serving-failover kicks in and reverts automatically
+when the window resets. `exhausted_until` is set to the probe's real reset time
+(race-free, no explicit clear); a FAILED probe is a no-op (a transient error
+must never fail a consumer over). Only marks — never changes `auth.active` or
+touches agent credentials. Default cadence 10 min (~6 tiny probes/hr per
+consumer account); `SWITCHROOM_CONSUMER_QUOTA_PROBE_MS` to tune,
+`SWITCHROOM_DISABLE_CONSUMER_QUOTA_PROBE=1` to disable. Broker-only change.
+
 ## v0.14.80 — Auto-fallback works for non-admin agents (#2206)
 
 Anthropic-account auto-failover never worked for the production fleet. On a
