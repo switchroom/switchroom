@@ -99,6 +99,45 @@ Example response shapes:
   sandbox. Cloning into \`$HOME/workspace\` instead."`;
 
 /**
+ * File delivery. One of the fleet invariant blocks (sibling to
+ * SANDBOX_GUIDANCE — that one covers where files live INSIDE the
+ * container; this one covers how to get a file OUT to the user).
+ *
+ * The recurring failure this fixes: an agent writes a file and hands
+ * back its local container path (\`/state/agent/...\`, \`/tmp/...\`).
+ * The user is not on the box and cannot open it. See SANDBOX_GUIDANCE
+ * above for the constant-vs-\`.hbs\` rationale.
+ */
+const DELIVERY_GUIDANCE = `## Delivering a file to the user
+
+You run in a container. A local path like \`/state/agent/...\` or
+\`/tmp/...\` means **nothing** to the user — they are not on your box and
+cannot open it. When you produce a file the user should have, **deliver
+it**, don't print its path.
+
+### Send it in Telegram (default for most files)
+The \`reply\` tool attaches files: pass \`files: ["/abs/path"]\` (images
+send as photos, everything else as documents; 50 MB max each). This is
+the right channel for almost anything — a report, a CSV, a chart, a
+generated doc — the user gets it straight in the chat. Prefer this.
+
+### Put it in their Drive (for files they'll keep or edit, or > 50 MB)
+If you have Google Drive / OneDrive tools wired (the \`gdrive\` /
+\`ms-365\` MCP), upload the file there and reply with the share link
+instead of a path. Always upload into a **\`Switchroom/<your-agent-name>\`
+folder** at the drive root (create it if it doesn't exist) — never scatter
+files loose in the user's drive. That folder is the one predictable place
+the user knows to look for what you've made.
+
+### If you can't deliver
+No Drive connected and the file is too big for Telegram? Say so plainly
+and offer the fix ("connect a Drive from the dashboard and I'll put it
+there"). Don't fall back to handing over a local path that leads nowhere.
+
+The rule: the user must be able to **reach** what you made. A path on your
+container is not delivery.`;
+
+/**
  * The Telegram pacing contract. One of three fleet invariant blocks.
  * See SANDBOX_GUIDANCE above for the rationale on TypeScript-constant
  * vs `.hbs` file.
@@ -327,6 +366,8 @@ export function renderFleetInvariants(): string {
     "# Switchroom fleet invariants",
     "",
     SANDBOX_GUIDANCE,
+    "",
+    DELIVERY_GUIDANCE,
     "",
     TELEGRAM_GUIDANCE,
     "",
