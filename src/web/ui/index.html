@@ -606,7 +606,7 @@
             <div id="ms-connect-status" style="color:var(--text-dim);margin-top:.3rem">Waiting for sign-in… (this card expires in ~15 min)</div>
           </div>`);
         const statusEl = () => document.getElementById('ms-connect-status');
-        const started = Date.now();
+        const deadline = Date.now() + ((data.expiresInSec || 900) * 1000 + 30000);
         const showConnected = (label) => {
           show(`<div class="loading" style="padding:.8rem;color:var(--green)">✓ Connected ${escapeHtml(label)}. Use the access toggles below to grant an agent.</div>`);
           fetchConnections();
@@ -615,6 +615,11 @@
         // re-check the broker's actual account list before declaring failure:
         // a new account appearing means the connect really succeeded (e.g. the
         // status was lost to a web restart). Only error if nothing new landed.
+        // Limitations (acceptable — the in-memory 'connected' state is the
+        // primary signal; this is only the lost-status fallback): a concurrent
+        // connect of a DIFFERENT account in another tab/CLI could be mistaken
+        // for this one; and re-connecting an ALREADY-known account (token
+        // refresh) shows no new account so falls through to the error.
         const settleNonConnected = async (reason) => {
           const after = await fetchMicrosoftAccountEmails();
           const fresh = [...after].find(a => !before.has(a));
@@ -622,10 +627,22 @@
           done();
         };
         const poll = async () => {
-          const sres = await fetch(`${API}/api/connections/microsoft/connect/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
-          const s = sres.ok ? await sres.json() : { state: 'failed', reason: `HTTP ${sres.status}` };
+          let s;
+          try {
+            const sres = await fetch(`${API}/api/connections/microsoft/connect/${encodeURIComponent(data.requestId)}`, { headers: authHeaders() });
+            s = sres.ok ? await sres.json() : { state: 'failed', reason: `HTTP ${sres.status}` };
+          } catch {
+            // Transient fetch failure — most likely the web process restarting
+            // mid-connect (the exact case this flow must survive). Don't die
+            // (that would strand msConnecting=true and lock the button): keep
+            // polling until the device-code deadline, then settle via the
+            // broker re-check (which recovers a token stored before the restart).
+            if (Date.now() > deadline) { await settleNonConnected('connection lost'); return; }
+            setTimeout(poll, 3000);
+            return;
+          }
           if (s.state === 'pending') {
-            if (Date.now() - started > ((data.expiresInSec || 900) * 1000 + 30000)) { const e = statusEl(); if (e) e.textContent = 'Expired — click Connect to try again.'; done(); return; }
+            if (Date.now() > deadline) { const e = statusEl(); if (e) e.textContent = 'Expired — click Connect to try again.'; done(); return; }
             setTimeout(poll, 3000);
             return;
           }
