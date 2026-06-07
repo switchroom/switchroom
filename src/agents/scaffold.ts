@@ -122,12 +122,14 @@ the right channel for almost anything — a report, a CSV, a chart, a
 generated doc — the user gets it straight in the chat. Prefer this.
 
 ### Put it in their Drive (for files they'll keep or edit, or > 50 MB)
-If you have Google Drive / OneDrive tools wired (the \`gdrive\` /
-\`ms-365\` MCP), upload the file there and reply with the share link
-instead of a path. Always upload into a **\`Switchroom/<your-agent-name>\`
-folder** at the drive root (create it if it doesn't exist) — never scatter
-files loose in the user's drive. That folder is the one predictable place
-the user knows to look for what you've made.
+Run \`switchroom deliver-file <path>\`. It uploads the file into the user's
+\`Switchroom/<your-agent-name>\` folder on their connected drive (creating
+the folder if needed) and prints a share link. Reply with that link — not
+a path. This is the reliable way: switchroom owns the destination and the
+upload, so you don't guess folder names or hit a per-file approval. (If you
+prefer the raw \`gdrive\` / \`ms-365\` MCP tools, still target that same
+\`Switchroom/<your-agent-name>\` folder — never scatter files loose in the
+user's drive.)
 
 ### If you can't deliver
 No Drive connected and the file is too big for Telegram? Say so plainly
