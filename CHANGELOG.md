@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.14.83 — Fleet-wide all-exhausted operator alert (#2215)
+
+Observability capstone to the failover trilogy. The trigger-based all-blocked
+card only fires when an agent 429s into the wall — it misses a quiet period
+(the fleet goes all-exhausted but no agent happens to hit it) and the
+consumer (hindsight) + cron paths added in v0.14.81/82, which degrade silently.
+
+quota-watch now emits one edge-triggered fleet alert: `🔴 All accounts
+exhausted` (with earliest-reset + self-healing reassurance) when every account
+enters the broker's exhausted state, and `🟢 Fleet recovered` when one frees.
+Keyed off the broker's authoritative per-account `exhausted` flag (not
+probe-derived), so there is no probe-failure false alarm; deduped so it never
+re-spams. Observability only — no behavior/recovery change.
+
+(This superseded the originally-scoped "split all-blocked vs probe-failed in
+logs": post-v0.14.80 the all-blocked decision is broker-authoritative, so that
+ambiguity no longer exists — the real gap was the missing quiet-period/
+consumer/cron alert, which this fills.)
+
 ## v0.14.82 — Cron quota preflight: defer + retry instead of firing into a wall (#2212)
 
 The last of the three account-failover gaps. A cron fires through the
