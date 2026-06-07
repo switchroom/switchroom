@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.14.86 — Durably hold weekly-quota auto-fallback (clerk wedge) (#2222)
+
+Follow-up to v0.14.84. Agent `clerk` went silently dead on the same
+`/rate-limit-options` weekly-quota TUI menu v0.14.84 was meant to catch. Deep
+inspection found the auto-failover chain broken in **three complementary
+places** — all three are required for a weekly wall to fail over *and stay
+failed over*:
+
+- **Detector blind spot (the bug v0.14.84 shipped).** The menu detector
+  anchored on `/rate-limit-options`, which is printed *above* the menu and
+  scrolls off the top of the `tmux capture-pane -p` viewport (no scrollback) on
+  a pane with enough preceding output. clerk wedged exactly that way and the
+  detector logged zero fires. Re-anchored on the option-1 menu-body row
+  (`Stop and wait for…`, pinned to the bottom of the pane where the cursor is)
+  plus an option string only this menu shows (`usage credits` — covering both
+  "Switch to…" and the newer "Add funds to continue with…" wording —
+  `Upgrade your plan`, or `/rate-limit-options`). Esc-only park unchanged
+  (compliance, vision.md pillar 3).
+
+- **Exhaustion window too short on the 429 path.** The menu path already
+  threaded the parsed weekly reset as `markExhausted`'s `until`; the 429 path
+  passed none → the broker's ~5h default. A weekly wall that surfaces as a 429
+  carries calendar wording (`resets Jun 9, 5am`) that the reset parser can't
+  read → an undefined reset → the ~5h default un-exhausts a weekly-walled
+  account after 5 hours. Factored the decision into a shared, unit-tested
+  `resolveExhaustUntil()` with a +7d floor that **never returns undefined**,
+  called from both the menu handler and the 429 path.
+
+- **Broker re-mirrored the walled account every refresh tick.** Even with a
+  correct weekly `until`, `mark-exhausted` marks quota + mirrors the fallback
+  once but never rewrites `auth.active`, and the refresh-tick fanout resolved
+  the effective account with no exhaustion check — so when the walled account's
+  OAuth token refreshed (~1h; refresh works, a quota wall is not an auth
+  failure) it silently re-mirrored the walled creds onto the whole fleet,
+  undoing the failover (flap). Routed the agent serving + fanout reads through
+  a shared `accountWithFailover()` (generalised from the proven consumer-
+  failover): serve/mirror the first healthy fallback while walled, fall back to
+  the pinned/active account when none is healthy (retry beats going dark), and
+  auto-revert once the window passes. Operator serving stays attribution-true.
+
+Kill switch `SWITCHROOM_RATE_LIMIT_DETECT=0` (detector) is unchanged. The
+broker change ships in the `switchroom-auth-broker` singleton — recreate it
+explicitly on rollout (the staggered per-agent restart skips singletons).
+
 ## v0.14.85 — Stop false "out of pre-paid credits" alarms (subscription-only) (#2220)
 
 Agents were posting "⚠️ out of pre-paid credits — cron tasks and inbound
