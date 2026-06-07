@@ -13,6 +13,7 @@
  *   auth rotate                 — cycle to next non-exhausted entry
  *   auth rm <label>
  *   auth show [<agent>]
+ *   auth schedule               — per-account 5h vs WEEKLY window + reset day
  *   auth refresh [<label>]      — diagnostic force-tick
  *   auth agent override <agent> (<label> | --clear)
  *
@@ -52,6 +53,7 @@ import {
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { registerAuthGoogleSubcommands } from "./auth-google.js";
 import { registerAuthMicrosoftSubcommands } from "./auth-microsoft.js";
+import { registerAuthScheduleSubcommands } from "./auth-schedule.js";
 import { setAuthActive } from "./auth-active-yaml.js";
 import { atomicWriteFileSync } from "../util/atomic.js";
 import { statSync } from "node:fs";
@@ -470,6 +472,7 @@ export function registerAuthCommand(program: Command): void {
 
   registerAuthGoogleSubcommands(program, auth);
   registerAuthMicrosoftSubcommands(program, auth);
+  registerAuthScheduleSubcommands(program, auth);
 
   // ── auth heal <agent> --json --config-dir <dir> ────────────────────────
   // Minimal surface kept for boot-self-test.sh's structural diagnoser
