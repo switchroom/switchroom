@@ -65,6 +65,22 @@ describe("Memory prompt guidance (post-#1850)", () => {
     expect(out).toContain("mcp__hindsight__reflect");
   });
 
+  it("renderFleetInvariants() includes the file-delivery guidance (no local-path dumps)", () => {
+    const out = renderFleetInvariants();
+    const deliveryIdx = out.indexOf("## Delivering a file to the user");
+    expect(deliveryIdx).toBeGreaterThan(-1);
+    // It must name the real delivery channels and forbid local-path dumps.
+    expect(out).toContain('files: ["/abs/path"]'); // reply attachment path
+    expect(out).toMatch(/Switchroom\/<your-agent-name>/); // the drive folder convention
+    expect(out).toMatch(/not on your box|cannot open it/i); // the "don't hand back a path" rule
+    // Placed in the sandbox→delivery flow: after the sandbox block, before memory.
+    const sandboxIdx = out.indexOf("## Sandbox: you're running in a switchroom container");
+    const memoryIdx = out.indexOf("## Memory — proactive, conversational");
+    expect(sandboxIdx).toBeGreaterThan(-1);
+    expect(deliveryIdx).toBeGreaterThan(sandboxIdx);
+    expect(memoryIdx).toBeGreaterThan(deliveryIdx);
+  });
+
   it("renderFleetInvariants() orders Telegram pacing BEFORE memory guidance", () => {
     // The fleet invariants file orders sections so the model reads
     // them in the same sequence as the prior --append-system-prompt
