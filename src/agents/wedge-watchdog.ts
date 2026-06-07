@@ -45,6 +45,99 @@ import { capturePane, sendKeys, PROMPTS, type PromptRule } from "./autoaccept.js
 export const WEDGE_FOOTER_SIGNATURE =
   /(?=[\s\S]*[Ee]sc(?:ape)?[^\n]*cancel)(?=[\s\S]*(?:to select|to navigate|↑\/↓))/;
 
+/**
+ * The claude CLI's WEEKLY-quota wall surfaces as an interactive
+ * `/rate-limit-options` chooser, NOT as a stderr 429 — so the gateway's
+ * inference-path 429 detection never sees it and none of the failover/alert
+ * machinery (markExhausted → roll → quota-watch) ever engages. A headless
+ * agent then sits silently dead on a menu no human will answer (real incident:
+ * finn, 2026-06-07 — wedged for hours, unrecovered).
+ *
+ * Crucially the generic WEDGE_FOOTER_SIGNATURE above does NOT match this menu:
+ * its footer is "Enter to confirm · Esc to cancel" with NO "to select" /
+ * "to navigate" / ↑↓ affordance, so the generic branch leaves it untouched.
+ * Hence a dedicated detector.
+ *
+ * Two INDEPENDENT anchors, both required, so it can never false-positive on
+ * normal model output (verified against the live wedged pane, 2026-06-07):
+ *   (a) the literal slash-command claude prints for this menu, which cannot
+ *       appear in ordinary output: `/rate-limit-options`;
+ *   (b) an option string ONLY this menu shows: "Switch to usage credits" or
+ *       "Upgrade your plan".
+ * (Grep of the repo confirmed zero pre-existing occurrences of any of these.)
+ */
+export const RATE_LIMIT_MENU_SIGNATURE =
+  /(?=[\s\S]*\/rate-limit-options)(?=[\s\S]*(?:Switch to usage credits|Upgrade your plan))/;
+
+const MONTHS: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+/**
+ * Parse claude's weekly-reset line ("… resets Jun 9, 5am (Australia/Melbourne)")
+ * into an epoch-ms timestamp, tz-aware. Returns null on ANY parse failure — the
+ * caller MUST substitute a weekly-scale fallback (now + 7d), never `undefined`:
+ * markExhausted's default `until` is ~5h, which would un-exhaust a WEEKLY-walled
+ * account after 5h and re-wedge it. A wrong reset time only changes WHEN the
+ * broker re-probes the account, never compliance or correctness.
+ */
+export function parseWeeklyReset(text: string, nowMs: number = Date.now()): number | null {
+  // "resets Jun 9, 5am (Australia/Melbourne)" / "... 5pm (...)" / "... 11:30am"
+  const m = text.match(
+    /resets\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s*(?:\(([^)]+)\))?/i,
+  );
+  if (!m) return null;
+  const mon = MONTHS[m[1].slice(0, 3).toLowerCase()];
+  if (mon === undefined) return null;
+  const day = Number(m[2]);
+  let hour = Number(m[3]);
+  const minute = m[4] ? Number(m[4]) : 0;
+  const ampm = m[5]?.toLowerCase();
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour === 12) hour = 0;
+  if (!Number.isFinite(day) || !Number.isFinite(hour) || day < 1 || day > 31 || hour > 23) {
+    return null;
+  }
+  const tz = m[6]?.trim();
+  // Resolve the year as the next occurrence (roll forward if M/D already passed).
+  const probeYear = new Date(nowMs).getUTCFullYear();
+  for (const year of [probeYear, probeYear + 1]) {
+    const epoch = wallClockToEpoch(year, mon, day, hour, minute, tz);
+    if (epoch != null && epoch > nowMs - 60_000) return epoch;
+  }
+  return null;
+}
+
+/**
+ * Convert a wall-clock time in an IANA tz to epoch-ms (null if the tz is
+ * unknown). Resolves the tz's offset AT that date via Intl, so it is correct
+ * across DST — NOT `new Date(localString)`, which assumes the container TZ.
+ */
+function wallClockToEpoch(
+  year: number, month: number, day: number, hour: number, minute: number, tz: string | undefined,
+): number | null {
+  const asUtc = Date.UTC(year, month, day, hour, minute, 0);
+  if (!tz) return asUtc; // no tz given → best-effort UTC
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    });
+    const parts = Object.fromEntries(
+      fmt.formatToParts(new Date(asUtc)).filter((p) => p.type !== "literal").map((p) => [p.type, p.value]),
+    );
+    const shown = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour) % 24, Number(parts.minute), Number(parts.second),
+    );
+    const offset = shown - asUtc; // how far ahead the tz wall clock is of UTC
+    return asUtc - offset;
+  } catch {
+    return null; // unknown tz
+  }
+}
+
 const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_STABILITY_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 60_000;
@@ -74,6 +167,26 @@ export interface WedgeWatchdogOptions {
   deferToPrompts?: PromptRule[];
   /** Override the blocking-modal signature (tests / tuning). */
   wedgeSignature?: RegExp;
+  /**
+   * Rate-limit (weekly-quota) menu detection. When the pane shows claude's
+   * `/rate-limit-options` chooser, the agent is quota-walled and headless — no
+   * 429 reached the gateway, so failover never fired. On a stable match the
+   * watchdog (a) signals the gateway to trigger the EXISTING account-failover
+   * (markExhausted → roll, or the all-exhausted alert) via `onRateLimitMenu`,
+   * then (b) parks the menu with `Esc` (the SAME compliant verb — Esc cancels
+   * without selecting any option, so it can never pick "Switch to usage
+   * credits" = off-subscription). Disabled when `rateLimitSignature` is null.
+   */
+  rateLimitSignature?: RegExp | null;
+  /**
+   * Called on a stability-confirmed rate-limit menu, with the parsed weekly
+   * reset (epoch-ms, or null when unparseable). Default: signal the gateway
+   * over its UDS. Soft-fail — must never throw. Set to undefined to detect +
+   * park WITHOUT signalling (e.g. tests).
+   */
+  onRateLimitMenu?: (agentName: string, resetAt: number | null) => void;
+  /** Test seam: clock-injected weekly-reset parser. Default: parseWeeklyReset. */
+  parseReset?: (text: string, nowMs: number) => number | null;
   /** Test seam: cap total polls. Default Infinity (runs until killed). */
   maxPolls?: number;
   /** Test seam: clock override. */
@@ -87,8 +200,12 @@ export interface WedgeWatchdogOptions {
 }
 
 export interface WedgeWatchdogResult {
-  /** Number of times Esc was dispatched to dismiss a stuck prompt. */
+  /** Number of times Esc was dispatched to dismiss a stuck prompt (includes
+   *  rate-limit-menu parks). */
   fires: number;
+  /** Subset of `fires` that were rate-limit (weekly-quota) menu detections —
+   *  each also signalled failover. */
+  rateLimitFires: number;
   /** Total polls executed (bounded only in tests via maxPolls). */
   polls: number;
   reason: "max-polls" | "stopped";
@@ -123,6 +240,11 @@ export async function runWedgeWatchdog(
   const cooldownMs = opts.cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const deferToPrompts = opts.deferToPrompts ?? PROMPTS;
   const signature = opts.wedgeSignature ?? WEDGE_FOOTER_SIGNATURE;
+  // `null` disables rate-limit detection (kill switch); `undefined` → default on.
+  const rateLimitSignature =
+    opts.rateLimitSignature === null ? null : (opts.rateLimitSignature ?? RATE_LIMIT_MENU_SIGNATURE);
+  const onRateLimitMenu = opts.onRateLimitMenu;
+  const parseReset = opts.parseReset ?? parseWeeklyReset;
   const maxPolls = opts.maxPolls ?? Number.POSITIVE_INFINITY;
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? defaultSleep;
@@ -133,6 +255,7 @@ export async function runWedgeWatchdog(
   let lastKey: string | null = null;
   let cooldownUntil = 0;
   let fires = 0;
+  let rateLimitFires = 0;
   let polls = 0;
 
   while (polls < maxPolls) {
@@ -148,14 +271,64 @@ export async function runWedgeWatchdog(
       text = "";
     }
 
+    // Rate-limit (weekly-quota) menu takes PRECEDENCE over the generic modal
+    // branch: it must be SIGNALLED (to trigger failover) before any Esc, and a
+    // bare Esc alone would just clear the visual block and re-wedge next turn.
+    const isRateLimitMenu = !!text && rateLimitSignature !== null && rateLimitSignature.test(text);
+
     const isBlockingModal =
+      !isRateLimitMenu &&
       !!text &&
       signature.test(text) &&
       // Defer to the boot autoaccept poller for first-run prompts — those
       // want Enter, not Esc.
       !deferToPrompts.some((p) => p.match.test(text));
 
-    if (isBlockingModal) {
+    if (isRateLimitMenu) {
+      const key = stabilityKey(text);
+      if (key === lastKey) {
+        stableCount++;
+      } else {
+        stableCount = 1;
+        lastKey = key;
+      }
+      if (stableCount >= stabilityThreshold && now() >= cooldownUntil) {
+        const resetAt = parseReset(text, now());
+        console.error(
+          `[wedge-watchdog] ${opts.agentName}: rate-limit (weekly-quota) menu detected ` +
+            `after ${stableCount} stable polls — signalling failover` +
+            (resetAt != null ? ` (resets ${new Date(resetAt).toISOString()})` : " (reset unparsed)") +
+            ` then parking with Esc`,
+        );
+        // (a) Trigger the EXISTING gateway failover chain. Soft-fail — the
+        //     never-throw sidecar contract holds even for a custom seam.
+        if (onRateLimitMenu) {
+          try {
+            onRateLimitMenu(opts.agentName, resetAt);
+          } catch (err) {
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: onRateLimitMenu threw: ${(err as Error).message}`,
+            );
+          }
+        }
+        // (b) Park the menu compliantly. ESC ONLY — cancels the modal without
+        //     selecting any option, so it can NEVER land on "Switch to usage
+        //     credits" (off-subscription) or "Upgrade your plan". Never send a
+        //     Down/numeric key here.
+        try {
+          send(opts.agentName, ["Escape"]);
+        } catch (err) {
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          );
+        }
+        fires++;
+        rateLimitFires++;
+        cooldownUntil = now() + cooldownMs;
+        stableCount = 0;
+        lastKey = null;
+      }
+    } else if (isBlockingModal) {
       const key = stabilityKey(text);
       if (key === lastKey) {
         stableCount++;
@@ -195,5 +368,5 @@ export async function runWedgeWatchdog(
     await sleep(pollIntervalMs);
   }
 
-  return { fires, polls, reason: "max-polls" };
+  return { fires, rateLimitFires, polls, reason: "max-polls" };
 }
