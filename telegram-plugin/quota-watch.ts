@@ -160,6 +160,99 @@ export function evaluateQuotaWatchAccount(args: {
   return { kind: "skip", accountLabel: label, reason: "no-matching-transition" };
 }
 
+// ─── Fleet-level: all accounts exhausted ───────────────────────────────────────
+
+/**
+ * Reserved key under which the fleet-wide "all accounts exhausted" alert state
+ * is stored in the same quota-watch.json map. Not a valid account label (emails
+ * can't contain this), so it never collides with a per-account entry, and the
+ * per-account loop (which iterates account snapshots, not state-map keys) never
+ * sees it. Encoded as a QuotaWatchAccountState so the existing load validator
+ * accepts it: lastNotifiedHealth "throttling" = currently alerting all-exhausted,
+ * "healthy"/null = not. Backward-compatible — old files simply lack the key.
+ */
+export const FLEET_ALL_EXHAUSTED_KEY = "__fleet_all_exhausted__";
+
+export type FleetAllExhaustedDecision =
+  | { kind: "notify"; message: string; newState: QuotaWatchAccountState; transition: "entered" | "recovered" }
+  | { kind: "skip"; reason: string };
+
+/**
+ * Fleet-wide all-exhausted alert (edge-triggered).
+ *
+ * Fires ONCE when every account enters the broker's exhausted state (no healthy
+ * account to fail over to — agents go quiet, crons defer, consumers/hindsight
+ * silently serve an exhausted account), and ONCE on recovery. This catches the
+ * cases the trigger-based interactive all-blocked card misses: a quiet period
+ * (no agent happens to 429 into the wall) and the consumer/cron paths.
+ *
+ * Authoritative source: the broker's per-account `exhausted` flag (set by
+ * mark-exhausted via failover + the consumer sensor), NOT probe-derived health
+ * — so there is no probe-failure false-alarm. Requires at least one account;
+ * an empty fleet never alerts.
+ */
+export function evaluateFleetAllExhausted(args: {
+  accounts: Array<{ label: string; exhausted: boolean; exhausted_until?: number }>;
+  prev: QuotaWatchAccountState;
+  now: number;
+}): FleetAllExhaustedDecision {
+  const { accounts, prev, now } = args;
+  const allExhausted = accounts.length > 0 && accounts.every((a) => a.exhausted);
+  // "throttling" doubles as the "currently alerting all-exhausted" marker.
+  const wasAlerting = prev.lastNotifiedHealth === "throttling";
+
+  if (allExhausted && !wasAlerting) {
+    return {
+      kind: "notify",
+      message: buildAllExhaustedMessage(accounts, now),
+      newState: { lastNotifiedHealth: "throttling", lastNotifiedAt: now },
+      transition: "entered",
+    };
+  }
+  if (!allExhausted && wasAlerting) {
+    return {
+      kind: "notify",
+      message: buildFleetRecoveredMessage(accounts),
+      newState: { lastNotifiedHealth: "healthy", lastNotifiedAt: now },
+      transition: "recovered",
+    };
+  }
+  return { kind: "skip", reason: allExhausted ? "still-all-exhausted" : "not-all-exhausted" };
+}
+
+function buildAllExhaustedMessage(
+  accounts: Array<{ label: string; exhausted_until?: number }>,
+  now: number,
+): string {
+  const resets = accounts
+    .map((a) => a.exhausted_until)
+    .filter((x): x is number => typeof x === "number" && x > now);
+  const earliest = resets.length > 0 ? Math.min(...resets) : null;
+  const resetLine = earliest
+    ? `Earliest reset: ${formatRelative(new Date(earliest), new Date(now))}.`
+    : `Reset time unknown (no window data).`;
+  return [
+    `🔴 <b>All accounts exhausted</b>`,
+    ``,
+    `Every Anthropic account (${accounts.length}) is quota-walled — there is no healthy account to fail over to.`,
+    resetLine,
+    ``,
+    `<i>This is self-healing: agents resume and deferred scheduled jobs run automatically once a window resets. Nothing is lost. Add headroom with <code>/auth add</code> if this recurs.</i>`,
+  ].join("\n");
+}
+
+function buildFleetRecoveredMessage(
+  accounts: Array<{ label: string; exhausted: boolean }>,
+): string {
+  const healthy = accounts.filter((a) => !a.exhausted).map((a) => a.label);
+  const which = healthy.length > 0 ? ` (<code>${escapeHtml(healthy[0]!)}</code>)` : "";
+  return [
+    `🟢 <b>Fleet recovered</b> — at least one account is healthy again${which}.`,
+    ``,
+    `<i>Agents are back; any deferred scheduled jobs will run on their next occurrence.</i>`,
+  ].join("\n");
+}
+
 // ─── Message builders ─────────────────────────────────────────────────────────
 
 function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): string {
