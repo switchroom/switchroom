@@ -144,6 +144,15 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
     // One dispatch attempt. `attempt` is zero-based. Returns nothing; records
     // the outcome to the audit sink (always — deferred fires are recorded too,
     // closing the silent-loss hole) and may schedule a bounded retry.
+    //
+    // Cadence note: for a cron whose interval is SHORTER than the retry backoff
+    // (default 1/3/5m, i.e. sub-5-min crons), a pending retry chain may still be
+    // live when the next natural occurrence fires, so two chains can briefly
+    // overlap and — on recovery — both dispatch (mild over-delivery). This is
+    // never silent loss (every attempt is audited distinctly) and is bounded by
+    // the cron cadence (no worse than the pre-gate baseline's per-minute futile
+    // fires); at-least-once is the scheduler's documented contract (replay.ts).
+    // Typical crons (hourly/daily briefings) never hit this.
     const attemptFire = async (attempt: number): Promise<void> => {
       const startedAt = now();
 
