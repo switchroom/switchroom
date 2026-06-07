@@ -59,15 +59,28 @@ export const WEDGE_FOOTER_SIGNATURE =
  * Hence a dedicated detector.
  *
  * Two INDEPENDENT anchors, both required, so it can never false-positive on
- * normal model output (verified against the live wedged pane, 2026-06-07):
- *   (a) the literal slash-command claude prints for this menu, which cannot
- *       appear in ordinary output: `/rate-limit-options`;
- *   (b) an option string ONLY this menu shows: "Switch to usage credits" or
- *       "Upgrade your plan".
- * (Grep of the repo confirmed zero pre-existing occurrences of any of these.)
+ * normal model output (verified against the live wedged panes, 2026-06-07):
+ *   (a) the interactive selector's option-1 row, which sits at the BOTTOM of
+ *       the pane (where the cursor is) and is therefore always inside the
+ *       captured viewport: "Stop and wait for …";
+ *   (b) an option string ONLY this menu shows: "usage credits" (covers both
+ *       "Switch to usage credits" and the newer "Add funds to continue with
+ *       usage credits" wording), "Upgrade your plan", or the literal
+ *       `/rate-limit-options` slash-command claude prints for the menu.
+ *
+ * v0.14.84 (#2218) anchored (a) on `/rate-limit-options` itself — but that
+ * line is printed ABOVE the menu options, so on a pane with enough preceding
+ * output it scrolls OFF the top of the `tmux capture-pane -p` viewport (which
+ * grabs only the visible ~50 lines, no scrollback). clerk wedged exactly this
+ * way on 2026-06-07 and the detector stayed silent (zero log fires). The fix
+ * re-anchors (a) on the option-1 row, which is pinned to the bottom of the
+ * pane and cannot scroll off; `/rate-limit-options` survives only as one of
+ * the (b) alternatives. "Stop and wait for" (not the full "…limit to reset")
+ * absorbs minor CLI wording drift (e.g. "…for your limit to reset").
+ * (Grep of the repo confirmed zero pre-existing occurrences of these.)
  */
 export const RATE_LIMIT_MENU_SIGNATURE =
-  /(?=[\s\S]*\/rate-limit-options)(?=[\s\S]*(?:Switch to usage credits|Upgrade your plan))/;
+  /(?=[\s\S]*Stop and wait for)(?=[\s\S]*(?:usage credits|Upgrade your plan|\/rate-limit-options))/;
 
 const MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,

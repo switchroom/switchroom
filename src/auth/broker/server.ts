@@ -973,8 +973,13 @@ export class AuthBroker {
    */
   private servingAccount(identity: Identity): string | null {
     const account = this.callerAccount(identity);
-    if (identity.kind !== "consumer") return account;
-    return this.consumerAccountWithFailover(account);
+    // Operator serving stays attribution-true — the operator CLI owns
+    // auth.active explicitly and a forced `auth use` must mirror exactly what
+    // it asked for. Consumers (pinned for quota isolation) AND agents (riding
+    // the swappable auth.active) both fail a walled account over so neither is
+    // ever served exhausted credentials.
+    if (identity.kind === "operator") return account;
+    return this.accountWithFailover(account);
   }
 
   /** True if `account` is currently within a mark-exhausted window. */
@@ -984,18 +989,30 @@ export class AuthBroker {
   }
 
   /**
-   * A consumer's pinned account, unless it's exhausted — then the first
+   * `account`, unless it's within a mark-exhausted window — then the first
    * non-exhausted account in `fallback_order` that has stored credentials.
-   * Falls back to the pinned account if no healthy alternative exists (better
-   * to retry the pinned one than serve nothing).
+   * Falls back to `account` itself when no healthy alternative exists (better
+   * to retry the pinned/active account than serve nothing — an all-walled
+   * fleet keeps trying rather than going dark).
+   *
+   * Shared by the consumer serving path AND the agent serving/fanout path.
+   * The agent path is the durable half of the #2218 weekly-wall fix:
+   * `mark-exhausted` marks quota + mirrors failover creds once but leaves
+   * `auth.active` pointed at the walled account, so the exhaustion-BLIND
+   * refresh-tick fanout (refreshOneAccount → fanoutToAffectedAgents, every
+   * ~1h when the walled account's OAuth token refreshes — refresh works fine,
+   * a quota wall is not an auth failure) would otherwise silently re-mirror the
+   * walled creds back onto the fleet, undoing the auto-fallback. Routing
+   * fanout + serving through this read makes the exhaustion window actually
+   * hold, and — like the consumer path — auto-reverts once the window passes.
    */
-  private consumerAccountWithFailover(pinned: string | null): string | null {
-    if (!pinned || !this.isAccountExhausted(pinned)) return pinned;
+  private accountWithFailover(account: string | null | undefined): string | null {
+    if (!account || !this.isAccountExhausted(account)) return account ?? null;
     for (const cand of this.config.auth?.fallback_order ?? []) {
-      if (cand === pinned || this.isAccountExhausted(cand)) continue;
+      if (cand === account || this.isAccountExhausted(cand)) continue;
       if (readAccountCredentials(cand, this.home)) return cand;
     }
-    return pinned;
+    return account;
   }
 
   /* ─── Op handlers ───────────────────────────────────────────── */
@@ -1180,7 +1197,7 @@ export class AuthBroker {
   /**
    * Consumer-account quota sensor tick. Probes every account pinned by a
    * consumer and, when a probe shows a hard wall, marks it exhausted so the
-   * consumer's serving-failover (consumerAccountWithFailover) kicks in. This
+   * consumer's serving-failover (accountWithFailover) kicks in. This
    * is the missing TRIGGER for a consumer (e.g. hindsight) on a dedicated
    * account that no agent shares — nothing else ever raises mark-exhausted for
    * it. Public for tests (driven directly via the `_testFetchQuota` seam).
@@ -2070,12 +2087,18 @@ export class AuthBroker {
     return out;
   }
 
-  /** Fan out to every agent whose effective account == label. */
+  /** Fan out to every agent whose effective (failover-resolved) account == label. */
   private fanoutToAffectedAgents(label: string): string[] {
     const auth = this.config.auth ?? {};
     const fanned: string[] = [];
     for (const [name, agent] of Object.entries(this.config.agents ?? {})) {
-      const effective = agent.auth?.override ?? auth.active;
+      // Match on the SERVED account (post exhaustion-failover), not the raw
+      // auth.active. When auth.active is walled, an agent's served account is
+      // its healthy fallback — so refreshing the fallback re-mirrors it, while
+      // refreshing the walled account matches no agent (it serves none) and so
+      // can never re-mirror walled creds. With nothing exhausted this is
+      // identical to matching auth.active.
+      const effective = this.accountWithFailover(agent.auth?.override ?? auth.active);
       if (effective === label) {
         if (this.fanoutForAgent(name)) fanned.push(name);
       }
@@ -2124,7 +2147,11 @@ export class AuthBroker {
     const auth = this.config.auth ?? {};
     const agent = (this.config.agents ?? {})[name];
     if (!agent) return false;
-    const effective = agent.auth?.override ?? auth.active;
+    // Mirror the effective account THROUGH exhaustion-failover: when the raw
+    // effective (override ?? auth.active) is walled, write the healthy fallback
+    // instead. Without this, a refresh-tick fanout of the walled account would
+    // re-mirror it onto the agent and undo the auto-fallback (#2218 durability).
+    const effective = this.accountWithFailover(agent.auth?.override ?? auth.active);
     if (!effective) return false;
     return this.mirrorAccountToAgent(effective, name);
   }

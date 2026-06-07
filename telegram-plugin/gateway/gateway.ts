@@ -125,6 +125,7 @@ import {
 } from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
+import { resolveExhaustUntil } from './exhaust-until.js'
 import {
   pendingAuthAddFlows,
   startAccountAuthSession,
@@ -4400,8 +4401,17 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // separately with the causal-shape headline ("5-hour limit on
     // ken" instead of generic "quota exhausted") — see
     // auth-snapshot-format.ts → renderFallbackAnnouncement.
+    //
+    // Thread the parsed reset as markExhausted's `until` via the shared
+    // resolveExhaustUntil floor. parseResetTime gives a finite epoch for
+    // ROLLING wordings ("resets in 2h", "retry after 60s"); a WEEKLY wall
+    // ("resets Jun 9, 5am") is UNPARSEABLE here → undefined → +7d floor.
+    // Pre-fix this called fireFleetAutoFallback(agent) with no until, so a
+    // weekly wall that surfaced as a 429 got markExhausted's ~5h default and
+    // the broker re-mirrored the still-walled account onto the fleet after 5h.
     if (willActuallyFire) {
-      void fireFleetAutoFallback(agent)
+      const untilMs = resolveExhaustUntil(modelUnavailable.resetAt?.getTime())
+      void fireFleetAutoFallback(agent, untilMs)
     }
   } else {
     try {
@@ -6271,11 +6281,7 @@ const ipcServer: IpcServer = createIpcServer({
   // existing chain handles the rest (roll to a fallback subscription account,
   // or the all-exhausted operator alert when none has quota). Fire-and-forget.
   onQuotaWallDetected(_client: IpcClient, msg: QuotaWallDetectedMessage) {
-    const WEEKLY_MS = 7 * 24 * 60 * 60 * 1000
-    const untilMs =
-      typeof msg.resetAt === 'number' && Number.isFinite(msg.resetAt) && msg.resetAt > Date.now()
-        ? msg.resetAt
-        : Date.now() + WEEKLY_MS
+    const untilMs = resolveExhaustUntil(msg.resetAt)
     process.stderr.write(
       `telegram gateway: quota_wall_detected agent=${msg.agentName} ` +
         `until=${new Date(untilMs).toISOString()}` +
@@ -14681,10 +14687,12 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       // operator is explicitly choosing, and is admin); only this automatic
       // path moves to the non-admin verb.
       failover: async () => {
-        // The 429 inference path passes no `until` (broker ~5h default). The
-        // rate-limit-MENU path (quota_wall_detected) passes the parsed WEEKLY
-        // reset, so the walled account isn't re-probed (and re-wedged) within
-        // the 5h default while it's weekly-capped.
+        // BOTH paths now pass a resolved `untilMs` via resolveExhaustUntil
+        // (never undefined): the rate-limit-MENU path threads the parsed weekly
+        // reset, and the 429 inference path threads parseResetTime's value or
+        // the +7d floor when it's a weekly wall it can't parse. So a
+        // weekly-capped account is never re-probed (and re-wedged) within the
+        // broker's ~5h default.
         const r = await client.markExhausted(untilMs)
         return { rolledTo: r.rolledTo ?? null, rolled: r.rolled }
       },
