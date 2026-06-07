@@ -186,18 +186,30 @@ export async function uploadLargeFile(
   return lastItem;
 }
 
+/** OneDrive share-link scope, in the order they're attempted. */
+export type ShareLinkScope = "anonymous" | "organization";
+
 /**
- * Create a shareable view link for an item. Prefers an anonymous link; if org
- * policy blocks it, falls back to an organization link, then to the item's own
- * webUrl. Returns the best available URL.
+ * Create a shareable view link for an item, trying each scope in `scopes`
+ * order and returning the first that succeeds; falls back to the item's own
+ * webUrl if all fail.
+ *
+ * SECURITY NOTE: the default first scope is `anonymous` (anyone-with-link, no
+ * sign-in) — the right UX for "open it from Telegram without an MS login", but
+ * a real over-share if the chat/link leaks. Operators who want tighter sharing
+ * pass `["organization"]` (requires the recipient be in the tenant) via the
+ * `SWITCHROOM_DELIVER_LINK_SCOPE` env knob on the CLI. Personal OneDrive
+ * accounts can't do `organization`, so for those it degrades to the item
+ * webUrl (sign-in required) rather than an anonymous link.
  */
 export async function createShareLink(
   deps: OneDriveDeps,
   item: DriveItem,
+  scopes: ShareLinkScope[] = ["anonymous", "organization"],
 ): Promise<string> {
   const f = deps.fetchImpl ?? fetch;
   const url = `${GRAPH}/me/drive/items/${item.id}/createLink`;
-  for (const scope of ["anonymous", "organization"] as const) {
+  for (const scope of scopes) {
     const resp = await f(url, {
       method: "POST",
       headers: { ...authHeaders(deps.accessToken), "Content-Type": "application/json" },
@@ -225,11 +237,13 @@ export async function deliverToOneDrive(args: {
   localPath: string;
   bytes: Uint8Array;
   fetchImpl?: typeof fetch;
+  /** Share-link scopes to attempt, in order. Default ["anonymous","organization"]. */
+  linkScopes?: ShareLinkScope[];
 }): Promise<DeliveredFile> {
   const deps: OneDriveDeps = { accessToken: args.accessToken, fetchImpl: args.fetchImpl };
   const folder = await ensureSwitchroomFolder(deps, args.agentName);
   const filename = basename(args.localPath);
   const item = await uploadFile(deps, folder.id, filename, args.bytes);
-  const link = await createShareLink(deps, item);
+  const link = await createShareLink(deps, item, args.linkScopes);
   return { itemId: item.id, link, folderPath: `Switchroom/${args.agentName}` };
 }

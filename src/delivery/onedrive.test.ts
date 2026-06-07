@@ -78,6 +78,21 @@ describe("ensureFolder", () => {
   });
 });
 
+describe("ensureFolder — nested create URL (the error-prone shape)", () => {
+  it("creates a nested folder via root:/<parent>:/children, not root/children", async () => {
+    let createUrl = "";
+    const f = mockFetch([
+      { method: "GET", match: "/root:/Switchroom/clerk", status: 404 },
+      { method: "POST", match: "/root:/Switchroom:/children", status: 201, json: { id: "AGENT", name: "clerk" }, record: (u) => { createUrl = u; } },
+    ]);
+    const item = await ensureFolder({ accessToken: TOKEN, fetchImpl: f }, "/Switchroom", "clerk");
+    expect(item.id).toBe("AGENT");
+    // Must use the nested form, NOT the top-level /root/children form.
+    expect(createUrl).toContain("/me/drive/root:/Switchroom:/children");
+    expect(createUrl).not.toContain("/me/drive/root/children");
+  });
+});
+
 describe("ensureSwitchroomFolder", () => {
   it("ensures both Switchroom and Switchroom/<agent>", async () => {
     const seen: string[] = [];
@@ -130,6 +145,37 @@ describe("uploadFile", () => {
     const item = await uploadFile({ accessToken: TOKEN, fetchImpl: f }, "FOLDER", "big.bin", big);
     expect(sessionRequested).toBe(true);
     expect(item.id).toBe("BIGITEM");
+  });
+
+  it("uploads a multi-chunk file: 202 for intermediate chunks, 201 on the last, correct Content-Range", async () => {
+    // 12 MiB → 3 chunks of 5/5/2 MiB. Pins the cross-chunk Content-Range math
+    // and the 202-intermediate branch.
+    const big = new Uint8Array(12 * 1024 * 1024);
+    const ranges: string[] = [];
+    let putCount = 0;
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("createUploadSession")) {
+        return { ok: true, status: 200, json: async () => ({ uploadUrl: "https://upload.example/s" }), text: async () => "" } as Response;
+      }
+      if (url.includes("upload.example/s") && method === "PUT") {
+        putCount++;
+        const cr = (init?.headers as Record<string, string>)["Content-Range"];
+        ranges.push(cr);
+        const last = putCount === 3;
+        return { ok: last, status: last ? 201 : 202, json: async () => (last ? { id: "BIG3", name: "x" } : {}), text: async () => "" } as Response;
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    }) as typeof fetch;
+    const item = await uploadFile({ accessToken: TOKEN, fetchImpl: f }, "FOLDER", "big.bin", big);
+    expect(item.id).toBe("BIG3");
+    expect(putCount).toBe(3);
+    const total = 12 * 1024 * 1024;
+    const chunk = 5 * 1024 * 1024;
+    expect(ranges[0]).toBe(`bytes 0-${chunk - 1}/${total}`);
+    expect(ranges[1]).toBe(`bytes ${chunk}-${2 * chunk - 1}/${total}`);
+    expect(ranges[2]).toBe(`bytes ${2 * chunk}-${total - 1}/${total}`);
   });
 });
 

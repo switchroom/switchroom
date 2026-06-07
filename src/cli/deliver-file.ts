@@ -19,7 +19,31 @@ import { basename } from "node:path";
 import type { Command } from "commander";
 
 import { AuthBrokerClient } from "../auth/broker/client.js";
-import { deliverToOneDrive, type DeliveredFile } from "../delivery/onedrive.js";
+import { deliverToOneDrive, type DeliveredFile, type ShareLinkScope } from "../delivery/onedrive.js";
+
+/**
+ * Resolve the OneDrive share-link scope order from `SWITCHROOM_DELIVER_LINK_SCOPE`.
+ * Default ["anonymous","organization"] (anyone-with-link first — the right UX
+ * for opening from Telegram). Set "organization" to require the recipient be in
+ * the tenant (personal accounts then degrade to a sign-in-required item link).
+ */
+export function resolveLinkScopes(env = process.env): ShareLinkScope[] {
+  const raw = (env.SWITCHROOM_DELIVER_LINK_SCOPE ?? "").trim().toLowerCase();
+  if (raw === "organization") return ["organization"];
+  if (raw === "anonymous") return ["anonymous"];
+  return ["anonymous", "organization"];
+}
+
+/**
+ * Defense-in-depth: agent names are schema-constrained to
+ * /^[a-z0-9][a-z0-9_-]{0,50}$/, so they can't contain `/` or `..`. Re-assert
+ * it here so a future caller / misconfigured env can't smuggle a path segment
+ * into the Switchroom/<agent> folder path. Falls back to "agent".
+ */
+export function safeAgentName(name: string | undefined): string {
+  const n = (name ?? "").trim();
+  return /^[a-z0-9][a-z0-9_-]{0,50}$/.test(n) ? n : "agent";
+}
 
 /** Injectable seams so the core is unit-testable without a broker or network. */
 export interface DeliverFileDeps {
@@ -64,11 +88,13 @@ export async function runDeliverFile(
   localPath: string,
   deps: DeliverFileDeps = {},
 ): Promise<DeliverFileResult> {
-  const agentName = deps.agentName ?? process.env.SWITCHROOM_AGENT_NAME ?? "agent";
+  const agentName = safeAgentName(deps.agentName ?? process.env.SWITCHROOM_AGENT_NAME);
   const sizeOf = deps.fileSize ?? ((p: string) => statSync(p).size);
   const read = deps.readFile ?? ((p: string) => new Uint8Array(readFileSync(p)));
   const getToken = deps.getAccessToken ?? brokerAccessToken;
-  const deliver = deps.deliver ?? deliverToOneDrive;
+  const deliver =
+    deps.deliver ??
+    ((a) => deliverToOneDrive({ ...a, linkScopes: resolveLinkScopes() }));
 
   let size: number;
   try {

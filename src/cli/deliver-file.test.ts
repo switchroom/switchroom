@@ -1,5 +1,28 @@
 import { describe, it, expect } from "vitest";
-import { runDeliverFile } from "./deliver-file.js";
+import { runDeliverFile, resolveLinkScopes, safeAgentName } from "./deliver-file.js";
+
+describe("resolveLinkScopes", () => {
+  it("defaults to anonymous-first", () => {
+    expect(resolveLinkScopes({} as NodeJS.ProcessEnv)).toEqual(["anonymous", "organization"]);
+  });
+  it("honors organization-only", () => {
+    expect(resolveLinkScopes({ SWITCHROOM_DELIVER_LINK_SCOPE: "organization" } as NodeJS.ProcessEnv)).toEqual(["organization"]);
+  });
+  it("honors anonymous-only", () => {
+    expect(resolveLinkScopes({ SWITCHROOM_DELIVER_LINK_SCOPE: "anonymous" } as NodeJS.ProcessEnv)).toEqual(["anonymous"]);
+  });
+});
+
+describe("safeAgentName (path-traversal guard)", () => {
+  it("passes a valid agent name", () => {
+    expect(safeAgentName("clerk")).toBe("clerk");
+  });
+  it("rejects a name with a slash or dot-dot, falling back to 'agent'", () => {
+    expect(safeAgentName("../evil")).toBe("agent");
+    expect(safeAgentName("a/b")).toBe("agent");
+    expect(safeAgentName(undefined)).toBe("agent");
+  });
+});
 
 const okDeps = {
   agentName: "clerk",
