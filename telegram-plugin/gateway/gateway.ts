@@ -408,6 +408,7 @@ import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-di
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
+  resolveCreditWatchFatalReasons,
   loadCreditState,
   saveCreditState,
 } from '../credits-watch.js'
@@ -14742,6 +14743,9 @@ async function runCreditWatch(): Promise<void> {
     currentReason: reason,
     prev,
     now: Date.now(),
+    // Subscription-only: empty by default → extra-usage-off never alarms.
+    // Opt back in via SWITCHROOM_CREDITS_WATCH_FATAL_REASONS. See credits-watch.ts.
+    fatalReasons: resolveCreditWatchFatalReasons(process.env),
   })
   if (decision.kind === 'skip') {
     return

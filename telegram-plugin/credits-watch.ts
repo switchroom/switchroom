@@ -27,20 +27,53 @@ import { join } from "path";
 const STATE_FILE = "credits-watch.json";
 
 /**
- * Possible values of `cachedExtraUsageDisabledReason` in `.claude.json`
- * that warrant a user-facing notification. Other values (null,
- * undefined, transient unknowns) are treated as "no notification
- * needed".
+ * Which `cachedExtraUsageDisabledReason` values warrant a user-facing alarm.
  *
- * Conservative list: only fatal-billing reasons. We don't want to fire
- * on every transient API blip the cache happens to write.
+ * IMPORTANT — empty by default (subscription-only model). The flag name says it
+ * all: `cachedExtraUsageDisabledReason` is *always* "why **extra usage** (the
+ * optional pay-as-you-go layer beyond the Pro/Max plan) is disabled." switchroom
+ * is subscription-only by design (compliance pillar 3 — "the plan is the
+ * ceiling, no API/pay-as-you-go"), so extra usage being OFF is the **expected,
+ * desired** state. Every value (`out_of_credits`, `extra_usage_disabled`,
+ * `credits_exhausted`, even `org_level_disabled` = "org admin disabled extra
+ * usage") describes that benign state — none indicates a real switchroom
+ * failure. Firing a "cron + replies will fail, buy credits" card on it is a
+ * false alarm AND advises something that contradicts the subscription-honest
+ * model.
+ *
+ * The genuine failure modes are covered elsewhere:
+ *   - an account's subscription window exhausts → stderr → fleet auto-fallback
+ *     (model-unavailable.ts → fireFleetAutoFallback) rolls to a healthy account;
+ *   - the WHOLE fleet exhausts → the quota-watch all-exhausted operator alert.
+ *
+ * So credits-watch defaults to silent. An operator who actually runs on
+ * pay-as-you-go and wants the alarm can opt specific reasons back in via
+ * `SWITCHROOM_CREDITS_WATCH_FATAL_REASONS` (comma-separated). See
+ * `resolveCreditWatchFatalReasons`.
  */
-const FATAL_REASONS = new Set([
+export const DEFAULT_CREDIT_FATAL_REASONS = new Set<string>();
+
+/** All reason strings recognized for opt-in via the env var. */
+const KNOWN_CREDIT_REASONS = [
   "out_of_credits",
   "org_level_disabled",
   "credits_exhausted",
   "extra_usage_disabled",
-]);
+] as const;
+
+/**
+ * Resolve the active fatal-reason set. Empty by default (subscription-only);
+ * if `SWITCHROOM_CREDITS_WATCH_FATAL_REASONS` is set, parse it as a
+ * comma-separated list (tokens kept verbatim — an unknown token is harmless,
+ * it simply never matches a real reason value). `*` opts in all known reasons.
+ */
+export function resolveCreditWatchFatalReasons(env: NodeJS.ProcessEnv): Set<string> {
+  const raw = env.SWITCHROOM_CREDITS_WATCH_FATAL_REASONS;
+  if (!raw || raw.trim().length === 0) return new Set(DEFAULT_CREDIT_FATAL_REASONS);
+  if (raw.trim() === "*") return new Set(KNOWN_CREDIT_REASONS);
+  const wanted = new Set(raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0));
+  return wanted;
+}
 
 export interface CreditState {
   /** Last reason we notified the user about. null when healthy / never notified. */
@@ -103,15 +136,22 @@ export function evaluateCreditState(args: {
   currentReason: string | null;
   prev: CreditState;
   now: number;
+  /**
+   * Which reasons are treated as fatal (worth alarming). Defaults to
+   * `DEFAULT_CREDIT_FATAL_REASONS` (empty — subscription-only: extra-usage-off
+   * is never a real failure). The gateway passes the env-resolved set.
+   */
+  fatalReasons?: Set<string>;
 }): CreditDecision {
   const { agentName, currentReason, prev, now } = args;
+  const fatalReasons = args.fatalReasons ?? DEFAULT_CREDIT_FATAL_REASONS;
 
   // Non-fatal current state (null, or some unknown reason) — no
   // notification regardless of prev (we already notified on entry to
   // fatal; recovery from a known-fatal state below is the only path
   // that fires when current is null).
-  const currentIsFatal = currentReason != null && FATAL_REASONS.has(currentReason);
-  const prevIsFatal = prev.lastNotifiedReason != null && FATAL_REASONS.has(prev.lastNotifiedReason);
+  const currentIsFatal = currentReason != null && fatalReasons.has(currentReason);
+  const prevIsFatal = prev.lastNotifiedReason != null && fatalReasons.has(prev.lastNotifiedReason);
 
   // Recovery path: last-notified was fatal, current is null/non-fatal.
   if (!currentIsFatal && prevIsFatal) {
