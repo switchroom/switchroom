@@ -16,12 +16,25 @@ describe('resolveAnswerThreadId', () => {
   const BREVO = 4
   const META = 3
 
-  it('explicit model thread wins outright', () => {
+  it('the model explicit no longer wins over a framework anchor (origin wins); kill switch restores legacy', () => {
+    // Default (framework authority): the resolved origin owns the topic — the
+    // model passing a different explicit thread cannot redirect the reply.
     expect(
       resolveAnswerThreadId({
+        explicitThreadId: BREVO, // model tried to send it to Brevo
+        originResolved: true,
+        originThreadId: META, // but the question came from Meta
+        liveTurnPresent: true,
+        liveThreadId: META,
+      }),
+    ).toBe(META)
+    // Kill switch (SWITCHROOM_REPLY_TOPIC_AUTHORITY=0): explicit wins outright.
+    expect(
+      resolveAnswerThreadId({
+        frameworkTopicAuthority: false,
         explicitThreadId: BREVO,
         originResolved: true,
-        originThreadId: META, // even if origin says otherwise
+        originThreadId: META,
         liveThreadId: META,
       }),
     ).toBe(BREVO)
@@ -86,18 +99,20 @@ describe('resolveAnswerThreadId', () => {
     ).toBeUndefined()
   })
 
-  it('precedence: explicit > origin > live (never chatThreadMap — not an input)', () => {
+  it('precedence (framework authority, default): origin > live > explicit (never chatThreadMap — not an input)', () => {
     // The chat last-seen thread is deliberately NOT a parameter: answer
     // paths can never reach it, which is what closes the wrong-topic bug.
-    // explicit beats both:
+    // The model's explicit no longer beats a framework anchor — origin wins
+    // even when the model asserted a different topic (the General→CRM fix):
     expect(
       resolveAnswerThreadId({
         explicitThreadId: 9,
         originResolved: true,
         originThreadId: BREVO,
+        liveTurnPresent: true,
         liveThreadId: META,
       }),
-    ).toBe(9)
+    ).toBe(BREVO)
     // no explicit, origin resolved → origin (not live):
     expect(
       resolveAnswerThreadId({
@@ -107,5 +122,15 @@ describe('resolveAnswerThreadId', () => {
         liveThreadId: META,
       }),
     ).toBe(BREVO)
+    // kill switch restores the legacy explicit-first precedence:
+    expect(
+      resolveAnswerThreadId({
+        frameworkTopicAuthority: false,
+        explicitThreadId: 9,
+        originResolved: true,
+        originThreadId: BREVO,
+        liveThreadId: META,
+      }),
+    ).toBe(9)
   })
 })

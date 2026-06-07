@@ -1566,6 +1566,15 @@ const TURN_ORIGIN_ROUTING_ENABLED =
 // mask a misroute. Kill switch off (=0) → echo-only origin (today's behaviour).
 const FRAMEWORK_ORIGIN_ROUTING_ENABLED =
   process.env.SWITCHROOM_FRAMEWORK_ORIGIN_ROUTING !== '0'
+// Reply-topic framework authority (2026-06-08 determinism pass). The topic an
+// ANSWER lands in is owned by the TURN it answers (origin → live), NOT the
+// model's `message_thread_id`. The model's explicit thread is demoted to a
+// last resort (consulted only when there is no origin AND no live turn). Closes
+// the model-chosen-topic override that sent a General-topic question's answer
+// into the CRM topic (marko) — the model could redirect any reply. Kill switch
+// off (=0) → legacy explicit-first precedence (the model's thread wins).
+const REPLY_TOPIC_AUTHORITY_ENABLED =
+  process.env.SWITCHROOM_REPLY_TOPIC_AUTHORITY !== '0'
 // Component 4 (per-turn topic framing). Add a one-line directive to the
 // channel meta + bridge instructions telling the model to answer ONLY the
 // current message's topic. Kill switch off (=0) → no framing field.
@@ -2033,15 +2042,32 @@ function resolveAnswerThreadWithLog(
     originResolved: originTurn != null,
     originThreadId: originTurn?.sessionThreadId,
     liveThreadId: liveTurn?.sessionThreadId,
+    liveTurnPresent: liveTurn != null,
     lastEndedResolvedForChat: recovered != null,
     lastEndedThreadIdForChat: recovered?.sessionThreadId,
+    frameworkTopicAuthority: REPLY_TOPIC_AUTHORITY_ENABLED,
   })
-  const via =
-    explicitThreadId != null ? 'explicit'
-    : originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
-    : liveTurn?.sessionThreadId != null ? 'live'
-    : recovered != null ? 'recovered'
-    : 'none'
+  // `via` reflects the ACTIVE precedence so telemetry matches routing.
+  const via = REPLY_TOPIC_AUTHORITY_ENABLED
+    ? (originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
+      : liveTurn != null ? 'live'
+      : explicitThreadId != null ? 'explicit'
+      : recovered != null ? 'recovered'
+      : 'none')
+    : (explicitThreadId != null ? 'explicit'
+      : originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
+      : liveTurn?.sessionThreadId != null ? 'live'
+      : recovered != null ? 'recovered'
+      : 'none')
+  // Observability: the model passed an explicit topic but a framework anchor
+  // (origin/live) overrode it. This is the deterministic correction that fixes
+  // the General→CRM misroute; surface it so the model's topic-grabbing is
+  // visible rather than silent.
+  const explicitOverridden =
+    REPLY_TOPIC_AUTHORITY_ENABLED &&
+    explicitThreadId != null &&
+    (originTurn != null || liveTurn != null) &&
+    threadId !== explicitThreadId
   const ownerTurn = originTurn ?? recovered ?? liveTurn
   const isSupergroup = chatId.startsWith('-100')
   // UNROUTED = a supergroup reply that resolved to NO topic with NO owner turn
@@ -2068,6 +2094,9 @@ function resolveAnswerThreadWithLog(
       (via === 'quoted' ? ' QUOTED(framework-origin)' : '') +
       (unrouted ? ' UNROUTED(supergroup→no-topic)' : '') +
       (misrouteRisk ? ' MISROUTE_RISK(no-echo→live-successor)' : '') +
+      (explicitOverridden
+        ? ` EXPLICIT_OVERRIDDEN(model→${explicitThreadId},routed→${threadId ?? '-'})`
+        : '') +
       '\n',
   )
   return threadId
