@@ -46,7 +46,7 @@ describe("formatResetDay (deterministic across host tz)", () => {
     expect(formatResetDay(WEEKLY_RESET, "UTC")).toBe("Sun 01:00");
     // Melbourne is UTC+10 → 01:00 UTC = 11:00 local, still Sunday.
     expect(formatResetDay(WEEKLY_RESET, "Australia/Melbourne")).toBe("Sun 11:00");
-    // ken.outlook's anchor (Mon 19:00 UTC) lands Tuesday morning in Melbourne.
+    // A Mon 19:00 UTC weekly anchor lands Tuesday morning in Melbourne (UTC+10).
     expect(formatResetDay(new Date("2026-06-08T19:00:00Z"), "Australia/Melbourne")).toBe("Tue 05:00");
   });
 });
@@ -111,7 +111,7 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
   });
 
   it("maxed weekly (>=99.5%) → weekly-walled even when exhausted_until is the sooner 5h reset", () => {
-    // The live ken.outlook case: 5h resets in ~27m, but weekly is 100% till Tue.
+    // The real-world case: the 5h window resets in ~27m, but weekly is 100% till Tue.
     const fiveSoon = new Date("2026-06-07T06:27:00Z");
     const weeklyTue = new Date("2026-06-09T19:00:00Z");
     expect(
@@ -288,7 +288,7 @@ describe("formatScheduleRows (no-color)", () => {
   it("active row shows the ● glyph, pool, and weekly reset day", () => {
     expect(lines[1]).toContain("●");
     expect(lines[1]).toContain("active #1");
-    expect(lines[1]).toContain("Sun 11:00"); // pixsoul-style Sunday anchor, Melbourne
+    expect(lines[1]).toContain("Sun 11:00"); // a Sunday weekly anchor, Melbourne
     expect(lines[1]).toContain("healthy");
   });
 

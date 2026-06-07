@@ -331,16 +331,27 @@ export function formatScheduleRows(
 }
 
 /** The freshness/legend footer lines. */
-export function formatFooter(rows: ScheduleRow[], live: boolean, now: Date, tz?: string): string[] {
+export function formatFooter(
+  rows: ScheduleRow[],
+  opts: { liveRequested: boolean; probedLive: boolean },
+  now: Date,
+  tz?: string,
+): string[] {
   const zone = tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   const at = formatResetDay(now, tz);
-  const src = live
+  const src = opts.probedLive
     ? `probed live · ${at} ${zone}`
-    : `cached snapshot (run without --cached for a live probe) · times in ${zone}`;
+    : opts.liveRequested
+      ? `live probe unavailable — showing cached snapshot · times in ${zone}`
+      : `cached snapshot (run without --cached for a live probe) · times in ${zone}`;
   const anyUnprobed = rows.some((r) => r.window.source === "none");
   const lines = [src];
-  if (!live && anyUnprobed) {
-    lines.push("some accounts have no cached probe yet — run without --cached to populate");
+  if (!opts.probedLive && anyUnprobed) {
+    lines.push(
+      opts.liveRequested
+        ? "some accounts have no quota data — the broker may not have served a probe"
+        : "some accounts have no cached probe yet — run without --cached to populate",
+    );
   }
   return lines;
 }
@@ -385,7 +396,7 @@ export function registerAuthScheduleSubcommands(
         console.log();
         for (const l of formatScheduleRows(rows, now)) console.log(l);
         console.log();
-        for (const l of formatFooter(rows, probedLive, now)) {
+        for (const l of formatFooter(rows, { liveRequested: live, probedLive }, now)) {
           console.log(chalk.gray("  " + l));
         }
         console.log();
