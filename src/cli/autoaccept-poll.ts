@@ -22,6 +22,7 @@
 
 import { runAutoaccept } from "../agents/autoaccept.js";
 import { runWedgeWatchdog } from "../agents/wedge-watchdog.js";
+import { signalQuotaWall } from "../agents/rate-limit-signal.js";
 
 async function main(): Promise<void> {
   const agentName = process.argv[2];
@@ -53,12 +54,30 @@ async function main(): Promise<void> {
     );
     process.exit(0);
   }
+  // Rate-limit (weekly-quota) menu detection: default ON. When detected, the
+  // watchdog signals the gateway to trigger account failover, then Esc-parks the
+  // menu. Kill switch SWITCHROOM_RATE_LIMIT_DETECT=0 → detect-disabled (the
+  // watchdog behaves exactly as before: generic-modal Esc only).
+  const rateLimitDetect = process.env.SWITCHROOM_RATE_LIMIT_DETECT !== "0";
   try {
-    console.error(`[autoaccept-poll] ${agentName}: entering wedge-watchdog (continuous)`);
-    // Runs until the container stops (maxPolls defaults to Infinity).
-    const res = await runWedgeWatchdog({ agentName });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires}`,
+      `[autoaccept-poll] ${agentName}: entering wedge-watchdog (continuous)` +
+        (rateLimitDetect ? " +rate-limit-detect" : " (rate-limit-detect OFF)"),
+    );
+    // Runs until the container stops (maxPolls defaults to Infinity).
+    const res = await runWedgeWatchdog({
+      agentName,
+      rateLimitSignature: rateLimitDetect ? undefined : null,
+      onRateLimitMenu: rateLimitDetect
+        ? (name, resetAt) => {
+            // Fire-and-forget; do not await (a slow/absent gateway socket must
+            // never stall the poll loop).
+            void signalQuotaWall(name, resetAt);
+          }
+        : undefined,
+    });
+    console.error(
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires}`,
     );
   } catch (err) {
     console.error(

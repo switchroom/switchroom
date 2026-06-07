@@ -393,6 +393,26 @@ export interface RequestConfigFinalizeMessage {
   detail?: string;
 }
 
+/**
+ * The autoaccept-poll wedge-watchdog detected claude's `/rate-limit-options`
+ * weekly-quota menu (a TUI wall that never produced a 429 the gateway could
+ * see). Asks the gateway to trigger the EXISTING account-failover chain
+ * (markExhausted → roll to a fallback subscription account, or the
+ * all-exhausted operator alert). Fire-and-forget; no reply.
+ *
+ * Trust model (same as inject_inbound): the socket is per-agent inside the
+ * container, but `agentName` is still validated server-side and never trusted
+ * to authorize anything beyond triggering the agent's own failover.
+ */
+export interface QuotaWallDetectedMessage {
+  type: "quota_wall_detected";
+  agentName: string;
+  /** Parsed weekly-reset epoch-ms. Omitted when the sidecar couldn't parse it;
+   *  the gateway then uses a weekly-scale default for markExhausted's `until`
+   *  (NOT the ~5h default, which would un-exhaust a weekly wall and re-wedge). */
+  resetAt?: number;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -407,4 +427,5 @@ export type ClientToGateway =
   | RequestDriveApprovalMessage
   | RequestMs365ApprovalMessage
   | RequestConfigApprovalMessage
-  | RequestConfigFinalizeMessage;
+  | RequestConfigFinalizeMessage
+  | QuotaWallDetectedMessage;

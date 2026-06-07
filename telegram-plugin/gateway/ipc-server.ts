@@ -4,6 +4,7 @@ import type {
   GatewayToClient,
   HeartbeatMessage,
   InjectInboundMessage,
+  QuotaWallDetectedMessage,
   OperatorEventForward,
   PermissionRequestForward,
   PtyPartialForward,
@@ -44,6 +45,14 @@ export interface IpcServerOptions {
    * inline scheduler simply ignore inject_inbound messages.
    */
   onInjectInbound?: (client: IpcClient, msg: InjectInboundMessage) => void;
+  /**
+   * The autoaccept-poll wedge-watchdog detected claude's `/rate-limit-options`
+   * weekly-quota menu (no 429 ever reached the gateway). Handler is expected to
+   * trigger the existing fleet auto-fallback for `msg.agentName`, threading
+   * `msg.resetAt` as the markExhausted `until`. Fire-and-forget; gateways that
+   * don't run failover simply ignore it.
+   */
+  onQuotaWallDetected?: (client: IpcClient, msg: QuotaWallDetectedMessage) => void;
   /**
    * RFC E §4.2 Cut 2 — Drive-write PreToolUse hook asks the gateway
    * to register a kernel approval request + post a diff-preview
@@ -237,6 +246,15 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof inb.meta === "object"
         && inb.meta !== null;
     }
+    case "quota_wall_detected": {
+      // wedge-watchdog detected the /rate-limit-options weekly-quota menu.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      // resetAt optional; when present it must be a finite epoch-ms.
+      if (m.resetAt !== undefined
+        && (typeof m.resetAt !== "number" || !Number.isFinite(m.resetAt as number))) return false;
+      return true;
+    }
     case "request_config_approval": {
       // #1623 — hostd-initiated config-edit approval card. Wire shape
       // only; the handler module validates the diff content.
@@ -317,6 +335,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onOperatorEvent,
     onPtyPartial,
     onInjectInbound,
+    onQuotaWallDetected,
     onRequestDriveApproval,
     onRequestMs365Approval,
     onRequestConfigApproval,
@@ -424,6 +443,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "inject_inbound":
         if (onInjectInbound) onInjectInbound(client, msg as InjectInboundMessage);
+        break;
+      case "quota_wall_detected":
+        if (onQuotaWallDetected) onQuotaWallDetected(client, msg as QuotaWallDetectedMessage);
         break;
       case "request_drive_approval":
         if (onRequestDriveApproval) {

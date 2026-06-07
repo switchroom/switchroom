@@ -348,6 +348,7 @@ import type {
   PtyPartialForward,
   InboundMessage,
   InjectInboundMessage,
+  QuotaWallDetectedMessage,
   PermissionEvent,
 } from './ipc-protocol.js'
 import { DebounceBuffer, HourCap, buildReactionInboundMeta, buildReactionInboundText, evaluateTriggerCandidate, isGroupChat, resolveReactionsConfig, truncatePreview, type PendingReaction, type ReactionBatch, type ReactionsResolvedConfig } from './reaction-trigger.js'
@@ -6257,6 +6258,30 @@ const ipcServer: IpcServer = createIpcServer({
     if (!delivered) {
       pendingInboundBuffer.push(msg.agentName, msg.inbound)
     }
+  },
+
+  // The wedge-watchdog detected claude's /rate-limit-options weekly-quota menu
+  // (a TUI wall that never produced a 429, so the inference-path auto-fallback
+  // never fired). Trigger the SAME fleet auto-fallback the 429 path uses,
+  // threading the parsed weekly reset as markExhausted's `until` — with a
+  // weekly-scale FALLBACK when the sidecar couldn't parse it (resetAt absent):
+  // passing undefined would let markExhausted use its ~5h default, which would
+  // un-exhaust a weekly-walled account and re-wedge it within hours. The
+  // existing chain handles the rest (roll to a fallback subscription account,
+  // or the all-exhausted operator alert when none has quota). Fire-and-forget.
+  onQuotaWallDetected(_client: IpcClient, msg: QuotaWallDetectedMessage) {
+    const WEEKLY_MS = 7 * 24 * 60 * 60 * 1000
+    const untilMs =
+      typeof msg.resetAt === 'number' && Number.isFinite(msg.resetAt) && msg.resetAt > Date.now()
+        ? msg.resetAt
+        : Date.now() + WEEKLY_MS
+    process.stderr.write(
+      `telegram gateway: quota_wall_detected agent=${msg.agentName} ` +
+        `until=${new Date(untilMs).toISOString()}` +
+        (msg.resetAt == null ? ' (reset unparsed → +7d default)' : '') +
+        ' — triggering fleet auto-fallback\n',
+    )
+    void fireFleetAutoFallback(msg.agentName, untilMs)
   },
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
@@ -14605,9 +14630,9 @@ function wouldFireFleetAutoFallback(): boolean {
  * so the user sees the outcome inline with the original "Model
  * unavailable" card.
  */
-async function fireFleetAutoFallback(triggerAgent: string): Promise<void> {
+async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<void> {
   return fleetFallbackGate.fire(
-    () => doFireFleetAutoFallback(triggerAgent),
+    () => doFireFleetAutoFallback(triggerAgent, untilMs),
     (err) => {
       process.stderr.write(
         `telegram gateway: [fleet-fallback] error agent=${triggerAgent}: ${(err as Error)?.message ?? err}\n`,
@@ -14620,7 +14645,7 @@ async function fireFleetAutoFallback(triggerAgent: string): Promise<void> {
  *  user-visible announcement was broadcast). False on no-op /
  *  error / idempotent-skip — caller uses this to decide whether to
  *  arm the post-fire suppression window. */
-async function doFireFleetAutoFallback(triggerAgent: string): Promise<boolean> {
+async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): Promise<boolean> {
   try {
     const client = await getAuthBrokerClient(triggerAgent)
     if (!client) {
@@ -14655,7 +14680,11 @@ async function doFireFleetAutoFallback(triggerAgent: string): Promise<boolean> {
       // operator is explicitly choosing, and is admin); only this automatic
       // path moves to the non-admin verb.
       failover: async () => {
-        const r = await client.markExhausted()
+        // The 429 inference path passes no `until` (broker ~5h default). The
+        // rate-limit-MENU path (quota_wall_detected) passes the parsed WEEKLY
+        // reset, so the walled account isn't re-probed (and re-wedged) within
+        // the 5h default while it's weekly-capped.
+        const r = await client.markExhausted(untilMs)
         return { rolledTo: r.rolledTo ?? null, rolled: r.rolled }
       },
       triggerAgent,
