@@ -346,6 +346,86 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
     broker.stop();
   });
 
+  it("consumer-quota-sensor fails a consumer over with NO agent on the account (the hindsight gap)", async () => {
+    // This is the gap the sensor closes: a consumer pinned to a dedicated
+    // account that NO agent shares (so nobody raises mark-exhausted). The
+    // broker probes it itself and marks it exhausted → serving-failover kicks.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+      // NOTE: no agent on `secondary` — nobody to raise mark-exhausted.
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    // Injected probe: `secondary` is walled (5h at 100%), everything else fine.
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async ({ accessToken }) =>
+        accessToken.includes("secondary")
+          ? { ok: true, data: {
+              fiveHourUtilizationPct: 100,
+              sevenDayUtilizationPct: 10,
+              fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+              sevenDayResetAt: null,
+              representativeClaim: "five_hour",
+              overageStatus: null,
+              overageDisabledReason: null,
+            } }
+          : { ok: true, data: {
+              fiveHourUtilizationPct: 5,
+              sevenDayUtilizationPct: 5,
+              fiveHourResetAt: null,
+              sevenDayResetAt: null,
+              representativeClaim: null,
+              overageStatus: null,
+              overageDisabledReason: null,
+            } },
+    });
+    await broker.start();
+
+    // Before the probe: pinned account is healthy in the broker's view → served.
+    const before = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(before.data.account).toBe("secondary");
+
+    // Drive one sensor tick (the timer is disabled in tests).
+    await broker.consumerQuotaProbeTick();
+
+    // Now the consumer fails over to the healthy default — no agent needed.
+    const after = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(after.data.account).toBe("default");
+    broker.stop();
+  });
+
+  it("consumer-quota-sensor does NOT mark on a probe that is healthy or failed", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }],
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    // Probe FAILS for secondary (transient) — must NOT fail the consumer over.
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => ({ ok: false, reason: "HTTP 503" }),
+    });
+    await broker.start();
+    await broker.consumerQuotaProbeTick();
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    // Still served the pinned account — a transient probe error is not exhaustion.
+    expect(resp.data.account).toBe("secondary");
+    broker.stop();
+  });
+
   it("keeps the pinned account when no healthy fallback exists (retry beats nothing)", async () => {
     const h = makeHarness();
     const config = makeConfig(h, {
