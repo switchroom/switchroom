@@ -179,6 +179,51 @@ export type HindsightProbe =
   | { ok: false; reason: string };
 
 /**
+ * Fetch the live tools/list from a Hindsight MCP endpoint — the advertised tool
+ * surface (name + required args), used by `switchroom doctor`'s contract-drift
+ * check (classifyToolContract). Best-effort with a short timeout; never throws.
+ * Returns the tool list on success, or a reason on failure. X-Bank-Id uses a
+ * throwaway probe id (tools/list is bank-independent).
+ */
+export async function fetchHindsightToolsList(
+  apiUrl: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; bankId?: string },
+): Promise<{ ok: true; tools: Array<{ name: string; required: string[] }> } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 4000;
+  const bankId = opts?.bankId ?? "__doctor_probe__";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+    const parsed = await parseSseOrJson<{
+      result?: { tools?: Array<{ name?: string; inputSchema?: { required?: string[] } }> };
+    }>(resp);
+    const raw = parsed.result?.tools;
+    if (!Array.isArray(raw)) return { ok: false, reason: "no tools in tools/list response" };
+    const tools = raw
+      .filter((t): t is { name: string; inputSchema?: { required?: string[] } } => typeof t?.name === "string")
+      .map((t) => ({ name: t.name, required: t.inputSchema?.required ?? [] }));
+    return { ok: true, tools };
+  } catch (err) {
+    clearTimeout(timeout);
+    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
+    return { ok: false, reason: String((err as Error).message ?? err) };
+  }
+}
+
+/**
  * Probe a Hindsight MCP endpoint by issuing an `initialize` request and
  * reading the `serverInfo` it returns. Used by `switchroom doctor` to
  * confirm that the URL configured in `memory.config.url` is actually
@@ -397,7 +442,12 @@ export async function ensureUserProfileMentalModel(
             // the isError check below.
             source_query:
               "What are the key facts, preferences, context, and communication style about the user I talk to? Summarize what matters for making the agent feel like it knows them.",
-            types: ["world", "experience"],
+            // NOTE: do NOT send `types` — create_mental_model's schema does not
+            // accept it (props: name, source_query, mental_model_id, tags,
+            // max_tokens, trigger_refresh_after_consolidation, bank_id), so the
+            // server SILENTLY DROPS it (isError stays false). The mental model
+            // draws across fact types from its source_query regardless. Adding a
+            // schema-unknown arg back here reds memory.hindsight-contract.fixture.
           },
         },
       }),
@@ -543,6 +593,21 @@ export async function createBank(
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
     }
 
+    // Check the MCP result envelope — a tools/call returns HTTP 200 with
+    // isError:true on a renamed/unknown arg (the source_query class). Without
+    // this, a future bank_id rename would report success while creating no bank.
+    try {
+      const created = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(toolResponse);
+      if (created.result?.isError === true) {
+        return { ok: false, reason: created.result.content?.[0]?.text ?? "create_bank returned isError" };
+      }
+    } catch {
+      // Unparseable body — treat HTTP 200 as success (legacy) rather than fail a
+      // working create on a parse hiccup.
+    }
+
     return { ok: true };
   } catch (err) {
     if ((err as Error).name === "AbortError") {
@@ -642,10 +707,17 @@ export async function updateBankMissions(
         method: "tools/call",
         params: {
           name: "update_bank",
+          // `update_bank` accepts top-level `mission` (the bank mission) but
+          // NOT a top-level `retain_mission` — that is a CONFIG field and must
+          // go through `config_updates` (verified live: the server SILENTLY
+          // DROPPED a top-level retain_mission, so the retain-steering half of
+          // every mission update was a live no-op). Route it correctly.
           arguments: {
             bank_id: bankId,
-            mission: missions.bank_mission,
-            retain_mission: missions.retain_mission,
+            ...(missions.bank_mission != null ? { mission: missions.bank_mission } : {}),
+            ...(missions.retain_mission != null
+              ? { config_updates: { retain_mission: missions.retain_mission } }
+              : {}),
           },
         },
       }),
@@ -656,6 +728,20 @@ export async function updateBankMissions(
 
     if (!toolResponse.ok) {
       return { ok: false, reason: `Tool call HTTP ${toolResponse.status}` };
+    }
+
+    // Check the MCP result envelope — HTTP 200 + isError:true on a renamed/
+    // unknown arg. Without this, a future arg rename would report success while
+    // updating nothing.
+    try {
+      const updated = await parseSseOrJson<{
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      }>(toolResponse);
+      if (updated.result?.isError === true) {
+        return { ok: false, reason: updated.result.content?.[0]?.text ?? "update_bank returned isError" };
+      }
+    } catch {
+      // Unparseable body — treat HTTP 200 as success (legacy).
     }
 
     return { ok: true };

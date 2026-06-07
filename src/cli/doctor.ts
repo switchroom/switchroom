@@ -27,8 +27,8 @@ import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
-import { probeHindsight, isHindsightEnabled } from "../memory/hindsight.js";
-import { checkHindsightContainerHealth } from "./doctor-memory.js";
+import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList } from "../memory/hindsight.js";
+import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
@@ -1001,6 +1001,18 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
     status: "ok",
     detail: `${probe.serverName} ${probe.serverVersion} at ${host}:${port}`,
   });
+
+  // Contract-drift check (2026-06-07): reachable + speaking MCP is STILL not
+  // enough — over 2 days, 5 callsites silently broke because the server renamed/
+  // removed a tool or arg while switchroom checked only HTTP status. Fetch the
+  // live tools/list and diff it against the tools switchroom uses, so an upstream
+  // contract change surfaces as a doctor `fail` within one maintenance cycle —
+  // not when a user notices their agent went amnesiac. Best-effort: a failed
+  // tools/list just skips this check (reachability already passed).
+  const toolsList = await fetchHindsightToolsList(url);
+  if (toolsList.ok) {
+    results.push(...classifyToolContract(toolsList.tools));
+  }
 
   // Consumer probe (#1245): broker-fed hindsight needs an
   // `auth.consumers[]` entry + a bound per-consumer socket. Replaces

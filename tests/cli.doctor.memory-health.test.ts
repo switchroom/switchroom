@@ -1,10 +1,61 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   classifyShmSize,
   classifyExtractionLogs,
   checkHindsightContainerHealth,
+  classifyToolContract,
+  type AdvertisedTool,
   MIN_HINDSIGHT_SHM_BYTES,
 } from "../src/cli/doctor-memory.js";
+import { EXPECTED_HINDSIGHT_TOOLS } from "../src/memory/hindsight-tools.js";
+
+/** The golden snapshot, reshaped into the advertised-tool form the doctor probe
+ *  produces — so the unit test exercises the classifier against REAL server
+ *  data without a live server. */
+function snapshotAdvertised(): AdvertisedTool[] {
+  const snap = JSON.parse(
+    readFileSync(resolve(__dirname, "fixtures", "hindsight-tools-list.snapshot.json"), "utf-8"),
+  ) as { tools: Record<string, { required: string[] }> };
+  return Object.entries(snap.tools).map(([name, s]) => ({ name, required: s.required }));
+}
+
+describe("classifyToolContract — live contract-drift detector", () => {
+  it("ALL OK against the real server surface (no drift today)", () => {
+    const results = classifyToolContract(snapshotAdvertised());
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("ok");
+    expect(results[0].name).toBe("hindsight contract");
+  });
+
+  it("catches a MISSING TOOL (a rename/removal — the delete_memory/update_memory class)", () => {
+    // Drop create_mental_model from the advertised set (simulates an upstream rename).
+    const advertised = snapshotAdvertised().filter((t) => t.name !== "create_mental_model");
+    const results = classifyToolContract(advertised);
+    const fail = results.find((r) => r.name === "hindsight contract: create_mental_model");
+    expect(fail?.status).toBe("fail");
+    expect(fail?.detail).toMatch(/no longer advertises it/);
+  });
+
+  it("catches a REQUIRED-ARG drift (the query->source_query class)", () => {
+    // Server now ALSO requires a new arg switchroom doesn't track.
+    const advertised = snapshotAdvertised().map((t) =>
+      t.name === "create_mental_model" ? { ...t, required: [...t.required, "owner_id"] } : t,
+    );
+    const results = classifyToolContract(advertised);
+    const fail = results.find((r) => r.name === "hindsight contract: create_mental_model");
+    expect(fail?.status).toBe("fail");
+    expect(fail?.detail).toMatch(/now requires \[owner_id\]/);
+  });
+
+  it("every tool in EXPECTED_HINDSIGHT_TOOLS is present in the snapshot (no stale const entries)", () => {
+    const names = new Set(snapshotAdvertised().map((t) => t.name));
+    for (const tool of Object.keys(EXPECTED_HINDSIGHT_TOOLS)) {
+      expect(names.has(tool), `${tool} in EXPECTED_HINDSIGHT_TOOLS but not the snapshot`).toBe(true);
+    }
+  });
+});
 
 describe("classifyShmSize", () => {
   it("fails on Docker's 64MB default (the 2026-06-06 outage cause)", () => {
