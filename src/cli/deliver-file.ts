@@ -20,6 +20,18 @@ import type { Command } from "commander";
 
 import { AuthBrokerClient } from "../auth/broker/client.js";
 import { deliverToOneDrive, type DeliveredFile, type ShareLinkScope } from "../delivery/onedrive.js";
+import { deliverToGoogleDrive, type GDriveShareScope } from "../delivery/gdrive.js";
+
+/**
+ * Google Drive equivalent of {@link resolveLinkScopes}: maps the shared
+ * SWITCHROOM_DELIVER_LINK_SCOPE knob onto Drive sharing scopes. "anonymous"
+ * → `anyone` (anyone-with-link); "organization" → `domain` (same-domain).
+ */
+export function resolveGoogleLinkScopes(env = process.env): GDriveShareScope[] {
+  const raw = (env.SWITCHROOM_DELIVER_LINK_SCOPE ?? "").trim().toLowerCase();
+  if (raw === "organization") return ["domain"];
+  return ["anyone"];
+}
 
 /**
  * Resolve the OneDrive share-link scope order from `SWITCHROOM_DELIVER_LINK_SCOPE`.
@@ -45,44 +57,78 @@ export function safeAgentName(name: string | undefined): string {
   return /^[a-z0-9][a-z0-9_-]{0,50}$/.test(n) ? n : "agent";
 }
 
+/** A connected drive resolved for delivery: a name + an upload fn. */
+export interface ResolvedProvider {
+  name: "OneDrive" | "Google Drive";
+  deliver: (args: { agentName: string; localPath: string; bytes: Uint8Array }) => Promise<DeliveredFile>;
+}
+
 /** Injectable seams so the core is unit-testable without a broker or network. */
 export interface DeliverFileDeps {
   agentName?: string;
-  /** Resolve a provider access token. Defaults to the auth-broker. */
-  getAccessToken?: (provider: "microsoft") => Promise<string>;
-  /** The actual upload. Defaults to the OneDrive provider. */
-  deliver?: (args: {
-    accessToken: string;
-    agentName: string;
-    localPath: string;
-    bytes: Uint8Array;
-  }) => Promise<DeliveredFile>;
+  /** Resolve the first connected drive's delivery fn, or null if none. */
+  resolveProvider?: () => Promise<ResolvedProvider | null>;
   readFile?: (p: string) => Uint8Array;
   fileSize?: (p: string) => number;
 }
 
 export interface DeliverFileResult {
   ok: boolean;
+  provider?: string;
   link?: string;
   folderPath?: string;
   filename?: string;
   error?: string;
 }
 
-async function brokerAccessToken(provider: "microsoft"): Promise<string> {
+/**
+ * Fetch a provider's fresh access token from the auth-broker, or null if the
+ * agent has no connected account for it. The broker keeps both Microsoft and
+ * Google access tokens fresh (background refresh-tick), so we use them directly.
+ * MUST close the client — it keeps a connection open, which would otherwise
+ * hang this one-shot process after it prints its result.
+ */
+async function brokerToken(provider: "microsoft" | "google"): Promise<string | null> {
   const client = new AuthBrokerClient();
-  const data = await client.getCredentials(provider);
-  const creds = data.credentials as { microsoftOauth?: { accessToken?: string } } | undefined;
-  const token = creds?.microsoftOauth?.accessToken;
-  if (!token) {
-    throw new Error("broker returned no Microsoft access token (is an account connected + enabled for this agent?)");
+  try {
+    const data = await client.getCredentials(provider);
+    const creds = data.credentials as {
+      microsoftOauth?: { accessToken?: string };
+      googleOauth?: { accessToken?: string };
+    } | undefined;
+    const token =
+      provider === "microsoft" ? creds?.microsoftOauth?.accessToken : creds?.googleOauth?.accessToken;
+    return token ?? null;
+  } catch {
+    return null; // no account / broker error for this provider → treat as not-connected
+  } finally {
+    await client.close().catch(() => {});
   }
-  return token;
+}
+
+/** Default: OneDrive first, then Google Drive; null when neither is connected. */
+async function defaultResolveProvider(): Promise<ResolvedProvider | null> {
+  const ms = await brokerToken("microsoft");
+  if (ms) {
+    return {
+      name: "OneDrive",
+      deliver: (a) => deliverToOneDrive({ ...a, accessToken: ms, linkScopes: resolveLinkScopes() }),
+    };
+  }
+  const g = await brokerToken("google");
+  if (g) {
+    return {
+      name: "Google Drive",
+      deliver: (a) => deliverToGoogleDrive({ ...a, accessToken: g, linkScopes: resolveGoogleLinkScopes() }),
+    };
+  }
+  return null;
 }
 
 /**
- * Pure-ish core: resolve token → read file → upload → return a result. No
- * process.exit / console here so it's testable; the CLI wrapper formats output.
+ * Pure-ish core: resolve a connected drive → read file → upload → return a
+ * result. No process.exit / console here so it's testable; the CLI wrapper
+ * formats output.
  */
 export async function runDeliverFile(
   localPath: string,
@@ -91,10 +137,7 @@ export async function runDeliverFile(
   const agentName = safeAgentName(deps.agentName ?? process.env.SWITCHROOM_AGENT_NAME);
   const sizeOf = deps.fileSize ?? ((p: string) => statSync(p).size);
   const read = deps.readFile ?? ((p: string) => new Uint8Array(readFileSync(p)));
-  const getToken = deps.getAccessToken ?? brokerAccessToken;
-  const deliver =
-    deps.deliver ??
-    ((a) => deliverToOneDrive({ ...a, linkScopes: resolveLinkScopes() }));
+  const resolveProvider = deps.resolveProvider ?? defaultResolveProvider;
 
   let size: number;
   try {
@@ -106,25 +149,23 @@ export async function runDeliverFile(
     return { ok: false, error: `file is empty: ${localPath}` };
   }
 
-  let accessToken: string;
-  try {
-    accessToken = await getToken("microsoft");
-  } catch (err) {
+  const provider = await resolveProvider();
+  if (!provider) {
     return {
       ok: false,
       error:
-        `no connected drive for delivery — ${(err as Error).message}. ` +
-        `Connect a Microsoft account from the dashboard, or send the file ` +
-        `directly with the reply tool (files: ["${localPath}"]) for files under 50MB.`,
+        `no connected drive for delivery. Connect a Microsoft or Google ` +
+        `account from the dashboard, or send the file directly with the ` +
+        `reply tool (files: ["${localPath}"]) for files under 50MB.`,
     };
   }
 
   try {
     const bytes = read(localPath);
-    const out = await deliver({ accessToken, agentName, localPath, bytes });
-    return { ok: true, link: out.link, folderPath: out.folderPath, filename: basename(localPath) };
+    const out = await provider.deliver({ agentName, localPath, bytes });
+    return { ok: true, provider: provider.name, link: out.link, folderPath: out.folderPath, filename: basename(localPath) };
   } catch (err) {
-    return { ok: false, error: `upload failed: ${(err as Error).message}` };
+    return { ok: false, provider: provider.name, error: `upload failed: ${(err as Error).message}` };
   }
 }
 
@@ -139,7 +180,7 @@ export function registerDeliverFileCommand(program: Command): void {
       const res = await runDeliverFile(path);
       if (res.ok) {
         process.stdout.write(
-          `Delivered ${res.filename} to the user's drive → ${res.folderPath}/\n` +
+          `Delivered ${res.filename} to the user's ${res.provider} → ${res.folderPath}/\n` +
             `Share link (reply with this): ${res.link}\n`,
         );
         return;
