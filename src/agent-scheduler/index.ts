@@ -47,6 +47,11 @@ import {
 export { type AgentChannelTarget, resolveChannelTarget, resolveEntryThreadId };
 import { JsonlAuditSink, type AuditSink } from "../scheduler/audit.js";
 import {
+  decideQuotaPreflight,
+  type QuotaPreflightDecision,
+} from "../scheduler/quota-preflight.js";
+import { AuthBrokerClient } from "../auth/broker/client.js";
+import {
   createInjectIpcClient,
   type InjectIpcClient,
 } from "./ipc-client.js";
@@ -81,6 +86,24 @@ export interface RegisterOptions {
   dispatcher: InboundDispatcher;
   /** Replaceable for tests. */
   now?: () => number;
+  /**
+   * Optional quota preflight. When it resolves `defer:true` (the fleet is
+   * fully quota-walled), the fire is HELD and bounded-retried instead of
+   * dispatched into a wall (where it would 429 and the run would be silently
+   * lost). Absent = legacy behavior (always dispatch). Injectable for tests;
+   * the caller fails open (broker unreachable → dispatch). See
+   * ../scheduler/quota-preflight.ts.
+   */
+  quotaGate?: (agent: string) => Promise<QuotaPreflightDecision>;
+  /** Max dispatch attempts (initial + retries) before giving up to the next
+   *  natural occurrence. Default 3. */
+  maxQuotaDeferAttempts?: number;
+  /** Backoff before the next retry, by zero-based attempt index. Default
+   *  1m / 3m / 5m. */
+  quotaDeferBackoffMs?: (attempt: number) => number;
+  /** Retry timer seam (tests inject a synchronous driver). Default setTimeout;
+   *  returns a canceller cleared on task stop. */
+  scheduleRetry?: (fn: () => void, ms: number) => { cancel: () => void };
 }
 
 export interface RegisteredTask {
@@ -94,12 +117,75 @@ export interface RegisteredTask {
  * to `dispatcher.sendToAgent` (the IPC write) and `sink.recordFire`
  * (the JSONL append).
  */
+// Default retry policy for quota-deferred fires.
+const DEFAULT_MAX_QUOTA_DEFER_ATTEMPTS = 3;
+function defaultQuotaDeferBackoffMs(attempt: number): number {
+  return [60_000, 180_000, 300_000][attempt] ?? 300_000;
+}
+
 export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
   const tasks: RegisteredTask[] = [];
   const now = opts.now ?? Date.now;
+  const maxAttempts = opts.maxQuotaDeferAttempts ?? DEFAULT_MAX_QUOTA_DEFER_ATTEMPTS;
+  const backoff = opts.quotaDeferBackoffMs ?? defaultQuotaDeferBackoffMs;
+  const scheduleRetry =
+    opts.scheduleRetry ??
+    ((fn, ms) => {
+      const t = setTimeout(fn, ms);
+      if (typeof t.unref === "function") t.unref();
+      return { cancel: () => clearTimeout(t) };
+    });
+
   for (const entry of opts.entries) {
-    const task = opts.cronLib.schedule(entry.cron, () => {
+    // Pending retry timers for this entry — cancelled on stop so a deferred
+    // fire never dispatches after shutdown.
+    const pendingRetries = new Set<{ cancel: () => void }>();
+
+    // One dispatch attempt. `attempt` is zero-based. Returns nothing; records
+    // the outcome to the audit sink (always — deferred fires are recorded too,
+    // closing the silent-loss hole) and may schedule a bounded retry.
+    const attemptFire = async (attempt: number): Promise<void> => {
       const startedAt = now();
+
+      // Quota preflight — only when a gate is wired. Fail OPEN: a broker
+      // hiccup must never block a scheduled fire.
+      if (opts.quotaGate) {
+        let decision: QuotaPreflightDecision;
+        try {
+          decision = await opts.quotaGate(entry.agent);
+        } catch {
+          decision = { defer: false, reason: "quota gate error (fail-open)" };
+        }
+        if (decision.defer) {
+          const more = attempt + 1 < maxAttempts;
+          const summary =
+            `deferred (quota): ${decision.reason} ` +
+            `[attempt ${attempt + 1}/${maxAttempts}]` +
+            (more ? "" : " — giving up; will re-run on next scheduled occurrence");
+          // exit_code -2 = deferred (fleet fully quota-walled). Distinct from
+          // 0 (delivered) / -1 (gateway not connected) so the truth is in the
+          // audit, not a silent "success".
+          opts.sink.recordFire({
+            agent: entry.agent,
+            scheduleIndex: entry.scheduleIndex,
+            promptKey: entry.promptKey,
+            exitCode: -2,
+            outputSummary: summary,
+            startedAt,
+            finishedAt: now(),
+          });
+          if (more) {
+            let handle: { cancel: () => void };
+            handle = scheduleRetry(() => {
+              pendingRetries.delete(handle);
+              void attemptFire(attempt + 1);
+            }, backoff(attempt));
+            pendingRetries.add(handle);
+          }
+          return;
+        }
+      }
+
       let delivered = false;
       let summary = "";
       try {
@@ -122,6 +208,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       // exit_code semantics for the IPC path:
       //   0 — bytes accepted by the local gateway socket (best signal)
       //  -1 — gateway not connected, or wire write failed
+      //  -2 — deferred: fleet fully quota-walled (recorded above)
       opts.sink.recordFire({
         agent: entry.agent,
         scheduleIndex: entry.scheduleIndex,
@@ -131,8 +218,19 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
         startedAt,
         finishedAt,
       });
+    };
+
+    const task = opts.cronLib.schedule(entry.cron, () => attemptFire(0));
+    tasks.push({
+      entry,
+      task: {
+        stop: () => {
+          for (const h of pendingRetries) h.cancel();
+          pendingRetries.clear();
+          task.stop();
+        },
+      },
     });
-    tasks.push({ entry, task });
   }
   return tasks;
 }
@@ -403,12 +501,32 @@ export async function main(): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const cronLib = require("node-cron") as CronLib;
 
+  // Cron quota preflight — don't throw a scheduled fire at a fully
+  // quota-walled fleet (it would 429 and the run would be silently lost);
+  // hold + bounded-retry until an account frees. Disable with
+  // SWITCHROOM_DISABLE_CRON_QUOTA_PREFLIGHT=1. Fails open: any broker error
+  // makes the gate return defer:false (handled in attemptFire), so a broker
+  // hiccup never blocks crons.
+  const quotaPreflightEnabled =
+    process.env.SWITCHROOM_DISABLE_CRON_QUOTA_PREFLIGHT !== "1";
+  const quotaGate = quotaPreflightEnabled
+    ? async (): Promise<QuotaPreflightDecision> => {
+        const client = new AuthBrokerClient();
+        try {
+          return decideQuotaPreflight(await client.listState());
+        } finally {
+          await client.close().catch(() => {});
+        }
+      }
+    : undefined;
+
   const tasks = registerAgentSchedule({
     entries,
     channel,
     sink,
     cronLib,
     dispatcher,
+    ...(quotaGate ? { quotaGate } : {}),
   });
 
   process.stdout.write(
