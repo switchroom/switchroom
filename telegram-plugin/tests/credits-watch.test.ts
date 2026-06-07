@@ -13,6 +13,7 @@ import { join } from "path";
 import {
   readClaudeJsonOverage,
   evaluateCreditState,
+  resolveCreditWatchFatalReasons,
   loadCreditState,
   saveCreditState,
   emptyCreditState,
@@ -81,10 +82,14 @@ describe("readClaudeJsonOverage", () => {
   });
 });
 
-describe("evaluateCreditState — transition decisions", () => {
+describe("evaluateCreditState — transition decisions (machinery, explicit fatal set)", () => {
   const NOW = 1_780_000_000_000;
   const HEALTHY = emptyCreditState();
   const FATAL_OUT = { lastNotifiedReason: "out_of_credits", lastNotifiedAt: NOW - 1000 };
+  // The transition machinery is policy-agnostic — pass an explicit fatal set so
+  // these tests pin entered/changed/exited behaviour independent of the (now
+  // empty) subscription-only default.
+  const FATAL = new Set(["out_of_credits", "org_level_disabled", "credits_exhausted", "extra_usage_disabled"]);
 
   it("entry: healthy → fatal triggers a notify", () => {
     const d = evaluateCreditState({
@@ -92,6 +97,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: "out_of_credits",
       prev: HEALTHY,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
@@ -108,6 +114,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: "out_of_credits",
       prev: FATAL_OUT,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("skip");
     if (d.kind !== "skip") return;
@@ -120,6 +127,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: "org_level_disabled",
       prev: FATAL_OUT,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
@@ -134,6 +142,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: null,
       prev: FATAL_OUT,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
@@ -148,6 +157,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: "some_unknown_transient_reason",
       prev: HEALTHY,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("skip");
     if (d.kind !== "skip") return;
@@ -160,6 +170,7 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: null,
       prev: HEALTHY,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("skip");
   });
@@ -170,11 +181,64 @@ describe("evaluateCreditState — transition decisions", () => {
       currentReason: "out_of_credits",
       prev: HEALTHY,
       now: NOW,
+      fatalReasons: FATAL,
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
     expect(d.message).toContain("&lt;evil&gt;");
     expect(d.message).not.toContain("<evil>");
+  });
+});
+
+describe("evaluateCreditState — subscription-only default (the fix)", () => {
+  const NOW = 1_780_000_000_000;
+  const HEALTHY = emptyCreditState();
+
+  // With the default (empty) fatal set, NONE of the extra-usage reasons alarm —
+  // because for subscription-only switchroom, extra-usage-off is the expected
+  // state and real exhaustion is handled by failover. This is the bug fix.
+  for (const reason of ["out_of_credits", "extra_usage_disabled", "credits_exhausted", "org_level_disabled"]) {
+    it(`default: '${reason}' does NOT alarm (no false 'out of credits' card)`, () => {
+      const d = evaluateCreditState({
+        agentName: "clerk",
+        currentReason: reason,
+        prev: HEALTHY,
+        now: NOW,
+        // fatalReasons omitted → DEFAULT_CREDIT_FATAL_REASONS (empty)
+      });
+      expect(d.kind).toBe("skip");
+    });
+  }
+
+  it("opt-in via explicit set restores the alarm (operator on pay-as-you-go)", () => {
+    const d = evaluateCreditState({
+      agentName: "clerk",
+      currentReason: "out_of_credits",
+      prev: HEALTHY,
+      now: NOW,
+      fatalReasons: new Set(["out_of_credits"]),
+    });
+    expect(d.kind).toBe("notify");
+  });
+});
+
+describe("resolveCreditWatchFatalReasons", () => {
+  it("defaults to EMPTY (subscription-only)", () => {
+    expect(resolveCreditWatchFatalReasons({}).size).toBe(0);
+  });
+  it("parses a comma-separated opt-in list", () => {
+    const s = resolveCreditWatchFatalReasons({ SWITCHROOM_CREDITS_WATCH_FATAL_REASONS: "out_of_credits, org_level_disabled" });
+    expect(s.has("out_of_credits")).toBe(true);
+    expect(s.has("org_level_disabled")).toBe(true);
+    expect(s.size).toBe(2);
+  });
+  it("'*' opts in all known reasons", () => {
+    const s = resolveCreditWatchFatalReasons({ SWITCHROOM_CREDITS_WATCH_FATAL_REASONS: "*" });
+    expect(s.has("out_of_credits")).toBe(true);
+    expect(s.size).toBeGreaterThanOrEqual(4);
+  });
+  it("blank/whitespace → empty", () => {
+    expect(resolveCreditWatchFatalReasons({ SWITCHROOM_CREDITS_WATCH_FATAL_REASONS: "  " }).size).toBe(0);
   });
 });
 
