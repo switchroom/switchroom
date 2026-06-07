@@ -25,6 +25,7 @@
  * local container (remote URL / no docker / inside an agent container).
  */
 import { execFileSync } from "node:child_process";
+import { EXPECTED_HINDSIGHT_TOOLS } from "../memory/hindsight-tools.js";
 
 export interface CheckResult {
   name: string;
@@ -151,5 +152,89 @@ export function checkHindsightContainerHealth(
     // logs unavailable — skip the extraction check rather than fail the run
   }
 
+  return results;
+}
+
+/**
+ * An advertised hindsight tool as returned by tools/list — just the bits the
+ * contract check needs.
+ */
+export interface AdvertisedTool {
+  name: string;
+  required: string[];
+}
+
+/**
+ * Pure: diff the live server's advertised tools against the tools switchroom
+ * actually uses (EXPECTED_HINDSIGHT_TOOLS). This is THE contract-drift detector
+ * — it would have caught all 5 of the 2026-06-06..07 incidents the moment the
+ * server changed (every mocked unit test stays green through an upstream
+ * rename; only a live diff catches it).
+ *
+ * Returns one CheckResult per drift (so each surfaces as its own doctor line)
+ * plus a single rollup `ok` line when the contract is clean. Two drift classes:
+ *  - MISSING TOOL: switchroom calls a tool the server no longer advertises
+ *    (renamed/removed) → every callsite silently no-ops (delete_memory,
+ *    update_memory, query→source_query at the tool level).
+ *  - REQUIRED-ARG DRIFT: the server now requires an arg switchroom doesn't
+ *    track (the source_query rename, at the arg level).
+ */
+export function classifyToolContract(advertised: AdvertisedTool[]): CheckResult[] {
+  const byName = new Map(advertised.map((t) => [t.name, t]));
+  const results: CheckResult[] = [];
+
+  for (const [tool, spec] of Object.entries(EXPECTED_HINDSIGHT_TOOLS)) {
+    const real = byName.get(tool);
+    if (real === undefined) {
+      results.push({
+        name: `hindsight contract: ${tool}`,
+        status: "fail",
+        detail:
+          `switchroom calls \`${tool}\` but the server no longer advertises it ` +
+          `(renamed/removed upstream) — every callsite silently no-ops`,
+        fix:
+          "Upstream hindsight changed its MCP tool contract. Update the callsite " +
+          "+ EXPECTED_HINDSIGHT_TOOLS (src/memory/hindsight-tools.ts) to the new " +
+          "name, refresh tests/fixtures/hindsight-tools-list.snapshot.json, or pin " +
+          "the prior hindsight image.",
+      });
+      continue;
+    }
+    const missing = spec.required.filter((arg) => !real.required.includes(arg));
+    const added = real.required.filter((arg) => !spec.required.includes(arg));
+    if (added.length > 0) {
+      results.push({
+        name: `hindsight contract: ${tool}`,
+        status: "fail",
+        detail:
+          `server now requires [${added.join(", ")}] on \`${tool}\` which ` +
+          `switchroom does not track — calls may silently no-op`,
+        fix:
+          "Reconcile EXPECTED_HINDSIGHT_TOOLS + the callsite args with the new " +
+          "server schema, then refresh the snapshot fixture.",
+      });
+    } else if (missing.length > 0) {
+      // We think it's required but the server dropped it — informational, the
+      // callsite still works (sending an unneeded arg the server may drop).
+      results.push({
+        name: `hindsight contract: ${tool}`,
+        status: "warn",
+        detail:
+          `switchroom treats [${missing.join(", ")}] as required on \`${tool}\` ` +
+          `but the server no longer does (loosened upstream) — harmless, but the ` +
+          `fixture is stale`,
+        fix: "Refresh EXPECTED_HINDSIGHT_TOOLS + the snapshot fixture.",
+      });
+    }
+  }
+
+  if (results.length === 0) {
+    const used = Object.keys(EXPECTED_HINDSIGHT_TOOLS).length;
+    results.push({
+      name: "hindsight contract",
+      status: "ok",
+      detail: `${used} used tools present, required args satisfied (${advertised.length} advertised)`,
+    });
+  }
   return results;
 }

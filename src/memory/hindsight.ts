@@ -179,6 +179,51 @@ export type HindsightProbe =
   | { ok: false; reason: string };
 
 /**
+ * Fetch the live tools/list from a Hindsight MCP endpoint — the advertised tool
+ * surface (name + required args), used by `switchroom doctor`'s contract-drift
+ * check (classifyToolContract). Best-effort with a short timeout; never throws.
+ * Returns the tool list on success, or a reason on failure. X-Bank-Id uses a
+ * throwaway probe id (tools/list is bank-independent).
+ */
+export async function fetchHindsightToolsList(
+  apiUrl: string,
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; bankId?: string },
+): Promise<{ ok: true; tools: Array<{ name: string; required: string[] }> } | { ok: false; reason: string }> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 4000;
+  const bankId = opts?.bankId ?? "__doctor_probe__";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetchImpl(`${apiUrl}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Bank-Id": bankId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!resp.ok) return { ok: false, reason: `HTTP ${resp.status}` };
+    const parsed = await parseSseOrJson<{
+      result?: { tools?: Array<{ name?: string; inputSchema?: { required?: string[] } }> };
+    }>(resp);
+    const raw = parsed.result?.tools;
+    if (!Array.isArray(raw)) return { ok: false, reason: "no tools in tools/list response" };
+    const tools = raw
+      .filter((t): t is { name: string; inputSchema?: { required?: string[] } } => typeof t?.name === "string")
+      .map((t) => ({ name: t.name, required: t.inputSchema?.required ?? [] }));
+    return { ok: true, tools };
+  } catch (err) {
+    clearTimeout(timeout);
+    if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
+    return { ok: false, reason: String((err as Error).message ?? err) };
+  }
+}
+
+/**
  * Probe a Hindsight MCP endpoint by issuing an `initialize` request and
  * reading the `serverInfo` it returns. Used by `switchroom doctor` to
  * confirm that the URL configured in `memory.config.url` is actually
