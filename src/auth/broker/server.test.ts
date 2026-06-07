@@ -2090,20 +2090,22 @@ describe("AuthBroker — historical-bug regressions (2026-05-14 fanout incident)
 });
 
 describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall durability)", () => {
-  // Fleet: active=ken, fallback ken→pixsoul, one agent (clerk). The auto-
-  // fallback path (mark-exhausted) marks ken's quota + mirrors the fallback
-  // ONCE but never rewrites auth.active, so the exhaustion-BLIND refresh-tick
-  // fanout used to silently re-mirror ken back onto the fleet within ~1h.
-  // These pin that the serving + fanout reads now honour the exhaustion window.
+  // Fleet: active=default, fallback default→secondary, one agent (clerk). The
+  // auto-fallback path (mark-exhausted) marks the active account's quota +
+  // mirrors the fallback ONCE but never rewrites auth.active, so the
+  // exhaustion-BLIND refresh-tick fanout used to silently re-mirror the walled
+  // account back onto the fleet within ~1h. These pin that the serving + fanout
+  // reads now honour the exhaustion window. (Models the real clerk incident,
+  // 2026-06-07, with neutral account labels.)
   function failoverHarness(opts: { now?: () => number } = {}) {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "ken",
-      fallback_order: ["ken", "pixsoul"],
+      active: "default",
+      fallback_order: ["default", "secondary"],
       agents: { clerk: {} },
     });
-    seedAccount(h, "ken");
-    seedAccount(h, "pixsoul");
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
     mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
     const broker = new AuthBroker(config, {
       home: h.home,
@@ -2126,30 +2128,30 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     let resp = (await rpc(clerkSock, { v: 1, id: "1", op: "get-credentials" })) as {
       ok: boolean; data: { account: string };
     };
-    expect(resp.data.account).toBe("ken"); // healthy
-    // clerk hits the weekly wall → mark-exhausted(ken) with a weekly until.
+    expect(resp.data.account).toBe("default"); // healthy
+    // clerk hits the weekly wall → mark-exhausted(default) with a weekly until.
     await rpc(clerkSock, { v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 7 * 24 * 3600_000 });
     resp = (await rpc(clerkSock, { v: 1, id: "3", op: "get-credentials" })) as {
       ok: boolean; data: { account: string };
     };
     expect(resp.ok).toBe(true);
-    expect(resp.data.account).toBe("pixsoul"); // NOT the walled ken
+    expect(resp.data.account).toBe("secondary"); // NOT the walled active
     broker.stop();
   });
 
   it("a refresh-tick fanout during exhaustion never re-mirrors the walled account (the rollback guard)", async () => {
     const { broker, clerkSock, mirror } = failoverHarness();
     await broker.start();
-    expect(readFileSync(mirror, "utf-8")).toContain("at-ken"); // boot mirror
+    expect(readFileSync(mirror, "utf-8")).toContain("at-default"); // boot mirror
     await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 7 * 24 * 3600_000 });
-    expect(readFileSync(mirror, "utf-8")).toContain("at-pixsoul"); // failover fanout
-    // The exhaustion-BLIND refresh-tick fanout fires. auth.active is STILL ken
-    // (mark-exhausted never rewrote it), so pre-fix fanoutForAgent re-mirrored
-    // ken's refreshed-but-walled creds here → the rollback. Now it must hold.
+    expect(readFileSync(mirror, "utf-8")).toContain("at-secondary"); // failover fanout
+    // The exhaustion-BLIND refresh-tick fanout fires. auth.active is STILL the
+    // walled account (mark-exhausted never rewrote it), so pre-fix fanoutForAgent
+    // re-mirrored its refreshed-but-walled creds here → the rollback. Must hold.
     broker._fanoutAll();
     const after = readFileSync(mirror, "utf-8");
-    expect(after).toContain("at-pixsoul");
-    expect(after).not.toContain("at-ken");
+    expect(after).toContain("at-secondary");
+    expect(after).not.toContain("at-default");
     broker.stop();
   });
 
@@ -2165,25 +2167,25 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     let resp = (await rpc(clerkSock, { v: 1, id: "2", op: "get-credentials" })) as {
       ok: boolean; data: { account: string };
     };
-    expect(resp.data.account).toBe("pixsoul");
-    // Past the weekly window → auto-revert to ken (consumer-failover semantics).
+    expect(resp.data.account).toBe("secondary");
+    // Past the weekly window → auto-revert to the active account.
     clock = weeklyUntil + 1;
     resp = (await rpc(clerkSock, { v: 1, id: "3", op: "get-credentials" })) as {
       ok: boolean; data: { account: string };
     };
-    expect(resp.data.account).toBe("ken");
+    expect(resp.data.account).toBe("default");
     broker.stop();
   });
 
   it("keeps serving the walled active when EVERY fallback is also exhausted (retry beats dark)", async () => {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "ken",
-      fallback_order: ["ken", "pixsoul"],
-      agents: { clerk: {}, gymbro: { auth: { override: "pixsoul" } } },
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      agents: { clerk: {}, gymbro: { auth: { override: "secondary" } } },
     });
-    seedAccount(h, "ken");
-    seedAccount(h, "pixsoul");
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
     mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
     mkdirSync(join(h.agentsDir, "gymbro"), { recursive: true });
     const broker = new AuthBroker(config, {
@@ -2191,15 +2193,15 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     });
     await broker.start();
     const until = Date.now() + 7 * 24 * 3600_000;
-    await rpc(join(h.socketRoot, "clerk", "sock"), { v: 1, id: "1", op: "mark-exhausted", until }); // marks ken
-    await rpc(join(h.socketRoot, "gymbro", "sock"), { v: 1, id: "2", op: "mark-exhausted", until }); // marks pixsoul
-    // clerk on ken (walled); its only fallback pixsoul is walled too → no
-    // healthy alternative → serve the pinned/active ken (retry) not nothing.
+    await rpc(join(h.socketRoot, "clerk", "sock"), { v: 1, id: "1", op: "mark-exhausted", until }); // marks default
+    await rpc(join(h.socketRoot, "gymbro", "sock"), { v: 1, id: "2", op: "mark-exhausted", until }); // marks secondary
+    // clerk on default (walled); its only fallback secondary is walled too → no
+    // healthy alternative → serve the pinned/active default (retry) not nothing.
     const resp = (await rpc(join(h.socketRoot, "clerk", "sock"), {
       v: 1, id: "3", op: "get-credentials",
     })) as { ok: boolean; data: { account: string } };
     expect(resp.ok).toBe(true);
-    expect(resp.data.account).toBe("ken");
+    expect(resp.data.account).toBe("default");
     broker.stop();
   });
 });
