@@ -83,6 +83,13 @@ vi.mock("../src/setup/hindsight.js", () => ({
   isHindsightRunning: vi.fn(() => false),
 }));
 
+// `running` now comes from an HTTP probe (probeHindsight), not docker.
+// Mock it; keep getCollectionForAgent real.
+vi.mock("../src/memory/hindsight.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/memory/hindsight.js")>();
+  return { ...actual, probeHindsight: vi.fn(async () => ({ ok: false, reason: "test-default" })) };
+});
+
 import {
   handleGetAgents,
   handleStartAgent,
@@ -116,7 +123,8 @@ import {
 import { isOriginAllowed, isTailscaleIdentified } from "../src/web/server.js";
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
-import { getHindsightStatus, isHindsightRunning } from "../src/setup/hindsight.js";
+import { getHindsightStatus } from "../src/setup/hindsight.js";
+import { probeHindsight } from "../src/memory/hindsight.js";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -499,7 +507,10 @@ describe("handleGetSystemHealth", () => {
     vi.clearAllMocks();
     brokerImpl.run = null;
     asMock(getHindsightStatus).mockReturnValue(null);
-    asMock(isHindsightRunning).mockReturnValue(false);
+    asMock(probeHindsight).mockResolvedValue({ ok: false, reason: "test-default" });
+    // Default: docker inspect unavailable (no docker) → inspectEnv yields nulls.
+    // clearAllMocks() resets call history but NOT return values, so reset here.
+    asMock(spawnSync).mockReturnValue({ status: 1, stdout: "", stderr: "no docker" } as never);
     home = mkdtempSync(join(tmpdir(), "syshealth-"));
   });
 
@@ -519,7 +530,7 @@ describe("handleGetSystemHealth", () => {
         }),
       });
 
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
     expect(h.broker.reachable).toBe(true);
     expect(h.broker.active).toBe("ken@example.com");
     expect(h.broker.accounts).toBe(2);
@@ -529,7 +540,7 @@ describe("handleGetSystemHealth", () => {
 
   it("reports broker unreachable without throwing", async () => {
     brokerImpl.run = null; // withAuthBrokerClient throws FakeUnreachable
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
     expect(h.broker.reachable).toBe(false);
     expect(h.broker.error).toContain("broker down");
   });
@@ -538,14 +549,14 @@ describe("handleGetSystemHealth", () => {
     brokerImpl.run = async () => {
       throw new brokerHoist.FakeBrokerError("EPROTO", "bad frame");
     };
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
     expect(h.broker.reachable).toBe(false);
     expect(h.broker.error).toBe("EPROTO: bad frame");
   });
 
-  it("reads live hindsight env from docker inspect when running", async () => {
+  it("reports hindsight running from the HTTP probe + env from docker inspect when available", async () => {
+    asMock(probeHindsight).mockResolvedValue({ ok: true, serverName: "hindsight", serverVersion: "1.0" });
     asMock(getHindsightStatus).mockReturnValue("Up 3 hours");
-    asMock(isHindsightRunning).mockReturnValue(true);
     asMock(spawnSync).mockReturnValue({
       status: 0,
       stdout: JSON.stringify([
@@ -557,23 +568,32 @@ describe("handleGetSystemHealth", () => {
       stderr: "",
     } as never);
 
-    const h = await handleGetSystemHealth(home);
-    expect(h.hindsight.running).toBe(true);
+    const h = await handleGetSystemHealth(undefined, home);
+    expect(h.hindsight.running).toBe(true); // from the HTTP probe, not docker
     expect(h.hindsight.containerStatus).toBe("Up 3 hours");
     expect(h.hindsight.model).toBe("claude-sonnet-4-6");
     expect(h.hindsight.provider).toBe("claude-code");
     expect(h.hindsight.mcpStateless).toBe(true);
   });
 
-  it("leaves hindsight env null when the container is absent", async () => {
+  it("reports hindsight NOT running when the probe fails (e.g. dockerless web, hindsight unreachable)", async () => {
+    asMock(probeHindsight).mockResolvedValue({ ok: false, reason: "Unreachable" });
     asMock(getHindsightStatus).mockReturnValue(null);
-    asMock(isHindsightRunning).mockReturnValue(false);
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
+    // running is false because the probe failed — NOT because docker said so.
     expect(h.hindsight.running).toBe(false);
     expect(h.hindsight.model).toBeNull();
     expect(h.hindsight.mcpStateless).toBeNull();
-    // docker inspect must NOT be probed when the container isn't running.
-    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the configured provider when docker inspect is unavailable but the probe succeeds", async () => {
+    asMock(probeHindsight).mockResolvedValue({ ok: true, serverName: "h", serverVersion: "1" });
+    asMock(getHindsightStatus).mockReturnValue(null);
+    asMock(spawnSync).mockReturnValue({ status: 1, stdout: "", stderr: "no docker" } as never);
+    const cfg = { memory: { config: { url: "http://127.0.0.1:18888/mcp/", provider: "claude-code" } } } as never;
+    const h = await handleGetSystemHealth(cfg, home);
+    expect(h.hindsight.running).toBe(true);
+    expect(h.hindsight.provider).toBe("claude-code"); // from config, not docker
   });
 
   it("parses the hostd audit log when present (newest entries, capped)", async () => {
@@ -593,7 +613,7 @@ describe("handleGetSystemHealth", () => {
       [line("restart", 0), line("update-apply", 1)].join("\n") + "\n",
     );
 
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
     expect(h.hostd.auditLogPresent).toBe(true);
     expect(h.hostd.recent).toHaveLength(2);
     expect(h.hostd.recent.map((e) => e.op)).toEqual([
@@ -603,7 +623,7 @@ describe("handleGetSystemHealth", () => {
   });
 
   it("reports hostd audit absent on a fresh install (no crash)", async () => {
-    const h = await handleGetSystemHealth(home);
+    const h = await handleGetSystemHealth(undefined, home);
     expect(h.hostd.auditLogPresent).toBe(false);
     expect(h.hostd.recent).toEqual([]);
   });
