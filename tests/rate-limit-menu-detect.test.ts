@@ -30,6 +30,25 @@ const RATE_LIMIT_SCREEN =
   "\n" +
   "  Enter to confirm · Esc to cancel";
 
+// The REAL way clerk wedged, 2026-06-07: the SAME menu, but with enough
+// preceding output that the `❯ /rate-limit-options` prompt line scrolled OFF
+// the top of the `tmux capture-pane -p` viewport (no scrollback). The v0.14.84
+// detector anchored on `/rate-limit-options` and so stayed SILENT here (zero
+// log fires) while clerk sat dead. This fixture omits that line and uses the
+// newer option-2 wording ("Add funds to continue with usage credits"). The
+// re-anchored signature (option-1 menu-body row + "usage credits") must match.
+const CLERK_RATE_LIMIT_SCREEN =
+  "  ⎿  You've hit your weekly limit · resets Jun 9, 5am (Australia/Melbourne)\n" +
+  "\n" +
+  "────────────────────────────────────────\n" +
+  "  What do you want to do?\n" +
+  "\n" +
+  "  ❯ 1. Stop and wait for limit to reset\n" +
+  "    2. Add funds to continue with usage credits\n" +
+  "    3. Upgrade your plan\n" +
+  "\n" +
+  "  Enter to confirm · Esc to cancel";
+
 const NORMAL_SCREEN =
   "⏵⏵ accept edits on (shift+tab to cycle) · esc to interrupt\n❯ ";
 
@@ -43,16 +62,25 @@ function recordSend() {
 }
 
 describe("RATE_LIMIT_MENU_SIGNATURE", () => {
-  it("matches the real /rate-limit-options pane", () => {
+  it("matches the real finn pane (prompt line present)", () => {
     expect(RATE_LIMIT_MENU_SIGNATURE.test(RATE_LIMIT_SCREEN)).toBe(true);
+  });
+  it("matches clerk's scroll-off pane: NO /rate-limit-options line + 'Add funds…' wording (the #2218 blind spot)", () => {
+    // This is the case the v0.14.84 detector MISSED — the regression guard.
+    expect(CLERK_RATE_LIMIT_SCREEN).not.toContain("/rate-limit-options");
+    expect(RATE_LIMIT_MENU_SIGNATURE.test(CLERK_RATE_LIMIT_SCREEN)).toBe(true);
   });
   it("does NOT match normal output / a generic modal / empty", () => {
     expect(RATE_LIMIT_MENU_SIGNATURE.test(NORMAL_SCREEN)).toBe(false);
     expect(RATE_LIMIT_MENU_SIGNATURE.test("Which option?\n❯ 1. Yes\n  2. No\nEnter to select · Esc to cancel")).toBe(false);
     expect(RATE_LIMIT_MENU_SIGNATURE.test("")).toBe(false);
     // Needs BOTH anchors — one alone is not enough.
+    // anchor B alone (no option-1 menu-body row):
     expect(RATE_LIMIT_MENU_SIGNATURE.test("see /rate-limit-options docs")).toBe(false);
     expect(RATE_LIMIT_MENU_SIGNATURE.test("you could Upgrade your plan someday")).toBe(false);
+    expect(RATE_LIMIT_MENU_SIGNATURE.test("we ran low on usage credits last month")).toBe(false);
+    // anchor A alone (option-1 row but no usage-credits/upgrade/slash-cmd):
+    expect(RATE_LIMIT_MENU_SIGNATURE.test("Stop and wait for the deploy to finish before retrying")).toBe(false);
   });
   it("the GENERIC wedge signature does NOT match this menu (why a dedicated detector is needed)", () => {
     // The footer is 'Enter to confirm · Esc to cancel' — no 'to select/navigate/↑↓'.
@@ -105,6 +133,28 @@ describe("runWedgeWatchdog — rate-limit branch", () => {
     expect(signals[0].name).toBe("finn");
     expect(signals[0].resetAt).toBe(Date.UTC(2026, 5, 8, 19, 0, 0));
     // COMPLIANCE: the ONLY keystroke ever sent is Escape — never Down/2/3.
+    expect(calls).toEqual([["Escape"]]);
+  });
+
+  it("clerk's scroll-off pane (no /rate-limit-options line) STILL signals failover + Esc-parks", async () => {
+    // End-to-end proof that the re-anchor fixes the #2218 blind spot: the exact
+    // pane shape that left clerk dead now drives the full watchdog branch.
+    const { send, calls } = recordSend();
+    const signals: Array<{ name: string; resetAt: number | null }> = [];
+    const res = await runWedgeWatchdog({
+      agentName: "clerk",
+      now: () => Date.UTC(2026, 5, 7, 0, 0, 0),
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureSeq([CLERK_RATE_LIMIT_SCREEN]),
+      send,
+      onRateLimitMenu: (name, resetAt) => signals.push({ name, resetAt }),
+    });
+    expect(res.rateLimitFires).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(signals[0].name).toBe("clerk");
+    expect(signals[0].resetAt).toBe(Date.UTC(2026, 5, 8, 19, 0, 0));
+    // COMPLIANCE preserved on this pane too: Esc only.
     expect(calls).toEqual([["Escape"]]);
   });
 

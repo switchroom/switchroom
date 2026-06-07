@@ -125,6 +125,7 @@ import {
 } from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
+import { resolveExhaustUntil } from './exhaust-until.js'
 import {
   pendingAuthAddFlows,
   startAccountAuthSession,
@@ -4400,8 +4401,17 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // separately with the causal-shape headline ("5-hour limit on
     // ken" instead of generic "quota exhausted") — see
     // auth-snapshot-format.ts → renderFallbackAnnouncement.
+    //
+    // Thread the parsed reset as markExhausted's `until` via the shared
+    // resolveExhaustUntil floor. parseResetTime gives a finite epoch for
+    // ROLLING wordings ("resets in 2h", "retry after 60s"); a WEEKLY wall
+    // ("resets Jun 9, 5am") is UNPARSEABLE here → undefined → +7d floor.
+    // Pre-fix this called fireFleetAutoFallback(agent) with no until, so a
+    // weekly wall that surfaced as a 429 got markExhausted's ~5h default and
+    // the broker re-mirrored the still-walled account onto the fleet after 5h.
     if (willActuallyFire) {
-      void fireFleetAutoFallback(agent)
+      const untilMs = resolveExhaustUntil(modelUnavailable.resetAt?.getTime())
+      void fireFleetAutoFallback(agent, untilMs)
     }
   } else {
     try {
@@ -6271,11 +6281,7 @@ const ipcServer: IpcServer = createIpcServer({
   // existing chain handles the rest (roll to a fallback subscription account,
   // or the all-exhausted operator alert when none has quota). Fire-and-forget.
   onQuotaWallDetected(_client: IpcClient, msg: QuotaWallDetectedMessage) {
-    const WEEKLY_MS = 7 * 24 * 60 * 60 * 1000
-    const untilMs =
-      typeof msg.resetAt === 'number' && Number.isFinite(msg.resetAt) && msg.resetAt > Date.now()
-        ? msg.resetAt
-        : Date.now() + WEEKLY_MS
+    const untilMs = resolveExhaustUntil(msg.resetAt)
     process.stderr.write(
       `telegram gateway: quota_wall_detected agent=${msg.agentName} ` +
         `until=${new Date(untilMs).toISOString()}` +
