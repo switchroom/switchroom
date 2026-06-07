@@ -336,3 +336,135 @@ describe("resolveEntryThreadId", () => {
     expect(resolveEntryThreadId(makeEntry(), dmChannel)).toBeUndefined();
   });
 });
+
+describe("registerAgentSchedule — quota preflight", () => {
+  // Manual retry driver: captures scheduled retries so tests step them
+  // deterministically instead of waiting on real timers.
+  function manualRetry() {
+    const pending: Array<{ fn: () => void; cancelled: boolean; done: boolean }> = [];
+    return {
+      pending,
+      scheduleRetry(fn: () => void) {
+        const item = { fn, cancelled: false, done: false };
+        pending.push(item);
+        return { cancel: () => { item.cancelled = true; } };
+      },
+      async drive() {
+        const item = pending.find((p) => !p.cancelled && !p.done);
+        if (!item) throw new Error("no pending retry to drive");
+        item.done = true;
+        item.fn();
+        // flush the async attemptFire kicked off by the retry callback
+        await new Promise((r) => setTimeout(r, 0));
+        await Promise.resolve();
+      },
+    };
+  }
+  const oneEntry = [sampleEntries[0]!];
+  const chan = { chatId: "-100", threadId: 7 };
+
+  it("defers (exit_code=-2, no dispatch) when the gate says the fleet is walled", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    const r = manualRetry();
+    registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => 1_700_000_000_000,
+      quotaGate: async () => ({ defer: true, reason: "all 2 account(s) exhausted" }),
+      scheduleRetry: r.scheduleRetry,
+    });
+
+    await cron.fire(0);
+
+    expect(dispatcher.calls).toHaveLength(0); // nothing thrown at the wall
+    expect(sink.fires).toHaveLength(1);
+    expect(sink.fires[0]!.exitCode).toBe(-2);
+    expect(sink.fires[0]!.outputSummary).toContain("deferred (quota)");
+    expect(r.pending).toHaveLength(1); // a retry was scheduled
+  });
+
+  it("retries after a defer and dispatches once an account frees", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    const r = manualRetry();
+    let walled = true; // frees before the retry
+    registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => 1_700_000_000_000,
+      quotaGate: async () =>
+        walled ? { defer: true, reason: "all exhausted" } : { defer: false, reason: "healthy" },
+      scheduleRetry: r.scheduleRetry,
+    });
+
+    await cron.fire(0);
+    expect(dispatcher.calls).toHaveLength(0);
+    expect(sink.fires[0]!.exitCode).toBe(-2);
+
+    walled = false; // an account freed (fleet failed over)
+    await r.drive();
+
+    expect(dispatcher.calls).toHaveLength(1); // ran on the retry
+    expect(sink.fires.at(-1)!.exitCode).toBe(0);
+  });
+
+  it("gives up after maxAttempts of sustained defer (no dispatch, last row flags give-up)", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    const r = manualRetry();
+    registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => 1_700_000_000_000,
+      quotaGate: async () => ({ defer: true, reason: "all exhausted" }),
+      maxQuotaDeferAttempts: 3,
+      scheduleRetry: r.scheduleRetry,
+    });
+
+    await cron.fire(0);   // attempt 1 → defer + schedule retry
+    await r.drive();      // attempt 2 → defer + schedule retry
+    await r.drive();      // attempt 3 → defer, give up (no further retry)
+
+    expect(dispatcher.calls).toHaveLength(0);
+    expect(sink.fires).toHaveLength(3);
+    expect(sink.fires.every((f) => f.exitCode === -2)).toBe(true);
+    expect(sink.fires.at(-1)!.outputSummary).toContain("giving up");
+    // No further retry scheduled after the final attempt.
+    expect(r.pending.filter((p) => !p.done)).toHaveLength(0);
+  });
+
+  it("fails OPEN: a gate error never blocks the fire (dispatches normally)", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => 1_700_000_000_000,
+      quotaGate: async () => { throw new Error("broker unreachable"); },
+    });
+
+    await cron.fire(0);
+
+    expect(dispatcher.calls).toHaveLength(1);
+    expect(sink.fires[0]!.exitCode).toBe(0);
+  });
+
+  it("stop() cancels a pending retry so a deferred fire never dispatches late", async () => {
+    const cron = fakeCron();
+    const sink = new InMemoryAuditSink();
+    const dispatcher = captureDispatcher({ delivered: true });
+    const r = manualRetry();
+    const tasks = registerAgentSchedule({
+      entries: oneEntry, channel: chan, sink, cronLib: cron, dispatcher,
+      now: () => 1_700_000_000_000,
+      quotaGate: async () => ({ defer: true, reason: "all exhausted" }),
+      scheduleRetry: r.scheduleRetry,
+    });
+
+    await cron.fire(0);
+    expect(r.pending).toHaveLength(1);
+    tasks[0]!.task.stop();
+    expect(r.pending[0]!.cancelled).toBe(true);
+  });
+});
