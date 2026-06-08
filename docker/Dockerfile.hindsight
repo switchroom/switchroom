@@ -36,11 +36,13 @@ USER root
 
 # Node was already present in the upstream `standalone` stage (used for
 # the Control Plane). We piggyback on it to install the claude CLI
-# globally. Pin the EXACT same version docker/Dockerfile.base ships so the
-# hindsight memory provider runs the identical claude bundle as the agent
-# containers — a version skew here could reintroduce the thinking-block /
-# thinking-effort class of failures on memory reflection (see #1978).
-RUN npm install -g @anthropic-ai/claude-code@2.1.168 \
+# globally. CLAUDE_CODE_VERSION default MUST stay in lockstep with
+# docker/Dockerfile.base so the hindsight memory provider runs the identical
+# claude bundle as the agent containers — a version skew here could reintroduce
+# the thinking-block / thinking-effort class of failures on memory reflection
+# (see #1978). The canary overrides it the same way base does.
+ARG CLAUDE_CODE_VERSION=2.1.168
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && claude --version >&2
 
 # Install claude-agent-sdk into the same venv the hindsight API runs from.

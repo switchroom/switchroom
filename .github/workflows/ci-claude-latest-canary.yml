@@ -1,0 +1,93 @@
+name: ci-claude-latest-canary
+
+# Nightly "is the latest claude CLI safe to bump to?" canary.
+#
+# A claude version bump is the one change where every required gate (lint,
+# vitest-against-fixtures, image builds, `claude --version`) can pass while the
+# runtime silently breaks — because none of them exercise the NEXT version's
+# real surface. This workflow does, ahead of time: it pulls `@latest` nightly
+# and proves it (a) installs in the base-image context and (b) still exposes
+# every CLI flag switchroom's agent boot depends on. A failure here is the
+# early warning that the next bump needs attention — surfaced automatically
+# instead of discovered during a manual canary.
+#
+# Credential-free by design: no OAuth, no Telegram, no real turn — so it runs
+# on hosted runners with no setup. The BEHAVIOURAL half (a real round-trip on
+# latest) is the UAT gate; see docs/operators/claude-cli-updates.md for wiring
+# the `uat-host` self-hosted runner so ci-uat becomes that gate.
+#
+# NOT a required check — informational. Its job is to fail loudly in the
+# Actions tab when latest drifts, not to block PRs.
+
+on:
+  schedule:
+    # 06:17 UTC daily — off the hour to avoid the cron thundering-herd.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-latest-canary
+  cancel-in-progress: true
+
+jobs:
+  latest-claude-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # ubuntu-latest ships node + npm (used for the global `claude` install
+      # below); bun is for the repo deps + vitest, matching the repo convention.
+      - name: Set up bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+
+      - name: Resolve pinned vs latest claude version
+        id: ver
+        run: |
+          PINNED="$(grep -m1 -oE 'CLAUDE_CODE_VERSION=[0-9.]+' docker/Dockerfile.base | cut -d= -f2)"
+          LATEST="$(npm view @anthropic-ai/claude-code version)"
+          echo "pinned=$PINNED" >>"$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >>"$GITHUB_OUTPUT"
+          echo "### Claude CLI canary" >>"$GITHUB_STEP_SUMMARY"
+          echo "- pinned (Dockerfile.base): \`$PINNED\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "- latest (npm):            \`$LATEST\`" >>"$GITHUB_STEP_SUMMARY"
+          if [ "$PINNED" = "$LATEST" ]; then
+            echo "- delta: **none — fleet is current**" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "- delta: **latest is ahead of the pin — a bump is available**" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install @latest in the base-image context (node:22-trixie-slim)
+        # Faithful to docker/Dockerfile.base's FROM — proves @latest installs
+        # and the binary runs in the SAME environment agents ship, not just on
+        # the runner's node. A broken publish (npm install fails, binary
+        # crashes) fails the job here.
+        run: |
+          set -euo pipefail
+          LATEST="${{ steps.ver.outputs.latest }}"
+          docker run --rm node:22-trixie-slim bash -c "
+            set -e
+            npm install -g @anthropic-ai/claude-code@${LATEST} >/dev/null 2>&1
+            claude --version
+          " | tee /tmp/latest-version.txt
+          echo "- install-in-base: ✅ \`$(cat /tmp/latest-version.txt)\`" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Install @latest on the runner
+        run: |
+          npm install -g @anthropic-ai/claude-code@${{ steps.ver.outputs.latest }}
+          claude --version
+
+      - name: Flag/subcommand contract against @latest
+        # Runs tests/claude-cli-contract.test.ts with `claude` now on PATH (so
+        # it asserts for real, not self-skips): every flag switchroom's agent
+        # boot depends on must still exist in `@latest`'s --help. A dropped or
+        # renamed flag fails here — the signal that the next bump would break
+        # agent boot.
+        run: |
+          bun install --frozen-lockfile --no-progress
+          bunx vitest run tests/claude-cli-contract.test.ts --reporter=basic
+          echo "- flag contract: ✅ all switchroom-required flags present in @latest" >>"$GITHUB_STEP_SUMMARY"

@@ -145,8 +145,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Pin claude CLI to an EXACT version in the base image so every agent /
 # scheduler container resolves the SAME, auditable bundle — the built
 # image is deterministic, not "whatever @latest resolved at build time."
-# Bumping the CLI is therefore an explicit, reviewable one-line change
-# here (see #1978). Agents do NOT install claude.
+# Bumping the CLI is an explicit, reviewable change to the CLAUDE_CODE_VERSION
+# default below (see #1978). Agents do NOT install claude.
+#
+# CLAUDE_CODE_VERSION is a build-arg whose DEFAULT is the production pin — a
+# normal build (no --build-arg) is byte-identical to a hardcoded pin and stays
+# fully auditable. The nightly latest-claude canary overrides it
+# (`--build-arg CLAUDE_CODE_VERSION=<latest>`) to build a throwaway image on the
+# next version and prove it boots BEFORE the pin is bumped. Keep this default in
+# lockstep with docker/Dockerfile.hindsight's CLAUDE_CODE_VERSION (#1978).
+ARG CLAUDE_CODE_VERSION=2.1.168
 # Fail-fast: if the npm install or the resulting binary is broken we
 # want the image build to die here, not produce a base that ships
 # downstream and explodes at agent boot. Previously this had a
@@ -166,7 +174,7 @@ ARG CACHE_BUST=default
 # bumps.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     echo "cache-bust=${CACHE_BUST}" > /dev/null \
- && npm install -g @anthropic-ai/claude-code@2.1.168 \
+ && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && claude --version >&2
 
 # Phase 1b: install bun. The broker server (src/vault/broker/server.ts)

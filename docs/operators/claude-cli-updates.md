@@ -1,0 +1,104 @@
+# Updating the bundled Claude CLI
+
+switchroom pins an **exact** Claude CLI version into every image so the whole
+fleet runs one auditable, deterministic runtime. The pin is the
+`CLAUDE_CODE_VERSION` build-arg default in **two** Dockerfiles, kept in lockstep
+(#1978 — a skew between the agent bundle and the hindsight reflection bundle can
+reintroduce the thinking-block failure class):
+
+- `docker/Dockerfile.base` → propagates to agent / broker / kernel / auth-broker
+  / hostd (all `FROM ${BASE_IMAGE}`)
+- `docker/Dockerfile.hindsight` (installs claude separately)
+
+A CLI bump is the one change where every *required* CI check can pass while the
+runtime silently breaks — the build checks only prove the binary **installs and
+runs**, not that its **behaviour** (turn delivery, hooks, injected/cron turns,
+stream/subagent formats) is still compatible. So updates follow a deliberate
+path with two regression layers.
+
+## The regression layers
+
+| Layer | What it proves | Where | Gating? |
+|---|---|---|---|
+| Image builds (`build-base`/`-dependents`/`-hindsight`) | the pinned version installs + `claude --version` runs in every image | required CI | ✅ |
+| **Flag contract** (`tests/claude-cli-contract.test.ts`) | every CLI flag agent-boot depends on still exists in the installed binary's `--help` | `vitest` (self-skips when claude absent) + the canary | ✅ (self-skips) |
+| **Nightly latest canary** (`ci-claude-latest-canary.yml`) | `claude@latest` still installs in the base context **and** passes the flag contract — *before* you bump | scheduled, informational | ❌ (alert) |
+| **Behavioural UAT** (`ci-uat.yml`) | a real inbound → claude → reply round-trip (and restart/inject scenarios) still work | `uat-host` self-hosted runner | ❌ until wired |
+
+The nightly canary answers "**is latest safe to bump?**" automatically: it goes
+red in the Actions tab the night a new version drops a flag switchroom needs or
+breaks install. The behavioural UAT is the only thing that proves a real turn
+still works — and it needs a self-hosted runner with subscription creds (below).
+
+## Routine update procedure
+
+1. **Check the canary.** If `ci-claude-latest-canary` is green, latest installs
+   and keeps every flag switchroom needs. Read its job summary for the
+   pinned-vs-latest delta.
+2. **Bump the pin.** Edit the `CLAUDE_CODE_VERSION=` default in **both**
+   `docker/Dockerfile.base` and `docker/Dockerfile.hindsight` to the new
+   version (keep them identical). One-line each.
+3. **PR → review → merge.** The `build-*` checks rebuild every image on the new
+   pin; the flag contract runs where claude is present.
+4. **Release** (version bump + CHANGELOG) → tag → `docker-images` rebuilds all
+   images.
+5. **Canary on `test-harness` first** — pin it to the new release, restart, and
+   verify `claude --version` *inside* the container reports the new version.
+6. **Behavioural check** — if the `uat-host` runner is wired, ci-uat round-trips
+   prove it. If not, do the manual canary: send a DM **and** a group message to
+   the test bot and confirm it replies (this catches injection/permission
+   regressions like the 2.1.166 cross-session-messaging hardening, which the
+   build checks are blind to).
+7. **Staggered fleet roll** + recreate singletons + **recreate hindsight**
+   (manual `docker run` — see the hindsight recreate note below).
+
+## Wiring the `uat-host` runner (makes the behavioural gate automatic)
+
+Once registered, `ci-uat.yml` runs the real round-trip UAT (`jtbd-*`,
+`fuzz-*`, `inbound-no-drop`) on every relevant change — turning the manual canary
+in step 6 into an automatic gate, and unlocking "track latest as long as CI
+passes."
+
+1. On the operator host (has the subscription creds + a running `test-harness`
+   agent + NOPASSWD sudo + the `switchroom` CLI on PATH), register a GitHub
+   Actions self-hosted runner with the label **`uat-host`**
+   (repo → Settings → Actions → Runners → New self-hosted runner).
+2. Set the repo **variable** `UAT_GATE_ENABLED=true` (repo → Settings →
+   Secrets and variables → Actions → Variables).
+3. Set the four repo **secrets** the UAT driver needs: `TELEGRAM_API_ID`,
+   `TELEGRAM_API_HASH`, `TELEGRAM_UAT_DRIVER_SESSION`,
+   `TELEGRAM_TEST_BOT_USERNAME` (from the mtcute login — see
+   `telegram-plugin/uat/`).
+4. Confirm a green ci-uat run, then **add `ci-uat` to the required checks**
+   ruleset (`gh api repos/switchroom/switchroom/rulesets/16470166` → append the
+   `ci-uat` context to `required_status_checks`, preserving `bypass_actors: []`
+   + `enforcement: active`). Now a CLI bump can't merge unless a real turn
+   still works.
+
+To run the behavioural check against **latest** (not just the pinned bundle),
+build a throwaway agent on latest before driving UAT:
+`switchroom apply --build-local` with the base image built
+`--build-arg CLAUDE_CODE_VERSION=<latest>`, restart `test-harness`, then run the
+UAT scenarios.
+
+## Hindsight recreate note (manual `docker run`, NOT compose)
+
+Hindsight is a standalone `docker run` (managed by `src/setup/hindsight.ts`),
+not part of the switchroom compose project. To pick up a new image it must be
+stop+rm+run with the COMPLETE flag set, or it crash-loops / loses the shm fix:
+
+- `--shm-size=2g` — the durable Postgres fix (the 2026-06-06 outage); **not**
+  in setup.ts, must be added manually or PG writes die.
+- `--tmpfs /run/claude-creds:rw,mode=0700,uid=11000,gid=11000` — **mandatory**;
+  the image runs `USER hindsight` (UID 11000) and the entrypoint mkdirs
+  `/run/claude-creds`. Without the uid-owned tmpfs → `Permission denied` →
+  restart loop.
+- `--memory=4g --memory-reservation=2g --pids-limit=1000`, the two volumes
+  (`switchroom-hindsight-data:/home/hindsight/.pg0` — Postgres data, persists
+  across recreate — and `auth-broker-hindsight-sock:/run/switchroom/auth-broker`),
+  ports `127.0.0.1:18888:8888` + `127.0.0.1:19999:9999`, and the captured env.
+
+`docker inspect` field-picking misses `Tmpfs` + `User` — use
+`src/setup/hindsight.ts` (`runHindsight`) as the source of truth for the run
+command, then add `--shm-size=2g`. Verify after:
+`curl 127.0.0.1:18888/health` → `{"status":"healthy","database":"connected"}`.
