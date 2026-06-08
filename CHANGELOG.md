@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.14.90 — Framework owns the reply topic, not the model (#2233)
+
+A General-topic question to an agent in a forum supergroup could get its answer
+routed to a *different* topic — so the person reading General saw silence. Root
+cause: General-topic messages carry no `message_thread_id`, and when the model
+passed an explicit `message_thread_id` on its reply, the answer-thread resolver
+let that explicit thread win **outright** over the framework's record of which
+topic the question came from. The model could redirect any reply to any topic.
+
+The topic a reply lands in is now owned by the **framework's turn anchor**, not
+the model's `message_thread_id`. New precedence:
+
+```
+origin turn  →  live in-flight turn  →  (model explicit, last resort)  →  late recovery
+```
+
+The model's explicit thread is consulted only when there is neither a resolved
+origin nor a live in-flight turn (a genuinely orphaned / proactive send). The
+live tier keys off the turn's *presence*, not its thread value, so a General
+live turn (which has no thread) still anchors the reply to General instead of
+letting the model pull it into another topic. Topic-targeting for proactive
+posts is therefore config-driven (a cron's `topic:`), not model-driven.
+
+Determinism is proven by total enumeration of the resolver's reachable input
+space (the load-bearing invariant: the output is independent of the model's
+explicit thread whenever an origin or live turn exists). Kill switch
+`SWITCHROOM_REPLY_TOPIC_AUTHORITY=0` restores the legacy explicit-first
+precedence. A new `EXPLICIT_OVERRIDDEN(model→X,routed→Y)` tag on the reply-route
+log surfaces every time the framework corrects a model topic-grab.
+
+`stream_reply` and all framework status surfaces (worker feed, handback,
+sub-agent progress, approval cards, cron) are unaffected — only a model
+deliberately cross-posting a `reply` to a different topic than the one it's
+working in is redirected (the misroute this fixes).
+
 ## v0.14.89 — Bump bundled claude CLI 2.1.159 → 2.1.168 (#2230)
 
 Bumps the bundled Claude CLI core runtime from 2.1.159 (pinned since v0.14.26)
