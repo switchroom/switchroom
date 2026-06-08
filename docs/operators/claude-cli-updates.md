@@ -54,26 +54,42 @@ still works — and it needs a self-hosted runner with subscription creds (below
 
 ## Wiring the `uat-host` runner (makes the behavioural gate automatic)
 
-Once registered, `ci-uat.yml` runs the real round-trip UAT (`jtbd-*`,
-`fuzz-*`, `inbound-no-drop`) on every relevant change — turning the manual canary
-in step 6 into an automatic gate, and unlocking "track latest as long as CI
-passes."
+Once registered, `ci-uat.yml` runs the real round-trip UAT (`fuzz-*`,
+`inbound-no-drop`, and on the operator host `jtbd-*`) on every relevant change —
+turning the manual canary in step 6 into an automatic gate, and unlocking
+"track latest as long as CI passes."
 
-1. On the operator host (has the subscription creds + a running `test-harness`
-   agent + NOPASSWD sudo + the `switchroom` CLI on PATH), register a GitHub
-   Actions self-hosted runner with the label **`uat-host`**
-   (repo → Settings → Actions → Runners → New self-hosted runner).
-2. Set the repo **variable** `UAT_GATE_ENABLED=true` (repo → Settings →
-   Secrets and variables → Actions → Variables).
-3. Set the four repo **secrets** the UAT driver needs: `TELEGRAM_API_ID`,
-   `TELEGRAM_API_HASH`, `TELEGRAM_UAT_DRIVER_SESSION`,
-   `TELEGRAM_TEST_BOT_USERNAME` (from the mtcute login — see
-   `telegram-plugin/uat/`).
-4. Confirm a green ci-uat run, then **add `ci-uat` to the required checks**
-   ruleset (`gh api repos/switchroom/switchroom/rulesets/16470166` → append the
-   `ci-uat` context to `required_status_checks`, preserving `bypass_actors: []`
-   + `enforcement: active`). Now a CLI bump can't merge unless a real turn
-   still works.
+**switchroom is a PUBLIC repo, so the runner is SANDBOXED** — a runner is a
+code-execution surface for fork PRs and must never sit unprotected next to the
+vault/fleet. The provided runner runs as a **container** with: non-root user,
+`no-new-privileges`, mem/pids caps, **no docker socket, no host mounts**, and a
+**bridge network (egress only)** — it reaches Telegram + GitHub but cannot touch
+the host's `127.0.0.1` fleet/vault. The host-mutating `jtbd-restart` scenarios
+self-skip there (no sudo); only the network-only round-trips run — exactly the
+boundary we want.
+
+One command does the whole setup (build the image; push the 4 `TELEGRAM_*`
+secrets + `UAT_GATE_ENABLED` from `.env`; set fork-PR approval to
+all-external-contributors; register + run the container):
+
+```bash
+scripts/setup-uat-runner.sh
+```
+
+(See `docker/Dockerfile.uat-runner` + `docker/uat-runner-entrypoint.sh` for the
+image; runner config persists in the `uat-runner-data` volume, so the container
+survives restarts without re-registering.)
+
+Then **confirm a green ci-uat run** and **add `ci-uat` to the required checks**
+ruleset (`gh api repos/switchroom/switchroom/rulesets/16470166` → append the
+`ci-uat` context to `required_status_checks`, preserving `bypass_actors: []` +
+`enforcement: active`). Now a CLI bump can't merge unless a real turn still
+works.
+
+> Security floor for a public-repo runner — all set by the script, do not
+> weaken: fork-PR approval = `all_external_contributors`; the runner has **no**
+> docker socket and **no** host mounts. Re-verify after any Actions-settings
+> change.
 
 To run the behavioural check against **latest** (not just the pinned bundle),
 build a throwaway agent on latest before driving UAT:
