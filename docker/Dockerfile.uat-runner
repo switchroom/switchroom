@@ -1,0 +1,34 @@
+# Sandboxed GitHub Actions self-hosted runner for switchroom UAT (label: uat-host).
+# Isolation by construction: runs as non-root, NO docker socket, NO host mounts,
+# egress-only networking. It can reach Telegram (to drive the test bot) + GitHub,
+# but cannot touch the host, the vault, the fleet, or docker. The host-mutating
+# jtbd-restart UAT scenarios self-skip here (no sudo) — exactly the boundary we
+# want: behavioural round-trip tests run; nothing on the host can be mutated.
+FROM node:22-trixie-slim
+
+ARG RUNNER_VERSION=2.334.0
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl ca-certificates git jq libicu76 unzip \
+ && rm -rf /var/lib/apt/lists/*
+
+# bun (UAT runs under bun, repo convention). Install as root, then copy the
+# real binary to a world-readable path the non-root runner can exec.
+RUN curl -fsSL https://bun.sh/install | bash \
+ && cp -L /root/.bun/bin/bun /usr/local/bin/bun \
+ && chmod 0755 /usr/local/bin/bun \
+ && rm -rf /root/.bun
+
+RUN useradd -m -d /home/runner runner
+WORKDIR /actions-runner
+RUN chown runner:runner /actions-runner
+USER runner
+
+RUN curl -fsSL -o runner.tar.gz \
+      "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+ && tar xzf runner.tar.gz && rm runner.tar.gz
+
+COPY --chown=runner:runner uat-runner-entrypoint.sh /actions-runner/entrypoint.sh
+ENTRYPOINT ["/actions-runner/entrypoint.sh"]
