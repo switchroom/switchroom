@@ -43,6 +43,19 @@ on:
       - ".github/workflows/ci-uat.yml"
   push:
     branches: [main]
+    # Same path scope as the PR trigger — a docs/docker/scripts merge must not
+    # spin up the (slow, runner-bound) UAT. Pre-fix the push trigger had NO
+    # paths filter, so every main merge ran the 35-min fuzz suite and
+    # timeout-cancelled, tying up the single uat-host runner.
+    paths:
+      - "telegram-plugin/**"
+      - "src/agents/**"
+      - "telegram-plugin/uat/**"
+      - "vitest.uat.config.ts"
+      - ".github/workflows/ci-uat.yml"
+  schedule:
+    # Nightly thorough fuzz pass (the uat-fuzz job below is schedule/dispatch-only).
+    - cron: "41 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -56,14 +69,24 @@ concurrency:
   group: ci-uat-${{ github.ref }}
   cancel-in-progress: false
 
+# The UAT splits into two jobs that share the single uat-host runner:
+#
+#   uat-gate  — FAST, deterministic round-trips (a real inbound→reply turn +
+#               rapid-fire no-drop). ~minutes. This is the required-check
+#               candidate: it's the behavioural signal a CLI bump (or any
+#               change) needs without the runner-bound 35-min fuzz pool. Runs on
+#               PR + push (path-scoped) + dispatch.
+#   uat-fuzz  — THOROUGH probabilistic fuzz pool + the restart vision scenario.
+#               Too slow to gate (the full pool exceeds a 35-min budget), so it
+#               is schedule/dispatch-ONLY and NON-required. Catches the broader
+#               regression surface nightly.
 jobs:
-  uat-fuzz:
-    # Gate on a repo variable so the workflow is invisible on hosts
-    # without a self-hosted runner registered — keeps PRs green until
-    # the operator opts in.
+  uat-gate:
+    # Gate on a repo variable so the workflow is invisible on hosts without a
+    # self-hosted runner registered — keeps PRs green until the operator opts in.
     if: vars.UAT_GATE_ENABLED == 'true'
     runs-on: [self-hosted, uat-host]
-    timeout-minutes: 35
+    timeout-minutes: 18
     env:
       TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
       TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -72,59 +95,71 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-
       - name: Secrets gate
-        # If any of the 4 UAT secrets are missing (rotation gap, fork
-        # PR, etc), skip cleanly with a clear log line. Mirrors BK
-        # pipeline.uat.yml:62-67.
         id: secrets
         run: |
           if [[ -z "${TELEGRAM_API_ID:-}" || -z "${TELEGRAM_API_HASH:-}" || -z "${TELEGRAM_UAT_DRIVER_SESSION:-}" || -z "${TELEGRAM_TEST_BOT_USERNAME:-}" ]]; then
             echo "ok=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::UAT fuzz skipped: one or more secrets missing (TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_UAT_DRIVER_SESSION / TELEGRAM_TEST_BOT_USERNAME). Expected for PRs from forks."
+            echo "::warning::UAT gate skipped: one or more TELEGRAM_* secrets missing (expected for fork PRs)."
           else
             echo "ok=true" >>"$GITHUB_OUTPUT"
           fi
-
       - name: Set up workspace
         if: steps.secrets.outputs.ok == 'true'
         uses: ./.github/actions/setup-switchroom
-
-      - name: UAT fuzz (scoped to fuzz-*.test.ts)
+      - name: Round-trip — warm-cache trivial DM (a real inbound→reply turn)
         if: steps.secrets.outputs.ok == 'true'
-        # Positional filter narrows vitest collection to fuzz-*.test.ts
-        # only — the vitest.uat.config.ts include glob picks up every
-        # scenario file, but only fuzz scenarios are PR-gate-stable.
+        # The core behavioural signal: a real message → a real reply. Catches a
+        # CLI-bump regression that breaks turn delivery / injection (e.g. the
+        # 2.1.166 cross-session-messaging hardening) — which the build/flag
+        # checks are blind to.
         working-directory: telegram-plugin
-        run: bun run test:uat fuzz-
-
-      - name: UAT JTBD vision scenarios (operator-host only — self-skips without sudo)
+        run: bun run test:uat jtbd-fast-trivial-dm
+      - name: Reliable-delivery — rapid-fire no-drop
         if: steps.secrets.outputs.ok == 'true'
-        # The jtbd-* scenarios encode vision/JTBD contracts that require
-        # a live switchroom host (NOPASSWD sudo + the switchroom CLI on
-        # PATH + a running test-harness agent) to run. On CI runners
-        # without that setup, each scenario self-skips via a
-        # `canShellSudo()` guard — the step still completes, so CI stays
-        # green, but a regression on the operator's harness host fails
-        # the gate as soon as they run UAT.
-        #
-        # Why this is gated separately from the fuzz scenarios: the
-        # vision UAT shells out to `switchroom agent restart`, which is
-        # mutating + side-effecting. It's the right tool for catching
-        # post-restart wedges (the #1556 self-blocking gate that
-        # produced the 5-min blank on every restart pre-v0.12.22) but
-        # mixing it with the fuzz pool would let one flake stall the
-        # gate. Keep them separate; operators run both during UAT.
-        working-directory: telegram-plugin
-        run: bun run test:uat jtbd-always-on-after-restart
-
-      - name: UAT reliable-delivery regression (rapid-fire no-drop)
-        if: steps.secrets.outputs.ok == 'true'
-        # Fires back-to-back messages at the turn-completion boundary and
-        # asserts every one gets its own reply — the regression gate for the
-        # deliver-until-acked queue (#2089), which replaced fire-and-forget
-        # delivery that stranded inbounds in the composer and dropped them at
-        # the 300s silence-poke. Driver-only (no sudo), but kept in its own
-        # step so a flake can't stall the fuzz pool.
+        # Back-to-back inbounds at the turn boundary, each must get its own
+        # reply — the deliver-until-acked regression gate (#2089). Driver-only,
+        # deterministic, fast.
         working-directory: telegram-plugin
         run: bun run test:uat inbound-no-drop
+
+  uat-fuzz:
+    # Thorough probabilistic pool — too slow to gate, so schedule/dispatch-ONLY
+    # and non-required. (Each fuzz scenario is a real ~10-30s round-trip; the
+    # full pool exceeds a 35-min job budget on the single runner.)
+    if: >-
+      vars.UAT_GATE_ENABLED == 'true' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, uat-host]
+    timeout-minutes: 50
+    env:
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      TELEGRAM_UAT_DRIVER_SESSION: ${{ secrets.TELEGRAM_UAT_DRIVER_SESSION }}
+      TELEGRAM_TEST_BOT_USERNAME: ${{ secrets.TELEGRAM_TEST_BOT_USERNAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Secrets gate
+        id: secrets
+        run: |
+          if [[ -z "${TELEGRAM_API_ID:-}" || -z "${TELEGRAM_API_HASH:-}" || -z "${TELEGRAM_UAT_DRIVER_SESSION:-}" || -z "${TELEGRAM_TEST_BOT_USERNAME:-}" ]]; then
+            echo "ok=false" >>"$GITHUB_OUTPUT"
+            echo "::warning::UAT fuzz skipped: TELEGRAM_* secrets missing."
+          else
+            echo "ok=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Set up workspace
+        if: steps.secrets.outputs.ok == 'true'
+        uses: ./.github/actions/setup-switchroom
+      - name: UAT fuzz (scoped to fuzz-*.test.ts)
+        if: steps.secrets.outputs.ok == 'true'
+        working-directory: telegram-plugin
+        run: bun run test:uat fuzz-
+      - name: UAT JTBD vision — restart (operator-host only; self-skips without sudo)
+        if: steps.secrets.outputs.ok == 'true'
+        # Shells `switchroom agent restart` (mutating) — self-skips via
+        # canShellSudo() on the sandboxed runner. Catches post-restart wedges
+        # on the operator host.
+        working-directory: telegram-plugin
+        run: bun run test:uat jtbd-always-on-after-restart
