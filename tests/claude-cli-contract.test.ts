@@ -50,7 +50,8 @@ function claudeVersion(): string {
 }
 
 /**
- * Flags switchroom passes to `claude` at agent boot (start.sh.hbs:655-663).
+ * Flags switchroom passes to `claude` at agent boot (the `exec claude` lines in
+ * profiles/_base/start.sh.hbs; --add-dir comes via SR_FLEET_ARG).
  * Each must remain present in `claude --help` or the agent won't boot the way
  * switchroom expects. The two channel-load flags
  * (`--dangerously-load-development-channels` / `--channels`) are deliberately
