@@ -471,6 +471,10 @@ import {
 } from './resume-inbound-builder.js'
 import { applySubagentsSchema, getSubagentByJsonlId } from '../registry/subagents-schema.js'
 import { resolveWorkerFeedDispatch, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
+import {
+  resolveSubagentStatusSurface,
+  isOrphanSubagentStatusEnabled,
+} from './subagent-status-surface.js'
 import { formatIdleFooter } from '../idle-footer.js'
 import { resolveCallingSubagent } from './resolve-calling-subagent.js'
 
@@ -20410,6 +20414,11 @@ void (async () => {
             // compose draft, so no answer-stream contention). The kill-switch
             // disables only the nesting; the parent's own feed is unaffected.
             const foregroundNestingEnabled = process.env.SWITCHROOM_FOREGROUND_SUBAGENT_NESTING !== '0'
+            // Orphaned-foreground status (2026-06-09): a FOREGROUND sub-agent
+            // with no live parent turn to nest into (dispatched outside a turn,
+            // or the turn ended while it kept running — extended autonomous
+            // work) is surfaced via the worker feed instead of vanishing.
+            const orphanStatusEnabled = isOrphanSubagentStatusEnabled(process.env.SWITCHROOM_ORPHAN_SUBAGENT_STATUS)
             const workerActivityFeed = createWorkerActivityFeed({
               bot: {
                 sendMessage: async (cid, text, sendOpts) => {
@@ -20609,6 +20618,29 @@ void (async () => {
                         }
                       }
                     }
+                    return
+                  }
+                  // Not nested → an orphaned foreground sub-agent that was
+                  // surfaced via the worker feed (no live turn to nest into):
+                  // finalize its message (no-op if none was posted). A
+                  // foreground result returns inline as the Task tool result, so
+                  // there is no handback to deliver — return after.
+                  if (
+                    resolveSubagentStatusSurface({
+                      isBackground: false,
+                      liveTurnPresent: false,
+                      workerFeedEnabled,
+                      orphanStatusEnabled,
+                    }) === 'worker-feed'
+                  ) {
+                    void workerActivityFeed.finish(agentId, {
+                      description: dispatch.feedDescription,
+                      lastTool: null,
+                      toolCount,
+                      latestSummary: resultText,
+                      elapsedMs: durationMs,
+                      state: outcome === 'failed' ? 'failed' : 'done',
+                    })
                   }
                   return
                 }
@@ -20738,8 +20770,39 @@ void (async () => {
                   // activity draft rather than a separate worker message. Pure
                   // jsonl-tail → render (no model call), inside the
                   // subscription-honest boundary.
+                  //
+                  // But a foreground sub-agent with NO live turn to nest into
+                  // (dispatched outside a turn, or the turn ended while it kept
+                  // running — extended autonomous work) has nowhere to nest, and
+                  // pre-fix it silently returned here → invisible. Route through
+                  // the proven decision: an orphaned foreground sub-agent goes to
+                  // the worker feed (owner-DM fallback), not into the void.
+                  const surface = resolveSubagentStatusSurface({
+                    isBackground: false,
+                    liveTurnPresent: currentTurn != null,
+                    workerFeedEnabled,
+                    orphanStatusEnabled,
+                  })
+                  if (surface === 'worker-feed') {
+                    const origin = resolveSubagentOriginChat(agentId)
+                    void workerActivityFeed.update(
+                      agentId,
+                      origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
+                      {
+                        description: dispatch.feedDescription,
+                        lastTool,
+                        toolCount,
+                        latestSummary,
+                        elapsedMs,
+                        state: 'running',
+                      },
+                      origin?.threadId,
+                    )
+                    return
+                  }
+                  if (surface !== 'nest') return // 'skip' — orphan-status off
                   const turn = currentTurn
-                  if (turn == null) return
+                  if (turn == null) return // defensive: 'nest' implies a live turn
                   // Render regardless of `replyCalled` — a foreground Task
                   // blocks the parent, so any reply seen while it runs is an
                   // interim ack, never the final answer. Gating on replyCalled
