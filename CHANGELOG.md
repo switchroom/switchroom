@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.15.0 — claude CLI 2.1.170 for Fable 5 (#2252)
+
+The fleet default model moved to **Fable 5** (`claude-fable-5[1m]`), and this
+release moves the in-container claude CLI with it.
+
+### claude CLI 2.1.168 → 2.1.170 across all images (#2252)
+
+Both lockstep pins bumped: `docker/Dockerfile.base` (flows to the agent,
+broker, kernel, auth-broker and hostd images via `FROM base`) and
+`docker/Dockerfile.hindsight`. 2.1.170 is the CLI version the Fable 5 banner
+recommends; agents ran Fable fine on 2.1.168, so this is a recommended-floor
+catch-up, not a fix. Rollback is a pin revert.
+
+### Dashboard: resilient connections fetch + always-fresh quota (#2239)
+
+The dashboard's connections panel now tolerates a slow/failed accounts fetch
+without blanking, and quota readings refresh without a manual reload.
+
 ## v0.14.93 — `agent restart` regenerates the compose, so pin bumps apply (#2249)
 
 A `release.pin` bump in `switchroom.yaml` followed by `switchroom agent restart`
