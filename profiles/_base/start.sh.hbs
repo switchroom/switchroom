@@ -163,6 +163,19 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
       bun /opt/switchroom/agent-scheduler/index.js &
   fi
 
+{{#if cronSessionEnabled}}
+  # 4) cheap cron SESSION (Tier 1, docs/rfcs/cheap-cron-sessions.md §2.2).
+  #    A SECOND interactive claude (no -p) dedicated to context:fresh cron
+  #    fires, registering to the gateway as the cron-suffixed bridge. This
+  #    block is rendered ONLY for an agent that has a Tier-1 cron entry; for
+  #    every other agent the cronSessionEnabled guard is false so the whole
+  #    block is absent and their start.sh is byte-identical to before.
+  if command -v claude >/dev/null 2>&1 && [ -f "$(dirname "$0")/cron-session.sh" ]; then
+    _switchroom_supervise cron-session /var/log/switchroom/cron-session.log \
+      bash "$(dirname "$0")/cron-session.sh" &
+  fi
+{{/if}}
+
   export SWITCHROOM_DOCKER_TMUX_INNER=1
   exec tmux -L "switchroom-{{name}}" \
     new-session -A -s "{{name}}" -x 400 -y 50 \

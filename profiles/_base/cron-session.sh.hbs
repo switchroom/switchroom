@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Tier-1 cheap cron SESSION launcher — docs/rfcs/cheap-cron-sessions.md §2.2.
+#
+# A SECOND interactive `claude` (no -p — compliance pillar 3) in the agent
+# container, dedicated to cheap cron fires. It registers to the SAME gateway
+# as a DISTINCT bridge identity `<name>-cron` (start.sh's gateway sidecar
+# routes meta.session=cron fires here and gates all status surfaces off this
+# identity — see telegram-plugin/gateway/cron-session.ts). Minimal context:
+# its own CLAUDE_CONFIG_DIR (separate transcript) + a TRIMMED .mcp.json (only
+# switchroom-telegram) → it pays a fraction of the main session's schema +
+# cache-read tax, at the cheap cron model.
+#
+# Forked as a supervised sidecar by start.sh ONLY when {{name}} actually has a
+# Tier-1 (context: fresh) cron entry AND SWITCHROOM_CHEAP_CRON is on — so the
+# whole feature is inert for the rest of the fleet (the start.sh fork block
+# renders empty). This script is a no-op artifact on disk until then.
+set -u
+
+# Runtime kill-switch. The fork is baked into start.sh whenever {{name}} has a
+# context:fresh cron entry (a config property), but the session only actually
+# runs when SWITCHROOM_CHEAP_CRON is on at runtime. Exit 78 (EX_CONFIG) so the
+# supervisor does NOT respawn-loop when the feature is off — a clean idle.
+case "${SWITCHROOM_CHEAP_CRON:-}" in
+  1 | true | on | ON) : ;;
+  *)
+    echo "cron-session: SWITCHROOM_CHEAP_CRON off — not starting (exit 78, no respawn)" >&2
+    exit 78
+    ;;
+esac
+
+CRON_NAME="{{name}}-cron"
+CRON_CONFIG_DIR="{{agentDir}}/.claude-cron"
+MAIN_CONFIG_DIR="{{agentDir}}/.claude"
+# v1: reuse the agent's project .mcp.json. The switchroom-telegram BRIDGE reads
+# SWITCHROOM_AGENT_NAME from the process env (exported below) — NOT its .mcp.json
+# env block — so it registers as the cron identity even off the shared config.
+# The bigger wins (fresh context + the cheap model) already hold; trimming the
+# MCP surface to just switchroom-telegram is a documented canary-time follow-up.
+CRON_MCP_CONFIG="{{agentDir}}/.mcp.json"
+CRON_SOCKET="switchroom-${CRON_NAME}"
+
+mkdir -p "$CRON_CONFIG_DIR"
+
+# Share the broker-managed OAuth creds (same subscription) without sharing the
+# main session's transcript/settings. The broker is the sole writer of
+# .credentials.json into the MAIN config dir; symlink it so the cron session
+# authenticates with the same account and re-reads on refresh. Transcript
+# (projects/) stays separate → minimal, /clear-friendly context.
+if [ -e "$MAIN_CONFIG_DIR/.credentials.json" ]; then
+  ln -sfn "$MAIN_CONFIG_DIR/.credentials.json" "$CRON_CONFIG_DIR/.credentials.json"
+fi
+if [ -e "$MAIN_CONFIG_DIR/settings.json" ]; then
+  ln -sfn "$MAIN_CONFIG_DIR/settings.json" "$CRON_CONFIG_DIR/settings.json"
+fi
+
+# Distinct identity + config dir for the bridge that runs inside claude.
+export SWITCHROOM_AGENT_NAME="$CRON_NAME"
+export CLAUDE_CONFIG_DIR="$CRON_CONFIG_DIR"
+
+CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You handle scheduled tasks only. Do the task, reply once with the result, and keep it brief. You do not have {{name}}'s full memory or persona — if a task needs them, say so rather than guessing."
+
+# Launch the cron claude in its OWN tmux session/socket so it never contends
+# with the main session's pane. Interactive (no -p). --strict-mcp-config pins
+# it to the trimmed config (switchroom-telegram only). Fresh each boot (no
+# --continue) — minimal context by construction.
+exec tmux -L "$CRON_SOCKET" \
+  new-session -A -s "$CRON_NAME" -x 400 -y 50 \
+  claude \
+    --dangerously-load-development-channels server:switchroom-telegram \
+    --plugin-dir "{{securityPluginDir}}" \
+    --mcp-config "$CRON_MCP_CONFIG" \
+    --strict-mcp-config \
+    --model {{{cronModelQ}}} \
+    --append-system-prompt "$CRON_APPEND_PROMPT"{{#if dangerousMode}} \
+    --dangerously-skip-permissions{{/if}}
