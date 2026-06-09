@@ -274,6 +274,7 @@ export class AuthBroker {
   /** Periodic probe of consumer-pinned accounts → auto mark-exhausted. See
    *  consumer-quota-sensor.ts. Null when disabled or no consumers. */
   private consumerProbeTimer: NodeJS.Timeout | null = null;
+  private fleetProbeTimer: NodeJS.Timeout | null = null;
   /** Quota fetcher — injectable for tests via opts._testFetchQuota. */
   private fetchQuotaImpl: typeof fetchQuota;
   private stateDir: string;
@@ -440,6 +441,23 @@ export class AuthBroker {
         }, probeMs);
         this.consumerProbeTimer.unref();
       }
+
+      // Fleet quota probe: keep every account's 5h/7d snapshot warm so the
+      // dashboard shows live quota with no manual "Refresh all quota" click.
+      // Always armed when probing is enabled (not gated on consumers — the
+      // dashboard wants quota regardless). Run once at boot so data is there
+      // immediately. Disable with SWITCHROOM_DISABLE_FLEET_QUOTA_PROBE=1.
+      if (probeMs > 0 && process.env.SWITCHROOM_DISABLE_FLEET_QUOTA_PROBE !== "1") {
+        void this.fleetQuotaProbeTick().catch((err) => {
+          this.logErr(`fleet-quota-probe (boot) threw: ${(err as Error).message}`);
+        });
+        this.fleetProbeTimer = setInterval(() => {
+          this.fleetQuotaProbeTick().catch((err) => {
+            this.logErr(`fleet-quota-probe threw: ${(err as Error).message}`);
+          });
+        }, probeMs);
+        this.fleetProbeTimer.unref();
+      }
     }
 
     // Boot fanout — write per-agent .credentials.json mirrors for every
@@ -482,6 +500,10 @@ export class AuthBroker {
     if (this.consumerProbeTimer) {
       clearInterval(this.consumerProbeTimer);
       this.consumerProbeTimer = null;
+    }
+    if (this.fleetProbeTimer) {
+      clearInterval(this.fleetProbeTimer);
+      this.fleetProbeTimer = null;
     }
     for (const [sock, lis] of this.listeners) {
       try { lis.server.close(); } catch { /* ignore */ }
@@ -1176,22 +1198,51 @@ export class AuthBroker {
         // Cache the utilization snapshot for listState consumers (quota-watch
         // loop). Only update on success — a failed probe should not evict a
         // valid previous snapshot.
-        if (result.ok) {
-          this.lastQuotaCache[label] = {
-            fiveHourUtilizationPct: result.data.fiveHourUtilizationPct,
-            sevenDayUtilizationPct: result.data.sevenDayUtilizationPct,
-            fiveHourResetAt: result.data.fiveHourResetAt?.toISOString() ?? null,
-            sevenDayResetAt: result.data.sevenDayResetAt?.toISOString() ?? null,
-            representativeClaim: result.data.representativeClaim,
-            overageStatus: result.data.overageStatus,
-            overageDisabledReason: result.data.overageDisabledReason,
-            capturedAt: this.now(),
-          };
-        }
+        if (result.ok) this.cacheQuotaSnapshot(label, result);
         return { label, result };
       }),
     );
     socket.write(encodeSuccess(id, { results }));
+  }
+
+  /** Store a successful quota probe in the in-memory cache that `list-state`
+   *  (and thus the dashboard) reads. Shared by the explicit probe op and the
+   *  periodic fleet tick so the snapshot shape stays in one place. */
+  private cacheQuotaSnapshot(label: string, result: QuotaResult): void {
+    if (!result.ok) return;
+    this.lastQuotaCache[label] = {
+      fiveHourUtilizationPct: result.data.fiveHourUtilizationPct,
+      sevenDayUtilizationPct: result.data.sevenDayUtilizationPct,
+      fiveHourResetAt: result.data.fiveHourResetAt?.toISOString() ?? null,
+      sevenDayResetAt: result.data.sevenDayResetAt?.toISOString() ?? null,
+      representativeClaim: result.data.representativeClaim,
+      overageStatus: result.data.overageStatus,
+      overageDisabledReason: result.data.overageDisabledReason,
+      capturedAt: this.now(),
+    };
+  }
+
+  /**
+   * Periodic background probe of every account's 5h/7d quota, so the dashboard
+   * shows live utilization WITHOUT the operator clicking "Refresh all quota".
+   * Each probe is a 1-token Haiku call (fetchQuota) — negligible spend. Caches
+   * the snapshot for `list-state`; a failed probe is a no-op (keeps the prior
+   * snapshot). Never throws into the timer. Public for tests.
+   */
+  async fleetQuotaProbeTick(): Promise<void> {
+    for (const label of listAccounts(this.home)) {
+      const creds = readAccountCredentials(label, this.home);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (!token) continue;
+      let result: QuotaResult;
+      try {
+        result = await this.fetchQuotaImpl({ accessToken: token });
+      } catch (err) {
+        this.logErr(`fleet-quota-probe ${label}: ${(err as Error).message}`);
+        continue;
+      }
+      this.cacheQuotaSnapshot(label, result);
+    }
   }
 
   /**

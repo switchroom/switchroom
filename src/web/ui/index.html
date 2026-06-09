@@ -440,15 +440,20 @@
       return h;
     }
 
+    // Tolerate a single transient failure on the 10s auto-refresh: one blip
+    // (e.g. the web container restarting) shouldn't flash a scary error over a
+    // healthy dashboard. Only surface the error after two in a row.
+    let agentFetchFails = 0;
     async function fetchAgents() {
       try {
         const res = await fetch(`${API}/api/agents`, { headers: authHeaders() });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         agents = await res.json();
         render();
+        agentFetchFails = 0;
         clearError();
       } catch (err) {
-        showError(`Failed to fetch agents: ${err.message}`);
+        if (++agentFetchFails >= 2) showError(`Failed to fetch agents: ${err.message}`);
       }
     }
 
@@ -494,12 +499,18 @@
     }
 
     async function fetchConnections() {
+      // Each fetch falls back independently (.catch → default). A single
+      // network blip — e.g. one endpoint momentarily unreachable — must NOT
+      // reject the whole batch and blank the connected accounts; the others
+      // still render. (Previously a bare Promise.all meant any one failure
+      // wiped the tab, so a connected Google/Microsoft account "vanished".)
+      const safe = (p, fallback) => p.then(r => r.ok ? r.json() : fallback).catch(() => fallback);
       try {
         const [google, microsoft, notion, agents] = await Promise.all([
-          fetch(`${API}/api/google-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
-          fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
-          fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }).then(r => r.ok ? r.json() : { configured: false, databases: [] }),
-          fetch(`${API}/api/agents`, { headers: authHeaders() }).then(r => r.ok ? r.json() : []),
+          safe(fetch(`${API}/api/google-accounts`, { headers: authHeaders() }), []),
+          safe(fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }), []),
+          safe(fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }), { configured: false, databases: [] }),
+          safe(fetch(`${API}/api/agents`, { headers: authHeaders() }), []),
         ]);
         const agentNames = (agents || []).map(a => a.name).sort();
         renderConnections({ google, microsoft, notion, agentNames });

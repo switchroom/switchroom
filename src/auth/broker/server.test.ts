@@ -1628,6 +1628,71 @@ describe("AuthBroker — probe-quota", () => {
       broker.stop();
     }
   });
+
+  it("fleetQuotaProbeTick populates last_quota for ALL accounts with no explicit probe (dashboard always-fresh quota)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "secondary", { expiresAt: 9_999_999_999_999 });
+
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => ({ ok: true, data: {
+        fiveHourUtilizationPct: 33,
+        sevenDayUtilizationPct: 12,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        representativeClaim: null,
+        overageStatus: null,
+        overageDisabledReason: null,
+      } }),
+    });
+    const client = new AuthBrokerClient({ socket: join(h.socketRoot, "ziggy", "sock") });
+    try {
+      await broker.start();
+      // No probe-quota op called — just the background tick the timer would run.
+      await broker.fleetQuotaProbeTick();
+      const state = await client.listState();
+      for (const label of ["default", "secondary"]) {
+        const acct = state.accounts.find((a) => a.label === label);
+        expect(acct?.last_quota, `${label} should have cached quota`).not.toBeNull();
+        expect(acct?.last_quota?.fiveHourUtilizationPct).toBeCloseTo(33, 1);
+        expect(acct?.last_quota?.sevenDayUtilizationPct).toBeCloseTo(12, 1);
+      }
+    } finally {
+      await client.close();
+      broker.stop();
+    }
+  });
+
+  it("fleetQuotaProbeTick keeps a prior snapshot when a probe fails (no eviction)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", agents: { ziggy: {} } });
+    seedAccount(h, "default", { expiresAt: 9_999_999_999_999 });
+    let mode: "ok" | "fail" = "ok";
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => mode === "ok"
+        ? { ok: true, data: { fiveHourUtilizationPct: 50, sevenDayUtilizationPct: 20, fiveHourResetAt: null, sevenDayResetAt: null, representativeClaim: null, overageStatus: null, overageDisabledReason: null } }
+        : { ok: false, reason: "HTTP 503" },
+    });
+    const client = new AuthBrokerClient({ socket: join(h.socketRoot, "ziggy", "sock") });
+    try {
+      await broker.start();
+      await broker.fleetQuotaProbeTick(); // ok → cached
+      mode = "fail";
+      await broker.fleetQuotaProbeTick(); // fail → must NOT evict
+      const acct = (await client.listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.last_quota?.fiveHourUtilizationPct).toBeCloseTo(50, 1);
+    } finally {
+      await client.close();
+      broker.stop();
+    }
+  });
 });
 
 describe("AuthBroker — drift detection", () => {
