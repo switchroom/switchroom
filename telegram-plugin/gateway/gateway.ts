@@ -287,6 +287,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
+import { isCronIdentity, resolveInjectTarget } from './cron-session.js'
 import {
   ObligationLedger,
   buildObligationRepresentInbound,
@@ -5474,6 +5475,19 @@ const ipcServer: IpcServer = createIpcServer({
 
   onClientRegistered(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
+    // Cheap-cron (§2.4/§3.3): a `<agent>-cron` bridge is the Tier-1 cheap
+    // session. It is STATUS-SILENT — it must NOT drive the gateway's
+    // singleton machinery (shadow bridge-state, warmup, boot card, which all
+    // track the MAIN agent's liveness). Drain any buffered cron fire to it
+    // (so a fire that triggered a lazy spawn lands), then return early.
+    if (isCronIdentity(client.agentName)) {
+      client.send({ type: 'status', status: 'agent_connected' })
+      const pending = pendingInboundBuffer.drain(client.agentName ?? '')
+      for (const m of pending) {
+        try { client.send(m) } catch { /* cron fire drop — best-effort, like today's cron */ }
+      }
+      return
+    }
     // Phase 2b shadow: ONLY emit bridgeUp for the REAL bridge sidecar
     // (with an agent name). Anonymous IPC clients (recall.py, mcp
     // handshakes, etc.) connect briefly without a name and would
@@ -5722,7 +5736,13 @@ const ipcServer: IpcServer = createIpcServer({
     }
   },
 
-  onSessionEvent(_client: IpcClient, msg: SessionEventForward) {
+  onSessionEvent(client: IpcClient, msg: SessionEventForward) {
+    // Cheap-cron §2.4: the cron session is status-silent — its session
+    // events must not drive the main agent's progress card, transcript
+    // tail, currentTurn, or silence-poke. Its reply still flows (onToolCall
+    // is not gated). currentTurn was never set for a cron fire (onInjectInbound
+    // skips markClaudeBusy), so the card machinery has nothing to attach to.
+    if (isCronIdentity(client.agentName)) return
     // Track the session-tail's attached file for the proactive-
     // compaction occupancy read (see maybeProactiveCompact).
     if (msg.activeFile) lastSessionActiveFile = msg.activeFile
@@ -5954,7 +5974,10 @@ const ipcServer: IpcServer = createIpcServer({
    * `handlePtyPartial` does its own buffering for the
    * partial-before-enqueue race.
    */
-  onPtyPartial(_client: IpcClient, msg: PtyPartialForward) {
+  onPtyPartial(client: IpcClient, msg: PtyPartialForward) {
+    // Cheap-cron §2.4: cron session is status-silent — no visible reply
+    // stream from its PTY tail (it would edit a card the main session owns).
+    if (isCronIdentity(client.agentName)) return
     handlePtyPartial(msg.text)
   },
 
@@ -6291,16 +6314,28 @@ const ipcServer: IpcServer = createIpcServer({
     const source = typeof msg.inbound.meta?.source === 'string'
       ? msg.inbound.meta.source
       : 'unknown'
-    const delivered = ipcServer.sendToAgent(msg.agentName, msg.inbound)
-    if (delivered) markClaudeBusyForInbound(msg.inbound)
+    // Cheap-cron (docs/rfcs/cheap-cron-sessions.md §3.3): a Tier-1 fire
+    // carries meta.session='cron' → route to the derived `<agent>-cron`
+    // bridge (a 2nd interactive Sonnet session in the same container).
+    // Every other fire (and all of today's callers) routes to the agent
+    // unchanged. Route+buffer share the same target so a fire that lands
+    // mid cron-session-spawn buffers under the cron identity and drains to
+    // it on register.
+    const target = resolveInjectTarget(msg.agentName, msg.inbound.meta)
+    const toCron = target !== msg.agentName
+    const delivered = ipcServer.sendToAgent(target, msg.inbound)
+    // Status-silent (§2.4): a cron fire must NOT set the MAIN agent's
+    // currentTurn (progress card / silence-poke). The cron session is
+    // fire-and-forget; its reply is its only Telegram surface.
+    if (delivered && !toCron) markClaudeBusyForInbound(msg.inbound)
     process.stderr.write(
-      `telegram gateway: inject_inbound agent=${msg.agentName} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
+      `telegram gateway: inject_inbound agent=${msg.agentName} target=${target} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
     )
     // #1150: same buffer-on-failure pattern as vault_grant_approved.
     // Cron fires use this path too — if a cron-driven wake-up lands
     // mid bridge-reconnect, buffer it for the next register.
     if (!delivered) {
-      pendingInboundBuffer.push(msg.agentName, msg.inbound)
+      pendingInboundBuffer.push(target, msg.inbound)
     }
   },
 
