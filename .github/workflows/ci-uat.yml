@@ -54,9 +54,10 @@ on:
       - "telegram-plugin/uat/**"
       - "vitest.uat.config.ts"
       - ".github/workflows/ci-uat.yml"
-  schedule:
-    # Nightly thorough fuzz pass (the uat-fuzz job below is schedule/dispatch-only).
-    - cron: "41 4 * * *"
+  # No `schedule:` — the nightly fuzz cron was removed (2026-06-09): each fuzz
+  # scenario is a real claude turn on the subscription, and an automatic nightly
+  # pass burns quota that competes with the live fleet. The thorough fuzz pool is
+  # now workflow_dispatch-ONLY (run it deliberately during a UAT pass).
   workflow_dispatch:
 
 permissions:
