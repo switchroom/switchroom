@@ -326,3 +326,88 @@ describe("ObligationLedger — escalate-grace window (over-escalation fix)", () 
     expect(L.decideAtIdle({ now: 142000, graceMs: 45000 }).action).toBe("escalate");
   });
 });
+
+describe("ObligationLedger — background-work grace (extended-autonomous fix, gymbro 2026-06-10)", () => {
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text: "research liven", openedAt };
+  }
+  // 20-min ceiling, mirroring OBLIGATION_BACKGROUND_WORK_GRACE_MS default.
+  const CEIL = 20 * 60_000;
+
+  it("skips an obligation younger than the ceiling while background work is active", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000)); // opened at t=1000
+    // 5 min later, a worker is running → genuine work in flight → wait.
+    expect(
+      L.decideAtIdle({ now: 1000 + 5 * 60_000, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: CEIL }).action,
+    ).toBe("none");
+  });
+
+  it("acts once the obligation crosses the ceiling EVEN IF work is still active (bounded — no silent drop)", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    // 20m + 1s after openedAt, still flagged active → ceiling wins → act.
+    expect(
+      L.decideAtIdle({ now: 1000 + CEIL + 1000, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: CEIL }).action,
+    ).toBe("represent");
+  });
+
+  it("backgroundWorkActive=false → no extra grace (pre-fix behaviour on this axis)", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000)); // still-queued, no turn end
+    expect(
+      L.decideAtIdle({ now: 2000, graceMs: 45000, backgroundWorkActive: false, backgroundGraceMs: CEIL }).action,
+    ).toBe("represent");
+  });
+
+  it("backgroundGraceMs=0 (kill switch) → work signal ignored, acts immediately", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    expect(
+      L.decideAtIdle({ now: 2000, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: 0 }).action,
+    ).toBe("represent");
+  });
+
+  it("composes with the trailing-answer grace: both must clear before acting", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteTurnEnded("c:3#1", 5000);
+    // turn-end grace cleared (60s later) but within bg ceiling + work active → still wait.
+    expect(
+      L.decideAtIdle({ now: 65000, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: CEIL }).action,
+    ).toBe("none");
+    // same instant, work no longer active → trailing grace already clear → act.
+    expect(
+      L.decideAtIdle({ now: 65000, graceMs: 45000, backgroundWorkActive: false, backgroundGraceMs: CEIL }).action,
+    ).toBe("represent");
+  });
+
+  it("picks the oldest ELIGIBLE: a young in-work obligation does not block an ancient one past the ceiling", () => {
+    const L = new ObligationLedger();
+    L.openIfAbsent(input("c:3#old", 1000)); // ancient
+    L.openIfAbsent(input("c:3#new", 1000 + CEIL)); // opened CEIL later
+    const now = 1000 + CEIL + 5000; // old is past ceiling; new is only 5s old
+    const d = L.decideAtIdle({ now, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: CEIL });
+    expect(d.action).toBe("represent");
+    expect(d.obligation?.originTurnId).toBe("c:3#old");
+  });
+
+  it("represent budget is preserved across the work window → resumes (not escalates) after a restart-kill", () => {
+    // Models the gymbro case: while the worker runs, the sweep must NOT burn the
+    // represent ladder. So after a restart kills the work (work now inactive),
+    // a never-represented obligation re-presents (resume) rather than escalates.
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    // During the work window, every sweep is a no-op (no markRepresented called).
+    for (const t of [60_000, 120_000, 300_000]) {
+      expect(
+        L.decideAtIdle({ now: t, graceMs: 45000, backgroundWorkActive: true, backgroundGraceMs: CEIL }).action,
+      ).toBe("none");
+    }
+    expect(L.list()[0].representCount).toBe(0); // budget intact
+    // Restart kills the work; obligation hydrated with representCount 0 → resume.
+    expect(
+      L.decideAtIdle({ now: 360_000, graceMs: 45000, backgroundWorkActive: false, backgroundGraceMs: CEIL }).action,
+    ).toBe("represent");
+  });
+});

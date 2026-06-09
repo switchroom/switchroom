@@ -89,7 +89,13 @@ interface Sim {
   steps: number;
 }
 
-function runSchedule(msgs: Msg[], seed: number, graceMs = 0): Sim {
+function runSchedule(
+  msgs: Msg[],
+  seed: number,
+  graceMs = 0,
+  bgGraceMs = 0,
+  bgAlwaysActive = false,
+): Sim {
   const PATH = "/state/agent/telegram/obligations.json";
   const store = memStore();
   let ledger = new ObligationLedger(MAX_REPRESENTS, {
@@ -148,12 +154,23 @@ function runSchedule(msgs: Msg[], seed: number, graceMs = 0): Sim {
         threadId: 3,
         messageId: m.msgId,
         text: `msg ${m.id}`,
-        openedAt: 1000 + steps,
+        // When the background-work ceiling is exercised it is measured from
+        // openedAt against `clock`, so openedAt must live on the same virtual
+        // clock (the legacy proofs keep the tiny 1000+steps value — they never
+        // read openedAt against `now`).
+        openedAt: bgGraceMs > 0 ? clock : 1000 + steps,
       });
       deliverTurn(m.id); // original turn (attempt 0)
     } else if (open) {
       const decision =
-        graceMs > 0 ? ledger.decideAtIdle({ now: clock, graceMs }) : ledger.decideAtIdle();
+        graceMs > 0 || bgGraceMs > 0
+          ? ledger.decideAtIdle({
+              now: clock,
+              graceMs,
+              backgroundWorkActive: bgGraceMs > 0 && bgAlwaysActive,
+              backgroundGraceMs: bgGraceMs,
+            })
+          : ledger.decideAtIdle();
       if (decision.action === "none") {
         // Every open obligation is within its grace window — the sweep waits.
         // Advance the clock so grace deterministically expires; no livelock.
@@ -269,6 +286,49 @@ describe("obligation determinism — every inbound reaches a terminal, no silent
       for (const m of msgs) {
         const t = terminals.get(m.id);
         expect(t, `grace seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
+        if (m.answerOnAttempt <= MAX_REPRESENTS) {
+          expect(t).toBe("answered");
+        } else if (m.escalateFailsFor < ESCALATE_MAX) {
+          expect(t).toBe("escalation-delivered");
+        } else {
+          expect(t).toBe("escalation-give-up");
+        }
+      }
+    }
+  });
+
+  it("holds across 3000 schedules WITH background-work grace PERPETUALLY active (ceiling forces a terminal, never prevents one)", () => {
+    // The hardest case for the new bound: the agent appears to be doing
+    // autonomous sub-agent work for the ENTIRE run (backgroundWorkActive never
+    // clears). The ledger must still drive every obligation to its correct
+    // terminal — proving the OBLIGATION_BACKGROUND_WORK_GRACE_MS ceiling makes
+    // the suppression bounded BY CONSTRUCTION (no livelock, no silent loss), and
+    // that, like the trailing-answer grace, it only DELAYS: the terminal each
+    // message reaches is IDENTICAL to the no-grace run. If always-on terminates
+    // correctly, every intermittent work pattern does too (strictly less
+    // suppression).
+    const ANSWER = [0, 1, 2, 3, 99];
+    const ESCFAIL = [0, 1, 2, 3, 5];
+    const GRACE_MS = 45_000;
+    const BG_CEIL_MS = 20 * 60_000; // mirrors OBLIGATION_BACKGROUND_WORK_GRACE_MS default
+    for (let seed = 1; seed <= 3000; seed++) {
+      const r = rng(seed * 7919);
+      const n = 1 + Math.floor(r() * 5);
+      const msgs: Msg[] = [];
+      for (let i = 0; i < n; i++) {
+        const msgId = seed * 100 + i;
+        msgs.push({
+          id: `c:3#${msgId}`,
+          msgId,
+          answerOnAttempt: pick(ANSWER, r),
+          escalateFailsFor: pick(ESCFAIL, r),
+        });
+      }
+      const { terminals, steps } = runSchedule(msgs, seed * 104729, GRACE_MS, BG_CEIL_MS, true);
+      expect(steps).toBeLessThan(10_000); // ceiling forces progress — no bg-grace livelock
+      for (const m of msgs) {
+        const t = terminals.get(m.id);
+        expect(t, `bg seed=${seed} msg=${m.id} answer=${m.answerOnAttempt} escFail=${m.escalateFailsFor}`).toBeDefined();
         if (m.answerOnAttempt <= MAX_REPRESENTS) {
           expect(t).toBe("answered");
         } else if (m.escalateFailsFor < ESCALATE_MAX) {

@@ -429,6 +429,7 @@ import {
   touchTurnActiveMarker,
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
+  readTurnActiveMarkerAgeMs,
   TURN_ACTIVE_MARKER_FILE,
 } from './turn-active-marker.js'
 import {
@@ -1467,6 +1468,34 @@ const OBLIGATION_ESCALATE_GRACE_MS = (() => {
   const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? n : 45_000
 })()
+
+// Background-work escalate-grace ceiling. The 45s grace above is far too short
+// for extended-autonomous sub-agent work: an agent that ack-firsts ("on it")
+// then delegates to a background worker OR an orphaned foreground sub-agent ends
+// its FOREGROUND turn in seconds, but the real answer lands minutes later. The
+// turn-in-flight machine (turn already ended) doesn't see that work, so the
+// sweep would re-present/escalate a false "⚠️ I may have missed this — re-send"
+// while the agent is genuinely researching (the gymbro liven-research case,
+// 2026-06-10). While `agentHasInFlightBackgroundWork()` holds, an open
+// obligation younger than THIS ceiling (from openedAt) is skipped. Bounded BY
+// CONSTRUCTION — a hard wall-clock ceiling, so even a stuck/leaked worker can't
+// suppress escalation forever; the obligation FSM still terminates. This also
+// preserves the represent budget across a restart that kills the work: with the
+// false represents suppressed, the hydrated obligation re-presents (resumes the
+// research) instead of prematurely escalating. Kill switch: =0 → pre-fix
+// behaviour (no background-work grace).
+const OBLIGATION_BACKGROUND_WORK_GRACE_MS = (() => {
+  const raw = process.env.SWITCHROOM_OBLIGATION_BACKGROUND_WORK_GRACE_MS
+  if (raw == null || raw === '') return 20 * 60_000 // 20 min — generous for real research, still bounded
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 20 * 60_000
+})()
+// Marker-freshness window for the orphaned-foreground signal. The turn-active
+// marker is touched on every foreground tool_use and on foreground sub-agent
+// JSONL growth, so an mtime younger than this means a sub-agent is touching it
+// RIGHT NOW; older ⇒ the work stopped (or the marker leaked) ⇒ not active.
+// Comfortably exceeds the sub-agent poll cadence so it doesn't flap.
+const TURN_ACTIVE_MARKER_FRESH_MS = 90_000
 
 // ─── Mid-turn auto-classify (steer-vs-queue), SHADOW mode ─────────────────────
 // Today a no-prefix mid-turn message always QUEUES. autoClassifyMidTurnInbound
@@ -5324,24 +5353,72 @@ const pendingInboundBuffer = createPendingInboundBuffer({ spool: inboundSpool })
 //       disconnect (disconnect-flush.ts), and by the 300s silence-poke watchdog;
 //   (3) the escalation send settles — bounded BY CONSTRUCTION via withDeadline
 //       below (grammy has no request timeout, so an unbounded send was the one
-//       way an obligation could get stuck OPEN forever — now closed).
+//       way an obligation could get stuck OPEN forever — now closed);
+//   (4) the background-work grace releases — an obligation skipped because
+//       agentHasInFlightBackgroundWork() is true is bounded by
+//       OBLIGATION_BACKGROUND_WORK_GRACE_MS (a hard wall-clock ceiling from
+//       openedAt). Even a permanently-stuck/leaked worker signal cannot suppress
+//       the act past the ceiling, so this adds NO unbounded liveness dependency:
+//       decideAtIdle ignores the work signal once now ≥ openedAt + ceiling, μ
+//       resumes decreasing, and termination still holds.
 // The only residual liveness assumption is the bridge eventually reconnecting /
 // the process restarting, which the entire gateway's inbound delivery already
 // depends on and which durable spool + boot-replay make self-healing.
+// True when the agent has in-flight autonomous sub-agent work the turn-in-flight
+// gate does NOT see: a running background worker (countRunningWorkers — its row
+// is INSERTed status='running' at dispatch, before the parent turn ends), OR an
+// orphaned/extended-autonomous FOREGROUND sub-agent that outlived its turn and is
+// still touching the turn-active marker (#2240; background activity deliberately
+// does NOT touch the parent marker, so the two signals are complementary).
+// Used ONLY by the obligation sweep to bound a false escalation during genuine
+// post-turn work. The caller already established the turn machine is idle (the
+// `turnInFlightForGate()` early-return), so a fresh marker here means orphaned
+// sub-agent activity (or a just-ended turn within the freshness window — a
+// harmless small extra grace, bounded by the ceiling either way).
+function agentHasInFlightBackgroundWork(now: number): boolean {
+  if (countRunningWorkers() > 0) return true
+  const ageMs = readTurnActiveMarkerAgeMs(STATE_DIR, now)
+  return ageMs != null && ageMs < TURN_ACTIVE_MARKER_FRESH_MS
+}
+// Throttle for the background-work defer diagnostic (the 5s sweep would otherwise
+// log every tick across a multi-minute research window).
+let lastBgWorkDeferLogMs = 0
 function obligationSweep(): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
   if (!obligationLedger.hasOpen()) return
   if (turnInFlightForGate()) return // a turn is running — let it finish/answer
   const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  const now = Date.now()
+  // Background-work grace: while genuine autonomous sub-agent work is in flight
+  // (a running worker, or an orphaned foreground sub-agent — neither visible to
+  // the turn machine), an obligation younger than the ceiling is NOT re-presented
+  // /escalated. Bounded by OBLIGATION_BACKGROUND_WORK_GRACE_MS so escalation
+  // always eventually fires. =0 disables it.
+  const backgroundWorkActive =
+    OBLIGATION_BACKGROUND_WORK_GRACE_MS > 0 && agentHasInFlightBackgroundWork(now)
   // Grace window: skip an obligation whose handling turn ended < grace ago — its
   // trailing slow/worker answer may still be landing (over-escalation fix).
   const decision = obligationLedger.decideAtIdle(
-    OBLIGATION_ESCALATE_GRACE_MS > 0
-      ? { now: Date.now(), graceMs: OBLIGATION_ESCALATE_GRACE_MS }
+    OBLIGATION_ESCALATE_GRACE_MS > 0 || backgroundWorkActive
+      ? {
+          now,
+          graceMs: OBLIGATION_ESCALATE_GRACE_MS,
+          backgroundWorkActive,
+          backgroundGraceMs: OBLIGATION_BACKGROUND_WORK_GRACE_MS,
+        }
       : undefined,
   )
   const o = decision.obligation
-  if (decision.action === 'none' || o == null) return
+  if (decision.action === 'none' || o == null) {
+    if (backgroundWorkActive && obligationLedger.hasOpen() && now - lastBgWorkDeferLogMs > 60_000) {
+      lastBgWorkDeferLogMs = now
+      process.stderr.write(
+        `telegram gateway: obligation sweep deferred — in-flight autonomous sub-agent work ` +
+          `(${obligationLedger.size()} open, bounded ${Math.round(OBLIGATION_BACKGROUND_WORK_GRACE_MS / 60_000)}m from receipt)\n`,
+      )
+    }
+    return
+  }
   if (decision.action === 'represent') {
     // Re-present goes through the bridge → buffer. Only the represent path is
     // gated on an empty buffer (let the existing drain run first, avoid

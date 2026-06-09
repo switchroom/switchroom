@@ -14,6 +14,7 @@ import {
   touchTurnActiveMarker,
   removeTurnActiveMarker,
   sweepStaleTurnActiveMarker,
+  readTurnActiveMarkerAgeMs,
 } from '../gateway/turn-active-marker.js'
 
 describe('turn-active-marker (#412)', () => {
@@ -191,5 +192,32 @@ describe('turn-active-marker (#412)', () => {
     const path = join(tmp, TURN_ACTIVE_MARKER_FILE)
     const mode = statSync(path).mode & 0o777
     expect(mode).toBe(0o600)
+  })
+
+  // readTurnActiveMarkerAgeMs — the orphaned-foreground "agent still working"
+  // signal for the obligation sweep (#2240 / gymbro 2026-06-10).
+  it('readTurnActiveMarkerAgeMs returns null when the marker is absent', () => {
+    expect(readTurnActiveMarkerAgeMs(tmp)).toBeNull()
+  })
+
+  it('readTurnActiveMarkerAgeMs returns a small age for a fresh marker', () => {
+    writeTurnActiveMarker(tmp, { turnKey: 'k', chatId: 'c', threadId: null, startedAt: 1 })
+    const age = readTurnActiveMarkerAgeMs(tmp)
+    expect(age).not.toBeNull()
+    // |age| is tiny for a just-written marker. It can be a hair negative when the
+    // filesystem mtime resolves slightly ahead of Date.now() — that's fine; what
+    // matters for the freshness signal is the small magnitude.
+    expect(Math.abs(age!)).toBeLessThan(5_000)
+  })
+
+  it('readTurnActiveMarkerAgeMs reflects a stale (back-dated) mtime against an injected clock', () => {
+    const path = join(tmp, TURN_ACTIVE_MARKER_FILE)
+    writeTurnActiveMarker(tmp, { turnKey: 'k', chatId: 'c', threadId: null, startedAt: 1 })
+    const tenMinAgo = new Date(Date.now() - 10 * 60_000)
+    utimesSync(path, tenMinAgo, tenMinAgo)
+    const now = tenMinAgo.getTime() + 10 * 60_000
+    const age = readTurnActiveMarkerAgeMs(tmp, now)
+    expect(age).not.toBeNull()
+    expect(Math.abs(age! - 10 * 60_000)).toBeLessThan(50) // ~10 min old
   })
 })

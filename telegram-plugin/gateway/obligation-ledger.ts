@@ -187,22 +187,61 @@ export class ObligationLedger {
    * genuinely-stale one is still acted on while a freshly-ended one waits. Pure
    * (clock injected via opts.now, mirroring the builder convention). With no opts
    * (or graceMs<=0) this is the pre-grace behaviour exactly.
+   *
+   * BACKGROUND-WORK GRACE (opts.backgroundWorkActive): the 45s `graceMs` above is
+   * far too short for extended-autonomous sub-agent work — an agent that
+   * ack-firsts ("on it") then delegates to a background worker or an orphaned
+   * foreground sub-agent ends its FOREGROUND turn in seconds, but the real answer
+   * lands minutes later. The in-flight machine (turn already ended) does not see
+   * that work, so the sweep would re-present/escalate a false "did I miss this?
+   * re-send" while the agent is genuinely researching (the gymbro liven case,
+   * 2026-06-10). When the gateway reports `backgroundWorkActive` (a running worker
+   * or a freshly-touched turn-active marker), an obligation younger than
+   * `backgroundGraceMs` (measured from openedAt) is SKIPPED. Bounded BY
+   * CONSTRUCTION: `backgroundGraceMs` is a hard wall-clock ceiling, so even a
+   * pathologically-stuck/leaked worker cannot suppress the escalation forever —
+   * once openedAt+backgroundGraceMs passes, the obligation is acted on regardless
+   * of work state, and the FSM still terminates.
    */
-  decideAtIdle(opts?: { now: number; graceMs: number }): LedgerDecision {
-    const o =
-      opts != null && opts.graceMs > 0 ? this.oldestEligible(opts.now, opts.graceMs) : this.oldest()
+  decideAtIdle(opts?: {
+    now: number
+    graceMs: number
+    backgroundWorkActive?: boolean
+    backgroundGraceMs?: number
+  }): LedgerDecision {
+    const useEligible = opts != null && (opts.graceMs > 0 || opts.backgroundWorkActive === true)
+    const o = useEligible
+      ? this.oldestEligible(
+          opts!.now,
+          opts!.graceMs,
+          opts!.backgroundWorkActive === true,
+          opts!.backgroundGraceMs ?? 0,
+        )
+      : this.oldest()
     if (o === undefined) return { action: 'none' }
     if (o.representCount >= this.maxRepresents) return { action: 'escalate', obligation: o }
     return { action: 'represent', obligation: o }
   }
 
-  /** The oldest open obligation whose handling turn ended at least `graceMs` ago
-   *  (or never ended — a still-queued obligation has no lastTurnEndedAt and is
-   *  always eligible; it can't have a trailing answer in flight). */
-  private oldestEligible(now: number, graceMs: number): Obligation | undefined {
+  /** The oldest open obligation that is currently ELIGIBLE to act on — i.e. NOT
+   *  within either grace window:
+   *   - trailing-answer grace: its handling turn ended < `graceMs` ago (a queued
+   *     obligation with no lastTurnEndedAt can't have a trailing answer, so it is
+   *     always eligible on this axis); AND
+   *   - background-work grace: when `backgroundWorkActive`, it was opened <
+   *     `backgroundGraceMs` ago (genuine in-flight autonomous work — bounded by
+   *     the ceiling so a stale/leaked worker can't suppress escalation forever). */
+  private oldestEligible(
+    now: number,
+    graceMs: number,
+    backgroundWorkActive: boolean,
+    backgroundGraceMs: number,
+  ): Obligation | undefined {
     let best: Obligation | undefined
     for (const o of this.open.values()) {
-      if (o.lastTurnEndedAt != null && now - o.lastTurnEndedAt < graceMs) continue // within grace
+      if (o.lastTurnEndedAt != null && now - o.lastTurnEndedAt < graceMs) continue // trailing-answer grace
+      if (backgroundWorkActive && backgroundGraceMs > 0 && now - o.openedAt < backgroundGraceMs)
+        continue // in-flight autonomous work, bounded by the ceiling
       if (best === undefined || o.openedAt < best.openedAt) best = o
     }
     return best
