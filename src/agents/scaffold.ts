@@ -383,6 +383,29 @@ export function renderFleetInvariants(): string {
 }
 
 import { DEFAULT_PROFILE } from "../config/schema.js";
+import { DEFAULT_CRON_MODEL, scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
+
+/**
+ * Cheap-cron (L4) start.sh context. `cronSessionEnabled` is purely
+ * config-derived — true iff the agent has a Tier-1 (context:fresh) cron
+ * entry — so the start.sh fork block renders EMPTY for every current fleet
+ * agent (none have that brand-new field), keeping their boot byte-identical.
+ * The runtime SWITCHROOM_CHEAP_CRON flag self-gates inside cron-session.sh.
+ */
+function buildCronSessionContext(agentConfig: AgentConfig): {
+  cronSessionEnabled: boolean;
+  cronModelQ: string;
+} {
+  const entries = (agentConfig.schedule ?? []).map((e) => ({
+    kind: e.kind,
+    model: e.model,
+    context: e.context,
+  }));
+  return {
+    cronSessionEnabled: scheduleNeedsCronSession(entries, { cheapCronEnabled: true }),
+    cronModelQ: shellSingleQuote(DEFAULT_CRON_MODEL),
+  };
+}
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -2179,6 +2202,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // {{#if hostHomeQ}} guard renders the symlink block as a no-op.
     hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
     modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+    ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
     permissionMode: agentConfig.permission_mode,
     fallbackModelQ: agentConfig.fallback_model
@@ -2820,6 +2844,21 @@ export function scaffoldAgent(
   // Make start.sh executable
   if (existsSync(join(agentDir, "start.sh"))) {
     chmodSync(join(agentDir, "start.sh"), 0o700);
+  }
+
+  // Cheap-cron (L4): render the Tier-1 cron-session launcher ONLY when this
+  // agent has a context:fresh entry. No current fleet agent does, so this is
+  // skipped fleet-wide — and the start.sh fork that runs it is empty too.
+  if (context.cronSessionEnabled) {
+    writeIfChanged(
+      join(agentDir, "cron-session.sh"),
+      () => renderTemplate(join(basePath, "cron-session.sh.hbs"), context),
+      created,
+      skipped,
+    );
+    if (existsSync(join(agentDir, "cron-session.sh"))) {
+      chmodSync(join(agentDir, "cron-session.sh"), 0o700);
+    }
   }
 
   writeIfMissing(
@@ -4691,6 +4730,7 @@ export function reconcileAgent(
       // $HOME/.switchroom symlink in start.sh's docker preamble.
       hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
       modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+      ...buildCronSessionContext(agentConfig),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
       fallbackModelQ: agentConfig.fallback_model
@@ -4759,6 +4799,19 @@ export function reconcileAgent(
       writeFileSync(startShPath, afterStartSh, "utf-8");
       chmodSync(startShPath, 0o755);
       changes.push(startShPath);
+    }
+
+    // Cheap-cron (L4): keep the cron-session launcher in sync on reconcile,
+    // only for agents with a context:fresh entry (none in the fleet today).
+    if (startShContext.cronSessionEnabled) {
+      const cronShPath = join(agentDir, "cron-session.sh");
+      const beforeCronSh = existsSync(cronShPath) ? readFileSync(cronShPath, "utf-8") : "";
+      const afterCronSh = renderTemplate(join(basePath, "cron-session.sh.hbs"), startShContext);
+      if (afterCronSh !== beforeCronSh) {
+        writeFileSync(cronShPath, afterCronSh, "utf-8");
+        chmodSync(cronShPath, 0o755);
+        changes.push(cronShPath);
+      }
     }
   }
 

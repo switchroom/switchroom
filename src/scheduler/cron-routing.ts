@@ -125,3 +125,21 @@ export function resolveEscalationRouting(
 ): CronRouting {
   return resolveCronRouting({ ...input, kind: "prompt" }, opts);
 }
+
+/**
+ * Does this agent's schedule need a Tier-1 cron SESSION spawned? True iff
+ * cheap-cron is on AND ≥1 entry routes (or escalates) to the cron session
+ * (`session: 'cron'`). An agent with only Tier-0 polls that escalate-to-main,
+ * or only Tier-2 entries, needs NO second session — so start.sh / compose
+ * only pay for the cron session where it's actually used (L4).
+ */
+export function scheduleNeedsCronSession(
+  entries: CronRoutingInput[],
+  opts: { cheapCronEnabled: boolean },
+): boolean {
+  if (!opts.cheapCronEnabled) return false;
+  return entries.some((e) => {
+    const r = e.kind === "poll" ? resolveEscalationRouting(e, opts) : resolveCronRouting(e, opts);
+    return r.session === "cron";
+  });
+}
