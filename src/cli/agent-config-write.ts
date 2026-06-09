@@ -60,6 +60,12 @@ import {
   type PendingReasonCode,
 } from "./agent-config-pending.js";
 import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  formatScheduleReport,
+  parseScheduleJsonl,
+  summarizeScheduleReport,
+} from "../scheduler/schedule-report.js";
 import { buildEnvelope, type ErrorEnvelope } from "../host-control/protocol.js";
 
 const MAX_ENTRIES_PER_AGENT = 20;
@@ -842,6 +848,49 @@ export function registerAgentConfigWriteCommands(program: Command): void {
         restart_hint: r.restart_hint,
       }) + "\n");
       appendAudit(resolvedAgent, "schedule.remove", { ...opts, slug: r.slug }, 0);
+    });
+
+  schedule
+    .command("report [agent]")
+    .description("Cheap-cron cost breakdown from the agent's scheduler.jsonl (Tier 0/1/2 fire counts)")
+    .option("--jsonl <path>", "Read a local scheduler.jsonl instead of docker-exec into the container")
+    .option("--since <iso>", "Only count fires at/after this ISO timestamp")
+    .option("--json", "Emit the summary as JSON")
+    .action((agentArg: string | undefined, opts: { jsonl?: string; since?: string; json?: boolean }) => {
+      const agent = agentArg ?? process.env.SWITCHROOM_AGENT_NAME;
+      if (!agent) {
+        process.stderr.write("schedule report: pass an agent name (or set $SWITCHROOM_AGENT_NAME)\n");
+        process.exit(2);
+      }
+      let blob: string;
+      if (opts.jsonl) {
+        blob = existsSync(opts.jsonl) ? readFileSync(opts.jsonl, "utf-8") : "";
+      } else {
+        try {
+          // Mirrors the inspection pattern used elsewhere: read in-container state.
+          blob = execFileSync("docker", ["exec", `switchroom-${agent}`, "cat", "/state/agent/scheduler.jsonl"], {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+        } catch {
+          process.stderr.write(
+            `schedule report: could not read scheduler.jsonl from container switchroom-${agent} ` +
+            `(is it running? try --jsonl <path>)\n`,
+          );
+          process.exit(1);
+        }
+      }
+      const sinceMs = opts.since ? Date.parse(opts.since) : undefined;
+      if (opts.since && Number.isNaN(sinceMs)) {
+        process.stderr.write(`schedule report: invalid --since '${opts.since}'\n`);
+        process.exit(2);
+      }
+      const summary = summarizeScheduleReport(parseScheduleJsonl(blob), sinceMs ? { sinceMs } : {});
+      if (opts.json) {
+        process.stdout.write(JSON.stringify({ agent, ...summary }) + "\n");
+      } else {
+        process.stdout.write(formatScheduleReport(agent, summary) + "\n");
+      }
     });
 }
 
