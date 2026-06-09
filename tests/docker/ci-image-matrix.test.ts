@@ -32,6 +32,10 @@ const DOCKER_MATRIX_OPT_OUT: Record<string, string> = {
   // dependent via BASE_IMAGE — it doesn't ship as a separate
   // switchroom-* tag.
   base: "built as build-base; consumed via BASE_IMAGE arg",
+  // uat-runner is the sandboxed self-hosted UAT host image (#2236); it is
+  // built/consumed by the UAT CI workflow, not published as a per-version
+  // fleet GHCR tag, so it is intentionally outside the docker-images matrix.
+  "uat-runner": "CI-only sandboxed UAT host runner (#2236); not a published fleet image",
 };
 
 function dockerfileNames(): string[] {
