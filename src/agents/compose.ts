@@ -27,6 +27,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
+import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { isReservedAgentName } from "../vault/broker/peercred.js";
@@ -128,10 +129,35 @@ export interface ResourceOverrides {
  * profile's `cpus` and any default `memReservation` / `pidsLimit`.
  * This matches the schema description for the `resources` field.
  */
+/**
+ * Cheap-cron (L4 refinement): headroom for the second (cron) claude session.
+ * Applied ONLY to agents that actually run one (a context:fresh / cheap-model
+ * cron entry — none in the fleet today), and ONLY where the operator hasn't
+ * pinned an explicit value (we never override an explicit sizing). RFC §4.
+ */
+const CRON_SESSION_MEM_BUMP_MIB = 512;
+const CRON_SESSION_PIDS_BUMP = 128;
+
+/** Parse a docker mem string ("1.5g", "256m", "512") to MiB; null if unparseable. */
+export function parseMemToMib(s: string): number | null {
+  const m = /^(\d+(?:\.\d+)?)\s*([gmk]?)b?$/i.exec(s.trim());
+  if (!m) return null;
+  const n = parseFloat(m[1]!);
+  const unit = (m[2] || "m").toLowerCase();
+  const mult = unit === "g" ? 1024 : unit === "k" ? 1 / 1024 : 1;
+  return Math.round(n * mult);
+}
+
+function bumpMem(s: string, addMib: number): string {
+  const mib = parseMemToMib(s);
+  return mib == null ? s : `${mib + addMib}m`;
+}
+
 export function resolveResourceDefaults(
   agentName: string,
   profile: string | undefined,
   overrides?: ResourceOverrides | undefined,
+  opts?: { cronSession?: boolean },
 ): ResourceDefaults {
   let base: ResourceDefaults;
   if (agentName === "klanker") {
@@ -141,15 +167,25 @@ export function resolveResourceDefaults(
   } else {
     base = RESOURCE_BY_PROFILE.default!;
   }
-  if (!overrides) return { ...base };
   const merged: ResourceDefaults = { ...base };
-  if (overrides.memory !== undefined) merged.memLimit = overrides.memory;
-  if (overrides.cpus !== undefined) merged.cpus = overrides.cpus;
-  if (overrides.memory_reservation !== undefined) {
-    merged.memReservation = overrides.memory_reservation;
+  if (overrides) {
+    if (overrides.memory !== undefined) merged.memLimit = overrides.memory;
+    if (overrides.cpus !== undefined) merged.cpus = overrides.cpus;
+    if (overrides.memory_reservation !== undefined) {
+      merged.memReservation = overrides.memory_reservation;
+    }
+    if (overrides.pids_limit !== undefined) {
+      merged.pidsLimit = overrides.pids_limit;
+    }
   }
-  if (overrides.pids_limit !== undefined) {
-    merged.pidsLimit = overrides.pids_limit;
+  // Cron-session headroom — only when the operator left the field to defaults.
+  if (opts?.cronSession) {
+    if (overrides?.memory === undefined) {
+      merged.memLimit = bumpMem(merged.memLimit, CRON_SESSION_MEM_BUMP_MIB);
+    }
+    if (overrides?.pids_limit === undefined && merged.pidsLimit !== undefined) {
+      merged.pidsLimit = merged.pidsLimit + CRON_SESSION_PIDS_BUMP;
+    }
   }
   return merged;
 }
@@ -464,7 +500,14 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
     // `resolved.resources` is the cascaded operator override (per-field
     // merge of defaults.resources → profile.resources → agent.resources,
     // see mergeAgentConfig). Unset fields fall back to RESOURCE_BY_PROFILE.
-    const resources = resolveResourceDefaults(name, profile, resolved.resources);
+    // Cheap-cron (L4 refinement): give cron-session agents a little headroom
+    // for the 2nd claude. Config-derived (a context:fresh/cheap-model entry) —
+    // false for every current fleet agent, so resources are unchanged today.
+    const cronSession = scheduleNeedsCronSession(
+      (resolved.schedule ?? []).map((e) => ({ kind: e.kind, model: e.model, context: e.context })),
+      { cheapCronEnabled: true },
+    );
+    const resources = resolveResourceDefaults(name, profile, resolved.resources, { cronSession });
     const strippedCaps = readStrippedCaps(agent);
     out.push({
       name,

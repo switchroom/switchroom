@@ -79,9 +79,13 @@ describe("cron-session.sh launcher — compliance + identity", () => {
     expect(out).toContain(".claude-cron");
   });
 
-  it("runs at the cheap cron model with strict mcp config", () => {
+  it("runs at the cheap cron model with the TRIMMED mcp config", () => {
     expect(out).toContain("--model 'claude-sonnet-4-6'");
     expect(out).toContain("--strict-mcp-config");
+    // points at the trimmed cron config (switchroom-telegram only), with a
+    // fallback to the full config for older scaffolds.
+    expect(out).toContain(".claude-cron/.mcp.json");
+    expect(out).toContain('[ -f "$CRON_MCP_CONFIG" ] ||');
   });
 
   it("self-gates on the runtime flag (exit 78, no respawn, when off)", () => {
