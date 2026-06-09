@@ -10,6 +10,8 @@ import { isHindsightEnabled } from "../memory/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift } from "../agents/scaffold.js";
+import { writeComposeFile } from "./write-compose.js";
+import { DEFAULT_COMPOSE_PATH } from "./apply.js";
 import { bareClonePath } from "../repos/bare-clone.js";
 import { removeAgentWorktree } from "../repos/agent-worktree.js";
 import { listAvailableProfiles } from "../agents/profiles.js";
@@ -525,6 +527,8 @@ export interface ReconcileAndRestartDeps {
    * helper exported from `src/agents/lifecycle.ts`.
    */
   applyCronChangesHot: typeof applyCronChangesHot;
+  /** Regenerate the fleet compose before recreate (pin/image self-heal). Injected for tests. */
+  writeComposeFile: typeof writeComposeFile;
 }
 
 export interface ReconcileAndRestartOpts {
@@ -538,6 +542,8 @@ export interface ReconcileAndRestartOpts {
    * for checks that go to the network.
    */
   force?: boolean;
+  /** Override the compose path (tests). Defaults to DEFAULT_COMPOSE_PATH. */
+  composePath?: string;
 }
 
 /**
@@ -559,6 +565,7 @@ export async function reconcileAndRestartAgent(
     restartAgent,
     gracefulRestartAgent,
     applyCronChangesHot,
+    writeComposeFile,
   },
 ): Promise<{ reconciled: boolean; restarted: boolean; waitingForTurn?: boolean; changes: string[] }> {
   const log = opts.silent ? () => {} : (msg: string) => console.log(msg);
@@ -579,11 +586,12 @@ export async function reconcileAndRestartAgent(
     {},
   );
 
-  // v0.7: infra-unit regen no longer happens here. Compose-file drift
-  // is reconciled by `switchroom apply` + `docker compose up -d
-  // --remove-orphans`. `reconcileAgent` covers the agent-dir layer
-  // (settings.json, hooks, start.sh) which is what restart needs to
-  // pick up.
+  // `reconcileAgent` covers the agent-dir layer (settings.json, hooks,
+  // start.sh). The FLEET COMPOSE (image/pin) is regenerated separately,
+  // just before the container recreate below — see the writeComposeFile
+  // call. Historically (v0.7) restart left compose drift to a separate
+  // `switchroom apply`, which silently broke "edit pin → restart" (the
+  // v0.14.92 roll; memory `agent-restart-needs-apply-for-pin`).
   const allChanges = [...result.changes];
 
   if (allChanges.length === 0) {
@@ -666,6 +674,38 @@ export async function reconcileAndRestartAgent(
         }
       }
     }
+  }
+
+  // ── Regenerate the fleet compose before recreating ──────────────────────
+  // So a `release.pin` / image change in switchroom.yaml actually reaches the
+  // container on a plain `agent restart` — restoring this function's
+  // "edit switchroom.yaml → restart → done" promise (the v0.7 regression that
+  // bit the v0.14.92 roll). Same writer as `apply` → no drift. Only the named
+  // service is recreated below (`--no-deps`), so regenerating the whole
+  // compose is safe: other agents converge as THEY restart (staggered roll).
+  // Best-effort: a write failure (e.g. non-sudo perms) WARNS but never aborts
+  // the restart — the bounce still works against the existing compose, exactly
+  // as before this fix.
+  try {
+    const r = await deps.writeComposeFile({
+      config,
+      composePath: opts.composePath ?? DEFAULT_COMPOSE_PATH,
+      switchroomConfigPath: configPath,
+    });
+    if (r.changed) {
+      const tagNote =
+        r.previousImageTag && r.previousImageTag !== r.imageTag
+          ? ` (image ${r.previousImageTag} → ${r.imageTag})`
+          : ` (image ${r.imageTag})`;
+      log(chalk.green(`  ${name}: compose regenerated${tagNote}`));
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(
+      chalk.yellow(
+        `  ${name}: could not regenerate compose (${msg}) — image/pin changes may not apply; run \`switchroom apply\``,
+      ),
+    );
   }
 
   if (opts.graceful) {

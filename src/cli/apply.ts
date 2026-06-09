@@ -57,8 +57,8 @@ import {
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants } from "../agents/scaffold.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
-import { generateCompose, allocateAgentUid } from "../agents/compose.js";
-import { resolveImageTag, resolveRelease } from "../config/release-resolve.js";
+import { allocateAgentUid } from "../agents/compose.js";
+import { writeComposeFile } from "./write-compose.js";
 import { detectInstallType } from "./install-detect.js";
 import {
   resolveOperatorUid,
@@ -941,42 +941,22 @@ export async function runApply(
   // operator listener simply isn't bound (broker skips when env var
   // is unset).
   const operatorUid: number | undefined = resolveOperatorUid();
-  // Resolve the release block for this apply run. Priority:
-  //   1. CLI flag override (--channel/--pin on `apply` or `update`)
-  //   2. Root `release` block from switchroom.yaml
-  //   3. Default {channel:"latest"} (implicit, via resolveImageTag's
-  //      undefined fallback)
-  // Per-agent `release` overrides are not (yet) plumbed through to
-  // compose tag selection — compose currently emits one image tag for
-  // the whole fleet. The data is still validated by the schema and
-  // surfaced in audit rows for forensic visibility.
-  const composeRelease = resolveRelease({
-    override: options.releaseOverride,
-    root: config.release,
-  });
-  const composeImageTag = resolveImageTag(composeRelease);
-  const composeContent = generateCompose({
+  // Generate + write the compose. Release block priority: CLI --channel/--pin
+  // override → root `release` → default latest (via resolveImageTag's undefined
+  // fallback). Per-agent `release` overrides aren't plumbed through to compose
+  // tag selection yet — compose emits one image tag for the whole fleet.
+  //
+  // Shared with the `agent restart` reconcile path via writeComposeFile so the
+  // two can NEVER drift — and so a `release.pin` bump applies on a plain
+  // restart, not only via apply (memory `agent-restart-needs-apply-for-pin`).
+  const { bytes: composeBytes } = await writeComposeFile({
     config,
-    imageTag: composeImageTag,
+    composePath,
+    switchroomConfigPath,
+    releaseOverride: options.releaseOverride,
     buildMode: options.buildLocal ? "local" : "pull",
     buildContext: options.buildContext,
-    // Bake the operator's HOME absolute path into volume sources at
-    // apply time. Avoids `${HOME}` resolving to /root under sudo.
-    homeDir: homedir(),
-    // Bind-mount the resolved switchroom.yaml directly into the broker,
-    // approval-kernel, and scheduler containers so they don't restart-loop
-    // on `ConfigError: No switchroom.yaml found` when the operator's
-    // config lives outside ~/.switchroom (v0.7 P0 install-path bug).
-    switchroomConfigPath,
-    // Captured above — turns on the host-shell operator socket.
-    operatorUid,
   });
-  await mkdir(dirname(composePath), { recursive: true });
-  await writeFile(composePath, composeContent, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  const composeBytes = Buffer.byteLength(composeContent, "utf8");
 
   writeOut(
     chalk.bold(`\nWrote `) +
