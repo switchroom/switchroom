@@ -241,6 +241,11 @@ export interface RefreshAccountData {
   expiresAt?: number;
 }
 
+export interface ClaimNotificationData {
+  /** True for the first claimant of the key inside the window. */
+  granted: boolean;
+}
+
 export interface AddAccountData {
   label: string;
   expiresAt?: number;
@@ -471,6 +476,25 @@ export class AuthBrokerClient {
       : { v: PROTOCOL_VERSION, id: randomUUID(), op: "mark-exhausted" };
     const data = await this.send(req);
     return data as MarkExhaustedData;
+  }
+
+  /**
+   * Fleet notification-dedup claim. Returns `granted: true` only for
+   * the first caller of `key` within `windowMs` — the winner sends the
+   * notification, everyone else stays silent. Callers should FAIL OPEN
+   * on error (send anyway): a broker that predates this op rejects the
+   * request at the protocol layer, and duplicated notifications beat
+   * silently dropped ones during a skewed rollout.
+   */
+  async claimNotification(key: string, windowMs: number): Promise<ClaimNotificationData> {
+    const data = await this.send({
+      v: PROTOCOL_VERSION,
+      id: randomUUID(),
+      op: "claim-notification",
+      key,
+      windowMs,
+    });
+    return data as ClaimNotificationData;
   }
 
   async refreshAccount(account: string): Promise<RefreshAccountData> {

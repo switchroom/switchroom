@@ -34,6 +34,8 @@ export function createAuthBrokerClient(): {
       broker.setOverride(agent, account),
     probeQuota: (accounts: readonly string[], timeoutMs?: number) =>
       broker.probeQuota(accounts, timeoutMs),
+    claimNotification: (key: string, windowMs: number) =>
+      broker.claimNotification(key, windowMs),
   }
   return { client, close: () => broker.close() }
 }

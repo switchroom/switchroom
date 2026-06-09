@@ -436,3 +436,269 @@ describe("evaluateFleetAllExhausted", () => {
     if (d.kind === "notify") expect(d.message).toContain("Reset time unknown");
   });
 });
+
+// ── hardening: tuning resolver + claim keys (2026-06-09 incident) ───────────
+
+import {
+  resolveQuotaWatchTuning,
+  buildQuotaClaimKey,
+  DEFAULT_QUOTA_WATCH_MAX_STALE_MS,
+  DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS,
+  QUOTA_WATCH_CLAIM_WINDOW_MS,
+  type QuotaWatchDecision,
+} from "../quota-watch.js";
+
+describe("resolveQuotaWatchTuning", () => {
+  it("defaults: stale gate 60min, late-recovery 6h, dedup on, probe-fail send off", () => {
+    const t = resolveQuotaWatchTuning({});
+    expect(t.maxStaleMs).toBe(DEFAULT_QUOTA_WATCH_MAX_STALE_MS);
+    expect(t.lateRecoveryMs).toBe(DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS);
+    expect(t.fleetDedup).toBe(true);
+    expect(t.sendOnProbeFail).toBe(false);
+  });
+
+  it("each knob is individually kill-switchable", () => {
+    const t = resolveQuotaWatchTuning({
+      SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS: "0",
+      SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS: "0",
+      SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP: "0",
+      SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL: "1",
+    });
+    expect(t.maxStaleMs).toBe(0);
+    expect(t.lateRecoveryMs).toBe(0);
+    expect(t.fleetDedup).toBe(false);
+    expect(t.sendOnProbeFail).toBe(true);
+  });
+
+  it("garbage numeric values fall back to defaults", () => {
+    const t = resolveQuotaWatchTuning({
+      SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS: "banana",
+      SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS: "-5",
+    });
+    expect(t.maxStaleMs).toBe(DEFAULT_QUOTA_WATCH_MAX_STALE_MS);
+    expect(t.lateRecoveryMs).toBe(DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS);
+  });
+
+  it("claim window exceeds one poll cycle (15 min) so all agents' observations of one edge dedup", () => {
+    expect(QUOTA_WATCH_CLAIM_WINDOW_MS).toBeGreaterThan(15 * 60_000);
+  });
+});
+
+describe("buildQuotaClaimKey", () => {
+  it("is namespaced and distinct per account, transition, and chat", () => {
+    const k1 = buildQuotaClaimKey("a@x.com", "entered-throttling", 111);
+    const k2 = buildQuotaClaimKey("a@x.com", "entered-throttling", 222);
+    const k3 = buildQuotaClaimKey("a@x.com", "recovered-to-healthy", 111);
+    const k4 = buildQuotaClaimKey("b@x.com", "entered-throttling", 111);
+    expect(new Set([k1, k2, k3, k4]).size).toBe(4);
+    expect(k1).toBe("quota-watch:a@x.com:entered-throttling:111");
+  });
+});
+
+// ── hardening: staleness gate ────────────────────────────────────────────────
+
+const TUNING = {
+  maxStaleMs: DEFAULT_QUOTA_WATCH_MAX_STALE_MS,
+  lateRecoveryMs: DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS,
+};
+
+describe("evaluateQuotaWatchAccount — staleness gate", () => {
+  it("a cached snapshot past maxStaleMs carries no opinion (skip, even on a real edge)", () => {
+    const staleHealthy: AccountSnapshot = {
+      ...HEALTHY_SNAP,
+      capturedAtMs: NOW - DEFAULT_QUOTA_WATCH_MAX_STALE_MS - 1,
+    };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: staleHealthy, prev: PREV_WAS_THROTTLING, now: NOW, tuning: TUNING,
+    });
+    expect(d.kind).toBe("skip");
+    expect((d as { reason: string }).reason).toBe("stale-snapshot");
+  });
+
+  it("a cached snapshot inside the shelf life classifies normally", () => {
+    const freshEnough: AccountSnapshot = {
+      ...THROTTLING_5H,
+      capturedAtMs: NOW - 5 * 60_000,
+    };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: freshEnough, prev: PREV_WAS_HEALTHY, now: NOW, tuning: TUNING,
+    });
+    expect(d.kind).toBe("notify");
+  });
+
+  it("live-probe snapshots (no capturedAtMs) are never stale-gated", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: THROTTLING_5H, prev: PREV_WAS_HEALTHY, now: NOW, tuning: TUNING,
+    });
+    expect(d.kind).toBe("notify");
+  });
+
+  it("maxStaleMs=0 disables the gate (legacy behaviour)", () => {
+    const ancient: AccountSnapshot = { ...THROTTLING_5H, capturedAtMs: NOW - 86_400_000 };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: ancient, prev: PREV_WAS_HEALTHY, now: NOW,
+      tuning: { maxStaleMs: 0, lateRecoveryMs: 0 },
+    });
+    expect(d.kind).toBe("notify");
+  });
+});
+
+// ── hardening: boot-tick + late-recovery reconciliation ─────────────────────
+
+describe("evaluateQuotaWatchAccount — recovery reconciliation", () => {
+  it("recovery on a boot tick reconciles silently (the fleet-bounce flood case)", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: HEALTHY_SNAP, prev: PREV_WAS_THROTTLING, now: NOW,
+      bootTick: true, tuning: TUNING,
+    });
+    expect(d.kind).toBe("reconcile");
+    const r = d as Extract<QuotaWatchDecision, { kind: "reconcile" }>;
+    expect(r.reason).toBe("boot-tick-recovery");
+    expect(r.transition).toBe("recovered-to-healthy");
+    // The latch must clear so the edge never re-fires.
+    expect(r.newAccountState.lastNotifiedHealth).toBe("healthy");
+  });
+
+  it("recovery whose 🟡 warning is older than lateRecoveryMs reconciles silently", () => {
+    const prev = {
+      lastNotifiedHealth: "throttling" as const,
+      lastNotifiedAt: NOW - DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS - 1,
+    };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: HEALTHY_SNAP, prev, now: NOW, tuning: TUNING,
+    });
+    expect(d.kind).toBe("reconcile");
+    expect((d as Extract<QuotaWatchDecision, { kind: "reconcile" }>).reason).toBe("late-recovery");
+  });
+
+  it("a prompt recovery on a normal tick still notifies", () => {
+    const prev = { lastNotifiedHealth: "throttling" as const, lastNotifiedAt: NOW - 30 * 60_000 };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: HEALTHY_SNAP, prev, now: NOW, tuning: TUNING,
+    });
+    expect(d.kind).toBe("notify");
+    expect((d as Extract<QuotaWatchDecision, { kind: "notify" }>).transition).toBe("recovered-to-healthy");
+  });
+
+  it("a 🟡 warning still notifies on a boot tick (warnings are level-state news)", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: THROTTLING_5H, prev: PREV_WAS_HEALTHY, now: NOW,
+      bootTick: true, tuning: TUNING,
+    });
+    expect(d.kind).toBe("notify");
+    expect((d as Extract<QuotaWatchDecision, { kind: "notify" }>).transition).toBe("entered-throttling");
+  });
+
+  it("lateRecoveryMs=0 disables reconciliation (legacy always-send)", () => {
+    const prev = { lastNotifiedHealth: "throttling" as const, lastNotifiedAt: NOW - 86_400_000 };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: HEALTHY_SNAP, prev, now: NOW,
+      tuning: { maxStaleMs: 0, lateRecoveryMs: 0 },
+    });
+    expect(d.kind).toBe("notify");
+  });
+
+  it("omitting bootTick/tuning entirely preserves the pre-hardening table", () => {
+    const prev = { lastNotifiedHealth: "throttling" as const, lastNotifiedAt: NOW - 86_400_000 };
+    const d = evaluateQuotaWatchAccount({
+      agentName: "test", snap: HEALTHY_SNAP, prev, now: NOW,
+    });
+    expect(d.kind).toBe("notify");
+  });
+});
+
+// ── total enumeration: every (state × input) cell of the decision FSM ────────
+//
+// Operator standard (feedback_prove_finite_fsm_not_sample): the decision
+// function is a finite table — prove it by enumerating EVERY cell, not by
+// sampling. Dimensions:
+//   prevHealth      ∈ {null, healthy, throttling}
+//   currentHealth   ∈ {healthy, throttling, blocked, unknown}
+//   staleness       ∈ {live (no capturedAtMs), fresh-cache, stale-cache}
+//   bootTick        ∈ {false, true}
+//   warningAge      ∈ {recent (< lateRecoveryMs), late (> lateRecoveryMs)}
+// = 3 × 4 × 3 × 2 × 2 = 144 cells. The expected kind for every cell is
+// computed from the documented table independently and asserted.
+
+describe("evaluateQuotaWatchAccount — total enumeration (144 cells)", () => {
+  const PREVS = [null, "healthy", "throttling"] as const;
+  const CURRENTS = ["healthy", "throttling", "blocked", "unknown"] as const;
+  const STALENESS = ["live", "fresh-cache", "stale-cache"] as const;
+  const BOOLS = [false, true] as const;
+  const AGES = ["recent", "late"] as const;
+
+  const SNAPS: Record<(typeof CURRENTS)[number], QuotaUtilization | null> = {
+    healthy: makeQuota(30, 40),
+    throttling: makeQuota(85, 40),
+    blocked: makeQuota(99.9, 99.9),
+    unknown: null,
+  };
+
+  it("every cell matches the documented table", () => {
+    let cells = 0;
+    for (const prevHealth of PREVS) {
+      for (const currentHealth of CURRENTS) {
+        for (const staleness of STALENESS) {
+          for (const bootTick of BOOLS) {
+            for (const age of AGES) {
+              cells++;
+              const lastNotifiedAt =
+                prevHealth === null
+                  ? 0
+                  : age === "late"
+                    ? NOW - DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS - 1
+                    : NOW - 30 * 60_000;
+              const prev = { lastNotifiedHealth: prevHealth, lastNotifiedAt };
+              const snap: AccountSnapshot = {
+                label: "enum@example.com",
+                isActive: false,
+                quota: SNAPS[currentHealth],
+                capturedAtMs:
+                  staleness === "live"
+                    ? undefined
+                    : staleness === "fresh-cache"
+                      ? NOW - 60_000
+                      : NOW - DEFAULT_QUOTA_WATCH_MAX_STALE_MS - 1,
+              };
+              const d = evaluateQuotaWatchAccount({
+                agentName: "enum", snap, prev, now: NOW, bootTick, tuning: TUNING,
+              });
+
+              // Independent expectation, straight from the documented table.
+              let expected: "notify" | "reconcile" | "skip";
+              const effPrev = prevHealth ?? "healthy";
+              if (staleness === "stale-cache") {
+                expected = "skip"; // gate fires before everything else
+              } else if (currentHealth === "blocked" || currentHealth === "unknown") {
+                expected = "skip"; // credits-watch domain / no data
+              } else if (currentHealth === effPrev) {
+                expected = "skip"; // steady-state
+              } else if (currentHealth === "throttling") {
+                expected = "notify"; // warnings always notify
+              } else {
+                // recovery: throttling → healthy
+                expected = bootTick || age === "late" ? "reconcile" : "notify";
+              }
+
+              expect(
+                d.kind,
+                `cell prev=${prevHealth} cur=${currentHealth} stale=${staleness} boot=${bootTick} age=${age}`,
+              ).toBe(expected);
+
+              // Terminal-state invariant: any notify/reconcile lands the
+              // latch on currentHealth, so re-running the SAME cell with the
+              // updated state is always a skip (the FSM cannot loop).
+              if (d.kind === "notify" || d.kind === "reconcile") {
+                const again = evaluateQuotaWatchAccount({
+                  agentName: "enum", snap, prev: d.newAccountState, now: NOW, bootTick, tuning: TUNING,
+                });
+                expect(again.kind, `re-run of cell prev=${prevHealth} cur=${currentHealth}`).toBe("skip");
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(cells).toBe(144);
+  });
+});

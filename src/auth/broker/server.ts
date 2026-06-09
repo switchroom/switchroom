@@ -142,6 +142,19 @@ interface QuotaState {
 }
 
 /**
+ * Fleet notification-dedup claims (`claim-notification` op): dedup key →
+ * unix-ms of the last GRANTED claim. Entries older than the largest
+ * permitted window (24h) are pruned on every grant so the file stays
+ * bounded. Persisted as `notification-claims.json`.
+ */
+interface NotificationClaims {
+  [key: string]: number;
+}
+
+/** Hard ceiling on claim retention — matches the protocol's max windowMs. */
+const NOTIFICATION_CLAIM_MAX_AGE_MS = 86_400_000;
+
+/**
  * Per-account cached utilization snapshot, written after each successful
  * `opProbeQuota` call. Consumed by `opListState` so callers (quota-watch
  * loop) can classify account health without triggering a live probe.
@@ -301,6 +314,9 @@ export class AuthBroker {
   private lastQuotaCache: LastQuotaCache = {};
   private shaIndex: ShaIndex = {};
   private thresholdViolations: ThresholdViolations = {};
+  /** Fleet notification-dedup claims: key → unix-ms of last grant.
+   *  Persisted so a broker restart inside the window stays closed. */
+  private notificationClaims: NotificationClaims = {};
   /** Last `expiresAt` the broker wrote per label — drives threshold-violation. */
   private lastWrittenExpiresAt = new Map<string, number | undefined>();
   /** Refresh leases held while a POST is in flight (in-process). */
@@ -936,6 +952,9 @@ export class AuthBroker {
             req.timeoutMs,
           );
           break;
+        case "claim-notification":
+          this.opClaimNotification(socket, reqId, identity, req.key, req.windowMs);
+          break;
       }
     } catch (err) {
       socket.write(
@@ -1341,6 +1360,40 @@ export class AuthBroker {
     const rolledTo = this.nextHealthyAccount(account, this.config.auth?.fallback_order ?? []);
     this.audit({ op: "mark-exhausted", identity, account, ok: true });
     socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
+  }
+
+  /**
+   * Fleet notification-dedup claim. Grants the FIRST caller of a given
+   * `key` inside `windowMs`; everyone else is denied. The check-and-set
+   * is fully synchronous (no awaits), so two agents racing the same key
+   * serialize on the event loop — exactly one grant per window, by
+   * construction.
+   *
+   * Audit: granted claims only. Denials are the designed common case
+   * (N-1 of N agents per event) — auditing them would re-create the
+   * very log spam this op exists to remove.
+   */
+  private opClaimNotification(
+    socket: net.Socket,
+    id: string,
+    identity: Identity,
+    key: string,
+    windowMs: number,
+  ): void {
+    const now = this.now();
+    const prev = this.notificationClaims[key];
+    const granted = prev === undefined || now - prev >= windowMs;
+    if (granted) {
+      this.notificationClaims[key] = now;
+      // Prune anything past the protocol's max window so the file stays
+      // bounded by the set of keys active in the last 24h.
+      for (const [k, ts] of Object.entries(this.notificationClaims)) {
+        if (now - ts > NOTIFICATION_CLAIM_MAX_AGE_MS) delete this.notificationClaims[k];
+      }
+      this.persistNotificationClaims();
+      this.audit({ op: "claim-notification", identity, account: key, ok: true });
+    }
+    socket.write(encodeSuccess(id, { granted }));
   }
 
   private async opRefreshAccount(
@@ -2358,6 +2411,7 @@ export class AuthBroker {
     this.quota = this.readJson<QuotaState>("quota.json") ?? {};
     this.shaIndex = this.readJson<ShaIndex>("sha-index.json") ?? {};
     this.thresholdViolations = this.readJson<ThresholdViolations>("threshold-violations.json") ?? {};
+    this.notificationClaims = this.readJson<NotificationClaims>("notification-claims.json") ?? {};
   }
 
   private readJson<T>(name: string): T | null {
@@ -2367,6 +2421,7 @@ export class AuthBroker {
   }
 
   private persistQuota(): void { atomicWriteJsonSync(join(this.stateDir, "quota.json"), this.quota, 0o600); }
+  private persistNotificationClaims(): void { atomicWriteJsonSync(join(this.stateDir, "notification-claims.json"), this.notificationClaims, 0o600); }
   private persistShaIndex(): void { atomicWriteJsonSync(join(this.stateDir, "sha-index.json"), this.shaIndex, 0o600); }
   private persistThresholdViolations(): void { atomicWriteJsonSync(join(this.stateDir, "threshold-violations.json"), this.thresholdViolations, 0o600); }
 

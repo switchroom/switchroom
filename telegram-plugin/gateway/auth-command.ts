@@ -238,6 +238,13 @@ export interface AuthBrokerClient {
     accounts: readonly string[],
     timeoutMs?: number,
   ): Promise<{ results: Array<{ label: string; result: import('../quota-check.js').QuotaResult }> }>
+  /**
+   * Fleet notification-dedup claim (quota-watch). First caller of `key`
+   * inside `windowMs` gets `granted: true` and sends; everyone else
+   * stays silent. Callers fail OPEN on error (skewed-rollout brokers
+   * reject the op at the protocol layer).
+   */
+  claimNotification(key: string, windowMs: number): Promise<{ granted: boolean }>
 }
 
 export interface AuthCommandContext {

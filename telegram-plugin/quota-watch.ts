@@ -73,6 +73,76 @@ export function emptyAccountState(): QuotaWatchAccountState {
   return { lastNotifiedHealth: null, lastNotifiedAt: 0 };
 }
 
+// ─── Tuning (env knobs) ───────────────────────────────────────────────────────
+
+/**
+ * Operational tuning for the watch loop, resolved once from env by the
+ * gateway. All three hardening behaviours are individually
+ * kill-switchable (incident 2026-06-09: a fleet bounce released
+ * days-stale recovery latches on all 11 agents at once → 26 duplicate
+ * 🟢 messages in 16 minutes):
+ *
+ *   SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS      0 disables the staleness gate
+ *                                            (default 60 min)
+ *   SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS  0 disables silent late-recovery
+ *                                            reconciliation (default 6 h)
+ *   SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP       "0" disables the broker claim
+ *                                            (every agent sends, pre-incident
+ *                                            behaviour)
+ *   SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL "1" restores sending from
+ *                                            cached data when the pre-send
+ *                                            validation probe fails
+ */
+export interface QuotaWatchTuning {
+  /** Cached snapshots older than this are treated as unknown (no opinion). 0 = off. */
+  maxStaleMs: number;
+  /** Recovery edges whose 🟡 warning is older than this reconcile silently. 0 = off. */
+  lateRecoveryMs: number;
+  /** Route sends through the broker's claim-notification dedup. */
+  fleetDedup: boolean;
+  /** Legacy: send from cached data when the validation probe fails. */
+  sendOnProbeFail: boolean;
+}
+
+export const DEFAULT_QUOTA_WATCH_MAX_STALE_MS = 60 * 60_000;
+export const DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS = 6 * 60 * 60_000;
+
+/** Broker claim window. Must exceed one full poll cycle (15 min) plus the
+ *  boot-stagger spread so every agent's observation of the SAME edge lands
+ *  inside one window; an account genuinely re-crossing the same edge later
+ *  than this re-notifies. */
+export const QUOTA_WATCH_CLAIM_WINDOW_MS = 30 * 60_000;
+
+export function resolveQuotaWatchTuning(
+  env: Record<string, string | undefined>,
+): QuotaWatchTuning {
+  const num = (raw: string | undefined, fallback: number): number => {
+    if (raw === undefined || raw === "") return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    maxStaleMs: num(env.SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS, DEFAULT_QUOTA_WATCH_MAX_STALE_MS),
+    lateRecoveryMs: num(env.SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS, DEFAULT_QUOTA_WATCH_LATE_RECOVERY_MS),
+    fleetDedup: env.SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP !== "0",
+    sendOnProbeFail: env.SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL === "1",
+  };
+}
+
+/**
+ * Broker dedup-claim key for one (account, transition, chat) cell.
+ * Per-CHAT keys keep the audience identical to pre-dedup behaviour:
+ * every chat that any agent would have notified still receives exactly
+ * one copy — from whichever agent claims it first.
+ */
+export function buildQuotaClaimKey(
+  accountLabel: string,
+  transition: string,
+  chatId: string | number,
+): string {
+  return `quota-watch:${accountLabel}:${transition}:${chatId}`;
+}
+
 // ─── Decision logic ───────────────────────────────────────────────────────────
 
 export type QuotaWatchTransition =
@@ -87,30 +157,73 @@ export type QuotaWatchDecision =
       newAccountState: QuotaWatchAccountState;
       transition: QuotaWatchTransition;
     }
+  | {
+      /**
+       * A real transition was observed, but it is no longer NEWS — persist
+       * the new state so the edge-trigger latch clears, send nothing.
+       * Two producers: boot-tick recoveries (a just-booted gateway cannot
+       * distinguish "just recovered" from "recovered while we were down",
+       * and fleet bounces synchronize all agents' first ticks → flood) and
+       * late recoveries (the matching 🟡 is hours old; an "all clear" now
+       * is state reconciliation, not information).
+       */
+      kind: "reconcile";
+      accountLabel: string;
+      newAccountState: QuotaWatchAccountState;
+      transition: QuotaWatchTransition;
+      reason: "boot-tick-recovery" | "late-recovery";
+    }
   | { kind: "skip"; accountLabel: string; reason: string };
 
 /**
  * Evaluate one account's quota state against its last-notified health.
  *
- * Transition table:
+ * Transition table (after the staleness gate — a cached snapshot older
+ * than `maxStaleMs` is no opinion at all → skip "stale-snapshot"):
  *   healthy → healthy        skip (steady-state)
- *   healthy → throttling     notify (entered-throttling)
+ *   healthy → throttling     notify (entered-throttling) — warnings are
+ *                            level-state news, valid on any tick incl. boot
  *   healthy → blocked        skip (credits-watch covers this)
- *   throttling → healthy     notify (recovered-to-healthy)
+ *   throttling → healthy     notify (recovered-to-healthy), EXCEPT:
+ *                              boot tick           → reconcile silently
+ *                              warning > lateRecoveryMs old → reconcile silently
  *   throttling → throttling  skip (already notified)
  *   throttling → blocked     skip (credits-watch covers blocked)
  *   blocked → *              skip (credits-watch domain)
  *   unknown → *              skip (no quota data — don't spam)
  *   * → unknown              skip (probe failed — transient, don't alarm)
+ *
+ * `bootTick` / `tuning` are optional: omitted (legacy callers/tests) the
+ * behaviour is exactly the pre-hardening table (no stale gate, no
+ * reconciliation).
  */
 export function evaluateQuotaWatchAccount(args: {
   agentName: string;
   snap: AccountSnapshot;
   prev: QuotaWatchAccountState;
   now: number;
+  /** True on the gateway's first watch tick after boot. */
+  bootTick?: boolean;
+  /** Staleness / late-recovery thresholds; 0 disables each. */
+  tuning?: Pick<QuotaWatchTuning, "maxStaleMs" | "lateRecoveryMs">;
 }): QuotaWatchDecision {
   const { agentName, snap, prev, now } = args;
+  const bootTick = args.bootTick ?? false;
+  const maxStaleMs = args.tuning?.maxStaleMs ?? 0;
+  const lateRecoveryMs = args.tuning?.lateRecoveryMs ?? 0;
   const label = snap.label;
+
+  // Staleness gate: a CACHED snapshot (capturedAtMs set) past its shelf
+  // life carries no opinion about the present — neither latch nor release.
+  // Live-probe snapshots (capturedAtMs undefined) are fresh by construction.
+  if (
+    maxStaleMs > 0 &&
+    snap.capturedAtMs !== undefined &&
+    now - snap.capturedAtMs > maxStaleMs
+  ) {
+    return { kind: "skip", accountLabel: label, reason: "stale-snapshot" };
+  }
+
   const currentHealth = classifyHealth(snap);
 
   // Unknown (probe failed) or blocked — skip entirely.
@@ -147,6 +260,31 @@ export function evaluateQuotaWatchAccount(args: {
       lastNotifiedHealth: "healthy",
       lastNotifiedAt: now,
     };
+    // A recovery observed on the first post-boot tick is not attributable
+    // to "just now" — the account may have recovered any time while this
+    // gateway was down, and a fleet bounce synchronizes every agent's
+    // first tick (the 2026-06-09 26-message flood). Reconcile silently.
+    if (bootTick) {
+      return {
+        kind: "reconcile",
+        accountLabel: label,
+        newAccountState: newState,
+        transition: "recovered-to-healthy",
+        reason: "boot-tick-recovery",
+      };
+    }
+    // Recovery whose matching 🟡 warning is hours old: the "all clear" is
+    // no longer actionable news (the user has long moved on; /auth shows
+    // live state on demand). Clear the latch without a message.
+    if (lateRecoveryMs > 0 && now - prev.lastNotifiedAt > lateRecoveryMs) {
+      return {
+        kind: "reconcile",
+        accountLabel: label,
+        newAccountState: newState,
+        transition: "recovered-to-healthy",
+        reason: "late-recovery",
+      };
+    }
     return {
       kind: "notify",
       accountLabel: label,

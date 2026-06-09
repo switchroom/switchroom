@@ -43,6 +43,11 @@ export interface AccountSnapshot {
   /** Mirrors the broker's `expiresAt` so the table can show token-life
    *  for accounts whose creds are about to expire. */
   expiresAtMs?: number;
+  /** Unix ms when `quota` was captured. Set for CACHED snapshots
+   *  (`buildSnapshotsFromCachedState`) so consumers can refuse to treat
+   *  stale data as current; undefined for live-probe snapshots (fresh
+   *  by construction). */
+  capturedAtMs?: number;
 }
 
 // ── health classification ────────────────────────────────────────────
@@ -653,6 +658,10 @@ export function buildSnapshotsFromCachedState(
       quota: reviveLastQuota(lq),
       quotaError: lq ? undefined : 'no cached quota (no probe since broker start)',
       expiresAtMs: acc.expiresAt,
+      // Surface the cache age so quota-watch can refuse to classify off
+      // stale data (the 2026-06-09 incident: a recovery latched days
+      // earlier only surfaced — and notified — at the next fleet bounce).
+      capturedAtMs: lq?.capturedAt,
     };
   });
 }
