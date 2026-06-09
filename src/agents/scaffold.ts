@@ -409,6 +409,38 @@ function buildCronSessionContext(agentConfig: AgentConfig): {
     cronModelQ: shellSingleQuote(DEFAULT_CRON_MODEL),
   };
 }
+
+/**
+ * Cheap-cron (L4 refinement): write a TRIMMED .mcp.json for the cron session
+ * at <agentDir>/.claude-cron/.mcp.json containing ONLY switchroom-telegram
+ * (the bridge it needs to reply). The cron session loads this via
+ * `--mcp-config … --strict-mcp-config`, so it pays a fraction of the main
+ * session's ~31k-token MCP schema tax (no hindsight/perplexity/webkite/
+ * agent-config/hostd). The switchroom-telegram entry is reused verbatim from
+ * the main set — its identity comes from the process env SWITCHROOM_AGENT_NAME
+ * (=<name>-cron, set by cron-session.sh), NOT a baked .mcp.json field.
+ *
+ * No-op unless the agent has a cron session AND actually uses switchroom-
+ * telegram (an agent on the official telegram plugin has no bridge to trim to,
+ * and couldn't run a cron session anyway). Returns the trimmed path or null.
+ */
+export function maybeWriteTrimmedCronMcp(
+  agentDir: string,
+  mcpServers: Record<string, McpServerConfig>,
+  cronSessionEnabled: boolean,
+): string | null {
+  if (!cronSessionEnabled) return null;
+  const telegram = mcpServers["switchroom-telegram"];
+  if (!telegram) return null;
+  const cronDir = join(agentDir, ".claude-cron");
+  mkdirSync(cronDir, { recursive: true });
+  const path = join(cronDir, ".mcp.json");
+  const content = JSON.stringify({ mcpServers: { "switchroom-telegram": telegram } }, null, 2) + "\n";
+  if (!existsSync(path) || readFileSync(path, "utf-8") !== content) {
+    writeFileSync(path, content, { encoding: "utf-8", mode: 0o600 });
+  }
+  return path;
+}
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -3183,6 +3215,13 @@ export function scaffoldAgent(
       skipped,
       0o600,
     );
+    // Cheap-cron (L4 refinement): trimmed .claude-cron/.mcp.json for the cron
+    // session (switchroom-telegram only) — no-op unless this agent runs one.
+    maybeWriteTrimmedCronMcp(
+      agentDir,
+      mcpServers,
+      buildCronSessionContext(agentConfig).cronSessionEnabled,
+    );
     // Claude Code only loads project `.mcp.json` servers that are on the
     // per-project trust allowlist. preTrustWorkspace sets
     // hasTrustDialogAccepted but never enabledMcpjsonServers, so any
@@ -5305,6 +5344,13 @@ export function reconcileAgent(
       writeFileSync(mcpJsonPath, after, { encoding: "utf-8", mode: 0o600 });
       changes.push(mcpJsonPath);
     }
+    // Cheap-cron (L4 refinement): keep the trimmed cron .mcp.json in sync.
+    const trimmedCronMcp = maybeWriteTrimmedCronMcp(
+      agentDir,
+      mcpServers,
+      buildCronSessionContext(agentConfig).cronSessionEnabled,
+    );
+    if (trimmedCronMcp) changes.push(trimmedCronMcp);
     // Mirror scaffoldAgent: keep every scaffolded server on Claude
     // Code's per-project trust allowlist (idempotent — runs every
     // reconcile so a newly-added gdrive/hostd is trusted on the next

@@ -31,12 +31,14 @@ esac
 CRON_NAME="{{name}}-cron"
 CRON_CONFIG_DIR="{{agentDir}}/.claude-cron"
 MAIN_CONFIG_DIR="{{agentDir}}/.claude"
-# v1: reuse the agent's project .mcp.json. The switchroom-telegram BRIDGE reads
-# SWITCHROOM_AGENT_NAME from the process env (exported below) — NOT its .mcp.json
-# env block — so it registers as the cron identity even off the shared config.
-# The bigger wins (fresh context + the cheap model) already hold; trimming the
-# MCP surface to just switchroom-telegram is a documented canary-time follow-up.
-CRON_MCP_CONFIG="{{agentDir}}/.mcp.json"
+# TRIMMED MCP config (scaffold writes .claude-cron/.mcp.json with ONLY
+# switchroom-telegram) → the cron session pays a fraction of the main session's
+# ~31k-token MCP schema tax. The switchroom-telegram BRIDGE reads
+# SWITCHROOM_AGENT_NAME from the process env (exported below), NOT its .mcp.json
+# env block, so it registers as the cron identity. Fall back to the full
+# .mcp.json if the trimmed file is missing (older scaffold) so it still boots.
+CRON_MCP_CONFIG="{{agentDir}}/.claude-cron/.mcp.json"
+[ -f "$CRON_MCP_CONFIG" ] || CRON_MCP_CONFIG="{{agentDir}}/.mcp.json"
 CRON_SOCKET="switchroom-${CRON_NAME}"
 
 mkdir -p "$CRON_CONFIG_DIR"
