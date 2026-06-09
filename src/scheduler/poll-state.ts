@@ -15,8 +15,14 @@
  *    dispatches its Tier-1 escalation, it advances the cursor AND records
  *    `pendingEscalation` in ONE atomic write. A restart mid-escalation
  *    re-polls, sees the already-advanced cursor → no new data → no
- *    re-escalation. `pendingEscalation` lets a crash *before* dispatch
- *    re-send exactly once; it's cleared on dispatch-ack.
+ *    re-escalation (the double-EMAIL guard — the property that matters).
+ *
+ *    NOTE: `pendingEscalation` is the forward hook for a crash that lands
+ *    AFTER the cursor advance but BEFORE a delivered dispatch (a lost-hit
+ *    window, not a double-fire). The boot-replay CONSUMER that re-dispatches
+ *    a dangling `pendingEscalation` is STAGED with the main() live-wiring —
+ *    it is written + cleared here but not yet read back. Until that lands a
+ *    crash in this narrow window drops the hit; documented, not yet closed.
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";

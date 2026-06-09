@@ -18,8 +18,14 @@ describe("isBlockedAddress — SSRF ranges fail closed", () => {
     "127.0.0.1", "127.5.5.5", "0.0.0.0", "10.0.0.5", "172.16.0.1", "172.31.255.255",
     "192.168.1.1", "169.254.169.254", "100.64.0.1", "224.0.0.1", "255.255.255.255",
     "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1",
+    // v4-mapped HEX form (WHATWG URL's canonical normalisation of ::ffff:127.0.0.1)
+    "::ffff:7f00:1", "::ffff:0a00:1", "::ffff:a9fe:a9fe",
   ])("blocks %s", (ip) => {
     expect(isBlockedAddress(ip)).toBe(true);
+  });
+
+  it("blocks a public-looking hex-mapped form only if its embedded v4 is private", () => {
+    expect(isBlockedAddress("::ffff:0808:0808")).toBe(false); // 8.8.8.8
   });
 
   it.each(["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8"])(

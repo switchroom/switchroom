@@ -74,9 +74,20 @@ function isBlockedV6(addr: string): boolean {
   if (a.startsWith("fe80")) return true; // link-local
   if (a.startsWith("fc") || a.startsWith("fd")) return true; // ULA fc00::/7
   if (a.startsWith("ff")) return true; // multicast
-  // IPv4-mapped (::ffff:a.b.c.d) — judge the embedded v4.
+  // IPv4-mapped, dotted form (::ffff:a.b.c.d) — judge the embedded v4.
   const mapped = a.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (mapped) return isBlockedV4(mapped[1]!);
+  // IPv4-mapped, HEX form (::ffff:7f00:1) — the canonical normalisation
+  // WHATWG URL emits for a bracketed v4-mapped literal. Decode the two hex
+  // groups to dotted-quad and judge the embedded v4 (else 127.0.0.1 slips
+  // through as ::ffff:7f00:1 on the DNS-rebind pin). Reviewer-found, PR #2244.
+  const hexMapped = a.match(/::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1]!, 16);
+    const lo = parseInt(hexMapped[2]!, 16);
+    const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isBlockedV4(v4);
+  }
   return false;
 }
 

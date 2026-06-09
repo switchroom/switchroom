@@ -5666,6 +5666,17 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onClientDisconnected(client: IpcClient) {
+    // Cheap-cron §2.4: a `<agent>-cron` bridge is the status-silent cron
+    // session. Its disconnect (e.g. B3 lazy idle-teardown) must NOT touch
+    // the MAIN agent's singleton state — emitting bridgeDown (the shadow
+    // state is unkeyed) or flushOnAgentDisconnect (flushes the main agent's
+    // active reactions / disposes its progress driver mid-turn) would be the
+    // "premature 👍" bug for the main session. Symmetric to the cron gate in
+    // onClientRegistered / onSessionEvent / onPtyPartial.
+    if (isCronIdentity(client.agentName)) {
+      process.stderr.write(`telegram gateway: cron-session bridge disconnected — agent=${client.agentName}\n`)
+      return
+    }
     // ONLY log "bridge disconnected" + emit bridgeDown for the REAL
     // bridge sidecar (matching the bridgeUp gate above). Anonymous IPC
     // clients — e.g. recall.py's one-shot legacy update_placeholder
