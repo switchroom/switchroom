@@ -58,8 +58,10 @@ describe("Dockerfile.hindsight shape", () => {
   });
 
   it("installs the @anthropic-ai/claude-code CLI globally", () => {
+    // Allow the install to be quoted + version-pinned, e.g.
+    // `npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"`.
     expect(dockerfile).toMatch(
-      /npm\s+install\s+-g\s+@anthropic-ai\/claude-code/,
+      /npm\s+install\s+-g\s+"?@anthropic-ai\/claude-code/,
     );
   });
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.91 — Surface orphaned foreground sub-agents (extended autonomous work) (#2240)
+
+When an agent kept working **after its turn ended** — extended autonomous work,
+which is desirable — any foreground sub-agent it dispatched had no live parent
+turn to nest its status into, so the work ran completely **invisible** (no
+progress card, no worker feed). Diagnosed on finn: a `reviewer` sub-agent ran
+for minutes with the operator seeing nothing.
+
+Status visibility no longer depends on the model holding a turn open. A
+foreground sub-agent with no live turn now surfaces via the worker-activity feed
+(the same `🛠 Worker` message, routed to the dispatching chat or the owner DM
+via the existing fallback), exactly like a background worker. In-turn foreground
+sub-agents still nest into the progress card, unchanged. The routing is a pure,
+total-enumeration-proven decision; kill switch `SWITCHROOM_ORPHAN_SUBAGENT_STATUS=0`.
+
 ## v0.14.90 — Framework owns the reply topic, not the model (#2233)
 
 A General-topic question to an agent in a forum supergroup could get its answer
