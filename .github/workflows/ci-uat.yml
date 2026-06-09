@@ -35,12 +35,13 @@ name: ci-uat
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "telegram-plugin/**"
-      - "src/agents/**"
-      - "telegram-plugin/uat/**"
-      - "vitest.uat.config.ts"
-      - ".github/workflows/ci-uat.yml"
+    # NO paths filter: the workflow must run on EVERY PR so the required
+    # `uat-gate` SENTINEL always reports a status. A path-gated required check
+    # deadlocks any PR that doesn't touch the listed paths (a release PR only
+    # bumps package.json) — the context is never produced and the merge blocks
+    # forever (#2237 → release v0.14.91 stuck). The HEAVY, runner-bound UAT is
+    # still path-gated, now via the `changes` job below, so docs/docker/release
+    # PRs don't spin up the self-hosted runner.
   push:
     branches: [main]
     # Same path scope as the PR trigger — a docs/docker/scripts merge must not
@@ -81,10 +82,42 @@ concurrency:
 #               is schedule/dispatch-ONLY and NON-required. Catches the broader
 #               regression surface nightly.
 jobs:
-  uat-gate:
-    # Gate on a repo variable so the workflow is invisible on hosts without a
-    # self-hosted runner registered — keeps PRs green until the operator opts in.
-    if: vars.UAT_GATE_ENABLED == 'true'
+  # ─── Path-change filter (sentinel pattern) ────────────────────────
+  # The heavy UAT only runs when a behavioural path changed; the
+  # always-running `uat-gate` sentinel (below) reports the
+  # branch-protection-required context regardless. Mirrors ci-tests-plugin.yml.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        with:
+          # The same behavioural surface the old workflow-level path filter
+          # gated on (a UAT round-trip only needs re-running when the
+          # plugin / agent-scaffold / UAT scenarios / setup change).
+          filters: |
+            relevant:
+              - 'telegram-plugin/**'
+              - 'src/agents/**'
+              - 'telegram-plugin/uat/**'
+              - 'vitest.uat.config.ts'
+              - '.github/actions/setup-switchroom/**'
+              - '.github/workflows/ci-uat.yml'
+
+  uat-gate-run:
+    # The heavy, runner-bound UAT round-trips. Gated on BOTH a behavioural path
+    # change AND the repo opt-in var, so docs/docker/release merges don't spin
+    # up the slow self-hosted runner (the operator intent the workflow-level
+    # path filter used to enforce). NOT the required context — the always-on
+    # `uat-gate` sentinel below is.
+    needs: changes
+    if: vars.UAT_GATE_ENABLED == 'true' && needs.changes.outputs.relevant == 'true'
     runs-on: [self-hosted, uat-host]
     timeout-minutes: 18
     env:
@@ -122,6 +155,33 @@ jobs:
         # deterministic, fast.
         working-directory: telegram-plugin
         run: bun run test:uat inbound-no-drop
+
+  # ─── Sentinel ─────────────────────────────────────────────────────
+  # Branch-protection-required context. ALWAYS runs (ubuntu-latest, no
+  # path/var gate) so the required `uat-gate` check is always reported:
+  # passes when the heavy run succeeded OR was legitimately skipped (non-UAT
+  # PR, or the opt-in var is off / no runner), fails only on a real UAT
+  # failure or path-filter infra failure. Mirrors ci-tests-plugin.yml's
+  # `bun-test` sentinel (fixes the #2237 path-gated-required-check deadlock).
+  uat-gate:
+    needs: [changes, uat-gate-run]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verdict
+        run: |
+          c='${{ needs.changes.result }}'
+          r='${{ needs.uat-gate-run.result }}'
+          if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
+            echo "::error::changes=$c — path-filter infra failed; can't trust the skip"
+            exit 1
+          fi
+          if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+            echo "::error::uat-gate-run=$r — real UAT failure, blocking"
+            exit 1
+          fi
+          echo "changes=$c uat-gate-run=$r → pass (ran=success, or skipped: non-UAT PR / gate off)"
 
   uat-fuzz:
     # Thorough probabilistic pool — too slow to gate, so schedule/dispatch-ONLY
