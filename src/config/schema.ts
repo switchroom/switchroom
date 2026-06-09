@@ -2653,6 +2653,26 @@ export const HostdConfigSchema = z.object({
     ),
 });
 
+// Cheap-cron operator config — docs/rfcs/cheap-cron-sessions.md §6.1.
+// The egress allowlist + secret→host bindings are the SSRF/exfil fence for
+// Tier-0 http-diff polls. Top-level + operator-owned (never agent-writable):
+// an agent can propose a poll, but the host it may reach and the secret it
+// may carry are decided HERE, at operator-commit time.
+export const CronEgressSchema = z.object({
+  allowed_hosts: z
+    .array(z.string().min(1))
+    .default([])
+    .describe("Hosts a poll may reach (exact, https-only). loopback/private/IP-literal are always rejected."),
+  secret_bindings: z
+    .record(z.string(), z.string().min(1))
+    .default({})
+    .describe("secretName → the single host it may be sent to. A poll carrying a secret to any other host is rejected."),
+});
+
+export const CronConfigSchema = z.object({
+  egress: CronEgressSchema.optional().describe("SSRF/exfil fence for http-diff polls."),
+});
+
 export const SwitchroomConfigSchema = z.object({
   switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
@@ -2908,6 +2928,11 @@ export const SwitchroomConfigSchema = z.object({
       AgentSchema,
     )
     .describe("Map of agent name to agent configuration"),
+  cron: CronConfigSchema.optional().describe(
+    "Cheap-cron settings (docs/rfcs/cheap-cron-sessions.md). Operator-owned " +
+    "egress allowlist + host-pinned secret bindings for Tier-0 http-diff " +
+    "polls (§6.1). Required to enable any http-diff poll; not agent-writable.",
+  ),
 });
 
 export type SwitchroomConfig = z.infer<typeof SwitchroomConfigSchema>;
@@ -2923,6 +2948,7 @@ export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;
 export type ScheduleEntry = z.infer<typeof ScheduleEntrySchema>;
 export type PollSpec = z.infer<typeof PollSpecSchema>;
+export type CronConfig = z.infer<typeof CronConfigSchema>;
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
