@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.14.93 — `agent restart` regenerates the compose, so pin bumps apply (#2249)
+
+A `release.pin` bump in `switchroom.yaml` followed by `switchroom agent restart`
+silently didn't take: restart re-emitted the agent-dir scaffold (`start.sh`) but
+**not** the fleet compose, so the container recreated against the *old* image ref
+still on disk. Operators had to remember a separate `switchroom apply` first.
+
+`agent restart` now regenerates the compose from the current config right before
+the recreate — restoring the "edit `switchroom.yaml` → restart → done" contract
+its own docstring already promised. Apply and restart share one
+`writeComposeFile()` so they can never drift; the compose path is resolved with
+the same env-aware resolver `restartAgent` reads from; a write failure warns but
+never aborts the bounce; and the file stays operator-owned under sudo. Only the
+named service is recreated (`--no-deps`), so a single-agent restart can't disrupt
+the rest of the fleet. (`switchroom update --pin` already ran `apply` internally
+and was unaffected.)
+
 ## v0.14.92 — Cheap cron: deterministic polls + a per-agent Sonnet cron session (#2244, #2245, #2246, #2247)
 
 Cron fires were expensive for a structural reason: **every fire injected a turn
