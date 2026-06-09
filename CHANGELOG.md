@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.14.92 — Cheap cron: deterministic polls + a per-agent Sonnet cron session (#2244, #2245, #2246, #2247)
+
+Cron fires were expensive for a structural reason: **every fire injected a turn
+into the agent's live session**, paying the full standing-context cache-read tax
+(system prompt + the ~31k-token MCP schema surface + the running conversation)
+*and* running at the agent's configured model — even when the fire was a `*/10`
+poll that found nothing to do. Two disabled polls (a telegram-capture and a
+lead-alert) were ~240 no-op fires/day, almost all wasted.
+
+This release lands the **cheap-cron** machinery in three tiers, cheapest-first,
+entirely behind `SWITCHROOM_CHEAP_CRON` (default **off** — a complete no-op until
+an operator opts in, so the fleet is unchanged):
+
+- **Tier 0 — deterministic poll (no model).** A `kind: poll` schedule entry runs
+  a declarative, operator-approved poll (`http-diff`) in the scheduler process.
+  No change → `HEARTBEAT_OK`, **zero model tokens**; only a hit escalates. This is
+  the headline saving. Fenced by an SSRF/egress guard (https-only operator
+  allowlist + host-pinned secret bindings + loopback/private/rebind rejection)
+  and write-ahead poll-state (a restart mid-escalation never double-fires; the
+  first poll of a new key records a baseline and never floods).
+- **Tier 1 — a per-agent cheap cron session.** A second *interactive* `claude
+  --model sonnet` registers to the gateway as a distinct `<name>-cron` bridge —
+  reusing the hardened single-bridge IPC untouched, with all status surfaces
+  gated off the cron identity (the cron session is status-silent). It loads a
+  **trimmed `.mcp.json`** (switchroom-telegram only), skipping the main session's
+  MCP schema tax, and shares the broker-managed OAuth.
+- **Tier 2 — main session.** `context: agent` injects into the live session,
+  exactly as today.
+
+Routing is driven by the reactivated `ScheduleEntry.model` field plus new
+`kind`/`context`, decided by a pure, total-enumeration-proven function. New
+`switchroom schedule report [agent]` shows the per-tier cost breakdown. Compliance
+is preserved by construction: Tier 0 touches no model; Tiers 1–2 are interactive
+`claude` (never `claude -p`).
+
 ## v0.14.91 — Surface orphaned foreground sub-agents (extended autonomous work) (#2240)
 
 When an agent kept working **after its turn ended** — extended autonomous work,
