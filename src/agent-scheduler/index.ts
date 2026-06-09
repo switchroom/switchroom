@@ -35,6 +35,10 @@ import {
   type InboundMessageWire,
   type SchedulerEntry,
 } from "../scheduler/dispatch.js";
+import { resolveCronRouting, resolveEscalationRouting } from "../scheduler/cron-routing.js";
+import type { PollOutcome } from "../scheduler/poll-engine.js";
+import type { PollStateStore } from "../scheduler/poll-state.js";
+import type { PollSpec } from "../config/schema.js";
 // AgentChannelTarget, resolveChannelTarget, and resolveEntryThreadId
 // live in ./channel-target.js (a node-cron-free leaf) so the gateway's
 // webhook-ingest path can import them without pulling node-cron into
@@ -104,6 +108,25 @@ export interface RegisterOptions {
   /** Retry timer seam (tests inject a synchronous driver). Default setTimeout;
    *  returns a canceller cleared on task stop. */
   scheduleRetry?: (fn: () => void, ms: number) => { cancel: () => void };
+  /**
+   * Cheap-cron hooks (docs/rfcs/cheap-cron-sessions.md). Absent or
+   * `enabled:false` ⟹ today's behaviour exactly (resolveCronRouting returns
+   * the main session, no poll runs). Wired in main() with the real broker
+   * secret-resolver + file poll-state; tests inject fakes.
+   */
+  cheapCron?: CheapCronHooks;
+}
+
+export interface CheapCronHooks {
+  enabled: boolean;
+  pollState: PollStateStore;
+  /** Run a declarative poll (model-free) and return whether to escalate. */
+  runPoll: (spec: PollSpec, prevCursor: string | undefined) => Promise<PollOutcome>;
+}
+
+/** Replace {{diff}} in an escalation prompt with the poll's diff summary. */
+function templateEscalationPrompt(prompt: string, diff: string): string {
+  return prompt.replace(/\{\{\s*diff\s*\}\}/g, diff);
 }
 
 export interface RegisteredTask {
@@ -195,13 +218,84 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
         }
       }
 
+      const cheapEnabled = opts.cheapCron?.enabled ?? false;
+      const routing = resolveCronRouting(entry, { cheapCronEnabled: cheapEnabled });
+      const threadId = resolveEntryThreadId(entry, opts.channel);
+      const record = (fields: {
+        exitCode: number;
+        summary: string;
+        tier: "poll" | "cheap" | "main";
+        modelUsed?: string;
+      }) =>
+        opts.sink.recordFire({
+          agent: entry.agent,
+          scheduleIndex: entry.scheduleIndex,
+          promptKey: entry.promptKey,
+          exitCode: fields.exitCode,
+          outputSummary: fields.summary.slice(0, 200),
+          startedAt,
+          finishedAt: now(),
+          tier: fields.tier,
+          ...(fields.modelUsed ? { modelUsed: fields.modelUsed } : {}),
+        });
+
+      // ── Tier 0: deterministic poll, no model ──────────────────────────
+      if (routing.tier === "poll" && opts.cheapCron && entry.poll) {
+        const stateKey = entry.poll.state_key;
+        const prev = opts.cheapCron.pollState.get(stateKey)?.value;
+        let outcome: PollOutcome;
+        try {
+          outcome = await opts.cheapCron.runPoll(entry.poll, prev);
+        } catch (err) {
+          outcome = { hit: false, baseline: false, error: (err as Error).message };
+        }
+        if (outcome.error) {
+          // exit -3 = poll error: no escalation; re-polls on next tick (idempotent).
+          record({ exitCode: -3, summary: `poll error: ${outcome.error}`, tier: "poll" });
+          return;
+        }
+        if (outcome.baseline) {
+          opts.cheapCron.pollState.setBaseline(stateKey, outcome.cursor!);
+          record({ exitCode: 0, summary: "poll baseline recorded — first run, no escalate", tier: "poll" });
+          return;
+        }
+        if (!outcome.hit) {
+          record({ exitCode: 0, summary: "HEARTBEAT_OK — no change (model-free)", tier: "poll" });
+          return;
+        }
+        // HIT → write-ahead the cursor BEFORE dispatch (double-escalation guard),
+        // then escalate the entry's prompt as a model fire (Tier 1/2).
+        opts.cheapCron.pollState.writeAhead(stateKey, outcome.cursor!, startedAt, outcome.diff ?? "");
+        const esc = resolveEscalationRouting(entry, { cheapCronEnabled: cheapEnabled });
+        let delivered = false;
+        try {
+          const r = dispatchAsInbound(
+            { ...entry, prompt: templateEscalationPrompt(entry.prompt, outcome.diff ?? "") },
+            { chatId: opts.channel.chatId, threadId, now, session: esc.session ?? "main", model: esc.cronModel },
+            opts.dispatcher,
+          );
+          delivered = r.delivered;
+        } catch (err) {
+          record({ exitCode: -1, summary: `escalation dispatch error: ${(err as Error).message}`, tier: esc.tier === "cheap" ? "cheap" : "main", modelUsed: esc.cronModel });
+          return;
+        }
+        if (delivered) opts.cheapCron.pollState.clearPending(stateKey);
+        record({
+          exitCode: delivered ? 0 : -1,
+          summary: delivered ? `poll hit → escalated (${outcome.diff})` : "poll hit → escalation not delivered",
+          tier: esc.tier === "cheap" ? "cheap" : "main",
+          modelUsed: esc.cronModel,
+        });
+        return;
+      }
+
+      // ── Tier 1/2: a model fire into the cron or main session ──────────
       let delivered = false;
       let summary = "";
       try {
-        const threadId = resolveEntryThreadId(entry, opts.channel);
         const result = dispatchAsInbound(
           entry,
-          { chatId: opts.channel.chatId, threadId, now },
+          { chatId: opts.channel.chatId, threadId, now, session: routing.session ?? "main", model: routing.cronModel },
           opts.dispatcher,
         );
         delivered = result.delivered;
@@ -211,21 +305,16 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       } catch (err) {
         summary = `dispatch error: ${(err as Error).message}`.slice(0, 200);
       }
-      const finishedAt = now();
-      // Mirror the shape host-side dispatch.ts:DispatchResult emits so
-      // Phase 3 audit parity is a field-for-field equality check.
       // exit_code semantics for the IPC path:
       //   0 — bytes accepted by the local gateway socket (best signal)
       //  -1 — gateway not connected, or wire write failed
       //  -2 — deferred: fleet fully quota-walled (recorded above)
-      opts.sink.recordFire({
-        agent: entry.agent,
-        scheduleIndex: entry.scheduleIndex,
-        promptKey: entry.promptKey,
+      //  -3 — Tier-0 poll error (recorded above)
+      record({
         exitCode: delivered ? 0 : -1,
-        outputSummary: summary,
-        startedAt,
-        finishedAt,
+        summary,
+        tier: routing.tier === "cheap" ? "cheap" : "main",
+        modelUsed: routing.cronModel,
       });
     };
 

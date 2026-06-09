@@ -19,7 +19,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
+import type { PollSpec, ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 
 export interface SchedulerEntry {
@@ -29,6 +29,16 @@ export interface SchedulerEntry {
   prompt: string;
   /** SHA-256 prefix of prompt — stable, non-reversible audit key. */
   promptKey: string;
+  /**
+   * Cheap-cron routing fields (docs/rfcs/cheap-cron-sessions.md). Consumed
+   * by the in-agent scheduler via resolveCronRouting() at fire time. All
+   * inert unless SWITCHROOM_CHEAP_CRON is on. `kind: poll` runs a model-free
+   * deterministic poll (requires `poll`) that only escalates on a hit.
+   */
+  kind?: "poll" | "prompt";
+  model?: string;
+  context?: "fresh" | "agent";
+  poll?: PollSpec;
   /**
    * Per-entry Telegram topic override (PR4b of supergroup-mode rollout).
    * Either a string alias defined in the agent's
@@ -78,6 +88,11 @@ export function collectScheduleEntries(
         // Propagate the per-entry topic override (PR1 schema field).
         // Resolved at dispatch time via resolveOutboundTopic().
         ...(entry.topic !== undefined ? { topic: entry.topic } : {}),
+        // Cheap-cron routing fields — inert unless SWITCHROOM_CHEAP_CRON on.
+        ...(entry.kind !== undefined ? { kind: entry.kind } : {}),
+        ...(entry.model !== undefined ? { model: entry.model } : {}),
+        ...(entry.context !== undefined ? { context: entry.context } : {}),
+        ...(entry.poll !== undefined ? { poll: entry.poll } : {}),
       });
     }
   }
@@ -102,6 +117,14 @@ export interface DispatchResult {
   outputSummary: string;
   startedAt: number;
   finishedAt: number;
+  /**
+   * Cheap-cron observability (docs/rfcs/cheap-cron-sessions.md §5). Which
+   * tier this fire took and the model it ran at, so `switchroom schedule
+   * report` can show the cost breakdown. Absent on legacy audit rows and
+   * when SWITCHROOM_CHEAP_CRON is off (treated as 'main').
+   */
+  tier?: "poll" | "cheap" | "main";
+  modelUsed?: string;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -169,6 +192,15 @@ export interface InboundDispatchOptions {
    * a fixed clock to make `messageId` and `ts` deterministic.
    */
   now?: () => number;
+  /**
+   * Cheap-cron routing (docs/rfcs/cheap-cron-sessions.md §3.3). Which
+   * gateway session this fire injects into — 'cron' for a Tier-1 cheap
+   * session, 'main' (or unset) for the live session. Emitted as
+   * `meta.session`; the gateway defaults absent → 'main' (back-compat).
+   */
+  session?: "cron" | "main";
+  /** Tier-1 cron-session model; emitted as `meta.model` for the cron bridge. */
+  model?: string;
 }
 
 export interface InboundDispatchResult {
@@ -212,6 +244,11 @@ export function dispatchAsInbound(
       source: "cron",
       schedule_index: String(entry.scheduleIndex),
       prompt_key: entry.promptKey,
+      // Cheap-cron session routing — emitted only when targeting the cron
+      // session, so existing fires stay byte-identical (gateway defaults
+      // absent → 'main'). meta is Record<string,string> on the wire.
+      ...(options.session === "cron" ? { session: "cron" } : {}),
+      ...(options.session === "cron" && options.model ? { model: options.model } : {}),
     },
   };
   const delivered = dispatcher.sendToAgent(entry.agent, message);
