@@ -174,3 +174,25 @@ export function sweepStaleTurnActiveMarker(
     return false;
   }
 }
+
+/**
+ * Age (ms) of the turn-active marker's mtime, or null if the marker is
+ * absent/unstattable. The marker is touched on every foreground tool_use AND
+ * (via the subagent-watcher, #501) on foreground sub-agent JSONL growth — so a
+ * SMALL age means the agent, or an orphaned/extended-autonomous foreground
+ * sub-agent that outlived its turn (#2240), is actively working RIGHT NOW, even
+ * though the turn-in-flight machine has gone idle. A large age (or null) means
+ * the work stopped or the marker leaked. Used by the obligation sweep to avoid a
+ * false "did I miss this? re-send" escalation while genuine post-turn work is in
+ * flight. Pure read; clock injectable for tests. Never throws — a stat failure
+ * is reported as null (treated as "not working").
+ */
+export function readTurnActiveMarkerAgeMs(stateDir: string, now?: number): number | null {
+  const path = join(stateDir, TURN_ACTIVE_MARKER_FILE);
+  try {
+    const st = statSync(path);
+    return (now ?? Date.now()) - st.mtimeMs;
+  } catch {
+    return null; // ENOENT / unstattable → not working
+  }
+}
