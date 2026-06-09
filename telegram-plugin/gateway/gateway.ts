@@ -422,6 +422,9 @@ import {
   saveQuotaWatchState,
   patchQuotaWatchState,
   emptyAccountState,
+  resolveQuotaWatchTuning,
+  buildQuotaClaimKey,
+  QUOTA_WATCH_CLAIM_WINDOW_MS,
 } from '../quota-watch.js'
 import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
 import {
@@ -14969,9 +14972,34 @@ async function runCreditWatch(): Promise<void> {
  * State persists across restarts via `<stateDir>/quota-watch.json`.
  * Mirrors runCreditWatch's structure and notification routing.
  */
-async function runQuotaWatch(): Promise<void> {
+
+/**
+ * Ask the broker for the fleet-wide dedup claim on one notification key.
+ * FAIL-OPEN on any error: a broker that predates the `claim-notification`
+ * op (skewed rollout) rejects at the protocol layer, and a transient IPC
+ * failure must degrade to duplicated notifications, never dropped ones.
+ */
+async function claimQuotaNotification(
+  brokerClient: NonNullable<Awaited<ReturnType<typeof getAuthBrokerClient>>>,
+  key: string,
+): Promise<boolean> {
+  try {
+    const res = await brokerClient.claimNotification(key, QUOTA_WATCH_CLAIM_WINDOW_MS)
+    return res.granted
+  } catch (err) {
+    process.stderr.write(`telegram gateway: quota-watch: claim failed (fail-open): ${err}\n`)
+    return true
+  }
+}
+
+async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   const agentName = getMyAgentName()
   const stateDir = STATE_DIR
+  const bootTick = opts.bootTick ?? false
+  // Hardening knobs (2026-06-09 incident: fleet bounce released stale
+  // recovery latches on all 11 agents at once → 26 duplicate sends).
+  // See QuotaWatchTuning in quota-watch.ts for the env contract.
+  const tuning = resolveQuotaWatchTuning(process.env)
 
   // Read broker state. The listState response now includes last_quota
   // per account — the broker's in-memory cache from previous probeQuota
@@ -15019,6 +15047,20 @@ async function runQuotaWatch(): Promise<void> {
     })
     if (fleetDecision.kind === 'notify') {
       for (const chat_id of access.allowFrom) {
+        // Fleet-level dedup: all 11 gateways detect this same edge within
+        // one poll cycle — only the broker-claim winner sends per chat.
+        if (tuning.fleetDedup) {
+          const granted = await claimQuotaNotification(
+            brokerClient,
+            buildQuotaClaimKey(FLEET_ALL_EXHAUSTED_KEY, fleetDecision.transition, chat_id),
+          )
+          if (!granted) {
+            process.stderr.write(
+              `telegram gateway: quota-watch: fleet-all-exhausted claim denied chat=${chat_id} — another agent notified\n`,
+            )
+            continue
+          }
+        }
         await swallowingApiCall(
           () =>
             bot.api.sendMessage(chat_id, fleetDecision.message, {
@@ -15056,10 +15098,21 @@ async function runQuotaWatch(): Promise<void> {
     snapshots.map((s, i) => [s.label, i]),
   )
 
+  // Reconciled transitions: state advances (latch clears) but nothing is
+  // sent — boot-tick and late recoveries (see QuotaWatchDecision docs).
+  let reconciledCount = 0
+  let mutatedState = watchState
+
   for (const snap of snapshots) {
     const prev = watchState[snap.label] ?? emptyAccountState()
-    const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now })
-    if (decision.kind !== 'skip') {
+    const decision = evaluateQuotaWatchAccount({ agentName, snap, prev, now, bootTick, tuning })
+    if (decision.kind === 'reconcile') {
+      mutatedState = patchQuotaWatchState(mutatedState, decision.accountLabel, decision.newAccountState)
+      reconciledCount++
+      process.stderr.write(
+        `telegram gateway: quota-watch: reconciled ${decision.transition} for account=${decision.accountLabel} (${decision.reason}) — no notification\n`,
+      )
+    } else if (decision.kind !== 'skip') {
       pendingTransitions.push({
         accountLabel: snap.label,
         snapIndex: labelToSnapIndex.get(snap.label) ?? -1,
@@ -15069,7 +15122,16 @@ async function runQuotaWatch(): Promise<void> {
   }
 
   if (pendingTransitions.length === 0) {
-    return // Steady-state: no notifications, no probes, no state write.
+    // Steady-state: no notifications, no probes. Persist only if a
+    // reconcile advanced the latch (otherwise no state write at all).
+    if (reconciledCount > 0) {
+      try {
+        saveQuotaWatchState(stateDir, mutatedState)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: quota-watch state persist failed: ${err}\n`)
+      }
+    }
+    return
   }
 
   // Transition detected: probe ONLY the crossing accounts to get fresh
@@ -15083,16 +15145,31 @@ async function runQuotaWatch(): Promise<void> {
       freshProbeMap.set(entry.label, entry.result)
     }
   } catch (err) {
-    // Probe failed — still send notifications using cached data.
-    // Don't abort: the user should know about the threshold crossing
-    // even if the message body shows slightly stale numbers.
     process.stderr.write(`telegram gateway: quota-watch: probe for crossing accounts failed: ${err}\n`)
+    if (!tuning.sendOnProbeFail) {
+      // A quota notification must never carry numbers we could not verify
+      // live. Leave the crossing accounts' state untouched — the
+      // transition re-evaluates (and re-probes) on the next 15-min tick.
+      // Persist any reconciles already applied, then bail.
+      if (reconciledCount > 0) {
+        try {
+          saveQuotaWatchState(stateDir, mutatedState)
+        } catch (saveErr) {
+          process.stderr.write(`telegram gateway: quota-watch state persist failed: ${saveErr}\n`)
+        }
+      }
+      process.stderr.write(
+        `telegram gateway: quota-watch: deferring ${pendingTransitions.length} notification(s) until probe succeeds\n`,
+      )
+      return
+    }
+    // Legacy (SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL=1): fall through
+    // and send from cached data.
   }
 
   // Build final notifications, enriching the snapshot with fresh probe
   // data where available.
-  let mutatedState = watchState
-  const notifications: Array<{ message: string; accountLabel: string }> = []
+  const notifications: Array<{ message: string; accountLabel: string; transition: string }> = []
 
   for (const { accountLabel, snapIndex, decision } of pendingTransitions) {
     // Re-evaluate with fresh probe data to get an accurate message body.
@@ -15100,37 +15177,88 @@ async function runQuotaWatch(): Promise<void> {
     const freshResult = freshProbeMap.get(accountLabel)
     let enrichedDecision = decision
     // pendingTransitions only ever holds notify decisions (pushed under
-    // `decision.kind !== 'skip'`). Narrow explicitly so `decision.transition`
-    // type-checks below; this continue never fires at runtime.
+    // `decision.kind !== 'skip'` / `!== 'reconcile'`). Narrow explicitly so
+    // `decision.transition` type-checks below; this continue never fires
+    // at runtime.
     if (decision.kind !== 'notify') continue
     if (freshResult && freshResult.ok && snapIndex >= 0) {
-      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data }
+      // Live numbers replace the cache — and capturedAtMs is cleared so the
+      // staleness gate never misfires on data we JUST probed.
+      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data, capturedAtMs: undefined }
       const prev = watchState[accountLabel] ?? emptyAccountState()
-      const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now })
+      const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now, bootTick, tuning })
       // If the fresh probe still shows the same transition, use the
       // enriched message. If it no longer shows a transition (e.g. the
       // account recovered in the 100ms between listState and probe),
       // fall through to skip this notification.
       if (re.kind === 'notify' && re.transition === decision.transition) {
         enrichedDecision = re
+      } else if (re.kind === 'reconcile') {
+        // Fresh data confirms the transition but it isn't news (boot-tick /
+        // late recovery) — advance the latch silently.
+        mutatedState = patchQuotaWatchState(mutatedState, accountLabel, re.newAccountState)
+        reconciledCount++
+        process.stderr.write(
+          `telegram gateway: quota-watch: reconciled ${re.transition} for account=${accountLabel} (${re.reason}) — no notification\n`,
+        )
+        continue
       } else if (re.kind === 'skip') {
         // State normalised by the time of the probe — don't notify.
         continue
       }
+    } else if (!tuning.sendOnProbeFail) {
+      // No verified fresh data for this account (per-account probe failure
+      // or label missing from the batch result). Same rule as the batch
+      // throw above: never send unverified numbers. State untouched —
+      // re-evaluated (and re-probed) next tick.
+      process.stderr.write(
+        `telegram gateway: quota-watch: probe unavailable for account=${accountLabel} — deferring notification\n`,
+      )
+      continue
     }
 
     if (enrichedDecision.kind !== 'notify') continue
-    notifications.push({ message: enrichedDecision.message, accountLabel })
+    notifications.push({
+      message: enrichedDecision.message,
+      accountLabel,
+      transition: enrichedDecision.transition,
+    })
     mutatedState = patchQuotaWatchState(mutatedState, accountLabel, enrichedDecision.newAccountState)
   }
 
   if (notifications.length === 0) {
-    return // All transitions resolved by the time of the live probe.
+    // All transitions resolved/deferred by the time of the live probe.
+    // Reconciles may still have advanced the latch — persist those.
+    if (reconciledCount > 0) {
+      try {
+        saveQuotaWatchState(stateDir, mutatedState)
+      } catch (err) {
+        process.stderr.write(`telegram gateway: quota-watch state persist failed: ${err}\n`)
+      }
+    }
+    return
   }
 
   // Send all notifications (one message per crossing account).
-  for (const { message, accountLabel } of notifications) {
+  for (const { message, accountLabel, transition } of notifications) {
     for (const chat_id of access.allowFrom) {
+      // Fleet-level dedup: every agent gateway independently detects the
+      // same account transition within one poll cycle. The broker claim
+      // grants exactly one sender per (account, transition, chat) per
+      // window — the other ten agents advance their local state silently.
+      // Fail-open on claim error (see claimQuotaNotification).
+      if (tuning.fleetDedup) {
+        const granted = await claimQuotaNotification(
+          brokerClient,
+          buildQuotaClaimKey(accountLabel, transition, chat_id),
+        )
+        if (!granted) {
+          process.stderr.write(
+            `telegram gateway: quota-watch: claim denied account=${accountLabel} chat=${chat_id} — another agent notified\n`,
+          )
+          continue
+        }
+      }
       // Quota-watch notify — best-effort. Wrap via swallowingApiCall so
       // flood-wait / deleted-chat / not-found surface as a stderr log
       // rather than a thrown exception that aborts the loop and leaves
@@ -20453,7 +20581,12 @@ void (async () => {
           // settle after boot (avoids a probe race with the boot-card
           // quota probe that fires in the first few seconds).
           setTimeout(() => {
-            void runQuotaWatch().catch((err) => {
+            // bootTick: recovery edges observed on the FIRST post-boot tick
+            // reconcile silently — a fleet bounce synchronizes all agents'
+            // first ticks, and a just-booted gateway can't tell "just
+            // recovered" from "recovered while we were down" (the
+            // 2026-06-09 26-message flood). Warnings still notify.
+            void runQuotaWatch({ bootTick: true }).catch((err) => {
               process.stderr.write(`telegram gateway: quota-watch initial run failed: ${err}\n`)
             })
           }, 30_000)

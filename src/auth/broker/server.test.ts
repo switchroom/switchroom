@@ -2270,3 +2270,157 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     broker.stop();
   });
 });
+
+describe("AuthBroker — claim-notification (fleet notification dedup)", () => {
+  function makeClaimBroker(h: Harness, fakeNow: () => number): AuthBroker {
+    const config = makeConfig(h, {
+      active: "default",
+      agents: { ziggy: {}, klanker: {} },
+    });
+    seedAccount(h, "default");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "klanker"), { recursive: true });
+    return new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      now: fakeNow,
+    });
+  }
+
+  it("grants the first claimant and denies the second inside the window — across agents", async () => {
+    const h = makeHarness();
+    let t = 1_000_000;
+    const broker = makeClaimBroker(h, () => t);
+    await broker.start();
+    const key = "quota-watch:acct@example.com:recovered-to-healthy:12345";
+    // ziggy (non-admin) claims first → granted. No ACL on this op.
+    const first = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "1", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(first.ok).toBe(true);
+    expect(first.data.granted).toBe(true);
+    // klanker claims the SAME key 5 minutes later → denied.
+    t += 5 * 60_000;
+    const second = await rpc(join(h.socketRoot, "klanker", "sock"), {
+      v: 1, id: "2", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(second.ok).toBe(true);
+    expect(second.data.granted).toBe(false);
+    broker.stop();
+  });
+
+  it("a different key (other chat / other transition) is independent", async () => {
+    const h = makeHarness();
+    const broker = makeClaimBroker(h, () => 1_000_000);
+    await broker.start();
+    const sock = join(h.socketRoot, "ziggy", "sock");
+    const a = await rpc(sock, {
+      v: 1, id: "1", op: "claim-notification",
+      key: "quota-watch:acct@example.com:recovered-to-healthy:111", windowMs: 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    const b = await rpc(sock, {
+      v: 1, id: "2", op: "claim-notification",
+      key: "quota-watch:acct@example.com:recovered-to-healthy:222", windowMs: 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    const c = await rpc(sock, {
+      v: 1, id: "3", op: "claim-notification",
+      key: "quota-watch:acct@example.com:entered-throttling:111", windowMs: 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(a.data.granted).toBe(true);
+    expect(b.data.granted).toBe(true); // other chat
+    expect(c.data.granted).toBe(true); // other edge direction
+    broker.stop();
+  });
+
+  it("re-grants the same key after the window expires", async () => {
+    const h = makeHarness();
+    let t = 1_000_000;
+    const broker = makeClaimBroker(h, () => t);
+    await broker.start();
+    const sock = join(h.socketRoot, "ziggy", "sock");
+    const key = "quota-watch:acct@example.com:entered-throttling:12345";
+    const first = await rpc(sock, {
+      v: 1, id: "1", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(first.data.granted).toBe(true);
+    // 29 min later: still inside the window → denied.
+    t += 29 * 60_000;
+    const inside = await rpc(sock, {
+      v: 1, id: "2", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(inside.data.granted).toBe(false);
+    // Another 2 min (31 total since grant): window expired → granted again
+    // (a genuine re-crossing of the same edge re-notifies).
+    t += 2 * 60_000;
+    const after = await rpc(sock, {
+      v: 1, id: "3", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(after.data.granted).toBe(true);
+    broker.stop();
+  });
+
+  it("claims persist across a broker restart (window survives the bounce)", async () => {
+    const h = makeHarness();
+    let t = 1_000_000;
+    const broker1 = makeClaimBroker(h, () => t);
+    await broker1.start();
+    const key = "quota-watch:acct@example.com:recovered-to-healthy:12345";
+    const first = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "1", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(first.data.granted).toBe(true);
+    broker1.stop();
+    // On-disk file exists with the key.
+    const onDisk = JSON.parse(readFileSync(join(h.stateDir, "notification-claims.json"), "utf-8"));
+    expect(onDisk[key]).toBe(1_000_000);
+    // New broker process, 5 min later (fleet bounce mid-window): still denied.
+    t += 5 * 60_000;
+    const broker2 = makeClaimBroker(h, () => t);
+    await broker2.start();
+    const second = await rpc(join(h.socketRoot, "klanker", "sock"), {
+      v: 1, id: "2", op: "claim-notification", key, windowMs: 30 * 60_000,
+    }) as { ok: boolean; data: { granted: boolean } };
+    expect(second.data.granted).toBe(false);
+    broker2.stop();
+  });
+
+  it("prunes entries older than 24h on the next grant (file stays bounded)", async () => {
+    const h = makeHarness();
+    let t = 1_000_000;
+    const broker = makeClaimBroker(h, () => t);
+    await broker.start();
+    const sock = join(h.socketRoot, "ziggy", "sock");
+    const oldKey = "quota-watch:acct@example.com:entered-throttling:111";
+    await rpc(sock, { v: 1, id: "1", op: "claim-notification", key: oldKey, windowMs: 60_000 });
+    // 25 hours later, a new grant triggers the prune sweep.
+    t += 25 * 60 * 60_000;
+    await rpc(sock, {
+      v: 1, id: "2", op: "claim-notification",
+      key: "quota-watch:acct@example.com:entered-throttling:222", windowMs: 60_000,
+    });
+    const onDisk = JSON.parse(readFileSync(join(h.stateDir, "notification-claims.json"), "utf-8"));
+    expect(onDisk[oldKey]).toBeUndefined();
+    expect(Object.keys(onDisk)).toHaveLength(1);
+    broker.stop();
+  });
+
+  it("two concurrent claims for the same key yield exactly one grant", async () => {
+    const h = makeHarness();
+    const broker = makeClaimBroker(h, () => 1_000_000);
+    await broker.start();
+    const key = "quota-watch:acct@example.com:recovered-to-healthy:999";
+    const [a, b] = await Promise.all([
+      rpc(join(h.socketRoot, "ziggy", "sock"), {
+        v: 1, id: "1", op: "claim-notification", key, windowMs: 60_000,
+      }),
+      rpc(join(h.socketRoot, "klanker", "sock"), {
+        v: 1, id: "2", op: "claim-notification", key, windowMs: 60_000,
+      }),
+    ]) as Array<{ ok: boolean; data: { granted: boolean } }>;
+    const grants = [a, b].filter((r) => r.data.granted).length;
+    expect(grants).toBe(1);
+    broker.stop();
+  });
+});

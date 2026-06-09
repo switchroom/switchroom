@@ -341,6 +341,36 @@ export const ProbeQuotaRequestSchema = z.object({
   timeoutMs: z.number().int().positive().max(60_000).optional(),
 });
 
+/**
+ * Fleet-wide notification dedup claim (#E4 follow-up — quota-watch
+ * de-duplication). Every agent gateway independently runs the same
+ * watchers (quota-watch, fleet all-exhausted) over the same shared
+ * account pool, so a single transition used to fan out one Telegram
+ * message PER AGENT (×11 on a full fleet). The broker — already the
+ * fleet's shared singleton — arbitrates: the first caller to claim a
+ * `key` within `windowMs` is granted (and should send); everyone else
+ * is denied (and should stay silent but still update local state).
+ *
+ * Keys are caller-defined, e.g.
+ * `quota-watch:<account>:<transition>:<chatId>` — per-chat keys keep
+ * the audience identical to the pre-dedup behaviour (every chat any
+ * agent would have notified still gets exactly one copy).
+ *
+ * ACL: same posture as `list-state` — no identity restriction. A
+ * denied claim is `granted: false`, never an error. Claims are
+ * persisted (`notification-claims.json`) so a broker restart inside
+ * the window does not re-open the gate.
+ */
+export const ClaimNotificationRequestSchema = z.object({
+  v: z.literal(PROTOCOL_VERSION),
+  op: z.literal("claim-notification"),
+  id: z.string().min(1),
+  /** Dedup key. Caller-namespaced (e.g. "quota-watch:<acct>:<edge>:<chat>"). */
+  key: z.string().min(1).max(512),
+  /** Deny subsequent claims for the same key for this long. */
+  windowMs: z.number().int().positive().max(86_400_000),
+});
+
 export const RequestSchema = z.discriminatedUnion("op", [
   GetCredentialsRequestSchema,
   ListStateRequestSchema,
@@ -353,6 +383,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   ListGoogleAccountsRequestSchema,
   ListMicrosoftAccountsRequestSchema,
   ProbeQuotaRequestSchema,
+  ClaimNotificationRequestSchema,
 ]);
 
 export type Request = z.infer<typeof RequestSchema>;
@@ -425,6 +456,11 @@ export const RmAccountDataSchema = z.object({
 export const SetOverrideDataSchema = z.object({
   agent: z.string(),
   account: z.string().nullable(),
+});
+
+export const ClaimNotificationDataSchema = z.object({
+  /** True for the first claimant inside the window — only they send. */
+  granted: z.boolean(),
 });
 
 /**
