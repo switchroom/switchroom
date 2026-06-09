@@ -18,7 +18,7 @@
 import { Option, type Command } from "commander";
 import chalk from "chalk";
 import { accessSync, chownSync, constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { spawnSync as childSpawnSync } from "node:child_process";
 import readline from "node:readline";
 // Embed example configs as text imports so they survive `bun build --compile`.

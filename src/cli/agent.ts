@@ -11,7 +11,6 @@ import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift } from "../agents/scaffold.js";
 import { writeComposeFile } from "./write-compose.js";
-import { DEFAULT_COMPOSE_PATH } from "./apply.js";
 import { bareClonePath } from "../repos/bare-clone.js";
 import { removeAgentWorktree } from "../repos/agent-worktree.js";
 import { listAvailableProfiles } from "../agents/profiles.js";
@@ -20,6 +19,7 @@ import {
   stopAgent,
   restartAgent,
   gracefulRestartAgent,
+  composeFilePath,
   applyCronChangesHot,
   classifyChangeKind,
   interruptAgent,
@@ -688,8 +688,12 @@ export async function reconcileAndRestartAgent(
   // as before this fix.
   try {
     const r = await deps.writeComposeFile({
+      // composeFilePath() is the SAME env-aware resolver restartAgent reads
+      // from (honours SWITCHROOM_COMPOSE_FILE / SWITCHROOM_HOME) — so the file
+      // we regenerate is exactly the one the recreate consumes, never a
+      // divergent DEFAULT path.
       config,
-      composePath: opts.composePath ?? DEFAULT_COMPOSE_PATH,
+      composePath: opts.composePath ?? composeFilePath(),
       switchroomConfigPath: configPath,
     });
     if (r.changed) {
