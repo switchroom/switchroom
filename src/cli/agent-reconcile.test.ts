@@ -27,12 +27,20 @@ function mkDeps(overrides: Partial<ReconcileAndRestartDeps> = {}): ReconcileAndR
   restartAgent: ReturnType<typeof vi.fn>;
   gracefulRestartAgent: ReturnType<typeof vi.fn>;
   applyCronChangesHot: ReturnType<typeof vi.fn>;
+  writeComposeFile: ReturnType<typeof vi.fn>;
 } {
   return {
     reconcileAgent: vi.fn(() => ({ agentDir: "/tmp/a", changes: [] })),
     restartAgent: vi.fn(),
     gracefulRestartAgent: vi.fn(),
     applyCronChangesHot: vi.fn(() => ({ cronScripts: [], ipcSignalled: false })),
+    writeComposeFile: vi.fn(async () => ({
+      composePath: "/tmp/compose.yml",
+      imageTag: "v0.0.0",
+      bytes: 0,
+      changed: false,
+      previousImageTag: null,
+    })),
     ...overrides,
   } as never;
 }
@@ -151,5 +159,54 @@ describe("reconcileAndRestartAgent — Phase F cron-only hot reload", () => {
     // depend on restart firing even when scaffold drift is zero.
     expect(deps.restartAgent).toHaveBeenCalledTimes(1);
     expect(deps.applyCronChangesHot).not.toHaveBeenCalled();
+  });
+});
+
+describe("reconcileAndRestartAgent — compose regen before recreate (pin self-heal)", () => {
+  it("regenerates the compose BEFORE recreating (so a pin bump applies on a plain restart)", async () => {
+    const order: string[] = [];
+    const deps = mkDeps({
+      writeComposeFile: vi.fn(async () => {
+        order.push("compose");
+        return { composePath: "/tmp/c.yml", imageTag: "v0.14.92", bytes: 10, changed: true, previousImageTag: "v0.14.91" };
+      }) as never,
+      restartAgent: vi.fn(() => { order.push("restart"); }) as never,
+    });
+
+    await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", "/cfg/switchroom.yaml", { silent: true, force: true, composePath: "/tmp/c.yml" }, deps);
+
+    expect(deps.writeComposeFile).toHaveBeenCalledTimes(1);
+    const arg = (deps.writeComposeFile as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(arg).toMatchObject({ composePath: "/tmp/c.yml", switchroomConfigPath: "/cfg/switchroom.yaml" });
+    // ordering: compose written, THEN container recreated
+    expect(order).toEqual(["compose", "restart"]);
+  });
+
+  it("cron-only hot path does NOT regenerate the compose (no recreate)", async () => {
+    const deps = mkDeps({
+      reconcileAgent: vi.fn(() => ({ agentDir: "/state/agents/foo", changes: ["/state/agents/foo/telegram/cron-0.sh"] })) as never,
+    });
+    await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", undefined, { silent: true, force: true }, deps);
+    expect(deps.writeComposeFile).not.toHaveBeenCalled();
+    expect(deps.restartAgent).not.toHaveBeenCalled();
+  });
+
+  it("a compose-regen failure WARNS but never aborts the restart", async () => {
+    const deps = mkDeps({
+      writeComposeFile: vi.fn(async () => { throw new Error("EACCES: permission denied"); }) as never,
+    });
+    const res = await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", undefined, { silent: true, force: true }, deps);
+    // restart still fired — the bounce works against the existing compose
+    expect(deps.restartAgent).toHaveBeenCalledTimes(1);
+    expect(res.restarted).toBe(true);
+  });
+
+  it("graceful restart still regenerates the compose first", async () => {
+    const deps = mkDeps({
+      gracefulRestartAgent: vi.fn(async () => ({ restartedImmediately: true, waitingForTurn: false })) as never,
+    });
+    await reconcileAndRestartAgent("foo", mkConfig("foo"), "/state/agents", undefined, { silent: true, force: true, graceful: true }, deps);
+    expect(deps.writeComposeFile).toHaveBeenCalledTimes(1);
+    expect(deps.gracefulRestartAgent).toHaveBeenCalledTimes(1);
   });
 });
