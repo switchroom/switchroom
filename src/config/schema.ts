@@ -61,20 +61,85 @@ export const AgentBindMountSchema = z.object({
     ),
 });
 
-export const ScheduleEntrySchema = z.object({
+// Tier-0 deterministic poll specs (docs/rfcs/cheap-cron-sessions.md §2.1).
+// A `kind: poll` entry runs model-free in the scheduler process; only a
+// *hit* escalates to a model fire (Tier 1/2) using the entry's prompt +
+// model/context. Two declarative, operator-approved poll types — never an
+// agent-authored script (the declaration itself is the capability; see
+// §6 SSRF/egress hardening). Discriminated on `type`.
+export const HttpDiffPollSchema = z.object({
+  type: z.literal("http-diff"),
+  url: z
+    .string()
+    .url()
+    .describe(
+      "Poll target. Host MUST match the operator egress allowlist (§6.1) — " +
+      "loopback/private/link-local/non-https are rejected; the IP is " +
+      "resolve-then-pinned against DNS-rebind. Not agent-writable without " +
+      "operator commit.",
+    ),
+  method: z.enum(["GET", "POST"]).default("GET"),
+  headers: z.record(z.string()).optional(),
+  secrets: z
+    .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))
+    .default([])
+    .describe(
+      "Vault keys this poll may inject into request headers. Each is " +
+      "HOST-PINNED (§6.1): a secret may only be sent to the host it is bound " +
+      "to in operator config, so an approved poll cannot exfil it elsewhere.",
+    ),
+  diff_jsonpath: z.string().describe("JSONPath into the response; the extracted value is compared to state_key."),
+  state_key: z.string().describe("Key under /state/agent/poll-state.json holding the last-seen value."),
+});
+
+export const TelegramReactionsPollSchema = z.object({
+  type: z.literal("telegram-reactions"),
+  chat_id: z.union([z.string().min(1), z.number().int()]).describe("Chat to scan for reactions (model-free internal gateway query)."),
+  emoji: z.string().min(1).describe("Reaction emoji that marks a message for capture (e.g. 👨‍💻)."),
+  lookback: z.number().int().positive().max(200).default(40),
+  state_key: z.string().describe("Key under poll-state.json holding the last-processed message id."),
+});
+
+export const PollSpecSchema = z.discriminatedUnion("type", [
+  HttpDiffPollSchema,
+  TelegramReactionsPollSchema,
+]);
+
+export const ScheduleEntrySchema = z
+  .object({
   cron: z.string().describe("Cron expression (e.g., '0 8 * * *')"),
-  prompt: z.string().describe("Prompt to send at the scheduled time"),
+  prompt: z.string().describe("Prompt to send at the scheduled time (the escalation prompt when kind=poll; templated with {{diff}})."),
+  kind: z
+    .enum(["poll", "prompt"])
+    .optional()
+    .describe(
+      "Tier-0 routing (docs/rfcs/cheap-cron-sessions.md). 'prompt' (default) " +
+      "fires a model turn every tick (Tier 1/2 per `context`). 'poll' runs a " +
+      "model-free deterministic check (requires `poll`) and only escalates to " +
+      "a model fire on a hit. Honoured only when SWITCHROOM_CHEAP_CRON is on.",
+    ),
+  poll: PollSpecSchema.optional().describe("Required iff kind=poll. The declarative poll spec."),
   model: z
     .string()
     .optional()
     .describe(
-      "DEPRECATED / IGNORED. Pre-v0.8 the singleton scheduler ran each " +
-      "task as an isolated headless invocation and could set --model per " +
-      "task. Post cron-fold-in (v0.8) the fire is injected into the agent's " +
-      "running session, so it always uses the agent's configured model " +
-      "— this field has no effect. Accepted (optional) only so existing " +
-      "configs keep validating; set the model at the agent level instead. " +
-      "See docs/scheduling.md.",
+      "Cron model hint. Reactivated by SWITCHROOM_CHEAP_CRON (was DEPRECATED/" +
+      "IGNORED in v0.8). A known-cheap id (sonnet/haiku family) routes the " +
+      "fire to a fresh cheap cron session (Tier 1, `context: fresh`); 'opus', " +
+      "a custom id, or unset routes to the agent's live session (Tier 2, " +
+      "`context: agent`) — the conservative default that preserves pre-v0.8 " +
+      "behaviour. Note: a live session's model is fixed at launch, so on Tier " +
+      "2 this is informational. See docs/scheduling.md.",
+    ),
+  context: z
+    .enum(["fresh", "agent"])
+    .optional()
+    .describe(
+      "Does this cron need the agent, or just a model? 'fresh' → a minimal-" +
+      "context cheap cron session (Tier 1). 'agent' → the agent's live " +
+      "session with full persona/memory (Tier 2). Unset → inferred from " +
+      "`model` (cheap→fresh, else agent). Honoured only when " +
+      "SWITCHROOM_CHEAP_CRON is on.",
     ),
   secrets: z
     .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))
@@ -103,7 +168,24 @@ export const ScheduleEntrySchema = z.object({
       "Alias-resolution happens at config-load — typos surface immediately. " +
       "See docs/rfcs/supergroup-mode.md.",
     ),
-});
+  })
+  .superRefine((entry, ctx) => {
+    const kind = entry.kind ?? "prompt";
+    if (kind === "poll" && !entry.poll) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["poll"],
+        message: "kind: poll requires a `poll` spec (http-diff or telegram-reactions).",
+      });
+    }
+    if (kind === "prompt" && entry.poll) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["poll"],
+        message: "`poll` is only valid when kind: poll.",
+      });
+    }
+  });
 
 export const AgentSoulSchema = z
   .object({
@@ -2840,6 +2922,7 @@ export type AgentSoul = z.infer<typeof AgentSoulSchema>;
 export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;
 export type ScheduleEntry = z.infer<typeof ScheduleEntrySchema>;
+export type PollSpec = z.infer<typeof PollSpecSchema>;
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
