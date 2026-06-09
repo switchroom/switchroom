@@ -25,6 +25,35 @@ below.
 
 ---
 
+## Build status (this branch)
+
+Behind `SWITCHROOM_CHEAP_CRON` (default **off**) — every layer below is dormant
+until the flag is set, so this branch is a no-op in production until the canary.
+
+| Layer | Status | Tests |
+|-------|--------|-------|
+| **L1** schema (`kind`/`context`/`poll`, un-deprecated `model`) + pure `resolveCronRouting` + `SchedulerEntry` thread-through | ✅ built | 23 (total enumeration, 90 inputs) |
+| **L2** gateway routing to a derived `<agent>-cron` bridge + status-silence gates | ✅ built | 3 + regression sweep |
+| **L3** Tier-0 http-diff engine + **SSRF/egress guard (§6.1, the BLOCK)** + write-ahead poll-state + `attemptFire` wiring | ✅ built | 45 + 6 integration |
+| egress allowlist config (`cron.egress`) | ✅ built | 282 config suite green |
+| **main() live-wiring** (vault-broker secret-resolver + file poll-state + real fetch/DNS) | ⏳ staged | — |
+| **L4** lazy B3 cron session launch (start.sh fork + trimmed `.mcp.json` + `/clear`) | ⏳ staged | — |
+| **L5** `schedule_add` cheap-default params + escalation staging + `schedule report` | ⏳ staged | — |
+| `telegram-reactions` poll (needs the internal gateway reactions verb) | ⏳ staged | — |
+
+**Why the split:** L1–L3 are the algorithmic + security core (the SSRF BLOCK
+resolution, the routing proof, the cost-saving poll engine) and the full gateway
+plumbing for the cron session — self-contained and exhaustively tested. The
+staged items are **deploy-sensitive integration**: the live wiring touches the
+**vault broker** (strict test-isolation discipline — see CLAUDE.md + the
+2026-05-22 clobber incident) and L4 launches a second `claude` process, both of
+which must be proven on the **test-harness canary**, not landed unproven in a
+long build session. With `escalate-to-main` (a poll entry with no `model`/
+`context` → Tier 2), **Tier-0 delivers its full cost saving without L4** — so the
+live wiring + canary is the next, focused PR.
+
+---
+
 ## 0. TL;DR
 
 Cron fires are expensive for one structural reason: **every fire injects a
