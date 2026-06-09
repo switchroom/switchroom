@@ -387,10 +387,13 @@ import { DEFAULT_CRON_MODEL, scheduleNeedsCronSession } from "../scheduler/cron-
 
 /**
  * Cheap-cron (L4) start.sh context. `cronSessionEnabled` is purely
- * config-derived — true iff the agent has a Tier-1 (context:fresh) cron
- * entry — so the start.sh fork block renders EMPTY for every current fleet
- * agent (none have that brand-new field), keeping their boot byte-identical.
- * The runtime SWITCHROOM_CHEAP_CRON flag self-gates inside cron-session.sh.
+ * config-derived — true iff the agent has a schedule entry that routes to the
+ * Tier-1 cron session: an explicit `context: fresh`, OR a cheap (sonnet/haiku)
+ * `model:` with no `context` (which `resolveCronRouting` infers to fresh), OR a
+ * `kind: poll` whose escalation does either. None of those fields exist on any
+ * current fleet config, so the start.sh fork block renders EMPTY for every
+ * current agent, keeping their boot byte-identical. The runtime
+ * SWITCHROOM_CHEAP_CRON flag self-gates again inside cron-session.sh.
  */
 function buildCronSessionContext(agentConfig: AgentConfig): {
   cronSessionEnabled: boolean;
