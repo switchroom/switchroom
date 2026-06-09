@@ -75,9 +75,10 @@ describe("recoverPendingEscalations", () => {
     poll: { type: "http-diff", url: "https://api.brevo.com/x", method: "GET", secrets: [], diff_jsonpath: "$.a", state_key: "k" },
   };
 
-  it("re-dispatches a dangling pendingEscalation once and clears it", () => {
+  it("re-dispatches a dangling pendingEscalation once, clears it, and audits it", () => {
     const pollState = createMemoryPollStateStore({ k: { value: "9", pendingEscalation: "cursor 9 > 5 (1)" } });
     const dispatcher = capture();
+    const fires: Array<{ tier?: string; outputSummary: string }> = [];
     const n = recoverPendingEscalations({
       entries: [pollEntry],
       pollState,
@@ -86,11 +87,15 @@ describe("recoverPendingEscalations", () => {
       cheapCronEnabled: true,
       now: () => 1000,
       log: () => {},
+      sink: { recordFire: (r) => fires.push(r) },
     });
     expect(n).toBe(1);
     expect(dispatcher.calls).toHaveLength(1);
     expect(dispatcher.calls[0]!.msg.text).toBe("New: cursor 9 > 5 (1)");
     expect(pollState.get("k")?.pendingEscalation).toBeUndefined();
+    // recovered hit is audited so `schedule report` counts it (reviewer note #1)
+    expect(fires).toHaveLength(1);
+    expect(fires[0]).toMatchObject({ tier: "main", outputSummary: "recovered pending escalation (boot)" });
   });
 
   it("no dangling escalation → no dispatch", () => {

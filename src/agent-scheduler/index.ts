@@ -31,11 +31,12 @@ import { loadConfig } from "../config/loader.js";
 import {
   collectScheduleEntries,
   dispatchAsInbound,
+  type DispatchResult,
   type InboundDispatcher,
   type InboundMessageWire,
   type SchedulerEntry,
 } from "../scheduler/dispatch.js";
-import { resolveCronRouting, resolveEscalationRouting } from "../scheduler/cron-routing.js";
+import { isCheapCronEnabled, resolveCronRouting, resolveEscalationRouting } from "../scheduler/cron-routing.js";
 import type { PollOutcome } from "../scheduler/poll-engine.js";
 import type { PollStateStore } from "../scheduler/poll-state.js";
 import type { PollSpec } from "../config/schema.js";
@@ -147,6 +148,8 @@ export function recoverPendingEscalations(opts: {
   cheapCronEnabled: boolean;
   now: () => number;
   log: (m: string) => void;
+  /** Optional audit sink so a boot-recovered hit shows in `schedule report`. */
+  sink?: { recordFire: (r: DispatchResult) => void };
 }): number {
   let recovered = 0;
   for (const entry of opts.entries) {
@@ -155,6 +158,7 @@ export function recoverPendingEscalations(opts: {
     if (!st?.pendingEscalation) continue;
     const esc = resolveEscalationRouting(entry, { cheapCronEnabled: opts.cheapCronEnabled });
     const threadId = resolveEntryThreadId(entry, opts.channel);
+    const startedAt = opts.now();
     try {
       const r = dispatchAsInbound(
         { ...entry, prompt: templateEscalationPrompt(entry.prompt, st.pendingEscalation) },
@@ -168,6 +172,17 @@ export function recoverPendingEscalations(opts: {
       } else {
         opts.log(`pending escalation for '${entry.poll.state_key}' not delivered — will retry next boot`);
       }
+      opts.sink?.recordFire({
+        agent: entry.agent,
+        scheduleIndex: entry.scheduleIndex,
+        promptKey: entry.promptKey,
+        exitCode: r.delivered ? 0 : -1,
+        outputSummary: r.delivered ? "recovered pending escalation (boot)" : "pending escalation not delivered (boot)",
+        startedAt,
+        finishedAt: opts.now(),
+        tier: esc.tier === "cheap" ? "cheap" : "main",
+        ...(esc.cronModel ? { modelUsed: esc.cronModel } : {}),
+      });
     } catch (e) {
       opts.log(`pending-escalation recovery failed for '${entry.poll.state_key}': ${(e as Error).message}`);
     }
@@ -543,8 +558,27 @@ export async function main(): Promise<void> {
             .map((m) => `[idx=${m.entry.scheduleIndex} key=${m.entry.promptKey}]`)
             .join(" ") + "\n",
         );
+        const cheapEnabledForReplay = isCheapCronEnabled(process.env);
         for (const m of missed) {
           const startedAt = Date.now();
+          // Cheap-cron: a `kind: poll` entry must NOT replay as a raw prompt —
+          // that would fire its escalation text (with a literal {{diff}}) as a
+          // model turn, bypassing the poll. A poll is stateful (durable cursor),
+          // so a missed fire is harmlessly caught by the next natural tick's
+          // poll (which compares against the advanced cursor). Skip + audit.
+          if (cheapEnabledForReplay && m.entry.kind === "poll") {
+            sink.recordFire({
+              agent: m.entry.agent,
+              scheduleIndex: m.entry.scheduleIndex,
+              promptKey: m.entry.promptKey,
+              exitCode: 0,
+              outputSummary: "poll replay skipped — re-polls on next tick (stateful cursor)",
+              startedAt,
+              finishedAt: Date.now(),
+              tier: "poll",
+            });
+            continue;
+          }
           const threadId = resolveEntryThreadId(m.entry, channel);
           const result = dispatchAsInbound(
             m.entry,
@@ -679,6 +713,7 @@ export async function main(): Promise<void> {
       cheapCronEnabled: true,
       now: Date.now,
       log: (m) => process.stderr.write(`agent-scheduler: ${m}\n`),
+      sink,
     });
     process.stdout.write(
       `agent-scheduler: ${agentName} cheap-cron ENABLED` +
