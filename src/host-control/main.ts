@@ -84,7 +84,13 @@ async function main(): Promise<void> {
     agentUids,
     config: {
       agents: Object.fromEntries(
-        Object.entries(config.agents).map(([n, a]) => [n, { admin: a.admin === true }]),
+        // `root: true` (the root-tier debugging agent) is strictly above
+        // admin and carries admin authority — so hostd's checkGate admits
+        // it to every admin-gated verb. See docs/root-agent.md.
+        Object.entries(config.agents).map(([n, a]) => [
+          n,
+          { admin: a.admin === true || (a as { root?: boolean }).root === true },
+        ]),
       ),
       ...(config.hostd
         ? {

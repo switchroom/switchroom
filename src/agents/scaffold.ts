@@ -2205,7 +2205,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // are NOT admin, hand fleet ops off", the klanker incident. The
     // two render sites diverging on exactly this field is the hazard
     // the comment at the reconcile site warns about.
-    admin: agentConfig.admin === true,
+    // `root: true` implies admin, so the root agent also gets the
+    // Admin-operations section; `root` additionally selects the
+    // root-tier capability block (see CLAUDE.md.hbs `{{#if root}}`).
+    admin: agentConfig.admin === true || agentConfig.root === true,
+    root: agentConfig.root === true,
     useSwitchroomPlugin: usesSwitchroomTelegramPlugin(agentConfig),
     useHotReloadStable: agentConfig.channels?.telegram?.hotReloadStable === true,
     // PR C: surface channels.telegram.enabled into start.sh as a literal
@@ -3149,7 +3153,7 @@ export function scaffoldAgent(
     // hostd MCP — admin-only (#1175 RFC C / PR δ). Compose only
     // bind-mounts the hostd socket for admin agents, so non-admin
     // entries here would just surface ENOENT at first call.
-    if (agentConfig.admin === true) {
+    if (agentConfig.admin === true || agentConfig.root === true) {
       mcpServers["hostd"] = {
         command: switchroomCliPath,
         args: ["mcp", "hostd"],
@@ -4881,7 +4885,10 @@ export function reconcileAgent(
         // Used by the "Admin surface" section of CLAUDE.md.hbs so an
         // admin: true agent gets the fleet-ops paragraph and a regular
         // agent gets the "I'm not admin — ask <peer>" refusal pattern.
-        admin: agentConfig.admin === true,
+        // root: true implies admin and additionally selects the root-tier
+        // capability block ({{#if root}} in CLAUDE.md.hbs).
+        admin: agentConfig.admin === true || agentConfig.root === true,
+        root: agentConfig.root === true,
       };
 
       // Render template, then append the switchroom-managed
@@ -5282,7 +5289,7 @@ export function reconcileAgent(
     // per-agent hostd socket for those (#1175 RFC C §5.2). Without
     // the socket, the tools fail at first call with a clean ENOENT
     // error message — but cleaner UX to just not surface them.
-    if (agentConfig.admin === true) {
+    if (agentConfig.admin === true || agentConfig.root === true) {
       mcpServers["hostd"] = {
         command: switchroomCliPath,
         args: ["mcp", "hostd"],

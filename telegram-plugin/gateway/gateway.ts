@@ -15465,9 +15465,11 @@ bot.command('connect', async ctx => {
   let isAdmin = false
   try {
     const cfg = loadSwitchroomConfig()
-    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean }> })
+    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean; root?: boolean }> })
       ?.agents?.[getMyAgentName()]
-    isAdmin = me?.admin === true
+    // `root: true` (the root-tier debugging agent) is above admin and
+    // carries admin authority — see docs/root-agent.md.
+    isAdmin = me?.admin === true || me?.root === true
   } catch { /* non-admin is the safe default */ }
   if (!isAuthAdmin({ isAdmin })) {
     await switchroomReply(
@@ -15627,8 +15629,10 @@ bot.command("auth", async ctx => {
   let isAdmin = false
   try {
     const cfg = loadSwitchroomConfig()
-    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean }> })?.agents?.[currentAgent]
-    isAdmin = me?.admin === true
+    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean; root?: boolean }> })?.agents?.[currentAgent]
+    // `root: true` (the root-tier debugging agent) is above admin and
+    // carries admin authority — see docs/root-agent.md.
+    isAdmin = me?.admin === true || me?.root === true
   } catch { /* best-effort — non-admin is the safe default */ }
 
   // `/auth add` and `/auth cancel` are gateway-routed (drive a

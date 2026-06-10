@@ -2073,6 +2073,22 @@ export const AgentSchema = z.object({
       "Claude never sees them. Requires the agent to use the switchroom-telegram " +
       "plugin. When false or absent, all messages pass through to Claude unchanged.",
     ),
+  root: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, this is a ROOT-tier debugging agent: a root-privileged " +
+      "container (runs as uid 0, mounts /var/run/docker.sock, the whole " +
+      "~/.switchroom tree, and the host root filesystem at /host) so you " +
+      "can DM it to debug the whole fleet — read any agent's logs, " +
+      "docker exec into peers, edit host files — instead of SSHing into " +
+      "the host as root. Implies admin: true (all admin slash commands). " +
+      "Standing root power, audited via the agent's own session transcript " +
+      "and shell history; there is no per-action approval tap. Per-agent " +
+      "only (never set at defaults/profile layers). Grant to exactly one " +
+      "trusted operator-private agent — it ingests other agents' output, " +
+      "which is attacker-influenced text. See docs/root-agent.md.",
+    ),
   settings_raw: z
     .record(z.string(), z.unknown())
     .optional()

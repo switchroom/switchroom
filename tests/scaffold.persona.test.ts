@@ -147,4 +147,23 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // similarly.
     expect(claudeMd.length).toBeLessThan(33500); // +vault sub-agent fallback guidance (PR #1632)
   });
+
+  it("root: true renders the root-tier host-access block + the admin surface", () => {
+    const config = makeAgentConfig({ root: true } as Partial<AgentConfig>);
+    const result = scaffoldAgent("overlord", config, tmpDir, telegramConfig);
+    const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
+    expect(claudeMd).toContain("Root-tier host access");
+    expect(claudeMd).toContain("/host"); // host root fs mount documented
+    expect(claudeMd).toContain("/host-home/.switchroom/");
+    // root implies admin → the admin surface renders too (not the
+    // non-admin hand-off branch).
+    expect(claudeMd).toContain("## Admin surface");
+    expect(claudeMd).not.toContain("You're NOT `admin: true`");
+  });
+
+  it("a non-root agent never renders the root-tier block", () => {
+    const result = scaffoldAgent("plain", makeAgentConfig(), tmpDir, telegramConfig);
+    const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
+    expect(claudeMd).not.toContain("Root-tier host access");
+  });
 });

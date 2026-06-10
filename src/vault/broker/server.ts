@@ -1833,7 +1833,10 @@ export class VaultBroker {
       // for the same reason.
       const isAdminAgent =
         agentName !== null &&
-        this.config?.agents?.[agentName]?.admin === true;
+        (this.config?.agents?.[agentName]?.admin === true ||
+          // `root: true` (the root-tier debugging agent) is strictly
+          // above admin and carries admin authority — docs/root-agent.md.
+          (this.config?.agents?.[agentName] as { root?: boolean } | undefined)?.root === true);
       // ── Operator-passphrase attestation for grant-mgmt (#1012 Phase 2) ─
       //
       // When the caller forwards an operator passphrase that matches the
