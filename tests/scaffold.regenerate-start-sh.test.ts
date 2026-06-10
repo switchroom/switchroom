@@ -112,6 +112,30 @@ describe("scaffoldAgent: start.sh content-aware regeneration (#879)", () => {
     );
   });
 
+  it("provisions the docker CLI for root agents, gated + idempotent + non-fatal", () => {
+    const name = "rooty";
+    const config = makeAgentConfig();
+    const switchroomConfig = makeSwitchroomConfig(name, config);
+
+    const res = scaffoldAgent(name, config, tmpDir, telegramConfig, switchroomConfig);
+    const startSh = readFileSync(join(res.agentDir, "start.sh"), "utf-8");
+
+    // Gated on the in-container root marker (emitted only for root: true)
+    // AND skips when already present → idempotent across restarts.
+    expect(startSh).toContain('[ "${SWITCHROOM_AGENT_ROOT:-}" = "true" ]');
+    expect(startSh).toContain('[ ! -x "$HOME/.local/bin/docker" ]');
+    // Version-pinned static client into the persistent Layer-1 bin dir.
+    expect(startSh).toContain("download.docker.com/linux/static/stable");
+    expect(startSh).toContain('mv "$HOME/.cache/docker/docker" "$HOME/.local/bin/docker"');
+    // Non-fatal: a fetch failure warns, doesn't abort the boot.
+    expect(startSh).toContain("docker CLI fetch failed");
+    // Must run before claude is launched (the CLAUDE_CONFIG_DIR export
+    // anchors the runtime block, same invariant as the prune above).
+    const dkrIdx = startSh.indexOf("provisioning docker CLI");
+    expect(dkrIdx).toBeGreaterThan(0);
+    expect(dkrIdx).toBeLessThan(startSh.indexOf("export CLAUDE_CONFIG_DIR="));
+  });
+
   it("does NOT rewrite an existing start.sh when content already matches the template", () => {
     const name = "stable-agent";
     const config = makeAgentConfig();
