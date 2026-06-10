@@ -173,3 +173,26 @@ describe('runFleetAutoFallback', () => {
     }
   });
 });
+
+// ── failure notice (broken-promise fix, 2026-06-09 incident follow-up) ──────
+
+import { renderFallbackFailureNotice } from "../auto-fallback-fleet.js";
+
+describe("renderFallbackFailureNotice", () => {
+  it("names the trigger agent, the reason, and the manual recovery verbs", () => {
+    const html = renderFallbackFailureNotice("marko", "auth-broker unreachable (no client).");
+    expect(html).toContain("Auto-failover could not run");
+    expect(html).toContain("<b>marko</b>");
+    expect(html).toContain("auth-broker unreachable");
+    expect(html).toContain("/auth use");
+    expect(html).toContain("/auth</code>");
+  });
+
+  it("escapes HTML in the error reason (broker errors can contain angle brackets)", () => {
+    const html = renderFallbackFailureNotice("a<b", 'request <probe-quota> failed & "timed out"');
+    expect(html).toContain("a&lt;b");
+    expect(html).toContain("&lt;probe-quota&gt;");
+    expect(html).toContain("&amp;");
+    expect(html).not.toMatch(/<probe-quota>/);
+  });
+});

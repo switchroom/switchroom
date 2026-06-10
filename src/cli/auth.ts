@@ -244,9 +244,36 @@ function formatQuotaReset(state: AccountState): string {
   return `${hours}h ${mins}m`;
 }
 
+/**
+ * Cached-utilization cell. Honesty fix (2026-06-09 incident follow-up):
+ * the table previously rendered ONLY the broker exhausted flag, so a
+ * 99%-utilized account read "available —" — and an agent verbally
+ * parroting `switchroom auth list` under-reported. Shows the broker's
+ * cached 5h·7d utilization with its age; "no data" (never probed) is
+ * distinct from "not exhausted". The (age) suffix is the staleness
+ * disclosure — this is the broker cache, not a live probe.
+ */
+export function formatQuotaUtilCell(
+  a: { last_quota?: { fiveHourUtilizationPct: number; sevenDayUtilizationPct: number; capturedAt: number } | null },
+  now: number = Date.now(),
+): string {
+  const lq = a.last_quota;
+  if (!lq) return "no data";
+  const ageMs = Math.max(0, now - lq.capturedAt);
+  const mins = Math.floor(ageMs / 60_000);
+  const ageStr =
+    mins < 1 ? "just now"
+    : mins < 60 ? `${mins}m ago`
+    : mins < 1440 ? `${Math.floor(mins / 60)}h ago`
+    : `${Math.floor(mins / 1440)}d ago`;
+  const five = Math.round(lq.fiveHourUtilizationPct);
+  const seven = Math.round(lq.sevenDayUtilizationPct);
+  return `${five}%·${seven}% (${ageStr})`;
+}
+
 function printAccountsTable(state: ListStateData): void {
   console.log(
-    chalk.bold("  ACCOUNT                           STATUS       EXPIRES    QUOTA-RESET"),
+    chalk.bold("  ACCOUNT                           STATUS       EXPIRES    QUOTA 5h·7d          QUOTA-RESET"),
   );
   for (const a of state.accounts) {
     const marker =
@@ -263,8 +290,9 @@ function printAccountsTable(state: ListStateData): void {
           : "available";
     const label = a.label.padEnd(32);
     const exp = formatExpiry(a.expiresAt).padEnd(10);
+    const util = formatQuotaUtilCell(a).padEnd(20);
     const quota = formatQuotaReset(a);
-    console.log(`  ${marker} ${label} ${status}    ${exp} ${quota}`);
+    console.log(`  ${marker} ${label} ${status}    ${exp} ${util} ${quota}`);
   }
 }
 

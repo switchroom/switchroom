@@ -785,7 +785,7 @@ export function renderShowText(
 }
 
 function formatAccountsTable(state: ListStateData, now: number): string {
-  const rows: string[][] = [['ACCOUNT', 'STATUS', 'EXPIRES', 'QUOTA-RESET']]
+  const rows: string[][] = [['ACCOUNT', 'STATUS', 'EXPIRES', 'QUOTA 5h·7d', 'QUOTA-RESET']]
   for (const acc of state.accounts) {
     const isActive = acc.label === state.active
     const marker = isActive
@@ -799,9 +799,35 @@ function formatAccountsTable(state: ListStateData, now: number): string {
       acc.exhausted && acc.exhausted_until != null && acc.exhausted_until > now
         ? formatRelativeMs(acc.exhausted_until - now)
         : '—'
-    rows.push([`${marker} ${escapeHtml(acc.label)}`, status, expires, quotaReset])
+    rows.push([
+      `${marker} ${escapeHtml(acc.label)}`,
+      status,
+      expires,
+      formatQuotaUtilCell(acc, now),
+      quotaReset,
+    ])
   }
   return alignTable(rows)
+}
+
+/**
+ * Cached-utilization cell for the legacy accounts table. Honesty fix
+ * (2026-06-09 incident follow-up): the table previously rendered ONLY
+ * the broker exhausted flag, so a 99%-utilized account read
+ * "available —" — and an agent parroting the table under-reported. Now
+ * shows the broker's cached 5h·7d utilization with its age, and
+ * distinguishes "no data" (never probed) from "not exhausted".
+ * Cached, not live: the (age) suffix is the staleness disclosure.
+ */
+export function formatQuotaUtilCell(
+  acc: { last_quota?: { fiveHourUtilizationPct: number; sevenDayUtilizationPct: number; capturedAt: number } | null },
+  now: number,
+): string {
+  const lq = acc.last_quota
+  if (!lq) return 'no data'
+  const age = now - lq.capturedAt
+  const ageStr = age > 0 ? formatRelativeMs(age) : '0s'
+  return `${Math.round(lq.fiveHourUtilizationPct)}%·${Math.round(lq.sevenDayUtilizationPct)}% (${ageStr} ago)`
 }
 
 function formatAgentsTable(state: ListStateData): string {

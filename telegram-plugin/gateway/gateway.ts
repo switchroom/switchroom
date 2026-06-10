@@ -157,7 +157,7 @@ import {
   formatModelUnavailableCard,
   resolveModelUnavailableFromOperatorEvent,
 } from '../model-unavailable.js'
-import { runFleetAutoFallback } from '../auto-fallback-fleet.js'
+import { runFleetAutoFallback, renderFallbackFailureNotice } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
 
@@ -14807,6 +14807,36 @@ async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Pr
   )
 }
 
+/**
+ * Broadcast a fleet-fallback FAILURE notice to every authorized chat.
+ *
+ * Why this exists: the model-unavailable card renders "Auto-failover in
+ * progress — see the announcement below" BEFORE the dispatcher's outcome
+ * is known. When the dispatcher errors (broker down, listState throw,
+ * markExhausted failure), the success announcement never lands and the
+ * card's promise is broken — the 2026-06-06→07 incident sent 12 such
+ * broken-promise cards while every fallback errored "set-active requires
+ * admin". The admin-gating root cause is fixed (#2206), but ANY future
+ * dispatcher error reproduces the broken promise. This notice closes the
+ * loop deterministically: card promised an announcement → an
+ * announcement ALWAYS arrives, success or failure.
+ *
+ * Disable with SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE=0 (log-only,
+ * pre-fix behaviour).
+ */
+function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): void {
+  if (process.env.SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE === '0') return
+  const access = loadAccess()
+  if (access.allowFrom.length === 0) return
+  const html = renderFallbackFailureNotice(triggerAgent, reason)
+  for (const chat_id of access.allowFrom) {
+    void swallowingApiCall(
+      () => bot.api.sendMessage(chat_id, html, { parse_mode: 'HTML' as const }),
+      { chat_id, verb: 'fleet-fallback:failure-notify' },
+    )
+  }
+}
+
 /** Returns true iff the dispatcher actually performed a swap (and the
  *  user-visible announcement was broadcast). False on no-op /
  *  error / idempotent-skip — caller uses this to decide whether to
@@ -14818,6 +14848,9 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
       process.stderr.write(
         `telegram gateway: [fleet-fallback] skipped agent=${triggerAgent} reason=no-broker-client\n`,
       )
+      // The model-unavailable card may have promised an announcement —
+      // keep the promise even though nothing could run.
+      broadcastFleetFallbackFailure(triggerAgent, 'auth-broker unreachable (no client).')
       return false
     }
     const state = await client.listState()
@@ -14881,6 +14914,10 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
     process.stderr.write(
       `telegram gateway: [fleet-fallback] error agent=${triggerAgent}: ${(err as Error)?.message ?? err}\n`,
     )
+    // Keep the card's "see the announcement below" promise on the error
+    // path — the 06-06→07 incident sent 12 cards whose promised
+    // announcement never arrived because this catch was log-only.
+    broadcastFleetFallbackFailure(triggerAgent, (err as Error)?.message ?? String(err))
     return false
   }
 }

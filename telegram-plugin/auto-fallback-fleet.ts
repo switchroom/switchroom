@@ -42,6 +42,33 @@ import {
   buildSnapshotsFromState,
 } from './auth-snapshot-format.js';
 
+/**
+ * Failure notice for when the fallback dispatcher itself errors (broker
+ * unreachable, listState/markExhausted throw). The model-unavailable
+ * card renders "Auto-failover in progress — see the announcement below"
+ * BEFORE the outcome is known; every error path must therefore still
+ * produce an announcement or the card's promise is broken (the
+ * 2026-06-06→07 incident: 12 cards promised an announcement while every
+ * dispatch errored "set-active requires admin" — log-only, nothing
+ * arrived). Pure builder so the shape is unit-testable.
+ */
+export function renderFallbackFailureNotice(triggerAgent: string, reason: string): string {
+  return (
+    `⚠️ <b>Auto-failover could not run</b> (trigger: <b>${escFailureHtml(triggerAgent)}</b>)\n` +
+    `${escFailureHtml(reason)}\n\n` +
+    `<i>Switch manually with <code>/auth use &lt;label&gt;</code>, or <code>/auth</code> for fleet status.</i>`
+  );
+}
+
+function escFailureHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export type FleetFallbackOutcome =
   | {
       kind: 'switched';
