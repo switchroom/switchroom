@@ -66,6 +66,14 @@ export type StatusProbeRow = {
 export type AgentMetadata = {
   agentName: string;
   model: string | null;
+  /**
+   * Live session-model override set via the `/model` picker (session-only,
+   * resets on restart). When present it's what the agent is ACTUALLY running
+   * right now, distinct from `model` (the persistent configured model). Null
+   * when no session switch is active — then `/status` just shows `model`.
+   * Surfaced so `/status` and `/model` never silently disagree.
+   */
+  sessionModel?: string | null;
   extendsProfile: string | null;
   topicName: string | null;
   topicEmoji: string | null;
@@ -122,7 +130,14 @@ export function formatAgentLine(meta: AgentMetadata): string {
   const topic = meta.topicName
     ? ` · topic: ${escapeHtml([meta.topicEmoji, meta.topicName].filter(Boolean).join(" "))}`
     : "";
-  return `<b>${escapeHtml(meta.agentName)}</b> · model: <code>${escapeHtml(m)}</code>${topic}`;
+  // A live `/model` session switch overrides what's running. Show it next to
+  // the configured model so the two surfaces agree (the override resets on
+  // restart, when the session reverts to the configured model).
+  const session =
+    meta.sessionModel && meta.sessionModel.length > 0
+      ? ` · live session: <code>${escapeHtml(meta.sessionModel)}</code>`
+      : "";
+  return `<b>${escapeHtml(meta.agentName)}</b> · model: <code>${escapeHtml(m)}</code>${session}${topic}`;
 }
 
 /**
