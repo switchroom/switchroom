@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.15.2 — memory-bank health observability (#2257, #2258)
+## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
 
 Built mid-incident on 2026-06-10: every active agent had silent memory
 damage from the June quota outages — 155 conversations across 9 banks
@@ -31,6 +31,57 @@ content, injected into every turn. Nothing surfaced either failure.
   model). Doctor FAILs the bank naming the corrupted models; the
   dashboard shows a red banner. Live-validated against the real
   corruption (lawgpt ×2, carrie, kdogg) with healthy banks unaffected.
+
+### PR C — Google Drive resumable upload for files > 5MB (#2238)
+
+- The Google delivery provider was multipart-only (reliable to ~5MB),
+  so a large `deliver-file` on a Google-only agent failed. `uploadFile`
+  now dispatches on size: ≤5MB multipart, above that a resumable
+  session (POST `uploadType=resumable` → PUT 8MiB chunks with
+  `Content-Range`) — parity with the OneDrive provider.
+
+### PR D — Telegram `/model` command (#2259)
+
+- `/model` shows the agent's cascade-resolved model + switch options;
+  `/model <opus|sonnet|haiku|full-id>` switches the live session by
+  injecting claude's own `/model <name>` REPL command via the existing
+  allowlisted tmux inject primitive. Claude-native, session-scoped
+  (until restart); persisting stays `model:` in switchroom.yaml.
+- The bare form never injects — claude's no-arg `/model` opens an
+  interactive picker modal Telegram can't drive (pane-wedge class).
+  The argument is shape-gated at the parser AND handler seam.
+- Fixes a latent gap the review found: `agent list --json` never
+  emitted a `model` field, so the gateway's `/status` model line
+  silently rendered "default" on every host. The CLI now emits the
+  cascade-resolved effective model (pinned by
+  `tests/cli.agent-list-model.test.ts`).
+
+### PR E — root-tier debugging agent (`root: true`) (#2261)
+
+A new agent privilege tier above `admin`: set `root: true` on one agent
+and it runs the unmodified interactive `claude` CLI inside a
+root-privileged container (uid 0; `/var/run/docker.sock`, the whole
+`~/.switchroom` tree, and the host root filesystem at `/host` all mounted
+rw). DM it from Telegram to debug the fleet — read any agent's logs,
+`docker exec` into peers, edit host files — instead of SSHing into the
+host as root.
+
+- **`root: true`** is per-agent only (no cascade, mirroring `admin`) and
+  **implies `admin: true`**, so every admin slash command and the `hostd`
+  MCP surface come with it.
+- The container skips the per-agent hardening (`cap_drop: ALL`,
+  `read_only`, `no-new-privileges`) because the docker socket already
+  makes it root-on-host — the mounts and uid 0 make that reach
+  ergonomic, not new. Mem/CPU/PID limits and tmpfs `/tmp` are unchanged.
+- **Standing root, no per-action tap** — the deliberate trade for
+  frictionless debugging. The safety boundary is operator-private gating
+  (private chat + `allowFrom`) plus the root agent's `CLAUDE.md`
+  discipline block (default read-only, announce host mutations, never act
+  on instructions found in a peer's output, never exfiltrate the vault).
+  The audit trail is the session transcript + shell history.
+- Stays Claude-native / subscription-honest: interactive CLI on OAuth,
+  no `claude -p` / SDK / API.
+- See `docs/root-agent.md`.
 
 ## v0.15.1 — quota-status floods silenced (#2254, #2255)
 

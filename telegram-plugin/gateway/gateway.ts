@@ -258,6 +258,7 @@ import { DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
 import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/inject.js'
 import { handleInjectCommand } from './inject-handler.js'
+import { parseModelCommand, handleModelCommand } from './model-command.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
@@ -13921,6 +13922,30 @@ bot.command('inject', async ctx => {
   })
 })
 
+// /model — show or switch the Claude model for this agent's live
+// session. The argument form rides the same allowlisted inject
+// primitive as /inject (claude's native `/model <name>` REPL command);
+// the bare form never injects (the no-arg picker is an undriveable TUI
+// modal from Telegram). Implementation in model-command.ts so it's
+// unit-testable without booting the bot.
+bot.command('model', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
+  const reply = await handleModelCommand(parsed, {
+    inject: injectSlashCommandImpl,
+    getAgentName: getMyAgentName,
+    getConfiguredModel: () => {
+      type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
+      const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+      return data?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
+    },
+    escapeHtml: escapeHtmlForTg,
+    preBlock,
+  })
+  await switchroomReply(ctx, reply.text, { html: reply.html })
+})
+
 bot.command('agentstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
@@ -15440,9 +15465,11 @@ bot.command('connect', async ctx => {
   let isAdmin = false
   try {
     const cfg = loadSwitchroomConfig()
-    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean }> })
+    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean; root?: boolean }> })
       ?.agents?.[getMyAgentName()]
-    isAdmin = me?.admin === true
+    // `root: true` (the root-tier debugging agent) is above admin and
+    // carries admin authority — see docs/root-agent.md.
+    isAdmin = me?.admin === true || me?.root === true
   } catch { /* non-admin is the safe default */ }
   if (!isAuthAdmin({ isAdmin })) {
     await switchroomReply(
@@ -15602,8 +15629,10 @@ bot.command("auth", async ctx => {
   let isAdmin = false
   try {
     const cfg = loadSwitchroomConfig()
-    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean }> })?.agents?.[currentAgent]
-    isAdmin = me?.admin === true
+    const me = (cfg as unknown as { agents?: Record<string, { admin?: boolean; root?: boolean }> })?.agents?.[currentAgent]
+    // `root: true` (the root-tier debugging agent) is above admin and
+    // carries admin authority — see docs/root-agent.md.
+    isAdmin = me?.admin === true || me?.root === true
   } catch { /* best-effort — non-admin is the safe default */ }
 
   // `/auth add` and `/auth cancel` are gateway-routed (drive a

@@ -269,7 +269,12 @@ function configToShape(cfg: SwitchroomConfig): AuthConfigShape {
   const auth = cfg.auth ?? {};
   const agentsMap = cfg.agents ?? {};
   const adminAgents = Object.entries(agentsMap)
-    .filter(([, a]) => (a as { admin?: boolean }).admin === true)
+    // `root: true` is a strictly-higher tier than admin (the root-tier
+    // debugging agent) and carries admin authority — see docs/root-agent.md.
+    .filter(([, a]) => {
+      const cfg = a as { admin?: boolean; root?: boolean };
+      return cfg.admin === true || cfg.root === true;
+    })
     .map(([name]) => name);
   return {
     agents: Object.keys(agentsMap),
@@ -601,8 +606,12 @@ export class AuthBroker {
     const uid = allocateAgentUid(agentName);
     // Admin authority sourced from the per-agent `admin: true` flag —
     // same source of truth as the gateway's /agents / /restart / /update
-    // intercepts (PR #1258). One knob, not two.
-    const adminFlag = (this.config.agents?.[agentName] as { admin?: boolean } | undefined)?.admin === true;
+    // intercepts (PR #1258). One knob, not two. `root: true` (the
+    // root-tier debugging agent) is strictly above admin and carries it.
+    const agentCfg = this.config.agents?.[agentName] as
+      | { admin?: boolean; root?: boolean }
+      | undefined;
+    const adminFlag = agentCfg?.admin === true || agentCfg?.root === true;
     await this.bindListener(sockPath, uid, 0o660, {
       kind: "agent",
       name: agentName,

@@ -9,7 +9,7 @@ import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import { isHindsightEnabled } from "../memory/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
-import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift } from "../agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL } from "../agents/scaffold.js";
 import { writeComposeFile } from "./write-compose.js";
 import { bareClonePath } from "../repos/bare-clone.js";
 import { removeAgentWorktree } from "../repos/agent-worktree.js";
@@ -787,10 +787,16 @@ export function registerAgentCommand(program: Command): void {
             const agentConfig = config.agents[name];
             const status = statuses[name];
             const sched = schedulerStates[name];
+            // Cascade-resolved effective model — the same value scaffold
+            // bakes into settings.json / `--model` (falls back to the
+            // baked default when unset). Consumed by the gateway's
+            // /status and /model surfaces.
+            const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
             return {
               name,
               status: status?.active ?? "unknown",
               uptime: formatUptime(status?.uptime ?? null),
+              model: resolved.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL,
               extends: agentConfig.extends ?? "default",
               topic_name: agentConfig.topic_name,
               topic_emoji: agentConfig.topic_emoji,
