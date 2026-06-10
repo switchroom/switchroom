@@ -316,27 +316,45 @@ describe("handleModelMenuCallback", () => {
     expect(out.reply.keyboard).toBeDefined();
   });
 
-  it("tapping the current model is a no-op refresh", async () => {
+  it("tapping the current model is a no-op that keeps the menu interactive", async () => {
     const { deps, calls } = makeMenuDeps();
     const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
     expect(calls.select).toEqual([]);
-    expect(out.answer).toContain("Already on Sonnet");
+    expect(out.answer).toContain("already");
+    // Menu keeps its buttons (a banner + the live menu, not a dead line).
+    expect(out.reply.keyboard).toBeDefined();
   });
 
-  it("busy agent → never selects", async () => {
+  it("busy agent → toastOnly refusal that leaves the menu untouched", async () => {
     const { deps, calls } = makeMenuDeps({ isBusy: () => true });
     const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
     expect(calls.select).toEqual([]);
     expect(out.answer).toContain("mid-turn");
+    // toastOnly tells the gateway to NOT edit the menu — buttons survive.
+    expect(out.toastOnly).toBe(true);
   });
 
-  it("selection failure surfaces the reason", async () => {
+  it("selection failure surfaces the reason AND keeps the menu so the operator can retry", async () => {
     const { deps } = makeMenuDeps({
       select: async () => ({ ok: false as const, reason: "cursor verification failed" }),
     });
     const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
-    expect(out.answer).toBe("Switch failed");
+    expect(out.answer).toContain("failed");
     expect(out.reply.text).toContain("cursor verification failed");
+    // The menu buttons are preserved — a failure no longer collapses the
+    // menu to a button-less error (the "nothing happened" bug).
+    expect(out.reply.keyboard).toBeDefined();
+  });
+
+  it("a successful switch banners the confirmation and keeps the menu", async () => {
+    const { deps } = makeMenuDeps({
+      select: async () => ({ ok: true as const, confirmation: "Set model to Haiku 4.5 for this session only" }),
+    });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
+    expect(out.answer).toContain("Haiku 4.5");
+    expect(out.reply.text).toContain("✅");
+    expect(out.reply.text).toContain("Set model to Haiku 4.5");
+    expect(out.reply.keyboard).toBeDefined();
   });
 
   it("mdl:r re-renders the dashboard", async () => {
