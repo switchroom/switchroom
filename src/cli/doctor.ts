@@ -28,6 +28,7 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList } from "../memory/hindsight.js";
+import { inspectBankHealth, staleMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
@@ -940,6 +941,106 @@ function probeAuthBrokerSocket(
   return "missing";
 }
 
+/**
+ * Per-agent bank ingest health. One CheckResult per agent bank:
+ *
+ * - fail: recent documents (≤30d) stored with ZERO extracted facts — the
+ *   fingerprint of a silent extraction outage (quota wall / shm). The fix
+ *   string carries the exact reprocess curl for the oldest gap.
+ * - warn: stale mental models (>7d since refresh) or a stuck pending queue.
+ * - ok:   facts flowing; surfaces doc/fact/model counts + newest activity.
+ *
+ * Banks for agents not in the config (shared/legacy) are not probed.
+ * Exported for tests.
+ */
+export async function checkBankIngestHealth(
+  config: SwitchroomConfig,
+  url: string,
+  opts?: { fetchImpl?: typeof fetch; now?: Date },
+): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const now = opts?.now ?? new Date();
+  // Dedupe: several agents may share a bank (memory.collection).
+  const banks = new Map<string, string[]>();
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    const bankId = agentConfig.memory?.collection ?? agentName;
+    banks.set(bankId, [...(banks.get(bankId) ?? []), agentName]);
+  }
+
+  // Inspect banks concurrently — sequential probes against a busy server
+  // (e.g. mid-extraction) compound each bank's latency into a doctor stall.
+  const inspected = await Promise.all(
+    [...banks].map(async ([bankId, agents]) =>
+      [bankId, agents, await inspectBankHealth(url, bankId, { fetchImpl: opts?.fetchImpl })] as const,
+    ),
+  );
+
+  for (const [bankId, agents, h] of inspected) {
+    const label = `bank ${bankId}` + (agents[0] !== bankId ? ` (${agents.join(", ")})` : "");
+    if (!h.ok) {
+      results.push({
+        name: label,
+        status: "warn",
+        detail: `inspection failed: ${h.reason}`,
+      });
+      continue;
+    }
+    if (h.totalDocuments === 0) {
+      results.push({
+        name: label,
+        status: "warn",
+        detail: "bank is empty (no documents retained yet)",
+      });
+      continue;
+    }
+
+    const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
+    const stale = staleMentalModels(h.mentalModels, 7, now);
+    const newestAge = ageDays(h.newestDocumentAt, now);
+    const summary =
+      `${h.totalDocuments} docs · ${h.totalFacts} facts · ` +
+      `newest ${h.newestDocumentAt?.slice(0, 10) ?? "?"} · ` +
+      `${h.mentalModels.length} mental models`;
+
+    if (gaps.length > 0) {
+      const oldest = gaps[0];
+      results.push({
+        name: label,
+        status: "fail",
+        detail: `${gaps.length} document(s) in the last 30d retained with ZERO extracted facts (oldest ${oldest.createdAt.slice(0, 10)}) — conversations from those turns are invisible to recall`,
+        fix:
+          "Extraction silently failed (check hindsight logs for quota/429/shm). Re-extract each: " +
+          `curl -X POST '${hindsightDocReprocessUrl(url, bankId, oldest.id)}' (repeat per doc id)`,
+      });
+      continue;
+    }
+    if (h.pendingOperations > 0 && newestAge !== null && newestAge > 1) {
+      results.push({
+        name: label,
+        status: "warn",
+        detail: `${h.pendingOperations} pending operation(s) with no new documents for ${Math.round(newestAge)}d — pipeline may be stuck`,
+      });
+      continue;
+    }
+    if (stale.length > 0) {
+      results.push({
+        name: label,
+        status: "warn",
+        detail: `${summary} · ${stale.length} stale (>7d): ${stale.map((m) => m.name).join(", ")}`,
+        fix: "POST /v1/default/banks/<bank>/mental-models/<id>/refresh to regenerate",
+      });
+      continue;
+    }
+    results.push({ name: label, status: "ok", detail: summary });
+  }
+  return results;
+}
+
+function hindsightDocReprocessUrl(mcpUrl: string, bankId: string, docId: string): string {
+  const base = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+  return `${base}/v1/default/banks/${encodeURIComponent(bankId)}/documents/${docId}/reprocess`;
+}
+
 async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> {
   if (!isHindsightEnabled(config)) {
     return [];
@@ -1025,6 +1126,13 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // (shm exhaustion or OAuth quota 429). These surface both from the local
   // container's shm config + recent logs; no-ops on a remote/dockerless setup.
   results.push(...checkHindsightContainerHealth());
+
+  // Per-agent bank ingest health (2026-06-10 incident class): a bank can be
+  // reachable and growing while fact extraction silently yields ZERO memory
+  // units per document (consumer quota wall / shm exhaustion) — the agent
+  // keeps "remembering" nothing and no surface goes red. Inspect each bank's
+  // REST surface for unextracted documents and stale mental models.
+  results.push(...(await checkBankIngestHealth(config, url)));
 
   // Per-agent bank health checks
   for (const [agentName, agentConfig] of Object.entries(config.agents)) {

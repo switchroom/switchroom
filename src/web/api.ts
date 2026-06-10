@@ -12,6 +12,12 @@ import {
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
 import {
+  inspectBankHealth,
+  staleMentalModels,
+  recentUnextracted,
+  type BankMentalModelSummary,
+} from "../memory/bank-health.js";
+import {
   getHindsightStatus,
 } from "../setup/hindsight.js";
 import {
@@ -1310,4 +1316,101 @@ export async function handleGetApprovals(): Promise<ApprovalsDashboard> {
   // Newest first — most relevant grant at the top of the table.
   const sorted = [...decisions].sort((a, b) => b.granted_at - a.granted_at);
   return { reachable: true, decisions: sorted };
+}
+
+/**
+ * Per-agent memory-bank health for the dashboard Memory tab. Mirrors the
+ * doctor's bank-ingest check (extraction gaps, mental-model staleness) so
+ * the operator sees the same truth in both surfaces.
+ */
+export interface MemoryBankHealthRow {
+  bank: string;
+  agents: string[];
+  ok: boolean;
+  reason?: string;
+  totalDocuments: number;
+  totalFacts: number;
+  pendingOperations: number;
+  newestDocumentAt: string | null;
+  /** Documents ≤30d old retained with zero extracted facts (silent extraction outage). */
+  recentUnextractedCount: number;
+  oldestUnextractedAt: string | null;
+  mentalModels: BankMentalModelSummary[];
+  staleMentalModelCount: number;
+  /** ok | warn | fail — same thresholds as `switchroom doctor`. */
+  status: "ok" | "warn" | "fail";
+  statusDetail: string;
+}
+
+export interface MemoryHealth {
+  reachable: boolean;
+  url: string;
+  banks: MemoryBankHealthRow[];
+}
+
+export async function handleGetMemoryHealth(
+  config: SwitchroomConfig,
+  opts?: { fetchImpl?: typeof fetch; now?: Date },
+): Promise<MemoryHealth> {
+  const url =
+    (config.memory?.config?.url as string | undefined) ??
+    "http://127.0.0.1:18888/mcp/";
+  const now = opts?.now ?? new Date();
+
+  let reachable = false;
+  try {
+    reachable = (await probeHindsight(url, { fetchImpl: opts?.fetchImpl })).ok;
+  } catch {
+    reachable = false;
+  }
+  if (!reachable) return { reachable, url, banks: [] };
+
+  // Group agents sharing a bank (memory.collection) into one row.
+  const banks = new Map<string, string[]>();
+  for (const agentName of Object.keys(config.agents)) {
+    const bank = getCollectionForAgent(agentName, config);
+    banks.set(bank, [...(banks.get(bank) ?? []), agentName]);
+  }
+
+  const rows = await Promise.all(
+    [...banks].map(async ([bank, agents]): Promise<MemoryBankHealthRow> => {
+      const h = await inspectBankHealth(url, bank, { fetchImpl: opts?.fetchImpl });
+      const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
+      const stale = staleMentalModels(h.mentalModels, 7, now);
+      let status: MemoryBankHealthRow["status"] = "ok";
+      let statusDetail = "facts flowing";
+      if (!h.ok) {
+        status = "warn";
+        statusDetail = `inspection failed: ${h.reason ?? "unknown"}`;
+      } else if (gaps.length > 0) {
+        status = "fail";
+        statusDetail = `${gaps.length} recent conversation(s) stored with zero extracted facts — invisible to recall`;
+      } else if (stale.length > 0) {
+        status = "warn";
+        statusDetail = `${stale.length} mental model(s) not refreshed in >7d`;
+      } else if (h.totalDocuments === 0) {
+        status = "warn";
+        statusDetail = "bank is empty";
+      }
+      return {
+        bank,
+        agents,
+        ok: h.ok,
+        reason: h.reason,
+        totalDocuments: h.totalDocuments,
+        totalFacts: h.totalFacts,
+        pendingOperations: h.pendingOperations,
+        newestDocumentAt: h.newestDocumentAt,
+        recentUnextractedCount: gaps.length,
+        oldestUnextractedAt: gaps[0]?.createdAt ?? null,
+        mentalModels: h.mentalModels,
+        staleMentalModelCount: stale.length,
+        status,
+        statusDetail,
+      };
+    }),
+  );
+
+  rows.sort((a, b) => a.bank.localeCompare(b.bank));
+  return { reachable, url, banks: rows };
 }
