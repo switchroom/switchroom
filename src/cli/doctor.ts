@@ -1038,7 +1038,7 @@ export async function checkBankIngestHealth(
 
 function hindsightDocReprocessUrl(mcpUrl: string, bankId: string, docId: string): string {
   const base = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
-  return `${base}/v1/default/banks/${encodeURIComponent(bankId)}/documents/${docId}/reprocess`;
+  return `${base}/v1/default/banks/${encodeURIComponent(bankId)}/documents/${encodeURIComponent(docId)}/reprocess`;
 }
 
 async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> {
