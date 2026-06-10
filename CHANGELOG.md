@@ -1,5 +1,17 @@
 # Changelog
 
+## unreleased — root agent auto-provisions the docker CLI
+
+Follow-up to the root debugging agent (#2261). A root agent has
+`/var/run/docker.sock` mounted but the shared agent image omits the
+~38 MB docker client (inert for every non-root agent). On a root agent's
+first boot, `start.sh` now fetches a version-pinned static `docker`
+client into the persistent `$HOME/.local/bin` — gated on
+`SWITCHROOM_AGENT_ROOT`, idempotent (skips when present), and non-fatal
+(a fetch failure leaves the agent fully functional minus docker, retried
+next restart). `docker ps/logs/exec/inspect` then work out of the box,
+no manual install. See `docs/root-agent.md`.
+
 ## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
 
 Built mid-incident on 2026-06-10: every active agent had silent memory

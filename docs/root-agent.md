@@ -70,6 +70,15 @@ host (`docker run -v /:/x …`), so the mounts and uid only make that
 reach *ergonomic*, not *new*. Mem/CPU/PID limits and the tmpfs `/tmp`
 are unchanged.
 
+**The `docker` CLI.** The shared agent image deliberately omits the
+~38 MB docker client (it's inert for the other agents, which have no
+socket). So on a root agent's **first boot**, `start.sh` fetches a
+version-pinned static `docker` client into `$HOME/.local/bin` (which
+persists across restarts via the `/state` bind mount) — gated on the
+`SWITCHROOM_AGENT_ROOT` marker, idempotent, and non-fatal (if the fetch
+fails the agent still boots, and it retries next restart). After first
+boot, `docker ps/logs/exec/inspect` just work.
+
 ## Security model — read this before granting it
 
 A root agent's **job** is to read other agents' logs and output — which

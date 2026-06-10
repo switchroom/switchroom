@@ -243,6 +243,39 @@ for _stray_claude in \
 done
 rm -rf "$HOME/.npm-global/lib/node_modules/@anthropic-ai/claude-code" 2>/dev/null || true
 unset _stray_claude
+
+# ── Root-tier agent: provision the docker CLI ────────────────────────
+# The root debugging agent (`root: true`) has /var/run/docker.sock
+# mounted so it can `docker ps/logs/exec` across the fleet — but the
+# shared agent image deliberately OMITS the ~38MB docker client (it is
+# inert for the 99% of agents without the socket, and bloats every
+# roll/pull). Fetch the version-pinned static client ONCE into the
+# persistent Layer-1 bin dir ($HOME/.local/bin survives restart via the
+# /state bind mount), so the root agent's docs-promised `docker` Just
+# Works without a manual install. Gated on the in-container marker
+# SWITCHROOM_AGENT_ROOT (emitted only for root: true — see compose.ts).
+# Idempotent (skips when already present); NON-FATAL (a fetch failure
+# leaves the agent fully functional minus docker, retried next boot).
+# See docs/root-agent.md.
+if [ "${SWITCHROOM_AGENT_ROOT:-}" = "true" ] && [ ! -x "$HOME/.local/bin/docker" ]; then
+  _dkr_ver="27.3.1"
+  _dkr_arch="$(uname -m)"
+  echo "start.sh: root agent — provisioning docker CLI ${_dkr_ver} (${_dkr_arch}) into \$HOME/.local/bin" >&2
+  mkdir -p "$HOME/.local/bin" "$HOME/.cache" 2>/dev/null || true
+  if curl -fsSL --max-time 120 \
+        "https://download.docker.com/linux/static/stable/${_dkr_arch}/docker-${_dkr_ver}.tgz" \
+        -o "$HOME/.cache/docker-cli.tgz" 2>/dev/null \
+     && tar xzf "$HOME/.cache/docker-cli.tgz" -C "$HOME/.cache" docker/docker 2>/dev/null \
+     && mv "$HOME/.cache/docker/docker" "$HOME/.local/bin/docker" \
+     && chmod 0755 "$HOME/.local/bin/docker"; then
+    echo "start.sh: docker CLI ready ($("$HOME/.local/bin/docker" --version 2>/dev/null))" >&2
+  else
+    echo "start.sh: WARN docker CLI fetch failed — root agent boots without it (retried next restart)" >&2
+  fi
+  rm -rf "$HOME/.cache/docker" "$HOME/.cache/docker-cli.tgz" 2>/dev/null || true
+  unset _dkr_ver _dkr_arch
+fi
+
 export CLAUDE_CONFIG_DIR="{{agentDir}}/.claude"
 # CLAUDE_CODE_OAUTH_TOKEN injection was removed with RFC H (auth-broker).
 # Claude reads .credentials.json directly; the broker is the sole writer
