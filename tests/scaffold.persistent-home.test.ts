@@ -6,6 +6,9 @@ import {
   readFileSync,
   writeFileSync,
   statSync,
+  lstatSync,
+  readlinkSync,
+  symlinkSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -91,6 +94,51 @@ describe("scaffoldAgent — Layer 1 persistent HOME", () => {
       const p = join(homeDir, sub);
       expect(existsSync(p), `expected ${p} to exist`).toBe(true);
       expect(statSync(p).isDirectory()).toBe(true);
+    }
+  });
+
+  it("pre-creates <agentDir>/home/.switchroom symlink to the host ~/.switchroom", () => {
+    // The host-side companion to start.sh's #910 symlink: it must exist
+    // BEFORE first boot so docker resolves the admin audit-log binds
+    // through it instead of materialising a real dir that breaks the
+    // gateway↔claude bridge (the overlord root-agent incident).
+    const prevHome = process.env.HOME;
+    const fakeHome = mkdtempSync(join(tmpdir(), "switchroom-fakehome-"));
+    process.env.HOME = fakeHome;
+    try {
+      const cfg = makeAgentConfig();
+      const sw = makeSwitchroomConfig("alice", cfg);
+      const res = scaffoldAgent("alice", cfg, tmpDir, telegramConfig, sw);
+
+      const link = join(res.agentDir, "home", ".switchroom");
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(join(fakeHome, ".switchroom"));
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("does not clobber an existing <agentDir>/home/.switchroom symlink", () => {
+    const prevHome = process.env.HOME;
+    const fakeHome = mkdtempSync(join(tmpdir(), "switchroom-fakehome-"));
+    process.env.HOME = fakeHome;
+    try {
+      const cfg = makeAgentConfig();
+      const sw = makeSwitchroomConfig("alice", cfg);
+      // First scaffold creates the link; a second scaffold (apply re-run)
+      // must leave the existing symlink untouched (idempotent).
+      const res = scaffoldAgent("alice", cfg, tmpDir, telegramConfig, sw);
+      const link = join(res.agentDir, "home", ".switchroom");
+      const before = readlinkSync(link);
+      scaffoldAgent("alice", cfg, tmpDir, telegramConfig, sw);
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe(before);
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(fakeHome, { recursive: true, force: true });
     }
   });
 

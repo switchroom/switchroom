@@ -79,6 +79,17 @@ persists across restarts via the `/state` bind mount) — gated on the
 fails the agent still boots, and it retries next restart). After first
 boot, `docker ps/logs/exec/inspect` just work.
 
+**The `$HOME/.switchroom` symlink.** A root agent is also an admin agent,
+so it gets the admin audit-log bind mounts (`vault-audit.log`,
+`host-control-audit.log`) at paths under `$HOME/.switchroom`. Because the
+gateway↔claude bridge locates its socket through `$HOME/.switchroom`,
+`switchroom apply` pre-creates that symlink on the host (pointing at the
+real `~/.switchroom`) *before* the container's first boot — otherwise
+docker would materialise `$HOME/.switchroom` as a real directory to host
+those mounts, the runtime symlink would be skipped, and the bridge would
+never register (DMs would silently buffer and never be answered). This is
+handled automatically; no operator action needed.
+
 ## Security model — read this before granting it
 
 A root agent's **job** is to read other agents' logs and output — which

@@ -12,6 +12,17 @@ client into the persistent `$HOME/.local/bin` — gated on
 next restart). `docker ps/logs/exec/inspect` then work out of the box,
 no manual install. See `docs/root-agent.md`.
 
+Also fixes a first-boot bridge break for admin/root agents: the admin
+audit-log bind mounts (`vault-audit.log`, `host-control-audit.log`) target
+paths under `$HOME/.switchroom`, so on a fresh agent's first boot docker
+materialised `$HOME/.switchroom` as a real directory before `start.sh`
+could lay down the `#910` symlink the gateway↔claude bridge relies on —
+the bridge then never registered and the agent silently buffered every
+Telegram DM without answering. `switchroom apply` now pre-creates that
+symlink on the host (create-only, never clobbers an existing link/dir)
+before first boot, so docker resolves the binds through it. Surfaced by
+the first root agent; would have hit any freshly-scaffolded admin agent.
+
 ## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
 
 Built mid-incident on 2026-06-10: every active agent had silent memory
