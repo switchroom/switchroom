@@ -18396,9 +18396,28 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Not authorized.' })
       return
     }
+    // Kill-switch covers the callback family too — stale menus keep
+    // their buttons after the flag flips, and the flag exists exactly
+    // for "picker-driving is misbehaving" (#2263 review blocker 2).
+    if (process.env.SWITCHROOM_MODEL_MENU === '0') {
+      await ctx.answerCallbackQuery({ text: 'Model menu is disabled (SWITCHROOM_MODEL_MENU=0).' }).catch(() => {})
+      await ctx
+        .editMessageText('Model menu is disabled on this agent. Use <code>/model &lt;name&gt;</code>.', {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+      return
+    }
+    // Answer the callback IMMEDIATELY — the select path drives the
+    // picker up to three times (multi-second); leaving the tap
+    // spinning invites a double-tap, which queues a second drive
+    // behind the pane lock and confuses the user. The final state is
+    // conveyed by the message edit (a callback can only be answered
+    // once).
+    await ctx.answerCallbackQuery({ text: 'Working…' }).catch(() => {})
     try {
       const outcome = await handleModelMenuCallback(data, buildModelDeps())
-      await ctx.answerCallbackQuery({ text: outcome.answer.slice(0, 190) }).catch(() => {})
       await ctx
         .editMessageText(outcome.reply.text, {
           parse_mode: 'HTML',
@@ -18409,7 +18428,6 @@ bot.on('callback_query:data', async ctx => {
       process.stderr.write(
         `telegram gateway: model-menu callback failed: ${(err as Error)?.message ?? String(err)}\n`,
       )
-      await ctx.answerCallbackQuery({ text: 'Model menu error — check logs.' }).catch(() => {})
     }
     return
   }

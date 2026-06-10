@@ -281,6 +281,9 @@ export async function buildModelMenu(
 
   const current = discovered.options.find((o) => o.current)
   const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
+  if (discovered.dismissFailed) {
+    lines.push('⚠️ <i>The picker may still be open on the agent pane — check it before switching.</i>')
+  }
   if (current) {
     const detail = current.detail ? ` · ${deps.escapeHtml(current.detail)}` : ''
     lines.push(`Now: <b>${deps.escapeHtml(current.label)}</b>${detail}`)

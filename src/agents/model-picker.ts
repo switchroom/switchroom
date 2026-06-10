@@ -45,6 +45,7 @@
  */
 
 import { makeTmuxRunner, type TmuxRunner } from "./inject.js";
+import { withPaneLock } from "./pane-lock.js";
 
 export interface ModelPickerOption {
   /** 1-based number as rendered by the picker. */
@@ -153,18 +154,25 @@ export interface PickerOpts {
   stepMs?: number;
   /** Hard ceiling on the whole operation (ms). Default 10000. */
   timeoutMs?: number;
-  /** Test seam — injected runner + sleep. */
+  /** Test seam — injected runner + sleep + logger. */
   _runner?: TmuxRunner;
   _sleep?: (ms: number) => Promise<void>;
+  _log?: (line: string) => void;
 }
 
 export type DiscoverResult =
-  | { ok: true; options: ModelPickerOption[]; currentLabel: string | null }
-  | { ok: false; reason: string };
+  | {
+      ok: true;
+      options: ModelPickerOption[];
+      currentLabel: string | null;
+      /** Esc + verify failed twice — the modal may still be open. */
+      dismissFailed?: true;
+    }
+  | { ok: false; reason: string; dismissFailed?: true };
 
 export type SelectResult =
   | { ok: true; confirmation: string }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; dismissFailed?: true };
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -175,6 +183,7 @@ interface Io {
   stepMs: number;
   timeoutMs: number;
   sleep: (ms: number) => Promise<void>;
+  log: (line: string) => void;
   startedAt: number;
 }
 
@@ -186,8 +195,26 @@ function makeIo(agentName: string, opts: PickerOpts): Io {
     stepMs: opts.stepMs ?? 600,
     timeoutMs: opts.timeoutMs ?? 10_000,
     sleep: opts._sleep ?? realSleep,
+    log: opts._log ?? ((line) => process.stderr.write(`${line}\n`)),
     startedAt: Date.now(),
   };
+}
+
+/**
+ * Dismiss + loudly report a failure. A false return means two
+ * Esc+verify rounds could not confirm the modal closed — the
+ * /rate-limit-options wedge class. The gateway log is the fleet's
+ * wedge forensics surface, so this must never fail silently.
+ */
+async function dismissOrWarn(io: Io, verb: string): Promise<boolean> {
+  const dismissed = await dismissPicker(io);
+  if (!dismissed) {
+    io.log(
+      `model-picker: ${verb}: picker may still be open after Esc retries ` +
+        `(socket=${io.socket} session=${io.session}) — pane needs eyes`,
+    );
+  }
+  return dismissed;
 }
 
 function expired(io: Io): boolean {
@@ -257,20 +284,29 @@ export async function discoverModels(
   if (!io.runner.hasSession(io.socket, io.session)) {
     return { ok: false, reason: "tmux session not found" };
   }
-  let parsed: ParsedModelPicker | null = null;
-  try {
-    parsed = await openPicker(io);
-  } finally {
-    await dismissPicker(io);
-  }
-  if (!parsed || !parsed.footerSeen) {
-    return {
-      ok: false,
-      reason: "picker did not render — agent may be mid-turn or the CLI changed its /model UI",
-    };
-  }
-  const current = parsed.options.find((o) => o.current) ?? null;
-  return { ok: true, options: parsed.options, currentLabel: current?.label ?? null };
+  // Serialize against every other drive on this pane (other /model
+  // dashboards, taps, /inject) — an overlapping drive's Enter landing
+  // in an open picker is the modal's "set as default".
+  return withPaneLock(`${io.socket}:${io.session}`, async () => {
+    io.startedAt = Date.now(); // budget starts when the lock is held
+    let parsed: ParsedModelPicker | null = null;
+    let dismissed = true;
+    try {
+      parsed = await openPicker(io);
+    } finally {
+      dismissed = await dismissOrWarn(io, "discover");
+    }
+    const tail = dismissed ? {} : { dismissFailed: true as const };
+    if (!parsed || !parsed.footerSeen) {
+      return {
+        ok: false,
+        reason: "picker did not render — agent may be mid-turn or the CLI changed its /model UI",
+        ...tail,
+      };
+    }
+    const current = parsed.options.find((o) => o.current) ?? null;
+    return { ok: true, options: parsed.options, currentLabel: current?.label ?? null, ...tail };
+  });
 }
 
 /**
@@ -288,54 +324,62 @@ export async function selectModel(
     return { ok: false, reason: "tmux session not found" };
   }
 
-  let selected = false;
-  try {
-    const parsed = await openPicker(io);
-    if (!parsed || !parsed.footerSeen) {
-      return { ok: false, reason: "picker did not render — agent may be mid-turn" };
-    }
-    const target = parsed.options.find((o) => o.label === targetLabel);
-    if (!target) {
-      const have = parsed.options.map((o) => o.label).join(", ");
-      return { ok: false, reason: `option "${targetLabel}" not offered (have: ${have})` };
-    }
-    if (parsed.cursorIndex < 0) {
-      return { ok: false, reason: "cursor marker not visible — refusing blind navigation" };
-    }
+  // Same per-pane serialization as discoverModels — see that comment.
+  return withPaneLock(`${io.socket}:${io.session}`, async () => {
+    io.startedAt = Date.now(); // budget starts when the lock is held
+    let selected = false;
+    try {
+      const parsed = await openPicker(io);
+      if (!parsed || !parsed.footerSeen) {
+        return { ok: false, reason: "picker did not render — agent may be mid-turn" };
+      }
+      const target = parsed.options.find((o) => o.label === targetLabel);
+      if (!target) {
+        const have = parsed.options.map((o) => o.label).join(", ");
+        return { ok: false, reason: `option "${targetLabel}" not offered (have: ${have})` };
+      }
+      if (parsed.cursorIndex < 0) {
+        return { ok: false, reason: "cursor marker not visible — refusing blind navigation" };
+      }
 
-    // Walk the cursor to the target row one keypress at a time,
-    // verifying position after the walk. Option indices are the
-    // picker's own contiguous numbering.
-    const delta = target.index - parsed.cursorIndex;
-    const key = delta > 0 ? "Down" : "Up";
-    for (let i = 0; i < Math.abs(delta); i++) {
-      if (expired(io)) return { ok: false, reason: "timed out navigating picker" };
-      sendKey(io, key);
-      await io.sleep(Math.min(io.stepMs, 250));
-    }
-    await io.sleep(io.stepMs);
-    const verifyPane = io.runner.capture(io.socket, io.session) ?? "";
-    const verify = parseModelPicker(verifyPane);
-    const atRow = verify?.options.find((o) => o.index === verify.cursorIndex);
-    if (!verify || !atRow || atRow.label !== targetLabel) {
-      return {
-        ok: false,
-        reason: `cursor verification failed (on "${atRow?.label ?? "?"}", wanted "${targetLabel}")`,
-      };
-    }
+      // Walk the cursor to the target row one keypress at a time,
+      // verifying position after the walk. Option indices are the
+      // picker's own contiguous numbering.
+      const delta = target.index - parsed.cursorIndex;
+      const key = delta > 0 ? "Down" : "Up";
+      for (let i = 0; i < Math.abs(delta); i++) {
+        if (expired(io)) return { ok: false, reason: "timed out navigating picker" };
+        sendKey(io, key);
+        await io.sleep(Math.min(io.stepMs, 250));
+      }
+      await io.sleep(io.stepMs);
+      const verifyPane = io.runner.capture(io.socket, io.session) ?? "";
+      const verify = parseModelPicker(verifyPane);
+      const atRow = verify?.options.find((o) => o.index === verify.cursorIndex);
+      if (!verify || !atRow || atRow.label !== targetLabel) {
+        return {
+          ok: false,
+          reason: `cursor verification failed (on "${atRow?.label ?? "?"}", wanted "${targetLabel}")`,
+        };
+      }
 
-    // `s` = apply for this session only.
-    sendLiteral(io, "s");
-    selected = true;
-    await io.sleep(io.stepMs);
-    const after = io.runner.capture(io.socket, io.session) ?? "";
-    const confirmation = extractConfirmation(after) ?? `Switched to ${targetLabel} (session)`;
-    return { ok: true, confirmation };
-  } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
-  } finally {
-    if (!selected) await dismissPicker(io);
-  }
+      // `s` = apply for this session only — the keypress dismisses the
+      // modal itself, so no Escape on this path.
+      sendLiteral(io, "s");
+      selected = true;
+      await io.sleep(io.stepMs);
+      const after = io.runner.capture(io.socket, io.session) ?? "";
+      const confirmation = extractConfirmation(after) ?? `Switched to ${targetLabel} (session)`;
+      return { ok: true, confirmation };
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    } finally {
+      if (!selected) {
+        const dismissed = await dismissOrWarn(io, "select");
+        void dismissed; // failure already logged loudly; result shape unchanged here
+      }
+    }
+  });
 }
 
 /**

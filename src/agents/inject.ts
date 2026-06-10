@@ -31,6 +31,7 @@
 
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { withPaneLock } from "./pane-lock.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -365,13 +366,19 @@ export async function injectSlashCommand(
   const settleMs = opts.settleMs ?? 2000;
   const timeoutMs = opts.timeoutMs ?? 5000;
 
-  return injectSlashCommandWith(makeTmuxRunner(tmuxBin), {
-    socket,
-    session,
-    command: command.trim(),
-    settleMs,
-    timeoutMs,
-  });
+  // Serialize against every other drive on this pane (other injects,
+  // the /model picker driver) — see src/agents/pane-lock.ts. An
+  // inject's Enter landing while another drive's modal is open would
+  // act as that modal's confirm key.
+  return withPaneLock(`${socket}:${session}`, () =>
+    injectSlashCommandWith(makeTmuxRunner(tmuxBin), {
+      socket,
+      session,
+      command: command.trim(),
+      settleMs,
+      timeoutMs,
+    }),
+  );
 }
 
 /**

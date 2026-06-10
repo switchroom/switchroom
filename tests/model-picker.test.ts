@@ -248,3 +248,92 @@ describe("selectModel", () => {
     expect(sentKeys(sends)).toContain("Escape");
   });
 });
+
+describe("pane-lock serialization (#2263 review blocker 1)", () => {
+  it("two concurrent drives on one pane never interleave keys", async () => {
+    // A slow runner whose captures resolve through real microtasks;
+    // both drives target the same socket:session, so the second must
+    // queue behind the first — the recorded send sequence must be the
+    // first drive's full key sequence followed by the second's, never
+    // interleaved.
+    const sends: string[][] = [];
+    let frameByDrive = 0;
+    const frames = [PICKER, AFTER_ESC, PICKER, AFTER_ESC];
+    const runner: TmuxRunner = {
+      capture: () => frames[Math.min(frameByDrive++, frames.length - 1)],
+      send: (_s, _t, args) => {
+        sends.push(args);
+      },
+      hasSession: () => true,
+    };
+    const opts = { ...fastOpts, _runner: runner };
+    const [a, b] = await Promise.all([
+      discoverModels("samepane", opts),
+      discoverModels("samepane", opts),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(sentKeys(sends)).toEqual([
+      "/model", "Enter", "Escape",
+      "/model", "Enter", "Escape",
+    ]);
+  });
+
+  it("a select queued behind a discover runs after its Escape", async () => {
+    const sends: string[][] = [];
+    let i = 0;
+    const frames = [
+      // discover: open → esc
+      PICKER, AFTER_ESC,
+      // select: open → walk-verify → s-confirm
+      PICKER, PICKER_CURSOR_3, AFTER_S,
+    ];
+    const runner: TmuxRunner = {
+      capture: () => frames[Math.min(i++, frames.length - 1)],
+      send: (_s, _t, args) => {
+        sends.push(args);
+      },
+      hasSession: () => true,
+    };
+    const opts = { ...fastOpts, _runner: runner };
+    const [d, s] = await Promise.all([
+      discoverModels("samepane2", opts),
+      selectModel("samepane2", "Haiku", opts),
+    ]);
+    expect(d.ok).toBe(true);
+    expect(s).toEqual({ ok: true, confirmation: "Set model to Haiku 4.5 for this session" });
+    expect(sentKeys(sends)).toEqual([
+      "/model", "Enter", "Escape",
+      "/model", "Enter", "Down", "s",
+    ]);
+  });
+});
+
+describe("dismissal failure is loud (#2263 review blocker 3)", () => {
+  it("discover logs + flags dismissFailed when Esc never closes the modal", async () => {
+    // Picker stays rendered with its footer at the tail forever —
+    // dismissal verification can never succeed.
+    const logs: string[] = [];
+    const { runner } = fakeRunner([PICKER]);
+    const res = await discoverModels("agentx", {
+      ...fastOpts,
+      _runner: runner,
+      _log: (l) => logs.push(l),
+    });
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.dismissFailed).toBe(true);
+    expect(logs.some((l) => l.includes("may still be open"))).toBe(true);
+  });
+
+  it("failed select logs the stuck-modal warning too", async () => {
+    const logs: string[] = [];
+    const { runner } = fakeRunner([PICKER]);
+    const res = await selectModel("agentx", "Nonexistent Model", {
+      ...fastOpts,
+      _runner: runner,
+      _log: (l) => logs.push(l),
+    });
+    expect(res.ok).toBe(false);
+    expect(logs.some((l) => l.includes("may still be open"))).toBe(true);
+  });
+});
