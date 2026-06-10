@@ -172,7 +172,7 @@ export type DiscoverResult =
 
 export type SelectResult =
   | { ok: true; confirmation: string }
-  | { ok: false; reason: string; dismissFailed?: true };
+  | { ok: false; reason: string };
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -375,8 +375,8 @@ export async function selectModel(
       return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     } finally {
       if (!selected) {
-        const dismissed = await dismissOrWarn(io, "select");
-        void dismissed; // failure already logged loudly; result shape unchanged here
+        // Failure is reported loudly inside dismissOrWarn (gateway log).
+        await dismissOrWarn(io, "select");
       }
     }
   });
