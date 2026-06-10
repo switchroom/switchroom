@@ -409,6 +409,7 @@
     <button id="tab-agents" onclick="switchTab('agents')">Agents</button>
     <button id="tab-accounts" onclick="switchTab('accounts')">Accounts</button>
     <button id="tab-system" onclick="switchTab('system')">System</button>
+    <button id="tab-memory" onclick="switchTab('memory')">Memory</button>
     <button id="tab-connections" onclick="switchTab('connections')">Connections</button>
     <button id="tab-schedule" onclick="switchTab('schedule')">Schedule</button>
     <button id="tab-approvals" onclick="switchTab('approvals')">Approvals</button>
@@ -419,6 +420,7 @@
     <div id="agents" style="display:none" class="loading">Loading agents...</div>
     <div id="accounts" style="display:none"></div>
     <div id="system" style="display:none"></div>
+    <div id="memory" style="display:none"></div>
     <div id="connections" style="display:none"></div>
     <div id="schedule" style="display:none"></div>
     <div id="approvals" style="display:none"></div>
@@ -496,6 +498,65 @@
       } catch (err) {
         showError(`Failed to fetch system health: ${err.message}`);
       }
+    }
+
+    async function fetchMemoryHealth() {
+      try {
+        const res = await fetch(`${API}/api/memory-health`, { headers: authHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        renderMemoryHealth(await res.json());
+        clearError();
+      } catch (err) {
+        showError(`Failed to fetch memory health: ${err.message}`);
+      }
+    }
+
+    function renderMemoryHealth(m) {
+      const container = document.getElementById('memory');
+      if (!m.reachable) {
+        container.innerHTML = `<div class="agent-card" style="padding:1rem">
+          <span class="status-dot inactive" style="display:inline-block;vertical-align:middle"></span>
+          <strong> Hindsight unreachable</strong>
+          <div style="color:var(--text-dim);margin-top:.5rem">${escapeHtml(m.url || '')} is not serving — agent memory (recall, retain, mental models) is down.</div>
+        </div>`;
+        return;
+      }
+      const statusDot = (s) => `<span class="status-dot ${s === 'ok' ? 'active' : s === 'warn' ? 'auth-warning' : 'inactive'}" style="display:inline-block;vertical-align:middle"></span>`;
+      const fmtDay = (iso) => iso ? iso.slice(0, 10) : '—';
+      const fmtAge = (iso) => {
+        if (!iso) return '';
+        const d = (Date.now() - Date.parse(iso)) / 86400000;
+        if (isNaN(d)) return '';
+        return d < 1 ? 'today' : `${Math.round(d)}d ago`;
+      };
+      const cards = (m.banks || []).map(b => {
+        const models = (b.mentalModels || []).map(mm => {
+          const ts = mm.lastRefreshedAt || mm.createdAt;
+          const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
+          return `<div class="meta-item"><label>${escapeHtml(mm.name)} </label><span style="${stale ? 'color:var(--yellow)' : ''}">${fmtAge(ts) || 'never refreshed'}</span></div>`;
+        }).join('');
+        const gapLine = b.recentUnextractedCount > 0
+          ? `<div style="color:var(--red);margin-top:.4rem">⚠ ${b.recentUnextractedCount} recent conversation(s) stored but NOT extracted (oldest ${fmtDay(b.oldestUnextractedAt)}) — invisible to recall until reprocessed</div>`
+          : '';
+        return `<div class="agent-card">
+          <div class="card-header" style="cursor:default">
+            ${statusDot(b.status)}<span class="agent-name">${escapeHtml(b.bank)}</span>
+            <span style="color:var(--text-dim);font-size:.85em;margin-left:.5rem">${escapeHtml((b.agents || []).join(', '))}</span>
+          </div>
+          <div style="padding:0 1.25rem 1rem">
+            <div style="color:var(--text-dim);margin-bottom:.4rem">${escapeHtml(b.statusDetail || '')}</div>
+            <div class="card-meta" style="padding:0">
+              <div class="meta-item"><label>Conversations </label><span>${b.totalDocuments}</span></div>
+              <div class="meta-item"><label>Facts </label><span>${b.totalFacts}</span></div>
+              <div class="meta-item"><label>Latest activity </label><span>${fmtDay(b.newestDocumentAt)} ${fmtAge(b.newestDocumentAt) ? '(' + fmtAge(b.newestDocumentAt) + ')' : ''}</span></div>
+              <div class="meta-item"><label>Mental models </label><span>${(b.mentalModels || []).length}${b.staleMentalModelCount ? ` <span style="color:var(--yellow)">(${b.staleMentalModelCount} stale)</span>` : ''}</span></div>
+            </div>
+            ${models ? `<div class="card-meta" style="padding:.4rem 0 0">${models}</div>` : ''}
+            ${gapLine}
+          </div>
+        </div>`;
+      }).join('');
+      container.innerHTML = `<div class="agents-grid">${cards || '<div style="color:var(--text-dim)">No agent banks configured.</div>'}</div>`;
     }
 
     async function fetchConnections() {
@@ -695,7 +756,7 @@
     }
 
     function switchTab(tab) {
-      const tabs = ['summary', 'agents', 'accounts', 'system', 'connections', 'schedule', 'approvals'];
+      const tabs = ['summary', 'agents', 'accounts', 'system', 'memory', 'connections', 'schedule', 'approvals'];
       for (const t of tabs) {
         document.getElementById(`tab-${t}`).classList.toggle('active', tab === t);
         document.getElementById(t).style.display = tab === t ? '' : 'none';
@@ -703,6 +764,7 @@
       if (tab === 'summary') fetchSummary();
       if (tab === 'accounts') fetchAccounts();
       if (tab === 'system') fetchSystemHealth();
+      if (tab === 'memory') fetchMemoryHealth();
       if (tab === 'connections') fetchConnections();
       if (tab === 'schedule') fetchSchedule();
       if (tab === 'approvals') fetchApprovals();

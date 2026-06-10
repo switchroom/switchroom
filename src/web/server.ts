@@ -30,6 +30,7 @@ import {
   handleGetAgentConfig,
   handleUseAccount,
   handleGetSystemHealth,
+  handleGetMemoryHealth,
   handleGetGoogleAccounts,
   handleGetMicrosoftAccounts,
   handleSetConnectionAccess,
@@ -379,6 +380,11 @@ function parseRoute(
     return { handler: "getSystemHealth", params: {} };
   }
 
+  // GET /api/memory-health
+  if (method === "GET" && pathname === "/api/memory-health") {
+    return { handler: "getMemoryHealth", params: {} };
+  }
+
   // GET /api/google-accounts
   if (method === "GET" && pathname === "/api/google-accounts") {
     return { handler: "getGoogleAccounts", params: {} };
@@ -638,6 +644,10 @@ export function startWebServer(
 
           case "getSystemHealth":
             return (async () => jsonResponse(await handleGetSystemHealth(config)))();
+
+          case "getMemoryHealth":
+            return (async () =>
+              jsonResponse(await handleGetMemoryHealth(freshConfig())))();
 
           case "getGoogleAccounts":
             return (async () =>
