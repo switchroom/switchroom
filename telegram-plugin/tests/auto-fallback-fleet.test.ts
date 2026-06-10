@@ -173,3 +173,74 @@ describe('runFleetAutoFallback', () => {
     }
   });
 });
+
+// ── failure notice (broken-promise fix, 2026-06-09 incident follow-up) ──────
+
+import { renderFallbackFailureNotice } from "../auto-fallback-fleet.js";
+
+describe("renderFallbackFailureNotice", () => {
+  it("names the trigger agent, the reason, and the manual recovery verbs", () => {
+    const html = renderFallbackFailureNotice("marko", "auth-broker unreachable (no client).");
+    expect(html).toContain("Auto-failover could not run");
+    expect(html).toContain("<b>marko</b>");
+    expect(html).toContain("auth-broker unreachable");
+    expect(html).toContain("/auth use");
+    expect(html).toContain("/auth</code>");
+  });
+
+  it("escapes HTML in the error reason (broker errors can contain angle brackets)", () => {
+    const html = renderFallbackFailureNotice("a<b", 'request <probe-quota> failed & "timed out"');
+    expect(html).toContain("a&lt;b");
+    expect(html).toContain("&lt;probe-quota&gt;");
+    expect(html).toContain("&amp;");
+    expect(html).not.toMatch(/<probe-quota>/);
+  });
+});
+
+// ── failure-notice cooldown (reviewer blocker: gate window never arms on
+//    failure; quota_wall_detected re-fires ~60s → unbounded notice spam) ─────
+
+import {
+  evaluateFallbackFailureNotice,
+  FALLBACK_FAILURE_NOTICE_COOLDOWN_MS,
+} from "../auto-fallback-fleet.js";
+
+describe("evaluateFallbackFailureNotice", () => {
+  const T0 = 1_780_000_000_000;
+
+  it("first failure always sends and arms the cooldown", () => {
+    const r = evaluateFallbackFailureNotice({ lastSentAtMs: 0 }, T0);
+    expect(r.send).toBe(true);
+    expect(r.next.lastSentAtMs).toBe(T0);
+  });
+
+  it("a repeat failure inside the cooldown is suppressed and does NOT extend the window", () => {
+    const armed = { lastSentAtMs: T0 };
+    const r = evaluateFallbackFailureNotice(armed, T0 + 60_000);
+    expect(r.send).toBe(false);
+    expect(r.next).toBe(armed); // unchanged — window not extended by suppressed attempts
+  });
+
+  it("sends again once the cooldown elapses", () => {
+    const r = evaluateFallbackFailureNotice(
+      { lastSentAtMs: T0 },
+      T0 + FALLBACK_FAILURE_NOTICE_COOLDOWN_MS,
+    );
+    expect(r.send).toBe(true);
+    expect(r.next.lastSentAtMs).toBe(T0 + FALLBACK_FAILURE_NOTICE_COOLDOWN_MS);
+  });
+
+  it("bounds the 60s quota_wall_detected re-fire storm to ≤2 notices/hour", () => {
+    // Simulate a wedged agent re-signalling every 60s for one hour with a
+    // dead broker — the incident shape the reviewer flagged.
+    let state = { lastSentAtMs: 0 };
+    let sent = 0;
+    for (let t = T0; t < T0 + 3_600_000; t += 60_000) {
+      const r = evaluateFallbackFailureNotice(state, t);
+      if (r.send) sent++;
+      state = r.next;
+    }
+    expect(sent).toBeLessThanOrEqual(2);
+    expect(sent).toBeGreaterThanOrEqual(1);
+  });
+});

@@ -42,6 +42,65 @@ import {
   buildSnapshotsFromState,
 } from './auth-snapshot-format.js';
 
+/**
+ * Failure notice for when the fallback dispatcher itself errors (broker
+ * unreachable, listState/markExhausted throw). The model-unavailable
+ * card renders "Auto-failover in progress — see the announcement below"
+ * BEFORE the outcome is known; every error path must therefore still
+ * produce an announcement or the card's promise is broken (the
+ * 2026-06-06→07 incident: 12 cards promised an announcement while every
+ * dispatch errored "set-active requires admin" — log-only, nothing
+ * arrived). Pure builder so the shape is unit-testable.
+ */
+export function renderFallbackFailureNotice(triggerAgent: string, reason: string): string {
+  return (
+    `⚠️ <b>Auto-failover could not run</b> (trigger: <b>${escFailureHtml(triggerAgent)}</b>)\n` +
+    `${escFailureHtml(reason)}\n\n` +
+    `<i>Switch manually with <code>/auth use &lt;label&gt;</code>, or <code>/auth</code> for fleet status.</i>`
+  );
+}
+
+function escFailureHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Cooldown for the failure notice. The fleetFallbackGate's dedup window
+ * deliberately arms ONLY on a successful swap (fleet-fallback-gate.ts:
+ * "No-ops … DO NOT arm the suppression window") — so it bounds nothing
+ * on the error path, and the card-less `quota_wall_detected` trigger
+ * re-signals every ~60s for the duration of a weekly wall. Without a
+ * notice-level bound, a persistent broker outage during a wall would
+ * stream ~60 failure notices/hour to every chat for days.
+ *
+ * Plain time cooldown, per gateway, in-memory. Deliberately NOT keyed
+ * by reason: broker error strings vary per attempt (timeout ms values
+ * etc.), so a new-reason bypass would re-open the spam hole. Worst
+ * case is one notice per gateway per cooldown window.
+ */
+export const FALLBACK_FAILURE_NOTICE_COOLDOWN_MS = 30 * 60_000;
+
+export interface FallbackFailureNoticeState {
+  /** Unix ms of the last failure notice this gateway sent. 0 = never. */
+  lastSentAtMs: number;
+}
+
+export function evaluateFallbackFailureNotice(
+  prev: FallbackFailureNoticeState,
+  now: number,
+  cooldownMs: number = FALLBACK_FAILURE_NOTICE_COOLDOWN_MS,
+): { send: boolean; next: FallbackFailureNoticeState } {
+  if (now - prev.lastSentAtMs >= cooldownMs) {
+    return { send: true, next: { lastSentAtMs: now } };
+  }
+  return { send: false, next: prev };
+}
+
 export type FleetFallbackOutcome =
   | {
       kind: 'switched';
