@@ -157,7 +157,7 @@ import {
   formatModelUnavailableCard,
   resolveModelUnavailableFromOperatorEvent,
 } from '../model-unavailable.js'
-import { runFleetAutoFallback, renderFallbackFailureNotice } from '../auto-fallback-fleet.js'
+import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, type FallbackFailureNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
 
@@ -14824,8 +14824,23 @@ async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Pr
  * Disable with SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE=0 (log-only,
  * pre-fix behaviour).
  */
+let fallbackFailureNoticeState: FallbackFailureNoticeState = { lastSentAtMs: 0 }
+
 function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): void {
   if (process.env.SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE === '0') return
+  // Notice-level cooldown (30 min, per gateway). The fleetFallbackGate's
+  // dedup window only arms on SUCCESSFUL swaps, so it bounds nothing
+  // here — and the card-less quota_wall_detected trigger re-fires every
+  // ~60s during a wall. Without this, a persistent broker outage would
+  // stream failure notices for days. See evaluateFallbackFailureNotice.
+  const verdict = evaluateFallbackFailureNotice(fallbackFailureNoticeState, Date.now())
+  if (!verdict.send) {
+    process.stderr.write(
+      `telegram gateway: [fleet-fallback] failure notice suppressed (cooldown) agent=${triggerAgent}: ${reason}\n`,
+    )
+    return
+  }
+  fallbackFailureNoticeState = verdict.next
   const access = loadAccess()
   if (access.allowFrom.length === 0) return
   const html = renderFallbackFailureNotice(triggerAgent, reason)

@@ -69,6 +69,38 @@ function escFailureHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * Cooldown for the failure notice. The fleetFallbackGate's dedup window
+ * deliberately arms ONLY on a successful swap (fleet-fallback-gate.ts:
+ * "No-ops … DO NOT arm the suppression window") — so it bounds nothing
+ * on the error path, and the card-less `quota_wall_detected` trigger
+ * re-signals every ~60s for the duration of a weekly wall. Without a
+ * notice-level bound, a persistent broker outage during a wall would
+ * stream ~60 failure notices/hour to every chat for days.
+ *
+ * Plain time cooldown, per gateway, in-memory. Deliberately NOT keyed
+ * by reason: broker error strings vary per attempt (timeout ms values
+ * etc.), so a new-reason bypass would re-open the spam hole. Worst
+ * case is one notice per gateway per cooldown window.
+ */
+export const FALLBACK_FAILURE_NOTICE_COOLDOWN_MS = 30 * 60_000;
+
+export interface FallbackFailureNoticeState {
+  /** Unix ms of the last failure notice this gateway sent. 0 = never. */
+  lastSentAtMs: number;
+}
+
+export function evaluateFallbackFailureNotice(
+  prev: FallbackFailureNoticeState,
+  now: number,
+  cooldownMs: number = FALLBACK_FAILURE_NOTICE_COOLDOWN_MS,
+): { send: boolean; next: FallbackFailureNoticeState } {
+  if (now - prev.lastSentAtMs >= cooldownMs) {
+    return { send: true, next: { lastSentAtMs: now } };
+  }
+  return { send: false, next: prev };
+}
+
 export type FleetFallbackOutcome =
   | {
       kind: 'switched';
