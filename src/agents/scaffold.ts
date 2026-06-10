@@ -448,6 +448,7 @@ import {
   deepMergeJson,
 } from "../config/merge.js";
 import { resolveTimezone, classifyTimezoneSource } from "../config/timezone.js";
+import { isContainerContext } from "../cli/agent-config.js";
 import {
   getProfilePath,
   getBaseProfilePath,
@@ -3337,6 +3338,44 @@ export function scaffoldAgent(
   mkdirSync(persistentHomeDir, { recursive: true });
   for (const sub of [".local/bin", ".npm-global", "bin"]) {
     mkdirSync(join(persistentHomeDir, sub), { recursive: true });
+  }
+
+  // Pre-create the $HOME/.switchroom symlink on the HOST, before the
+  // container's first boot (#910 host-side companion). start.sh.hbs also
+  // creates this link at runtime, but its guard refuses to clobber a
+  // pre-existing real directory at $HOME/.switchroom — and for ADMIN /
+  // ROOT agents docker creates exactly that: the admin audit-log binds
+  // (`…/vault-audit.log`, `…/host-control-audit.log` in compose.ts) target
+  // paths UNDER $HOME/.switchroom, so on a fresh agent's first boot docker
+  // materialises $HOME/.switchroom as a real dir to host those mount
+  // points BEFORE start.sh runs → the runtime symlink is skipped → the
+  // gateway↔claude bridge can't resolve `$HOME/.switchroom/agents/<name>/
+  // telegram/gateway.sock` and never registers (the agent silently
+  // ingests Telegram DMs into a buffer that never drains). Non-admin
+  // agents dodge this only because they have no mounts under the link.
+  // Seeding the symlink here means docker resolves those binds THROUGH it
+  // (the working klanker shape) and never creates the conflicting dir.
+  // Host-only: in-container reconcile has HOME=/state/agent/home (the
+  // wrong target) and the link already exists, so skip there. Create-only
+  // (never clobbers an existing symlink or a real dir — an already-booted
+  // agent is left to start.sh / operator).
+  if (!isContainerContext() && process.env.HOME) {
+    const dotSwitchroomLink = join(persistentHomeDir, ".switchroom");
+    let linkExists = true;
+    try {
+      lstatSync(dotSwitchroomLink);
+    } catch {
+      linkExists = false;
+    }
+    if (!linkExists) {
+      try {
+        symlinkSync(join(process.env.HOME, ".switchroom"), dotSwitchroomLink);
+        created.push(dotSwitchroomLink);
+      } catch {
+        // Best-effort: a failure here just falls back to start.sh's
+        // runtime attempt (which works for non-admin agents).
+      }
+    }
   }
   const homeEnvBlock = [
     "# switchroom Layer 1: per-agent persistent HOME.",
