@@ -279,6 +279,11 @@ export async function buildModelMenu(
     }
   }
 
+  // claude's ✔ marks the DEFAULT FOR NEW SESSIONS, which is a different axis
+  // from the model the agent is running right now (set via --model at launch
+  // or a prior session switch). Labelling the ✔ row "Now:" was misleading —
+  // it could read "Opus 4.8" while the live session is on Fable. Call it what
+  // it is, and tell the operator a switch applies to the live session.
   const current = discovered.options.find((o) => o.current)
   const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
   if (discovered.dismissFailed) {
@@ -286,18 +291,26 @@ export async function buildModelMenu(
   }
   if (current) {
     const detail = current.detail ? ` · ${deps.escapeHtml(current.detail)}` : ''
-    lines.push(`Now: <b>${deps.escapeHtml(current.label)}</b>${detail}`)
+    lines.push(`Default (new sessions): <b>${deps.escapeHtml(current.label)}</b>${detail}`)
   } else {
-    lines.push('Now: <i>unknown (no ✔ row in picker)</i>')
+    lines.push('Default (new sessions): <i>unknown (no ✔ row in picker)</i>')
   }
   if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
-  lines.push('', 'Tap to switch (applies to the live session):')
+  lines.push('', 'Tap a model to switch the <b>live session</b>:')
   lines.push(PERSIST_NOTE)
 
   return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(discovered.options) }
 }
 
 export interface ModelCallbackOutcome {
+  /**
+   * When true, the caller should ONLY show the toast (`answer`) and leave
+   * the existing menu message untouched — used for the mid-turn refusal so
+   * the menu keeps its buttons and the operator can simply tap again when
+   * the agent goes idle, instead of the menu collapsing to a button-less
+   * "try again" line (which read as "nothing happened").
+   */
+  toastOnly?: boolean
   /** Short toast for answerCallbackQuery. */
   answer: string
   /** Replacement dashboard (message edit). */
@@ -321,19 +334,30 @@ export async function handleModelMenuCallback(
   if (!data.startsWith(MODEL_CALLBACK_SELECT)) {
     return { answer: 'Unknown action', reply: await buildModelMenu(deps) }
   }
+  // Mid-turn: refuse WITHOUT touching the message. Driving the picker types
+  // into claude's input box, which mid-turn would queue "/model" as user
+  // text. toastOnly keeps the menu (and its buttons) exactly as-is so the
+  // operator just taps again when the agent is idle — no button-less
+  // "try again" line that read as a dead menu.
   if (deps.isBusy()) {
-    return { answer: 'Agent is mid-turn — try again shortly', reply: busyReply(deps) }
+    return {
+      answer: '⏳ Agent is mid-turn — tap again when it’s idle',
+      reply: busyReply(deps),
+      toastOnly: true,
+    }
   }
 
   const tag = data.slice(MODEL_CALLBACK_SELECT.length)
   const discovered = await deps.discover(deps.getAgentName())
   if (!discovered.ok) {
+    // Keep the menu interactive: re-render (falls back to v1 text if even
+    // the show path can't discover) with the failure as a banner.
     return {
       answer: 'Picker unavailable',
-      reply: {
-        text: `❌ Could not open the model picker: ${deps.escapeHtml(discovered.reason)}`,
-        html: true,
-      },
+      reply: await menuWithBanner(
+        deps,
+        `❌ Could not open the model picker: ${deps.escapeHtml(discovered.reason)}`,
+      ),
     }
   }
   const target = discovered.options.find((o) => labelTag(o.label) === tag)
@@ -343,26 +367,46 @@ export async function handleModelMenuCallback(
     return { answer: 'Model list changed — menu refreshed', reply: fresh }
   }
   if (target.current) {
-    const fresh = await buildModelMenu(deps)
-    return { answer: `Already on ${target.label}`, reply: fresh }
+    return {
+      answer: `Default is already ${target.label}`,
+      reply: await menuWithBanner(deps, `ℹ️ <b>${deps.escapeHtml(target.label)}</b> is already the default.`),
+    }
   }
 
   const result = await deps.select(deps.getAgentName(), target.label)
   if (!result.ok) {
+    // Switch failed but the agent is reachable — keep the menu so the
+    // operator can retry, with the reason as a banner.
     return {
-      answer: 'Switch failed',
-      reply: {
-        text: `❌ Switch to <b>${deps.escapeHtml(target.label)}</b> failed: ${deps.escapeHtml(result.reason)}`,
-        html: true,
-      },
+      answer: 'Switch failed — see the menu',
+      reply: await menuWithBanner(
+        deps,
+        `❌ Switch to <b>${deps.escapeHtml(target.label)}</b> failed: ${deps.escapeHtml(result.reason)}`,
+      ),
     }
   }
 
+  return {
+    answer: deps.escapeHtml(result.confirmation),
+    reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(result.confirmation)}`),
+  }
+}
+
+/**
+ * Re-render the live menu with a one-line banner on top. Used by every
+ * post-tap outcome (success, already-default, failure) so the menu ALWAYS
+ * keeps its buttons and the operator can act again — the consistent
+ * "status line + interactive menu" shape the other dashboards use. Falls
+ * back to the banner alone if the menu can't be rebuilt right now.
+ */
+async function menuWithBanner(
+  deps: ModelMenuDeps & ModelCommandDeps,
+  banner: string,
+): Promise<ModelMenuReply> {
   const fresh = await buildModelMenu(deps)
-  const confirmed: ModelMenuReply = {
-    text: [`✅ ${deps.escapeHtml(result.confirmation)}`, '', fresh.text].join('\n'),
+  return {
+    text: [banner, '', fresh.text].join('\n'),
     html: true,
     ...(fresh.keyboard ? { keyboard: fresh.keyboard } : {}),
   }
-  return { answer: result.confirmation, reply: confirmed }
 }

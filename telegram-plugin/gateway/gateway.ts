@@ -18409,15 +18409,29 @@ bot.on('callback_query:data', async ctx => {
         .catch(() => {})
       return
     }
-    // Answer the callback IMMEDIATELY — the select path drives the
-    // picker up to three times (multi-second); leaving the tap
-    // spinning invites a double-tap, which queues a second drive
-    // behind the pane lock and confuses the user. The final state is
-    // conveyed by the message edit (a callback can only be answered
-    // once).
-    await ctx.answerCallbackQuery({ text: 'Working…' }).catch(() => {})
+    const modelDeps = buildModelDeps()
+    // Mid-turn refusal is INSTANT (a sync isBusy() check, no picker drive),
+    // so handle it before the "Working…" ack: toast WHY and leave the menu
+    // message untouched (buttons intact) so the operator taps again when
+    // idle. Editing the menu into a button-less "try again" line was the
+    // "nothing happened" report — the menu looked dead.
+    if (modelDeps.isBusy()) {
+      await ctx
+        .answerCallbackQuery({ text: '⏳ Agent is mid-turn — tap again when it’s idle', show_alert: false })
+        .catch(() => {})
+      return
+    }
+    // Ack IMMEDIATELY — the select path drives the picker (multi-second);
+    // leaving the tap spinning invites a double-tap, which queues a second
+    // drive behind the pane lock. A callback can only be answered once, so
+    // the rich result (what was set / why it failed) is conveyed by the
+    // message edit — which now ALWAYS keeps the menu buttons.
+    await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
     try {
-      const outcome = await handleModelMenuCallback(data, buildModelDeps())
+      const outcome = await handleModelMenuCallback(data, modelDeps)
+      // toastOnly: a no-op outcome that should not disturb the menu (defence
+      // in depth — the isBusy() short-circuit above is the live path).
+      if (outcome.toastOnly) return
       await ctx
         .editMessageText(outcome.reply.text, {
           parse_mode: 'HTML',
