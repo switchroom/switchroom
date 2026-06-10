@@ -46,6 +46,11 @@ import {
   quotaIndicatesExhaustion,
   resolveConsumerProbeIntervalMs,
 } from "./consumer-quota-sensor.js";
+import {
+  isAccountBlocked as evalAccountBlocked,
+  snapshotShouldClearMark,
+  clampMarkExpiry,
+} from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../../util/atomic.js";
 import {
@@ -136,6 +141,12 @@ interface ThresholdViolations {
 
 interface QuotaEntry {
   exhausted_until: number;
+  /** Unix ms when this mark was written. Lets eligibility compare the mark's
+   *  recency against a live snapshot (most-recent-signal-wins). Optional for
+   *  backward-compat with marks persisted before 2026-06-10 — a legacy mark
+   *  with no `marked_at` is treated as older than any fresh probe, so live
+   *  truth overrides it (the safe direction). */
+  marked_at?: number;
 }
 interface QuotaState {
   [label: string]: QuotaEntry;
@@ -1032,10 +1043,22 @@ export class AuthBroker {
     return this.accountWithFailover(account);
   }
 
-  /** True if `account` is currently within a mark-exhausted window. */
+  /**
+   * True if `account` is blocked from serving / failover right now.
+   *
+   * Live-truth-authoritative (2026-06-10 fix): a fresh quota snapshot
+   * (≤24h, newer than the mark) decides — walled→blocked, healthy→not —
+   * and only when there is no usable live snapshot does the persisted
+   * `exhausted_until` mark govern. This is what stops a bogus future mark
+   * from stranding a live-healthy account, and a stale past mark from
+   * routing onto a live-walled one. See account-eligibility.ts.
+   */
   private isAccountExhausted(account: string): boolean {
-    const q = this.quota[account];
-    return q !== undefined && q.exhausted_until > this.now();
+    return evalAccountBlocked({
+      mark: this.quota[account],
+      snapshot: this.lastQuotaCache[account],
+      now: this.now(),
+    });
   }
 
   /**
@@ -1101,7 +1124,11 @@ export class AuthBroker {
       const creds = readAccountCredentials(label, this.home);
       const meta = readAccountMeta(label, this.home);
       const q = this.quota[label];
-      const exhausted = q !== undefined && q.exhausted_until > this.now();
+      // Report the SAME live-authoritative verdict the failover path uses, so
+      // the dashboard / quota-watch never see `exhausted=true` while live util
+      // is healthy (the contradicting-fields bug). `exhausted_until` still
+      // carries the raw mark for transparency.
+      const exhausted = this.isAccountExhausted(label);
       const lq = this.lastQuotaCache[label];
       return {
         label,
@@ -1238,7 +1265,7 @@ export class AuthBroker {
    *  periodic fleet tick so the snapshot shape stays in one place. */
   private cacheQuotaSnapshot(label: string, result: QuotaResult): void {
     if (!result.ok) return;
-    this.lastQuotaCache[label] = {
+    const snapshot = {
       fiveHourUtilizationPct: result.data.fiveHourUtilizationPct,
       sevenDayUtilizationPct: result.data.sevenDayUtilizationPct,
       fiveHourResetAt: result.data.fiveHourResetAt?.toISOString() ?? null,
@@ -1248,6 +1275,19 @@ export class AuthBroker {
       overageDisabledReason: result.data.overageDisabledReason,
       capturedAt: this.now(),
     };
+    this.lastQuotaCache[label] = snapshot;
+    // Self-heal: a fresh, clearly-healthy probe (both windows well under the
+    // wall) that is newer than the mark CLEARS the persisted mark — so a
+    // misfired/expired exhaustion can't linger on disk and survive restarts
+    // (the sticky-bogus-+7d-mark that outlasted recreate on 2026-06-10). A
+    // genuine weekly wall (7d≥99.5%) is never "clearly healthy" → never cleared.
+    if (snapshotShouldClearMark(snapshot, this.quota[label], this.now())) {
+      delete this.quota[label];
+      this.persistQuota();
+      process.stdout.write(
+        `auth-broker: live probe shows ${label} healthy (5h=${snapshot.fiveHourUtilizationPct}% 7d=${snapshot.sevenDayUtilizationPct}%) — cleared stale exhaustion mark\n`,
+      );
+    }
   }
 
   /**
@@ -1300,13 +1340,27 @@ export class AuthBroker {
         this.logErr(`consumer-quota-probe ${label}: ${(err as Error).message}`);
         continue;
       }
+      // Cache the fresh probe first: keeps the consumer account's snapshot warm
+      // for the dashboard AND makes it the live truth clampMarkExpiry consults
+      // below (so a genuine consumer weekly wall keeps its real reset). A
+      // healthy probe here also self-heals any stale mark via cacheQuotaSnapshot.
+      this.cacheQuotaSnapshot(label, result);
       const decision = quotaIndicatesExhaustion(result);
       if (!decision.exhausted) continue;
-      const exhaustedUntil = decision.until ?? this.now() + MARK_EXHAUSTED_DEFAULT_MS;
+      const now = this.now();
+      // This probe IS the live truth for `label`, so a long until here is
+      // self-corroborated — pass the snapshot so clampMarkExpiry honors a real
+      // weekly reset while still clamping an uncorroborated default.
+      const exhaustedUntil = clampMarkExpiry({
+        proposedUntil: decision.until ?? now + MARK_EXHAUSTED_DEFAULT_MS,
+        now,
+        shortMs: MARK_EXHAUSTED_DEFAULT_MS,
+        snapshot: this.lastQuotaCache[label],
+      });
       // Idempotent: skip the write/persist if already marked at/past this reset.
       const existing = this.quota[label]?.exhausted_until;
       if (existing !== undefined && existing >= exhaustedUntil) continue;
-      this.quota[label] = { exhausted_until: exhaustedUntil };
+      this.quota[label] = { exhausted_until: exhaustedUntil, marked_at: now };
       this.persistQuota();
       this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, ok: true });
       process.stdout.write(
@@ -1357,8 +1411,19 @@ export class AuthBroker {
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
       return;
     }
-    const exhaustedUntil = until ?? this.now() + MARK_EXHAUSTED_DEFAULT_MS;
-    this.quota[account] = { exhausted_until: exhaustedUntil };
+    const now = this.now();
+    // Clamp the misfire-prone case: a mark longer than the 5h default (the +7d
+    // weekly fallback that landed on the healthy primary on 2026-06-10) is only
+    // honored when a FRESH live probe of THIS account confirms its 7-day window
+    // is actually walled. An uncorroborated long mark clamps to 5h, so a
+    // misparsed weekly signal self-expires fast instead of stranding for days.
+    const exhaustedUntil = clampMarkExpiry({
+      proposedUntil: until ?? now + MARK_EXHAUSTED_DEFAULT_MS,
+      now,
+      shortMs: MARK_EXHAUSTED_DEFAULT_MS,
+      snapshot: this.lastQuotaCache[account],
+    });
+    this.quota[account] = { exhausted_until: exhaustedUntil, marked_at: now };
     this.persistQuota();
     // Fan out next-fallback creds to every agent whose active account is `account`.
     const rolled = this.fanoutFailoverFor(account);
@@ -2248,9 +2313,10 @@ export class AuthBroker {
     for (let i = 1; i <= order.length; i++) {
       const cand = order[(start + i) % order.length];
       if (!cand) continue;
-      const q = this.quota[cand];
-      const exhausted = q !== undefined && q.exhausted_until > this.now();
-      if (!exhausted && accountExists(cand, this.home)) return cand;
+      // Live-authoritative: skip a candidate the live probe shows walled even
+      // if its mark expired, and accept one the live probe shows healthy even
+      // if a stale/bogus mark says exhausted. (The 2026-06-10 root predicate.)
+      if (!this.isAccountExhausted(cand) && accountExists(cand, this.home)) return cand;
     }
     return null;
   }

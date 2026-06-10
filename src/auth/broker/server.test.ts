@@ -2220,6 +2220,75 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     broker.stop();
   });
 
+  // ── Live-quota-authoritative eligibility (2026-06-10 stale-mark outage) ──
+  // A quota fetch seam that returns per-account utilization keyed by the
+  // `at-<label>` token seedAccount writes, so a fleetQuotaProbeTick populates
+  // lastQuotaCache with a chosen live snapshot per account.
+  function liveQuota(util: Record<string, { five: number; seven: number }>) {
+    return async ({ accessToken }: { accessToken: string }) => {
+      const label = accessToken.replace(/^at-/, "");
+      const u = util[label] ?? { five: 0, seven: 0 };
+      return { ok: true as const, data: {
+        fiveHourUtilizationPct: u.five, sevenDayUtilizationPct: u.seven,
+        fiveHourResetAt: null, sevenDayResetAt: null,
+        representativeClaim: null, overageStatus: null, overageDisabledReason: null,
+      } };
+    };
+  }
+
+  it("INCIDENT A: a bogus future mark on a LIVE-HEALTHY account is ignored AND self-healed", async () => {
+    let clock = Date.UTC(2026, 5, 10, 7, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      _testFetchQuota: liveQuota({ default: { five: 4, seven: 20 }, secondary: { five: 5, seven: 10 } }),
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      // Stamp the bogus +7d mark on the healthy primary (the pixsoul shape).
+      await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 7 * 24 * 3600_000 });
+      // No live data yet → eligibility falls back to the mark → would fail over.
+      // Now a live probe lands showing default healthy (5h=4 / 7d=20).
+      await broker.fleetQuotaProbeTick();
+      // Serving must IGNORE the stale mark and keep default (live-authoritative).
+      const resp = (await rpc(clerkSock, { v: 1, id: "2", op: "get-credentials" })) as { data: { account: string } };
+      expect(resp.data.account).toBe("default");
+      // …and the healthy probe must have SELF-HEALED the mark off disk.
+      const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(false);
+      expect(acct?.exhausted_until).toBeUndefined();
+    } finally { broker.stop(); }
+  });
+
+  it("INCIDENT B: failover SKIPS a candidate whose mark is past but whose LIVE quota is walled", async () => {
+    let clock = Date.UTC(2026, 5, 10, 7, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary", "tertiary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary"); seedAccount(h, "tertiary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      // default genuinely walled; secondary LIVE-walled (5h=100) despite no mark;
+      // tertiary healthy. Failover must hop over secondary to tertiary.
+      _testFetchQuota: liveQuota({ default: { five: 100, seven: 30 }, secondary: { five: 100, seven: 27 }, tertiary: { five: 3, seven: 8 } }),
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      await broker.fleetQuotaProbeTick(); // live snapshots populate
+      // default walls → mark-exhausted; live shows secondary walled too.
+      await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 3600_000 });
+      const resp = (await rpc(clerkSock, { v: 1, id: "2", op: "get-credentials" })) as { data: { account: string } };
+      expect(resp.data.account).toBe("tertiary"); // NOT secondary (live-walled)
+    } finally { broker.stop(); }
+  });
+
   it("a weekly until holds past markExhausted's ~5h default, then auto-reverts", async () => {
     let clock = Date.UTC(2026, 5, 7, 0, 0, 0);
     const { broker, clerkSock } = failoverHarness({ now: () => clock });
