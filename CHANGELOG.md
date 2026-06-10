@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.15.1 — quota-status floods silenced (#2254, #2255)
+
+The 2026-06-09 incident: a fleet bounce released days-stale quota-recovery
+latches on all 11 agent gateways at once — 26 byte-identical 🟢 "Quota back in
+healthy range" messages in 16 minutes, for recoveries that had happened 19h
+and 3.4 days earlier. Content was technically true; volume and timing made it
+read as wrong. This release fixes the notifier and its sibling surfaces.
+
+### PR A — quota-watch: fleet dedup + staleness gate + verified numbers (#2254)
+
+One account edge used to mean up to 26 Telegram sends (11 independent
+watchers × per-agent chat fan-out). The auth-broker now arbitrates a
+`claim-notification` op: the first claimant per (account, transition, chat)
+in a 30-minute window sends; the other agents advance their local state
+silently. Per-chat keys keep the audience identical. Gateways fail OPEN on
+claim errors, so a skewed rollout degrades to today's duplicates, never to
+silence. Classification gains a staleness gate (cached snapshots older than
+60 min carry no opinion), recovery edges observed on the first post-boot tick
+or whose 🟡 warning is over 6 h old reconcile silently (the latch clears,
+nothing is sent), and a notification whose pre-send validation probe fails is
+deferred to the next tick instead of shipping unverified numbers. The
+decision FSM is proven by total enumeration (144 cells + a terminal-state
+invariant). Kill-switches: `SWITCHROOM_QUOTA_WATCH_FLEET_DEDUP=0`,
+`SWITCHROOM_QUOTA_WATCH_MAX_STALE_MS=0`,
+`SWITCHROOM_QUOTA_WATCH_LATE_RECOVERY_MS=0`,
+`SWITCHROOM_QUOTA_WATCH_SEND_ON_PROBE_FAIL=1`.
+
+### PR B — fallback failure notice + honest quota columns (#2255)
+
+The ⚠️ model-unavailable card promises "Auto-failover in progress — see the
+announcement below" before the dispatcher's outcome is known; on dispatcher
+error nothing ever arrived (12 broken-promise cards on 06-06→07). Every error
+path now broadcasts a failure notice with the manual recovery verbs, bounded
+by a dedicated 30-minute per-gateway cooldown (the fallback gate's dedup
+window only arms on successful swaps, so it could not bound this). Kill:
+`SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE=0`. And `switchroom auth list` plus
+the Telegram legacy fleet table now show a `QUOTA 5h·7d` column from the
+broker's cached utilization with its age ("16%·1% (3m ago)") — a 99%-utilized
+account no longer reads "available —", and "no data" is distinct from "not
+exhausted".
+
 ## v0.15.0 — claude CLI 2.1.170 for Fable 5 (#2252)
 
 The fleet default model moved to **Fable 5** (`claude-fable-5[1m]`), and this
