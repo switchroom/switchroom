@@ -311,6 +311,13 @@ export interface ModelCallbackOutcome {
    * "try again" line (which read as "nothing happened").
    */
   toastOnly?: boolean
+  /**
+   * On a successful session switch, the live model name now running (parsed
+   * from claude's confirmation, e.g. "Fable 5"). The gateway records this as
+   * the session-model override so `/status` reflects what's actually running.
+   * Absent on every non-switch outcome.
+   */
+  selectedModel?: string
   /** Short toast for answerCallbackQuery. */
   answer: string
   /** Replacement dashboard (message edit). */
@@ -366,13 +373,14 @@ export async function handleModelMenuCallback(
     const fresh = await buildModelMenu(deps)
     return { answer: 'Model list changed — menu refreshed', reply: fresh }
   }
-  if (target.current) {
-    return {
-      answer: `Default is already ${target.label}`,
-      reply: await menuWithBanner(deps, `ℹ️ <b>${deps.escapeHtml(target.label)}</b> is already the default.`),
-    }
-  }
-
+  // NOTE: do NOT short-circuit when target.current is set. The picker's ✔
+  // marks claude's DEFAULT FOR NEW SESSIONS, which is a DIFFERENT axis from
+  // the model the live session is running (set by --model at launch). Tapping
+  // the ✔ row to apply that model to the live session is a legitimate switch
+  // — e.g. an agent launched on Fable tapping "Default (Opus)". Skipping it
+  // here was the "tapped Default, nothing happened" bug. Always drive the
+  // selection; claude harmlessly answers "Kept model as X" if it's already
+  // the session model.
   const result = await deps.select(deps.getAgentName(), target.label)
   if (!result.ok) {
     // Switch failed but the agent is reachable — keep the menu so the
@@ -389,7 +397,23 @@ export async function handleModelMenuCallback(
   return {
     answer: deps.escapeHtml(result.confirmation),
     reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(result.confirmation)}`),
+    selectedModel: sessionModelFromConfirmation(result.confirmation) ?? target.label,
   }
+}
+
+/**
+ * Pull the model NAME out of claude's session-switch confirmation so it can
+ * be shown in `/status` as the live session model. claude phrases it as
+ * "Set model to <name> for this session only" (or "Switched to <name>").
+ * Returns null when the confirmation doesn't carry a recognizable name (the
+ * caller falls back to the tapped picker label).
+ */
+export function sessionModelFromConfirmation(confirmation: string): string | null {
+  const m = /(?:Set model to|Switched to)\s+(.+?)(?:\s+for (?:this|the) session|\s*\(|\s*$)/i.exec(
+    confirmation.trim(),
+  )
+  const name = m?.[1]?.trim()
+  return name && name.length > 0 ? name : null
 }
 
 /**

@@ -82,6 +82,17 @@ describe("formatAgentLine", () => {
     const out = formatAgentLine({ ...baseMeta, topicName: "Planning", topicEmoji: "🗓" });
     expect(out).toContain("topic: 🗓 Planning");
   });
+  it("shows the live session model alongside the configured model when a /model switch is active", () => {
+    const out = formatAgentLine({ ...baseMeta, model: "claude-fable-5[1m]", sessionModel: "Opus 4.8 (1M context)" });
+    // Both surfaces present + agree: configured AND what's actually running.
+    expect(out).toContain("<code>claude-fable-5[1m]</code>");
+    expect(out).toContain("live session: <code>Opus 4.8 (1M context)</code>");
+  });
+  it("omits the session line when no override is active", () => {
+    expect(formatAgentLine({ ...baseMeta, sessionModel: null })).not.toContain("live session");
+    expect(formatAgentLine({ ...baseMeta, sessionModel: "" })).not.toContain("live session");
+    expect(formatAgentLine(baseMeta)).not.toContain("live session");
+  });
   it("omits topic when only emoji is set", () => {
     // topicName null → no topic chunk. Keeps the line clean.
     expect(formatAgentLine({ ...baseMeta, topicEmoji: "🗓" })).not.toContain("topic");

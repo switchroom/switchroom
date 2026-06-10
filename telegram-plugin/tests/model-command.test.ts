@@ -212,6 +212,7 @@ import {
   buildModelMenu,
   handleModelMenuCallback,
   modelSelectCallbackData,
+  sessionModelFromConfirmation,
   MODEL_CALLBACK_REFRESH,
   type ModelMenuDeps,
 } from "../gateway/model-command.js";
@@ -316,12 +317,14 @@ describe("handleModelMenuCallback", () => {
     expect(out.reply.keyboard).toBeDefined();
   });
 
-  it("tapping the current model is a no-op that keeps the menu interactive", async () => {
+  it("tapping the ✔ (default) row STILL drives a switch — ✔ is the new-session default, not the live session model", async () => {
+    // OPTIONS marks "Sonnet" current (the ✔). An agent launched on a
+    // different model must still be able to apply the ✔ row to its live
+    // session — skipping it was the "tapped Default, nothing happened" bug.
     const { deps, calls } = makeMenuDeps();
     const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
-    expect(calls.select).toEqual([]);
-    expect(out.answer).toContain("already");
-    // Menu keeps its buttons (a banner + the live menu, not a dead line).
+    expect(calls.select).toEqual(["Sonnet"]);
+    expect(out.reply.text).toContain("✅");
     expect(out.reply.keyboard).toBeDefined();
   });
 
@@ -346,7 +349,7 @@ describe("handleModelMenuCallback", () => {
     expect(out.reply.keyboard).toBeDefined();
   });
 
-  it("a successful switch banners the confirmation and keeps the menu", async () => {
+  it("a successful switch banners the confirmation, keeps the menu, AND reports the live model for /status", async () => {
     const { deps } = makeMenuDeps({
       select: async () => ({ ok: true as const, confirmation: "Set model to Haiku 4.5 for this session only" }),
     });
@@ -355,6 +358,20 @@ describe("handleModelMenuCallback", () => {
     expect(out.reply.text).toContain("✅");
     expect(out.reply.text).toContain("Set model to Haiku 4.5");
     expect(out.reply.keyboard).toBeDefined();
+    // The gateway records this so /status reflects the live session model.
+    expect(out.selectedModel).toBe("Haiku 4.5");
+  });
+});
+
+describe("sessionModelFromConfirmation", () => {
+  it("pulls the model name from claude's session-switch confirmation", () => {
+    expect(sessionModelFromConfirmation("Set model to Fable 5 for this session only")).toBe("Fable 5");
+    expect(sessionModelFromConfirmation("Set model to Opus 4.8 (1M context) for this session only")).toBe("Opus 4.8");
+    expect(sessionModelFromConfirmation("Switched to Haiku 4.5")).toBe("Haiku 4.5");
+  });
+  it("returns null when no recognizable name is present", () => {
+    expect(sessionModelFromConfirmation("Kept model as Opus 4.8 (default)")).toBeNull();
+    expect(sessionModelFromConfirmation("")).toBeNull();
   });
 
   it("mdl:r re-renders the dashboard", async () => {

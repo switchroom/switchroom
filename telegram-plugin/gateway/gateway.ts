@@ -13767,6 +13767,14 @@ function buildAgentAudit(agentName: string): AgentAudit | undefined {
 // broker's fleet-wide `ListStateData` payload via
 // `buildAuthSummaryFromBroker`, with billingType pulled from the
 // agent's `.claude.json` (the broker doesn't track plan tier).
+/**
+ * Live session-model override set by the `/model` picker (session-only). Held
+ * in gateway memory so it clears on restart, the same point at which claude's
+ * session reverts to the configured model — keeping `/status` honest without
+ * a persisted store. Null when no session switch is active.
+ */
+let activeSessionModelOverride: string | null = null
+
 async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   type AgentListResp = {
     agents: Array<{
@@ -13795,6 +13803,7 @@ async function buildAgentMetadata(agentName: string): Promise<AgentMetadata> {
   return {
     agentName,
     model: a?.model ?? null,
+    sessionModel: activeSessionModelOverride,
     extendsProfile: (a?.extends ?? a?.template) ?? null,
     topicName: a?.topic_name ?? null,
     topicEmoji: a?.topic_emoji ?? null,
@@ -18429,6 +18438,12 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
     try {
       const outcome = await handleModelMenuCallback(data, modelDeps)
+      // Record a successful session switch so /status reflects what's
+      // actually running. In-memory only → clears when the gateway (and thus
+      // claude's session) restarts, exactly matching the session-only scope.
+      if (outcome.selectedModel) {
+        activeSessionModelOverride = outcome.selectedModel
+      }
       // toastOnly: a no-op outcome that should not disturb the menu (defence
       // in depth — the isBusy() short-circuit above is the live path).
       if (outcome.toastOnly) return
