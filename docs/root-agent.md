@@ -16,7 +16,8 @@ its schedules like any other agent.
 Reach for a root agent when you find yourself SSHing into the switchroom
 host as root to:
 
-- read another agent's logs (`docker logs`, `/var/log/switchroom/...`),
+- read another agent's logs (`docker logs switchroom-<agent>`, or
+  `~/.switchroom/logs/<agent>/`),
 - `docker exec` into a wedged peer to see what it's stuck on,
 - inspect or edit `~/.switchroom/switchroom.yaml` and re-`apply`,
 - look at host-level state (Coolify, nginx, systemd, disk) that an

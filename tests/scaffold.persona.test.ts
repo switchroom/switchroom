@@ -159,6 +159,18 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // non-admin hand-off branch).
     expect(claudeMd).toContain("## Admin surface");
     expect(claudeMd).not.toContain("You're NOT `admin: true`");
+    // Accuracy pins (the root agent runs as uid 0; these claims were
+    // verified against the live container):
+    // 1. The root block resolves the contradiction with the admin
+    //    approval-card section (root is no-tap, not gated by hostd).
+    expect(claudeMd).toContain("supersedes the \"Admin surface\" section");
+    // 2. Correct host-side per-agent log path (NOT the in-container
+    //    /var/log/switchroom path, which doesn't exist under /host).
+    expect(claudeMd).toContain("/host-home/.switchroom/logs/<agent>/");
+    expect(claudeMd).not.toContain("/host/var/log/switchroom/");
+    // 3. No claim that a full `switchroom apply` runs from the container
+    //    (compose dir isn't mounted) — it's flagged as a host operation.
+    expect(claudeMd).toContain("hand the `apply` to the operator");
   });
 
   it("a non-root agent never renders the root-tier block", () => {
