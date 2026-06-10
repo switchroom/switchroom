@@ -258,6 +258,7 @@ import { DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
 import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/inject.js'
 import { handleInjectCommand } from './inject-handler.js'
+import { parseModelCommand, handleModelCommand } from './model-command.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
@@ -13919,6 +13920,30 @@ bot.command('inject', async ctx => {
     preBlock,
     formatOutput: formatSwitchroomOutput,
   })
+})
+
+// /model — show or switch the Claude model for this agent's live
+// session. The argument form rides the same allowlisted inject
+// primitive as /inject (claude's native `/model <name>` REPL command);
+// the bare form never injects (the no-arg picker is an undriveable TUI
+// modal from Telegram). Implementation in model-command.ts so it's
+// unit-testable without booting the bot.
+bot.command('model', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
+  const reply = await handleModelCommand(parsed, {
+    inject: injectSlashCommandImpl,
+    getAgentName: getMyAgentName,
+    getConfiguredModel: () => {
+      type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
+      const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+      return data?.agents?.find(a => a.name === getMyAgentName())?.model ?? null
+    },
+    escapeHtml: escapeHtmlForTg,
+    preBlock,
+  })
+  await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
 bot.command('agentstart', async ctx => {
