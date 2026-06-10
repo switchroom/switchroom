@@ -44,11 +44,11 @@ describe("snapshot predicates", () => {
 });
 
 describe("isAccountBlocked — live truth is authoritative over the mark", () => {
-  it("INCIDENT A (pixsoul): bogus future mark, but fresh healthy probe → NOT blocked", () => {
+  it("INCIDENT A (healthy primary): bogus future mark, but fresh healthy probe → NOT blocked", () => {
     const mark: ExhaustionMark = { exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000, marked_at: NOW - 60_000 };
     expect(isAccountBlocked({ mark, snapshot: snap(4, 20, 30_000), now: NOW })).toBe(false);
   });
-  it("INCIDENT B (outlook): stale PAST mark, but fresh walled probe → blocked", () => {
+  it("INCIDENT B (walled secondary): stale PAST mark, but fresh walled probe → blocked", () => {
     const mark: ExhaustionMark = { exhausted_until: NOW - 60_000, marked_at: NOW - 3 * 60 * 60 * 1000 };
     expect(isAccountBlocked({ mark, snapshot: snap(100, 27, 30_000), now: NOW })).toBe(true);
   });
@@ -91,7 +91,7 @@ describe("snapshotShouldClearMark — self-heal", () => {
 
 describe("clampMarkExpiry — only override a long mark the live data DISPROVES", () => {
   it("clamps a >5h mark when a fresh probe CONTRADICTS the weekly wall (7d healthy)", () => {
-    // The pixsoul misfire shape: a +7d mark proposed while live 7d=20%.
+    // The healthy-primary misfire shape: a +7d mark proposed while live 7d=20%.
     const proposed = NOW + 7 * 24 * 60 * 60 * 1000;
     expect(clampMarkExpiry({ proposedUntil: proposed, now: NOW, shortMs: FIVE_H, snapshot: snap(4, 20, 0) }))
       .toBe(NOW + FIVE_H);

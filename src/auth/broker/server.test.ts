@@ -2250,7 +2250,7 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     const clerkSock = join(h.socketRoot, "clerk", "sock");
     try {
       await broker.start();
-      // Stamp the bogus +7d mark on the healthy primary (the pixsoul shape).
+      // Stamp the bogus +7d mark on the healthy primary (the incident shape).
       await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 7 * 24 * 3600_000 });
       // No live data yet → eligibility falls back to the mark → would fail over.
       // Now a live probe lands showing default healthy (5h=4 / 7d=20).

@@ -5,9 +5,9 @@
  * The 2026-06-10 outage was a stale-data-over-live-truth inversion: the broker
  * judged an account healthy-or-not PURELY by a persisted `exhausted_until`
  * mark, never consulting the live quota probe sitting beside it in
- * `lastQuotaCache`. One misfired +7d mark on the healthy primary (pixsoul,
- * live 7d=20%) therefore stranded the whole fleet, and a stale *past* mark on
- * a live-walled account (outlook, live 5h=100%) made it look eligible — both
+ * `lastQuotaCache`. One misfired +7d mark on the healthy primary account
+ * (live 7d=20%) therefore stranded the whole fleet, and a stale *past* mark on
+ * a live-walled secondary account (live 5h=100%) made it look eligible — both
  * failover paths picked wrong because they trusted a timestamp over the truth.
  *
  * Principle (operator directive): rely on accurate LIVE status, never stale
