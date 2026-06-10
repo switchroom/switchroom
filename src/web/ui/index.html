@@ -538,6 +538,9 @@
         const gapLine = b.recentUnextractedCount > 0
           ? `<div style="color:var(--red);margin-top:.4rem">⚠ ${b.recentUnextractedCount} recent conversation(s) stored but NOT extracted (oldest ${fmtDay(b.oldestUnextractedAt)}) — invisible to recall until reprocessed</div>`
           : '';
+        const corruptLine = (b.corruptedMentalModelNames || []).length > 0
+          ? `<div style="color:var(--red);margin-top:.4rem">⚠ corrupted mental model(s): ${escapeHtml(b.corruptedMentalModelNames.join(', '))} — content is an LLM failure message; refresh once quota recovers</div>`
+          : '';
         return `<div class="agent-card">
           <div class="card-header" style="cursor:default">
             ${statusDot(b.status)}<span class="agent-name">${escapeHtml(b.bank)}</span>
@@ -552,6 +555,7 @@
               <div class="meta-item"><label>Mental models </label><span>${(b.mentalModels || []).length}${b.staleMentalModelCount ? ` <span style="color:var(--yellow)">(${b.staleMentalModelCount} stale)</span>` : ''}</span></div>
             </div>
             ${models ? `<div class="card-meta" style="padding:.4rem 0 0">${models}</div>` : ''}
+            ${corruptLine}
             ${gapLine}
           </div>
         </div>`;

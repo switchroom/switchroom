@@ -28,7 +28,7 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
 import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList } from "../memory/hindsight.js";
-import { inspectBankHealth, staleMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
+import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
@@ -996,12 +996,24 @@ export async function checkBankIngestHealth(
 
     const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
     const stale = staleMentalModels(h.mentalModels, 7, now);
+    const corrupted = corruptedMentalModels(h.mentalModels);
     const newestAge = ageDays(h.newestDocumentAt, now);
     const summary =
       `${h.totalDocuments} docs · ${h.totalFacts} facts · ` +
       `newest ${h.newestDocumentAt?.slice(0, 10) ?? "?"} · ` +
       `${h.mentalModels.length} mental models`;
 
+    if (corrupted.length > 0) {
+      results.push({
+        name: label,
+        status: "fail",
+        detail: `${corrupted.length} mental model(s) hold a persisted LLM-failure message instead of real content (${corrupted.map((m) => m.name).join(", ")}) — that garbage is injected into every agent turn`,
+        fix:
+          "A refresh ran while the LLM was quota-walled and the error string was stored as content. " +
+          "Once quota recovers: POST /v1/default/banks/<bank>/mental-models/<id>/refresh and verify the content regenerated.",
+      });
+      continue;
+    }
     if (gaps.length > 0) {
       const oldest = gaps[0];
       results.push({
