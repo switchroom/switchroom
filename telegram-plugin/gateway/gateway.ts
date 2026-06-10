@@ -247,6 +247,7 @@ import {
 import {
   fetchQuota,
   formatQuotaBlock,
+  formatQuotaLine,
   type QuotaResult,
 } from '../quota-check.js'
 import {
@@ -258,7 +259,17 @@ import { DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
 import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/inject.js'
 import { handleInjectCommand } from './inject-handler.js'
-import { parseModelCommand, handleModelCommand } from './model-command.js'
+import {
+  parseModelCommand,
+  handleModelCommand,
+  buildModelMenu,
+  handleModelMenuCallback,
+  MODEL_CALLBACK_PREFIX,
+  type ModelMenuDeps,
+  type ModelCommandDeps,
+  type ModelMenuReply,
+} from './model-command.js'
+import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
@@ -13922,19 +13933,39 @@ bot.command('inject', async ctx => {
   })
 })
 
-// /model — show or switch the Claude model for this agent's live
-// session. The argument form rides the same allowlisted inject
-// primitive as /inject (claude's native `/model <name>` REPL command);
-// the bare form never injects (the no-arg picker is an undriveable TUI
-// modal from Telegram). Implementation in model-command.ts so it's
+// /model — model dashboard + switch for this agent's live session.
+// Bare form: drives claude's own /model picker (open → parse → Esc,
+// src/agents/model-picker.ts) to discover the live option list — no
+// hardcoded model names — and renders it as an inline-keyboard menu
+// with the current model + a brief quota line. A tap re-opens the
+// picker fresh and applies session-only (`s`). Kill-switch
+// SWITCHROOM_MODEL_MENU=0 reverts the bare form to the static v1
+// text. The typed argument form rides the allowlisted inject
+// primitive unchanged. Implementation in model-command.ts so it's
 // unit-testable without booting the bot.
-bot.command('model', async ctx => {
-  if (!isAuthorizedSender(ctx)) return
-  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
-  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
-  const reply = await handleModelCommand(parsed, {
-    inject: injectSlashCommandImpl,
+function buildModelDeps(): ModelMenuDeps & ModelCommandDeps {
+  return {
+    discover: (a) => discoverModels(a),
+    select: (a, label) => selectModel(a, label),
+    isBusy: () => currentTurn !== null,
     getAgentName: getMyAgentName,
+    getQuotaBrief: async () => {
+      // Broker-routed probe first (authoritative), local headers as
+      // fallback — same ladder as the boot card / legacy /usage.
+      try {
+        const probed = await probeQuotaForBootCard(getMyAgentName(), 4000)
+        if (probed?.ok) return formatQuotaLine(probed.data)
+      } catch { /* fall through */ }
+      try {
+        const agentDir = resolveAgentDirFromEnv()
+        if (agentDir) {
+          const local = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
+          if (local.ok) return formatQuotaLine(local.data)
+        }
+      } catch { /* quota is garnish — never block the menu on it */ }
+      return null
+    },
+    inject: injectSlashCommandImpl,
     getConfiguredModel: () => {
       type AgentListResp = { agents: Array<{ name: string; model?: string | null }> }
       const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
@@ -13942,7 +13973,30 @@ bot.command('model', async ctx => {
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
-  })
+  }
+}
+
+function modelMenuReplyMarkup(reply: ModelMenuReply): InlineKeyboard | undefined {
+  if (!reply.keyboard) return undefined
+  const kb = new InlineKeyboard()
+  for (const row of reply.keyboard) {
+    for (const btn of row) kb.text(btn.text, btn.callback_data)
+    kb.row()
+  }
+  return kb
+}
+
+bot.command('model', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
+  const deps = buildModelDeps()
+  if (parsed.kind === 'show' && process.env.SWITCHROOM_MODEL_MENU !== '0') {
+    const menu = await buildModelMenu(deps)
+    await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
+    return
+  }
+  const reply = await handleModelCommand(parsed, deps)
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
@@ -18327,6 +18381,54 @@ bot.on('callback_query:data', async ctx => {
   // existing CLI invocations plus dashboard refresh.
   if (data.startsWith('auth:')) {
     await handleAuthDashboardCallback(ctx)
+    return
+  }
+
+  // `mdl:*` — model-menu taps (/model dashboard). `mdl:s:<tag>`
+  // selects a model by label-tag via a fresh picker discovery (never
+  // a stale index); `mdl:r` re-renders. Strict allowFrom gate like
+  // every other mutating callback family — a model switch changes the
+  // fleet's quota burn profile.
+  if (data.startsWith(MODEL_CALLBACK_PREFIX)) {
+    const access = loadAccess()
+    const senderId = String(ctx.from?.id ?? '')
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' })
+      return
+    }
+    // Kill-switch covers the callback family too — stale menus keep
+    // their buttons after the flag flips, and the flag exists exactly
+    // for "picker-driving is misbehaving" (#2263 review blocker 2).
+    if (process.env.SWITCHROOM_MODEL_MENU === '0') {
+      await ctx.answerCallbackQuery({ text: 'Model menu is disabled (SWITCHROOM_MODEL_MENU=0).' }).catch(() => {})
+      await ctx
+        .editMessageText('Model menu is disabled on this agent. Use <code>/model &lt;name&gt;</code>.', {
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [] },
+        })
+        .catch(() => {})
+      return
+    }
+    // Answer the callback IMMEDIATELY — the select path drives the
+    // picker up to three times (multi-second); leaving the tap
+    // spinning invites a double-tap, which queues a second drive
+    // behind the pane lock and confuses the user. The final state is
+    // conveyed by the message edit (a callback can only be answered
+    // once).
+    await ctx.answerCallbackQuery({ text: 'Working…' }).catch(() => {})
+    try {
+      const outcome = await handleModelMenuCallback(data, buildModelDeps())
+      await ctx
+        .editMessageText(outcome.reply.text, {
+          parse_mode: 'HTML',
+          reply_markup: modelMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: model-menu callback failed: ${(err as Error)?.message ?? String(err)}\n`,
+      )
+    }
     return
   }
 

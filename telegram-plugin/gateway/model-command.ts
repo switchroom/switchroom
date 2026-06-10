@@ -2,13 +2,14 @@
  * Telegram `/model` command — show or switch the Claude model for this
  * agent's live session.
  *
- * `/model` (bare) shows the configured model and the switch options.
- * It deliberately NEVER injects the bare `/model` verb into the claude
- * pane: with no argument the CLI renders an interactive picker modal
- * that nothing on the Telegram side can drive (no arrow keys, no Esc),
- * which would wedge the pane — the same TUI-modal class of wedge as
- * the /rate-limit-options incident. Only the argument form is ever
- * injected.
+ * `/model` (bare) renders the model dashboard: the live model, a brief
+ * quota line, and an inline-keyboard menu of the options claude's own
+ * `/model` picker offers (discovered live via `src/agents/model-picker.ts`
+ * — opened, parsed, Esc'd; never hardcoded, so new models appear the
+ * moment the installed CLI offers them). A button tap re-opens the
+ * picker fresh, matches the row by label, and applies session-only.
+ * When discovery fails (agent mid-turn, CLI UI changed, kill-switched
+ * via SWITCHROOM_MODEL_MENU=0) it falls back to the static v1 text.
  *
  * `/model <alias|full-id>` types claude's own `/model <name>` into the
  * agent's tmux pane via the existing allowlisted inject primitive
@@ -24,6 +25,12 @@
  */
 
 import type { InjectResult } from '../../src/agents/inject.js'
+import {
+  labelTag,
+  type DiscoverResult,
+  type SelectResult,
+  type ModelPickerOption,
+} from '../../src/agents/model-picker.js'
 
 /**
  * Aliases the claude CLI resolves natively. Listed in help text only —
@@ -179,4 +186,183 @@ export async function handleModelCommand(
     text: `❌ ${verbHtml} — ${deps.escapeHtml(result.errorMessage ?? 'inject failed')}`,
     html: true,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Picker-driven model menu (v2) — discovery, render, callback selection.
+// ---------------------------------------------------------------------------
+
+export interface ModelMenuDeps {
+  /** Live picker discovery — src/agents/model-picker.ts discoverModels. */
+  discover: (agent: string) => Promise<DiscoverResult>
+  /** Live picker selection by label — selectModel (session-only `s`). */
+  select: (agent: string, label: string) => Promise<SelectResult>
+  /**
+   * True while the agent is mid-turn. Driving the picker types into
+   * claude's input box; doing that mid-turn would queue "/model" as
+   * user text instead of opening the modal — refuse instead.
+   */
+  isBusy: () => boolean
+  getAgentName: () => string
+  /** One-line quota summary (e.g. "29% / 5h · 33% / 7d") or null. */
+  getQuotaBrief: () => Promise<string | null>
+  escapeHtml: (s: string) => string
+}
+
+/** Raw Telegram inline-keyboard shape (grammY accepts it verbatim). */
+export interface ModelMenuKeyboardButton {
+  text: string
+  callback_data: string
+}
+
+export interface ModelMenuReply {
+  text: string
+  html: true
+  /** Rows of buttons; absent on the no-menu fallback. */
+  keyboard?: ModelMenuKeyboardButton[][]
+}
+
+export const MODEL_CALLBACK_PREFIX = 'mdl:'
+const MODEL_CALLBACK_SELECT = 'mdl:s:'
+export const MODEL_CALLBACK_REFRESH = 'mdl:r'
+
+export function modelSelectCallbackData(label: string): string {
+  // Identity is the label's hash, not its index — a tap re-discovers
+  // the picker and matches by tag, so a list that shifted between
+  // render and tap can never select the wrong row. 8 hex chars keeps
+  // callback_data tiny (well under Telegram's 64-byte cap).
+  return `${MODEL_CALLBACK_SELECT}${labelTag(label)}`
+}
+
+function busyReply(deps: Pick<ModelMenuDeps, 'escapeHtml'>): ModelMenuReply {
+  return {
+    text: '⏳ The agent is mid-turn — the model picker needs an idle prompt. Try again in a moment.',
+    html: true,
+  }
+}
+
+function menuKeyboard(options: ModelPickerOption[]): ModelMenuKeyboardButton[][] {
+  // One option per row (labels + ✔ render cleanly at full width on
+  // mobile), refresh on a trailing row.
+  const rows: ModelMenuKeyboardButton[][] = options.map((o) => [
+    {
+      text: o.current ? `✅ ${o.label}` : o.label,
+      callback_data: modelSelectCallbackData(o.label),
+    },
+  ])
+  rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
+  return rows
+}
+
+/**
+ * Build the `/model` dashboard: live model + quota brief + tap menu.
+ * Returns a keyboard-less fallback (v1-shaped static text) when the
+ * picker can't be driven right now — the command never hard-fails.
+ */
+export async function buildModelMenu(
+  deps: ModelMenuDeps & ModelCommandDeps,
+): Promise<ModelMenuReply> {
+  if (deps.isBusy()) return busyReply(deps)
+
+  const [discovered, quota] = await Promise.all([
+    deps.discover(deps.getAgentName()),
+    deps.getQuotaBrief().catch(() => null),
+  ])
+
+  if (!discovered.ok) {
+    // Graceful static fallback — same content as the v1 show path,
+    // with the discovery failure surfaced.
+    const v1 = await handleModelCommand({ kind: 'show' }, deps)
+    return {
+      text: [`<i>(picker unavailable: ${deps.escapeHtml(discovered.reason)})</i>`, v1.text].join('\n'),
+      html: true,
+    }
+  }
+
+  const current = discovered.options.find((o) => o.current)
+  const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
+  if (discovered.dismissFailed) {
+    lines.push('⚠️ <i>The picker may still be open on the agent pane — check it before switching.</i>')
+  }
+  if (current) {
+    const detail = current.detail ? ` · ${deps.escapeHtml(current.detail)}` : ''
+    lines.push(`Now: <b>${deps.escapeHtml(current.label)}</b>${detail}`)
+  } else {
+    lines.push('Now: <i>unknown (no ✔ row in picker)</i>')
+  }
+  if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
+  lines.push('', 'Tap to switch (applies to the live session):')
+  lines.push(PERSIST_NOTE)
+
+  return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(discovered.options) }
+}
+
+export interface ModelCallbackOutcome {
+  /** Short toast for answerCallbackQuery. */
+  answer: string
+  /** Replacement dashboard (message edit). */
+  reply: ModelMenuReply
+}
+
+/**
+ * Handle a `mdl:*` callback tap. `mdl:r` re-renders the dashboard;
+ * `mdl:s:<tag>` re-discovers the picker, resolves the tag back to a
+ * live label, and applies it session-only. A tag that no longer
+ * matches (claude updated its options since render) re-renders the
+ * menu instead of guessing.
+ */
+export async function handleModelMenuCallback(
+  data: string,
+  deps: ModelMenuDeps & ModelCommandDeps,
+): Promise<ModelCallbackOutcome> {
+  if (data === MODEL_CALLBACK_REFRESH) {
+    return { answer: 'Refreshed', reply: await buildModelMenu(deps) }
+  }
+  if (!data.startsWith(MODEL_CALLBACK_SELECT)) {
+    return { answer: 'Unknown action', reply: await buildModelMenu(deps) }
+  }
+  if (deps.isBusy()) {
+    return { answer: 'Agent is mid-turn — try again shortly', reply: busyReply(deps) }
+  }
+
+  const tag = data.slice(MODEL_CALLBACK_SELECT.length)
+  const discovered = await deps.discover(deps.getAgentName())
+  if (!discovered.ok) {
+    return {
+      answer: 'Picker unavailable',
+      reply: {
+        text: `❌ Could not open the model picker: ${deps.escapeHtml(discovered.reason)}`,
+        html: true,
+      },
+    }
+  }
+  const target = discovered.options.find((o) => labelTag(o.label) === tag)
+  if (!target) {
+    // Options changed since the menu rendered — never guess; re-render.
+    const fresh = await buildModelMenu(deps)
+    return { answer: 'Model list changed — menu refreshed', reply: fresh }
+  }
+  if (target.current) {
+    const fresh = await buildModelMenu(deps)
+    return { answer: `Already on ${target.label}`, reply: fresh }
+  }
+
+  const result = await deps.select(deps.getAgentName(), target.label)
+  if (!result.ok) {
+    return {
+      answer: 'Switch failed',
+      reply: {
+        text: `❌ Switch to <b>${deps.escapeHtml(target.label)}</b> failed: ${deps.escapeHtml(result.reason)}`,
+        html: true,
+      },
+    }
+  }
+
+  const fresh = await buildModelMenu(deps)
+  const confirmed: ModelMenuReply = {
+    text: [`✅ ${deps.escapeHtml(result.confirmation)}`, '', fresh.text].join('\n'),
+    html: true,
+    ...(fresh.keyboard ? { keyboard: fresh.keyboard } : {}),
+  }
+  return { answer: result.confirmation, reply: confirmed }
 }
