@@ -786,6 +786,11 @@ describe("runUpdate", () => {
         // switchroom.yaml and the call count would depend on whether
         // the developer running tests has hostd enabled.
         hostControlEnabled: false,
+        // Likewise pin web_service.managed off so the refresh-web step is
+        // skipped — otherwise the host's real switchroom.yaml leaks in and a
+        // dev/operator box with managed: true adds a 7th call (the EACCES
+        // overlay-loader noise + "length 6 got 7" on the live host).
+        webServiceManaged: false,
       });
       expect(code).toBe(0);
       // 6 calls total:
@@ -837,6 +842,9 @@ describe("runUpdate", () => {
         agentNamesFn: () => ["a"],
         syncBundledSkillsFn: () => { /* intentional no-op */ },
         hostControlEnabled: true,
+        // Pin web_service.managed off so the refresh-web step doesn't leak in
+        // from the host's real switchroom.yaml (would make this 7 calls).
+        webServiceManaged: false,
       });
       expect(code).toBe(0);
       // 6 calls total:

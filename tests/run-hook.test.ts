@@ -136,6 +136,12 @@ describe("run-hook.sh", () => {
     expect(i.occurrences).toBe(1);
   });
 
+  // This and the auto-resolve test below each fork the real `bun dist/cli`
+  // several times (record/resolve/list). A bun cold-start of the ~2.7MB
+  // bundle is ~1s, so 4-5 forks comfortably exceed vitest's 5s default
+  // testTimeout when the box is loaded (full-suite parallel run) — that was
+  // the run-hook flake, a TIMEOUT not a logic failure. Give the spawn-heavy
+  // cases room. (The single-fork tests below stay on the default.)
   it("coalesces repeated failures (occurrences bumps)", () => {
     const script = makeScript("flaky.sh", "echo bad >&2; exit 1");
     runHook("hook:flaky", script);
@@ -144,7 +150,7 @@ describe("run-hook.sh", () => {
     const issues = listIssues() as Array<{ occurrences: number }>;
     expect(issues).toHaveLength(1);
     expect(issues[0].occurrences).toBe(3);
-  });
+  }, 30_000);
 
   it("auto-resolves the matching fingerprint on a subsequent success", () => {
     const failing = makeScript("h.sh", "echo bad >&2; exit 1");
@@ -166,7 +172,7 @@ describe("run-hook.sh", () => {
     expect(issues[0].resolved_at).toBeDefined();
     // Avoid unused-var lint
     void passing;
-  });
+  }, 30_000);
 
   it("forwards stdout from the wrapped command", () => {
     const script = makeScript("out.sh", "echo hello-from-hook");
