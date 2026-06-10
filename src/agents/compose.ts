@@ -440,6 +440,20 @@ interface AgentServiceData {
    */
   admin: boolean;
   /**
+   * Yaml-level `root: true` flag — the ROOT-tier debugging agent. When
+   * set, `emitAgentService` emits a root-privileged container variant:
+   * `user: "0:0"`, no `cap_drop`/`read_only`/`no-new-privileges`
+   * hardening, with `/var/run/docker.sock`, the whole `~/.switchroom`
+   * tree, and the host root filesystem (`/host`) bind-mounted rw — the
+   * same host reach `switchroom-hostd` has, but driven by the
+   * interactive `claude` session directly so the operator can debug the
+   * fleet from Telegram instead of an SSH root shell. `root === true`
+   * ALSO forces `admin === true` (see describeAgents) so every existing
+   * admin gate applies. Per-agent only; never cascade-resolved. Default
+   * false. See docs/root-agent.md.
+   */
+  root: boolean;
+  /**
    * Operator-declared extra bind-mounts (#1164). ADMIN-ONLY: validated
    * + emitted by `emitAgentService` if and only if `admin === true`.
    * Read directly from the per-agent config — deliberately not
@@ -519,7 +533,12 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
       // Unset → "host" (zero behaviour change vs. pre-#1413).
       networkIsolation:
         resolved.network_isolation === "strict" ? "strict" : "host",
-      admin: agent.admin === true,
+      // `root: true` is a strictly-higher tier than admin and forces
+      // admin semantics on (env, audit-log mounts, hostd MCP wiring,
+      // every gateway/broker admin gate) so the root agent needs only
+      // the one flag. Per-agent only, mirroring admin (no cascade).
+      admin: agent.admin === true || agent.root === true,
+      root: agent.root === true,
       // Per-agent only (no cascade) — see AgentServiceData.bindMounts
       // doc comment for the rationale.
       bindMounts: agent.bind_mounts ? [...agent.bind_mounts] : [],
@@ -1395,7 +1414,18 @@ function emitAgentService(
   lines.push(`    tty: true`);
   lines.push(`    stdin_open: true`);
   lines.push(`    stop_grace_period: 45s`);
-  lines.push(`    user: "${a.uid}:${a.uid}"`);
+  // ROOT-tier agent: runs as uid 0 so the interactive claude session can
+  // write the host root fs (mounted at /host below) and drive docker.sock
+  // directly — the "standing root shell over Telegram" the operator chose
+  // over a per-action tap. Normal agents stay pinned to their deterministic
+  // non-root UID. The brokers chown each per-agent socket to a.uid, but a
+  // uid-0 process bypasses file perms and the ACL gates on the bind PATH
+  // (path-as-identity in docker mode), so credential fetch still works.
+  if (a.root) {
+    lines.push(`    user: "0:0"`);
+  } else {
+    lines.push(`    user: "${a.uid}:${a.uid}"`);
+  }
   lines.push(`    mem_limit: ${a.resources.memLimit}`);
   if (a.resources.memReservation !== undefined) {
     lines.push(`    mem_reservation: ${a.resources.memReservation}`);
@@ -1404,14 +1434,22 @@ function emitAgentService(
     lines.push(`    pids_limit: ${a.resources.pidsLimit}`);
   }
   lines.push(`    cpus: ${a.resources.cpus.toFixed(1)}`);
-  lines.push(`    security_opt:`);
-  lines.push(`      - "no-new-privileges:true"`);
-  lines.push(`    cap_drop:`);
-  lines.push(`      - "ALL"`);
-  // read_only root FS — claude CLI, tini, tmux, node only need writable
-  // /tmp (and the explicit /state/* mounts above). tmpfs keeps /tmp
-  // RAM-backed and capped so a runaway can't fill the host disk.
-  lines.push(`    read_only: true`);
+  // ROOT-tier agent deliberately skips the per-agent hardening
+  // (no-new-privileges / cap_drop ALL / read_only). docker.sock already
+  // makes it root-on-host, so the hardening would only break the host
+  // debugging it exists to do (writing /host, full caps for docker exec)
+  // without adding any isolation. Everything else (mem/pids/cpu limits,
+  // tmpfs) is unchanged.
+  if (!a.root) {
+    lines.push(`    security_opt:`);
+    lines.push(`      - "no-new-privileges:true"`);
+    lines.push(`    cap_drop:`);
+    lines.push(`      - "ALL"`);
+    // read_only root FS — claude CLI, tini, tmux, node only need writable
+    // /tmp (and the explicit /state/* mounts above). tmpfs keeps /tmp
+    // RAM-backed and capped so a runaway can't fill the host disk.
+    lines.push(`    read_only: true`);
+  }
   lines.push(`    tmpfs:`);
   lines.push(`      - /tmp:size=1g,mode=1777`);
   lines.push(`    depends_on:`);
@@ -1601,6 +1639,13 @@ function emitAgentService(
   // schema's `admin: true` flag must surface here — otherwise the
   // yaml field is silently a no-op. The gateway reads it at
   // `telegram-plugin/gateway/gateway.ts:514`.
+  // SWITCHROOM_AGENT_ROOT: in-container marker that this is the ROOT-tier
+  // debugging agent. The scaffold reads it to render the root persona /
+  // capability block in CLAUDE.md; emitted before the admin block since
+  // root implies admin (a.admin is already true here when a.root).
+  if (a.root === true) {
+    env.SWITCHROOM_AGENT_ROOT = "true";
+  }
   if (a.admin === true) {
     env.SWITCHROOM_AGENT_ADMIN = "true";
     // Note: grant-mgmt RPCs (list_grants, mint_grant, revoke_grant)
@@ -1649,6 +1694,27 @@ function emitAgentService(
   // use; path-as-identity invariant is enforced by socketPathToName
   // parsing the broker-side path on every connection.
   lines.push(`      - auth-broker-${a.name}-sock:/run/switchroom/auth-broker`);
+  // ROOT-tier debugging agent mount set (the operator chose standing
+  // root over a per-action tap). These three mounts are the same host
+  // reach `switchroom-hostd` has, plus the host root fs so the agent can
+  // read/edit any host file without the `docker run -v /:/x` dance —
+  // a Telegram-driven replacement for an SSH root shell. NOT routed
+  // through the bind_mounts denylist (that gates operator-declared
+  // `bind_mounts:` entries; these are framework-injected for the root
+  // tier specifically). Only ever emitted for `root: true`.
+  if (a.root === true) {
+    // docker.sock — manage / exec into / read logs of every other
+    // container in the fleet. This alone is root-equivalent on the host.
+    lines.push(`      - /var/run/docker.sock:/var/run/docker.sock:rw`);
+    // The whole ~/.switchroom tree (all agents' scaffolds, logs, configs,
+    // the vault, audit logs) at /host-home/.switchroom — mirrors hostd's
+    // mount so the root agent can inspect any agent's on-host state.
+    lines.push(`      - ${homePrefix}/.switchroom:/host-home/.switchroom:rw`);
+    // The host root filesystem at /host — full read/write reach to the
+    // host OS (system logs, /etc, Coolify/nginx state, …) so debugging
+    // doesn't bottom out at the container boundary.
+    lines.push(`      - /:/host:rw`);
+  }
   if (a.admin === true) {
     // Admin agents need read access to the host operator's vault
     // audit log so the bot's `/vault audit <agent>` Recent-denials

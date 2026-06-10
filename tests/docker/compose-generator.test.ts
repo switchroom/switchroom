@@ -35,6 +35,7 @@ interface MakeConfigAgent {
   extends?: string;
   settings_raw?: Record<string, unknown>;
   admin?: boolean;
+  root?: boolean;
   env?: Record<string, string>;
   bind_mounts?: Array<{ source: string; target?: string; mode?: "ro" | "rw" }>;
   resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
@@ -63,6 +64,7 @@ function makeConfig(
           extends: cfg.extends,
           settings_raw: cfg.settings_raw,
           admin: cfg.admin,
+          root: cfg.root,
           env: cfg.env,
           bind_mounts: cfg.bind_mounts,
           resources: cfg.resources,
@@ -2628,5 +2630,71 @@ describe("network_isolation — sec WS6-F1 / feature #1413", () => {
     // Top-level networks lists ONLY the strict agent's net.
     expect(out).toContain("switchroom-net-isolated:");
     expect(out).not.toContain("switchroom-net-hostagent:");
+  });
+});
+
+describe("root-tier debugging agent (root: true)", () => {
+  // Extract just the named agent's service block from the compose YAML.
+  function blockFor(out: string, name: string): string {
+    return (
+      new RegExp(`agent-${name}:[\\s\\S]*?(?=\\n {2}agent-|\\nvolumes:)`).exec(out)?.[0] ?? ""
+    );
+  }
+
+  it("runs as uid 0 and skips the per-agent hardening", () => {
+    const out = generateCompose({ config: makeConfig({ overlord: { root: true } }) });
+    const block = blockFor(out, "overlord");
+    expect(block).toContain(`user: "0:0"`);
+    expect(block).not.toContain(`user: "1`); // no allocated 10001-10999 UID
+    // The root tier deliberately drops the hardening — docker.sock already
+    // makes it root-on-host, so the hardening would only block its job.
+    expect(block).not.toContain("no-new-privileges");
+    expect(block).not.toContain("read_only: true");
+    expect(block).not.toMatch(/cap_drop:\s*\n\s*-\s*"ALL"/);
+    // tmpfs /tmp is still present (RAM-backed, capped).
+    expect(block).toContain("/tmp:size=1g");
+  });
+
+  it("mounts docker.sock, the whole ~/.switchroom tree, and the host root fs", () => {
+    const out = generateCompose({ config: makeConfig({ overlord: { root: true } }) });
+    const block = blockFor(out, "overlord");
+    expect(block).toContain("/var/run/docker.sock:/var/run/docker.sock:rw");
+    expect(block).toContain("/.switchroom:/host-home/.switchroom:rw");
+    expect(block).toContain("- /:/host:rw");
+  });
+
+  it("implies admin: emits SWITCHROOM_AGENT_ADMIN and SWITCHROOM_AGENT_ROOT", () => {
+    const out = generateCompose({ config: makeConfig({ overlord: { root: true } }) });
+    const block = blockFor(out, "overlord");
+    expect(block).toContain("SWITCHROOM_AGENT_ROOT: \"true\"");
+    expect(block).toContain("SWITCHROOM_AGENT_ADMIN: \"true\"");
+    // describeAgents reports admin true for a root agent (gate fan-out).
+    const meta = describeAgents(makeConfig({ overlord: { root: true } }));
+    expect(meta[0]?.root).toBe(true);
+    expect(meta[0]?.admin).toBe(true);
+  });
+
+  it("does NOT leak root privileges to a normal agent", () => {
+    const out = generateCompose({
+      config: makeConfig({ overlord: { root: true }, coach: {} }),
+    });
+    const coach = blockFor(out, "coach");
+    expect(coach).not.toContain("/var/run/docker.sock");
+    expect(coach).not.toContain("- /:/host:rw");
+    expect(coach).not.toContain("SWITCHROOM_AGENT_ROOT");
+    expect(coach).not.toContain(`user: "0:0"`);
+    // Normal agent keeps its hardening.
+    expect(coach).toContain("no-new-privileges:true");
+    expect(coach).toContain("read_only: true");
+  });
+
+  it("a plain admin agent is NOT granted the root mount set", () => {
+    const out = generateCompose({ config: makeConfig({ chief: { admin: true } }) });
+    const block = blockFor(out, "chief");
+    expect(block).toContain("SWITCHROOM_AGENT_ADMIN: \"true\"");
+    expect(block).not.toContain("SWITCHROOM_AGENT_ROOT");
+    expect(block).not.toContain("/var/run/docker.sock");
+    expect(block).not.toContain("- /:/host:rw");
+    expect(block).toContain("read_only: true");
   });
 });
