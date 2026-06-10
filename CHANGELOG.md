@@ -1,6 +1,62 @@
 # Changelog
 
-## unreleased — root-tier debugging agent (`root: true`)
+## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
+
+Built mid-incident on 2026-06-10: every active agent had silent memory
+damage from the June quota outages — 155 conversations across 9 banks
+were retained but never fact-extracted (invisible to recall), and mental-
+model refreshes that ran during the quota wall persisted the literal LLM
+error string ("You're out of extra usage · resets 3am (UTC)") as model
+content, injected into every turn. Nothing surfaced either failure.
+
+### PR A — hindsight bank-health in doctor + dashboard Memory tab (#2257)
+
+- New `src/memory/bank-health.ts`: REST inspection client over
+  `/v1/default/banks/*` (stats, documents with per-doc extracted-fact
+  counts, mental models with refresh timestamps). Injectable fetch,
+  never throws.
+- `switchroom doctor`: per-bank checks — FAIL on recent (≤30d, >1KB)
+  zero-fact documents with the exact `/reprocess` curl in the fix
+  string; WARN on stale (>7d) mental models or a stuck pending queue;
+  OK line summarises docs/facts/newest-activity/models. Banks probed
+  concurrently; agents sharing a collection dedupe into one row.
+- Dashboard: new **Memory** tab (`GET /api/memory-health`) with the
+  same per-bank truth: status dot, conversations/facts, latest
+  activity, extraction-gap banner, per-model refresh age.
+
+### PR B — detect LLM-failure-corrupted mental models (#2258)
+
+- `corruptedMentalModels()`: fingerprints tiny content matching
+  quota/limit failure phrasing (or empty content on a refreshed
+  model). Doctor FAILs the bank naming the corrupted models; the
+  dashboard shows a red banner. Live-validated against the real
+  corruption (lawgpt ×2, carrie, kdogg) with healthy banks unaffected.
+
+### PR C — Google Drive resumable upload for files > 5MB (#2238)
+
+- The Google delivery provider was multipart-only (reliable to ~5MB),
+  so a large `deliver-file` on a Google-only agent failed. `uploadFile`
+  now dispatches on size: ≤5MB multipart, above that a resumable
+  session (POST `uploadType=resumable` → PUT 8MiB chunks with
+  `Content-Range`) — parity with the OneDrive provider.
+
+### PR D — Telegram `/model` command (#2259)
+
+- `/model` shows the agent's cascade-resolved model + switch options;
+  `/model <opus|sonnet|haiku|full-id>` switches the live session by
+  injecting claude's own `/model <name>` REPL command via the existing
+  allowlisted tmux inject primitive. Claude-native, session-scoped
+  (until restart); persisting stays `model:` in switchroom.yaml.
+- The bare form never injects — claude's no-arg `/model` opens an
+  interactive picker modal Telegram can't drive (pane-wedge class).
+  The argument is shape-gated at the parser AND handler seam.
+- Fixes a latent gap the review found: `agent list --json` never
+  emitted a `model` field, so the gateway's `/status` model line
+  silently rendered "default" on every host. The CLI now emits the
+  cascade-resolved effective model (pinned by
+  `tests/cli.agent-list-model.test.ts`).
+
+### PR E — root-tier debugging agent (`root: true`) (#2261)
 
 A new agent privilege tier above `admin`: set `root: true` on one agent
 and it runs the unmodified interactive `claude` CLI inside a
