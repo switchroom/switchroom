@@ -14,7 +14,8 @@
  * Drive v3 endpoints used:
  *   - GET  /drive/v3/files?q=...              — find a folder by name+parent
  *   - POST /drive/v3/files                    — create a folder
- *   - POST /upload/drive/v3/files?uploadType=multipart — upload a file
+ *   - POST /upload/drive/v3/files?uploadType=multipart — upload a small file
+ *   - POST /upload/drive/v3/files?uploadType=resumable + PUT chunks — large file
  *   - POST /drive/v3/files/<id>/permissions   — make it shareable
  *   - GET  /drive/v3/files/<id>?fields=webViewLink — the link
  */
@@ -96,13 +97,30 @@ export async function ensureSwitchroomFolder(
   return ensureFolder(deps, agentName, top.id);
 }
 
+/** Drive's single-request multipart upload is reliable up to ~5 MB; above
+ *  that we switch to a resumable session. */
+export const GDRIVE_MULTIPART_MAX_BYTES = 5 * 1024 * 1024;
+
 /**
- * Upload `bytes` as `filename` into folder `parentId` via a multipart upload
- * (metadata + content in one request). Drive's simple/multipart upload handles
- * files up to 5 MB inline well; larger files would want a resumable session
- * (follow-up — the common delivery case is small).
+ * Upload `bytes` as `filename` into folder `parentId`. Small files go in one
+ * multipart request; files over the 5 MB cap use a resumable session (so the
+ * "keep/edit, or > 50 MB" case the delivery guidance promises actually works).
  */
 export async function uploadFile(
+  deps: GDriveDeps,
+  parentId: string,
+  filename: string,
+  bytes: Uint8Array,
+  mimeType = "application/octet-stream",
+): Promise<GFile> {
+  if (bytes.byteLength <= GDRIVE_MULTIPART_MAX_BYTES) {
+    return uploadMultipart(deps, parentId, filename, bytes, mimeType);
+  }
+  return uploadResumable(deps, parentId, filename, bytes, mimeType);
+}
+
+/** Single-request multipart upload (metadata + content). Small files only. */
+export async function uploadMultipart(
   deps: GDriveDeps,
   parentId: string,
   filename: string,
@@ -135,6 +153,66 @@ export async function uploadFile(
     throw new Error(`Drive upload failed: HTTP ${resp.status} — ${await readBody(resp)}`);
   }
   return (await resp.json()) as GFile;
+}
+
+/**
+ * Resumable upload for files over the multipart cap. Two phases:
+ *   1. POST metadata to `uploadType=resumable` → session URL in the `Location`
+ *      response header.
+ *   2. PUT the bytes in chunks to that URL with `Content-Range`; Drive replies
+ *      308 (incomplete → keep going) until the final chunk returns 200/201 with
+ *      the file resource.
+ */
+export async function uploadResumable(
+  deps: GDriveDeps,
+  parentId: string,
+  filename: string,
+  bytes: Uint8Array,
+  mimeType = "application/octet-stream",
+): Promise<GFile> {
+  const f = deps.fetchImpl ?? fetch;
+
+  // Phase 1: initiate the session.
+  const init = await f(`${UPLOAD}/files?uploadType=resumable&fields=id,name,webViewLink`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${deps.accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Type": mimeType,
+    },
+    body: JSON.stringify({ name: filename, parents: [parentId] }),
+  });
+  if (!init.ok) {
+    throw new Error(`Drive resumable init failed: HTTP ${init.status} — ${await readBody(init)}`);
+  }
+  const sessionUrl = init.headers.get("location") ?? init.headers.get("Location");
+  if (!sessionUrl) {
+    throw new Error("Drive resumable init returned no session URL (Location header)");
+  }
+
+  // Phase 2: PUT chunks. 256 KiB multiple per Drive's rules.
+  const CHUNK = 8 * 1024 * 1024; // 8 MiB
+  const total = bytes.byteLength;
+  let lastFile: GFile | null = null;
+  for (let start = 0; start < total; start += CHUNK) {
+    const end = Math.min(start + CHUNK, total);
+    const chunk = bytes.subarray(start, end);
+    const put = await f(sessionUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": String(chunk.byteLength),
+        "Content-Range": `bytes ${start}-${end - 1}/${total}`,
+      },
+      body: chunk as unknown as BodyInit,
+    });
+    if (put.status === 200 || put.status === 201) {
+      lastFile = (await put.json()) as GFile;
+    } else if (put.status !== 308) {
+      throw new Error(`Drive resumable chunk failed: HTTP ${put.status} — ${await readBody(put)}`);
+    }
+  }
+  if (!lastFile) throw new Error("Drive resumable upload completed without a final file resource");
+  return lastFile;
 }
 
 /** Drive sharing scope, attempted in order. */

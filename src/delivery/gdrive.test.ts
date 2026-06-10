@@ -5,6 +5,7 @@ import {
   uploadFile,
   createShareLink,
   deliverToGoogleDrive,
+  GDRIVE_MULTIPART_MAX_BYTES,
 } from "./gdrive.js";
 
 function route(
@@ -88,6 +89,47 @@ describe("uploadFile", () => {
     const file = await uploadFile({ accessToken: TOKEN, fetchImpl: f }, "FOLDER", "r.pdf", new Uint8Array([1, 2, 3]));
     expect(file.id).toBe("FILE");
     expect(ct).toContain("multipart/related; boundary=");
+  });
+
+  it("switches to a resumable session for a file over the multipart cap", async () => {
+    // 20 MiB → init session + chunked PUTs (8 MiB each → 3 chunks).
+    const big = new Uint8Array(20 * 1024 * 1024);
+    const ranges: string[] = [];
+    let initted = false;
+    let puts = 0;
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST" && url.includes("uploadType=resumable")) {
+        initted = true;
+        return { ok: true, status: 200, headers: new Headers({ location: "https://upload.googleapis.com/session/xyz" }), json: async () => ({}), text: async () => "" } as Response;
+      }
+      if (method === "PUT" && url.includes("upload.googleapis.com/session")) {
+        puts++;
+        ranges.push((init?.headers as Record<string, string>)["Content-Range"]);
+        const last = puts === 3;
+        return { ok: last, status: last ? 200 : 308, headers: new Headers(), json: async () => (last ? { id: "BIG", name: "big.bin" } : {}), text: async () => "" } as Response;
+      }
+      throw new Error(`unexpected ${method} ${url}`);
+    }) as typeof fetch;
+    const file = await uploadFile({ accessToken: TOKEN, fetchImpl: f }, "FOLDER", "big.bin", big);
+    expect(initted).toBe(true);
+    expect(file.id).toBe("BIG");
+    expect(puts).toBe(3);
+    const total = 20 * 1024 * 1024;
+    const chunk = 8 * 1024 * 1024;
+    expect(ranges[0]).toBe(`bytes 0-${chunk - 1}/${total}`);
+    expect(ranges[2]).toBe(`bytes ${2 * chunk}-${total - 1}/${total}`);
+  });
+
+  it("errors clearly if the resumable init returns no session URL", async () => {
+    const big = new Uint8Array(GDRIVE_MULTIPART_MAX_BYTES + 1);
+    const f = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST") return { ok: true, status: 200, headers: new Headers(), json: async () => ({}), text: async () => "" } as Response;
+      throw new Error("should not PUT without a session");
+    }) as typeof fetch;
+    await expect(uploadFile({ accessToken: TOKEN, fetchImpl: f }, "FOLDER", "big.bin", big)).rejects.toThrow(/no session URL/);
   });
 });
 
