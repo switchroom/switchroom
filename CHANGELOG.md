@@ -1,16 +1,46 @@
 # Changelog
 
-## unreleased — root agent auto-provisions the docker CLI
+## v0.15.3 — failover trusts live quota; /model dashboard; root agent docker CLI (#2265, #2263, #2262, #2264)
 
-Follow-up to the root debugging agent (#2261). A root agent has
-`/var/run/docker.sock` mounted but the shared agent image omits the
-~38 MB docker client (inert for every non-root agent). On a root agent's
-first boot, `start.sh` now fetches a version-pinned static `docker`
-client into the persistent `$HOME/.local/bin` — gated on
-`SWITCHROOM_AGENT_ROOT`, idempotent (skips when present), and non-fatal
-(a fetch failure leaves the agent fully functional minus docker, retried
-next restart). `docker ps/logs/exec/inspect` then work out of the box,
-no manual install. See `docs/root-agent.md`.
+### Failover: live quota is authoritative over stale exhaustion marks (#2265)
+
+The 2026-06-10 fleet failover outage was a stale-data-over-live-truth
+inversion. The auth-broker judged an account eligible-or-not purely by
+the persisted `exhausted_until` mark, never consulting the live quota
+probe already cached beside it. One misfired `+7d` weekly mark on the
+healthy primary account stranded the whole fleet — every failover
+returned `no-eligible-target` — and it survived `auth use`/`refresh` and
+a broker recreate because nothing cleared a mark on a healthy probe. A
+separate path routed a consumer onto an account whose mark had expired
+(looked eligible) while its live 5h was 100% walled.
+
+Fix (most-recent-signal-wins): a new pure `account-eligibility` module
+makes a fresh (≤24h) quota snapshot that is newer than the mark
+authoritative — walled→blocked, healthy→not — and only falls back to the
+mark when there is no usable live data. A clearly-healthy probe now
+self-heals (clears) a stale mark off disk, so a misfire can't outlast one
+probe cycle. Marks carry `marked_at` for recency comparison. Wired into
+the broker's three decision points (serving, failover, and the
+`list-state` `exhausted` field, which also stops the all-exhausted alert
+and cron preflight from false-alarming on a stale-mark-but-healthy
+account). 289 broker + 67 server tests, both incident shapes reproduced
+as integration tests.
+
+### /model dashboard + root agent docker CLI (#2263, #2262, #2264)
+
+- `/model` is now a live picker-driven menu with a quota brief (#2263),
+  plus a UAT DM scenario covering show / switch / bad-name (#2262).
+- A root debugging agent (`SWITCHROOM_AGENT_ROOT`) auto-provisions a
+  version-pinned static `docker` client into `$HOME/.local/bin` on first
+  boot — idempotent and non-fatal, so `docker ps/logs/exec/inspect` work
+  out of the box (#2264). See `docs/root-agent.md`.
+
+## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
+
+Built mid-incident on 2026-06-10: every active agent had silent memory
+damage from the June quota outages — 155 conversations across 9 banks
+were retained but never fact-extracted (invisible to recall), and mental-
+model refreshes that ran during the quota wall persisted the literal LLM
 
 ## v0.15.2 — memory-bank health, /model command, root debugging agent (#2257, #2258, #2238, #2259, #2261)
 
