@@ -203,3 +203,147 @@ describe("inject allowlist contract", () => {
     expect(INJECT_COMMANDS.has("/model")).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Picker-driven menu (v2) — buildModelMenu + handleModelMenuCallback
+// ---------------------------------------------------------------------------
+
+import {
+  buildModelMenu,
+  handleModelMenuCallback,
+  modelSelectCallbackData,
+  MODEL_CALLBACK_REFRESH,
+  type ModelMenuDeps,
+} from "../gateway/model-command.js";
+import { labelTag } from "../../src/agents/model-picker.js";
+
+const OPTIONS = [
+  { index: 1, label: "Default (recommended)", detail: "Opus 4.8 with 1M context", current: false },
+  { index: 2, label: "Sonnet", detail: "Sonnet 4.6 · Efficient", current: true },
+  { index: 3, label: "Haiku", detail: "Haiku 4.5 · Fastest", current: false },
+];
+
+function makeMenuDeps(overrides: Partial<ModelMenuDeps> = {}) {
+  const calls = { discover: 0, select: [] as string[] };
+  const base = makeDeps(); // v1 deps (inject/getConfiguredModel/escapeHtml/preBlock)
+  const deps = {
+    ...base.deps,
+    discover: async () => {
+      calls.discover++;
+      return { ok: true as const, options: OPTIONS, currentLabel: "Sonnet" };
+    },
+    select: async (_a: string, label: string) => {
+      calls.select.push(label);
+      return { ok: true as const, confirmation: `Set model to ${label} for this session` };
+    },
+    isBusy: () => false,
+    getQuotaBrief: async () => "29% / 5h · 33% / 7d",
+    ...overrides,
+  };
+  return { deps, calls, injectCalls: base.calls };
+}
+
+describe("buildModelMenu", () => {
+  it("renders current model, quota brief, and one button per discovered option", async () => {
+    const { deps, calls } = makeMenuDeps();
+    const menu = await buildModelMenu(deps);
+    expect(calls.discover).toBe(1);
+    expect(menu.text).toContain("<b>Sonnet</b>");
+    expect(menu.text).toContain("29% / 5h · 33% / 7d");
+    expect(menu.keyboard).toBeDefined();
+    // 3 option rows + refresh row
+    expect(menu.keyboard!.length).toBe(4);
+    expect(menu.keyboard![1][0].text).toBe("✅ Sonnet");
+    expect(menu.keyboard![0][0].text).toBe("Default (recommended)");
+    expect(menu.keyboard![3][0].callback_data).toBe(MODEL_CALLBACK_REFRESH);
+  });
+
+  it("every callback_data fits Telegram's 64-byte cap", async () => {
+    const { deps } = makeMenuDeps();
+    const menu = await buildModelMenu(deps);
+    for (const row of menu.keyboard!) {
+      for (const btn of row) {
+        expect(Buffer.byteLength(btn.callback_data, "utf-8")).toBeLessThanOrEqual(64);
+      }
+    }
+  });
+
+  it("busy agent → no discovery, no keyboard, explanatory text", async () => {
+    const { deps, calls } = makeMenuDeps({ isBusy: () => true });
+    const menu = await buildModelMenu(deps);
+    expect(calls.discover).toBe(0);
+    expect(menu.keyboard).toBeUndefined();
+    expect(menu.text).toContain("mid-turn");
+  });
+
+  it("discovery failure → static v1 fallback with the reason, no keyboard", async () => {
+    const { deps } = makeMenuDeps({
+      discover: async () => ({ ok: false as const, reason: "tmux session not found" }),
+    });
+    const menu = await buildModelMenu(deps);
+    expect(menu.keyboard).toBeUndefined();
+    expect(menu.text).toContain("picker unavailable");
+    expect(menu.text).toContain("Configured:");
+  });
+
+  it("quota failure never blocks the menu", async () => {
+    const { deps } = makeMenuDeps({
+      getQuotaBrief: async () => {
+        throw new Error("broker down");
+      },
+    });
+    const menu = await buildModelMenu(deps);
+    expect(menu.keyboard).toBeDefined();
+    expect(menu.text).not.toContain("Quota:");
+  });
+});
+
+describe("handleModelMenuCallback", () => {
+  it("mdl:s:<tag> selects by re-discovered label", async () => {
+    const { deps, calls } = makeMenuDeps();
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
+    expect(calls.select).toEqual(["Haiku"]);
+    expect(out.answer).toContain("Set model to Haiku");
+    expect(out.reply.text).toContain("✅");
+  });
+
+  it("stale tag (options changed) → never selects, re-renders menu", async () => {
+    const { deps, calls } = makeMenuDeps();
+    const staleTag = `mdl:s:${labelTag("Removed Model")}`;
+    const out = await handleModelMenuCallback(staleTag, deps);
+    expect(calls.select).toEqual([]);
+    expect(out.answer).toContain("refreshed");
+    expect(out.reply.keyboard).toBeDefined();
+  });
+
+  it("tapping the current model is a no-op refresh", async () => {
+    const { deps, calls } = makeMenuDeps();
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Sonnet"), deps);
+    expect(calls.select).toEqual([]);
+    expect(out.answer).toContain("Already on Sonnet");
+  });
+
+  it("busy agent → never selects", async () => {
+    const { deps, calls } = makeMenuDeps({ isBusy: () => true });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
+    expect(calls.select).toEqual([]);
+    expect(out.answer).toContain("mid-turn");
+  });
+
+  it("selection failure surfaces the reason", async () => {
+    const { deps } = makeMenuDeps({
+      select: async () => ({ ok: false as const, reason: "cursor verification failed" }),
+    });
+    const out = await handleModelMenuCallback(modelSelectCallbackData("Haiku"), deps);
+    expect(out.answer).toBe("Switch failed");
+    expect(out.reply.text).toContain("cursor verification failed");
+  });
+
+  it("mdl:r re-renders the dashboard", async () => {
+    const { deps, calls } = makeMenuDeps();
+    const out = await handleModelMenuCallback(MODEL_CALLBACK_REFRESH, deps);
+    expect(out.answer).toBe("Refreshed");
+    expect(calls.discover).toBe(1);
+    expect(out.reply.keyboard).toBeDefined();
+  });
+});

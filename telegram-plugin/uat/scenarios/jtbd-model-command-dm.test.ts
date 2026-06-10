@@ -29,19 +29,21 @@ const REPLY_TIMEOUT_MS = 30_000;
 
 describe("uat: /model command — show, switch, bad-name", () => {
   it(
-    "bare /model shows configured model without injecting",
+    "bare /model shows the model dashboard (menu v2) or static fallback (v1)",
     async () => {
       const sc = await spinUp({ agent: AGENT });
       try {
         await sc.sendDM("/model");
-        const reply = await sc.expectMessage(/Configured:/i, {
+        // v2 (picker-driven menu): "Now: <model>"; v1 / fallback path:
+        // "Configured: <model>". Either proves the gateway handled the
+        // command rather than forwarding it to claude as plain text.
+        const shape = /Now:|Configured:/i;
+        const reply = await sc.expectMessage(shape, {
           from: "bot",
           timeout: REPLY_TIMEOUT_MS,
         });
-        expect(reply.text).toMatch(/Configured:/i);
-        // Switch affordances present
-        expect(reply.text).toMatch(/\/model (opus|sonnet|haiku)/);
-        // Persistence caveat present
+        expect(reply.text).toMatch(shape);
+        // Persistence caveat present on both shapes
         expect(reply.text).toMatch(/switchroom\.yaml/i);
       } finally {
         await sc.tearDown();
