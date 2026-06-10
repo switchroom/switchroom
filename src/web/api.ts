@@ -14,6 +14,7 @@ import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
 import {
   inspectBankHealth,
   staleMentalModels,
+  corruptedMentalModels,
   recentUnextracted,
   type BankMentalModelSummary,
 } from "../memory/bank-health.js";
@@ -1337,6 +1338,8 @@ export interface MemoryBankHealthRow {
   oldestUnextractedAt: string | null;
   mentalModels: BankMentalModelSummary[];
   staleMentalModelCount: number;
+  /** Models whose content is a persisted LLM-failure message (quota wall during refresh). */
+  corruptedMentalModelNames: string[];
   /** ok | warn | fail — same thresholds as `switchroom doctor`. */
   status: "ok" | "warn" | "fail";
   statusDetail: string;
@@ -1377,11 +1380,15 @@ export async function handleGetMemoryHealth(
       const h = await inspectBankHealth(url, bank, { fetchImpl: opts?.fetchImpl });
       const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
       const stale = staleMentalModels(h.mentalModels, 7, now);
+      const corrupted = corruptedMentalModels(h.mentalModels);
       let status: MemoryBankHealthRow["status"] = "ok";
       let statusDetail = "facts flowing";
       if (!h.ok) {
         status = "warn";
         statusDetail = `inspection failed: ${h.reason ?? "unknown"}`;
+      } else if (corrupted.length > 0) {
+        status = "fail";
+        statusDetail = `${corrupted.length} mental model(s) corrupted by an LLM failure message — injected into every turn until refreshed`;
       } else if (gaps.length > 0) {
         status = "fail";
         statusDetail = `${gaps.length} recent conversation(s) stored with zero extracted facts — invisible to recall`;
@@ -1405,6 +1412,7 @@ export async function handleGetMemoryHealth(
         oldestUnextractedAt: gaps[0]?.createdAt ?? null,
         mentalModels: h.mentalModels,
         staleMentalModelCount: stale.length,
+        corruptedMentalModelNames: corrupted.map((m) => m.name),
         status,
         statusDetail,
       };

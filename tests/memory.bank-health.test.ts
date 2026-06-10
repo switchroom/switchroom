@@ -3,6 +3,7 @@ import {
   inspectBankHealth,
   hindsightRestBase,
   staleMentalModels,
+  corruptedMentalModels,
   recentUnextracted,
   ageDays,
 } from "../src/memory/bank-health.js";
@@ -59,7 +60,7 @@ const HEALTHY_BANK = {
   },
   models: {
     items: [
-      { id: "m1", name: "Case State", last_refreshed_at: "2026-06-10T01:00:00Z", created_at: "2026-04-01T00:00:00Z" },
+      { id: "m1", name: "Case State", last_refreshed_at: "2026-06-10T01:00:00Z", created_at: "2026-04-01T00:00:00Z", content: "# Case State\n\nA healthy, substantive synthesis of the matter." },
     ],
   },
 };
@@ -85,8 +86,8 @@ const STALE_MODEL_BANK = {
   },
   models: {
     items: [
-      { id: "m1", name: "Old Map", last_refreshed_at: "2026-05-20T00:00:00Z", created_at: "2026-04-01T00:00:00Z" },
-      { id: "m2", name: "Fresh", last_refreshed_at: "2026-06-10T00:00:00Z", created_at: "2026-04-01T00:00:00Z" },
+      { id: "m1", name: "Old Map", last_refreshed_at: "2026-05-20T00:00:00Z", created_at: "2026-04-01T00:00:00Z", content: "# Old Map\n\nReal content, just not refreshed lately." },
+      { id: "m2", name: "Fresh", last_refreshed_at: "2026-06-10T00:00:00Z", created_at: "2026-04-01T00:00:00Z", content: "# Fresh\n\nRecently refreshed real content." },
     ],
   },
 };
@@ -147,6 +148,24 @@ describe("helpers", () => {
       NOW,
     );
     expect(stale.map((m) => m.id)).toEqual(["a"]);
+  });
+
+  it("corruptedMentalModels fingerprints persisted LLM-failure content", () => {
+    const mk = (id: string, contentHead: string, contentLength: number, refreshed: string | null = "2026-06-10T01:39:00Z") =>
+      ({ id, name: id, lastRefreshedAt: refreshed, createdAt: "2026-04-01T00:00:00Z", contentLength, contentHead });
+    const corrupted = corruptedMentalModels([
+      // The live 2026-06-10 incident strings:
+      mk("quota", "You're out of extra usage · resets 3am (UTC)", 44),
+      mk("session", "You've hit your session limit · resets 1pm (Australia/Melbourne)", 65),
+      // Empty content but HAS refreshed → corrupt; never refreshed → fine.
+      mk("empty-refreshed", "", 0),
+      mk("empty-never", "", 0, null),
+      // Real content mentioning limits is NOT corrupt (length >= 300).
+      mk("real", "# Case State — discusses the usage limit of the trust...", 8000),
+      // Short but genuine content without failure phrasing is NOT corrupt.
+      mk("short-real", "## Notes\nNothing recorded yet beyond the kickoff.", 49),
+    ]);
+    expect(corrupted.map((m) => m.id)).toEqual(["quota", "session", "empty-refreshed"]);
   });
 
   it("recentUnextracted windows by age and ignores trivial documents", () => {
@@ -214,6 +233,44 @@ describe("checkBankIngestHealth (doctor)", () => {
     );
     expect(results[0].status).toBe("warn");
     expect(results[0].detail).toContain("inspection failed");
+  });
+});
+
+const CORRUPT_MODEL_BANK = {
+  stats: { total_documents: 5, total_nodes: 50, pending_operations: 0 },
+  documents: {
+    items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 100, memory_unit_count: 2 }],
+  },
+  models: {
+    items: [
+      {
+        id: "m1", name: "Case State",
+        last_refreshed_at: "2026-06-10T01:39:00Z", created_at: "2026-04-01T00:00:00Z",
+        content: "You're out of extra usage · resets 3am (UTC)",
+      },
+    ],
+  },
+};
+
+describe("corruption detection end-to-end", () => {
+  it("doctor fails the bank and names the corrupted model", async () => {
+    const results = await checkBankIngestHealth(
+      minimalConfig({ lawgpt: {} }),
+      "http://x/mcp/",
+      { fetchImpl: fakeFetchFor({ lawgpt: CORRUPT_MODEL_BANK }), now: NOW },
+    );
+    expect(results[0].status).toBe("fail");
+    expect(results[0].detail).toContain("Case State");
+    expect(results[0].detail).toContain("LLM-failure message");
+  });
+
+  it("dashboard row carries fail status + corrupted names", async () => {
+    const health = await handleGetMemoryHealth(minimalConfig({ lawgpt: {} }), {
+      fetchImpl: fakeFetchFor({ lawgpt: CORRUPT_MODEL_BANK }),
+      now: NOW,
+    });
+    expect(health.banks[0].status).toBe("fail");
+    expect(health.banks[0].corruptedMentalModelNames).toEqual(["Case State"]);
   });
 });
 

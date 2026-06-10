@@ -31,6 +31,10 @@ export interface BankMentalModelSummary {
   name: string;
   lastRefreshedAt: string | null;
   createdAt: string | null;
+  /** Length of the rendered content (0 when absent). */
+  contentLength: number;
+  /** First ~200 chars of content — enough for corruption fingerprinting. */
+  contentHead: string;
 }
 
 export interface BankHealth {
@@ -133,6 +137,7 @@ export async function inspectBankHealth(
       name?: string;
       last_refreshed_at?: string | null;
       created_at?: string | null;
+      content?: string | null;
     }>;
   }>(`${base}/v1/default/banks/${bank}/mental-models`, opts);
   if (!models.ok) return { ...empty, reason: models.reason };
@@ -165,7 +170,7 @@ export async function inspectBankHealth(
     newestDocumentAt,
     unextractedDocuments: unextracted,
     mentalModels: (models.data.items ?? [])
-      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null } =>
+      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null } =>
         typeof m?.id === "string" && typeof m?.name === "string",
       )
       .map((m) => ({
@@ -173,6 +178,8 @@ export async function inspectBankHealth(
         name: m.name,
         lastRefreshedAt: m.last_refreshed_at ?? null,
         createdAt: m.created_at ?? null,
+        contentLength: (m.content ?? "").length,
+        contentHead: (m.content ?? "").slice(0, 200),
       })),
   };
 }
@@ -183,6 +190,24 @@ export function ageDays(iso: string | null, now: Date = new Date()): number | nu
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
   return Math.max(0, (now.getTime() - t) / 86_400_000);
+}
+
+/**
+ * Mental models whose content is a persisted LLM-failure message rather than
+ * real synthesis. Observed live 2026-06-10: a refresh during an OAuth quota
+ * wall stored the literal error ("You're out of extra usage · resets 3am
+ * (UTC)") as the model's content — which then gets injected into every agent
+ * turn until the next successful refresh. Fingerprint: tiny content matching
+ * a quota/limit phrase, or empty content on a model that HAS refreshed.
+ */
+export function corruptedMentalModels(
+  models: BankMentalModelSummary[],
+): BankMentalModelSummary[] {
+  const failurePhrase = /out of (extra )?usage|hit your (usage |session )?limit|resets \d|quota exceeded|rate.?limit/i;
+  return models.filter((m) => {
+    if (m.contentLength === 0) return m.lastRefreshedAt !== null;
+    return m.contentLength < 300 && failurePhrase.test(m.contentHead);
+  });
 }
 
 /** Mental models whose last refresh (or creation, if never refreshed) is older than `staleDays`. */
