@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.15.2 — memory-bank health observability (#2257, #2258)
+
+Built mid-incident on 2026-06-10: every active agent had silent memory
+damage from the June quota outages — 155 conversations across 9 banks
+were retained but never fact-extracted (invisible to recall), and mental-
+model refreshes that ran during the quota wall persisted the literal LLM
+error string ("You're out of extra usage · resets 3am (UTC)") as model
+content, injected into every turn. Nothing surfaced either failure.
+
+### PR A — hindsight bank-health in doctor + dashboard Memory tab (#2257)
+
+- New `src/memory/bank-health.ts`: REST inspection client over
+  `/v1/default/banks/*` (stats, documents with per-doc extracted-fact
+  counts, mental models with refresh timestamps). Injectable fetch,
+  never throws.
+- `switchroom doctor`: per-bank checks — FAIL on recent (≤30d, >1KB)
+  zero-fact documents with the exact `/reprocess` curl in the fix
+  string; WARN on stale (>7d) mental models or a stuck pending queue;
+  OK line summarises docs/facts/newest-activity/models. Banks probed
+  concurrently; agents sharing a collection dedupe into one row.
+- Dashboard: new **Memory** tab (`GET /api/memory-health`) with the
+  same per-bank truth: status dot, conversations/facts, latest
+  activity, extraction-gap banner, per-model refresh age.
+
+### PR B — detect LLM-failure-corrupted mental models (#2258)
+
+- `corruptedMentalModels()`: fingerprints tiny content matching
+  quota/limit failure phrasing (or empty content on a refreshed
+  model). Doctor FAILs the bank naming the corrupted models; the
+  dashboard shows a red banner. Live-validated against the real
+  corruption (lawgpt ×2, carrie, kdogg) with healthy banks unaffected.
+
 ## v0.15.1 — quota-status floods silenced (#2254, #2255)
 
 The 2026-06-09 incident: a fleet bounce released days-stale quota-recovery
