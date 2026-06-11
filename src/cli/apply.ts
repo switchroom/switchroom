@@ -58,7 +58,7 @@ import {
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants } from "../agents/scaffold.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
-import { writeComposeFile } from "./write-compose.js";
+import { writeComposeFile, resolveHostSwitchroomConfigPath } from "./write-compose.js";
 import { detectInstallType } from "./install-detect.js";
 import {
   resolveOperatorUid,
@@ -1341,8 +1341,16 @@ export function registerApplyCommand(program: Command): void {
 
           const parentOpts = program.opts();
           const config = loadConfig(parentOpts.config);
-          const switchroomConfigPath =
-            parentOpts.config ?? findConfigFile();
+          // Translate container-internal config paths to host paths before
+          // baking into compose bind-mount sources. When `switchroom apply`
+          // runs from inside an agent container, SWITCHROOM_CONFIG is the
+          // container path `/state/config/switchroom.yaml`. Emitting that
+          // verbatim as a bind-mount source makes Docker auto-create an
+          // empty directory at that host path, crashing broker + auth-broker
+          // with EISDIR (2026-06-11 v0.15.3 rollback incident).
+          const switchroomConfigPath = resolveHostSwitchroomConfigPath(
+            parentOpts.config ?? findConfigFile(),
+          );
 
           // ─── Self-elevation pre-check (#920) ────────────────────
           //
