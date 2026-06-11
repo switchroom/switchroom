@@ -4337,6 +4337,11 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   // --- Switchroom-owned UserPromptSubmit hooks ---
   const useHotReloadStable = agentConfig.channels?.telegram?.hotReloadStable === true;
+  // inject_on_change: default true — suppress re-injection of static/unchanged
+  // content each turn, reducing per-turn token overhead by ~3 KB. Set to false
+  // per-agent in switchroom.yaml channels.telegram.inject_on_change to revert
+  // to legacy always-emit behaviour.
+  const useInjectOnChange = agentConfig.channels?.telegram?.inject_on_change !== false;
   // Per-turn pacing directive — v3 (conversational-pacing for Option B,
   // v0.13.61).
   //
@@ -4445,7 +4450,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           type: "command",
           command: wrap(
             "hook:workspace-dynamic",
-            `bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
+            `${useInjectOnChange ? `env SWITCHROOM_INJECT_ON_CHANGE=1 ` : ""}bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
           ),
           timeout: 5,
         },
@@ -4467,13 +4472,28 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       hooks: [
         {
           type: "command",
-          // Emits the per-turn pacing directive (above) — its stdout is
-          // injected adjacent to the user's message. Static string; an
-          // inline `printf` avoids a baked-in hook script.
-          command: wrap(
-            "hook:turn-pacing",
-            `printf '%s\\n' ${shellSingleQuote(turnPacingDirective)}`,
-          ),
+          // Emits the per-turn pacing directive (above).
+          // inject_on_change=true: use a hook script that gates injection
+          //   on session_id + directive hash, suppressing the ~3 KB
+          //   re-injection on every subsequent turn of a session.
+          // inject_on_change=false: legacy inline printf (every turn).
+          command: useInjectOnChange
+            ? (() => {
+                const directiveHash = createHash("sha256")
+                  .update(turnPacingDirective)
+                  .digest("hex");
+                // Pass directive + hash as env vars in the hook command.
+                // The hook script reads TURN_PACING_DIRECTIVE and
+                // TURN_PACING_HASH from its environment.
+                return wrap(
+                  "hook:turn-pacing",
+                  `env TURN_PACING_DIRECTIVE=${shellSingleQuote(turnPacingDirective)} TURN_PACING_HASH=${shellSingleQuote(directiveHash)} bash "${join(DOCKER_BIN_PATH, "turn-pacing-hook.sh")}"`,
+                );
+              })()
+            : wrap(
+                "hook:turn-pacing",
+                `printf '%s\\n' ${shellSingleQuote(turnPacingDirective)}`,
+              ),
           timeout: 3,
         },
       ],

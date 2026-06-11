@@ -608,6 +608,18 @@ export const TelegramChannelSchema = z
         "Costs ~5-10% per-turn latency/spend since the stable prefix is no " +
         "longer prompt-cached."
       ),
+    inject_on_change: z
+      .boolean()
+      .optional()
+      .describe(
+        "Context-efficiency gate for per-turn hook injection (default true). " +
+        "When true (the default), the turn-pacing directive and dynamic " +
+        "workspace content are only re-emitted when their content changes or " +
+        "the session_id changes — suppressing redundant injection that " +
+        "otherwise triples compaction frequency. Set to false to revert to " +
+        "the legacy always-emit behaviour (every turn injects the full " +
+        "content regardless of whether it changed)."
+      ),
     /**
      * Progress-card driver tuning. These knobs are only effective when
      * stream_mode is 'checklist' (the default). All values are in
