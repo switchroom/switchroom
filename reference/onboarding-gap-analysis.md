@@ -66,8 +66,8 @@ list, none of them declarative per-agent:
   `switchroom workspace render --stable`, which returns a hardcoded list:
   `AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`,
   `BOOTSTRAP.md`. Goes into the system prompt once, cached.
-- **Dynamic UserPromptSubmit hook.** Injects `MEMORY.md` and `HEARTBEAT.md`
-  into context every turn. Hardcoded list today.
+- **Dynamic UserPromptSubmit hook.** Injects `MEMORY.md` (plus today/yesterday
+  daily notes) into context every turn. Hardcoded list.
 - **Agent self-read.** `AGENTS.md` instructs the agent to read additional
   files (e.g. `BRIEF.md`) on session start. Nothing loads them — the agent
   pulls them because its own instructions say to.
@@ -199,7 +199,7 @@ the bar for "done" — not aspirational, the actual gate.
 - **Scope:** each agent declares in its config (likely a `workspace:`
   stanza in `switchroom.yaml` or a separate `workspace.yaml`) which files
   the per-turn UserPromptSubmit hook injects. Today it's hardcoded
-  `MEMORY.md` + `HEARTBEAT.md`. `lawgpt` wants `BRIEF.md` in the dynamic
+  `MEMORY.md`. `lawgpt` wants `BRIEF.md` in the dynamic
   list because case state evolves faster than the system-prompt cache.
 - **Success criteria:** at least one agent (lawgpt) runs with a
   per-agent dynamic list that differs from the default, and the extra
