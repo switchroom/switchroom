@@ -105,6 +105,85 @@ TODAY_FILE="$WS_DIR/memory/${CACHE_DATE}.md"
 YESTERDAY_DATE="$(date -u -d 'yesterday' +%Y-%m-%d 2>/dev/null || echo "")"
 YESTERDAY_FILE="$WS_DIR/memory/${YESTERDAY_DATE}.md"
 
+# ---------------------------------------------------------------------------
+# Helper: strip HEARTBEAT.md section from rendered body when suppression
+# is warranted (prompt has no "heartbeat" keyword AND HB file unchanged).
+# Returns the (possibly stripped) body via stdout.
+# Args: $1=body $2=ws_dir $3=session_id $4=prompt_text
+# Side-effect: updates the per-session HB state file when needed.
+# ---------------------------------------------------------------------------
+_strip_heartbeat_if_needed() {
+  local body="$1"
+  local ws_dir="$2"
+  local session_id="$3"
+  local prompt_text="$4"
+
+  # If not inject-on-change mode just return body unchanged.
+  if [ "$INJECT_ON_CHANGE" != "1" ]; then
+    printf '%s' "$body"
+    return
+  fi
+
+  local heartbeat_file="$ws_dir/HEARTBEAT.md"
+  local prompt_is_heartbeat=0
+  if printf '%s' "${prompt_text:-}" | grep -qi "heartbeat"; then
+    prompt_is_heartbeat=1
+  fi
+
+  if [ "$prompt_is_heartbeat" = "0" ]; then
+    local hb_hash=""
+    if [ -f "$heartbeat_file" ]; then
+      hb_hash=$(sha256sum < "$heartbeat_file" 2>/dev/null | cut -d' ' -f1 || true)
+    fi
+
+    local hb_suppress=0
+    if [ -n "$session_id" ]; then
+      local hb_state_dir="${TELEGRAM_STATE_DIR:-${HOME:-/tmp}/.claude/switchroom-hookcache}/.hook-state"
+      local hb_state_file="$hb_state_dir/ws-heartbeat.$session_id"
+      if [ -f "$hb_state_file" ]; then
+        local recorded_hb_hash
+        recorded_hb_hash=$(head -1 "$hb_state_file" 2>/dev/null || echo "")
+        if [ -n "$hb_hash" ] && [ "$hb_hash" = "$recorded_hb_hash" ]; then
+          hb_suppress=1
+        fi
+      fi
+      # Record current HB hash for this session.
+      if [ -n "$hb_hash" ]; then
+        [ -d "$hb_state_dir" ] || mkdir -p "$hb_state_dir" 2>/dev/null || true
+        if [ -d "$hb_state_dir" ]; then
+          printf '%s\n%s\n' "$hb_hash" "$session_id" > "$hb_state_file" 2>/dev/null || true
+          # Keep at most 5 ws-heartbeat state files to bound growth.
+          # shellcheck disable=SC2012
+          local old_hb_count
+          old_hb_count=$(ls -1 "$hb_state_dir"/ws-heartbeat.* 2>/dev/null | grep -cv "ws-heartbeat\.$session_id$" || true)
+          if [ "$old_hb_count" -gt 5 ]; then
+            ls -1t "$hb_state_dir"/ws-heartbeat.* 2>/dev/null \
+              | grep -v "ws-heartbeat\.$session_id$" \
+              | tail -n +6 \
+              | xargs rm -f 2>/dev/null || true
+          fi
+        fi
+      fi
+    fi
+
+    if [ "$hb_suppress" = "1" ]; then
+      body=$(printf '%s' "$body" | awk '
+        /^## .*HEARTBEAT\.md/ { skip=1; next }
+        /^## / { skip=0 }
+        !skip { print }
+      ' 2>/dev/null || printf '%s' "$body")
+      # If stripping left an empty body, return nothing.
+      local trimmed
+      trimmed=$(printf '%s' "$body" | tr -d '[:space:]' 2>/dev/null || true)
+      if [ -z "$trimmed" ]; then
+        return
+      fi
+    fi
+  fi
+
+  printf '%s' "$body"
+}
+
 if [ -f "$BODY_FILE" ]; then
   # Compare BODY_FILE mtime against every source. If any source is newer
   # the cache is stale; fall through. If all sources are older (or
@@ -143,11 +222,18 @@ if [ -f "$BODY_FILE" ]; then
         printf '%s\n%s\n' "$CACHED_HASH_FOR_STATE" "$SESSION_ID" > "$SESSION_STATE_FILE" 2>/dev/null || true
       fi
     fi
-    # Check HEARTBEAT suppression in inject-on-change mode.
-    # HEARTBEAT.md content is filtered out unless prompt matches OR it changed.
-    # (Suppression is handled by re-rendering with HEARTBEAT excluded; here
-    # we emit the full body and rely on the HEARTBEAT-aware render path below.)
-    cat "$BODY_FILE"
+    # Check HEARTBEAT suppression in inject-on-change mode on the fast path.
+    # Apply the same HEARTBEAT gating as the full-render path: strip the HB
+    # section unless the prompt contains "heartbeat" or HEARTBEAT.md changed.
+    if [ "$INJECT_ON_CHANGE" = "1" ]; then
+      _fast_body=$(cat "$BODY_FILE")
+      _fast_body=$(_strip_heartbeat_if_needed "$_fast_body" "$WS_DIR" "$SESSION_ID" "$PROMPT_TEXT")
+      if [ -n "$_fast_body" ]; then
+        printf '%s\n' "$_fast_body"
+      fi
+    else
+      cat "$BODY_FILE"
+    fi
     exit 0
   fi
 fi
@@ -173,68 +259,10 @@ if [ -z "$WS_DYNAMIC" ]; then
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# HEARTBEAT.md gating (inject-on-change mode only).
-#
-# HEARTBEAT.md is a cron-updated "intentions" file that rarely changes
-# mid-session. In inject-on-change mode we suppress it unless:
-#   a) The prompt mentions "heartbeat" or "HEARTBEAT" (the cron scheduler's
-#      own heartbeat-prompt pattern), OR
-#   b) The HEARTBEAT.md file content changed since the last time we emitted it.
-#
-# Technique: compute a hash of the HEARTBEAT.md file directly (not the full
-# render). Keep a separate per-session state entry for the HEARTBEAT hash.
-# Strip the HEARTBEAT section from WS_DYNAMIC when suppressed, using awk.
-# ---------------------------------------------------------------------------
-if [ "$INJECT_ON_CHANGE" = "1" ]; then
-  HEARTBEAT_FILE="$WS_DIR/HEARTBEAT.md"
-  PROMPT_IS_HEARTBEAT=0
-  # Case-insensitive substring match on the prompt text.
-  if printf '%s' "${PROMPT_TEXT:-}" | grep -qi "heartbeat"; then
-    PROMPT_IS_HEARTBEAT=1
-  fi
-
-  if [ "$PROMPT_IS_HEARTBEAT" = "0" ]; then
-    # Compute hash of HEARTBEAT.md (if it exists).
-    HB_HASH=""
-    if [ -f "$HEARTBEAT_FILE" ]; then
-      HB_HASH=$(sha256sum < "$HEARTBEAT_FILE" 2>/dev/null | cut -d' ' -f1 || true)
-    fi
-
-    # Check per-session HEARTBEAT state.
-    HB_SUPPRESS=0
-    if [ -n "$SESSION_ID" ]; then
-      HB_STATE_DIR="${TELEGRAM_STATE_DIR:-${HOME:-/tmp}/.claude/switchroom-hookcache}/.hook-state"
-      HB_STATE_FILE="$HB_STATE_DIR/ws-heartbeat.$SESSION_ID"
-      if [ -f "$HB_STATE_FILE" ]; then
-        RECORDED_HB_HASH=$(head -1 "$HB_STATE_FILE" 2>/dev/null || echo "")
-        if [ -n "$HB_HASH" ] && [ "$HB_HASH" = "$RECORDED_HB_HASH" ]; then
-          HB_SUPPRESS=1
-        fi
-      fi
-      # Record current HEARTBEAT hash for this session (even if unchanged).
-      if [ -n "$HB_HASH" ]; then
-        mkdir -p "$HB_STATE_DIR" 2>/dev/null || true
-        printf '%s\n%s\n' "$HB_HASH" "$SESSION_ID" > "$HB_STATE_FILE" 2>/dev/null || true
-      fi
-    fi
-
-    if [ "$HB_SUPPRESS" = "1" ]; then
-      # Strip the HEARTBEAT.md section from the rendered output. The
-      # section starts at a line matching "## .*/HEARTBEAT.md" and ends
-      # just before the next "## " section header (or end of output).
-      WS_DYNAMIC=$(printf '%s' "$WS_DYNAMIC" | awk '
-        /^## .*HEARTBEAT\.md/ { skip=1; next }
-        /^## / { skip=0 }
-        !skip { print }
-      ' 2>/dev/null || printf '%s' "$WS_DYNAMIC")
-      # If stripping left an empty body, emit nothing.
-      WS_DYNAMIC_TRIMMED=$(printf '%s' "$WS_DYNAMIC" | tr -d '[:space:]' 2>/dev/null || true)
-      if [ -z "$WS_DYNAMIC_TRIMMED" ]; then
-        exit 0
-      fi
-    fi
-  fi
+# Apply HEARTBEAT gating via the shared helper (inject-on-change mode only).
+WS_DYNAMIC=$(_strip_heartbeat_if_needed "$WS_DYNAMIC" "$WS_DIR" "$SESSION_ID" "$PROMPT_TEXT")
+if [ -z "$WS_DYNAMIC" ]; then
+  exit 0
 fi
 
 # Content-addressed dedupe sidecar. Anthropic's prompt cache is keyed on
@@ -255,8 +283,20 @@ _ws_record_session_state() {
   local hash="$1" sid="$2"
   if [ -n "$hash" ] && [ -n "$sid" ]; then
     local sdir="${TELEGRAM_STATE_DIR:-${HOME:-/tmp}/.claude/switchroom-hookcache}/.hook-state"
-    mkdir -p "$sdir" 2>/dev/null || true
-    printf '%s\n%s\n' "$hash" "$sid" > "$sdir/ws-dynamic.$sid" 2>/dev/null || true
+    [ -d "$sdir" ] || mkdir -p "$sdir" 2>/dev/null || true
+    if [ -d "$sdir" ]; then
+      printf '%s\n%s\n' "$hash" "$sid" > "$sdir/ws-dynamic.$sid" 2>/dev/null || true
+      # Keep at most 5 ws-dynamic state files to bound growth.
+      # shellcheck disable=SC2012
+      local old_count
+      old_count=$(ls -1 "$sdir"/ws-dynamic.* 2>/dev/null | grep -cv "ws-dynamic\.$sid$" || true)
+      if [ "$old_count" -gt 5 ]; then
+        ls -1t "$sdir"/ws-dynamic.* 2>/dev/null \
+          | grep -v "ws-dynamic\.$sid$" \
+          | tail -n +6 \
+          | xargs rm -f 2>/dev/null || true
+      fi
+    fi
   fi
 }
 

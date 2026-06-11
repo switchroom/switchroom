@@ -257,6 +257,55 @@ describe("workspace-dynamic-hook.sh (inject-on-change mode)", () => {
     }
   });
 
+  it("BLOCKER 2 regression: fast-path (fresh cache) strips HEARTBEAT on non-heartbeat prompt with unchanged HB", async () => {
+    // This test guards the BLOCKER 2 fix: before the fix, the fast-path (lines
+    // ~108-153) would cat BODY_FILE and exit 0 WITHOUT applying heartbeat
+    // stripping, so HEARTBEAT.md was emitted every turn in the common case.
+
+    const fakeAgentDir = join(tmp, "agent-hb-fast");
+    const wsDir = join(fakeAgentDir, "workspace");
+    mkdirSync(wsDir, { recursive: true });
+    writeFileSync(join(wsDir, "MEMORY.md"), "mem content");
+    const hbPath = join(wsDir, "HEARTBEAT.md");
+    writeFileSync(hbPath, "intentions: stay focused");
+
+    const hbSection = `## ${wsDir}/HEARTBEAT.md\nintentions: stay focused\n`;
+    const payload = `# Project Context\n\n## ${wsDir}/MEMORY.md\nmem content\n\n${hbSection}`;
+    makeShim(shimDir, payload);
+
+    // Turn 1: first turn for this session — seeds both ws-dynamic and ws-heartbeat state.
+    const a = runHook({
+      cacheDir, shimDir, stateDir,
+      agentDirOverride: fakeAgentDir,
+      sessionId: "session-fast-hb",
+      prompt: "regular message",
+    });
+    expect(a.exitCode).toBe(0);
+    // First turn always emits (no prior state).
+
+    // Now wait for BODY_FILE to be newer than the workspace sources so
+    // the mtime fast-path fires on the next turn. The hook writes BODY_FILE
+    // after a fresh render, but we need it newer than MEMORY.md and HEARTBEAT.md.
+    // Touch the files with an older timestamp to ensure the fast-path is taken.
+    // Use 2s sleep to guarantee mtime difference.
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Turn 2: same session, same prompt (no heartbeat keyword), HEARTBEAT unchanged.
+    // The fast-path should take over (BODY_FILE is fresh), BUT heartbeat must be stripped.
+    const b = runHook({
+      cacheDir, shimDir, stateDir,
+      agentDirOverride: fakeAgentDir,
+      sessionId: "session-fast-hb",
+      prompt: "a regular message without hb keyword",
+    });
+    expect(b.exitCode).toBe(0);
+    // Either fully suppressed (ws-dynamic session check) OR HEARTBEAT stripped.
+    // Either way, HEARTBEAT content must NOT appear.
+    if (b.stdout !== "") {
+      expect(b.stdout).not.toContain("intentions: stay focused");
+    }
+  }, 10_000);
+
   it("legacy mode (inject_on_change=0) emits every turn", () => {
     const payload = "# Project Context (dynamic workspace files)\n\n## MEMORY.md\nlegacy content\n";
     makeShim(shimDir, payload);

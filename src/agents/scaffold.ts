@@ -4450,7 +4450,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           type: "command",
           command: wrap(
             "hook:workspace-dynamic",
-            `${useInjectOnChange ? "SWITCHROOM_INJECT_ON_CHANGE=1 " : ""}bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
+            `${useInjectOnChange ? `env SWITCHROOM_INJECT_ON_CHANGE=1 ` : ""}bash "${join(DOCKER_BIN_PATH, "workspace-dynamic-hook.sh")}"`,
           ),
           timeout: 5,
         },
@@ -4487,7 +4487,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
                 // TURN_PACING_HASH from its environment.
                 return wrap(
                   "hook:turn-pacing",
-                  `TURN_PACING_DIRECTIVE=${shellSingleQuote(turnPacingDirective)} TURN_PACING_HASH=${shellSingleQuote(directiveHash)} bash "${join(DOCKER_BIN_PATH, "turn-pacing-hook.sh")}"`,
+                  `env TURN_PACING_DIRECTIVE=${shellSingleQuote(turnPacingDirective)} TURN_PACING_HASH=${shellSingleQuote(directiveHash)} bash "${join(DOCKER_BIN_PATH, "turn-pacing-hook.sh")}"`,
                 );
               })()
             : wrap(

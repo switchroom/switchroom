@@ -181,6 +181,105 @@ describe("buildSettingsHooksBlock", () => {
   });
 });
 
+describe("inject_on_change command format drift detection", () => {
+  it("new env-prefix turn-pacing command is not-drift vs itself", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { inject_on_change: true } },
+    });
+    const params = {
+      agentName: "test-agent",
+      agentConfig,
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    };
+    const expected = buildSettingsHooksBlock(params);
+    const { drifted } = detectHooksDrift(expected, expected);
+    expect(drifted).toBe(false);
+  });
+
+  it("old printf-style turn-pacing command is detected as drift vs new env-prefix form", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { inject_on_change: true } },
+    });
+    // Build the current (correct) hooks block.
+    const expected = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig,
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    });
+
+    // Simulate a stale settings.json that still has the old printf-style command.
+    // We deep-clone expected and replace the turn-pacing command with the old format.
+    const stale = JSON.parse(JSON.stringify(expected)) as typeof expected;
+    const ups = stale.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
+    for (const entry of ups) {
+      for (const hook of entry.hooks) {
+        if (hook.command.includes("turn-pacing-hook.sh")) {
+          // Replace with old-style printf form (no env prefix).
+          hook.command = hook.command.replace(
+            /^bash run-hook\.sh 'hook:turn-pacing' env /,
+            "bash run-hook.sh 'hook:turn-pacing' ",
+          );
+          // Also simulate the really old format with bare assignment.
+          hook.command = "bash run-hook.sh 'hook:turn-pacing' TURN_PACING_DIRECTIVE='old directive' bash \"/opt/switchroom/bin/turn-pacing-hook.sh\"";
+        }
+      }
+    }
+
+    const { drifted } = detectHooksDrift(expected, stale as Record<string, unknown>);
+    expect(drifted).toBe(true);
+  });
+
+  it("new env-prefix workspace-dynamic command is not-drift vs itself under inject_on_change=true", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { inject_on_change: true } },
+    });
+    const params = {
+      agentName: "test-agent",
+      agentConfig,
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    };
+    const expected = buildSettingsHooksBlock(params);
+    // Check workspace-dynamic command has the env prefix.
+    const ups = expected.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
+    const wsDynCmd = ups.flatMap(e => e.hooks.map(h => h.command))
+      .find(c => c.includes("workspace-dynamic-hook.sh"));
+    expect(wsDynCmd).toBeDefined();
+    expect(wsDynCmd).toContain("env SWITCHROOM_INJECT_ON_CHANGE=1");
+    // And it must not-drift vs itself.
+    const { drifted } = detectHooksDrift(expected, expected);
+    expect(drifted).toBe(false);
+  });
+
+  it("old bare-assignment workspace-dynamic command is detected as drift", () => {
+    const agentConfig = makeAgentConfig({
+      channels: { telegram: { inject_on_change: true } },
+    });
+    const expected = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig,
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    });
+
+    const stale = JSON.parse(JSON.stringify(expected)) as typeof expected;
+    const ups = stale.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>;
+    for (const entry of ups) {
+      for (const hook of entry.hooks) {
+        if (hook.command.includes("workspace-dynamic-hook.sh")) {
+          // Old broken format without `env` prefix.
+          hook.command = hook.command.replace("env SWITCHROOM_INJECT_ON_CHANGE=1 bash", "SWITCHROOM_INJECT_ON_CHANGE=1 bash");
+        }
+      }
+    }
+
+    const { drifted } = detectHooksDrift(expected, stale as Record<string, unknown>);
+    expect(drifted).toBe(true);
+  });
+});
+
 describe("detectHooksDrift", () => {
   it("returns drifted=false when hooks are identical", () => {
     const hooks = {
