@@ -172,6 +172,32 @@ describe("generateCompose config mount is never a container path", () => {
   });
 });
 
+describe("generateCompose — refuses a /host-home prefix (2026-06-11/12 fleet outages)", () => {
+  it("throws when homeDir is the in-container host-home mount point", () => {
+    // homedir() inside the hostd container returns /host-home when
+    // SWITCHROOM_HOST_HOME is unset — emitting it as a bind source killed the
+    // fleet (agent scaffold mount empty → start.sh missing → exec 127; broker
+    // EISDIR). The generator must fail loud, not produce a fleet-killer.
+    expect(() =>
+      generateCompose({ config: makeConfig({ klanker: {} }), homeDir: "/host-home" }),
+    ).toThrow(/in-container mount point|host path/i);
+  });
+  it("throws for any path under /host-home/", () => {
+    expect(() =>
+      generateCompose({ config: makeConfig({ klanker: {} }), homeDir: "/host-home/nested" }),
+    ).toThrow(/host-home/);
+  });
+  it("accepts a real host home", () => {
+    expect(() =>
+      generateCompose({
+        config: makeConfig({ klanker: {} }),
+        homeDir: "/home/op",
+        switchroomConfigPath: "/home/op/.switchroom/switchroom.yaml",
+      }),
+    ).not.toThrow();
+  });
+});
+
 describe("allocateAgentUid", () => {
   it("returns UID in the reserved range", () => {
     for (const name of ["klanker", "coach", "finn", "ziggy", "alpha", "z9"]) {

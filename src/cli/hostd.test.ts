@@ -46,6 +46,15 @@ describe("renderHostdComposeFile", () => {
     expect(out).toContain("/var/run/docker.sock:/var/run/docker.sock:rw");
   });
 
+  it("exports SWITCHROOM_HOST_HOME = the REAL host home (so in-container apply emits host bind sources, not /host-home)", () => {
+    const out = renderHostdComposeFile({ hostHome: "/home/alice", imageTag: "latest" });
+    // The 2026-06-11/12 outages: without this, in-container apply did
+    // homedir()→/host-home and poisoned every bind source. HOME stays
+    // /host-home (socket convention) but SWITCHROOM_HOST_HOME must be real.
+    expect(out).toContain("HOME: /host-home");
+    expect(out).toContain("SWITCHROOM_HOST_HOME: /home/alice");
+  });
+
   it("pins the image tag exactly as passed", () => {
     const out = renderHostdComposeFile({
       hostHome: "/home/x",

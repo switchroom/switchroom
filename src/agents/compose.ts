@@ -802,6 +802,30 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // preserves the older `${HOME}` shape for callers that haven't been
   // updated.
   const homePrefix = opts.homeDir ?? "${HOME}";
+  // Backstop (2026-06-11/12 fleet outages): `homePrefix` is the leading
+  // segment of EVERY host-path bind source, so it MUST be a host path. The
+  // one poison value is `/host-home` — the in-container mount point of the
+  // host home that hostd pins HOME to. If an in-container apply runs without
+  // SWITCHROOM_HOST_HOME set, homedir() returns /host-home and it leaks into
+  // every source: docker auto-creates empty `/host-home/...` dirs on the
+  // host, so the agent scaffold mount is empty (start.sh missing → exec
+  // fails 127) and the brokers EISDIR. Worse, that value gets baked back
+  // into the fleet as SWITCHROOM_HOST_HOME, self-perpetuating. Refuse to
+  // emit it — fail loud with the recovery path instead of generating a
+  // fleet-killing compose. (Root cause is fixed by hostd setting
+  // SWITCHROOM_HOST_HOME; this guards every other caller, forever.)
+  if (homePrefix === "/host-home" || homePrefix.startsWith("/host-home/")) {
+    throw new Error(
+      `compose: refusing to generate — the host-home prefix resolved to "${homePrefix}", ` +
+      `which is the IN-CONTAINER mount point, not a host path. Emitting it as a bind-mount ` +
+      `source would make docker create empty dirs on the host and crash the fleet (start.sh ` +
+      `missing → exec 127; broker EISDIR).\n\n` +
+      `Cause: \`apply\` ran inside a container without SWITCHROOM_HOST_HOME set to the real ` +
+      `host home. Recovery: run \`switchroom apply\` once from the HOST shell (not via an ` +
+      `agent / hostd), which regenerates the compose with correct host paths and re-bakes a ` +
+      `correct SWITCHROOM_HOST_HOME into the fleet.`,
+    );
+  }
   // Default container_name prefix matches the compose project name and
   // every operator command in the docs (`docker exec -it switchroom-
   // vault-broker ...`, `journalctl --user -u switchroom-vault-broker`).
