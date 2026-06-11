@@ -1607,6 +1607,26 @@ function emitAgentService(
     SWITCHROOM_TIMEZONE: a.timezone,
     TZ: a.timezone,
   };
+  // SWITCHROOM_HOST_HOME: baked-in host home directory.
+  //
+  // When an agent (or a sub-agent it launches) invokes `switchroom apply`
+  // from inside the container, the CLI resolves the config file via
+  // SWITCHROOM_CONFIG — which is the CONTAINER path `/state/config/
+  // switchroom.yaml`. Without a mapping back to the host path, that
+  // container path would be emitted verbatim as the bind-mount SOURCE in
+  // the regenerated compose file. Docker then auto-creates an empty
+  // directory at `/state/config/switchroom.yaml` on the host, the broker
+  // tries to read it as a file, and crashes with EISDIR.
+  //
+  // The fix: bake the host home at apply time so the in-container CLI can
+  // translate `/state/config/switchroom.yaml` → `<host-home>/.switchroom/
+  // switchroom.yaml`. See `resolveHostSwitchroomConfigPath` in
+  // `src/cli/write-compose.ts`. Emitted unconditionally (only set when
+  // homeDir is known — the only callers that don't pass homeDir are old
+  // tests that don't exercise the container path).
+  if (hostHomeForChecks) {
+    env.SWITCHROOM_HOST_HOME = hostHomeForChecks;
+  }
   // PostHog runtime telemetry — opt-out honoured, distinct-ID propagated
   // from the host CLI so CLI + runtime events merge under the same user.
   // See docs/posthog.md (Switchroom Runtime dashboard section).
