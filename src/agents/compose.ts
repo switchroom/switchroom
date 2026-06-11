@@ -641,6 +641,44 @@ export function normalizeBindMountPath(p: string): string {
   return out;
 }
 
+/** The in-container path the config is mounted AT (also the SWITCHROOM_CONFIG
+ *  value for containerised services). Never a valid host bind SOURCE. */
+export const CONTAINER_CONFIG_PATH = "/state/config/switchroom.yaml";
+
+/**
+ * Resolve the HOST bind-mount source for the switchroom.yaml config mount.
+ *
+ * `switchroomConfigPath` is the path the *running generator* reads its config
+ * from. On the host that's the real host path; but when `apply` runs INSIDE a
+ * container (the hostd `/update apply` path) it's the in-container path
+ * `/state/config/switchroom.yaml` — which is NOT a host path. Emitting it as a
+ * bind source makes docker auto-create an empty host directory, so the broker
+ * reads a directory and dies with EISDIR (the 2026-06-11 fleet outage).
+ *
+ * A bind source must live on the host filesystem. Any path under `/state/`
+ * (the container-only state tree, including the config-mount target itself)
+ * can never be a host source, so it's replaced with the canonical host config
+ * `<homePrefix>/.switchroom/switchroom.yaml` — the same `homePrefix` every
+ * other mount uses, correct whether the generator runs on the host or in a
+ * container. A genuine custom HOST path is passed through untouched. Returns
+ * `undefined` when no config path was given (back-compat: no config mount).
+ * Pure — no IO.
+ */
+export function resolveConfigMountSource(
+  switchroomConfigPath: string | undefined,
+  homePrefix: string,
+): string | undefined {
+  if (!switchroomConfigPath) return undefined;
+  // `/state/...` is the in-container state mount — never a host source.
+  if (
+    switchroomConfigPath === CONTAINER_CONFIG_PATH ||
+    switchroomConfigPath.startsWith("/state/")
+  ) {
+    return `${homePrefix}/.switchroom/switchroom.yaml`;
+  }
+  return switchroomConfigPath;
+}
+
 /**
  * Validate one entry from an agent's `bind_mounts:` list. Returns the
  * resolved (source, target, mode) on success; throws a descriptive
@@ -785,7 +823,20 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // sudo-bake works), but the existsSync probe must use the real host
   // home. Falls back to process.env.HOME when no homeDir is passed.
   const hostHomeForChecks = opts.homeDir ?? process.env.HOME ?? "";
-  const switchroomConfigPath = opts.switchroomConfigPath;
+  // The config mount SOURCE must be a HOST path — docker bind-mounts it off the
+  // host filesystem. `opts.switchroomConfigPath` is where the RUNNING generator
+  // reads ITS config, which is the in-CONTAINER path `/state/config/
+  // switchroom.yaml` when `apply` runs inside a container (the hostd
+  // `/update apply` path). Emitting that container path as a bind source made
+  // docker auto-create an empty host directory → the brokers read a directory
+  // → `EISDIR` crash-loop → every agent stuck "Created" (the 2026-06-11 fleet
+  // outage). Sanitise here so no caller — host or container — can poison the
+  // mount: a `/state/...` container-only path is replaced with the canonical
+  // host config under `homePrefix`, the same prefix every other mount uses.
+  const switchroomConfigPath = resolveConfigMountSource(
+    opts.switchroomConfigPath,
+    homePrefix,
+  );
   // Bundled-skills pool dir. Default to the live resolver so production
   // calls Just Work; tests pass an explicit path (or "") to override.
   const bundledSkillsPoolDir = opts.bundledSkillsPoolDir ?? getBundledSkillsPoolDir();

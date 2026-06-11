@@ -28,6 +28,8 @@ import {
   AGENT_UID_MIN,
   AGENT_UID_MAX,
   describeAgents,
+  resolveConfigMountSource,
+  CONTAINER_CONFIG_PATH,
 } from "../../src/agents/compose.js";
 import type { SwitchroomConfig } from "../../src/config/schema.js";
 
@@ -121,6 +123,52 @@ describe("assertNoAgentUidCollision — sec WS6-F4 (#1419)", () => {
     expect(() =>
       generateCompose({ config: makeConfig({ klanker: {}, bob: {} }) }),
     ).not.toThrow();
+  });
+});
+
+describe("resolveConfigMountSource — config bind source must be a HOST path (2026-06-11 outage)", () => {
+  const HOME = "/home/op";
+  const CANON = `${HOME}/.switchroom/switchroom.yaml`;
+
+  it("undefined → undefined (back-compat: no config mount)", () => {
+    expect(resolveConfigMountSource(undefined, HOME)).toBeUndefined();
+  });
+  it("a real host path passes through untouched", () => {
+    expect(resolveConfigMountSource(CANON, HOME)).toBe(CANON);
+    expect(resolveConfigMountSource("/home/op/custom/switchroom.yaml", HOME)).toBe("/home/op/custom/switchroom.yaml");
+  });
+  it("the in-container config path → canonical host path (the bug: apply run inside a container)", () => {
+    expect(resolveConfigMountSource(CONTAINER_CONFIG_PATH, HOME)).toBe(CANON);
+    expect(resolveConfigMountSource("/state/config/switchroom.yaml", HOME)).toBe(CANON);
+  });
+  it("any /state/… container path → canonical host path", () => {
+    expect(resolveConfigMountSource("/state/whatever.yaml", HOME)).toBe(CANON);
+  });
+});
+
+describe("generateCompose config mount is never a container path", () => {
+  it("rewrites a container-path switchroomConfigPath to the host source (broker/kernel/auth-broker)", () => {
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      // Simulate `apply` running inside a container: the running process reads
+      // its config from the in-container path. This must NOT leak into a bind
+      // source — that auto-created an empty host dir → EISDIR broker crash.
+      switchroomConfigPath: "/state/config/switchroom.yaml",
+    });
+    // No bind line uses the container path as a SOURCE…
+    expect(yaml).not.toMatch(/- \/state\/config\/switchroom\.yaml:\/state\/config\/switchroom\.yaml/);
+    // …and the config IS mounted from the canonical host path.
+    expect(yaml).toContain("/home/op/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro");
+  });
+
+  it("preserves a genuine host switchroomConfigPath as the source", () => {
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      switchroomConfigPath: "/home/op/.switchroom/switchroom.yaml",
+    });
+    expect(yaml).toContain("/home/op/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro");
   });
 });
 
