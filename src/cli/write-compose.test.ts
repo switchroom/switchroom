@@ -107,9 +107,9 @@ describe("resolveHostSwitchroomConfigPath", () => {
     // This is the core regression guard: when running inside docker with
     // SWITCHROOM_HOST_HOME set, the container path must become the host path.
     process.env.SWITCHROOM_RUNTIME = "docker";
-    process.env.SWITCHROOM_HOST_HOME = "/home/kenthompson";
+    process.env.SWITCHROOM_HOST_HOME = "/home/testop";
     expect(resolveHostSwitchroomConfigPath("/state/config/switchroom.yaml"))
-      .toBe("/home/kenthompson/.switchroom/switchroom.yaml");
+      .toBe("/home/testop/.switchroom/switchroom.yaml");
   });
 
   it("preserves non-/state/config/ paths inside a container (explicit --config bind-mount)", () => {
@@ -117,7 +117,7 @@ describe("resolveHostSwitchroomConfigPath", () => {
     // path passes it via --config. It starts with '/mnt/...' not '/state/config/',
     // so the translator must leave it alone.
     process.env.SWITCHROOM_RUNTIME = "docker";
-    process.env.SWITCHROOM_HOST_HOME = "/home/kenthompson";
+    process.env.SWITCHROOM_HOST_HOME = "/home/testop";
     expect(resolveHostSwitchroomConfigPath("/mnt/host/switchroom.yaml"))
       .toBe("/mnt/host/switchroom.yaml");
   });
