@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.15.5 — ship every agent hook script into the image (turn-pacing 127 fix)
+
+A one-fix release closing the last loose end from the v0.15.4 batch.
+
+### Agent image ships ALL bin hook scripts (#2281)
+
+- `#2273` added `bin/turn-pacing-hook.sh` and wired it into the agent's
+  `UserPromptSubmit` hooks (via `DOCKER_BIN_PATH`) but never added the matching
+  `COPY` line to `Dockerfile.agent` — so the script was absent from the image
+  and the hook exec-failed `127` **every turn, fleet-wide**, losing the
+  turn-pacing directive and logging a 🔴 `hook:turn-pacing::env exited 127`
+  per turn (surfaced as "Finn · 1 issue" on the status board).
+- Fix: replace the drifting explicit per-script `COPY bin/<name>-hook.sh` list
+  with a single `COPY bin/*.sh /opt/switchroom/bin/` glob (+ `chmod +x`), so
+  any hook script the scaffold references is shipped by construction.
+- New build-gate regression guard (`tests/docker/dockerfile-agent-bakes.test.ts`)
+  cross-references every `join(DOCKER_BIN_PATH, "<x>.sh")` reference in
+  `scaffold.ts` against the Dockerfile — a referenced-but-unshipped hook now
+  fails the build instead of the fleet.
+
 ## v0.15.4 — fleet-outage root-cause fixes + /model picker UX + spool de-spam
 
 The headline is **two fleet-killer class bugs**, both root-caused and fixed in
