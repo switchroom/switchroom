@@ -6609,7 +6609,7 @@ if (!STATIC) {
     // promise EXPLICITLY (honest failure) instead of letting it sit
     // forever. This is what makes the guarantee deterministic: every
     // queued message ends either delivered or visibly retracted.
-    inboundSpool?.sweepEscalations((e) => {
+    inboundSpool?.sweepEscalations((e, { postNotice }) => {
       const chat = e.msg.chatId
       const escThread =
         typeof e.msg.meta?.threadId === 'string' && e.msg.meta.threadId
@@ -6620,7 +6620,14 @@ if (!STATIC) {
       // the message is being declared undeliverable, so the queued-status must
       // not dangle beside the "couldn't deliver" notice (idempotent best-effort;
       // a normal turn-start/turn-end reaps far sooner — this is the 15-min edge).
+      // Reaping happens for EVERY dropped entry; only the user-facing notice is
+      // coalesced (postNotice), so a burst of undeliverable inbounds doesn't
+      // leave dangling placeholders even when its notice is suppressed.
       reapQueuedStatus(chat, escThread)
+      // Coalesced per chat by the spool's sliding window — a multi-restart
+      // outage that re-ages a synthetic into the bound every 15 min posts ONE
+      // notice, not one per cycle (the 2026-06-09 marko "please resend" spam).
+      if (!postNotice) return
       void swallowingApiCall(
         () =>
           bot.api.sendMessage(

@@ -285,6 +285,107 @@ describe('inbound-spool — bounded escalation (promise always resolved)', () =>
   })
 })
 
+describe('inbound-spool — give-up notice coalescing (2026-06-09 marko spam)', () => {
+  // Helper: drive a sweep, return the list of postNotice flags per dropped entry.
+  function sweepFlags(s: ReturnType<typeof createInboundSpool>): boolean[] {
+    const flags: boolean[] = []
+    s.sweepEscalations((_e, { postNotice }) => flags.push(postNotice))
+    return flags
+  }
+
+  it('a burst of undeliverable entries in one chat posts exactly ONE notice', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({
+      path: PATH, fs, now: () => t,
+      escalateAfterMs: 100, escalateNoticeCooldownMs: 10_000,
+    })
+    // Three synthetics, same chat, distinct ids (fresh ts → distinct spoolId,
+    // the exact churn shape that produced the spam).
+    s.put('marko', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    s.put('marko', msg({ messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    s.put('marko', msg({ messageId: 0, ts: 3, meta: { source: 'cron' } }))
+    t = 1000 // all older than the 100ms bound
+    const flags = sweepFlags(s)
+    expect(flags.length).toBe(3) // all three dropped (promise retracted)
+    expect(flags.filter(Boolean).length).toBe(1) // ONE notice posted
+    expect(s.liveCount()).toBe(0)
+  })
+
+  it('distinct chats each get their own notice', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({ path: PATH, fs, now: () => t, escalateAfterMs: 100 })
+    s.put('marko', msg({ chatId: 'A', messageId: 1 }))
+    s.put('marko', msg({ chatId: 'B', messageId: 2 }))
+    t = 1000
+    expect(sweepFlags(s).filter(Boolean).length).toBe(2)
+  })
+
+  it('same chat, different forum topics are coalesced independently', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({ path: PATH, fs, now: () => t, escalateAfterMs: 100 })
+    s.put('marko', msg({ chatId: 'A', messageId: 1, meta: { threadId: '3' } }))
+    s.put('marko', msg({ chatId: 'A', messageId: 2, meta: { threadId: '4' } }))
+    t = 1000
+    expect(sweepFlags(s).filter(Boolean).length).toBe(2)
+  })
+
+  it('THE BUG: the coalescing window survives a restart — a re-aged synthetic does not re-spam', () => {
+    const fs = fakeFs()
+    let t = 0
+    const opts = { escalateAfterMs: 100, escalateNoticeCooldownMs: 60_000 }
+    // Boot 1: one synthetic ages out → posts the notice.
+    const s1 = createInboundSpool({ path: PATH, fs, now: () => t, ...opts })
+    s1.put('marko', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    t = 1000
+    expect(sweepFlags(s1)).toEqual([true])
+    // Restart. A NEW synthetic (fresh ts → fresh id) lands and ages out within
+    // the cooldown. Pre-fix this re-posted every cycle across restarts.
+    t = 5000
+    const s2 = createInboundSpool({ path: PATH, fs, now: () => t, ...opts })
+    s2.put('marko', msg({ messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    t = 6000
+    expect(sweepFlags(s2)).toEqual([false]) // dropped, but notice SUPPRESSED
+  })
+
+  it('compaction preserves the coalescing window (a post-compaction restart does not re-spam)', () => {
+    const fs = fakeFs()
+    let t = 0
+    // Tiny compact threshold so the next append triggers a rewrite.
+    const opts = { escalateAfterMs: 100, escalateNoticeCooldownMs: 60_000, compactAtBytes: 1 }
+    const s1 = createInboundSpool({ path: PATH, fs, now: () => t, ...opts })
+    s1.put('marko', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    t = 1000
+    expect(sweepFlags(s1)).toEqual([true]) // posts + appends esc; compaction runs
+    // After compaction the file must still carry the esc record → a restart
+    // hydrates the window → a new re-aged synthetic stays suppressed.
+    t = 5000
+    const s2 = createInboundSpool({ path: PATH, fs, now: () => t, ...opts })
+    s2.put('marko', msg({ messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    t = 6000
+    expect(sweepFlags(s2)).toEqual([false])
+  })
+
+  it('re-notifies after the burst goes quiet for longer than the cooldown', () => {
+    const fs = fakeFs()
+    let t = 0
+    const s = createInboundSpool({
+      path: PATH, fs, now: () => t,
+      escalateAfterMs: 100, escalateNoticeCooldownMs: 1000,
+    })
+    s.put('marko', msg({ messageId: 0, ts: 1, meta: { source: 'cron' } }))
+    t = 200
+    expect(sweepFlags(s)).toEqual([true]) // first notice
+    // Quiet gap longer than the cooldown, then a new stuck synthetic.
+    t = 5000
+    s.put('marko', msg({ messageId: 0, ts: 2, meta: { source: 'cron' } }))
+    t = 5200
+    expect(sweepFlags(s)).toEqual([true]) // genuinely new situation → re-notify
+  })
+})
+
 describe('inbound-spool — robustness', () => {
   it('a failing appendFileSync does not throw and keeps in-memory live state', () => {
     const fs = fakeFs()
