@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.15.4 — fleet-outage root-cause fixes + /model picker UX + spool de-spam
+
+The headline is **two fleet-killer class bugs**, both root-caused and fixed in
+layers. When `apply` runs inside a container (the hostd `/update apply` path),
+the compose generator was emitting in-container paths as bind-mount SOURCES —
+docker auto-created empty dirs on the host, so brokers crashed (EISDIR) and
+agents exec-failed (`start.sh` missing → 127). Twice on 2026-06-11/12.
+
+### Compose generation is container-context-safe (#2275, #2276, #2279)
+
+- **#2279 (the root cause)**: hostd now exports `SWITCHROOM_HOST_HOME` (the
+  real host home) so an in-container `apply` resolves host bind sources
+  correctly — previously `homedir()` returned `/host-home` (the mount point)
+  and poisoned every source, self-perpetuating by re-baking `/host-home` into
+  the fleet. Plus a generator **backstop** that refuses to emit `/host-home`
+  as a bind source, failing loud with the recovery path instead of generating
+  a fleet-killing compose. Guards every caller, forever.
+- **#2275 / #2276**: the same fix for the config-file mount specifically —
+  a `/state/config/…` container path is rewritten to the canonical host path
+  (caller-side translation + a generator guard).
+
+### /model picker UX (#2270, #2271)
+
+- The picker never leaves a dead menu: a mid-turn tap is an instant toast that
+  keeps the buttons; every outcome re-renders the menu with a status banner
+  (✅ set / ❌ failed / ℹ️ already), so a switch never collapses to a
+  button-less line.
+- Tapping the ✔ row actually switches the live session (the ✔ marks the
+  default-for-new-sessions, not the running model), and `/status` now reflects
+  the live session-model override so the two surfaces agree.
+
+### Inbound-spool give-up de-spam (#2278)
+
+The durable spool's "couldn't deliver — please resend" notice is now coalesced
+per chat on a persisted sliding window: a burst of undeliverable inbounds
+(e.g. a synthetic re-aged every 15 min across restarts during an outage) posts
+**one** notice, not one per cycle — and the window survives restarts.
+
+### Context diet (#2273, #2274)
+
+- Turn-pacing and workspace-dynamic UserPromptSubmit hooks are gated to
+  inject-on-change (#2273); the always-injected `HEARTBEAT.md` workspace file
+  is removed (#2274).
+
 ## v0.15.3 — failover trusts live quota; /model dashboard; root agent docker CLI (#2265, #2263, #2262, #2264)
 
 ### Failover: live quota is authoritative over stale exhaustion marks (#2265)
