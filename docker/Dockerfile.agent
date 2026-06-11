@@ -171,11 +171,17 @@ WORKDIR /
 COPY telegram-plugin/start.js /opt/switchroom/telegram-plugin/start.js
 COPY telegram-plugin/package.json /opt/switchroom/telegram-plugin/package.json
 COPY telegram-plugin/hooks /opt/switchroom/telegram-plugin/hooks
-COPY bin/run-hook.sh /opt/switchroom/bin/run-hook.sh
-COPY bin/timezone-hook.sh /opt/switchroom/bin/timezone-hook.sh
-COPY bin/user-profile-refresh-hook.sh /opt/switchroom/bin/user-profile-refresh-hook.sh
-COPY bin/workspace-stable-hook.sh /opt/switchroom/bin/workspace-stable-hook.sh
-COPY bin/workspace-dynamic-hook.sh /opt/switchroom/bin/workspace-dynamic-hook.sh
+# Copy ALL bin/ shell scripts as a glob, not an explicit per-script list.
+# An explicit list silently drops any newly-added script: #2273 added
+# bin/turn-pacing-hook.sh (referenced UNCONDITIONALLY by the agent's
+# turn-pacing UserPromptSubmit hook) but no COPY line, so the script was
+# absent from the image and the hook exec-failed 127 every turn, fleet-wide
+# (lost turn-pacing directive + a 🔴 issue per turn). handoff-briefing.sh and
+# boot-self-test.sh were missing the same way (silently, behind command-v/-x
+# guards). The glob includes every current AND future hook script, so this
+# "added a script, forgot the COPY" regression class cannot recur. All are
+# small agent-runtime shell scripts; none are secrets.
+COPY bin/*.sh /opt/switchroom/bin/
 RUN chmod +x /opt/switchroom/bin/*.sh
 
 # ─── Frequently-changed dist COPYs (LAST, only these bust on src-only PRs) ───
