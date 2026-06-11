@@ -102,14 +102,31 @@ export function spoolId(msg: InboundMessage): string {
 }
 
 interface SpoolRecord {
-  t: 'put' | 'ack'
-  id: string
+  t: 'put' | 'ack' | 'esc'
+  /** Present on `put`/`ack` (spoolId). Absent on `esc`. */
+  id?: string
   /** Present only on `put`. The full inbound to replay. */
   msg?: InboundMessage
   /** Present only on `put`. Owning agent (replay re-pushes per agent). */
   agent?: string
   /** Present only on `put`. ms epoch first-spooled — drives escalation. */
   firstAt?: number
+  /** Present only on `esc` — the chat the give-up notice was/would be
+   *  posted to, and when. Durably records the per-chat escalation-notice
+   *  window so a burst of undeliverable inbounds (or a multi-restart
+   *  outage) produces ONE "couldn't deliver" notice per chat, not one
+   *  per dropped entry. */
+  chat?: string | number
+  thread?: string
+  at?: number
+}
+
+/** Stable per-(chat,thread) key for coalescing give-up notices. */
+function escChatKey(msg: InboundMessage): string {
+  const threadRaw = msg.meta?.threadId
+  const thread =
+    typeof threadRaw === 'string' && threadRaw.length > 0 ? threadRaw : '-'
+  return `${msg.chatId}:${thread}`
 }
 
 export interface InboundSpoolFsSeam {
@@ -134,6 +151,14 @@ export interface InboundSpoolOptions {
   escalateAfterMs?: number
   /** Rewrite-compact the JSONL once it exceeds this. Default 256 KiB. */
   compactAtBytes?: number
+  /** Coalescing window for the user-facing "couldn't deliver" notice,
+   *  per chat. The window SLIDES on every escalation attempt (posted or
+   *  suppressed), so a sustained burst posts exactly one notice and only
+   *  re-notifies after the burst goes quiet for this long. Must exceed
+   *  the rate at which undeliverable entries age out (the 15-min
+   *  `escalateAfterMs` here) or back-to-back attempts wouldn't coalesce.
+   *  Default 30 min. */
+  escalateNoticeCooldownMs?: number
 }
 
 export interface ReplayEntry {
@@ -165,10 +190,20 @@ export interface InboundSpool {
    *  finished could land on top of the handback turn. Tombstones the
    *  dropped entries durably. */
   dropMatching: (predicate: (id: string) => boolean) => number
-  /** Escalate+drop entries older than `escalateAfterMs`. Calls
-   *  `onEscalate` once per dropped entry (post the "couldn't deliver"
-   *  card there). Returns the count escalated. Safe to call on a timer. */
-  sweepEscalations: (onEscalate: (e: ReplayEntry) => void) => number
+  /** Escalate+drop entries older than `escalateAfterMs`. Every dropped
+   *  entry is tombstoned (the promise is retracted deterministically),
+   *  but the user-facing notice is COALESCED per chat: `onEscalate` is
+   *  called for every dropped entry with `postNotice` indicating whether
+   *  to actually post the "couldn't deliver" card. `postNotice` is true
+   *  only for the first escalation to a given chat within
+   *  `escalateNoticeCooldownMs` — a burst of undeliverable inbounds (e.g.
+   *  a synthetic re-created every 15 min while the agent is down, across
+   *  restarts) yields ONE notice, not one per entry. The window is
+   *  persisted, so it holds across a gateway restart. Returns the count
+   *  of entries dropped. Safe to call on a timer. */
+  sweepEscalations: (
+    onEscalate: (e: ReplayEntry, opts: { postNotice: boolean }) => void,
+  ) => number
   /** Test/observability: count of live (un-acked) ids. */
   liveCount: () => number
 }
@@ -179,11 +214,18 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   const log = opts.log ?? ((l: string) => process.stderr.write(l))
   const escalateAfterMs = opts.escalateAfterMs ?? 15 * 60 * 1000
   const compactAtBytes = opts.compactAtBytes ?? 256 * 1024
+  const escalateNoticeCooldownMs = opts.escalateNoticeCooldownMs ?? 30 * 60 * 1000
 
   // In-memory projection of the on-disk log, rebuilt from the file at
   // construction. `live` maps spoolId → the put record (insertion order
   // preserved via the Map). An `ack` deletes from `live`.
   const live = new Map<string, { agent: string; msg: InboundMessage; firstAt: number }>()
+  // Per-chat last escalation-ATTEMPT time (posted or suppressed). Drives
+  // the sliding coalescing window so a burst of give-up escalations posts
+  // one notice. Rebuilt from durable `esc` records at construction so the
+  // window survives a gateway restart (the actual 2026-06-09 spam: a
+  // synthetic re-aged into the bound every 15 min across many restarts).
+  const escAttemptByChat = new Map<string, number>()
 
   function parseLine(line: string): SpoolRecord | null {
     const s = line.trim()
@@ -196,7 +238,13 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     }
     if (rec == null || typeof rec !== 'object') return null
     const r = rec as Record<string, unknown>
-    if (r.t !== 'put' && r.t !== 'ack') return null
+    if (r.t !== 'put' && r.t !== 'ack' && r.t !== 'esc') return null
+    if (r.t === 'esc') {
+      // esc records key on chat, not a spoolId.
+      if (typeof r.chat !== 'string' && typeof r.chat !== 'number') return null
+      if (typeof r.at !== 'number') return null
+      return r as unknown as SpoolRecord
+    }
     if (typeof r.id !== 'string' || r.id.length === 0) return null
     if (r.t === 'put') {
       if (r.msg == null || typeof r.msg !== 'object') return null
@@ -209,6 +257,7 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   // Rebuild `live` from the file. Tolerates a torn last line.
   function hydrate(): void {
     live.clear()
+    escAttemptByChat.clear()
     if (!fs.existsSync(path)) return
     let raw = ''
     try {
@@ -221,13 +270,17 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
       if (rec == null) continue
       if (rec.t === 'put') {
         // Last put for an id wins; an ack later removes it.
-        live.set(rec.id, {
+        live.set(rec.id as string, {
           agent: rec.agent as string,
           msg: rec.msg as InboundMessage,
           firstAt: rec.firstAt as number,
         })
+      } else if (rec.t === 'esc') {
+        // Last escalation-attempt time per chat wins (records are in
+        // append order). Restores the sliding window across a restart.
+        escAttemptByChat.set(`${rec.chat}:${rec.thread ?? '-'}`, rec.at as number)
       } else {
-        live.delete(rec.id)
+        live.delete(rec.id as string)
       }
     }
   }
@@ -267,6 +320,22 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
     for (const [id, e] of live) {
       lines.push(
         JSON.stringify({ t: 'put', id, agent: e.agent, msg: e.msg, firstAt: e.firstAt } satisfies SpoolRecord),
+      )
+    }
+    // Preserve the latest escalation-attempt time per chat so the sliding
+    // coalescing window isn't reset by compaction (which would let the next
+    // burst re-spam). One record per chat — bounded by the chat count.
+    for (const [key, at] of escAttemptByChat) {
+      const sep = key.lastIndexOf(':')
+      const chat = key.slice(0, sep)
+      const thread = key.slice(sep + 1)
+      lines.push(
+        JSON.stringify({
+          t: 'esc',
+          chat,
+          ...(thread !== '-' ? { thread } : {}),
+          at,
+        } satisfies SpoolRecord),
       )
     }
     const tmp = path + '.compact.tmp'
@@ -328,24 +397,46 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
       return n
     },
     sweepEscalations(onEscalate) {
-      const cutoff = now() - escalateAfterMs
-      let n = 0
+      const tNow = now()
+      const cutoff = tNow - escalateAfterMs
+      let dropped = 0
+      let posted = 0
       for (const [id, e] of [...live.entries()]) {
         if (e.firstAt > cutoff) continue
         live.delete(id)
         appendRecord({ t: 'ack', id }) // tombstone — promise retracted
+        // Coalesce the user-facing notice per chat on a SLIDING window:
+        // post only when the last attempt to this chat was longer ago than
+        // the cooldown; every attempt (posted or not) slides the window, so
+        // a sustained burst stays quiet after the first notice and only
+        // re-notifies once the burst goes quiet. Durable via `esc` records.
+        const key = escChatKey(e.msg)
+        const lastAttempt = escAttemptByChat.get(key)
+        const postNotice =
+          lastAttempt === undefined || tNow - lastAttempt >= escalateNoticeCooldownMs
+        escAttemptByChat.set(key, tNow)
+        const threadRaw = e.msg.meta?.threadId
+        const thread =
+          typeof threadRaw === 'string' && threadRaw.length > 0 ? threadRaw : undefined
+        appendRecord({ t: 'esc', chat: e.msg.chatId, thread, at: tNow })
         try {
-          onEscalate({ agent: e.agent, msg: e.msg })
+          onEscalate({ agent: e.agent, msg: e.msg }, { postNotice })
         } catch (err) {
           log(`inbound-spool: onEscalate threw id=${id}: ${(err as Error).message}\n`)
         }
-        n++
+        if (postNotice) posted++
+        dropped++
       }
-      if (n > 0) {
-        log(`inbound-spool: escalated+dropped ${n} undelivered entr${n === 1 ? 'y' : 'ies'} (older than ${escalateAfterMs}ms)\n`)
+      if (dropped > 0) {
+        const suppressed = dropped - posted
+        log(
+          `inbound-spool: escalated+dropped ${dropped} undelivered entr${dropped === 1 ? 'y' : 'ies'} ` +
+          `(older than ${escalateAfterMs}ms; ${posted} notice${posted === 1 ? '' : 's'} posted` +
+          `${suppressed > 0 ? `, ${suppressed} coalesced` : ''})\n`,
+        )
         maybeCompact()
       }
-      return n
+      return dropped
     },
     liveCount() {
       return live.size
