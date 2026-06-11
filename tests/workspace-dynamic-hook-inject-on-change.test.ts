@@ -12,9 +12,7 @@ import { join, resolve } from "node:path";
  *  - Second turn of same session suppresses (same hash, same session)
  *  - Content change re-emits
  *  - New session re-emits
- *  - HEARTBEAT.md is suppressed when prompt has no "heartbeat" and HB unchanged
- *  - HEARTBEAT.md is included when prompt contains "heartbeat"
- *  - HEARTBEAT.md is included when HB content changed
+ *  - HEARTBEAT.md (if present on disk) is never emitted by the hook
  *  - Corrupted / missing state dir falls back to emit (fail-open)
  */
 
@@ -179,132 +177,32 @@ describe("workspace-dynamic-hook.sh (inject-on-change mode)", () => {
     expect(c.stdout).toContain("stable content");
   }, 10_000);
 
-  it("HEARTBEAT.md is suppressed when prompt has no 'heartbeat' keyword and HB unchanged", () => {
-    const fakeAgentDir = join(tmp, "agent");
-    const wsDir = join(fakeAgentDir, "workspace");
-    mkdirSync(wsDir, { recursive: true });
-    writeFileSync(join(wsDir, "MEMORY.md"), "mem");
-    const hbPath = join(wsDir, "HEARTBEAT.md");
-    writeFileSync(hbPath, "intentions: work on stuff");
-
-    const hbSection = `## ${wsDir}/HEARTBEAT.md\nintentions: work on stuff\n`;
-    const payload = `# Project Context (dynamic workspace files)\n\n## ${wsDir}/MEMORY.md\nmem\n\n${hbSection}`;
-    makeShim(shimDir, payload);
-
-    // First turn: HEARTBEAT included (new session)
-    const a = runHook({
-      cacheDir, shimDir, stateDir,
-      agentDirOverride: fakeAgentDir,
-      sessionId: "session-A",
-      prompt: "hey what are you working on",
-    });
-    expect(a.exitCode).toBe(0);
-    // First turn emits everything
-    expect(a.stdout).toContain("mem");
-
-    // Second turn same session: HEARTBEAT unchanged + prompt not heartbeat → HB stripped
-    const b = runHook({
-      cacheDir, shimDir, stateDir,
-      agentDirOverride: fakeAgentDir,
-      sessionId: "session-A",
-      prompt: "regular message",
-    });
-    // Either completely suppressed (mem already seen) or HB stripped — in either
-    // case, HEARTBEAT content must not appear
-    if (b.stdout !== "") {
-      expect(b.stdout).not.toContain("intentions: work on stuff");
-    }
-  });
-
-  it("HEARTBEAT.md is included when prompt contains 'heartbeat' (case-insensitive)", () => {
-    const fakeAgentDir = join(tmp, "agent");
-    const wsDir = join(fakeAgentDir, "workspace");
-    mkdirSync(wsDir, { recursive: true });
-    writeFileSync(join(wsDir, "MEMORY.md"), "mem");
-    const hbPath = join(wsDir, "HEARTBEAT.md");
-    writeFileSync(hbPath, "intentions: work on stuff");
-
-    const hbSection = `## ${wsDir}/HEARTBEAT.md\nintentions: work on stuff\n`;
-    const payload = `# Project Context (dynamic workspace files)\n\n## ${wsDir}/MEMORY.md\nmem\n\n${hbSection}`;
-    makeShim(shimDir, payload);
-
-    // First turn emits everything to seed state
-    runHook({
-      cacheDir, shimDir, stateDir,
-      agentDirOverride: fakeAgentDir,
-      sessionId: "session-hb",
-      prompt: "regular message",
-    });
-
-    // Second turn with heartbeat keyword — must include HEARTBEAT even if it didn't change
-    const b = runHook({
-      cacheDir, shimDir, stateDir,
-      agentDirOverride: fakeAgentDir,
-      sessionId: "session-hb",
-      prompt: "HEARTBEAT check",
-    });
-    expect(b.exitCode).toBe(0);
-    // The full payload should be emitted (not suppressed by session check because
-    // session-state suppression is for the entire workspace block, and HEARTBEAT
-    // gating only strips the section when NOT a heartbeat prompt)
-    // At minimum: HEARTBEAT content must appear if the full block is emitted.
-    // (session-state may suppress the whole block on second turn; the key
-    // invariant is that HEARTBEAT is NOT stripped when prompt matches)
-    // This test verifies no HEARTBEAT stripping occurs when the prompt matches.
-    // We verify this by checking that if output is non-empty, HB section is present.
-    if (b.stdout !== "") {
-      expect(b.stdout).toContain("intentions: work on stuff");
-    }
-  });
-
-  it("BLOCKER 2 regression: fast-path (fresh cache) strips HEARTBEAT on non-heartbeat prompt with unchanged HB", async () => {
-    // This test guards the BLOCKER 2 fix: before the fix, the fast-path (lines
-    // ~108-153) would cat BODY_FILE and exit 0 WITHOUT applying heartbeat
-    // stripping, so HEARTBEAT.md was emitted every turn in the common case.
-
-    const fakeAgentDir = join(tmp, "agent-hb-fast");
+  it("HEARTBEAT.md on disk is never emitted — the dynamic hook no longer renders it", () => {
+    // HEARTBEAT.md was removed from DYNAMIC_BOOTSTRAP_FILENAMES in switchroom.
+    // Even if an agent has a stale HEARTBEAT.md on disk, the workspace renderer
+    // will not include it in dynamic output and the hook must not emit it.
+    const fakeAgentDir = join(tmp, "agent-hb-removed");
     const wsDir = join(fakeAgentDir, "workspace");
     mkdirSync(wsDir, { recursive: true });
     writeFileSync(join(wsDir, "MEMORY.md"), "mem content");
-    const hbPath = join(wsDir, "HEARTBEAT.md");
-    writeFileSync(hbPath, "intentions: stay focused");
+    // Place a stale HEARTBEAT.md on disk (orphan from before the removal).
+    writeFileSync(join(wsDir, "HEARTBEAT.md"), "intentions: this should never appear");
 
-    const hbSection = `## ${wsDir}/HEARTBEAT.md\nintentions: stay focused\n`;
-    const payload = `# Project Context\n\n## ${wsDir}/MEMORY.md\nmem content\n\n${hbSection}`;
+    // Shim emits only MEMORY.md — as the real renderer would after the removal.
+    const payload = `# Project Context (dynamic workspace files)\n\n## ${wsDir}/MEMORY.md\nmem content\n`;
     makeShim(shimDir, payload);
 
-    // Turn 1: first turn for this session — seeds both ws-dynamic and ws-heartbeat state.
-    const a = runHook({
+    const r = runHook({
       cacheDir, shimDir, stateDir,
       agentDirOverride: fakeAgentDir,
-      sessionId: "session-fast-hb",
-      prompt: "regular message",
+      sessionId: "session-no-hb",
+      prompt: "HEARTBEAT check",
     });
-    expect(a.exitCode).toBe(0);
-    // First turn always emits (no prior state).
-
-    // Now wait for BODY_FILE to be newer than the workspace sources so
-    // the mtime fast-path fires on the next turn. The hook writes BODY_FILE
-    // after a fresh render, but we need it newer than MEMORY.md and HEARTBEAT.md.
-    // Touch the files with an older timestamp to ensure the fast-path is taken.
-    // Use 2s sleep to guarantee mtime difference.
-    await new Promise((r) => setTimeout(r, 1100));
-
-    // Turn 2: same session, same prompt (no heartbeat keyword), HEARTBEAT unchanged.
-    // The fast-path should take over (BODY_FILE is fresh), BUT heartbeat must be stripped.
-    const b = runHook({
-      cacheDir, shimDir, stateDir,
-      agentDirOverride: fakeAgentDir,
-      sessionId: "session-fast-hb",
-      prompt: "a regular message without hb keyword",
-    });
-    expect(b.exitCode).toBe(0);
-    // Either fully suppressed (ws-dynamic session check) OR HEARTBEAT stripped.
-    // Either way, HEARTBEAT content must NOT appear.
-    if (b.stdout !== "") {
-      expect(b.stdout).not.toContain("intentions: stay focused");
-    }
-  }, 10_000);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("mem content");
+    expect(r.stdout).not.toContain("this should never appear");
+    expect(r.stdout).not.toContain("HEARTBEAT.md");
+  });
 
   it("legacy mode (inject_on_change=0) emits every turn", () => {
     const payload = "# Project Context (dynamic workspace files)\n\n## MEMORY.md\nlegacy content\n";

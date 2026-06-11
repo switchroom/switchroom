@@ -602,7 +602,7 @@ export const TelegramChannelSchema = z
       .optional()
       .describe(
         "If true, the stable workspace prefix (AGENTS.md, SOUL.md, USER.md, " +
-        "IDENTITY.md, TOOLS.md, HEARTBEAT.md) is re-injected on every turn via " +
+        "IDENTITY.md, TOOLS.md) is re-injected on every turn via " +
         "the UserPromptSubmit hook instead of baked into --append-system-prompt " +
         "at session start. Lets workspace edits propagate without a restart. " +
         "Costs ~5-10% per-turn latency/spend since the stable prefix is no " +

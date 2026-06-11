@@ -12,9 +12,8 @@
  *   change within a session, so we bake them into the system prompt where
  *   they cache nicely.
  * - **Dynamic files** (injected via UserPromptSubmit hook at the start of
- *   each turn): MEMORY.md, memory/YYYY-MM-DD.md for today and yesterday,
- *   HEARTBEAT.md. These change mid-session and need to be re-read on every
- *   turn.
+ *   each turn): MEMORY.md, memory/YYYY-MM-DD.md for today and yesterday.
+ *   These change mid-session and need to be re-read on every turn.
  *
  * Both pipelines run through `bootstrap-budget.ts` for per-file and
  * total-size cap enforcement so we don't blow through Claude Code's
@@ -43,11 +42,10 @@
  *    content that never changes mid-session.
  *
  * 3. **PER-TURN** (never cached): Workspace dynamic render (MEMORY.md,
- *    today/yesterday daily notes, HEARTBEAT.md) + Hindsight recall results.
+ *    today/yesterday daily notes) + Hindsight recall results.
  *    Injected via UserPromptSubmit hooks, which prepend to the user message.
- *    Content changes every turn (MEMORY.md edits, daily note updates,
- *    HEARTBEAT intentions), so there's no caching benefit to promoting this
- *    to the system prompt.
+ *    Content changes every turn (MEMORY.md edits, daily note updates),
+ *    so there's no caching benefit to promoting this to the system prompt.
  *
  * The ordering (stable → per-session → per-turn) ensures the longest-lived
  * content is in the prefix where it caches best, and the most volatile
@@ -72,7 +70,6 @@ import {
 import {
   DEFAULT_AGENTS_FILENAME,
   DEFAULT_BOOTSTRAP_FILENAME,
-  DEFAULT_HEARTBEAT_FILENAME,
   DEFAULT_IDENTITY_FILENAME,
   DEFAULT_MEMORY_FILENAME,
   DEFAULT_SOUL_DEFAULT_FILENAME,
@@ -104,12 +101,11 @@ export const STABLE_BOOTSTRAP_FILENAMES: WorkspaceBootstrapFileName[] = [
 
 /**
  * Files that change mid-session and belong in the UserPromptSubmit hook
- * (re-read every turn). MEMORY.md and HEARTBEAT.md are read from the
- * workspace root; daily files are read from `workspace/memory/YYYY-MM-DD.md`.
+ * (re-read every turn). MEMORY.md is read from the workspace root; daily
+ * files are read from `workspace/memory/YYYY-MM-DD.md`.
  */
 export const DYNAMIC_BOOTSTRAP_FILENAMES: WorkspaceBootstrapFileName[] = [
   DEFAULT_MEMORY_FILENAME,
-  DEFAULT_HEARTBEAT_FILENAME,
 ];
 
 export const DEFAULT_BOOTSTRAP_MAX_CHARS = 12_000;
@@ -213,7 +209,7 @@ export async function loadStableBootstrapFiles(
 }
 
 /**
- * Load the dynamic workspace bootstrap files — MEMORY.md, HEARTBEAT.md, and
+ * Load the dynamic workspace bootstrap files — MEMORY.md and
  * today/yesterday's daily note at `memory/YYYY-MM-DD.md`.
  *
  * Dates are computed against `now` (defaults to the current time) in UTC by

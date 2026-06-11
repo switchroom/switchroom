@@ -1133,7 +1133,6 @@ describe("scaffoldAgent", () => {
     expect(existsSync(join(workspaceDir, "IDENTITY.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "TOOLS.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "MEMORY.md"))).toBe(true);
-    expect(existsSync(join(workspaceDir, "HEARTBEAT.md"))).toBe(true);
     expect(existsSync(join(workspaceDir, "memory"))).toBe(true);
 
     // .hbs templates must have been rendered (not copied raw) — the file
@@ -1734,8 +1733,8 @@ describe("reconcileAgent", () => {
 
   it("seeds NEW workspace templates added to the profile after scaffold (A4a regression)", () => {
     // Sprint 2 review finding A4a: when a new release ships a new
-    // workspace bootstrap template (e.g. HEARTBEAT.md.hbs added later),
-    // reconcile must pick it up and render it into existing agents'
+    // workspace bootstrap template, reconcile must pick it up and render
+    // it into existing agents'
     // workspace directories. The earlier smoke test only proved that a
     // DELETED file gets re-seeded, not that a NEW template in the
     // profile flows through.

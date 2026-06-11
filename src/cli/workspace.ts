@@ -74,7 +74,7 @@ export function registerWorkspaceCommand(program: Command): void {
         "(used by start.sh and the UserPromptSubmit hook)",
     )
     .option("--stable", "Render only stable files (AGENTS/SOUL/USER/IDENTITY/TOOLS/BOOTSTRAP)")
-    .option("--dynamic", "Render only dynamic files (MEMORY + today/yesterday daily + HEARTBEAT)")
+    .option("--dynamic", "Render only dynamic files (MEMORY + today/yesterday daily)")
     .option(
       "--warning-mode <mode>",
       "Truncation warning mode: off | once | always | error (default: off for start.sh use)",

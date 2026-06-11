@@ -3820,7 +3820,6 @@ export function classifyChange(
   // Hot — per-turn hook re-reads
   if (relPath === "workspace/MEMORY.md") return "hot";
   if (relPath.startsWith("workspace/memory/") && relPath.endsWith(".md")) return "hot";
-  if (relPath === "workspace/HEARTBEAT.md") return "hot";
 
   // Soul files — persona identity (name, vibe, creature) is baked into
   // --append-system-prompt at session start. When hotReloadStable is true the
@@ -5427,10 +5426,9 @@ export function reconcileAgent(
   // --- Re-seed workspace bootstrap files from the profile.
   //
   //     writeIfMissing semantics mean user edits survive, but new template
-  //     files added to the profile (e.g. a HEARTBEAT.md shipped in a later
-  //     switchroom release) will be seeded on reconcile — matching scaffold
-  //     behavior. Without this call, agents scaffolded before a template
-  //     addition stay out of date until rescaffolded.
+  //     files added to the profile will be seeded on reconcile — matching
+  //     scaffold behavior. Without this call, agents scaffolded before a
+  //     template addition stay out of date until rescaffolded.
   //
   // skipProfileTemplates: `getProfilePath` resolves source-relative to
   // `<install>/profiles/<name>` and falls back to `<install>/profiles/default`;

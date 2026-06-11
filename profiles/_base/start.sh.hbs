@@ -620,8 +620,8 @@ APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuo
 # Inject AGENTS.md / SOUL.md / IDENTITY.md / USER.md / TOOLS.md /
 # BOOTSTRAP.md from the agent's workspace/ dir into --append-system-prompt.
 # These files are stable across a session, so baking them into the system
-# prompt is cache-friendly. Dynamic files (MEMORY.md, today's daily,
-# HEARTBEAT.md) are injected via the UserPromptSubmit hook, not here.
+# prompt is cache-friendly. Dynamic files (MEMORY.md, today's daily)
+# are injected via the UserPromptSubmit hook, not here.
 #
 # When channels.telegram.hotReloadStable is true, this injection moves to
 # a UserPromptSubmit hook instead (see workspace-stable-hook.sh).

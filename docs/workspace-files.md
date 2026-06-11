@@ -10,7 +10,7 @@ it belongs to.
 | Mechanism                       | Files                                                        | When it loads                  | Cache           |
 | ------------------------------- | ------------------------------------------------------------ | ------------------------------ | --------------- |
 | **Stable system-prompt render** | `AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md` | Once, at `claude` launch       | Prefix cache    |
-| **Dynamic UserPromptSubmit hook** | `MEMORY.md`, `HEARTBEAT.md`, `memory/YYYY-MM-DD.md` (today + yesterday) | Every turn                     | Never cached    |
+| **Dynamic UserPromptSubmit hook** | `MEMORY.md`, `memory/YYYY-MM-DD.md` (today + yesterday) | Every turn                     | Never cached    |
 | **Agent self-read**             | Whatever `AGENTS.md` tells the agent to read                 | Agent decides, usually turn 1  | N/A (tool call) |
 
 If you renamed a file and something broke, you probably changed mechanism
@@ -70,7 +70,6 @@ File list:
 ```ts
 export const DYNAMIC_BOOTSTRAP_FILENAMES: WorkspaceBootstrapFileName[] = [
   DEFAULT_MEMORY_FILENAME,      // MEMORY.md
-  DEFAULT_HEARTBEAT_FILENAME,   // HEARTBEAT.md
 ];
 // Plus:
 //   memory/YYYY-MM-DD.md for today
@@ -158,7 +157,6 @@ Agent processes turn
   commands
 - `BOOTSTRAP.md` — one-time startup instructions that don't fit above
 - `MEMORY.md` — long-term curated memory, updated mid-session
-- `HEARTBEAT.md` — intentions / current state for heartbeat checks
 - `memory/YYYY-MM-DD.md` — daily raw-log notes
 - `BRIEF.md` — per-agent convention; not loaded automatically; must be
   referenced in `AGENTS.md` if you want the agent to read it

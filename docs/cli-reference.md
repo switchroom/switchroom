@@ -112,7 +112,7 @@ switchroom drive connect|disconnect <agent>   # Per-agent Google Drive OAuth
 Each agent has a workspace directory
 (`~/.switchroom/agents/<name>/workspace/`) with editable stable files
 (`AGENTS.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`) and dynamic files
-(`MEMORY.md`, `memory/YYYY-MM-DD.md`, `HEARTBEAT.md`) injected into the
+(`MEMORY.md`, `memory/YYYY-MM-DD.md`) injected into the
 model's context at turn time.
 
 `SOUL.md` (the persona) is a special case since v0.12.0: it is

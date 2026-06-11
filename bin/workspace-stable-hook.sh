@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # UserPromptSubmit hook for stable workspace content (AGENTS.md, SOUL.md,
-# USER.md, IDENTITY.md, TOOLS.md, HEARTBEAT.md).
+# USER.md, IDENTITY.md, TOOLS.md).
 #
 # Used only when channels.telegram.hotReloadStable is true. In that mode,
 # the stable workspace render moves from a session-start bake into
@@ -34,7 +34,7 @@ if ! command -v switchroom >/dev/null 2>&1; then
 fi
 
 # Render the stable workspace files (AGENTS.md, SOUL.md, IDENTITY.md, USER.md,
-# TOOLS.md, HEARTBEAT.md). The render command exits 0 and returns empty string
+# TOOLS.md). The render command exits 0 and returns empty string
 # if the workspace doesn't exist or all stable files are missing/empty, so no
 # special-casing needed here.
 #
