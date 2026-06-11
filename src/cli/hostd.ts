@@ -125,6 +125,19 @@ services:
       # operator's home), so the socket paths the agent fleet sees
       # (~/.switchroom/hostd/<agent>/sock) match the paths hostd binds.
       HOME: /host-home
+      # The REAL host home path. HOME above is pinned to /host-home (the
+      # in-container mount point) for the socket-path convention, but that
+      # is NOT a host filesystem path. When hostd shells out \`switchroom
+      # apply\` / \`agent restart\`, the compose generator must emit HOST
+      # paths as bind-mount SOURCES — homedir() inside here returns
+      # /host-home, which docker would auto-create as empty dirs on the
+      # host (start.sh missing → every agent exec-fails 127; broker EISDIR
+      # — the 2026-06-11/12 fleet outages). SWITCHROOM_HOST_HOME is the
+      # generator's authoritative host home (write-compose.ts prefers it
+      # over homedir(); compose.ts bakes it into each agent). Without it,
+      # an in-container apply poisons every bind source with /host-home AND
+      # re-bakes /host-home into the fleet, self-perpetuating.
+      SWITCHROOM_HOST_HOME: ${hostHome}
       # Hostd's CLI shellouts (\`switchroom <verb>\`) need to pick up the
       # same config the agent fleet's compose generator did. Point at
       # the resolved /state/config bind so the agent fleet's config-path
