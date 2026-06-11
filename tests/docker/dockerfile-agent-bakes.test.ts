@@ -49,6 +49,41 @@ describe("Dockerfile.agent bakes", () => {
   });
 });
 
+describe("Dockerfile.agent ships every hook script the scaffold invokes", () => {
+  // Cross-reference the Dockerfile against scaffold.ts's ACTUAL hook-script
+  // references (via DOCKER_BIN_PATH). #2273 added bin/turn-pacing-hook.sh +
+  // wired it into the agent's UserPromptSubmit hooks but never added the COPY
+  // line, so the script was absent from the image and the hook exec-failed
+  // 127 every turn, fleet-wide. This guard ties the image to what the runtime
+  // needs: any referenced hook script that isn't shipped fails the build gate.
+  const scaffold = readFileSync(resolve(root, "src/agents/scaffold.ts"), "utf8");
+  const referenced = [
+    ...new Set(
+      [...scaffold.matchAll(/join\(DOCKER_BIN_PATH,\s*"([^"]+\.sh)"\)/g)].map((m) => m[1]),
+    ),
+  ];
+  const copiesViaGlob = /COPY\s+bin\/\*\.sh\s+\/opt\/switchroom\/bin\//.test(dockerfile);
+
+  it("sanity: scaffold references the known hook scripts incl. turn-pacing-hook.sh", () => {
+    expect(referenced).toContain("turn-pacing-hook.sh");
+    expect(referenced).toContain("workspace-dynamic-hook.sh");
+    expect(referenced.length).toBeGreaterThanOrEqual(5);
+  });
+
+  for (const script of referenced) {
+    it(`ships ${script} into the agent image (glob or explicit COPY)`, () => {
+      const copiesExplicit = new RegExp(
+        `COPY\\s+bin/${script.replace(/\./g, "\\.")}\\s`,
+      ).test(dockerfile);
+      expect(
+        copiesViaGlob || copiesExplicit,
+        `Dockerfile.agent must COPY bin/${script} (the scaffold runs it via DOCKER_BIN_PATH) — ` +
+        `add it to the bake list, or use the bin/*.sh glob`,
+      ).toBe(true);
+    });
+  }
+});
+
 /**
  * Playwright is delivered through TWO bindings — the JS binding for the
  * `@playwright/mcp` default MCP, and the Python binding for the bundled
