@@ -160,6 +160,43 @@ networks:
 `;
 }
 
+/**
+ * Resolve the REAL host home for the hostd compose bind sources.
+ *
+ * Mirrors `write-compose.ts` (the agent-fleet generator, fixed in #2279):
+ * prefer `SWITCHROOM_HOST_HOME` over `homedir()`. `hostd install` regenerates
+ * its OWN compose; when the regen runs INSIDE the hostd container (the
+ * `/update apply` → refresh-hostd path), `homedir()` returns `/host-home` —
+ * the in-container mount point of the operator home that hostd pins `HOME` to,
+ * NOT a host filesystem path. Emitting it as a bind SOURCE makes Docker
+ * auto-create empty `/host-home/...` dirs on the host, so the config mount is
+ * empty → hostd crash-loops on `ConfigError`, and the poison value re-bakes
+ * into the new compose's `SWITCHROOM_HOST_HOME`, self-perpetuating.
+ *
+ * #2279 fixed this for the agent fleet but left `hostd install` on bare
+ * `homedir()`. This closes that gap. The backstop refuses to ever emit a
+ * `/host-home` source — fail loud with the recovery path instead of writing a
+ * compose that crash-loops the daemon.
+ */
+export function resolveHostdHostHome(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
+  const fromEnv = env.SWITCHROOM_HOST_HOME?.trim();
+  const resolved = fromEnv && fromEnv.length > 0 ? fromEnv : home;
+  if (resolved === "/host-home" || resolved.startsWith("/host-home/")) {
+    throw new Error(
+      `switchroom hostd install: refusing to generate — the host home resolved to ` +
+        `"${resolved}", the in-container mount point of the operator home (never a valid ` +
+        `host bind source). Emitting it would make Docker create empty /host-home dirs on ` +
+        `the host and crash-loop hostd on a missing config mount.\n\n` +
+        `Recovery: run \`switchroom hostd install\` from the HOST shell (not inside the ` +
+        `hostd container), or set SWITCHROOM_HOST_HOME to the real host home first.`,
+    );
+  }
+  return resolved;
+}
+
 function hostdDir(): string {
   return join(homedir(), ".switchroom", "hostd");
 }
@@ -220,7 +257,7 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   mkdirSync(dir, { recursive: true });
 
   const yaml = renderHostdComposeFile({
-    hostHome: homedir(),
+    hostHome: resolveHostdHostHome(),
     imageTag: opts.tag ?? DEFAULT_IMAGE_TAG,
     // SUDO_UID-aware (install often runs under sudo); undefined on
     // non-POSIX → operator listener simply not bound.
