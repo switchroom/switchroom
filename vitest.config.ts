@@ -233,6 +233,8 @@ export default defineConfig({
       // reaction-trigger tests (#1074) use bun:test — run via test:bun.
       "**/telegram-plugin/tests/reaction-trigger.test.ts",
       "**/telegram-plugin/tests/reaction-trigger-flow.test.ts",
+      // reaction-dispatch tests (#2291) use bun:test — run via test:bun.
+      "**/telegram-plugin/tests/reaction-dispatch.test.ts",
     ],
     coverage: {
       provider: "v8",

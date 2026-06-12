@@ -662,6 +662,28 @@ export function mergeAgentConfig(
     (merged as { reactions?: Record<string, unknown> }).reactions = combined;
   }
 
+  // --- reaction_dispatch: per-field override merge, agent wins (#2291) ---
+  //
+  // Same shape as `reactions` above. `enabled` is an independently
+  // overridable scalar; `emojis` uses REPLACE semantics so an operator
+  // can narrow the allowlist (or set `[]`) per-agent without flipping
+  // `enabled`. Undefined fields fall through so the gateway's
+  // resolveReactionDispatchConfig() reaches the (OFF) built-in defaults.
+  const dReactionDispatch =
+    (defaults as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch;
+  const mReactionDispatch =
+    (merged as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch;
+  if (dReactionDispatch || mReactionDispatch) {
+    const base = dReactionDispatch ?? {};
+    const override = mReactionDispatch ?? {};
+    const combined: Record<string, unknown> = { ...base };
+    for (const [k, v] of Object.entries(override)) {
+      if (v !== undefined) combined[k] = v;
+    }
+    (merged as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch =
+      combined;
+  }
+
   // --- resources: shallow per-key merge, agent wins ---
   //
   // Same shape as `experimental` below — operators may set a subset of

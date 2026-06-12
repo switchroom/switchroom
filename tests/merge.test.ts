@@ -1040,3 +1040,66 @@ describe("mergeAgentConfig reactions block", () => {
     expect(rx.trigger_emojis).toEqual(["✅"]);
   });
 });
+
+// ─── reaction_dispatch cascade (#2291) ────────────────────────────────────
+
+describe("mergeAgentConfig reaction_dispatch block", () => {
+  it("default-off: no block on defaults or agent leaves field absent", () => {
+    const result = mergeAgentConfig({} as AgentDefaults, baseAgent());
+    expect(
+      (result as { reaction_dispatch?: unknown }).reaction_dispatch,
+    ).toBeUndefined();
+  });
+
+  it("falls through from defaults when agent omits the block", () => {
+    const defaults: AgentDefaults = {
+      reaction_dispatch: { enabled: true, emojis: ["👨‍💻"] },
+    } as AgentDefaults;
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(
+      (result as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch,
+    ).toEqual({ enabled: true, emojis: ["👨‍💻"] });
+  });
+
+  it("enabled overrides per-field; emojis REPLACE (not union)", () => {
+    const defaults: AgentDefaults = {
+      reaction_dispatch: { enabled: false, emojis: ["👍", "👎"] },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      reaction_dispatch: { enabled: true, emojis: ["✅"] },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> })
+      .reaction_dispatch!;
+    expect(rd.enabled).toBe(true);
+    expect(rd.emojis).toEqual(["✅"]);
+  });
+
+  it("emojis: [] replaces defaults to disable without flipping enabled", () => {
+    const defaults: AgentDefaults = {
+      reaction_dispatch: { enabled: true, emojis: ["👍"] },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      reaction_dispatch: { emojis: [] },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> })
+      .reaction_dispatch!;
+    expect(rd.emojis).toEqual([]);
+    expect(rd.enabled).toBe(true);
+  });
+
+  it("undefined fields on agent do not clobber defaults", () => {
+    const defaults: AgentDefaults = {
+      reaction_dispatch: { enabled: true, emojis: ["👨‍💻"] },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      reaction_dispatch: {},
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> })
+      .reaction_dispatch!;
+    expect(rd.enabled).toBe(true);
+    expect(rd.emojis).toEqual(["👨‍💻"]);
+  });
+});

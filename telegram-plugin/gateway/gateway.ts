@@ -366,6 +366,7 @@ import type {
   PermissionEvent,
 } from './ipc-protocol.js'
 import { DebounceBuffer, HourCap, buildReactionInboundMeta, buildReactionInboundText, evaluateTriggerCandidate, isGroupChat, resolveReactionsConfig, truncatePreview, type PendingReaction, type ReactionBatch, type ReactionsResolvedConfig } from './reaction-trigger.js'
+import { buildReactionDispatchInbound, evaluateReactionDispatch, resolveReactionDispatchConfig, type ReactionDispatchResolvedConfig } from './reaction-dispatch.js'
 import { writePidFile, clearPidFile } from './pid-file.js'
 import { acquireStartupLock, releaseStartupLock } from './startup-mutex.js'
 import { drainShutdown } from './shutdown-drain.js'
@@ -19825,6 +19826,120 @@ function getReactionDebounce(): DebounceBuffer {
   return reactionDebounce
 }
 
+// ─── reaction_dispatch (#2291) ─────────────────────────────────────────────
+// Event-driven dispatch of ANY qualifying message_reaction as an inbound
+// `<channel event="reaction">` turn. Default OFF; independent of the
+// bot-authored `reactions` feedback path above.
+let reactionDispatchCfg: ReactionDispatchResolvedConfig | null = null
+
+function getReactionDispatchConfig(): ReactionDispatchResolvedConfig {
+  if (reactionDispatchCfg) return reactionDispatchCfg
+  let raw: unknown = undefined
+  try {
+    const cfg = loadSwitchroomConfig()
+    const agentName = process.env.SWITCHROOM_AGENT_NAME
+    if (agentName) {
+      const rawAgent = cfg.agents?.[agentName]
+      if (rawAgent) {
+        const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+        raw = (resolved as { reaction_dispatch?: unknown }).reaction_dispatch
+      }
+    }
+  } catch (err) {
+    process.stderr.write(
+      `telegram gateway: reaction_dispatch: config load failed, defaulting OFF: ${(err as Error).message}\n`,
+    )
+  }
+  reactionDispatchCfg = resolveReactionDispatchConfig(
+    raw as Parameters<typeof resolveReactionDispatchConfig>[0] ?? null,
+  )
+  return reactionDispatchCfg
+}
+
+/**
+ * Event-driven reaction → inbound turn (#2291). Called from the
+ * message_reaction handler for add/change events. Filters by the
+ * `reaction_dispatch` emoji allowlist (default empty ⇒ no-op), looks up
+ * the reacted message's text from the SQLite history buffer (graceful on
+ * miss), and injects an inbound shaped like a button-callback event via
+ * the same ipcServer.sendToAgent path cron uses. Removals never reach
+ * here (the caller filters them).
+ */
+function maybeDispatchReaction(args: {
+  chatId: string
+  messageId: number
+  emoji: string | null
+  action: 'add' | 'change'
+  user: string
+  userId: number
+  threadId?: number
+}): void {
+  const cfg = getReactionDispatchConfig()
+  const decision = evaluateReactionDispatch(cfg, { emoji: args.emoji, action: args.action })
+  if (!decision.ok) {
+    if (decision.reason === 'emoji_not_in_allowlist' && cfg.enabled) {
+      process.stderr.write(
+        `telegram gateway: reaction_dispatch.reject reason=allowlist_miss emoji=${args.emoji} chat=${args.chatId}\n`,
+      )
+    }
+    return
+  }
+
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) {
+    process.stderr.write(
+      `telegram gateway: reaction_dispatch: skipped — SWITCHROOM_AGENT_NAME unset\n`,
+    )
+    return
+  }
+
+  // History lookup is best-effort; a miss yields an empty body. The
+  // envelope still carries emoji / message_id / chat_id / user.
+  let reactedText = ''
+  if (HISTORY_ENABLED) {
+    try {
+      const row = lookupMessageRoleAndText(args.chatId, args.messageId)
+      reactedText = row?.text ?? ''
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: reaction_dispatch: history lookup failed: ${err}\n`,
+      )
+    }
+  }
+
+  const { text, meta } = buildReactionDispatchInbound({
+    emoji: args.emoji!,
+    chatId: args.chatId,
+    messageId: args.messageId,
+    user: args.user,
+    userId: args.userId,
+    reactedText,
+    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
+  })
+
+  const ts = Date.now()
+  const inbound: InboundMessage = {
+    type: 'inbound',
+    chatId: args.chatId,
+    ...(typeof args.threadId === 'number' ? { threadId: args.threadId } : {}),
+    messageId: ts,
+    user: args.user,
+    userId: args.userId,
+    ts,
+    text,
+    meta,
+  }
+  const delivered = ipcServer.sendToAgent(agentName, inbound)
+  if (delivered) markClaudeBusyForInbound(inbound)
+  process.stderr.write(
+    `telegram gateway: reaction_dispatch agent=${agentName} chat=${args.chatId} ` +
+    `emoji=${args.emoji} message_id=${args.messageId} delivered=${delivered}\n`,
+  )
+  if (!delivered) {
+    pendingInboundBuffer.push(agentName, inbound)
+  }
+}
+
 /**
  * Dispatch a debounce-flushed batch as a synthetic InboundMessage via
  * the same `ipcServer.sendToAgent` path the cron-fold-in uses.
@@ -19949,9 +20064,28 @@ async function handleMessageReaction(ctx: Context): Promise<void> {
     // From here on we ignore failures rather than reject (the persist
     // path above is the v1 contract; trigger is best-effort).
     if (action === 'remove' || emoji === null) return
-    if (!HISTORY_ENABLED) return // need history to identify bot-authored target
     const reacter = update.user
     if (!reacter) return // anonymous group-channel reactions — not user-attributable
+
+    const reacterName = reacter.first_name ?? reacter.username ?? String(reacter.id)
+
+    // ─── reaction_dispatch (#2291) ───────────────────────────────────────
+    // Event-driven dispatch of ANY qualifying reaction as a button-style
+    // inbound turn. Independent of (and runs before) the bot-authored
+    // `reactions` feedback path below; both may fire for one reaction.
+    maybeDispatchReaction({
+      chatId: chat_id,
+      messageId: message_id,
+      emoji,
+      action,
+      user: reacterName,
+      userId: reacter.id,
+      ...(typeof update.message_thread_id === 'number'
+        ? { threadId: update.message_thread_id }
+        : {}),
+    })
+
+    if (!HISTORY_ENABLED) return // need history to identify bot-authored target
 
     const cfg = getReactionsConfig()
     if (!cfg.enabled) return
@@ -20025,7 +20159,7 @@ async function handleMessageReaction(ctx: Context): Promise<void> {
       ts: Date.now(),
       preview,
       userId: reacter.id,
-      user: reacter.first_name ?? reacter.username ?? String(reacter.id),
+      user: reacterName,
       ...(typeof update.message_thread_id === 'number'
         ? { threadId: update.message_thread_id }
         : {}),
