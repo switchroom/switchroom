@@ -15,6 +15,8 @@ import {
   matchesRule,
   renderTemplate,
   buildGithubContext,
+  buildLinearContext,
+  buildGenericContext,
   parseDurationMs,
   isQuietHour,
   evaluateDispatch,
@@ -41,6 +43,9 @@ const prOpened = loadFixture('github-pr-opened.json')
 const prLabeled = loadFixture('github-pr-labeled.json')
 const prDependabot = loadFixture('github-pr-dependabot.json')
 const pushPayload = loadFixture('github-push.json')
+const linearIssue = loadFixture('linear-issue-assigned.json')
+const linearComment = loadFixture('linear-comment-mention.json')
+const genericEvent = loadFixture('generic-event.json')
 
 // ─── parseDurationMs ──────────────────────────────────────────────────────────
 
@@ -92,6 +97,8 @@ describe('renderTemplate', () => {
     labels: 'needs-review',
     action: 'opened',
     event: 'pull_request',
+    assignee: '',
+    body: 'Add dark mode',
   }
 
   it('interpolates known fields', () => {
@@ -117,31 +124,31 @@ describe('matchesRule', () => {
   const baseMatcher: DispatchMatcher = { event: 'pull_request' }
 
   it('matches on event alone', () => {
-    expect(matchesRule('pull_request', prOpened, baseMatcher)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prOpened, baseMatcher)).toBe(true)
   })
 
   it('rejects wrong event', () => {
-    expect(matchesRule('push', prOpened, baseMatcher)).toBe(false)
+    expect(matchesRule('github', 'push', prOpened, baseMatcher)).toBe(false)
   })
 
   it('matches when action is in list', () => {
     const m: DispatchMatcher = { event: 'pull_request', actions: ['opened', 'synchronize'] }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(true)
   })
 
   it('rejects when action not in list', () => {
     const m: DispatchMatcher = { event: 'pull_request', actions: ['closed'] }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(false)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(false)
   })
 
   it('matches labels_any when at least one label present', () => {
     const m: DispatchMatcher = { event: 'pull_request', labels_any: ['needs-review', 'bug'] }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(true)
   })
 
   it('rejects labels_any when none match', () => {
     const m: DispatchMatcher = { event: 'pull_request', labels_any: ['bug', 'wontfix'] }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(false)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(false)
   })
 
   it('matches labels_all when all labels present', () => {
@@ -149,7 +156,7 @@ describe('matchesRule', () => {
       event: 'pull_request',
       labels_all: ['needs-review', 'enhancement'],
     }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(true)
   })
 
   it('rejects labels_all when any label missing', () => {
@@ -157,7 +164,7 @@ describe('matchesRule', () => {
       event: 'pull_request',
       labels_all: ['needs-review', 'missing-label'],
     }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(false)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(false)
   })
 
   it('excludes dependabot author', () => {
@@ -165,7 +172,7 @@ describe('matchesRule', () => {
       event: 'pull_request',
       exclude_authors: ['dependabot[bot]'],
     }
-    expect(matchesRule('pull_request', prDependabot, m)).toBe(false)
+    expect(matchesRule('github', 'pull_request', prDependabot, m)).toBe(false)
   })
 
   it('allows non-excluded author', () => {
@@ -173,7 +180,7 @@ describe('matchesRule', () => {
       event: 'pull_request',
       exclude_authors: ['dependabot[bot]'],
     }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(true)
   })
 
   it('full combined rule matches correctly', () => {
@@ -183,9 +190,9 @@ describe('matchesRule', () => {
       labels_any: ['needs-review'],
       exclude_authors: ['dependabot[bot]', 'coolify[bot]'],
     }
-    expect(matchesRule('pull_request', prOpened, m)).toBe(true)
-    expect(matchesRule('pull_request', prDependabot, m)).toBe(false)
-    expect(matchesRule('push', pushPayload, m)).toBe(false)
+    expect(matchesRule('github', 'pull_request', prOpened, m)).toBe(true)
+    expect(matchesRule('github', 'pull_request', prDependabot, m)).toBe(false)
+    expect(matchesRule('github', 'push', pushPayload, m)).toBe(false)
   })
 })
 
@@ -497,5 +504,292 @@ describe('evaluateDispatch', () => {
     expect(count).toBe(2)
     expect(injected).toHaveLength(2)
     expect((injected[1].inbound.meta as Record<string, string>).rule_index).toBe('1')
+  })
+
+  // ── Generic / Linear source dispatch (#2272) ────────────────────────────────
+
+  const captureInjectFor = captureInject
+
+  it('fires a generic-source rule', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      generic: [
+        {
+          match: { event: 'ci', labels_any: ['prod'] },
+          prompt: 'Deploy event: {{title}}',
+        },
+      ],
+    }
+
+    const count = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'generic',
+        eventType: 'ci',
+        payload: genericEvent,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
+    )
+
+    expect(count).toBe(1)
+    expect(injected).toHaveLength(1)
+    expect(injected[0].inbound.text).toBe('Deploy event: Deploy finished')
+    expect((injected[0].inbound.meta as Record<string, string>).event).toBe('ci')
+  })
+
+  it('fires a linear issue rule matched on assignee', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      linear: [
+        {
+          match: { event: 'issue', actions: ['update'], assignee_any: ['clerk'] },
+          prompt: 'Linear {{number}} assigned: {{title}}\n{{html_url}}',
+        },
+      ],
+    }
+
+    const count = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'issue',
+        payload: linearIssue,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
+    )
+
+    expect(count).toBe(1)
+    expect(injected[0].inbound.text).toContain('ENG-42')
+    expect(injected[0].inbound.text).toContain('Investigate flaky webhook test')
+  })
+
+  it('fires a linear comment rule matched on mention', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      linear: [
+        {
+          match: { event: 'comment', mentions_any: ['@clerk'] },
+          prompt: 'Mentioned on {{number}}',
+        },
+      ],
+    }
+
+    const count = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'comment',
+        payload: linearComment,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
+    )
+
+    expect(count).toBe(1)
+    expect(injected[0].inbound.text).toBe('Mentioned on ENG-42')
+  })
+
+  it('does NOT fire a linear rule when assignee does not match', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      linear: [
+        {
+          match: { event: 'issue', assignee_any: ['someone-else'] },
+          prompt: 'x',
+        },
+      ],
+    }
+
+    const count = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'issue',
+        payload: linearIssue,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn },
+    )
+
+    expect(count).toBe(0)
+    expect(injected).toHaveLength(0)
+  })
+
+  it('respects cooldown for a non-github (linear) source', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      linear: [
+        {
+          match: { event: 'issue', assignee_any: ['clerk'] },
+          prompt: 'Linear {{number}}',
+          cooldown: '5m',
+        },
+      ],
+    }
+    const deps = { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn }
+
+    evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'issue',
+        payload: linearIssue,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      deps,
+    )
+    const count2 = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'issue',
+        payload: linearIssue,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      { ...deps, now: () => 1_060_000 }, // 1 min later — still cooling
+    )
+
+    expect(injected).toHaveLength(1)
+    expect(count2).toBe(0)
+  })
+
+  it('linear and github cooldown keys do not collide (same number)', () => {
+    const resolveAgentDir = makeTmpResolveAgentDir()
+    const { injected, injectFn } = captureInjectFor()
+    const config: WebhookDispatchConfig = {
+      github: [{ match: { event: 'pull_request' }, prompt: 'gh', cooldown: '5m' }],
+      linear: [{ match: { event: 'issue' }, prompt: 'ln', cooldown: '5m' }],
+    }
+    const deps = { resolveAgentDir, now: () => 1_000_000, log: () => {}, injectFn }
+
+    // github PR #42 fires...
+    evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'github',
+        eventType: 'pull_request',
+        payload: prOpened,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      deps,
+    )
+    // ...linear issue (rule index 0, repo 'linear') must NOT be coalesced
+    // by the github cooldown entry even though both are rule index 0.
+    const count = evaluateDispatch(
+      {
+        agent: 'reggie',
+        source: 'linear',
+        eventType: 'issue',
+        payload: linearIssue,
+        dispatchConfig: config,
+        chatId: FORUM_CHAT,
+      },
+      deps,
+    )
+
+    expect(count).toBe(1)
+    expect(injected).toHaveLength(2)
+  })
+})
+
+// ─── buildLinearContext / buildGenericContext (#2272) ─────────────────────────
+
+describe('buildLinearContext', () => {
+  it('extracts issue fields', () => {
+    const ctx = buildLinearContext('issue', linearIssue)
+    expect(ctx.number).toBe('ENG-42')
+    expect(ctx.title).toBe('Investigate flaky webhook test')
+    expect(ctx.html_url).toBe('https://linear.app/acme/issue/ENG-42')
+    expect(ctx.assignee).toBe('clerk')
+    expect(ctx.action).toBe('update')
+    expect(ctx.labels).toBe('bug, agent-task')
+    expect(ctx.event).toBe('issue')
+  })
+
+  it('extracts comment fields with the parent issue identifier', () => {
+    const ctx = buildLinearContext('comment', linearComment)
+    expect(ctx.number).toBe('ENG-42')
+    expect(ctx.action).toBe('create')
+    // body carries the comment text for mention matching
+    expect(ctx.body).toContain('@clerk')
+  })
+})
+
+describe('buildGenericContext', () => {
+  it('extracts probed fields and uses source name as repo/event', () => {
+    const ctx = buildGenericContext('ci', genericEvent)
+    expect(ctx.repo).toBe('ci')
+    expect(ctx.event).toBe('ci')
+    expect(ctx.title).toBe('Deploy finished')
+    expect(ctx.assignee).toBe('ops-bot')
+    expect(ctx.labels).toBe('prod, deploy')
+    expect(ctx.html_url).toBe('https://ci.example.com/runs/99')
+  })
+})
+
+// ─── source-aware matchesRule (#2272) ─────────────────────────────────────────
+
+describe('matchesRule (linear/generic)', () => {
+  it('matches linear assignee_any', () => {
+    expect(
+      matchesRule('linear', 'issue', linearIssue, {
+        event: 'issue',
+        assignee_any: ['clerk'],
+      }),
+    ).toBe(true)
+    expect(
+      matchesRule('linear', 'issue', linearIssue, {
+        event: 'issue',
+        assignee_any: ['nobody'],
+      }),
+    ).toBe(false)
+  })
+
+  it('matches linear labels_any', () => {
+    expect(
+      matchesRule('linear', 'issue', linearIssue, {
+        event: 'issue',
+        labels_any: ['agent-task'],
+      }),
+    ).toBe(true)
+  })
+
+  it('matches linear comment mentions_any case-insensitively', () => {
+    expect(
+      matchesRule('linear', 'comment', linearComment, {
+        event: 'comment',
+        mentions_any: ['@CLERK'],
+      }),
+    ).toBe(true)
+    expect(
+      matchesRule('linear', 'comment', linearComment, {
+        event: 'comment',
+        mentions_any: ['@bob'],
+      }),
+    ).toBe(false)
+  })
+
+  it('matches generic action + labels', () => {
+    expect(
+      matchesRule('generic', 'ci', genericEvent, {
+        event: 'ci',
+        actions: ['fired'],
+        labels_all: ['prod', 'deploy'],
+      }),
+    ).toBe(true)
   })
 })

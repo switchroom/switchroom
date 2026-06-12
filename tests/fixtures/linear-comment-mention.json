@@ -1,0 +1,13 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "url": "https://linear.app/acme/issue/ENG-42#comment-abc",
+  "data": {
+    "body": "Can @clerk take a look at this regression?",
+    "user": { "name": "alice", "displayName": "Alice" },
+    "issue": {
+      "identifier": "ENG-42",
+      "title": "Investigate flaky webhook test"
+    }
+  }
+}

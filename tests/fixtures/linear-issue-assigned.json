@@ -1,0 +1,14 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "url": "https://linear.app/acme/issue/ENG-42",
+  "data": {
+    "identifier": "ENG-42",
+    "title": "Investigate flaky webhook test",
+    "assignee": { "name": "clerk", "displayName": "clerk" },
+    "labels": [
+      { "name": "bug" },
+      { "name": "agent-task" }
+    ]
+  }
+}

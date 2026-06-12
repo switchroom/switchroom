@@ -16,9 +16,11 @@ import { describe, it, expect } from 'vitest'
 import { createHmac } from 'crypto'
 import {
   verifyGithubSignature,
+  verifyLinearSignature,
   verifyBearerToken,
   renderGithubEvent,
   renderGenericEvent,
+  renderLinearEvent,
 } from '../src/web/webhook-verify.js'
 
 const SECRET = 'this-is-a-shared-secret'
@@ -206,5 +208,102 @@ describe('renderGenericEvent', () => {
     expect(r.text).not.toContain('<bad>')
     expect(r.text).toContain('&lt;bad&gt;')
     expect(r.text).toContain('&lt;bold&gt;')
+  })
+})
+
+// ─── verifyLinearSignature (#2272) ────────────────────────────────────────────
+
+function linearSig(body: Uint8Array, secret: string): string {
+  // Linear sends a BARE hex digest — no `sha256=` prefix.
+  return createHmac('sha256', secret).update(body).digest('hex')
+}
+
+describe('verifyLinearSignature', () => {
+  const body = new TextEncoder().encode('{"action":"create","type":"Issue"}')
+
+  it('accepts a valid bare-hex signature', () => {
+    const r = verifyLinearSignature(body, linearSig(body, SECRET), SECRET)
+    expect(r.ok).toBe(true)
+  })
+
+  it('rejects missing signature header', () => {
+    const r = verifyLinearSignature(body, undefined, SECRET)
+    expect(r).toMatchObject({ ok: false, reason: 'no-signature-header' })
+  })
+
+  it('rejects a github-style sha256= prefixed value (wrong format)', () => {
+    const r = verifyLinearSignature(body, 'sha256=' + linearSig(body, SECRET), SECRET)
+    expect(r).toMatchObject({ ok: false, reason: 'malformed-hex' })
+  })
+
+  it('rejects malformed hex', () => {
+    const r = verifyLinearSignature(body, 'zz'.repeat(32), SECRET)
+    expect(r).toMatchObject({ ok: false, reason: 'malformed-hex' })
+  })
+
+  it('rejects a signature signed with a different secret', () => {
+    const r = verifyLinearSignature(body, linearSig(body, 'wrong-secret'), SECRET)
+    expect(r).toMatchObject({ ok: false, reason: 'signature-mismatch' })
+  })
+
+  it('rejects a tampered body', () => {
+    const tampered = new TextEncoder().encode('{"action":"remove"}')
+    const r = verifyLinearSignature(tampered, linearSig(body, SECRET), SECRET)
+    expect(r).toMatchObject({ ok: false, reason: 'signature-mismatch' })
+  })
+
+  it('rejects when no secret is configured', () => {
+    const r = verifyLinearSignature(body, linearSig(body, SECRET), '')
+    expect(r).toMatchObject({ ok: false, reason: 'no-secret-configured' })
+  })
+
+  it('tolerates surrounding whitespace in the header', () => {
+    const r = verifyLinearSignature(body, '  ' + linearSig(body, SECRET) + '\n', SECRET)
+    expect(r.ok).toBe(true)
+  })
+})
+
+// ─── renderLinearEvent (#2272) ────────────────────────────────────────────────
+
+describe('renderLinearEvent', () => {
+  it('renders an issue event with identifier, action, assignee, title', () => {
+    const r = renderLinearEvent('issue', {
+      action: 'update',
+      url: 'https://linear.app/acme/issue/ENG-7',
+      data: {
+        identifier: 'ENG-7',
+        title: 'Fix the thing',
+        assignee: { displayName: 'clerk' },
+      },
+    })
+    expect(r.text).toContain('ENG-7')
+    expect(r.text).toContain('update')
+    expect(r.text).toContain('@clerk')
+    expect(r.text).toContain('Fix the thing')
+    expect(r.disableLinkPreview).toBe(true)
+  })
+
+  it('renders a comment event with the parent issue id and body', () => {
+    const r = renderLinearEvent('comment', {
+      action: 'create',
+      data: { body: 'looks good', issue: { identifier: 'ENG-7' } },
+    })
+    expect(r.text).toContain('ENG-7')
+    expect(r.text).toContain('looks good')
+  })
+
+  it('HTML-escapes attacker-controlled fields (data not instructions)', () => {
+    const r = renderLinearEvent('issue', {
+      action: 'create',
+      data: { identifier: 'ENG-9', title: '<script>alert(1)</script>' },
+    })
+    expect(r.text).not.toContain('<script>')
+    expect(r.text).toContain('&lt;script&gt;')
+  })
+
+  it('falls back for unknown linear types', () => {
+    const r = renderLinearEvent('project', { action: 'update', data: {} })
+    expect(r.text).toContain('project')
+    expect(r.text).toContain('update')
   })
 })

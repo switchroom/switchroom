@@ -45,9 +45,11 @@ import { join } from 'path'
 import { homedir } from 'os'
 import {
   verifyGithubSignature,
+  verifyLinearSignature,
   verifyBearerToken,
   renderGithubEvent,
   renderGenericEvent,
+  renderLinearEvent,
   type WebhookSource,
 } from './webhook-verify.js'
 import type { WebhookDispatchConfig } from './webhook-dispatch.js'
@@ -138,7 +140,7 @@ export interface WebhookHandlerResult {
   headers?: Record<string, string>
 }
 
-const KNOWN_SOURCES: WebhookSource[] = ['github', 'generic']
+const KNOWN_SOURCES: WebhookSource[] = ['github', 'generic', 'linear']
 
 function jsonReply(
   status: number,
@@ -387,6 +389,11 @@ export async function handleWebhookIngest(
   if (source === 'github') {
     const sigHeader = args.headers.get('x-hub-signature-256')
     verifyResult = verifyGithubSignature(args.body, sigHeader, secret)
+  } else if (source === 'linear') {
+    // Linear sends a bare hex HMAC-SHA256 of the raw body in the
+    // `Linear-Signature` header — no Bearer auth (#2272).
+    const sigHeader = args.headers.get('linear-signature')
+    verifyResult = verifyLinearSignature(args.body, sigHeader, secret)
   } else {
     const authHeader = args.headers.get('authorization')
     verifyResult = verifyBearerToken(authHeader, secret)
@@ -450,12 +457,20 @@ export async function handleWebhookIngest(
 
   // Render to a Telegram-ready string. Stored on the event record so
   // the follow-up "post to Telegram" PR doesn't have to re-render.
-  const eventType = source === 'github'
-    ? (args.headers.get('x-github-event') ?? 'unknown')
-    : args.source
-  const rendered = source === 'github'
-    ? renderGithubEvent(eventType, payload)
-    : renderGenericEvent(args.source, payload)
+  // Event type per source: github from header, linear from the body's
+  // `type` field (lower-cased), generic = the source name.
+  const eventType =
+    source === 'github'
+      ? (args.headers.get('x-github-event') ?? 'unknown')
+      : source === 'linear'
+        ? String(payload.type ?? 'unknown').toLowerCase()
+        : args.source
+  const rendered =
+    source === 'github'
+      ? renderGithubEvent(eventType, payload)
+      : source === 'linear'
+        ? renderLinearEvent(eventType, payload)
+        : renderGenericEvent(args.source, payload)
 
   // ── viaGateway: forward to the in-container gateway (agent UID) ───────────
   // The gateway owns dedup + the jsonl append + dispatch; the receiver is

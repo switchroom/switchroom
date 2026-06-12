@@ -23,6 +23,15 @@
  *     policy (off the subscription) and would spawn a parasitic second
  *     telegram bridge (#1617). See `docs/rfcs/eliminate-claude-p.md`.
  *
+ * Sources (#2272): dispatch is no longer github-only. Rules live under
+ * a per-source key — `github`, `generic`, or `linear`. Each source
+ * gets its own context builder (`buildGithubContext` /
+ * `buildLinearContext` / `buildGenericContext`) so the same static
+ * matcher (event/action/label/author/assignee/mention) and the same
+ * knobs (cooldown, quiet_hours; rate limit + dedup live in the ingest
+ * handler) apply uniformly. The security model is unchanged: rendered
+ * payloads are data, never instructions.
+ *
  * Configuration (in switchroom.yaml under agents.<name>.channels.telegram):
  *
  * ```yaml
@@ -39,6 +48,16 @@
  *         {{html_url}}
  *       cooldown: 5m
  *       quiet_hours: { start: 22, end: 8, tz: Australia/Melbourne }
+ *   linear:
+ *     - description: "Act on issues assigned to me"
+ *       match:
+ *         event: issue
+ *         actions: [create, update]
+ *         assignee_any: [clerk]
+ *       prompt: |
+ *         Linear {{number}} assigned to you: {{title}}
+ *         {{html_url}}
+ *       cooldown: 2m
  * ```
  */
 
@@ -61,6 +80,13 @@ export interface DispatchMatcher {
   labels_all?: string[]
   /** If the author login matches any of these, skip dispatch. */
   exclude_authors?: string[]
+  /** (linear/generic) Match only when the event's assignee is one of
+   *  these names. If absent, assignee is not constrained. */
+  assignee_any?: string[]
+  /** (linear/generic) Match only when the event text mentions one of
+   *  these handles (substring, case-insensitive). Useful for
+   *  "@mention the agent" routing. */
+  mentions_any?: string[]
 }
 
 export interface QuietHours {
@@ -84,7 +110,13 @@ export interface DispatchRule {
 
 export interface WebhookDispatchConfig {
   github?: DispatchRule[]
+  generic?: DispatchRule[]
+  linear?: DispatchRule[]
 }
+
+/** Webhook sources that support dispatch rule evaluation (#2272). */
+export const DISPATCH_SOURCES = ['github', 'generic', 'linear'] as const
+export type DispatchSource = (typeof DISPATCH_SOURCES)[number]
 
 /** Flat helper bag for template interpolation. */
 export interface TemplateContext {
@@ -96,6 +128,11 @@ export interface TemplateContext {
   labels: string
   action: string
   event: string
+  /** (linear/generic) Assignee display name, when the event carries one. */
+  assignee: string
+  /** (linear/generic) Free text searched by `mentions_any` — for linear
+   *  this is the issue title + comment body. */
+  body: string
   [key: string]: string
 }
 
@@ -138,20 +175,161 @@ export function buildGithubContext(
   const rawLabels = (obj?.labels as Array<Record<string, unknown>> | undefined) ?? []
   const labels = rawLabels.map((l) => String(l.name ?? '')).join(', ')
   const action = String(payload.action ?? '')
+  const assignee = String(
+    (obj?.assignee as Record<string, unknown> | undefined)?.login ?? '',
+  )
 
-  return { repo, number, title, html_url, author, labels, action, event: eventType }
+  return {
+    repo,
+    number,
+    title,
+    html_url,
+    author,
+    labels,
+    action,
+    event: eventType,
+    assignee,
+    body: title,
+  }
+}
+
+/**
+ * Build the flat TemplateContext from a Linear webhook envelope (#2272).
+ * `eventType` is the lower-cased Linear `type` ("issue", "comment").
+ *
+ * Linear envelope shape: `{ action, type, url, data: {...} }`.
+ *   - issue:   data.{identifier,title,assignee,labels}
+ *   - comment: data.{body, issue:{identifier,title}}
+ */
+export function buildLinearContext(
+  eventType: string,
+  payload: Record<string, unknown>,
+): TemplateContext {
+  const data = (payload.data as Record<string, unknown> | undefined) ?? {}
+  const issue = (data.issue as Record<string, unknown> | undefined) ?? {}
+
+  const number = String(data.identifier ?? issue.identifier ?? '')
+  const title = String(data.title ?? issue.title ?? '')
+  const html_url = String(payload.url ?? '')
+  const action = String(payload.action ?? '')
+  const assignee = String(
+    (data.assignee as Record<string, unknown> | undefined)?.displayName ??
+      (data.assignee as Record<string, unknown> | undefined)?.name ??
+      '',
+  )
+  const author = String(
+    (data.user as Record<string, unknown> | undefined)?.displayName ??
+      (data.user as Record<string, unknown> | undefined)?.name ??
+      '',
+  )
+  const rawLabels = (data.labels as Array<Record<string, unknown>> | undefined) ?? []
+  const labels = rawLabels.map((l) => String(l.name ?? '')).join(', ')
+  const commentBody = String(data.body ?? '')
+  const body = [title, commentBody].filter(Boolean).join('\n')
+
+  return {
+    repo: 'linear',
+    number,
+    title,
+    html_url,
+    author,
+    labels,
+    action,
+    event: eventType,
+    assignee,
+    body,
+  }
+}
+
+/**
+ * Build the flat TemplateContext for a generic webhook (#2272). The
+ * shape is operator-defined; we probe common fields and treat the
+ * source name as `repo` so `{{repo}}` is meaningful in templates.
+ * `event` is the source name (generic events have no event header).
+ */
+export function buildGenericContext(
+  source: string,
+  payload: Record<string, unknown>,
+): TemplateContext {
+  const title =
+    typeof payload.title === 'string'
+      ? payload.title
+      : typeof payload.message === 'string'
+        ? payload.message
+        : typeof payload.text === 'string'
+          ? payload.text
+          : ''
+  const action = String(payload.action ?? '')
+  const html_url = typeof payload.url === 'string' ? payload.url : ''
+  const number = String(payload.id ?? payload.number ?? '')
+  const author = String(payload.author ?? payload.user ?? '')
+  const assignee = String(payload.assignee ?? '')
+  const rawLabels = Array.isArray(payload.labels)
+    ? (payload.labels as unknown[]).map((l) =>
+        typeof l === 'string' ? l : String((l as Record<string, unknown>)?.name ?? ''),
+      )
+    : []
+  const labels = rawLabels.join(', ')
+
+  return {
+    repo: source,
+    number,
+    title,
+    html_url,
+    author,
+    labels,
+    action,
+    event: source,
+    assignee,
+    body: title,
+  }
+}
+
+/**
+ * Dispatch to the right context builder by source (#2272).
+ */
+export function buildContext(
+  source: string,
+  eventType: string,
+  payload: Record<string, unknown>,
+): TemplateContext {
+  switch (source) {
+    case 'linear':
+      return buildLinearContext(eventType, payload)
+    case 'generic':
+      return buildGenericContext(eventType, payload)
+    default:
+      return buildGithubContext(eventType, payload)
+  }
 }
 
 // ─── Static matcher ───────────────────────────────────────────────────────────
 
+/** Split the comma-joined `labels` context field back into a Set. */
+function labelSetFromContext(ctx: TemplateContext): Set<string> {
+  return new Set(
+    ctx.labels
+      .split(',')
+      .map((l) => l.trim())
+      .filter(Boolean),
+  )
+}
+
 /**
  * Returns true iff the payload matches all constraints in the matcher.
  *
- * @param eventType  The X-GitHub-Event header value.
+ * Source-aware (#2272): label/author/assignee fields are read off the
+ * source-specific TemplateContext, so the same matcher works for
+ * github, linear, and generic events.
+ *
+ * @param source     The webhook source ("github" | "linear" | "generic").
+ * @param eventType  Source event name (github event header / linear
+ *                   type / generic source name).
  * @param payload    Parsed JSON body.
  * @param matcher    Rule matcher constraints.
  */
 export function matchesRule(
+  source: string,
   eventType: string,
   payload: Record<string, unknown>,
   matcher: DispatchMatcher,
@@ -159,8 +337,7 @@ export function matchesRule(
   // Event name must match.
   if (matcher.event !== eventType) return false
 
-  // Build context for label/author access.
-  const ctx = buildGithubContext(eventType, payload)
+  const ctx = buildContext(source, eventType, payload)
 
   // action filter — if specified, the payload's action must be in the list.
   if (matcher.actions && matcher.actions.length > 0) {
@@ -172,26 +349,28 @@ export function matchesRule(
     if (matcher.exclude_authors.includes(ctx.author)) return false
   }
 
+  // assignee_any — at least one assignee in the list must match (linear/generic).
+  if (matcher.assignee_any && matcher.assignee_any.length > 0) {
+    if (!matcher.assignee_any.includes(ctx.assignee)) return false
+  }
+
+  // mentions_any — the event text must mention one of these (case-insensitive substring).
+  if (matcher.mentions_any && matcher.mentions_any.length > 0) {
+    const hay = ctx.body.toLowerCase()
+    const hasMention = matcher.mentions_any.some((m) => hay.includes(m.toLowerCase()))
+    if (!hasMention) return false
+  }
+
   // labels_any — at least one label in the list must be present.
   if (matcher.labels_any && matcher.labels_any.length > 0) {
-    const pr = payload.pull_request as Record<string, unknown> | undefined
-    const issue = payload.issue as Record<string, unknown> | undefined
-    const rawLabels =
-      ((pr ?? issue)?.labels as Array<Record<string, unknown>> | undefined) ?? []
-    const labelNames = new Set(rawLabels.map((l) => String(l.name ?? '')))
-    const hasAny = matcher.labels_any.some((l) => labelNames.has(l))
-    if (!hasAny) return false
+    const labelNames = labelSetFromContext(ctx)
+    if (!matcher.labels_any.some((l) => labelNames.has(l))) return false
   }
 
   // labels_all — every label in the list must be present.
   if (matcher.labels_all && matcher.labels_all.length > 0) {
-    const pr = payload.pull_request as Record<string, unknown> | undefined
-    const issue = payload.issue as Record<string, unknown> | undefined
-    const rawLabels =
-      ((pr ?? issue)?.labels as Array<Record<string, unknown>> | undefined) ?? []
-    const labelNames = new Set(rawLabels.map((l) => String(l.name ?? '')))
-    const hasAll = matcher.labels_all.every((l) => labelNames.has(l))
-    if (!hasAll) return false
+    const labelNames = labelSetFromContext(ctx)
+    if (!matcher.labels_all.every((l) => labelNames.has(l))) return false
   }
 
   return true
@@ -217,8 +396,14 @@ interface CooldownFileShape {
   dispatches: Record<string, number>
 }
 
-function cooldownKey(eventType: string, repo: string, number: string, ruleIndex: number): string {
-  return `${eventType}:${repo}:${number}:${ruleIndex}`
+function cooldownKey(
+  source: string,
+  eventType: string,
+  repo: string,
+  number: string,
+  ruleIndex: number,
+): string {
+  return `${source}:${eventType}:${repo}:${number}:${ruleIndex}`
 }
 
 function loadCooldownFile(path: string): Record<string, number> {
@@ -475,19 +660,21 @@ export function evaluateDispatch(
   const cooldownStore =
     deps.cooldownStore ?? createFileCooldownStore(resolveAgentDir)
 
-  // Only github source is supported for dispatch in this iteration.
-  if (args.source !== 'github') return 0
+  // Dispatch supports github, generic, and linear sources (#2272).
+  // Rules are keyed by source under dispatchConfig; an unknown source
+  // (or one with no rules configured) is a no-op.
+  if (!(DISPATCH_SOURCES as readonly string[]).includes(args.source)) return 0
 
-  const rules = args.dispatchConfig.github
+  const rules = args.dispatchConfig[args.source as DispatchSource]
   if (!rules || rules.length === 0) return 0
 
-  const ctx = buildGithubContext(args.eventType, args.payload)
+  const ctx = buildContext(args.source, args.eventType, args.payload)
   let fired = 0
 
   for (let i = 0; i < rules.length; i++) {
     const rule = rules[i]
 
-    if (!matchesRule(args.eventType, args.payload, rule.match)) continue
+    if (!matchesRule(args.source, args.eventType, args.payload, rule.match)) continue
 
     // Quiet hours check
     if (rule.quiet_hours && isQuietHour(rule.quiet_hours, nowDate())) {
@@ -500,7 +687,7 @@ export function evaluateDispatch(
     // Cooldown check
     const cooldownMs = rule.cooldown ? parseDurationMs(rule.cooldown) : 0
     if (cooldownMs > 0) {
-      const ck = cooldownKey(args.eventType, ctx.repo, ctx.number, i)
+      const ck = cooldownKey(args.source, args.eventType, ctx.repo, ctx.number, i)
       if (cooldownStore.isCoolingDown(args.agent, ck, cooldownMs, now)) {
         log(
           `webhook-dispatch: agent='${args.agent}' rule=${i} skipped (cooldown)\n`,

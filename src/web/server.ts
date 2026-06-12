@@ -313,7 +313,7 @@ async function handleWebhookRoute(
       body: bodyBuf,
       headers: req.headers,
       allowedSources,
-      config: { secrets: agentSecrets as Partial<Record<"github" | "generic", string>> },
+      config: { secrets: agentSecrets as Partial<Record<"github" | "generic" | "linear", string>> },
       agentExists: agentConfig !== undefined,
       dispatchConfig: agentConfig?.channels?.telegram?.webhook_dispatch,
       // Docker-runtime: forward to the agent's gateway instead of writing

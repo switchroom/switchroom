@@ -166,6 +166,62 @@ describe('recordWebhookEvent', () => {
     expect(injected[0].inbound.text).toBe('Review foo/bar #1')
   })
 
+  it('fires a linear-source dispatch rule (#2272)', () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const injected: Array<{ agent: string; inbound: InboundMessageWire }> = []
+    const linearConfig: RecordDeps['loadConfig'] = () =>
+      ({
+        telegram: { forum_chat_id: '-100123' },
+        agents: {
+          reggie: {
+            topic_id: 42,
+            channels: {
+              telegram: {
+                webhook_dispatch: {
+                  linear: [
+                    {
+                      match: { event: 'issue', assignee_any: ['clerk'] },
+                      prompt: 'Linear {{number}} for you',
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      }) as unknown as ReturnType<NonNullable<RecordDeps['loadConfig']>>
+
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: linearConfig,
+      inject: (agent, inbound) => {
+        injected.push({ agent, inbound })
+        return true
+      },
+    }
+
+    const rec = baseRecord({
+      source: 'linear',
+      event_type: 'issue',
+      rendered_text: 'Linear ENG-9 updated',
+      delivery_id: undefined,
+      payload: {
+        action: 'update',
+        type: 'Issue',
+        url: 'https://linear.app/x/ENG-9',
+        data: { identifier: 'ENG-9', title: 'Do the thing', assignee: { displayName: 'clerk' } },
+      },
+    })
+
+    const result = recordWebhookEvent(rec, deps)
+    expect(result.status).toBe('ok')
+    expect(result.dispatched).toBe(1)
+    expect(injected).toHaveLength(1)
+    expect(injected[0].inbound.text).toBe('Linear ENG-9 for you')
+  })
+
   it('does not dispatch when there is no chat target configured', () => {
     const { resolveAgentDir } = makeTmpResolveAgentDir()
     const injected: unknown[] = []

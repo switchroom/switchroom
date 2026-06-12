@@ -1,0 +1,8 @@
+{
+  "action": "fired",
+  "id": "evt-99",
+  "title": "Deploy finished",
+  "url": "https://ci.example.com/runs/99",
+  "assignee": "ops-bot",
+  "labels": ["prod", "deploy"]
+}

@@ -672,3 +672,67 @@ describe('handleWebhookIngest — Cloudflare edge lock (requireEdge)', () => {
     expect(result.status).toBe(401)
   })
 })
+
+// ─── Linear source ingest (#2272) ─────────────────────────────────────────────
+
+function makeLinearSig(body: Uint8Array, secret: string = SECRET): string {
+  // Bare hex digest — no sha256= prefix.
+  return createHmac('sha256', secret).update(body).digest('hex')
+}
+
+function linearArgs(body: Uint8Array, headers: Headers): WebhookHandlerArgs {
+  return {
+    agent: 'myagent',
+    source: 'linear',
+    body,
+    headers,
+    allowedSources: ['linear'],
+    config: { secrets: { linear: SECRET } },
+    agentExists: true,
+  }
+}
+
+describe('linear source ingest', () => {
+  const payload = { action: 'update', type: 'Issue', url: 'https://linear.app/x/ENG-1', data: { identifier: 'ENG-1', title: 'hi' } }
+
+  it('accepts a valid Linear-Signature and records the event', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody(payload)
+    const headers = new Headers()
+    headers.set('linear-signature', makeLinearSig(body))
+    const result = await handleWebhookIngest(
+      linearArgs(body, headers),
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(202)
+    const logged = JSON.parse(
+      readFileSync(join(resolveAgentDir('myagent'), 'telegram', 'webhook-events.jsonl'), 'utf-8').trim(),
+    ) as Record<string, unknown>
+    expect(logged.source).toBe('linear')
+    // event_type is the lower-cased linear `type`
+    expect(logged.event_type).toBe('issue')
+    expect(String(logged.rendered_text)).toContain('ENG-1')
+  })
+
+  it('rejects an invalid Linear-Signature with 401', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody(payload)
+    const headers = new Headers()
+    headers.set('linear-signature', makeLinearSig(body, 'wrong-secret'))
+    const result = await handleWebhookIngest(
+      linearArgs(body, headers),
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(401)
+  })
+
+  it('rejects a missing Linear-Signature with 401', async () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const body = makeBody(payload)
+    const result = await handleWebhookIngest(
+      linearArgs(body, new Headers()),
+      baseDeps(resolveAgentDir, 1000),
+    )
+    expect(result.status).toBe(401)
+  })
+})
