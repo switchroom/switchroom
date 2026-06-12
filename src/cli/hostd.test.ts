@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { renderHostdComposeFile } from "./hostd.js";
+import { renderHostdComposeFile, resolveHostdHostHome } from "./hostd.js";
 
 describe("renderHostdComposeFile", () => {
   it("renders a valid yaml-shaped string", () => {
@@ -129,5 +129,51 @@ describe("renderHostdComposeFile", () => {
   it("declares its own network so the hostd project doesn't accidentally join the agent fleet's net", () => {
     const out = renderHostdComposeFile({ hostHome: "/h", imageTag: "latest" });
     expect(out).toContain("name: switchroom-hostd-net");
+  });
+});
+
+describe("resolveHostdHostHome (in-container /host-home guard, #2279 gap)", () => {
+  it("prefers SWITCHROOM_HOST_HOME over homedir()", () => {
+    // In-container: homedir() is the poison /host-home, but the env carries
+    // the real host home (baked by a host-side install). Env wins.
+    expect(
+      resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "/home/operator" }, "/host-home"),
+    ).toBe("/home/operator");
+  });
+
+  it("falls back to homedir() when SWITCHROOM_HOST_HOME is unset", () => {
+    expect(resolveHostdHostHome({}, "/home/alice")).toBe("/home/alice");
+  });
+
+  it("treats empty/whitespace SWITCHROOM_HOST_HOME as unset", () => {
+    expect(resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "   " }, "/home/alice")).toBe(
+      "/home/alice",
+    );
+  });
+
+  it("THROWS when the resolved home is /host-home (the in-container poison)", () => {
+    // The exact fleet-killer: in-container install, no SWITCHROOM_HOST_HOME,
+    // homedir() === /host-home. Must fail loud, not emit a poisoned compose.
+    expect(() => resolveHostdHostHome({}, "/host-home")).toThrow(/refusing to generate/);
+    expect(() => resolveHostdHostHome({}, "/host-home")).toThrow(/run.*from the HOST/i);
+  });
+
+  it("THROWS when SWITCHROOM_HOST_HOME itself is /host-home (self-perpetuation guard)", () => {
+    // A previously-poisoned compose baked SWITCHROOM_HOST_HOME=/host-home;
+    // reading it back must not re-poison — the backstop catches it too.
+    expect(() =>
+      resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "/host-home" }, "/home/alice"),
+    ).toThrow(/refusing to generate/);
+  });
+
+  it("THROWS for any path UNDER /host-home", () => {
+    expect(() => resolveHostdHostHome({}, "/host-home/nested")).toThrow(
+      /refusing to generate/,
+    );
+  });
+
+  it("accepts a real host home unchanged", () => {
+    expect(resolveHostdHostHome({}, "/home/operator")).toBe("/home/operator");
+    expect(resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "/root" }, "/home/x")).toBe("/root");
   });
 });
