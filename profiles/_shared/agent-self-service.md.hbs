@@ -28,13 +28,32 @@ tools is to let you do the edit yourself.
 
 ### Tools
 
-- **`schedule_add(cron_expr, prompt, name?, secrets?)`** — append a new schedule
-  entry. The `prompt` is what *you* (the agent) will receive when the cron
-  fires; phrase it from your future-self's perspective (e.g.
-  `"Time for the daily digest — pull yesterday's GitHub activity and DM the
-  summary to chat 12345"`, not `"please send the digest"`). Optional
+- **`schedule_add(cron_expr, prompt, name?, secrets?, model?, context?)`** —
+  append a new schedule entry. Takes effect within **~30s** (the scheduler
+  hot-reloads — no restart needed). The `prompt` is what *you* (the agent) will
+  receive when the cron fires; phrase it from your future-self's perspective
+  (e.g. `"Time for the daily digest — pull yesterday's GitHub activity and DM
+  the summary to chat 12345"`, not `"please send the digest"`). Optional
   `name` is a stable slug for `schedule_remove`; if omitted, a 12-hex hash
   derived from the entry content is assigned.
+
+  **Mind the cost — pick the cheapest tier that does the job:**
+  - *Default (no `model`)* — the fire runs as a **full turn in your live
+    session**: your model, your whole context + memory. Right for work that
+    genuinely needs *you* (your persona, your conversation history). Costly for
+    routine checks — every fire pays your full context.
+  - *`model: "sonnet"`* (or `context: "fresh"`) — routes the fire to a **cheap,
+    minimal-context cron session** (Tier 1): a fresh Sonnet with just the
+    prompt, no heavy context. Use for light, self-contained recurring work
+    (summarise a feed, format a digest) where you don't need your memory. Much
+    cheaper per fire. *(Honoured only when the operator has enabled cheap-cron;
+    otherwise it still runs as a normal turn — never silently dropped.)*
+  - *"Only act when X changes"* — don't poll with a frequent prompt cron (every
+    fire is a wasted turn when nothing changed). Ask the **operator** to set up
+    a **poll** (model-free check, e.g. a webpage/API via `kind: poll`) or, for
+    reaction-triggered work, **`reaction_dispatch`** (an emoji reaction wakes
+    you instantly — zero polling). These need an operator config commit
+    (egress/identity gates), so request them rather than authoring them yourself.
 
 - **`schedule_remove(name | cron_hash)`** — delete by `name` (the slug from
   add) or by 12-hex `cron_hash` (shown in `cron_list` output). Both

@@ -32,12 +32,45 @@ describe("scheduleAdd — happy path", () => {
     expect(r.cron_hash).toBe(expected);
     expect(r.slug).toBe(`cron-${expected}`);
     expect(r.would_recreate).toBe(false);
-    expect(r.restart_required).toBe(true);
-    expect(r.restart_hint).toContain("alice");
-    expect(r.restart_hint).toMatch(/restart/i);
+    // Since #2293 the scheduler hot-reloads, so an add is live within ~30s
+    // with no restart (hot-reload is on by default).
+    expect(r.restart_required).toBe(false);
+    expect(r.restart_hint).toMatch(/~30s|hot-reload|no restart/i);
     expect(existsSync(r.path)).toBe(true);
     const content = readFileSync(r.path, "utf-8");
     expect(content).toContain("prompt: morning standup");
+  });
+
+  it("reports restart_required + names the agent when hot-reload is disabled", () => {
+    const prev = process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD;
+    process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD = "0";
+    try {
+      const r = scheduleAdd({ agent: "alice", cronExpr: "0 7 * * *", prompt: "frozen", root });
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(r.restart_required).toBe(true);
+      expect(r.restart_hint).toContain("alice");
+      expect(r.restart_hint).toMatch(/restart/i);
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD;
+      else process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD = prev;
+    }
+  });
+
+  it("authors a Tier-1 cheap-cron entry with --model / --context", () => {
+    const r = scheduleAdd({
+      agent: "alice",
+      cronExpr: "0 8 * * *",
+      prompt: "daily digest",
+      model: "sonnet",
+      context: "fresh",
+      root,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const content = readFileSync(r.path, "utf-8");
+    expect(content).toContain("model: sonnet");
+    expect(content).toContain("context: fresh");
   });
 });
 
@@ -144,8 +177,9 @@ describe("scheduleRemove", () => {
     const r = scheduleRemove({ cronHash: add.cron_hash, root });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.restart_required).toBe(true);
-    expect(r.restart_hint).toContain("alice");
+    // Hot-reload (#2293): a remove is picked up within ~30s, no restart.
+    expect(r.restart_required).toBe(false);
+    expect(r.restart_hint).toMatch(/~30s|hot-reload|no restart/i);
     expect(existsSync(add.path)).toBe(false);
   });
 
