@@ -17,7 +17,7 @@ defaults:
       prompt: "Weekly review: summarize this week's progress and next week's goals"
 ```
 
-Run `switchroom agent create <name>` or `switchroom agent reconcile <name>` to materialize the schedule, then `switchroom agent restart <name>` so the in-container scheduler re-registers the new timers.
+Run `switchroom agent create <name>` or `switchroom agent reconcile <name>` to materialize the schedule. The in-container scheduler **hot-reloads** the change within ~30s — no restart needed (see "no restart required" below).
 
 ### 2. Conversational / per-agent overlay (no YAML edit)
 
@@ -40,7 +40,9 @@ switchroom cron list
 
 This same surface is exposed over the **agent-config MCP broker**, so an agent can manage *its own* schedule when you ask it in chat ("set up a daily 8am briefing"). Identity is pinned to `$SWITCHROOM_AGENT_NAME`; cross-agent writes are denied (exit 7). Run `switchroom schedule --help` for the full flag list.
 
-Either way, a schedule change takes effect once the in-container scheduler re-registers — on the next `switchroom agent restart <name>` (or any container restart). There is no hot-reload; the scheduler reads config at boot.
+Either way, a schedule change takes effect **automatically, without a restart**. The in-container scheduler **hot-reloads**: it re-reads `switchroom.yaml` + the `schedule.d` overlay on a short poll (default 30s, `SWITCHROOM_SCHEDULER_RELOAD_POLL_MS`) and, when the effective schedule changes, swaps the live cron timers in place — the tmux/agent session is untouched. So a removed entry stops firing and a new one starts within ~30s. An agent that authors its *first* cron (previously schedule-less) restarts its own scheduler sibling once to activate (a clean ~1s self-restart, no container bounce). A restart is no longer required for schedule edits to take effect.
+
+Hot-reload is on by default; set `SWITCHROOM_SCHEDULER_HOT_RELOAD=0` to freeze the schedule at boot (the pre-reload behaviour). A schedule edit that doesn't take effect within a minute is the signal to check `SWITCHROOM_SCHEDULER_HOT_RELOAD` and the `agent-scheduler.log` for a `reload skipped (config error…)` line (an overlay file caught mid-write keeps the current schedule and retries next tick).
 
 ### Release-triggered fleet restart (opt-in, #1743)
 
