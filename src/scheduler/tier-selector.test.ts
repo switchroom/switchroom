@@ -88,6 +88,26 @@ describe("recommendCronTier — cadence default (no explicit hint)", () => {
       expect(recommendCronTier({ smallestGapMin: gap }).reason.length).toBeGreaterThan(0);
     }
   });
+
+  it("explicit kind: 'prompt' (no model/context) falls through to the cadence default", () => {
+    // 'prompt' is the no-op kind — it must NOT short-circuit; cadence decides.
+    const frequent = recommendCronTier({ smallestGapMin: 5, kind: "prompt" });
+    expect(frequent.tier).toBe("cheap");
+    expect(frequent.source).toBe("cadence-default");
+    const daily = recommendCronTier({ smallestGapMin: 1440, kind: "prompt" });
+    expect(daily.tier).toBe("main");
+    expect(daily.source).toBe("cadence-default");
+  });
+
+  it("degenerate gaps don't crash and resolve deterministically", () => {
+    // smallestGapMin comes from extractCronSmallestGapMin (positive ints) upstream,
+    // but the selector must still be total: 0/negative ≤ threshold → cheap;
+    // NaN/Infinity fail the ≤ comparison → main. Never throws.
+    expect(recommendCronTier({ smallestGapMin: 0 }).tier).toBe("cheap");
+    expect(recommendCronTier({ smallestGapMin: -5 }).tier).toBe("cheap");
+    expect(recommendCronTier({ smallestGapMin: Number.NaN }).tier).toBe("main");
+    expect(recommendCronTier({ smallestGapMin: Number.POSITIVE_INFINITY }).tier).toBe("main");
+  });
 });
 
 describe("resolveFrequentGapMin", () => {
