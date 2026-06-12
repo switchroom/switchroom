@@ -14,7 +14,8 @@ import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
-import { loadConfig } from "../config/loader.js";
+import { loadConfig, resolvePath } from "../config/loader.js";
+import { getViaBrokerStructured, resolveBrokerSocketPath } from "../vault/broker/client.js";
 import { containerName } from "../agents/lifecycle.js";
 import {
   handleGetAgents,
@@ -271,6 +272,53 @@ function loadWebhookSecrets(): Record<string, Record<string, string>> {
   }
 }
 
+/**
+ * Resolve a webhook source's signature secret from the vault at
+ * `webhook/<agent>/<source>` — the location `switchroom telegram enable
+ * webhook` writes it to. Read via the vault broker as the web server's
+ * own (operator) identity; the secret must therefore be broker-readable
+ * by the operator (i.e. NOT scoped `--allow <agent>`, which would lock
+ * out the verifier). Returns the raw string secret, or null when the key
+ * is absent / the broker is unreachable / the entry isn't a string —
+ * every null path fails closed (the route returns 401 "no secret").
+ *
+ * Non-throwing: a broker hiccup must not 500 the webhook endpoint.
+ */
+export async function resolveWebhookSecretFromVault(
+  agent: string,
+  source: string,
+  config: SwitchroomConfig,
+): Promise<string | null> {
+  const key = `webhook/${agent}/${source}`;
+  try {
+    const socket = resolveBrokerSocketPath({
+      vaultBrokerSocket: config.vault?.broker?.socket
+        ? resolvePath(config.vault.broker.socket)
+        : undefined,
+    });
+    const result = await getViaBrokerStructured(key, { socket });
+    if (result.kind === "ok" && result.entry.kind === "string") {
+      return result.entry.value;
+    }
+    // not_found is the common, benign "webhook not enabled / no vault
+    // secret" case — stay quiet. denied/unreachable are misconfigurations
+    // worth a log line (e.g. the secret got scoped `--allow <agent>`,
+    // which denies the operator-identity verifier).
+    if (result.kind === "denied" || result.kind === "unreachable") {
+      process.stderr.write(
+        `webhook-ingest: vault resolve for ${key} → ${result.kind}` +
+        `${"code" in result && result.code ? ` (${result.code})` : ""}` +
+        `; webhook will 401 until the secret is operator-readable\n`,
+      );
+    }
+  } catch (err) {
+    process.stderr.write(
+      `webhook-ingest: vault resolve for ${key} threw: ${(err as Error).message}\n`,
+    );
+  }
+  return null;
+}
+
 async function handleWebhookRoute(
   req: Request,
   agent: string,
@@ -286,8 +334,22 @@ async function handleWebhookRoute(
   // it, so reading from the new spot covers both old and new
   // switchroom.yaml shapes.
   const allowedSources = agentConfig?.channels?.telegram?.webhook_sources ?? [];
+  // Two secret sources, file-first:
+  //  1. webhook-secrets.json — the legacy operator-managed file (github
+  //     secrets for hand-wired agents). Kept for backwards compatibility.
+  //  2. The vault under `webhook/<agent>/<source>` — the CANONICAL path
+  //     since `switchroom telegram enable webhook` (src/cli/telegram.ts),
+  //     which vault-stores the per-source secret. The receiver historically
+  //     only read the file (loadWebhookSecrets' "future PR" TODO), so every
+  //     CLI-enabled webhook 401'd "no secret in vault" — its secret was in
+  //     the vault but nothing here resolved it. Resolve it now, only when
+  //     the file doesn't already supply this source (file wins).
   const allSecrets = loadWebhookSecrets();
-  const agentSecrets = allSecrets[agent] ?? {};
+  const agentSecrets: Record<string, string> = { ...(allSecrets[agent] ?? {}) };
+  if (!agentSecrets[source]) {
+    const fromVault = await resolveWebhookSecretFromVault(agent, source, config);
+    if (fromVault) agentSecrets[source] = fromVault;
+  }
 
   // Cloudflare-only edge lock (Phase 2). Per-agent opt-in; the secret
   // itself is endpoint-global (one file guards the whole receiver). Loaded
