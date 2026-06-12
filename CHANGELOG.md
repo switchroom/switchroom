@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.15.7 — hostd install resolves the real host home (close #2279 gap)
+
+A fleet-killer hardening release.
+
+### `hostd install` is container-context-safe (#2285)
+
+- `switchroom hostd install` regenerated its OWN compose bind-mount **sources**
+  via bare `homedir()`. When that regen runs inside the hostd container (the
+  `/update apply` → refresh-hostd path), `homedir()` returns `/host-home` — the
+  in-container mount point of the operator home, not a host path. Docker then
+  auto-created empty `/host-home/...` dirs on the host, the config mount was
+  empty, and **hostd crash-looped on `ConfigError: Failed to read config file:
+  /state/config/switchroom.yaml`** (observed live 2026-06-12, all agents cut off
+  from host control). The poison also re-baked into the new compose's
+  `SWITCHROOM_HOST_HOME`, self-perpetuating.
+- #2279 fixed this exact class for the agent-fleet generator but left
+  `hostd install` on bare `homedir()`. New `resolveHostdHostHome()` mirrors the
+  canonical resolver (`SWITCHROOM_HOST_HOME || homedir()`) and **refuses to emit
+  when the resolved home is `/host-home` or under it** — failing loud with the
+  "run from the HOST" recovery path instead of writing a daemon-killing compose.
+  The self-perpetuation guard also rejects a `SWITCHROOM_HOST_HOME` that is
+  itself `/host-home`.
+
 ## v0.15.6 — webhook dispatch for generic + Linear sources
 
 Extends agent-waking webhook dispatch beyond GitHub (epic #717).
