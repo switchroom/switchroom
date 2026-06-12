@@ -69,6 +69,9 @@ interface ToolArgs {
   secrets?: string[];
   name?: string;
   cron_hash?: string;
+  // schedule_add cheap-cron tier hints
+  model?: string;
+  context?: string;
   // skill_install (#1163 Phase 2)
   source?: string;
   // peers_list
@@ -132,10 +135,17 @@ export const TOOLS = [
   {
     name: "schedule_add",
     description:
-      "Append a cron schedule entry to the agent's overlay dir. " +
-      "Overlay-sourced entries with non-empty `secrets:` are REJECTED " +
-      "(E_OVERLAY_SECRETS_REQUIRES_APPROVAL); operator-authored entries " +
-      "in switchroom.yaml are unaffected.",
+      "Append a cron schedule entry to your overlay. Takes effect within ~30s — " +
+      "the scheduler hot-reloads, no restart needed. Overlay entries with " +
+      "non-empty `secrets:` are REJECTED (E_OVERLAY_SECRETS_REQUIRES_APPROVAL). " +
+      "COST: by default each fire runs as a full turn in your live session " +
+      "(your model, your whole context) — fine for work that needs your memory/" +
+      "persona, but costly for routine checks. For a lighter recurring task, set " +
+      "`model: \"sonnet\"` to run that fire in a cheap, minimal-context cron " +
+      "session instead (saves tokens; needs cheap-cron enabled by the operator). " +
+      "For 'only do something when X changes' (e.g. a webpage, or a reaction), " +
+      "ask the operator to set up a poll or reaction-dispatch instead of a " +
+      "frequent prompt cron — far cheaper than polling with a full turn.",
     inputSchema: {
       type: "object" as const,
       required: ["cron_expr", "prompt"],
@@ -144,6 +154,22 @@ export const TOOLS = [
         prompt: { type: "string", minLength: 1, maxLength: 4000 },
         secrets: { type: "array", items: { type: "string" } },
         name: { type: "string", pattern: "^[a-z0-9-]{1,40}$" },
+        model: {
+          type: "string",
+          description:
+            "Optional cheap-cron tier hint. A known-cheap model ('sonnet'/'haiku') " +
+            "routes this fire to a fresh, minimal-context cron session (Tier 1) " +
+            "instead of your full live session (Tier 2) — cheaper per fire. Omit " +
+            "for context-heavy work that needs your memory/persona. Inert unless " +
+            "the operator has enabled cheap-cron.",
+        },
+        context: {
+          type: "string",
+          enum: ["fresh", "agent"],
+          description:
+            "Tier hint: 'fresh' = minimal-context cheap session (Tier 1); 'agent' " +
+            "= your full live session (Tier 2). Usually inferred from `model`.",
+        },
       },
     },
   },
@@ -447,6 +473,8 @@ export function dispatchTool(
       if (a.agent) base.push("--agent", a.agent);
       if (a.name) base.push("--name", a.name);
       if (a.secrets && a.secrets.length > 0) base.push("--secrets", a.secrets.join(","));
+      if (a.model) base.push("--model", a.model);
+      if (a.context) base.push("--context", a.context);
       cliArgs = base;
       parseMode = "json";
       break;

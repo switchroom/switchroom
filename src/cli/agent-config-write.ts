@@ -37,7 +37,8 @@ import { parse as parseYaml, stringify as yamlStringify } from "yaml";
 import {
   appendAudit,
   resolveTargetAgent,
-  restartRequiredNote,
+  scheduleLiveNote,
+  scheduleRestartRequired,
 } from "./agent-config.js";
 import {
   writeOverlayEntry,
@@ -251,6 +252,18 @@ interface AddOpts {
   prompt: string;
   secrets?: string[];
   name?: string;
+  /**
+   * Cheap-cron tier hint (docs/rfcs/cheap-cron-sessions.md). A known-cheap
+   * model id (sonnet/haiku) routes this fire to a fresh, minimal-context
+   * cron session (Tier 1) instead of the agent's full live session (Tier 2),
+   * cutting per-fire token cost. Honoured only when SWITCHROOM_CHEAP_CRON is
+   * on; otherwise inert (the fire still runs as a normal turn). Agent-authorable
+   * — no security gate (unlike `poll`, which needs an operator egress commit).
+   */
+  model?: string;
+  /** Tier hint: 'fresh' → minimal-context cheap session (Tier 1); 'agent' →
+   *  the agent's live session (Tier 2). Unset → inferred from `model`. */
+  context?: "fresh" | "agent";
   /** Test-only: override overlay root. */
   root?: string;
   /**
@@ -277,9 +290,10 @@ export interface ScheduleAddResult {
   path: string;
   cron_hash: string;
   would_recreate: false;
-  /** Entry is on disk but the in-container scheduler captured its
-   *  entries at boot — not live until the agent restarts. */
-  restart_required: true;
+  /** Since #2293 the in-agent scheduler hot-reloads the overlay, so this
+   *  is `false` by default (entry is live within ~30s). It is only `true`
+   *  when hot-reload is disabled (`SWITCHROOM_SCHEDULER_HOT_RELOAD=0`). */
+  restart_required: boolean;
   restart_hint: string;
 }
 
@@ -335,6 +349,10 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
   };
   if (opts.secrets && opts.secrets.length > 0) entry.secrets = opts.secrets;
   if (opts.name) entry.name = opts.name;
+  // Cheap-cron tier hints (inert unless SWITCHROOM_CHEAP_CRON is on). Plain
+  // ScheduleEntry fields validated by ScheduleEntrySchema on reconcile.
+  if (opts.model) entry.model = opts.model;
+  if (opts.context) entry.context = opts.context;
 
   // We construct the doc as { schedule: [entry] }. `name` is NOT a
   // schema field on ScheduleEntrySchema today — we stash it in a
@@ -460,8 +478,8 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
     path,
     cron_hash: hash,
     would_recreate: false,
-    restart_required: true,
-    restart_hint: restartRequiredNote(agent),
+    restart_required: scheduleRestartRequired(),
+    restart_hint: scheduleLiveNote(agent),
   };
 }
 
@@ -489,12 +507,21 @@ export function scheduleAddOrStage(
   if (stageReason === null) return r;
 
   const agent = resolveTargetAgent(opts.agent);
-  const entry: { cron: string; prompt: string; secrets?: string[]; name?: string } = {
+  const entry: {
+    cron: string;
+    prompt: string;
+    secrets?: string[];
+    name?: string;
+    model?: string;
+    context?: "fresh" | "agent";
+  } = {
     cron: opts.cronExpr,
     prompt: opts.prompt,
   };
   if (opts.secrets && opts.secrets.length > 0) entry.secrets = opts.secrets;
   if (opts.name) entry.name = opts.name;
+  if (opts.model) entry.model = opts.model;
+  if (opts.context) entry.context = opts.context;
 
   // Reconstruct the YAML body we WOULD have written. Mirrors the
   // scheduleAdd doc-build (filter `name` out of the schedule entry;
@@ -536,7 +563,9 @@ export interface ScheduleRemoveResult {
   ok: true;
   slug: string;
   path: string;
-  restart_required: true;
+  /** `false` by default (hot-reload removes the entry within ~30s); `true`
+   *  only when `SWITCHROOM_SCHEDULER_HOT_RELOAD=0`. */
+  restart_required: boolean;
   restart_hint: string;
 }
 
@@ -620,8 +649,8 @@ export function scheduleRemove(opts: RemoveOpts): ScheduleRemoveResult | Schedul
     ok: true,
     slug: match.slug,
     path: match.path,
-    restart_required: true,
-    restart_hint: restartRequiredNote(agent),
+    restart_required: scheduleRestartRequired(),
+    restart_hint: scheduleLiveNote(agent),
   };
 }
 
@@ -639,6 +668,14 @@ export function registerAgentConfigWriteCommands(program: Command): void {
     .option("--secrets <list>", "Comma-separated vault keys (REJECTED for agent-authored overlays)")
     .option("--name <slug>", "Optional human-readable name (a-z 0-9 -)")
     .option(
+      "--model <id>",
+      "Cheap-cron tier hint: a known-cheap model (sonnet/haiku) routes this fire to a fresh, minimal-context cron session (Tier 1) instead of the agent's full live session (Tier 2), cutting token cost. Inert unless SWITCHROOM_CHEAP_CRON is on.",
+    )
+    .option(
+      "--context <mode>",
+      "Tier hint: 'fresh' (minimal-context cheap session) or 'agent' (full live session). Unset → inferred from --model.",
+    )
+    .option(
       "--stage-on-reject",
       "When a security gate trips (secrets/quota/min-interval), stage the entry under .pending/ for operator approval instead of rejecting with exit 9. Used by the MCP path; operator CLI defaults to off.",
     )
@@ -648,8 +685,14 @@ export function registerAgentConfigWriteCommands(program: Command): void {
       prompt: string;
       secrets?: string;
       name?: string;
+      model?: string;
+      context?: string;
       stageOnReject?: boolean;
     }) => {
+      if (opts.context && opts.context !== "fresh" && opts.context !== "agent") {
+        emitError("E_INVALID_PROMPT", "--context must be 'fresh' or 'agent'");
+        process.exit(1);
+      }
       const secrets = opts.secrets
         ? opts.secrets.split(",").map((s) => s.trim()).filter(Boolean)
         : undefined;
@@ -670,6 +713,8 @@ export function registerAgentConfigWriteCommands(program: Command): void {
           prompt: opts.prompt,
           secrets,
           name: opts.name,
+          model: opts.model,
+          context: opts.context as "fresh" | "agent" | undefined,
         });
       } catch (err) {
         // Cross-agent denial path (matches read-side: exit 7).

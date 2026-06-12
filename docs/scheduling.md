@@ -222,6 +222,19 @@ Trade-off: scheduled tasks now share session context (better for "remember what 
 
 If the agent is down at fire time, the in-container sidecar can't deliver — the boot-time replay window catches up to 30 minutes; anything older is explicitly reported via the [skipped-run notice](#skipped-run-notice-downtime-longer-than-the-replay-window), not silently dropped.
 
+### Controlling per-fire cost (tiers)
+
+Because each fire is a full turn in the live session by default, a frequent cron pays the agent's whole context every time — wasteful for routine checks. Entries (and `schedule_add`) take optional tier hints, honoured when `SWITCHROOM_CHEAP_CRON` is enabled (see `docs/rfcs/cheap-cron-sessions.md`):
+
+| You want… | Use | Cost |
+|---|---|---|
+| The fire to act *as the agent* (persona, memory, recent chat) | default (no `model`) — **Tier 2** | full live-session turn |
+| Light, self-contained work (summarise/format) — no memory needed | `model: sonnet` / `context: fresh` — **Tier 1** | a fresh minimal-context cheap session |
+| "Only do something when X changes" (a webpage/API) | `kind: poll` (operator-set; egress-gated) — **Tier 0** | model-free check; a model fire only on a *hit* |
+| "Do something when a message is reacted to" | **`reaction_dispatch`** (event-driven, #2291) — not a cron at all | zero polling; the reaction wakes the agent |
+
+Agents can self-author the `model`/`context` hints (no security gate). `kind: poll` and `reaction_dispatch` need an operator config commit (egress / identity gates), so an agent should *request* them. With the flag off, all hints are inert — every fire is a normal Tier-2 turn (a `kind: poll` entry fires its escalation prompt directly); disabling cheap-cron can never silently drop a cron.
+
 ## Managing the scheduler
 
 ```bash

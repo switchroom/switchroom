@@ -206,6 +206,29 @@ export function restartRequiredNote(agent: string): string {
   );
 }
 
+/**
+ * Schedule-specific liveness note. Since #2293 the in-agent scheduler
+ * HOT-RELOADS the schedule.d overlay (default on; `SWITCHROOM_SCHEDULER_HOT_RELOAD=0`
+ * freezes it), so a schedule add/remove takes effect within ~30s with NO
+ * restart — unlike skills/MCP, which still load at boot. Kept distinct
+ * from {@link restartRequiredNote} so the agent gets accurate guidance and
+ * doesn't pointlessly bounce itself. The env read mirrors `isHotReloadEnabled`
+ * in src/agent-scheduler/index.ts (kept inline to avoid pulling node-cron
+ * into the CLI bundle).
+ */
+export function scheduleRestartRequired(): boolean {
+  // Hot-reload on (default) ⇒ no restart. Only `=0` (frozen-at-boot) requires one.
+  return (process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD ?? "") === "0";
+}
+
+export function scheduleLiveNote(agent: string): string {
+  const hotReload = (process.env.SWITCHROOM_SCHEDULER_HOT_RELOAD ?? "") !== "0";
+  return hotReload
+    ? `Live within ~30s — the in-agent scheduler hot-reloads the overlay; no restart needed.`
+    : `Not live yet — hot-reload is disabled (SWITCHROOM_SCHEDULER_HOT_RELOAD=0). ` +
+        `Run \`switchroom agent restart ${agent}\` for this to take effect.`;
+}
+
 function getAgentSlice(config: SwitchroomConfig, agent: string): unknown {
   const slice = config.agents?.[agent];
   if (!slice) {
