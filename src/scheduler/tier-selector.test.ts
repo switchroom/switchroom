@@ -1,0 +1,101 @@
+/**
+ * Tests for the deterministic cron tier selector (the cheap-crons JTBD
+ * value-gate). The decision space is small and fully enumerated here —
+ * the operator's bar is "prove determinism by enumeration, not sampling".
+ */
+
+import { describe, it, expect } from "vitest";
+import {
+  recommendCronTier,
+  resolveFrequentGapMin,
+  DEFAULT_FREQUENT_GAP_MIN,
+  type TierRecommendation,
+} from "./tier-selector.js";
+
+describe("recommendCronTier — explicit hints win (override the cadence default)", () => {
+  it("kind: poll → Tier 0, regardless of cadence", () => {
+    for (const gap of [1, 60, 1440]) {
+      const r = recommendCronTier({ smallestGapMin: gap, kind: "poll" });
+      expect(r.tier).toBe("poll");
+      expect(r.source).toBe("explicit");
+    }
+  });
+
+  it("context: fresh → cheap; context: agent → main (even when cadence would say otherwise)", () => {
+    // context: agent on a frequent cron — explicit beats the frequent→cheap default.
+    expect(recommendCronTier({ smallestGapMin: 5, context: "agent" }).tier).toBe("main");
+    // context: fresh on a daily cron — explicit beats the infrequent→main default.
+    expect(recommendCronTier({ smallestGapMin: 1440, context: "fresh" }).tier).toBe("cheap");
+  });
+
+  it("a known-cheap model → cheap; opus/custom → main", () => {
+    expect(recommendCronTier({ smallestGapMin: 1440, model: "sonnet" }).tier).toBe("cheap");
+    expect(recommendCronTier({ smallestGapMin: 1440, model: "claude-haiku-4-5" }).tier).toBe("cheap");
+    expect(recommendCronTier({ smallestGapMin: 5, model: "opus" }).tier).toBe("main");
+    expect(recommendCronTier({ smallestGapMin: 5, model: "claude-opus-4-8" }).tier).toBe("main");
+    // a custom/unknown id is conservatively the full session, not cheap.
+    expect(recommendCronTier({ smallestGapMin: 5, model: "my-custom-id" }).tier).toBe("main");
+  });
+
+  it("every explicit-hint path is sourced 'explicit'", () => {
+    const explicit: TierRecommendation[] = [
+      recommendCronTier({ smallestGapMin: 5, kind: "poll" }),
+      recommendCronTier({ smallestGapMin: 5, context: "fresh" }),
+      recommendCronTier({ smallestGapMin: 5, context: "agent" }),
+      recommendCronTier({ smallestGapMin: 5, model: "sonnet" }),
+      recommendCronTier({ smallestGapMin: 5, model: "opus" }),
+    ];
+    for (const r of explicit) expect(r.source).toBe("explicit");
+  });
+});
+
+describe("recommendCronTier — cadence default (no explicit hint)", () => {
+  it("frequent (≤ threshold) defaults to cheap", () => {
+    for (const gap of [1, 5, 15, 30, 59, 60]) {
+      const r = recommendCronTier({ smallestGapMin: gap });
+      expect(r.tier).toBe("cheap");
+      expect(r.source).toBe("cadence-default");
+    }
+  });
+
+  it("infrequent (> threshold) defaults to the agent session", () => {
+    for (const gap of [61, 120, 1440, 10080]) {
+      const r = recommendCronTier({ smallestGapMin: gap });
+      expect(r.tier).toBe("main");
+      expect(r.source).toBe("cadence-default");
+    }
+  });
+
+  it("the boundary is inclusive at the threshold (60 → cheap, 61 → main)", () => {
+    expect(recommendCronTier({ smallestGapMin: 60 }).tier).toBe("cheap");
+    expect(recommendCronTier({ smallestGapMin: 61 }).tier).toBe("main");
+  });
+
+  it("respects an overridden threshold", () => {
+    // With a 10-min threshold, a 15-min cron is now 'infrequent' → main.
+    expect(recommendCronTier({ smallestGapMin: 15 }, 10).tier).toBe("main");
+    expect(recommendCronTier({ smallestGapMin: 10 }, 10).tier).toBe("cheap");
+  });
+
+  it("is deterministic — identical input yields identical output", () => {
+    const a = recommendCronTier({ smallestGapMin: 30 });
+    const b = recommendCronTier({ smallestGapMin: 30 });
+    expect(a).toEqual(b);
+  });
+
+  it("always produces a reason string", () => {
+    for (const gap of [5, 60, 61, 1440]) {
+      expect(recommendCronTier({ smallestGapMin: gap }).reason.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("resolveFrequentGapMin", () => {
+  it("defaults to 60 and floors invalid/non-positive overrides", () => {
+    expect(resolveFrequentGapMin({})).toBe(DEFAULT_FREQUENT_GAP_MIN);
+    expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "30" })).toBe(30);
+    expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "0" })).toBe(60);
+    expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "-5" })).toBe(60);
+    expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "nope" })).toBe(60);
+  });
+});
