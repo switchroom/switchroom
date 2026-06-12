@@ -395,6 +395,95 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
 }
 
 /**
+ * Stable change-detection signature for an agent's schedule entries.
+ *
+ * The agent-scheduler loads the schedule (switchroom.yaml + the
+ * `schedule.d/*.yaml` overlay) ONCE at boot. Agents self-author cron
+ * entries via their agent-config tools, and operators edit the overlay
+ * — but without a reload those edits don't take effect until the
+ * container restarts, so a *removed* entry keeps firing (a zombie
+ * schedule that burns a wasted turn every interval) and a *new* entry
+ * never runs. This signature lets the reload watcher cheaply detect
+ * "did the effective schedule change?" by value, independent of file
+ * mtimes (which are unreliable over Docker bind mounts).
+ */
+export function scheduleSignature(entries: SchedulerEntry[]): string {
+  // JSON of the full entry array, in collectScheduleEntries' deterministic
+  // order. Captures cron, prompt, promptKey, scheduleIndex AND the
+  // cheap-cron routing fields (kind/poll/model/session) — any of which
+  // changes scheduling behaviour.
+  return JSON.stringify(entries);
+}
+
+export interface ScheduleReloader {
+  /** One poll: reload entries, and if the signature changed, stop the
+   *  current tasks and re-register. Never throws — a transient config
+   *  parse error (e.g. an overlay caught mid-write) keeps the current
+   *  schedule and is reported via onError. */
+  tick(): void;
+  /** The currently-live tasks (post-reload) — shutdown must stop THESE,
+   *  not the boot set, or a reloaded-away task leaks. */
+  currentTasks(): RegisteredTask[];
+}
+
+/**
+ * In-process schedule hot-reload (no container restart).
+ *
+ * Pure orchestration — fs / node-cron live behind the injected
+ * `loadEntries` and `register` callbacks, so this is unit-testable with
+ * fakes. The container's tmux/agent session is untouched; only the cron
+ * task set is swapped. Replay is a boot-only concern and is deliberately
+ * NOT re-run here (a reload is not a restart — it must not resurrect
+ * missed fires).
+ */
+export function createScheduleReloader(opts: {
+  loadEntries: () => SchedulerEntry[];
+  register: (entries: SchedulerEntry[]) => RegisteredTask[];
+  initialTasks: RegisteredTask[];
+  initialEntries: SchedulerEntry[];
+  log: (msg: string) => void;
+  onError?: (err: Error) => void;
+}): ScheduleReloader {
+  let tasks = opts.initialTasks;
+  let sig = scheduleSignature(opts.initialEntries);
+  return {
+    tick(): void {
+      let next: SchedulerEntry[];
+      try {
+        next = opts.loadEntries();
+      } catch (err) {
+        opts.onError?.(err as Error);
+        return; // keep the current schedule on a transient load error
+      }
+      const nextSig = scheduleSignature(next);
+      if (nextSig === sig) return;
+      const before = tasks.length;
+      for (const t of tasks) t.task.stop();
+      tasks = opts.register(next);
+      sig = nextSig;
+      opts.log(`schedule reloaded: ${before} → ${tasks.length} task(s)`);
+    },
+    currentTasks(): RegisteredTask[] {
+      return tasks;
+    },
+  };
+}
+
+/** Reload poll cadence (ms). Overlay edits are rare and detection within
+ *  ~30s is plenty; the poll is a yaml re-parse + a few overlay file reads,
+ *  negligible CPU. Floored at 1s. */
+export function resolveReloadPollMs(env: NodeJS.ProcessEnv): number {
+  const raw = Number.parseInt(env.SWITCHROOM_SCHEDULER_RELOAD_POLL_MS ?? "", 10);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 30_000;
+}
+
+/** Hot-reload is on by default; `SWITCHROOM_SCHEDULER_HOT_RELOAD=0` restores
+ *  the pre-reload behaviour (schedule frozen at boot). */
+export function isHotReloadEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.SWITCHROOM_SCHEDULER_HOT_RELOAD !== "0";
+}
+
+/**
  * Build an `InboundDispatcher` backed by a local IPC client that
  * writes `inject_inbound` envelopes to the gateway. Tests pass a
  * capturing dispatcher directly to `registerAgentSchedule` and skip
@@ -481,12 +570,46 @@ export async function main(): Promise<void> {
     // agent. setInterval is enough to peg the event loop; container
     // restart re-runs main() and re-reads config, so a future
     // `apply` that adds schedule entries gets picked up cleanly.
-    setInterval(() => { /* idle */ }, 1 << 30);
+    //
+    // Hot-reload (cold 0→N): an agent that self-authors its FIRST cron
+    // (or an operator adding one to a previously schedule-less agent)
+    // shouldn't have to wait for a manual bounce. A lightweight watcher
+    // detects entries appearing and exits(0) so the supervisor reboots
+    // straight into the active path above — which sets up the sink / IPC
+    // / replay that a 0-entry boot deliberately skipped. The exit is
+    // clean and the sidecar typically ran ≫60s, so the supervisor's
+    // backoff counter resets (no penalty). Guarded against flapping: we
+    // only exit when entries are genuinely non-empty.
+    let idleTimer: ReturnType<typeof setInterval>;
+    if (isHotReloadEnabled(process.env)) {
+      idleTimer = setInterval(() => {
+        let appeared: SchedulerEntry[];
+        try {
+          appeared = collectScheduleEntries(loadConfig(configPath)).filter(
+            (e) => e.agent === agentName,
+          );
+        } catch {
+          return; // overlay caught mid-write — re-check next tick
+        }
+        if (appeared.length > 0) {
+          process.stdout.write(
+            `agent-scheduler: ${agentName} schedule appeared (${appeared.length} ` +
+            `entr${appeared.length === 1 ? "y" : "ies"}) — restarting to activate\n`,
+          );
+          clearInterval(idleTimer);
+          releaseLock(lockPath);
+          process.exit(0); // supervisor respawns into the active scheduling path
+        }
+      }, resolveReloadPollMs(process.env));
+    } else {
+      idleTimer = setInterval(() => { /* idle */ }, 1 << 30);
+    }
     // Release the lock cleanly on SIGTERM/SIGINT so a subsequent
     // boot doesn't have to fall back to the stale-lock reclaim path
     // in acquireLock. Only matters for log cleanliness — the reclaim
     // path works either way (#895 boot-time freshness check).
     const cleanup = (): never => {
+      clearInterval(idleTimer);
       releaseLock(lockPath);
       process.exit(0);
     };
@@ -721,15 +844,18 @@ export async function main(): Promise<void> {
     );
   }
 
-  const tasks = registerAgentSchedule({
-    entries,
-    channel,
-    sink,
-    cronLib,
-    dispatcher,
-    ...(quotaGate ? { quotaGate } : {}),
-    ...(cheapCron ? { cheapCron } : {}),
-  });
+  const registerForEntries = (es: SchedulerEntry[]): RegisteredTask[] =>
+    registerAgentSchedule({
+      entries: es,
+      channel,
+      sink,
+      cronLib,
+      dispatcher,
+      ...(quotaGate ? { quotaGate } : {}),
+      ...(cheapCron ? { cheapCron } : {}),
+    });
+
+  const tasks = registerForEntries(entries);
 
   process.stdout.write(
     `agent-scheduler: ${agentName} registered ${tasks.length} task(s); ` +
@@ -737,8 +863,34 @@ export async function main(): Promise<void> {
     `socket=${socketPath} jsonl=${jsonlPath}\n`,
   );
 
+  // Hot-reload: pick up schedule.d / switchroom.yaml edits WITHOUT a
+  // container restart (an agent self-authoring crons, or an operator
+  // editing the overlay). Before this, the schedule was frozen at boot,
+  // so a removed entry kept firing (a zombie that burned a wasted turn
+  // every interval) and a new entry never ran until the next bounce.
+  // In-process task swap — the tmux/agent session is untouched.
+  let reloader: ScheduleReloader | undefined;
+  let reloadTimer: ReturnType<typeof setInterval> | undefined;
+  if (isHotReloadEnabled(process.env)) {
+    reloader = createScheduleReloader({
+      loadEntries: () =>
+        collectScheduleEntries(loadConfig(configPath)).filter((e) => e.agent === agentName),
+      register: registerForEntries,
+      initialTasks: tasks,
+      initialEntries: entries,
+      log: (m) => process.stdout.write(`agent-scheduler: ${agentName} ${m}\n`),
+      onError: (e) =>
+        process.stderr.write(
+          `agent-scheduler: ${agentName} reload skipped (config error, keeping current schedule): ${e.message}\n`,
+        ),
+    });
+    reloadTimer = setInterval(() => reloader!.tick(), resolveReloadPollMs(process.env));
+  }
+
   const shutdown = () => {
-    for (const t of tasks) t.task.stop();
+    if (reloadTimer) clearInterval(reloadTimer);
+    // Stop the CURRENTLY-live tasks (post-reload), not the boot set.
+    for (const t of (reloader ? reloader.currentTasks() : tasks)) t.task.stop();
     sink.close();
     ipcClient.close();
     releaseLock(lockPath);
