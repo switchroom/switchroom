@@ -43,15 +43,34 @@ import { existsSync, mkdirSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { withConfigError } from "./helpers.js";
+import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 
 /**
- * Image tag the install verb pins. Defaults to `:latest`. Override
- * via `--tag <X>` when standing up a specific version (recommended
- * for production deploys; `:latest` is the dev/operator default).
+ * Resolve the web image tag for an install.
+ *
+ * Precedence (highest first), mirroring the agent-fleet generator
+ * (`write-compose.ts` → `resolveImageTag(resolveRelease(...))`) and the
+ * sibling `hostd install`:
+ *   1. explicit `--tag <X>` (operator override)
+ *   2. `release.pin` / `release.channel` from switchroom.yaml
+ *   3. `latest` (resolveImageTag's back-compat default)
+ *
+ * Before this, `webd install` hardcoded `latest` and ignored
+ * `release.pin` — so the web singleton lagged the pinned fleet, and a
+ * plain `webd install` right after a tag push could land the PRIOR
+ * image (`:latest` promotion lags the version-tag build). Honoring the
+ * pin makes web version-coherent with the rest of the fleet by default.
+ * See memory `feedback_singletons_dont_recreate_on_pin_bump`.
  */
-const DEFAULT_IMAGE_TAG = "latest";
+export function resolveWebImageTag(
+  explicitTag: string | undefined,
+  release: ReleaseBlockShape | undefined,
+): string {
+  if (explicitTag) return explicitTag;
+  return resolveImageTag(resolveRelease({ root: release }));
+}
 
 /**
  * Compose project name for the web service. MUST be distinct from
@@ -213,7 +232,7 @@ interface InstallOptions {
   dryRun?: boolean;
 }
 
-async function doInstall(opts: InstallOptions): Promise<void> {
+async function doInstall(opts: InstallOptions, program: Command): Promise<void> {
   // The container MUST run as the operator uid (peercred gate + file
   // ownership). Refuse to write a compose file that would run as root
   // or with an unknown uid — a root-mode forward is silently 503'd by
@@ -236,9 +255,14 @@ async function doInstall(opts: InstallOptions): Promise<void> {
   const composePath = webdComposePath();
   mkdirSync(dir, { recursive: true });
 
+  // Default to the release pin from switchroom.yaml (version-coherent with
+  // the agent fleet); `--tag` overrides; `latest` if neither is set.
+  const cfg = getConfig(program);
+  const imageTag = resolveWebImageTag(opts.tag, cfg.release);
+
   const yaml = renderWebComposeFile({
     hostHome: homedir(),
-    imageTag: opts.tag ?? DEFAULT_IMAGE_TAG,
+    imageTag,
     operatorUid,
   });
 
@@ -260,13 +284,13 @@ async function doInstall(opts: InstallOptions): Promise<void> {
   // glitch, GHCR throttle) surfaces before the up step rather than
   // mid-recreate. `docker compose pull` is idempotent and skips images
   // already at the requested digest.
-  console.log(chalk.dim(`    Pulling ghcr.io/switchroom/switchroom-web:${opts.tag ?? DEFAULT_IMAGE_TAG}…`));
+  console.log(chalk.dim(`    Pulling ghcr.io/switchroom/switchroom-web:${imageTag}…`));
   const pull = runDocker(["compose", "-p", WEB_COMPOSE_PROJECT, "-f", composePath, "pull"]);
   if (!pull.ok) {
     console.error(chalk.red(`  pull failed:\n${pull.stderr}`));
     console.error(
       chalk.yellow(
-        `  Hint: \`ghcr.io/switchroom/switchroom-web:${opts.tag ?? DEFAULT_IMAGE_TAG}\` may not be published yet.\n` +
+        `  Hint: \`ghcr.io/switchroom/switchroom-web:${imageTag}\` may not be published yet.\n` +
           `  Check the docker-images workflow run and verify the tag at:\n` +
           `      https://github.com/switchroom/switchroom/pkgs/container/switchroom-web`,
       ),
@@ -357,11 +381,14 @@ export function registerWebdCommand(program: Command): void {
   webd
     .command("install")
     .description("Install or refresh the web container (writes ~/.switchroom/web/docker-compose.yml + docker compose up -d)")
-    .option("--tag <tag>", "Image tag (default: latest)", DEFAULT_IMAGE_TAG)
+    .option(
+      "--tag <tag>",
+      "Image tag override (default: resolved from release.pin in switchroom.yaml, else latest)",
+    )
     .option("--dry-run", "Print the compose file and the docker commands without writing or running anything")
     .action(
       withConfigError(async (opts: InstallOptions) => {
-        await doInstall(opts);
+        await doInstall(opts, program);
       }),
     );
 

@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { renderWebComposeFile } from "./webd.js";
+import { renderWebComposeFile, resolveWebImageTag } from "./webd.js";
 
 describe("renderWebComposeFile", () => {
   it("renders a valid yaml-shaped string for the switchroom-web service", () => {
@@ -104,5 +104,26 @@ describe("renderWebComposeFile", () => {
   it("uses a 15s stop_grace_period for clean bun shutdown on docker stop", () => {
     const out = renderWebComposeFile({ hostHome: "/h", imageTag: "latest", operatorUid: 1000 });
     expect(out).toContain("stop_grace_period: 15s");
+  });
+});
+
+describe("resolveWebImageTag (honor release.pin like the agent fleet)", () => {
+  it("uses an explicit --tag override above everything", () => {
+    expect(resolveWebImageTag("v9.9.9", { pin: "v0.15.7" })).toBe("v9.9.9");
+    expect(resolveWebImageTag("v9.9.9", undefined)).toBe("v9.9.9");
+  });
+
+  it("defaults to release.pin when no --tag (the gap this closes)", () => {
+    expect(resolveWebImageTag(undefined, { pin: "v0.15.7" })).toBe("v0.15.7");
+    expect(resolveWebImageTag(undefined, { pin: "sha-abc1234" })).toBe("sha-abc1234");
+  });
+
+  it("falls back to a release channel when no pin", () => {
+    expect(resolveWebImageTag(undefined, { channel: "rc" })).toBe("rc");
+  });
+
+  it("falls back to 'latest' when neither --tag nor release is set", () => {
+    expect(resolveWebImageTag(undefined, undefined)).toBe("latest");
+    expect(resolveWebImageTag(undefined, {})).toBe("latest");
   });
 });
