@@ -49,6 +49,7 @@ that touches the job.
 
 - [`keep-my-subscription-honest.md`](keep-my-subscription-honest.md) — keep my subscription the only thing I'm paying for
 - [`share-auth-across-the-fleet.md`](share-auth-across-the-fleet.md) — log into Anthropic once per account, not once per agent
+- [`crons-use-the-model-only-when-it-earns-it.md`](crons-use-the-model-only-when-it-earns-it.md) — scheduled work spends the model only when it adds value
 
 ### Always available, in Telegram, done properly — *there when you want it*
 
