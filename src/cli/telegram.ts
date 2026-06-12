@@ -16,7 +16,9 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   matchesRule,
-  buildGithubContext,
+  buildContext,
+  DISPATCH_SOURCES,
+  type DispatchSource,
   renderTemplate,
   parseDurationMs,
   isQuietHour,
@@ -686,7 +688,15 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
         }
 
         // Collect matches without spawning
-        const rules = opts.source === "github" ? (dispatchConfig.github ?? []) : [];
+        if (!(DISPATCH_SOURCES as readonly string[]).includes(opts.source)) {
+          console.log(
+            chalk.yellow(
+              `Source '${opts.source}' does not support dispatch (known: ${DISPATCH_SOURCES.join(", ")}).`,
+            ),
+          );
+          return;
+        }
+        const rules = dispatchConfig[opts.source as DispatchSource] ?? [];
         if (rules.length === 0) {
           console.log(chalk.yellow(`No dispatch rules for source '${opts.source}'.`));
           return;
@@ -697,7 +707,7 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
 
         for (let i = 0; i < rules.length; i++) {
           const rule = rules[i];
-          const matched = matchesRule(opts.event, payload, rule.match);
+          const matched = matchesRule(opts.source, opts.event, payload, rule.match);
           const prefix = matched ? chalk.green("✓ MATCH") : chalk.dim("✗ no match");
           const desc = rule.description ? ` — ${rule.description}` : ` — rule ${i}`;
           console.log(`${prefix}  rule ${i}${desc}`);
@@ -722,7 +732,7 @@ function registerDispatchVerb(tg: Command, _program: Command): void {
           }
 
           // Rendered prompt
-          const ctx = buildGithubContext(opts.event, payload);
+          const ctx = buildContext(opts.source, opts.event, payload);
           const rendered = renderTemplate(rule.prompt, ctx);
           console.log(chalk.bold("  rendered prompt:"));
           for (const line of rendered.split("\n")) {

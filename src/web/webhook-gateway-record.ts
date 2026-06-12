@@ -30,6 +30,7 @@ import {
 } from './webhook-handler.js'
 import {
   evaluateDispatch,
+  DISPATCH_SOURCES,
   type CooldownStore,
   type WebhookDispatchConfig,
 } from './webhook-dispatch.js'
@@ -150,11 +151,12 @@ export function recordWebhookEvent(
     `webhook-gateway: agent='${agent}' source='${rec.source}' event='${rec.event_type}' recorded ts=${now}\n`,
   )
 
-  // ── Fire webhook_dispatch rules (github only) ─────────────────────────────
+  // ── Fire webhook_dispatch rules (github / generic / linear) ───────────────
   // This wires the previously-unreachable evaluateDispatch: the legacy
   // receiver passed dispatchConfig through but never consumed it (#1625
   // shipped the evaluator with no production caller). The gateway holds
   // the bridge IPC server, so delivery is in-process via deps.inject.
+  // #2272 extends dispatch beyond github to generic + linear sources.
   let dispatched = 0
   try {
     const config = (deps.loadConfig ?? loadSwitchroomConfig)()
@@ -164,7 +166,7 @@ export function recordWebhookEvent(
           ?.webhook_dispatch
       : undefined
 
-    if (dispatchConfig && rec.source === 'github') {
+    if (dispatchConfig && (DISPATCH_SOURCES as readonly string[]).includes(rec.source)) {
       const target = resolveChannelTarget(config, agent)
       if (!target) {
         log(

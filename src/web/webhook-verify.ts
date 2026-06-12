@@ -20,6 +20,10 @@
  *     Simple shared-secret model for in-house tools that can't do
  *     HMAC. The token is per-source-per-agent, declared in the
  *     vault under `webhook/<agent>/<source>`.
+ *   - **linear** (#2272): hex HMAC-SHA256 over the raw request body,
+ *     signature in the `Linear-Signature` header. Linear sends a bare
+ *     hex digest (NO `sha256=` prefix) and no Bearer auth. Same
+ *     per-source secret model as github/generic.
  *
  * Both verifiers are CONSTANT-TIME compares to defeat timing attacks.
  * The Node `crypto.timingSafeEqual` requires equal-length buffers;
@@ -74,6 +78,42 @@ export function verifyGithubSignature(
 }
 
 /**
+ * Verify a Linear-style HMAC-SHA256 webhook signature (#2272).
+ *
+ * Header format: a bare 64-char lowercase hex digest in the
+ * `Linear-Signature` header — NO `sha256=` prefix (unlike GitHub).
+ * The signed content is the raw request body bytes; the caller must
+ * pass the body unmodified (no JSON.parse → re-stringify).
+ *
+ * Same reason-leak posture as the other verifiers: every failure mode
+ * returns `{ ok: false }` and the route handler returns a plain 401.
+ */
+export function verifyLinearSignature(
+  body: Uint8Array,
+  signatureHeader: string | null | undefined,
+  secret: string,
+): WebhookVerifyResult {
+  if (!secret || secret.length === 0) {
+    return { ok: false, reason: 'no-secret-configured' }
+  }
+  if (!signatureHeader) {
+    return { ok: false, reason: 'no-signature-header' }
+  }
+  const provided = signatureHeader.trim()
+  if (!/^[0-9a-f]{64}$/.test(provided)) {
+    return { ok: false, reason: 'malformed-hex' }
+  }
+  const expected = createHmac('sha256', secret).update(body).digest('hex')
+  // Constant-time compare. Both are 64-char hex (validated above) so
+  // they're always the same length here.
+  const a = Buffer.from(provided, 'utf-8')
+  const b = Buffer.from(expected, 'utf-8')
+  if (a.length !== b.length) return { ok: false, reason: 'length-mismatch' }
+  if (!timingSafeEqual(a, b)) return { ok: false, reason: 'signature-mismatch' }
+  return { ok: true }
+}
+
+/**
  * Verify a Bearer token from the Authorization header.
  *
  * Header format: `Authorization: Bearer <token>`. Constant-time
@@ -109,7 +149,7 @@ export function verifyBearerToken(
  * purpose-built rather than generic — generic catch-alls invite
  * abuse-by-misuse.
  */
-export type WebhookSource = 'github' | 'generic'
+export type WebhookSource = 'github' | 'generic' | 'linear'
 
 export interface RenderedWebhookMessage {
   text: string
@@ -166,6 +206,76 @@ export function renderGithubEvent(
     default:
       return {
         text: `🐙 <b>${escapeHtml(repo)}</b> ${escapeHtml(eventType)} by @${escapeHtml(sender)}`,
+        disableLinkPreview: true,
+      }
+  }
+}
+
+/**
+ * Render a verified Linear webhook payload into a single-line Telegram
+ * message (#2272). Linear's webhook envelope shape:
+ *
+ * ```json
+ * {
+ *   "action": "create",            // create | update | remove
+ *   "type": "Issue",               // Issue | Comment | ...
+ *   "url": "https://linear.app/...",
+ *   "data": {
+ *     "identifier": "ENG-42",
+ *     "title": "Fix the thing",
+ *     "assignee": { "name": "agent", "displayName": "agent" },
+ *     "labels": [{ "name": "bug" }],
+ *     "body": "...",               // comment text on Comment events
+ *     "issue": { "identifier": "ENG-42", "title": "Fix the thing" }
+ *   }
+ * }
+ * ```
+ *
+ * Every interpolated field is HTML-escaped: the payload is attacker-
+ * influenced data, never instructions (same posture as renderGithubEvent).
+ * Pure — no fetch, no DB. Caller passes the parsed JSON envelope.
+ */
+export function renderLinearEvent(
+  eventType: string,
+  payload: Record<string, unknown>,
+): RenderedWebhookMessage {
+  const action = String(payload.action ?? '')
+  const url = typeof payload.url === 'string' ? payload.url : ''
+  const data = (payload.data as Record<string, unknown> | undefined) ?? {}
+
+  // `eventType` is the Linear `type` field, lower-cased by the handler.
+  switch (eventType) {
+    case 'issue': {
+      const id = String(data.identifier ?? '?')
+      const title = String(data.title ?? '')
+      const assignee =
+        (data.assignee as { displayName?: string; name?: string } | undefined)?.displayName ??
+        (data.assignee as { name?: string } | undefined)?.name ??
+        ''
+      return {
+        text:
+          `📐 <b>Linear</b> issue ${escapeHtml(id)} ${escapeHtml(action)}` +
+          `${assignee ? ` → @${escapeHtml(assignee)}` : ''}\n` +
+          `${escapeHtml(title)}${url ? `\n${url}` : ''}`,
+        disableLinkPreview: true,
+      }
+    }
+    case 'comment': {
+      const issue = (data.issue as { identifier?: string; title?: string } | undefined) ?? {}
+      const id = String(issue.identifier ?? '?')
+      const body = String(data.body ?? '').slice(0, 200)
+      return {
+        text:
+          `📐 <b>Linear</b> comment ${escapeHtml(action)} on ${escapeHtml(id)}\n` +
+          `${escapeHtml(body)}${url ? `\n${url}` : ''}`,
+        disableLinkPreview: true,
+      }
+    }
+    default:
+      return {
+        text:
+          `📐 <b>Linear</b> ${escapeHtml(eventType)} ${escapeHtml(action)}` +
+          `${url ? `\n${url}` : ''}`,
         disableLinkPreview: true,
       }
   }

@@ -41,6 +41,58 @@ Use this for in-house tools that can't HMAC-sign:
 
 The body must be JSON. Common fields (`title`, `message`, `text`) are auto-rendered into the stored Telegram-ready text; otherwise a JSON snippet is used.
 
+## Setup — Linear (#2272)
+
+Linear signs its webhooks with a **bare hex HMAC-SHA256 of the raw body** in the `Linear-Signature` header (no `sha256=` prefix, no Bearer auth).
+
+1. `webhook_sources: [ linear ]` in switchroom.yaml.
+2. Put the signing secret in `webhook-secrets.json`: `{ "finn": { "linear": "<linear-webhook-secret>" } }`.
+3. In Linear → Settings → API → Webhooks, point the URL at `https://<your-host>/webhook/finn/linear` and copy the generated signing secret into step 2.
+4. Pick the resources to deliver (Issues, Comments).
+
+`event_type` is the lower-cased Linear `type` (`issue`, `comment`). Issue and comment events render the identifier (e.g. `ENG-42`), action, assignee, title/body and URL.
+
+## Auto-dispatch (waking the agent)
+
+When an event matches a `webhook_dispatch` rule, switchroom injects the rendered prompt as a synthesized turn into the agent's live `claude` session (never a headless `claude -p`). Dispatch works for **github, generic, and linear** sources (#2272 — previously github-only). Rules are keyed by source:
+
+```yaml
+agents:
+  clerk:
+    channels:
+      telegram:
+        webhook_sources: [ linear ]
+        webhook_dispatch:
+          linear:
+            - description: "Act on issues assigned to me"
+              match:
+                event: issue          # linear `type`, lower-cased
+                actions: [create, update]
+                assignee_any: [clerk]  # match on assignee display name
+              prompt: |
+                Linear {{number}} assigned to you: {{title}}
+                {{html_url}}
+              cooldown: 2m
+            - description: "Respond when @mentioned in a comment"
+              match:
+                event: comment
+                mentions_any: ["@clerk"]  # case-insensitive substring of the comment body
+              prompt: "You were mentioned on {{number}} — take a look:\n{{html_url}}"
+```
+
+Matcher knobs by source:
+
+| field | github | linear | generic |
+|---|---|---|---|
+| `event` (required) | event header | `type` (lower) | source name |
+| `actions` | yes | yes | yes |
+| `labels_any` / `labels_all` | yes | yes | yes |
+| `exclude_authors` | yes | yes | yes |
+| `assignee_any` | — | yes | yes |
+| `mentions_any` | — | yes | yes |
+
+All sources support the `cooldown` and `quiet_hours` knobs; the ingest path's `webhook_rate_limit` and github delivery-id dedup apply uniformly. Template fields available in `prompt`: `{{repo}}`, `{{number}}`, `{{title}}`, `{{html_url}}`, `{{author}}`, `{{assignee}}`, `{{labels}}`, `{{action}}`, `{{event}}`.
+
 ## What the agent sees
 
 Each verified event becomes one JSONL line at `<agent>/telegram/webhook-events.jsonl`:
@@ -59,8 +111,10 @@ Tell the agent (or have it know via CLAUDE.md) to `cat` or `tail` this file when
 
 ## Security
 
-- HMAC-SHA256 verification for `github` (constant-time compare).
+- HMAC-SHA256 verification for `github` (`X-Hub-Signature-256`, `sha256=`-prefixed hex, constant-time compare).
+- HMAC-SHA256 verification for `linear` (`Linear-Signature`, bare hex of the raw body, constant-time compare).
 - Bearer token verification for `generic` (constant-time compare, length-pre-checked).
+- Dispatched events are treated as **data, not instructions** — every rendered field is HTML-escaped before it reaches the agent's prompt.
 - Source not in agent's allowlist → 403, no further processing.
 - Source unknown → 400.
 - Verification fails → 401 with a generic body, but the operator log line carries the specific reason for debugging.

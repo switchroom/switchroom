@@ -535,6 +535,39 @@ export const SessionContinuitySchema = z
  * from env vars at startup but may not act on every field yet. We
  * define them in the schema so users can start setting them now.
  */
+
+/**
+ * A single webhook_dispatch rule (#1625, extended for generic/linear in
+ * #2272). Shared across the per-source rule arrays under
+ * channels.telegram.webhook_dispatch — github / generic / linear all use
+ * the same shape. The matcher fields not relevant to a given source are
+ * simply ignored at evaluation time (e.g. assignee_any/mentions_any are
+ * no-ops for github, exclude_authors is a no-op for generic).
+ */
+const webhookDispatchRule = z.object({
+  description: z.string().optional(),
+  match: z
+    .object({
+      event: z.string(),
+      actions: z.array(z.string()).optional(),
+      labels_any: z.array(z.string()).optional(),
+      labels_all: z.array(z.string()).optional(),
+      exclude_authors: z.array(z.string()).optional(),
+      assignee_any: z.array(z.string()).optional(),
+      mentions_any: z.array(z.string()).optional(),
+    })
+    .passthrough(),
+  prompt: z.string(),
+  cooldown: z.string().optional(),
+  quiet_hours: z
+    .object({
+      start: z.number().int().min(0).max(23),
+      end: z.number().int().min(0).max(23),
+      tz: z.string().optional(),
+    })
+    .optional(),
+});
+
 export const TelegramChannelSchema = z
   .object({
     enabled: z
@@ -821,13 +854,14 @@ export const TelegramChannelSchema = z
         "defaults.channels.telegram.interrupt."
       ),
     webhook_sources: z
-      .array(z.enum(["github", "generic"]))
+      .array(z.enum(["github", "generic", "linear"]))
       .optional()
       .describe(
         "External webhook sources allowed to ingest events into this agent's " +
         "log. POST /webhook/<agent>/<source> on the switchroom web server. " +
         "Each source has its own signature verification ('github' = " +
-        "X-Hub-Signature-256 HMAC-SHA256, 'generic' = Bearer token). " +
+        "X-Hub-Signature-256 HMAC-SHA256, 'generic' = Bearer token, " +
+        "'linear' = Linear-Signature bare-hex HMAC-SHA256 of the raw body). " +
         "Per-source secret read from ~/.switchroom/webhook-secrets.json " +
         "keyed by [agent][source]. Verified events append to " +
         "<agent>/telegram/webhook-events.jsonl for the agent to read on " +
@@ -838,37 +872,17 @@ export const TelegramChannelSchema = z
       ),
     webhook_dispatch: z
       .object({
-        github: z
-          .array(
-            z.object({
-              description: z.string().optional(),
-              match: z
-                .object({
-                  event: z.string(),
-                  actions: z.array(z.string()).optional(),
-                  labels_any: z.array(z.string()).optional(),
-                  labels_all: z.array(z.string()).optional(),
-                  exclude_authors: z.array(z.string()).optional(),
-                })
-                .passthrough(),
-              prompt: z.string(),
-              cooldown: z.string().optional(),
-              quiet_hours: z
-                .object({
-                  start: z.number().int().min(0).max(23),
-                  end: z.number().int().min(0).max(23),
-                  tz: z.string().optional(),
-                })
-                .optional(),
-            }),
-          )
-          .optional(),
+        github: z.array(webhookDispatchRule).optional(),
+        generic: z.array(webhookDispatchRule).optional(),
+        linear: z.array(webhookDispatchRule).optional(),
       })
       .optional()
       .describe(
         "Auto-dispatch rules: when a verified webhook event matches a rule, " +
         "inject the rendered prompt into the agent's live session (#1625). " +
-        "Supports cooldowns, quiet hours, and label/action matchers. " +
+        "Rules are keyed by source — 'github', 'generic', or 'linear' (#2272). " +
+        "Supports cooldowns, quiet hours, label/action matchers, and (for " +
+        "linear/generic) assignee_any / mentions_any matchers. " +
         "Off by default — opt in per agent. See src/web/webhook-dispatch.ts.",
       ),
     webhook_rate_limit: z
@@ -1917,7 +1931,7 @@ export const AgentSchema = z.object({
   // canonical channels.telegram.* spot and logs a deprecation warning.
   // Remove these fields once no live switchroom.yaml uses them.
   webhook_sources: z
-    .array(z.enum(["github", "generic"]))
+    .array(z.enum(["github", "generic", "linear"]))
     .optional()
     .describe(
       "[DEPRECATED — moved to channels.telegram.webhook_sources in #596] " +
