@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import {
   defaultAuditLogPath,
   formatForCli,
@@ -36,11 +37,29 @@ import {
 } from "../host-control/audit-reader.js";
 
 /**
- * Image tag the install verb pins. Defaults to `:latest`. Override
- * via `--tag <X>` when standing up a specific version (recommended
- * for production deploys; `:latest` is the dev/operator default).
+ * Resolve the hostd image tag for an install.
+ *
+ * Precedence (highest first), mirroring how the agent-fleet generator
+ * resolves its tag (`write-compose.ts` → `resolveImageTag(resolveRelease(...))`):
+ *   1. explicit `--tag <X>` (operator override)
+ *   2. `release.pin` / `release.channel` from switchroom.yaml
+ *   3. `latest` (resolveImageTag's back-compat default)
+ *
+ * Before this, `hostd install` hardcoded `latest` and ignored
+ * `release.pin` — so after a release the singleton lagged the fleet
+ * (the agents/brokers honor the pin, hostd didn't), and a plain
+ * `hostd install` right after a tag push could land the PRIOR image
+ * because `:latest` promotion lags the version-tag build. Honoring the
+ * pin makes hostd version-coherent with the rest of the fleet by
+ * default. See memory `feedback_singletons_dont_recreate_on_pin_bump`.
  */
-const DEFAULT_IMAGE_TAG = "latest";
+export function resolveHostdImageTag(
+  explicitTag: string | undefined,
+  release: ReleaseBlockShape | undefined,
+): string {
+  if (explicitTag) return explicitTag;
+  return resolveImageTag(resolveRelease({ root: release }));
+}
 
 /**
  * Compose project name for the daemon. MUST be distinct from
@@ -256,9 +275,13 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   const composePath = hostdComposePath();
   mkdirSync(dir, { recursive: true });
 
+  // Default to the release pin from switchroom.yaml (version-coherent with
+  // the agent fleet); `--tag` overrides; `latest` if neither is set.
+  const imageTag = resolveHostdImageTag(opts.tag, cfg.release);
+
   const yaml = renderHostdComposeFile({
     hostHome: resolveHostdHostHome(),
-    imageTag: opts.tag ?? DEFAULT_IMAGE_TAG,
+    imageTag,
     // SUDO_UID-aware (install often runs under sudo); undefined on
     // non-POSIX → operator listener simply not bound.
     operatorUid: resolveOperatorUid(),
@@ -294,13 +317,13 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   // glitch, GHCR throttle) surfaces before the up step rather than
   // mid-restart-cycle. `docker compose pull` is idempotent and
   // skips images already at the requested digest.
-  console.log(chalk.dim(`    Pulling ghcr.io/switchroom/switchroom-hostd:${opts.tag ?? DEFAULT_IMAGE_TAG}…`));
+  console.log(chalk.dim(`    Pulling ghcr.io/switchroom/switchroom-hostd:${imageTag}…`));
   const pull = runDocker(["compose", "-p", HOSTD_COMPOSE_PROJECT, "-f", composePath, "pull"]);
   if (!pull.ok) {
     console.error(chalk.red(`  pull failed:\n${pull.stderr}`));
     console.error(
       chalk.yellow(
-        `  Hint: \`ghcr.io/switchroom/switchroom-hostd:${opts.tag ?? DEFAULT_IMAGE_TAG}\` may not be published yet.\n` +
+        `  Hint: \`ghcr.io/switchroom/switchroom-hostd:${imageTag}\` may not be published yet.\n` +
           `  Check the docker-images workflow run and verify the tag at:\n` +
           `      https://github.com/switchroom/switchroom/pkgs/container/switchroom-hostd`,
       ),
@@ -411,7 +434,10 @@ export function registerHostdCommand(program: Command): void {
   hostd
     .command("install")
     .description("Install or refresh the hostd container (writes ~/.switchroom/hostd/docker-compose.yml + docker compose up -d)")
-    .option("--tag <tag>", "Image tag (default: latest)", DEFAULT_IMAGE_TAG)
+    .option(
+      "--tag <tag>",
+      "Image tag override (default: resolved from release.pin in switchroom.yaml, else latest)",
+    )
     .option("--dry-run", "Print the compose file and the docker commands without writing or running anything")
     // withConfigError is a higher-order wrapper (helpers.ts:9) — it
     // accepts a handler and RETURNS a function that catches ConfigError

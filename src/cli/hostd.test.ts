@@ -8,7 +8,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { renderHostdComposeFile, resolveHostdHostHome } from "./hostd.js";
+import {
+  renderHostdComposeFile,
+  resolveHostdHostHome,
+  resolveHostdImageTag,
+} from "./hostd.js";
 
 describe("renderHostdComposeFile", () => {
   it("renders a valid yaml-shaped string", () => {
@@ -175,5 +179,28 @@ describe("resolveHostdHostHome (in-container /host-home guard, #2279 gap)", () =
   it("accepts a real host home unchanged", () => {
     expect(resolveHostdHostHome({}, "/home/operator")).toBe("/home/operator");
     expect(resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "/root" }, "/home/x")).toBe("/root");
+  });
+});
+
+describe("resolveHostdImageTag (honor release.pin like the agent fleet)", () => {
+  it("uses an explicit --tag override above everything", () => {
+    expect(resolveHostdImageTag("v9.9.9", { pin: "v0.15.7" })).toBe("v9.9.9");
+    expect(resolveHostdImageTag("v9.9.9", undefined)).toBe("v9.9.9");
+  });
+
+  it("defaults to release.pin when no --tag (the gap this closes)", () => {
+    // Previously hardcoded "latest" → hostd lagged the pinned fleet. Now it
+    // tracks the same pin the agents/brokers resolve.
+    expect(resolveHostdImageTag(undefined, { pin: "v0.15.7" })).toBe("v0.15.7");
+    expect(resolveHostdImageTag(undefined, { pin: "sha-abc1234" })).toBe("sha-abc1234");
+  });
+
+  it("falls back to a release channel when no pin", () => {
+    expect(resolveHostdImageTag(undefined, { channel: "rc" })).toBe("rc");
+  });
+
+  it("falls back to 'latest' when neither --tag nor release is set", () => {
+    expect(resolveHostdImageTag(undefined, undefined)).toBe("latest");
+    expect(resolveHostdImageTag(undefined, {})).toBe("latest");
   });
 });
