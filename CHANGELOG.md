@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.15.6 — webhook dispatch for generic + Linear sources
+
+Extends agent-waking webhook dispatch beyond GitHub (epic #717).
+
+### Source-generic webhook dispatch + Linear (#2272, #2283)
+
+- `evaluateDispatch` and the `webhook_dispatch` schema now key rules by
+  **source** — `github` / `generic` / `linear` — so any known source can wake
+  the agent through the same `inject_inbound` path, not just github. Cooldown
+  keys are namespaced by source so rule indices can't collide across sources.
+- **Linear** is a first-class source:
+  - `verifyLinearSignature` — bare-hex HMAC-SHA256 of the raw body in the
+    `Linear-Signature` header (Linear sends no Bearer auth); per-source secret
+    from `webhook-secrets.json` keyed `[agent][source]`.
+  - `renderLinearEvent` — issue/comment events, HTML-escaped, strict template
+    (payloads are data, never instructions).
+  - `buildLinearContext` + new `assignee_any` / `mentions_any` rule matchers.
+- Dispatch knobs (cooldown, quiet_hours) and the ingest-path rate-limit + dedup
+  now apply uniformly across generic/linear. Security model unchanged:
+  per-source secret, edge lock, rendered payloads escaped and treated as data.
+- Docs: `docs/webhook-ingest.md` gains Linear setup + a per-source matcher table.
+
 ## v0.15.5 — ship every agent hook script into the image (turn-pacing 127 fix)
 
 A one-fix release closing the last loose end from the v0.15.4 batch.
