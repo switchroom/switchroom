@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.15.8 — cheaper crons: schedule hot-reload + agent-facing tier options
+
+Cron token-optimization: scheduled work should pay for a model only when the
+model earns it (the cheap-crons JTBD). This release ships the capability;
+cheap-cron routing stays behind `SWITCHROOM_CHEAP_CRON`.
+
+### Schedule hot-reload (#2293)
+
+- The in-agent scheduler now hot-reloads the `schedule.d` overlay (default on;
+  `SWITCHROOM_SCHEDULER_HOT_RELOAD=0` to freeze). A schedule add/remove takes
+  effect within ~30s with **no restart** — fixing the "frozen at boot" class
+  where a removed entry kept firing (a zombie burning a wasted turn every
+  interval) and a new entry never ran. In-process node-cron task swap; the
+  agent session is untouched. Cold 0→N self-restarts cleanly into the active
+  path. Replay stays boot-only.
+
+### Agent-facing cron tier options (#2294)
+
+- `schedule_add` gains `--model` / `--context` (CLI + the agent-config MCP
+  tool), so an agent can route a light recurring task to a fresh, cheap
+  cron session (Tier 1) instead of its full live session (Tier 2). Inert
+  unless `SWITCHROOM_CHEAP_CRON` is on; never silently dropped.
+- `restart_required` is now hot-reload-aware (`false` + "live within ~30s" by
+  default; `true` only when hot-reload is disabled). Skill writes unchanged
+  (skills still load at boot). The agent self-service doc + MCP descriptions +
+  `docs/scheduling.md` now teach the cost model (default Tier 2 for
+  memory-dependent work, `model: sonnet` Tier 1 for light work, and "ask the
+  operator for a poll / reaction-dispatch" for change-triggered work).
+
 ## v0.15.7 — hostd install resolves the real host home (close #2279 gap)
 
 A fleet-killer hardening release.
