@@ -44,6 +44,8 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `reactions.debounce_ms` | override | Per-chat debounce window in ms. Reactions within the window collapse into one batched synthetic. Default `30000`. |
 | `reactions.per_hour_cap` | override | Max reaction-triggered synthetic turns per chat per rolling hour. Refusals are stderr-logged but not surfaced to the agent. Default `10`. |
 | `reactions.group_admin_only` | override | In groups/supergroups, only trigger when the reacter is `creator` or `administrator`. Failing the lookup is treated as non-admin (fail-closed). DMs are never affected by this flag. Default `true`. |
+| `reaction_dispatch.enabled` | override | Master switch for the event-driven reaction-dispatch path (#2291). When `true`, an emoji reaction on **any** message is forwarded to the agent as a `<channel source="switchroom-telegram" event="reaction" …>` inbound turn (button-callback shape) carrying the reacted message's text. Distinct from `reactions` (which only handles reactions on the bot's own messages). Default `false`. |
+| `reaction_dispatch.emojis` | replace | Emoji allowlist that triggers a dispatch. Only additions/changes matching the list fire; removals never do. **Replace semantics** — narrow per-agent or set `[]` to disable. Default `[]` (nothing fires). |
 | `session.max_idle` | override | Fresh session after idle period (`2h`, `30m`) |
 | `session.max_turns` | override | Fresh session after N user turns |
 | `channels.telegram.plugin` | override | `switchroom` (default, enhanced) or `official` |

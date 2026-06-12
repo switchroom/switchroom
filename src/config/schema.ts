@@ -1488,6 +1488,55 @@ export const ReactionsSchema = z
   .optional();
 
 /**
+ * Reaction-dispatch configuration (#2291) — controls whether an emoji
+ * reaction on ANY message is forwarded to the agent as an event-driven
+ * inbound channel turn shaped like a button callback:
+ *
+ *   <channel source="switchroom-telegram" event="reaction"
+ *            emoji="👨‍💻" message_id="..." chat_id="..." user="...">
+ *   <reacted message text>
+ *   </channel>
+ *
+ * Distinct from `reactions` (ReactionsSchema, #1074), which only forwards
+ * reactions on the BOT's own messages (debounced/hour-capped feedback,
+ * default ON). This block is for reaction-driven workflows (e.g. react
+ * 👨‍💻 to capture a message to Linear) and replaces wasteful cron polling
+ * of get_recent_messages. See `telegram-plugin/gateway/reaction-dispatch.ts`
+ * and `docs/configuration.md`.
+ *
+ * Default OFF: with no `reaction_dispatch` block (or an empty `emojis`
+ * allowlist) NO reaction turns fire. Only additions/changes matching the
+ * allowlist dispatch — removals never do.
+ *
+ * Cascade modes:
+ *   - enabled: override (simple scalar; agent wins).
+ *   - emojis: replace (NOT union) — operators narrow the allowlist
+ *     per-agent; setting `[]` disables dispatch without flipping `enabled`.
+ */
+export const ReactionDispatchSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "Master switch for the reaction-dispatch path. Default false — " +
+        "with no reaction_dispatch block, reactions are persisted (and may " +
+        "feed the `reactions` feedback path) but are NEVER dispatched as " +
+        "event-driven inbound turns.",
+      ),
+    emojis: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Emoji allowlist that triggers a `<channel event=\"reaction\">` " +
+        "inbound turn when reacted to any message. Default [] (nothing " +
+        "fires). Cascade mode: REPLACE (not union) — a layer's list " +
+        "replaces lower layers entirely so an operator can narrow per-agent.",
+      ),
+  })
+  .optional();
+
+/**
  * Release-channel pin / pointer for the update flow.
  *
  * Either `channel` (track a moving pointer — dev / rc / latest) OR
@@ -1615,6 +1664,7 @@ const profileFields = {
       "UNION across defaults -> profile -> agent (see docs/configuration.md).",
     ),
   reactions: ReactionsSchema,
+  reaction_dispatch: ReactionDispatchSchema,
   model: z
     .string()
     .regex(
@@ -1980,6 +2030,7 @@ export const AgentSchema = z.object({
     )
     .optional(),
   reactions: ReactionsSchema,
+  reaction_dispatch: ReactionDispatchSchema,
   model: z
     .string()
     .regex(
