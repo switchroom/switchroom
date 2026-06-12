@@ -119,6 +119,40 @@
 
     .meta-item span { color: var(--text); }
 
+    .scope-toggle {
+      cursor: pointer;
+      color: var(--text);
+      border-bottom: 1px dotted var(--text-dim);
+      user-select: none;
+    }
+    .scope-toggle:hover { color: var(--blue); }
+    .scope-toggle:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .scope-caret {
+      display: inline-block;
+      width: 0.9em;
+      margin-right: 0.15rem;
+      color: var(--text-dim);
+      font-size: 0.75em;
+    }
+    .scope-list {
+      list-style: none;
+      margin: 0.35rem 0 0;
+      padding: 0.5rem 0.75rem;
+      width: 100%;
+      background: var(--surface-hover);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 0.78rem;
+      line-height: 1.5;
+    }
+    .scope-list li {
+      color: var(--text);
+      word-break: break-all;
+      padding: 0.1rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .scope-list li:last-child { border-bottom: none; }
+
     .card-actions {
       padding: 0.75rem 1.25rem;
       border-top: 1px solid var(--border);
@@ -1225,6 +1259,7 @@
     const _dimC = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
 
     let _accessBtnSeq = 0;
+    let _scopeSeq = 0;
 
     // One OAuth-account card (Google or Microsoft — same shape; Microsoft
     // adds an account-type pill). When agentNames is supplied, renders a
@@ -1255,6 +1290,24 @@
              }).join('')}
            </div>`
         : '';
+      // Scope: clickable "N scope(s)" that expands a full-width list of the
+      // individual scopes below the meta row (the old version hid them in a
+      // title tooltip only). The list is a sibling block after .card-meta so
+      // it isn't squished inside the flex-wrapped meta-items.
+      const scopeList = a.scope ? a.scope.split(/\s+/).filter(Boolean) : [];
+      let scopeCount, scopeBlock = '';
+      if (scopeList.length) {
+        const sid = `scopes-${++_scopeSeq}`;
+        scopeCount = `<span class="scope-toggle" id="${sid}-t" role="button" tabindex="0" aria-expanded="false" aria-controls="${sid}"
+            onclick="toggleScopes('${sid}')"
+            onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleScopes('${sid}');}"
+          ><span class="scope-caret">▸</span>${escapeHtml(scopeList.length + ' scope' + (scopeList.length === 1 ? '' : 's'))}</span>`;
+        scopeBlock = `<ul class="scope-list" id="${sid}" hidden>${
+          scopeList.map(s => `<li title="${escapeHtml(s)}">${escapeHtml(s)}</li>`).join('')
+        }</ul>`;
+      } else {
+        scopeCount = _dimC('—');
+      }
       return `
       <div class="account-card">
         <div class="account-card-header">
@@ -1264,9 +1317,10 @@
         <div class="account-usage"><label style="color:var(--text-dim);opacity:.7">Enabled for: </label>${acl}</div>
         <div class="card-meta" style="padding:0">
           <div class="meta-item"><label>Expires </label><span>${expires}</span></div>
-          <div class="meta-item" title="${a.scope ? escapeHtml(a.scope) : ''}"><label>Scope </label><span>${a.scope ? escapeHtml(a.scope.split(' ').length + ' scope(s)') : _dimC('—')}</span></div>
+          <div class="meta-item"><label>Scope </label><span>${scopeCount}</span></div>
           <div class="meta-item"><label>Client </label><span>${a.clientId ? escapeHtml(a.clientId.slice(0, 16) + '…') : _dimC('—')}</span></div>
         </div>
+        ${scopeBlock}
         ${manage}
       </div>`;
     }
@@ -1528,6 +1582,22 @@
         openDetails.add(name);
         render();
         if (!agentDetails[name]) fetchAgentDetail(name);
+      }
+    }
+
+    // Expand/collapse a connection card's scope list in place. Self-contained
+    // (no global state / re-render) — just flips the list's [hidden] and the
+    // toggle's caret + aria-expanded.
+    function toggleScopes(id) {
+      const list = document.getElementById(id);
+      const toggle = document.getElementById(id + '-t');
+      if (!list) return;
+      const open = list.hidden;
+      list.hidden = !open;
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', String(open));
+        const caret = toggle.querySelector('.scope-caret');
+        if (caret) caret.textContent = open ? '▾' : '▸';
       }
     }
 
