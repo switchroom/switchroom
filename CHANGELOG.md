@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.15.13 — 30-min scoped approvals + Linear capture/create-issue (#2317, #2313–#2316)
+
+### PR — feat(approvals): "⏱ 30 min" scoped approval tier (#2317)
+
+A new middle rung on the Telegram permission card between **✅ Allow once**
+(re-asks on the very next call) and **🔁 Always…** (a durable forever-write to
+`tools.allow`): a fixed-window, scoped, fail-closed auto-approval. After the
+operator taps **⏱ 30 min**, byte-identical in-scope requests auto-allow for 30
+minutes without re-carding — killing tap-fatigue when an agent re-edits the
+same file or re-runs the same safe command seconds apart.
+
+Conservative by design (serves `reference/access-model.md` — "you hold the
+leash", without babysitting):
+
+- **Narrow scope only.** Only an exact file path (`Edit(/x.ts)`) or a Bash
+  command-family (`Bash(git:*)`) is ever time-boxed. Broad scopes ("any file",
+  resource-blind MCP, "any command") do not get the ⏱ button — they stay
+  once/always.
+- **Irreversible stays gated, at grant AND match time.** A `Bash(git:*)` grant
+  auto-allows `git status` but **re-cards** on `git push --force` /
+  `git reset --hard` / `rm` / `sudo` / pipe-to-shell / backtick-or-`$()`
+  substitution — `isDestructiveBashCommand` is fail-closed (unknown → treat as
+  risky) and re-checked on every matching call.
+- **Fixed window, dies on restart.** A matching call never slides the window;
+  only an operator re-tap resets it. Expiry fails closed (re-cards).
+- **Gateway-side only.** The auto-allow verdict is dispatched without the
+  `rule` field, so the bridge's untimed `sessionAllowRules` never caches it
+  (a `rule` there would silently promote 30 min → session-forever in agent-uid
+  memory). Per-agent isolation; every auto-allow is logged.
+- **Default-on** with an ops kill-switch (`SWITCHROOM_SCOPED_APPROVAL_TTL_MS=0`
+  disables the tier and hides the button). All policy lives in a pure,
+  unit-tested module (`telegram-plugin/scoped-approval.ts`).
+
+### PR — feat(linear): `linear_create_issue` tool (#2314)
+
+An agent can file a Linear issue from a turn via a new MCP tool, resolving the
+Linear app token from the vault.
+
+### PR — feat(linear): capture-on-reaction → Linear as a switchroom default (#2315)
+
+Reacting to a message captures it into Linear as a switchroom default path.
+
+### PR — fix(linear-agent): force `webhook_via_gateway` on linear-agent setup (#2316)
+
+`switchroom linear-agent setup` now forces `webhook_via_gateway` so a freshly
+installed Linear agent wakes via the in-process gateway inject path.
+
+### PR — fix(scaffold): guard the `model: default` footgun (#2313)
+
+A literal `model: default` in agent config is remapped to the switchroom
+default model rather than being passed through to claude as a bogus id.
+
 ## v0.15.12 — Linear agents as first-class actors (#2298, #2310)
 
 ### PR — feat(model): keep `fable` selectable + model regression coverage (#2310)
