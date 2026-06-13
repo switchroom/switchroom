@@ -137,6 +137,20 @@ export type RuntimeMetricEvent =
       // executeReply scrub site. The two new sites close that gap.
       site: 'reply' | 'edit_message' | 'progress_update' | 'answer_stream' | 'stream_reply' | 'turn_flush'
     }
+  /**
+   * #2307 Tier-1: a cron fire routed to the `<agent>-cron` cheap session
+   * (meta.session=cron) fell back to the MAIN session because the cron bridge
+   * wasn't registered (wedged boot, crashed session, or hot-added cron with no
+   * live session yet). Each occurrence means the Tier-1 saving was NOT realised
+   * for that fire — a climbing counter is the runtime signal that a cron
+   * session is down (the doctor check catches a permanently-wedged one at boot;
+   * this catches a session that registered then died).
+   */
+  | {
+      kind: 'cron_fell_back_to_main'
+      agent: string
+      prompt_key: string
+    }
 
 /**
  * The JSONL sink lives under the runtime state dir so it's per-agent
