@@ -10,6 +10,8 @@ const rows: ScheduleReportRow[] = [
   { tier: "poll", exitCode: 0, startedAt: 100 },
   { tier: "poll", exitCode: 0, startedAt: 200 },
   { tier: "poll", exitCode: -3, startedAt: 250 }, // poll error
+  { tier: "action", exitCode: 0, startedAt: 260 }, // model-free action (cost 0)
+  { tier: "action", exitCode: -4, startedAt: 270 }, // action error
   { tier: "cheap", exitCode: 0, modelUsed: "claude-sonnet-4-6", startedAt: 300 },
   { tier: "main", exitCode: 0, startedAt: 400 },
   { tier: "main", exitCode: -2, startedAt: 450 }, // deferred
@@ -20,13 +22,14 @@ describe("summarizeScheduleReport", () => {
   it("counts by tier, errors, deferred, cost-weight", () => {
     const s = summarizeScheduleReport(rows);
     expect(s).toMatchObject({
-      total: 7,
+      total: 9,
       pollFires: 3,
+      actionFires: 2,
       cheapFires: 1,
       mainFires: 3, // 2 main + 1 legacy untiered
-      errors: 1, // the -3 poll error (deferred -2 excluded)
+      errors: 2, // the -3 poll error + the -4 action error (deferred -2 excluded)
       deferred: 1,
-      costWeight: 0 * 3 + 1 * 1 + 5 * 3, // = 16
+      costWeight: 0 * 3 + 0 * 2 + 1 * 1 + 5 * 3, // actions are free = 16
     });
     expect(s.byModel).toEqual({ "claude-sonnet-4-6": 1 });
   });
@@ -56,9 +59,9 @@ describe("parseScheduleJsonl", () => {
 });
 
 describe("formatScheduleReport", () => {
-  it("shows the model-free %", () => {
+  it("shows the model-free % (poll + action)", () => {
     const out = formatScheduleReport("marko", summarizeScheduleReport(rows));
     expect(out).toContain("marko");
-    expect(out).toContain("43% model-free"); // 3/7
+    expect(out).toContain("56% model-free"); // (3 poll + 2 action) / 9
   });
 });

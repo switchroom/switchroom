@@ -7,7 +7,7 @@
  */
 
 export interface ScheduleReportRow {
-  tier?: "poll" | "cheap" | "main";
+  tier?: "poll" | "action" | "cheap" | "main";
   exitCode: number;
   modelUsed?: string;
   startedAt?: number;
@@ -18,6 +18,8 @@ export interface ScheduleReportSummary {
   total: number;
   /** Model-free Tier-0 poll fires (no-op/baseline) — the saving, cost 0. */
   pollFires: number;
+  /** Model-free Tier-0 action fires (mechanical verbs) — cost 0. */
+  actionFires: number;
   /** Tier-1 cheap-session model fires. */
   cheapFires: number;
   /** Tier-2 main-session model fires (incl. legacy untiered rows). */
@@ -35,8 +37,8 @@ export interface ScheduleReportSummary {
   byModel: Record<string, number>;
 }
 
-// Relative cost weights (sonnet:opus output ≈ 1:5). Tier 0 is free.
-const TIER_WEIGHT: Record<"poll" | "cheap" | "main", number> = { poll: 0, cheap: 1, main: 5 };
+// Relative cost weights (sonnet:opus output ≈ 1:5). Tier 0 (poll/action) is free.
+const TIER_WEIGHT: Record<"poll" | "action" | "cheap" | "main", number> = { poll: 0, action: 0, cheap: 1, main: 5 };
 
 export function summarizeScheduleReport(
   rows: ScheduleReportRow[],
@@ -45,6 +47,7 @@ export function summarizeScheduleReport(
   const s: ScheduleReportSummary = {
     total: 0,
     pollFires: 0,
+    actionFires: 0,
     cheapFires: 0,
     mainFires: 0,
     errors: 0,
@@ -58,6 +61,7 @@ export function summarizeScheduleReport(
     // Legacy rows (pre-cheap-cron) have no tier → count as main (today's behaviour).
     const tier = r.tier ?? "main";
     if (tier === "poll") s.pollFires += 1;
+    else if (tier === "action") s.actionFires += 1;
     else if (tier === "cheap") s.cheapFires += 1;
     else s.mainFires += 1;
     s.costWeight += TIER_WEIGHT[tier];
@@ -86,11 +90,12 @@ export function parseScheduleJsonl(blob: string): ScheduleReportRow[] {
 
 export function formatScheduleReport(agent: string, s: ScheduleReportSummary): string {
   const modelFires = s.cheapFires + s.mainFires;
-  const savedPct = s.total > 0 ? Math.round((s.pollFires / s.total) * 100) : 0;
+  const modelFreePct = s.total > 0 ? Math.round(((s.pollFires + s.actionFires) / s.total) * 100) : 0;
   const lines = [
     `cron report — ${agent}`,
     `  total fires        ${s.total}`,
-    `  Tier 0 poll (free) ${s.pollFires}  (${savedPct}% model-free)`,
+    `  Tier 0 poll (free) ${s.pollFires}  (${modelFreePct}% model-free incl. actions)`,
+    `  Tier 0 action(free)${s.actionFires}`,
     `  Tier 1 cheap       ${s.cheapFires}`,
     `  Tier 2 main        ${s.mainFires}`,
     `  model fires        ${modelFires}`,

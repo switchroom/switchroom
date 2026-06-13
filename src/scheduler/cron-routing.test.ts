@@ -11,7 +11,7 @@ import {
 // ── Total enumeration of the reachable input space ──────────────────────
 // operator standard feedback_prove_finite_fsm_not_sample: prove the finite
 // decision by walking EVERY input, not a random sample.
-const KINDS: Array<CronRoutingInput["kind"]> = ["poll", "prompt", undefined];
+const KINDS: Array<CronRoutingInput["kind"]> = ["poll", "prompt", "action", undefined];
 const MODELS: Array<{ label: string; value: string | undefined }> = [
   { label: "cheap-sonnet", value: "claude-sonnet-4-6" },
   { label: "cheap-haiku", value: "haiku" },
@@ -35,6 +35,14 @@ describe("resolveCronRouting — total enumeration", () => {
               { cheapCronEnabled },
             );
 
+            // INV-0: kind=action is FLAG-INDEPENDENT — model-free, no session,
+            // regardless of the kill-switch (an action has no Tier-2 fallback,
+            // so gating it on the flag would silently drop the cron).
+            if (kind === "action") {
+              expect(r).toEqual({ tier: "action", session: null, customModelDowngrade: false });
+              continue;
+            }
+
             // INV-1: flag off ⟹ pre-RFC behaviour, every field inert.
             if (!cheapCronEnabled) {
               expect(r).toEqual({ tier: "main", session: "main", customModelDowngrade: false });
@@ -43,6 +51,7 @@ describe("resolveCronRouting — total enumeration", () => {
 
             // INV-2: tier↔session coherence.
             if (r.tier === "poll") expect(r.session).toBeNull();
+            if (r.tier === "action") expect(r.session).toBeNull();
             if (r.tier === "cheap") expect(r.session).toBe("cron");
             if (r.tier === "main") expect(r.session).toBe("main");
 
@@ -63,7 +72,7 @@ describe("resolveCronRouting — total enumeration", () => {
         }
       }
     }
-    expect(n).toBe(FLAGS.length * KINDS.length * MODELS.length * CONTEXTS.length); // 2*3*5*3 = 90
+    expect(n).toBe(FLAGS.length * KINDS.length * MODELS.length * CONTEXTS.length); // 2*4*5*3 = 120
   });
 });
 
@@ -73,6 +82,16 @@ describe("resolveCronRouting — the load-bearing cases", () => {
   it("kind=poll → Tier 0 regardless of model/context", () => {
     expect(resolveCronRouting({ kind: "poll", model: "opus" }, on).tier).toBe("poll");
     expect(resolveCronRouting({ kind: "poll", context: "fresh" }, on).tier).toBe("poll");
+  });
+
+  it("kind=action → tier:action, model-free, FLAG-INDEPENDENT (never a session)", () => {
+    expect(resolveCronRouting({ kind: "action", model: "opus" }, on)).toEqual({
+      tier: "action",
+      session: null,
+      customModelDowngrade: false,
+    });
+    // even with the kill-switch OFF an action still runs model-free.
+    expect(resolveCronRouting({ kind: "action" }, { cheapCronEnabled: false }).tier).toBe("action");
   });
 
   it("explicit context wins over model inference", () => {

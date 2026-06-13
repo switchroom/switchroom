@@ -50,7 +50,7 @@ export interface TierRecommendation {
 export interface TierSelectorInput {
   /** The cron's smallest implied gap in minutes (from extractCronSmallestGapMin). */
   smallestGapMin: number;
-  kind?: "poll" | "prompt";
+  kind?: "poll" | "prompt" | "action";
   model?: string;
   context?: "fresh" | "agent";
 }
@@ -80,6 +80,9 @@ export function recommendCronTier(
   frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
 ): TierRecommendation {
   // 1. Explicit hints win — the agent/operator asked for a specific tier.
+  if (input.kind === "action") {
+    return { tier: "action", source: "explicit", reason: "declared kind: action (model-free verb)" };
+  }
   if (input.kind === "poll") {
     return { tier: "poll", source: "explicit", reason: "declared kind: poll (model-free check)" };
   }
@@ -117,7 +120,7 @@ export function recommendCronTier(
 /** The minimal shape `applyDefaultTier` reads + augments. */
 export interface TierableEntry {
   cron: string;
-  kind?: "poll" | "prompt";
+  kind?: "poll" | "prompt" | "action";
   model?: string;
   context?: "fresh" | "agent";
 }

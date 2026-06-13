@@ -115,6 +115,30 @@ describe("collectScheduleEntries — cascade resolution", () => {
     expect(entries.map((e) => e.scheduleIndex)).toEqual([0, 1, 2]);
   });
 
+  it("propagates a kind:action entry (no prompt) with its action spec + a stable key", () => {
+    const cfg = configFromAgents({
+      alice: {
+        schedule: [
+          {
+            cron: "0 9 * * *",
+            kind: "action",
+            action: { type: "telegram-message", text: "Daily heartbeat {{date}}" },
+          },
+        ],
+      },
+    });
+    const entries = collectScheduleEntries(cfg);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      agent: "alice",
+      kind: "action",
+      action: { type: "telegram-message", text: "Daily heartbeat {{date}}" },
+    });
+    // No prompt on an action; the audit key is still present + non-empty.
+    expect(entries[0]?.prompt).toBeUndefined();
+    expect(entries[0]?.promptKey).toMatch(/^[0-9a-f]{12}$/);
+  });
+
   it("empty defaults + empty profile + empty agent yields no entries (no false positives)", () => {
     const cfg = configFromAgents(
       { alice: { extends: "ops" } },

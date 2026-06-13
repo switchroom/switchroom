@@ -18,11 +18,11 @@
  * passes it in) — so the enumeration test needs no mocks.
  */
 
-export type CronTier = "poll" | "cheap" | "main";
+export type CronTier = "poll" | "action" | "cheap" | "main";
 export type CronSession = "cron" | "main";
 
 export interface CronRoutingInput {
-  kind?: "poll" | "prompt";
+  kind?: "poll" | "prompt" | "action";
   model?: string;
   context?: "fresh" | "agent";
 }
@@ -79,6 +79,17 @@ export function resolveCronRouting(
   input: CronRoutingInput,
   opts: { cheapCronEnabled: boolean },
 ): CronRouting {
+  // kind: action is a model-free deterministic verb — FLAG-INDEPENDENT. The
+  // cheap-cron kill-switch governs MODEL tiering (poll escalation, cheap vs
+  // main session), not whether a zero-token action runs. An action has no
+  // prompt, so it has no Tier-2 fallback; gating it on the flag would silently
+  // drop the cron when disabled, violating "disabling can never drop a cron".
+  // So it always routes to tier:action (model-free, no session), regardless of
+  // the flag. Decided before the kill-switch early-return below.
+  if ((input.kind ?? "prompt") === "action") {
+    return { tier: "action", session: null, customModelDowngrade: false };
+  }
+
   // Kill-switch: flag off ⟹ exactly today's behaviour. Every fire is a
   // main-session turn; kind/model/context are inert. A `kind: poll` entry
   // fires its escalation prompt as an ordinary turn — disabling the flag can
