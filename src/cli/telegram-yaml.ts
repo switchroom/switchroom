@@ -22,6 +22,14 @@ export type TelegramFeature = "voice_in" | "telegraph" | "webhook_sources" | "li
  * optional `workspace_id`). The token is a vault reference, never an inline
  * literal — the secret itself is stored in the vault by the CLI's vaultPut.
  * Idempotent on re-run (setIn overwrites the block).
+ *
+ * Also forces `channels.telegram.webhook_via_gateway: true`. A Linear agent
+ * is useless without it: inbound `AgentSessionEvent`s (the mention/delegation
+ * wakes) are handled gateway-side (`recordWebhookEvent`), and the web receiver
+ * only forwards to the gateway when `webhook_via_gateway === true`
+ * (`src/web/server.ts`). Setting the `linear_agent` block without it produces
+ * a configured-but-deaf agent — the gap that silently broke carrie's first
+ * standup until it was patched in by hand (#2298).
  */
 export function setLinearAgent(
   yamlText: string,
@@ -33,6 +41,7 @@ export function setLinearAgent(
   const block: Record<string, unknown> = { enabled: true, token: opts.token };
   if (opts.workspaceId) block.workspace_id = opts.workspaceId;
   doc.setIn(["agents", agentName, "channels", "telegram", "linear_agent"], block);
+  doc.setIn(["agents", agentName, "channels", "telegram", "webhook_via_gateway"], true);
   return String(doc);
 }
 
