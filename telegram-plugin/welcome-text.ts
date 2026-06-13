@@ -318,6 +318,10 @@ export const TELEGRAM_MENU_COMMANDS = [
   // same inject primitive as `/inject /model` but with a typed argument,
   // so it never opens the undriveable no-arg picker modal).
   { command: "model", description: "Show or switch the Claude model" },
+  // /effort — show or switch the reasoning effort (low→max, faster→smarter).
+  // Same Claude-native inject mechanism as /model; session-scoped, reverts
+  // to the configured `thinking_effort` default on restart.
+  { command: "effort", description: "Show or switch the reasoning effort" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
   // Vault — secrets + capability grants. /vault is a top-level command
@@ -379,6 +383,7 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/auth rm [agent] &lt;slot&gt; [--force]</code> — remove a slot`,
     `<code>/model</code> — show the configured Claude model`,
     `<code>/model &lt;name&gt;</code> — switch the live session's model (opus · sonnet · haiku or a full id; until restart)`,
+    `<code>/effort</code> — show or switch reasoning effort (low · medium · high · xhigh · max; until restart)`,
     `<code>/topics</code> — topic-to-agent mappings`,
     `<code>/permissions [agent]</code> — show agent permissions`,
     `<code>/grant &lt;tool&gt;</code> — grant a tool permission`,
