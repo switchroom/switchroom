@@ -1,5 +1,5 @@
 /**
- * Tests for the "⏱ 30 min" scoped-approval tier (scoped-approval.ts) —
+ * Tests for scoped-approval.ts — the 30-min window backing the "Allow" tap
  * the middle rung between "Allow once" and "🔁 Always".
  *
  * These pin the access-model invariants the adversarial review flagged as
@@ -233,7 +233,7 @@ describe('isDestructiveBashCommand — fail-closed denylist', () => {
     recordScopedGrant(store, 'clerk', 'Bash(git:*)', T0, TTL)
     // first token is the harmless `git`, but the backtick hides `rm -rf`
     expect(lookupScopedGrant(store, 'clerk', 'Bash', bashInput('git status `rm -rf /important`'), T0 + 1)).toBeNull()
-    // and the request never gets offered the ⏱ button at grant time either
+    // and the request never gets a window at grant time either
     expect(timeBoxRule('Bash', bashInput('git status `rm -rf x`'))).toBeNull()
   })
 
