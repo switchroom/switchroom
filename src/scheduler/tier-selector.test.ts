@@ -125,38 +125,33 @@ describe("resolveFrequentGapMin", () => {
   });
 });
 
-describe("applyDefaultTier — cheap-by-default for hint-less frequent crons", () => {
-  it("a frequent hint-less cron gets context: fresh (→ cheap Tier-1)", () => {
-    expect(applyDefaultTier(tierable({ cron: "*/30 * * * *" })).context).toBe("fresh");
-    expect(applyDefaultTier(tierable({ cron: "0 * * * *" })).context).toBe("fresh"); // hourly
+describe("applyDefaultTier — tool-aware: cadence is advisory, never FORCES Tier-1", () => {
+  // Holistic-trace finding: the Tier-1 cheap session is tool/memory-starved,
+  // so forcing a hint-less cron into it on cadence alone is unsafe (a
+  // tool-using cron would run starved and fail, uncaught by the bridge-down
+  // fallback). Tier-1 is now OPT-IN. applyDefaultTier passes through; the
+  // cadence recommendation lives in recommendCronTier for shadow/guidance.
+
+  it("a frequent hint-less cron is NOT auto-routed to cheap (no context injected)", () => {
+    expect(applyDefaultTier(tierable({ cron: "*/30 * * * *" })).context).toBeUndefined();
+    expect(applyDefaultTier(tierable({ cron: "0 * * * *" })).context).toBeUndefined(); // hourly
+    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *" })).context).toBeUndefined();
   });
 
-  it("an infrequent hint-less cron is left untouched (stays full-session default)", () => {
-    // The regression that matters: a daily briefing must NOT be downgraded.
-    expect(applyDefaultTier(tierable({ cron: "0 8 * * *" })).context).toBeUndefined();
-    expect(applyDefaultTier(tierable({ cron: "0 18 * * 0" })).context).toBeUndefined(); // weekly
-  });
-
-  it("explicit hints are never overridden", () => {
-    // context: agent on a frequent cron — operator said full session, we obey.
+  it("explicit opt-in hints are preserved unchanged (the author's tool-aware signal)", () => {
+    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", context: "fresh" })).context).toBe("fresh");
+    expect(applyDefaultTier(tierable({ cron: "0 8 * * *", model: "sonnet" })).model).toBe("sonnet");
     expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", context: "agent" })).context).toBe("agent");
-    // explicit model on a frequent cron — untouched (no context injected).
-    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", model: "opus" })).context).toBeUndefined();
-    // a poll is explicit — untouched.
-    const poll = applyDefaultTier(tierable({ cron: "*/5 * * * *", kind: "poll" }));
-    expect(poll.context).toBeUndefined();
-    expect(poll.kind).toBe("poll");
+    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", kind: "poll" })).kind).toBe("poll");
   });
 
-  it("an unreadable cadence is treated as infrequent (conservative — never wrongly cheap)", () => {
-    expect(applyDefaultTier(tierable({ cron: "0-10 * * * *" })).context).toBeUndefined();
-    expect(applyDefaultTier(tierable({ cron: "garbage" })).context).toBeUndefined();
-  });
-
-  it("preserves all other fields", () => {
+  it("is a pure pass-through — nothing injected", () => {
     const out = applyDefaultTier(tierable({ cron: "*/30 * * * *", kind: "prompt" }));
-    expect(out.cron).toBe("*/30 * * * *");
-    expect(out.kind).toBe("prompt");
-    expect(out.context).toBe("fresh");
+    expect(out).toEqual({ cron: "*/30 * * * *", kind: "prompt" });
+  });
+
+  it("recommendCronTier still surfaces the advisory (recommender intact)", () => {
+    // Only the enforcing applyDefaultTier changed; the recommendation stays.
+    expect(recommendCronTier({ smallestGapMin: 30 }).tier).toBe("cheap");
   });
 });
