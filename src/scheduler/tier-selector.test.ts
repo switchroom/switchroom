@@ -126,14 +126,13 @@ describe("resolveFrequentGapMin", () => {
   });
 });
 
-describe("applyDefaultTier — DEFAULT-OFF: pass-through (flag unset, today's fleet)", () => {
-  // #2307 PR4: the cadence auto-router is re-enabled but ships default-off
-  // behind SWITCHROOM_CRON_AUTO_TIER. With the flag unset (autoTierEnabled
-  // defaulting false via the explicit arg below), applyDefaultTier is the
-  // #2305 pass-through — inert for the fleet until a canary flips the flag.
+describe("applyDefaultTier — kill-switch tripped (autoTierEnabled=false): pass-through", () => {
+  // v0.15.17: the cadence auto-router is DEFAULT-ON. The kill-switch
+  // (SWITCHROOM_CRON_AUTO_TIER=0/off → autoTierEnabled false) reverts to the
+  // #2305 pass-through, every frequent cron stays a full Tier-2 turn.
   const off = (e: TierableEntry) => applyDefaultTier(e, DEFAULT_FREQUENT_GAP_MIN, false);
 
-  it("a frequent hint-less cron is NOT auto-routed to cheap (flag off)", () => {
+  it("a frequent hint-less cron is NOT auto-routed to cheap (kill-switch on)", () => {
     expect(off(tierable({ cron: "*/30 * * * *" })).context).toBeUndefined();
     expect(off(tierable({ cron: "0 * * * *" })).context).toBeUndefined(); // hourly
     expect(off(tierable({ cron: "*/5 * * * *" })).context).toBeUndefined();
@@ -185,18 +184,20 @@ describe("applyDefaultTier — flag ON: cadence re-enabled (#2307 PR4)", () => {
   });
 });
 
-describe("resolveCronAutoTier — default OFF; only 1/true/on enables", () => {
+describe("resolveCronAutoTier — DEFAULT-ON kill-switch (only 0/false/off disables)", () => {
   it.each([
+    // unset / empty / anything else → ON (the default — it's a kill-switch now)
+    ["", true],
+    [undefined, true],
     ["1", true],
     ["true", true],
     ["on", true],
-    ["ON", true],
-    ["", false],
-    [undefined, false],
+    ["anything", true],
+    // the kill-switch values
     ["0", false],
     ["false", false],
     ["off", false],
-    ["yes", false], // only the three canonical truthy values
+    ["OFF", false],
   ])("SWITCHROOM_CRON_AUTO_TIER=%s → %s", (val, expected) => {
     expect(resolveCronAutoTier({ SWITCHROOM_CRON_AUTO_TIER: val } as NodeJS.ProcessEnv)).toBe(expected);
   });

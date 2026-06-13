@@ -94,10 +94,11 @@ export function buildCheapCronHooks(
         now,
       });
     }
-    // telegram-reactions is schema-accepted but STAGED — it needs the
-    // net-new internal gateway reactions query verb. Until then it records a
-    // poll-error (no escalation), never a silent success.
-    return { hit: false, baseline: false, error: `poll type '${spec.type}' not yet wired (staged)` };
+    // Unreachable today — http-diff is the only poll type (the telegram-reactions
+    // poll was removed; reaction_dispatch covers reactions). Kept as a
+    // forward-compat guard for a future poll type added to PollSpecSchema: never
+    // a silent success, always an audited poll-error.
+    return { hit: false, baseline: false, error: "poll type not yet wired" };
   };
 
   // Tier-0 action (#2307): model-free, terminal. telegram-message posts to the
