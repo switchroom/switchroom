@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.15.14 — cheap-cron Tier-0 action tier + Tier-1 un-starve (#2307)
+
+Completes #2307 — making scheduled work spend the model only when it earns it.
+Everything here is **inert for the fleet** by default (no agent runs a cron
+session; `kind: action` is unused; `SWITCHROOM_CRON_AUTO_TIER` is off), so the
+release is byte-identical for running agents until an operator opts in.
+
+### Tier-0 — model-free action tier (#2320, #2321; engine in v0.15.13/#2318)
+
+A `kind: action` cron now **completes mechanical work deterministically in the
+scheduler process — zero model calls, no second `claude`, no session wake**.
+Two action types: `telegram-message` (post fixed/templated text to the agent's
+**own** chat — `{{date}}/{{time}}/{{agent}}` only, no secrets in a message) and
+`webhook` (a fixed HTTP request through the same egress fence the polls use).
+
+- **#2320** — `send_outbound` gateway IPC verb: the one `ClientToGateway` verb
+  that posts a Telegram message **without waking the model** (no
+  `inject_inbound`, no `currentTurn`). Fences `agentName == self` +
+  `assertAllowedChat` so an action can only post to the agent's own chat.
+- **#2321** — wiring: `buildCheapCronHooks.runAction` over the `send_outbound`
+  transport + the agent's own channel target.
+
+`kind: action` is operator-config-only (the `schedule_add` MCP tool can't author
+it) and **flag-independent** (model-free regardless of `SWITCHROOM_CHEAP_CRON`).
+
+### Tier-1 — un-starve the cheap cron session (#2322–#2325)
+
+The Tier-1 cheap cron session (`<agent>-cron` — a second cheap Sonnet `claude`
+for cheap cron fires) was lobotomised (trimmed `.mcp.json`, a "you don't have
+memory" prompt) and never ran in production. Now it's "a fresh, low-context
+conversation that **still has the agent's memory + tools**, on a cheaper model."
+
+- **#2322** — the cron `.mcp.json` carries the **full** filtered MCP set (shared
+  hindsight memory bank — baked from the base agent name, zero fragmentation;
+  tool-search-deferred to keep context cheap). The cron bridge's liveness file
+  is isolated (`SWITCHROOM_BRIDGE_ALIVE_PATH` → `.bridge-alive-cron`) so it can't
+  mask a dead main bridge, while `STATE_DIR`/gateway socket stay shared. The
+  append-prompt now says it shares memory + tools.
+- **#2323** — boot-wedge fix: `seedCronConfigDir` seeds the cron
+  `CLAUDE_CONFIG_DIR` with onboarding + trust state (full server set), so the
+  cron `claude` no longer wedges on the first-run wizard and the `<agent>-cron`
+  bridge actually registers. The shared onboarding helpers gained a
+  `configDirName` param (default `.claude`, so the main boot path is untouched).
+- **#2324** — observability: a `switchroom doctor` *Cron Session* check
+  (asserts the cron bridge is registered when expected) + a
+  `cron_fell_back_to_main` runtime metric (a climbing counter = a down cron
+  session).
+- **#2325** — re-enable cadence auto-routing behind **default-off**
+  `SWITCHROOM_CRON_AUTO_TIER`: a hint-less frequent (≤60min) cron auto-routes to
+  the cheap session; daily/weekly and unreadable cadences stay on the main
+  session; explicit hints always win. Graceful fallback means a misconfigured
+  flag never drops a cron.
+
+See `docs/scheduling.md` for the `kind: action` and auto-routing operator docs.
+
 ## v0.15.13 — 30-min scoped approvals + Linear capture/create-issue (#2317, #2313–#2316)
 
 ### PR — feat(approvals): "⏱ 30 min" scoped approval tier (#2317)
