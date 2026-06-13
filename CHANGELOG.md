@@ -1,6 +1,15 @@
 # Changelog
 
-## unreleased — Linear agents as first-class actors
+## v0.15.12 — Linear agents as first-class actors (#2298, #2310)
+
+### PR — feat(model): keep `fable` selectable + model regression coverage (#2310)
+
+`fable` is now a first-class `/model` alias (alongside `opus`/`sonnet`/
+`haiku`/`default`) so the latest flagship (Fable 5) stays discoverable. The
+2026-06-13 fleet outage came from pinning the full *codename* `claude-fable-5`
+(retired server-side → 4xx), not the alias; regression tests lock in that
+aliases stay selectable and that the `/model` shape-gate passes any full id
+through to claude (switchroom never allowlists models).
 
 ### PR — feat(linear): Linear agents as first-class actors (#2298)
 
