@@ -8,7 +8,8 @@ import { InMemoryAuditSink } from "../scheduler/audit.js";
 import type { InboundDispatcher, InboundMessageWire, SchedulerEntry } from "../scheduler/dispatch.js";
 import { createMemoryPollStateStore } from "../scheduler/poll-state.js";
 import type { PollOutcome } from "../scheduler/poll-engine.js";
-import type { PollSpec } from "../config/schema.js";
+import type { ActionOutcome } from "../scheduler/action-engine.js";
+import type { ActionSpec, PollSpec } from "../config/schema.js";
 import { registerAgentSchedule, type CheapCronHooks, type CronLib } from "./index.js";
 
 function fakeCron(): CronLib & { fire: (i: number) => Promise<void> } {
@@ -104,6 +105,94 @@ describe("Tier-0 poll wiring", () => {
     expect(h.dispatcher.calls).toHaveLength(1); // disabling never drops a cron
     expect(h.dispatcher.calls[0]!.msg.meta.session).toBeUndefined();
     expect(h.sink.fires[0]).toMatchObject({ tier: "main" });
+  });
+});
+
+describe("Tier-0 action wiring (#2307)", () => {
+  const ACTION: ActionSpec = { type: "telegram-message", text: "Daily heartbeat {{date}}", parse_mode: "html" };
+  const actionEntry: SchedulerEntry = {
+    agent: "marko",
+    scheduleIndex: 2,
+    cron: "0 9 * * *",
+    promptKey: "a1",
+    kind: "action",
+    action: ACTION,
+  };
+
+  function actionHarness(
+    runAction: ((spec: ActionSpec, ctx: { threadId?: number }) => Promise<ActionOutcome>) | undefined,
+    opts: { enabled?: boolean } = {},
+  ) {
+    const cron = fakeCron();
+    const dispatcher = capture();
+    const sink = new InMemoryAuditSink();
+    const cheapCron: CheapCronHooks = {
+      enabled: opts.enabled ?? true,
+      pollState: createMemoryPollStateStore(),
+      runPoll: async () => ({ hit: false, baseline: false }),
+      ...(runAction ? { runAction } : {}),
+    };
+    registerAgentSchedule({
+      entries: [actionEntry],
+      channel: { chatId: "123", threadId: undefined } as never,
+      sink,
+      cronLib: cron,
+      dispatcher,
+      now: () => 1000,
+      cheapCron,
+    });
+    return { cron, dispatcher, sink };
+  }
+
+  it("runs the action model-free → NO dispatch, tier=action, exit 0", async () => {
+    const calls: Array<{ spec: ActionSpec; ctx: { threadId?: number } }> = [];
+    const h = actionHarness(async (spec, ctx) => {
+      calls.push({ spec, ctx });
+      return { ok: true, summary: "message sent (21 chars)" };
+    });
+    await h.cron.fire(0);
+    expect(h.dispatcher.calls).toHaveLength(0); // ← zero model fires (the whole point)
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.spec).toEqual(ACTION);
+    expect(h.sink.fires[0]).toMatchObject({ exitCode: 0, tier: "action" });
+    expect(h.sink.fires[0]!.outputSummary).toMatch(/action ok/);
+  });
+
+  it("an action error → exit -4, still NO dispatch, sibling-safe", async () => {
+    const h = actionHarness(async () => ({ ok: false, summary: "", error: "http 500" }));
+    await h.cron.fire(0);
+    expect(h.dispatcher.calls).toHaveLength(0);
+    expect(h.sink.fires[0]).toMatchObject({ exitCode: -4, tier: "action" });
+    expect(h.sink.fires[0]!.outputSummary).toMatch(/action error: http 500/);
+  });
+
+  it("a thrown runAction is caught → exit -4, never crashes the tick", async () => {
+    const h = actionHarness(async () => {
+      throw new Error("boom");
+    });
+    await h.cron.fire(0);
+    expect(h.sink.fires[0]).toMatchObject({ exitCode: -4, tier: "action" });
+    expect(h.sink.fires[0]!.outputSummary).toMatch(/boom/);
+  });
+
+  it("transport unwired (runAction absent) → graceful -4 no-op, no dispatch, no fall-through to a model fire", async () => {
+    const h = actionHarness(undefined);
+    await h.cron.fire(0);
+    expect(h.dispatcher.calls).toHaveLength(0);
+    expect(h.sink.fires[0]).toMatchObject({ exitCode: -4, tier: "action" });
+    expect(h.sink.fires[0]!.outputSummary).toMatch(/transport unavailable/);
+  });
+
+  it("FLAG OFF → an action STILL runs model-free (never dropped by the kill-switch)", async () => {
+    const ran: ActionSpec[] = [];
+    const h = actionHarness(async (spec) => {
+      ran.push(spec);
+      return { ok: true, summary: "ok" };
+    }, { enabled: false });
+    await h.cron.fire(0);
+    expect(ran).toHaveLength(1);
+    expect(h.dispatcher.calls).toHaveLength(0);
+    expect(h.sink.fires[0]).toMatchObject({ tier: "action", exitCode: 0 });
   });
 });
 

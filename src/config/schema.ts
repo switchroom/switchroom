@@ -105,20 +105,86 @@ export const PollSpecSchema = z.discriminatedUnion("type", [
   TelegramReactionsPollSchema,
 ]);
 
+// Tier-0 deterministic ACTION specs (docs/rfcs/cheap-cron-sessions.md §2.1,
+// reference/crons-use-the-model-only-when-it-earns-it.md). A `kind: action`
+// entry runs model-free in the scheduler process and COMPLETES the work — it
+// never escalates to a model (the terminal sibling of `kind: poll`, which
+// escalates on a hit). Zero tokens, no second `claude`, no session wake.
+// Only mechanical verbs whose output is FULLY determined by config +
+// deterministic substitution belong here; anything needing NL synthesis
+// (a Linear issue body, a summary) must stay `kind: poll`/`prompt` and use a
+// model. Discriminated on `type`.
+export const TelegramMessageActionSchema = z.object({
+  type: z.literal("telegram-message"),
+  text: z
+    .string()
+    .min(1)
+    .describe(
+      "Operator-authored message text. Posts to the AGENT'S OWN chat only " +
+      "(the chat is not configurable — fenced by construction), into the " +
+      "entry-level `topic` when set. Supports ONLY deterministic placeholders " +
+      "{{date}} / {{time}} (UTC, from the fire clock) and {{agent}}. NO vault " +
+      "secrets (use a webhook action for secret-bearing requests) and NO model " +
+      "output — the text is fully determined by config.",
+    ),
+  parse_mode: z.enum(["html", "text"]).default("html").describe("Telegram parse mode for the message body."),
+});
+
+export const WebhookActionSchema = z.object({
+  type: z.literal("webhook"),
+  url: z
+    .string()
+    .url()
+    .describe(
+      "Webhook target. SAME egress fence as an http-diff poll (§6.1): https " +
+      "only, host on the operator egress allowlist, loopback/private/link-local " +
+      "rejected, resolved IP DNS-rebind-pinned. Not agent-writable without an " +
+      "operator commit.",
+    ),
+  method: z.enum(["GET", "POST"]).default("POST"),
+  headers: z.record(z.string()).optional().describe("Static headers; {{secret}} substitution applies."),
+  body: z.string().optional().describe("Static request body; {{secret}} substitution applies."),
+  secrets: z
+    .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))
+    .default([])
+    .describe(
+      "Vault keys this webhook may inject into headers/body via {{name}}. Each " +
+      "is HOST-PINNED (§6.1): a secret may only be sent to the host it is bound " +
+      "to in operator config, so an approved action cannot exfil it elsewhere.",
+    ),
+});
+
+export const ActionSpecSchema = z.discriminatedUnion("type", [
+  TelegramMessageActionSchema,
+  WebhookActionSchema,
+]);
+
 export const ScheduleEntrySchema = z
   .object({
   cron: z.string().describe("Cron expression (e.g., '0 8 * * *')"),
-  prompt: z.string().describe("Prompt to send at the scheduled time (the escalation prompt when kind=poll; templated with {{diff}})."),
+  prompt: z
+    .string()
+    .optional()
+    .describe(
+      "Prompt to send at the scheduled time (the escalation prompt when " +
+      "kind=poll; templated with {{diff}}). Required for kind prompt/poll; " +
+      "absent for kind=action (an action has no model fire, so no prompt).",
+    ),
   kind: z
-    .enum(["poll", "prompt"])
+    .enum(["poll", "prompt", "action"])
     .optional()
     .describe(
       "Tier-0 routing (docs/rfcs/cheap-cron-sessions.md). 'prompt' (default) " +
       "fires a model turn every tick (Tier 1/2 per `context`). 'poll' runs a " +
       "model-free deterministic check (requires `poll`) and only escalates to " +
-      "a model fire on a hit. Honoured only when SWITCHROOM_CHEAP_CRON is on.",
+      "a model fire on a hit. 'action' runs a model-free deterministic verb " +
+      "(requires `action`) that COMPLETES the work and never escalates — zero " +
+      "tokens, no session. poll/prompt are honoured only when " +
+      "SWITCHROOM_CHEAP_CRON is on; an action is model-free regardless (the " +
+      "kill-switch governs model tiering, not deterministic actions).",
     ),
   poll: PollSpecSchema.optional().describe("Required iff kind=poll. The declarative poll spec."),
+  action: ActionSpecSchema.optional().describe("Required iff kind=action. The declarative action spec (telegram-message or webhook)."),
   model: z
     .string()
     .optional()
@@ -178,11 +244,40 @@ export const ScheduleEntrySchema = z
         message: "kind: poll requires a `poll` spec (http-diff or telegram-reactions).",
       });
     }
-    if (kind === "prompt" && entry.poll) {
+    if (kind !== "poll" && entry.poll) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["poll"],
         message: "`poll` is only valid when kind: poll.",
+      });
+    }
+    if (kind === "action" && !entry.action) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["action"],
+        message: "kind: action requires an `action` spec (telegram-message or webhook).",
+      });
+    }
+    if (kind !== "action" && entry.action) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["action"],
+        message: "`action` is only valid when kind: action.",
+      });
+    }
+    // prompt is the model fire's text — required for prompt/poll, absent for action.
+    if (kind !== "action" && (entry.prompt === undefined || entry.prompt.trim() === "")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["prompt"],
+        message: `kind: ${kind} requires a non-empty \`prompt\`.`,
+      });
+    }
+    if (kind === "action" && entry.prompt !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["prompt"],
+        message: "`prompt` is not valid for kind: action (an action never fires a model).",
       });
     }
   });
@@ -3088,6 +3183,7 @@ export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;
 export type ScheduleEntry = z.infer<typeof ScheduleEntrySchema>;
 export type PollSpec = z.infer<typeof PollSpecSchema>;
+export type ActionSpec = z.infer<typeof ActionSpecSchema>;
 export type CronConfig = z.infer<typeof CronConfigSchema>;
 export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;

@@ -19,15 +19,18 @@
  */
 
 import { createHash } from "node:crypto";
-import type { PollSpec, ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
+import type { ActionSpec, PollSpec, ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 
 export interface SchedulerEntry {
   agent: string;
   scheduleIndex: number;
   cron: string;
-  prompt: string;
-  /** SHA-256 prefix of prompt — stable, non-reversible audit key. */
+  /** The model-fire text (prompt/poll). Absent for kind=action — an action
+   *  never fires a model, so it has no prompt. */
+  prompt?: string;
+  /** SHA-256 prefix of the prompt (or, for an action, its spec) — stable,
+   *  non-reversible audit key. */
   promptKey: string;
   /**
    * Cheap-cron routing fields (docs/rfcs/cheap-cron-sessions.md). Consumed
@@ -35,10 +38,12 @@ export interface SchedulerEntry {
    * inert unless SWITCHROOM_CHEAP_CRON is on. `kind: poll` runs a model-free
    * deterministic poll (requires `poll`) that only escalates on a hit.
    */
-  kind?: "poll" | "prompt";
+  kind?: "poll" | "prompt" | "action";
   model?: string;
   context?: "fresh" | "agent";
   poll?: PollSpec;
+  /** Required iff kind=action. The declarative model-free action spec. */
+  action?: ActionSpec;
   /**
    * Per-entry Telegram topic override (PR4b of supergroup-mode rollout).
    * Either a string alias defined in the agent's
@@ -79,12 +84,15 @@ export function collectScheduleEntries(
     const schedule: ScheduleEntry[] = resolved.schedule ?? [];
     for (let i = 0; i < schedule.length; i++) {
       const entry = schedule[i]!;
+      // An action has no prompt; key the audit off its spec instead so the
+      // promptKey stays a stable, non-reversible correlation id.
+      const auditMaterial = entry.prompt ?? `action:${JSON.stringify(entry.action ?? {})}`;
       out.push({
         agent,
         scheduleIndex: i,
         cron: entry.cron,
-        prompt: entry.prompt,
-        promptKey: createHash("sha256").update(entry.prompt).digest("hex").slice(0, 12),
+        ...(entry.prompt !== undefined ? { prompt: entry.prompt } : {}),
+        promptKey: createHash("sha256").update(auditMaterial).digest("hex").slice(0, 12),
         // Propagate the per-entry topic override (PR1 schema field).
         // Resolved at dispatch time via resolveOutboundTopic().
         ...(entry.topic !== undefined ? { topic: entry.topic } : {}),
@@ -93,6 +101,7 @@ export function collectScheduleEntries(
         ...(entry.model !== undefined ? { model: entry.model } : {}),
         ...(entry.context !== undefined ? { context: entry.context } : {}),
         ...(entry.poll !== undefined ? { poll: entry.poll } : {}),
+        ...(entry.action !== undefined ? { action: entry.action } : {}),
       });
     }
   }
@@ -123,7 +132,7 @@ export interface DispatchResult {
    * report` can show the cost breakdown. Absent on legacy audit rows and
    * when SWITCHROOM_CHEAP_CRON is off (treated as 'main').
    */
-  tier?: "poll" | "cheap" | "main";
+  tier?: "poll" | "action" | "cheap" | "main";
   modelUsed?: string;
 }
 
@@ -239,7 +248,9 @@ export function dispatchAsInbound(
     user: "cron",
     userId: 0,
     ts,
-    text: entry.prompt,
+    // dispatchAsInbound is only called for prompt/poll entries (which carry a
+    // prompt); an action never reaches here. Fallback keeps the type total.
+    text: entry.prompt ?? "",
     meta: {
       source: "cron",
       schedule_index: String(entry.scheduleIndex),

@@ -39,8 +39,9 @@ import {
 import { isCheapCronEnabled, resolveCronRouting, resolveEscalationRouting } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import type { PollOutcome } from "../scheduler/poll-engine.js";
+import type { ActionOutcome } from "../scheduler/action-engine.js";
 import type { PollStateStore } from "../scheduler/poll-state.js";
-import type { PollSpec } from "../config/schema.js";
+import type { ActionSpec, PollSpec } from "../config/schema.js";
 import { buildCheapCronHooks } from "./cheap-cron-wiring.js";
 // AgentChannelTarget, resolveChannelTarget, and resolveEntryThreadId
 // live in ./channel-target.js (a node-cron-free leaf) so the gateway's
@@ -125,11 +126,21 @@ export interface CheapCronHooks {
   pollState: PollStateStore;
   /** Run a declarative poll (model-free) and return whether to escalate. */
   runPoll: (spec: PollSpec, prevCursor: string | undefined) => Promise<PollOutcome>;
+  /**
+   * Run a declarative ACTION (model-free, terminal — no escalation). Posts to
+   * the agent's OWN chat (`ctx.threadId` resolves the entry's topic) or fires a
+   * webhook. Optional: present once the action transport (send_outbound IPC) is
+   * wired; absent ⟹ a `kind: action` fire records a graceful "transport
+   * unavailable" no-op rather than crashing or falling through to a model fire.
+   */
+  runAction?: (spec: ActionSpec, ctx: { threadId?: number }) => Promise<ActionOutcome>;
 }
 
-/** Replace {{diff}} in an escalation prompt with the poll's diff summary. */
-function templateEscalationPrompt(prompt: string, diff: string): string {
-  return prompt.replace(/\{\{\s*diff\s*\}\}/g, diff);
+/** Replace {{diff}} in an escalation prompt with the poll's diff summary.
+ *  Only called for poll entries (which carry a prompt); the `?? ""` keeps the
+ *  type total now that SchedulerEntry.prompt is optional (kind=action). */
+function templateEscalationPrompt(prompt: string | undefined, diff: string): string {
+  return (prompt ?? "").replace(/\{\{\s*diff\s*\}\}/g, diff);
 }
 
 /**
@@ -290,7 +301,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       const record = (fields: {
         exitCode: number;
         summary: string;
-        tier: "poll" | "cheap" | "main";
+        tier: "poll" | "action" | "cheap" | "main";
         modelUsed?: string;
       }) =>
         opts.sink.recordFire({
@@ -355,6 +366,40 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
         return;
       }
 
+      // ── Tier 0: deterministic ACTION, no model, terminal ──────────────
+      // Routing returns tier:"action" FLAG-INDEPENDENTLY (an action is
+      // model-free regardless of SWITCHROOM_CHEAP_CRON). It COMPLETES the work
+      // and never escalates — no dispatchAsInbound, no session wake.
+      if (routing.tier === "action") {
+        if (!opts.cheapCron?.runAction || !entry.action) {
+          // Transport not wired yet (PR2/PR3) or malformed entry: graceful
+          // no-op so a misconfigured action never crashes the tick or falls
+          // through to a (prompt-less) model fire. Audited, not silent.
+          record({
+            exitCode: -4,
+            summary: !entry.action
+              ? "action skipped — no action spec on entry"
+              : "action skipped — action transport unavailable",
+            tier: "action",
+          });
+          return;
+        }
+        let outcome: ActionOutcome;
+        try {
+          outcome = await opts.cheapCron.runAction(entry.action, { threadId });
+        } catch (err) {
+          outcome = { ok: false, summary: "", error: (err as Error).message };
+        }
+        // exit -4 = action error: no escalation; re-runs next tick (we accept a
+        // possibly-missed fire over a double-fire — actions are not replayed).
+        record({
+          exitCode: outcome.ok ? 0 : -4,
+          summary: outcome.ok ? `action ok: ${outcome.summary}` : `action error: ${outcome.error}`,
+          tier: "action",
+        });
+        return;
+      }
+
       // ── Tier 1/2: a model fire into the cron or main session ──────────
       let delivered = false;
       let summary = "";
@@ -376,6 +421,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       //  -1 — gateway not connected, or wire write failed
       //  -2 — deferred: fleet fully quota-walled (recorded above)
       //  -3 — Tier-0 poll error (recorded above)
+      //  -4 — Tier-0 action error / skipped (recorded above)
       record({
         exitCode: delivered ? 0 : -1,
         summary,
@@ -689,6 +735,24 @@ export async function main(): Promise<void> {
         const cheapEnabledForReplay = isCheapCronEnabled(process.env);
         for (const m of missed) {
           const startedAt = Date.now();
+          // A `kind: action` entry must NOT replay as a raw prompt (it has no
+          // prompt) and must NOT double-fire a side effect (a re-sent message /
+          // re-fired webhook). We accept a possibly-MISSED action over a
+          // double — the next natural tick runs it. Flag-independent (actions
+          // are model-free regardless of cheap-cron). Skip + audit.
+          if (m.entry.kind === "action") {
+            sink.recordFire({
+              agent: m.entry.agent,
+              scheduleIndex: m.entry.scheduleIndex,
+              promptKey: m.entry.promptKey,
+              exitCode: 0,
+              outputSummary: "action replay skipped — runs on next tick (never double-fired)",
+              startedAt,
+              finishedAt: Date.now(),
+              tier: "action",
+            });
+            continue;
+          }
           // Cheap-cron: a `kind: poll` entry must NOT replay as a raw prompt —
           // that would fire its escalation text (with a literal {{diff}}) as a
           // model turn, bypassing the poll. A poll is stateful (durable cursor),
@@ -732,7 +796,8 @@ export async function main(): Promise<void> {
           `skipped (older than ${windowMinutes}min window) — notifying user\n`,
         );
         const lines = staleSkipped.map((s) => {
-          const oneLine = s.entry.prompt.replace(/\s+/g, " ").trim().slice(0, 80);
+          const label = s.entry.prompt ?? `action: ${s.entry.action?.type ?? "?"}`;
+          const oneLine = label.replace(/\s+/g, " ").trim().slice(0, 80);
           return `- "${oneLine}" — cron \`${s.entry.cron}\`, ` +
             `most recent missed run ~${new Date(s.expectedFireMs).toISOString()}`;
         });

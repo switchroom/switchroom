@@ -23,11 +23,14 @@ import { createHash } from "node:crypto";
  * comfortably in a unit-name segment while keeping collision odds
  * negligible at typical fleet sizes (<100 entries per agent).
  */
-export function cronUnitHash(cron: string, prompt: string): string {
+export function cronUnitHash(cron: string, prompt: string | undefined): string {
+  // `prompt` is optional now that kind=action entries carry no prompt; coalesce
+  // so the hash stays total (an action entry's unit name is derived from cron
+  // alone, which is sufficient for path classification).
   return createHash("sha256")
     .update(cron)
     .update("\0")
-    .update(prompt)
+    .update(prompt ?? "")
     .digest("hex")
     .slice(0, 12);
 }
@@ -37,14 +40,14 @@ export function cronUnitHash(cron: string, prompt: string): string {
  * extension so callers can append `.sh` (script) or `.source` (the
  * overlay attribution sidecar).
  */
-export function cronUnitName(cron: string, prompt: string): string {
+export function cronUnitName(cron: string, prompt: string | undefined): string {
   return `cron-${cronUnitHash(cron, prompt)}`;
 }
 
 /**
  * Filename used on disk under `<agentDir>/telegram/`.
  */
-export function cronScriptFilename(cron: string, prompt: string): string {
+export function cronScriptFilename(cron: string, prompt: string | undefined): string {
   return `${cronUnitName(cron, prompt)}.sh`;
 }
 
