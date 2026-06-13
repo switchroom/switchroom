@@ -12,6 +12,7 @@ import { registerWebCommand } from "./web.js";
 import { registerSetupCommand } from "./setup.js";
 import { registerDoctorCommand } from "./doctor.js";
 import { registerUpdateCommand } from "./update.js";
+import { registerRolloutCommand } from "./rollout.js";
 import { registerRestartCommand } from "./restart.js";
 import { registerVersionCommand } from "./version.js";
 import { registerVersionsCommand } from "./versions.js";
@@ -68,6 +69,7 @@ export const program = new Command()
 registerSetupCommand(program);
 registerDoctorCommand(program);
 registerUpdateCommand(program);
+registerRolloutCommand(program);
 registerRestartCommand(program);
 registerVersionCommand(program);
 registerVersionsCommand(program);
