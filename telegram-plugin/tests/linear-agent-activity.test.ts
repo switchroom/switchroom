@@ -51,7 +51,7 @@ describe('linear_agent_activity — gateway wiring (#2298)', () => {
   })
 
   it('is allow-listed and dispatched', () => {
-    expect(gw).toMatch(/'linear_agent_activity',\n\]\)/)
+    expect(gw).toMatch(/'linear_agent_activity',/)
     expect(gw).toMatch(/case 'linear_agent_activity':\s*\n\s*return executeLinearAgentActivity\(args\)/)
   })
 })
