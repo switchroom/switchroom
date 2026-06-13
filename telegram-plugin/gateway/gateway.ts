@@ -7670,13 +7670,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // topic and a late stream-reply can't be stolen by a successor turn. DM:
   // every tier undefined → unchanged. Kill switch off → legacy live-turn
   // injection only.
-  // The resolved origin turn is hoisted UNCONDITIONALLY (outside the
-  // message_thread_id==null guard below) so the obligation-close path has
-  // the correct routedOriginTurn even when the model explicitly passes
-  // message_thread_id (forum-topic streams). Without this hoist, Fix 1
-  // is a no-op for forum-topic streams — the origin is never resolved and
-  // closeObligationOnSubstantiveReply falls through to the live-turn
-  // fallback. Matches executeReply's unconditional resolution.
   // Origin resolution is hoisted UNCONDITIONALLY (outside the
   // message_thread_id==null guard below) so the obligation-close path has
   // the correct routedOriginTurn even when the model explicitly passes
