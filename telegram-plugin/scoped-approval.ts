@@ -203,6 +203,15 @@ export function isDestructiveBashCommand(command: string): boolean {
   if (!command || !command.trim()) return true;
   const c = command.toLowerCase();
 
+  // Backtick command substitution is un-vettable: the destructive op can
+  // hide inside `…` where the command-position anchors below (which include
+  // `$(` but not the backtick) would miss it — e.g. `git status \`rm -rf x\``
+  // matches the `Bash(git:*)` family but its first token is the harmless
+  // `git`. There is no need to time-box a backtick-substituted command, so
+  // fail closed (re-card). `$(…)` substitution stays handled by the `(`
+  // anchor in the rules below.
+  if (c.includes("`")) return true;
+
   // download-and-execute: ... | sh|bash|python|node
   if (/\|\s*(sudo\s+)?(sh|bash|zsh|fish|python\d?|perl|ruby|node)\b/.test(c)) return true;
   // privilege escalation
