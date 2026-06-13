@@ -33,12 +33,20 @@ import {
 } from '../../src/agents/model-picker.js'
 
 /**
- * Aliases the claude CLI resolves natively. Listed in help text only —
- * the handler does NOT restrict to these (a full model id like
- * `claude-opus-4-8` passes through and claude itself validates it, so
- * new aliases/models work without a switchroom release).
+ * Aliases the claude CLI resolves natively (`claude --help`: "an alias for
+ * the latest model (e.g. 'fable', 'opus', or 'sonnet')"). Listed in help
+ * text only — the handler does NOT restrict to these (a full model id like
+ * `claude-opus-4-8` passes through and claude itself validates it, so new
+ * aliases/models work without a switchroom release).
+ *
+ * `fable` is the latest flagship (Fable 5) — kept selectable here on
+ * purpose. NB the alias is NOT the full codename: `claude-fable-5` (a
+ * pinned pre-launch id) was retired server-side and 4xx'd the whole fleet
+ * on 2026-06-13, while the `fable` alias keeps resolving to the current
+ * model. Aliases are the durable way to pick a model — see the model
+ * regression tests.
  */
-export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'default'] as const
+export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable', 'default'] as const
 
 /**
  * Shape gate for the model argument. This string is typed literally
