@@ -59,6 +59,7 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   ["/hooks", { description: "List configured hooks", expectsOutput: true }],
   ["/memory", { description: "Open memory picker", expectsOutput: true }],
   ["/model", { description: "Open model picker", expectsOutput: true }],
+  ["/effort", { description: "Set reasoning effort", expectsOutput: true }],
   [
     "/clear",
     { description: "Clear session screen", expectsOutput: false },

@@ -9,7 +9,7 @@ import { resolveAgentsDir, loadConfig } from "../config/loader.js";
 import { isHindsightEnabled } from "../memory/hindsight.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
-import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL } from "../agents/scaffold.js";
+import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
 import { writeComposeFile } from "./write-compose.js";
 import { bareClonePath } from "../repos/bare-clone.js";
 import { removeAgentWorktree } from "../repos/agent-worktree.js";
@@ -797,6 +797,10 @@ export function registerAgentCommand(program: Command): void {
               status: status?.active ?? "unknown",
               uptime: formatUptime(status?.uptime ?? null),
               model: resolved.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL,
+              // Cascade-resolved effort — what start.sh bakes into
+              // `--effort`, and the default the /effort session switch
+              // reverts to on restart. Consumed by the gateway's /effort.
+              thinking_effort: resolved.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
               extends: agentConfig.extends ?? "default",
               topic_name: agentConfig.topic_name,
               topic_emoji: agentConfig.topic_emoji,

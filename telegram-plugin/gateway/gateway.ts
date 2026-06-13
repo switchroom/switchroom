@@ -271,6 +271,15 @@ import {
   type ModelMenuReply,
 } from './model-command.js'
 import { discoverModels, selectModel } from '../../src/agents/model-picker.js'
+import {
+  parseEffortCommand,
+  handleEffortCommand,
+  buildEffortMenu,
+  handleEffortMenuCallback,
+  EFFORT_CALLBACK_PREFIX,
+  type EffortCommandDeps,
+  type EffortMenuReply,
+} from './effort-command.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
@@ -14219,6 +14228,51 @@ bot.command('model', async ctx => {
   await switchroomReply(ctx, reply.text, { html: reply.html })
 })
 
+// `/effort` — show or switch the reasoning effort for the live session.
+// The effort sibling of `/model`: bare form renders a five-button menu
+// (low/medium/high/xhigh/max, the live level ✅), a typed form
+// `/effort <level>` sets it directly. Both ride the allowlisted inject
+// primitive (claude's own `/effort` REPL command), session-scoped — boot
+// re-pins the configured default via start.sh's `--effort`. Implementation
+// in effort-command.ts so it's unit-testable without booting the bot.
+function buildEffortDeps(): EffortCommandDeps {
+  return {
+    inject: injectSlashCommandImpl,
+    getAgentName: getMyAgentName,
+    getConfiguredEffort: () => {
+      type AgentListResp = { agents: Array<{ name: string; thinking_effort?: string | null }> }
+      const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
+      return data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ?? null
+    },
+    escapeHtml: escapeHtmlForTg,
+    preBlock,
+  }
+}
+
+function effortMenuReplyMarkup(reply: EffortMenuReply): InlineKeyboard | undefined {
+  if (!reply.keyboard) return undefined
+  const kb = new InlineKeyboard()
+  for (const row of reply.keyboard) {
+    for (const btn of row) kb.text(btn.text, btn.callback_data)
+    kb.row()
+  }
+  return kb
+}
+
+bot.command('effort', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
+  const parsed = parseEffortCommand(text) ?? { kind: 'show' as const }
+  const deps = buildEffortDeps()
+  if (parsed.kind === 'show') {
+    const menu = buildEffortMenu(deps)
+    await switchroomReply(ctx, menu.text, { html: true, reply_markup: effortMenuReplyMarkup(menu) })
+    return
+  }
+  const reply = await handleEffortCommand(parsed, deps)
+  await switchroomReply(ctx, reply.text, { html: reply.html })
+})
+
 bot.command('agentstart', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const name = ctx.match?.trim() || getMyAgentName()
@@ -18608,6 +18662,33 @@ bot.on('callback_query:data', async ctx => {
   // a stale index); `mdl:r` re-renders. Strict allowFrom gate like
   // every other mutating callback family — a model switch changes the
   // fleet's quota burn profile.
+  if (data.startsWith(EFFORT_CALLBACK_PREFIX)) {
+    const access = loadAccess()
+    const senderId = String(ctx.from?.id ?? '')
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' })
+      return
+    }
+    // No picker-driving (the inline `/effort <level>` form sets it
+    // directly via the inject primitive), so no mid-turn guard is needed
+    // here — just ack and apply.
+    await ctx.answerCallbackQuery({ text: 'Setting effort…' }).catch(() => {})
+    try {
+      const outcome = await handleEffortMenuCallback(data, buildEffortDeps())
+      await ctx
+        .editMessageText(outcome.reply.text, {
+          parse_mode: 'HTML',
+          reply_markup: effortMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
+        })
+        .catch(() => {})
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: effort-menu callback failed: ${(err as Error)?.message ?? String(err)}\n`,
+      )
+    }
+    return
+  }
+
   if (data.startsWith(MODEL_CALLBACK_PREFIX)) {
     const access = loadAccess()
     const senderId = String(ctx.from?.id ?? '')
