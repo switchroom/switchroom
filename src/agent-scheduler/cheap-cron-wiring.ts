@@ -13,14 +13,24 @@
  */
 
 import { lookup as dnsLookup } from "node:dns/promises";
-import type { PollSpec, SwitchroomConfig } from "../config/schema.js";
+import type { ActionSpec, PollSpec, SwitchroomConfig } from "../config/schema.js";
 import { isCheapCronEnabled } from "../scheduler/cron-routing.js";
 import type { EgressAllowlist } from "../scheduler/poll-egress.js";
 import { runHttpDiffPoll, type HttpDiffSpec, type PollOutcome } from "../scheduler/poll-engine.js";
+import { runAction as runActionEngine, type ActionOutcome } from "../scheduler/action-engine.js";
 import { createFilePollStateStore, type PollStateStore } from "../scheduler/poll-state.js";
 import { getViaBroker } from "../vault/broker/client.js";
 // type-only (erased) → no runtime import cycle with index.ts.
 import type { CheapCronHooks } from "./index.js";
+
+/** Post a MODEL-FREE outbound to the agent's OWN chat (bound by the caller in
+ *  main() over the IPC client + the agent's channel target). Returns true iff
+ *  the bytes were accepted by the gateway socket. */
+export type PostOutbound = (args: {
+  threadId?: number;
+  text: string;
+  parseMode: "html" | "text";
+}) => boolean;
 
 export interface CheapCronWiringDeps {
   /** Resolve a vault secret by name. Default: the agent's vault broker (ACL by socket identity). */
@@ -30,6 +40,12 @@ export interface CheapCronWiringDeps {
   lookup?: (host: string) => Promise<string | null>;
   pollState?: PollStateStore;
   now?: () => number;
+  /** Agent slug — drives {{agent}} substitution in telegram-message actions. */
+  agentName?: string;
+  /** Model-free outbound seam for telegram-message actions (#2307). Absent ⟹
+   *  a telegram-message action records "not delivered"; webhook actions are
+   *  unaffected (they use fetch). main() wires this over the IPC sendOutbound. */
+  postOutbound?: PostOutbound;
 }
 
 const defaultResolveSecret = async (name: string): Promise<string> => {
@@ -65,6 +81,8 @@ export function buildCheapCronHooks(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const lookup = deps.lookup ?? defaultLookup;
   const now = deps.now ?? Date.now;
+  const agentName = deps.agentName ?? env.SWITCHROOM_AGENT_NAME ?? "-";
+  const postOutbound = deps.postOutbound;
 
   const runPoll = async (spec: PollSpec, prevCursor: string | undefined): Promise<PollOutcome> => {
     if (spec.type === "http-diff") {
@@ -82,5 +100,26 @@ export function buildCheapCronHooks(
     return { hit: false, baseline: false, error: `poll type '${spec.type}' not yet wired (staged)` };
   };
 
-  return { enabled: true, pollState, runPoll };
+  // Tier-0 action (#2307): model-free, terminal. telegram-message posts to the
+  // agent's own chat via postOutbound (the IPC send_outbound seam); webhook
+  // fires through the shared egress fence. The engine never wakes a model.
+  const runAction = async (
+    spec: ActionSpec,
+    ctx: { threadId?: number },
+  ): Promise<ActionOutcome> => {
+    return runActionEngine(spec, {
+      fetchImpl,
+      resolveSecret,
+      lookup,
+      allow: egress,
+      now,
+      agent: agentName,
+      sendMessage: async (text, opts) =>
+        postOutbound
+          ? postOutbound({ threadId: ctx.threadId, text, parseMode: opts.parseMode })
+          : false,
+    });
+  };
+
+  return { enabled: true, pollState, runPoll, runAction };
 }

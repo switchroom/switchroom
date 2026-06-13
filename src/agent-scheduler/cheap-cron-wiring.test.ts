@@ -65,6 +65,65 @@ describe("buildCheapCronHooks", () => {
   });
 });
 
+describe("buildCheapCronHooks — runAction (#2307)", () => {
+  it("telegram-message → posts the substituted text via postOutbound (model-free)", async () => {
+    const posts: Array<{ threadId?: number; text: string; parseMode: string }> = [];
+    const hooks = buildCheapCronHooks(CONFIG, ON, {
+      pollState: createMemoryPollStateStore(),
+      agentName: "clerk",
+      now: () => Date.UTC(2026, 5, 13, 9, 5),
+      postOutbound: (args) => (posts.push(args), true),
+    });
+    const out = await hooks!.runAction!(
+      { type: "telegram-message", text: "Heartbeat {{date}} — {{agent}}", parse_mode: "html" },
+      { threadId: 7 },
+    );
+    expect(out.ok).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ threadId: 7, text: "Heartbeat 2026-06-13 — clerk", parseMode: "html" });
+  });
+
+  it("telegram-message with NO postOutbound wired → graceful not-delivered (no throw)", async () => {
+    const hooks = buildCheapCronHooks(CONFIG, ON, { pollState: createMemoryPollStateStore() });
+    const out = await hooks!.runAction!(
+      { type: "telegram-message", text: "hi", parse_mode: "html" },
+      {},
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toMatch(/not delivered/);
+  });
+
+  it("webhook → fires through the wired egress fence, no postOutbound needed", async () => {
+    const fetched: string[] = [];
+    const hooks = buildCheapCronHooks(CONFIG, ON, {
+      pollState: createMemoryPollStateStore(),
+      resolveSecret: async () => "tok",
+      lookup: async () => "8.8.8.8",
+      fetchImpl: (async (url: string) => (fetched.push(url), new Response("ok", { status: 200 }))) as unknown as typeof fetch,
+    });
+    const out = await hooks!.runAction!(
+      { type: "webhook", url: "https://api.brevo.com/ping", method: "POST", secrets: [] },
+      {},
+    );
+    expect(out.ok).toBe(true);
+    expect(fetched).toEqual(["https://api.brevo.com/ping"]);
+  });
+
+  it("webhook to a non-allowlisted host is denied by the wired egress guard", async () => {
+    const hooks = buildCheapCronHooks(CONFIG, ON, {
+      pollState: createMemoryPollStateStore(),
+      lookup: async () => "8.8.8.8",
+      fetchImpl: (async () => new Response("ok", { status: 200 })) as unknown as typeof fetch,
+    });
+    const out = await hooks!.runAction!(
+      { type: "webhook", url: "https://evil.example/x", method: "POST", secrets: [] },
+      {},
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toMatch(/egress denied/);
+  });
+});
+
 describe("recoverPendingEscalations", () => {
   const pollEntry: SchedulerEntry = {
     agent: "marko",

@@ -894,7 +894,21 @@ export async function main(): Promise<void> {
   // Cheap-cron live wiring (docs/rfcs/cheap-cron-sessions.md). Returns
   // undefined when SWITCHROOM_CHEAP_CRON is off → registerAgentSchedule sees
   // no hook → today's behaviour exactly.
-  const cheapCron = buildCheapCronHooks(config, process.env);
+  //
+  // postOutbound: the MODEL-FREE send_outbound seam for Tier-0 telegram-message
+  // actions (#2307), bound here over the IPC client + the agent's OWN channel
+  // target. The gateway re-fences chatId to the agent's allowlist; the action
+  // spec carries no chat target, so an action can only post to this chat.
+  const postOutbound = (args: { threadId?: number; text: string; parseMode: "html" | "text" }): boolean =>
+    ipcClient.sendOutbound({
+      type: "send_outbound",
+      agentName,
+      chatId: channel.chatId,
+      ...(args.threadId != null ? { threadId: args.threadId } : {}),
+      text: args.text,
+      parseMode: args.parseMode,
+    });
+  const cheapCron = buildCheapCronHooks(config, process.env, { agentName, postOutbound });
   if (cheapCron) {
     // Recover any escalation that advanced its cursor but crashed before
     // delivery (the lost-hit window), before the live loop starts.
