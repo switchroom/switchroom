@@ -5,10 +5,15 @@
 # container, dedicated to cheap cron fires. It registers to the SAME gateway
 # as a DISTINCT bridge identity `<name>-cron` (start.sh's gateway sidecar
 # routes meta.session=cron fires here and gates all status surfaces off this
-# identity — see telegram-plugin/gateway/cron-session.ts). Minimal context:
-# its own CLAUDE_CONFIG_DIR (separate transcript) + a TRIMMED .mcp.json (only
-# switchroom-telegram) → it pays a fraction of the main session's schema +
-# cache-read tax, at the cheap cron model.
+# identity — see telegram-plugin/gateway/cron-session.ts).
+#
+# Tier-1 (#2307) is "a fresh conversation that STILL has the agent's memory +
+# tools, on a cheaper model." It loads the agent's FULL .mcp.json (its own
+# .claude-cron/.mcp.json — same hindsight bank baked from the BASE name, same
+# tools) with ENABLE_TOOL_SEARCH so the schema set DEFERS (low context cost).
+# The saving is dropping the accumulated main-session conversation context +
+# the cheaper model — NOT lobotomising the session. Its CLAUDE_CONFIG_DIR is
+# separate (own transcript) so each fire starts fresh and /clear-friendly.
 #
 # Forked as a supervised sidecar by start.sh ONLY when {{name}} actually has a
 # Tier-1 (context: fresh) cron entry AND SWITCHROOM_CHEAP_CRON is on — so the
@@ -35,12 +40,13 @@ esac
 CRON_NAME="{{name}}-cron"
 CRON_CONFIG_DIR="{{agentDir}}/.claude-cron"
 MAIN_CONFIG_DIR="{{agentDir}}/.claude"
-# TRIMMED MCP config (scaffold writes .claude-cron/.mcp.json with ONLY
-# switchroom-telegram) → the cron session pays a fraction of the main session's
-# ~31k-token MCP schema tax. The switchroom-telegram BRIDGE reads
-# SWITCHROOM_AGENT_NAME from the process env (exported below), NOT its .mcp.json
-# env block, so it registers as the cron identity. Fall back to the full
-# .mcp.json if the trimmed file is missing (older scaffold) so it still boots.
+# Cron .mcp.json (scaffold writes .claude-cron/.mcp.json with the agent's FULL
+# filtered MCP set — same hindsight bank, same tools — but the switchroom-
+# telegram entry carries a DISTINCT SWITCHROOM_BRIDGE_ALIVE_PATH so its liveness
+# file can't mask the main bridge). The bridge reads SWITCHROOM_AGENT_NAME from
+# the process env (exported below), NOT its .mcp.json env block, so it registers
+# as the cron identity. Fall back to the main .mcp.json if the cron file is
+# missing (older scaffold) so it still boots.
 CRON_MCP_CONFIG="{{agentDir}}/.claude-cron/.mcp.json"
 [ -f "$CRON_MCP_CONFIG" ] || CRON_MCP_CONFIG="{{agentDir}}/.mcp.json"
 CRON_SOCKET="switchroom-${CRON_NAME}"
@@ -63,12 +69,23 @@ fi
 export SWITCHROOM_AGENT_NAME="$CRON_NAME"
 export CLAUDE_CONFIG_DIR="$CRON_CONFIG_DIR"
 
-CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You handle scheduled tasks only. Do the task, reply once with the result, and keep it brief. You do not have {{name}}'s full memory or persona — if a task needs them, say so rather than guessing."
+# Defer the (now full) MCP schema set via tool-search so the cron session keeps
+# its low-context cost — the heavy servers load on demand; switchroom-telegram
+# + hindsight stay alwaysLoad. Normally inherited from start.sh's env; set here
+# as a belt-and-braces default, honouring the operator kill-switch + any value
+# already in the env.
+if [ "${SWITCHROOM_DISABLE_TOOL_SEARCH:-}" != "1" ]; then
+  export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-auto}"
+fi
+
+CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You run scheduled tasks in a fresh, low-context conversation on a cheaper model — but you SHARE {{name}}'s memory (hindsight) and tools, so use them: recall what you need, look things up, reply with real substance. Do the scheduled task, reply once with the result, and keep it tight."
 
 # Launch the cron claude in its OWN tmux session/socket so it never contends
 # with the main session's pane. Interactive (no -p). --strict-mcp-config pins
-# it to the trimmed config (switchroom-telegram only). Fresh each boot (no
-# --continue) — minimal context by construction.
+# it to the cron .mcp.json (full set, tool-search-deferred). Fresh each boot
+# (no --continue) — low context by construction. cd into the workspace so
+# claude's project key matches the pre-seeded trust state (.claude-cron).
+cd "{{agentDir}}" || exit 1
 exec tmux -L "$CRON_SOCKET" \
   new-session -A -s "$CRON_NAME" -x 400 -y 50 \
   claude \
