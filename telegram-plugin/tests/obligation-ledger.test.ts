@@ -105,20 +105,61 @@ describe("ObligationLedger", () => {
       expect(L.resolveCloseTarget(undefined, "c:3#715")).toBe("c:3#715");
     });
 
-    it("no echo + MULTIPLE open → close NOTHING (never wrong-close/drop)", () => {
+    it("no echo + MULTIPLE open + live turn IS open → close the live turn's OWN obligation (Fix 2)", () => {
       const L = new ObligationLedger();
       L.openIfAbsent(input("c:635#713", 1000));
       L.openIfAbsent(input("c:3#715", 1100));
-      // the marko race: 713's un-echoed reply lands while currentTurn=715.
-      // Closing 715 would silently drop it → resolveCloseTarget refuses.
-      expect(L.resolveCloseTarget(undefined, "c:3#715")).toBeNull();
-      expect(L.isOpen("c:3#715")).toBe(true); // 715 stays open → re-presented
+      // A substantive reply delivered during currentTurn=715 (no model echo, no
+      // routed origin) closes 715's own obligation. 713 stays open and is
+      // re-presented. The 713/715 invariant holds: this does NOT close 713.
+      expect(L.resolveCloseTarget(undefined, "c:3#715")).toBe("c:3#715");
+      expect(L.isOpen("c:635#713")).toBe(true); // 713 stays open
+    });
+
+    it("no echo + MULTIPLE open + live turn NOT one of them → close nothing (713/715 invariant preserved)", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:635#713", 1000));
+      L.openIfAbsent(input("c:3#715", 1100));
+      // currentTurn=999 is NOT an open obligation. We can't identify the right
+      // target → refuse to close anything (a re-present is safer than a wrong close).
+      expect(L.resolveCloseTarget(undefined, "c:9#999")).toBeNull();
+      expect(L.isOpen("c:635#713")).toBe(true);
+      expect(L.isOpen("c:3#715")).toBe(true);
     });
 
     it("no echo + live turn not an open obligation → null", () => {
       const L = new ObligationLedger();
       L.openIfAbsent(input("c:3#715", 1100));
       expect(L.resolveCloseTarget(undefined, "c:9#999")).toBeNull();
+    });
+
+    it("routedOriginId (Fix 1) closes the routed target even with multiple open + no model echo", () => {
+      // Simulate the clerk incident: two obligations open, agent answers #14057
+      // via a quoted reply (via=quoted), no model echo. The gateway resolves
+      // routedOriginId=#14057 from the quote. That obligation closes; #14059 stays.
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:0#14057", 1000));
+      L.openIfAbsent(input("c:0#14059", 1100));
+      expect(L.resolveCloseTarget(undefined, "c:0#14059", "c:0#14057")).toBe("c:0#14057");
+      // Close it to confirm only #14057 closes
+      L.close("c:0#14057");
+      expect(L.isOpen("c:0#14057")).toBe(false);
+      expect(L.isOpen("c:0#14059")).toBe(true);
+    });
+
+    it("echoedTurnId wins over routedOriginId when both present (echoed is authoritative)", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:635#713", 1000));
+      L.openIfAbsent(input("c:3#715", 1100));
+      // Model explicitly echoed 713 AND router resolved 715 as routed origin.
+      // The echo is authoritative — close 713.
+      expect(L.resolveCloseTarget("c:635#713", "c:3#715", "c:3#715")).toBe("c:635#713");
+    });
+
+    it("routedOriginId=null falls through to live-turn fallback", () => {
+      const L = new ObligationLedger();
+      L.openIfAbsent(input("c:3#715", 1100));
+      expect(L.resolveCloseTarget(undefined, "c:3#715", null)).toBe("c:3#715");
     });
   });
 });
@@ -409,5 +450,172 @@ describe("ObligationLedger — background-work grace (extended-autonomous fix, g
     expect(
       L.decideAtIdle({ now: 360_000, graceMs: 45000, backgroundWorkActive: false, backgroundGraceMs: CEIL }).action,
     ).toBe("represent");
+  });
+});
+
+describe("ObligationLedger — per-represent grace (Fix 3: clerk 2026-06-13 incident)", () => {
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text: "x", openedAt };
+  }
+
+  const REPR_GRACE = 120_000; // 2 min, mirroring the default
+
+  it("a freshly re-presented obligation is ineligible until representGraceMs elapses", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    // Re-present fires at t=5000; markRepresented stamps lastRepresentedAt.
+    L.markRepresented("c:3#1", 5000);
+    // 10s later — still within 120s represent grace → ineligible → none.
+    expect(
+      L.decideAtIdle({ now: 15000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // 120s + 1ms after re-present → grace expired → act.
+    expect(
+      L.decideAtIdle({ now: 5000 + REPR_GRACE + 1, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("markRepresented stamps lastRepresentedAt and persists", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.markRepresented("c:3#1", 9000);
+    const snap = L.list()[0];
+    expect(snap.lastRepresentedAt).toBe(9000);
+    expect(snap.representCount).toBe(1);
+    // Persisted: onChange fired for open + markRepresented = 2 snapshots
+    expect(snapshots.length).toBe(2);
+    expect(snapshots[1][0].lastRepresentedAt).toBe(9000);
+  });
+
+  it("representGraceMs=0 (kill switch) → no per-represent grace, acts immediately", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.markRepresented("c:3#1", 5000);
+    // Kill switch: representGraceMs=0 → the freshly-represented obligation is still eligible.
+    expect(
+      L.decideAtIdle({ now: 5001, graceMs: 45000, representGraceMs: 0 }).action,
+    ).toBe("represent");
+  });
+
+  it("an obligation that was NEVER re-presented has no per-represent grace (no lastRepresentedAt)", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    // No markRepresented call → no lastRepresentedAt → always eligible on this axis.
+    expect(
+      L.decideAtIdle({ now: 2000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("per-represent grace survives hydration (durable snapshot)", () => {
+    const L = new ObligationLedger(2);
+    const now = 10_000;
+    L.hydrate([
+      {
+        originTurnId: "c:3#1",
+        chatId: "-100123",
+        threadId: 3,
+        messageId: 1,
+        text: "x",
+        openedAt: 1000,
+        representCount: 1,
+        lastRepresentedAt: now - 5000, // represented 5s ago
+      },
+    ]);
+    // 5s after re-present, grace=120s → still within grace → none.
+    expect(
+      L.decideAtIdle({ now, graceMs: 0, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // 120s + 1ms after re-present → grace expired → escalate (count=1 < max=2 → represent).
+    expect(
+      L.decideAtIdle({ now: now - 5000 + REPR_GRACE + 1, graceMs: 0, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("per-represent grace composes with trailing-answer grace: both must clear", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.noteTurnEnded("c:3#1", 5000);
+    L.markRepresented("c:3#1", 5000);
+    // Both graces active; trailing: turn ended 5s ago (grace=45s → in grace);
+    // per-represent: re-presented 5s ago (grace=120s → in grace) → none.
+    expect(
+      L.decideAtIdle({ now: 10000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // Trailing grace cleared (50s after turn-end), per-represent NOT yet (only 45s after re-present).
+    expect(
+      L.decideAtIdle({ now: 5000 + 50000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // Both cleared (125s after re-present at t=5000 → t=130000).
+    expect(
+      L.decideAtIdle({ now: 5000 + REPR_GRACE + 5000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+  });
+
+  it("the clerk incident: two messages arrive, re-present fires at T; the sweep ticks again at T+5s → grace prevents premature escalation", () => {
+    // This is the exact sequence from clerk 2026-06-13: obligation re-presented
+    // at T, sweep fires at T+5s before the re-present turn has even landed, would
+    // immediately fire AGAIN (burning representCount to 2 → escalate in 5 more
+    // seconds). With per-represent grace, the T+5s tick is a no-op.
+    const L = new ObligationLedger(2);
+    const T = 1_000_000;
+    L.openIfAbsent(input("c:0#14057", T));
+    // First represent at T
+    L.markRepresented("c:0#14057", T);
+    expect(L.list()[0].representCount).toBe(1);
+    // Sweep at T+5s: MUST be "none" (within per-represent grace)
+    expect(
+      L.decideAtIdle({ now: T + 5000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // Sweep at T+10s: still within grace
+    expect(
+      L.decideAtIdle({ now: T + 10000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("none");
+    // Sweep after grace: eligible for second represent (not escalate — count=1 < max=2)
+    expect(
+      L.decideAtIdle({ now: T + REPR_GRACE + 1000, graceMs: 45000, representGraceMs: REPR_GRACE }).action,
+    ).toBe("represent");
+    expect(L.list()[0].representCount).toBe(1); // still 1 — decideAtIdle is pure
+  });
+});
+
+describe("ObligationLedger — escalation suppression predicate (Fix 4)", () => {
+  // Fix 4 is implemented in the gateway (obligationSweep checks
+  // hasOutboundDeliveredSince before calling driveEscalation). We test the
+  // predicate seam via the pattern the sweep uses: if an outbound was delivered
+  // since openedAt, the obligation should be closed silently, not escalated.
+  // This suite tests the ledger behaviour that enables that path: after a
+  // silent close the ledger is empty and the next sweep sees 'none'.
+  function input(id: string, openedAt: number) {
+    return { originTurnId: id, chatId: "-100123", threadId: 3, messageId: Number(id.split("#").pop() ?? 0), text: "x", openedAt };
+  }
+
+  it("a silently-closed obligation (gateway closed on outbound-delivered check) leaves ledger empty", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    // Gateway's Fix 4 path: outbound delivered since openedAt → close silently
+    expect(L.close("c:3#1")).toBe(true);
+    expect(L.hasOpen()).toBe(false);
+    expect(L.decideAtIdle().action).toBe("none");
+  });
+
+  it("an escalation that reaches maxRepresents WITHOUT any known outbound still proceeds (escalate action)", () => {
+    const L = new ObligationLedger(2);
+    L.openIfAbsent(input("c:3#1", 1000));
+    L.markRepresented("c:3#1");
+    L.markRepresented("c:3#1");
+    // hasOutboundDeliveredSince returns false (no outbound recorded) → escalate
+    const d = L.decideAtIdle({ now: 9_999_999, graceMs: 0, representGraceMs: 0 });
+    expect(d.action).toBe("escalate");
+    expect(d.obligation?.originTurnId).toBe("c:3#1");
+  });
+
+  it("silent close fires onChange (persists the empty set)", () => {
+    const snapshots: Obligation[][] = [];
+    const L = new ObligationLedger(2, { onChange: (s) => snapshots.push(s) });
+    L.openIfAbsent(input("c:3#1", 1000)); // snapshot[0]
+    L.close("c:3#1"); // snapshot[1] = []
+    expect(snapshots.length).toBe(2);
+    expect(snapshots[1]).toEqual([]);
   });
 });

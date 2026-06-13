@@ -101,6 +101,23 @@ describe("obligation-store", () => {
     expect(loaded.map((o) => o.originTurnId)).toEqual(["c:3#715", "c:5#900"]);
   });
 
+  it("round-trips lastRepresentedAt through parse → isObligationRow filter → hydrate", () => {
+    // Regression: isObligationRow only checks required fields; optional fields
+    // (lastRepresentedAt, lastTurnEndedAt, escalateAttempts) must survive the
+    // filter without being stripped. A missing check would silently drop the field
+    // and break the per-represent grace window across restarts.
+    const { fs } = memFs();
+    const snap: Obligation[] = [
+      ob("c:3#715", { representCount: 1, lastRepresentedAt: 1_700_000_000_000, lastTurnEndedAt: 1_700_000_001_000 }),
+    ];
+    persistObligations(PATH, fs, snap);
+    const loaded = loadObligations(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]!.lastRepresentedAt).toBe(1_700_000_000_000);
+    expect(loaded[0]!.lastTurnEndedAt).toBe(1_700_000_001_000);
+    expect(loaded[0]!.representCount).toBe(1);
+  });
+
   it("never throws on a write failure — degrades to in-memory (logs)", () => {
     const logs: string[] = [];
     const fs: ObligationStoreFsSeam = {
