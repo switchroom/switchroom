@@ -53,8 +53,13 @@ export function findExistingClaudeJson(): string | null {
 export function copyOnboardingState(
   sourcePath: string,
   agentDir: string,
+  // #2307 Tier-1: the Tier-1 cron session has its OWN CLAUDE_CONFIG_DIR
+  // (.claude-cron) that needs the same onboarding/trust seed as the main
+  // .claude dir, or its `claude` wedges on the first-run wizard and the
+  // <agent>-cron bridge never registers. Defaults to ".claude" (main session).
+  configDirName = ".claude",
 ): void {
-  const claudeDir = join(agentDir, ".claude");
+  const claudeDir = join(agentDir, configDirName);
   mkdirSync(claudeDir, { recursive: true });
 
   // Claude Code reads onboarding state from .claude.json (with leading dot)
@@ -241,8 +246,8 @@ export function loadUserConfig(): UserConfig | null {
  * Add the agent's working directory to the projects map in .claude.json
  * with hasTrustDialogAccepted: true, so the agent doesn't prompt for trust.
  */
-export function preTrustWorkspace(agentDir: string): void {
-  const configPath = join(agentDir, ".claude", ".claude.json");
+export function preTrustWorkspace(agentDir: string, configDirName = ".claude"): void {
+  const configPath = join(agentDir, configDirName, ".claude.json");
 
   if (!existsSync(configPath)) {
     return;
@@ -293,8 +298,9 @@ export function preTrustWorkspace(agentDir: string): void {
 export function ensureMcpServersTrusted(
   agentDir: string,
   serverKeys: string[],
+  configDirName = ".claude",
 ): void {
-  const configPath = join(agentDir, ".claude", ".claude.json");
+  const configPath = join(agentDir, configDirName, ".claude.json");
 
   if (!existsSync(configPath)) {
     return;
@@ -359,8 +365,8 @@ export function ensureMcpServersTrusted(
  * forever even though the broker has already logged it in. This
  * matches `src/agents/scaffold.ts`'s writer (`true`, numStartups 1).
  */
-export function createMinimalClaudeConfig(agentDir: string): void {
-  const claudeDir = join(agentDir, ".claude");
+export function createMinimalClaudeConfig(agentDir: string, configDirName = ".claude"): void {
+  const claudeDir = join(agentDir, configDirName);
   mkdirSync(claudeDir, { recursive: true });
 
   const configPath = join(claudeDir, ".claude.json");
@@ -374,4 +380,22 @@ export function createMinimalClaudeConfig(agentDir: string): void {
       mode: 0o600,
     });
   }
+}
+
+/**
+ * #2307 Tier-1: seed the cron session's CLAUDE_CONFIG_DIR (.claude-cron) with
+ * the same onboarding + trust state the main .claude dir gets, so the cron
+ * `claude` doesn't wedge on the first-run wizard / trust gate (the
+ * autoaccept-poll sidecar watches only the MAIN tmux session, so nothing
+ * dismisses a cron-session wizard). Idempotent: createMinimalClaudeConfig
+ * early-returns if the file exists, preTrust/ensureMcpServersTrusted
+ * read-modify-write. Runs on BOTH the scaffold and reconcile paths (so the
+ * in-container reconcile writes the in-container project key that matches the
+ * cron claude's cwd). `serverKeys` MUST be the full cron .mcp.json key set or
+ * Claude Code silently ignores those servers.
+ */
+export function seedCronConfigDir(agentDir: string, serverKeys: string[]): void {
+  createMinimalClaudeConfig(agentDir, ".claude-cron");
+  preTrustWorkspace(agentDir, ".claude-cron");
+  ensureMcpServersTrusted(agentDir, serverKeys, ".claude-cron");
 }

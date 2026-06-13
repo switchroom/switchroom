@@ -474,6 +474,13 @@ export function maybeWriteCronMcp(
   if (!existsSync(path) || readFileSync(path, "utf-8") !== content) {
     writeFileSync(path, content, { encoding: "utf-8", mode: 0o600 });
   }
+  // #2307 Tier-1: seed .claude-cron/.claude.json with onboarding + trust state
+  // for the FULL cron server set, or the cron `claude` wedges on the first-run
+  // wizard (autoaccept-poll watches only the MAIN tmux session) and the
+  // <agent>-cron bridge never registers. Idempotent; runs on both scaffold and
+  // reconcile so the in-container reconcile writes the container-path project
+  // key that matches the cron claude's cwd.
+  seedCronConfigDir(agentDir, Object.keys(cronServers));
   return path;
 }
 import {
@@ -518,6 +525,7 @@ import {
   preTrustWorkspace,
   ensureMcpServersTrusted,
   createMinimalClaudeConfig,
+  seedCronConfigDir,
   loadUserConfig,
 } from "../setup/onboarding.js";
 import { ensureBareClone } from "../repos/bare-clone.js";
