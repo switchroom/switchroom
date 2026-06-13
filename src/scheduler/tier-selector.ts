@@ -35,6 +35,7 @@
  */
 
 import { isKnownCheapModel, type CronTier } from "./cron-routing.js";
+import { estimateCronGapMin } from "./cron-cadence.js";
 
 export type TierSource = "explicit" | "cadence-default";
 
@@ -68,6 +69,27 @@ export const DEFAULT_FREQUENT_GAP_MIN = 60;
 export function resolveFrequentGapMin(env: NodeJS.ProcessEnv = process.env): number {
   const raw = Number.parseInt(env.SWITCHROOM_CRON_FREQUENT_GAP_MIN ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_FREQUENT_GAP_MIN;
+}
+
+/**
+ * Whether the cadence-default AUTO-ROUTER is enabled (#2307 Tier-1).
+ *
+ * Re-enabling cadence-driven Tier-1 routing is only safe now that the cron
+ * session is capability-complete (full MCP + shared memory + a non-wedging
+ * boot — PRs 1–3). But it is a high-blast-radius flip (it routes every
+ * frequent hint-less cron into the cheap session on the next `apply`), so it
+ * ships DEFAULT-OFF behind this flag and is proven on a test-harness canary
+ * before the default is reconsidered. OFF ⟹ `applyDefaultTier` is the #2305
+ * pass-through (today's behaviour). Only `1`/`true`/`on` enables it.
+ *
+ * NOTE: graceful fallback (the cron fire falls back to the main session when no
+ * cron bridge is registered) means a transient scaffold-vs-runtime flag
+ * mismatch is non-fatal — the fire still lands, just not cheaply, and the
+ * cron_fell_back_to_main metric records it.
+ */
+export function resolveCronAutoTier(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.SWITCHROOM_CRON_AUTO_TIER ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "on";
 }
 
 /**
@@ -128,32 +150,43 @@ export interface TierableEntry {
 /**
  * Apply the cron tier default to a hint-less entry.
  *
- * IMPORTANT — tool-aware safety (the holistic-trace finding): this used to
- * inject `context: "fresh"` for any frequent cron, forcing it into the cheap
- * Tier-1 session. That is UNSAFE to do on cadence alone, because the Tier-1
- * session is deliberately context- AND tool-minimal (only the telegram bridge
- * MCP + built-in tools; no memory/persona, no hindsight/drive/web MCPs). A
- * frequent cron that needs those would run starved and fail its job — and the
- * graceful main-session fallback does NOT catch that (it only covers a
- * bridge-down delivery failure, not a capability shortfall). We cannot read a
- * prompt's tool/memory need deterministically, so cadence is the WRONG signal
- * to force Tier-1.
+ * History: #2305 turned this into a pass-through because the Tier-1 cron
+ * session was tool/memory-STARVED (telegram bridge + built-ins only) — forcing
+ * a frequent cron into it on cadence alone would run it starved, and the
+ * earlier "you don't have memory" prompt made it punt. That hazard is now
+ * GONE: #2307 PRs 1–3 made the cron session capability-complete (full MCP set,
+ * shared hindsight memory bank, tool-search-deferred, a non-wedging boot, and
+ * observability for a down session). So cadence is once again a sound
+ * automatic signal — a frequent hint-less cron is overwhelmingly a routine
+ * check that doesn't need the live session's accumulated context.
  *
- * The only sound tool-awareness signal is the AUTHOR's: an explicit
- * `model: sonnet` / `context: fresh` asserts "this cron is self-contained".
- * So Tier-1 is OPT-IN. Cadence stays ADVISORY — `recommendCronTier` still
- * surfaces "this could be cheaper" for shadow/guidance, but we no longer
- * force the routing. The big automatic win lives in Tier-0 (model-free),
- * which has none of these hazards.
+ * Re-enabled behaviour (when `autoTierEnabled`): a hint-less entry whose
+ * cadence is frequent (≤ `frequentGapMin`, default 60min) gets `context:
+ * "fresh"` injected → it routes to the cheap Tier-1 session. Daily/weekly and
+ * any cron whose cadence we can't read (`estimateCronGapMin → Infinity`) stay
+ * on the main session. EXPLICIT hints (kind / context / model) are always
+ * honoured untouched — the author's signal wins.
  *
- * This function therefore passes the entry through unchanged: explicit hints
- * are honoured by the router; hint-less crons keep the safe full-session
- * default. Kept as the seam where a future *tool-aware* auto-router would
- * plug in. Pure, no I/O.
+ * High blast radius (it flips routing for every frequent cron on the next
+ * `apply`), so it is DEFAULT-OFF behind `SWITCHROOM_CRON_AUTO_TIER`
+ * (`resolveCronAutoTier`) until a test-harness canary proves the cron session
+ * runs without falling back. OFF ⟹ the #2305 pass-through (today's behaviour),
+ * so this function is inert for the fleet until the flag is set. Pure: env is
+ * read only via the injected `autoTierEnabled` default.
  */
 export function applyDefaultTier<T extends TierableEntry>(
   entry: T,
-  _frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
+  frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
+  autoTierEnabled: boolean = resolveCronAutoTier(),
 ): T {
-  return entry;
+  // Default-off kill-switch: pass-through preserves today's behaviour exactly.
+  if (!autoTierEnabled) return entry;
+  // Explicit author hints win — never override kind/context/model.
+  if (entry.kind !== undefined || entry.context !== undefined || entry.model !== undefined) {
+    return entry;
+  }
+  // Cadence default. Frequent ⟹ cheap (inject context:fresh); infrequent or
+  // unreadable cadence (Infinity) ⟹ leave on the main session.
+  const rec = recommendCronTier({ smallestGapMin: estimateCronGapMin(entry.cron) }, frequentGapMin);
+  return rec.tier === "cheap" ? { ...entry, context: "fresh" as const } : entry;
 }

@@ -8,6 +8,7 @@ import { describe, it, expect } from "vitest";
 import {
   recommendCronTier,
   resolveFrequentGapMin,
+  resolveCronAutoTier,
   applyDefaultTier,
   DEFAULT_FREQUENT_GAP_MIN,
   type TierRecommendation,
@@ -125,33 +126,78 @@ describe("resolveFrequentGapMin", () => {
   });
 });
 
-describe("applyDefaultTier — tool-aware: cadence is advisory, never FORCES Tier-1", () => {
-  // Holistic-trace finding: the Tier-1 cheap session is tool/memory-starved,
-  // so forcing a hint-less cron into it on cadence alone is unsafe (a
-  // tool-using cron would run starved and fail, uncaught by the bridge-down
-  // fallback). Tier-1 is now OPT-IN. applyDefaultTier passes through; the
-  // cadence recommendation lives in recommendCronTier for shadow/guidance.
+describe("applyDefaultTier — DEFAULT-OFF: pass-through (flag unset, today's fleet)", () => {
+  // #2307 PR4: the cadence auto-router is re-enabled but ships default-off
+  // behind SWITCHROOM_CRON_AUTO_TIER. With the flag unset (autoTierEnabled
+  // defaulting false via the explicit arg below), applyDefaultTier is the
+  // #2305 pass-through — inert for the fleet until a canary flips the flag.
+  const off = (e: TierableEntry) => applyDefaultTier(e, DEFAULT_FREQUENT_GAP_MIN, false);
 
-  it("a frequent hint-less cron is NOT auto-routed to cheap (no context injected)", () => {
-    expect(applyDefaultTier(tierable({ cron: "*/30 * * * *" })).context).toBeUndefined();
-    expect(applyDefaultTier(tierable({ cron: "0 * * * *" })).context).toBeUndefined(); // hourly
-    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *" })).context).toBeUndefined();
-  });
-
-  it("explicit opt-in hints are preserved unchanged (the author's tool-aware signal)", () => {
-    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", context: "fresh" })).context).toBe("fresh");
-    expect(applyDefaultTier(tierable({ cron: "0 8 * * *", model: "sonnet" })).model).toBe("sonnet");
-    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", context: "agent" })).context).toBe("agent");
-    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", kind: "poll" })).kind).toBe("poll");
+  it("a frequent hint-less cron is NOT auto-routed to cheap (flag off)", () => {
+    expect(off(tierable({ cron: "*/30 * * * *" })).context).toBeUndefined();
+    expect(off(tierable({ cron: "0 * * * *" })).context).toBeUndefined(); // hourly
+    expect(off(tierable({ cron: "*/5 * * * *" })).context).toBeUndefined();
   });
 
   it("is a pure pass-through — nothing injected", () => {
-    const out = applyDefaultTier(tierable({ cron: "*/30 * * * *", kind: "prompt" }));
+    const out = off(tierable({ cron: "*/30 * * * *", kind: "prompt" }));
     expect(out).toEqual({ cron: "*/30 * * * *", kind: "prompt" });
   });
 
   it("recommendCronTier still surfaces the advisory (recommender intact)", () => {
-    // Only the enforcing applyDefaultTier changed; the recommendation stays.
     expect(recommendCronTier({ smallestGapMin: 30 }).tier).toBe("cheap");
+  });
+});
+
+describe("applyDefaultTier — flag ON: cadence re-enabled (#2307 PR4)", () => {
+  // The cron session is capability-complete (PRs 1–3), so cadence is a sound
+  // automatic signal again. autoTierEnabled passed true explicitly (the canary
+  // sets SWITCHROOM_CRON_AUTO_TIER=1).
+  const on = (e: TierableEntry) => applyDefaultTier(e, DEFAULT_FREQUENT_GAP_MIN, true);
+
+  it("a frequent hint-less cron gets context:fresh injected (→ cheap Tier-1)", () => {
+    expect(on(tierable({ cron: "*/30 * * * *" })).context).toBe("fresh");
+    expect(on(tierable({ cron: "0 * * * *" })).context).toBe("fresh"); // hourly == 60min == frequent
+    expect(on(tierable({ cron: "*/5 * * * *" })).context).toBe("fresh");
+  });
+
+  it("daily / weekly stay on the main session (infrequent → no injection)", () => {
+    expect(on(tierable({ cron: "0 8 * * *" })).context).toBeUndefined(); // daily
+    expect(on(tierable({ cron: "0 9 * * 1" })).context).toBeUndefined(); // weekly
+  });
+
+  it("an UNREADABLE cadence stays full (Infinity → main, never a starved guess)", () => {
+    expect(on(tierable({ cron: "bogus" })).context).toBeUndefined();
+    expect(on(tierable({ cron: "15-30 * * * *" })).context).toBeUndefined(); // minute range → unknown
+  });
+
+  it("explicit author hints are honoured untouched (kind / context / model win)", () => {
+    expect(on(tierable({ cron: "*/5 * * * *", context: "agent" })).context).toBe("agent");
+    expect(on(tierable({ cron: "*/5 * * * *", context: "fresh" })).context).toBe("fresh");
+    expect(on(tierable({ cron: "*/5 * * * *", model: "opus" })).context).toBeUndefined(); // explicit model → no inject
+    expect(on(tierable({ cron: "*/5 * * * *", kind: "poll" })).context).toBeUndefined();
+    expect(on(tierable({ cron: "*/5 * * * *", kind: "action" })).context).toBeUndefined();
+  });
+
+  it("respects a custom frequent-gap threshold", () => {
+    // gap 30min with a 15min threshold → not frequent → main.
+    expect(applyDefaultTier(tierable({ cron: "*/30 * * * *" }), 15, true).context).toBeUndefined();
+  });
+});
+
+describe("resolveCronAutoTier — default OFF; only 1/true/on enables", () => {
+  it.each([
+    ["1", true],
+    ["true", true],
+    ["on", true],
+    ["ON", true],
+    ["", false],
+    [undefined, false],
+    ["0", false],
+    ["false", false],
+    ["off", false],
+    ["yes", false], // only the three canonical truthy values
+  ])("SWITCHROOM_CRON_AUTO_TIER=%s → %s", (val, expected) => {
+    expect(resolveCronAutoTier({ SWITCHROOM_CRON_AUTO_TIER: val } as NodeJS.ProcessEnv)).toBe(expected);
   });
 });

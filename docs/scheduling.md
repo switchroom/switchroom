@@ -236,6 +236,8 @@ Because each fire is a full turn in the live session by default, a frequent cron
 
 Agents can self-author the `model`/`context` hints (no security gate). `kind: poll`, `kind: action`, and `reaction_dispatch` need an operator config commit (egress / identity gates), so an agent should *request* them. With the flag off, all hints are inert — every fire is a normal Tier-2 turn (a `kind: poll` entry fires its escalation prompt directly); disabling cheap-cron can never silently drop a cron. **A `kind: action` is the exception: it is model-free regardless of the flag** — the kill-switch governs model tiering, and an action has no model fire to fall back to.
 
+**Automatic Tier-1 routing (`SWITCHROOM_CRON_AUTO_TIER`, default off, #2307).** With this flag enabled, a **hint-less** cron whose cadence is **frequent** (≤ 60 min, tunable via `SWITCHROOM_CRON_FREQUENT_GAP_MIN`) is auto-routed to the cheap Tier-1 session — you no longer have to set `context: fresh` by hand for routine checks. Daily/weekly crons, and any cron whose cadence can't be read, stay on the full session; explicit `kind`/`context`/`model` hints always win. It is **default-off** because it flips routing for every frequent cron on the next `apply` (high blast radius) — enable it only after confirming the cron session is healthy for the agent (`switchroom doctor` → the *Cron Session* section, and the `cron_fell_back_to_main` metric stays flat). Graceful fallback means even a misconfigured flag never drops a cron — a fire with no cron bridge just runs on the main session.
+
 #### `kind: action` — model-free mechanical verbs (#2307)
 
 An action *replaces* a model turn with a deterministic verb. Two types (operator-config only — an agent cannot self-author one):
