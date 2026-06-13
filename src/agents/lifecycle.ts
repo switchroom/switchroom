@@ -804,6 +804,13 @@ export function classifyChangeKind(path: string): ChangeKind {
   // the new form remains on disk. The shared regex lives in
   // `cron-unit-name.ts` so all classifiers stay in lockstep.
   if (/\/telegram\/cron-(?:\d+|[0-9a-f]{12})\.sh$/.test(path)) return "cron";
+  // Cron-session (Tier-1) infrastructure: the trimmed `.claude-cron/.mcp.json`
+  // (+ cron-session.sh) are rendered when a cron routes to a cheap session.
+  // They are a deterministic consequence of a CRON change (the value-gate
+  // flipping a frequent cron to Tier-1), so classify them as cron — otherwise
+  // the `.mcp.json` rule below tags them "settings" and a cron-only reconcile
+  // refuses the change, breaking agent self-authoring of frequent crons.
+  if (path.includes("/.claude-cron/")) return "cron";
   if (path.includes("/.claude/skills/")) return "skill";
   if (path.endsWith("/.claude/settings.json")) return "settings";
   if (path.endsWith("/.mcp.json")) return "settings";
