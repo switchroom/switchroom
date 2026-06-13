@@ -3660,8 +3660,9 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
   }
 }
 
-// "⏱ 30 min" scoped-approval store (the middle tier between Allow-once and
-// 🔁 Always). Operator-tapped, gateway-side ONLY (never pushed to the
+// Scoped-approval store: the 30-min window that backs the "✅ Allow" tap for
+// narrow non-destructive scopes (not a separate button — it IS what Allow
+// means for those). Operator-tapped, gateway-side ONLY (never pushed to the
 // bridge's untimed sessionAllowRules), fixed-window, fail-closed. Keyed by
 // agent name for per-agent isolation. All policy lives in
 // ../scoped-approval.ts (pure + unit-tested); this gateway only wires it.
@@ -5605,24 +5606,27 @@ const pendingPermissionBuffer = createPendingPermissionBuffer()
  * are resolved at call-time, after module init.)
  */
 /**
- * The default permission-card action row: ❌ Deny · ✅ Allow once ·
+ * The default permission-card action row: ❌ Deny · ✅ Allow ·
  * 🔁 Always… (the last only when a meaningful always-rule exists).
  * Tapping "🔁 Always…" swaps this row for the scope sub-menu; "← Back"
  * rebuilds this row. callback_data stays tiny (verb + 5-char id) so we
  * never approach Telegram's 64-byte ceiling.
+ *
+ * "✅ Allow" is no longer always literally "once": for a NARROW,
+ * non-destructive scope it auto-grants a fixed 30-min window (so the same
+ * action stops re-asking) — that is the default behavior of the allow tap,
+ * not a separate button. Broad / MCP / destructive scopes stay truly once.
+ * The post-tap card states which happened (honest-card contract). The
+ * decision lives in the allow handler via resolveTimeBox; the label here is
+ * deliberately neutral ("Allow", not "Allow once" or "Allow 30 min").
  */
 function buildPermissionActionRow(
   requestId: string,
   showAlways: boolean,
-  showTimeBox = false,
 ): InlineKeyboard {
   const kb = new InlineKeyboard()
     .text('❌ Deny', `perm:deny:${requestId}`)
-    .text('✅ Allow once', `perm:allow:${requestId}`)
-  // "⏱ 30 min" sits between once and always. Only shown for a narrow,
-  // non-destructive scope (resolveTimeBox decides); broad/MCP/destructive
-  // requests get once/always only.
-  if (showTimeBox) kb.text('⏱ 30 min', `perm:tmb:${requestId}`)
+    .text('✅ Allow', `perm:allow:${requestId}`)
   if (showAlways) kb.text('🔁 Always…', `perm:always:${requestId}`)
   return kb
 }
@@ -6044,19 +6048,15 @@ const ipcServer: IpcServer = createIpcServer({
       description,
       agentName: _client.agentName,
     })
-    // Compact action row: ❌ Deny · ✅ Allow once · 🔁 Always… — the
-    // scope of an "always" grant stays hidden until the operator taps
-    // "🔁 Always…", which swaps the row for a scope choice (this file /
-    // any file ⚠️). The "🔁 Always…" button only appears when we can
-    // synthesize a meaningful rule for this tool; unknown tools get the
-    // two-button row only.
-    const scopeChoices = resolveScopedAllowChoices(toolName, inputPreview)
-    const showAlways = scopeChoices != null
-    // Offer "⏱ 30 min" only for a narrow, non-destructive scope, and only
-    // when the tier is enabled (TTL > 0).
-    const showTimeBox = scopedApprovalTtlMs() > 0 &&
-      resolveTimeBox(toolName, inputPreview, scopeChoices) != null
-    const keyboard = buildPermissionActionRow(requestId, showAlways, showTimeBox)
+    // Compact action row: ❌ Deny · ✅ Allow · 🔁 Always… — the scope of an
+    // "always" grant stays hidden until the operator taps "🔁 Always…",
+    // which swaps the row for a scope choice (this file / any file ⚠️). The
+    // "🔁 Always…" button only appears when we can synthesize a meaningful
+    // rule for this tool; unknown tools get the two-button row only. "Allow"
+    // itself auto-grants a 30-min window for narrow non-destructive scopes
+    // (decided in the allow handler), so there is no separate time-box button.
+    const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
+    const keyboard = buildPermissionActionRow(requestId, showAlways)
     // Route the card to the SAME place the post-verdict resume message
     // lands (resolvePermissionCardTargets): the ORIGINATING chat+topic when
     // there's an active turn — so a supergroup agent's card appears IN the
@@ -19073,7 +19073,7 @@ bot.on('callback_query:data', async ctx => {
   }
 
   // Permission request buttons.
-  const m = /^perm:(allow|deny|always|asn|asb|back|tmb):([a-km-z]{5})$/.exec(data)
+  const m = /^perm:(allow|deny|always|asn|asb|back):([a-km-z]{5})$/.exec(data)
   if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
   const access = loadAccess()
   const senderId = String(ctx.from.id)
@@ -19088,10 +19088,7 @@ bot.on('callback_query:data', async ctx => {
     if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
     let keyboard: InlineKeyboard
     if (behavior === 'back') {
-      const backChoices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
-      const backTimeBox = scopedApprovalTtlMs() > 0 &&
-        resolveTimeBox(details.tool_name, details.input_preview, backChoices) != null
-      keyboard = buildPermissionActionRow(request_id, true, backTimeBox)
+      keyboard = buildPermissionActionRow(request_id, true)
     } else {
       const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
       if (choices == null) {
@@ -19315,69 +19312,45 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  // "⏱ 30 min" — record a fixed-window scoped grant for the NARROW scope,
-  // then allow the in-flight call. Mirrors the asn/asb structure: dispatch
-  // the verdict immediately, then edit the card. CRITICAL: the verdict
-  // carries NO `rule` (unlike asn/asb), so the bridge does not cache it
-  // untimed — the window lives only in scopedGrants, gateway-side.
-  if (behavior === 'tmb') {
-    const details = pendingPermissions.get(request_id)
-    if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
-    const ttl = scopedApprovalTtlMs()
-    if (ttl <= 0) { await ctx.answerCallbackQuery({ text: 'Time-boxed approvals are disabled.' }).catch(() => {}); return }
-    const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
-    const tb = resolveTimeBox(details.tool_name, details.input_preview, choices)
-    if (!tb) { await ctx.answerCallbackQuery({ text: 'This action can\'t be time-boxed.' }).catch(() => {}); return }
-    const agentName = selfAgentName()
-    if (!agentName) { await ctx.answerCallbackQuery({ text: 'Time-box needs SWITCHROOM_AGENT_NAME — gateway is misconfigured.' }).catch(() => {}); return }
-
-    pendingPermissions.delete(request_id)
-    // (1) Allow the in-flight call NOW — no `rule` (keeps the window
-    // strictly gateway-side; the bridge must not cache it untimed).
-    dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior: 'allow' })
-    // (2) Record the fixed-window grant so matching calls auto-allow.
-    recordScopedGrant(scopedGrants, agentName, tb.rule, Date.now(), ttl)
-    resumeReactionAfterVerdict()
-    postPermissionResumeMessage({
-      behavior: 'allow',
-      action: naturalAction(details.tool_name, details.input_preview),
-    })
-    process.stderr.write(
-      `telegram gateway: scoped-approval granted rule="${tb.rule}" agent=${agentName} ` +
-      `ttl_ms=${ttl} (request_id=${request_id})\n`,
-    )
-
-    const mins = Math.max(1, Math.round(ttl / 60_000))
-    // Honest card: state the real BREADTH (e.g. "any `git` command"), not
-    // just the rule, plus the window — consent covers both (access-model
-    // honest-card contract).
-    const sourceMsg = ctx.callbackQuery?.message
-    const baseText = sourceMsg && 'text' in sourceMsg && sourceMsg.text
-      ? escapeHtmlForTg(sourceMsg.text)
-      : ''
-    const editLabel = `⏱ <b>Allowed for ${mins} min — ${escapeHtmlForTg(tb.breadth)}</b> · re-asks after that, and now for anything else`
-    await finalizeCallback(ctx, {
-      ackText: `⏱ Allowed for ${mins} min`.slice(0, 200),
-      newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
-      parseMode: 'HTML',
-    })
-    return
-  }
-
-  // Forward permission decision to connected bridges. Capture the work
-  // phrase BEFORE deleting the pending entry — postPermissionResumeMessage
-  // (fired in synthInbound below) names the resumed work.
-  const resumeAction = (() => {
-    const d = pendingPermissions.get(request_id)
-    return d ? naturalAction(d.tool_name, d.input_preview) : ''
-  })()
+  // Forward permission decision to connected bridges. Capture the pending
+  // details BEFORE deleting the entry — the resume message names the resumed
+  // work, and "Allow" on a narrow non-destructive scope auto-grants a 30-min
+  // window (resolveTimeBox) so the same action stops re-asking. This IS the
+  // default behavior of Allow (no separate button); broad / MCP / destructive
+  // scopes (resolveTimeBox → null) and the disabled tier (ttl<=0) stay truly
+  // once. The verdict is still dispatched WITHOUT a `rule` (below), so the
+  // bridge never caches it untimed — the window lives only in scopedGrants.
+  const pd = pendingPermissions.get(request_id)
+  const resumeAction = pd ? naturalAction(pd.tool_name, pd.input_preview) : ''
+  const scopedTtl = scopedApprovalTtlMs()
+  const timeBox = (behavior === 'allow' && scopedTtl > 0 && pd)
+    ? resolveTimeBox(pd.tool_name, pd.input_preview, resolveScopedAllowChoices(pd.tool_name, pd.input_preview))
+    : null
+  const grantAgent = selfAgentName()
   pendingPermissions.delete(request_id)
+  if (timeBox && grantAgent) {
+    recordScopedGrant(scopedGrants, grantAgent, timeBox.rule, Date.now(), scopedTtl)
+    process.stderr.write(
+      `telegram gateway: scoped-approval granted via Allow rule="${timeBox.rule}" ` +
+      `agent=${grantAgent} ttl_ms=${scopedTtl} (request_id=${request_id})\n`,
+    )
+  }
+  const scopedMins = Math.max(1, Math.round(scopedTtl / 60_000))
   // The card collapses to a plain verdict label. The distinct agent-voiced
   // "got it, continuing: …" message (posted on resume below) now carries
   // the "is it working or did my tap do nothing?" signal the old
   // `▶️ resuming…` card footnote used to — and names the work, which the
   // footnote never did. Keeps the card terse and the resume legible.
-  const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+  // Honest-card: when a window was granted, the label states the real breadth
+  // + duration; otherwise plain "Allowed once".
+  const ackText = behavior === 'deny'
+    ? '❌ Denied'
+    : (timeBox ? `✅ Allowed (${scopedMins} min)` : '✅ Allowed once')
+  const htmlLabel = behavior === 'deny'
+    ? '❌ <b>Denied</b>'
+    : (timeBox
+        ? `✅ <b>Allowed — won't ask again about ${escapeHtmlForTg(timeBox.breadth)} for ${scopedMins} min</b>`
+        : '✅ <b>Allowed once</b>')
   // HTML-escape the source text — same hazard as the scope-commit and
   // recent-denial paths above. The permission card body
   // (formatPermissionCardBody) appends claude-supplied `description`
@@ -19396,10 +19369,12 @@ bot.on('callback_query:data', async ctx => {
   // permission was already broadcast. Routing through finalizeCallback
   // strips the keyboard atomically with the status-line edit.
   await finalizeCallback(ctx, {
-    ackText: label,
-    newText: baseText ? `${baseText}\n\n${label}` : label,
+    ackText: ackText.slice(0, 200),
+    newText: baseText ? `${baseText}\n\n${htmlLabel}` : htmlLabel,
     parseMode: 'HTML',
     synthInbound: () => {
+      // No `rule` → the bridge does NOT cache this (truly once on the bridge);
+      // any 30-min stickiness lives only in scopedGrants (recorded above).
       dispatchPermissionVerdict({
         type: 'permission',
         requestId: request_id,

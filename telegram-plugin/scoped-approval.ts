@@ -1,9 +1,13 @@
 /**
- * Scoped, time-boxed approval — the "⏱ 30 min" tier, the middle rung
- * between "✅ Allow once" (re-prompts on the very next call) and
- * "🔁 Always…" (a durable `tools.allow` write that lasts forever). After
- * the operator taps "⏱ 30 min" on a permission card, byte-identical
- * in-scope requests auto-allow for a fixed window without re-carding.
+ * Scoped, time-boxed approval — the default behavior of the "✅ Allow" tap
+ * for a NARROW, non-destructive scope. Tapping Allow on such a request
+ * auto-grants a fixed window so byte-identical in-scope requests auto-allow
+ * without re-carding (killing tap-fatigue on re-edits / re-runs). Broad /
+ * MCP / destructive scopes get no window — Allow stays truly once for them.
+ * "🔁 Always…" remains the separate durable (`tools.allow`, forever) tier.
+ * There is deliberately no separate time-box button: the window IS what
+ * "Allow" means for a narrow safe scope, disclosed honestly on the post-tap
+ * card ("won't ask again about <breadth> for 30 min" vs "allowed once").
  *
  * Design contract (reference/access-model.md — "you hold the leash"):
  *
@@ -21,14 +25,13 @@
  *  - **Conservative scope (this tier, v1).** Only the *narrow* scope is
  *    ever time-boxed: an exact file path (`Edit(/x.ts)`) or a Bash
  *    command-family (`Bash(git:*)`). Broad scopes ("any file", resource-
- *    blind MCP, "any command") are NOT offered the ⏱ button — they stay
- *    once / always. This covers the real fatigue (re-editing the same
+ *    blind MCP, "any command") get NO window — Allow stays truly once for them. This covers the real fatigue (re-editing the same
  *    file, re-running a safe command) without fanning one tap across an
  *    unbounded action set.
  *  - **Fail-closed on irreversible.** A Bash family grant (`Bash(git:*)`)
  *    must never auto-allow a destructive member of that family
  *    (`git push --force`, `git reset --hard`). `isDestructiveBashCommand`
- *    is re-checked at BOTH grant time (don't offer ⏱) and match time
+ *    is re-checked at BOTH grant time (no window granted) and match time
  *    (a cached family grant fails closed → re-cards) so per-call consent
  *    for irreversible actions is preserved.
  *
@@ -45,8 +48,8 @@ export const SCOPED_APPROVAL_DEFAULT_TTL_MS = 30 * 60 * 1000;
 
 /**
  * Resolve the configured window from the environment. `0` (or negative)
- * disables the tier — the gateway hides the ⏱ button and never
- * short-circuits. A blank/garbage value falls back to the 30-min default.
+ * disables the window — Allow becomes truly once for every scope and the
+ * gateway never short-circuits. A blank/garbage value falls back to the 30-min default.
  * Kill-switch: `SWITCHROOM_SCOPED_APPROVAL_TTL_MS=0`.
  */
 export function scopedApprovalTtlMs(
@@ -84,7 +87,7 @@ const BASH_FAMILY_RULE = /^Bash\(([^:]+):\*\)$/;
  * Conservative time-box eligibility. Given the already-resolved scope
  * choices for a permission request, return the NARROW rule to time-box
  * plus an honest breadth phrase — or `null` when this request must not
- * get a ⏱ button (broad-only tools, MCP, Skill, a destructive Bash
+ * get a window (broad-only tools, MCP, Skill, a destructive Bash
  * command, or any tool with no narrow sub-scope).
  *
  *  - File tools with an exact path → time-boxable (bounded to the one
