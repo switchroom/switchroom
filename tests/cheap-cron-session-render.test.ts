@@ -79,13 +79,24 @@ describe("cron-session.sh launcher — compliance + identity", () => {
     expect(out).toContain(".claude-cron");
   });
 
-  it("runs at the cheap cron model with the TRIMMED mcp config", () => {
+  it("runs at the cheap cron model with the cron mcp config", () => {
     expect(out).toContain("--model 'claude-sonnet-4-6'");
     expect(out).toContain("--strict-mcp-config");
-    // points at the trimmed cron config (switchroom-telegram only), with a
-    // fallback to the full config for older scaffolds.
+    // points at the cron config (full set, tool-search-deferred), with a
+    // fallback to the main config for older scaffolds.
     expect(out).toContain(".claude-cron/.mcp.json");
     expect(out).toContain('[ -f "$CRON_MCP_CONFIG" ] ||');
+  });
+
+  it("Tier-1 un-starve (#2307): tool-search on, memory-sharing prompt, cwd aligned", () => {
+    // full set defers via tool-search → keeps low context (honours the kill-switch)
+    expect(out).toContain('ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-auto}"');
+    expect(out).toContain("SWITCHROOM_DISABLE_TOOL_SEARCH");
+    // the append-prompt now tells the worker it SHARES memory + tools (not lobotomised)
+    expect(out).toMatch(/SHARE .*memory/);
+    expect(out).not.toMatch(/do not have .* full memory/);
+    // cd into the workspace so claude's project key matches the seeded trust state
+    expect(out).toMatch(/cd ".*" \|\| exit 1/);
   });
 
   it("self-gates on the runtime flag (exit 78, no respawn, only when explicitly disabled)", () => {

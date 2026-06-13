@@ -7,39 +7,58 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { maybeWriteTrimmedCronMcp } from "../src/agents/scaffold.js";
+import { maybeWriteCronMcp } from "../src/agents/scaffold.js";
 import { parseMemToMib, resolveResourceDefaults } from "../src/agents/compose.js";
 
-const tg = { command: "bun", args: ["run", "start"], env: { TELEGRAM_STATE_DIR: "/state" }, alwaysLoad: true } as never;
+const tg = { command: "bun", args: ["run", "start"], env: { TELEGRAM_STATE_DIR: "/state/agents/clerk/telegram" }, alwaysLoad: true } as never;
+const hindsight = { command: "x", env: { HINDSIGHT_BANK_ID: "clerk" }, alwaysLoad: true } as never;
 const full = {
   "switchroom-telegram": tg,
-  hindsight: { command: "x" } as never,
+  hindsight,
   perplexity: { command: "y" } as never,
   "agent-config": { command: "z" } as never,
 };
 
-describe("maybeWriteTrimmedCronMcp", () => {
-  it("writes a switchroom-telegram-ONLY config when cron session enabled", () => {
+describe("maybeWriteCronMcp (Tier-1 un-starve, #2307)", () => {
+  it("writes the FULL MCP set when cron session enabled (shared memory + tools)", () => {
     const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
-    const path = maybeWriteTrimmedCronMcp(dir, full, true);
+    const path = maybeWriteCronMcp(dir, full, true);
     expect(path).toBe(join(dir, ".claude-cron", ".mcp.json"));
     const parsed = JSON.parse(readFileSync(path!, "utf-8"));
-    expect(Object.keys(parsed.mcpServers)).toEqual(["switchroom-telegram"]);
-    // the heavy schema servers are gone (the ~31k-token saving)
-    expect(parsed.mcpServers.hindsight).toBeUndefined();
-    expect(parsed.mcpServers["agent-config"]).toBeUndefined();
-    // the bridge entry is reused verbatim (identity comes from process env)
-    expect(parsed.mcpServers["switchroom-telegram"]).toEqual(tg);
+    // the heavy schema servers are PRESENT now (deferred via tool-search), not trimmed
+    expect(Object.keys(parsed.mcpServers).sort()).toEqual(
+      ["agent-config", "hindsight", "perplexity", "switchroom-telegram"],
+    );
+    // hindsight shares the BASE agent's bank (no <name>-cron fragmentation)
+    expect(parsed.mcpServers.hindsight.env.HINDSIGHT_BANK_ID).toBe("clerk");
+    expect(parsed.mcpServers.hindsight.alwaysLoad).toBe(true);
+  });
+
+  it("isolates the cron bridge's liveness file (RISK #2) while sharing STATE_DIR", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
+    const parsed = JSON.parse(readFileSync(maybeWriteCronMcp(dir, full, true)!, "utf-8"));
+    const cronTg = parsed.mcpServers["switchroom-telegram"];
+    // distinct liveness path so a live <name>-cron bridge can't mask main
+    expect(cronTg.env.SWITCHROOM_BRIDGE_ALIVE_PATH).toBe("/state/agents/clerk/telegram/.bridge-alive-cron");
+    // STATE_DIR (access.json / history / gateway.sock) stays SHARED
+    expect(cronTg.env.TELEGRAM_STATE_DIR).toBe("/state/agents/clerk/telegram");
+    expect(cronTg.alwaysLoad).toBe(true);
+  });
+
+  it("does NOT mutate the caller's mcpServers map (the main .mcp.json source)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
+    maybeWriteCronMcp(dir, full, true);
+    expect((full["switchroom-telegram"] as { env: Record<string, string> }).env.SWITCHROOM_BRIDGE_ALIVE_PATH).toBeUndefined();
   });
 
   it("no-op when cron session disabled (the whole fleet today)", () => {
     const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
-    expect(maybeWriteTrimmedCronMcp(dir, full, false)).toBeNull();
+    expect(maybeWriteCronMcp(dir, full, false)).toBeNull();
   });
 
   it("no-op when the agent has no switchroom-telegram bridge", () => {
     const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
-    expect(maybeWriteTrimmedCronMcp(dir, { hindsight: { command: "x" } as never }, true)).toBeNull();
+    expect(maybeWriteCronMcp(dir, { hindsight: { command: "x" } as never }, true)).toBeNull();
   });
 });
 
