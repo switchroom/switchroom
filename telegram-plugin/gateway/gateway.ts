@@ -420,6 +420,14 @@ import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.
 import { list as listIssues, resolve as resolveIssue } from '../../src/issues/index.js'
 import { formatPermissionCardBody, describeGrant, naturalAction, formatPermissionResumeMessage } from '../permission-title.js'
 import { resolveScopedAllowChoices, isRulePersisted } from '../permission-rule.js'
+import {
+  type ScopedGrantStore,
+  scopedApprovalTtlMs,
+  resolveTimeBox,
+  recordScopedGrant,
+  lookupScopedGrant,
+  sweepScopedGrants,
+} from '../scoped-approval.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
   readClaudeJsonOverage,
@@ -3651,6 +3659,14 @@ function sweepStaleAlwaysAllowCorrelations(now = Date.now()): void {
   }
 }
 
+// "⏱ 30 min" scoped-approval store (the middle tier between Allow-once and
+// 🔁 Always). Operator-tapped, gateway-side ONLY (never pushed to the
+// bridge's untimed sessionAllowRules), fixed-window, fail-closed. Keyed by
+// agent name for per-agent isolation. All policy lives in
+// ../scoped-approval.ts (pure + unit-tested); this gateway only wires it.
+const scopedGrants: ScopedGrantStore = new Map()
+const selfAgentName = (): string => process.env.SWITCHROOM_AGENT_NAME ?? ''
+
 // `ask_user` MCP tool — open prompts awaiting a user button-tap.
 // Keyed by askId (8 hex chars from generateAskId). Each entry holds
 // the deferred promise that resolves the originating tool call, the
@@ -4246,6 +4262,9 @@ const pendingStateReaper = setInterval(() => {
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
   }
+  // Drop expired "⏱ 30 min" scoped grants. (Lookup already fails closed on
+  // expiry; this just keeps the map from accumulating dead entries.)
+  sweepScopedGrants(scopedGrants, now)
   for (const [k, v] of deferredSecrets) {
     if (now - v.staged_at > DEFERRED_SECRET_TTL_MS) deferredSecrets.delete(k)
   }
@@ -5591,10 +5610,18 @@ const pendingPermissionBuffer = createPendingPermissionBuffer()
  * rebuilds this row. callback_data stays tiny (verb + 5-char id) so we
  * never approach Telegram's 64-byte ceiling.
  */
-function buildPermissionActionRow(requestId: string, showAlways: boolean): InlineKeyboard {
+function buildPermissionActionRow(
+  requestId: string,
+  showAlways: boolean,
+  showTimeBox = false,
+): InlineKeyboard {
   const kb = new InlineKeyboard()
     .text('❌ Deny', `perm:deny:${requestId}`)
     .text('✅ Allow once', `perm:allow:${requestId}`)
+  // "⏱ 30 min" sits between once and always. Only shown for a narrow,
+  // non-destructive scope (resolveTimeBox decides); broad/MCP/destructive
+  // requests get once/always only.
+  if (showTimeBox) kb.text('⏱ 30 min', `perm:tmb:${requestId}`)
   if (showAlways) kb.text('🔁 Always…', `perm:always:${requestId}`)
   return kb
 }
@@ -5978,6 +6005,32 @@ const ipcServer: IpcServer = createIpcServer({
 
   onPermissionRequest(_client: IpcClient, msg: PermissionRequestForward) {
     const { requestId, toolName, description, inputPreview } = msg
+    // "⏱ 30 min" short-circuit: if the operator tapped a live scoped grant
+    // covering this exact request, auto-allow without posting a card. CRITICAL:
+    // dispatch WITHOUT a `rule` so the bridge does NOT cache it untimed
+    // (sessionAllowRules has no TTL — a `rule` here would silently promote the
+    // 30-min window to session-forever). The fixed window lives only in
+    // scopedGrants. lookupScopedGrant fails closed on expiry and on a
+    // destructive Bash command matching a family grant. No card, no pending
+    // entry, no awaiting reaction — the turn just continues, silently.
+    const scopedTtl = scopedApprovalTtlMs()
+    if (scopedTtl > 0) {
+      const hit = lookupScopedGrant(scopedGrants, selfAgentName(), toolName, inputPreview, Date.now())
+      if (hit) {
+        // Silent auto-allow — no card was posted and the turn was never parked
+        // on the awaiting glyph, so we intentionally OMIT the resume-glyph flip
+        // and the agent-voiced resume message (posting "got it, continuing" on
+        // every auto-allowed call is the exact noise this tier removes). The
+        // `no-card-verdict` sentinel below exempts this callsite from the
+        // resume-guard pairing test.
+        dispatchPermissionVerdict({ type: 'permission', requestId, behavior: 'allow' }) // no-card-verdict
+        process.stderr.write(
+          `telegram gateway: scoped-approval auto-allow tool=${toolName} rule="${hit}" ` +
+          `request=${requestId} (time-boxed window)\n`,
+        )
+        return
+      }
+    }
     pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     // Natural-language card body — a plain sentence ("Gymbro wants to
     // edit: supplement-log.md" + a why-line), never a raw tool id.
@@ -5996,8 +6049,13 @@ const ipcServer: IpcServer = createIpcServer({
     // any file ⚠️). The "🔁 Always…" button only appears when we can
     // synthesize a meaningful rule for this tool; unknown tools get the
     // two-button row only.
-    const showAlways = resolveScopedAllowChoices(toolName, inputPreview) != null
-    const keyboard = buildPermissionActionRow(requestId, showAlways)
+    const scopeChoices = resolveScopedAllowChoices(toolName, inputPreview)
+    const showAlways = scopeChoices != null
+    // Offer "⏱ 30 min" only for a narrow, non-destructive scope, and only
+    // when the tier is enabled (TTL > 0).
+    const showTimeBox = scopedApprovalTtlMs() > 0 &&
+      resolveTimeBox(toolName, inputPreview, scopeChoices) != null
+    const keyboard = buildPermissionActionRow(requestId, showAlways, showTimeBox)
     // Route the card to the SAME place the post-verdict resume message
     // lands (resolvePermissionCardTargets): the ORIGINATING chat+topic when
     // there's an active turn — so a supergroup agent's card appears IN the
@@ -18969,7 +19027,7 @@ bot.on('callback_query:data', async ctx => {
   }
 
   // Permission request buttons.
-  const m = /^perm:(allow|deny|always|asn|asb|back):([a-km-z]{5})$/.exec(data)
+  const m = /^perm:(allow|deny|always|asn|asb|back|tmb):([a-km-z]{5})$/.exec(data)
   if (!m) { await ctx.answerCallbackQuery().catch(() => {}); return }
   const access = loadAccess()
   const senderId = String(ctx.from.id)
@@ -18984,7 +19042,10 @@ bot.on('callback_query:data', async ctx => {
     if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
     let keyboard: InlineKeyboard
     if (behavior === 'back') {
-      keyboard = buildPermissionActionRow(request_id, true)
+      const backChoices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
+      const backTimeBox = scopedApprovalTtlMs() > 0 &&
+        resolveTimeBox(details.tool_name, details.input_preview, backChoices) != null
+      keyboard = buildPermissionActionRow(request_id, true, backTimeBox)
     } else {
       const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
       if (choices == null) {
@@ -19202,6 +19263,55 @@ bot.on('callback_query:data', async ctx => {
     // card; no synthInbound (would double-fire the verdict).
     await finalizeCallback(ctx, {
       ackText: ackText.slice(0, 200),
+      newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
+      parseMode: 'HTML',
+    })
+    return
+  }
+
+  // "⏱ 30 min" — record a fixed-window scoped grant for the NARROW scope,
+  // then allow the in-flight call. Mirrors the asn/asb structure: dispatch
+  // the verdict immediately, then edit the card. CRITICAL: the verdict
+  // carries NO `rule` (unlike asn/asb), so the bridge does not cache it
+  // untimed — the window lives only in scopedGrants, gateway-side.
+  if (behavior === 'tmb') {
+    const details = pendingPermissions.get(request_id)
+    if (!details) { await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {}); return }
+    const ttl = scopedApprovalTtlMs()
+    if (ttl <= 0) { await ctx.answerCallbackQuery({ text: 'Time-boxed approvals are disabled.' }).catch(() => {}); return }
+    const choices = resolveScopedAllowChoices(details.tool_name, details.input_preview)
+    const tb = resolveTimeBox(details.tool_name, details.input_preview, choices)
+    if (!tb) { await ctx.answerCallbackQuery({ text: 'This action can\'t be time-boxed.' }).catch(() => {}); return }
+    const agentName = selfAgentName()
+    if (!agentName) { await ctx.answerCallbackQuery({ text: 'Time-box needs SWITCHROOM_AGENT_NAME — gateway is misconfigured.' }).catch(() => {}); return }
+
+    pendingPermissions.delete(request_id)
+    // (1) Allow the in-flight call NOW — no `rule` (keeps the window
+    // strictly gateway-side; the bridge must not cache it untimed).
+    dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior: 'allow' })
+    // (2) Record the fixed-window grant so matching calls auto-allow.
+    recordScopedGrant(scopedGrants, agentName, tb.rule, Date.now(), ttl)
+    resumeReactionAfterVerdict()
+    postPermissionResumeMessage({
+      behavior: 'allow',
+      action: naturalAction(details.tool_name, details.input_preview),
+    })
+    process.stderr.write(
+      `telegram gateway: scoped-approval granted rule="${tb.rule}" agent=${agentName} ` +
+      `ttl_ms=${ttl} (request_id=${request_id})\n`,
+    )
+
+    const mins = Math.max(1, Math.round(ttl / 60_000))
+    // Honest card: state the real BREADTH (e.g. "any `git` command"), not
+    // just the rule, plus the window — consent covers both (access-model
+    // honest-card contract).
+    const sourceMsg = ctx.callbackQuery?.message
+    const baseText = sourceMsg && 'text' in sourceMsg && sourceMsg.text
+      ? escapeHtmlForTg(sourceMsg.text)
+      : ''
+    const editLabel = `⏱ <b>Allowed for ${mins} min — ${escapeHtmlForTg(tb.breadth)}</b> · re-asks after that, and now for anything else`
+    await finalizeCallback(ctx, {
+      ackText: `⏱ Allowed for ${mins} min`.slice(0, 200),
       newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
       parseMode: 'HTML',
     })
