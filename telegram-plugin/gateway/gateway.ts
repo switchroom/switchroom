@@ -467,7 +467,7 @@ import {
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
-import { emitLinearAgentActivity } from './linear-activity.js'
+import { emitLinearAgentActivity, createLinearIssue } from './linear-activity.js'
 import {
   approvalRequest,
   approvalConsume,
@@ -6720,6 +6720,7 @@ const ALLOWED_TOOLS = new Set([
   'vault_request_access',
   'request_secret',
   'linear_agent_activity',
+  'linear_create_issue',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -6767,6 +6768,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeRequestSecret(args)
     case 'linear_agent_activity':
       return executeLinearAgentActivity(args)
+    case 'linear_create_issue':
+      return executeLinearCreateIssue(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -6800,6 +6803,10 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
 
 async function executeLinearAgentActivity(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
   return emitLinearAgentActivity(args)
+}
+
+async function executeLinearCreateIssue(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  return createLinearIssue(args)
 }
 
 async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {

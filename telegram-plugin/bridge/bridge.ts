@@ -479,6 +479,37 @@ const TOOL_SCHEMAS = [
       required: ['agent_session_id', 'type'],
     },
   },
+  {
+    name: 'linear_create_issue',
+    description:
+      'File a new Linear issue from a Telegram message the operator flagged for capture (#2312). Use this when a turn was triggered by a capture reaction (the inbound carries event="reaction" with a capture emoji like 👨‍💻 or 📌) — turn the reacted message + any relevant thread context into a well-formed issue. Write a crisp imperative title and a body that captures the ask, the context, and any acceptance criteria you can infer; the agent files it AS its own Linear app actor. Team is auto-resolved when the workspace has a single team; if there are multiple it returns text asking for an explicit team_id. Pass dedup_key (e.g. the chat_id:message_id of the reacted message) so a re-react of the same message does not file a duplicate. Resolves the agent\'s Linear app token from the vault; on VAULT-BROKER-DENIED it returns text instructing you to vault_request_access for `linear/<agent>/token`. Returns "Filed: <title> → <url>" on success — reply that link to the operator in plain text.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Issue title — a crisp, imperative one-liner (e.g. "Fix duplicate webhook retries on Brevo sync").',
+        },
+        body: {
+          type: 'string',
+          description: 'Issue description (Markdown). Capture the ask, relevant context from the message/thread, and any acceptance criteria you can infer.',
+        },
+        team_id: {
+          type: 'string',
+          description: 'Optional Linear team id. Omit to auto-resolve when the workspace has a single team; required only when the workspace has multiple teams.',
+        },
+        dedup_key: {
+          type: 'string',
+          description: 'Optional idempotency key (use the reacted message identity, e.g. "<chat_id>:<message_id>"). A prior capture with the same key short-circuits to "Already filed: <url>".',
+        },
+        priority: {
+          type: 'number',
+          description: 'Optional Linear priority (0 none, 1 urgent, 2 high, 3 normal, 4 low).',
+        },
+      },
+      required: ['title', 'body'],
+    },
+  },
 ]
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_SCHEMAS }))
