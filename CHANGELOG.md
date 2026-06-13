@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.15.17 — cheap-cron Tier-1 auto-routing DEFAULT-ON (#2307)
+
+Now that the Tier-1 cheap cron session boots automatically (v0.15.16, canary
+green end-to-end), cadence auto-routing is **on by default** — a frequent
+hint-less cron runs cheap without you opting in (the Defaults principle).
+
+- **#2331** — `SWITCHROOM_CRON_AUTO_TIER` flips from a default-off feature flag
+  to a **default-on safety kill-switch** (`=0`/`false`/`off` reverts the fleet
+  to full Tier-2 turns, mirroring `SWITCHROOM_CHEAP_CRON`). A frequent (≤60min)
+  hint-less cron auto-routes to the cheap Tier-1 session; daily/weekly and
+  unreadable cadences stay on the full session; an explicit `context: agent` is
+  the per-cron opt-out. Also removes the never-wired `telegram-reactions` poll
+  type (redundant with the event-driven `reaction_dispatch`, #2291).
+
+Blast radius on this fleet is small (only agents with a frequent hint-less cron
+get a cron session); graceful fallback means a cron is never dropped.
+
 ## v0.15.16 — Tier-1 cron-session auto-boot (#2307 canary follow-up 2)
 
 The v0.15.15 canary proved the Tier-1 cron session works end-to-end once its
