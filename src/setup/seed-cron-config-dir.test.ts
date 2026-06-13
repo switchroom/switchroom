@@ -7,7 +7,7 @@
  * + the FULL cron server key set, and that the main .claude dir is untouched.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -59,6 +59,43 @@ describe("seedCronConfigDir (#2307 Tier-1)", () => {
       "notion",
       "switchroom-telegram",
     ]);
+  });
+
+  // CANARY FIX (v0.15.15): the minimal config (hasCompletedOnboarding only) is
+  // NOT enough — the cron claude wedges on login-method/theme without
+  // oauthAccount. seedCronConfigDir copies the agent's fully-onboarded MAIN
+  // config so the cron session inherits the working onboarding state.
+  function writeMainConfig(extra: Record<string, unknown>): void {
+    const mainDir = join(agentDir, ".claude");
+    mkdirSync(mainDir, { recursive: true });
+    writeFileSync(
+      join(mainDir, ".claude.json"),
+      JSON.stringify({ hasCompletedOnboarding: true, oauthAccount: { uuid: "acc-1" }, ...extra }, null, 2),
+    );
+  }
+
+  it("COPIES the fully-onboarded main config (oauthAccount/theme) when it exists", () => {
+    writeMainConfig({ theme: "dark", hasSeenTasksHint: true });
+    seedCronConfigDir(agentDir, keys);
+    const cron = readCron() as Record<string, unknown>;
+    // the onboarding markers that the minimal seed lacked are now present
+    expect(cron.oauthAccount).toEqual({ uuid: "acc-1" });
+    expect(cron.theme).toBe("dark");
+    expect(cron.hasSeenTasksHint).toBe(true);
+    // and the cron-project MCP trust is layered on top
+    const project = (cron.projects as Record<string, { enabledMcpjsonServers?: string[]; hasTrustDialogAccepted?: boolean }>)[resolve(agentDir)];
+    expect(project.hasTrustDialogAccepted).toBe(true);
+    expect((project.enabledMcpjsonServers ?? []).sort()).toEqual([...keys].sort());
+  });
+
+  it("OVERWRITES a stale cron config on re-seed so it re-syncs with the main (e.g. oauthAccount added after first login)", () => {
+    // first seed: no main config yet → minimal (no oauthAccount)
+    seedCronConfigDir(agentDir, keys);
+    expect((readCron() as Record<string, unknown>).oauthAccount).toBeUndefined();
+    // later: main config gains oauthAccount (agent logged in); re-seed copies it
+    writeMainConfig({});
+    seedCronConfigDir(agentDir, keys);
+    expect((readCron() as Record<string, unknown>).oauthAccount).toEqual({ uuid: "acc-1" });
   });
 });
 
