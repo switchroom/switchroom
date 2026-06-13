@@ -19341,15 +19341,17 @@ bot.on('callback_query:data', async ctx => {
   // the "is it working or did my tap do nothing?" signal the old
   // `▶️ resuming…` card footnote used to — and names the work, which the
   // footnote never did. Keeps the card terse and the resume legible.
-  // Honest-card: when a window was granted, the label states the real breadth
-  // + duration; otherwise plain "Allowed once".
+  // Honest-card: only claim the window when one was actually recorded
+  // (timeBox eligible AND we had an agent name to key it under) — never
+  // promise "won't ask again for 30 min" if nothing was stored.
+  const windowGranted = timeBox != null && grantAgent !== ''
   const ackText = behavior === 'deny'
     ? '❌ Denied'
-    : (timeBox ? `✅ Allowed (${scopedMins} min)` : '✅ Allowed once')
+    : (windowGranted ? `✅ Allowed (${scopedMins} min)` : '✅ Allowed once')
   const htmlLabel = behavior === 'deny'
     ? '❌ <b>Denied</b>'
-    : (timeBox
-        ? `✅ <b>Allowed — won't ask again about ${escapeHtmlForTg(timeBox.breadth)} for ${scopedMins} min</b>`
+    : (windowGranted
+        ? `✅ <b>Allowed — won't ask again about ${escapeHtmlForTg(timeBox!.breadth)} for ${scopedMins} min</b>`
         : '✅ <b>Allowed once</b>')
   // HTML-escape the source text — same hazard as the scope-commit and
   // recent-denial paths above. The permission card body
