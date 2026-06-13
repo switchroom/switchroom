@@ -23,6 +23,7 @@ import {
   reconcileAgent,
   scaffoldAgent,
   SWITCHROOM_DEFAULT_MAIN_MODEL,
+  resolveMainModel,
 } from "../src/agents/scaffold.js";
 import type {
   AgentConfig,
@@ -142,5 +143,29 @@ describe("reconcileAgent — default model (#472 #16)", () => {
     // settings_raw is applied AFTER the switchroom-owned default, so it
     // takes precedence — that's the design of the escape hatch.
     expect(settings.model).toBe("claude-haiku-4-5-20251001");
+  });
+});
+
+describe("resolveMainModel — the `model: default` footgun guard", () => {
+  it("remaps the `default` alias to the switchroom default (NOT the account default)", () => {
+    // `model: default` passes the literal string to claude, which resolves it
+    // to the ACCOUNT default (e.g. claude-fable-5) — inaccessible on some
+    // accounts → 4xx every turn (bit test-harness 2026-06-13). Must remap.
+    expect(resolveMainModel("default")).toBe(SWITCHROOM_DEFAULT_MAIN_MODEL);
+    expect(resolveMainModel("default")).not.toBe("default");
+  });
+
+  it("falls back to the switchroom default when unset", () => {
+    expect(resolveMainModel(undefined)).toBe(SWITCHROOM_DEFAULT_MAIN_MODEL);
+  });
+
+  it("passes explicit real models / aliases through unchanged", () => {
+    expect(resolveMainModel("claude-opus-4-8")).toBe("claude-opus-4-8");
+    expect(resolveMainModel("opus")).toBe("opus");
+    expect(resolveMainModel("sonnet")).toBe("sonnet");
+    expect(resolveMainModel("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5-20251001");
+    // a deliberate fable id (an account that HAS access) is honoured — we only
+    // guard the bare `default` alias, not fable itself.
+    expect(resolveMainModel("claude-fable-5")).toBe("claude-fable-5");
   });
 });
