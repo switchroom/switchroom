@@ -105,6 +105,21 @@ tmux -L "$CRON_SOCKET" \
     --append-system-prompt "$CRON_APPEND_PROMPT"{{#if dangerousMode}} \
     --dangerously-skip-permissions{{/if}}
 
+# Dismiss the cron session's per-boot first-run prompt. Even with the seeded
+# .claude-cron/.claude.json (copied from the fully-onboarded main config),
+# `--dangerously-load-development-channels` re-prompts EVERY launch ("I am using
+# this for local development") — that ack is not persisted to config. The MAIN
+# autoaccept-poll watches only `switchroom-<name>`; this one watches
+# `switchroom-${CRON_NAME}` (the cron socket) and dispatches the same prompt
+# rule. Boot-phase only (WEDGE_WATCHDOG off → dismiss then exit); re-forked on
+# every cron-session.sh (re)spawn so a later respawn's prompt is caught too.
+# Without this the cron `claude` wedges and the <name>-cron bridge never
+# registers (every Tier-1 fire then falls back to main).
+if [ -f /opt/switchroom/autoaccept-poll.js ] && command -v bun >/dev/null 2>&1; then
+  SWITCHROOM_WEDGE_WATCHDOG=0 bun /opt/switchroom/autoaccept-poll.js "$CRON_NAME" \
+    >> /var/log/switchroom/cron-session.log 2>&1 &
+fi
+
 # `new-session -d` returns immediately (tmux daemonizes the session), so block
 # here while the session lives — this keeps cron-session.sh as the supervisor's
 # long-running child. When the cron claude exits (crash / kill), the session

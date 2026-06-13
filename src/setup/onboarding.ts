@@ -385,17 +385,47 @@ export function createMinimalClaudeConfig(agentDir: string, configDirName = ".cl
 /**
  * #2307 Tier-1: seed the cron session's CLAUDE_CONFIG_DIR (.claude-cron) with
  * the same onboarding + trust state the main .claude dir gets, so the cron
- * `claude` doesn't wedge on the first-run wizard / trust gate (the
- * autoaccept-poll sidecar watches only the MAIN tmux session, so nothing
- * dismisses a cron-session wizard). Idempotent: createMinimalClaudeConfig
- * early-returns if the file exists, preTrust/ensureMcpServersTrusted
- * read-modify-write. Runs on BOTH the scaffold and reconcile paths (so the
- * in-container reconcile writes the in-container project key that matches the
- * cron claude's cwd). `serverKeys` MUST be the full cron .mcp.json key set or
- * Claude Code silently ignores those servers.
+ * `claude` doesn't wedge on a first-run prompt (the autoaccept-poll sidecar
+ * watches only the MAIN tmux session by default — cron-session.sh forks a
+ * second one for the cron session to dismiss the per-boot dev-channels ack).
+ *
+ * CANARY FINDING (v0.15.15, #2307): a MINIMAL config (hasCompletedOnboarding
+ * only) is NOT enough — the cron claude still wedges on the login-method /
+ * theme prompts because the minimal config lacks `oauthAccount`, the theme
+ * flag, and the various `hasSeenX` first-run markers. The MAIN agent is already
+ * fully onboarded (the auth-broker logged it in; claude wrote `oauthAccount`
+ * etc.), so we COPY the agent's main `.claude/.claude.json` verbatim into the
+ * cron dir — the cron session inherits the exact, working onboarding state —
+ * then layer the cron-project MCP trust on top. Overwrite (not write-if-missing)
+ * so each reconcile RE-SYNCS the cron config as the main config gains fields
+ * (e.g. `oauthAccount` written only after the first login).
+ *
+ * Runs on BOTH the scaffold and reconcile paths (so the in-container reconcile
+ * writes the in-container project key that matches the cron claude's cwd).
+ * `serverKeys` MUST be the full cron .mcp.json key set or Claude Code silently
+ * ignores those servers.
  */
 export function seedCronConfigDir(agentDir: string, serverKeys: string[]): void {
-  createMinimalClaudeConfig(agentDir, ".claude-cron");
+  const mainConfig = join(agentDir, ".claude", ".claude.json");
+  const cronDir = join(agentDir, ".claude-cron");
+  const cronConfig = join(cronDir, ".claude.json");
+  mkdirSync(cronDir, { recursive: true });
+  if (existsSync(mainConfig)) {
+    // Copy the agent's fully-onboarded main config (oauthAccount / theme / all
+    // first-run markers) verbatim, OVERWRITING any stale cron copy so it stays
+    // in sync. Then preTrust/ensureMcpServersTrusted re-apply the cron-project
+    // MCP trust on top.
+    try {
+      copyFileSync(mainConfig, cronConfig);
+    } catch {
+      // If the copy fails (perms / mid-write), fall back to the minimal config
+      // so the cron session at least skips the onboarding WIZARD.
+      createMinimalClaudeConfig(agentDir, ".claude-cron");
+    }
+  } else {
+    // Fresh agent whose main config isn't written yet — minimal is the floor.
+    createMinimalClaudeConfig(agentDir, ".claude-cron");
+  }
   preTrustWorkspace(agentDir, ".claude-cron");
   ensureMcpServersTrusted(agentDir, serverKeys, ".claude-cron");
 }

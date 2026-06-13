@@ -82,6 +82,13 @@ describe("cron-session.sh launcher — compliance + identity", () => {
     expect(out).toMatch(/while tmux -L "\$CRON_SOCKET" has-session -t "\$CRON_NAME"/);
   });
 
+  it("forks a boot-phase autoaccept for the CRON socket (dismisses the dev-channels ack)", () => {
+    // The main autoaccept watches switchroom-<name>; the cron session needs its
+    // own (switchroom-<name>-cron) or it wedges on the per-boot dev-channels
+    // prompt. Boot-phase only (WEDGE_WATCHDOG off → dismiss then exit).
+    expect(out).toMatch(/SWITCHROOM_WEDGE_WATCHDOG=0 bun \/opt\/switchroom\/autoaccept-poll\.js "\$CRON_NAME"/);
+  });
+
   it("registers as the cron bridge identity and its own config dir", () => {
     expect(out).toContain('SWITCHROOM_AGENT_NAME="$CRON_NAME"');
     expect(out).toContain('CRON_NAME="marko-cron"');
