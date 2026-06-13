@@ -12,7 +12,29 @@
 
 import { parseDocument, type Document, isMap, isSeq, type YAMLMap, type YAMLSeq } from "yaml";
 
-export type TelegramFeature = "voice_in" | "telegraph" | "webhook_sources";
+export type TelegramFeature = "voice_in" | "telegraph" | "webhook_sources" | "linear_agent";
+
+/**
+ * Set the `linear_agent` block under
+ * `agents.<agent>.channels.telegram.linear_agent` (#2298).
+ *
+ * Writes `{ enabled: true, token: "vault:linear/<agent>/token" }` (plus an
+ * optional `workspace_id`). The token is a vault reference, never an inline
+ * literal — the secret itself is stored in the vault by the CLI's vaultPut.
+ * Idempotent on re-run (setIn overwrites the block).
+ */
+export function setLinearAgent(
+  yamlText: string,
+  agentName: string,
+  opts: { token: string; workspaceId?: string },
+): string {
+  const doc = parseDocument(yamlText);
+  ensureAgent(doc, agentName);
+  const block: Record<string, unknown> = { enabled: true, token: opts.token };
+  if (opts.workspaceId) block.workspace_id = opts.workspaceId;
+  doc.setIn(["agents", agentName, "channels", "telegram", "linear_agent"], block);
+  return String(doc);
+}
 
 /**
  * Set a feature payload under `agents.<agentName>.channels.telegram.<feature>`.

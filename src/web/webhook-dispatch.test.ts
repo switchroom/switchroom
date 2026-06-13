@@ -20,6 +20,8 @@ import {
   parseDurationMs,
   isQuietHour,
   evaluateDispatch,
+  parseLinearAgentSession,
+  buildLinearInbound,
   createFileCooldownStore,
   type DispatchMatcher,
   type DispatchRule,
@@ -791,5 +793,76 @@ describe('matchesRule (linear/generic)', () => {
         labels_all: ['prod', 'deploy'],
       }),
     ).toBe(true)
+  })
+})
+
+describe('parseLinearAgentSession (#2298)', () => {
+  it('returns null for a non-AgentSessionEvent payload', () => {
+    expect(parseLinearAgentSession({ type: 'Issue', action: 'create' })).toBeNull()
+  })
+
+  it('returns null when no session id is present', () => {
+    expect(
+      parseLinearAgentSession({ type: 'AgentSessionEvent', action: 'created', agentSession: {} }),
+    ).toBeNull()
+  })
+
+  it('derives mention trigger from a comment + reads promptContext', () => {
+    const s = parseLinearAgentSession({
+      type: 'AgentSessionEvent',
+      action: 'created',
+      promptContext: 'Do the thing on ENG-42',
+      agentSession: {
+        id: 'sess_1',
+        issue: { identifier: 'ENG-42', title: 'Thing' },
+        comment: { body: '@carrie do it' },
+      },
+    })
+    expect(s).not.toBeNull()
+    expect(s!.sessionId).toBe('sess_1')
+    expect(s!.trigger).toBe('mention')
+    expect(s!.action).toBe('created')
+    expect(s!.promptContext).toBe('Do the thing on ENG-42')
+  })
+
+  it('derives delegation trigger when there is no comment', () => {
+    const s = parseLinearAgentSession({
+      type: 'AgentSessionEvent',
+      action: 'created',
+      agentSession: { id: 'sess_2', issue: { identifier: 'ENG-9', title: 'Build it' } },
+    })
+    expect(s!.trigger).toBe('delegation')
+    // No promptContext → readable summary fallback.
+    expect(s!.promptContext).toBeUndefined()
+    expect(s!.summary).toContain('delegated')
+    expect(s!.summary).toContain('ENG-9')
+  })
+
+  it('honours an explicit trigger field', () => {
+    const s = parseLinearAgentSession({
+      type: 'AgentSessionEvent',
+      action: 'prompted',
+      agentSession: { id: 'sess_3', trigger: 'delegation', comment: { body: 'hi' } },
+    })
+    expect(s!.trigger).toBe('delegation')
+  })
+})
+
+describe('buildLinearInbound (#2298)', () => {
+  it('builds an inbound with linear meta and falls back to summary when no promptContext', () => {
+    const session = parseLinearAgentSession({
+      type: 'AgentSessionEvent',
+      action: 'created',
+      agentSession: { id: 'sess_4', issue: { identifier: 'ENG-1', title: 'X' } },
+    })!
+    const inbound = buildLinearInbound(session, { chatId: '-100', threadId: 7 }, 1234)
+    expect(inbound.meta?.source).toBe('linear')
+    expect(inbound.meta?.agent_session_id).toBe('sess_4')
+    expect(inbound.meta?.linear_trigger).toBe('delegation')
+    expect(inbound.meta?.linear_event).toBe('agent_session.created')
+    expect(inbound.chatId).toBe('-100')
+    expect(inbound.threadId).toBe(7)
+    expect(inbound.user).toBe('linear')
+    expect(inbound.text).toContain('ENG-1')
   })
 })

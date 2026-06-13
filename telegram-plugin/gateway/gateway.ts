@@ -467,6 +467,7 @@ import {
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
+import { emitLinearAgentActivity } from './linear-activity.js'
 import {
   approvalRequest,
   approvalConsume,
@@ -6718,6 +6719,7 @@ const ALLOWED_TOOLS = new Set([
   'vault_request_save',
   'vault_request_access',
   'request_secret',
+  'linear_agent_activity',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -6763,6 +6765,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeVaultRequestAccess(args)
     case 'request_secret':
       return executeRequestSecret(args)
+    case 'linear_agent_activity':
+      return executeLinearAgentActivity(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -6792,6 +6796,10 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
 
   process.stderr.write(`telegram gateway: send_checklist: sent chatId=${chat_id} messageId=${sent.message_id} tasks=${tasks.length}\n`)
   return { content: [{ type: 'text', text: `checklist sent (id: ${sent.message_id})` }] }
+}
+
+async function executeLinearAgentActivity(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  return emitLinearAgentActivity(args)
 }
 
 async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {

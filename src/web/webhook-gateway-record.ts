@@ -31,6 +31,8 @@ import {
 import {
   evaluateDispatch,
   DISPATCH_SOURCES,
+  parseLinearAgentSession,
+  buildLinearInbound,
   type CooldownStore,
   type WebhookDispatchConfig,
 } from './webhook-dispatch.js'
@@ -150,6 +152,61 @@ export function recordWebhookEvent(
   log(
     `webhook-gateway: agent='${agent}' source='${rec.source}' event='${rec.event_type}' recorded ts=${now}\n`,
   )
+
+  // ── Linear AgentSessionEvent (#2298) ──────────────────────────────────────
+  // A first-class Linear agent session (an @mention or a delegation) ALWAYS
+  // wakes the agent — no dispatch-rule matcher. The verified event is already
+  // recorded above; here we synthesize the inject turn tagged
+  // meta.source="linear" with the agent_session_id so the agent can respond
+  // with AgentActivity via the linear_agent_activity MCP tool. Gated on the
+  // agent having linear_agent.enabled in its config.
+  if (rec.source === 'linear') {
+    try {
+      const session = parseLinearAgentSession(rec.payload)
+      if (session) {
+        const config = (deps.loadConfig ?? loadSwitchroomConfig)()
+        const rawAgent = config.agents?.[agent]
+        const linearAgent = rawAgent
+          ? resolveAgentConfig(config.defaults, config.profiles, rawAgent).channels
+              ?.telegram?.linear_agent
+          : undefined
+        if (!linearAgent?.enabled) {
+          log(
+            `linear-agent: agent='${agent}' session='${session.sessionId}' ignored — linear_agent not enabled\n`,
+          )
+        } else {
+          const target = resolveChannelTarget(config, agent)
+          if (!target) {
+            log(
+              `linear-agent: agent='${agent}' session='${session.sessionId}' skipped — no chat target (forum_chat_id / chat_id unset)\n`,
+            )
+          } else {
+            const inbound = buildLinearInbound(
+              session,
+              {
+                chatId: target.chatId,
+                ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
+              },
+              now,
+            )
+            const ok = deps.inject ? deps.inject(agent, inbound) : false
+            log(
+              `linear-agent: agent='${agent}' session='${session.sessionId}' trigger='${session.trigger}' ` +
+                `${ok ? 'injected' : 'NOT injected (no inject sink)'}\n`,
+            )
+            // Agent-session events are a distinct lifecycle from ordinary
+            // webhook_dispatch — return without falling through to the
+            // dispatch-rule matcher so a session isn't double-fired.
+            return { status: 'ok', ts: now, dispatched: ok ? 1 : 0 }
+          }
+        }
+      }
+    } catch (err) {
+      log(
+        `linear-agent: agent='${agent}' session inject error (event recorded): ${(err as Error).message}\n`,
+      )
+    }
+  }
 
   // ── Fire webhook_dispatch rules (github / generic / linear) ───────────────
   // This wires the previously-unreachable evaluateDispatch: the legacy
