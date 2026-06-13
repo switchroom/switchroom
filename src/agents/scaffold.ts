@@ -1041,6 +1041,24 @@ export const SWITCHROOM_DEFAULT_MAIN_MODEL = "claude-sonnet-4-6";
 export const SWITCHROOM_DEFAULT_THINKING_EFFORT = "low";
 
 /**
+ * Resolve a config `model:` value for the agent's claude launch.
+ *
+ * Footgun guard: a bare `model: default` is NOT "use the switchroom default" —
+ * claude passes the literal string through, and Anthropic resolves it to the
+ * *account's* default model (e.g. claude-fable-5). If the account has no access
+ * to that model, EVERY turn 4xx's ("model may not exist or you may not have
+ * access"). That bit test-harness on 2026-06-13. We remap the `default` alias
+ * (and unset) to switchroom's known-good default so a config `model:` can never
+ * resolve to an inaccessible account-default. Any explicit real model id or
+ * other alias (opus/sonnet/haiku/full id) passes through unchanged — operators
+ * who want a specific model still get it.
+ */
+export function resolveMainModel(model: string | undefined): string {
+  if (model === undefined || model === "default") return SWITCHROOM_DEFAULT_MAIN_MODEL;
+  return model;
+}
+
+/**
  * Built-in Claude Code tools. When `tools.allow: [all]` is set in
  * switchroom.yaml, every one of these is pre-approved so the agent never
  * blocks on a permission prompt at runtime.
@@ -2244,7 +2262,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // (#910). When unset (e.g. tests with no HOME) the template's
     // {{#if hostHomeQ}} guard renders the symlink block as a no-op.
     hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
-    modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+    modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
     ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
     permissionMode: agentConfig.permission_mode,
@@ -3063,7 +3081,7 @@ export function scaffoldAgent(
       // for rationale). Always written to settings.model so the user
       // doesn't have to pass --model on every invocation, and so the
       // doctor / debug surfaces show the resolved choice.
-      settings.model = agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL;
+      settings.model = resolveMainModel(agentConfig.model);
 
       // --- Phase 5: settings_raw escape hatch ---
       //
@@ -4836,7 +4854,7 @@ export function reconcileAgent(
       // Mirror buildWorkspaceContext (#910): host home for the
       // $HOME/.switchroom symlink in start.sh's docker preamble.
       hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
-      modelQ: shellSingleQuote(agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL),
+      modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
       ...buildCronSessionContext(agentConfig),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
       permissionMode: agentConfig.permission_mode,
@@ -5218,7 +5236,7 @@ export function reconcileAgent(
     // produce the same settings.model byte-for-byte. Apply the switchroom
     // default (Sonnet 4.6) when the operator hasn't set an explicit
     // override in switchroom.yaml.
-    settings.model = agentConfig.model ?? SWITCHROOM_DEFAULT_MAIN_MODEL;
+    settings.model = resolveMainModel(agentConfig.model);
 
     // --- Phase 5: settings_raw escape hatch ---
     //
