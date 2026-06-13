@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { parse } from "yaml";
 import { setTelegramFeature, removeTelegramFeature } from "../src/cli/telegram-yaml.js";
 
 describe("telegram-yaml: setTelegramFeature", () => {
@@ -161,6 +162,24 @@ describe("telegram-yaml: setLinearAgent (#2298)", () => {
     expect(after).toContain("enabled: true");
     expect(after).toContain("token: vault:linear/carrie/token");
     expect(after).toContain("topic_name: Carrie");
+  });
+
+  it("forces webhook_via_gateway: true so inbound AgentSessionEvents reach the gateway (#2298)", () => {
+    // Without this the linear_agent block is configured-but-deaf: the web
+    // receiver only forwards to the gateway when webhook_via_gateway === true.
+    const before = "agents:\n  carrie:\n    topic_name: Carrie\n";
+    const after = setLinearAgent(before, "carrie", { token: "vault:linear/carrie/token" });
+    expect(after).toContain("webhook_via_gateway: true");
+    const parsed = parse(after) as { agents: { carrie: { channels: { telegram: { webhook_via_gateway?: boolean } } } } };
+    expect(parsed.agents.carrie.channels.telegram.webhook_via_gateway).toBe(true);
+  });
+
+  it("preserves an already-true webhook_via_gateway on re-run", () => {
+    const before =
+      "agents:\n  carrie:\n    channels:\n      telegram:\n        webhook_via_gateway: true\n";
+    const after = setLinearAgent(before, "carrie", { token: "vault:linear/carrie/token" });
+    const parsed = parse(after) as { agents: { carrie: { channels: { telegram: { webhook_via_gateway?: boolean } } } } };
+    expect(parsed.agents.carrie.channels.telegram.webhook_via_gateway).toBe(true);
   });
 
   it("includes workspace_id when provided", () => {
