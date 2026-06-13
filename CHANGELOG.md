@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.15.9 — cheap crons by default (value-gate drives the tier)
+
+The cheap-correct cron tier is now the **default**, chosen deterministically by
+the system rather than via an opt-in flag (the cheap-crons JTBD's Defaults
+fix). A frequent, hint-less cron routes to a cheap Tier-1 session automatically;
+daily/weekly briefings keep the full agent session; anything whose cadence
+can't be read confidently stays full (conservative — never strips context).
+
+- **Cheap-cron is ON by default** (#2299). `SWITCHROOM_CHEAP_CRON=0/false/off`
+  is the emergency kill-switch (restores all-Tier-2). Disabling never silently
+  drops a cron.
+- **Deterministic value-gate** (#2294/#2297/#2299): a conservative cadence
+  estimator + `applyDefaultTier` fill `context: fresh` for confidently
+  sub-hourly hint-less crons. Explicit `kind`/`model`/`context` always win.
+  Wired consistently across the scheduler fire path, scaffold cron-session
+  rendering, and compose resource headroom. Threshold tunable via
+  `SWITCHROOM_CRON_FREQUENT_GAP_MIN`.
+- Cheap-crons JTBD added to the design contract
+  (`reference/crons-use-the-model-only-when-it-earns-it.md`).
+
 ## v0.15.8 — cheaper crons: schedule hot-reload + agent-facing tier options
 
 Cron token-optimization: scheduled work should pay for a model only when the
