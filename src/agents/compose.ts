@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
+import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { isReservedAgentName } from "../vault/broker/peercred.js";
@@ -517,8 +518,13 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
     // Cheap-cron (L4 refinement): give cron-session agents a little headroom
     // for the 2nd claude. Config-derived (a context:fresh/cheap-model entry) —
     // false for every current fleet agent, so resources are unchanged today.
+    // Apply the value-gate default (cheap-by-default) like the scaffold +
+    // fire path do, so a frequent hint-less cron that routes to a Tier-1
+    // session also gets its resource headroom here — the three stay in sync.
     const cronSession = scheduleNeedsCronSession(
-      (resolved.schedule ?? []).map((e) => ({ kind: e.kind, model: e.model, context: e.context })),
+      (resolved.schedule ?? []).map((e) =>
+        applyDefaultTier({ cron: e.cron, kind: e.kind, model: e.model, context: e.context }),
+      ),
       { cheapCronEnabled: true },
     );
     const resources = resolveResourceDefaults(name, profile, resolved.resources, { cronSession });
