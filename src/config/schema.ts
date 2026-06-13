@@ -930,6 +930,43 @@ export const TelegramChannelSchema = z
         "but the secret file is missing/empty every request is rejected. Off " +
         "by default. See docs/rfcs/webhook-cloudflare-edge-lock.md.",
       ),
+    linear_agent: z
+      .object({
+        enabled: z.boolean(),
+        token: z
+          .string()
+          .describe(
+            "vault:<key> reference to the Linear OAuth app token (actor=app). " +
+            "Resolved at runtime via the vault broker (canonically " +
+            "vault:linear/<agent>/token). Never an inline literal.",
+          ),
+        workspace_id: z
+          .string()
+          .optional()
+          .describe(
+            "Optional Linear workspace (organization) id this agent is " +
+            "installed into. Informational — used for setup hints and " +
+            "multi-workspace disambiguation; the token already scopes the " +
+            "app to its workspace.",
+          ),
+      })
+      .optional()
+      .describe(
+        "Linear first-class agent integration (#2298). When enabled, the " +
+        "agent appears in a Linear workspace as an app actor (own name/" +
+        "avatar, @-mentionable, delegate-assignable). Linear AgentSessionEvent " +
+        "webhooks (mention / delegation) wake the agent instantly via the " +
+        "same gateway inject path as webhook_dispatch, tagged " +
+        "meta.source=\"linear\" with the agent_session_id, and the agent " +
+        "responds with structured AgentActivity (thought/message/complete/" +
+        "error) via the linear_agent_activity MCP tool. Builds the " +
+        "session-lifecycle layer on top of the plain webhook_sources:[linear] " +
+        "+ webhook_dispatch support (#2272). The OAuth app token is stored in " +
+        "the vault and referenced here as vault:linear/<agent>/token; run " +
+        "`switchroom linear-agent setup <agent>` to provision it. Off by " +
+        "default — opt in per agent. Cascades from " +
+        "defaults.channels.telegram.linear_agent.",
+      ),
     // ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────
     // Per-agent override of the fleet-wide telegram.forum_chat_id.
     // When set, this agent owns its own supergroup with forum topics

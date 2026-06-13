@@ -44,6 +44,43 @@ describe("TelegramChannelSchema — supergroup smart defaults", () => {
   });
 });
 
+describe("TelegramChannelSchema.linear_agent (#2298)", () => {
+  it("parses a valid linear_agent block", () => {
+    const r = TelegramChannelSchema.parse({
+      linear_agent: { enabled: true, token: "vault:linear/carrie/token" },
+    });
+    expect(r?.linear_agent?.enabled).toBe(true);
+    expect(r?.linear_agent?.token).toBe("vault:linear/carrie/token");
+  });
+
+  it("accepts an optional workspace_id", () => {
+    const r = TelegramChannelSchema.parse({
+      linear_agent: {
+        enabled: true,
+        token: "vault:linear/carrie/token",
+        workspace_id: "ws_abc123",
+      },
+    });
+    expect(r?.linear_agent?.workspace_id).toBe("ws_abc123");
+  });
+
+  it("is optional — unset stays undefined", () => {
+    expect(TelegramChannelSchema.parse({ bot_token: "vault:x" })?.linear_agent).toBeUndefined();
+  });
+
+  it("requires enabled", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ linear_agent: { token: "vault:linear/carrie/token" } }),
+    ).toThrow();
+  });
+
+  it("requires token", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ linear_agent: { enabled: true } }),
+    ).toThrow();
+  });
+});
+
 describe("TelegramChannelSchema.clear_status_on_completion", () => {
   it("accepts true / false and round-trips the boolean", () => {
     expect(TelegramChannelSchema.parse({ clear_status_on_completion: true })?.clear_status_on_completion).toBe(true);

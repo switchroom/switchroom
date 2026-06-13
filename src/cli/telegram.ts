@@ -617,7 +617,7 @@ async function applyYamlRemoveWebhook(
  * confusing "vault not found" error when the natural action is to
  * create it.
  */
-async function vaultPut(program: Command, key: string, value: string): Promise<void> {
+export async function vaultPut(program: Command, key: string, value: string): Promise<void> {
   const configPath = (program.optsWithGlobals().config as string | undefined) ?? undefined;
   const vaultPath = resolveVaultPath(configPath);
   const passphrase = await getVaultPassphrase();

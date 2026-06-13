@@ -29,7 +29,7 @@ describe('request_secret — gateway wiring', () => {
   })
 
   it('is allow-listed and dispatched', () => {
-    expect(gw).toMatch(/'request_secret',\n\]\)/)
+    expect(gw).toMatch(/'request_secret',\n/)
     expect(gw).toMatch(/case 'request_secret':\s*\n\s*return executeRequestSecret\(args\)/)
   })
 

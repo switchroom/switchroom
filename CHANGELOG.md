@@ -1,5 +1,43 @@
 # Changelog
 
+## unreleased — Linear agents as first-class actors
+
+### PR — feat(linear): Linear agents as first-class actors (#2298)
+
+Builds the agent-session lifecycle layer on top of the plain Linear webhook
+support (#2272), so an operator can install an agent into a Linear workspace
+as a first-class app actor (own name/avatar, @-mentionable, delegate-assignable)
+and have mentions/delegations wake it instantly — no polling cron.
+
+- **Config**: new per-agent `channels.telegram.linear_agent` block
+  (`enabled` + `token` vault ref + optional `workspace_id`), mirroring the
+  `webhook_dispatch` conventions. Off by default.
+- **Agent sessions**: a verified Linear `AgentSessionEvent` (mention or
+  delegation) ALWAYS wakes the agent (no dispatch-rule matcher) via the same
+  in-process gateway inject path `webhook_dispatch` uses — tagged
+  `meta.source="linear"` with `agent_session_id`, `linear_trigger`
+  (`mention`|`delegation`), and `linear_event`. The injected content is
+  Linear's pre-assembled `promptContext` when present, else a readable
+  summary. Gated on `linear_agent.enabled`.
+- **MCP tool `linear_agent_activity`**: the agent emits structured Linear
+  AgentActivity (`thought`/`message`/`complete`/`error`) against a session via
+  the `agentActivityCreate` GraphQL mutation. Resolves the agent's Linear app
+  token from the vault (`linear/<agent>/token`); on a vault denial it returns
+  actionable text pointing at `vault_request_access`.
+- **CLI `switchroom linear-agent setup --agent <name> --token <token>`**:
+  vault-stores the app token, patches switchroom.yaml to enable the
+  `linear_agent` block, and prints the webhook URL to register in Linear plus
+  the OAuth authorize-URL hint block (the browser authorize step can't run
+  headless, so the token is passed in via `--token`). Supports `--dry-run`.
+
+Tests: `src/config/schema.test.ts` (linear_agent parse/required),
+`src/web/webhook-dispatch.test.ts` (parseLinearAgentSession + buildLinearInbound),
+`src/web/webhook-gateway-record.test.ts` (verified AgentSessionEvent injects with
+meta.source=linear + session id; not-enabled is ignored),
+`telegram-plugin/tests/linear-agent-activity.test.ts` (tool wiring + stubbed-fetch
+happy path + vault-denied guidance + API-error surfacing),
+`tests/cli.telegram.test.ts` (setLinearAgent YAML editor).
+
 ## v0.15.11 — make `latest` safe: tool-aware cron routing + claude CLI 2.1.177
 
 Housekeeping release so the published `latest` is safe to roll. v0.15.9/v0.15.10

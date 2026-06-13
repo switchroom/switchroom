@@ -455,6 +455,30 @@ const TOOL_SCHEMAS = [
       required: ['chat_id', 'key'],
     },
   },
+  {
+    name: 'linear_agent_activity',
+    description:
+      'Emit a structured Linear AgentActivity against an agent session (#2298). Use this ONLY inside a turn that was woken by a Linear agent session (the inbound carries meta.source="linear" and meta.agent_session_id) — pass that agent_session_id back here. Linear renders activities as status chips + a timeline on the issue, so the human sees acknowledge → work → result. Emit a `thought` within ~10s of being woken so the session does not look dead, then `message`(s) as you make progress, and finally exactly one terminal `complete` (work done) or `error` (you could not proceed). body is required for thought/message/error and optional for complete. Resolves the agent\'s Linear app token from the vault; on VAULT-BROKER-DENIED it returns an error instructing you to vault_request_access for `linear/<agent>/token`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agent_session_id: {
+          type: 'string',
+          description: 'The Linear AgentSession id — copy it verbatim from the woken turn\'s meta.agent_session_id.',
+        },
+        type: {
+          type: 'string',
+          enum: ['thought', 'message', 'complete', 'error'],
+          description: 'Activity kind. thought = visible reasoning ack (emit within ~10s); message = progress update; complete = terminal success; error = terminal failure.',
+        },
+        body: {
+          type: 'string',
+          description: 'Activity text (Markdown). Required for thought/message/error; optional for complete (a closing summary).',
+        },
+      },
+      required: ['agent_session_id', 'type'],
+    },
+  },
 ]
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_SCHEMAS }))

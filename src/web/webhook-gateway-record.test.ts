@@ -222,6 +222,99 @@ describe('recordWebhookEvent', () => {
     expect(injected[0].inbound.text).toBe('Linear ENG-9 for you')
   })
 
+  it('injects a verified Linear AgentSessionEvent with meta.source=linear + session id (#2298)', () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const injected: Array<{ agent: string; inbound: InboundMessageWire }> = []
+    const linearAgentConfig: RecordDeps['loadConfig'] = () =>
+      ({
+        telegram: { forum_chat_id: '-100123' },
+        agents: {
+          reggie: {
+            topic_id: 42,
+            channels: {
+              telegram: {
+                linear_agent: { enabled: true, token: 'vault:linear/reggie/token' },
+              },
+            },
+          },
+        },
+      }) as unknown as ReturnType<NonNullable<RecordDeps['loadConfig']>>
+
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: linearAgentConfig,
+      inject: (agent, inbound) => {
+        injected.push({ agent, inbound })
+        return true
+      },
+    }
+
+    const rec = baseRecord({
+      source: 'linear',
+      event_type: 'agentsessionevent',
+      rendered_text: 'Linear agent session',
+      delivery_id: undefined,
+      payload: {
+        type: 'AgentSessionEvent',
+        action: 'created',
+        promptContext: 'Please draft the article on issue ENG-42.',
+        agentSession: {
+          id: 'sess_abc123',
+          issue: { identifier: 'ENG-42', title: 'Draft article' },
+          comment: { body: '@reggie draft this' },
+        },
+      },
+    })
+
+    const result = recordWebhookEvent(rec, deps)
+    expect(result.status).toBe('ok')
+    expect(result.dispatched).toBe(1)
+    expect(injected).toHaveLength(1)
+    expect(injected[0].inbound.meta?.source).toBe('linear')
+    expect(injected[0].inbound.meta?.agent_session_id).toBe('sess_abc123')
+    expect(injected[0].inbound.meta?.linear_trigger).toBe('mention')
+    expect(injected[0].inbound.meta?.linear_event).toBe('agent_session.created')
+    expect(injected[0].inbound.text).toBe('Please draft the article on issue ENG-42.')
+    expect(injected[0].inbound.chatId).toBe('-100123')
+    expect(injected[0].inbound.threadId).toBe(42)
+  })
+
+  it('does not inject a Linear AgentSessionEvent when linear_agent is not enabled (#2298)', () => {
+    const { resolveAgentDir } = makeTmpResolveAgentDir()
+    const injected: unknown[] = []
+    const deps: RecordDeps = {
+      resolveAgentDir,
+      dedupStore: makeDedupStore(),
+      log: () => {},
+      loadConfig: () =>
+        ({
+          telegram: { forum_chat_id: '-100123' },
+          agents: { reggie: { topic_id: 42, channels: { telegram: {} } } },
+        }) as unknown as ReturnType<NonNullable<RecordDeps['loadConfig']>>,
+      inject: () => {
+        injected.push(true)
+        return true
+      },
+    }
+
+    const rec = baseRecord({
+      source: 'linear',
+      event_type: 'agentsessionevent',
+      delivery_id: undefined,
+      payload: {
+        type: 'AgentSessionEvent',
+        action: 'created',
+        agentSession: { id: 'sess_xyz', issue: { identifier: 'ENG-1' } },
+      },
+    })
+
+    const result = recordWebhookEvent(rec, deps)
+    expect(result.status).toBe('ok')
+    expect(injected).toHaveLength(0)
+  })
+
   it('does not dispatch when there is no chat target configured', () => {
     const { resolveAgentDir } = makeTmpResolveAgentDir()
     const injected: unknown[] = []

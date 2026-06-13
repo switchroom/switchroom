@@ -151,7 +151,32 @@ describe("telegram-yaml: removeTelegramFeature", () => {
 
 // ─── #597 phase 2: webhook source array helpers ─────────────────────────────
 
-import { addWebhookSource, removeWebhookSource } from "../src/cli/telegram-yaml.js";
+import { addWebhookSource, removeWebhookSource, setLinearAgent } from "../src/cli/telegram-yaml.js";
+
+describe("telegram-yaml: setLinearAgent (#2298)", () => {
+  it("writes an enabled linear_agent block with a vault token ref", () => {
+    const before = "agents:\n  carrie:\n    topic_name: Carrie\n";
+    const after = setLinearAgent(before, "carrie", { token: "vault:linear/carrie/token" });
+    expect(after).toContain("linear_agent:");
+    expect(after).toContain("enabled: true");
+    expect(after).toContain("token: vault:linear/carrie/token");
+    expect(after).toContain("topic_name: Carrie");
+  });
+
+  it("includes workspace_id when provided", () => {
+    const before = "agents:\n  carrie:\n    topic_name: C\n";
+    const after = setLinearAgent(before, "carrie", {
+      token: "vault:linear/carrie/token",
+      workspaceId: "ws_123",
+    });
+    expect(after).toContain("workspace_id: ws_123");
+  });
+
+  it("throws when the agent isn't declared", () => {
+    const before = "agents:\n  carrie:\n    topic_name: C\n";
+    expect(() => setLinearAgent(before, "ghost", { token: "vault:linear/ghost/token" })).toThrow(/not declared/);
+  });
+});
 
 describe("telegram-yaml: addWebhookSource (#597 phase 2)", () => {
   it("creates the webhook_sources array on first source", () => {

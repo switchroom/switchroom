@@ -617,6 +617,193 @@ export function injectWebhookInbound(
     )
 }
 
+// ─── Linear agent sessions (#2298) ──────────────────────────────────────────
+
+/**
+ * The interesting fields of a Linear `AgentSessionEvent` webhook payload.
+ *
+ * Linear's envelope for the agent platform (docs:
+ * https://linear.app/developers/agents) looks roughly like:
+ *
+ * ```json
+ * {
+ *   "type": "AgentSessionEvent",
+ *   "action": "created" | "prompted",
+ *   "agentSession": {
+ *     "id": "<session-id>",
+ *     "issue": { "identifier": "ENG-42", "title": "..." },
+ *     "comment": { "body": "@carrie draft this" }
+ *   },
+ *   "promptContext": "…pre-assembled, LLM-ready context…"   // sometimes top-level
+ * }
+ * ```
+ *
+ * Field placement has drifted across Linear's beta; we read defensively
+ * from a couple of candidate locations and fall back to a readable summary
+ * so the turn is never empty.
+ */
+export interface LinearAgentSession {
+  sessionId: string
+  /** "mention" (an @mention created the session) | "delegation" (an issue
+   *  was delegated/assigned to the agent). Derived from the event. */
+  trigger: 'mention' | 'delegation'
+  /** The Linear envelope action (created / prompted / …), lower-cased. */
+  action: string
+  /** Linear's pre-assembled prompt context, when present. */
+  promptContext?: string
+  /** A readable fallback summary built from issue / comment fields. */
+  summary: string
+}
+
+/**
+ * Parse a verified Linear `AgentSessionEvent` payload into the fields the
+ * inject path needs. Returns null when the payload is not an agent-session
+ * event (so the caller can fall through to ordinary webhook_dispatch).
+ *
+ * Pure — no fetch, no DB. The payload is attacker-influenced DATA; nothing
+ * here is treated as instructions (the rendered turn carries it verbatim,
+ * the same posture as renderLinearEvent).
+ */
+export function parseLinearAgentSession(
+  payload: Record<string, unknown>,
+): LinearAgentSession | null {
+  const type = String(payload.type ?? '').toLowerCase()
+  if (type !== 'agentsessionevent') return null
+
+  const action = String(payload.action ?? '').toLowerCase()
+  const session =
+    (payload.agentSession as Record<string, unknown> | undefined) ??
+    (payload.agent_session as Record<string, unknown> | undefined) ??
+    {}
+
+  const sessionId = String(
+    session.id ??
+      (payload.agentSessionId as string | undefined) ??
+      (payload.agent_session_id as string | undefined) ??
+      '',
+  )
+  if (!sessionId) return null
+
+  // Trigger derivation: a comment-driven session is a mention; an issue
+  // delegated/assigned with no comment is a delegation. Linear sometimes
+  // sets an explicit `trigger`; honour it when present.
+  const explicitTrigger = String(
+    session.trigger ?? (payload.trigger as string | undefined) ?? '',
+  ).toLowerCase()
+  const comment = session.comment as Record<string, unknown> | undefined
+  const trigger: 'mention' | 'delegation' =
+    explicitTrigger === 'mention' || explicitTrigger === 'delegation'
+      ? (explicitTrigger as 'mention' | 'delegation')
+      : comment
+        ? 'mention'
+        : 'delegation'
+
+  const promptContext =
+    typeof payload.promptContext === 'string'
+      ? payload.promptContext
+      : typeof session.promptContext === 'string'
+        ? (session.promptContext as string)
+        : undefined
+
+  // Readable fallback summary from issue + comment.
+  const issue = (session.issue as Record<string, unknown> | undefined) ?? {}
+  const issueId = String(issue.identifier ?? '')
+  const issueTitle = String(issue.title ?? '')
+  const commentBody =
+    typeof comment?.body === 'string' ? (comment.body as string) : ''
+  const summaryParts: string[] = []
+  summaryParts.push(
+    trigger === 'mention'
+      ? `You were @mentioned in Linear`
+      : `An issue was delegated to you in Linear`,
+  )
+  if (issueId || issueTitle) {
+    summaryParts.push(`Issue ${issueId}${issueTitle ? `: ${issueTitle}` : ''}`.trim())
+  }
+  if (commentBody) summaryParts.push(commentBody)
+  const summary = summaryParts.join('\n')
+
+  return { sessionId, trigger, action, promptContext, summary }
+}
+
+/**
+ * Synthesize an `InboundMessage` for a Linear AgentSessionEvent and deliver
+ * it to the agent's gateway as an `inject_inbound` envelope — the same path
+ * `injectWebhookInbound` uses, but tagged for the agent-session lifecycle:
+ *
+ *   - `meta.source = "linear"`
+ *   - `meta.agent_session_id` — the Linear session id (for the
+ *     `linear_agent_activity` MCP tool to emit AgentActivity against)
+ *   - `meta.linear_trigger` — "mention" | "delegation"
+ *   - `meta.linear_event` — a compact event type ("agent_session.<action>")
+ *
+ * The turn content is Linear's pre-assembled `promptContext` when present,
+ * else a readable summary. Mentions/delegations ALWAYS wake the agent (no
+ * dispatch-rule matcher) — that is the whole point of the agents platform.
+ *
+ * Fire-and-forget (host-runtime path). In viaGateway mode the gateway
+ * delivers in-process via the `inject` callback instead — see
+ * recordWebhookEvent.
+ */
+export function injectLinearInbound(
+  agent: string,
+  session: LinearAgentSession,
+  ctx: { chatId: string; threadId?: number },
+  deps: InjectWebhookInboundDeps = {},
+): void {
+  const log = deps.log ?? ((s) => process.stderr.write(s))
+  const resolveAgentDir =
+    deps.resolveAgentDir ?? ((a) => join(homedir(), '.switchroom', 'agents', a))
+  const now = (deps.now ?? Date.now)()
+  const socketPath = join(resolveAgentDir(agent), 'telegram', 'gateway.sock')
+
+  const inbound = buildLinearInbound(session, ctx, now)
+
+  const injectFn = deps.injectFn ?? defaultInject
+  injectFn(socketPath, agent, inbound)
+    .then((ok) =>
+      log(
+        `linear-agent: agent='${agent}' session='${session.sessionId}' inject_inbound ` +
+          `${ok ? 'delivered to gateway' : 'not delivered (gateway not connected)'}\n`,
+      ),
+    )
+    .catch((err: unknown) =>
+      log(`linear-agent: agent='${agent}' inject failed: ${String(err)}\n`),
+    )
+}
+
+/**
+ * Pure builder for the Linear AgentSession inbound. Shared by the
+ * host-runtime inject path (injectLinearInbound) and the in-process
+ * gateway path (recordWebhookEvent) so the wire shape is identical and
+ * testable without a socket.
+ */
+export function buildLinearInbound(
+  session: LinearAgentSession,
+  ctx: { chatId: string; threadId?: number },
+  now: number,
+): InboundMessageWire {
+  const content = session.promptContext && session.promptContext.trim().length > 0
+    ? session.promptContext
+    : session.summary
+  return {
+    type: 'inbound',
+    chatId: ctx.chatId,
+    ...(ctx.threadId !== undefined ? { threadId: ctx.threadId } : {}),
+    messageId: now,
+    user: 'linear',
+    userId: 0,
+    ts: now,
+    text: content,
+    meta: {
+      source: 'linear',
+      agent_session_id: session.sessionId,
+      linear_trigger: session.trigger,
+      linear_event: `agent_session.${session.action || 'event'}`,
+    },
+  }
+}
+
 // ─── Main dispatch evaluator ──────────────────────────────────────────────────
 
 export interface EvaluateDispatchArgs {
