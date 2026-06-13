@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.15.18 — 30-min approvals fold into "Allow" + `switchroom rollout` verb (#2333, #2334)
+
+### PR — feat(approvals): fold the 30-min window into the "Allow" tap (#2333)
+
+Refines the v0.15.13 scoped-approval tier per operator feedback: there is no
+longer a separate **⏱ 30 min** button. The 30-min window is now the DEFAULT
+behavior of **✅ Allow** for a narrow, non-destructive action — tap Allow on a
+re-edit of the same file (or a safe command-family) and it stops re-asking for
+30 minutes. Broad / MCP / destructive scopes stay truly once. The button is
+relabeled "✅ Allow" (from "Allow once"), and the post-tap card states the real
+outcome honestly: "won't ask again about edits to x.ts for 30 min" vs "Allowed
+once". All invariants from #2317 are preserved unchanged — gateway-side-only
+(no `rule` leaked to the bridge's untimed cache), irreversible commands re-card
+at grant AND match time, fixed window, dies on restart, fail-closed expiry,
+kill-switch `SWITCHROOM_SCOPED_APPROVAL_TTL_MS=0`.
+
+### PR — feat(cli): `switchroom rollout` — safe staggered fleet deploy (#2334)
+
+A new verb that encodes the correct staggered-rollout sequence as one command
+so it can't be fumbled: **apply** (regenerate compose, no bounce) → **canary-
+first staggered `agent restart --wait --force` with a per-agent `--version`
+assert, STOP on the first mismatch** → **refresh `switchroom-web` +
+`switchroom-hostd`** (separate compose projects that don't self-heal on a pin
+bump) → **version sweep**. It orchestrates the existing hardened subcommands —
+no new destructive primitive.
+
+- Closes the recurring footguns: apply-before-restart ordering, stale
+  singletons (self-heal on first restart, #2170), stale web/hostd, the
+  `:latest` pull-race (the per-agent version assert).
+- `test-harness` rolls first (automatic canary gate); stop-on-first-mismatch
+  never strands the fleet silently — it reports what rolled and how to resume
+  (idempotent re-run). web/hostd refresh failures are non-fatal.
+- `--dry-run` prints the plan; `--pin vX.Y.Z` sets the target (rejects a
+  sha-pin up front — not version-assertable); `--agents <list>` rolls a subset;
+  `--skip-web` skips the web/hostd refresh.
+
 ## v0.15.17 — cheap-cron Tier-1 auto-routing DEFAULT-ON (#2307)
 
 Now that the Tier-1 cheap cron session boots automatically (v0.15.16, canary
