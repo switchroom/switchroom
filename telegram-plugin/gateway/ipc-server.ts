@@ -262,7 +262,10 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (typeof m.agentName !== "string"
         || !AGENT_NAME_RE.test(m.agentName as string)) return false;
       if (typeof m.chatId !== "string" || (m.chatId as string).length === 0) return false;
-      if (typeof m.text !== "string" || (m.text as string).length === 0) return false;
+      // text non-empty and bounded — Telegram caps a message at 4096 chars;
+      // reject over-long here (defense in depth against a malformed payload).
+      if (typeof m.text !== "string" || (m.text as string).length === 0
+        || (m.text as string).length > 4096) return false;
       if (m.threadId !== undefined
         && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
       if (m.parseMode !== undefined && m.parseMode !== "html" && m.parseMode !== "text") return false;

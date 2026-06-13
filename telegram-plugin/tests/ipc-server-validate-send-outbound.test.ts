@@ -34,10 +34,12 @@ describe("validateClientMessage — send_outbound", () => {
     expect(validateClientMessage({ ...base, chatId: 123 })).toBe(false);
   });
 
-  it("rejects a missing / empty text", () => {
+  it("rejects a missing / empty / over-long text", () => {
     expect(validateClientMessage({ ...base, text: undefined })).toBe(false);
     expect(validateClientMessage({ ...base, text: "" })).toBe(false);
     expect(validateClientMessage({ ...base, text: 5 })).toBe(false);
+    expect(validateClientMessage({ ...base, text: "x".repeat(4096) })).toBe(true); // at the cap
+    expect(validateClientMessage({ ...base, text: "x".repeat(4097) })).toBe(false); // over Telegram's limit
   });
 
   it("rejects a non-integer threadId", () => {

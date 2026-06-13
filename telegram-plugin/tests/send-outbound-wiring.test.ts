@@ -29,7 +29,11 @@ describe("send_outbound — ipc-server routing", () => {
 describe("send_outbound — gateway handler invariants", () => {
   // Isolate the handler body for the assertions below.
   const start = gw.indexOf("onSendOutbound(_client: IpcClient, msg: SendOutboundMessage)");
-  const handler = gw.slice(start, start + 1600);
+  // Bound the slice at the START of the NEXT handler so the whole onSendOutbound
+  // body is covered regardless of how it grows (no fixed char window to outgrow),
+  // without bleeding into a sibling handler.
+  const next = gw.indexOf("onQuotaWallDetected(", start);
+  const handler = gw.slice(start, next > start ? next : start + 2600);
 
   it("the handler exists", () => {
     expect(start).toBeGreaterThan(0);
