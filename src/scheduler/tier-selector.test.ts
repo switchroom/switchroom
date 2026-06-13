@@ -8,9 +8,14 @@ import { describe, it, expect } from "vitest";
 import {
   recommendCronTier,
   resolveFrequentGapMin,
+  applyDefaultTier,
   DEFAULT_FREQUENT_GAP_MIN,
   type TierRecommendation,
+  type TierableEntry,
 } from "./tier-selector.js";
+
+/** Type the literal as TierableEntry so `.context` is visible after augmentation. */
+const tierable = (e: TierableEntry): TierableEntry => e;
 
 describe("recommendCronTier — explicit hints win (override the cadence default)", () => {
   it("kind: poll → Tier 0, regardless of cadence", () => {
@@ -117,5 +122,41 @@ describe("resolveFrequentGapMin", () => {
     expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "0" })).toBe(60);
     expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "-5" })).toBe(60);
     expect(resolveFrequentGapMin({ SWITCHROOM_CRON_FREQUENT_GAP_MIN: "nope" })).toBe(60);
+  });
+});
+
+describe("applyDefaultTier — cheap-by-default for hint-less frequent crons", () => {
+  it("a frequent hint-less cron gets context: fresh (→ cheap Tier-1)", () => {
+    expect(applyDefaultTier(tierable({ cron: "*/30 * * * *" })).context).toBe("fresh");
+    expect(applyDefaultTier(tierable({ cron: "0 * * * *" })).context).toBe("fresh"); // hourly
+  });
+
+  it("an infrequent hint-less cron is left untouched (stays full-session default)", () => {
+    // The regression that matters: a daily briefing must NOT be downgraded.
+    expect(applyDefaultTier(tierable({ cron: "0 8 * * *" })).context).toBeUndefined();
+    expect(applyDefaultTier(tierable({ cron: "0 18 * * 0" })).context).toBeUndefined(); // weekly
+  });
+
+  it("explicit hints are never overridden", () => {
+    // context: agent on a frequent cron — operator said full session, we obey.
+    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", context: "agent" })).context).toBe("agent");
+    // explicit model on a frequent cron — untouched (no context injected).
+    expect(applyDefaultTier(tierable({ cron: "*/5 * * * *", model: "opus" })).context).toBeUndefined();
+    // a poll is explicit — untouched.
+    const poll = applyDefaultTier(tierable({ cron: "*/5 * * * *", kind: "poll" }));
+    expect(poll.context).toBeUndefined();
+    expect(poll.kind).toBe("poll");
+  });
+
+  it("an unreadable cadence is treated as infrequent (conservative — never wrongly cheap)", () => {
+    expect(applyDefaultTier(tierable({ cron: "0-10 * * * *" })).context).toBeUndefined();
+    expect(applyDefaultTier(tierable({ cron: "garbage" })).context).toBeUndefined();
+  });
+
+  it("preserves all other fields", () => {
+    const out = applyDefaultTier(tierable({ cron: "*/30 * * * *", kind: "prompt" }));
+    expect(out.cron).toBe("*/30 * * * *");
+    expect(out.kind).toBe("prompt");
+    expect(out.context).toBe("fresh");
   });
 });

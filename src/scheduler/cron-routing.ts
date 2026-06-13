@@ -54,10 +54,20 @@ export function isKnownCheapModel(model: string | undefined): boolean {
   return model !== undefined && CHEAP_MODEL_RE.test(model);
 }
 
-/** Reads the kill-switch. The ONLY env read in this module; isolated so the core stays pure. */
+/**
+ * Reads the kill-switch. The ONLY env read in this module; isolated so the
+ * core stays pure.
+ *
+ * Cheap-cron is the DEFAULT (cheap-crons JTBD: scheduled work spends the
+ * model only when it adds value). `SWITCHROOM_CHEAP_CRON=0` (or false/off) is
+ * the emergency kill-switch that restores the pre-cheap behaviour (every fire
+ * a full Tier-2 turn). Anything else — including unset — is ON. Disabling can
+ * never silently drop a cron: a `kind: poll` entry just fires its escalation
+ * prompt as an ordinary turn.
+ */
 export function isCheapCronEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = (env.SWITCHROOM_CHEAP_CRON ?? "").toLowerCase();
-  return v === "1" || v === "true" || v === "on";
+  return !(v === "0" || v === "false" || v === "off");
 }
 
 /** Tier-1 cron-session model: honour an explicit cheap id, else default to sonnet. */

@@ -35,6 +35,7 @@
  */
 
 import { isKnownCheapModel, type CronTier } from "./cron-routing.js";
+import { estimateCronGapMin } from "./cron-cadence.js";
 
 export type TierSource = "explicit" | "cadence-default";
 
@@ -112,4 +113,43 @@ export function recommendCronTier(
       `fires every ~${input.smallestGapMin}min (> ${frequentGapMin}min) — defaulting to the agent's ` +
       `full session; set model: sonnet (or context: fresh) to run it cheaply`,
   };
+}
+
+/** The minimal shape `applyDefaultTier` reads + augments. */
+export interface TierableEntry {
+  cron: string;
+  kind?: "poll" | "prompt";
+  model?: string;
+  context?: "fresh" | "agent";
+}
+
+/**
+ * Fill in the cheap-by-default tier when the entry carries NO explicit hint.
+ *
+ * This is what makes cheap the *default* (the Defaults-principle fix): a
+ * frequent, hint-less cron is augmented with `context: "fresh"` so the
+ * router (`resolveCronRouting`) sends it to a cheap Tier-1 session instead
+ * of the agent's full session. Explicit entries (kind/model/context set) are
+ * returned untouched — the operator/agent's choice always wins. Infrequent
+ * crons (and any cadence we can't read confidently → estimateCronGapMin
+ * returns Infinity) keep the conservative full-session default, so we never
+ * strip context from work that may need it.
+ *
+ * Pure: cadence comes from the cron string via estimateCronGapMin; no I/O.
+ */
+export function applyDefaultTier<T extends TierableEntry>(
+  entry: T,
+  frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
+): T {
+  // Any explicit hint → leave it exactly as authored.
+  if (entry.kind === "poll" || entry.context !== undefined || entry.model !== undefined) {
+    return entry;
+  }
+  const rec = recommendCronTier(
+    { smallestGapMin: estimateCronGapMin(entry.cron) },
+    frequentGapMin,
+  );
+  // Only the cheap recommendation changes anything; "main" is already the
+  // router's default for a hint-less entry, so leave it untouched.
+  return rec.tier === "cheap" ? { ...entry, context: "fresh" } : entry;
 }

@@ -14,7 +14,8 @@ const CONFIG = {
 } as unknown as SwitchroomConfig;
 
 const ON = { SWITCHROOM_CHEAP_CRON: "1" } as NodeJS.ProcessEnv;
-const OFF = {} as NodeJS.ProcessEnv;
+// Cheap-cron is on by default now; OFF is the explicit kill-switch value.
+const OFF = { SWITCHROOM_CHEAP_CRON: "0" } as NodeJS.ProcessEnv;
 
 function capture(): InboundDispatcher & { calls: Array<{ agent: string; msg: InboundMessageWire }> } {
   const calls: Array<{ agent: string; msg: InboundMessageWire }> = [];

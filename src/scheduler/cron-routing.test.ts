@@ -130,15 +130,21 @@ describe("isKnownCheapModel", () => {
   });
 });
 
-describe("isCheapCronEnabled", () => {
+describe("isCheapCronEnabled — default ON; only 0/false/off disables (kill-switch)", () => {
   it.each([
     ["1", true],
     ["true", true],
     ["on", true],
     ["ON", true],
+    // unset / empty / anything else → ON (cheap-cron is the default).
+    ["", true],
+    [undefined, true],
+    ["anything", true],
+    // the kill-switch values.
     ["0", false],
-    ["", false],
-    [undefined, false],
+    ["false", false],
+    ["off", false],
+    ["OFF", false],
   ])("SWITCHROOM_CHEAP_CRON=%s → %s", (val, expected) => {
     expect(isCheapCronEnabled({ SWITCHROOM_CHEAP_CRON: val } as NodeJS.ProcessEnv)).toBe(expected);
   });
