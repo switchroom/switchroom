@@ -7670,24 +7670,43 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // topic and a late stream-reply can't be stolen by a successor turn. DM:
   // every tier undefined → unchanged. Kill switch off → legacy live-turn
   // injection only.
-  // Hoist the resolved origin turn so the obligation-close path (below) can
-  // pass it into resolveCloseTarget as routedOriginId (mirrors executeReply).
+  // The resolved origin turn is hoisted UNCONDITIONALLY (outside the
+  // message_thread_id==null guard below) so the obligation-close path has
+  // the correct routedOriginTurn even when the model explicitly passes
+  // message_thread_id (forum-topic streams). Without this hoist, Fix 1
+  // is a no-op for forum-topic streams — the origin is never resolved and
+  // closeObligationOnSubstantiveReply falls through to the live-turn
+  // fallback. Matches executeReply's unconditional resolution.
+  // Origin resolution is hoisted UNCONDITIONALLY (outside the
+  // message_thread_id==null guard below) so the obligation-close path has
+  // the correct routedOriginTurn even when the model explicitly passes
+  // message_thread_id (forum-topic streams). Without this hoist, Fix 1
+  // is a no-op for forum-topic streams — the origin is never resolved and
+  // closeObligationOnSubstantiveReply falls through to the live-turn
+  // fallback. Matches executeReply's unconditional resolution. Thread
+  // injection still stays scoped to the message_thread_id==null branch —
+  // only the obligation-close input changes.
   let streamRoutedOriginTurn: CurrentTurn | null = null
+  // Track whether the origin was found via echo (for the routing log below).
+  let streamOriginVia: 'echo' | 'quoted' | null = null
+  if (TURN_ORIGIN_ROUTING_ENABLED) {
+    // Origin precedence: model echo first, then the framework-owned quoted
+    // message_id as a deterministic fallback (mirrors executeReply).
+    const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
+    const quotedTurn =
+      echoedTurn == null ? findTurnByQuotedMessageId(String(args.chat_id), args.reply_to) : null
+    const originTurn = echoedTurn ?? quotedTurn
+    streamRoutedOriginTurn = originTurn ?? null
+    streamOriginVia = originTurn == null ? null : echoedTurn != null ? 'echo' : 'quoted'
+  }
   if (args.message_thread_id == null) {
     let injected: number | undefined
     if (TURN_ORIGIN_ROUTING_ENABLED) {
-      // Origin precedence: model echo first, then the framework-owned quoted
-      // message_id as a deterministic fallback (mirrors executeReply).
-      const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
-      const quotedTurn =
-        echoedTurn == null ? findTurnByQuotedMessageId(String(args.chat_id), args.reply_to) : null
-      const originTurn = echoedTurn ?? quotedTurn
-      streamRoutedOriginTurn = originTurn ?? null
       injected = resolveAnswerThreadWithLog(
         String(args.chat_id),
         undefined,
-        originTurn,
-        originTurn == null ? null : echoedTurn != null ? 'echo' : 'quoted',
+        streamRoutedOriginTurn,
+        streamOriginVia,
         turn,
         'stream_reply',
       )

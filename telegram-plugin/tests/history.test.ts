@@ -10,6 +10,7 @@ import {
   query,
   getRecentOutboundCount,
   getLatestInboundMessageId,
+  hasOutboundDeliveredSince,
   _resetForTests,
 } from '../history.js'
 
@@ -360,6 +361,88 @@ describe('getRecentOutboundCount (backstop dedup helper)', () => {
     recordOutbound({ chat_id: '-200', thread_id: null, message_ids: [11], texts: ['in chat -200'], ts: now })
     expect(getRecentOutboundCount('-100', 2)).toBe(1)
     expect(getRecentOutboundCount('-200', 2)).toBe(1)
+  })
+})
+
+// A substantive reply: 200+ chars (the FINAL_ANSWER_MIN_CHARS threshold).
+const SUBSTANTIVE = 'A'.repeat(200)
+// A non-substantive ack: short (<200 chars).
+const ACK = 'On it.'
+
+describe('hasOutboundDeliveredSince', () => {
+  beforeEach(() => initHistory(stateDir, 30))
+
+  it('returns true when a substantive outbound exists after openedAt', () => {
+    const openedAt = 1_000_000 * 1000 // ms
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [10],
+      texts: [SUBSTANTIVE],
+      ts: 1_000_001, // sec — 1s after openedAt
+    })
+    expect(hasOutboundDeliveredSince('-100', openedAt)).toBe(true)
+  })
+
+  it('returns false when the only outbound is BEFORE openedAt', () => {
+    const openedAt = 1_000_002 * 1000 // ms — after the message
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [10],
+      texts: [SUBSTANTIVE],
+      ts: 1_000_001, // sec — before openedAt
+    })
+    expect(hasOutboundDeliveredSince('-100', openedAt)).toBe(false)
+  })
+
+  it('returns false for a non-substantive ack after openedAt (blocker regression)', () => {
+    // An agent that sends a short ack ("on it") then ghosts must NOT have
+    // its escalation suppressed. The predicate must never match a bare ack.
+    const openedAt = 1_000_000 * 1000
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: null,
+      message_ids: [10],
+      texts: [ACK],          // < 200 chars — non-substantive
+      ts: 1_000_001,
+    })
+    expect(hasOutboundDeliveredSince('-100', openedAt)).toBe(false)
+  })
+
+  it('thread_id=undefined matches any thread (DM semantics)', () => {
+    const openedAt = 1_000_000 * 1000
+    recordOutbound({
+      chat_id: '-100',
+      thread_id: 5,
+      message_ids: [10],
+      texts: [SUBSTANTIVE],
+      ts: 1_000_001,
+    })
+    // No thread filter → should find it
+    expect(hasOutboundDeliveredSince('-100', openedAt, undefined)).toBe(true)
+  })
+
+  it('thread_id=number scopes to that thread only', () => {
+    const openedAt = 1_000_000 * 1000
+    recordOutbound({ chat_id: '-100', thread_id: 5, message_ids: [10], texts: [SUBSTANTIVE], ts: 1_000_001 })
+    expect(hasOutboundDeliveredSince('-100', openedAt, 5)).toBe(true)
+    expect(hasOutboundDeliveredSince('-100', openedAt, 6)).toBe(false)
+  })
+
+  it('thread_id=null matches only chat-root (non-thread) messages', () => {
+    const openedAt = 1_000_000 * 1000
+    recordOutbound({ chat_id: '-100', thread_id: null, message_ids: [10], texts: [SUBSTANTIVE], ts: 1_000_001 })
+    expect(hasOutboundDeliveredSince('-100', openedAt, null)).toBe(true)
+    // A thread-scoped message should NOT match the root filter
+    recordOutbound({ chat_id: '-100', thread_id: 3, message_ids: [11], texts: [SUBSTANTIVE], ts: 1_000_002 })
+    expect(hasOutboundDeliveredSince('-100', openedAt, null)).toBe(true) // root still there
+    expect(hasOutboundDeliveredSince('-100', openedAt, 3)).toBe(true)    // thread 3 also there
+    expect(hasOutboundDeliveredSince('-100', openedAt, 9)).toBe(false)   // thread 9 not there
+  })
+
+  it('returns false when no history is present for the chat', () => {
+    expect(hasOutboundDeliveredSince('-999', 0)).toBe(false)
   })
 })
 

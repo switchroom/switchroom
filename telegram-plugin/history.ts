@@ -547,12 +547,21 @@ export function getRecentOutboundCount(
 }
 
 /**
- * Returns true if at least one outbound (bot → user, role='assistant') message
- * was delivered to `chatId` (and optionally `threadId`) AFTER `sinceMs` (wall-
- * clock epoch milliseconds). Used by the obligation sweep to suppress a false
- * "I may have missed this" escalation when the agent visibly answered: if an
- * outbound landed since the obligation was opened, the obligation is stale —
- * close it silently rather than alarming the user.
+ * Returns true if at least one SUBSTANTIVE outbound (bot → user, role='assistant')
+ * message was delivered to `chatId` (and optionally `threadId`) AFTER `sinceMs`
+ * (wall-clock epoch milliseconds). Used by the obligation sweep to suppress a false
+ * "I may have missed this" escalation when the agent visibly answered: if a
+ * substantive outbound landed since the obligation was opened, the obligation is
+ * stale — close it silently rather than alarming the user.
+ *
+ * SUBSTANTIVE: we never suppress escalation on a bare ack ("on it", "give me a
+ * sec") — an agent that acks then ghosts must still escalate. The history schema
+ * does not store a done/substantive flag, so we approximate: a row counts only
+ * when LENGTH(text) >= 200 (the FINAL_ANSWER_MIN_CHARS constant from
+ * final-answer-detect.ts). This is false-negative-safe: a genuine substantive
+ * answer that happens to be < 200 chars will still fire an escalation, which is
+ * the conservative (safe) outcome. A schema column would be more precise but is
+ * disproportionate for this predicate; the reviewer accepted this approach.
  *
  * `threadId` semantics:
  *   - undefined → any message in the chat regardless of thread (DMs + supergroups)
@@ -570,8 +579,12 @@ export function hasOutboundDeliveredSince(
   try {
     const cutoffSec = Math.floor(sinceMs / 1000)
     const params: unknown[] = [chatId, cutoffSec]
+    // LENGTH(text) >= 200 scopes to substantive replies only — never suppress
+    // escalation on a mere ack. Mirrors FINAL_ANSWER_MIN_CHARS (200) from
+    // final-answer-detect.ts; the `done` flag is not stored in the history
+    // schema, so length is the closest available proxy.
     let sql =
-      "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ?"
+      "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ? AND LENGTH(text) >= 200"
     if (threadId !== undefined) {
       if (threadId === null) {
         sql += ' AND thread_id IS NULL'
