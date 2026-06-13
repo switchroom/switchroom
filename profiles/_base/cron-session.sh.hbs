@@ -17,15 +17,19 @@
 set -u
 
 # Runtime kill-switch. The fork is baked into start.sh whenever {{name}} has a
-# context:fresh cron entry (a config property), but the session only actually
-# runs when SWITCHROOM_CHEAP_CRON is on at runtime. Exit 78 (EX_CONFIG) so the
-# supervisor does NOT respawn-loop when the feature is off — a clean idle.
+# cron entry the value-gate routes to a cheap session, but the session only
+# actually runs when cheap-cron is enabled at runtime. Cheap-cron is ON by
+# DEFAULT (matches isCheapCronEnabled in src/scheduler/cron-routing.ts — only
+# SWITCHROOM_CHEAP_CRON=0/false/off disables it); the old "off unless =1" gate
+# here meant the cron session quarantined itself even with cheap-by-default on,
+# so every Tier-1 fire fell back to the main session and saved nothing. Exit 78
+# (EX_CONFIG) on the explicit kill-switch so the supervisor cleanly idles.
 case "${SWITCHROOM_CHEAP_CRON:-}" in
-  1 | true | on | ON) : ;;
-  *)
-    echo "cron-session: SWITCHROOM_CHEAP_CRON off — not starting (exit 78, no respawn)" >&2
+  0 | false | off | OFF | False | FALSE)
+    echo "cron-session: SWITCHROOM_CHEAP_CRON disabled (=0) — not starting (exit 78, no respawn)" >&2
     exit 78
     ;;
+  *) : ;;
 esac
 
 CRON_NAME="{{name}}-cron"

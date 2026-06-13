@@ -88,9 +88,20 @@ describe("cron-session.sh launcher — compliance + identity", () => {
     expect(out).toContain('[ -f "$CRON_MCP_CONFIG" ] ||');
   });
 
-  it("self-gates on the runtime flag (exit 78, no respawn, when off)", () => {
+  it("self-gates on the runtime flag (exit 78, no respawn, only when explicitly disabled)", () => {
     expect(out).toContain("SWITCHROOM_CHEAP_CRON");
     expect(out).toContain("exit 78");
+    // Cheap-cron is ON by default (mirrors isCheapCronEnabled): the gate must
+    // exit only on the explicit kill-switch values, NOT default-off. The old
+    // `1 | true | on) :;; *) exit 78` quarantined the session even with
+    // cheap-by-default on, so every Tier-1 fire fell back to main and saved
+    // nothing. Assert the disable-values arm and that the wildcard arm runs
+    // (does not exit).
+    expect(out).toMatch(/0 \| false \| off/i);
+    // The non-disabled default arm is a no-op (`*) :`) — the session starts.
+    expect(out).toMatch(/\*\)\s*:\s*;;/);
+    // Guard against regressing to the old default-off gate.
+    expect(out).not.toMatch(/1 \| true \| on \| ON\) : ;;/);
   });
 
   it("shares the broker OAuth creds via symlink (same subscription)", () => {
