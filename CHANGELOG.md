@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.15.11 — make `latest` safe: tool-aware cron routing + claude CLI 2.1.177
+
+Housekeeping release so the published `latest` is safe to roll. v0.15.9/v0.15.10
+enforced cadence-based cheap-cron routing WITHOUT the tool-aware de-risk — they
+should not be pinned fleet-wide. This supersedes them.
+
+- **Tool-aware cron routing** (#2305): cadence is advisory; Tier-1 (cheap
+  cron session) is OPT-IN via explicit `model: sonnet` / `context: fresh`.
+  `applyDefaultTier` no longer forces a hint-less cron into the cheap session
+  (which is context/tool-minimal and could starve a tool-using cron). The
+  graceful main-session fallback (#2301) still guarantees a cron is never
+  dropped by tier routing. Full Tier-1 hardening tracked in #2307.
+- **Bundled claude CLI 2.1.170 → 2.1.177** (#2306).
+
+Includes the v0.15.8–v0.15.10 cron work: schedule hot-reload (#2293), agent
+tier options (#2294), the cheap-crons JTBD (#2296), value-gate selector
+(#2297), graceful Tier-1 fallback + reconcile classify (#2301), cron-session
+shell gate default-on (#2304).
+
 ## v0.15.10 — cheap-by-default made robust (graceful Tier-1 fallback)
 
 Re-rolls the cheap-crons default (v0.15.9, #2299) with the fix for the blocker
