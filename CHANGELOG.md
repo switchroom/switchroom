@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.15.16 — Tier-1 cron-session auto-boot (#2307 canary follow-up 2)
+
+The v0.15.15 canary proved the Tier-1 cron session works end-to-end once its
+boot prompts are dismissed, but it didn't boot *automatically*. This fixes the
+last two wedges so the `<agent>-cron` bridge registers with no manual step.
+
+- **#2329** — (1) `seedCronConfigDir` now copies the agent's fully-onboarded
+  main `.claude/.claude.json` into `.claude-cron` (the minimal seed lacked
+  `oauthAccount`/theme → login/theme wedge); (2) `cron-session.sh` forks a
+  boot-phase `autoaccept-poll` for the cron socket so the per-boot
+  `--dangerously-load-development-channels` ack is dismissed (the main
+  autoaccept watches only `switchroom-<name>`).
+
+Still inert for the fleet by default (cron session / `kind: action` /
+`SWITCHROOM_CRON_AUTO_TIER` are all opt-in).
+
 ## v0.15.15 — Tier-1 cron-session boot fix (#2307 canary follow-up)
 
 A canary follow-up to v0.15.14. The v0.15.14 test-harness canary proved Tier-0
