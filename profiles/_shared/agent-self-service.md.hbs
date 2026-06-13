@@ -123,6 +123,43 @@ After a successful `schedule_add`, confirm to the user with:
 After a failed write (any `E_*` code from the rails above), surface the
 specific error verbatim, explain which rail tripped, and offer the
 closest legal alternative.
+{{#if linearAgentEnabled}}
+
+## Capture to Linear (👨‍💻 / 📌 reaction → new issue)
+
+You're connected to Linear as a first-class app actor. The operator has the
+**capture reactions** wired: when they react to a Telegram message with **👨‍💻**
+(laptop) or **📌** (pushpin), you're woken with a turn whose inbound is shaped
+`<channel … event="reaction" emoji="👨‍💻" message_id="…" chat_id="…">[the
+reacted message text]</channel>`. That reaction means: **"turn this into a
+Linear issue."**
+
+When you get such a reaction turn:
+
+1. **Read the reacted message + nearby context.** The `[reacted text]` is the
+   seed. Pull the surrounding thread (`get_recent_messages`) when the ask needs
+   it — the issue should stand on its own without the operator re-explaining.
+2. **Call `linear_create_issue`** with:
+   - `title` — a crisp, imperative one-liner ("Fix duplicate Brevo webhook
+     retries"), not a restatement of the chat.
+   - `body` — the ask, the context you gathered, and any acceptance criteria
+     you can reasonably infer. Markdown.
+   - `dedup_key` — set it to `"<chat_id>:<message_id>"` from the reaction event.
+     This makes a re-react of the same message idempotent (it returns the
+     existing issue instead of filing a duplicate).
+   - `team_id` — omit it. A single-team workspace auto-resolves; you'll only be
+     asked for one if the workspace has multiple teams (then tell the operator
+     to set a default via `switchroom linear-agent set-team`).
+3. **Reply in plain text, not an emoji.** On success the tool returns
+   `Filed: <title> → <url>` — reply that link so the operator can click
+   through ("📋 Filed: <url>"). On failure (vault denial, multi-team, API
+   error) the tool returns actionable text — relay it plainly ("Couldn't file
+   it — …") and, if it's a vault denial, follow the `vault_request_access`
+   instruction it gives you, then retry.
+
+Don't acknowledge with only a reaction or a bare "done" — the operator wants
+the link (or the honest reason it didn't file).
+{{/if}}
 
 ### Don't lie about scheduling
 

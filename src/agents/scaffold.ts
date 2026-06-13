@@ -1497,6 +1497,15 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.clear_status_on_completion !== undefined) {
     out.SWITCHROOM_TG_CLEAR_STATUS_ON_COMPLETION = tg.clear_status_on_completion ? "1" : "0";
   }
+  // Linear capture default team (#2312) — only needed for multi-team
+  // workspaces, where the create tool can't auto-resolve. Single-team
+  // workspaces leave this unset and the tool resolves the only team.
+  const linearDefaultTeam = (
+    tg as { linear_agent?: { default_team_id?: string } } | undefined
+  )?.linear_agent?.default_team_id;
+  if (linearDefaultTeam) {
+    out.SWITCHROOM_LINEAR_DEFAULT_TEAM_ID = linearDefaultTeam;
+  }
   return out;
 }
 
@@ -2238,6 +2247,19 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // "true"/"false" string. Default true preserves prior behavior.
     telegramEnabledFlag:
       agentConfig.channels?.telegram?.enabled === false ? "false" : "true",
+    // `{{#if linearAgentEnabled}}` in the agent-self-service fragment keys
+    // off this to render the capture-on-reaction → Linear playbook (#2312).
+    // Set HERE in the shared builder (not at the two render sites) precisely
+    // to avoid the klanker hazard: both scaffoldAgent's `context` and
+    // reconcileAgent's `claudeContext` derive from buildWorkspaceContext, so
+    // the flag resolves identically on both paths — a diverging value would
+    // diff-abort every reconcile.
+    linearAgentEnabled:
+      (
+        agentConfig.channels?.telegram as
+          | { linear_agent?: { enabled?: boolean } }
+          | undefined
+      )?.linear_agent?.enabled === true,
     // sec WS8-F1 / #1416: unconditional read-only image-baked
     // security-hooks plugin dir. Always set — it is the unstrippable
     // tool-safety authority, not an opt-in feature.
@@ -4968,6 +4990,18 @@ export function reconcileAgent(
         // capability block ({{#if root}} in CLAUDE.md.hbs).
         admin: agentConfig.admin === true || agentConfig.root === true,
         root: agentConfig.root === true,
+        // {{#if linearAgentEnabled}} in the agent-self-service fragment.
+        // KLANKER HAZARD: this reconcile-path claudeContext is a hand-curated
+        // subset, NOT buildWorkspaceContext — so this flag MUST mirror the
+        // value buildWorkspaceContext sets (scaffold.ts ~2240) byte-for-byte,
+        // or the self-service fragment renders differently on apply vs
+        // first-scaffold and the diff-abort below trips on every reconcile.
+        linearAgentEnabled:
+          (
+            agentConfig.channels?.telegram as
+              | { linear_agent?: { enabled?: boolean } }
+              | undefined
+          )?.linear_agent?.enabled === true,
       };
 
       // Render template, then append the switchroom-managed

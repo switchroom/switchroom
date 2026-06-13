@@ -109,6 +109,28 @@ describe('createLinearIssue — behaviour (#2312)', () => {
     expect(calls[0].variables.input).toMatchObject({ teamId: 'team_explicit' })
   })
 
+  it('uses deps.defaultTeamId when no team_id is passed (multi-team default)', async () => {
+    const { fetchImpl, calls } = routingFetch({ issueCreate: issueOk })
+    const r = await createLinearIssue(
+      { title: 'X', body: 'Y' },
+      { resolveToken: okToken('t'), fetchImpl, defaultTeamId: 'team_default', log: () => {} },
+    )
+    expect(r.content[0].text).toMatch(/Filed:/)
+    // default team skips the teams() resolution entirely.
+    expect(calls).toHaveLength(1)
+    expect(calls[0].query).toMatch(/issueCreate/)
+    expect(calls[0].variables.input).toMatchObject({ teamId: 'team_default' })
+  })
+
+  it('explicit team_id overrides deps.defaultTeamId', async () => {
+    const { fetchImpl, calls } = routingFetch({ issueCreate: issueOk })
+    await createLinearIssue(
+      { title: 'X', body: 'Y', team_id: 'team_explicit' },
+      { resolveToken: okToken('t'), fetchImpl, defaultTeamId: 'team_default', log: () => {} },
+    )
+    expect(calls[0].variables.input).toMatchObject({ teamId: 'team_explicit' })
+  })
+
   it('passes priority through when provided', async () => {
     const { fetchImpl, calls } = routingFetch({ issueCreate: issueOk })
     await createLinearIssue(

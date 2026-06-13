@@ -37,6 +37,35 @@ export function setLinearAgent(
 }
 
 /**
+ * Set `default_team_id` on an agent's existing `linear_agent` block (#2312).
+ *
+ * Only needed for multi-team Linear workspaces — single-team workspaces
+ * auto-resolve. Requires the `linear_agent` block to already exist (run
+ * `linear-agent setup` first); throws otherwise so we never silently create
+ * a half-configured block. Pass `teamId: null` to clear it.
+ */
+export function setLinearDefaultTeam(
+  yamlText: string,
+  agentName: string,
+  teamId: string | null,
+): string {
+  const doc = parseDocument(yamlText);
+  ensureAgent(doc, agentName);
+  if (!doc.hasIn(["agents", agentName, "channels", "telegram", "linear_agent"])) {
+    throw new Error(
+      `agent '${agentName}' has no linear_agent block. Run 'switchroom linear-agent setup --agent ${agentName} --token <token>' first.`,
+    );
+  }
+  const path = ["agents", agentName, "channels", "telegram", "linear_agent", "default_team_id"];
+  if (teamId === null) {
+    if (doc.hasIn(path)) doc.deleteIn(path);
+  } else {
+    doc.setIn(path, teamId);
+  }
+  return String(doc);
+}
+
+/**
  * Set a feature payload under `agents.<agentName>.channels.telegram.<feature>`.
  * Creates intermediate maps if absent. Returns the new YAML string.
  *

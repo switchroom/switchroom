@@ -33,6 +33,9 @@ export interface LinearActivityDeps {
   fetchImpl?: typeof fetch
   /** Agent slug (defaults to SWITCHROOM_AGENT_NAME). */
   agent?: string
+  /** Default Linear team id for captured issues (multi-team workspaces);
+   *  defaults to SWITCHROOM_LINEAR_DEFAULT_TEAM_ID. Tests inject directly. */
+  defaultTeamId?: string
   /** Log sink — stderr in production. */
   log?: (line: string) => void
 }
@@ -190,7 +193,13 @@ export async function createLinearIssue(
   const title = args.title as string | undefined
   if (!title || title.trim() === '') throw new Error('linear_create_issue: title is required')
   const body = (args.body as string | undefined) ?? ''
-  const teamIdArg = (args.team_id as string | undefined) ?? undefined
+  // Explicit team_id wins; otherwise the operator's configured default team
+  // (scaffold injects SWITCHROOM_LINEAR_DEFAULT_TEAM_ID for multi-team
+  // workspaces); otherwise we auto-resolve below (zero-config single team).
+  const teamIdArg =
+    (args.team_id as string | undefined) ??
+    (deps.defaultTeamId ?? process.env.SWITCHROOM_LINEAR_DEFAULT_TEAM_ID) ??
+    undefined
   const dedupKey = (args.dedup_key as string | undefined) ?? undefined
   const priority = typeof args.priority === 'number' ? (args.priority as number) : undefined
 

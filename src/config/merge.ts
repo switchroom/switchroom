@@ -684,6 +684,38 @@ export function mergeAgentConfig(
       combined;
   }
 
+  // --- linear capture default: 👨‍💻 / 📌 → file a Linear issue (#2312) ---
+  //
+  // When an agent has `channels.telegram.linear_agent.enabled: true` and has
+  // NOT configured a `reaction_dispatch` emoji allowlist, default the capture
+  // emojis ON so the reaction → linear_create_issue flow works out of the box
+  // (Defaults test — zero config). This runs AFTER the reaction_dispatch
+  // cascade above so an explicit per-agent allowlist (including `emojis: []`
+  // to opt out) always wins — we only fill the hole when `emojis` is still
+  // unset. Touching only the (top-level) `reaction_dispatch.emojis`; the
+  // playbook block (gated on `linearAgentEnabled`) tells the agent what the
+  // capture emojis mean.
+  const linearEnabled =
+    (
+      merged.channels?.telegram as
+        | { linear_agent?: { enabled?: boolean } }
+        | undefined
+    )?.linear_agent?.enabled === true;
+  if (linearEnabled) {
+    const rd = (
+      merged as {
+        reaction_dispatch?: { enabled?: boolean; emojis?: unknown };
+      }
+    ).reaction_dispatch;
+    if (!rd || rd.emojis === undefined) {
+      (merged as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch =
+        {
+          enabled: rd?.enabled ?? true,
+          emojis: ["👨‍💻", "📌"],
+        };
+    }
+  }
+
   // --- resources: shallow per-key merge, agent wins ---
   //
   // Same shape as `experimental` below — operators may set a subset of
