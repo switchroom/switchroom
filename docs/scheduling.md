@@ -231,9 +231,35 @@ Because each fire is a full turn in the live session by default, a frequent cron
 | The fire to act *as the agent* (persona, memory, recent chat) | default (no `model`) — **Tier 2** | full live-session turn |
 | Light, self-contained work (summarise/format) — no memory needed | `model: sonnet` / `context: fresh` — **Tier 1** | a fresh minimal-context cheap session |
 | "Only do something when X changes" (a webpage/API) | `kind: poll` (operator-set; egress-gated) — **Tier 0** | model-free check; a model fire only on a *hit* |
+| "Do this exact mechanical thing on a schedule" (post a fixed message, ping a webhook) | `kind: action` (operator-set) — **Tier 0** | model-free; the action *completes* the work — **no model at all** |
 | "Do something when a message is reacted to" | **`reaction_dispatch`** (event-driven, #2291) — not a cron at all | zero polling; the reaction wakes the agent |
 
-Agents can self-author the `model`/`context` hints (no security gate). `kind: poll` and `reaction_dispatch` need an operator config commit (egress / identity gates), so an agent should *request* them. With the flag off, all hints are inert — every fire is a normal Tier-2 turn (a `kind: poll` entry fires its escalation prompt directly); disabling cheap-cron can never silently drop a cron.
+Agents can self-author the `model`/`context` hints (no security gate). `kind: poll`, `kind: action`, and `reaction_dispatch` need an operator config commit (egress / identity gates), so an agent should *request* them. With the flag off, all hints are inert — every fire is a normal Tier-2 turn (a `kind: poll` entry fires its escalation prompt directly); disabling cheap-cron can never silently drop a cron. **A `kind: action` is the exception: it is model-free regardless of the flag** — the kill-switch governs model tiering, and an action has no model fire to fall back to.
+
+#### `kind: action` — model-free mechanical verbs (#2307)
+
+An action *replaces* a model turn with a deterministic verb. Two types (operator-config only — an agent cannot self-author one):
+
+```yaml
+schedule:
+  # Post a fixed message into the agent's own chat every morning. No model.
+  - cron: "0 8 * * *"
+    kind: action
+    action:
+      type: telegram-message
+      text: "Morning — heartbeat {{date}} ✅"   # {{date}}/{{time}}/{{agent}} only; NO secrets
+  # Ping a status webhook hourly. Same egress fence as a poll.
+  - cron: "0 * * * *"
+    kind: action
+    action:
+      type: webhook
+      url: "https://hooks.example.com/heartbeat"   # host must be in cron.egress.allowed_hosts
+      method: POST
+      secrets: ["status_token"]                     # host-pinned via cron.egress.secret_bindings
+      headers: { authorization: "Bearer {{status_token}}" }
+```
+
+`telegram-message` posts only to the agent's **own** chat (no `chat_id` field — fenced by construction) and substitutes only the deterministic `{{date}}`/`{{time}}`/`{{agent}}` placeholders — **no vault secrets in a message body, no model output**. `webhook` reuses the poll egress allowlist + host-pinned secret bindings. Anything that needs the model to *write* something (a summary, a Linear issue body) is not an action — use `kind: poll` + an escalation prompt, or `reaction_dispatch`.
 
 ## Managing the scheduler
 
