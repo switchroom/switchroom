@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.15.15 — Tier-1 cron-session boot fix (#2307 canary follow-up)
+
+A canary follow-up to v0.15.14. The v0.15.14 test-harness canary proved Tier-0
+model-free actions and Tier-1 cadence auto-routing both work end-to-end, and
+caught one pre-existing bug that only became reachable once the cron session was
+un-starved + trust-seeded.
+
+- **#2327** — launch the Tier-1 cron session **detached**. `cron-session.sh` ran
+  `tmux new-session -A` (attach), but the cron session is a supervised
+  background sidecar with no controlling TTY (the main session owns it), so
+  attach died `open terminal failed: not a terminal` and the `<agent>-cron`
+  bridge never registered (every Tier-1 fire then fell back to main —
+  gracefully, but the saving was never realised). Now uses `new-session -d` +
+  a `tmux has-session` supervise-block. With this, the cron bridge registers and
+  a frequent cron actually runs in the cheap session.
+
+Still inert for the fleet by default (no cron session / `kind: action` /
+`SWITCHROOM_CRON_AUTO_TIER` until opt-in).
+
 ## v0.15.14 — cheap-cron Tier-0 action tier + Tier-1 un-starve (#2307)
 
 Completes #2307 — making scheduled work spend the model only when it earns it.
