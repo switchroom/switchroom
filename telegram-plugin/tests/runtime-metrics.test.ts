@@ -82,6 +82,15 @@ describe('runtime-metrics — JSONL sink', () => {
     expect(parsed.ended_via).toBe('reply')
   })
 
+  it('cron_fell_back_to_main carries agent + prompt_key (#2307 Tier-1)', () => {
+    emitRuntimeMetric({ kind: 'cron_fell_back_to_main', agent: 'clerk', prompt_key: 'abc123' })
+    const parsed = JSON.parse(readFileSync(metricsPath, 'utf-8').trim())
+    expect(parsed.kind).toBe('cron_fell_back_to_main')
+    expect(parsed.agent).toBe('clerk')
+    expect(parsed.prompt_key).toBe('abc123')
+    expect(typeof parsed.ts).toBe('number')
+  })
+
   it('appends — does not overwrite — across calls', () => {
     for (let i = 0; i < 5; i++) {
       emitRuntimeMetric({

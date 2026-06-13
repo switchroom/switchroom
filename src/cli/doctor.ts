@@ -35,6 +35,7 @@ import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
 import { runHostdChecks } from "./doctor-hostd.js";
 import { runDriveChecks, runDriveBrokerReachabilityChecks } from "./doctor-drive.js";
 import { runWebkiteChecks } from "./doctor-webkite.js";
+import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
@@ -2774,6 +2775,10 @@ export function registerDoctorCommand(program: Command): void {
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
           { title: "Webkite", results: runWebkiteChecks(config) },
+          // #2307 Tier-1: cron-session bridge liveness. Empty (no results) for
+          // the fleet today — only agents the value-gate routes to a cron
+          // session produce a line.
+          { title: "Cron Session", results: runCronSessionChecks(config) },
         ];
 
         // Repo Hygiene (#1072): only when doctor runs from a switchroom

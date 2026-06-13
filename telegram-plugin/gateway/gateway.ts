@@ -6547,6 +6547,10 @@ const ipcServer: IpcServer = createIpcServer({
       process.stderr.write(
         `telegram gateway: cron fire fell back to main session (no cron bridge) agent=${msg.agentName} prompt_key=${promptKey}\n`,
       )
+      // #2307 Tier-1 observability: a climbing counter means the cron session is
+      // down (registered then died, or never came up) — the Tier-1 saving is
+      // lost for this fire. Surfaced via the unified runtime-metrics fan-out.
+      emitRuntimeMetric({ kind: 'cron_fell_back_to_main', agent: msg.agentName, prompt_key: promptKey })
     }
     // Status-silent (§2.4): a cron fire delivered to the CRON session must NOT
     // set the MAIN agent's currentTurn. But a fire that LANDED on the main
