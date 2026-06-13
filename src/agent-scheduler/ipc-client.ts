@@ -21,7 +21,7 @@
  */
 
 import { createConnection, type Socket } from "node:net";
-import type { InjectInboundMessage } from "../../telegram-plugin/gateway/ipc-protocol.js";
+import type { InjectInboundMessage, SendOutboundMessage } from "../../telegram-plugin/gateway/ipc-protocol.js";
 
 export interface InjectIpcClientOptions {
   socketPath: string;
@@ -52,6 +52,13 @@ export interface InjectIpcClient {
    * or the write fails.
    */
   sendInjectInbound(msg: InjectInboundMessage): boolean;
+  /**
+   * #2307 Tier-0 action tier — send a MODEL-FREE `send_outbound` envelope
+   * (a `kind: action` telegram-message). Same fire-and-forget delivery
+   * semantics as `sendInjectInbound`: true iff the bytes were accepted by
+   * the local socket. The gateway fences the chat to the agent's own.
+   */
+  sendOutbound(msg: SendOutboundMessage): boolean;
   isConnected(): boolean;
   /**
    * Resolve to true once the client is connected, false on timeout.
@@ -157,6 +164,15 @@ export function createInjectIpcClient(
 
   return {
     sendInjectInbound(msg: InjectInboundMessage): boolean {
+      if (!socket || !connected) return false;
+      try {
+        return socket.write(JSON.stringify(msg) + "\n");
+      } catch (err) {
+        log(`scheduler ipc: write failed: ${(err as Error).message}`);
+        return false;
+      }
+    },
+    sendOutbound(msg: SendOutboundMessage): boolean {
       if (!socket || !connected) return false;
       try {
         return socket.write(JSON.stringify(msg) + "\n");
