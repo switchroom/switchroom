@@ -58,6 +58,17 @@ export function normalizeVersion(v: string): string {
 }
 
 /**
+ * True only when `target` is a concrete semver (optionally `v`-prefixed) we
+ * can assert against the in-container `switchroom --version`. A `sha-<hex>`
+ * pin is a VALID release.pin but is NOT version-assertable — the CLI always
+ * prints the semver, so a sha target would "mismatch" on agent #1 and stop
+ * the roll with a confusing message. Reject it up front instead.
+ */
+export function isVersionAssertable(target: string): boolean {
+  return /^v?\d+\.\d+\.\d+$/.test(target.trim());
+}
+
+/**
  * Order agents canary-first: `test-harness` (the sanctioned canary) goes
  * first if present, so a bad build fails on it before touching the rest
  * (stop-on-first-mismatch turns this into an automatic canary gate).
@@ -242,6 +253,15 @@ export function registerRolloutCommand(program: Command): void {
           "rollout needs a pinned version: pass --pin vX.Y.Z, or set " +
             "`release.pin` in switchroom.yaml. (A floating channel has no " +
             "fixed version to assert against.)\n",
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (!isVersionAssertable(target)) {
+        process.stderr.write(
+          `rollout asserts the in-container \`switchroom --version\` (always a ` +
+            `semver), so the target must be a tagged release like v0.15.18 — ` +
+            `\`${target}\` isn't version-assertable. Pass --pin vX.Y.Z.\n`,
         );
         process.exitCode = 2;
         return;

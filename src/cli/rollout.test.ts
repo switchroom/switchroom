@@ -11,6 +11,7 @@
 import { describe, it, expect } from "vitest";
 import {
   normalizeVersion,
+  isVersionAssertable,
   orderAgentsCanaryFirst,
   planRollout,
   formatRolloutPlan,
@@ -24,6 +25,19 @@ describe("normalizeVersion", () => {
     expect(normalizeVersion("v0.15.18")).toBe("0.15.18");
     expect(normalizeVersion(" 0.15.18 ")).toBe("0.15.18");
     expect(normalizeVersion("v0.15.18")).toBe(normalizeVersion("0.15.18"));
+  });
+});
+
+describe("isVersionAssertable", () => {
+  it("accepts a semver tag with or without the v prefix", () => {
+    expect(isVersionAssertable("v0.15.18")).toBe(true);
+    expect(isVersionAssertable("0.15.18")).toBe(true);
+    expect(isVersionAssertable(" v0.15.18 ")).toBe(true);
+  });
+  it("rejects a sha-pin (valid release.pin, but not version-assertable)", () => {
+    expect(isVersionAssertable("sha-18e9d152")).toBe(false);
+    expect(isVersionAssertable("latest")).toBe(false);
+    expect(isVersionAssertable("v0.15")).toBe(false);
   });
 });
 
