@@ -54,6 +54,17 @@ const dispatchCallsites = LINES.flatMap((line, i) =>
     : [],
 )
 
+// A SILENT auto-allow path (the "⏱ 30 min" scoped-approval short-circuit in
+// onPermissionRequest) posts NO card: the turn was never parked on 🙏, so it
+// must NOT call resumeReactionAfterVerdict() / postPermissionResumeMessage()
+// — doing so on every auto-allowed call is the exact noise that tier removes.
+// Such callsites carry the `no-card-verdict` sentinel within the 3 lines above
+// the dispatch and are exempt from the resume/post pairing. The invariant the
+// guard protects (a verdict that un-parks a CARD must visibly resume it) still
+// holds for every card-bearing path.
+const isSilentNoCardVerdict = (idx: number): boolean =>
+  LINES.slice(Math.max(0, idx - 3), idx + 1).some((l) => /no-card-verdict/.test(l))
+
 // How far below the dispatch the resume call is allowed to live. The
 // widest real gap today is ~9 lines (the slash-command path); 15 gives
 // refactor headroom without letting an unrelated resume "cover" a
@@ -68,6 +79,7 @@ describe('permission verdict → resume reaction wiring', () => {
   it('every dispatchPermissionVerdict() callsite flips the awaiting glyph back via resumeReactionAfterVerdict()', () => {
     const unpaired: number[] = []
     for (const idx of dispatchCallsites) {
+      if (isSilentNoCardVerdict(idx)) continue
       const window = LINES.slice(idx, idx + RESUME_WINDOW + 1).join('\n')
       if (!/\bresumeReactionAfterVerdict\s*\(\s*\)/.test(window)) {
         // 1-based line number for a human-readable failure.
@@ -98,6 +110,7 @@ describe('permission verdict → resume reaction wiring', () => {
   it('every dispatchPermissionVerdict() callsite posts the agent-voiced resume message via postPermissionResumeMessage()', () => {
     const unpaired: number[] = []
     for (const idx of dispatchCallsites) {
+      if (isSilentNoCardVerdict(idx)) continue
       const window = LINES.slice(idx, idx + POST_WINDOW + 1).join('\n')
       if (!/\bpostPermissionResumeMessage\s*\(/.test(window)) {
         unpaired.push(idx + 1)
