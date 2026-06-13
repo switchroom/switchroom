@@ -113,6 +113,46 @@ describe("isValidModelArg", () => {
   });
 });
 
+// Regression for the 2026-06-13 fleet outage: defaults.model was pinned to
+// the full codename `claude-fable-5`, which Anthropic retired server-side →
+// every agent 4xx'd. The fix is to select models by ALIAS (durable) instead
+// of pinned ids. This locks in that `fable` (and the other aliases) stay
+// selectable, and documents the alias-vs-codename distinction.
+describe("model selection: aliases stay selectable (incl. fable)", () => {
+  it("lists fable as a first-class alias", () => {
+    // `fable` is the latest flagship (Fable 5) and must remain pickable.
+    expect(MODEL_ALIASES).toContain("fable");
+    // The standard set is intact alongside it.
+    for (const a of ["opus", "sonnet", "haiku", "default"]) {
+      expect(MODEL_ALIASES, a).toContain(a);
+    }
+  });
+
+  it("each alias is a valid model arg and parses as a set", () => {
+    for (const alias of MODEL_ALIASES) {
+      expect(isValidModelArg(alias), alias).toBe(true);
+      expect(parseModelCommand(`/model ${alias}`)).toEqual({ kind: "set", model: alias });
+    }
+  });
+
+  it("the help text surfaces the fable alias", async () => {
+    const reply = await handleModelCommand({ kind: "help" }, makeDeps());
+    expect(reply.text).toContain("fable");
+  });
+
+  it("passthrough: a full id (incl. the retired claude-fable-5 codename) is shape-accepted, not allowlisted", () => {
+    // switchroom does NOT allowlist models — the SHAPE gate passes any
+    // well-formed id through to claude, which is the sole validator. So the
+    // retired `claude-fable-5` codename still parses here (it just 4xx's at
+    // claude); selection flexibility (any current/future model) is preserved.
+    expect(parseModelCommand("/model claude-fable-5")).toEqual({
+      kind: "set",
+      model: "claude-fable-5",
+    });
+    expect(isValidModelArg("claude-fable-5")).toBe(true);
+  });
+});
+
 describe("handleModelCommand — show / help never inject (picker-wedge guard)", () => {
   it("show renders configured model + switch options without injecting", async () => {
     const { deps, calls } = makeDeps();
