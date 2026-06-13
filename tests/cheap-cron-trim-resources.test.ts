@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { maybeWriteCronMcp } from "../src/agents/scaffold.js";
 import { parseMemToMib, resolveResourceDefaults } from "../src/agents/compose.js";
 
@@ -49,6 +49,18 @@ describe("maybeWriteCronMcp (Tier-1 un-starve, #2307)", () => {
     const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
     maybeWriteCronMcp(dir, full, true);
     expect((full["switchroom-telegram"] as { env: Record<string, string> }).env.SWITCHROOM_BRIDGE_ALIVE_PATH).toBeUndefined();
+  });
+
+  it("seeds .claude-cron/.claude.json trust state (PR2 boot-wedge) with the full key set", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cron-mcp-"));
+    maybeWriteCronMcp(dir, full, true);
+    const seed = JSON.parse(readFileSync(join(dir, ".claude-cron", ".claude.json"), "utf-8"));
+    expect(seed.hasCompletedOnboarding).toBe(true);
+    const project = seed.projects[resolve(dir)];
+    expect(project.hasTrustDialogAccepted).toBe(true);
+    expect((project.enabledMcpjsonServers as string[]).sort()).toEqual(
+      ["agent-config", "hindsight", "perplexity", "switchroom-telegram"],
+    );
   });
 
   it("no-op when cron session disabled (the whole fleet today)", () => {
