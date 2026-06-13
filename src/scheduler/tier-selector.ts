@@ -35,7 +35,6 @@
  */
 
 import { isKnownCheapModel, type CronTier } from "./cron-routing.js";
-import { estimateCronGapMin } from "./cron-cadence.js";
 
 export type TierSource = "explicit" | "cadence-default";
 
@@ -124,32 +123,34 @@ export interface TierableEntry {
 }
 
 /**
- * Fill in the cheap-by-default tier when the entry carries NO explicit hint.
+ * Apply the cron tier default to a hint-less entry.
  *
- * This is what makes cheap the *default* (the Defaults-principle fix): a
- * frequent, hint-less cron is augmented with `context: "fresh"` so the
- * router (`resolveCronRouting`) sends it to a cheap Tier-1 session instead
- * of the agent's full session. Explicit entries (kind/model/context set) are
- * returned untouched — the operator/agent's choice always wins. Infrequent
- * crons (and any cadence we can't read confidently → estimateCronGapMin
- * returns Infinity) keep the conservative full-session default, so we never
- * strip context from work that may need it.
+ * IMPORTANT — tool-aware safety (the holistic-trace finding): this used to
+ * inject `context: "fresh"` for any frequent cron, forcing it into the cheap
+ * Tier-1 session. That is UNSAFE to do on cadence alone, because the Tier-1
+ * session is deliberately context- AND tool-minimal (only the telegram bridge
+ * MCP + built-in tools; no memory/persona, no hindsight/drive/web MCPs). A
+ * frequent cron that needs those would run starved and fail its job — and the
+ * graceful main-session fallback does NOT catch that (it only covers a
+ * bridge-down delivery failure, not a capability shortfall). We cannot read a
+ * prompt's tool/memory need deterministically, so cadence is the WRONG signal
+ * to force Tier-1.
  *
- * Pure: cadence comes from the cron string via estimateCronGapMin; no I/O.
+ * The only sound tool-awareness signal is the AUTHOR's: an explicit
+ * `model: sonnet` / `context: fresh` asserts "this cron is self-contained".
+ * So Tier-1 is OPT-IN. Cadence stays ADVISORY — `recommendCronTier` still
+ * surfaces "this could be cheaper" for shadow/guidance, but we no longer
+ * force the routing. The big automatic win lives in Tier-0 (model-free),
+ * which has none of these hazards.
+ *
+ * This function therefore passes the entry through unchanged: explicit hints
+ * are honoured by the router; hint-less crons keep the safe full-session
+ * default. Kept as the seam where a future *tool-aware* auto-router would
+ * plug in. Pure, no I/O.
  */
 export function applyDefaultTier<T extends TierableEntry>(
   entry: T,
-  frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
+  _frequentGapMin: number = DEFAULT_FREQUENT_GAP_MIN,
 ): T {
-  // Any explicit hint → leave it exactly as authored.
-  if (entry.kind === "poll" || entry.context !== undefined || entry.model !== undefined) {
-    return entry;
-  }
-  const rec = recommendCronTier(
-    { smallestGapMin: estimateCronGapMin(entry.cron) },
-    frequentGapMin,
-  );
-  // Only the cheap recommendation changes anything; "main" is already the
-  // router's default for a hint-less entry, so leave it untouched.
-  return rec.tier === "cheap" ? { ...entry, context: "fresh" } : entry;
+  return entry;
 }
