@@ -299,7 +299,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
-import { isCronIdentity, resolveInjectTarget } from './cron-session.js'
+import { isCronIdentity, deliverInjectWithFallback } from './cron-session.js'
 import {
   ObligationLedger,
   buildObligationRepresentInbound,
@@ -6425,19 +6425,34 @@ const ipcServer: IpcServer = createIpcServer({
     // unchanged. Route+buffer share the same target so a fire that lands
     // mid cron-session-spawn buffers under the cron identity and drains to
     // it on register.
-    const target = resolveInjectTarget(msg.agentName, msg.inbound.meta)
-    const toCron = target !== msg.agentName
-    const delivered = ipcServer.sendToAgent(target, msg.inbound)
-    // Status-silent (§2.4): a cron fire must NOT set the MAIN agent's
-    // currentTurn (progress card / silence-poke). The cron session is
-    // fire-and-forget; its reply is its only Telegram surface.
-    if (delivered && !toCron) markClaudeBusyForInbound(msg.inbound)
+    // Graceful Tier-1 fallback (cheap-crons JTBD: a cron must NEVER be
+    // dropped because of tier routing). A cron-routed fire whose `<agent>-cron`
+    // bridge isn't connected (boot-forked session not up yet for a hot-added
+    // frequent cron, or a crashed cron session) falls back to the MAIN agent
+    // bridge so the fire lands now; it routes cheap again once the session is
+    // up. See deliverInjectWithFallback.
+    const { target, delivered, fellBackToMain } = deliverInjectWithFallback(
+      msg.agentName,
+      msg.inbound.meta,
+      (t) => ipcServer.sendToAgent(t, msg.inbound),
+    )
+    if (fellBackToMain) {
+      process.stderr.write(
+        `telegram gateway: cron fire fell back to main session (no cron bridge) agent=${msg.agentName} prompt_key=${promptKey}\n`,
+      )
+    }
+    // Status-silent (§2.4): a cron fire delivered to the CRON session must NOT
+    // set the MAIN agent's currentTurn. But a fire that LANDED on the main
+    // bridge (a non-cron fire, or one that fell back) IS a main-session turn —
+    // surface it on the progress card, or the session looks dark.
+    if (delivered && target === msg.agentName) markClaudeBusyForInbound(msg.inbound)
     process.stderr.write(
-      `telegram gateway: inject_inbound agent=${msg.agentName} target=${target} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
+      `telegram gateway: inject_inbound agent=${msg.agentName} target=${target}${fellBackToMain ? " (fellback)" : ""} source=${source} prompt_key=${promptKey} delivered=${delivered}\n`,
     )
     // #1150: same buffer-on-failure pattern as vault_grant_approved.
-    // Cron fires use this path too — if a cron-driven wake-up lands
-    // mid bridge-reconnect, buffer it for the next register.
+    // Only reached if BOTH the cron bridge and the main bridge are down
+    // (e.g. mid-restart) — buffer under the bridge we tried last so it
+    // drains on the next register.
     if (!delivered) {
       pendingInboundBuffer.push(target, msg.inbound)
     }

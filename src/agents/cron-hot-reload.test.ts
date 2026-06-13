@@ -27,6 +27,16 @@ describe("classifyChangeKind", () => {
     expect(classifyChangeKind("/state/agents/foo/.mcp.json")).toBe("settings");
   });
 
+  it("tags .claude-cron/ (Tier-1 cron-session infra) as cron, not settings", () => {
+    // Regression: the cron-session trimmed MCP is rendered when a cron routes
+    // to a cheap session. It must classify as cron so a cron-only reconcile
+    // (agent self-authoring a frequent cron) accepts it — otherwise the
+    // .mcp.json rule below would tag it "settings" and the add fails.
+    expect(classifyChangeKind("/state/agents/foo/.claude-cron/.mcp.json")).toBe("cron");
+    // The main agent's .mcp.json is still settings (not under .claude-cron).
+    expect(classifyChangeKind("/state/agents/foo/.mcp.json")).toBe("settings");
+  });
+
   it("tags .claude/skills/ payload as skill", () => {
     expect(classifyChangeKind("/state/agents/foo/.claude/skills/humanizer/SKILL.md")).toBe("skill");
   });
