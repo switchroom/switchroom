@@ -1103,3 +1103,62 @@ describe("mergeAgentConfig reaction_dispatch block", () => {
     expect(rd.emojis).toEqual(["👨‍💻"]);
   });
 });
+
+// ─── linear capture default-emoji injection (#2312) ───────────────────────
+
+function linearAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  return baseAgent({
+    channels: { telegram: { linear_agent: { enabled: true, token: "vault:linear/x/token" } } },
+    ...overrides,
+  } as Partial<AgentConfig>);
+}
+
+describe("mergeAgentConfig linear capture default (#2312)", () => {
+  it("defaults the capture emojis ON when linear_agent is enabled and no reaction_dispatch is set", () => {
+    const result = mergeAgentConfig({} as AgentDefaults, linearAgent());
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch!;
+    expect(rd).toEqual({ enabled: true, emojis: ["👨‍💻", "📌"] });
+  });
+
+  it("does NOT inject when linear_agent is absent", () => {
+    const result = mergeAgentConfig({} as AgentDefaults, baseAgent());
+    expect((result as { reaction_dispatch?: unknown }).reaction_dispatch).toBeUndefined();
+  });
+
+  it("does NOT inject when linear_agent.enabled is false", () => {
+    const agent = baseAgent({
+      channels: { telegram: { linear_agent: { enabled: false, token: "vault:linear/x/token" } } },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    expect((result as { reaction_dispatch?: unknown }).reaction_dispatch).toBeUndefined();
+  });
+
+  it("an explicit reaction_dispatch.emojis allowlist WINS over the default", () => {
+    const agent = linearAgent({
+      reaction_dispatch: { enabled: true, emojis: ["🔖"] },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch!;
+    expect(rd.emojis).toEqual(["🔖"]);
+  });
+
+  it("respects an explicit opt-out via emojis: [] (does not re-inject)", () => {
+    const agent = linearAgent({
+      reaction_dispatch: { emojis: [] },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch!;
+    expect(rd.emojis).toEqual([]);
+  });
+
+  it("preserves an operator-set enabled:false when only enabled (not emojis) is given", () => {
+    // emojis still undefined → we fill emojis but keep the operator's enabled.
+    const agent = linearAgent({
+      reaction_dispatch: { enabled: false },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    const rd = (result as { reaction_dispatch?: Record<string, unknown> }).reaction_dispatch!;
+    expect(rd.enabled).toBe(false);
+    expect(rd.emojis).toEqual(["👨‍💻", "📌"]);
+  });
+});

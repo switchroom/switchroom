@@ -151,7 +151,44 @@ describe("telegram-yaml: removeTelegramFeature", () => {
 
 // ─── #597 phase 2: webhook source array helpers ─────────────────────────────
 
-import { addWebhookSource, removeWebhookSource, setLinearAgent } from "../src/cli/telegram-yaml.js";
+import { addWebhookSource, removeWebhookSource, setLinearAgent, setLinearDefaultTeam } from "../src/cli/telegram-yaml.js";
+
+describe("telegram-yaml: setLinearDefaultTeam (#2312)", () => {
+  const withLinear = setLinearAgent(
+    "agents:\n  carrie:\n    topic_name: C\n",
+    "carrie",
+    { token: "vault:linear/carrie/token" },
+  );
+
+  it("sets default_team_id on an existing linear_agent block", () => {
+    const after = setLinearDefaultTeam(withLinear, "carrie", "team_abc");
+    expect(after).toContain("default_team_id: team_abc");
+    expect(after).toContain("token: vault:linear/carrie/token");
+  });
+
+  it("overwrites an existing default_team_id (idempotent)", () => {
+    const once = setLinearDefaultTeam(withLinear, "carrie", "team_abc");
+    const twice = setLinearDefaultTeam(once, "carrie", "team_xyz");
+    expect(twice).toContain("default_team_id: team_xyz");
+    expect(twice).not.toContain("team_abc");
+  });
+
+  it("clears the default_team_id when passed null", () => {
+    const set = setLinearDefaultTeam(withLinear, "carrie", "team_abc");
+    const cleared = setLinearDefaultTeam(set, "carrie", null);
+    expect(cleared).not.toContain("default_team_id");
+  });
+
+  it("throws when the agent has no linear_agent block", () => {
+    const before = "agents:\n  carrie:\n    topic_name: C\n";
+    expect(() => setLinearDefaultTeam(before, "carrie", "team_abc")).toThrow(/no linear_agent block/);
+  });
+
+  it("throws when the agent isn't declared", () => {
+    const before = "agents:\n  carrie:\n    topic_name: C\n";
+    expect(() => setLinearDefaultTeam(before, "ghost", "team_abc")).toThrow(/not declared/);
+  });
+});
 
 describe("telegram-yaml: setLinearAgent (#2298)", () => {
   it("writes an enabled linear_agent block with a vault token ref", () => {

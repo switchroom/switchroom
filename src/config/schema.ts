@@ -949,6 +949,16 @@ export const TelegramChannelSchema = z
             "multi-workspace disambiguation; the token already scopes the " +
             "app to its workspace.",
           ),
+        default_team_id: z
+          .string()
+          .optional()
+          .describe(
+            "Optional Linear team id new captured issues file into when the " +
+            "agent doesn't pass an explicit team_id. Unnecessary for a " +
+            "single-team workspace (auto-resolved); set it only when the " +
+            "workspace has multiple teams. Manage via " +
+            "`switchroom linear-agent set-team <agent> <team>`.",
+          ),
       })
       .optional()
       .describe(

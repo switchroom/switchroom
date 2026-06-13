@@ -24,7 +24,7 @@ import { Command } from "commander";
 import chalk from "chalk";
 import { readFileSync, writeFileSync } from "node:fs";
 import { getConfigPath, withConfigError } from "./helpers.js";
-import { setLinearAgent } from "./telegram-yaml.js";
+import { setLinearAgent, setLinearDefaultTeam } from "./telegram-yaml.js";
 import { vaultPut } from "./telegram.js";
 
 interface LinearAgentSetupOpts {
@@ -103,6 +103,41 @@ export function registerLinearAgentCommand(program: Command): void {
         }
 
         printLinearInstructions(opts, vaultKey);
+      }),
+    );
+
+  linear
+    .command("set-team")
+    .description(
+      "Set (or clear) the default Linear team captured issues file into for <agent>. Only needed when the workspace has multiple teams — a single-team workspace auto-resolves. Pass --clear to remove the default.",
+    )
+    .requiredOption("--agent <name>", "Agent name (must have a linear_agent block)")
+    .option("--team <id>", "Linear team id new captured issues default to.")
+    .option("--clear", "Remove the configured default team (revert to auto-resolve).")
+    .action(
+      withConfigError(async (opts: { agent: string; team?: string; clear?: boolean }) => {
+        if (!/^[a-z][a-z0-9_-]{0,63}$/.test(opts.agent)) {
+          fail(`--agent must be a lowercase agent slug (got '${opts.agent}').`);
+        }
+        if (!opts.clear && (!opts.team || opts.team.trim().length === 0)) {
+          fail("pass either --team <id> or --clear.");
+        }
+
+        const path = getConfigPath(program);
+        const before = readFileSync(path, "utf-8");
+        let after: string;
+        try {
+          after = setLinearDefaultTeam(before, opts.agent, opts.clear ? null : opts.team!.trim());
+        } catch (err) {
+          fail((err as Error).message);
+        }
+        writeFileSync(path, after, "utf-8");
+        if (opts.clear) {
+          console.log(chalk.green(`✓ Cleared default Linear team for '${opts.agent}' (auto-resolve).`));
+        } else {
+          console.log(chalk.green(`✓ Default Linear team for '${opts.agent}' set to ${opts.team!.trim()}.`));
+        }
+        console.log(chalk.gray(`  Run 'switchroom agent restart ${opts.agent}' to pick up the change.`));
       }),
     );
 }
