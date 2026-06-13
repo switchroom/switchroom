@@ -86,8 +86,16 @@ CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You r
 # (no --continue) — low context by construction. cd into the workspace so
 # claude's project key matches the pre-seeded trust state (.claude-cron).
 cd "{{agentDir}}" || exit 1
-exec tmux -L "$CRON_SOCKET" \
-  new-session -A -s "$CRON_NAME" -x 400 -y 50 \
+# Create the cron tmux session DETACHED (-d), not in attach mode. This is a
+# SUPERVISED BACKGROUND sidecar (start.sh forks it with `&`) with no controlling
+# TTY — the MAIN session owns the container's foreground TTY. The attach flag
+# needs a TTY, so it dies "open terminal failed: not a terminal" and the cron
+# bridge never registers (every Tier-1 fire then falls back to main). `-d` runs
+# claude in a detached pane that registers fine; a human can still
+# `tmux -L "$CRON_SOCKET" attach -t "$CRON_NAME"` later. The `-x/-y` give the
+# pane a size since there's no TTY to derive one from.
+tmux -L "$CRON_SOCKET" \
+  new-session -d -s "$CRON_NAME" -x 400 -y 50 \
   claude \
     --dangerously-load-development-channels server:switchroom-telegram \
     --plugin-dir "{{securityPluginDir}}" \
@@ -96,3 +104,12 @@ exec tmux -L "$CRON_SOCKET" \
     --model {{{cronModelQ}}} \
     --append-system-prompt "$CRON_APPEND_PROMPT"{{#if dangerousMode}} \
     --dangerously-skip-permissions{{/if}}
+
+# `new-session -d` returns immediately (tmux daemonizes the session), so block
+# here while the session lives — this keeps cron-session.sh as the supervisor's
+# long-running child. When the cron claude exits (crash / kill), the session
+# ends, the loop exits, and the supervisor respawns us cleanly (with backoff).
+while tmux -L "$CRON_SOCKET" has-session -t "$CRON_NAME" 2>/dev/null; do
+  sleep 5
+done
+echo "cron-session: ${CRON_NAME} tmux session ended — exiting for supervisor respawn" >&2

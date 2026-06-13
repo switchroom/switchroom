@@ -66,10 +66,20 @@ describe("cron-session.sh launcher — compliance + identity", () => {
   const out = renderTemplate(CRON_SH, baseCtx);
 
   it("is interactive claude — NEVER claude -p (pillar 3)", () => {
-    expect(out).toContain("exec tmux");
+    expect(out).toContain("tmux -L");
     expect(out).toMatch(/\bclaude\b/);
     expect(out).not.toMatch(/claude\s+-p\b/);
     expect(out).not.toContain("--print");
+  });
+
+  it("creates the tmux session DETACHED (-d), not attached (-A) — it's a no-TTY background sidecar", () => {
+    // `new-session -A` (attach) dies "open terminal failed: not a terminal" in
+    // the supervised background fork (no controlling TTY) — the bug that kept
+    // the cron bridge from ever registering. -d runs claude in a detached pane.
+    expect(out).toMatch(/new-session -d -s "\$CRON_NAME"/);
+    expect(out).not.toMatch(/new-session -A/);
+    // and it blocks while the session lives so the supervisor sees a long-running child.
+    expect(out).toMatch(/while tmux -L "\$CRON_SOCKET" has-session -t "\$CRON_NAME"/);
   });
 
   it("registers as the cron bridge identity and its own config dir", () => {
