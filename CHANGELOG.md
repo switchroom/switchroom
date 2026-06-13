@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.15.10 — cheap-by-default made robust (graceful Tier-1 fallback)
+
+Re-rolls the cheap-crons default (v0.15.9, #2299) with the fix for the blocker
+its canary caught: the Tier-1 cron session is boot-forked, so a frequent cron
+added by hot-reload or agent self-authoring had no live session.
+
+- **Graceful Tier-1 fallback** (#2301): a cron-routed fire whose cron-session
+  bridge isn't connected falls back to the main agent session, so a cron is
+  NEVER dropped by tier routing — cheap when the session is up, full session
+  otherwise. It routes cheap again once the next restart forks the session.
+- **Reconcile fix** (#2301): `.claude-cron/` (Tier-1 trimmed MCP) is classified
+  as cron infrastructure, so an agent self-authoring a frequent cron no longer
+  fails the cron-only reconcile.
+- Cheap-by-default itself (#2299): a deterministic, conservative value-gate
+  routes confidently-frequent hint-less crons to a cheap session; daily/weekly
+  briefings and any unreadable cadence keep the full session. `SWITCHROOM_CHEAP_CRON=0`
+  is the kill-switch.
+
 ## v0.15.9 — cheap crons by default (value-gate drives the tier)
 
 The cheap-correct cron tier is now the **default**, chosen deterministically by
