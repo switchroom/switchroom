@@ -139,6 +139,7 @@ import {
   recordReaction, lookupMessageRoleAndText,
   checkpointWal as checkpointHistoryWal,
   pruneMessagesOlderThanDays,
+  hasOutboundDeliveredSince,
 } from '../history.js'
 import {
   runRegistryReaper,
@@ -1506,6 +1507,20 @@ const OBLIGATION_BACKGROUND_WORK_GRACE_MS = (() => {
   const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? n : 20 * 60_000
 })()
+// Per-represent grace window. After a re-present fires, the obligation is
+// ineligible for the next represent/escalate until at least this many ms have
+// elapsed since markRepresented. Without this the 5s sweep can fire again
+// before the re-presented turn even reaches the agent, burning the represent
+// budget and producing back-to-back re-presents or a premature escalation.
+// Default 120s — generous enough for a turn to start + deliver an answer;
+// small enough not to delay genuine unanswered re-presents.
+// Kill switch: SWITCHROOM_OBLIGATION_REPRESENT_GRACE_MS=0 → no per-represent grace.
+const OBLIGATION_REPRESENT_GRACE_MS = (() => {
+  const raw = process.env.SWITCHROOM_OBLIGATION_REPRESENT_GRACE_MS
+  if (raw == null || raw === '') return 120_000
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 120_000
+})()
 // Marker-freshness window for the orphaned-foreground signal. The turn-active
 // marker is touched on every foreground tool_use and on foreground sub-agent
 // JSONL growth, so an mtime younger than this means a sub-agent is touching it
@@ -2175,23 +2190,38 @@ function hasDifferentThreadedRecentTurn(
  * PR2 obligation-ledger CLOSE. Called when a SUBSTANTIVE final answer lands
  * (not a bare interim ack — using finalAnswerSubstantive, the #2141 signal): the
  * obligation discharged is the one for the SAME origin the answer routes to
- * (origin_turn_id the model echoed, else the live turn). So 713's reply closes
- * 713's obligation even after currentTurn flipped to 715, and 715 stays open
- * until ITS own substantive answer. An ack does NOT close (so ack-then-ghost is
- * re-presented, not re-dropped). turn.turnId === the obligation's origin id
- * (both deriveTurnId(chat,thread,messageId) of the same inbound). No-op unless
- * the flag is on. NOTE residual: a genuinely SHORT answer (<200 chars, not a
- * stream-done) reads as non-substantive and won't close → a bounded re-ask
- * (≤2) then one operator-visible nudge — the accepted double-ask tradeoff,
- * measured in the canary.
+ * (origin_turn_id the model echoed, else the routed origin the gateway resolved,
+ * else the live turn). So 713's reply closes 713's obligation even after
+ * currentTurn flipped to 715, and 715 stays open until ITS own substantive
+ * answer. Answers to re-presented obligations (via=quoted, no model echo) close
+ * via the gateway-resolved routedOriginTurn. An ack does NOT close (so
+ * ack-then-ghost is re-presented, not re-dropped). The live-turn fallback fires
+ * only for the live turn's OWN obligation (it was the turn delivering this
+ * reply), preserving the 713/715 invariant. No-op unless the flag is on.
+ *
+ * @param routedOriginTurn — the origin the reply router already resolved
+ *   (echoedTurn ?? quotedTurn); pass whenever the TURN_ORIGIN_ROUTING path ran.
+ *   Skipped when null/undefined (pre-routing paths, or DM with no quote).
  */
 function closeObligationOnSubstantiveReply(
   args: Record<string, unknown>,
   liveTurn: CurrentTurn | null | undefined,
+  routedOriginTurn?: CurrentTurn | null,
 ): void {
   if (!OBLIGATION_LEDGER_ENABLED) return
   const echoed = findTurnByOriginId(args.origin_turn_id as string | undefined)
-  const target = obligationLedger.resolveCloseTarget(echoed?.turnId, liveTurn?.turnId)
+  // routedOriginTurn is the gateway-resolved origin (echoedTurn ?? quotedTurn).
+  // Only pass it as routedOriginId when it DIFFERS from the echoed turn (if
+  // echoed is present, resolveCloseTarget's first branch already handles it),
+  // and only when it is NOT the live turn (live-turn is the fallback, not the
+  // routed origin — passing live turn here would bypass the live-turn fallback
+  // logic and still close correctly, but naming matters for the 713/715 case:
+  // the routed origin on a via=quoted reply IS the origin, not "live fallback").
+  const routedOriginId =
+    routedOriginTurn != null && echoed == null
+      ? routedOriginTurn.turnId
+      : null
+  const target = obligationLedger.resolveCloseTarget(echoed?.turnId, liveTurn?.turnId, routedOriginId)
   if (target != null) obligationLedger.close(target)
 }
 
@@ -5414,13 +5444,16 @@ function obligationSweep(): void {
     OBLIGATION_BACKGROUND_WORK_GRACE_MS > 0 && agentHasInFlightBackgroundWork(now)
   // Grace window: skip an obligation whose handling turn ended < grace ago — its
   // trailing slow/worker answer may still be landing (over-escalation fix).
+  // Per-represent grace: skip an obligation re-presented < grace ago — prevents
+  // the 5s sweep from immediately firing again before the re-present even lands.
   const decision = obligationLedger.decideAtIdle(
-    OBLIGATION_ESCALATE_GRACE_MS > 0 || backgroundWorkActive
+    OBLIGATION_ESCALATE_GRACE_MS > 0 || backgroundWorkActive || OBLIGATION_REPRESENT_GRACE_MS > 0
       ? {
           now,
           graceMs: OBLIGATION_ESCALATE_GRACE_MS,
           backgroundWorkActive,
           backgroundGraceMs: OBLIGATION_BACKGROUND_WORK_GRACE_MS,
+          representGraceMs: OBLIGATION_REPRESENT_GRACE_MS,
         }
       : undefined,
   )
@@ -5449,8 +5482,22 @@ function obligationSweep(): void {
     )
     return
   }
-  // escalate — re-present ladder exhausted. Send ONE operator-visible nudge and
-  // close the obligation ONLY AFTER it actually lands. This inverts the old
+  // escalate — re-present ladder exhausted. Before sending the user-visible
+  // apology, check whether the agent has ALREADY delivered an outbound reply
+  // to this chat since the obligation was opened. If yes, the obligation is
+  // stale (the agent did answer, just without closing the obligation via the
+  // normal close path) — close silently instead of alarming the user with a
+  // false "I may have missed this". This is Fix 4: escalate only on knowledge,
+  // not doubt. Fall back to false (safe: never suppresses) if history unavailable.
+  if (HISTORY_ENABLED && hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
+    process.stderr.write(
+      `telegram gateway: obligation closed silently — outbound delivered since open origin=${o.originTurnId}\n`,
+    )
+    obligationLedger.close(o.originTurnId)
+    return
+  }
+  // Proceed with escalation: send ONE operator-visible nudge and close the
+  // obligation ONLY AFTER it actually lands. This inverts the old
   // close-before-send (which silently dropped the terminal whenever the send
   // failed): the close is now itself an observable terminal. A transient send
   // failure leaves the obligation OPEN → retried next sweep; a PERMANENT one
@@ -6955,6 +7002,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // heuristic is what mis-routed a late reply to whichever topic most
   // recently received a message. DM: every tier is undefined → unchanged.
   // Kill switch off → exact legacy resolveThreadId precedence.
+  // Hoist the resolved origin turn so the obligation-close path (below) can
+  // pass it into resolveCloseTarget as routedOriginId, closing re-presented
+  // obligations even when the model omitted origin_turn_id (Fix 1/2).
+  let replyRoutedOriginTurn: CurrentTurn | null = null
   let threadId: number | undefined
   if (TURN_ORIGIN_ROUTING_ENABLED) {
     const explicit = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
@@ -6964,6 +7015,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     const echoedTurn = findTurnByOriginId(args.origin_turn_id as string | undefined)
     const quotedTurn = echoedTurn == null ? findTurnByQuotedMessageId(chat_id, args.reply_to) : null
     const originTurn = echoedTurn ?? quotedTurn
+    replyRoutedOriginTurn = originTurn ?? null
     threadId = resolveAnswerThreadWithLog(
       chat_id,
       Number.isFinite(explicit as number) ? (explicit as number) : undefined,
@@ -7205,7 +7257,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
               text: decision.mergedText,
               disableNotification,
             })
-            if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
+            if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
           }
           outboundDedup.record(
             chat_id,
@@ -7558,7 +7610,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       finalizeStatusReaction(chat_id, threadId, 'done')
       // PR2: close this origin's obligation on a SUBSTANTIVE final answer
       // (after finalize so the reaction guard test's anchor window is stable).
-      if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
+      if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
     }
     // v0.13.30 follow-up — release the buffer gate on EVERY reply
     // finalize, not just on `isFinalAnswerReply`. The narrow
@@ -7618,6 +7670,9 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // topic and a late stream-reply can't be stolen by a successor turn. DM:
   // every tier undefined → unchanged. Kill switch off → legacy live-turn
   // injection only.
+  // Hoist the resolved origin turn so the obligation-close path (below) can
+  // pass it into resolveCloseTarget as routedOriginId (mirrors executeReply).
+  let streamRoutedOriginTurn: CurrentTurn | null = null
   if (args.message_thread_id == null) {
     let injected: number | undefined
     if (TURN_ORIGIN_ROUTING_ENABLED) {
@@ -7627,6 +7682,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       const quotedTurn =
         echoedTurn == null ? findTurnByQuotedMessageId(String(args.chat_id), args.reply_to) : null
       const originTurn = echoedTurn ?? quotedTurn
+      streamRoutedOriginTurn = originTurn ?? null
       injected = resolveAnswerThreadWithLog(
         String(args.chat_id),
         undefined,
@@ -7910,7 +7966,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       disableNotification: args.disable_notification === true,
       done: args.done === true,
     })
-    if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn)
+    if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, streamRoutedOriginTurn)
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
     // If a stream's first emit was ack-shaped (disable_notification:true,

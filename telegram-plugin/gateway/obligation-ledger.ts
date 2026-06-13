@@ -55,6 +55,12 @@ export interface Obligation {
    *  that re-stamps this once, and representCount is capped, so the ladder still
    *  terminates. Durable (part of the snapshot) so the grace survives restart. */
   lastTurnEndedAt?: number
+  /** Wall-clock ms this obligation was most recently re-presented. Drives the
+   *  per-represent grace: a freshly re-presented obligation is skipped until
+   *  at least `representGraceMs` has elapsed, preventing immediate second
+   *  re-present/escalate when the sweep fires < 5s later. Durable (part of the
+   *  snapshot) so the grace window survives a restart. */
+  lastRepresentedAt?: number
 }
 
 /** What the gateway should do for the oldest open obligation at an idle boundary. */
@@ -202,20 +208,30 @@ export class ObligationLedger {
    * pathologically-stuck/leaked worker cannot suppress the escalation forever —
    * once openedAt+backgroundGraceMs passes, the obligation is acted on regardless
    * of work state, and the FSM still terminates.
+   *
+   * PER-REPRESENT GRACE (opts.representGraceMs > 0): an obligation that was just
+   * re-presented is ineligible until at least `representGraceMs` ms have elapsed
+   * since `lastRepresentedAt`. Without this, the 5s sweep can fire again before
+   * the re-presented turn even reaches the agent, burning the represent budget
+   * immediately and producing back-to-back escalations on the same message.
    */
   decideAtIdle(opts?: {
     now: number
     graceMs: number
     backgroundWorkActive?: boolean
     backgroundGraceMs?: number
+    representGraceMs?: number
   }): LedgerDecision {
-    const useEligible = opts != null && (opts.graceMs > 0 || opts.backgroundWorkActive === true)
+    const useEligible =
+      opts != null &&
+      (opts.graceMs > 0 || opts.backgroundWorkActive === true || (opts.representGraceMs ?? 0) > 0)
     const o = useEligible
       ? this.oldestEligible(
           opts!.now,
           opts!.graceMs,
           opts!.backgroundWorkActive === true,
           opts!.backgroundGraceMs ?? 0,
+          opts!.representGraceMs ?? 0,
         )
       : this.oldest()
     if (o === undefined) return { action: 'none' }
@@ -224,24 +240,30 @@ export class ObligationLedger {
   }
 
   /** The oldest open obligation that is currently ELIGIBLE to act on — i.e. NOT
-   *  within either grace window:
+   *  within any grace window:
    *   - trailing-answer grace: its handling turn ended < `graceMs` ago (a queued
    *     obligation with no lastTurnEndedAt can't have a trailing answer, so it is
-   *     always eligible on this axis); AND
+   *     always eligible on this axis);
    *   - background-work grace: when `backgroundWorkActive`, it was opened <
    *     `backgroundGraceMs` ago (genuine in-flight autonomous work — bounded by
-   *     the ceiling so a stale/leaked worker can't suppress escalation forever). */
+   *     the ceiling so a stale/leaked worker can't suppress escalation forever);
+   *   - per-represent grace: it was re-presented < `representGraceMs` ago (prevents
+   *     a 5s sweep tick from immediately firing again on the same obligation before
+   *     the re-presented turn even reaches the agent). */
   private oldestEligible(
     now: number,
     graceMs: number,
     backgroundWorkActive: boolean,
     backgroundGraceMs: number,
+    representGraceMs: number,
   ): Obligation | undefined {
     let best: Obligation | undefined
     for (const o of this.open.values()) {
       if (o.lastTurnEndedAt != null && now - o.lastTurnEndedAt < graceMs) continue // trailing-answer grace
       if (backgroundWorkActive && backgroundGraceMs > 0 && now - o.openedAt < backgroundGraceMs)
         continue // in-flight autonomous work, bounded by the ceiling
+      if (representGraceMs > 0 && o.lastRepresentedAt != null && now - o.lastRepresentedAt < representGraceMs)
+        continue // per-represent grace: sweep fired before re-presented turn landed
       if (best === undefined || o.openedAt < best.openedAt) best = o
     }
     return best
@@ -259,29 +281,48 @@ export class ObligationLedger {
   /**
    * Decide which obligation a substantive reply discharges — DETERMINISTICALLY,
    * holding for any model behavior:
-   *  - `echoedTurnId` (the model echoed origin_turn_id back) → authoritative;
-   *    close exactly that (a no-op via close() if it isn't actually open).
-   *  - else, close the live turn's obligation ONLY when UNAMBIGUOUS — exactly
-   *    one obligation open. With >1 open and no echo we cannot tell which one
-   *    the reply answered; closing the live turn's would silently drop the other
-   *    (713's un-echoed reply landing while currentTurn=715 must NOT close 715).
-   *    So we close nothing → the real target stays open and is re-presented (a
-   *    bounded double-ask), never wrong-closed. Returns the id to close, or null.
+   *
+   *  1. `echoedTurnId` (model echoed origin_turn_id back) → authoritative; close
+   *     exactly that (a no-op via close() if it isn't actually open).
+   *  2. `routedOriginId` (gateway-resolved origin from quote/via=quoted or
+   *     via=live routing) → treat as the definitive target when present; this
+   *     makes answers to re-presented messages close their obligation even when
+   *     no model echo was provided and even with >1 open obligation (the routed
+   *     origin IS the answer's origin — this is deterministic, not a guess).
+   *     The 713/715 invariant still holds: the gateway only passes a routedOriginId
+   *     that it has positively resolved as the reply's origin (quote resolution,
+   *     via=quoted); it never passes the LIVE turn id here when a different
+   *     obligation is the resolved origin.
+   *  3. else, close the live turn's own obligation when that turn itself is open —
+   *     this is unambiguous (the reply happened IN that turn, so the turn's own
+   *     obligation IS the right target). The 713/715 wrong-close protection is
+   *     preserved by ordering: routed/echoed origin (steps 1/2) wins first;
+   *     live-turn fallback (step 3) only fires when no routed origin resolved, AND
+   *     only for the live turn's OWN obligation (not another open obligation). A
+   *     reply answering message A landing while currentTurn=B must STILL not close B
+   *     — only steps 1/2 can close A in that case. With multiple open obligations
+   *     and no routed origin, the LIVE turn's own obligation is the safe default
+   *     (relaxed from size==1 which wrongly blocked it when a second message arrived
+   *     meanwhile). Returns the id to close, or null.
    */
   resolveCloseTarget(
     echoedTurnId: string | null | undefined,
     liveTurnId: string | null | undefined,
+    routedOriginId?: string | null,
   ): string | null {
     if (echoedTurnId != null) return echoedTurnId
-    if (liveTurnId != null && this.open.size === 1 && this.open.has(liveTurnId)) return liveTurnId
+    if (routedOriginId != null) return routedOriginId
+    if (liveTurnId != null && this.open.has(liveTurnId)) return liveTurnId
     return null
   }
 
-  /** Record that an obligation was just re-presented (bumps representCount). */
-  markRepresented(originTurnId: string): number {
+  /** Record that an obligation was just re-presented (bumps representCount, stamps
+   *  lastRepresentedAt for the per-represent grace window). */
+  markRepresented(originTurnId: string, now = Date.now()): number {
     const o = this.open.get(originTurnId)
     if (o === undefined) return 0
     o.representCount += 1
+    o.lastRepresentedAt = now
     this.persist()
     return o.representCount
   }

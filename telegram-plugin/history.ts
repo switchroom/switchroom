@@ -546,6 +546,50 @@ export function getRecentOutboundCount(
   return row?.cnt ?? 0
 }
 
+/**
+ * Returns true if at least one outbound (bot → user, role='assistant') message
+ * was delivered to `chatId` (and optionally `threadId`) AFTER `sinceMs` (wall-
+ * clock epoch milliseconds). Used by the obligation sweep to suppress a false
+ * "I may have missed this" escalation when the agent visibly answered: if an
+ * outbound landed since the obligation was opened, the obligation is stale —
+ * close it silently rather than alarming the user.
+ *
+ * `threadId` semantics:
+ *   - undefined → any message in the chat regardless of thread (DMs + supergroups)
+ *   - explicit number → only that thread (precise for supergroups with topics)
+ *   - explicit null → only chat-root (non-thread) messages
+ *
+ * Falls back to false (safe: never suppresses escalation) if history is not yet
+ * initialised or the query fails.
+ */
+export function hasOutboundDeliveredSince(
+  chatId: string,
+  sinceMs: number,
+  threadId?: number | null,
+): boolean {
+  try {
+    const cutoffSec = Math.floor(sinceMs / 1000)
+    const params: unknown[] = [chatId, cutoffSec]
+    let sql =
+      "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ?"
+    if (threadId !== undefined) {
+      if (threadId === null) {
+        sql += ' AND thread_id IS NULL'
+      } else {
+        sql += ' AND thread_id = ?'
+        params.push(threadId)
+      }
+    }
+    sql += ' LIMIT 1'
+    const row = requireDb()
+      .prepare(sql)
+      .get(...(params as [unknown, ...unknown[]])) as Record<string, unknown> | undefined
+    return row != null
+  } catch {
+    return false
+  }
+}
+
 export function query(opts: QueryOptions): RecordedMessage[] {
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT))
   const params: unknown[] = [opts.chat_id]
