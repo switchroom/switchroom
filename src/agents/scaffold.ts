@@ -384,6 +384,7 @@ export function renderFleetInvariants(): string {
 
 import { DEFAULT_PROFILE } from "../config/schema.js";
 import { DEFAULT_CRON_MODEL, scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
+import { applyDefaultTier } from "../scheduler/tier-selector.js";
 
 /**
  * Cheap-cron (L4) start.sh context. `cronSessionEnabled` is purely
@@ -399,11 +400,13 @@ function buildCronSessionContext(agentConfig: AgentConfig): {
   cronSessionEnabled: boolean;
   cronModelQ: string;
 } {
-  const entries = (agentConfig.schedule ?? []).map((e) => ({
-    kind: e.kind,
-    model: e.model,
-    context: e.context,
-  }));
+  // Apply the cheap-by-default tier (value-gate) so a frequent, hint-less
+  // cron — which routes to a Tier-1 cron session at runtime — also gets the
+  // cron-session.sh rendered here. Without this, the scaffold and the fire
+  // path would disagree and the session would be missing at fire time.
+  const entries = (agentConfig.schedule ?? []).map((e) =>
+    applyDefaultTier({ cron: e.cron, kind: e.kind, model: e.model, context: e.context }),
+  );
   return {
     cronSessionEnabled: scheduleNeedsCronSession(entries, { cheapCronEnabled: true }),
     cronModelQ: shellSingleQuote(DEFAULT_CRON_MODEL),

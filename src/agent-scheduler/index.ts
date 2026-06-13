@@ -37,6 +37,7 @@ import {
   type SchedulerEntry,
 } from "../scheduler/dispatch.js";
 import { isCheapCronEnabled, resolveCronRouting, resolveEscalationRouting } from "../scheduler/cron-routing.js";
+import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import type { PollOutcome } from "../scheduler/poll-engine.js";
 import type { PollStateStore } from "../scheduler/poll-state.js";
 import type { PollSpec } from "../config/schema.js";
@@ -280,7 +281,11 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
       }
 
       const cheapEnabled = opts.cheapCron?.enabled ?? false;
-      const routing = resolveCronRouting(entry, { cheapCronEnabled: cheapEnabled });
+      // Value-gate: fill the cheap-by-default tier for a hint-less entry
+      // (frequent → cheap Tier-1 session) before routing. Explicit
+      // kind/model/context are untouched. Only when cheap-cron is on.
+      const routed = cheapEnabled ? applyDefaultTier(entry) : entry;
+      const routing = resolveCronRouting(routed, { cheapCronEnabled: cheapEnabled });
       const threadId = resolveEntryThreadId(entry, opts.channel);
       const record = (fields: {
         exitCode: number;
