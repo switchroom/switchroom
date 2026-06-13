@@ -363,6 +363,7 @@ import type {
   PtyPartialForward,
   InboundMessage,
   InjectInboundMessage,
+  SendOutboundMessage,
   QuotaWallDetectedMessage,
   PermissionEvent,
 } from './ipc-protocol.js'
@@ -6562,6 +6563,47 @@ const ipcServer: IpcServer = createIpcServer({
     if (!delivered) {
       pendingInboundBuffer.push(target, msg.inbound)
     }
+  },
+
+  // #2307 Tier-0 action tier — a MODEL-FREE outbound post. The agent-scheduler
+  // fires this for a `kind: action` `telegram-message`; the gateway posts the
+  // (already-substituted) text to the agent's OWN chat with NO model: no
+  // inject_inbound, no session wake, no currentTurn mutation. Two fences:
+  //   1. agentName must match this gateway's own SWITCHROOM_AGENT_NAME.
+  //   2. chatId must be an allowlisted chat for this agent (assertAllowedChat).
+  // An action carries no chat target of its own — the scheduler supplies the
+  // agent's own chat — so 2 is belt-and-braces against a malformed/foreign id.
+  onSendOutbound(_client: IpcClient, msg: SendOutboundMessage) {
+    const self = process.env.SWITCHROOM_AGENT_NAME
+    if (self && msg.agentName !== self) {
+      process.stderr.write(
+        `telegram gateway: send_outbound rejected — agent mismatch (${msg.agentName} != ${self})\n`,
+      )
+      return
+    }
+    try {
+      assertAllowedChat(msg.chatId)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: send_outbound rejected — ${(err as Error).message}\n`,
+      )
+      return
+    }
+    const threadId = msg.threadId
+    const parseMode = msg.parseMode === 'text' ? undefined : 'HTML'
+    // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send.
+    // General topic (thread 1) sends omit message_thread_id per the outbound convention.
+    void swallowingApiCall(
+      () =>
+        bot.api.sendMessage(msg.chatId, msg.text, {
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: msg.chatId, verb: 'cron-action-send', ...(threadId != null ? { threadId } : {}) },
+    )
+    process.stderr.write(
+      `telegram gateway: send_outbound agent=${msg.agentName} chat=${msg.chatId} thread=${threadId ?? '-'} len=${msg.text.length}\n`,
+    )
   },
 
   // The wedge-watchdog detected claude's /rate-limit-options weekly-quota menu

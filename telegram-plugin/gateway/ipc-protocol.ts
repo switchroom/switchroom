@@ -413,6 +413,35 @@ export interface QuotaWallDetectedMessage {
   resetAt?: number;
 }
 
+/**
+ * #2307 (Tier-0 action tier) — a MODEL-FREE outbound post. Sent by the
+ * in-agent scheduler when a `kind: action` cron's `telegram-message` fires:
+ * the gateway posts `text` to the agent's OWN chat with no model involvement
+ * (NO `inject_inbound`, NO session wake, NO `currentTurn` mutation). This is
+ * the deliberate counterpart to `inject_inbound` — the one ClientToGateway
+ * verb that produces an outbound WITHOUT a turn.
+ *
+ * Trust model: same as `inject_inbound` — the socket is per-agent inside the
+ * container, only that-UID processes can connect. `agentName` is validated
+ * server-side, and the gateway FENCES `chatId` to the agent's own configured
+ * chat (DM allowlist / forum_chat_id) and rejects a foreign chat — an action
+ * can never post elsewhere (the action spec carries no chat target; the
+ * scheduler supplies the agent's own).
+ */
+export interface SendOutboundMessage {
+  type: "send_outbound";
+  /** Target agent — gateway verifies it matches its own SWITCHROOM_AGENT_NAME. */
+  agentName: string;
+  /** Agent's own chat id (fenced server-side against the agent's config). */
+  chatId: string;
+  /** Forum topic thread id (General/unset omitted; 1 is stripped on send). */
+  threadId?: number;
+  /** Message body — already substitution-resolved by the action engine. */
+  text: string;
+  /** Telegram parse mode. Defaults to HTML. */
+  parseMode?: "html" | "text";
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -428,4 +457,5 @@ export type ClientToGateway =
   | RequestMs365ApprovalMessage
   | RequestConfigApprovalMessage
   | RequestConfigFinalizeMessage
-  | QuotaWallDetectedMessage;
+  | QuotaWallDetectedMessage
+  | SendOutboundMessage;

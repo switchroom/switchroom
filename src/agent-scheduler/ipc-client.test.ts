@@ -13,7 +13,7 @@ import { describe, it, expect } from "vitest";
 import { EventEmitter } from "node:events";
 import type { Socket } from "node:net";
 import { createInjectIpcClient } from "./ipc-client.js";
-import type { InjectInboundMessage } from "../../telegram-plugin/gateway/ipc-protocol.js";
+import type { InjectInboundMessage, SendOutboundMessage } from "../../telegram-plugin/gateway/ipc-protocol.js";
 
 class FakeSocket extends EventEmitter {
   public writes: string[] = [];
@@ -80,6 +80,34 @@ describe("createInjectIpcClient", () => {
     expect(parsed.agentName).toBe("klanker");
     expect(parsed.inbound.meta.source).toBe("cron");
 
+    client.close();
+  });
+
+  it("sendOutbound returns false before connect, true after, as one NDJSON line", async () => {
+    const fake = new FakeSocket();
+    const client = createInjectIpcClient({
+      socketPath: "/fake.sock",
+      _connect: () => fake as unknown as Socket,
+    });
+    const msg: SendOutboundMessage = {
+      type: "send_outbound",
+      agentName: "clerk",
+      chatId: "12345",
+      threadId: 7,
+      text: "Daily heartbeat 2026-06-13",
+      parseMode: "html",
+    };
+    expect(client.sendOutbound(msg)).toBe(false); // not connected yet
+
+    await tick();
+    fake.emit("connect");
+
+    expect(client.sendOutbound(msg)).toBe(true);
+    expect(fake.writes).toHaveLength(1);
+    const parsed = JSON.parse(fake.writes[0]!.trim());
+    expect(parsed.type).toBe("send_outbound");
+    expect(parsed.chatId).toBe("12345");
+    expect(parsed.text).toBe("Daily heartbeat 2026-06-13");
     client.close();
   });
 

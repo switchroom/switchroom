@@ -4,6 +4,7 @@ import type {
   GatewayToClient,
   HeartbeatMessage,
   InjectInboundMessage,
+  SendOutboundMessage,
   QuotaWallDetectedMessage,
   OperatorEventForward,
   PermissionRequestForward,
@@ -45,6 +46,15 @@ export interface IpcServerOptions {
    * inline scheduler simply ignore inject_inbound messages.
    */
   onInjectInbound?: (client: IpcClient, msg: InjectInboundMessage) => void;
+  /**
+   * #2307 Tier-0 action tier — a model-free outbound post. Invoked when the
+   * agent-scheduler sibling fires a `kind: action` `telegram-message`. The
+   * handler is expected to post `msg.text` to `msg.chatId` (fenced to the
+   * agent's own chat) via the locked bot — with NO model, NO inject_inbound,
+   * NO session wake. Optional: gateways that don't run the inline scheduler
+   * ignore it.
+   */
+  onSendOutbound?: (client: IpcClient, msg: SendOutboundMessage) => void;
   /**
    * The autoaccept-poll wedge-watchdog detected claude's `/rate-limit-options`
    * weekly-quota menu (no 429 ever reached the gateway). Handler is expected to
@@ -246,6 +256,21 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && typeof inb.meta === "object"
         && inb.meta !== null;
     }
+    case "send_outbound": {
+      // #2307 Tier-0 action tier — a model-free outbound post. Validate the
+      // wire shape; the gateway handler fences chatId to the agent's own chat.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.chatId !== "string" || (m.chatId as string).length === 0) return false;
+      // text non-empty and bounded — Telegram caps a message at 4096 chars;
+      // reject over-long here (defense in depth against a malformed payload).
+      if (typeof m.text !== "string" || (m.text as string).length === 0
+        || (m.text as string).length > 4096) return false;
+      if (m.threadId !== undefined
+        && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
+      if (m.parseMode !== undefined && m.parseMode !== "html" && m.parseMode !== "text") return false;
+      return true;
+    }
     case "quota_wall_detected": {
       // wedge-watchdog detected the /rate-limit-options weekly-quota menu.
       if (typeof m.agentName !== "string"
@@ -335,6 +360,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onOperatorEvent,
     onPtyPartial,
     onInjectInbound,
+    onSendOutbound,
     onQuotaWallDetected,
     onRequestDriveApproval,
     onRequestMs365Approval,
@@ -443,6 +469,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "inject_inbound":
         if (onInjectInbound) onInjectInbound(client, msg as InjectInboundMessage);
+        break;
+      case "send_outbound":
+        if (onSendOutbound) onSendOutbound(client, msg as SendOutboundMessage);
         break;
       case "quota_wall_detected":
         if (onQuotaWallDetected) onQuotaWallDetected(client, msg as QuotaWallDetectedMessage);
