@@ -92,17 +92,17 @@ export const HttpDiffPollSchema = z.object({
   state_key: z.string().describe("Key under /state/agent/poll-state.json holding the last-seen value."),
 });
 
-export const TelegramReactionsPollSchema = z.object({
-  type: z.literal("telegram-reactions"),
-  chat_id: z.union([z.string().min(1), z.number().int()]).describe("Chat to scan for reactions (model-free internal gateway query)."),
-  emoji: z.string().min(1).describe("Reaction emoji that marks a message for capture (e.g. 👨‍💻)."),
-  lookback: z.number().int().positive().max(200).default(40),
-  state_key: z.string().describe("Key under poll-state.json holding the last-processed message id."),
-});
-
+// NOTE: a `telegram-reactions` poll type was prototyped here but removed
+// (#2307 follow-up) — it was never wired (it errored "not yet wired" at
+// runtime) and is redundant with `reaction_dispatch` (#2291), which is
+// event-driven (Telegram pushes the reaction → instant wake) rather than
+// polled, and is the path the Linear-capture default uses. The poll's only
+// niche — a non-admin bot in a group that can't receive reaction pushes — is
+// not a topology switchroom targets (its bots are admins in their own chats).
+// `PollSpecSchema` stays a single-arm discriminated union on `type` so a future
+// poll type can be added back without changing the shape.
 export const PollSpecSchema = z.discriminatedUnion("type", [
   HttpDiffPollSchema,
-  TelegramReactionsPollSchema,
 ]);
 
 // Tier-0 deterministic ACTION specs (docs/rfcs/cheap-cron-sessions.md §2.1,
@@ -241,7 +241,7 @@ export const ScheduleEntrySchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["poll"],
-        message: "kind: poll requires a `poll` spec (http-diff or telegram-reactions).",
+        message: "kind: poll requires a `poll` spec (http-diff).",
       });
     }
     if (kind !== "poll" && entry.poll) {

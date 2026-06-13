@@ -57,9 +57,12 @@ describe("buildCheapCronHooks", () => {
     expect(out.error).toMatch(/egress denied/);
   });
 
-  it("telegram-reactions is staged → poll error, never a silent success", async () => {
+  it("an unknown/future poll type → poll error, never a silent success", async () => {
+    // http-diff is the only poll type today (telegram-reactions removed —
+    // reaction_dispatch covers reactions). A poll type the engine doesn't
+    // handle must record an error, never silently succeed.
     const hooks = buildCheapCronHooks(CONFIG, ON, { pollState: createMemoryPollStateStore() });
-    const out = await hooks!.runPoll({ type: "telegram-reactions", chat_id: "1", emoji: "👨‍💻", lookback: 40, state_key: "k" }, undefined);
+    const out = await hooks!.runPoll({ type: "future-type" } as never, undefined);
     expect(out.error).toMatch(/not yet wired/);
     expect(out.hit).toBe(false);
   });
