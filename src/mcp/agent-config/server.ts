@@ -138,14 +138,16 @@ export const TOOLS = [
       "Append a cron schedule entry to your overlay. Takes effect within ~30s — " +
       "the scheduler hot-reloads, no restart needed. Overlay entries with " +
       "non-empty `secrets:` are REJECTED (E_OVERLAY_SECRETS_REQUIRES_APPROVAL). " +
-      "COST: by default each fire runs as a full turn in your live session " +
-      "(your model, your whole context) — fine for work that needs your memory/" +
-      "persona, but costly for routine checks. For a lighter recurring task, set " +
-      "`model: \"sonnet\"` to run that fire in a cheap, minimal-context cron " +
-      "session instead (saves tokens; needs cheap-cron enabled by the operator). " +
-      "For 'only do something when X changes' (e.g. a webpage, or a reaction), " +
-      "ask the operator to set up a poll or reaction-dispatch instead of a " +
-      "frequent prompt cron — far cheaper than polling with a full turn.",
+      "COST: a FREQUENT cron (every <=60min) is already auto-routed to a cheap, " +
+      "minimal-context cron session (Tier 1) by default; a DAILY/WEEKLY cron runs " +
+      "as a full turn in your live session (Tier 2). Set `model: \"sonnet\"` / " +
+      "`context: \"fresh\"` to force the cheap session for a self-contained " +
+      "daily/weekly job, or `context: \"agent\"` to keep a fire on your full " +
+      "session when it needs your accumulated context. CHEAPER STILL (request " +
+      "from the operator — you can't self-author these): a `kind: action` runs a " +
+      "FIXED post/webhook MODEL-FREE (zero tokens, no session) for a set " +
+      "reminder/ping; a `kind: poll` or reaction-dispatch handles 'only act when " +
+      "X changes' without a wasted turn each tick.",
     inputSchema: {
       type: "object" as const,
       required: ["cron_expr", "prompt"],
@@ -160,8 +162,9 @@ export const TOOLS = [
             "Optional cheap-cron tier hint. A known-cheap model ('sonnet'/'haiku') " +
             "routes this fire to a fresh, minimal-context cron session (Tier 1) " +
             "instead of your full live session (Tier 2) — cheaper per fire. Omit " +
-            "for context-heavy work that needs your memory/persona. Inert unless " +
-            "the operator has enabled cheap-cron.",
+            "for context-heavy work that needs your accumulated conversation " +
+            "context (a frequent cron is already Tier-1 by default; this is mainly " +
+            "to make a daily/weekly self-contained job cheap too).",
         },
         context: {
           type: "string",

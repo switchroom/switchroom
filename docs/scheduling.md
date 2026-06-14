@@ -224,12 +224,12 @@ If the agent is down at fire time, the in-container sidecar can't deliver — th
 
 ### Controlling per-fire cost (tiers)
 
-Because each fire is a full turn in the live session by default, a frequent cron pays the agent's whole context every time — wasteful for routine checks. Entries (and `schedule_add`) take optional tier hints, honoured when `SWITCHROOM_CHEAP_CRON` is enabled (see `docs/rfcs/cheap-cron-sessions.md`):
+A cron pays for a model only when the model earns it. By default a **frequent** cron (≤60min) auto-routes to a cheap Tier-1 session and a **daily/weekly** cron runs a full Tier-2 turn (see "Automatic Tier-1 routing" below); entries (and `schedule_add`) can also set explicit tier hints. The whole system is on by default — `SWITCHROOM_CHEAP_CRON=0` is the master kill-switch (see `docs/rfcs/cheap-cron-sessions.md`):
 
 | You want… | Use | Cost |
 |---|---|---|
-| The fire to act *as the agent* (persona, memory, recent chat) | default (no `model`) — **Tier 2** | full live-session turn |
-| Light, self-contained work (summarise/format) — no memory needed | `model: sonnet` / `context: fresh` — **Tier 1** | a fresh minimal-context cheap session |
+| The fire to act *as the agent* (persona, accumulated chat context) | `context: agent` (or just a daily/weekly cadence) — **Tier 2** | full live-session turn |
+| Light, self-contained work (summarise/format) — no live-session context needed | `model: sonnet` / `context: fresh`, **or any frequent (≤60min) cron by default** — **Tier 1** | a fresh minimal-context cheap session (still shares memory + tools) |
 | "Only do something when X changes" (a webpage/API) | `kind: poll` (operator-set; egress-gated) — **Tier 0** | model-free check; a model fire only on a *hit* |
 | "Do this exact mechanical thing on a schedule" (post a fixed message, ping a webhook) | `kind: action` (operator-set) — **Tier 0** | model-free; the action *completes* the work — **no model at all** |
 | "Do something when a message is reacted to" | **`reaction_dispatch`** (event-driven, #2291) — not a cron at all | zero polling; the reaction wakes the agent |
