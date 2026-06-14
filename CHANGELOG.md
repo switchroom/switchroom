@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.15.22 — admin config edits name the agents to restart (#2346)
+
+### PR — feat(config-edit): name which agents to restart for an admin edit (#2346)
+
+Closes the admin/arbitrary-edit half of the "config edit takes effect" gap. An
+admin agent's `config_propose_edit` is written + reconciled, but claude loads
+config at boot — so the change was silently INERT in the running agents until a
+restart, with no signal which ones. The finalize card just said "✅ Applied".
+
+Now the Applied card names exactly which agents must restart, with the command:
+"🔄 Not live until restart — affects: clerk, gymbro · `/restart clerk` ·
+`/restart gymbro`"; a shared/inherited change (defaults / profiles / top-level)
+guides to "affects all agents — run `switchroom rollout`".
+
+- New `src/host-control/config-blast-radius.ts` `classifyBlastRadius(before,
+  after)` deep-diffs the config: `agents.<X>.*` → agent X; defaults / profiles /
+  any other top-level → fleet-wide. **Fails safe** — unparseable or ambiguous →
+  fleet-wide (over-inclusive; never silently under-reports). Pure + unit-tested.
+- Read-only classification + honest card text; **no auto-restart, no new
+  authorization path**. The self-scoped "Always allow" case already
+  auto-restarts (#2343); this completes the admin case at the legibility level.
+  A one-tap "Restart affected" button was deferred (would add a callback stack on
+  the riskiest surface for a one-tap delta over the command the card shows).
+
 ## v0.15.21 — approval cards resume reliably (mid-turn strand fix) (#2340)
 
 ### PR — fix(gateway): turn-gate vault/secret resume synthetics (#2340)
