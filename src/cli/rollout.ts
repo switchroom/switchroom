@@ -33,11 +33,12 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, renameSync, chownSync } from "node:fs";
+import { readFileSync, chownSync, statSync } from "node:fs";
 import type { Command } from "commander";
 import { getConfig, getConfigPath } from "./helpers.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { atomicWriteFileSync } from "../util/atomic.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -350,11 +351,10 @@ export function registerRolloutCommand(program: Command): void {
           const before = readFileSync(configPath, "utf8");
           const after = setReleasePinInConfig(before, pin);
           if (after === before) return; // idempotent no-op
-          // Atomic tmp+rename — switchroom.yaml is the fleet's single source
-          // of truth; a SIGKILL mid-write mustn't corrupt it.
-          const tmp = `${configPath}.tmp`;
-          writeFileSync(tmp, after, { mode: 0o644 });
-          renameSync(tmp, configPath);
+          // Crash-safe atomic write (fsync + unique tmp + rename), preserving
+          // the file's existing mode — switchroom.yaml is the fleet's single
+          // source of truth; a crash mid-write mustn't corrupt or truncate it.
+          atomicWriteFileSync(configPath, after, statSync(configPath).mode & 0o777);
           // rollout self-elevates via sudo; a root write would leave the
           // operator-owned config root-owned and EACCES-lock other yaml verbs
           // (and erode the read-only-operator-config foundation). chown back.
