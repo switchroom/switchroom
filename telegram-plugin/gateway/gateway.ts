@@ -18622,6 +18622,55 @@ bot.command('version', async ctx => {
 })
 
 
+// /whoami — the operator's view of THIS agent's sandbox (the same
+// `config whoami` the agent itself can call as an MCP tool, and the host CLI
+// exposes). Read-only, isAuthorizedSender-gated like /version — surfaces
+// tools / MCP / vault key-NAMES (never values) / powers so the operator can
+// see at a glance what this agent is authorized for.
+bot.command('whoami', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  try {
+    let raw: string
+    try { raw = switchroomExecCombined(['config', 'whoami'], 10000) }
+    catch (err: unknown) { raw = (err as any).stdout ?? (err as any).message ?? 'whoami failed' }
+    const trimmed = stripAnsi(raw).trim()
+    let card: string
+    try { card = formatWhoamiCard(JSON.parse(trimmed.split('\n').pop() ?? trimmed)) }
+    catch { card = preBlock(formatSwitchroomOutput(trimmed || 'whoami: no output')) }
+    await switchroomReply(ctx, card, { html: true })
+  } catch (err: unknown) {
+    await switchroomReply(ctx, `<b>whoami failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+  }
+})
+
+/** Compact HTML card from the `config whoami` JSON view. Names/booleans only. */
+function formatWhoamiCard(v: {
+  name?: string; persona?: string | null; model?: string | null; tier?: string;
+  tools?: { allow?: string[]; deny?: string[] }; mcpServers?: string[]; skills?: string[];
+  vault?: { key: string; readable: boolean }[];
+  powers?: { admin?: boolean; root?: boolean; configEdit?: boolean; crossAgentHostVerbs?: boolean };
+  scheduleCount?: number; memoryBackend?: string | null;
+}): string {
+  const esc = escapeHtmlForTg
+  const yn = (b?: boolean) => (b ? '✓' : '✗')
+  const lines: string[] = []
+  lines.push(`👤 <b>${esc(v.name ?? '?')}</b> · ${esc(v.tier ?? 'standard')}`)
+  if (v.persona) lines.push(esc(v.persona))
+  if (v.model) lines.push(`Model: ${esc(v.model)}`)
+  const allow = v.tools?.allow ?? []
+  lines.push(`Tools: ${allow.length ? esc(allow.slice(0, 8).join(', ')) + (allow.length > 8 ? ` …(+${allow.length - 8})` : '') : '—'}`)
+  if ((v.tools?.deny ?? []).length) lines.push(`Denied: ${esc((v.tools!.deny!).join(', '))}`)
+  if ((v.mcpServers ?? []).length) lines.push(`MCP: ${esc(v.mcpServers!.join(', '))}`)
+  if ((v.skills ?? []).length) lines.push(`Skills: ${esc(v.skills!.join(', '))}`)
+  if ((v.vault ?? []).length) {
+    lines.push(`Vault keys (names only): ${v.vault!.map(k => `${esc(k.key)} ${yn(k.readable)}`).join(', ')}`)
+  }
+  const p = v.powers ?? {}
+  lines.push(`Powers: admin ${yn(p.admin)} · root ${yn(p.root)} · config-edit ${yn(p.configEdit)} · cross-agent verbs ${yn(p.crossAgentHostVerbs)}`)
+  lines.push(`Schedule: ${v.scheduleCount ?? 0} cron · Memory: ${esc(v.memoryBackend ?? 'none')}`)
+  return lines.join('\n')
+}
+
 bot.command('commands', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(ctx, buildSwitchroomHelpText(getMyAgentName()), { html: true })

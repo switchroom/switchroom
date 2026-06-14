@@ -49,6 +49,7 @@ describe("TOOLS export", () => {
       "skill_remove",          // #1163 Phase 2
       "skill_remove_personal", // #1819 Phase 1
       "skill_search",          // #1819 Phase 3
+      "whoami",                // legibility — "see your own sandbox"
     ]);
   });
 
@@ -75,6 +76,15 @@ describe("dispatchTool — happy path", () => {
     // Ensure --agent was forwarded.
     const [, args] = spawnSyncMock.mock.calls[0]!;
     expect(args).toEqual(["config", "get", "--agent", "a"]);
+  });
+
+  it("whoami shells `config whoami` and parses the JSON view", () => {
+    okCall(JSON.stringify({ name: "a", tier: "admin", tools: { allow: [], deny: [] } }) + "\n");
+    const res = dispatchTool("whoami", { agent: "a" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text).tier).toBe("admin");
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["config", "whoami", "--agent", "a"]);
   });
 
   it("cron_list / skill_list parse JSON", () => {
