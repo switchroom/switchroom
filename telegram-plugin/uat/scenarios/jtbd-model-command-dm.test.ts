@@ -34,10 +34,13 @@ describe("uat: /model command — show, switch, bad-name", () => {
       const sc = await spinUp({ agent: AGENT });
       try {
         await sc.sendDM("/model");
-        // v2 (picker-driven menu): "Now: <model>"; v1 / fallback path:
-        // "Configured: <model>". Either proves the gateway handled the
-        // command rather than forwarding it to claude as plain text.
-        const shape = /Now:|Configured:/i;
+        // v2 (picker-driven menu) renders the live model as
+        // "Default (new sessions): <model>" (shipped wording, verified
+        // live on test-harness v0.15.21); "Now: <model>" was the
+        // pre-ship wording; v1 / fallback path renders "Configured:
+        // <model>". Any of these proves the gateway handled the command
+        // rather than forwarding it to claude as plain text.
+        const shape = /Default \(new sessions\):|Now:|Configured:/i;
         const reply = await sc.expectMessage(shape, {
           from: "bot",
           timeout: REPLY_TIMEOUT_MS,
