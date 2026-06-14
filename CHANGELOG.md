@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.15.21 — approval cards resume reliably (mid-turn strand fix) (#2340)
+
+### PR — fix(gateway): turn-gate vault/secret resume synthetics (#2340)
+
+Approval cards (vault grant approve/deny, secret provide/decline, vault save)
+inject a synthetic "resume your task" inbound to wake the waiting agent. That
+inject did a raw `ipcServer.sendToAgent` and only buffered the message when the
+bridge was disconnected (`delivered=false`). But approvals routinely land
+**while the agent's grant-requesting turn is still finishing** — the socket
+write succeeds (`delivered=true`) yet claude is mid-turn, so the channel
+notification is typed into its TUI composer and stranded by the
+turn-completion race (the #1556 lawgpt-composer wedge class). `delivered=true`
+meant the buffer never rescued it, so the agent sat idle until the operator
+manually poked it — the "approved but doesn't continue" symptom. It got worse
+recently because Telegram-ID auto-unlock + cached passphrase mint the grant
+while the requesting turn is still open, so approvals now land mid-turn far
+more often.
+
+- All eight resume synthetics (`vault_grant_approved`/`denied`,
+  `secret_provided`/`declined`/`provide_failed`,
+  `vault_save_completed`/`failed`/`discarded`) now route through a new
+  `deliverResumeSyntheticOrBuffer` helper that consults the **same**
+  `decideInboundDelivery` turn-gate the normal Telegram inbound path uses.
+  Mid-turn → `buffer-until-idle` (the turn-end drain + idle-drain timer flush
+  it the instant claude goes idle, where it lands cleanly as a fresh turn);
+  idle → deliver; bridge-down → buffer (unchanged #1150 behaviour).
+- Live proof (clerk `hotdoc/credentials`, 2026-06-13): injection 179ms before
+  `turn_end`, then 2 minutes of silence until a manual poke.
+- Other approval families (dangerous-tool / skill / MCP permissions,
+  Drive/Microsoft writes, hostd config edits) were never affected — they keep
+  the turn alive (suspend-in-place or block-in-turn) rather than ending it, so
+  an approval flows straight back into the running turn.
+
 ## v0.15.20 — admin-agent self-management: see your sandbox, grants take effect, durable pins (#2339, #2341, #2343)
 
 Three improvements that let an admin/root agent (and the operator) manage the
