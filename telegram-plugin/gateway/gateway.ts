@@ -1717,6 +1717,53 @@ function formatFeedElapsed(ms: number): string {
 function turnInFlightForGate(): boolean {
   return isDeliveryCutoverEnabled() ? isMachineInTurn() : claudeBusyKeys.size > 0
 }
+
+/**
+ * Deliver a synthetic "resume" inbound — the wake-up the gateway sends
+ * after an operator approves/denies a vault grant, provides/declines a
+ * requested secret, or completes/fails/discards a vault save — turn-gated
+ * exactly like a real Telegram inbound.
+ *
+ * THE BUG (clerk `hotdoc/credentials`, 2026-06-13): these synthetics did a
+ * raw `ipcServer.sendToAgent` and buffered ONLY on `delivered=false`
+ * (bridge disconnected). But approvals routinely land WHILE the agent's
+ * grant-requesting turn is still finishing — the socket write succeeds
+ * (`delivered=true`) yet claude is mid-turn, so the channel notification
+ * is typed into its TUI composer and stranded by the turn-completion race
+ * (#1556, the lawgpt wedge). `delivered=true` → the buffer never rescued
+ * it → the agent sat idle until the operator manually poked it. Observed:
+ * injection 179ms BEFORE turn_end, then 2 minutes of silence.
+ *
+ * Fix: route through the SAME `decideInboundDelivery` gate the Telegram
+ * `handleInbound` path uses. Mid-turn → `buffer-until-idle` (the
+ * turn-complete hook `releaseTurnBufferGate → drainBufferedIfAllowed`,
+ * plus the idle-drain timer, flush it the instant claude goes idle, where
+ * it lands cleanly as a fresh turn). Idle → deliver now; buffer on a
+ * genuine delivery miss exactly as before. Unlike the cron `inject_inbound`
+ * path (deliberately ungated — at-least-once replay), a one-shot resume
+ * synthetic must never strand, so it IS gated.
+ *
+ * Returns true iff delivered to the bridge now (false = buffered/held;
+ * the caller's forensic log records this as `delivered=false`, which now
+ * means "held mid-turn OR bridge-down" — both are "will flush when idle",
+ * never "dropped").
+ */
+function deliverResumeSyntheticOrBuffer(agent: string, synthetic: InboundMessage): boolean {
+  const decision = decideInboundDelivery({
+    turnInFlight: turnInFlightForGate(),
+    isSteering: false,
+    isInterrupt: false,
+  })
+  if (decision === 'buffer-until-idle') {
+    pendingInboundBuffer.push(agent, synthetic)
+    return false
+  }
+  const delivered = ipcServer.sendToAgent(agent, synthetic)
+  if (delivered) markClaudeBusyForInbound(synthetic)
+  else pendingInboundBuffer.push(agent, synthetic)
+  return delivered
+}
+
 const pendingRestarts = new Map<string, number>()  // agentName -> timestamp when restart was requested
 
 // ─── Proactive context compaction (session.max_context_tokens) ──────────
@@ -8942,9 +8989,7 @@ async function captureProvidedSecret(
       stage_id: armed.stageId,
     },
   }
-  const delivered = ipcServer.sendToAgent(armed.agent, synthetic)
-  if (delivered) markClaudeBusyForInbound(synthetic)
-  else pendingInboundBuffer.push(armed.agent, synthetic)
+  const delivered = deliverResumeSyntheticOrBuffer(armed.agent, synthetic)
   process.stderr.write(
     `telegram gateway: secret_provided injection agent=${armed.agent} key=${armed.key} stage=${armed.stageId} delivered=${delivered}\n`,
   )
@@ -9025,9 +9070,7 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
         stage_id: stageId,
       },
     }
-    const delivered = ipcServer.sendToAgent(pending.agent, synthetic)
-    if (delivered) markClaudeBusyForInbound(synthetic)
-    else pendingInboundBuffer.push(pending.agent, synthetic)
+    deliverResumeSyntheticOrBuffer(pending.agent, synthetic)
     return
   }
 
@@ -16563,22 +16606,14 @@ async function performVaultAccessApproval(
     stageId,
     operatorId: senderId,
   })
-  const delivered = ipcServer.sendToAgent(pending.agent, synthetic)
-  if (delivered) markClaudeBusyForInbound(synthetic)
+  // Turn-gated via deliverResumeSyntheticOrBuffer: mid-turn → buffer
+  // (flushed at turn-end) so the resume never strands in claude's
+  // composer (#1556); idle → deliver; bridge-down → buffer (#1150).
+  const delivered = deliverResumeSyntheticOrBuffer(pending.agent, synthetic)
   process.stderr.write(
     `telegram gateway: vault_grant_approved injection agent=${pending.agent} ` +
     `key=${pending.key} stage=${stageId} delivered=${delivered}\n`,
   )
-  // #1150 root cause: if `delivered=false` the bridge wasn't connected
-  // at send-time (mid-reconnect, claude-session bouncing between
-  // turns, etc). Pre-fix this just logged + dropped — the agent stayed
-  // idle forever and the operator had to poke. Now we buffer the
-  // inbound so the next bridge-register call drains it. Bounded to
-  // 32 entries per agent (see pending-inbound-buffer.ts) — a never-
-  // reconnecting bridge can't fill memory.
-  if (!delivered) {
-    pendingInboundBuffer.push(pending.agent, synthetic)
-  }
 }
 
 async function handleVaultRequestAccessCallback(ctx: Context, data: string): Promise<void> {
@@ -16644,15 +16679,11 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
       stageId,
       operatorId: senderId,
     })
-    const denyDelivered = ipcServer.sendToAgent(pending.agent, denyInbound)
-    if (denyDelivered) markClaudeBusyForInbound(denyInbound)
+    const denyDelivered = deliverResumeSyntheticOrBuffer(pending.agent, denyInbound)
     process.stderr.write(
       `telegram gateway: vault_grant_denied injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${denyDelivered}\n`,
     )
-    if (!denyDelivered) {
-      pendingInboundBuffer.push(pending.agent, denyInbound)
-    }
     return
   }
 
@@ -16823,13 +16854,11 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       stageId,
       operatorId: senderId,
     })
-    const dDelivered = ipcServer.sendToAgent(pending.agent, discardInbound)
-    if (dDelivered) markClaudeBusyForInbound(discardInbound)
+    const dDelivered = deliverResumeSyntheticOrBuffer(pending.agent, discardInbound)
     process.stderr.write(
       `telegram gateway: vault_save_discarded injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${dDelivered}\n`,
     )
-    if (!dDelivered) pendingInboundBuffer.push(pending.agent, discardInbound)
     return
   }
 
@@ -16952,13 +16981,11 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         operatorId: senderId,
         reason: failReason,
       })
-      const fDelivered = ipcServer.sendToAgent(pending.agent, failInbound)
-      if (fDelivered) markClaudeBusyForInbound(failInbound)
+      const fDelivered = deliverResumeSyntheticOrBuffer(pending.agent, failInbound)
       process.stderr.write(
         `telegram gateway: vault_save_failed injection agent=${pending.agent} ` +
         `key=${pending.key} stage=${stageId} delivered=${fDelivered}\n`,
       )
-      if (!fDelivered) pendingInboundBuffer.push(pending.agent, failInbound)
       return
     }
 
@@ -16987,13 +17014,11 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       stageId,
       operatorId: senderId,
     })
-    const okDelivered = ipcServer.sendToAgent(pending.agent, okInbound)
-    if (okDelivered) markClaudeBusyForInbound(okInbound)
+    const okDelivered = deliverResumeSyntheticOrBuffer(pending.agent, okInbound)
     process.stderr.write(
       `telegram gateway: vault_save_completed injection agent=${pending.agent} ` +
       `key=${pending.key} stage=${stageId} delivered=${okDelivered}\n`,
     )
-    if (!okDelivered) pendingInboundBuffer.push(pending.agent, okInbound)
     return
   }
 

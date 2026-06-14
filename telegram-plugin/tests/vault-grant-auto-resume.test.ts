@@ -39,17 +39,28 @@ function extractPerformBlock(): string {
 describe("performVaultAccessApproval injects a synthetic inbound on success (#1052)", () => {
   const block = extractPerformBlock();
 
-  it("calls ipcServer.sendToAgent AFTER successful mint + token-write", () => {
+  it("routes the resume injection through the turn-gated helper AFTER successful mint + token-write", () => {
     // fails when: the auto-resume injection gets dropped. Pre-fix
     // operator had to message the agent again to resume the task —
     // the injection is the load-bearing wiring.
-    expect(block, "missing ipcServer.sendToAgent call").toMatch(/ipcServer\.sendToAgent\(/);
+    //
+    // The raw `ipcServer.sendToAgent` was replaced by
+    // `deliverResumeSyntheticOrBuffer` (the mid-turn-strand fix,
+    // 2026-06-14): a resume delivered while the grant-requesting turn
+    // is still finishing used to strand in claude's composer
+    // (delivered=true but mid-turn → #1556). The helper turn-gates the
+    // send (buffer-until-idle when a turn is in flight) so the resume
+    // always lands as a fresh turn. Pinning the helper call (not raw
+    // sendToAgent) is the new load-bearing contract.
+    expect(block, "missing deliverResumeSyntheticOrBuffer call").toMatch(
+      /deliverResumeSyntheticOrBuffer\(/,
+    );
     // Must run AFTER the mint-success path (i.e., after the
     // `result.kind === 'error'` early-return guard).
     const errorReturn = block.indexOf("result.kind === 'error'");
-    const sendIdx = block.indexOf("ipcServer.sendToAgent(");
+    const sendIdx = block.indexOf("deliverResumeSyntheticOrBuffer(");
     expect(errorReturn).toBeGreaterThan(0);
-    expect(sendIdx, "sendToAgent must come AFTER the error-return early exit").toBeGreaterThan(errorReturn);
+    expect(sendIdx, "the resume helper must come AFTER the error-return early exit").toBeGreaterThan(errorReturn);
   });
 
   it("delegates inbound construction to buildVaultGrantApprovedInbound", () => {
