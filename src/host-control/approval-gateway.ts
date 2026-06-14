@@ -34,6 +34,10 @@ export interface ApprovalResult {
   finalize: (outcome: {
     outcome: "applied" | "reconcile_failed_rolled_back";
     detail?: string;
+    /** Agents that must restart for the edit to go live (empty if fleetWide). */
+    affectedAgents?: string[];
+    /** True when a shared/inherited key changed → all agents affected. */
+    fleetWide?: boolean;
   }) => Promise<void>;
 }
 
@@ -74,6 +78,8 @@ export class SocketApprovalGateway implements ApprovalGateway {
       const finalize = async (outcome: {
         outcome: "applied" | "reconcile_failed_rolled_back";
         detail?: string;
+        affectedAgents?: string[];
+        fleetWide?: boolean;
       }): Promise<void> => {
         // Best-effort single-shot write on the existing connection.
         if (client.destroyed) return;
@@ -84,6 +90,8 @@ export class SocketApprovalGateway implements ApprovalGateway {
               requestId: req.requestId,
               outcome: outcome.outcome,
               ...(outcome.detail ? { detail: outcome.detail } : {}),
+              ...(outcome.affectedAgents ? { affectedAgents: outcome.affectedAgents } : {}),
+              ...(outcome.fleetWide !== undefined ? { fleetWide: outcome.fleetWide } : {}),
             }) + "\n",
           );
           client.end();

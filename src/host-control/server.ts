@@ -60,6 +60,7 @@ import {
   validateConfigEdit,
   assertSelfScopedAllowEdit,
 } from "./config-edit-validator.js";
+import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
@@ -1508,7 +1509,15 @@ export class HostdServer {
         (async () => this.runSwitchroom(["apply"]));
       const recRes = await runner({ requestId: approvalId });
       if (recRes.exit_code === 0) {
-        await approval.finalize({ outcome: "applied" });
+        // Tell the operator which agents must restart for this edit to go
+        // live (claude loads config at boot — an applied edit is inert until
+        // restart). Fails safe to fleet-wide on any ambiguity.
+        const blast = classifyBlastRadius(snapshot, postApply);
+        await approval.finalize({
+          outcome: "applied",
+          affectedAgents: blast.agents,
+          fleetWide: blast.fleetWide,
+        });
         return {
           v: 1,
           request_id: req.request_id,
