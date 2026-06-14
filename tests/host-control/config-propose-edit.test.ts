@@ -245,7 +245,8 @@ describe("hostd config_propose_edit — non-admin self-scoped always-allow", () 
     expect(resp.result).toBe("completed");
     expect(requests.length).toBe(1);
     expect(requests[0]!.agentName).toBe("bob");
-    expect(finalizeCalls).toEqual([{ outcome: "applied" }]);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("applied");
     const live = readFileSync(configPath, "utf8");
     expect(live).toContain("mcp__perplexity__search");
     expect(reconcileInvocations).toBe(1);
@@ -534,7 +535,8 @@ describe("hostd config_propose_edit — apply path (#1623)", () => {
     expect(requests[0]!.requestId).toBe("deadbeef");
     expect(requests[0]!.agentName).toBe("klanker");
     expect(requests[0]!.unifiedDiff).toBe(GOOD_DIFF);
-    expect(finalizeCalls).toEqual([{ outcome: "applied" }]);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("applied");
     // Live file actually contains the post-patch content.
     const live = readFile(configPath, "utf8");
     expect(live).toContain("# touched by apply-path test");
@@ -745,7 +747,8 @@ describe("hostd config_propose_edit — bind-mount-safe in-place write", () => {
     await server.start();
     const resp = await send({ unified_diff: GOOD_DIFF, request_id: "ip-1" });
     expect(resp.result).toBe("completed");
-    expect(finalizeCalls).toEqual([{ outcome: "applied" }]);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("applied");
     // Content updated …
     expect(readFile(configPath, "utf8")).toContain(
       "# touched by apply-path test",

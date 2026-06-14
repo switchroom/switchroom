@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   buildConfigApprovalCardBody,
+  buildLiveNote,
   handleRequestConfigApproval,
   handleRequestConfigFinalize,
   parseConfigApprovalCallback,
@@ -263,6 +264,29 @@ describe("timeout path", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("buildLiveNote", () => {
+  it("names specific affected agents + the per-agent restart command", () => {
+    const note = buildLiveNote(["clerk", "gymbro"], false);
+    expect(note).toContain("clerk, gymbro");
+    expect(note).toContain("/restart clerk");
+    expect(note).toContain("/restart gymbro");
+    expect(note).toContain("Not live until restart");
+  });
+  it("guides to a full rollout when fleet-wide (no per-agent list)", () => {
+    const note = buildLiveNote([], true);
+    expect(note).toContain("all agents");
+    expect(note).toContain("switchroom rollout");
+    expect(note).not.toContain("/restart");
+  });
+  it("is empty when nothing is runtime-affected", () => {
+    expect(buildLiveNote([], false)).toBe("");
+    expect(buildLiveNote(undefined, undefined)).toBe("");
+  });
+  it("HTML-escapes agent names", () => {
+    expect(buildLiveNote(["a<b>"], false)).toContain("a&lt;b&gt;");
   });
 });
 

@@ -377,6 +377,27 @@ export async function resolvePendingConfigApproval(
   return true;
 }
 
+/**
+ * The "make it live" note appended to an Applied card. claude loads config at
+ * boot, so an applied edit is inert in the running agents until they restart —
+ * this names exactly what must bounce (and the command) instead of letting the
+ * change silently not take effect. Fleet-wide (shared config) → guide to a full
+ * rollout, never a per-agent list. Empty when nothing runtime-affected.
+ */
+export function buildLiveNote(affectedAgents?: string[], fleetWide?: boolean): string {
+  if (fleetWide) {
+    return (
+      `\n\n⚠️ Shared config changed — affects all agents. Not live until they ` +
+      `restart: run <code>switchroom rollout</code> (or <code>/update apply</code>).`
+    );
+  }
+  const agents = (affectedAgents ?? []).filter((a) => typeof a === "string" && a.length > 0);
+  if (agents.length === 0) return "";
+  const list = agents.map(escapeHtml).join(", ");
+  const cmds = agents.map((a) => `/restart ${escapeHtml(a)}`).join(" · ");
+  return `\n\n🔄 Not live until restart — affects: <b>${list}</b>\n${cmds}`;
+}
+
 /** IPC `request_config_finalize` handler — edits the card to the terminal outcome. */
 export async function handleRequestConfigFinalize(
   _client: Pick<IpcClient, "send">,
@@ -393,9 +414,15 @@ export async function handleRequestConfigFinalize(
   // Clean up the pending entry — finalize is the terminal transition.
   pending.delete(msg.requestId);
 
+  // On apply, tell the operator what must restart for the edit to go LIVE —
+  // claude loads config at boot, so an applied edit is inert until restart.
+  // Specific agents → name them + the one-liner to bounce them; shared config
+  // → guide to a full rollout (never silently leave the change un-live).
+  const liveNote =
+    msg.outcome === "applied" ? buildLiveNote(msg.affectedAgents, msg.fleetWide) : "";
   const body =
     msg.outcome === "applied"
-      ? `✅ <b>Applied</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}`
+      ? `✅ <b>Applied</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}${liveNote}`
       : `⚠️ <b>Reconcile failed; rolled back</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}`;
   try {
     await deps.editCard({

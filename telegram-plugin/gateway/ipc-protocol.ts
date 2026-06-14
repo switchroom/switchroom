@@ -391,6 +391,14 @@ export interface RequestConfigFinalizeMessage {
   outcome: "applied" | "reconcile_failed_rolled_back";
   /** Optional short diagnostic appended to the card body. */
   detail?: string;
+  /**
+   * On `applied`: agents that must restart for the edit to go live (claude
+   * loads config at boot). Empty when `fleetWide`. The finalize card offers a
+   * one-tap restart of these. Computed host-side by classifyBlastRadius.
+   */
+  affectedAgents?: string[];
+  /** On `applied`: a shared/inherited key changed → all agents affected. */
+  fleetWide?: boolean;
 }
 
 /**

@@ -307,6 +307,16 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (m.detail !== undefined
         && (typeof m.detail !== "string"
           || (m.detail as string).length > 500)) return false;
+      // affectedAgents (optional): a bounded list of kebab-case agent names —
+      // they drive a restart button, so validate shape + charclass even though
+      // the sender (hostd) is trusted (defense in depth).
+      if (m.affectedAgents !== undefined) {
+        if (!Array.isArray(m.affectedAgents) || (m.affectedAgents as unknown[]).length > 64) return false;
+        for (const a of m.affectedAgents as unknown[]) {
+          if (typeof a !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(a)) return false;
+        }
+      }
+      if (m.fleetWide !== undefined && typeof m.fleetWide !== "boolean") return false;
       return true;
     }
     case "request_drive_approval": {
