@@ -363,7 +363,7 @@ describe("dispatchTool — failure modes", () => {
   });
 });
 
-describe("dispatchTool — config_propose_edit (PR 1a stub)", () => {
+describe("dispatchTool — config_propose_edit", () => {
   const VALID_DIFF =
     "--- a/switchroom.yaml\n+++ b/switchroom.yaml\n@@ -1,1 +1,1 @@\n-a\n+b\n";
 
@@ -381,9 +381,9 @@ describe("dispatchTool — config_propose_edit (PR 1a stub)", () => {
       reason: "tweak the version comment",
       target_path: "/state/config/switchroom.yaml",
     });
-    // Daemon returned an error response — surfaces as isError but the
-    // request DID make it to the wire (this is the stub's expected
-    // outcome until PR 1b/1c).
+    // Daemon returned an error response (here: config-edit disabled) —
+    // surfaces as isError, but the request DID make it to the wire (this
+    // tests the MCP dispatch forwards a well-formed call to hostd).
     expect(res.isError).toBe(true);
     const sent = hostdRequestMock.mock.calls[0]![1];
     expect(sent.op).toBe("config_propose_edit");

@@ -42,8 +42,14 @@ describe("renderHostdComposeFile", () => {
     // setup) symlink it into ~/.switchroom/. The dir bind preserves
     // the symlink as a symlink (with a host-path target the container
     // can't resolve); the direct file bind follows the symlink at
-    // mount time.
+    // mount time. MUST be :rw — hostd is the sanctioned config writer
+    // (config_propose_edit applies an operator-approved diff in place);
+    // :ro makes every config edit fail EROFS and roll back. Regression
+    // guard for that bug.
     expect(out).toContain(
+      "/home/alice/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:rw",
+    );
+    expect(out).not.toContain(
       "/home/alice/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro",
     );
     // docker.sock is a fixed host path; bind-mount is host-home-agnostic.

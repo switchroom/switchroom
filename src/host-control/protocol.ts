@@ -251,24 +251,26 @@ export const AgentSmokeRequestSchema = z.object({
 
 // ─── PR 1a (admin-agent-config-edit RFC §3.1) ─────────────────────────────
 //
-// `config_propose_edit` — admin agent proposes a unified-diff patch
-// against `/state/config/switchroom.yaml`. PR 1a wires the wire shape
-// + dispatcher stub only; the validation pipeline (PR 1b) and apply
-// path (PR 1c) follow. Until then the dispatcher returns either
-// `E_CONFIG_EDIT_DISABLED` (flag off) or `E_NOT_IMPLEMENTED` (flag on).
+// `config_propose_edit` — an agent proposes a unified-diff patch against
+// `/state/config/switchroom.yaml`. SHIPPED end-to-end (#1623): the wire
+// shape, the validation pipeline, and the validate→approve→apply→reconcile
+// path are all live. When `hostd.config_edit_enabled` is false the
+// dispatcher returns `E_CONFIG_EDIT_DISABLED`; otherwise it validates,
+// raises an operator approval card, and applies on Allow. (`E_NOT_IMPLEMENTED`
+// is retained in the enum below for wire stability but is no longer returned.)
 //
-// Inputs mirror RFC §3.1: a unified diff body, a human-readable
-// rationale rendered onto the operator approval card in PR 1c, and an
-// explicit `target_path` that MUST equal the canonical config path —
-// future-proofing against accidental multi-file diffs and giving the
-// validator (PR 1b) a single load-bearing path string to anchor on.
+// Inputs: a unified diff body, a human-readable rationale rendered onto the
+// operator approval card, and an explicit `target_path` that MUST equal the
+// canonical config path — guarding against accidental multi-file diffs and
+// giving the validator a single load-bearing path string to anchor on.
 export const ConfigProposeEditRequestSchema = z.object({
   ...RequestEnvelope,
   op: z.literal("config_propose_edit"),
   args: z.object({
     /** Unified diff against switchroom.yaml. Wire layer bounds the
-     *  envelope; structural validation (≥3 lines context, no path
-     *  traversal, LF-only, ≤1 MB) is PR 1b's job. */
+     *  envelope; structural validation (any context level incl. zero,
+     *  no path traversal, single-file, LF-only, ≤1 MB) runs in
+     *  config-edit-validator. */
     unified_diff: z.string().min(1).max(MAX_FRAME_BYTES - 1024),
     /** Operator-visible justification rendered on the approval card.
      *  Hard-capped at 500 chars per RFC §3.3. */
@@ -281,20 +283,19 @@ export const ConfigProposeEditRequestSchema = z.object({
 });
 
 /**
- * Error codes returned by `config_propose_edit`. Stubbed wire vocabulary
- * for PR 1a — only the first two are reachable today; the rest are
- * declared up-front so callers (and the eventual approval-card
- * renderer) can switch on a stable enum once 1b/1c fill them in.
+ * Error codes returned by `config_propose_edit` (shipped, #1623). Stable
+ * wire enum; callers switch on it. `E_NOT_IMPLEMENTED` is RETAINED for wire
+ * compatibility but is no longer returned by any handler.
  *
- *   E_CONFIG_EDIT_DISABLED — `hostd.config_edit_enabled` is false (PR 1a)
- *   E_NOT_IMPLEMENTED      — flag on but the apply path isn't shipped (PR 1a)
- *   E_VALIDATION_REJECTED  — diff shape / path / encoding (PR 1b)
- *   E_SCHEMA_REJECTED      — post-patch yaml fails zod (PR 1b)
- *   E_APPLY_REJECTED       — `git apply --check` against live file failed (PR 1c)
- *   E_RATE_LIMITED         — per-agent token bucket exhausted (PR 1c)
- *   E_RECONCILE_FAILED     — `switchroom apply` exited non-zero post-write (PR 1c)
- *   E_DENIED               — operator tapped Deny (PR 1c)
- *   E_EXPIRED              — 10-minute timeout (PR 1c)
+ *   E_CONFIG_EDIT_DISABLED — `hostd.config_edit_enabled` is false
+ *   E_NOT_IMPLEMENTED      — retained for wire stability; NEVER returned now
+ *   E_VALIDATION_REJECTED  — diff shape / path / encoding
+ *   E_SCHEMA_REJECTED      — post-patch yaml fails zod
+ *   E_APPLY_REJECTED       — `git apply --check` against live file failed
+ *   E_RATE_LIMITED         — per-agent token bucket exhausted
+ *   E_RECONCILE_FAILED     — `switchroom apply` exited non-zero post-write
+ *   E_DENIED               — operator tapped Deny
+ *   E_EXPIRED              — 10-minute timeout
  */
 export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   "E_CONFIG_EDIT_DISABLED",

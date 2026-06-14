@@ -349,8 +349,9 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
   };
   if (opts.secrets && opts.secrets.length > 0) entry.secrets = opts.secrets;
   if (opts.name) entry.name = opts.name;
-  // Cheap-cron tier hints (inert unless SWITCHROOM_CHEAP_CRON is on). Plain
-  // ScheduleEntry fields validated by ScheduleEntrySchema on reconcile.
+  // Cheap-cron tier hints (active by default; SWITCHROOM_CHEAP_CRON=0/false/off
+  // is the kill-switch). Plain ScheduleEntry fields validated by
+  // ScheduleEntrySchema on reconcile.
   if (opts.model) entry.model = opts.model;
   if (opts.context) entry.context = opts.context;
 
@@ -669,7 +670,7 @@ export function registerAgentConfigWriteCommands(program: Command): void {
     .option("--name <slug>", "Optional human-readable name (a-z 0-9 -)")
     .option(
       "--model <id>",
-      "Cheap-cron tier hint: a known-cheap model (sonnet/haiku) routes this fire to a fresh, minimal-context cron session (Tier 1) instead of the agent's full live session (Tier 2), cutting token cost. Inert unless SWITCHROOM_CHEAP_CRON is on.",
+      "Cheap-cron tier hint: a known-cheap model (sonnet/haiku) routes this fire to a fresh, minimal-context cron session (Tier 1) instead of the agent's full live session (Tier 2), cutting token cost. Active by default; SWITCHROOM_CHEAP_CRON=0 is the kill-switch.",
     )
     .option(
       "--context <mode>",

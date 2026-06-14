@@ -132,8 +132,14 @@ services:
       # resolve there. Mounting the file directly forces docker to
       # follow the symlink at mount time and bind the underlying file
       # to the container path. Mirrors how the agent containers expose
-      # the config (also at /state/config/switchroom.yaml).
-      - ${hostHome}/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:ro
+      # the config (also at /state/config/switchroom.yaml) — but RW here,
+      # not ro: hostd is the SANCTIONED config writer (config_propose_edit
+      # applies an operator-approved diff in place via O_RDWR). With :ro the
+      # write fails EROFS and every config_propose_edit rolls back
+      # (E_RECONCILE_FAILED_ROLLED_BACK) — agents could never amend the yaml.
+      # Agents themselves still mount it ro; only hostd, the tap-gated writer,
+      # gets rw. The in-place writer preserves the file's owner/mode.
+      - ${hostHome}/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:rw
       # docker.sock is the whole reason hostd exists — agents shouldn't
       # have it, but hostd (auditing every shell-out via run-hook.sh's
       # pattern) is the controlled chokepoint.

@@ -179,9 +179,10 @@ export const ScheduleEntrySchema = z
       "model-free deterministic check (requires `poll`) and only escalates to " +
       "a model fire on a hit. 'action' runs a model-free deterministic verb " +
       "(requires `action`) that COMPLETES the work and never escalates — zero " +
-      "tokens, no session. poll/prompt are honoured only when " +
-      "SWITCHROOM_CHEAP_CRON is on; an action is model-free regardless (the " +
-      "kill-switch governs model tiering, not deterministic actions).",
+      "tokens, no session. poll/prompt tiering is on by default " +
+      "(SWITCHROOM_CHEAP_CRON=0 is the kill-switch); an action is model-free " +
+      "regardless (the kill-switch governs model tiering, not deterministic " +
+      "actions).",
     ),
   poll: PollSpecSchema.optional().describe("Required iff kind=poll. The declarative poll spec."),
   action: ActionSpecSchema.optional().describe("Required iff kind=action. The declarative action spec (telegram-message or webhook)."),
@@ -204,8 +205,8 @@ export const ScheduleEntrySchema = z
       "Does this cron need the agent, or just a model? 'fresh' → a minimal-" +
       "context cheap cron session (Tier 1). 'agent' → the agent's live " +
       "session with full persona/memory (Tier 2). Unset → inferred from " +
-      "`model` (cheap→fresh, else agent). Honoured only when " +
-      "SWITCHROOM_CHEAP_CRON is on.",
+      "`model` (cheap→fresh, else agent). On by default; " +
+      "SWITCHROOM_CHEAP_CRON=0 is the kill-switch.",
     ),
   secrets: z
     .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))

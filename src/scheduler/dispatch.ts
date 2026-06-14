@@ -34,9 +34,10 @@ export interface SchedulerEntry {
   promptKey: string;
   /**
    * Cheap-cron routing fields (docs/rfcs/cheap-cron-sessions.md). Consumed
-   * by the in-agent scheduler via resolveCronRouting() at fire time. All
-   * inert unless SWITCHROOM_CHEAP_CRON is on. `kind: poll` runs a model-free
-   * deterministic poll (requires `poll`) that only escalates on a hit.
+   * by the in-agent scheduler via resolveCronRouting() at fire time. Active by
+   * default; SWITCHROOM_CHEAP_CRON=0/false/off is the kill-switch. `kind: poll`
+   * runs a model-free deterministic poll (requires `poll`) that only escalates
+   * on a hit.
    */
   kind?: "poll" | "prompt" | "action";
   model?: string;
@@ -96,7 +97,7 @@ export function collectScheduleEntries(
         // Propagate the per-entry topic override (PR1 schema field).
         // Resolved at dispatch time via resolveOutboundTopic().
         ...(entry.topic !== undefined ? { topic: entry.topic } : {}),
-        // Cheap-cron routing fields — inert unless SWITCHROOM_CHEAP_CRON on.
+        // Cheap-cron routing fields — active by default (SWITCHROOM_CHEAP_CRON=0 disables).
         ...(entry.kind !== undefined ? { kind: entry.kind } : {}),
         ...(entry.model !== undefined ? { model: entry.model } : {}),
         ...(entry.context !== undefined ? { context: entry.context } : {}),

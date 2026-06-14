@@ -885,8 +885,8 @@ JTBDs — see "Design contract" above.)
 - **Config resolution** → `src/config/merge.ts` + `docs/configuration.md`.
 - **Progress card** → `telegram-plugin/stream-reply-handler.ts` +
   `telegram-plugin/card-format.ts` + `docs/telegram-plugin.md`.
-- **Background worker-activity feed** (flag
-  `SWITCHROOM_WORKER_ACTIVITY_FEED`, default off) → live edit-in-place
+- **Background worker-activity feed** (on by default; kill-switch
+  `SWITCHROOM_WORKER_ACTIVITY_FEED=0`) → live edit-in-place
   message per `run_in_background` sub-agent. Render in
   `telegram-plugin/worker-activity-feed.ts`; wired in
   `telegram-plugin/gateway/gateway.ts` `onProgress`/`onFinish`. The feed
