@@ -1748,19 +1748,19 @@ function turnInFlightForGate(): boolean {
  * means "held mid-turn OR bridge-down" — both are "will flush when idle",
  * never "dropped").
  */
-function deliverResumeSyntheticOrBuffer(agent: string, synthetic: InboundMessage): boolean {
+function deliverResumeSyntheticOrBuffer(agent: string, inbound: InboundMessage): boolean {
   const decision = decideInboundDelivery({
     turnInFlight: turnInFlightForGate(),
     isSteering: false,
     isInterrupt: false,
   })
   if (decision === 'buffer-until-idle') {
-    pendingInboundBuffer.push(agent, synthetic)
+    pendingInboundBuffer.push(agent, inbound)
     return false
   }
-  const delivered = ipcServer.sendToAgent(agent, synthetic)
-  if (delivered) markClaudeBusyForInbound(synthetic)
-  else pendingInboundBuffer.push(agent, synthetic)
+  const delivered = ipcServer.sendToAgent(agent, inbound)
+  if (delivered) markClaudeBusyForInbound(inbound)
+  else pendingInboundBuffer.push(agent, inbound)
   return delivered
 }
 
@@ -8954,9 +8954,7 @@ async function captureProvidedSecret(
         stage_id: armed.stageId,
       },
     }
-    const fdelivered = ipcServer.sendToAgent(armed.agent, failMsg)
-    if (fdelivered) markClaudeBusyForInbound(failMsg)
-    else pendingInboundBuffer.push(armed.agent, failMsg)
+    deliverResumeSyntheticOrBuffer(armed.agent, failMsg)
     return true
   }
 

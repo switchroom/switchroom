@@ -67,21 +67,31 @@ describe("resume synthetics use the turn-gate (mid-turn → buffer)", () => {
   });
 
   it("no resume synthetic is sent via a raw ungated ipcServer.sendToAgent", () => {
-    // Every *_approved/_denied, secret_provided/_declined,
-    // vault_save_completed/_failed/_discarded resume must route through
-    // the helper. A raw sendToAgent of one of these named inbound vars
-    // would reintroduce the mid-turn strand. The ONLY ipcServer.sendToAgent
-    // referencing these synthetics should be inside the helper itself
-    // (which sends a generic `synthetic` param), so none of the named
-    // resume vars may appear as a raw sendToAgent argument.
+    // Every resume wake-up — vault_grant_approved/denied, secret_provided/
+    // declined, secret_provide_failed, vault_save_completed/failed/discarded
+    // — must route through the helper. A raw sendToAgent of one of these
+    // named inbound vars would reintroduce the mid-turn strand. The helper
+    // deliberately names its param `inbound` (NOT any of these), so the
+    // ONLY legitimate raw sendToAgent is the helper's own
+    // `ipcServer.sendToAgent(agent, inbound)`; every resume-synthetic var
+    // name below must be absent as a raw send argument.
     const rawResumeSends = [
       ...gatewaySrc.matchAll(
-        /ipcServer\.sendToAgent\([^,]+,\s*(denyInbound|discardInbound|failInbound|okInbound)\)/g,
+        /ipcServer\.sendToAgent\([^,]+,\s*(synthetic|failMsg|denyInbound|discardInbound|failInbound|okInbound)\)/g,
       ),
     ];
     expect(
       rawResumeSends.map((m) => m[1]),
       "resume synthetic sent via raw sendToAgent — must use deliverResumeSyntheticOrBuffer",
     ).toEqual([]);
+  });
+
+  it("the helper's send uses a param name distinct from every resume var (keeps the grep guard honest)", () => {
+    // If the helper param were renamed back to `synthetic`, the guard
+    // above would get a false pass (the helper's own send would mask a
+    // regressed callsite). Pin the param name.
+    const start = gatewaySrc.indexOf("function deliverResumeSyntheticOrBuffer");
+    const sig = gatewaySrc.slice(start, start + 120);
+    expect(sig).toMatch(/deliverResumeSyntheticOrBuffer\(agent: string, inbound: InboundMessage\)/);
   });
 });
