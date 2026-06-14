@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.15.20 — admin-agent self-management: see your sandbox, grants take effect, durable pins (#2339, #2341, #2343)
+
+Three improvements that let an admin/root agent (and the operator) manage the
+fleet more legibly and reliably — each grounded in the access model (every
+change still flows from operator config or an operator tap; no agent authors
+its own authorization).
+
+### PR — feat(whoami): an agent can see its own sandbox (#2341)
+
+New on-demand legibility surface so an agent that hits a permission wall can
+see what it's actually authorized for instead of guessing or escalating
+(reference/access-model.md, "Dead-ends breed workarounds"):
+
+- **`whoami` MCP tool** on the already-scaffolded agent-config server — the
+  agent's primary consumer; its description says to call it FIRST when blocked.
+- **`switchroom config whoami`** host CLI verb; **operator `/whoami`** in
+  Telegram (read-only, like `/version`).
+- Reports tier, resolved tools (allow/deny), MCP servers, skills, vault KEY
+  NAMES (never values) each with the live ACL verdict, powers
+  (admin/root/config-edit/cross-agent verbs), schedule count, memory backend.
+- **Drift-free**: computed from the SAME enforcement functions that gate each
+  action (`resolveAgentConfig` + `checkAclByAgent`), not a hand-list. Pure
+  over config → works in-container. Secret values never appear.
+
+### PR — feat(approvals): "Always allow" auto-restarts so the grant takes effect (#2343)
+
+Tapping **🔁 Always allow** writes a durable grant, but claude loads settings
+at boot — so it was inert until a manual restart (the "restart agent for full
+effect" hint operators ignored, leaving the same permission to re-prompt).
+Now a durable Always-allow schedules a **marker-safe, turn-deferred
+SELF-restart** (caller agent only; fires at turn-complete, never mid-turn;
+only after the operator's tap) so the grant goes live automatically. Reuses
+the existing marker-safe restart machinery — no new primitive. Kill-switch
+`SWITCHROOM_AUTORESTART_ON_GRANT=0` (default-on).
+
+### PR — feat(cli): durable `--pin` for rollout / update (#2339)
+
+`switchroom rollout --pin vX` and `switchroom update --pin vX` were one-shot
+(never written to switchroom.yaml, so the next plain reconcile reverted the
+fleet). They now **persist `release.pin`** to the config (comment-preserving,
+atomic via `atomicWriteFileSync`, ownership-restored after a sudo write,
+idempotent, dry-run-safe) as the first step — so a pinned roll sticks. Shared
+helper across both verbs so the two `--pin` paths can't diverge.
+
 ## v0.15.19 — `/effort` Telegram command (#2336)
 
 ### PR — feat(telegram): `/effort` command — switch reasoning effort per session (#2336)
