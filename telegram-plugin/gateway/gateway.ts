@@ -438,6 +438,7 @@ import {
   lookupScopedGrant,
   sweepScopedGrants,
 } from '../scoped-approval.js'
+import { grantRestartDecision, type GrantRestartDecision } from './grant-restart.js'
 import { synthesizeAllowRuleDiff, extractAddedAllowRule } from '../permission-diff.js'
 import {
   readClaudeJsonOverage,
@@ -13402,6 +13403,54 @@ async function sweepBeforeSelfRestart(): Promise<void> {
 }
 
 /**
+ * Schedule a marker-safe, turn-deferred SELF-restart so a just-persisted
+ * config change ACTUALLY takes effect. claude loads tools / MCP servers /
+ * settings at process start, so a durable "Always allow" write is inert in
+ * the running session until the next restart — the old "restart agent for
+ * full effect" text asked the operator to do this by hand, and most never
+ * did (so the grant didn't stick and the same prompt reappeared). This
+ * completes the flow the operator already approved.
+ *
+ * CALLER-AGENT ONLY (an "Always allow" edits the calling agent's own
+ * `agents.<self>.tools.allow`, a provably single-agent blast radius). The
+ * restart fires when the CURRENT turn completes (via `pendingRestarts`),
+ * never mid-turn — so the operator-approved action finishes first. If no
+ * turn is in flight, it fires immediately after a short drain delay. A
+ * marker is written first so the post-restart greeting lands in the chat
+ * the operator tapped. Kill-switch: `SWITCHROOM_AUTORESTART_ON_GRANT=0`.
+ *
+ * Returns 'disabled' | 'deferred' | 'now'.
+ */
+function scheduleGrantRestart(
+  agentName: string,
+  chatId: string | number | undefined,
+  threadId: number | undefined,
+  reason: string,
+): GrantRestartDecision {
+  const decision = grantRestartDecision({
+    killSwitch: process.env.SWITCHROOM_AUTORESTART_ON_GRANT,
+    selfAgent: process.env.SWITCHROOM_AGENT_NAME,
+    agentName,
+    turnInFlight: turnInFlightForGate(),
+  })
+  if (decision === "disabled") return decision
+  // Marker first → the post-restart greeting lands in the chat the operator
+  // tapped, not the default operator DM.
+  if (chatId != null) {
+    writeRestartMarker({ chat_id: String(chatId), thread_id: threadId ?? null, ack_message_id: null, ts: Date.now() })
+  }
+  stampUserRestartReason(reason)
+  if (decision === "deferred") {
+    pendingRestarts.set(agentName, Date.now()) // fires at turn-complete (marker-safe)
+  } else {
+    // No turn to drain — restart now, after a short delay so this callback's
+    // card edit flushes first.
+    void sweepBeforeSelfRestart().finally(() => triggerSelfRestart(agentName, reason, 1500))
+  }
+  return decision
+}
+
+/**
  * Shape the `switchroom auth ...` CLI stdout into a Telegram-friendly
  * HTML block. Returns the body text AND the OAuth authorize URL (if
  * one was present in the output) so the caller can wire a tappable
@@ -19405,10 +19454,26 @@ bot.on('callback_query:data', async ctx => {
 
     const ok = durable
     const legacyNote = legacy && durable
+    // Make the durable grant LIVE: config_propose_edit's apply already
+    // regenerated the scaffold (settings.json with the new tools.allow), so a
+    // marker-safe, turn-deferred self-restart loads it — no more "restart by
+    // hand" hint that the operator ignores (leaving the grant inert until the
+    // next bounce). Only on the hostd-durable path (scaffold currency assured);
+    // legacy path keeps the manual hint. Self-agent only; kill-switch
+    // SWITCHROOM_AUTORESTART_ON_GRANT=0.
+    const restartScheduled =
+      ok && !legacy &&
+      scheduleGrantRestart(
+        agentName,
+        ctx.chat?.id,
+        (ctx.callbackQuery?.message as { message_thread_id?: number } | undefined)?.message_thread_id,
+        `always-allow: ${grantPhrase}`,
+      ) !== "disabled"
+    const liveSuffix = restartScheduled ? " — applying now (restarting to take effect)" : ""
     const ackText = ok
       ? (legacyNote
           ? `✅ Saved. ${agentName} can now ${grantPhrase} without asking (legacy path).`
-          : `✅ Saved. ${agentName} can now ${grantPhrase} without asking.`)
+          : `✅ Saved. ${agentName} can now ${grantPhrase} without asking.${liveSuffix}`)
       : (editLockHint
           ? `⚠️ Allowed for now — config edits are locked. Enable hostd.config_edit_enabled.`
           : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`)
@@ -19425,7 +19490,9 @@ bot.on('callback_query:data', async ctx => {
     const editLabel = ok
       ? (legacyNote
           ? `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking (legacy path); restart agent for full effect`
-          : `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking; restart agent for full effect`)
+          : restartScheduled
+            ? `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking — applying now (restarting to take effect).`
+            : `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking; restart agent for full effect`)
       : (editLockHint
           ? `⚠️ <b>Allowed for now — "always" did NOT save.</b> Config edits are locked; enable <code>hostd.config_edit_enabled</code>.`
           : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`)
