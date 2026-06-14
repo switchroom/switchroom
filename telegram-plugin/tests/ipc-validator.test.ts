@@ -332,4 +332,32 @@ describe('validateClientMessage', () => {
       expect(validateClientMessage({ ...valid, ttlMs: '300000' })).toBe(false)
     })
   })
+
+  describe('request_config_finalize — affectedAgents / fleetWide (#2346)', () => {
+    const valid = { type: 'request_config_finalize', requestId: 'r1', outcome: 'applied' }
+
+    it('accepts the bare message and the new optional fields', () => {
+      expect(validateClientMessage(valid)).toBe(true)
+      expect(validateClientMessage({ ...valid, affectedAgents: ['clerk', 'gymbro'], fleetWide: false })).toBe(true)
+      expect(validateClientMessage({ ...valid, affectedAgents: [], fleetWide: true })).toBe(true)
+    })
+
+    it('rejects a non-array affectedAgents', () => {
+      expect(validateClientMessage({ ...valid, affectedAgents: 'clerk' })).toBe(false)
+    })
+
+    it('rejects affectedAgents with an unsafe / non-kebab name (defense in depth)', () => {
+      expect(validateClientMessage({ ...valid, affectedAgents: ['../etc'] })).toBe(false)
+      expect(validateClientMessage({ ...valid, affectedAgents: ['has space'] })).toBe(false)
+      expect(validateClientMessage({ ...valid, affectedAgents: [42] })).toBe(false)
+    })
+
+    it('rejects an over-long affectedAgents list', () => {
+      expect(validateClientMessage({ ...valid, affectedAgents: Array.from({ length: 65 }, (_, i) => `a${i}`) })).toBe(false)
+    })
+
+    it('rejects a non-boolean fleetWide', () => {
+      expect(validateClientMessage({ ...valid, fleetWide: 'yes' })).toBe(false)
+    })
+  })
 })
