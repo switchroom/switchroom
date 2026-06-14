@@ -45,7 +45,7 @@ Stall watchdogs promote to 🥱 (30s idle) then 😨 (90s) so the user always kn
 
 When an agent dispatches a sub-agent with `run_in_background: true`, that worker decouples from the parent turn — once the turn ends, a long-running worker would read as silence with nothing surfacing its progress. The worker-activity feed closes that gap.
 
-While the flag `SWITCHROOM_WORKER_ACTIVITY_FEED` is set (default **off**), the gateway posts **one regular Telegram message per background worker and edits it in place** as work happens:
+The feed is **on by default** (kill-switch: `SWITCHROOM_WORKER_ACTIVITY_FEED=0`). When on, the gateway posts **one regular Telegram message per background worker and edits it in place** as work happens:
 
 ```
 🔧 Worker · Crawl the repo for dead code
@@ -62,7 +62,7 @@ The header carries the **real dispatch task** (the `description` passed to the `
 
 (Failures finalize to `⚠️ Worker failed · …`.) It's the same "live, growing message" shape the agent's own answer uses — not a separate pinned card. Independently, the turn's 👍 (done) reaction is **held** while any background worker is still running, so the reaction never implies the work finished while a worker is still grinding.
 
-The feed is off by default and is intended for agents that routinely fan out background work. Enable it per-agent by setting `SWITCHROOM_WORKER_ACTIVITY_FEED=1` in the agent's gateway environment.
+The feed is on by default. To disable it per-agent, set `SWITCHROOM_WORKER_ACTIVITY_FEED=0` in the agent's gateway environment.
 
 ### Message history
 
@@ -198,4 +198,4 @@ The switchroom fork reads additional env vars from `start.sh`:
 | `TELEGRAM_STATE_DIR` | Auto-set by scaffold | Path to `telegram/` dir (history.db, access.json) |
 | `SWITCHROOM_AGENT_NAME` | Auto-set by scaffold | Agent name for self-restart detection |
 | `SWITCHROOM_CONFIG` | Auto-set by scaffold | Path to switchroom.yaml for config resolution |
-| `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (opt-in) | `1` enables the background worker-activity feed (default off). See "Background worker activity feed" above |
+| `SWITCHROOM_WORKER_ACTIVITY_FEED` | Gateway env (kill-switch) | On by default; `0` disables the background worker-activity feed. See "Background worker activity feed" above |

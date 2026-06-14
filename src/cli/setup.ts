@@ -1520,11 +1520,10 @@ async function stepGoogleWorkspace(
   // mints credentials in the broker, then `auth google enable
   // <email> <agent>` writes the per-agent ACL.
   //
-  // (The `account add` verb is a stub today per Phase 3b.3 — the
-  // OAuth flow extraction lives in Phase 3b.2d alongside refresh-
-  // tick wiring. Until that lands, the v0.6.0 `drive connect <agent>`
-  // verb still works as the OAuth onramp. Wizard surfaces both so
-  // operators can pick.)
+  // `account add` runs the full desktop-loopback OAuth flow end-to-end
+  // (mints + validates the refresh token, registers with the auth-broker);
+  // `enable` then writes the per-agent ACL. `drive connect <agent>` is the
+  // older single-agent onramp, kept as an alternative.
   const accountAddCmd = `switchroom auth google account add <your-google-account-email>`;
   const enableCmd = `switchroom auth google enable <your-google-account-email> ${firstName}`;
   const fallbackCmd = `switchroom drive connect ${firstName}`;
@@ -1543,12 +1542,11 @@ async function stepGoogleWorkspace(
     console.log(chalk.cyan(`      ${enableCmd}`));
     console.log();
     console.log(
-      chalk.gray(`    (\`account add\` is a stub today — Phase 3b.2d wires the OAuth flow.`),
+      chalk.gray(`    (\`account add\` runs the OAuth flow in your browser. Older`),
     );
     console.log(
-      chalk.gray(`     Until then, use the v0.6.0 fallback:`),
+      chalk.gray(`     single-agent alternative: ${fallbackCmd})`),
     );
-    console.log(chalk.gray(`       ${fallbackCmd})`));
   } else {
     console.log(chalk.gray(`  ${STEP_DONE} Skipped — connect later with:`));
     console.log(chalk.cyan(`    ${accountAddCmd}`));

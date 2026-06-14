@@ -15,13 +15,12 @@
  * `hostdRequest()` and surfaces the response. The wire-side gate is
  * the security boundary; this layer is plumbing.
  *
- * Surface decision: tools are exposed unconditionally even on
- * non-admin agents. The daemon-side gate already returns `denied` for
- * unauthorized cross-agent calls, so non-admin agents can still
- * self-restart via `agent_restart{name: "<self>"}`. Tool visibility
- * is not the security boundary.
+ * Surface decision: within an agent that HAS this server, every tool is
+ * exposed unconditionally — the daemon-side gate returns `denied` for
+ * unauthorized cross-agent calls, so tool visibility is not the security
+ * boundary. (The scaffold only wires this server into admin/root agents'
+ * .mcp.json — see scaffold.ts — so non-admin agents don't carry it at all.)
  *
- * Wired by the agent scaffold into .mcp.json for every agent (PR δ).
  * Socket lookup is path-as-identity: the agent's `SWITCHROOM_AGENT_NAME`
  * pins which `/run/switchroom/hostd/<name>/sock` to talk to.
  */
@@ -67,7 +66,7 @@ interface ToolArgs {
   // update_apply release-override (PR B)
   channel?: "dev" | "rc" | "latest";
   pin?: string;
-  // config_propose_edit (PR 1a — admin-agent-config-edit RFC §3.1)
+  // config_propose_edit args
   unified_diff?: string;
   target_path?: string;
 }
@@ -249,18 +248,20 @@ export const TOOLS = [
   {
     name: "config_propose_edit",
     description:
-      "Propose a unified-diff patch against /state/config/switchroom.yaml " +
-      "(RFC admin-agent-config-edit). When fully shipped the host validates " +
-      "the patch (applies cleanly + post-patch yaml parses against the " +
-      "config schema) and raises a Telegram approval card in the OPERATOR's " +
-      "primary chat — NOT yours; the requesting agent's chat is not the " +
-      "approval surface. Admin-only at the wire layer. " +
-      "Current status (PR 1a — skeleton): the tool is registered but the " +
-      "feature is OFF by default; calling it returns " +
-      "E_CONFIG_EDIT_DISABLED until the operator sets " +
-      "hostd.config_edit_enabled=true in switchroom.yaml. Even when enabled " +
-      "in this PR, the call returns E_NOT_IMPLEMENTED — the validation " +
-      "pipeline (PR 1b) and apply path (PR 1c) ship in follow-up PRs.",
+      "Propose a unified-diff patch against /state/config/switchroom.yaml. " +
+      "The host validates the patch (applies cleanly + post-patch yaml parses " +
+      "against the config schema + no secret leak), raises a Telegram approval " +
+      "card in the OPERATOR's primary chat (NOT yours — the requesting agent's " +
+      "chat is not the approval surface), and on Allow applies it in place and " +
+      "reconciles (rolling back if reconcile fails); returns " +
+      "result:\"completed\" on success. Use this — behind the operator's tap — " +
+      "to amend config instead of asking the operator to hand-edit the yaml. " +
+      "Admin agents may propose ANY field; non-admin agents are confined to " +
+      "their own agents.<self>.tools.allow. Requires " +
+      "hostd.config_edit_enabled=true (operator opt-in; default off) — returns " +
+      "E_CONFIG_EDIT_DISABLED otherwise. An applied edit is not live in the " +
+      "running agent until it restarts (the approval card names which agents " +
+      "to bounce).",
     inputSchema: {
       type: "object" as const,
       required: ["unified_diff", "reason", "target_path"],
@@ -269,9 +270,9 @@ export const TOOLS = [
           type: "string",
           minLength: 1,
           description:
-            "Unified diff against switchroom.yaml. Must have ≥3 lines " +
-            "context (enforced in PR 1b); no path-traversal or multi-file " +
-            "diffs. LF-only, ≤1 MB.",
+            "Unified diff against switchroom.yaml. Any context level (a " +
+            "zero-context diff is fine); single-file, no path-traversal. " +
+            "LF-only, ≤1 MB.",
         },
         reason: {
           type: "string",
@@ -446,9 +447,9 @@ export async function dispatchTool(
       break;
     }
     case "config_propose_edit": {
-      // PR 1a (admin-agent-config-edit RFC §3.1). Argument shape
-      // validated here before hitting the wire so the disabled-path
-      // response is clearly the daemon's, not a wire-decode rejection.
+      // Argument shape validated here before hitting the wire so the
+      // disabled-path response is clearly the daemon's, not a
+      // wire-decode rejection.
       if (!args.unified_diff || typeof args.unified_diff !== "string") {
         return errorText(
           "config_propose_edit: unified_diff is required (non-empty string).",

@@ -179,9 +179,10 @@ export const ScheduleEntrySchema = z
       "model-free deterministic check (requires `poll`) and only escalates to " +
       "a model fire on a hit. 'action' runs a model-free deterministic verb " +
       "(requires `action`) that COMPLETES the work and never escalates — zero " +
-      "tokens, no session. poll/prompt are honoured only when " +
-      "SWITCHROOM_CHEAP_CRON is on; an action is model-free regardless (the " +
-      "kill-switch governs model tiering, not deterministic actions).",
+      "tokens, no session. poll/prompt tiering is on by default " +
+      "(SWITCHROOM_CHEAP_CRON=0 is the kill-switch); an action is model-free " +
+      "regardless (the kill-switch governs model tiering, not deterministic " +
+      "actions).",
     ),
   poll: PollSpecSchema.optional().describe("Required iff kind=poll. The declarative poll spec."),
   action: ActionSpecSchema.optional().describe("Required iff kind=action. The declarative action spec (telegram-message or webhook)."),
@@ -204,8 +205,8 @@ export const ScheduleEntrySchema = z
       "Does this cron need the agent, or just a model? 'fresh' → a minimal-" +
       "context cheap cron session (Tier 1). 'agent' → the agent's live " +
       "session with full persona/memory (Tier 2). Unset → inferred from " +
-      "`model` (cheap→fresh, else agent). Honoured only when " +
-      "SWITCHROOM_CHEAP_CRON is on.",
+      "`model` (cheap→fresh, else agent). On by default; " +
+      "SWITCHROOM_CHEAP_CRON=0 is the kill-switch.",
     ),
   secrets: z
     .array(z.string().regex(/^[a-zA-Z0-9_\-/]+$/, "Secret key names must contain only alphanumeric characters, underscores, hyphens, and forward slashes"))
@@ -2853,9 +2854,9 @@ export const WebServiceConfigSchema = z.object({
  * critical surface (RFC §2.2, §5) and ships off until the operator
  * explicitly opts in.
  *
- * PR 1a (this PR) wires the schema field + a stub dispatcher. The
- * validation pipeline (1b) and apply path (1c) follow; until 1c lands
- * `config_edit_rate_per_hour` is configurable but not yet enforced.
+ * `config_propose_edit` is shipped (validate → operator approval → apply
+ * → reconcile). `config_edit_rate_per_hour` is configurable but the rate
+ * limiter is not yet enforced.
  */
 export const HostdConfigSchema = z.object({
   config_edit_enabled: z
@@ -2865,8 +2866,8 @@ export const HostdConfigSchema = z.object({
       "Opt-in toggle for the `config_propose_edit` hostd verb (RFC " +
       "admin-agent-config-edit §3). Default false — the verb returns " +
       "`E_CONFIG_EDIT_DISABLED` until the operator explicitly flips " +
-      "this to true. When true (and once PR 1c lands the apply path), " +
-      "admin agents can propose unified-diff patches against " +
+      "this to true. When true, admin agents can propose unified-diff " +
+      "patches against " +
       "`/state/config/switchroom.yaml`, gated by an operator approval " +
       "card in the primary chat. Same trust posture as `update_apply` " +
       "and `agent_restart`: the human-in-the-loop tap is the security " +
@@ -2881,10 +2882,9 @@ export const HostdConfigSchema = z.object({
     .describe(
       "Per-requesting-agent rate cap for `config_propose_edit` cards " +
       "(RFC admin-agent-config-edit §5). Default 3 cards/hour; min 1, " +
-      "max 20. Implemented as a sqlite token bucket in PR 1c; the " +
-      "field is wired here in PR 1a so operators can pin it before the " +
-      "limiter is live. Above the cap, the verb returns " +
-      "`E_RATE_LIMITED` without raising a card.",
+      "max 20. Configurable now, but the rate limiter is not yet enforced " +
+      "(no `E_RATE_LIMITED` is currently raised); the field is reserved so " +
+      "operators can pin the cap ahead of the limiter going live.",
     ),
 });
 
@@ -3059,8 +3059,8 @@ export const SwitchroomConfigSchema = z.object({
   hostd: HostdConfigSchema.default({}).describe(
     "hostd verb-level knobs (RFC admin-agent-config-edit). Distinct " +
     "from `host_control:` which governs whether the daemon runs at " +
-    "all. Currently scopes the opt-in flag and rate cap for the new " +
-    "`config_propose_edit` verb (PR 1a — disabled by default).",
+    "all. Scopes the opt-in flag and rate cap for the " +
+    "`config_propose_edit` verb (disabled by default).",
   ),
   web_service: WebServiceConfigSchema.default({}).describe(
     "Web-service container (dashboard + GitHub-webhook receiver) config. " +
