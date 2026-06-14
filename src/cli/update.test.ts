@@ -90,6 +90,44 @@ describe("planUpdate", () => {
     }
   });
 
+  it("inserts persist-release-pin BEFORE regen-compose when --pin is set, and its run persists the pin", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-persist-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const persisted: string[] = [];
+      const steps = planUpdate({
+        composePath,
+        hostControlEnabled: false,
+        pin: "v0.15.19",
+        persistPinFn: (p) => persisted.push(p),
+      });
+      const names = steps.map((s) => s.name);
+      // persist must come before the compose regen (so apply reads the persisted pin)
+      expect(names).toContain("persist-release-pin");
+      expect(names.indexOf("persist-release-pin")).toBeLessThan(
+        names.indexOf("regen-compose-for-release-override"),
+      );
+      // running the step persists exactly the pin
+      steps.find((s) => s.name === "persist-release-pin")!.run();
+      expect(persisted).toEqual(["v0.15.19"]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT insert persist-release-pin when --channel (not --pin) is set", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-chan-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const steps = planUpdate({ composePath, hostControlEnabled: false, channel: "latest" });
+      expect(steps.map((s) => s.name)).not.toContain("persist-release-pin");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("does NOT insert regen-compose-for-release-override when neither --channel nor --pin set", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-norel-"));
     try {

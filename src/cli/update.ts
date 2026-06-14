@@ -37,12 +37,41 @@
  */
 import { Option, type Command } from "commander";
 import chalk from "chalk";
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, renameSync, chownSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
-import { loadConfig } from "../config/loader.js";
+import { loadConfig, findConfigFile } from "../config/loader.js";
 import { writeRestartReasonMarker } from "../agents/lifecycle.js";
+import { setReleasePinInConfig } from "./release-yaml.js";
+import { resolveOperatorUid } from "./operator-uid.js";
+
+/**
+ * Default durable-pin persister for `update --pin`: comment-preserving,
+ * atomic, ownership-restoring write of `release.pin` to switchroom.yaml.
+ * Shares setReleasePinInConfig with `switchroom rollout --pin` so the two
+ * `--pin` paths can't diverge. Returns a no-op closure on the resolved
+ * config (or `configPath` override for tests).
+ */
+function defaultPersistPin(configPath?: string): (pin: string) => void {
+  return (pin: string) => {
+    const path = configPath ?? findConfigFile();
+    const before = readFileSync(path, "utf8");
+    const after = setReleasePinInConfig(before, pin);
+    if (after === before) return; // idempotent no-op
+    const tmp = `${path}.tmp`;
+    writeFileSync(tmp, after, { mode: 0o644 });
+    renameSync(tmp, path);
+    try {
+      if (typeof process.geteuid === "function" && process.geteuid() === 0) {
+        const uid = resolveOperatorUid();
+        if (uid !== undefined) chownSync(path, uid, uid);
+      }
+    } catch {
+      /* dev hosts may lack CAP_CHOWN — best-effort */
+    }
+  };
+}
 
 interface UpdateOptions {
   check?: boolean;
@@ -88,6 +117,13 @@ interface UpdateOptions {
   /** One-shot release-pin override (mirrors `apply --pin`). Mutually
    *  exclusive with `channel`. */
   pin?: string;
+  /** Test seam — replace the durable release.pin persister used when
+   *  `--pin` is set (default: comment-preserving atomic write to
+   *  switchroom.yaml via setReleasePinInConfig). */
+  persistPinFn?: (pin: string) => void;
+  /** Config path for the default pin persister (default: resolved
+   *  switchroom.yaml). Test seam. */
+  configPath?: string;
 }
 
 interface UpdateStep {
@@ -206,6 +242,23 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   // step that regenerates the compose with the override applied; the
   // main apply-config step below then re-runs apply with the full
   // scaffold sweep + the same override for consistency.
+  // `--pin` must be DURABLE, not one-shot: persist release.pin to
+  // switchroom.yaml BEFORE regenerating compose, so apply/pull/recreate all
+  // read the same persisted pin and the next plain reconcile can't revert
+  // the fleet. Shares setReleasePinInConfig with `switchroom rollout --pin`
+  // so the two `--pin` paths can't diverge. (--channel stays one-shot; a
+  // floating channel has no fixed version to persist.) Skipped under --check
+  // (run closures don't fire in check mode).
+  if (opts.pin) {
+    const pin = opts.pin;
+    const persist = opts.persistPinFn ?? defaultPersistPin(opts.configPath);
+    steps.push({
+      name: "persist-release-pin",
+      description: `Persist release.pin=${pin} to switchroom.yaml (durable)`,
+      run: () => persist(pin),
+    });
+  }
+
   const releaseOverrideArgs: string[] = [];
   if (opts.channel) releaseOverrideArgs.push("--channel", opts.channel);
   if (opts.pin) releaseOverrideArgs.push("--pin", opts.pin);
