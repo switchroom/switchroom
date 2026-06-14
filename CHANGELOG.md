@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.23 — config-edit works end-to-end: writable, discoverable, honestly described (#2350)
+
+Fixes the bug where an admin agent couldn't edit `switchroom.yaml`, plus the
+broader class it exposed.
+
+- **EROFS fix (the real blocker).** hostd mounted `switchroom.yaml` **read-only**,
+  so `config_propose_edit` validated + got operator approval but always died at
+  the write (`EROFS → E_RECONCILE_FAILED_ROLLED_BACK`) — it had never been able
+  to commit. hostd is the sanctioned, operator-tap-gated config writer, so its
+  mount is now `:rw` (agents stay `:ro` — the security boundary is unchanged);
+  the in-place writer preserves the file's owner/mode. Regression-guarded in
+  `hostd.test.ts`.
+- **Honest self-descriptions.** The `config_propose_edit` MCP tool no longer
+  describes itself as an unimplemented "PR 1a skeleton / returns
+  E_NOT_IMPLEMENTED" (it shipped long ago) — an agent reading that wrongly
+  refused. Also: admin `CLAUDE.md` now points agents at `config_propose_edit`
+  (+ `get_status`) instead of asking the operator to hand-edit yaml; the setup
+  wizard no longer calls the working Google OAuth flow a "stub"; and the
+  cheap-cron + worker-activity-feed default-flip docs are corrected to "on by
+  default; `=0` disables".
+- **Recurrence guard.** New `scripts/check-stale-tool-descriptions.mjs` (wired
+  into `npm run lint`) fails CI when an agent-facing tool description or prompt
+  carries build-time-status language (PR-number / skeleton / E_NOT_IMPLEMENTED
+  / "ships in follow-up" / "not yet implemented"); genuine deferrals use an
+  `intentional-deferred:` waiver.
+
 ## v0.15.22 — admin config edits name the agents to restart (#2346)
 
 ### PR — feat(config-edit): name which agents to restart for an admin edit (#2346)
