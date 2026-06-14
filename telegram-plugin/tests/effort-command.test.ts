@@ -21,35 +21,25 @@ import {
   EFFORT_CALLBACK_PREFIX,
   type EffortCommandDeps,
 } from "../gateway/effort-command.js";
-import type { InjectResult } from "../../src/agents/inject.js";
+import type { EffortApplyResult } from "../../src/agents/effort-picker.js";
 
-function okResult(output: string): InjectResult {
-  return {
-    outcome: "ok",
-    output,
-    truncated: false,
-    command: "/effort",
-    meta: { description: "Set reasoning effort", expectsOutput: true },
-  };
+function applyOk(level: string, confirmed = false): EffortApplyResult {
+  return { ok: true, level, confirmed, output: `Set effort level to ${level}` };
 }
 
-function failedResult(errorMessage: string): InjectResult {
-  return {
-    outcome: "failed",
-    output: "",
-    truncated: false,
-    command: "/effort",
-    errorMessage,
-    meta: { description: "Set reasoning effort", expectsOutput: true },
-  };
+function applyFail(
+  reason: "session_missing" | "confirm_failed" | "apply_unverified",
+  wedged?: boolean,
+): EffortApplyResult {
+  return { ok: false, reason, ...(wedged !== undefined ? { wedged } : {}) };
 }
 
 function makeDeps(overrides: Partial<EffortCommandDeps> = {}) {
-  const calls: Array<{ agent: string; command: string }> = [];
+  const calls: Array<{ agent: string; level: string }> = [];
   const deps: EffortCommandDeps = {
-    inject: async (agent, command) => {
-      calls.push({ agent, command });
-      return okResult("Set effort level to high");
+    applyEffort: async (agent, level) => {
+      calls.push({ agent, level });
+      return applyOk(level);
     },
     getAgentName: () => "carrie",
     getConfiguredEffort: () => "low",
@@ -127,18 +117,24 @@ describe("effort-command: handler", () => {
     expect(r.text).toContain("low");
   });
 
-  it("set injects exactly '/effort <level>' and relays output", async () => {
+  it("set applies exactly the level and relays output", async () => {
     const { deps, calls } = makeDeps();
     const r = await handleEffortCommand({ kind: "set", level: "high" }, deps);
-    expect(calls).toEqual([{ agent: "carrie", command: "/effort high" }]);
+    expect(calls).toEqual([{ agent: "carrie", level: "high" }]);
     expect(r.text).toContain("Set effort level to high");
     expect(r.text).toMatch(/reverts to the configured default/);
   });
 
-  it("set surfaces an inject failure", async () => {
-    const { deps } = makeDeps({ inject: async () => failedResult("pane locked") });
+  it("set notes the re-read cost when a confirmation was needed", async () => {
+    const { deps } = makeDeps({ applyEffort: async (_a, l) => applyOk(l, true) });
+    const r = await handleEffortCommand({ kind: "set", level: "high" }, deps);
+    expect(r.text).toMatch(/re-reads the cached history/);
+  });
+
+  it("set surfaces a confirm_failed outcome honestly", async () => {
+    const { deps } = makeDeps({ applyEffort: async () => applyFail("confirm_failed", false) });
     const r = await handleEffortCommand({ kind: "set", level: "max" }, deps);
-    expect(r.text).toContain("pane locked");
+    expect(r.text).toContain("couldn't confirm the switch");
     expect(r.text).toContain("❌");
   });
 
@@ -146,7 +142,7 @@ describe("effort-command: handler", () => {
     const { deps, calls } = makeDeps();
     // Hand-craft a parsed object that skipped the parser's gate.
     const r = await handleEffortCommand({ kind: "set", level: "evil; rm -rf" as never }, deps);
-    expect(calls).toEqual([]); // never injected
+    expect(calls).toEqual([]); // never applied
     expect(r.text).toMatch(/not a valid effort level/);
   });
 });
@@ -164,22 +160,36 @@ describe("effort-command: menu + callback", () => {
     expect(menu.keyboard![0]).toHaveLength(5);
   });
 
-  it("callback eff:s:<level> injects the level and checks it in the re-render", async () => {
+  it("callback eff:s:<level> applies the level and checks it in the re-render", async () => {
     const { deps, calls } = makeDeps();
     const out = await handleEffortMenuCallback(effortSelectCallbackData("xhigh"), deps);
-    expect(calls).toEqual([{ agent: "carrie", command: "/effort xhigh" }]);
+    expect(calls).toEqual([{ agent: "carrie", level: "xhigh" }]);
     expect(out.selectedEffort).toBe("xhigh");
     expect(out.reply.text).toContain("Effort → ");
     const checked = out.reply.keyboard!.flat().find((b) => b.text.startsWith("✅"));
     expect(checked?.text).toBe("✅ xhigh");
   });
 
-  it("callback with a failed inject keeps the menu and shows the error, no selection", async () => {
-    const { deps } = makeDeps({ inject: async () => failedResult("session_missing") });
+  it("callback notes the re-read when a confirmation was answered", async () => {
+    const { deps } = makeDeps({ applyEffort: async (_a, l) => applyOk(l, true) });
+    const out = await handleEffortMenuCallback(effortSelectCallbackData("high"), deps);
+    expect(out.reply.text).toMatch(/re-reads history/);
+    expect(out.selectedEffort).toBe("high");
+  });
+
+  it("callback with a failed apply keeps the menu and shows the error, no selection", async () => {
+    const { deps } = makeDeps({ applyEffort: async () => applyFail("session_missing") });
     const out = await handleEffortMenuCallback(effortSelectCallbackData("max"), deps);
     expect(out.selectedEffort).toBeUndefined();
     expect(out.reply.text).toContain("❌");
     expect(out.reply.keyboard!.flat()).toHaveLength(5); // buttons preserved
+  });
+
+  it("callback surfaces a wedged confirm_failed as a warning, no selection", async () => {
+    const { deps } = makeDeps({ applyEffort: async () => applyFail("confirm_failed", true) });
+    const out = await handleEffortMenuCallback(effortSelectCallbackData("max"), deps);
+    expect(out.selectedEffort).toBeUndefined();
+    expect(out.reply.text).toMatch(/may still be open/);
   });
 
   it("callback ignores a malformed level", async () => {

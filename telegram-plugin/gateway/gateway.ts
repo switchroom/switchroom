@@ -280,6 +280,7 @@ import {
   type EffortCommandDeps,
   type EffortMenuReply,
 } from './effort-command.js'
+import { applyEffort } from '../../src/agents/effort-picker.js'
 import { type BannerState } from '../slot-banner.js'
 import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
@@ -14237,7 +14238,7 @@ bot.command('model', async ctx => {
 // in effort-command.ts so it's unit-testable without booting the bot.
 function buildEffortDeps(): EffortCommandDeps {
   return {
-    inject: injectSlashCommandImpl,
+    applyEffort: (agent, level) => applyEffort(agent, level),
     getAgentName: getMyAgentName,
     getConfiguredEffort: () => {
       type AgentListResp = { agents: Array<{ name: string; thinking_effort?: string | null }> }

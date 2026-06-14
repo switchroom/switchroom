@@ -22,7 +22,7 @@
  * unit-testable without booting the bot.
  */
 
-import type { InjectResult } from '../../src/agents/inject.js'
+import type { EffortApplyResult } from '../../src/agents/effort-picker.js'
 
 /**
  * The effort levels the installed CLI accepts (`claude --help`:
@@ -66,8 +66,14 @@ export function parseEffortCommand(text: string): ParsedEffortCommand | null {
 }
 
 export interface EffortCommandDeps {
-  /** Inject primitive — wired to injectSlashCommand in the gateway. */
-  inject: (agent: string, command: string) => Promise<InjectResult>
+  /**
+   * Apply an effort level to the live session. Wired to `applyEffort`
+   * (src/agents/effort-picker.ts), which types `/effort <level>` AND drives
+   * the "Change effort level?" confirmation modal that claude shows when the
+   * switch would invalidate a cached conversation — so it never wedges the
+   * pane the way a bare inject would.
+   */
+  applyEffort: (agent: string, level: string) => Promise<EffortApplyResult>
   getAgentName: () => string
   /**
    * The agent's cascade-resolved `thinking_effort` from
@@ -127,52 +133,48 @@ export async function handleEffortCommand(
     return helpText(deps, `not a valid effort level: ${parsed.level}`)
   }
   const verbHtml = `<code>/effort ${deps.escapeHtml(parsed.level)}</code>`
-  let result: InjectResult
+  let result: EffortApplyResult
   try {
-    result = await deps.inject(deps.getAgentName(), `/effort ${parsed.level}`)
+    result = await deps.applyEffort(deps.getAgentName(), parsed.level)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    return { text: `❌ ${verbHtml} — inject failed: ${deps.escapeHtml(msg)}`, html: true }
+    return { text: `❌ ${verbHtml} — failed: ${deps.escapeHtml(msg)}`, html: true }
   }
+  return { text: applyResultText(parsed.level, result, deps), html: true }
+}
 
-  if (result.outcome === 'ok') {
-    return {
-      text: [
-        `${verbHtml}`,
-        deps.preBlock(result.output),
-        ...(result.truncated ? ['<i>truncated</i>'] : []),
-        PERSIST_NOTE,
-      ].join('\n'),
-      html: true,
+/**
+ * Render an effort-apply outcome. `confirmed` means a "Change effort level?"
+ * modal was answered — switching mid-conversation re-reads the history, so we
+ * say so honestly rather than just claiming success.
+ */
+function applyResultText(level: string, result: EffortApplyResult, deps: EffortCommandDeps): string {
+  const verbHtml = `<code>/effort ${deps.escapeHtml(level)}</code>`
+  if (result.ok) {
+    const lines = [`✅ ${verbHtml} — ${deps.escapeHtml(result.output)}`]
+    if (result.confirmed) {
+      lines.push('<i>Switched mid-conversation — your next turn re-reads the cached history (slower, one time).</i>')
     }
+    lines.push(PERSIST_NOTE)
+    return lines.join('\n')
   }
-  if (result.outcome === 'ok_no_output') {
-    return {
-      text: [
-        `${verbHtml} — sent, but no response captured. The agent may be mid-turn; check <code>/inject /status</code> to confirm the active effort.`,
-        PERSIST_NOTE,
-      ].join('\n'),
-      html: true,
-    }
+  if (result.reason === 'session_missing') {
+    return '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.'
   }
-  // outcome === 'failed'
-  if (result.errorCode === 'session_missing') {
-    return {
-      text:
-        '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.',
-      html: true,
-    }
+  if (result.reason === 'confirm_failed') {
+    const wedged = result.wedged
+      ? ' The confirmation prompt may still be open on the pane — check it.'
+      : ' The change was cancelled and the pane left as it was.'
+    return `❌ ${verbHtml} — couldn't confirm the switch.${wedged}`
   }
-  return {
-    text: `❌ ${verbHtml} — ${deps.escapeHtml(result.errorMessage ?? 'inject failed')}`,
-    html: true,
-  }
+  // apply_unverified
+  return `❌ ${verbHtml} — sent, but couldn't confirm it applied. The agent may be mid-turn; check <code>/inject /status</code>.`
 }
 
 // ---------------------------------------------------------------------------
 // Button menu — five fixed levels, the live one marked ✅. No live discovery
-// (the levels don't churn) and no picker-driving (the inline `/effort <level>`
-// form sets it directly), so this is far simpler than the /model menu.
+// (the levels don't churn). A tap applies the level via applyEffort, which
+// drives the confirmation modal so it never wedges the pane.
 // ---------------------------------------------------------------------------
 
 export interface EffortMenuKeyboardButton {
@@ -231,9 +233,11 @@ export interface EffortCallbackOutcome {
 }
 
 /**
- * Handle an `eff:*` callback tap. `eff:s:<level>` injects claude's
- * `/effort <level>` and re-renders the menu with a one-line banner and the
- * new level checked. Never throws — failures render as a banner.
+ * Handle an `eff:*` callback tap. `eff:s:<level>` applies the level via
+ * applyEffort (which drives the confirmation modal, so a mid-conversation
+ * switch confirms cleanly instead of wedging the pane) and re-renders the
+ * menu with a one-line banner and the new level checked. Never throws —
+ * failures render as a banner.
  */
 export async function handleEffortMenuCallback(
   data: string,
@@ -249,21 +253,27 @@ export async function handleEffortMenuCallback(
   let banner: string
   let selected: string | undefined
   try {
-    const result = await deps.inject(deps.getAgentName(), `/effort ${level}`)
-    if (result.outcome === 'ok' || result.outcome === 'ok_no_output') {
-      banner = `✅ Effort → <code>${deps.escapeHtml(level)}</code> for this session`
+    const result = await deps.applyEffort(deps.getAgentName(), level)
+    if (result.ok) {
+      banner = result.confirmed
+        ? `✅ Effort → <code>${deps.escapeHtml(level)}</code> (mid-conversation: next turn re-reads history)`
+        : `✅ Effort → <code>${deps.escapeHtml(level)}</code> for this session`
       selected = level
-    } else if (result.errorCode === 'session_missing') {
+    } else if (result.reason === 'session_missing') {
       banner = '❌ tmux session not found — is the agent running under the supervisor?'
+    } else if (result.reason === 'confirm_failed') {
+      banner = result.wedged
+        ? '⚠️ Couldn’t confirm the switch — the prompt may still be open on the pane.'
+        : '❌ Couldn’t confirm the switch — cancelled, effort unchanged.'
     } else {
-      banner = `❌ couldn't set effort: ${deps.escapeHtml(result.errorMessage ?? 'inject failed')}`
+      banner = '❌ Sent, but couldn’t confirm it applied (agent may be mid-turn).'
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    banner = `❌ inject failed: ${deps.escapeHtml(msg)}`
+    banner = `❌ failed: ${deps.escapeHtml(msg)}`
   }
   // Re-render with the just-selected level checked (or the configured
-  // default if the inject failed) and the banner on top.
+  // default if it didn't apply) and the banner on top.
   const menu = buildEffortMenu(deps, selected)
   return {
     reply: { ...menu, text: `${banner}\n${menu.text}` },
