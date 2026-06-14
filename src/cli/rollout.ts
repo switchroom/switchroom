@@ -33,11 +33,16 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { readFileSync, chownSync, statSync } from "node:fs";
 import type { Command } from "commander";
-import { getConfig } from "./helpers.js";
+import { getConfig, getConfigPath } from "./helpers.js";
+import { setReleasePinInConfig } from "./release-yaml.js";
+import { resolveOperatorUid } from "./operator-uid.js";
+import { atomicWriteFileSync } from "../util/atomic.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
+  | { kind: "persist-pin"; pin: string }
   | { kind: "apply" }
   | { kind: "restart-agent"; agent: string }
   | { kind: "refresh-web" }
@@ -47,6 +52,14 @@ export type RolloutStep =
 export interface RolloutPlanOpts {
   /** Skip the web + hostd refresh (step 3). */
   skipWeb?: boolean;
+  /**
+   * When set (i.e. the operator passed `--pin`), persist `release.pin` to
+   * switchroom.yaml as the FIRST step so the roll is durable — apply,
+   * restart, web and hostd then all read the same persisted pin. Omitted
+   * when the target already came from the config's `release.pin` (nothing
+   * to persist).
+   */
+  pinToPersist?: string;
 }
 
 /**
@@ -88,7 +101,9 @@ export function planRollout(
   agents: string[],
   opts: RolloutPlanOpts = {},
 ): RolloutStep[] {
-  const steps: RolloutStep[] = [{ kind: "apply" }];
+  const steps: RolloutStep[] = [];
+  if (opts.pinToPersist) steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
+  steps.push({ kind: "apply" });
   for (const agent of orderAgentsCanaryFirst(agents)) {
     steps.push({ kind: "restart-agent", agent });
   }
@@ -110,6 +125,9 @@ export function formatRolloutPlan(
   for (const s of steps) {
     n += 1;
     switch (s.kind) {
+      case "persist-pin":
+        lines.push(`  ${n}. persist release.pin=${s.pin} to switchroom.yaml (durable)`);
+        break;
       case "apply":
         lines.push(`  ${n}. apply — regenerate compose with ${target} image refs`);
         break;
@@ -140,6 +158,13 @@ export interface RolloutDeps {
   probeVersion(agent: string): string | null;
   /** Emit a progress line. */
   log(line: string): void;
+  /**
+   * Durably persist `release.pin = pin` to switchroom.yaml (comment-
+   * preserving, atomic, ownership-restoring). Only invoked for a
+   * `persist-pin` step. Optional so callers that never persist (and tests)
+   * can omit it.
+   */
+  persistPin?(pin: string): void;
 }
 
 export interface RolloutResult {
@@ -164,8 +189,6 @@ export function executeRollout(
   steps: RolloutStep[],
   target: string,
   deps: RolloutDeps,
-  /** Whether to pass `--pin <target>` to the apply step. */
-  pinOnApply: boolean,
 ): RolloutResult {
   const targetNorm = normalizeVersion(target);
   const rolled: string[] = [];
@@ -173,10 +196,21 @@ export function executeRollout(
 
   for (const step of steps) {
     switch (step.kind) {
+      case "persist-pin": {
+        // Persist FIRST so the subsequent bare `apply` (and restart / web /
+        // hostd) all read the same durable pin — no one-shot --pin needed.
+        deps.log(`→ persist release.pin=${step.pin} to switchroom.yaml`);
+        if (deps.persistPin) {
+          deps.persistPin(step.pin);
+        } else {
+          warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
+        }
+        break;
+      }
       case "apply": {
+        // Bare apply — it reads release.pin from the (now-persisted) config.
         deps.log(`→ apply — regenerating compose for ${target}`);
-        const args = pinOnApply ? ["apply", "--pin", target] : ["apply"];
-        const r = deps.run(args);
+        const r = deps.run(["apply"]);
         if (r.status !== 0) {
           return { ok: false, rolled, failedStep: "apply", warnings };
         }
@@ -282,13 +316,21 @@ export function registerRolloutCommand(program: Command): void {
         return;
       }
 
-      const steps = planRollout(requested, { skipWeb: opts.skipWeb });
+      // Persist the pin durably only when the operator passed --pin; a
+      // target read from config.release.pin is already persisted.
+      const steps = planRollout(requested, {
+        skipWeb: opts.skipWeb,
+        pinToPersist: opts.pin ?? undefined,
+      });
 
       if (opts.dryRun) {
+        // Dry-run prints the plan (incl. the persist step) and writes NOTHING
+        // — it returns before executeRollout, so no persist/apply/restart runs.
         process.stdout.write(formatRolloutPlan(steps, target) + "\n");
         return;
       }
 
+      const configPath = getConfigPath(program);
       const scriptPath = process.argv[1] ?? "switchroom";
       const deps: RolloutDeps = {
         run: (args) => {
@@ -305,10 +347,30 @@ export function registerRolloutCommand(program: Command): void {
           return (r.stdout ?? "").trim().split("\n").pop()?.trim() ?? null;
         },
         log: (line) => process.stdout.write(line + "\n"),
+        persistPin: (pin) => {
+          const before = readFileSync(configPath, "utf8");
+          const after = setReleasePinInConfig(before, pin);
+          if (after === before) return; // idempotent no-op
+          // Crash-safe atomic write (fsync + unique tmp + rename), preserving
+          // the file's existing mode — switchroom.yaml is the fleet's single
+          // source of truth; a crash mid-write mustn't corrupt or truncate it.
+          atomicWriteFileSync(configPath, after, statSync(configPath).mode & 0o777);
+          // rollout self-elevates via sudo; a root write would leave the
+          // operator-owned config root-owned and EACCES-lock other yaml verbs
+          // (and erode the read-only-operator-config foundation). chown back.
+          try {
+            if (typeof process.geteuid === "function" && process.geteuid() === 0) {
+              const uid = resolveOperatorUid();
+              if (uid !== undefined) chownSync(configPath, uid, uid);
+            }
+          } catch {
+            /* dev hosts may lack CAP_CHOWN — best-effort */
+          }
+        },
       };
 
       process.stdout.write(`Rolling ${requested.length} agent(s) to ${target}…\n`);
-      const result = executeRollout(steps, target, deps, opts.pin != null);
+      const result = executeRollout(steps, target, deps);
 
       for (const w of result.warnings) process.stderr.write(`⚠️  ${w}\n`);
 

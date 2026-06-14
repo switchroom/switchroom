@@ -94,9 +94,10 @@ describe("formatRolloutPlan", () => {
 function harness(opts: {
   versions: Record<string, string | null>;
   runStatus?: (args: string[]) => number;
-}): { deps: RolloutDeps; runs: string[][]; logs: string[] } {
+}): { deps: RolloutDeps; runs: string[][]; logs: string[]; persisted: string[] } {
   const runs: string[][] = [];
   const logs: string[] = [];
+  const persisted: string[] = [];
   const deps: RolloutDeps = {
     run: (args) => {
       runs.push(args);
@@ -104,8 +105,9 @@ function harness(opts: {
     },
     probeVersion: (agent) => opts.versions[agent] ?? null,
     log: (line) => logs.push(line),
+    persistPin: (pin) => persisted.push(pin),
   };
-  return { deps, runs, logs };
+  return { deps, runs, logs, persisted };
 }
 
 describe("executeRollout", () => {
@@ -116,25 +118,47 @@ describe("executeRollout", () => {
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", marko: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, false);
+    const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(["clerk", "marko"]);
-    // apply ran first, then each restart, then webd + hostd install.
+    // apply ran first (always bare — pin is persisted, not passed one-shot),
+    // then each restart, then webd + hostd install.
     expect(runs[0]).toEqual(["apply"]);
     expect(runs).toContainEqual(["agent", "restart", "clerk", "--wait", "--force"]);
     expect(runs).toContainEqual(["webd", "install", "--tag", TARGET]);
     expect(runs).toContainEqual(["hostd", "install", "--tag", TARGET]);
   });
 
-  it("passes --pin to apply only when pinOnApply is true", () => {
-    const steps: RolloutStep[] = [{ kind: "apply" }];
-    const withPin = harness({ versions: {} });
-    executeRollout(steps, TARGET, withPin.deps, true);
-    expect(withPin.runs[0]).toEqual(["apply", "--pin", TARGET]);
+  it("persists the pin BEFORE a bare apply when pinToPersist is set", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    // persist-pin is the very first step.
+    expect(steps[0]).toEqual({ kind: "persist-pin", pin: TARGET });
+    const { deps, runs, persisted } = harness({ versions: { clerk: "0.15.18" } });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(persisted).toEqual([TARGET]); // persisted exactly once
+    expect(runs[0]).toEqual(["apply"]); // apply is bare — no one-shot --pin
+  });
 
-    const noPin = harness({ versions: {} });
-    executeRollout(steps, TARGET, noPin.deps, false);
-    expect(noPin.runs[0]).toEqual(["apply"]);
+  it("does NOT persist (no persist-pin step) when target came from config", () => {
+    const steps = planRollout(["clerk"]); // no pinToPersist
+    expect(steps.find((s) => s.kind === "persist-pin")).toBeUndefined();
+    const { deps, persisted } = harness({ versions: { clerk: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    expect(persisted).toEqual([]);
+  });
+
+  it("warns (does not crash) if a persist-pin step has no persist hook", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    const runs: string[][] = [];
+    const r = executeRollout(steps, TARGET, {
+      run: (a) => { runs.push(a); return { status: 0 }; },
+      probeVersion: () => "0.15.18",
+      log: () => {},
+      // persistPin intentionally omitted
+    });
+    expect(r.ok).toBe(true);
+    expect(r.warnings.some((w) => w.includes("NOT durable"))).toBe(true);
   });
 
   it("STOPS at the first agent that comes back on the wrong version", () => {
@@ -142,7 +166,7 @@ describe("executeRollout", () => {
     const { deps, runs } = harness({
       versions: { clerk: "0.15.18", marko: "0.15.17" /* stale! */, finn: "0.15.18" },
     });
-    const r = executeRollout(steps, TARGET, deps, false);
+    const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("restart-agent");
     expect(r.failedAgent).toBe("marko");
@@ -156,7 +180,7 @@ describe("executeRollout", () => {
   it("STOPS when an agent is unreachable (probe returns null)", () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({ versions: { clerk: null } });
-    const r = executeRollout(steps, TARGET, deps, false);
+    const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedAgent).toBe("clerk");
     expect(r.rolled).toEqual([]);
@@ -168,7 +192,7 @@ describe("executeRollout", () => {
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "apply" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps, false);
+    const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(false);
     expect(r.failedStep).toBe("apply");
     expect(r.rolled).toEqual([]);
@@ -181,7 +205,7 @@ describe("executeRollout", () => {
       versions: { clerk: "0.15.18" },
       runStatus: (args) => (args[0] === "webd" || args[0] === "hostd" ? 1 : 0),
     });
-    const r = executeRollout(steps, TARGET, deps, false);
+    const r = executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.rolled).toEqual(["clerk"]);
     expect(r.warnings.length).toBe(2);
@@ -191,7 +215,7 @@ describe("executeRollout", () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({ versions: { clerk: "0.15.18" } });
     // target carries the v-prefix; in-container version does not.
-    const r = executeRollout(steps, "v0.15.18", deps, false);
+    const r = executeRollout(steps, "v0.15.18", deps);
     expect(r.ok).toBe(true);
   });
 });
