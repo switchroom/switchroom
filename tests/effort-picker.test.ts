@@ -114,6 +114,26 @@ describe("applyEffort", () => {
     expect(res).toEqual({ ok: false, reason: "apply_unverified" });
   });
 
+  it("throw-safety: a mid-modal send failure still best-effort cancels the modal", async () => {
+    // send #3 is the confirm Enter — make it throw (e.g. tmux blip). The
+    // finally must capture, see the modal still open, and Esc it before the
+    // error propagates, so the pane is never left wedged.
+    const sends: string[][] = [];
+    let i = 0;
+    const runner: TmuxRunner = {
+      capture: () => [MODAL_LOW, MODAL_LOW][Math.min(i++, 1)],
+      send: (_s, _t, args) => {
+        sends.push(args);
+        if (sends.length === 3) throw new Error("tmux blip");
+      },
+      hasSession: () => true,
+    };
+    await expect(
+      applyEffort("agentx", "low", { ...fastOpts, _runner: runner }),
+    ).rejects.toThrow(/tmux blip/);
+    expect(sentKeys(sends)[sends.length - 1]).toBe("Escape"); // finally cancelled
+  });
+
   it("does not false-match the command echo (verb before level)", async () => {
     // A pane that only shows the echo "/effort high" (verb precedes level)
     // must NOT be read as applied — only "high · /effort" (the banner) counts.

@@ -100,48 +100,64 @@ export async function applyEffort(
     const startedAt = Date.now();
     const expired = () => Date.now() - startedAt >= timeoutMs;
 
-    runner.send(socket, session, ["send-keys", "-l", `/effort ${level}`]);
-    runner.send(socket, session, ["send-keys", "Enter"]);
+    try {
+      runner.send(socket, session, ["send-keys", "-l", `/effort ${level}`]);
+      runner.send(socket, session, ["send-keys", "Enter"]);
 
-    let confirmed = false;
-    let confirmKeys = 0;
+      let confirmed = false;
+      let confirmKeys = 0;
 
-    while (!expired()) {
-      await sleep(stepMs);
-      const pane = runner.capture(socket, session) ?? "";
+      while (!expired()) {
+        await sleep(stepMs);
+        const pane = runner.capture(socket, session) ?? "";
 
-      if (CONFIRM_RE.test(pane)) {
-        if (confirmKeys >= 2) {
-          // Two confirms didn't clear it — cancel so we never wedge the pane.
-          runner.send(socket, session, ["send-keys", "Escape"]);
-          await sleep(stepMs);
-          const after = runner.capture(socket, session) ?? "";
-          log(
-            `effort-picker: confirm modal would not dismiss for ${agentName} ` +
-              `(socket=${socket}) — cancelled`,
-          );
-          return { ok: false, reason: "confirm_failed", wedged: CONFIRM_RE.test(after) };
+        if (CONFIRM_RE.test(pane)) {
+          if (confirmKeys >= 2) {
+            // Two confirms didn't clear it — cancel so we never wedge the pane.
+            runner.send(socket, session, ["send-keys", "Escape"]);
+            await sleep(stepMs);
+            const after = runner.capture(socket, session) ?? "";
+            log(
+              `effort-picker: confirm modal would not dismiss for ${agentName} ` +
+                `(socket=${socket}) — cancelled`,
+            );
+            return { ok: false, reason: "confirm_failed", wedged: CONFIRM_RE.test(after) };
+          }
+          // Cursor defaults to "Yes, switch to <level>"; Enter confirms.
+          runner.send(socket, session, ["send-keys", "Enter"]);
+          confirmed = true;
+          confirmKeys += 1;
+          continue;
         }
-        // Cursor defaults to "Yes, switch to <level>"; Enter confirms.
-        runner.send(socket, session, ["send-keys", "Enter"]);
-        confirmed = true;
-        confirmKeys += 1;
-        continue;
+
+        if (appliedRe(level).test(pane)) {
+          return { ok: true, level, confirmed, output: applyLine(pane, level) };
+        }
+        // Otherwise the command is still rendering — keep polling.
       }
 
-      if (appliedRe(level).test(pane)) {
-        return { ok: true, level, confirmed, output: applyLine(pane, level) };
+      // Timed out. If a modal lingers, cancel it so the pane isn't wedged.
+      const final = runner.capture(socket, session) ?? "";
+      if (CONFIRM_RE.test(final)) {
+        runner.send(socket, session, ["send-keys", "Escape"]);
+        log(`effort-picker: timeout with modal open for ${agentName} — cancelled`);
+        return { ok: false, reason: "confirm_failed", wedged: true };
       }
-      // Otherwise the command is still rendering — keep polling.
+      return { ok: false, reason: "apply_unverified" };
+    } finally {
+      // Defence in depth: never exit this driver with a confirmation modal
+      // still open. Normal paths leave none (success has no modal; the cancel
+      // paths already Esc'd), so this is a no-op then — it only bites when the
+      // drive threw mid-modal. Best-effort and self-isolating: a throw here
+      // (tmux already gone → nothing to wedge) must not mask the real outcome.
+      try {
+        const pane = runner.capture(socket, session) ?? "";
+        if (CONFIRM_RE.test(pane)) {
+          runner.send(socket, session, ["send-keys", "Escape"]);
+        }
+      } catch {
+        /* tmux unreachable — no live modal to leave open */
+      }
     }
-
-    // Timed out. If a modal lingers, cancel it so the pane isn't wedged.
-    const final = runner.capture(socket, session) ?? "";
-    if (CONFIRM_RE.test(final)) {
-      runner.send(socket, session, ["send-keys", "Escape"]);
-      log(`effort-picker: timeout with modal open for ${agentName} — cancelled`);
-      return { ok: false, reason: "confirm_failed", wedged: true };
-    }
-    return { ok: false, reason: "apply_unverified" };
   });
 }

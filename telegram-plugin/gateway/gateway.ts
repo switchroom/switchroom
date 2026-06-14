@@ -14246,7 +14246,6 @@ function buildEffortDeps(): EffortCommandDeps {
       return data?.agents?.find(a => a.name === getMyAgentName())?.thinking_effort ?? null
     },
     escapeHtml: escapeHtmlForTg,
-    preBlock,
   }
 }
 

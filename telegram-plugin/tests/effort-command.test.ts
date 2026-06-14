@@ -44,7 +44,6 @@ function makeDeps(overrides: Partial<EffortCommandDeps> = {}) {
     getAgentName: () => "carrie",
     getConfiguredEffort: () => "low",
     escapeHtml: (s) => s,
-    preBlock: (s) => `<pre>${s}</pre>`,
     ...overrides,
   };
   return { deps, calls };

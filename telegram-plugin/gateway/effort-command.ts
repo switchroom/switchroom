@@ -82,7 +82,6 @@ export interface EffortCommandDeps {
    */
   getConfiguredEffort: () => string | null
   escapeHtml: (s: string) => string
-  preBlock: (s: string) => string
 }
 
 export interface EffortCommandReply {
