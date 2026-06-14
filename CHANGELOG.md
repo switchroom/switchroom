@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.15.19 — `/effort` Telegram command (#2336)
+
+### PR — feat(telegram): `/effort` command — switch reasoning effort per session (#2336)
+
+A Telegram **`/effort`** command, the sibling of `/model`, to show or switch the
+Claude **reasoning effort** (`low · medium · high · xhigh · max`,
+faster→smarter) for an agent's live session. The bare `/effort` renders a
+five-button menu (the live level marked ✅); `/effort <level>` sets it directly.
+Both type claude's own native `/effort` REPL command into the agent pane via the
+existing allowlisted inject primitive — Claude-native, no API/SDK/config
+mutation.
+
+The switch is **session-scoped**: `start.sh` already relaunches claude with
+`--effort <thinking_effort>` (the cascade default, `low`), so a session change
+reverts to the configured default on the next restart. The config + launch
+plumbing already existed (`thinking_effort` cascade field,
+`SWITCHROOM_DEFAULT_THINKING_EFFORT`); this adds only the command surface:
+`effort-command.ts` (parser + handler + menu + callback, 18 tests), the
+`/effort` inject-allowlist entry, `thinking_effort` in `agent list --json`, the
+gateway wiring, and the slash-menu + `/commands` entries. No fleet behavior
+change on deploy (every agent already launches at `--effort low`).
+
 ## v0.15.18 — 30-min approvals fold into "Allow" + `switchroom rollout` verb (#2333, #2334)
 
 ### PR — feat(approvals): fold the 30-min window into the "Allow" tap (#2333)
