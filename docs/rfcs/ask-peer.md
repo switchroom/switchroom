@@ -124,7 +124,7 @@ agents:
 - The target may *also* opt out of being asked
   (`agents.<target>.peers.askable: false`) so a sensitive specialist is
   unaskable even if someone lists it.
-- Honors any future `memory.isolation: strict` intent: a strict agent is
+- Honors the existing `memory.isolation: strict` setting: a strict agent is
   `askable: false` by default.
 
 ## 5. Worked example
