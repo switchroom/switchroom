@@ -40,9 +40,12 @@ describe("buildWhoami", () => {
     expect(buildWhoami(CFG, "plain").tier).toBe("standard");
   });
 
-  it("surfaces the agent's resolved tools (allow + deny)", () => {
+  it("surfaces the agent's RESOLVED tools (cascade-merged, not the raw slice)", () => {
     const w = buildWhoami(CFG, "clerk");
-    expect(w.tools.allow).toContain("Edit(/state/x.ts)");
+    expect(w.tools.allow).toContain("Edit(/state/x.ts)"); // agent's own
+    // defaults.tools.allow=["Read"] is merged in — proves whoami reads the
+    // resolved cascade (resolveAgentConfig), not the raw config.agents slice.
+    expect(w.tools.allow).toContain("Read");
     expect(w.tools.deny).toContain("Bash(rm:*)");
   });
 
