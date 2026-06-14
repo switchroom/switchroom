@@ -230,7 +230,11 @@ describe("scaffoldAgent", () => {
 
   it("start.sh skips the symlink block when HOME is unset (test/non-host context)", () => {
     const prevHome = process.env.HOME;
+    const prevHostHome = process.env.SWITCHROOM_HOST_HOME;
     delete process.env.HOME;
+    // SWITCHROOM_HOST_HOME now also feeds hostHomeQ (in-hostd bake fix); clear
+    // it too so this stays a true "no host home" context.
+    delete process.env.SWITCHROOM_HOST_HOME;
     try {
       const config = makeAgentConfig();
       const result = scaffoldAgent("no-home-agent", config, tmpDir, telegramConfig);
@@ -241,6 +245,7 @@ describe("scaffoldAgent", () => {
       expect(startSh).not.toContain("ln -sfn");
     } finally {
       if (prevHome !== undefined) process.env.HOME = prevHome;
+      if (prevHostHome !== undefined) process.env.SWITCHROOM_HOST_HOME = prevHostHome;
     }
   });
 

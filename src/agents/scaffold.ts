@@ -1134,6 +1134,68 @@ function shellSingleQuote(s: string): string {
 }
 
 /**
+ * The real host home for values BAKED into generated artifacts (start.sh's
+ * `cd "{{agentDir}}"`, the `$HOME/.switchroom` symlink target, …).
+ *
+ * `homedir()` / `$HOME` is the right answer when `switchroom apply` runs on
+ * the host. But hostd shells out `switchroom apply` from INSIDE its container
+ * (the `config_propose_edit` reconcile path), where `$HOME` is `/host-home`
+ * (the in-container mount point of the operator's home — a bind, not a host
+ * filesystem path). Baking `/host-home/...` into an agent's start.sh is fatal:
+ * the agent containers mount `~/.switchroom` at its REAL host path (same path
+ * in/out, `network_mode: host`) and have NO `/host-home` mount, so every
+ * `cd "{{agentDir}}"` / `--plugin-dir {{agentDir}}/...` / `$HOME/.switchroom`
+ * symlink dangles and claude falls to the login screen (2026-06-14 carrie/
+ * fleet-wide scaffold poison).
+ *
+ * Filesystem WRITES during apply must still use `$HOME` (`/host-home`, which
+ * bind-resolves to the real dir) — only BAKED values are translated. This
+ * mirrors `write-compose.ts` (`homeDir: SWITCHROOM_HOST_HOME || homedir()`),
+ * which already protects the compose bind SOURCES the same way; the scaffold
+ * path was the unprotected sibling.
+ *
+ * `SWITCHROOM_HOST_HOME` is the generator's authoritative host home, baked
+ * into the hostd container env by `compose.ts`. On the host it is unset (or
+ * equals `$HOME`), so this is a no-op there. Returns `undefined` only when
+ * BOTH are unset (test / non-host context) — the template's
+ * `{{#if hostHomeQ}}` guard then renders the symlink block as a no-op, exactly
+ * as the pre-fix `process.env.HOME ? … : undefined` did.
+ */
+function hostHomeForBake(): string | undefined {
+  return process.env.SWITCHROOM_HOST_HOME || process.env.HOME || undefined;
+}
+
+/** Shell-quoted host home for baking into start.sh, or undefined when unset. */
+function hostHomeQForBake(): string | undefined {
+  const h = hostHomeForBake();
+  return h ? shellSingleQuote(h) : undefined;
+}
+
+/**
+ * Translate a path rooted at the in-container home (`$HOME`, e.g.
+ * `/host-home/.switchroom/agents/foo`) to the real host home
+ * (`SWITCHROOM_HOST_HOME`, e.g. `/home/op/.switchroom/agents/foo`) so it is
+ * safe to BAKE into an agent artifact. No-op when:
+ *   - running on the host (`SWITCHROOM_HOST_HOME` unset or == `$HOME`), or
+ *   - the path is not under `$HOME` (e.g. `/state/config/...`,
+ *     `/opt/switchroom/...`) — those are already container-correct.
+ * See {@link hostHomeForBake} for why this exists.
+ */
+export function toHostHomePath(p: string): string {
+  const hostHome = process.env.SWITCHROOM_HOST_HOME;
+  const containerHome = process.env.HOME;
+  if (
+    hostHome &&
+    containerHome &&
+    hostHome !== containerHome &&
+    (p === containerHome || p.startsWith(containerHome + "/"))
+  ) {
+    return hostHome + p.slice(containerHome.length);
+  }
+  return p;
+}
+
+/**
  * Compose a template-generated file with an optional user sidecar.
  * Result = <rendered template>\n\n---\n\n<sidecar contents> if sidecar exists,
  * else just <rendered template>.
@@ -2242,7 +2304,10 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
   } = args;
   return {
     name,
-    agentDir,
+    // BAKED into start.sh (cd, CLAUDE_CONFIG_DIR, --plugin-dir, …). Must be a
+    // HOST path, not the in-container /host-home, when apply runs inside hostd.
+    // See toHostHomePath. The filesystem writes elsewhere keep the local value.
+    agentDir: toHostHomePath(agentDir),
     repoRoot: REPO_ROOT,
     topicId,
     topicName: agentConfig.topic_name,
@@ -2321,9 +2386,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       ? shellSingleQuote(resolve(switchroomConfigPath))
       : undefined,
     // Host home — baked into start.sh.hbs's $HOME/.switchroom symlink
-    // (#910). When unset (e.g. tests with no HOME) the template's
-    // {{#if hostHomeQ}} guard renders the symlink block as a no-op.
-    hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
+    // (#910). Prefer SWITCHROOM_HOST_HOME so an in-hostd apply bakes the real
+    // host home, not /host-home (see hostHomeForBake). When neither is set
+    // (e.g. tests with no HOME) the template's {{#if hostHomeQ}} guard renders
+    // the symlink block as a no-op.
+    hostHomeQ: hostHomeQForBake(),
     modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
     ...buildCronSessionContext(agentConfig),
     thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
@@ -4882,7 +4949,10 @@ export function reconcileAgent(
     const basePath = getBaseProfilePath();
     const startShContext: Record<string, unknown> = {
       name,
-      agentDir,
+      // BAKED into start.sh — must be a HOST path, not in-container /host-home,
+      // when reconcile (apply) runs inside hostd. See toHostHomePath. startShPath
+      // above and the FS writes below keep the local container-relative value.
+      agentDir: toHostHomePath(agentDir),
       repoRoot: REPO_ROOT,
       botToken: resolvedBotToken ?? rawBotToken,
       forumChatId: telegramConfig.forum_chat_id,
@@ -4915,8 +4985,10 @@ export function reconcileAgent(
         : undefined,
       hindsightTopicFilterMode,
       // Mirror buildWorkspaceContext (#910): host home for the
-      // $HOME/.switchroom symlink in start.sh's docker preamble.
-      hostHomeQ: process.env.HOME ? shellSingleQuote(process.env.HOME) : undefined,
+      // $HOME/.switchroom symlink in start.sh's docker preamble. Prefer
+      // SWITCHROOM_HOST_HOME so an in-hostd reconcile bakes the real host
+      // home, not /host-home (see hostHomeForBake).
+      hostHomeQ: hostHomeQForBake(),
       modelQ: shellSingleQuote(resolveMainModel(agentConfig.model)),
       ...buildCronSessionContext(agentConfig),
       thinkingEffort: agentConfig.thinking_effort ?? SWITCHROOM_DEFAULT_THINKING_EFFORT,
