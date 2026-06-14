@@ -270,7 +270,7 @@ export const switchroomHelpCommandNames = [
   "agents", "agentstart", "stop", "restart", "logs", "memory",
   // Auth & config — consolidated onto the `/auth` dashboard.
   "auth", "model",
-  "topics", "update", "version",
+  "topics", "update", "version", "whoami",
   "permissions", "grant", "dangerous", "vault", "doctor",
   "commands",
   // Note: "reconcile" is a deprecated alias still handled as a bot command
@@ -374,6 +374,7 @@ export function switchroomHelpText(agentName: string): string {
     `<code>/update</code> — dry-run plan; <code>/update apply</code> — actually pull images, reconcile, restart`,
     `<code>/restart [name|all]</code> — bounce agent (drains in-flight turn by default)`,
     `<code>/version</code> — show versions + running agent health summary`,
+    `<code>/whoami</code> — this agent's sandbox: tools, MCP, vault key-names, powers`,
     ``,
     `<b>Auth &amp; config</b>`,
     `<code>/auth</code> — auth status or actions`,

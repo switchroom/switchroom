@@ -31,6 +31,8 @@ import {
 } from "node:fs";
 import { withConfigError, getConfig } from "./helpers.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { resolveAgentConfig } from "../config/merge.js";
+import { checkAclByAgent } from "../vault/broker/acl.js";
 
 // Per-agent audit path. We deliberately do NOT share one log file across
 // all agents — that would let any agent read every other agent's audit
@@ -229,6 +231,127 @@ export function scheduleLiveNote(agent: string): string {
         `Run \`switchroom agent restart ${agent}\` for this to take effect.`;
 }
 
+/**
+ * The legible "what am I allowed to do" view for one agent — the answer to
+ * the access-model's "an agent should be able to see its own sandbox" so it
+ * stops guessing and overreaching (reference/access-model.md, "Dead-ends
+ * breed workarounds").
+ *
+ * DRIFT-FREE BY CONSTRUCTION: every field is computed from the SAME
+ * operator-owned config + the SAME enforcement functions that actually gate
+ * each action — `resolveAgentConfig` (the resolved cascade the scaffold
+ * itself uses, NOT the raw `config.agents[x]` slice `config get` returns)
+ * and `checkAclByAgent` (the vault ACL enforcer). It never maintains a
+ * parallel hand-list that could drift into a comforting lie.
+ *
+ * Secret VALUES never appear — vault is reported as key NAMES + a readable
+ * boolean only.
+ */
+export interface WhoamiView {
+  name: string;
+  persona: string | null;
+  model: string | null;
+  tier: "root" | "admin" | "standard";
+  tools: { allow: string[]; deny: string[] };
+  mcpServers: string[];
+  skills: string[];
+  /** Vault keys this agent's config references, each with the ACL verdict. */
+  vault: { key: string; readable: boolean }[];
+  powers: {
+    admin: boolean;
+    root: boolean;
+    /** Whether agent-proposed config edits are enabled (hostd.config_edit_enabled). */
+    configEdit: boolean;
+    /** True when cross-agent host verbs (restart/logs/exec/doctor/update) are reachable. */
+    crossAgentHostVerbs: boolean;
+  };
+  scheduleCount: number;
+  memoryBackend: string | null;
+}
+
+/** Recursively collect `vault:<key>` references from a resolved config slice. */
+function collectVaultKeys(value: unknown, out: Set<string>): void {
+  if (typeof value === "string") {
+    if (value.startsWith("vault:")) out.add(value.slice("vault:".length));
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectVaultKeys(v, out);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      // `secrets: [names]` is a declared-key list (names, never values).
+      if (k === "secrets" && Array.isArray(v)) {
+        for (const s of v) if (typeof s === "string") out.add(s);
+      } else {
+        collectVaultKeys(v, out);
+      }
+    }
+  }
+}
+
+/**
+ * Build the resolved {@link WhoamiView} for `agentName`. Pure over `config`
+ * — no broker round-trip, no disk read beyond the already-loaded config —
+ * so it works unchanged in-container (config is bind-mounted read-only) and
+ * unit-tests without fixtures. Throws if the agent isn't defined.
+ */
+export function buildWhoami(
+  config: SwitchroomConfig,
+  agentName: string,
+): WhoamiView {
+  const slice = config.agents?.[agentName];
+  if (!slice) throw new Error(`agent "${agentName}" not defined in switchroom.yaml`);
+  const resolved = resolveAgentConfig(config.defaults, config.profiles, slice) as Record<
+    string,
+    unknown
+  >;
+
+  const admin = resolved.admin === true || resolved.root === true;
+  const root = resolved.root === true;
+
+  const toolsBlock = (resolved.tools ?? {}) as { allow?: string[]; deny?: string[] };
+  const allow = [
+    ...(toolsBlock.allow ?? []),
+    ...((resolved.allowed_tools as string[] | undefined) ?? []),
+  ];
+  const deny = [
+    ...(toolsBlock.deny ?? []),
+    ...((resolved.disallowed_tools as string[] | undefined) ?? []),
+  ];
+
+  const mcpServers = Object.keys(
+    (resolved.mcp_servers as Record<string, unknown> | undefined) ?? {},
+  );
+  const skills = ((resolved.skills as string[] | undefined) ?? []).slice();
+
+  const vaultKeys = new Set<string>();
+  collectVaultKeys(resolved, vaultKeys);
+  const vault = [...vaultKeys]
+    .sort()
+    .map((key) => ({ key, readable: checkAclByAgent(config, agentName, key).allow }));
+
+  const configEdit = config.hostd?.config_edit_enabled === true;
+
+  const schedule = (resolved.schedule as unknown[] | undefined) ?? [];
+
+  return {
+    name: agentName,
+    persona: (resolved.description as string | undefined) ?? (resolved.persona as string | undefined) ?? null,
+    model: (resolved.model as string | undefined) ?? null,
+    tier: root ? "root" : admin ? "admin" : "standard",
+    tools: { allow, deny },
+    mcpServers,
+    skills,
+    vault,
+    powers: { admin, root, configEdit, crossAgentHostVerbs: admin },
+    scheduleCount: schedule.length,
+    memoryBackend:
+      ((config.memory as { backend?: string } | undefined)?.backend) ?? null,
+  };
+}
+
 function getAgentSlice(config: SwitchroomConfig, agent: string): unknown {
   const slice = config.agents?.[agent];
   if (!slice) {
@@ -292,6 +415,36 @@ export function registerAgentConfigCommands(program: Command): void {
         } catch (err) {
           process.stderr.write(`${(err as Error).message}\n`);
           appendAudit(agent, "config.get", { ...opts }, 1);
+          process.exit(1);
+        }
+      }),
+    );
+
+  // switchroom config whoami — the agent's own legible sandbox
+  config
+    .command("whoami")
+    .description("Emit what this agent is allowed to do (tools, MCP, vault key-names, powers) as JSON — its own sandbox, computed from live enforcement")
+    .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .action(
+      withConfigError(async (opts: { agent?: string }) => {
+        let agent: string;
+        try {
+          agent = resolveTargetAgent(opts.agent);
+        } catch (err) {
+          process.stderr.write(`${(err as Error).message}\n`);
+          appendAudit(opts.agent ?? "<unknown>", "config.whoami", { ...opts }, 7);
+          process.exit(7);
+        }
+        const cfg = getConfig(program);
+        try {
+          // buildWhoami emits key NAMES + booleans only — no secret values —
+          // so no stripSecretValues pass is needed.
+          const view = buildWhoami(cfg, agent);
+          process.stdout.write(JSON.stringify(view) + "\n");
+          appendAudit(agent, "config.whoami", { ...opts }, 0);
+        } catch (err) {
+          process.stderr.write(`${(err as Error).message}\n`);
+          appendAudit(agent, "config.whoami", { ...opts }, 1);
           process.exit(1);
         }
       }),

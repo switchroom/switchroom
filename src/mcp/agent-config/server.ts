@@ -1,8 +1,8 @@
 /**
  * agent-config MCP shim.
  *
- * Tiny stdio MCP server that exposes four read-only tools backed by
- * the corresponding `switchroom <cmd>` CLI subcommands. The shim
+ * Tiny stdio MCP server that exposes read-only + self-service config tools
+ * backed by the corresponding `switchroom <cmd>` CLI subcommands. The shim
  * re-exec's the CLI on every tool call so the audit-log row is
  * written from the same process tree as a direct CLI invocation and
  * the peer-cred-by-construction story holds — both run as the
@@ -99,6 +99,25 @@ export const TOOLS = [
       "Return the agent's merged switchroom config slice as JSON. " +
       "Read-only. Cross-agent reads are denied: if --agent doesn't match " +
       "$SWITCHROOM_AGENT_NAME (the agent's pinned identity), the call fails.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent: {
+          type: "string",
+          description:
+            "Target agent name. Optional — defaults to the env-pinned agent identity.",
+        },
+      },
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "See your own sandbox: the tools, MCP servers, vault key-NAMES (never " +
+      "values), skills, schedule and privileges (admin/root/config-edit) you " +
+      "actually have, as JSON — computed from live enforcement. Call this " +
+      "FIRST when you hit a permission wall, instead of guessing or asking. " +
+      "Read-only; defaults to your own identity.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -434,6 +453,10 @@ export function dispatchTool(
   switch (name) {
     case "config_get":
       cliArgs = buildArgs(["config", "get"], args);
+      parseMode = "json";
+      break;
+    case "whoami":
+      cliArgs = buildArgs(["config", "whoami"], args);
       parseMode = "json";
       break;
     case "cron_list":
