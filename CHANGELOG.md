@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.24 — scaffold bakes the host home, not the in-container /host-home (#2353)
+
+Closes the second half of the in-container-apply host-home bug class. v0.15.23
+made `config_propose_edit` work — which meant hostd began running `switchroom
+apply` from **inside its own container**, where `$HOME=/host-home` (the
+in-container bind-mount point of the operator's home, not a host filesystem
+path). The scaffold generator baked `$HOME`-rooted paths into each agent's
+`start.sh` (`cd "{{agentDir}}"`, `--plugin-dir {{agentDir}}/...`, the
+`$HOME/.switchroom` symlink target). Agent containers mount `~/.switchroom` at
+its **real host path** (same path in/out, `network_mode: host`) and have no
+`/host-home` mount, so every baked path dangled → claude fell to the login
+screen. This poisoned the whole fleet's on-disk scaffolds (one agent broke on
+recreate; the rest were landmines on next recreate).
+
+- **Scaffold bakes the host home.** New `toHostHomePath` / `hostHomeForBake`
+  helpers translate the **baked** `agentDir` + `$HOME/.switchroom` symlink
+  target from the in-container home to `SWITCHROOM_HOST_HOME` at both `start.sh`
+  render sites (initial scaffold + reconcile). Filesystem **writes** keep using
+  `$HOME` (`/host-home`, which bind-resolves to the real dir) — only baked
+  values change. No-op on the host (`SWITCHROOM_HOST_HOME` unset or `== $HOME`).
+  This mirrors the protection `write-compose.ts` already gave the compose bind
+  sources (#2279/#2285); the scaffold path was the unprotected sibling.
+- **Regression test.** `tests/scaffold.host-home-bake.test.ts` reproduces the
+  in-hostd scenario and asserts `start.sh` bakes the host path, not
+  `/host-home`.
+
 ## v0.15.23 — config-edit works end-to-end: writable, discoverable, honestly described (#2350)
 
 Fixes the bug where an admin agent couldn't edit `switchroom.yaml`, plus the
