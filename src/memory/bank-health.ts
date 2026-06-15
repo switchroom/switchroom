@@ -35,6 +35,42 @@ export interface BankMentalModelSummary {
   contentLength: number;
   /** First ~200 chars of content — enough for corruption fingerprinting. */
   contentHead: string;
+  /**
+   * The recall question this model answers — hindsight's `source_query`. This
+   * is the "why" of a model: the operator reads it and knows what the model is
+   * FOR without opening its content. Empty string when absent.
+   */
+  sourceQuery: string;
+  /** Refresh trigger mode (`full` | `incremental` | …) from `trigger.mode`. */
+  refreshMode: string | null;
+}
+
+/**
+ * Full detail for one mental model — the content the operator actually wants
+ * to read, plus its provenance (how many source facts it was synthesized
+ * from, by type). Fetched on demand per-model so the memory-health list stays
+ * light: the list carries summaries; the operator expands one model to pull
+ * its full text + provenance.
+ */
+export interface MentalModelDetail {
+  id: string;
+  name: string;
+  /** The recall question this model answers (the "why"). */
+  sourceQuery: string;
+  /** The rendered content injected into the agent's context on recall. */
+  content: string;
+  lastRefreshedAt: string | null;
+  createdAt: string | null;
+  refreshMode: string | null;
+  /**
+   * Count of the source facts this model was synthesized FROM, keyed by fact
+   * type (observation, directives, world, opinion, experience, mental-models).
+   * This is the provenance — it makes "how memory works" concrete: e.g.
+   * `{ observation: 24, directives: 11, "mental-models": 3 }`.
+   */
+  basedOnCounts: Record<string, number>;
+  /** Sum of basedOnCounts — total source facts behind this model. */
+  totalSourceFacts: number;
 }
 
 export interface BankHealth {
@@ -138,6 +174,8 @@ export async function inspectBankHealth(
       last_refreshed_at?: string | null;
       created_at?: string | null;
       content?: string | null;
+      source_query?: string | null;
+      trigger?: { mode?: string | null } | null;
     }>;
   }>(`${base}/v1/default/banks/${bank}/mental-models`, opts);
   if (!models.ok) return { ...empty, reason: models.reason };
@@ -170,7 +208,7 @@ export async function inspectBankHealth(
     newestDocumentAt,
     unextractedDocuments: unextracted,
     mentalModels: (models.data.items ?? [])
-      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null } =>
+      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null; source_query?: string | null; trigger?: { mode?: string | null } | null } =>
         typeof m?.id === "string" && typeof m?.name === "string",
       )
       .map((m) => ({
@@ -180,7 +218,63 @@ export async function inspectBankHealth(
         createdAt: m.created_at ?? null,
         contentLength: (m.content ?? "").length,
         contentHead: (m.content ?? "").slice(0, 200),
+        sourceQuery: m.source_query ?? "",
+        refreshMode: m.trigger?.mode ?? null,
       })),
+  };
+}
+
+/**
+ * Fetch one mental model's full detail (content + provenance) by id. Used by
+ * the dashboard's on-demand "view model" expander — the operator clicks a
+ * model to read what it actually knows and where it came from. The bank-health
+ * list endpoint deliberately truncates content (corruption fingerprint only);
+ * this is how the full text is pulled, one model at a time. Never throws.
+ */
+export async function getMentalModelDetail(
+  mcpUrl: string,
+  bankId: string,
+  modelId: string,
+  opts?: FetchOpts,
+): Promise<{ ok: true; model: MentalModelDetail } | { ok: false; reason: string }> {
+  const base = hindsightRestBase(mcpUrl);
+  const bank = encodeURIComponent(bankId);
+  const id = encodeURIComponent(modelId);
+  const res = await getJson<{
+    id?: string;
+    name?: string;
+    source_query?: string | null;
+    content?: string | null;
+    last_refreshed_at?: string | null;
+    created_at?: string | null;
+    trigger?: { mode?: string | null } | null;
+    reflect_response?: { based_on?: Record<string, unknown[]> | null } | null;
+  }>(`${base}/v1/default/banks/${bank}/mental-models/${id}`, opts);
+  if (!res.ok) return res;
+
+  const m = res.data;
+  const basedOn = m.reflect_response?.based_on ?? {};
+  const basedOnCounts: Record<string, number> = {};
+  let totalSourceFacts = 0;
+  for (const [type, facts] of Object.entries(basedOn)) {
+    const n = Array.isArray(facts) ? facts.length : 0;
+    basedOnCounts[type] = n;
+    totalSourceFacts += n;
+  }
+
+  return {
+    ok: true,
+    model: {
+      id: m.id ?? modelId,
+      name: m.name ?? modelId,
+      sourceQuery: m.source_query ?? "",
+      content: m.content ?? "",
+      lastRefreshedAt: m.last_refreshed_at ?? null,
+      createdAt: m.created_at ?? null,
+      refreshMode: m.trigger?.mode ?? null,
+      basedOnCounts,
+      totalSourceFacts,
+    },
   };
 }
 

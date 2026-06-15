@@ -9,11 +9,13 @@ import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
 import {
   inspectBankHealth,
+  getMentalModelDetail,
   staleMentalModels,
   corruptedMentalModels,
   recentUnextracted,
   ageDays,
   type BankMentalModelSummary,
+  type MentalModelDetail,
 } from "../memory/bank-health.js";
 import {
   reprocessDocuments,
@@ -2007,6 +2009,46 @@ export async function handleMemoryBuildProfile(
   const trigger = deps?.trigger ?? buildUserProfile;
   try {
     return await trigger(url, bank, { fetchImpl: deps?.fetchImpl });
+  } catch (err) {
+    return { ok: false, error: String((err as Error).message ?? err) };
+  }
+}
+
+export interface MentalModelDetailResult {
+  ok: boolean;
+  model?: MentalModelDetail;
+  error?: string;
+}
+
+/**
+ * GET /api/memory/model?bank=&id= — full detail for one mental model (the
+ * content the operator reads + its provenance). On-demand so the memory-health
+ * list stays light.
+ *
+ * SECURITY: `bank` is gated to a known fleet bank (no network); the model id
+ * is then resolved straight against hindsight by-id, which 404s on an unknown
+ * id (a forged loopback request can only READ models that genuinely exist in
+ * the operator's own fleet banks — no write, no model call). This is a pure
+ * read, so — unlike the remediation POSTs that trigger LLM work — it doesn't
+ * pay the extra round-trip to re-validate the id against a full inspect.
+ * Never throws.
+ */
+export async function handleGetMentalModel(
+  config: SwitchroomConfig,
+  bank: string,
+  modelId: string,
+  deps?: { fetchImpl?: typeof fetch; detail?: typeof getMentalModelDetail },
+): Promise<MentalModelDetailResult> {
+  if (!bank) return { ok: false, error: "Query must include `bank`." };
+  if (!modelId) return { ok: false, error: "Query must include `id`." };
+  if (!isKnownBank(config, bank)) return { ok: false, error: `Unknown bank: ${bank}` };
+
+  const url = resolveMemoryUrl(config);
+  const detail = deps?.detail ?? getMentalModelDetail;
+  try {
+    const res = await detail(url, bank, modelId, { fetchImpl: deps?.fetchImpl });
+    if (!res.ok) return { ok: false, error: res.reason };
+    return { ok: true, model: res.model };
   } catch (err) {
     return { ok: false, error: String((err as Error).message ?? err) };
   }
