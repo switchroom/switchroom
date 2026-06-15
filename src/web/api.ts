@@ -1711,7 +1711,19 @@ export async function handleGetGrants(
   const list = deps.list ?? listGrantsViaBroker;
   // No agent filter → all agents' grants. Pin opts.socket to the operator
   // socket so the broker resolver can't fall through to a non-operator path.
-  const result = await list(undefined, { socket });
+  // listGrantsViaBroker is contractually non-throwing, but wrap defensively
+  // so this handler's documented "never throws" holds even if that contract
+  // ever changes — a thrown error degrades to reachable:false, not a 500.
+  let result: Awaited<ReturnType<typeof list>>;
+  try {
+    result = await list(undefined, { socket });
+  } catch (err) {
+    return {
+      reachable: false,
+      grants: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
   if (result.kind !== "ok") {
     // unreachable | error — surface the broker's reason; never throw.
     return { reachable: false, grants: [], error: result.msg };

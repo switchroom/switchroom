@@ -1476,15 +1476,16 @@ describe("handleGetGrants (standing capability grants — broker grants DB)", ()
     expect(r.grants.map((g) => g.id)).toEqual(["new", "mid", "old"]);
   });
 
-  it("never throws — a rejecting list surfaces as an error result", async () => {
-    // handleGetGrants awaits `list`; a thrown error would propagate, so the
-    // contract is that injected `list` returns a typed result. Verify the
-    // happy default path doesn't require a real broker by injecting an
-    // unreachable result (the production code path is identical).
-    const list = vi.fn(async () => ({ kind: "unreachable" as const, msg: "ENOENT" }));
+  it("never throws — a genuinely REJECTING list degrades to reachable:false", async () => {
+    // handleGetGrants wraps the await in try/catch so its documented
+    // "never throws" holds even if list's non-throwing contract changes.
+    const list = vi.fn(async () => {
+      throw new Error("socket exploded mid-RPC");
+    });
     const r = await handleGetGrants({ socketPath: "/sock", list });
     expect(r.reachable).toBe(false);
-    expect(r.error).toBe("ENOENT");
+    expect(r.grants).toEqual([]);
+    expect(r.error).toContain("socket exploded");
   });
 });
 
