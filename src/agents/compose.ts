@@ -298,6 +298,23 @@ export interface ComposeGeneratorOptions {
    */
   homeDir?: string;
   /**
+   * Absolute home path to use for FILESYSTEM probes (`existsSync` /
+   * `mkdirSync`) that gate optional bind mounts, as opposed to `homeDir`
+   * which is BAKED into mount sources + the agent's `SWITCHROOM_HOST_HOME`.
+   *
+   * These differ only when `apply` runs INSIDE the hostd container: there
+   * `homeDir` is the real HOST home (`SWITCHROOM_HOST_HOME=/home/op`, what the
+   * agent must see), but that path does not exist in hostd's own filesystem —
+   * the operator's home is bind-mounted at `/host-home`. Probing `homeDir`
+   * there returns false and SILENTLY DROPS every conditional mount
+   * (mcp-launchers, skills, fleet, credentials, …) → agents recreated by an
+   * in-hostd reconcile lose them (the 2026-06-15 marko meta_pages outage).
+   * `probeHomeDir` is the container-real home (`homedir()` = `/host-home` in
+   * hostd, `/home/op` on the host), so the probes see the bind-mounted dirs.
+   * Defaults to `homeDir` for back-compat (on the host they are identical).
+   */
+  probeHomeDir?: string;
+  /**
    * Absolute host path to the switchroom.yaml the operator wants the
    * containerised broker / kernel / scheduler to load. Bind-mounted
    * read-only into each of those services at /state/config/switchroom.yaml,
@@ -853,6 +870,13 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // sudo-bake works), but the existsSync probe must use the real host
   // home. Falls back to process.env.HOME when no homeDir is passed.
   const hostHomeForChecks = opts.homeDir ?? process.env.HOME ?? "";
+  // The home to probe with existsSync/mkdirSync. Differs from
+  // hostHomeForChecks ONLY for an in-hostd apply: there hostHomeForChecks is
+  // the host path (baked for the agent) but the operator's dirs are visible
+  // at /host-home, so probing hostHomeForChecks finds nothing and drops every
+  // conditional mount. probeHome is the container-real home. Defaults to
+  // hostHomeForChecks (identical on the host). See GenerateComposeOpts.probeHomeDir.
+  const probeHome = opts.probeHomeDir ?? hostHomeForChecks;
   // The config mount SOURCE must be a HOST path — docker bind-mounts it off the
   // host filesystem. `opts.switchroomConfigPath` is where the RUNNING generator
   // reads ITS config, which is the in-CONTAINER path `/state/config/
@@ -883,8 +907,8 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // /state/agent/analytics-id. Determinism: if the file is present, its
   // contents are stable across runs by design.
   let resolvedAnalyticsId: string | null = null;
-  if (hostHomeForChecks !== "") {
-    const idPath = join(hostHomeForChecks, ".switchroom", "analytics-id");
+  if (probeHome !== "") {
+    const idPath = join(probeHome, ".switchroom", "analytics-id");
     if (existsSync(idPath)) {
       try {
         const raw = readFileSync(idPath, "utf-8").trim();
@@ -1356,6 +1380,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       buildContext,
       homePrefix,
       hostHomeForChecks,
+      probeHome,
       switchroomConfigPath,
       containerNamePrefix,
       {
@@ -1433,6 +1458,7 @@ function emitAgentService(
   buildContext: string | undefined,
   homePrefix: string,
   hostHomeForChecks: string,
+  probeHome: string,
   switchroomConfigPath: string | undefined,
   containerNamePrefix: string,
   posthog: PosthogRuntimeEnv,
@@ -1835,7 +1861,7 @@ function emitAgentService(
     // not have it yet, and docker compose `up` hard-fails when a
     // `:ro` source is missing (same pattern as the skills /
     // credentials mounts below).
-    if (existsSync(`${hostHomeForChecks}/.switchroom/vault-audit.log`)) {
+    if (existsSync(`${probeHome}/.switchroom/vault-audit.log`)) {
       lines.push(
         `      - ${homePrefix}/.switchroom/vault-audit.log:/state/agent/home/.switchroom/vault-audit.log:ro`,
       );
@@ -1848,7 +1874,7 @@ function emitAgentService(
     // creates the file lazily on the first privileged-verb request, so
     // a fresh install may not have it yet and compose `up` would
     // hard-fail on a missing :ro source.
-    if (existsSync(`${hostHomeForChecks}/.switchroom/host-control-audit.log`)) {
+    if (existsSync(`${probeHome}/.switchroom/host-control-audit.log`)) {
       lines.push(
         `      - ${homePrefix}/.switchroom/host-control-audit.log:/state/agent/home/.switchroom/host-control-audit.log:ro`,
       );
@@ -1877,7 +1903,7 @@ function emitAgentService(
   // `up` would hard-fail on a missing source. We bind read-write so
   // the daemon can chown the socket file from the host side; the agent
   // only connects.
-  if (hostControlEnabled && existsSync(`${hostHomeForChecks}/.switchroom/hostd/${a.name}`)) {
+  if (hostControlEnabled && existsSync(`${probeHome}/.switchroom/hostd/${a.name}`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/hostd/${a.name}:/run/switchroom/hostd/${a.name}`,
     );
@@ -1932,7 +1958,7 @@ function emitAgentService(
   // missing `:ro` source. skills/ is operator-authored, non-secret
   // content (WS6 audit: LOW info-disclosure only) so it stays
   // fleet-wide.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/skills`)) {
+  if (existsSync(`${probeHome}/.switchroom/skills`)) {
     lines.push(`      - ${homePrefix}/.switchroom/skills:${homePrefix}/.switchroom/skills:ro`);
   }
   // Operator-declared MCP launcher dir (#1786 follow-up). Operators who
@@ -1947,7 +1973,7 @@ function emitAgentService(
   // skills/ pattern above; existsSync-guarded so dev installs without
   // a launcher dir don't hard-fail compose `up`. Pure-URL MCPs (e.g.
   // notion `type: http`) don't need this mount.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/mcp-launchers`)) {
+  if (existsSync(`${probeHome}/.switchroom/mcp-launchers`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/mcp-launchers:${homePrefix}/.switchroom/mcp-launchers:ro`,
     );
@@ -1962,7 +1988,7 @@ function emitAgentService(
   // agent never writes here; `switchroom apply` is the only writer.
   // Created with seeded files by `ensureHostMountSources` in apply.ts,
   // so existsSync is true on every post-apply install.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/fleet`)) {
+  if (existsSync(`${probeHome}/.switchroom/fleet`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/fleet:${homePrefix}/.switchroom/fleet:ro`,
     );
@@ -1981,7 +2007,7 @@ function emitAgentService(
   // pre-existing flat `~/.switchroom/credentials/*` files into per-
   // agent subdirs is surfaced as a loud `doctor` warning (see
   // checkFlatCredentialsMigration) — never a silent break.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/credentials/${a.name}`)) {
+  if (existsSync(`${probeHome}/.switchroom/credentials/${a.name}`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/credentials/${a.name}:${homePrefix}/.switchroom/credentials:ro`,
     );
@@ -1991,7 +2017,7 @@ function emitAgentService(
   // then traps the agent uid out of writing — pre-creating with the
   // operator's umask sidesteps that).
   try {
-    mkdirSync(`${hostHomeForChecks}/.switchroom/audit/${a.name}`, { recursive: true });
+    mkdirSync(`${probeHome}/.switchroom/audit/${a.name}`, { recursive: true });
   } catch { /* best-effort */ }
   // Phase B (switchroom #1163): pre-create the per-agent overlay
   // directory so the agent-config write tools (Phase C) have a writable
@@ -2000,7 +2026,7 @@ function emitAgentService(
   // volume entry is needed — just the host-side dir, owned by the
   // operator umask before docker auto-creates it as root.
   try {
-    mkdirSync(`${hostHomeForChecks}/.switchroom/agents/${a.name}/schedule.d`, { recursive: true });
+    mkdirSync(`${probeHome}/.switchroom/agents/${a.name}/schedule.d`, { recursive: true });
   } catch { /* best-effort */ }
   // Agent-config audit log (rw) — the read-only agent-config MCP broker
   // (src/mcp/agent-config/server.ts) appends one JSONL row per tool call
@@ -2026,10 +2052,10 @@ function emitAgentService(
   // (i.e. ~/.switchroom-config/ exists). Pre-create the per-agent
   // subdir under operator umask so docker doesn't auto-create as root
   // (the chown sweep in alignAgentUid will fix ownership on next apply).
-  if (existsSync(`${hostHomeForChecks}/.switchroom-config`)) {
+  if (existsSync(`${probeHome}/.switchroom-config`)) {
     try {
       mkdirSync(
-        `${hostHomeForChecks}/.switchroom-config/agents/${a.name}/personal-skills`,
+        `${probeHome}/.switchroom-config/agents/${a.name}/personal-skills`,
         { recursive: true },
       );
     } catch { /* best-effort */ }
@@ -2052,12 +2078,12 @@ function emitAgentService(
   // operator install — one ~700MB copy on disk instead of N. The
   // cloakbrowser pipx tool itself is baked into the agent image
   // (Dockerfile.agent) so the venv shebang lines resolve in-container.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/bin/webkite`)) {
+  if (existsSync(`${probeHome}/.switchroom/bin/webkite`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/bin/webkite:/usr/local/bin/webkite:ro`,
     );
   }
-  if (existsSync(`${hostHomeForChecks}/.cloakbrowser`)) {
+  if (existsSync(`${probeHome}/.cloakbrowser`)) {
     lines.push(
       `      - ${homePrefix}/.cloakbrowser:/state/agent/home/.cloakbrowser:ro`,
     );
@@ -2065,7 +2091,7 @@ function emitAgentService(
   // Operator-authored shared webkite config (e.g. defaults.format,
   // proxy rotation file). Optional — agents work fine without it,
   // using webkite's built-in defaults.
-  if (existsSync(`${hostHomeForChecks}/.switchroom/webkite/config.toml`)) {
+  if (existsSync(`${probeHome}/.switchroom/webkite/config.toml`)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/webkite/config.toml:/state/agent/home/.config/webkite/config.toml:ro`,
     );

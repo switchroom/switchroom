@@ -126,6 +126,13 @@ export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteCom
     // returns the container user's home — so we prefer SWITCHROOM_HOST_HOME
     // when available (it's baked in by compose.ts at apply time).
     homeDir: process.env.SWITCHROOM_HOST_HOME || homedir(),
+    // Home for FILESYSTEM probes (existsSync/mkdirSync gating optional mounts).
+    // Unlike homeDir, this is the CONTAINER-REAL home — `homedir()` is
+    // `/host-home` inside hostd (where the operator's dirs are bind-mounted)
+    // and `/home/op` on the host. Probing homeDir (the baked host path) inside
+    // hostd finds nothing and drops every conditional mount (the 2026-06-15
+    // marko meta_pages outage). On the host the two are identical.
+    probeHomeDir: homedir(),
     switchroomConfigPath: resolvedConfigPath,
     // Captured for the broker's host-shell operator socket chown.
     operatorUid,

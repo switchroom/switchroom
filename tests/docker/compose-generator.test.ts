@@ -20,7 +20,10 @@
  *   - scheduler service emitted with docker.sock mount
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   generateCompose,
   allocateAgentUid,
@@ -2770,5 +2773,46 @@ describe("root-tier debugging agent (root: true)", () => {
     expect(block).not.toContain("/var/run/docker.sock");
     expect(block).not.toContain("- /:/host:rw");
     expect(block).toContain("read_only: true");
+  });
+});
+
+describe("conditional-mount probe home (in-hostd apply — marko meta_pages regression)", () => {
+  // When apply runs INSIDE hostd, homeDir is the real HOST home
+  // (SWITCHROOM_HOST_HOME=/home/op — what the agent must see, baked into the
+  // mount source), but that path does NOT exist in hostd's own filesystem;
+  // the operator's dirs are bind-mounted at /host-home. The existsSync probes
+  // that gate optional mounts must therefore use probeHomeDir (the
+  // container-real home), not homeDir — else every conditional mount
+  // (mcp-launchers, skills, fleet, …) is silently dropped and agents recreated
+  // by an in-hostd reconcile lose them. 2026-06-15 marko outage.
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-probe-home-"));
+    mkdirSync(join(tmpDir, ".switchroom", "mcp-launchers"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("emits the mcp-launchers mount using homeDir when the dir exists at probeHomeDir", () => {
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op", // baked source — does NOT exist on this filesystem
+      probeHomeDir: tmpDir, // real filesystem home (mirrors /host-home in hostd)
+    });
+    // Probe hit at probeHomeDir → mount emitted, SOURCE baked from homeDir.
+    expect(yaml).toContain(
+      "/home/op/.switchroom/mcp-launchers:/home/op/.switchroom/mcp-launchers:ro",
+    );
+  });
+
+  it("DROPS the mount when probeHomeDir is omitted (defaults to homeDir — the bug)", () => {
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op", // probeHome defaults to this; /home/op has no launchers dir here
+    });
+    // existsSync(/home/op/.switchroom/mcp-launchers) is false → not mounted.
+    // This is exactly the in-hostd failure mode the probeHomeDir split fixes.
+    expect(yaml).not.toContain("/.switchroom/mcp-launchers:");
   });
 });
