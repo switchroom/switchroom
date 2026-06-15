@@ -227,6 +227,57 @@
       font-size: 0.85rem;
     }
 
+    /* ProblemDetail block — an actionable error/degraded state with a
+       remediation. Reuses the error-banner palette but in a muted card so it
+       reads as "here is what to do", not just "something is broken". */
+    .problem {
+      background: rgba(248,113,113,0.08);
+      border: 1px solid rgba(248,113,113,0.28);
+      border-radius: var(--radius);
+      padding: 0.75rem 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.85rem;
+    }
+    .problem.muted {
+      background: var(--surface-hover);
+      border-color: var(--border);
+    }
+    .problem-title { font-weight: 600; color: var(--text); }
+    .problem.muted .problem-title { color: var(--text); }
+    .problem:not(.muted) .problem-title { color: var(--red); }
+    .problem-detail { color: var(--text-dim); margin-top: 0.25rem; }
+    .problem-remediation { margin-top: 0.55rem; }
+    .problem-remediation .rem-label { color: var(--text-dim); display: block; margin-bottom: 0.3rem; }
+    .problem-cmd {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .problem-cmd code {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.3rem 0.5rem;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+      font-size: 0.75rem;
+      color: var(--text);
+      user-select: all;
+      word-break: break-all;
+    }
+    .problem-copy {
+      padding: 0.25rem 0.6rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--blue);
+      font-size: 0.72rem;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .problem-copy:hover { background: var(--surface-hover); }
+    .problem-remediation a { color: var(--blue); }
+
     .loading {
       text-align: center;
       padding: 4rem;
@@ -548,11 +599,7 @@
     function renderMemoryHealth(m) {
       const container = document.getElementById('memory');
       if (!m.reachable) {
-        container.innerHTML = `<div class="agent-card" style="padding:1rem">
-          <span class="status-dot inactive" style="display:inline-block;vertical-align:middle"></span>
-          <strong> Hindsight unreachable</strong>
-          <div style="color:var(--text-dim);margin-top:.5rem">${escapeHtml(m.url || '')} is not serving — agent memory (recall, retain, mental models) is down.</div>
-        </div>`;
+        container.innerHTML = renderProblem(problemFor('hindsight-down', { url: m.url }));
         return;
       }
       const statusDot = (s) => `<span class="status-dot ${s === 'ok' ? 'active' : s === 'warn' ? 'auth-warning' : 'inactive'}" style="display:inline-block;vertical-align:middle"></span>`;
@@ -935,6 +982,195 @@
       }[c]));
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // ProblemDetail — actionable error/degraded rendering.
+    //
+    // A ProblemDetail is `{ title, detail?, remediation? }` where
+    // `remediation = { kind, label, value }` and kind ∈
+    // 'command' | 'link' | 'telegram' | 'none'. renderProblem() turns it into
+    // a styled block; problemFor() is a small catalog mapping a KNOWN
+    // condition → a ProblemDetail (with the next-step command baked in).
+    //
+    // XSS: every server-derived string (title/detail/error text) goes through
+    // escapeHtml. Remediation `value` for 'command' is always a static
+    // literal from the catalog, but it's escaped anyway for defence in depth.
+    // ───────────────────────────────────────────────────────────────────
+
+    // Copy a command to the clipboard. Degrades gracefully where the
+    // Clipboard API is unavailable (insecure context / old browser): the
+    // <code> is `user-select:all` so the operator can still copy by hand.
+    function copyProblemCmd(btn) {
+      const text = btn && btn.getAttribute('data-copy');
+      if (text == null) return;
+      const flash = (label) => {
+        const prev = btn.textContent;
+        btn.textContent = label;
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => flash('Copied'), () => flash('Copy failed'));
+        } else {
+          flash('Select & copy');
+        }
+      } catch {
+        flash('Select & copy');
+      }
+    }
+
+    // Allowlist link schemes for remediation hrefs. escapeHtml prevents
+    // attribute breakout but NOT a `javascript:`/`data:` scheme; today no
+    // catalog entry uses a server-derived href, but guard it so a future
+    // `link`/`telegram` remediation can never become an injection vector.
+    function safeHref(url) {
+      const u = String(url || '').trim();
+      return /^(https?:|tg:|mailto:)/i.test(u) ? u : '#';
+    }
+
+    function renderProblem(problem) {
+      if (!problem) return '';
+      const muted = problem.muted ? ' muted' : '';
+      const title = `<div class="problem-title">${escapeHtml(problem.title || 'Problem')}</div>`;
+      const detail = problem.detail
+        ? `<div class="problem-detail">${escapeHtml(problem.detail)}</div>`
+        : '';
+      let rem = '';
+      const r = problem.remediation;
+      if (r && r.kind && r.kind !== 'none') {
+        if (r.kind === 'command') {
+          const cmd = escapeHtml(r.value || '');
+          // data-copy holds the RAW (unescaped) command for clipboard write;
+          // attribute context is still escaped via escapeHtml so the value
+          // can't break out of the attribute.
+          rem = `<div class="problem-remediation">
+            ${r.label ? `<span class="rem-label">${escapeHtml(r.label)}</span>` : ''}
+            <span class="problem-cmd"><code>${cmd}</code><button class="problem-copy" type="button" data-copy="${escapeHtml(r.value || '')}" onclick="copyProblemCmd(this)">Copy</button></span>
+          </div>`;
+        } else if (r.kind === 'link') {
+          rem = `<div class="problem-remediation">
+            <a href="${escapeHtml(safeHref(r.value))}" target="_blank" rel="noopener">${escapeHtml(r.label || r.value || 'Open')}</a>
+          </div>`;
+        } else if (r.kind === 'telegram') {
+          const note = r.value
+            ? `<a href="${escapeHtml(safeHref(r.value))}" target="_blank" rel="noopener">${escapeHtml(r.label || 'Act in Telegram')}</a>`
+            : escapeHtml(r.label || 'Act from Telegram (no model call is made from the dashboard).');
+          rem = `<div class="problem-remediation">${note}</div>`;
+        }
+      } else if (r && r.label) {
+        // kind:'none' but a label hint was supplied (e.g. a "Refresh" nudge).
+        rem = `<div class="problem-remediation"><span class="rem-label">${escapeHtml(r.label)}</span></div>`;
+      }
+      return `<div class="problem${muted}">${title}${detail}${rem}</div>`;
+    }
+
+    // Catalog: known condition → ProblemDetail. Keep small + readable. Error
+    // strings are pattern-matched defensively (case-insensitive, optional).
+    function problemFor(kind, ctx) {
+      ctx = ctx || {};
+      switch (kind) {
+        case 'hindsight-down':
+          return {
+            title: 'Hindsight (agent memory) is not serving',
+            detail: (ctx.url ? `${ctx.url} is not responding. ` : '') +
+              'Agent memory — recall, retain, mental models — is down until it recovers.',
+            remediation: {
+              kind: 'command',
+              label: 'Run on the host:',
+              value: 'switchroom memory setup --stop && switchroom memory setup',
+            },
+          };
+        case 'broker-socket-absent':
+          return {
+            title: 'Auth-broker socket not mounted into the dashboard',
+            detail: (ctx.error ? `${ctx.error} ` : '') +
+              'The web container has no broker socket — re-mount it so the dashboard can read live account state.',
+            remediation: {
+              kind: 'command',
+              label: 'Re-mount on the host:',
+              value: 'switchroom web install',
+            },
+          };
+        case 'broker-down':
+          return {
+            title: 'Auth-broker unreachable',
+            detail: (ctx.error ? `${ctx.error} ` : '') +
+              'The socket is present but the broker is not answering.',
+            remediation: {
+              kind: 'command',
+              label: 'Check broker status on the host:',
+              value: 'switchroom vault broker status',
+            },
+          };
+        case 'hostd-no-audit':
+          return {
+            muted: true,
+            title: 'hostd has handled no privileged verbs yet',
+            detail: 'This is informational — the audit log is empty because no privileged operation has run, not because hostd is broken.',
+            remediation: { kind: 'none' },
+          };
+        case 'schedule-degraded':
+          return {
+            title: 'Schedule view is incomplete',
+            detail: ctx.reason
+              ? `${ctx.reason} Showing the base-config-only view (per-agent cascade overrides may be missing).`
+              : 'hostd is unreachable — showing the base-config-only view (per-agent cascade overrides may be missing).',
+            remediation: {
+              kind: 'command',
+              label: 'Diagnose on the host:',
+              value: 'switchroom doctor',
+            },
+          };
+        case 'approvals-socket-absent':
+          return {
+            title: 'Approval-kernel operator socket not present',
+            detail: (ctx.error ? `${ctx.error} ` : '') +
+              'The dashboard has no operator socket to read the approval ledger — re-apply to (re)create it.',
+            remediation: {
+              kind: 'command',
+              label: 'Run on the host:',
+              value: 'switchroom apply',
+            },
+          };
+        case 'approvals-kernel-down':
+          return {
+            title: 'Approval-kernel unreachable',
+            detail: (ctx.error ? `${ctx.error} ` : '') +
+              'The kernel socket is present but the kernel is not answering.',
+            remediation: {
+              kind: 'command',
+              label: 'Check the singletons on the host:',
+              value: 'docker compose -p switchroom ps',
+            },
+          };
+        case 'connections-degraded':
+          return {
+            muted: true,
+            title: 'Live broker data unavailable — showing configured accounts only',
+            detail: 'These accounts are from the config; the broker did not return live slot state, so connection status may be stale.',
+            remediation: { kind: 'none', label: 'Refresh the tab once the broker is reachable to see live status.' },
+          };
+        default:
+          return { title: String(kind || 'Problem'), remediation: { kind: 'none' } };
+      }
+    }
+
+    // Classify an auth-broker error string into the right catalog condition.
+    // "socket file not found" / ENOENT / "no such file" ⇒ socket not mounted;
+    // anything else (connection refused, etc.) ⇒ broker is down.
+    function brokerProblem(error) {
+      return /not found|enoent|no such file/i.test(String(error || ''))
+        ? problemFor('broker-socket-absent', { error })
+        : problemFor('broker-down', { error });
+    }
+
+    // Classify an approvals error string. "operator socket not present" /
+    // operatorUid ⇒ socket absent (apply); otherwise kernel is down.
+    function approvalsProblem(error) {
+      return /not present|operatoruid/i.test(String(error || ''))
+        ? problemFor('approvals-socket-absent', { error })
+        : problemFor('approvals-kernel-down', { error });
+    }
+
     function statusClass(agent) {
       if (agent.active === 'active') {
         if (agent.auth && agent.auth.expiresAt) {
@@ -1232,22 +1468,31 @@
              <div class="meta-item"><label>Agents </label><span>${b.agents ?? '—'}</span></div>
              <div class="meta-item"><label>Consumers </label><span>${b.consumers ?? '—'}</span></div>
            </div>`
-        : `<div style="color:var(--red)">unreachable${b.error ? ' — ' + escapeHtml(b.error) : ''}</div>`;
+        : renderProblem(brokerProblem(b.error));
 
       const statelessCell = hs.mcpStateless == null
         ? dim('unknown')
         : hs.mcpStateless ? 'stateless' : '<span style="color:var(--yellow)">stateful</span>';
-      const hindsightBody = `
+      const hindsightMeta = `
         <div class="card-meta" style="padding:0">
           <div class="meta-item"><label>Container </label><span>${hs.containerStatus ? escapeHtml(hs.containerStatus) : dim('absent')}</span></div>
           <div class="meta-item"><label>Model </label><span>${hs.model ? escapeHtml(hs.model) : dim('unknown')}</span></div>
           <div class="meta-item"><label>Provider </label><span>${hs.provider ? escapeHtml(hs.provider) : dim('unknown')}</span></div>
           <div class="meta-item"><label>MCP </label><span>${statelessCell}</span></div>
         </div>`;
+      // When hindsight isn't serving, lead with the actionable remediation,
+      // then still show the (now-stale) container/model meta beneath it.
+      const hindsightBody = hs.running === false
+        ? renderProblem(problemFor('hindsight-down', {})) + hindsightMeta
+        : hindsightMeta;
 
       let hostdBody;
       if (!hd.auditLogPresent) {
-        hostdBody = dim(hd.error ? `audit log error: ${hd.error}` : 'no audit log yet (hostd has handled no privileged verbs)');
+        // A genuine read error stays a red dim line; the benign "empty audit
+        // log" case is an informational ProblemDetail (not an error state).
+        hostdBody = hd.error
+          ? `<div style="color:var(--red)">${escapeHtml('audit log error: ' + hd.error)}</div>`
+          : renderProblem(problemFor('hostd-no-audit', {}));
       } else if (!hd.recent || hd.recent.length === 0) {
         hostdBody = dim('audit log present, no entries');
       } else {
@@ -1458,15 +1703,41 @@
           ${fullAccessBanner}${notionBody}
         </div>`;
 
-      container.innerHTML = googleSection + microsoftSection + notionSection;
+      // Tab-level degraded banner: when every OAuth account (Google +
+      // Microsoft) is config-only (no live broker slot) and there's at least
+      // one, the broker data is unavailable — surface that ABOVE the sections
+      // without blanking the config-only cards.
+      const oauth = [...google, ...microsoft];
+      const allConfigOnly = oauth.length > 0 && oauth.every(a => a.brokerKnown === false);
+      const degradedBanner = allConfigOnly
+        ? renderProblem(problemFor('connections-degraded', {}))
+        : '';
+
+      container.innerHTML = degradedBanner + googleSection + microsoftSection + notionSection;
     }
 
     function renderSchedule(data) {
       const container = document.getElementById('schedule');
       const entries = (data && data.entries) || [];
       const recent = (data && data.recentByAgent) || {};
+      const degraded = !!(data && data.degraded);
+      const truncated = !!(data && data.truncated);
+      // Degraded banner: hostd is unreachable, so this is the base-config-only
+      // view (per-agent cascade overrides may be absent). Render it ABOVE the
+      // cards — never instead of them — so the operator sees both the
+      // incompleteness AND whatever entries we DO have.
+      const degradedBanner = degraded
+        ? renderProblem(problemFor('schedule-degraded', { reason: data && data.reason }))
+        : '';
+      const truncatedNote = truncated
+        ? '<div style="font-size:.78rem;color:var(--text-dim);margin-bottom:.75rem">(some entries trimmed to fit)</div>'
+        : '';
       if (entries.length === 0) {
-        container.innerHTML = '<div class="loading">No <code>schedule:</code> entries in any agent\'s cascade-resolved config.</div>';
+        // A bare "No schedule entries" is misleading when hostd is just down —
+        // show the actionable degraded banner instead.
+        container.innerHTML = degraded
+          ? degradedBanner
+          : '<div class="loading">No <code>schedule:</code> entries in any agent\'s cascade-resolved config.</div>';
         return;
       }
       const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
@@ -1503,15 +1774,14 @@
           </div>
         </div>`;
       }).join('');
-      container.innerHTML = cards;
+      container.innerHTML = degradedBanner + truncatedNote + cards;
     }
 
     function renderApprovals(data) {
       const container = document.getElementById('approvals');
       const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
       if (!data || data.reachable === false) {
-        const why = (data && data.error) ? escapeHtml(data.error) : 'approval-kernel not reachable from host';
-        container.innerHTML = `<div class="loading">Approval ledger unavailable — ${why}</div>`;
+        container.innerHTML = renderProblem(approvalsProblem(data && data.error));
         return;
       }
       const decisions = data.decisions || [];
