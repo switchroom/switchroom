@@ -100,6 +100,26 @@ describe('resolveTimeBox — conservative eligibility', () => {
     expect(timeBoxRule('Skill', JSON.stringify({ skill: 'deep-research' }))).toBeNull()
     expect(timeBoxRule('TotallyUnknown', '{}')).toBeNull()
   })
+
+  it('time-boxes read-only whole-tool inspection (Grep/Glob) on the broad grant', () => {
+    // No narrow sub-scope exists (BROAD_ONLY), but they are read-only — so the
+    // broad grant is safe to time-box. This is the dominant "stop re-asking for
+    // the same low-risk inspection" case the operator wants.
+    expect(timeBoxRule('Grep', JSON.stringify({ pattern: 'foo', path: '/state/x.ts' }))).toBe('Grep')
+    expect(timeBoxRule('Glob', JSON.stringify({ pattern: '**/*.ts' }))).toBe('Glob')
+  })
+
+  it('honest breadth for the read-only whole-tool window', () => {
+    const choices = resolveScopedAllowChoices('Grep', JSON.stringify({ pattern: 'foo' }))
+    expect(resolveTimeBox('Grep', JSON.stringify({ pattern: 'foo' }), choices)?.breadth).toBe('any Grep')
+  })
+
+  it('still does NOT time-box network-egress broad-only tools (WebFetch/WebSearch)', () => {
+    // Read-only-of-the-filesystem is the bar; network egress is a different
+    // risk class and is excluded on purpose (also denied via webkite).
+    expect(timeBoxRule('WebFetch', JSON.stringify({ url: 'https://x' }))).toBeNull()
+    expect(timeBoxRule('WebSearch', JSON.stringify({ query: 'x' }))).toBeNull()
+  })
 })
 
 describe('lookupScopedGrant — no seed, no extend, fail closed', () => {
@@ -119,6 +139,19 @@ describe('lookupScopedGrant — no seed, no extend, fail closed', () => {
     const store: ScopedGrantStore = new Map()
     recordScopedGrant(store, 'clerk', 'Edit(/state/x.ts)', T0, TTL)
     expect(lookupScopedGrant(store, 'clerk', 'Edit', editInput('/state/y.ts'), T0 + 1)).toBeNull()
+  })
+
+  it('a Grep grant dedups later Greps with DIFFERENT regexes (the spam case)', () => {
+    // Operator taps ✅ Allow on the first Grep → whole-tool window. The agent
+    // then greps the same file with 2 more regexes — both auto-allow, no
+    // re-prompt, for the life of the window.
+    const store: ScopedGrantStore = new Map()
+    const t = resolveTimeBox('Grep', JSON.stringify({ pattern: 'foo' }), resolveScopedAllowChoices('Grep', JSON.stringify({ pattern: 'foo' })))
+    recordScopedGrant(store, 'clerk', t!.rule, T0, TTL)
+    expect(lookupScopedGrant(store, 'clerk', 'Grep', JSON.stringify({ pattern: 'bar' }), T0 + 1_000)).toBe('Grep')
+    expect(lookupScopedGrant(store, 'clerk', 'Grep', JSON.stringify({ pattern: 'baz', path: '/state/other.ts' }), T0 + 2_000)).toBe('Grep')
+    // …and it still fails closed after the window.
+    expect(lookupScopedGrant(store, 'clerk', 'Grep', JSON.stringify({ pattern: 'bar' }), T0 + TTL)).toBeNull()
   })
 
   it('FIXED window — a matching call never extends expiresAt', () => {

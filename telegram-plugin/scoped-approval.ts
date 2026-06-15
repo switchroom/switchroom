@@ -83,6 +83,16 @@ export interface TimeBoxDecision {
 const FILE_RULE = /^(Edit|Write|MultiEdit|NotebookEdit|Read)\((.+)\)$/;
 const BASH_FAMILY_RULE = /^Bash\(([^:]+):\*\)$/;
 
+// Read-only whole-tool inspection tools. permission-rule.ts classifies these
+// as BROAD_ONLY (no meaningful path sub-scope — Grep/Glob match a pattern
+// across files), so they only ever offer a broad "any Grep/Glob" grant. They
+// are READ-ONLY — they cannot mutate anything — so time-boxing that broad grant
+// is low-risk and is exactly the dominant "stop re-asking for the same
+// low-risk inspection" case (e.g. grepping a file with several regexes). This
+// deliberately EXCLUDES WebFetch/WebSearch (also BROAD_ONLY): network egress is
+// a different risk class, and webkite denies them anyway.
+const READ_ONLY_WHOLE_TOOLS = new Set(["Grep", "Glob"]);
+
 /**
  * Conservative time-box eligibility. Given the already-resolved scope
  * choices for a permission request, return the NARROW rule to time-box
@@ -96,12 +106,24 @@ const BASH_FAMILY_RULE = /^Bash\(([^:]+):\*\)$/;
  *    triggering command itself is non-destructive. The family grant
  *    still covers the whole `<tok>` family for matching, but match-time
  *    re-checks each later command (see `lookupScopedGrant`).
+ *  - Read-only whole-tool inspection (Grep/Glob) → time-boxable on the
+ *    broad grant: no sub-scope exists, but they cannot mutate anything, so
+ *    "any Grep for 30 min" is the safe, dominant low-risk-repeat case.
  */
 export function resolveTimeBox(
   toolName: string,
   inputPreview: string | undefined,
   choices: ScopedAllowChoices | null,
 ): TimeBoxDecision | null {
+  // Read-only whole-tool inspection (Grep/Glob) has no narrow sub-scope, only
+  // a broad grant — but it is read-only, so the broad grant is safe to
+  // time-box and is the dominant low-risk-repeat case. A stored bare-tool
+  // rule ("Grep") matches every later Grep call (matchesAllowRule: rule ===
+  // toolName), so different regexes/paths all dedup for the window.
+  if (READ_ONLY_WHOLE_TOOLS.has(toolName) && choices?.broad) {
+    return { rule: choices.broad.rule, breadth: `any ${toolName}` };
+  }
+
   // Only ever time-box the narrow scope, and only when one exists.
   const specific = choices?.specific;
   if (!specific || specific.broad) return null;
