@@ -36,6 +36,7 @@ operators jump to **Operating**; contributors and reviewers use
 | [sub-agents.md](sub-agents.md) | Sub-agent delegation ("Opus plans, Sonnet implements"). |
 | [supergroup-mode.md](supergroup-mode.md) | One agent owns a Telegram forum supergroup, routing work into per-topic threads (opt-in). |
 | [google-workspace.md](google-workspace.md) | Agents reading Google Docs/Sheets/Slides/folders. |
+| [linear.md](linear.md) | Agents as first-class Linear app actors: OAuth setup, self-refreshing tokens, MCP tools. |
 | [webhook-ingest.md](webhook-ingest.md) | Pushing external events into a specific agent's log. |
 | [posthog.md](posthog.md) | Telemetry: product analytics + error tracking via PostHog. |
 | [publishing.md](publishing.md) | Publishing the switchroom Claude Code plugin / marketplace. |

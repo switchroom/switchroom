@@ -43,6 +43,12 @@ The body must be JSON. Common fields (`title`, `message`, `text`) are auto-rende
 
 ## Setup — Linear (#2272)
 
+> For making an agent a **first-class Linear app actor** (OAuth `actor=app`
+> setup, the `linear-agent` CLI, self-refreshing tokens, the
+> `linear_agent_activity` / `linear_create_issue` MCP tools), see
+> **[`linear.md`](linear.md)**. This section covers only the plain
+> webhook-ingest + dispatch path.
+
 Linear signs its webhooks with a **bare hex HMAC-SHA256 of the raw body** in the `Linear-Signature` header (no `sha256=` prefix, no Bearer auth).
 
 1. `webhook_sources: [ linear ]` in switchroom.yaml.
