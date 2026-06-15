@@ -215,23 +215,27 @@ the workspace has more than one team (a single-team workspace auto-resolves).
 
 ## Config reference
 
-`linear-agent setup` writes this block (you don't hand-edit it):
+`linear-agent setup` writes the `linear_agent` block + `webhook_via_gateway`
+and the `secrets[]` grants (you don't hand-edit those). The
+`webhook_sources: [linear]` line is added *separately* when you register the
+webhook secret (setup step 5, or `switchroom telegram enable webhook --agent
+<name> --source linear --secret <signing-secret>`).
 
 ```yaml
 agents:
   carrie:
     secrets:
-      - linear/carrie/token      # access token (read+rotate ACL)
-      - linear/carrie/oauth       # refresh bundle (read+rotate ACL)
+      - linear/carrie/token       # access token (read+rotate ACL)   ← setup
+      - linear/carrie/oauth       # refresh bundle (read+rotate ACL)  ← setup
     channels:
       telegram:
-        linear_agent:
+        linear_agent:             # ← setup
           enabled: true
           token: "vault:linear/carrie/token"
           workspace_id: "<org-id>"   # optional
           default_team_id: "<team>"  # set via `set-team`, optional
-        webhook_via_gateway: true     # forward verified webhooks to the in-container gateway
-        webhook_sources:
+        webhook_via_gateway: true     # ← setup (forwards verified webhooks to the in-container gateway)
+        webhook_sources:              # ← added when you register the webhook secret
           - linear
 ```
 
