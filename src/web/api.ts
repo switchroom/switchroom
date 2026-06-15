@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import {
   getAllAgentStatuses,
@@ -32,7 +32,9 @@ import {
   approvalList,
   resolveKernelOperatorSocket,
 } from "../vault/approvals/client.js";
+import { listGrantsViaBroker } from "../vault/broker/client.js";
 import type { ApprovalDecisionMeta } from "../vault/broker/protocol.js";
+import { homedir } from "node:os";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { resolveAgentConfig } from "../config/merge.js";
@@ -115,6 +117,7 @@ export const DASHBOARD_CACHE_TTL = {
   agents: 5000,
   accounts: 10000,
   approvals: 15000,
+  grants: 15000,
 } as const;
 
 /** Test-only: reset the shared dashboard cache between cases. */
@@ -1614,6 +1617,133 @@ export async function handleGetApprovals(): Promise<ApprovalsDashboard> {
   // Newest first — most relevant grant at the top of the table.
   const sorted = [...decisions].sort((a, b) => b.granted_at - a.granted_at);
   return { reachable: true, decisions: sorted };
+}
+
+/**
+ * Host-side vault-broker OPERATOR socket path — the host end of the
+ * compose bind `~/.switchroom/broker-operator → /run/switchroom/broker/operator`.
+ * The broker restricts this socket to read-only ops (notably
+ * `list_grants`), so it is safe for the host observer (the web dashboard)
+ * and is what `switchroom vault grants` reads passphrase-free.
+ *
+ * Mirrors `resolveKernelOperatorSocket` (approvals/client.ts): probe the
+ * host fs here and pass the result as `opts.socket` to `listGrantsViaBroker`
+ * — deliberately NOT folded into the broker's own `resolveBrokerSocketPath`,
+ * which stays a pure env/opts function so no other caller's behaviour
+ * depends on whether this socket happens to exist.
+ */
+export function brokerOperatorSocketPath(
+  home: string = process.env.HOME || homedir(),
+): string {
+  return join(home, ".switchroom", "broker-operator", "sock");
+}
+
+/**
+ * Resolve the host broker-operator socket iff it exists, else null. The
+ * read-only host caller uses this to decide whether to talk to the broker;
+ * absent ⇒ the grants view degrades (broker not host-reachable) rather
+ * than silently changing the broker resolver contract.
+ */
+export function resolveBrokerOperatorSocket(
+  home: string = process.env.HOME || homedir(),
+): string | null {
+  const p = brokerOperatorSocketPath(home);
+  return existsSync(p) ? p : null;
+}
+
+/**
+ * Standing capability grants (the vault-broker grants DB) for the dashboard
+ * Approvals tab. The approval-KERNEL decision ledger (`handleGetApprovals`)
+ * is honestly empty on most installs — the daily per-tool Allow/Deny taps
+ * never write it — so the operator's REAL standing grants live here, in the
+ * broker's `list_grants` op (the same data `switchroom vault grants` shows).
+ *
+ * READ-ONLY by construction: this calls `list_grants` over the operator
+ * socket (no agent filter → fleet-wide) and never grants/mints/revokes. No
+ * model call, no docker, no broker WRITE op.
+ *
+ * Three states, each rendered distinctly:
+ *   - operator socket absent  → broker not host-reachable on this install.
+ *     `reachable:false` + an actionable error.
+ *   - socket present, RPC unreachable/error → `reachable:false` + the
+ *     broker's reason.
+ *   - ok → grants[] (newest first for the table).
+ */
+export interface GrantDashboardRow {
+  id: string;
+  agent: string;
+  /** Keys/globs this grant authorizes for READ. */
+  keys: string[];
+  /** Keys/globs this grant authorizes for WRITE. `[]` = read-only. */
+  writeKeys: string[];
+  /** unix MILLISECONDS (converted from the broker's unix seconds) or null. */
+  expiresAt: number | null;
+  /** unix MILLISECONDS (converted from the broker's unix seconds). */
+  createdAt: number;
+  description: string | null;
+}
+
+export interface GrantsDashboard {
+  reachable: boolean;
+  grants: GrantDashboardRow[];
+  error?: string;
+}
+
+export async function handleGetGrants(
+  deps: {
+    socketPath?: string | null;
+    list?: typeof listGrantsViaBroker;
+  } = {},
+): Promise<GrantsDashboard> {
+  // `deps.socketPath` overrides the fs probe (tests / injected); when the
+  // key is OMITTED we probe, when it's explicitly null we honour that.
+  const socket =
+    "socketPath" in deps ? deps.socketPath : resolveBrokerOperatorSocket();
+  if (socket == null) {
+    return {
+      reachable: false,
+      grants: [],
+      error:
+        "vault-broker operator socket not present — host-side grant " +
+        "listing needs a broker-operator bind (re-apply to (re)create it).",
+    };
+  }
+  const list = deps.list ?? listGrantsViaBroker;
+  // No agent filter → all agents' grants. Pin opts.socket to the operator
+  // socket so the broker resolver can't fall through to a non-operator path.
+  // listGrantsViaBroker is contractually non-throwing, but wrap defensively
+  // so this handler's documented "never throws" holds even if that contract
+  // ever changes — a thrown error degrades to reachable:false, not a 500.
+  let result: Awaited<ReturnType<typeof list>>;
+  try {
+    result = await list(undefined, { socket });
+  } catch (err) {
+    return {
+      reachable: false,
+      grants: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  if (result.kind !== "ok") {
+    // unreachable | error — surface the broker's reason; never throw.
+    return { reachable: false, grants: [], error: result.msg };
+  }
+  // GrantMeta `created_at` / `expires_at` are unix SECONDS (see
+  // src/vault/grants.ts — `Math.floor(Date.now() / 1000)`); the UI's
+  // `formatTimestamp` expects unix MILLISECONDS, so convert at this
+  // boundary (×1000) and document the unit on the row fields.
+  const rows: GrantDashboardRow[] = result.grants.map((g) => ({
+    id: g.id,
+    agent: g.agent_slug,
+    keys: g.key_allow,
+    writeKeys: g.write_allow,
+    expiresAt: g.expires_at == null ? null : g.expires_at * 1000,
+    createdAt: g.created_at * 1000,
+    description: g.description,
+  }));
+  // Newest first — most recent grant at the top of the table.
+  rows.sort((a, b) => b.createdAt - a.createdAt);
+  return { reachable: true, grants: rows };
 }
 
 /**

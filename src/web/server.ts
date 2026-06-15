@@ -39,6 +39,7 @@ import {
   handleGetNotionWorkspace,
   handleGetSchedule,
   handleGetApprovals,
+  handleGetGrants,
   handleGetSummary,
   dashboardCache,
   DASHBOARD_CACHE_TTL,
@@ -46,6 +47,7 @@ import {
   type SystemHealth,
   type ScheduleDashboard,
   type ApprovalsDashboard,
+  type GrantsDashboard,
   type AccountDashboardInfo,
 } from "./api.js";
 import type { CachedResult } from "./cache.js";
@@ -495,6 +497,13 @@ function parseRoute(
     return { handler: "getApprovals", params: {} };
   }
 
+  // GET /api/grants — standing capability grants from the vault-broker
+  // grants DB (the operator's REAL grants; the kernel decision ledger
+  // above is honestly empty on most installs).
+  if (method === "GET" && pathname === "/api/grants") {
+    return { handler: "getGrants", params: {} };
+  }
+
   // GET /api/accounts
   if (method === "GET" && pathname === "/api/accounts") {
     return { handler: "getAccounts", params: {} };
@@ -628,6 +637,12 @@ export function startWebServer(
       "approvals",
       DASHBOARD_CACHE_TTL.approvals,
       () => handleGetApprovals(),
+    );
+  const cachedGrants = (): Promise<CachedResult<GrantsDashboard>> =>
+    dashboardCache.get(
+      "grants",
+      DASHBOARD_CACHE_TTL.grants,
+      () => handleGetGrants(),
     );
   const cachedAccounts = (): Promise<CachedResult<AccountDashboardInfo[]>> =>
     dashboardCache.get(
@@ -819,6 +834,10 @@ export function startWebServer(
           case "getApprovals":
             return (async () =>
               jsonResponse(withStamp(await cachedApprovals())))();
+
+          case "getGrants":
+            return (async () =>
+              jsonResponse(withStamp(await cachedGrants())))();
 
           case "getAccounts":
             // Array response — bare array, no stamp wrap (see getAgents).

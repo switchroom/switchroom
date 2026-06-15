@@ -112,6 +112,7 @@ import {
   handleGetMicrosoftConnectStatus,
   __resetMicrosoftConnectStatuses,
   handleGetApprovals,
+  handleGetGrants,
   handleRefreshAccountsQuota,
   __resetQuotaCacheForTests,
   __resetAgentStatusCacheForTests,
@@ -1370,6 +1371,121 @@ describe("handleGetApprovals", () => {
     expect(approvalList).toHaveBeenCalledWith(undefined, {
       socket: "/run/op/sock",
     });
+  });
+});
+
+describe("handleGetGrants (standing capability grants — broker grants DB)", () => {
+  // Injectable `list` + `socketPath` deps → no real broker, no fs probe.
+  const fakeGrant = (over: Partial<{
+    id: string;
+    agent_slug: string;
+    key_allow: string[];
+    write_allow: string[];
+    expires_at: number | null;
+    created_at: number;
+    description: string | null;
+  }> = {}) => ({
+    id: "g1",
+    agent_slug: "agent-a",
+    key_allow: ["api/foo"],
+    write_allow: [],
+    expires_at: null,
+    created_at: 1_700_000_000, // unix SECONDS
+    description: null,
+    ...over,
+  });
+
+  it("returns reachable:false + an actionable error when the socket is absent (null)", async () => {
+    const list = vi.fn();
+    const r = await handleGetGrants({ socketPath: null, list });
+    expect(r.reachable).toBe(false);
+    expect(r.grants).toEqual([]);
+    expect(r.error).toMatch(/operator socket not present/i);
+    // Must not attempt the RPC when there's no socket.
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("maps kind:'ok' grants and pins opts.socket (no agent filter)", async () => {
+    const list = vi.fn(async () => ({
+      kind: "ok" as const,
+      grants: [
+        fakeGrant({
+          id: "g1",
+          agent_slug: "alice",
+          key_allow: ["api/key", "api/other"],
+          write_allow: ["api/key"],
+          expires_at: 1_700_000_500,
+          created_at: 1_700_000_000,
+          description: "scoped grant",
+        }),
+      ],
+    }));
+    const r = await handleGetGrants({ socketPath: "/run/broker-op/sock", list });
+    expect(r.reachable).toBe(true);
+    expect(list).toHaveBeenCalledWith(undefined, { socket: "/run/broker-op/sock" });
+    expect(r.grants).toHaveLength(1);
+    const g = r.grants[0];
+    // Projection: agent_slug→agent, key_allow→keys, write_allow→writeKeys.
+    expect(g.id).toBe("g1");
+    expect(g.agent).toBe("alice");
+    expect(g.keys).toEqual(["api/key", "api/other"]);
+    expect(g.writeKeys).toEqual(["api/key"]);
+    expect(g.description).toBe("scoped grant");
+    // Time-unit: GrantMeta is unix SECONDS, UI wants ms → ×1000.
+    expect(g.createdAt).toBe(1_700_000_000_000);
+    expect(g.expiresAt).toBe(1_700_000_500_000);
+  });
+
+  it("keeps a null expires_at as null (never-expiring grant)", async () => {
+    const list = vi.fn(async () => ({
+      kind: "ok" as const,
+      grants: [fakeGrant({ expires_at: null })],
+    }));
+    const r = await handleGetGrants({ socketPath: "/sock", list });
+    expect(r.grants[0].expiresAt).toBeNull();
+    // created_at still converted to ms.
+    expect(r.grants[0].createdAt).toBe(1_700_000_000_000);
+  });
+
+  it("maps kind:'unreachable' to reachable:false + the broker reason", async () => {
+    const list = vi.fn(async () => ({ kind: "unreachable" as const, msg: "broker not answering" }));
+    const r = await handleGetGrants({ socketPath: "/sock", list });
+    expect(r.reachable).toBe(false);
+    expect(r.grants).toEqual([]);
+    expect(r.error).toBe("broker not answering");
+  });
+
+  it("maps kind:'error' to reachable:false + the broker reason", async () => {
+    const list = vi.fn(async () => ({ kind: "error" as const, msg: "denied" }));
+    const r = await handleGetGrants({ socketPath: "/sock", list });
+    expect(r.reachable).toBe(false);
+    expect(r.grants).toEqual([]);
+    expect(r.error).toBe("denied");
+  });
+
+  it("sorts grants newest-first by createdAt", async () => {
+    const list = vi.fn(async () => ({
+      kind: "ok" as const,
+      grants: [
+        fakeGrant({ id: "old", created_at: 1_000 }),
+        fakeGrant({ id: "new", created_at: 9_000 }),
+        fakeGrant({ id: "mid", created_at: 5_000 }),
+      ],
+    }));
+    const r = await handleGetGrants({ socketPath: "/sock", list });
+    expect(r.grants.map((g) => g.id)).toEqual(["new", "mid", "old"]);
+  });
+
+  it("never throws — a genuinely REJECTING list degrades to reachable:false", async () => {
+    // handleGetGrants wraps the await in try/catch so its documented
+    // "never throws" holds even if list's non-throwing contract changes.
+    const list = vi.fn(async () => {
+      throw new Error("socket exploded mid-RPC");
+    });
+    const r = await handleGetGrants({ socketPath: "/sock", list });
+    expect(r.reachable).toBe(false);
+    expect(r.grants).toEqual([]);
+    expect(r.error).toContain("socket exploded");
   });
 });
 
