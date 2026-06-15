@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.15.27 — Admin dashboard overhaul (#2363–2370)
+
+A full audit and rebuild of the `switchroom-web` admin dashboard. The web
+container is dockerless by design (the one internet-facing component), which
+had silently broken a whole family of features that assumed docker access;
+the fix routes the control + observability path through hostd (which holds the
+docker socket) over its ungated operator socket, while keeping the web making
+**zero model calls** (now enforced by a CI guard).
+
+### PR #2363 — repair the Agents-tab crash + 4 data-accuracy bugs
+- CRITICAL: the Agent Details panel read a field the API renamed post-RFC-H,
+  throwing a TypeError that blanked the entire Agents grid on every poll.
+- Accounts now derive 5h/7d quota from the broker's free `last_quota` snapshot
+  instead of spending a billed probe; the health badge reflects the broker's
+  live `exhausted` flag.
+- Connections show a "connected" pill + "auto-refreshes" instead of
+  "Expires 23d ago"; a non-unreachable broker error no longer vanishes a
+  configured account. The System hostd panel surfaces the error string and
+  uses a tri-state status dot.
+
+### PR #2364 — uptime/mem, schedule overlays, logs via hostd read-ops
+- New read-only hostd verbs `agent_status` (uptime + memory) and
+  `agent_schedule` (merges each agent's `schedule.d/*.yaml` cron overlays —
+  0600 agent-owned, unreadable by the operator/web, readable by hostd as root)
+  with a provably frame-bounded payload. Logs route through hostd `agent_logs`.
+
+### PR #2365 — control plane via hostd
+- Restart routes through hostd's `agent_restart` (ungated). Live-log streaming
+  polls hostd and replaces in place (the old `docker logs -f` couldn't run in
+  the dockerless container). Liveness honesty: the status dot is labeled a
+  bridge heartbeat, with a real "Last turn" signal from the turns DB.
+
+### PR #2366 — server-side SWR cache + /api/summary + visibility-gated poll
+- A stale-while-revalidate cache fronts every expensive panel; `/api/summary`
+  collapses the Summary tab's 5-way fan-out into one round-trip; the 10s poll
+  pauses when the tab is backgrounded. The billed quota probe is never cached.
+
+### PR #2367 — actionable errors (ProblemDetail framework)
+- Every error/degraded state renders a remediation (a copyable host command,
+  link, or Telegram note) instead of a raw string; degraded banners replace
+  silent empties (e.g. the schedule view when hostd is unreachable).
+
+### PR #2368 — standing capability grants on the Approvals tab
+- The approval-kernel ledger is honestly empty; the real standing grants live
+  in the vault-broker grants DB. A read-only "Standing capability grants"
+  section surfaces them.
+
+### PR #2369 — Memory remediation buttons
+- Per-bank "Reprocess", "Refresh model", and "Build profile" buttons that POST
+  to hindsight to trigger the work on its own claude-code provider — the web
+  makes no model call. Targets are re-derived/validated server-side.
+
+### PR #2370 — triage strip, recent turns, WS-auth fix, CI guard
+- A "Needs attention" triage strip on Summary; recent turns in the agent
+  Details panel; the live-log WebSocket now authenticates via the
+  `Sec-WebSocket-Protocol` bearer the server already checks; and a lint guard
+  that fails if `src/web` imports an Anthropic SDK / hits the raw API /
+  spawns `claude -p`.
+
 ## v0.15.26 — Linear app tokens self-heal (durable OAuth refresh) (#2360, #2361)
 
 Linear's `actor=app` token exchange returns a short-lived access token (~24h)
