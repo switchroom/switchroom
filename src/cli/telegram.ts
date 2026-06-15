@@ -25,7 +25,7 @@ import {
 } from "../web/webhook-dispatch.js";
 import { createInterface } from "node:readline";
 import { resolvePath, loadConfig } from "../config/loader.js";
-import { createVault, setStringSecret } from "../vault/vault.js";
+import { createVault, setStringSecret, getStringSecret } from "../vault/vault.js";
 import { getConfig, getConfigPath, withConfigError } from "./helpers.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveStatePath } from "../config/paths.js";
@@ -627,6 +627,33 @@ export async function vaultPut(program: Command, key: string, value: string): Pr
   }
   setStringSecret(passphrase, vaultPath, key, value);
   console.log(chalk.green(`✓ Stored secret in vault as '${key}'`));
+}
+
+/**
+ * Host-side vault write that does NOT print (the quiet sibling of
+ * `vaultPut`). For verbs that store several keys in one operation and
+ * render their own summary (e.g. the linear-agent token+bundle store).
+ */
+export async function vaultPutQuiet(program: Command, key: string, value: string): Promise<void> {
+  const configPath = (program.optsWithGlobals().config as string | undefined) ?? undefined;
+  const vaultPath = resolveVaultPath(configPath);
+  const passphrase = await getVaultPassphrase();
+  if (!existsSync(vaultPath)) createVault(passphrase, vaultPath);
+  setStringSecret(passphrase, vaultPath, key, value);
+}
+
+/**
+ * Host-side vault read (direct file decrypt, operator passphrase). Returns
+ * null when the key is absent. Used by verbs that need to read a stored
+ * secret programmatically — e.g. `linear-agent refresh` reading the OAuth
+ * bundle before exchanging the refresh token.
+ */
+export async function vaultGet(program: Command, key: string): Promise<string | null> {
+  const configPath = (program.optsWithGlobals().config as string | undefined) ?? undefined;
+  const vaultPath = resolveVaultPath(configPath);
+  if (!existsSync(vaultPath)) return null;
+  const passphrase = await getVaultPassphrase();
+  return getStringSecret(passphrase, vaultPath, key);
 }
 
 function resolveVaultPath(configPath?: string): string {
