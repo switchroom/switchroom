@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.15.29 — Per-cron Schedule view (#2375)
+
+The dashboard Schedule tab now shows each cron as a self-contained block —
+its title (captured from the overlay file's `# name:` header), cron
+expression + routing badges, prompt, and its OWN recent fire history right
+below it (matched by `promptKey`) — instead of a flat per-agent table with a
+separate agent-wide fires table. Fires are now bounded per-cron, so a busy
+cron no longer crowds a quiet one out of the window.
+
 ## v0.15.28 — Dashboard favicon (#2373)
 
 The admin dashboard now serves the switchroom logo as its favicon (a
