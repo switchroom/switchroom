@@ -209,3 +209,45 @@ describe('createLinearIssue — behaviour (#2312)', () => {
     expect(r.content[0].text).toMatch(/Linear API 401/)
   })
 })
+
+import { serializeBundle, type RefreshIO } from '../../src/linear/oauth-refresh.js'
+
+describe('createLinearIssue — token threading across gql calls after a 401 refresh', () => {
+  it('a 401 on the teams resolve refreshes, and issueCreate carries the FRESH token', async () => {
+    // No team_id + no dedup → flow is: teams(query) then issueCreate(mutation).
+    // The teams call 401s → refresh → retry; activeToken must then carry the
+    // fresh token to issueCreate. Pins the mutable-activeToken threading.
+    const auths: Array<{ op: string; auth?: string }> = []
+    let teamsHits = 0
+    const fetchImpl = (async (url: string, init: { headers?: Record<string, string>; body?: string }) => {
+      const auth = init?.headers?.Authorization
+      const body = init?.body ?? ''
+      if (url.includes('/oauth/token')) {
+        return { ok: true, status: 200, json: async () => ({ access_token: 'lin_fresh', expires_in: 3600 }), text: async () => '' } as unknown as Response
+      }
+      if (body.includes('teams(')) {
+        auths.push({ op: 'teams', auth })
+        teamsHits++
+        if (teamsHits === 1) return { ok: false, status: 401, json: async () => ({}), text: async () => 'unauthorized' } as unknown as Response
+        return { ok: true, status: 200, json: async () => ({ data: { teams: { nodes: [{ id: 'team_1', key: 'ENG', name: 'Eng' }] } } }), text: async () => '' } as unknown as Response
+      }
+      // issueCreate
+      auths.push({ op: 'issueCreate', auth })
+      return { ok: true, status: 200, json: async () => ({ data: { issueCreate: { success: true, issue: { identifier: 'ENG-1', url: 'https://linear.app/x/issue/ENG-1' } } } }), text: async () => '' } as unknown as Response
+    }) as unknown as typeof fetch
+
+    const io: RefreshIO = {
+      readBundle: async () => serializeBundle({ clientId: 'c', clientSecret: 's', refreshToken: 'rt', expiresAt: 0 }),
+      writeToken: async () => {},
+      writeBundle: async () => {},
+    }
+    const r = await createLinearIssue(
+      { title: 'a bug' },
+      { agent: 'carrie', resolveToken: okToken('lin_expired'), fetchImpl, refreshIO: () => io, log: () => {} },
+    )
+    expect(r.content[0].text).toMatch(/Filed:/)
+    // teams: expired then fresh (retry); issueCreate: fresh (threaded).
+    expect(auths.find((a) => a.op === 'issueCreate')?.auth).toBe('lin_fresh')
+    expect(auths.filter((a) => a.op === 'teams').map((a) => a.auth)).toEqual(['lin_expired', 'lin_fresh'])
+  })
+})
