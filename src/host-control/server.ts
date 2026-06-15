@@ -62,6 +62,14 @@ import {
 } from "./config-edit-validator.js";
 import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
+import { loadConfig, resolveAgentsDir } from "../config/loader.js";
+import { getAllAgentStatuses } from "../agents/lifecycle.js";
+import {
+  collectScheduleEntries,
+  type SchedulerEntry,
+  type DispatchResult,
+} from "../scheduler/dispatch.js";
+import { readRecentFires } from "../agent-scheduler/replay.js";
 
 /** Subset of switchroom.yaml the daemon reads. */
 export interface ServerConfig {
@@ -707,6 +715,13 @@ export class HostdServer {
         case "agent_smoke":
           resp = await this.handleAgentSmoke(req, started);
           break;
+        // ── Dashboard read-ops (dockerless-web fix) ──────────────
+        case "agent_status":
+          resp = this.handleAgentStatus(req, started);
+          break;
+        case "agent_schedule":
+          resp = this.handleAgentSchedule(req, started);
+          break;
         // ── PR 1a (admin-agent-config-edit RFC) ──────────────────
         // Stub dispatcher: flag-gated disabled error or a
         // not-implemented marker. PR 1b adds validation; PR 1c adds
@@ -831,6 +846,24 @@ export class HostdServer {
         return callerAdmin
           ? null
           : `doctor requires admin: true on caller "${caller.name}"`;
+      case "agent_status":
+      case "agent_schedule":
+        // Read-only dashboard observability. The real consumer is the
+        // web, which connects over the OPERATOR socket and returned null
+        // at the top of this method (ungated, by design — see the
+        // dispatcher comment in main.ts and hostd-config-propose.ts).
+        // For an AGENT caller we mirror agent_smoke/agent_logs: a
+        // self-scoped query (its own name) is harmless self-debugging;
+        // a single OTHER agent's view or the whole-fleet view (name
+        // omitted) is broader exposure, so require admin — same posture
+        // as doctor's whole-fleet enumeration. These verbs change
+        // nothing; no fleet-mutation lock applies.
+        if (req.args.name !== undefined && req.args.name === caller.name) {
+          return null;
+        }
+        return callerAdmin
+          ? null
+          : `${req.op} ${req.args.name === undefined ? "fleet view" : "cross-agent"} requires admin: true on caller "${caller.name}"`;
       case "config_propose_edit":
         // Admin callers may propose ANY edit to the central
         // switchroom.yaml. Non-admin callers are admitted here but
@@ -1749,6 +1782,101 @@ export class HostdServer {
     return respond("running", probes);
   }
 
+  /**
+   * Read-only fleet (or single-agent) docker status — uptime + memory +
+   * active. The whole point: hostd HAS the docker socket, so
+   * `getAllAgentStatuses` (which shells `docker inspect`/`docker stats`)
+   * works here, where it throws/returns-null in the dockerless web
+   * container. Result is JSON-encoded into `payload` as `{ statuses }`.
+   *
+   * Always `completed` when the config loads and the status sweep runs
+   * (a down/absent container is a *finding* in the per-agent status, not
+   * a verb failure — same posture as doctor). A genuine fault (config
+   * unreadable, status sweep throws) returns `error` with a message;
+   * never crashes the daemon.
+   */
+  private handleAgentStatus(
+    req: Extract<HostdRequest, { op: "agent_status" }>,
+    started: number,
+  ): HostdResponse {
+    try {
+      const cfg = loadConfig(this.opts.configPath);
+      const all = getAllAgentStatuses(cfg);
+      const statuses = req.args.name
+        ? req.args.name in all
+          ? { [req.args.name]: all[req.args.name]! }
+          : {}
+        : all;
+      return {
+        v: 1,
+        request_id: req.request_id,
+        result: "completed",
+        exit_code: 0,
+        duration_ms: Date.now() - started,
+        payload: JSON.stringify({ statuses }),
+      };
+    } catch (e) {
+      return {
+        v: 1,
+        request_id: req.request_id,
+        result: "error",
+        exit_code: null,
+        duration_ms: Date.now() - started,
+        error: `agent_status failed: ${(e as Error).message}`,
+      };
+    }
+  }
+
+  /**
+   * Read-only cron schedule view — the cascade-resolved schedule entries
+   * PLUS the most-recent fires per agent. Loads config FRESH (not the
+   * daemon's cached startup config): `loadConfig` merges each agent's
+   * `~/.switchroom/agents/<name>/schedule.d/*.yaml` overlays, and those
+   * files are 0600 owned by the agent's container UID — readable here
+   * (hostd runs as root with DAC_OVERRIDE) but EACCES from the
+   * operator/web vantage. That overlay-merge is exactly why this lands
+   * the agent-authored crons the dashboard otherwise misses.
+   *
+   * Result is JSON-encoded into `payload` as `{ entries, recentByAgent }`,
+   * BOUNDED by {@link boundScheduleView} (prompt ≤160 chars, each fire's
+   * outputSummary ≤100 chars, last 8 fires/agent) so the frame stays
+   * under the 64 KiB cap even for a large fleet with long prompts.
+   */
+  private handleAgentSchedule(
+    req: Extract<HostdRequest, { op: "agent_schedule" }>,
+    started: number,
+  ): HostdResponse {
+    try {
+      const cfg = loadConfig(this.opts.configPath);
+      let entries = collectScheduleEntries(cfg);
+      if (req.args.name) entries = entries.filter((e) => e.agent === req.args.name);
+      const agentsDir = resolveAgentsDir(cfg);
+      const recentByAgent: Record<string, DispatchResult[]> = {};
+      for (const agent of new Set(entries.map((e) => e.agent))) {
+        const rows = readRecentFires(resolve(agentsDir, agent, "scheduler.jsonl"));
+        if (rows.length > 0) recentByAgent[agent] = rows;
+      }
+      const bounded = boundScheduleView(entries, recentByAgent);
+      return {
+        v: 1,
+        request_id: req.request_id,
+        result: "completed",
+        exit_code: 0,
+        duration_ms: Date.now() - started,
+        payload: JSON.stringify(bounded),
+      };
+    } catch (e) {
+      return {
+        v: 1,
+        request_id: req.request_id,
+        result: "error",
+        exit_code: null,
+        duration_ms: Date.now() - started,
+        error: `agent_schedule failed: ${(e as Error).message}`,
+      };
+    }
+  }
+
   /** Spawn the host `docker` CLI and capture stdout/stderr. Symmetric
    *  with {@link runSwitchroom}; broken out for testability + so
    *  failures get a "docker binary missing" surface separate from
@@ -2088,6 +2216,49 @@ export class HostdServer {
 function tail(s: string, bytes = TAIL_BYTES): string {
   if (Buffer.byteLength(s, "utf8") <= bytes) return s;
   return s.slice(s.length - bytes);
+}
+
+/** Max chars retained from a schedule entry's `prompt` in the bounded
+ *  `agent_schedule` payload — the web only renders a preview. */
+export const SCHEDULE_PROMPT_MAX_CHARS = 160;
+/** Max chars retained from a fire's `outputSummary` in the bounded payload. */
+export const SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS = 100;
+/** Max recent fires retained per agent in the bounded payload. */
+export const SCHEDULE_MAX_FIRES_PER_AGENT = 8;
+
+/**
+ * Pure, frame-bounding shaper for the `agent_schedule` payload (extracted
+ * so it can be unit-tested without a daemon). It (a) truncates each
+ * entry's `prompt` to {@link SCHEDULE_PROMPT_MAX_CHARS}, (b) keeps only
+ * the LAST {@link SCHEDULE_MAX_FIRES_PER_AGENT} fires per agent (newest),
+ * and (c) truncates each fire's `outputSummary` to
+ * {@link SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS}. Without these bounds a large
+ * fleet with long prompts / verbose fire summaries could blow the 64 KiB
+ * response frame. Returns NEW objects — never mutates the inputs (the
+ * daemon's caller has no other reader, but purity keeps the test honest
+ * and avoids surprising any future caller).
+ */
+export function boundScheduleView(
+  entries: SchedulerEntry[],
+  recentByAgent: Record<string, DispatchResult[]>,
+): { entries: SchedulerEntry[]; recentByAgent: Record<string, DispatchResult[]> } {
+  const boundedEntries = entries.map((e) =>
+    e.prompt !== undefined && e.prompt.length > SCHEDULE_PROMPT_MAX_CHARS
+      ? { ...e, prompt: e.prompt.slice(0, SCHEDULE_PROMPT_MAX_CHARS) }
+      : { ...e },
+  );
+  const boundedRecent: Record<string, DispatchResult[]> = {};
+  for (const [agent, rows] of Object.entries(recentByAgent)) {
+    boundedRecent[agent] = rows
+      .slice(-SCHEDULE_MAX_FIRES_PER_AGENT)
+      .map((r) =>
+        typeof r.outputSummary === "string" &&
+        r.outputSummary.length > SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS
+          ? { ...r, outputSummary: r.outputSummary.slice(0, SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS) }
+          : { ...r },
+      );
+  }
+  return { entries: boundedEntries, recentByAgent: boundedRecent };
 }
 
 /**

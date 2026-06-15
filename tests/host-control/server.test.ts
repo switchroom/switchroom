@@ -1314,3 +1314,203 @@ describe("hostd server — apply-asset preflight (klanker incident)", () => {
     expect(resp.error).not.toContain(join(partial, "profiles") + ",");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Dashboard read-ops (dockerless-web fix): the agent_status /
+// agent_schedule verbs. Unlike the other e2e verbs above (which only
+// shell the stub CLI), these LOAD a real config — so this block stands up
+// its own server with `configPath` pointing at a tmp switchroom.yaml.
+//
+// ISOLATION: the overlay loader resolves `schedule.d` under
+// `$HOME/.switchroom/agents/<name>/` (resolveDualPath → process.env.HOME),
+// NOT under config.agents_dir — so this block ALSO overrides HOME to a
+// tmpdir. Both `SWITCHROOM_AGENTS_DIR` (resolveAgentsDir, the scheduler
+// ledger path) and HOME (the overlay tree) point at the SAME isolated
+// `<roTmp>/.switchroom/agents` so NOTHING reads/writes the operator's
+// real ~/.switchroom. (Verified: without the HOME override the loader
+// EACCES'd on the operator's real 0600 overlay files — exactly the
+// production bug this verb fixes, but a test must never touch live state.)
+//
+// Proves: dispatch wiring, the operator-ungated/agent-admin gate, the
+// `payload` round-trip, agent_schedule's recent-fire read against a real
+// scheduler.jsonl, AND that a schedule.d overlay cron is merged in (the
+// load-bearing fix — fresh loadConfig sees the overlay the base config
+// lacks).
+// ─────────────────────────────────────────────────────────────────────
+describe("hostd server — dashboard read-ops (agent_status / agent_schedule)", () => {
+  let roTmp: string;
+  let roServer: HostdServer;
+  let agentsDir: string;
+  let savedAgentsDir: string | undefined;
+  let savedHome: string | undefined;
+
+  beforeAll(async () => {
+    roTmp = mkdtempSync(join(tmpdir(), "hostd-readops-"));
+    // The agents tree lives under <roTmp>/.switchroom/agents so the
+    // overlay loader (HOME-rooted) and the ledger reader (agents_dir-
+    // rooted) resolve to the SAME isolated location.
+    agentsDir = join(roTmp, ".switchroom", "agents");
+    const cfgPath = join(roTmp, "switchroom.yaml");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(
+      cfgPath,
+      [
+        "switchroom:",
+        "  version: 1",
+        `  agents_dir: "${agentsDir}"`,
+        "telegram:",
+        '  bot_token: "x"',
+        '  forum_chat_id: "1"',
+        "agents:",
+        "  klanker:",
+        "    topic_name: Klanker",
+        "    schedule:",
+        '      - cron: "*/30 * * * *"',
+        `        prompt: "${"p".repeat(300)}"`,
+        "  bob:",
+        "    topic_name: Bob",
+      ].join("\n") + "\n",
+    );
+    // Seed a scheduler.jsonl with > 8 fires + a long outputSummary so the
+    // bound payload exercises both truncation paths.
+    mkdirSync(join(agentsDir, "klanker"), { recursive: true });
+    const rows = Array.from({ length: 12 }, (_, i) =>
+      JSON.stringify({
+        agent: "klanker",
+        scheduleIndex: 0,
+        promptKey: "k",
+        exitCode: 0,
+        outputSummary: i === 11 ? "s".repeat(300) : "ok",
+        startedAt: 1747300000000 + i,
+        finishedAt: 1747300000500 + i,
+      }),
+    );
+    writeFileSync(join(agentsDir, "klanker", "scheduler.jsonl"), rows.join("\n") + "\n");
+
+    // The agent-authored overlay cron the base config doesn't carry —
+    // this is what the operator/web (uid 1000) can't read (0600, agent-
+    // owned) but hostd (root) can. Asserting it surfaces proves the fix.
+    mkdirSync(join(agentsDir, "klanker", "schedule.d"), { recursive: true });
+    writeFileSync(
+      join(agentsDir, "klanker", "schedule.d", "cron-overlay.yaml"),
+      ["schedule:", '  - cron: "0 9 * * *"', '    prompt: "overlay standup"'].join("\n") + "\n",
+    );
+
+    savedAgentsDir = process.env.SWITCHROOM_AGENTS_DIR;
+    savedHome = process.env.HOME;
+    process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
+    process.env.HOME = roTmp;
+
+    roServer = new HostdServer({
+      homeDir: roTmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stubBin,
+      auditLogPath: join(roTmp, "audit.log"),
+      allowNonLinux: true,
+      configPath: cfgPath,
+    });
+    await roServer.start();
+  });
+
+  afterAll(async () => {
+    if (roServer) await roServer.stop();
+    if (savedAgentsDir === undefined) delete process.env.SWITCHROOM_AGENTS_DIR;
+    else process.env.SWITCHROOM_AGENTS_DIR = savedAgentsDir;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(roTmp, { recursive: true, force: true });
+  });
+
+  const adminSock = () =>
+    roServer.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+  const nonAdminSock = () =>
+    roServer.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+
+  it("agent_status: returns completed with a JSON payload of fleet statuses", async () => {
+    const resp = await hostdRequest(
+      { socketPath: adminSock() },
+      { v: 1, op: "agent_status", request_id: "ro-st-1", args: {} },
+    );
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    expect(resp.payload).toBeDefined();
+    const parsed = JSON.parse(resp.payload!) as {
+      statuses: Record<string, { uptime: string | null; memory: string | null }>;
+    };
+    // Both configured agents appear (docker may be absent → uptime null,
+    // which is exactly the dockerless-web case this backfill serves).
+    expect(Object.keys(parsed.statuses).sort()).toEqual(["bob", "klanker"]);
+  });
+
+  it("agent_status: narrows to one agent when name is given", async () => {
+    const resp = await hostdRequest(
+      { socketPath: adminSock() },
+      { v: 1, op: "agent_status", request_id: "ro-st-2", args: { name: "klanker" } },
+    );
+    const parsed = JSON.parse(resp.payload!) as { statuses: Record<string, unknown> };
+    expect(Object.keys(parsed.statuses)).toEqual(["klanker"]);
+  });
+
+  it("agent_status: cross-agent / fleet view denied for a non-admin agent", async () => {
+    const resp = await hostdRequest(
+      { socketPath: nonAdminSock() },
+      { v: 1, op: "agent_status", request_id: "ro-st-3", args: {} },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/requires admin/);
+  });
+
+  it("agent_status: self-target allowed for a non-admin agent", async () => {
+    const resp = await hostdRequest(
+      { socketPath: nonAdminSock() },
+      { v: 1, op: "agent_status", request_id: "ro-st-4", args: { name: "bob" } },
+    );
+    expect(resp.result).toBe("completed");
+    const parsed = JSON.parse(resp.payload!) as { statuses: Record<string, unknown> };
+    expect(Object.keys(parsed.statuses)).toEqual(["bob"]);
+  });
+
+  it("agent_schedule: returns the cron entries + bounded recent fires", async () => {
+    const resp = await hostdRequest(
+      { socketPath: adminSock() },
+      { v: 1, op: "agent_schedule", request_id: "ro-sc-1", args: {} },
+    );
+    expect(resp.result).toBe("completed");
+    const parsed = JSON.parse(resp.payload!) as {
+      entries: Array<{ agent: string; cron: string; prompt?: string }>;
+      recentByAgent: Record<string, Array<{ outputSummary: string }>>;
+    };
+    const klEntries = parsed.entries.filter((e) => e.agent === "klanker");
+    const baseEntry = klEntries.find((e) => e.cron === "*/30 * * * *")!;
+    expect(baseEntry).toBeDefined();
+    // Prompt truncated to the 160-char cap (was seeded at 300).
+    expect(baseEntry.prompt).toHaveLength(160);
+    // The fix: the agent-authored schedule.d overlay cron — readable by
+    // hostd (root) but not the dockerless web (0600, agent-owned) — is
+    // merged in by the FRESH loadConfig. Without it the dashboard misses
+    // crons the agent actually fires.
+    expect(klEntries.some((e) => e.cron === "0 9 * * *")).toBe(true);
+    // Last 8 fires only; the newest fire's long summary truncated to 100.
+    expect(parsed.recentByAgent.klanker).toHaveLength(8);
+    expect(parsed.recentByAgent.klanker.at(-1)!.outputSummary).toHaveLength(100);
+  });
+
+  it("agent_schedule: filters to one agent when name is given", async () => {
+    const resp = await hostdRequest(
+      { socketPath: adminSock() },
+      { v: 1, op: "agent_schedule", request_id: "ro-sc-2", args: { name: "klanker" } },
+    );
+    const parsed = JSON.parse(resp.payload!) as { entries: Array<{ agent: string }> };
+    expect(parsed.entries.every((e) => e.agent === "klanker")).toBe(true);
+    expect(parsed.entries.length).toBeGreaterThan(0);
+  });
+
+  it("agent_schedule: fleet view denied for a non-admin agent", async () => {
+    const resp = await hostdRequest(
+      { socketPath: nonAdminSock() },
+      { v: 1, op: "agent_schedule", request_id: "ro-sc-3", args: {} },
+    );
+    expect(resp.result).toBe("denied");
+  });
+});
