@@ -1415,6 +1415,9 @@ export interface ScheduleDashboard {
   degraded?: boolean;
   /** Human-readable explanation when `degraded` is true. */
   reason?: string;
+  /** True when hostd shed entries/fires to fit the response frame (a
+   *  pathologically large fleet) — the view is otherwise accurate. */
+  truncated?: boolean;
 }
 
 /**
@@ -1438,8 +1441,12 @@ export async function handleGetSchedule(
   const viaHostd = await fetchSchedule();
   if (viaHostd) {
     // hostd already bounded the payload (last 8 fires/agent, truncated
-    // prompts/summaries); pass it through unchanged.
-    return { entries: viaHostd.entries, recentByAgent: viaHostd.recentByAgent };
+    // prompts/summaries, slim entries); pass it through unchanged.
+    return {
+      entries: viaHostd.entries,
+      recentByAgent: viaHostd.recentByAgent,
+      ...(viaHostd.truncated ? { truncated: true } : {}),
+    };
   }
 
   // Degraded: hostd unreachable. Base-config-only view (no overlay crons).

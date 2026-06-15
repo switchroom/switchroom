@@ -92,6 +92,8 @@ export async function fetchScheduleViaHostd(
 ): Promise<{
   entries: SchedulerEntry[];
   recentByAgent: Record<string, DispatchResult[]>;
+  /** True when hostd shed entries/fires to fit the response frame. */
+  truncated?: boolean;
 } | null> {
   const socketPath =
     opts.socketPath !== undefined ? opts.socketPath : resolveHostdOperatorSocket();
@@ -112,6 +114,7 @@ export async function fetchScheduleViaHostd(
     const parsed = JSON.parse(resp.payload) as {
       entries?: SchedulerEntry[];
       recentByAgent?: Record<string, DispatchResult[]>;
+      truncated?: boolean;
     };
     if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.entries)) {
       return null;
@@ -119,6 +122,7 @@ export async function fetchScheduleViaHostd(
     return {
       entries: parsed.entries,
       recentByAgent: parsed.recentByAgent ?? {},
+      ...(parsed.truncated ? { truncated: true } : {}),
     };
   } catch {
     return null;

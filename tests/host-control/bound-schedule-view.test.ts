@@ -11,8 +11,16 @@ import {
   SCHEDULE_PROMPT_MAX_CHARS,
   SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS,
   SCHEDULE_MAX_FIRES_PER_AGENT,
+  SCHEDULE_FRAME_BUDGET_BYTES,
 } from "../../src/host-control/server.js";
 import type { SchedulerEntry, DispatchResult } from "../../src/scheduler/dispatch.js";
+
+/** The exact bytes the payload contributes to the response frame (JSON,
+ *  then re-encoded as the `payload` string field). Mirrors the daemon's
+ *  internal `scheduleFrameBytes`. */
+function frameBytes(view: unknown): number {
+  return Buffer.byteLength(JSON.stringify(JSON.stringify(view)), "utf8");
+}
 
 function entry(over: Partial<SchedulerEntry> = {}): SchedulerEntry {
   return {
@@ -96,5 +104,67 @@ describe("boundScheduleView", () => {
     });
     expect(recentByAgent.clerk).toHaveLength(1);
     expect(recentByAgent.marko).toHaveLength(2);
+  });
+
+  it("projects entries to a render-only slim shape — drops the unbounded poll/action specs", () => {
+    const huge = "A".repeat(50_000); // an operator-authored action text with no schema max
+    const { entries } = boundScheduleView(
+      [
+        entry({
+          kind: "action",
+          model: "sonnet",
+          context: "fresh",
+          topic: "planning",
+          // unbounded specs the wire must NOT carry:
+          action: { kind: "webhook", url: "https://x", body: huge } as unknown as SchedulerEntry["action"],
+          poll: { huge } as unknown as SchedulerEntry["poll"],
+        }),
+      ],
+      {},
+    );
+    const e = entries[0] as SchedulerEntry & { action?: unknown; poll?: unknown };
+    // Rendered + small routing fields kept…
+    expect(e.agent).toBe("clerk");
+    expect(e.cron).toBe("*/30 * * * *");
+    expect(e.kind).toBe("action");
+    expect(e.model).toBe("sonnet");
+    expect(e.context).toBe("fresh");
+    expect(e.topic).toBe("planning");
+    // …unbounded specs dropped.
+    expect(e.action).toBeUndefined();
+    expect(e.poll).toBeUndefined();
+  });
+
+  it("enforces a hard frame budget — a pathological fleet is truncated and fits", () => {
+    // Far more entries than any real fleet, each with a max-length prompt.
+    const many: SchedulerEntry[] = Array.from({ length: 4000 }, (_, i) =>
+      entry({ scheduleIndex: i, prompt: "p".repeat(SCHEDULE_PROMPT_MAX_CHARS) }),
+    );
+    const fires: Record<string, DispatchResult[]> = {
+      clerk: Array.from({ length: 50 }, (_, i) => fire({ startedAt: i, outputSummary: "s".repeat(200) })),
+    };
+    const view = boundScheduleView(many, fires);
+    // The output FITS the frame budget (the whole point)…
+    expect(frameBytes(view)).toBeLessThanOrEqual(SCHEDULE_FRAME_BUDGET_BYTES);
+    // …it was marked truncated, fires were shed first, and entries trimmed.
+    expect(view.truncated).toBe(true);
+    expect(view.entries.length).toBeLessThan(many.length);
+    expect(view.entries.length).toBeGreaterThan(0);
+  });
+
+  it("does NOT mark a normal fleet truncated", () => {
+    // A realistic fleet (a few dozen entries, a handful of fires each) is
+    // well under budget and untouched.
+    const realistic: SchedulerEntry[] = Array.from({ length: 40 }, (_, i) =>
+      entry({ scheduleIndex: i, prompt: "morning routine " + i }),
+    );
+    const fires: Record<string, DispatchResult[]> = {
+      clerk: [fire(), fire()],
+      marko: [fire({ agent: "marko" })],
+    };
+    const view = boundScheduleView(realistic, fires);
+    expect(view.truncated).toBeUndefined();
+    expect(view.entries).toHaveLength(40);
+    expect(view.recentByAgent.clerk).toHaveLength(2);
   });
 });

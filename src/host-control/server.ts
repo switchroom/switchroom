@@ -2225,28 +2225,77 @@ export const SCHEDULE_PROMPT_MAX_CHARS = 160;
 export const SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS = 100;
 /** Max recent fires retained per agent in the bounded payload. */
 export const SCHEDULE_MAX_FIRES_PER_AGENT = 8;
+/**
+ * Hard ceiling on the bytes the `agent_schedule` payload contributes to the
+ * response FRAME. The payload is JSON-encoded then embedded as a STRING in
+ * the response, so its frame cost = `JSON.stringify(JSON.stringify(view))`
+ * length (escaping accounted for exactly). We trim until that's under
+ * `MAX_FRAME_BYTES` minus envelope headroom — so `encodeResponse` can never
+ * throw "frame too large", even for a pathological fleet.
+ */
+export const SCHEDULE_FRAME_BUDGET_BYTES = MAX_FRAME_BYTES - 2048;
+
+export interface BoundedScheduleView {
+  entries: SchedulerEntry[];
+  recentByAgent: Record<string, DispatchResult[]>;
+  /** True when entries/fires were shed to fit the frame budget. */
+  truncated?: boolean;
+}
 
 /**
- * Pure, frame-bounding shaper for the `agent_schedule` payload (extracted
- * so it can be unit-tested without a daemon). It (a) truncates each
- * entry's `prompt` to {@link SCHEDULE_PROMPT_MAX_CHARS}, (b) keeps only
- * the LAST {@link SCHEDULE_MAX_FIRES_PER_AGENT} fires per agent (newest),
- * and (c) truncates each fire's `outputSummary` to
- * {@link SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS}. Without these bounds a large
- * fleet with long prompts / verbose fire summaries could blow the 64 KiB
- * response frame. Returns NEW objects — never mutates the inputs (the
- * daemon's caller has no other reader, but purity keeps the test honest
- * and avoids surprising any future caller).
+ * Render-only projection of a SchedulerEntry. Keeps only the fields the
+ * dashboard renders (+ the small cheap-cron routing scalars) and DROPS the
+ * UNBOUNDED `poll` / `action` specs (a Telegram action's `text`, a webhook
+ * body/headers/url have no schema max). Truncates the prompt. This is what
+ * makes a single entry's encoded size bounded by the prompt cap, not by
+ * arbitrary operator-authored spec content.
+ */
+function slimScheduleEntry(e: SchedulerEntry): SchedulerEntry {
+  const slim: SchedulerEntry = {
+    agent: e.agent,
+    scheduleIndex: e.scheduleIndex,
+    cron: e.cron,
+    promptKey: e.promptKey,
+  };
+  if (e.prompt !== undefined) {
+    slim.prompt =
+      e.prompt.length > SCHEDULE_PROMPT_MAX_CHARS
+        ? e.prompt.slice(0, SCHEDULE_PROMPT_MAX_CHARS)
+        : e.prompt;
+  }
+  if (e.kind !== undefined) slim.kind = e.kind;
+  if (e.model !== undefined) slim.model = e.model;
+  if (e.context !== undefined) slim.context = e.context;
+  if (e.topic !== undefined) slim.topic = e.topic;
+  // poll / action specs intentionally dropped — unbounded + unrendered.
+  return slim;
+}
+
+/** Exact frame cost of a payload object: its JSON encoded, then re-encoded
+ *  as the response's `payload` STRING field (so quote/backslash escaping is
+ *  counted precisely — no 2× guesswork). */
+function scheduleFrameBytes(view: BoundedScheduleView): number {
+  return Buffer.byteLength(JSON.stringify(JSON.stringify(view)), "utf8");
+}
+
+/**
+ * Pure, frame-bounding shaper for the `agent_schedule` payload (extracted so
+ * it can be unit-tested without a daemon). It (a) projects each entry to a
+ * render-only slim shape (dropping the unbounded poll/action specs) with a
+ * truncated prompt, (b) keeps only the LAST
+ * {@link SCHEDULE_MAX_FIRES_PER_AGENT} fires per agent (newest) with each
+ * `outputSummary` truncated, and (c) enforces a HARD frame budget: if the
+ * payload would still exceed {@link SCHEDULE_FRAME_BUDGET_BYTES} (a
+ * pathological fleet — hundreds of entries), it sheds the least-essential
+ * data first (all fires, then entries from the tail) until it fits, setting
+ * `truncated`. This guarantees the response frame can never overflow
+ * `MAX_FRAME_BYTES`. Returns NEW objects — never mutates the inputs.
  */
 export function boundScheduleView(
   entries: SchedulerEntry[],
   recentByAgent: Record<string, DispatchResult[]>,
-): { entries: SchedulerEntry[]; recentByAgent: Record<string, DispatchResult[]> } {
-  const boundedEntries = entries.map((e) =>
-    e.prompt !== undefined && e.prompt.length > SCHEDULE_PROMPT_MAX_CHARS
-      ? { ...e, prompt: e.prompt.slice(0, SCHEDULE_PROMPT_MAX_CHARS) }
-      : { ...e },
-  );
+): BoundedScheduleView {
+  const slimEntries = entries.map(slimScheduleEntry);
   const boundedRecent: Record<string, DispatchResult[]> = {};
   for (const [agent, rows] of Object.entries(recentByAgent)) {
     boundedRecent[agent] = rows
@@ -2258,7 +2307,18 @@ export function boundScheduleView(
           : { ...r },
       );
   }
-  return { entries: boundedEntries, recentByAgent: boundedRecent };
+
+  let view: BoundedScheduleView = { entries: slimEntries, recentByAgent: boundedRecent };
+  if (scheduleFrameBytes(view) <= SCHEDULE_FRAME_BUDGET_BYTES) return view;
+
+  // Over budget. Shed fires first (supplementary), then trim entries from
+  // the tail until it fits. Entries are the point; fires are a bonus.
+  view = { entries: slimEntries, recentByAgent: {}, truncated: true };
+  while (scheduleFrameBytes(view) > SCHEDULE_FRAME_BUDGET_BYTES && view.entries.length > 1) {
+    const keep = Math.max(1, Math.floor(view.entries.length * 0.8));
+    view = { entries: view.entries.slice(0, keep), recentByAgent: {}, truncated: true };
+  }
+  return view;
 }
 
 /**
