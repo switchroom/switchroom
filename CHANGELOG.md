@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.15.30 — Fix: restore per-cron fire history (#2377)
+
+v0.15.29's per-cron fire bounding kept the last fires of every distinct
+`promptKey`, including obsolete ones a long-lived agent accumulates — which
+blew the response frame budget so the trim shed all fires and the Schedule
+tab showed "no fires" for every cron. `boundScheduleView` now keeps only
+fires whose `promptKey` matches a current cron.
+
 ## v0.15.29 — Per-cron Schedule view (#2375)
 
 The dashboard Schedule tab now shows each cron as a self-contained block —
