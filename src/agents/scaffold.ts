@@ -2901,7 +2901,14 @@ export function scaffoldAgent(
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
   const baseAllow = hasAllWildcard
-    ? ALL_BUILTIN_TOOLS
+    // `[all]` means "all built-ins" — but it must ALSO keep any explicit tools
+    // the operator listed alongside it. A 🔁 "Always allow" tap persists a
+    // privileged hostd / Skill / 3rd-party-MCP rule into tools.allow as
+    // `[all, mcp__hostd__agent_logs]` (those are deliberately NOT in
+    // ALL_BUILTIN_TOOLS — the leash: even an [all] admin approves them once).
+    // Dropping the explicit entries here is why such grants never reached
+    // settings.json and the agent re-asked forever (klanker, 2026-06-15).
+    ? [...ALL_BUILTIN_TOOLS, ...rawAllow.filter((t) => t !== "all")]
     : rawAllow.filter((t) => t !== "all");
   // If the user didn't specify any allowed tools AND dangerous_mode is off,
   // seed a safe read-only default set so routine tool calls don't spam the
@@ -4845,7 +4852,14 @@ export function reconcileAgent(
   const rawAllow = tools.allow ?? [];
   const hasAllWildcard = rawAllow.includes("all");
   const baseAllow = hasAllWildcard
-    ? ALL_BUILTIN_TOOLS
+    // `[all]` means "all built-ins" — but it must ALSO keep any explicit tools
+    // the operator listed alongside it. A 🔁 "Always allow" tap persists a
+    // privileged hostd / Skill / 3rd-party-MCP rule into tools.allow as
+    // `[all, mcp__hostd__agent_logs]` (those are deliberately NOT in
+    // ALL_BUILTIN_TOOLS — the leash: even an [all] admin approves them once).
+    // Dropping the explicit entries here is why such grants never reached
+    // settings.json and the agent re-asked forever (klanker, 2026-06-15).
+    ? [...ALL_BUILTIN_TOOLS, ...rawAllow.filter((t) => t !== "all")]
     : rawAllow.filter((t) => t !== "all");
   const reconcileDangerousMode = agentConfig.dangerous_mode === true;
   const reconcileHadExplicitAllow = rawAllow.length > 0;
