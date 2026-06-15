@@ -191,3 +191,22 @@ describe("performLinearRefresh (orchestration over injected I/O)", () => {
     if (!res.ok) { expect(res.reason).toBe("persist_failed"); expect(res.detail).toContain("broker denied"); }
   });
 });
+
+describe("performLinearRefresh — rotation-safety on partial persist", () => {
+  it("writeBundle succeeds but writeToken fails → persist_failed, BUT the rotated bundle WAS written (recovery possible)", async () => {
+    let writtenBundle: string | null = null;
+    const res = await performLinearRefresh({
+      readBundle: async () => serializeBundle(BUNDLE),
+      writeBundle: async (j) => { writtenBundle = j; }, // succeeds
+      writeToken: async () => { throw new Error("token write failed"); }, // fails AFTER bundle
+      fetchImpl: fakeFetch(200, { access_token: "lin_new", refresh_token: "lin_refresh_rotated", expires_in: 3600 }),
+      nowSec: () => 0,
+    });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe("persist_failed");
+    // The doc's core claim: the rotated refresh token is persisted, so a
+    // retry reads it and recovers — nothing stranded on the dead old one.
+    expect(writtenBundle).not.toBeNull();
+    expect(parseBundle(writtenBundle)).toMatchObject({ refreshToken: "lin_refresh_rotated" });
+  });
+});
