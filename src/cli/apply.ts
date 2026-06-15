@@ -55,7 +55,7 @@ import {
   findConfigFile,
   ConfigError,
 } from "../config/loader.js";
-import { scaffoldAgent, alignAgentUid, renderFleetInvariants } from "../agents/scaffold.js";
+import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath } from "../agents/scaffold.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { writeComposeFile, resolveHostSwitchroomConfigPath } from "./write-compose.js";
@@ -933,6 +933,14 @@ export async function runApply(
 
   // ── 3. Generate compose file ──────────────────────────────────────
   const composePath = options.outPath ?? DEFAULT_COMPOSE_PATH;
+  // Display-only host path for the operator hints below. When apply runs INSIDE
+  // the hostd container, homedir() is the in-container HOME (/host-home), so
+  // composePath/DEFAULT_COMPOSE_PATH point at a path no host operator can
+  // copy-paste into `docker compose -f …`. Translate to the real host home via
+  // SWITCHROOM_HOST_HOME (same helper that fixes baked scaffold paths). The
+  // file is still WRITTEN to composePath (the bind-mounted container path) —
+  // only the printed strings change. No-op on the host (helper returns input).
+  const displayComposePath = toHostHomePath(composePath);
   // Capture the host operator UID so the broker can chown its operator
   // socket at bind time. Under sudo, `process.getuid()` returns 0 (root)
   // — what we actually want is the underlying user's UID, which sudo
@@ -960,13 +968,13 @@ export async function runApply(
 
   writeOut(
     chalk.bold(`\nWrote `) +
-      composePath +
+      displayComposePath +
       chalk.gray(` (${composeBytes} bytes)\n`),
   );
   writeOut(
     `Bring the fleet up with:\n` +
-      `  docker compose -p ${COMPOSE_PROJECT} -f ${composePath} pull && \\\n` +
-      `    docker compose -p ${COMPOSE_PROJECT} -f ${composePath} up -d --remove-orphans\n`,
+      `  docker compose -p ${COMPOSE_PROJECT} -f ${displayComposePath} pull && \\\n` +
+      `    docker compose -p ${COMPOSE_PROJECT} -f ${displayComposePath} up -d --remove-orphans\n`,
   );
   writeOut(
     chalk.gray(
