@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.15.33 — Memory tab: grouped bands + model relationships (#2385)
+
+The dashboard Memory tab is regrouped and now visualizes how models relate.
+Each bank card is split into labelled bands — **Bank summary** (a dense stat
+line + an aggregate source-mix bar + a per-model freshness heat-strip) →
+**Mental models** → **Actions** — with problems (corruption / extraction gaps)
+promoted to a red attention band at the top. A model that synthesizes other
+models is shown as a **hub** (badge + clickable "draws on" chips) with its
+source models nested beneath it via tree connectors; clicking a chip scrolls
+to and flashes that model. Banks with no such relationships degrade to a flat
+list (no empty graph). Each model carries a stacked **provenance bar**
+(observations / directives / from-other-models). The model→model edges and
+provenance come from data the list call already returns — no extra hindsight
+round-trips, still zero model calls.
+
 ## v0.15.32 — in-hostd reconcile keeps conditional mounts; config_propose_edit determinism (#2382, #2381)
 
 ### PR #2382 — compose probes the container-real home for conditional mounts
