@@ -122,6 +122,7 @@ import {
   handleMemoryReprocess,
   handleMemoryRefreshModel,
   handleMemoryBuildProfile,
+  handleGetMentalModel,
   __resetDashboardCacheForTests,
   type AgentInfo,
   type SystemHealth,
@@ -2306,6 +2307,76 @@ describe("memory remediation handlers", () => {
       });
       expect(r.ok).toBe(false);
       expect(r.error).toBe("MCP error");
+    });
+  });
+
+  describe("handleGetMentalModel", () => {
+    it("rejects a missing bank/id without hitting hindsight", async () => {
+      const detail = vi.fn();
+      const r1 = await handleGetMentalModel(mockConfig, "", "mm-1", { detail: detail as never });
+      expect(r1.ok).toBe(false);
+      expect(r1.error).toContain("bank");
+      const r2 = await handleGetMentalModel(mockConfig, "coach-mem", "", { detail: detail as never });
+      expect(r2.ok).toBe(false);
+      expect(r2.error).toContain("id");
+      expect(detail).not.toHaveBeenCalled();
+    });
+
+    it("rejects an unknown bank (gate before any network call)", async () => {
+      const detail = vi.fn();
+      const r = await handleGetMentalModel(mockConfig, "nope", "mm-1", {
+        detail: detail as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Unknown bank");
+      expect(detail).not.toHaveBeenCalled();
+    });
+
+    it("returns the model detail for a known bank", async () => {
+      const detail = vi.fn(async () => ({
+        ok: true as const,
+        model: {
+          id: "mm-1",
+          name: "user-profile",
+          sourceQuery: "What do we know about the user?",
+          content: "# User Profile\n\n…",
+          lastRefreshedAt: "2026-06-15T11:00:00Z",
+          createdAt: "2026-06-06T00:00:00Z",
+          refreshMode: "full",
+          basedOnCounts: { observation: 24, directives: 11 },
+          totalSourceFacts: 35,
+        },
+      }));
+      const r = await handleGetMentalModel(mockConfig, "coach-mem", "mm-1", {
+        detail: detail as never,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.model?.sourceQuery).toBe("What do we know about the user?");
+      expect(r.model?.totalSourceFacts).toBe(35);
+      // The MCP url (not the REST base) is passed through to the detail fetcher.
+      expect(detail.mock.calls[0][0]).toBe("http://127.0.0.1:18888/mcp/");
+      expect(detail.mock.calls[0][1]).toBe("coach-mem");
+      expect(detail.mock.calls[0][2]).toBe("mm-1");
+    });
+
+    it("maps a detail failure (e.g. 404 unknown id) to ok:false", async () => {
+      const detail = vi.fn(async () => ({ ok: false as const, reason: "HTTP 404" }));
+      const r = await handleGetMentalModel(mockConfig, "coach-mem", "forged", {
+        detail: detail as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe("HTTP 404");
+    });
+
+    it("never throws — a throwing detail fetch is mapped to ok:false", async () => {
+      const detail = vi.fn(async () => {
+        throw new Error("boom");
+      });
+      const r = await handleGetMentalModel(mockConfig, "coach-mem", "mm-1", {
+        detail: detail as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("boom");
     });
   });
 });

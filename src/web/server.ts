@@ -33,6 +33,7 @@ import {
   handleMemoryReprocess,
   handleMemoryRefreshModel,
   handleMemoryBuildProfile,
+  handleGetMentalModel,
   handleGetGoogleAccounts,
   handleGetMicrosoftAccounts,
   handleSetConnectionAccess,
@@ -493,6 +494,13 @@ function parseRoute(
   // Create-if-missing the user-profile mental model for a bank.
   if (method === "POST" && pathname === "/api/memory/build-profile") {
     return { handler: "memoryBuildProfile", params: {} };
+  }
+
+  // GET /api/memory/model?bank=&id=
+  // On-demand full detail (content + provenance) for one mental model — the
+  // "view what it knows" expander. Pure read; no model call.
+  if (method === "GET" && pathname === "/api/memory/model") {
+    return { handler: "getMentalModel", params: {} };
   }
 
   // GET /api/google-accounts
@@ -995,6 +1003,15 @@ export function startWebServer(
                 return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
               }
               const result = await handleMemoryBuildProfile(freshConfig(), body);
+              return jsonResponse(result, result.ok ? 200 : 400);
+            })();
+          }
+
+          case "getMentalModel": {
+            return (async () => {
+              const bank = url.searchParams.get("bank") ?? "";
+              const id = url.searchParams.get("id") ?? "";
+              const result = await handleGetMentalModel(freshConfig(), bank, id);
               return jsonResponse(result, result.ok ? 200 : 400);
             })();
           }

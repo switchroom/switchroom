@@ -636,12 +636,67 @@
       // JSON for a single-quoted onclick attribute: escape the quote
       // chars that could break out of the attribute (', &, <, >).
       const attrJson = (v) => escapeHtml(JSON.stringify(v));
-      const cards = (m.banks || []).map(b => {
+
+      // --- "How memory works" explainer (live fleet totals) ---
+      // The Memory tab's job: make the invisible pipeline legible. The
+      // operator should understand WHAT the agents remember, the WHY behind
+      // each model, and HOW the pipeline turns conversations into recall.
+      const banks = m.banks || [];
+      const totals = banks.reduce((a, b) => {
+        a.docs += b.totalDocuments || 0;
+        a.facts += b.totalFacts || 0;
+        a.models += (b.mentalModels || []).length;
+        return a;
+      }, { docs: 0, facts: 0, models: 0 });
+      const fmtNum = (n) => (n || 0).toLocaleString();
+      const stage = (label, count, desc) => `<div style="flex:1 1 140px;min-width:130px;background:var(--surface-hover);border-radius:8px;padding:.6rem .7rem">
+        <div style="font-weight:600">${escapeHtml(label)}${count !== '' ? ` <span style="color:var(--blue)">${count}</span>` : ''}</div>
+        <div style="color:var(--text-dim);font-size:.78em;margin-top:.25rem;line-height:1.35">${escapeHtml(desc)}</div>
+      </div>`;
+      const arrow = `<div style="display:flex;align-items:center;color:var(--text-dim);font-size:1.1em">→</div>`;
+      const explainer = `<div class="agent-card" style="margin-bottom:1rem">
+        <div class="card-header" style="cursor:default">
+          <span class="agent-name">How memory works</span>
+          <span style="color:var(--text-dim);font-size:.85em;margin-left:.5rem">${banks.length} bank${banks.length === 1 ? '' : 's'} · hindsight</span>
+        </div>
+        <div style="padding:0 1.25rem 1rem">
+          <div style="display:flex;flex-wrap:wrap;align-items:stretch;gap:.5rem;margin:.2rem 0 .7rem">
+            ${stage('Conversations', fmtNum(totals.docs), 'Every agent turn is retained verbatim as a document.')}
+            ${arrow}
+            ${stage('Facts', fmtNum(totals.facts), "Hindsight extracts durable facts from each conversation — on its OWN model, never the agent's quota.")}
+            ${arrow}
+            ${stage('Mental models', fmtNum(totals.models), 'Facts are synthesized into named models, each answering one recall question.')}
+            ${arrow}
+            ${stage('Recall', '', 'On each turn the agent pulls the relevant models back into context — it never re-reads raw history.')}
+          </div>
+          <div style="color:var(--text-dim);font-size:.85em">Expand any model below to read what it knows and where it came from. A <span style="color:var(--yellow)">stale</span> or empty model means the agent is reasoning from an out-of-date picture.</div>
+        </div>
+      </div>`;
+
+      const cards = banks.map((b, bi) => {
         const bankJs = attrJson(b.bank);
-        const models = (b.mentalModels || []).map(mm => {
+        const models = (b.mentalModels || []).map((mm, mi) => {
           const ts = mm.lastRefreshedAt || mm.createdAt;
           const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
-          return `<div class="meta-item"><label>${escapeHtml(mm.name)} </label><span style="${stale ? 'color:var(--yellow)' : ''}">${fmtAge(ts) || 'never refreshed'}</span></div>`;
+          const detailId = `memdetail-${bi}-${mi}`;
+          const idJs = attrJson(mm.id);
+          const ageLabel = fmtAge(ts) || 'never refreshed';
+          const why = mm.sourceQuery
+            ? `<div style="color:var(--text-dim);font-size:.84em;margin-top:.15rem">answers: “${escapeHtml(mm.sourceQuery)}”</div>`
+            : '';
+          const modeBadge = mm.refreshMode
+            ? `<span style="color:var(--text-dim);font-size:.78em;border:1px solid var(--border);border-radius:5px;padding:0 .35rem">${escapeHtml(mm.refreshMode)}</span>`
+            : '';
+          return `<div style="border-top:1px solid var(--border);padding:.5rem 0">
+            <div style="display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap">
+              <strong>${escapeHtml(mm.name)}</strong>
+              <span style="font-size:.82em;${stale ? 'color:var(--yellow)' : 'color:var(--text-dim)'}">${ageLabel}${stale ? ' · stale' : ''}</span>
+              ${modeBadge}
+              <button class="btn" type="button" style="margin-left:auto;padding:.12rem .55rem;font-size:.8em" onclick='memViewModel(${bankJs}, ${idJs}, "${detailId}", this)'>view</button>
+            </div>
+            ${why}
+            <div id="${detailId}" style="display:none;margin-top:.5rem"></div>
+          </div>`;
         }).join('');
         const gapLine = b.recentUnextractedCount > 0
           ? `<div style="color:var(--red);margin-top:.4rem">⚠ ${b.recentUnextractedCount} recent conversation(s) stored but NOT extracted (oldest ${fmtDay(b.oldestUnextractedAt)}) — invisible to recall until reprocessed</div>`
@@ -694,14 +749,14 @@
               <div class="meta-item"><label>Latest activity </label><span>${fmtDay(b.newestDocumentAt)} ${fmtAge(b.newestDocumentAt) ? '(' + fmtAge(b.newestDocumentAt) + ')' : ''}</span></div>
               <div class="meta-item"><label>Mental models </label><span>${(b.mentalModels || []).length}${b.staleMentalModelCount ? ` <span style="color:var(--yellow)">(${b.staleMentalModelCount} stale)</span>` : ''}</span></div>
             </div>
-            ${models ? `<div class="card-meta" style="padding:.4rem 0 0">${models}</div>` : ''}
+            ${models ? `<div style="margin-top:.5rem"><div style="font-size:.74em;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.1rem">Mental models — what this fleet remembers</div>${models}</div>` : ''}
             ${corruptLine}
             ${gapLine}
             ${buttonRow}
           </div>
         </div>`;
       }).join('');
-      container.innerHTML = `<div class="agents-grid">${cards || '<div style="color:var(--text-dim)">No agent banks configured.</div>'}</div>`;
+      container.innerHTML = explainer + `<div class="agents-grid">${cards || '<div style="color:var(--text-dim)">No agent banks configured.</div>'}</div>`;
     }
 
     // --- Memory remediation actions ---
@@ -748,6 +803,58 @@
     function memBuildProfile(bank, btn) {
       memRemediate(btn, '/api/memory/build-profile', { bank }, 'Building…', 'Build profile',
         () => 'Profile build triggered');
+    }
+
+    // --- View one mental model's full content + provenance ---
+    // Lazy: the memory-health list carries only summaries (name/why/age) so
+    // it stays light across many banks; the full text is pulled on demand
+    // when the operator clicks "view". Pure READ of hindsight's REST — no
+    // model call, no quota. Re-click toggles collapse (content cached after
+    // the first load).
+    async function memViewModel(bank, id, detailId, btn) {
+      const el = document.getElementById(detailId);
+      if (!el) return;
+      if (el.dataset.open === '1') {
+        el.style.display = 'none';
+        el.dataset.open = '0';
+        if (btn) btn.textContent = 'view';
+        return;
+      }
+      el.style.display = 'block';
+      el.dataset.open = '1';
+      if (btn) btn.textContent = 'hide';
+      if (el.dataset.loaded === '1') return;
+      el.innerHTML = '<div style="color:var(--text-dim);font-size:.85em">Loading…</div>';
+      try {
+        const res = await fetch(`${API}/api/memory/model?bank=${encodeURIComponent(bank)}&id=${encodeURIComponent(id)}`, { headers: authHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok || !data.model) {
+          el.innerHTML = `<div style="color:var(--red);font-size:.85em">Couldn't load model: ${escapeHtml(data.error || ('HTTP ' + res.status))}</div>`;
+          return;
+        }
+        el.innerHTML = renderModelDetail(data.model);
+        el.dataset.loaded = '1';
+      } catch (err) {
+        el.innerHTML = `<div style="color:var(--red);font-size:.85em">Couldn't load model: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    // The "why + how" of a single model: where it came from (provenance) and
+    // the full content the agent actually recalls.
+    function renderModelDetail(model) {
+      const prov = Object.entries(model.basedOnCounts || {})
+        .filter(([, n]) => n > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([type, n]) => `${n} ${escapeHtml(type.replace(/-/g, ' '))}`)
+        .join(' · ');
+      const provLine = (model.totalSourceFacts || 0) > 0
+        ? `<div style="color:var(--text-dim);font-size:.82em;margin-bottom:.4rem">Synthesized from ${model.totalSourceFacts} source fact${model.totalSourceFacts === 1 ? '' : 's'}: ${prov}</div>`
+        : `<div style="color:var(--text-dim);font-size:.82em;margin-bottom:.4rem">No source facts recorded — likely a seed or manually set value.</div>`;
+      const content = (model.content || '').trim();
+      const body = content
+        ? `<pre style="white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.7rem;max-height:340px;overflow:auto;font-size:.82em;line-height:1.45;margin:0">${escapeHtml(content)}</pre>`
+        : `<div style="color:var(--yellow);font-size:.85em">This model has no content — it's empty, so the agent recalls nothing from it.</div>`;
+      return provLine + body;
     }
 
     async function fetchConnections() {

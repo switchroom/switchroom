@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   inspectBankHealth,
+  getMentalModelDetail,
   hindsightRestBase,
   staleMentalModels,
   corruptedMentalModels,
@@ -60,7 +61,7 @@ const HEALTHY_BANK = {
   },
   models: {
     items: [
-      { id: "m1", name: "Case State", last_refreshed_at: "2026-06-10T01:00:00Z", created_at: "2026-04-01T00:00:00Z", content: "# Case State\n\nA healthy, substantive synthesis of the matter." },
+      { id: "m1", name: "Case State", last_refreshed_at: "2026-06-10T01:00:00Z", created_at: "2026-04-01T00:00:00Z", content: "# Case State\n\nA healthy, substantive synthesis of the matter.", source_query: "What is the current state of the matter?", trigger: { mode: "full" } },
     ],
   },
 };
@@ -111,6 +112,18 @@ describe("inspectBankHealth", () => {
     expect(h.newestDocumentAt).toBe("2026-06-09T10:00:00Z");
     expect(h.unextractedDocuments).toHaveLength(0);
     expect(h.mentalModels).toHaveLength(1);
+    // The model summary now carries the "why" (source_query) + refresh mode.
+    expect(h.mentalModels[0].sourceQuery).toBe("What is the current state of the matter?");
+    expect(h.mentalModels[0].refreshMode).toBe("full");
+  });
+
+  it("defaults sourceQuery/refreshMode when the model omits them", async () => {
+    const h = await inspectBankHealth("http://x/mcp/", "stale", {
+      fetchImpl: fakeFetchFor({ stale: STALE_MODEL_BANK }),
+    });
+    expect(h.ok).toBe(true);
+    expect(h.mentalModels[0].sourceQuery).toBe("");
+    expect(h.mentalModels[0].refreshMode).toBeNull();
   });
 
   it("collects zero-fact documents oldest-first", async () => {
@@ -127,6 +140,79 @@ describe("inspectBankHealth", () => {
     });
     expect(h.ok).toBe(false);
     expect(h.reason).toContain("503");
+  });
+});
+
+describe("getMentalModelDetail", () => {
+  // The by-id endpoint (/mental-models/<id>) — NOT the list. The full-content
+  // detail with provenance from reflect_response.based_on.
+  function fakeDetailFetch(body: unknown, status = 200): typeof fetch {
+    return (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (!/\/mental-models\/[^/]+$/.test(url)) {
+        return new Response("wrong route", { status: 404 });
+      }
+      if (status !== 200) return new Response("err", { status });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+  }
+
+  it("returns full content + provenance counts by fact type", async () => {
+    const res = await getMentalModelDetail("http://x/mcp/", "assistant", "mm-1", {
+      fetchImpl: fakeDetailFetch({
+        id: "mm-1",
+        name: "user-profile",
+        source_query: "What do we know about the user?",
+        content: "# User Profile\n\nKen builds switchroom.",
+        last_refreshed_at: "2026-06-15T11:00:00Z",
+        created_at: "2026-06-06T00:00:00Z",
+        trigger: { mode: "full" },
+        reflect_response: {
+          based_on: {
+            observation: [{}, {}, {}],
+            directives: [{}, {}],
+            world: [],
+            "mental-models": [{}],
+          },
+        },
+      }),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.model.sourceQuery).toBe("What do we know about the user?");
+    expect(res.model.content).toContain("Ken builds switchroom");
+    expect(res.model.refreshMode).toBe("full");
+    expect(res.model.basedOnCounts).toEqual({
+      observation: 3,
+      directives: 2,
+      world: 0,
+      "mental-models": 1,
+    });
+    expect(res.model.totalSourceFacts).toBe(6);
+  });
+
+  it("tolerates a missing reflect_response (no provenance)", async () => {
+    const res = await getMentalModelDetail("http://x/mcp/", "assistant", "mm-2", {
+      fetchImpl: fakeDetailFetch({ id: "mm-2", name: "Bare", content: "x" }),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.model.totalSourceFacts).toBe(0);
+    expect(res.model.basedOnCounts).toEqual({});
+    expect(res.model.sourceQuery).toBe("");
+    expect(res.model.refreshMode).toBeNull();
+  });
+
+  it("degrades to ok:false with a reason on HTTP failure (never throws)", async () => {
+    const res = await getMentalModelDetail("http://x/mcp/", "assistant", "mm-3", {
+      fetchImpl: fakeDetailFetch({}, 404),
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toContain("404");
   });
 });
 
