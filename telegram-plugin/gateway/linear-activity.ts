@@ -17,8 +17,10 @@
 
 import {
   getViaBrokerStructured,
+  putViaBroker,
   readVaultTokenFile,
 } from '../../src/vault/broker/client.js'
+import { performLinearRefresh, type RefreshIO } from '../../src/linear/oauth-refresh.js'
 
 export const LINEAR_GRAPHQL_ENDPOINT = 'https://api.linear.app/graphql'
 
@@ -33,6 +35,10 @@ export interface LinearActivityDeps {
   fetchImpl?: typeof fetch
   /** Agent slug (defaults to SWITCHROOM_AGENT_NAME). */
   agent?: string
+  /** Build the RefreshIO used to auto-refresh on a 401 (tests inject a
+   *  fake; production uses the broker-backed `brokerRefreshIO`). When
+   *  omitted, on-401 refresh uses the broker. */
+  refreshIO?: (agent: string) => RefreshIO
   /** Default Linear team id for captured issues (multi-team workspaces);
    *  defaults to SWITCHROOM_LINEAR_DEFAULT_TEAM_ID. Tests inject directly. */
   defaultTeamId?: string
@@ -54,6 +60,79 @@ export async function defaultResolveLinearToken(agent: string): Promise<LinearTo
   if (result.kind === 'not_found') return { ok: false, reason: 'not_found' }
   if (result.kind === 'denied') return { ok: false, reason: 'denied' }
   return { ok: false, reason: 'unknown' }
+}
+
+/**
+ * Broker-backed RefreshIO: reads `linear/<agent>/oauth` and rotates both
+ * `linear/<agent>/token` and the bundle via the broker `put` op (#950 — an
+ * agent rotates keys it can already read, no operator passphrase, no host
+ * round-trip). Requires `linear/<agent>/oauth` to be in the agent's ACL
+ * (linear-agent setup adds it to `secrets[]`).
+ */
+export function brokerRefreshIO(agent: string, fetchImpl?: typeof fetch): RefreshIO {
+  const token = readVaultTokenFile(agent) ?? undefined
+  const opt = token ? { token } : {}
+  return {
+    readBundle: async () => {
+      const r = await getViaBrokerStructured(`linear/${agent}/oauth`, opt)
+      return r.kind === 'ok' && r.entry.kind === 'string' ? r.entry.value : null
+    },
+    writeToken: async (t) => {
+      const r = await putViaBroker(`linear/${agent}/token`, { kind: 'string', value: t }, opt)
+      if (r.kind !== 'ok') throw new Error(`broker put linear/${agent}/token: ${r.kind}`)
+    },
+    writeBundle: async (j) => {
+      const r = await putViaBroker(`linear/${agent}/oauth`, { kind: 'string', value: j }, opt)
+      if (r.kind !== 'ok') throw new Error(`broker put linear/${agent}/oauth: ${r.kind}`)
+    },
+    ...(fetchImpl ? { fetchImpl } : {}),
+  }
+}
+
+/**
+ * POST to Linear's GraphQL endpoint; on a 401 (expired/invalid app token)
+ * auto-refresh the token once via the stored refresh bundle and retry with
+ * the fresh token. This is the durable self-heal: a Linear app token that
+ * expired (~24h–30d) is silently rotated in-container on its next use rather
+ * than failing the agent's turn. A `revoked` refresh token (the one case
+ * needing operator re-auth) is logged loudly and the original 401 surfaces.
+ *
+ * Returns the final Response and the token in force (callers read the body).
+ */
+async function linearPostWithRefresh(
+  body: string,
+  token: string,
+  agent: string,
+  fetchImpl: typeof fetch,
+  log: (s: string) => void,
+  refreshIO?: (agent: string) => RefreshIO,
+): Promise<{ resp: Response; token: string }> {
+  const post = (t: string) =>
+    fetchImpl(LINEAR_GRAPHQL_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: t },
+      body,
+    })
+
+  let resp = await post(token)
+  if (resp.status !== 401) return { resp, token }
+
+  const io = (refreshIO ?? ((a) => brokerRefreshIO(a, fetchImpl)))(agent)
+  const refreshed = await performLinearRefresh({ ...io, fetchImpl })
+  if (!refreshed.ok) {
+    if (refreshed.reason === 'revoked') {
+      log(
+        `telegram gateway: linear token REVOKED agent=${agent} — refresh token is dead; ` +
+          `operator must re-authorize (linear-agent setup --refresh-token …)\n`,
+      )
+    } else {
+      log(`telegram gateway: linear token refresh failed agent=${agent} reason=${refreshed.reason}\n`)
+    }
+    return { resp, token } // surface the original 401
+  }
+  log(`telegram gateway: linear token auto-refreshed agent=${agent} (was 401)\n`)
+  resp = await post(refreshed.accessToken)
+  return { resp, token: refreshed.accessToken }
 }
 
 /**
@@ -118,14 +197,16 @@ export async function emitLinearAgentActivity(
   const fetchImpl = deps.fetchImpl ?? fetch
   let resp: Response
   try {
-    resp = await fetchImpl(LINEAR_GRAPHQL_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: tokenResult.token,
-      },
-      body: JSON.stringify({ query: mutation, variables }),
-    })
+    // Auto-refresh on a 401 (expired app token) and retry once — see
+    // linearPostWithRefresh.
+    ;({ resp } = await linearPostWithRefresh(
+      JSON.stringify({ query: mutation, variables }),
+      tokenResult.token,
+      agent,
+      fetchImpl,
+      log,
+      deps.refreshIO,
+    ))
   } catch (err) {
     return {
       content: [{ type: 'text', text: `linear_agent_activity failed: request error: ${(err as Error).message}` }],
@@ -217,16 +298,23 @@ export async function createLinearIssue(
       ],
     }
   }
-  const token = tokenResult.token
+  // Mutable so a 401-triggered refresh on one gql call carries the fresh
+  // token to subsequent calls in this issue-create flow.
+  let activeToken = tokenResult.token
 
   const gql = async (query: string, variables: Record<string, unknown>): Promise<{ ok: true; data: any } | { ok: false; text: string }> => {
     let resp: Response
     try {
-      resp = await fetchImpl(LINEAR_GRAPHQL_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: token },
-        body: JSON.stringify({ query, variables }),
-      })
+      const out = await linearPostWithRefresh(
+        JSON.stringify({ query, variables }),
+        activeToken,
+        agent,
+        fetchImpl,
+        log,
+        deps.refreshIO,
+      )
+      resp = out.resp
+      activeToken = out.token
     } catch (err) {
       return { ok: false, text: `request error: ${(err as Error).message}` }
     }
