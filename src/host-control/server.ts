@@ -2310,13 +2310,29 @@ export function boundScheduleView(
     r.outputSummary.length > SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS
       ? { ...r, outputSummary: r.outputSummary.slice(0, SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS) }
       : { ...r };
+  // The promptKeys of the CURRENT crons, per agent. Fires whose promptKey
+  // isn't a current cron are dropped — they're obsolete (a cron's prompt was
+  // edited → new key) and the dashboard, which matches fires to a cron by
+  // promptKey, would never render them anyway. Critically this also BOUNDS
+  // the payload to (current crons × N): a long-lived agent accumulates fires
+  // for many obsolete keys (e.g. 21 keys / 2638 fires), and keeping 8 of EACH
+  // blew the frame budget → the trim shed ALL fires. Bounding to current crons
+  // keeps it small.
+  const currentKeysByAgent = new Map<string, Set<string>>();
+  for (const e of entries) {
+    let s = currentKeysByAgent.get(e.agent);
+    if (!s) { s = new Set<string>(); currentKeysByAgent.set(e.agent, s); }
+    s.add(e.promptKey);
+  }
   const boundedRecent: Record<string, DispatchResult[]> = {};
   for (const [agent, rows] of Object.entries(recentByAgent)) {
+    const currentKeys = currentKeysByAgent.get(agent) ?? new Set<string>();
     // Bound fires PER CRON (promptKey), not per agent — the dashboard renders
-    // each cron's own fire history, so keep the last N of EACH cron. Group
-    // preserving input (chronological) order, keep the newest N per key.
+    // each cron's own fire history, so keep the last N of EACH current cron.
+    // Group preserving input (chronological) order, keep the newest N per key.
     const byKey = new Map<string, DispatchResult[]>();
     for (const r of rows) {
+      if (!currentKeys.has(r.promptKey)) continue; // drop obsolete-cron fires
       const arr = byKey.get(r.promptKey);
       if (arr) arr.push(r);
       else byKey.set(r.promptKey, [r]);
@@ -2325,7 +2341,7 @@ export function boundScheduleView(
     for (const arr of byKey.values()) {
       for (const r of arr.slice(-SCHEDULE_MAX_FIRES_PER_CRON)) kept.push(truncSummary(r));
     }
-    boundedRecent[agent] = kept;
+    if (kept.length > 0) boundedRecent[agent] = kept;
   }
 
   let view: BoundedScheduleView = { entries: slimEntries, recentByAgent: boundedRecent };

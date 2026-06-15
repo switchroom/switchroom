@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { HostdServer } from "../../src/host-control/server.js";
 import { hostdRequest } from "../../src/host-control/client.js";
 
@@ -1374,11 +1375,16 @@ describe("hostd server — dashboard read-ops (agent_status / agent_schedule)", 
     // Seed a scheduler.jsonl with > 8 fires + a long outputSummary so the
     // bound payload exercises both truncation paths.
     mkdirSync(join(agentsDir, "klanker"), { recursive: true });
+    // Fires must carry the base cron's REAL promptKey (sha256(prompt) prefix,
+    // as collectScheduleEntries computes it) so boundScheduleView's
+    // current-cron filter keeps them — fires for a key no current cron owns
+    // are dropped as obsolete.
+    const baseKey = createHash("sha256").update("p".repeat(300)).digest("hex").slice(0, 12);
     const rows = Array.from({ length: 12 }, (_, i) =>
       JSON.stringify({
         agent: "klanker",
         scheduleIndex: 0,
-        promptKey: "k",
+        promptKey: baseKey,
         exitCode: 0,
         outputSummary: i === 11 ? "s".repeat(300) : "ok",
         startedAt: 1747300000000 + i,
