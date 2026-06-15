@@ -3,7 +3,9 @@ import {
   fetchFleetStatusViaHostd,
   fetchScheduleViaHostd,
   fetchAgentLogsViaHostd,
+  restartAgentViaHostd,
   HOSTD_UNREACHABLE_LOGS_MESSAGE,
+  HOSTD_UNREACHABLE_CONTROL_MESSAGE,
 } from "./hostd-read-client.js";
 import type { HostdResponse } from "../host-control/protocol.js";
 
@@ -208,5 +210,88 @@ describe("fetchAgentLogsViaHostd", () => {
     });
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.error).toContain("No such container");
+  });
+
+  it("falls back to stderr_tail when an error result carries no `error` string", async () => {
+    // `docker logs` on a stopped container exits non-zero with the cause in
+    // stderr_tail and NO `error` — the operator should see the real reason.
+    const out = await fetchAgentLogsViaHostd("clerk", 50, {
+      socketPath: SOCK,
+      send: async () =>
+        resp({ result: "error", exit_code: 1, stderr_tail: "Error: container is not running\n" }),
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("container is not running");
+  });
+});
+
+describe("restartAgentViaHostd", () => {
+  it("routes through agent_restart and maps `completed` → ok", async () => {
+    let sent: unknown;
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: SOCK,
+      send: async (_opts, req) => {
+        sent = req;
+        return resp({ result: "completed" });
+      },
+    });
+    expect(out).toEqual({ ok: true });
+    expect(sent).toMatchObject({
+      op: "agent_restart",
+      args: { name: "clerk", force: true, reason: "restart requested from dashboard" },
+    });
+  });
+
+  it("maps `started` → ok (restart is async — started IS success)", async () => {
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: SOCK,
+      send: async () => resp({ result: "started", exit_code: null }),
+    });
+    expect(out).toEqual({ ok: true });
+  });
+
+  it("maps `denied` → {ok:false} surfacing hostd's reason", async () => {
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: SOCK,
+      send: async () =>
+        resp({ result: "denied", exit_code: null, error: "cross-agent restart needs admin" }),
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("cross-agent restart needs admin");
+  });
+
+  it("maps `error` → {ok:false} surfacing hostd's reason", async () => {
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: SOCK,
+      send: async () => resp({ result: "error", exit_code: null, error: "recreate failed" }),
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("recreate failed");
+  });
+
+  it("returns the actionable control message on a null socket", async () => {
+    let called = false;
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: null,
+      send: async () => {
+        called = true;
+        return resp({});
+      },
+    });
+    expect(out).toEqual({ ok: false, error: HOSTD_UNREACHABLE_CONTROL_MESSAGE });
+    // Short-circuits before opening any connection.
+    expect(called).toBe(false);
+    if (!out.ok) expect(out.error).toContain("needs hostd");
+  });
+
+  it("returns the actionable control message when the transport throws", async () => {
+    const out = await restartAgentViaHostd("clerk", {
+      socketPath: SOCK,
+      send: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toBe(HOSTD_UNREACHABLE_CONTROL_MESSAGE);
   });
 });

@@ -162,10 +162,15 @@ export async function fetchAgentLogsViaHostd(
     if (resp.result === "completed") {
       return { ok: true, logs: resp.stdout_tail ?? "" };
     }
-    // denied / error — surface hostd's reason if it gave one.
+    // denied / error — surface the real cause. `docker logs` on a stopped/
+    // absent container exits non-zero with the diagnostic in `stderr_tail`
+    // and NO `error` string, so fall back to it before the generic message.
     return {
       ok: false,
-      error: resp.error ?? `hostd agent_logs returned '${resp.result}'`,
+      error:
+        resp.error ??
+        (resp.stderr_tail && resp.stderr_tail.trim()) ??
+        `hostd agent_logs returned '${resp.result}'`,
     };
   } catch {
     return { ok: false, error: HOSTD_UNREACHABLE_LOGS_MESSAGE };
@@ -179,3 +184,75 @@ export async function fetchAgentLogsViaHostd(
 export const HOSTD_UNREACHABLE_LOGS_MESSAGE =
   "Logs need hostd (the dashboard container has no docker access by design). " +
   "Ensure host_control is enabled, or run `switchroom agent logs <name>` on the host.";
+
+/** Actionable error shown when agent CONTROL (restart) can't reach hostd.
+ *  The dashboard container has no docker BY DESIGN, so a restart cannot
+ *  `docker` directly — it must go through hostd's `agent_restart` verb.
+ *  When hostd is down/unconfigured we point the operator at the real
+ *  levers rather than leaking `spawn docker ENOENT`. */
+export const HOSTD_UNREACHABLE_CONTROL_MESSAGE =
+  "Agent control needs hostd (the dashboard container has no docker access by design). " +
+  "Ensure host_control is enabled, or run `switchroom agent restart <name>` on the host.";
+
+export interface RestartViaHostdOpts extends HostdReadOpts {
+  /** Operator-visible reason rendered into the hostd audit row. */
+  reason?: string;
+  /** Bypass safety prompts on the host-side CLI. Defaults true (the
+   *  dashboard restart is an explicit operator click). */
+  force?: boolean;
+}
+
+/**
+ * Restart a peer agent via hostd's EXISTING `agent_restart` verb. The
+ * dockerless web container can't `docker` — so the dashboard's Restart
+ * button routes here instead of shelling docker (which `spawn`s ENOENT).
+ *
+ * The verb is reached over the OPERATOR socket, which `checkGate` leaves
+ * ungated — so restart from the dashboard acts immediately (the operator
+ * chose ungated for restart; start/stop are a separate approval-gated PR).
+ *
+ * Never throws. Maps:
+ *   - `completed` / `started` → `{ ok: true }` (restart is async — hostd
+ *     returns `started` after spawning the recreate; that IS success).
+ *   - `denied` / `error`      → `{ ok: false, error: <hostd reason> }`.
+ *   - null socket / transport throw → `{ ok: false, error: <actionable> }`.
+ */
+export async function restartAgentViaHostd(
+  name: string,
+  opts: RestartViaHostdOpts = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const socketPath =
+    opts.socketPath !== undefined ? opts.socketPath : resolveHostdOperatorSocket();
+  if (!socketPath) {
+    return { ok: false, error: HOSTD_UNREACHABLE_CONTROL_MESSAGE };
+  }
+  const send = opts.send ?? hostdRequest;
+  const req: HostdRequest = {
+    v: 1,
+    op: "agent_restart",
+    request_id: readRequestId("agent_restart"),
+    args: {
+      name,
+      reason: opts.reason ?? "restart requested from dashboard",
+      force: opts.force ?? true,
+    },
+  };
+  try {
+    const resp: HostdResponse = await send(
+      { socketPath, timeoutMs: opts.timeoutMs ?? READ_TIMEOUT_MS },
+      req,
+    );
+    // `started` is the expected happy path: hostd spawns the recreate
+    // detached and acks immediately. `completed` covers a fast synchronous
+    // finish. Either is success.
+    if (resp.result === "completed" || resp.result === "started") {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      error: resp.error ?? `hostd agent_restart returned '${resp.result}'`,
+    };
+  } catch {
+    return { ok: false, error: HOSTD_UNREACHABLE_CONTROL_MESSAGE };
+  }
+}
