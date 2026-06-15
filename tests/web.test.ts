@@ -115,7 +115,14 @@ import {
   handleRefreshAccountsQuota,
   __resetQuotaCacheForTests,
   __resetAgentStatusCacheForTests,
+  handleGetSummary,
+  __resetDashboardCacheForTests,
   type AgentInfo,
+  type SystemHealth,
+  type ScheduleDashboard,
+  type ApprovalsDashboard,
+  type AccountDashboardInfo,
+  type SummaryPart,
 } from "../src/web/api.js";
 import { resolveAgentsDir } from "../src/config/loader.js";
 import { getAccountInfos } from "../src/auth/account-store.js";
@@ -1482,5 +1489,134 @@ describe("handleRefreshAccountsQuota (cached + manual refresh)", () => {
       expect(a.quotaStale).toBe(true);
     }
     expect(probeCalls).toBe(0); // the cost guarantee
+  });
+});
+
+describe("handleGetSummary — cached aggregate for the Summary tab", () => {
+  beforeEach(() => {
+    __resetDashboardCacheForTests();
+  });
+
+  // The handler is pure orchestration over cache-bound producers, so the
+  // tests inject fakes — no broker/docker/hostd. Each `part(value, at)`
+  // mimics what `dashboardCache.get` returns: the value + its dataAsOf.
+  const part = <T>(value: T, dataAsOf: number): SummaryPart<T> => ({
+    value,
+    dataAsOf,
+  });
+
+  const fakeAgents: AgentInfo[] = [
+    {
+      name: "coach",
+      active: "active",
+      uptime: null,
+      memory: null,
+      extends: "default",
+      topic_name: "Fitness",
+      auth: { authenticated: true },
+      memoryCollection: "coach-mem",
+      lastTurnAt: null,
+    },
+  ];
+  const fakeSystemHealth: SystemHealth = {
+    broker: { reachable: true, active: "pixsoul", accounts: 2, agents: 1, consumers: 0 },
+    hindsight: {
+      containerStatus: null,
+      running: true,
+      model: "x",
+      provider: "y",
+      mcpStateless: true,
+    },
+    hostd: { auditLogPresent: true, recent: [] },
+  };
+  const fakeApprovals: ApprovalsDashboard = { reachable: true, decisions: [] };
+  const fakeSchedule: ScheduleDashboard = { entries: [], recentByAgent: {} };
+  const fakeAccounts: AccountDashboardInfo[] = [];
+
+  it("returns all parts and stamps dataAsOf as the OLDEST part", async () => {
+    const out = await handleGetSummary({
+      agents: async () => part(fakeAgents, 1000),
+      systemHealth: async () => part(fakeSystemHealth, 3000),
+      approvals: async () => part(fakeApprovals, 2000),
+      schedule: async () => part(fakeSchedule, 5000),
+      accounts: async () => part(fakeAccounts, 4000),
+    });
+    expect(out.agents).toEqual(fakeAgents);
+    expect(out.systemHealth).toEqual(fakeSystemHealth);
+    expect(out.approvals).toEqual(fakeApprovals);
+    expect(out.schedule).toEqual(fakeSchedule);
+    expect(out.accounts).toEqual(fakeAccounts);
+    // Oldest of {1000,3000,2000,5000,4000} = 1000.
+    expect(out.dataAsOf).toBe(1000);
+  });
+
+  it("tolerates ONE producer throwing — that field is null, the rest present", async () => {
+    const out = await handleGetSummary({
+      agents: async () => part(fakeAgents, 1000),
+      systemHealth: async () => {
+        throw new Error("broker down");
+      },
+      approvals: async () => part(fakeApprovals, 2000),
+      schedule: async () => part(fakeSchedule, 5000),
+      accounts: async () => part(fakeAccounts, 4000),
+    });
+    expect(out.systemHealth).toBeNull(); // the failed part
+    expect(out.agents).toEqual(fakeAgents); // others unaffected
+    expect(out.approvals).toEqual(fakeApprovals);
+    expect(out.schedule).toEqual(fakeSchedule);
+    expect(out.accounts).toEqual(fakeAccounts);
+    // dataAsOf ignores the null part → oldest of the survivors = 1000.
+    expect(out.dataAsOf).toBe(1000);
+  });
+
+  it("when EVERY producer throws, all fields null and dataAsOf 0", async () => {
+    const boom = async (): Promise<never> => {
+      throw new Error("nope");
+    };
+    const out = await handleGetSummary({
+      agents: boom,
+      systemHealth: boom,
+      approvals: boom,
+      schedule: boom,
+      accounts: boom,
+    });
+    expect(out.agents).toBeNull();
+    expect(out.systemHealth).toBeNull();
+    expect(out.approvals).toBeNull();
+    expect(out.schedule).toBeNull();
+    expect(out.accounts).toBeNull();
+    expect(out.dataAsOf).toBe(0);
+  });
+
+  it("runs the producers concurrently (Promise.all, not sequential)", async () => {
+    // If serialized, the second producer would observe the first already
+    // settled. We assert all five were INVOKED before any resolves by
+    // counting starts before the gate opens.
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const mk =
+      <T>(value: T): (() => Promise<SummaryPart<T>>) =>
+      async () => {
+        started++;
+        await gate;
+        return part(value, 1000);
+      };
+    const p = handleGetSummary({
+      agents: mk(fakeAgents),
+      systemHealth: mk(fakeSystemHealth),
+      approvals: mk(fakeApprovals),
+      schedule: mk(fakeSchedule),
+      accounts: mk(fakeAccounts),
+    });
+    // Let the microtasks up to the gate run.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(started).toBe(5); // all kicked before any completed
+    release();
+    const out = await p;
+    expect(out.agents).toEqual(fakeAgents);
   });
 });
