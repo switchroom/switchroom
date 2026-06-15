@@ -54,6 +54,26 @@ function makeRequestId(prefix: string): string {
   return `${prefix}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
+// Wire timeouts are PER-OP. Almost every hostd op returns promptly
+// (`started`/`completed` within a tick), so a snappy 10s wire keeps the
+// agent responsive. `config_propose_edit` is the exception: the daemon
+// BLOCKS server-side awaiting the operator's approval tap (up to
+// CONFIG_APPROVAL_TIMEOUT_MS = 10 min in host-control/server.ts) before
+// it applies and returns. A 10s wire on that op times out by
+// construction — a human cannot tap in 10s — and the agent misreads the
+// timeout as a wire failure, then re-fires, stacking phantom approval
+// cards (the 2026-06-15 klanker debacle: re-fires double-wrote a config
+// entry). The wire MUST outlast the approval window; this mirrors the
+// web dashboard's PROPOSE_TIMEOUT_MS (src/web/hostd-config-propose.ts).
+const DEFAULT_WIRE_TIMEOUT_MS = 10_000;
+const WIRE_TIMEOUT_MS_BY_OP: Partial<Record<HostdRequest["op"], number>> = {
+  config_propose_edit: 11 * 60 * 1000,
+};
+
+export function wireTimeoutForOp(op: HostdRequest["op"]): number {
+  return WIRE_TIMEOUT_MS_BY_OP[op] ?? DEFAULT_WIRE_TIMEOUT_MS;
+}
+
 interface ToolArgs {
   name?: string;
   reason?: string;
@@ -261,7 +281,13 @@ export const TOOLS = [
       "hostd.config_edit_enabled=true (operator opt-in; default off) — returns " +
       "E_CONFIG_EDIT_DISABLED otherwise. An applied edit is not live in the " +
       "running agent until it restarts (the approval card names which agents " +
-      "to bounce).",
+      "to bounce). This call BLOCKS until the operator taps Allow/Deny (or the " +
+      "~10-min approval window expires) — that is expected, NOT a hang. Issue " +
+      "it ONCE and wait for the single result; do NOT re-fire while waiting " +
+      "(a duplicate identical proposal is collapsed onto the pending one, but " +
+      "re-firing only adds confusion). On a genuine failure you get a " +
+      "structured error (E_*); surface that honestly rather than falling back " +
+      "to asking the operator to hand-edit the yaml.",
     inputSchema: {
       type: "object" as const,
       required: ["unified_diff", "reason", "target_path"],
@@ -489,7 +515,7 @@ export async function dispatchTool(
   let resp: HostdResponse;
   try {
     resp = await hostdRequest(
-      { socketPath: sockPath, timeoutMs: 10_000 },
+      { socketPath: sockPath, timeoutMs: wireTimeoutForOp(req.op) },
       req,
     );
   } catch (err) {
