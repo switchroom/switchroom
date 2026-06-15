@@ -830,10 +830,21 @@
     }
 
     async function fetchApprovals() {
+      // Fetch the kernel decision ledger AND the standing capability grants
+      // in parallel, INDEPENDENTLY: a failure of one must not blank the
+      // other (mirror the resilient `safe` pattern in fetchConnections).
+      // Standing grants (the broker grants DB) are the section that's
+      // actually useful — the kernel ledger is honestly empty on most
+      // installs.
+      const safe = (p, fallback) =>
+        p.then(r => r.ok ? r.json() : fallback).catch(() => fallback);
       try {
-        const res = await fetch(`${API}/api/approvals`, { headers: authHeaders() });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        renderApprovals(await res.json());
+        const [approvals, grants] = await Promise.all([
+          safe(fetch(`${API}/api/approvals`, { headers: authHeaders() }), null),
+          safe(fetch(`${API}/api/grants`, { headers: authHeaders() }),
+            { reachable: false, grants: [], error: 'Failed to fetch standing grants.' }),
+        ]);
+        renderApprovals(approvals, grants);
         clearError();
       } catch (err) {
         showError(`Failed to fetch approvals: ${err.message}`);
@@ -1140,6 +1151,17 @@
               kind: 'command',
               label: 'Check the singletons on the host:',
               value: 'docker compose -p switchroom ps',
+            },
+          };
+        case 'grants-unreachable':
+          return {
+            title: 'Standing capability grants unavailable',
+            detail: (ctx.error ? `${ctx.error} ` : '') +
+              'The vault-broker (which owns the grants DB) is not host-reachable, so the operator\'s standing grants can\'t be listed.',
+            remediation: {
+              kind: 'command',
+              label: 'Check broker status on the host:',
+              value: 'switchroom vault broker status',
             },
           };
         case 'connections-degraded':
@@ -1777,17 +1799,81 @@
       container.innerHTML = degradedBanner + truncatedNote + cards;
     }
 
-    function renderApprovals(data) {
+    function renderApprovals(data, grants) {
       const container = document.getElementById('approvals');
+      // Two independent sections: the operator's REAL standing capability
+      // grants (broker grants DB — the actually-useful one), then the
+      // kernel decision ledger (honestly empty on most installs). They
+      // degrade independently — one being unreachable never blanks the
+      // other.
+      container.innerHTML =
+        renderStandingGrants(grants) + renderApprovalDecisions(data);
+    }
+
+    // Standing capability grants from the vault-broker grants DB — what
+    // `switchroom vault grants` lists. write_allow grants are the sensitive
+    // ones (highlighted), mirroring the Drive-scope highlight below.
+    function renderStandingGrants(grants) {
       const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
+      const heading = '<h3 style="margin:0 0 0.5rem;font-size:0.95rem">Standing capability grants</h3>';
+      if (!grants || grants.reachable === false) {
+        return heading +
+          renderProblem(problemFor('grants-unreachable', { error: grants && grants.error }));
+      }
+      const rows = grants.grants || [];
+      if (rows.length === 0) {
+        return heading +
+          '<div class="loading" style="color:var(--text-dim)">No standing capability grants.</div>';
+      }
+      const now = Date.now();
+      const chipList = (keys) => (keys && keys.length)
+        ? keys.map(k => `<span class="chip">${escapeHtml(k)}</span>`).join(' ')
+        : dim('—');
+      const body = rows.map(g => {
+        const expired = g.expiresAt != null && g.expiresAt < now;
+        const writeCell = (g.writeKeys && g.writeKeys.length)
+          ? `<span class="usage-pill primary" title="write grants are the sensitive ones">write</span> ` +
+            g.writeKeys.map(k => `<span class="chip">${escapeHtml(k)}</span>`).join(' ')
+          : dim('read-only');
+        const expiresCell = g.expiresAt == null
+          ? dim('never')
+          : `<span style="${expired ? 'color:var(--text-dim)' : ''}">${formatTimestamp(g.expiresAt)}${expired ? ' (expired)' : ''}</span>`;
+        return `
+        <tr>
+          <td>${escapeHtml(g.agent || '—')}</td>
+          <td>${chipList(g.keys)}</td>
+          <td>${writeCell}</td>
+          <td>${expiresCell}</td>
+          <td>${g.createdAt ? formatTimestamp(g.createdAt) : dim('—')}</td>
+          <td>${g.description ? escapeHtml(g.description) : dim('—')}</td>
+        </tr>`;
+      }).join('');
+      return heading + `
+        <div style="margin-bottom:0.6rem;font-size:0.8rem;color:var(--text-dim)">
+          Read-only view via the vault-broker operator socket — ${rows.length} grant(s). Write grants highlighted.
+        </div>
+        <div class="accounts-table-wrap">
+          <table class="accounts-table">
+            <thead><tr>
+              <th>Agent</th><th>Keys (read)</th><th>Write</th>
+              <th>Expires</th><th>Granted</th><th>Description</th>
+            </tr></thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>`;
+    }
+
+    // Kernel decision ledger (RFC B) — kept as-is. Honestly empty on most
+    // installs (the daily Allow/Deny taps don't write it); that's correct.
+    function renderApprovalDecisions(data) {
+      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
+      const heading = '<h3 style="margin:1.25rem 0 0.5rem;font-size:0.95rem">Approval decision ledger</h3>';
       if (!data || data.reachable === false) {
-        container.innerHTML = renderProblem(approvalsProblem(data && data.error));
-        return;
+        return heading + renderProblem(approvalsProblem(data && data.error));
       }
       const decisions = data.decisions || [];
       if (decisions.length === 0) {
-        container.innerHTML = '<div class="loading">No approval decisions recorded yet.</div>';
-        return;
+        return heading + '<div class="loading">No approval decisions recorded yet.</div>';
       }
       const now = Date.now();
       const statusOf = (d) => {
@@ -1815,7 +1901,7 @@
           <td title="${d.revoke_reason ? escapeHtml(d.revoke_reason) : ''}">${d.revoked_at ? formatTimestamp(d.revoked_at) : dim('—')}</td>
         </tr>`;
       }).join('');
-      container.innerHTML = `
+      return heading + `
         <div style="margin-bottom:0.6rem;font-size:0.8rem;color:var(--text-dim)">
           Read-only view via the kernel operator socket — ${decisions.length} decision(s). Drive scopes highlighted.
         </div>
