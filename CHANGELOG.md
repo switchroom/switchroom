@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.15.28 — Dashboard favicon (#2373)
+
+The admin dashboard now serves the switchroom logo as its favicon (a
+transparent multi-size `favicon.ico` + apple-touch icon), instead of the
+generic browser-tab icon.
+
 ## v0.15.27 — Admin dashboard overhaul (#2363–2370)
 
 A full audit and rebuild of the `switchroom-web` admin dashboard. The web
