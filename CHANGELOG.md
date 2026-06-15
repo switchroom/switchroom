@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.15.31 — Memory tab: what models know, the why, and how memory works (#2379)
+
+The dashboard Memory tab now makes the agents' memory legible. Each mental
+model shows the recall question it answers (hindsight's `source_query` — the
+"why"), a refresh-mode badge, and a **view** expander that lazy-loads its full
+content plus provenance (e.g. *"Synthesized from 35 source facts: 24
+observations · 11 directives"*). A new **How memory works** panel explains the
+`Conversations → Facts → Mental models → Recall` pipeline with live fleet
+totals. The web makes **zero model calls** — it only reads hindsight's REST
+API (new read-only `GET /api/memory/model`, bank-gated; CI-enforced
+subscription-honest).
+
 ## v0.15.30 — Fix: restore per-cron fire history (#2377)
 
 v0.15.29's per-cron fire bounding kept the last fires of every distinct
