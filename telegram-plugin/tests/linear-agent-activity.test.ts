@@ -122,3 +122,78 @@ describe('emitLinearAgentActivity — behaviour (#2298)', () => {
     expect(r.content[0].text).toMatch(/Linear API 401/)
   })
 })
+
+import { serializeBundle, type RefreshIO } from '../../src/linear/oauth-refresh.js'
+
+/** fetch fake routing by URL: the GraphQL endpoint 401s on the first hit then
+ *  200s; the OAuth token endpoint returns a fresh token. Records the
+ *  Authorization header per call so we can prove the retry used the new token. */
+function refreshAwareFetch(opts: { tokenStatus?: number; tokenBody?: unknown } = {}) {
+  const calls: Array<{ url: string; auth?: string }> = []
+  let graphqlHits = 0
+  const fetchImpl = (async (url: string, init: { headers?: Record<string, string> }) => {
+    const auth = init?.headers?.Authorization
+    calls.push({ url, auth })
+    if (url.includes('/oauth/token')) {
+      const status = opts.tokenStatus ?? 200
+      const body = opts.tokenBody ?? { access_token: 'lin_fresh', refresh_token: 'rt_new', expires_in: 86400 }
+      return { ok: status >= 200 && status < 300, status, json: async () => body, text: async () => (typeof body === 'string' ? body : JSON.stringify(body)) } as unknown as Response
+    }
+    graphqlHits++
+    if (graphqlHits === 1) {
+      return { ok: false, status: 401, json: async () => ({}), text: async () => 'unauthorized' } as unknown as Response
+    }
+    return { ok: true, status: 200, json: async () => ({ data: { agentActivityCreate: { success: true } } }), text: async () => '' } as unknown as Response
+  }) as unknown as typeof fetch
+  return { fetchImpl, calls }
+}
+
+function fakeRefreshIO(): { io: RefreshIO; writes: { token?: string; bundle?: string } } {
+  const writes: { token?: string; bundle?: string } = {}
+  const io: RefreshIO = {
+    readBundle: async () => serializeBundle({ clientId: 'cid', clientSecret: 'csec', refreshToken: 'rt_old', expiresAt: 0 }),
+    writeToken: async (t) => { writes.token = t },
+    writeBundle: async (j) => { writes.bundle = j },
+  }
+  return { io, writes }
+}
+
+describe('linear_agent_activity — auto-refresh on 401 (#2298 durability)', () => {
+  it('refreshes the app token on a 401 and retries once with the fresh token', async () => {
+    const { fetchImpl, calls } = refreshAwareFetch()
+    const { io, writes } = fakeRefreshIO()
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_expired'), fetchImpl, refreshIO: () => io, log: () => {} },
+    )
+    expect(r.content[0].text).toMatch(/emitted/)
+    // The refresh wrote the new access token; the GraphQL retry used it.
+    expect(writes.token).toBe('lin_fresh')
+    const graphqlAuths = calls.filter((c) => c.url.includes('/graphql')).map((c) => c.auth)
+    expect(graphqlAuths).toEqual(['lin_expired', 'lin_fresh'])
+  })
+
+  it('a revoked refresh token surfaces the 401 (one retry, no loop) and logs REVOKED', async () => {
+    const { fetchImpl } = refreshAwareFetch({ tokenStatus: 400, tokenBody: 'invalid_grant' })
+    const { io } = fakeRefreshIO()
+    const logs: string[] = []
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_dead'), fetchImpl, refreshIO: () => io, log: (s) => logs.push(s) },
+    )
+    expect(r.content[0].text).toMatch(/Linear API 401/)
+    expect(logs.join('')).toMatch(/REVOKED/)
+  })
+
+  it('no 401 → no refresh attempt (happy path unchanged)', async () => {
+    const { fetchImpl, calls } = fakeFetch(200, { data: { agentActivityCreate: { success: true } } })
+    let refreshBuilt = false
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'message', body: 'ok' },
+      { agent: 'carrie', resolveToken: okToken('lin_good'), fetchImpl, refreshIO: () => { refreshBuilt = true; return fakeRefreshIO().io }, log: () => {} },
+    )
+    expect(r.content[0].text).toMatch(/emitted/)
+    expect(refreshBuilt).toBe(false)
+    expect(calls.length).toBe(1)
+  })
+})

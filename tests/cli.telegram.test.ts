@@ -152,7 +152,7 @@ describe("telegram-yaml: removeTelegramFeature", () => {
 
 // ─── #597 phase 2: webhook source array helpers ─────────────────────────────
 
-import { addWebhookSource, removeWebhookSource, setLinearAgent, setLinearDefaultTeam } from "../src/cli/telegram-yaml.js";
+import { addWebhookSource, removeWebhookSource, setLinearAgent, setLinearDefaultTeam, addAgentSecret } from "../src/cli/telegram-yaml.js";
 
 describe("telegram-yaml: setLinearDefaultTeam (#2312)", () => {
   const withLinear = setLinearAgent(
@@ -348,5 +348,25 @@ describe("telegram-yaml: removeWebhookSource (#597 phase 2)", () => {
     const before = "agents:\n  klanker:\n    topic_name: K\n";
     const after = removeWebhookSource(before, "ghost", "github");
     expect(after).toBe(before);
+  });
+});
+
+describe("telegram-yaml: addAgentSecret (linear refresh ACL)", () => {
+  it("creates the secrets[] list when absent", () => {
+    const before = "agents:\n  carrie:\n    topic_name: C\n";
+    const after = addAgentSecret(before, "carrie", "linear/carrie/oauth");
+    expect(after).toMatch(/secrets:/);
+    expect(after).toContain("linear/carrie/oauth");
+  });
+
+  it("appends to an existing secrets[] and is idempotent", () => {
+    const before = "agents:\n  carrie:\n    secrets:\n      - linear/carrie/token\n";
+    const once = addAgentSecret(before, "carrie", "linear/carrie/oauth");
+    expect(once).toContain("linear/carrie/token");
+    expect(once).toContain("linear/carrie/oauth");
+    // idempotent: re-adding the same key is a no-op (no duplicate)
+    const twice = addAgentSecret(once, "carrie", "linear/carrie/oauth");
+    expect(twice).toBe(once);
+    expect((twice.match(/linear\/carrie\/oauth/g) ?? []).length).toBe(1);
   });
 });

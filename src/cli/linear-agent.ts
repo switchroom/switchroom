@@ -24,7 +24,7 @@ import { Command } from "commander";
 import chalk from "chalk";
 import { readFileSync, writeFileSync } from "node:fs";
 import { getConfigPath, withConfigError } from "./helpers.js";
-import { setLinearAgent, setLinearDefaultTeam } from "./telegram-yaml.js";
+import { setLinearAgent, setLinearDefaultTeam, addAgentSecret } from "./telegram-yaml.js";
 import { vaultPut, vaultPutQuiet, vaultGet } from "./telegram.js";
 import { performLinearRefresh, serializeBundle } from "../linear/oauth-refresh.js";
 
@@ -118,6 +118,14 @@ export function registerLinearAgentCommand(program: Command): void {
             token: `vault:${vaultKey}`,
             ...(opts.workspaceId ? { workspaceId: opts.workspaceId } : {}),
           });
+          // Auto-refresh needs the agent to be able to read + rotate its
+          // refresh bundle via the broker — grant it ACL by adding the key
+          // to the agent's standing secrets[] (the access-token key is
+          // already there or added by the operator's standing grant).
+          if (canRefresh) {
+            after = addAgentSecret(after, opts.agent, bundleKey);
+            after = addAgentSecret(after, opts.agent, vaultKey);
+          }
         } catch (err) {
           fail((err as Error).message);
         }
@@ -133,7 +141,7 @@ export function registerLinearAgentCommand(program: Command): void {
             console.log(chalk.green(`✓ Auto-refresh enabled — refresh bundle stored at '${bundleKey}'`));
             console.log(
               chalk.gray(
-                `  Add '${bundleKey}' to agents.${opts.agent}.secrets[] so the agent can rotate it in-container (broker put).`,
+                `  Granted ACL: '${bundleKey}' + '${vaultKey}' added to agents.${opts.agent}.secrets[] (agent rotates them in-container on a 401).`,
               ),
             );
           } else {

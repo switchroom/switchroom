@@ -199,7 +199,7 @@ export interface RefreshIO {
 }
 
 export type PerformRefreshResult =
-  | { ok: true; expiresAt: number }
+  | { ok: true; accessToken: string; expiresAt: number }
   | {
       ok: false;
       reason: "no_bundle" | "revoked" | "network" | "http_error" | "bad_response" | "persist_failed";
@@ -242,5 +242,5 @@ export async function performLinearRefresh(io: RefreshIO): Promise<PerformRefres
   } catch (err) {
     return { ok: false, reason: "persist_failed", detail: (err as Error).message };
   }
-  return { ok: true, expiresAt: res.expiresAt };
+  return { ok: true, accessToken: res.accessToken, expiresAt: res.expiresAt };
 }

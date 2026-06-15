@@ -147,7 +147,7 @@ describe("performLinearRefresh (orchestration over injected I/O)", () => {
       fetchImpl: fakeFetch(200, { access_token: "lin_new", refresh_token: "lin_refresh_new", expires_in: 86400 }),
       nowSec: () => 100,
     });
-    expect(res).toEqual({ ok: true, expiresAt: 100 + 86400 });
+    expect(res).toEqual({ ok: true, accessToken: "lin_new", expiresAt: 100 + 86400 });
     // bundle persisted before token (rotation-safety)
     expect(order).toEqual(["bundle", "token"]);
     expect(writtenToken).toBe("lin_new");

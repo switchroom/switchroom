@@ -180,6 +180,30 @@ export function addWebhookSource(
 }
 
 /**
+ * Add a key to an agent's standing `secrets[]` list (the operator-set
+ * vault grant the broker mints the agent's read/rotate ACL from).
+ * Idempotent. Used by `linear-agent setup` to grant the agent ACL over
+ * its `linear/<agent>/oauth` refresh bundle so it can rotate the token
+ * in-container via the broker `put` op.
+ */
+export function addAgentSecret(yamlText: string, agentName: string, key: string): string {
+  const doc = parseDocument(yamlText);
+  ensureAgent(doc, agentName);
+  const existing = doc.getIn(["agents", agentName, "secrets"]);
+  if (isSeq(existing)) {
+    const seq = existing as YAMLSeq;
+    for (const item of seq.items) {
+      const v = (item as { value?: unknown }).value ?? item;
+      if (v === key) return yamlText; // idempotent
+    }
+    seq.add(key);
+  } else {
+    doc.setIn(["agents", agentName, "secrets"], [key]);
+  }
+  return String(doc);
+}
+
+/**
  * Remove a webhook source from the array. No-op when the source isn't
  * present. When the array becomes empty, the parent webhook_sources
  * entry is dropped (and empty parent maps pruned) so the YAML doesn't
