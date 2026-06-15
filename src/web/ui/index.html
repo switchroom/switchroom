@@ -566,13 +566,15 @@
           // other sections still render (see renderAgentDetailInner).
           fetch(`${API}/api/agents/${encodeURIComponent(name)}/turns?limit=10`, { headers: authHeaders() }),
         ]);
-        // The turns endpoint returns { ok, turns?, error? } — pull the
-        // array out (null on a non-ok response / malformed payload).
+        // The /turns success response is a BARE Turn[] array (same
+        // convention as /accounts + /subagents above); only the error
+        // path sends { ok:false, error }. So read the array directly —
+        // null on a non-ok response / malformed payload.
         let turns = null;
         if (turnsRes.ok) {
           try {
             const body = await turnsRes.json();
-            turns = body && body.ok && Array.isArray(body.turns) ? body.turns : null;
+            turns = Array.isArray(body) ? body : null;
           } catch { turns = null; }
         }
         agentDetails[name] = {
