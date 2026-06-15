@@ -332,15 +332,63 @@ export interface AccountDashboardInfo extends AccountInfo {
   /** Broker-derived quota / exhaustion state. `null` when broker unreachable. */
   quota: AccountState | null;
   /**
-   * Live 5h/7d utilization from the last cached probe, or null if never
-   * probed / probe failed. Populated by the refresh endpoint, never by
-   * this default load (cost — see AccountQuotaUsage).
+   * Live 5h/7d utilization. Sourced (in order) from the in-process probe
+   * cache (the billed ↻ button), else the broker's own `last_quota` snapshot
+   * — which the default-on fleet quota probe populates for FREE, so a cold
+   * tab shows live usage without spending a billed probe. null only when
+   * neither source has data.
    */
   quotaUsage: AccountQuotaUsage | null;
-  /** true when there's no fresh cached probe (UI shows a refresh prompt). */
+  /** Where quotaUsage came from: a billed probe, the free broker snapshot, or nothing. */
+  quotaUsageSource: "probe" | "broker-cache" | null;
+  /** true when the displayed usage is older than the cache TTL (UI hints ↻). */
   quotaStale: boolean;
   /** Agents currently bound to this account (fleet active or per-agent override). */
   usedBy: string[];
+}
+
+/** ISO 8601 → unix ms, or null when absent/unparseable. */
+export function isoToMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Resolve the 5h/7d usage to show for an account, preferring (in order):
+ *   1. the in-process probe cache (freshest — from the billed ↻ button), then
+ *   2. the broker's own `last_quota` snapshot, which the default-on fleet
+ *      quota probe keeps fresh for FREE — so a cold tab shows live usage with
+ *      no billed probe (the ↻ stays a true force-refresh).
+ * null only when neither source has data. Pure + exported for unit testing.
+ */
+export function deriveAccountQuotaView(
+  brokerState: AccountState | null,
+  probe: { usage: AccountQuotaUsage | null; fetchedAt: number } | undefined,
+  now: number,
+): {
+  quotaUsage: AccountQuotaUsage | null;
+  quotaUsageSource: "probe" | "broker-cache" | null;
+  quotaStale: boolean;
+} {
+  const probeFresh = !!probe && now - probe.fetchedAt < QUOTA_CACHE_TTL_MS;
+  let quotaUsage: AccountQuotaUsage | null = probeFresh ? (probe!.usage ?? null) : null;
+  let quotaUsageSource: "probe" | "broker-cache" | null = quotaUsage ? "probe" : null;
+  let quotaStale = !probeFresh;
+
+  if (!quotaUsage && brokerState?.last_quota) {
+    const lq = brokerState.last_quota;
+    quotaUsage = {
+      fiveHourPct: lq.fiveHourUtilizationPct,
+      sevenDayPct: lq.sevenDayUtilizationPct,
+      fiveHourResetAt: isoToMs(lq.fiveHourResetAt),
+      sevenDayResetAt: isoToMs(lq.sevenDayResetAt),
+      capturedAt: lq.capturedAt,
+    };
+    quotaUsageSource = "broker-cache";
+    quotaStale = now - lq.capturedAt >= QUOTA_CACHE_TTL_MS;
+  }
+  return { quotaUsage, quotaUsageSource, quotaStale };
 }
 
 export async function handleGetAccounts(
@@ -374,14 +422,18 @@ export async function handleGetAccounts(
       usedBy.sort();
     }
     const now = Date.now();
-    const ce = quotaCache.get(info.label);
+    const brokerState = brokerAccounts.get(info.label) ?? null;
+    const view = deriveAccountQuotaView(brokerState, quotaCache.get(info.label), now);
+
     return {
       ...info,
-      quota: brokerAccounts.get(info.label) ?? null,
-      // Cache read only — NEVER probe here (cost). Stale/missing → null
-      // + quotaStale:true so the UI can prompt a refresh.
-      quotaUsage: quotaEntryFresh(ce, now) ? (ce!.usage ?? null) : null,
-      quotaStale: !quotaEntryFresh(ce, now),
+      // The on-disk health (from the abandoned meta.json) can never show
+      // quota-exhausted; the broker's exhausted flag is the live authority.
+      health: brokerState?.exhausted ? "quota-exhausted" : info.health,
+      quota: brokerState,
+      quotaUsage: view.quotaUsage,
+      quotaUsageSource: view.quotaUsageSource,
+      quotaStale: view.quotaStale,
       usedBy,
     };
   });
@@ -629,6 +681,18 @@ function inspectEnv(
   return out;
 }
 
+/**
+ * Read-only / health-probe hostd verbs excluded from the "recent privileged
+ * verbs" panel — they aren't mutations and (agent_smoke especially) dominate
+ * the audit log, drowning the real actions the panel is meant to show.
+ */
+const HOSTD_NOISE_OPS = new Set<string>([
+  "agent_smoke",
+  "get_status",
+  "agent_status",
+  "agent_logs",
+]);
+
 export async function handleGetSystemHealth(
   config?: SwitchroomConfig,
   home?: string,
@@ -702,7 +766,12 @@ export async function handleGetSystemHealth(
     if (existsSync(logPath)) {
       hostd.auditLogPresent = true;
       const raw = readFileSync(logPath, "utf-8");
-      hostd.recent = readAndFilter(raw, {}, 10);
+      // Drop read-only/health-probe verbs — agent_smoke alone is the large
+      // majority of rows and buries the actual privileged mutations this
+      // panel exists to surface. Read a wide window, filter, then take 10.
+      hostd.recent = readAndFilter(raw, {}, 1000)
+        .filter((e) => !HOSTD_NOISE_OPS.has(e.op))
+        .slice(-10);
     }
   } catch (err) {
     hostd.error = err instanceof Error ? err.message : String(err);
@@ -747,8 +816,18 @@ export async function handleGetGoogleAccounts(
       }
     });
   } catch (err) {
-    if (!(err instanceof AuthBrokerUnreachableError)) throw err;
-    // Degraded: ACL still renders from config; live fields stay null.
+    // Degraded — never 500 the dashboard: ANY broker error (unreachable OR a
+    // protocol/internal error) falls through to the config-only union so a
+    // configured account never vanishes (the #2239 vanish bug via the
+    // error-response channel). Log the non-unreachable case for diagnosis.
+    if (!(err instanceof AuthBrokerUnreachableError)) {
+      process.stderr.write(
+        `dashboard: live broker error reading workspace accounts ` +
+          `(${err instanceof AuthBrokerError ? err.code : "unknown"}); ` +
+          `showing config-only ACL: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    // ACL still renders from config; live fields stay null.
   }
   // Union of config-declared accounts and broker-known slots so an
   // account present in only one source is still visible.
@@ -819,8 +898,18 @@ export async function handleGetMicrosoftAccounts(
       }
     });
   } catch (err) {
-    if (!(err instanceof AuthBrokerUnreachableError)) throw err;
-    // Degraded: ACL still renders from config; live fields stay null.
+    // Degraded — never 500 the dashboard: ANY broker error (unreachable OR a
+    // protocol/internal error) falls through to the config-only union so a
+    // configured account never vanishes (the #2239 vanish bug via the
+    // error-response channel). Log the non-unreachable case for diagnosis.
+    if (!(err instanceof AuthBrokerUnreachableError)) {
+      process.stderr.write(
+        `dashboard: live broker error reading workspace accounts ` +
+          `(${err instanceof AuthBrokerError ? err.code : "unknown"}); ` +
+          `showing config-only ACL: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+    // ACL still renders from config; live fields stay null.
   }
   const cfgAccounts =
     (config as { microsoft_accounts?: Record<string, { enabled_for?: string[] }> })
