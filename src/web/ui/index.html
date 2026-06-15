@@ -485,6 +485,59 @@
       .card-meta { gap: 0.3rem 1rem; }
       nav.tabs { padding: 0 1rem; overflow-x: auto; }
     }
+
+    /* --- Memory tab: banded cards, provenance bars, model relationships --- */
+    .mm-band { padding: .55rem 0; border-top: 1px solid var(--border); }
+    .mm-band-h { font-size: .68rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-dim); margin-bottom: .4rem; display: flex; align-items: center; gap: .4rem; }
+    .mm-band-h .n { color: var(--text); opacity: .6; }
+    .mm-stat-line { color: var(--text); font-size: .9em; line-height: 1.5; }
+    .mm-stat-line .dim { color: var(--text-dim); }
+    /* stacked provenance bar (segments sized by source-fact composition) */
+    .prov-bar { display: flex; height: 7px; border-radius: 4px; overflow: hidden; background: var(--border); margin: .35rem 0 .15rem; }
+    .prov-bar > span { display: block; min-width: 2px; }
+    .prov-obs { background: var(--blue); }
+    .prov-dir { background: var(--green); }
+    .prov-der { background: var(--yellow); }
+    .prov-legend { font-size: .72rem; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: .15rem .8rem; margin-top: .3rem; }
+    .prov-legend i { width: .6rem; height: .6rem; border-radius: 2px; display: inline-block; vertical-align: middle; margin-right: .25rem; }
+    /* freshness heat-strip: one cell per model */
+    .heat { display: flex; gap: 2px; flex-wrap: wrap; margin-top: .4rem; }
+    .heat span { width: 16px; height: 8px; border-radius: 2px; }
+    .heat .fresh { background: var(--green); }
+    .heat .stale { background: var(--yellow); }
+    .heat .cold { background: var(--text-dim); opacity: .45; }
+    .heat .corrupt { background: var(--red); }
+    /* model rows + cluster (hub→leaf) tree connectors */
+    .mm-row { padding: .4rem 0; }
+    .mm-row + .mm-row { border-top: 1px solid var(--border); }
+    .mm-cluster { border-top: 1px solid var(--border); }
+    .mm-cluster .mm-row + .mm-row { border-top: none; }
+    .mm-top { display: flex; align-items: baseline; gap: .45rem; flex-wrap: wrap; }
+    .mm-name { font-weight: 600; }
+    .mm-meta { font-size: .8em; color: var(--text-dim); margin-left: auto; white-space: nowrap; }
+    .mm-why { color: var(--text-dim); font-size: .84em; margin-top: .12rem; }
+    .mm-leaf { padding-left: 1.15rem; position: relative; }
+    .mm-leaf::before { content: ""; position: absolute; left: .35rem; top: 0; bottom: 0; border-left: 2px solid var(--border); }
+    .mm-leaf:last-child::before { bottom: calc(100% - 1.05rem); }
+    .mm-leaf::after { content: ""; position: absolute; left: .35rem; top: 1.05rem; width: .5rem; border-top: 2px solid var(--border); }
+    /* relationship chips */
+    .mm-chips { margin-top: .25rem; font-size: .8em; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; }
+    .mm-chip { background: var(--surface-hover); border: 1px solid var(--border); border-radius: 5px; padding: 0 .35rem; cursor: pointer; color: var(--text); }
+    .mm-chip:hover { border-color: var(--blue); }
+    .mm-chip.raw { cursor: default; color: var(--text-dim); }
+    .mm-chip.muted { background: transparent; border: 1px dashed var(--border); cursor: default; color: var(--text-dim); }
+    /* model badges */
+    .mm-badge { font-size: .7rem; border: 1px solid var(--border); border-radius: 5px; padding: 0 .3rem; color: var(--text-dim); }
+    .mm-badge.stale { color: var(--yellow); border-color: var(--yellow); }
+    .mm-badge.corrupt { color: var(--red); border-color: var(--red); }
+    .mm-badge.hub { color: var(--blue); border-color: var(--blue); }
+    /* flash when a chip scrolls you to its target row */
+    @keyframes mmflash { 0% { background: rgba(96,165,250,.28); } 100% { background: transparent; } }
+    .mm-flash { animation: mmflash 1.3s ease-out; border-radius: 6px; }
+    /* attention band (problems promoted to top of card) */
+    .mm-attn { border-left: 3px solid var(--red); padding: .4rem .6rem; margin: .15rem 0 .35rem; background: rgba(248,113,113,.07); border-radius: 0 6px 6px 0; font-size: .86em; }
+    .mm-attn.warn { border-left-color: var(--yellow); background: rgba(251,191,36,.06); }
+    .mm-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
   </style>
 </head>
 <body>
@@ -620,6 +673,7 @@
         container.innerHTML = renderProblem(problemFor('hindsight-down', { url: m.url }));
         return;
       }
+      const banks = m.banks || [];
       const statusDot = (s) => `<span class="status-dot ${s === 'ok' ? 'active' : s === 'warn' ? 'auth-warning' : 'inactive'}" style="display:inline-block;vertical-align:middle"></span>`;
       const fmtDay = (iso) => iso ? iso.slice(0, 10) : '—';
       const fmtAge = (iso) => {
@@ -628,32 +682,50 @@
         if (isNaN(d)) return '';
         return d < 1 ? 'today' : `${Math.round(d)}d ago`;
       };
-      // A bank "has a user-profile model" if any mental model is named
-      // like user-profile (mirrors hindsight's exact-name check, but
-      // tolerant of the "User Profile" display variant for the UI hint).
+      const fmtNum = (n) => (n || 0).toLocaleString();
+      const fmtK = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n || 0));
+      const isStaleTs = (iso) => iso && (Date.now() - Date.parse(iso)) > 7 * 86400000;
       const hasUserProfile = (b) => (b.mentalModels || []).some(mm =>
         /^user[- ]?profile$/i.test(String(mm.name || '')));
-      // JSON for a single-quoted onclick attribute: escape the quote
-      // chars that could break out of the attribute (', &, <, >).
+      // JSON for a single-quoted onclick attribute (escapeHtml covers ' & < > ").
       const attrJson = (v) => escapeHtml(JSON.stringify(v));
+      // Fold hindsight's fact types into 3 provenance buckets: observations,
+      // directives/other facts, and derived-from-other-models.
+      const provSegments = (counts) => {
+        const c = counts || {};
+        const obs = c.observation || 0;
+        const models = c['mental-models'] || 0;
+        let other = 0;
+        for (const [k, v] of Object.entries(c)) {
+          if (k !== 'observation' && k !== 'mental-models') other += v || 0;
+        }
+        return { obs, other, models, total: obs + other + models };
+      };
+      const provBar = (counts, h) => {
+        const s = provSegments(counts);
+        if (s.total === 0) return '';
+        const seg = (n, cls) => n > 0 ? `<span class="${cls}" style="flex:${n}" title="${n}"></span>` : '';
+        return `<div class="prov-bar"${h ? ` style="height:${h}px"` : ''}>${seg(s.obs, 'prov-obs')}${seg(s.other, 'prov-dir')}${seg(s.models, 'prov-der')}</div>`;
+      };
 
-      // --- "How memory works" explainer (live fleet totals) ---
-      // The Memory tab's job: make the invisible pipeline legible. The
-      // operator should understand WHAT the agents remember, the WHY behind
-      // each model, and HOW the pipeline turns conversations into recall.
-      const banks = m.banks || [];
+      // --- "How memory works" explainer + shared provenance legend ---
       const totals = banks.reduce((a, b) => {
         a.docs += b.totalDocuments || 0;
         a.facts += b.totalFacts || 0;
         a.models += (b.mentalModels || []).length;
         return a;
       }, { docs: 0, facts: 0, models: 0 });
-      const fmtNum = (n) => (n || 0).toLocaleString();
       const stage = (label, count, desc) => `<div style="flex:1 1 140px;min-width:130px;background:var(--surface-hover);border-radius:8px;padding:.6rem .7rem">
         <div style="font-weight:600">${escapeHtml(label)}${count !== '' ? ` <span style="color:var(--blue)">${count}</span>` : ''}</div>
         <div style="color:var(--text-dim);font-size:.78em;margin-top:.25rem;line-height:1.35">${escapeHtml(desc)}</div>
       </div>`;
       const arrow = `<div style="display:flex;align-items:center;color:var(--text-dim);font-size:1.1em">→</div>`;
+      const legend = `<div class="prov-legend">
+        <span style="color:var(--text)">Source mix:</span>
+        <span><i class="prov-obs"></i>observations</span>
+        <span><i class="prov-dir"></i>directives &amp; facts</span>
+        <span><i class="prov-der"></i>from other models</span>
+      </div>`;
       const explainer = `<div class="agent-card" style="margin-bottom:1rem">
         <div class="card-header" style="cursor:default">
           <span class="agent-name">How memory works</span>
@@ -665,98 +737,184 @@
             ${arrow}
             ${stage('Facts', fmtNum(totals.facts), "Hindsight extracts durable facts from each conversation — on its OWN model, never the agent's quota.")}
             ${arrow}
-            ${stage('Mental models', fmtNum(totals.models), 'Facts are synthesized into named models, each answering one recall question.')}
+            ${stage('Mental models', fmtNum(totals.models), 'Facts (and other models) are synthesized into named models, each answering one recall question.')}
             ${arrow}
             ${stage('Recall', '', 'On each turn the agent pulls the relevant models back into context — it never re-reads raw history.')}
           </div>
-          <div style="color:var(--text-dim);font-size:.85em">Expand any model below to read what it knows and where it came from. A <span style="color:var(--yellow)">stale</span> or empty model means the agent is reasoning from an out-of-date picture.</div>
+          <div style="color:var(--text-dim);font-size:.85em">A <span style="color:var(--blue)">hub</span> model synthesizes other models (the <span style="color:var(--text)">draws on</span> links); a <span style="color:var(--yellow)">stale</span> or empty model means the agent is reasoning from an out-of-date picture. The bars below show each model's source mix.</div>
+          ${legend}
         </div>
       </div>`;
 
       const cards = banks.map((b, bi) => {
         const bankJs = attrJson(b.bank);
-        const models = (b.mentalModels || []).map((mm, mi) => {
+        const models = b.mentalModels || [];
+        const corrupt = new Set(b.corruptedMentalModelNames || []);
+        const byId = new Map(models.map(mm => [mm.id, mm]));
+        // model→model edges, self-references and dangling ids filtered for hub-ness
+        const edgesOf = (mm) => (mm.derivedFromModelIds || []).filter(id => id && id !== mm.id);
+        const anyEdges = models.some(mm => edgesOf(mm).length > 0);
+        const hubs = models.filter(mm => edgesOf(mm).length > 0);
+
+        const freshRank = (mm) => corrupt.has(mm.name) ? 2 : isStaleTs(mm.lastRefreshedAt || mm.createdAt) ? 1 : 0;
+        const tsMs = (mm) => { const ts = mm.lastRefreshedAt || mm.createdAt; return ts ? Date.parse(ts) : 0; };
+        const freshCmp = (a, c) => freshRank(a) - freshRank(c) || tsMs(c) - tsMs(a);
+
+        // One model row. isLeaf indents it under a hub with a tree connector.
+        const modelRow = (mm, opts) => {
+          opts = opts || {};
           const ts = mm.lastRefreshedAt || mm.createdAt;
-          const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
-          const detailId = `memdetail-${bi}-${mi}`;
+          const stale = isStaleTs(ts);
+          const corr = corrupt.has(mm.name);
+          const isHub = edgesOf(mm).length > 0;
+          const safe = (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+          const detailId = `memdetail-${bi}-${safe(mm.id)}`;
+          const rowId = `mmrow-${bi}-${safe(mm.id)}`;
           const idJs = attrJson(mm.id);
-          const ageLabel = fmtAge(ts) || 'never refreshed';
+          const meta = [fmtK(mm.contentLength) + 'c', mm.refreshMode, fmtAge(ts) || 'never'].filter(Boolean).join(' · ');
+          const badges = [
+            isHub ? `<span class="mm-badge hub" title="synthesizes other models">hub</span>` : '',
+            corr ? `<span class="mm-badge corrupt">corrupted</span>` : (stale ? `<span class="mm-badge stale">stale</span>` : ''),
+          ].join('');
+          let chips = '';
+          if (isHub) {
+            const items = edgesOf(mm).map(id => {
+              const t = byId.get(id);
+              return t
+                ? `<span class="mm-chip" onclick='focusModel(${bi}, ${attrJson(t.id)})'>${escapeHtml(t.name)}</span>`
+                : `<span class="mm-chip raw" title="not a model in this bank">${escapeHtml(id)}</span>`;
+            });
+            const s = provSegments(mm.basedOnCounts);
+            if (s.obs + s.other > 0) items.push(`<span class="mm-chip muted" title="also synthesized from raw facts">+ raw facts</span>`);
+            chips = `<div class="mm-chips"><span>draws on:</span>${items.join('')}</div>`;
+          }
           const why = mm.sourceQuery
-            ? `<div style="color:var(--text-dim);font-size:.84em;margin-top:.15rem">answers: “${escapeHtml(mm.sourceQuery)}”</div>`
+            ? `<div class="mm-why">answers: “${escapeHtml(mm.sourceQuery)}”</div>`
             : '';
-          const modeBadge = mm.refreshMode
-            ? `<span style="color:var(--text-dim);font-size:.78em;border:1px solid var(--border);border-radius:5px;padding:0 .35rem">${escapeHtml(mm.refreshMode)}</span>`
-            : '';
-          return `<div style="border-top:1px solid var(--border);padding:.5rem 0">
-            <div style="display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap">
-              <strong>${escapeHtml(mm.name)}</strong>
-              <span style="font-size:.82em;${stale ? 'color:var(--yellow)' : 'color:var(--text-dim)'}">${ageLabel}${stale ? ' · stale' : ''}</span>
-              ${modeBadge}
-              <button class="btn" type="button" style="margin-left:auto;padding:.12rem .55rem;font-size:.8em" onclick='memViewModel(${bankJs}, ${idJs}, "${detailId}", this)'>view</button>
-            </div>
+          return `<div class="mm-row${opts.leaf ? ' mm-leaf' : ''}" id="${rowId}">
+            <div class="mm-top"><span class="mm-name">${escapeHtml(mm.name)}</span>${badges}<span class="mm-meta">${escapeHtml(meta)}</span></div>
             ${why}
-            <div id="${detailId}" style="display:none;margin-top:.5rem"></div>
+            ${provBar(mm.basedOnCounts)}
+            ${chips}
+            <div style="margin-top:.3rem"><button class="btn" type="button" style="padding:.1rem .5rem;font-size:.78em" onclick='memViewModel(${bankJs}, ${idJs}, "${detailId}", this)'>view content</button></div>
+            <div id="${detailId}" style="display:none;margin-top:.4rem"></div>
           </div>`;
-        }).join('');
-        const gapLine = b.recentUnextractedCount > 0
-          ? `<div style="color:var(--red);margin-top:.4rem">⚠ ${b.recentUnextractedCount} recent conversation(s) stored but NOT extracted (oldest ${fmtDay(b.oldestUnextractedAt)}) — invisible to recall until reprocessed</div>`
+        };
+
+        // Order: each hub followed by its leaves (a cluster), then orphans
+        // freshest-first. No edges anywhere → a flat freshness-ordered list
+        // (no spine, no chips) — the common, calm case.
+        const rendered = new Set();
+        const blocks = [];
+        if (anyEdges) {
+          for (const hub of hubs) {
+            if (rendered.has(hub.id)) continue;
+            rendered.add(hub.id);
+            let cluster = modelRow(hub, {});
+            for (const id of edgesOf(hub)) {
+              const leaf = byId.get(id);
+              if (!leaf || rendered.has(leaf.id)) continue;
+              rendered.add(leaf.id);
+              cluster += modelRow(leaf, { leaf: true });
+            }
+            blocks.push(`<div class="mm-cluster">${cluster}</div>`);
+          }
+        }
+        const orphans = models.filter(mm => !rendered.has(mm.id)).sort(freshCmp);
+        for (const o of orphans) blocks.push(modelRow(o, {}));
+        const modelsHtml = blocks.join('');
+
+        // Attention band — problems promoted to the top of the card.
+        const warnLines = [];
+        if ((b.corruptedMentalModelNames || []).length > 0) {
+          warnLines.push(`corrupted: ${escapeHtml(b.corruptedMentalModelNames.join(', '))} — content is an LLM failure message; refresh once quota recovers`);
+        }
+        if (b.recentUnextractedCount > 0) {
+          warnLines.push(`${b.recentUnextractedCount} recent conversation(s) stored but NOT extracted (oldest ${fmtDay(b.oldestUnextractedAt)}) — invisible to recall until reprocessed`);
+        }
+        const attn = warnLines.length
+          ? `<div class="mm-attn ${b.status === 'fail' ? '' : 'warn'}">${warnLines.map(w => `<div>⚠ ${w}</div>`).join('')}</div>`
           : '';
-        const corruptLine = (b.corruptedMentalModelNames || []).length > 0
-          ? `<div style="color:var(--red);margin-top:.4rem">⚠ corrupted mental model(s): ${escapeHtml(b.corruptedMentalModelNames.join(', '))} — content is an LLM failure message; refresh once quota recovers</div>`
-          : '';
-        // --- Remediation buttons (audit ranks 7 + 22) ---
-        // Each triggers an HTTP poke at hindsight; hindsight does the LLM
-        // work on its own provider — the dashboard makes NO model call.
+
+        // Bank-summary band: dense stat line + aggregate source-mix bar + freshness heat-strip.
+        const agg = {};
+        for (const mm of models) for (const [k, v] of Object.entries(mm.basedOnCounts || {})) agg[k] = (agg[k] || 0) + (v || 0);
+        const statLine = `${fmtNum(b.totalDocuments)} <span class="dim">conversations</span> · ${fmtNum(b.totalFacts)} <span class="dim">facts</span> · <span class="dim">latest</span> ${fmtDay(b.newestDocumentAt)}${fmtAge(b.newestDocumentAt) ? ` <span class="dim">(${fmtAge(b.newestDocumentAt)})</span>` : ''} · ${models.length} <span class="dim">model${models.length === 1 ? '' : 's'}</span>${b.staleMentalModelCount ? ` <span style="color:var(--yellow)">(${b.staleMentalModelCount} stale)</span>` : ''}`;
+        const heatCell = (mm) => {
+          const ts = mm.lastRefreshedAt || mm.createdAt;
+          const age = ts ? (Date.now() - Date.parse(ts)) / 86400000 : null;
+          const cls = corrupt.has(mm.name) ? 'corrupt' : age === null ? 'cold' : age > 7 ? 'stale' : 'fresh';
+          return `<span class="${cls}" title="${escapeHtml(mm.name)} — ${fmtAge(ts) || 'never refreshed'}"></span>`;
+        };
+        const heat = models.length ? `<div class="heat" title="freshness, one cell per model">${models.map(heatCell).join('')}</div>` : '';
+        const aggBar = provBar(agg, 9);
+
+        // Mental-models band header — count + a hub-summary when relationships exist.
+        const mmHeader = `Mental models <span class="n">${models.length}</span>` +
+          (anyEdges ? `<span class="mm-badge hub" style="margin-left:auto">${hubs.length} synthesize${hubs.length === 1 ? 's' : ''} others</span>` : '');
+
+        // --- Remediation buttons (unchanged behaviour) ---
         const buttons = [];
-        // Reprocess the extraction-gap docs.
         if (b.recentUnextractedCount > 0) {
           const n = Math.min(b.recentUnextractedCount, (b.unextractedDocIds || []).length) || b.recentUnextractedCount;
           buttons.push(`<button class="btn" type="button" onclick='memReprocess(${bankJs}, this)'>Reprocess ${n} doc${n === 1 ? '' : 's'}</button>`);
         }
-        // Refresh each corrupted/stale model (map corrupted NAME → id).
         const affectedIds = new Set();
         for (const name of (b.corruptedMentalModelNames || [])) {
-          const mm = (b.mentalModels || []).find(x => x.name === name);
+          const mm = models.find(x => x.name === name);
           if (mm && mm.id) affectedIds.add(mm.id);
         }
-        for (const mm of (b.mentalModels || [])) {
-          const ts = mm.lastRefreshedAt || mm.createdAt;
-          const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
-          if (stale && mm.id) affectedIds.add(mm.id);
+        for (const mm of models) {
+          if (isStaleTs(mm.lastRefreshedAt || mm.createdAt) && mm.id) affectedIds.add(mm.id);
         }
-        for (const mm of (b.mentalModels || [])) {
+        for (const mm of models) {
           if (!affectedIds.has(mm.id)) continue;
           const idJs = attrJson(mm.id), nameJs = attrJson(mm.name);
           buttons.push(`<button class="btn" type="button" onclick='memRefreshModel(${bankJs}, ${idJs}, ${nameJs}, this)'>Refresh ${escapeHtml(mm.name)}</button>`);
         }
-        // Build the user-profile model when the bank has data but no profile.
         if (b.totalDocuments > 0 && !hasUserProfile(b)) {
           buttons.push(`<button class="btn" type="button" onclick='memBuildProfile(${bankJs}, this)'>Build profile</button>`);
         }
-        const buttonRow = buttons.length
-          ? `<div class="rem-actions" style="margin-top:.6rem;display:flex;flex-wrap:wrap;gap:.4rem">${buttons.join('')}</div>`
+        const actionsBand = buttons.length
+          ? `<div class="mm-band"><div class="mm-band-h">Actions</div><div class="mm-actions">${buttons.join('')}</div></div>`
           : '';
+
         return `<div class="agent-card">
           <div class="card-header" style="cursor:default">
             ${statusDot(b.status)}<span class="agent-name">${escapeHtml(b.bank)}</span>
             <span style="color:var(--text-dim);font-size:.85em;margin-left:.5rem">${escapeHtml((b.agents || []).join(', '))}</span>
           </div>
           <div style="padding:0 1.25rem 1rem">
-            <div style="color:var(--text-dim);margin-bottom:.4rem">${escapeHtml(b.statusDetail || '')}</div>
-            <div class="card-meta" style="padding:0">
-              <div class="meta-item"><label>Conversations </label><span>${b.totalDocuments}</span></div>
-              <div class="meta-item"><label>Facts </label><span>${b.totalFacts}</span></div>
-              <div class="meta-item"><label>Latest activity </label><span>${fmtDay(b.newestDocumentAt)} ${fmtAge(b.newestDocumentAt) ? '(' + fmtAge(b.newestDocumentAt) + ')' : ''}</span></div>
-              <div class="meta-item"><label>Mental models </label><span>${(b.mentalModels || []).length}${b.staleMentalModelCount ? ` <span style="color:var(--yellow)">(${b.staleMentalModelCount} stale)</span>` : ''}</span></div>
+            <div style="color:var(--text-dim);margin:.1rem 0 .3rem">${escapeHtml(b.statusDetail || '')}</div>
+            ${attn}
+            <div class="mm-band" style="border-top:none">
+              <div class="mm-band-h">Bank summary</div>
+              <div class="mm-stat-line">${statLine}</div>
+              ${aggBar}
+              ${heat}
             </div>
-            ${models ? `<div style="margin-top:.5rem"><div style="font-size:.74em;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.1rem">Mental models — what this fleet remembers</div>${models}</div>` : ''}
-            ${corruptLine}
-            ${gapLine}
-            ${buttonRow}
+            <div class="mm-band">
+              <div class="mm-band-h">${mmHeader}</div>
+              ${modelsHtml || '<div style="color:var(--text-dim);font-size:.85em">No mental models yet — facts are still accumulating.</div>'}
+            </div>
+            ${actionsBand}
           </div>
         </div>`;
       }).join('');
       container.innerHTML = explainer + `<div class="agents-grid">${cards || '<div style="color:var(--text-dim)">No agent banks configured.</div>'}</div>`;
+    }
+
+    // Chip-as-cross-link: scroll to the named model's row in the same card
+    // and flash it. Pure DOM — no graph canvas. `bi` is the bank index, `id`
+    // the target model id (must match modelRow's id sanitization exactly).
+    function focusModel(bi, id) {
+      const rowId = `mmrow-${bi}-${String(id).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+      const el = document.getElementById(rowId);
+      if (!el) return;
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      el.classList.remove('mm-flash');
+      void el.offsetWidth; // restart the animation
+      el.classList.add('mm-flash');
     }
 
     // --- Memory remediation actions ---
