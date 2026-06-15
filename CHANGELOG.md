@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.15.26 — Linear app tokens self-heal (durable OAuth refresh) (#2360, #2361)
+
+Linear's `actor=app` token exchange returns a short-lived access token (~24h)
+plus a `refresh_token`, but `linear-agent setup` stored only the access token —
+so a Linear agent (carrie, clerk) went dead on expiry and needed a manual
+browser re-auth. This release makes app tokens durable: they refresh themselves.
+
+### PR — refresh core + storage + verb (#2360)
+
+- New `src/linear/oauth-refresh.ts` (pure, injectable): exchanges the refresh
+  token at Linear's token endpoint; classifies a dead refresh token (`400
+  invalid_grant`) as `revoked` — the only case needing operator re-auth — vs
+  transient failures; preserves the old refresh token when Linear doesn't
+  rotate; persists the rotated **bundle before the access token** so a failed
+  write can't strand a rotated refresh token.
+- `linear-agent setup` now stores the rotatable refresh bundle (`--refresh-token`,
+  `--token-expires-in`, and the app `--client-id`/`--client-secret`) at
+  `linear/<agent>/oauth`.
+- New `linear-agent refresh --agent <name>` verb (host-side refresh / ops seed).
+
+### PR — in-container auto-refresh on 401 (#2361)
+
+- On a Linear `401`, the runtime refreshes the token **in-container** via the
+  broker `put` op (#950 — an agent rotates keys it can already read; no operator
+  passphrase) and retries **once**. A `revoked` refresh token is logged loudly
+  (`grep 'linear token REVOKED'`) and the original 401 surfaces — bounded, no
+  loop. Wired into both `linear_agent_activity` and `linear_create_issue`.
+- `linear-agent setup` auto-grants the ACL (adds `linear/<agent>/oauth` +
+  `linear/<agent>/token` to the agent's `secrets[]`) so in-container rotation
+  works out of the box.
+
+Net: a Linear app actor self-heals on token expiry with **zero operator touch**,
+and the vault passphrase boundary is respected (all rotation happens
+in-container). Existing Linear agents need one browser re-auth via
+`setup --refresh-token …` to seed their bundle.
+
 ## v0.15.25 — permissions stop re-asking: [all] keeps grants + scoped 30-min covers Grep/Glob (#2357, #2358)
 
 Two fixes to the approval flow, both surfaced while diagnosing an admin agent
