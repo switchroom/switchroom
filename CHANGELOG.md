@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.15.25 — permissions stop re-asking: [all] keeps grants + scoped 30-min covers Grep/Glob (#2357, #2358)
+
+Two fixes to the approval flow, both surfaced while diagnosing an admin agent
+that re-asked for the same permission on every turn.
+
+### PR #2357 — `tools.allow: [all]` keeps explicit grants
+
+An agent with `tools.allow: [all]` expands to all built-in tools + the
+switchroom-managed MCP tokens, deliberately excluding privileged hostd tools,
+`Skill(...)`, and 3rd-party MCP (the leash — even an `[all]` admin approves
+those once). The intended "stop asking" path is a 🔁 Always tap, which now
+durably persists the rule into `tools.allow` as `[all, mcp__hostd__agent_logs]`
+via hostd `config_propose_edit`. But the scaffold's `[all]` branch dropped
+every explicit entry at reconcile, so the persisted grant never reached the
+agent's `settings.json` → the agent re-asked forever. Fix (both render sites):
+when `[all]` is present, keep the explicit non-`all` entries alongside the
+built-ins. Strictly additive; honors the operator's explicit grant.
+
+Also: the `switchroom apply` "manual recreate" hint now prints the real host
+compose path (via `toHostHomePath`) instead of the in-container `/host-home`
+path when apply runs inside hostd. Display-only.
+
+### PR #2358 — scoped 30-min approval covers read-only Grep/Glob
+
+The scoped 30-min window (tap ✅ Allow → the same low-risk action auto-allows
+for 30 min) had effectively never fired: `resolveTimeBox` only time-boxed
+Read/Edit/Write-with-a-path and non-destructive Bash families — tools that are
+usually pre-approved and rarely prompt — while the tools that actually prompt
+and repeat (`Grep`, `Glob`) are "broad-only" (no path sub-scope) and every
+broad rule was refused. So an agent grepping a file with several regexes
+re-asked on each one even after ✅ Allow. Fix: time-box the broad grant for
+read-only whole-tool inspection (Grep, Glob) — they can't mutate, so "any Grep
+for 30 min" is low-risk and stops the spam. Network-egress broad-only tools
+(WebFetch/WebSearch) stay per-call. Gateway-side only, TTL-bounded,
+fail-closed, kill-switch `SWITCHROOM_SCOPED_APPROVAL_TTL_MS=0` unchanged.
+
 ## v0.15.24 — scaffold bakes the host home, not the in-container /host-home (#2353)
 
 Closes the second half of the in-container-apply host-home bug class. v0.15.23
