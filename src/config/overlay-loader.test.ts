@@ -251,6 +251,21 @@ describe("applyAgentOverlays", () => {
     expect(JSON.stringify(sched[0])).not.toMatch(/overlay-title|school-alerts/i);
   });
 
+  it("does not bleed the next line into the title for a whitespace-only `# name:` header", () => {
+    const dir = overlayDir("foo");
+    // A malformed empty-value `# name:` header must NOT pull `schedule:` (the
+    // next line) in as the title — the regex stays on the comment's own line.
+    writeFileSync(
+      join(dir, "cron-feedface11.yaml"),
+      "# name:   \n" + "schedule:\n  - cron: '0 8 * * *'\n    prompt: p\n",
+    );
+    const cfg = makeConfig({ foo: { schedule: [] } });
+    applyAgentOverlays(cfg);
+    const sched = cfg.agents.foo.schedule as Array<Record<symbol, unknown>>;
+    // No `# name:` value + hash-only filename → no title at all.
+    expect(sched[0][OVERLAY_TITLE]).toBeUndefined();
+  });
+
   it("leaves OVERLAY_TITLE undefined for a hash-only cron-<hash>.yaml with no `# name:`", () => {
     const dir = overlayDir("foo");
     writeFileSync(

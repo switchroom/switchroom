@@ -84,7 +84,10 @@ export const OVERLAY_TITLE = Symbol.for("switchroom.config.overlay-title");
  * `fileName` is the basename (e.g. "weekend-planner.yaml").
  */
 function deriveOverlayTitle(raw: string, fileName: string): string | undefined {
-  const titleFromComment = raw.match(/^#\s*name:\s*(\S.*?)\s*$/m)?.[1];
+  // `[^\S\n]` = whitespace but NOT a newline, so the inter-token spacing
+  // stays on the comment's own line: a whitespace-only `# name:   ` header
+  // can't consume the newline and bleed the NEXT line in as the title.
+  const titleFromComment = raw.match(/^#[^\S\n]*name:[^\S\n]*(\S.*?)[^\S\n]*$/m)?.[1];
   if (titleFromComment) return titleFromComment;
   const base = fileName.replace(/\.ya?ml$/i, "");
   // Generic auto-generated name (cron-<6+ hex>) carries no title.
