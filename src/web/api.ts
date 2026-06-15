@@ -12,8 +12,15 @@ import {
   staleMentalModels,
   corruptedMentalModels,
   recentUnextracted,
+  ageDays,
   type BankMentalModelSummary,
 } from "../memory/bank-health.js";
+import {
+  reprocessDocuments,
+  refreshMentalModel,
+  buildUserProfile,
+  restBaseFromMcpUrl,
+} from "./memory-remediation.js";
 import {
   getHindsightStatus,
 } from "../setup/hindsight.js";
@@ -1763,6 +1770,13 @@ export interface MemoryBankHealthRow {
   /** Documents ≤30d old retained with zero extracted facts (silent extraction outage). */
   recentUnextractedCount: number;
   oldestUnextractedAt: string | null;
+  /**
+   * IDs of the recent-unextracted gap docs (the reprocess button's
+   * targets), bounded to the first 20 so a huge backlog can't bloat the
+   * payload. Server re-derives these on the POST — the client never
+   * supplies them.
+   */
+  unextractedDocIds: string[];
   mentalModels: BankMentalModelSummary[];
   staleMentalModelCount: number;
   /** Models whose content is a persisted LLM-failure message (quota wall during refresh). */
@@ -1808,6 +1822,11 @@ export async function handleGetMemoryHealth(
       const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
       const stale = staleMentalModels(h.mentalModels, 7, now);
       const corrupted = corruptedMentalModels(h.mentalModels);
+      const newestAge = ageDays(h.newestDocumentAt, now);
+      // Mirror doctor.ts's "pending queue may be stuck" warn: pending
+      // operations AND no new documents for >1d.
+      const pendingStuck =
+        h.pendingOperations > 0 && newestAge !== null && newestAge > 1;
       let status: MemoryBankHealthRow["status"] = "ok";
       let statusDetail = "facts flowing";
       if (!h.ok) {
@@ -1819,6 +1838,10 @@ export async function handleGetMemoryHealth(
       } else if (gaps.length > 0) {
         status = "fail";
         statusDetail = `${gaps.length} recent conversation(s) stored with zero extracted facts — invisible to recall`;
+      } else if (pendingStuck) {
+        // Doctor precedence: after gaps, before stale.
+        status = "warn";
+        statusDetail = `${h.pendingOperations} memory operation(s) pending with no new documents for ${Math.round(newestAge)}d — pipeline may be stuck`;
       } else if (stale.length > 0) {
         status = "warn";
         statusDetail = `${stale.length} mental model(s) not refreshed in >7d`;
@@ -1837,6 +1860,7 @@ export async function handleGetMemoryHealth(
         newestDocumentAt: h.newestDocumentAt,
         recentUnextractedCount: gaps.length,
         oldestUnextractedAt: gaps[0]?.createdAt ?? null,
+        unextractedDocIds: gaps.slice(0, 20).map((d) => d.id),
         mentalModels: h.mentalModels,
         staleMentalModelCount: stale.length,
         corruptedMentalModelNames: corrupted.map((m) => m.name),
@@ -1848,6 +1872,144 @@ export async function handleGetMemoryHealth(
 
   rows.sort((a, b) => a.bank.localeCompare(b.bank));
   return { reachable, url, banks: rows };
+}
+
+/**
+ * Resolve the configured hindsight MCP url (default 127.0.0.1:18888).
+ * Shared by the memory-remediation handlers below.
+ */
+function resolveMemoryUrl(config: SwitchroomConfig): string {
+  return (
+    (config.memory?.config?.url as string | undefined) ??
+    "http://127.0.0.1:18888/mcp/"
+  );
+}
+
+/**
+ * Is `bank` a real memory bank for this fleet? Used to gate the
+ * remediation POSTs so the dashboard can't poke an arbitrary bank.
+ */
+function isKnownBank(config: SwitchroomConfig, bank: string): boolean {
+  for (const agentName of Object.keys(config.agents)) {
+    if (getCollectionForAgent(agentName, config) === bank) return true;
+  }
+  return false;
+}
+
+/**
+ * POST /api/memory/reprocess — re-extract facts from the stuck (gap)
+ * documents of a bank.
+ *
+ * The doc IDs are re-derived SERVER-SIDE from the live inspect result
+ * (NOT trusted from the client) so a loopback-forgeable dashboard POST
+ * can't reprocess arbitrary documents. Triggers only; hindsight runs
+ * the extraction on its own provider — the web makes no model call.
+ * Never throws.
+ */
+export async function handleMemoryReprocess(
+  config: SwitchroomConfig,
+  body: { bank?: unknown },
+  deps?: {
+    fetchImpl?: typeof fetch;
+    trigger?: typeof reprocessDocuments;
+    inspect?: typeof inspectBankHealth;
+    now?: Date;
+  },
+): Promise<{ ok: boolean; triggered?: number; failed?: number; error?: string }> {
+  const bank = typeof body.bank === "string" ? body.bank : "";
+  if (!bank) return { ok: false, error: "Body must include `bank` (string)." };
+  if (!isKnownBank(config, bank)) return { ok: false, error: `Unknown bank: ${bank}` };
+
+  const url = resolveMemoryUrl(config);
+  const inspect = deps?.inspect ?? inspectBankHealth;
+  const trigger = deps?.trigger ?? reprocessDocuments;
+  const now = deps?.now ?? new Date();
+
+  try {
+    const h = await inspect(url, bank, { fetchImpl: deps?.fetchImpl });
+    if (!h.ok) return { ok: false, error: `inspection failed: ${h.reason ?? "unknown"}` };
+    const gaps = recentUnextracted(h.unextractedDocuments, 30, now);
+    const docIds = gaps.slice(0, 20).map((d) => d.id);
+    if (docIds.length === 0) return { ok: true, triggered: 0, failed: 0 };
+
+    const result = await trigger(restBaseFromMcpUrl(url), bank, docIds, {
+      fetchImpl: deps?.fetchImpl,
+    });
+    return {
+      ok: result.failed === 0,
+      triggered: result.triggered,
+      failed: result.failed,
+      ...(result.error ? { error: result.error } : {}),
+    };
+  } catch (err) {
+    return { ok: false, error: String((err as Error).message ?? err) };
+  }
+}
+
+/**
+ * POST /api/memory/refresh-model — regenerate one mental model (fixes a
+ * corrupted or stale model).
+ *
+ * `modelId` is validated against the bank's ACTUAL mental models (live
+ * inspect) before any POST, so the dashboard can't refresh an arbitrary
+ * model id. Triggers only; no model call from the web. Never throws.
+ */
+export async function handleMemoryRefreshModel(
+  config: SwitchroomConfig,
+  body: { bank?: unknown; modelId?: unknown },
+  deps?: {
+    fetchImpl?: typeof fetch;
+    trigger?: typeof refreshMentalModel;
+    inspect?: typeof inspectBankHealth;
+  },
+): Promise<{ ok: boolean; error?: string }> {
+  const bank = typeof body.bank === "string" ? body.bank : "";
+  const modelId = typeof body.modelId === "string" ? body.modelId : "";
+  if (!bank) return { ok: false, error: "Body must include `bank` (string)." };
+  if (!modelId) return { ok: false, error: "Body must include `modelId` (string)." };
+  if (!isKnownBank(config, bank)) return { ok: false, error: `Unknown bank: ${bank}` };
+
+  const url = resolveMemoryUrl(config);
+  const inspect = deps?.inspect ?? inspectBankHealth;
+  const trigger = deps?.trigger ?? refreshMentalModel;
+
+  try {
+    const h = await inspect(url, bank, { fetchImpl: deps?.fetchImpl });
+    if (!h.ok) return { ok: false, error: `inspection failed: ${h.reason ?? "unknown"}` };
+    if (!h.mentalModels.some((m) => m.id === modelId)) {
+      return { ok: false, error: `Unknown mental model for bank ${bank}` };
+    }
+
+    return await trigger(restBaseFromMcpUrl(url), bank, modelId, {
+      fetchImpl: deps?.fetchImpl,
+    });
+  } catch (err) {
+    return { ok: false, error: String((err as Error).message ?? err) };
+  }
+}
+
+/**
+ * POST /api/memory/build-profile — create-if-missing the user-profile
+ * mental model for a bank (the "knows you" feature). Triggers hindsight
+ * to build it on its own provider; no model call from the web. Never
+ * throws.
+ */
+export async function handleMemoryBuildProfile(
+  config: SwitchroomConfig,
+  body: { bank?: unknown },
+  deps?: { fetchImpl?: typeof fetch; trigger?: typeof buildUserProfile },
+): Promise<{ ok: boolean; error?: string }> {
+  const bank = typeof body.bank === "string" ? body.bank : "";
+  if (!bank) return { ok: false, error: "Body must include `bank` (string)." };
+  if (!isKnownBank(config, bank)) return { ok: false, error: `Unknown bank: ${bank}` };
+
+  const url = resolveMemoryUrl(config);
+  const trigger = deps?.trigger ?? buildUserProfile;
+  try {
+    return await trigger(url, bank, { fetchImpl: deps?.fetchImpl });
+  } catch (err) {
+    return { ok: false, error: String((err as Error).message ?? err) };
+  }
 }
 
 /**

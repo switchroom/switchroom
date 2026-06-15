@@ -30,6 +30,9 @@ import {
   handleUseAccount,
   handleGetSystemHealth,
   handleGetMemoryHealth,
+  handleMemoryReprocess,
+  handleMemoryRefreshModel,
+  handleMemoryBuildProfile,
   handleGetGoogleAccounts,
   handleGetMicrosoftAccounts,
   handleSetConnectionAccess,
@@ -470,6 +473,26 @@ function parseRoute(
   // GET /api/memory-health
   if (method === "GET" && pathname === "/api/memory-health") {
     return { handler: "getMemoryHealth", params: {} };
+  }
+
+  // POST /api/memory/reprocess  body: { bank }
+  // Re-extract facts from a bank's stuck (gap) documents. The web only
+  // POKES hindsight's REST API — hindsight does the LLM work on its own
+  // provider; no model call from the dashboard.
+  if (method === "POST" && pathname === "/api/memory/reprocess") {
+    return { handler: "memoryReprocess", params: {} };
+  }
+
+  // POST /api/memory/refresh-model  body: { bank, modelId }
+  // Regenerate one mental model (fixes a corrupted/stale model).
+  if (method === "POST" && pathname === "/api/memory/refresh-model") {
+    return { handler: "memoryRefreshModel", params: {} };
+  }
+
+  // POST /api/memory/build-profile  body: { bank }
+  // Create-if-missing the user-profile mental model for a bank.
+  if (method === "POST" && pathname === "/api/memory/build-profile") {
+    return { handler: "memoryBuildProfile", params: {} };
   }
 
   // GET /api/google-accounts
@@ -926,6 +949,48 @@ export function startWebServer(
               const force = body.force === true;
               const result = await handleRefreshAccountsQuota(labels, force);
               return jsonResponse(result, result.ok ? 200 : 502);
+            })();
+          }
+
+          case "memoryReprocess": {
+            return (async () => {
+              let body: { bank?: unknown } = {};
+              try {
+                const raw = await req.text();
+                body = raw ? JSON.parse(raw) : {};
+              } catch {
+                return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+              }
+              const result = await handleMemoryReprocess(freshConfig(), body);
+              return jsonResponse(result, result.ok ? 200 : 400);
+            })();
+          }
+
+          case "memoryRefreshModel": {
+            return (async () => {
+              let body: { bank?: unknown; modelId?: unknown } = {};
+              try {
+                const raw = await req.text();
+                body = raw ? JSON.parse(raw) : {};
+              } catch {
+                return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+              }
+              const result = await handleMemoryRefreshModel(freshConfig(), body);
+              return jsonResponse(result, result.ok ? 200 : 400);
+            })();
+          }
+
+          case "memoryBuildProfile": {
+            return (async () => {
+              let body: { bank?: unknown } = {};
+              try {
+                const raw = await req.text();
+                body = raw ? JSON.parse(raw) : {};
+              } catch {
+                return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+              }
+              const result = await handleMemoryBuildProfile(freshConfig(), body);
+              return jsonResponse(result, result.ok ? 200 : 400);
             })();
           }
 

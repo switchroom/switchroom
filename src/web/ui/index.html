@@ -610,7 +610,16 @@
         if (isNaN(d)) return '';
         return d < 1 ? 'today' : `${Math.round(d)}d ago`;
       };
+      // A bank "has a user-profile model" if any mental model is named
+      // like user-profile (mirrors hindsight's exact-name check, but
+      // tolerant of the "User Profile" display variant for the UI hint).
+      const hasUserProfile = (b) => (b.mentalModels || []).some(mm =>
+        /^user[- ]?profile$/i.test(String(mm.name || '')));
+      // JSON for a single-quoted onclick attribute: escape the quote
+      // chars that could break out of the attribute (', &, <, >).
+      const attrJson = (v) => escapeHtml(JSON.stringify(v));
       const cards = (m.banks || []).map(b => {
+        const bankJs = attrJson(b.bank);
         const models = (b.mentalModels || []).map(mm => {
           const ts = mm.lastRefreshedAt || mm.createdAt;
           const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
@@ -621,6 +630,38 @@
           : '';
         const corruptLine = (b.corruptedMentalModelNames || []).length > 0
           ? `<div style="color:var(--red);margin-top:.4rem">⚠ corrupted mental model(s): ${escapeHtml(b.corruptedMentalModelNames.join(', '))} — content is an LLM failure message; refresh once quota recovers</div>`
+          : '';
+        // --- Remediation buttons (audit ranks 7 + 22) ---
+        // Each triggers an HTTP poke at hindsight; hindsight does the LLM
+        // work on its own provider — the dashboard makes NO model call.
+        const buttons = [];
+        // Reprocess the extraction-gap docs.
+        if (b.recentUnextractedCount > 0) {
+          const n = Math.min(b.recentUnextractedCount, (b.unextractedDocIds || []).length) || b.recentUnextractedCount;
+          buttons.push(`<button class="btn" type="button" onclick='memReprocess(${bankJs}, this)'>Reprocess ${n} doc${n === 1 ? '' : 's'}</button>`);
+        }
+        // Refresh each corrupted/stale model (map corrupted NAME → id).
+        const affectedIds = new Set();
+        for (const name of (b.corruptedMentalModelNames || [])) {
+          const mm = (b.mentalModels || []).find(x => x.name === name);
+          if (mm && mm.id) affectedIds.add(mm.id);
+        }
+        for (const mm of (b.mentalModels || [])) {
+          const ts = mm.lastRefreshedAt || mm.createdAt;
+          const stale = ts && (Date.now() - Date.parse(ts)) > 7 * 86400000;
+          if (stale && mm.id) affectedIds.add(mm.id);
+        }
+        for (const mm of (b.mentalModels || [])) {
+          if (!affectedIds.has(mm.id)) continue;
+          const idJs = attrJson(mm.id), nameJs = attrJson(mm.name);
+          buttons.push(`<button class="btn" type="button" onclick='memRefreshModel(${bankJs}, ${idJs}, ${nameJs}, this)'>Refresh ${escapeHtml(mm.name)}</button>`);
+        }
+        // Build the user-profile model when the bank has data but no profile.
+        if (b.totalDocuments > 0 && !hasUserProfile(b)) {
+          buttons.push(`<button class="btn" type="button" onclick='memBuildProfile(${bankJs}, this)'>Build profile</button>`);
+        }
+        const buttonRow = buttons.length
+          ? `<div class="rem-actions" style="margin-top:.6rem;display:flex;flex-wrap:wrap;gap:.4rem">${buttons.join('')}</div>`
           : '';
         return `<div class="agent-card">
           <div class="card-header" style="cursor:default">
@@ -638,10 +679,57 @@
             ${models ? `<div class="card-meta" style="padding:.4rem 0 0">${models}</div>` : ''}
             ${corruptLine}
             ${gapLine}
+            ${buttonRow}
           </div>
         </div>`;
       }).join('');
       container.innerHTML = `<div class="agents-grid">${cards || '<div style="color:var(--text-dim)">No agent banks configured.</div>'}</div>`;
+    }
+
+    // --- Memory remediation actions ---
+    // Each pokes a hindsight REST/MCP endpoint via the web's POST routes.
+    // Hindsight does the LLM extraction on its OWN claude-code provider;
+    // the dashboard never calls a model. A confirm() gates each because
+    // it consumes subscription quota (low-risk, but explicit).
+    const REM_CONFIRM = 'This triggers memory re-processing on the subscription. Continue?';
+
+    // `label` names the action for the failure toast; `successMsg(data)`
+    // builds the success toast from the response body.
+    async function memRemediate(btn, url, payload, working, label, successMsg) {
+      if (!confirm(REM_CONFIRM)) return;
+      const orig = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = working; }
+      try {
+        const res = await fetch(`${API}${url}`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          showToast(`${label} failed: ${data.error || `HTTP ${res.status}`}`, false);
+        } else {
+          showToast(successMsg(data), true);
+        }
+      } catch (err) {
+        showToast(`${label} failed: ${err.message}`, false);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = orig; }
+        fetchMemoryHealth();
+      }
+    }
+
+    function memReprocess(bank, btn) {
+      memRemediate(btn, '/api/memory/reprocess', { bank }, 'Reprocessing…', 'Reprocess',
+        (d) => `Reprocess triggered (${d.triggered ?? 0} doc${(d.triggered ?? 0) === 1 ? '' : 's'}${d.failed ? `, ${d.failed} failed` : ''})`);
+    }
+    function memRefreshModel(bank, modelId, name, btn) {
+      memRemediate(btn, '/api/memory/refresh-model', { bank, modelId }, 'Refreshing…', 'Refresh',
+        () => `Refresh triggered for ${name}`);
+    }
+    function memBuildProfile(bank, btn) {
+      memRemediate(btn, '/api/memory/build-profile', { bank }, 'Building…', 'Build profile',
+        () => 'Profile build triggered');
     }
 
     async function fetchConnections() {

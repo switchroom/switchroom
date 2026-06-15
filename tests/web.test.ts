@@ -117,6 +117,9 @@ import {
   __resetQuotaCacheForTests,
   __resetAgentStatusCacheForTests,
   handleGetSummary,
+  handleMemoryReprocess,
+  handleMemoryRefreshModel,
+  handleMemoryBuildProfile,
   __resetDashboardCacheForTests,
   type AgentInfo,
   type SystemHealth,
@@ -1734,5 +1737,263 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
     release();
     const out = await p;
     expect(out.agents).toEqual(fakeAgents);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memory remediation handlers (audit ranks 7 + 22). These are HTTP pokes at
+// hindsight — they make ZERO model calls. Tests inject the inspect/trigger
+// deps so they never touch a real hindsight instance.
+// ---------------------------------------------------------------------------
+describe("memory remediation handlers", () => {
+  // mockConfig agents: coach (bank "coach-mem"), sage (bank "sage").
+  const mkBankHealth = (over: Partial<{
+    ok: boolean;
+    reason?: string;
+    totalDocuments: number;
+    totalFacts: number;
+    pendingOperations: number;
+    newestDocumentAt: string | null;
+    unextractedDocuments: Array<{ id: string; createdAt: string; textLength: number; memoryUnitCount: number }>;
+    mentalModels: Array<{ id: string; name: string; lastRefreshedAt: string | null; createdAt: string | null; contentLength: number; contentHead: string }>;
+  }> = {}) => ({
+    bankId: "coach-mem",
+    ok: true,
+    totalDocuments: 5,
+    totalFacts: 20,
+    pendingOperations: 0,
+    newestDocumentAt: new Date().toISOString(),
+    unextractedDocuments: [],
+    mentalModels: [],
+    ...over,
+  });
+
+  describe("handleMemoryReprocess", () => {
+    it("rejects an unknown bank without inspecting", async () => {
+      const inspect = vi.fn();
+      const trigger = vi.fn();
+      const r = await handleMemoryReprocess(mockConfig, { bank: "nope" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Unknown bank");
+      expect(inspect).not.toHaveBeenCalled();
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("rejects a missing bank", async () => {
+      const r = await handleMemoryReprocess(mockConfig, {}, {});
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("bank");
+    });
+
+    it("re-derives gap doc ids server-side and triggers reprocess", async () => {
+      const now = new Date();
+      const recent = new Date(now.getTime() - 86400000).toISOString();
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          unextractedDocuments: [
+            { id: "doc-a", createdAt: recent, textLength: 5000, memoryUnitCount: 0 },
+            { id: "doc-b", createdAt: recent, textLength: 5000, memoryUnitCount: 0 },
+          ],
+        }),
+      );
+      let passedIds: string[] = [];
+      const trigger = vi.fn(async (_base: string, _bank: string, ids: string[]) => {
+        passedIds = ids;
+        return { triggered: ids.length, failed: 0 };
+      });
+      const r = await handleMemoryReprocess(mockConfig, { bank: "coach-mem" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+        now,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.triggered).toBe(2);
+      expect(r.failed).toBe(0);
+      expect(passedIds.sort()).toEqual(["doc-a", "doc-b"]);
+      // The trigger gets the REST base (no /mcp/), not the raw doc list from the body.
+      expect(trigger.mock.calls[0][0]).toBe("http://127.0.0.1:18888");
+    });
+
+    it("ignores client-supplied doc ids — only inspected gaps are used", async () => {
+      const inspect = vi.fn(async () => mkBankHealth({ unextractedDocuments: [] }));
+      const trigger = vi.fn();
+      const r = await handleMemoryReprocess(
+        mockConfig,
+        { bank: "coach-mem", docIds: ["evil-1"] } as never,
+        { inspect: inspect as never, trigger: trigger as never },
+      );
+      // No gaps from inspect → no-op, trigger never called with arbitrary ids.
+      expect(r.ok).toBe(true);
+      expect(r.triggered).toBe(0);
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("maps a failed inspection to ok:false", async () => {
+      const inspect = vi.fn(async () => mkBankHealth({ ok: false, reason: "Timeout" }));
+      const r = await handleMemoryReprocess(mockConfig, { bank: "coach-mem" }, {
+        inspect: inspect as never,
+        trigger: vi.fn() as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Timeout");
+    });
+
+    it("reports failed > 0 as ok:false but still surfaces counts", async () => {
+      const now = new Date();
+      const recent = new Date(now.getTime() - 86400000).toISOString();
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          unextractedDocuments: [
+            { id: "doc-a", createdAt: recent, textLength: 5000, memoryUnitCount: 0 },
+          ],
+        }),
+      );
+      const trigger = vi.fn(async () => ({ triggered: 0, failed: 1, error: "HTTP 500" }));
+      const r = await handleMemoryReprocess(mockConfig, { bank: "coach-mem" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+        now,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.failed).toBe(1);
+      expect(r.error).toBe("HTTP 500");
+    });
+
+    it("never throws — a throwing trigger is caught and mapped to ok:false", async () => {
+      const now = new Date();
+      const recent = new Date(now.getTime() - 86400000).toISOString();
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          unextractedDocuments: [
+            { id: "doc-a", createdAt: recent, textLength: 5000, memoryUnitCount: 0 },
+          ],
+        }),
+      );
+      const trigger = vi.fn(async () => {
+        throw new Error("boom");
+      });
+      const r = await handleMemoryReprocess(mockConfig, { bank: "coach-mem" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+        now,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("boom");
+    });
+  });
+
+  describe("handleMemoryRefreshModel", () => {
+    it("rejects an unknown bank", async () => {
+      const r = await handleMemoryRefreshModel(mockConfig, { bank: "nope", modelId: "m" }, {
+        inspect: vi.fn() as never,
+        trigger: vi.fn() as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Unknown bank");
+    });
+
+    it("rejects a missing modelId", async () => {
+      const r = await handleMemoryRefreshModel(mockConfig, { bank: "coach-mem" }, {});
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("modelId");
+    });
+
+    it("rejects a modelId not belonging to the bank (no arbitrary POST)", async () => {
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          mentalModels: [
+            { id: "mm-1", name: "user-profile", lastRefreshedAt: null, createdAt: null, contentLength: 10, contentHead: "x" },
+          ],
+        }),
+      );
+      const trigger = vi.fn();
+      const r = await handleMemoryRefreshModel(mockConfig, { bank: "coach-mem", modelId: "forged-id" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Unknown mental model");
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("triggers a refresh for a valid model id", async () => {
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          mentalModels: [
+            { id: "mm-1", name: "user-profile", lastRefreshedAt: null, createdAt: null, contentLength: 10, contentHead: "x" },
+          ],
+        }),
+      );
+      const trigger = vi.fn(async () => ({ ok: true as const }));
+      const r = await handleMemoryRefreshModel(mockConfig, { bank: "coach-mem", modelId: "mm-1" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(true);
+      expect(trigger).toHaveBeenCalledWith(
+        "http://127.0.0.1:18888",
+        "coach-mem",
+        "mm-1",
+        expect.anything(),
+      );
+    });
+
+    it("maps a trigger failure to ok:false with error", async () => {
+      const inspect = vi.fn(async () =>
+        mkBankHealth({
+          mentalModels: [
+            { id: "mm-1", name: "x", lastRefreshedAt: null, createdAt: null, contentLength: 0, contentHead: "" },
+          ],
+        }),
+      );
+      const trigger = vi.fn(async () => ({ ok: false, error: "HTTP 502" }));
+      const r = await handleMemoryRefreshModel(mockConfig, { bank: "coach-mem", modelId: "mm-1" }, {
+        inspect: inspect as never,
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe("HTTP 502");
+    });
+  });
+
+  describe("handleMemoryBuildProfile", () => {
+    it("rejects an unknown bank", async () => {
+      const trigger = vi.fn();
+      const r = await handleMemoryBuildProfile(mockConfig, { bank: "nope" }, {
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("Unknown bank");
+      expect(trigger).not.toHaveBeenCalled();
+    });
+
+    it("rejects a missing bank", async () => {
+      const r = await handleMemoryBuildProfile(mockConfig, {}, {});
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain("bank");
+    });
+
+    it("triggers buildUserProfile with the MCP url (not the REST base)", async () => {
+      const trigger = vi.fn(async () => ({ ok: true }));
+      const r = await handleMemoryBuildProfile(mockConfig, { bank: "coach-mem" }, {
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(true);
+      // buildUserProfile takes the MCP url (with /mcp/), not the REST base.
+      expect(trigger.mock.calls[0][0]).toBe("http://127.0.0.1:18888/mcp/");
+      expect(trigger.mock.calls[0][1]).toBe("coach-mem");
+    });
+
+    it("maps a trigger failure to ok:false", async () => {
+      const trigger = vi.fn(async () => ({ ok: false, error: "MCP error" }));
+      const r = await handleMemoryBuildProfile(mockConfig, { bank: "sage" }, {
+        trigger: trigger as never,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toBe("MCP error");
+    });
   });
 });
