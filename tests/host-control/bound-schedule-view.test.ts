@@ -66,7 +66,7 @@ describe("boundScheduleView", () => {
 
   it("truncates each fire's outputSummary to the cap", () => {
     const long = "y".repeat(SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS + 50);
-    const { recentByAgent } = boundScheduleView([], {
+    const { recentByAgent } = boundScheduleView([entry()], {
       clerk: [fire({ outputSummary: long })],
     });
     expect(recentByAgent.clerk[0].outputSummary).toHaveLength(
@@ -78,7 +78,7 @@ describe("boundScheduleView", () => {
     const many = Array.from({ length: SCHEDULE_MAX_FIRES_PER_CRON + 5 }, (_, i) =>
       fire({ promptKey: "k1", startedAt: i, finishedAt: i + 1, exitCode: i }),
     );
-    const { recentByAgent } = boundScheduleView([], { clerk: many });
+    const { recentByAgent } = boundScheduleView([entry({ promptKey: "k1" })], { clerk: many });
     expect(recentByAgent.clerk).toHaveLength(SCHEDULE_MAX_FIRES_PER_CRON);
     // The last fire (highest startedAt) survives; the oldest is dropped.
     expect(recentByAgent.clerk.at(-1)!.startedAt).toBe(
@@ -93,12 +93,30 @@ describe("boundScheduleView", () => {
       fire({ promptKey: "busy", startedAt: i }),
     );
     const quiet = [fire({ promptKey: "quiet", startedAt: 1000 }), fire({ promptKey: "quiet", startedAt: 1001 })];
-    const { recentByAgent } = boundScheduleView([], { clerk: [...busy, ...quiet] });
+    const { recentByAgent } = boundScheduleView(
+      [entry({ promptKey: "busy" }), entry({ promptKey: "quiet" })],
+      { clerk: [...busy, ...quiet] },
+    );
     const byKey = (k: string) => recentByAgent.clerk.filter((f) => f.promptKey === k);
     // Busy cron capped at N; quiet cron's 2 fires SURVIVE (the old per-agent
     // cap would have dropped them entirely).
     expect(byKey("busy")).toHaveLength(SCHEDULE_MAX_FIRES_PER_CRON);
     expect(byKey("quiet")).toHaveLength(2);
+  });
+
+  it("drops fires for OBSOLETE crons (promptKey not among current entries)", () => {
+    // A long-lived agent accumulates fires for old prompt versions (edited
+    // crons → new keys). Those must be dropped — the UI matches fires to a
+    // current cron by promptKey, and keeping them blew the frame budget.
+    const { recentByAgent } = boundScheduleView([entry({ promptKey: "current" })], {
+      clerk: [
+        fire({ promptKey: "current", startedAt: 1 }),
+        fire({ promptKey: "obsolete-v1", startedAt: 2 }),
+        fire({ promptKey: "obsolete-v2", startedAt: 3 }),
+      ],
+    });
+    expect(recentByAgent.clerk).toHaveLength(1);
+    expect(recentByAgent.clerk[0].promptKey).toBe("current");
   });
 
   it("does not mutate the input objects (purity)", () => {
@@ -112,10 +130,13 @@ describe("boundScheduleView", () => {
   });
 
   it("passes through multiple agents independently", () => {
-    const { recentByAgent } = boundScheduleView([], {
-      clerk: [fire({ agent: "clerk" })],
-      marko: [fire({ agent: "marko" }), fire({ agent: "marko" })],
-    });
+    const { recentByAgent } = boundScheduleView(
+      [entry({ agent: "clerk" }), entry({ agent: "marko" })],
+      {
+        clerk: [fire({ agent: "clerk" })],
+        marko: [fire({ agent: "marko" }), fire({ agent: "marko" })],
+      },
+    );
     expect(recentByAgent.clerk).toHaveLength(1);
     expect(recentByAgent.marko).toHaveLength(2);
   });
@@ -163,12 +184,15 @@ describe("boundScheduleView", () => {
   });
 
   it("preserves each fire's promptKey (the cron↔fire match key)", () => {
-    const { recentByAgent } = boundScheduleView([], {
-      clerk: [
-        fire({ promptKey: "cron-a-key", outputSummary: "ok" }),
-        fire({ promptKey: "cron-b-key", outputSummary: "ok" }),
-      ],
-    });
+    const { recentByAgent } = boundScheduleView(
+      [entry({ promptKey: "cron-a-key" }), entry({ promptKey: "cron-b-key" })],
+      {
+        clerk: [
+          fire({ promptKey: "cron-a-key", outputSummary: "ok" }),
+          fire({ promptKey: "cron-b-key", outputSummary: "ok" }),
+        ],
+      },
+    );
     expect(recentByAgent.clerk.map((f) => f.promptKey)).toEqual([
       "cron-a-key",
       "cron-b-key",
@@ -177,7 +201,7 @@ describe("boundScheduleView", () => {
 
   it("preserves promptKey even on a fire whose outputSummary is truncated", () => {
     const long = "y".repeat(SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS + 50);
-    const { recentByAgent } = boundScheduleView([], {
+    const { recentByAgent } = boundScheduleView([entry({ promptKey: "kept-key" })], {
       clerk: [fire({ promptKey: "kept-key", outputSummary: long })],
     });
     expect(recentByAgent.clerk[0].promptKey).toBe("kept-key");
