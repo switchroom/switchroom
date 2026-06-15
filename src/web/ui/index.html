@@ -992,23 +992,39 @@
     }
 
     function renderAgentDetail(name) {
+      // Wrapped so a single malformed detail can NEVER throw into render()'s
+      // agents.map and blank the whole grid. (The accounts.assigned crash this
+      // replaces did exactly that: it read a field the API renamed to
+      // {active, details} post-RFC-H, threw a TypeError on every open panel,
+      // and aborted the map → the entire Agents tab went blank on each poll.)
+      try {
+        return renderAgentDetailInner(name);
+      } catch (err) {
+        return `<div style="color:var(--red)">Detail render failed: ${escapeHtml((err && err.message) || String(err))}</div>`;
+      }
+    }
+
+    function renderAgentDetailInner(name) {
       const d = agentDetails[name];
       if (!d) return '<div style="color:var(--text-dim)">Loading…</div>';
       const accounts = d.accounts;
       const subagents = d.subagents;
       const config = d.config;
 
+      // handleGetAgentAccounts returns { active: string|null, details: AccountInfo[] }
+      // — the single bound account (fleet-active or per-agent auth.override),
+      // NOT the pre-RFC-H assigned[] list.
       let accountsHtml;
-      if (!accounts || accounts.assigned.length === 0) {
-        accountsHtml = '<div style="color:var(--text-dim)">No accounts assigned (falls back to <code>default</code>).</div>';
+      const activeLabel = accounts && accounts.active;
+      if (!activeLabel) {
+        accountsHtml = '<div style="color:var(--text-dim)">No per-agent account override — uses the fleet-active account.</div>';
       } else {
-        const byLabel = new Map((accounts.details || []).map(d => [d.label, d]));
-        accountsHtml = accounts.assigned.map((label, i) => {
-          const info = byLabel.get(label);
-          if (!info) return `<span class="chip missing" title="not in ~/.switchroom/accounts/">${escapeHtml(label)} · missing</span>`;
-          const tag = i === 0 ? ' · primary' : '';
-          return `<span class="chip"><span class="health-badge ${escapeHtml(info.health)}" style="margin-right:0.4rem">${escapeHtml(info.health)}</span>${escapeHtml(label)}${tag}</span>`;
-        }).join('');
+        const info = (accounts.details || []).find(x => x && x.label === activeLabel);
+        if (!info) {
+          accountsHtml = `<span class="chip missing" title="bound account not found in ~/.switchroom/accounts/">${escapeHtml(activeLabel)} · missing</span>`;
+        } else {
+          accountsHtml = `<span class="chip"><span class="health-badge ${escapeHtml(info.health)}" style="margin-right:0.4rem">${escapeHtml(info.health)}</span>${escapeHtml(activeLabel)} · bound</span>`;
+        }
       }
 
       let subHtml;
@@ -1021,7 +1037,7 @@
       const configText = config ? JSON.stringify(config, null, 2) : '(unavailable)';
 
       return `
-        <h4>Accounts</h4>${accountsHtml}
+        <h4>Account</h4>${accountsHtml}
         <h4>Sub-agents</h4>${subHtml}
         <h4>Resolved config</h4><pre class="config-pre">${escapeHtml(configText)}</pre>
       `;
@@ -1071,7 +1087,7 @@
           fiveH: pctCell(u ? u.fiveHourPct : null, '5h', a.quotaStale, u ? u.fiveHourResetAt : null),
           sevenD: pctCell(u ? u.sevenDayPct : null, '7d', a.quotaStale, u ? u.sevenDayResetAt : null),
           captured: u && u.capturedAt
-            ? formatTimestamp(u.capturedAt)
+            ? `${formatTimestamp(u.capturedAt)}${a.quotaUsageSource === 'broker-cache' ? '<div style="font-size:.7rem;color:var(--text-dim)">broker cache (free)</div>' : ''}`
             : '<span style="color:var(--text-dim)">never</span>',
           exhaustedCell: q == null
             ? '<span style="color:var(--text-dim)">broker offline</span>'
@@ -1221,15 +1237,33 @@
       } else if (!hd.recent || hd.recent.length === 0) {
         hostdBody = dim('audit log present, no entries');
       } else {
+        // Tri-state, not a binary ok/!ok — async mutations log a `started`
+        // row (exit_code null) that is NOT a failure; painting it red made the
+        // panel a wall of false-alarm red. Map: error/non-zero exit → red,
+        // denied → grey, started/in-flight → blue, completed+exit0 → green.
+        const verbStatus = (e) => {
+          if (e.result === 'denied') return { cls: 'denied', dotStyle: 'background:var(--text-dim)', label: 'denied' };
+          if (e.result === 'error' || (e.exit_code != null && e.exit_code !== 0))
+            return { cls: 'err', dotStyle: 'background:var(--red)', label: e.result || 'error' };
+          if (e.result === 'started' || e.exit_code == null)
+            return { cls: 'started', dotStyle: 'background:var(--blue);box-shadow:0 0 6px var(--blue)', label: e.result || 'in progress' };
+          return { cls: 'ok', dotStyle: 'background:var(--green);box-shadow:0 0 6px var(--green)', label: e.result || 'ok' };
+        };
         const rows = hd.recent.slice().reverse().map(e => {
           const caller = e.caller && e.caller.kind === 'agent' ? escapeHtml(e.caller.name) : 'operator';
-          const ok = e.result === 'ok' || e.exit_code === 0;
+          const st = verbStatus(e);
+          // The one diagnostic field — stderr_tail/error — was previously
+          // dropped, making EROFS/reconcile failures unreadable. Surface it.
+          const detail = e.stderr_tail || e.error;
+          const detailRow = (st.cls === 'err' || st.cls === 'denied') && detail
+            ? `<tr><td colspan="4" style="color:var(--red);font-size:.72rem;white-space:pre-wrap;word-break:break-word;padding-top:0">${escapeHtml(String(detail).slice(0, 400))}</td></tr>`
+            : '';
           return `<tr>
-            <td>${dot(ok)} ${escapeHtml(e.op || '?')}</td>
+            <td><span class="status-dot" style="display:inline-block;vertical-align:middle;${st.dotStyle}"></span> ${escapeHtml(e.op || '?')}</td>
             <td>${caller}</td>
-            <td>${escapeHtml(e.result || '?')}${e.exit_code != null ? ` (${e.exit_code})` : ''}</td>
+            <td>${escapeHtml(st.label)}${e.exit_code != null ? ` (${e.exit_code})` : ''}</td>
             <td>${escapeHtml(shortTs(e.ts))}</td>
-          </tr>`;
+          </tr>${detailRow}`;
         }).join('');
         hostdBody = `<table class="accounts-table" style="margin-top:0.5rem">
           <thead><tr><th>Verb</th><th>Caller</th><th>Result</th><th>When</th></tr></thead>
@@ -1267,9 +1301,18 @@
     function renderOAuthAccountCard(a, opts) {
       const provider = (opts && opts.provider) || '';
       const agentNames = (opts && opts.agentNames) || [];
-      const expires = a.expiresAt ? formatTimestamp(a.expiresAt) : _dimC('—');
+      // expiresAt is the SHORT-LIVED access-token expiry, NOT connection
+      // health. For a broker-known slot the refresh token keeps it alive, so a
+      // past value means "lazily refreshes on next use" — rendering it as
+      // "Expires 23d ago" made healthy connected accounts look broken (the
+      // "connections aren't accurate" complaint). Don't alarm on it.
+      const expires = !a.expiresAt
+        ? _dimC('—')
+        : (a.brokerKnown && a.expiresAt < Date.now())
+          ? '<span style="color:var(--text-dim)">auto-refreshes</span>'
+          : formatTimestamp(a.expiresAt);
       const known = a.brokerKnown
-        ? '<span class="usage-pill primary">slot present</span>'
+        ? '<span class="usage-pill primary">connected</span>'
         : '<span style="color:var(--yellow)">config-only (no broker slot)</span>';
       const acl = (a.enabledFor && a.enabledFor.length)
         ? a.enabledFor.map(escapeHtml).join(', ')
