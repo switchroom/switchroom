@@ -2223,8 +2223,14 @@ function tail(s: string, bytes = TAIL_BYTES): string {
 export const SCHEDULE_PROMPT_MAX_CHARS = 160;
 /** Max chars retained from a fire's `outputSummary` in the bounded payload. */
 export const SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS = 100;
-/** Max recent fires retained per agent in the bounded payload. */
-export const SCHEDULE_MAX_FIRES_PER_AGENT = 8;
+/**
+ * Max recent fires retained PER CRON (keyed by promptKey) in the bounded
+ * payload. The dashboard renders each cron's OWN fire history, so fires are
+ * bounded per-cron — a busy cron must not crowd a quiet one out of the
+ * agent's window (the old per-agent cap did exactly that). The frame budget
+ * below is the absolute backstop for an agent with pathologically many crons.
+ */
+export const SCHEDULE_MAX_FIRES_PER_CRON = 8;
 /**
  * Hard ceiling on the bytes the `agent_schedule` payload contributes to the
  * response FRAME. The payload is JSON-encoded then embedded as a STRING in
@@ -2257,6 +2263,9 @@ function slimScheduleEntry(e: SchedulerEntry): SchedulerEntry {
     cron: e.cron,
     promptKey: e.promptKey,
   };
+  // The cron's human title (overlay `# name:` header) — a small string,
+  // and the per-cron block header the dashboard renders, so keep it.
+  if (e.name !== undefined) slim.name = e.name;
   if (e.prompt !== undefined) {
     slim.prompt =
       e.prompt.length > SCHEDULE_PROMPT_MAX_CHARS
@@ -2283,8 +2292,8 @@ function scheduleFrameBytes(view: BoundedScheduleView): number {
  * it can be unit-tested without a daemon). It (a) projects each entry to a
  * render-only slim shape (dropping the unbounded poll/action specs) with a
  * truncated prompt, (b) keeps only the LAST
- * {@link SCHEDULE_MAX_FIRES_PER_AGENT} fires per agent (newest) with each
- * `outputSummary` truncated, and (c) enforces a HARD frame budget: if the
+ * {@link SCHEDULE_MAX_FIRES_PER_CRON} fires PER CRON (by promptKey, newest)
+ * with each `outputSummary` truncated, and (c) enforces a HARD frame budget: if the
  * payload would still exceed {@link SCHEDULE_FRAME_BUDGET_BYTES} (a
  * pathological fleet — hundreds of entries), it sheds the least-essential
  * data first (all fires, then entries from the tail) until it fits, setting
@@ -2296,16 +2305,27 @@ export function boundScheduleView(
   recentByAgent: Record<string, DispatchResult[]>,
 ): BoundedScheduleView {
   const slimEntries = entries.map(slimScheduleEntry);
+  const truncSummary = (r: DispatchResult): DispatchResult =>
+    typeof r.outputSummary === "string" &&
+    r.outputSummary.length > SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS
+      ? { ...r, outputSummary: r.outputSummary.slice(0, SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS) }
+      : { ...r };
   const boundedRecent: Record<string, DispatchResult[]> = {};
   for (const [agent, rows] of Object.entries(recentByAgent)) {
-    boundedRecent[agent] = rows
-      .slice(-SCHEDULE_MAX_FIRES_PER_AGENT)
-      .map((r) =>
-        typeof r.outputSummary === "string" &&
-        r.outputSummary.length > SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS
-          ? { ...r, outputSummary: r.outputSummary.slice(0, SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS) }
-          : { ...r },
-      );
+    // Bound fires PER CRON (promptKey), not per agent — the dashboard renders
+    // each cron's own fire history, so keep the last N of EACH cron. Group
+    // preserving input (chronological) order, keep the newest N per key.
+    const byKey = new Map<string, DispatchResult[]>();
+    for (const r of rows) {
+      const arr = byKey.get(r.promptKey);
+      if (arr) arr.push(r);
+      else byKey.set(r.promptKey, [r]);
+    }
+    const kept: DispatchResult[] = [];
+    for (const arr of byKey.values()) {
+      for (const r of arr.slice(-SCHEDULE_MAX_FIRES_PER_CRON)) kept.push(truncSummary(r));
+    }
+    boundedRecent[agent] = kept;
   }
 
   let view: BoundedScheduleView = { entries: slimEntries, recentByAgent: boundedRecent };

@@ -1919,37 +1919,81 @@
         return;
       }
       const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
-      // Group entries by agent.
+      // Group entries by agent. Agents sorted by name; within an agent the
+      // entries keep their cascade-given order (defaults → profile → agent →
+      // overlays), which is the order the operator/agent declared them.
       const byAgent = {};
       for (const e of entries) (byAgent[e.agent] ||= []).push(e);
-      const cards = Object.keys(byAgent).sort().map(agent => {
-        const rows = byAgent[agent].map(e => `
-          <tr>
-            <td><code>${escapeHtml(e.cron)}</code></td>
-            <td title="${escapeHtml(e.prompt)}">${escapeHtml(e.prompt.length > 70 ? e.prompt.slice(0, 70) + '…' : e.prompt)}</td>
-          </tr>`).join('');
-        const fires = (recent[agent] || []).slice().reverse();
-        const fireRows = fires.length === 0
-          ? `<tr><td colspan="3">${dim('no recorded fires yet')}</td></tr>`
+
+      // One self-contained block per cron: title (or cron expr as fallback
+      // heading) + badges, the prompt, then THIS cron's recent fires right
+      // below it. Fires are matched to a cron by promptKey — both the entry
+      // and each DispatchResult carry the same stable SHA. (Edge: two
+      // entries with an identical prompt share a promptKey, so they'd share
+      // the same fire list — acceptable; identical prompts are
+      // indistinguishable in the audit ledger by design.)
+      const renderCron = (e, agentFires) => {
+        const hasTitle = typeof e.name === 'string' && e.name.length > 0;
+        const heading = hasTitle
+          ? `<span style="font-weight:600;color:var(--text)">${escapeHtml(e.name)}</span>`
+          : `<span style="color:var(--text-dim)">${escapeHtml(e.cron)}</span>`;
+        const badges = []
+          .concat(e.kind ? [e.kind] : [])
+          .concat(e.model ? [e.model] : [])
+          .concat(e.context ? [e.context] : [])
+          .map(b => `<span class="chip">${escapeHtml(String(b))}</span>`)
+          .join('');
+        // Prompt: kind:action entries have no prompt (the action is
+        // model-free), so show a muted marker rather than a blank line.
+        const promptText = typeof e.prompt === 'string' ? e.prompt : '';
+        const promptBlock = promptText
+          ? `<div style="margin:.4rem 0 .55rem;color:var(--text);font-size:.84rem" title="${escapeHtml(promptText)}">${escapeHtml(promptText.length > 140 ? promptText.slice(0, 140) + '…' : promptText)}</div>`
+          : `<div style="margin:.4rem 0 .55rem">${dim(e.kind === 'action' ? 'model-free action' : '—')}</div>`;
+        // Recent fires for THIS cron only — filter the agent's fire list by
+        // matching promptKey, newest-first, last 8.
+        const fires = agentFires
+          .filter(f => f.promptKey === e.promptKey)
+          .slice()
+          .reverse()
+          .slice(0, 8);
+        const fireList = fires.length === 0
+          ? `<div style="font-size:.78rem">${dim('no recorded fires yet')}</div>`
           : fires.map(f => {
               const ok = f.exitCode === 0;
-              return `<tr>
-                <td><span class="status-dot ${ok ? 'active' : 'inactive'}" style="display:inline-block;vertical-align:middle"></span> ${escapeHtml(shortTs(new Date(f.startedAt).toISOString()))}</td>
-                <td>${escapeHtml(String(f.outputSummary || '').slice(0, 80))}</td>
-                <td>${ok ? 'ok' : 'exit ' + escapeHtml(String(f.exitCode))}</td>
-              </tr>`;
+              const when = escapeHtml(shortTs(new Date(f.startedAt).toISOString()));
+              const summary = String(f.outputSummary || '');
+              const summaryHtml = summary
+                ? ' · <span style="color:var(--text-dim)">' + escapeHtml(summary.length > 70 ? summary.slice(0, 70) + '…' : summary) + '</span>'
+                : '';
+              return `<div style="font-size:.78rem;line-height:1.55">
+                <span class="status-dot ${ok ? 'active' : 'inactive'}" style="display:inline-block;vertical-align:middle;margin-right:.35rem"></span>${when} · ${ok ? 'ok' : 'exit ' + escapeHtml(String(f.exitCode))}${summaryHtml}
+              </div>`;
             }).join('');
+        return `
+          <div style="border:1px solid var(--border);border-radius:8px;padding:.7rem .85rem;margin-bottom:.7rem;background:var(--surface-hover)">
+            <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+              ${heading}
+              <code style="font-size:.78rem">${escapeHtml(e.cron)}</code>
+              ${badges}
+            </div>
+            ${promptBlock}
+            <div style="border-top:1px solid var(--border);padding-top:.5rem">
+              <div style="font-size:.72rem;color:var(--text-dim);margin-bottom:.3rem">Recent fires</div>
+              ${fireList}
+            </div>
+          </div>`;
+      };
+
+      const cards = Object.keys(byAgent).sort().map(agent => {
+        const agentFires = recent[agent] || [];
+        const list = byAgent[agent].map(e => renderCron(e, agentFires)).join('');
         return `
         <div class="agent-card" style="margin-bottom:1rem">
           <div class="card-header" style="cursor:default">
             <span class="agent-name">${escapeHtml(agent)}</span>
             <span class="agent-topic">${byAgent[agent].length} schedule entr${byAgent[agent].length === 1 ? 'y' : 'ies'}</span>
           </div>
-          <div style="padding:0 1.25rem 1rem">
-            <table class="accounts-table"><thead><tr><th>Cron</th><th>Prompt</th></tr></thead><tbody>${rows}</tbody></table>
-            <div style="margin-top:0.6rem;font-size:0.8rem;color:var(--text-dim)">Recent fires (from scheduler.jsonl)</div>
-            <table class="accounts-table"><thead><tr><th>When</th><th>Result</th><th>Exit</th></tr></thead><tbody>${fireRows}</tbody></table>
-          </div>
+          <div style="padding:.5rem 1.25rem 1rem">${list}</div>
         </div>`;
       }).join('');
       container.innerHTML = degradedBanner + truncatedNote + cards;

@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyAgentOverlays, OVERLAY_SOURCE } from "./overlay-loader.js";
+import { applyAgentOverlays, OVERLAY_SOURCE, OVERLAY_TITLE } from "./overlay-loader.js";
 import type { SwitchroomConfig } from "./schema.js";
 
 /**
@@ -231,6 +231,67 @@ describe("applyAgentOverlays", () => {
     // Marker is non-enumerable: JSON.stringify must not surface it.
     const json = JSON.stringify(sched[1]);
     expect(json).not.toMatch(/overlay-source/i);
+  });
+
+  it("stamps OVERLAY_TITLE from a top-of-file `# name:` comment", () => {
+    const dir = overlayDir("foo");
+    writeFileSync(
+      join(dir, "cron-deadbeef99.yaml"),
+      "# name: school-alerts-linear\n" +
+        "schedule:\n  - cron: '0 7 * * *'\n    prompt: check school portal\n",
+    );
+    const cfg = makeConfig({ foo: { schedule: [] } });
+    applyAgentOverlays(cfg);
+    const sched = cfg.agents.foo.schedule as Array<Record<symbol, unknown>>;
+    expect(sched).toHaveLength(1);
+    // The `# name:` comment is authoritative even though the FILENAME is a
+    // generic cron-<hash> auto-name.
+    expect(sched[0][OVERLAY_TITLE]).toBe("school-alerts-linear");
+    // Non-enumerable: JSON.stringify must not surface it.
+    expect(JSON.stringify(sched[0])).not.toMatch(/overlay-title|school-alerts/i);
+  });
+
+  it("leaves OVERLAY_TITLE undefined for a hash-only cron-<hash>.yaml with no `# name:`", () => {
+    const dir = overlayDir("foo");
+    writeFileSync(
+      join(dir, "cron-1a2b3c4d5e.yaml"),
+      "schedule:\n  - cron: '0 8 * * *'\n    prompt: no title here\n",
+    );
+    const cfg = makeConfig({ foo: { schedule: [] } });
+    applyAgentOverlays(cfg);
+    const sched = cfg.agents.foo.schedule as Array<Record<symbol, unknown>>;
+    expect(sched).toHaveLength(1);
+    // A hash is not a meaningful title — must NOT be used as one.
+    expect(sched[0][OVERLAY_TITLE]).toBeUndefined();
+  });
+
+  it("derives OVERLAY_TITLE from a hand-named filename when there's no `# name:` comment", () => {
+    const dir = overlayDir("foo");
+    writeFileSync(
+      join(dir, "weekend-planner.yaml"),
+      "schedule:\n  - cron: '0 9 * * 6'\n    prompt: plan the weekend\n",
+    );
+    const cfg = makeConfig({ foo: { schedule: [] } });
+    applyAgentOverlays(cfg);
+    const sched = cfg.agents.foo.schedule as Array<Record<symbol, unknown>>;
+    expect(sched).toHaveLength(1);
+    expect(sched[0][OVERLAY_TITLE]).toBe("weekend-planner");
+  });
+
+  it("stamps the SAME title on every entry a multi-entry overlay file declares", () => {
+    const dir = overlayDir("foo");
+    writeFileSync(
+      join(dir, "morning-suite.yaml"),
+      "schedule:\n" +
+        "  - cron: '0 7 * * *'\n    prompt: first\n" +
+        "  - cron: '0 8 * * *'\n    prompt: second\n",
+    );
+    const cfg = makeConfig({ foo: { schedule: [] } });
+    applyAgentOverlays(cfg);
+    const sched = cfg.agents.foo.schedule as Array<Record<symbol, unknown>>;
+    expect(sched).toHaveLength(2);
+    expect(sched[0][OVERLAY_TITLE]).toBe("morning-suite");
+    expect(sched[1][OVERLAY_TITLE]).toBe("morning-suite");
   });
 
   it("accepts an empty overlay document (no schedule key)", () => {

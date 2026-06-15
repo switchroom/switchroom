@@ -10,7 +10,7 @@ import {
   boundScheduleView,
   SCHEDULE_PROMPT_MAX_CHARS,
   SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS,
-  SCHEDULE_MAX_FIRES_PER_AGENT,
+  SCHEDULE_MAX_FIRES_PER_CRON,
   SCHEDULE_FRAME_BUDGET_BYTES,
 } from "../../src/host-control/server.js";
 import type { SchedulerEntry, DispatchResult } from "../../src/scheduler/dispatch.js";
@@ -74,17 +74,31 @@ describe("boundScheduleView", () => {
     );
   });
 
-  it("keeps only the LAST N fires per agent (newest)", () => {
-    const many = Array.from({ length: SCHEDULE_MAX_FIRES_PER_AGENT + 5 }, (_, i) =>
-      fire({ startedAt: i, finishedAt: i + 1, exitCode: i }),
+  it("keeps only the LAST N fires of a single cron (newest)", () => {
+    const many = Array.from({ length: SCHEDULE_MAX_FIRES_PER_CRON + 5 }, (_, i) =>
+      fire({ promptKey: "k1", startedAt: i, finishedAt: i + 1, exitCode: i }),
     );
     const { recentByAgent } = boundScheduleView([], { clerk: many });
-    expect(recentByAgent.clerk).toHaveLength(SCHEDULE_MAX_FIRES_PER_AGENT);
+    expect(recentByAgent.clerk).toHaveLength(SCHEDULE_MAX_FIRES_PER_CRON);
     // The last fire (highest startedAt) survives; the oldest is dropped.
     expect(recentByAgent.clerk.at(-1)!.startedAt).toBe(
-      SCHEDULE_MAX_FIRES_PER_AGENT + 4,
+      SCHEDULE_MAX_FIRES_PER_CRON + 4,
     );
     expect(recentByAgent.clerk[0].startedAt).toBe(5);
+  });
+
+  it("bounds fires PER CRON (promptKey) — a busy cron can't crowd a quiet one out", () => {
+    // One agent, two crons: a busy cron (many fires) + a quiet cron (2 fires).
+    const busy = Array.from({ length: SCHEDULE_MAX_FIRES_PER_CRON + 10 }, (_, i) =>
+      fire({ promptKey: "busy", startedAt: i }),
+    );
+    const quiet = [fire({ promptKey: "quiet", startedAt: 1000 }), fire({ promptKey: "quiet", startedAt: 1001 })];
+    const { recentByAgent } = boundScheduleView([], { clerk: [...busy, ...quiet] });
+    const byKey = (k: string) => recentByAgent.clerk.filter((f) => f.promptKey === k);
+    // Busy cron capped at N; quiet cron's 2 fires SURVIVE (the old per-agent
+    // cap would have dropped them entirely).
+    expect(byKey("busy")).toHaveLength(SCHEDULE_MAX_FIRES_PER_CRON);
+    expect(byKey("quiet")).toHaveLength(2);
   });
 
   it("does not mutate the input objects (purity)", () => {
@@ -133,6 +147,43 @@ describe("boundScheduleView", () => {
     // …unbounded specs dropped.
     expect(e.action).toBeUndefined();
     expect(e.poll).toBeUndefined();
+  });
+
+  it("carries the entry's `name` (cron title) through the slim projection", () => {
+    const { entries } = boundScheduleView(
+      [entry({ name: "school-alerts-linear", prompt: "check portal" })],
+      {},
+    );
+    expect(entries[0].name).toBe("school-alerts-linear");
+  });
+
+  it("omits `name` when the entry has none (base-config / hash-only cron)", () => {
+    const { entries } = boundScheduleView([entry({ prompt: "untitled" })], {});
+    expect(entries[0].name).toBeUndefined();
+  });
+
+  it("preserves each fire's promptKey (the cron↔fire match key)", () => {
+    const { recentByAgent } = boundScheduleView([], {
+      clerk: [
+        fire({ promptKey: "cron-a-key", outputSummary: "ok" }),
+        fire({ promptKey: "cron-b-key", outputSummary: "ok" }),
+      ],
+    });
+    expect(recentByAgent.clerk.map((f) => f.promptKey)).toEqual([
+      "cron-a-key",
+      "cron-b-key",
+    ]);
+  });
+
+  it("preserves promptKey even on a fire whose outputSummary is truncated", () => {
+    const long = "y".repeat(SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS + 50);
+    const { recentByAgent } = boundScheduleView([], {
+      clerk: [fire({ promptKey: "kept-key", outputSummary: long })],
+    });
+    expect(recentByAgent.clerk[0].promptKey).toBe("kept-key");
+    expect(recentByAgent.clerk[0].outputSummary).toHaveLength(
+      SCHEDULE_OUTPUT_SUMMARY_MAX_CHARS,
+    );
   });
 
   it("enforces a hard frame budget — a pathological fleet is truncated and fits", () => {
