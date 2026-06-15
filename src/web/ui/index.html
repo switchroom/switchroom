@@ -958,7 +958,7 @@
       container.innerHTML = agents.map(a => `
         <div class="agent-card" data-agent="${escapeHtml(a.name)}">
           <div class="card-header" onclick="toggleLogs('${escapeHtml(a.name)}')">
-            <div class="status-dot ${statusClass(a)}" title="${escapeHtml(a.active)}"></div>
+            <div class="status-dot ${statusClass(a)}" title="${escapeHtml(a.active)} · bridge heartbeat (not a claude-liveness signal)"></div>
             <div class="agent-name">${escapeHtml(a.name)}</div>
             <div class="agent-topic">${a.topic_emoji ? escapeHtml(a.topic_emoji) + ' ' : ''}${escapeHtml(a.topic_name)}</div>
           </div>
@@ -966,6 +966,7 @@
             <div class="meta-item"><label>Status </label><span>${escapeHtml(a.active)}</span></div>
             <div class="meta-item"><label>Uptime </label><span>${formatUptime(a.uptime)}</span></div>
             <div class="meta-item"><label>Mem </label><span>${a.memory || '--'}</span></div>
+            <div class="meta-item"><label>Last turn </label><span>${a.lastTurnAt ? formatTimestamp(a.lastTurnAt) : '—'}</span></div>
             <div class="meta-item"><label>Profile </label><span>${escapeHtml(a.extends)}</span></div>
             <div class="meta-item"><label>Auth </label><span>${a.auth.authenticated ? '✓' : '✗'}</span></div>
             <div class="meta-item"><label>Account </label><span>${a.primaryAccount ? escapeHtml(a.primaryAccount) : '<span style="color:var(--text-dim)">default</span>'}</span></div>
@@ -1647,9 +1648,15 @@
     async function toggleLogs(name) {
       if (openLogs.has(name)) {
         openLogs.delete(name);
+        unsubscribeLogs(name);
       } else {
         openLogs.add(name);
+        // One-shot paint for instant feedback, then subscribe to the
+        // hostd-poll live stream (replaces the panel every few seconds).
         await loadLogs(name);
+        render();
+        subscribeLogs(name);
+        return;
       }
       render();
     }
@@ -1694,11 +1701,29 @@
           if (msg.type === 'log' && msg.agent) {
             const el = document.getElementById(`log-output-${msg.agent}`);
             if (el && openLogs.has(msg.agent)) {
-              el.textContent += msg.data;
+              // hostd-poll stream sends REPLACE (the latest tail). The
+              // legacy docker-follow stream appended; keep both shapes so
+              // an old payload (no `replace`) still works.
+              if (msg.replace) {
+                el.textContent = msg.data || '(no output)';
+              } else {
+                el.textContent += msg.data;
+              }
               el.scrollTop = el.scrollHeight;
+            }
+          } else if (msg.type === 'log_error' && msg.agent) {
+            const el = document.getElementById(`log-output-${msg.agent}`);
+            if (el && openLogs.has(msg.agent)) {
+              el.textContent = `Error: ${msg.data || 'log stream unavailable'}`;
             }
           }
         } catch {}
+      };
+
+      ws.onopen = () => {
+        // Re-subscribe any panels that were left open across a reconnect
+        // so a dropped socket doesn't leave a permanently-dead log panel.
+        for (const name of openLogs) subscribeLogs(name);
       };
 
       ws.onclose = () => {
@@ -1708,6 +1733,20 @@
       ws.onerror = () => {
         ws.close();
       };
+    }
+
+    // Send a {subscribe} for an agent's live-log poll stream, guarded on
+    // an OPEN socket (a closed socket re-subscribes via ws.onopen above).
+    function subscribeLogs(name) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: 'subscribe', agent: name })); } catch {}
+      }
+    }
+
+    function unsubscribeLogs(name) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: 'unsubscribe', agent: name })); } catch {}
+      }
     }
 
     // Init. Summary is the default visible tab; fetchAgents still runs

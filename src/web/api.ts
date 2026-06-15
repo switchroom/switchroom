@@ -4,9 +4,6 @@ import { resolve } from "node:path";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import {
   getAllAgentStatuses,
-  startAgent,
-  stopAgent,
-  restartAgent,
 } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
@@ -73,6 +70,7 @@ import {
   fetchFleetStatusViaHostd,
   fetchScheduleViaHostd,
   fetchAgentLogsViaHostd,
+  restartAgentViaHostd,
 } from "./hostd-read-client.js";
 import type { AgentStatus } from "../agents/lifecycle.js";
 import { randomUUID } from "node:crypto";
@@ -107,6 +105,39 @@ export interface AgentInfo {
     expiresAt?: number;
   };
   memoryCollection: string;
+  /**
+   * When the agent last STARTED a turn (newest `turns.started_at`, unix
+   * ms), or null when the agent has no turns DB / no turns yet. A real
+   * claude-liveness signal distinct from `active` — which only reflects
+   * the bridge↔gateway `.bridge-alive` heartbeat (a claude wedged on a
+   * quota menu still shows `active`). The UI renders this as "Last turn".
+   */
+  lastTurnAt: number | null;
+}
+
+/**
+ * Read the newest turn's `started_at` for an agent from its per-agent
+ * turns DB. `started_at` (not `ended_at`) is the field that always
+ * exists and best represents "when the agent last ran a turn" — an
+ * in-flight turn has a null `ended_at` but a real `started_at`, and
+ * `listTurnsForAgent` already orders by `started_at DESC`, so the top
+ * row is the most recent activity. Wrapped in try/catch → null on a
+ * missing DB / read error / `bun:sqlite` unavailable (under vitest the
+ * Bun-only sqlite loader throws — the dashboard runs under Bun, so this
+ * is real there and degrades to null in tests).
+ */
+export function readLastTurnAt(agentsDir: string, name: string): number | null {
+  try {
+    const db = openTurnsDb(resolve(agentsDir, name));
+    try {
+      const turns = listTurnsForAgent(db, { limit: 1 });
+      return turns.length > 0 ? turns[0].started_at : null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -172,8 +203,12 @@ export async function handleGetAgents(
   deps: {
     now?: number;
     fetchFleetStatus?: () => Promise<Record<string, AgentStatus> | null>;
+    /** Injectable for tests (default reads the real per-agent turns DB,
+     *  which needs `bun:sqlite` — unavailable under vitest). */
+    readLastTurn?: (agentsDir: string, name: string) => number | null;
   } = {},
 ): Promise<AgentInfo[]> {
+  const readLastTurn = deps.readLastTurn ?? readLastTurnAt;
   const statuses = getAllAgentStatuses(config);
   const authStatuses = getAllAuthStatuses(config);
   const agentsDir = resolveAgentsDir(config);
@@ -237,39 +272,70 @@ export async function handleGetAgents(
         expiresAt: auth?.expiresAt,
       },
       memoryCollection: collection,
+      // A real claude-liveness signal (newest turn's start), distinct
+      // from `active` (bridge heartbeat only). Null-safe per agent.
+      lastTurnAt: readLastTurn(agentsDir, name),
     });
   }
 
   return agents;
 }
 
-export function handleStartAgent(name: string): { ok: boolean; error?: string } {
-  try {
-    startAgent(name);
-    void captureEvent("agent_started", { agent: name, source: "web_api" });
-    return { ok: true };
-  } catch (err) {
-    void captureException(err, { action: "start_agent", agent: name });
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+/**
+ * Start/Stop from the dashboard are deferred to a follow-up PR — they
+ * need a new Telegram approval card (start/stop are NOT ungated like
+ * restart). Until then the dashboard does NOT shell docker (the web
+ * container is dockerless BY DESIGN — that would `spawn` ENOENT).
+ * It returns this actionable message pointing the operator at the host
+ * CLI. `verb` is "start" or "stop".
+ */
+export function startStopNeedsOperatorMessage(verb: "start" | "stop"): string {
+  return (
+    `${verb === "start" ? "Start" : "Stop"} from the dashboard needs operator approval (a follow-up). ` +
+    `For now run on the host: \`switchroom agent ${verb} ${"<name>"}\`.`
+  );
 }
 
-export function handleStopAgent(name: string): { ok: boolean; error?: string } {
-  try {
-    stopAgent(name);
-    void captureEvent("agent_stopped", { agent: name, source: "web_api" });
-    return { ok: true };
-  } catch (err) {
-    void captureException(err, { action: "stop_agent", agent: name });
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+/** Exported for tests + UI parity — the static start/stop deferral text. */
+export const START_NEEDS_OPERATOR_MESSAGE = startStopNeedsOperatorMessage("start");
+export const STOP_NEEDS_OPERATOR_MESSAGE = startStopNeedsOperatorMessage("stop");
+
+export async function handleStartAgent(
+  _name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // Deferred to the start/stop-approval PR. Do NOT shell docker (dockerless
+  // web → ENOENT) — return the actionable host-CLI message instead.
+  return { ok: false, error: START_NEEDS_OPERATOR_MESSAGE };
 }
 
-export function handleRestartAgent(name: string): { ok: boolean; error?: string } {
+export async function handleStopAgent(
+  _name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // Deferred to the start/stop-approval PR. See handleStartAgent.
+  return { ok: false, error: STOP_NEEDS_OPERATOR_MESSAGE };
+}
+
+/**
+ * Restart an agent from the dashboard. The web container is dockerless BY
+ * DESIGN, so this CANNOT shell `restartAgent()` (→ `spawn docker ENOENT`).
+ * It routes through hostd's existing `agent_restart` verb over the
+ * ungated operator socket — the operator chose restart to be UNGATED, so
+ * it acts immediately (no approval card). When hostd is unreachable the
+ * helper returns an actionable "needs hostd" message instead of a raw
+ * docker error. `deps.restart` is injectable for tests.
+ */
+export async function handleRestartAgent(
+  name: string,
+  deps: { restart?: typeof restartAgentViaHostd } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const restart = deps.restart ?? restartAgentViaHostd;
   try {
-    restartAgent(name);
-    void captureEvent("agent_restarted", { agent: name, source: "web_api" });
-    return { ok: true };
+    const result = await restart(name);
+    if (result.ok) {
+      void captureEvent("agent_restarted", { agent: name, source: "web_api" });
+      return { ok: true };
+    }
+    return { ok: false, error: result.error };
   } catch (err) {
     void captureException(err, { action: "restart_agent", agent: name });
     return { ok: false, error: err instanceof Error ? err.message : String(err) };

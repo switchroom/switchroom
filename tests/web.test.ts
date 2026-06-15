@@ -95,6 +95,8 @@ import {
   handleStartAgent,
   handleStopAgent,
   handleRestartAgent,
+  START_NEEDS_OPERATOR_MESSAGE,
+  STOP_NEEDS_OPERATOR_MESSAGE,
   handleGetLogs,
   handleGetSystemHealth,
   handleGetGoogleAccounts,
@@ -221,6 +223,7 @@ describe("handleGetAgents", () => {
     const expectedKeys: (keyof AgentInfo)[] = [
       "name", "active", "uptime", "memory", "extends",
       "topic_name", "topic_emoji", "auth", "primaryAccount", "memoryCollection",
+      "lastTurnAt",
     ];
 
     for (const agent of result) {
@@ -271,71 +274,116 @@ describe("handleGetAgents", () => {
     expect(coach.uptime).toBeNull();
     expect(coach.memory).toBeNull();
   });
+
+  it("includes lastTurnAt from the injected turns reader", async () => {
+    asMock(getAllAgentStatuses).mockReturnValue({
+      coach: { active: "active", uptime: null, memory: null, pid: null },
+      sage: { active: "inactive", uptime: null, memory: null, pid: null },
+    });
+    asMock(getAllAuthStatuses).mockReturnValue({
+      coach: { authenticated: false },
+      sage: { authenticated: false },
+    });
+
+    const result = await handleGetAgents(mockConfig, {
+      fetchFleetStatus: async () => null,
+      // Inject so the test never touches the real per-agent turns DB
+      // (which needs `bun:sqlite`, unavailable under vitest).
+      readLastTurn: (_dir, name) => (name === "coach" ? 1_700_000_000_000 : null),
+    });
+
+    const coach = result.find((a) => a.name === "coach")!;
+    const sage = result.find((a) => a.name === "sage")!;
+    expect(coach).toHaveProperty("lastTurnAt", 1_700_000_000_000);
+    // null-safe: an agent with no turns DB / no turns reads null, not a throw.
+    expect(sage).toHaveProperty("lastTurnAt", null);
+  });
+
+  it("is null-safe for lastTurnAt when the default reader hits a missing DB", async () => {
+    // The default readLastTurnAt opens the real turns DB at the mocked
+    // agentsDir (which doesn't exist) and must degrade to null, never throw.
+    asMock(getAllAgentStatuses).mockReturnValue({
+      coach: { active: "inactive", uptime: null, memory: null, pid: null },
+    });
+    asMock(getAllAuthStatuses).mockReturnValue({ coach: { authenticated: false } });
+
+    const result = await handleGetAgents(mockConfig, {
+      fetchFleetStatus: async () => null,
+      // No readLastTurn injected → exercises the real readLastTurnAt path.
+    });
+    const coach = result.find((a) => a.name === "coach")!;
+    expect(coach.lastTurnAt).toBeNull();
+  });
 });
 
-describe("handleStartAgent", () => {
+describe("handleStartAgent (deferred to approval PR — never shells docker)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("calls startAgent and returns ok on success", () => {
-    asMock(startAgent).mockImplementation(() => {});
-    const result = handleStartAgent("coach");
-    expect(result).toEqual({ ok: true });
-    expect(startAgent).toHaveBeenCalledWith("coach");
-  });
-
-  it("returns error when startAgent throws", () => {
-    asMock(startAgent).mockImplementation(() => {
-      throw new Error("service not found");
-    });
-    const result = handleStartAgent("missing");
+  it("returns the actionable host-CLI message and does NOT call startAgent", async () => {
+    const result = await handleStartAgent("coach");
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("service not found");
+    expect(result.error).toBe(START_NEEDS_OPERATOR_MESSAGE);
+    expect(result.error).toContain("switchroom agent start");
+    // The dockerless web must never shell the lifecycle start (→ docker).
+    expect(startAgent).not.toHaveBeenCalled();
   });
 });
 
-describe("handleStopAgent", () => {
+describe("handleStopAgent (deferred to approval PR — never shells docker)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("calls stopAgent and returns ok on success", () => {
-    asMock(stopAgent).mockImplementation(() => {});
-    const result = handleStopAgent("coach");
-    expect(result).toEqual({ ok: true });
-    expect(stopAgent).toHaveBeenCalledWith("coach");
-  });
-
-  it("returns error when stopAgent throws", () => {
-    asMock(stopAgent).mockImplementation(() => {
-      throw new Error("cannot stop");
-    });
-    const result = handleStopAgent("coach");
+  it("returns the actionable host-CLI message and does NOT call stopAgent", async () => {
+    const result = await handleStopAgent("coach");
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("cannot stop");
+    expect(result.error).toBe(STOP_NEEDS_OPERATOR_MESSAGE);
+    expect(result.error).toContain("switchroom agent stop");
+    expect(stopAgent).not.toHaveBeenCalled();
   });
 });
 
-describe("handleRestartAgent", () => {
+describe("handleRestartAgent (hostd-routed, ungated)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("calls restartAgent and returns ok on success", () => {
-    asMock(restartAgent).mockImplementation(() => {});
-    const result = handleRestartAgent("sage");
+  it("routes through the injected hostd restart and returns ok on success", async () => {
+    let calledWith: string | undefined;
+    const result = await handleRestartAgent("sage", {
+      restart: async (name) => {
+        calledWith = name;
+        return { ok: true };
+      },
+    });
     expect(result).toEqual({ ok: true });
-    expect(restartAgent).toHaveBeenCalledWith("sage");
+    expect(calledWith).toBe("sage");
+    // Never shells the dockerful lifecycle restart from the web container.
+    expect(restartAgent).not.toHaveBeenCalled();
   });
 
-  it("returns error when restartAgent throws", () => {
-    asMock(restartAgent).mockImplementation(() => {
-      throw new Error("restart failed");
+  it("surfaces the actionable error when hostd is unreachable", async () => {
+    const result = await handleRestartAgent("sage", {
+      restart: async () => ({
+        ok: false,
+        error: "Agent control needs hostd (the dashboard container has no docker access by design).",
+      }),
     });
-    const result = handleRestartAgent("sage");
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("restart failed");
+    expect(result.error).toContain("needs hostd");
+    expect(restartAgent).not.toHaveBeenCalled();
+  });
+
+  it("degrades gracefully if the restart helper itself throws", async () => {
+    const result = await handleRestartAgent("sage", {
+      restart: async () => {
+        throw new Error("unexpected");
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("unexpected");
   });
 });
 

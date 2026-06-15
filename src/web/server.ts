@@ -10,13 +10,11 @@ import {
 } from "node:fs";
 import { resolve, extname, join, relative, dirname } from "node:path";
 import { homedir } from "node:os";
-import { spawn } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { loadConfig, resolvePath } from "../config/loader.js";
 import { getViaBrokerStructured, resolveBrokerSocketPath } from "../vault/broker/client.js";
-import { containerName } from "../agents/lifecycle.js";
 import {
   handleGetAgents,
   handleStartAgent,
@@ -42,8 +40,18 @@ import {
   handleGetSchedule,
   handleGetApprovals,
 } from "./api.js";
+import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
+
+/** Live-log poll cadence (ms) for the WS stream. hostd reads `docker
+ *  logs --tail` each tick — a poll, not a follow, because the dockerless
+ *  web can't `docker logs -f`. 3s balances freshness against host load. */
+const LOG_POLL_INTERVAL_MS = 3000;
+/** Trailing lines requested each poll. hostd caps its `stdout_tail` at
+ *  4 KiB regardless, so a very high-volume container shows only the last
+ *  ~tail; acceptable for this at-a-glance log view. */
+const LOG_POLL_TAIL_LINES = 400;
 
 const MIME_TYPES: Record<string, string> = {
   ".html": "text/html",
@@ -655,7 +663,7 @@ export function startWebServer(
             if (!config.agents[agentName]) {
               return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
             }
-            return jsonResponse(handleStartAgent(agentName));
+            return (async () => jsonResponse(await handleStartAgent(agentName)))();
           }
 
           case "stopAgent": {
@@ -663,7 +671,7 @@ export function startWebServer(
             if (!config.agents[agentName]) {
               return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
             }
-            return jsonResponse(handleStopAgent(agentName));
+            return (async () => jsonResponse(await handleStopAgent(agentName)))();
           }
 
           case "restartAgent": {
@@ -671,7 +679,7 @@ export function startWebServer(
             if (!config.agents[agentName]) {
               return jsonResponse({ ok: false, error: `Unknown agent: ${agentName}` }, 404);
             }
-            return jsonResponse(handleRestartAgent(agentName));
+            return (async () => jsonResponse(await handleRestartAgent(agentName)))();
           }
 
           case "getTurns": {
@@ -872,90 +880,104 @@ export function startWebServer(
         // No-op; tracking handled per-subscription
       },
       close(ws) {
-        const proc = (ws as any)._logProcess;
-        if (proc) {
-          proc.kill();
-          (ws as any)._logProcess = null;
+        // Stop the live-log poll loop on disconnect.
+        const interval = (ws as any)._logInterval;
+        if (interval) {
+          clearInterval(interval);
+          (ws as any)._logInterval = null;
         }
       },
       message(ws, message) {
-        // Handle subscription requests for agent logs
+        // Handle subscription requests for agent logs.
+        //
+        // The web container is dockerless BY DESIGN (no docker binary/
+        // socket — security hardening), so it CANNOT `docker logs -f` to
+        // follow a stream. Instead we POLL hostd's `agent_logs` verb (hostd
+        // runs as root with the docker socket) every few seconds and push
+        // the latest tail as a REPLACE. hostd caps its tail at 4 KiB, so a
+        // very high-volume container shows only the last ~tail — acceptable
+        // for this at-a-glance view. The client merges/replaces the panel.
+        let data: any;
         try {
-          const data = JSON.parse(String(message));
-          if (data.type === "subscribe" && data.agent) {
-            const agentName = String(data.agent).replace(/[^a-zA-Z0-9_-]/g, "");
-            // Only allow subscribing to agents that actually exist in config.
-            if (!agentName || !config.agents[agentName]) {
-              try {
-                ws.send(JSON.stringify({ type: "error", error: "Unknown agent" }));
-              } catch {}
-              return;
-            }
+          data = JSON.parse(String(message));
+        } catch {
+          return; // Ignore invalid messages
+        }
 
-            // Kill any existing log process before subscribing to a new one
-            const existing = (ws as any)._logProcess;
-            if (existing) {
-              existing.kill();
-              (ws as any)._logProcess = null;
-            }
+        const clearLogInterval = () => {
+          const existing = (ws as any)._logInterval;
+          if (existing) {
+            clearInterval(existing);
+            (ws as any)._logInterval = null;
+          }
+        };
 
-            // Agents are Docker containers since v0.7 — stream the
-            // container log, not a (nonexistent) systemd user unit.
-            // docker logs splits container stdout/stderr across the
-            // two fds; both are forwarded to the client below.
-            const child = spawn(
-              "docker",
-              ["logs", "-f", "--tail", "20", containerName(agentName)],
-              { stdio: ["ignore", "pipe", "pipe"] }
-            );
+        if (data && data.type === "unsubscribe") {
+          clearLogInterval();
+          return;
+        }
 
-            // A missing `docker` binary (or exec failure) emits an
-            // 'error' event with no stdout/stderr; without a handler
-            // Node treats it as unhandled and crashes the server.
-            // Surface it to the client as a log_error instead.
-            child.on("error", (err: Error) => {
+        if (data && data.type === "subscribe" && data.agent) {
+          const agentName = String(data.agent).replace(/[^a-zA-Z0-9_-]/g, "");
+          // Only allow subscribing to agents that actually exist in config.
+          if (!agentName || !config.agents[agentName]) {
+            try {
+              ws.send(JSON.stringify({ type: "error", error: "Unknown agent" }));
+            } catch {}
+            return;
+          }
+
+          // Drop any existing poll loop before starting a new one (the
+          // client only views one agent's logs at a time per socket).
+          clearLogInterval();
+
+          // One poll: read the tail via hostd, push a REPLACE. On a hard
+          // error (hostd down / denied) surface it once and stop the loop
+          // so we don't spin pushing the same failure every 3s.
+          const poll = async () => {
+            let result: Awaited<ReturnType<typeof fetchAgentLogsViaHostd>>;
+            try {
+              result = await fetchAgentLogsViaHostd(agentName, LOG_POLL_TAIL_LINES);
+            } catch (err) {
+              // fetchAgentLogsViaHostd never throws, but belt-and-braces.
               try {
                 ws.send(JSON.stringify({
                   type: "log_error",
                   agent: agentName,
-                  data: `failed to stream logs: ${err.message}\n`,
+                  data: err instanceof Error ? err.message : String(err),
                 }));
-              } catch {
-                // Client already gone — nothing to clean up; the
-                // process never started so there's no pid to kill.
-              }
-            });
-
-            child.stdout.on("data", (chunk: Buffer) => {
+              } catch {}
+              clearLogInterval();
+              return;
+            }
+            if (result.ok) {
               try {
                 ws.send(JSON.stringify({
                   type: "log",
                   agent: agentName,
-                  data: chunk.toString("utf-8"),
+                  data: result.logs,
+                  replace: true,
                 }));
               } catch {
-                // Client disconnected
-                child.kill();
+                // Client gone mid-send — stop polling.
+                clearLogInterval();
               }
-            });
-
-            child.stderr.on("data", (chunk: Buffer) => {
+            } else {
               try {
                 ws.send(JSON.stringify({
                   type: "log_error",
                   agent: agentName,
-                  data: chunk.toString("utf-8"),
+                  data: result.error,
                 }));
-              } catch {
-                child.kill();
-              }
-            });
+              } catch {}
+              // Don't keep hammering hostd on a hard error.
+              clearLogInterval();
+            }
+          };
 
-            // Store child reference for cleanup
-            (ws as any)._logProcess = child;
-          }
-        } catch {
-          // Ignore invalid messages
+          // Immediate first poll, then a steady cadence.
+          void poll();
+          (ws as any)._logInterval = setInterval(() => void poll(), LOG_POLL_INTERVAL_MS);
         }
       },
     },
