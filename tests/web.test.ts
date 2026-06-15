@@ -112,6 +112,7 @@ import {
   handleGetApprovals,
   handleRefreshAccountsQuota,
   __resetQuotaCacheForTests,
+  __resetAgentStatusCacheForTests,
   type AgentInfo,
 } from "../src/web/api.js";
 import { resolveAgentsDir } from "../src/config/loader.js";
@@ -164,9 +165,11 @@ const mockConfig: SwitchroomConfig = {
 describe("handleGetAgents", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // The hostd backfill is TTL-cached at module scope; isolate cases.
+    __resetAgentStatusCacheForTests();
   });
 
-  it("returns combined status and auth info for each agent", () => {
+  it("returns combined status and auth info for each agent", async () => {
     asMock(getAllAgentStatuses).mockReturnValue({
       coach: { active: "active", uptime: "2025-01-01T00:00:00Z", memory: "128MB", pid: 1234 },
       sage: { active: "inactive", uptime: null, memory: null, pid: null },
@@ -177,7 +180,9 @@ describe("handleGetAgents", () => {
       sage: { authenticated: false },
     });
 
-    const result = handleGetAgents(mockConfig);
+    const result = await handleGetAgents(mockConfig, {
+      fetchFleetStatus: async () => null,
+    });
 
     expect(result).toHaveLength(2);
 
@@ -200,7 +205,7 @@ describe("handleGetAgents", () => {
     expect(sage.memoryCollection).toBe("sage"); // Falls back to agent name
   });
 
-  it("returns correct shape with all fields", () => {
+  it("returns correct shape with all fields", async () => {
     asMock(getAllAgentStatuses).mockReturnValue({
       coach: { active: "active", uptime: null, memory: null, pid: null },
       sage: { active: "inactive", uptime: null, memory: null, pid: null },
@@ -210,7 +215,9 @@ describe("handleGetAgents", () => {
       sage: { authenticated: false },
     });
 
-    const result = handleGetAgents(mockConfig);
+    const result = await handleGetAgents(mockConfig, {
+      fetchFleetStatus: async () => null,
+    });
     const expectedKeys: (keyof AgentInfo)[] = [
       "name", "active", "uptime", "memory", "extends",
       "topic_name", "topic_emoji", "auth", "primaryAccount", "memoryCollection",
@@ -222,6 +229,47 @@ describe("handleGetAgents", () => {
       }
       expect(agent.auth).toHaveProperty("authenticated");
     }
+  });
+
+  it("backfills null uptime/memory from hostd (dockerless web)", async () => {
+    // Dockerless: getAllAgentStatuses returns null uptime/memory.
+    asMock(getAllAgentStatuses).mockReturnValue({
+      coach: { active: "inactive", uptime: null, memory: null, pid: null },
+      sage: { active: "inactive", uptime: null, memory: null, pid: null },
+    });
+    asMock(getAllAuthStatuses).mockReturnValue({
+      coach: { authenticated: false },
+      sage: { authenticated: false },
+    });
+
+    const result = await handleGetAgents(mockConfig, {
+      // hostd (root, docker socket) supplies what the web can't read.
+      fetchFleetStatus: async () => ({
+        coach: { active: "active", uptime: "2026-06-15T00:00:00Z", memory: "256MB", pid: 99 },
+      }),
+    });
+
+    const coach = result.find((a) => a.name === "coach")!;
+    expect(coach.uptime).toBe("2026-06-15T00:00:00Z");
+    expect(coach.memory).toBe("256MB");
+    // No hostd row for sage → stays null (graceful).
+    const sage = result.find((a) => a.name === "sage")!;
+    expect(sage.uptime).toBeNull();
+    expect(sage.memory).toBeNull();
+  });
+
+  it("keeps null uptime/memory when hostd is unreachable", async () => {
+    asMock(getAllAgentStatuses).mockReturnValue({
+      coach: { active: "inactive", uptime: null, memory: null, pid: null },
+    });
+    asMock(getAllAuthStatuses).mockReturnValue({ coach: { authenticated: false } });
+
+    const result = await handleGetAgents(mockConfig, {
+      fetchFleetStatus: async () => null, // hostd down
+    });
+    const coach = result.find((a) => a.name === "coach")!;
+    expect(coach.uptime).toBeNull();
+    expect(coach.memory).toBeNull();
   });
 });
 
@@ -296,56 +344,43 @@ describe("handleGetLogs", () => {
     vi.clearAllMocks();
   });
 
-  it("returns merged container stdout+stderr from docker logs", () => {
-    asMock(spawnSync).mockReturnValue({
-      status: 0,
-      stdout: "line 1\nline 2\n",
-      stderr: "boot warn\n",
-    } as any);
-
-    const result = handleGetLogs("coach", 50);
+  it("returns logs from the hostd agent_logs verb", async () => {
+    const result = await handleGetLogs("coach", 50, {
+      fetchLogs: async (name, lines) => {
+        expect(name).toBe("coach");
+        expect(lines).toBe(50);
+        return { ok: true, logs: "line 1\nline 2\nboot warn\n" };
+      },
+    });
     expect(result.ok).toBe(true);
     expect(result.logs).toContain("line 1");
-    // docker logs splits container stdout/stderr; both are surfaced.
     expect(result.logs).toContain("boot warn");
-    expect(spawnSync).toHaveBeenCalledWith(
-      "docker",
-      ["logs", "--tail", "50", "switchroom-coach"],
-      expect.objectContaining({ encoding: "utf-8" })
-    );
   });
 
-  it("uses default of 50 lines", () => {
-    asMock(spawnSync).mockReturnValue({ status: 0, stdout: "output", stderr: "" } as any);
-
-    handleGetLogs("sage");
-    expect(spawnSync).toHaveBeenCalledWith(
-      "docker",
-      ["logs", "--tail", "50", "switchroom-sage"],
-      expect.any(Object)
-    );
+  it("uses default of 50 lines", async () => {
+    let observed = -1;
+    await handleGetLogs("sage", undefined, {
+      fetchLogs: async (_name, lines) => {
+        observed = lines;
+        return { ok: true, logs: "output" };
+      },
+    });
+    expect(observed).toBe(50);
   });
 
-  it("returns error when docker logs exits non-zero (no such container)", () => {
-    asMock(spawnSync).mockReturnValue({
-      status: 1,
-      stdout: "",
-      stderr: "Error: No such container: switchroom-missing\n",
-    } as any);
-
-    const result = handleGetLogs("missing", 10);
+  it("surfaces an actionable error when hostd is unreachable", async () => {
+    const result = await handleGetLogs("coach", 10, {
+      fetchLogs: async () => ({
+        ok: false,
+        error:
+          "Logs need hostd (the dashboard container has no docker access by design). " +
+          "Ensure host_control is enabled, or run `switchroom agent logs <name>` on the host.",
+      }),
+    });
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("No such container");
-  });
-
-  it("returns error when docker binary is unavailable", () => {
-    asMock(spawnSync).mockReturnValue({
-      error: new Error("spawn docker ENOENT"),
-    } as any);
-
-    const result = handleGetLogs("coach", 10);
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain("ENOENT");
+    // No raw `spawn docker ENOENT` — points the operator at the real lever.
+    expect(result.error).toContain("need hostd");
+    expect(result.error).not.toContain("ENOENT");
   });
 });
 
@@ -1116,7 +1151,12 @@ describe("handleGetSchedule", () => {
       },
     }) as unknown as SwitchroomConfig;
 
-  it("returns cascade-resolved entries with recent fires from scheduler.jsonl", () => {
+  // hostd-down ⇒ degraded base-config-only fallback path. Inject a null
+  // hostd fetch so these exercise the local collectScheduleEntries +
+  // readRecentFires path deterministically (no real UDS).
+  const hostdDown = { fetchSchedule: async () => null };
+
+  it("returns cascade-resolved entries with recent fires from scheduler.jsonl", async () => {
     mkdirSync(join(tmp, "coach"), { recursive: true });
     const row = (idx: number, code: number) =>
       JSON.stringify({
@@ -1133,27 +1173,45 @@ describe("handleGetSchedule", () => {
       [row(0, 0), row(1, -1)].join("\n") + "\n",
     );
 
-    const d = handleGetSchedule(cfgWithSchedule());
+    const d = await handleGetSchedule(cfgWithSchedule(), hostdDown);
     expect(d.entries.filter((e) => e.agent === "coach")).toHaveLength(2);
     expect(d.entries[0].cron).toBe("0 9 * * *");
     expect(d.recentByAgent.coach).toHaveLength(2);
     expect(d.recentByAgent.coach[1].exitCode).toBe(-1);
+    // Degraded because hostd was down — UI must warn overlays are missing.
+    expect(d.degraded).toBe(true);
+    expect(d.reason).toContain("hostd");
   });
 
-  it("skips agents with no scheduler.jsonl without failing", () => {
-    const d = handleGetSchedule(cfgWithSchedule());
+  it("skips agents with no scheduler.jsonl without failing", async () => {
+    const d = await handleGetSchedule(cfgWithSchedule(), hostdDown);
     expect(d.entries.length).toBeGreaterThan(0);
     expect(d.recentByAgent.coach).toBeUndefined();
   });
 
-  it("tolerates a torn JSONL line", () => {
+  it("tolerates a torn JSONL line", async () => {
     mkdirSync(join(tmp, "coach"), { recursive: true });
     writeFileSync(
       join(tmp, "coach", "scheduler.jsonl"),
       '{"agent":"coach","exitCode":0,"outputSummary":"ok","startedAt":1,"finishedAt":2,"scheduleIndex":0,"promptKey":"k"}\n{ broken json\n',
     );
-    const d = handleGetSchedule(cfgWithSchedule());
+    const d = await handleGetSchedule(cfgWithSchedule(), hostdDown);
     expect(d.recentByAgent.coach).toHaveLength(1);
+  });
+
+  it("uses the hostd superset (overlays) and is NOT degraded when hostd is reachable", async () => {
+    const d = await handleGetSchedule(cfgWithSchedule(), {
+      // hostd sees an agent-authored schedule.d cron the base config lacks.
+      fetchSchedule: async () => ({
+        entries: [
+          { agent: "clerk", scheduleIndex: 0, cron: "*/30 * * * *", promptKey: "x" },
+        ],
+        recentByAgent: { clerk: [] },
+      }),
+    });
+    expect(d.entries).toHaveLength(1);
+    expect(d.entries[0].agent).toBe("clerk");
+    expect(d.degraded).toBeUndefined();
   });
 });
 

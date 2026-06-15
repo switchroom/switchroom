@@ -7,7 +7,6 @@ import {
   startAgent,
   stopAgent,
   restartAgent,
-  containerName,
 } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
 import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
@@ -70,6 +69,12 @@ import {
   resolveHostdOperatorSocket,
   type ProposeOutcome,
 } from "./hostd-config-propose.js";
+import {
+  fetchFleetStatusViaHostd,
+  fetchScheduleViaHostd,
+  fetchAgentLogsViaHostd,
+} from "./hostd-read-client.js";
+import type { AgentStatus } from "../agents/lifecycle.js";
 import { randomUUID } from "node:crypto";
 import {
   startMicrosoftConnect,
@@ -124,11 +129,67 @@ export function agentBridgeAlive(
   }
 }
 
-export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
+/**
+ * Short-TTL cache for the hostd-backfilled fleet status. `/api/agents` is
+ * polled every ~10s by the dashboard; without a cache that poll would
+ * round-trip hostd (and thus `docker inspect`/`docker stats` host-side)
+ * every tick → a docker-stats storm. A ~5s TTL means at most one hostd
+ * round-trip per poll cycle. Mirrors the `quotaCache` module-Map pattern.
+ * Single key (`"fleet"`) — the web always asks hostd for the whole fleet.
+ */
+export const AGENT_STATUS_CACHE_TTL_MS = 5000;
+interface StatusCacheEntry {
+  statuses: Record<string, AgentStatus> | null;
+  fetchedAt: number;
+}
+const statusCache = new Map<string, StatusCacheEntry>();
+
+/** Test-only: reset the module status cache between cases. */
+export function __resetAgentStatusCacheForTests(): void {
+  statusCache.clear();
+}
+
+/**
+ * TTL-cached hostd fleet-status fetch. Returns the (possibly null)
+ * backfill map. `fetch` is injectable for tests. A `null` from hostd is
+ * cached too — so a down daemon doesn't get hammered every 10s tick.
+ */
+async function cachedFleetStatus(
+  now: number,
+  fetchImpl: () => Promise<Record<string, AgentStatus> | null> = fetchFleetStatusViaHostd,
+): Promise<Record<string, AgentStatus> | null> {
+  const cached = statusCache.get("fleet");
+  if (cached && now - cached.fetchedAt < AGENT_STATUS_CACHE_TTL_MS) {
+    return cached.statuses;
+  }
+  const statuses = await fetchImpl();
+  statusCache.set("fleet", { statuses, fetchedAt: now });
+  return statuses;
+}
+
+export async function handleGetAgents(
+  config: SwitchroomConfig,
+  deps: {
+    now?: number;
+    fetchFleetStatus?: () => Promise<Record<string, AgentStatus> | null>;
+  } = {},
+): Promise<AgentInfo[]> {
   const statuses = getAllAgentStatuses(config);
   const authStatuses = getAllAuthStatuses(config);
   const agentsDir = resolveAgentsDir(config);
   const agents: AgentInfo[] = [];
+
+  // Dockerless web: `getAllAgentStatuses` shells docker and returns
+  // uptime/memory=null for every agent. hostd (root, docker socket) can
+  // read them — backfill from it when any status is missing them. TTL-
+  // cached so the 10s poll doesn't storm docker-stats. Never throws:
+  // hostd unreachable ⇒ null ⇒ we keep the null uptime/memory.
+  const needsBackfill = Object.values(statuses).some(
+    (s) => s && (s.uptime === null || s.memory === null),
+  );
+  const hostdStatuses = needsBackfill
+    ? await cachedFleetStatus(deps.now ?? Date.now(), deps.fetchFleetStatus)
+    : null;
 
   for (const [name, agentConfig] of Object.entries(config.agents)) {
     const status = statuses[name];
@@ -152,11 +213,19 @@ export function handleGetAgents(config: SwitchroomConfig): AgentInfo[] {
           ? "active"
           : (status?.active ?? "unknown");
 
+    // uptime/memory: prefer the local docker read; backfill from hostd
+    // when the dockerless path left them null. `active` keeps the
+    // docker-or-.bridge-alive logic above (hostd is only consulted for
+    // the two fields the web genuinely cannot read).
+    const hostd = hostdStatuses?.[name];
+    const uptime = status?.uptime ?? hostd?.uptime ?? null;
+    const memory = status?.memory ?? hostd?.memory ?? null;
+
     agents.push({
       name,
       active,
-      uptime: status?.uptime ?? null,
-      memory: status?.memory ?? null,
+      uptime,
+      memory,
       extends: agentConfig.extends ?? "default",
       topic_name: agentConfig.topic_name,
       topic_emoji: agentConfig.topic_emoji,
@@ -207,31 +276,23 @@ export function handleRestartAgent(name: string): { ok: boolean; error?: string 
   }
 }
 
-export function handleGetLogs(
+export async function handleGetLogs(
   name: string,
-  lines: number = 50
-): { ok: boolean; logs?: string; error?: string } {
-  // Agents are Docker containers since v0.7 — there is no
-  // `switchroom-<name>` systemd user unit to journalctl against.
-  // `docker logs` splits the container's stdout/stderr across the two
-  // fds; a container can log to either, so merge both for a complete
-  // view. spawnSync hands back both streams regardless of exit code.
-  const res = spawnSync(
-    "docker",
-    ["logs", "--tail", String(lines), containerName(name)],
-    { encoding: "utf-8", timeout: 5000 },
-  );
-  if (res.error) {
-    return { ok: false, error: res.error.message };
-  }
-  if (res.status !== 0) {
-    const stderr = (res.stderr ?? "").trim();
-    return {
-      ok: false,
-      error: stderr || `docker logs exited ${res.status ?? "non-zero"}`,
-    };
-  }
-  return { ok: true, logs: `${res.stdout ?? ""}${res.stderr ?? ""}` };
+  lines: number = 50,
+  deps: {
+    fetchLogs?: typeof fetchAgentLogsViaHostd;
+  } = {},
+): Promise<{ ok: boolean; logs?: string; error?: string }> {
+  // The web container is dockerless BY DESIGN (no docker binary/socket —
+  // security hardening). It cannot `docker logs`. Route through hostd's
+  // existing `agent_logs` verb (hostd runs as root with the docker
+  // socket). hostd already merges the container's stdout/stderr streams
+  // and caps the tail at 4 KiB — acceptable for this one-shot view; live
+  // streaming is a later PR. When hostd is unreachable the helper returns
+  // an actionable "needs hostd" message instead of a raw
+  // `spawn docker ENOENT`.
+  const fetchLogs = deps.fetchLogs ?? fetchAgentLogsViaHostd;
+  return await fetchLogs(name, lines);
 }
 
 export function handleGetTurns(
@@ -1344,11 +1405,51 @@ export interface ScheduleDashboard {
   entries: SchedulerEntry[];
   /** agent → most-recent DispatchResult rows (newest last), capped. */
   recentByAgent: Record<string, DispatchResult[]>;
+  /**
+   * True when hostd was unreachable and this view is base-config-only —
+   * i.e. it is MISSING the agent-authored `schedule.d/*.yaml` cron
+   * overlays (0600, owned by the agent UID → operator/web gets EACCES;
+   * only hostd, as root, can read them). The UI uses this to warn that
+   * an agent may be firing crons not shown here.
+   */
+  degraded?: boolean;
+  /** Human-readable explanation when `degraded` is true. */
+  reason?: string;
+  /** True when hostd shed entries/fires to fit the response frame (a
+   *  pathologically large fleet) — the view is otherwise accurate. */
+  truncated?: boolean;
 }
 
-export function handleGetSchedule(
+/**
+ * Cron schedule view. The accurate source is hostd (`agent_schedule`):
+ * it re-loads config FRESH as root, merging each agent's 0600
+ * `schedule.d/*.yaml` overlays the dockerless web can't read — so it's
+ * the SUPERSET (e.g. clerk's 9 agent-authored crons). When hostd is
+ * unreachable we fall back to the base-config-only
+ * `collectScheduleEntries(config)` and mark the response `degraded` so
+ * the UI can say "schedule view needs hostd — showing base-config only".
+ *
+ * `fetchSchedule` is injectable for tests.
+ */
+export async function handleGetSchedule(
   config: SwitchroomConfig,
-): ScheduleDashboard {
+  deps: {
+    fetchSchedule?: typeof fetchScheduleViaHostd;
+  } = {},
+): Promise<ScheduleDashboard> {
+  const fetchSchedule = deps.fetchSchedule ?? fetchScheduleViaHostd;
+  const viaHostd = await fetchSchedule();
+  if (viaHostd) {
+    // hostd already bounded the payload (last 8 fires/agent, truncated
+    // prompts/summaries, slim entries); pass it through unchanged.
+    return {
+      entries: viaHostd.entries,
+      recentByAgent: viaHostd.recentByAgent,
+      ...(viaHostd.truncated ? { truncated: true } : {}),
+    };
+  }
+
+  // Degraded: hostd unreachable. Base-config-only view (no overlay crons).
   const entries = collectScheduleEntries(config);
   const agentsDir = resolveAgentsDir(config);
   const recentByAgent: Record<string, DispatchResult[]> = {};
@@ -1361,7 +1462,15 @@ export function handleGetSchedule(
     );
     if (rows.length > 0) recentByAgent[agent] = rows.slice(-10);
   }
-  return { entries, recentByAgent };
+  return {
+    entries,
+    recentByAgent,
+    degraded: true,
+    reason:
+      "schedule view needs hostd — showing base-config only " +
+      "(agent-authored schedule.d crons are not included). " +
+      "Ensure host_control is enabled.",
+  };
 }
 
 /**

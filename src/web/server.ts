@@ -635,7 +635,7 @@ export function startWebServer(
 
         switch (route.handler) {
           case "getAgents":
-            return jsonResponse(handleGetAgents(config));
+            return (async () => jsonResponse(await handleGetAgents(freshConfig())))();
 
           case "getLogs": {
             const agentName = route.params.name;
@@ -647,7 +647,7 @@ export function startWebServer(
               Number.isInteger(rawLines) && rawLines >= 1 && rawLines <= 10000
                 ? rawLines
                 : 50;
-            return jsonResponse(handleGetLogs(agentName, lines));
+            return (async () => jsonResponse(await handleGetLogs(agentName, lines)))();
           }
 
           case "startAgent": {
@@ -705,7 +705,8 @@ export function startWebServer(
           }
 
           case "getSystemHealth":
-            return (async () => jsonResponse(await handleGetSystemHealth(config)))();
+            return (async () =>
+              jsonResponse(await handleGetSystemHealth(freshConfig())))();
 
           case "getMemoryHealth":
             return (async () =>
@@ -723,14 +724,16 @@ export function startWebServer(
             return jsonResponse(handleGetNotionWorkspace(freshConfig()));
 
           case "getSchedule":
-            return jsonResponse(handleGetSchedule(config));
+            return (async () =>
+              jsonResponse(await handleGetSchedule(freshConfig())))();
 
           case "getApprovals":
             return (async () =>
               jsonResponse(await handleGetApprovals()))();
 
           case "getAccounts":
-            return (async () => jsonResponse(await handleGetAccounts(config)))();
+            return (async () =>
+              jsonResponse(await handleGetAccounts(freshConfig())))();
 
           case "useAccount": {
             return (async () => {

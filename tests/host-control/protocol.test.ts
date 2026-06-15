@@ -114,6 +114,96 @@ describe("hostd protocol — framing & schema", () => {
   });
 });
 
+describe("hostd protocol — dashboard read-ops (agent_status / agent_schedule)", () => {
+  it("round-trips an agent_status request (whole fleet — name omitted)", () => {
+    const req: HostdRequest = {
+      v: 1,
+      op: "agent_status",
+      request_id: "st-1",
+      args: {},
+    };
+    const decoded = decodeRequest(encodeRequest(req).trimEnd());
+    expect(decoded).toEqual(req);
+  });
+
+  it("round-trips an agent_status request narrowed to one agent", () => {
+    const req: HostdRequest = {
+      v: 1,
+      op: "agent_status",
+      request_id: "st-2",
+      args: { name: "clerk" },
+    };
+    const decoded = decodeRequest(encodeRequest(req).trimEnd());
+    expect(decoded).toEqual(req);
+  });
+
+  it("round-trips an agent_schedule request (whole fleet)", () => {
+    const req: HostdRequest = {
+      v: 1,
+      op: "agent_schedule",
+      request_id: "sc-1",
+      args: {},
+    };
+    const decoded = decodeRequest(encodeRequest(req).trimEnd());
+    expect(decoded).toEqual(req);
+  });
+
+  it("round-trips an agent_schedule request narrowed to one agent", () => {
+    const req: HostdRequest = {
+      v: 1,
+      op: "agent_schedule",
+      request_id: "sc-2",
+      args: { name: "clerk" },
+    };
+    const decoded = decodeRequest(encodeRequest(req).trimEnd());
+    expect(decoded).toEqual(req);
+  });
+
+  it("rejects an agent name that isn't kebab-case ASCII", () => {
+    const wire = JSON.stringify({
+      v: 1,
+      op: "agent_status",
+      request_id: "st-bad",
+      args: { name: "bad name!" },
+    });
+    expect(() => decodeRequest(wire)).toThrow();
+  });
+
+  it("round-trips the optional structured `payload` field on a completed response", () => {
+    const payload = JSON.stringify({
+      statuses: {
+        clerk: { active: "active", uptime: "2026-06-15T00:00:00Z", memory: "256MB", pid: 7 },
+      },
+    });
+    const resp: HostdResponse = {
+      v: 1,
+      request_id: "st-1",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 12,
+      payload,
+    };
+    const decoded = decodeResponse(encodeResponse(resp).trimEnd());
+    expect(decoded).toEqual(resp);
+    // The producer-shaped JSON survives intact for the caller to re-parse.
+    expect(JSON.parse(decoded.payload!)).toEqual(JSON.parse(payload));
+  });
+
+  it("ResponseSchema accepts a response WITHOUT payload (backwards-compat)", () => {
+    const resp: HostdResponse = {
+      v: 1,
+      request_id: "no-payload",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 0,
+      stdout_tail: "hi",
+    };
+    const decoded = decodeResponse(encodeResponse(resp).trimEnd());
+    expect(decoded).toEqual(resp);
+    expect(decoded.payload).toBeUndefined();
+  });
+});
+
 describe("error_envelope — #1758 Phase 1 round-trip", () => {
   const variants: Array<{ name: string; fix: unknown }> = [
     { name: "flip_yaml_flag", fix: { kind: "flip_yaml_flag", yaml_path: "hostd.config_edit_enabled", to: true } },

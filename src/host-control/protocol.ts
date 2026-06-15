@@ -225,6 +225,44 @@ export const DoctorRequestSchema = z.object({
   args: z.object({}).optional(),
 });
 
+// ─── Dashboard read-ops (dockerless-web fix) ──────────────────────────────
+//
+// The admin dashboard ships as a DELIBERATELY dockerless container
+// (`switchroom-web`, operator uid, no docker binary/socket). That makes
+// three things impossible from the web vantage:
+//   - agent uptime/memory (needs `docker inspect`/`docker stats`),
+//   - reading each agent's `schedule.d/*.yaml` cron overlays (0600,
+//     owned by the agent container UID → operator/web gets EACCES),
+// hostd runs as root with the docker socket AND `~/.switchroom` mounted,
+// so it can do both. These two verbs are READ-ONLY and ungated for the
+// operator caller (the web reaches hostd over the operator socket, which
+// `checkGate` leaves ungated). Both return their structured result in the
+// `payload` field (JSON-encoded; bounded by the 64 KiB frame) rather than
+// the 4 KiB stdout_tail. Logs reuse the existing `agent_logs` verb.
+
+/** Whole-fleet (name omitted) or single-agent docker status — uptime +
+ *  memory + active. Read-only; result is JSON in `payload`. */
+export const AgentStatusRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("agent_status"),
+  args: z.object({
+    /** Narrow to one agent; omit ⇒ whole fleet. */
+    name: AgentNameSchema.optional(),
+  }),
+});
+
+/** Cascade-resolved cron schedule + recent fires, read FRESH so the
+ *  per-agent `schedule.d/*.yaml` overlays (which hostd can read as root)
+ *  are merged. Read-only; result is JSON in `payload`. */
+export const AgentScheduleRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("agent_schedule"),
+  args: z.object({
+    /** Narrow to one agent; omit ⇒ whole fleet. */
+    name: AgentNameSchema.optional(),
+  }),
+});
+
 /**
  * Read-only in-agent liveness battery. hostd `docker exec`s a FIXED
  * set of presence/validity probes inside the target agent container
@@ -336,6 +374,8 @@ export const RequestSchema = z.discriminatedUnion("op", [
   AgentExecRequestSchema,
   DoctorRequestSchema,
   AgentSmokeRequestSchema,
+  AgentStatusRequestSchema,
+  AgentScheduleRequestSchema,
   ConfigProposeEditRequestSchema,
 ]);
 
@@ -351,6 +391,8 @@ export type AgentLogsRequest = z.infer<typeof AgentLogsRequestSchema>;
 export type AgentExecRequest = z.infer<typeof AgentExecRequestSchema>;
 export type DoctorRequest = z.infer<typeof DoctorRequestSchema>;
 export type AgentSmokeRequest = z.infer<typeof AgentSmokeRequestSchema>;
+export type AgentStatusRequest = z.infer<typeof AgentStatusRequestSchema>;
+export type AgentScheduleRequest = z.infer<typeof AgentScheduleRequestSchema>;
 export type ConfigProposeEditRequest = z.infer<typeof ConfigProposeEditRequestSchema>;
 export type HostdRequest = z.infer<typeof RequestSchema>;
 
@@ -491,6 +533,19 @@ const ResponseEnvelope = {
   stdout_tail: z.string().optional(),
   /** Last 4 KiB of stderr. */
   stderr_tail: z.string().optional(),
+  /**
+   * Optional JSON-encoded STRUCTURED result for read-only verbs that
+   * return more than a 4 KiB text tail (e.g. `agent_status` →
+   * `{statuses}`, `agent_schedule` → `{entries, recentByAgent}`). The
+   * shape is verb-specific; the wire layer only guarantees it's a string
+   * and that the WHOLE response frame stays under `MAX_FRAME_BYTES`
+   * (64 KiB) — handlers that emit `payload` are responsible for bounding
+   * their own content (truncating prompts / fire summaries / fire counts)
+   * so the encoded frame fits. Distinct from `stdout_tail`, which is a
+   * raw process-output tail; `payload` is producer-shaped data the caller
+   * `JSON.parse`s. Absent on every existing verb (back-compatible).
+   */
+  payload: z.string().optional(),
   /** Operator-visible error message for `denied` / `error`. */
   error: z.string().optional(),
   /** Structured error envelope (#1758 Phase 1). Sibling of `error`;
