@@ -32,7 +32,7 @@
  * is tracked separately for #1163 Phase 2 follow-up).
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { ZodError } from "zod";
 import type { ScheduleEntry, SwitchroomConfig } from "./schema.js";
@@ -50,6 +50,50 @@ import { resolveDualPath } from "./paths.js";
  * agent-facing config view.
  */
 export const OVERLAY_SOURCE = Symbol.for("switchroom.config.overlay-source");
+
+/**
+ * Marker stamped on every overlay-sourced schedule entry carrying the
+ * human-readable *title* for the cron the file defines. Derived from a
+ * top-of-file `# name: <title>` comment if present, else the file's
+ * basename (sans extension) UNLESS that basename is a generic
+ * auto-generated `cron-<hash>` name — in which case there's no
+ * meaningful title and the marker is left unset.
+ *
+ * Read downstream by `collectScheduleEntries` (`scheduler/dispatch.ts`)
+ * to populate `SchedulerEntry.name`, which the dashboard's Schedule tab
+ * renders as the per-cron block header.
+ *
+ * Like {@link OVERLAY_SOURCE} it's a Symbol so it stays invisible to
+ * JSON-serialisation paths (scaffold writes, audit logs) and won't bleed
+ * into the agent-facing config view.
+ */
+export const OVERLAY_TITLE = Symbol.for("switchroom.config.overlay-title");
+
+/**
+ * Derive a human title for the cron(s) declared in an overlay file.
+ *
+ *   1. A top-of-file `# name: <title>` comment wins (authoritative even
+ *      when the filename is a `cron-<hash>.yaml` auto-name).
+ *   2. Otherwise the filename basename without its extension — a
+ *      hand-named `weekend-planner.yaml` → "weekend-planner".
+ *   3. EXCEPT a generic auto-generated `cron-<hash>` basename (the
+ *      overlay-writer's default for an un-named cron): that hash is not
+ *      a meaningful title, so return undefined.
+ *
+ * `raw` is the file's raw text (pre-YAML-parse, so the comment survives);
+ * `fileName` is the basename (e.g. "weekend-planner.yaml").
+ */
+function deriveOverlayTitle(raw: string, fileName: string): string | undefined {
+  // `[^\S\n]` = whitespace but NOT a newline, so the inter-token spacing
+  // stays on the comment's own line: a whitespace-only `# name:   ` header
+  // can't consume the newline and bleed the NEXT line in as the title.
+  const titleFromComment = raw.match(/^#[^\S\n]*name:[^\S\n]*(\S.*?)[^\S\n]*$/m)?.[1];
+  if (titleFromComment) return titleFromComment;
+  const base = fileName.replace(/\.ya?ml$/i, "");
+  // Generic auto-generated name (cron-<6+ hex>) carries no title.
+  if (/^cron-[0-9a-f]{6,}$/i.test(base)) return undefined;
+  return base.length > 0 ? base : undefined;
+}
 
 export interface OverlayWarning {
   agent: string;
@@ -94,7 +138,7 @@ function listYamlFiles(dir: string): string[] {
   return out.sort(); // stable load order for deterministic merging
 }
 
-function stampOverlay(entry: ScheduleEntry): ScheduleEntry {
+function stampOverlay(entry: ScheduleEntry, title?: string): ScheduleEntry {
   // Non-enumerable so JSON.stringify / structured logs ignore it. The
   // marker is read by downstream consumers via `(entry as any)[OVERLAY_SOURCE]`.
   Object.defineProperty(entry, OVERLAY_SOURCE, {
@@ -103,6 +147,17 @@ function stampOverlay(entry: ScheduleEntry): ScheduleEntry {
     configurable: false,
     writable: false,
   });
+  // Stamp the human title only when the file actually carries one (a
+  // `# name:` comment or a meaningful filename) — a hash-only filename
+  // leaves it unset so downstream can fall back to the cron expression.
+  if (title !== undefined) {
+    Object.defineProperty(entry, OVERLAY_TITLE, {
+      value: title,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
   return entry;
 }
 
@@ -148,6 +203,11 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
           const parsed = parseYaml(raw);
           const doc = OverlayDocSchema.parse(parsed);
 
+          // Title is per-FILE (one overlay file = one logical cron the
+          // operator/agent named) — derive once from the raw text +
+          // basename, then stamp every entry the file declares.
+          const title = deriveOverlayTitle(raw, basename(file));
+
           for (const entry of doc.schedule ?? []) {
             if (entry.secrets && entry.secrets.length > 0) {
               const w: OverlayWarning = {
@@ -162,7 +222,7 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
               );
               continue;
             }
-            merged.push(stampOverlay(entry));
+            merged.push(stampOverlay(entry, title));
           }
 
           // Phase 2 (#1163) — schedule.d files MAY also declare a

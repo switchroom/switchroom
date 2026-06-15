@@ -21,11 +21,21 @@
 import { createHash } from "node:crypto";
 import type { ActionSpec, PollSpec, ScheduleEntry, SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { OVERLAY_TITLE } from "../config/overlay-loader.js";
 
 export interface SchedulerEntry {
   agent: string;
   scheduleIndex: number;
   cron: string;
+  /**
+   * Human-readable title for this cron, surfaced in the dashboard's
+   * Schedule tab as the per-cron block header. Sourced from an overlay
+   * file's top-of-file `# name:` comment (or a meaningful filename) via
+   * the `OVERLAY_TITLE` symbol the overlay loader stamps. Absent for
+   * base-config crons and for hash-only overlay filenames (no
+   * meaningful title) — the UI falls back to the cron expression.
+   */
+  name?: string;
   /** The model-fire text (prompt/poll). Absent for kind=action — an action
    *  never fires a model, so it has no prompt. */
   prompt?: string;
@@ -88,10 +98,16 @@ export function collectScheduleEntries(
       // An action has no prompt; key the audit off its spec instead so the
       // promptKey stays a stable, non-reversible correlation id.
       const auditMaterial = entry.prompt ?? `action:${JSON.stringify(entry.action ?? {})}`;
+      // Human title: stamped by the overlay loader on the raw entry via the
+      // non-enumerable OVERLAY_TITLE symbol (survives the cascade-merge
+      // spread, same as OVERLAY_SOURCE). Absent for base-config crons and
+      // hash-only overlay filenames.
+      const title = (entry as Record<symbol, unknown>)[OVERLAY_TITLE];
       out.push({
         agent,
         scheduleIndex: i,
         cron: entry.cron,
+        ...(typeof title === "string" && title.length > 0 ? { name: title } : {}),
         ...(entry.prompt !== undefined ? { prompt: entry.prompt } : {}),
         promptKey: createHash("sha256").update(auditMaterial).digest("hex").slice(0, 12),
         // Propagate the per-entry topic override (PR1 schema field).

@@ -11,6 +11,7 @@
 
 import { describe, it, expect } from "vitest";
 import { collectScheduleEntries } from "./dispatch.js";
+import { OVERLAY_TITLE } from "../config/overlay-loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
 function configFromAgents(
@@ -137,6 +138,42 @@ describe("collectScheduleEntries — cascade resolution", () => {
     // No prompt on an action; the audit key is still present + non-empty.
     expect(entries[0]?.prompt).toBeUndefined();
     expect(entries[0]?.promptKey).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  it("surfaces an OVERLAY_TITLE-stamped raw entry as SchedulerEntry.name", () => {
+    const cfg = configFromAgents({
+      alice: {
+        schedule: [
+          // Mirror what the overlay loader stamps: a non-enumerable
+          // OVERLAY_TITLE symbol on the raw entry object.
+          (() => {
+            const e: Record<string | symbol, unknown> = {
+              cron: "0 7 * * *",
+              prompt: "morning briefing",
+            };
+            Object.defineProperty(e, OVERLAY_TITLE, {
+              value: "school-alerts-linear",
+              enumerable: false,
+              configurable: false,
+              writable: false,
+            });
+            return e;
+          })(),
+        ],
+      },
+    });
+    const entries = collectScheduleEntries(cfg);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.name).toBe("school-alerts-linear");
+  });
+
+  it("leaves SchedulerEntry.name undefined for an un-stamped (base-config) entry", () => {
+    const cfg = configFromAgents({
+      alice: { schedule: [{ cron: "0 8 * * *", prompt: "no title" }] },
+    });
+    const entries = collectScheduleEntries(cfg);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.name).toBeUndefined();
   });
 
   it("empty defaults + empty profile + empty agent yields no entries (no false positives)", () => {
