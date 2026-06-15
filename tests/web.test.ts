@@ -1519,7 +1519,7 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
     },
   ];
   const fakeSystemHealth: SystemHealth = {
-    broker: { reachable: true, active: "pixsoul", accounts: 2, agents: 1, consumers: 0 },
+    broker: { reachable: true, active: "ops@example.com", accounts: 2, agents: 1, consumers: 0 },
     hindsight: {
       containerStatus: null,
       running: true,
