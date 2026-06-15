@@ -25,17 +25,26 @@ import chalk from "chalk";
 import { readFileSync, writeFileSync } from "node:fs";
 import { getConfigPath, withConfigError } from "./helpers.js";
 import { setLinearAgent, setLinearDefaultTeam } from "./telegram-yaml.js";
-import { vaultPut } from "./telegram.js";
+import { vaultPut, vaultPutQuiet, vaultGet } from "./telegram.js";
+import { performLinearRefresh, serializeBundle } from "../linear/oauth-refresh.js";
 
 interface LinearAgentSetupOpts {
   agent: string;
   token: string;
+  refreshToken?: string;
+  tokenExpiresIn?: string;
   clientId?: string;
   clientSecret?: string;
   redirectUri?: string;
   workspaceId?: string;
   webhookBase?: string;
   dryRun?: boolean;
+}
+
+/** Vault key holding the agent's rotatable OAuth refresh bundle (JSON
+ *  string: {client_id, client_secret, refresh_token, expires_at}). */
+function bundleKeyFor(agent: string): string {
+  return `linear/${agent}/oauth`;
 }
 
 export function registerLinearAgentCommand(program: Command): void {
@@ -55,8 +64,10 @@ export function registerLinearAgentCommand(program: Command): void {
       "--token <token>",
       "The Linear OAuth app token (actor=app), obtained out-of-band via the browser authorize step. Stored in the vault, never in switchroom.yaml.",
     )
-    .option("--client-id <id>", "Linear OAuth app client id (for the printed authorize-URL hint).")
-    .option("--client-secret <secret>", "Linear OAuth app client secret (informational — not stored by this verb).")
+    .option("--client-id <id>", "Linear OAuth app client id. Stored (with --client-secret + --refresh-token) to enable unattended token refresh.")
+    .option("--client-secret <secret>", "Linear OAuth app client secret. Stored in the vault (with --client-id + --refresh-token) so the token can be refreshed without a browser re-auth.")
+    .option("--refresh-token <token>", "The refresh_token from the OAuth exchange. Stored so an expired access token self-heals (see 'linear-agent refresh').")
+    .option("--token-expires-in <seconds>", "expires_in from the OAuth token response (seconds). Records when the access token expires so refresh runs proactively. Defaults to 86400.")
     .option("--redirect-uri <uri>", "OAuth redirect URI registered on the Linear app (for the authorize-URL hint).")
     .option("--workspace-id <id>", "Optional Linear workspace (organization) id to record in config.")
     .option(
@@ -74,10 +85,29 @@ export function registerLinearAgentCommand(program: Command): void {
         }
 
         const vaultKey = `linear/${opts.agent}/token`;
+        const bundleKey = bundleKeyFor(opts.agent);
+        // Auto-refresh needs the full set: refresh_token + the app creds to
+        // exchange it. Anything less stores only the (short-lived) access
+        // token, same as before.
+        const canRefresh = Boolean(opts.refreshToken && opts.clientId && opts.clientSecret);
         if (!opts.dryRun) {
           await vaultPut(program, vaultKey, opts.token);
+          if (canRefresh) {
+            const expiresIn = Number.parseInt(opts.tokenExpiresIn ?? "", 10);
+            const ttl = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 86400;
+            const bundle = serializeBundle({
+              clientId: opts.clientId!,
+              clientSecret: opts.clientSecret!,
+              refreshToken: opts.refreshToken!,
+              expiresAt: Math.floor(Date.now() / 1000) + ttl,
+            });
+            await vaultPutQuiet(program, bundleKey, bundle);
+          }
         } else {
           console.log(chalk.gray(`[dry-run] would store the Linear token in the vault as '${vaultKey}'`));
+          if (canRefresh) {
+            console.log(chalk.gray(`[dry-run] would store the refresh bundle as '${bundleKey}' (enables auto-refresh)`));
+          }
         }
 
         const path = getConfigPath(program);
@@ -99,10 +129,72 @@ export function registerLinearAgentCommand(program: Command): void {
           writeFileSync(path, after, "utf-8");
           console.log(chalk.green(`✓ Enabled linear-agent for agent '${opts.agent}'`));
           console.log(chalk.gray(`  Vault key: ${vaultKey}`));
+          if (canRefresh) {
+            console.log(chalk.green(`✓ Auto-refresh enabled — refresh bundle stored at '${bundleKey}'`));
+            console.log(
+              chalk.gray(
+                `  Add '${bundleKey}' to agents.${opts.agent}.secrets[] so the agent can rotate it in-container (broker put).`,
+              ),
+            );
+          } else {
+            console.log(
+              chalk.yellow(
+                `⚠ No refresh bundle stored — the access token will expire (~24h) and need a manual re-auth.`,
+              ),
+            );
+            console.log(
+              chalk.gray(
+                `  To enable auto-refresh, re-run with --refresh-token <rt> --client-id <id> --client-secret <secret> --token-expires-in <sec>.`,
+              ),
+            );
+          }
           console.log(chalk.gray(`  Run 'switchroom agent restart ${opts.agent}' to pick up the change.`));
         }
 
         printLinearInstructions(opts, vaultKey);
+      }),
+    );
+
+  linear
+    .command("refresh")
+    .description(
+      "Refresh <agent>'s Linear app token using the stored refresh bundle (linear/<agent>/oauth). Exchanges the refresh_token for a fresh access token, writes it to linear/<agent>/token, and rotates the stored refresh_token + expiry. Use to recover an expired token or seed automation. Host-side write — the running agent picks it up on its next broker re-mirror / restart.",
+    )
+    .requiredOption("--agent <name>", "Agent name (must have a linear_agent block)")
+    .action(
+      withConfigError(async (opts: { agent: string }) => {
+        if (!/^[a-z][a-z0-9_-]{0,63}$/.test(opts.agent)) {
+          fail(`--agent must be a lowercase agent slug (got '${opts.agent}').`);
+        }
+        const bundleKey = bundleKeyFor(opts.agent);
+        const res = await performLinearRefresh({
+          readBundle: () => vaultGet(program, bundleKey),
+          writeToken: (t) => vaultPutQuiet(program, `linear/${opts.agent}/token`, t),
+          writeBundle: (json) => vaultPutQuiet(program, bundleKey, json),
+        });
+        if (!res.ok) {
+          if (res.reason === "no_bundle") {
+            fail(
+              `No refresh bundle at '${bundleKey}'. Provision one via 'linear-agent setup --agent ${opts.agent} ` +
+                `--token <t> --refresh-token <rt> --client-id <id> --client-secret <secret>'.`,
+            );
+          }
+          if (res.reason === "revoked") {
+            fail(
+              `Refresh token is dead (revoked/expired) — re-authorize in a browser (actor=app) and re-run setup with the new --refresh-token. (${res.detail})`,
+            );
+          }
+          fail(`Refresh failed (${res.reason}): ${res.detail}`);
+        }
+        if (res.ok) {
+          const hours = Math.max(1, Math.round((res.expiresAt - Date.now() / 1000) / 3600));
+          console.log(chalk.green(`✓ Refreshed Linear token for '${opts.agent}' (expires in ~${hours}h).`));
+          console.log(
+            chalk.gray(
+              `  Written to vault:linear/${opts.agent}/token (+ rotated bundle). Restart the agent or wait for the broker to re-mirror.`,
+            ),
+          );
+        }
       }),
     );
 
