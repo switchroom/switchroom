@@ -761,6 +761,7 @@ export function startWebServer(
                   approvals: cachedApprovals,
                   schedule: cachedSchedule,
                   accounts: cachedAccounts,
+                  memoryHealth: cachedMemoryHealth,
                 }),
               ))();
 
@@ -815,6 +816,10 @@ export function startWebServer(
             if (!result.ok) {
               return jsonResponse({ ok: false, error: result.error }, 500);
             }
+            // CONTRACT: success returns a BARE Turn[] array (same shape as
+            // /accounts + /subagents), NOT a { ok, turns } envelope — the
+            // UI's fetchAgentDetail reads `Array.isArray(body)`. Don't wrap
+            // this without updating that client read in lockstep.
             return jsonResponse(result.turns);
           }
 

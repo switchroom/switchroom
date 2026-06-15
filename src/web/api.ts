@@ -2032,9 +2032,180 @@ export interface SummaryDashboard {
   approvals: ApprovalsDashboard | null;
   schedule: ScheduleDashboard | null;
   accounts: AccountDashboardInfo[] | null;
+  /** Per-agent memory-bank health, pulled through the same cache key the
+   *  Memory tab uses. Powers the "needs attention" memory rows. null when
+   *  hindsight was unreachable / the producer threw. */
+  memoryHealth: MemoryHealth | null;
+  /** Server-derived triage list — the things that genuinely need the
+   *  operator's eye right now, sorted critical→warn→info and capped. Empty
+   *  when nothing is wrong. Each item points at the tab to investigate. */
+  attention: AttentionItem[];
   /** Oldest (min) `dataAsOf` across the parts, unix ms — the summary's
    *  effective freshness. */
   dataAsOf: number;
+}
+
+/**
+ * One row in the Summary tab's "needs attention" triage strip. Pure data,
+ * derived server-side from the parts the summary already aggregates (no
+ * new wire reads). `tab` is the dashboard tab the operator should open to
+ * act on it — the UI makes the row clickable → `switchTab(item.tab)`.
+ */
+export interface AttentionItem {
+  severity: "critical" | "warn" | "info";
+  title: string;
+  detail?: string;
+  tab: "memory" | "accounts" | "schedule" | "system" | "agents";
+}
+
+/** Severity ordering for the triage sort — lower sorts first. */
+const ATTENTION_SEVERITY_RANK: Record<AttentionItem["severity"], number> = {
+  critical: 0,
+  warn: 1,
+  info: 2,
+};
+
+/** Cap on the number of attention rows so a pathological fleet can't bloat
+ *  the strip (or the payload). The most-severe items survive the cap. */
+export const ATTENTION_MAX_ITEMS = 12;
+
+/**
+ * Derive the "needs attention" triage list from the already-aggregated
+ * summary parts. PURE — no IO, no clock except the injected `now` (used
+ * only for the token-expiry window) — so it's fully unit-testable. Every
+ * part is optional: a null/missing part contributes nothing (the summary
+ * degrades part-by-part, and so does the triage). Sorted critical→warn→
+ * info and capped at {@link ATTENTION_MAX_ITEMS}.
+ */
+export function deriveAttention(
+  parts: {
+    memoryHealth?: MemoryHealth | null;
+    accounts?: AccountDashboardInfo[] | null;
+    schedule?: ScheduleDashboard | null;
+    systemHealth?: SystemHealth | null;
+    agents?: AgentInfo[] | null;
+  },
+  now: number,
+): AttentionItem[] {
+  const items: AttentionItem[] = [];
+
+  // ── memory ───────────────────────────────────────────────────────────
+  const mem = parts.memoryHealth;
+  if (mem) {
+    if (!mem.reachable) {
+      items.push({
+        severity: "critical",
+        title: "Hindsight unreachable",
+        detail: "Memory recall and extraction are down — agents are amnesiac.",
+        tab: "memory",
+      });
+    }
+    for (const bank of mem.banks ?? []) {
+      for (const name of bank.corruptedMentalModelNames ?? []) {
+        items.push({
+          severity: "critical",
+          title: `Mental model corrupted: ${name}`,
+          detail: `Bank ${bank.bank} — an LLM-failure message is injected into every turn until refreshed.`,
+          tab: "memory",
+        });
+      }
+      if (bank.recentUnextractedCount > 0) {
+        items.push({
+          severity: "critical",
+          title: `${bank.recentUnextractedCount} unextracted conversation(s)`,
+          detail: `Bank ${bank.bank} — stored with zero extracted facts, invisible to recall.`,
+          tab: "memory",
+        });
+      }
+      if (bank.staleMentalModelCount > 0) {
+        items.push({
+          severity: "warn",
+          title: `${bank.staleMentalModelCount} stale mental model(s)`,
+          detail: `Bank ${bank.bank} — not refreshed in >7d.`,
+          tab: "memory",
+        });
+      }
+    }
+  }
+
+  // ── accounts ─────────────────────────────────────────────────────────
+  for (const acct of parts.accounts ?? []) {
+    if (acct?.quota?.exhausted) {
+      items.push({
+        severity: "warn",
+        title: `Account ${acct.label} quota exhausted`,
+        detail: acct.quota.exhausted_until
+          ? `Resets around ${new Date(acct.quota.exhausted_until).toISOString()}.`
+          : undefined,
+        tab: "accounts",
+      });
+    }
+  }
+
+  // ── schedule ─────────────────────────────────────────────────────────
+  for (const [agent, fires] of Object.entries(parts.schedule?.recentByAgent ?? {})) {
+    if ((fires ?? []).some((f) => f && f.exitCode !== 0)) {
+      items.push({
+        severity: "warn",
+        title: `Cron ${agent} last fire failed`,
+        detail: "A recent scheduled fire returned a non-zero exit code.",
+        tab: "schedule",
+      });
+    }
+  }
+
+  // ── system ───────────────────────────────────────────────────────────
+  const sys = parts.systemHealth;
+  if (sys) {
+    if (sys.broker?.reachable === false) {
+      items.push({
+        severity: "critical",
+        title: "Auth-broker unreachable",
+        detail: sys.broker.error,
+        tab: "system",
+      });
+    }
+    if (sys.hindsight?.running === false) {
+      items.push({
+        severity: "critical",
+        title: "Hindsight not running",
+        detail: "The memory backend container isn't serving.",
+        tab: "system",
+      });
+    }
+    if (sys.hostd?.error) {
+      items.push({
+        severity: "critical",
+        title: "Hostd error",
+        detail: sys.hostd.error,
+        tab: "system",
+      });
+    }
+  }
+
+  // ── agents (auth token expiry) ───────────────────────────────────────
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  for (const agent of parts.agents ?? []) {
+    const exp = agent?.auth?.expiresAt;
+    // Within the next 24h (and not already long-expired into the deep past —
+    // any future-or-recent expiry inside the window warrants a warning).
+    if (typeof exp === "number" && exp - now > 0 && exp - now < DAY_MS) {
+      items.push({
+        severity: "warn",
+        title: `${agent.name} token expires soon`,
+        detail: "OAuth token expires within 24h — re-auth before it lapses.",
+        tab: "agents",
+      });
+    }
+  }
+
+  // Stable sort critical→warn→info (Array.prototype.sort is stable in V8),
+  // then cap so the most-severe items always survive.
+  items.sort(
+    (a, b) =>
+      ATTENTION_SEVERITY_RANK[a.severity] - ATTENTION_SEVERITY_RANK[b.severity],
+  );
+  return items.slice(0, ATTENTION_MAX_ITEMS);
 }
 
 /** One cached part of the summary: the value plus when it was produced. */
@@ -2049,13 +2220,17 @@ export interface SummaryPart<T> {
  * and becomes a null field (the others still render). Pure orchestration
  * — no broker/docker/hostd knowledge — so it's unit-testable with fakes.
  */
-export async function handleGetSummary(deps: {
-  agents: () => Promise<SummaryPart<AgentInfo[]>>;
-  systemHealth: () => Promise<SummaryPart<SystemHealth>>;
-  approvals: () => Promise<SummaryPart<ApprovalsDashboard>>;
-  schedule: () => Promise<SummaryPart<ScheduleDashboard>>;
-  accounts: () => Promise<SummaryPart<AccountDashboardInfo[]>>;
-}): Promise<SummaryDashboard> {
+export async function handleGetSummary(
+  deps: {
+    agents: () => Promise<SummaryPart<AgentInfo[]>>;
+    systemHealth: () => Promise<SummaryPart<SystemHealth>>;
+    approvals: () => Promise<SummaryPart<ApprovalsDashboard>>;
+    schedule: () => Promise<SummaryPart<ScheduleDashboard>>;
+    accounts: () => Promise<SummaryPart<AccountDashboardInfo[]>>;
+    memoryHealth: () => Promise<SummaryPart<MemoryHealth>>;
+  },
+  now: number = Date.now(),
+): Promise<SummaryDashboard> {
   const safe = async <T>(
     p: () => Promise<SummaryPart<T>>,
   ): Promise<{ value: T | null; dataAsOf: number | null }> => {
@@ -2067,22 +2242,36 @@ export async function handleGetSummary(deps: {
     }
   };
 
-  const [agents, systemHealth, approvals, schedule, accounts] =
+  const [agents, systemHealth, approvals, schedule, accounts, memoryHealth] =
     await Promise.all([
       safe(deps.agents),
       safe(deps.systemHealth),
       safe(deps.approvals),
       safe(deps.schedule),
       safe(deps.accounts),
+      safe(deps.memoryHealth),
     ]);
 
   // The summary is only as fresh as its OLDEST present part. Ignore
   // nulls (a failed part has no stamp). When every part failed there's no
-  // data to stamp → 0.
-  const stamps = [agents, systemHealth, approvals, schedule, accounts]
+  // data to stamp → 0. memoryHealth participates in freshness too.
+  const stamps = [agents, systemHealth, approvals, schedule, accounts, memoryHealth]
     .map((p) => p.dataAsOf)
     .filter((d): d is number => typeof d === "number");
   const dataAsOf = stamps.length > 0 ? Math.min(...stamps) : 0;
+
+  // Server-side triage from the parts already aggregated — pure derivation,
+  // no extra reads. Each null part simply contributes nothing.
+  const attention = deriveAttention(
+    {
+      memoryHealth: memoryHealth.value,
+      accounts: accounts.value,
+      schedule: schedule.value,
+      systemHealth: systemHealth.value,
+      agents: agents.value,
+    },
+    now,
+  );
 
   return {
     agents: agents.value,
@@ -2090,6 +2279,8 @@ export async function handleGetSummary(deps: {
     approvals: approvals.value,
     schedule: schedule.value,
     accounts: accounts.value,
+    memoryHealth: memoryHealth.value,
+    attention,
     dataAsOf,
   };
 }

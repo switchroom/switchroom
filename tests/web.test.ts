@@ -117,6 +117,8 @@ import {
   __resetQuotaCacheForTests,
   __resetAgentStatusCacheForTests,
   handleGetSummary,
+  deriveAttention,
+  ATTENTION_MAX_ITEMS,
   handleMemoryReprocess,
   handleMemoryRefreshModel,
   handleMemoryBuildProfile,
@@ -126,6 +128,8 @@ import {
   type ScheduleDashboard,
   type ApprovalsDashboard,
   type AccountDashboardInfo,
+  type MemoryHealth,
+  type AttentionItem,
   type SummaryPart,
 } from "../src/web/api.js";
 import { resolveAgentsDir } from "../src/config/loader.js";
@@ -1651,22 +1655,74 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
   const fakeApprovals: ApprovalsDashboard = { reachable: true, decisions: [] };
   const fakeSchedule: ScheduleDashboard = { entries: [], recentByAgent: {} };
   const fakeAccounts: AccountDashboardInfo[] = [];
+  const fakeMemoryHealth: MemoryHealth = {
+    reachable: true,
+    url: "http://127.0.0.1:18888/mcp/",
+    banks: [],
+  };
 
-  it("returns all parts and stamps dataAsOf as the OLDEST part", async () => {
+  it("returns all parts (incl memoryHealth) and stamps dataAsOf as the OLDEST part", async () => {
     const out = await handleGetSummary({
       agents: async () => part(fakeAgents, 1000),
       systemHealth: async () => part(fakeSystemHealth, 3000),
       approvals: async () => part(fakeApprovals, 2000),
       schedule: async () => part(fakeSchedule, 5000),
       accounts: async () => part(fakeAccounts, 4000),
+      memoryHealth: async () => part(fakeMemoryHealth, 6000),
     });
     expect(out.agents).toEqual(fakeAgents);
     expect(out.systemHealth).toEqual(fakeSystemHealth);
     expect(out.approvals).toEqual(fakeApprovals);
     expect(out.schedule).toEqual(fakeSchedule);
     expect(out.accounts).toEqual(fakeAccounts);
-    // Oldest of {1000,3000,2000,5000,4000} = 1000.
+    expect(out.memoryHealth).toEqual(fakeMemoryHealth);
+    // A healthy fleet → no attention rows.
+    expect(out.attention).toEqual([]);
+    // Oldest of {1000,3000,2000,5000,4000,6000} = 1000.
     expect(out.dataAsOf).toBe(1000);
+  });
+
+  it("derives `attention` from the parts (memory + broker)", async () => {
+    const memUnhealthy: MemoryHealth = {
+      reachable: true,
+      url: "http://127.0.0.1:18888/mcp/",
+      banks: [
+        {
+          bank: "coach-mem",
+          agents: ["coach"],
+          ok: true,
+          totalDocuments: 5,
+          totalFacts: 10,
+          pendingOperations: 0,
+          newestDocumentAt: null,
+          recentUnextractedCount: 2,
+          oldestUnextractedAt: null,
+          unextractedDocIds: [],
+          mentalModels: [],
+          staleMentalModelCount: 0,
+          corruptedMentalModelNames: [],
+          status: "fail",
+          statusDetail: "gaps",
+        },
+      ],
+    };
+    const sysBrokerDown: SystemHealth = {
+      ...fakeSystemHealth,
+      broker: { reachable: false, error: "socket missing" },
+    };
+    const out = await handleGetSummary({
+      agents: async () => part(fakeAgents, 1000),
+      systemHealth: async () => part(sysBrokerDown, 1000),
+      approvals: async () => part(fakeApprovals, 1000),
+      schedule: async () => part(fakeSchedule, 1000),
+      accounts: async () => part(fakeAccounts, 1000),
+      memoryHealth: async () => part(memUnhealthy, 1000),
+    });
+    // Both a critical (broker + unextracted) surface; criticals sort first.
+    expect(out.attention.length).toBeGreaterThanOrEqual(2);
+    expect(out.attention[0].severity).toBe("critical");
+    expect(out.attention.some((a) => a.tab === "system")).toBe(true);
+    expect(out.attention.some((a) => a.tab === "memory")).toBe(true);
   });
 
   it("tolerates ONE producer throwing — that field is null, the rest present", async () => {
@@ -1678,17 +1734,21 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
       approvals: async () => part(fakeApprovals, 2000),
       schedule: async () => part(fakeSchedule, 5000),
       accounts: async () => part(fakeAccounts, 4000),
+      memoryHealth: async () => part(fakeMemoryHealth, 6000),
     });
     expect(out.systemHealth).toBeNull(); // the failed part
     expect(out.agents).toEqual(fakeAgents); // others unaffected
     expect(out.approvals).toEqual(fakeApprovals);
     expect(out.schedule).toEqual(fakeSchedule);
     expect(out.accounts).toEqual(fakeAccounts);
+    expect(out.memoryHealth).toEqual(fakeMemoryHealth);
+    // A null part contributes nothing to attention (no throw).
+    expect(out.attention).toEqual([]);
     // dataAsOf ignores the null part → oldest of the survivors = 1000.
     expect(out.dataAsOf).toBe(1000);
   });
 
-  it("when EVERY producer throws, all fields null and dataAsOf 0", async () => {
+  it("when EVERY producer throws, all fields null, attention empty, dataAsOf 0", async () => {
     const boom = async (): Promise<never> => {
       throw new Error("nope");
     };
@@ -1698,18 +1758,21 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
       approvals: boom,
       schedule: boom,
       accounts: boom,
+      memoryHealth: boom,
     });
     expect(out.agents).toBeNull();
     expect(out.systemHealth).toBeNull();
     expect(out.approvals).toBeNull();
     expect(out.schedule).toBeNull();
     expect(out.accounts).toBeNull();
+    expect(out.memoryHealth).toBeNull();
+    expect(out.attention).toEqual([]);
     expect(out.dataAsOf).toBe(0);
   });
 
   it("runs the producers concurrently (Promise.all, not sequential)", async () => {
     // If serialized, the second producer would observe the first already
-    // settled. We assert all five were INVOKED before any resolves by
+    // settled. We assert all six were INVOKED before any resolves by
     // counting starts before the gate opens.
     let started = 0;
     let release!: () => void;
@@ -1729,14 +1792,263 @@ describe("handleGetSummary — cached aggregate for the Summary tab", () => {
       approvals: mk(fakeApprovals),
       schedule: mk(fakeSchedule),
       accounts: mk(fakeAccounts),
+      memoryHealth: mk(fakeMemoryHealth),
     });
     // Let the microtasks up to the gate run.
     await Promise.resolve();
     await Promise.resolve();
-    expect(started).toBe(5); // all kicked before any completed
+    expect(started).toBe(6); // all kicked before any completed
     release();
     const out = await p;
     expect(out.agents).toEqual(fakeAgents);
+  });
+});
+
+describe("deriveAttention — server-side triage derivation (pure)", () => {
+  const NOW = 1_700_000_000_000;
+
+  const mkBank = (
+    over: Partial<MemoryHealth["banks"][number]> = {},
+  ): MemoryHealth["banks"][number] => ({
+    bank: "coach-mem",
+    agents: ["coach"],
+    ok: true,
+    totalDocuments: 1,
+    totalFacts: 1,
+    pendingOperations: 0,
+    newestDocumentAt: null,
+    recentUnextractedCount: 0,
+    oldestUnextractedAt: null,
+    unextractedDocIds: [],
+    mentalModels: [],
+    staleMentalModelCount: 0,
+    corruptedMentalModelNames: [],
+    status: "ok",
+    statusDetail: "facts flowing",
+    ...over,
+  });
+
+  it("empty/healthy inputs → no items", () => {
+    expect(deriveAttention({}, NOW)).toEqual([]);
+    expect(
+      deriveAttention(
+        {
+          memoryHealth: { reachable: true, url: "u", banks: [] },
+          accounts: [],
+          schedule: { entries: [], recentByAgent: {} },
+          systemHealth: {
+            broker: { reachable: true },
+            hindsight: {
+              containerStatus: null,
+              running: true,
+              model: null,
+              provider: null,
+              mcpStateless: null,
+            },
+            hostd: { auditLogPresent: true, recent: [] },
+          },
+          agents: [],
+        },
+        NOW,
+      ),
+    ).toEqual([]);
+  });
+
+  it("null/missing parts contribute nothing", () => {
+    expect(
+      deriveAttention(
+        {
+          memoryHealth: null,
+          accounts: null,
+          schedule: null,
+          systemHealth: null,
+          agents: null,
+        },
+        NOW,
+      ),
+    ).toEqual([]);
+  });
+
+  it("memory: corrupted model → critical/memory", () => {
+    const out = deriveAttention(
+      {
+        memoryHealth: {
+          reachable: true,
+          url: "u",
+          banks: [mkBank({ corruptedMentalModelNames: ["user-profile"] })],
+        },
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "critical", tab: "memory" });
+    expect(out[0].title).toContain("user-profile");
+  });
+
+  it("memory: recent unextracted → critical/memory", () => {
+    const out = deriveAttention(
+      {
+        memoryHealth: {
+          reachable: true,
+          url: "u",
+          banks: [mkBank({ recentUnextractedCount: 3 })],
+        },
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "critical", tab: "memory" });
+  });
+
+  it("memory: stale model → warn/memory", () => {
+    const out = deriveAttention(
+      {
+        memoryHealth: {
+          reachable: true,
+          url: "u",
+          banks: [mkBank({ staleMentalModelCount: 2 })],
+        },
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "warn", tab: "memory" });
+  });
+
+  it("memory: unreachable hindsight → critical/memory", () => {
+    const out = deriveAttention(
+      { memoryHealth: { reachable: false, url: "u", banks: [] } },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "critical", tab: "memory" });
+  });
+
+  it("accounts: exhausted quota → warn/accounts", () => {
+    const out = deriveAttention(
+      {
+        accounts: [
+          {
+            label: "pix@x",
+            quota: { exhausted: true, exhausted_until: NOW + 3600_000 },
+          } as unknown as AccountDashboardInfo,
+          {
+            label: "ok@x",
+            quota: { exhausted: false },
+          } as unknown as AccountDashboardInfo,
+        ],
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "warn", tab: "accounts" });
+    expect(out[0].title).toContain("pix@x");
+  });
+
+  it("schedule: a non-zero recent fire → warn/schedule", () => {
+    const out = deriveAttention(
+      {
+        schedule: {
+          entries: [],
+          recentByAgent: {
+            clerk: [
+              { exitCode: 0 } as never,
+              { exitCode: -1 } as never,
+            ],
+            ok: [{ exitCode: 0 } as never],
+          },
+        },
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "warn", tab: "schedule" });
+    expect(out[0].title).toContain("clerk");
+  });
+
+  it("system: broker down / hindsight down / hostd error → critical/system", () => {
+    const out = deriveAttention(
+      {
+        systemHealth: {
+          broker: { reachable: false, error: "no socket" },
+          hindsight: {
+            containerStatus: null,
+            running: false,
+            model: null,
+            provider: null,
+            mcpStateless: null,
+          },
+          hostd: { auditLogPresent: false, recent: [], error: "audit unreadable" },
+        },
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(3);
+    expect(out.every((a) => a.severity === "critical" && a.tab === "system")).toBe(true);
+  });
+
+  it("agents: token expiring within 24h → warn/agents; far-future does not", () => {
+    const mkAgent = (name: string, expiresAt?: number): AgentInfo =>
+      ({
+        name,
+        active: "active",
+        uptime: null,
+        memory: null,
+        extends: "default",
+        topic_name: name,
+        auth: { authenticated: true, expiresAt },
+        memoryCollection: `${name}-mem`,
+        lastTurnAt: null,
+      } as AgentInfo);
+    const out = deriveAttention(
+      {
+        agents: [
+          mkAgent("soon", NOW + 60 * 60 * 1000), // 1h → warn
+          mkAgent("later", NOW + 48 * 60 * 60 * 1000), // 48h → no
+          mkAgent("past", NOW - 1000), // already expired → no (window is future)
+          mkAgent("none"), // no expiry → no
+        ],
+      },
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ severity: "warn", tab: "agents" });
+    expect(out[0].title).toContain("soon");
+  });
+
+  it("sorts critical → warn → info", () => {
+    const out = deriveAttention(
+      {
+        memoryHealth: {
+          reachable: true,
+          url: "u",
+          banks: [
+            mkBank({ staleMentalModelCount: 1 }), // warn
+            mkBank({ recentUnextractedCount: 1 }), // critical
+          ],
+        },
+      },
+      NOW,
+    );
+    expect(out.map((a) => a.severity)).toEqual(["critical", "warn"]);
+  });
+
+  it("caps the list at ATTENTION_MAX_ITEMS, keeping the most severe", () => {
+    // 20 stale-model (warn) banks + 1 unextracted (critical) bank.
+    const banks: MemoryHealth["banks"] = [];
+    for (let i = 0; i < 20; i++) {
+      banks.push(mkBank({ bank: `bank${i}`, staleMentalModelCount: 1 }));
+    }
+    banks.push(mkBank({ bank: "critical-bank", recentUnextractedCount: 1 }));
+    const out = deriveAttention(
+      { memoryHealth: { reachable: true, url: "u", banks } },
+      NOW,
+    );
+    expect(out).toHaveLength(ATTENTION_MAX_ITEMS);
+    // The single critical must survive the cap (sorted first).
+    expect(out[0].severity).toBe("critical");
+    const items: AttentionItem[] = out;
+    expect(items.every((a) => a.severity !== "info")).toBe(true);
   });
 });
 
