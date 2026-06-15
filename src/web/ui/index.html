@@ -808,22 +808,29 @@
       if (tab === 'approvals') fetchApprovals();
     }
 
-    // Fleet overview — aggregates the cheap endpoints client-side
-    // (one parallel fan-out; no new server work, no extra docker/probe
-    // cost beyond what those tabs already do). Each tile degrades
-    // independently if its source errors.
+    // Fleet overview — ONE round-trip to the server-side aggregate
+    // (/api/summary), which pulls each part through the same per-tab
+    // cache so a Summary open warms the tabs and they can never disagree.
+    // Each tile still degrades independently: the server nulls any part
+    // whose producer threw, and a whole-fetch failure leaves the prior
+    // render in place.
     async function fetchSummary() {
       const el = document.getElementById('summary');
-      const get = async (p) => {
-        try {
-          const r = await fetch(`${API}${p}`, { headers: authHeaders() });
-          return r.ok ? await r.json() : null;
-        } catch { return null; }
-      };
-      const [ag, sys, appr, sched, accts] = await Promise.all([
-        get('/api/agents'), get('/api/system-health'),
-        get('/api/approvals'), get('/api/schedule'), get('/api/accounts'),
-      ]);
+      let summary;
+      try {
+        const r = await fetch(`${API}/api/summary`, { headers: authHeaders() });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        summary = await r.json();
+      } catch (err) {
+        // Degraded: keep whatever's already rendered (don't blank the
+        // tab on a transient blip) and surface the error.
+        el.classList.remove('loading');
+        showError(`Failed to fetch summary: ${err.message}`);
+        return;
+      }
+      const ag = summary.agents, sys = summary.systemHealth,
+            appr = summary.approvals, sched = summary.schedule,
+            accts = summary.accounts;
       clearError();
       const tile = (title, body, ok) => `
         <div class="agent-card" style="min-width:220px">
@@ -899,7 +906,13 @@
       } else quotaTile = tile('Quota', dim('unavailable'), null);
 
       el.classList.remove('loading');
-      el.innerHTML = `<div class="agents-grid">${agentsTile}${brokerTile}${hsTile}${hostdTile}${apprTile}${schedTile}${quotaTile}</div>`;
+      // "data as of" — the summary's freshness is its OLDEST part (server
+      // sends the min dataAsOf). A tiny muted line; refreshed on every
+      // tab-open. `formatTimestamp` renders it as "Ns/Nm ago".
+      const asOf = (typeof summary.dataAsOf === 'number' && summary.dataAsOf > 0)
+        ? `<div style="color:var(--text-dim);font-size:.75rem;margin:.25rem 0 .5rem">data as of ${escapeHtml(formatTimestamp(summary.dataAsOf))}</div>`
+        : '';
+      el.innerHTML = `${asOf}<div class="agents-grid">${agentsTile}${brokerTile}${hsTile}${hostdTile}${apprTile}${schedTile}${quotaTile}</div>`;
     }
 
     function showError(msg) {
@@ -1271,7 +1284,13 @@
           <tbody>${rows}</tbody></table>`;
       }
 
+      // Subtle freshness hint: the cached object carries `stale:true` when
+      // it's being served past its TTL while a background refresh runs.
+      const updating = h.stale
+        ? `<span style="color:var(--text-dim);font-size:.7rem;margin-left:.4rem">(updating…)</span>`
+        : '';
       container.innerHTML = `
+        ${updating ? `<div style="margin-bottom:.4rem">System health ${updating}</div>` : ''}
         <div class="agents-grid">
           <div class="agent-card"><div class="card-header" style="cursor:default">
             ${dot(b.reachable)}<span class="agent-name">auth-broker</span></div>
@@ -1757,7 +1776,14 @@
     fetchSummary();
     fetchAgents();
     connectWebSocket();
-    setInterval(fetchAgents, 10000);
+    // Fleet poll — gated on tab visibility. A phone with the dashboard
+    // backgrounded (or a laptop tab the operator switched away from)
+    // shouldn't keep hitting the host every 10s; the cache absorbs the
+    // cost, but skipping the request entirely is strictly better. The
+    // next foregrounded tick refreshes immediately.
+    setInterval(() => {
+      if (document.visibilityState === 'visible') fetchAgents();
+    }, 10000);
   </script>
 </body>
 </html>

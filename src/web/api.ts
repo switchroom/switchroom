@@ -88,6 +88,39 @@ import {
 } from "../auth/broker/client.js";
 import { openTurnsDb, listTurnsForAgent, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
 import { applySubagentsSchema, listSubagents, type Subagent } from "../../telegram-plugin/registry/subagents-schema.js";
+import { SwrCache } from "./cache.js";
+
+/**
+ * Shared stale-while-revalidate cache for the dashboard's read-only
+ * panels. Every expensive READ route (system-health, memory-health,
+ * schedule, agents, accounts, approvals) goes through this so a tab-open
+ * or poll-tick serves a cached value fast and at most one background
+ * refresh hits the host (docker inspect / broker RPC / hindsight probe /
+ * hostd round-trip / per-agent sqlite). The `/api/summary` aggregate
+ * pulls each part through the SAME keys + TTLs, so a Summary open warms
+ * the per-tab caches (and vice-versa) — they can never disagree.
+ *
+ * NOT cached: the billed quota refresh (`handleRefreshAccountsQuota`),
+ * any mutation (start/stop/restart/use/connect/access), webhooks, logs WS.
+ */
+export const dashboardCache = new SwrCache();
+
+/** Cache TTLs (ms), keyed by the dashboard route. Tuned per cost/churn:
+ *  fast-changing + cheap (agents) gets a short TTL; expensive + slow-
+ *  changing (memory-health, one MCP round-trip per bank) gets a long one. */
+export const DASHBOARD_CACHE_TTL = {
+  "system-health": 15000,
+  "memory-health": 60000,
+  schedule: 30000,
+  agents: 5000,
+  accounts: 10000,
+  approvals: 15000,
+} as const;
+
+/** Test-only: reset the shared dashboard cache between cases. */
+export function __resetDashboardCacheForTests(): void {
+  dashboardCache.clear();
+}
 
 export interface AgentInfo {
   name: string;
@@ -1685,4 +1718,86 @@ export async function handleGetMemoryHealth(
 
   rows.sort((a, b) => a.bank.localeCompare(b.bank));
   return { reachable, url, banks: rows };
+}
+
+/**
+ * The default Summary tab's single round-trip. Aggregates the cached
+ * reads the tiles need so the client fetches ONE endpoint instead of
+ * five. Each part is pulled through the SAME per-tab cache key + TTL it
+ * has on its own route — so a Summary open warms the per-tab caches (and
+ * vice-versa) and the two surfaces can never show different numbers.
+ *
+ * Each field degrades INDEPENDENTLY: the parts run under `Promise.all`,
+ * but every producer is wrapped so a throw yields `null` for that field
+ * (and `dataAsOf` 0 for the stamp calc) rather than failing the whole
+ * summary. `dataAsOf` is the OLDEST of the parts' stamps (the summary is
+ * only as fresh as its stalest piece). The caller (server.ts) supplies
+ * the cache-bound producers via `deps`; the default reads are wired there.
+ */
+export interface SummaryDashboard {
+  agents: AgentInfo[] | null;
+  systemHealth: SystemHealth | null;
+  approvals: ApprovalsDashboard | null;
+  schedule: ScheduleDashboard | null;
+  accounts: AccountDashboardInfo[] | null;
+  /** Oldest (min) `dataAsOf` across the parts, unix ms — the summary's
+   *  effective freshness. */
+  dataAsOf: number;
+}
+
+/** One cached part of the summary: the value plus when it was produced. */
+export interface SummaryPart<T> {
+  value: T;
+  dataAsOf: number;
+}
+
+/**
+ * Aggregate the summary from cache-bound producers. Each `deps.<part>`
+ * returns the cached value + its `dataAsOf`; a rejection is caught here
+ * and becomes a null field (the others still render). Pure orchestration
+ * — no broker/docker/hostd knowledge — so it's unit-testable with fakes.
+ */
+export async function handleGetSummary(deps: {
+  agents: () => Promise<SummaryPart<AgentInfo[]>>;
+  systemHealth: () => Promise<SummaryPart<SystemHealth>>;
+  approvals: () => Promise<SummaryPart<ApprovalsDashboard>>;
+  schedule: () => Promise<SummaryPart<ScheduleDashboard>>;
+  accounts: () => Promise<SummaryPart<AccountDashboardInfo[]>>;
+}): Promise<SummaryDashboard> {
+  const safe = async <T>(
+    p: () => Promise<SummaryPart<T>>,
+  ): Promise<{ value: T | null; dataAsOf: number | null }> => {
+    try {
+      const r = await p();
+      return { value: r.value, dataAsOf: r.dataAsOf };
+    } catch {
+      return { value: null, dataAsOf: null };
+    }
+  };
+
+  const [agents, systemHealth, approvals, schedule, accounts] =
+    await Promise.all([
+      safe(deps.agents),
+      safe(deps.systemHealth),
+      safe(deps.approvals),
+      safe(deps.schedule),
+      safe(deps.accounts),
+    ]);
+
+  // The summary is only as fresh as its OLDEST present part. Ignore
+  // nulls (a failed part has no stamp). When every part failed there's no
+  // data to stamp → 0.
+  const stamps = [agents, systemHealth, approvals, schedule, accounts]
+    .map((p) => p.dataAsOf)
+    .filter((d): d is number => typeof d === "number");
+  const dataAsOf = stamps.length > 0 ? Math.min(...stamps) : 0;
+
+  return {
+    agents: agents.value,
+    systemHealth: systemHealth.value,
+    approvals: approvals.value,
+    schedule: schedule.value,
+    accounts: accounts.value,
+    dataAsOf,
+  };
 }

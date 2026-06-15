@@ -39,7 +39,16 @@ import {
   handleGetNotionWorkspace,
   handleGetSchedule,
   handleGetApprovals,
+  handleGetSummary,
+  dashboardCache,
+  DASHBOARD_CACHE_TTL,
+  type AgentInfo,
+  type SystemHealth,
+  type ScheduleDashboard,
+  type ApprovalsDashboard,
+  type AccountDashboardInfo,
 } from "./api.js";
+import type { CachedResult } from "./cache.js";
 import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
@@ -409,6 +418,12 @@ function parseRoute(
     return { handler: "getAgents", params: {} };
   }
 
+  // GET /api/summary — one aggregate of the cached reads for the Summary
+  // tab, so it needs a single round-trip instead of fanning out to five.
+  if (method === "GET" && pathname === "/api/summary") {
+    return { handler: "getSummary", params: {} };
+  }
+
   // GET /api/agents/:name/logs
   const logsMatch = pathname.match(/^\/api\/agents\/([^/]+)\/logs$/);
   if (method === "GET" && logsMatch) {
@@ -575,6 +590,57 @@ export function startWebServer(
     }
   };
 
+  // ── Cached read producers ────────────────────────────────────────────
+  // Every expensive READ panel routes through `dashboardCache` (a tiny
+  // stale-while-revalidate cache) keyed by the route name, so a tab-open
+  // / poll-tick serves a cached value fast and at most ONE background
+  // refresh hits the host. These producers are shared verbatim by the
+  // per-tab routes AND `/api/summary` — same key + TTL — so a Summary
+  // open warms the tabs (and vice-versa) and the two can never disagree.
+  // Each returns the cached value plus its `dataAsOf` stamp. Producers
+  // re-read `freshConfig()` per refresh (the config can change under us).
+  const cachedAgents = (): Promise<CachedResult<AgentInfo[]>> =>
+    dashboardCache.get(
+      "agents",
+      DASHBOARD_CACHE_TTL.agents,
+      () => handleGetAgents(freshConfig()),
+    );
+  const cachedSystemHealth = (): Promise<CachedResult<SystemHealth>> =>
+    dashboardCache.get(
+      "system-health",
+      DASHBOARD_CACHE_TTL["system-health"],
+      () => handleGetSystemHealth(freshConfig()),
+    );
+  const cachedMemoryHealth = () =>
+    dashboardCache.get(
+      "memory-health",
+      DASHBOARD_CACHE_TTL["memory-health"],
+      () => handleGetMemoryHealth(freshConfig()),
+    );
+  const cachedSchedule = (): Promise<CachedResult<ScheduleDashboard>> =>
+    dashboardCache.get(
+      "schedule",
+      DASHBOARD_CACHE_TTL.schedule,
+      () => handleGetSchedule(freshConfig()),
+    );
+  const cachedApprovals = (): Promise<CachedResult<ApprovalsDashboard>> =>
+    dashboardCache.get(
+      "approvals",
+      DASHBOARD_CACHE_TTL.approvals,
+      () => handleGetApprovals(),
+    );
+  const cachedAccounts = (): Promise<CachedResult<AccountDashboardInfo[]>> =>
+    dashboardCache.get(
+      "accounts",
+      DASHBOARD_CACHE_TTL.accounts,
+      () => handleGetAccounts(freshConfig()),
+    );
+
+  /** Attach the cache stamp to an OBJECT response. Arrays stay bare (the
+   *  UI expects a raw array there) — only object panels carry the stamp. */
+  const withStamp = <T extends object>(part: CachedResult<T>): T =>
+    ({ ...part.value, dataAsOf: part.dataAsOf, stale: part.stale } as T);
+
   // Loopback-only when binding to a localhost address; any other bind address
   // (including 0.0.0.0) is considered a deliberate network-exposure opt-in.
   const localhostOnly =
@@ -643,7 +709,22 @@ export function startWebServer(
 
         switch (route.handler) {
           case "getAgents":
-            return (async () => jsonResponse(await handleGetAgents(freshConfig())))();
+            // Array response — the UI expects a bare array, so DON'T wrap
+            // it; the cache still speeds the poll. Stamp lives on the
+            // object panels + the summary.
+            return (async () => jsonResponse((await cachedAgents()).value))();
+
+          case "getSummary":
+            return (async () =>
+              jsonResponse(
+                await handleGetSummary({
+                  agents: cachedAgents,
+                  systemHealth: cachedSystemHealth,
+                  approvals: cachedApprovals,
+                  schedule: cachedSchedule,
+                  accounts: cachedAccounts,
+                }),
+              ))();
 
           case "getLogs": {
             const agentName = route.params.name;
@@ -714,11 +795,11 @@ export function startWebServer(
 
           case "getSystemHealth":
             return (async () =>
-              jsonResponse(await handleGetSystemHealth(freshConfig())))();
+              jsonResponse(withStamp(await cachedSystemHealth())))();
 
           case "getMemoryHealth":
             return (async () =>
-              jsonResponse(await handleGetMemoryHealth(freshConfig())))();
+              jsonResponse(withStamp(await cachedMemoryHealth())))();
 
           case "getGoogleAccounts":
             return (async () =>
@@ -733,15 +814,15 @@ export function startWebServer(
 
           case "getSchedule":
             return (async () =>
-              jsonResponse(await handleGetSchedule(freshConfig())))();
+              jsonResponse(withStamp(await cachedSchedule())))();
 
           case "getApprovals":
             return (async () =>
-              jsonResponse(await handleGetApprovals()))();
+              jsonResponse(withStamp(await cachedApprovals())))();
 
           case "getAccounts":
-            return (async () =>
-              jsonResponse(await handleGetAccounts(freshConfig())))();
+            // Array response — bare array, no stamp wrap (see getAgents).
+            return (async () => jsonResponse((await cachedAccounts()).value))();
 
           case "useAccount": {
             return (async () => {
