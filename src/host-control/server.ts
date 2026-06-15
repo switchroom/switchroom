@@ -40,7 +40,7 @@ import {
   closeSync,
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
-import { randomUUID, randomBytes } from "node:crypto";
+import { createHash, randomUUID, randomBytes } from "node:crypto";
 import {
   decodeRequest,
   encodeResponse,
@@ -1426,8 +1426,61 @@ export class HostdServer {
         .build(req.request_id, Date.now() - started);
     }
     const callerName = caller.kind === "agent" ? caller.name : "operator";
+    // ── Idempotency: collapse identical in-flight proposals ─────────
+    // A re-fired identical proposal (same caller + same diff) must not
+    // post a SECOND approval card or apply twice. Key by caller+diff
+    // hash and share the in-flight promise so duplicate/concurrent
+    // proposals converge on ONE card and EXACTLY ONE apply. This is
+    // the invariant that survives the 2026-06-15 klanker debacle's
+    // failure class: re-fires (then driven by a 10s wire timeout) had
+    // stacked phantom cards and double-wrote a config entry.
+    const dedupeKey = `${callerName}:${createHash("sha256")
+      .update(req.args.unified_diff)
+      .digest("hex")}`;
+    const pending = this.inflightConfigProposals.get(dedupeKey);
+    if (pending) {
+      process.stderr.write(
+        `hostd: config_propose_edit — collapsed identical in-flight proposal from ${callerName} (dedupe)\n`,
+      );
+      return await pending;
+    }
+    const run = this.runConfigProposeApprovalAndApply(
+      req,
+      caller,
+      callerName,
+      configPath,
+      verdict.postApplyContent,
+      started,
+    );
+    this.inflightConfigProposals.set(dedupeKey, run);
+    try {
+      return await run;
+    } finally {
+      this.inflightConfigProposals.delete(dedupeKey);
+    }
+  }
+
+  /** In-flight config_propose_edit proposals, keyed by caller+diff hash. */
+  private inflightConfigProposals = new Map<string, Promise<HostdResponse>>();
+
+  /**
+   * The approval-card + mutex-serialized apply phase of
+   * `config_propose_edit`, split out so identical in-flight proposals
+   * can be deduped onto a single shared promise (exactly-once apply).
+   * Caller (`handleConfigProposeEdit`) has already validated the diff,
+   * passed the self-scope gate, and confirmed the approval gateway is
+   * wired.
+   */
+  private async runConfigProposeApprovalAndApply(
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    callerName: string,
+    configPath: string,
+    postApply: string,
+    started: number,
+  ): Promise<HostdResponse> {
     const approvalId = (this.opts.generateApprovalId ?? defaultApprovalId)();
-    const approval = await this.opts.approvalGateway.requestApproval({
+    const approval = await this.opts.approvalGateway!.requestApproval({
       requestId: approvalId,
       agentName: callerName,
       reason: req.args.reason,
@@ -1509,7 +1562,6 @@ export class HostdServer {
           started,
         );
       }
-      const postApply = verdict.postApplyContent;
       // In-place write preserving the inode (bind-mount safe). The old
       // `<path>.tmp` → rename() swap returned EBUSY here because
       // switchroom.yaml is itself a read-only bind-mount source mounted
