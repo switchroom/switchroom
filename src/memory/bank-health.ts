@@ -43,6 +43,25 @@ export interface BankMentalModelSummary {
   sourceQuery: string;
   /** Refresh trigger mode (`full` | `incremental` | …) from `trigger.mode`. */
   refreshMode: string | null;
+  /**
+   * Provenance: count of the source facts this model was synthesized FROM,
+   * keyed by fact type (observation, directives, world, opinion, experience,
+   * mental-models). Extracted from the list call's `reflect_response.based_on`
+   * — no extra round-trip. Small (counts only; the heavy fact text is
+   * dropped). `{}` when the model has no recorded provenance.
+   */
+  basedOnCounts: Record<string, number>;
+  /** Sum of `basedOnCounts` — total source facts behind this model. */
+  totalSourceFacts: number;
+  /**
+   * The "relationships": ids of the OTHER mental models in this bank that this
+   * model synthesizes from (from `based_on["mental-models"]`). A model with a
+   * non-empty list is a *hub* drawing on *leaf* models; an empty list is a leaf
+   * built only from raw facts. Resolvable to display names within the bank's
+   * own `mentalModels[]`. This is what lets the dashboard draw the model→model
+   * dependency graph.
+   */
+  derivedFromModelIds: string[];
 }
 
 /**
@@ -71,6 +90,8 @@ export interface MentalModelDetail {
   basedOnCounts: Record<string, number>;
   /** Sum of basedOnCounts — total source facts behind this model. */
   totalSourceFacts: number;
+  /** Ids of the other mental models this one synthesizes from (the edges). */
+  derivedFromModelIds: string[];
 }
 
 export interface BankHealth {
@@ -122,6 +143,40 @@ async function getJson<T>(
     if ((err as Error).name === "AbortError") return { ok: false, reason: "Timeout" };
     return { ok: false, reason: String((err as Error).message ?? err) };
   }
+}
+
+interface BasedOnSummary {
+  basedOnCounts: Record<string, number>;
+  totalSourceFacts: number;
+  derivedFromModelIds: string[];
+}
+
+/**
+ * Parse hindsight's `reflect_response.based_on` (a map of fact-type → array of
+ * source facts) into compact provenance: per-type counts, the total, and the
+ * ids of the OTHER mental models this one derives from (the `mental-models`
+ * bucket — the model→model edges). Tolerant of any shape; the heavy per-fact
+ * text is dropped — we keep only counts + edge ids.
+ */
+function summarizeBasedOn(
+  reflect?: { based_on?: Record<string, unknown> | null } | null,
+): BasedOnSummary {
+  const basedOn = reflect?.based_on ?? {};
+  const basedOnCounts: Record<string, number> = {};
+  let totalSourceFacts = 0;
+  const derivedFromModelIds: string[] = [];
+  for (const [type, facts] of Object.entries(basedOn ?? {})) {
+    if (!Array.isArray(facts)) continue;
+    basedOnCounts[type] = facts.length;
+    totalSourceFacts += facts.length;
+    if (type === "mental-models") {
+      for (const f of facts) {
+        const id = (f as { id?: unknown })?.id;
+        if (typeof id === "string" && id) derivedFromModelIds.push(id);
+      }
+    }
+  }
+  return { basedOnCounts, totalSourceFacts, derivedFromModelIds };
 }
 
 /**
@@ -176,6 +231,7 @@ export async function inspectBankHealth(
       content?: string | null;
       source_query?: string | null;
       trigger?: { mode?: string | null } | null;
+      reflect_response?: { based_on?: Record<string, unknown> | null } | null;
     }>;
   }>(`${base}/v1/default/banks/${bank}/mental-models`, opts);
   if (!models.ok) return { ...empty, reason: models.reason };
@@ -208,19 +264,26 @@ export async function inspectBankHealth(
     newestDocumentAt,
     unextractedDocuments: unextracted,
     mentalModels: (models.data.items ?? [])
-      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null; source_query?: string | null; trigger?: { mode?: string | null } | null } =>
+      .filter((m): m is { id: string; name: string; last_refreshed_at?: string | null; created_at?: string | null; content?: string | null; source_query?: string | null; trigger?: { mode?: string | null } | null; reflect_response?: { based_on?: Record<string, unknown> | null } | null } =>
         typeof m?.id === "string" && typeof m?.name === "string",
       )
-      .map((m) => ({
-        id: m.id,
-        name: m.name,
-        lastRefreshedAt: m.last_refreshed_at ?? null,
-        createdAt: m.created_at ?? null,
-        contentLength: (m.content ?? "").length,
-        contentHead: (m.content ?? "").slice(0, 200),
-        sourceQuery: m.source_query ?? "",
-        refreshMode: m.trigger?.mode ?? null,
-      })),
+      .map((m) => {
+        const { basedOnCounts, totalSourceFacts, derivedFromModelIds } =
+          summarizeBasedOn(m.reflect_response);
+        return {
+          id: m.id,
+          name: m.name,
+          lastRefreshedAt: m.last_refreshed_at ?? null,
+          createdAt: m.created_at ?? null,
+          contentLength: (m.content ?? "").length,
+          contentHead: (m.content ?? "").slice(0, 200),
+          sourceQuery: m.source_query ?? "",
+          refreshMode: m.trigger?.mode ?? null,
+          basedOnCounts,
+          totalSourceFacts,
+          derivedFromModelIds,
+        };
+      }),
   };
 }
 
@@ -253,14 +316,8 @@ export async function getMentalModelDetail(
   if (!res.ok) return res;
 
   const m = res.data;
-  const basedOn = m.reflect_response?.based_on ?? {};
-  const basedOnCounts: Record<string, number> = {};
-  let totalSourceFacts = 0;
-  for (const [type, facts] of Object.entries(basedOn)) {
-    const n = Array.isArray(facts) ? facts.length : 0;
-    basedOnCounts[type] = n;
-    totalSourceFacts += n;
-  }
+  const { basedOnCounts, totalSourceFacts, derivedFromModelIds } =
+    summarizeBasedOn(m.reflect_response);
 
   return {
     ok: true,
@@ -274,6 +331,7 @@ export async function getMentalModelDetail(
       refreshMode: m.trigger?.mode ?? null,
       basedOnCounts,
       totalSourceFacts,
+      derivedFromModelIds,
     },
   };
 }

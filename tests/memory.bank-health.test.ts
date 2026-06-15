@@ -93,6 +93,37 @@ const STALE_MODEL_BANK = {
   },
 };
 
+// A bank whose hub model synthesizes two leaf models (the relationship graph).
+const HUB_BANK = {
+  stats: { total_documents: 12, total_nodes: 120, pending_operations: 0 },
+  documents: {
+    items: [{ id: "d1", created_at: "2026-06-09T00:00:00Z", text_length: 4000, memory_unit_count: 9 }],
+  },
+  models: {
+    items: [
+      {
+        id: "hub", name: "hub",
+        last_refreshed_at: "2026-06-10T00:00:00Z", created_at: "2026-04-01T00:00:00Z",
+        content: "# Hub\n\nSynthesis of the leaves.", source_query: "the big picture?",
+        trigger: { mode: "full" },
+        reflect_response: { based_on: { observation: [{}, {}, {}, {}, {}], directives: [{}, {}], "mental-models": [{ id: "leaf-1" }, { id: "leaf-2" }] } },
+      },
+      {
+        id: "leaf-1", name: "Leaf One",
+        last_refreshed_at: "2026-06-10T00:00:00Z", created_at: "2026-04-01T00:00:00Z",
+        content: "# Leaf One", source_query: "leaf one?",
+        reflect_response: { based_on: { directives: [{}, {}, {}, {}] } },
+      },
+      {
+        id: "leaf-2", name: "Leaf Two",
+        last_refreshed_at: "2026-06-10T00:00:00Z", created_at: "2026-04-01T00:00:00Z",
+        content: "# Leaf Two", source_query: "leaf two?",
+        reflect_response: { based_on: { directives: [{}, {}] } },
+      },
+    ],
+  },
+};
+
 describe("hindsightRestBase", () => {
   it("strips the /mcp/ suffix", () => {
     expect(hindsightRestBase("http://127.0.0.1:18888/mcp/")).toBe("http://127.0.0.1:18888");
@@ -124,6 +155,21 @@ describe("inspectBankHealth", () => {
     expect(h.ok).toBe(true);
     expect(h.mentalModels[0].sourceQuery).toBe("");
     expect(h.mentalModels[0].refreshMode).toBeNull();
+  });
+
+  it("extracts provenance counts + model→model edges from the list call", async () => {
+    const h = await inspectBankHealth("http://x/mcp/", "assistant", {
+      fetchImpl: fakeFetchFor({ assistant: HUB_BANK }),
+    });
+    expect(h.ok).toBe(true);
+    const byName = Object.fromEntries(h.mentalModels.map((mm) => [mm.name, mm]));
+    // Hub: derives from two leaf models + raw facts.
+    expect(byName.hub.derivedFromModelIds).toEqual(["leaf-1", "leaf-2"]);
+    expect(byName.hub.basedOnCounts).toEqual({ observation: 5, directives: 2, "mental-models": 2 });
+    expect(byName.hub.totalSourceFacts).toBe(9);
+    // Leaf: no outgoing edges.
+    expect(byName["Leaf One"].derivedFromModelIds).toEqual([]);
+    expect(byName["Leaf One"].basedOnCounts).toEqual({ directives: 4 });
   });
 
   it("collects zero-fact documents oldest-first", async () => {
@@ -175,7 +221,7 @@ describe("getMentalModelDetail", () => {
             observation: [{}, {}, {}],
             directives: [{}, {}],
             world: [],
-            "mental-models": [{}],
+            "mental-models": [{ id: "leaf-a" }, { id: "leaf-b" }],
           },
         },
       }),
@@ -189,12 +235,15 @@ describe("getMentalModelDetail", () => {
       observation: 3,
       directives: 2,
       world: 0,
-      "mental-models": 1,
+      "mental-models": 2,
     });
-    expect(res.model.totalSourceFacts).toBe(6);
+    expect(res.model.totalSourceFacts).toBe(7);
+    // The model→model edges (relationships) are extracted from the
+    // mental-models bucket's ids.
+    expect(res.model.derivedFromModelIds).toEqual(["leaf-a", "leaf-b"]);
   });
 
-  it("tolerates a missing reflect_response (no provenance)", async () => {
+  it("tolerates a missing reflect_response (no provenance, no edges)", async () => {
     const res = await getMentalModelDetail("http://x/mcp/", "assistant", "mm-2", {
       fetchImpl: fakeDetailFetch({ id: "mm-2", name: "Bare", content: "x" }),
     });
@@ -202,6 +251,7 @@ describe("getMentalModelDetail", () => {
     if (!res.ok) return;
     expect(res.model.totalSourceFacts).toBe(0);
     expect(res.model.basedOnCounts).toEqual({});
+    expect(res.model.derivedFromModelIds).toEqual([]);
     expect(res.model.sourceQuery).toBe("");
     expect(res.model.refreshMode).toBeNull();
   });
