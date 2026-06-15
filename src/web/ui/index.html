@@ -558,15 +558,28 @@
 
     async function fetchAgentDetail(name) {
       try {
-        const [accRes, subRes, cfgRes] = await Promise.all([
+        const [accRes, subRes, cfgRes, turnsRes] = await Promise.all([
           fetch(`${API}/api/agents/${encodeURIComponent(name)}/accounts`, { headers: authHeaders() }),
           fetch(`${API}/api/agents/${encodeURIComponent(name)}/subagents`, { headers: authHeaders() }),
           fetch(`${API}/api/agents/${encodeURIComponent(name)}/config`, { headers: authHeaders() }),
+          // Recent turns — resilient: a failure leaves turns null and the
+          // other sections still render (see renderAgentDetailInner).
+          fetch(`${API}/api/agents/${encodeURIComponent(name)}/turns?limit=10`, { headers: authHeaders() }),
         ]);
+        // The turns endpoint returns { ok, turns?, error? } — pull the
+        // array out (null on a non-ok response / malformed payload).
+        let turns = null;
+        if (turnsRes.ok) {
+          try {
+            const body = await turnsRes.json();
+            turns = body && body.ok && Array.isArray(body.turns) ? body.turns : null;
+          } catch { turns = null; }
+        }
         agentDetails[name] = {
           accounts: accRes.ok ? await accRes.json() : null,
           subagents: subRes.ok ? await subRes.json() : null,
           config: cfgRes.ok ? await cfgRes.json() : null,
+          turns,
         };
         render();
       } catch (err) {
@@ -1058,7 +1071,31 @@
       const asOf = (typeof summary.dataAsOf === 'number' && summary.dataAsOf > 0)
         ? `<div style="color:var(--text-dim);font-size:.75rem;margin:.25rem 0 .5rem">data as of ${escapeHtml(formatTimestamp(summary.dataAsOf))}</div>`
         : '';
-      el.innerHTML = `${asOf}<div class="agents-grid">${agentsTile}${brokerTile}${hsTile}${hostdTile}${apprTile}${schedTile}${quotaTile}</div>`;
+      el.innerHTML = `${renderAttention(summary.attention)}${asOf}<div class="agents-grid">${agentsTile}${brokerTile}${hsTile}${hostdTile}${apprTile}${schedTile}${quotaTile}</div>`;
+    }
+
+    // "Needs attention" triage strip — the FIRST block on the Summary tab.
+    // The server derives `attention: AttentionItem[]` (severity-sorted,
+    // capped) from the parts the summary already carries; each item is
+    // clickable → switchTab(item.tab). Reuses the .problem styling
+    // (red title for critical/warn, muted for info). Empty → a calm
+    // "nothing needs attention" line. Every interpolated value is escaped.
+    function renderAttention(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return `<div class="problem muted" style="margin-bottom:.75rem"><div class="problem-title">✓ Nothing needs attention</div></div>`;
+      }
+      const rows = items.map((it) => {
+        const sev = (it && it.severity) || 'info';
+        const muted = sev === 'info' ? ' muted' : '';
+        const tab = String((it && it.tab) || 'summary');
+        const title = `<div class="problem-title">${escapeHtml((it && it.title) || 'Attention')}</div>`;
+        const detail = it && it.detail
+          ? `<div class="problem-detail">${escapeHtml(it.detail)}</div>`
+          : '';
+        // Whole row clickable → jump to the tab to act on it.
+        return `<div class="problem${muted}" role="button" tabindex="0" style="cursor:pointer;margin-bottom:.4rem" onclick="switchTab('${escapeHtml(tab)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('${escapeHtml(tab)}')}">${title}${detail}</div>`;
+      }).join('');
+      return `<div style="margin-bottom:.75rem">${rows}</div>`;
     }
 
     function showError(msg) {
@@ -1394,11 +1431,37 @@
         subHtml = subagents.map(s => `<span class="chip">${escapeHtml(s.name || s.id || '?')}${s.status ? ' · ' + escapeHtml(s.status) : ''}</span>`).join('');
       }
 
+      // Recent turns — each Turn carries `started_at` (unix ms),
+      // `ended_at` (null while in-flight), and `user_prompt_preview` (the
+      // first ~200 chars of the user message). We render the start time,
+      // an ended/in-flight status, and a truncated prompt. A null `turns`
+      // (fetch failed) renders nothing different from "no turns" — the
+      // other sections are unaffected either way.
+      const turns = d.turns;
+      let turnsHtml;
+      if (!Array.isArray(turns) || turns.length === 0) {
+        turnsHtml = '<div style="color:var(--text-dim)">No turns recorded.</div>';
+      } else {
+        turnsHtml = turns.map(t => {
+          const when = escapeHtml(formatTimestamp(t.started_at));
+          const status = t.ended_at ? 'ended' : 'in-flight';
+          const raw = (t.user_prompt_preview || '').replace(/\s+/g, ' ').trim();
+          const summary = raw
+            ? escapeHtml(raw.length > 80 ? raw.slice(0, 80) + '…' : raw)
+            : '<span style="color:var(--text-dim)">(no prompt)</span>';
+          return `<div style="margin-bottom:.4rem">
+            <span style="color:var(--text-dim);font-size:.8rem">${when} · ${escapeHtml(status)}</span><br>
+            <span>${summary}</span>
+          </div>`;
+        }).join('');
+      }
+
       const configText = config ? JSON.stringify(config, null, 2) : '(unavailable)';
 
       return `
         <h4>Account</h4>${accountsHtml}
         <h4>Sub-agents</h4>${subHtml}
+        <h4>Recent turns</h4>${turnsHtml}
         <h4>Resolved config</h4><pre class="config-pre">${escapeHtml(configText)}</pre>
       `;
     }
@@ -2154,9 +2217,14 @@
     }
 
     function connectWebSocket() {
-      let wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
-      if (TOKEN) wsUrl += `?token=${encodeURIComponent(TOKEN)}`;
-      ws = new WebSocket(wsUrl);
+      const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+      // Browsers can't set Authorization on a WS upgrade, but they CAN set
+      // Sec-WebSocket-Protocol. The server already reads the bearer token
+      // from that header (extractBearerToken → ["bearer", token]) and
+      // ignores any ?token= query param — so ride the subprotocol. No
+      // token (Tailscale-identified bind) → no subprotocol → the server
+      // falls back to the Tailscale-User-Login header, unchanged.
+      ws = TOKEN ? new WebSocket(wsUrl, ['bearer', TOKEN]) : new WebSocket(wsUrl);
 
       ws.onmessage = (event) => {
         try {

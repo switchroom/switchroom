@@ -761,6 +761,7 @@ export function startWebServer(
                   approvals: cachedApprovals,
                   schedule: cachedSchedule,
                   accounts: cachedAccounts,
+                  memoryHealth: cachedMemoryHealth,
                 }),
               ))();
 
