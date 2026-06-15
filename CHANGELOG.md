@@ -1,6 +1,38 @@
 # Changelog
 
-## v0.15.31 — Memory tab: what models know, the why, and how memory works (#2379)
+## v0.15.32 — in-hostd reconcile keeps conditional mounts; config_propose_edit determinism (#2382, #2381)
+
+### PR #2382 — compose probes the container-real home for conditional mounts
+
+Closes the filesystem-probe half of the in-hostd-apply host-home bug class
+(the bake half was #2353). compose generation gates every optional bind mount
+(mcp-launchers, skills, fleet, credentials, .switchroom-config, webkite,
+cloakbrowser, audit/schedule.d pre-creates) on
+`existsSync(${hostHome}/.switchroom/...)`. When `apply` runs INSIDE hostd — any
+agent self-restart through hostd (`/restart`, `/new`, `/reset`,
+`config_propose_edit`, `/update apply`) — `hostHome` is the real HOST path
+(`/home/op`, correct for baking), but that path doesn't exist in hostd's own
+filesystem (the operator's home is bind-mounted at `/host-home`). So every
+probe returned false and **silently dropped the conditional mounts**, and the
+agent recreated by that reconcile booted without them. This caused the
+2026-06-15 marko meta_pages outage: marko was restarted through hostd after a
+token rotation, the mcp-launchers mount was dropped, its launcher ENOENT'd, and
+the `mcp__meta_pages__*` tools never registered ("No such tool available") —
+the token was fine the whole time.
+
+Fix: split a `probeHome` (container-real home, `homedir()` = `/host-home` in
+hostd) for all `existsSync`/`mkdirSync`, from the `hostHomeForChecks` bake home
+(host path, still bakes mount sources + the agent's `SWITCHROOM_HOST_HOME`
+env). On the host the two are identical → zero change; inside hostd the probes
+now see the bind-mounted dirs. (Follow-up #2383 tracks the same latent class in
+the bundled-skills pool mount.) Rule of thumb: **bake with the host home, probe
+with the container-real home.**
+
+### PR #2381 — config_propose_edit deterministic from agents
+
+Per-op wire timeout + idempotent proposals so an admin agent's
+`config_propose_edit` behaves deterministically (no duplicate proposals on
+retry, bounded wait per op).
 
 The dashboard Memory tab now makes the agents' memory legible. Each mental
 model shows the recall question it answers (hindsight's `source_query` — the
