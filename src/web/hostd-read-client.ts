@@ -162,10 +162,15 @@ export async function fetchAgentLogsViaHostd(
     if (resp.result === "completed") {
       return { ok: true, logs: resp.stdout_tail ?? "" };
     }
-    // denied / error — surface hostd's reason if it gave one.
+    // denied / error — surface the real cause. `docker logs` on a stopped/
+    // absent container exits non-zero with the diagnostic in `stderr_tail`
+    // and NO `error` string, so fall back to it before the generic message.
     return {
       ok: false,
-      error: resp.error ?? `hostd agent_logs returned '${resp.result}'`,
+      error:
+        resp.error ??
+        (resp.stderr_tail && resp.stderr_tail.trim()) ??
+        `hostd agent_logs returned '${resp.result}'`,
     };
   } catch {
     return { ok: false, error: HOSTD_UNREACHABLE_LOGS_MESSAGE };

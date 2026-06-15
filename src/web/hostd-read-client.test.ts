@@ -211,6 +211,18 @@ describe("fetchAgentLogsViaHostd", () => {
     expect(out.ok).toBe(false);
     if (!out.ok) expect(out.error).toContain("No such container");
   });
+
+  it("falls back to stderr_tail when an error result carries no `error` string", async () => {
+    // `docker logs` on a stopped container exits non-zero with the cause in
+    // stderr_tail and NO `error` — the operator should see the real reason.
+    const out = await fetchAgentLogsViaHostd("clerk", 50, {
+      socketPath: SOCK,
+      send: async () =>
+        resp({ result: "error", exit_code: 1, stderr_tail: "Error: container is not running\n" }),
+    });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toContain("container is not running");
+  });
 });
 
 describe("restartAgentViaHostd", () => {
