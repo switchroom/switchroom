@@ -1018,6 +1018,15 @@
       }
     }
 
+    // Allowlist link schemes for remediation hrefs. escapeHtml prevents
+    // attribute breakout but NOT a `javascript:`/`data:` scheme; today no
+    // catalog entry uses a server-derived href, but guard it so a future
+    // `link`/`telegram` remediation can never become an injection vector.
+    function safeHref(url) {
+      const u = String(url || '').trim();
+      return /^(https?:|tg:|mailto:)/i.test(u) ? u : '#';
+    }
+
     function renderProblem(problem) {
       if (!problem) return '';
       const muted = problem.muted ? ' muted' : '';
@@ -1039,11 +1048,11 @@
           </div>`;
         } else if (r.kind === 'link') {
           rem = `<div class="problem-remediation">
-            <a href="${escapeHtml(r.value || '#')}" target="_blank" rel="noopener">${escapeHtml(r.label || r.value || 'Open')}</a>
+            <a href="${escapeHtml(safeHref(r.value))}" target="_blank" rel="noopener">${escapeHtml(r.label || r.value || 'Open')}</a>
           </div>`;
         } else if (r.kind === 'telegram') {
           const note = r.value
-            ? `<a href="${escapeHtml(r.value)}" target="_blank" rel="noopener">${escapeHtml(r.label || 'Act in Telegram')}</a>`
+            ? `<a href="${escapeHtml(safeHref(r.value))}" target="_blank" rel="noopener">${escapeHtml(r.label || 'Act in Telegram')}</a>`
             : escapeHtml(r.label || 'Act from Telegram (no model call is made from the dashboard).');
           rem = `<div class="problem-remediation">${note}</div>`;
         }
