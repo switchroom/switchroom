@@ -52,6 +52,9 @@ export type OutboundEvent =
   | { kind: "cron"; entryTopic: string | number | undefined }
   // Boot card / SessionStart — always alerts.
   | { kind: "boot" }
+  // Linear app-token auth went dead and can't self-heal (no refresh bundle
+  // or a revoked refresh token) — an operator-action alert, ops/alerts lane.
+  | { kind: "linear-auth" }
   // Compact / watchdog — system-initiated notifications.
   | { kind: "compact-watchdog" }
   // Slash-command output classes that always belong in admin.
@@ -129,6 +132,7 @@ export function resolveOutboundTopic(
     }
     case "boot":
     case "compact-watchdog":
+    case "linear-auth":
       if (!inSupergroupMode) return undefined;
       return aliasToId(cfg, ALERTS_ALIAS) ?? cfg.default_topic_id;
     case "command-mutation":

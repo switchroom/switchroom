@@ -6963,12 +6963,70 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
   return { content: [{ type: 'text', text: `checklist sent (id: ${sent.message_id})` }] }
 }
 
+/**
+ * Per-(agent,reason) cooldown for the Linear-auth-dead operator alert. The
+ * triggering 401 recurs on every Linear call once the token expires, so
+ * without a cooldown the operator would be paged on every capture/activity.
+ * One alert per reason per window is enough to surface the action item.
+ */
+const linearAuthAlertLast = new Map<string, number>()
+const LINEAR_AUTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000
+
+/**
+ * Surface an un-healable Linear auth failure (no refresh bundle / revoked
+ * refresh token) to the operator as a Telegram message — not just a gateway
+ * log line. Deduped per (agent,reason) and gated by SWITCHROOM_LINEAR_AUTH_ALERT=0.
+ * Best-effort: a failed send never affects the agent's turn.
+ */
+function notifyLinearAuthDead(info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }): void {
+  if (process.env.SWITCHROOM_LINEAR_AUTH_ALERT === '0') return
+  const key = `${info.agent}:${info.reason}`
+  const now = Date.now()
+  const last = linearAuthAlertLast.get(key)
+  if (last != null && now - last < LINEAR_AUTH_ALERT_COOLDOWN_MS) return
+  linearAuthAlertLast.set(key, now)
+  void (async () => {
+    try {
+      const chatId = loadAccess().allowFrom[0]
+      if (!chatId) return
+      const threadId = topicForRecipient({
+        recipientChatId: chatId,
+        resolvedTopic: resolveAgentOutboundTopic({ kind: 'linear-auth' }) ?? chatThreadMap.get(chatId),
+        supergroupChatId: resolveAgentSupergroupChatId(),
+      })
+      const agentLabel = escapeHtml(info.agent)
+      const why =
+        info.reason === 'no_bundle'
+          ? `no refresh credentials are stored (<code>linear/${agentLabel}/oauth</code> is missing), so its daily-expiring token can't renew`
+          : `its Linear refresh token was revoked`
+      const text =
+        `🔑 <b>Linear auth needs you</b>\n` +
+        `<b>${agentLabel}</b> can't reach Linear — ${why}. ` +
+        `Its access token will keep failing until you re-authorize.\n\n` +
+        `Re-auth (actor=app) then run <code>switchroom linear-agent setup --agent ${agentLabel} ` +
+        `--token … --refresh-token … --client-id … --client-secret …</code> on the host, ` +
+        `or ask me to walk you through it.`
+      await swallowingApiCall(
+        () =>
+          bot.api.sendMessage(chatId, text, {
+            parse_mode: 'HTML',
+            ...(threadId != null ? { message_thread_id: threadId } : {}),
+          }),
+        { chat_id: chatId, verb: 'linearAuthDead' },
+      )
+      process.stderr.write(`telegram gateway: linear auth-dead alert sent agent=${info.agent} reason=${info.reason}\n`)
+    } catch {
+      /* best-effort */
+    }
+  })()
+}
+
 async function executeLinearAgentActivity(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  return emitLinearAgentActivity(args)
+  return emitLinearAgentActivity(args, { onAuthUnrecoverable: notifyLinearAuthDead })
 }
 
 async function executeLinearCreateIssue(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  return createLinearIssue(args)
+  return createLinearIssue(args, { onAuthUnrecoverable: notifyLinearAuthDead })
 }
 
 async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {

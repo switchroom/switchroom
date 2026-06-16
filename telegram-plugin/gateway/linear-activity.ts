@@ -44,6 +44,14 @@ export interface LinearActivityDeps {
   defaultTeamId?: string
   /** Log sink — stderr in production. */
   log?: (line: string) => void
+  /** Invoked when a Linear 401 CANNOT self-heal because the situation needs
+   *  an operator to act: `no_bundle` (no refresh credentials were ever
+   *  stored — the silent-setup-failure case) or `revoked` (the refresh token
+   *  itself is dead). The gateway wires this to a deduped operator-facing
+   *  Telegram alert so a daily-expiring token stops failing invisibly. NOT
+   *  called for transient reasons (network/http_error/bad_response) — those
+   *  retry on their own. */
+  onAuthUnrecoverable?: (info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }) => void
 }
 
 export type ToolTextResult = { content: Array<{ type: string; text: string }> }
@@ -106,6 +114,7 @@ async function linearPostWithRefresh(
   fetchImpl: typeof fetch,
   log: (s: string) => void,
   refreshIO?: (agent: string) => RefreshIO,
+  onAuthUnrecoverable?: (info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }) => void,
 ): Promise<{ resp: Response; token: string }> {
   const post = (t: string) =>
     fetchImpl(LINEAR_GRAPHQL_ENDPOINT, {
@@ -125,7 +134,21 @@ async function linearPostWithRefresh(
         `telegram gateway: linear token REVOKED agent=${agent} — refresh token is dead; ` +
           `operator must re-authorize (linear-agent setup --refresh-token …)\n`,
       )
+      onAuthUnrecoverable?.({ agent, reason: 'revoked', detail: refreshed.detail })
+    } else if (refreshed.reason === 'no_bundle') {
+      // No refresh bundle was ever stored (the silent-setup-failure case):
+      // the access token expires ~daily and there is nothing to renew from.
+      // This is invisible in the gateway log alone — surface it to the
+      // operator so they can re-provision instead of the agent failing
+      // every day forever.
+      log(
+        `telegram gateway: linear token DEAD agent=${agent} — no refresh bundle stored ` +
+          `(linear/${agent}/oauth absent); operator must re-authorize\n`,
+      )
+      onAuthUnrecoverable?.({ agent, reason: 'no_bundle', detail: refreshed.detail })
     } else {
+      // Transient (network / http_error / bad_response): retries on its own,
+      // no operator action — log only, don't page.
       log(`telegram gateway: linear token refresh failed agent=${agent} reason=${refreshed.reason}\n`)
     }
     return { resp, token } // surface the original 401
@@ -206,6 +229,7 @@ export async function emitLinearAgentActivity(
       fetchImpl,
       log,
       deps.refreshIO,
+      deps.onAuthUnrecoverable,
     ))
   } catch (err) {
     return {
@@ -312,6 +336,7 @@ export async function createLinearIssue(
         fetchImpl,
         log,
         deps.refreshIO,
+        deps.onAuthUnrecoverable,
       )
       resp = out.resp
       activeToken = out.token

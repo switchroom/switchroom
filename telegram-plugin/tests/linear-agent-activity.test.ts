@@ -197,3 +197,60 @@ describe('linear_agent_activity — auto-refresh on 401 (#2298 durability)', () 
     expect(calls.length).toBe(1)
   })
 })
+
+/** RefreshIO whose bundle is absent → performLinearRefresh returns no_bundle
+ *  (the silent-setup-failure case clerk/carrie hit in prod). */
+function noBundleRefreshIO(): RefreshIO {
+  return { readBundle: async () => null, writeToken: async () => {}, writeBundle: async () => {} }
+}
+
+describe('emitLinearAgentActivity — operator alert when auth is unrecoverable (FIX 1)', () => {
+  it('no refresh bundle → onAuthUnrecoverable(no_bundle) fires', async () => {
+    const { fetchImpl } = refreshAwareFetch()
+    const alerts: Array<{ agent: string; reason: string }> = []
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      {
+        agent: 'clerk',
+        resolveToken: okToken('lin_expired'),
+        fetchImpl,
+        refreshIO: () => noBundleRefreshIO(),
+        log: () => {},
+        onAuthUnrecoverable: (i) => alerts.push(i),
+      },
+    )
+    expect(r.content[0].text).toMatch(/Linear API 401/)
+    expect(alerts).toEqual([{ agent: 'clerk', reason: 'no_bundle', detail: expect.any(String) }])
+  })
+
+  it('revoked refresh token → onAuthUnrecoverable(revoked) fires', async () => {
+    const { fetchImpl } = refreshAwareFetch({ tokenStatus: 400, tokenBody: 'invalid_grant' })
+    const alerts: Array<{ agent: string; reason: string }> = []
+    await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_dead'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(alerts.map((a) => a.reason)).toEqual(['revoked'])
+  })
+
+  it('transient refresh failure (HTTP 500) does NOT page the operator', async () => {
+    const { fetchImpl } = refreshAwareFetch({ tokenStatus: 500, tokenBody: 'upstream boom' })
+    const alerts: unknown[] = []
+    await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_x'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(alerts).toEqual([])
+  })
+
+  it('successful auto-refresh does NOT page the operator', async () => {
+    const { fetchImpl } = refreshAwareFetch()
+    const alerts: unknown[] = []
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_expired'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(r.content[0].text).toMatch(/emitted/)
+    expect(alerts).toEqual([])
+  })
+})
