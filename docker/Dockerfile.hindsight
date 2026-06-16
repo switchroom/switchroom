@@ -63,8 +63,51 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # (only uv-managed binaries land in /app/api/.venv/bin/). So we use
 # `uv pip install` against the existing venv via VIRTUAL_ENV — same
 # package manager the venv is already authored by, no pip required.
-RUN VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir claude-agent-sdk \
+#
+# PINNED (#2392): previously unpinned, so a rebuild silently floated the SDK
+# 0.2.87 → 0.2.99 across the v0.7.1→v0.8.2 base bump (the CLI is meticulously
+# lockstep-pinned via CLAUDE_CODE_VERSION; the SDK wasn't). Pin it for
+# reproducibility. 0.2.87 is the version proven-good on the prior base image
+# and satisfies the provider's `claude-agent-sdk>=0.2.82` requirement.
+RUN VIRTUAL_ENV=/app/api/.venv uv pip install --no-cache-dir 'claude-agent-sdk==0.2.87' \
  && /app/api/.venv/bin/python -c "from claude_agent_sdk import query; print('claude-agent-sdk ok')" >&2
+
+# #2392: neutralize the upstream claude_code-provider env isolation, which is
+# incompatible with our file-based creds. Upstream PR #1825 (for #1751, a
+# plugin-recursion retain loop) made `_get_isolated_claude_env()` set, for
+# every spawned `claude` subprocess:
+#   CLAUDE_CONFIG_DIR            = a fresh EMPTY tempdir
+#   CLAUDE_SECURESTORAGE_CONFIG_DIR = ""   (force a constant keychain service name)
+# That design assumes OAuth lives in the OS keychain. This container has NO
+# keychain — it uses FILE creds at /run/claude-creds/.credentials.json. A
+# throwaway test (3 env variants, real creds) proved: the empty CONFIG_DIR
+# discards the file creds AND, decisively, `CLAUDE_SECURESTORAGE_CONFIG_DIR=""`
+# forces keychain-only auth → "Not logged in" → 100% of fact-extraction
+# (memory capture) fails (the 2026-06-16 v0.8.2 outage). Variants that worked:
+# {CLAUDE_CONFIG_DIR=/run/claude-creds} alone, and {} (inherit). Variant with
+# SECURESTORAGE="" FAILED even with the right CONFIG_DIR.
+# Fix: point CONFIG_DIR at the real file-creds dir AND DROP the SECURESTORAGE
+# override entirely — i.e. {"CLAUDE_CONFIG_DIR": "/run/claude-creds"}. We run
+# NO hindsight-memory plugin here (clean .claude.json) so the #1751 recursion
+# cannot occur. Self-verifying: the build FAILS LOUDLY if upstream reformats
+# the function, so we never silently ship the regression. (`os` is not imported
+# in that module, hence the literal path — the fixed mount the entrypoint
+# writes creds to and sets CLAUDE_CONFIG_DIR to.)
+RUN python3 - <<'PYEOF'
+import pathlib
+f = pathlib.Path("/app/api/hindsight_api/engine/providers/claude_code_llm.py")
+s = f.read_text()
+OLD_PATH = '        path = tempfile.mkdtemp(prefix="hindsight-claude-code-")'
+NEW_PATH = '        path = "/run/claude-creds"  # switchroom #2392: real file-creds dir, not an isolated tempdir'
+OLD_SS = '            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "",\n'
+assert OLD_PATH in s, "switchroom #2392 patch: mkdtemp line not found in claude_code_llm.py — upstream reformatted _get_isolated_claude_env; re-author this patch in docker/Dockerfile.hindsight"
+assert OLD_SS in s, "switchroom #2392 patch: CLAUDE_SECURESTORAGE_CONFIG_DIR dict entry not found — upstream reformatted; re-author this patch"
+s = s.replace(OLD_PATH, NEW_PATH, 1).replace(OLD_SS, "", 1)
+f.write_text(s)
+t = f.read_text()
+assert NEW_PATH in t and OLD_SS not in t and 'mkdtemp(prefix="hindsight-claude-code-")' not in t, "switchroom #2392 patch: verification failed"
+print("switchroom #2392: claude_code env isolation neutralized (CLAUDE_CONFIG_DIR=/run/claude-creds, SECURESTORAGE override dropped)")
+PYEOF
 
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
