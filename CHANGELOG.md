@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.15.34 — Connections tab: honest failure state + auto-retry (#2388)
+
+The dashboard Connections tab no longer renders a transient fetch failure as
+"nothing configured". The tab fetches only on open (not the fleet poll), and a
+failed fetch used to collapse to an empty list — indistinguishable from "no
+accounts". Now a failed fetch shows a clear "couldn't load — retrying" banner
+(and per-provider "couldn't load" instead of "none configured"), with bounded
+auto-retry (3s/6s/9s) that self-heals a blip without a manual re-click. A
+genuinely-empty bank is unchanged. (This web image also carries the v0.15.33
+Memory-tab redesign, which a parallel v0.15.32 fleet rollout had reverted.)
+
 ## v0.15.33 — Memory tab: grouped bands + model relationships (#2385)
 
 The dashboard Memory tab is regrouped and now visualizes how models relate.
