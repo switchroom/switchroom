@@ -46,6 +46,7 @@ import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
+import { checkDowngrade } from "./deploy-version-guard.js";
 
 /**
  * Resolve the web image tag for an install.
@@ -230,6 +231,7 @@ function runDocker(args: string[]): { ok: boolean; stdout: string; stderr: strin
 interface InstallOptions {
   tag?: string;
   dryRun?: boolean;
+  allowDowngrade?: boolean;
 }
 
 async function doInstall(opts: InstallOptions, program: Command): Promise<void> {
@@ -259,6 +261,19 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   // the agent fleet); `--tag` overrides; `latest` if neither is set.
   const cfg = getConfig(program);
   const imageTag = resolveWebImageTag(opts.tag, cfg.release);
+
+  // Downgrade guard: refuse to revert a newer running web build (the
+  // concurrent-rollout revert hazard). A no-op skip, not an error — so
+  // `update` (fatal on nonzero) and `rollout` (non-fatal) both stay clean.
+  const guard = checkDowngrade({
+    container: "switchroom-web",
+    targetTag: imageTag,
+    allowDowngrade: opts.allowDowngrade,
+  });
+  if (guard.skip) {
+    console.log(chalk.yellow(`  ⏭  ${opts.dryRun ? "[dry-run] " : ""}${guard.message}`));
+    return;
+  }
 
   const yaml = renderWebComposeFile({
     hostHome: homedir(),
@@ -386,6 +401,10 @@ export function registerWebdCommand(program: Command): void {
       "Image tag override (default: resolved from release.pin in switchroom.yaml, else latest)",
     )
     .option("--dry-run", "Print the compose file and the docker commands without writing or running anything")
+    .option(
+      "--allow-downgrade",
+      "Deploy even if the running container is on a newer version (overrides the anti-revert guard)",
+    )
     .action(
       withConfigError(async (opts: InstallOptions) => {
         await doInstall(opts, program);

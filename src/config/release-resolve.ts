@@ -54,3 +54,37 @@ export function resolveRelease(opts: {
   if (opts.root) return opts.root;
   return undefined;
 }
+
+/** Parse a `vX.Y.Z` image tag into [major, minor, patch], or null if it
+ *  isn't a release-version tag (channel names, `sha-…` pins, `latest`). */
+function parseSemverTag(tag: string | null | undefined): [number, number, number] | null {
+  if (!tag) return null;
+  const m = /^v(\d+)\.(\d+)\.(\d+)$/.exec(tag.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * Order two image tags by release version.
+ *
+ *   < 0  → `a` is older than `b`
+ *   = 0  → same version
+ *   > 0  → `a` is newer than `b`
+ *   null → not comparable (either side isn't a `vX.Y.Z` tag — e.g. a
+ *          channel pointer, a `sha-…` pin, `latest`, or a missing value)
+ *
+ * Deliberately conservative: anything that isn't a clean release version
+ * is "unorderable", so the deploy guard never blocks a channel/sha/latest
+ * deploy — it only ever refuses a clear `vX.Y.Z` → older-`vX.Y.Z` downgrade.
+ */
+export function compareReleaseTags(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): number | null {
+  const pa = parseSemverTag(a);
+  const pb = parseSemverTag(b);
+  if (!pa || !pb) return null;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}

@@ -30,6 +30,7 @@ import { spawnSync } from "node:child_process";
 import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
+import { checkDowngrade } from "./deploy-version-guard.js";
 import {
   defaultAuditLogPath,
   formatForCli,
@@ -251,6 +252,7 @@ function runDocker(args: string[]): { ok: boolean; stdout: string; stderr: strin
 interface InstallOptions {
   tag?: string;
   dryRun?: boolean;
+  allowDowngrade?: boolean;
 }
 
 async function doInstall(opts: InstallOptions, program: Command): Promise<void> {
@@ -284,6 +286,18 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
   // Default to the release pin from switchroom.yaml (version-coherent with
   // the agent fleet); `--tag` overrides; `latest` if neither is set.
   const imageTag = resolveHostdImageTag(opts.tag, cfg.release);
+
+  // Downgrade guard: refuse to revert a newer running hostd build (the
+  // concurrent-rollout revert hazard). A no-op skip, not an error.
+  const guard = checkDowngrade({
+    container: "switchroom-hostd",
+    targetTag: imageTag,
+    allowDowngrade: opts.allowDowngrade,
+  });
+  if (guard.skip) {
+    console.log(chalk.yellow(`  ⏭  ${opts.dryRun ? "[dry-run] " : ""}${guard.message}`));
+    return;
+  }
 
   const yaml = renderHostdComposeFile({
     hostHome: resolveHostdHostHome(),
@@ -445,6 +459,10 @@ export function registerHostdCommand(program: Command): void {
       "Image tag override (default: resolved from release.pin in switchroom.yaml, else latest)",
     )
     .option("--dry-run", "Print the compose file and the docker commands without writing or running anything")
+    .option(
+      "--allow-downgrade",
+      "Deploy even if the running container is on a newer version (overrides the anti-revert guard)",
+    )
     // withConfigError is a higher-order wrapper (helpers.ts:9) — it
     // accepts a handler and RETURNS a function that catches ConfigError
     // and exits cleanly. The returned function is what gets registered
