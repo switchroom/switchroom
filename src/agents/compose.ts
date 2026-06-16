@@ -24,8 +24,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
+import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
@@ -804,6 +804,47 @@ function readStrippedCaps(agent: AgentConfig): string[] {
   const caps = raw.cap_add;
   if (Array.isArray(caps)) return caps.map(String);
   return [];
+}
+
+/**
+ * Does a conditional-mount SOURCE resolve to a real host path? Used to gate
+ * optional `:ro` bind mounts (docker `up` hard-fails on a missing source).
+ *
+ * `existsSync` (which FOLLOWS symlinks) is the common case and handles real
+ * dirs + symlinks whose target resolves in this filesystem. But some
+ * conditional dirs are symlinks to an ABSOLUTE host path — e.g.
+ * `~/.switchroom/skills -> /home/op/.switchroom-config/skills`. When `apply`
+ * runs INSIDE hostd, `probeHome` is `/host-home` and the symlink's `/home/op`
+ * target is unresolvable there, so plain `existsSync` returns false and the
+ * mount is WRONGLY dropped (#2387 — the in-hostd reconcile silently loses the
+ * skills mount). Detect that case: if the path is a symlink, resolve its
+ * target against `probeHome` (translate a `hostHome`-rooted target to the
+ * container-real home) and check THAT. The baked mount SOURCE stays the
+ * host-home path, which docker resolves host-side at mount time. On the host
+ * (`hostHome === probeHome`) this is identical to `existsSync`.
+ */
+function conditionalMountPresent(
+  probePath: string,
+  hostHome: string,
+  probeHome: string,
+): boolean {
+  if (existsSync(probePath)) return true;
+  try {
+    if (!lstatSync(probePath).isSymbolicLink()) return false;
+    let target = readlinkSync(probePath);
+    if (!isAbsolute(target)) target = resolve(dirname(probePath), target);
+    if (
+      hostHome &&
+      probeHome &&
+      hostHome !== probeHome &&
+      target.startsWith(hostHome + "/")
+    ) {
+      target = probeHome + target.slice(hostHome.length);
+    }
+    return existsSync(target);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1958,7 +1999,7 @@ function emitAgentService(
   // missing `:ro` source. skills/ is operator-authored, non-secret
   // content (WS6 audit: LOW info-disclosure only) so it stays
   // fleet-wide.
-  if (existsSync(`${probeHome}/.switchroom/skills`)) {
+  if (conditionalMountPresent(`${probeHome}/.switchroom/skills`, hostHomeForChecks, probeHome)) {
     lines.push(`      - ${homePrefix}/.switchroom/skills:${homePrefix}/.switchroom/skills:ro`);
   }
   // Operator-declared MCP launcher dir (#1786 follow-up). Operators who
@@ -1973,7 +2014,7 @@ function emitAgentService(
   // skills/ pattern above; existsSync-guarded so dev installs without
   // a launcher dir don't hard-fail compose `up`. Pure-URL MCPs (e.g.
   // notion `type: http`) don't need this mount.
-  if (existsSync(`${probeHome}/.switchroom/mcp-launchers`)) {
+  if (conditionalMountPresent(`${probeHome}/.switchroom/mcp-launchers`, hostHomeForChecks, probeHome)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/mcp-launchers:${homePrefix}/.switchroom/mcp-launchers:ro`,
     );
@@ -1988,7 +2029,7 @@ function emitAgentService(
   // agent never writes here; `switchroom apply` is the only writer.
   // Created with seeded files by `ensureHostMountSources` in apply.ts,
   // so existsSync is true on every post-apply install.
-  if (existsSync(`${probeHome}/.switchroom/fleet`)) {
+  if (conditionalMountPresent(`${probeHome}/.switchroom/fleet`, hostHomeForChecks, probeHome)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/fleet:${homePrefix}/.switchroom/fleet:ro`,
     );
@@ -2007,7 +2048,7 @@ function emitAgentService(
   // pre-existing flat `~/.switchroom/credentials/*` files into per-
   // agent subdirs is surfaced as a loud `doctor` warning (see
   // checkFlatCredentialsMigration) — never a silent break.
-  if (existsSync(`${probeHome}/.switchroom/credentials/${a.name}`)) {
+  if (conditionalMountPresent(`${probeHome}/.switchroom/credentials/${a.name}`, hostHomeForChecks, probeHome)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/credentials/${a.name}:${homePrefix}/.switchroom/credentials:ro`,
     );
@@ -2052,7 +2093,7 @@ function emitAgentService(
   // (i.e. ~/.switchroom-config/ exists). Pre-create the per-agent
   // subdir under operator umask so docker doesn't auto-create as root
   // (the chown sweep in alignAgentUid will fix ownership on next apply).
-  if (existsSync(`${probeHome}/.switchroom-config`)) {
+  if (conditionalMountPresent(`${probeHome}/.switchroom-config`, hostHomeForChecks, probeHome)) {
     try {
       mkdirSync(
         `${probeHome}/.switchroom-config/agents/${a.name}/personal-skills`,
@@ -2104,12 +2145,26 @@ function emitAgentService(
   // exotic test setups and docker compose `up` hard-fails on missing
   // `:ro` sources. Skip when the pool path is already covered by the
   // operator skills mount above (no duplicate volume entries).
+  // bundledSkillsPoolDir is homedir()-derived (container-real — `/host-home`
+  // inside hostd). The mount SOURCE must be the HOST path so the agent
+  // (network_mode host, same path in/out) resolves it; and the
+  // dedup-vs-skills-mount `startsWith` below must compare host-rooted paths
+  // or it mismatches in hostd (`/host-home` vs `/home/op`) and wrongly emits
+  // a `/host-home` source (#2383). Translate probeHome→hostHomeForChecks,
+  // like every other mount source.
+  const bundledSkillsBakeDir =
+    probeHome &&
+    hostHomeForChecks &&
+    probeHome !== hostHomeForChecks &&
+    bundledSkillsPoolDir.startsWith(probeHome + "/")
+      ? hostHomeForChecks + bundledSkillsPoolDir.slice(probeHome.length)
+      : bundledSkillsPoolDir;
   if (
     bundledSkillsPoolDir &&
     existsSync(bundledSkillsPoolDir) &&
-    !bundledSkillsPoolDir.startsWith(`${hostHomeForChecks}/.switchroom/skills`)
+    !bundledSkillsBakeDir.startsWith(`${hostHomeForChecks}/.switchroom/skills`)
   ) {
-    lines.push(`      - ${bundledSkillsPoolDir}:${bundledSkillsPoolDir}:ro`);
+    lines.push(`      - ${bundledSkillsBakeDir}:${bundledSkillsBakeDir}:ro`);
   }
   // switchroom.yaml file mount (read-only) — the in-container gateway
   // daemon needs `--config $SWITCHROOM_CONFIG` to talk to the
