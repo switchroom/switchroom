@@ -30,7 +30,17 @@
 # sec WS9-F4 (#1418): pinned by digest — third-party mutable `:latest`
 # from another org; an upstream repoint would otherwise flow into the
 # published hindsight image undetected. Dependabot tracks bumps.
-FROM ghcr.io/vectorize-io/hindsight:latest@sha256:e82b2c051784affa73243108c06402655043999e362bb3b7226b4da1000e1660
+#
+# Pinned to vectorize-io/hindsight v0.8.2 (digest below; label
+# org.opencontainers.image.version=0.8.2, built 2026-06-12). Bumped from
+# v0.7.1 (sha256:e82b2c05…) to pick up the concurrent-retain FK-violation fix
+# (vectorize-io/hindsight #1795 + #1882, closed 2026-06-01) and the 0.8.x
+# entity-link rework — fixes the `batch_retain` ForeignKeyViolation on
+# `unit_entities` that was silently dropping ~2-3% of memory writes
+# (switchroom #2392). NOTE: upstream publishes only `:latest` (no `:vX.Y.Z`
+# tag in ghcr), so the digest IS the version pin. A bump runs DB migrations
+# on the persisted memory volume — back up `switchroom-hindsight-data` first.
+FROM ghcr.io/vectorize-io/hindsight:latest@sha256:7c069db2d7aeeae82d3d3917292b87b14d6547f979c8b1335a42c94d09d57213
 
 USER root
 

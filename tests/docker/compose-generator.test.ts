@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -2814,5 +2814,39 @@ describe("conditional-mount probe home (in-hostd apply — marko meta_pages regr
     // existsSync(/home/op/.switchroom/mcp-launchers) is false → not mounted.
     // This is exactly the in-hostd failure mode the probeHomeDir split fixes.
     expect(yaml).not.toContain("/.switchroom/mcp-launchers:");
+  });
+
+  // #2387: a conditional dir that is a symlink to an ABSOLUTE host path
+  // (skills -> /home/op/.switchroom-config/skills) is dropped by plain
+  // existsSync inside hostd (follows the link to /home/op, unresolvable there).
+  it("keeps a symlinked conditional dir (skills→absolute host path) on in-hostd apply (#2387)", () => {
+    // skills is a symlink to an absolute HOST path; the target only resolves
+    // when translated to the container-real home (probeHomeDir).
+    mkdirSync(join(tmpDir, ".switchroom-config", "skills"), { recursive: true });
+    symlinkSync("/home/op/.switchroom-config/skills", join(tmpDir, ".switchroom", "skills"));
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      probeHomeDir: tmpDir,
+    });
+    // The symlink-aware probe resolves the target via probeHome → mount emitted
+    // with the HOST-rooted source (docker follows the symlink host-side).
+    expect(yaml).toContain("/home/op/.switchroom/skills:/home/op/.switchroom/skills:ro");
+  });
+
+  // #2383: a bundled-skills pool OUTSIDE ~/.switchroom/skills must bake a
+  // HOST-rooted mount source, not the container-real /host-home path.
+  it("bakes a host-rooted source for an out-of-skills bundled pool on in-hostd apply (#2383)", () => {
+    const pool = join(tmpDir, "ext-skills-pool");
+    mkdirSync(pool, { recursive: true });
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      probeHomeDir: tmpDir,
+      bundledSkillsPoolDir: pool, // probeHome-rooted (container-real)
+    });
+    // Emitted with the translated HOST path, NOT the container-real tmpDir path.
+    expect(yaml).toContain("/home/op/ext-skills-pool:/home/op/ext-skills-pool:ro");
+    expect(yaml).not.toContain(`${pool}:${pool}:ro`);
   });
 });
