@@ -1,6 +1,27 @@
 # Changelog
 
-## v0.15.35 — Deploy anti-revert guard: refuse to downgrade web/hostd (#2390)
+## v0.15.36 — in-hostd reconcile keeps symlinked + bundled-skills mounts; hindsight v0.8.2 (#2393)
+
+Completes the in-hostd conditional-mount fix (#2382) and bumps the hindsight
+backend to stop silent memory-write loss.
+
+- **Symlinked conditional dirs survive an in-hostd reconcile (#2387).**
+  `~/.switchroom/skills` is a symlink to an absolute host path; inside hostd
+  `existsSync` followed it to a `/home/op` target hostd can't see → the skills
+  mount was silently dropped on any agent self-restart through hostd. New
+  symlink-aware probe resolves the link target against the container-real home;
+  the baked mount source stays the host path (docker follows it host-side).
+  Applied to skills/mcp-launchers/fleet/credentials/.switchroom-config. No-op
+  on the host.
+- **Bundled-skills pool bakes a host-rooted source (#2383).** The
+  dedup-vs-skills check compared a `/host-home` path against the `/home/op`
+  host path in hostd, wrongly emitting a `/host-home` mount source. Translated
+  the bake path to the host home.
+- **hindsight bumped v0.7.1 → v0.8.2 (#2392).** Picks up the concurrent-retain
+  `ForeignKeyViolation` fix (upstream vectorize-io/hindsight #1795/#1882) +
+  0.8.x entity-link rework — the `batch_retain` FK race on `unit_entities` was
+  silently dropping ~2-3% of memory writes. The image bump runs DB migrations
+  on the persisted memory volume on first boot (recreated backup-first).
 
 Reliability fix for concurrent rollouts. Agents share one host and one
 `release.pin`; an agent rolling an OLDER pin used to silently revert a
