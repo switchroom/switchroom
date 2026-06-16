@@ -487,7 +487,7 @@ import {
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
-import { emitLinearAgentActivity, createLinearIssue } from './linear-activity.js'
+import { emitLinearAgentActivity, createLinearIssue, buildLinearAuthDeadMessage, type LinearAuthDeadReason } from './linear-activity.js'
 import {
   approvalRequest,
   approvalConsume,
@@ -6978,13 +6978,12 @@ const LINEAR_AUTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000
  * log line. Deduped per (agent,reason) and gated by SWITCHROOM_LINEAR_AUTH_ALERT=0.
  * Best-effort: a failed send never affects the agent's turn.
  */
-function notifyLinearAuthDead(info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }): void {
+function notifyLinearAuthDead(info: { agent: string; reason: LinearAuthDeadReason; detail: string }): void {
   if (process.env.SWITCHROOM_LINEAR_AUTH_ALERT === '0') return
   const key = `${info.agent}:${info.reason}`
   const now = Date.now()
   const last = linearAuthAlertLast.get(key)
   if (last != null && now - last < LINEAR_AUTH_ALERT_COOLDOWN_MS) return
-  linearAuthAlertLast.set(key, now)
   void (async () => {
     try {
       const chatId = loadAccess().allowFrom[0]
@@ -6994,18 +6993,7 @@ function notifyLinearAuthDead(info: { agent: string; reason: 'no_bundle' | 'revo
         resolvedTopic: resolveAgentOutboundTopic({ kind: 'linear-auth' }) ?? chatThreadMap.get(chatId),
         supergroupChatId: resolveAgentSupergroupChatId(),
       })
-      const agentLabel = escapeHtml(info.agent)
-      const why =
-        info.reason === 'no_bundle'
-          ? `no refresh credentials are stored (<code>linear/${agentLabel}/oauth</code> is missing), so its daily-expiring token can't renew`
-          : `its Linear refresh token was revoked`
-      const text =
-        `🔑 <b>Linear auth needs you</b>\n` +
-        `<b>${agentLabel}</b> can't reach Linear — ${why}. ` +
-        `Its access token will keep failing until you re-authorize.\n\n` +
-        `Re-auth (actor=app) then run <code>switchroom linear-agent setup --agent ${agentLabel} ` +
-        `--token … --refresh-token … --client-id … --client-secret …</code> on the host, ` +
-        `or ask me to walk you through it.`
+      const text = buildLinearAuthDeadMessage(info.agent, info.reason)
       await swallowingApiCall(
         () =>
           bot.api.sendMessage(chatId, text, {
@@ -7014,6 +7002,10 @@ function notifyLinearAuthDead(info: { agent: string; reason: 'no_bundle' | 'revo
           }),
         { chat_id: chatId, verb: 'linearAuthDead' },
       )
+      // Stamp the cooldown only after a successful send so a transient
+      // Telegram failure doesn't burn the 6h window (the 401 recurs and will
+      // retry the page on the next Linear call).
+      linearAuthAlertLast.set(key, now)
       process.stderr.write(`telegram gateway: linear auth-dead alert sent agent=${info.agent} reason=${info.reason}\n`)
     } catch {
       /* best-effort */

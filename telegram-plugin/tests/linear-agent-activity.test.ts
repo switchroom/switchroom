@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import {
   emitLinearAgentActivity,
+  buildLinearAuthDeadMessage,
   type LinearTokenResult,
 } from '../gateway/linear-activity.js'
 
@@ -241,6 +242,25 @@ describe('emitLinearAgentActivity — operator alert when auth is unrecoverable 
       { agent: 'carrie', resolveToken: okToken('lin_x'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
     )
     expect(alerts).toEqual([])
+  })
+
+  it('buildLinearAuthDeadMessage: no_bundle names the missing oauth key + re-auth command', () => {
+    const msg = buildLinearAuthDeadMessage('clerk', 'no_bundle')
+    expect(msg).toMatch(/Linear auth needs you/)
+    expect(msg).toContain('<code>linear/clerk/oauth</code>')
+    expect(msg).toContain('switchroom linear-agent setup --agent clerk')
+  })
+
+  it('buildLinearAuthDeadMessage: revoked says the refresh token was revoked', () => {
+    const msg = buildLinearAuthDeadMessage('carrie', 'revoked')
+    expect(msg).toMatch(/refresh token was revoked/)
+    expect(msg).not.toContain('/oauth</code> is missing')
+  })
+
+  it('buildLinearAuthDeadMessage: HTML-escapes a hostile agent slug', () => {
+    const msg = buildLinearAuthDeadMessage('a<b>&c', 'no_bundle')
+    expect(msg).toContain('a&lt;b&gt;&amp;c')
+    expect(msg).not.toContain('a<b>&c')
   })
 
   it('successful auto-refresh does NOT page the operator', async () => {

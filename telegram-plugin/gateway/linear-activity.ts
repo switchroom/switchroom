@@ -24,6 +24,37 @@ import { performLinearRefresh, type RefreshIO } from '../../src/linear/oauth-ref
 
 export const LINEAR_GRAPHQL_ENDPOINT = 'https://api.linear.app/graphql'
 
+/** The two operator-action reasons a Linear 401 can't self-heal. */
+export type LinearAuthDeadReason = 'no_bundle' | 'revoked'
+
+/** Minimal HTML-escape (Telegram parse_mode: 'HTML'). Kept local so the
+ *  message builder is self-contained + unit-testable without reaching into a
+ *  gateway-only escaper (the bug that shipped the first cut of this alert). */
+function escapeHtmlMin(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * Build the operator-facing Telegram alert (HTML) for an un-healable Linear
+ * auth failure. Pure + self-escaping so it can be unit-tested directly. The
+ * gateway's `notifyLinearAuthDead` only handles dedup + transport.
+ */
+export function buildLinearAuthDeadMessage(agent: string, reason: LinearAuthDeadReason): string {
+  const a = escapeHtmlMin(agent)
+  const why =
+    reason === 'no_bundle'
+      ? `no refresh credentials are stored (<code>linear/${a}/oauth</code> is missing), so its daily-expiring token can't renew`
+      : `its Linear refresh token was revoked`
+  return (
+    `🔑 <b>Linear auth needs you</b>\n` +
+    `<b>${a}</b> can't reach Linear — ${why}. ` +
+    `Its access token will keep failing until you re-authorize.\n\n` +
+    `Re-auth (actor=app) then run <code>switchroom linear-agent setup --agent ${a} ` +
+    `--token … --refresh-token … --client-id … --client-secret …</code> on the host, ` +
+    `or ask me to walk you through it.`
+  )
+}
+
 export type LinearTokenResult =
   | { ok: true; token: string }
   | { ok: false; reason: 'denied' | 'unreachable' | 'not_found' | 'unknown' }
@@ -51,7 +82,7 @@ export interface LinearActivityDeps {
    *  Telegram alert so a daily-expiring token stops failing invisibly. NOT
    *  called for transient reasons (network/http_error/bad_response) — those
    *  retry on their own. */
-  onAuthUnrecoverable?: (info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }) => void
+  onAuthUnrecoverable?: (info: { agent: string; reason: LinearAuthDeadReason; detail: string }) => void
 }
 
 export type ToolTextResult = { content: Array<{ type: string; text: string }> }
@@ -114,7 +145,7 @@ async function linearPostWithRefresh(
   fetchImpl: typeof fetch,
   log: (s: string) => void,
   refreshIO?: (agent: string) => RefreshIO,
-  onAuthUnrecoverable?: (info: { agent: string; reason: 'no_bundle' | 'revoked'; detail: string }) => void,
+  onAuthUnrecoverable?: (info: { agent: string; reason: LinearAuthDeadReason; detail: string }) => void,
 ): Promise<{ resp: Response; token: string }> {
   const post = (t: string) =>
     fetchImpl(LINEAR_GRAPHQL_ENDPOINT, {
