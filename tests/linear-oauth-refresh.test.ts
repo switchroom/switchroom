@@ -210,3 +210,78 @@ describe("performLinearRefresh — rotation-safety on partial persist", () => {
     expect(parseBundle(writtenBundle)).toMatchObject({ refreshToken: "lin_refresh_rotated" });
   });
 });
+
+import {
+  buildLinearAuthorizeUrl,
+  exchangeLinearAuthCode,
+  LINEAR_AUTHORIZE_ENDPOINT,
+} from "../src/linear/oauth-refresh.js";
+
+describe("buildLinearAuthorizeUrl", () => {
+  it("builds an actor=app consent URL with the agent scopes", () => {
+    const url = buildLinearAuthorizeUrl({ clientId: "cid123", redirectUri: "http://localhost:3000/callback" });
+    expect(url.startsWith(LINEAR_AUTHORIZE_ENDPOINT + "?")).toBe(true);
+    const q = new URL(url).searchParams;
+    expect(q.get("client_id")).toBe("cid123");
+    expect(q.get("redirect_uri")).toBe("http://localhost:3000/callback");
+    expect(q.get("response_type")).toBe("code");
+    expect(q.get("actor")).toBe("app");
+    expect(q.get("prompt")).toBe("consent");
+    expect(q.get("scope")).toBe("read,write,app:assignable,app:mentionable");
+  });
+
+  it("includes state when provided and honors custom scopes", () => {
+    const url = buildLinearAuthorizeUrl({ clientId: "c", redirectUri: "https://x/cb", scopes: ["read"], state: "s1" });
+    const q = new URL(url).searchParams;
+    expect(q.get("state")).toBe("s1");
+    expect(q.get("scope")).toBe("read");
+  });
+});
+
+describe("exchangeLinearAuthCode", () => {
+  it("exchanges an authorization_code for access + refresh tokens", async () => {
+    let seenUrl = "";
+    let seenBody = "";
+    const fetchImpl = fakeFetch(
+      200,
+      { access_token: "lin_acc", refresh_token: "lin_ref", expires_in: 3600, scope: "read write" },
+      (url, init) => { seenUrl = url; seenBody = String(init.body); },
+    );
+    const r = await exchangeLinearAuthCode(
+      { clientId: "cid", clientSecret: "sec", code: "auth_code_1", redirectUri: "http://localhost:3000/callback" },
+      { fetchImpl, nowSec: () => 1000 },
+    );
+    expect(seenUrl).toBe(LINEAR_TOKEN_ENDPOINT);
+    expect(seenBody).toContain("grant_type=authorization_code");
+    expect(seenBody).toContain("code=auth_code_1");
+    expect(seenBody).toContain("client_secret=sec");
+    expect(r).toEqual({ ok: true, accessToken: "lin_acc", refreshToken: "lin_ref", expiresAt: 4600, scope: "read write" });
+  });
+
+  it("returns bad_code on a 400 invalid_grant (operator must re-authorize)", async () => {
+    const fetchImpl = fakeFetch(400, "invalid_grant");
+    const r = await exchangeLinearAuthCode(
+      { clientId: "c", clientSecret: "s", code: "stale", redirectUri: "http://x/cb" },
+      { fetchImpl },
+    );
+    expect(r).toMatchObject({ ok: false, reason: "bad_code" });
+  });
+
+  it("rejects a response with no refresh_token (non-renewable — the original bug)", async () => {
+    const fetchImpl = fakeFetch(200, { access_token: "lin_acc", expires_in: 3600 });
+    const r = await exchangeLinearAuthCode(
+      { clientId: "c", clientSecret: "s", code: "x", redirectUri: "http://x/cb" },
+      { fetchImpl },
+    );
+    expect(r).toMatchObject({ ok: false, reason: "bad_response" });
+  });
+
+  it("network error → tagged network result, never throws", async () => {
+    const fetchImpl = (async () => { throw new Error("boom"); }) as unknown as typeof fetch;
+    const r = await exchangeLinearAuthCode(
+      { clientId: "c", clientSecret: "s", code: "x", redirectUri: "http://x/cb" },
+      { fetchImpl },
+    );
+    expect(r).toMatchObject({ ok: false, reason: "network", detail: "boom" });
+  });
+});
