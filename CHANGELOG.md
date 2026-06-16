@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.15.35 — Deploy anti-revert guard: refuse to downgrade web/hostd (#2390)
+
+Reliability fix for concurrent rollouts. Agents share one host and one
+`release.pin`; an agent rolling an OLDER pin used to silently revert a
+newer-deployed `switchroom-web`/`switchroom-hostd` (its `webd/hostd install
+--tag <old>` step blindly `docker compose up`'d, with no check against the
+running version). Now `webd install` / `hostd install` read the running
+container's tag and REFUSE a clear `vX.Y.Z → older-vX.Y.Z` downgrade (a no-op
+skip, not an error — so `update` and `rollout` both stay clean), unless
+`--allow-downgrade` is passed. Channel / `sha-…` / `latest` deploys and
+upgrades/same-version/first-installs are unaffected. Both `rollout` and
+`update` route through these install commands, so every deploy path is
+covered.
+
 ## v0.15.34 — Connections tab: honest failure state + auto-retry (#2388)
 
 The dashboard Connections tab no longer renders a transient fetch failure as
