@@ -75,7 +75,9 @@ describe('linear_create_issue — gateway wiring (#2312)', () => {
   })
 
   it('is allow-listed and dispatched', () => {
-    expect(gw).toMatch(/'linear_create_issue',\n\]\)/)
+    // Membership in ALLOWED_TOOLS (not position — new linear tools may be
+    // appended after it, e.g. linear_agent_setup).
+    expect(gw).toMatch(/^\s*'linear_create_issue',\s*$/m)
     expect(gw).toMatch(/case 'linear_create_issue':\s*\n\s*return executeLinearCreateIssue\(args\)/)
   })
 })
