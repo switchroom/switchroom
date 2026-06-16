@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.15.37 — Linear agent auth: loud failures, in-container self-serve, proactive watch (#2394, #2396, #2397)
+
+Hardens Linear `actor=app` agent auth after the clerk/carrie incident, where
+both agents silently failed Linear with a daily 401: their refresh BUNDLE
+(`linear/<agent>/oauth`) was never persisted, because `linear-agent setup` is a
+host-only command that no-ops when run inside an agent container — so the access
+token expired (~24h) with nothing to refresh from, and nobody was told.
+
+- **Un-healable Linear auth now pages the operator (#2394).** A Linear 401 that
+  can't auto-refresh because no refresh bundle was stored (`no_bundle`) or the
+  refresh token was revoked (`revoked`) now posts a `🔑 Linear auth needs you`
+  Telegram alert in the alerts lane — deduped 6 h per `(agent, reason)`,
+  kill-switch `SWITCHROOM_LINEAR_AUTH_ALERT=0`. Transient errors
+  (network/HTTP/bad-response) stay log-only. New `linear-auth` outbound
+  topic-router kind.
+- **Agents can self-serve Linear auth in-container, operator-approved (#2396).**
+  New `linear_agent_setup` MCP tool: `action: "authorize_url"` returns the
+  browser consent URL; `action: "complete"` exchanges the code and stores the
+  access token + refresh bundle via the broker. New-key creation rides a
+  `vault_request_access` write-grant; the durable `secrets[]` ACL + `linear_agent`
+  block ride `config_propose_edit` — both operator-approved. Secrets stay
+  in-process (never config or logs).
+- **Footgun guard + proactive watch (#2397).** `linear-agent setup`/`refresh`
+  now refuse under `SWITCHROOM_RUNTIME=docker` (they'd silently create a
+  throwaway vault) and point at the MCP tool / host shell. A proactive
+  Linear-auth watch runs on boot (35 s) + every 6 h
+  (`SWITCHROOM_LINEAR_AUTH_WATCH_POLL_MS=0` disables): missing bundle → alert
+  now, access token near expiry → proactive rotate, revoked → alert. Wires the
+  previously-dead `needsRefresh` helper.
+
 ## v0.15.36 — in-hostd reconcile keeps symlinked + bundled-skills mounts; hindsight v0.8.2 (#2393)
 
 Completes the in-hostd conditional-mount fix (#2382) and bumps the hindsight
