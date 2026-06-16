@@ -47,6 +47,32 @@ function bundleKeyFor(agent: string): string {
   return `linear/${agent}/oauth`;
 }
 
+/**
+ * `setup`/`refresh` write the vault FILE directly (operator passphrase). Inside
+ * an agent container there is no mounted vault + no passphrase, so those writes
+ * silently create a throwaway vault and "succeed" — the exact footgun that left
+ * clerk/carrie with a token but no refresh bundle (a daily 401 with no
+ * self-heal, 2026-06-16). Fail loudly instead and point at the sanctioned
+ * in-container path (the `linear_agent_setup` MCP tool) or the host shell.
+ */
+export function linearSandboxRefusal(
+  verb: string,
+  runtime: string | undefined = process.env.SWITCHROOM_RUNTIME,
+): string | null {
+  if (runtime !== "docker") return null;
+  return (
+    `'linear-agent ${verb}' is a HOST command — it writes the vault file directly, which ` +
+    `doesn't work inside an agent container (no mounted vault, no passphrase) and would ` +
+    `silently no-op.\n  • In-container: use the 'linear_agent_setup' MCP tool (operator-approved).\n` +
+    `  • On the host shell: run this same command there.`
+  );
+}
+
+function refuseInSandbox(verb: string): void {
+  const msg = linearSandboxRefusal(verb);
+  if (msg) fail(msg);
+}
+
 export function registerLinearAgentCommand(program: Command): void {
   const linear = program
     .command("linear-agent")
@@ -77,6 +103,7 @@ export function registerLinearAgentCommand(program: Command): void {
     .option("--dry-run", "Print the YAML diff + instructions without writing or vaulting anything")
     .action(
       withConfigError(async (opts: LinearAgentSetupOpts) => {
+        refuseInSandbox("setup");
         if (!/^[a-z][a-z0-9_-]{0,63}$/.test(opts.agent)) {
           fail(`--agent must be a lowercase agent slug (got '${opts.agent}').`);
         }
@@ -171,6 +198,7 @@ export function registerLinearAgentCommand(program: Command): void {
     .requiredOption("--agent <name>", "Agent name (must have a linear_agent block)")
     .action(
       withConfigError(async (opts: { agent: string }) => {
+        refuseInSandbox("refresh");
         if (!/^[a-z][a-z0-9_-]{0,63}$/.test(opts.agent)) {
           fail(`--agent must be a lowercase agent slug (got '${opts.agent}').`);
         }

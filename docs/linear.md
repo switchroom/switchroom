@@ -169,6 +169,31 @@ Recovery: re-run the **Setup — the OAuth dance** above and `setup` with the ne
 `--refresh-token`. (Everything else — transient network/HTTP errors — is
 treated as retryable and not surfaced as a re-auth ask.)
 
+### Proactive watch (don't wait for a 401)
+
+Refresh + the operator alert used to be **reactive only** — they fired when an
+agent made a live Linear call and got a `401`. A linear-enabled agent that
+rarely calls Linear could sit dead-auth unnoticed. The gateway now runs a
+**proactive Linear-auth watch** on boot (35 s after start) and every 6 h
+(`SWITCHROOM_LINEAR_AUTH_WATCH_POLL_MS`, `0` disables):
+
+- bundle **missing/invalid** → fires the operator alert immediately;
+- access token **within the 2 h refresh skew** → rotates it proactively (so the
+  next real call never eats a 401), surfacing a **revoked** refresh token via
+  the alert;
+- token fresh / expiry-untracked → nothing (the reactive path still covers
+  untracked bundles).
+
+Logged as `telegram gateway: linear-auth-watch agent=<name> status=<…>`.
+
+### Footgun guard: `linear-agent setup`/`refresh` are HOST commands
+
+`setup`/`refresh` write the vault file directly with the operator passphrase.
+Run **inside an agent container** they would silently create a throwaway vault
+and "succeed" (the original clerk/carrie failure). They now **refuse** in a
+sandbox (`SWITCHROOM_RUNTIME=docker`) with a clear error pointing at the
+`linear_agent_setup` MCP tool (in-container) or the host shell.
+
 When auth dies (revoked, OR no refresh bundle was ever stored), the operator
 also gets a **🔑 Linear auth needs you** Telegram alert in the alerts lane —
 no more silent daily 401s (the clerk/carrie incident, 2026-06-16). Kill-switch:
