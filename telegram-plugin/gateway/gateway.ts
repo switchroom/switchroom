@@ -487,8 +487,10 @@ import {
   listGrantsViaBroker,
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
-import { emitLinearAgentActivity, createLinearIssue, buildLinearAuthDeadMessage, type LinearAuthDeadReason } from './linear-activity.js'
+import { emitLinearAgentActivity, createLinearIssue, buildLinearAuthDeadMessage, brokerRefreshIO, type LinearAuthDeadReason } from './linear-activity.js'
 import { runLinearAgentSetup } from './linear-setup.js'
+import { runLinearAuthCheck } from './linear-auth-watch.js'
+import { performLinearRefresh } from '../../src/linear/oauth-refresh.js'
 import {
   approvalRequest,
   approvalConsume,
@@ -13237,6 +13239,46 @@ function resolveAgentSupergroupChatId(): string | undefined {
   }
 }
 
+/** Whether THIS agent has `channels.telegram.linear_agent.enabled`. Used by the
+ *  proactive Linear-auth watch to skip agents that aren't Linear actors. */
+function isSelfLinearAgentEnabled(): boolean {
+  const agentName = process.env.SWITCHROOM_AGENT_NAME
+  if (!agentName) return false
+  try {
+    const cfg = loadSwitchroomConfig()
+    const rawAgent = cfg.agents?.[agentName]
+    if (!rawAgent) return false
+    const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent)
+    const la = (resolved.channels?.telegram as { linear_agent?: { enabled?: boolean } } | undefined)?.linear_agent
+    return la?.enabled === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One proactive Linear-auth check for this agent (boot + interval). Reads the
+ * refresh bundle via the broker; missing → operator alert, near-expiry →
+ * proactive rotate, revoked → operator alert. Best-effort, never throws.
+ * Disabled with SWITCHROOM_LINEAR_AUTH_WATCH_POLL_MS=0.
+ */
+async function runLinearAuthWatch(): Promise<void> {
+  const agent = process.env.SWITCHROOM_AGENT_NAME
+  if (!agent) return
+  const io = brokerRefreshIO(agent)
+  const status = await runLinearAuthCheck({
+    agent,
+    linearEnabled: isSelfLinearAgentEnabled,
+    readBundle: io.readBundle,
+    refresh: () => performLinearRefresh(io),
+    onAuthDead: notifyLinearAuthDead,
+    log: (s) => process.stderr.write(s),
+  })
+  if (status !== 'disabled' && status !== 'fresh') {
+    process.stderr.write(`telegram gateway: linear-auth-watch agent=${agent} status=${status}\n`)
+  }
+}
+
 /**
  * Stamp a user-facing restart reason into the clean-shutdown marker
  * (same file the SIGTERM handler writes to and the next session greeting
@@ -21457,6 +21499,24 @@ void (async () => {
               process.stderr.write(`telegram gateway: quota-watch scheduled run failed: ${err}\n`)
             })
           }, QUOTA_WATCH_POLL_MS).unref()
+        }
+
+        // Proactive Linear-auth watch (FIX 3): catch a dead/missing/near-expiry
+        // Linear bundle BEFORE the agent needs Linear, instead of only on a live
+        // 401. Boot run (delayed so the broker connection settles) + interval.
+        // SWITCHROOM_LINEAR_AUTH_WATCH_POLL_MS=0 disables it.
+        const LINEAR_AUTH_WATCH_POLL_MS = Number(process.env.SWITCHROOM_LINEAR_AUTH_WATCH_POLL_MS ?? 6 * 60 * 60_000)
+        if (LINEAR_AUTH_WATCH_POLL_MS > 0) {
+          setTimeout(() => {
+            void runLinearAuthWatch().catch((err) => {
+              process.stderr.write(`telegram gateway: linear-auth-watch initial run failed: ${err}\n`)
+            })
+          }, 35_000)
+          setInterval(() => {
+            void runLinearAuthWatch().catch((err) => {
+              process.stderr.write(`telegram gateway: linear-auth-watch scheduled run failed: ${err}\n`)
+            })
+          }, LINEAR_AUTH_WATCH_POLL_MS).unref()
         }
 
         // Restart-watchdog: poll systemd's NRestarts for the agent unit.
