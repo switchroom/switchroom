@@ -1015,23 +1015,41 @@
       return provLine + body;
     }
 
-    async function fetchConnections() {
-      // Each fetch falls back independently (.catch → default). A single
-      // network blip — e.g. one endpoint momentarily unreachable — must NOT
-      // reject the whole batch and blank the connected accounts; the others
-      // still render. (Previously a bare Promise.all meant any one failure
-      // wiped the tab, so a connected Google/Microsoft account "vanished".)
-      const safe = (p, fallback) => p.then(r => r.ok ? r.json() : fallback).catch(() => fallback);
+    async function fetchConnections(opts) {
+      opts = opts || {};
+      const attempt = opts.attempt || 0;
+      // Distinguish a FAILED fetch from a genuinely-empty result. The old
+      // `safe` collapsed both to []/{}, so a transient broker/web blip
+      // rendered identically to "nothing configured" — and because this tab
+      // fetches only on open (NOT the 10s fleet poll), a one-time failure
+      // stuck until a manual re-click. Track ok per fetch so renderConnections
+      // can show an honest "couldn't load" state, and self-heal with bounded
+      // retries. (A single endpoint failing still renders the others.)
+      const safe = (p, fallback) => p
+        .then(r => r.ok ? r.json().then(d => ({ ok: true, data: d })) : { ok: false, data: fallback })
+        .catch(() => ({ ok: false, data: fallback }));
       try {
-        const [google, microsoft, notion, agents] = await Promise.all([
+        const [g, ms, n, ag] = await Promise.all([
           safe(fetch(`${API}/api/google-accounts`, { headers: authHeaders() }), []),
           safe(fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }), []),
           safe(fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }), { configured: false, databases: [] }),
           safe(fetch(`${API}/api/agents`, { headers: authHeaders() }), []),
         ]);
-        const agentNames = (agents || []).map(a => a.name).sort();
-        renderConnections({ google, microsoft, notion, agentNames });
+        // Notion legitimately reports unconfigured — not a failure. The OAuth
+        // providers + the agent list are the ones whose failure must not read
+        // as "empty".
+        const fetchFailed = !g.ok || !ms.ok || !ag.ok;
+        renderConnections({
+          google: g.data, microsoft: ms.data, notion: n.data,
+          agentNames: (ag.data || []).map(a => a.name).sort(),
+          googleFailed: !g.ok, microsoftFailed: !ms.ok, fetchFailed,
+        });
         clearError();
+        // Self-heal a transient blip without a manual re-click. Bounded
+        // backoff (3s, 6s, 9s); stops the instant a fetch succeeds.
+        if (fetchFailed && attempt < 3) {
+          setTimeout(() => fetchConnections({ attempt: attempt + 1 }), 3000 * (attempt + 1));
+        }
       } catch (err) {
         showError(`Failed to fetch connections: ${err.message}`);
       }
@@ -1566,6 +1584,14 @@
             detail: 'These accounts are from the config; the broker did not return live slot state, so connection status may be stale.',
             remediation: { kind: 'none', label: 'Refresh the tab once the broker is reachable to see live status.' },
           };
+        case 'connections-unreachable':
+          return {
+            title: "Couldn't load live connection data — retrying",
+            detail: 'The dashboard could not reach the account data source (the broker or web container may be restarting). ' +
+              'This is NOT "no accounts configured" — your connected accounts are unchanged. ' +
+              'Auto-retrying; the tab fills in once it recovers.',
+            remediation: { kind: 'none', label: 'Or refresh the page if it persists.' },
+          };
         default:
           return { title: String(kind || 'Problem'), remediation: { kind: 'none' } };
       }
@@ -2093,13 +2119,21 @@
       const notion = data.notion || { configured: false, databases: [] };
       const agentNames = data.agentNames || [];
 
+      // When a provider's fetch FAILED (not genuinely empty), its empty-state
+      // must say "couldn't load", never "none configured" — otherwise a
+      // transient blip reads as "you have no accounts".
       const googleSection = _connectionSection(
         'Google',
-        'No Google accounts. Add one under <code>google_accounts:</code> and run <code>switchroom auth google account add</code>.',
+        data.googleFailed
+          ? "Couldn't load Google accounts — the data source was unreachable (retrying)."
+          : 'No Google accounts. Add one under <code>google_accounts:</code> and run <code>switchroom auth google account add</code>.',
         google.map(a => renderOAuthAccountCard(a, { showType: false, provider: 'google', agentNames })).join(''),
       );
 
       const msCards = microsoft.map(a => renderOAuthAccountCard(a, { showType: true, provider: 'microsoft', agentNames })).join('');
+      const msEmpty = data.microsoftFailed
+        ? "Couldn't load Microsoft accounts — the data source was unreachable (retrying)."
+        : 'No Microsoft accounts yet — click <b>Connect a Microsoft account</b> above (or <code>/connect microsoft</code> from Telegram).';
       const microsoftSection = `
         <div style="margin-bottom:1.5rem">
           <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">
@@ -2109,7 +2143,7 @@
           <div id="ms-connect-card"></div>
           ${msCards
             ? `<div class="accounts-grid">${msCards}</div>`
-            : `<div class="loading" style="padding:.8rem">No Microsoft accounts yet — click <b>Connect a Microsoft account</b> above (or <code>/connect microsoft</code> from Telegram).</div>`}
+            : `<div class="loading" style="padding:.8rem">${msEmpty}</div>`}
         </div>`;
 
       let notionCards = '';
@@ -2156,7 +2190,14 @@
         ? renderProblem(problemFor('connections-degraded', {}))
         : '';
 
-      container.innerHTML = degradedBanner + googleSection + microsoftSection + notionSection;
+      // A failed fetch must NOT masquerade as "nothing configured" — lead
+      // with an honest banner so the operator knows the empty look is a
+      // load failure (auto-retrying), not an absence of accounts.
+      const unreachableBanner = data.fetchFailed
+        ? renderProblem(problemFor('connections-unreachable', {}))
+        : '';
+
+      container.innerHTML = unreachableBanner + degradedBanner + googleSection + microsoftSection + notionSection;
     }
 
     function renderSchedule(data) {
