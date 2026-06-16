@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import {
   emitLinearAgentActivity,
+  buildLinearAuthDeadMessage,
   type LinearTokenResult,
 } from '../gateway/linear-activity.js'
 
@@ -195,5 +196,81 @@ describe('linear_agent_activity — auto-refresh on 401 (#2298 durability)', () 
     expect(r.content[0].text).toMatch(/emitted/)
     expect(refreshBuilt).toBe(false)
     expect(calls.length).toBe(1)
+  })
+})
+
+/** RefreshIO whose bundle is absent → performLinearRefresh returns no_bundle
+ *  (the silent-setup-failure case clerk/carrie hit in prod). */
+function noBundleRefreshIO(): RefreshIO {
+  return { readBundle: async () => null, writeToken: async () => {}, writeBundle: async () => {} }
+}
+
+describe('emitLinearAgentActivity — operator alert when auth is unrecoverable (FIX 1)', () => {
+  it('no refresh bundle → onAuthUnrecoverable(no_bundle) fires', async () => {
+    const { fetchImpl } = refreshAwareFetch()
+    const alerts: Array<{ agent: string; reason: string }> = []
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      {
+        agent: 'clerk',
+        resolveToken: okToken('lin_expired'),
+        fetchImpl,
+        refreshIO: () => noBundleRefreshIO(),
+        log: () => {},
+        onAuthUnrecoverable: (i) => alerts.push(i),
+      },
+    )
+    expect(r.content[0].text).toMatch(/Linear API 401/)
+    expect(alerts).toEqual([{ agent: 'clerk', reason: 'no_bundle', detail: expect.any(String) }])
+  })
+
+  it('revoked refresh token → onAuthUnrecoverable(revoked) fires', async () => {
+    const { fetchImpl } = refreshAwareFetch({ tokenStatus: 400, tokenBody: 'invalid_grant' })
+    const alerts: Array<{ agent: string; reason: string }> = []
+    await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_dead'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(alerts.map((a) => a.reason)).toEqual(['revoked'])
+  })
+
+  it('transient refresh failure (HTTP 500) does NOT page the operator', async () => {
+    const { fetchImpl } = refreshAwareFetch({ tokenStatus: 500, tokenBody: 'upstream boom' })
+    const alerts: unknown[] = []
+    await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_x'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(alerts).toEqual([])
+  })
+
+  it('buildLinearAuthDeadMessage: no_bundle names the missing oauth key + re-auth command', () => {
+    const msg = buildLinearAuthDeadMessage('clerk', 'no_bundle')
+    expect(msg).toMatch(/Linear auth needs you/)
+    expect(msg).toContain('<code>linear/clerk/oauth</code>')
+    expect(msg).toContain('switchroom linear-agent setup --agent clerk')
+  })
+
+  it('buildLinearAuthDeadMessage: revoked says the refresh token was revoked', () => {
+    const msg = buildLinearAuthDeadMessage('carrie', 'revoked')
+    expect(msg).toMatch(/refresh token was revoked/)
+    expect(msg).not.toContain('/oauth</code> is missing')
+  })
+
+  it('buildLinearAuthDeadMessage: HTML-escapes a hostile agent slug', () => {
+    const msg = buildLinearAuthDeadMessage('a<b>&c', 'no_bundle')
+    expect(msg).toContain('a&lt;b&gt;&amp;c')
+    expect(msg).not.toContain('a<b>&c')
+  })
+
+  it('successful auto-refresh does NOT page the operator', async () => {
+    const { fetchImpl } = refreshAwareFetch()
+    const alerts: unknown[] = []
+    const r = await emitLinearAgentActivity(
+      { agent_session_id: 'sess', type: 'thought', body: 'hi' },
+      { agent: 'carrie', resolveToken: okToken('lin_expired'), fetchImpl, refreshIO: () => fakeRefreshIO().io, log: () => {}, onAuthUnrecoverable: (i) => alerts.push(i) },
+    )
+    expect(r.content[0].text).toMatch(/emitted/)
+    expect(alerts).toEqual([])
   })
 })

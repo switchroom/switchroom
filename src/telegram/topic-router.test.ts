@@ -230,6 +230,16 @@ describe("resolveOutboundTopic — ops-lane events (boot, compact-watchdog, comm
     expect(out).toBe(41);
   });
 
+  it("linear-auth: lands in alerts alias", () => {
+    const out = resolveOutboundTopic(SG_CONFIG, { kind: "linear-auth" });
+    expect(out).toBe(41);
+  });
+
+  it("linear-auth: undefined in fleet mode (no default_topic_id)", () => {
+    const out = resolveOutboundTopic({}, { kind: "linear-auth" });
+    expect(out).toBeUndefined();
+  });
+
   it("command-mutation: lands in admin alias", () => {
     const out = resolveOutboundTopic(SG_CONFIG, { kind: "command-mutation" });
     expect(out).toBe(31);
