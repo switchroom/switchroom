@@ -510,6 +510,38 @@ const TOOL_SCHEMAS = [
       required: ['title', 'body'],
     },
   },
+  {
+    name: 'linear_agent_setup',
+    description:
+      'Provision THIS agent as a Linear app actor (actor=app OAuth) from inside the container — the operator-approved in-container path that replaces the host-only `switchroom linear-agent setup` (which silently no-ops in a sandbox). Two steps. action="authorize_url": pass the OAuth app client_id + redirect_uri; returns the browser URL the operator opens to consent. action="complete": pass client_id, client_secret, redirect_uri, and the code from the redirect; exchanges it and stores the access token (linear/<agent>/token) + the durable refresh bundle (linear/<agent>/oauth) via the vault broker so the token auto-renews. Writing those NEW keys needs a write-grant — if the broker denies, the tool returns the exact vault_request_access calls to make (operator approves), then re-run "complete". After it stores the values, follow the returned guidance to config_propose_edit the linear_agent block + secrets[] ACL (also operator-approved) to make it durable. The client_secret and code are used in-process only — never stored in config or logged.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['authorize_url', 'complete'],
+          description: '"authorize_url" to get the browser consent URL; "complete" to exchange the code and store the credentials.',
+        },
+        client_id: {
+          type: 'string',
+          description: 'Linear OAuth app client id (from Linear → Settings → API → your agent app).',
+        },
+        redirect_uri: {
+          type: 'string',
+          description: 'The redirect URI registered on the Linear OAuth app (e.g. http://localhost:3000/callback). Must match exactly in both steps.',
+        },
+        client_secret: {
+          type: 'string',
+          description: 'Linear OAuth app client secret. Required for action="complete"; used in-process for the token exchange, never stored or logged.',
+        },
+        code: {
+          type: 'string',
+          description: 'The authorization code from the redirect URL (the `code=` query param). Required for action="complete"; single-use.',
+        },
+      },
+      required: ['action', 'client_id', 'redirect_uri'],
+    },
+  },
 ]
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_SCHEMAS }))

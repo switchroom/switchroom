@@ -168,6 +168,31 @@ When you get such a reaction turn:
 
 Don't acknowledge with only a reaction or a bare "done" — the operator wants
 the link (or the honest reason it didn't file).
+
+### If your Linear auth breaks (a 401 / "can't reach Linear")
+
+Linear `actor=app` access tokens expire (~24h) and renew from a stored
+**refresh bundle** (`linear/<you>/oauth`). If that bundle is missing or its
+refresh token was revoked, your Linear calls 401 and the operator gets a
+"🔑 Linear auth needs you" alert. You can re-authorize yourself — it's an
+operator-approved, in-container flow (no host shell needed):
+
+1. Ask the operator for the Linear **OAuth app client_id + redirect_uri** (and
+   they'll have the client_secret ready for step 3).
+2. Call **`linear_agent_setup`** with `action: "authorize_url"`, the
+   `client_id`, and `redirect_uri`. Relay the returned URL — the operator opens
+   it, consents, and copies the `code=` value from the redirect.
+3. Call **`linear_agent_setup`** with `action: "complete"` + `client_id`,
+   `client_secret`, `redirect_uri`, and that `code`. It exchanges the code and
+   stores the access token + refresh bundle via the vault broker.
+   - If it returns **vault_request_access** instructions, the keys need a
+     write-grant — make those calls, the operator approves, then re-run
+     `complete` (re-open the authorize URL first if the code went stale).
+   - If it returns **config_propose_edit** guidance (durability/ACL), propose
+     that edit so the change survives restarts and auto-refresh keeps working.
+
+The client_secret and code are used only for the exchange — never store them in
+config or paste them into a normal message; pass them straight to the tool.
 {{/if}}
 
 ### Don't lie about scheduling

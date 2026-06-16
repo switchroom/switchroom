@@ -488,6 +488,7 @@ import {
   revokeGrantViaBroker,
 } from '../../src/vault/broker/client.js'
 import { emitLinearAgentActivity, createLinearIssue, buildLinearAuthDeadMessage, type LinearAuthDeadReason } from './linear-activity.js'
+import { runLinearAgentSetup } from './linear-setup.js'
 import {
   approvalRequest,
   approvalConsume,
@@ -6883,6 +6884,7 @@ const ALLOWED_TOOLS = new Set([
   'request_secret',
   'linear_agent_activity',
   'linear_create_issue',
+  'linear_agent_setup',
 ])
 
 async function executeToolCall(tool: string, args: Record<string, unknown>): Promise<unknown> {
@@ -6932,6 +6934,8 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
       return executeLinearAgentActivity(args)
     case 'linear_create_issue':
       return executeLinearCreateIssue(args)
+    case 'linear_agent_setup':
+      return executeLinearAgentSetup(args)
     default:
       throw new Error(`unknown tool: ${tool}`)
   }
@@ -7019,6 +7023,10 @@ async function executeLinearAgentActivity(args: Record<string, unknown>): Promis
 
 async function executeLinearCreateIssue(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
   return createLinearIssue(args, { onAuthUnrecoverable: notifyLinearAuthDead })
+}
+
+async function executeLinearAgentSetup(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  return runLinearAgentSetup(args)
 }
 
 async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {

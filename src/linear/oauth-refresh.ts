@@ -19,11 +19,135 @@
  */
 
 export const LINEAR_TOKEN_ENDPOINT = "https://api.linear.app/oauth/token";
+export const LINEAR_AUTHORIZE_ENDPOINT = "https://linear.app/oauth/authorize";
+
+/** The actor=app scopes a switchroom Linear agent needs: read+write the
+ *  workspace, be assignable as a delegate, and be @-mentionable. */
+export const LINEAR_AGENT_SCOPES = [
+  "read",
+  "write",
+  "app:assignable",
+  "app:mentionable",
+] as const;
 
 /** Default proactive-refresh skew: refresh when the access token is within
  *  2h of expiry, so a near-expiry token is replaced on its next use rather
  *  than failing the call. */
 export const DEFAULT_REFRESH_SKEW_SEC = 2 * 3600;
+
+/**
+ * Build the Linear `actor=app` authorize URL the operator opens in a browser
+ * to mint an authorization code. Pure (no I/O). The operator consents, Linear
+ * redirects to `redirectUri?code=…`, and that code is exchanged by
+ * {@link exchangeLinearAuthCode}. `prompt=consent` forces the consent screen
+ * so a re-auth reliably issues a fresh refresh token.
+ */
+export function buildLinearAuthorizeUrl(args: {
+  clientId: string;
+  redirectUri: string;
+  scopes?: readonly string[];
+  state?: string;
+}): string {
+  const params = new URLSearchParams({
+    client_id: args.clientId,
+    redirect_uri: args.redirectUri,
+    response_type: "code",
+    scope: (args.scopes ?? LINEAR_AGENT_SCOPES).join(","),
+    actor: "app",
+    prompt: "consent",
+  });
+  if (args.state) params.set("state", args.state);
+  return `${LINEAR_AUTHORIZE_ENDPOINT}?${params.toString()}`;
+}
+
+export type AuthCodeExchangeResult =
+  | {
+      ok: true;
+      accessToken: string;
+      refreshToken: string;
+      /** Epoch seconds the new access token expires. */
+      expiresAt: number;
+      scope?: string;
+    }
+  | {
+      ok: false;
+      /** `bad_code` = the authorization code was wrong/expired/already used
+       *  (operator must re-open the authorize URL); others are transient. */
+      reason: "bad_code" | "network" | "http_error" | "bad_response";
+      detail: string;
+    };
+
+/**
+ * Exchange an OAuth `authorization_code` (from the browser redirect) for an
+ * access token + refresh token at Linear's token endpoint. Never throws —
+ * returns a tagged result. NEVER logs the secret values. This is the one-time
+ * counterpart to {@link refreshLinearAppToken}: it mints the FIRST bundle,
+ * after which the refresh path keeps it alive.
+ */
+export async function exchangeLinearAuthCode(
+  args: { clientId: string; clientSecret: string; code: string; redirectUri: string },
+  opts: { fetchImpl?: typeof fetch; nowSec?: () => number } = {},
+): Promise<AuthCodeExchangeResult> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const nowSec = opts.nowSec ?? (() => Math.floor(Date.now() / 1000));
+
+  const form = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: args.code,
+    client_id: args.clientId,
+    client_secret: args.clientSecret,
+    redirect_uri: args.redirectUri,
+  });
+
+  let resp: Response;
+  try {
+    resp = await fetchImpl(LINEAR_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+  } catch (err) {
+    return { ok: false, reason: "network", detail: (err as Error).message };
+  }
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    // A wrong/expired/reused code surfaces as 400 invalid_grant.
+    const badCode = resp.status === 400 || /invalid_grant|invalid_request/i.test(txt);
+    return {
+      ok: false,
+      reason: badCode ? "bad_code" : "http_error",
+      detail: `HTTP ${resp.status}${txt ? ` ${txt.slice(0, 200)}` : ""}`,
+    };
+  }
+
+  let json: { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown };
+  try {
+    json = (await resp.json()) as typeof json;
+  } catch {
+    return { ok: false, reason: "bad_response", detail: "non-JSON token response" };
+  }
+
+  const accessToken = json.access_token;
+  if (typeof accessToken !== "string" || accessToken.length === 0) {
+    return { ok: false, reason: "bad_response", detail: "no access_token in response" };
+  }
+  const refreshToken = json.refresh_token;
+  if (typeof refreshToken !== "string" || refreshToken.length === 0) {
+    // No refresh_token means no durable bundle — surface it so the caller
+    // doesn't silently store a non-renewable token (the original bug).
+    return { ok: false, reason: "bad_response", detail: "no refresh_token in response (was actor=app + a fresh consent used?)" };
+  }
+  const expiresIn = typeof json.expires_in === "number" ? json.expires_in : 86400;
+
+  return {
+    ok: true,
+    accessToken,
+    refreshToken,
+    expiresAt: nowSec() + expiresIn,
+    ...(typeof json.scope === "string" ? { scope: json.scope } : {}),
+  };
+}
 
 export interface LinearOAuthBundle {
   clientId: string;

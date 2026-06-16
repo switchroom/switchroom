@@ -169,6 +169,32 @@ Recovery: re-run the **Setup — the OAuth dance** above and `setup` with the ne
 `--refresh-token`. (Everything else — transient network/HTTP errors — is
 treated as retryable and not surfaced as a re-auth ask.)
 
+When auth dies (revoked, OR no refresh bundle was ever stored), the operator
+also gets a **🔑 Linear auth needs you** Telegram alert in the alerts lane —
+no more silent daily 401s (the clerk/carrie incident, 2026-06-16). Kill-switch:
+`SWITCHROOM_LINEAR_AUTH_ALERT=0`.
+
+### Self-serve recovery from inside the agent (no host shell)
+
+`switchroom linear-agent setup` is **host-only** — it writes the vault file with
+the operator passphrase, which doesn't exist inside an agent container, so
+running it in-container silently no-ops (this is how clerk/carrie ended up with
+a token but no bundle). The in-container path is the **`linear_agent_setup` MCP
+tool**, which an agent can drive with operator approval:
+
+1. `linear_agent_setup({ action: "authorize_url", client_id, redirect_uri })`
+   → returns the browser consent URL (operator opens it, copies the `code`).
+2. `linear_agent_setup({ action: "complete", client_id, client_secret,
+   redirect_uri, code })` → exchanges the code and stores
+   `linear/<agent>/token` + `linear/<agent>/oauth` via the broker.
+
+Creating those keys the first time needs a **write-grant**
+(`vault_request_access` scope `write`, operator-approved) — the tool returns the
+exact calls to make. The durable `secrets[]` ACL + `linear_agent` block are
+added via **`config_propose_edit`** (also operator-approved). The
+client_secret/code are used in-process for the exchange only — never stored in
+config or logged.
+
 ---
 
 ## CLI reference — `switchroom linear-agent`
