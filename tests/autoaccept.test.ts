@@ -60,12 +60,11 @@ describe("runAutoaccept", () => {
     const { sentKeys } = setupTmux([
       // poll 1: theme prompt visible
       "Choose the text style you'd like\n[1] Auto",
-      // poll 2..N: nothing — falls through to idle-timeout
+      // poll 2..N: nothing (no REPL footer) — runs out via maxPolls
       "",
     ]);
     const res = await runAutoaccept({
       agentName: "klanker",
-      idleTimeoutMs: 5,
       pollIntervalMs: 0,
       now: () => 0, // never advances; rely on maxPolls
       sleep: () => {},
@@ -83,7 +82,6 @@ describe("runAutoaccept", () => {
     ]);
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -105,7 +103,6 @@ describe("runAutoaccept", () => {
     ]);
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -115,16 +112,70 @@ describe("runAutoaccept", () => {
     expect(sentKeys).toHaveLength(1);
   });
 
-  it("exits cleanly with idle-timeout when no prompts match", async () => {
-    setupTmux(["claude > _", "claude > _", "claude > _"]);
+  it("exits repl-ready the moment claude reaches the REPL (clean handoff)", async () => {
+    // Boot screen, then the REPL footer appears → exit cleanly so the
+    // sidecar hands the pane to the wedge-watchdog.
+    setupTmux([
+      "starting up…",
+      "❯ \n────────────\n? for shortcuts · ← for agents",
+    ]);
+    const res = await runAutoaccept({
+      agentName: "a",
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 50,
+    });
+    expect(res.reason).toBe("repl-ready");
+    expect(res.fired).toEqual([]);
+  });
+
+  it("does NOT give up while claude is still booting, then fires a LATE-rendering dev-channels prompt", async () => {
+    // The 2026-06-17 cold-restart regression: under CPU contention claude
+    // took far longer than the old 30s idle window to render the
+    // dev-channels prompt. The poller must keep waiting through a blank /
+    // pre-REPL pane and still dispatch the prompt when it finally appears.
+    const { sentKeys } = setupTmux([
+      "", // claude not started rendering yet
+      "",
+      "",
+      "",
+      "", // ...well past the retired 30s idle window...
+      "WARNING: Loading development channels\n❯ 1. I am using this for local development\n  2. Exit",
+      "❯ \n? for shortcuts · ← for agents", // REPL after the prompt is dismissed
+    ]);
+    // Clock advances 60s per poll — under the OLD "idle since launch" logic
+    // this would have given up on the first blank poll. The hard cap is far
+    // higher, so the late prompt is still caught.
     let t = 0;
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 100,
+      bootHardCapMs: 600_000,
       pollIntervalMs: 0,
-      // wall-clock advances 50ms per call → after 3 polls we hit 150ms idle
       now: () => {
-        t += 50;
+        t += 60_000;
+        return t;
+      },
+      sleep: () => {},
+      maxPolls: 50,
+    });
+    expect(res.fired).toContain("dev-channels-loading");
+    expect(sentKeys[0]).toEqual(["Enter"]);
+    expect(res.reason).toBe("repl-ready");
+  });
+
+  it("a blank pane never trips an early exit — only the hard cap does", async () => {
+    // claude never renders anything (truly hung container). The poller must
+    // not exit until bootHardCapMs, then surface idle-timeout so the sidecar
+    // can still enter the watch phase.
+    setupTmux([""]); // setupTmux returns "" once exhausted anyway
+    let t = 0;
+    const res = await runAutoaccept({
+      agentName: "a",
+      bootHardCapMs: 300,
+      pollIntervalMs: 0,
+      now: () => {
+        t += 100;
         return t;
       },
       sleep: () => {},
@@ -145,7 +196,6 @@ describe("runAutoaccept", () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -171,7 +221,6 @@ describe("runAutoaccept", () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -192,7 +241,6 @@ describe("runAutoaccept", () => {
     const { sentKeys } = setupTmux(["BLIP", "BLIP", "BLIP", "BLIP"]);
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -305,7 +353,6 @@ describe("runAutoaccept — new dev-channels prompt dispatch", () => {
     ]);
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
@@ -325,7 +372,6 @@ describe("runAutoaccept — new dev-channels prompt dispatch", () => {
     ]);
     const res = await runAutoaccept({
       agentName: "a",
-      idleTimeoutMs: 1,
       pollIntervalMs: 0,
       now: () => 0,
       sleep: () => {},
