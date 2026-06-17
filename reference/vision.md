@@ -47,59 +47,19 @@ So I built it.
 
 ## The four outcomes
 
-Every feature serves one of these. If it doesn't, it doesn't belong.
+Every feature serves one of these. If it doesn't, it doesn't belong. The
+*why* of each lives here in one line. The full definition, how the product
+functions to deliver them, and the jobs that ladder up to each live in
+[`product-spec.md`](product-spec.md).
 
-### 1. A standing team that knows you: *specialists, not one generalist*
+1. **A standing team that knows you** — specialists, not one generalist.
+2. **You hold the leash** — controlled, purposeful, never roaming.
+3. **Subscription-honest and predictable** — the plan is the ceiling.
+4. **Always available, in Telegram, done properly** — there when you want it.
 
-The headline. One bot per specialist. Each its own persona, memory,
-skills, tools, credentials. `clerk` is the canonical one: a chief of
-staff that runs the calendar, watches the health data, fields the
-household asks, all in one voice, because it knows you across all of
-it. The coding specialist is the same thesis, not an exception. It
-remembers why the product is the way it is, so its pushback on a
-half-formed idea from the train is worth something. Add a specialist
-in ten lines of YAML. You don't fork the product.
-
-Memory serves this. It isn't the pitch.
-
-### 2. You hold the leash: *controlled, purposeful, never roaming*
-
-The substantive one. Agents act, but only with what you gave them. A
-specialist sees only the credentials and tools you granted it. It can
-ask for more. You get an Allow or Deny card in Telegram. Only your tap
-grants it. It can't self-elevate or route around you. No heartbeats:
-beck-and-call plus the explicit schedules you set, never a loop of its
-own. You're never in the dark, the state reads in plain words, and you
-can steer or stop a turn mid-flight. Awareness and control. Not a
-tool-call log to babysit.
-
-### 3. Subscription-honest and predictable: *the plan is the ceiling*
-
-Every agent runs the unmodified `claude` binary, OAuth straight to
-Anthropic, the same flow as the desktop. No Agent SDK. No API-key
-routing. No raw API. No credential interception. This is a hard
-constraint, not a preference: running the native CLI on the
-subscription is what keeps switchroom inside Anthropic's third-party
-policy. The moment a feature reaches for the SDK or the API, it has
-left switchroom.
-
-Every model call is the interactive `claude` session, or a turn
-synthesized into it. Headless `claude -p` is the same CLI, but as of
-the 2026-06-15 policy it counts as programmatic usage, off the
-subscription, so switchroom keeps that work in the interactive session
-too.
-
-Cost is the subscription you chose, not a meter you can't forecast.
-Need more throughput, pool accounts with automatic failover. One bill.
-The one you already pay.
-
-### 4. Always available, in Telegram, done properly: *there when you want it*
-
-Each specialist is a long-running service. It survives reboots,
-network drops, your laptop closing. It runs its scheduled work and
-it's there the second you reach for it, anywhere your phone has
-signal. Available and punctual. Not autonomous. Telegram is the
-interface, singular on purpose, not one tab of a bridge.
+The hard constraints under these — claude-native, no-self-escalation,
+on-leash, single-tenant, telegram-only — are the lines we won't cross by
+construction: [`invariants.md`](invariants.md).
 
 ---
 
@@ -149,14 +109,17 @@ principal sees, the setup wizard.
 
 ## How vision becomes verdict
 
-The *what* and *why*. Two sibling docs turn it into a verdict on a
+The *why*. Three anchors and a product layer turn it into a verdict on a
 specific PR or design:
 
-- **`reference/principles.md`** carries the three standards (docs /
-  defaults / consistency) every change is checked against.
-- **`reference/*.md` JTBDs** are the outcome-focused jobs. Each maps
-  to one of the four outcomes above.
+- [`principles.md`](principles.md) — the three standards (docs / defaults /
+  consistency) every change is checked against.
+- [`invariants.md`](invariants.md) — the lines we won't cross by
+  construction.
+- [`product-spec.md`](product-spec.md) — the four outcomes (in full) and the
+  job index. The per-job **job specs** (`reference/*.md` with `job:`
+  frontmatter) each `serves:` one outcome.
 
-A feature lands when it (a) advances one of the four outcomes,
-(b) satisfies its JTBD, (c) passes all three principle checks.
-Anything else is out of scope, however clever.
+A change lands when it (a) advances one of the four outcomes, (b) satisfies
+its job spec, (c) passes all three principle checks, and (d) crosses no
+invariant. Anything else is out of scope, however clever.

@@ -61,7 +61,7 @@ export function registerTelegramCommand(program: Command): void {
  * the agent has observed inbound messages from in a given chat. Reads the
  * local SQLite history buffer (`<agentDir>/telegram/history.db`).
  *
- * Onboarding ergonomics for supergroup-mode (docs/rfcs/supergroup-mode.md):
+ * Onboarding ergonomics for supergroup-mode (reference/rfcs/supergroup-mode.md):
  * after enabling a forum supergroup, the operator sends one message in
  * each topic, runs this command, and gets back the numeric thread IDs to
  * paste under `channels.telegram.topic_aliases`. The command also prints

@@ -1,7 +1,7 @@
 /**
  * Per-tool DB resolution for Notion's PreToolUse hook.
  *
- * RFC docs/rfcs/notion-integration.md §8.2.
+ * RFC reference/rfcs/notion-integration.md §8.2.
  *
  * For each Notion MCP write tool, the PreToolUse hook needs to know
  * the parent database UUID of the target page/block so the allowlist

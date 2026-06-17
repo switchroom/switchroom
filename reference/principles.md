@@ -1,7 +1,7 @@
 ---
-job: keep switchroom feeling like one product, not a kit
-outcome: Every PR, design review, and release is checked against three product principles. Features that fail the checks get redesigned, not shipped and patched.
-stakes: Without explicit standards, "convention over configuration" decays into "configure everything." The fleet stops feeling like one product.
+title: Switchroom product principles
+status: the second anchor — the three checks every PR, review, and release must pass
+audience: anyone designing, building, reviewing, or releasing switchroom
 ---
 
 # Switchroom product principles

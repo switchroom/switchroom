@@ -149,7 +149,7 @@ const FUZZ_CASES: readonly FuzzCase[] = [
   // The conservative regex set in `telegram-plugin/inbound-classifier.ts`
   // captures 10 standalone "ping" patterns that count toward the
   // primary lagging KPI `inbound_status_query`. Each fire is a JTBD
-  // failure (`reference/know-what-my-agent-is-doing.md`), so we
+  // failure (`reference/jobs/know-what-my-agent-is-doing.md`), so we
   // want every variant to (a) reach the agent unchanged, (b)
   // produce a sensible reply (no crash, no loop, no ghosting).
   // Tracks cause class CC-7 from

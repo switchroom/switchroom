@@ -196,4 +196,4 @@ rename across the boundary without updating both sides.
 
 - `src/agents/workspace.ts` — loader implementation
 - `src/agents/bootstrap-budget.ts` — budget enforcement
-- `reference/onboarding-gap-analysis.md` — historical motivation for the workspace loader convergence design (point-in-time, 2026-04-25; not a live roadmap)
+- `reference/rfcs/onboarding-gap-analysis.md` — historical motivation for the workspace loader convergence design (point-in-time, 2026-04-25; not a live roadmap)

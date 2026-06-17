@@ -398,7 +398,7 @@ publisher verification is the v1.5+ path.
 
 ## Related
 
-- RFC #1873 — `docs/rfcs/microsoft-workspace.md` (full design)
+- RFC #1873 — `reference/rfcs/microsoft-workspace.md` (full design)
 - Issue #1875 — 5-PR implementation series tracking
 - `docs/google-workspace.md` — sibling Google integration (much of the
   shape is parallel; provider-specific divergences documented)

@@ -66,7 +66,7 @@ export interface SlotMeta {
    * operator display. Anthropic doesn't expose a profile endpoint, so
    * this is set explicitly via `setSlotLabel` and survives reauths.
    * Bridges to the new global-account model in
-   * `reference/share-auth-across-the-fleet.md`: a label of "work-pro"
+   * `reference/jobs/share-auth-across-the-fleet.md`: a label of "work-pro"
    * here matches up with the global account at
    * `~/.switchroom/accounts/work-pro/`.
    */

@@ -16,7 +16,7 @@
  *   `skip` is deliberately distinct from `warn` so that `warn` keeps
  *   meaning "look at this" and the operator never learns to ignore
  *   the column (the "cosmetic summary the user learns to distrust"
- *   anti-pattern in reference/restart-and-know-what-im-running.md).
+ *   anti-pattern in reference/jobs/restart-and-know-what-im-running.md).
  *   It never affects the exit code, and it STILL prints its
  *   how-to-verify line — honest, not hidden (avoids "lying by
  *   omission").

@@ -7,7 +7,7 @@
  * This is the hook's private hatchet, used only when the PreToolUse
  * gate needs to peek at Notion to compute the allowlist verdict.
  *
- * RFC docs/rfcs/notion-integration.md PR 3.
+ * RFC reference/rfcs/notion-integration.md PR 3.
  */
 
 import type { NotionApiClient } from "./db-resolver.js";

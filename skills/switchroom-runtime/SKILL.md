@@ -145,7 +145,7 @@ Doubled `!!` (typo / emphasis) reaches you verbatim. Empty `!` gets a "Send your
 
 ## "status?" / "still there?" — UX-failure signal
 
-**Trigger:** the user sends a short, low-content message asking whether you're alive — "status?", "still there?", "any update?", "you working?". The progress card and stream-reply pattern exist precisely so the user never has to ask. When you see one of those messages, treat it as a defect signal: something about the in-flight turn made the user feel uncertain. The product expectation (per `reference/know-what-my-agent-is-doing.md`) is that this rate trends to zero.
+**Trigger:** the user sends a short, low-content message asking whether you're alive — "status?", "still there?", "any update?", "you working?". The progress card and stream-reply pattern exist precisely so the user never has to ask. When you see one of those messages, treat it as a defect signal: something about the in-flight turn made the user feel uncertain. The product expectation (per `reference/jobs/know-what-my-agent-is-doing.md`) is that this rate trends to zero.
 
 Your response should:
 

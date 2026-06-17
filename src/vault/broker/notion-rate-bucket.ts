@@ -1,5 +1,5 @@
 /**
- * Notion rate-bucket primitive — RFC docs/rfcs/notion-integration.md §7.
+ * Notion rate-bucket primitive — RFC reference/rfcs/notion-integration.md §7.
  *
  * Pure token-bucket implementation, shared globally by the broker
  * across all agents that consume the same integration token. Not yet

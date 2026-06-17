@@ -8,7 +8,7 @@
  * the operator's approval card — the agent's own workspace IS the
  * approval boundary.
  *
- * Per Phase 0 spike findings (`docs/rfcs/agent-managed-skills-phase0-findings.md`):
+ * Per Phase 0 spike findings (`reference/rfcs/agent-managed-skills-phase0-findings.md`):
  *   - Personal skills live at `.claude/skills/personal-<name>/` (flat
  *     path, `personal-` name prefix). Claude-code's depth-1 discovery
  *     scans this without modification.

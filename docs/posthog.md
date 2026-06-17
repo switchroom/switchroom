@@ -66,7 +66,7 @@ also auto-stamp `agent` (the agent name) and `switchroom_version`.
 ### Gateway / runtime events (#1122)
 
 These power the **Switchroom Runtime** dashboard and the
-conversational-turn-UX KPIs (see `reference/know-what-my-agent-is-doing.md`).
+conversational-turn-UX KPIs (see `reference/jobs/know-what-my-agent-is-doing.md`).
 Emitted from inside each agent container by the telegram-plugin gateway.
 
 | Event                    | Source                                                                                  | Key properties                                                                                                              |

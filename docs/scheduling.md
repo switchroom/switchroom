@@ -136,7 +136,7 @@ The agent relays this to the user in plain language. This satisfies the *survive
 ### Targeting a forum topic (supergroup-owned agents)
 
 When an agent owns a Telegram supergroup (`channels.telegram.chat_id` is
-set — the [supergroup-owned topology](rfcs/supergroup-easy-defaults.md)),
+set — the [supergroup-owned topology](../reference/rfcs/supergroup-easy-defaults.md)),
 each schedule entry can choose **which forum topic** it posts into via the
 per-entry `topic:` field. Without it, cron output lands in the agent's
 `default_topic_id` (General, topic `1`).
@@ -224,7 +224,7 @@ If the agent is down at fire time, the in-container sidecar can't deliver — th
 
 ### Controlling per-fire cost (tiers)
 
-A cron pays for a model only when the model earns it. By default a **frequent** cron (≤60min) auto-routes to a cheap Tier-1 session and a **daily/weekly** cron runs a full Tier-2 turn (see "Automatic Tier-1 routing" below); entries (and `schedule_add`) can also set explicit tier hints. The whole system is on by default — `SWITCHROOM_CHEAP_CRON=0` is the master kill-switch (see `docs/rfcs/cheap-cron-sessions.md`):
+A cron pays for a model only when the model earns it. By default a **frequent** cron (≤60min) auto-routes to a cheap Tier-1 session and a **daily/weekly** cron runs a full Tier-2 turn (see "Automatic Tier-1 routing" below); entries (and `schedule_add`) can also set explicit tier hints. The whole system is on by default — `SWITCHROOM_CHEAP_CRON=0` is the master kill-switch (see `reference/rfcs/cheap-cron-sessions.md`):
 
 | You want… | Use | Cost |
 |---|---|---|

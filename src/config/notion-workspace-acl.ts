@@ -1,6 +1,6 @@
 /**
  * Notion Workspace ACL predicates + load-time cross-validation —
- * RFC docs/rfcs/notion-integration.md.
+ * RFC reference/rfcs/notion-integration.md.
  *
  * Mirrors `microsoft-workspace-acl.ts` shape where the model fits, with
  * two material differences:

@@ -1,5 +1,5 @@
 /**
- * Cheap-cron observability — docs/rfcs/cheap-cron-sessions.md §5.
+ * Cheap-cron observability — reference/rfcs/cheap-cron-sessions.md §5.
  *
  * Aggregates scheduler.jsonl audit rows into a per-tier cost breakdown so
  * the operator can SEE the saving: how many fires were model-free Tier-0

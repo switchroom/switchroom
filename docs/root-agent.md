@@ -122,7 +122,7 @@ rules:
 
 If you want the highest-safety posture instead — reads free, but host
 *mutations* require the vault passphrase (the crown-jewels tier in
-`reference/access-model.md`) — that is a different design than what
+`reference/rfcs/access-model.md`) — that is a different design than what
 `root: true` ships today; open an issue.
 
 ## Relationship to `switchroom-hostd`

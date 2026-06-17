@@ -1,6 +1,6 @@
 /**
  * Notion integration doctor checks —
- * RFC docs/rfcs/notion-integration.md §9 PR 4.
+ * RFC reference/rfcs/notion-integration.md §9 PR 4.
  *
  * Mirrors `doctor-microsoft.ts` and `doctor-drive.ts` shape but with
  * the Notion-specific probes:

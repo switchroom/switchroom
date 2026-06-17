@@ -237,7 +237,7 @@ describe('decideTurnFlush', () => {
   // Regression guard for the redundant-follow-up-message fix: this reverts
   // the #1291 post-reply-tail flush, which posted a duplicate recap on
   // essentially every turn because the model habitually writes a closing
-  // summary after its final reply. See reference/conversational-pacing.md
+  // summary after its final reply. See reference/rfcs/conversational-pacing.md
   // — "the framework owns the beat; the model authors the words".
   describe('reply-called turns never flush trailing terminal text', () => {
     it('skips even when a long substantive tail follows the reply', () => {

@@ -1,5 +1,5 @@
 /**
- * Tier-0 http-diff poll engine — docs/rfcs/cheap-cron-sessions.md §2.1.
+ * Tier-0 http-diff poll engine — reference/rfcs/cheap-cron-sessions.md §2.1.
  *
  * Model-free: fetch a URL, extract a cursor via a tiny JSONPath, compare
  * to the durable cursor. New cursor ⟹ a hit that escalates to a Tier-1

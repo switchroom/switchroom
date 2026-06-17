@@ -1,6 +1,6 @@
 /**
  * Scaffold-emission gate for the per-agent `notion` MCP entry —
- * RFC docs/rfcs/notion-integration.md PR 2.
+ * RFC reference/rfcs/notion-integration.md PR 2.
  *
  * `resolveNotionMcpEntry` is the pure decision the scaffoldAgent /
  * reconcileAgent / mcpJson paths call. These cases pin the contract:

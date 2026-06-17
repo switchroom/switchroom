@@ -1,5 +1,5 @@
 /**
- * Webhook ingest client (RFC docs/rfcs/webhook-via-gateway-socket.md).
+ * Webhook ingest client (RFC reference/rfcs/webhook-via-gateway-socket.md).
  *
  * Host-side counterpart to `telegram-plugin/gateway/webhook-ingest-server.ts`.
  * After the receiver verifies (HMAC/Bearer) and renders an event, it forwards

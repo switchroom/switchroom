@@ -61,7 +61,7 @@ export const AgentBindMountSchema = z.object({
     ),
 });
 
-// Tier-0 deterministic poll specs (docs/rfcs/cheap-cron-sessions.md §2.1).
+// Tier-0 deterministic poll specs (reference/rfcs/cheap-cron-sessions.md §2.1).
 // A `kind: poll` entry runs model-free in the scheduler process; only a
 // *hit* escalates to a model fire (Tier 1/2) using the entry's prompt +
 // model/context. Two declarative, operator-approved poll types — never an
@@ -105,8 +105,8 @@ export const PollSpecSchema = z.discriminatedUnion("type", [
   HttpDiffPollSchema,
 ]);
 
-// Tier-0 deterministic ACTION specs (docs/rfcs/cheap-cron-sessions.md §2.1,
-// reference/crons-use-the-model-only-when-it-earns-it.md). A `kind: action`
+// Tier-0 deterministic ACTION specs (reference/rfcs/cheap-cron-sessions.md §2.1,
+// reference/jobs/crons-use-the-model-only-when-it-earns-it.md). A `kind: action`
 // entry runs model-free in the scheduler process and COMPLETES the work — it
 // never escalates to a model (the terminal sibling of `kind: poll`, which
 // escalates on a hit). Zero tokens, no second `claude`, no session wake.
@@ -174,7 +174,7 @@ export const ScheduleEntrySchema = z
     .enum(["poll", "prompt", "action"])
     .optional()
     .describe(
-      "Tier-0 routing (docs/rfcs/cheap-cron-sessions.md). 'prompt' (default) " +
+      "Tier-0 routing (reference/rfcs/cheap-cron-sessions.md). 'prompt' (default) " +
       "fires a model turn every tick (Tier 1/2 per `context`). 'poll' runs a " +
       "model-free deterministic check (requires `poll`) and only escalates to " +
       "a model fire on a hit. 'action' runs a model-free deterministic verb " +
@@ -233,7 +233,7 @@ export const ScheduleEntrySchema = z
       "or a numeric topic ID. Falls back to the agent's `default_topic_id` " +
       "when unset. Ignored for agents in fleet-shared or dm_only mode. " +
       "Alias-resolution happens at config-load — typos surface immediately. " +
-      "See docs/rfcs/supergroup-mode.md.",
+      "See reference/rfcs/supergroup-mode.md.",
     ),
   })
   .superRefine((entry, ctx) => {
@@ -1010,7 +1010,7 @@ export const TelegramChannelSchema = z
         "(running as the agent UID) becomes the sole writer of " +
         "webhook-events.jsonl + dedup/cooldown state and also fires " +
         "webhook_dispatch. Off by default for back-compat with host-runtime " +
-        "installs. See docs/rfcs/webhook-via-gateway-socket.md.",
+        "installs. See reference/rfcs/webhook-via-gateway-socket.md.",
       ),
     webhook_require_edge: z
       .boolean()
@@ -1024,7 +1024,7 @@ export const TelegramChannelSchema = z
         "alone can't (it proves body provenance, not network path). Stacks " +
         "on the GitHub-IP WAF + per-agent HMAC. Fail-closed: when required " +
         "but the secret file is missing/empty every request is rejected. Off " +
-        "by default. See docs/rfcs/webhook-cloudflare-edge-lock.md.",
+        "by default. See reference/rfcs/webhook-cloudflare-edge-lock.md.",
       ),
     linear_agent: z
       .object({
@@ -1073,7 +1073,7 @@ export const TelegramChannelSchema = z
         "default — opt in per agent. Cascades from " +
         "defaults.channels.telegram.linear_agent.",
       ),
-    // ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────
+    // ─── Supergroup-owned mode (RFC reference/rfcs/supergroup-mode.md) ──────
     // Per-agent override of the fleet-wide telegram.forum_chat_id.
     // When set, this agent owns its own supergroup with forum topics
     // (the new third topology, alongside fleet-shared and dm_only).
@@ -1085,7 +1085,7 @@ export const TelegramChannelSchema = z
       .describe(
         "Per-agent supergroup ID — overrides fleet `telegram.forum_chat_id`. " +
         "When set, requires `default_topic_id`. Negative integer as string. " +
-        "Forbidden when `dm_only: true`. See docs/rfcs/supergroup-mode.md.",
+        "Forbidden when `dm_only: true`. See reference/rfcs/supergroup-mode.md.",
       ),
     default_topic_id: z
       .number()
@@ -1341,7 +1341,7 @@ export const MicrosoftWorkspaceConfigSchema = z
   .optional();
 
 /**
- * Top-level notion_workspace config block — RFC docs/rfcs/notion-integration.md.
+ * Top-level notion_workspace config block — RFC reference/rfcs/notion-integration.md.
  *
  * Centralizes the Notion internal-integration token, the friendly-name →
  * database UUID map, and the global rate-limit bucket size. Block is
@@ -1503,7 +1503,7 @@ export const AgentMicrosoftWorkspaceConfigSchema = z
   .optional();
 
 /**
- * Per-agent notion_workspace override — RFC docs/rfcs/notion-integration.md.
+ * Per-agent notion_workspace override — RFC reference/rfcs/notion-integration.md.
  *
  * Presence of the block opts the agent IN to Notion access (the launcher
  * is scaffolded, the `.mcp.json` entry is emitted, the broker grants the
@@ -2421,7 +2421,7 @@ export const AgentSchema = z.object({
     "microsoft_client_id/secret are not per-agent.",
   ),
   notion_workspace: AgentNotionWorkspaceConfigSchema.describe(
-    "RFC docs/rfcs/notion-integration.md. Per-agent Notion access. " +
+    "RFC reference/rfcs/notion-integration.md. Per-agent Notion access. " +
     "Presence opts the agent IN (launcher scaffolded, MCP entry emitted, " +
     "broker grants the integration token). Optional `databases:` filter " +
     "narrows which DBs this agent may read/write — names must resolve in " +
@@ -2505,7 +2505,7 @@ export const AgentSchema = z.object({
   // Supergroup-mode exclusion: dm_only agents have their own bot+chat
   // and don't participate in forum-topic routing. The three modes
   // (fleet-shared, dm_only, supergroup-owned) are mutually exclusive.
-  // See docs/rfcs/supergroup-mode.md.
+  // See reference/rfcs/supergroup-mode.md.
   if (agent.dm_only !== true) return;
   const tg = agent.channels?.telegram;
   if (tg == null) return;
@@ -2735,7 +2735,7 @@ export const QuotaConfigSchema = z.object({
 
 /**
  * Host-control daemon (`switchroom-hostd`) — default-on since RFC C
- * Phase 2 (#1338); see `docs/rfcs/host-control-daemon.md`. The daemon
+ * Phase 2 (#1338); see `reference/rfcs/host-control-daemon.md`. The daemon
  * is the `switchroom-hostd` Docker container, running in its own
  * compose project (separate from the agent fleet's project). When
  * enabled (the default), the compose generator emits per-agent UDS
@@ -2846,7 +2846,7 @@ export const WebServiceConfigSchema = z.object({
  * hostd verb-level knobs (separate from `host_control:` which gates
  * the daemon itself).
  *
- * Introduced by `docs/rfcs/admin-agent-config-edit.md` §3 / §4 to opt
+ * Introduced by `reference/rfcs/admin-agent-config-edit.md` §3 / §4 to opt
  * in the new `config_propose_edit` verb and bound its per-agent
  * rate. The verb is the approval-gated path for admin agents to edit
  * `switchroom.yaml` without operator copy-paste (RFC §1). Default
@@ -2888,7 +2888,7 @@ export const HostdConfigSchema = z.object({
     ),
 });
 
-// Cheap-cron operator config — docs/rfcs/cheap-cron-sessions.md §6.1.
+// Cheap-cron operator config — reference/rfcs/cheap-cron-sessions.md §6.1.
 // The egress allowlist + secret→host bindings are the SSRF/exfil fence for
 // Tier-0 http-diff polls. Top-level + operator-owned (never agent-writable):
 // an agent can propose a poll, but the host it may reach and the secret it
@@ -3039,7 +3039,7 @@ export const SwitchroomConfigSchema = z.object({
     "when omitted the broker does not register the Microsoft provider.",
   ),
   notion_workspace: NotionWorkspaceConfigSchema.describe(
-    "RFC docs/rfcs/notion-integration.md. Top-level Notion integration " +
+    "RFC reference/rfcs/notion-integration.md. Top-level Notion integration " +
     "config — vault key for the integration token, friendly-name → " +
     "database UUID map, optional MCP-package version pin, and optional " +
     "global rate-limit override (default 3 rps, Notion's documented " +
@@ -3052,7 +3052,7 @@ export const SwitchroomConfigSchema = z.object({
   ),
   host_control: HostControlConfigSchema.default({}).describe(
     "Host-control daemon configuration. Defaults to enabled=true since " +
-    "RFC C Phase 2 (docs/rfcs/host-control-daemon.md). Omit the block " +
+    "RFC C Phase 2 (reference/rfcs/host-control-daemon.md). Omit the block " +
     "to accept defaults; set `enabled: false` only on legacy systemd-" +
     "mode installs (removal tracked as RFC C Phase 3).",
   ),
@@ -3164,7 +3164,7 @@ export const SwitchroomConfigSchema = z.object({
     )
     .describe("Map of agent name to agent configuration"),
   cron: CronConfigSchema.optional().describe(
-    "Cheap-cron settings (docs/rfcs/cheap-cron-sessions.md). Operator-owned " +
+    "Cheap-cron settings (reference/rfcs/cheap-cron-sessions.md). Operator-owned " +
     "egress allowlist + host-pinned secret bindings for Tier-0 http-diff " +
     "polls (§6.1). Required to enable any http-diff poll; not agent-writable.",
   ),

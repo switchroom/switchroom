@@ -9,7 +9,7 @@ Two distinct things, two distinct mechanisms:
 - **Authoring a skill for one agent** is Claude-native and needs no switchroom machinery: the agent just writes files into `$CLAUDE_CONFIG_DIR/skills/<slug>/` (its own writable, persistent dir — use the bundled `skill-creator` skill). A non-blocking PreToolUse linter nudges it toward a well-formed skill. There is **no** skill-authoring tool/CLI/broker — it's plain file writes. This is live for that agent on its next session.
 - **Sharing a skill with other agents** is a deliberate, reviewed change, **not a runtime action**. A fleet-wide skill is effectively code every agent runs, so it goes through a pull request like any other code: land it in the reviewed skill set (the populations below), and it reaches agents via the normal reconcile/`switchroom apply` path. There is intentionally no in-agent "publish to the fleet" command — an agent can *propose* a skill by opening a PR; a human approves it.
 
-> Historical note: an earlier design (`docs/rfcs/skill-authoring-native.md`, Phase 2a) added a runtime `skill_publish` broker path. It was removed — review-via-PR is the stronger, simpler gate for fleet-wide skills. The RFC is kept as a design record; this page is the current behaviour.
+> Historical note: an earlier design (`reference/rfcs/skill-authoring-native.md`, Phase 2a) added a runtime `skill_publish` broker path. It was removed — review-via-PR is the stronger, simpler gate for fleet-wide skills. The RFC is kept as a design record; this page is the current behaviour.
 
 ## Four skill populations
 

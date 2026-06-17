@@ -10,7 +10,7 @@
  * 75s, firm at 180s) and the 60s user-visible awareness ping were
  * retired: their success rate was 0-7% by the design's own KPI, and they
  * duplicated a job the draft thinking-lane now does natively. See
- * `reference/conversational-pacing.md` § Safety net.
+ * `reference/rfcs/conversational-pacing.md` § Safety net.
  *
  * What remains: ONE silence clock and ONE terminal action.
  *
@@ -323,7 +323,7 @@ export function silenceMsForKey(key: string, now: number): number | null {
  * Verbatim framework-fallback text — the user-visible "still working / still
  * thinking" message the gateway sends at the 300s threshold when the model
  * hasn't broken its own silence. Wording is load-bearing (see
- * `reference/conversational-pacing.md` § Safety net). Two principles:
+ * `reference/rfcs/conversational-pacing.md` § Safety net). Two principles:
  *
  *   1. The parenthetical `(no update from agent in N min)` is honest —
  *      distinguishes from "the agent said something" so users learn to trust

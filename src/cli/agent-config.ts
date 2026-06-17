@@ -234,7 +234,7 @@ export function scheduleLiveNote(agent: string): string {
 /**
  * The legible "what am I allowed to do" view for one agent — the answer to
  * the access-model's "an agent should be able to see its own sandbox" so it
- * stops guessing and overreaching (reference/access-model.md, "Dead-ends
+ * stops guessing and overreaching (reference/rfcs/access-model.md, "Dead-ends
  * breed workarounds").
  *
  * DRIFT-FREE BY CONSTRUCTION: every field is computed from the SAME

@@ -5,7 +5,7 @@
  * `bun:sqlite` (runtime-bound) and can't be exercised from vitest. This
  * module is pure-data-in, string-out so the formatting is unit-testable.
  *
- * Part of PR7 of the supergroup-mode rollout (docs/rfcs/supergroup-mode.md).
+ * Part of PR7 of the supergroup-mode rollout (reference/rfcs/supergroup-mode.md).
  */
 
 import chalk from "chalk";

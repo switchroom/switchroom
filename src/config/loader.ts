@@ -209,7 +209,7 @@ export function loadConfig(configPath?: string): SwitchroomConfig {
   // far worse UX than failing fast at config-load.
   validateAllCronTopicAliases(config, filePath);
 
-  // RFC docs/rfcs/notion-integration.md PR 1: cross-validate per-agent
+  // RFC reference/rfcs/notion-integration.md PR 1: cross-validate per-agent
   // notion_workspace.databases references against the top-level
   // notion_workspace.databases friendly-name map. Same rationale as the
   // cron-topic-alias check above — silent fall-through at runtime is

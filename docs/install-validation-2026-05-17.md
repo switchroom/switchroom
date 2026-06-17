@@ -299,7 +299,7 @@ that resolved their token before the recreate keep working on a
 held long-poll, masking it.
 
 Strategic resolution captured as **RFC J — Vault-broker resilience
-& default auto-unlock** (`docs/rfcs/vault-broker-resilience.md`):
+& default auto-unlock** (`reference/rfcs/vault-broker-resilience.md`):
 (1) auto-unlock as the unattended default — mechanism already
 exists, wire it into non-interactive setup; (2) supervisor
 exponential-backoff + indefinite retry for the transient-dependency

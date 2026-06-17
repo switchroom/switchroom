@@ -43,7 +43,7 @@ export interface SchedulerEntry {
    *  non-reversible audit key. */
   promptKey: string;
   /**
-   * Cheap-cron routing fields (docs/rfcs/cheap-cron-sessions.md). Consumed
+   * Cheap-cron routing fields (reference/rfcs/cheap-cron-sessions.md). Consumed
    * by the in-agent scheduler via resolveCronRouting() at fire time. Active by
    * default; SWITCHROOM_CHEAP_CRON=0/false/off is the kill-switch. `kind: poll`
    * runs a model-free deterministic poll (requires `poll`) that only escalates
@@ -144,7 +144,7 @@ export interface DispatchResult {
   startedAt: number;
   finishedAt: number;
   /**
-   * Cheap-cron observability (docs/rfcs/cheap-cron-sessions.md §5). Which
+   * Cheap-cron observability (reference/rfcs/cheap-cron-sessions.md §5). Which
    * tier this fire took and the model it ran at, so `switchroom schedule
    * report` can show the cost breakdown. Absent on legacy audit rows and
    * when SWITCHROOM_CHEAP_CRON is off (treated as 'main').
@@ -219,7 +219,7 @@ export interface InboundDispatchOptions {
    */
   now?: () => number;
   /**
-   * Cheap-cron routing (docs/rfcs/cheap-cron-sessions.md §3.3). Which
+   * Cheap-cron routing (reference/rfcs/cheap-cron-sessions.md §3.3). Which
    * gateway session this fire injects into — 'cron' for a Tier-1 cheap
    * session, 'main' (or unset) for the live session. Emitted as
    * `meta.session`; the gateway defaults absent → 'main' (back-compat).

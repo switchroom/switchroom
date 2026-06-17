@@ -2,7 +2,7 @@
  * InboundDeliveryStateMachine — pure transition function for the
  * gateway's inbound→bridge→outbound pipeline.
  *
- * Per `docs/rfcs/inbound-delivery-state-machine.md` (RFC merged in
+ * Per `reference/rfcs/inbound-delivery-state-machine.md` (RFC merged in
  * PR #1576): the gateway's delivery state was implicit and scattered
  * across 8+ pieces of mutable state. The wedge cluster of 2026-05-19
  * (9 PRs in 36h all patching variants of "inbound stranded → 5-min

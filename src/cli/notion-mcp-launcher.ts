@@ -1,5 +1,5 @@
 /**
- * `switchroom notion-mcp-launcher` — RFC docs/rfcs/notion-integration.md PR 2.
+ * `switchroom notion-mcp-launcher` — RFC reference/rfcs/notion-integration.md PR 2.
  *
  * Hidden CLI verb spawned by Claude Code (per the `.mcp.json` entry
  * emitted by `resolveNotionMcpEntry`). Runs inside the agent container
@@ -250,7 +250,7 @@ export function registerNotionMcpLauncherCommand(program: Command): void {
       "Override the heartbeat file path. Default: /state/agent/notion-launcher.heartbeat.json",
     )
     .description(
-      "Internal — Notion MCP launcher. Fetches the integration token from the vault-broker and execs @notionhq/notion-mcp-server in stdio mode. RFC docs/rfcs/notion-integration.md PR 2.",
+      "Internal — Notion MCP launcher. Fetches the integration token from the vault-broker and execs @notionhq/notion-mcp-server in stdio mode. RFC reference/rfcs/notion-integration.md PR 2.",
     )
     .action(
       async (opts: {

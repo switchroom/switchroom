@@ -1,7 +1,7 @@
 /**
  * JTBD scenario — guaranteed fast acknowledgement (human-feel UX epic).
  *
- * Serves: `reference/conversational-pacing.md` and the JTBD
+ * Serves: `reference/rfcs/conversational-pacing.md` and the JTBD
  * "talking to my agent feels like talking to a capable person".
  *
  * A person you message answers in a beat — "got it", "on it, checking

@@ -2,7 +2,7 @@
  * over-ping-safety-net.ts — pure decision predicate for #1674's
  * "at-most-one device-ping per turn" framework safety net.
  *
- * Background. `reference/conversational-pacing.md` beat 5 is
+ * Background. `reference/rfcs/conversational-pacing.md` beat 5 is
  * explicit: the model should deliver the answer as a fresh `reply`
  * omitting `disable_notification` (i.e. pinging the device once).
  * EXACTLY ONE ping per turn. The model occasionally violates this

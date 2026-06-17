@@ -1,7 +1,7 @@
 /**
  * Prefix-cache warmup turn — opt-in cold-start TTFO optimization.
  *
- * Per cold-start TTFO RFC (docs/rfcs/cold-start-ttfo.md, PR #1589),
+ * Per cold-start TTFO RFC (reference/rfcs/cold-start-ttfo.md, PR #1589),
  * Option A. On every bridge-up after a restart, synthesize a synthetic
  * inbound (`__WARMUP_PING__`, meta.source="warmup") and deliver it to
  * the just-registered bridge. Claude processes the message — paying

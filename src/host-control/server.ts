@@ -3,7 +3,7 @@
  * dispatches a closed set of operator-only switchroom verbs to the
  * host CLI.
  *
- * Phase 1 scope (per RFC C, `docs/rfcs/host-control-daemon.md`):
+ * Phase 1 scope (per RFC C, `reference/rfcs/host-control-daemon.md`):
  *   - `agent_restart`  (mutating; self → any caller, cross-agent →
  *                      admin)
  *   - `upgrade_status` (read-only; any)
@@ -1273,7 +1273,7 @@ export class HostdServer {
           `Allowed: ${READONLY_EXEC_ALLOWLIST.join(", ")}. ` +
           `Writes inside peer containers require the host_os.exec ` +
           `approval-kernel scope, which is not yet wired — see ` +
-          `docs/rfcs/approval-kernel.md §6 (deferred follow-up).`,
+          `reference/rfcs/approval-kernel.md §6 (deferred follow-up).`,
         Date.now() - started,
       );
     }

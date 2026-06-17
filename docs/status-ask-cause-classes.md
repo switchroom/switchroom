@@ -5,7 +5,7 @@
 > nudges (ack at 10s, soft at 75s, firm at 180s) and the 60s
 > user-visible awareness ping were retired once the live-updating
 > reply/draft took over the acknowledgement + progress beats — see
-> `reference/conversational-pacing.md` for the current design. Only the
+> `reference/rfcs/conversational-pacing.md` for the current design. Only the
 > **300s framework fallback + unwedge** survives. Consequently the
 > cause classes that describe the ladder are now historical: **CC-3**
 > (soft poke wire path) and **CC-5** (`subagentDispatchActive` leak)
@@ -17,11 +17,11 @@
 
 **Goal** (week of 2026-05-13): drive `inbound_status_query` to zero by closing the gaps between the conversational-pacing redesign (#1122) and what is actually exercised by tests.
 
-The JTBD anti-signal lives in `reference/know-what-my-agent-is-doing.md` § "Signs it's working":
+The JTBD anti-signal lives in `reference/jobs/know-what-my-agent-is-doing.md` § "Signs it's working":
 
 > The user never feels the need to ask "status?", "what are you doing?", "still there?", "any update?". If they do, the product is failing at its core job.
 
-PostHog tracks this as `inbound_status_query` (primary lagging KPI). The classifier lives in `telegram-plugin/inbound-classifier.ts`. The three-layer model that should keep the rate at zero is documented in `reference/conversational-pacing.md`:
+PostHog tracks this as `inbound_status_query` (primary lagging KPI). The classifier lives in `telegram-plugin/inbound-classifier.ts`. The three-layer model that should keep the rate at zero is documented in `reference/rfcs/conversational-pacing.md`:
 
 | Layer | Owns | Implementation |
 |---|---|---|

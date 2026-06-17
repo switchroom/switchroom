@@ -41,7 +41,7 @@
  * autoRetry transformer; if two topics in the same chat both burst
  * past the limit, grammY backs off per the Retry-After header — same
  * worst-case behavior as the old per-chat lock, just hit differently.
- * See docs/rfcs/supergroup-mode.md and the
+ * See reference/rfcs/supergroup-mode.md and the
  * `tests/outbound-ordering.test.ts` 429-isolation row.
  */
 

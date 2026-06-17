@@ -1,5 +1,5 @@
 /**
- * Webhook ingest UDS server (RFC docs/rfcs/webhook-via-gateway-socket.md).
+ * Webhook ingest UDS server (RFC reference/rfcs/webhook-via-gateway-socket.md).
  *
  * A dedicated, peercred-gated Unix socket the host-side web receiver
  * forwards verified webhook events to. It is deliberately SEPARATE from

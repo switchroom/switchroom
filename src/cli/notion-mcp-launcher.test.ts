@@ -1,5 +1,5 @@
 /**
- * Tests for notion-mcp-launcher — RFC docs/rfcs/notion-integration.md PR 2.
+ * Tests for notion-mcp-launcher — RFC reference/rfcs/notion-integration.md PR 2.
  */
 
 import { EventEmitter } from "node:events";

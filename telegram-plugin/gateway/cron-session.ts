@@ -1,5 +1,5 @@
 /**
- * Cheap-cron session identity — docs/rfcs/cheap-cron-sessions.md §3.3.
+ * Cheap-cron session identity — reference/rfcs/cheap-cron-sessions.md §3.3.
  *
  * Rather than rekey the gateway's hardened single-bridge machinery
  * (agentIndex / pendingInboundBuffer / handleRegister, each carrying

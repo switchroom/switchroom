@@ -44,7 +44,7 @@ export function registerAuthMicrosoftSubcommands(
   const microsoft = authParent
     .command("microsoft")
     .description(
-      "Manage Microsoft 365 accounts shared across agents (RFC #1873 — see docs/rfcs/microsoft-workspace.md)",
+      "Manage Microsoft 365 accounts shared across agents (RFC #1873 — see reference/rfcs/microsoft-workspace.md)",
     );
 
   registerEnable(microsoft, program);

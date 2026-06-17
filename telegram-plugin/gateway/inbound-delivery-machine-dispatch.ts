@@ -1,7 +1,7 @@
 /**
  * InboundDeliveryStateMachine — DISPATCH (Phase 2b PR 3a, bridgeUp cutover).
  *
- * Per RFC `docs/rfcs/inbound-delivery-state-machine.md`, the state
+ * Per RFC `reference/rfcs/inbound-delivery-state-machine.md`, the state
  * machine is pure: `transition(state, event) → { state', effects[] }`.
  * The gateway's job is to (a) emit events at the right moments and
  * (b) execute the returned effects against real I/O. This module owns

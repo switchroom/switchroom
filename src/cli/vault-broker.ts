@@ -64,7 +64,7 @@ function getSocketPath(configPath?: string): string {
   // restart preflight) at the legacy host path even when a docker-mode
   // operator had `SWITCHROOM_VAULT_BROKER_SOCK` exported — false
   // "broker unreachable" reports were the symptom. See
-  // reference/sub-agent-visibility-rfc.md §Bug 4 for the full trace.
+  // reference/rfcs/sub-agent-visibility.md §Bug 4 for the full trace.
   const env = process.env.SWITCHROOM_VAULT_BROKER_SOCK;
   if (env) return resolvePath(env);
 

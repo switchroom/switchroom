@@ -1,6 +1,6 @@
 /**
  * Background sub-agent visibility scenario — closes #709 / #776 / #782 / #788
- * (the four-issue family analysed in `reference/sub-agent-visibility-rfc.md`).
+ * (the four-issue family analysed in `reference/rfcs/sub-agent-visibility.md`).
  *
  * Verifies three acceptance criteria from the RFC in a single run because
  * they share setup:

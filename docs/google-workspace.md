@@ -7,7 +7,7 @@ Google account, not a service account. Nothing leaves your subscription.
 
 > **Status (2026-05-15).** The Phase 1 primitives are merged; the
 > end-to-end Telegram flow lands as a series of follow-up wiring PRs
-> (see `docs/rfcs/doc-connection-completion.md` §10 for the
+> (see `reference/rfcs/doc-connection-completion.md` §10 for the
 > still-outstanding pieces). This guide describes the model — sections
 > tagged **(pending wire-up)** are not yet operator-visible.
 
@@ -473,11 +473,11 @@ structural tree so the agent can re-plan from ground truth.
 
 ## See also
 
-- `docs/rfcs/google-workspace-generalization.md` — RFC G (per-account
+- `reference/rfcs/google-workspace-generalization.md` — RFC G (per-account
   ACL, auth-broker provider, examples/personal-google-workspace-mcp/).
-- `docs/rfcs/doc-connection-completion.md` — RFC E (Drive collab loop,
+- `reference/rfcs/doc-connection-completion.md` — RFC E (Drive collab loop,
   Phase 1 anchors / diff-preview / folder picker / recovery).
-- `docs/rfcs/gdrive-mcp.md` — RFC D (original Drive MCP integration,
+- `reference/rfcs/gdrive-mcp.md` — RFC D (original Drive MCP integration,
   shipped v0.6.0; supersedes the env-vars-only auth model).
 - `docs/configuration.md` — the cascade, all knobs.
 - `examples/personal-google-workspace-mcp/` — host-side single-user

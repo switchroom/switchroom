@@ -1,5 +1,5 @@
 /**
- * Cheap-cron live wiring — docs/rfcs/cheap-cron-sessions.md.
+ * Cheap-cron live wiring — reference/rfcs/cheap-cron-sessions.md.
  *
  * Constructs the CheapCronHooks the in-agent scheduler passes to
  * registerAgentSchedule, from operator config + env + the vault broker.

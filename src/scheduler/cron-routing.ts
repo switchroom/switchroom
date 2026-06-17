@@ -1,5 +1,5 @@
 /**
- * Pure cron tier-routing — docs/rfcs/cheap-cron-sessions.md §2–3.
+ * Pure cron tier-routing — reference/rfcs/cheap-cron-sessions.md §2–3.
  *
  * Given a schedule entry's (kind, model, context) and the global
  * SWITCHROOM_CHEAP_CRON flag, decide which tier a fire takes, which

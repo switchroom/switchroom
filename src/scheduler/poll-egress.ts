@@ -1,6 +1,6 @@
 /**
  * SSRF / exfil egress guard for Tier-0 http-diff polls —
- * docs/rfcs/cheap-cron-sessions.md §6.1 (resolves the review BLOCK).
+ * reference/rfcs/cheap-cron-sessions.md §6.1 (resolves the review BLOCK).
  *
  * A poll = URL + headers + vault secrets executed by the scheduler. Left
  * unfenced that is a textbook SSRF + secret-exfil primitive (point a poll

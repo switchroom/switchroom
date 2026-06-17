@@ -1,7 +1,7 @@
 /**
  * JTBD scenario — wake-audit content visibility post-restart.
  *
- * Serves: `reference/restart-and-know-what-im-running.md` — the JTBD:
+ * Serves: `reference/jobs/restart-and-know-what-im-running.md` — the JTBD:
  *
  *   *Outcome:* After any restart, the user is told what config is live.
  *   Model, tools, skills, memory backend, auth state. **No need to ask.**

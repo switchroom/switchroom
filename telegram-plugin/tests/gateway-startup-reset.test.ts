@@ -16,7 +16,7 @@ import { clearStaleTelegramPollingState } from "../startup-reset";
  *
  * These tests pin that behaviour so we don't accidentally remove the
  * call during a future refactor and reintroduce the silent-respawn
- * anti-pattern from reference/restart-and-know-what-im-running.md.
+ * anti-pattern from reference/jobs/restart-and-know-what-im-running.md.
  */
 
 describe("clearStaleTelegramPollingState", () => {

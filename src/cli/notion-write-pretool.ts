@@ -1,6 +1,6 @@
 /**
  * PreToolUse hook for @notionhq/notion-mcp-server tool calls —
- * RFC docs/rfcs/notion-integration.md §8 PR 3.
+ * RFC reference/rfcs/notion-integration.md §8 PR 3.
  *
  * Bundled to `/opt/switchroom/hooks/notion-write-pretool.mjs` at build
  * time so it runs inside the agent container with zero relative

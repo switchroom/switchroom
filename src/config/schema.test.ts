@@ -830,7 +830,7 @@ describe("TelegramChannelSchema.enabled (offline-dev master switch)", () => {
   });
 });
 
-// ─── Supergroup-owned mode (RFC docs/rfcs/supergroup-mode.md) ──────────
+// ─── Supergroup-owned mode (RFC reference/rfcs/supergroup-mode.md) ──────────
 describe("TelegramChannelSchema supergroup-owned fields", () => {
   it("accepts a fully-specified supergroup-owned agent block", () => {
     const result = AgentSchema.parse(

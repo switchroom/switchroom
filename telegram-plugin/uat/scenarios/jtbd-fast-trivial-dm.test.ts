@@ -1,7 +1,7 @@
 /**
  * JTBD scenario — short happy path: trivial questions reply FAST.
  *
- * Serves: `reference/know-what-my-agent-is-doing.md` — the short-path
+ * Serves: `reference/jobs/know-what-my-agent-is-doing.md` — the short-path
  * contract: a question with no real work should produce a plain reply
  * with no ceremony (no soft-commit, no progress chunks) within a tight
  * budget. Users judge agent speed on THIS path more than any other.
@@ -12,7 +12,7 @@
  *
  * ## Targets
  *
- * From `reference/conversational-pacing.md` and the post-v0.12.22
+ * From `reference/rfcs/conversational-pacing.md` and the post-v0.12.22
  * baseline measurements:
  *
  *   - **TTFO p95 (vision target):** < 30s — the published contract.

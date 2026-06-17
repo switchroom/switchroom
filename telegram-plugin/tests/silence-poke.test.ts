@@ -528,7 +528,7 @@ describe('silence-poke — fallback handler errors do not break timer', () => {
 })
 
 // CC-4 from `docs/status-ask-cause-classes.md`: wording is load-bearing
-// (`reference/conversational-pacing.md` § Safety net). Snapshot the exact
+// (`reference/rfcs/conversational-pacing.md` § Safety net). Snapshot the exact
 // strings here so a refactor that drops a key phrase fails loud at test
 // time. If you genuinely need to change the wording, update the snapshot
 // AND the design doc together.

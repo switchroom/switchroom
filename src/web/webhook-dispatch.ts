@@ -21,7 +21,7 @@
  *     interactive `claude` session. No `claude -p`: a headless
  *     `claude -p` is *programmatic* usage under Anthropic's 2026-06-15
  *     policy (off the subscription) and would spawn a parasitic second
- *     telegram bridge (#1617). See `docs/rfcs/eliminate-claude-p.md`.
+ *     telegram bridge (#1617). See `reference/rfcs/eliminate-claude-p.md`.
  *
  * Sources (#2272): dispatch is no longer github-only. Rules live under
  * a per-source key — `github`, `generic`, or `linear`. Each source
