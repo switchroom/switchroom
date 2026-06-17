@@ -17,7 +17,7 @@
  * unpinned message.
  *
  * See #421 (banner pin lifecycle) and JTBD
- * `reference/track-plan-quota-live.md` ("at a glance").
+ * `reference/jobs/track-plan-quota-live.md` ("at a glance").
  */
 
 import type { BannerState } from './slot-banner.js';

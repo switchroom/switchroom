@@ -1,7 +1,7 @@
 /**
  * Cloudflare-only edge lock for the webhook ingest path (Phase 2 of the
- * Docker-native webhook work — see docs/rfcs/webhook-via-gateway-socket.md
- * and docs/rfcs/webhook-cloudflare-edge-lock.md).
+ * Docker-native webhook work — see reference/rfcs/webhook-via-gateway-socket.md
+ * and reference/rfcs/webhook-cloudflare-edge-lock.md).
  *
  * The receiver is reachable only behind Cloudflare (`hooks.switchroom.ai`
  * → cloudflared tunnel → localhost:8080). A Cloudflare Transform Rule

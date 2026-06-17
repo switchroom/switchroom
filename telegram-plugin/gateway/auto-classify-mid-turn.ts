@@ -7,7 +7,7 @@
  *
  * Today a no-prefix mid-turn message always QUEUES (the default flipped
  * 2026-04-17 away from the blunt "everything steers" — see
- * reference/steer-or-queue-mid-flight.md). This module is the basis for a
+ * reference/jobs/steer-or-queue-mid-flight.md). This module is the basis for a
  * smarter default. It ships first in SHADOW mode (the gateway logs what it WOULD
  * decide but still queues), to gather real-world data — how often mid-turn
  * messages are same-topic continuations vs cross-topic new tasks, and the

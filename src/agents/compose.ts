@@ -1834,7 +1834,7 @@ function emitAgentService(
   // operatorUid the broker/kernel/auth-broker operator sockets use; emitted
   // unconditionally when known so enabling the flag needs no re-apply of a
   // different shape. Absent ⇒ gateway allows only self → receiver 503s,
-  // surfacing the misconfiguration. See docs/rfcs/webhook-via-gateway-socket.md.
+  // surfacing the misconfiguration. See reference/rfcs/webhook-via-gateway-socket.md.
   if (operatorUid !== undefined) {
     env.SWITCHROOM_WEBHOOK_RECEIVER_UID = String(operatorUid);
   }

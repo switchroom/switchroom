@@ -1,6 +1,6 @@
 /**
  * Loader-level test for notion_workspace cross-validation —
- * RFC docs/rfcs/notion-integration.md PR 1.
+ * RFC reference/rfcs/notion-integration.md PR 1.
  *
  * Confirms that the loader hookup (loader.ts → validateNotionWorkspaceConfig)
  * fails fast at config-load time on invalid notion_workspace cross-refs.

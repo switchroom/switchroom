@@ -112,7 +112,7 @@ export interface WebhookHandlerArgs {
    * UID lacks write to the per-agent-UID-owned dir). Instead it forwards the
    * verified + rendered event to the agent's in-container gateway over
    * `<agent>/telegram/webhook.sock`; the gateway owns dedup, the jsonl
-   * append, and dispatch. See docs/rfcs/webhook-via-gateway-socket.md.
+   * append, and dispatch. See reference/rfcs/webhook-via-gateway-socket.md.
    */
   viaGateway?: boolean
   /**
@@ -122,7 +122,7 @@ export interface WebhookHandlerArgs {
    * edge) or it is rejected 403 before any HMAC work. Fail-closed: if the
    * lock is required but `edgeSecret` is null (secret file missing), every
    * request is rejected. Off by default. See
-   * docs/rfcs/webhook-cloudflare-edge-lock.md.
+   * reference/rfcs/webhook-cloudflare-edge-lock.md.
    */
   requireEdge?: boolean
   /**

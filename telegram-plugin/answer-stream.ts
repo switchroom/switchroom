@@ -11,7 +11,7 @@ import {
  * Answer-lane incremental streaming for long Telegram replies.
  *
  * This module implements the "narrative" liveness layer described in
- * `reference/know-what-my-agent-is-doing.md`:
+ * `reference/jobs/know-what-my-agent-is-doing.md`:
  *
  *   ambient     → 👀 ack reaction
  *   structured  → progress card (existing, via stream-reply-handler.ts lane:'progress')

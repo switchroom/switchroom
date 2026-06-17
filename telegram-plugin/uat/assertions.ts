@@ -395,7 +395,7 @@ export async function waitForCardPhase(
  * The actual card render uses emoji markers in the header: `✅` for
  * done, `❌` for errors, `⚙️` while working (foreground), `🌀` for
  * Background (parent done but fleet still running, see #862 /
- * reference/conversational-pacing.md),
+ * reference/rfcs/conversational-pacing.md),
  * and `⏳` during the boot-card window. These markers are stable
  * enough to key on for UAT — finer parsing (checklist items,
  * sub-agent row content) is out of scope.

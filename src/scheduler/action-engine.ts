@@ -1,6 +1,6 @@
 /**
- * Tier-0 model-free action engine — docs/rfcs/cheap-cron-sessions.md §2.1,
- * reference/crons-use-the-model-only-when-it-earns-it.md.
+ * Tier-0 model-free action engine — reference/rfcs/cheap-cron-sessions.md §2.1,
+ * reference/jobs/crons-use-the-model-only-when-it-earns-it.md.
  *
  * A `kind: action` entry COMPLETES its work deterministically in the
  * scheduler process: send a fixed/templated Telegram message to the agent's

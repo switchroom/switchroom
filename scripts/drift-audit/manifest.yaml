@@ -65,7 +65,7 @@ units:
   # leakage as too-technical drift.
 
   - id: jtbd-run-a-fleet-of-specialists
-    path: reference/run-a-fleet-of-specialists.md
+    path: reference/jobs/run-a-fleet-of-specialists.md
     category: jtbd
     anchors_hint: |
       Outcome: one bot per specialist, persona/scope/memory/boundaries.
@@ -73,7 +73,7 @@ units:
       (per-agent token, per-agent topic).
 
   - id: jtbd-feel-like-a-colleague
-    path: reference/feel-like-a-colleague.md
+    path: reference/jobs/feel-like-a-colleague.md
     category: jtbd
     anchors_hint: |
       Asks before assuming, verifies before claiming, defers on
@@ -82,7 +82,7 @@ units:
       behavior, approval-kernel gating.
 
   - id: jtbd-give-each-agent-its-own-workspace
-    path: reference/give-each-agent-its-own-workspace.md
+    path: reference/jobs/give-each-agent-its-own-workspace.md
     category: jtbd
     anchors_hint: |
       Each agent has isolated working tree, switchroom owns lifecycle.
@@ -90,7 +90,7 @@ units:
       docker per-agent UID model.
 
   - id: jtbd-remember-across-sessions
-    path: reference/remember-across-sessions.md
+    path: reference/jobs/remember-across-sessions.md
     category: jtbd
     anchors_hint: |
       Hindsight integration, mental model carries across restarts.
@@ -99,7 +99,7 @@ units:
       disabled in favour of Hindsight."
 
   - id: jtbd-extend-without-forking
-    path: reference/extend-without-forking.md
+    path: reference/jobs/extend-without-forking.md
     category: jtbd
     anchors_hint: |
       Configure, not edit. Verify against profiles/ (CLAUDE.md.hbs +
@@ -107,7 +107,7 @@ units:
       `switchroom agent create --profile` path.
 
   - id: jtbd-know-what-my-agent-is-doing
-    path: reference/know-what-my-agent-is-doing.md
+    path: reference/jobs/know-what-my-agent-is-doing.md
     category: jtbd
     anchors_hint: |
       Plain-language state, never silent. Verify against the
@@ -117,7 +117,7 @@ units:
       — JTBD must not still describe it as the mechanism.
 
   - id: jtbd-restart-and-know-what-im-running
-    path: reference/restart-and-know-what-im-running.md
+    path: reference/jobs/restart-and-know-what-im-running.md
     category: jtbd
     anchors_hint: |
       Boot/restart greeting that tells the user what's live. Verify
@@ -125,7 +125,7 @@ units:
       `/upgradestatus`.
 
   - id: jtbd-track-plan-quota-live
-    path: reference/track-plan-quota-live.md
+    path: reference/jobs/track-plan-quota-live.md
     category: jtbd
     anchors_hint: |
       Live quota visibility without a dashboard. Verify against the
@@ -133,7 +133,7 @@ units:
       whatever surface communicates quota state to the user.
 
   - id: jtbd-steer-or-queue-mid-flight
-    path: reference/steer-or-queue-mid-flight.md
+    path: reference/jobs/steer-or-queue-mid-flight.md
     category: jtbd
     anchors_hint: |
       Correction vs new task disambiguation. Verify against the Steer
@@ -141,7 +141,7 @@ units:
       the telegram-plugin gateway.
 
   - id: jtbd-keep-my-subscription-honest
-    path: reference/keep-my-subscription-honest.md
+    path: reference/jobs/keep-my-subscription-honest.md
     category: jtbd
     anchors_hint: |
       Pro/Max OAuth only, no API/SDK. Verify against compliance-
@@ -150,7 +150,7 @@ units:
       would contradict this.
 
   - id: jtbd-share-auth-across-the-fleet
-    path: reference/share-auth-across-the-fleet.md
+    path: reference/jobs/share-auth-across-the-fleet.md
     category: jtbd
     anchors_hint: |
       One login per account, not per agent. Verify against the
@@ -158,7 +158,7 @@ units:
       the `switchroom auth add/use` flow.
 
   - id: jtbd-survive-reboots-and-real-life
-    path: reference/survive-reboots-and-real-life.md
+    path: reference/jobs/survive-reboots-and-real-life.md
     category: jtbd
     anchors_hint: |
       Clean resume after crash, no silent loss. Verify against
@@ -166,7 +166,7 @@ units:
       marker + sweep, container `restart: unless-stopped`.
 
   - id: jtbd-idempotent-update-and-restart
-    path: reference/idempotent-update-and-restart.md
+    path: reference/jobs/idempotent-update-and-restart.md
     category: jtbd
     anchors_hint: |
       `switchroom apply` + `docker compose up` produces a coherent
@@ -174,7 +174,7 @@ units:
       marker, the "Code != runtime" section of CLAUDE.md.
 
   - id: jtbd-talk-to-agents-from-anywhere
-    path: reference/talk-to-agents-from-anywhere.md
+    path: reference/jobs/talk-to-agents-from-anywhere.md
     category: jtbd
     anchors_hint: |
       Phone-first. Verify against the Telegram-only model (no Slack/
@@ -183,7 +183,7 @@ units:
 
   # ── Artefact (current) (1) ─────────────────────────────────────
   - id: artefact-conversational-pacing
-    path: reference/conversational-pacing.md
+    path: reference/rfcs/conversational-pacing.md
     category: artefact-current
     anchors_hint: |
       The five-beat human-feel model. Verify against the actual
@@ -194,7 +194,7 @@ units:
 
   # ── RFC: shipped (1) ───────────────────────────────────────────
   - id: rfc-sub-agent-visibility
-    path: reference/sub-agent-visibility-rfc.md
+    path: reference/rfcs/sub-agent-visibility.md
     category: rfc-shipped
     anchors_hint: |
       Frontmatter says "shipped (closed) — TDD verification landed."
@@ -205,7 +205,7 @@ units:
 
   # ── RFC: draft (1) ─────────────────────────────────────────────
   - id: rfc-docker-multi-container
-    path: reference/rfc-docker-multi-container.md
+    path: reference/rfcs/docker-multi-container.md
     category: rfc-draft
     anchors_hint: |
       Frontmatter says Draft. But CLAUDE.md describes a fully-shipped
@@ -216,7 +216,7 @@ units:
 
   # ── Archived (1) ───────────────────────────────────────────────
   - id: archived-status-card-design
-    path: reference/status-card-design.md
+    path: reference/rfcs/status-card-design.md
     category: archived
     anchors_hint: |
       Frontmatter says archived, supersededBy conversational-pacing.md.
@@ -229,7 +229,7 @@ units:
   # as a unit. That file was deleted in PR #534 (commit 8bdb86cb)
   # before the audit infra landed, so the unit was removed.
   - id: historical-onboarding-gap-analysis
-    path: reference/onboarding-gap-analysis.md
+    path: reference/rfcs/onboarding-gap-analysis.md
     category: historical
     anchors_hint: |
       Frontmatter status says historical (last updated 2026-04-25);

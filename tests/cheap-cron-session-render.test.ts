@@ -1,5 +1,5 @@
 /**
- * L4 render safety — docs/rfcs/cheap-cron-sessions.md §2.2.
+ * L4 render safety — reference/rfcs/cheap-cron-sessions.md §2.2.
  *
  * The load-bearing property: the cron-session fork in start.sh renders
  * EMPTY unless `cronSessionEnabled` (a config-derived flag that is false

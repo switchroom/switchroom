@@ -17,7 +17,7 @@
  * idempotent and has no user-visible side effects beyond clearing the
  * (probably-empty) pending-updates queue.
  *
- * Reference: reference/restart-and-know-what-im-running.md — "silent
+ * Reference: reference/jobs/restart-and-know-what-im-running.md — "silent
  * respawn. Agent comes back and the user has to guess whether it's
  * the same agent." A gateway stuck in a 409 loop is exactly that
  * failure mode.

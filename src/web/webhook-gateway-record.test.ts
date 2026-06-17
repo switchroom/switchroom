@@ -1,6 +1,6 @@
 /**
  * Tests for the gateway-side webhook record handler
- * (`recordWebhookEvent`, RFC docs/rfcs/webhook-via-gateway-socket.md).
+ * (`recordWebhookEvent`, RFC reference/rfcs/webhook-via-gateway-socket.md).
  *
  * This is the in-container (agent UID) handler the forwarded record lands
  * in. It owns dedup, the `webhook-events.jsonl` append, and `webhook_dispatch`

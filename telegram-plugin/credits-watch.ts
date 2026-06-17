@@ -13,7 +13,7 @@
  * silently failed (stdout to /dev/null), and the user only noticed
  * hours later when they wondered why their morning brief never came.
  * Direct violation of the #1 product principle (silent failure is
- * the worst case — see reference/know-what-my-agent-is-doing.md).
+ * the worst case — see reference/jobs/know-what-my-agent-is-doing.md).
  *
  * This module is a pure decision layer. It reads the file, compares
  * against the last-notified state on disk, and tells the caller

@@ -9,7 +9,7 @@
  * "Allow" means for a narrow safe scope, disclosed honestly on the post-tap
  * card ("won't ask again about <breadth> for 30 min" vs "allowed once").
  *
- * Design contract (reference/access-model.md — "you hold the leash"):
+ * Design contract (reference/rfcs/access-model.md — "you hold the leash"):
  *
  *  - **Operator-authored only.** Every cache entry is created by an
  *    `allowFrom`-authenticated Telegram tap. No tool call can seed an

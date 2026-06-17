@@ -1,5 +1,5 @@
 /**
- * Tests for notion-workspace-acl — RFC docs/rfcs/notion-integration.md PR 1.
+ * Tests for notion-workspace-acl — RFC reference/rfcs/notion-integration.md PR 1.
  * Mirrors `microsoft-workspace-acl.test.ts` shape where the model fits.
  */
 

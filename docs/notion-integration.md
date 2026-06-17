@@ -5,7 +5,7 @@ Notion pages and databases under a single operator-owned **internal
 integration**, with per-agent allowlists at the database level.
 
 This is the operator-facing setup guide. See
-[`docs/rfcs/notion-integration.md`](./rfcs/notion-integration.md) for
+[`reference/rfcs/notion-integration.md`](../reference/rfcs/notion-integration.md) for
 the design rationale.
 
 ## What you get

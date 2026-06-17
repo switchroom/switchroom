@@ -13,7 +13,7 @@
  * reason, never throws. The CLI rolls the results up into a single exit
  * code: 0 if every check is `ok`, 1 if any check is `fail`.
  *
- * See reference/onboarding-gap-analysis.md §3 for the gap this closes.
+ * See reference/rfcs/onboarding-gap-analysis.md §3 for the gap this closes.
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";

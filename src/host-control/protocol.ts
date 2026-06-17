@@ -30,7 +30,7 @@
  *                       full-fleet health; same posture as
  *                       `update_check`)
  *
- * See docs/rfcs/host-control-daemon.md for the full verb table and
+ * See reference/rfcs/host-control-daemon.md for the full verb table and
  * trust posture.
  */
 
@@ -175,7 +175,7 @@ export const AgentStopRequestSchema = z.object({
 // Phase-2 agent_{start,stop,restart} verbs, but the interesting use
 // case is cross-agent). Mutations inside the peer container are
 // deferred to a follow-up PR that adds the `host_os.exec` scope to the
-// approval-kernel (see docs/rfcs/approval-kernel.md §6).
+// approval-kernel (see reference/rfcs/approval-kernel.md §6).
 
 /** `docker logs --tail <n> <agent>` — synchronous, read-only. */
 export const AgentLogsRequestSchema = z.object({

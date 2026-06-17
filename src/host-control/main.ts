@@ -7,7 +7,7 @@
  * as the broker, kernel, and agent images, but in its own compose
  * project (`switchroom-hostd`) so the switchroom project's
  * `compose up -d --remove-orphans` cycle cannot recreate it mid-
- * update. See `docs/rfcs/host-control-daemon.md` § 5.1.
+ * update. See `reference/rfcs/host-control-daemon.md` § 5.1.
  *
  * Phase 1 (this file) is supervisor-agnostic — it just instantiates
  * HostdServer, starts it, and waits for SIGTERM. Phase 1.5 adds the

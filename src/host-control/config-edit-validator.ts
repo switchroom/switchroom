@@ -1,7 +1,7 @@
 /**
  * config_propose_edit — PR 1b validation pipeline.
  *
- * Implements RFC §4 (`docs/rfcs/admin-agent-config-edit.md`). Pure
+ * Implements RFC §4 (`reference/rfcs/admin-agent-config-edit.md`). Pure
  * functions: no daemon state, no flock, no audit-log writes, no
  * approval card. The dispatcher (`server.ts`) calls
  * `validateConfigEdit()` and turns the verdict into a `HostdResponse`

@@ -563,7 +563,7 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
  *     different agent's container from inside our own (no docker.sock).
  *   - else (v0.6 legacy non-docker path, scheduled for removal in
  *     Phase 3 of the host-control daemon rollout — see
- *     `docs/rfcs/host-control-daemon.md`): detached `systemctl --user
+ *     `reference/rfcs/host-control-daemon.md`): detached `systemctl --user
  *     restart` of the two units. This branch is never reached on
  *     v0.7+ docker installs (the `isDocker` guard above takes the
  *     docker branch); only callable on legacy systemd hosts that
@@ -1901,7 +1901,7 @@ type CurrentTurn = {
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
-  // (`reference/conversational-pacing.md` beat 5) says EXACTLY ONE
+  // (`reference/rfcs/conversational-pacing.md` beat 5) says EXACTLY ONE
   // ping per turn — the final answer. When the model violates that
   // (sends a substantive answer pinged + a wrap-up "Delivered…" or
   // meta-narration also pinged), subsequent reply calls with
@@ -5803,7 +5803,7 @@ const ipcServer: IpcServer = createIpcServer({
     // (5-min cooldown per agent), and skipped if no boot chat resolves.
     // Claude responds NO_REPLY per inline instruction; existing
     // silent-marker suppression at gateway.ts:5906 swallows the
-    // outbound. See docs/rfcs/cold-start-ttfo.md Option A.
+    // outbound. See reference/rfcs/cold-start-ttfo.md Option A.
     if (client.agentName != null) {
       maybeFireWarmup({
         selfAgent: client.agentName,
@@ -6586,7 +6586,7 @@ const ipcServer: IpcServer = createIpcServer({
     const source = typeof msg.inbound.meta?.source === 'string'
       ? msg.inbound.meta.source
       : 'unknown'
-    // Cheap-cron (docs/rfcs/cheap-cron-sessions.md §3.3): a Tier-1 fire
+    // Cheap-cron (reference/rfcs/cheap-cron-sessions.md §3.3): a Tier-1 fire
     // carries meta.session='cron' → route to the derived `<agent>-cron`
     // bridge (a 2nd interactive Sonnet session in the same container).
     // Every other fire (and all of today's callers) routes to the agent
@@ -7148,7 +7148,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   let disableNotification = args.disable_notification === true
 
   // #1675 over-ping safety net. The conversational-pacing contract
-  // (`reference/conversational-pacing.md` beat 5) says EXACTLY ONE
+  // (`reference/rfcs/conversational-pacing.md` beat 5) says EXACTLY ONE
   // device ping per turn — the final answer. The model sometimes
   // violates this by sending a substantive answer pinged + a wrap-up
   // ("Delivered all three steps…", "Sent.", or meta-narration) ALSO
@@ -10254,7 +10254,7 @@ function handleSessionEvent(ev: SessionEvent): void {
             //   only fires for text-only turns where the stream IS the
             //   answer): PING. The user reached for the agent and the
             //   model produced an answer; per beat 5 of
-            //   `reference/conversational-pacing.md` the final answer MUST
+            //   `reference/rfcs/conversational-pacing.md` the final answer MUST
             //   ping the device exactly once. Without this carve-out, a
             //   short text-only turn ("on it" being the whole response)
             //   lands silently and the user has no notification to know
@@ -11699,7 +11699,7 @@ async function handleInbound(
   }
 
   // `!`-prefix interrupt (#575). Closes
-  // `reference/steer-or-queue-mid-flight.md`'s correction path.
+  // `reference/jobs/steer-or-queue-mid-flight.md`'s correction path.
   //
   // Behavior:
   //   1. SIGINT the agent service. This kills any in-flight turn —
@@ -13156,7 +13156,7 @@ function resolveBootChatId(
   // operator sees lifecycle events in a predictable lane instead of
   // chat-root. For fleet-mode / DM agents the helper returns undefined
   // → behavior unchanged (lands at chat-root as today). PR4b of
-  // supergroup-mode rollout (docs/rfcs/supergroup-mode.md).
+  // supergroup-mode rollout (reference/rfcs/supergroup-mode.md).
   const supergroupBootTopic = resolveAgentOutboundTopic({ kind: 'boot' })
   const bootSupergroup = resolveAgentSupergroupChatId()
   // The boot topic is valid only in the agent's supergroup — attach it per

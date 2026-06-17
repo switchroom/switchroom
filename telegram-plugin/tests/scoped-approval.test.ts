@@ -3,7 +3,7 @@
  * the middle rung between "Allow once" and "🔁 Always".
  *
  * These pin the access-model invariants the adversarial review flagged as
- * load-bearing (reference/access-model.md "you hold the leash"):
+ * load-bearing (reference/rfcs/access-model.md "you hold the leash"):
  *   - no tool call can SEED a grant (first contact never auto-allows);
  *   - no tool call can EXTEND the window (fixed box — expiresAt is set once
  *     at the operator tap and never moves on a match);

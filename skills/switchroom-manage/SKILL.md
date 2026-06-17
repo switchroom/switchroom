@@ -38,7 +38,7 @@ When the user says "add a new agent", "add an agent to my switchroom setup", or 
 
 ### Anthropic accounts (one OAuth, many agents)
 
-The auth model treats the Anthropic account as the unit of authentication: one OAuth flow per account, then every agent in the fleet inherits the fleet-wide active account. The `switchroom-auth-broker` daemon owns the refresh loop and is the sole writer of every `credentials.json`. See `docs/auth.md` for the operator guide and `reference/share-auth-across-the-fleet.md` for the design.
+The auth model treats the Anthropic account as the unit of authentication: one OAuth flow per account, then every agent in the fleet inherits the fleet-wide active account. The `switchroom-auth-broker` daemon owns the refresh loop and is the sole writer of every `credentials.json`. See `docs/auth.md` for the operator guide and `reference/jobs/share-auth-across-the-fleet.md` for the design.
 
 **Bootstrap flow when the user wants to share one Pro/Max subscription across agents:**
 

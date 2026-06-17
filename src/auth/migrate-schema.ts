@@ -1,6 +1,6 @@
 /**
  * In-place YAML upgrade from the pre-RFC-H per-agent auth schema to the
- * RFC H fleet-wide model (see docs/rfcs/auth-broker.md §6).
+ * RFC H fleet-wide model (see reference/rfcs/auth-broker.md §6).
  *
  * Algorithm:
  *   1. Detect legacy shape — any agent has `auth.accounts: […]` or

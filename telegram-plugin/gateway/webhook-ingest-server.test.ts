@@ -1,6 +1,6 @@
 /**
  * Tests for the peercred-gated webhook ingest UDS server
- * (RFC docs/rfcs/webhook-via-gateway-socket.md).
+ * (RFC reference/rfcs/webhook-via-gateway-socket.md).
  *
  * MUST run under `bun test`: the peer-credential gate calls
  * `getPeerCred` (bun:ffi getsockopt SO_PEERCRED), which returns null

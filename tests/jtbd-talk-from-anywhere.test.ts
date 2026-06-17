@@ -1,5 +1,5 @@
 /**
- * JTBD contract tests for `reference/talk-to-agents-from-anywhere.md`.
+ * JTBD contract tests for `reference/jobs/talk-to-agents-from-anywhere.md`.
  *
  * The JTBD's load-bearing line:
  *

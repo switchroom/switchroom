@@ -16,8 +16,8 @@ opt-in and per-agent — you can run a mixed fleet (most agents DM, one owns
 a supergroup).
 
 > Internals and the routing design live in
-> [rfcs/supergroup-mode.md](rfcs/supergroup-mode.md) and
-> [rfcs/supergroup-easy-defaults.md](rfcs/supergroup-easy-defaults.md).
+> [rfcs/supergroup-mode.md](../reference/rfcs/supergroup-mode.md) and
+> [rfcs/supergroup-easy-defaults.md](../reference/rfcs/supergroup-easy-defaults.md).
 > This page is the operator how-to.
 
 ## What you get
@@ -121,5 +121,5 @@ into the same topic.
 - [scheduling.md](scheduling.md) — per-cron topic targeting.
 - [configuration.md](configuration.md) — the full `switchroom.yaml`
   cascade.
-- [rfcs/supergroup-mode.md](rfcs/supergroup-mode.md) — design + routing
+- [rfcs/supergroup-mode.md](../reference/rfcs/supergroup-mode.md) — design + routing
   internals.

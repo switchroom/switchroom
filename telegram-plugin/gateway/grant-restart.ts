@@ -6,7 +6,7 @@
  * turn-deferred-vs-now — unit-tests without gateway.ts's boot side-effects
  * (same pattern as scoped-approval.ts / admin-commands/index.ts).
  *
- * Contract (reference/access-model.md): the restart only ever follows an
+ * Contract (reference/rfcs/access-model.md): the restart only ever follows an
  * operator-approved, single-agent, additive `tools.allow` edit, and only
  * ever bounces the CALLER's own agent — never a peer, never fleet-wide.
  */

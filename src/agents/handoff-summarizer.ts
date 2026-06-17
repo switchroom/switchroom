@@ -22,7 +22,7 @@
  * the next session reorients itself from the raw tail (and from its
  * own memory files) on its first turn — the summarization "moves into"
  * the agent's live interactive session, which is subscription-funded.
- * See `docs/rfcs/eliminate-claude-p.md`.
+ * See `reference/rfcs/eliminate-claude-p.md`.
  *
  * Both writes are atomic (tmpfile + rename) so the telegram plugin
  * never reads a half-written file. The tail is also mirrored to

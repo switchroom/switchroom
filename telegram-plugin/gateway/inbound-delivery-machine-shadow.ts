@@ -1,7 +1,7 @@
 /**
  * InboundDeliveryStateMachine — SHADOW MODE wiring (Phase 2b PR 2).
  *
- * Per RFC `docs/rfcs/inbound-delivery-state-machine.md` Phase 2b PR 2:
+ * Per RFC `reference/rfcs/inbound-delivery-state-machine.md` Phase 2b PR 2:
  * the state machine runs ALONGSIDE the existing imperative gateway
  * code, recording predicted effects to a structured trace. Behavior
  * is unchanged — every existing code path still executes the actual

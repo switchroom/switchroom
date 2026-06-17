@@ -113,7 +113,7 @@ export interface RegisterOptions {
    *  returns a canceller cleared on task stop. */
   scheduleRetry?: (fn: () => void, ms: number) => { cancel: () => void };
   /**
-   * Cheap-cron hooks (docs/rfcs/cheap-cron-sessions.md). Absent or
+   * Cheap-cron hooks (reference/rfcs/cheap-cron-sessions.md). Absent or
    * `enabled:false` ⟹ today's behaviour exactly (resolveCronRouting returns
    * the main session, no poll runs). Wired in main() with the real broker
    * secret-resolver + file poll-state; tests inject fakes.
@@ -891,7 +891,7 @@ export async function main(): Promise<void> {
       }
     : undefined;
 
-  // Cheap-cron live wiring (docs/rfcs/cheap-cron-sessions.md). Returns
+  // Cheap-cron live wiring (reference/rfcs/cheap-cron-sessions.md). Returns
   // undefined when SWITCHROOM_CHEAP_CRON is off → registerAgentSchedule sees
   // no hook → today's behaviour exactly.
   //

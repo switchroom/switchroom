@@ -163,7 +163,7 @@ if (ms365HookEscape.changed) {
   console.log(`[build] ASCII-escaped ${ms365HookEscape.nonAsciiCount} non-ASCII code units in dist/cli/ms-365-write-pretool.mjs`);
 }
 
-// Bundle the notion-write-pretool hook — RFC docs/rfcs/notion-integration.md
+// Bundle the notion-write-pretool hook — RFC reference/rfcs/notion-integration.md
 // §8 PR 3. Same pattern: self-contained .mjs the agent container runs
 // via node. Imports the shared resolver + cache + config-loader from
 // src/notion/ and src/config/ which aren't otherwise available inside

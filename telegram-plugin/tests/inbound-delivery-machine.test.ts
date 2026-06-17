@@ -1,7 +1,7 @@
 /**
  * Property tests for `inbound-delivery-machine.ts`.
  *
- * Per RFC `docs/rfcs/inbound-delivery-state-machine.md`: 5 invariants
+ * Per RFC `reference/rfcs/inbound-delivery-state-machine.md`: 5 invariants
  * validated over arbitrary event schedules. A counterexample is the
  * minimal evidence that the machine has a bug. The wedge-cluster
  * bugs (v0.12.22 boot-wedge, overlapping-turn silence, #1564 sibling

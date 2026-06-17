@@ -121,7 +121,7 @@ export const MICROSOFT_WORKSPACE_MCP_PACKAGE = "@softeria/ms-365-mcp-server";
 
 /**
  * Pinned `@notionhq/notion-mcp-server` version — RFC
- * docs/rfcs/notion-integration.md PR 2.
+ * reference/rfcs/notion-integration.md PR 2.
  *
  * Notion ships its MCP server as an npm package; pinning by semver
  * version (same discipline as softeria). Bumping discipline: pin to a
@@ -260,7 +260,7 @@ export function getMs365McpSettingsEntry(
 
 /**
  * MCP server entry for the Notion launcher — RFC
- * docs/rfcs/notion-integration.md PR 2.
+ * reference/rfcs/notion-integration.md PR 2.
  *
  * Spawns `<switchroom> notion-mcp-launcher` which in turn fetches the
  * integration token from the vault-broker and execs

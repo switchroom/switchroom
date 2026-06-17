@@ -14,7 +14,7 @@ claim through the four phases.
 
 ```yaml
 - id: jtbd-know-what-my-agent-is-doing
-  path: reference/know-what-my-agent-is-doing.md
+  path: reference/jobs/know-what-my-agent-is-doing.md
   category: jtbd
   anchors_hint: |
     Plain-language state, never silent. ... Note: the pinned progress
@@ -28,7 +28,7 @@ what to check, just a starting point.
 ## Phase 1 — Audit finding
 
 The Phase 1 agent reads
-`reference/know-what-my-agent-is-doing.md` end-to-end and extracts
+`reference/jobs/know-what-my-agent-is-doing.md` end-to-end and extracts
 this claim (hypothetical line numbers):
 
 > *"A pinned progress card stays at the top of the topic while the
@@ -48,7 +48,7 @@ The finding gets written to
 
 ```yaml
 unit_id: jtbd-know-what-my-agent-is-doing
-unit_path: reference/know-what-my-agent-is-doing.md
+unit_path: reference/jobs/know-what-my-agent-is-doing.md
 category: jtbd
 audited_at: 2026-05-26T14:00:00Z
 auditor_notes: |
@@ -123,10 +123,10 @@ pointing at the retired card. It writes
 ```markdown
 # Fix batch: remove pinned-progress-card references from JTBDs and artefact
 
-**Scope:** reference/know-what-my-agent-is-doing.md,
-reference/feel-like-a-colleague.md,
-reference/survive-reboots-and-real-life.md,
-reference/conversational-pacing.md
+**Scope:** reference/jobs/know-what-my-agent-is-doing.md,
+reference/jobs/feel-like-a-colleague.md,
+reference/jobs/survive-reboots-and-real-life.md,
+reference/rfcs/conversational-pacing.md
 
 **Verdict pattern:** drift-major (3) + jtbd-stale-example (2). All
 trace to PR #1122 retiring the pinned progress card; current
@@ -137,7 +137,7 @@ mechanism is in-place reply streaming.
 ## Findings in this batch
 
 ### Finding 1 — jtbd-know-what-my-agent-is-doing:c1
-- **File:** `reference/know-what-my-agent-is-doing.md` L48-L50
+- **File:** `reference/jobs/know-what-my-agent-is-doing.md` L48-L50
 - **Quote:** "A pinned progress card stays at the top..."
 - **Verdict:** drift-major
 - **Proposed action:** update-text
@@ -179,7 +179,7 @@ operator enables auto-merge.
 
 After the PR merges, Phase 4 re-runs Phase 1 on the four touched
 units. For
-`reference/know-what-my-agent-is-doing.md` the new findings file at
+`reference/jobs/know-what-my-agent-is-doing.md` the new findings file at
 `audit/2026-05-26/reverify/jtbd-know-what-my-agent-is-doing.yaml`
 shows c1 and c2 as `aligned`. Diff produces:
 

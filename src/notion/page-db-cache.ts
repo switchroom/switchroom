@@ -2,7 +2,7 @@
  * In-process LRU cache mapping Notion page/block IDs → parent database
  * UUIDs (or null when the page has no DB ancestor).
  *
- * RFC docs/rfcs/notion-integration.md §8.3.
+ * RFC reference/rfcs/notion-integration.md §8.3.
  *
  * Used by the PreToolUse hook to avoid re-walking the
  * page→parent→...→DB chain on every Notion write. The mapping is

@@ -1,7 +1,7 @@
 /**
  * JTBD scenario — forwarded burst / split paste coalesces into ONE turn.
  *
- * Serves: `reference/steer-or-queue-mid-flight.md` — the "Forwarded
+ * Serves: `reference/jobs/steer-or-queue-mid-flight.md` — the "Forwarded
  * burst / split paste" UAT prompt. When several messages land in quick
  * succession from the same sender (a forward of 3-4 messages, or a long
  * paste Telegram split into chunks), inbound coalescing must merge them

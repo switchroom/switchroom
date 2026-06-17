@@ -5,9 +5,9 @@ subscriptions). The **account is the unit of authentication** — one
 OAuth flow per Anthropic account, then "use this account on these
 agents" is configuration, not another OAuth round.
 
-Architecture detail at [`docs/rfcs/auth-broker.md`](rfcs/auth-broker.md);
+Architecture detail at [`reference/rfcs/auth-broker.md`](../reference/rfcs/auth-broker.md);
 the design contract at
-[`reference/share-auth-across-the-fleet.md`](../reference/share-auth-across-the-fleet.md).
+[`reference/jobs/share-auth-across-the-fleet.md`](../reference/jobs/share-auth-across-the-fleet.md).
 This doc is the operator-facing summary.
 
 ## Mental model

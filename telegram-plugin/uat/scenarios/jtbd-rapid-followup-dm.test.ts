@@ -2,7 +2,7 @@
  * JTBD scenario — rapid follow-ups (steering vs queued classification).
  *
  * Live contract codified in `_shared/telegram-style.md.hbs` and
- * `reference/steer-or-queue-mid-flight.md` (default-flip commits
+ * `reference/jobs/steer-or-queue-mid-flight.md` (default-flip commits
  * `4fff90bf` + `597a58af`, 2026-04-17):
  *
  * - A mid-turn follow-up with NO prefix is `queued="true"` — new

@@ -3,7 +3,7 @@
  * "consecutive silent replies edit one growing message" UX fix.
  *
  * Background. Modern Claude 2.1.x on this fleet implements
- * conversational pacing (`reference/conversational-pacing.md` beats
+ * conversational pacing (`reference/rfcs/conversational-pacing.md` beats
  * 1 + 3 + 5) by calling the `reply` MCP tool multiple times in a
  * turn — a silent ack, silent per-step updates, and one pinged
  * final answer. The over-ping safety net (#1674) caps the

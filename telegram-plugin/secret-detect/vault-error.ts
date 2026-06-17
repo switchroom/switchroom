@@ -158,7 +158,7 @@ export function renderVaultCliError(
       // Route the operator at the Telegram-native equivalent for the
       // verb in flight — only `init` needs a one-time host shell.
       // Closes the "leave Telegram for a verb that exists in Telegram"
-      // anti-pattern from reference/talk-to-agents-from-anywhere.md.
+      // anti-pattern from reference/jobs/talk-to-agents-from-anywhere.md.
       return {
         suppressRaw: true,
         html:

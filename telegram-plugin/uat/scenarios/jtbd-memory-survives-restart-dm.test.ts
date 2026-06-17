@@ -1,7 +1,7 @@
 /**
  * JTBD scenario — memory survives across restart (the "fleet differentiator").
  *
- * Serves: `reference/remember-across-sessions.md` — the JTBD says:
+ * Serves: `reference/jobs/remember-across-sessions.md` — the JTBD says:
  *
  *   *Outcome:* The agent brings back relevant facts, preferences,
  *   decisions, and open threads from past conversations, in the right

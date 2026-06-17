@@ -1,5 +1,5 @@
 /**
- * `switchroom notion` — RFC docs/rfcs/notion-integration.md PR 4.
+ * `switchroom notion` — RFC reference/rfcs/notion-integration.md PR 4.
  *
  * Operator-facing CLI for Notion integration setup + smoke testing.
  *
@@ -30,7 +30,7 @@ export function registerNotionCommand(program: Command): void {
   const cmd = program
     .command("notion")
     .description(
-      "Notion integration operator helpers (list-dbs, test). See docs/rfcs/notion-integration.md.",
+      "Notion integration operator helpers (list-dbs, test). See reference/rfcs/notion-integration.md.",
     );
 
   cmd

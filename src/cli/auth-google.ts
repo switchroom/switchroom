@@ -52,7 +52,7 @@ export function registerAuthGoogleSubcommands(
   const google = authParent
     .command("google")
     .description(
-      "Manage Google Workspace accounts shared across agents (RFC G — see docs/rfcs/google-workspace-generalization.md)",
+      "Manage Google Workspace accounts shared across agents (RFC G — see reference/rfcs/google-workspace-generalization.md)",
     );
 
   registerConnect(google, program);

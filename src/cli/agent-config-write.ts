@@ -253,7 +253,7 @@ interface AddOpts {
   secrets?: string[];
   name?: string;
   /**
-   * Cheap-cron tier hint (docs/rfcs/cheap-cron-sessions.md). A known-cheap
+   * Cheap-cron tier hint (reference/rfcs/cheap-cron-sessions.md). A known-cheap
    * model id (sonnet/haiku) routes this fire to a fresh, minimal-context
    * cron session (Tier 1) instead of the agent's full live session (Tier 2),
    * cutting per-fire token cost. Honoured only when SWITCHROOM_CHEAP_CRON is

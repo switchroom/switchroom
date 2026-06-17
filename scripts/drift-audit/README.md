@@ -85,13 +85,13 @@ with a category that selects the right Phase 1 prompt branch:
 
 | Category | Examples | Code-vs-doc verdict rule |
 |---|---|---|
-| `jtbd` | `reference/feel-like-a-colleague.md` | Code is authoritative. If the outcome isn't realized, flag drift. If JTBD leaks implementation, flag too-technical. |
+| `jtbd` | `reference/jobs/feel-like-a-colleague.md` | Code is authoritative. If the outcome isn't realized, flag drift. If JTBD leaks implementation, flag too-technical. |
 | `contract` | `reference/vision.md`, `reference/principles.md` | Vision is authoritative. Code drift here is escalated, not auto-fixed. |
-| `artefact-current` | `reference/conversational-pacing.md` | Code is authoritative. Update artefact text if shipped behavior diverged. |
-| `rfc-shipped` | `reference/sub-agent-visibility-rfc.md` | Verify `status: shipped` still true; flag if reverted. |
-| `rfc-draft` | `reference/rfc-docker-multi-container.md` | Verify Draft hasn't been overtaken by reality. If shipped, mark superseded or promote to a shipped artefact. |
-| `archived` | `reference/status-card-design.md` | Confirm `status: archived` still appropriate; flag references elsewhere that treat it as current. |
-| `historical` | `reference/onboarding-gap-analysis.md` | Verify the historical disclaimer still holds; flag if anyone is using it as current spec. |
+| `artefact-current` | `reference/rfcs/conversational-pacing.md` | Code is authoritative. Update artefact text if shipped behavior diverged. |
+| `rfc-shipped` | `reference/rfcs/sub-agent-visibility.md` | Verify `status: shipped` still true; flag if reverted. |
+| `rfc-draft` | `reference/rfcs/docker-multi-container.md` | Verify Draft hasn't been overtaken by reality. If shipped, mark superseded or promote to a shipped artefact. |
+| `archived` | `reference/rfcs/status-card-design.md` | Confirm `status: archived` still appropriate; flag references elsewhere that treat it as current. |
+| `historical` | `reference/rfcs/onboarding-gap-analysis.md` | Verify the historical disclaimer still holds; flag if anyone is using it as current spec. |
 | `docs` | `docs/*.md` (post-pilot) | Code is authoritative. Standard drift verdicts. |
 | `src-comments` | `src/<module>/` (post-pilot) | Code is authoritative. Comments referencing dead code/PRs/versions get deleted or updated. |
 

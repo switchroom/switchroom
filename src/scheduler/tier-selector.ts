@@ -1,6 +1,6 @@
 /**
  * Deterministic cron tier *selector* — the value-gate from the cheap-crons
- * JTBD (`reference/crons-use-the-model-only-when-it-earns-it.md`).
+ * JTBD (`reference/jobs/crons-use-the-model-only-when-it-earns-it.md`).
  *
  * The job: scheduled work should pay for a model only when the model adds
  * value. Today the cheap tiers are opt-in — an agent or operator must set

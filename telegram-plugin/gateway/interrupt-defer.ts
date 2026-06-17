@@ -3,7 +3,7 @@
 // A `!`-prefix interrupt SIGINTs the agent's in-flight turn (tmux C-c) and
 // then resumes with the replacement body as a fresh turn. Firing the SIGINT
 // the instant `!` arrives can land mid-tool-call — a C-c during a Write or a
-// Bash leaves the tool's work half-done. `reference/steer-or-queue-mid-flight.md`
+// Bash leaves the tool's work half-done. `reference/jobs/steer-or-queue-mid-flight.md`
 // names this exact anti-pattern: "Mid-tool-call is not 'amend time.'"
 //
 // We can't pause claude's internal loop (the unmodified-CLI constraint — the

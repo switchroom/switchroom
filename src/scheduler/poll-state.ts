@@ -1,5 +1,5 @@
 /**
- * Tier-0 poll state — docs/rfcs/cheap-cron-sessions.md §2.1.
+ * Tier-0 poll state — reference/rfcs/cheap-cron-sessions.md §2.1.
  *
  * Durable cursor per poll `state_key`, on the /state/agent/ volume so it
  * survives restart and is NOT touched by reconcile (reconcile writes

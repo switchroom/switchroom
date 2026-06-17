@@ -172,7 +172,7 @@ export interface FlushDecisionInput {
  * message second-guesses an explicit reply and posts a redundant duplicate
  * on essentially every turn, because the model habitually writes a closing
  * summary. The framework owns the *beat*; the model authors the *words*
- * and emits them via reply (`reference/conversational-pacing.md`).
+ * and emits them via reply (`reference/rfcs/conversational-pacing.md`).
  *
  * (This reverts the #1291 post-reply-tail flush. Its intent — catch a
  * soft-commit reply followed by the real answer in terminal text only —

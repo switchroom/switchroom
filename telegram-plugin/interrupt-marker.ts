@@ -1,5 +1,5 @@
 /**
- * `!`-prefix interrupt marker — closes #575 / part of `reference/steer-or-queue-mid-flight.md`.
+ * `!`-prefix interrupt marker — closes #575 / part of `reference/jobs/steer-or-queue-mid-flight.md`.
  *
  * The product contract: when the user starts a Telegram message with
  * `!`, they're saying "drop what you're doing and handle this

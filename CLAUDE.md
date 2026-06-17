@@ -57,7 +57,7 @@ construction, however useful it seems.
   callsite is a constraint violation: route the work through the
   interactive agent session as a synthesized turn instead. The
   existing callsites are being removed — see
-  `docs/rfcs/eliminate-claude-p.md`. A CI guard
+  `reference/rfcs/eliminate-claude-p.md`. A CI guard
   (`tests/bridge-flap-regression-guard.test.ts`) already enforces
   `--strict-mcp-config` on any headless `claude` spawn.
 - **Before adding any code path that calls a model:** it MUST be the
@@ -223,8 +223,9 @@ test that writes there corrupts a running fleet (real incident,
 
 ## Design contract
 
-`reference/` is the design contract for any non-trivial change. Three
-docs, three questions:
+`reference/` is the design contract for any non-trivial change. A
+five-layer hierarchy, top (most durable) to bottom (most concrete) —
+see `reference/README.md` for the map.
 
 **Vision — `reference/vision.md`** — *should we build this?*
 Every feature serves one of four outcomes:
@@ -245,23 +246,38 @@ Three checks. A "no" on any one is a redesign, not a follow-up:
 2. **Defaults test** — does it work on a fresh `switchroom setup` with zero config?
 3. **Consistency test** — same CLI shape, cascade, vault syntax, progress card as adjacent features?
 
-**JTBDs — `reference/<job>.md`** — *did it do the user's job?*
-14 outcome-focused jobs grouped by outcome in `reference/README.md`.
-Survey cheaply: `head -5 reference/*.md` reads every `job: / outcome:
-/ stakes:` frontmatter in one shot. Read in full only the JTBD(s) the
-change touches.
+**Invariants — `reference/invariants.md`** — *are we even allowed?*
+The lines we won't cross by construction (claude-native,
+no-self-escalation, on-leash, single-tenant, telegram-only,
+chat-is-the-single-source-of-truth). Not a principle you trade off — a
+hard gate. Breaking one is out of scope, full stop.
+
+**Product spec — `reference/product-spec.md`** — *what does it deliver?*
+The four outcomes in full, how the product functions at a high level,
+and the job index (the single source of truth for which jobs exist).
+
+**Job specs — `reference/jobs/<job>.md`** — *did it do the user's job?*
+19 outcome-focused jobs, each with `job: / outcome: / stakes: / serves:
+/ invariants:` frontmatter. Survey cheaply: `head -7 reference/jobs/*.md`.
+Read in full only the job spec(s) the change touches; the body is
+**Good / bad** (dual-audience decision aid), **Prove it** (UAT wired to
+real scenarios), and **Verdict**. Doc-class rule: `job:` ALWAYS means a
+durable job spec (in `reference/jobs/`); a doc with `serves:` / `artefact:`
+/ `backs:` (no `job:`) is an RFC or design record carrying the *how* (in
+`reference/rfcs/`) — `serves:` the job it delivers, or `backs:` the
+invariant it details (e.g. `access-model.md` backs `no-self-escalation`).
 
 ### Triggers — when to consult deeper
 
-- **Designing or scoping** → read `vision.md`; name which outcome.
-- **Opening a PR / doing review** → run the three checks above; cite the JTBD the change serves in the PR description.
-- **Touching a UX surface** (CLI output, error messages, progress card, setup flow, profile/skill defaults) → read the matching JTBD's *Anti-patterns* section before designing.
+- **Designing or scoping** → read `vision.md` + `product-spec.md`; name which outcome.
+- **Opening a PR / doing review** → run the three principle checks + confirm no invariant is crossed; cite the job spec the change serves in the PR description.
+- **Touching a UX surface** (CLI output, error messages, status surfaces, setup flow, profile/skill defaults) → read the matching job spec's *Good / bad* section before designing.
 
 ### Verdict rule
 
 A change ships when it (a) advances one of the four outcomes,
-(b) satisfies its JTBD, and (c) passes all three principle checks.
-Anything else is out of scope, however clever.
+(b) satisfies its job spec, (c) passes all three principle checks, and
+(d) crosses no invariant. Anything else is out of scope, however clever.
 
 ## Repo layout
 
@@ -312,8 +328,15 @@ profiles/               Built-in agent profiles (CLAUDE.md.hbs + SOUL.md.hbs)
                         (includes the docker-mode tmux preamble, since v0.7.5).
 skills/                 Bundled Claude Code skills (symlinked into agents)
 docs/                   User-facing docs
-reference/              Design contract — vision.md, principles.md,
-                        and outcome-focused JTBDs (*.md)
+reference/              The design home (all design thinking, one place).
+                        Root holds only the top tier: anchors (vision.md,
+                        principles.md, invariants.md) + product-spec.md
+                        (outcomes + job index). jobs/ (per-job job specs);
+                        rfcs/ (ALL RFCs + standing design records — the
+                        "how" layer, incl. access-model.md detailing the
+                        no-self-escalation invariant). docs/ holds
+                        usage/operator docs only; design docs are NOT split
+                        across docs/.
 scripts/                Build + release helpers
 tests/                  Vitest suite for src/
   docker/               Docker-specific tests (compose generator, broker IPC,
@@ -880,7 +903,7 @@ contiguous token pattern. See
 ## Where to look first
 
 (Implementation pointers. For *design intent* — outcomes, principles,
-JTBDs — see "Design contract" above.)
+invariants, job specs — see "Design contract" above.)
 
 - **Config resolution** → `src/config/merge.ts` + `docs/configuration.md`.
 - **Progress card** → `telegram-plugin/stream-reply-handler.ts` +

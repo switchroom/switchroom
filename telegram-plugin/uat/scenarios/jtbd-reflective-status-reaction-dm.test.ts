@@ -2,7 +2,7 @@
  * JTBD scenario — reflective status reaction (#1713).
  *
  * Serves the JTBD "know what my agent is actually doing" (see
- * `reference/know-what-my-agent-is-doing.md`). The status reaction on
+ * `reference/jobs/know-what-my-agent-is-doing.md`). The status reaction on
  * the user's inbound is the *primary* ambient liveness signal — the
  * user reads it as "what is the agent doing right now". When it
  * collapses straight to 👍 mid-turn, the signal evaporates and the

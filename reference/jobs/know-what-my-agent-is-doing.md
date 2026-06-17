@@ -1,0 +1,138 @@
+---
+job: know what my agent is actually doing
+outcome: At any moment during a turn, the user can see what the agent is up to and why, without asking.
+stakes: If the user can't see it, they can't trust it. If they can't trust it, they stop using the product.
+serves: hold-the-leash
+invariants: [chat-is-the-single-source-of-truth]
+---
+
+# Job Spec: know what my agent is actually doing
+
+> A durable Job Spec. The *how* (the ambient reaction state machine, the
+> conversational pacing rhythm, the worker-activity feed, the silence
+> fallback) lives in the design artifact `reference/rfcs/conversational-pacing.md`
+> and the prompt at `profiles/_shared/telegram-style.md.hbs`. That
+> implementation churns; this job does not.
+
+## The job
+
+A user sends a non-trivial message and the agent goes off to work: reading,
+running tools, maybe handing off to sub-agents. The user wants to know
+whether it's going somewhere useful, whether it's stuck, or whether it's
+doing something unexpected. Most agent products give them a black box:
+message in, eventually a message out, nothing in the middle. The job is to
+close that gap so the user never has to ask.
+
+> We used to do this with a pinned, parallel progress card. We retired it
+> (#1122): a surface running beside the conversation always devolved into
+> redundant noise or a crutch for a model that wouldn't just talk. The job
+> underneath was unchanged. The signal now lives in the conversation itself.
+
+## Good / bad
+
+**Good looks like**
+
+- The user gets an ambient signal that the agent heard them, effectively
+  instantly. No silent gap between "I sent it" and "something's happening".
+- That signal distinguishes phases at a glance: acknowledged, thinking or
+  working, actively editing. It stays present from receipt to turn end and
+  never disappears mid-turn.
+- A trivial ask just gets the answer. No progress ceremony, no widgets. The
+  reply is the signal.
+- The user can tell running from stuck at a glance. A stuck agent visibly
+  escalates rather than going quiet.
+- Pivots, blockers, finishing a chunk, dispatching a sub-agent: each is
+  narrated in plain language, as it happens, in the conversation.
+- Sub-agent and background work is visible in the same thread. No separate
+  surface to hunt for. True in a DM and in a forum channel alike.
+- Failures, limits, crashes, and restarts are always spoken. The user is
+  told what happened and what resumes.
+- Scrolling back a week later reads as a real conversation, not a deleted
+  widget.
+
+**Bad looks like — never ship this**
+
+- A separate progress surface running parallel to the chat. This was the
+  retired card. It duplicates the conversation or covers for a model that
+  won't talk. Make the model talk.
+- Narrating every tool call as its own message. Tool churn isn't something
+  the user can act on. Silence during tool-calling is fine; the ambient
+  signal carries "alive".
+- Mid-turn updates that buzz the device. Notification fatigue trains users
+  to mute the bot.
+- One undifferentiated "working" signal that loses the phase distinction.
+- Hiding progress behind a command or a button the user has to invoke. If
+  they have to ask, the product already failed.
+- Showing raw debug output (JSON, stack traces, prompt text) in place of a
+  human-readable message.
+- Sub-agent work on a surface the parent turn never references.
+- Any silent failure: stuck, rate-limited, crashed, or restarted with no
+  word.
+
+## Prove it
+
+Named by job × surface, pointing at real scenarios in
+`telegram-plugin/uat/scenarios/`.
+
+- **Instant ack + trivial ask (DM)** — `jtbd-fast-ack-dm`,
+  `jtbd-fast-trivial-dm`. *Watch:* ambient ack within ~1s; the trivial reply
+  carries no progress ceremony. *Invariant:* every inbound gets an ambient
+  ack before the answer; trivial turns add no widgets.
+- **Long multi-step work (DM)** — `jtbd-soft-commit-dm`, `fuzz-real-work-dm`.
+  *Watch:* at least one plain-language soft-commit or mid-turn update; the
+  framework fallback does not fire on a visibly-progressing turn.
+  *Invariant:* meaningful punctuation is narrated; the fallback never fires
+  while the turn is visibly progressing.
+- **Phase-distinct liveness (DM)** — `jtbd-reflective-status-reaction-dm`.
+  *Watch:* acknowledged vs working vs coding are visibly different; the
+  signal only resolves on turn end. *Invariant:* a liveness signal is
+  present from receipt to terminal state, reflective not ratcheted.
+- **Sub-agent + background, in-thread (DM + channel)** —
+  `jtbd-subagent-handback-dm`, `jtbd-foreground-subagent-activity-dm` /
+  `-channel`, `bg-sub-agent-dispatch-dm`, `jtbd-worker-activity-feed-dm` /
+  `-channel`. *Watch:* dispatch and report land in the same thread;
+  background completion surfaces without a separate surface. *Invariant:* no
+  agent work happens on a surface the parent never references; holds in DM
+  and channel.
+- **Genuine stall / silent end (DM)** — `midturn-silent-dm`,
+  `silent-end-recovery-dm`. *Watch:* a fully silent wedge is broken by a
+  user-visible message and the turn is unwedged. *Invariant:* a turn never
+  ends or stalls in silence; the fallback fires at most once per turn.
+- **Restart mid-conversation (DM + channel)** —
+  `jtbd-message-during-restart-dm` / `-channel`,
+  `jtbd-always-on-after-restart-dm`, `jtbd-interrupted-turn-resumes-dm`.
+  *Watch:* the user is told what was interrupted and the work resumes.
+  *Invariant:* a restart never swallows an in-flight turn or an inbound
+  silently.
+- **Status-ask rate (DM)** — `jtbd-status-query-dm`, `fuzz-status-ask-dm`.
+  *Watch:* the user rarely needs to ask; when they do, it's answered as a
+  real question. *Invariant:* status-ask rate is the lagging KPI for this
+  job (`inbound_status_query` in `docs/posthog.md`); non-zero is a defect
+  signal, not a feature request.
+
+**Fuzz corpus:** vary message timing × turn length × tool churn × sub-agent
+fan-out × restart-mid-turn × surface (DM vs forum channel). The invariants
+above must hold across the corpus: always an ambient ack, never silent,
+never a parallel surface, fallback at most once and never on a
+visibly-progressing turn.
+
+## Verdict
+
+- **Done when:** the user always knows the agent heard them, can tell
+  working from stuck, and never needs to ask "what are you doing?" — proven
+  across DM and channel by the scenarios above.
+
+## Production-readiness
+
+- *Latency:* the ambient ack lands within ~1s (p95) of the inbound arriving.
+- *Reliability:* no terminal state (success, failure, crash, restart) leaves
+  the user in silence; the silence fallback is the floor, bounded to one
+  fire per turn.
+- *Surface parity:* every signal is proven in both DM and forum channel.
+  Channel-routing bugs hid for months while UAT was DM-only.
+
+---
+
+> **Implementation:** `reference/rfcs/conversational-pacing.md` (the design
+> artifact, `serves:` this job) and `profiles/_shared/telegram-style.md.hbs`
+> (the prompt). Those churn; this job outlives them.

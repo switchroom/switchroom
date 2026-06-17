@@ -59,17 +59,17 @@ operators jump to **Operating**; contributors and reviewers use
 
 ## Reference
 
-### RFCs (`docs/rfcs/`)
+### RFCs (`reference/rfcs/`)
 
 | RFC | Title / status |
 |---|---|
-| [rfcs/bot-token-to-vault.md](rfcs/bot-token-to-vault.md) | RFC A: Complete the bot-token-to-vault migration (Draft v2). |
-| [rfcs/approval-kernel.md](rfcs/approval-kernel.md) | RFC B: Unified human-approval kernel (Draft v4). |
-| [rfcs/host-control-daemon.md](rfcs/host-control-daemon.md) | RFC C: Host-control daemon `switchroom-hostd` (Draft v3). |
-| [rfcs/gdrive-mcp.md](rfcs/gdrive-mcp.md) | RFC D: Google Drive MCP integration (Implemented v0.6.0). |
-| [rfcs/doc-connection-completion.md](rfcs/doc-connection-completion.md) | RFC E: Make Google Drive a real collaboration surface (Draft v3.1). |
-| [rfcs/google-workspace-generalization.md](rfcs/google-workspace-generalization.md) | RFC G: Google Workspace as a first-class capability (Draft v3). |
-| [rfcs/auth-broker.md](rfcs/auth-broker.md) | RFC H: switchroom-auth-broker single-writer credential plane (Draft v1). |
+| [rfcs/bot-token-to-vault.md](../reference/rfcs/bot-token-to-vault.md) | RFC A: Complete the bot-token-to-vault migration (Draft v2). |
+| [rfcs/approval-kernel.md](../reference/rfcs/approval-kernel.md) | RFC B: Unified human-approval kernel (Draft v4). |
+| [rfcs/host-control-daemon.md](../reference/rfcs/host-control-daemon.md) | RFC C: Host-control daemon `switchroom-hostd` (Draft v3). |
+| [rfcs/gdrive-mcp.md](../reference/rfcs/gdrive-mcp.md) | RFC D: Google Drive MCP integration (Implemented v0.6.0). |
+| [rfcs/doc-connection-completion.md](../reference/rfcs/doc-connection-completion.md) | RFC E: Make Google Drive a real collaboration surface (Draft v3.1). |
+| [rfcs/google-workspace-generalization.md](../reference/rfcs/google-workspace-generalization.md) | RFC G: Google Workspace as a first-class capability (Draft v3). |
+| [rfcs/auth-broker.md](../reference/rfcs/auth-broker.md) | RFC H: switchroom-auth-broker single-writer credential plane (Draft v1). |
 
 ### Diagrams (`docs/diagrams/`)
 

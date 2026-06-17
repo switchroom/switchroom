@@ -877,7 +877,7 @@ const AGENT_CONFIG_MCP_TOOLS = [
  * `/update apply`, etc. are unaffected — those dispatch through the
  * gateway's direct hostd UDS path, not the agent's MCP tool surface.
  *
- * See docs/rfcs/host-control-daemon.md §5.4 and the
+ * See reference/rfcs/host-control-daemon.md §5.4 and the
  * project_hostd_admin_privilege_human_approval design call: autonomous
  * only for self + read-only; mutating / host verbs gated by approval.
  * Existing fleet agents that already baked in the wildcard are
@@ -2148,7 +2148,7 @@ export function installHindsightPlugin(
   // on restart. Setting retainEveryNTurns=1 makes every Stop hook
   // trigger retention. Cost: more frequent hindsight API calls
   // (cheap — async POST to a local container). Memory is the moat
-  // (reference/remember-across-sessions.md); paying for it on every
+  // (reference/jobs/remember-across-sessions.md); paying for it on every
   // turn is correct.
   applyHindsightSettingsOverrides(destPath);
 
@@ -2484,7 +2484,7 @@ export const DOCKER_TELEGRAM_PLUGIN_PATH = "/opt/switchroom/telegram-plugin";
  * `settings.json.hooks` at scaffold time; pre-Bug-3 the scaffold emitted
  * the operator's host repo path here, which doesn't exist inside the
  * container — hooks silently never ran (RFC Phase 3 §Bug 3 in
- * reference/sub-agent-visibility-rfc.md).
+ * reference/rfcs/sub-agent-visibility.md).
  */
 export const DOCKER_HOOKS_PATH = `${DOCKER_TELEGRAM_PLUGIN_PATH}/hooks`;
 
@@ -2673,7 +2673,7 @@ export function resolveMs365McpEntry(
 }
 
 /**
- * RFC docs/rfcs/notion-integration.md PR 2 — resolve the per-agent
+ * RFC reference/rfcs/notion-integration.md PR 2 — resolve the per-agent
  * `notion` MCP entry.
  *
  * Mirrors `resolveMs365McpEntry` shape. Gate: NOT hard opt-out +
@@ -3582,7 +3582,7 @@ export function scaffoldAgent(
   // --via-claude` (drives claude through its native broader-scope OAuth;
   // see src/auth/via-claude.ts) then `switchroom auth use <label>`. Adding
   // the 2nd/3rd/Nth agent to the same account is a YAML edit; no further
-  // OAuth round-trips. See `reference/share-auth-across-the-fleet.md`.
+  // OAuth round-trips. See `reference/jobs/share-auth-across-the-fleet.md`.
   //
   // UPGRADE WARN: if ~/.claude-home/.credentials.json (or ~/.claude/.credentials.json)
   // exists at scaffold time, we deliberately skip copying it. Agents that were
@@ -3845,7 +3845,7 @@ export function scaffoldAgent(
   // Create the Hindsight bank idempotently. Without this, the first
   // `retain` call against the newly scaffolded agent blows up with a raw
   // foreign-key constraint violation because the bank doesn't exist yet
-  // (see reference/onboarding-gap-analysis.md §1). create_bank is a no-op
+  // (see reference/rfcs/onboarding-gap-analysis.md §1). create_bank is a no-op
   // if the bank already exists. We intentionally await this BEFORE the
   // downstream bank-mission and mental-model ops — those depend on the
   // bank existing and would fail the same way. If Hindsight itself is
@@ -4310,7 +4310,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
-          // RFC docs/rfcs/notion-integration.md §8 — gates @notionhq/
+          // RFC reference/rfcs/notion-integration.md §8 — gates @notionhq/
           // notion-mcp-server tools behind the per-DB allowlist + the
           // create_database ban + the standalone-page deny. Hook
           // returns block decisions with operator-friendly reasons;

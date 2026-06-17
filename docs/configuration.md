@@ -594,7 +594,7 @@ primitives is the right tool:
   open a PR using its own git identity without touching host state.
 - **"Admin agent should deploy a merged change (`switchroom apply`,
   `agent restart`, `update apply`)."** That's the host-control
-  daemon's job — see `docs/rfcs/host-control-daemon.md`. `bind_mounts:`
+  daemon's job — see `reference/rfcs/host-control-daemon.md`. `bind_mounts:`
   does not give an agent host-side control; even with the source
   tree mounted, the agent can't run docker commands or `sudo` on
   the host. The daemon is the right surface.
@@ -675,7 +675,7 @@ the sandbox and `add_dirs:` is a no-op.
 
 ## Notion Workspace (`notion_workspace:`)
 
-The Notion integration (`docs/rfcs/notion-integration.md`) is configured
+The Notion integration (`reference/rfcs/notion-integration.md`) is configured
 with one top-level block + one per-agent block. Unlike
 `google_workspace` / `microsoft_workspace`, there's no per-account
 concept — one integration token = one Notion workspace.

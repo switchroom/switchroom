@@ -201,7 +201,7 @@ Switchroom routes every model call through the interactive `claude` session. Cro
 
 **One tracked exception:** the host-control deep-probe path (`src/host-control/server.ts`) contains a single opt-in diagnostic invocation that is off by default (issue #1798 tracks its removal). Operators who require zero programmatic usage should confirm this probe is disabled in their configuration.
 
-The `reference/keep-my-subscription-honest.md` JTBD and `reference/vision.md` pillar 3 document the constraint; `CLAUDE.md` enforces it as an engineering gate. This attestation was written before the 2026-06-15 split and should be re-reviewed against the final published policy once stable.
+The `reference/jobs/keep-my-subscription-honest.md` JTBD and `reference/vision.md` pillar 3 document the constraint; `CLAUDE.md` enforces it as an engineering gate. This attestation was written before the 2026-06-15 split and should be re-reviewed against the final published policy once stable.
 
 ---
 

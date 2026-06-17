@@ -492,7 +492,7 @@ describe('per-source rate limiting', () => {
 // When channels.telegram.webhook_via_gateway is true, the receiver verifies +
 // renders the event but does NOT write the agent dir; it forwards to the
 // in-container gateway over webhook.sock and maps the gateway's response to an
-// HTTP status. See docs/rfcs/webhook-via-gateway-socket.md.
+// HTTP status. See reference/rfcs/webhook-via-gateway-socket.md.
 describe('handleWebhookIngest — viaGateway forward', () => {
   /** A forwardFn spy matching `typeof forwardToGateway`. */
   function makeForward(

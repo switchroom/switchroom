@@ -4,7 +4,7 @@
  * Resolves the `message_thread_id` an autonomous (non-reply) outbound
  * should target when an agent is in supergroup-owned mode
  * (`channels.telegram.chat_id` + `default_topic_id` set per
- * docs/rfcs/supergroup-mode.md). Returns `undefined` for agents in
+ * reference/rfcs/supergroup-mode.md). Returns `undefined` for agents in
  * fleet-shared or dm_only mode — callers fall back to today's behavior
  * (route to the agent's single `topic_id` / DM chat).
  *

@@ -1,5 +1,5 @@
 /**
- * Gateway-side webhook record handler (RFC docs/rfcs/webhook-via-gateway-socket.md).
+ * Gateway-side webhook record handler (RFC reference/rfcs/webhook-via-gateway-socket.md).
  *
  * Under the Docker runtime the host-side web receiver runs as the operator
  * UID and cannot write a per-agent-UID-owned agent dir (EACCES → HTTP 500)
