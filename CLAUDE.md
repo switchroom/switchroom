@@ -466,6 +466,34 @@ misbehaves, the recovery lever is still `workflow_dispatch` re-trigger
   "~25 agent minutes" is the right one. Reserve human-time estimates
   only for work that explicitly needs the user's review or input.
 
+## Secrets on the dev host — `.env` + the auto-unlocked vault
+
+You almost never need a vault passphrase on a running switchroom host, and
+you rarely need to copy secrets around. Two facts an agent working this repo
+should know up front (so a session doesn't have to be *told* each time):
+
+- **The vault is auto-unlocked here.** The broker derives its key from
+  `/etc/machine-id` at boot (see the runtime-architecture § above), so
+  `switchroom vault get <key>` returns the secret **with no passphrase**,
+  both from a plain host shell and from inside an agent container
+  (`docker exec switchroom-<agent> switchroom vault get <key>`). List names
+  with `switchroom vault list`. The passphrase is only a fallback for when
+  the broker is unreachable. **Do not** mirror the vault into plaintext —
+  it holds the operator's entire credential store (SSH keys, every OAuth /
+  bot token); a plaintext copy is a security regression and buys nothing,
+  since reads are already passphrase-free.
+
+- **The repo-root `.env` is a gitignored cache of the dev/UAT secrets**
+  (mtcute driver creds, bot tokens, GitHub PAT, `SWITCHROOM_UAT_CHAT_ID`,
+  …). The **UAT harness auto-loads it** at startup
+  (`telegram-plugin/uat/load-env.ts`), so `bun run --cwd telegram-plugin
+  test:uat …` already has the creds — you do **not** need to source `.env`
+  or unlock the vault to run mtcute UAT. `.env.example` documents every key
+  and the vault-refresh workflow; keep the two key-sets in sync when you add
+  a knob. The file is **not** auto-exported into general shells by design;
+  for an ad-hoc secret in a script, prefer `switchroom vault get <key>` over
+  copying it into `.env`.
+
 ## Repo model & dev flow
 
 Switchroom uses a **fork + canonical** model. Read this before pushing.
