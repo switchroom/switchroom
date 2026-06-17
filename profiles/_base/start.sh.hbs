@@ -164,7 +164,7 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   fi
 
 {{#if cronSessionEnabled}}
-  # 4) cheap cron SESSION (Tier 1, docs/rfcs/cheap-cron-sessions.md §2.2).
+  # 4) cheap cron SESSION (Tier 1, reference/rfcs/cheap-cron-sessions.md §2.2).
   #    A SECOND interactive claude (no -p) dedicated to context:fresh cron
   #    fires, registering to the gateway as the cron-suffixed bridge. This
   #    block is rendered ONLY for an agent that has a Tier-1 cron entry; for

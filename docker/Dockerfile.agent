@@ -167,7 +167,7 @@ WORKDIR /
 # which doesn't exist inside the container — Claude Code silently
 # skipped them and bg-sub-agent tracking, secret-redaction, tool-label,
 # and silent-end paths all went dark in docker mode (RFC Phase 3 §Bug 3,
-# reference/sub-agent-visibility-rfc.md).
+# reference/rfcs/sub-agent-visibility.md).
 COPY telegram-plugin/start.js /opt/switchroom/telegram-plugin/start.js
 COPY telegram-plugin/package.json /opt/switchroom/telegram-plugin/package.json
 COPY telegram-plugin/hooks /opt/switchroom/telegram-plugin/hooks
@@ -205,7 +205,7 @@ RUN chmod 0755 /opt/switchroom/hooks/drive-write-pretool.mjs
 COPY dist/cli/ms-365-write-pretool.mjs /opt/switchroom/hooks/ms-365-write-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/ms-365-write-pretool.mjs
 
-# Notion PreToolUse hook (RFC docs/rfcs/notion-integration.md §8 PR 3).
+# Notion PreToolUse hook (RFC reference/rfcs/notion-integration.md §8 PR 3).
 # Gates `mcp__notion__*` tool calls behind the per-DB allowlist defined
 # in notion_workspace.databases. Also enforces the create_database ban
 # (§6.2 rule 3) and the standalone-page deny (§6.2 rule 2). No approval

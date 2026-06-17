@@ -20,7 +20,7 @@
  *        writing to a registry.db nobody read, leaving every bg sub-agent
  *        invisible to the watcher. Surfaced by
  *        bg-sub-agent-dispatch-dm.test.ts; see RFC Phase 2 §Bug 2 in
- *        reference/sub-agent-visibility-rfc.md.
+ *        reference/rfcs/sub-agent-visibility.md.
  *     3. process.cwd() (legacy fallback for ad-hoc invocations).
  *
  * Performance: the actual DB write is deferred via setImmediate (Node 22+
