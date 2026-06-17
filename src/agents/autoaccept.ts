@@ -47,10 +47,29 @@ export interface PromptRule {
 
 export interface AutoacceptOptions {
   agentName: string;
-  /** Per-prompt timeout in ms. Default 30000. After this many ms with no prompt match, exit cleanly. */
-  idleTimeoutMs?: number;
+  /**
+   * Absolute ceiling (ms) on the boot phase. The poller normally exits the
+   * INSTANT claude reaches the REPL (see `replReadyMatch`); this cap only
+   * bounds the pathological "claude never boots" case so the sidecar can
+   * still hand off to the watch phase instead of looping forever. Default
+   * 600_000 (10 min) — deliberately generous.
+   *
+   * It is NOT an idle timer. The pre-REPL pane (blank, a shell line, a
+   * half-rendered banner, or a not-yet-matched prompt) must never trigger an
+   * early exit: that is precisely what stranded 11/12 agents on the
+   * unanswered dev-channels prompt during the 2026-06-17 cold full-host
+   * restart, where claude — starved for CPU while every agent booted at once
+   * — took well over the old 30s idle window just to render the prompt.
+   */
+  bootHardCapMs?: number;
   /** Per-poll interval in ms. Default 250. */
   pollIntervalMs?: number;
+  /**
+   * Pane signature that means claude has reached the interactive REPL — the
+   * clean signal to end the boot phase and hand off to the wedge-watchdog.
+   * Default: REPL_READY_SIGNATURE.
+   */
+  replReadyMatch?: RegExp;
   /** Override prompt set for tests. Default: built-in PROMPTS. */
   prompts?: PromptRule[];
   /** Test seam: cap total polls before giving up regardless of timer wall-clock. */
@@ -62,7 +81,12 @@ export interface AutoacceptOptions {
 
 export interface AutoacceptResult {
   fired: string[];
-  reason: "idle-timeout" | "manual-stop";
+  /**
+   * - `repl-ready`: claude reached the REPL — the normal, healthy handoff.
+   * - `idle-timeout`: `bootHardCapMs` elapsed without reaching the REPL.
+   * - `manual-stop`: `maxPolls` reached (tests only).
+   */
+  reason: "repl-ready" | "idle-timeout" | "manual-stop";
 }
 
 // Translated from `bin/autoaccept.exp`. The expect script uses `.{1,30}`
@@ -137,7 +161,19 @@ export const PROMPTS: PromptRule[] = [
   },
 ];
 
-const DEFAULT_IDLE_MS = 30_000;
+/**
+ * claude's interactive REPL footer. It is present on both the idle prompt
+ * ("? for shortcuts"), a working turn ("esc to interrupt"), and the
+ * "accept edits on" / "← for agents" affordances. None of these appear on
+ * ANY first-run prompt screen (those show "Enter to confirm · Esc to
+ * cancel"), so a match unambiguously means claude has finished booting and
+ * dispatched all first-run prompts — the clean signal to hand the pane over
+ * to the continuous wedge-watchdog.
+ */
+export const REPL_READY_SIGNATURE =
+  /← for agents|accept edits on|\? for shortcuts|esc to interrupt/;
+
+const DEFAULT_BOOT_HARD_CAP_MS = 600_000;
 const DEFAULT_POLL_MS = 250;
 
 function defaultSleep(ms: number): Promise<void> {
@@ -189,14 +225,24 @@ export function sendKeys(agentName: string, keys: string[]): boolean {
 }
 
 /**
- * Run the autoaccept poller until idle-timeout. Resolves with the list of
- * fired prompt names. Never throws.
+ * Run the autoaccept boot poller. Dispatches first-run TUI prompts as they
+ * render, and returns the moment claude reaches the REPL (`repl-ready`) so
+ * the caller can hand off to the continuous wedge-watchdog. Resolves with
+ * the list of fired prompt names. Never throws.
+ *
+ * Crucially the poller does NOT give up on a quiet pane: it keeps polling
+ * until claude is demonstrably up (REPL footer) or the generous
+ * `bootHardCapMs` ceiling trips. The previous "30s idle since launch"
+ * heuristic gave up before a slow-booting claude had even rendered the
+ * dev-channels prompt, stranding the whole fleet on a cold full-host restart
+ * (2026-06-17) — see `bootHardCapMs`.
  */
 export async function runAutoaccept(
   opts: AutoacceptOptions,
 ): Promise<AutoacceptResult> {
-  const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_MS;
+  const bootHardCapMs = opts.bootHardCapMs ?? DEFAULT_BOOT_HARD_CAP_MS;
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
+  const replReady = opts.replReadyMatch ?? REPL_READY_SIGNATURE;
   const rules = (opts.prompts ?? PROMPTS).map((r) => ({
     rule: r,
     fired: 0,
@@ -207,11 +253,12 @@ export async function runAutoaccept(
   const sleep = opts.sleep ?? defaultSleep;
   const maxPolls = opts.maxPolls ?? Number.POSITIVE_INFINITY;
 
-  let lastFire = now();
+  const startTime = now();
   let polls = 0;
 
   while (polls < maxPolls) {
     polls++;
+    const t = now();
     const text = capturePane(opts.agentName);
     let matchedThisPoll = false;
     if (text) {
@@ -228,11 +275,24 @@ export async function runAutoaccept(
         }
       }
     }
-    if (matchedThisPoll) {
-      lastFire = now();
-    } else if (now() - lastFire >= idleTimeoutMs) {
-      return { fired, reason: "idle-timeout" };
+
+    // A prompt fired this poll → claude is still mid first-run flow. Keep
+    // polling for the next prompt / the REPL; never give up mid-sequence.
+    if (!matchedThisPoll) {
+      // Clean handoff: claude has reached the interactive REPL.
+      if (text && replReady.test(text)) {
+        return { fired, reason: "repl-ready" };
+      }
+      // Pathological ceiling ONLY: claude never reached the REPL and isn't
+      // prompting. Hand off to the watch phase rather than loop forever. A
+      // blank / pre-REPL / not-yet-matched-prompt pane must never exit early
+      // (the 2026-06-17 cold-restart wedge), so this is the sole giving-up
+      // condition and is measured generously from launch.
+      if (t - startTime >= bootHardCapMs) {
+        return { fired, reason: "idle-timeout" };
+      }
     }
+
     await sleep(pollIntervalMs);
   }
   return { fired, reason: "manual-stop" };

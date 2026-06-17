@@ -8,7 +8,9 @@
 //
 // Two phases in one process:
 //   1. Boot phase — `runAutoaccept` dispatches the first-run TUI prompts
-//      (theme / MCP trust / dev-channels) and returns after idle-timeout.
+//      (theme / MCP trust / dev-channels) and returns once claude reaches
+//      the REPL (or, in the pathological never-boots case, after the
+//      generous boot hard-cap).
 //   2. Watch phase — `runWedgeWatchdog` then runs for the container
 //      lifetime, dismissing any STABLE blocking modal selector that wedges
 //      the agent mid-session (the AskUserQuestion / ExitPlanMode class).
