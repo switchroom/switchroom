@@ -38,6 +38,7 @@ import { runWebkiteChecks } from "./doctor-webkite.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
+import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
@@ -2713,6 +2714,29 @@ export function registerDoctorCommand(program: Command): void {
           process.exit(1);
         }
 
+        // Shared vault-broker ACL reader for the connection-health probes
+        // (Notion + user-declared MCP secrets). Soft-fails to "unreachable"
+        // so a down/locked broker yields warnings, never false failures.
+        const vaultAclReader = async (
+          key: string,
+        ): Promise<
+          | { kind: "ok"; allow: string[] }
+          | { kind: "unreachable"; msg: string }
+          | { kind: "not_found" }
+        > => {
+          try {
+            const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+            const result = await getViaBrokerStructured(key);
+            if (result.kind === "ok") {
+              return { kind: "ok", allow: result.entry.scope?.allow ?? [] };
+            }
+            if (result.kind === "not_found") return { kind: "not_found" };
+            return { kind: "unreachable", msg: result.msg };
+          } catch (err) {
+            return { kind: "unreachable", msg: (err as Error).message };
+          }
+        };
+
         const sections: Array<{ title: string; results: CheckResult[] }> = [
           { title: "Dependencies", results: checkDependencies() },
           { title: "Skills Prerequisites", results: checkSkillsPrerequisites() },
@@ -2754,24 +2778,11 @@ export function registerDoctorCommand(program: Command): void {
           },
           {
             title: "Notion (RFC notion-integration)",
-            results: await runNotionChecks(config, {
-              vaultAclReader: async (key: string) => {
-                try {
-                  const { getViaBrokerStructured } = await import("../vault/broker/client.js");
-                  const result = await getViaBrokerStructured(key);
-                  if (result.kind === "ok") {
-                    return {
-                      kind: "ok",
-                      allow: result.entry.scope?.allow ?? [],
-                    };
-                  }
-                  if (result.kind === "not_found") return { kind: "not_found" };
-                  return { kind: "unreachable", msg: result.msg };
-                } catch (err) {
-                  return { kind: "unreachable", msg: (err as Error).message };
-                }
-              },
-            }),
+            results: await runNotionChecks(config, { vaultAclReader }),
+          },
+          {
+            title: "MCP Connections (auth)",
+            results: await runMcpSecretChecks(config, { vaultAclReader }),
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
           { title: "Webkite", results: runWebkiteChecks(config) },
