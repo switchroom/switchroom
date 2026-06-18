@@ -24,13 +24,19 @@ import chalk from "chalk";
 import { readFileSync, writeFileSync } from "node:fs";
 
 import {
-  disableAgentsOnMicrosoftAccount,
-  enableAgentsOnMicrosoftAccount,
   getEnabledAgentsForMicrosoftAccount,
   listMicrosoftAccounts,
   removeMicrosoftAccountEntry,
 } from "./microsoft-accounts-yaml.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
+import {
+  planMicrosoftEnable,
+  planMicrosoftDisable,
+} from "./microsoft-enable-plan.js";
+import {
+  reloadAuthBroker,
+  authBrokerReloadHint,
+} from "../auth/broker/reload-signal.js";
 import { resolveMicrosoftClientId } from "../auth/default-oauth-clients.js";
 import { selectMicrosoftScopes } from "../microsoft/scopes.js";
 import { buildMicrosoftCredentials as buildMicrosoftCredentialsCore } from "../microsoft/credentials.js";
@@ -69,7 +75,7 @@ function registerEnable(microsoftParent: Command, program: Command): void {
   microsoftParent
     .command("enable <account> <agents...>")
     .description(
-      "Enable a Microsoft account on one or more agents. Use `all` to enable on every declared agent. Appends to microsoft_accounts.<account>.enabled_for[] — does NOT mint the broker credentials (use `auth microsoft account add` for that).",
+      "Enable a Microsoft account on one or more agents. Use `all` to enable on every declared agent. Appends to microsoft_accounts.<account>.enabled_for[] AND pins agents.<agent>.microsoft_workspace.account (both are required, else the broker returns ACCOUNT_NOT_FOUND), then hot-reloads the running auth-broker so it's live immediately. Does NOT mint the broker credentials — use `auth microsoft account add` for that.",
     )
     .action(
       withConfigError(async (account: string, agents: string[]) => {
@@ -79,13 +85,13 @@ function registerEnable(microsoftParent: Command, program: Command): void {
         validateAgentSlugs(agents, config);
         const yamlPath = getConfigPath(program);
         const before = readFileSync(yamlPath, "utf-8");
-        const enabledBefore = getEnabledAgentsBefore(before, normalizedAccount);
 
-        const after = enableAgentsOnMicrosoftAccount(before, normalizedAccount, agents);
-        if (after !== before) writeFileSync(yamlPath, after);
-
-        const enabledAfter = getEnabledAgentsForMicrosoftAccount(after, normalizedAccount) ?? [];
-        const newlyEnabled = enabledAfter.filter((a) => !enabledBefore.includes(a));
+        // Plan + write BOTH halves of the gate (ACL + per-agent selector). The
+        // broker needs both, else it returns ACCOUNT_NOT_FOUND; `enable` used
+        // to write only the ACL. See microsoft-enable-plan.ts.
+        const { text, newlyEnabled, enabledAfter, selectorSet, selectorConflict } =
+          planMicrosoftEnable(before, normalizedAccount, agents);
+        if (text !== before) writeFileSync(yamlPath, text);
 
         console.log();
         if (newlyEnabled.length === 0) {
@@ -103,10 +109,38 @@ function registerEnable(microsoftParent: Command, program: Command): void {
             `  ${chalk.gray("already enabled on:")} ${alreadyEnabled.join(", ")}`,
           );
         }
-        console.log();
-        if (newlyEnabled.length > 0) {
+        if (selectorSet.length > 0) {
           console.log(
-            `Next: ${chalk.bold(`switchroom agent restart ${newlyEnabled.join(" ")}`)} so the wrapper picks up the new ACL.`,
+            `  ${chalk.green("✓")} ${chalk.gray("pinned")} ${chalk.bold("microsoft_workspace.account")} ${chalk.gray("on:")} ${selectorSet.join(", ")}`,
+          );
+        }
+        for (const { agent, current } of selectorConflict) {
+          console.log(
+            chalk.yellow(
+              `  ⚠ ${chalk.bold(agent)} already pins a different account (${chalk.bold(current)}) — left as-is. Repin with \`switchroom auth microsoft disable ${current} ${agent}\` first if that's unintended.`,
+            ),
+          );
+        }
+
+        // 3. Hot-reload the running broker so the new ACL + selector are live
+        //    immediately — no manual `docker restart switchroom-auth-broker`.
+        if (text !== before) {
+          const reload = reloadAuthBroker();
+          if (reload.ok) {
+            console.log(
+              `  ${chalk.green("✓")} ${chalk.gray("auth-broker hot-reloaded — credentials are live.")}`,
+            );
+          } else {
+            const hint = authBrokerReloadHint(reload);
+            if (hint) console.log(chalk.yellow(`  ⚠ ${hint}`));
+          }
+        }
+
+        console.log();
+        if (newlyEnabled.length > 0 || selectorSet.length > 0) {
+          const restartTargets = [...new Set([...newlyEnabled, ...selectorSet])];
+          console.log(
+            `Next: ${chalk.bold(`switchroom agent restart ${restartTargets.join(" ")}`)} to regenerate the agent's MCP config and surface the Microsoft/OneDrive tools.`,
           );
           console.log();
         }
@@ -138,11 +172,11 @@ function registerDisable(microsoftParent: Command, program: Command): void {
           return;
         }
 
-        const after = disableAgentsOnMicrosoftAccount(before, normalizedAccount, agents);
-        if (after !== before) writeFileSync(yamlPath, after);
-
-        const enabledAfter = getEnabledAgentsForMicrosoftAccount(after, normalizedAccount) ?? [];
-        const removed = enabledBefore.filter((a) => !enabledAfter.includes(a));
+        // Plan + write: drop the ACL AND clear each removed agent's now-dangling
+        // selector (symmetry with enable). See microsoft-enable-plan.ts.
+        const { text, removed, enabledAfter, selectorCleared } =
+          planMicrosoftDisable(before, normalizedAccount, agents);
+        if (text !== before) writeFileSync(yamlPath, text);
 
         console.log();
         if (removed.length === 0) {
@@ -163,10 +197,29 @@ function registerDisable(microsoftParent: Command, program: Command): void {
             `  ${chalk.gray("still enabled on:")} ${enabledAfter.join(", ")}`,
           );
         }
+        if (selectorCleared.length > 0) {
+          console.log(
+            `  ${chalk.gray("cleared")} ${chalk.bold("microsoft_workspace.account")} ${chalk.gray("on:")} ${selectorCleared.join(", ")}`,
+          );
+        }
+
+        // Hot-reload the running broker so the dropped access is live now.
+        if (text !== before) {
+          const reload = reloadAuthBroker();
+          if (reload.ok) {
+            console.log(
+              `  ${chalk.green("✓")} ${chalk.gray("auth-broker hot-reloaded — access revoked live.")}`,
+            );
+          } else {
+            const hint = authBrokerReloadHint(reload);
+            if (hint) console.log(chalk.yellow(`  ⚠ ${hint}`));
+          }
+        }
+
         console.log();
         if (removed.length > 0) {
           console.log(
-            `Next: ${chalk.bold(`switchroom agent restart ${removed.join(" ")}`)} so the wrapper drops its access.`,
+            `Next: ${chalk.bold(`switchroom agent restart ${removed.join(" ")}`)} so the agent drops the Microsoft MCP from its config.`,
           );
           console.log();
         }
