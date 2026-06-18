@@ -22,19 +22,20 @@ your subscription. (RFC #1873.)
 #    <account> is the Microsoft EMAIL, not a label.
 switchroom auth microsoft account add you@outlook.com
 
-# 2. Allow an agent to use that account (the ACL — enabled_for[]).
+# 2. Allow an agent to use that account. `enable` writes BOTH halves of
+#    the gate — the ACL (microsoft_accounts.you@outlook.com.enabled_for[])
+#    AND the per-agent selector (agents.clerk.microsoft_workspace.account) —
+#    then hot-reloads the running auth-broker so the grant is live at once.
+#    (It won't override a selector already pinned to a different account;
+#    it warns instead.)
 switchroom auth microsoft enable you@outlook.com clerk
 
-# 3. REQUIRED, separate from step 2: set the agent's account selector
-#    in switchroom.yaml, then reconcile. Without this the broker returns
-#    ACCOUNT_NOT_FOUND and the agent silently has no M365.
-#      agents:
-#        clerk:
-#          microsoft_workspace:
-#            account: you@outlook.com
+# 3. Restart the agent so it regenerates its MCP config and surfaces the
+#    Microsoft/OneDrive tools (the broker credential is already live from
+#    step 2 — this step is only about the agent's tool list).
 switchroom agent restart clerk        # or `switchroom update` for the fleet
 
-# 4. Verify (catches the step-3 trap up front):
+# 4. Verify:
 switchroom doctor                     # see "Microsoft 365 (RFC #1873)"
 ```
 
@@ -224,17 +225,25 @@ After consent, the CLI shows:
 
 ## Granting access to agents
 
-Two separate steps (both required):
+The broker needs **two** things to serve a credential: the ACL
+(`microsoft_accounts.<acct>.enabled_for[]` lists the agent) AND the
+per-agent selector (`agents.<agent>.microsoft_workspace.account`). It
+derives the account from the selector, then checks the ACL — missing
+the selector yields `ACCOUNT_NOT_FOUND`; missing the ACL yields
+`ACCESS_DENIED`.
 
-**Step 1**: the ACL — written by the CLI verb:
+`enable` writes **both** in one command and hot-reloads the broker:
 
 ```bash
 switchroom auth microsoft enable you@outlook.com clerk lawgpt
-# Mutates microsoft_accounts.you@outlook.com.enabled_for[] in switchroom.yaml
+# • appends clerk, lawgpt to microsoft_accounts.you@outlook.com.enabled_for[]
+# • pins agents.{clerk,lawgpt}.microsoft_workspace.account = you@outlook.com
+#   (skipped + warned for an agent already pinned to a DIFFERENT account)
+# • SIGHUPs switchroom-auth-broker so the grant is live immediately —
+#   no `docker restart` needed
 ```
 
-**Step 2**: the per-agent account selector — must be set in YAML by
-hand or by your config tooling:
+The resulting YAML:
 
 ```yaml
 agents:
@@ -246,16 +255,14 @@ agents:
       account: you@outlook.com
 ```
 
-The broker derives the account from the per-agent selector, then
-checks the ACL. If you do step 1 without step 2, the broker returns
-`ACCOUNT_NOT_FOUND` silently the first time the agent calls a MS tool.
-If you do step 2 without step 1, the broker returns `ACCESS_DENIED`.
-`switchroom doctor` catches both up front (`microsoft:matrix:*`).
+`switchroom doctor` still catches any hand-edited mismatch up front
+(`microsoft:matrix:*`).
 
-`switchroom auth microsoft disable you@outlook.com clerk` removes
-agent from the ACL, leaving the account in `microsoft_accounts:` with
-empty `enabled_for[]` (dormant — matches shipped Google behavior per
-RFC §6.1).
+`switchroom auth microsoft disable you@outlook.com clerk` removes the
+agent from the ACL, clears its now-dangling selector (when it pointed
+at this account), and hot-reloads the broker. The account stays in
+`microsoft_accounts:` with an empty `enabled_for[]` (dormant — matches
+shipped Google behavior per RFC §6.1).
 
 ## Listing what's configured
 
