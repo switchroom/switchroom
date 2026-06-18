@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.15.38 — Connection health + leaner telegram tool surface + cold-restart fix
+
+Makes third-party **connections** (MCP integrations) honest about their auth
+state, trims the always-loaded telegram tool surface, and fixes a fleet-wide
+cold-restart wedge.
+
+- **Cold full-host restart no longer wedges the fleet (#2402).** The autoaccept
+  boot poller used a 30 s "idle since launch" timeout; when every agent boots at
+  once and `claude` is CPU-starved, the dev-channels prompt rendered after the
+  window closed and the poller gave up — stranding 11/12 agents on an
+  unanswered prompt. It now polls until `claude` reaches the REPL
+  (`REPL_READY_SIGNATURE`), with a generous `bootHardCapMs` ceiling for the
+  pathological never-boots case. A blank/pre-REPL pane can no longer trigger an
+  early exit.
+- **`switchroom doctor` surfaces configured-but-unauthed MCP connections
+  (#2404).** Framework integrations (gdrive/ms-365/notion) already verified
+  auth; the blind spot was user-declared MCPs (perplexity, postiz, brevo, meta,
+  google_ads). New "MCP Connections (auth)" section flags a missing vault key or
+  ACL drift with the exact `vault set --allow` fix. Cascade-accurate to the
+  broker ACL; fail-safe (broker-down → WARN, never a false fail).
+- **Unauthed connections surface at agent start (#2406).** `apply` computes
+  connection-health host-side and writes a snapshot the boot card reads via a
+  new `probeConnections` probe — a non-silent boot-card line + `/status` Health
+  row naming the unauthed integration and its fix. The boot card stays
+  silent-when-healthy.
+- **Leaner always-loaded telegram tool surface (#2408).** `switchroom-telegram`
+  is the primary interface, so its ~8k-token schema loads on every agent every
+  turn. The 3 `linear_*` tools are now advertised only when the agent has the
+  Linear connection configured, and the server is no longer pinned wholesale:
+  the bridge pins only the load-bearing hot tools (reply, stream_reply,
+  get_recent_messages, react, edit_message, send_typing, download_attachment)
+  via the native per-tool `_meta["anthropic/alwaysLoad"]`, so the ~14 cold tools
+  defer under tool-search — reclaiming ~5k tokens/agent. Kill switch:
+  `SWITCHROOM_DISABLE_TOOL_SEARCH=1`.
+- **Also:** permission-card origin-topic recovery after a force-closed turn and
+  no-repeat after a TTL timeout (#2407, #2411); web Connections tab — path-based
+  routing, Linear app-actor section, visibility fix (#2405, #2409, #2410);
+  hindsight v0.8.2 claude_code provider uses our file creds (#2399); docs:
+  vault is passphrase-free + .env auto-loads for UAT (#2403).
+
 ## v0.15.37 — Linear agent auth: loud failures, in-container self-serve, proactive watch (#2394, #2396, #2397)
 
 Hardens Linear `actor=app` agent auth after the clerk/carrie incident, where
