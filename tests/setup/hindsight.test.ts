@@ -62,6 +62,32 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(args).not.toContain("--entrypoint");
   });
 
+  it("adds a container healthcheck so docker restarts a wedged API", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    expect(args).toContain("--health-cmd");
+    const cmd = args[args.indexOf("--health-cmd") + 1] as string;
+    // Hits /health via python3 (always in the image; curl/wget are not).
+    expect(cmd).toContain("python3");
+    expect(cmd).toContain("/health");
+    expect(args).toContain("--health-interval");
+  });
+
+  it("mounts a SEPARATE backups volume so a data-volume loss is recoverable", () => {
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    let found = false;
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-v" && args[i + 1] === "switchroom-hindsight-backups:/backups") {
+        found = true;
+        break;
+      }
+    }
+    expect(found).toBe(true);
+    // Must NOT co-locate backups on the data volume (defeats the point).
+    expect(args).not.toContain("switchroom-hindsight-data:/backups");
+  });
+
   it("bind-mounts the auth-broker consumer socket volume", () => {
     startHindsight({ apiPort: 8888, uiPort: 9999 });
     const args = findRunArgs();
@@ -229,6 +255,18 @@ describe("generateHindsightComposeSnippet — tmpfs ownership", () => {
       await import("../../src/setup/hindsight.js");
     const snippet = generateHindsightComposeSnippet();
     expect(snippet).toMatch(new RegExp(`shm_size:\\s*${shm}\\b`));
+  });
+
+  it("emits a healthcheck + separate backups volume (parity with the docker-run path)", async () => {
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    const snippet = generateHindsightComposeSnippet();
+    expect(snippet).toMatch(/healthcheck:/);
+    expect(snippet).toContain("/health");
+    expect(snippet).toContain("- switchroom-hindsight-backups:/backups");
+    // The backups volume must be declared under top-level `volumes:`.
+    expect(snippet).toMatch(/^ {2}switchroom-hindsight-backups:/m);
+    // Backups must not share the data volume mount.
+    expect(snippet).not.toContain("switchroom-hindsight-data:/backups");
   });
 });
 

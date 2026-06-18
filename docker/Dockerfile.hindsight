@@ -147,6 +147,10 @@ RUN OLD_UID=$(id -u hindsight) && NEW_UID=11000 \
 RUN mkdir -p /usr/local/lib/switchroom && chmod 0755 /usr/local/lib/switchroom
 COPY --chmod=0644 docker/hindsight-fetch-creds.cjs /usr/local/lib/switchroom/hindsight-fetch-creds.cjs
 
+# Periodic maintenance script (rotated pg_dump backup + autovacuum tuning
+# + completed-op retention), invoked by the entrypoint's background loop.
+COPY --chmod=0755 docker/hindsight-maintenance.sh /usr/local/lib/switchroom/hindsight-maintenance.sh
+
 # Entrypoint shim — runs the fetcher at boot, spawns a refresh sidecar,
 # then execs the upstream CMD. See the file header for the boot/refresh
 # flow + env knobs + fail-loud guards.

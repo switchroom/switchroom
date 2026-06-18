@@ -75,6 +75,11 @@ CRED_FILE="${CRED_DIR}/.credentials.json"
 WAIT_TIMEOUT_S="${SWITCHROOM_HINDSIGHT_WAIT_S:-60}"
 REFRESH_S="${SWITCHROOM_HINDSIGHT_REFRESH_S:-1800}"
 FETCHER="${SWITCHROOM_HINDSIGHT_FETCHER:-/usr/local/lib/switchroom/hindsight-fetch-creds.cjs}"
+# Periodic maintenance (backup + autovacuum tuning + op retention). Runs
+# from the same background loop because it needs a live pg (which boots
+# only after the exec below). Best-effort + idempotent. See the script
+# header for the jobs + env knobs. Empty/unset path disables it.
+MAINTENANCE="${SWITCHROOM_HINDSIGHT_MAINTENANCE_SCRIPT:-/usr/local/lib/switchroom/hindsight-maintenance.sh}"
 REAP_STALE_S="${SWITCHROOM_HINDSIGHT_REAP_STALE_S:-1800}"
 # pg0 instance descriptor (holds the embedded-postgres password); the
 # reaper reads it to connect. Overridable for host tests.
@@ -167,6 +172,9 @@ if [ "${REFRESH_S}" -gt 0 ] && [ -f "${FETCHER}" ]; then
       # successfully-fetched credentials until the loop catches up.
       # Same loop drives the stale-claim reaper (fix B) — also best-effort.
       reap_stale_processing || true
+      # ...and periodic maintenance (backup / autovacuum / op retention).
+      # Self-gates on interval + pg-readiness; safe to invoke every tick.
+      [ -f "${MAINTENANCE}" ] && sh "${MAINTENANCE}" || true
     done
   ) &
   log "credential refresh loop started (interval=${REFRESH_S}s, pid=$!)"
