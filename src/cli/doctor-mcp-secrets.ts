@@ -37,11 +37,29 @@ export interface CheckResult {
   fix?: string;
 }
 
-/** Vault-ACL read result, matching doctor-notion's reader contract. */
+/** Vault-ACL read result: the entry's scope (allow + deny) on `kind: "ok"`. */
 export type VaultAclResult =
-  | { kind: "ok"; allow: string[] }
+  | { kind: "ok"; allow: string[]; deny: string[] }
   | { kind: "unreachable"; msg: string }
   | { kind: "not_found" };
+
+/**
+ * Mirror of the broker's `checkEntryScope` (src/vault/broker/acl.ts): an
+ * agent that has already passed the `mcp_servers.secrets[]` ACL grant is
+ * STILL subject to the vault entry's scope. The entry denies iff the agent
+ * is in `scope.deny`, OR `scope.allow` is non-empty and the agent is absent
+ * from it. An EMPTY `scope.allow` imposes no restriction (this is why the
+ * v0.15.38 check false-positived: it treated empty-allow as "deny everyone").
+ */
+export function entryScopeDenies(
+  agent: string,
+  allow: string[],
+  deny: string[],
+): boolean {
+  if (deny.includes(agent)) return true;
+  if (allow.length > 0 && !allow.includes(agent)) return true;
+  return false;
+}
 
 export interface McpSecretProbeDeps {
   /**
@@ -181,20 +199,24 @@ export async function runMcpSecretChecks(
         });
         continue;
       }
-      if (!acl.allow.includes(r.agent)) {
-        const updated = [...new Set([...acl.allow, r.agent])].sort().join(",");
+      // kind === "ok": the key exists. The agent passes the secrets[] ACL
+      // grant by construction (every key here is from its mcp_servers
+      // secrets[]), but the broker ALSO applies the entry scope on top
+      // (checkEntryScope). Only flag when the scope actually denies — an
+      // empty scope.allow does NOT (the v0.15.38 false-positive).
+      if (entryScopeDenies(r.agent, acl.allow, acl.deny)) {
         results.push({
           name,
           status: "fail",
-          detail: `agent '${r.agent}' loads MCP '${r.server}' but is NOT on the vault ACL for '${key}' — the broker will deny it at runtime`,
-          fix: `switchroom vault set ${key} --allow ${updated} (vault set overwrites the scope — re-state the full list including '${r.agent}').`,
+          detail: `agent '${r.agent}' loads MCP '${r.server}' but the vault entry scope for '${key}' denies it — the broker will deny at runtime`,
+          fix: `switchroom vault set ${key} --allow ${[...new Set([...acl.allow, r.agent])].sort().join(",")} (vault set overwrites the scope — re-state the full list including '${r.agent}'; and drop it from --deny if present).`,
         });
         continue;
       }
       results.push({
         name,
         status: "ok",
-        detail: `MCP '${r.server}' → '${key}' present + ACL-allowed`,
+        detail: `MCP '${r.server}' → '${key}' present + scope-allowed`,
       });
     }
   }

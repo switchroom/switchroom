@@ -26,6 +26,7 @@ import { join } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   computeMcpSecretRequirements,
+  entryScopeDenies,
   type VaultAclResult,
 } from "../cli/doctor-mcp-secrets.js";
 
@@ -38,7 +39,12 @@ export interface ConnectionIssue {
   server: string;
   /** The vault key it needs. */
   key: string;
-  /** "missing" = key absent; "acl" = key present but agent not granted. */
+  /**
+   * "missing" = the declared vault key has no value; "acl" = the key exists
+   * but the vault entry scope (allow/deny) denies this agent. Both are real
+   * runtime auth failures. (An EMPTY scope.allow is NOT a denial — that was
+   * the v0.15.38 false-positive.)
+   */
   kind: "missing" | "acl";
   /** One-line human description. */
   detail: string;
@@ -118,14 +124,19 @@ export async function computeAgentConnectionIssues(
         });
         continue;
       }
-      if (!acl.allow.includes(agentName)) {
+      // kind === "ok": key exists and the agent passes the secrets[] ACL
+      // grant by construction — but the broker ALSO applies the entry scope
+      // (checkEntryScope). Only flag when the scope actually denies; an empty
+      // scope.allow imposes no restriction (the v0.15.38 false-positive was
+      // treating empty-allow as "deny everyone").
+      if (entryScopeDenies(agentName, acl.allow, acl.deny)) {
         const updated = [...new Set([...acl.allow, agentName])].sort().join(",");
         issues.push({
           server: r.server,
           key,
           kind: "acl",
-          detail: `MCP '${r.server}' not on the vault ACL for '${key}' — broker will deny at runtime`,
-          fix: `switchroom vault set ${key} --allow ${updated} (re-state the full list)`,
+          detail: `MCP '${r.server}' — vault entry scope for '${key}' denies this agent — broker will deny at runtime`,
+          fix: `switchroom vault set ${key} --allow ${updated} (re-state the full list; drop from --deny if present)`,
         });
       }
     }

@@ -11,10 +11,15 @@ function cfg(partial: Record<string, unknown>): SwitchroomConfig {
   return partial as unknown as SwitchroomConfig;
 }
 
-/** A vaultAclReader stub from a key→result map (default: not_found). */
-function reader(map: Record<string, VaultAclResult>) {
-  return async (key: string): Promise<VaultAclResult> =>
-    map[key] ?? { kind: "not_found" };
+/** A vaultAclReader stub from a key→result map (default: not_found).
+ *  ok entries may omit `deny` (filled with []). */
+type OkEntry = { kind: "ok"; allow: string[]; deny?: string[] };
+type ReaderEntry = OkEntry | { kind: "unreachable"; msg: string } | { kind: "not_found" };
+function reader(map: Record<string, ReaderEntry>) {
+  return async (key: string): Promise<VaultAclResult> => {
+    const e = map[key] ?? { kind: "not_found" as const };
+    return e.kind === "ok" ? { kind: "ok", allow: e.allow, deny: e.deny ?? [] } : e;
+  };
 }
 
 describe("computeMcpSecretRequirements", () => {
@@ -114,14 +119,28 @@ describe("runMcpSecretChecks", () => {
     expect(res[0].fix).toContain("switchroom vault set meta/token --allow marko");
   });
 
-  it("FAILs when the key exists but the agent is off its ACL (re-states full list)", async () => {
+  it("OKs a present key with an EMPTY scope.allow (v0.15.38 false-positive fix)", async () => {
+    // The real fleet case: no scope → checkEntryScope imposes no restriction.
+    const res = await runMcpSecretChecks(base, {
+      vaultAclReader: reader({ "meta/token": { kind: "ok", allow: [], deny: [] } }),
+    });
+    expect(res[0].status).toBe("ok");
+  });
+
+  it("FAILs when scope.allow is NON-empty and the agent is absent (real denial)", async () => {
     const res = await runMcpSecretChecks(base, {
       vaultAclReader: reader({ "meta/token": { kind: "ok", allow: ["someoneelse"] } }),
     });
     expect(res[0].status).toBe("fail");
-    expect(res[0].detail).toContain("NOT on the vault ACL");
-    // fix re-states the FULL list (existing + marko), sorted.
+    expect(res[0].detail).toContain("scope");
     expect(res[0].fix).toContain("--allow marko,someoneelse");
+  });
+
+  it("FAILs when the agent is in scope.deny (deny wins over empty allow)", async () => {
+    const res = await runMcpSecretChecks(base, {
+      vaultAclReader: reader({ "meta/token": { kind: "ok", allow: [], deny: ["marko"] } }),
+    });
+    expect(res[0].status).toBe("fail");
   });
 
   it("OKs when the key exists and the agent is on its ACL", async () => {
