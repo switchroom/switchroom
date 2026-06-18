@@ -121,14 +121,16 @@ and crosses no invariant.
 Add `observation` to the auto-recall `types`. Turns 45k of paid-for,
 deduped, provenance-carrying observations from dead weight into the
 "curated, by-relevance" recall the job demands. Pure consumption change
-in the same `memory_units`/HNSW index — near-zero added recall latency,
+(retrieval + local rerank, no model call) — it adds one
+per-fact-type retrieval arm, but the cross-encoder rerank stays bounded
+by the 300-candidate cap, so the added latency is *bounded*, not zero;
 and observations are *denser* (one synthesized statement replaces N raw
 facts) so coverage improves inside the same 1024-token cap. **Do not**
-route the hot recall path through `reflect` (an agentic ~5-iteration
-loop, 300s ceiling) — that would blow warm TTFO (~1.7s) into seconds and
-multiply per-turn tokens; reflect stays reserved for explicit
-"what do you know about me" asks. See *Speed & token budget* below — this
-phase may also let the recall budget drop `mid`→`low` (faster + cheaper).
+route the hot recall path through `reflect` (an agentic loop, ~5–10
+iterations / 10 ceiling, 300s wall-timeout) — that would blow warm TTFO
+(~1.7s) into seconds and multiply per-turn tokens; reflect stays reserved
+for explicit "what do you know about me" asks (where it belongs and is
+kept — Phase 5 builds on it).
 
 **Phase 2 — Specialize each bank.** Set a per-agent `retain_mission` /
 `reflect_mission` / `disposition` from the agent's profile (a coach
@@ -156,28 +158,40 @@ side without polling.
 Operator-curated, or agent-proposes → operator-confirms in chat, for
 specialists that earn a pinned model (the gap behind "Hindsight doesn't
 create models as needed"). Deliberately *not* autonomous creation
-(tension 3). Curate **selectively** — each model adds
-post-consolidation refresh spend (bounded ~2048 tokens, but can hit the
-300s reflect timeout, which we already see fail ~9×), so more models is
-more invisible background cost. Their upside is real on the *explicit*
-reflect path (fresh models let reflect short-circuit the lower tiers →
-faster), but they do not speed the hot recall path.
+(tension 3). Curate **selectively** — a model set to
+`refresh_after_consolidation` (which defaults *off*) adds
+post-consolidation refresh spend (bounded ~2048 tokens, and a reflect
+refresh can hit the 300s wall-timeout — observed historically on this
+fleet), so more refresh-enabled models is more invisible background cost.
+Their upside is real on the *explicit* reflect path (fresh models let
+reflect short-circuit the lower tiers → faster), but they do not speed
+the hot recall path.
 
 **Phase 6 — Two near-free hot-path levers (UX + speed + tokens).** Not
 synthesis-tier work, but the largest responsiveness/cost wins and they
 cross no invariant:
-- **Gate recall on need.** Recall fires on *every* turn — a trivial
-  "what time is it" still pays a ~5s recall arm + up to 1024 injected
-  tokens it never uses. Skipping recall for plausibly-stateless/trivial
-  asks speeds exactly the warm-TTFO path the `jtbd-fast-trivial-dm` gate
-  measures *and* saves tokens.
+- **Gate recall on need.** Recall fires on *every* substantive turn — a
+  trivial "what time is it" still pays a ~1–2s recall arm (budget `low`)
+  + up to 1024 injected tokens it never uses. The hook already skips
+  ultra-short and ack-phrase turns; this *extends* that skip to
+  plausibly-stateless/trivial asks, speeding the warm-TTFO path the
+  `jtbd-fast-trivial-dm` gate measures *and* saving tokens. **Caveat
+  (symmetry with 6b):** the failure mode is a false negative — gating a
+  turn that *did* need memory undercuts the job's continuity criteria,
+  so this lever is likewise gated on proving no recall-quality
+  regression, not shipped blind.
 - **Right-size retain cadence.** `retainEveryNTurns=1` means every turn
   triggers background consolidation (sonnet) — the single largest
-  *invisible* subscription draw, and the engine room of tension (1).
-  Retaining every 2–3 turns roughly halves that spend. **Caveat:** the
-  every-turn setting is deliberate (the restart-memory-loss UAT), so
-  this is a real tradeoff to measure, not a free win — hence its own
-  lever, gated on proving no memory-loss regression.
+  *invisible* subscription draw (live: on the order of ~1M consolidation
+  tokens/day/agent, ~100% of an agent's LLM spend), and the engine room
+  of tension (1). Firing retain every 2–3 turns instead cuts that
+  roughly in proportion — an order-of-magnitude estimate, not derived
+  math: switchroom runs `full-session` retain mode (not chunked), so
+  each fire re-consolidates the accumulated transcript and the per-fire
+  cost grows with session length, making the real savings curve
+  non-linear. **Caveat:** the every-turn setting is deliberate (the
+  restart-memory-loss UAT), so this is a real tradeoff to measure, not a
+  free win — gated on proving no memory-loss regression.
 
 ## Speed & token budget
 
@@ -186,25 +200,31 @@ The fit argument above is about *correctness*; this section weighs
 directions:
 
 - **Foreground (per-turn).** The auto-recall hook runs on every
-  `UserPromptSubmit` (budget `mid` ~5s, 12s timeout) and injects up to
-  1024 tokens of context. This is on the critical path for warm TTFO
-  (~1.7s baseline, gated by `jtbd-fast-trivial-dm`). Anything added here
-  is felt directly.
+  substantive `UserPromptSubmit` at budget **`low`** (~1–2s, vector
+  retrieval + local rerank, **no model call**), with an 8s recall
+  timeout inside the 12s hook ceiling, injecting up to 1024 tokens of
+  context. It is on the critical path for warm TTFO (~1.7s baseline,
+  gated by `jtbd-fast-trivial-dm`), so anything added here is felt
+  directly — but it spends *no* model tokens. (`low` is operator-raisable
+  to `mid` ~5s, which adds an LLM rerank pass; switchroom does not.)
 - **Background (invisible).** Every retain triggers consolidation
-  (sonnet) the operator never sees; `retainEveryNTurns=1` makes that
-  per-turn. This is the largest *uncounted* subscription draw and the
-  engine room of invariant tension (1). Mental-model refreshes add to it.
+  (sonnet, on the subscription) the operator never sees;
+  `retainEveryNTurns=1` makes that per-turn. This is the largest
+  *uncounted* subscription draw — live, it is essentially **100% of an
+  agent's model spend** (order ~1M consolidation tokens/day/agent) — and
+  the engine room of invariant tension (1). Mental-model refreshes (when
+  refresh-enabled) add to it.
 
 Per-phase scorecard against the three axes:
 
 | Phase | UX | Speed | Tokens |
 |---|---|---|---|
-| 1. Consume observations | curated, not grab-bag | ~neutral (same index) | denser → ≤ same; may enable `mid`→`low` |
+| 1. Consume observations | curated, not grab-bag | bounded (+1 arm; rerank capped at 300) | denser → ≤ same; no model call |
 | 2. Per-agent missions/disposition | specialized recall | neutral (shapes extraction) | slight win — less noise stored |
 | 3. Directives ("corrections stick") | strong | negligible | small fixed per-turn cost if always injected |
 | 4. Chat-legible (sparse) | legible **iff** sparse | negligible | minor output tokens |
 | 5. Curated mental models | + faster *reflect* | neutral on hot path | background refresh spend; timeout risk |
-| 6a. Gate recall on need | trivial turns feel instant | **win** — skips ~5s arm | **win** — drops ~1024 tok on trivial turns |
+| 6a. Gate recall on need | trivial turns feel instant | **win** — skips ~1–2s arm | **win** — drops ~1024 tok on trivial turns |
 | 6b. Right-size retain cadence | unchanged | unchanged | **win** — ~halves background consolidation |
 
 Net read: **Phase 1(a), 2, 3, 6a** are positive-or-neutral on all three
