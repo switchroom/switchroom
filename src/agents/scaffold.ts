@@ -2217,6 +2217,24 @@ function applyHindsightSettingsOverrides(pluginDestPath: string): void {
   // floor so weak Jaccard-overlap hits drop silently. Operators can
   // override via memory.recall.min_overlap in switchroom.yaml.
   settings.recallMinOverlap = 0.10;
+  // Phase 1 (RFC reference/rfcs/hindsight-synthesis-layers.md): consume
+  // the synthesized `observation` tier at recall, not just raw
+  // world/experience. Observations are deduped, dated, provenance-backed
+  // syntheses the consolidation engine already generates on every retain
+  // — excluding them threw away the curated tier and left recall as the
+  // "grab-bag" the remember-across-sessions job calls bad. An A/B on the
+  // test-harness bank showed observations rank top, reconcile contradictory
+  // raw facts, and dedup near-duplicates, at neutral recall latency and
+  // zero model spend (recall is retrieval + local rerank). Operators can
+  // override via memory.recall.types in switchroom.yaml.
+  settings.recallTypes = ["world", "experience", "observation"];
+  // Phase 6a: on top of the ack-skip, skip recall on plausibly-stateless
+  // trivial turns (time/date/day, bare greetings) — saves the ~1-2s
+  // recall arm + up to ~1024 injected tokens on turns that never need
+  // user memory. Conservative + guarded against any personal/stateful
+  // signal (see recall.py `_is_trivial_stateless`). Off-switch:
+  // memory.recall.skip_trivial=false in switchroom.yaml.
+  settings.recallSkipTrivial = true;
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 
