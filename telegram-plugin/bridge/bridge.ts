@@ -27,6 +27,7 @@ import {
   type PtyTailHandle,
 } from '../pty-tail.js'
 import { createIpcClient, type IpcClientHandle } from './ipc-client.js'
+import { buildEffectiveToolSchemas, LINEAR_ENV } from './tool-filter.js'
 import type { InboundMessage, PermissionEvent, StatusEvent } from '../gateway/ipc-protocol.js'
 import { matchesAllowRule } from '../permission-rule.js'
 
@@ -544,7 +545,17 @@ const TOOL_SCHEMAS = [
   },
 ]
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_SCHEMAS }))
+// Tool-surface right-sizing (P4): connection-gate linear_* + per-tool
+// alwaysLoad pins for the hot path. See tool-filter.ts for the rationale.
+// Computed once at startup — SWITCHROOM_TELEGRAM_LINEAR is fixed for the
+// process lifetime (set by the gateway in .mcp.json when Linear is wired).
+const EFFECTIVE_TOOL_SCHEMAS = buildEffectiveToolSchemas(TOOL_SCHEMAS, {
+  linearEnabled: process.env[LINEAR_ENV] === '1',
+})
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: EFFECTIVE_TOOL_SCHEMAS,
+}))
 
 // ─── MCP CallTool → IPC forward ─────────────────────────────────────────
 

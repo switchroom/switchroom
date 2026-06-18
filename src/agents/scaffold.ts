@@ -3277,6 +3277,17 @@ export function scaffoldAgent(
     // `schedule_add`. See switchroom#1892.
     const telegramStateDir = `${DOCKER_AGENT_HOME}/.switchroom/agents/${name}/telegram`;
 
+    // Linear connection gate (P4-A): the bridge only advertises the
+    // linear_* tools when this agent actually has the Linear connection
+    // configured. Mirrors the `linearAgentEnabled` derivation in
+    // buildWorkspaceContext (scaffold.ts:2362) so both stay in lockstep.
+    const linearAgentEnabled =
+      (
+        agentConfig.channels?.telegram as
+          | { linear_agent?: { enabled?: boolean } }
+          | undefined
+      )?.linear_agent?.enabled === true;
+
     const mcpServers: Record<string, McpServerConfig> = {
       "switchroom-telegram": {
         command: "bun",
@@ -3285,12 +3296,21 @@ export function scaffoldAgent(
           TELEGRAM_STATE_DIR: telegramStateDir,
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
+          // Gate the linear_* tools (P4-A). Only set when the Linear
+          // connection is configured; the bridge drops those 3 tools
+          // otherwise so a non-Linear agent never carries their schema.
+          ...(linearAgentEnabled ? { SWITCHROOM_TELEGRAM_LINEAR: "1" } : {}),
         },
-        // LOAD-BEARING under tool search: reply / stream_reply /
-        // get_recent_messages / react must never defer, or every turn pays a
-        // ToolSearch round-trip before it can answer (the orphaned-reply
-        // failure class). Pin them loaded.
-        alwaysLoad: true,
+        // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
+        // wholesale. The bridge pins the load-bearing hot tools (reply /
+        // stream_reply / get_recent_messages / react / edit_message /
+        // send_typing / download_attachment) individually via the native
+        // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
+        // never defer (no orphaned-reply round-trip), while the ~14 cold
+        // tools (linear / vault / checklist / gif / sticker / pin / delete
+        // / forward / ask_user) defer and load on first use — reclaiming
+        // ~5k tokens of always-on baseline per agent.
+        alwaysLoad: false,
       },
       // Read-only agent-config broker. Exposes 4 tools (config_get,
       // cron_list, skill_list, audit_tail) that re-exec the switchroom
@@ -5492,6 +5512,17 @@ export function reconcileAgent(
     // switchroom#1892.
     const telegramStateDir = `${DOCKER_AGENT_HOME}/.switchroom/agents/${name}/telegram`;
 
+    // Linear connection gate (P4-A): the bridge only advertises the
+    // linear_* tools when this agent actually has the Linear connection
+    // configured. Mirrors the `linearAgentEnabled` derivation in
+    // buildWorkspaceContext (scaffold.ts:2362) so both stay in lockstep.
+    const linearAgentEnabled =
+      (
+        agentConfig.channels?.telegram as
+          | { linear_agent?: { enabled?: boolean } }
+          | undefined
+      )?.linear_agent?.enabled === true;
+
     const mcpServers: Record<string, McpServerConfig> = {
       "switchroom-telegram": {
         command: "bun",
@@ -5500,12 +5531,21 @@ export function reconcileAgent(
           TELEGRAM_STATE_DIR: telegramStateDir,
           SWITCHROOM_CONFIG: resolvedConfigPath,
           SWITCHROOM_CLI_PATH: switchroomCliPath,
+          // Gate the linear_* tools (P4-A). Only set when the Linear
+          // connection is configured; the bridge drops those 3 tools
+          // otherwise so a non-Linear agent never carries their schema.
+          ...(linearAgentEnabled ? { SWITCHROOM_TELEGRAM_LINEAR: "1" } : {}),
         },
-        // LOAD-BEARING under tool search: reply / stream_reply /
-        // get_recent_messages / react must never defer, or every turn pays a
-        // ToolSearch round-trip before it can answer (the orphaned-reply
-        // failure class). Pin them loaded.
-        alwaysLoad: true,
+        // Tool-search right-sizing (P4-B): the server is NO LONGER pinned
+        // wholesale. The bridge pins the load-bearing hot tools (reply /
+        // stream_reply / get_recent_messages / react / edit_message /
+        // send_typing / download_attachment) individually via the native
+        // per-tool `_meta["anthropic/alwaysLoad"]` annotation, so they
+        // never defer (no orphaned-reply round-trip), while the ~14 cold
+        // tools (linear / vault / checklist / gif / sticker / pin / delete
+        // / forward / ask_user) defer and load on first use — reclaiming
+        // ~5k tokens of always-on baseline per agent.
+        alwaysLoad: false,
       },
       // Read-only agent-config broker. Exposes 4 tools (config_get,
       // cron_list, skill_list, audit_tail) that re-exec the switchroom
