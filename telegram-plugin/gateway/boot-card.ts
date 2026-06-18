@@ -46,6 +46,7 @@ import {
   probeBroker,
   probeKernel,
   probeSkills,
+  probeConnections,
   watchAgentProcess,
   AGENT_LIVE_WINDOW_MS,
   AGENT_LIVE_POLL_INTERVAL_MS,
@@ -120,6 +121,7 @@ export type ProbeKey =
   | 'broker'
   | 'kernel'
   | 'skills'
+  | 'connections'
 
 export type ProbeMap = Partial<Record<ProbeKey, ProbeResult | null>>
 
@@ -253,11 +255,12 @@ const PROBE_LABELS: Record<ProbeKey, string> = {
   broker:    'Broker',
   kernel:    'Kernel',
   skills:    'Skills',
+  connections: 'Connections',
 }
 
 const PROBE_KEYS: ReadonlyArray<ProbeKey> = [
   'account', 'agent', 'gateway', 'quota', 'hindsight',
-  'scheduler', 'broker', 'kernel', 'skills',
+  'scheduler', 'broker', 'kernel', 'skills', 'connections',
 ]
 
 const REASON_EMOJI: Record<RestartReason, string> = {
@@ -617,6 +620,7 @@ export async function runAllProbes(opts: RunProbesOpts): Promise<ProbeMap> {
     probeBroker(undefined, { dockerMode: opts.dockerMode }).then(r => { probes.broker = r }),
     probeKernel(undefined, { dockerMode: opts.dockerMode }).then(r => { probes.kernel = r }),
     probeSkills(opts.agentDir, { agentName: opts.agentSlug ?? opts.agentName }).then(r => { probes.skills = r }),
+    probeConnections(opts.agentDir).then(r => { probes.connections = r }),
   ])
 
   return probes

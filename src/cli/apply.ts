@@ -56,6 +56,8 @@ import {
   ConfigError,
 } from "../config/loader.js";
 import { scaffoldAgent, alignAgentUid, renderFleetInvariants, toHostHomePath } from "../agents/scaffold.js";
+import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
+import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { writeComposeFile, resolveHostSwitchroomConfigPath } from "./write-compose.js";
@@ -679,6 +681,24 @@ export async function runApply(
     );
   }
 
+  // Shared vault-broker ACL reader for the per-agent connection-health
+  // snapshot written below (read by the boot card's probeConnections). Soft-
+  // fails to "unreachable" → refreshAgentConnectionHealth then emits zero
+  // issues (auth assumed), so a down/locked broker never false-flags an agent.
+  const connHealthVaultAclReader = async (key: string): Promise<VaultAclResult> => {
+    try {
+      const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+      const result = await getViaBrokerStructured(key);
+      if (result.kind === "ok") {
+        return { kind: "ok", allow: result.entry.scope?.allow ?? [] };
+      }
+      if (result.kind === "not_found") return { kind: "not_found" };
+      return { kind: "unreachable", msg: result.msg };
+    } catch (err) {
+      return { kind: "unreachable", msg: (err as Error).message };
+    }
+  };
+
   // ── 1. Scaffold each agent ────────────────────────────────────────
   let scaffolded = 0;
   const failures: ScaffoldFailure[] = [];
@@ -722,6 +742,15 @@ export async function runApply(
           ),
         );
       }
+      // Connection-health snapshot for the boot card's probeConnections
+      // (configured-but-unauthed MCP integrations). Computed host-side here
+      // because the in-container boot probe can't query the broker. Written
+      // BEFORE alignAgentUid so the chown below covers the file. Best-effort
+      // (refreshAgentConnectionHealth never throws) — must never break apply.
+      await refreshAgentConnectionHealth(config, name, join(agentsDir, name), {
+        vaultAclReader: connHealthVaultAclReader,
+      });
+
       // Align per-agent dir ownership with the container UID assigned
       // by compose.ts. Without this the bind-mount lands read-only
       // for the in-container UID and the agent fails on first write.

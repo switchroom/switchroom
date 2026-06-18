@@ -14289,7 +14289,7 @@ async function buildLiveProbeRows(agentName: string): Promise<StatusProbeRow[]> 
     // Render order matches the boot card's PROBE_KEYS so the two
     // surfaces tell the same story in the same order.
     const order = ['account', 'agent', 'gateway', 'quota', 'hindsight',
-      'scheduler', 'broker', 'kernel', 'skills'] as const
+      'scheduler', 'broker', 'kernel', 'skills', 'connections'] as const
     for (const k of order) {
       const r = probes[k]
       if (!r) continue
