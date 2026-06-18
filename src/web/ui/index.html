@@ -474,7 +474,14 @@
     }
 
     @media (min-width: 701px) {
-      .accounts-grid { display: none; }
+      /* The Accounts tab shows a wide-screen TABLE and a mobile card grid,
+         hiding the grid on desktop. Scope that hide to #accounts: the
+         Connections tab reuses .accounts-grid for its OAuth/Notion cards but
+         has NO table fallback, so an unscoped rule blanked every connection
+         card on any screen wider than 700px (the cards rendered but were
+         display:none, while the empty-state text — not in a grid — still
+         showed). */
+      #accounts .accounts-grid { display: none; }
     }
 
     @media (max-width: 600px) {
