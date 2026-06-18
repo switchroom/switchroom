@@ -100,6 +100,12 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("bakes the maintenance sidecar (backup/autovacuum/retention) as executable", () => {
+    expect(dockerfile).toMatch(
+      /COPY\s+--chmod=0755\s+docker\/hindsight-maintenance\.sh\s+\/usr\/local\/lib\/switchroom\/hindsight-maintenance\.sh/,
+    );
+  });
+
   it("ends as USER hindsight (so the entrypoint runs as UID 11000)", () => {
     expect(dockerfile).toMatch(/^USER\s+hindsight\b/m);
   });

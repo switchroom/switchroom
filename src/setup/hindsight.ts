@@ -233,6 +233,20 @@ export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
 export const HINDSIGHT_DEFAULT_SHM_SIZE = "2g";
 
 /**
+ * Container healthcheck. Hits the in-container `/health` endpoint (which
+ * reports DB connectivity) and exits non-zero on any failure — including
+ * connection-refused (URLError) and non-200 (HTTPError), both of which
+ * raise and propagate to a non-zero process exit. `python3` is always
+ * present in the upstream image; `curl`/`wget` are not, so we don't rely
+ * on them. `HINDSIGHT_HEALTHCHECK_PY` is the bare script body (compose
+ * exec-form `["CMD","python3","-c",PY]`); `HINDSIGHT_HEALTHCHECK_CMD` is
+ * the shell string for `docker run --health-cmd`.
+ */
+export const HINDSIGHT_HEALTHCHECK_PY =
+  'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:8888/health",timeout=4).getcode()==200 else 1)';
+export const HINDSIGHT_HEALTHCHECK_CMD = `python3 -c '${HINDSIGHT_HEALTHCHECK_PY}'`;
+
+/**
  * Check if a TCP port is free for binding on 127.0.0.1.
  * Returns true if free, false if something is already listening.
  */
@@ -387,9 +401,21 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     // HINDSIGHT_DEFAULT_SHM_SIZE) or all writes/queries fail with
     // "No space left on device". Keep in sync with the compose snippet.
     `--shm-size=${HINDSIGHT_DEFAULT_SHM_SIZE}`,
+    // Restart a wedged API: docker had no liveness signal for hindsight,
+    // so an unresponsive server (or a never-booting one) stayed "up"
+    // forever. python3 is always present in the image; curl/wget are not.
+    "--health-cmd", HINDSIGHT_HEALTHCHECK_CMD,
+    "--health-interval", "30s",
+    "--health-timeout", "5s",
+    "--health-retries", "3",
+    "--health-start-period", "60s",
     "-p", `127.0.0.1:${apiPort}:8888`,
     "-p", `127.0.0.1:${uiPort}:9999`,
     "-v", "switchroom-hindsight-data:/home/hindsight/.pg0",
+    // Backups land on a SEPARATE volume from the data, so a data-volume
+    // loss/corruption is recoverable. The entrypoint's maintenance loop
+    // writes rotated pg_dumps here; operators can snapshot/copy it off-host.
+    "-v", "switchroom-hindsight-backups:/backups",
     // Broker UDS — same shape the agent fleet uses. The named volume is
     // populated by the auth-broker singleton (which chowns the socket to
     // the declared consumer UID); inside this container the socket is
@@ -484,8 +510,18 @@ export function generateHindsightComposeSnippet(): string {
     // PostgreSQL shm — see HINDSIGHT_DEFAULT_SHM_SIZE. Without this the
     // container gets Docker's 64MB default and all writes/queries fail.
     `    shm_size: ${HINDSIGHT_DEFAULT_SHM_SIZE}`,
+    // Liveness — restart a wedged/never-booted API (see the docker-run path).
+    "    healthcheck:",
+    `      test: ${JSON.stringify(["CMD", "python3", "-c", HINDSIGHT_HEALTHCHECK_PY])}`,
+    "      interval: 30s",
+    "      timeout: 5s",
+    "      retries: 3",
+    "      start_period: 60s",
     "    volumes:",
     "      - switchroom-hindsight-data:/home/hindsight/.pg0",
+    // Backups on a separate volume from the data — recoverable if the data
+    // volume is lost/corrupted. Written by the entrypoint maintenance loop.
+    "      - switchroom-hindsight-backups:/backups",
     `      - ${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,
     "    tmpfs:",
     `      - /run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
@@ -493,6 +529,7 @@ export function generateHindsightComposeSnippet(): string {
     "",
     "volumes:",
     "  switchroom-hindsight-data:",
+    "  switchroom-hindsight-backups:",
     `  ${HINDSIGHT_BROKER_SOCK_VOLUME}:`,
     "    external: true",
     "    # Bound by the switchroom-auth-broker singleton in the main",
