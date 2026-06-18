@@ -448,6 +448,51 @@ export function stopHindsight(): void {
 }
 
 /**
+ * Pull the latest Hindsight image. `startHindsight` runs `docker run`
+ * against whatever image is locally present — it never pulls — so a
+ * recreate that wants the newest `:latest` must pull first. Inherits
+ * stdio so the operator sees pull progress during `switchroom update`.
+ */
+export function pullHindsightImage(): void {
+  execFileSync("docker", ["pull", HINDSIGHT_IMAGE], { stdio: "inherit" });
+}
+
+/**
+ * Read the host ports the RUNNING hindsight container currently
+ * publishes, so a recreate can rebind the SAME ports and never change
+ * `memory.config.url` under the fleet (a silent port change would point
+ * every agent's MCP client at a dead URL). Returns null if the container
+ * isn't running / can't be read — callers then fall back to
+ * `pickHindsightPorts()`.
+ */
+export function getRunningHindsightPorts(): { apiPort: number; uiPort: number } | null {
+  const readPort = (containerPort: number): number | null => {
+    try {
+      const out = execFileSync(
+        "docker",
+        ["port", "switchroom-hindsight", `${containerPort}/tcp`],
+        { stdio: "pipe", encoding: "utf-8" },
+      );
+      // Output is one or more lines like "127.0.0.1:18888" / "[::]:18888".
+      const m = out.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
+      if (!m) return null;
+      const port = Number(m.slice(m.lastIndexOf(":") + 1));
+      return Number.isInteger(port) && port > 0 ? port : null;
+    } catch {
+      return null;
+    }
+  };
+  const apiPort = readPort(HINDSIGHT_DEFAULT_API_PORT);
+  if (apiPort === null) return null;
+  // The UI port is informational (unused by switchroom); reuse it if
+  // readable, else derive the standard pair (8888→9999, 18888→19999).
+  const uiPort =
+    readPort(HINDSIGHT_DEFAULT_UI_PORT) ??
+    (apiPort === HINDSIGHT_DEFAULT_API_PORT ? HINDSIGHT_DEFAULT_UI_PORT : 19999);
+  return { apiPort, uiPort };
+}
+
+/**
  * Get the status of the Hindsight Docker container.
  */
 export function getHindsightStatus(): string | null {

@@ -112,6 +112,9 @@ interface UpdateOptions {
   /** Test seam — override `web_service.managed` detection for the
    *  `refresh-web` step instead of reading from switchroom.yaml. */
   webServiceManaged?: boolean;
+  /** Test seam — override `memory.backend === "hindsight"` detection for
+   *  the `refresh-hindsight` step instead of reading from switchroom.yaml. */
+  memoryBackendHindsight?: boolean;
   /** One-shot release-channel override (mirrors `apply --channel`). */
   channel?: "dev" | "rc" | "latest";
   /** One-shot release-pin override (mirrors `apply --pin`). Mutually
@@ -431,6 +434,48 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
     run: () => {
       const r = runner(process.execPath, [scriptPath, "webd", "install"]);
       if (r.status !== 0) throw new Error("switchroom webd install failed");
+    },
+  });
+
+  // refresh-hindsight: pull the latest hindsight image and recreate the
+  // container. Same isolation gap as refresh-hostd/refresh-web — the
+  // hindsight singleton runs as its own standalone `docker run` container
+  // (managed by `memory setup`, NOT in the agent fleet's compose project),
+  // and it uses a floating `:latest` tag that `pull-images` / `--pin`
+  // never touch. So before this step existed, `switchroom update` left
+  // hindsight on whatever stale `:latest` it last started with — even
+  // after the durability fixes (#2412 stable worker_id, #2416 backups /
+  // healthcheck / self-maintenance) were already baked into `:latest`,
+  // the running container kept serving the pre-fix image until an operator
+  // separately ran `memory setup --stop` + `memory setup`. This step folds
+  // that recreate into the update (reusing the container's current port so
+  // memory.config.url never changes under the fleet).
+  //
+  // Skipped when the memory backend isn't hindsight OR --skip-images is set.
+  let memoryBackendHindsight: boolean;
+  if (typeof opts.memoryBackendHindsight === "boolean") {
+    memoryBackendHindsight = opts.memoryBackendHindsight;
+  } else {
+    try {
+      memoryBackendHindsight = loadConfig().memory?.backend === "hindsight";
+    } catch {
+      // Best-effort: skip rather than fail the whole update if config
+      // can't be loaded.
+      memoryBackendHindsight = false;
+    }
+  }
+  steps.push({
+    name: "refresh-hindsight",
+    description:
+      "switchroom memory setup --recreate — pull latest hindsight image + recreate the memory singleton (standalone container, reusing its current port)",
+    skipReason: !memoryBackendHindsight
+      ? "memory.backend is not hindsight — no hindsight singleton to refresh"
+      : opts.skipImages
+        ? "--skip-images flag set"
+        : undefined,
+    run: () => {
+      const r = runner(process.execPath, [scriptPath, "memory", "setup", "--recreate"]);
+      if (r.status !== 0) throw new Error("switchroom memory setup --recreate failed");
     },
   });
 
