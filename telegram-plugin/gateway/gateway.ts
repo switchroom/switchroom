@@ -293,6 +293,7 @@ import { refreshBanner } from '../slot-banner-driver.js'
 import { loadConfig as loadSwitchroomConfig, findConfigFile as findSwitchroomConfigFile } from '../../src/config/loader.js'; import { resolveAgentConfig } from '../../src/config/merge.js'
 import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, type TopicRouterConfig as _OutboundRouterConfig } from '../../src/telegram/topic-router.js'
 import { readTurnUsages } from '../../src/agents/perf.js'
+import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
@@ -2796,6 +2797,45 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
       // moot, so only evaluate when no restart drained this pass.
       maybeProactiveCompact();
     }
+    // Context-headroom snapshot (RFC context-headroom-surface) — write the
+    // current occupancy + cap so `switchroom status`/`doctor`/web can show
+    // headroom. Independent of proactive-compaction (writes even when no cap
+    // is configured) and best-effort (never throws). Runs on the same idle
+    // signal — never mid-turn.
+    snapshotContextOccupancy();
+  }
+}
+
+/**
+ * Write the per-agent context-occupancy snapshot from the same live occupancy
+ * proactive-compaction reads — but unconditionally (even with no cap set), so
+ * the operator always sees headroom. Best-effort; never throws.
+ */
+function snapshotContextOccupancy(): void {
+  try {
+    const agentName = process.env.SWITCHROOM_AGENT_NAME;
+    const file = lastSessionActiveFile;
+    if (!agentName || !file) return;
+    const turns = readTurnUsages(file, 1);
+    if (turns.length === 0) return;
+    const t = turns[0];
+    const occupancy = t.input + t.cacheRead + t.cacheCreate;
+    let cap: number | null = null;
+    try {
+      const cfg = loadSwitchroomConfig();
+      const rawAgent = cfg.agents?.[agentName] ?? {};
+      const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent);
+      cap = resolved.session?.max_context_tokens ?? null;
+    } catch {
+      cap = null; // config unreadable → show occupancy without a ratio
+    }
+    const stateDir = process.env.SWITCHROOM_AGENT_STATE_DIR ?? "/state/agent";
+    writeContextOccupancySnapshot(
+      stateDir,
+      buildContextOccupancy(occupancy, cap, Date.now()),
+    );
+  } catch {
+    /* best-effort — never disrupt the idle gate */
   }
 }
 
