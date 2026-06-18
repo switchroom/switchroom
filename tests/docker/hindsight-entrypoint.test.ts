@@ -400,6 +400,100 @@ describe("hindsight-entrypoint.sh (#1245)", () => {
     }
   }, 10_000);
 
+  it("pins a stable HINDSIGHT_API_WORKER_ID so restart-recovery reclaims stranded ops", async () => {
+    // Durability fix (incident 2026-06-18): the upstream worker_id
+    // defaults to the container hostname (ephemeral docker id), so a
+    // worker that died mid-consolidation stranded its 'processing' ops
+    // forever — recover_own_tasks() only reclaims WHERE worker_id=<own>.
+    // Pinning a stable id makes every restart reclaim its predecessor's
+    // work. `env` as CMD prints the exported environment.
+    stopBroker = await startFakeBroker(socketPath);
+    const result = await runEntrypoint({ socketPath, credDir, cmd: ["env"] });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/^HINDSIGHT_API_WORKER_ID=switchroom-hindsight$/m);
+  });
+
+  it("lets an operator-provided HINDSIGHT_API_WORKER_ID win (`:=` only fills when unset)", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const result = await new Promise<{ status: number | null; stdout: string }>(
+      (res) => {
+        const child = spawn("sh", [ENTRYPOINT, "env"], {
+          env: {
+            ...process.env,
+            SWITCHROOM_AUTH_BROKER_SOCKET: socketPath,
+            SWITCHROOM_HINDSIGHT_CRED_DIR: credDir,
+            SWITCHROOM_HINDSIGHT_WAIT_S: "5",
+            SWITCHROOM_HINDSIGHT_REFRESH_S: "0",
+            SWITCHROOM_HINDSIGHT_FETCHER: FETCHER,
+            HINDSIGHT_API_WORKER_ID: "operator-pinned-id",
+          },
+        });
+        let stdout = "";
+        child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+        child.on("close", (status) => res({ status, stdout }));
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/^HINDSIGHT_API_WORKER_ID=operator-pinned-id$/m);
+  });
+
+  it("ships a lease-timeout reaper that resets stuck 'processing' ops, correctly guarded", () => {
+    // The reaper is the no-restart-wedge backstop. We can't stand up the
+    // embedded pg in a host unit test, so pin its SQL shape + guards
+    // statically (the dangerous-to-drift parts).
+    const raw = readFileSync(ENTRYPOINT, "utf-8");
+    // Only touches stuck 'processing' rows, never anything else.
+    expect(raw).toMatch(/status='processing'/);
+    // Keyed on claim AGE (lease timeout), not the ephemeral worker_id.
+    expect(raw).toMatch(/claimed_at < now\(\) - make_interval\(secs => \$\{REAP_STALE_S\}\)/);
+    // Mirrors upstream recover_own_tasks(): never reset in-flight batch ops.
+    expect(raw).toMatch(/result_metadata->>'batch_id' IS NULL/);
+    // Gated + best-effort: 0 disables, and it rides the existing loop.
+    expect(raw).toMatch(/REAP_STALE_S.*-gt 0.*\|\| return 0/);
+    expect(raw).toMatch(/reap_stale_processing \|\| true/);
+  });
+
+  it("the reaper no-ops cleanly when the embedded pg descriptor is absent (host/test)", async () => {
+    // With REAP_STALE_S>0 (default) but PG0_INSTANCE pointing nowhere, the
+    // reaper must early-return without erroring under `set -e`. Boot with a
+    // live refresh loop (REFRESH_S=1 → reaper fires each tick) and a
+    // resident CMD; after a couple ticks the marker must exist (entrypoint
+    // reached exec) and stderr must carry the loop-started line with no
+    // psql/python crash leaking through. We don't await 'close' — the
+    // background loop holds the stdio pipes open — we kill after the wait,
+    // mirroring the refresh-loop test above.
+    stopBroker = await startFakeBroker(socketPath);
+    const marker = join(dir, "reaper-safe-child-ran");
+    const child = spawn(
+      "sh",
+      [ENTRYPOINT, "sh", "-c", `touch ${marker}; sleep 5`],
+      {
+        env: {
+          ...process.env,
+          SWITCHROOM_AUTH_BROKER_SOCKET: socketPath,
+          SWITCHROOM_HINDSIGHT_CRED_DIR: credDir,
+          SWITCHROOM_HINDSIGHT_WAIT_S: "5",
+          SWITCHROOM_HINDSIGHT_REFRESH_S: "1",
+          SWITCHROOM_HINDSIGHT_FETCHER: FETCHER,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: join(dir, "does-not-exist.json"),
+        },
+      },
+    );
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    try {
+      await new Promise((r) => setTimeout(r, 2500));
+      expect(existsSync(marker)).toBe(true);
+      expect(stderr).toMatch(/credential refresh loop started/);
+      // The reaper fired (REFRESH_S=1) but found no pg → silent no-op:
+      // no reset log, and crucially no leaked psql/python crash.
+      expect(stderr).not.toMatch(/stale-claim reaper reset/);
+      expect(stderr).not.toMatch(/Traceback|psql:|not found/);
+    } finally {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+    }
+  }, 10_000);
+
   it("Dockerfile pins UID 11000 to match HINDSIGHT_DEFAULT_UID", () => {
     // The broker chowns the per-consumer socket to consumer.uid (mode 0600).
     // If the runtime UID inside hindsight didn't match what the operator
