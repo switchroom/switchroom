@@ -2,7 +2,7 @@
 artefact: Shared user-identity profile across the fleet — evaluation + recommendation
 serves: jobs/remember-across-sessions.md
 relates: jobs/run-a-fleet-of-specialists.md, invariants.md
-status: proposal (2026-06-19) — EVALUATION; recommends the light path, defers the heavy one
+status: Draft (2026-06-19) — EVALUATION; recommends the light path, defers the heavy one
 ---
 
 # A shared, operator-defined user identity across the fleet
@@ -80,17 +80,21 @@ no new bank, no identity-keyed recall.
   Negligible, and it's identity facts the agent would otherwise
   reconstruct from recall anyway.
 - **Delivers:** every agent consistently knows the declared baseline,
-  immediately, even on a brand-new or zero-traffic agent. This is ~80%
+  immediately, even on a brand-new or zero-traffic agent. This is most
   of the stated value.
-- **Limits:** static (every fact every turn — fine for a small stable
-  profile, wasteful if it grows large); single-profile (no per-speaker
-  switching); doesn't grow or self-correct.
+- **Limits — and these are precisely what design A buys back:** static
+  (every fact every turn — fine for a small stable profile, wasteful if
+  it grows large → A's *semantic recall*); single-profile (no per-speaker
+  switching → A's *identity keying*); doesn't grow or self-correct (→ A's
+  *living bank*). All three are speculative-today (see the verdict), which
+  is why they're the deferred remainder, not the core.
 
 ### A — Heavy: shared hindsight bank + `recallAdditionalBanks` + identity keying
 
-The recall hook already supports `recallAdditionalBanks` and the code
-even names this use case — `recall.py:680`: *"Also recall from any
-additional banks (e.g. shared user profile bank)."* The heavy design:
+The recall hook already supports `recallAdditionalBanks`
+(`vendor/hindsight-memory/scripts/recall.py:641`) and the code even
+names this use case — `recall.py:744`: *"Also recall from any additional
+banks (e.g. shared user profile bank)."* The heavy design:
 seed a shared per-user bank (`user-profile:ken`) top-down, wire every
 agent's `recallAdditionalBanks` to include it, and **select the bank by
 the inbound Telegram `user_id`** so the active speaker's profile
@@ -101,7 +105,7 @@ surfaces.
   corrected** over time, and genuine **per-speaker** switching (Ken's
   profile when Ken talks, Lisa's when Lisa talks).
 - **What it costs:** `recallAdditionalBanks` isn't wired through
-  switchroom config today (`src/cli/memory.ts:31` is the only mention) —
+  switchroom config today (`src/cli/memory.ts:33` is the only mention) —
   it needs config-cascade plumbing, bank seeding/maintenance, and
   inbound-`user_id`→bank selection. It adds a **second recall query every
   turn** (latency + tokens — the exact axis the Phase 1/6a work just
