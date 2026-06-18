@@ -204,9 +204,15 @@ it just can't **add** a new one without the passphrase.
 > forgotten it, grant the key on the host instead:
 > `switchroom vault grant <agent> --keys <key> --duration 30d`.
 
-`adminOnlyKeys` takes effect on **broker + gateway restart** (the broker has no
-ACL hot-reload — `switchroom apply` then restart, or
-`docker compose -p switchroom restart vault-broker`).
+`adminOnlyKeys`, per-cron secret ACLs, agent `admin:` flags, and the approval
+posture (`vault.broker.approvalAuth` / `postureMintAgents`) all **hot-reload on
+the broker side** — `switchroom apply` SIGHUPs the running `switchroom-vault-broker`
+so config edits take effect with no broker restart (the broker re-reads
+`switchroom.yaml` in place; the decrypted vault is preserved). Restart is only
+needed for the **gateway** half (the Telegram `/vault` surface re-reads config at
+agent restart) and for changes the broker treats as restart-only: `vault.path`
+and the auto-unlock settings. If `apply` can't reach Docker, the fallback is
+`docker restart switchroom-vault-broker`.
 
 ---
 

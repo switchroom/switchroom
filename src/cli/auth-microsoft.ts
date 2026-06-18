@@ -36,7 +36,7 @@ import {
 import {
   reloadAuthBroker,
   authBrokerReloadHint,
-} from "../auth/broker/reload-signal.js";
+} from "./broker-reload.js";
 import { resolveMicrosoftClientId } from "../auth/default-oauth-clients.js";
 import { selectMicrosoftScopes } from "../microsoft/scopes.js";
 import { buildMicrosoftCredentials as buildMicrosoftCredentialsCore } from "../microsoft/credentials.js";

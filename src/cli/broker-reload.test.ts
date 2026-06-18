@@ -2,10 +2,14 @@ import { describe, it, expect } from "vitest";
 
 import {
   reloadAuthBroker,
+  reloadVaultBroker,
+  reloadBroker,
   authBrokerReloadHint,
+  brokerReloadHint,
   AUTH_BROKER_CONTAINER,
+  VAULT_BROKER_CONTAINER,
   type DockerRunner,
-} from "./reload-signal.js";
+} from "./broker-reload.js";
 
 function runnerReturning(
   ret: { status: number | null; stderr?: string; error?: Error },
@@ -17,6 +21,34 @@ function runnerReturning(
   };
   return { runner, calls };
 }
+
+describe("reloadVaultBroker / reloadBroker", () => {
+  it("sends SIGHUP to the vault-broker container (regression: nothing used to)", () => {
+    const { runner, calls } = runnerReturning({ status: 0 });
+    const result = reloadVaultBroker({ runner });
+    expect(result).toEqual({ ok: true });
+    expect(calls).toEqual([["kill", "--signal=HUP", VAULT_BROKER_CONTAINER]]);
+  });
+
+  it("reloadBroker targets whatever container it's given", () => {
+    const { runner, calls } = runnerReturning({ status: 0 });
+    reloadBroker({ runner, container: "switchroom-vault-broker" });
+    expect(calls[0]).toEqual(["kill", "--signal=HUP", "switchroom-vault-broker"]);
+  });
+
+  it("auth + vault constants are the expected container names", () => {
+    expect(AUTH_BROKER_CONTAINER).toBe("switchroom-auth-broker");
+    expect(VAULT_BROKER_CONTAINER).toBe("switchroom-vault-broker");
+  });
+
+  it("brokerReloadHint names the given container in the restart hint", () => {
+    const hint = brokerReloadHint(
+      { ok: false, reason: "no-docker" },
+      VAULT_BROKER_CONTAINER,
+    );
+    expect(hint).toMatch(/docker restart switchroom-vault-broker/);
+  });
+});
 
 describe("reloadAuthBroker", () => {
   it("sends SIGHUP to the auth-broker container (regression: nothing used to)", () => {
