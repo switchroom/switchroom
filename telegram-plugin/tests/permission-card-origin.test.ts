@@ -35,11 +35,11 @@ describe('pickRecoveredPermissionOrigin', () => {
   it('recovers the supergroup chat + topic of the most-recent fresh turn', () => {
     // The marko shape: the force-closed turn was in supergroup topic 3.
     const recovered = pickRecoveredPermissionOrigin(
-      [turn('-1003831053471', 3, 11 * 60_000)],
+      [turn('-1001234567890', 3, 11 * 60_000)],
       NOW,
       MAX_AGE,
     )
-    expect(recovered).toEqual({ chatId: '-1003831053471', threadId: 3 })
+    expect(recovered).toEqual({ chatId: '-1001234567890', threadId: 3 })
   })
 
   it('picks the most-recently-started turn when several are fresh', () => {
@@ -75,11 +75,11 @@ describe('pickRecoveredPermissionOrigin', () => {
 
   it('recovers a DM-origin turn thread-less (threadId undefined)', () => {
     const recovered = pickRecoveredPermissionOrigin(
-      [turn('8248703757', undefined, 3 * 60_000)],
+      [turn('12345', undefined, 3 * 60_000)],
       NOW,
       MAX_AGE,
     )
-    expect(recovered).toEqual({ chatId: '8248703757', threadId: undefined })
+    expect(recovered).toEqual({ chatId: '12345', threadId: undefined })
   })
 
   it('keeps the freshest in-window turn even when stale turns are present', () => {
