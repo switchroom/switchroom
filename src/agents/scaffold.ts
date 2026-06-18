@@ -2225,15 +2225,19 @@ function applyHindsightSettingsOverrides(pluginDestPath: string): void {
   // "grab-bag" the remember-across-sessions job calls bad. An A/B on the
   // test-harness bank showed observations rank top, reconcile contradictory
   // raw facts, and dedup near-duplicates, at neutral recall latency and
-  // zero model spend (recall is retrieval + local rerank). Operators can
-  // override via memory.recall.types in switchroom.yaml.
+  // zero model spend (recall is retrieval + local rerank). Switchroom
+  // default; not yet wired to a memory.recall.types yaml cascade (a
+  // per-agent override would need a schema field + HINDSIGHT_RECALL_TYPES
+  // env export — tracked as a follow-up).
   settings.recallTypes = ["world", "experience", "observation"];
   // Phase 6a: on top of the ack-skip, skip recall on plausibly-stateless
   // trivial turns (time/date/day, bare greetings) — saves the ~1-2s
   // recall arm + up to ~1024 injected tokens on turns that never need
   // user memory. Conservative + guarded against any personal/stateful
-  // signal (see recall.py `_is_trivial_stateless`). Off-switch:
-  // memory.recall.skip_trivial=false in switchroom.yaml.
+  // signal (see recall.py `_is_trivial_stateless`). recall.py honours the
+  // `recallSkipTrivial` setting, so the off-switch today is setting it
+  // false in the agent's plugin settings.json; a memory.recall.skip_trivial
+  // yaml cascade is a tracked follow-up.
   settings.recallSkipTrivial = true;
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
