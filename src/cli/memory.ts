@@ -17,6 +17,8 @@ import {
   getHindsightStatus,
   generateHindsightComposeSnippet,
   pickHindsightPorts,
+  pullHindsightImage,
+  getRunningHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
 } from "../setup/hindsight.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -215,8 +217,12 @@ export function registerMemoryCommand(program: Command): void {
     .description("Manage the Hindsight Docker container")
     .option("--stop", "Stop and remove the Hindsight container")
     .option("--status", "Show Hindsight container status")
+    .option(
+      "--recreate",
+      "Pull the latest image and recreate the container (reusing its current port). Used by `switchroom update` to keep the hindsight singleton current.",
+    )
     .option("--provider <provider>", "LLM provider (ollama, openai, anthropic)")
-    .action(async (opts: { stop?: boolean; status?: boolean; provider?: string }) => {
+    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; provider?: string }) => {
       if (opts.status) {
         if (!isDockerAvailable()) {
           console.log(chalk.red("  Docker is not available."));
@@ -248,31 +254,57 @@ export function registerMemoryCommand(program: Command): void {
         return;
       }
 
-      // Default: start the container
+      // Default: start the container (or, with --recreate, pull the
+      // latest image and recreate it — used by `switchroom update`).
       if (!isDockerAvailable()) {
         console.log(chalk.red("\n  Docker is not available."));
         console.log(chalk.gray("  Install Docker: https://docs.docker.com/get-docker/\n"));
         process.exit(1);
       }
 
-      if (isHindsightRunning()) {
+      const recreate = opts.recreate === true;
+
+      // --recreate rebinds the SAME host ports the running container
+      // currently publishes, so memory.config.url never changes under the
+      // fleet. Read them before we stop the container. (null → fall back
+      // to pickHindsightPorts, e.g. when nothing is running yet.)
+      const reusePorts = recreate ? getRunningHindsightPorts() : null;
+
+      // A plain `setup` on a running container is a no-op; --recreate
+      // proceeds (pull + recreate) even when it's up.
+      if (isHindsightRunning() && !recreate) {
         console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;
       }
 
+      if (recreate) {
+        console.log(chalk.gray("  Pulling latest Hindsight image..."));
+        try {
+          pullHindsightImage();
+        } catch (err) {
+          console.error(chalk.red(`\n  Failed to pull Hindsight image: ${(err as Error).message}\n`));
+          process.exit(1);
+        }
+      }
+
       if (isHindsightContainerExists()) {
-        console.log(chalk.gray("  Removing stopped switchroom-hindsight container..."));
+        console.log(chalk.gray("  Removing existing switchroom-hindsight container..."));
         stopHindsight();
       }
 
-      // Pick host ports — try upstream defaults first, fall back to 18888/19999
-      // if anything is already bound on 8888/9999.
+      // Reuse the prior ports on --recreate; otherwise pick host ports —
+      // upstream defaults first, fall back to 18888/19999 if 8888/9999 are
+      // already bound.
       let ports: { apiPort: number; uiPort: number };
-      try {
-        ports = await pickHindsightPorts();
-      } catch (err) {
-        console.error(chalk.red(`\n  ${(err as Error).message}\n`));
-        process.exit(1);
+      if (reusePorts) {
+        ports = reusePorts;
+      } else {
+        try {
+          ports = await pickHindsightPorts();
+        } catch (err) {
+          console.error(chalk.red(`\n  ${(err as Error).message}\n`));
+          process.exit(1);
+        }
       }
       if (ports.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
         console.log(

@@ -26,7 +26,7 @@ function fakeRunner() {
 }
 
 describe("planUpdate", () => {
-  it("produces 8 steps in default mode (no --rebuild)", () => {
+  it("produces 9 steps in default mode (no --rebuild)", () => {
     const tmp = mkdtempSync(join(tmpdir(), "update-plan-"));
     try {
       const composePath = join(tmp, "docker-compose.yml");
@@ -35,17 +35,44 @@ describe("planUpdate", () => {
         composePath,
         hostControlEnabled: false,
         webServiceManaged: false,
+        memoryBackendHindsight: false,
       });
       expect(steps.map((s) => s.name)).toEqual([
         "pull-images",
         "apply-config",
         "refresh-hostd",
         "refresh-web",
+        "refresh-hindsight",
         "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
         "doctor",
       ]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("refresh-hindsight runs when memory.backend is hindsight, skips otherwise / on --skip-images", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "update-hs-"));
+    try {
+      const composePath = join(tmp, "docker-compose.yml");
+      writeFileSync(composePath, "services: {}\n");
+      const find = (steps: ReturnType<typeof planUpdate>) =>
+        steps.find((s) => s.name === "refresh-hindsight")!;
+      // backend = hindsight → step is active (no skipReason).
+      expect(
+        find(planUpdate({ composePath, memoryBackendHindsight: true })).skipReason,
+      ).toBeUndefined();
+      // backend != hindsight → skipped.
+      expect(
+        find(planUpdate({ composePath, memoryBackendHindsight: false })).skipReason,
+      ).toMatch(/not hindsight/);
+      // --skip-images → skipped even when backend is hindsight.
+      expect(
+        find(planUpdate({ composePath, memoryBackendHindsight: true, skipImages: true }))
+          .skipReason,
+      ).toMatch(/skip-images/);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -152,6 +179,7 @@ describe("planUpdate", () => {
         rebuild: true,
         hostControlEnabled: false,
         webServiceManaged: false,
+        memoryBackendHindsight: false,
       });
       expect(steps.map((s) => s.name)).toEqual([
         "pull-images",
@@ -159,6 +187,7 @@ describe("planUpdate", () => {
         "apply-config",
         "refresh-hostd",
         "refresh-web",
+        "refresh-hindsight",
         "sync-bundled-skills",
         "stamp-restart-marker",
         "recreate-containers",
@@ -824,11 +853,12 @@ describe("runUpdate", () => {
         // switchroom.yaml and the call count would depend on whether
         // the developer running tests has hostd enabled.
         hostControlEnabled: false,
-        // Likewise pin web_service.managed off so the refresh-web step is
-        // skipped — otherwise the host's real switchroom.yaml leaks in and a
-        // dev/operator box with managed: true adds a 7th call (the EACCES
-        // overlay-loader noise + "length 6 got 7" on the live host).
+        // Likewise pin web_service.managed + memory.backend off so the
+        // refresh-web / refresh-hindsight steps are skipped — otherwise the
+        // host's real switchroom.yaml leaks in and a dev/operator box adds
+        // extra calls ("length 6 got 7+" on the live host).
         webServiceManaged: false,
+        memoryBackendHindsight: false,
       });
       expect(code).toBe(0);
       // 6 calls total:
@@ -880,9 +910,11 @@ describe("runUpdate", () => {
         agentNamesFn: () => ["a"],
         syncBundledSkillsFn: () => { /* intentional no-op */ },
         hostControlEnabled: true,
-        // Pin web_service.managed off so the refresh-web step doesn't leak in
-        // from the host's real switchroom.yaml (would make this 7 calls).
+        // Pin web_service.managed + memory.backend off so the refresh-web /
+        // refresh-hindsight steps don't leak in from the host's real
+        // switchroom.yaml (would make this 7+ calls).
         webServiceManaged: false,
+        memoryBackendHindsight: false,
       });
       expect(code).toBe(0);
       // 6 calls total:
