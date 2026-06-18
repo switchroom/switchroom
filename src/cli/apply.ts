@@ -690,7 +690,11 @@ export async function runApply(
       const { getViaBrokerStructured } = await import("../vault/broker/client.js");
       const result = await getViaBrokerStructured(key);
       if (result.kind === "ok") {
-        return { kind: "ok", allow: result.entry.scope?.allow ?? [] };
+        return {
+          kind: "ok",
+          allow: result.entry.scope?.allow ?? [],
+          deny: result.entry.scope?.deny ?? [],
+        };
       }
       if (result.kind === "not_found") return { kind: "not_found" };
       return { kind: "unreachable", msg: result.msg };

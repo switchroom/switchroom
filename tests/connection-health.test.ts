@@ -11,9 +11,14 @@ import type { SwitchroomConfig } from "../src/config/schema.js";
 function cfg(partial: Record<string, unknown>): SwitchroomConfig {
   return partial as unknown as SwitchroomConfig;
 }
-function reader(map: Record<string, VaultAclResult>) {
-  return async (key: string): Promise<VaultAclResult> =>
-    map[key] ?? { kind: "not_found" };
+// Accepts ok entries as {allow, deny?} and fills deny:[] so fixtures stay terse.
+type OkEntry = { kind: "ok"; allow: string[]; deny?: string[] };
+type ReaderEntry = OkEntry | { kind: "unreachable"; msg: string } | { kind: "not_found" };
+function reader(map: Record<string, ReaderEntry>) {
+  return async (key: string): Promise<VaultAclResult> => {
+    const e = map[key] ?? { kind: "not_found" as const };
+    return e.kind === "ok" ? { kind: "ok", allow: e.allow, deny: e.deny ?? [] } : e;
+  };
 }
 
 const marko = cfg({
@@ -39,14 +44,33 @@ describe("computeAgentConnectionIssues", () => {
     expect(issues[0].fix).toContain("switchroom vault set meta/token --allow marko");
   });
 
-  it("flags ACL drift as an 'acl' issue and re-states the full allowlist", async () => {
+  it("does NOT flag a present key with an EMPTY scope.allow (v0.15.38 false-positive fix)", async () => {
+    // The real fleet case: keys have no scope (allow=[] deny=[]). checkEntryScope
+    // imposes no restriction on empty allow, so the agent is authed.
     const issues = await computeAgentConnectionIssues(marko, "marko", reader({
-      "meta/token": { kind: "ok", allow: ["someoneelse"] },
+      "meta/token": { kind: "ok", allow: [], deny: [] },
+      "postiz/key": { kind: "ok", allow: [], deny: [] },
+    }));
+    expect(issues).toEqual([]);
+  });
+
+  it("flags an 'acl' issue when scope.allow is NON-empty and the agent is absent (real denial)", async () => {
+    const issues = await computeAgentConnectionIssues(marko, "marko", reader({
+      "meta/token": { kind: "ok", allow: ["someoneelse"] }, // non-empty, marko absent → broker denies
       "postiz/key": { kind: "ok", allow: ["marko"] },
     }));
     expect(issues).toHaveLength(1);
     expect(issues[0]).toMatchObject({ server: "meta", kind: "acl" });
     expect(issues[0].fix).toContain("--allow marko,someoneelse");
+  });
+
+  it("flags an 'acl' issue when the agent is in scope.deny (deny wins)", async () => {
+    const issues = await computeAgentConnectionIssues(marko, "marko", reader({
+      "meta/token": { kind: "ok", allow: [], deny: ["marko"] }, // empty allow but explicit deny
+      "postiz/key": { kind: "ok", allow: ["marko"] },
+    }));
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({ server: "meta", kind: "acl" });
   });
 
   it("returns no issues when everything is authed", async () => {
