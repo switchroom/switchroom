@@ -61,7 +61,7 @@ Other state survives a restart through dedicated channels:
 - **`.wake-audit-pending`** sentinel under `TELEGRAM_STATE_DIR` — dropped on every boot. The agent's first turn runs a three-signal check (owed reply / orphan sub-agents / open todos), surfaces findings, then `rm -f`s the sentinel.
 - **`SWITCHROOM_SESSION_MODE`** env (`continue` / `handoff` / `fresh` / `cold`) — exported for the SessionStart hook so the session-greeting card can render the correct "Session" row.
 
-The `/reset` and `/new` Telegram commands write a `.force-fresh-session` marker that start.sh consumes once to force a cold boot regardless of `resume_mode`.
+The `/new` Telegram command writes a `.force-fresh-session` marker that start.sh consumes once to force a cold boot regardless of `resume_mode`. (`/reset` was removed — it was a pure alias of `/new`.)
 
 ### The gateway
 
@@ -135,7 +135,7 @@ The main agent loop does **not** use `claude -p`. Agents run interactive — by 
 
 **Three-tier Telegram command model** — every per-agent gateway routes inbound slash commands through three tiers:
 
-1. **Self-management commands** — `/auth`, `/restart` (self), `/interrupt`, `/new`, `/reset`, `/version`, `/help`, `/approve`, `/deny`, `/pending`. Handled by the gateway locally on **every** agent, regardless of admin status. Claude is never invoked. These work even when Claude is rate-limited, the OAuth token is expired, or the model is unreachable.
+1. **Self-management commands** — `/auth`, `/restart` (self), `/interrupt`, `/new`, `/compact`, `/clear`, `/version`, `/help`, `/approve`, `/deny`, `/pending`. Handled by the gateway locally on **every** agent, regardless of admin status. Claude is never invoked. These work even when Claude is rate-limited, the OAuth token is expired, or the model is unreachable. (`/compact` and `/clear` inject into the live session and are open to any chat member.)
 2. **Fleet-management commands** — `/agents`, `/restart <other>`, `/stop`, `/agentstart`, `/update`, `/logs`, `/reconcile`, `/grant`, `/dangerous`, `/permissions`, `/vault`, `/memory`, `/topics`. Intercepted by the gateway and routed to the `switchroom` CLI **only when the agent has `admin: true`** in `switchroom.yaml`. Other agents reject with an "admin required" reply; Claude never sees the command.
 3. **Conversational fall-through** — everything else (plain text, non-slash messages, slash commands the gateway doesn't recognise) is forwarded to Claude as a normal inbound turn.
 

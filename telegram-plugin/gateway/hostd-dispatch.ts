@@ -1,7 +1,7 @@
 /**
  * Hostd dispatch helpers for the gateway's self-restart slash-commands
  * (#1175 RFC C, Phase 2). When the operator has opted into
- * `host_control.enabled: true`, /restart, /new, /reset, and
+ * `host_control.enabled: true`, /restart, /new, and
  * /update apply route through the per-agent hostd UDS instead of the
  * in-container `spawnSwitchroomDetached` shellout.
  *

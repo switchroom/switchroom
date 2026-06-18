@@ -12,7 +12,6 @@ import {
   switchroomHelpCommandNames,
   restartAckText,
   newSessionAckText,
-  resetSessionAckText,
   TELEGRAM_BASE_COMMANDS,
   TELEGRAM_SWITCHROOM_COMMANDS,
   TELEGRAM_MENU_COMMANDS,
@@ -137,7 +136,8 @@ describe("helpText", () => {
     expect(out).toContain("/deny");
     expect(out).toContain("/pending");
     expect(out).toContain("/new");
-    expect(out).toContain("/reset");
+    expect(out).toContain("/compact");
+    expect(out).toContain("/clear");
   });
   it("points at the richer /commands", () => {
     expect(helpText("assistant")).toContain("/commands");
@@ -347,9 +347,11 @@ describe("switchroomHelpText + switchroomHelpCommandNames", () => {
     expect(out).toContain("<b>Auth &amp; config</b>");
   });
   it("the name array contains the Sprint 2/3 additions", () => {
-    for (const needed of ["new", "reset", "approve", "deny", "pending"]) {
+    for (const needed of ["new", "compact", "clear", "approve", "deny", "pending"]) {
       expect(switchroomHelpCommandNames).toContain(needed);
     }
+    // /reset was removed (it was a pure alias of /new).
+    expect(switchroomHelpCommandNames).not.toContain("reset");
   });
 });
 
@@ -370,9 +372,11 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
   it("menu includes the session-control commands (the most-used trio)", () => {
     const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
     // These MUST be in the menu — they're the primary mobile UX flows
-    for (const must of ["new", "reset", "approve", "deny", "pending", "restart", "logs", "commands"]) {
+    for (const must of ["new", "compact", "clear", "approve", "deny", "pending", "restart", "logs", "commands"]) {
       expect(names, `missing /${must} from Telegram menu`).toContain(must);
     }
+    // /reset removed (alias of /new).
+    expect(names, "/reset should be gone from the menu").not.toContain("reset");
   });
 
   it("menu drops the ops primitives that cluttered the old catalogue", () => {
@@ -451,7 +455,7 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
   });
 });
 
-describe("restart / new / reset ack text", () => {
+describe("restart / new ack text", () => {
   it("restartAckText is consistent", () => {
     expect(restartAckText("assistant")).toBe("🔄 Restarting <b>assistant</b>…");
   });
@@ -463,13 +467,8 @@ describe("restart / new / reset ack text", () => {
     expect(newSessionAckText("assistant", false))
       .toBe("🆕 Started fresh session for <b>assistant</b> · restarting…");
   });
-  it("resetSessionAckText with flush", () => {
-    expect(resetSessionAckText("assistant", true))
-      .toBe("🔄 Reset session for <b>assistant</b> · flushed handoff · restarting…");
-  });
-  it("HTML-escapes agent name in all three", () => {
+  it("HTML-escapes agent name in both", () => {
     expect(restartAckText("<x>")).toContain("&lt;x&gt;");
     expect(newSessionAckText("<x>", true)).toContain("&lt;x&gt;");
-    expect(resetSessionAckText("<x>", true)).toContain("&lt;x&gt;");
   });
 });

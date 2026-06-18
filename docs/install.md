@@ -162,7 +162,7 @@ agent's gateway will handle fleet-management commands locally
 without invoking Claude — Claude only sees conversational messages.
 
 Per-agent commands like `/auth list`, `/auth reauth`, `/interrupt`,
-`/restart` (self), `/new`, and `/reset` work on **every** agent's
+`/restart` (self), `/new`, `/compact`, and `/clear` work on **every** agent's
 gateway regardless of `admin: true` — they're independent of the
 LLM's health, so they keep working even when Claude is rate-limited
 or the OAuth token is expired.

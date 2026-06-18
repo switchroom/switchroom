@@ -48,6 +48,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `reaction_dispatch.emojis` | replace | Emoji allowlist that triggers a dispatch. Only additions/changes matching the list fire; removals never do. **Replace semantics** — narrow per-agent or set `[]` to disable. Default `[]` (nothing fires). |
 | `session.max_idle` | override | Fresh session after idle period (`2h`, `30m`) |
 | `session.max_turns` | override | Fresh session after N user turns |
+| `session.idle_clear_after` | override | Auto-run `/clear` (wipe working context) after this much idle. Default `3h` (on by default); `0s` disables. Long-term memory stays in Hindsight. |
 | `channels.telegram.plugin` | override | `switchroom` (default, enhanced) or `official` |
 | `channels.telegram.format` | override | Reply format (`html`, `markdownv2`, `text`) |
 | `channels.telegram.rate_limit_ms` | override | Min delay between outgoing messages |
