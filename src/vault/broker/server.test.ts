@@ -871,3 +871,72 @@ describe("VaultBroker server: audit log emission (denied identity)", () => {
     expect(JSON.stringify(row)).not.toContain("bar-value");
   });
 });
+
+// ── reload (SIGHUP hot-reload) ───────────────────────────────────────────────
+// Regression: the vault-broker used to cache switchroom.yaml at boot with no
+// reload path, so secret-ACL / agent-admin / approval-posture edits silently
+// no-op'd until a `docker restart`. reload(config) swaps the live config the
+// authorization decisions read — and MUST NOT disturb the decrypted vault
+// (the load-bearing safety property: unlock state lives in separate fields).
+describe("VaultBroker.reload (SIGHUP hot-reload)", () => {
+  let broker: VaultBroker;
+  let socketPath: string;
+  let tmpDir: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-reload-"));
+    socketPath = path.join(tmpDir, "test.sock");
+  });
+
+  afterEach(() => {
+    if (broker) broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  it("swaps the live config WITHOUT disturbing the decrypted vault", async () => {
+    const cfgA = { ...makeMinimalConfig(), agents: { a1: { admin: false } } } as any;
+    broker = new VaultBroker({ _testSecrets: cloneSecrets(), _testConfig: cfgA });
+    await broker.start(socketPath, undefined, undefined);
+
+    // Boot state: unlocked, config A (a1 not admin).
+    expect(broker._getConfigRef()?.agents?.a1?.admin).toBe(false);
+    const secretsBefore = broker._getSecretsRef();
+    expect(secretsBefore).not.toBeNull();
+
+    // Hot-reload to a config where a1 IS admin.
+    const cfgB = { ...makeMinimalConfig(), agents: { a1: { admin: true } } } as any;
+    broker.reload(cfgB);
+
+    // Config swapped — the gate now sees a1 as admin...
+    expect(broker._getConfigRef()?.agents?.a1?.admin).toBe(true);
+    // ...and the decrypted vault is the SAME object, untouched. reload must
+    // never re-unlock, re-run auto-unlock, or drop secrets.
+    expect(broker._getSecretsRef()).toBe(secretsBefore);
+    expect(broker._getSecretsRef()).not.toBeNull();
+  });
+
+  it("status RPC still reports unlocked + full keyCount after reload", async () => {
+    broker = new VaultBroker({
+      _testSecrets: cloneSecrets(),
+      _testConfig: makeMinimalConfig(),
+    });
+    await broker.start(socketPath, undefined, undefined);
+
+    broker.reload({ ...makeMinimalConfig(), agents: { x: { admin: true } } } as any);
+
+    const resp = await rpc(socketPath, { v: 1, op: "status" });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "status" in resp) {
+      expect(resp.status.unlocked).toBe(true);
+      expect(resp.status.keyCount).toBe(Object.keys(TEST_SECRETS).length);
+    }
+  });
+});

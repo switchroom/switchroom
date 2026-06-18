@@ -28,6 +28,14 @@ import readline from "node:readline";
 // ENOENT. Text imports are bundled into the binary at compile time.
 import switchroomExample from "../../examples/switchroom.yaml" with { type: "text" };
 import minimalExample from "../../examples/minimal.yaml" with { type: "text" };
+import {
+  reloadAuthBroker,
+  reloadVaultBroker,
+  brokerReloadHint,
+  AUTH_BROKER_CONTAINER,
+  VAULT_BROKER_CONTAINER,
+  type BrokerReloadResult,
+} from "./broker-reload.js";
 
 /** Embedded example configs, keyed by name. Mirrors files under examples/. */
 const EMBEDDED_EXAMPLES: Record<string, string> = {
@@ -1517,6 +1525,32 @@ export function registerApplyCommand(program: Command): void {
               ),
             );
             process.exit(1);
+          }
+
+          // Hot-reload the running brokers so config edits take effect without
+          // a container restart: the auth-broker for Microsoft/Google account
+          // ACLs, the vault-broker for secret-ACLs / agent-`admin` / approval
+          // posture. apply is the chokepoint every config edit flows through,
+          // so this is the durable catch-all (the targeted `auth microsoft
+          // enable/disable` verbs also self-trigger). Best-effort + idempotent:
+          // a SIGHUP only swaps the broker's in-memory config — it does NOT
+          // manage container lifecycle (bringing the fleet up still defers to
+          // `docker compose up`, by design). Silent when a broker isn't running
+          // (fresh setup) or docker is unreachable (in-container apply); only a
+          // genuine docker error is surfaced.
+          const brokerReloads: Array<[string, BrokerReloadResult]> = [
+            [AUTH_BROKER_CONTAINER, reloadAuthBroker()],
+            [VAULT_BROKER_CONTAINER, reloadVaultBroker()],
+          ];
+          for (const [name, reload] of brokerReloads) {
+            if (reload.ok) {
+              process.stdout.write(
+                chalk.gray(`  ↻ ${name} hot-reloaded (config now live)\n`),
+              );
+            } else if (reload.reason === "error") {
+              const hint = brokerReloadHint(reload, name);
+              if (hint) process.stderr.write(chalk.yellow(`  ⚠ ${hint}\n`));
+            }
           }
 
           // Post-apply doctor sweep (#929). Surfaces the stale-start.sh

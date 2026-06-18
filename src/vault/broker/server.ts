@@ -384,6 +384,32 @@ export class VaultBroker {
   }
 
   /**
+   * SIGHUP hot-reload — swap the cached `switchroom.yaml` so secret-ACL,
+   * agent-`admin`, and approval-posture edits take effect WITHOUT a
+   * container restart.
+   *
+   * Safe by construction: every authorization decision reads `this.config`
+   * live (`checkAclByAgent` / `checkAcl`, the admin/root gate,
+   * `vault.broker.{approvalAuth, postureMintAgents, adminOnlyKeys}`), so
+   * swapping the one field is sufficient — there are no config-derived
+   * caches to recompute. The decrypted vault lives in SEPARATE fields
+   * (`this.secrets` / `this.passphrase`) and is deliberately left
+   * untouched: a reload never re-unlocks, re-runs auto-unlock, or
+   * re-resolves `this.vaultPath`. Consequently `vault.path` and the
+   * auto-unlock settings are restart-only (mirrors the auth-broker's
+   * provider-registration reload caveat). Per-agent socket listeners are
+   * likewise NOT reconciled here — a new agent needs new compose
+   * bind-mounts that only `apply` + `docker compose up` create.
+   *
+   * Caller (the SIGHUP handler) validates the config via `loadConfig`
+   * first and keeps the old config on any parse failure, so a half-written
+   * file never lands here.
+   */
+  reload(config: SwitchroomConfig): void {
+    this.config = config;
+  }
+
+  /**
    * Best-effort readiness sentinel for the docker healthcheck (RFC J
    * Phase 4). On unlock we touch SWITCHROOM_VAULT_BROKER_READY_PATH;
    * on lock we remove it. The compose healthcheck tests this file so
@@ -486,6 +512,15 @@ export class VaultBroker {
    */
   _getSecretsRef(): Record<string, VaultEntry> | null {
     return this.secrets;
+  }
+
+  /**
+   * Test-only: return direct reference to the cached config. Used by the
+   * reload() test to verify a SIGHUP hot-reload swaps the live config that
+   * every authorization decision reads.
+   */
+  _getConfigRef(): SwitchroomConfig | null {
+    return this.config;
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
@@ -3135,6 +3170,26 @@ export async function main(): Promise<void> {
 
   const broker = new VaultBroker();
   registerShutdownHandlers(broker);
+
+  // SIGHUP — hot-reload switchroom.yaml so secret-ACL / agent-admin /
+  // approval-posture edits take effect without a container restart. Mirrors
+  // the auth-broker (src/auth/broker/index.ts): re-read config from disk and
+  // hand it to reload(). Both the synchronous loadConfig() throw and any
+  // reload failure are caught + logged, so a half-written or invalid config
+  // never crashes the broker — it keeps serving the last-good config.
+  process.on("SIGHUP", () => {
+    void (async () => {
+      try {
+        const { loadConfig } = await import("../../config/loader.js");
+        broker.reload(loadConfig(configPath));
+        process.stdout.write("vault-broker: SIGHUP reload — config refreshed\n");
+      } catch (err) {
+        process.stderr.write(
+          `vault-broker: SIGHUP reload failed (keeping previous config): ${(err as Error).message}\n`,
+        );
+      }
+    })();
+  });
 
   if (perAgentTargets.length > 0) {
     // Phase 2a path. We still need start() to load config, vault path,
