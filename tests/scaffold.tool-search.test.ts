@@ -31,16 +31,16 @@ afterEach(() => {
 });
 
 describe("buildToolSearchEnvVars — default, override, kill switch", () => {
-  it("defaults to ENABLE_TOOL_SEARCH=auto (self-gating, transparent on small tool sets)", () => {
+  it("defaults to ENABLE_TOOL_SEARCH=true (force-defer; auto never fires on the 1M window)", () => {
     delete process.env.SWITCHROOM_DISABLE_TOOL_SEARCH;
     delete process.env.SWITCHROOM_TOOL_SEARCH_MODE;
-    expect(buildToolSearchEnvVars()).toEqual({ ENABLE_TOOL_SEARCH: "auto" });
+    expect(buildToolSearchEnvVars()).toEqual({ ENABLE_TOOL_SEARCH: "true" });
   });
 
-  it("SWITCHROOM_TOOL_SEARCH_MODE overrides the value (true / auto:N)", () => {
+  it("SWITCHROOM_TOOL_SEARCH_MODE overrides the value (auto / auto:N)", () => {
     delete process.env.SWITCHROOM_DISABLE_TOOL_SEARCH;
-    process.env.SWITCHROOM_TOOL_SEARCH_MODE = "true";
-    expect(buildToolSearchEnvVars()).toEqual({ ENABLE_TOOL_SEARCH: "true" });
+    process.env.SWITCHROOM_TOOL_SEARCH_MODE = "auto";
+    expect(buildToolSearchEnvVars()).toEqual({ ENABLE_TOOL_SEARCH: "auto" });
     process.env.SWITCHROOM_TOOL_SEARCH_MODE = "auto:20";
     expect(buildToolSearchEnvVars()).toEqual({ ENABLE_TOOL_SEARCH: "auto:20" });
   });

@@ -1666,20 +1666,29 @@ function buildHumanizerEnvVars(
  * `alwaysLoad: true` in .mcp.json so reply/get_recent_messages/recall never
  * defer (no per-turn ToolSearch round-trip).
  *
- * Default value `auto` (self-gating: claude only defers once the tool surface
- * exceeds ~10% of the window, which every agent's does — a small-surface agent
- * is left untouched). Override per fleet via SWITCHROOM_TOOL_SEARCH_MODE
- * (e.g. `true` to force always-defer, `auto:N` for an N% threshold). Kill
- * switch SWITCHROOM_DISABLE_TOOL_SEARCH=1 omits the var entirely → claude
- * loads all tools (today's behaviour). A per-agent `env: {ENABLE_TOOL_SEARCH}`
- * in switchroom.yaml still wins (spread after this in the env builder).
+ * Default value `true` (force-defer). `auto` was the prior default but it
+ * NEVER fires on this fleet: `auto`'s char threshold scales with the model
+ * window, and on the 1M-Opus window the whole ~50-80k MCP tool surface fits
+ * under it, so claude loads everything upfront (measured 2026-06-18: clerk
+ * baseline 79,056 tok under `auto`, unchanged even by the per-tool diet).
+ * `true` forces deferral of every tool NOT pinned via
+ * `_meta["anthropic/alwaysLoad"]` — switchroom pins the load-bearing hot path
+ * (reply / stream_reply / etc. in the telegram bridge; hindsight + agent-config
+ * server-wide), so the reply path stays loaded while the heavy business-MCP +
+ * cold-tool surface defers. Canary (test-harness, 2026-06-18): baseline
+ * 79,056 → 47,064 tok (~40%) with the reply UAT still passing.
+ *
+ * Override per fleet via SWITCHROOM_TOOL_SEARCH_MODE (e.g. `auto` / `auto:N`).
+ * Kill switch SWITCHROOM_DISABLE_TOOL_SEARCH=1 omits the var entirely → claude
+ * loads all tools. A per-agent `env: {ENABLE_TOOL_SEARCH}` in switchroom.yaml
+ * still wins (spread after this in the env builder).
  *
  * Consumed by claude (inner start.sh pass), not the gateway, so the
  * env-before-gateway-fork landmine does not constrain placement.
  */
 export function buildToolSearchEnvVars(): Record<string, string> {
   if (process.env.SWITCHROOM_DISABLE_TOOL_SEARCH === "1") return {};
-  return { ENABLE_TOOL_SEARCH: process.env.SWITCHROOM_TOOL_SEARCH_MODE ?? "auto" };
+  return { ENABLE_TOOL_SEARCH: process.env.SWITCHROOM_TOOL_SEARCH_MODE ?? "true" };
 }
 
 /**
