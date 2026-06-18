@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.15.40 — tool-search ON by default (~40% smaller working context)
+
+- **`ENABLE_TOOL_SEARCH` now defaults to `true` (force-defer), not `auto` (#2421).**
+  `auto`'s threshold scales with the model window; on the 1M-Opus window the
+  whole ~50-80k MCP tool surface fits under it, so `auto` loaded everything
+  upfront — it never deferred (measured: clerk fresh-boot baseline 79,056 tok
+  under `auto`, unchanged even after the per-tool diet). `true` defers every
+  tool NOT pinned via `_meta["anthropic/alwaysLoad"]`; switchroom pins the
+  load-bearing hot path (reply / stream_reply / get_recent_messages / react in
+  the telegram bridge; hindsight + agent-config server-wide), so the reply path
+  stays loaded while the heavy business-MCP + cold-tool surface defers and loads
+  on first use. **Canary: fresh-boot baseline 79,056 → 47,064 tok (~40%)** with
+  the reply UAT still passing. Trade-off: a deferred tool pays a one-time
+  ToolSearch round-trip on first use per session (once-per-tool) for ~32k of
+  per-turn context savings. Revert with `SWITCHROOM_TOOL_SEARCH_MODE=auto`;
+  full opt-out `SWITCHROOM_DISABLE_TOOL_SEARCH=1`.
+
 ## v0.15.39 — fix: connection-health false positives (empty scope.allow)
 
 - **Connection-health no longer false-flags working MCPs (#2417).** v0.15.38's
