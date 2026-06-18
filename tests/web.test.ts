@@ -102,6 +102,7 @@ import {
   handleGetGoogleAccounts,
   handleGetMicrosoftAccounts,
   handleGetNotionWorkspace,
+  handleGetLinearAgents,
   handleGetSchedule,
   handleGetAccounts,
   handleUseAccount,
@@ -947,6 +948,97 @@ describe("handleGetNotionWorkspace", () => {
       "databases",
       "fullAccessAgents",
       "vaultKey",
+    ]);
+  });
+});
+
+describe("handleGetLinearAgents", () => {
+  // linear_agent lives under channels.telegram and is cascade-resolved, so the
+  // test configs set it directly on the agent (no profile needed).
+  const withLinear = (
+    agents: Record<string, unknown>,
+  ): SwitchroomConfig =>
+    ({ ...mockConfig, agents } as unknown as SwitchroomConfig);
+
+  it("reports not-configured when no agent has linear_agent enabled", () => {
+    const out = handleGetLinearAgents(
+      withLinear({ alpha: {}, beta: { channels: { telegram: {} } } }),
+    );
+    expect(out.configured).toBe(false);
+    expect(out.agents).toEqual([]);
+  });
+
+  it("lists only agents with linear_agent.enabled, sorted, with workspace/team", () => {
+    const out = handleGetLinearAgents(
+      withLinear({
+        ziggy: {
+          channels: {
+            telegram: {
+              linear_agent: {
+                enabled: true,
+                token: "vault:linear/ziggy/token",
+                workspace_id: "ws-zzz",
+                default_team_id: "team-zzz",
+              },
+            },
+          },
+        },
+        carrie: {
+          channels: {
+            telegram: {
+              linear_agent: { enabled: true, token: "vault:linear/carrie/token" },
+            },
+          },
+        },
+        // enabled:false → excluded
+        finn: {
+          channels: {
+            telegram: {
+              linear_agent: { enabled: false, token: "vault:linear/finn/token" },
+            },
+          },
+        },
+        // no linear_agent → excluded
+        klanker: {},
+      }),
+    );
+    expect(out.configured).toBe(true);
+    expect(out.agents.map((a) => a.agent)).toEqual(["carrie", "ziggy"]);
+    const ziggy = out.agents.find((a) => a.agent === "ziggy")!;
+    expect(ziggy.workspaceId).toBe("ws-zzz");
+    expect(ziggy.defaultTeamId).toBe("team-zzz");
+    expect(ziggy.tokenVaultKey).toBe("vault:linear/ziggy/token");
+    const carrie = out.agents.find((a) => a.agent === "carrie")!;
+    expect(carrie.workspaceId).toBeNull();
+    expect(carrie.defaultTeamId).toBeNull();
+  });
+
+  it("never leaks a token value — only a vault: reference, and masks an inline literal", () => {
+    const out = handleGetLinearAgents(
+      withLinear({
+        // A schema violation (inline literal, not a vault: ref) must NOT be
+        // surfaced — tokenVaultKey is nulled rather than leaking the secret.
+        rogue: {
+          channels: {
+            telegram: {
+              linear_agent: {
+                enabled: true,
+                token: "lin_" + "api_" + "REALSECRET",
+              },
+            },
+          },
+        },
+      }),
+    );
+    expect(out.agents[0].tokenVaultKey).toBeNull();
+    const serialized = JSON.stringify(out);
+    expect(serialized).not.toContain("REALSECRET");
+    // Only metadata fields exist on each agent entry — no raw token field.
+    expect(Object.keys(out.agents[0]).sort()).toEqual([
+      "agent",
+      "defaultTeamId",
+      "tokenVaultKey",
+      "workspaceId",
     ]);
   });
 });
