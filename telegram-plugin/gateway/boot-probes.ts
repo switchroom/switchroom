@@ -1421,6 +1421,68 @@ function renderBucketedSkills(switchroom: string[], agent: string[]): string {
   return parts.length === 0 ? 'none resolved' : parts.join(' · ')
 }
 
+// ─── Probe: Connections (configured-but-unauthed MCP integrations) ───────────
+
+/**
+ * Surface configured-but-unauthed MCP connections at agent start. The auth
+ * verdict can't be computed in-container (this boot probe must not do
+ * vault/grant work — see the module header), so `switchroom apply` computes
+ * it host-side and drops a snapshot at
+ * `<agentDir>/.claude/connection-health.json` (src/agents/connection-health.ts).
+ * This probe just reads it.
+ *
+ *   ok       — snapshot missing/unparseable (not yet computed → assume
+ *              healthy, don't nag) OR zero issues
+ *   degraded — ≥1 connection configured but not authed; detail names the
+ *              servers, nextStep carries the first fix
+ *
+ * Never `fail`: an unauthed integration degrades that one capability, it
+ * doesn't take the agent down, and the silent-when-healthy boot card
+ * should not red an agent over a missing third-party token.
+ */
+export interface ConnectionIssueShape {
+  server: string
+  key: string
+  kind: string
+  detail: string
+  fix: string
+}
+
+export async function probeConnections(
+  agentDir: string,
+  opts: { readFileImpl?: (path: string) => string } = {},
+): Promise<ProbeResult> {
+  return withTimeout('Connections', (async (): Promise<ProbeResult> => {
+    const path = join(agentDir, '.claude', 'connection-health.json')
+    const read = opts.readFileImpl ?? ((p: string) => readFileSync(p, 'utf8'))
+    let issues: ConnectionIssueShape[] = []
+    try {
+      const parsed = JSON.parse(read(path)) as { issues?: ConnectionIssueShape[] }
+      issues = Array.isArray(parsed.issues) ? parsed.issues : []
+    } catch {
+      // ENOENT (never applied with this build) or malformed — assume healthy.
+      return { status: 'ok', label: 'Connections', detail: 'no issues' }
+    }
+    if (issues.length === 0) {
+      return { status: 'ok', label: 'Connections', detail: 'all authed' }
+    }
+    const servers = [...new Set(issues.map((i) => i.server))]
+    const named = servers.slice(0, 4).join(', ')
+    const more = servers.length > 4 ? ` +${servers.length - 4} more` : ''
+    const first = issues[0]
+    const extra =
+      issues.length > 1
+        ? ` (+${issues.length - 1} more — run \`switchroom doctor\`)`
+        : ''
+    return {
+      status: 'degraded',
+      label: 'Connections',
+      detail: `${servers.length} integration(s) configured but not authed: ${named}${more}`,
+      nextStep: `${first.fix}${extra}`,
+    }
+  })())
+}
+
 export interface SkillsFsImpl {
   readdir: (p: string) => string[]
   exists: (p: string) => boolean

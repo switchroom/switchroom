@@ -74,4 +74,27 @@ describe('permission card routing', () => {
     const body = GATEWAY_SRC.slice(start, start + 1400)
     expect(body).toContain('resolvePermissionCardTargets()')
   })
+
+  // marko Rentals-budget incident (2026-06-17): a turn force-closed by the
+  // orphaned-reply backstop nulled currentTurn, so a permission gate that
+  // fired afterwards fell through to the operator-DM fan-out instead of the
+  // forum topic. The helper must first try to recover the origin from the
+  // recently-started turn registry.
+  it('resolvePermissionCardTargets recovers origin from recent turns when currentTurn is null', () => {
+    const start = GATEWAY_SRC.indexOf('function resolvePermissionCardTargets(')
+    expect(start).toBeGreaterThan(-1)
+    const end = GATEWAY_SRC.indexOf('\n}', start)
+    const body = GATEWAY_SRC.slice(start, end)
+    // Recovery is attempted via the pure helper over the turn registry...
+    expect(body).toContain('pickRecoveredPermissionOrigin')
+    expect(body).toContain('recentTurnsById')
+    // ...before the operator-DM fan-out (recovery branch precedes allowFrom).
+    expect(body.indexOf('pickRecoveredPermissionOrigin')).toBeLessThan(
+      body.indexOf('allowFrom'),
+    )
+  })
+
+  it('the origin-recovery path has a kill switch', () => {
+    expect(GATEWAY_SRC).toContain('SWITCHROOM_PERMISSION_CARD_ORIGIN_RECOVERY')
+  })
 })
