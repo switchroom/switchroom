@@ -98,12 +98,25 @@ describe("planMicrosoftDisable", () => {
   });
 
   it("does NOT clear a selector pinned to a DIFFERENT account", () => {
-    // Enable ziggy (already pins ACCT) then disable a different account from it.
+    // lawgpt is enabled_for ACCT (via the ACL) but its selector points at
+    // someone-else@outlook.com (enable reported it as a conflict, left it).
+    // Disabling ACCT from lawgpt drops the ACL but MUST leave the unrelated
+    // selector intact — only a selector matching the disabled account is cleared.
+    const enabled = planMicrosoftEnable(FIXTURE, ACCT, ["lawgpt"]).text;
+    expect(getAgentWorkspaceAccount(enabled, "microsoft", "lawgpt")).toBe(
+      "someone-else@outlook.com",
+    );
+    const { text, removed, selectorCleared } = planMicrosoftDisable(enabled, ACCT, ["lawgpt"]);
+    expect(removed).toEqual(["lawgpt"]);
+    expect(selectorCleared).toEqual([]); // the negative the guard protects
+    expect(getAgentWorkspaceAccount(text, "microsoft", "lawgpt")).toBe(
+      "someone-else@outlook.com",
+    );
+  });
+
+  it("DOES clear a selector that matched the disabled account", () => {
     const enabled = planMicrosoftEnable(FIXTURE, ACCT, ["ziggy"]).text;
-    const { selectorCleared, removed } = planMicrosoftDisable(enabled, ACCT, ["ziggy"]);
-    expect(removed).toEqual(["ziggy"]);
-    // ziggy's selector pointed at ACCT, so it IS cleared here — sanity that the
-    // guard is by account-match, not blind.
+    const { selectorCleared } = planMicrosoftDisable(enabled, ACCT, ["ziggy"]);
     expect(selectorCleared).toEqual(["ziggy"]);
   });
 });
