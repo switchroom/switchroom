@@ -5,9 +5,12 @@
  * schemas so the ~31k-token integration-server surface stops occupying the
  * window every turn. Two halves must stay wired:
  *   1. the ENABLE_TOOL_SEARCH env var (default `auto`, kill-switchable);
- *   2. `alwaysLoad: true` pinned on the LOAD-BEARING framework servers
- *      (switchroom-telegram, hindsight, agent-config) so reply /
- *      get_recent_messages / recall never defer (the orphaned-reply hazard).
+ *   2. The LOAD-BEARING tools never defer (the orphaned-reply hazard).
+ *      - hindsight + agent-config: pinned server-wide via `alwaysLoad: true`.
+ *      - switchroom-telegram (P4): NO LONGER pinned server-wide
+ *        (`alwaysLoad: false`); the bridge pins only the hot tools (reply /
+ *        stream_reply / get_recent_messages / react / …) per-tool via
+ *        `_meta["anthropic/alwaysLoad"]`, so the ~14 cold tools defer.
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
@@ -60,16 +63,43 @@ describe("tool-search wiring (source guards)", () => {
     }
   });
 
-  it("the LOAD-BEARING framework servers carry alwaysLoad:true", () => {
-    // Each server-entry literal closes its env block first, so look in a
-    // window large enough to span past it to the entry's own alwaysLoad.
-    const telegram = scaffoldSrc.split('"switchroom-telegram": {')[1]?.slice(0, 600) ?? "";
-    expect(telegram).toMatch(/alwaysLoad: true/);
+  it("agent-config + hindsight stay pinned server-wide (alwaysLoad:true)", () => {
     const agentConfig = scaffoldSrc.split('"agent-config": {')[1]?.slice(0, 500) ?? "";
     expect(agentConfig).toMatch(/alwaysLoad: true/);
     // hindsight pinned in scaffold-integration.ts.
     const integ = readFileSync(resolve(__dirname, "..", "src", "memory", "scaffold-integration.ts"), "utf-8");
     expect(integ).toMatch(/key: "hindsight", value: \{ \.\.\.mcpConfig, alwaysLoad: true \}/);
+  });
+
+  it("switchroom-telegram is NO LONGER pinned server-wide (P4-B: alwaysLoad:false)", () => {
+    // Both writer sites must agree (byte-for-byte invariant, #1892).
+    const blocks = scaffoldSrc.split('"switchroom-telegram": {').slice(1);
+    expect(blocks.length).toBe(2);
+    for (const b of blocks) {
+      // The FIRST alwaysLoad after the telegram marker is the telegram
+      // entry's own (agent-config's comes later) — must be false now.
+      const m = b.match(/alwaysLoad: (true|false)/);
+      expect(m?.[1]).toBe("false");
+    }
+  });
+
+  it("the bridge pins the hot tools per-tool via _meta anthropic/alwaysLoad", () => {
+    // P4-B: deferral safety now lives in the bridge's tool-filter, not the
+    // server flag. The reply path MUST be in the always-load set.
+    const filterSrc = readFileSync(
+      resolve(__dirname, "..", "telegram-plugin", "bridge", "tool-filter.ts"),
+      "utf-8",
+    );
+    expect(filterSrc).toMatch(/ALWAYS_LOAD_TOOLS/);
+    expect(filterSrc).toMatch(/anthropic\/alwaysLoad/);
+    expect(filterSrc).toMatch(/'reply'/);
+    expect(filterSrc).toMatch(/'stream_reply'/);
+    // and the bridge actually applies it to the tools/list response.
+    const bridgeSrc = readFileSync(
+      resolve(__dirname, "..", "telegram-plugin", "bridge", "bridge.ts"),
+      "utf-8",
+    );
+    expect(bridgeSrc).toMatch(/buildEffectiveToolSchemas\(TOOL_SCHEMAS/);
   });
 
   it("McpServerConfig carries the optional alwaysLoad field", () => {
