@@ -67,6 +67,12 @@ import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
+import {
+  permissionSignature,
+  timeoutDenyMessage,
+  duplicateDenyMessage,
+  isRecentTimeoutDuplicate,
+} from './permission-timeout.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
@@ -3723,6 +3729,28 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
 const PERMISSION_TTL_MS = 10 * 60_000
+// No-repeat-on-timeout (marko Rentals-budget loop, 2026-06-17). When a card
+// auto-denies on TTL, the model is told it was a TIMEOUT (not a denial) so it
+// doesn't retry; if it retries the identical (tool, input) anyway while the
+// operator is still absent, we short-circuit-deny it WITHOUT posting a second
+// card. `permissionTimeoutSignatures` maps signature → last-timeout epoch ms;
+// it is cleared the moment the operator is active again (answers any card, or
+// sends a message), so suppression only ever holds during genuine absence.
+// Kill switch: SWITCHROOM_PERMISSION_NO_REPEAT=0.
+const PERMISSION_NO_REPEAT_ENABLED =
+  process.env.SWITCHROOM_PERMISSION_NO_REPEAT !== '0'
+// Safety cap on how long a timed-out signature suppresses retries even if the
+// operator-activity reset is somehow missed; the reset is the primary bound.
+const PERMISSION_DUPLICATE_WINDOW_MS = 60 * 60_000
+const permissionTimeoutSignatures = new Map<string, number>()
+function clearPermissionTimeoutSuppression(reason: string): void {
+  if (permissionTimeoutSignatures.size === 0) return
+  const n = permissionTimeoutSignatures.size
+  permissionTimeoutSignatures.clear()
+  process.stderr.write(
+    `telegram gateway: permission no-repeat suppression cleared (${n} sig(s)) — ${reason}\n`,
+  )
+}
 // Permission/approval-card origin recovery (marko Rentals-budget, 2026-06-17).
 // When `currentTurn` was force-closed by the orphaned-reply backstop but the
 // claude session kept running into a permission-gated tool, recover the card's
@@ -4340,22 +4368,45 @@ const pendingStateReaper = setInterval(() => {
       // permission (or takes a fallback). Routed through
       // dispatchPermissionVerdict so it's buffered+redelivered too if
       // the bridge is also offline at sweep time.
-      dispatchPermissionVerdict({ type: 'permission', requestId: k, behavior: 'deny' })
+      // Carry a TIMEOUT reason to the model (claude renders it as "…the user
+      // said: …") so it can tell a timeout from a real denial and not retry
+      // the identical call — the duplicate-card loop this series closes.
+      const timeoutMinutes = Math.round(PERMISSION_TTL_MS / 60000)
+      dispatchPermissionVerdict({
+        type: 'permission',
+        requestId: k,
+        behavior: 'deny',
+        message: timeoutDenyMessage(timeoutMinutes),
+      })
       // The auto-deny un-parks the suspended turn — flip 🙏 → working so
       // it doesn't sit on the awaiting glyph (or stall) after the timeout.
       resumeReactionAfterVerdict()
       postPermissionResumeMessage({
         behavior: 'deny',
         action: naturalAction(v.tool_name, v.input_preview),
-        timeoutMinutes: Math.round(PERMISSION_TTL_MS / 60000),
+        timeoutMinutes,
       })
+      // Remember this (tool, input) timed out so an immediate identical retry
+      // (while the operator is still absent) is short-circuited without a
+      // second card. Cleared on operator activity.
+      if (PERMISSION_NO_REPEAT_ENABLED) {
+        permissionTimeoutSignatures.set(
+          permissionSignature(v.tool_name, v.input_preview),
+          now,
+        )
+      }
       process.stderr.write(
         `telegram gateway: permission TTL expired — auto-deny request=${k} ` +
         `tool=${v.tool_name} (no operator response in ` +
-        `${Math.round(PERMISSION_TTL_MS / 60000)}m)\n`,
+        `${timeoutMinutes}m)\n`,
       )
       pendingPermissions.delete(k)
     }
+  }
+  // Drop no-repeat suppression entries past the safety-cap window (the primary
+  // bound is the operator-activity reset; this just keeps the map from growing).
+  for (const [sig, at] of permissionTimeoutSignatures) {
+    if (now - at > PERMISSION_DUPLICATE_WINDOW_MS) permissionTimeoutSignatures.delete(sig)
   }
   for (const [k, v] of vaultPassphraseCache) {
     if (now > v.expiresAt) vaultPassphraseCache.delete(k)
@@ -6128,6 +6179,30 @@ const ipcServer: IpcServer = createIpcServer({
         process.stderr.write(
           `telegram gateway: scoped-approval auto-allow tool=${toolName} rule="${hit}" ` +
           `request=${requestId} (time-boxed window)\n`,
+        )
+        return
+      }
+    }
+    // No-repeat short-circuit: this exact (tool, input) already timed out and
+    // the operator hasn't been active since (the suppression map is cleared on
+    // any operator activity). Deny it WITH a timeout-duplicate reason and post
+    // NO second card — the model retrying into an absent operator is the loop
+    // this closes. The turn still unblocks (deny verdict), and a returning
+    // operator resets suppression so the next ask gets a fresh card.
+    if (PERMISSION_NO_REPEAT_ENABLED) {
+      const sig = permissionSignature(toolName, inputPreview)
+      if (isRecentTimeoutDuplicate(permissionTimeoutSignatures, sig, Date.now(), PERMISSION_DUPLICATE_WINDOW_MS)) {
+        // no-card-verdict: no card was posted and the turn was never parked on
+        // the awaiting glyph, so we omit the resume-reaction flip / resume msg.
+        dispatchPermissionVerdict({
+          type: 'permission',
+          requestId,
+          behavior: 'deny',
+          message: duplicateDenyMessage,
+        })
+        process.stderr.write(
+          `telegram gateway: permission no-repeat short-circuit — duplicate of a ` +
+          `timed-out request tool=${toolName} request=${requestId} (no card posted)\n`,
         )
         return
       }
@@ -11615,6 +11690,11 @@ async function handleInbound(
     return
   }
 
+  // A real message from an allowed sender (gate passed) ⇒ the operator is
+  // present, so reset any no-repeat suppression: the next time the agent asks
+  // for something that timed out earlier, they should see a fresh card.
+  clearPermissionTimeoutSuppression('operator inbound')
+
   // Capture wall-clock receive time for inbound_ack metric (#203).
   // Must be after gate() so early-exit paths (drop/pair) don't skew the delta.
   //
@@ -15169,6 +15249,8 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
     )
     return
   }
+  // Operator answered via slash ⇒ present; reset no-repeat suppression.
+  clearPermissionTimeoutSuppression('operator answered via /approve|/deny')
   // Forward to connected bridges — same IPC the button handler uses.
   dispatchPermissionVerdict({ type: 'permission', requestId: request_id, behavior })
   resumeReactionAfterVerdict()
@@ -19675,6 +19757,9 @@ bot.on('callback_query:data', async ctx => {
   // scopes (resolveTimeBox → null) and the disabled tier (ttl<=0) stay truly
   // once. The verdict is still dispatched WITHOUT a `rule` (below), so the
   // bridge never caches it untimed — the window lives only in scopedGrants.
+  // Operator tapped a verdict ⇒ they are present; reset no-repeat suppression
+  // so a later identical ask is shown fresh rather than silently short-circuited.
+  clearPermissionTimeoutSuppression('operator answered a permission card')
   const pd = pendingPermissions.get(request_id)
   const resumeAction = pd ? naturalAction(pd.tool_name, pd.input_preview) : ''
   const scopedTtl = scopedApprovalTtlMs()
@@ -20954,6 +21039,7 @@ async function shutdown(signal: string): Promise<void> {
   pendingReauthFlows.clear()
   pendingVaultOps.clear()
   pendingPermissions.clear()
+  permissionTimeoutSignatures.clear()
 
   try {
     await ipcServer.close()

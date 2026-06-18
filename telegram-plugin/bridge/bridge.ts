@@ -702,6 +702,12 @@ function onPermission(msg: PermissionEvent): void {
     params: {
       request_id: msg.requestId,
       behavior: msg.behavior,
+      // `message` (deny only) is rendered by claude's channel as
+      // "…the user said: ${message}". We use it to tell the model a deny was
+      // a TIMEOUT, not a human denial — so it doesn't retry the identical
+      // call and re-raise a duplicate card. Omitted → claude's default
+      // "Denied" (safe degradation).
+      ...(msg.message ? { message: msg.message } : {}),
     },
   }).catch((err) => {
     process.stderr.write(`telegram bridge: failed to deliver permission to Claude: ${err}\n`)
