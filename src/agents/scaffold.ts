@@ -2225,19 +2225,19 @@ function applyHindsightSettingsOverrides(pluginDestPath: string): void {
   // "grab-bag" the remember-across-sessions job calls bad. An A/B on the
   // test-harness bank showed observations rank top, reconcile contradictory
   // raw facts, and dedup near-duplicates, at neutral recall latency and
-  // zero model spend (recall is retrieval + local rerank). Switchroom
-  // default; not yet wired to a memory.recall.types yaml cascade (a
-  // per-agent override would need a schema field + HINDSIGHT_RECALL_TYPES
-  // env export — tracked as a follow-up).
+  // zero model spend (recall is retrieval + local rerank). This is the
+  // ON-BY-DEFAULT value for every agent on every install; operators opt
+  // OUT per-agent (or fleet-wide under `defaults`) via memory.recall.types
+  // in switchroom.yaml — start.sh exports HINDSIGHT_RECALL_TYPES only when
+  // overridden, and the env value wins over this settings.json default.
   settings.recallTypes = ["world", "experience", "observation"];
   // Phase 6a: on top of the ack-skip, skip recall on plausibly-stateless
   // trivial turns (time/date/day, bare greetings) — saves the ~1-2s
   // recall arm + up to ~1024 injected tokens on turns that never need
   // user memory. Conservative + guarded against any personal/stateful
-  // signal (see recall.py `_is_trivial_stateless`). recall.py honours the
-  // `recallSkipTrivial` setting, so the off-switch today is setting it
-  // false in the agent's plugin settings.json; a memory.recall.skip_trivial
-  // yaml cascade is a tracked follow-up.
+  // signal (see recall.py `_is_trivial_stateless`). On by default; operators
+  // opt OUT via memory.recall.skip_trivial=false in switchroom.yaml
+  // (exported as HINDSIGHT_RECALL_SKIP_TRIVIAL only when overridden).
   settings.recallSkipTrivial = true;
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
@@ -2296,6 +2296,10 @@ interface BuildWorkspaceContextArgs {
   hindsightRecallMaxMemories: number | undefined;
   hindsightRecallCacheTtlSecs: number | undefined;
   hindsightRecallMinOverlap: number | undefined;
+  // Phase 1 / 6a opt-out cascade. Comma-joined types + stringified bool,
+  // each undefined unless the operator overrode the switchroom default.
+  hindsightRecallTypes?: string;
+  hindsightRecallSkipTrivial?: string;
   // PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
   // injected as HINDSIGHT_TOPIC_ALIASES_JSON so retain.py can resolve
   // numeric thread_ids to human alias names in memory metadata.
@@ -2330,6 +2334,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallTypes,
+    hindsightRecallSkipTrivial,
     hindsightTopicAliasesJson,
     hindsightTopicFilterMode,
   } = args;
@@ -2406,6 +2412,8 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallTypes,
+    hindsightRecallSkipTrivial,
     // PR6 — only emit the env-export blocks when we actually have a
     // value, so `{{#if hindsightTopicAliasesJsonQ}}` and friends are
     // false-y for fleet-shared / DM agents (the dominant case).
@@ -2997,6 +3005,17 @@ export function scaffoldAgent(
   // means "use the plugin's settings.json default of 0.0" (i.e. gate
   // disabled, current behaviour). Set 0.10–0.20 to start filtering.
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
+  // Phase 1 / 6a opt-out: undefined unless the operator overrode the
+  // switchroom default (observations on, trivial-skip on). Exported only
+  // when set (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force.
+  const hindsightRecallTypes = agentConfig.memory?.recall?.types?.length
+    ? agentConfig.memory.recall.types.join(",")
+    : undefined;
+  const hindsightRecallSkipTrivial =
+    agentConfig.memory?.recall?.skip_trivial === undefined
+      ? undefined
+      : String(agentConfig.memory.recall.skip_trivial);
 
   // PR6 — supergroup-mode topic tagging. Build the {alias: thread_id}
   // JSON for retain.py + recall.py to resolve numeric thread_ids to
@@ -3039,6 +3058,8 @@ export function scaffoldAgent(
     hindsightRecallMaxMemories,
     hindsightRecallCacheTtlSecs,
     hindsightRecallMinOverlap,
+    hindsightRecallTypes,
+    hindsightRecallSkipTrivial,
     hindsightTopicAliasesJson,
     hindsightTopicFilterMode,
   });
@@ -4974,6 +4995,17 @@ export function reconcileAgent(
   const hindsightRecallMaxMemories = agentConfig.memory?.recall?.max_memories;
   const hindsightRecallCacheTtlSecs = agentConfig.memory?.recall?.cache_ttl_secs;
   const hindsightRecallMinOverlap = agentConfig.memory?.recall?.min_overlap;
+  // Phase 1 / 6a opt-out: undefined unless the operator overrode the
+  // switchroom default (observations on, trivial-skip on). Exported only
+  // when set (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force.
+  const hindsightRecallTypes = agentConfig.memory?.recall?.types?.length
+    ? agentConfig.memory.recall.types.join(",")
+    : undefined;
+  const hindsightRecallSkipTrivial =
+    agentConfig.memory?.recall?.skip_trivial === undefined
+      ? undefined
+      : String(agentConfig.memory.recall.skip_trivial);
   // PR6 — mirror scaffoldAgent's computation. Both paths feed
   // buildWorkspaceContext, so the template sees identical shape.
   const topicAliases = agentConfig.channels?.telegram?.topic_aliases;
@@ -5042,6 +5074,8 @@ export function reconcileAgent(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      hindsightRecallTypes,
+      hindsightRecallSkipTrivial,
       // PR6 — supergroup-mode topic tagging env vars. Same gate as
       // buildWorkspaceContext: only emit the shell-quoted JSON when
       // we actually have a topic_aliases map.
@@ -5716,6 +5750,8 @@ export function reconcileAgent(
       hindsightRecallMaxMemories,
       hindsightRecallCacheTtlSecs,
       hindsightRecallMinOverlap,
+      hindsightRecallTypes,
+      hindsightRecallSkipTrivial,
       hindsightTopicAliasesJson,
       hindsightTopicFilterMode,
     });

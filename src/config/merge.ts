@@ -383,8 +383,9 @@ export function mergeAgentConfig(
   // dropping max_memories. The doc table at docs/configuration.md:32 says
   // "per-field merge" implying deep behaviour; cascade users expected
   // overriding one knob to leave the rest in place. Now `recall` deep-merges
-  // (one level — sufficient because recall has only scalar children) and
-  // every other top-level memory key keeps the existing override behaviour.
+  // (one level — per-key replace; an override's `types` array replaces the
+  // base array wholesale, which is the intended semantics for that field)
+  // and every other top-level memory key keeps the existing override behaviour.
   if (defaults.memory || merged.memory) {
     const base = defaults.memory ?? {};
     const override = merged.memory ?? {};

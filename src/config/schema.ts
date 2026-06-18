@@ -374,6 +374,26 @@ export const AgentMemorySchema = z
             "current behaviour). Try 0.10–0.20 to start; observe the " +
             "`overlap_dropped` field via `switchroom memory recall-log`.",
           ),
+        types: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Hindsight fact types to recall. Switchroom default is " +
+            "[\"world\", \"experience\", \"observation\"] — the synthesized " +
+            "`observation` tier is on by default. Set to " +
+            "[\"world\", \"experience\"] to opt out of observation-backed " +
+            "recall for this agent (or fleet-wide under defaults).",
+          ),
+        skip_trivial: z
+          .boolean()
+          .optional()
+          .describe(
+            "Skip recall on plausibly-stateless trivial turns (time/date/" +
+            "greeting). Switchroom default true — saves the recall arm + " +
+            "injected tokens on turns that never need memory, guarded so it " +
+            "never skips a turn that references user/project/session state. " +
+            "Set false to always run recall.",
+          ),
         topic_filter_mode: z
           .enum(["soft-preamble", "hard-filter"])
           .optional()

@@ -332,6 +332,21 @@ export HINDSIGHT_RECALL_CACHE_TTL_SECS={{hindsightRecallCacheTtlSecs}}
 {{#if (isNumber hindsightRecallMinOverlap)}}
 export HINDSIGHT_RECALL_MIN_OVERLAP={{hindsightRecallMinOverlap}}
 {{/if}}
+# Recall fact types (memory.recall.types cascade). Switchroom default is
+# world,experience,observation (the synthesized `observation` tier is ON
+# by default, set in the plugin settings.json). Export only when the
+# operator OPTED OUT via switchroom.yaml — comma-separated; the env value
+# wins over settings.json. e.g. ["world","experience"] drops
+# observation-backed recall for this agent.
+{{#if hindsightRecallTypes}}
+export HINDSIGHT_RECALL_TYPES="{{hindsightRecallTypes}}"
+{{/if}}
+# Trivial-turn recall skip (memory.recall.skip_trivial cascade). On by
+# default (plugin settings.json). Export only when the operator overrode
+# it; set false to always run recall.
+{{#if hindsightRecallSkipTrivial}}
+export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
+{{/if}}
 # PR6 — supergroup-mode topic tagging. JSON map of {alias: thread_id}
 # parsed by retain.py + recall.py to (a) stamp chat_id/thread_id/topic_alias
 # into retained memory metadata and (b) emit a "Current topic: …" preamble

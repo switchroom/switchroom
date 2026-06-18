@@ -98,6 +98,15 @@ ENV_OVERRIDES = {
     # [0.0, 1.0]. Set by start.sh from agents.<name>.memory.recall.min_overlap
     # (cascading through defaults). 0.0 = off (current behaviour).
     "HINDSIGHT_RECALL_MIN_OVERLAP": ("recallMinOverlap", float),
+    # Switchroom-local: recall fact types (comma-separated). Set by start.sh
+    # from agents.<name>.memory.recall.types only when the operator overrode
+    # the switchroom default (world,experience,observation) — i.e. the
+    # opt-out path for the synthesized `observation` tier.
+    "HINDSIGHT_RECALL_TYPES": ("recallTypes", list),
+    # Switchroom-local: trivial-turn recall skip (Phase 6a). Set by start.sh
+    # from agents.<name>.memory.recall.skip_trivial only on override; the
+    # switchroom default is on (recall.py falls back to True).
+    "HINDSIGHT_RECALL_SKIP_TRIVIAL": ("recallSkipTrivial", bool),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
     "HINDSIGHT_API_PORT": ("apiPort", int),
@@ -121,6 +130,9 @@ def _cast_env(value: str, typ):
             return int(value)
         if typ is float:
             return float(value)
+        if typ is list:
+            # Comma-separated → list of trimmed, non-empty strings.
+            return [t.strip() for t in value.split(",") if t.strip()]
         return value
     except (ValueError, AttributeError):
         return None
