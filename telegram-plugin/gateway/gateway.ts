@@ -67,6 +67,7 @@ import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
+import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
@@ -3280,6 +3281,29 @@ function resolvePermissionCardTargets(): Array<{ chatId: string; threadId: numbe
   if (turn != null) {
     return [{ chatId: turn.sessionChatId, threadId: turn.sessionThreadId }]
   }
+  // currentTurn was nulled — most commonly because the orphaned-reply backstop
+  // force-closed the turn while the single claude session kept running and then
+  // hit a permission-gated tool (e.g. a retry after a first card auto-denied:
+  // marko Rentals-budget, 2026-06-17). Recover the originating topic from the
+  // recently-started turn registry so the card lands where the operator is
+  // working, instead of fanning out to operator DMs (thread-stripped) where it
+  // sits unseen until the 10-min TTL auto-denies it. Kill switch (=0) restores
+  // the legacy DM fan-out.
+  if (PERMISSION_CARD_ORIGIN_RECOVERY_ENABLED) {
+    const recovered = pickRecoveredPermissionOrigin(
+      recentTurnsById.values(),
+      Date.now(),
+      PERMISSION_CARD_ORIGIN_MAX_AGE_MS,
+    )
+    if (recovered != null) {
+      process.stderr.write(
+        `telegram gateway: permission-card origin recovered from recent turn ` +
+        `chat=${recovered.chatId} thread=${recovered.threadId ?? '-'} ` +
+        `(currentTurn was null — force-closed turn)\n`,
+      )
+      return [recovered]
+    }
+  }
   const sg = resolveAgentSupergroupChatId()
   const topic = resolveAgentOutboundTopic({
     kind: 'permission',
@@ -3699,6 +3723,17 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
 const PERMISSION_TTL_MS = 10 * 60_000
+// Permission/approval-card origin recovery (marko Rentals-budget, 2026-06-17).
+// When `currentTurn` was force-closed by the orphaned-reply backstop but the
+// claude session kept running into a permission-gated tool, recover the card's
+// origin topic from the recently-started turn registry instead of fanning out
+// to operator DMs. Kill switch: SWITCHROOM_PERMISSION_CARD_ORIGIN_RECOVERY=0.
+const PERMISSION_CARD_ORIGIN_RECOVERY_ENABLED =
+  process.env.SWITCHROOM_PERMISSION_CARD_ORIGIN_RECOVERY !== '0'
+// A backstop-closed turn is seconds-to-minutes old; bound recovery so a
+// long-idle agent's stale registry entry can't mis-route a much later
+// permission into an old topic (it falls back to the operator-DM fan-out).
+const PERMISSION_CARD_ORIGIN_MAX_AGE_MS = 30 * 60_000
 
 // #1977 — single-tap correlation for the durable "🔁 Always allow"
 // flow. When the gateway dispatches a `config_propose_edit` to hostd in
