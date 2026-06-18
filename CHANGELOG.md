@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.15.41 — memory: observation-backed recall + trivial-turn skip (on by default)
+
+- **Recall now consumes the synthesized `observation` tier, on by default
+  for every agent (#2425, RFC `reference/rfcs/hindsight-synthesis-layers.md`
+  phase 1).** Auto-recall requested only raw `world`/`experience` facts, so
+  the deduped, dated, provenance-backed observations the consolidation engine
+  already generates on every retain (~46k of them) were thrown away — leaving
+  recall as the "grab-bag" the `remember-across-sessions` job calls bad. A/B
+  on the test-harness bank: with observations, results rank top, reconcile
+  contradictory raw facts, and dedup near-duplicates, at neutral recall latency
+  and zero model spend (recall is retrieval + local rerank).
+- **Recall is skipped on plausibly-stateless trivial turns (#2425, phase 6a).**
+  Time/date/greeting turns no longer pay the ~1–2s recall arm + up to ~1024
+  injected tokens. Conservative + guarded: the classifier bails the instant a
+  prompt references user/project/session state (validated corpus: 18/18 trivial
+  skipped, 16/16 memory-needing kept, zero false negatives).
+- **Opt-out cascade (#2427).** Both default ON; operators opt out per-agent or
+  fleet-wide under `defaults.memory.recall` via `types` / `skip_trivial` in
+  `switchroom.yaml` (exported as `HINDSIGHT_RECALL_TYPES` /
+  `HINDSIGHT_RECALL_SKIP_TRIVIAL` only when overridden; env wins over the
+  on-by-default settings.json).
+- **`switchroom --version` reads package.json, not stale build-info (#2426).**
+
+## v0.15.40 — tool-search ON by default (~40% smaller working context)
+
+- **`ENABLE_TOOL_SEARCH` now defaults to `true` (force-defer), not `auto` (#2421).**
+  `auto`'s threshold scales with the model window; on the 1M-Opus window the
+  whole ~50-80k MCP tool surface fits under it, so `auto` loaded everything
+  upfront — it never deferred (measured: clerk fresh-boot baseline 79,056 tok
+  under `auto`, unchanged even after the per-tool diet). `true` defers every
+  tool NOT pinned via `_meta["anthropic/alwaysLoad"]`; switchroom pins the
+  load-bearing hot path (reply / stream_reply / get_recent_messages / react in
+  the telegram bridge; hindsight + agent-config server-wide), so the reply path
+  stays loaded while the heavy business-MCP + cold-tool surface defers and loads
+  on first use. **Canary: fresh-boot baseline 79,056 → 47,064 tok (~40%)** with
+  the reply UAT still passing. Trade-off: a deferred tool pays a one-time
+  ToolSearch round-trip on first use per session (once-per-tool) for ~32k of
+  per-turn context savings. Revert with `SWITCHROOM_TOOL_SEARCH_MODE=auto`;
+  full opt-out `SWITCHROOM_DISABLE_TOOL_SEARCH=1`.
+
 ## v0.15.39 — fix: connection-health false positives (empty scope.allow)
 
 - **Connection-health no longer false-flags working MCPs (#2417).** v0.15.38's
