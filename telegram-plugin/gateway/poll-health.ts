@@ -10,18 +10,23 @@
  *
  * Fix:
  *   A separate setInterval calls `getMe()` (a lightweight Bot API
- *   endpoint) every HEALTH_INTERVAL_MS. Three consecutive failures
- *   constitute a stall: we stop the runner, wait RESTART_GRACE_MS
- *   for the in-flight request to die, then let the caller restart it.
+ *   endpoint) every `intervalMs`. `failureThreshold` consecutive
+ *   failures constitute a stall and fire `onStall`.
  *
  *   A single failure doesn't count — transient network blips happen.
  *   The threshold must be >= 3 so a brief Telegram outage (e.g. a
  *   data-centre hiccup) doesn't cause thrashing.
  *
+ * Recovery (see gateway.ts onStall → poll-stall-recovery.ts):
+ *   `onStall` does NOT stop()+re-run the runner — grammy's stop() blocks
+ *   on a non-abortable getUpdates retry backoff during an outage, which hung
+ *   the fleet deaf (2026-06-18). It exits the process non-zero and the
+ *   supervisor restarts the gateway with a fresh runner.
+ *
  * Usage:
  *   const hc = createPollHealthCheck({
  *     ping:  () => bot.api.getMe(),
- *     onStall: async () => { await runnerHandle.stop(); … restart … },
+ *     onStall: async () => { recoverFromPollStall({ agentName }); },
  *     log:   (msg) => process.stderr.write(msg),
  *   });
  *   // start after the runner is up:
