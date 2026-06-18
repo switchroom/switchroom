@@ -579,6 +579,19 @@ export const SessionSchema = z
         "Useful on large-window models (e.g. 1M Opus) to hold a " +
         "deliberately lean working context.",
       ),
+    idle_clear_after: z
+      .string()
+      .regex(
+        /^\d+[smh]$/,
+        "Duration must be a number followed by s, m, or h (e.g. '3h', '90m')",
+      )
+      .optional()
+      .describe(
+        "Auto-run /clear (wipe the working context) after the live " +
+        "session has been idle this long. Defaults to '3h' when unset " +
+        "(on by default); set '0s' to disable. Long-term memory lives " +
+        "in Hindsight, so a clear loses only the in-session thread.",
+      ),
   })
   .optional();
 

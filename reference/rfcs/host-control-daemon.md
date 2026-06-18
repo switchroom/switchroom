@@ -37,7 +37,7 @@ synchronous shell-outs** the gateway issues per session, all targeting
    because `SWITCHROOM_CONFIG` is mounted `:ro` and these verbs don't
    touch the running fleet.
 
-2. **Per-agent self-restart** (`/restart`, `/new`, `/reset` → `agent
+2. **Per-agent self-restart** (`/restart`, `/new` → `agent
    restart <self>`). Today: detached spawn via
    `spawnSwitchroomDetached`, restart marker + sweep. The gateway
    runs *inside* the agent container in v0.7+, so the legacy

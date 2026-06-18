@@ -94,3 +94,20 @@ Behavior:
 - **Cascade.** Standard `session.*` per-field merge: set fleet-wide under `defaults.session` or override per agent/profile. Orthogonal to `session.max_idle` / `session.max_turns` (fresh-session rotation) and `session_continuity.resume_mode`.
 
 This is the recommended setting for an always-on fleet on the 1M Opus model where lean, fast, high-signal turns matter more than maximum single-session memory (Hindsight remains the cross-session safety net).
+
+### Idle auto-clear (`session.idle_clear_after`)
+
+After a session has been idle for this long (wall-clock, no inbound/turn/cron activity), the gateway auto-runs `/clear` to wipe the working context, so a long-untouched agent starts the next message on a fresh slate instead of resuming a stale, context-heavy thread.
+
+```yaml
+defaults:
+  session:
+    idle_clear_after: 3h   # default; '0s' disables
+```
+
+- **On by default** (`3h`) — unlike `max_context_tokens`, no opt-in needed. Set `0s` to disable.
+- **Clear, not compact.** It wipes the in-session thread; long-term memory lives in Hindsight, so only the scratch thread is lost. (Use `max_context_tokens` if you'd rather *compact* on size.)
+- **When it fires.** A wall-clock interval (≈60s), never mid-turn (same idle gate as proactive compaction); fires once per idle period and re-arms on the next activity. Cron fires count as activity, so a scheduled-only agent isn't cleared mid-work.
+- **Notice.** A subtle one-line message ("🧹 Cleared after 3h idle …") posts so you know why the agent is fresh.
+- **Manual control.** `/compact` and `/clear` are first-class Telegram commands (open to any chat member) for on-demand trimming/wiping.
+- **Cascade.** Standard `session.*` per-field merge; duration string (`3h`, `90m`, `7200s`). Env override `SWITCHROOM_IDLE_CLEAR_MS` (ms) for testing.

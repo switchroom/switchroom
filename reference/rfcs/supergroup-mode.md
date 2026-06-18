@@ -138,7 +138,7 @@ notification, `admin` for action-required).
 | Hostd approval card (always operator-initiated) | originating turn's `message_thread_id` | `admin` alias |
 | Compact card / watchdog (system-initiated) | `alerts` alias | `default_topic_id` |
 | **Query slash commands** (`/status`, `/help`, `/version`, `/auth`, `/usage`-light) | reply in originating topic | — |
-| **Mutation slash commands** (`/restart`, `/update apply`, `/new`, `/reset`, `/stop`, `/agentstart`) | `admin` alias | originating topic |
+| **Mutation slash commands** (`/restart`, `/update apply`, `/new`, `/stop`, `/agentstart`) | `admin` alias | originating topic |
 | **Heavy-output slash commands** (`/logs`, `/upgradestatus`, `/audit`, `/memory <q>`, `/permissions`) | `admin` alias always | `default_topic_id` |
 | **Approval-button callbacks** (`apv:…`, `/approve` `/deny` `/pending`) | reply where the card was (callback-driven, no change) | — |
 

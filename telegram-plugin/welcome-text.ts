@@ -170,7 +170,7 @@ export function helpText(agentName: string): string {
     ``,
     `This bot is the <b>${escapeHtml(agentName)}</b> agent. Text and photos route through to it; replies, reactions and progress cards come back.`,
     ``,
-    `Tool approvals surface as inline buttons (✅ / ❌) or via <code>/approve</code>, <code>/deny</code>, <code>/pending</code>. Start a fresh session with <code>/new</code> or <code>/reset</code>.`,
+    `Tool approvals surface as inline buttons (✅ / ❌) or via <code>/approve</code>, <code>/deny</code>, <code>/pending</code>. Start a fresh session with <code>/new</code>, or trim/clear context with <code>/compact</code> / <code>/clear</code>.`,
     ``,
     `<code>/start</code> — pairing instructions`,
     `<code>/status</code> — agent, model, auth`,
@@ -265,7 +265,7 @@ export function statusUnpairedText(): string {
  */
 export const switchroomHelpCommandNames = [
   // Session & approvals
-  "new", "reset", "approve", "deny", "pending", "interrupt",
+  "new", "compact", "clear", "approve", "deny", "pending", "interrupt",
   // Agents
   "agents", "agentstart", "stop", "restart", "logs", "memory",
   // Auth & config — consolidated onto the `/auth` dashboard.
@@ -298,7 +298,8 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "status", description: "Agent, model, auth" },
   // Session control (most-used)
   { command: "new", description: "Fresh session (flush handoff, restart)" },
-  { command: "reset", description: "Alias of /new" },
+  { command: "compact", description: "Compact context (summarize, keep the thread)" },
+  { command: "clear", description: "Clear context (fresh slate; memory in Hindsight)" },
   // Inline approvals
   { command: "approve", description: "Approve pending tool permission" },
   { command: "deny", description: "Deny pending tool permission" },
@@ -312,8 +313,10 @@ export const TELEGRAM_MENU_COMMANDS = [
   // #725 Phase 2 — inject a Claude Code REPL slash command into the agent's
   // tmux pane (allowlisted: /cost, /status, /model, /clear, /compact,
   // /memory, /hooks). Requires the tmux supervisor (the default — refused
-  // when the agent has experimental.legacy_pty=true).
-  { command: "inject", description: "Inject a Claude Code slash command (e.g. /cost)" },
+  // when the agent has experimental.legacy_pty=true). NOT in the slash-menu
+  // (kept the 20-entry mobile cap; the common injects /compact, /clear,
+  // /model, /effort are first-class menu commands). Still typable + in
+  // /commands.
   // /model — show or switch the Claude model (session-scoped; rides the
   // same inject primitive as `/inject /model` but with a typed argument,
   // so it never opens the undriveable no-arg picker modal).
@@ -356,7 +359,8 @@ export function switchroomHelpText(agentName: string): string {
     ``,
     `<b>Session &amp; approvals</b>`,
     `<code>/new</code> — fresh session (flush handoff, restart)`,
-    `<code>/reset</code> — alias of /new`,
+    `<code>/compact</code> — compact context (summarize, keep the thread)`,
+    `<code>/clear</code> — clear context (fresh slate; memory in Hindsight)`,
     `<code>/approve [id]</code> — approve pending tool permission`,
     `<code>/deny [id]</code> — deny pending tool permission`,
     `<code>/pending</code> — list pending permission prompts`,
@@ -404,7 +408,7 @@ export function switchroomHelpText(agentName: string): string {
 }
 
 /**
- * Ack shown when a self-targeting /restart (or /new, /reset) kicks off.
+ * Ack shown when a self-targeting /restart (or /new) kicks off.
  * Centralized so gateway and monolith agree on wording.
  */
 export function restartAckText(agentName: string): string {
@@ -414,9 +418,4 @@ export function restartAckText(agentName: string): string {
 export function newSessionAckText(agentName: string, flushedHandoff: boolean): string {
   const tail = flushedHandoff ? " · flushed handoff" : "";
   return `🆕 Started fresh session for <b>${escapeHtml(agentName)}</b>${tail} · restarting…`;
-}
-
-export function resetSessionAckText(agentName: string, flushedHandoff: boolean): string {
-  const tail = flushedHandoff ? " · flushed handoff" : "";
-  return `🔄 Reset session for <b>${escapeHtml(agentName)}</b>${tail} · restarting…`;
 }

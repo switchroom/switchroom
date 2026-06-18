@@ -208,7 +208,6 @@ import {
   switchroomHelpText as buildSwitchroomHelpText,
   restartAckText as buildRestartAckText,
   newSessionAckText as buildNewSessionAckText,
-  resetSessionAckText as buildResetSessionAckText,
   TELEGRAM_BASE_COMMANDS,
   TELEGRAM_SWITCHROOM_COMMANDS,
   type AgentMetadata, type AuthSummary, type StatusProbeRow,
@@ -266,7 +265,7 @@ import {
 import { DEFAULT_SLOT } from '../../src/auth/accounts.js'
 import { currentActiveSlot, type AuthCodeOutcome } from '../../src/auth/manager.js'
 import { injectSlashCommand as injectSlashCommandImpl } from '../../src/agents/inject.js'
-import { handleInjectCommand } from './inject-handler.js'
+import { handleInjectCommand, type InjectDeps } from './inject-handler.js'
 import {
   parseModelCommand,
   handleModelCommand,
@@ -295,6 +294,7 @@ import { resolveOutboundTopic as resolveOutboundTopicHelper, topicForRecipient, 
 import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
+import { decideIdleClear, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -1353,6 +1353,11 @@ function checkApprovals(): void {
   }
 }
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
+// Idle auto-clear: check wall-clock idle every minute; maybeIdleClear no-ops
+// when disabled ('0s'), mid-turn, or already cleared this idle period. The
+// `let` state + maybeIdleClear are hoisted/initialized before this fires.
+const IDLE_CLEAR_CHECK_MS = Number(process.env.SWITCHROOM_IDLE_CLEAR_CHECK_MS ?? 60_000)
+if (!STATIC && IDLE_CLEAR_CHECK_MS > 0) setInterval(maybeIdleClear, IDLE_CLEAR_CHECK_MS).unref()
 
 // ─── Thread / status / stream state ───────────────────────────────────────
 const chatThreadMap = new Map<string, number>()
@@ -3096,6 +3101,111 @@ function maybeProactiveCompact(): void {
     .finally(() => {
       compactDispatching = false;
     });
+}
+
+// ─── Idle auto-clear ──────────────────────────────────────────────────────
+// Wall-clock idle → /clear (idle-clear.ts). Independent of proactive-compact
+// (occupancy-driven at the turn-end gate): a fully-idle agent never ends a
+// turn, so this runs on its own interval. Any activity (inbound / turn start /
+// cron fire) resets the timer via markIdleActivity(); fires once per idle
+// period; never mid-turn (turnInFlightForGate, the same gate compaction uses).
+let lastIdleActivityAt = Date.now();
+let idleAutoCleared = false;
+let idleClearDispatching = false;
+
+/** Reset the idle timer + re-arm auto-clear. Call on ANY activity. */
+function markIdleActivity(): void {
+  lastIdleActivityAt = Date.now();
+  idleAutoCleared = false;
+}
+
+/** Idle window in ms: env override → per-agent config → 3h default. 0 disables. */
+function resolveIdleClearMs(): number {
+  const env = process.env.SWITCHROOM_IDLE_CLEAR_MS;
+  if (env != null && env !== '') {
+    const n = Number(env);
+    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_IDLE_CLEAR_MS;
+  }
+  try {
+    const agentName = process.env.SWITCHROOM_AGENT_NAME;
+    if (!agentName) return DEFAULT_IDLE_CLEAR_MS;
+    const cfg = loadSwitchroomConfig();
+    const rawAgent = cfg.agents?.[agentName] ?? {};
+    const resolved = resolveAgentConfig(cfg.defaults, cfg.profiles, rawAgent);
+    const raw = resolved.session?.idle_clear_after;
+    if (raw == null) return DEFAULT_IDLE_CLEAR_MS; // unset → on by default (3h)
+    const ms = idleDurationToMs(raw);
+    return ms == null ? DEFAULT_IDLE_CLEAR_MS : ms;
+  } catch {
+    return DEFAULT_IDLE_CLEAR_MS; // config unreadable → keep the default on
+  }
+}
+
+/** Evaluate idle auto-clear (runs on IDLE_CLEAR_CHECK_MS interval). */
+function maybeIdleClear(): void {
+  if (idleClearDispatching) return;
+  const agentName = process.env.SWITCHROOM_AGENT_NAME;
+  if (!agentName) return;
+  const idleClearMs = resolveIdleClearMs();
+  const decision = decideIdleClear(
+    {
+      lastActivityAt: lastIdleActivityAt,
+      idleClearMs,
+      alreadyCleared: idleAutoCleared,
+      turnInFlight: turnInFlightForGate(),
+    },
+    Date.now(),
+  );
+  if (!decision.clear) return;
+  // Fire once per idle period — set BEFORE the await so the next tick can't
+  // double-dispatch. markIdleActivity() re-arms on the next real activity.
+  idleAutoCleared = true;
+  idleClearDispatching = true;
+  process.stderr.write(
+    `telegram gateway: idle auto-/clear for ${agentName} ` +
+      `(idle >= ${Math.round(idleClearMs / 60_000)}m)\n`,
+  );
+  // Accepted check-to-send race (same as maybeProactiveCompact): a new inbound
+  // could arrive between the gate check and the tmux send; /clear then lands in
+  // claude's prompt buffer and runs at the next idle prompt (inject.ts FUTURE-GAP).
+  void injectSlashCommandImpl(agentName, '/clear')
+    .then(() => { void postIdleClearNotice(idleClearMs); })
+    .catch((err: unknown) => {
+      process.stderr.write(
+        `telegram gateway: idle /clear inject failed for ` +
+          `${agentName}: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    })
+    .finally(() => { idleClearDispatching = false; });
+}
+
+/** Subtle one-line notice so the operator knows the session was auto-cleared. */
+async function postIdleClearNotice(idleClearMs: number): Promise<void> {
+  try {
+    const chatId = loadAccess().allowFrom[0];
+    if (!chatId) return;
+    const threadId = topicForRecipient({
+      recipientChatId: chatId,
+      resolvedTopic:
+        resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
+        ?? chatThreadMap.get(chatId),
+      supergroupChatId: resolveAgentSupergroupChatId(),
+    });
+    const hrs = Math.round((idleClearMs / 3_600_000) * 10) / 10;
+    const text =
+      `🧹 <b>Cleared after ${hrs}h idle</b> — fresh slate next message; ` +
+      `long-term memory is in Hindsight.`;
+    await swallowingApiCall(
+      () =>
+        bot.api.sendMessage(chatId, text, {
+          parse_mode: 'HTML',
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: chatId, verb: 'idleAutoClear.notice' },
+    );
+  } catch {
+    /* best-effort notice — the /clear itself still happened */
+  }
 }
 
 /**
@@ -6731,6 +6841,10 @@ const ipcServer: IpcServer = createIpcServer({
   },
 
   onInjectInbound(_client: IpcClient, msg: InjectInboundMessage) {
+    // Cron fires (incl. cheap-cron, whose session events are dropped before
+    // currentTurn is set) are real activity — re-arm idle auto-clear so a
+    // working scheduled agent isn't wiped after 3h of "no inbound".
+    markIdleActivity()
     const promptKey = typeof msg.inbound.meta?.prompt_key === 'string'
       ? msg.inbound.meta.prompt_key
       : 'unknown'
@@ -10035,6 +10149,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           isDm: isDmChatId(ev.chatId),
         }
         currentTurn = next
+        markIdleActivity() // any turn start (main session) is activity — re-arm idle clear
         // Status-surface observability: one line at every turn SET so a later
         // dark card is traceable to which turn/topic key it belonged to.
         process.stderr.write(
@@ -11713,6 +11828,7 @@ async function handleInbound(
   // (image_path_2, attachment_file_id_2, …) alongside the primary.
   extraAttachments?: CoalesceAttachment[],
 ): Promise<void> {
+  markIdleActivity() // any inbound resets the idle auto-clear timer + re-arms
   const isTopicMessage = ctx.message?.is_topic_message ?? false
   const messageThreadId = ctx.message?.message_thread_id
 
@@ -14493,19 +14609,37 @@ bot.command('agents', async ctx => {
 
 // /inject — #725 Phase 2 slash-command bridge. Implementation in
 // inject-handler.ts so it's unit-testable without booting the bot.
-bot.command('inject', async ctx => {
-  await handleInjectCommand(ctx, {
-    isAuthorized: isAuthorizedSender,
+// Shared deps for the inject-backed commands. `/inject <verb>` uses the
+// defaults; first-class /compact and /clear pass `open` (anyone in the chat —
+// operator decision, single-tenant trust) + a `fixedVerb` so they don't need
+// the `/inject` prefix.
+function buildInjectDeps(opts?: { open?: boolean; fixedVerb?: string }): InjectDeps {
+  return {
+    isAuthorized: opts?.open ? () => true : isAuthorizedSender,
     inject: injectSlashCommandImpl,
     // accent is already inlined into the body by the handler via
     // buildAccentHeader; switchroomReply doesn't need to know about it.
-    reply: async (ctx, text, opts) => switchroomReply(ctx, text, { html: opts?.html }),
+    reply: async (ctx, text, replyOpts) => switchroomReply(ctx, text, { html: replyOpts?.html }),
     getAgentName: getMyAgentName,
-    getArgs: getCommandArgs,
+    getArgs: opts?.fixedVerb != null ? () => opts.fixedVerb as string : getCommandArgs,
     escapeHtml: escapeHtmlForTg,
     preBlock,
     formatOutput: formatSwitchroomOutput,
-  })
+  }
+}
+
+bot.command('inject', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps())
+})
+
+// /compact + /clear — first-class session-control commands, open to anyone in
+// the chat. Both are in the INJECT_COMMANDS allowlist; they ride the same
+// inject primitive as `/inject compact` / `/inject clear`.
+bot.command('compact', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/compact' }))
+})
+bot.command('clear', async ctx => {
+  await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
 })
 
 // /model — model dashboard + switch for this agent's live session.
@@ -14746,7 +14880,8 @@ function flushAgentHandoff(agentDir: string): number {
   return removed
 }
 
-async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Promise<void> {
+async function handleNewCommand(ctx: Context): Promise<void> {
+  const kind = 'new' // /reset removed (was a pure alias); keep the string for messages
   if (!isAuthorizedSender(ctx)) return
   const name = (typeof ctx.match === "string" ? ctx.match : "").trim() || getMyAgentName()
   try { assertSafeAgentName(name) } catch { await switchroomReply(ctx, 'Invalid agent name.'); return }
@@ -14796,9 +14931,7 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
 
   const chatId = String(ctx.chat!.id)
   const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-  const ackText = kind === 'new'
-    ? buildNewSessionAckText(name, flushed > 0)
-    : buildResetSessionAckText(name, flushed > 0)
+  const ackText = buildNewSessionAckText(name, flushed > 0)
   let ackId: number | null = null
   // #1075: thread-id-bearing — fall back to main chat.
   try {
@@ -14864,8 +14997,7 @@ async function handleNewOrResetCommand(ctx: Context, kind: 'new' | 'reset'): Pro
   )
 }
 
-bot.command('new', async ctx => handleNewOrResetCommand(ctx, 'new'))
-bot.command('reset', async ctx => handleNewOrResetCommand(ctx, 'reset'))
+bot.command('new', async ctx => handleNewCommand(ctx))
 
 // /update — host update from Telegram (#919). Default = dry-run plan
 // (`switchroom update --check`); explicit `apply` triggers the real
