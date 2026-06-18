@@ -1240,11 +1240,32 @@
       }
     }
 
-    function switchTab(tab) {
-      const tabs = ['summary', 'agents', 'accounts', 'system', 'memory', 'connections', 'schedule', 'approvals'];
-      for (const t of tabs) {
+    // Canonical tab list — kept in sync with the nav buttons above and with
+    // SPA_TAB_ROUTES in src/web/server.ts (the server serves the SPA shell for
+    // these paths so a reload/deep-link doesn't 404).
+    const TAB_NAMES = ['summary', 'agents', 'accounts', 'system', 'memory', 'connections', 'schedule', 'approvals'];
+
+    // Derive the active tab from the URL path (`/connections` → 'connections',
+    // '/' → 'summary'). Unknown paths fall back to summary.
+    function tabFromPath() {
+      const name = location.pathname.replace(/^\/+/, '').replace(/\/+$/, '');
+      return TAB_NAMES.includes(name) ? name : 'summary';
+    }
+
+    // opts.push === false suppresses the history push — used when the switch is
+    // itself driven by navigation (initial load, back/forward) so we don't
+    // double-stack history entries.
+    function switchTab(tab, opts) {
+      if (!TAB_NAMES.includes(tab)) tab = 'summary';
+      for (const t of TAB_NAMES) {
         document.getElementById(`tab-${t}`).classList.toggle('active', tab === t);
         document.getElementById(t).style.display = tab === t ? '' : 'none';
+      }
+      // Mirror the tab into the URL path so reload/deep-link/back-forward all
+      // land here. Summary canonicalises to '/'.
+      if (!opts || opts.push !== false) {
+        const path = tab === 'summary' ? '/' : '/' + tab;
+        if (location.pathname !== path) history.pushState({ tab }, '', path);
       }
       if (tab === 'summary') fetchSummary();
       if (tab === 'accounts') fetchAccounts();
@@ -1254,6 +1275,11 @@
       if (tab === 'schedule') fetchSchedule();
       if (tab === 'approvals') fetchApprovals();
     }
+
+    // Back/forward: restore the tab from the history entry (or the path).
+    window.addEventListener('popstate', (e) => {
+      switchTab((e.state && e.state.tab) || tabFromPath(), { push: false });
+    });
 
     // Fleet overview — ONE round-trip to the server-side aggregate
     // (/api/summary), which pulls each part through the same per-tab
@@ -2635,12 +2661,16 @@
       }
     }
 
-    // Init. Summary is the default visible tab; fetchAgents still runs
-    // (populates the agents tab + keeps the 10s fleet poll warm + the
-    // log WS depends on it). Summary is fetched on init + on tab-switch
-    // only — deliberately NOT on the 10s interval (it fans out to
-    // system-health etc.; on-demand refresh is enough).
-    fetchSummary();
+    // Init. The initial tab comes from the URL path (so a reload/deep-link of
+    // `/connections` opens Connections, not Summary); '/' → Summary. We stamp
+    // the history entry so the first back/forward works, then switchTab
+    // (push:false) shows the tab and fetches just its data. fetchAgents still
+    // runs unconditionally (keeps the 10s fleet poll warm + the log WS depends
+    // on it). Per-tab data is fetched on switch only — deliberately NOT on the
+    // 10s interval (it fans out to system-health etc.; on-demand is enough).
+    const initialTab = tabFromPath();
+    history.replaceState({ tab: initialTab }, '', location.pathname);
+    switchTab(initialTab, { push: false });
     fetchAgents();
     connectWebSocket();
     // Fleet poll — gated on tab visibility. A phone with the dashboard

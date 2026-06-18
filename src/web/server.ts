@@ -78,6 +78,48 @@ const MIME_TYPES: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
+// Top-level dashboard tabs that the client mirrors into the URL path
+// (history.pushState → `/connections`, `/agents`, …). A full-page load or
+// reload of one of these paths must serve the SPA shell (index.html) instead
+// of 404-ing, so the in-page router can select the right tab on boot. Keep in
+// sync with the `tabs` array in src/web/ui/index.html (switchTab).
+const SPA_TAB_ROUTES = new Set([
+  "summary",
+  "agents",
+  "accounts",
+  "system",
+  "memory",
+  "connections",
+  "schedule",
+  "approvals",
+]);
+
+/**
+ * Map an incoming GET path to the static file to serve. The dashboard is a
+ * single-page app whose active tab is mirrored into the URL path, so the root
+ * and every known tab route (`/connections`, `/agents`, …) resolve to the
+ * index.html shell; the in-page router then selects the tab. Any other path is
+ * returned unchanged so a genuinely missing asset still 404s rather than being
+ * masked by the shell. Exported for unit coverage.
+ */
+export function resolveDashboardFilePath(pathname: string): string {
+  const routeName = pathname.replace(/^\/+/, "").replace(/\/+$/, "");
+  return pathname === "/" || SPA_TAB_ROUTES.has(routeName)
+    ? "/index.html"
+    : pathname;
+}
+
+/**
+ * Cache-Control for a static dashboard asset by extension. The whole app is one
+ * inline HTML document, so a stale cached shell pins stale render code (this is
+ * what made already-fixed bugs — e.g. "my connections don't show" — persist in
+ * the browser). The server sends no validators, so HTML must always revalidate;
+ * other assets get no explicit policy. Exported for unit coverage.
+ */
+export function dashboardCacheControl(ext: string): string | undefined {
+  return ext === ".html" ? "no-cache, must-revalidate" : undefined;
+}
+
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -1034,8 +1076,9 @@ export function startWebServer(
         }
       }
 
-      // Static files — no auth required
-      let filePath = pathname === "/" ? "/index.html" : pathname;
+      // Static files — no auth required. SPA path routing (root + known tab
+      // routes → index.html shell) lives in resolveDashboardFilePath.
+      const filePath = resolveDashboardFilePath(pathname);
       const fullPath = join(uiDir, filePath);
 
       // Resolve symlinks before comparing so traversal via symlinked uiDir
@@ -1057,9 +1100,10 @@ export function startWebServer(
       const ext = extname(realFullPath);
       const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
       const content = readFileSync(realFullPath);
-      return new Response(content, {
-        headers: { "Content-Type": contentType },
-      });
+      const headers: Record<string, string> = { "Content-Type": contentType };
+      const cacheControl = dashboardCacheControl(ext);
+      if (cacheControl) headers["Cache-Control"] = cacheControl;
+      return new Response(content, { headers });
     },
 
     websocket: {

@@ -139,7 +139,12 @@ import {
   resolveKernelOperatorSocket,
   approvalList,
 } from "../src/vault/approvals/client.js";
-import { isOriginAllowed, isTailscaleIdentified } from "../src/web/server.js";
+import {
+  isOriginAllowed,
+  isTailscaleIdentified,
+  resolveDashboardFilePath,
+  dashboardCacheControl,
+} from "../src/web/server.js";
 import { getAllAgentStatuses, startAgent, stopAgent, restartAgent } from "../src/agents/lifecycle.js";
 import { getAllAuthStatuses } from "../src/auth/manager.js";
 import { getHindsightStatus } from "../src/setup/hindsight.js";
@@ -2378,5 +2383,64 @@ describe("memory remediation handlers", () => {
       expect(r.ok).toBe(false);
       expect(r.error).toContain("boom");
     });
+  });
+});
+
+describe("resolveDashboardFilePath — SPA tab path routing", () => {
+  const TAB_ROUTES = [
+    "summary",
+    "agents",
+    "accounts",
+    "system",
+    "memory",
+    "connections",
+    "schedule",
+    "approvals",
+  ];
+
+  it("serves the index.html shell for the root path", () => {
+    expect(resolveDashboardFilePath("/")).toBe("/index.html");
+  });
+
+  it("serves the shell for every known tab route (reload/deep-link doesn't 404)", () => {
+    for (const tab of TAB_ROUTES) {
+      expect(resolveDashboardFilePath(`/${tab}`)).toBe("/index.html");
+    }
+  });
+
+  it("tolerates a trailing slash on a tab route", () => {
+    expect(resolveDashboardFilePath("/connections/")).toBe("/index.html");
+  });
+
+  it("passes through real asset paths unchanged (not masked by the shell)", () => {
+    expect(resolveDashboardFilePath("/index.html")).toBe("/index.html");
+    expect(resolveDashboardFilePath("/styles.css")).toBe("/styles.css");
+    expect(resolveDashboardFilePath("/favicon.ico")).toBe("/favicon.ico");
+  });
+
+  it("passes through unknown paths unchanged so they still 404", () => {
+    // A path that is NOT a tab and NOT a real file must stay as-is — the
+    // caller's existsSync check then 404s it, rather than the shell masking
+    // the miss.
+    expect(resolveDashboardFilePath("/nope")).toBe("/nope");
+    expect(resolveDashboardFilePath("/connections-typo")).toBe(
+      "/connections-typo",
+    );
+    expect(resolveDashboardFilePath("/agents/extra/depth")).toBe(
+      "/agents/extra/depth",
+    );
+  });
+});
+
+describe("dashboardCacheControl — stale-shell prevention", () => {
+  it("forces revalidation on the HTML document (kills stale-render bugs)", () => {
+    expect(dashboardCacheControl(".html")).toBe("no-cache, must-revalidate");
+  });
+
+  it("applies no explicit policy to non-HTML assets", () => {
+    expect(dashboardCacheControl(".css")).toBeUndefined();
+    expect(dashboardCacheControl(".js")).toBeUndefined();
+    expect(dashboardCacheControl(".png")).toBeUndefined();
+    expect(dashboardCacheControl("")).toBeUndefined();
   });
 });
