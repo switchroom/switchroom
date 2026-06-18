@@ -2444,3 +2444,33 @@ describe("dashboardCacheControl — stale-shell prevention", () => {
     expect(dashboardCacheControl("")).toBeUndefined();
   });
 });
+
+describe("dashboard CSS — .accounts-grid desktop-hide must stay scoped", () => {
+  // Regression guard for the "connections never show on desktop" bug. The
+  // Accounts tab shows a wide-screen table and hides its mobile card grid via
+  // `@media (min-width: 701px) { .accounts-grid { display: none } }`. The
+  // Connections tab REUSES .accounts-grid for its OAuth/Notion cards but has no
+  // table fallback, so an UNSCOPED rule hid every connection card on any screen
+  // wider than 700px (cards rendered but display:none; only the non-grid
+  // empty-state text showed). The fix scopes the hide to `#accounts`. If anyone
+  // reintroduces the unscoped form, this fails.
+  const html = readFileSync(
+    new URL("../src/web/ui/index.html", import.meta.url),
+    "utf8",
+  );
+
+  it("hides .accounts-grid on desktop only within #accounts", () => {
+    expect(html).toContain("#accounts .accounts-grid { display: none; }");
+  });
+
+  it("has no UNSCOPED .accounts-grid display:none rule (would blank Connections)", () => {
+    // Any `.accounts-grid { display: none }` NOT scoped by `#accounts ` is the
+    // exact regression: it hides the Connections tab's cards (which have no
+    // table fallback). The `.accounts-grid` base rule uses `display: grid` and
+    // the 600px rule sets grid-template-columns, so this pattern is specific to
+    // the desktop-hide. The negative lookbehind passes the scoped form.
+    expect(html).not.toMatch(
+      /(?<!#accounts )\.accounts-grid\s*\{\s*display:\s*none/,
+    );
+  });
+});
