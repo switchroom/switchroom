@@ -1,0 +1,76 @@
+/**
+ * Source-text pins for the no-repeat-on-timeout wiring (marko Rentals-budget
+ * loop, 2026-06-17). gateway.ts / bridge.ts have top-level side effects and
+ * aren't unit-importable; the decision logic is unit-tested in
+ * permission-timeout.test.ts. These pins lock the wiring so it can't silently
+ * regress.
+ */
+
+import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const read = (p: string) => readFileSync(resolve(__dirname, '..', p), 'utf8')
+const GATEWAY = read('gateway/gateway.ts')
+const BRIDGE = read('bridge/bridge.ts')
+const IPC_PROTOCOL = read('gateway/ipc-protocol.ts')
+const IPC_CLIENT = read('bridge/ipc-client.ts')
+
+function slice(src: string, fnHeader: string, span = 1600): string {
+  const start = src.indexOf(fnHeader)
+  expect(start, `expected to find ${fnHeader}`).toBeGreaterThan(-1)
+  return src.slice(start, start + span)
+}
+
+describe('no-repeat-on-timeout wiring', () => {
+  it('PermissionEvent carries an optional message field', () => {
+    const evt = slice(IPC_PROTOCOL, 'export interface PermissionEvent', 2400)
+    expect(evt).toMatch(/message\?:\s*string/)
+  })
+
+  it('the bridge IPC validator accepts an optional non-empty message', () => {
+    expect(IPC_CLIENT).toMatch(/m\.message === undefined/)
+  })
+
+  it('the bridge forwards message on the permission channel notification', () => {
+    const fn = slice(BRIDGE, 'function onPermission(', 1600)
+    expect(fn).toContain('notifications/claude/channel/permission')
+    expect(fn).toMatch(/msg\.message/)
+  })
+
+  it('the TTL auto-deny attaches a timeout message and records the signature', () => {
+    // Within the pending-permission sweep block.
+    const sweep = slice(GATEWAY, 'for (const [k, v] of pendingPermissions)', 2200)
+    expect(sweep).toContain('timeoutDenyMessage(')
+    expect(sweep).toContain('permissionTimeoutSignatures.set(')
+  })
+
+  it('onPermissionRequest short-circuits a recent-timeout duplicate before posting a card', () => {
+    const fn = slice(GATEWAY, 'onPermissionRequest(', 4000)
+    const dupIdx = fn.indexOf('isRecentTimeoutDuplicate(')
+    const cardIdx = fn.indexOf('pendingPermissions.set(requestId')
+    expect(dupIdx).toBeGreaterThan(-1)
+    expect(cardIdx).toBeGreaterThan(-1)
+    // The duplicate check must run BEFORE the card is registered/posted.
+    expect(dupIdx).toBeLessThan(cardIdx)
+    expect(fn).toContain('duplicateDenyMessage')
+  })
+
+  it('suppression is reset on operator activity (inbound + card verdict + slash)', () => {
+    // Three distinct reset points so a returning operator always gets a fresh card.
+    const resets = GATEWAY.match(/clearPermissionTimeoutSuppression\(/g) ?? []
+    // 1 definition call inside the helper + at least 3 reset callsites.
+    expect(resets.length).toBeGreaterThanOrEqual(3)
+    expect(GATEWAY).toContain("clearPermissionTimeoutSuppression('operator inbound')")
+  })
+
+  it('has a kill switch', () => {
+    expect(GATEWAY).toContain('SWITCHROOM_PERMISSION_NO_REPEAT')
+  })
+
+  it('sweeps stale suppression entries past the safety-cap window', () => {
+    expect(GATEWAY).toMatch(/permissionTimeoutSignatures\.delete\(sig\)/)
+  })
+})

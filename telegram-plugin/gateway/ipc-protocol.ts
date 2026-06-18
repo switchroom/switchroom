@@ -38,6 +38,18 @@ export interface PermissionEvent {
    * (`mcp__<server>__*`).
    */
   rule?: string;
+  /**
+   * Optional human-readable reason for the verdict, surfaced to the model
+   * verbatim by claude's permission channel as "…the user said: ${message}".
+   * Only set on `deny`. switchroom uses it to make a TIMEOUT auto-deny (no
+   * operator response within the TTL) distinguishable from a deliberate
+   * operator denial — otherwise both render as the generic "Denied" and the
+   * model retries the identical call, re-raising an identical card 10 min
+   * later (marko Rentals-budget loop, 2026-06-17). When absent, claude falls
+   * back to its default "Denied", so this degrades safely on any claude that
+   * ignores the field.
+   */
+  message?: string;
 }
 
 export interface StatusEvent {

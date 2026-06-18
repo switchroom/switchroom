@@ -26,7 +26,10 @@ export function validateGatewayMessage(msg: unknown): msg is GatewayToClient {
         && (m.behavior === "allow" || m.behavior === "deny")
         // `rule` is optional (only sent on "🔁 Always allow"); when present
         // it must be a non-empty string. #1138 wire extension.
-        && (m.rule === undefined || (typeof m.rule === "string" && m.rule.length > 0));
+        && (m.rule === undefined || (typeof m.rule === "string" && m.rule.length > 0))
+        // `message` is optional (deny only — the timeout-vs-denial reason);
+        // when present it must be a non-empty string.
+        && (m.message === undefined || (typeof m.message === "string" && m.message.length > 0));
     case "status":
       return typeof m.status === "string";
     case "tool_call_result":
