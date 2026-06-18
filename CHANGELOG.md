@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.15.39 — fix: connection-health false positives (empty scope.allow)
+
+- **Connection-health no longer false-flags working MCPs (#2417).** v0.15.38's
+  doctor "MCP Connections (auth)" check + agent-start boot card reported a
+  user-declared MCP as "not authed" whenever the agent wasn't in the vault
+  entry's `scope.allow` — *including the normal case of an empty `scope.allow`*,
+  which the broker treats as no restriction. The whole fleet false-positived.
+  The check now mirrors the broker's `checkEntryScope` exactly
+  (`entryScopeDenies`): an empty allow is fine; only a non-empty allow without
+  the agent, or the agent being in `scope.deny`, is a real denial (and
+  `scope.deny` is now threaded through the readers, so deny-based revocations
+  are caught too). Real-denial detection is preserved; only the empty-allow
+  false positive is removed.
+- **Also:** agents nudged to batch foreseeable approvals + not drop timed-out
+  ones (#2415); hindsight automated backups + container healthcheck + pg
+  self-maintenance (#2416).
+
 ## v0.15.38 — Connection health + leaner telegram tool surface + cold-restart fix
 
 Makes third-party **connections** (MCP integrations) honest about their auth
