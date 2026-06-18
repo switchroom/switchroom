@@ -5,7 +5,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
 import { getAllAgentStatuses, getAgentStartSha } from "../agents/lifecycle.js";
-import { COMMIT_SHA, VERSION } from "../build-info.js";
+import { COMMIT_SHA } from "../build-info.js";
+import { SWITCHROOM_VERSION as VERSION } from "./resolve-version.js";
 
 /**
  * Try to get the installed claude-code version.
