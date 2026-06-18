@@ -370,6 +370,7 @@ import {
   foregroundFinishAction,
 } from './foreground-nesting.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
+import { recoverFromPollStall } from './poll-stall-recovery.js'
 import type {
   ToolCallMessage,
   ToolCallResult,
@@ -21158,54 +21159,32 @@ process.on('uncaughtException', err => {
 let runnerHandle: RunnerHandle | null = null
 
 // Long-poll health-check handle (issue #56). Created once per process, started
-// after the runner comes up, stopped on clean shutdown. The `onStall` callback
-// stops the runner so the outer retry loop can restart it.
+// after the runner comes up, stopped on clean shutdown. On a confirmed stall
+// the gateway EXITS non-zero and the supervisor restarts it with a fresh runner
+// (see recoverFromPollStall + the 2026-06-18 incident note there). It does NOT
+// try to stop()+re-run the runner in place — grammy's stop() blocks on a non-
+// abortable getUpdates retry backoff during a network outage, which hung the
+// whole fleet deaf.
 //
 // Interval and threshold are configurable via env for ops/testing flexibility:
-//   SWITCHROOM_POLL_HEALTH_INTERVAL_MS — default 5 min
-//   SWITCHROOM_POLL_HEALTH_THRESHOLD   — default 3
+//   SWITCHROOM_POLL_HEALTH_INTERVAL_MS — default 60s (fast self-heal after a flap)
+//   SWITCHROOM_POLL_HEALTH_THRESHOLD   — default 3 (a single blip must not trip it)
 const POLL_HEALTH_INTERVAL_MS = Number(
-  process.env.SWITCHROOM_POLL_HEALTH_INTERVAL_MS ?? 5 * 60_000,
+  process.env.SWITCHROOM_POLL_HEALTH_INTERVAL_MS ?? 60_000,
 )
 const POLL_HEALTH_THRESHOLD = Number(
   process.env.SWITCHROOM_POLL_HEALTH_THRESHOLD ?? 3,
 )
-
-/** Sentinel error thrown by onStall so the outer for-loop retries rather
- *  than exiting. The catch block recognises this specific message. */
-class PollStallError extends Error {
-  constructor() {
-    super('poll_stall_restart')
-    this.name = 'PollStallError'
-  }
-}
 
 let pollHealthCheck: PollHealthCheckHandle | null = null
 if (POLL_HEALTH_INTERVAL_MS > 0) {
   pollHealthCheck = createPollHealthCheck({
     ping: () => bot.api.getMe(),
     onStall: async () => {
-      const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
-      process.stderr.write(
-        `telegram gateway: poll.health_check.stall_recovery stopping runner agent=${agentName}\n`,
-      )
-      if (runnerHandle != null && runnerHandle.isRunning()) {
-        try {
-          await runnerHandle.stop()
-        } catch (err) {
-          process.stderr.write(
-            `telegram gateway: poll.health_check.stall_recovery runner.stop error: ${(err as Error).message}\n`,
-          )
-        }
-      }
-      // runnerHandle.stop() causes task() to resolve. That would normally
-      // hit the `return` below and exit the startup IIFE. Instead we throw
-      // PollStallError from inside task()'s continuation by surfacing it
-      // through the outer catch block — but task() itself doesn't throw here.
-      //
-      // The simpler fix: set runnerHandle to a sentinel that the code below
-      // `await runnerHandle.task()` checks to decide continue vs return.
-      runnerHandle = null
+      // Exit non-zero → _switchroom_supervise restarts the gateway sidecar
+      // with a fresh runner. Never awaits runnerHandle.stop() (it hangs on a
+      // wedged source). recoverFromPollStall exits 1, never 78.
+      recoverFromPollStall({ agentName: process.env.SWITCHROOM_AGENT_NAME ?? '-' })
     },
     intervalMs: POLL_HEALTH_INTERVAL_MS,
     failureThreshold: POLL_HEALTH_THRESHOLD,
@@ -22287,20 +22266,10 @@ void (async () => {
       pollHealthCheck?.stop()
       pollHealthCheck?.start()
       await runnerHandle.task()
-      // If onStall fired, it called runnerHandle.stop() which resolved task()
-      // above, then set runnerHandle = null. Detect that here and continue the
-      // loop to restart the runner. A normal clean exit leaves runnerHandle non-
-      // null (the stopped handle is still non-null at this point), so we can
-      // distinguish: null means stall-triggered, non-null means clean exit.
-      if (runnerHandle === null) {
-        const agentName = process.env.SWITCHROOM_AGENT_NAME ?? '-'
-        process.stderr.write(
-          `telegram gateway: poll.health_check.stall_recovery restarting runner agent=${agentName}\n`,
-        )
-        // Brief pause so the Telegram API can close the stalled connection.
-        await new Promise(r => setTimeout(r, 2000))
-        continue
-      }
+      // task() resolves only on clean shutdown (shutdown-drain stops the
+      // runner) — exit the startup IIFE. Stall recovery no longer routes here:
+      // onStall exits the process and the supervisor restarts the gateway
+      // (see recoverFromPollStall). The 409 path below re-runs in place.
       return
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 409) {
