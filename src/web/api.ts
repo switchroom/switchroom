@@ -1192,6 +1192,74 @@ export function handleGetNotionWorkspace(
   };
 }
 
+export interface LinearAgentInfo {
+  /** Agent name. */
+  agent: string;
+  /** Linear workspace (organization) id, if declared. */
+  workspaceId: string | null;
+  /** Default Linear team id new captured issues file into, if declared. */
+  defaultTeamId: string | null;
+  /**
+   * Vault key REFERENCE for the OAuth access token (e.g.
+   * `vault:linear/<agent>/token`) — never the token itself. Null if the
+   * config field is absent or (defensively) not a `vault:` reference.
+   */
+  tokenVaultKey: string | null;
+}
+
+export interface LinearAgentsDashboard {
+  /** True when at least one agent is connected as a Linear OAuth app actor. */
+  configured: boolean;
+  /** Agents with `channels.telegram.linear_agent.enabled` (cascade-resolved). */
+  agents: LinearAgentInfo[];
+}
+
+/**
+ * Linear view for the dashboard. Linear has exactly ONE integration mode:
+ * the first-class OAuth **app actor** (`channels.telegram.linear_agent`) — an
+ * agent appears in the workspace as its own actor (#2298). There is no
+ * "personal API token for MCP" alternative, so an agent with
+ * `linear_agent.enabled` IS connected as a Linear OAuth agent.
+ *
+ * This is config-only (like Notion): the internet-facing web tier reads the
+ * cascade-resolved per-agent config and returns only metadata + the token's
+ * vault-key REFERENCE. It never reads the vault, so the access token / OAuth
+ * refresh bundle (client_secret, refresh_token) never reach the web tier or
+ * the client. Live token freshness lives with the in-agent gateway's proactive
+ * `linear-auth-watch` (which alerts the operator on Telegram); surfacing it
+ * here would require the web tier to read per-agent vault state, which the
+ * minimal-surface web container deliberately cannot do.
+ */
+export function handleGetLinearAgents(
+  config: SwitchroomConfig,
+): LinearAgentsDashboard {
+  const agentNames = Object.keys(config.agents ?? {});
+  const agents: LinearAgentInfo[] = [];
+  for (const name of agentNames) {
+    const rawAgent = config.agents?.[name];
+    if (!rawAgent) continue;
+    const linear = resolveAgentConfig(
+      config.defaults,
+      config.profiles,
+      rawAgent,
+    ).channels?.telegram?.linear_agent;
+    if (!linear?.enabled) continue;
+    // The schema mandates a `vault:` reference; surface it only when it
+    // actually looks like one so a misconfigured inline literal can't leak.
+    const tok = linear.token;
+    const tokenVaultKey =
+      typeof tok === "string" && tok.startsWith("vault:") ? tok : null;
+    agents.push({
+      agent: name,
+      workspaceId: linear.workspace_id ?? null,
+      defaultTeamId: linear.default_team_id ?? null,
+      tokenVaultKey,
+    });
+  }
+  agents.sort((a, b) => a.agent.localeCompare(b.agent));
+  return { configured: agents.length > 0, agents };
+}
+
 export type ConnectionAccessStatus =
   | { state: "pending"; startedAt: number }
   | { state: "applied"; startedAt: number; restartAgent: string }

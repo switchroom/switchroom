@@ -41,6 +41,7 @@ import {
   handleStartMicrosoftConnect,
   handleGetMicrosoftConnectStatus,
   handleGetNotionWorkspace,
+  handleGetLinearAgents,
   handleGetSchedule,
   handleGetApprovals,
   handleGetGrants,
@@ -560,6 +561,11 @@ function parseRoute(
     return { handler: "getNotionWorkspace", params: {} };
   }
 
+  // GET /api/linear-agents
+  if (method === "GET" && pathname === "/api/linear-agents") {
+    return { handler: "getLinearAgents", params: {} };
+  }
+
   // GET /api/schedule
   if (method === "GET" && pathname === "/api/schedule") {
     return { handler: "getSchedule", params: {} };
@@ -904,6 +910,9 @@ export function startWebServer(
 
           case "getNotionWorkspace":
             return jsonResponse(handleGetNotionWorkspace(freshConfig()));
+
+          case "getLinearAgents":
+            return jsonResponse(handleGetLinearAgents(freshConfig()));
 
           case "getSchedule":
             return (async () =>

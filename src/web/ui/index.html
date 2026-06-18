@@ -1036,20 +1036,21 @@
         .then(r => r.ok ? r.json().then(d => ({ ok: true, data: d })) : { ok: false, data: fallback })
         .catch(() => ({ ok: false, data: fallback }));
       try {
-        const [g, ms, n, ag] = await Promise.all([
+        const [g, ms, n, li, ag] = await Promise.all([
           safe(fetch(`${API}/api/google-accounts`, { headers: authHeaders() }), []),
           safe(fetch(`${API}/api/microsoft-accounts`, { headers: authHeaders() }), []),
           safe(fetch(`${API}/api/notion-workspace`, { headers: authHeaders() }), { configured: false, databases: [] }),
+          safe(fetch(`${API}/api/linear-agents`, { headers: authHeaders() }), { configured: false, agents: [] }),
           safe(fetch(`${API}/api/agents`, { headers: authHeaders() }), []),
         ]);
-        // Notion legitimately reports unconfigured — not a failure. The OAuth
-        // providers + the agent list are the ones whose failure must not read
-        // as "empty".
+        // Notion + Linear legitimately report unconfigured — not a failure. The
+        // OAuth providers + the agent list are the ones whose failure must not
+        // read as "empty".
         const fetchFailed = !g.ok || !ms.ok || !ag.ok;
         renderConnections({
-          google: g.data, microsoft: ms.data, notion: n.data,
+          google: g.data, microsoft: ms.data, notion: n.data, linear: li.data,
           agentNames: (ag.data || []).map(a => a.name).sort(),
-          googleFailed: !g.ok, microsoftFailed: !ms.ok, fetchFailed,
+          googleFailed: !g.ok, microsoftFailed: !ms.ok, linearFailed: !li.ok, fetchFailed,
         });
         clearError();
         // Self-heal a transient blip without a manual re-click. Bounded
@@ -2150,6 +2151,7 @@
       const google = data.google || [];
       const microsoft = data.microsoft || [];
       const notion = data.notion || { configured: false, databases: [] };
+      const linear = data.linear || { configured: false, agents: [] };
       const agentNames = data.agentNames || [];
 
       // When a provider's fetch FAILED (not genuinely empty), its empty-state
@@ -2213,6 +2215,37 @@
           ${fullAccessBanner}${notionBody}
         </div>`;
 
+      // Linear — first-class OAuth app actors (config-only; the web tier never
+      // reads the per-agent vault, so no token/expiry is shown — and never the
+      // secret). One card per agent with linear_agent.enabled.
+      const linearCards = (linear.agents || []).map(a => {
+        const meta = [];
+        if (a.workspaceId) meta.push(`<div class="meta-item"><label>Workspace </label><span>${escapeHtml(a.workspaceId)}</span></div>`);
+        if (a.defaultTeamId) meta.push(`<div class="meta-item"><label>Default team </label><span>${escapeHtml(a.defaultTeamId)}</span></div>`);
+        if (a.tokenVaultKey) meta.push(`<div class="meta-item"><label>Token </label><span><code>${escapeHtml(a.tokenVaultKey)}</code></span></div>`);
+        return `
+        <div class="account-card">
+          <div class="account-card-header">
+            <div class="account-label">${escapeHtml(a.agent)}</div>
+            <span style="margin-left:auto" class="usage-pill primary">OAuth agent</span>
+          </div>
+          <div class="card-meta" style="padding:0">${meta.join('') || _dimC('—')}</div>
+        </div>`;
+      }).join('');
+      const linearNote = (linear.agents && linear.agents.length)
+        ? `<div style="margin:0 0 .6rem;font-size:.85rem;color:var(--text-dim)">Connected as Linear <b>OAuth app actors</b> — each appears in the workspace as its own actor (not a personal API token for MCP).</div>`
+        : '';
+      const linearBody = linearCards
+        ? `<div class="accounts-grid">${linearCards}</div>`
+        : `<div class="loading" style="padding:.8rem">${data.linearFailed
+            ? "Couldn't load Linear agents — the data source was unreachable (retrying)."
+            : 'No Linear agents connected. Run <code>switchroom linear-agent setup --agent &lt;name&gt;</code> to connect one as a Linear OAuth app actor.'}</div>`;
+      const linearSection = `
+        <div style="margin-bottom:1.5rem">
+          <h3 style="margin:0 0 .6rem;font-size:.95rem;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em">Linear</h3>
+          ${linearNote}${linearBody}
+        </div>`;
+
       // Tab-level degraded banner: when every OAuth account (Google +
       // Microsoft) is config-only (no live broker slot) and there's at least
       // one, the broker data is unavailable — surface that ABOVE the sections
@@ -2230,7 +2263,7 @@
         ? renderProblem(problemFor('connections-unreachable', {}))
         : '';
 
-      container.innerHTML = unreachableBanner + degradedBanner + googleSection + microsoftSection + notionSection;
+      container.innerHTML = unreachableBanner + degradedBanner + googleSection + microsoftSection + notionSection + linearSection;
     }
 
     function renderSchedule(data) {
