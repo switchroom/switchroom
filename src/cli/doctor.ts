@@ -39,6 +39,7 @@ import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
 import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
+import { runContextChecks } from "./doctor-context.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
 import { runSecretAccessChecks } from "./doctor-secret-access.js";
 import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
@@ -2787,6 +2788,31 @@ export function registerDoctorCommand(program: Command): void {
           {
             title: "MCP Connections (auth)",
             results: await runMcpSecretChecks(config, { vaultAclReader }),
+          },
+          {
+            title: "Context Headroom",
+            results: await runContextChecks(config, {
+              readSnapshot: async (agent) => {
+                // Snapshot lives at the agent's 0700 state dir → read via
+                // docker exec (mirrors how status queries agents).
+                try {
+                  const { execFileSync } = await import("node:child_process");
+                  const out = execFileSync(
+                    "docker",
+                    ["exec", `switchroom-${agent}`, "cat", "/state/agent/context-occupancy.json"],
+                    { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 },
+                  );
+                  return { kind: "ok", snapshot: JSON.parse(out) };
+                } catch (err) {
+                  const msg = (err as Error).message ?? String(err);
+                  // No file / container down → absent (skip), not a failure.
+                  if (/No such|cannot|not running|exited|No such container/i.test(msg)) {
+                    return { kind: "absent" };
+                  }
+                  return { kind: "unreadable", msg: `snapshot read failed: ${msg}` };
+                }
+              },
+            }),
           },
           { title: "MFF Skill", results: await checkMff(passphrase, vaultPath, config) },
           { title: "Webkite", results: runWebkiteChecks(config) },

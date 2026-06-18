@@ -165,6 +165,8 @@ export default defineConfig({
       "**/src/vault/broker/server.test.ts",
       "**/src/vault/broker/auto-unlock.test.ts",
       "**/telegram-plugin/tests/boot-probes.test.ts",
+      // context-occupancy.test.ts uses bun:test — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/context-occupancy.test.ts",
       // tool-filter.test.ts uses bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/tests/tool-filter.test.ts",
       // boot-probes-connections.test.ts uses bun:test — excluded here, run via test:bun.
