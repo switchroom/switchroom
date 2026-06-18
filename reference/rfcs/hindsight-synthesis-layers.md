@@ -2,7 +2,7 @@
 artefact: Hindsight primitive fit — use the synthesis layers the memory job demands
 serves: jobs/remember-across-sessions.md
 relates: jobs/run-a-fleet-of-specialists.md, jobs/feel-like-a-colleague.md
-status: proposal (2026-06-18) — analysis + phased plan, not yet scheduled
+status: proposal (2026-06-18, rev. speed/token budget) — analysis + phased plan, not yet scheduled
 ---
 
 # Hindsight synthesis layers — what we run vs. what the job asks for
@@ -118,11 +118,17 @@ Ordered by leverage-per-effort. Each phase is independently shippable
 and crosses no invariant.
 
 **Phase 1 — Consume what we already synthesize (cheapest, highest leverage).**
-Include `observation` in the auto-recall types, or route recall through
-`reflect` for queries that warrant synthesis. Turns 45k of paid-for,
+Add `observation` to the auto-recall `types`. Turns 45k of paid-for,
 deduped, provenance-carrying observations from dead weight into the
-"curated, by-relevance" recall the job demands. Pure consumption change;
-no new background work.
+"curated, by-relevance" recall the job demands. Pure consumption change
+in the same `memory_units`/HNSW index — near-zero added recall latency,
+and observations are *denser* (one synthesized statement replaces N raw
+facts) so coverage improves inside the same 1024-token cap. **Do not**
+route the hot recall path through `reflect` (an agentic ~5-iteration
+loop, 300s ceiling) — that would blow warm TTFO (~1.7s) into seconds and
+multiply per-turn tokens; reflect stays reserved for explicit
+"what do you know about me" asks. See *Speed & token budget* below — this
+phase may also let the recall budget drop `mid`→`low` (faster + cheaper).
 
 **Phase 2 — Specialize each bank.** Set a per-agent `retain_mission` /
 `reflect_mission` / `disposition` from the agent's profile (a coach
@@ -136,16 +142,76 @@ verbatim, chat-legible) rather than hoping recall re-surfaces them. The
 most invariant-aligned primitive for the job's "rules set once stay
 respected / correction sticks" criteria.
 
-**Phase 4 — Make memory chat-legible.** Optionally surface a terse
-"remembered: X" / "updated what I know about Y" line so recall and
-consolidation stop being invisible — closing tension (1) and (2). The
-`consolidation.completed` webhook can drive the update side without
-polling.
+**Phase 4 — Make memory chat-legible (sparse, not per-turn).** Surface a
+terse "remembered: X" / "updated what I know about Y" line so recall and
+consolidation stop being invisible — closing tension (1) and (2). **This
+must be sparse and material-only**, never default-on-every-turn:
+the job lists "regurgitating old facts unprompted just to prove it
+remembered" as a top anti-pattern, so a per-turn legibility line would
+*become* that anti-pattern. Surface only on a genuine store/correct, or
+on request. The `consolidation.completed` webhook can drive the update
+side without polling.
 
-**Phase 5 — Curated mental models per specialist.** Operator-curated, or
-agent-proposes → operator-confirms in chat, for specialists that earn a
-pinned model (the gap behind "Hindsight doesn't create models as
-needed"). Deliberately *not* autonomous creation (tension 3).
+**Phase 5 — Curated mental models per specialist (selective).**
+Operator-curated, or agent-proposes → operator-confirms in chat, for
+specialists that earn a pinned model (the gap behind "Hindsight doesn't
+create models as needed"). Deliberately *not* autonomous creation
+(tension 3). Curate **selectively** — each model adds
+post-consolidation refresh spend (bounded ~2048 tokens, but can hit the
+300s reflect timeout, which we already see fail ~9×), so more models is
+more invisible background cost. Their upside is real on the *explicit*
+reflect path (fresh models let reflect short-circuit the lower tiers →
+faster), but they do not speed the hot recall path.
+
+**Phase 6 — Two near-free hot-path levers (UX + speed + tokens).** Not
+synthesis-tier work, but the largest responsiveness/cost wins and they
+cross no invariant:
+- **Gate recall on need.** Recall fires on *every* turn — a trivial
+  "what time is it" still pays a ~5s recall arm + up to 1024 injected
+  tokens it never uses. Skipping recall for plausibly-stateless/trivial
+  asks speeds exactly the warm-TTFO path the `jtbd-fast-trivial-dm` gate
+  measures *and* saves tokens.
+- **Right-size retain cadence.** `retainEveryNTurns=1` means every turn
+  triggers background consolidation (sonnet) — the single largest
+  *invisible* subscription draw, and the engine room of tension (1).
+  Retaining every 2–3 turns roughly halves that spend. **Caveat:** the
+  every-turn setting is deliberate (the restart-memory-loss UAT), so
+  this is a real tradeoff to measure, not a free win — hence its own
+  lever, gated on proving no memory-loss regression.
+
+## Speed & token budget
+
+The fit argument above is about *correctness*; this section weighs
+*cost*. Two latency/token surfaces matter, and they pull in opposite
+directions:
+
+- **Foreground (per-turn).** The auto-recall hook runs on every
+  `UserPromptSubmit` (budget `mid` ~5s, 12s timeout) and injects up to
+  1024 tokens of context. This is on the critical path for warm TTFO
+  (~1.7s baseline, gated by `jtbd-fast-trivial-dm`). Anything added here
+  is felt directly.
+- **Background (invisible).** Every retain triggers consolidation
+  (sonnet) the operator never sees; `retainEveryNTurns=1` makes that
+  per-turn. This is the largest *uncounted* subscription draw and the
+  engine room of invariant tension (1). Mental-model refreshes add to it.
+
+Per-phase scorecard against the three axes:
+
+| Phase | UX | Speed | Tokens |
+|---|---|---|---|
+| 1. Consume observations | curated, not grab-bag | ~neutral (same index) | denser → ≤ same; may enable `mid`→`low` |
+| 2. Per-agent missions/disposition | specialized recall | neutral (shapes extraction) | slight win — less noise stored |
+| 3. Directives ("corrections stick") | strong | negligible | small fixed per-turn cost if always injected |
+| 4. Chat-legible (sparse) | legible **iff** sparse | negligible | minor output tokens |
+| 5. Curated mental models | + faster *reflect* | neutral on hot path | background refresh spend; timeout risk |
+| 6a. Gate recall on need | trivial turns feel instant | **win** — skips ~5s arm | **win** — drops ~1024 tok on trivial turns |
+| 6b. Right-size retain cadence | unchanged | unchanged | **win** — ~halves background consolidation |
+
+Net read: **Phase 1(a), 2, 3, 6a** are positive-or-neutral on all three
+axes (1(a) and 6a are close to free wins). **Phase 4** is UX-positive
+only if kept sparse. **Phase 5** trades background tokens for
+explicit-reflect speed — curate selectively. **Phase 6b** is the biggest
+token lever but a measured tradeoff, not a free win.
 
 ## Verdict check (the four-part rule)
 
@@ -153,9 +219,10 @@ needed"). Deliberately *not* autonomous creation (tension 3).
   job and the specialist job.
 - **Satisfies the job spec?** Moves recall from the job's *bad* column
   (grab-bag/raw) toward its *good* column (curated/legible/by-relevance).
-- **Passes the three principle checks?** Defaults: phases 1–3 are config
-  defaults, no operator assembly. Docs: behavior improves without new
-  user-facing concepts. Consistency: same vault/config cascade.
+- **Passes the three principle checks?** Defaults: phases 1–3 and 6 are
+  config defaults, no operator assembly. Docs: behavior improves without
+  new user-facing concepts. Consistency: same vault/config cascade.
+  Speed/tokens: net-positive or measured (see *Speed & token budget*).
 - **Crosses an invariant?** No — each phase is shaped to avoid the
   tensions named above (no autonomous self-writes; legibility added, not
   removed).
