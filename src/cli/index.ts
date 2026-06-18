@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { VERSION } from "../build-info.js";
+import { SWITCHROOM_VERSION as VERSION } from "./resolve-version.js";
 import { registerAgentCommand } from "./agent.js";
 import { registerStatusCommand } from "./status.js";
 import { registerTopicsCommand } from "./topics.js";

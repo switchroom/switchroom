@@ -247,6 +247,10 @@ RUN chmod 0755 /opt/switchroom/security-plugin/hooks/*.mjs
 # shells out to `switchroom <verb>` for /auth, /vault, /agent, /topics
 # and friends (see telegram-plugin/gateway/gateway.ts:switchroomExec).
 COPY dist/cli/switchroom.js /opt/switchroom/switchroom.js
+# Ship package.json next to the bundle so `switchroom --version` resolves the
+# authoritative version at runtime (src/cli/resolve-version.ts), immune to a
+# stale build-info baked into the prebuilt bundle or a build-cache layer.
+COPY package.json /opt/switchroom/package.json
 RUN chmod 0755 /opt/switchroom/switchroom.js \
  && ln -s /opt/switchroom/switchroom.js /usr/local/bin/switchroom
 
