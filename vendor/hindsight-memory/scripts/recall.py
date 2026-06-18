@@ -42,6 +42,7 @@ Exit codes:
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -466,6 +467,57 @@ def read_transcript_messages(transcript_path: str) -> list:
     return messages
 
 
+# Switchroom Phase 6a — stateless-prompt classifier for the recall skip.
+# Returns True ONLY for prompts that provably never need user memory: the
+# current time/date/day, or a bare greeting. Biased hard toward False —
+# any personal pronoun, memory verb, or context word means "could need
+# memory → recall anyway". Trap case: "what host am I on" reads trivial
+# but needs memory; the "i" token blocks the skip.
+_TRIVIAL_GREETINGS = frozenset({
+    "hi", "hello", "hey", "heya", "hiya", "yo", "howdy", "sup",
+    "hey there", "hello there", "hi there",
+    "morning", "good morning", "good afternoon", "good evening", "evening",
+})
+# Any of these as a whole word → do NOT skip (prompt may depend on stored
+# user / project / session state).
+_STATEFUL_SIGNALS = frozenset({
+    "i", "im", "ive", "id", "me", "my", "mine", "myself",
+    "we", "our", "ours", "us", "you", "your", "yours",
+    "remember", "recall", "forget", "forgot", "remind",
+    "last", "earlier", "yesterday", "before", "again", "previously", "recent",
+    "project", "task", "status", "config", "setup", "host", "machine",
+    "running", "deploy", "agent", "memory", "note", "noted",
+})
+# Matched against an apostrophe-stripped form, so "what's"→"whats",
+# "today's"→"todays". Covers "what time is it", "what's the time",
+# "what day is it", "what's today's date", "current time", "time?".
+_STATELESS_QUESTION_RE = re.compile(
+    r"^(?:what(?:s| is)?\s+)?"
+    r"(?:the\s+|current\s+|todays\s+)?"
+    r"(?:time|date|day(?:\s+of\s+(?:the\s+)?week)?)"
+    r"(?:\s+is\s+it)?(?:\s+(?:right\s+now|now|today))?"
+    r"\s*\??$"
+)
+
+
+def _is_trivial_stateless(ack_form, stripped):
+    text = (stripped or "").lower().strip()
+    core = text.strip(" \t\n\r.,!?…👍👌✅🆗🙏")
+    if not core:
+        return False
+    core_noapos = core.replace("'", "")
+    # If any token signals personal / project / session state, bail —
+    # apostrophes stripped so "i'm"/"i've" tokenise to im/ive (stateful).
+    tokens = re.findall(r"[a-z]+", core_noapos)
+    if any(tok in _STATEFUL_SIGNALS for tok in tokens):
+        return False
+    if core in _TRIVIAL_GREETINGS:
+        return True
+    if _STATELESS_QUESTION_RE.match(core_noapos):
+        return True
+    return False
+
+
 def main():
     config = load_config()
 
@@ -520,6 +572,18 @@ def main():
     })
     if _ack_form in ACK_PHRASES:
         debug_log(config, f"Prompt is ack-only ({_ack_form!r}), skipping recall")
+        return
+
+    # Switchroom Phase 6a (RFC hindsight-synthesis-layers.md) — skip recall
+    # on plausibly-stateless trivial asks (time/date/day, bare greetings)
+    # when `recallSkipTrivial` is on. Same conservatism as the ack-skip:
+    # a false negative (skipping a turn that DID need memory) costs the
+    # remember-across-sessions continuity, so `_is_trivial_stateless`
+    # bails the instant the prompt carries any personal/stateful signal
+    # (a pronoun, a memory verb, "project", etc.). It only skips an exact
+    # stateless form — never a content-classifier guess.
+    if config.get("recallSkipTrivial", True) and _is_trivial_stateless(_ack_form, _stripped):
+        debug_log(config, f"Prompt is trivial/stateless ({_ack_form!r}), skipping recall")
         return
 
     session_id = hook_input.get("session_id") or ""
