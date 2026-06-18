@@ -46,6 +46,7 @@ import type { ApprovalDecisionMeta } from "../vault/broker/protocol.js";
 import { homedir } from "node:os";
 import { captureEvent, captureException } from "../analytics/posthog.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import type { ContextSnapshot } from "../cli/doctor-context.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import {
   agentCanAccessNotionDB,
@@ -158,6 +159,34 @@ export interface AgentInfo {
    * quota menu still shows `active`). The UI renders this as "Last turn".
    */
   lastTurnAt: number | null;
+  /**
+   * Working-context headroom snapshot the gateway writes at each idle gate
+   * (RFC context-headroom-surface): occupancy / cap / state. Null when the
+   * agent hasn't run a turn since boot (no snapshot) or it's unreadable. The
+   * UI renders a gauge; pillar 3 (predictable) made visible.
+   */
+  context: ContextSnapshot | null;
+}
+
+/**
+ * Read an agent's context-occupancy snapshot from `<agentsDir>/<name>/
+ * context-occupancy.json` (the gateway writes it in-container to
+ * /state/agent/, host-mounted here). Null on any error — missing snapshot
+ * (idle since boot) / unreadable / malformed → the UI shows "—". Mirrors
+ * readLastTurnAt's degrade-to-null contract.
+ */
+export function readContextOccupancy(
+  agentsDir: string,
+  name: string,
+): ContextSnapshot | null {
+  try {
+    const raw = readFileSync(resolve(agentsDir, name, "context-occupancy.json"), "utf-8");
+    const s = JSON.parse(raw) as ContextSnapshot;
+    if (typeof s?.occupancy !== "number") return null;
+    return s;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -251,9 +280,12 @@ export async function handleGetAgents(
     /** Injectable for tests (default reads the real per-agent turns DB,
      *  which needs `bun:sqlite` — unavailable under vitest). */
     readLastTurn?: (agentsDir: string, name: string) => number | null;
+    /** Injectable for tests (default reads the per-agent snapshot file). */
+    readContext?: (agentsDir: string, name: string) => ContextSnapshot | null;
   } = {},
 ): Promise<AgentInfo[]> {
   const readLastTurn = deps.readLastTurn ?? readLastTurnAt;
+  const readContext = deps.readContext ?? readContextOccupancy;
   const statuses = getAllAgentStatuses(config);
   const authStatuses = getAllAuthStatuses(config);
   const agentsDir = resolveAgentsDir(config);
@@ -320,6 +352,7 @@ export async function handleGetAgents(
       // A real claude-liveness signal (newest turn's start), distinct
       // from `active` (bridge heartbeat only). Null-safe per agent.
       lastTurnAt: readLastTurn(agentsDir, name),
+      context: readContext(agentsDir, name),
     });
   }
 

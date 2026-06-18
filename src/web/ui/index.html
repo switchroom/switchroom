@@ -122,6 +122,15 @@
 
     .meta-item span { color: var(--text); }
 
+    /* Context-headroom gauge (RFC context-headroom-surface). */
+    .ctx-gauge { display: inline-flex; align-items: center; gap: 0.4rem; }
+    .ctx-text { color: var(--text); font-variant-numeric: tabular-nums; }
+    .ctx-bar {
+      display: inline-block; width: 48px; height: 6px; border-radius: 3px;
+      background: var(--bg-dim, rgba(255,255,255,0.12)); overflow: hidden;
+    }
+    .ctx-fill { display: block; height: 100%; border-radius: 3px; }
+
     .scope-toggle {
       cursor: pointer;
       color: var(--text);
@@ -1659,6 +1668,27 @@
       return 'inactive';
     }
 
+    // Context-headroom gauge (RFC context-headroom-surface): occupancy/cap
+    // with a fill bar, amber when tight (≥80%). '—' when no snapshot yet.
+    function fmtTok(n) {
+      return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+    }
+    function formatContext(ctx) {
+      if (!ctx || ctx.state === 'unknown' || typeof ctx.occupancy !== 'number') {
+        return '<span style="color:var(--text-dim)">—</span>';
+      }
+      if (ctx.cap == null || ctx.pct == null) {
+        return `<span>${fmtTok(ctx.occupancy)} <span style="color:var(--text-dim)">(no cap)</span></span>`;
+      }
+      const pct = Math.max(0, Math.min(1, ctx.pct));
+      const tight = ctx.state === 'tight';
+      const col = tight ? 'var(--amber, #d99)' : 'var(--green)';
+      return `<span class="ctx-gauge" title="${fmtTok(ctx.occupancy)} / ${fmtTok(ctx.cap)} tokens — ${Math.round(pct * 100)}% of cap${tight ? ' (tight — /compact near)' : ''}">`
+        + `<span class="ctx-text">${fmtTok(ctx.occupancy)}/${fmtTok(ctx.cap)} (${Math.round(pct * 100)}%)</span>`
+        + `<span class="ctx-bar"><span class="ctx-fill" style="width:${(pct * 100).toFixed(0)}%;background:${col}"></span></span>`
+        + `</span>`;
+    }
+
     function formatUptime(timestamp) {
       if (!timestamp) return '--';
       const d = new Date(timestamp);
@@ -1693,6 +1723,7 @@
             <div class="meta-item"><label>Uptime </label><span>${formatUptime(a.uptime)}</span></div>
             <div class="meta-item"><label>Mem </label><span>${a.memory || '--'}</span></div>
             <div class="meta-item"><label>Last turn </label><span>${a.lastTurnAt ? formatTimestamp(a.lastTurnAt) : '—'}</span></div>
+            <div class="meta-item meta-context"><label>Context </label>${formatContext(a.context)}</div>
             <div class="meta-item"><label>Profile </label><span>${escapeHtml(a.extends)}</span></div>
             <div class="meta-item"><label>Auth </label><span>${a.auth.authenticated ? '✓' : '✗'}</span></div>
             <div class="meta-item"><label>Account </label><span>${a.primaryAccount ? escapeHtml(a.primaryAccount) : '<span style="color:var(--text-dim)">default</span>'}</span></div>
