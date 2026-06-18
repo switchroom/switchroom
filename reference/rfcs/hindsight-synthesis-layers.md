@@ -42,8 +42,9 @@ for, within the lines.
   were curated by hand, not grown.
 - **Reflect prefers the tiers we don't feed it.** The reflect agent's
   forced tool order is `search_mental_models` → `search_observations`
-  → `recall` (raw) → `expand`; on a non-high budget it short-circuits
-  the lower tiers if the mental models come back fresh. Switchroom
+  → `recall` (raw) (with `expand` available but not forced); on a
+  non-high budget it short-circuits the lower tiers if the mental
+  models come back fresh. Switchroom
   invokes reflect only on explicit "what do you know about me" asks,
   and feeds it mostly raw facts plus the one model.
 - **Per-agent banks are isolated but not specialized.** Banks are keyed
