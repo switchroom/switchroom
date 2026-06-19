@@ -2161,11 +2161,20 @@ export function installHindsightPlugin(
   // turn is correct.
   // Resolve the effective extra recall banks for this agent — the static
   // shared-bank foundation for per-user memory (ship-B; RFC
-  // reference/rfcs/per-speaker-memory-routing.md). `agentMemory` is the
-  // cascaded per-agent memory (defaults.memory.recall is already merged in by
-  // src/config/merge.ts), so the per-agent value wins and the fleet default
-  // is reflected here too.
-  const additionalBanks = agentMemory?.recall?.additional_banks ?? [];
+  // reference/rfcs/per-speaker-memory-routing.md). Read from the CASCADED
+  // config (defaults → profile → agent), mirroring how the env-export path
+  // reads the sibling recall knobs (max_memories etc.) — so a fleet-wide
+  // `defaults.memory.recall.additional_banks` is honoured, not just a
+  // per-agent value. `switchroomConfig.agents[agentName]` is the raw,
+  // pre-cascade block, so resolve it here.
+  const agentRaw = switchroomConfig.agents[agentName];
+  const additionalBanks = agentRaw
+    ? resolveAgentConfig(
+        switchroomConfig.defaults,
+        switchroomConfig.profiles,
+        agentRaw,
+      ).memory?.recall?.additional_banks ?? []
+    : [];
   applyHindsightSettingsOverrides(destPath, additionalBanks);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.

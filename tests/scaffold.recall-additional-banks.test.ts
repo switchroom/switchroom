@@ -63,4 +63,39 @@ describe("hindsight recall — additional_banks → recallAdditionalBanks", () =
     expect(s.recallSkipTrivial).toBe(true);
     expect(s.recallMaxMemories).toBe(8);
   });
+
+  // The headline use case: a shared profile bank set ONCE under `defaults`
+  // must reach every agent. This exercises the cascade (defaults → agent),
+  // which the per-agent-only cases above do not.
+  function settingsForCascade(cfg: {
+    defaults?: unknown;
+    agentMemory?: unknown;
+  }): Record<string, unknown> {
+    const config = {
+      agents: { probe: cfg.agentMemory ? { memory: cfg.agentMemory } : {} },
+      defaults: cfg.defaults,
+      memory: { backend: "hindsight", config: { url: "http://localhost:18888/mcp/" } },
+      telegram: { bot_token: "t", forum_chat_id: "c" },
+    } as unknown as SwitchroomConfig;
+    const res = installHindsightPlugin("probe", tmpDir, config);
+    expect(res).not.toBeNull();
+    const p = join(tmpDir, ".claude", "plugins", "hindsight-memory", "settings.json");
+    return JSON.parse(readFileSync(p, "utf-8"));
+  }
+
+  it("cascade: a fleet-wide defaults.memory.recall.additional_banks reaches an agent with no override", () => {
+    const s = settingsForCascade({
+      defaults: { memory: { recall: { additional_banks: ["operator-profile"] } } },
+    });
+    expect(s.recallAdditionalBanks).toEqual(["operator-profile"]);
+  });
+
+  it("cascade: a per-agent additional_banks overrides the fleet default", () => {
+    const s = settingsForCascade({
+      defaults: { memory: { recall: { additional_banks: ["operator-profile"] } } },
+      agentMemory: { recall: { additional_banks: ["probe-only"] } },
+    });
+    // recall deep-merges per-key (replace), so the agent's array wins.
+    expect(s.recallAdditionalBanks).toEqual(["probe-only"]);
+  });
 });
