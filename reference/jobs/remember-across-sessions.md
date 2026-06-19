@@ -38,8 +38,8 @@ memory the user won't trust.
   relationship; the agent picks up roughly where it was.
 - The user can ask what the agent believes about them and why, and get an
   honest, legible answer.
-- Each agent's memory is its own — different specialists, topics, and the
-  single user are never conflated into one pool.
+- Each agent's memory is its own — different specialists, topics, and
+  distinct users are never conflated into one pool.
 
 **Bad looks like — never ship this**
 
