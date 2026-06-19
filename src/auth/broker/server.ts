@@ -1099,18 +1099,18 @@ export class AuthBroker {
     // fails over). mark-exhausted stays on the raw callerAccount for attribution.
     const account = this.servingAccount(identity);
     if (!account) {
-      this.audit({ op: "get-credentials", identity, ok: false, error: "no-active-account" });
+      this.audit({ op: "get-credentials", identity, accountKind: "claude", ok: false, error: "no-active-account" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
       return;
     }
     const creds = readAccountCredentials(account, this.home);
     if (!creds) {
-      this.audit({ op: "get-credentials", identity, account, ok: false, error: "missing-credentials" });
+      this.audit({ op: "get-credentials", identity, account, accountKind: "claude", ok: false, error: "missing-credentials" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `no credentials for account '${account}'`));
       return;
     }
     const expiresAt = creds.claudeAiOauth?.expiresAt;
-    this.audit({ op: "get-credentials", identity, account, ok: true });
+    this.audit({ op: "get-credentials", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { account, credentials: creds, expiresAt }));
   }
 
@@ -1197,7 +1197,7 @@ export class AuthBroker {
       })
       .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
       .sort((a, b) => a.account.localeCompare(b.account));
-    this.audit({ op: "list-google-accounts", identity, ok: true });
+    this.audit({ op: "list-google-accounts", identity, accountKind: "google", ok: true });
     socket.write(encodeSuccess(id, { accounts }));
   }
 
@@ -1239,7 +1239,7 @@ export class AuthBroker {
             ok: false,
             reason: "no credentials for account in broker store",
           };
-          this.audit({ op: "probe-quota", identity, account: label, ok: false, error: "missing-credentials" });
+          this.audit({ op: "probe-quota", identity, account: label, accountKind: "claude", ok: false, error: "missing-credentials" });
           return { label, result };
         }
         const result = await this.fetchQuotaImpl({ accessToken: token, timeoutMs });
@@ -1247,6 +1247,7 @@ export class AuthBroker {
           op: "probe-quota",
           identity,
           account: label,
+          accountKind: "claude",
           ok: result.ok,
           error: result.ok ? undefined : result.reason,
         });
@@ -1362,7 +1363,7 @@ export class AuthBroker {
       if (existing !== undefined && existing >= exhaustedUntil) continue;
       this.quota[label] = { exhausted_until: exhaustedUntil, marked_at: now };
       this.persistQuota();
-      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, ok: true });
+      this.audit({ op: "mark-exhausted", identity: { kind: "operator" }, account: label, accountKind: "claude", ok: true });
       process.stdout.write(
         `auth-broker: consumer-quota-sensor marked ${label} exhausted until ${new Date(exhaustedUntil).toISOString()} — consumer(s) fail over\n`,
       );
@@ -1376,12 +1377,12 @@ export class AuthBroker {
     account: string,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "set-active", identity, account, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "set-active", identity, account, accountKind: "claude", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "set-active requires admin");
       return;
     }
     if (!accountExists(account, this.home)) {
-      this.audit({ op: "set-active", identity, account, ok: false, error: "ACCOUNT_NOT_FOUND" });
+      this.audit({ op: "set-active", identity, account, accountKind: "claude", ok: false, error: "ACCOUNT_NOT_FOUND" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `account '${account}' not found`));
       return;
     }
@@ -1395,7 +1396,7 @@ export class AuthBroker {
     };
     this.config = cfg;
     const fanned = this.fanoutToAffectedAgents(account);
-    this.audit({ op: "set-active", identity, account, ok: true });
+    this.audit({ op: "set-active", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { active: account, fanned }));
   }
 
@@ -1407,7 +1408,7 @@ export class AuthBroker {
   ): Promise<void> {
     const account = this.callerAccount(identity);
     if (!account) {
-      this.audit({ op: "mark-exhausted", identity, ok: false, error: "no-active-account" });
+      this.audit({ op: "mark-exhausted", identity, accountKind: "claude", ok: false, error: "no-active-account" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", "no active account configured"));
       return;
     }
@@ -1432,7 +1433,7 @@ export class AuthBroker {
     // accurate "switched to <X>" without a follow-up admin set-active. `null`
     // when every fallback_order entry is also exhausted (genuine all-blocked).
     const rolledTo = this.nextHealthyAccount(account, this.config.auth?.fallback_order ?? []);
-    this.audit({ op: "mark-exhausted", identity, account, ok: true });
+    this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
   }
 
@@ -1477,24 +1478,24 @@ export class AuthBroker {
     account: string,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "refresh-account", identity, account, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "refresh-account", identity, account, accountKind: "claude", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "refresh-account requires admin");
       return;
     }
     if (!accountExists(account, this.home)) {
-      this.audit({ op: "refresh-account", identity, account, ok: false, error: "ACCOUNT_NOT_FOUND" });
+      this.audit({ op: "refresh-account", identity, account, accountKind: "claude", ok: false, error: "ACCOUNT_NOT_FOUND" });
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `account '${account}' not found`));
       return;
     }
     const result = await this.refreshOneAccount(account, /*force*/ true);
     if (result.kind === "failed") {
-      this.audit({ op: "refresh-account", identity, account, ok: false, error: result.error });
+      this.audit({ op: "refresh-account", identity, account, accountKind: "claude", ok: false, error: result.error });
       socket.write(encodeError(id, "REFRESH_FAILED", result.error));
       return;
     }
     const creds = readAccountCredentials(account, this.home);
     const expiresAt = creds?.claudeAiOauth?.expiresAt;
-    this.audit({ op: "refresh-account", identity, account, ok: true });
+    this.audit({ op: "refresh-account", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { account, expiresAt }));
   }
 
@@ -1507,7 +1508,7 @@ export class AuthBroker {
     replace: boolean,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "claude", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "add-account requires admin");
       return;
     }
@@ -1518,7 +1519,7 @@ export class AuthBroker {
       return;
     }
     if (accountExists(label, this.home) && !replace) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "claude", ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
       socket.write(encodeError(id, "ACCOUNT_ALREADY_EXISTS", `account '${label}' already exists; pass replace:true to overwrite`));
       return;
     }
@@ -1542,7 +1543,7 @@ export class AuthBroker {
     // Fan out to any agents already pinned to this label.
     this.fanoutToAffectedAgents(label);
     const expiresAt = credentials.claudeAiOauth?.expiresAt;
-    this.audit({ op: "add-account", identity, account: label, ok: true, replace });
+    this.audit({ op: "add-account", identity, account: label, accountKind: "claude", ok: true, replace });
     socket.write(encodeSuccess(id, { label, expiresAt }));
   }
 
@@ -1553,7 +1554,7 @@ export class AuthBroker {
     label: string,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "rm-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "rm-account", identity, account: label, accountKind: "claude", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "rm-account requires admin");
       return;
     }
@@ -1587,7 +1588,7 @@ export class AuthBroker {
     this.persistShaIndex();
     this.persistQuota();
     this.persistThresholdViolations();
-    this.audit({ op: "rm-account", identity, account: label, ok: true });
+    this.audit({ op: "rm-account", identity, account: label, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { label }));
   }
 
@@ -1648,7 +1649,7 @@ export class AuthBroker {
       | undefined;
     const account = agent?.google_workspace?.account;
     if (!account) {
-      this.audit({ op: "get-credentials", identity, ok: false, error: "no-google-account-configured" });
+      this.audit({ op: "get-credentials", identity, accountKind: "google", ok: false, error: "no-google-account-configured" });
       socket.write(
         encodeError(
           id,
@@ -1663,7 +1664,7 @@ export class AuthBroker {
       .google_accounts;
     const enabledFor = ga?.[account]?.enabled_for ?? [];
     if (!enabledFor.includes(agentName)) {
-      this.audit({ op: "get-credentials", identity, account, ok: false, error: "acl-deny" });
+      this.audit({ op: "get-credentials", identity, account, accountKind: "google", ok: false, error: "acl-deny" });
       socket.write(
         encodeError(
           id,
@@ -1676,7 +1677,7 @@ export class AuthBroker {
     // Storage read.
     const creds = readGoogleAccountCredentials(this.stateDir, account);
     if (!creds) {
-      this.audit({ op: "get-credentials", identity, account, ok: false, error: "missing-credentials" });
+      this.audit({ op: "get-credentials", identity, account, accountKind: "google", ok: false, error: "missing-credentials" });
       socket.write(
         encodeError(
           id,
@@ -1687,7 +1688,7 @@ export class AuthBroker {
       return;
     }
     const expiresAt = creds.googleOauth?.expiresAt;
-    this.audit({ op: "get-credentials", identity, account, ok: true });
+    this.audit({ op: "get-credentials", identity, account, accountKind: "google", ok: true });
     socket.write(encodeSuccess(id, { account, credentials: creds, expiresAt }));
   }
 
@@ -1700,7 +1701,7 @@ export class AuthBroker {
     replace: boolean,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "google", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "add-account requires admin");
       return;
     }
@@ -1715,7 +1716,7 @@ export class AuthBroker {
       return;
     }
     if (googleAccountExists(this.stateDir, label) && !replace) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "google", ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
       socket.write(encodeError(id, "ACCOUNT_ALREADY_EXISTS", `google account '${label}' already exists; pass replace:true to overwrite`));
       return;
     }
@@ -1726,7 +1727,7 @@ export class AuthBroker {
       return;
     }
     const expiresAt = credentials.googleOauth?.expiresAt;
-    this.audit({ op: "add-account", identity, account: label, ok: true, replace });
+    this.audit({ op: "add-account", identity, account: label, accountKind: "google", ok: true, replace });
     socket.write(encodeSuccess(id, { label, expiresAt }));
   }
 
@@ -1743,7 +1744,7 @@ export class AuthBroker {
     label: string,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "rm-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "rm-account", identity, account: label, accountKind: "google", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "rm-account requires admin");
       return;
     }
@@ -1770,7 +1771,7 @@ export class AuthBroker {
       socket.write(encodeError(id, "INTERNAL", (err as Error).message));
       return;
     }
-    this.audit({ op: "rm-account", identity, account: label, ok: true });
+    this.audit({ op: "rm-account", identity, account: label, accountKind: "google", ok: true });
     socket.write(encodeSuccess(id, { label }));
   }
 
@@ -1803,7 +1804,7 @@ export class AuthBroker {
       | undefined;
     const account = agent?.microsoft_workspace?.account;
     if (!account) {
-      this.audit({ op: "get-credentials", identity, ok: false, error: "no-microsoft-account-configured" });
+      this.audit({ op: "get-credentials", identity, accountKind: "microsoft", ok: false, error: "no-microsoft-account-configured" });
       socket.write(
         encodeError(
           id,
@@ -1818,7 +1819,7 @@ export class AuthBroker {
       .microsoft_accounts;
     const enabledFor = ma?.[account]?.enabled_for ?? [];
     if (!enabledFor.includes(agentName)) {
-      this.audit({ op: "get-credentials", identity, account, ok: false, error: "acl-deny" });
+      this.audit({ op: "get-credentials", identity, account, accountKind: "microsoft", ok: false, error: "acl-deny" });
       socket.write(
         encodeError(
           id,
@@ -1831,7 +1832,7 @@ export class AuthBroker {
     // Storage read.
     const creds = readMicrosoftAccountCredentials(this.stateDir, account);
     if (!creds) {
-      this.audit({ op: "get-credentials", identity, account, ok: false, error: "missing-credentials" });
+      this.audit({ op: "get-credentials", identity, account, accountKind: "microsoft", ok: false, error: "missing-credentials" });
       socket.write(
         encodeError(
           id,
@@ -1842,7 +1843,7 @@ export class AuthBroker {
       return;
     }
     const expiresAt = creds.microsoftOauth?.expiresAt;
-    this.audit({ op: "get-credentials", identity, account, ok: true });
+    this.audit({ op: "get-credentials", identity, account, accountKind: "microsoft", ok: true });
     socket.write(encodeSuccess(id, { account, credentials: creds, expiresAt }));
   }
 
@@ -1855,7 +1856,7 @@ export class AuthBroker {
     replace: boolean,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "microsoft", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "add-account requires admin");
       return;
     }
@@ -1867,7 +1868,7 @@ export class AuthBroker {
       return;
     }
     if (microsoftAccountExists(this.stateDir, label) && !replace) {
-      this.audit({ op: "add-account", identity, account: label, ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
+      this.audit({ op: "add-account", identity, account: label, accountKind: "microsoft", ok: false, error: "ACCOUNT_ALREADY_EXISTS" });
       socket.write(encodeError(id, "ACCOUNT_ALREADY_EXISTS", `microsoft account '${label}' already exists; pass replace:true to overwrite`));
       return;
     }
@@ -1878,7 +1879,7 @@ export class AuthBroker {
       return;
     }
     const expiresAt = credentials.microsoftOauth?.expiresAt;
-    this.audit({ op: "add-account", identity, account: label, ok: true, replace });
+    this.audit({ op: "add-account", identity, account: label, accountKind: "microsoft", ok: true, replace });
     socket.write(encodeSuccess(id, { label, expiresAt }));
   }
 
@@ -1895,7 +1896,7 @@ export class AuthBroker {
     label: string,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "rm-account", identity, account: label, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "rm-account", identity, account: label, accountKind: "microsoft", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "rm-account requires admin");
       return;
     }
@@ -1922,7 +1923,7 @@ export class AuthBroker {
       socket.write(encodeError(id, "INTERNAL", (err as Error).message));
       return;
     }
-    this.audit({ op: "rm-account", identity, account: label, ok: true });
+    this.audit({ op: "rm-account", identity, account: label, accountKind: "microsoft", ok: true });
     socket.write(encodeSuccess(id, { label }));
   }
 
@@ -1953,7 +1954,7 @@ export class AuthBroker {
       })
       .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
       .sort((a, b) => a.account.localeCompare(b.account));
-    this.audit({ op: "list-microsoft-accounts", identity, ok: true });
+    this.audit({ op: "list-microsoft-accounts", identity, accountKind: "microsoft", ok: true });
     socket.write(encodeSuccess(id, { accounts }));
   }
 
@@ -1965,7 +1966,7 @@ export class AuthBroker {
     account: string | null,
   ): Promise<void> {
     if (!this.isAdmin(identity)) {
-      this.audit({ op: "set-override", identity, account: account ?? undefined, ok: false, error: "FORBIDDEN" });
+      this.audit({ op: "set-override", identity, account: account ?? undefined, accountKind: "claude", ok: false, error: "FORBIDDEN" });
       this.respondForbidden(socket, id, "set-override requires admin");
       return;
     }
@@ -1986,7 +1987,7 @@ export class AuthBroker {
     this.config = { ...this.config, agents };
     // Re-mirror this agent's creds against its new effective account.
     this.fanoutForAgent(agentName);
-    this.audit({ op: "set-override", identity, account: account ?? undefined, ok: true });
+    this.audit({ op: "set-override", identity, account: account ?? undefined, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { agent: agentName, account }));
   }
 
@@ -2540,6 +2541,19 @@ export class AuthBroker {
     op: string;
     identity: Identity;
     account?: string;
+    /**
+     * Credential kind for the account this audit entry concerns.
+     * Omitted for ops that have no account context (list-state, claim-notification,
+     * mirror-symlink-refused) or for list-* ops where the op name already
+     * encodes the provider.
+     *
+     * Values:
+     *   "claude"    — Anthropic / claudeAiOauth credential
+     *   "google"    — Google Workspace / googleOauth credential
+     *   "microsoft" — Microsoft 365 / microsoftOauth credential
+     *   "unknown"   — provider could not be determined at the call site
+     */
+    accountKind?: "claude" | "microsoft" | "google" | "unknown";
     ok: boolean;
     error?: string;
     replace?: boolean;
@@ -2553,6 +2567,7 @@ export class AuthBroker {
       op: entry.op,
       peer,
       account: entry.account,
+      accountKind: entry.accountKind,
       ok: entry.ok,
       error: entry.error,
       replace: entry.replace,
