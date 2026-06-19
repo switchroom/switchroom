@@ -189,6 +189,36 @@ export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4;
 export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
 
 /**
+ * Reflect wall-clock timeout. Vendor default is 300s. Mental-model
+ * refresh re-runs the model's `source_query` through the agentic reflect
+ * loop; on a large bank (observed: 12-13k observations) that legitimately
+ * exceeds 300s, so the refresh times out and the model stays stale —
+ * which is the main reason user-profile models go unpopulated on
+ * high-volume agents (2026-06-19 fleet: refresh timeouts across 8 banks).
+ * 600s lets large-bank refreshes complete. Trade-off: an interactive
+ * `reflect` query also gets the longer ceiling, but those rarely approach
+ * 300s, so the net is strictly more models successfully refreshing.
+ */
+export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
+
+/**
+ * Consolidation throughput knobs (modest, reversible). Consolidation is
+ * LLM-bound via the claude-code provider (observed ~510s/op), so a deep
+ * backlog (e.g. after a stall) drains slowly. Two conservative levers:
+ *
+ * - LLM_BATCH_SIZE 8→12: more facts per LLM call → fewer round-trips per
+ *   round, so less per-call overhead at ~the same total tokens. Kept
+ *   modest (not 16+) to avoid diluting per-fact synthesis quality.
+ * - CONSOLIDATION_MAX_SLOTS 2→3: one more bank consolidates concurrently,
+ *   which matters during multi-bank backlog recovery. Kept to 3 (not
+ *   higher) because every slot is a concurrent claude subprocess on the
+ *   shared subscription — more would risk contending with the fleet's own
+ *   model usage (subscription-honest). Both revert via the env vars.
+ */
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 12;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 3;
+
+/**
  * Container resource caps (memory + pids only; CPU intentionally NOT capped).
  *
  * Live observed RSS on a 9-agent fleet: 3.4 GiB. Capping memory at
@@ -385,6 +415,13 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "-e", `HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,
     "-e", `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
     "-e", `HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
+    // Reflect wall timeout — let large-bank mental-model refreshes finish
+    // (vendor 300s times out on 12k+ obs banks → stale user-profile models).
+    "-e", `HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
+    // Consolidation throughput (modest): fewer LLM round-trips per round +
+    // one more concurrent bank during backlog recovery. See constants above.
+    "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
+    "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
   ];
 
   const args = [
@@ -549,6 +586,9 @@ export function generateHindsightComposeSnippet(): string {
     `      - HINDSIGHT_API_RERANKER_MAX_CANDIDATES=${HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}`,
     `      - HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT}`,
     `      - HINDSIGHT_API_RECALL_MAX_CONCURRENT=${HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT}`,
+    `      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
+    `      - HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
+    `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,

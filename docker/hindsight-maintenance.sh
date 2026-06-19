@@ -34,6 +34,8 @@
 #   SWITCHROOM_HINDSIGHT_BACKUP_INTERVAL_MIN  min minutes between backups. default 1440
 #   SWITCHROOM_HINDSIGHT_BACKUP_KEEP          rotated backups to retain. default 7
 #   SWITCHROOM_HINDSIGHT_RETENTION_DAYS       completed-op prune age. default 30
+#   SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S     warn if oldest pending/processing
+#                                             op older than this. default 7200 (2h). 0=off
 set -u
 
 MAINT_ENABLED="${SWITCHROOM_HINDSIGHT_MAINTENANCE:-1}"
@@ -42,6 +44,14 @@ BACKUP_DIR="${SWITCHROOM_HINDSIGHT_BACKUP_DIR:-/backups}"
 BACKUP_INTERVAL_MIN="${SWITCHROOM_HINDSIGHT_BACKUP_INTERVAL_MIN:-1440}"
 BACKUP_KEEP="${SWITCHROOM_HINDSIGHT_BACKUP_KEEP:-7}"
 RETENTION_DAYS="${SWITCHROOM_HINDSIGHT_RETENTION_DAYS:-30}"
+# Queue-liveness warn threshold: if the oldest pending/processing async
+# op is older than this, the consolidation/retain pipeline is likely
+# wedged (the 26-day strand of 2026-05-23 went unseen because nothing
+# watched this). Default 2h — well above ~510s/op + the 30-min lease
+# reaper. 0 disables. Logs a loud WARNING (picked up by docker logs /
+# any log monitoring); the reaper still auto-heals stuck *processing*
+# ops, so this is visibility, not the heal.
+QUEUE_LAG_WARN_S="${SWITCHROOM_HINDSIGHT_QUEUE_LAG_WARN_S:-7200}"
 
 log() { echo "switchroom-hindsight-maintenance: $*" >&2; }
 
@@ -84,6 +94,20 @@ _sql "ALTER TABLE IF EXISTS unit_entities SET (autovacuum_vacuum_scale_factor=0.
 _pruned="$(_sql "WITH d AS (DELETE FROM async_operations WHERE status='completed' AND created_at < now() - make_interval(days => ${RETENTION_DAYS}) RETURNING 1) SELECT count(*) FROM d")"
 if [ "${_pruned:-0}" -gt 0 ] 2>/dev/null; then
   log "pruned ${_pruned} completed async_operations older than ${RETENTION_DAYS}d"
+fi
+
+# --- 4. Queue-liveness probe: warn (loudly, in the logs) if the
+# consolidation/retain pipeline looks wedged. Catches the strand class
+# that previously hid for 26 days. Reports the oldest pending/processing
+# op's age; if it exceeds the threshold, something isn't draining. ---
+if [ "${QUEUE_LAG_WARN_S}" -gt 0 ] 2>/dev/null; then
+  # "count|oldest_age_seconds" for non-terminal ops (0 rows → "0|0").
+  _q="$(_sql "SELECT count(*)||'|'||coalesce(max(extract(epoch from (now()-created_at)))::bigint,0) FROM async_operations WHERE status IN ('pending','processing')")"
+  _qn="${_q%%|*}"
+  _qage="${_q##*|}"
+  if [ "${_qage:-0}" -gt "${QUEUE_LAG_WARN_S}" ] 2>/dev/null; then
+    log "WARNING: queue may be wedged — ${_qn} pending/processing async op(s), oldest $((_qage/60))m old (> $((QUEUE_LAG_WARN_S/60))m). Consolidation/retain pipeline not draining; inspect async_operations + 'docker logs switchroom-hindsight'."
+  fi
 fi
 
 # --- 1. Backup: rotated pg_dump, at most once per interval ---

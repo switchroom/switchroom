@@ -106,6 +106,17 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("creates /backups owned by hindsight BEFORE `USER hindsight` (so the named volume is writable)", () => {
+    // A root-owned /backups mount point makes the fresh named volume
+    // root-owned → the non-root hindsight process EACCESes on pg_dump and
+    // backups silently never succeed (observed live on the v0.15.41 roll).
+    expect(dockerfile).toMatch(/mkdir -p \/backups && chown hindsight:hindsight \/backups/);
+    const chownIdx = dockerfile.search(/chown hindsight:hindsight \/backups/);
+    const userIdx = dockerfile.search(/^USER\s+hindsight\b/m);
+    expect(chownIdx).toBeGreaterThanOrEqual(0);
+    expect(userIdx).toBeGreaterThan(chownIdx); // chown runs as root, before the USER switch
+  });
+
   it("ends as USER hindsight (so the entrypoint runs as UID 11000)", () => {
     expect(dockerfile).toMatch(/^USER\s+hindsight\b/m);
   });

@@ -154,6 +154,38 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(envPairs).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-6");
   });
 
+  it("raises the reflect wall timeout (vendor 300s times out large-bank mental-model refresh)", async () => {
+    const { HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S: t } = await import("../../src/setup/hindsight.js");
+    expect(t).toBeGreaterThan(300);
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    const envPairs: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e") envPairs.push(args[i + 1] as string);
+    }
+    expect(envPairs).toContain(`HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${t}`);
+    // Parity in the compose path.
+    const { generateHindsightComposeSnippet } = await import("../../src/setup/hindsight.js");
+    expect(generateHindsightComposeSnippet()).toContain(`HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${t}`);
+  });
+
+  it("sets modest consolidation throughput knobs (batch size + slots) on both emit paths", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    const args = findRunArgs();
+    const envPairs: string[] = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-e") envPairs.push(args[i + 1] as string);
+    }
+    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`);
+    expect(envPairs).toContain(`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`);
+    // Kept modest to stay subscription-honest (concurrent claude subprocesses).
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).toBeLessThanOrEqual(4);
+    const snippet = h.generateHindsightComposeSnippet();
+    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`);
+    expect(snippet).toContain(`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`);
+  });
+
   it("enables stateless MCP (HINDSIGHT_API_MCP_STATELESS=true) so a hindsight bounce doesn't strand agent-side MCP sessions", () => {
     // Stateful MCP makes the server assign an Mcp-Session-Id on
     // initialize that the client must echo on every subsequent call.
