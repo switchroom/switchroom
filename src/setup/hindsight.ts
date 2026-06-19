@@ -214,9 +214,24 @@ export const HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S = 600;
  *   higher) because every slot is a concurrent claude subprocess on the
  *   shared subscription — more would risk contending with the fleet's own
  *   model usage (subscription-honest). Both revert via the env vars.
+ *
+ * Two more (added after the 2026-06-19 backlog dig): these target a
+ * single backed-up bank, where MAX_SLOTS doesn't help (slots parallelise
+ * ACROSS banks, but the bottleneck is one bank's per-op rate). The hard
+ * ceiling on concurrent model calls is MAX_SLOTS × LLM_PARALLELISM, so we
+ * keep it fleet-safe: 3 × 6 = 18 (was 3 × 4 = 12), NOT a reckless
+ * doubling that would starve the fleet's interactive model usage.
+ * - LLM_PARALLELISM 4→6: more tag-groups consolidated concurrently WITHIN
+ *   one op → faster per-op drain on a single bank.
+ * - MAX_MEMORIES_PER_ROUND 100→300: a larger scope clears in one op
+ *   instead of re-queuing, cutting per-op setup overhead.
+ * Pairs with the 8g memory limit below (more in-flight consolidation =
+ * more RSS). All operator-overridable via the generated compose / -e.
  */
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE = 12;
 export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 3;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM = 6;
+export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND = 300;
 
 /**
  * Container resource caps (memory + pids only; CPU intentionally NOT capped).
@@ -243,8 +258,12 @@ export const HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS = 3;
  *
  * PIDs cap is defense-in-depth, matches the agent `coding` profile.
  */
-export const HINDSIGHT_DEFAULT_MEM_LIMIT = "4g";
-export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "2g";
+// 4g→8g (2026-06-19): baseline RSS is ~3.4g on a 9-agent fleet — only
+// ~600m of headroom under the old 4g cap, and the consolidation-throughput
+// bump above (LLM_PARALLELISM 4→6 = more in-flight synthesis) pushes it
+// higher. 8g gives comfortable headroom on the 60g host. Reservation 2g→4g.
+export const HINDSIGHT_DEFAULT_MEM_LIMIT = "8g";
+export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "4g";
 export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
 
 /**
@@ -422,6 +441,8 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     // one more concurrent bank during backlog recovery. See constants above.
     "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     "-e", `HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
+    "-e", `HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
+    "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
   ];
 
   const args = [
@@ -589,6 +610,8 @@ export function generateHindsightComposeSnippet(): string {
     `      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=${HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S}`,
     `      - HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`,
     `      - HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`,
+    `      - HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`,
+    `      - HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
