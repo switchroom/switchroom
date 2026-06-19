@@ -427,27 +427,40 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
   });
 
   it("keeps the pinned account when no healthy fallback exists (retry beats nothing)", async () => {
+    // All three escape routes are exhausted: pinned account, every fallback_order
+    // member, AND auth.active. The last-resort branch (2026-06-19 fix) correctly
+    // skips auth.active because it is exhausted, so the broker returns the pinned
+    // account rather than going dark.
     const h = makeHarness();
     const config = makeConfig(h, {
       active: "default",
       fallback_order: ["secondary"],
       consumers: [{ name: "hindsight", account: "secondary" }],
-      agents: { marker: { auth: { override: "secondary" } } },
+      agents: {
+        marker: { auth: { override: "secondary" } },
+        // A second agent on "default" (auth.active) so we can exhaust it too.
+        marker2: {},
+      },
     });
     seedAccount(h, "default");
     seedAccount(h, "secondary");
     mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "marker2"), { recursive: true });
     const broker = new AuthBroker(config, {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
     });
     await broker.start();
+    // Exhaust the pinned account (secondary) AND auth.active (default).
     await rpc(join(h.socketRoot, "marker", "sock"), {
       v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
     });
-    // fallback_order only lists the (now-exhausted) pinned account → no healthy
-    // alternative → stay pinned rather than serve nothing.
+    await rpc(join(h.socketRoot, "marker2", "sock"), {
+      v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    // fallback_order only lists the (now-exhausted) pinned account, AND auth.active
+    // is also exhausted → no healthy alternative → stay pinned rather than serve nothing.
     const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
-      v: 1, id: "2", op: "get-credentials",
+      v: 1, id: "3", op: "get-credentials",
     }) as { ok: boolean; data: { account: string } };
     expect(resp.ok).toBe(true);
     expect(resp.data.account).toBe("secondary");
@@ -492,6 +505,169 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
     const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
     expect((quota["default"]?.exhausted_until ?? 0) > Date.now()).toBe(false);
     expect(quota["secondary"].exhausted_until > Date.now()).toBe(true);
+    broker.stop();
+  });
+});
+
+// ─── 2026-06-19 incident regression: consumer follows auth.active as last resort ───
+//
+// Incident: hindsight (consumer pinned to a dedicated account) stalled for ~2h
+// because its pinned account AND every fallback_order member were all walled, but
+// the healthy fleet-active account (auth.active) was never consulted. The fix adds
+// auth.active as a last-resort after fallback_order is exhausted.
+describe("AuthBroker — consumer last-resort failover to auth.active (2026-06-19 fix)", () => {
+  it("(a) consumer pinned to exhausted account + ALL fallback_order exhausted + healthy auth.active → returns auth.active", async () => {
+    const h = makeHarness();
+    // hindsight is pinned to "hindsight-acct". fallback_order has "fallback1"
+    // which will also be exhausted. auth.active is "fleet-active" which is healthy.
+    const config = makeConfig(h, {
+      active: "fleet-active",
+      fallback_order: ["fallback1"],
+      consumers: [{ name: "hindsight", account: "hindsight-acct" }],
+      agents: {
+        marker: { auth: { override: "hindsight-acct" } },
+        marker2: { auth: { override: "fallback1" } },
+      },
+    });
+    seedAccount(h, "fleet-active");
+    seedAccount(h, "hindsight-acct");
+    seedAccount(h, "fallback1");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "marker2"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Exhaust both the pinned account and the only fallback_order member.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    await rpc(join(h.socketRoot, "marker2", "sock"), {
+      v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    // Consumer should now fall through to the healthy fleet-active account.
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "3", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("fleet-active");
+    broker.stop();
+  });
+
+  it("(b) precedence: a healthy fallback_order member is chosen over auth.active", async () => {
+    // fallback_order must still be tried BEFORE auth.active — we only reach
+    // auth.active when fallback_order is fully exhausted.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "fleet-active",
+      fallback_order: ["fallback-healthy"],
+      consumers: [{ name: "hindsight", account: "hindsight-acct" }],
+      agents: { marker: { auth: { override: "hindsight-acct" } } },
+    });
+    seedAccount(h, "fleet-active");
+    seedAccount(h, "hindsight-acct");
+    seedAccount(h, "fallback-healthy");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Only exhaust the pinned account; fallback-healthy stays healthy.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    // Must be the fallback_order member, NOT auth.active.
+    expect(resp.data.account).toBe("fallback-healthy");
+    broker.stop();
+  });
+
+  it("(c) no-op for an agent whose account == auth.active (strict no-op guarantee)", async () => {
+    // Agents ride auth.active directly. When auth.active is walled, callerAccount()
+    // for an agent is already auth.active, so account === active in the last-resort
+    // branch and it is skipped. The agent must NOT be handed auth.active again
+    // (it would return the exhausted account either way — the fallback_order loop
+    // is the correct path for agents, same as before this fix).
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "fleet-active",
+      fallback_order: ["secondary"],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "fleet-active");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // While fleet-active is healthy, agent gets it.
+    const before = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(before.ok).toBe(true);
+    expect(before.data.account).toBe("fleet-active");
+
+    // Exhaust fleet-active (as the agent itself, which rides auth.active).
+    await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    // Agent now falls to secondary (via fallback_order), not back to fleet-active.
+    // The last-resort branch is a no-op because account === active.
+    const after = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "3", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(after.ok).toBe(true);
+    expect(after.data.account).toBe("secondary");
+    broker.stop();
+  });
+
+  it("(d) when auth.active is also exhausted, still returns original account (no false positive)", async () => {
+    // The last-resort must NOT fire when auth.active is itself exhausted.
+    // In that case accountWithFailover falls through to `return account` as before.
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "fleet-active",
+      fallback_order: [],
+      consumers: [{ name: "hindsight", account: "hindsight-acct" }],
+      agents: {
+        marker: { auth: { override: "hindsight-acct" } },
+        marker2: {},  // rides fleet-active
+      },
+    });
+    seedAccount(h, "fleet-active");
+    seedAccount(h, "hindsight-acct");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "marker2"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Exhaust both the consumer's pinned account and fleet-active.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    await rpc(join(h.socketRoot, "marker2", "sock"), {
+      v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    // No healthy account exists at all — consumer must get its pinned account
+    // back (the "retry beats nothing" invariant) rather than some undefined state.
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "3", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("hindsight-acct");
     broker.stop();
   });
 });
