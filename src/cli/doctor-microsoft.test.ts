@@ -15,11 +15,11 @@ const baseConfig = (overrides: Partial<SwitchroomConfig> = {}): SwitchroomConfig
   ({
     agents: {
       clerk: {
-        microsoft_workspace: { account: "ken@outlook.com" },
+        microsoft_workspace: { account: "bob@example.com" },
       },
     },
     microsoft_accounts: {
-      "ken@outlook.com": { enabled_for: ["clerk"] },
+      "bob@example.com": { enabled_for: ["clerk"] },
     },
     microsoft_workspace: {
       microsoft_client_id: "vault:microsoft-oauth-client-id",
@@ -70,7 +70,7 @@ describe("runMicrosoftChecks — config matrix", () => {
 
   it("agent has account but is NOT in enabled_for → fail", () => {
     const cfg = baseConfig({
-      microsoft_accounts: { "ken@outlook.com": { enabled_for: ["other"] } },
+      microsoft_accounts: { "bob@example.com": { enabled_for: ["other"] } },
     });
     const results = runMicrosoftChecks(cfg, defaultMockDeps());
     const matrix = results.find((r) => r.name === "microsoft:matrix:clerk");
@@ -95,7 +95,7 @@ describe("runMicrosoftChecks — config matrix", () => {
       microsoft_workspace: { account: "ken@contoso.com" },
     } as unknown as SwitchroomConfig["agents"][string];
     cfg.microsoft_accounts = {
-      "ken@outlook.com": { enabled_for: ["clerk"] },
+      "bob@example.com": { enabled_for: ["clerk"] },
     };
     const results = runMicrosoftChecks(cfg, defaultMockDeps());
     const reverse = results.find((r) =>

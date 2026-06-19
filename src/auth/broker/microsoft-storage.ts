@@ -12,7 +12,7 @@
  * Storage layout:
  *
  *   ~/.switchroom/state/auth-broker/microsoft/
- *     ken@outlook.com/
+ *     bob@example.com/
  *       credentials.json   ← `{ microsoftOauth: { ... } }`, mode 0600
  *     ken@work.example.com/
  *       credentials.json
