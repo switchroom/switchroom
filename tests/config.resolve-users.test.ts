@@ -76,6 +76,23 @@ describe("resolveUsers — serves/knows → recall maps", () => {
     expect(r.additionalBanks.sort()).toEqual(["kids-profile", "shared"]);
   });
 
+  it("explicit sender_banks wins on a key conflict with the generated map", () => {
+    const r = resolveUsers(
+      cfg({
+        users: USERS,
+        agents: {
+          marko: {
+            serves: ["lisa"],
+            memory: { recall: { sender_banks: { "8201250670": "override-bank" } } },
+          },
+        },
+      }),
+      "marko",
+    );
+    // lisa's id 8201250670 generates → lisa-profile, but the explicit map wins.
+    expect(r.senderBanks["8201250670"]).toBe("override-bank");
+  });
+
   it("unknown served user is skipped defensively (no throw)", () => {
     const r = resolveUsers(cfg({ users: USERS, agents: { x: { serves: ["ghost"] } } }), "x");
     expect(r.senderBanks).toEqual({});
