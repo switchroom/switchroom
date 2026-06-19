@@ -2159,7 +2159,23 @@ export function installHindsightPlugin(
   // (cheap — async POST to a local container). Memory is the moat
   // (reference/jobs/remember-across-sessions.md); paying for it on every
   // turn is correct.
-  applyHindsightSettingsOverrides(destPath);
+  // Resolve the effective extra recall banks for this agent — the static
+  // shared-bank foundation for per-user memory (ship-B; RFC
+  // reference/rfcs/per-speaker-memory-routing.md). Read from the CASCADED
+  // config (defaults → profile → agent), mirroring how the env-export path
+  // reads the sibling recall knobs (max_memories etc.) — so a fleet-wide
+  // `defaults.memory.recall.additional_banks` is honoured, not just a
+  // per-agent value. `switchroomConfig.agents[agentName]` is the raw,
+  // pre-cascade block, so resolve it here.
+  const agentRaw = switchroomConfig.agents[agentName];
+  const additionalBanks = agentRaw
+    ? resolveAgentConfig(
+        switchroomConfig.defaults,
+        switchroomConfig.profiles,
+        agentRaw,
+      ).memory?.recall?.additional_banks ?? []
+    : [];
+  applyHindsightSettingsOverrides(destPath, additionalBanks);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
   // The plugin's hooks expect HINDSIGHT_API_URL (the REST base), not the
@@ -2187,7 +2203,10 @@ export function installHindsightPlugin(
  * updates. This function is the single point of switchroom-specific
  * memory tuning.
  */
-function applyHindsightSettingsOverrides(pluginDestPath: string): void {
+function applyHindsightSettingsOverrides(
+  pluginDestPath: string,
+  additionalBanks: readonly string[],
+): void {
   const settingsPath = join(pluginDestPath, "settings.json");
   if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
   let raw: string;
@@ -2239,6 +2258,15 @@ function applyHindsightSettingsOverrides(pluginDestPath: string): void {
   // opt OUT via memory.recall.skip_trivial=false in switchroom.yaml
   // (exported as HINDSIGHT_RECALL_SKIP_TRIVIAL only when overridden).
   settings.recallSkipTrivial = true;
+  // Static shared-bank recall (RFC reference/rfcs/per-speaker-memory-routing.md,
+  // ship-B): recall these extra banks on every turn, merged into the agent's
+  // own bank results. Sourced from memory.recall.additional_banks (cascaded);
+  // written per-agent because settings.json is per-agent. Left at the vendor
+  // default ([]) when unset. The plugin recalls each with an 8s timeout and is
+  // non-fatal on failure. Single-tenant: all banks are the operator's data.
+  if (additionalBanks.length > 0) {
+    settings.recallAdditionalBanks = [...additionalBanks];
+  }
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 

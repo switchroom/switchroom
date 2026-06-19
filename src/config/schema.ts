@@ -384,6 +384,18 @@ export const AgentMemorySchema = z
             "[\"world\", \"experience\"] to opt out of observation-backed " +
             "recall for this agent (or fleet-wide under defaults).",
           ),
+        additional_banks: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Extra Hindsight banks to recall from on every turn, merged into " +
+            "the agent's own bank results — e.g. a shared operator/household " +
+            "profile bank authored via `switchroom memory profile`. Each is " +
+            "recalled with an 8s timeout and is non-fatal on failure. Stays " +
+            "within the single tenant: all banks are the operator's data, in " +
+            "the operator's Hindsight instance (see the `single-tenant` " +
+            "invariant). Defaults to [] (no extra banks).",
+          ),
         skip_trivial: z
           .boolean()
           .optional()
@@ -1814,6 +1826,7 @@ const profileFields = {
           max_memories: z.number().int().min(0).optional(),
           cache_ttl_secs: z.number().int().min(0).optional(),
           min_overlap: z.number().min(0).max(1).optional(),
+          additional_banks: z.array(z.string()).optional(),
         })
         .optional(),
     })

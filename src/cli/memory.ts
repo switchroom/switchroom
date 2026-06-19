@@ -573,4 +573,154 @@ export function registerMemoryCommand(program: Command): void {
         },
       ),
     );
+
+  // switchroom memory profile — author + inspect operator "profile" banks.
+  // The static shared-bank foundation for per-user memory (RFC
+  // reference/rfcs/per-speaker-memory-routing.md, ship-B): operator-authored
+  // facts live in their own Hindsight bank, wired into agents via
+  // memory.recall.additional_banks. Single-tenant — the operator's own data
+  // in the operator's Hindsight instance.
+  const restBase = (url: string | undefined): string =>
+    (url ?? "http://127.0.0.1:8888/mcp/")
+      .replace(/\/mcp\/?$/, "")
+      .replace(/\/$/, "");
+  const VALID_BANK = /^[a-zA-Z0-9_.-]+$/;
+
+  const profile = memory
+    .command("profile")
+    .description(
+      "Author + inspect operator profile banks (shared/per-user memory; wire via memory.recall.additional_banks)",
+    );
+
+  profile
+    .command("add <bank> <fact...>")
+    .description(
+      "Add an operator-authored fact to a profile bank (creates the bank on first write)",
+    )
+    .option(
+      "--timeout <ms>",
+      "HTTP timeout in milliseconds (retain runs synchronously; default: 60000)",
+      "60000",
+    )
+    .action(
+      withConfigError(
+        async (bank: string, factWords: string[], opts: { timeout: string }) => {
+          const config = getConfig(program);
+          if (!bank || !VALID_BANK.test(bank)) {
+            console.error(
+              chalk.red(
+                "Bank name must be non-empty and contain only letters, digits, '.', '_', or '-'.",
+              ),
+            );
+            process.exit(1);
+          }
+          const content = factWords.join(" ").trim();
+          if (content.length === 0) {
+            console.error(chalk.red("A non-empty fact is required."));
+            process.exit(1);
+          }
+          const base = restBase(config.memory?.config?.url as string | undefined);
+          const url = `${base}/v1/default/banks/${encodeURIComponent(bank)}/memories`;
+          const timeoutMs = Math.max(1000, parseInt(opts.timeout, 10) || 60000);
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                items: [{ content, tags: ["operator-authored", "profile"] }],
+                async: false,
+              }),
+              signal: ctrl.signal,
+            });
+            if (!res.ok) {
+              console.error(
+                chalk.red(`✗ Retain failed: HTTP ${res.status}`),
+                chalk.gray(await res.text().catch(() => "")),
+              );
+              process.exit(1);
+            }
+            console.log(chalk.green(`✓ Added to profile bank "${bank}"`));
+            console.log(chalk.gray(`  ${content}`));
+            console.log(
+              chalk.gray(
+                "  (fact extraction runs in the background — `profile list` may lag a few seconds)",
+              ),
+            );
+            console.log(
+              chalk.gray(
+                `\n  Wire it into agents via memory.recall.additional_banks: ["${bank}"] in switchroom.yaml,\n  then \`switchroom apply\` + restart the agent(s).`,
+              ),
+            );
+          } catch (e) {
+            console.error(
+              chalk.red("✗ Retain failed:"),
+              chalk.gray(e instanceof Error ? e.message : String(e)),
+            );
+            process.exit(1);
+          } finally {
+            clearTimeout(t);
+          }
+        },
+      ),
+    );
+
+  profile
+    .command("list <bank>")
+    .description("List the memory units in a profile bank")
+    .option("--limit <n>", "Max units to show (default: 50)", "50")
+    .option("--timeout <ms>", "HTTP timeout in milliseconds (default: 10000)", "10000")
+    .action(
+      withConfigError(
+        async (bank: string, opts: { limit: string; timeout: string }) => {
+          const config = getConfig(program);
+          if (!bank || !VALID_BANK.test(bank)) {
+            console.error(chalk.red("Bank name must contain only letters, digits, '.', '_', or '-'."));
+            process.exit(1);
+          }
+          const base = restBase(config.memory?.config?.url as string | undefined);
+          const limit = Math.max(1, parseInt(opts.limit, 10) || 50);
+          const url = `${base}/v1/default/banks/${encodeURIComponent(bank)}/memories/list?limit=${limit}`;
+          const timeoutMs = Math.max(1000, parseInt(opts.timeout, 10) || 10000);
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, { signal: ctrl.signal });
+            if (!res.ok) {
+              console.error(
+                chalk.red(`✗ List failed: HTTP ${res.status}`),
+                chalk.gray(await res.text().catch(() => "")),
+              );
+              process.exit(1);
+            }
+            const data = (await res.json()) as {
+              results?: unknown[];
+              memories?: unknown[];
+              units?: unknown[];
+            };
+            const units = (data.results ?? data.memories ?? data.units ?? []) as Array<
+              Record<string, unknown>
+            >;
+            console.log(chalk.bold(`\n  Profile bank "${bank}" — ${units.length} unit(s)\n`));
+            for (const u of units) {
+              const ft = ((u.fact_type as string) ?? "?").padEnd(11);
+              const text = String(u.content ?? u.text ?? "")
+                .replace(/\s+/g, " ")
+                .slice(0, 100);
+              console.log(`  ${chalk.gray(ft)} ${text}`);
+            }
+            console.log();
+          } catch (e) {
+            console.error(
+              chalk.red("✗ List failed:"),
+              chalk.gray(e instanceof Error ? e.message : String(e)),
+            );
+            process.exit(1);
+          } finally {
+            clearTimeout(t);
+          }
+        },
+      ),
+    );
 }
