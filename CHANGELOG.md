@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.15.43 — hindsight ops: working backups, mental-model refresh, throughput, liveness
+
+- **Automated backup now actually works (#2436).** The
+  `switchroom-hindsight-backups` volume mounts onto `/backups`, but the
+  dir didn't exist in the image, so Docker created the mount point
+  root-owned and the non-root hindsight process (UID 11000) got EACCES on
+  every `pg_dump` — automated backups **silently never succeeded**.
+  `/backups` is now created 11000-owned before `USER hindsight` so a fresh
+  named volume inherits writable ownership.
+- **Mental-model refresh no longer times out on large banks (#2436).**
+  Reflect wall timeout raised 300s→600s: refreshing a model over a 12-13k
+  observation bank exceeded 300s and timed out, leaving user-profile
+  models stale (observed across 8 banks). 600s lets them complete.
+- **Consolidation throughput (modest, reversible) (#2436).**
+  `CONSOLIDATION_LLM_BATCH_SIZE` 8→12 (fewer LLM round-trips) and
+  `WORKER_CONSOLIDATION_MAX_SLOTS` 2→3 (one more concurrent bank during
+  backlog recovery). Kept conservative — slots are a global pool of
+  concurrent `claude` subprocesses (subscription-honest).
+- **Queue-liveness probe (#2436).** The maintenance loop now logs a loud
+  WARNING (read-only) when the oldest pending/processing op exceeds a
+  threshold (default 2h) — the visibility that was missing when a 26-day
+  consolidation stall went unnoticed. The lease reaper still auto-heals
+  stuck processing ops.
+
 ## v0.15.42 — poll auto-recovery, context-headroom surface, session commands
 
 - **Telegram poll auto-recovery after a network flap (#2432).** A flaky-internet
