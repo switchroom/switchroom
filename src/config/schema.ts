@@ -1788,8 +1788,38 @@ export const NetworkIsolationSchema = z
     "cycle, #1413). Cascades override (agent → profile → defaults).",
   );
 
+// First-class users (RFC reference/rfcs/user-concept.md — memory-routing
+// phase). `serves` / `knows` reference entries in the top-level `users:`
+// block and are resolved (unioned) into the recall maps by resolveUsers().
+// Defined once and mirrored into profileFields (defaults/profiles) and
+// AgentSchema (per-agent), like every other agent field.
+const servesField = z
+  .array(z.string())
+  .optional()
+  .describe(
+    "Users (keys in the top-level `users:` block) this agent works for. When " +
+    "a served user messages this agent, their profile_bank is recalled " +
+    "(speaker routing → memory.recall.sender_banks). Unions with any explicit " +
+    "memory.recall.sender_banks. NOTE: this does not yet generate access " +
+    "(allowFrom) — pair agent access as today; allowFrom generation is a " +
+    "later phase.",
+  );
+const knowsField = z
+  .array(z.string())
+  .optional()
+  .describe(
+    "Users or banks this agent always knows as subjects — recalled and " +
+    "recall-ranked even when that person is not the speaker (→ " +
+    "memory.recall.additional_banks). A `users:` key resolves to that user's " +
+    "profile_bank; any other string is used as a raw bank name (e.g. a `kids` " +
+    "profile bank with no Telegram identity). Unions with any explicit " +
+    "memory.recall.additional_banks.",
+  );
+
 const profileFields = {
   extends: z.string().optional(),
+  serves: servesField,
+  knows: knowsField,
   bot_token: z.string().optional(),
   release: ReleaseBlock.optional().describe(
     "Release-channel pin / pointer. Either `channel` (dev|rc|latest) or " +
@@ -2081,6 +2111,8 @@ export const AgentSchema = z.object({
       "filesystem directory `profiles/<name>/`. Defaults to DEFAULT_PROFILE " +
       "('default') when unset.",
     ),
+  serves: servesField,
+  knows: knowsField,
   bot_token: z
     .string()
     .optional()
@@ -2969,6 +3001,31 @@ export const CronConfigSchema = z.object({
   egress: CronEgressSchema.optional().describe("SSRF/exfil fence for http-diff polls."),
 });
 
+/**
+ * A first-class user — a trusted person the fleet serves, identified by their
+ * Telegram account and carrying their own memory profile bank. RFC
+ * reference/rfcs/user-concept.md. The operator's own trusted people
+ * (single-tenant), assigned to agents via `serves` / `knows`.
+ */
+export const UserSchema = z.object({
+  name: z.string().optional().describe("Display name for the user."),
+  telegram_ids: z
+    .array(z.string())
+    .min(1)
+    .describe(
+      "Telegram username(s) and/or numeric user id(s) identifying this user " +
+      "(a leading @ is optional). Matched against the message sender for " +
+      "per-speaker memory routing.",
+    ),
+  profile_bank: z
+    .string()
+    .describe(
+      "Hindsight bank holding this user's memory profile (author via " +
+      "`switchroom memory profile add <bank> ...`).",
+    ),
+});
+export type User = z.infer<typeof UserSchema>;
+
 export const SwitchroomConfigSchema = z.object({
   switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
@@ -3216,6 +3273,15 @@ export const SwitchroomConfigSchema = z.object({
       "Inline profiles declared here take priority over filesystem " +
       "profiles/<name>/ directories when both exist.",
     ),
+  users: z
+    .record(z.string(), UserSchema)
+    .optional()
+    .describe(
+      "Trusted users the fleet serves — each a Telegram identity plus a " +
+      "memory profile bank. Assigned to agents via `serves` / `knows`. The " +
+      "operator's own trusted people (single-tenant), not multi-tenant. See " +
+      "reference/rfcs/user-concept.md.",
+    ),
   agents: z
     .record(
       z.string().regex(/^[a-z0-9][a-z0-9_-]{0,50}$/, {
@@ -3229,6 +3295,34 @@ export const SwitchroomConfigSchema = z.object({
     "egress allowlist + host-pinned secret bindings for Tier-0 http-diff " +
     "polls (§6.1). Required to enable any http-diff poll; not agent-writable.",
   ),
+}).superRefine((cfg, ctx) => {
+  // Every `serves` entry must name a user defined in the top-level `users:`
+  // block (a typo would silently route nothing). `knows` is permissive — an
+  // entry may be a user OR a raw bank name, so it is not checked here.
+  const userKeys = new Set(Object.keys(cfg.users ?? {}));
+  const checkServes = (
+    serves: readonly string[] | undefined,
+    path: (string | number)[],
+  ) => {
+    (serves ?? []).forEach((s, i) => {
+      if (!userKeys.has(s)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `serves references unknown user "${s}" — add it to the top-level ` +
+            "`users:` block (or did you mean `knows` for a raw bank name?)",
+          path: [...path, i],
+        });
+      }
+    });
+  };
+  checkServes(cfg.defaults?.serves, ["defaults", "serves"]);
+  for (const [name, p] of Object.entries(cfg.profiles ?? {})) {
+    checkServes((p as { serves?: string[] }).serves, ["profiles", name, "serves"]);
+  }
+  for (const [name, a] of Object.entries(cfg.agents ?? {})) {
+    checkServes((a as { serves?: string[] }).serves, ["agents", name, "serves"]);
+  }
 });
 
 export type SwitchroomConfig = z.infer<typeof SwitchroomConfigSchema>;
