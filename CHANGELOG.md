@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.15.44 — per-user memory: profile banks, per-speaker routing, first-class users
+
+The fleet now gives each trusted user their own memory. When a user messages an agent, recall surfaces *their* profile — not a blended pool.
+
+- **Profile banks + `memory.recall.additional_banks` (#2441).** Recall can merge extra Hindsight banks (a shared / profile bank) into an agent's own results — recall-ranked, 8s timeout each, non-fatal. New `switchroom memory profile add/list` authors operator-written facts into a named bank.
+- **Per-speaker routing — `memory.recall.sender_banks` (#2442).** The recall hook reads the Telegram sender from the `<channel user="…">` envelope and routes recall to that user's profile bank (additive; a leading `@` is optional; the sender is part of the recall cache key so multi-user sessions don't cross-serve). Vendor recall-hook change only — no model/SDK/API path added.
+- **First-class users — `users:` + agent `serves` / `knows` (#2444).** Define a trusted person once (`telegram_ids` + `profile_bank`) and assign them to agents: `serves` generates `sender_banks` (speaker routing), `knows` generates `additional_banks` (subject knowledge — accepts a user or a raw bank). Union semantics; a `serves` typo is a config error. Memory-routing phase only — access (`allowFrom`) generation is deferred. RFC `reference/rfcs/user-concept.md`.
+- **`single-tenant` invariant clarified (#2439, #2440).** Multiple *trusted users within one tenant* and per-user memory isolation are now explicit goals — the invariant had conflated "single deployment" with "single human."
+- **Hindsight: 8 GB memory + consolidation throughput knobs (#2438).** Mem limit 4 GB → 8 GB (baseline RSS ~3.4 GB was tight); exposes `LLM_PARALLELISM` (4→6) and `MAX_MEMORIES_PER_ROUND` (100→300) as managed config — concurrency ceiling 3×6=18, fleet-safe. Applied via `memory setup --recreate`.
+
 ## v0.15.43 — hindsight ops: working backups, mental-model refresh, throughput, liveness
 
 - **Automated backup now actually works (#2436).** The
