@@ -64,4 +64,16 @@ describe("hindsight-maintenance.sh", () => {
     // Interval gate so it backs up at most once per window.
     expect(raw).toMatch(/-mmin "?-?\$\{BACKUP_INTERVAL_MIN\}/);
   });
+
+  it("runs a queue-liveness probe that warns (read-only) when the pipeline is wedged", () => {
+    const raw = readFileSync(SCRIPT, "utf-8");
+    // Reads the oldest non-terminal op age — read-only (SELECT, never mutates).
+    expect(raw).toMatch(/FROM async_operations WHERE status IN \('pending','processing'\)/);
+    expect(raw).toMatch(/QUEUE_LAG_WARN_S/);
+    // Gated (0 disables) and emits a WARNING, not a mutation.
+    expect(raw).toMatch(/\$\{QUEUE_LAG_WARN_S\}.*-gt 0/);
+    expect(raw).toMatch(/log "WARNING: queue may be wedged/);
+    // The probe must not DELETE/UPDATE — it's visibility only.
+    expect(raw).not.toMatch(/(DELETE|UPDATE).*status IN \('pending','processing'\)/);
+  });
 });
