@@ -3996,8 +3996,7 @@ export function scaffoldAgent(
         return false;
       });
 
-    // Update bank missions and ensure user-profile MM — both gated on the
-    // bank actually existing.
+    // Update bank missions — gated on the bank actually existing.
     //
     // Mission selection: explicit user yaml wins. When the operator hasn't
     // set a `retain_mission`, scaffold (NOT reconcile) seeds the upstream-

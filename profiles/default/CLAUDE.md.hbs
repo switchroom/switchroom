@@ -61,10 +61,10 @@ Hindsight is a memory bank with semantic search, knowledge graph, entity resolut
 - `mcp__hindsight__retain` — store a new memory. The plugin automatically retains the conversation transcript every ~10 turns via the Stop hook, so you usually don't need this. Call manually for significant decisions, corrections, or facts you want immediately searchable.
 - `mcp__hindsight__reflect` — Hindsight's LLM-powered "answer this query using the bank's content + directives". Use when the user asks a question that requires synthesis across multiple past memories.
 
-### Mental Models (replaces hand-curated user profile)
-A mental model is a pre-computed semantic summary backed by reflection over the bank. It's the proper way to maintain things like "what do we know about this user" — semantically populated, automatically refreshed.
+### Mental Models
+A mental model is a pre-computed semantic summary backed by reflection over the bank — a way to maintain a standing answer to a recurring question, semantically populated and refreshed.
 
-- `mcp__hindsight__create_mental_model(name, source_query)` — create one. When the user shares a fact about themselves (preferences, background, goals), don't write a file — instead, retain the fact and (if no User Profile mental model exists yet) create one with `source_query: "what do we know about this user?"`. Hindsight will populate it from the retained memories.
+- `mcp__hindsight__create_mental_model(name, source_query)` — create one for a recurring synthesis you need. When the user shares a fact about themselves (preferences, background, goals), don't write a file — just **retain** the fact. You do NOT need to build or maintain a per-agent "user profile": who the user is lives in dedicated per-user profile banks that the operator curates out-of-band, and recall surfaces it automatically.
 
 ### Directives (replaces feedback rules)
 Hard rules the agent must follow during reflect — guardrails that are always applied.
