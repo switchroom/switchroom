@@ -131,6 +131,24 @@ switchroom memory profile list operator-profile        # inspect what's in the b
 
 `add` retains an operator-authored fact into the named bank (creating it on first write); fact extraction runs in the background, so `list` may lag a few seconds. After authoring, wire the bank in via `additional_banks` (above), then `switchroom apply` + restart the agent(s).
 
+### Per-speaker recall — `memory.recall.sender_banks`
+
+When an agent serves **multiple trusted users**, route recall to the *speaker's* profile bank with a `sender_banks` map. On each inbound, the agent recalls its own bank **plus** the bank mapped to whoever sent the message — so each user gets their own context instead of a blended pool. This is the per-user isolation the [`single-tenant`](../reference/invariants.md#single-tenant) invariant calls for, and it keeps recall relevant + token-efficient.
+
+```yaml
+agents:
+  clerk:
+    memory:
+      recall:
+        sender_banks:
+          "@lisa": lisa-profile      # match by Telegram @username …
+          "123456789": ken-profile   # … or by numeric user_id
+```
+
+The key is matched against the sender's Telegram username (when they have one) or their numeric user id — both are emitted in the message envelope. Author the target banks with `switchroom memory profile add <bank> "..."` (above).
+
+**It is additive recall scoping, never an access boundary.** Who may *drive* an agent stays the per-agent assignment in `access.allowFrom` — the sender hint only changes which memory is *recalled*, never who is allowed to talk to the agent. All banks remain your own data in your own Hindsight instance, fully visible to you. Combine with `additional_banks` for a shared bank everyone sees *plus* a per-person bank.
+
 ### Demoting individual memories from auto-recall
 
 If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.

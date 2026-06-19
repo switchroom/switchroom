@@ -89,6 +89,35 @@ def extract_topic_from_prompt(
     return chat_id, thread_id
 
 
+# Switchroom (per-speaker memory routing, RFC
+# reference/rfcs/per-speaker-memory-routing.md): extract the sender identity
+# (`user=` attribute) from the channel envelope. The gateway emits
+# `user = from.username ?? String(from.id)`, so this is a username when the
+# sender has one, else their numeric Telegram user id. Used to route recall to
+# the speaker's profile bank — additive recall scoping, never an auth boundary.
+_USER_RE = re.compile(
+    r"<channel\b[^>]*\buser=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+
+
+def extract_user_from_prompt(prompt: str) -> Optional[str]:
+    """Pull the sender `user` out of the `<channel ...>` envelope.
+
+    Returns None when the prompt isn't channel-wrapped (interactive
+    sessions, non-Telegram channels, test fixtures). The value is the
+    sender's username when set, else their numeric Telegram user id.
+    """
+    if not prompt or not isinstance(prompt, str):
+        return None
+    head = prompt[:1024]
+    match = _USER_RE.search(head)
+    if not match:
+        return None
+    user = match.group(1).strip()
+    return user or None
+
+
 def gateway_socket_path() -> Optional[str]:
     """Resolve the gateway socket path for the current agent.
 

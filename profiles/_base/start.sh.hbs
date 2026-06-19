@@ -355,6 +355,12 @@ export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
 {{#if hindsightTopicAliasesJsonQ}}
 export HINDSIGHT_TOPIC_ALIASES_JSON={{{hindsightTopicAliasesJsonQ}}}
 {{/if}}
+# Switchroom (per-speaker memory routing): {sender: bank} map so recall.py
+# routes recall to the speaker's profile bank. Emitted only when the agent
+# has a memory.recall.sender_banks map; absent for single-user agents.
+{{#if hindsightSenderBanksJsonQ}}
+export HINDSIGHT_SENDER_BANKS_JSON={{{hindsightSenderBanksJsonQ}}}
+{{/if}}
 # PR6 — topic filter mode for cross-topic memory recall. Default
 # "soft-preamble": all topic-tagged memories surface and the model
 # decides relevance via the preamble. "hard-filter": drop memories

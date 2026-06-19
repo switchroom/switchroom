@@ -59,7 +59,7 @@ from lib.content import (
 )
 from lib.daemon import get_api_url
 from lib.directives import fetch_active_directives, format_active_directives_block
-from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, update_placeholder
+from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.state import read_state, write_state
 
 LAST_RECALL_STATE = "last_recall.json"
@@ -194,6 +194,7 @@ def _cache_key(
     bank_id: str,
     extra_banks: list,
     active_thread_id: str | None = None,
+    active_sender: str | None = None,
 ) -> str:
     """Stable hash for cache keying. Session_id is included so a new
     session always misses, regardless of the TTL setting. Extra banks
@@ -204,6 +205,11 @@ def _cache_key(
     but different topic) don't collide on the cache. Empty/None
     collapses to the empty string — backward-compatible for
     fleet-shared / DM agents where no thread_id is present.
+
+    Switchroom (per-speaker routing): `active_sender` is included for the
+    same reason — in a multi-user session two speakers sending the same
+    prompt resolve to different recall banks, so the sender must be part of
+    the key or one speaker's recall would be served to the other.
     """
     parts = [
         session_id or "",
@@ -211,6 +217,7 @@ def _cache_key(
         bank_id or "",
         ",".join(sorted(extra_banks or [])),
         active_thread_id or "",
+        active_sender or "",
     ]
     payload = "\x1f".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -640,11 +647,35 @@ def main():
     bank_id = derive_bank_id(hook_input, config)
     additional_banks = config.get("recallAdditionalBanks", []) or []
 
+    # Switchroom (per-speaker memory routing, RFC
+    # reference/rfcs/per-speaker-memory-routing.md): when this agent serves
+    # multiple trusted users, also recall the *speaker's* profile bank. The
+    # sender is in the `<channel user="...">` envelope; the sender→bank map is
+    # injected as HINDSIGHT_SENDER_BANKS_JSON ({"<username-or-id>": "<bank>"}).
+    # Additive — never replaces the agent's own bank, never an auth boundary
+    # (single-tenant). Failure-safe + silent on every error path.
+    active_sender = extract_user_from_prompt(prompt)
+    if active_sender:
+        sender_banks_json = os.environ.get("HINDSIGHT_SENDER_BANKS_JSON", "")
+        if sender_banks_json:
+            try:
+                sender_banks = json.loads(sender_banks_json)
+                if isinstance(sender_banks, dict):
+                    sender_bank = sender_banks.get(active_sender)
+                    if (
+                        sender_bank
+                        and sender_bank != bank_id
+                        and sender_bank not in additional_banks
+                    ):
+                        additional_banks = [*additional_banks, sender_bank]
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
     # Switchroom #424 phase 4.1 — cache check BEFORE any HTTP traffic.
     # Whole-session-scoped, opt-in via HINDSIGHT_RECALL_CACHE_TTL_SECS.
     cache_ttl = _cache_ttl_secs()
     cache_key = (
-        _cache_key(session_id, prompt, bank_id, additional_banks, active_thread_id)
+        _cache_key(session_id, prompt, bank_id, additional_banks, active_thread_id, active_sender)
         if cache_ttl > 0
         else ""
     )

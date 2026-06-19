@@ -396,6 +396,19 @@ export const AgentMemorySchema = z
             "the operator's Hindsight instance (see the `single-tenant` " +
             "invariant). Defaults to [] (no extra banks).",
           ),
+        sender_banks: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            "Per-speaker recall routing: a map of Telegram sender → extra " +
+            "recall bank. When a message arrives, the agent also recalls the " +
+            "speaker's bank (matched by @username or numeric user_id), merged " +
+            "into its own results — so each trusted user gets their own " +
+            "profile context. Additive recall scoping within the single " +
+            "tenant: never an access boundary (who may drive an agent stays " +
+            "the per-agent user assignment in `access.allowFrom`). Author the " +
+            "banks via `switchroom memory profile`.",
+          ),
         skip_trivial: z
           .boolean()
           .optional()
@@ -1827,6 +1840,7 @@ const profileFields = {
           cache_ttl_secs: z.number().int().min(0).optional(),
           min_overlap: z.number().min(0).max(1).optional(),
           additional_banks: z.array(z.string()).optional(),
+          sender_banks: z.record(z.string(), z.string()).optional(),
         })
         .optional(),
     })
