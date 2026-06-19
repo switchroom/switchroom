@@ -122,7 +122,7 @@ function loadConnectionsRenderer(): (data: unknown) => string {
 const MOCK = {
   google: [
     {
-      account: "pixsoul@gmail.com",
+      account: "alice@example.com",
       expiresAt: 1,
       scope: "https://www.googleapis.com/auth/drive.file",
       clientId: "cid-123456789012",
@@ -165,7 +165,7 @@ describe("Connections tab renders provider cards from data (real inline renderCo
 
   it("renders Google + Microsoft + Linear cards with their identifiers", () => {
     const out = render(MOCK);
-    expect(out).toContain("pixsoul@gmail.com");
+    expect(out).toContain("alice@example.com");
     expect(out).toContain("ken@outlook.com");
     expect(out).toContain("carrie");
     // Linear is shown as an OAuth app actor, not a personal token.
@@ -180,7 +180,7 @@ describe("Connections tab renders provider cards from data (real inline renderCo
     // `display:none` blanked on desktop.
     const gridStart = out.indexOf('class="accounts-grid"');
     expect(gridStart).toBeGreaterThanOrEqual(0);
-    expect(out.indexOf("pixsoul@gmail.com")).toBeGreaterThan(gridStart);
+    expect(out.indexOf("alice@example.com")).toBeGreaterThan(gridStart);
   });
 
   it("never leaks an account expiry as a scary 'expired' for a broker-known slot", () => {
