@@ -1085,6 +1085,27 @@ export class AuthBroker {
       if (cand === account || this.isAccountExhausted(cand)) continue;
       if (readAccountCredentials(cand, this.home)) return cand;
     }
+    // Last-resort: if auth.active is set, is different from the exhausted
+    // account, is itself not exhausted, and has credentials, use it.
+    //
+    // This intentionally breaks consumer quota-isolation as a last resort to
+    // avoid a total stall. It only triggers when BOTH the consumer's pinned
+    // account AND every fallback_order member are walled — the 2026-06-19
+    // incident where hindsight stalled fleet-wide for ~2h because auth.active
+    // was healthy but never consulted. For agents, callerAccount() already
+    // returns auth.active, so account === active and this branch is skipped
+    // (strict no-op). For consumers whose pinned account differs from
+    // auth.active, this gives the fleet-active account as an emergency escape
+    // hatch, and reverts automatically once the exhaustion window clears.
+    const active = this.config.auth?.active;
+    if (
+      active &&
+      active !== account &&
+      !this.isAccountExhausted(active) &&
+      readAccountCredentials(active, this.home)
+    ) {
+      return active;
+    }
     return account;
   }
 
