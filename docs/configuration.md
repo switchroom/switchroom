@@ -102,6 +102,35 @@ The cap applies to the *combined* result list across the primary bank and any `r
 
 Operationally: the cap is set via the `HINDSIGHT_RECALL_MAX_MEMORIES` env var that `start.sh` exports. The vendored plugin's `recall.py` slices results client-side before formatting (plugin v0.4.0 has no `recallTopK` setting on the Claude Code integration — only Openclaw exposes it).
 
+### Shared / profile recall banks — `memory.recall.additional_banks`
+
+By default an agent recalls only its own bank. Point `additional_banks` at one or more extra Hindsight banks and the recall hook queries them too on every turn, **merging** their hits into the agent's own results (each extra bank gets an 8s timeout and is non-fatal on failure). Use this for a shared operator/household profile every agent should know — preferences, projects, people — kept consistent fleet-wide.
+
+```yaml
+defaults:
+  memory:
+    recall:
+      additional_banks: ["operator-profile"]   # every agent also recalls this bank
+
+agents:
+  coach:
+    memory:
+      recall:
+        additional_banks: ["operator-profile", "fitness-context"]
+```
+
+This stays within the **single tenant**: every bank is your own data, in your own Hindsight instance, fully visible to you (see the [`single-tenant`](../reference/invariants.md#single-tenant) invariant). It is additive recall scoping, never an access boundary.
+
+**Authoring a profile bank — `switchroom memory profile`:**
+
+```
+switchroom memory profile add operator-profile "Ken prefers concise, direct answers and dislikes preamble."
+switchroom memory profile add operator-profile "Primary project this quarter is the switchroom fleet."
+switchroom memory profile list operator-profile        # inspect what's in the bank
+```
+
+`add` retains an operator-authored fact into the named bank (creating it on first write); fact extraction runs in the background, so `list` may lag a few seconds. After authoring, wire the bank in via `additional_banks` (above), then `switchroom apply` + restart the agent(s).
+
 ### Demoting individual memories from auto-recall
 
 If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.
