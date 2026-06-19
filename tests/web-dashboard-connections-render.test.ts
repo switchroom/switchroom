@@ -254,10 +254,12 @@ describe("Connections CSS — card containers are never hidden unscoped on deskt
   });
 
   it("never hides .accounts-grid / .account-card unscoped inside a desktop @media", () => {
-    const desktop = mediaBlocks(css).filter((b) => {
-      const mm = b.prelude.match(/min-width:\s*(\d+)px/);
-      return mm != null && Number(mm[1]) >= 601;
-    });
+    const desktop = mediaBlocks(css).filter((b) =>
+      // Any `min-width` breakpoint applies at desktop widths and up; an unscoped
+      // card-hide at ANY such breakpoint blanks the Connections tab. Don't floor
+      // at 601px — a hide added at e.g. min-width:481px would otherwise slip past.
+      /min-width:\s*\d+px/.test(b.prelude),
+    );
     const offenders: string[] = [];
     for (const block of desktop) {
       // Split the block into `selector { decls }` rules.
