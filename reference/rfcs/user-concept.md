@@ -124,12 +124,20 @@ is the one asking.
 
 `access.allowFrom`, `memory.recall.sender_banks`, and
 `memory.recall.additional_banks` remain valid as direct, low-level config —
-`users:` is the higher layer that *generates* them. Precedence: the
-user-assignment-generated values are the **base**; an explicit per-agent
-`sender_banks`/`additional_banks`/`allowFrom` **merges on top** (per-key, via
-the existing `memory.recall` cascade), so an operator can always override or
-extend a generated map for one agent. A fleet with no `users:` block behaves
-exactly as today.
+`users:` is the higher layer that *generates* them. Precedence (decided —
+see Open Question 1): `resolveUsers()` computes the generated values and
+**unions** any explicit per-agent `allowFrom` / `sender_banks` /
+`additional_banks` on top — additive, so an explicit value *extends* the
+generated set rather than replacing it.
+
+Crucially, this union is done **inside `resolveUsers()`**, not by leaning on
+the default config cascade. The `memory.recall` cascade
+(`src/config/merge.ts`) merges one level per-key and **replaces** an
+array/map value wholesale (an override's `additional_banks` array or
+`sender_banks` map replaces the base, it does not extend it) — so relying on
+it would silently drop the generated wiring. `resolveUsers()` therefore
+produces the final unioned maps itself, before scaffold emits them. A fleet
+with no `users:` block generates empty maps and behaves exactly as today.
 
 ## Effort
 
@@ -158,10 +166,15 @@ exactly as today.
 
 ## Open questions
 
-1. **`allowFrom` merge semantics** — should `serves`-generated ids **union**
-   with an explicit `allowFrom` (additive, safest) or be overridable to a
-   subset? Recommend union; an operator removing a served user's access is a
-   `serves` edit, keeping one source of truth.
+1. **Generated-vs-explicit precedence — decided: union.** Explicit per-agent
+   `allowFrom` / `sender_banks` / `additional_banks` **union** with the
+   `serves`/`knows`-generated values (additive, safest), computed in
+   `resolveUsers()` rather than the replace-by-default cascade (see Backward
+   compatibility above). One source of truth: removing a served user's access
+   is a `serves` edit, not a subtractive override. Open sub-question: do we
+   ever need a *subtractive* per-agent exclusion ("serves Lisa fleet-wide but
+   not on this agent")? Deferred — add an explicit `excludes:` only if a real
+   need appears.
 2. **Served vs known overlap** — a `serves` user is speaker-routed; should
    they *also* be always-known (subject) on that agent? Recommend **no** by
    default (speaker routing already loads them when they talk; add them to
