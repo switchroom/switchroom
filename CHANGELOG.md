@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.42 — poll auto-recovery, context-headroom surface, session commands
+
+- **Telegram poll auto-recovery after a network flap (#2432).** A flaky-internet
+  flap could leave the whole fleet alive-but-deaf: the long-poll stall-recovery
+  hung in grammy's `runnerHandle.stop()`, which awaits a runner task blocked on a
+  non-abortable `getUpdates` retry backoff — so the runner never stopped and the
+  in-place restart never ran. Now a confirmed stall exits the gateway non-zero and
+  `_switchroom_supervise` restarts it with a fresh runner (exit 1, **never 78**).
+  Stall detection sped up 5min→60s, so a flap self-heals in ~3min instead of
+  staying deaf until a manual restart. Restarts only the gateway sidecar (claude
+  untouched; in-flight turns boot-resumed).
+- **Context-headroom surface (#2429, #2430).** Each agent's working-context
+  occupancy vs the cap is now visible — a "Context Headroom" section in `switchroom
+  doctor` (WARN on the tight band) and a per-agent gauge on the web fleet view. The
+  gateway writes a per-turn snapshot reusing the exact occupancy proactive-compaction
+  reads, so the surface can never disagree with what triggers `/compact`. Read-only,
+  no per-turn model cost. Makes the ~40% tool-search context win legible.
+- **Telegram session commands (#2434).** Removed `/reset` (a pure alias of `/new`);
+  added `/compact` and `/clear` as first-class commands open to any chat member; and
+  sessions now auto-`/clear` after **3h idle by default** (`session.idle_clear_after`;
+  `0s` disables) — clearing the working context only, with long-term memory kept in
+  Hindsight. Never fires mid-turn; inbound and cron activity re-arm it. Subtle notice
+  on auto-clear.
+- **`switchroom update` refreshes the hindsight singleton (#2431).** A version
+  update now also recreates the hindsight container, not just the agents/broker.
+
 ## v0.15.41 — memory: observation-backed recall + trivial-turn skip (on by default)
 
 - **Recall now consumes the synthesized `observation` tier, on by default
