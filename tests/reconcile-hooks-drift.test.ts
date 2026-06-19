@@ -39,6 +39,20 @@ describe("buildSettingsHooksBlock", () => {
     expect(result.PostToolUse).toBeUndefined();
   });
 
+  it("does NOT wire the retired user-profile-refresh Stop hook, even with hindsight enabled", () => {
+    // Per-agent user-profile mental models are retired in favour of dedicated
+    // profile banks — the refresh Stop hook must no longer be emitted.
+    const result = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig: makeAgentConfig(),
+      hindsightEnabled: true,
+      useSwitchroomPlugin: true,
+    });
+    const stop = (result.Stop ?? []) as Array<{ hooks: Array<{ command: string }> }>;
+    const stopCmds = stop.flatMap((e) => e.hooks.map((h) => h.command));
+    expect(stopCmds.some((c) => c.includes("user-profile-refresh-hook.sh"))).toBe(false);
+  });
+
   it("with telegram plugin adds PreToolUse and PostToolUse hooks", () => {
     const agentConfig = makeAgentConfig({
       plugin: "switchroom-telegram",
