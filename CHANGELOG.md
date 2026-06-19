@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.15.45 — profile-bank visibility + retire per-agent user-profile mental models
+
+Follow-ups to the per-user memory work (v0.15.44).
+
+- **Profile banks on the health surfaces (#2446).** Per-user / shared profile banks (`ken-profile`, `lisa-profile`, …) now appear on the web dashboard `/memory` tab (labelled "profile bank"), in `switchroom doctor`, and in `switchroom memory stats` — previously invisible because those surfaces enumerated only agent collections. New shared `collectProfileBanks` helper drives all three.
+- **Retire per-agent user-profile mental models (#2447).** Dedicated profile banks are now the source of truth for "who the user is", so scaffold/reconcile no longer auto-create a per-agent `user-profile` mental model and no longer wire the `user-profile-refresh` Stop hook. This removes a drift class (empty/failed models injected every turn and flagged by doctor) and a source of personal-fact conflicts (a stale per-agent profile outranking the curated bank). The dashboard "Build profile" button + the helper remain as a dormant opt-in; agent guidance no longer tells agents to build one.
+
 ## v0.15.44 — per-user memory: profile banks, per-speaker routing, first-class users
 
 The fleet now gives each trusted user their own memory. When a user messages an agent, recall surfaces *their* profile — not a blended pool.
