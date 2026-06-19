@@ -149,6 +149,29 @@ The key is matched against the sender's Telegram username (when they have one) o
 
 **It is additive recall scoping, never an access boundary.** Who may *drive* an agent stays the per-agent assignment in `access.allowFrom` — the sender hint only changes which memory is *recalled*, never who is allowed to talk to the agent. All banks remain your own data in your own Hindsight instance, fully visible to you. Combine with `additional_banks` for a shared bank everyone sees *plus* a per-person bank.
 
+### First-class users — `users:` + agent `serves` / `knows`
+
+Rather than hand-maintaining `sender_banks` and `additional_banks` maps per agent, define each trusted person **once** as a user and assign them to agents. See [`reference/rfcs/user-concept.md`](../reference/rfcs/user-concept.md).
+
+```yaml
+users:
+  ken:  { telegram_ids: ["mekenthompson"], profile_bank: ken-profile }
+  lisa: { telegram_ids: ["8201250670"],    profile_bank: lisa-profile }
+
+agents:
+  ziggy:  { serves: [lisa] }                       # Lisa's own agent
+  marko:  { serves: [ken, lisa] }                  # serves both
+  gymbro: { serves: [ken] }                        # Ken only
+  clerk:  { serves: [ken], knows: [lisa, kids] }   # Ken drives; always knows the family
+```
+
+- **`serves: [<user>…]`** — users this agent works for. When a served user messages it, their `profile_bank` is recalled (generates `sender_banks`).
+- **`knows: [<user-or-bank>…]`** — profiles this agent always knows as *subjects*, even when that person isn't the speaker (generates `additional_banks`). A user name resolves to their profile bank; any other string is a raw bank name (e.g. a `kids` bank with no Telegram identity).
+
+`serves`/`knows` accept a fleet-wide default (`defaults.serves: [ken]` → every agent serves Ken) which **unions** with per-agent values. Generated maps also union with any explicit per-agent `sender_banks`/`additional_banks`. A `serves` entry must name a user in the `users:` block (a typo is a config error); `knows` is permissive.
+
+> **Note:** this generates the *memory* wiring only. Who may **drive** an agent (`access.allowFrom`) is still paired at agent creation as today — generating access from `users:` is a future phase.
+
 ### Demoting individual memories from auto-recall
 
 If one specific memory keeps surfacing in the recall block and isn't useful (over-broad world fact, stale context, etc.), tag it with `[demote-from-recall]` — or `demote-from-recall` / `no-recall`, all three work. The memory stays in the bank, `mcp__hindsight__reflect` and manual recall can still find it, but auto-recall skips it.

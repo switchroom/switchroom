@@ -483,6 +483,7 @@ export function maybeWriteCronMcp(
   seedCronConfigDir(agentDir, Object.keys(cronServers));
   return path;
 }
+import { resolveUsers } from "../config/users.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -2165,16 +2166,10 @@ export function installHindsightPlugin(
   // config (defaults → profile → agent), mirroring how the env-export path
   // reads the sibling recall knobs (max_memories etc.) — so a fleet-wide
   // `defaults.memory.recall.additional_banks` is honoured, not just a
-  // per-agent value. `switchroomConfig.agents[agentName]` is the raw,
-  // pre-cascade block, so resolve it here.
-  const agentRaw = switchroomConfig.agents[agentName];
-  const additionalBanks = agentRaw
-    ? resolveAgentConfig(
-        switchroomConfig.defaults,
-        switchroomConfig.profiles,
-        agentRaw,
-      ).memory?.recall?.additional_banks ?? []
-    : [];
+  // per-agent value. Now also folds in the `knows`-assigned user/bank profiles
+  // (user concept, RFC reference/rfcs/user-concept.md); resolveUsers() handles
+  // the cascade + union (defaults ∪ agent, generated ∪ explicit) itself.
+  const additionalBanks = resolveUsers(switchroomConfig, agentName).additionalBanks;
   applyHindsightSettingsOverrides(destPath, additionalBanks);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
@@ -3066,7 +3061,13 @@ export function scaffoldAgent(
   // Switchroom (per-speaker memory routing): {sender: bank} map →
   // HINDSIGHT_SENDER_BANKS_JSON. Sourced from memory.recall.sender_banks
   // (cascaded). Undefined when no map is set (the env-export block no-ops).
-  const senderBanks = agentConfig.memory?.recall?.sender_banks;
+  // `serves`-assigned users generate sender_banks (speaker routing), unioned
+  // with any explicit map — resolved by resolveUsers() (user concept, RFC
+  // reference/rfcs/user-concept.md). Falls back to the explicit map when no
+  // full config is in scope.
+  const senderBanks = switchroomConfig
+    ? resolveUsers(switchroomConfig, name).senderBanks
+    : agentConfig.memory?.recall?.sender_banks ?? {};
   const hindsightSenderBanksJson = senderBanks && Object.keys(senderBanks).length > 0
     ? JSON.stringify(senderBanks)
     : undefined;
@@ -5057,7 +5058,13 @@ export function reconcileAgent(
     ? JSON.stringify(topicAliases)
     : undefined;
   // Switchroom (per-speaker memory routing): mirror scaffoldAgent's compute.
-  const senderBanks = agentConfig.memory?.recall?.sender_banks;
+  // `serves`-assigned users generate sender_banks (speaker routing), unioned
+  // with any explicit map — resolved by resolveUsers() (user concept, RFC
+  // reference/rfcs/user-concept.md). Falls back to the explicit map when no
+  // full config is in scope.
+  const senderBanks = switchroomConfig
+    ? resolveUsers(switchroomConfig, name).senderBanks
+    : agentConfig.memory?.recall?.sender_banks ?? {};
   const hindsightSenderBanksJson = senderBanks && Object.keys(senderBanks).length > 0
     ? JSON.stringify(senderBanks)
     : undefined;
