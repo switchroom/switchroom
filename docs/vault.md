@@ -330,9 +330,12 @@ switchroom vault audit --who my-agent-cron-0
   read the vault file directly.
 - **Host-level compromise**: kernel-level access, full-disk access, or access
   to the user's home directory bypasses all vault protections.
-- **Multi-tenant**: Switchroom is a single-user system.  Multiple users on the
-  same host each have separate vault files and broker sockets, but there is no
-  isolation between processes running as the same UID.
+- **Multi-tenant**: Switchroom is single-tenant, not multi-tenant. Trusted
+  users *within* a tenant share its vault by design — there is no per-user
+  vault isolation (they're implicitly trusted; see the `single-tenant`
+  invariant). Separate OS users on the same host each get separate vault
+  files and broker sockets, but processes running as the same UID are not
+  isolated from each other.
 - **Config edits**: anyone who can edit `switchroom.yaml` can add a key to a
   cron's `secrets[]` list, granting it broker access to any vault key.
   Anyone who knows the vault passphrase can read the vault file directly.
