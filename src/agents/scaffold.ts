@@ -2334,6 +2334,10 @@ interface BuildWorkspaceContextArgs {
   // Optional filter-mode env injected at scaffold time (default
   // "soft-preamble" if unset; "hard-filter" to drop cross-topic memories).
   hindsightTopicAliasesJson?: string;
+  // Switchroom (per-speaker memory routing): JSON map of {sender: bank}
+  // injected as HINDSIGHT_SENDER_BANKS_JSON so recall.py routes recall to
+  // the speaker's profile bank.
+  hindsightSenderBanksJson?: string;
   hindsightTopicFilterMode?: string;
 }
 
@@ -2365,6 +2369,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightTopicAliasesJson,
+    hindsightSenderBanksJson,
     hindsightTopicFilterMode,
   } = args;
   return {
@@ -2447,6 +2452,9 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // false-y for fleet-shared / DM agents (the dominant case).
     hindsightTopicAliasesJsonQ: hindsightTopicAliasesJson
       ? shellSingleQuote(hindsightTopicAliasesJson)
+      : undefined,
+    hindsightSenderBanksJsonQ: hindsightSenderBanksJson
+      ? shellSingleQuote(hindsightSenderBanksJson)
       : undefined,
     hindsightTopicFilterMode,
     switchroomConfigPathQ: switchroomConfigPath
@@ -3055,6 +3063,13 @@ export function scaffoldAgent(
   const hindsightTopicAliasesJson = topicAliases && Object.keys(topicAliases).length > 0
     ? JSON.stringify(topicAliases)
     : undefined;
+  // Switchroom (per-speaker memory routing): {sender: bank} map →
+  // HINDSIGHT_SENDER_BANKS_JSON. Sourced from memory.recall.sender_banks
+  // (cascaded). Undefined when no map is set (the env-export block no-ops).
+  const senderBanks = agentConfig.memory?.recall?.sender_banks;
+  const hindsightSenderBanksJson = senderBanks && Object.keys(senderBanks).length > 0
+    ? JSON.stringify(senderBanks)
+    : undefined;
   // PR6 — topic filter mode opt-in. Defaults to undefined (the script
   // falls back to "soft-preamble" internally). Operator sets via
   // memory.recall.topic_filter_mode in switchroom.yaml when binding
@@ -3089,6 +3104,7 @@ export function scaffoldAgent(
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightTopicAliasesJson,
+    hindsightSenderBanksJson,
     hindsightTopicFilterMode,
   });
 
@@ -5040,6 +5056,11 @@ export function reconcileAgent(
   const hindsightTopicAliasesJson = topicAliases && Object.keys(topicAliases).length > 0
     ? JSON.stringify(topicAliases)
     : undefined;
+  // Switchroom (per-speaker memory routing): mirror scaffoldAgent's compute.
+  const senderBanks = agentConfig.memory?.recall?.sender_banks;
+  const hindsightSenderBanksJson = senderBanks && Object.keys(senderBanks).length > 0
+    ? JSON.stringify(senderBanks)
+    : undefined;
   const hindsightTopicFilterMode = (
     agentConfig.memory?.recall as { topic_filter_mode?: string } | undefined
   )?.topic_filter_mode;
@@ -5109,6 +5130,9 @@ export function reconcileAgent(
       // we actually have a topic_aliases map.
       hindsightTopicAliasesJsonQ: hindsightTopicAliasesJson
         ? shellSingleQuote(hindsightTopicAliasesJson)
+        : undefined,
+      hindsightSenderBanksJsonQ: hindsightSenderBanksJson
+        ? shellSingleQuote(hindsightSenderBanksJson)
         : undefined,
       hindsightTopicFilterMode,
       // Mirror buildWorkspaceContext (#910): host home for the
@@ -5781,6 +5805,7 @@ export function reconcileAgent(
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightTopicAliasesJson,
+      hindsightSenderBanksJson,
       hindsightTopicFilterMode,
     });
     // Phase 5 migration: preserve any agent-specific edits to the legacy
