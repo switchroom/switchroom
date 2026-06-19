@@ -27,7 +27,7 @@ import { getAllAuthStatuses } from "../auth/manager.js";
 import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
-import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList } from "../memory/hindsight.js";
+import { probeHindsight, isHindsightEnabled, fetchHindsightToolsList, collectProfileBanks } from "../memory/hindsight.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract } from "./doctor-memory.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
@@ -969,6 +969,12 @@ export async function checkBankIngestHealth(
     const bankId = agentConfig.memory?.collection ?? agentName;
     banks.set(bankId, [...(banks.get(bankId) ?? []), agentName]);
   }
+  // Profile banks (per-user / shared) — recall routes to them but no agent
+  // owns them; sweep their health alongside the agent banks.
+  const profileBanks = collectProfileBanks(config);
+  for (const bank of profileBanks) {
+    if (!banks.has(bank)) banks.set(bank, []);
+  }
 
   // Inspect banks concurrently — sequential probes against a busy server
   // (e.g. mid-extraction) compound each bank's latency into a doctor stall.
@@ -979,7 +985,13 @@ export async function checkBankIngestHealth(
   );
 
   for (const [bankId, agents, h] of inspected) {
-    const label = `bank ${bankId}` + (agents[0] !== bankId ? ` (${agents.join(", ")})` : "");
+    const label =
+      `bank ${bankId}` +
+      (profileBanks.has(bankId)
+        ? " (profile)"
+        : agents[0] !== bankId
+          ? ` (${agents.join(", ")})`
+          : "");
     if (!h.ok) {
       results.push({
         name: label,

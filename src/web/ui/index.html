@@ -898,7 +898,7 @@
         return `<div class="agent-card">
           <div class="card-header" style="cursor:default">
             ${statusDot(b.status)}<span class="agent-name">${escapeHtml(b.bank)}</span>
-            <span style="color:var(--text-dim);font-size:.85em;margin-left:.5rem">${escapeHtml((b.agents || []).join(', '))}</span>
+            <span style="color:var(--text-dim);font-size:.85em;margin-left:.5rem">${b.kind === 'profile' ? '<em>profile bank</em>' : escapeHtml((b.agents || []).join(', '))}</span>
           </div>
           <div style="padding:0 1.25rem 1rem">
             <div style="color:var(--text-dim);margin:.1rem 0 .3rem">${escapeHtml(b.statusDetail || '')}</div>
