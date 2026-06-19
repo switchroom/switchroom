@@ -439,6 +439,28 @@ describe("handleGetMemoryHealth (dashboard)", () => {
     expect(byBank.stale.agents).toEqual(["ziggy"]);
   });
 
+  it("surfaces profile banks as agent-less rows with kind:'profile'", async () => {
+    const config = {
+      memory: { backend: "hindsight", config: { url: "http://x/mcp/" } },
+      agents: {
+        clerk: {
+          memory: { collection: "clerk", recall: { additional_banks: ["ken-profile"] } },
+        },
+      },
+    } as unknown as SwitchroomConfig;
+    const health = await handleGetMemoryHealth(config, {
+      fetchImpl: fakeFetchFor({ clerk: HEALTHY_BANK, "ken-profile": HEALTHY_BANK }),
+      now: NOW,
+    });
+    const byBank = Object.fromEntries(health.banks.map((b) => [b.bank, b]));
+    // agent bank: owned, kind 'agent'
+    expect(byBank.clerk.kind).toBe("agent");
+    expect(byBank.clerk.agents).toEqual(["clerk"]);
+    // profile bank: no owning agent, kind 'profile'
+    expect(byBank["ken-profile"].kind).toBe("profile");
+    expect(byBank["ken-profile"].agents).toEqual([]);
+  });
+
   it("reports unreachable without throwing when hindsight is down", async () => {
     const down = (async () => new Response("nope", { status: 502 })) as unknown as typeof fetch;
     const health = await handleGetMemoryHealth(minimalConfig({ a: {} }), {

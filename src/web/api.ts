@@ -6,7 +6,11 @@ import {
   getAllAgentStatuses,
 } from "../agents/lifecycle.js";
 import { getAllAuthStatuses } from "../auth/manager.js";
-import { getCollectionForAgent, probeHindsight } from "../memory/hindsight.js";
+import {
+  collectProfileBanks,
+  getCollectionForAgent,
+  probeHindsight,
+} from "../memory/hindsight.js";
 import {
   inspectBankHealth,
   getMentalModelDetail,
@@ -1887,6 +1891,12 @@ export interface MemoryBankHealthRow {
   /** ok | warn | fail — same thresholds as `switchroom doctor`. */
   status: "ok" | "warn" | "fail";
   statusDetail: string;
+  /**
+   * `agent` = an agent's own `memory.collection`; `profile` = a standalone
+   * per-user / shared profile bank that recall routes to but no agent owns
+   * (its `agents` list is empty). Lets the UI label profile banks distinctly.
+   */
+  kind: "agent" | "profile";
 }
 
 export interface MemoryHealth {
@@ -1917,6 +1927,14 @@ export async function handleGetMemoryHealth(
   for (const agentName of Object.keys(config.agents)) {
     const bank = getCollectionForAgent(agentName, config);
     banks.set(bank, [...(banks.get(bank) ?? []), agentName]);
+  }
+
+  // Profile banks (per-user / shared) have no owning agent — recall routes to
+  // them but they're not any agent's collection. Add them as agent-less rows
+  // so the operator sees their health alongside the agent banks.
+  const profileBankSet = collectProfileBanks(config);
+  for (const bank of profileBankSet) {
+    if (!banks.has(bank)) banks.set(bank, []);
   }
 
   const rows = await Promise.all(
@@ -1969,6 +1987,7 @@ export async function handleGetMemoryHealth(
         corruptedMentalModelNames: corrupted.map((m) => m.name),
         status,
         statusDetail,
+        kind: profileBankSet.has(bank) ? "profile" : "agent",
       };
     }),
   );
@@ -1996,7 +2015,9 @@ function isKnownBank(config: SwitchroomConfig, bank: string): boolean {
   for (const agentName of Object.keys(config.agents)) {
     if (getCollectionForAgent(agentName, config) === bank) return true;
   }
-  return false;
+  // Profile banks (per-user / shared) are real banks too — allow remediation
+  // (reprocess / refresh model) on them, same as agent banks.
+  return collectProfileBanks(config).has(bank);
 }
 
 /**

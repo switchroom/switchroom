@@ -1,4 +1,5 @@
 import type { SwitchroomConfig, MemoryBackendConfig } from "../config/schema.js";
+import { resolveUsers } from "../config/users.js";
 
 export interface McpServerConfig {
   type?: string;
@@ -86,6 +87,44 @@ export function getCollectionForAgent(
 ): string {
   const agentConfig = config.agents[agentName];
   return agentConfig?.memory?.collection ?? agentName;
+}
+
+/**
+ * Collect the standalone "profile banks" referenced across the config — the
+ * per-user / shared hindsight banks that recall routes to but that are NOT any
+ * agent's own `memory.collection`. Deduped, drawn from:
+ *   - `users.<name>.profile_bank` (first-class users, even if not yet assigned)
+ *   - every bank any agent actually recalls, via `resolveUsers` (so the cascade
+ *     + `serves`/`knows` + explicit `additional_banks`/`sender_banks` are all
+ *     covered, not just raw per-agent config).
+ *
+ * These are invisible to the agent-driven health surfaces (dashboard Memory
+ * tab, `doctor`, `memory stats`), which only enumerate agent collections — so
+ * each of those surfaces unions this set in to show profile-bank health too.
+ *
+ * With `excludeAgentCollections` (default true) any bank that is already some
+ * agent's collection is dropped, so a bank never shows as both.
+ */
+export function collectProfileBanks(
+  config: SwitchroomConfig,
+  opts: { excludeAgentCollections?: boolean } = {},
+): Set<string> {
+  const { excludeAgentCollections = true } = opts;
+  const banks = new Set<string>();
+  for (const user of Object.values(config.users ?? {})) {
+    if (user.profile_bank) banks.add(user.profile_bank);
+  }
+  for (const agentName of Object.keys(config.agents)) {
+    const { senderBanks, additionalBanks } = resolveUsers(config, agentName);
+    for (const b of Object.values(senderBanks)) banks.add(b);
+    for (const b of additionalBanks) banks.add(b);
+  }
+  if (excludeAgentCollections) {
+    for (const agentName of Object.keys(config.agents)) {
+      banks.delete(getCollectionForAgent(agentName, config));
+    }
+  }
+  return banks;
 }
 
 /**

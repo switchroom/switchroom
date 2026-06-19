@@ -3,6 +3,7 @@ import chalk from "chalk";
 import {
   getCollectionForAgent,
   isStrictIsolation,
+  collectProfileBanks,
   addMemoryTag,
   DEMOTE_FROM_RECALL_TAG,
 } from "../memory/hindsight.js";
@@ -163,6 +164,28 @@ export function registerMemoryCommand(program: Command): void {
         }
 
         console.log();
+
+        // Profile banks (per-user / shared) — recall routes to them but no
+        // agent owns them, so they don't appear in the agent table above.
+        const profileBanks = collectProfileBanks(config);
+        if (profileBanks.size > 0) {
+          const owners = new Map<string, string[]>();
+          for (const [uname, u] of Object.entries(config.users ?? {})) {
+            if (u.profile_bank) {
+              owners.set(u.profile_bank, [
+                ...(owners.get(u.profile_bank) ?? []),
+                uname,
+              ]);
+            }
+          }
+          console.log(chalk.bold("  Profile banks (per-user / shared):\n"));
+          for (const bank of [...profileBanks].sort()) {
+            const who = owners.get(bank);
+            const label = who ? `user: ${who.join(", ")}` : "shared";
+            console.log(`  ${bank.padEnd(widths[1])}  ${chalk.gray(label)}`);
+          }
+          console.log();
+        }
 
         // Print stats commands
         console.log(chalk.bold("  Hindsight CLI commands:\n"));
