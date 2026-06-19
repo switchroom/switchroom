@@ -514,7 +514,7 @@ import { shouldEmitNotionMcp } from "../config/notion-workspace-acl.js";
 import { reconcileAgentDefaultSkills } from "./reconcile-default-skills.js";
 import { applyTelegramProgressGuidance } from "./sub-agent-telegram-prompt.js";
 import type { McpServerConfig } from "../memory/hindsight.js";
-import { createBank, updateBankMissions, ensureUserProfileMentalModel, DEFAULT_RETAIN_MISSION, isHindsightEnabled } from "../memory/hindsight.js";
+import { createBank, updateBankMissions, DEFAULT_RETAIN_MISSION, isHindsightEnabled } from "../memory/hindsight.js";
 import { loadTopicState } from "../telegram/state.js";
 import { resolveDualPath } from "../config/paths.js";
 import { resolvePath } from "../config/loader.js";
@@ -4031,18 +4031,6 @@ export function scaffoldAgent(
         .catch((err) => {
           console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
         });
-
-      ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
-        .then((result) => {
-          if (result.ok) {
-            console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
-          } else {
-            console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-          }
-        })
-        .catch((err) => {
-          console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-        });
     });
   }
 
@@ -4287,17 +4275,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       async: true,
     });
   }
-  if (hindsightEnabled) {
-    stopHooks.push({
-      type: "command",
-      command: wrap(
-        "hook:user-profile-refresh",
-        `bash "${join(DOCKER_BIN_PATH, "user-profile-refresh-hook.sh")}"`,
-      ),
-      timeout: 10,
-      async: true,
-    });
-  }
+  // Per-agent user-profile mental models are retired — dedicated profile
+  // banks (users.*.profile_bank, recall additional_banks/sender_banks) are the
+  // source of truth, so we no longer auto-create or refresh a per-bank
+  // "user-profile" mental model. (No user-profile-refresh Stop hook wired.)
   if (useSwitchroomPlugin) {
     stopHooks.push({
       type: "command",
@@ -5944,18 +5925,6 @@ export function reconcileAgent(
             console.warn(`  ${chalk.yellow("⚠")} Bank mission update error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
           });
       }
-
-      ensureUserProfileMentalModel(apiUrl, hindsightBankId, { timeoutMs: 5000 })
-        .then((result) => {
-          if (result.ok) {
-            console.log(`  ${chalk.green("✓")} User-profile Mental Model ready for ${formatAgentBankLabel(name, hindsightBankId)}`);
-          } else {
-            console.warn(`  ${chalk.yellow("⚠")} Failed to create user-profile MM for ${formatAgentBankLabel(name, hindsightBankId)}: ${result.reason}`);
-          }
-        })
-        .catch((err) => {
-          console.warn(`  ${chalk.yellow("⚠")} User-profile MM error for ${formatAgentBankLabel(name, hindsightBankId)}: ${err}`);
-        });
     });
   }
 
