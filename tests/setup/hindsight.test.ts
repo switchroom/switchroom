@@ -179,11 +179,28 @@ describe("hindsight broker-fed mode (#1245)", () => {
     }
     expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`);
     expect(envPairs).toContain(`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`);
-    // Kept modest to stay subscription-honest (concurrent claude subprocesses).
-    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS).toBeLessThanOrEqual(4);
+    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
+    expect(envPairs).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
+    // Subscription-honest ceiling: concurrent model calls = slots × parallelism.
+    // Keep it well under a reckless level (was 12; bumped to 18, cap the guard at 24).
+    expect(h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS * h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM).toBeLessThanOrEqual(24);
     const snippet = h.generateHindsightComposeSnippet();
-    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_BATCH_SIZE}`);
-    expect(snippet).toContain(`HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_SLOTS}`);
+    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM}`);
+    expect(snippet).toContain(`HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${h.HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`);
+  });
+
+  it("raises the memory limit to give the throughput bump headroom (8g, was 4g)", async () => {
+    const h = await import("../../src/setup/hindsight.js");
+    // Baseline RSS ~3.4g; 4g was tight, and more in-flight consolidation
+    // raises it. Both emit paths must carry the bumped limit.
+    const m = /^(\d+)g$/.exec(h.HINDSIGHT_DEFAULT_MEM_LIMIT);
+    expect(m, "mem limit should be N gigabytes").not.toBeNull();
+    expect(Number(m![1])).toBeGreaterThanOrEqual(8);
+    startHindsight({ apiPort: 8888, uiPort: 9999 });
+    expect(findRunArgs()).toContain(`--memory=${h.HINDSIGHT_DEFAULT_MEM_LIMIT}`);
+    expect(h.generateHindsightComposeSnippet()).toMatch(
+      new RegExp(`mem_limit:\\s*${h.HINDSIGHT_DEFAULT_MEM_LIMIT}\\b`),
+    );
   });
 
   it("enables stateless MCP (HINDSIGHT_API_MCP_STATELESS=true) so a hindsight bounce doesn't strand agent-side MCP sessions", () => {
