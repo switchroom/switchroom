@@ -370,6 +370,23 @@ describe("checkBankIngestHealth (doctor)", () => {
     expect(results[0].status).toBe("warn");
     expect(results[0].detail).toContain("inspection failed");
   });
+
+  it("sweeps profile banks too, labelled '(profile)' (not '()')", async () => {
+    const config = {
+      memory: { backend: "hindsight", config: { url: "http://x/mcp/" } },
+      agents: {
+        clerk: { memory: { collection: "clerk", recall: { additional_banks: ["ken-profile"] } } },
+      },
+    } as unknown as SwitchroomConfig;
+    const results = await checkBankIngestHealth(config, "http://x/mcp/", {
+      fetchImpl: fakeFetchFor({ clerk: HEALTHY_BANK, "ken-profile": HEALTHY_BANK }),
+      now: NOW,
+    });
+    const names = results.map((r) => r.name);
+    expect(names).toContain("bank ken-profile (profile)");
+    // the agent-less profile bank must NOT render the empty "()" label
+    expect(names).not.toContain("bank ken-profile ()");
+  });
 });
 
 const CORRUPT_MODEL_BANK = {
