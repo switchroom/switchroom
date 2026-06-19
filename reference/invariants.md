@@ -57,11 +57,29 @@ else.
 
 ## `single-tenant`
 
-Single operator by design. One person's box, tokens, and data. Not
-multi-tenant.
+Single **tenant** by design — one deployment on one operator's box, with
+their tokens and data. Not a multi-tenant SaaS. The deployment is the trust
+boundary.
 
-- **By-construction test:** does this assume more than one tenant, or expose
-  one operator's state to another? If yes, it is out.
+Inside that one tenant you may run **multiple trusted users**: the operator
+assigns Telegram user IDs to agents in `switchroom.yaml` (most agents serve
+one user, some serve several). Everyone the operator wires in is
+**implicitly trusted** — this is not an authorization model for mutually
+distrusting parties, and who may drive an agent is exactly that per-agent
+user assignment, nothing finer.
+
+Even within that trust, agents **should isolate memory per user and respect
+user memory privacy** — one user's memories should not bleed into another
+user's recall context. This is a best-effort *should*, not a hard wall, and
+it serves two ends at once: privacy among trusted users, and **token
+efficiency** (surfacing another user's irrelevant memories just wastes
+recall budget). The operator who owns the tenant keeps full visibility; the
+isolation is *between the users they configured*, never from the operator.
+
+- **By-construction test:** does this assume more than one **tenant**
+  (deployment), or expose one tenant's data to a *different* tenant? If yes,
+  it is out. Multiple trusted **users** inside one tenant — including
+  per-user memory isolation — is in scope, not a violation.
 
 ## `telegram-only`
 

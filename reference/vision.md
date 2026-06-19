@@ -87,7 +87,7 @@ hidden.
 | A multi-provider orchestrator | No OpenAI, Gemini, Llama, or model swapping for inference. Auxiliary services (e.g. voice transcription via Whisper) are opt-in helpers, not Claude replacements. |
 | A multi-channel bridge | Not Slack, not Discord, not Teams. Telegram, done properly. |
 | An autonomous agent | No heartbeats. Beck-and-call plus explicit schedules, on your leash. |
-| Multi-tenant | Single-operator by design. |
+| Multi-tenant | Single-tenant by design — one operator's deployment. Multiple *trusted* users within that one tenant are supported; serving *separate* tenants is not. |
 | A hosted service | Self-hosted only. Your box, your tokens, your data. |
 | A mobile app | Telegram is the mobile app. |
 
