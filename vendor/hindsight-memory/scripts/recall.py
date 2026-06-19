@@ -188,6 +188,47 @@ def _cache_ttl_secs() -> int:
         return 0
 
 
+def _normalize_sender(sender: str) -> str:
+    """Drop a single leading '@'. The gateway emits a bare username
+    (`from.username`), but operators naturally write `@handle` in config —
+    normalizing both sides lets either form match."""
+    return sender[1:] if sender.startswith("@") else sender
+
+
+def _resolve_sender_bank(
+    sender_banks_json: str,
+    active_sender: str | None,
+    bank_id: str,
+    additional_banks: list,
+) -> list:
+    """Per-speaker memory routing: if `active_sender` maps to a bank in the
+    HINDSIGHT_SENDER_BANKS_JSON map, return ``additional_banks`` with that
+    bank appended (additive — skips dup/self). A leading '@' on either the
+    map keys or the sender is normalized away, so ``@lisa``, ``lisa``, and
+    the gateway's bare-emitted ``lisa`` all resolve together. Failure-safe:
+    any bad input (missing sender/env, non-dict JSON, decode error) returns
+    ``additional_banks`` unchanged. Never replaces the agent's own bank and
+    never touches auth — additive recall scoping only (single-tenant).
+    """
+    if not active_sender or not sender_banks_json:
+        return additional_banks
+    try:
+        sender_banks = json.loads(sender_banks_json)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return additional_banks
+    if not isinstance(sender_banks, dict):
+        return additional_banks
+    normalized = {_normalize_sender(str(k)): v for k, v in sender_banks.items()}
+    sender_bank = normalized.get(_normalize_sender(active_sender))
+    if (
+        sender_bank
+        and sender_bank != bank_id
+        and sender_bank not in additional_banks
+    ):
+        return [*additional_banks, sender_bank]
+    return additional_banks
+
+
 def _cache_key(
     session_id: str,
     prompt: str,
@@ -655,21 +696,12 @@ def main():
     # Additive — never replaces the agent's own bank, never an auth boundary
     # (single-tenant). Failure-safe + silent on every error path.
     active_sender = extract_user_from_prompt(prompt)
-    if active_sender:
-        sender_banks_json = os.environ.get("HINDSIGHT_SENDER_BANKS_JSON", "")
-        if sender_banks_json:
-            try:
-                sender_banks = json.loads(sender_banks_json)
-                if isinstance(sender_banks, dict):
-                    sender_bank = sender_banks.get(active_sender)
-                    if (
-                        sender_bank
-                        and sender_bank != bank_id
-                        and sender_bank not in additional_banks
-                    ):
-                        additional_banks = [*additional_banks, sender_bank]
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
+    additional_banks = _resolve_sender_bank(
+        os.environ.get("HINDSIGHT_SENDER_BANKS_JSON", ""),
+        active_sender,
+        bank_id,
+        additional_banks,
+    )
 
     # Switchroom #424 phase 4.1 — cache check BEFORE any HTTP traffic.
     # Whole-session-scoped, opt-in via HINDSIGHT_RECALL_CACHE_TTL_SECS.

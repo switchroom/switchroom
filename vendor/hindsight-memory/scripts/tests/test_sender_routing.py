@@ -70,5 +70,58 @@ class CacheKeySenderTests(unittest.TestCase):
         )
 
 
+class ResolveSenderBankTests(unittest.TestCase):
+    """The map lookup. The gateway emits a BARE username (from.username),
+    while operators naturally write `@handle` in config — both must resolve.
+    Plus additive append, dup/self skip, and fail-safe behaviour."""
+
+    def test_at_keyed_map_resolves_bare_sender(self):
+        # The headline case: operator keys "@lisa", gateway emits "lisa".
+        out = recall._resolve_sender_bank('{"@lisa": "lisa-profile"}', "lisa", "clerk", [])
+        self.assertEqual(out, ["lisa-profile"])
+
+    def test_bare_keyed_map_resolves_bare_sender(self):
+        out = recall._resolve_sender_bank('{"lisa": "lisa-profile"}', "lisa", "clerk", [])
+        self.assertEqual(out, ["lisa-profile"])
+
+    def test_numeric_id_key(self):
+        out = recall._resolve_sender_bank('{"123456789": "ken-profile"}', "123456789", "clerk", [])
+        self.assertEqual(out, ["ken-profile"])
+
+    def test_additive_keeps_existing_extra_banks(self):
+        out = recall._resolve_sender_bank('{"@lisa": "lisa-profile"}', "lisa", "clerk", ["shared"])
+        self.assertEqual(out, ["shared", "lisa-profile"])
+
+    def test_skips_self_bank(self):
+        out = recall._resolve_sender_bank('{"@lisa": "clerk"}', "lisa", "clerk", [])
+        self.assertEqual(out, [])
+
+    def test_skips_duplicate(self):
+        out = recall._resolve_sender_bank('{"@lisa": "lisa-profile"}', "lisa", "clerk", ["lisa-profile"])
+        self.assertEqual(out, ["lisa-profile"])
+
+    def test_unmapped_sender_unchanged(self):
+        out = recall._resolve_sender_bank('{"@lisa": "lisa-profile"}', "stranger", "clerk", ["shared"])
+        self.assertEqual(out, ["shared"])
+
+    def test_no_sender_unchanged(self):
+        self.assertEqual(recall._resolve_sender_bank('{"@lisa": "x"}', None, "clerk", []), [])
+
+    def test_empty_env_unchanged(self):
+        self.assertEqual(recall._resolve_sender_bank("", "lisa", "clerk", ["a"]), ["a"])
+
+    def test_bad_json_unchanged(self):
+        self.assertEqual(recall._resolve_sender_bank("{not json", "lisa", "clerk", []), [])
+
+    def test_non_dict_json_unchanged(self):
+        self.assertEqual(recall._resolve_sender_bank('["lisa"]', "lisa", "clerk", []), [])
+
+    def test_does_not_mutate_input_list(self):
+        original = ["shared"]
+        out = recall._resolve_sender_bank('{"@lisa": "lisa-profile"}', "lisa", "clerk", original)
+        self.assertEqual(original, ["shared"])  # input untouched
+        self.assertEqual(out, ["shared", "lisa-profile"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -141,11 +141,11 @@ agents:
     memory:
       recall:
         sender_banks:
-          "@lisa": lisa-profile      # match by Telegram @username …
+          "@lisa": lisa-profile      # by Telegram username (leading @ optional) …
           "123456789": ken-profile   # … or by numeric user_id
 ```
 
-The key is matched against the sender's Telegram username (when they have one) or their numeric user id — both are emitted in the message envelope. Author the target banks with `switchroom memory profile add <bank> "..."` (above).
+The key is matched against the sender's Telegram username (when they have one) or their numeric user id — both are emitted in the message envelope. A leading `@` is optional: `@lisa` and `lisa` both match (the gateway emits the bare handle). Author the target banks with `switchroom memory profile add <bank> "..."` (above).
 
 **It is additive recall scoping, never an access boundary.** Who may *drive* an agent stays the per-agent assignment in `access.allowFrom` — the sender hint only changes which memory is *recalled*, never who is allowed to talk to the agent. All banks remain your own data in your own Hindsight instance, fully visible to you. Combine with `additional_banks` for a shared bank everyone sees *plus* a per-person bank.
 

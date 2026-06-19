@@ -402,7 +402,8 @@ export const AgentMemorySchema = z
           .describe(
             "Per-speaker recall routing: a map of Telegram sender → extra " +
             "recall bank. When a message arrives, the agent also recalls the " +
-            "speaker's bank (matched by @username or numeric user_id), merged " +
+            "speaker's bank (matched by Telegram username — a leading @ is " +
+            "optional — or numeric user_id), merged " +
             "into its own results — so each trusted user gets their own " +
             "profile context. Additive recall scoping within the single " +
             "tenant: never an access boundary (who may drive an agent stays " +
