@@ -17,6 +17,8 @@ function ok(part: Partial<{
   sevenDayUtilizationPct: number;
   fiveHourResetAt: Date | null;
   sevenDayResetAt: Date | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
 }>): QuotaResult {
   return {
     ok: true,
@@ -26,8 +28,8 @@ function ok(part: Partial<{
       fiveHourResetAt: part.fiveHourResetAt ?? null,
       sevenDayResetAt: part.sevenDayResetAt ?? null,
       representativeClaim: null,
-      overageStatus: null,
-      overageDisabledReason: null,
+      overageStatus: part.overageStatus ?? null,
+      overageDisabledReason: part.overageDisabledReason ?? null,
     },
   };
 }
@@ -74,6 +76,31 @@ describe("quotaIndicatesExhaustion", () => {
   it("a FAILED probe is NEVER exhaustion (no fail-over on transient errors)", () => {
     const failed: QuotaResult = { ok: false, reason: "HTTP 503" };
     expect(quotaIndicatesExhaustion(failed)).toEqual({ exhausted: false, until: null });
+  });
+
+  it("out_of_credits at 0% util ⇒ exhausted (until=null, no util-window reset)", () => {
+    // The consumer pinned to a credits-dead account would 429 on every call
+    // despite 0% util — the sensor must mark it exhausted.
+    expect(
+      quotaIndicatesExhaustion(ok({
+        fiveHourUtilizationPct: 0,
+        sevenDayUtilizationPct: 0,
+        overageStatus: "rejected",
+        overageDisabledReason: "out_of_credits",
+      })),
+    ).toEqual({ exhausted: true, until: null });
+  });
+
+  it("org_level_disabled at 75% util ⇒ NOT exhausted (benign — live active account)", () => {
+    // overageStatus:"rejected" + the benign reason must NOT trip exhaustion.
+    expect(
+      quotaIndicatesExhaustion(ok({
+        fiveHourUtilizationPct: 75,
+        sevenDayUtilizationPct: 40,
+        overageStatus: "rejected",
+        overageDisabledReason: "org_level_disabled",
+      })),
+    ).toEqual({ exhausted: false, until: null });
   });
 });
 

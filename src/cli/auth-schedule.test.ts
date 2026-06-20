@@ -29,6 +29,7 @@ const NONE: WindowSnapshot = {
   weeklyPct: null,
   weeklyResetAt: null,
   source: "none",
+  overageServeBlocking: false,
 };
 
 describe("formatDuration", () => {
@@ -134,6 +135,41 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
       }),
     ).toBe("healthy");
   });
+
+  it("overageServeBlocking (out_of_credits) → out-of-credits, WINS over healthy util", () => {
+    // 0% util would otherwise classify healthy; the dead-credits signal wins.
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({ fiveHourPct: 0, weeklyPct: 0, overageServeBlocking: true }),
+        now: NOW,
+      }),
+    ).toBe("out-of-credits");
+  });
+
+  it("overageServeBlocking wins over a maxed weekly window too", () => {
+    expect(
+      classifyState({
+        exhausted: true,
+        exhaustedUntil: WEEKLY_RESET,
+        window: win({ weeklyPct: 100, weeklyResetAt: WEEKLY_RESET, overageServeBlocking: true }),
+        now: NOW,
+      }),
+    ).toBe("out-of-credits");
+  });
+
+  it("org_level_disabled at 75% (overageServeBlocking false) → unchanged (healthy)", () => {
+    // The benign reason never sets overageServeBlocking, so util governs as before.
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({ fiveHourPct: 75, weeklyPct: 40, overageServeBlocking: false }),
+        now: NOW,
+      }),
+    ).toBe("healthy");
+  });
 });
 
 describe("resolveWindow — live preferred, cached fallback, ISO→Date", () => {
@@ -193,6 +229,39 @@ describe("resolveWindow — live preferred, cached fallback, ISO→Date", () => 
     const w = resolveWindow({ label: "x", exhausted: false } as never, undefined);
     expect(w).toEqual(NONE);
   });
+
+  it("propagates a serve-blocking overage reason from a live probe", () => {
+    const probe: ProbeQuotaData = {
+      results: [
+        {
+          label: "default",
+          result: {
+            ok: true,
+            data: {
+              fiveHourUtilizationPct: 0,
+              sevenDayUtilizationPct: 0,
+              fiveHourResetAt: null,
+              sevenDayResetAt: null,
+              representativeClaim: null,
+              overageStatus: "rejected",
+              overageDisabledReason: "out_of_credits",
+            },
+          },
+        },
+      ],
+    };
+    expect(resolveWindow(account as never, probe).overageServeBlocking).toBe(true);
+  });
+
+  it("does NOT flag a benign org_level_disabled reason from the cached snapshot", () => {
+    const benign = {
+      ...account,
+      last_quota: { ...account.last_quota, overageStatus: "rejected", overageDisabledReason: "org_level_disabled" },
+    };
+    const w = resolveWindow(benign as never, undefined);
+    expect(w.source).toBe("cached");
+    expect(w.overageServeBlocking).toBe(false);
+  });
 });
 
 function makeState(): ListStateData {
@@ -250,6 +319,7 @@ describe("formatStateCell horizon", () => {
         weeklyPct: 100,
         weeklyResetAt: new Date("2026-06-09T19:00:00Z"),
         source: "live",
+        overageServeBlocking: false,
       },
       exhausted: true,
       exhaustedUntil: new Date("2026-06-07T06:27:00Z"),
@@ -260,13 +330,26 @@ describe("formatStateCell horizon", () => {
     expect(cell).toContain("2d"); // ~2d to Tuesday, NOT the 27m 5h reset
     expect(cell).not.toContain("27m");
   });
+
+  it("renders the out-of-credits state (no countdown horizon)", () => {
+    const row: ScheduleRow = {
+      label: "x",
+      isActive: false,
+      fallbackRank: 2,
+      window: { ...NONE, fiveHourPct: 0, weeklyPct: 0, source: "live", overageServeBlocking: true },
+      exhausted: false,
+      exhaustedUntil: null,
+      state: "out-of-credits",
+    };
+    expect(formatStateCell(row, NOW)).toBe("out-of-credits");
+  });
 });
 
 describe("cell formatters", () => {
   it("em-dash on missing data; otherwise pct + day", () => {
     expect(formatFiveHourCell(NONE, NOW)).toBe("—");
     expect(formatWeeklyCell(NONE, NOW)).toBe("—");
-    const w = { ...NONE, fiveHourPct: 40, fiveHourResetAt: FIVE_RESET, weeklyPct: 8, weeklyResetAt: WEEKLY_RESET, source: "live" as const };
+    const w = { ...NONE, fiveHourPct: 40, fiveHourResetAt: FIVE_RESET, weeklyPct: 8, weeklyResetAt: WEEKLY_RESET, source: "live" as const, overageServeBlocking: false };
     expect(formatFiveHourCell(w, NOW)).toBe("40% · 1h 10m");
     expect(formatWeeklyCell(w, NOW, "UTC")).toBe("8% · Sun 01:00 (6d 19h)");
   });

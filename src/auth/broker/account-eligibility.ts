@@ -41,12 +41,59 @@ export const HEALTHY_CLEAR_PCT = 80;
  */
 export const SNAPSHOT_STALE_AGE_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * STRICT ALLOWLIST of `overageDisabledReason` values that mean the account
+ * cannot serve right now and must be treated as exhausted / blocked —
+ * regardless of utilization %.
+ *
+ * The 2026-06-20 lesson: the broker captured Anthropic's overage headers per
+ * account but no failover/exhaustion/health decision consulted them, so an
+ * idle-but-unusable account (`overageDisabledReason:"out_of_credits"` at 0%
+ * util) read healthy, got picked as a failover target, 429'd, and the
+ * live-probe self-heal cleared any exhaustion mark on it.
+ *
+ * CRITICAL — discriminate on the DISABLED REASON, never on `overageStatus`:
+ *  - `"out_of_credits"`  → SERVE-BLOCKING (account is dead; treat as exhausted).
+ *  - `"org_level_disabled"` → BENIGN. This is the LIVE, ACTIVE, WORKING fleet
+ *    account: overage is merely switched off org-wide, but it serves fine off
+ *    the subscription. Marking it exhausted takes down the fleet. NOT here.
+ *  - `null` / unknown / any unseen value → BENIGN (deny-by-omission).
+ *
+ * Keying on `overageStatus === "rejected"` is WRONG — the active, healthy
+ * account reports `rejected` too. Only the disabled-reason discriminates.
+ *
+ * Any NEW reason added here is a production-affecting change: confirm with the
+ * operator (which serve state Anthropic actually means by it) before adding.
+ */
+export const SERVE_BLOCKING_OVERAGE_REASONS = new Set<string>(["out_of_credits"]);
+
 /** The minimal live-snapshot shape the eligibility decision needs. */
 export interface QuotaSnapshot {
   fiveHourUtilizationPct: number;
   sevenDayUtilizationPct: number;
   /** Unix ms when this snapshot was captured by a live probe. */
   capturedAt: number;
+  /** Anthropic's `anthropic-ratelimit-unified-overage-status` header, when the
+   *  probe carried it. Captured for transparency; NOT the discriminator (see
+   *  SERVE_BLOCKING_OVERAGE_REASONS) — the active healthy account reports
+   *  `rejected` here too. */
+  overageStatus?: string | null;
+  /** Anthropic's `anthropic-ratelimit-unified-overage-disabled-reason` header.
+   *  THIS is the serve-blocking discriminator: `out_of_credits` is dead,
+   *  `org_level_disabled` is benign. See SERVE_BLOCKING_OVERAGE_REASONS. */
+  overageDisabledReason?: string | null;
+}
+
+/**
+ * Is this snapshot's overage state serve-blocking? True only when the live
+ * `overageDisabledReason` is on the strict allowlist (`out_of_credits`). An
+ * account at 0% util that is out of credits is unusable and must be treated as
+ * exhausted; `org_level_disabled` / null / unknown are benign (deny-by-
+ * omission). PURE — no I/O.
+ */
+export function isOverageServeBlocking(snapshot: QuotaSnapshot): boolean {
+  const reason = snapshot.overageDisabledReason;
+  return reason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(reason);
 }
 
 /** A persisted exhaustion mark. `markedAt` is when it was written (added
@@ -99,8 +146,9 @@ export function isAccountBlocked(opts: {
   if (snapshotFresh(snapshot, now)) {
     const markedAt = mark?.marked_at ?? 0;
     if (snapshot.capturedAt >= markedAt) {
-      // Live truth is the newer signal → it decides, mark ignored.
-      return snapshotWalled(snapshot);
+      // Live truth is the newer signal → it decides, mark ignored. Walled on
+      // util OR serve-blocked by overage (out_of_credits at any util) → blocked.
+      return snapshotWalled(snapshot) || isOverageServeBlocking(snapshot);
     }
   }
   // No usable live truth (or the mark is newer) → trust the mark.
@@ -121,6 +169,11 @@ export function snapshotShouldClearMark(
   if (!mark) return false;
   if (!snapshotFresh(snapshot, now)) return false;
   if (snapshot.capturedAt < (mark.marked_at ?? 0)) return false;
+  // A serve-blocking overage (out_of_credits) is an exhaustion in its own
+  // right — never let a 0%-util-but-credits-dead probe self-heal a mark off
+  // such an account (that's exactly the live-probe re-clear the 2026-06-20
+  // bug exploited). Util being low does NOT make it "clearly healthy".
+  if (isOverageServeBlocking(snapshot)) return false;
   return snapshotClearlyHealthy(snapshot);
 }
 

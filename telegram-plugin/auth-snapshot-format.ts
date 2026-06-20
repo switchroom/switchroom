@@ -60,7 +60,23 @@ export interface AccountSnapshot {
 export const THROTTLING_THRESHOLD_PCT = 80;
 
 /**
+ * STRICT ALLOWLIST of serve-blocking `overageDisabledReason` values. Replicated
+ * verbatim from the broker's `SERVE_BLOCKING_OVERAGE_REASONS`
+ * (src/auth/broker/account-eligibility.ts) because the plugin can't import
+ * across the package boundary cleanly — keep the two in sync.
+ *
+ * `out_of_credits` → blocked (the account is dead even at 0% util).
+ * `org_level_disabled` → BENIGN (the live active fleet account: overage off but
+ * still serving off subscription). `null` / unknown → benign (deny-by-omission).
+ * Do NOT key on `overageStatus` ("rejected" appears on the healthy account too).
+ * Any new reason here is production-affecting — confirm with the operator first.
+ */
+const SERVE_BLOCKING_OVERAGE_REASONS = new Set<string>(['out_of_credits']);
+
+/**
  * Decide the health verdict for one account. The two "binding" facts:
+ *   - overageDisabledReason is serve-blocking (out_of_credits) → blocked,
+ *     even at 0% util (the account is dead until billing is fixed)
  *   - 5h or 7d utilization >= 100% (or `representativeClaim` non-null
  *     plus utilization >= 99.5%) → blocked
  *   - either window above 80%, or representativeClaim set with > 50% →
@@ -71,6 +87,12 @@ export const THROTTLING_THRESHOLD_PCT = 80;
 export function classifyHealth(snap: AccountSnapshot): AccountHealth {
   if (!snap.quota) return 'unknown';
   const q = snap.quota;
+  // A serve-blocking overage reason wins over the util gate: a credits-dead
+  // account reads 0% util but 429s on every call, so it must show 'blocked'
+  // (drives the display, quota-watch, and the auto-fallback idempotency guard).
+  if (q.overageDisabledReason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(q.overageDisabledReason)) {
+    return 'blocked';
+  }
   const max = Math.max(q.fiveHourUtilizationPct, q.sevenDayUtilizationPct);
   if (max >= 99.5) return 'blocked';
   if (max >= THROTTLING_THRESHOLD_PCT) return 'throttling';

@@ -135,6 +135,46 @@ describe('runFleetAutoFallback', () => {
     expect(out.announcement).toContain('Stale event?');
   });
 
+  it('out_of_credits active account ⇒ swap fires (classifyHealth=blocked, not idempotent-skip)', async () => {
+    // The active account is at 0% util but credits-dead. classifyHealth must
+    // read 'blocked' so the idempotency guard does NOT skip — the swap fires.
+    const failover = vi.fn(async () => ({ rolledTo: 'bob@example.com', rolled: ['alice@example.com'] }));
+    const out = await runFleetAutoFallback({
+      state: state('alice@example.com', ['alice@example.com', 'bob@example.com']),
+      quotas: [
+        qOk({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' }),
+        qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+    });
+
+    expect(out.kind).toBe('switched');
+    expect(failover).toHaveBeenCalledTimes(1);
+    if (out.kind === 'switched') expect(out.newLabel).toBe('bob@example.com');
+  });
+
+  it('org_level_disabled active @75% ⇒ NO swap (idempotency: classifyHealth=healthy)', async () => {
+    // The benign reason on the live active account must NOT trigger a swap.
+    const failover = vi.fn();
+    const out = await runFleetAutoFallback({
+      state: state('alice@example.com', ['alice@example.com', 'bob@example.com']),
+      quotas: [
+        qOk({ fiveHourUtilizationPct: 75, sevenDayUtilizationPct: 40, overageStatus: 'rejected', overageDisabledReason: 'org_level_disabled' }),
+        qOk({ fiveHourUtilizationPct: 5, sevenDayUtilizationPct: 10 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+    });
+
+    expect(out.kind).toBe('no-eligible-target');
+    expect(failover).not.toHaveBeenCalled();
+  });
+
   it('returns no-old-active (no failover) when broker has no active account', async () => {
     const failover = vi.fn();
     const out = await runFleetAutoFallback({

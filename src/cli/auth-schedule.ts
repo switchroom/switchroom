@@ -32,6 +32,7 @@ import type {
   AccountState,
   ProbeQuotaData,
 } from "../auth/broker/client.js";
+import { SERVE_BLOCKING_OVERAGE_REASONS } from "../auth/broker/account-eligibility.js";
 
 // ─── Pure model ──────────────────────────────────────────────────────────
 
@@ -42,9 +43,23 @@ export interface WindowSnapshot {
   weeklyResetAt: Date | null;
   /** Where the numbers came from: a live probe, the broker's cache, or nothing. */
   source: "live" | "cached" | "none";
+  /**
+   * True when the probe/cache carried a serve-blocking `overageDisabledReason`
+   * (`out_of_credits`) — the account is dead even at 0% util. Discriminated on
+   * the same strict allowlist the broker uses (see SERVE_BLOCKING_OVERAGE_
+   * REASONS); `org_level_disabled` / null / unknown are benign → false.
+   */
+  overageServeBlocking: boolean;
+}
+
+/** Is a probe/cache overage reason serve-blocking? Mirrors the broker's
+ *  isOverageServeBlocking using the shared strict allowlist. */
+function overageReasonBlocks(reason: string | null | undefined): boolean {
+  return reason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(reason);
 }
 
 export type AccountWindowState =
+  | "out-of-credits"
   | "healthy"
   | "5h-walled"
   | "weekly-walled"
@@ -79,6 +94,7 @@ export function resolveWindow(
       weeklyPct: d.sevenDayUtilizationPct,
       weeklyResetAt: d.sevenDayResetAt,
       source: "live",
+      overageServeBlocking: overageReasonBlocks(d.overageDisabledReason),
     };
   }
   const lq = account.last_quota;
@@ -89,6 +105,7 @@ export function resolveWindow(
       weeklyPct: lq.sevenDayUtilizationPct,
       weeklyResetAt: lq.sevenDayResetAt ? new Date(lq.sevenDayResetAt) : null,
       source: "cached",
+      overageServeBlocking: overageReasonBlocks(lq.overageDisabledReason),
     };
   }
   return {
@@ -97,6 +114,7 @@ export function resolveWindow(
     weeklyPct: null,
     weeklyResetAt: null,
     source: "none",
+    overageServeBlocking: false,
   };
 }
 
@@ -113,6 +131,11 @@ export function classifyState(args: {
   now: Date;
 }): AccountWindowState {
   const { exhausted, exhaustedUntil, window, now } = args;
+  // A serve-blocking overage (out_of_credits) means the account is dead even at
+  // 0% util — it wins over every util-based verdict (healthy/weekly/5h). Same
+  // strict-allowlist semantics as the broker; org_level_disabled is benign and
+  // never sets window.overageServeBlocking.
+  if (window.overageServeBlocking) return "out-of-credits";
   const hasWindowData =
     window.fiveHourPct !== null ||
     window.weeklyPct !== null ||
@@ -246,6 +269,10 @@ export function formatStateCell(row: ScheduleRow, now: Date): string {
         : row.exhaustedUntil;
   const rel = horizon ? ` · ${formatDuration(horizon.getTime() - now.getTime())}` : "";
   switch (row.state) {
+    case "out-of-credits":
+      // No util-window reset to count down to — overage is off until billing
+      // is fixed, not until a window rolls. State name carries the meaning.
+      return "out-of-credits";
     case "healthy":
       return "healthy";
     case "unprobed":
@@ -282,6 +309,8 @@ function colorState(text: string, state: AccountWindowState, color: boolean): st
   switch (state) {
     case "healthy":
       return chalk.green(text);
+    case "out-of-credits":
+      return chalk.red(text);
     case "weekly-walled":
       return chalk.red(text);
     case "5h-walled":
