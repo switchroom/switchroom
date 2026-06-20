@@ -1,5 +1,5 @@
 ---
-job: When my agent learns a better way to work, make the improvement stick reliably without me re-teaching it — and without it sprawling skills or crons
+job: When my agent learns a better way to work, make the improvement stick reliably without me re-teaching it — and without it sprawling skills, crons, or its own guidance
 outcome: Agents stop repeating corrected mistakes; small fixes to their own skills happen invisibly and reversibly; anything larger arrives as a one-tap suggestion
 stakes: Get it wrong and we lose either way — nothing improves (recurring corrections, trust leaks) or it runs away (token waste, unreviewable skill/cron sprawl, unsafe changes)
 serves: standing-team
@@ -34,7 +34,8 @@ reviewed PR). This job adds *when* to do it and *how far* to go alone.
 - A correction given once never has to be given again.
 - A small, safe fix to the agent's own existing skill just happens, silently
   and reversibly.
-- A bigger change (new behaviour, shared skill) arrives as one one-tap
+- A bigger change — a shared skill, or an edit to the agent's own guidance
+  (`CLAUDE.md`/`SOUL.md`) that touches every turn — arrives as one one-tap
   suggestion.
 - A new cron or new skill is always proposed, never self-served.
 - Idle turns cost ~nothing; the operator never waits on the review.
