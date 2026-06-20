@@ -326,6 +326,7 @@ import {
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
 import { driveEscalation } from './escalation-drive.js'
+import { shouldSuppressRepresent } from './represent-guard.js'
 import { createInboundSpool } from './inbound-spool.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
@@ -5797,6 +5798,34 @@ function obligationSweep(): void {
     return
   }
   if (decision.action === 'represent') {
+    // Fix #2472 — duplicate-represent guard. Before re-presenting AGAIN, check
+    // whether the agent has ALREADY delivered a substantive outbound reply to
+    // this chat SINCE the obligation was most recently re-presented. If so the
+    // obligation is satisfied-but-misdetected (the reply landed but its routing
+    // didn't resolve back to this origin, so the normal close path missed it) —
+    // close silently and do NOT re-fire, which is what produced the near-identical
+    // duplicate in #2472 (reply 10608 answered represent_count=1, yet
+    // represent_count=2 fired anyway → duplicate 10609).
+    //
+    // The cutoff is `lastRepresentedAt` (the time of the PREVIOUS represent), NOT
+    // `openedAt`. This is load-bearing: the genuine "agent wrote a plain-text
+    // answer and never called reply" case must still represent ONCE. On the first
+    // represent `lastRepresentedAt` is undefined, so this guard is a no-op and the
+    // single represent fires as before. Only the SECOND-and-later represent is
+    // gated — exactly where a reply that landed between fires must suppress the
+    // re-ask. Falls back to false (never suppresses) if history is unavailable.
+    if (
+      shouldSuppressRepresent(o, {
+        historyEnabled: HISTORY_ENABLED,
+        hasOutboundDeliveredSince,
+      })
+    ) {
+      process.stderr.write(
+        `telegram gateway: obligation closed silently — reply delivered since last represent (no re-fire) origin=${o.originTurnId}\n`,
+      )
+      obligationLedger.close(o.originTurnId)
+      return
+    }
     // Re-present goes through the bridge → buffer. Only the represent path is
     // gated on an empty buffer (let the existing drain run first, avoid
     // double-presenting). Escalation below is NOT gated on the buffer — it is a
