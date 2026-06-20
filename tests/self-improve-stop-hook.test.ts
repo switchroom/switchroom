@@ -185,7 +185,17 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
       const wrapped =
         `<channel source="switchroom-telegram" source="self_improve_review" ` +
         `triggering_session="loop">\n${prompt}`;
+      // The window ALSO carries two genuine operator corrections (which the
+      // scan filter does NOT remove). This pins the short-circuit: if the
+      // `isReviewTurn(lastUser)` guard regressed, the gate would run on those
+      // corrections, trip, and inject — so the "no inject" assertion would
+      // fail. (Without these, a single sub-threshold directive made the test
+      // pass even against the buggy `startsWith` guard — a hollow regression.)
       const tp = writeTranscript("wrapped-review.jsonl", [
+        { role: "user", text: "No, that's wrong — you included drafts again." },
+        { role: "assistant", text: "Fixed." },
+        { role: "user", text: "That's not what I asked, I told you to exclude drafts." },
+        { role: "assistant", text: "Understood." },
         { role: "user", text: wrapped },
         { role: "assistant", text: "Bound the directive. Ending the turn." },
       ]);
