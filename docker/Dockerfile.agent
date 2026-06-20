@@ -223,6 +223,16 @@ RUN chmod 0755 /opt/switchroom/hooks/notion-write-pretool.mjs
 COPY dist/cli/skill-validate-pretool.mjs /opt/switchroom/hooks/skill-validate-pretool.mjs
 RUN chmod 0755 /opt/switchroom/hooks/skill-validate-pretool.mjs
 
+# Agent self-improvement Stop gate (RFC reference/rfcs/agent-self-improvement.md
+# slice 1). A cheap deterministic per-turn triage; on a learning signal
+# it injects a forked review turn via the gateway socket (inject_inbound,
+# not claude -p). Deliberately NOT in the security-plugin: it's a quality
+# loop, not a load-bearing safety control, and it only reads the
+# transcript + injects an in-session review the agent itself runs within
+# its own trust domain. The kill switch is SWITCHROOM_SELF_IMPROVE=0.
+COPY dist/cli/self-improve-stop.mjs /opt/switchroom/hooks/self-improve-stop.mjs
+RUN chmod 0755 /opt/switchroom/hooks/self-improve-stop.mjs
+
 # Image-baked security-hooks plugin (sec WS8-F1 / #1416). A separate,
 # minimal --plugin-dir holding ONLY the load-bearing PreToolUse safety
 # hooks (secret-exfil guard + Drive-write approval gate). Loaded from

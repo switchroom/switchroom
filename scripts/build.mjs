@@ -197,6 +197,23 @@ if (skillHookEscape.changed) {
   console.log(`[build] ASCII-escaped ${skillHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/skill-validate-pretool.mjs`);
 }
 
+// Bundle the self-improve-stop hook — RFC reference/rfcs/agent-self-improvement.md
+// slice 1. Turn-end GATE: a self-contained .mjs the agent container runs
+// via node from the bundled-hooks path. It imports the src/self-improve/*
+// gate/router/prompt modules + node:net, none of which resolve from the
+// raw .mjs hooks dir inside the agent image — so bundle to one file.
+console.log("[build] bundling src/cli/self-improve-stop.ts -> dist/cli/self-improve-stop.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/self-improve-stop.ts"))} --outfile ${JSON.stringify(resolve(outDir, "self-improve-stop.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const selfImproveHookOutFile = resolve(outDir, "self-improve-stop.mjs");
+chmodSync(selfImproveHookOutFile, 0o755);
+const selfImproveHookEscape = escapeBundleNonAscii(selfImproveHookOutFile);
+if (selfImproveHookEscape.changed) {
+  console.log(`[build] ASCII-escaped ${selfImproveHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/self-improve-stop.mjs`);
+}
+
 // Bundle the autoaccept-poll entrypoint. The agent unit's ExecStartPost
 // invokes this in the background to dispatch first-run TUI prompts via
 // `tmux capture-pane` + `tmux send-keys`. Must ship in dist/ because

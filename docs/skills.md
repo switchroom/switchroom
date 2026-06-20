@@ -175,9 +175,61 @@ For a switchroom-bundled fleet-default skill (every agent regardless of role):
 
 1. **Don't auto-install.** Add it as a developer-pool skill instead and let operators opt in via `defaults.skills`. Auto-injecting into every agent's tool list adds cognitive overhead per turn for users who'll never call it. The `role: foreman` opt-in is the right escape hatch for the operator-skill case.
 
+## Self-improvement (agents fix their own skills)
+
+Agents get better the longer they run: when a correction recurs, or the
+same manual fix shows up twice, the agent can land a small, tested,
+reversible edit to a skill **it already owns** — silently — and surface
+anything bigger as a proposal. This is on by default (opt-out), built on
+the skill-authoring path above. See the
+[RFC](../reference/rfcs/agent-self-improvement.md) and
+[job spec](../reference/jobs/get-better-the-longer-they-run.md).
+
+How it works (slice 1):
+
+1. **Gate (cheap, every turn).** A switchroom-owned async **Stop hook**
+   (`self-improve-stop`) runs a *deterministic* triage over the
+   just-finished turn — an operator correction, a repeated manual fix, or
+   a standing rule that didn't bind. A turn with no signal costs ~nothing
+   (no model call, no IO beyond the transcript read). The second
+   occurrence trips ("correct once, never again").
+2. **Forked review (only when the gate trips).** The hook injects a
+   review turn into the live session (`inject_inbound`, the same
+   primitive cron uses — never a new `claude -p` spawn, keeping it
+   subscription-honest). The review is restricted to memory + skill
+   read/write tools and runs off the reply path.
+3. **Tier router.** The review classifies the change by blast radius —
+   **T1** (small, reversible, single-file edit to an owned skill) lands
+   automatically; **T2/T3** (medium / shared / new-cron / new-skill /
+   cross-agent / irreversible) are written to a per-agent
+   pending-suggestions queue and never auto-applied.
+4. **Eval gate on T1.** Before a T1 edit lands, the skill's
+   `evals/evals.json` runs through the skill-creator grader +
+   `aggregate_benchmark.py`; the edit lands only if evals pass and don't
+   regress baseline. A skill with no evals downgrades to a T2 proposal.
+5. **Audit/rollback.** T1 edits go through the existing skill-write path,
+   so the validator hook + git history are the audit and rollback. The
+   only new state is the pending-queue file.
+
+Defaults (tunable via env; first measured on `clerk`):
+
+| Knob | Env | Default |
+|---|---|---|
+| Disable entirely | `SWITCHROOM_SELF_IMPROVE` | `1` (set `0` to opt out) |
+| Repetition threshold | `SWITCHROOM_SELF_IMPROVE_THRESHOLD` | `2` |
+| T1 auto-apply diff cap (lines) | `SWITCHROOM_SELF_IMPROVE_T1_MAX_LINES` | `30` |
+| Max auto-applies/day | `SWITCHROOM_SELF_IMPROVE_MAX_AUTO_PER_DAY` | `3` |
+| Max outstanding pending | `SWITCHROOM_SELF_IMPROVE_MAX_PENDING` | `5` |
+
+Pending suggestions live at `<stateDir>/self-improve-pending.jsonl`
+(one-tap Telegram / Linear surfacing is a later slice).
+
 ## Related code
 
 - `src/agents/scaffold.ts:installSwitchroomSkills` — auto-install of `switchroom-*` skills
 - `src/agents/scaffold.ts:syncGlobalSkills` — user-managed skill symlinking from `skills_dir`
+- `src/agents/scaffold.ts:buildSettingsHooksBlock` — wires the `self-improve-stop` Stop gate
+- `src/cli/self-improve-stop.ts` — the gate hook (bundled to `dist/cli/self-improve-stop.mjs`)
+- `src/self-improve/` — gate, tier router, eval gate, pending queue, rate limit, review prompt
 - `src/config/schema.ts` — `defaults.skills` + `agents.<name>.skills` schema
 - `examples/switchroom.yaml` — example config showing both forms
