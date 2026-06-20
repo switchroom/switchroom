@@ -199,11 +199,16 @@ function escapeFeedHtml(s: string): string {
  * are italic with a `✓`. Capped to the last MIRROR_MAX_LINES with a dim
  * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
  * Callers send the result verbatim — do NOT re-escape or re-wrap it.
+ *
+ * `stepCount` (optional): when `final=true` and `stepCount > 0`, appends a
+ * `✓ N steps` footer line so the persisted feed record shows an accurate
+ * total of surfaced (non-surface-tool) steps for the turn.
  */
 export function renderActivityFeed(
   lines: string[],
   final = false,
   liveSuffix = "",
+  stepCount?: number,
 ): string | null {
   if (lines.length === 0) return null;
   const shown = lines.slice(-MIRROR_MAX_LINES);
@@ -223,6 +228,12 @@ export function renderActivityFeed(
     const esc = escapeFeedHtml(l);
     out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`);
   });
+  // Final total: append a `✓ N steps` footer when the turn has a non-zero
+  // surfaced step count. Only shown on the persisted terminal render
+  // (`final=true`) so the live in-progress feed stays clean.
+  if (final && stepCount != null && stepCount > 0) {
+    out.push(`<i>✓ ${stepCount} steps</i>`);
+  }
   return out.join("\n");
 }
 
@@ -251,15 +262,19 @@ const NESTED_PREFIX = "   ↳ ";
  * and the child block is indented, newest = bold `→`, earlier = italic, with
  * a `↳ +N earlier…` header when it overflows. Returns ready Telegram HTML
  * (callers must NOT re-escape) or null when there is nothing to show.
+ *
+ * `stepCount` (optional): forwarded to `renderActivityFeed` for the `✓ N steps`
+ * footer on the persisted terminal render (`final=true`).
  */
 export function renderActivityFeedWithNested(
   lines: string[],
   childLines: string[],
   final = false,
   liveSuffix = "",
+  stepCount?: number,
 ): string | null {
   const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
-  if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix);
+  if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix, stepCount);
 
   const out: string[] = [];
   const shownParent = lines.slice(-MIRROR_MAX_LINES);
@@ -283,6 +298,10 @@ export function renderActivityFeedWithNested(
         : `${NESTED_PREFIX}<i>${esc}</i>`,
     );
   });
+  // Final total: same `✓ N steps` footer as the flat render.
+  if (final && stepCount != null && stepCount > 0) {
+    out.push(`<i>✓ ${stepCount} steps</i>`);
+  }
   return out.length > 0 ? out.join("\n") : null;
 }
 

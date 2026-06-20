@@ -1962,6 +1962,14 @@ type CurrentTurn = {
   // Phase 1 of #332: count of tool_use events in the current turn, for
   // the tool_call_count column in the turns registry.
   toolCallCount: number
+  // Count of tool_label events that passed the isTelegramSurfaceTool guard
+  // this turn — the deterministic, surface-tool-excluded step count used by
+  // the `✓ N steps` activity-feed total and the `tools=` lifecycle log.
+  // Incremented in `case 'tool_label':` AFTER the surface-tool guard so
+  // reply/stream_reply/edit_message/react are never counted. send_typing and
+  // sync_retain are suppressed at the hook (computeLabel returns null) and
+  // never arrive as tool_label events — excluded automatically.
+  labeledToolCount: number
   // Tool-activity summary — mirrors Claude Code's native chat-UI
   // rendering ("Ran 5 commands, read a file"). Counters are
   // incremented in `case 'tool_use'`; `activityMessageId` holds the
@@ -9882,7 +9890,11 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
   for (const narrative of turn.foregroundSubAgents.values()) {
     childLines.push(...narrative)
   }
-  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix)
+  // Pass labeledToolCount as stepCount only on the terminal (final) render so
+  // the persisted feed record shows a `✓ N steps` total. The live in-progress
+  // feed omits it (stepCount undefined) to stay clean and minimal.
+  const stepCount = final ? turn.labeledToolCount : undefined
+  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount)
 }
 
 /**
@@ -10137,6 +10149,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           lastAssistantMsgId: null,
           lastAssistantDone: false,
           toolCallCount: 0,
+          labeledToolCount: 0,
           activityMessageId: null,
           activityInFlight: null,
           activityPendingRender: null,
@@ -10342,6 +10355,12 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
+      // Count surfaced tool steps. This is the single source of truth for the
+      // `tools=` lifecycle field and the `✓ N steps` activity-feed total.
+      // Placed AFTER the surface-tool guard so reply/stream_reply/edit_message/
+      // react are never counted. send_typing and sync_retain are suppressed at
+      // the hook level (computeLabel returns null) so they never arrive here.
+      turn.labeledToolCount++
       // Stop feeding once the FINAL answer has landed — the hand-off where
       // `clearActivitySummary` deletes the feed so the answer is the
       // authoritative surface. Gating on `replyCalled` (any reply) killed the

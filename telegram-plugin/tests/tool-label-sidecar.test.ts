@@ -147,4 +147,48 @@ describe('tool-label-sidecar', () => {
     expect(s.getLabel('A')).toBe('first')
     s.stop()
   })
+
+  /**
+   * Issue #2461: the sidecar's `onLabel` callback exposes `toolName` so the
+   * gateway can filter surface tools (reply/stream_reply/edit_message/react)
+   * from the surfaced step count. This test pins that the toolName flows
+   * through correctly for both non-surface and surface-tool entries, so the
+   * gateway's `isTelegramSurfaceTool(ev.toolName)` guard works as the single
+   * filter that keeps reply/react out of `labeledToolCount`.
+   *
+   * Note: send_typing and sync_retain never appear here because
+   * computeLabel returns null for them → hook never writes to the sidecar.
+   */
+  it('toolName flows through onLabel so callers can exclude surface tools from counts', () => {
+    const sessionId = 'sess-count'
+    const sched = makeManualScheduler()
+    const f = join(stateDir, `tool-labels-${sessionId}.jsonl`)
+    writeFileSync(
+      f,
+      // Non-surface tools — should be counted.
+      JSON.stringify({ ts: 1, tool_use_id: 'R1', agent_id: null, label: 'Reading CLAUDE.md', tool_name: 'Read' }) + '\n' +
+      JSON.stringify({ ts: 2, tool_use_id: 'M1', agent_id: null, label: 'Searching memory', tool_name: 'mcp__hindsight__recall' }) + '\n' +
+      // Surface tool — must NOT be counted.
+      JSON.stringify({ ts: 3, tool_use_id: 'RP', agent_id: null, label: 'Replying', tool_name: 'mcp__switchroom-telegram__reply' }) + '\n' +
+      // Another non-surface.
+      JSON.stringify({ ts: 4, tool_use_id: 'B1', agent_id: null, label: 'List workspace', tool_name: 'Bash' }) + '\n',
+    )
+    const s = createToolLabelSidecar({ stateDir, sessionId, scheduler: sched })
+
+    const SURFACE_TOOLS = new Set([
+      'mcp__switchroom-telegram__reply',
+      'mcp__switchroom-telegram__stream_reply',
+      'mcp__switchroom-telegram__edit_message',
+      'mcp__switchroom-telegram__react',
+    ])
+
+    let surfacedCount = 0
+    s.onLabel((_id, _label, toolName) => {
+      if (!SURFACE_TOOLS.has(toolName)) surfacedCount++
+    })
+
+    // Read + mcp__hindsight__recall + Bash = 3 surfaced; reply = 0.
+    expect(surfacedCount).toBe(3)
+    s.stop()
+  })
 })

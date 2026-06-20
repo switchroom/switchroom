@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { toolLabel, isHumanDescription } from '../tool-labels.js'
+import { isTelegramSurfaceTool } from '../tool-names.js'
 
 describe('toolLabel', () => {
   it('Read: uses basename of file_path', () => {
@@ -379,5 +380,71 @@ describe('isHumanDescription', () => {
   it('missing or non-object input → false', () => {
     expect(isHumanDescription('Bash', undefined)).toBe(false)
     expect(isHumanDescription('Bash')).toBe(false)
+  })
+})
+
+/**
+ * Surface-tool exclusion contract (#2461).
+ *
+ * The gateway's `labeledToolCount` is incremented in `case 'tool_label':` AFTER
+ * `isTelegramSurfaceTool(ev.toolName)` returns false — so the count reflects
+ * only non-surface tools. This describe block pins that contract by verifying
+ * which tool names are classified as surface tools (never counted) vs
+ * non-surface tools (counted when they produce a label).
+ *
+ * send_typing and sync_retain are excluded at the hook level: `computeLabel`
+ * returns null for them → no sidecar line → no tool_label event → never reach
+ * the `labeledToolCount++` path. That suppression is tested in
+ * tool-label-sidecar.test.ts (the sidecar never gets those entries).
+ */
+describe('isTelegramSurfaceTool — surface-tool exclusion for labeledToolCount (#2461)', () => {
+  it('reply and stream_reply are surface tools — never counted', () => {
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__reply')).toBe(true)
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__stream_reply')).toBe(true)
+  })
+
+  it('edit_message and react are surface tools — never counted', () => {
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__edit_message')).toBe(true)
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__react')).toBe(true)
+  })
+
+  it('Read tool is NOT a surface tool — counted when it produces a label', () => {
+    expect(isTelegramSurfaceTool('Read')).toBe(false)
+  })
+
+  it('mcp__hindsight__* tools are NOT surface tools — counted', () => {
+    expect(isTelegramSurfaceTool('mcp__hindsight__recall')).toBe(false)
+    expect(isTelegramSurfaceTool('mcp__hindsight__retain')).toBe(false)
+    expect(isTelegramSurfaceTool('mcp__hindsight__reflect')).toBe(false)
+  })
+
+  it('Bash, Edit, Write, Grep are NOT surface tools — counted', () => {
+    expect(isTelegramSurfaceTool('Bash')).toBe(false)
+    expect(isTelegramSurfaceTool('Edit')).toBe(false)
+    expect(isTelegramSurfaceTool('Write')).toBe(false)
+    expect(isTelegramSurfaceTool('Grep')).toBe(false)
+  })
+
+  it('operator MCP tools (perplexity, webkite, etc.) are NOT surface tools — counted', () => {
+    expect(isTelegramSurfaceTool('mcp__perplexity__perplexity_search')).toBe(false)
+    expect(isTelegramSurfaceTool('mcp__webkite__read')).toBe(false)
+    expect(isTelegramSurfaceTool('mcp__google-workspace__list_events')).toBe(false)
+  })
+
+  it('other switchroom-telegram tools (get_recent_messages, send_typing) are NOT surface tools', () => {
+    // get_recent_messages is a read/query tool — not a conversation surface tool.
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__get_recent_messages')).toBe(false)
+    // send_typing is suppressed at the hook level (computeLabel returns null),
+    // so it never generates a tool_label event. But isTelegramSurfaceTool itself
+    // does NOT classify it as a surface tool — the two suppression mechanisms
+    // are orthogonal. The hook suppression is the right gate for send_typing.
+    expect(isTelegramSurfaceTool('mcp__switchroom-telegram__send_typing')).toBe(false)
+  })
+
+  it('clerk-telegram prefix also works (legacy registration key)', () => {
+    expect(isTelegramSurfaceTool('mcp__clerk-telegram__reply')).toBe(true)
+    expect(isTelegramSurfaceTool('mcp__clerk-telegram__stream_reply')).toBe(true)
+    expect(isTelegramSurfaceTool('mcp__clerk-telegram__edit_message')).toBe(true)
+    expect(isTelegramSurfaceTool('mcp__clerk-telegram__react')).toBe(true)
   })
 })
