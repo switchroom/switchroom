@@ -695,12 +695,57 @@ describe('repairEscapedWhitespace', () => {
     expect(isLikelyTelegramHtml(repaired)).toBe(true)
   })
 
-  test('leaves text alone when it already contains real newlines', () => {
-    // If the caller provided real newlines, we trust them completely and
-    // don't touch literal `\n` that may appear inside their content (e.g.
-    // a regex or shell snippet).
-    const input = 'Real newline here\nand a literal \\n in a regex example'
-    expect(repairEscapedWhitespace(input)).toBe(input)
+  test('unescapes literal \\n in prose even when real newlines are present (mixed-message fix, #2456)', () => {
+    // The old implementation bailed entirely when any real newline was present.
+    // The new implementation unescapes literal \\n outside code spans regardless,
+    // so a mixed message (real newlines + stray literal \\n in prose) is repaired.
+    const input = 'Real newline here\nand a literal \\n escape in prose'
+    const out = repairEscapedWhitespace(input)
+    // The literal \n in prose becomes a real newline; the existing real newline is preserved.
+    expect(out).toBe('Real newline here\nand a literal \n escape in prose')
+  })
+
+  test('preserves literal \\n inside inline code span when mixed with real newlines (#2456)', () => {
+    // The structurally safe version: a \\n inside backticks must stay verbatim,
+    // even in a message that also has real newlines and literal \\n in prose.
+    const input = 'First line\nUse `grep -P \\n` for newlines\nand prose \\n here'
+    const out = repairEscapedWhitespace(input)
+    // Inline code span preserved verbatim (\\n inside backticks untouched).
+    expect(out).toContain('`grep -P \\n`')
+    // The literal \\n in prose is unescaped to a real newline.
+    expect(out).toContain('and prose \n here')
+    // The original real newlines are preserved.
+    expect(out).toContain('First line\n')
+  })
+
+  test('preserves literal \\n inside fenced code block (#2456)', () => {
+    // A fenced code block containing a literal \\n (e.g. a regex or shell snippet)
+    // must not be unescaped.
+    const input = 'Prose \\n here\n```bash\necho "line1\\nline2"\n```\nMore \\n prose'
+    const out = repairEscapedWhitespace(input)
+    // The \\n inside the fenced block stays verbatim.
+    expect(out).toContain('```bash\necho "line1\\nline2"\n```')
+    // The \\n in prose is unescaped.
+    expect(out).toContain('Prose \n here')
+    expect(out).toContain('More \n prose')
+  })
+
+  test('pure no-real-newline case still unescapes (backward compat)', () => {
+    // Original pre-#2456 case: message with NO real newlines and literal \\n.
+    const input = 'Line one\\nLine two\\nLine three'
+    expect(repairEscapedWhitespace(input)).toBe('Line one\nLine two\nLine three')
+  })
+
+  test('genuine escaped backslash (\\\\n) stays literal even in mixed-newline message (#2456)', () => {
+    // \\\\n in the source is the two-char sequence \\ then n — the user typed
+    // a backslash followed by the letter n, NOT a newline.  The protect-\\
+    // phase must still work inside mixed messages.
+    const input = 'Windows path: C:\\\\temp\\\\file.txt\\nnext line\nreal newline too'
+    const out = repairEscapedWhitespace(input)
+    // The \\n becomes a real newline.
+    expect(out).toContain('C:\\temp\\file.txt\nnext line')
+    // The real newline is preserved.
+    expect(out).toContain('real newline too')
   })
 
   test('leaves single-line text alone when it has no escape sequences', () => {
