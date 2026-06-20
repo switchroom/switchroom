@@ -8,6 +8,8 @@ import {
   readReviewContext,
   reviewIsPending,
   clearReviewContext,
+  hasFiredForSession,
+  markFiredForSession,
   REVIEW_CONTEXT_FILE,
   type ReviewContext,
 } from "../src/self-improve/review-context.js";
@@ -73,6 +75,27 @@ describe("self-improve review-context marker", () => {
     writeFileSync(join(stateDir, REVIEW_CONTEXT_FILE), "{ not json", "utf-8");
     expect(readReviewContext(stateDir)).toBeNull();
     expect(reviewIsPending(stateDir)).toBe(false);
+  });
+
+  it("per-session breaker: records and recalls a fired session (issue #2462)", () => {
+    expect(hasFiredForSession(stateDir, "sess-A")).toBe(false);
+    markFiredForSession(stateDir, "sess-A");
+    expect(hasFiredForSession(stateDir, "sess-A")).toBe(true);
+    // A different session is unaffected.
+    expect(hasFiredForSession(stateDir, "sess-B")).toBe(false);
+    markFiredForSession(stateDir, "sess-B");
+    expect(hasFiredForSession(stateDir, "sess-A")).toBe(true);
+    expect(hasFiredForSession(stateDir, "sess-B")).toBe(true);
+    // Idempotent — re-marking doesn't break recall.
+    markFiredForSession(stateDir, "sess-A");
+    expect(hasFiredForSession(stateDir, "sess-A")).toBe(true);
+  });
+
+  it("per-session breaker: ignores empty / unknown session ids", () => {
+    markFiredForSession(stateDir, "");
+    markFiredForSession(stateDir, "unknown");
+    expect(hasFiredForSession(stateDir, "")).toBe(false);
+    expect(hasFiredForSession(stateDir, "unknown")).toBe(false);
   });
 
   it("defaults signals to [] when the marker omits them", () => {

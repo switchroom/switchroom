@@ -36,6 +36,18 @@ import type { LearningSignal } from "./types.js";
 
 export const REVIEW_CONTEXT_FILE = "self-improve-review-context.json";
 
+/**
+ * Sibling state file recording which sessions have already had a review
+ * INJECTED. Belt-and-suspenders per-session re-fire breaker (issue #2462):
+ * once a review fires for a given session, a subsequent Stop in that same
+ * session must NOT inject again, even if the review-turn guard logic
+ * regresses. Keyed by `session_id`; bounded so it can't grow unbounded.
+ */
+export const FIRED_SESSIONS_FILE = "self-improve-fired-sessions.json";
+
+/** Cap on remembered fired sessions (newest kept). */
+const FIRED_SESSIONS_MAX = 200;
+
 export interface ReviewContext {
   /** ISO timestamp the review was injected. */
   created_at: string;
@@ -97,5 +109,58 @@ export function clearReviewContext(stateDir: string): void {
     rmSync(contextPath(stateDir), { force: true });
   } catch {
     /* nothing to do */
+  }
+}
+
+function firedSessionsPath(stateDir: string): string {
+  return join(stateDir, FIRED_SESSIONS_FILE);
+}
+
+/** Read the recorded fired-session ids (newest last), or [] on any error. */
+function readFiredSessions(stateDir: string): string[] {
+  const p = firedSessionsPath(stateDir);
+  if (!existsSync(p)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.filter((x): x is string => typeof x === "string");
+    }
+  } catch {
+    /* malformed — treat as empty */
+  }
+  return [];
+}
+
+/**
+ * True iff a review has ALREADY been injected for this session. The Stop
+ * hook consults this before injecting, so one tripped session yields at
+ * most one review even if the review-turn guard misses (issue #2462).
+ */
+export function hasFiredForSession(stateDir: string, sessionId: string): boolean {
+  if (!sessionId || sessionId === "unknown") return false;
+  return readFiredSessions(stateDir).includes(sessionId);
+}
+
+/**
+ * Record that a review has been injected for `sessionId`. Best-effort,
+ * deduped, and bounded to the most recent `FIRED_SESSIONS_MAX` ids.
+ */
+export function markFiredForSession(stateDir: string, sessionId: string): void {
+  if (!sessionId || sessionId === "unknown") return;
+  try {
+    if (!existsSync(stateDir)) {
+      mkdirSync(stateDir, { recursive: true, mode: 0o755 });
+    }
+    const seen = readFiredSessions(stateDir).filter((s) => s !== sessionId);
+    seen.push(sessionId);
+    const bounded =
+      seen.length > FIRED_SESSIONS_MAX ? seen.slice(-FIRED_SESSIONS_MAX) : seen;
+    writeFileSync(
+      firedSessionsPath(stateDir),
+      JSON.stringify(bounded),
+      "utf-8",
+    );
+  } catch {
+    /* best-effort breaker; injection still proceeds */
   }
 }

@@ -5,10 +5,12 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildReviewPrompt } from "../src/self-improve/review-prompt.js";
+import { buildReviewPrompt, REVIEW_SOURCE } from "../src/self-improve/review-prompt.js";
 import {
   writeReviewContext,
   reviewIsPending,
+  hasFiredForSession,
+  markFiredForSession,
 } from "../src/self-improve/review-context.js";
 
 // Drive the hook through `bun` against source (mirrors
@@ -119,6 +121,9 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
         SWITCHROOM_AGENT_NAME: "test-agent",
         SWITCHROOM_GATEWAY_SOCKET: socketPath,
         SWITCHROOM_SELF_IMPROVE_CHAT_ID: "1234",
+        // Isolate the per-session breaker's state file to this test's tmp dir
+        // (issue #2462) so it doesn't touch the shared default state dir.
+        TELEGRAM_STATE_DIR: join(tmp, "state-inject"),
       });
       expect(r.status).toBe(0);
 
@@ -137,7 +142,7 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
     }
   });
 
-  it("does NOT recurse: a review turn does not re-trip the gate", () => {
+  it("does NOT recurse: a BARE review turn does not re-trip the gate", () => {
     if (!bunOk) return;
     const socketPath = join(tmp, "gw2.sock");
     // The last user message is a review prompt we previously injected.
@@ -155,6 +160,104 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
       SWITCHROOM_GATEWAY_SOCKET: socketPath, // no server listening — connect would fail anyway
     });
     expect(r.status).toBe(0);
+  });
+
+  // Regression for issue #2462: the injected review returns CHANNEL-WRAPPED,
+  // so its transcript text is `<channel source="self_improve_review" ...>
+  // [self-improvement review] …</channel>`, NOT the bare banner. The old
+  // `startsWith("[self-improvement review]")` guard never matched this form,
+  // so the gate re-scanned, re-tripped on the embedded correction evidence,
+  // and re-injected forever. With a live server we assert NOTHING is injected.
+  it("does NOT re-fire on the CHANNEL-WRAPPED review turn (issue #2462)", async () => {
+    if (!bunOk) return;
+
+    const socketPath = join(tmp, "gw-wrapped.sock");
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+
+    try {
+      // The exact shape that broke it: the channel envelope wraps the banner
+      // AND the original correction evidence the gate would otherwise re-count.
+      const wrapped =
+        `<channel source="${REVIEW_SOURCE}" chat_id="1234" ts="1718000000">` +
+        "[self-improvement review] The turn-end gate detected a learning signal. " +
+        "evidence: No, that's wrong. That's not what I asked, I told you to exclude drafts." +
+        "</channel>";
+      // The window still contains the ORIGINAL two operator corrections that
+      // first tripped the gate, PLUS the injected review (channel-wrapped) as
+      // the latest user turn. Under the OLD `startsWith` guard this re-trips
+      // and re-injects (the infinite loop). The fixed guard must catch the
+      // wrapped review and exit without injecting.
+      const tp = writeTranscript("wrapped-review.jsonl", [
+        { role: "user", text: "Send the digest." },
+        { role: "assistant", text: "Sent." },
+        { role: "user", text: "No, that's wrong — you included drafts again." },
+        { role: "assistant", text: "Fixed." },
+        { role: "user", text: "That's not what I asked, I told you to exclude drafts." },
+        { role: "assistant", text: "Apologies, corrected." },
+        { role: "user", text: wrapped },
+        { role: "assistant", text: "Recorded a pending suggestion." },
+      ]);
+      const r = run(JSON.stringify({ session_id: "s-wrapped", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+        TELEGRAM_STATE_DIR: join(tmp, "state-wrapped"),
+      });
+      expect(r.status).toBe(0);
+
+      // Give any (errant) async write a moment, then assert NONE landed.
+      await new Promise((res) => setTimeout(res, 250));
+      expect(received.join("")).toBe("");
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
+    }
+  });
+
+  // Layer-3 breaker: once a review has been injected for a session, a second
+  // Stop in the SAME session must not inject again — even with a fresh
+  // tripping transcript that would otherwise trip the gate (issue #2462).
+  it("per-session breaker prevents a SECOND injection in the same session", async () => {
+    if (!bunOk) return;
+
+    const socketPath = join(tmp, "gw-breaker.sock");
+    const stateDir = mkdtempSync(join(tmpdir(), "self-improve-stop-breaker-"));
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+
+    try {
+      // Pre-arm the breaker as the first injection would have.
+      markFiredForSession(stateDir, "s-breaker");
+      expect(hasFiredForSession(stateDir, "s-breaker")).toBe(true);
+
+      // A transcript that DOES trip the gate (two operator corrections).
+      const tp = writeTranscript("breaker.jsonl", [
+        { role: "user", text: "No, that's wrong — you included drafts again." },
+        { role: "assistant", text: "Fixed." },
+        { role: "user", text: "That's not what I asked, I told you to exclude drafts." },
+      ]);
+      const r = run(JSON.stringify({ session_id: "s-breaker", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+        TELEGRAM_STATE_DIR: stateDir,
+      });
+      expect(r.status).toBe(0);
+
+      await new Promise((res) => setTimeout(res, 250));
+      expect(received.join("")).toBe(""); // breaker held — no second injection
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   it("clears the review-context marker at the end of a REAL review turn (regression: no leak)", () => {

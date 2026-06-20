@@ -29,6 +29,39 @@ import { resolveSelfImproveConfig } from "./config.js";
 /** The `meta.source` stamped on the synthesized review inbound. */
 export const REVIEW_SOURCE = "self_improve_review";
 
+/** The leading banner of a review prompt (see `buildReviewPrompt`). */
+export const REVIEW_MARKER = "[self-improvement review]";
+
+/**
+ * True iff `text` is (the transcript form of) a review turn WE injected.
+ *
+ * The injected inbound comes back through the gateway CHANNEL-WRAPPED, so
+ * the stored user text is NOT the bare banner — it looks like:
+ *
+ *   <channel source="self_improve_review" ...>[self-improvement review] …</channel>
+ *
+ * The original guard used `text.startsWith(REVIEW_MARKER)`, which never
+ * matches the wrapped form → infinite re-fire loop (issue #2462). We match
+ * robustly on EITHER the channel envelope's `source="self_improve_review"`
+ * attribute OR a substring of the banner, so both the wrapped form and the
+ * bare form (older transcripts / tests) are caught.
+ */
+export function isReviewInjectedText(text: string): boolean {
+  if (typeof text !== "string" || text.length === 0) return false;
+  // Channel-wrapped form: `<channel ... source="self_improve_review" ...>`.
+  // The attribute can appear with single or double quotes; match either,
+  // only inside a leading `<channel ...>` envelope to avoid false positives
+  // from an operator quoting the string.
+  const sourceAttr = new RegExp(
+    `^\\s*<channel\\b[^>]*\\bsource\\s*=\\s*["']?${REVIEW_SOURCE}\\b`,
+    "i",
+  );
+  if (sourceAttr.test(text)) return true;
+  // Bare / embedded banner (older transcripts, unit tests): a substring
+  // check — NOT startsWith — so a channel-stripped variant still matches.
+  return text.includes(REVIEW_MARKER);
+}
+
 /**
  * Build the review prompt text. `signals` is the gate's output; the
  * prompt is bounded (signals are already capped by the gate).
