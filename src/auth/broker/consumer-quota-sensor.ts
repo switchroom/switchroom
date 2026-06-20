@@ -63,6 +63,9 @@ export function quotaIndicatesExhaustion(result: QuotaResult): ExhaustionDecisio
   if (isOverageServeBlocking({
     fiveHourUtilizationPct: d.fiveHourUtilizationPct,
     sevenDayUtilizationPct: d.sevenDayUtilizationPct,
+    // Throwaway snapshot used only for the pure overage check, which keys
+    // solely on overageDisabledReason and ignores capturedAt. This `0` is a
+    // placeholder, NOT a real 1970 timestamp.
     capturedAt: 0,
     overageStatus: d.overageStatus,
     overageDisabledReason: d.overageDisabledReason,
