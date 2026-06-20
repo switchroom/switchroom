@@ -45,7 +45,7 @@ import { loadConfig, findConfigFile } from "../config/loader.js";
 import { writeRestartReasonMarker } from "../agents/lifecycle.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
-import { atomicWriteFileSync } from "../util/atomic.js";
+import { writeConfigFileSync } from "../util/atomic.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -60,8 +60,10 @@ function defaultPersistPin(configPath?: string): (pin: string) => void {
     const before = readFileSync(path, "utf8");
     const after = setReleasePinInConfig(before, pin);
     if (after === before) return; // idempotent no-op
-    // Crash-safe atomic write, preserving the file's existing mode.
-    atomicWriteFileSync(path, after, statSync(path).mode & 0o777);
+    // Config-file write: tries atomic rename(2) first; falls back to
+    // in-place rewrite on EBUSY/EXDEV/EINVAL (single-file bind mount
+    // inside the hostd container rejects rename over the mount point).
+    writeConfigFileSync(path, after, statSync(path).mode & 0o777);
     try {
       if (typeof process.geteuid === "function" && process.geteuid() === 0) {
         const uid = resolveOperatorUid();

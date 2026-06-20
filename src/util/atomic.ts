@@ -91,3 +91,58 @@ export function atomicWriteJsonSync(
 ): void {
   atomicWriteFileSync(destPath, JSON.stringify(value, null, 2) + "\n", mode);
 }
+
+/**
+ * Config-file variant of atomicWriteFileSync for non-secret config files
+ * (e.g. switchroom.yaml) that may live on single-file bind mounts inside
+ * the hostd container.
+ *
+ * On a single-file bind mount the kernel rejects rename(2) with EBUSY (and
+ * occasionally EXDEV or EINVAL on some container runtimes) because the bind
+ * mount point IS the inode — you cannot atomically swap it out from under
+ * the mount entry.  The standard atomic pattern therefore fails before any
+ * fleet change reaches the file.  For a non-secret config file the narrow
+ * non-atomic window of an in-place rewrite is acceptable: the file holds no
+ * secret material and concurrent readers will see either the old bytes or
+ * the new bytes — a partial read is the only risk, and it is bounded by a
+ * single write(2) + fsync(2) on a file that is kilobytes in size.
+ *
+ * Strategy:
+ *   1. Try the fully-atomic rename path first (identical to atomicWriteFileSync).
+ *   2. If rename(2) throws EBUSY | EXDEV | EINVAL, fall back to an in-place
+ *      rewrite: open with O_WRONLY | O_TRUNC, write, fsync, close.
+ *   3. Any other error is re-thrown unchanged (atomicity is NOT silently
+ *      swallowed for any other failure class).
+ *
+ * Do NOT use this function for secret-bearing files (vault entries, OAuth
+ * credentials) — those must always go through atomicWriteFileSync.
+ */
+export function writeConfigFileSync(
+  destPath: string,
+  contents: string | Buffer,
+  mode = 0o644,
+): void {
+  try {
+    atomicWriteFileSync(destPath, contents, mode);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EBUSY" && code !== "EXDEV" && code !== "EINVAL") {
+      throw err;
+    }
+    // Bind-mount target — fall back to in-place rewrite.
+    const buf = typeof contents === "string" ? Buffer.from(contents, "utf-8") : contents;
+    let fd: number | null = null;
+    try {
+      fd = openSync(destPath, constants.O_WRONLY | constants.O_TRUNC, mode);
+      writeSync(fd, buf, 0, buf.length, 0);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = null;
+    } catch (fallbackErr) {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* already closed */ }
+      }
+      throw fallbackErr;
+    }
+  }
+}
