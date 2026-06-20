@@ -119,11 +119,11 @@ describe('naturalAction — MCP tools', () => {
 })
 
 describe('formatPermissionCardBody', () => {
-  test('renders "<Agent> wants to <action>" + why line', () => {
+  test('renders "<Agent> wants to <action>" + why line (why = caller reason)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Edit',
-      inputPreview: JSON.stringify({ file_path: '/work/supplement-log.md' }),
-      description: 'logging today\'s lifts',
+      inputPreview: JSON.stringify({ file_path: '/work/supplement-log.md', reason: 'logging today\'s lifts' }),
+      description: 'Edit a file on disk.',
       agentName: 'gymbro',
     })
     expect(body).toBe(
@@ -131,11 +131,46 @@ describe('formatPermissionCardBody', () => {
     )
   })
 
-  test('shows "not provided" when description is missing or whitespace', () => {
+  // #2469: the `why:` line is the CALLER's reason, never the tool's static
+  // schema description (which can contain literal $SWITCHROOM_* tokens).
+  test('why is the caller-supplied reason, NOT the schema description (#2469)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__agent_restart',
+      inputPreview: JSON.stringify({ name: 'carrie', reason: 'gateway is wedged, bouncing it' }),
+      description: 'Restart an agent via the host-control daemon. cross-agent (`name` ≠ $SWITCHROOM_AGENT_NAME) …',
+      agentName: 'carrie',
+    })
+    expect(body).toContain('why: <i>gateway is wedged, bouncing it</i>')
+    expect(body).not.toContain('$SWITCHROOM_AGENT_NAME')
+    expect(body).not.toContain('host-control daemon')
+  })
+
+  test('why accepts a `why` arg as well as `reason`', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'ls /tmp', why: 'listing temp files' }),
+      description: 'Run a shell command.',
+      agentName: 'gymbro',
+    })
+    expect(body).toContain('why: <i>listing temp files</i>')
+  })
+
+  test('shows "not provided" when no caller reason is present (never the description)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
       inputPreview: JSON.stringify({ command: 'ls /tmp' }),
-      description: '   \n ',
+      description: 'Run a shell command on the host.',
+      agentName: 'gymbro',
+    })
+    expect(body).toContain('why: <i>not provided</i>')
+    expect(body).not.toContain('Run a shell command')
+  })
+
+  test('shows "not provided" when caller reason is whitespace only', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'Bash',
+      inputPreview: JSON.stringify({ command: 'ls /tmp', reason: '   \n ' }),
+      description: 'Run a shell command.',
       agentName: 'gymbro',
     })
     expect(body).toContain('why: <i>not provided</i>')
@@ -144,18 +179,18 @@ describe('formatPermissionCardBody', () => {
   test('drops the agent prefix when agentName is null (early-boot edge)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Skill',
-      inputPreview: JSON.stringify({ skill: 'mail' }),
-      description: 'do the thing',
+      inputPreview: JSON.stringify({ skill: 'mail', reason: 'do the thing' }),
+      description: 'Use a skill.',
       agentName: null,
     })
     expect(body).toBe(['🔐 Use the mail skill', 'why: <i>do the thing</i>'].join('\n'))
   })
 
-  test('HTML-escapes <, >, & in agentName / action / description', () => {
+  test('HTML-escapes <, >, & in agentName / action / reason', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
-      inputPreview: JSON.stringify({ command: 'echo "a < b && c > d"' }),
-      description: 'compare a < b & c > d',
+      inputPreview: JSON.stringify({ command: 'echo "a < b && c > d"', reason: 'compare a < b & c > d' }),
+      description: 'Run a shell command.',
       agentName: 'agent<test>',
     })
     expect(body).toContain('&lt;test&gt;')
@@ -165,25 +200,73 @@ describe('formatPermissionCardBody', () => {
     expect(body).toContain('<i>')
   })
 
-  test('truncates a very long description with an ellipsis', () => {
+  test('truncates a very long caller reason with an ellipsis', () => {
     const body = formatPermissionCardBody({
       toolName: 'Skill',
-      inputPreview: JSON.stringify({ skill: 'mail' }),
-      description: 'x'.repeat(500),
+      inputPreview: JSON.stringify({ skill: 'mail', reason: 'x'.repeat(500) }),
+      description: 'Use a skill.',
       agentName: 'clerk',
     })
     expect(body).toContain('xxxx…</i>')
     expect(body.split('\n')[0]).toBe('🔐 <b>Clerk</b> wants to use the mail skill')
   })
 
-  test('collapses internal whitespace in the description', () => {
+  test('collapses internal whitespace in the caller reason', () => {
     const body = formatPermissionCardBody({
       toolName: 'Skill',
-      inputPreview: JSON.stringify({ skill: 'mail' }),
-      description: 'first\n\nsecond\t\t paragraph',
+      inputPreview: JSON.stringify({ skill: 'mail', reason: 'first\n\nsecond\t\t paragraph' }),
+      description: 'Use a skill.',
       agentName: 'clerk',
     })
     expect(body).toContain('why: <i>first second paragraph</i>')
+  })
+
+  // #2469: hostd agent_* cards must name WHICH agent is targeted, pulled
+  // from the `name` input arg — not the static curated phrase.
+  test('hostd agent_restart names the target agent in the title (#2469)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__agent_restart',
+      inputPreview: JSON.stringify({ name: 'carrie', reason: 'wedged' }),
+      description: 'Restart an agent via the host-control daemon. $SWITCHROOM_AGENT_NAME …',
+      agentName: 'klanker',
+    })
+    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to restart agent `carrie` in the fleet')
+  })
+
+  test('hostd start/stop/logs/exec each name the target agent (#2469)', () => {
+    const mk = (tool: string) =>
+      formatPermissionCardBody({
+        toolName: tool,
+        inputPreview: JSON.stringify({ name: 'pixel' }),
+        description: 'static schema doc',
+        agentName: 'klanker',
+      }).split('\n')[0]
+    expect(mk('mcp__hostd__agent_start')).toBe('🔐 <b>Klanker</b> wants to start agent `pixel` in the fleet')
+    expect(mk('mcp__hostd__agent_stop')).toBe('🔐 <b>Klanker</b> wants to stop agent `pixel` in the fleet')
+    expect(mk('mcp__hostd__agent_logs')).toBe("🔐 <b>Klanker</b> wants to read agent `pixel`'s container logs")
+    expect(mk('mcp__hostd__agent_exec')).toBe('🔐 <b>Klanker</b> wants to run a read-only inspection inside agent `pixel`')
+  })
+
+  test('hostd agent verb without a name arg falls back to the generic phrase (no crash) (#2469)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__agent_restart',
+      inputPreview: JSON.stringify({ reason: 'bouncing the fleet' }),
+      description: 'static schema doc',
+      agentName: 'klanker',
+    })
+    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to restart an agent in the fleet')
+    expect(body).toContain('why: <i>bouncing the fleet</i>')
+  })
+
+  test('non-name-arg gated verb (update_apply) stays generic and does not break (#2469)', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__update_apply',
+      inputPreview: JSON.stringify({ reason: 'rolling out v0.16' }),
+      description: 'static schema doc',
+      agentName: 'klanker',
+    })
+    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to apply a fleet-wide update (pull + recreate)')
+    expect(body).toContain('why: <i>rolling out v0.16</i>')
   })
 
   // Clarity fix: the card gains a third "↳" line summarizing the REST
@@ -195,6 +278,7 @@ describe('formatPermissionCardBody', () => {
       toolName: 'mcp__brevo__post',
       inputPreview: JSON.stringify({
         path: '/smtp/email',
+        reason: 'sending the priority-access invite',
         body: { subject: 'Priority access', templateId: 12, to: [{ email: 'lisa@example.com' }] },
       }),
       description: 'HIGH RISK: write to the brevo API (POST).',
@@ -202,7 +286,7 @@ describe('formatPermissionCardBody', () => {
     })
     const lines = body.split('\n')
     expect(lines[0]).toBe('🔐 <b>Marko</b> wants to POST /smtp/email (Brevo)')
-    expect(lines[1]).toBe('why: <i>HIGH RISK: write to the brevo API (POST).</i>')
+    expect(lines[1]).toBe('why: <i>sending the priority-access invite</i>')
     // Third line: scalar keys show value; the nested `to` array shows key-only.
     expect(lines[2]).toContain('↳')
     expect(lines[2]).toContain('subject: Priority access')
