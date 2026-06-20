@@ -2400,14 +2400,18 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
   // A quota fetch seam that returns per-account utilization keyed by the
   // `at-<label>` token seedAccount writes, so a fleetQuotaProbeTick populates
   // lastQuotaCache with a chosen live snapshot per account.
-  function liveQuota(util: Record<string, { five: number; seven: number }>) {
+  function liveQuota(
+    util: Record<string, { five: number; seven: number; overageStatus?: string | null; overageReason?: string | null }>,
+  ) {
     return async ({ accessToken }: { accessToken: string }) => {
       const label = accessToken.replace(/^at-/, "");
       const u = util[label] ?? { five: 0, seven: 0 };
       return { ok: true as const, data: {
         fiveHourUtilizationPct: u.five, sevenDayUtilizationPct: u.seven,
         fiveHourResetAt: null, sevenDayResetAt: null,
-        representativeClaim: null, overageStatus: null, overageDisabledReason: null,
+        representativeClaim: null,
+        overageStatus: u.overageStatus ?? null,
+        overageDisabledReason: u.overageReason ?? null,
       } };
     };
   }
@@ -2513,6 +2517,129 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     expect(resp.ok).toBe(true);
     expect(resp.data.account).toBe("default");
     broker.stop();
+  });
+
+  // ── Overage serve-blocking (2026-06-20: out_of_credits at 0% util) ─────────
+  it("(a) out_of_credits active @0% ⇒ list-state exhausted:true AND serves the healthy fallback", async () => {
+    let clock = Date.UTC(2026, 5, 20, 7, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      // default idle-but-credits-dead (0% util, out_of_credits); secondary healthy.
+      _testFetchQuota: liveQuota({
+        default: { five: 0, seven: 0, overageStatus: "rejected", overageReason: "out_of_credits" },
+        secondary: { five: 5, seven: 10 },
+      }),
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      await broker.fleetQuotaProbeTick();
+      // list-state: default reads exhausted purely from the overage reason.
+      const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(true);
+      // get-credentials must fail over to the healthy secondary, not serve the dead account.
+      const resp = (await rpc(clerkSock, { v: 1, id: "1", op: "get-credentials" })) as { data: { account: string } };
+      expect(resp.data.account).toBe("secondary");
+    } finally { broker.stop(); }
+  });
+
+  it("(b) org_level_disabled active @75% ⇒ exhausted:false AND still served (MANDATORY end-to-end catastrophic guard)", async () => {
+    let clock = Date.UTC(2026, 5, 20, 7, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      // The LIVE fleet account: 75% util, overage org-disabled + status rejected,
+      // but serving fine off subscription. Must NOT be marked exhausted.
+      _testFetchQuota: liveQuota({
+        default: { five: 75, seven: 40, overageStatus: "rejected", overageReason: "org_level_disabled" },
+        secondary: { five: 5, seven: 10 },
+      }),
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      await broker.fleetQuotaProbeTick();
+      const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(false);
+      // get-credentials must KEEP serving default (no spurious failover).
+      const resp = (await rpc(clerkSock, { v: 1, id: "1", op: "get-credentials" })) as { data: { account: string } };
+      expect(resp.data.account).toBe("default");
+    } finally { broker.stop(); }
+  });
+
+  it("(c) a pre-seeded mark survives a 0%/out_of_credits probe (NOT self-healed); contrast 0%/null clears it", async () => {
+    let clock = Date.UTC(2026, 5, 20, 7, 0, 0);
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    // out_of_credits build: a fresh healthy-looking (0%) probe must NOT clear the mark.
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      now: () => clock,
+      _testFetchQuota: liveQuota({
+        default: { five: 0, seven: 0, overageStatus: "rejected", overageReason: "out_of_credits" },
+        secondary: { five: 5, seven: 10 },
+      }),
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 3600_000 });
+      await broker.fleetQuotaProbeTick(); // 0% probe — but out_of_credits → must NOT self-heal
+      const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(true);
+      expect(acct?.exhausted_until).toBeDefined();
+    } finally { broker.stop(); }
+
+    // Contrast: SAME 0% util with a NULL overage reason DOES self-heal the mark.
+    let clock2 = Date.UTC(2026, 5, 20, 7, 0, 0);
+    const h2 = makeHarness();
+    const config2 = makeConfig(h2, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h2, "default"); seedAccount(h2, "secondary");
+    mkdirSync(join(h2.agentsDir, "clerk"), { recursive: true });
+    const broker2 = new AuthBroker(config2, {
+      home: h2.home, stateDir: h2.stateDir, socketRoot: h2.socketRoot, disableRefreshLoop: true,
+      now: () => clock2,
+      _testFetchQuota: liveQuota({ default: { five: 0, seven: 0 }, secondary: { five: 5, seven: 10 } }),
+    });
+    const clerkSock2 = join(h2.socketRoot, "clerk", "sock");
+    try {
+      await broker2.start();
+      await rpc(clerkSock2, { v: 1, id: "1", op: "mark-exhausted", until: clock2 + 3600_000 });
+      await broker2.fleetQuotaProbeTick(); // 0% + null reason → clears
+      const acct = (await new AuthBrokerClient({ socket: clerkSock2 }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(false);
+      expect(acct?.exhausted_until).toBeUndefined();
+    } finally { broker2.stop(); }
+  });
+
+  it("(d) cold-start with no snapshot is NOT pre-blocked by overage (deny-by-omission)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
+    seedAccount(h, "default"); seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    const clerkSock = join(h.socketRoot, "clerk", "sock");
+    try {
+      await broker.start();
+      // No fleetQuotaProbeTick — no snapshot at all. Must serve default normally.
+      const resp = (await rpc(clerkSock, { v: 1, id: "1", op: "get-credentials" })) as { data: { account: string } };
+      expect(resp.data.account).toBe("default");
+      const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
+      expect(acct?.exhausted).toBe(false);
+    } finally { broker.stop(); }
   });
 });
 

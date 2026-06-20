@@ -67,6 +67,22 @@ describe('classifyHealth', () => {
   it('returns unknown when quota probe failed', () => {
     expect(classifyHealth(snap({ quota: null, quotaError: 'HTTP 401' }))).toBe('unknown');
   });
+  it('out_of_credits overage at 0% util → blocked (the credits-dead account)', () => {
+    expect(
+      classifyHealth(snap({ quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' }) })),
+    ).toBe('blocked');
+  });
+  it('org_level_disabled at 75% util → unchanged/healthy (MANDATORY non-regression: live active account)', () => {
+    // overageStatus:"rejected" + the benign reason must NOT flip it to blocked.
+    expect(
+      classifyHealth(snap({ quota: quota({ fiveHourUtilizationPct: 75, sevenDayUtilizationPct: 40, overageStatus: 'rejected', overageDisabledReason: 'org_level_disabled' }) })),
+    ).toBe('healthy');
+  });
+  it('unknown overage reason (payment_failed) at 0% util → healthy (deny-by-omission)', () => {
+    expect(
+      classifyHealth(snap({ quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageDisabledReason: 'payment_failed' }) })),
+    ).toBe('healthy');
+  });
   it('THROTTLING_THRESHOLD_PCT is 80 (regression — design choice, see jtbd)', () => {
     // If this number changes, the recommendation footer + button visibility
     // shift; bump it deliberately.

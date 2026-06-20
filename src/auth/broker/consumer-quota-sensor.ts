@@ -15,6 +15,7 @@
  */
 
 import type { QuotaResult } from "../quota.js";
+import { isOverageServeBlocking } from "./account-eligibility.js";
 
 /**
  * Utilization at/above this on the binding window counts as a hard wall.
@@ -54,6 +55,20 @@ export interface ExhaustionDecision {
 export function quotaIndicatesExhaustion(result: QuotaResult): ExhaustionDecision {
   if (!result.ok) return { exhausted: false, until: null };
   const d = result.data;
+  // A serve-blocking overage (out_of_credits) means the account is dead even at
+  // 0% util — a consumer pinned to it would 429 on every call. Mark exhausted.
+  // The reason discriminator (not overageStatus) lives in account-eligibility;
+  // org_level_disabled / null / unknown are benign and do NOT trip this. Carry
+  // no reset (the wall isn't a util window) → caller uses its default window.
+  if (isOverageServeBlocking({
+    fiveHourUtilizationPct: d.fiveHourUtilizationPct,
+    sevenDayUtilizationPct: d.sevenDayUtilizationPct,
+    capturedAt: 0,
+    overageStatus: d.overageStatus,
+    overageDisabledReason: d.overageDisabledReason,
+  })) {
+    return { exhausted: true, until: null };
+  }
   const fiveBlocked = d.fiveHourUtilizationPct >= EXHAUSTION_PCT;
   const sevenBlocked = d.sevenDayUtilizationPct >= EXHAUSTION_PCT;
   if (!fiveBlocked && !sevenBlocked) return { exhausted: false, until: null };
