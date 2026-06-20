@@ -4308,6 +4308,22 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       timeout: 5,
       async: true,
     });
+    // Agent self-improvement GATE — RFC
+    // reference/rfcs/agent-self-improvement.md slice 1. A cheap,
+    // deterministic per-turn triage; on a learning signal it injects a
+    // forked review turn (inject_inbound, NOT claude -p). Async so it
+    // never sits on the turn-end reply path; bundled from
+    // src/cli/self-improve-stop.ts (imports src/self-improve/* + node:net),
+    // hence DOCKER_BUNDLED_HOOKS_PATH like skill-validate-pretool.
+    stopHooks.push({
+      type: "command",
+      command: wrap(
+        "hook:self-improve-stop",
+        `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "self-improve-stop.mjs")}"`,
+      ),
+      timeout: 10,
+      async: true,
+    });
   }
   const switchroomStop = stopHooks.length > 0 ? [{ hooks: stopHooks }] : [];
 

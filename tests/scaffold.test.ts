@@ -2543,6 +2543,12 @@ describe("scaffoldAgent with global defaults cascade", () => {
             timeout: 5,
             async: true,
           },
+          {
+            type: "command",
+            command: expect.stringContaining("self-improve-stop.mjs"),
+            timeout: 10,
+            async: true,
+          },
         ],
       },
     ]);

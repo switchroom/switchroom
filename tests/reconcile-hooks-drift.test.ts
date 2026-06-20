@@ -53,6 +53,38 @@ describe("buildSettingsHooksBlock", () => {
     expect(stopCmds.some((c) => c.includes("user-profile-refresh-hook.sh"))).toBe(false);
   });
 
+  it("wires the agent self-improvement Stop gate when the telegram plugin is on", () => {
+    // RFC reference/rfcs/agent-self-improvement.md slice 1: the turn-end
+    // gate attaches as a switchroom-owned async Stop hook, alongside
+    // handoff / secret-scrub / tool-label. Gated on useSwitchroomPlugin
+    // because it needs the gateway socket to inject the forked review.
+    const withPlugin = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig: makeAgentConfig(),
+      hindsightEnabled: false,
+      useSwitchroomPlugin: true,
+    });
+    const stopWith = (withPlugin.Stop ?? []) as Array<{
+      hooks: Array<{ command: string; async?: boolean }>;
+    }>;
+    const selfImprove = stopWith
+      .flatMap((e) => e.hooks)
+      .find((h) => h.command.includes("self-improve-stop.mjs"));
+    expect(selfImprove).toBeDefined();
+    expect(selfImprove?.async).toBe(true);
+
+    // Without the plugin, no gateway socket → the gate is not wired.
+    const noPlugin = buildSettingsHooksBlock({
+      agentName: "test-agent",
+      agentConfig: makeAgentConfig(),
+      hindsightEnabled: false,
+      useSwitchroomPlugin: false,
+    });
+    const stopNo = (noPlugin.Stop ?? []) as Array<{ hooks: Array<{ command: string }> }>;
+    const stopNoCmds = stopNo.flatMap((e) => e.hooks.map((h) => h.command));
+    expect(stopNoCmds.some((c) => c.includes("self-improve-stop.mjs"))).toBe(false);
+  });
+
   it("with telegram plugin adds PreToolUse and PostToolUse hooks", () => {
     const agentConfig = makeAgentConfig({
       plugin: "switchroom-telegram",

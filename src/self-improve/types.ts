@@ -1,0 +1,92 @@
+/**
+ * Agent self-improvement — shared types (RFC
+ * `reference/rfcs/agent-self-improvement.md`, slice 1).
+ *
+ * The job (`reference/jobs/get-better-the-longer-they-run.md`): when an
+ * agent is corrected, or finds a path it will reuse, that lesson should
+ * bind on every future run without re-teaching — and without the agent
+ * manufacturing skills/crons. Slice 1 builds the foundational vertical:
+ * a cheap deterministic GATE on the turn-end Stop hook, a forked review
+ * (routed through `inject_inbound`, not `claude -p`), a blast-radius
+ * TIER router, an eval gate on T1, and a per-agent pending-suggestions
+ * queue for everything heavier.
+ *
+ * These are pure, dependency-light types so the gate / router / queue /
+ * eval-gate modules stay unit-testable without the gateway, the broker,
+ * or a live `claude` process.
+ */
+
+/** A normalised conversation message, shape-compatible with the Claude
+ *  Code transcript (`{role, content}`) the Stop hook reads. `content`
+ *  is the flattened text — the gate works on text, not tool payloads. */
+export interface TurnMessage {
+  role: "user" | "assistant" | string;
+  /** Flattened text of the message (list-content shapes are joined). */
+  text: string;
+}
+
+/** The kinds of deterministic learning signal the gate detects. */
+export type LearningSignalKind =
+  /** Operator said "no / wrong / that's not it / I told you …". */
+  | "operator-correction"
+  /** The same manual fix (e.g. an identical Edit) recurred. */
+  | "repeated-manual-fix"
+  /** A standing directive ("always do X") the agent did not honour. */
+  | "directive-not-bound";
+
+/** One detected signal with the evidence that tripped it. */
+export interface LearningSignal {
+  kind: LearningSignalKind;
+  /** Short human-readable reason (goes into the forked-review prompt). */
+  reason: string;
+  /** How many occurrences were counted (≥ threshold when it trips). */
+  occurrences: number;
+  /** A short verbatim excerpt of the triggering text (capped). */
+  evidence: string;
+}
+
+/** Result of running the gate over a finished turn. */
+export interface GateResult {
+  /** True iff at least one signal crossed the repetition threshold. */
+  tripped: boolean;
+  /** Every signal at/above threshold (empty when not tripped). */
+  signals: LearningSignal[];
+}
+
+/** Blast-radius tier for a candidate self-improvement change. */
+export type Tier =
+  /** Nothing to do (most turns). */
+  | "T0"
+  /** Small, reversible edit to a skill the agent already owns → auto. */
+  | "T1"
+  /** Medium / shared-skill → propose (one-tap), do not auto-apply. */
+  | "T2"
+  /** New cron / new skill / cross-agent / irreversible → ask explicitly. */
+  | "T3";
+
+/**
+ * A candidate change the forked review proposes. The router consumes
+ * this to assign a tier; the eval gate consumes it before a T1 lands.
+ */
+export interface ChangeCandidate {
+  /** The lesson, in one line (operator-readable). */
+  lesson: string;
+  /** The smallest change that makes the lesson bind. */
+  proposedChange: string;
+  /** Target skill slug, when the change edits a skill the agent owns. */
+  skillSlug?: string;
+  /** True iff `skillSlug` names a skill in the agent's OWN writable dir. */
+  ownsSkill?: boolean;
+  /** Estimated changed-line count for the edit (single skill file). */
+  changedLines?: number;
+  /** True iff the change touches more than one skill file. */
+  multiFile?: boolean;
+  /** True iff the change creates a NEW skill (vs editing an existing one). */
+  createsNewSkill?: boolean;
+  /** True iff the change creates / edits a cron schedule. */
+  touchesCron?: boolean;
+  /** True iff the change reaches another agent. */
+  crossAgent?: boolean;
+  /** True iff the change is not cleanly reversible (git/validator can't undo). */
+  irreversible?: boolean;
+}
