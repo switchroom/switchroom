@@ -12,6 +12,7 @@ function turn(overrides: Partial<StatusSurfaceTurnView> = {}): StatusSurfaceTurn
     sessionThreadId: undefined,
     startedAt: 1_780_000_000_000,
     toolCallCount: 0,
+    labeledToolCount: 0,
     activityMessageId: null,
     activityEverOpened: false,
     activityDrainFailures: 0,
@@ -35,7 +36,7 @@ describe('formatTurnLifecycle', () => {
     const line = formatTurnLifecycle(
       'clear',
       'turn_end',
-      turn({ sessionThreadId: 3, toolCallCount: 5, activityMessageId: 42, activityEverOpened: true, replyCalled: true, finalAnswerDelivered: true }),
+      turn({ sessionThreadId: 3, toolCallCount: 5, labeledToolCount: 5, activityMessageId: 42, activityEverOpened: true, replyCalled: true, finalAnswerDelivered: true }),
       1_780_000_300_000, // +300s
     )
     expect(line).toContain('turn-lifecycle clear reason=turn_end')
@@ -63,7 +64,7 @@ describe('formatTurnLifecycle', () => {
 describe('detectStatusSurfaceDegraded', () => {
   it('flags a turn that did tool work but never opened the feed due to send failures (the resume-400 signature)', () => {
     const d = detectStatusSurfaceDegraded(
-      turn({ toolCallCount: 3, activityEverOpened: false, activityDrainFailures: 10 }),
+      turn({ toolCallCount: 3, labeledToolCount: 3, activityEverOpened: false, activityDrainFailures: 10 }),
     )
     expect(d).not.toBeNull()
     expect(d!.reason).toBe('feed-never-opened')
@@ -75,7 +76,7 @@ describe('detectStatusSurfaceDegraded', () => {
     // the sticky activityEverOpened keeps this from false-positiving.
     expect(
       detectStatusSurfaceDegraded(
-        turn({ toolCallCount: 4, activityMessageId: null, activityEverOpened: true, activityDrainFailures: 0 }),
+        turn({ toolCallCount: 4, labeledToolCount: 4, activityMessageId: null, activityEverOpened: true, activityDrainFailures: 0 }),
       ),
     ).toBeNull()
   })
@@ -83,7 +84,7 @@ describe('detectStatusSurfaceDegraded', () => {
   it('does NOT flag a turn that never attempted a feed send (e.g. ack-first suppression)', () => {
     expect(
       detectStatusSurfaceDegraded(
-        turn({ toolCallCount: 2, activityEverOpened: false, activityDrainFailures: 0 }),
+        turn({ toolCallCount: 2, labeledToolCount: 2, activityEverOpened: false, activityDrainFailures: 0 }),
       ),
     ).toBeNull()
   })
