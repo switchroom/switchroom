@@ -11,8 +11,8 @@ import { ObligationLedger } from "../gateway/obligation-ledger.js";
 // duplicate), while the genuine "plain text, never replied" case still represents
 // ONCE and the represent_count cap is honored.
 
-const CHAT = "8248703757";
-const ORIGIN = "8248703757:_#10605";
+const CHAT = "12345";
+const ORIGIN = "12345:_#10605";
 
 function obligation(over: Partial<RepresentGuardObligation> = {}): RepresentGuardObligation {
   return { originTurnId: ORIGIN, chatId: CHAT, ...over };
