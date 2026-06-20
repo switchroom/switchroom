@@ -193,6 +193,66 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
   });
 });
 
+describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)", () => {
+  it("appends '✓ N steps' footer when final=true and stepCount > 0", () => {
+    const lines = ["Reading CLAUDE.md", "Searching memory", "Running a command"];
+    const out = renderActivityFeed(lines, true, "", 5)!;
+    // All lines are done (✓) and the footer is appended.
+    expect(out).toContain("<i>✓ Running a command</i>");
+    expect(out).toContain("<i>✓ 5 steps</i>");
+    expect(out.endsWith("<i>✓ 5 steps</i>")).toBe(true);
+  });
+
+  it("stepCount=0 → no footer (no tools fired that were surfaced)", () => {
+    const lines = ["Reading CLAUDE.md"];
+    const out = renderActivityFeed(lines, true, "", 0)!;
+    expect(out).not.toContain("steps");
+    expect(out).toBe("<i>✓ Reading CLAUDE.md</i>");
+  });
+
+  it("stepCount undefined → no footer (live/non-final callers omit it)", () => {
+    const lines = ["Reading CLAUDE.md"];
+    const out = renderActivityFeed(lines, true)!;
+    expect(out).not.toContain("steps");
+  });
+
+  it("stepCount present but final=false → no footer (live in-progress feed stays clean)", () => {
+    const lines = ["Reading CLAUDE.md", "Running a command"];
+    const out = renderActivityFeed(lines, false, "", 7)!;
+    expect(out).not.toContain("steps");
+    // The newest line is still the live in-progress step.
+    expect(out).toContain("<b>→ Running a command</b>");
+  });
+
+  it("stepCount=1 footer reads '✓ 1 steps' (no special-casing)", () => {
+    const lines = ["Reading CLAUDE.md"];
+    const out = renderActivityFeed(lines, true, "", 1)!;
+    expect(out).toContain("<i>✓ 1 steps</i>");
+  });
+
+  it("footer appears even when the feed overflows MIRROR_MAX_LINES", () => {
+    const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
+    const out = renderActivityFeed(lines, true, "", 9)!;
+    expect(out).toContain("<i>✓ +3 earlier…</i>");
+    expect(out).toContain("<i>✓ 9 steps</i>");
+    expect(out.endsWith("<i>✓ 9 steps</i>")).toBe(true);
+  });
+
+  it("stepCount is surface-tool-excluded: reply/react count 0, Read+mcp count correctly", () => {
+    // This test documents the counting contract: stepCount is incremented
+    // after the isTelegramSurfaceTool guard in case 'tool_label', so surface
+    // tools (reply/stream_reply/edit_message/react) are never counted. The
+    // rendered footer reflects only the surfaced non-surface steps.
+    const lines = ["Reading CLAUDE.md", "Searching memory"]; // 2 non-surface labels
+    // stepCount=2 (Read + mcp__hindsight__recall) — reply is NOT counted.
+    const out = renderActivityFeed(lines, true, "", 2)!;
+    expect(out).toContain("<i>✓ 2 steps</i>");
+    // stepCount=0 would mean only surface tools fired — no footer.
+    const outSurfaceOnly = renderActivityFeed(["Reading CLAUDE.md"], true, "", 0)!;
+    expect(outSurfaceOnly).not.toContain("steps");
+  });
+});
+
 describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A)", () => {
   it("with no child lines, is identical to the flat feed", () => {
     const lines = ["Searching memory", "Delegating: review the migration"];
@@ -265,6 +325,26 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     expect(renderActivityFeedWithNested(["Reading a.ts"], [], false, " · 9s")).toBe(
       "<b>→ Reading a.ts · 9s</b>",
     );
+  });
+
+  it("stepCount footer appears on final=true with children present", () => {
+    const parent = ["Delegating: review the migration"];
+    const child = ["Reading schema.ts", "Looking for foreign keys"];
+    const out = renderActivityFeedWithNested(parent, child, true, "", 5)!;
+    expect(out).toContain("<i>✓ 5 steps</i>");
+    expect(out.endsWith("<i>✓ 5 steps</i>")).toBe(true);
+    expect(out).not.toContain("→");
+  });
+
+  it("stepCount footer appears on final=true with no children (delegates to flat render)", () => {
+    const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 3)!;
+    expect(out).toContain("<i>✓ 3 steps</i>");
+    expect(out).toBe("<i>✓ Reading a.ts</i>\n<i>✓ 3 steps</i>");
+  });
+
+  it("stepCount=0 → no footer even on final=true", () => {
+    const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 0)!;
+    expect(out).not.toContain("steps");
   });
 
   // Pins the invariant the gateway's foreground handoff-clear path relies on:

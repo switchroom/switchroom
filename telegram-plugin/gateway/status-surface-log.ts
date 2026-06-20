@@ -30,6 +30,17 @@ export interface StatusSurfaceTurnView {
   sessionThreadId: number | undefined
   startedAt: number
   toolCallCount: number
+  /**
+   * Count of tool_label events that passed the surface-tool guard this turn —
+   * i.e. the number of surfaced (non-surface, non-suppressed) tool steps. This
+   * is the deterministic single source of truth for the `tools=` lifecycle
+   * field and the `✓ N steps` activity-feed total. Incremented in
+   * `case 'tool_label':` AFTER the `isTelegramSurfaceTool` guard so that
+   * reply/stream_reply/edit_message/react are never counted. send_typing and
+   * sync_retain are suppressed at the hook level (computeLabel returns null)
+   * and never arrive as tool_label events, so they are excluded automatically.
+   */
+  labeledToolCount: number
   /** Live activity-feed message id; null until the first send captures it. */
   activityMessageId: number | null
   /**
@@ -67,7 +78,7 @@ export function formatTurnLifecycle(
   return (
     `turn-lifecycle ${action} reason=${reason} turnId=${t.turnId} ` +
     `chat=${t.sessionChatId} thread=${t.sessionThreadId ?? '-'} ` +
-    `tools=${t.toolCallCount} activityMsgId=${t.activityMessageId ?? 'none'} ` +
+    `tools=${t.labeledToolCount} activityMsgId=${t.activityMessageId ?? 'none'} ` +
     `feedOpened=${t.activityEverOpened} drainFailures=${t.activityDrainFailures} ` +
     `replyCalled=${t.replyCalled} finalAnswer=${t.finalAnswerDelivered} age_ms=${ageMs}`
   )
@@ -89,13 +100,13 @@ export function formatTurnLifecycle(
 export function detectStatusSurfaceDegraded(
   t: StatusSurfaceTurnView,
 ): { reason: string; detail: string } | null {
-  if (t.toolCallCount === 0) return null
+  if (t.labeledToolCount === 0) return null
   if (t.activityEverOpened) return null
   if (t.activityDrainFailures === 0) return null
   return {
     reason: 'feed-never-opened',
     detail:
-      `tools=${t.toolCallCount} drainFailures=${t.activityDrainFailures} ` +
+      `tools=${t.labeledToolCount} drainFailures=${t.activityDrainFailures} ` +
       `activityMsgId=none — the live activity feed failed every send this turn ` +
       `(card was dark despite tool work)`,
   }
