@@ -233,6 +233,16 @@ RUN chmod 0755 /opt/switchroom/hooks/skill-validate-pretool.mjs
 COPY dist/cli/self-improve-stop.mjs /opt/switchroom/hooks/self-improve-stop.mjs
 RUN chmod 0755 /opt/switchroom/hooks/self-improve-stop.mjs
 
+# Agent self-improvement APPLY-GUARD (RFC reference/rfcs/agent-self-improvement.md
+# slice 2). The DETERMINISTIC T1 gate, a PreToolUse hook on Write/Edit/
+# MultiEdit. No-op on a normal turn; when a self-improve review is pending
+# (marker present) it enforces own-skill + diff-cap + evals-pass + rate-cap
+# on any skill edit, or BLOCKS it and downgrades to a pending proposal. Like
+# the Stop gate it's a quality loop within the agent's own trust domain, so
+# it lives here, not in the security-plugin. Kill switch SWITCHROOM_SELF_IMPROVE=0.
+COPY dist/cli/self-improve-apply-guard-pretool.mjs /opt/switchroom/hooks/self-improve-apply-guard-pretool.mjs
+RUN chmod 0755 /opt/switchroom/hooks/self-improve-apply-guard-pretool.mjs
+
 # Image-baked security-hooks plugin (sec WS8-F1 / #1416). A separate,
 # minimal --plugin-dir holding ONLY the load-bearing PreToolUse safety
 # hooks (secret-exfil guard + Drive-write approval gate). Loaded from

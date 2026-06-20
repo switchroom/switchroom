@@ -214,6 +214,24 @@ if (selfImproveHookEscape.changed) {
   console.log(`[build] ASCII-escaped ${selfImproveHookEscape.nonAsciiCount} non-ASCII code units in dist/cli/self-improve-stop.mjs`);
 }
 
+// Bundle the self-improve-apply-guard-pretool hook — RFC
+// reference/rfcs/agent-self-improvement.md slice 2. The DETERMINISTIC T1
+// apply-guard: a self-contained .mjs the agent runs via node from the
+// bundled-hooks path. Imports the src/self-improve/* apply-guard / eval-gate
+// / tier-router / pending-queue / review-context modules, none of which
+// resolve from the raw .mjs hooks dir — so bundle to one file.
+console.log("[build] bundling src/cli/self-improve-apply-guard-pretool.ts -> dist/cli/self-improve-apply-guard-pretool.mjs");
+execSync(
+  `bun build ${JSON.stringify(resolve(root, "src/cli/self-improve-apply-guard-pretool.ts"))} --outfile ${JSON.stringify(resolve(outDir, "self-improve-apply-guard-pretool.mjs"))} --target node`,
+  { stdio: "inherit", cwd: root }
+);
+const selfImproveGuardOutFile = resolve(outDir, "self-improve-apply-guard-pretool.mjs");
+chmodSync(selfImproveGuardOutFile, 0o755);
+const selfImproveGuardEscape = escapeBundleNonAscii(selfImproveGuardOutFile);
+if (selfImproveGuardEscape.changed) {
+  console.log(`[build] ASCII-escaped ${selfImproveGuardEscape.nonAsciiCount} non-ASCII code units in dist/cli/self-improve-apply-guard-pretool.mjs`);
+}
+
 // Bundle the autoaccept-poll entrypoint. The agent unit's ExecStartPost
 // invokes this in the background to dispatch first-run TUI prompts via
 // `tmux capture-pane` + `tmux send-keys`. Must ship in dist/ because

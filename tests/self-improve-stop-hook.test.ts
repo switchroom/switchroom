@@ -5,6 +5,12 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { buildReviewPrompt } from "../src/self-improve/review-prompt.js";
+import {
+  writeReviewContext,
+  reviewIsPending,
+} from "../src/self-improve/review-context.js";
+
 // Drive the hook through `bun` against source (mirrors
 // tests/skill-validate-pretool.test.ts) so the test doesn't depend on
 // build order. Skip cleanly if bun is absent.
@@ -149,5 +155,46 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
       SWITCHROOM_GATEWAY_SOCKET: socketPath, // no server listening — connect would fail anyway
     });
     expect(r.status).toBe(0);
+  });
+
+  it("clears the review-context marker at the end of a REAL review turn (regression: no leak)", () => {
+    if (!bunOk) return;
+    const stateDir = mkdtempSync(join(tmpdir(), "self-improve-stop-marker-"));
+    try {
+      // Arm the marker exactly as the Stop hook would at injection time.
+      writeReviewContext(stateDir, {
+        created_at: new Date(Date.now() - 60_000).toISOString(),
+        triggering_session: "prev",
+        chat_id: "c",
+        signals: [],
+      });
+      expect(reviewIsPending(stateDir)).toBe(true);
+
+      // A real review turn: the last user message is the ACTUAL review
+      // prompt (built from a benign signal). It trips NO gate signal — the
+      // precise case the leak bug missed — yet the marker must still clear,
+      // because review-turn detection now runs BEFORE the gate check.
+      const prompt = buildReviewPrompt([
+        {
+          kind: "directive-not-bound",
+          reason: "standing rule not honoured",
+          occurrences: 2,
+          evidence: "always exclude drafts",
+        },
+      ]);
+      const tp = writeTranscript("real-review.jsonl", [
+        { role: "user", text: prompt },
+        { role: "assistant", text: "Edited the skill and recorded the change." },
+      ]);
+      const r = run(JSON.stringify({ session_id: "rev", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(tmp, "no-server.sock"),
+      });
+      expect(r.status).toBe(0);
+      expect(reviewIsPending(stateDir)).toBe(false); // marker cleared — no leak
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });
