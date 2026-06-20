@@ -157,6 +157,99 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
     expect(r.status).toBe(0);
   });
 
+  // Regression for the infinite re-fire loop (issue #2462). The REAL runtime
+  // shape of an injected review turn is NOT the bare banner — the gateway
+  // wraps it in a `<channel …>` envelope first, so the banner is not at
+  // offset 0. With a live server listening we assert the hook injects
+  // NOTHING: it must recognise the wrapped review turn and short-circuit.
+  it("does NOT re-inject on a CHANNEL-WRAPPED review turn (the loop bug)", async () => {
+    if (!bunOk) return;
+    const socketPath = join(tmp, "gw-wrapped.sock");
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+    try {
+      const prompt = buildReviewPrompt([
+        {
+          kind: "directive-not-bound",
+          reason: "A standing rule was restated 2× — it isn't binding",
+          occurrences: 2,
+          evidence: "Lisa and JDLF emails are always relevant",
+        },
+      ]);
+      // Exactly how the gateway stores it: channel envelope + newline + prompt.
+      const wrapped =
+        `<channel source="switchroom-telegram" source="self_improve_review" ` +
+        `triggering_session="loop">\n${prompt}`;
+      const tp = writeTranscript("wrapped-review.jsonl", [
+        { role: "user", text: wrapped },
+        { role: "assistant", text: "Bound the directive. Ending the turn." },
+      ]);
+      const r = run(JSON.stringify({ session_id: "loop", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+      });
+      expect(r.status).toBe(0);
+      await new Promise((res) => setTimeout(res, 200));
+      expect(received.join("")).toBe(""); // no inject — loop broken
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
+    }
+  });
+
+  // Defense in depth (issue #2462): even when the review turn is NOT last —
+  // e.g. a wrapped review prompt earlier in the window plus a benign normal
+  // message last — the gate must not COUNT the review prompt's embedded
+  // evidence as a fresh restated rule and re-fire. The scan filter drops our
+  // own injected prompts before the gate runs.
+  it("does NOT re-fire from a review prompt sitting in the scan window", async () => {
+    if (!bunOk) return;
+    const socketPath = join(tmp, "gw-window.sock");
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+    try {
+      // Two wrapped review prompts carrying the SAME directive evidence — left
+      // in the scan, the directive detector would cluster them (count ≥ 2) and
+      // re-fire. They must be filtered out.
+      const mk = (n: number) =>
+        `<channel source="switchroom-telegram" source="self_improve_review" ` +
+        `triggering_session="w${n}">\n` +
+        buildReviewPrompt([
+          {
+            kind: "directive-not-bound",
+            reason: "A standing rule was restated — always dedupe the recipients",
+            occurrences: 2,
+            evidence: "always dedupe the recipients",
+          },
+        ]);
+      const tp = writeTranscript("window-review.jsonl", [
+        { role: "user", text: mk(1) },
+        { role: "assistant", text: "Bound it." },
+        { role: "user", text: mk(2) },
+        { role: "assistant", text: "Already bound." },
+        { role: "user", text: "ok thanks" }, // benign normal turn is last
+      ]);
+      const r = run(JSON.stringify({ session_id: "window", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+      });
+      expect(r.status).toBe(0);
+      await new Promise((res) => setTimeout(res, 200));
+      expect(received.join("")).toBe(""); // filtered — no self-amplification
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
+    }
+  });
+
   it("clears the review-context marker at the end of a REAL review turn (regression: no leak)", () => {
     if (!bunOk) return;
     const stateDir = mkdtempSync(join(tmpdir(), "self-improve-stop-marker-"));
