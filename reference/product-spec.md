@@ -81,6 +81,7 @@ Each links its job spec in `jobs/`.
 - [`give-each-agent-its-own-workspace.md`](jobs/give-each-agent-its-own-workspace.md)
 - [`remember-across-sessions.md`](jobs/remember-across-sessions.md)
 - [`extend-without-forking.md`](jobs/extend-without-forking.md)
+- [`get-better-the-longer-they-run.md`](jobs/get-better-the-longer-they-run.md)
 - [`get-from-zero-to-a-working-fleet.md`](jobs/get-from-zero-to-a-working-fleet.md)
 - [`deliver-files-i-can-open.md`](jobs/deliver-files-i-can-open.md)
 
