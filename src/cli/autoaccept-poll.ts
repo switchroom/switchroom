@@ -22,9 +22,44 @@
 // start. tmux not running yet, capture-pane erroring, send-keys racing the
 // prompt: all soft-failures.
 
+import { execFileSync } from "node:child_process";
 import { runAutoaccept } from "../agents/autoaccept.js";
 import { runWedgeWatchdog } from "../agents/wedge-watchdog.js";
 import { signalQuotaWall } from "../agents/rate-limit-signal.js";
+
+/**
+ * #2471 — manifest-stall escalation. A turn stuck "Manifesting" with a
+ * Stop-hook error never ends, so the in-pane Esc the watchdog already
+ * tried could not clear it. The cleanest in-container recovery is the
+ * tmux interrupt (`send-keys C-c`) — the SAME primitive the operator's
+ * `! interrupt` uses — which breaks the wedged turn and returns claude to
+ * an idle REPL; the next inbound (or the gateway's own resume path)
+ * carries the work forward. We deliberately do NOT kill the session here
+ * (the watchdog's hard contract forbids destructive tmux verbs); a bare
+ * interrupt is the most aggressive compliant action. If the interrupt
+ * itself does not clear the wedge, the log line below tells the operator
+ * a hard `switchroom agent restart` is warranted.
+ *
+ * Soft-fail throughout — must never throw (never-throw sidecar contract).
+ */
+function requestWedgeRestart(agentName: string, reason: string): void {
+  const socket = `switchroom-${agentName}`;
+  console.error(
+    `[autoaccept-poll] ${agentName}: manifest-stall recovery — ${reason}; ` +
+      `sending tmux interrupt (C-c). If this recurs, a hard ` +
+      `'switchroom agent restart ${agentName}' is warranted.`,
+  );
+  try {
+    execFileSync("tmux", ["-L", socket, "send-keys", "-t", agentName, "C-c"], {
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    console.error(
+      `[autoaccept-poll] ${agentName}: wedge interrupt send-keys failed: ${(err as Error).message}`,
+    );
+  }
+}
 
 async function main(): Promise<void> {
   const agentName = process.argv[2];
@@ -77,9 +112,11 @@ async function main(): Promise<void> {
             void signalQuotaWall(name, resetAt);
           }
         : undefined,
+      // #2471 — wire the manifest-stall escalation (kill/interrupt + handoff).
+      requestRestart: requestWedgeRestart,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} confirmModalFires=${res.confirmModalFires} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(

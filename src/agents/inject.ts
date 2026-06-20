@@ -59,7 +59,11 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   ["/hooks", { description: "List configured hooks", expectsOutput: true }],
   ["/memory", { description: "Open memory picker", expectsOutput: true }],
   ["/model", { description: "Open model picker", expectsOutput: true }],
-  ["/effort", { description: "Set reasoning effort", expectsOutput: true }],
+  // #2471 — `/effort` was previously listed here as an allowlisted inject,
+  // but injecting it surfaces a blocking "Change effort level? 1. Yes /
+  // 2. No" confirmation modal that an agent/headless session can't answer,
+  // wedging the turn. It now lives ONLY in INJECT_BLOCKED — effort is set
+  // non-interactively via the `--effort` CLI flag at session start.
   [
     "/clear",
     { description: "Clear session screen", expectsOutput: false },
@@ -95,6 +99,25 @@ export const INJECT_BLOCKED: ReadonlyMap<string, InjectBlockedMeta> = new Map([
   ["/logout", { reason: "would terminate the agent's auth session" }],
   ["/exit", { reason: "would kill the agent process" }],
   ["/quit", { reason: "would kill the agent process" }],
+  // #2471 — `/effort` opens a blocking "Change effort level? 1. Yes / 2.
+  // No" confirmation modal whenever the session has a cached conversation.
+  // The RAW inject primitive types the command and walks away, leaving the
+  // modal open with no human to answer it — which wedges the pane (the
+  // Stop hook then errors "0/6" and the session spins "Manifesting"
+  // forever). Effort has a DEDICATED, modal-driving path:
+  // `applyEffort` (src/agents/effort-picker.ts), wired to the `/effort`
+  // Telegram command and its inline-keyboard menu, which confirms or
+  // cancels the modal so it never lingers. So `/effort` must NOT ride the
+  // bare inject allowlist — it lives here in the blocklist, routing
+  // operators to the proper command. (Boot effort is set non-interactively
+  // via the `--effort` CLI flag, start.sh.hbs `{{thinkingEffort}}`.)
+  [
+    "/effort",
+    {
+      reason:
+        "leaves a blocking confirmation modal open and wedges the pane; use the /effort command (it drives the modal), not raw inject",
+    },
+  ],
 ]);
 
 /**
@@ -203,6 +226,50 @@ export function validateInjectCommand(command: string): string {
     );
   }
   return bare;
+}
+
+/**
+ * Normalize a slash command for dedupe comparison: trim, collapse
+ * internal whitespace, lowercase. `/effort  high` and `/EFFORT high`
+ * collapse to the same key so re-injected duplicates are recognised
+ * regardless of casing or spacing noise.
+ */
+export function normalizeInjectCommand(command: string): string {
+  return command.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * #2471 — collapse a queue of injected slash commands so the same
+ * command stacking up N times reduces to a single send. This guards the
+ * raw-inject / programmatic path (the one that bypasses
+ * {@link validateInjectCommand}) against the failure observed in #2471,
+ * where repeated identical `/effort high` injections piled up and each
+ * re-armed the blocking modal.
+ *
+ * Semantics:
+ *   - Order-preserving: the FIRST occurrence of each distinct command
+ *     keeps its position; later exact duplicates are dropped.
+ *   - "Distinct" is by {@link normalizeInjectCommand} (case- and
+ *     whitespace-insensitive), so `/effort high` and `/EFFORT  high`
+ *     are treated as the same command.
+ *   - Empty / whitespace-only entries are dropped.
+ *
+ * This is intentionally a pure list transform with no tmux side-effects
+ * so it is trivially unit-testable and reusable by any caller that holds
+ * a backlog of queued injects.
+ */
+export function dedupeInjectQueue(commands: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of commands) {
+    if (typeof raw !== "string") continue;
+    const key = normalizeInjectCommand(raw);
+    if (key.length === 0) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(raw.trim());
+  }
+  return out;
 }
 
 function defaultSocketName(agentName: string): string {

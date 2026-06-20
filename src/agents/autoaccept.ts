@@ -153,6 +153,25 @@ export const PROMPTS: PromptRule[] = [
     keys: ["Enter"],
   },
   {
+    // #2471 — `/effort` confirmation modal:
+    //   Change effort level?
+    //   ❯ 1. Yes, switch to high
+    //     2. No, go back
+    // An agent/headless-driven session can't tap the 1/2 keyboard choice
+    // itself, so the modal blocks indefinitely and wedges the turn (Stop
+    // hook then errors "0/6"; session spins "Manifesting"). We DISMISS it
+    // (Escape == "No, go back") rather than confirm — effort is set
+    // non-interactively via the `--effort` CLI flag at session start, so
+    // the interactive change is never something we want to accept on the
+    // model's behalf. maxFires is bumped because a stack of queued
+    // `/effort` injections can re-arm the modal several times; each
+    // re-arm must be Esc'd again.
+    name: "effort-modal-dismiss",
+    match: /Change.{1,30}effort.{1,30}level/i,
+    keys: ["Escape"],
+    maxFires: 5,
+  },
+  {
     // Generic "Enter to confirm" — last because the more specific
     // matchers above should take precedence on the same screen.
     name: "enter-to-confirm",

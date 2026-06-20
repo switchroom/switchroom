@@ -82,6 +82,48 @@ export const WEDGE_FOOTER_SIGNATURE =
 export const RATE_LIMIT_MENU_SIGNATURE =
   /(?=[\s\S]*Stop and wait for)(?=[\s\S]*(?:usage credits|Upgrade your plan|\/rate-limit-options))/;
 
+/**
+ * #2471 — generic confirmation-MODAL signature, detected by SHAPE rather
+ * than by the strict model-picker footer (`WEDGE_FOOTER_SIGNATURE`). The
+ * dominant case is claude's `/effort` confirmation modal:
+ *   Change effort level?
+ *   ❯ 1. Yes, switch to high
+ *     2. No, go back
+ * which carries NO "to select" / "to navigate" / ↑↓ affordance, so the
+ * generic `WEDGE_FOOTER_SIGNATURE` leaves it untouched — exactly the gap
+ * that wedged overlord on 2026-06-20.
+ *
+ * Two alternative anchors, either sufficient:
+ *   (a) the specific "Change effort level" wording (robust to re-wording
+ *       of the option rows), OR
+ *   (b) a generic "1. Yes … / 2. No …" numbered yes/no selector, which is
+ *       the shape every effort-style confirmation shares.
+ *
+ * Critically, this signature is matched with SHAPE-persistence (the modal
+ * has been continuously PRESENT across N polls) NOT byte-stability — a
+ * modal whose pane re-renders (the manifest timer resetting to 0s, Ink
+ * repaints) never reads byte-identical, which is precisely why the
+ * byte-stability gate missed #2471. See `runWedgeWatchdog`.
+ */
+export const CONFIRM_MODAL_SIGNATURE =
+  /Change\s+effort\s+level|(?=[\s\S]*\b1\.\s*Yes\b)(?=[\s\S]*\b2\.\s*No\b)/i;
+
+/**
+ * #2471 — semantic NO-PROGRESS signature. A turn that is "Manifesting"
+ * (or otherwise spinning under the working footer) AND has a Stop-hook
+ * error visible ("Stop hook error occurred" / "running stop hooks 0/N")
+ * is wedged DESPITE emitting terminal activity: the manifest timer keeps
+ * resetting to 0s, no tool calls land, and the Stop hook never completes,
+ * so the turn never cleanly ends. Naive no-output watchdogs miss this
+ * because the pane is still repainting. Both anchors are required so a
+ * healthy mid-turn spinner (no stop-hook error) never trips it.
+ */
+export const STOP_HOOK_ERROR_SIGNATURE =
+  /Stop hook error|running stop hooks\s+0\/\d+/i;
+
+/** Whether a pane is in the "Manifesting"/spinning working state. */
+export const MANIFESTING_SIGNATURE = /Manifesting|esc to interrupt/i;
+
 const MONTHS: Record<string, number> = {
   jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
   jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
@@ -155,6 +197,27 @@ const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_STABILITY_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 60_000;
 
+// #2471 — shape-persistence + semantic-stall defaults. Configurable via
+// env where the codebase already does this (`SWITCHROOM_WEDGE_*`).
+//
+//   * CONFIRM_MODAL: a confirmation modal must be PRESENT (not
+//     byte-stable) for this many consecutive polls before we Esc it. With
+//     the default 5s cadence, 3 polls ≈ 15s of continuous-present modal.
+//   * MANIFEST_STALL: a Manifesting + stop-hook-error state must persist
+//     for this many consecutive polls before we escalate to kill+restart.
+//     Default 60 polls ≈ 5 min @ 5s — matches the ~27-min overlord wedge
+//     while staying clear of any healthy long turn (which won't carry a
+//     stop-hook error anyway).
+const DEFAULT_CONFIRM_MODAL_POLLS = 3;
+const DEFAULT_MANIFEST_STALL_POLLS = 60;
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 export interface WedgeWatchdogOptions {
   agentName: string;
   /** Poll cadence in ms. Default 5000. */
@@ -200,6 +263,43 @@ export interface WedgeWatchdogOptions {
   onRateLimitMenu?: (agentName: string, resetAt: number | null) => void;
   /** Test seam: clock-injected weekly-reset parser. Default: parseWeeklyReset. */
   parseReset?: (text: string, nowMs: number) => number | null;
+  /**
+   * #2471 — generic confirmation-modal signature, detected by SHAPE
+   * persistence (modal continuously PRESENT across polls) rather than
+   * byte-stability. Catches the `/effort` "Change effort level?" modal
+   * whose re-rendering pane defeats the byte-stable gate. On a
+   * shape-persistent match the watchdog Escs it (the SAME compliant verb —
+   * Esc == "No, go back", never confirms an effort change on the model's
+   * behalf). `null` disables this branch.
+   */
+  confirmModalSignature?: RegExp | null;
+  /**
+   * Consecutive polls a confirmation modal must be PRESENT before Esc.
+   * Default `SWITCHROOM_WEDGE_CONFIRM_POLLS` or 3.
+   */
+  confirmModalPolls?: number;
+  /**
+   * #2471 — semantic no-progress: a "Manifesting" + Stop-hook-error state
+   * that persists past `manifestStallPolls`. The in-pane Esc evidently
+   * could not clear it (the turn never ends), so this escalates to a clean
+   * kill + handoff restart via `requestRestart`. `null` disables the
+   * branch.
+   */
+  manifestStallSignature?: RegExp | null;
+  /**
+   * Consecutive polls a Manifesting + stop-hook-error state must persist
+   * before escalating to restart. Default
+   * `SWITCHROOM_WEDGE_MANIFEST_POLLS` or 60 (~5 min @ 5s).
+   */
+  manifestStallPolls?: number;
+  /**
+   * Called once when a manifest-stall wedge is confirmed: perform the
+   * clean kill + handoff restart (the `resume_interrupted` path). Soft-fail
+   * — must never throw. Default: undefined (detect + log only). The sidecar
+   * wires this to the actual restart so the decision logic stays pure and
+   * testable, and so the destructive action is opt-in.
+   */
+  requestRestart?: (agentName: string, reason: string) => void;
   /** Test seam: cap total polls. Default Infinity (runs until killed). */
   maxPolls?: number;
   /** Test seam: clock override. */
@@ -219,6 +319,11 @@ export interface WedgeWatchdogResult {
   /** Subset of `fires` that were rate-limit (weekly-quota) menu detections —
    *  each also signalled failover. */
   rateLimitFires: number;
+  /** #2471 — subset of `fires` that dismissed a confirmation modal detected
+   *  by SHAPE persistence (the `/effort`-class wedge). */
+  confirmModalFires: number;
+  /** #2471 — count of manifest-stall escalations (kill + handoff restart). */
+  restartEscalations: number;
   /** Total polls executed (bounded only in tests via maxPolls). */
   polls: number;
   reason: "max-polls" | "stopped";
@@ -258,6 +363,21 @@ export async function runWedgeWatchdog(
     opts.rateLimitSignature === null ? null : (opts.rateLimitSignature ?? RATE_LIMIT_MENU_SIGNATURE);
   const onRateLimitMenu = opts.onRateLimitMenu;
   const parseReset = opts.parseReset ?? parseWeeklyReset;
+  // #2471 — shape-persistence confirmation modal + semantic manifest-stall.
+  // `null` disables the branch; `undefined` → default on.
+  const confirmModalSignature =
+    opts.confirmModalSignature === null
+      ? null
+      : (opts.confirmModalSignature ?? CONFIRM_MODAL_SIGNATURE);
+  const confirmModalPolls =
+    opts.confirmModalPolls ?? envInt("SWITCHROOM_WEDGE_CONFIRM_POLLS", DEFAULT_CONFIRM_MODAL_POLLS);
+  const manifestStallSignature =
+    opts.manifestStallSignature === null
+      ? null
+      : (opts.manifestStallSignature ?? MANIFESTING_SIGNATURE);
+  const manifestStallPolls =
+    opts.manifestStallPolls ?? envInt("SWITCHROOM_WEDGE_MANIFEST_POLLS", DEFAULT_MANIFEST_STALL_POLLS);
+  const requestRestart = opts.requestRestart;
   const maxPolls = opts.maxPolls ?? Number.POSITIVE_INFINITY;
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? defaultSleep;
@@ -269,7 +389,14 @@ export async function runWedgeWatchdog(
   let cooldownUntil = 0;
   let fires = 0;
   let rateLimitFires = 0;
+  let confirmModalFires = 0;
+  let restartEscalations = 0;
   let polls = 0;
+  // #2471 — shape-persistence counters (independent of the byte-stable
+  // `stableCount`): how many CONSECUTIVE polls each shape has been PRESENT.
+  let confirmModalPresent = 0;
+  let manifestStallPresent = 0;
+  let confirmCooldownUntil = 0;
 
   while (polls < maxPolls) {
     polls++;
@@ -289,13 +416,74 @@ export async function runWedgeWatchdog(
     // bare Esc alone would just clear the visual block and re-wedge next turn.
     const isRateLimitMenu = !!text && rateLimitSignature !== null && rateLimitSignature.test(text);
 
+    // #2471 — confirmation modal detected by SHAPE persistence (NOT
+    // byte-stability). Precedence below rate-limit, above the byte-stable
+    // blocking-modal branch — this is the `/effort` "Change effort level?"
+    // class whose re-rendering pane defeats `stabilityKey`.
+    //
+    // We do NOT defer to the boot autoaccept PROMPTS here. The boot poller
+    // is idle-timeout bounded (~30s) — it has exited by the time a
+    // mid-session effort modal appears, so the watchdog is the only catcher
+    // left. And the first-run prompts the boot poller owns ("1. I am using
+    // this for local development" / "2. Exit", theme/MCP) do NOT match the
+    // confirmation-modal shape (a "1. Yes / 2. No" selector or the effort
+    // wording), so there is no collision to defer for. The watchdog's
+    // remedy here (Esc) is also identical to the autoaccept effort rule, so
+    // even an overlap would be harmless.
+    const isConfirmModal =
+      !isRateLimitMenu &&
+      !!text &&
+      confirmModalSignature !== null &&
+      confirmModalSignature.test(text);
+
     const isBlockingModal =
       !isRateLimitMenu &&
+      !isConfirmModal &&
       !!text &&
       signature.test(text) &&
       // Defer to the boot autoaccept poller for first-run prompts — those
       // want Enter, not Esc.
       !deferToPrompts.some((p) => p.match.test(text));
+
+    // #2471 — semantic no-progress tracker, INDEPENDENT of the modal
+    // chain: a "Manifesting"/spinning turn with a Stop-hook error present
+    // is wedged despite terminal activity. Tracked every poll (a modal
+    // poll naturally won't match Manifesting, so the two counters don't
+    // collide).
+    const isManifestStall =
+      !!text &&
+      manifestStallSignature !== null &&
+      manifestStallSignature.test(text) &&
+      STOP_HOOK_ERROR_SIGNATURE.test(text);
+    if (isManifestStall) {
+      manifestStallPresent++;
+      if (manifestStallPresent >= manifestStallPolls) {
+        const detail =
+          `Manifesting + stop-hook-error present ${manifestStallPresent} polls ` +
+          `(~${Math.round((manifestStallPresent * pollIntervalMs) / 1000)}s) with no progress`;
+        console.error(
+          `[wedge-watchdog] ${opts.agentName}: manifest-stall wedge — ${detail}; ` +
+            (requestRestart
+              ? "escalating to kill + handoff restart"
+              : "no requestRestart wired — logging only"),
+        );
+        if (requestRestart) {
+          try {
+            requestRestart(opts.agentName, detail);
+          } catch (err) {
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: requestRestart threw: ${(err as Error).message}`,
+            );
+          }
+          restartEscalations++;
+        }
+        // Reset so we don't re-escalate every subsequent poll; require a
+        // fresh full streak (the restart itself should clear the pane).
+        manifestStallPresent = 0;
+      }
+    } else {
+      manifestStallPresent = 0;
+    }
 
     if (isRateLimitMenu) {
       const key = stabilityKey(text);
@@ -341,6 +529,35 @@ export async function runWedgeWatchdog(
         stableCount = 0;
         lastKey = null;
       }
+    } else if (isConfirmModal) {
+      // #2471 — SHAPE persistence, not byte-stability: count consecutive
+      // polls the modal has been PRESENT. A flickering modal (timer
+      // resetting to 0s) advances this counter where the byte-stable
+      // branch never would.
+      confirmModalPresent++;
+      // Modal cleared the byte-stable streak machinery — keep it neutral so
+      // a later byte-stable wedge starts fresh.
+      stableCount = 0;
+      lastKey = null;
+      if (confirmModalPresent >= confirmModalPolls && now() >= confirmCooldownUntil) {
+        console.error(
+          `[wedge-watchdog] ${opts.agentName}: dismissing stuck confirmation modal ` +
+            `(Esc == "No, go back") after ${confirmModalPresent} polls present ` +
+            `(~${Math.round((confirmModalPresent * pollIntervalMs) / 1000)}s, flicker-immune) ` +
+            `— no human to answer it`,
+        );
+        try {
+          send(opts.agentName, ["Escape"]);
+        } catch (err) {
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          );
+        }
+        fires++;
+        confirmModalFires++;
+        confirmCooldownUntil = now() + cooldownMs;
+        confirmModalPresent = 0;
+      }
     } else if (isBlockingModal) {
       const key = stabilityKey(text);
       if (key === lastKey) {
@@ -376,10 +593,20 @@ export async function runWedgeWatchdog(
       // any accumulated streak.
       stableCount = 0;
       lastKey = null;
+      // #2471 — the confirmation modal is gone; reset its shape-present
+      // streak so a re-armed modal must re-accumulate from scratch.
+      confirmModalPresent = 0;
     }
 
     await sleep(pollIntervalMs);
   }
 
-  return { fires, rateLimitFires, polls, reason: "max-polls" };
+  return {
+    fires,
+    rateLimitFires,
+    confirmModalFires,
+    restartEscalations,
+    polls,
+    reason: "max-polls",
+  };
 }
