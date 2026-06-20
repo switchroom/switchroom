@@ -33,6 +33,10 @@ import { homedir } from "node:os";
 import { runGate } from "../self-improve/gate.js";
 import { buildReviewPrompt, REVIEW_SOURCE } from "../self-improve/review-prompt.js";
 import { selfImproveEnabled } from "../self-improve/config.js";
+import {
+  writeReviewContext,
+  clearReviewContext,
+} from "../self-improve/review-context.js";
 import type { TurnMessage } from "../self-improve/types.js";
 
 /** Newest-last window of messages to scan. Bounds the gate's cost and
@@ -118,6 +122,15 @@ function readTranscript(path: string): TurnMessage[] {
   }
   // Bounded tail.
   return out.length > SCAN_WINDOW ? out.slice(-SCAN_WINDOW) : out;
+}
+
+/** Agent state dir — set by start.sh; same fallback as the apply-guard
+ *  hook so both agree on where the review-context marker lives. */
+function resolveStateDir(): string {
+  return (
+    process.env.TELEGRAM_STATE_DIR ??
+    join(homedir(), ".claude", "channels", "telegram")
+  );
 }
 
 function resolveSocketPath(): string {
@@ -215,24 +228,45 @@ function main(): void {
     typeof event.session_id === "string" ? event.session_id : "unknown";
 
   const messages = readTranscript(transcriptPath);
+
+  // Review-turn detection FIRST — BEFORE the gate check, and independent of
+  // it. A turn we injected is itself a transcript whose most-recent user
+  // message starts with the "[self-improvement review]" banner. On such a
+  // turn we (a) clear the review-context marker so the apply-guard stops
+  // enforcing on later NORMAL turns, and (b) never recurse by reviewing a
+  // review. This MUST run before `!gate.tripped` returns: a well-behaved
+  // review (the review prompt + a benign skill edit) trips NO learning
+  // signal, so if the clear sat after the gate check the marker would leak
+  // after every real review — wrongly blocking later normal-turn edits and,
+  // worse, letting a normal-turn edit auto-apply against a STALE benchmark.
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  if (lastUser && lastUser.text.startsWith("[self-improvement review]")) {
+    clearReviewContext(resolveStateDir());
+    process.exit(0);
+  }
+
   const gate = runGate(messages);
 
   // Cost guarantee: no signal → return immediately, zero added work.
   if (!gate.tripped) process.exit(0);
 
-  // Don't recurse: a review turn we injected is itself a transcript; if
-  // its own messages somehow trip the gate, we'd loop. The injected
-  // turn's first user message carries meta.source=self_improve_review;
-  // the transcript flattening drops meta, but the visible prompt starts
-  // with the "[self-improvement review]" banner — bail if the most
-  // recent user message is one of ours.
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  if (lastUser && lastUser.text.startsWith("[self-improvement review]")) {
-    process.exit(0);
-  }
-
   const agentName = process.env.SWITCHROOM_AGENT_NAME ?? "";
   if (!agentName) process.exit(0); // can't route without identity — fail-open
+
+  // Drop the review-context marker BEFORE injecting, so the apply-guard in
+  // the forked review turn enforces the deterministic T1 gate on any skill
+  // edit the review attempts. Best-effort: a marker failure must not stop
+  // the review from being injected (the guard then simply no-ops).
+  try {
+    writeReviewContext(resolveStateDir(), {
+      created_at: new Date().toISOString(),
+      triggering_session: sessionId,
+      chat_id: resolveChatId(),
+      signals: gate.signals,
+    });
+  } catch {
+    /* marker best-effort; review still injects */
+  }
 
   const prompt = buildReviewPrompt(gate.signals);
   injectReview(agentName, prompt, sessionId);

@@ -133,6 +133,15 @@ describe("buildSettingsHooksBlock", () => {
       e.hooks.some(h => h.command.includes("repo-context-pretool.mjs")),
     );
     expect(repoContextEntry?.matcher).toBe("^(Read|Edit|Write|MultiEdit|NotebookEdit|Bash)$");
+
+    // RFC agent-self-improvement slice 2: the deterministic apply-guard
+    // PreToolUse hook is registered and scoped to the file-write tools (it
+    // no-ops unless a self-improve review marker is present).
+    expect(preCmds.some(c => c.includes("self-improve-apply-guard-pretool.mjs"))).toBe(true);
+    const applyGuardEntry = preHooks.find(e =>
+      e.hooks.some(h => h.command.includes("self-improve-apply-guard-pretool.mjs")),
+    );
+    expect(applyGuardEntry?.matcher).toBe("^(Write|Edit|MultiEdit)$");
   });
 
   it("with user hooks declared merges them with switchroom-owned hooks", () => {

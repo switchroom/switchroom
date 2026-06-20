@@ -4470,6 +4470,29 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
           ],
         },
         {
+          // Agent self-improvement APPLY-GUARD — RFC
+          // reference/rfcs/agent-self-improvement.md slice 2. The
+          // DETERMINISTIC T1 gate: when a self-improve review is pending
+          // (the Stop hook dropped a review-context marker), any skill-file
+          // Write/Edit must clear own-skill + diff-cap + evals-present +
+          // evals-pass (no baseline regression) + the daily auto-apply cap,
+          // or it is BLOCKED and downgraded to a T2/T3 pending proposal.
+          // No-op on a normal turn (no marker) — the advisory linter above
+          // still runs. Bundled like skill-validate-pretool because it
+          // imports src/self-improve/*.
+          matcher: "^(Write|Edit|MultiEdit)$",
+          hooks: [
+            {
+              type: "command",
+              command: wrap(
+                "hook:self-improve-apply-guard-pretool",
+                `node "${join(DOCKER_BUNDLED_HOOKS_PATH, "self-improve-apply-guard-pretool.mjs")}"`,
+              ),
+              timeout: 30,
+            },
+          ],
+        },
+        {
           // Catch-all PreToolUse: deterministic tool-call labels (#783).
           // Hook always exits 0; never emits stdout JSON; writes one line
           // to $TELEGRAM_STATE_DIR/tool-labels-${session_id}.jsonl.
