@@ -14731,10 +14731,12 @@ bot.command('model', async ctx => {
 // `/effort` — show or switch the reasoning effort for the live session.
 // The effort sibling of `/model`: bare form renders a five-button menu
 // (low/medium/high/xhigh/max, the live level ✅), a typed form
-// `/effort <level>` sets it directly. Both ride the allowlisted inject
-// primitive (claude's own `/effort` REPL command), session-scoped — boot
-// re-pins the configured default via start.sh's `--effort`. Implementation
-// in effort-command.ts so it's unit-testable without booting the bot.
+// `/effort <level>` sets it directly. Both ride the dedicated `applyEffort`
+// driver (claude's own `/effort` REPL command, with the confirmation modal
+// answered so the pane never wedges — NOT the bare inject primitive, which
+// is blocklisted for `/effort` since #2471), session-scoped — boot re-pins
+// the configured default via start.sh's `--effort`. Implementation in
+// effort-command.ts so it's unit-testable without booting the bot.
 function buildEffortDeps(): EffortCommandDeps {
   return {
     applyEffort: (agent, level) => applyEffort(agent, level),

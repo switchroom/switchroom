@@ -14,8 +14,10 @@ import {
   INJECT_BLOCKED,
   InjectError,
   diffPane,
+  dedupeInjectQueue,
   injectSlashCommand,
   injectSlashCommandWith,
+  normalizeInjectCommand,
   validateInjectCommand,
   type TmuxRunner,
 } from "./inject.js";
@@ -47,6 +49,19 @@ describe("validateInjectCommand", () => {
       })();
       expect(err).toBeInstanceOf(InjectError);
       expect((err as InjectError).code).toBe("blocked");
+    }
+  });
+
+  it("#2471 — blocks /effort (opens a blocking confirmation modal)", () => {
+    for (const variant of ["/effort", "/effort high", "/EFFORT high"]) {
+      try {
+        validateInjectCommand(variant);
+        throw new Error(`expected /effort to be blocked: ${variant}`);
+      } catch (e) {
+        expect(e).toBeInstanceOf(InjectError);
+        expect((e as InjectError).code).toBe("blocked");
+        expect((e as InjectError).message).toMatch(/blocking confirmation modal/i);
+      }
     }
   });
 
@@ -91,6 +106,35 @@ describe("INJECT_COMMANDS metadata", () => {
     const meta = INJECT_COMMANDS.get("/clear");
     expect(meta?.expectsOutput).toBe(false);
     expect(meta?.silentNote).toBeUndefined();
+  });
+});
+
+describe("#2471 dedupeInjectQueue", () => {
+  it("collapses repeated identical commands to a single send (order-preserving)", () => {
+    const queue = ["/effort high", "/effort high", "/effort high"];
+    expect(dedupeInjectQueue(queue)).toEqual(["/effort high"]);
+  });
+
+  it("treats case- and whitespace-variants as the same command", () => {
+    const queue = ["/effort high", "/EFFORT  high", "  /effort   high  "];
+    expect(dedupeInjectQueue(queue)).toEqual(["/effort high"]);
+  });
+
+  it("keeps distinct commands and preserves first-occurrence order", () => {
+    const queue = ["/cost", "/effort high", "/cost", "/status", "/effort high"];
+    expect(dedupeInjectQueue(queue)).toEqual(["/cost", "/effort high", "/status"]);
+  });
+
+  it("drops empty / whitespace-only entries", () => {
+    expect(dedupeInjectQueue(["", "  ", "/cost", ""])).toEqual(["/cost"]);
+  });
+
+  it("returns an empty array for an empty queue", () => {
+    expect(dedupeInjectQueue([])).toEqual([]);
+  });
+
+  it("normalizeInjectCommand collapses casing and whitespace", () => {
+    expect(normalizeInjectCommand("  /EFFORT   high  ")).toBe("/effort high");
   });
 });
 

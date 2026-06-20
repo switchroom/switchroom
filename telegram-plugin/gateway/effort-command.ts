@@ -6,9 +6,14 @@
  * inline keyboard of the five levels the CLI offers
  * (`low · medium · high · xhigh · max`, faster→smarter), the live level
  * marked ✅. A tap types claude's own `/effort <level>` into the agent's
- * tmux pane via the allowlisted inject primitive (`/effort` is on the
- * inject allowlist) — the Claude-native mechanism: the unmodified CLI's
- * REPL command, no API, no SDK, no config mutation.
+ * tmux pane via the dedicated `applyEffort` driver
+ * (src/agents/effort-picker.ts) — the Claude-native mechanism: the
+ * unmodified CLI's REPL command, no API, no SDK, no config mutation.
+ * `applyEffort` (NOT the bare inject primitive) is used deliberately: it
+ * answers the "Change effort level?" confirmation modal so the pane never
+ * wedges. `/effort` is therefore on the inject BLOCKLIST (#2471) — raw
+ * `/inject /effort` would leave that modal open — and this command is the
+ * only sanctioned path.
  *
  * `/effort <level>` does the same non-interactively.
  *

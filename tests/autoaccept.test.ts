@@ -286,6 +286,11 @@ describe("PROMPTS — regex sanity (translated from bin/autoaccept.exp)", () => 
       expected: "provider",
     },
     {
+      // #2471 — the /effort confirmation modal.
+      text: "Change effort level?\n❯ 1. Yes, switch to high\n  2. No, go back",
+      expected: "effort-modal-dismiss",
+    },
+    {
       text: "Press Enter to confirm your selection",
       expected: "enter-to-confirm",
     },
@@ -297,6 +302,14 @@ describe("PROMPTS — regex sanity (translated from bin/autoaccept.exp)", () => 
       expect(hit?.name).toBe(expected);
     });
   }
+
+  it("#2471 — the effort modal rule dismisses with Escape (never confirms)", () => {
+    const rule = PROMPTS.find((p) => p.name === "effort-modal-dismiss");
+    expect(rule).toBeDefined();
+    expect(rule?.keys).toEqual(["Escape"]);
+    // Must allow several re-arms (a stack of queued /effort injects).
+    expect(rule?.maxFires).toBeGreaterThan(1);
+  });
 
   it("does NOT match per-tool 'Yes, I accept this file edit' style prompts", () => {
     // Critical: per-tool permission prompts must fall through to the
