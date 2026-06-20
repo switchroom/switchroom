@@ -10410,12 +10410,6 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
-      // Count surfaced tool steps. This is the single source of truth for the
-      // `tools=` lifecycle field and the `✓ N steps` activity-feed total.
-      // Placed AFTER the surface-tool guard so reply/stream_reply/edit_message/
-      // react are never counted. send_typing and sync_retain are suppressed at
-      // the hook level (computeLabel returns null) so they never arrive here.
-      turn.labeledToolCount++
       // Stop feeding once the FINAL answer has landed — the hand-off where
       // `clearActivitySummary` deletes the feed so the answer is the
       // authoritative surface. Gating on `replyCalled` (any reply) killed the
@@ -10474,6 +10468,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
+        // Count surfaced tool steps — the single source of truth for the `tools=`
+        // lifecycle field and the `✓ N steps` total. Incremented HERE (not at the
+        // top of the case) so the count stays consistent with what the feed
+        // actually surfaces: an empty label (appendActivityLabel → null) or a
+        // label dropped by the post-final-answer reopen guard never inflates it.
+        // Surface tools (reply/react) returned earlier; send_typing/sync_retain
+        // are suppressed at the hook (computeLabel → null) so they never arrive.
+        turn.labeledToolCount++
         // A new tool label = a new live step → re-anchor the heartbeat clock so
         // the " · Ns" elapsed restarts from this step (and the feed itself just
         // advanced, so it isn't stale).
