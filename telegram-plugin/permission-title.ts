@@ -78,6 +78,21 @@ const INTERNAL_MCP_SERVERS = new Set([
 ]);
 
 /**
+ * hostd fleet verbs that take a target agent `name` as a required arg. The
+ * approval card MUST name WHICH agent is targeted (#2469) — "restart an
+ * agent" with no name leaves the operator blind. We interpolate the target
+ * into the curated phrase: "restart an agent in the fleet" → "restart agent
+ * `carrie` in the fleet". Stays generic when `name` is absent (never crash).
+ */
+const HOSTD_AGENT_TARGET_VERBS = new Set([
+  "mcp__hostd__agent_restart",
+  "mcp__hostd__agent_start",
+  "mcp__hostd__agent_stop",
+  "mcp__hostd__agent_logs",
+  "mcp__hostd__agent_exec",
+]);
+
+/**
  * Build the multi-line card body for an approval prompt.
  *
  *   🔐 <b>Gymbro</b> wants to edit: supplement-log.md
@@ -86,10 +101,23 @@ const INTERNAL_MCP_SERVERS = new Set([
  * Output is HTML-escaped for `parse_mode: 'HTML'`. The agent name is
  * capitalized for the sentence; dropped (with "wants to") when null —
  * the bridge client can be anonymous during early-boot edge cases.
+ *
+ * The `why:` line is the CALLER's stated rationale — the `reason`/`why`
+ * argument on the tool input, NOT the tool's static JSONSchema
+ * `description`. The schema description is documentation (it can contain
+ * literal tokens like `$SWITCHROOM_AGENT_NAME`), so surfacing it as the
+ * "why" reads like an un-interpolated variable and discards the agent's
+ * actual reason (#2469). We only fall back to "not provided" — never to
+ * the schema description.
  */
 export function formatPermissionCardBody(opts: {
   toolName: string;
   inputPreview: string | undefined;
+  /**
+   * The tool's static JSONSchema description. Retained for the signature
+   * (callers still pass it) but deliberately NOT used as the `why:` line —
+   * see #2469. The caller's rationale comes from the input args instead.
+   */
   description: string | undefined;
   agentName: string | null;
 }): string {
@@ -104,7 +132,10 @@ export function formatPermissionCardBody(opts: {
     lines.push(`🔐 ${escapeTgHtml(capFirst(action))}`);
   }
 
-  const rawWhy = (opts.description ?? "").replace(/\s+/g, " ").trim();
+  // why: the caller-supplied rationale (`reason`/`why` arg), never the
+  // static schema description (#2469).
+  const callerReason = callerSuppliedReason(opts.inputPreview);
+  const rawWhy = (callerReason ?? "").replace(/\s+/g, " ").trim();
   const truncatedWhy =
     rawWhy.length > DESCRIPTION_LINE_MAX
       ? rawWhy.slice(0, DESCRIPTION_LINE_MAX - 1) + "…"
@@ -194,7 +225,7 @@ function naturalMcpAction(
   const server = parts.length >= 2 ? parts[1]! : "";
   const curated = MCP_TOOL_DESCRIPTIONS[toolName];
   if (curated) {
-    const phrase = lowerFirst(curated);
+    const phrase = hostdAgentPhrase(toolName, input) ?? lowerFirst(curated);
     return INTERNAL_MCP_SERVERS.has(server)
       ? phrase
       : `${phrase} (${prettyMcpServer(server)})`;
@@ -215,6 +246,37 @@ function naturalMcpAction(
       : `${verb} (${prettyMcpServer(server)})`;
   }
   return `use ${toolName}`;
+}
+
+/**
+ * For the hostd `agent_*` fleet verbs, build an action phrase that NAMES the
+ * target agent (#2469) — "restart agent `carrie` in the fleet". The verb is
+ * derived from the tool name (`agent_restart` → "restart"); `agent_logs` /
+ * `agent_exec` get bespoke phrasing. Returns null when the tool isn't a
+ * name-targeted hostd verb or no `name` arg is present, so the caller falls
+ * back to the generic curated phrase (never crashes on a missing name).
+ */
+function hostdAgentPhrase(
+  toolName: string,
+  input: Record<string, unknown> | null,
+): string | null {
+  if (!HOSTD_AGENT_TARGET_VERBS.has(toolName)) return null;
+  const name = input ? readString(input, "name") : null;
+  if (!name) return null;
+  switch (toolName) {
+    case "mcp__hostd__agent_restart":
+      return `restart agent \`${name}\` in the fleet`;
+    case "mcp__hostd__agent_start":
+      return `start agent \`${name}\` in the fleet`;
+    case "mcp__hostd__agent_stop":
+      return `stop agent \`${name}\` in the fleet`;
+    case "mcp__hostd__agent_logs":
+      return `read agent \`${name}\`'s container logs`;
+    case "mcp__hostd__agent_exec":
+      return `run a read-only inspection inside agent \`${name}\``;
+    default:
+      return null;
+  }
 }
 
 /**
@@ -445,6 +507,19 @@ function parseInput(raw: string | undefined): Record<string, unknown> | null {
 function readString(input: Record<string, unknown>, key: string): string | null {
   const value = input[key];
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * The caller's stated rationale for a tool call — the `reason` (or `why`)
+ * argument it passed. This is the agent's actual justification, which is
+ * what belongs on the `why:` line of the approval card. Returns null when
+ * no reason was supplied (caller renders "not provided") — we never fall
+ * back to the tool's static schema description (#2469).
+ */
+function callerSuppliedReason(inputPreview: string | undefined): string | null {
+  const input = parseInput(inputPreview);
+  if (!input) return null;
+  return readString(input, "reason") ?? readString(input, "why");
 }
 
 function skillBasenameFromPath(input: Record<string, unknown>): string | null {
