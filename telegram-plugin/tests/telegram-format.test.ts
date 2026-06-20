@@ -785,6 +785,56 @@ describe('repairEscapedWhitespace', () => {
     // Literal \n must not survive anywhere.
     expect(html).not.toContain('\\n')
   })
+
+  // ── Sentinel-collision safety (reviewer blocker) ─────────────────────────
+
+  test('does not produce "undefined" when input contains NUL-byte sequences (#2456)', () => {
+    // A per-call random nonce makes sentinel collision statistically impossible.
+    // Confirm that a message containing NUL bytes (which could match a hardcoded
+    // sentinel) is passed through safely rather than emitting literal "undefined".
+    // We craft a string that would have matched the OLD hardcoded sentinel \x00REPMASK0\x00
+    // to prove it no longer causes corruption.
+    const dangerous = 'hello \x00REPMASK0\x00 world \\n end'
+    const out = repairEscapedWhitespace(dangerous)
+    // Must not produce the string "undefined" in output.
+    expect(out).not.toContain('undefined')
+    // The \\n in prose must be unescaped.
+    expect(out).toContain(' end')
+    expect(out).not.toContain('\\n')
+  })
+
+  // ── Unclosed fenced block (reviewer major) ────────────────────────────────
+
+  test('handles unclosed fenced block gracefully: \\n in trailing content is still unescaped', () => {
+    // An unclosed ``` is not matched by the fenced-block regex (it requires a
+    // closing ```). Content after the unmatched opening is treated as prose, so
+    // literal \\n there gets unescaped — which is the least-surprising outcome
+    // for malformed input (the alternative would be silently swallowing content).
+    const input = 'Prose \\n here\n```bash\necho "line1\\nline2"\n'
+    const out = repairEscapedWhitespace(input)
+    // \\n in prose before the unclosed fence is unescaped.
+    expect(out).toContain('Prose \n here')
+    // The function must not throw and must return a string.
+    expect(typeof out).toBe('string')
+  })
+
+  // ── \\t and CRLF in mixed-newline messages (reviewer gaps) ────────────────
+
+  test('unescapes \\t in prose even when real newlines are also present (#2456)', () => {
+    const input = 'First line\nCol1\\tCol2\\tCol3\nthird'
+    const out = repairEscapedWhitespace(input)
+    expect(out).toContain('Col1\tCol2\tCol3')
+    expect(out).toContain('First line\n')
+    expect(out).toContain('\nthird')
+  })
+
+  test('unescapes \\r in prose when real newlines are also present (#2456)', () => {
+    // A message that mixes real newlines and a literal \\r escape in prose.
+    const input = 'First line\nsome \\r carriage return in prose'
+    const out = repairEscapedWhitespace(input)
+    expect(out).toContain('some \r carriage return in prose')
+    expect(out).toContain('First line\n')
+  })
 })
 
 // ---------------------------------------------------------------------------

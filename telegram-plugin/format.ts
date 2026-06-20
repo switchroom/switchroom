@@ -579,20 +579,37 @@ function escapeUnescapedEntities(inner: string): string {
 export function repairEscapedWhitespace(text: string): string {
   if (!/\\[nrt"\\]/.test(text)) return text
 
+  // Per-call random nonce prevents sentinel collision: if user text happens to
+  // contain our placeholder bytes, the restore step would look up an out-of-range
+  // index and produce "undefined" in the Telegram output. A nonce that is unique
+  // per invocation makes the sentinel statistically impossible to collide with.
+  const nonce = Math.random().toString(36).slice(2)
+  const CODE_MASK_PH = `\x00RM${nonce}_`
+  const BACKSLASH_PH = `\x00BK${nonce}_`
+
   // Mask fenced code blocks (``` ... ```) and inline code spans (` ... `)
   // so the unescape pass never touches their content.
+  //
+  // Fenced blocks are extracted first. Only CLOSED fenced blocks (with a
+  // matching closing ```) are masked — an unclosed fence is left as-is so the
+  // inline-code pass below won't misparse the two leading backticks as an empty
+  // inline span and expose the block's interior.
+  //
+  // Inline code uses `[^\`\n]+` (one or more non-backtick, non-newline chars)
+  // matching the same definition that markdownToHtml uses, so the masked regions
+  // are consistent with what the downstream pipeline treats as code.
   const codeMasks: string[] = []
-  const CODE_MASK_PH = '\x00REPMASK'
 
   const masked = text
-    // Fenced code blocks first (may span real newlines or literal \n sequences)
+    // Closed fenced code blocks only (``` ... ``` with a matching closer).
     .replace(/```[\s\S]*?```/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
       return `${CODE_MASK_PH}${idx}\x00`
     })
-    // Inline code spans (single backtick, non-greedy, no embedded backticks)
-    .replace(/`[^`]*`/g, (m) => {
+    // Inline code spans: at least one character between backticks, no embedded
+    // backtick or newline (matches markdownToHtml's /`([^`\n]+)`/ definition).
+    .replace(/`[^`\n]+`/g, (m) => {
       const idx = codeMasks.length
       codeMasks.push(m)
       return `${CODE_MASK_PH}${idx}\x00`
@@ -600,17 +617,17 @@ export function repairEscapedWhitespace(text: string): string {
 
   // Order matters: protect existing `\\` first so `\\n` stays as a literal
   // backslash + n and doesn't become a newline.
-  const BACKSLASH_PH = '\x00BKSL\x00'
   const unescaped = masked
     .replace(/\\\\/g, BACKSLASH_PH)
     .replace(/\\n/g, '\n')
     .replace(/\\r/g, '\r')
     .replace(/\\t/g, '\t')
     .replace(/\\"/g, '"')
-    .replace(new RegExp(BACKSLASH_PH, 'g'), '\\')
+    .replace(new RegExp(BACKSLASH_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '\\')
 
   // Restore masked code spans verbatim.
-  return unescaped.replace(new RegExp(`${CODE_MASK_PH}(\\d+)\x00`, 'g'), (_m, idx) => codeMasks[Number(idx)])
+  const restoreRe = new RegExp(`${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`, 'g')
+  return unescaped.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
 }
 
 // ---------------------------------------------------------------------------
