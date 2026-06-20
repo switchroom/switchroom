@@ -91,3 +91,69 @@ export function atomicWriteJsonSync(
 ): void {
   atomicWriteFileSync(destPath, JSON.stringify(value, null, 2) + "\n", mode);
 }
+
+/**
+ * Config-file variant of atomicWriteFileSync for non-secret config files
+ * (e.g. switchroom.yaml) that may live on single-file bind mounts inside
+ * the hostd container.
+ *
+ * On a single-file bind mount the kernel rejects rename(2) with EBUSY (and
+ * occasionally EXDEV or EINVAL on some container runtimes) because the bind
+ * mount point IS the inode — you cannot atomically swap it out from under
+ * the mount entry.  The standard atomic pattern therefore fails before any
+ * fleet change reaches the file.  For a non-secret config file the narrow
+ * non-atomic window of an in-place rewrite is acceptable: the file holds no
+ * secret material and concurrent readers will see either the old bytes or
+ * the new bytes — a partial read is the only risk, and it is bounded by a
+ * single write(2) + fsync(2) on a file that is kilobytes in size.
+ *
+ * Strategy:
+ *   1. Try the fully-atomic rename path first (identical to atomicWriteFileSync).
+ *   2. If rename(2) throws EBUSY | EXDEV | EINVAL, fall back to an in-place
+ *      rewrite: open with O_WRONLY | O_TRUNC, write, fsync, close.
+ *   3. Any other error is re-thrown unchanged (atomicity is NOT silently
+ *      swallowed for any other failure class).
+ *
+ * **DATA-LOSS WINDOW (accepted risk):** If write(2) fails after O_TRUNC has
+ * already truncated the file, the file is left EMPTY — not merely partially
+ * written, but zero bytes.  A concurrent reader or config loader that opens
+ * the file in this window will see an empty YAML document and may error or
+ * revert to defaults.  This risk is accepted and bounded: it only materialises
+ * on the EBUSY/EXDEV/EINVAL fallback path (i.e. single-file bind mounts), and
+ * only for non-secret config files — never for vault entries or OAuth tokens.
+ *
+ * Do NOT use this function for secret-bearing files (vault entries, OAuth
+ * credentials) — those must always go through atomicWriteFileSync.
+ */
+export function writeConfigFileSync(
+  destPath: string,
+  contents: string | Buffer,
+  mode = 0o644,
+): void {
+  try {
+    atomicWriteFileSync(destPath, contents, mode);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EBUSY" && code !== "EXDEV" && code !== "EINVAL") {
+      throw err;
+    }
+    // Bind-mount target — fall back to in-place rewrite.
+    const buf = typeof contents === "string" ? Buffer.from(contents, "utf-8") : contents;
+    let fd: number | null = null;
+    try {
+      // `mode` is only consulted by the kernel when O_CREAT is set; without
+      // O_CREAT it is ignored and the file's existing inode permissions are
+      // preserved — which is the desired behaviour for an in-place rewrite.
+      fd = openSync(destPath, constants.O_WRONLY | constants.O_TRUNC, mode);
+      writeSync(fd, buf, 0, buf.length, 0);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = null;
+    } catch (fallbackErr) {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* already closed */ }
+      }
+      throw fallbackErr;
+    }
+  }
+}
