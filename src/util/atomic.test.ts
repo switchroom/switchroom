@@ -175,4 +175,48 @@ describe("writeConfigFileSync (#2457 — EBUSY bind-mount fallback)", () => {
     // openSync(p, O_WRONLY|O_TRUNC) on a nonexistent file throws ENOENT
     expect(() => writeConfigFileSync(p, "content\n")).toThrow();
   });
+
+  it("EBUSY fallback: preserves the file's existing inode permissions (mode unchanged)", () => {
+    // Create the file with a restrictive mode so we can verify it is left intact
+    // after an in-place rewrite. O_TRUNC without O_CREAT does not touch the mode.
+    const p = join(dir, "restricted.yaml");
+    fs.writeFileSync(p, "old: true\n", { mode: 0o600 });
+    expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+    });
+
+    writeConfigFileSync(p, "new: true\n");
+
+    expect(fs.readFileSync(p, "utf8")).toBe("new: true\n");
+    // The in-place fallback must not alter the inode's permission bits.
+    expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  });
+
+  it("EBUSY fallback: fsyncSync throwing EIO propagates the error and closes the fd (no leak)", () => {
+    const p = join(dir, "switchroom.yaml");
+    fs.writeFileSync(p, "agents: {}\n", { mode: 0o644 });
+
+    // First: enter the fallback path via a mocked EBUSY on rename.
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error("EBUSY: resource busy or locked"), { code: "EBUSY" });
+    });
+
+    // Spy on closeSync so we can assert it is called even when fsyncSync throws.
+    const closeSpy = vi.spyOn(fs, "closeSync");
+    // Make fsyncSync throw EIO once (simulates a hardware/kernel I/O error after
+    // the file has been opened with O_TRUNC).
+    const fsyncSpy = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+      throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+    });
+
+    expect(() => writeConfigFileSync(p, "new content\n")).toThrow("EIO");
+
+    // The fd must have been closed despite the fsyncSync failure — no leak.
+    expect(closeSpy).toHaveBeenCalled();
+
+    fsyncSpy.mockRestore();
+    closeSpy.mockRestore();
+  });
 });

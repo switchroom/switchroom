@@ -114,6 +114,14 @@ export function atomicWriteJsonSync(
  *   3. Any other error is re-thrown unchanged (atomicity is NOT silently
  *      swallowed for any other failure class).
  *
+ * **DATA-LOSS WINDOW (accepted risk):** If write(2) fails after O_TRUNC has
+ * already truncated the file, the file is left EMPTY — not merely partially
+ * written, but zero bytes.  A concurrent reader or config loader that opens
+ * the file in this window will see an empty YAML document and may error or
+ * revert to defaults.  This risk is accepted and bounded: it only materialises
+ * on the EBUSY/EXDEV/EINVAL fallback path (i.e. single-file bind mounts), and
+ * only for non-secret config files — never for vault entries or OAuth tokens.
+ *
  * Do NOT use this function for secret-bearing files (vault entries, OAuth
  * credentials) — those must always go through atomicWriteFileSync.
  */
@@ -133,6 +141,9 @@ export function writeConfigFileSync(
     const buf = typeof contents === "string" ? Buffer.from(contents, "utf-8") : contents;
     let fd: number | null = null;
     try {
+      // `mode` is only consulted by the kernel when O_CREAT is set; without
+      // O_CREAT it is ignored and the file's existing inode permissions are
+      // preserved — which is the desired behaviour for an in-place rewrite.
       fd = openSync(destPath, constants.O_WRONLY | constants.O_TRUNC, mode);
       writeSync(fd, buf, 0, buf.length, 0);
       fsyncSync(fd);
