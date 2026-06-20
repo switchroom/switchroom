@@ -55,6 +55,30 @@ function writeTranscript(name: string, msgs: Array<{ role: string; text: string 
   return p;
 }
 
+/**
+ * Write a transcript whose entries may be either plain text OR a list of
+ * `tool_use` parts (the real assistant-message shape), so the gate's
+ * Edit/Bash fix-fingerprinting can be exercised faithfully.
+ */
+type Entry =
+  | { role: "user" | "assistant"; text: string }
+  | {
+      role: "assistant";
+      tools: Array<{ name: string; input: Record<string, unknown> }>;
+    };
+function writeToolTranscript(name: string, entries: Entry[]): string {
+  const p = join(tmp, name);
+  const lines = entries.map((e) => {
+    const content =
+      "tools" in e
+        ? e.tools.map((t) => ({ type: "tool_use", name: t.name, input: t.input }))
+        : e.text;
+    return JSON.stringify({ type: e.role, message: { role: e.role, content } });
+  });
+  writeFileSync(p, lines.join("\n") + "\n");
+  return p;
+}
+
 describe("self-improve-stop hook — fail-open + cost guarantee", () => {
   it("exits 0 silently on empty / non-JSON stdin", () => {
     if (!bunOk) return;
@@ -298,6 +322,89 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
       expect(reviewIsPending(stateDir)).toBe(false); // marker cleared — no leak
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// #2462 follow-up: the repeated-manual-fix detector fingerprinted an Edit by
+// FILE PATH only, so several DISTINCT edits to one file in a normal turn
+// mis-read as "the same fix applied N×" and tripped a review. The fingerprint
+// is now content-aware: only a genuinely identical re-applied edit recurs.
+describe("self-improve-stop hook — repeated-manual-fix is content-aware (#2462 follow-up)", () => {
+  function injectedNothing(received: string[]): boolean {
+    return received.join("") === "";
+  }
+
+  it("does NOT fire on several DISTINCT edits to the same file (normal iteration)", async () => {
+    if (!bunOk) return;
+    const socketPath = join(tmp, "gw-distinct.sock");
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+    try {
+      // Three real, DIFFERENT edits to the same path — exactly what iterating
+      // on a fix looks like. Path-only fingerprinting tripped here; content-
+      // aware fingerprinting must not.
+      const file = "/repo/src/self-improve/review-prompt.ts";
+      const tp = writeToolTranscript("distinct-edits.jsonl", [
+        { role: "user", text: "Make the change." },
+        {
+          role: "assistant",
+          tools: [
+            { name: "Edit", input: { file_path: file, old_string: "const A = 1;", new_string: "const A = 2;" } },
+            { name: "Edit", input: { file_path: file, old_string: "foo(bar)", new_string: "foo(baz)" } },
+            { name: "Edit", input: { file_path: file, old_string: "// todo", new_string: "// done" } },
+          ],
+        },
+        { role: "user", text: "thanks" },
+      ]);
+      const r = run(JSON.stringify({ session_id: "distinct", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+      });
+      expect(r.status).toBe(0);
+      await new Promise((res) => setTimeout(res, 200));
+      expect(injectedNothing(received)).toBe(true); // no false repeated-manual-fix
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
+    }
+  });
+
+  it("STILL fires on a genuinely identical remediation re-applied (signal preserved)", async () => {
+    if (!bunOk) return;
+    const socketPath = join(tmp, "gw-identical.sock");
+    const received: string[] = [];
+    const server: Server = await new Promise((resolve) => {
+      const s = createServer((conn) => {
+        conn.on("data", (d) => received.push(d.toString("utf-8")));
+      });
+      s.listen(socketPath, () => resolve(s));
+    });
+    try {
+      // The SAME Bash remediation run twice — the real "I had to redo the same
+      // fix" signal the detector exists to catch. Must still trip.
+      const cmd = "rm -f /tmp/stale.lock && systemctl restart worker";
+      const tp = writeToolTranscript("identical-fix.jsonl", [
+        { role: "user", text: "It's stuck." },
+        { role: "assistant", tools: [{ name: "Bash", input: { command: cmd } }] },
+        { role: "user", text: "stuck again." },
+        { role: "assistant", tools: [{ name: "Bash", input: { command: cmd } }] },
+      ]);
+      const r = run(JSON.stringify({ session_id: "identical", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        SWITCHROOM_GATEWAY_SOCKET: socketPath,
+        SWITCHROOM_SELF_IMPROVE_CHAT_ID: "9",
+      });
+      expect(r.status).toBe(0);
+      await new Promise((res) => setTimeout(res, 200));
+      const envelope = JSON.parse(received.join("").trim());
+      expect(envelope.inbound.text).toContain("repeated-manual-fix");
+    } finally {
+      await new Promise<void>((res) => server.close(() => res()));
     }
   });
 });

@@ -57,6 +57,20 @@ function readStdin(): string {
 }
 
 /**
+ * Cheap, stable, non-crypto string hash (djb2) → short base36 digest. Used
+ * only to make Edit/Write fix fingerprints content-aware (NOT a security
+ * primitive): two distinct edits to the same file get distinct fingerprints,
+ * an identical re-applied edit gets the same one.
+ */
+function shortHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
  * Flatten one Claude Code transcript entry's content to text. Handles
  * the nested `{type, message:{role, content}}` shape and the flat
  * `{role, content}` shape; content may be a string or a list of parts
@@ -89,14 +103,37 @@ function flatten(entry: unknown): TurnMessage | null {
       if (p.type === "text" && typeof p.text === "string") {
         parts.push(p.text);
       } else if (p.type === "tool_use" && typeof p.name === "string") {
-        // Compact "Name(primary-arg)" — enough for the gate's
-        // Edit(...)/Bash(...) fix fingerprints without dumping payloads.
+        // Compact "Name(arg)" — enough for the gate's Edit(...)/Bash(...) fix
+        // fingerprints without dumping payloads.
         const input = (p.input ?? {}) as Record<string, unknown>;
-        const arg =
+        const file =
           (typeof input.file_path === "string" && input.file_path) ||
-          (typeof input.command === "string" && input.command) ||
           (typeof input.path === "string" && input.path) ||
           "";
+        let arg: string;
+        if (typeof input.command === "string") {
+          // Bash: the command IS the fix content — keep it whole so an
+          // identical remediation re-run still fingerprints as a repeat.
+          arg = input.command;
+        } else if (file) {
+          // Edit/Write/MultiEdit: the repeated-manual-fix signal must
+          // fingerprint the FIX (the actual change), NOT just the file path.
+          // A path-only fingerprint mis-reads normal iterative editing — a
+          // few DISTINCT edits to one file in a turn — as "the same fix
+          // applied N×" (issue #2462 follow-up). Append a short content hash
+          // so only a genuinely identical re-applied edit recurs.
+          const editish = [
+            typeof input.old_string === "string" ? input.old_string : "",
+            typeof input.new_string === "string" ? input.new_string : "",
+            typeof input.content === "string" ? input.content : "",
+            input.edits !== undefined ? JSON.stringify(input.edits) : "",
+          ];
+          arg = editish.some((x) => x.length > 0)
+            ? `${file} #${shortHash(editish.join(" "))}`
+            : file;
+        } else {
+          arg = "";
+        }
         parts.push(`${p.name}(${arg})`);
       }
     }
