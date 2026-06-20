@@ -563,34 +563,71 @@ function escapeUnescapedEntities(inner: string): string {
  * The message then ships to Telegram intact and the user sees literal
  * `\n\n` in the chat instead of paragraph breaks.
  *
- * Heuristic: if the text contains ZERO real newlines AND has at least one
- * literal `\n`, `\r`, or `\t` escape sequence, the caller almost certainly
- * intended those as real whitespace and the client serializer ate them.
- * Unescape them (also `\\` and `\"`). If the text has any real newline,
- * trust the caller exactly as given and do nothing — legitimate content
- * may contain a literal `\n` inside a shell snippet or regex.
+ * Unescape literal `\n`, `\r`, `\t`, and `\"` sequences everywhere EXCEPT
+ * inside code spans (inline backtick spans and fenced ``` blocks). Those
+ * regions are masked with placeholders before the unescape pass so that a
+ * literal `\n` a user typed inside a shell snippet or regex is preserved
+ * verbatim. The genuine escaped-backslash sequence `\\n` (which the user
+ * intended as a literal backslash + n, not a newline) is handled by
+ * protecting `\\` before touching `\n`.
  *
- * This is intentionally narrow: it only fires on the clear bug signature
- * (multi-line-looking content collapsed to one physical line). False
- * positives on a single-line message that legitimately contains `\n` are
- * possible but rare — users writing single-line shell snippets typically
- * wrap them in backticks, and this runs before markdown→HTML so the
- * unescape has no effect on text inside fenced code blocks if it already
- * has real newlines around them.
+ * This deliberately fires even when the message contains real newlines —
+ * the old whole-message heuristic ("bail if any real newline exists") was
+ * too broad and prevented repair of mixed messages that had both real
+ * newlines and stray literal `\n` escape sequences outside code spans.
  */
 export function repairEscapedWhitespace(text: string): string {
-  if (text.includes('\n') || text.includes('\r')) return text
   if (!/\\[nrt"\\]/.test(text)) return text
-  // Order matters: protect existing `\\` first so `\\n` stays as `\n`
-  // literal and doesn't become a newline.
-  const BACKSLASH_PH = '\x00BKSL\x00'
-  return text
+
+  // Per-call random nonce prevents sentinel collision: if user text happens to
+  // contain our placeholder bytes, the restore step would look up an out-of-range
+  // index and produce "undefined" in the Telegram output. A nonce that is unique
+  // per invocation makes the sentinel statistically impossible to collide with.
+  const nonce = Math.random().toString(36).slice(2)
+  const CODE_MASK_PH = `\x00RM${nonce}_`
+  const BACKSLASH_PH = `\x00BK${nonce}_`
+
+  // Mask fenced code blocks (``` ... ```) and inline code spans (` ... `)
+  // so the unescape pass never touches their content.
+  //
+  // Fenced blocks are extracted first. Only CLOSED fenced blocks (with a
+  // matching closing ```) are masked — an unclosed fence is left as-is so the
+  // inline-code pass below won't misparse the two leading backticks as an empty
+  // inline span and expose the block's interior.
+  //
+  // Inline code uses `[^\`\n]+` (one or more non-backtick, non-newline chars)
+  // matching the same definition that markdownToHtml uses, so the masked regions
+  // are consistent with what the downstream pipeline treats as code.
+  const codeMasks: string[] = []
+
+  const masked = text
+    // Closed fenced code blocks only (``` ... ``` with a matching closer).
+    .replace(/```[\s\S]*?```/g, (m) => {
+      const idx = codeMasks.length
+      codeMasks.push(m)
+      return `${CODE_MASK_PH}${idx}\x00`
+    })
+    // Inline code spans: at least one character between backticks, no embedded
+    // backtick or newline (matches markdownToHtml's /`([^`\n]+)`/ definition).
+    .replace(/`[^`\n]+`/g, (m) => {
+      const idx = codeMasks.length
+      codeMasks.push(m)
+      return `${CODE_MASK_PH}${idx}\x00`
+    })
+
+  // Order matters: protect existing `\\` first so `\\n` stays as a literal
+  // backslash + n and doesn't become a newline.
+  const unescaped = masked
     .replace(/\\\\/g, BACKSLASH_PH)
     .replace(/\\n/g, '\n')
     .replace(/\\r/g, '\r')
     .replace(/\\t/g, '\t')
     .replace(/\\"/g, '"')
-    .replace(new RegExp(BACKSLASH_PH, 'g'), '\\')
+    .replace(new RegExp(BACKSLASH_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '\\')
+
+  // Restore masked code spans verbatim.
+  const restoreRe = new RegExp(`${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`, 'g')
+  return unescaped.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
 }
 
 // ---------------------------------------------------------------------------
