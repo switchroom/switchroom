@@ -30,6 +30,43 @@ import { resolveSelfImproveConfig } from "./config.js";
 export const REVIEW_SOURCE = "self_improve_review";
 
 /**
+ * The banner that opens every review prompt. Single source of truth so the
+ * builder (below) and the review-turn DETECTOR (`isReviewTurn`) can never
+ * drift apart — a drift there is exactly what let the re-fire loop through
+ * (the detector matched a string the builder no longer emitted at offset 0).
+ */
+export const REVIEW_BANNER = "[self-improvement review]";
+
+/**
+ * Is `text` the transcript of a review turn WE injected? Used by the Stop
+ * hook to (a) short-circuit so a review never reviews itself, and (b) drop
+ * our own injected prompts from the gate's scan window.
+ *
+ * Robust to the TWO shapes the review prompt takes in a transcript:
+ *   - bare banner — the raw `buildReviewPrompt` output (unit tests, and a
+ *     safety net), where the banner is at offset 0; and
+ *   - channel-wrapped — the REAL runtime shape. The gateway wraps every
+ *     injected inbound in a `<channel source="…" source="self_improve_review"
+ *     …>\n<prompt>` envelope before it lands in the transcript, so the banner
+ *     is NOT at offset 0. The brittle `startsWith(BANNER)` check missed this
+ *     entirely → the guard never fired → the gate re-injected every turn
+ *     (issue #2462). We match our own `meta.source` on the envelope, or the
+ *     banner immediately after the opening tag.
+ */
+export function isReviewTurn(text: string): boolean {
+  if (!text) return false;
+  if (text.startsWith(REVIEW_BANNER)) return true;
+  const env = /^<channel\b[^>]*>/i.exec(text);
+  if (env) {
+    if (env[0].includes(`source="${REVIEW_SOURCE}"`)) return true;
+    if (text.slice(env[0].length).replace(/^\s+/, "").startsWith(REVIEW_BANNER)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Build the review prompt text. `signals` is the gate's output; the
  * prompt is bounded (signals are already capped by the gate).
  */
@@ -38,7 +75,7 @@ export function buildReviewPrompt(signals: LearningSignal[]): string {
   const lines: string[] = [];
 
   lines.push(
-    "[self-improvement review] The turn-end gate detected a learning " +
+    `${REVIEW_BANNER} The turn-end gate detected a learning ` +
       "signal — a correction or pattern that should bind on future runs. " +
       "Run a focused, forked review. Use ONLY memory tools (recall/retain/" +
       "directives) and skill read/write tools (Read/Write/Edit under your " +

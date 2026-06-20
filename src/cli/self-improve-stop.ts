@@ -31,7 +31,11 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 import { runGate } from "../self-improve/gate.js";
-import { buildReviewPrompt, REVIEW_SOURCE } from "../self-improve/review-prompt.js";
+import {
+  buildReviewPrompt,
+  isReviewTurn,
+  REVIEW_SOURCE,
+} from "../self-improve/review-prompt.js";
 import { selfImproveEnabled } from "../self-improve/config.js";
 import {
   writeReviewContext,
@@ -231,21 +235,35 @@ function main(): void {
 
   // Review-turn detection FIRST — BEFORE the gate check, and independent of
   // it. A turn we injected is itself a transcript whose most-recent user
-  // message starts with the "[self-improvement review]" banner. On such a
-  // turn we (a) clear the review-context marker so the apply-guard stops
-  // enforcing on later NORMAL turns, and (b) never recurse by reviewing a
-  // review. This MUST run before `!gate.tripped` returns: a well-behaved
-  // review (the review prompt + a benign skill edit) trips NO learning
-  // signal, so if the clear sat after the gate check the marker would leak
-  // after every real review — wrongly blocking later normal-turn edits and,
-  // worse, letting a normal-turn edit auto-apply against a STALE benchmark.
+  // message is the review prompt. On such a turn we (a) clear the
+  // review-context marker so the apply-guard stops enforcing on later NORMAL
+  // turns, and (b) never recurse by reviewing a review. This MUST run before
+  // `!gate.tripped` returns: a well-behaved review (the review prompt + a
+  // benign skill edit) trips NO learning signal, so if the clear sat after
+  // the gate check the marker would leak after every real review — wrongly
+  // blocking later normal-turn edits and, worse, letting a normal-turn edit
+  // auto-apply against a STALE benchmark.
+  //
+  // `isReviewTurn` (not a bare `startsWith`) is load-bearing: the gateway
+  // wraps every injected inbound in a `<channel …>` envelope before it lands
+  // in the transcript, so the banner is NOT at offset 0. The old prefix check
+  // never matched the real shape → the guard never fired → the review
+  // re-injected every turn in an unbounded loop (issue #2462).
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  if (lastUser && lastUser.text.startsWith("[self-improvement review]")) {
+  if (lastUser && isReviewTurn(lastUser.text)) {
     clearReviewContext(resolveStateDir());
     process.exit(0);
   }
 
-  const gate = runGate(messages);
+  // Defense in depth (also #2462): never let the gate INGEST our own injected
+  // review prompts. They embed the prior turn's evidence, which the directive
+  // detector would re-count as a fresh "restated rule" — a self-amplifying
+  // feedback loop that climbs past threshold on every pass. Filtering them out
+  // of the scan window keeps the gate measuring the operator's turn, not its
+  // own output, even when a real message and a review inbound batch together
+  // (so `lastUser` above isn't the review and the short-circuit is missed).
+  const scanMessages = messages.filter((m) => !isReviewTurn(m.text));
+  const gate = runGate(scanMessages);
 
   // Cost guarantee: no signal → return immediately, zero added work.
   if (!gate.tripped) process.exit(0);
