@@ -224,7 +224,11 @@ export function evaluateQuotaWatchAccount(args: {
     return { kind: "skip", accountLabel: label, reason: "stale-snapshot" };
   }
 
-  const currentHealth = classifyHealth(snap);
+  // #2494 Bug A — classify against THIS tick's clock so the refill
+  // normalization uses the same `now` the rest of the decision does (the
+  // default `new Date()` would diverge from a frozen test clock / a replayed
+  // tick and mis-zero a still-future reset window).
+  const currentHealth = classifyHealth(snap, new Date(now));
 
   // Unknown (probe failed) or blocked — skip entirely.
   if (currentHealth === "unknown" || currentHealth === "blocked") {

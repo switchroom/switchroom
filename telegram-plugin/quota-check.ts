@@ -54,6 +54,15 @@ export type QuotaUtilization = {
   representativeClaim: string | null;
   overageStatus: string | null;
   overageDisabledReason: string | null;
+  /**
+   * #2494 Bug C — header-presence markers. Mirror of the field in
+   * `src/auth/quota.ts` (kept in sync across the bundle boundary). The
+   * utilization fields are always numeric (a missing header coalesces to 0),
+   * so on their own they cannot tell a genuine 0% from a filled-0 thin probe.
+   * Optional → unset means "real probe" (legacy snapshots / fixtures).
+   */
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
 };
 
 export type QuotaResult =
@@ -120,8 +129,12 @@ export function parseQuotaHeaders(headers: Headers): QuotaResult {
   return {
     ok: true,
     data: {
+      // #2494 Bug C — coalesce missing window to 0 for back-compat but record
+      // which windows were actually present (both-absent returned ok:false).
       fiveHourUtilizationPct: (fiveHour ?? 0) * 100,
       sevenDayUtilizationPct: (sevenDay ?? 0) * 100,
+      fiveHourUtilPresent: fiveHour != null,
+      sevenDayUtilPresent: sevenDay != null,
       fiveHourResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-5h-reset"),
       sevenDayResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-7d-reset"),
       representativeClaim: headers.get("anthropic-ratelimit-unified-representative-claim"),

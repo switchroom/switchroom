@@ -19,6 +19,7 @@
  */
 
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
+import { isProbeThin, refillNormalizedUtils } from '../src/auth/quota.js';
 import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
 
 // ── shared types ─────────────────────────────────────────────────────
@@ -84,19 +85,48 @@ const SERVE_BLOCKING_OVERAGE_REASONS = new Set<string>(['out_of_credits']);
  *   - everything else → healthy
  *   - probe failure → unknown
  */
-export function classifyHealth(snap: AccountSnapshot): AccountHealth {
+export function classifyHealth(snap: AccountSnapshot, now: Date = new Date()): AccountHealth {
   if (!snap.quota) return 'unknown';
   const q = snap.quota;
+  // #2494 Bug C — a thin/headerless probe (no real utilization signal on
+  // EITHER window) must not masquerade as a confident 0% / healthy. Treat it
+  // as unknown so the card surfaces a data-quality gap, not "healthy".
+  if (isProbeThin(q)) return 'unknown';
   // A serve-blocking overage reason wins over the util gate: a credits-dead
   // account reads 0% util but 429s on every call, so it must show 'blocked'
   // (drives the display, quota-watch, and the auto-fallback idempotency guard).
   if (q.overageDisabledReason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(q.overageDisabledReason)) {
     return 'blocked';
   }
-  const max = Math.max(q.fiveHourUtilizationPct, q.sevenDayUtilizationPct);
+  // #2494 Bug A — read utilization through the refill normalization: a window
+  // whose reset has already passed has rolled since the snapshot was captured,
+  // so its stale high utilization must be treated as 0%. A just-refilled
+  // account self-corrects to healthy without an extra probe.
+  const norm = refillNormalizedUtils(q, now);
+  const max = Math.max(norm.fiveHourUtilizationPct, norm.sevenDayUtilizationPct);
   if (max >= 99.5) return 'blocked';
   if (max >= THROTTLING_THRESHOLD_PCT) return 'throttling';
   return 'healthy';
+}
+
+/**
+ * #2494 Bug C — why is a BLOCKED account blocked? Two materially different
+ * causes that the card must render distinctly:
+ *   - 'billing-dead' — a genuine serve-blocking `overageDisabledReason`
+ *     (out_of_credits). NOT a timer: it stays dead until billing is fixed.
+ *   - 'quota-exhausted' — a util window is maxed but recovers when that window
+ *     rolls. Show the reset countdown.
+ * Returns null for non-blocked accounts.
+ */
+export type BlockedReason = 'billing-dead' | 'quota-exhausted';
+
+export function blockedReason(snap: AccountSnapshot, now: Date = new Date()): BlockedReason | null {
+  if (classifyHealth(snap, now) !== 'blocked') return null;
+  const q = snap.quota!;
+  if (q.overageDisabledReason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(q.overageDisabledReason)) {
+    return 'billing-dead';
+  }
+  return 'quota-exhausted';
 }
 
 /**
@@ -232,21 +262,41 @@ function renderAccountRow(
   }
 
   const q = snap.quota;
-  const fiveStr = fmtPct(q.fiveHourUtilizationPct);
-  const sevenStr = fmtPct(q.sevenDayUtilizationPct);
+  // #2494 Bug C — a thin/headerless probe carries no real utilization; render
+  // it as a data-quality gap, never a confident "0% / 0%".
+  if (isProbeThin(q)) {
+    lines.push(
+      `${marker}<code>${escapeHtml(snap.label)}</code>  <i>quota unknown (thin probe)</i>`,
+    );
+    return lines;
+  }
+  // #2494 Bug A — show refill-normalized utilization so a window that has
+  // already reset reads its true post-refill 0%, not the stale capture value.
+  const norm = refillNormalizedUtils(q, now);
+  const fiveStr = fmtPct(norm.fiveHourUtilizationPct);
+  const sevenStr = fmtPct(norm.sevenDayUtilizationPct);
   lines.push(
     `${marker}<code>${escapeHtml(snap.label)}</code>  ${fiveStr} / ${sevenStr}`,
   );
 
-  const health = classifyHealth(snap);
+  const health = classifyHealth(snap, now);
   if (health === 'blocked') {
-    // Surface only the recovery countdown — the binding window's reset
-    // is the only thing that matters until then.
+    const reason = blockedReason(snap, now);
+    if (reason === 'billing-dead') {
+      // #2494 Bug C — billing-dead is NOT a timer. Surface the real reason and
+      // make clear it does not recover on a window roll.
+      lines.push(
+        `  <i>billing disabled (${escapeHtml(q.overageDisabledReason ?? 'out_of_credits')}) — won't recover until billing is fixed</i>`,
+      );
+      return lines;
+    }
+    // quota-exhausted (recoverable): surface only the recovery countdown — the
+    // binding window's reset is the only thing that matters until then.
     const win = bindingWindow(q);
     const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
     const winLabel = win === '5h' ? '5-hour' : '7-day';
     lines.push(
-      `  <i>back ${formatAbsolute(reset, tz)} (in ${formatRelative(reset, now)}, ${winLabel} cap)</i>`,
+      `  <i>quota exhausted — back ${formatAbsolute(reset, tz)} (in ${formatRelative(reset, now)}, ${winLabel} cap)</i>`,
     );
     return lines;
   }
@@ -300,7 +350,7 @@ export function renderAuthSnapshotFormat2(
   const order: AccountHealth[] = ['blocked', 'throttling', 'healthy', 'unknown'];
   const grouped = new Map<AccountHealth, AccountSnapshot[]>();
   for (const s of snapshots) {
-    const h = classifyHealth(s);
+    const h = classifyHealth(s, now);
     if (!grouped.has(h)) grouped.set(h, []);
     grouped.get(h)!.push(s);
   }
@@ -346,9 +396,9 @@ export function renderAuthSnapshotFormat2(
 export function recommendation(snapshots: AccountSnapshot[], now: Date = new Date()): string {
   const active = snapshots.find((s) => s.isActive);
   if (!active) return 'No active account set.';
-  const activeHealth = classifyHealth(active);
+  const activeHealth = classifyHealth(active, now);
   const others = snapshots.filter((s) => !s.isActive);
-  const healthyAlt = others.find((s) => classifyHealth(s) === 'healthy');
+  const healthyAlt = others.find((s) => classifyHealth(s, now) === 'healthy');
 
   if (activeHealth === 'healthy') {
     return `Recommendation: stay on ${active.label}.`;
@@ -365,18 +415,78 @@ export function recommendation(snapshots: AccountSnapshot[], now: Date = new Dat
     if (healthyAlt) {
       return `Recommendation: active ${active.label} is BLOCKED — switch to ${healthyAlt.label} now.`;
     }
-    // No healthy alternative; surface the earliest recovery time.
-    const earliestRecovery = pickEarliestRecovery(snapshots, now);
-    if (earliestRecovery) {
-      return `All accounts blocked. Earliest recovery: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
-    }
-    return `All accounts blocked. Run /auth add to attach another subscription.`;
+    // #2494 Bug B — no healthy alternative. Do NOT collapse to "All accounts
+    // blocked": that's only honest when EVERY account is truly walled with no
+    // usable or imminently-refilling slot. Distinguish the buckets first.
+    return summarizeNoHealthyAlt(snapshots, now);
   }
 
   // unknown
   return `Active ${active.label}: quota probe failed; broker last_seen unknown.`;
 }
 
+/**
+ * #2494 Bug B — honest fleet summary when the active account is blocked and no
+ * fully-healthy alternative exists. Buckets every account so the summary never
+ * claims "all blocked" while a throttling / imminently-refilling / usable slot
+ * exists. Surfaces the soonest refill ETA across the fleet.
+ */
+function summarizeNoHealthyAlt(snapshots: AccountSnapshot[], now: Date): string {
+  let throttlingLabel: string | null = null;
+  let allTrulyBlocked = true;
+  for (const s of snapshots) {
+    const h = classifyHealth(s, now);
+    if (h === 'throttling') {
+      // A throttling account is still usable.
+      if (!throttlingLabel) throttlingLabel = s.label;
+      allTrulyBlocked = false;
+    } else if (h === 'healthy' || h === 'unknown') {
+      // Healthy is handled by the caller; unknown is not provably blocked.
+      allTrulyBlocked = false;
+    } else if (h === 'blocked' && blockedReason(s, now) === 'quota-exhausted') {
+      // Quota-exhausted recovers WHEN its window rolls — but only counts as
+      // "refilling" (not terminal) if it actually carries a future reset on the
+      // binding window. A maxed window with no reset timestamp has no imminent
+      // recovery and stays in the truly-blocked bucket (Bug B: "blocked = ≥99.5%
+      // AND no imminent reset").
+      if (s.quota) {
+        const win = bindingWindow(s.quota);
+        const at = win === '5h' ? s.quota.fiveHourResetAt : s.quota.sevenDayResetAt;
+        if (at && at.getTime() > now.getTime()) allTrulyBlocked = false;
+      }
+    }
+  }
+
+  const earliestRecovery = pickEarliestRecovery(snapshots, now);
+
+  if (throttlingLabel) {
+    // A usable (throttling) slot exists — recommend it, with the soonest refill.
+    const eta = earliestRecovery
+      ? ` Soonest full refill: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`
+      : '';
+    return `No fully-healthy account; ${throttlingLabel} is throttling but still usable.${eta}`;
+  }
+
+  if (!allTrulyBlocked) {
+    // No usable slot now, but at least one account is refilling — not all dead.
+    if (earliestRecovery) {
+      return `All accounts at capacity; soonest refill: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
+    }
+    return `All accounts at capacity — waiting on a window refill.`;
+  }
+
+  // Genuinely all blocked (billing-dead with no upcoming reset, or no data).
+  if (earliestRecovery) {
+    return `All accounts blocked. Earliest recovery: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
+  }
+  return `All accounts blocked. Run /auth add to attach another subscription.`;
+}
+
+/**
+ * Earliest refill ETA across the fleet. #2494 Bug A/B — only counts a future
+ * reset on the binding window; a window whose reset has already passed has
+ * refilled (handled by refill normalization) and is not "recovery pending".
+ */
 function pickEarliestRecovery(
   snapshots: AccountSnapshot[],
   now: Date,
@@ -384,6 +494,7 @@ function pickEarliestRecovery(
   let best: { label: string; at: Date } | null = null;
   for (const s of snapshots) {
     if (!s.quota) continue;
+    if (isProbeThin(s.quota)) continue;
     const win = bindingWindow(s.quota);
     const at = win === '5h' ? s.quota.fiveHourResetAt : s.quota.sevenDayResetAt;
     if (!at || at.getTime() <= now.getTime()) continue;
@@ -656,6 +767,10 @@ export function reviveLastQuota(snap: LastQuotaSnapshot | null | undefined): Quo
     representativeClaim: snap.representativeClaim,
     overageStatus: snap.overageStatus,
     overageDisabledReason: snap.overageDisabledReason,
+    // #2494 Bug C — forward the header-presence markers so a cached thin probe
+    // still renders as `unknown`, not a confident 0%.
+    fiveHourUtilPresent: snap.fiveHourUtilPresent,
+    sevenDayUtilPresent: snap.sevenDayUtilPresent,
   };
 }
 

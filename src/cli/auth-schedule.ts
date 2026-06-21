@@ -33,6 +33,7 @@ import type {
   ProbeQuotaData,
 } from "../auth/broker/client.js";
 import { SERVE_BLOCKING_OVERAGE_REASONS } from "../auth/broker/account-eligibility.js";
+import { refillNormalizedUtils } from "../auth/quota.js";
 
 // ─── Pure model ──────────────────────────────────────────────────────────
 
@@ -50,6 +51,18 @@ export interface WindowSnapshot {
    * REASONS); `org_level_disabled` / null / unknown are benign → false.
    */
   overageServeBlocking: boolean;
+  /**
+   * #2494 Bug C — the live overage-disabled reason carried by the probe/cache,
+   * when serve-blocking. Surfaced verbatim by the renderer so a billing-dead
+   * account names the real reason ("out_of_credits"), not just a state word.
+   */
+  overageReason: string | null;
+  /**
+   * #2494 Bug C — true when the probe came back thin/headerless (no real
+   * utilization signal). Distinct from a genuine 0% so the renderer can show
+   * "unknown" rather than a confident "0%".
+   */
+  probeThin: boolean;
 }
 
 /** Is a probe/cache overage reason serve-blocking? Mirrors the broker's
@@ -60,6 +73,10 @@ function overageReasonBlocks(reason: string | null | undefined): boolean {
 
 export type AccountWindowState =
   | "out-of-credits"
+  // #2494 Bug C — recoverable quota exhaustion: a util window is maxed but the
+  // account comes back when that window rolls. Distinct from the terminal
+  // billing-dead "out-of-credits"; carries a reset countdown.
+  | "quota-exhausted"
   | "healthy"
   | "5h-walled"
   | "weekly-walled"
@@ -95,6 +112,8 @@ export function resolveWindow(
       weeklyResetAt: d.sevenDayResetAt,
       source: "live",
       overageServeBlocking: overageReasonBlocks(d.overageDisabledReason),
+      overageReason: d.overageDisabledReason ?? null,
+      probeThin: isThin(d),
     };
   }
   const lq = account.last_quota;
@@ -106,6 +125,8 @@ export function resolveWindow(
       weeklyResetAt: lq.sevenDayResetAt ? new Date(lq.sevenDayResetAt) : null,
       source: "cached",
       overageServeBlocking: overageReasonBlocks(lq.overageDisabledReason),
+      overageReason: lq.overageDisabledReason ?? null,
+      probeThin: isThin(lq),
     };
   }
   return {
@@ -115,7 +136,20 @@ export function resolveWindow(
     weeklyResetAt: null,
     source: "none",
     overageServeBlocking: false,
+    overageReason: null,
+    probeThin: false,
   };
+}
+
+/**
+ * #2494 Bug C — a probe is thin when BOTH window utilization headers were
+ * explicitly absent. Markers unset (legacy snapshot / fixture) → not thin.
+ */
+function isThin(d: {
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
+}): boolean {
+  return d.fiveHourUtilPresent === false && d.sevenDayUtilPresent === false;
 }
 
 /**
@@ -131,11 +165,28 @@ export function classifyState(args: {
   now: Date;
 }): AccountWindowState {
   const { exhausted, exhaustedUntil, window, now } = args;
-  // A serve-blocking overage (out_of_credits) means the account is dead even at
-  // 0% util — it wins over every util-based verdict (healthy/weekly/5h). Same
-  // strict-allowlist semantics as the broker; org_level_disabled is benign and
-  // never sets window.overageServeBlocking.
+  // #2494 Bug C — a serve-blocking overage (out_of_credits) means the account
+  // is billing-dead even at 0% util — it wins over every util-based verdict.
+  // This is genuine "out-of-credits": NOT a timer, recovers only when billing
+  // is fixed. Same strict-allowlist semantics as the broker.
   if (window.overageServeBlocking) return "out-of-credits";
+  // #2494 Bug C — a thin/headerless probe carries no real utilization; it must
+  // not pose as a confident reading. Treat as unprobed (renders "unknown").
+  if (window.probeThin) return "unprobed";
+  // #2494 Bug A — read utilization through refill normalization: a window
+  // whose reset has already passed has rolled since capture, so its stale high
+  // util is treated as 0%. A just-refilled account self-corrects to healthy.
+  const norm = refillNormalizedUtils(
+    {
+      fiveHourUtilizationPct: window.fiveHourPct ?? 0,
+      sevenDayUtilizationPct: window.weeklyPct ?? 0,
+      fiveHourResetAt: window.fiveHourResetAt,
+      sevenDayResetAt: window.weeklyResetAt,
+    },
+    now,
+  );
+  const fivePct = window.fiveHourPct === null ? null : norm.fiveHourUtilizationPct;
+  const weeklyPct = window.weeklyPct === null ? null : norm.sevenDayUtilizationPct;
   const hasWindowData =
     window.fiveHourPct !== null ||
     window.weeklyPct !== null ||
@@ -145,13 +196,24 @@ export function classifyState(args: {
   // ledger: even when `exhausted_until` points at a sooner 5h reset, once that
   // 5h window clears the weekly cap still blocks the account until its (days-
   // away) reset. So a near-100% weekly takes precedence over "5h-walled".
+  // (Refill-normalized weeklyPct is already 0 once the weekly reset passes.)
   if (
-    window.weeklyPct !== null &&
-    window.weeklyPct >= WEEKLY_WALL_PCT &&
+    weeklyPct !== null &&
+    weeklyPct >= WEEKLY_WALL_PCT &&
     window.weeklyResetAt !== null &&
     window.weeklyResetAt.getTime() > now.getTime()
   ) {
     return "weekly-walled";
+  }
+  // #2494 Bug C — a maxed 5h window with a future reset is recoverable quota
+  // exhaustion (comes back when the window rolls), distinct from billing-dead.
+  if (
+    fivePct !== null &&
+    fivePct >= WEEKLY_WALL_PCT &&
+    window.fiveHourResetAt !== null &&
+    window.fiveHourResetAt.getTime() > now.getTime()
+  ) {
+    return "quota-exhausted";
   }
   if (!exhausted) {
     // No exhaustion ledger AND no probe/cache data → we genuinely don't know.
@@ -232,19 +294,29 @@ export function formatResetDay(d: Date, tz?: string): string {
   return `${dow} ${hm}`;
 }
 
-/** 5h cell, raw (uncolored): "40% · 1h 2m" or "—". */
+/** 5h cell, raw (uncolored): "40% · 1h 2m", "unknown", or "—".
+ *  #2494 — refill-aware (a passed reset reads 0%) and thin-aware. */
 export function formatFiveHourCell(w: WindowSnapshot, now: Date): string {
+  if (w.probeThin) return "unknown";
   if (w.fiveHourPct === null) return EM_DASH;
+  const refilled =
+    w.fiveHourResetAt !== null && w.fiveHourResetAt.getTime() <= now.getTime();
+  const pct = refilled ? 0 : w.fiveHourPct;
   const reset = w.fiveHourResetAt
     ? ` · ${formatDuration(w.fiveHourResetAt.getTime() - now.getTime())}`
     : "";
-  return `${Math.round(w.fiveHourPct)}%${reset}`;
+  return `${Math.round(pct)}%${reset}`;
 }
 
-/** Weekly cell, raw (uncolored): "8% · Sun 11:00 (5d 3h)" or "—". */
+/** Weekly cell, raw (uncolored): "8% · Sun 11:00 (5d 3h)", "unknown", or "—".
+ *  #2494 — refill-aware and thin-aware. */
 export function formatWeeklyCell(w: WindowSnapshot, now: Date, tz?: string): string {
+  if (w.probeThin) return "unknown";
   if (w.weeklyPct === null && w.weeklyResetAt === null) return EM_DASH;
-  const pct = w.weeklyPct === null ? EM_DASH : `${Math.round(w.weeklyPct)}%`;
+  const refilled =
+    w.weeklyResetAt !== null && w.weeklyResetAt.getTime() <= now.getTime();
+  const pct =
+    w.weeklyPct === null ? EM_DASH : `${Math.round(refilled ? 0 : w.weeklyPct)}%`;
   if (!w.weeklyResetAt) return pct;
   const rel = formatDuration(w.weeklyResetAt.getTime() - now.getTime());
   return `${pct} · ${formatResetDay(w.weeklyResetAt, tz)} (${rel})`;
@@ -264,15 +336,22 @@ export function formatStateCell(row: ScheduleRow, now: Date): string {
   const horizon =
     row.state === "weekly-walled"
       ? (row.window.weeklyResetAt ?? row.exhaustedUntil)
-      : row.state === "5h-walled"
+      : row.state === "5h-walled" || row.state === "quota-exhausted"
         ? (row.window.fiveHourResetAt ?? row.exhaustedUntil)
         : row.exhaustedUntil;
   const rel = horizon ? ` · ${formatDuration(horizon.getTime() - now.getTime())}` : "";
   switch (row.state) {
     case "out-of-credits":
-      // No util-window reset to count down to — overage is off until billing
-      // is fixed, not until a window rolls. State name carries the meaning.
-      return "out-of-credits";
+      // #2494 Bug C — billing-dead. No util-window reset to count down to —
+      // overage is off until billing is fixed, not until a window rolls. Name
+      // the real reason so it reads distinctly from a recoverable exhaustion.
+      return row.window.overageReason
+        ? `billing disabled (${row.window.overageReason})`
+        : "billing disabled";
+    case "quota-exhausted":
+      // #2494 Bug C — recoverable: comes back when the 5h window rolls. Carries
+      // the reset countdown, unlike the terminal billing-dead state above.
+      return `quota-exhausted${rel}`;
     case "healthy":
       return "healthy";
     case "unprobed":
@@ -313,6 +392,9 @@ function colorState(text: string, state: AccountWindowState, color: boolean): st
       return chalk.red(text);
     case "weekly-walled":
       return chalk.red(text);
+    case "quota-exhausted":
+      // Recoverable — amber, not the terminal red of billing-dead.
+      return chalk.yellow(text);
     case "5h-walled":
       return chalk.yellow(text);
     default:

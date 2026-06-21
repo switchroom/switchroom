@@ -48,7 +48,34 @@ export type QuotaUtilization = {
   representativeClaim: string | null;
   overageStatus: string | null;
   overageDisabledReason: string | null;
+  /**
+   * #2494 Bug C — header-presence markers. The two utilization fields are
+   * always numeric (a missing header coalesces to 0 for back-compat), so on
+   * their own they cannot distinguish "genuinely 0% used" from "the probe
+   * came back thin / headerless and we filled 0". These flags carry that
+   * distinction so renderers can show `unknown` for an absent window instead
+   * of a confident `0%`. Optional (default-true semantics) so cached
+   * snapshots / hand-built fixtures that predate the field still read as a
+   * real probe — a snapshot that genuinely measured 0% leaves them unset.
+   */
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
 };
+
+/**
+ * #2494 Bug C — is this probe "thin" (no real utilization signal)? True only
+ * when BOTH windows are explicitly marked absent. A probe with at least one
+ * present window (the existing "7d missing, 5h present" case) is NOT thin.
+ * When the markers are unset (cached snapshot / legacy fixture) we treat the
+ * probe as real, never thin — absence of the flag means "predates the flag",
+ * not "headerless".
+ */
+export function isProbeThin(q: {
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
+}): boolean {
+  return q.fiveHourUtilPresent === false && q.sevenDayUtilPresent === false;
+}
 
 export type QuotaResult =
   | { ok: true; data: QuotaUtilization }
@@ -92,14 +119,69 @@ export function parseQuotaHeaders(headers: Headers): QuotaResult {
   return {
     ok: true,
     data: {
+      // #2494 Bug C — we still coalesce a missing window header to 0 so the
+      // numeric fields stay non-null for back-compat, but record which
+      // windows were actually present so renderers can tell a real 0% from a
+      // filled-0. (Both-absent already returned ok:false above, so at least
+      // one of these is true here.)
       fiveHourUtilizationPct: (fiveHour ?? 0) * 100,
       sevenDayUtilizationPct: (sevenDay ?? 0) * 100,
+      fiveHourUtilPresent: fiveHour != null,
+      sevenDayUtilPresent: sevenDay != null,
       fiveHourResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-5h-reset"),
       sevenDayResetAt: parseEpochHeader(headers, "anthropic-ratelimit-unified-7d-reset"),
       representativeClaim: headers.get("anthropic-ratelimit-unified-representative-claim"),
       overageStatus: headers.get("anthropic-ratelimit-unified-overage-status"),
       overageDisabledReason: headers.get("anthropic-ratelimit-unified-overage-disabled-reason"),
     },
+  };
+}
+
+// ── #2494 Bug A — refill-aware utilization normalization ──────────────────
+//
+// A cached/probed snapshot carries its window RESET timestamps alongside the
+// utilization. When `now` has crossed a window's reset, that window has rolled
+// since capture and its old utilization is stale — the window is empty again.
+// Every classifier (card `classifyHealth`, `auth schedule` `classifyState`,
+// the fleet `recommendation`) must read through this normalization so a
+// just-refilled account self-corrects across the refill boundary with zero
+// extra probes, regardless of snapshot age.
+
+export interface RefillNormalizedUtils {
+  fiveHourUtilizationPct: number;
+  sevenDayUtilizationPct: number;
+  /** True when the 5h window's reset has passed (treated as refilled → 0%). */
+  fiveHourRefilled: boolean;
+  /** True when the 7d window's reset has passed (treated as refilled → 0%). */
+  sevenDayRefilled: boolean;
+}
+
+/**
+ * Given a snapshot's per-window utilization + reset timestamps and the
+ * current clock, return utilization normalized for refills: any window whose
+ * `resetAt` is non-null and `<= now` is treated as `0%` (the window rolled
+ * after the snapshot was captured). Windows without a reset timestamp, or
+ * whose reset is still in the future, pass through unchanged.
+ */
+export function refillNormalizedUtils(
+  q: {
+    fiveHourUtilizationPct: number;
+    sevenDayUtilizationPct: number;
+    fiveHourResetAt: Date | null;
+    sevenDayResetAt: Date | null;
+  },
+  now: Date,
+): RefillNormalizedUtils {
+  const nowMs = now.getTime();
+  const fiveHourRefilled =
+    q.fiveHourResetAt != null && q.fiveHourResetAt.getTime() <= nowMs;
+  const sevenDayRefilled =
+    q.sevenDayResetAt != null && q.sevenDayResetAt.getTime() <= nowMs;
+  return {
+    fiveHourUtilizationPct: fiveHourRefilled ? 0 : q.fiveHourUtilizationPct,
+    sevenDayUtilizationPct: sevenDayRefilled ? 0 : q.sevenDayUtilizationPct,
+    fiveHourRefilled,
+    sevenDayRefilled,
   };
 }
 

@@ -186,7 +186,11 @@ export async function runFleetAutoFallback(
   // Idempotency guard: don't swap a healthy active account, even if
   // the trigger event said quota_exhausted. The event may be stale
   // (event posted, window rolled over, gateway picked it up late).
-  const oldHealth = classifyHealth(oldSnap);
+  // #2494 Bug A — classify against this run's `now` so the refill
+  // normalization uses the same clock as the rest of the decision (a default
+  // `new Date()` would diverge from `deps.now` and could mis-zero a window
+  // whose reset is still future relative to the event's clock).
+  const oldHealth = classifyHealth(oldSnap, now);
   if (oldHealth === 'healthy') {
     return {
       kind: 'no-eligible-target',

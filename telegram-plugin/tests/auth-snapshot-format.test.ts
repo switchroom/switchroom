@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyHealth,
+  blockedReason,
   bindingWindow,
   formatRelative,
   formatAbsolute,
@@ -557,13 +558,26 @@ describe('buildSnapshotsFromCachedState', () => {
 // ── recommendation logic edge cases ──────────────────────────────────
 
 describe('recommendation', () => {
-  it('warns "all blocked" when no healthy alternative exists', () => {
+  it('#2494 Bug B: does NOT say "all blocked" when an alternative is refilling', () => {
+    // a@x is maxed with no reset (truly blocked); b@x is maxed but its weekly
+    // window resets in ~2d (refilling). The honest summary must surface the
+    // refill, not collapse to a false "All accounts blocked".
     const snaps: AccountSnapshot[] = [
       snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }),
       snap({ label: 'b@x', quota: quota({ sevenDayUtilizationPct: 100, sevenDayResetAt: new Date('2026-05-17T00:00:00Z') }) }),
     ];
     const out = recommendation(snaps, NOW);
-    expect(out).toMatch(/All accounts blocked\. Earliest recovery: b@x in 1d/);
+    expect(out).not.toContain('All accounts blocked');
+    expect(out).toMatch(/soonest refill: b@x in 1d/);
+  });
+
+  it('#2494 Bug B: says "all blocked" only when EVERY account is truly walled (no reset)', () => {
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }),
+      snap({ label: 'b@x', quota: quota({ sevenDayUtilizationPct: 100 }) }),
+    ];
+    const out = recommendation(snaps, NOW);
+    expect(out).toContain('All accounts blocked');
   });
 
   it('reports throttling-with-no-alt when active is throttling and others are too', () => {
@@ -573,5 +587,122 @@ describe('recommendation', () => {
     ];
     const out = recommendation(snaps, NOW);
     expect(out).toContain('throttling; no healthy alternative');
+  });
+
+  it('#2494 Bug B: mixed blocked-active + throttling-other → recommends the throttling slot, never "all blocked"', () => {
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }),
+      snap({ label: 'b@x', quota: quota({ fiveHourUtilizationPct: 85 }) }), // throttling, usable
+    ];
+    const out = recommendation(snaps, NOW);
+    expect(out).not.toContain('All accounts blocked');
+    expect(out).toContain('b@x is throttling but still usable');
+  });
+});
+
+// ── #2494 Bug A — refill-aware classification ───────────────────────────
+
+describe('#2494 Bug A — refill-aware classifyHealth', () => {
+  it('a pre-refill snapshot read AFTER its 5h reset classifies healthy', () => {
+    // Captured at 100% on a 5h window whose reset is 3 min in the PAST → rolled.
+    const pastReset = new Date(NOW.getTime() - 3 * 60_000);
+    const s = snap({
+      isActive: true,
+      quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: pastReset, sevenDayUtilizationPct: 1 }),
+    });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+  });
+
+  it('a maxed weekly whose reset has PASSED classifies healthy', () => {
+    const pastWeekly = new Date(NOW.getTime() - 60_000);
+    const s = snap({ quota: quota({ sevenDayUtilizationPct: 100, sevenDayResetAt: pastWeekly, fiveHourUtilizationPct: 2 }) });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+  });
+
+  it('a maxed window with a FUTURE reset still classifies blocked (not yet refilled)', () => {
+    const futureReset = new Date(NOW.getTime() + 60 * 60_000);
+    const s = snap({ quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) });
+    expect(classifyHealth(s, NOW)).toBe('blocked');
+  });
+
+  it('the just-refilled lone active account is not falsely "all blocked" in the summary', () => {
+    const pastReset = new Date(NOW.getTime() - 3 * 60_000);
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: pastReset, sevenDayUtilizationPct: 1 }) }),
+    ];
+    expect(recommendation(snaps, NOW)).toContain('stay on a@x');
+  });
+});
+
+// ── #2494 Bug C — quota-exhausted vs billing-dead, thin probe ────────────
+
+describe('#2494 Bug C — blockedReason + thin probe', () => {
+  it('out_of_credits → billing-dead', () => {
+    const s = snap({ quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) });
+    expect(classifyHealth(s, NOW)).toBe('blocked');
+    expect(blockedReason(s, NOW)).toBe('billing-dead');
+  });
+
+  it('a maxed window (no overage reason) → quota-exhausted (recoverable)', () => {
+    const futureReset = new Date(NOW.getTime() + 30 * 60_000);
+    const s = snap({ quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) });
+    expect(blockedReason(s, NOW)).toBe('quota-exhausted');
+  });
+
+  it('blockedReason is null for a non-blocked account', () => {
+    expect(blockedReason(snap({ quota: quota({ fiveHourUtilizationPct: 10 }) }), NOW)).toBeNull();
+  });
+
+  it('a thin/headerless probe classifies unknown, never a confident 0%/healthy', () => {
+    const s = snap({
+      quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, fiveHourUtilPresent: false, sevenDayUtilPresent: false }),
+    });
+    expect(classifyHealth(s, NOW)).toBe('unknown');
+  });
+
+  it('a real 0%/0% probe (both windows present) stays healthy', () => {
+    const s = snap({
+      quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, fiveHourUtilPresent: true, sevenDayUtilPresent: true }),
+    });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+  });
+
+  it('a single-window probe (7d header missing) is NOT thin → governed by util', () => {
+    const s = snap({
+      quota: quota({ fiveHourUtilizationPct: 50, sevenDayUtilizationPct: 0, fiveHourUtilPresent: true, sevenDayUtilPresent: false }),
+    });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+  });
+});
+
+// ── #2494 — row rendering distinguishes the states ──────────────────────
+
+describe('#2494 — renderAuthSnapshotFormat2 row rendering', () => {
+  it('billing-dead row says "billing disabled" with the reason, no timer', () => {
+    const out = renderAuthSnapshotFormat2(
+      [snap({ label: 'dead@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) })],
+      { now: NOW },
+    );
+    expect(out).toContain('billing disabled (out_of_credits)');
+    expect(out).not.toContain('quota exhausted');
+  });
+
+  it('quota-exhausted row shows a recovery countdown, not "billing disabled"', () => {
+    const futureReset = new Date(NOW.getTime() + 45 * 60_000);
+    const out = renderAuthSnapshotFormat2(
+      [snap({ label: 'ex@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) })],
+      { now: NOW },
+    );
+    expect(out).toContain('quota exhausted');
+    expect(out).not.toContain('billing disabled');
+  });
+
+  it('thin probe row renders "quota unknown", not "0% / 0%"', () => {
+    const out = renderAuthSnapshotFormat2(
+      [snap({ label: 'thin@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, fiveHourUtilPresent: false, sevenDayUtilPresent: false }) })],
+      { now: NOW },
+    );
+    expect(out).toContain('quota unknown');
+    expect(out).not.toContain('0% / 0%');
   });
 });
