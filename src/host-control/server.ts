@@ -57,6 +57,7 @@ import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
 import { parseRolloutResultLine } from "../cli/rollout.js";
+import { parseUpdateResultLine } from "../cli/update.js";
 import { parseAuditLine } from "./audit-reader.js";
 import {
   validateConfigEdit,
@@ -198,6 +199,14 @@ interface StatusEntry {
   failed_step?: string;
   /** Agent that failed the version assert (when failed_step is restart). */
   failed_agent?: string;
+  /** Actual version detected on failed_agent (null = unreachable). BONUS #2458 got-field gap. */
+  got?: string | null;
+  // ─── Update-apply deferral result (#2458) ──────────────────────────
+  // Steps that were deferred because the update ran in hostd-context
+  // (SWITCHROOM_HOSTD_CONTEXT=1). Populated by parsing the
+  // SWITCHROOM_UPDATE_RESULT sentinel from the child's stdout. Absent
+  // when no steps were deferred (non-hostd-context run or older driver).
+  deferred?: string[];
 }
 
 /**
@@ -1261,7 +1270,12 @@ export class HostdServer {
       request_id: req.request_id,
       started_at: started,
     };
-    this.spawnFleetMutation(req.op, args, entry);
+    // Inject SWITCHROOM_HOSTD_CONTEXT=1 so the update driver knows it is
+    // running inside the hostd container and must defer the refresh-hostd /
+    // refresh-web steps rather than attempting to recreate the very container
+    // it is running in (#2458). The driver emits a SWITCHROOM_UPDATE_RESULT
+    // sentinel line that we parse below to populate entry.deferred.
+    this.spawnFleetMutation(req.op, args, entry, { SWITCHROOM_HOSTD_CONTEXT: "1" });
     return {
       v: 1,
       request_id: req.request_id,
@@ -2244,14 +2258,25 @@ export class HostdServer {
     op: "update_apply" | "apply" | "rollout",
     args: string[],
     entry: StatusEntry,
+    extraEnv?: Record<string, string>,
   ): void {
-    this.runSwitchroom(args)
+    this.runSwitchroom(args, extraEnv)
       .then((res) => {
         entry.result = res.exit_code === 0 ? "completed" : "error";
         entry.exit_code = res.exit_code;
         entry.finished_at = Date.now();
         entry.stdout_tail = tail(res.stdout);
         entry.stderr_tail = tail(res.stderr);
+        // Parse the deferral sentinel emitted by the update driver when
+        // one or more steps were deferred due to hostd-context (#2458).
+        // Only relevant for update_apply (apply/rollout don't emit it), but
+        // parseUpdateResultLine is a no-op / returns null on absent sentinel.
+        if (op === "update_apply") {
+          const parsed = parseUpdateResultLine(res.stdout);
+          if (parsed && parsed.deferred.length > 0) {
+            entry.deferred = parsed.deferred;
+          }
+        }
       })
       .catch((err) => {
         entry.result = "error";
@@ -2302,6 +2327,11 @@ export class HostdServer {
           entry.rolled = parsed.rolled;
           if (parsed.failedStep) entry.failed_step = parsed.failedStep;
           if (parsed.failedAgent) entry.failed_agent = parsed.failedAgent;
+          // BONUS (#2458 got-field gap): the sentinel carries `got` (the
+          // actual version detected on the failed agent, or null when
+          // unreachable). Preserve it so get_status readers can surface the
+          // mismatch without scraping stdout.
+          if (parsed.got !== undefined) entry.got = parsed.got;
           // Structured `ok` is the authority; exit code corroborates.
           entry.result = parsed.ok ? "completed" : "error";
         } else {
@@ -2364,9 +2394,24 @@ export class HostdServer {
             rolled: entry.rolled ?? [],
             ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
             ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
+            // BONUS (#2458 got-field gap): include `got` when present.
+            ...(entry.got !== undefined ? { got: entry.got } : {}),
             ...(entry.pin ? { pin: entry.pin } : {}),
           })
         : undefined;
+    // Update-apply (#2458) payload: deferred steps + channel/pin enrichment.
+    const updatePayload: Record<string, unknown> | null =
+      entry.op === "update_apply" &&
+      (entry.deferred !== undefined ||
+        entry.channel !== undefined ||
+        entry.pin !== undefined)
+        ? {
+            ...(entry.deferred !== undefined ? { deferred: entry.deferred } : {}),
+            ...(entry.pin !== undefined ? { pin: entry.pin } : {}),
+            ...(entry.channel !== undefined ? { channel: entry.channel } : {}),
+          }
+        : null;
+    const payload = rolloutPayload ?? (updatePayload ? JSON.stringify(updatePayload) : undefined);
     return {
       v: 1,
       request_id,
@@ -2375,7 +2420,7 @@ export class HostdServer {
       duration_ms: (entry.finished_at ?? Date.now()) - entry.started_at,
       stdout_tail: entry.stdout_tail || undefined,
       stderr_tail: entry.stderr_tail || undefined,
-      ...(rolloutPayload ? { payload: rolloutPayload } : {}),
+      ...(payload ? { payload } : {}),
       error: entry.error,
     };
   }
@@ -2515,6 +2560,10 @@ export class HostdServer {
       ...(entry.rolled ? { rolled: entry.rolled } : {}),
       ...(entry.failed_step ? { failed_step: entry.failed_step } : {}),
       ...(entry.failed_agent ? { failed_agent: entry.failed_agent } : {}),
+      // BONUS (#2458 got-field gap): version detected on failed agent.
+      ...(entry.got !== undefined ? { got: entry.got } : {}),
+      // Update-apply deferral result (#2458) — only on update_apply rows.
+      ...(entry.deferred ? { deferred: entry.deferred } : {}),
     });
   }
 

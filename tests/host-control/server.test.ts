@@ -1945,3 +1945,249 @@ describe("hostd server — orphaned-started-row reconcile (#2487)", () => {
     expect(synthRows).toHaveLength(1); // exactly one, not two
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2458 — update_apply hostd-context deferral
+//
+// Asserts: (1) SWITCHROOM_HOSTD_CONTEXT=1 is injected for update_apply
+//          (2) `apply` does NOT get that env var
+//          (3) a child emitting the deferral sentinel populates
+//              StatusEntry.deferred and surfaces in get_status payload
+// ─────────────────────────────────────────────────────────────────────────────
+describe("hostd server — update_apply hostd-context deferral (#2458)", () => {
+  /** Set up a server whose switchroomBin echoes its env/argv to a recording
+   *  file and optionally emits a deferral sentinel. Returns the admin socket
+   *  path and the recording-file path. */
+  async function freshDeferralServer(opts: {
+    emitSentinel?: boolean;
+    sentinelOk?: boolean;
+    deferred?: string[];
+  } = {}): Promise<{ sock: string; recOut: string; assets: string }> {
+    if (server) await server.stop();
+
+    // Create apply-time assets so the preflight doesn't deny the request.
+    // These dirs don't need to be executable, so they live in the test tmpdir.
+    const assets = join(tmp, `assets-deferral-${Date.now()}`);
+    mkdirSync(join(assets, "profiles", "default"), { recursive: true });
+    mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+
+    // The stub SCRIPT and its recording file must live on a filesystem that
+    // allows exec — /tmp is noexec in this container, but /var/tmp is exec.
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-deferral-"));
+    const recOut = join(execTmp, `rec.txt`);
+    const deferred = opts.deferred ?? ["refresh-hostd", "refresh-web"];
+    const sentinel =
+      opts.emitSentinel !== false
+        ? `SWITCHROOM_UPDATE_RESULT:${JSON.stringify({ ok: opts.sentinelOk ?? true, deferred })}`
+        : "";
+
+    const recStub = join(execTmp, `stub.sh`);
+    writeFileSync(
+      recStub,
+      `#!/bin/sh\n` +
+        `echo "argv: $@" >> "${recOut}"\n` +
+        `echo "ctx: $SWITCHROOM_HOSTD_CONTEXT" >> "${recOut}"\n` +
+        (sentinel ? `echo '${sentinel}'\n` : "") +
+        `exit 0\n`,
+    );
+    chmodSync(recStub, 0o755);
+
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: recStub,
+      auditLogPath: join(tmp, "audit.log"),
+      applyAssetsRoot: assets,
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    return { sock, recOut, assets };
+  }
+
+  it("update_apply: spawns child with SWITCHROOM_HOSTD_CONTEXT=1", async () => {
+    const { sock, recOut } = await freshDeferralServer();
+
+    const started = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "update_apply", request_id: "ua-ctx-1", args: {} },
+    );
+    expect(started.result).toBe("started");
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const rec = readFileSync(recOut, "utf8");
+    // The stub echoes "ctx: $SWITCHROOM_HOSTD_CONTEXT" — must be "1".
+    expect(rec).toContain("ctx: 1");
+    expect(rec).toContain("argv: update");
+  });
+
+  it("apply: does NOT inject SWITCHROOM_HOSTD_CONTEXT", async () => {
+    const { sock, recOut } = await freshDeferralServer({ emitSentinel: false });
+
+    const started = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "apply", request_id: "ap-ctx-1", args: {} },
+    );
+    expect(started.result).toBe("started");
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const rec = readFileSync(recOut, "utf8");
+    // For `apply`, SWITCHROOM_HOSTD_CONTEXT must NOT be "1" (env var absent → empty).
+    expect(rec).not.toContain("ctx: 1");
+  });
+
+  it("sentinel parsed from child stdout populates StatusEntry.deferred in get_status payload", async () => {
+    const { sock } = await freshDeferralServer({
+      emitSentinel: true,
+      sentinelOk: true,
+      deferred: ["refresh-hostd", "refresh-web"],
+    });
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "update_apply", request_id: "ua-sent-1", args: {} },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: "ua-sent-poll",
+        args: { target_request_id: "ua-sent-1" },
+      },
+    );
+    expect(poll.result).toBe("completed");
+    expect(poll.payload).toBeDefined();
+    const payload = JSON.parse(poll.payload!) as { deferred: string[] };
+    expect(payload.deferred).toContain("refresh-hostd");
+    expect(payload.deferred).toContain("refresh-web");
+  });
+
+  it("deferred list also appears in the terminal audit row", async () => {
+    const { sock } = await freshDeferralServer({
+      emitSentinel: true,
+      sentinelOk: true,
+      deferred: ["refresh-hostd", "refresh-web"],
+    });
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "update_apply", request_id: "ua-audit-1", args: {} },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const rows = readFileSync(join(tmp, "audit.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ua-audit-1" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.deferred).toEqual(["refresh-hostd", "refresh-web"]);
+  });
+
+  it("no sentinel → no payload.deferred (non-hostd-context update_apply)", async () => {
+    const { sock } = await freshDeferralServer({ emitSentinel: false });
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "update_apply", request_id: "ua-nosent-1", args: {} },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: "ua-nosent-poll",
+        args: { target_request_id: "ua-nosent-1" },
+      },
+    );
+    expect(poll.result).toBe("completed");
+    // No deferred steps → either no payload or payload without deferred.
+    if (poll.payload) {
+      const payload = JSON.parse(poll.payload!) as Record<string, unknown>;
+      expect(payload.deferred).toBeUndefined();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BONUS: rollout `got`-field gap (#2458)
+//
+// The ROLLOUT_RESULT sentinel includes `got` (actual version on the failed
+// agent) but spawnRollout was previously dropping it. Assert the fix:
+// `got` appears in the get_status payload AND the terminal audit row.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("hostd server — rollout got-field gap fix (BONUS #2458)", () => {
+  it("got field from sentinel appears in get_status payload and terminal audit", async () => {
+    // failStub must be executable — use /var/tmp (not /tmp which is noexec in this container)
+    const execTmpBonus = mkdtempSync(join("/var/tmp", "hostd-bonus-rollout-"));
+    const failStub = join(execTmpBonus, "stub.sh");
+    writeFileSync(
+      failStub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":false,"rolled":[],"failedStep":"restart-agent","failedAgent":"canary","got":"0.15.17","warnings":[]}'\n` +
+        `exit 1\n`,
+    );
+    chmodSync(failStub, 0o755);
+
+    const assets = join(tmp, `assets-rollout-got-${Date.now()}`);
+    mkdirSync(join(assets, "profiles", "default"), { recursive: true });
+    mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+
+    if (server) await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: failStub,
+      auditLogPath: join(tmp, "audit.log"),
+      applyAssetsRoot: assets,
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-got-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: "ro-got-poll",
+        args: { target_request_id: "ro-got-1" },
+      },
+    );
+    expect(poll.result).toBe("error");
+    expect(poll.payload).toBeDefined();
+    const payload = JSON.parse(poll.payload!) as { failedAgent: string; got: string };
+    // BONUS: `got` must be in the payload.
+    expect(payload.failedAgent).toBe("canary");
+    expect(payload.got).toBe("0.15.17");
+
+    const rows = readFileSync(join(tmp, "audit.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-got-1" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    // BONUS: `got` must also be in the durable audit row.
+    expect(terminal!.got).toBe("0.15.17");
+    expect(terminal!.failed_agent).toBe("canary");
+  });
+});

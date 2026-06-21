@@ -8,7 +8,16 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { planUpdate, runUpdate, isGitCheckout, rebuildRefusalMessage } from "./update.js";
+import {
+  planUpdate,
+  runUpdate,
+  isGitCheckout,
+  rebuildRefusalMessage,
+  isHostdContext,
+  encodeUpdateResultLine,
+  parseUpdateResultLine,
+  UPDATE_RESULT_SENTINEL,
+} from "./update.js";
 
 function fakeRunner() {
   const calls: Array<{ cmd: string; args: string[] }> = [];
@@ -981,5 +990,253 @@ describe("isGitCheckout", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ── #2458 hostd-context deferral ──────────────────────────────────────────────
+
+describe("isHostdContext", () => {
+  it("returns true when SWITCHROOM_HOSTD_CONTEXT is '1'", () => {
+    expect(isHostdContext({ SWITCHROOM_HOSTD_CONTEXT: "1" })).toBe(true);
+  });
+
+  it("returns false when SWITCHROOM_HOSTD_CONTEXT is absent", () => {
+    expect(isHostdContext({})).toBe(false);
+  });
+
+  it("returns false when SWITCHROOM_HOSTD_CONTEXT is set to another value", () => {
+    expect(isHostdContext({ SWITCHROOM_HOSTD_CONTEXT: "true" })).toBe(false);
+    expect(isHostdContext({ SWITCHROOM_HOSTD_CONTEXT: "0" })).toBe(false);
+  });
+});
+
+describe("encodeUpdateResultLine / parseUpdateResultLine", () => {
+  it("round-trips { ok: true, deferred: ['refresh-hostd', 'refresh-web'] }", () => {
+    const payload = { ok: true, deferred: ["refresh-hostd", "refresh-web"] };
+    const line = encodeUpdateResultLine(payload);
+    expect(line.startsWith(UPDATE_RESULT_SENTINEL)).toBe(true);
+    const parsed = parseUpdateResultLine(line);
+    expect(parsed).toEqual(payload);
+  });
+
+  it("round-trips { ok: false, deferred: ['refresh-hostd'] }", () => {
+    const payload = { ok: false, deferred: ["refresh-hostd"] };
+    const line = encodeUpdateResultLine(payload);
+    const parsed = parseUpdateResultLine(line);
+    expect(parsed).toEqual(payload);
+  });
+
+  it("returns null for stdout with no sentinel", () => {
+    expect(parseUpdateResultLine("no sentinel here\n")).toBeNull();
+    expect(parseUpdateResultLine("")).toBeNull();
+  });
+
+  it("returns null for malformed JSON after the sentinel", () => {
+    expect(parseUpdateResultLine(`${UPDATE_RESULT_SENTINEL}not-json`)).toBeNull();
+  });
+
+  it("returns null for JSON missing required fields", () => {
+    expect(
+      parseUpdateResultLine(`${UPDATE_RESULT_SENTINEL}{"ok":true}`),
+    ).toBeNull();
+    expect(
+      parseUpdateResultLine(`${UPDATE_RESULT_SENTINEL}{"deferred":[]}`),
+    ).toBeNull();
+  });
+
+  it("finds the LAST sentinel line when stdout has multiple occurrences", () => {
+    const first = encodeUpdateResultLine({ ok: false, deferred: ["refresh-hostd"] });
+    const second = encodeUpdateResultLine({ ok: true, deferred: ["refresh-hostd", "refresh-web"] });
+    const combined = `some preamble\n${first}\nmore output\n${second}\n`;
+    const parsed = parseUpdateResultLine(combined);
+    // Must return the LAST sentinel (ok: true), not the first (ok: false).
+    expect(parsed?.ok).toBe(true);
+    expect(parsed?.deferred).toEqual(["refresh-hostd", "refresh-web"]);
+  });
+});
+
+describe("planUpdate — hostdContext deferral (#2458)", () => {
+  it("refresh-hostd gets skipReason containing 'deferred' and isHostdDeferred=true when hostdContext=true and hostControlEnabled=true", () => {
+    const steps = planUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: false,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+    });
+    const step = steps.find((s) => s.name === "refresh-hostd")!;
+    expect(step).toBeDefined();
+    expect(step.skipReason).toMatch(/deferred/);
+    expect(step.skipReason).toMatch(/#2458/);
+    expect(step.isHostdDeferred).toBe(true);
+  });
+
+  it("refresh-web gets skipReason containing 'deferred' and isHostdDeferred=true when hostdContext=true and webServiceManaged=true", () => {
+    const steps = planUpdate({
+      hostControlEnabled: false,
+      webServiceManaged: true,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+    });
+    const step = steps.find((s) => s.name === "refresh-web")!;
+    expect(step).toBeDefined();
+    expect(step.skipReason).toMatch(/deferred/);
+    expect(step.skipReason).toMatch(/#2458/);
+    expect(step.isHostdDeferred).toBe(true);
+  });
+
+  it("refresh-hostd still skips with existing reason when hostControlEnabled=false (hostdContext is not checked)", () => {
+    const steps = planUpdate({
+      hostControlEnabled: false,
+      webServiceManaged: false,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+    });
+    const step = steps.find((s) => s.name === "refresh-hostd")!;
+    expect(step.skipReason).toMatch(/host_control.enabled is not true/);
+    expect(step.skipReason).not.toMatch(/deferred/);
+    expect(step.isHostdDeferred).toBeFalsy();
+  });
+
+  it("refresh-hostd has NO skipReason and isHostdDeferred is falsy when hostdContext=false and hostControlEnabled=true", () => {
+    const steps = planUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: false,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: false,
+    });
+    const step = steps.find((s) => s.name === "refresh-hostd")!;
+    expect(step.skipReason).toBeUndefined();
+    expect(step.isHostdDeferred).toBeFalsy();
+  });
+
+  it("--skip-images reason still wins over hostdContext deferral; isHostdDeferred is false", () => {
+    const steps = planUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: true,
+      memoryBackendHindsight: false,
+      skipImages: true,
+      hostdContext: true,
+    });
+    const hostd = steps.find((s) => s.name === "refresh-hostd")!;
+    const web = steps.find((s) => s.name === "refresh-web")!;
+    expect(hostd.skipReason).toBe("--skip-images flag set");
+    expect(web.skipReason).toBe("--skip-images flag set");
+    // --skip-images is not a hostd-context deferral; isHostdDeferred must be false
+    expect(hostd.isHostdDeferred).toBeFalsy();
+    expect(web.isHostdDeferred).toBeFalsy();
+  });
+
+  it("deferred sentinel uses isHostdDeferred flag (not skipReason string match) to identify deferred steps", async () => {
+    // This test ensures the sentinel emitted by runUpdate correctly identifies
+    // deferred steps via the explicit isHostdDeferred flag, not string coupling.
+    const lines: string[] = [];
+    const code = await runUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: true,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+      runner: () => ({ status: 0 }),
+      composePath: "/dev/null",
+      syncBundledSkillsFn: () => {},
+      agentNamesFn: () => [],
+      writeMarkerFn: () => {},
+      stdout: (s) => lines.push(s),
+      stderr: () => {},
+    });
+    expect(code).toBe(0);
+    const allOut = lines.join("");
+    const parsed = parseUpdateResultLine(allOut);
+    // The deferred list must contain exactly the isHostdDeferred=true steps
+    expect(parsed?.deferred).toContain("refresh-hostd");
+    expect(parsed?.deferred).toContain("refresh-web");
+    // Steps whose skipReason doesn't include "deferred" must NOT appear
+    expect(parsed?.deferred).not.toContain("pull-images");
+    expect(parsed?.deferred).not.toContain("apply-config");
+  });
+});
+
+describe("runUpdate — hostdContext sentinel emission (#2458)", () => {
+  it("emits SWITCHROOM_UPDATE_RESULT sentinel with deferred steps on success", async () => {
+    const lines: string[] = [];
+    const code = await runUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: true,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+      // Supply a no-op runner so pull-images / apply-config etc. succeed without docker.
+      runner: () => ({ status: 0 }),
+      // Provide a composePath so the pull-images step doesn't skip on missing file.
+      composePath: "/dev/null",
+      // Prevent sync-bundled-skills from writing to real ~/.switchroom.
+      syncBundledSkillsFn: () => {},
+      // Prevent stamp-restart-marker from reading real config.
+      agentNamesFn: () => [],
+      writeMarkerFn: () => {},
+      stdout: (s) => lines.push(s),
+      stderr: () => {},
+    });
+    expect(code).toBe(0);
+    const allOut = lines.join("");
+    expect(allOut).toContain(UPDATE_RESULT_SENTINEL);
+    const parsed = parseUpdateResultLine(allOut);
+    expect(parsed?.ok).toBe(true);
+    expect(parsed?.deferred).toContain("refresh-hostd");
+    expect(parsed?.deferred).toContain("refresh-web");
+  });
+
+  it("does NOT emit sentinel when hostdContext=false (no deferred steps)", async () => {
+    const lines: string[] = [];
+    await runUpdate({
+      hostControlEnabled: false,
+      webServiceManaged: false,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: false,
+      runner: () => ({ status: 0 }),
+      composePath: "/dev/null",
+      syncBundledSkillsFn: () => {},
+      agentNamesFn: () => [],
+      writeMarkerFn: () => {},
+      stdout: (s) => lines.push(s),
+      stderr: () => {},
+    });
+    const allOut = lines.join("");
+    expect(allOut).not.toContain(UPDATE_RESULT_SENTINEL);
+  });
+
+  it("emits sentinel with ok=false when a non-deferred step fails mid-run", async () => {
+    const lines: string[] = [];
+    let callCount = 0;
+    const code = await runUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: false,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+      runner: () => {
+        // Fail only the first real step (pull-images) to trigger the failure path.
+        callCount++;
+        return { status: callCount === 1 ? 1 : 0 };
+      },
+      composePath: "/dev/null",
+      syncBundledSkillsFn: () => {},
+      agentNamesFn: () => [],
+      writeMarkerFn: () => {},
+      stdout: (s) => lines.push(s),
+      stderr: () => {},
+    });
+    expect(code).toBe(1);
+    const allOut = lines.join("");
+    // Sentinel IS emitted on failure when there are deferred steps.
+    expect(allOut).toContain(UPDATE_RESULT_SENTINEL);
+    const parsed = parseUpdateResultLine(allOut);
+    expect(parsed?.ok).toBe(false);
+    expect(parsed?.deferred).toContain("refresh-hostd");
   });
 });
