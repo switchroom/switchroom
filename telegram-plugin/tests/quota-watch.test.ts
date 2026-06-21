@@ -217,6 +217,22 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     expect(d.message).toContain("5-hour");
   });
 
+  it("#2495 Change 3 — throttling alarm advertises live-probe corroboration, not a raw cache read", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    // The alarm body's source-of-truth footnote must reflect that the gateway
+    // corroborates the alarm with a forceLive probe (the broker re-probe at
+    // gateway.ts runQuotaWatch), not "Source: broker quota cache".
+    expect(d.message).toContain("Live-probe corroborated");
+    expect(d.message).not.toContain("Source: broker quota cache");
+  });
+
   it("recovery message contains account label and percentages", () => {
     const d = evaluateQuotaWatchAccount({
       agentName: "lawgpt",

@@ -16152,7 +16152,13 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   const crossingLabels = pendingTransitions.map(t => t.accountLabel)
   let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]['result']>()
   try {
-    const probeData = await brokerClient.probeQuota(crossingLabels, 8000)
+    // #2495 Change 3 — forceLive bypasses the broker's probe-on-open TTL so the
+    // DECISION to alarm is corroborated by a TRUE live probe, never a cache hit.
+    // Only the transition-to-alarm pays for this; steady-state polls stay on the
+    // cheap cached listState read (no probe). Honors the existing fleet/consumer
+    // probe knobs upstream — this re-evaluation never fires without a detected
+    // transition.
+    const probeData = await brokerClient.probeQuota(crossingLabels, 8000, true)
     for (const entry of probeData.results) {
       freshProbeMap.set(entry.label, entry.result)
     }
@@ -16661,18 +16667,27 @@ bot.command("auth", async ctx => {
     liveQuotas: async (accounts) => {
       try {
         const { results } = await client.probeQuota(accounts.map((a) => a.label))
+        // #2495 Change 2 — the broker tags each result `served:"live"|"cache"`
+        // (TTL hit or failed-probe fallback). When ANY account was served from
+        // cache, surface the OLDEST snapshot's capturedAt so the card stamps
+        // "⚠ cached Nm ago" instead of a false live stamp.
+        let staleCachedAtMs: number | undefined
         // Preserve input order (broker also preserves it, but be defensive).
-        return accounts.map((a) => {
+        const quotas = accounts.map((a) => {
           const hit = results.find((r) => r.label === a.label)
           if (!hit) return { ok: false as const, reason: "broker returned no result for account" }
+          if (hit.served === 'cache' && hit.capturedAt != null) {
+            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
+          }
           return hit.result
         })
+        return { quotas, staleCachedAtMs }
       } catch (err) {
         // Surface a uniform per-account failure so the dashboard renders
         // gracefully (label badge stays UNKNOWN) instead of falling back
         // to the legacy table.
         const reason = `broker probe-quota failed: ${(err as Error)?.message ?? String(err)}`
-        return accounts.map(() => ({ ok: false as const, reason }))
+        return { quotas: accounts.map(() => ({ ok: false as const, reason })) }
       }
     },
     tz: process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ,
@@ -19039,9 +19054,17 @@ bot.command('usage', async ctx => {
       const state = await client.listState()
       if (state.accounts.length > 0) {
         // Broker-routed probe (#1336) — see gateway.ts:8910 for diagnosis.
+        // #2495 Change 2 — the broker applies a probe-on-open TTL + single-
+        // flight; a TTL-hit or failed-probe fallback is tagged served:"cache",
+        // which we surface as a "⚠ cached Nm ago" footer instead of a false
+        // live stamp.
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
+        let staleCachedAtMs: number | undefined
         const quotas = state.accounts.map((a) => {
           const hit = probeResp.results.find((r) => r.label === a.label)
+          if (hit?.served === 'cache' && hit.capturedAt != null) {
+            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
+          }
           return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
         })
         const { renderAuthSnapshotFormat2, buildSnapshotsFromState } = await import(
@@ -19052,7 +19075,7 @@ bot.command('usage', async ctx => {
         const text = renderAuthSnapshotFormat2(snapshots, {
           tz,
           now: new Date(),
-          liveProbedAtMs: Date.now(),
+          ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: Date.now() }),
         })
         await switchroomReply(ctx, text, { html: true })
         return

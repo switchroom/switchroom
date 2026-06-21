@@ -202,6 +202,14 @@ export interface SnapshotRenderOpts {
   /** Refresh stamp shown in the footer; usually `Date.now()` of the
    *  most recent live probe. Omit to suppress. */
   liveProbedAtMs?: number;
+  /**
+   * #2495 Change 2 — the probe-on-open attempted a live refresh but it
+   * FAILED, so the card is rendered off the durable cache. When set, the
+   * footer shows an explicit "⚠ cached Nm ago" warning (age measured from
+   * this `capturedAt`) instead of a false "Live · refreshed 0s ago" stamp.
+   * Takes precedence over `liveProbedAtMs`.
+   */
+  staleCachedAtMs?: number;
 }
 
 /**
@@ -335,6 +343,14 @@ function renderAccountRow(
  * `buildSnapshotKeyboard` below) — keep the formatting and the
  * keyboard in lockstep so the buttons always reflect current state.
  */
+/** Relative-age stamp shared by the live + degraded footers: "0s ago",
+ *  "3m ago". Measured against `now` (defaults to wall-clock) so tests with
+ *  an injected clock get deterministic output. */
+function formatAgeStamp(atMs: number, now: Date = new Date()): string {
+  const ageSec = Math.max(0, Math.round((now.getTime() - atMs) / 1000));
+  return ageSec < 60 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`;
+}
+
 export function renderAuthSnapshotFormat2(
   snapshots: AccountSnapshot[],
   opts: SnapshotRenderOpts = {},
@@ -372,10 +388,13 @@ export function renderAuthSnapshotFormat2(
   lines.push('');
   lines.push('────────────────────────────');
   lines.push(`<i>${recommendation(snapshots, now)}</i>`);
-  if (opts.liveProbedAtMs != null) {
-    const ageSec = Math.max(0, Math.round((Date.now() - opts.liveProbedAtMs) / 1000));
-    const ageStr = ageSec < 60 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`;
-    lines.push(`<i>Live · refreshed ${ageStr}</i>`);
+  // #2495 Change 2 — a failed probe-on-open renders an explicit "cached Nm
+  // ago" warning, never a false live stamp. The degraded variant takes
+  // precedence over the live stamp.
+  if (opts.staleCachedAtMs != null) {
+    lines.push(`<i>⚠ cached ${formatAgeStamp(opts.staleCachedAtMs, now)}</i>`);
+  } else if (opts.liveProbedAtMs != null) {
+    lines.push(`<i>Live · refreshed ${formatAgeStamp(opts.liveProbedAtMs, now)}</i>`);
   } else {
     lines.push('<i>Live</i>');
   }
@@ -655,6 +674,10 @@ export interface SnapshotKeyboardOpts {
   /** Limit how many "Switch → X" buttons we render. Beyond this, the
    *  user can drill in via /usage. Default 3. */
   maxSwitchButtons?: number;
+  /** #2495 folded nit A — clock for health classification, threaded so the
+   *  keyboard agrees with the card body instead of defaulting to a second
+   *  `new Date()`. Defaults to wall-clock. */
+  now?: Date;
 }
 
 /**
@@ -673,14 +696,15 @@ export function buildSnapshotKeyboard(
   opts: SnapshotKeyboardOpts = {},
 ): KeyboardRow[] {
   const max = opts.maxSwitchButtons ?? 3;
+  const now = opts.now ?? new Date();
   const rows: KeyboardRow[] = [];
 
   // Switch buttons — healthy non-active first, then throttling
   // non-active. Skip blocked entirely.
   const switchTargets = snapshots
     .filter((s) => !s.isActive)
-    .sort((a, b) => switchPriority(a) - switchPriority(b))
-    .filter((s) => classifyHealth(s) !== 'blocked' && classifyHealth(s) !== 'unknown')
+    .sort((a, b) => switchPriority(a, now) - switchPriority(b, now))
+    .filter((s) => classifyHealth(s, now) !== 'blocked' && classifyHealth(s, now) !== 'unknown')
     .slice(0, max);
 
   for (const t of switchTargets) {
@@ -702,8 +726,8 @@ export function buildSnapshotKeyboard(
 }
 
 /** Lower number = higher priority for "switch to me" button. */
-function switchPriority(s: AccountSnapshot): number {
-  const h = classifyHealth(s);
+function switchPriority(s: AccountSnapshot, now: Date = new Date()): number {
+  const h = classifyHealth(s, now);
   if (h === 'healthy') return 0;
   if (h === 'throttling') return 1;
   if (h === 'unknown') return 2;

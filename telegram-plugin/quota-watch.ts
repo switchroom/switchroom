@@ -30,6 +30,13 @@
  * IPC call (cheap). `probeQuota` is only called on state-change (when
  * we're going to send a message anyway) to get fresh numbers for the
  * notification body. On no-change polls, only `listState` is called.
+ *
+ * #2495 Change 3 — the transition-to-alarm probe is `forceLive` (bypasses
+ * the broker's probe-on-open TTL), so the DECISION to alarm is corroborated
+ * by a TRUE live probe of the affected account, not a possibly-stale cache
+ * read. The re-evaluation with fresh numbers can suppress an alarm whose
+ * stale-snapshot transition no longer holds. Steady state stays cheap: a
+ * no-change poll never probes. Cost is one live probe per transition edge.
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -493,7 +500,7 @@ function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): strin
     `Binding window: ${winLabel}${resetStr}`,
     `${activeNote}${altNote}`,
     ``,
-    `<i>Threshold: ${THROTTLING_THRESHOLD_PCT}% on either window. Source: broker quota cache.</i>`,
+    `<i>Threshold: ${THROTTLING_THRESHOLD_PCT}% on either window. Live-probe corroborated (#2495).</i>`,
     `<i>Run /auth for full fleet status or /usage for the active account.</i>`,
   ]
     .join("\n")

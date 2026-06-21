@@ -339,6 +339,15 @@ export const ProbeQuotaRequestSchema = z.object({
   accounts: z.array(z.string().min(1)).min(1).max(32),
   /** Override probe timeout per account (ms). Defaults to 10s. */
   timeoutMs: z.number().int().positive().max(60_000).optional(),
+  /**
+   * #2495 Change 2/3 — bypass the probe-on-open TTL gate and force a live
+   * upstream probe. Used by the proactive quota-watch alarm path, which must
+   * CORROBORATE a stale-snapshot transition with a true live probe before
+   * alarming — a TTL-hit cache read would defeat the corroboration. Normal
+   * card-open renders leave this unset (TTL-gated). Single-flight coalescing
+   * still applies even when forced.
+   */
+  forceLive: z.boolean().optional(),
 });
 
 /**

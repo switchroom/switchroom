@@ -127,7 +127,8 @@ describe('handleAuthCommand — keyboard attachment', () => {
   it('attaches a smart keyboard when liveQuotas yields one result per account', async () => {
     const reply = await handleAuthCommand(
       { kind: 'show' },
-      makeCtx({ liveQuotas: async () => FIXTURE_QUOTAS, tz: 'UTC' }),
+      // #2495 Change 2 — the enricher now returns { quotas, staleCachedAtMs? }.
+      makeCtx({ liveQuotas: async () => ({ quotas: FIXTURE_QUOTAS }), tz: 'UTC' }),
     );
     expect(reply.keyboard).toBeDefined();
     const allButtonText = reply.keyboard!.flat().map((b) => b.text);
@@ -152,5 +153,29 @@ describe('handleAuthCommand — keyboard attachment', () => {
     );
     expect(reply.keyboard).toBeUndefined();
     expect(reply.text).toContain('ACCOUNT'); // legacy table fallback
+  });
+
+  it('#2495 Change 2 — stamps "⚠ cached Nm ago" when the enricher reports a cache fallback', async () => {
+    const reply = await handleAuthCommand(
+      { kind: 'show' },
+      makeCtx({
+        liveQuotas: async () => ({
+          quotas: FIXTURE_QUOTAS,
+          staleCachedAtMs: Date.now() - 5 * 60_000, // 5 min old cache
+        }),
+        tz: 'UTC',
+      }),
+    );
+    expect(reply.text).toContain('⚠ cached');
+    expect(reply.text).not.toContain('Live · refreshed');
+  });
+
+  it('#2495 Change 2 — stamps a live refresh when the enricher reports no cache fallback', async () => {
+    const reply = await handleAuthCommand(
+      { kind: 'show' },
+      makeCtx({ liveQuotas: async () => ({ quotas: FIXTURE_QUOTAS }), tz: 'UTC' }),
+    );
+    expect(reply.text).toContain('Live · refreshed');
+    expect(reply.text).not.toContain('⚠ cached');
   });
 });

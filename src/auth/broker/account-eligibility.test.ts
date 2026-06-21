@@ -165,6 +165,39 @@ describe("snapshotShouldClearMark — self-heal", () => {
     const mark: ExhaustionMark = { exhausted_until: NOW + 1000, marked_at: NOW };
     expect(snapshotShouldClearMark(snap(4, 20, 10 * 60_000), mark, NOW)).toBe(false);
   });
+  it("#2495 nit B — NEVER clears a mark on a THIN probe (no util headers)", () => {
+    // A headerless probe coalesces both windows to 0% — which reads as
+    // "clearly healthy" but is NOT evidence of health. Refuse to self-heal a
+    // real exhaustion mark off it.
+    const mark: ExhaustionMark = { exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000, marked_at: NOW - 60_000 };
+    const thin: QuotaSnapshot = {
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 0,
+      capturedAt: NOW,
+      fiveHourUtilPresent: false,
+      sevenDayUtilPresent: false,
+    };
+    expect(snapshotShouldClearMark(thin, mark, NOW)).toBe(false);
+    // Contrast: a probe that ACTUALLY measured 0% on both (markers present)
+    // is real health → DOES clear (regression anchor).
+    const real: QuotaSnapshot = {
+      fiveHourUtilizationPct: 0,
+      sevenDayUtilizationPct: 0,
+      capturedAt: NOW,
+      fiveHourUtilPresent: true,
+      sevenDayUtilPresent: true,
+    };
+    expect(snapshotShouldClearMark(real, mark, NOW)).toBe(true);
+    // And a partial probe (5h present, 7d absent) is NOT thin → clears.
+    const partial: QuotaSnapshot = {
+      fiveHourUtilizationPct: 4,
+      sevenDayUtilizationPct: 0,
+      capturedAt: NOW,
+      fiveHourUtilPresent: true,
+      sevenDayUtilPresent: false,
+    };
+    expect(snapshotShouldClearMark(partial, mark, NOW)).toBe(true);
+  });
   it("NEVER clears a mark off an out_of_credits account, even at 0% util", () => {
     // The 2026-06-20 self-heal bug: a fresh low-util probe must NOT un-exhaust a
     // credits-dead account. Low util ≠ healthy when overage is serve-blocking.
