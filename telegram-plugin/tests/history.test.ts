@@ -444,6 +444,66 @@ describe('hasOutboundDeliveredSince', () => {
   it('returns false when no history is present for the chat', () => {
     expect(hasOutboundDeliveredSince('-999', 0)).toBe(false)
   })
+
+  // #2474 follow-up — the duplicate-represent guard passes a LOW minChars so a
+  // terse-but-genuine reply counts as "the user was answered". The escalate
+  // branch keeps the 200-char default.
+  describe('minChars parameter (decoupled represent-guard threshold)', () => {
+    it('default threshold (200) does NOT count a terse real reply', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: ['Yes — done.'], // < 200 chars
+        ts: 1_000_001,
+      })
+      // escalate-branch behavior is unchanged: a terse reply is NOT substantive
+      expect(hasOutboundDeliveredSince('-100', openedAt)).toBe(false)
+    })
+
+    it('minChars=1 DOES count a terse real reply (fixes the #2472 terse-reply gap)', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: ['Merged, all three landed.'], // genuine short reply
+        ts: 1_000_001,
+      })
+      // represent-guard threshold: any real reply suppresses the duplicate
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 1)).toBe(true)
+    })
+
+    it('minChars=1 still does NOT count an empty/whitespace-only row', () => {
+      // A degenerate outbound (no real content) must never read as "answered",
+      // even at the lowest threshold — minChars is clamped to >= 1.
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: [''],
+        ts: 1_000_001,
+      })
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 1)).toBe(false)
+      // minChars=0 is clamped up to 1, so an empty row is still excluded
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 0)).toBe(false)
+    })
+
+    it('minChars=1 respects the thread filter (terse reply scoped to its thread)', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: 5,
+        message_ids: [10],
+        texts: ['ok'],
+        ts: 1_000_001,
+      })
+      expect(hasOutboundDeliveredSince('-100', openedAt, 5, 1)).toBe(true)
+      expect(hasOutboundDeliveredSince('-100', openedAt, 6, 1)).toBe(false)
+    })
+  })
 })
 
 describe('secret redaction at persistence (both directions)', () => {

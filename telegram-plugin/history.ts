@@ -557,11 +557,26 @@ export function getRecentOutboundCount(
  * SUBSTANTIVE: we never suppress escalation on a bare ack ("on it", "give me a
  * sec") — an agent that acks then ghosts must still escalate. The history schema
  * does not store a done/substantive flag, so we approximate: a row counts only
- * when LENGTH(text) >= 200 (the FINAL_ANSWER_MIN_CHARS constant from
- * final-answer-detect.ts). This is false-negative-safe: a genuine substantive
- * answer that happens to be < 200 chars will still fire an escalation, which is
- * the conservative (safe) outcome. A schema column would be more precise but is
- * disproportionate for this predicate; the reviewer accepted this approach.
+ * when LENGTH(text) >= `minChars` (default 200, the FINAL_ANSWER_MIN_CHARS
+ * constant from final-answer-detect.ts). This is false-negative-safe for the
+ * escalate branch: a genuine substantive answer that happens to be < 200 chars
+ * will still fire an escalation, which is the conservative (safe) outcome. A
+ * schema column would be more precise but is disproportionate for this predicate;
+ * the reviewer accepted this approach.
+ *
+ * `minChars` semantics (decoupled per caller, #2474 follow-up):
+ *   - The ESCALATE branch (Fix 4) keeps the 200 default: it must not stand down an
+ *     escalation on a mere ack, so it still demands a substantive-LENGTH outbound.
+ *   - The duplicate-represent GUARD (#2472) passes a LOW value (1): for that path
+ *     ANY genuine assistant reply to the turn — even a terse "Yes — done." or
+ *     "Merged, all three landed." — means the user was answered, so the duplicate
+ *     represent must be suppressed. The 200-char proxy was borrowed from the
+ *     escalate branch and is WRONG there: a short-but-real reply left the
+ *     duplicate-represent bug (#2472) alive. This is safe because the rows this
+ *     query counts (role='assistant') are ONLY ever written by recordOutbound —
+ *     i.e. real bot→user messages (reply / stream_reply / silent-anchor content /
+ *     command acks). Typing indicators and progress-card edits NEVER call
+ *     recordOutbound, so they cannot be miscounted as "the user was answered".
  *
  * `threadId` semantics:
  *   - undefined → any message in the chat regardless of thread (DMs + supergroups)
@@ -575,16 +590,23 @@ export function hasOutboundDeliveredSince(
   chatId: string,
   sinceMs: number,
   threadId?: number | null,
+  minChars = 200,
 ): boolean {
   try {
     const cutoffSec = Math.floor(sinceMs / 1000)
-    const params: unknown[] = [chatId, cutoffSec]
-    // LENGTH(text) >= 200 scopes to substantive replies only — never suppress
-    // escalation on a mere ack. Mirrors FINAL_ANSWER_MIN_CHARS (200) from
-    // final-answer-detect.ts; the `done` flag is not stored in the history
-    // schema, so length is the closest available proxy.
+    // Clamp to >= 1 so the predicate never counts an empty/whitespace-only row
+    // (a degenerate outbound) as a delivered reply, even if a caller passes 0.
+    const minLen = Math.max(1, Math.floor(minChars))
+    const params: unknown[] = [chatId, cutoffSec, minLen]
+    // LENGTH(text) >= minChars scopes to replies of at least the caller's
+    // threshold. ESCALATE passes the default 200 (substantive-only — never stand
+    // down on a mere ack). The duplicate-represent GUARD passes a low value so a
+    // terse-but-real reply counts (#2472/#2474). The `done` flag is not stored in
+    // the history schema, so length is the closest available proxy; rows here are
+    // only ever recordOutbound writes (real bot→user sends), so progress-card
+    // edits / typing indicators are structurally excluded.
     let sql =
-      "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ? AND LENGTH(text) >= 200"
+      "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ? AND LENGTH(text) >= ?"
     if (threadId !== undefined) {
       if (threadId === null) {
         sql += ' AND thread_id IS NULL'

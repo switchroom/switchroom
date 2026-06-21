@@ -37,8 +37,16 @@ export interface RepresentGuardDeps {
   /** True when history is available to query (else the guard never suppresses). */
   historyEnabled: boolean
   /**
-   * Has a SUBSTANTIVE assistant reply been delivered to this chat (optionally
-   * scoped to thread) at or after `sinceMs`? Wraps history.hasOutboundDeliveredSince.
+   * Has a genuine assistant reply been delivered to this chat (optionally scoped
+   * to thread) at or after `sinceMs`? Wraps history.hasOutboundDeliveredSince.
+   *
+   * For the represent guard the gateway binds this with a LOW minChars (#2474
+   * follow-up): ANY real reply to the turn — even a terse "Yes — done." — means
+   * the user was answered and the duplicate represent must be suppressed. The
+   * 200-char "substantive" proxy is the ESCALATE branch's concern, not this one;
+   * applying it here left short-but-real replies failing to suppress the duplicate
+   * (the #2472 gap). The underlying query only counts recordOutbound rows, so
+   * typing indicators / progress-card edits are never miscounted as a reply.
    */
   hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number) => boolean
 }
