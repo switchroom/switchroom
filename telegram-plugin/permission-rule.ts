@@ -301,7 +301,7 @@ export function matchesAllowRule(
       return bashFirstToken(cmd) === m[1];
     }
     if (FILE_TOOLS.has(ruleTool)) {
-      return filePathFrom(input) === arg;
+      return filePathFrom(input, inputPreview) === arg;
     }
     return false;
   }
