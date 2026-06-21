@@ -173,15 +173,15 @@ export function naturalAction(
     case "Edit":
     case "MultiEdit":
     case "NotebookEdit": {
-      const f = fileBase(input);
+      const f = fileBase(input, inputPreview);
       return f ? `edit: ${f}` : "edit files";
     }
     case "Write": {
-      const f = fileBase(input);
+      const f = fileBase(input, inputPreview);
       return f ? `write: ${f}` : "write files";
     }
     case "Read": {
-      const f = fileBase(input);
+      const f = fileBase(input, inputPreview);
       return f ? `read: ${f}` : "read files";
     }
     case "Bash": {
@@ -467,10 +467,43 @@ function resolveSkillName(input: Record<string, unknown>): string | null {
   );
 }
 
-function fileBase(input: Record<string, unknown> | null): string | null {
-  if (!input) return null;
-  const p = readString(input, "file_path") ?? readString(input, "notebook_path");
-  return p ? basename(p) : null;
+function fileBase(
+  input: Record<string, unknown> | null,
+  rawPreview?: string,
+): string | null {
+  if (input) {
+    const p = readString(input, "file_path") ?? readString(input, "notebook_path");
+    if (p) return basename(p);
+  }
+  // Claude Code truncates inputPreview to 200 chars, making the surrounding
+  // JSON invalid (Edit/Write always exceed 200 chars once old_string/new_string
+  // are included). "file_path" is the first key, so its value is intact in the
+  // truncated prefix — extract it with a lenient regex on the raw string.
+  if (rawPreview) {
+    const p = extractFilePathFromRaw(rawPreview);
+    if (p) return basename(p);
+  }
+  return null;
+}
+
+/**
+ * Regex-based fallback to extract "file_path" or "notebook_path" from a raw
+ * (possibly truncated / invalid-JSON) inputPreview string. JSON-unescapes the
+ * captured value so paths with backslashes or unicode escapes are returned
+ * correctly. Returns null when neither key is present or the captured value is
+ * empty.
+ */
+function extractFilePathFromRaw(raw: string): string | null {
+  // Match the first occurrence of "file_path" or "notebook_path".
+  const m = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw);
+  if (!m) return null;
+  try {
+    // JSON.parse the quoted string literal so escape sequences are resolved.
+    const value = JSON.parse(`"${m[1]}"`) as string;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function lowerFirst(text: string): string {
