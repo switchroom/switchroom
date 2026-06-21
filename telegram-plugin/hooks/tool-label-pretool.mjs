@@ -149,7 +149,9 @@ export function computeLabel(toolName, input) {
       // the progress card path that used to surface this was retired
       // when `progressDriver` was nulled out in #1122 PR3.
       const slug = clip(asText(i.skill), 64)
-      return slug ? `Running skill ${slug}` : null
+      // Never-null: a Skill call with an empty slug still opens the feed
+      // (a degenerate first-tool Skill would otherwise read as silence).
+      return slug ? `Running skill ${slug}` : 'Running a skill'
     }
   }
 
@@ -213,7 +215,15 @@ export function computeLabel(toolName, input) {
     return `Using ${tool.replace(/[-_]+/g, ' ')}`
   }
 
-  return null
+  // Never-null fallthrough: any unrecognized BUILT-IN tool (no mcp__ prefix,
+  // not matched above) gets a generic label rather than dropping its sidecar
+  // line. A null here was the dark-turn mechanism — if such a tool was a
+  // turn's first/only tool, no tool_label event fired, the activity feed
+  // never opened, and a working turn read as pure silence. Surface tools
+  // (reply/react/send_typing/sync_retain) return earlier and are also
+  // suppressed at the gateway's isTelegramSurfaceTool guard, so this does
+  // not resurface them.
+  return 'Working…'
 }
 
 function main() {
