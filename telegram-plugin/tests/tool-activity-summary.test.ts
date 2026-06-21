@@ -342,6 +342,25 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     expect(out).toBe("<i>✓ Reading a.ts</i>\n<i>✓ 3 steps</i>");
   });
 
+  // Liveness-driven feed open (dark-turn fix): a turn that emits no tool_label
+  // (pure thinking / suppressed tools) gets a minimal "Working…" placeholder so
+  // the feed still opens and stays visibly alive. These pin the exact render
+  // the gateway's feedHeartbeatTick (open + climb) and clearActivitySummary
+  // (terminal record) depend on.
+  describe("liveness placeholder — 'Working…' feed", () => {
+    it("renders the live in-progress placeholder with climbing elapsed", () => {
+      expect(
+        renderActivityFeedWithNested(["Working…"], [], false, " · 12s"),
+      ).toBe("<b>→ Working… · 12s</b>");
+    });
+
+    it("finalizes the placeholder to a done record (no frozen → line)", () => {
+      expect(renderActivityFeedWithNested(["Working…"], [], true)).toBe(
+        "<i>✓ Working…</i>",
+      );
+    });
+  });
+
   it("stepCount=0 → no footer even on final=true", () => {
     const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 0)!;
     expect(out).not.toContain("steps");
