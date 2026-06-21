@@ -89,6 +89,7 @@ interface ToolArgs {
   // rollout (#2487)
   agents?: string[];
   skip_web?: boolean;
+  allow_downgrade?: boolean;
   // config_propose_edit args
   unified_diff?: string;
   target_path?: string;
@@ -287,12 +288,14 @@ export const TOOLS = [
       "pins are rejected because the version assert needs a semver to " +
       "compare against. The hostd/web self-refresh is DEFERRED on this path " +
       "(an agent-invoked rollout cannot recreate its own hostd container " +
-      "without killing itself); run that host-side. Downgrade pins are " +
-      "rejected (rollback is an operator-tapped verb, not an agent " +
-      "rollout). Admin-only at the wire layer AND deliberately NOT pre-" +
-      "approved — every call surfaces a Telegram approval card for the " +
-      "operator to tap. Returns `started`; poll get_status for the " +
-      "structured outcome (which agents rolled / where it stopped).",
+      "without killing itself); run that host-side. By default downgrade pins " +
+      "are rejected — pass `allow_downgrade: true` for the operator-approved " +
+      "rollback path to a known-good earlier tag; all other safety rails " +
+      "(canary order, version-assert, stop-on-mismatch) apply unchanged. " +
+      "Admin-only at the wire layer AND deliberately NOT pre-approved — every " +
+      "call surfaces a Telegram approval card for the operator to tap. " +
+      "Returns `started`; poll get_status for the structured outcome " +
+      "(which agents rolled / where it stopped).",
     inputSchema: {
       type: "object" as const,
       required: ["pin"],
@@ -319,6 +322,16 @@ export const TOOLS = [
             "Skip the web + hostd refresh step. NB: on this (hostd) path " +
             "the hostd/web refresh is deferred regardless; this flag is " +
             "forwarded for parity.",
+        },
+        allow_downgrade: {
+          type: "boolean",
+          description:
+            "Operator-approved rollback to a known-good earlier tag (#2487 PR2). " +
+            "When true, the downgrade guard is relaxed so `pin` may be older " +
+            "than the current release.pin. All other safety rails (canary order, " +
+            "version-assert, stop-on-mismatch, persist-after-canary, " +
+            "hostd/web deferral) apply unchanged. Still gated by the operator " +
+            "approval card — not pre-approved.",
         },
       },
     },
@@ -562,6 +575,7 @@ export async function dispatchTool(
           pin: args.pin,
           ...(args.agents ? { agents: args.agents } : {}),
           ...(args.skip_web ? { skip_web: true } : {}),
+          ...(args.allow_downgrade ? { allow_downgrade: true } : {}),
         },
       };
       break;

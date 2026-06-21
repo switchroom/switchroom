@@ -18,6 +18,7 @@ import {
   executeRollout,
   encodeRolloutResultLine,
   parseRolloutResultLine,
+  shouldRefuseDowngrade,
   ROLLOUT_RESULT_SENTINEL,
   type RolloutDeps,
   type RolloutResult,
@@ -357,5 +358,83 @@ describe("rollout structured-result sentinel (#2487)", () => {
 
   it("returns null when no sentinel line is present (child died early)", () => {
     expect(parseRolloutResultLine("Rolling 3 agents…\napply\n")).toBeNull();
+  });
+});
+
+// ── shouldRefuseDowngrade — pure guard for the allow_downgrade flag ────────
+
+describe("shouldRefuseDowngrade (#2487 PR2)", () => {
+  const CURRENT = "v0.15.18";
+
+  it("refuses a concrete downgrade when hostdCtx=true and flag is absent", () => {
+    expect(shouldRefuseDowngrade(true, "v0.15.16", CURRENT, undefined)).toBe(true);
+  });
+
+  it("allows the same downgrade when allow_downgrade=true (operator approved)", () => {
+    expect(shouldRefuseDowngrade(true, "v0.15.16", CURRENT, true)).toBe(false);
+  });
+
+  it("never refuses an upgrade (newer pin)", () => {
+    expect(shouldRefuseDowngrade(true, "v0.15.20", CURRENT, undefined)).toBe(false);
+  });
+
+  it("never refuses when compareReleaseTags returns null (sha/channel pins)", () => {
+    // sha pin — compareReleaseTags returns null → guard never fires
+    expect(shouldRefuseDowngrade(true, "sha-abc1234", CURRENT, undefined)).toBe(false);
+    // channel/floating — also returns null
+    expect(shouldRefuseDowngrade(true, "latest", CURRENT, undefined)).toBe(false);
+  });
+
+  it("host-shell path (hostdCtx=false) is never gated regardless of pin vs current", () => {
+    expect(shouldRefuseDowngrade(false, "v0.15.16", CURRENT, undefined)).toBe(false);
+    expect(shouldRefuseDowngrade(false, "v0.15.16", CURRENT, false)).toBe(false);
+  });
+
+  it("never refuses when pin is absent (target comes from config, not --pin)", () => {
+    expect(shouldRefuseDowngrade(true, undefined, CURRENT, undefined)).toBe(false);
+  });
+});
+
+// ── ROLL_STEP prefix on per-step log lines (#2459) ─────────────────────────
+
+describe("executeRollout — ROLL_STEP greppable step markers (#2459)", () => {
+  const TARGET = "v0.15.18";
+
+  it("emits ROLL_STEP apply on the apply step", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    const applyLog = logs.find((l) => l.startsWith("ROLL_STEP apply"));
+    expect(applyLog).toBeTruthy();
+  });
+
+  it("emits ROLL_STEP restart-agent on each restart step", () => {
+    const steps = planRollout(["clerk", "marko"]);
+    const { deps, logs } = harness({ versions: { clerk: "0.15.18", marko: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    const restartLogs = logs.filter((l) => l.startsWith("ROLL_STEP restart-agent"));
+    expect(restartLogs.length).toBe(2);
+  });
+
+  it("emits ROLL_STEP refresh-web and ROLL_STEP refresh-hostd", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    expect(logs.some((l) => l.startsWith("ROLL_STEP refresh-web"))).toBe(true);
+    expect(logs.some((l) => l.startsWith("ROLL_STEP refresh-hostd"))).toBe(true);
+  });
+
+  it("emits ROLL_STEP sweep on the sweep step", () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    expect(logs.some((l) => l.startsWith("ROLL_STEP sweep"))).toBe(true);
+  });
+
+  it("emits ROLL_STEP persist-pin when a pinToPersist step is present", () => {
+    const steps = planRollout(["clerk"], { pinToPersist: TARGET });
+    const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
+    executeRollout(steps, TARGET, deps);
+    expect(logs.some((l) => l.startsWith("ROLL_STEP persist-pin"))).toBe(true);
   });
 });

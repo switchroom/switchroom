@@ -231,6 +231,31 @@ export interface RolloutResult {
 }
 
 /**
+ * Pure guard: returns true when the downgrade should be refused.
+ *
+ * Refuses only when ALL of:
+ *   - hostdContext is true (agent-invoked path, not host-shell),
+ *   - pin is supplied (not floating from config),
+ *   - allowDowngrade is falsy (operator hasn't authorized the rollback),
+ *   - compareReleaseTags returns a negative (concrete downgrade, not a
+ *     channel/sha which returns null).
+ *
+ * Exported for unit testing.
+ */
+export function shouldRefuseDowngrade(
+  hostdContext: boolean,
+  pin: string | undefined,
+  current: string | undefined,
+  allowDowngrade: boolean | undefined,
+): boolean {
+  if (!hostdContext) return false;
+  if (!pin) return false;
+  if (allowDowngrade) return false;
+  const cmp = compareReleaseTags(pin, current);
+  return cmp !== null && cmp < 0;
+}
+
+/**
  * True when this `switchroom rollout` was spawned by the host-control
  * daemon on behalf of an agent MCP call (#2487). hostd sets
  * `SWITCHROOM_HOSTD_CONTEXT=1` on the child env. The flag flips three
@@ -329,7 +354,7 @@ export function executeRollout(
         // On the hostd path this runs AFTER the canary is green; on the
         // host-shell path it runs FIRST. Either way: durably persist so
         // subsequent reconciles read the same pin.
-        deps.log(`→ persist release.pin=${step.pin} to switchroom.yaml`);
+        deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
         if (deps.persistPin) {
           deps.persistPin(step.pin);
         } else {
@@ -341,7 +366,7 @@ export function executeRollout(
         // hostd path: pin not yet persisted (it follows the canary), so
         // pass the one-shot --pin so compose regenerates on the target.
         // host-shell path: pin already persisted → bare apply reads it.
-        deps.log(`→ apply — regenerating compose for ${target}`);
+        deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
         const applyArgs = execOpts.hostdContext
           ? ["apply", "--pin", target]
           : ["apply"];
@@ -352,7 +377,7 @@ export function executeRollout(
         break;
       }
       case "restart-agent": {
-        deps.log(`→ restart ${step.agent} (--wait --force)`);
+        deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
         // `agent restart` can exit 0 while still "polling" on boot — do
         // NOT trust its status; the version assert is the real gate.
         deps.run(["agent", "restart", step.agent, "--wait", "--force"]);
@@ -373,19 +398,19 @@ export function executeRollout(
         break;
       }
       case "refresh-web": {
-        deps.log(`→ webd install --tag ${target}`);
+        deps.log(`ROLL_STEP refresh-web — webd install --tag ${target}`);
         const r = deps.run(["webd", "install", "--tag", target]);
         if (r.status !== 0) warnings.push(`web refresh failed (non-fatal); agents already rolled`);
         break;
       }
       case "refresh-hostd": {
-        deps.log(`→ hostd install --tag ${target}`);
+        deps.log(`ROLL_STEP refresh-hostd — hostd install --tag ${target}`);
         const r = deps.run(["hostd", "install", "--tag", target]);
         if (r.status !== 0) warnings.push(`hostd refresh failed (non-fatal); agents already rolled`);
         break;
       }
       case "sweep": {
-        deps.log(`→ sweep`);
+        deps.log(`ROLL_STEP sweep`);
         for (const a of rolled) {
           const v = deps.probeVersion(a);
           deps.log(`  ${a}: ${v ?? "<unreachable>"}`);
@@ -415,8 +440,14 @@ export function registerRolloutCommand(program: Command): void {
       "Comma-separated subset of agents to roll (default: all configured).",
     )
     .option("--skip-web", "Skip the web + hostd refresh step.")
+    .option(
+      "--allow-downgrade",
+      "Permit rolling to an older semver tag (operator-approved rollback path). " +
+        "When set, the downgrade guard is relaxed so --pin may be older than the " +
+        "current release.pin. All other safety rails apply unchanged.",
+    )
     .option("--dry-run", "Print the plan and exit without changing anything.")
-    .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; dryRun?: boolean }) => {
+    .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; allowDowngrade?: boolean; dryRun?: boolean }) => {
       const config = getConfig(program);
       const target = opts.pin ?? config.release?.pin;
       if (!target) {
@@ -437,25 +468,27 @@ export function registerRolloutCommand(program: Command): void {
         process.exitCode = 2;
         return;
       }
-      // #2487 item 9 — reject DOWNGRADE pins on the agent-reachable
-      // (hostd) path specifically. `--agents <list>` + arbitrary `--pin`
-      // is a more surgical abuse surface than update_apply (targeted
-      // downgrade); downgrade-as-rollback is deferred to PR2's operator-
-      // tapped rollback verb. compareReleaseTags is conservative: it only
-      // refuses a clean vX.Y.Z → older-vX.Y.Z move, never a channel/sha.
-      if (hostdCtx && opts.pin) {
+      // #2487 PR2 — downgrade guard: reject a version older than the
+      // current release.pin on the hostd path UNLESS --allow-downgrade is
+      // set (the operator-approved rollback path). compareReleaseTags is
+      // conservative: it only refuses a clean vX.Y.Z → older-vX.Y.Z move,
+      // never a channel/sha (those return null and never block).
+      if (shouldRefuseDowngrade(hostdCtx, opts.pin, config.release?.pin, opts.allowDowngrade)) {
         const current = config.release?.pin;
-        const cmp = compareReleaseTags(opts.pin, current);
-        if (cmp !== null && cmp < 0) {
-          process.stderr.write(
-            `rollout (hostd path) refuses a DOWNGRADE: ${opts.pin} is older ` +
-              `than the current pin ${current}. Downgrade/rollback is an ` +
-              `operator-tapped verb (deferred to PR2), not an agent rollout. ` +
-              `Nothing was changed.\n`,
-          );
-          process.exitCode = 2;
-          return;
-        }
+        process.stderr.write(
+          `rollout (hostd path) refuses a DOWNGRADE: ${opts.pin} is older ` +
+            `than the current pin ${current}. Pass --allow-downgrade to ` +
+            `authorize an operator-approved rollback to a known-good earlier ` +
+            `tag. Nothing was changed.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (opts.allowDowngrade) {
+        const current = config.release?.pin;
+        process.stdout.write(
+          `⤵ DOWNGRADE authorized (operator-approved rollback): ${current ?? "<unpinned>"} → ${opts.pin ?? target}\n`,
+        );
       }
       const allAgents = Object.keys(config.agents ?? {});
       const requested = opts.agents
@@ -545,7 +578,9 @@ export function registerRolloutCommand(program: Command): void {
         },
       };
 
-      process.stdout.write(`Rolling ${requested.length} agent(s) to ${target}…\n`);
+      process.stdout.write(
+        `${opts.allowDowngrade ? "Rolling back" : "Rolling"} ${requested.length} agent(s) to ${target}…\n`,
+      );
       const result = executeRollout(steps, target, deps, { hostdContext: hostdCtx });
 
       // hostd path: the hostd/web refresh was intentionally dropped from

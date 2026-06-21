@@ -174,6 +174,15 @@ export const RolloutRequestSchema = z.object({
        *  SIGKILL the in-flight rollout — hostd's own child); this flag
        *  is forwarded for parity but the deferral is unconditional. */
       skip_web: z.boolean().optional(),
+      /**
+       * Operator-approved rollback to a known-good earlier tag (#2487 PR2).
+       * When set, the downgrade guard in `switchroom rollout` is relaxed to
+       * permit `--pin <oldtag>` even when that tag is older than the current
+       * `release.pin`. All other safety rails (canary order, version-assert,
+       * stop-on-mismatch, persist-after-canary, hostd/web deferral) apply
+       * unchanged. Absent ⇒ false (downgrade rejected as before).
+       */
+      allow_downgrade: z.boolean().optional(),
     })
     .required({ pin: true }),
 });
