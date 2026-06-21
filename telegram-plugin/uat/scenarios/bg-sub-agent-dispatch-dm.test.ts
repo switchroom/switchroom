@@ -5,187 +5,173 @@
  * Verifies three acceptance criteria from the RFC in a single run because
  * they share setup:
  *
- *   AC-1 — Background-dispatch-and-continue: card stays pinned past
- *          parent `turn_end`; fleet zone surfaces the running sub-agent.
- *   AC-2 — Done semantics: header reads 🌀 Background (not ✅ Done)
- *          while the bg sub-agent runs; flips to ✅ Done after it
- *          terminates.
- *   AC-3 — Live activity: card body materially changes across a 15s
- *          window while bg work is in flight (elapsed counter or fleet
- *          row's `last activity` advances) — proves the heartbeat +
- *          subagent-watcher are actually feeding the renderer.
+ *   AC-1 — Background-dispatch-and-continue: worker-feed message appears
+ *          while the background sub-agent runs; persists past parent
+ *          `turn_end` so the user can watch the worker in flight.
+ *   AC-2 — Done semantics: feed message reads `running ·` while the bg
+ *          sub-agent runs; flips to `finished · completed` (or `failed`)
+ *          after it terminates.
+ *   AC-3 — Live activity: feed body materially changes across a 6s window
+ *          while bg work is in flight (elapsed counter or narrative step
+ *          advances) — proves the subagent-watcher is actually feeding the
+ *          renderer.
  *
  * Prompt strategy: **Option 1 (explicit tool-naming)** per the RFC §
  * "Background-dispatch prompt". An earlier Option-2 (naturalistic)
  * attempt produced exactly the failure mode the RFC predicted —
- * model ran the sleeps inline via Bash, card never reached Background
+ * model ran the sleeps inline via Bash, feed never reached Background
  * phase. This test verifies the *visibility infra*, not the LLM's
  * delegation judgment; pinning the tool name and arg keeps the
  * scenario deterministic.
  *
- * Requires the same env as the other DM scenarios (see SETUP.md §6)
- * and the test-harness override `progress_card.delay_ms: 1000` so the
- * card actually fires on a short turn (SETUP.md §5).
+ * Architecture note (post-#1122 PR3): the pinned progress card was
+ * deleted. Background sub-agent visibility is now surfaced via the
+ * worker-activity-feed (`SWITCHROOM_WORKER_ACTIVITY_FEED=1`): a regular
+ * Telegram message that posts once the worker has been running for
+ * `firstPaintMin` (8s default on test-harness) and edits in-place as
+ * activity arrives. This test drives assertions against that feed.
  *
- * Runtime budget is generous — the inner deadlines sum to ~150s
- * worst-case (5s pin + 30s parent-ack + 30s background phase + 15s
- * delta-snapshot + 120s done) plus ~12s spinUp overhead. The outer
- * `it()` timeout absorbs the lot.
+ * Requires the same env as the other DM scenarios (see SETUP.md §6).
+ *
+ * Root causes fixed in #2501 (this PR):
+ *   Bug 1 — orphan correlation. `backfillJsonlAgentId` used a fuzzy
+ *           (agentType, description) match to link a newly-discovered JSONL
+ *           to its registry row. When the match failed (description null,
+ *           or race), `jsonl_agent_id` stayed NULL, so
+ *           `resolveWorkerFeedDispatch(getSubagentByJsonlId(db, id), …)`
+ *           returned `{ isBackground: false }` — routing the worker as a
+ *           foreground sub-agent and suppressing the worker-feed. Fix:
+ *           prefer the direct `toolUseId` PK lookup that Claude Code already
+ *           writes to `agent-<id>.meta.json`.
+ *   Bug 2 — liveness writes silently skipped. With `jsonl_agent_id = NULL`
+ *           (Bug 1 not fixed), `bumpSubagentActivity` queries by
+ *           `jsonl_agent_id` and finds nothing — every liveness tick is a
+ *           no-op and the last_activity_at column never updates. Fixed as a
+ *           consequence of Bug 1 (once the row is linked, liveness writes
+ *           land).
+ *
+ * Runtime budget is generous — the inner deadlines sum to ~225s
+ * worst-case (45s parent-ack + 75s feed-first-paint + 12s delta + 180s
+ * done) plus ~12s spinUp overhead. The outer `it()` timeout absorbs the lot.
+ * The 180s done-window accommodates the stall-detection path: the watcher
+ * fires `onFinish` 60s after the last JSONL event, because background
+ * workers don't reliably emit `sub_agent_turn_end`.
  */
 
 import { describe, expect, it } from "vitest";
 import { spinUp } from "../harness.js";
+import { WORKER_FEED_RE } from "../assertions.js";
 
 // Explicit dispatch prompt (Option 1 per the RFC §"Background-dispatch
 // prompt"). The naturalistic Option-2 version didn't reliably get the
 // model to use the Agent tool with run_in_background:true — first
 // attempt produced the failure mode the RFC predicted (parent ran the
-// sleeps inline via Bash; card never transitioned to Background).
+// sleeps inline via Bash; feed never surfaced Background-phase activity).
 //
 // This test asserts the VISIBILITY INFRA works, not that the model
 // makes good delegation judgments. Naming the tool + the arg lets the
-// scenario be deterministic. If the model can't be made to use the
-// Agent tool even with this prompt, that's an unrelated bug (model
-// alignment / tool registration) and the scenario fails distinctly
-// from the visibility-infra failure modes we're trying to catch.
+// scenario be deterministic.
 //
-// Time profile: ~60s of bg work, paced with three separate sleeps so
-// the worker emits multiple tool_use events the subagent-watcher can
-// surface as fresh `last activity` updates. We need the Background
-// phase to last long enough that we can take a snapshot, wait one
-// heartbeat tick (5s default), and snapshot again.
+// Time profile: ~60s of bg work, paced with ten short steps so the
+// worker emits multiple tool_use + narrative events the subagent-watcher
+// can surface as fresh edits. We need the Background phase to last long
+// enough to clear the 8s first-paint threshold and take a snapshot.
 const BG_DISPATCH_PROMPT =
   `Use the Agent tool with subagent_type "general-purpose" and ` +
   `run_in_background: true to dispatch a worker with this exact task: ` +
-  `"Run \`sleep 20\` via the Bash tool, then \`echo step1\`, then ` +
-  `\`sleep 20\` again, then \`echo step2\`, then \`sleep 20\` a third ` +
-  `time, then \`echo done\`. That's three separate Bash tool calls ` +
-  `with sleeps between echoes." After dispatching, send a brief reply ` +
-  `saying you've kicked off the background worker so I can watch the ` +
-  `progress card.`;
+  `"Do ten steps, ONE AT A TIME, k = 1 through 10. Before each step ` +
+  `write a brief one-sentence narration of what you are about to do, ` +
+  `then run \`sleep 2\` via the Bash tool, then run \`echo step-k\` via ` +
+  `the Bash tool (substitute the real number for k). Run every sleep and ` +
+  `every echo as its OWN separate Bash call — never batch or chain them ` +
+  `with && — and narrate before each so progress surfaces incrementally. ` +
+  `Do not stop early; complete all ten steps." After dispatching, send a ` +
+  `brief reply saying you've kicked off the background worker so I can ` +
+  `watch the progress feed.`;
 
-/**
- * STATUS: currently red — surfaces two real production bugs the
- * RFC §Risks predicted as possible-but-unverified. Marked `it.fails`
- * so a future fix flips it green and a regression flips it red again.
- *
- *   Bug 1 — orphan correlation. The parent's `Agent` tool_use_id
- *           doesn't get matched to the spawned `sub_agent_started`
- *           event. Gateway log: `pendingSpawns=0 correlated=orphan`.
- *           Result: `isBackgroundDispatch` is never set on the fleet
- *           member; the card's header phase transitions to Background
- *           only by accident (orphans defer too, but they don't carry
- *           the bg flag).
- *
- *   Bug 2 — subagent-watcher can't track the worker. Gateway log:
- *           `subagent-watcher: liveness skip <agentId> — row not in
- *           DB yet (Phase 2 Pre hook pending)`. Result: no
- *           sub_agent_tool_use events reach the fleet member; the
- *           fleet row's `last activity` field never updates with the
- *           worker's actual tool calls. The card edits we see are
- *           just elapsed-counter ticks from the heartbeat.
- *
- * Both bugs are real and live on `main`. The scenario above passes
- * AC-1 (card stays pinned), partially passes AC-2 (Background phase
- * fires) and AC-3 (card body changes — from heartbeat alone), and
- * fails AC-2's closing half (card never reaches Done in 120s because
- * the orphan never terminates from the gateway's view).
- *
- * When Bug 1 + Bug 2 are fixed, change `describe.skip` to `describe`
- * below — the assertions are correct; only the production code is
- * wrong.
- *
- * Update post-#1105: all five RFC bugs (1–5 in earlier PRs, 6–7 in
- * #1105) merged. Unskipped here for the next UAT re-run. If 6/6 ACs
- * pass, close #709 / #776 / #782 / #788.
- */
+const WORKER_RUNNING_RE = /running\s*·/i;
+const WORKER_DONE_RE = /finished\s*·\s*(completed|failed)/i;
+
 describe("uat: background sub-agent visibility (#709/#776/#782/#788)", () => {
   it(
-    "card stays pinned with 🌀 Background header + live fleet activity, then flips to ✅ Done",
+    "worker-feed appears with running status then flips to finished once the sub-agent completes",
     async () => {
       const sc = await spinUp({ agent: "test-harness" });
       try {
         await sc.sendDM(BG_DISPATCH_PROMPT);
 
-        // AC-1 step 1: card pins quickly (delay_ms: 1000 on test-harness).
-        // Generous timeout so a slow first-turn doesn't false-flag.
-        const card = await sc.expectPinnedCard({ timeout: 15_000 });
-        expect(card.messageId).toBeGreaterThan(0);
+        // Parent ack reply — confirms the parent turn closed.
+        await sc.expectMessage(/.+/, { from: "bot", timeout: 45_000 });
 
-        // Parent ack reply. Note: we DON'T strictly require the model
-        // to mention "dispatch" in the reply — naturalistic prompt means
-        // the model picks the wording. We just need *some* bot reply
-        // so we know the parent turn closed (which is the point where
-        // pre-fix the card would unpin).
-        await sc.expectMessage(/.+/, { from: "bot", timeout: 30_000 });
-
-        // AC-2: header MUST be 🌀 Background (post-#1039) or, if the
-        // bg dispatch happened so fast the worker hasn't started yet,
-        // it might still be ⚙️ Working with the parent zone done. We
-        // poll for the background phase with a 45s budget — long
-        // enough for the worker to actually start firing tools, short
-        // enough that "we never saw Background" surfaces as a real
-        // bug, not a timeout-tuning issue.
+        // AC-1 step 1: worker-feed message appears after first-paint delay
+        // (~8s default). The message starts with "🛠 Worker" and shows
+        // "running ·" while the worker is in flight. Generous timeout so a
+        // slow first tool_use + narrative doesn't false-flag.
         //
-        // The dual-acceptable phases below model the realistic flow:
-        // parent reply lands → header should be Background (or
-        // briefly still Working if the parent's `done` event lags
-        // the bg dispatch's tool_use).
-        const bgPhaseCard = await sc.waitForCardPhase(card, "background", {
-          timeout: 45_000,
+        // Distinct from the parent's ack — `expectMessage` starts observing
+        // from after the parent ack, so the feed paint is the next match.
+        const feed = await sc.expectMessage(WORKER_FEED_RE, {
+          from: "bot",
+          timeout: 75_000,
         });
-        expect(bgPhaseCard.text).toMatch(/🌀|Background/i);
-        // The negative — Done MUST NOT have fired before bg started.
-        // Asserts the defer-gate is doing its job. If this trips, the
-        // `hasLiveBackground` correlation at progress-card-driver.ts:1108
-        // is broken (or the bg dispatch never registered as a fleet
-        // member at all — see RFC §Phase 2 diagnosis paths).
-        expect(bgPhaseCard.text).not.toMatch(/✅|\bDone\b/i);
+        expect(feed.messageId).toBeGreaterThan(0);
+        expect(feed.text).toMatch(WORKER_FEED_RE);
 
-        // AC-3: card edits land regularly while bg runs. Snapshot
-        // the current card body, wait one heartbeat tick (5s default
-        // + 1s slack), then fetch the card body again. The body MUST
-        // differ (elapsed counter, fleet last-activity age, etc.).
+        // AC-2 step 1: feed body MUST show "running ·" (the in-flight
+        // status), NOT the terminal "finished ·" — the worker hasn't
+        // completed yet.
+        expect(feed.text).toMatch(WORKER_RUNNING_RE);
+        expect(feed.text).not.toMatch(WORKER_DONE_RE);
+
+        // AC-3: feed edits land regularly while the worker runs. Snapshot
+        // the current body, wait 12s (well above the 2.5s edit throttle,
+        // and enough that at least one step + sleep cycle completes), then
+        // re-fetch the SAME message. The body MUST differ (elapsed counter
+        // or narrative step advances).
         //
         // We re-fetch the SAME message via `driver.getMessage(chatId,
-        // cardId)` rather than `expectPinnedCard` because the latter
-        // listens for NEW pin events. Once the card is pinned, no
-        // further pin event fires — `expectPinnedCard` would wait
-        // for an event that never comes and time out spuriously even
-        // though the card is alive and being edited (caught in the
-        // first run of this scenario).
+        // msgId)` rather than `expectMessage(WORKER_FEED_RE)` because the
+        // latter listens for NEW messages. The feed edits in-place; a new
+        // send only happens on re-post (stale messageId). So re-fetching is
+        // the right shape.
         //
-        // If the card freezes — heartbeat dead, subagent-watcher not
-        // flushing, fleet member never registered — `afterDelta` will
-        // equal `beforeDelta` and surface the bug cleanly. If the
-        // card was unpinned by an over-eager defer-gate release,
-        // `getMessage` returns null and we surface it with a clear
-        // assertion.
-        const beforeDelta = bgPhaseCard.text;
-        await new Promise((r) => setTimeout(r, 6_000));
+        // 12s instead of 6s: the first edit arrives ~6-8s after paint (one
+        // step/sleep cycle), so 6s was racy. 12s gives a safe 2x margin.
+        const beforeDelta = feed.text;
+        await new Promise((r) => setTimeout(r, 12_000));
         const afterDeltaMsg = await sc.driver.getMessage(
           sc.botUserId,
-          bgPhaseCard.messageId,
+          feed.messageId,
         );
-        expect(afterDeltaMsg, "card message disappeared mid-flight (AC-1 regression)").not.toBeNull();
+        expect(afterDeltaMsg, "feed message disappeared mid-flight (AC-1 regression)").not.toBeNull();
         expect(afterDeltaMsg!.text).not.toBe(beforeDelta);
 
-        // AC-2 closing half: bg terminates → header flips to ✅ Done.
-        // Generous budget — the inner sleeps sum to ~60s but
-        // post-completion the deferred-completion gate plus the
-        // heartbeat cadence can add another 5-30s before the card
-        // finalises.
-        const doneCard = await sc.waitForCardPhase(bgPhaseCard, "done", {
-          timeout: 120_000,
-        });
-        expect(doneCard.text).toMatch(/✅|Done/i);
+        // AC-2 closing half: bg terminates → body flips to "finished ·
+        // completed". The terminal edit is triggered by the subagent-watcher's
+        // stall detection (60s after the last JSONL activity), because
+        // background Claude Code workers don't always emit a sub_agent_turn_end
+        // event. Budget: worker steps (~60s) + stall window (60s) + slack.
+        // From first-paint to terminal is typically 140-165s.
+        let doneText: string | null = null;
+        const deadline = Date.now() + 180_000;
+        while (Date.now() < deadline) {
+          const m = await sc.driver.getMessage(sc.botUserId, feed.messageId);
+          if (m != null && WORKER_DONE_RE.test(m.text)) {
+            doneText = m.text;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 3_000));
+        }
+        expect(doneText, "worker-feed never reached a terminal recap").not.toBeNull();
+        expect(doneText!).toMatch(/tools?/i);
+        // Body MUST have changed between first paint and terminal.
+        expect(doneText).not.toBe(beforeDelta);
       } finally {
         await sc.tearDown();
       }
     },
-    // Outer per-test budget: sum of inner deadlines (15 + 30 + 45 + 15 +
-    // 10 + 120 = 235s) + spinUp settle (~12s) + slack. Round up to keep
-    // the inner-deadline error visible if any of them trip.
-    300_000,
+    // Outer per-test budget: sum of inner deadlines (45 + 75 + 16 + 180 =
+    // 316s) + spinUp settle (~12s) + slack.
+    360_000,
   );
 });

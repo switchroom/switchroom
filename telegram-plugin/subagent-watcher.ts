@@ -504,13 +504,18 @@ interface FsLike {
  * PreToolUse hook (keyed on tool_use_id) but didn't yet know the JSONL stem.
  *
  * Strategy: read the `agent-<id>.meta.json` sibling Claude Code writes next
- * to each sub-agent JSONL. It carries the same `{ agentType, description }`
- * pair the parent passed to the Agent() tool. We match that pair to the
- * most-recent row in `subagents` where `jsonl_agent_id IS NULL` and link them.
+ * to each sub-agent JSONL. It carries `{ agentType, description, toolUseId }`
+ * where `toolUseId` is the primary key of the `subagents` row (written by
+ * `subagent-tracker-pretool.mjs` from `event.tool_use_id`). We use the direct
+ * `toolUseId` lookup first (exact PK match, race-safe); fall back to the fuzzy
+ * `(agentType, description)` match only when `toolUseId` is absent (older
+ * Claude Code versions that pre-date this field in the meta).
  *
  * Edge cases:
  *   - meta.json missing or unreadable: no-op (the row stays unlinked; liveness
  *     writes from this agent's JSONL won't land, but the system stays correct).
+ *   - `toolUseId` present but no matching row (hook crashed / race): fall
+ *     through to the fuzzy match so the link is still attempted.
  *   - Multiple in-flight rows with identical (agent_type, description): the
  *     most recently started one wins (FIFO matches dispatch order in practice).
  *   - Row already linked to a different agentId: SQL `WHERE jsonl_agent_id IS
@@ -526,7 +531,7 @@ export function backfillJsonlAgentId(
   log?: (msg: string) => void,
 ): void {
   const metaPath = jsonlPath.replace(/\.jsonl$/, '.meta.json')
-  let meta: { agentType?: string; description?: string }
+  let meta: { agentType?: string; description?: string; toolUseId?: string }
   try {
     const raw = readFileSync(metaPath, 'utf8')
     meta = JSON.parse(raw)
@@ -534,8 +539,8 @@ export function backfillJsonlAgentId(
     log?.(`subagent-watcher: backfill skip ${agentId} — meta.json not readable at ${metaPath}`)
     return
   }
-  if (!meta.agentType && !meta.description) {
-    log?.(`subagent-watcher: backfill skip ${agentId} — meta.json has no agentType/description`)
+  if (!meta.agentType && !meta.description && !meta.toolUseId) {
+    log?.(`subagent-watcher: backfill skip ${agentId} — meta.json has no agentType/description/toolUseId`)
     return
   }
 
@@ -545,27 +550,51 @@ export function backfillJsonlAgentId(
     .get(agentId)
   if (already != null) return
 
-  // Find the most-recent matching unmatched row.
-  const candidate = db
-    .prepare(`
-      SELECT id FROM subagents
-      WHERE jsonl_agent_id IS NULL
-        AND agent_type IS ?
-        AND description IS ?
-      ORDER BY started_at DESC
-      LIMIT 1
-    `)
-    .get(meta.agentType ?? null, meta.description ?? null) as { id: string } | null
+  // Primary path (Bug 1 fix): direct PK lookup via the toolUseId Claude Code
+  // writes to meta.json. The pretool hook inserts the row with `id =
+  // event.tool_use_id`, so this is an exact match with no ambiguity — no
+  // race, no description-collision, no fuzzy-match false-negative.
+  let candidateId: string | null = null
+  if (meta.toolUseId) {
+    const direct = db
+      .prepare('SELECT id FROM subagents WHERE id = ? AND jsonl_agent_id IS NULL LIMIT 1')
+      .get(meta.toolUseId) as { id: string } | null
+    if (direct != null) {
+      candidateId = direct.id
+      log?.(`subagent-watcher: backfill direct-key match ${agentId} → ${candidateId} (toolUseId=${meta.toolUseId})`)
+    } else {
+      log?.(`subagent-watcher: backfill direct-key miss ${agentId} toolUseId=${meta.toolUseId} — falling back to fuzzy match`)
+    }
+  }
 
-  if (candidate == null) {
-    log?.(`subagent-watcher: backfill no candidate for ${agentId} (type=${meta.agentType} desc=${meta.description})`)
+  // Fallback path: fuzzy (agentType, description) match for older Claude Code
+  // versions whose meta.json predates the toolUseId field.
+  if (candidateId == null && (meta.agentType || meta.description)) {
+    const fuzzy = db
+      .prepare(`
+        SELECT id FROM subagents
+        WHERE jsonl_agent_id IS NULL
+          AND agent_type IS ?
+          AND description IS ?
+        ORDER BY started_at DESC
+        LIMIT 1
+      `)
+      .get(meta.agentType ?? null, meta.description ?? null) as { id: string } | null
+    if (fuzzy != null) {
+      candidateId = fuzzy.id
+      log?.(`subagent-watcher: backfill fuzzy match ${agentId} → ${candidateId} (type=${meta.agentType} desc=${meta.description})`)
+    }
+  }
+
+  if (candidateId == null) {
+    log?.(`subagent-watcher: backfill no candidate for ${agentId} (toolUseId=${meta.toolUseId} type=${meta.agentType} desc=${meta.description})`)
     return
   }
 
   db
     .prepare('UPDATE subagents SET jsonl_agent_id = ? WHERE id = ?')
-    .run(agentId, candidate.id)
-  log?.(`subagent-watcher: backfill linked ${agentId} → ${candidate.id}`)
+    .run(agentId, candidateId)
+  log?.(`subagent-watcher: backfill linked ${agentId} → ${candidateId}`)
 
   // Backfill parent_turn_key (gateway-side). The PreToolUse hook can't know
   // the gateway-minted Telegram turn_key (a chat+topic+turn key) — it only
@@ -588,7 +617,7 @@ export function backfillJsonlAgentId(
   try {
     const linkedRow = db
       .prepare('SELECT started_at, parent_turn_key FROM subagents WHERE id = ?')
-      .get(candidate.id) as { started_at: number; parent_turn_key: string | null } | null
+      .get(candidateId) as { started_at: number; parent_turn_key: string | null } | null
     if (linkedRow != null && linkedRow.parent_turn_key == null) {
       const turn = db
         .prepare(
@@ -600,12 +629,12 @@ export function backfillJsonlAgentId(
       if (turn?.turn_key != null) {
         db
           .prepare('UPDATE subagents SET parent_turn_key = ? WHERE id = ?')
-          .run(turn.turn_key, candidate.id)
-        log?.(`subagent-watcher: backfill parent_turn_key ${candidate.id} → ${turn.turn_key}`)
+          .run(turn.turn_key, candidateId)
+        log?.(`subagent-watcher: backfill parent_turn_key ${candidateId} → ${turn.turn_key}`)
       }
     }
   } catch (err) {
-    log?.(`subagent-watcher: parent_turn_key backfill skipped for ${candidate.id} — ${(err as Error).message}`)
+    log?.(`subagent-watcher: parent_turn_key backfill skipped for ${candidateId} — ${(err as Error).message}`)
   }
 }
 

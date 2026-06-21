@@ -90,6 +90,16 @@ function writeMeta(agentType: string, description: string): string {
   return jsonlPath
 }
 
+/**
+ * Write meta.json with a `toolUseId` field (Bug 1 fix — direct PK lookup).
+ * Modern Claude Code versions write this alongside `agentType` and `description`.
+ */
+function writeMetaWithToolUseId(toolUseId: string, agentType: string, description: string): string {
+  const jsonlPath = join(tempDir, 'worker.jsonl')
+  writeFileSync(join(tempDir, 'worker.meta.json'), JSON.stringify({ agentType, description, toolUseId }))
+  return jsonlPath
+}
+
 function readSub(id: string) {
   return db.prepare('SELECT jsonl_agent_id, parent_turn_key FROM subagents WHERE id = ?').get(id) as
     | { jsonl_agent_id: string | null; parent_turn_key: string | null }
@@ -151,6 +161,57 @@ describe('backfillJsonlAgentId — parent_turn_key resolution', () => {
     // Still linked, but no turn to attribute it to.
     expect(row?.jsonl_agent_id).toBe('agentstem_d')
     expect(row?.parent_turn_key == null).toBe(true)
+  })
+})
+
+// ─── #2501: direct toolUseId PK lookup (Bug 1 fix) ───────────────────────────
+// Claude Code writes `toolUseId` to meta.json so backfillJsonlAgentId can
+// match the row by its primary key instead of the fuzzy (agentType, description)
+// match that fails when descriptions collide or are null.
+describe('backfillJsonlAgentId — toolUseId direct PK lookup (#2501)', () => {
+  it('uses toolUseId from meta.json to link the row directly by PK', () => {
+    insertTurn({ turnKey: '555:10', chatId: '555', startedAt: 1000, endedAt: 2000 })
+    insertSub({ id: 'toolu_direct', agentType: 'general-purpose', description: null as unknown as string, startedAt: 1500 })
+
+    const jsonlPath = writeMetaWithToolUseId('toolu_direct', 'general-purpose', '')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_direct')
+
+    const row = readSub('toolu_direct')
+    expect(row?.jsonl_agent_id).toBe('agentstem_direct')
+  })
+
+  it('direct PK lookup succeeds even when description is null (fuzzy match would fail)', () => {
+    // Two rows with the same agentType and NULL description — fuzzy match is ambiguous.
+    insertSub({ id: 'toolu_null_desc_1', agentType: 'general-purpose', description: null as unknown as string, startedAt: 1000 })
+    insertSub({ id: 'toolu_null_desc_2', agentType: 'general-purpose', description: null as unknown as string, startedAt: 2000 })
+
+    // meta.json carries the exact toolUseId for the first row.
+    const jsonlPath = writeMetaWithToolUseId('toolu_null_desc_1', 'general-purpose', '')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_null_desc')
+
+    // Must link to the first row, not the more-recent second one.
+    expect(readSub('toolu_null_desc_1')?.jsonl_agent_id).toBe('agentstem_null_desc')
+    expect(readSub('toolu_null_desc_2')?.jsonl_agent_id).toBeNull()
+  })
+
+  it('falls back to fuzzy match when toolUseId in meta.json does not match any row', () => {
+    insertSub({ id: 'toolu_fuzzy', agentType: 'researcher', description: 'Find stuff', startedAt: 1000 })
+
+    // toolUseId points at a non-existent row; fuzzy match should still work.
+    const jsonlPath = writeMetaWithToolUseId('toolu_NONEXISTENT', 'researcher', 'Find stuff')
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_fuzzy_fallback')
+
+    expect(readSub('toolu_fuzzy')?.jsonl_agent_id).toBe('agentstem_fuzzy_fallback')
+  })
+
+  it('meta.json with only toolUseId and no agentType/description still links the row', () => {
+    insertSub({ id: 'toolu_id_only', agentType: null as unknown as string, description: null as unknown as string, startedAt: 1000 })
+
+    const jsonlPath = join(tempDir, 'worker.jsonl')
+    writeFileSync(join(tempDir, 'worker.meta.json'), JSON.stringify({ toolUseId: 'toolu_id_only' }))
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_id_only')
+
+    expect(readSub('toolu_id_only')?.jsonl_agent_id).toBe('agentstem_id_only')
   })
 })
 
