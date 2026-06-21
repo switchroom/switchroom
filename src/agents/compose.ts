@@ -27,6 +27,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
+import { isValidTimezone } from "../config/schema.js";
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import { resolveAgentConfig } from "../config/merge.js";
@@ -2033,6 +2034,36 @@ function emitAgentService(
     lines.push(
       `      - ${homePrefix}/.switchroom/fleet:${homePrefix}/.switchroom/fleet:ro`,
     );
+  }
+  // /etc/localtime passthrough — keep the system clock zone in sync with
+  // the resolved per-agent timezone (#1198 follow-up). `TZ` /
+  // `SWITCHROOM_TIMEZONE` (emitted in `emitAgentServiceEnv`) already
+  // cover everything that reads the `TZ` env var — glibc `date(1)`,
+  // Node `Intl`, Python, cron. But statically-linked Go binaries and
+  // some Java runtimes ignore `TZ` and read `/etc/localtime` directly,
+  // so without this they see the base image's UTC regardless of the
+  // operator's declared zone. We CANNOT fix this from inside start.sh:
+  // the agent process runs as the unprivileged uid (Dockerfile.agent
+  // `USER 10001`, compose `user: <uid>:<uid>`) on a `read_only: true`
+  // rootfs with `cap_drop: ALL` + `no-new-privileges`, so `ln -sf
+  // /etc/localtime` would hard-fail. A docker-daemon bind mount is
+  // applied by the daemon (root) BEFORE the entrypoint and is exempt
+  // from the read-only rootfs — the right layer for this. Source is the
+  // host's zoneinfo file for the resolved zone. `a.timezone` is IANA-
+  // validated on the config-sourced branches, but `resolveTimezone`'s
+  // server-detection fallback (`/etc/timezone` contents / `/etc/localtime`
+  // symlink tail) is NOT run through `isValidTimezone` — so re-validate
+  // here before interpolating into a path, keeping a stray `..` out of
+  // the bind source regardless of how the zone was resolved. Only
+  // `/etc/localtime` is synced (not `/etc/timezone`); the Go/JVM readers
+  // this targets read `/etc/localtime`, and the rest honor `TZ`.
+  // existsSync-guarded because docker compose `up` hard-fails on a missing
+  // bind source and an exotic host may lack tzdata — when absent we skip
+  // and fall back to the env-var path (the cosmetic 95% case). Same host
+  // path inside the container, so a plain absolute bind with no
+  // `homePrefix` rewrite.
+  if (isValidTimezone(a.timezone) && existsSync(`/usr/share/zoneinfo/${a.timezone}`)) {
+    lines.push(`      - /usr/share/zoneinfo/${a.timezone}:/etc/localtime:ro`);
   }
   // PER-AGENT credentials mount (sec WS6-F2, #1390). Previously the
   // ENTIRE `~/.switchroom/credentials/` dir was bind-mounted `:ro`
