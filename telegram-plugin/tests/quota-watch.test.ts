@@ -369,24 +369,96 @@ describe("patchQuotaWatchState", () => {
 describe("evaluateFleetAllExhausted", () => {
   const notAlerting = { lastNotifiedHealth: null, lastNotifiedAt: 0 };
   const alerting = { lastNotifiedHealth: "throttling" as const, lastNotifiedAt: 1000 };
+  // Use a realistic "now" so a fresh probe (capturedAt near NOW) and a stale
+  // probe (capturedAt older than maxStaleMs) are unambiguous.
+  const NOW = 10_000_000_000;
+  const STALE = DEFAULT_QUOTA_WATCH_MAX_STALE_MS;
+  const gate = { maxStaleMs: STALE };
+  /** A fresh live snapshot captured `ageMs` ago (default: just now). */
+  const freshProbe = (ageMs = 0) => ({ capturedAt: NOW - ageMs });
+  /** A stale snapshot, captured just past the staleness ceiling. */
+  const staleProbe = () => ({ capturedAt: NOW - STALE - 1 });
 
-  it("notifies (entered) when every account is exhausted and we weren't alerting", () => {
+  it("notifies (entered) when every exhausted account is backed by a FRESH probe", () => {
     const d = evaluateFleetAllExhausted({
       accounts: [
-        { label: "a", exhausted: true, exhausted_until: 5_000 },
-        { label: "b", exhausted: true, exhausted_until: 9_000 },
+        { label: "a", exhausted: true, exhausted_until: NOW + 5_000, last_quota: freshProbe() },
+        { label: "b", exhausted: true, exhausted_until: NOW + 9_000, last_quota: freshProbe(60_000) },
       ],
       prev: notAlerting,
-      now: 1_000,
+      now: NOW,
+      tuning: gate,
     });
     expect(d.kind).toBe("notify");
     if (d.kind === "notify") {
       expect(d.transition).toBe("entered");
       expect(d.newState.lastNotifiedHealth).toBe("throttling");
       expect(d.message).toContain("All accounts exhausted");
-      // earliest reset is the 5_000 one
+      // earliest reset is the +5_000 one
       expect(d.message).toContain("Earliest reset");
     }
+  });
+
+  it("skips (probe-blind) when all exhausted rests on STALE marks with no fresh probe (#2478)", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, exhausted_until: NOW + 5_000, last_quota: staleProbe() },
+        { label: "b", exhausted: true, exhausted_until: NOW + 9_000, last_quota: null },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") expect(d.reason).toBe("probe-blind");
+  });
+
+  it("skips (probe-blind) on MIXED freshness — one stale-mark-only account is enough (#2478)", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, exhausted_until: NOW + 5_000, last_quota: freshProbe() },
+        { label: "b", exhausted: true, exhausted_until: NOW + 9_000, last_quota: staleProbe() },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") expect(d.reason).toBe("probe-blind");
+  });
+
+  it("notifies (entered) on a genuine serve-blocking overage (out_of_credits) with a fresh probe", () => {
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        {
+          label: "a",
+          exhausted: true,
+          last_quota: { capturedAt: NOW, overageDisabledReason: "out_of_credits" },
+        },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind === "notify") expect(d.transition).toBe("entered");
+  });
+
+  it("out_of_credits corroborates exhaustion even when the snapshot is past the staleness ceiling", () => {
+    // A serve-blocking overage is exhaustion in its own right — age-independent.
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        {
+          label: "a",
+          exhausted: true,
+          last_quota: { capturedAt: NOW - STALE - 1, overageDisabledReason: "out_of_credits" },
+        },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("notify");
   });
 
   it("skips (still) when all exhausted and already alerting — no re-spam", () => {
@@ -394,15 +466,19 @@ describe("evaluateFleetAllExhausted", () => {
       accounts: [{ label: "a", exhausted: true }, { label: "b", exhausted: true }],
       prev: alerting,
       now: 2_000,
+      tuning: gate,
     });
     expect(d.kind).toBe("skip");
   });
 
-  it("notifies (recovered) when one account frees after we were alerting", () => {
+  it("notifies (recovered) when one account frees after we were alerting — UNGUARDED by probe-blind", () => {
+    // Recovery must fire even when freshness data is absent, so a legitimately
+    // fired alert is never stranded (#2478 scope: gate only the `entered` edge).
     const d = evaluateFleetAllExhausted({
       accounts: [{ label: "a", exhausted: false }, { label: "b", exhausted: true }],
       prev: alerting,
       now: 3_000,
+      tuning: gate,
     });
     expect(d.kind).toBe("notify");
     if (d.kind === "notify") {
@@ -413,20 +489,51 @@ describe("evaluateFleetAllExhausted", () => {
     }
   });
 
+  it("entered then recovered: a legit fire (fresh probes) is followed by a working recovery edge", () => {
+    const entered = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, last_quota: freshProbe() },
+        { label: "b", exhausted: true, last_quota: freshProbe() },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(entered.kind).toBe("notify");
+    if (entered.kind !== "notify") return;
+    expect(entered.transition).toBe("entered");
+    // Feed the persisted state forward; one account frees.
+    const recovered = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: false, last_quota: freshProbe() },
+        { label: "b", exhausted: true, last_quota: freshProbe() },
+      ],
+      prev: entered.newState,
+      now: NOW + 60_000,
+      tuning: gate,
+    });
+    expect(recovered.kind).toBe("notify");
+    if (recovered.kind === "notify") expect(recovered.transition).toBe("recovered");
+  });
+
   it("skips (not-all) when some account is healthy and we weren't alerting", () => {
     const d = evaluateFleetAllExhausted({
       accounts: [{ label: "a", exhausted: false }, { label: "b", exhausted: true }],
       prev: notAlerting,
       now: 4_000,
+      tuning: gate,
     });
     expect(d.kind).toBe("skip");
   });
 
   it("never alerts on an empty fleet", () => {
-    expect(evaluateFleetAllExhausted({ accounts: [], prev: notAlerting, now: 1 }).kind).toBe("skip");
+    expect(
+      evaluateFleetAllExhausted({ accounts: [], prev: notAlerting, now: 1, tuning: gate }).kind,
+    ).toBe("skip");
   });
 
-  it("shows reset-unknown when no exhausted_until is present", () => {
+  it("with the gate disabled (maxStaleMs 0) the legacy bare-mark behaviour is preserved", () => {
+    // Kill-switch parity: tuning omitted / 0 → fire on bare marks (pre-#2478).
     const d = evaluateFleetAllExhausted({
       accounts: [{ label: "a", exhausted: true }],
       prev: notAlerting,

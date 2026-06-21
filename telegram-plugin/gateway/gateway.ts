@@ -16000,6 +16000,10 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
       accounts: listStateData.accounts,
       prev: fleetPrev,
       now,
+      // #2478: the same staleness ceiling the per-account loop uses. Gates the
+      // `entered` alert behind live corroboration so a probe blackout's stale
+      // marks can't false-fire 🔴 All accounts exhausted.
+      tuning,
     })
     if (fleetDecision.kind === 'notify') {
       for (const chat_id of access.allowFrom) {
