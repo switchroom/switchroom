@@ -419,7 +419,12 @@ function exhaustionLiveCorroborated(
   const lq = account.last_quota;
   if (!lq) return false;
   if (lq.overageDisabledReason === "out_of_credits") return true;
-  return now - lq.capturedAt <= maxStaleMs;
+  // Mirror `snapshotFresh`'s clock-skew guard: a future-dated `capturedAt`
+  // makes `now - capturedAt` negative and would slip past the staleness gate,
+  // so a skewed snapshot reads as fresh. Reject snapshots dated more than the
+  // broker's 60_000 ms tolerance ahead of `now` (matches the inline literal in
+  // `snapshotFresh`, src/auth/broker/account-eligibility.ts).
+  return now - lq.capturedAt <= maxStaleMs && lq.capturedAt <= now + 60_000;
 }
 
 function buildAllExhaustedMessage(
