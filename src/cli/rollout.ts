@@ -329,7 +329,7 @@ export function executeRollout(
         // On the hostd path this runs AFTER the canary is green; on the
         // host-shell path it runs FIRST. Either way: durably persist so
         // subsequent reconciles read the same pin.
-        deps.log(`→ persist release.pin=${step.pin} to switchroom.yaml`);
+        deps.log(`ROLL_STEP persist-pin — release.pin=${step.pin} to switchroom.yaml`);
         if (deps.persistPin) {
           deps.persistPin(step.pin);
         } else {
@@ -341,7 +341,7 @@ export function executeRollout(
         // hostd path: pin not yet persisted (it follows the canary), so
         // pass the one-shot --pin so compose regenerates on the target.
         // host-shell path: pin already persisted → bare apply reads it.
-        deps.log(`→ apply — regenerating compose for ${target}`);
+        deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
         const applyArgs = execOpts.hostdContext
           ? ["apply", "--pin", target]
           : ["apply"];
@@ -352,7 +352,7 @@ export function executeRollout(
         break;
       }
       case "restart-agent": {
-        deps.log(`→ restart ${step.agent} (--wait --force)`);
+        deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
         // `agent restart` can exit 0 while still "polling" on boot — do
         // NOT trust its status; the version assert is the real gate.
         deps.run(["agent", "restart", step.agent, "--wait", "--force"]);
@@ -373,19 +373,19 @@ export function executeRollout(
         break;
       }
       case "refresh-web": {
-        deps.log(`→ webd install --tag ${target}`);
+        deps.log(`ROLL_STEP refresh-web — webd install --tag ${target}`);
         const r = deps.run(["webd", "install", "--tag", target]);
         if (r.status !== 0) warnings.push(`web refresh failed (non-fatal); agents already rolled`);
         break;
       }
       case "refresh-hostd": {
-        deps.log(`→ hostd install --tag ${target}`);
+        deps.log(`ROLL_STEP refresh-hostd — hostd install --tag ${target}`);
         const r = deps.run(["hostd", "install", "--tag", target]);
         if (r.status !== 0) warnings.push(`hostd refresh failed (non-fatal); agents already rolled`);
         break;
       }
       case "sweep": {
-        deps.log(`→ sweep`);
+        deps.log(`ROLL_STEP sweep`);
         for (const a of rolled) {
           const v = deps.probeVersion(a);
           deps.log(`  ${a}: ${v ?? "<unreachable>"}`);
