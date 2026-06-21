@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.48 — live activity feed never goes dark on a working turn
+
+A productive foreground turn could read as pure silence. The activity feed was
+purely tool-driven (it opened only when a tool emitted a non-null label), so a
+turn dominated by thinking or by suppressed-by-design tools (typing / memory /
+reply) never opened a feed and looked idle until the 300s silence-poke.
+
+- **Liveness-driven feed open.** `feedHeartbeatTick` now opens a minimal
+  `Working…` feed once a turn has been alive `SWITCHROOM_FEED_LIVENESS_OPEN_MS`
+  (default 12s) with no labelled tool yet, and keeps its elapsed climbing via
+  the existing 6s heartbeat. The first real tool label takes over and its edit
+  replaces the placeholder; a pure-thinking turn finalizes to `✓ Working…`
+  rather than freezing on the live line. Kill switch `SWITCHROOM_FEED_LIVENESS_OPEN=0`.
+  Validated live on the UAT harness (feed opened at `→ Working… · 7s` on a
+  tool-less turn).
+- **Never-null tool labels.** `computeLabel` no longer returns `null` for an
+  unrecognized built-in tool (the fallthrough) or an empty-slug `Skill` — a
+  null label wrote no sidecar line, so a turn whose first/only tool hit that
+  path opened no feed at all. Surface/control tools (reply / react / send_typing
+  / sync_retain) stay suppressed (pinned by new tests).
+- **labeledToolCount counted after the feed push (#2461 Phase 5).** The
+  `tools=` lifecycle field and `✓ N steps` total now increment only when a
+  label actually renders, so dropped/empty labels no longer inflate the count.
+- **UAT coverage.** New `jtbd-liveness-feed-open-dm` scenario plus the
+  re-homed foreground feed-visibility scenarios pin the feed-open invariant.
+
 ## v0.15.45 — profile-bank visibility + retire per-agent user-profile mental models
 
 Follow-ups to the per-user memory work (v0.15.44).
