@@ -149,9 +149,10 @@ export function computeLabel(toolName, input) {
       // the progress card path that used to surface this was retired
       // when `progressDriver` was nulled out in #1122 PR3.
       const slug = clip(asText(i.skill), 64)
-      // Never-null: a Skill call with an empty slug still opens the feed
-      // (a degenerate first-tool Skill would otherwise read as silence).
-      return slug ? `Running skill ${slug}` : 'Running a skill'
+      // Empty-slug Skill stays suppressed (degenerate/malformed call): the
+      // liveness feed-open backstops visibility for a tool-less turn, so this
+      // does not need a label. Keeps the #2111 sidecar contract.
+      return slug ? `Running skill ${slug}` : null
     }
   }
 
