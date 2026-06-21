@@ -68,10 +68,12 @@ describe('classifyHealth', () => {
   it('returns unknown when quota probe failed', () => {
     expect(classifyHealth(snap({ quota: null, quotaError: 'HTTP 401' }))).toBe('unknown');
   });
-  it('out_of_credits overage at 0% util → blocked (the credits-dead account)', () => {
+  it('out_of_credits overage at 0% util → healthy (demoted to informational — serves fine from quota)', () => {
+    // THE KEY CHANGE: out_of_credits is no longer serve-blocking. An account at
+    // 0% util with out_of_credits is a valid failover target (pixsoul scenario).
     expect(
       classifyHealth(snap({ quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' }) })),
-    ).toBe('blocked');
+    ).toBe('healthy');
   });
   it('org_level_disabled at 75% util → unchanged/healthy (MANDATORY non-regression: live active account)', () => {
     // overageStatus:"rejected" + the benign reason must NOT flip it to blocked.
@@ -679,13 +681,22 @@ describe('#2494 Bug A — refill-aware classifyHealth', () => {
   });
 });
 
-// ── #2494 Bug C — quota-exhausted vs billing-dead, thin probe ────────────
+// ── #2494 Bug C — quota-exhausted vs thin probe (billing-dead demoted) ────────
 
-describe('#2494 Bug C — blockedReason + thin probe', () => {
-  it('out_of_credits → billing-dead', () => {
+describe('#2494 Bug C — blockedReason + thin probe (out_of_credits now informational)', () => {
+  it('out_of_credits at 0% util → healthy (demoted from billing-dead to informational)', () => {
+    // THE KEY CHANGE: out_of_credits is no longer a blocked state.
     const s = snap({ quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+    expect(blockedReason(s, NOW)).toBeNull(); // not blocked → no blocked reason
+  });
+
+  it('out_of_credits at HIGH util is still blocked (via util wall, not credits)', () => {
+    // blocked because 5h>=99.5%, NOT because of out_of_credits
+    const futureReset = new Date(NOW.getTime() + 30 * 60_000);
+    const s = snap({ quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset, overageDisabledReason: 'out_of_credits' }) });
     expect(classifyHealth(s, NOW)).toBe('blocked');
-    expect(blockedReason(s, NOW)).toBe('billing-dead');
+    expect(blockedReason(s, NOW)).toBe('quota-exhausted'); // blocked by quota, not billing
   });
 
   it('a maxed window (no overage reason) → quota-exhausted (recoverable)', () => {
@@ -696,6 +707,12 @@ describe('#2494 Bug C — blockedReason + thin probe', () => {
 
   it('blockedReason is null for a non-blocked account', () => {
     expect(blockedReason(snap({ quota: quota({ fiveHourUtilizationPct: 10 }) }), NOW)).toBeNull();
+  });
+
+  it('org_level_disabled behavior is unchanged — still healthy', () => {
+    const s = snap({ quota: quota({ fiveHourUtilizationPct: 75, sevenDayUtilizationPct: 40, overageStatus: 'rejected', overageDisabledReason: 'org_level_disabled' }) });
+    expect(classifyHealth(s, NOW)).toBe('healthy');
+    expect(blockedReason(s, NOW)).toBeNull();
   });
 
   it('a thin/headerless probe classifies unknown, never a confident 0%/healthy', () => {
@@ -720,19 +737,39 @@ describe('#2494 Bug C — blockedReason + thin probe', () => {
   });
 });
 
-// ── #2494 — row rendering distinguishes the states ──────────────────────
+// ── #2494 — row rendering: out_of_credits as informational annotation ─────────
 
-describe('#2494 — renderAuthSnapshotFormat2 row rendering', () => {
-  it('billing-dead row says "billing disabled" with the reason, no timer', () => {
+describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demoted)', () => {
+  it('out_of_credits at 0% util → healthy row with informational overage annotation, NOT blocked', () => {
+    // THE KEY CHANGE: pixsoul scenario — 0% util, out_of_credits → healthy group
+    // with an informational sub-line "overage off (out_of_credits) — serving from quota"
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'dead@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) })],
       { now: NOW },
     );
-    expect(out).toContain('billing disabled (out_of_credits)');
+    // Must be in HEALTHY group, not BLOCKED
+    expect(out).toContain('🟢 <b>HEALTHY</b>');
+    expect(out).not.toContain('🔴 <b>BLOCKED</b>');
+    // Must have informational annotation
+    expect(out).toContain('overage off (out_of_credits) — serving from quota');
+    // Must NOT have old blocked framing
+    expect(out).not.toContain('billing disabled');
+    expect(out).not.toContain("won't recover until billing is fixed");
     expect(out).not.toContain('quota exhausted');
   });
 
-  it('quota-exhausted row shows a recovery countdown, not "billing disabled"', () => {
+  it('out_of_credits account is a valid failover target (appears in buildSnapshotKeyboard switch buttons)', () => {
+    // A 0%-util out_of_credits account must be offerable as a switch target
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }), // blocked, active
+      snap({ label: 'pixsoul@gmail.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
+    ];
+    const rows = buildSnapshotKeyboard(snaps);
+    const allText = rows.flat().map((b) => b.text);
+    expect(allText).toContain('Switch fleet → pixsoul@gmail.com');
+  });
+
+  it('quota-exhausted row shows a recovery countdown, not "billing disabled" or overage annotation', () => {
     const futureReset = new Date(NOW.getTime() + 45 * 60_000);
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'ex@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) })],
@@ -740,6 +777,7 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering', () => {
     );
     expect(out).toContain('quota exhausted');
     expect(out).not.toContain('billing disabled');
+    expect(out).not.toContain('overage off');
   });
 
   it('thin probe row renders "quota unknown", not "0% / 0%"', () => {
@@ -749,5 +787,27 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering', () => {
     );
     expect(out).toContain('quota unknown');
     expect(out).not.toContain('0% / 0%');
+  });
+
+  it('org_level_disabled at 85% util has no overage annotation (only in OVERAGE_EXHAUSTED_REASONS)', () => {
+    // org_level_disabled is NOT on the OVERAGE_EXHAUSTED_REASONS list → no annotation
+    const out = renderAuthSnapshotFormat2(
+      [snap({ label: 'org@x', isActive: false, quota: quota({ fiveHourUtilizationPct: 85, overageDisabledReason: 'org_level_disabled' }) })],
+      { now: NOW },
+    );
+    expect(out).toContain('🟡 <b>THROTTLING</b>');
+    expect(out).not.toContain('overage off');
+  });
+
+  it('recommendation treats out_of_credits 0%-util account as healthy alternative', () => {
+    // The active account is blocked (quota), the out_of_credits 0%-util account
+    // is the only alternative — it must be recommended as the switch target.
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'main@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }), // blocked
+      snap({ label: 'pixsoul@gmail.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
+    ];
+    const out = recommendation(snaps, NOW);
+    expect(out).toContain('switch to pixsoul@gmail.com');
+    expect(out).not.toContain('All accounts blocked');
   });
 });

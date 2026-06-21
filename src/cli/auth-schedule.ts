@@ -32,7 +32,7 @@ import type {
   AccountState,
   ProbeQuotaData,
 } from "../auth/broker/client.js";
-import { SERVE_BLOCKING_OVERAGE_REASONS } from "../auth/broker/account-eligibility.js";
+import { OVERAGE_EXHAUSTED_REASONS } from "../auth/broker/account-eligibility.js";
 import { refillNormalizedUtils } from "../auth/quota.js";
 
 // ─── Pure model ──────────────────────────────────────────────────────────
@@ -45,16 +45,17 @@ export interface WindowSnapshot {
   /** Where the numbers came from: a live probe, the broker's cache, or nothing. */
   source: "live" | "cached" | "none";
   /**
-   * True when the probe/cache carried a serve-blocking `overageDisabledReason`
-   * (`out_of_credits`) — the account is dead even at 0% util. Discriminated on
-   * the same strict allowlist the broker uses (see SERVE_BLOCKING_OVERAGE_
-   * REASONS); `org_level_disabled` / null / unknown are benign → false.
+   * True when the probe/cache carried an `overageDisabledReason` on the
+   * informational allowlist (`out_of_credits`). Informational only — this flag
+   * means "no overage headroom", NOT that the account is dead or serve-blocked.
+   * Use `overageReason` to annotate the display; never use this to block serving.
+   * `org_level_disabled` / null / unknown are benign → false.
    */
   overageServeBlocking: boolean;
   /**
-   * #2494 Bug C — the live overage-disabled reason carried by the probe/cache,
-   * when serve-blocking. Surfaced verbatim by the renderer so a billing-dead
-   * account names the real reason ("out_of_credits"), not just a state word.
+   * The live overage-disabled reason carried by the probe/cache, when on the
+   * informational allowlist. Surfaced verbatim by the renderer as an annotation
+   * on a healthy/throttling row ("out_of_credits") — NOT as a blocked state.
    */
   overageReason: string | null;
   /**
@@ -65,23 +66,31 @@ export interface WindowSnapshot {
   probeThin: boolean;
 }
 
-/** Is a probe/cache overage reason serve-blocking? Mirrors the broker's
- *  isOverageServeBlocking using the shared strict allowlist. */
+/** Does a probe/cache overage reason appear on the informational allowlist?
+ *  Informational only — MUST NOT gate serving. Mirrors OVERAGE_EXHAUSTED_REASONS. */
 function overageReasonBlocks(reason: string | null | undefined): boolean {
-  return reason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(reason);
+  return reason != null && OVERAGE_EXHAUSTED_REASONS.has(reason);
 }
 
 export type AccountWindowState =
-  | "out-of-credits"
   // #2494 Bug C — recoverable quota exhaustion: a util window is maxed but the
-  // account comes back when that window rolls. Distinct from the terminal
-  // billing-dead "out-of-credits"; carries a reset countdown.
+  // account comes back when that window rolls. Carries a reset countdown.
   | "quota-exhausted"
   | "healthy"
   | "5h-walled"
   | "weekly-walled"
   | "walled"
   | "unprobed";
+
+/**
+ * "out-of-credits" is no longer a state that blocks serving. An account with
+ * `out_of_credits` at low util is healthy — `overageServeBlocking` is surfaced
+ * as an informational annotation on the row, not as a separate wall state.
+ * This alias exists so any code that references the old state string still
+ * compiles during the transition; treat it as "healthy" semantically.
+ * @deprecated — kept for backwards compat only; do not add new references.
+ */
+export type LegacyOutOfCreditsState = "out-of-credits";
 
 /** Weekly utilization at/above this is treated as walled (mirrors the broker's sensor). */
 const WEEKLY_WALL_PCT = 99.5;
@@ -157,6 +166,11 @@ function isThin(d: {
  * load-bearing distinction. When we have window reset timestamps we match
  * `exhausted_until` against them precisely; otherwise we fall back to a
  * duration heuristic (a 5h wall resets within hours, a weekly wall in days).
+ *
+ * NOTE: `overageServeBlocking` (out_of_credits) is NOT a wall state. An account
+ * with out_of_credits at low util serves fine from quota — it is healthy. The
+ * renderer surfaces it as an informational annotation ("overage off") on the
+ * row, not as a separate state. Do NOT add a return "out-of-credits" here.
  */
 export function classifyState(args: {
   exhausted: boolean;
@@ -165,11 +179,6 @@ export function classifyState(args: {
   now: Date;
 }): AccountWindowState {
   const { exhausted, exhaustedUntil, window, now } = args;
-  // #2494 Bug C — a serve-blocking overage (out_of_credits) means the account
-  // is billing-dead even at 0% util — it wins over every util-based verdict.
-  // This is genuine "out-of-credits": NOT a timer, recovers only when billing
-  // is fixed. Same strict-allowlist semantics as the broker.
-  if (window.overageServeBlocking) return "out-of-credits";
   // #2494 Bug C — a thin/headerless probe carries no real utilization; it must
   // not pose as a confident reading. Treat as unprobed (renders "unknown").
   if (window.probeThin) return "unprobed";
@@ -206,7 +215,7 @@ export function classifyState(args: {
     return "weekly-walled";
   }
   // #2494 Bug C — a maxed 5h window with a future reset is recoverable quota
-  // exhaustion (comes back when the window rolls), distinct from billing-dead.
+  // exhaustion (comes back when the window rolls).
   if (
     fivePct !== null &&
     fivePct >= WEEKLY_WALL_PCT &&
@@ -328,7 +337,9 @@ function poolLabel(row: ScheduleRow): string {
   return "excluded";
 }
 
-/** State cell, raw (uncolored): "healthy" / "5h-walled · 2h 18m" / etc. */
+/** State cell, raw (uncolored): "healthy" / "5h-walled · 2h 18m" / etc.
+ *  When the account has no overage headroom (out_of_credits), appends an
+ *  informational annotation: "healthy (overage off: out_of_credits)". */
 export function formatStateCell(row: ScheduleRow, now: Date): string {
   // Show the horizon that actually matters for the classified wall — the
   // weekly reset for a weekly wall, the 5h reset for a 5h wall — not just the
@@ -340,22 +351,24 @@ export function formatStateCell(row: ScheduleRow, now: Date): string {
         ? (row.window.fiveHourResetAt ?? row.exhaustedUntil)
         : row.exhaustedUntil;
   const rel = horizon ? ` · ${formatDuration(horizon.getTime() - now.getTime())}` : "";
+  // Informational overage annotation — shown on healthy/throttling/unprobed
+  // rows when out_of_credits is set. MUST NOT change the state verdict; only
+  // appended to the text label so the operator is aware of the overage flag.
+  const overageNote =
+    row.window.overageServeBlocking && row.window.overageReason
+      ? ` (overage off: ${row.window.overageReason})`
+      : row.window.overageServeBlocking
+        ? " (overage off)"
+        : "";
   switch (row.state) {
-    case "out-of-credits":
-      // #2494 Bug C — billing-dead. No util-window reset to count down to —
-      // overage is off until billing is fixed, not until a window rolls. Name
-      // the real reason so it reads distinctly from a recoverable exhaustion.
-      return row.window.overageReason
-        ? `billing disabled (${row.window.overageReason})`
-        : "billing disabled";
     case "quota-exhausted":
-      // #2494 Bug C — recoverable: comes back when the 5h window rolls. Carries
-      // the reset countdown, unlike the terminal billing-dead state above.
+      // Recoverable: comes back when the 5h window rolls. Carries the reset
+      // countdown. No overage annotation — quota exhaustion is the binding cause.
       return `quota-exhausted${rel}`;
     case "healthy":
-      return "healthy";
+      return `healthy${overageNote}`;
     case "unprobed":
-      return "no recent probe";
+      return `no recent probe${overageNote}`;
     case "5h-walled":
       return `5h-walled${rel}`;
     case "weekly-walled":
@@ -388,12 +401,9 @@ function colorState(text: string, state: AccountWindowState, color: boolean): st
   switch (state) {
     case "healthy":
       return chalk.green(text);
-    case "out-of-credits":
-      return chalk.red(text);
     case "weekly-walled":
       return chalk.red(text);
     case "quota-exhausted":
-      // Recoverable — amber, not the terminal red of billing-dead.
       return chalk.yellow(text);
     case "5h-walled":
       return chalk.yellow(text);

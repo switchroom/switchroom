@@ -1,12 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
   isAccountBlocked,
+  hasNoOverageHeadroom,
   isOverageServeBlocking,
   snapshotShouldClearMark,
   clampMarkExpiry,
   snapshotFresh,
   snapshotWalled,
   snapshotClearlyHealthy,
+  OVERAGE_EXHAUSTED_REASONS,
   SERVE_BLOCKING_OVERAGE_REASONS,
   WALL_PCT,
   HEALTHY_CLEAR_PCT,
@@ -53,38 +55,54 @@ describe("snapshot predicates", () => {
   });
 });
 
-describe("isOverageServeBlocking — strict allowlist on the DISABLED REASON", () => {
-  it("out_of_credits → true (the credits-dead account)", () => {
-    expect(isOverageServeBlocking(snap(0, 0, 0, { reason: "out_of_credits" }))).toBe(true);
+describe("hasNoOverageHeadroom — informational allowlist on the DISABLED REASON", () => {
+  it("out_of_credits → true (no overage headroom, informational only)", () => {
+    expect(hasNoOverageHeadroom(snap(0, 0, 0, { reason: "out_of_credits" }))).toBe(true);
     // rejected status alongside it must not change the verdict (we key on reason)
     expect(
-      isOverageServeBlocking(snap(0, 0, 0, { status: "rejected", reason: "out_of_credits" })),
+      hasNoOverageHeadroom(snap(0, 0, 0, { status: "rejected", reason: "out_of_credits" })),
     ).toBe(true);
   });
   it("org_level_disabled → false (MANDATORY non-regression: the live active fleet account)", () => {
-    // This account serves fine off subscription; overage is merely off. It even
-    // reports overageStatus:"rejected" — must STILL be benign.
+    // This account serves fine off subscription; overage is merely off.
     expect(
-      isOverageServeBlocking(snap(75, 40, 0, { status: "rejected", reason: "org_level_disabled" })),
+      hasNoOverageHeadroom(snap(75, 40, 0, { status: "rejected", reason: "org_level_disabled" })),
     ).toBe(false);
   });
   it("null reason → false (deny-by-omission)", () => {
-    expect(isOverageServeBlocking(snap(0, 0, 0, { reason: null }))).toBe(false);
-    expect(isOverageServeBlocking(snap(0, 0, 0))).toBe(false); // field absent
+    expect(hasNoOverageHeadroom(snap(0, 0, 0, { reason: null }))).toBe(false);
+    expect(hasNoOverageHeadroom(snap(0, 0, 0))).toBe(false); // field absent
   });
   it("unknown reason (payment_failed) → false (deny-by-omission)", () => {
-    expect(isOverageServeBlocking(snap(0, 0, 0, { reason: "payment_failed" }))).toBe(false);
+    expect(hasNoOverageHeadroom(snap(0, 0, 0, { reason: "payment_failed" }))).toBe(false);
   });
   it("the allowlist contains ONLY out_of_credits", () => {
-    expect([...SERVE_BLOCKING_OVERAGE_REASONS]).toEqual(["out_of_credits"]);
+    expect([...OVERAGE_EXHAUSTED_REASONS]).toEqual(["out_of_credits"]);
+  });
+  it("SERVE_BLOCKING_OVERAGE_REASONS is an alias for OVERAGE_EXHAUSTED_REASONS (backwards compat)", () => {
+    expect(SERVE_BLOCKING_OVERAGE_REASONS).toBe(OVERAGE_EXHAUSTED_REASONS);
+  });
+  it("isOverageServeBlocking is an alias for hasNoOverageHeadroom (backwards compat)", () => {
+    // Both should return true for out_of_credits
+    expect(isOverageServeBlocking(snap(0, 0, 0, { reason: "out_of_credits" }))).toBe(true);
+    expect(isOverageServeBlocking(snap(0, 0, 0, { reason: "org_level_disabled" }))).toBe(false);
   });
 });
 
-describe("isAccountBlocked — overage serve-blocking is exhaustion too", () => {
-  it("out_of_credits at 0% util, fresh, no mark ⇒ TRUE (idle-but-unusable)", () => {
+describe("isAccountBlocked — out_of_credits is NOT serve-blocking (demoted to informational)", () => {
+  it("out_of_credits at 0% util, fresh, no mark ⇒ FALSE (eligible failover target)", () => {
+    // THE KEY CHANGE: out_of_credits is informational, NOT a block. An account
+    // at 0% util with out_of_credits serves fine from quota. This reverses the
+    // 2026-06-20 guard which was the defect.
     expect(
       isAccountBlocked({ snapshot: snap(0, 0, 30_000, { reason: "out_of_credits" }), now: NOW }),
-    ).toBe(true);
+    ).toBe(false);
+  });
+  it("out_of_credits at 0% util is a valid failover target (the pixsoul@gmail.com scenario)", () => {
+    // pixsoul@gmail.com: 5h=0%, 7d=2%, out_of_credits. MUST be eligible.
+    expect(
+      isAccountBlocked({ snapshot: snap(0, 2, 30_000, { status: "rejected", reason: "out_of_credits" }), now: NOW }),
+    ).toBe(false);
   });
   it("org_level_disabled at 75% util, fresh, no mark ⇒ FALSE (MANDATORY catastrophic-regression guard)", () => {
     // The live fleet account. Below the 99.5% wall, benign overage reason →
@@ -102,7 +120,7 @@ describe("isAccountBlocked — overage serve-blocking is exhaustion too", () => 
     ).toBe(false);
   });
   it("out_of_credits on a STALE snapshot (>24h) ⇒ ignored, falls back to the mark", () => {
-    // Stale overage data must not block on its own; only the mark governs.
+    // Stale overage data must not affect eligibility; only the mark governs.
     const staleAge = SNAPSHOT_STALE_AGE_MS + 60_000;
     expect(
       isAccountBlocked({
@@ -118,6 +136,36 @@ describe("isAccountBlocked — overage serve-blocking is exhaustion too", () => 
         now: NOW,
       }),
     ).toBe(true); // unexpired mark governs
+  });
+  it("out_of_credits at HIGH util (>=99.5%) IS blocked — the util wall fires, not the credits flag", () => {
+    // Still blocked when actually quota-walled. The block comes from snapshotWalled,
+    // not from the out_of_credits flag.
+    expect(
+      isAccountBlocked({ snapshot: snap(99.6, 0, 30_000, { reason: "out_of_credits" }), now: NOW }),
+    ).toBe(true);
+    expect(
+      isAccountBlocked({ snapshot: snap(0, 99.6, 30_000, { reason: "out_of_credits" }), now: NOW }),
+    ).toBe(true);
+  });
+});
+
+describe("isAccountBlocked — real 429 → mark-exhausted path remains the safety net", () => {
+  it("an active mark blocks the account regardless of out_of_credits (mark is the safety net)", () => {
+    // A real 429 raises mark-exhausted. That mark blocks until expiry.
+    // out_of_credits alone does not block, but the MARK does.
+    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 1000 };
+    expect(
+      isAccountBlocked({
+        mark,
+        snapshot: snap(0, 0, 30_000, { reason: "out_of_credits" }),
+        now: NOW,
+      }),
+    ).toBe(true); // mark governs when mark is newer than snapshot
+  });
+  it("a mark NEWER than the snapshot wins (a just-seen 429 beats an older probe)", () => {
+    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 1_000 };
+    // snapshot captured 10min ago showed healthy, but the 429 mark is newer
+    expect(isAccountBlocked({ mark, snapshot: snap(10, 10, 10 * 60_000), now: NOW })).toBe(true);
   });
 });
 
@@ -143,11 +191,6 @@ describe("isAccountBlocked — live truth is authoritative over the mark", () =>
     const mark: ExhaustionMark = { exhausted_until: NOW + 1000, marked_at: NOW - 1000 };
     // even a healthy-looking but 25h-old snapshot must not un-block a live mark
     expect(isAccountBlocked({ mark, snapshot: snap(4, 20, SNAPSHOT_STALE_AGE_MS + 60_000), now: NOW })).toBe(true);
-  });
-  it("a mark NEWER than the snapshot wins (a just-seen 429 beats an older probe)", () => {
-    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 1_000 };
-    // snapshot captured 10min ago showed healthy, but the 429 mark is newer
-    expect(isAccountBlocked({ mark, snapshot: snap(10, 10, 10 * 60_000), now: NOW })).toBe(true);
   });
 });
 
@@ -198,19 +241,28 @@ describe("snapshotShouldClearMark — self-heal", () => {
     };
     expect(snapshotShouldClearMark(partial, mark, NOW)).toBe(true);
   });
-  it("NEVER clears a mark off an out_of_credits account, even at 0% util", () => {
-    // The 2026-06-20 self-heal bug: a fresh low-util probe must NOT un-exhaust a
-    // credits-dead account. Low util ≠ healthy when overage is serve-blocking.
+  it("out_of_credits at 0% util DOES clear a mark — a healthy low-util probe self-heals normally", () => {
+    // THE KEY CHANGE from the 2026-06-20 guard: out_of_credits is informational.
+    // A 0%-util probe is genuinely healthy; it should clear a misfired mark.
+    // The real safety net for a dead account is mark-exhausted via 429, not here.
     const mark: ExhaustionMark = { exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000, marked_at: NOW - 60_000 };
     expect(
       snapshotShouldClearMark(snap(2, 5, 0, { reason: "out_of_credits" }), mark, NOW),
-    ).toBe(false);
-    // Contrast: the SAME util with a null reason DOES clear (regression anchor).
+    ).toBe(true); // CHANGED: was false, now true — healthy util self-heals
+    // Same behavior as null reason (regression anchor — should be identical now)
     expect(snapshotShouldClearMark(snap(2, 5, 0, { reason: null }), mark, NOW)).toBe(true);
-    // And org_level_disabled at low util is benign → also clears.
+    // org_level_disabled is still benign → also clears.
     expect(
       snapshotShouldClearMark(snap(2, 5, 0, { reason: "org_level_disabled" }), mark, NOW),
     ).toBe(true);
+  });
+  it("out_of_credits at HIGH util does NOT clear (the util wall prevents it)", () => {
+    // Even though out_of_credits is now informational, a walled util still blocks
+    // clearing. The snapshotClearlyHealthy check (both windows < 80%) prevents it.
+    const mark: ExhaustionMark = { exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000, marked_at: NOW - 60_000 };
+    expect(
+      snapshotShouldClearMark(snap(85, 20, 0, { reason: "out_of_credits" }), mark, NOW),
+    ).toBe(false); // 85% >= 80% → not clearly healthy → no clear
   });
 });
 

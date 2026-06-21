@@ -61,29 +61,39 @@ export interface AccountSnapshot {
 export const THROTTLING_THRESHOLD_PCT = 80;
 
 /**
- * STRICT ALLOWLIST of serve-blocking `overageDisabledReason` values. Replicated
- * verbatim from the broker's `SERVE_BLOCKING_OVERAGE_REASONS`
- * (src/auth/broker/account-eligibility.ts) because the plugin can't import
- * across the package boundary cleanly — keep the two in sync.
+ * INFORMATIONAL ALLOWLIST of `overageDisabledReason` values that mean the
+ * account has no overage headroom. Replicated from the broker's
+ * `OVERAGE_EXHAUSTED_REASONS` (src/auth/broker/account-eligibility.ts) because
+ * the plugin can't import across the package boundary — keep the two in sync.
  *
- * `out_of_credits` → blocked (the account is dead even at 0% util).
- * `org_level_disabled` → BENIGN (the live active fleet account: overage off but
- * still serving off subscription). `null` / unknown → benign (deny-by-omission).
+ * These are NOT serve-blocking: the fleet runs on quota, not credits. An account
+ * with `out_of_credits` at low util serves fine. `org_level_disabled` → benign
+ * (the live active fleet account: overage off but serving fine off subscription).
+ * `null` / unknown → benign (deny-by-omission).
+ *
+ * MUST NEVER gate serving or failover eligibility — informational annotation
+ * only (e.g. "overage off (out_of_credits) — serving from quota").
  * Do NOT key on `overageStatus` ("rejected" appears on the healthy account too).
- * Any new reason here is production-affecting — confirm with the operator first.
+ * The drift test (overage-allowlist-drift.test.ts) guards these two copies stay
+ * in sync — update BOTH when this list changes.
  */
-const SERVE_BLOCKING_OVERAGE_REASONS = new Set<string>(['out_of_credits']);
+const OVERAGE_EXHAUSTED_REASONS = new Set<string>(['out_of_credits']);
 
 /**
- * Decide the health verdict for one account. The two "binding" facts:
- *   - overageDisabledReason is serve-blocking (out_of_credits) → blocked,
- *     even at 0% util (the account is dead until billing is fixed)
- *   - 5h or 7d utilization >= 100% (or `representativeClaim` non-null
- *     plus utilization >= 99.5%) → blocked
- *   - either window above 80%, or representativeClaim set with > 50% →
- *     throttling
+ * Decide the health verdict for one account. Binding facts (in order):
+ *   - probe failure → unknown
+ *   - thin/headerless probe → unknown (no real utilization signal)
+ *   - 5h or 7d utilization >= 99.5% → blocked (quota wall)
+ *   - either window above 80% → throttling
  *   - everything else → healthy
  *   - probe failure → unknown
+ *
+ * NOTE: `out_of_credits` (overageDisabledReason) is NOT a serve-block here.
+ * The fleet runs on quota, not on overage credits. An account with `out_of_credits`
+ * at low util (e.g. pixsoul@gmail.com at 5h=0%, 7d=2%) serves fine and is a
+ * valid failover target. Overage fields are informational only — surfaced as an
+ * annotation on healthy/throttling rows, never as a blocked verdict.
+ * Failover safety against a real 429 is preserved via the mark-exhausted path.
  */
 export function classifyHealth(snap: AccountSnapshot, now: Date = new Date()): AccountHealth {
   if (!snap.quota) return 'unknown';
@@ -92,12 +102,6 @@ export function classifyHealth(snap: AccountSnapshot, now: Date = new Date()): A
   // EITHER window) must not masquerade as a confident 0% / healthy. Treat it
   // as unknown so the card surfaces a data-quality gap, not "healthy".
   if (isProbeThin(q)) return 'unknown';
-  // A serve-blocking overage reason wins over the util gate: a credits-dead
-  // account reads 0% util but 429s on every call, so it must show 'blocked'
-  // (drives the display, quota-watch, and the auto-fallback idempotency guard).
-  if (q.overageDisabledReason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(q.overageDisabledReason)) {
-    return 'blocked';
-  }
   // #2494 Bug A — read utilization through the refill normalization: a window
   // whose reset has already passed has rolled since the snapshot was captured,
   // so its stale high utilization must be treated as 0%. A just-refilled
@@ -110,22 +114,20 @@ export function classifyHealth(snap: AccountSnapshot, now: Date = new Date()): A
 }
 
 /**
- * #2494 Bug C — why is a BLOCKED account blocked? Two materially different
- * causes that the card must render distinctly:
- *   - 'billing-dead' — a genuine serve-blocking `overageDisabledReason`
- *     (out_of_credits). NOT a timer: it stays dead until billing is fixed.
+ * Why is a BLOCKED account blocked? Only one cause now: quota exhaustion.
  *   - 'quota-exhausted' — a util window is maxed but recovers when that window
  *     rolls. Show the reset countdown.
+ *
+ * NOTE: 'billing-dead' has been removed. `out_of_credits` accounts are now
+ * healthy (not blocked) — they appear in the HEALTHY group with an informational
+ * overage annotation. See classifyHealth for the rationale.
+ *
  * Returns null for non-blocked accounts.
  */
-export type BlockedReason = 'billing-dead' | 'quota-exhausted';
+export type BlockedReason = 'quota-exhausted';
 
 export function blockedReason(snap: AccountSnapshot, now: Date = new Date()): BlockedReason | null {
   if (classifyHealth(snap, now) !== 'blocked') return null;
-  const q = snap.quota!;
-  if (q.overageDisabledReason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(q.overageDisabledReason)) {
-    return 'billing-dead';
-  }
   return 'quota-exhausted';
 }
 
@@ -289,15 +291,6 @@ function renderAccountRow(
 
   const health = classifyHealth(snap, now);
   if (health === 'blocked') {
-    const reason = blockedReason(snap, now);
-    if (reason === 'billing-dead') {
-      // #2494 Bug C — billing-dead is NOT a timer. Surface the real reason and
-      // make clear it does not recover on a window roll.
-      lines.push(
-        `  <i>billing disabled (${escapeHtml(q.overageDisabledReason ?? 'out_of_credits')}) — won't recover until billing is fixed</i>`,
-      );
-      return lines;
-    }
     // quota-exhausted (recoverable): surface only the recovery countdown — the
     // binding window's reset is the only thing that matters until then.
     const win = bindingWindow(q);
@@ -323,6 +316,13 @@ function renderAccountRow(
     ? `7d resets ${formatAbsolute(q.sevenDayResetAt, tz)} (in ${formatRelative(q.sevenDayResetAt, now)})`
     : '7d resets —';
   lines.push(`  <i>${fiveFirst ? fiveSeg : sevenSeg}  ·  ${fiveFirst ? sevenSeg : fiveSeg}</i>`);
+  // Informational overage annotation: if out_of_credits (no overage headroom),
+  // surface it as a sub-line on a healthy/throttling row — NOT a blocked badge.
+  if (q.overageDisabledReason != null && OVERAGE_EXHAUSTED_REASONS.has(q.overageDisabledReason)) {
+    lines.push(
+      `  <i>overage off (${escapeHtml(q.overageDisabledReason)}) — serving from quota</i>`,
+    );
+  }
   return lines;
 }
 
@@ -494,7 +494,7 @@ function summarizeNoHealthyAlt(snapshots: AccountSnapshot[], now: Date): string 
     return `All accounts at capacity — waiting on a window refill.`;
   }
 
-  // Genuinely all blocked (billing-dead with no upcoming reset, or no data).
+  // Genuinely all blocked (quota-exhausted with no upcoming reset, or no data).
   if (earliestRecovery) {
     return `All accounts blocked. Earliest recovery: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
   }

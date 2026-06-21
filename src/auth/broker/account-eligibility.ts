@@ -44,30 +44,54 @@ export const HEALTHY_CLEAR_PCT = 80;
 export const SNAPSHOT_STALE_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
- * STRICT ALLOWLIST of `overageDisabledReason` values that mean the account
- * cannot serve right now and must be treated as exhausted / blocked —
- * regardless of utilization %.
+ * INFORMATIONAL ALLOWLIST of `overageDisabledReason` values that mean the
+ * account has no overage headroom (credits balance is zero or disabled). These
+ * are **NOT serve-blocking** for a Claude Pro Max subscription fleet: the fleet
+ * runs on quota, not on overage credits. An account whose quota utilization is
+ * low (e.g. 5h=0%, 7d=2%) serves perfectly fine even when `out_of_credits` is
+ * set — that flag describes overage-past-quota availability only.
  *
- * The 2026-06-20 lesson: the broker captured Anthropic's overage headers per
- * account but no failover/exhaustion/health decision consulted them, so an
- * idle-but-unusable account (`overageDisabledReason:"out_of_credits"` at 0%
- * util) read healthy, got picked as a failover target, 429'd, and the
- * live-probe self-heal cleared any exhaustion mark on it.
+ * DESIGN RATIONALE (Jun 2026 incident reversal):
+ *   The 2026-06-20 incident (#2455) added `out_of_credits` as a serve-block to
+ *   guard against an idle-but-429ing account. That guard was structurally wrong:
+ *   it confused overage (credits past the subscription quota) with quota itself.
+ *   An account at 0% util is NOT 429ing due to `out_of_credits` — it 429s only
+ *   when its quota window is actually walled (≥99.5%). Failover safety is
+ *   preserved via the EXISTING `mark-exhausted` path: agents raise mark-
+ *   exhausted on a real 429, which blocks that account until the mark expires.
+ *   We do NOT need to proxy the credits flag for this.
+ *
+ *   The structurally identical `org_level_disabled` (also overage-off, also
+ *   reports `overageStatus:"rejected"`) was always treated as benign/healthy.
+ *   Both are "overage off" — the asymmetric treatment of `out_of_credits` was
+ *   the defect.
+ *
+ * USAGE — call `hasNoOverageHeadroom(snapshot)` to detect this informational
+ * condition. MUST NEVER gate serving or failover eligibility. May be surfaced
+ * as an informational annotation (e.g. "overage off (out_of_credits) — serving
+ * from quota") alongside a healthy/throttling display row.
  *
  * CRITICAL — discriminate on the DISABLED REASON, never on `overageStatus`:
- *  - `"out_of_credits"`  → SERVE-BLOCKING (account is dead; treat as exhausted).
- *  - `"org_level_disabled"` → BENIGN. This is the LIVE, ACTIVE, WORKING fleet
- *    account: overage is merely switched off org-wide, but it serves fine off
- *    the subscription. Marking it exhausted takes down the fleet. NOT here.
- *  - `null` / unknown / any unseen value → BENIGN (deny-by-omission).
+ *  - `"out_of_credits"`  → informational "no overage headroom". Does NOT block.
+ *  - `"org_level_disabled"` → BENIGN (identical to out_of_credits semantically
+ *    for a subscription fleet). Already treated correctly.
+ *  - `null` / unknown / any unseen value → benign (deny-by-omission).
  *
  * Keying on `overageStatus === "rejected"` is WRONG — the active, healthy
  * account reports `rejected` too. Only the disabled-reason discriminates.
  *
- * Any NEW reason added here is a production-affecting change: confirm with the
- * operator (which serve state Anthropic actually means by it) before adding.
+ * Any NEW reason added here is informational only. Adding it does NOT gate
+ * serving — that is an explicit design constraint, not an accident.
  */
-export const SERVE_BLOCKING_OVERAGE_REASONS = new Set<string>(["out_of_credits"]);
+export const OVERAGE_EXHAUSTED_REASONS = new Set<string>(["out_of_credits"]);
+
+/**
+ * @deprecated Use OVERAGE_EXHAUSTED_REASONS. This alias exists so callers that
+ * imported the old name still compile; it will be removed in a future cleanup.
+ * The semantics changed: these reasons are INFORMATIONAL (no overage headroom),
+ * NOT serve-blocking. See OVERAGE_EXHAUSTED_REASONS doc comment.
+ */
+export const SERVE_BLOCKING_OVERAGE_REASONS = OVERAGE_EXHAUSTED_REASONS;
 
 /** The minimal live-snapshot shape the eligibility decision needs. */
 export interface QuotaSnapshot {
@@ -76,13 +100,14 @@ export interface QuotaSnapshot {
   /** Unix ms when this snapshot was captured by a live probe. */
   capturedAt: number;
   /** Anthropic's `anthropic-ratelimit-unified-overage-status` header, when the
-   *  probe carried it. Captured for transparency; NOT the discriminator (see
-   *  SERVE_BLOCKING_OVERAGE_REASONS) — the active healthy account reports
-   *  `rejected` here too. */
+   *  probe carried it. Captured for transparency; NOT a serving discriminator —
+   *  the active healthy account reports `rejected` here too. See
+   *  OVERAGE_EXHAUSTED_REASONS for the informational disabled-reason list. */
   overageStatus?: string | null;
   /** Anthropic's `anthropic-ratelimit-unified-overage-disabled-reason` header.
-   *  THIS is the serve-blocking discriminator: `out_of_credits` is dead,
-   *  `org_level_disabled` is benign. See SERVE_BLOCKING_OVERAGE_REASONS. */
+   *  Informational only: `out_of_credits` means no overage headroom, NOT that
+   *  the account cannot serve from quota. `org_level_disabled` is benign.
+   *  See OVERAGE_EXHAUSTED_REASONS. MUST NOT gate serving or failover. */
   overageDisabledReason?: string | null;
   /** #2494 Bug C — which util windows the probe actually carried. A probe
    *  with BOTH false is "thin" (no real signal, 0%-coalesced) and must NOT be
@@ -93,15 +118,24 @@ export interface QuotaSnapshot {
 }
 
 /**
- * Is this snapshot's overage state serve-blocking? True only when the live
- * `overageDisabledReason` is on the strict allowlist (`out_of_credits`). An
- * account at 0% util that is out of credits is unusable and must be treated as
- * exhausted; `org_level_disabled` / null / unknown are benign (deny-by-
- * omission). PURE — no I/O.
+ * Does this snapshot indicate the account has no overage headroom? True when
+ * `overageDisabledReason` is on the informational allowlist (`out_of_credits`).
+ * This is a display/annotation flag ONLY — it MUST NOT gate serving or failover
+ * eligibility. An account with `out_of_credits` at low util serves fine from
+ * quota. `org_level_disabled` / null / unknown are benign (deny-by-omission).
+ * PURE — no I/O.
+ */
+export function hasNoOverageHeadroom(snapshot: QuotaSnapshot): boolean {
+  const reason = snapshot.overageDisabledReason;
+  return reason != null && OVERAGE_EXHAUSTED_REASONS.has(reason);
+}
+
+/**
+ * @deprecated Use hasNoOverageHeadroom. The semantics changed: this no longer
+ * implies serve-blocking. Kept for callers that import the old name.
  */
 export function isOverageServeBlocking(snapshot: QuotaSnapshot): boolean {
-  const reason = snapshot.overageDisabledReason;
-  return reason != null && SERVE_BLOCKING_OVERAGE_REASONS.has(reason);
+  return hasNoOverageHeadroom(snapshot);
 }
 
 /** A persisted exhaustion mark. `markedAt` is when it was written (added
@@ -155,8 +189,9 @@ export function isAccountBlocked(opts: {
     const markedAt = mark?.marked_at ?? 0;
     if (snapshot.capturedAt >= markedAt) {
       // Live truth is the newer signal → it decides, mark ignored. Walled on
-      // util OR serve-blocked by overage (out_of_credits at any util) → blocked.
-      return snapshotWalled(snapshot) || isOverageServeBlocking(snapshot);
+      // util → blocked. Overage (out_of_credits) is informational only and does
+      // NOT gate serving; failover safety is preserved via mark-exhausted on 429.
+      return snapshotWalled(snapshot);
     }
   }
   // No usable live truth (or the mark is newer) → trust the mark.
@@ -183,11 +218,11 @@ export function snapshotShouldClearMark(
   // self-heal a mark on a thin probe; require a probe that actually measured at
   // least one window before clearing.
   if (isProbeThin(snapshot)) return false;
-  // A serve-blocking overage (out_of_credits) is an exhaustion in its own
-  // right — never let a 0%-util-but-credits-dead probe self-heal a mark off
-  // such an account (that's exactly the live-probe re-clear the 2026-06-20
-  // bug exploited). Util being low does NOT make it "clearly healthy".
-  if (isOverageServeBlocking(snapshot)) return false;
+  // out_of_credits is informational (no overage headroom), NOT a serve-block.
+  // A 0%-util account with out_of_credits is healthy from a quota standpoint and
+  // SHOULD self-heal a misfired mark. The 2026-06-20 guard here was the defect:
+  // it prevented a healthy account from being restored to the failover pool.
+  // Failover safety is preserved via mark-exhausted on a real 429, not here.
   return snapshotClearlyHealthy(snapshot);
 }
 

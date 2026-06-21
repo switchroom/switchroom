@@ -78,9 +78,11 @@ describe("quotaIndicatesExhaustion", () => {
     expect(quotaIndicatesExhaustion(failed)).toEqual({ exhausted: false, until: null });
   });
 
-  it("out_of_credits at 0% util ⇒ exhausted (until=null, no util-window reset)", () => {
-    // The consumer pinned to a credits-dead account would 429 on every call
-    // despite 0% util — the sensor must mark it exhausted.
+  it("out_of_credits at 0% util ⇒ NOT exhausted (informational only — serves fine from quota)", () => {
+    // THE KEY CHANGE: out_of_credits is informational. A consumer pinned to a
+    // 0%-util out_of_credits account serves fine from quota. Exhaustion is only
+    // via a real util wall (≥99.5%), not via the credits flag.
+    // Failover safety is preserved via mark-exhausted on a real 429.
     expect(
       quotaIndicatesExhaustion(ok({
         fiveHourUtilizationPct: 0,
@@ -88,7 +90,7 @@ describe("quotaIndicatesExhaustion", () => {
         overageStatus: "rejected",
         overageDisabledReason: "out_of_credits",
       })),
-    ).toEqual({ exhausted: true, until: null });
+    ).toEqual({ exhausted: false, until: null });
   });
 
   it("org_level_disabled at 75% util ⇒ NOT exhausted (benign — live active account)", () => {
