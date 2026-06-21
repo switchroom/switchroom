@@ -183,6 +183,51 @@ export type QuotaWatchDecision =
   | { kind: "skip"; accountLabel: string; reason: string };
 
 /**
+ * #2495 BLOCKER fix — the corroboration probe result, as the gateway's
+ * runQuotaWatch sees it from `brokerClient.probeQuota(..., forceLive=true)`.
+ * Structurally a subset of `ProbeQuotaEntry` (src/auth/broker/client.ts): a
+ * `result` discriminated on `ok`, plus a `served` tag the broker stamps to
+ * say HOW the result was sourced.
+ *
+ * The trap this guards: under `forceLive`, when the upstream live probe FAILS
+ * and the broker holds a prior snapshot, it returns `cachedSnapshotToResult`
+ * — `result.ok === true` but `served === "cache"` (server.ts opProbeQuota).
+ * A naive `result.ok` check then treats that stale cache read as a live
+ * corroboration, fires the alarm, and stamps the false "Live-probe
+ * corroborated (#2495)" footnote. The acceptance criterion is the opposite:
+ * an alarm must be backed by a LIVE probe, not a stale cache read.
+ */
+export type CorroborationProbe = {
+  result: { ok: true } | { ok: false };
+  /**
+   * How the result was sourced. `"live"` = fresh upstream probe (genuine
+   * corroboration). `"cache"` = served from the durable cache (TTL-hit or
+   * probe-failure fallback) — NOT corroboration. Absent on legacy responses,
+   * which we treat as NOT corroborated (fail-closed: never claim a live
+   * corroboration we can't prove).
+   */
+  served?: "live" | "cache";
+};
+
+/**
+ * #2495 BLOCKER fix — decide whether a forceLive corroboration probe counts
+ * as a genuine LIVE corroboration of the alarm.
+ *
+ * Genuine corroboration requires BOTH `result.ok` AND `served === "live"`.
+ * A result that is `ok:true` but `served:"cache"` (the failed-probe
+ * cache-fallback) is treated EXACTLY like a probe failure: it is NOT
+ * corroboration, so the caller must DEFER — leave watch state untouched and
+ * re-evaluate next tick when a true live probe can be obtained. A missing
+ * entry (`undefined`) is likewise not corroboration.
+ *
+ * Pure + total so it can be unit-tested at the seam without standing up the
+ * broker or the gateway loop.
+ */
+export function isLiveCorroboration(entry: CorroborationProbe | undefined): boolean {
+  return entry?.result.ok === true && entry.served === "live";
+}
+
+/**
  * Evaluate one account's quota state against its last-notified health.
  *
  * Transition table (after the staleness gate — a cached snapshot older

@@ -469,6 +469,7 @@ import {
   resolveQuotaWatchTuning,
   buildQuotaClaimKey,
   QUOTA_WATCH_CLAIM_WINDOW_MS,
+  isLiveCorroboration,
 } from '../quota-watch.js'
 import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
 import {
@@ -16150,7 +16151,11 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   // numbers for the notification message bodies. One batched RPC for all
   // crossing accounts (typically 1, rarely 2+).
   const crossingLabels = pendingTransitions.map(t => t.accountLabel)
-  let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]['result']>()
+  // #2495 BLOCKER fix — store the FULL entry (result + `served` tag), not just
+  // `entry.result`. The corroboration gate below needs `served` to tell a true
+  // live probe apart from a failed-probe cache fallback (which is `ok:true`
+  // but `served:"cache"` — vacuous corroboration).
+  let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]>()
   try {
     // #2495 Change 3 — forceLive bypasses the broker's probe-on-open TTL so the
     // DECISION to alarm is corroborated by a TRUE live probe, never a cache hit.
@@ -16160,7 +16165,7 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
     // transition.
     const probeData = await brokerClient.probeQuota(crossingLabels, 8000, true)
     for (const entry of probeData.results) {
-      freshProbeMap.set(entry.label, entry.result)
+      freshProbeMap.set(entry.label, entry)
     }
   } catch (err) {
     process.stderr.write(`telegram gateway: quota-watch: probe for crossing accounts failed: ${err}\n`)
@@ -16192,17 +16197,25 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   for (const { accountLabel, snapIndex, decision } of pendingTransitions) {
     // Re-evaluate with fresh probe data to get an accurate message body.
     // If the fresh probe succeeded, replace the snap's quota with live data.
-    const freshResult = freshProbeMap.get(accountLabel)
+    const freshEntry = freshProbeMap.get(accountLabel)
     let enrichedDecision = decision
     // pendingTransitions only ever holds notify decisions (pushed under
     // `decision.kind !== 'skip'` / `!== 'reconcile'`). Narrow explicitly so
     // `decision.transition` type-checks below; this continue never fires
     // at runtime.
     if (decision.kind !== 'notify') continue
-    if (freshResult && freshResult.ok && snapIndex >= 0) {
+    // #2495 BLOCKER fix — only a GENUINE live probe corroborates the alarm. A
+    // forceLive entry that is `ok:true` but `served:"cache"` (the broker's
+    // failed-probe cache fallback) is NOT corroboration: the upstream probe
+    // failed, so we have no live confirmation that the throttling crossing is
+    // real right now. Treat it exactly like a probe failure → fall through to
+    // the defer branch below (state untouched, re-evaluated next tick). This
+    // also guarantees the "Live-probe corroborated (#2495)" footnote is only
+    // ever stamped on a real live probe.
+    if (isLiveCorroboration(freshEntry) && freshEntry!.result.ok && snapIndex >= 0) {
       // Live numbers replace the cache — and capturedAtMs is cleared so the
       // staleness gate never misfires on data we JUST probed.
-      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data, capturedAtMs: undefined }
+      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshEntry!.result.data, capturedAtMs: undefined }
       const prev = watchState[accountLabel] ?? emptyAccountState()
       const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now, bootTick, tuning })
       // If the fresh probe still shows the same transition, use the
