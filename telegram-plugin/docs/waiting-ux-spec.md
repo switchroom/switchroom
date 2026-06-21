@@ -1,7 +1,7 @@
 # Waiting-for-reply UX — v2 spec (three-class contract)
 
-Tracks: [#545](https://github.com/mekenthompson/switchroom/issues/545),
-[#553](https://github.com/mekenthompson/switchroom/issues/553) (PR series),
+Tracks: [#545](https://github.com/switchroom/switchroom/issues/545),
+[#553](https://github.com/switchroom/switchroom/issues/553) (PR series),
 [#1713](https://github.com/switchroom/switchroom/issues/1713)
 (reflective status-reaction restoration)
 
