@@ -10,41 +10,23 @@
  * of the bot's final reply — otherwise the user looks at their
  * inbound, sees it still wearing 🤔, and asks "you done?").
  *
- * History: this scenario was previously `describe.skip` with a
- * rationale that the pinned progress card "renders INSTEAD of
- * reactions". The card was retired in #1126; the card-vs-reaction
- * branch in the gateway is dead. We can now exercise the full
- * lifecycle end-to-end without the two-agent split.
- *
  * What we assert (in priority order):
  *
  *  1. Within the turn, the bot places AT LEAST ONE reaction on the
  *     inbound message (the L1 "I'm alive" signal). We poll via
  *     `driver.pollReactions()` rather than subscribing to push
- *     events — see the DM limitation note below.
+ *     events — Telegram does not deliver `updateMessageReactions`
+ *     push events to the human account when a bot sets a reaction
+ *     in a DM (fixes #2502).
  *  2. By the time the bot has sent a final reply (+ a short tail
- *     for Telegram to apply the terminal-emoji replace), the LAST
- *     reaction on the inbound message is in the `done` set
- *     (`👍 / 💯 / 🎉`).
- *
- * Why polling instead of `observeReactions`:
- *
- *   When a BOT calls `setMessageReaction` on a DM, Telegram's
- *   MTProto server does NOT deliver `updateMessageReactions` to the
- *   human user's account. Telegram only delivers
- *   `updateBotMessageReaction` to the BOT's own update stream.
- *   `observeReactions` hooks `onRawUpdate` and would correctly handle
- *   the update if it arrived — but it never does for DMs where the
- *   reactor is a bot. The gateway log confirms `setMessageReaction`
- *   returns `status=ok`, so the reaction IS applied on Telegram's
- *   side; we just can't observe it via push. Polling with
- *   `driver.pollReactions()` (wraps `messages.getMessagesReactions`)
- *   queries the current reaction state directly and is not affected
- *   by the push-delivery gap. Fixes #2502.
+ *     for Telegram to apply the terminal-emoji replace), the reaction
+ *     on the inbound message is in the `done` set (`👍 / 💯 / 🎉`).
  *
  * Polling strategy:
- *   - Poll every `POLL_INTERVAL_MS` until either a reaction appears
- *     OR the bot has replied AND `TAIL_AFTER_REPLY_MS` has elapsed.
+ *   - Poll every `POLL_INTERVAL_MS` until a terminal-done emoji
+ *     appears OR the bot has replied AND `TAIL_AFTER_REPLY_MS` has
+ *     elapsed. Bail immediately on reply-timeout so CI doesn't burn
+ *     the full 90s safety ceiling.
  *   - After the reply arrives, keep polling through the tail window
  *     so the terminal emoji (👍) has time to replace the working
  *     emoji (👀/🤔). In practice the replace happens within 1-2s
@@ -82,6 +64,7 @@ describe("uat: reaction lifecycle on driver DM", () => {
         // Wait for the bot's reply (any content). We start polling
         // concurrently so we capture intermediate reactions during
         // the turn.
+        let replyTimedOut = false;
         const replyPromise = sc
           .expectMessage(/\S/, { from: "bot", timeout: 60_000 })
           .then((reply) => {
@@ -89,6 +72,12 @@ describe("uat: reaction lifecycle on driver DM", () => {
             replyReceived = true;
             replyReceivedAt = Date.now();
             return reply;
+          })
+          .catch((err: unknown) => {
+            // expectMessage timeout → mark so the poll loop exits immediately
+            // instead of burning the full 90s safety ceiling on CI failure.
+            replyTimedOut = true;
+            throw err;
           });
 
         // Polling loop: sample reactions while waiting for the reply,
@@ -96,6 +85,8 @@ describe("uat: reaction lifecycle on driver DM", () => {
         const poll = async (): Promise<void> => {
           const deadline = Date.now() + 90_000; // safety ceiling
           while (Date.now() < deadline) {
+            // Bail early if the reply timed out — no point polling further.
+            if (replyTimedOut) break;
             const emojis = await sc.driver.pollReactions(
               sc.botUserId,
               sent.messageId,
@@ -131,7 +122,15 @@ describe("uat: reaction lifecycle on driver DM", () => {
         // terminal-done emoji. `setMessageReaction` replaces atomically,
         // so the last snapshot holds whatever is currently on the message.
         const lastSnapshot = reactionHistory[reactionHistory.length - 1];
-        const lastEmoji = lastSnapshot[lastSnapshot.length - 1];
+        // The bot uses setMessageReaction (replace, not append) — exactly one
+        // emoji should be set at any time. Assert the invariant so we catch
+        // accidental multi-emoji states, then check the terminal-done value.
+        expect(
+          lastSnapshot.length,
+          `expected exactly 1 reaction in the final snapshot, got [${lastSnapshot.join(",")}]. ` +
+            `All snapshots: ${reactionHistory.map((s) => `[${s.join(",")}]`).join(" ")}`,
+        ).toBe(1);
+        const lastEmoji = lastSnapshot[0];
         expect(
           TERMINAL_DONE_EMOJI.has(lastEmoji),
           `expected last reaction to be one of ${[
