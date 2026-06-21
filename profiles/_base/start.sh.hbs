@@ -67,6 +67,22 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   # lifecycle. Ampersand-backgrounded by callers below.
   _switchroom_supervise() {
     local _name="$1"; local _logfile="$2"; shift 2
+    # Optional `--oneshot-ok` flag (must directly follow the logfile):
+    # marks a sidecar that can LEGITIMATELY complete. For such a sidecar
+    # a clean exit 0 means "job done" → stop supervising, no respawn.
+    # This is the autoaccept sidecar's case: under
+    # SWITCHROOM_WEDGE_WATCHDOG=0 it dispatches the first-run prompts and
+    # exits 0 by design (and if the watch loop ever returns cleanly, that
+    # too is a completed job, not a crash). Without this flag the old
+    # supervisor respawned that clean exit every 60s forever — pure
+    # restart/log churn with zero productive work (klanker, #2471 wedge
+    # diagnosis: 192 status=0 respawns). A must-always-run sidecar (the
+    # gateway, the scheduler) must NOT pass this flag — a clean exit
+    # there IS abnormal and must still restart.
+    local _oneshot_ok=0
+    if [ "${1:-}" = "--oneshot-ok" ]; then
+      _oneshot_ok=1; shift
+    fi
     local _cap=60
     local _delay=1
     local _attempt=0
@@ -86,6 +102,15 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
       # be terminal for an always-on agent.
       if [ $_exit -eq 78 ]; then
         echo "[supervise] $_name exit 78 (EX_CONFIG) — quarantined, not restarting. Operator action required." >> "$_logfile"
+        return 0
+      fi
+      # Clean completion of an opt-in one-shot-capable sidecar: the job
+      # finished successfully, so do NOT respawn (respawning a
+      # legitimately-completed exit-0 is the churn this guard removes).
+      # A non-zero exit still falls through to the indefinite backoff
+      # below — a crash always self-heals.
+      if [ $_oneshot_ok -eq 1 ] && [ $_exit -eq 0 ]; then
+        echo "[supervise] $_name completed cleanly (exit 0) — one-shot-ok, not respawning." >> "$_logfile"
         return 0
       fi
       # A run that stayed up for at least the backoff cap means the
@@ -139,7 +164,13 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   #    keeps a flaky run from busy-looping. Set SWITCHROOM_WEDGE_WATCHDOG=0
   #    to restore the legacy boot-only single-shot behaviour.
   if [ -f /opt/switchroom/autoaccept-poll.js ] && command -v bun >/dev/null 2>&1; then
-    _switchroom_supervise autoaccept /var/log/switchroom/autoaccept.log \
+    # --oneshot-ok: this sidecar can legitimately complete (exit 0) — the
+    # boot-only mode (SWITCHROOM_WEDGE_WATCHDOG=0) dispatches the first-run
+    # prompts then exits, and a clean watch-loop return is also a finished
+    # job, not a crash. Marking it one-shot-ok stops the supervisor from
+    # respawning that clean exit every 60s forever (the #2471-diagnosed
+    # churn). A genuine crash (non-zero) still backs off + retries.
+    _switchroom_supervise autoaccept /var/log/switchroom/autoaccept.log --oneshot-ok \
       bun /opt/switchroom/autoaccept-poll.js "{{name}}" &
   fi
 
