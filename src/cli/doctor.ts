@@ -46,6 +46,7 @@ import { runInlinedSecretChecks } from "./doctor-inlined-secrets.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
+import { runTimezoneChecks } from "./doctor-timezone.js";
 
 /**
  * Result of a single doctor check.
@@ -2759,6 +2760,7 @@ export function registerDoctorCommand(program: Command): void {
           { title: "Skills Prerequisites", results: checkSkillsPrerequisites() },
           { title: "Manifest Drift", results: await checkManifestDrift() },
           { title: "Configuration", results: checkConfig(config, configPath) },
+          { title: "Timezone", results: runTimezoneChecks(config) },
           {
             title: "Config secrets (WS6-F3)",
             results: runInlinedSecretChecks(config, { configPath }),

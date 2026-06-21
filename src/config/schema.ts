@@ -1260,6 +1260,17 @@ export const ChannelsSchema = z
  */
 const TIMEZONE_REGEX = /^UTC$|^[A-Z][A-Za-z0-9_+-]+(\/[A-Z][A-Za-z0-9_+-]+){1,2}$/;
 
+/**
+ * Public predicate over the same `TIMEZONE_REGEX` the `timezone` zod
+ * fields validate with. Exported so non-schema callers (the setup
+ * wizard's interactive timezone prompt, #2483) validate a hand-typed
+ * IANA zone against the exact same rule the config schema enforces,
+ * instead of re-deriving a looser one that drifts.
+ */
+export function isValidTimezone(value: string): boolean {
+  return TIMEZONE_REGEX.test(value);
+}
+
 const ApproverIdSchema = z.union([z.number(), z.string().regex(/^\d+$/)]);
 
 /**

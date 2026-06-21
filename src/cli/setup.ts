@@ -49,6 +49,9 @@ import {
   isValidSupergroupChatId,
   setAgentSupergroupChatId,
 } from "./supergroup-setup-yaml.js";
+import { setSwitchroomTimezone } from "./timezone-setup-yaml.js";
+import { detectServerTimezone } from "../config/timezone.js";
+import { isValidTimezone } from "../config/schema.js";
 
 const STEP_PENDING = chalk.gray("○");
 const STEP_ACTIVE = chalk.blue("->");
@@ -268,12 +271,103 @@ async function copyExampleConfig(
     chalk.yellow(`  Edit ${destFile} to customize, then re-run switchroom setup.`),
   );
 
+  // Timezone safe-default (#2483). A fresh config never sets
+  // `switchroom.timezone`, so `resolveTimezone()` falls through to
+  // `detectServerTimezone()` → "UTC" on a bare cloud VM, and every
+  // agent's per-turn time hint + cron evaluation silently runs hours
+  // off. Make the choice explicit at install instead of leaving it to
+  // the invisible fallback. NEVER persist "UTC" (the thing we're
+  // avoiding) — only a confidently-real detected zone, else prompt
+  // (interactive) or warn loudly (headless).
+  await writeDetectedTimezone(destFile, nonInteractive);
+
   const config = loadConfig(destFile);
   console.log(
     chalk.green(`  ${STEP_DONE} Config loaded`) +
       chalk.gray(` (${Object.keys(config.agents).length} agents)`),
   );
   return { config, configPath: resolve(destFile) };
+}
+
+/**
+ * Detect the host timezone and persist an explicit `switchroom.timezone`
+ * into the freshly-bootstrapped config (#2483). Three branches:
+ *
+ *   - detected a REAL non-UTC zone  → write it (no prompt needed)
+ *   - detected UTC + interactive    → prompt for the real zone, validate,
+ *                                     write it; on empty/declined input,
+ *                                     skip the write + warn once
+ *   - detected UTC + headless       → skip the write, emit ONE loud
+ *                                     stderr line, degrade to today's
+ *                                     UTC-fallback behaviour (no hang)
+ *
+ * NEVER writes "UTC": that's the silent-wrong-time fallback this whole
+ * step exists to avoid. The atomic read-mutate-write mirrors the
+ * setAgentSupergroupChatId / setAuthActive pattern.
+ *
+ * Exported for tests; production callers reach it via copyExampleConfig.
+ * `detect` and `prompt` are injectable so tests don't depend on the
+ * host's /etc or a live TTY.
+ */
+export async function writeDetectedTimezone(
+  destFile: string,
+  nonInteractive: boolean,
+  detect: () => string = detectServerTimezone,
+  prompt: (question: string, defaultValue?: string) => Promise<string> = ask,
+): Promise<void> {
+  const detected = detect();
+
+  if (detected !== "UTC" && isValidTimezone(detected)) {
+    // A confidently-real host zone — persist it verbatim, visible/editable.
+    const before = readFileSync(destFile, "utf-8");
+    const after = setSwitchroomTimezone(before, detected);
+    if (after !== before) writeFileSync(destFile, after);
+    console.log(
+      chalk.green(`  Detected timezone ${detected} — wrote switchroom.timezone.`),
+    );
+    return;
+  }
+
+  // detected === "UTC" (or an unparseable detection we won't trust).
+  if (nonInteractive) {
+    console.error(
+      chalk.yellow(
+        "  ⚠ timezone unspecified — agents will use UTC; set switchroom.timezone " +
+          "(e.g. \"Australia/Melbourne\") in switchroom.yaml or agents will run hours off.",
+      ),
+    );
+    return;
+  }
+
+  // Interactive UTC case — likely a bare cloud VM. Ask for the real zone.
+  const answer = await prompt(
+    "  Timezone? [detected: UTC — likely wrong; e.g. Australia/Melbourne]",
+    "",
+  );
+  const zone = answer.trim();
+  if (zone.length === 0) {
+    console.error(
+      chalk.yellow(
+        "  ⚠ No timezone set — agents will use UTC and run hours off. " +
+          "Set switchroom.timezone in switchroom.yaml when you know your zone.",
+      ),
+    );
+    return;
+  }
+  if (!isValidTimezone(zone) || zone === "UTC") {
+    console.error(
+      chalk.yellow(
+        `  ⚠ "${zone}" is not a valid IANA zone (expected Region/City like ` +
+          "\"Australia/Melbourne\"). Skipping — agents will use UTC. " +
+          "Edit switchroom.timezone in switchroom.yaml by hand.",
+      ),
+    );
+    return;
+  }
+  const before = readFileSync(destFile, "utf-8");
+  const after = setSwitchroomTimezone(before, zone);
+  if (after !== before) writeFileSync(destFile, after);
+  console.log(chalk.green(`  Wrote switchroom.timezone: ${zone}.`));
 }
 
 // ─── Step 2: Bot Tokens ─────────────────────────────────────────────────────
