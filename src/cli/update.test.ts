@@ -1056,7 +1056,7 @@ describe("encodeUpdateResultLine / parseUpdateResultLine", () => {
 });
 
 describe("planUpdate — hostdContext deferral (#2458)", () => {
-  it("refresh-hostd gets skipReason containing 'deferred' when hostdContext=true and hostControlEnabled=true", () => {
+  it("refresh-hostd gets skipReason containing 'deferred' and isHostdDeferred=true when hostdContext=true and hostControlEnabled=true", () => {
     const steps = planUpdate({
       hostControlEnabled: true,
       webServiceManaged: false,
@@ -1068,9 +1068,10 @@ describe("planUpdate — hostdContext deferral (#2458)", () => {
     expect(step).toBeDefined();
     expect(step.skipReason).toMatch(/deferred/);
     expect(step.skipReason).toMatch(/#2458/);
+    expect(step.isHostdDeferred).toBe(true);
   });
 
-  it("refresh-web gets skipReason containing 'deferred' when hostdContext=true and webServiceManaged=true", () => {
+  it("refresh-web gets skipReason containing 'deferred' and isHostdDeferred=true when hostdContext=true and webServiceManaged=true", () => {
     const steps = planUpdate({
       hostControlEnabled: false,
       webServiceManaged: true,
@@ -1082,6 +1083,7 @@ describe("planUpdate — hostdContext deferral (#2458)", () => {
     expect(step).toBeDefined();
     expect(step.skipReason).toMatch(/deferred/);
     expect(step.skipReason).toMatch(/#2458/);
+    expect(step.isHostdDeferred).toBe(true);
   });
 
   it("refresh-hostd still skips with existing reason when hostControlEnabled=false (hostdContext is not checked)", () => {
@@ -1095,9 +1097,10 @@ describe("planUpdate — hostdContext deferral (#2458)", () => {
     const step = steps.find((s) => s.name === "refresh-hostd")!;
     expect(step.skipReason).toMatch(/host_control.enabled is not true/);
     expect(step.skipReason).not.toMatch(/deferred/);
+    expect(step.isHostdDeferred).toBeFalsy();
   });
 
-  it("refresh-hostd has NO skipReason when hostdContext=false and hostControlEnabled=true", () => {
+  it("refresh-hostd has NO skipReason and isHostdDeferred is falsy when hostdContext=false and hostControlEnabled=true", () => {
     const steps = planUpdate({
       hostControlEnabled: true,
       webServiceManaged: false,
@@ -1107,9 +1110,10 @@ describe("planUpdate — hostdContext deferral (#2458)", () => {
     });
     const step = steps.find((s) => s.name === "refresh-hostd")!;
     expect(step.skipReason).toBeUndefined();
+    expect(step.isHostdDeferred).toBeFalsy();
   });
 
-  it("--skip-images reason still wins over hostdContext deferral", () => {
+  it("--skip-images reason still wins over hostdContext deferral; isHostdDeferred is false", () => {
     const steps = planUpdate({
       hostControlEnabled: true,
       webServiceManaged: true,
@@ -1121,6 +1125,38 @@ describe("planUpdate — hostdContext deferral (#2458)", () => {
     const web = steps.find((s) => s.name === "refresh-web")!;
     expect(hostd.skipReason).toBe("--skip-images flag set");
     expect(web.skipReason).toBe("--skip-images flag set");
+    // --skip-images is not a hostd-context deferral; isHostdDeferred must be false
+    expect(hostd.isHostdDeferred).toBeFalsy();
+    expect(web.isHostdDeferred).toBeFalsy();
+  });
+
+  it("deferred sentinel uses isHostdDeferred flag (not skipReason string match) to identify deferred steps", async () => {
+    // This test ensures the sentinel emitted by runUpdate correctly identifies
+    // deferred steps via the explicit isHostdDeferred flag, not string coupling.
+    const lines: string[] = [];
+    const code = await runUpdate({
+      hostControlEnabled: true,
+      webServiceManaged: true,
+      memoryBackendHindsight: false,
+      skipImages: false,
+      hostdContext: true,
+      runner: () => ({ status: 0 }),
+      composePath: "/dev/null",
+      syncBundledSkillsFn: () => {},
+      agentNamesFn: () => [],
+      writeMarkerFn: () => {},
+      stdout: (s) => lines.push(s),
+      stderr: () => {},
+    });
+    expect(code).toBe(0);
+    const allOut = lines.join("");
+    const parsed = parseUpdateResultLine(allOut);
+    // The deferred list must contain exactly the isHostdDeferred=true steps
+    expect(parsed?.deferred).toContain("refresh-hostd");
+    expect(parsed?.deferred).toContain("refresh-web");
+    // Steps whose skipReason doesn't include "deferred" must NOT appear
+    expect(parsed?.deferred).not.toContain("pull-images");
+    expect(parsed?.deferred).not.toContain("apply-config");
   });
 });
 

@@ -152,6 +152,13 @@ interface UpdateStep {
   description: string;
   /** When true, step is skipped entirely (e.g. --skip-images). */
   skipReason?: string;
+  /**
+   * True when this step was deferred because the CLI is running inside the
+   * hostd container and cannot recreate itself or its compose siblings.
+   * Used as the machine-readable sentinel for the deferred-steps list —
+   * prefer this over string-matching `skipReason`.
+   */
+  isHostdDeferred?: boolean;
   /** Invoked when not in --check mode. Throws on failure. */
   run: () => void;
 }
@@ -488,6 +495,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         : hostdContext
           ? "deferred (hostd-context): finish host-side via `switchroom hostd install` — update_apply cannot recreate its own hostd container without SIGKILLing itself (#2458)"
           : undefined,
+    isHostdDeferred: hostControlEnabled && !opts.skipImages && hostdContext,
     run: () => {
       const r = runner(process.execPath, [scriptPath, "hostd", "install"]);
       if (r.status !== 0) throw new Error("switchroom hostd install failed");
@@ -531,6 +539,7 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         : hostdContext
           ? "deferred (hostd-context): finish host-side via `switchroom webd install` — update_apply cannot recreate the web container without SIGKILLing the hostd container it shares a compose project with (#2458)"
           : undefined,
+    isHostdDeferred: webServiceManaged && !opts.skipImages && hostdContext,
     run: () => {
       const r = runner(process.execPath, [scriptPath, "webd", "install"]);
       if (r.status !== 0) throw new Error("switchroom webd install failed");
@@ -1117,7 +1126,7 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
       // Even on failure, emit the sentinel if any deferred steps exist so
       // the server can record which steps were left pending (#2458).
       const deferredOnFailure = steps
-        .filter((s) => s.skipReason?.includes("deferred"))
+        .filter((s) => s.isHostdDeferred)
         .map((s) => s.name);
       if (deferredOnFailure.length > 0) {
         stdout(encodeUpdateResultLine({ ok: false, deferred: deferredOnFailure }) + "\n");
@@ -1129,7 +1138,7 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
   // Emit the structured sentinel when any steps were deferred so the server
   // can populate StatusEntry.deferred without parsing human output (#2458).
   const deferred = steps
-    .filter((s) => s.skipReason?.includes("deferred"))
+    .filter((s) => s.isHostdDeferred)
     .map((s) => s.name);
   if (deferred.length > 0) {
     stdout(encodeUpdateResultLine({ ok: true, deferred }) + "\n");

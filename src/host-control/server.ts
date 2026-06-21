@@ -2410,6 +2410,7 @@ export class HostdServer {
             ...(entry.channel !== undefined ? { channel: entry.channel } : {}),
           }
         : null;
+    const payload = rolloutPayload ?? (updatePayload ? JSON.stringify(updatePayload) : undefined);
     return {
       v: 1,
       request_id,
@@ -2418,8 +2419,7 @@ export class HostdServer {
       duration_ms: (entry.finished_at ?? Date.now()) - entry.started_at,
       stdout_tail: entry.stdout_tail || undefined,
       stderr_tail: entry.stderr_tail || undefined,
-      ...(rolloutPayload ? { payload: rolloutPayload } : {}),
-      ...(updatePayload ? { payload: JSON.stringify(updatePayload) } : {}),
+      ...(payload ? { payload } : {}),
       error: entry.error,
     };
   }
