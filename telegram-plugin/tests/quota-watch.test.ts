@@ -18,6 +18,8 @@ import {
   patchQuotaWatchState,
   emptyQuotaWatchState,
   emptyAccountState,
+  isLiveCorroboration,
+  type CorroborationProbe,
 } from "../quota-watch.js";
 import type { AccountSnapshot } from "../auth-snapshot-format.js";
 import type { QuotaUtilization } from "../quota-check.js";
@@ -217,6 +219,22 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     expect(d.message).toContain("5-hour");
   });
 
+  it("#2495 Change 3 — throttling alarm advertises live-probe corroboration, not a raw cache read", () => {
+    const d = evaluateQuotaWatchAccount({
+      agentName: "lawgpt",
+      snap: THROTTLING_5H,
+      prev: PREV_NEVER_NOTIFIED,
+      now: NOW,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    // The alarm body's source-of-truth footnote must reflect that the gateway
+    // corroborates the alarm with a forceLive probe (the broker re-probe at
+    // gateway.ts runQuotaWatch), not "Source: broker quota cache".
+    expect(d.message).toContain("Live-probe corroborated");
+    expect(d.message).not.toContain("Source: broker quota cache");
+  });
+
   it("recovery message contains account label and percentages", () => {
     const d = evaluateQuotaWatchAccount({
       agentName: "lawgpt",
@@ -269,6 +287,79 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
     expect(d.message).toContain("refills in");
+  });
+});
+
+// ── corroboration gate (#2495 BLOCKER) ───────────────────────────────────────
+
+describe("isLiveCorroboration — only a genuine live probe corroborates (#2495 BLOCKER)", () => {
+  // A successful upstream live probe.
+  const LIVE_OK: CorroborationProbe = { result: { ok: true }, served: "live" };
+  // The trap: under forceLive, when the upstream probe FAILS but the broker
+  // holds a prior snapshot, opProbeQuota returns cachedSnapshotToResult →
+  // result.ok === true but served === "cache". Vacuous corroboration.
+  const CACHE_FALLBACK_AFTER_PROBE_FAIL: CorroborationProbe = {
+    result: { ok: true },
+    served: "cache",
+  };
+  // A hard probe failure with no prior snapshot to fall back on.
+  const PROBE_FAILED: CorroborationProbe = { result: { ok: false }, served: "live" };
+
+  it("a genuine live probe (ok:true, served:'live') corroborates", () => {
+    expect(isLiveCorroboration(LIVE_OK)).toBe(true);
+  });
+
+  it("a failed-probe cache fallback (ok:true, served:'cache') does NOT corroborate", () => {
+    // This is the BLOCKER: a stale cache read must NOT be mistaken for a live
+    // corroboration, even though result.ok is true.
+    expect(isLiveCorroboration(CACHE_FALLBACK_AFTER_PROBE_FAIL)).toBe(false);
+  });
+
+  it("a failed probe (ok:false) does NOT corroborate", () => {
+    expect(isLiveCorroboration(PROBE_FAILED)).toBe(false);
+  });
+
+  it("a missing entry (probe absent from batch result) does NOT corroborate", () => {
+    expect(isLiveCorroboration(undefined)).toBe(false);
+  });
+
+  it("a legacy entry with no `served` tag does NOT corroborate (fail-closed)", () => {
+    expect(isLiveCorroboration({ result: { ok: true } })).toBe(false);
+  });
+
+  // Simulate the gateway gate (runQuotaWatch). The gate fires the alarm and
+  // stamps the "Live-probe corroborated" footnote ONLY when
+  // isLiveCorroboration is true; otherwise it DEFERS (state untouched).
+  function gateDecision(entry: CorroborationProbe | undefined): {
+    fired: boolean;
+    message: string | null;
+  } {
+    if (isLiveCorroboration(entry)) {
+      // Genuine corroboration → re-evaluate and notify with the live numbers.
+      const d = evaluateQuotaWatchAccount({
+        agentName: "lawgpt",
+        snap: THROTTLING_5H,
+        prev: PREV_NEVER_NOTIFIED,
+        now: NOW,
+      });
+      return { fired: true, message: d.kind === "notify" ? d.message : null };
+    }
+    // Not corroborated → defer. No alarm, no footnote.
+    return { fired: false, message: null };
+  }
+
+  it("failed-probe cache fallback → alarm DEFERRED, no false 'Live-probe corroborated' footnote", () => {
+    const decision = gateDecision(CACHE_FALLBACK_AFTER_PROBE_FAIL);
+    expect(decision.fired).toBe(false);
+    expect(decision.message).toBeNull();
+    // The false footnote must NOT be produced on this path.
+    expect(decision.message ?? "").not.toContain("Live-probe corroborated");
+  });
+
+  it("genuine live probe → alarm FIRES and stamps the 'Live-probe corroborated' footnote", () => {
+    const decision = gateDecision(LIVE_OK);
+    expect(decision.fired).toBe(true);
+    expect(decision.message).toContain("Live-probe corroborated");
   });
 });
 

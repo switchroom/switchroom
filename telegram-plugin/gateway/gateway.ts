@@ -469,6 +469,7 @@ import {
   resolveQuotaWatchTuning,
   buildQuotaClaimKey,
   QUOTA_WATCH_CLAIM_WINDOW_MS,
+  isLiveCorroboration,
 } from '../quota-watch.js'
 import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
 import {
@@ -16150,11 +16151,21 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   // numbers for the notification message bodies. One batched RPC for all
   // crossing accounts (typically 1, rarely 2+).
   const crossingLabels = pendingTransitions.map(t => t.accountLabel)
-  let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]['result']>()
+  // #2495 BLOCKER fix — store the FULL entry (result + `served` tag), not just
+  // `entry.result`. The corroboration gate below needs `served` to tell a true
+  // live probe apart from a failed-probe cache fallback (which is `ok:true`
+  // but `served:"cache"` — vacuous corroboration).
+  let freshProbeMap = new Map<string, Awaited<ReturnType<typeof brokerClient.probeQuota>>['results'][number]>()
   try {
-    const probeData = await brokerClient.probeQuota(crossingLabels, 8000)
+    // #2495 Change 3 — forceLive bypasses the broker's probe-on-open TTL so the
+    // DECISION to alarm is corroborated by a TRUE live probe, never a cache hit.
+    // Only the transition-to-alarm pays for this; steady-state polls stay on the
+    // cheap cached listState read (no probe). Honors the existing fleet/consumer
+    // probe knobs upstream — this re-evaluation never fires without a detected
+    // transition.
+    const probeData = await brokerClient.probeQuota(crossingLabels, 8000, true)
     for (const entry of probeData.results) {
-      freshProbeMap.set(entry.label, entry.result)
+      freshProbeMap.set(entry.label, entry)
     }
   } catch (err) {
     process.stderr.write(`telegram gateway: quota-watch: probe for crossing accounts failed: ${err}\n`)
@@ -16186,17 +16197,25 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
   for (const { accountLabel, snapIndex, decision } of pendingTransitions) {
     // Re-evaluate with fresh probe data to get an accurate message body.
     // If the fresh probe succeeded, replace the snap's quota with live data.
-    const freshResult = freshProbeMap.get(accountLabel)
+    const freshEntry = freshProbeMap.get(accountLabel)
     let enrichedDecision = decision
     // pendingTransitions only ever holds notify decisions (pushed under
     // `decision.kind !== 'skip'` / `!== 'reconcile'`). Narrow explicitly so
     // `decision.transition` type-checks below; this continue never fires
     // at runtime.
     if (decision.kind !== 'notify') continue
-    if (freshResult && freshResult.ok && snapIndex >= 0) {
+    // #2495 BLOCKER fix — only a GENUINE live probe corroborates the alarm. A
+    // forceLive entry that is `ok:true` but `served:"cache"` (the broker's
+    // failed-probe cache fallback) is NOT corroboration: the upstream probe
+    // failed, so we have no live confirmation that the throttling crossing is
+    // real right now. Treat it exactly like a probe failure → fall through to
+    // the defer branch below (state untouched, re-evaluated next tick). This
+    // also guarantees the "Live-probe corroborated (#2495)" footnote is only
+    // ever stamped on a real live probe.
+    if (isLiveCorroboration(freshEntry) && freshEntry!.result.ok && snapIndex >= 0) {
       // Live numbers replace the cache — and capturedAtMs is cleared so the
       // staleness gate never misfires on data we JUST probed.
-      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshResult.data, capturedAtMs: undefined }
+      const enrichedSnap = { ...snapshots[snapIndex]!, quota: freshEntry!.result.data, capturedAtMs: undefined }
       const prev = watchState[accountLabel] ?? emptyAccountState()
       const re = evaluateQuotaWatchAccount({ agentName, snap: enrichedSnap, prev, now, bootTick, tuning })
       // If the fresh probe still shows the same transition, use the
@@ -16661,18 +16680,27 @@ bot.command("auth", async ctx => {
     liveQuotas: async (accounts) => {
       try {
         const { results } = await client.probeQuota(accounts.map((a) => a.label))
+        // #2495 Change 2 — the broker tags each result `served:"live"|"cache"`
+        // (TTL hit or failed-probe fallback). When ANY account was served from
+        // cache, surface the OLDEST snapshot's capturedAt so the card stamps
+        // "⚠ cached Nm ago" instead of a false live stamp.
+        let staleCachedAtMs: number | undefined
         // Preserve input order (broker also preserves it, but be defensive).
-        return accounts.map((a) => {
+        const quotas = accounts.map((a) => {
           const hit = results.find((r) => r.label === a.label)
           if (!hit) return { ok: false as const, reason: "broker returned no result for account" }
+          if (hit.served === 'cache' && hit.capturedAt != null) {
+            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
+          }
           return hit.result
         })
+        return { quotas, staleCachedAtMs }
       } catch (err) {
         // Surface a uniform per-account failure so the dashboard renders
         // gracefully (label badge stays UNKNOWN) instead of falling back
         // to the legacy table.
         const reason = `broker probe-quota failed: ${(err as Error)?.message ?? String(err)}`
-        return accounts.map(() => ({ ok: false as const, reason }))
+        return { quotas: accounts.map(() => ({ ok: false as const, reason })) }
       }
     },
     tz: process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ,
@@ -19039,9 +19067,17 @@ bot.command('usage', async ctx => {
       const state = await client.listState()
       if (state.accounts.length > 0) {
         // Broker-routed probe (#1336) — see gateway.ts:8910 for diagnosis.
+        // #2495 Change 2 — the broker applies a probe-on-open TTL + single-
+        // flight; a TTL-hit or failed-probe fallback is tagged served:"cache",
+        // which we surface as a "⚠ cached Nm ago" footer instead of a false
+        // live stamp.
         const probeResp = await client.probeQuota(state.accounts.map((a) => a.label)).catch(() => ({ results: [] }))
+        let staleCachedAtMs: number | undefined
         const quotas = state.accounts.map((a) => {
           const hit = probeResp.results.find((r) => r.label === a.label)
+          if (hit?.served === 'cache' && hit.capturedAt != null) {
+            staleCachedAtMs = staleCachedAtMs == null ? hit.capturedAt : Math.min(staleCachedAtMs, hit.capturedAt)
+          }
           return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
         })
         const { renderAuthSnapshotFormat2, buildSnapshotsFromState } = await import(
@@ -19052,7 +19088,7 @@ bot.command('usage', async ctx => {
         const text = renderAuthSnapshotFormat2(snapshots, {
           tz,
           now: new Date(),
-          liveProbedAtMs: Date.now(),
+          ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: Date.now() }),
         })
         await switchroomReply(ctx, text, { html: true })
         return

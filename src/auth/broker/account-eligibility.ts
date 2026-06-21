@@ -18,6 +18,8 @@
  * PURE — no I/O, no clock except the injected `now`. Fully unit-tested.
  */
 
+import { isProbeThin } from "../quota.js";
+
 /**
  * Utilization at/above this on either window is a hard wall. Matches
  * `EXHAUSTION_PCT` in consumer-quota-sensor.ts and `classifyHealth`'s
@@ -82,6 +84,12 @@ export interface QuotaSnapshot {
    *  THIS is the serve-blocking discriminator: `out_of_credits` is dead,
    *  `org_level_disabled` is benign. See SERVE_BLOCKING_OVERAGE_REASONS. */
   overageDisabledReason?: string | null;
+  /** #2494 Bug C — which util windows the probe actually carried. A probe
+   *  with BOTH false is "thin" (no real signal, 0%-coalesced) and must NOT be
+   *  trusted to self-heal a real exhaustion mark (#2495 folded nit B). Unset
+   *  means "predates the flag" → treated as a real probe. */
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
 }
 
 /**
@@ -169,6 +177,12 @@ export function snapshotShouldClearMark(
   if (!mark) return false;
   if (!snapshotFresh(snapshot, now)) return false;
   if (snapshot.capturedAt < (mark.marked_at ?? 0)) return false;
+  // #2495 folded nit B — a THIN probe (no util headers, both windows coalesced
+  // to 0) is NOT evidence of health: `snapshotClearlyHealthy` reads it as 0%/0%
+  // and would clear a real exhaustion mark off a headerless response. Refuse to
+  // self-heal a mark on a thin probe; require a probe that actually measured at
+  // least one window before clearing.
+  if (isProbeThin(snapshot)) return false;
   // A serve-blocking overage (out_of_credits) is an exhaustion in its own
   // right — never let a 0%-util-but-credits-dead probe self-heal a mark off
   // such an account (that's exactly the live-probe re-clear the 2026-06-20

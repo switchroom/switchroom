@@ -237,7 +237,19 @@ export interface AuthBrokerClient {
   probeQuota(
     accounts: readonly string[],
     timeoutMs?: number,
-  ): Promise<{ results: Array<{ label: string; result: import('../quota-check.js').QuotaResult }> }>
+    /** #2495 Change 2/3 — bypass the broker's probe-on-open TTL (quota-watch
+     *  alarm corroboration). Normal card opens omit it (TTL-gated). */
+    forceLive?: boolean,
+  ): Promise<{
+    results: Array<{
+      label: string
+      result: import('../quota-check.js').QuotaResult
+      /** #2495 Change 2 — how this result was sourced ("live" vs "cache"). */
+      served?: 'live' | 'cache'
+      /** Unix ms the served snapshot was captured (set when served==="cache"). */
+      capturedAt?: number
+    }>
+  }>
   /**
    * Fleet notification-dedup claim (quota-watch). First caller of `key`
    * inside `windowMs` gets `granted: true` and sends; everyone else
@@ -280,9 +292,22 @@ export interface AuthCommandContext {
    */
   liveQuotas?: (
     accounts: AccountState[],
-  ) => Promise<import('../quota-check.js').QuotaResult[]>
+  ) => Promise<LiveQuotasResult>
   /** Operator timezone forwarded to the Format 2 renderer. */
   tz?: string
+}
+
+/**
+ * #2495 Change 2 — the enriched probe result. `quotas` stays parallel to
+ * `state.accounts` (the contract `buildSnapshotsFromState` relies on);
+ * `staleCachedAtMs` is set when ANY account was served from the durable cache
+ * (probe-on-open TTL hit OR a failed live probe falling back to cache) — it
+ * carries the OLDEST such snapshot's `capturedAt` so the footer stamps
+ * "⚠ cached Nm ago" instead of a false "Live · refreshed 0s ago".
+ */
+export interface LiveQuotasResult {
+  quotas: import('../quota-check.js').QuotaResult[]
+  staleCachedAtMs?: number
 }
 
 export interface AuthCommandReply {
@@ -345,10 +370,18 @@ export async function handleAuthCommand(
       const state = await ctx.client.listState()
       let liveQuotas: import('../quota-check.js').QuotaResult[] | undefined
       let liveProbedAtMs: number | undefined
+      let staleCachedAtMs: number | undefined
       if (ctx.liveQuotas && state.accounts.length > 0) {
         try {
-          liveQuotas = await ctx.liveQuotas(state.accounts)
-          liveProbedAtMs = Date.now()
+          const enriched = await ctx.liveQuotas(state.accounts)
+          liveQuotas = enriched.quotas
+          // #2495 Change 2 — only claim a live "refreshed Ns ago" stamp when
+          // NOTHING was served from cache; otherwise show "⚠ cached Nm ago".
+          if (enriched.staleCachedAtMs != null) {
+            staleCachedAtMs = enriched.staleCachedAtMs
+          } else {
+            liveProbedAtMs = Date.now()
+          }
         } catch {
           // Live probe failed — fall back to legacy table silently.
           liveQuotas = undefined
@@ -361,13 +394,14 @@ export async function handleAuthCommand(
       let keyboard: AuthCommandReply['keyboard']
       if (liveQuotas && liveQuotas.length === state.accounts.length) {
         const snapshots = buildSnapshotsFromState(state, liveQuotas)
-        keyboard = buildSnapshotKeyboard(snapshots)
+        keyboard = buildSnapshotKeyboard(snapshots, { now: new Date() })
       }
       return {
         text: renderShowText(state, Date.now(), {
           liveQuotas,
           tz: ctx.tz,
           liveProbedAtMs,
+          staleCachedAtMs,
         }),
         html: true,
         keyboard,
@@ -709,6 +743,10 @@ export interface RenderShowOpts {
   /** Wall-clock ms when the live probes returned, used for "refreshed
    *  Ns ago" footer. Omit to suppress that footer line. */
   liveProbedAtMs?: number
+  /** #2495 Change 2 — set when the render was served from the durable cache
+   *  (probe-on-open TTL hit or failed probe). Renders "⚠ cached Nm ago" in
+   *  the footer (takes precedence over liveProbedAtMs). */
+  staleCachedAtMs?: number
 }
 
 /**
@@ -745,6 +783,7 @@ export function renderShowText(
         tz: opts.tz,
         now: new Date(now),
         liveProbedAtMs: opts.liveProbedAtMs,
+        staleCachedAtMs: opts.staleCachedAtMs,
       }),
     )
   } else {

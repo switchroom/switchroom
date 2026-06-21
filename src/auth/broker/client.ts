@@ -232,6 +232,16 @@ export interface ProbeQuotaEntry {
         };
       }
     | { ok: false; reason: string };
+  /**
+   * #2495 Change 2 — how this result was sourced. `"live"` = a fresh upstream
+   * probe; `"cache"` = served from the durable cache (TTL-hit or probe-failure
+   * fallback). Absent on legacy responses. When `"cache"`, `capturedAt` carries
+   * the snapshot age so the card can stamp "⚠ cached Nm ago" instead of a false
+   * live stamp.
+   */
+  served?: "live" | "cache";
+  /** Unix ms the served snapshot was captured (set when `served === "cache"`). */
+  capturedAt?: number;
 }
 
 export interface ProbeQuotaData {
@@ -448,6 +458,7 @@ export class AuthBrokerClient {
   async probeQuota(
     accounts: readonly string[],
     timeoutMs?: number,
+    forceLive?: boolean,
   ): Promise<ProbeQuotaData> {
     const data = await this.send({
       v: PROTOCOL_VERSION,
@@ -455,6 +466,7 @@ export class AuthBrokerClient {
       op: "probe-quota",
       accounts: [...accounts],
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(forceLive ? { forceLive: true } : {}),
     });
     // JSON.parse does not revive Date. The broker serialises
     // fiveHourResetAt/sevenDayResetAt as Date → ISO string on the wire,

@@ -166,13 +166,42 @@ interface NotificationClaims {
 const NOTIFICATION_CLAIM_MAX_AGE_MS = 86_400_000;
 
 /**
+ * #2495 Change 2 — probe-on-open TTL. A `probe-quota` request whose cached
+ * snapshot is younger than this serves the cache instead of paying for a live
+ * upstream call. 45s is short enough that an opened /auth or /usage card is
+ * effectively realtime, but long enough that a render storm (a fleet boot, a
+ * user mashing Refresh, several agents' cards opening at once) doesn't multiply
+ * into one billable probe per render.
+ *
+ * COST: each live probe is a billable POST /v1/messages that consumes a sliver
+ * of the account's own quota (the only source of real ratelimit headers — see
+ * quota.ts). TTL + single-flight together cap probe volume to at most one
+ * upstream call per account per TTL window, no matter how many cards render.
+ *
+ * Env override: SWITCHROOM_QUOTA_PROBE_TTL_MS (ms). 0 disables the TTL gate
+ * (every probe-quota goes live — only single-flight coalescing remains).
+ */
+const DEFAULT_QUOTA_PROBE_TTL_MS = 45_000;
+
+function quotaProbeTtlMs(): number {
+  const raw = process.env.SWITCHROOM_QUOTA_PROBE_TTL_MS;
+  if (raw == null || raw === "") return DEFAULT_QUOTA_PROBE_TTL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_QUOTA_PROBE_TTL_MS;
+}
+
+/**
  * Per-account cached utilization snapshot, written after each successful
  * `opProbeQuota` call. Consumed by `opListState` so callers (quota-watch
  * loop) can classify account health without triggering a live probe.
- * In-memory only — intentionally not persisted. The cache populates from
- * `/auth`, auto-fallback, and boot-card probes; on broker restart it is
- * empty until the next such event (watchers treat absent entries as
- * "unknown" and skip — acceptable cold-start gap).
+ *
+ * #2495 Change 1 — durable. Mirrored to disk (`last-quota.json`) alongside
+ * the exhaustion ledger (`quota.json`) on every `cacheQuotaSnapshot` and
+ * reloaded on boot, so a broker restart serves last-known (age-stamped via
+ * `capturedAt`) utilization instead of a blank/`unknown` card until the next
+ * fleet tick repopulates it. The presence markers (`fiveHourUtilPresent` /
+ * `sevenDayUtilPresent`, added in #2494) round-trip too so a thin reloaded
+ * snapshot is still recognisably thin.
  */
 interface LastQuotaEntry {
   fiveHourUtilizationPct: number;
@@ -238,6 +267,29 @@ export interface AuthBrokerOptions {
 }
 
 /* ───────────────────────── Helpers ───────────────────────── */
+
+/**
+ * #2495 Change 2 — reconstruct a probe-shaped `QuotaResult` from a durable
+ * cache entry, so a TTL-hit / probe-failure fallback can be served on the same
+ * wire shape as a live probe. The ISO reset strings are revived to Date for
+ * the in-process consumers; the client revives again on the wire (harmless).
+ */
+function cachedSnapshotToResult(s: LastQuotaEntry): QuotaResult {
+  return {
+    ok: true,
+    data: {
+      fiveHourUtilizationPct: s.fiveHourUtilizationPct,
+      sevenDayUtilizationPct: s.sevenDayUtilizationPct,
+      fiveHourResetAt: s.fiveHourResetAt ? new Date(s.fiveHourResetAt) : null,
+      sevenDayResetAt: s.sevenDayResetAt ? new Date(s.sevenDayResetAt) : null,
+      representativeClaim: s.representativeClaim,
+      overageStatus: s.overageStatus,
+      overageDisabledReason: s.overageDisabledReason,
+      fiveHourUtilPresent: s.fiveHourUtilPresent,
+      sevenDayUtilPresent: s.sevenDayUtilPresent,
+    },
+  };
+}
 
 function sha256Hex(content: string): string {
   return createHash("sha256").update(content).digest("hex");
@@ -329,8 +381,13 @@ export class AuthBroker {
 
   // In-memory state mirrored to disk.
   private quota: QuotaState = {};
-  /** In-memory utilization cache (not persisted). Populated by opProbeQuota. */
+  /** Utilization cache. Populated by opProbeQuota; mirrored to disk
+   *  (`last-quota.json`) and reloaded on boot — #2495 Change 1. */
   private lastQuotaCache: LastQuotaCache = {};
+  /** #2495 Change 2 — single-flight: in-flight live probes keyed by account
+   *  label. Concurrent `probe-quota` requests for the same label share the one
+   *  pending upstream call (a render storm = 1 API call per account, not N). */
+  private probeInFlight = new Map<string, Promise<QuotaResult>>();
   private shaIndex: ShaIndex = {};
   private thresholdViolations: ThresholdViolations = {};
   /** Fleet notification-dedup claims: key → unix-ms of last grant.
@@ -973,6 +1030,7 @@ export class AuthBroker {
             identity,
             req.accounts,
             req.timeoutMs,
+            req.forceLive,
           );
           break;
         case "claim-notification":
@@ -1253,12 +1311,29 @@ export class AuthBroker {
     identity: Identity,
     accounts: readonly string[],
     timeoutMs?: number,
+    forceLive?: boolean,
   ): Promise<void> {
+    // #2495 Change 2/3 — forceLive (quota-watch corroboration) bypasses the
+    // TTL gate so the alarm decision is taken off a true live probe, not a
+    // possibly-stale cache read. Single-flight still applies.
+    const ttlMs = forceLive ? 0 : quotaProbeTtlMs();
     const results = await Promise.all(
-      accounts.map(async (label): Promise<{ label: string; result: QuotaResult }> => {
+      accounts.map(async (label): Promise<{ label: string; result: QuotaResult; served?: "live" | "cache"; capturedAt?: number }> => {
+        // #2495 Change 2 — TTL gate: a cached snapshot younger than the TTL
+        // serves the cache, skipping the billable upstream probe entirely.
+        const cached = this.lastQuotaCache[label];
+        if (ttlMs > 0 && cached && this.now() - cached.capturedAt < ttlMs) {
+          return { label, result: cachedSnapshotToResult(cached), served: "cache", capturedAt: cached.capturedAt };
+        }
+
         const creds = readAccountCredentials(label, this.home);
         const token = creds?.claudeAiOauth?.accessToken;
         if (!token) {
+          // No live creds. If we have ANY prior snapshot, serve it stale rather
+          // than render a blank card; otherwise surface the failure.
+          if (cached) {
+            return { label, result: cachedSnapshotToResult(cached), served: "cache", capturedAt: cached.capturedAt };
+          }
           const result: QuotaResult = {
             ok: false,
             reason: "no credentials for account in broker store",
@@ -1266,7 +1341,10 @@ export class AuthBroker {
           this.audit({ op: "probe-quota", identity, account: label, accountKind: "claude", ok: false, error: "missing-credentials" });
           return { label, result };
         }
-        const result = await this.fetchQuotaImpl({ accessToken: token, timeoutMs });
+
+        // #2495 Change 2 — single-flight: concurrent renders for the same label
+        // share one in-flight upstream probe (a render storm = 1 API call).
+        const result = await this.probeQuotaSingleFlight(label, token, timeoutMs);
         this.audit({
           op: "probe-quota",
           identity,
@@ -1278,11 +1356,43 @@ export class AuthBroker {
         // Cache the utilization snapshot for listState consumers (quota-watch
         // loop). Only update on success — a failed probe should not evict a
         // valid previous snapshot.
-        if (result.ok) this.cacheQuotaSnapshot(label, result);
-        return { label, result };
+        if (result.ok) {
+          this.cacheQuotaSnapshot(label, result);
+          return { label, result, served: "live" };
+        }
+        // #2495 Change 2 — probe FAILED. If we have a prior snapshot, serve it
+        // age-stamped (served:"cache") so the card renders an explicit
+        // "⚠ cached Nm ago" warning instead of a false live stamp.
+        if (cached) {
+          return { label, result: cachedSnapshotToResult(cached), served: "cache", capturedAt: cached.capturedAt };
+        }
+        return { label, result, served: "live" };
       }),
     );
     socket.write(encodeSuccess(id, { results }));
+  }
+
+  /**
+   * #2495 Change 2 — single-flight wrapper around a live quota probe. The
+   * first caller for a label starts the upstream `fetchQuota`; concurrent
+   * callers await the SAME promise. The entry is cleared when it settles, so
+   * the next probe-on-open (after the TTL window) starts a fresh call.
+   */
+  private probeQuotaSingleFlight(
+    label: string,
+    token: string,
+    timeoutMs?: number,
+  ): Promise<QuotaResult> {
+    const existing = this.probeInFlight.get(label);
+    if (existing) return existing;
+    const pending = this.fetchQuotaImpl({ accessToken: token, timeoutMs })
+      .finally(() => {
+        // Only clear if WE are still the registered in-flight promise (a later
+        // probe could have replaced it after we settled).
+        if (this.probeInFlight.get(label) === pending) this.probeInFlight.delete(label);
+      });
+    this.probeInFlight.set(label, pending);
+    return pending;
   }
 
   /** Store a successful quota probe in the in-memory cache that `list-state`
@@ -1303,6 +1413,9 @@ export class AuthBroker {
       sevenDayUtilPresent: result.data.sevenDayUtilPresent,
     };
     this.lastQuotaCache[label] = snapshot;
+    // #2495 Change 1 — persist the cache so a broker restart serves this
+    // last-known snapshot (age-stamped via capturedAt) instead of blank.
+    this.persistLastQuotaCache();
     // Self-heal: a fresh, clearly-healthy probe (both windows well under the
     // wall) that is newer than the mark CLEARS the persisted mark — so a
     // misfired/expired exhaustion can't linger on disk and survive restarts
@@ -2514,6 +2627,9 @@ export class AuthBroker {
     this.shaIndex = this.readJson<ShaIndex>("sha-index.json") ?? {};
     this.thresholdViolations = this.readJson<ThresholdViolations>("threshold-violations.json") ?? {};
     this.notificationClaims = this.readJson<NotificationClaims>("notification-claims.json") ?? {};
+    // #2495 Change 1 — reload the durable utilization cache so a restart
+    // serves last-known (age-stamped) quota, not a blank card.
+    this.lastQuotaCache = this.readJson<LastQuotaCache>("last-quota.json") ?? {};
   }
 
   private readJson<T>(name: string): T | null {
@@ -2523,6 +2639,9 @@ export class AuthBroker {
   }
 
   private persistQuota(): void { atomicWriteJsonSync(join(this.stateDir, "quota.json"), this.quota, 0o600); }
+  /** #2495 Change 1 — mirror the utilization cache to disk so it survives
+   *  a broker restart. Same atomic-write pattern as the exhaustion ledger. */
+  private persistLastQuotaCache(): void { atomicWriteJsonSync(join(this.stateDir, "last-quota.json"), this.lastQuotaCache, 0o600); }
   private persistNotificationClaims(): void { atomicWriteJsonSync(join(this.stateDir, "notification-claims.json"), this.notificationClaims, 0o600); }
   private persistShaIndex(): void { atomicWriteJsonSync(join(this.stateDir, "sha-index.json"), this.shaIndex, 0o600); }
   private persistThresholdViolations(): void { atomicWriteJsonSync(join(this.stateDir, "threshold-violations.json"), this.thresholdViolations, 0o600); }
@@ -2738,12 +2857,15 @@ export class AuthBroker {
     shaIndex: ShaIndex;
     thresholdViolations: ThresholdViolations;
     listeners: string[];
+    /** #2495 Change 1 — durable utilization cache (in-memory view). */
+    lastQuotaCache: LastQuotaCache;
   } {
     return {
       quota: { ...this.quota },
       shaIndex: { ...this.shaIndex },
       thresholdViolations: { ...this.thresholdViolations },
       listeners: [...this.listeners.keys()],
+      lastQuotaCache: structuredClone(this.lastQuotaCache),
     };
   }
 

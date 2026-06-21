@@ -247,9 +247,29 @@ describe('renderAuthSnapshotFormat2', () => {
   it('renders refresh stamp when liveProbedAtMs given', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps.slice(0, 1), {
       now: NOW,
-      liveProbedAtMs: Date.now() - 12_000,
+      liveProbedAtMs: NOW.getTime() - 12_000,
     });
     expect(out).toMatch(/<i>Live · refreshed \d+s ago<\/i>/);
+  });
+
+  it('#2495 Change 2 — renders "⚠ cached Nm ago" (NOT a live stamp) on staleCachedAtMs', () => {
+    const out = renderAuthSnapshotFormat2(fixtureSnaps.slice(0, 1), {
+      now: NOW,
+      staleCachedAtMs: NOW.getTime() - 3 * 60_000, // 3 min old cache
+    });
+    expect(out).toMatch(/<i>⚠ cached 3m ago<\/i>/);
+    // Crucially: no false live stamp.
+    expect(out).not.toContain('Live · refreshed');
+  });
+
+  it('#2495 Change 2 — staleCachedAtMs takes precedence over liveProbedAtMs', () => {
+    const out = renderAuthSnapshotFormat2(fixtureSnaps.slice(0, 1), {
+      now: NOW,
+      liveProbedAtMs: NOW.getTime(),
+      staleCachedAtMs: NOW.getTime() - 90_000,
+    });
+    expect(out).toContain('⚠ cached');
+    expect(out).not.toContain('Live · refreshed');
   });
 });
 
@@ -394,6 +414,31 @@ describe('buildSnapshotKeyboard', () => {
     const rows = buildSnapshotKeyboard(snaps, { maxSwitchButtons: 2 });
     const switchRows = rows.slice(0, -1);
     expect(switchRows.length).toBe(2);
+  });
+
+  it('#2495 nit A — threads `now` so a refilled-since-snapshot account is offered as a switch target', () => {
+    // refilled@x reads 100% on 5h, but its reset is in the PAST relative to the
+    // threaded `now` → refill-normalized to 0% → healthy → a valid switch
+    // target. With a default `new Date()` (well after the fixture epoch) the
+    // normalization still treats it as refilled, so to prove the THREADING we
+    // compare two explicit clocks.
+    const resetAt = new Date('2026-05-15T00:00:00Z'); // before `now`
+    const snaps: AccountSnapshot[] = [
+      snap({ label: 'active@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 5 }) }),
+      snap({
+        label: 'refilled@x',
+        quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: resetAt }),
+      }),
+    ];
+    // `now` AFTER the reset → refilled@x normalizes to healthy → offered.
+    const after = buildSnapshotKeyboard(snaps, { now: new Date('2026-05-15T00:53:00Z') })
+      .flat().map((b) => b.text);
+    expect(after).toContain('Switch fleet → refilled@x');
+    // `now` BEFORE the reset → still walled → NOT offered. Proves the threaded
+    // clock actually drives classification (a default-`now` impl would ignore it).
+    const before = buildSnapshotKeyboard(snaps, { now: new Date('2026-05-14T23:00:00Z') })
+      .flat().map((b) => b.text);
+    expect(before).not.toContain('Switch fleet → refilled@x');
   });
 });
 
