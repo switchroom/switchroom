@@ -39,6 +39,7 @@ import { getConfig, getConfigPath } from "./helpers.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
+import { compareReleaseTags } from "../config/release-resolve.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -60,6 +61,26 @@ export interface RolloutPlanOpts {
    * to persist).
    */
   pinToPersist?: string;
+  /**
+   * hostd/MCP path (#2487). When true the plan is reshaped for the
+   * unattended, agent-invoked rollout:
+   *
+   *   1. persist-pin moves from FIRST to AFTER the canary agent confirms
+   *      the target version (so a failed canary never leaves a persisted-
+   *      but-unverified pin that the next reconcile rolls fleet-wide —
+   *      brick scenario #2). The canary is rolled on a one-shot `--pin`
+   *      image ref via `apply`'s reading of the env-passed target; the
+   *      durable pin is only written once the canary is green.
+   *   2. the web + hostd refresh steps are DROPPED entirely — an
+   *      agent-invoked rollout must not synchronously recreate its own
+   *      hostd container (it would SIGKILL the in-flight rollout, which
+   *      is hostd's own child — brick scenario #1). The executor reports
+   *      "hostd/web refresh deferred — run host-side" instead.
+   *
+   * Gating the new ordering behind this explicit flag (not euid) keeps the
+   * host-shell path's persist-first behavior a deliberate choice.
+   */
+  hostdContext?: boolean;
 }
 
 /**
@@ -102,9 +123,39 @@ export function planRollout(
   opts: RolloutPlanOpts = {},
 ): RolloutStep[] {
   const steps: RolloutStep[] = [];
+  const ordered = orderAgentsCanaryFirst(agents);
+
+  if (opts.hostdContext) {
+    // hostd/MCP path (#2487): persist the pin AFTER the canary confirms,
+    // and DROP the hostd/web refresh (defer to host-side). The bare
+    // `apply` reads the env-passed one-shot target, so the canary rolls
+    // on the target image WITHOUT a durable pin write first.
+    steps.push({ kind: "apply" });
+    const [canary, ...rest] = ordered;
+    if (canary !== undefined) {
+      steps.push({ kind: "restart-agent", agent: canary });
+      // Durable pin is written only once the canary is green — a failed
+      // canary returns from executeRollout BEFORE this step is reached.
+      if (opts.pinToPersist) {
+        steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
+      }
+      for (const agent of rest) {
+        steps.push({ kind: "restart-agent", agent });
+      }
+    } else if (opts.pinToPersist) {
+      // No agents to roll (shouldn't happen — caller guards) but keep
+      // the persist intent consistent.
+      steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
+    }
+    steps.push({ kind: "sweep" });
+    return steps;
+  }
+
+  // Host-shell path: persist-FIRST (durable before any restart), then
+  // the web + hostd refresh — unchanged, deliberate.
   if (opts.pinToPersist) steps.push({ kind: "persist-pin", pin: opts.pinToPersist });
   steps.push({ kind: "apply" });
-  for (const agent of orderAgentsCanaryFirst(agents)) {
+  for (const agent of ordered) {
     steps.push({ kind: "restart-agent", agent });
   }
   if (!opts.skipWeb) {
@@ -180,15 +231,93 @@ export interface RolloutResult {
 }
 
 /**
+ * True when this `switchroom rollout` was spawned by the host-control
+ * daemon on behalf of an agent MCP call (#2487). hostd sets
+ * `SWITCHROOM_HOSTD_CONTEXT=1` on the child env. The flag flips three
+ * deliberate behaviors versus the host-shell path:
+ *   - persist the durable pin AFTER the canary, not before (planRollout);
+ *   - defer the hostd/web self-refresh (planRollout drops those steps);
+ *   - suppress "Run with sudo" guidance + soften the persistPin chown-back
+ *     (we're already euid 0 inside the hostd container, not via sudo).
+ */
+export function isHostdContext(): boolean {
+  return process.env.SWITCHROOM_HOSTD_CONTEXT === "1";
+}
+
+/**
+ * Sentinel prefix for the machine-readable rollout result line. hostd
+ * parses this off the spawned child's stdout to populate STRUCTURED
+ * status fields (`rolled[]`, `failedStep`, `failedAgent`) instead of
+ * flattening the outcome into a stdout tail (#2487 item 4). Emitted only
+ * on the hostd-context path; harmless on the host-shell path (we don't
+ * emit it there).
+ */
+export const ROLLOUT_RESULT_SENTINEL = "SWITCHROOM_ROLLOUT_RESULT:";
+
+/** Serialize a result for the sentinel line hostd parses. */
+export function encodeRolloutResultLine(result: RolloutResult): string {
+  return (
+    ROLLOUT_RESULT_SENTINEL +
+    JSON.stringify({
+      ok: result.ok,
+      rolled: result.rolled,
+      ...(result.failedStep ? { failedStep: result.failedStep } : {}),
+      ...(result.failedAgent ? { failedAgent: result.failedAgent } : {}),
+      ...(result.got !== undefined ? { got: result.got } : {}),
+      warnings: result.warnings,
+    })
+  );
+}
+
+/** Parse the last sentinel line out of a rollout child's stdout. Returns
+ *  null when no sentinel was emitted (e.g. the child died before
+ *  finishing). hostd uses this to recover structured fields. */
+export function parseRolloutResultLine(
+  stdout: string,
+): {
+  ok: boolean;
+  rolled: string[];
+  failedStep?: string;
+  failedAgent?: string;
+  got?: string | null;
+  warnings: string[];
+} | null {
+  const lines = stdout.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (line.startsWith(ROLLOUT_RESULT_SENTINEL)) {
+      try {
+        return JSON.parse(line.slice(ROLLOUT_RESULT_SENTINEL.length));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Execute a rollout plan. STOPS at the first failure that can strand the
  * fleet (apply failure, or an agent that doesn't return on the target
  * version). web/hostd refresh failures are non-fatal warnings — the agents
  * are already rolled; a stale dashboard/daemon doesn't strand them.
  */
+export interface RolloutExecOpts {
+  /**
+   * hostd/MCP path (#2487). When true, the durable pin is NOT yet
+   * persisted at the `apply` step (it's persisted after the canary), so
+   * `apply` is given the one-shot `--pin <target>` to regenerate compose
+   * against the target image. On the host-shell path the pin is already
+   * persisted, so a bare `apply` reads it from config.
+   */
+  hostdContext?: boolean;
+}
+
 export function executeRollout(
   steps: RolloutStep[],
   target: string,
   deps: RolloutDeps,
+  execOpts: RolloutExecOpts = {},
 ): RolloutResult {
   const targetNorm = normalizeVersion(target);
   const rolled: string[] = [];
@@ -197,8 +326,9 @@ export function executeRollout(
   for (const step of steps) {
     switch (step.kind) {
       case "persist-pin": {
-        // Persist FIRST so the subsequent bare `apply` (and restart / web /
-        // hostd) all read the same durable pin — no one-shot --pin needed.
+        // On the hostd path this runs AFTER the canary is green; on the
+        // host-shell path it runs FIRST. Either way: durably persist so
+        // subsequent reconciles read the same pin.
         deps.log(`→ persist release.pin=${step.pin} to switchroom.yaml`);
         if (deps.persistPin) {
           deps.persistPin(step.pin);
@@ -208,9 +338,14 @@ export function executeRollout(
         break;
       }
       case "apply": {
-        // Bare apply — it reads release.pin from the (now-persisted) config.
+        // hostd path: pin not yet persisted (it follows the canary), so
+        // pass the one-shot --pin so compose regenerates on the target.
+        // host-shell path: pin already persisted → bare apply reads it.
         deps.log(`→ apply — regenerating compose for ${target}`);
-        const r = deps.run(["apply"]);
+        const applyArgs = execOpts.hostdContext
+          ? ["apply", "--pin", target]
+          : ["apply"];
+        const r = deps.run(applyArgs);
         if (r.status !== 0) {
           return { ok: false, rolled, failedStep: "apply", warnings };
         }
@@ -263,11 +398,13 @@ export function executeRollout(
 }
 
 export function registerRolloutCommand(program: Command): void {
+  const hostdCtx = isHostdContext();
   program
     .command("rollout")
     .description(
       "Deploy a pinned version to the fleet, safely (staggered restart + " +
-        "per-agent version assert + web/hostd refresh). Run with sudo.",
+        "per-agent version assert + web/hostd refresh)." +
+        (hostdCtx ? "" : " Run with sudo."),
     )
     .option(
       "--pin <version>",
@@ -300,6 +437,26 @@ export function registerRolloutCommand(program: Command): void {
         process.exitCode = 2;
         return;
       }
+      // #2487 item 9 — reject DOWNGRADE pins on the agent-reachable
+      // (hostd) path specifically. `--agents <list>` + arbitrary `--pin`
+      // is a more surgical abuse surface than update_apply (targeted
+      // downgrade); downgrade-as-rollback is deferred to PR2's operator-
+      // tapped rollback verb. compareReleaseTags is conservative: it only
+      // refuses a clean vX.Y.Z → older-vX.Y.Z move, never a channel/sha.
+      if (hostdCtx && opts.pin) {
+        const current = config.release?.pin;
+        const cmp = compareReleaseTags(opts.pin, current);
+        if (cmp !== null && cmp < 0) {
+          process.stderr.write(
+            `rollout (hostd path) refuses a DOWNGRADE: ${opts.pin} is older ` +
+              `than the current pin ${current}. Downgrade/rollback is an ` +
+              `operator-tapped verb (deferred to PR2), not an agent rollout. ` +
+              `Nothing was changed.\n`,
+          );
+          process.exitCode = 2;
+          return;
+        }
+      }
       const allAgents = Object.keys(config.agents ?? {});
       const requested = opts.agents
         ? opts.agents.split(",").map((s) => s.trim()).filter(Boolean)
@@ -321,6 +478,7 @@ export function registerRolloutCommand(program: Command): void {
       const steps = planRollout(requested, {
         skipWeb: opts.skipWeb,
         pinToPersist: opts.pin ?? undefined,
+        hostdContext: hostdCtx,
       });
 
       if (opts.dryRun) {
@@ -355,13 +513,31 @@ export function registerRolloutCommand(program: Command): void {
           // in-place rewrite on EBUSY/EXDEV/EINVAL (single-file bind mount
           // inside the hostd container rejects rename over the mount point).
           writeConfigFileSync(configPath, after, statSync(configPath).mode & 0o777);
-          // rollout self-elevates via sudo; a root write would leave the
-          // operator-owned config root-owned and EACCES-lock other yaml verbs
-          // (and erode the read-only-operator-config foundation). chown back.
+          // chown-back rationale differs by path:
+          //   host-shell: rollout self-elevates via sudo; a root write
+          //     would leave the operator-owned config root-owned and
+          //     EACCES-lock other yaml verbs. chown back to the operator.
+          //   hostd: we're euid 0 inside the hostd container's mount
+          //     namespace (NOT via sudo). The config is a bind-mounted
+          //     single file at /state/config/switchroom.yaml whose
+          //     on-disk owner is the operator on the host. resolveOperatorUid()
+          //     must resolve the operator's uid for the chown to be
+          //     meaningful; if it can't, we SKIP the chown rather than
+          //     chown to a wrong/garbage uid — leaving the host's existing
+          //     ownership intact is safer than corrupting it (#2487 item 8).
           try {
             if (typeof process.geteuid === "function" && process.geteuid() === 0) {
               const uid = resolveOperatorUid();
-              if (uid !== undefined) chownSync(configPath, uid, uid);
+              if (uid !== undefined) {
+                chownSync(configPath, uid, uid);
+              } else if (hostdCtx) {
+                process.stderr.write(
+                  "⚠️  rollout (hostd path): could not resolve operator uid; " +
+                    "skipping config chown-back to avoid leaving switchroom.yaml " +
+                    "root-owned. Verify ownership host-side if other yaml verbs " +
+                    "EACCES.\n",
+                );
+              }
             }
           } catch {
             /* dev hosts may lack CAP_CHOWN — best-effort */
@@ -370,9 +546,26 @@ export function registerRolloutCommand(program: Command): void {
       };
 
       process.stdout.write(`Rolling ${requested.length} agent(s) to ${target}…\n`);
-      const result = executeRollout(steps, target, deps);
+      const result = executeRollout(steps, target, deps, { hostdContext: hostdCtx });
+
+      // hostd path: the hostd/web refresh was intentionally dropped from
+      // the plan (it would SIGKILL this very process). Surface that as a
+      // deferral note so the operator knows to refresh host-side.
+      if (hostdCtx) {
+        result.warnings.push(
+          "hostd/web refresh deferred — run host-side (`switchroom webd install` " +
+            "/ `switchroom hostd install`). An agent-invoked rollout cannot " +
+            "recreate its own hostd container without killing itself.",
+        );
+      }
 
       for (const w of result.warnings) process.stderr.write(`⚠️  ${w}\n`);
+
+      // hostd parses this sentinel to populate STRUCTURED status fields
+      // (rolled[]/failedStep/failedAgent) instead of a flattened tail.
+      if (hostdCtx) {
+        process.stdout.write(encodeRolloutResultLine(result) + "\n");
+      }
 
       if (!result.ok) {
         process.stderr.write(

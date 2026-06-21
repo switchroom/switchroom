@@ -74,6 +74,7 @@ describe("TOOLS export", () => {
       "agent_stop",
       "config_propose_edit", // PR 1a (admin-agent-config-edit) — flag-gated stub
       "get_status",     // PR B — read last terminal update_apply audit row
+      "rollout",        // #2487 — safe staggered canary fleet roll
       "update_apply",
       "update_check",
     ]);
@@ -178,6 +179,53 @@ describe("dispatchTool — happy path", () => {
 
   it("update_apply rejects malformed pin without hitting the wire", async () => {
     const res = await dispatchTool("update_apply", { pin: "not-a-pin" });
+    expect(res.isError).toBe(true);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  // ── #2487 rollout dispatch ───────────────────────────────────────────
+  it("rollout sends a rollout request with a semver pin", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    const res = await dispatchTool("rollout", { pin: "v0.15.18" });
+    expect(res.isError).toBeFalsy();
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.op).toBe("rollout");
+    expect(sent.args).toEqual({ pin: "v0.15.18" });
+    expect(sent.request_id).toMatch(/^mcp-rollout-/);
+    expect(sent.v).toBe(1);
+  });
+
+  it("rollout forwards agents + skip_web", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      agents: ["test-harness", "clerk"],
+      skip_web: true,
+    });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args).toEqual({
+      pin: "v0.15.18",
+      agents: ["test-harness", "clerk"],
+      skip_web: true,
+    });
+  });
+
+  it("rollout rejects a sha- pin at the wire boundary (semver-only)", async () => {
+    const res = await dispatchTool("rollout", { pin: "sha-abc1234" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/SHA pins are rejected|invalid/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("rollout rejects a missing pin without hitting the wire", async () => {
+    const res = await dispatchTool("rollout", {});
+    expect(res.isError).toBe(true);
+    expect(res.content[0]!.text).toMatch(/pin is required/);
+    expect(hostdRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("rollout rejects an empty agents array without hitting the wire", async () => {
+    const res = await dispatchTool("rollout", { pin: "v0.15.18", agents: [] });
     expect(res.isError).toBe(true);
     expect(hostdRequestMock).not.toHaveBeenCalled();
   });
