@@ -447,7 +447,7 @@ describe('truncated inputPreview recovery — Edit/Write file_path extraction', 
   }
 
   test('naturalAction recovers file basename from truncated Edit inputPreview', () => {
-    const filePath = '/home/kenthompson/project/src/some/long/module.ts'
+    const filePath = '/home/user/project/src/some/long/module.ts'
     const preview = truncatedPreview(filePath)
 
     // The truncated preview must be invalid JSON (precondition of the bug).
@@ -458,7 +458,7 @@ describe('truncated inputPreview recovery — Edit/Write file_path extraction', 
   })
 
   test('naturalAction recovers file basename from truncated Write inputPreview', () => {
-    const filePath = '/home/kenthompson/project/src/config/settings.json'
+    const filePath = '/home/user/project/src/config/settings.json'
     const full = JSON.stringify({
       file_path: filePath,
       content: 'x'.repeat(300),
@@ -469,7 +469,7 @@ describe('truncated inputPreview recovery — Edit/Write file_path extraction', 
   })
 
   test('resolveScopedAllowChoices includes a per-file "This file" choice for truncated Edit inputPreview', () => {
-    const filePath = '/home/kenthompson/project/src/some/long/module.ts'
+    const filePath = '/home/user/project/src/some/long/module.ts'
     const preview = truncatedPreview(filePath)
 
     // The truncated preview must be invalid JSON (precondition of the bug).
