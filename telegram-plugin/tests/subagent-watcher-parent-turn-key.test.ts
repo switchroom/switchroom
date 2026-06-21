@@ -264,3 +264,44 @@ describe('backfillJsonlAgentId — overlapping windows / hook precedence (#2081)
     expect(row?.parent_turn_key).toBe('-100:7:1400')
   })
 })
+
+// ─── #2506: null meta.json guard ─────────────────────────────────────────────
+// JSON.parse('null') succeeds and returns null. Before the fix, the enclosing
+// try/catch only covered the read+parse, so execution fell through to
+// `if (!meta.agentType …)` which threw TypeError: Cannot read properties of
+// null. The fix guards with `if (!meta || …)` so a literal-null meta.json
+// degrades to the same clean skip as any other "no usable fields" case.
+describe('backfillJsonlAgentId — null meta.json guard (#2506)', () => {
+  it('meta.json containing literal null → clean skip, no throw, row stays unlinked', () => {
+    insertSub({ id: 'toolu_null_meta', agentType: 'worker', description: 'task', startedAt: 1000 })
+
+    const jsonlPath = join(tempDir, 'null_meta_worker.jsonl')
+    writeFileSync(join(tempDir, 'null_meta_worker.meta.json'), 'null')
+
+    const logs: string[] = []
+    // Must not throw — before the fix this crashed with TypeError: Cannot read
+    // properties of null (reading 'agentType').
+    expect(() => backfillJsonlAgentId(db, jsonlPath, 'agentstem_null_meta', (m) => logs.push(m))).not.toThrow()
+
+    // Row must remain unlinked (the skip path, not the link path).
+    const row = readSub('toolu_null_meta')
+    expect(row?.jsonl_agent_id).toBeNull()
+
+    // A skip log must have been emitted (not a misleading 'backfill error').
+    expect(logs.some((l) => l.includes('backfill skip') && l.includes('agentstem_null_meta'))).toBe(true)
+  })
+
+  it('meta.json containing literal null → skip log does NOT contain "error"', () => {
+    // The outer try/catch in registerAgent would have surfaced this as a
+    // "backfill error" before the fix; now it should be a clean "backfill skip".
+    const jsonlPath = join(tempDir, 'null_meta_worker2.jsonl')
+    writeFileSync(join(tempDir, 'null_meta_worker2.meta.json'), 'null')
+
+    const logs: string[] = []
+    backfillJsonlAgentId(db, jsonlPath, 'agentstem_null_meta2', (m) => logs.push(m))
+
+    // Should have a skip log, not an error log.
+    expect(logs.some((l) => l.toLowerCase().includes('error'))).toBe(false)
+    expect(logs.some((l) => l.includes('backfill skip'))).toBe(true)
+  })
+})

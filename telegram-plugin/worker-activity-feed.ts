@@ -162,15 +162,18 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
   const header = `🛠 <b>Worker</b> · <i>${escapeHtml(desc)}</i>`
   const finished = v.state === 'done' || v.state === 'failed'
 
-  const steps = (v.narrativeLines ?? [])
-    // A narrative entry can itself be multi-line (e.g. a worker's final
-    // "Done.\n\n## Summary\n…"). Collapse to one visual line so a step
-    // slot stays single-line after the per-line markdown strip.
+  // Clean narrative lines (strip Markdown, collapse whitespace) but keep the
+  // raw (pre-HTML-escape) strings so the char-budget fitter can truncate raw
+  // content first and then escape, avoiding broken HTML entities at the slice
+  // boundary (e.g. &amp; → &amp or &lt; → &l after a naive escaped-string cut).
+  const rawSteps = (v.narrativeLines ?? [])
     .map((s) => stripMarkdown(s).replace(/\s+/g, ' ').trim())
     .filter((s) => s.length > 0)
-    // In no-truncate mode each line renders in FULL (no per-line "…").
-    // In legacy mode the STEP_MAX clip is preserved exactly.
-    .map((s) => escapeHtml(noTruncate ? s : truncate(s, STEP_MAX)))
+  // Escape + clip (clip only in legacy mode) for the rendered feed.
+  const steps = rawSteps.map((s) => escapeHtml(noTruncate ? s : truncate(s, STEP_MAX)))
+  // Newest raw step: used by _fitWorkerBodyToCharBudget's extreme fallback to
+  // truncate raw text before escaping (mirrors _fitToCharBudget in tool-activity-summary.ts).
+  const rawNewestStep = rawSteps[rawSteps.length - 1] ?? ''
 
   if (finished) {
     const verb = v.state === 'done' ? 'completed' : 'failed'
@@ -185,7 +188,7 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
       lines.push(`${emoji} <i>${escapeHtml(truncate(result, RESULT_MAX))}</i>`)
     }
     const body = lines.join('\n')
-    return noTruncate ? _fitWorkerBodyToCharBudget(body, lines) : body
+    return noTruncate ? _fitWorkerBodyToCharBudget(body, lines, rawNewestStep) : body
   }
 
   const lines = [header, `<i>running · ${elapsed} · ${v.toolCount} ${toolWord}</i>`]
@@ -196,13 +199,14 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
     // the manager always supplies narrativeLines.
     const summary = stripMarkdown(v.latestSummary).replace(/\s+/g, ' ').trim()
     if (summary.length > 0) {
-      lines.push(`<b>→ ${escapeHtml(truncate(summary, STEP_MAX))}</b>`)
+      // In no-truncate mode, render in full (no STEP_MAX clip); legacy mode preserves the clip.
+      lines.push(`<b>→ ${escapeHtml(noTruncate ? summary : truncate(summary, STEP_MAX))}</b>`)
     } else {
       lines.push('<i>starting…</i>')
     }
   }
   const body = lines.join('\n')
-  return noTruncate ? _fitWorkerBodyToCharBudget(body, lines) : body
+  return noTruncate ? _fitWorkerBodyToCharBudget(body, lines, rawNewestStep) : body
 }
 
 /**
@@ -212,40 +216,52 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
  * header + status line) are always kept.
  *
  * If the final (newest) feed line is itself oversized, it is hard-truncated so
- * at least some content survives — never returning a body with no step bullet.
+ * at least some step content survives — never returning a body with no step
+ * bullet. `rawNewestStep` is the raw (un-HTML-escaped) text of that newest step
+ * so the extreme fallback can truncate RAW content first, then escape and wrap.
+ *
+ * Never slice already-escaped HTML — that breaks entities (&amp; → &amp) and
+ * leaves dangling tags. Truncate the RAW content first, then escape and wrap,
+ * re-checking post-escape because escaping can expand (&→&amp;).
+ * Mirrors the identical strategy in `_fitToCharBudget` (tool-activity-summary.ts).
  */
-function _fitWorkerBodyToCharBudget(body: string, lines: string[]): string {
+function _fitWorkerBodyToCharBudget(body: string, lines: string[], rawNewestStep: string): string {
   if (body.length <= STATUS_CARD_CHAR_BUDGET) return body
   // lines[0] = header, lines[1] = status line, lines[2..] = step feed + optional rule/result
   const fixed = lines.slice(0, 2)
   const feed = lines.slice(2)
   // Try dropping oldest feed lines until the output fits (keeping the newest).
-  // Stop before dropping ALL lines — the extreme case below handles that.
   for (let drop = 1; drop < feed.length; drop++) {
     const kept = feed.slice(drop)
-    if (kept.length === 0) break // don't return a body with no step bullet here
     const candidate = [...fixed, ...kept].join('\n')
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
-  // Extreme: the newest feed line is itself oversized. Hard-truncate it to fit
-  // so at least some step content survives (a truncated step is better than none).
-  // The feed lines are already HTML-escaped; slice the escaped string and patch
-  // the closing tag so Telegram sees valid HTML.
+  // Extreme: the newest feed line is itself oversized. Never slice the already-
+  // escaped HTML string — that splits entities (&amp;lt; → &amp;l, &amp;am…).
+  // Instead: truncate the RAW step content first, then escape and wrap, checking
+  // post-escape because escaping can expand the length (&→&amp;).
   const newestLine = feed[feed.length - 1] ?? ''
   const fixedJoined = fixed.join('\n')
-  const overhead = fixedJoined.length + 1 // +1 for the \n between fixed and newest
+  const isBold = newestLine.startsWith('<b>')
+  const isItalic = newestLine.startsWith('<i>')
+  const openTag = isBold ? '<b>' : isItalic ? '<i>' : ''
+  const closeTag = isBold ? '</b>' : isItalic ? '</i>' : ''
+  const prefix = isBold ? '→ ' : isItalic ? '✓ ' : ''
+  const wrapperOverhead = openTag.length + prefix.length + closeTag.length
+  const overhead = fixedJoined.length + 1 // +1 for the \n joining fixed and newest
   const maxNewest = Math.max(0, STATUS_CARD_CHAR_BUDGET - overhead)
-  if (maxNewest > 10 && newestLine.length > 0) {
-    // Detect wrapper tags (<b>→ …</b> or <i>✓ …</i>) and re-close after truncation.
-    const isBold = newestLine.startsWith('<b>')
-    const isItalic = newestLine.startsWith('<i>')
-    const closingTag = isBold ? '</b>' : isItalic ? '</i>' : ''
-    const tagOverhead = isBold || isItalic ? (3 + closingTag.length) : 0 // <b> or <i> open tag
-    const sliceAt = maxNewest - closingTag.length - tagOverhead
-    if (sliceAt > 0) {
-      const inner = newestLine.slice(3, 3 + sliceAt) // strip opening tag
-      const truncated = (isBold ? '<b>' : isItalic ? '<i>' : '') + inner + closingTag
-      return [fixedJoined, truncated].join('\n')
+  if (maxNewest > wrapperOverhead && rawNewestStep.length > 0) {
+    const maxRaw = maxNewest - wrapperOverhead
+    let raw = rawNewestStep.slice(0, maxRaw)
+    let escaped = escapeHtml(raw)
+    // Re-check post-escape: escaping can expand the string (& → &amp; etc.).
+    while (raw.length > 0 && wrapperOverhead + escaped.length > maxNewest) {
+      const excess = wrapperOverhead + escaped.length - maxNewest
+      raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
+      escaped = escapeHtml(raw)
+    }
+    if (escaped.length > 0) {
+      return [fixedJoined, `${openTag}${prefix}${escaped}${closeTag}`].join('\n')
     }
   }
   // Absolute last resort: just the fixed headers (budget too tight even for one char).
@@ -285,8 +301,10 @@ interface WorkerHandle {
   cooldownUntil: number
   /**
    * Accumulated narrative lines (oldest→newest), deduped against the
-   * immediately-preceding line and capped to NARRATIVE_MAX_LINES. Grows the
-   * live render so the feed reads like the main agent's answer.
+   * immediately-preceding line. In no-truncate mode capped to
+   * STATUS_ROLLING_LINES (rolling window); in legacy mode to
+   * NARRATIVE_MAX_LINES. Grows the live render so the feed reads like the
+   * main agent's answer.
    */
   narrative: string[]
   /** Per-worker serialization chain so ticks can't interleave sends. */

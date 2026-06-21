@@ -165,9 +165,9 @@ export function describeToolUse(
 // exact-duplicates collapsed, capped to the most recent MIRROR_MAX_LINES
 // with a "+N earlier" header so a heavy turn stays readable.
 //
-// When SWITCHROOM_STATUS_NO_TRUNCATE is not '0' (the default), all cosmetic
-// caps are lifted and the full feed is shown, bounded only by the 4096-char
-// Telegram limit via STATUS_CARD_CHAR_BUDGET.
+// When SWITCHROOM_STATUS_NO_TRUNCATE is not '0' (the default), per-line "…"
+// clips and overflow headers are dropped; only the last STATUS_ROLLING_LINES
+// steps are shown in full, bounded by the 4096-char limit (STATUS_CARD_CHAR_BUDGET).
 
 import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
 
@@ -418,9 +418,6 @@ function _fitNestedToCharBudget(
     const out: string[] = [];
     if (pDrop > 0) out.push(`<i>✓ +${pDrop} earlier…</i>`);
     for (const l of shownP) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
-    if (children.length > 0) out.push(`${NESTED_PREFIX}<i>+0 earlier…</i>`); // placeholder (unconditional pop below — children is guaranteed non-empty here; this pair is a size-estimation probe kept structurally symmetric with the cDrop loop)
-    // Actually render children at full length.
-    out.pop(); // remove placeholder (children guaranteed non-empty at this call site)
     const lastChildIdx = children.length - 1;
     children.forEach((l, i) => {
       const esc = escapeFeedHtml(l);

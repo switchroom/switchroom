@@ -672,15 +672,28 @@ describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative a
 // the oversized line then immediately splice it out, making the narrative empty
 // and the step vanish from the rendered output.
 
-/** Cheap valid-HTML checker: balanced <b>/<i> tags and no partial entity. */
+/**
+ * Cheap valid-HTML checker: balanced <b>/<i> tags and no dangling/partial entity.
+ * Checks for partial entities (e.g. `&am`, `&l`, `&amp` without trailing `;`)
+ * as produced by naive slicing of already-escaped HTML at an entity boundary.
+ */
 function isValidWorkerHtml(s: string): boolean {
   const bOpen = (s.match(/<b>/g) ?? []).length
   const bClose = (s.match(/<\/b>/g) ?? []).length
   const iOpen = (s.match(/<i>/g) ?? []).length
   const iClose = (s.match(/<\/i>/g) ?? []).length
   if (bOpen !== bClose || iOpen !== iClose) return false
-  // No partial entity (e.g. &amp without semicolon at end or mid-string).
-  if (/&[a-z]+$/.test(s)) return false
+  // Check every `&` occurrence: the run of letters after it must end with `;`.
+  // A partial entity like `&am`, `&l`, or `&amp` (no ;) would fail this.
+  // We scan every `&` manually so there's no regex backtracking ambiguity.
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '&') continue
+    let j = i + 1
+    while (j < s.length && s[j] >= 'a' && s[j] <= 'z') j++
+    // j is now at the character after the letter run.
+    // If there were letters and the next char isn't ';', it's a broken entity.
+    if (j > i + 1 && (j >= s.length || s[j] !== ';')) return false
+  }
   return true
 }
 
@@ -728,6 +741,112 @@ describe('extreme-edge: single oversized narrative line (no-truncate ON)', () =>
     // Step must be present in some form (truncated is fine, absent is not).
     const hasBullet = out.includes('→') || out.includes('✓')
     expect(hasBullet).toBe(true)
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
+  })
+})
+
+// ─── Bug 2: _fitWorkerBodyToCharBudget must not slice already-escaped HTML ───
+//
+// Before the fix, the extreme fallback in _fitWorkerBodyToCharBudget sliced
+// directly into the already-HTML-escaped newest line string. If the slice
+// boundary landed inside an HTML entity (&amp;, &lt;, &gt;), the output
+// contained a broken entity fragment (&am, &l, &amp without ;), which
+// Telegram Bot API rejects with HTTP 400 on parse_mode:'HTML'.
+//
+// The fix mirrors _fitToCharBudget (tool-activity-summary.ts): truncate RAW
+// content first, then escape, then wrap, re-checking post-escape because
+// escaping can expand the string (&→&amp; etc.).
+//
+// These tests place entity characters (&, <, >) at positions that, under the
+// old naive slice, would produce exactly the broken fragments the issue
+// identified (&am, &l). They assert the output is valid HTML and within budget.
+
+describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities', () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+  })
+
+  /**
+   * Build a narrative line that, after HTML-escaping, has the entity boundary
+   * at a precise position so a naive `escaped.slice(3, 3 + N)` would split it.
+   *
+   * Strategy: fill with 'x' characters up to a budget, then append an entity
+   * character so the entity starts right where the slice would land.
+   */
+  function buildEntityBoundaryLine(entityChar: string, charBudget: number): string {
+    // The fitter computes sliceAt ≈ charBudget - tagOverhead - closingTag.length.
+    // After the "→ " prefix (2 chars) and <b>…</b> wrapper (7 chars total overhead
+    // in the old code), the inner slice window is roughly charBudget - 9.
+    // Place the entity character so it lands at the very start of where the
+    // naive slice would begin — i.e., fill with (charBudget - 9) 'x's then '&'.
+    const fillLen = Math.max(0, charBudget - 9)
+    return 'x'.repeat(fillLen) + entityChar + 'y'.repeat(50)
+  }
+
+  it('& at entity boundary: output is valid HTML (no &am, &amp without ; etc.)', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // A line that places '&' right at the slice boundary so naive cut → &am
+    const line = buildEntityBoundaryLine('&', 4096)
+    expect(line.length).toBeGreaterThan(100) // sanity: line is substantial
+
+    const out = renderWorkerActivity(view({ narrativeLines: [line] }))
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
+    // No partial entity fragments that the old code produced.
+    expect(out).not.toMatch(/&amp$/)   // incomplete &amp; at end
+    expect(out).not.toMatch(/&am[^p]/) // &am followed by non-p (e.g. &amy)
+    expect(out).not.toMatch(/&[lg]t?[^;]/) // &l, &lt without semicolon
+  })
+
+  it('< at entity boundary: output is valid HTML (no &l, &lt without ; etc.)', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const line = buildEntityBoundaryLine('<', 4096)
+
+    const out = renderWorkerActivity(view({ narrativeLines: [line] }))
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(out).not.toMatch(/&lt$/)    // incomplete &lt; at end
+    expect(out).not.toMatch(/&l[^t;]/) // &l followed by non-t
+  })
+
+  it('> at entity boundary: output is valid HTML (no &g, &gt without ; etc.)', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const line = buildEntityBoundaryLine('>', 4096)
+
+    const out = renderWorkerActivity(view({ narrativeLines: [line] }))
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(out).not.toMatch(/&gt$/)    // incomplete &gt; at end
+    expect(out).not.toMatch(/&g[^t;]/) // &g followed by non-t
+  })
+
+  it('entity-dense line (& < > interleaved): output ≤ budget and valid HTML', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // Mix entity characters throughout so any slice position is dangerous.
+    const chunk = '&' + 'x'.repeat(3) + '<' + 'y'.repeat(3) + '>' + 'z'.repeat(3)
+    const line = chunk.repeat(500) // ~10k chars raw → well over budget after escape
+    expect(line.length).toBeGreaterThan(4000)
+
+    const out = renderWorkerActivity(view({ narrativeLines: [line] }))
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
+  })
+
+  it('single & alone in the line: valid HTML and within budget', () => {
+    // Regression: a one-char entity line is a degenerate case the while-loop
+    // must handle without infinite-looping or returning empty content.
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // Build a huge line: filler xs then '&' then more xs
+    const line = 'x'.repeat(3000) + '&' + 'x'.repeat(1000)
+    expect(line.length).toBeGreaterThan(4000)
+
+    const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
     expect(isValidWorkerHtml(out)).toBe(true)

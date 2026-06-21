@@ -503,13 +503,14 @@ interface FsLike {
  * Backfill `jsonl_agent_id` for a sub-agent row that was inserted by the
  * PreToolUse hook (keyed on tool_use_id) but didn't yet know the JSONL stem.
  *
- * Strategy: read the `agent-<id>.meta.json` sibling Claude Code writes next
- * to each sub-agent JSONL. It carries `{ agentType, description, toolUseId }`
- * where `toolUseId` is the primary key of the `subagents` row (written by
- * `subagent-tracker-pretool.mjs` from `event.tool_use_id`). We use the direct
- * `toolUseId` lookup first (exact PK match, race-safe); fall back to the fuzzy
- * `(agentType, description)` match only when `toolUseId` is absent (older
- * Claude Code versions that pre-date this field in the meta).
+ * Strategy: read the `agent-<id>.meta.json` sibling that the Claude Code
+ * binary writes next to each sub-agent JSONL. It carries `{ agentType,
+ * description, toolUseId }` where `toolUseId` is the primary key of the
+ * `subagents` row — the same `event.tool_use_id` value the pretool hook
+ * (`subagent-tracker-pretool.mjs`) uses when it inserts the DB row. We use
+ * the direct `toolUseId` lookup first (exact PK match, race-safe); fall back
+ * to the fuzzy `(agentType, description)` match only when `toolUseId` is
+ * absent (older Claude Code versions that pre-date this field in the meta).
  *
  * Edge cases:
  *   - meta.json missing or unreadable: no-op (the row stays unlinked; liveness
@@ -531,7 +532,7 @@ export function backfillJsonlAgentId(
   log?: (msg: string) => void,
 ): void {
   const metaPath = jsonlPath.replace(/\.jsonl$/, '.meta.json')
-  let meta: { agentType?: string; description?: string; toolUseId?: string }
+  let meta: { agentType?: string; description?: string; toolUseId?: string } | null
   try {
     const raw = readFileSync(metaPath, 'utf8')
     meta = JSON.parse(raw)
@@ -539,7 +540,7 @@ export function backfillJsonlAgentId(
     log?.(`subagent-watcher: backfill skip ${agentId} — meta.json not readable at ${metaPath}`)
     return
   }
-  if (!meta.agentType && !meta.description && !meta.toolUseId) {
+  if (!meta || (!meta.agentType && !meta.description && !meta.toolUseId)) {
     log?.(`subagent-watcher: backfill skip ${agentId} — meta.json has no agentType/description/toolUseId`)
     return
   }
