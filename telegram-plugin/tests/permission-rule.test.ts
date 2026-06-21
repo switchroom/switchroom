@@ -203,6 +203,23 @@ describe('matchesAllowRule — scoped file/Bash/Skill rules', () => {
   it('does not match a different tool with the same arg', () => {
     expect(matchesAllowRule('Skill(mail)', 'Bash', JSON.stringify({ skill: 'mail' }))).toBe(false)
   })
+
+  it('matches a scoped Edit rule when the inputPreview is truncated (enforcement-half fix)', () => {
+    // Simulate Claude Code's 200-char truncation of inputPreview for Edit calls
+    // where old_string/new_string push the JSON past 200 chars.
+    const filePath = '/path/to/module.ts'
+    const truncatedPreview = JSON.stringify({
+      file_path: filePath,
+      old_string: 'function oldFn() {\n  // many lines of old code that push JSON well past 200 chars\n  const x = doSomething();\n  return x;\n}',
+      new_string: 'function newFn() { return doSomethingElse(); }',
+    }).slice(0, 200)
+
+    // Precondition: the preview must be invalid JSON (proving truncation occurred).
+    expect(() => JSON.parse(truncatedPreview)).toThrow()
+
+    // The scoped rule must still match — file_path is the first key and intact.
+    expect(matchesAllowRule(`Edit(${filePath})`, 'Edit', truncatedPreview)).toBe(true)
+  })
 })
 
 describe('matchesAllowRule — MCP', () => {

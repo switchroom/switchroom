@@ -15,6 +15,7 @@ import {
   formatPermissionResumeMessage,
 } from '../permission-title.js'
 import type { ScopeOption } from '../permission-rule.js'
+import { resolveScopedAllowChoices } from '../permission-rule.js'
 
 const opt = (rule: string): ScopeOption => ({ rule, buttonLabel: 'x', broad: false })
 
@@ -422,5 +423,65 @@ describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
     expect(
       formatPermissionResumeMessage({ agentName: null, behavior: 'allow', action: 'edit: x.md' }),
     ).toBe('▶️ <b>Agent</b> — got it, continuing: <i>edit: x.md</i>')
+  })
+})
+
+describe('truncated inputPreview recovery — Edit/Write file_path extraction', () => {
+  /**
+   * Claude Code produces `input_preview = JSON.stringify(displayInput).slice(0, 200)`.
+   * For Edit/Write the serialised form is:
+   *   {"file_path":"...","old_string":"<hundreds of chars>","new_string":"..."}
+   * which almost always exceeds 200 chars, leaving invalid (truncated) JSON.
+   * "file_path" is the first key so its value is intact within 200 chars.
+   * The lenient regex fallback must recover it so cards read "edit: module.ts"
+   * instead of the generic "edit files".
+   */
+  function truncatedPreview(filePath: string): string {
+    const full = JSON.stringify({
+      file_path: filePath,
+      old_string:
+        'function oldFn() {\n  // many lines of old code that push the JSON way past 200 chars\n  const x = doSomething();\n  return x;\n}',
+      new_string: 'function newFn() { return doSomethingElse(); }',
+    })
+    return full.slice(0, 200)
+  }
+
+  test('naturalAction recovers file basename from truncated Edit inputPreview', () => {
+    const filePath = '/home/user/project/src/some/long/module.ts'
+    const preview = truncatedPreview(filePath)
+
+    // The truncated preview must be invalid JSON (precondition of the bug).
+    expect(() => JSON.parse(preview)).toThrow()
+
+    // After fix: basename is recovered via regex fallback.
+    expect(naturalAction('Edit', preview)).toBe('edit: module.ts')
+  })
+
+  test('naturalAction recovers file basename from truncated Write inputPreview', () => {
+    const filePath = '/home/user/project/src/config/settings.json'
+    const full = JSON.stringify({
+      file_path: filePath,
+      content: 'x'.repeat(300),
+    })
+    const preview = full.slice(0, 200)
+    expect(() => JSON.parse(preview)).toThrow()
+    expect(naturalAction('Write', preview)).toBe('write: settings.json')
+  })
+
+  test('resolveScopedAllowChoices includes a per-file "This file" choice for truncated Edit inputPreview', () => {
+    const filePath = '/home/user/project/src/some/long/module.ts'
+    const preview = truncatedPreview(filePath)
+
+    // The truncated preview must be invalid JSON (precondition of the bug).
+    expect(() => JSON.parse(preview)).toThrow()
+
+    const choices = resolveScopedAllowChoices('Edit', preview)
+    expect(choices).not.toBeNull()
+    // After fix: specific "This file" choice present with the full path.
+    expect(choices!.specific).toBeDefined()
+    expect(choices!.specific!.buttonLabel).toBe('This file')
+    expect(choices!.specific!.rule).toBe(`Edit(${filePath})`)
+    // Broad option also present.
+    expect(choices!.broad.buttonLabel).toBe('Any file')
   })
 })

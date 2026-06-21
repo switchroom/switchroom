@@ -91,7 +91,7 @@ export function resolveScopedAllowChoices(
 
   // ── File tools: this exact path vs any file.
   if (FILE_TOOLS.has(toolName)) {
-    const path = filePathFrom(input);
+    const path = filePathFrom(input, inputPreview);
     const broad: ScopeOption = { rule: toolName, buttonLabel: "Any file", broad: true };
     if (path) {
       return {
@@ -163,9 +163,36 @@ function resolveSkillName(input: Record<string, unknown>): string | null {
   );
 }
 
-function filePathFrom(input: Record<string, unknown> | null): string | null {
-  if (!input) return null;
-  return readString(input, "file_path") ?? readString(input, "notebook_path");
+function filePathFrom(
+  input: Record<string, unknown> | null,
+  rawPreview?: string,
+): string | null {
+  if (input) {
+    const p = readString(input, "file_path") ?? readString(input, "notebook_path");
+    if (p) return p;
+  }
+  // Claude Code truncates inputPreview to 200 chars, making the surrounding
+  // JSON invalid for Edit/Write (old_string/new_string push it past 200).
+  // "file_path" is the first key, so its value is intact in the truncated
+  // prefix — extract it with a lenient regex on the raw string.
+  if (rawPreview) return extractFilePathFromRaw(rawPreview);
+  return null;
+}
+
+/**
+ * Regex-based fallback to extract "file_path" or "notebook_path" from a raw
+ * (possibly truncated / invalid-JSON) inputPreview string. JSON-unescapes the
+ * captured value. Returns null when neither key is present or value is empty.
+ */
+function extractFilePathFromRaw(raw: string): string | null {
+  const m = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw);
+  if (!m) return null;
+  try {
+    const value = JSON.parse(`"${m[1]}"`) as string;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -274,7 +301,7 @@ export function matchesAllowRule(
       return bashFirstToken(cmd) === m[1];
     }
     if (FILE_TOOLS.has(ruleTool)) {
-      return filePathFrom(input) === arg;
+      return filePathFrom(input, inputPreview) === arg;
     }
     return false;
   }
