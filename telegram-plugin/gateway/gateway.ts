@@ -1724,6 +1724,22 @@ const FEED_REOPEN_AFTER_ACK_ENABLED =
 const FEED_HEARTBEAT_ENABLED = process.env.SWITCHROOM_FEED_HEARTBEAT !== '0'
 const FEED_HEARTBEAT_TICK_MS = 6_000
 const FEED_HEARTBEAT_MIN_STALE_MS = 6_000
+// Liveness-driven feed open. The activity feed is otherwise TOOL-driven — it
+// opens only when a tool emits a non-null label. A turn dominated by thinking
+// or by suppressed-by-design tools (typing / memory recall / reply) emits no
+// label, so the feed never opens and a long turn reads as pure silence until
+// the 300s silence-poke (the #680 dark-turn). When a turn has been alive >=
+// FEED_LIVENESS_OPEN_MS with no feed yet, open a minimal "Working…" feed so the
+// user always has a live indicator; the first real tool label edits it with
+// real content. Runs on the heartbeat interval, so the effective open lands in
+// [threshold, threshold + FEED_HEARTBEAT_TICK_MS). Kill switch:
+// SWITCHROOM_FEED_LIVENESS_OPEN=0. Default on.
+const FEED_LIVENESS_OPEN_ENABLED = process.env.SWITCHROOM_FEED_LIVENESS_OPEN !== '0'
+const FEED_LIVENESS_OPEN_MS = (() => {
+  const raw = process.env.SWITCHROOM_FEED_LIVENESS_OPEN_MS
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 12_000
+})()
 
 /** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
 function formatFeedElapsed(ms: number): string {
@@ -5259,8 +5275,12 @@ let inFlightUpdate: { requestId: string; startedAt: number } | null = null
 //   SWITCHROOM_SILENCE_FALLBACK_MS         — base threshold (default 300000)
 //   SWITCHROOM_SILENCE_FALLBACK_HARD_MS    — hard ceiling for the in-flight-tool
 //                                            defer (default 900000 = 15min)
-//   SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1 — enable the defer (default OFF;
-//                                            canary on marko against #2162 telemetry)
+//   SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1 — enable the defer. NOTE: this is
+//                                            now set fleet-wide in defaults.env
+//                                            (was a marko canary against #2162;
+//                                            promoted to the fleet default). The
+//                                            code default below is still OFF, so
+//                                            the live behaviour comes from config.
 function parsePositiveMsEnv(name: string, fallbackMs: number): number {
   const raw = process.env[name]
   if (raw == null || raw === '') return fallbackMs
@@ -10043,8 +10063,31 @@ async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
 function feedHeartbeatTick(): void {
   const turn = currentTurn
   if (turn == null) return
-  if (turn.activityMessageId == null) return // no live feed yet / already cleared
   if (turn.finalAnswerDelivered) return // feed handed off to the answer
+
+  // Liveness feed (open + maintain). `mirrorLines.length === 0` means no tool
+  // has ever produced a label this turn — pure thinking, or only suppressed
+  // tools. Open a minimal "Working…" feed once the turn passes the threshold,
+  // and keep its elapsed climbing until a real label arrives. The first label
+  // makes mirrorLines non-empty, so the labelled-feed heartbeat below takes
+  // over and its edit cleanly replaces the placeholder. drainActivitySummary
+  // sends (opens) when activityMessageId is null and edits (maintains) once set
+  // — so this one branch handles both the open and the climb.
+  if (turn.mirrorLines.length === 0) {
+    if (!FEED_LIVENESS_OPEN_ENABLED || turn.sessionChatId == null) return
+    const age = Date.now() - turn.startedAt
+    if (age < FEED_LIVENESS_OPEN_MS) return
+    const rendered = renderActivityFeedWithNested(['Working…'], [], false, ` · ${formatFeedElapsed(age)}`)
+    if (rendered == null) return
+    turn.activityPendingRender = rendered
+    if (turn.activityInFlight == null) {
+      turn.activityInFlight = drainActivitySummary(turn)
+    }
+    return
+  }
+
+  // Labelled-feed heartbeat: keep a stale in-progress step visibly advancing.
+  if (turn.activityMessageId == null) return // no live feed yet / already cleared
   if (turn.lastToolLabelAt == null) return // feed not driven by a labelled step
   const elapsed = Date.now() - turn.lastToolLabelAt
   if (elapsed < FEED_HEARTBEAT_MIN_STALE_MS) return // step is fresh; feed advancing normally
@@ -10106,8 +10149,15 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
     }
     // Default: leave the status message as a record, edited to a terminal
     // all-done state so it doesn't freeze on a misleading "→ in-progress" line.
-    const finalHtml =
+    let finalHtml =
       finalHtmlOverride !== undefined ? finalHtmlOverride : composeTurnActivity(turn, true)
+    // Liveness-only feed: opened on the timer for a turn that never labelled a
+    // tool (pure thinking / suppressed tools), so mirrorLines is empty and the
+    // terminal render is null. Finalize to a done "✓ Working…" record instead
+    // of leaving the message frozen on the live "→ Working…" line.
+    if (finalHtml == null && turn.mirrorLines.length === 0 && turn.activityEverOpened) {
+      finalHtml = renderActivityFeedWithNested(['Working…'], [], true)
+    }
     if (finalHtml == null) return
     try {
       await robustApiCall(
@@ -10406,12 +10456,6 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
-      // Count surfaced tool steps. This is the single source of truth for the
-      // `tools=` lifecycle field and the `✓ N steps` activity-feed total.
-      // Placed AFTER the surface-tool guard so reply/stream_reply/edit_message/
-      // react are never counted. send_typing and sync_retain are suppressed at
-      // the hook level (computeLabel returns null) so they never arrive here.
-      turn.labeledToolCount++
       // Stop feeding once the FINAL answer has landed — the hand-off where
       // `clearActivitySummary` deletes the feed so the answer is the
       // authoritative surface. Gating on `replyCalled` (any reply) killed the
@@ -10470,6 +10514,14 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {
+        // Count surfaced tool steps — the single source of truth for the `tools=`
+        // lifecycle field and the `✓ N steps` total. Incremented HERE (not at the
+        // top of the case) so the count stays consistent with what the feed
+        // actually surfaces: an empty label (appendActivityLabel → null) or a
+        // label dropped by the post-final-answer reopen guard never inflates it.
+        // Surface tools (reply/react) returned earlier; send_typing/sync_retain
+        // are suppressed at the hook (computeLabel → null) so they never arrive.
+        turn.labeledToolCount++
         // A new tool label = a new live step → re-anchor the heartbeat clock so
         // the " · Ns" elapsed restarts from this step (and the feed itself just
         // advanced, so it isn't stale).

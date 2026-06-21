@@ -135,6 +135,25 @@ describe("tool-label-pretool.mjs", () => {
     expect(r.sidecarLines).toHaveLength(0);
   });
 
+  it("unknown built-in tool → 'Working…' (never-null fallthrough opens the feed)", () => {
+    // A built-in tool (no mcp__ prefix) that matches none of the switch arms
+    // used to fall through to null → no sidecar line → if it was a turn's
+    // first/only tool, the feed never opened. The fallthrough now labels it
+    // so the feed always opens.
+    const r = run(
+      {
+        session_id: "sess-test",
+        tool_use_id: "t-unknown-builtin",
+        tool_name: "SomeFutureBuiltinTool",
+        tool_input: {},
+      },
+      stateDir,
+    );
+    expect(r.status).toBe(0);
+    expect(r.sidecarLines).toHaveLength(1);
+    expect(r.sidecarLines[0].label).toBe("Working…");
+  });
+
   it("Edit / Write / NotebookEdit produce matching verbs", () => {
     const cases: Array<[string, Record<string, unknown>, string]> = [
       ["Edit", { file_path: "/x/foo.ts" }, "Editing foo.ts"],
