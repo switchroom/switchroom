@@ -26,6 +26,7 @@ switchroom:
   version: 1
   agents_dir: ~/.switchroom/agents
   skills_dir: ~/.switchroom/skills           # shared skill pool (symlinked per agent)
+  # timezone: "Region/City"  # agents' local time + cron evaluation; defaults to UTC if unset
 
 telegram:
   # Single-agent fallback ONLY. This is the bot the one shipped agent

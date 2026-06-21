@@ -12,6 +12,7 @@
 
 switchroom:
   version: 1
+  # timezone: "Region/City"  # agents' local time + cron evaluation; defaults to UTC if unset
 
 telegram:
   bot_token: "vault:telegram-bot-token"
