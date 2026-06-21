@@ -39,6 +39,7 @@ import {
   stripMarkdown,
   truncate,
 } from './card-format.js'
+import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET } from './status-no-truncate.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -97,7 +98,7 @@ const RULE = '─────'
  * caps message length and a wall of stale lines buries the live one. Six
  * keeps recent context without dominating the chat.
  */
-const NARRATIVE_MAX_LINES = 6
+export const NARRATIVE_MAX_LINES = 6
 
 /**
  * Append the accumulated step feed to `lines`, mirroring the main agent's
@@ -105,10 +106,13 @@ const NARRATIVE_MAX_LINES = 6
  * the newest renders in-progress (`→`, bold) unless `allDone`, and an overflow
  * header (`✓ +N earlier…`) appears when the feed exceeds NARRATIVE_MAX_LINES.
  * `steps` are already cleaned + escaped HTML.
+ *
+ * When `noTruncate` is true (SWITCHROOM_STATUS_NO_TRUNCATE != '0'), all steps
+ * are shown — the caller is responsible for trimming to the char budget after.
  */
-function appendStepFeed(lines: string[], steps: string[], allDone: boolean): void {
+function appendStepFeed(lines: string[], steps: string[], allDone: boolean, noTruncate = false): void {
   if (steps.length === 0) return
-  const shown = steps.slice(-NARRATIVE_MAX_LINES)
+  const shown = noTruncate ? steps : steps.slice(-NARRATIVE_MAX_LINES)
   const hidden = steps.length - shown.length
   if (hidden > 0) lines.push(`<i>✓ +${hidden} earlier…</i>`)
   const lastIdx = shown.length - 1
@@ -140,6 +144,7 @@ function appendStepFeed(lines: string[], steps: string[], allDone: boolean): voi
  *   ✅ <i>{cleaned result paragraph}</i>
  */
 export function renderWorkerActivity(v: WorkerActivityView): string {
+  const noTruncate = statusNoTruncate()
   const desc = truncate(stripMarkdown(v.description).trim() || 'background task', DESC_MAX)
   const elapsed = formatDuration(v.elapsedMs)
   const toolWord = v.toolCount === 1 ? 'tool' : 'tools'
@@ -157,7 +162,7 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
   if (finished) {
     const verb = v.state === 'done' ? 'completed' : 'failed'
     const lines = [header, `<i>finished · ${verb} · ${v.toolCount} ${toolWord} · ${elapsed}</i>`]
-    appendStepFeed(lines, steps, true)
+    appendStepFeed(lines, steps, true, noTruncate)
     // On terminal, latestSummary carries the worker's final result text
     // (gateway onFinish), distinct from the running narrative steps.
     const result = cleanWorkerResultParagraph(v.latestSummary)
@@ -166,12 +171,13 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
       lines.push(RULE)
       lines.push(`${emoji} <i>${escapeHtml(truncate(result, RESULT_MAX))}</i>`)
     }
-    return lines.join('\n')
+    const body = lines.join('\n')
+    return noTruncate ? _fitWorkerBodyToCharBudget(body, lines) : body
   }
 
   const lines = [header, `<i>running · ${elapsed} · ${v.toolCount} ${toolWord}</i>`]
   if (steps.length > 0) {
-    appendStepFeed(lines, steps, false)
+    appendStepFeed(lines, steps, false, noTruncate)
   } else {
     // Back-compat for direct render callers that pass only latestSummary;
     // the manager always supplies narrativeLines.
@@ -182,7 +188,30 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
       lines.push('<i>starting…</i>')
     }
   }
-  return lines.join('\n')
+  const body = lines.join('\n')
+  return noTruncate ? _fitWorkerBodyToCharBudget(body, lines) : body
+}
+
+/**
+ * Internal helper: when no-truncate mode produces a body that exceeds the
+ * Telegram char budget, drop the oldest step-feed lines (the ones after the
+ * two fixed header lines) until it fits, prepending a "+N earlier…" header.
+ * The two fixed header lines (🛠 Worker header + status line) are always kept.
+ */
+function _fitWorkerBodyToCharBudget(body: string, lines: string[]): string {
+  if (body.length <= STATUS_CARD_CHAR_BUDGET) return body
+  // lines[0] = header, lines[1] = status line, lines[2..] = step feed + optional rule/result
+  const fixed = lines.slice(0, 2)
+  const feed = lines.slice(2)
+  for (let drop = 1; drop < feed.length; drop++) {
+    const kept = feed.slice(drop)
+    const candidate = [...fixed, `<i>✓ +${drop} earlier…</i>`, ...kept].join('\n')
+    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
+  }
+  // Extreme: only fixed headers fit. They are pre-escaped HTML but bounded
+  // by DESC_MAX (~80 raw chars), so the joined string is well under the
+  // budget in practice. Return as-is — never slice escaped HTML.
+  return fixed.join('\n')
 }
 
 export interface WorkerActivityFeedOpts {
@@ -290,8 +319,21 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // same narrative across ticks while a tool runs; we only grow on change.
     if (h.narrative[h.narrative.length - 1] === line) return
     h.narrative.push(line)
-    if (h.narrative.length > NARRATIVE_MAX_LINES) {
-      h.narrative.splice(0, h.narrative.length - NARRATIVE_MAX_LINES)
+    if (statusNoTruncate()) {
+      // No-truncate mode: bound memory with a generous COUNT cap so a single
+      // oversized line can never empty the array (a char-budget splice would
+      // push then immediately splice the only line, discarding it silently).
+      // Render-time (_fitWorkerBodyToCharBudget) enforces the wire limit.
+      // 200 lines × ~100 chars ≈ 20 KB in memory — a safe ceiling.
+      const NARRATIVE_MEM_CAP = 200
+      if (h.narrative.length > NARRATIVE_MEM_CAP) {
+        h.narrative.splice(0, h.narrative.length - NARRATIVE_MEM_CAP)
+      }
+    } else {
+      // Truncate mode: hard cap to NARRATIVE_MAX_LINES (original behaviour).
+      if (h.narrative.length > NARRATIVE_MAX_LINES) {
+        h.narrative.splice(0, h.narrative.length - NARRATIVE_MAX_LINES)
+      }
     }
   }
 

@@ -164,6 +164,12 @@ export function describeToolUse(
 // cleared on reply. Chronological (oldest first, newest last), consecutive
 // exact-duplicates collapsed, capped to the most recent MIRROR_MAX_LINES
 // with a "+N earlier" header so a heavy turn stays readable.
+//
+// When SWITCHROOM_STATUS_NO_TRUNCATE is not '0' (the default), all cosmetic
+// caps are lifted and the full feed is shown, bounded only by the 4096-char
+// Telegram limit via STATUS_CARD_CHAR_BUDGET.
+
+import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET } from './status-no-truncate.js'
 
 export const MIRROR_MAX_LINES = 6;
 
@@ -211,8 +217,18 @@ export function renderActivityFeed(
   stepCount?: number,
 ): string | null {
   if (lines.length === 0) return null;
-  const shown = lines.slice(-MIRROR_MAX_LINES);
-  const hidden = lines.length - shown.length;
+  const noTruncate = statusNoTruncate();
+  // When no-truncate is ON, show all lines; when OFF, cap to MIRROR_MAX_LINES.
+  // In both modes we may need to trim oldest lines to fit the Telegram budget.
+  let shown: string[];
+  let hidden: number;
+  if (noTruncate) {
+    shown = lines;
+    hidden = 0;
+  } else {
+    shown = lines.slice(-MIRROR_MAX_LINES);
+    hidden = lines.length - shown.length;
+  }
   const out: string[] = [];
   if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`);
   const lastIdx = shown.length - 1;
@@ -234,7 +250,58 @@ export function renderActivityFeed(
   if (final && stepCount != null && stepCount > 0) {
     out.push(`<i>✓ ${stepCount} steps</i>`);
   }
-  return out.join("\n");
+  const result = out.join("\n");
+  // No-truncate mode: enforce the Telegram char budget by trimming oldest
+  // lines first until the output fits, then prepend a "+N earlier…" header.
+  if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
+    return _fitToCharBudget(lines, final, liveSuffix, stepCount);
+  }
+  return result;
+}
+
+/**
+ * Internal helper: called only in no-truncate mode when the full render
+ * exceeds STATUS_CARD_CHAR_BUDGET. Drops oldest lines one at a time until
+ * the rendered output fits, prepending a "+N earlier…" header to surface
+ * the clip. The caller is responsible for not re-calling this recursively
+ * (the budget is wide enough that a "+N" header itself never causes overflow).
+ */
+function _fitToCharBudget(
+  lines: string[],
+  final: boolean,
+  liveSuffix: string,
+  stepCount?: number,
+): string | null {
+  for (let drop = 1; drop < lines.length; drop++) {
+    const shown = lines.slice(drop);
+    const out: string[] = [`<i>✓ +${drop} earlier…</i>`];
+    const lastIdx = shown.length - 1;
+    shown.forEach((l, i) => {
+      const esc = escapeFeedHtml(l);
+      out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`);
+    });
+    if (final && stepCount != null && stepCount > 0) {
+      out.push(`<i>✓ ${stepCount} steps</i>`);
+    }
+    const candidate = out.join("\n");
+    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
+  }
+  // Rare but reachable with long Bash labels containing special chars (e.g. &&).
+  // Never slice already-escaped HTML — that breaks entities (&amp; → &amp) and
+  // leaves dangling tags. Instead truncate the RAW content first, then escape
+  // and wrap, re-checking post-escape because escaping can expand (&→&amp;).
+  const wrapperOverhead = final
+    ? "<i>✓ </i>".length
+    : ("<b>→ </b>".length + liveSuffix.length);
+  const maxRaw = Math.max(0, STATUS_CARD_CHAR_BUDGET - wrapperOverhead);
+  let raw = lines[lines.length - 1].slice(0, maxRaw);
+  let newest = escapeFeedHtml(raw);
+  while (raw.length > 0 && wrapperOverhead + newest.length > STATUS_CARD_CHAR_BUDGET) {
+    const excess = wrapperOverhead + newest.length - STATUS_CARD_CHAR_BUDGET;
+    raw = raw.slice(0, Math.max(0, raw.length - excess - 1));
+    newest = escapeFeedHtml(raw);
+  }
+  return final ? `<i>✓ ${newest}</i>` : `<b>→ ${newest}${liveSuffix}</b>`;
 }
 
 // ─── Foreground sub-agent nesting (Model A) ─────────────────────────────────
@@ -276,21 +343,26 @@ export function renderActivityFeedWithNested(
   const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
   if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix, stepCount);
 
+  const noTruncate = statusNoTruncate();
   const out: string[] = [];
-  const shownParent = lines.slice(-MIRROR_MAX_LINES);
+
+  // Parent lines: when no-truncate is ON show all; when OFF cap to MIRROR_MAX_LINES.
+  const shownParent = noTruncate ? lines : lines.slice(-MIRROR_MAX_LINES);
   const hiddenParent = lines.length - shownParent.length;
   if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`);
   for (const l of shownParent) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
 
-  const shownChild = children.slice(-NESTED_MAX_LINES);
+  // Child lines: when no-truncate is ON show all; when OFF cap to NESTED_MAX_LINES.
+  const shownChild = noTruncate ? children : children.slice(-NESTED_MAX_LINES);
   const hiddenChild = children.length - shownChild.length;
   if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`);
   const lastChildIdx = shownChild.length - 1;
   // `final`: the nested newest step also renders done (✓) so the left-behind
   // feed reads as completed, not stuck on a "→ in-progress" child step.
   // `liveSuffix` (heartbeat): appended to the nested newest in-progress step.
+  // NESTED_LINE_MAX per-line cap: only applied when no-truncate is OFF.
   shownChild.forEach((l, i) => {
-    const t = l.length > NESTED_LINE_MAX ? l.slice(0, NESTED_LINE_MAX - 1) + "…" : l;
+    const t = (!noTruncate && l.length > NESTED_LINE_MAX) ? l.slice(0, NESTED_LINE_MAX - 1) + "…" : l;
     const esc = escapeFeedHtml(t);
     out.push(
       i === lastChildIdx && !final
@@ -302,7 +374,88 @@ export function renderActivityFeedWithNested(
   if (final && stepCount != null && stepCount > 0) {
     out.push(`<i>✓ ${stepCount} steps</i>`);
   }
-  return out.length > 0 ? out.join("\n") : null;
+  if (out.length === 0) return null;
+  const result = out.join("\n");
+  // No-truncate mode: enforce the Telegram char budget by trimming oldest
+  // parent lines first, then oldest child lines, until the output fits.
+  if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
+    return _fitNestedToCharBudget(lines, children, final, liveSuffix, stepCount);
+  }
+  return result;
+}
+
+/**
+ * Internal helper: called only in no-truncate mode when the full nested render
+ * exceeds STATUS_CARD_CHAR_BUDGET. Trims oldest parent lines first, then
+ * oldest child lines, until the output fits, surfacing a "+N earlier…" header
+ * for each dropped group.
+ */
+function _fitNestedToCharBudget(
+  lines: string[],
+  children: string[],
+  final: boolean,
+  liveSuffix: string,
+  stepCount?: number,
+): string | null {
+  // Try dropping parent lines first (oldest first), keeping all children.
+  for (let pDrop = 1; pDrop <= lines.length; pDrop++) {
+    const shownP = lines.slice(pDrop);
+    const out: string[] = [];
+    if (pDrop > 0) out.push(`<i>✓ +${pDrop} earlier…</i>`);
+    for (const l of shownP) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
+    if (children.length > 0) out.push(`${NESTED_PREFIX}<i>+0 earlier…</i>`); // placeholder (unconditional pop below — children is guaranteed non-empty here; this pair is a size-estimation probe kept structurally symmetric with the cDrop loop)
+    // Actually render children at full length.
+    out.pop(); // remove placeholder (children guaranteed non-empty at this call site)
+    const lastChildIdx = children.length - 1;
+    children.forEach((l, i) => {
+      const esc = escapeFeedHtml(l);
+      out.push(
+        i === lastChildIdx && !final
+          ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
+          : `${NESTED_PREFIX}<i>${esc}</i>`,
+      );
+    });
+    if (final && stepCount != null && stepCount > 0) out.push(`<i>✓ ${stepCount} steps</i>`);
+    const candidate = out.join("\n");
+    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
+  }
+  // Parent fully dropped; now also drop child lines oldest first.
+  for (let cDrop = 1; cDrop < children.length; cDrop++) {
+    const shownC = children.slice(cDrop);
+    const out: string[] = [
+      `<i>✓ +${lines.length} earlier…</i>`,
+      `${NESTED_PREFIX}<i>+${cDrop} earlier…</i>`,
+    ];
+    const lastChildIdx = shownC.length - 1;
+    shownC.forEach((l, i) => {
+      const esc = escapeFeedHtml(l);
+      out.push(
+        i === lastChildIdx && !final
+          ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
+          : `${NESTED_PREFIX}<i>${esc}</i>`,
+      );
+    });
+    if (final && stepCount != null && stepCount > 0) out.push(`<i>✓ ${stepCount} steps</i>`);
+    const candidate = out.join("\n");
+    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
+  }
+  // Rare but reachable with long Bash labels containing special chars (e.g. &&).
+  // Never slice already-escaped HTML — that breaks entities and leaves dangling tags.
+  // Truncate RAW content first, then escape and wrap, re-checking post-escape.
+  const wrapperOverhead = final
+    ? (NESTED_PREFIX + "<i></i>").length
+    : (NESTED_PREFIX + "<b>→ </b>").length + liveSuffix.length;
+  const maxRaw = Math.max(0, STATUS_CARD_CHAR_BUDGET - wrapperOverhead);
+  let raw = children[children.length - 1].slice(0, maxRaw);
+  let newest = escapeFeedHtml(raw);
+  while (raw.length > 0 && wrapperOverhead + newest.length > STATUS_CARD_CHAR_BUDGET) {
+    const excess = wrapperOverhead + newest.length - STATUS_CARD_CHAR_BUDGET;
+    raw = raw.slice(0, Math.max(0, raw.length - excess - 1));
+    newest = escapeFeedHtml(raw);
+  }
+  return final
+    ? `${NESTED_PREFIX}<i>${newest}</i>`
+    : `${NESTED_PREFIX}<b>→ ${newest}${liveSuffix}</b>`;
 }
 
 /**

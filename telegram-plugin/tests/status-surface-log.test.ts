@@ -101,6 +101,23 @@ describe('detectStatusSurfaceDegraded — uses labeledToolCount (#2461)', () => 
     expect(detectStatusSurfaceDegraded(t)).toBeNull()
   })
 
+  it('H-2: reply-only turn — all tools surface-suppressed, drain failures present — no false-positive DEGRADED', () => {
+    // Scenario: agent sent a reply but all 5 tool_uses were surface tools
+    // (reply/react/etc) so labeledToolCount=0. Three activity-feed drain
+    // failures occurred (e.g. Telegram 400s from a stale anchor), but since
+    // there was nothing to surface, DEGRADED must NOT fire — the exemption is
+    // `labeledToolCount === 0`. This is the critical missing coverage case for
+    // the `labeledToolCount === 0` short-circuit in detectStatusSurfaceDegraded.
+    const t = makeTurn({
+      toolCallCount: 5,
+      labeledToolCount: 0,
+      activityDrainFailures: 3,
+      activityEverOpened: false,
+      replyCalled: true,
+    })
+    expect(detectStatusSurfaceDegraded(t)).toBeNull()
+  })
+
   it('returns null when feed opened fine (activityEverOpened=true)', () => {
     const t = makeTurn({ labeledToolCount: 3, activityEverOpened: true, activityDrainFailures: 2 })
     expect(detectStatusSurfaceDegraded(t)).toBeNull()

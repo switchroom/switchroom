@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import {
   renderWorkerActivity,
   createWorkerActivityFeed,
   isWorkerActivityFeedEnabled,
+  NARRATIVE_MAX_LINES,
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
@@ -153,7 +154,9 @@ describe('renderWorkerActivity', () => {
     expect(stepCount(out)).toBe(2)
   })
 
-  it('shows an overflow header when the feed exceeds the cap', () => {
+  it('shows an overflow header when the feed exceeds the cap (no-truncate OFF)', () => {
+    // This test exercises the capping behaviour that is active when the flag is OFF.
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
     const lines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines: lines }))
     expect(out).toContain('<i>✓ +3 earlier…</i>')
@@ -162,6 +165,7 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain('<b>→ step 9</b>')
     // 6 visible step lines (the overflow header is not itself a step).
     expect(out.match(/step \d/g) ?? []).toHaveLength(6)
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
   })
 
   it('strips Markdown markup from narrative + description + result', () => {
@@ -391,7 +395,9 @@ describe('createWorkerActivityFeed', () => {
     expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(1)
   })
 
-  it('caps the narrative block to the last 6 lines', async () => {
+  it('caps the narrative block to the last 6 lines (no-truncate OFF)', async () => {
+    // This test exercises the capping behaviour that is active when the flag is OFF.
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
@@ -408,6 +414,7 @@ describe('createWorkerActivityFeed', () => {
     expect(last.text).not.toContain('line 3')
     expect(last.text).toContain('line 4')
     expect(last.text).toContain('line 9')
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
   })
 
   it('grows the narrative even while throttled (line surfaces on next edit)', async () => {
@@ -499,5 +506,178 @@ describe('createWorkerActivityFeed — log sink', () => {
     clock = 3000
     await feed.update('w1', 'chat', view({ elapsedMs: 3000 }))
     expect(logs.some((l) => l.startsWith('worker-feed: paint'))).toBe(false)
+  })
+})
+
+// ─── SWITCHROOM_STATUS_NO_TRUNCATE feature flag tests ────────────────────────
+
+describe('SWITCHROOM_STATUS_NO_TRUNCATE — renderWorkerActivity', () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+  })
+
+  it('no-truncate ON (default): a narrative with > NARRATIVE_MAX_LINES renders ALL lines', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE // default = ON
+    const narrativeLines = Array.from({ length: NARRATIVE_MAX_LINES + 4 }, (_, i) => `step ${i + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines }))
+    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
+      expect(out).toContain(`step ${i}`)
+    }
+    // No spurious overflow header when all steps fit in the budget.
+    expect(out).not.toContain('+4 earlier')
+    expect(out).toContain(`<b>→ step ${NARRATIVE_MAX_LINES + 4}</b>`)
+  })
+
+  it('no-truncate OFF (=0): existing NARRATIVE_MAX_LINES cap is preserved', () => {
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+    const narrativeLines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines }))
+    expect(out).toContain('<i>✓ +3 earlier…</i>')
+    expect(out).not.toContain('step 1')
+    expect(out).toContain('step 4')
+    expect(out).toContain('<b>→ step 9</b>')
+    expect(out.match(/step \d/g) ?? []).toHaveLength(6)
+  })
+
+  it('no-truncate ON + pathologically huge narrative (500 lines): rendered output ≤ 4096 chars', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const narrativeLines = Array.from({ length: 500 }, (_, i) => `step number ${i + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines }))
+    // Hard invariant: must never exceed Telegram's 4096 char limit.
+    expect(out.length).toBeLessThanOrEqual(4096)
+    // Oldest lines should have been clipped with a header.
+    expect(out).toContain('earlier…')
+    // The newest step must still be present.
+    expect(out).toContain('step number 500')
+  })
+})
+
+describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative accumulation', () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+  })
+
+  it('no-truncate ON: narrative accumulates more than NARRATIVE_MAX_LINES distinct lines', async () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    // Push more lines than NARRATIVE_MAX_LINES into the feed.
+    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
+      clock += 1000
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
+    }
+
+    const last = bot.edits.at(-1)!
+    // All accumulated lines should be present (not spliced to NARRATIVE_MAX_LINES).
+    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
+      expect(last.text).toContain(`line ${i}`)
+    }
+    // No overflow header for a small feed that fits in the budget.
+    expect(last.text).not.toContain('+4 earlier')
+    expect(last.text).toContain(`<b>→ line ${NARRATIVE_MAX_LINES + 4}</b>`)
+  })
+
+  it('no-truncate OFF (=0): narrative is still spliced to NARRATIVE_MAX_LINES (original behaviour)', async () => {
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    for (let i = 1; i <= 9; i++) {
+      clock += 1000
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
+    }
+
+    const last = bot.edits.at(-1)!
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(6)
+    expect(last.text).not.toContain('line 1')
+    expect(last.text).not.toContain('line 3')
+    expect(last.text).toContain('line 4')
+    expect(last.text).toContain('line 9')
+  })
+
+  it('no-truncate ON: env-flip seam works (set/delete per test)', () => {
+    // Verify the seam: after setting '0', the flag reads as OFF.
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+    const lines = Array.from({ length: NARRATIVE_MAX_LINES + 2 }, (_, i) => `s ${i + 1}`)
+    const offOut = renderWorkerActivity(view({ narrativeLines: lines }))
+    expect(offOut).toContain('+2 earlier')
+
+    // After deleting, the flag reads as ON (default).
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const onOut = renderWorkerActivity(view({ narrativeLines: lines }))
+    expect(onOut).not.toContain('+2 earlier')
+    for (let i = 1; i <= NARRATIVE_MAX_LINES + 2; i++) {
+      expect(onOut).toContain(`s ${i}`)
+    }
+  })
+})
+
+// ─── Extreme-edge: single oversized narrative line (no-truncate ON) ──────────
+// Reproduces the bug where accumulateNarrative's char-budget splice would push
+// the oversized line then immediately splice it out, making the narrative empty
+// and the step vanish from the rendered output.
+
+/** Cheap valid-HTML checker: balanced <b>/<i> tags and no partial entity. */
+function isValidWorkerHtml(s: string): boolean {
+  const bOpen = (s.match(/<b>/g) ?? []).length
+  const bClose = (s.match(/<\/b>/g) ?? []).length
+  const iOpen = (s.match(/<i>/g) ?? []).length
+  const iClose = (s.match(/<\/i>/g) ?? []).length
+  if (bOpen !== bClose || iOpen !== iClose) return false
+  // No partial entity (e.g. &amp without semicolon at end or mid-string).
+  if (/&[a-z]+$/.test(s)) return false
+  return true
+}
+
+describe('extreme-edge: single oversized narrative line (no-truncate ON)', () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+  })
+
+  it('no-truncate ON: one ~4100-char step is shown (truncated) not discarded, output ≤ budget and valid HTML', async () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+
+    // Build a latestSummary > STATUS_CARD_CHAR_BUDGET chars with && and special chars.
+    const base = 'run build && deploy && notify with <args> & flags=1 '
+    const hugeStep = base.repeat(80) + '&&'
+    expect(hugeStep.length).toBeGreaterThan(4000)
+
+    await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: hugeStep }))
+    expect(bot.sent).toHaveLength(1)
+    const out = bot.sent[0].text
+
+    // The step must NOT have vanished — some portion must appear.
+    // Since the step is huge it will be truncated, but the worker card itself
+    // must contain a step bullet (→ or ✓).
+    const hasBullet = out.includes('→') || out.includes('✓')
+    expect(hasBullet).toBe(true)
+
+    // Wire safety: output must be within the Telegram char budget.
+    expect(out.length).toBeLessThanOrEqual(4096)
+
+    // Valid HTML: balanced tags and no partial entity.
+    expect(isValidWorkerHtml(out)).toBe(true)
+  })
+
+  it('no-truncate ON: one ~4100-char step via renderWorkerActivity directly → ≤ budget and valid HTML', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const base = 'compile && link && package && ship: action=deploy env=<prod> flag=1 '
+    const hugeStep = base.repeat(65)
+    expect(hugeStep.length).toBeGreaterThan(4000)
+
+    const out = renderWorkerActivity(view({ narrativeLines: [hugeStep] }))
+
+    // Step must be present in some form (truncated is fine, absent is not).
+    const hasBullet = out.includes('→') || out.includes('✓')
+    expect(hasBullet).toBe(true)
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    expect(isValidWorkerHtml(out)).toBe(true)
   })
 })
