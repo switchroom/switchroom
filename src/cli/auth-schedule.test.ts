@@ -17,6 +17,7 @@ const {
   formatWeeklyCell,
   formatStateCell,
   formatScheduleRows,
+  formatFooter,
 } = _testing;
 
 const NOW = new Date("2026-06-07T06:00:00.000Z"); // Sunday
@@ -497,5 +498,63 @@ describe("formatScheduleRows (no-color)", () => {
     expect(lines[2]).toContain("5h-walled");
     expect(lines[3]).toContain("weekly-walled");
     expect(lines[3]).toContain("excluded");
+  });
+});
+
+// ── #2500 — formatFooter probedLive correctness ───────────────────────────
+//
+// These tests exercise the probedLive flag at the footer level (the pure
+// helper). The CLI wiring path is: `probedLive = live && probe !== undefined &&
+// probe.results.some(r => r.served === "live")` — a TTL cache-hit or
+// failed-probe fallback must NOT stamp "probed live".
+
+describe("#2500 — formatFooter does not stamp 'probed live' on a cache-served result", () => {
+  const emptyRows: ScheduleRow[] = [];
+
+  it("a probe with all results served='live' stamps probed live", () => {
+    const liveProbe: ProbeQuotaData = {
+      results: [
+        { label: "default", result: { ok: true, data: { fiveHourUtilizationPct: 10, sevenDayUtilizationPct: 5, fiveHourResetAt: FIVE_RESET, sevenDayResetAt: WEEKLY_RESET, representativeClaim: null, overageStatus: null, overageDisabledReason: null } }, served: "live" },
+      ],
+    };
+    // Simulate the CLI wiring: probedLive requires at least one served==="live".
+    const probedLive = liveProbe.results.some((r) => r.served === "live");
+    expect(probedLive).toBe(true);
+    const footer = formatFooter(emptyRows, { liveRequested: true, probedLive }, NOW);
+    expect(footer[0]).toContain("probed live");
+  });
+
+  it("a probe with all results served='cache' does NOT stamp probed live", () => {
+    const cacheProbe: ProbeQuotaData = {
+      results: [
+        { label: "default", result: { ok: true, data: { fiveHourUtilizationPct: 10, sevenDayUtilizationPct: 5, fiveHourResetAt: FIVE_RESET, sevenDayResetAt: WEEKLY_RESET, representativeClaim: null, overageStatus: null, overageDisabledReason: null } }, served: "cache", capturedAt: Date.now() - 30_000 },
+      ],
+    };
+    // CLI wiring: served='cache' on all results → probedLive = false.
+    const probedLive = cacheProbe.results.some((r) => r.served === "live");
+    expect(probedLive).toBe(false);
+    const footer = formatFooter(emptyRows, { liveRequested: true, probedLive }, NOW);
+    expect(footer[0]).not.toContain("probed live");
+    // Should show the stale/unavailable variant instead.
+    expect(footer[0]).toContain("cached");
+  });
+
+  it("a probe with no served field (legacy response) is treated as not-live", () => {
+    // Legacy broker responses omit `served` entirely. Guard: undefined is not "live".
+    const legacyProbe: ProbeQuotaData = {
+      results: [
+        { label: "default", result: { ok: true, data: { fiveHourUtilizationPct: 10, sevenDayUtilizationPct: 5, fiveHourResetAt: FIVE_RESET, sevenDayResetAt: WEEKLY_RESET, representativeClaim: null, overageStatus: null, overageDisabledReason: null } } },
+      ],
+    };
+    const probedLive = legacyProbe.results.some((r) => r.served === "live");
+    expect(probedLive).toBe(false);
+    const footer = formatFooter(emptyRows, { liveRequested: true, probedLive }, NOW);
+    expect(footer[0]).not.toContain("probed live");
+  });
+
+  it("--cached path (liveRequested=false) always shows cached-snapshot footer regardless of served", () => {
+    const footer = formatFooter(emptyRows, { liveRequested: false, probedLive: false }, NOW);
+    expect(footer[0]).toContain("cached snapshot");
+    expect(footer[0]).not.toContain("probed live");
   });
 });

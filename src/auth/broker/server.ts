@@ -1724,9 +1724,11 @@ export class AuthBroker {
     delete this.quota[label];
     delete this.thresholdViolations[label];
     this.lastWrittenExpiresAt.delete(label);
+    delete this.lastQuotaCache[label];
     this.persistShaIndex();
     this.persistQuota();
     this.persistThresholdViolations();
+    this.persistLastQuotaCache();
     this.audit({ op: "rm-account", identity, account: label, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { label }));
   }
