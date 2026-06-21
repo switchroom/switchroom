@@ -1488,6 +1488,19 @@ const deliveryQueue = createDeliveryQueue<InboundMessage>()
 // SWITCHROOM_OBLIGATION_LEDGER=0 → every hook below is a no-op → zero change.
 const OBLIGATION_LEDGER_ENABLED = process.env.SWITCHROOM_OBLIGATION_LEDGER !== '0'
 const OBLIGATION_REPRESENT_MAX = 2
+// Minimum reply length (chars) the duplicate-represent guard (#2472/#2474) treats
+// as "the user was answered". DECOUPLED from the escalate branch's 200-char proxy:
+// for the represent guard ANY genuine assistant reply — even a terse "Yes — done."
+// — satisfies the obligation, so suppressing the duplicate re-ask must not require
+// 200 chars. Default 1 (any non-empty real reply; empty/whitespace rows are
+// clamped out inside hasOutboundDeliveredSince). Override via env for tuning. Safe
+// because only recordOutbound writes role='assistant' rows — progress-card edits
+// and typing indicators are never counted.
+const OBLIGATION_REPRESENT_GUARD_MIN_REPLY_CHARS = (() => {
+  const raw = process.env.SWITCHROOM_OBLIGATION_REPRESENT_GUARD_MIN_REPLY_CHARS
+  const n = raw != null ? Number.parseInt(raw, 10) : NaN
+  return Number.isFinite(n) && n >= 1 ? n : 1
+})()
 const OBLIGATION_SWEEP_MS = 5_000
 // Bound on escalation SEND attempts. The escalation now closes only AFTER a
 // successful send (a transient failure stays OPEN and retries next sweep), so a
@@ -5817,7 +5830,16 @@ function obligationSweep(): void {
     if (
       shouldSuppressRepresent(o, {
         historyEnabled: HISTORY_ENABLED,
-        hasOutboundDeliveredSince,
+        // Pass the represent-guard's OWN low threshold — a terse-but-real reply
+        // must suppress the duplicate (#2472/#2474), unlike the escalate branch
+        // below which keeps the 200-char default.
+        hasOutboundDeliveredSince: (chatId, sinceMs, threadId) =>
+          hasOutboundDeliveredSince(
+            chatId,
+            sinceMs,
+            threadId,
+            OBLIGATION_REPRESENT_GUARD_MIN_REPLY_CHARS,
+          ),
       })
     ) {
       process.stderr.write(

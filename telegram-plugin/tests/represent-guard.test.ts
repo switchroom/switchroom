@@ -80,6 +80,61 @@ describe("shouldSuppressRepresent — #2472 duplicate-represent guard", () => {
   });
 });
 
+// #2474 follow-up — the terse-reply gap. PR #2474 suppressed the duplicate
+// represent only when the satisfied-check saw a >=200-char "substantive" reply
+// (the 200-char proxy borrowed from the ESCALATE branch). A GENUINE but SHORT
+// reply (e.g. "Yes — done.") therefore did NOT suppress the duplicate, leaving
+// the #2472 duplicate-message bug alive for terse answers. The guard itself is
+// pure: the gateway now binds hasOutboundDeliveredSince with a LOW minChars so a
+// terse-but-real reply reports true. These tests model the wired predicate's
+// behavior at the guard boundary.
+describe("represent guard — terse genuine reply suppresses the duplicate (#2474 follow-up)", () => {
+  /** Models the gateway-wired predicate AFTER the fix: reports true for ANY real
+   *  reply at/after the cutoff regardless of length (minChars=1 inside history).
+   *  `replyChars` is the length of the terse reply; included to make the intent
+   *  explicit — the predicate no longer gates on length. */
+  function terseReplyDeliveredAt(replyTs: number, replyChars: number) {
+    expect(replyChars).toBeGreaterThan(0); // a real, non-empty reply
+    return (_chat: string, sinceMs: number) => replyTs >= sinceMs;
+  }
+
+  it("suppresses the duplicate when a SHORT genuine reply landed since the last represent", () => {
+    // count=1 fired at t=1000; the agent answered with a terse 11-char reply
+    // ("Yes — done.") at t=1500. The duplicate (count=2) must now be suppressed —
+    // before the fix the 200-char gate let it through.
+    const o = obligation({ lastRepresentedAt: 1000 });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      hasOutboundDeliveredSince: terseReplyDeliveredAt(1500, "Yes — done.".length),
+    });
+    expect(suppress).toBe(true);
+  });
+
+  it("does NOT suppress when only framework noise occurred since the last represent", () => {
+    // Typing indicators and progress-card edits never call recordOutbound, so no
+    // assistant row exists for them → the wired predicate reports false. A real
+    // answer never landed, so the represent SHOULD still fire (no false suppress).
+    const o = obligation({ lastRepresentedAt: 1000 });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      // No assistant row for typing/progress edits → predicate is false.
+      hasOutboundDeliveredSince: () => false,
+    });
+    expect(suppress).toBe(false);
+  });
+
+  it("does NOT suppress when the terse reply PREDATES the last represent", () => {
+    // A terse reply at t=500 answered an EARLIER ask, not the represent at t=1000.
+    // The cutoff is lastRepresentedAt, so a pre-cutoff terse reply must not count.
+    const o = obligation({ lastRepresentedAt: 1000 });
+    const suppress = shouldSuppressRepresent(o, {
+      historyEnabled: true,
+      hasOutboundDeliveredSince: terseReplyDeliveredAt(500, "ok".length),
+    });
+    expect(suppress).toBe(false);
+  });
+});
+
 describe("represent_count cap is honored by the ledger — a misdetected obligation cannot loop", () => {
   it("escalates (stops re-presenting) once representCount reaches maxRepresents", () => {
     const L = new ObligationLedger(2); // maxRepresents = 2
