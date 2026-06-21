@@ -89,6 +89,59 @@ describe("gateway supervisor — RFC J Phase 2 backoff", () => {
     expect(l).not.toMatch(/giving up|hit 10 restarts/i);
   }, 20_000);
 
+  it("--oneshot-ok: a clean exit 0 stops supervising (no respawn, no churn)", () => {
+    // Regression guard for the #2471 wedge-diagnosis churn: the autoaccept
+    // sidecar legitimately exits 0 (boot-only mode, or a clean watch-loop
+    // return). Without --oneshot-ok the supervisor respawned that exit
+    // every 60s forever (klanker: 192 status=0 respawns). With the flag a
+    // clean exit returns 0 immediately and never retries.
+    const log = join(dir, "oneshot.log");
+    const cnt = join(dir, "oneshot.cnt");
+    writeFileSync(cnt, "0");
+    const out = runBash(
+      `_switchroom_supervise tOS ${JSON.stringify(log)} --oneshot-ok sh -c '
+         n=$(cat ${JSON.stringify(cnt)}); n=$((n+1)); echo $n > ${JSON.stringify(cnt)}
+         exit 0'; echo "RC=$?"`,
+      10_000,
+    );
+    expect(out).toContain("RC=0");
+    // Ran exactly once — not respawned.
+    expect(readFileSync(cnt, "utf-8").trim()).toBe("1");
+    const l = readFileSync(log, "utf-8");
+    expect(l).toContain("completed cleanly (exit 0) — one-shot-ok, not respawning");
+    expect(l).not.toContain("retrying in");
+  });
+
+  it("--oneshot-ok: a NON-zero exit still backs off and retries (crash self-heals)", () => {
+    // The flag must only short-circuit clean completion. A crash (exit 1)
+    // from a one-shot-ok sidecar must still retry indefinitely — otherwise
+    // a flaky autoaccept boot would never recover.
+    const log = join(dir, "oneshot-crash.log");
+    runBash(
+      `_switchroom_supervise tOSC ${JSON.stringify(log)} --oneshot-ok sh -c 'exit 1' & SPID=$!
+       sleep 4; kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; true`,
+      15_000,
+    );
+    const l = readFileSync(log, "utf-8");
+    expect(l).toContain("attempt=1) — retrying in 1s");
+    expect(l).toContain("attempt=2) — retrying in 2s");
+    expect(l).not.toContain("one-shot-ok, not respawning");
+  }, 15_000);
+
+  it("WITHOUT --oneshot-ok: a clean exit 0 is treated as a crash and respawns", () => {
+    // The default (gateway / scheduler) contract is unchanged: a clean
+    // exit 0 there is abnormal and must restart.
+    const log = join(dir, "default-exit0.log");
+    runBash(
+      `_switchroom_supervise tD0 ${JSON.stringify(log)} sh -c 'exit 0' & SPID=$!
+       sleep 4; kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; true`,
+      15_000,
+    );
+    const l = readFileSync(log, "utf-8");
+    expect(l).toContain("attempt=1) — retrying in 1s");
+    expect(l).not.toContain("one-shot-ok");
+  }, 15_000);
+
   it("a run lasting >= cap resets the backoff (attempt back to 1)", () => {
     const log = join(dir, "c.log");
     const cnt = join(dir, "c.cnt");
