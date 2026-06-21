@@ -503,7 +503,11 @@ export function registerAuthScheduleSubcommands(
 
         const now = new Date();
         const rows = buildScheduleRows(state, probe, now);
-        const probedLive = live && probe !== undefined;
+        // #2500 — only stamp "probed live" when the probe actually hit the upstream.
+        // probe.results carry served:"live"|"cache" (added in #2498). A TTL cache-hit
+        // or failed-probe fallback returns served:"cache"; that must not be presented
+        // as a live read. Require at least one result that was genuinely live.
+        const probedLive = live && probe !== undefined && probe.results.some((r) => r.served === "live");
         console.log();
         for (const l of formatScheduleRows(rows, now)) console.log(l);
         console.log();

@@ -1,5 +1,6 @@
 /**
  * #2495 — auth-broker quota state durability + realtime probe-on-open.
+ * #2509 — rm-account must prune lastQuotaCache (in-memory + disk).
  *
  * Covers:
  *   - Change 1: durable quota cache (write → reload → identical incl. markers).
@@ -8,6 +9,8 @@
  *     + stale-fallback labeling (a failed probe is served `cache`, not `live`).
  *   - Change 2/3: forceLive bypasses the TTL gate (the quota-watch
  *     corroboration probe is a TRUE live probe).
+ *   - #2509: rm-account removes lastQuotaCache entry in-memory AND on disk;
+ *     a fresh broker reload does not revive the removed label.
  *
  * Strategy mirrors server.test.ts: a tmpdir broker reachable over a real UDS,
  * probes injected via `_testFetchQuota`. Never touches `~/.switchroom`.
@@ -54,11 +57,19 @@ afterEach(() => {
   harnesses = [];
 });
 
-function makeConfig(h: Harness, active: string): SwitchroomConfig {
+function makeConfig(
+  h: Harness,
+  active: string,
+  opts: { adminAgents?: string[]; nonActiveAccounts?: string[] } = {},
+): SwitchroomConfig {
+  const agents: Record<string, object> = { ziggy: {} };
+  for (const name of opts.adminAgents ?? []) {
+    agents[name] = { admin: true };
+  }
   return ({
     switchroom: { version: 1, agents_dir: h.agentsDir },
     telegram: {},
-    agents: { ziggy: {} },
+    agents,
     auth: { active },
     google_workspace: undefined,
   } as unknown) as SwitchroomConfig;
@@ -268,5 +279,80 @@ describe("#2495 Change 2 — probe-on-open TTL + single-flight", () => {
     expect(calls).toBe(2);
     expect(r.data.results[0].served).toBe("live");
     broker.stop();
+  });
+});
+
+describe("#2509 — rm-account prunes lastQuotaCache (in-memory + disk + reload)", () => {
+  it("rm-account removes the label from lastQuotaCache in-memory", async () => {
+    const h = makeHarness();
+    seedAccount(h, "default");
+    seedAccount(h, "spare");
+    const broker = new AuthBroker(makeConfig(h, "default", { adminAgents: ["clerk"] }), {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => okProbe(30, 3),
+    });
+    await broker.start();
+    const probeSock = join(h.socketRoot, "ziggy", "sock");
+    const adminSock = join(h.socketRoot, "clerk", "sock");
+    // Seed the cache for both accounts.
+    await rpc(probeSock, { v: 1, id: "1", op: "probe-quota", accounts: ["default", "spare"] });
+    expect(broker._state().lastQuotaCache["spare"]).toBeDefined();
+    // rm-account "spare" via admin socket — "spare" is not fleet active.
+    const rmResp: any = await rpc(adminSock, { v: 1, id: "2", op: "rm-account", label: "spare" });
+    expect(rmResp.ok).toBe(true);
+    // In-memory cache must no longer contain "spare".
+    expect(broker._state().lastQuotaCache["spare"]).toBeUndefined();
+    // "default" must be untouched.
+    expect(broker._state().lastQuotaCache["default"]).toBeDefined();
+    broker.stop();
+  });
+
+  it("rm-account removes the label from last-quota.json on disk", async () => {
+    const h = makeHarness();
+    seedAccount(h, "default");
+    seedAccount(h, "spare");
+    const broker = new AuthBroker(makeConfig(h, "default", { adminAgents: ["clerk"] }), {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => okProbe(20, 2),
+    });
+    await broker.start();
+    const probeSock = join(h.socketRoot, "ziggy", "sock");
+    const adminSock = join(h.socketRoot, "clerk", "sock");
+    await rpc(probeSock, { v: 1, id: "1", op: "probe-quota", accounts: ["default", "spare"] });
+    // Confirm "spare" is in the on-disk file.
+    const beforeFile = JSON.parse(readFileSync(join(h.stateDir, "last-quota.json"), "utf-8"));
+    expect(beforeFile["spare"]).toBeDefined();
+    await rpc(adminSock, { v: 1, id: "2", op: "rm-account", label: "spare" });
+    // After removal the file must not contain "spare".
+    const afterFile = JSON.parse(readFileSync(join(h.stateDir, "last-quota.json"), "utf-8"));
+    expect(afterFile["spare"]).toBeUndefined();
+    expect(afterFile["default"]).toBeDefined();
+    broker.stop();
+  });
+
+  it("rm-account entry stays gone across a broker reload (loadStateFromDisk does not revive it)", async () => {
+    const h = makeHarness();
+    seedAccount(h, "default");
+    seedAccount(h, "spare");
+    const broker = new AuthBroker(makeConfig(h, "default", { adminAgents: ["clerk"] }), {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => okProbe(15, 5),
+    });
+    await broker.start();
+    const probeSock = join(h.socketRoot, "ziggy", "sock");
+    const adminSock = join(h.socketRoot, "clerk", "sock");
+    await rpc(probeSock, { v: 1, id: "1", op: "probe-quota", accounts: ["default", "spare"] });
+    await rpc(adminSock, { v: 1, id: "2", op: "rm-account", label: "spare" });
+    broker.stop();
+
+    // A fresh broker reloads from disk — "spare" must NOT come back.
+    const broker2 = new AuthBroker(makeConfig(h, "default", { adminAgents: ["clerk"] }), {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => okProbe(99, 99),
+    });
+    await broker2.start();
+    expect(broker2._state().lastQuotaCache["spare"]).toBeUndefined();
+    expect(broker2._state().lastQuotaCache["default"]).toBeDefined();
+    broker2.stop();
   });
 });
