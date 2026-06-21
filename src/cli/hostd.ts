@@ -31,6 +31,7 @@ import { getConfig, withConfigError } from "./helpers.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { checkDowngrade } from "./deploy-version-guard.js";
+import { removeStaleContainerIfNeeded } from "./singleton-stale-cleanup.js";
 import {
   defaultAuditLogPath,
   formatForCli,
@@ -350,6 +351,15 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
     );
     process.exit(1);
   }
+
+  // Stale-container reconciliation: if a container named switchroom-hostd
+  // exists under a DIFFERENT compose project (e.g. old containerized-path
+  // install), `compose up` would try to CREATE (not RECREATE) it and fail
+  // with a name conflict. Remove the stale container first so the create
+  // succeeds. Idempotent and logged. See singleton-stale-cleanup.ts.
+  removeStaleContainerIfNeeded("switchroom-hostd", HOSTD_COMPOSE_PROJECT, (line) =>
+    console.log(chalk.dim(line)),
+  );
 
   console.log(chalk.dim(`    Bringing up daemon…`));
   const up = runDocker(["compose", "-p", HOSTD_COMPOSE_PROJECT, "-f", composePath, "up", "-d"]);
