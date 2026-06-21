@@ -368,6 +368,15 @@ export class Driver {
    * - Custom emojis (`reactionCustomEmoji`) are skipped — scenarios
    *   that need them aren't in scope and parsing them would require
    *   resolving the document id to an alias.
+   *
+   * **DM / bot-reaction limitation:** when a BOT calls
+   * `setMessageReaction` on a DM, Telegram's MTProto server does NOT
+   * deliver `updateMessageReactions` to the human user's account.
+   * The server only delivers `updateBotMessageReaction` to the BOT's
+   * own update stream, so `onRawUpdate` never fires for the driver.
+   * For DM bot-reaction assertions, use {@link pollReactions} instead
+   * — it calls `messages.getMessagesReactions` directly (pull, not
+   * push) to read the current reaction set on any message.
    */
   observeReactions(
     chatId: number,
@@ -579,6 +588,41 @@ export class Driver {
     const msg = results[0];
     if (!msg) return null;
     return toObserved(msg, false);
+  }
+
+  /**
+   * Poll the current set of emoji reactions on a message by making a
+   * direct `messages.getMessagesReactions` MTProto call.
+   *
+   * Unlike {@link observeReactions}, this is a **pull** operation —
+   * it does not depend on push updates from the Telegram server. This
+   * makes it the correct verification method for DM bot-reaction
+   * scenarios: when a bot calls `setMessageReaction` on a DM, Telegram
+   * does not deliver `updateMessageReactions` to the user account, but
+   * the reaction IS queryable via this API.
+   *
+   * Returns an array of emoji strings currently on the message
+   * (e.g. `["👍"]`, `["👀", "🤔"]`). Returns an empty array when
+   * no reactions are set, or when `getMessageReactionsById` returns
+   * null (message deleted / not visible).
+   *
+   * Custom-emoji reactions are excluded (the documentId can't be
+   * trivially shown as a string without resolving it).
+   */
+  async pollReactions(chatId: number, messageId: number): Promise<string[]> {
+    const c = this.requireClient();
+    const results = await c.getMessageReactionsById(chatId, [messageId]);
+    const msgReactions = results[0];
+    if (!msgReactions) return [];
+    const emojis: string[] = [];
+    for (const rc of msgReactions.reactions) {
+      const emoji = rc.emoji;
+      if (typeof emoji === "string") {
+        emojis.push(emoji);
+      }
+      // Long (custom emoji document id) — skip, can't stringify cheaply
+    }
+    return emojis;
   }
 
   /**
