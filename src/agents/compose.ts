@@ -823,6 +823,19 @@ function readStrippedCaps(agent: AgentConfig): string[] {
  * container-real home) and check THAT. The baked mount SOURCE stays the
  * host-home path, which docker resolves host-side at mount time. On the host
  * (`hostHome === probeHome`) this is identical to `existsSync`.
+ *
+ * Fallback (#2512): hostd only bind-mounts `~/.switchroom/` into its container
+ * (not `~/.switchroom-config/` or other operator dirs). A symlink like
+ * `~/.switchroom/skills -> /home/op/.switchroom-config/skills` has a
+ * `hostHome`-rooted target, and after translation the target becomes
+ * `/host-home/.switchroom-config/skills` — which still doesn't exist inside
+ * hostd because that directory isn't mounted there. The translated-existsSync
+ * path is a dead end for targets outside the hostd bind tree. If the symlink
+ * itself exists AND its target is an absolute path under `hostHome` (meaning
+ * it unambiguously refers to something on the host), that is sufficient
+ * evidence: docker resolves symlinks host-side at bind-mount time and will
+ * find the target. Trust the symlink; don't require the translated target to
+ * be probe-resolvable inside the container.
  */
 function conditionalMountPresent(
   probePath: string,
@@ -834,13 +847,21 @@ function conditionalMountPresent(
     if (!lstatSync(probePath).isSymbolicLink()) return false;
     let target = readlinkSync(probePath);
     if (!isAbsolute(target)) target = resolve(dirname(probePath), target);
-    if (
-      hostHome &&
-      probeHome &&
-      hostHome !== probeHome &&
-      target.startsWith(hostHome + "/")
-    ) {
-      target = probeHome + target.slice(hostHome.length);
+    if (hostHome && probeHome && hostHome !== probeHome) {
+      if (target.startsWith(hostHome + "/")) {
+        // The symlink target is host-home-rooted: it unambiguously points at a
+        // real host path. Prefer verifying the translated (probe-home) path
+        // when it's reachable. But if it isn't — e.g. hostd only mounts
+        // ~/.switchroom, not ~/.switchroom-config — trust the symlink anyway.
+        // Docker resolves symlinks host-side at bind-mount time, so the mount
+        // source is valid as long as the symlink itself exists (which lstatSync
+        // above already confirmed).
+        const translated = probeHome + target.slice(hostHome.length);
+        if (existsSync(translated)) return true;
+        // Translated path not reachable inside this container, but the symlink
+        // points at a host-rooted path — docker will find it at mount time.
+        return true;
+      }
     }
     return existsSync(target);
   } catch {

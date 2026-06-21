@@ -2834,6 +2834,36 @@ describe("conditional-mount probe home (in-hostd apply — marko meta_pages regr
     expect(yaml).toContain("/home/op/.switchroom/skills:/home/op/.switchroom/skills:ro");
   });
 
+  // #2512: hostd only mounts ~/.switchroom into its container — NOT
+  // ~/.switchroom-config or any other operator dir. A symlink like
+  //   ~/.switchroom/skills -> /home/op/.switchroom-config/skills
+  // points at a host-rooted path. The translated target becomes
+  // /host-home/.switchroom-config/skills which does NOT exist inside the
+  // container (because .switchroom-config isn't mounted). The #2387 fix
+  // translated the target and then checked existsSync on the translated path —
+  // still false → mount dropped again. The correct behaviour: a symlink whose
+  // target starts with hostHome is unambiguously host-rooted; docker resolves
+  // it host-side at bind-mount time regardless of whether the translated path
+  // is reachable inside the container.
+  it("keeps a symlinked skills dir even when the symlink target is not reachable in the container (#2512)", () => {
+    // Simulate the production setup: ~/.switchroom/skills is a symlink to
+    // /home/op/.switchroom-config/skills, but ~/.switchroom-config/ is NOT
+    // mounted into probeHomeDir (hostd only mounts ~/.switchroom).
+    // So the translated target /probeHomeDir/.switchroom-config/skills does not exist.
+    mkdirSync(join(tmpDir, ".switchroom"), { recursive: true });
+    // Only create the symlink, NOT the target inside tmpDir — mirrors hostd.
+    symlinkSync("/home/op/.switchroom-config/skills", join(tmpDir, ".switchroom", "skills"));
+    const yaml = generateCompose({
+      config: makeConfig({ klanker: {} }),
+      homeDir: "/home/op",
+      probeHomeDir: tmpDir,
+    });
+    // Symlink exists and its target is host-home-rooted → mount must be emitted.
+    // Docker resolves the symlink host-side; we must not drop it because the
+    // translated target happens to be outside the container's bind tree.
+    expect(yaml).toContain("/home/op/.switchroom/skills:/home/op/.switchroom/skills:ro");
+  });
+
   // #2383: a bundled-skills pool OUTSIDE ~/.switchroom/skills must bake a
   // HOST-rooted mount source, not the container-real /host-home path.
   it("bakes a host-rooted source for an out-of-skills bundled pool on in-hostd apply (#2383)", () => {
