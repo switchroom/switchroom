@@ -143,6 +143,41 @@ export const ApplyRequestSchema = z.object({
   args: z.object({}).optional(),
 });
 
+// ─── PR1 (#2487) — agent-reachable safe staggered rollout ─────────────────
+//
+// `rollout` exposes `switchroom rollout` — the staggered canary +
+// per-agent version-assert + stop-on-mismatch verb — over the wire so an
+// admin agent can run a SAFE fleet roll behind a single operator approval
+// card (the verb is deliberately omitted from HOSTD_MCP_TOOLS in
+// scaffold.ts, so any agent call surfaces a Telegram approval).
+//
+// Wire-layer safety: `pin` is SEMVER-ONLY here (`^v\d+\.\d+\.\d+$`),
+// rejecting `sha-…` pins at decode. A sha pin is a valid release.pin but
+// is NOT version-assertable (the in-container `switchroom --version`
+// always prints the semver), so it would "mismatch" on agent #1 and stop
+// the roll with a confusing message. update_apply still accepts sha pins
+// (it doesn't assert versions); rollout does not.
+export const RolloutRequestSchema = z.object({
+  ...RequestEnvelope,
+  op: z.literal("rollout"),
+  args: z
+    .object({
+      /** Semver target to roll the fleet to (e.g. v0.15.18). Required:
+       *  a staggered version-assert roll has nothing to assert against
+       *  without a concrete tag. SHA pins are rejected at the wire. */
+      pin: z.string().regex(/^v\d+\.\d+\.\d+$/),
+      /** Comma-free explicit subset of agents to roll. Omit ⇒ all
+       *  configured agents (canary-first ordering still applies). */
+      agents: z.array(AgentNameSchema).min(1).optional(),
+      /** Skip the web + hostd refresh step. On the hostd/MCP path the
+       *  hostd/web refresh is ALWAYS deferred regardless (it would
+       *  SIGKILL the in-flight rollout — hostd's own child); this flag
+       *  is forwarded for parity but the deferral is unconditional. */
+      skip_web: z.boolean().optional(),
+    })
+    .required({ pin: true }),
+});
+
 export const AgentStartRequestSchema = z.object({
   ...RequestEnvelope,
   op: z.literal("agent_start"),
@@ -368,6 +403,7 @@ export const RequestSchema = z.discriminatedUnion("op", [
   UpdateCheckRequestSchema,
   UpdateApplyRequestSchema,
   ApplyRequestSchema,
+  RolloutRequestSchema,
   AgentStartRequestSchema,
   AgentStopRequestSchema,
   AgentLogsRequestSchema,
@@ -385,6 +421,7 @@ export type GetStatusRequest = z.infer<typeof GetStatusRequestSchema>;
 export type UpdateCheckRequest = z.infer<typeof UpdateCheckRequestSchema>;
 export type UpdateApplyRequest = z.infer<typeof UpdateApplyRequestSchema>;
 export type ApplyRequest = z.infer<typeof ApplyRequestSchema>;
+export type RolloutRequest = z.infer<typeof RolloutRequestSchema>;
 export type AgentStartRequest = z.infer<typeof AgentStartRequestSchema>;
 export type AgentStopRequest = z.infer<typeof AgentStopRequestSchema>;
 export type AgentLogsRequest = z.infer<typeof AgentLogsRequestSchema>;

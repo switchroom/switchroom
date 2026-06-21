@@ -86,10 +86,18 @@ interface ToolArgs {
   // update_apply release-override (PR B)
   channel?: "dev" | "rc" | "latest";
   pin?: string;
+  // rollout (#2487)
+  agents?: string[];
+  skip_web?: boolean;
   // config_propose_edit args
   unified_diff?: string;
   target_path?: string;
 }
+
+/** Semver-only pin matcher for the rollout verb (#2487). Rejects `sha-…`
+ *  pins at the wire — a sha is a valid release.pin but is NOT
+ *  version-assertable, so it would stop the staggered roll on agent #1. */
+const ROLLOUT_SEMVER_PIN_RE = /^v\d+\.\d+\.\d+$/;
 
 export const TOOLS = [
   {
@@ -261,6 +269,56 @@ export const TOOLS = [
             "One-shot release-pin override (sha-<7-40 hex> or " +
             "v<semver>). Mirrors `switchroom update --pin`. Mutually " +
             "exclusive with `channel`.",
+        },
+      },
+    },
+  },
+  {
+    name: "rollout",
+    description:
+      "SAFELY roll the fleet to a pinned SEMVER version, staggered and " +
+      "canary-gated (#2487). Unlike update_apply (a blunt all-at-once " +
+      "recreate), this restarts agents one at a time canary-first, asserts " +
+      "each agent's in-container `switchroom --version` matches the target, " +
+      "and STOPS on the first mismatch — so a bad build fails on the canary " +
+      "before touching the rest of the fleet. The durable release.pin is " +
+      "persisted only AFTER the canary confirms (a failed canary never " +
+      "strands a bad pin). `pin` MUST be a tagged semver (vX.Y.Z) — sha " +
+      "pins are rejected because the version assert needs a semver to " +
+      "compare against. The hostd/web self-refresh is DEFERRED on this path " +
+      "(an agent-invoked rollout cannot recreate its own hostd container " +
+      "without killing itself); run that host-side. Downgrade pins are " +
+      "rejected (rollback is an operator-tapped verb, not an agent " +
+      "rollout). Admin-only at the wire layer AND deliberately NOT pre-" +
+      "approved — every call surfaces a Telegram approval card for the " +
+      "operator to tap. Returns `started`; poll get_status for the " +
+      "structured outcome (which agents rolled / where it stopped).",
+    inputSchema: {
+      type: "object" as const,
+      required: ["pin"],
+      properties: {
+        pin: {
+          type: "string",
+          pattern: "^v\\d+\\.\\d+\\.\\d+$",
+          description:
+            "Target semver to roll to, e.g. v0.15.18. SHA pins are " +
+            "rejected — the staggered roll asserts the in-container " +
+            "semver version.",
+        },
+        agents: {
+          type: "array",
+          items: { type: "string", pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$" },
+          minItems: 1,
+          description:
+            "Explicit subset of agents to roll (default: all configured). " +
+            "Canary-first ordering still applies.",
+        },
+        skip_web: {
+          type: "boolean",
+          description:
+            "Skip the web + hostd refresh step. NB: on this (hostd) path " +
+            "the hostd/web refresh is deferred regardless; this flag is " +
+            "forwarded for parity.",
         },
       },
     },
@@ -468,6 +526,42 @@ export async function dispatchTool(
           ...(args.rebuild ? { rebuild: true } : {}),
           ...(args.channel ? { channel: args.channel } : {}),
           ...(args.pin ? { pin: args.pin } : {}),
+        },
+      };
+      break;
+    }
+    case "rollout": {
+      // Semver-only pin, rejected at the MCP boundary (fail fast with a
+      // friendly message rather than round-tripping a wire-decode error).
+      // A sha pin is NOT version-assertable and would stop the roll on
+      // agent #1 — so it's rejected here, not just at the daemon.
+      if (!args.pin || typeof args.pin !== "string") {
+        return errorText("rollout: pin is required (a semver like v0.15.18).");
+      }
+      if (!ROLLOUT_SEMVER_PIN_RE.test(args.pin)) {
+        return errorText(
+          `rollout: pin "${args.pin}" is invalid. Must be a tagged semver ` +
+            `(vX.Y.Z). SHA pins are rejected — the staggered roll asserts ` +
+            `the in-container semver version.`,
+        );
+      }
+      if (
+        args.agents !== undefined &&
+        (!Array.isArray(args.agents) || args.agents.length === 0)
+      ) {
+        return errorText(
+          "rollout: agents, when provided, must be a non-empty array of " +
+            "agent names.",
+        );
+      }
+      req = {
+        v: 1,
+        op: "rollout",
+        request_id: makeRequestId("mcp-rollout"),
+        args: {
+          pin: args.pin,
+          ...(args.agents ? { agents: args.agents } : {}),
+          ...(args.skip_web ? { skip_web: true } : {}),
         },
       };
       break;

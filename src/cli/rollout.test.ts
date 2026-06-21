@@ -16,7 +16,11 @@ import {
   planRollout,
   formatRolloutPlan,
   executeRollout,
+  encodeRolloutResultLine,
+  parseRolloutResultLine,
+  ROLLOUT_RESULT_SENTINEL,
   type RolloutDeps,
+  type RolloutResult,
   type RolloutStep,
 } from "./rollout.js";
 
@@ -217,5 +221,141 @@ describe("executeRollout", () => {
     // target carries the v-prefix; in-container version does not.
     const r = executeRollout(steps, "v0.15.18", deps);
     expect(r.ok).toBe(true);
+  });
+});
+
+// ── #2487 hostd/MCP-path ordering + structured result + deferral ──────────
+
+describe("planRollout — hostd context (#2487)", () => {
+  const TARGET = "v0.15.18";
+
+  it("persists the pin AFTER the canary, not before", () => {
+    const steps = planRollout(["clerk", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const kinds = steps.map((s) =>
+      s.kind === "restart-agent" ? `r:${s.agent}` : s.kind,
+    );
+    // apply → canary (test-harness) → persist-pin → rest → sweep.
+    expect(kinds).toEqual([
+      "apply",
+      "r:test-harness",
+      "persist-pin",
+      "r:clerk",
+      "sweep",
+    ]);
+    // persist-pin comes strictly AFTER the canary restart.
+    const persistIdx = kinds.indexOf("persist-pin");
+    const canaryIdx = kinds.indexOf("r:test-harness");
+    expect(persistIdx).toBeGreaterThan(canaryIdx);
+  });
+
+  it("DROPS the hostd/web refresh steps (deferred — would SIGKILL itself)", () => {
+    const kinds = planRollout(["clerk", "marko"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    }).map((s) => s.kind);
+    expect(kinds).not.toContain("refresh-web");
+    expect(kinds).not.toContain("refresh-hostd");
+  });
+
+  it("host-shell path is unchanged — persist FIRST, web/hostd present", () => {
+    const kinds = planRollout(["clerk", "test-harness"], {
+      pinToPersist: TARGET,
+    }).map((s) => s.kind);
+    expect(kinds[0]).toBe("persist-pin"); // FIRST, deliberate
+    expect(kinds).toContain("refresh-web");
+    expect(kinds).toContain("refresh-hostd");
+  });
+});
+
+describe("executeRollout — hostd context (#2487)", () => {
+  const TARGET = "v0.15.18";
+
+  it("apply uses one-shot --pin (pin not yet persisted before canary)", () => {
+    const steps = planRollout(["clerk", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    expect(runs[0]).toEqual(["apply", "--pin", TARGET]);
+  });
+
+  it("does NOT persist the pin when the canary FAILS its version assert", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps, persisted, runs } = harness({
+      // canary (test-harness) comes back stale → roll STOPS before persist.
+      versions: { "test-harness": "0.15.17", clerk: "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(false);
+    expect(r.failedAgent).toBe("test-harness");
+    expect(r.rolled).toEqual([]);
+    // The brick-scenario-#2 guard: a failed canary leaves NO persisted pin.
+    expect(persisted).toEqual([]);
+    // clerk was never touched.
+    expect(runs).not.toContainEqual(["agent", "restart", "clerk", "--wait", "--force"]);
+  });
+
+  it("persists the pin once the canary is GREEN, then rolls the rest", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps, persisted } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    expect(r.rolled).toEqual(["test-harness", "clerk"]);
+    expect(persisted).toEqual([TARGET]); // persisted exactly once, after canary
+  });
+});
+
+describe("rollout structured-result sentinel (#2487)", () => {
+  it("round-trips a successful result through encode/parse", () => {
+    const result: RolloutResult = {
+      ok: true,
+      rolled: ["test-harness", "clerk"],
+      warnings: ["hostd/web refresh deferred"],
+    };
+    const line = encodeRolloutResultLine(result);
+    expect(line.startsWith(ROLLOUT_RESULT_SENTINEL)).toBe(true);
+    const parsed = parseRolloutResultLine("noise\n" + line + "\nmore noise");
+    expect(parsed).toEqual({
+      ok: true,
+      rolled: ["test-harness", "clerk"],
+      warnings: ["hostd/web refresh deferred"],
+    });
+  });
+
+  it("round-trips a FAILED result with failedAgent/failedStep", () => {
+    const result: RolloutResult = {
+      ok: false,
+      rolled: ["test-harness"],
+      failedStep: "restart-agent",
+      failedAgent: "clerk",
+      got: "0.15.17",
+      warnings: [],
+    };
+    const parsed = parseRolloutResultLine(encodeRolloutResultLine(result));
+    expect(parsed).toMatchObject({
+      ok: false,
+      rolled: ["test-harness"],
+      failedStep: "restart-agent",
+      failedAgent: "clerk",
+    });
+  });
+
+  it("returns null when no sentinel line is present (child died early)", () => {
+    expect(parseRolloutResultLine("Rolling 3 agents…\napply\n")).toBeNull();
   });
 });

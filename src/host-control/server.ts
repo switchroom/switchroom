@@ -56,6 +56,8 @@ import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
+import { parseRolloutResultLine } from "../cli/rollout.js";
+import { parseAuditLine } from "./audit-reader.js";
 import {
   validateConfigEdit,
   assertSelfScopedAllowEdit,
@@ -184,6 +186,18 @@ interface StatusEntry {
     install_type: InstallType;
     detected_at: string;
   };
+  // ─── Rollout-flow structured result (#2487) ────────────────────────
+  // Populated only on `rollout` rows. The staggered rollout's outcome is
+  // preserved as STRUCTURED fields (not flattened into a stdout tail) so
+  // a `get_status` reader / the gateway can show exactly which agents
+  // rolled and where it stopped. Parsed from the spawned child's
+  // sentinel line (see parseRolloutResultLine in cli/rollout.ts).
+  /** Agents confirmed on the target version, in order. */
+  rolled?: string[];
+  /** Step that stopped the rollout (e.g. "restart-agent", "apply"). */
+  failed_step?: string;
+  /** Agent that failed the version assert (when failed_step is restart). */
+  failed_agent?: string;
 }
 
 /**
@@ -385,6 +399,17 @@ const STATUS_MAX_ENTRIES = 256;
 /** Tail length for stdout/stderr in audit + response frames. */
 const TAIL_BYTES = 4096;
 
+/**
+ * #2487 item 7 — minimum age before a `started` fleet-mutation row with no
+ * terminal counterpart is treated as ORPHANED on hostd boot. A normal
+ * mutation completes (and writes its terminal row) well under this; only a
+ * mutation whose process died without finishing (SIGKILL mid-rollout)
+ * leaves a `started` row this stale. Conservative (15 min) so an in-flight
+ * mutation that legitimately spans a quick hostd restart isn't falsely
+ * flagged. Exported so the boot-reconcile test can pin the threshold.
+ */
+export const ORPHAN_RECONCILE_AGE_MS = 15 * 60 * 1000;
+
 export class HostdServer {
   // One Server per bound socket path. `node:net.Server.listen` can
   // only be called once per instance — to bind N agent sockets we
@@ -424,7 +449,11 @@ export class HostdServer {
    * common "fleet boot in parallel" case for no real safety win.
    */
   private fleetMutationInFlight:
-    | { op: "update_apply" | "apply"; request_id: string; started_at: number }
+    | {
+        op: "update_apply" | "apply" | "rollout";
+        request_id: string;
+        started_at: number;
+      }
     | null = null;
 
   constructor(private opts: ServerOptions) {}
@@ -544,6 +573,108 @@ export class HostdServer {
     } catch (err) {
       await this.stop();
       throw err;
+    }
+
+    // #2487 item 7 — orphaned-`started`-row reconcile guard. A fleet
+    // mutation (update_apply / apply / rollout) records a synchronous
+    // `started` audit row, then a `terminal` row when the spawned child
+    // finishes. If hostd is SIGKILLed mid-mutation (e.g. a rollout's
+    // hostd-refresh recreated this very container — brick scenario #1),
+    // the terminal row never lands: the fleet is left half-rolled and the
+    // status shows a perpetual `started`. On the next boot we scan for
+    // such orphans and emit a LOUD terminal failure row so the gap is
+    // detectable (via /audit hostd / get_status) instead of silently
+    // hanging forever. Best-effort: never throws, never blocks boot.
+    await this.reconcileOrphanedFleetMutations().catch((e) => {
+      process.stderr.write(
+        `hostd: orphan-reconcile sweep failed (non-fatal): ${(e as Error).message}\n`,
+      );
+    });
+  }
+
+  /**
+   * Scan the audit log for fleet-mutation `started` rows with no matching
+   * `terminal` row, older than {@link ORPHAN_RECONCILE_AGE_MS}, and append
+   * a loud terminal failure row for each (#2487 item 7). Emits
+   * `rollout_orphaned` for rollout ops and `update_failed` for
+   * update_apply/apply — the gateway / audit reader can branch on op +
+   * this synthetic phase to alert the operator. A row that ALREADY has a
+   * terminal counterpart, or that we already reconciled (its synthetic
+   * row exists), is skipped — the sweep is idempotent across reboots.
+   */
+  private async reconcileOrphanedFleetMutations(): Promise<void> {
+    const path = this.auditLogPath();
+    if (!existsSync(path)) return;
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf-8");
+    } catch {
+      return;
+    }
+    const FLEET_OPS = new Set(["update_apply", "apply", "rollout"]);
+    // request_id → started row info; cleared when a terminal/orphan row
+    // for the same request_id is seen.
+    const startedRows = new Map<
+      string,
+      { op: string; ts: number; caller_name?: string }
+    >();
+    for (const line of raw.split("\n")) {
+      const e = parseAuditLine(line);
+      if (!e) continue;
+      // Our synthetic orphan row (op=rollout_orphaned/update_failed,
+      // phase=orphan_reconciled) carries the ORIGINAL request_id and
+      // resolves the started — checked BEFORE the FLEET_OPS filter since
+      // its own op is not a fleet op. This makes the sweep idempotent.
+      if (e.phase === "orphan_reconciled") {
+        startedRows.delete(e.request_id);
+        continue;
+      }
+      if (!FLEET_OPS.has(e.op)) continue;
+      // A terminal row resolves the started.
+      if (e.phase === "terminal") {
+        startedRows.delete(e.request_id);
+        continue;
+      }
+      // Synchronous request-path `started` row (no phase).
+      if (e.result === "started" && e.phase === undefined) {
+        const tsMs = Date.parse(e.ts);
+        startedRows.set(e.request_id, {
+          op: e.op,
+          ts: Number.isFinite(tsMs) ? tsMs : Date.now(),
+          caller_name: e.caller.kind === "agent" ? e.caller.name : undefined,
+        });
+      }
+    }
+    const now = Date.now();
+    for (const [request_id, info] of startedRows) {
+      if (now - info.ts < ORPHAN_RECONCILE_AGE_MS) continue; // too fresh
+      const synthOp = info.op === "rollout" ? "rollout_orphaned" : "update_failed";
+      process.stderr.write(
+        `hostd: ORPHANED ${info.op} (request_id=${request_id}, ` +
+          `started ${Math.floor((now - info.ts) / 60000)}m ago, no terminal ` +
+          `row) — emitting ${synthOp}. The fleet may be half-rolled; verify ` +
+          `host-side.\n`,
+      );
+      await this.appendAuditRow({
+        ts: new Date().toISOString(),
+        op: synthOp,
+        phase: "orphan_reconciled",
+        // Carry the ORIGINAL request_id so the terminal row resolves the
+        // orphan on the next boot's sweep (idempotency).
+        request_id,
+        original_op: info.op,
+        caller: info.caller_name
+          ? { kind: "agent", name: info.caller_name }
+          : { kind: "operator" },
+        result: "error",
+        exit_code: null,
+        duration_ms: now - info.ts,
+        error:
+          `${info.op} left a perpetual 'started' status with no terminal row ` +
+          `(hostd likely SIGKILLed mid-mutation — brick scenario #1). ` +
+          `Reconciled to a failure on hostd boot. The fleet may be ` +
+          `half-rolled; verify versions host-side and re-run if needed.`,
+      });
     }
   }
 
@@ -694,6 +825,9 @@ export class HostdServer {
         case "apply":
           resp = this.handleApply(req, caller, started);
           break;
+        case "rollout":
+          resp = this.handleRollout(req, caller, started);
+          break;
         case "agent_start":
           resp = await this.handleAgentStart(req, started);
           break;
@@ -802,10 +936,15 @@ export class HostdServer {
         return null;
       case "update_apply":
       case "apply":
+      case "rollout":
         // Fleet-wide mutations. Require admin: a non-admin agent
         // accidentally regenerating compose / pulling images on the
         // whole fleet is the obvious foot-gun. Operator is always
         // allowed (kind === "operator" already returned null above).
+        // `rollout` (#2487) is additionally kept OUT of HOSTD_MCP_TOOLS
+        // in scaffold.ts, so an agent's call surfaces a Telegram approval
+        // card — the human tap is the real boundary; this admin gate is
+        // the wire-side floor.
         return callerAdmin
           ? null
           : `${req.op} requires admin: true on caller "${caller.name}"`;
@@ -1169,6 +1308,78 @@ export class HostdServer {
       started_at: started,
     };
     this.spawnFleetMutation(req.op, args, entry);
+    return {
+      v: 1,
+      request_id: req.request_id,
+      result: "started",
+      exit_code: null,
+      duration_ms: Date.now() - started,
+    };
+  }
+
+  /**
+   * Mutating + long-running: `switchroom rollout` — the SAFE staggered
+   * canary + per-agent version-assert + stop-on-mismatch fleet deploy
+   * (#2487). Modeled on handleUpdateApply (shares the fleet-mutation lock
+   * + apply-asset preflight) but with three load-bearing differences:
+   *
+   *   1. The spawned CLI runs with `SWITCHROOM_HOSTD_CONTEXT=1`, which
+   *      flips the rollout to (a) persist the durable pin AFTER the canary
+   *      confirms (not before — brick scenario #2), and (b) DROP the
+   *      hostd/web self-refresh (it would SIGKILL this very rollout, which
+   *      is hostd's own child — brick scenario #1).
+   *   2. The outcome (`rolled[]` / `failedStep` / `failedAgent`) is
+   *      preserved into STRUCTURED status fields, parsed from the child's
+   *      sentinel line — NOT flattened into a stdout tail.
+   *   3. `pin` is semver-only (already enforced at the wire schema).
+   *
+   * Returns `started`; default wire timeout (no long override) — same
+   * async fire-and-forget pattern as update_apply.
+   */
+  private handleRollout(
+    req: Extract<HostdRequest, { op: "rollout" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): HostdResponse {
+    const denied = this.checkFleetMutationLock(req.op, req.request_id, started);
+    if (denied) return denied;
+
+    const assetDenied = this.applyAssetPreflight(req.request_id, started);
+    if (assetDenied) return assetDenied;
+
+    const args = ["rollout", "--pin", req.args.pin];
+    if (req.args.agents && req.args.agents.length > 0) {
+      args.push("--agents", req.args.agents.join(","));
+    }
+    if (req.args.skip_web) args.push("--skip-web");
+
+    const installCtx = readCachedInstallType(
+      this.opts.bindRoot ?? this.opts.homeDir,
+    );
+
+    const entry: StatusEntry = {
+      request_id: req.request_id,
+      caller,
+      op: req.op,
+      result: "started",
+      exit_code: null,
+      started_at: started,
+      finished_at: null,
+      stdout_tail: "",
+      stderr_tail: "",
+      pin: req.args.pin,
+      install_context: {
+        install_type: installCtx.install_type,
+        detected_at: installCtx.detected_at,
+      },
+    };
+    this.recordStatus(entry);
+    this.fleetMutationInFlight = {
+      op: "rollout",
+      request_id: req.request_id,
+      started_at: started,
+    };
+    this.spawnRollout(args, entry);
     return {
       v: 1,
       request_id: req.request_id,
@@ -2008,7 +2219,7 @@ export class HostdServer {
   }
 
   private checkFleetMutationLock(
-    op: "update_apply" | "apply",
+    op: "update_apply" | "apply" | "rollout",
     request_id: string,
     started: number,
   ): HostdResponse | null {
@@ -2029,7 +2240,7 @@ export class HostdServer {
    *  Updates the status entry on completion AND releases the
    *  fleet-mutation lock (success or fail). */
   private spawnFleetMutation(
-    op: "update_apply" | "apply",
+    op: "update_apply" | "apply" | "rollout",
     args: string[],
     entry: StatusEntry,
   ): void {
@@ -2070,6 +2281,52 @@ export class HostdServer {
       });
   }
 
+  /**
+   * Fire-and-forget spawn for `rollout` (#2487). Distinct from
+   * spawnFleetMutation: it injects the `SWITCHROOM_HOSTD_CONTEXT=1`
+   * sentinel into the child env and parses the child's STRUCTURED result
+   * sentinel off stdout into the status entry's `rolled[]` / `failed_step`
+   * / `failed_agent` fields — instead of relying on a flattened stdout
+   * tail. Releases the fleet-mutation lock on completion (success/fail).
+   */
+  private spawnRollout(args: string[], entry: StatusEntry): void {
+    this.runSwitchroom(args, { SWITCHROOM_HOSTD_CONTEXT: "1" })
+      .then((res) => {
+        entry.exit_code = res.exit_code;
+        entry.finished_at = Date.now();
+        entry.stdout_tail = tail(res.stdout);
+        entry.stderr_tail = tail(res.stderr);
+        const parsed = parseRolloutResultLine(res.stdout);
+        if (parsed) {
+          entry.rolled = parsed.rolled;
+          if (parsed.failedStep) entry.failed_step = parsed.failedStep;
+          if (parsed.failedAgent) entry.failed_agent = parsed.failedAgent;
+          // Structured `ok` is the authority; exit code corroborates.
+          entry.result = parsed.ok ? "completed" : "error";
+        } else {
+          // No sentinel — the child died before finishing (e.g. SIGKILL).
+          // Fall back to the exit code; structured fields stay unset so a
+          // reader can tell the outcome wasn't cleanly captured.
+          entry.result = res.exit_code === 0 ? "completed" : "error";
+        }
+      })
+      .catch((err) => {
+        entry.result = "error";
+        entry.exit_code = null;
+        entry.finished_at = Date.now();
+        entry.error = (err as Error).message;
+      })
+      .finally(() => {
+        void this.writeTerminalAudit(entry);
+        if (
+          this.fleetMutationInFlight &&
+          this.fleetMutationInFlight.request_id === entry.request_id
+        ) {
+          this.fleetMutationInFlight = null;
+        }
+      });
+  }
+
   private handleGetStatus(
     req: Extract<HostdRequest, { op: "get_status" }>,
     _caller: SocketIdentity,
@@ -2093,6 +2350,22 @@ export class HostdServer {
     request_id: string,
     entry: StatusEntry,
   ): HostdResponse {
+    // Rollout (#2487) surfaces its STRUCTURED outcome via `payload` so a
+    // get_status reader gets rolled[]/failedStep/failedAgent as data, not
+    // a stdout-tail it has to grep. Only emitted on rollout entries that
+    // actually captured structured fields.
+    const rolloutPayload =
+      entry.op === "rollout" &&
+      (entry.rolled !== undefined ||
+        entry.failed_step !== undefined ||
+        entry.failed_agent !== undefined)
+        ? JSON.stringify({
+            rolled: entry.rolled ?? [],
+            ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
+            ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
+            ...(entry.pin ? { pin: entry.pin } : {}),
+          })
+        : undefined;
     return {
       v: 1,
       request_id,
@@ -2101,6 +2374,7 @@ export class HostdServer {
       duration_ms: (entry.finished_at ?? Date.now()) - entry.started_at,
       stdout_tail: entry.stdout_tail || undefined,
       stderr_tail: entry.stderr_tail || undefined,
+      ...(rolloutPayload ? { payload: rolloutPayload } : {}),
       error: entry.error,
     };
   }
@@ -2236,18 +2510,26 @@ export class HostdServer {
       ...(entry.pin ? { pin: entry.pin } : {}),
       ...(entry.resolved_sha ? { resolved_sha: entry.resolved_sha } : {}),
       ...(entry.install_context ? { install_context: entry.install_context } : {}),
+      // Rollout structured result (#2487) — only present on rollout rows.
+      ...(entry.rolled ? { rolled: entry.rolled } : {}),
+      ...(entry.failed_step ? { failed_step: entry.failed_step } : {}),
+      ...(entry.failed_agent ? { failed_agent: entry.failed_agent } : {}),
     });
   }
 
-  /** Spawn the host switchroom CLI and capture stdout/stderr. */
+  /** Spawn the host switchroom CLI and capture stdout/stderr. An
+   *  optional `extraEnv` is merged onto the inherited env — used by the
+   *  rollout path to flip the in-container `SWITCHROOM_HOSTD_CONTEXT`
+   *  sentinel (#2487). */
   private runSwitchroom(
     args: string[],
+    extraEnv?: Record<string, string>,
   ): Promise<{ exit_code: number; stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
       const bin = this.opts.switchroomBin ?? "switchroom";
       const child = spawn(bin, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env },
+        env: { ...process.env, ...(extraEnv ?? {}) },
       });
       let stdout = "";
       let stderr = "";

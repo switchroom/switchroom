@@ -43,6 +43,13 @@ export interface AuditEntry {
     install_type: string;
     detected_at: string;
   };
+  // ─── Rollout-flow structured result (#2487) ────────────────────────
+  /** Agents confirmed on the target version, in order (rollout rows). */
+  rolled?: string[];
+  /** Step that stopped the rollout (rollout rows). */
+  failed_step?: string;
+  /** Agent that failed the version assert (rollout rows). */
+  failed_agent?: string;
 }
 
 export interface AuditFilters {
@@ -122,6 +129,11 @@ export function parseAuditLine(line: string): AuditEntry | null {
       };
     }
   }
+  if (Array.isArray(o.rolled) && o.rolled.every((x) => typeof x === "string")) {
+    entry.rolled = o.rolled as string[];
+  }
+  if (typeof o.failed_step === "string") entry.failed_step = o.failed_step;
+  if (typeof o.failed_agent === "string") entry.failed_agent = o.failed_agent;
   return entry;
 }
 

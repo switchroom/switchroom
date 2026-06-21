@@ -710,6 +710,11 @@ describe("scaffoldAgent", () => {
       "mcp__hostd__agent_start",
       "mcp__hostd__agent_stop",
       "mcp__hostd__agent_logs",
+      // #2487: the safe staggered rollout is mutating + a more surgical
+      // abuse surface (--agents + arbitrary --pin) than update_apply, so
+      // it MUST stay out of the pre-approved set — every agent call
+      // surfaces a Telegram approval card.
+      "mcp__hostd__rollout",
     ]) {
       expect(allow).not.toContain(verb);
     }

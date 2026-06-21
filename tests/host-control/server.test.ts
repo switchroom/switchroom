@@ -4,8 +4,8 @@
  * `switchroomBin` to a small shell script the test writes.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, statSync } from "node:fs";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync, statSync, appendFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -996,6 +996,190 @@ describe("hostd server — Phase 2 fleet mutations + lock", () => {
     expect(execRow!.stderr_tail).toBeUndefined();
   });
 
+  // ── #2487 rollout (safe staggered canary fleet roll) ─────────────────
+  it("rollout: requires admin (denied for non-admin caller)", async () => {
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/bob/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-deny", args: { pin: "v0.15.18" } },
+    );
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/rollout requires admin/);
+  });
+
+  it("rollout: rejects a sha- pin at wire decode (semver-only)", async () => {
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+    const resp = await hostdRequest(
+      { socketPath: sock },
+      // sha pin is a valid update_apply pin but NOT a valid rollout pin.
+      { v: 1, op: "rollout", request_id: "ro-sha", args: { pin: "sha-abc1234" } } as never,
+    );
+    // Wire schema rejects it before dispatch → denied bad-request.
+    expect(resp.result).toBe("denied");
+    expect(resp.error).toMatch(/bad request/);
+  });
+
+  it("rollout: returns started for admin, spawns with --pin + SWITCHROOM_HOSTD_CONTEXT", async () => {
+    // Stub that records its env + argv so we can prove the context
+    // sentinel + flags are plumbed, and emits the structured sentinel.
+    const recStub = join(tmp, "switchroom-rollout-stub.sh");
+    const recOut = join(tmp, "rollout-rec.txt");
+    writeFileSync(
+      recStub,
+      `#!/bin/sh\n` +
+        `echo "argv: $@" >> "${recOut}"\n` +
+        `echo "ctx: $SWITCHROOM_HOSTD_CONTEXT" >> "${recOut}"\n` +
+        // Emit the structured result sentinel the daemon parses.
+        `echo 'Rolling 2 agents…'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["test-harness","klanker"],"warnings":["hostd/web refresh deferred"]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(recStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: recStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const started = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "rollout",
+        request_id: "ro-ok",
+        args: { pin: "v0.15.18", agents: ["test-harness", "klanker"] },
+      },
+    );
+    expect(started.result).toBe("started");
+    expect(started.exit_code).toBeNull();
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const { readFileSync } = await import("node:fs");
+    const rec = readFileSync(recOut, "utf8");
+    // --pin + --agents plumbed; SWITCHROOM_HOSTD_CONTEXT set on the child.
+    expect(rec).toContain("argv: rollout --pin v0.15.18 --agents test-harness,klanker");
+    expect(rec).toContain("ctx: 1");
+
+    // get_status surfaces the STRUCTURED outcome via `payload`, not a tail.
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: "ro-poll",
+        args: { target_request_id: "ro-ok" },
+      },
+    );
+    expect(poll.result).toBe("completed");
+    expect(poll.payload).toBeDefined();
+    const payload = JSON.parse(poll.payload!);
+    expect(payload.rolled).toEqual(["test-harness", "klanker"]);
+
+    // Terminal audit row carries the structured rolled[] too.
+    const rows = readFileSync(join(tmp, "audit.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const terminal = rows.find(
+      (r) => r.request_id === "ro-ok" && r.phase === "terminal",
+    );
+    expect(terminal).toBeDefined();
+    expect(terminal!.op).toBe("rollout");
+    expect(terminal!.rolled).toEqual(["test-harness", "klanker"]);
+  });
+
+  it("rollout: a FAILED canary surfaces failed_agent in the terminal row + status", async () => {
+    const failStub = join(tmp, "switchroom-rollout-fail-stub.sh");
+    writeFileSync(
+      failStub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":false,"rolled":[],"failedStep":"restart-agent","failedAgent":"test-harness","got":"0.15.17","warnings":[]}'\n` +
+        `exit 1\n`,
+    );
+    chmodSync(failStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: failStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-fail", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "get_status",
+        request_id: "ro-fail-poll",
+        args: { target_request_id: "ro-fail" },
+      },
+    );
+    expect(poll.result).toBe("error");
+    const payload = JSON.parse(poll.payload!);
+    expect(payload.failedAgent).toBe("test-harness");
+    expect(payload.failedStep).toBe("restart-agent");
+
+    const { readFileSync } = await import("node:fs");
+    const terminal = readFileSync(join(tmp, "audit.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r.request_id === "ro-fail" && r.phase === "terminal");
+    expect(terminal!.failed_agent).toBe("test-harness");
+    expect(terminal!.failed_step).toBe("restart-agent");
+  });
+
+  it("rollout: shares the fleet-mutation lock with update_apply/apply", async () => {
+    const slowStub = join(tmp, "switchroom-rollout-slow.sh");
+    writeFileSync(slowStub, `#!/bin/sh\nsleep 1\nexit 0\n`);
+    chmodSync(slowStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: slowStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    const first = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-lock-1", args: { pin: "v0.15.18" } },
+    );
+    expect(first.result).toBe("started");
+
+    // A concurrent update_apply is blocked by the SAME shared lock.
+    const blocked = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "update_apply", request_id: "ro-lock-2", args: {} },
+    );
+    expect(blocked.result).toBe("denied");
+    expect(blocked.error).toMatch(/fleet-mutation lock held/);
+    expect(blocked.error).toMatch(/ro-lock-1/);
+
+    await new Promise((r) => setTimeout(r, 1500));
+  });
+
   // ── Phase 3 admin observability — agent_logs / agent_exec ─────────────
   it("agent_logs: shells out to docker and returns stdout_tail (admin cross-agent)", async () => {
     // Swap to a "docker" stub that echoes its argv so we can assert
@@ -1518,5 +1702,165 @@ describe("hostd server — dashboard read-ops (agent_status / agent_schedule)", 
       { v: 1, op: "agent_schedule", request_id: "ro-sc-3", args: {} },
     );
     expect(resp.result).toBe("denied");
+  });
+});
+
+// ── #2487 item 7 — orphaned-`started`-row reconcile guard on boot ─────────
+describe("hostd server — orphaned-started-row reconcile (#2487)", () => {
+  let otmp: string;
+  let ostub: string;
+  let auditPath: string;
+
+  function seedRow(row: Record<string, unknown>): void {
+    appendFileSync(auditPath, JSON.stringify(row) + "\n");
+  }
+
+  function readRows(): Record<string, unknown>[] {
+    return readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  }
+
+  beforeEach(() => {
+    otmp = mkdtempSync(join(tmpdir(), "hostd-orphan-"));
+    ostub = join(otmp, "stub.sh");
+    writeFileSync(ostub, `#!/bin/sh\nexit 0\n`);
+    chmodSync(ostub, 0o755);
+    auditPath = join(otmp, "audit.log");
+  });
+
+  afterEach(async () => {
+    if (server) await server.stop();
+    rmSync(otmp, { recursive: true, force: true });
+  });
+
+  async function bootServer(): Promise<void> {
+    server = new HostdServer({
+      homeDir: otmp,
+      agentUids: { klanker: 10001 },
+      config: { agents: { klanker: { admin: true } } },
+      switchroomBin: ostub,
+      auditLogPath: auditPath,
+      allowNonLinux: true,
+    });
+    await server.start();
+  }
+
+  it("emits a rollout_orphaned terminal row for a stale rollout `started` with no terminal", async () => {
+    const old = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30m ago
+    seedRow({
+      ts: old,
+      op: "rollout",
+      caller: { kind: "agent", name: "klanker" },
+      request_id: "orphan-1",
+      result: "started",
+      exit_code: null,
+      duration_ms: 0,
+    });
+
+    await bootServer();
+
+    const synth = readRows().find(
+      (r) => r.request_id === "orphan-1" && r.phase === "orphan_reconciled",
+    );
+    expect(synth).toBeDefined();
+    expect(synth!.op).toBe("rollout_orphaned");
+    expect(synth!.result).toBe("error");
+    expect(synth!.original_op).toBe("rollout");
+  });
+
+  it("emits update_failed for a stale update_apply orphan", async () => {
+    const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    seedRow({
+      ts: old,
+      op: "update_apply",
+      caller: { kind: "operator" },
+      request_id: "orphan-ua",
+      result: "started",
+      exit_code: null,
+      duration_ms: 0,
+    });
+
+    await bootServer();
+
+    const synth = readRows().find(
+      (r) => r.request_id === "orphan-ua" && r.phase === "orphan_reconciled",
+    );
+    expect(synth).toBeDefined();
+    expect(synth!.op).toBe("update_failed");
+  });
+
+  it("does NOT flag a started row that already has a terminal row", async () => {
+    const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    seedRow({
+      ts: old,
+      op: "rollout",
+      caller: { kind: "agent", name: "klanker" },
+      request_id: "done-1",
+      result: "started",
+      exit_code: null,
+      duration_ms: 0,
+    });
+    seedRow({
+      ts: old,
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "agent", name: "klanker" },
+      request_id: "done-1",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 1000,
+    });
+
+    await bootServer();
+
+    const synth = readRows().find(
+      (r) => r.request_id === "done-1" && r.phase === "orphan_reconciled",
+    );
+    expect(synth).toBeUndefined();
+  });
+
+  it("does NOT flag a started row that is too fresh (< 15m)", async () => {
+    const recent = new Date(Date.now() - 60 * 1000).toISOString(); // 1m ago
+    seedRow({
+      ts: recent,
+      op: "rollout",
+      caller: { kind: "agent", name: "klanker" },
+      request_id: "fresh-1",
+      result: "started",
+      exit_code: null,
+      duration_ms: 0,
+    });
+
+    await bootServer();
+
+    const synth = readRows().find(
+      (r) => r.request_id === "fresh-1" && r.phase === "orphan_reconciled",
+    );
+    expect(synth).toBeUndefined();
+  });
+
+  it("is idempotent — a second boot does NOT re-emit for an already-reconciled orphan", async () => {
+    const old = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    seedRow({
+      ts: old,
+      op: "rollout",
+      caller: { kind: "agent", name: "klanker" },
+      request_id: "orphan-idem",
+      result: "started",
+      exit_code: null,
+      duration_ms: 0,
+    });
+
+    await bootServer();
+    await server.stop();
+    await bootServer(); // second boot
+
+    const synthRows = readRows().filter(
+      (r) => r.request_id === "orphan-idem" && r.phase === "orphan_reconciled",
+    );
+    expect(synthRows).toHaveLength(1); // exactly one, not two
   });
 });
