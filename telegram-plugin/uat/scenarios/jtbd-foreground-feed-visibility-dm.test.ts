@@ -12,19 +12,39 @@
  *   - `SILENCE_LIVENESS_PRODUCTION` ON (the default): a new tool-activity label
  *     appearing on the feed, or an answer-stream draft update.
  *
- * What `SILENCE_LIVENESS_PRODUCTION` does NOT cover is the model's own
- * thinking gap BETWEEN tools — the window after a `tool_result` is consumed
- * and before the next `tool_use` is emitted. During that gap the model is
- * composing, not emitting events, and `noteProduction` is never called. On a
- * slow-reasoning turn (deep research, or a prompt that deliberately paces
- * several steps over ~30 s) those thinking gaps can silently accumulate past a
- * short fallback threshold. When the threshold fires, `onFrameworkFallback`
- * nulls `currentTurn`, which darkens the live activity-feed message mid-turn
- * even though the agent is still working.
+ * Crucially, every render resets the clock to ZERO — so the failure is NOT
+ * cumulative across many short gaps. The feed only darkens on a SINGLE
+ * continuous no-render window longer than the threshold. Heartbeat edits keep
+ * the message visually advancing but do NOT count as liveness, so they do not
+ * reset the clock; only a real tool-label render or an answer-stream draft does.
  *
- * This scenario shrinks the fallback to 20 s via
+ * This file is the DETERMINISTIC guard half of the pair. The fleet runs
+ * `SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1` (set in defaults.env — it is the
+ * fleet default, despite a stale gateway.ts comment that still says "OFF, canary
+ * on marko"). With the defer ON, a single long IN-FLIGHT tool does NOT trip the
+ * base fallback: the defer holds it back while the tool runs (up to the hard
+ * ceiling, default 15 min) and the feed heartbeat keeps editing the live
+ * message. So the CORRECT behaviour for a long in-flight turn is: the feed stays
+ * lit. This guard pins exactly that. A regression that breaks the defer, stops
+ * the heartbeat, or nulls `currentTurn` for an in-flight turn darkens the feed,
+ * and this test catches it.
+ *
+ * The workload is one ~35 s no-output command (`sleep 35`) — well under the
+ * default 15 min hard ceiling — so under prod config the feed must stay live
+ * across the shrunk 20 s base fallback. A prompt of several FAST steps would not
+ * exercise the silence window at all (each tool start re-renders and resets the
+ * clock); one long stretch is what holds the clock open.
+ *
+ * This guard does NOT reproduce #680's exact trigger — silent model thinking
+ * BETWEEN tools, with no tool in-flight. The defer does not cover that vector
+ * and it cannot be forced deterministically; it lives in the sibling best-effort
+ * scenario `jtbd-foreground-feed-thinkgap-dm.test.ts`. Together the pair covers
+ * the feed-visibility invariant deterministically (here) and the true #680
+ * vector best-effort (there).
+ *
+ * This scenario shrinks the base fallback to 20 s via
  * `SWITCHROOM_SILENCE_FALLBACK_MS=20000` on the test-harness agent so the
- * regression is reproducible in a test window without waiting 5 minutes.
+ * window is exercised within a test budget instead of 5 minutes.
  *
  * ## Required env precondition (operator must set on test-harness agent)
  *
@@ -140,28 +160,36 @@ const MIN_ANSWER_CHARS = 150;
 const OVERALL_BUDGET_MS = 150_000;
 
 /**
- * Prompt designed to produce 4–6 sequential FOREGROUND tool calls with
- * short thinking gaps between them, spanning ~30–40 s total. Each step is
- * a quick shell command so the gap is model thinking, not tool wall-clock.
- * The explicit "one at a time" + "brief note" pattern mirrors the
- * jtbd-worker-activity-feed pacing: it prevents the model from batching all
- * calls in one burst (which would eliminate the between-tool thinking gap
- * that the regression window lives in).
+ * Workload prompt: one ~33 s no-output command, `timeout 33 tail -f /dev/null`.
+ * NOTE: standalone `sleep` is blocked by the Claude Code harness ("foreground
+ * sleep is blocked"), so this is the hook-safe equivalent of a long in-flight
+ * no-op. The tool's label renders once at its start (resetting the clock to
+ * zero), then nothing renders for ~33 s while the tool is in-flight. Under prod
+ * config (defer ON) the base fallback is HELD during that in-flight stretch, so
+ * the feed must stay live and the heartbeat keeps editing it. That is the
+ * invariant this guard asserts; a regression that lets `currentTurn` get nulled
+ * mid-stretch breaks it.
  *
- * We do NOT use run_in_background here — this must be a FOREGROUND turn so
+ * The prompt explicitly asks the model to give the Bash call a short
+ * DESCRIPTION. That matters: an empty-label tool is dropped from the activity
+ * feed (it never opens), which would fail the test on "feed never appeared"
+ * (shape a) for the wrong reason. A labelled tool opens the feed reliably.
+ *
+ * Why not several fast steps: each fast tool start emits a fresh label that
+ * resets the clock, so the silence window never opens at all and the test would
+ * pass vacuously (a false green). One long stretch is what holds it open.
+ *
+ * We do NOT use run_in_background — this must be a FOREGROUND turn so
  * currentTurn stays in place and the silence clock applies to it directly.
  */
 const SEQUENTIAL_WORK_PROMPT =
-  "Please do exactly the following steps IN ORDER, one at a time. " +
-  "Before each step, write a one-sentence note about what you are about to do, " +
-  "then run the command via the Bash tool as a SEPARATE call — never chain steps " +
-  "together or run them in parallel. " +
-  "Step 1: check the current date and time with `date`. " +
-  "Step 2: list the number of files in /etc with `ls /etc | wc -l`. " +
-  "Step 3: check system uptime with `uptime`. " +
-  "Step 4: show the kernel version with `uname -r`. " +
-  "Step 5: show how much memory is free with `free -h | head -2`. " +
-  "After all five steps, send me a short paragraph summarising what you found.";
+  "Use the Bash tool to run EXACTLY this command — and give the tool call a " +
+  'short description such as "long-running wait" so it is clearly labelled: ' +
+  "`timeout 33 tail -f /dev/null`. It runs for about 33 seconds and then exits " +
+  "on its own (a non-zero timeout exit code is expected and fine). Do not run " +
+  "any other tool while it is running. After it finishes, reply with a short " +
+  "paragraph (a few sentences) telling me it completed and that you waited " +
+  "about 33 seconds.";
 
 describe("uat: foreground activity-feed visibility across silence-fallback threshold", () => {
   it(
@@ -236,10 +264,13 @@ describe("uat: foreground activity-feed visibility across silence-fallback thres
 
         // ── Snapshot before the fallback mark ───────────────────────────────
         // Record the feed body and clock, then wait FALLBACK_WINDOW_MS so the
-        // shrunk silence-fallback threshold has definitely elapsed. During this
-        // wait the model is doing its between-tool thinking — precisely the gap
-        // that SILENCE_LIVENESS_PRODUCTION does NOT cover — so the fallback
-        // timer is counting down.
+        // shrunk base fallback has definitely elapsed. During this wait the
+        // single in-flight stretch (`sleep 35`) emits no renders, but the defer
+        // (prod default ON) HOLDS the base fallback while the tool is in-flight,
+        // so currentTurn survives and the feed heartbeat keeps editing the
+        // message. We assert those heartbeat edits keep landing after the mark;
+        // if a regression nulls currentTurn mid-stretch, the edits stop and we
+        // catch it.
         const beforeMarkText = feedMsg!.text;
         const markAt = Date.now() + FALLBACK_WINDOW_MS;
 
@@ -268,7 +299,7 @@ describe("uat: foreground activity-feed visibility across silence-fallback thres
             "currentTurn was nulled mid-turn by the silence-fallback handler, " +
             "which then triggered clearActivitySummary and removed the live feed " +
             "message. The regression: a productive foreground turn went dark " +
-            "because thinking-gaps between tool calls accumulated past the " +
+            "because a continuous no-render window exceeded the " +
             `shrunk threshold (SWITCHROOM_SILENCE_FALLBACK_MS=${PRECONDITION_FALLBACK_MS}).`,
         ).not.toBeNull();
 

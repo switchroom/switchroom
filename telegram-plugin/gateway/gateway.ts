@@ -5259,8 +5259,12 @@ let inFlightUpdate: { requestId: string; startedAt: number } | null = null
 //   SWITCHROOM_SILENCE_FALLBACK_MS         — base threshold (default 300000)
 //   SWITCHROOM_SILENCE_FALLBACK_HARD_MS    — hard ceiling for the in-flight-tool
 //                                            defer (default 900000 = 15min)
-//   SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1 — enable the defer (default OFF;
-//                                            canary on marko against #2162 telemetry)
+//   SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=1 — enable the defer. NOTE: this is
+//                                            now set fleet-wide in defaults.env
+//                                            (was a marko canary against #2162;
+//                                            promoted to the fleet default). The
+//                                            code default below is still OFF, so
+//                                            the live behaviour comes from config.
 function parsePositiveMsEnv(name: string, fallbackMs: number): number {
   const raw = process.env[name]
   if (raw == null || raw === '') return fallbackMs
