@@ -82,6 +82,19 @@ const SEVERITY_RANK: Record<AuthSeverity, number> = {
 };
 
 /**
+ * Warn about a missing refresh token only when the access token is
+ * actually expiring soon. Modern Claude Pro/Max subscription OAuth
+ * issues long-lived access tokens (~317 days) with NO refresh token by
+ * design — this is the current steady state for every subscription-
+ * authenticated agent. Emitting a "renew before they expire" warning on
+ * every boot for a token valid for ~10 months is noise, not signal.
+ *
+ * 14 days gives the operator comfortable runway to re-auth before the
+ * token lapses while keeping boots quiet for the common long-lived case.
+ */
+const REFRESH_TOKEN_WARN_WITHIN_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
+
+/**
  * Inspect an agent's `.credentials.json` and return a structured
  * diagnosis. Pure read; no side effects. Used by the boot-self-test
  * issue card path and by `tests/auth-heal-diagnose.test.ts`.
@@ -166,7 +179,16 @@ export function diagnoseAuthState(claudeConfigDir: string): AuthDiagnosis {
             summary: "credentials file has invalid expiry — send /auth in this chat to reset",
           });
         }
-        if (!oauth.refreshToken || oauth.refreshToken.length === 0) {
+        // Only warn about a missing refresh token when the access token
+        // is actually expiring soon. Long-lived subscription OAuth tokens
+        // (~317 days, no refresh token by design) should not trigger this
+        // warning on every boot — it fires only when renewal is genuinely
+        // imminent (within REFRESH_TOKEN_WARN_WITHIN_MS).
+        const expiresAtValid =
+          typeof expiresAt === "number" && Number.isFinite(expiresAt);
+        const expiringSoon =
+          !expiresAtValid || expiresAt < Date.now() + REFRESH_TOKEN_WARN_WITHIN_MS;
+        if ((!oauth.refreshToken || oauth.refreshToken.length === 0) && expiringSoon) {
           findings.push({
             code: "refresh_token_missing",
             severity: "warn",
