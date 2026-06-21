@@ -30,6 +30,8 @@ const NONE: WindowSnapshot = {
   weeklyResetAt: null,
   source: "none",
   overageServeBlocking: false,
+  overageReason: null,
+  probeThin: false,
 };
 
 describe("formatDuration", () => {
@@ -169,6 +171,109 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
         now: NOW,
       }),
     ).toBe("healthy");
+  });
+
+  // ── #2494 Bug A — refill-aware classification ──────────────────────────
+  it("Bug A: a pre-refill snapshot read AFTER its 5h reset → healthy", () => {
+    // Snapshot captured at 100% on a 5h window whose reset is 5 min IN THE PAST
+    // relative to `now`: the window has rolled, so it must read healthy.
+    const pastReset = new Date(NOW.getTime() - 5 * 60_000);
+    expect(
+      classifyState({
+        exhausted: true,
+        exhaustedUntil: pastReset,
+        window: win({ fiveHourPct: 100, fiveHourResetAt: pastReset, weeklyPct: 1, source: "live" }),
+        now: NOW,
+      }),
+    ).toBe("healthy");
+  });
+
+  it("Bug A: a maxed weekly whose reset has PASSED → healthy (window refilled)", () => {
+    const pastWeekly = new Date(NOW.getTime() - 60_000);
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({ weeklyPct: 100, weeklyResetAt: pastWeekly, fiveHourPct: 2, source: "live" }),
+        now: NOW,
+      }),
+    ).toBe("healthy");
+  });
+
+  // ── #2494 Bug C — recoverable quota-exhausted vs billing-dead ──────────
+  it("Bug C: maxed 5h with a FUTURE reset → quota-exhausted (recoverable), NOT out-of-credits", () => {
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({ fiveHourPct: 100, fiveHourResetAt: FIVE_RESET, weeklyPct: 10, source: "live" }),
+        now: NOW,
+      }),
+    ).toBe("quota-exhausted");
+  });
+
+  it("Bug C: out_of_credits (billing-dead) is distinct from quota-exhausted", () => {
+    // Same maxed 5h window, but a serve-blocking overage reason: billing-dead wins.
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({
+          fiveHourPct: 100,
+          fiveHourResetAt: FIVE_RESET,
+          overageServeBlocking: true,
+          overageReason: "out_of_credits",
+        }),
+        now: NOW,
+      }),
+    ).toBe("out-of-credits");
+  });
+
+  it("Bug C: a thin/headerless probe → unprobed (renders unknown), never a confident 0%", () => {
+    expect(
+      classifyState({
+        exhausted: false,
+        exhaustedUntil: null,
+        window: win({ fiveHourPct: 0, weeklyPct: 0, source: "live", probeThin: true }),
+        now: NOW,
+      }),
+    ).toBe("unprobed");
+  });
+});
+
+describe("#2494 — formatStateCell quota-exhausted vs billing-dead, cells refill/thin-aware", () => {
+  const baseRow = (window: WindowSnapshot, state: ScheduleRow["state"]): ScheduleRow => ({
+    label: "x",
+    isActive: false,
+    fallbackRank: 2,
+    window,
+    exhausted: false,
+    exhaustedUntil: null,
+    state,
+  });
+
+  it("quota-exhausted shows a 5h reset countdown", () => {
+    const cell = formatStateCell(
+      baseRow(
+        { ...NONE, fiveHourPct: 100, fiveHourResetAt: FIVE_RESET, source: "live" },
+        "quota-exhausted",
+      ),
+      NOW,
+    );
+    expect(cell).toContain("quota-exhausted");
+    expect(cell).toMatch(/\d+[hm]/); // has a countdown
+  });
+
+  it("thin probe renders 5h/weekly cells as 'unknown', not 0%", () => {
+    const w: WindowSnapshot = { ...NONE, fiveHourPct: 0, weeklyPct: 0, source: "live", probeThin: true };
+    expect(formatFiveHourCell(w, NOW)).toBe("unknown");
+    expect(formatWeeklyCell(w, NOW)).toBe("unknown");
+  });
+
+  it("refilled 5h cell reads 0% even when the snapshot captured 100%", () => {
+    const pastReset = new Date(NOW.getTime() - 60_000);
+    const w: WindowSnapshot = { ...NONE, fiveHourPct: 100, fiveHourResetAt: pastReset, source: "live" };
+    expect(formatFiveHourCell(w, NOW)).toContain("0%");
   });
 });
 
@@ -320,6 +425,8 @@ describe("formatStateCell horizon", () => {
         weeklyResetAt: new Date("2026-06-09T19:00:00Z"),
         source: "live",
         overageServeBlocking: false,
+        overageReason: null,
+        probeThin: false,
       },
       exhausted: true,
       exhaustedUntil: new Date("2026-06-07T06:27:00Z"),
@@ -331,17 +438,28 @@ describe("formatStateCell horizon", () => {
     expect(cell).not.toContain("27m");
   });
 
-  it("renders the out-of-credits state (no countdown horizon)", () => {
+  it("renders the out-of-credits state as billing-dead with the real reason (no timer)", () => {
+    // #2494 Bug C — billing-dead renders "billing disabled (<reason>)", NOT a
+    // countdown: it does not recover on a window roll.
     const row: ScheduleRow = {
       label: "x",
       isActive: false,
       fallbackRank: 2,
-      window: { ...NONE, fiveHourPct: 0, weeklyPct: 0, source: "live", overageServeBlocking: true },
+      window: {
+        ...NONE,
+        fiveHourPct: 0,
+        weeklyPct: 0,
+        source: "live",
+        overageServeBlocking: true,
+        overageReason: "out_of_credits",
+      },
       exhausted: false,
       exhaustedUntil: null,
       state: "out-of-credits",
     };
-    expect(formatStateCell(row, NOW)).toBe("out-of-credits");
+    const cell = formatStateCell(row, NOW);
+    expect(cell).toBe("billing disabled (out_of_credits)");
+    expect(cell).not.toMatch(/\d+[dhm]/); // no countdown
   });
 });
 

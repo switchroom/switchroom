@@ -185,6 +185,9 @@ interface LastQuotaEntry {
   overageDisabledReason: string | null;
   /** Unix ms when this snapshot was captured. */
   capturedAt: number;
+  /** #2494 Bug C — which util windows were present in the probe headers. */
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
 }
 
 interface LastQuotaCache {
@@ -1296,6 +1299,8 @@ export class AuthBroker {
       overageStatus: result.data.overageStatus,
       overageDisabledReason: result.data.overageDisabledReason,
       capturedAt: this.now(),
+      fiveHourUtilPresent: result.data.fiveHourUtilPresent,
+      sevenDayUtilPresent: result.data.sevenDayUtilPresent,
     };
     this.lastQuotaCache[label] = snapshot;
     // Self-heal: a fresh, clearly-healthy probe (both windows well under the

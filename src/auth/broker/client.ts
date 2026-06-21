@@ -155,6 +155,14 @@ export interface LastQuotaSnapshot {
   overageDisabledReason: string | null;
   /** Unix ms when this snapshot was captured by the broker. */
   capturedAt: number;
+  /**
+   * #2494 Bug C — which utilization windows were actually present in the probe
+   * headers. Optional: a snapshot that predates the field (or a real probe
+   * that measured 0%) leaves them unset, which is read as "present". A thin
+   * probe (both explicitly false) renders as `unknown`, never a confident 0%.
+   */
+  fiveHourUtilPresent?: boolean;
+  sevenDayUtilPresent?: boolean;
 }
 
 export interface AccountState {
@@ -218,6 +226,9 @@ export interface ProbeQuotaEntry {
           representativeClaim: string | null;
           overageStatus: string | null;
           overageDisabledReason: string | null;
+          // #2494 Bug C — header-presence markers (see LastQuotaSnapshot).
+          fiveHourUtilPresent?: boolean;
+          sevenDayUtilPresent?: boolean;
         };
       }
     | { ok: false; reason: string };
