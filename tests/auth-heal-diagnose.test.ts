@@ -11,12 +11,13 @@ import { diagnoseAuthState } from "../src/cli/auth.js";
  * every state transition without spawning subprocesses.
  *
  * Severity rules under test:
- *   - everything missing on disk           → error
- *   - .credentials.json missing, .oauth-token present → warn
- *   - .credentials.json malformed/corrupt  → error
- *   - access token expired                 → error
- *   - refreshToken missing                 → warn
- *   - everything healthy + future expiry   → ok
+ *   - everything missing on disk                          → error
+ *   - .credentials.json missing, .oauth-token present     → warn
+ *   - .credentials.json malformed/corrupt                 → error
+ *   - access token expired                                → error
+ *   - refreshToken missing + token expiring within 14d    → warn
+ *   - refreshToken missing + long-lived token (>14d out)  → ok (no false positive)
+ *   - everything healthy + future expiry                  → ok
  */
 
 let configDir: string;
@@ -105,7 +106,8 @@ describe("diagnoseAuthState", () => {
     expect(expired!.summary).toMatch(/\/auth/);
   });
 
-  it("flags missing refreshToken as warn/refresh_token_missing", () => {
+  it("flags missing refreshToken as warn/refresh_token_missing when token expires soon (1h)", () => {
+    // Token expiring in 1 hour with no refresh token → genuine renewal risk → warn.
     writeCreds({
       claudeAiOauth: {
         accessToken: "tok",
@@ -118,6 +120,36 @@ describe("diagnoseAuthState", () => {
     expect(
       r.findings.find((f) => f.code === "refresh_token_missing"),
     ).toBeDefined();
+  });
+
+  it("flags missing refreshToken as warn/refresh_token_missing when token expires within 14d (3d)", () => {
+    // Token expiring in 3 days with no refresh token → still within the warning window → warn.
+    writeCreds({
+      claudeAiOauth: {
+        accessToken: "tok",
+        expiresAt: Date.now() + 3 * 86_400_000, // 3 days
+      },
+    });
+    const r = diagnoseAuthState(configDir);
+    expect(r.severity).toBe("warn");
+    expect(r.findings.find((f) => f.code === "refresh_token_missing")).toBeDefined();
+  });
+
+  it("suppresses refresh_token_missing for long-lived subscription token (300d, no refreshToken)", () => {
+    // Regression: Claude Pro/Max subscription OAuth issues ~317-day tokens with
+    // no refresh token by design. This warning was firing on every boot for every
+    // agent, which is misleading when the token is valid for ~10 months.
+    // expiresAt = 300 days out, no refreshToken → severity ok, no findings.
+    writeCreds({
+      claudeAiOauth: {
+        accessToken: "tok",
+        expiresAt: Date.now() + 300 * 86_400_000, // 300 days
+      },
+    });
+    const r = diagnoseAuthState(configDir);
+    expect(r.severity).toBe("ok");
+    expect(r.findings).toHaveLength(0);
+    expect(r.recommendation).toHaveLength(0);
   });
 
   it("returns ok with no findings when state is fully healthy", () => {
