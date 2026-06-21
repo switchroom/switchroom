@@ -427,6 +427,40 @@ describe("evaluateFleetAllExhausted", () => {
     if (d.kind === "skip") expect(d.reason).toBe("probe-blind");
   });
 
+  it("skips (probe-blind) when a probe is FUTURE-dated beyond the clock-skew tolerance (#2479 nit)", () => {
+    // A future-dated capturedAt makes `now - capturedAt` negative, which would
+    // slip under the staleness ceiling and read as fresh. The clock-skew guard
+    // (mirrored from broker `snapshotFresh`: capturedAt <= now + 60_000) must
+    // reject it so a skewed snapshot does NOT corroborate exhaustion.
+    const futureProbe = () => ({ capturedAt: NOW + 60_000 + 1 }); // 1ms past tolerance
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, exhausted_until: NOW + 5_000, last_quota: futureProbe() },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") expect(d.reason).toBe("probe-blind");
+  });
+
+  it("notifies (entered) when a probe is future-dated WITHIN the skew tolerance (boundary)", () => {
+    // Exactly +60_000 ms is within tolerance and still negative-age fresh — it
+    // must count as a fresh live probe (proves the guard is a future-dating
+    // skew allowance, not an outright rejection of any future timestamp).
+    const d = evaluateFleetAllExhausted({
+      accounts: [
+        { label: "a", exhausted: true, exhausted_until: NOW + 5_000, last_quota: { capturedAt: NOW + 60_000 } },
+      ],
+      prev: notAlerting,
+      now: NOW,
+      tuning: gate,
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind === "notify") expect(d.transition).toBe("entered");
+  });
+
   it("notifies (entered) on a genuine serve-blocking overage (out_of_credits) with a fresh probe", () => {
     const d = evaluateFleetAllExhausted({
       accounts: [
