@@ -129,6 +129,22 @@ interface UpdateOptions {
   /** Config path for the default pin persister (default: resolved
    *  switchroom.yaml). Test seam. */
   configPath?: string;
+  /**
+   * True when this update run is driven by the hostd `update_apply` RPC
+   * (i.e. the process was spawned with `SWITCHROOM_HOSTD_CONTEXT=1`).
+   *
+   * In this context the update driver CANNOT recreate the hostd container
+   * (that would SIGKILL itself mid-run) or the web container (same compose
+   * project risk). Both steps are given a `skipReason` so they are deferred
+   * and the sentinel line at the end tells the server which steps were
+   * deferred. The operator must finish those host-side via
+   * `switchroom hostd install` / `webd install`.
+   *
+   * Default: auto-detected via `isHostdContext()` (checks
+   * `process.env.SWITCHROOM_HOSTD_CONTEXT === "1"`). Test seam: supply
+   * `true`/`false` explicitly to avoid touching the real process env.
+   */
+  hostdContext?: boolean;
 }
 
 interface UpdateStep {
@@ -231,6 +247,78 @@ export function rebuildRefusalMessage(scriptPath: string): string | null {
 }
 
 /**
+ * True when the running update was spawned BY the hostd `update_apply`
+ * RPC handler — hostd injects `SWITCHROOM_HOSTD_CONTEXT=1` into the
+ * child's env to signal this. In that context the driver must NOT
+ * recreate the hostd container (it would SIGKILL itself) or the web
+ * container (same compose-project risk). Both steps are deferred and
+ * the caller is expected to finish them host-side.
+ *
+ * Accepts the env as an optional arg so unit tests can exercise it
+ * without mutating the real process env.
+ *
+ * Exported so the server and tests can import it directly.
+ */
+export function isHostdContext(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SWITCHROOM_HOSTD_CONTEXT === "1";
+}
+
+/**
+ * The sentinel prefix emitted as the LAST stdout line by `runUpdate`
+ * when one or more steps were deferred due to running in hostd-context
+ * (#2458). The server parses this line to extract structured
+ * `{ ok, deferred }` without scraping human output.
+ *
+ * Format: `SWITCHROOM_UPDATE_RESULT:<json>`
+ */
+export const UPDATE_RESULT_SENTINEL = "SWITCHROOM_UPDATE_RESULT:";
+
+/**
+ * Encode a `{ ok, deferred }` result into the sentinel line that
+ * `runUpdate` emits and the server parses.
+ */
+export function encodeUpdateResultLine(payload: {
+  ok: boolean;
+  deferred: string[];
+}): string {
+  return `${UPDATE_RESULT_SENTINEL}${JSON.stringify(payload)}`;
+}
+
+/**
+ * Parse the sentinel line from the captured stdout of a spawned update
+ * driver. Returns `null` when the sentinel is absent (non-hostd-context
+ * run, older driver) or malformed.
+ *
+ * Searches from the END of stdout so intermediate "SWITCHROOM_UPDATE_RESULT:"
+ * substrings in step output can't shadow the final sentinel.
+ */
+export function parseUpdateResultLine(stdout: string): {
+  ok: boolean;
+  deferred: string[];
+} | null {
+  const idx = stdout.lastIndexOf(UPDATE_RESULT_SENTINEL);
+  if (idx === -1) return null;
+  const raw = stdout.slice(idx + UPDATE_RESULT_SENTINEL.length).split("\n")[0];
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      "ok" in parsed &&
+      "deferred" in parsed &&
+      typeof (parsed as { ok: unknown }).ok === "boolean" &&
+      Array.isArray((parsed as { deferred: unknown }).deferred)
+    ) {
+      return parsed as { ok: boolean; deferred: string[] };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Build the ordered list of update steps. Pure function — no side
  * effects. The action handler iterates this list and either prints
  * (--check) or executes (default).
@@ -240,6 +328,12 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
   const runner = opts.runner ?? defaultRunner;
   const scriptPath = opts.scriptPath ?? process.argv[1] ?? "";
   const steps: UpdateStep[] = [];
+  // Resolve whether we are running inside the hostd container. When true,
+  // refresh-hostd and refresh-web are deferred (cannot recreate the very
+  // container that spawned us — SIGKILL mid-run). The sentinel line at the
+  // end of runUpdate tells the server which steps were deferred.
+  const hostdContext =
+    typeof opts.hostdContext === "boolean" ? opts.hostdContext : isHostdContext();
 
   // When --channel / --pin is set, the resolved image tag in compose
   // needs to change BEFORE pull-images runs (so `docker compose pull`
@@ -391,7 +485,9 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       ? "host_control.enabled is not true — daemon not in use"
       : opts.skipImages
         ? "--skip-images flag set"
-        : undefined,
+        : hostdContext
+          ? "deferred (hostd-context): finish host-side via `switchroom hostd install` — update_apply cannot recreate its own hostd container without SIGKILLing itself (#2458)"
+          : undefined,
     run: () => {
       const r = runner(process.execPath, [scriptPath, "hostd", "install"]);
       if (r.status !== 0) throw new Error("switchroom hostd install failed");
@@ -432,7 +528,9 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
       ? "web_service.managed is not true — web container not in use (legacy systemd unit)"
       : opts.skipImages
         ? "--skip-images flag set"
-        : undefined,
+        : hostdContext
+          ? "deferred (hostd-context): finish host-side via `switchroom webd install` — update_apply cannot recreate the web container without SIGKILLing the hostd container it shares a compose project with (#2458)"
+          : undefined,
     run: () => {
       const r = runner(process.execPath, [scriptPath, "webd", "install"]);
       if (r.status !== 0) throw new Error("switchroom webd install failed");
@@ -1016,10 +1114,26 @@ async function runUpdate(opts: UpdateOptions): Promise<number> {
       stderr(
         chalk.red(`✗ ${step.name} failed: ${(err as Error).message}\n`),
       );
+      // Even on failure, emit the sentinel if any deferred steps exist so
+      // the server can record which steps were left pending (#2458).
+      const deferredOnFailure = steps
+        .filter((s) => s.skipReason?.includes("deferred"))
+        .map((s) => s.name);
+      if (deferredOnFailure.length > 0) {
+        stdout(encodeUpdateResultLine({ ok: false, deferred: deferredOnFailure }) + "\n");
+      }
       return 1;
     }
   }
   stdout(chalk.green("\n✓ update complete\n"));
+  // Emit the structured sentinel when any steps were deferred so the server
+  // can populate StatusEntry.deferred without parsing human output (#2458).
+  const deferred = steps
+    .filter((s) => s.skipReason?.includes("deferred"))
+    .map((s) => s.name);
+  if (deferred.length > 0) {
+    stdout(encodeUpdateResultLine({ ok: true, deferred }) + "\n");
+  }
   return 0;
 }
 
