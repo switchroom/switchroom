@@ -40,12 +40,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mekenthompson/switchroom.git",
+    "url": "https://github.com/switchroom/switchroom.git",
     "directory": "telegram-plugin"
   },
-  "homepage": "https://github.com/mekenthompson/switchroom/tree/main/telegram-plugin#readme",
+  "homepage": "https://github.com/switchroom/switchroom/tree/main/telegram-plugin#readme",
   "bugs": {
-    "url": "https://github.com/mekenthompson/switchroom/issues"
+    "url": "https://github.com/switchroom/switchroom/issues"
   },
   "publishConfig": {
     "access": "public"

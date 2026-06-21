@@ -6,8 +6,8 @@
     "name": "Ken Thompson",
     "email": "me@kenthompson.com.au"
   },
-  "homepage": "https://github.com/mekenthompson/switchroom",
-  "repository": "https://github.com/mekenthompson/switchroom",
+  "homepage": "https://github.com/switchroom/switchroom",
+  "repository": "https://github.com/switchroom/switchroom",
   "license": "MIT",
   "keywords": [
     "telegram",
