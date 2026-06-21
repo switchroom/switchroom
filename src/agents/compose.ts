@@ -849,17 +849,19 @@ function conditionalMountPresent(
     if (!isAbsolute(target)) target = resolve(dirname(probePath), target);
     if (hostHome && probeHome && hostHome !== probeHome) {
       if (target.startsWith(hostHome + "/")) {
-        // The symlink target is host-home-rooted: it unambiguously points at a
-        // real host path. Prefer verifying the translated (probe-home) path
-        // when it's reachable. But if it isn't — e.g. hostd only mounts
-        // ~/.switchroom, not ~/.switchroom-config — trust the symlink anyway.
-        // Docker resolves symlinks host-side at bind-mount time, so the mount
-        // source is valid as long as the symlink itself exists (which lstatSync
-        // above already confirmed).
-        const translated = probeHome + target.slice(hostHome.length);
-        if (existsSync(translated)) return true;
-        // Translated path not reachable inside this container, but the symlink
-        // points at a host-rooted path — docker will find it at mount time.
+        // The symlink target is host-rooted, so docker will resolve it on the
+        // host at bind-mount time and the mount source is valid. The generator
+        // runs inside hostd, which only mounts ~/.switchroom/ and cannot stat
+        // the symlink's real host target — so we cannot distinguish a live
+        // target from a dangling one from here. "Trust it" is the only workable
+        // choice.
+        //
+        // ACCEPTED TRADEOFF: a symlink whose host target is genuinely missing
+        // will cause `docker compose up` to hard-fail (agent can't start)
+        // rather than silently drop the mount (agent starts without skills).
+        // That's intentional — switchroom reconcile manages these symlinks, so
+        // a dangling target is not a real production state, and a loud failure
+        // is preferable to a silent capability loss.
         return true;
       }
     }
