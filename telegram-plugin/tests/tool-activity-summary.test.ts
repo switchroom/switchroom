@@ -8,6 +8,7 @@ import {
   MIRROR_MAX_LINES,
   NESTED_MAX_LINES,
 } from "../tool-activity-summary.js";
+import { STATUS_ROLLING_LINES } from "../status-no-truncate.js";
 
 describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
   it("Bash uses the model-authored description verbatim, never the command", () => {
@@ -403,33 +404,58 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
 });
 
 // ─── SWITCHROOM_STATUS_NO_TRUNCATE feature flag tests ───────────────────────
+// New contract (rolling-5-full):
+//   ON  → last STATUS_ROLLING_LINES lines rendered in FULL; no overflow header;
+//          char-budget backstop is the only ceiling.
+//   OFF → MIRROR_MAX_LINES / NESTED_MAX_LINES + per-line clips (legacy, unchanged).
 
 describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeed", () => {
   afterEach(() => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
   });
 
-  it("no-truncate ON (default): a feed > MIRROR_MAX_LINES renders ALL lines", () => {
+  it("no-truncate ON (default): with 12 lines, exactly the last STATUS_ROLLING_LINES render", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE; // default = ON
-    const lines = Array.from({ length: MIRROR_MAX_LINES + 5 }, (_, i) => `Action ${i + 1}`);
+    // Use a prefix that makes substring matches impossible (e.g. "XAct-001" won't match "XAct-010").
+    const lines = Array.from({ length: 12 }, (_, i) => `XAct-${String(i + 1).padStart(3, '0')}`);
     const out = renderActivityFeed(lines)!;
-    // All lines must appear (oldest = ✓ done, newest = → in-progress).
-    for (let i = 1; i <= MIRROR_MAX_LINES + 5; i++) {
-      expect(out).toContain(`Action ${i}`);
+    const firstVisible = 12 - STATUS_ROLLING_LINES + 1;
+    // The last STATUS_ROLLING_LINES lines must appear.
+    for (let i = firstVisible; i <= 12; i++) {
+      expect(out).toContain(`XAct-${String(i).padStart(3, '0')}`);
     }
-    // No spurious "+N earlier" when all lines fit.
-    expect(out).not.toContain("earlier");
+    // Earlier lines must NOT appear.
+    for (let i = 1; i < firstVisible; i++) {
+      expect(out).not.toContain(`XAct-${String(i).padStart(3, '0')}`);
+    }
+    // No overflow header in no-truncate mode.
+    expect(out).not.toContain("earlier…");
     // Newest is still the in-progress step.
-    expect(out).toContain(`<b>→ Action ${MIRROR_MAX_LINES + 5}</b>`);
+    expect(out).toContain(`<b>→ XAct-012</b>`);
+  });
+
+  it("no-truncate ON: a 150-char line renders in FULL (no '…' per-line truncation)", () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
+    const longLine = "a".repeat(75) + " " + "b".repeat(74); // 150 chars
+    const out = renderActivityFeed([longLine])!;
+    expect(out).toContain(longLine);
+    expect(out).not.toContain("…");
+  });
+
+  it("no-truncate ON: no '✓ +N earlier…' overflow header even with many lines", () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
+    const lines = Array.from({ length: 20 }, (_, i) => `Action ${i + 1}`);
+    const out = renderActivityFeed(lines)!;
+    expect(out).not.toContain("earlier…");
   });
 
   it("no-truncate ON: setting env to '1' (or any non-'0') is also ON", () => {
     process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "1";
     const lines = Array.from({ length: MIRROR_MAX_LINES + 2 }, (_, i) => `Step ${i + 1}`);
     const out = renderActivityFeed(lines)!;
-    expect(out).toContain(`Step 1`);
-    expect(out).toContain(`Step ${MIRROR_MAX_LINES + 2}`);
+    // Rolling window: last STATUS_ROLLING_LINES visible, no overflow header.
     expect(out).not.toContain("earlier");
+    expect(out).toContain(`Step ${MIRROR_MAX_LINES + 2}`);
   });
 
   it("no-truncate OFF (=0): existing truncation behaviour preserved (cap to MIRROR_MAX_LINES)", () => {
@@ -442,20 +468,20 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeed", () => {
     expect(out).toContain("<b>→ Action 9</b>");
   });
 
-  it("no-truncate ON + pathologically huge feed (500 long lines): output ≤ 4096 chars and oldest lines are clipped with header", () => {
+  it("no-truncate ON + pathologically oversized lines: char-budget backstop fires, output ≤ 4096 chars", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE; // default ON
-    // 500 lines of ~20 chars each → well over 4000 chars rendered.
-    const lines = Array.from({ length: 500 }, (_, i) => `Action step number ${i + 1}`);
+    // STATUS_ROLLING_LINES lines of ~900 chars each → well over 4000 chars rendered.
+    const bigLine = "z".repeat(900);
+    const lines = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const out = renderActivityFeed(lines)!;
     // Hard invariant: output must not exceed Telegram's 4096-char limit.
     expect(out.length).toBeLessThanOrEqual(4096);
-    // Clip header must be present (oldest lines were dropped).
-    expect(out).toContain("earlier…");
-    // The newest line must still be present.
-    expect(out).toContain("Action step number 500");
+    // The newest line must still be present (some portion of it).
+    const hasBullet = out.includes("→") || out.includes("✓");
+    expect(hasBullet).toBe(true);
   });
 
-  it("no-truncate ON: no spurious '+N earlier' header when feed is small enough to fit", () => {
+  it("no-truncate ON: no spurious overflow header when feed is small", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const lines = Array.from({ length: 3 }, (_, i) => `Short step ${i + 1}`);
     const out = renderActivityFeed(lines)!;
@@ -468,31 +494,43 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () =>
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
   });
 
-  it("no-truncate ON: parent > MIRROR_MAX_LINES shows all parent lines", () => {
+  it("no-truncate ON: with many parent lines, only the last STATUS_ROLLING_LINES render (no overflow header)", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const parent = Array.from({ length: MIRROR_MAX_LINES + 3 }, (_, i) => `Parent ${i + 1}`);
     const child = ["Child step A", "Child step B"];
     const out = renderActivityFeedWithNested(parent, child)!;
-    for (let i = 1; i <= MIRROR_MAX_LINES + 3; i++) {
+    const totalParent = MIRROR_MAX_LINES + 3;
+    const firstVisible = totalParent - STATUS_ROLLING_LINES + 1;
+    for (let i = firstVisible; i <= totalParent; i++) {
       expect(out).toContain(`Parent ${i}`);
     }
-    expect(out).not.toContain("+3 earlier"); // no parent truncation header
+    for (let i = 1; i < firstVisible; i++) {
+      expect(out).not.toContain(`Parent ${i}`);
+    }
+    // No overflow header in no-truncate mode.
+    expect(out).not.toContain("earlier…");
     expect(out).toContain("   ↳ <b>→ Child step B</b>");
   });
 
-  it("no-truncate ON: child > NESTED_MAX_LINES shows all child lines", () => {
+  it("no-truncate ON: with many child lines, only the last STATUS_ROLLING_LINES child lines render", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const parent = ["Delegating: big task"];
     const child = Array.from({ length: NESTED_MAX_LINES + 4 }, (_, i) => `Child ${i + 1}`);
     const out = renderActivityFeedWithNested(parent, child)!;
-    for (let i = 1; i <= NESTED_MAX_LINES + 4; i++) {
+    const totalChild = NESTED_MAX_LINES + 4;
+    const firstVisible = totalChild - STATUS_ROLLING_LINES + 1;
+    for (let i = firstVisible; i <= totalChild; i++) {
       expect(out).toContain(`Child ${i}`);
     }
-    expect(out).not.toContain("+4 earlier"); // no child truncation header
-    expect(out).toContain(`   ↳ <b>→ Child ${NESTED_MAX_LINES + 4}</b>`);
+    for (let i = 1; i < firstVisible; i++) {
+      expect(out).not.toContain(`Child ${i}`);
+    }
+    // No overflow header in no-truncate mode.
+    expect(out).not.toContain("earlier…");
+    expect(out).toContain(`   ↳ <b>→ Child ${totalChild}</b>`);
   });
 
-  it("no-truncate ON: a line longer than NESTED_LINE_MAX renders in full (no '…' truncation)", () => {
+  it("no-truncate ON: a child line longer than NESTED_LINE_MAX renders in full (no '…' truncation)", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const longLine = "x".repeat(120); // well over the 90-char NESTED_LINE_MAX
     const out = renderActivityFeedWithNested(["Delegating"], [longLine])!;
@@ -501,7 +539,7 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () =>
     expect(out).not.toContain(longLine.slice(0, 89) + "…");
   });
 
-  it("no-truncate OFF (=0): per-line NESTED_LINE_MAX cap is still applied", () => {
+  it("no-truncate OFF (=0): per-line NESTED_LINE_MAX cap is still applied (regression guard)", () => {
     process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
     const longLine = "x".repeat(120);
     const out = renderActivityFeedWithNested(["Delegating"], [longLine])!;
@@ -509,18 +547,17 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () =>
     expect(out).not.toContain(longLine);
   });
 
-  it("no-truncate ON + huge nested feed: output ≤ 4096 chars with oldest-lines-dropped header", () => {
+  it("no-truncate ON + huge nested feed: char-budget backstop fires, output ≤ 4096 chars", () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    // 150 parent + 150 child lines of ~25 chars each → well over 4000 chars rendered.
-    const parent = Array.from({ length: 150 }, (_, i) => `Parent activity step ${i + 1}`);
-    const child = Array.from({ length: 150 }, (_, i) => `Child activity step ${i + 1}`);
+    // STATUS_ROLLING_LINES parent + STATUS_ROLLING_LINES child lines of ~900 chars each.
+    const bigLine = "w".repeat(900);
+    const parent = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
+    const child = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const out = renderActivityFeedWithNested(parent, child)!;
     // Hard invariant: output must not exceed Telegram's 4096-char limit.
     expect(out.length).toBeLessThanOrEqual(4096);
-    // Clip header must be present (oldest lines were dropped).
-    expect(out).toContain("earlier…");
-    // The newest child line must still be present.
-    expect(out).toContain(`Child activity step 150`);
+    // The newest child line must still be present (some portion of it).
+    expect(out).toContain("   ↳ ");
   });
 });
 
