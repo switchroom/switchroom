@@ -1352,6 +1352,7 @@ export class HostdServer {
       args.push("--agents", req.args.agents.join(","));
     }
     if (req.args.skip_web) args.push("--skip-web");
+    if (req.args.allow_downgrade) args.push("--allow-downgrade");
 
     const installCtx = readCachedInstallType(
       this.opts.bindRoot ?? this.opts.homeDir,

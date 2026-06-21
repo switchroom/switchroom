@@ -230,6 +230,20 @@ describe("dispatchTool — happy path", () => {
     expect(hostdRequestMock).not.toHaveBeenCalled();
   });
 
+  it("rollout forwards allow_downgrade when true", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("rollout", { pin: "v0.15.16", allow_downgrade: true });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args.allow_downgrade).toBe(true);
+  });
+
+  it("rollout omits allow_downgrade when not set (default upgrade path)", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("rollout", { pin: "v0.15.18" });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args.allow_downgrade).toBeUndefined();
+  });
+
   it("agent_logs forwards tail when provided and omits it when not", async () => {
     hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
     await dispatchTool("agent_logs", { name: "scribe", tail: 250 });

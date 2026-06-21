@@ -1180,6 +1180,87 @@ describe("hostd server — Phase 2 fleet mutations + lock", () => {
     await new Promise((r) => setTimeout(r, 1500));
   });
 
+  it("rollout: forwards --allow-downgrade to the spawned CLI argv when set", async () => {
+    // Mirror the existing argv-assertion pattern: stub records its argv
+    // to a file, then we assert --allow-downgrade is present.
+    const recStub = join(tmp, "switchroom-rollout-downgrade-stub.sh");
+    const recOut = join(tmp, "rollout-downgrade-rec.txt");
+    writeFileSync(
+      recStub,
+      `#!/bin/sh\n` +
+        `echo "argv: $@" >> "${recOut}"\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(recStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: recStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "rollout",
+        request_id: "ro-downgrade",
+        args: { pin: "v0.15.16", allow_downgrade: true },
+      },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const { readFileSync } = await import("node:fs");
+    const rec = readFileSync(recOut, "utf8");
+    expect(rec).toContain("--allow-downgrade");
+    expect(rec).toContain("--pin v0.15.16");
+  });
+
+  it("rollout: does NOT include --allow-downgrade in argv when omitted (default path)", async () => {
+    const recStub = join(tmp, "switchroom-rollout-nod-stub.sh");
+    const recOut = join(tmp, "rollout-nod-rec.txt");
+    writeFileSync(
+      recStub,
+      `#!/bin/sh\n` +
+        `echo "argv: $@" >> "${recOut}"\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(recStub, 0o755);
+    await server.stop();
+    server = new (await import("../../src/host-control/server.js")).HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: recStub,
+      auditLogPath: join(tmp, "audit.log"),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      {
+        v: 1,
+        op: "rollout",
+        request_id: "ro-nod",
+        args: { pin: "v0.15.18" },
+      },
+    );
+    await new Promise((r) => setTimeout(r, 300));
+
+    const { readFileSync } = await import("node:fs");
+    const rec = readFileSync(recOut, "utf8");
+    expect(rec).not.toContain("--allow-downgrade");
+  });
+
   // ── Phase 3 admin observability — agent_logs / agent_exec ─────────────
   it("agent_logs: shells out to docker and returns stdout_tail (admin cross-agent)", async () => {
     // Swap to a "docker" stub that echoes its argv so we can assert
