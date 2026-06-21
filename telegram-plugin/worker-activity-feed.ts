@@ -39,7 +39,7 @@ import {
   stripMarkdown,
   truncate,
 } from './card-format.js'
-import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET } from './status-no-truncate.js'
+import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -105,16 +105,27 @@ export const NARRATIVE_MAX_LINES = 6
  * activity card (`renderActivityFeed`): prior steps render done (`✓`, italic),
  * the newest renders in-progress (`→`, bold) unless `allDone`, and an overflow
  * header (`✓ +N earlier…`) appears when the feed exceeds NARRATIVE_MAX_LINES.
- * `steps` are already cleaned + escaped HTML.
+ * `steps` are already cleaned + escaped HTML (but NOT per-line clipped when
+ * noTruncate is true — full content is preserved).
  *
- * When `noTruncate` is true (SWITCHROOM_STATUS_NO_TRUNCATE != '0'), all steps
- * are shown — the caller is responsible for trimming to the char budget after.
+ * When `noTruncate` is true (SWITCHROOM_STATUS_NO_TRUNCATE != '0'):
+ *   - Shows only the LAST STATUS_ROLLING_LINES steps (rolling window).
+ *   - No `✓ +N earlier…` overflow header — strictly the rolling window.
+ *   - Each line renders in FULL (no per-line "…" — clip must NOT be applied
+ *     before passing steps to this function in noTruncate mode).
+ * The only remaining ceiling is the char-budget backstop in the caller.
  */
 function appendStepFeed(lines: string[], steps: string[], allDone: boolean, noTruncate = false): void {
   if (steps.length === 0) return
-  const shown = noTruncate ? steps : steps.slice(-NARRATIVE_MAX_LINES)
-  const hidden = steps.length - shown.length
-  if (hidden > 0) lines.push(`<i>✓ +${hidden} earlier…</i>`)
+  let shown: string[]
+  if (noTruncate) {
+    // Rolling window: last STATUS_ROLLING_LINES lines, no overflow header.
+    shown = steps.slice(-STATUS_ROLLING_LINES)
+  } else {
+    shown = steps.slice(-NARRATIVE_MAX_LINES)
+    const hidden = steps.length - shown.length
+    if (hidden > 0) lines.push(`<i>✓ +${hidden} earlier…</i>`)
+  }
   const lastIdx = shown.length - 1
   shown.forEach((s, i) => {
     lines.push(!allDone && i === lastIdx ? `<b>→ ${s}</b>` : `<i>✓ ${s}</i>`)
@@ -157,7 +168,9 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
     // slot stays single-line after the per-line markdown strip.
     .map((s) => stripMarkdown(s).replace(/\s+/g, ' ').trim())
     .filter((s) => s.length > 0)
-    .map((s) => escapeHtml(truncate(s, STEP_MAX)))
+    // In no-truncate mode each line renders in FULL (no per-line "…").
+    // In legacy mode the STEP_MAX clip is preserved exactly.
+    .map((s) => escapeHtml(noTruncate ? s : truncate(s, STEP_MAX)))
 
   if (finished) {
     const verb = v.state === 'done' ? 'completed' : 'failed'
@@ -195,23 +208,48 @@ export function renderWorkerActivity(v: WorkerActivityView): string {
 /**
  * Internal helper: when no-truncate mode produces a body that exceeds the
  * Telegram char budget, drop the oldest step-feed lines (the ones after the
- * two fixed header lines) until it fits, prepending a "+N earlier…" header.
- * The two fixed header lines (🛠 Worker header + status line) are always kept.
+ * two fixed header lines) until it fits. The two fixed header lines (🛠 Worker
+ * header + status line) are always kept.
+ *
+ * If the final (newest) feed line is itself oversized, it is hard-truncated so
+ * at least some content survives — never returning a body with no step bullet.
  */
 function _fitWorkerBodyToCharBudget(body: string, lines: string[]): string {
   if (body.length <= STATUS_CARD_CHAR_BUDGET) return body
   // lines[0] = header, lines[1] = status line, lines[2..] = step feed + optional rule/result
   const fixed = lines.slice(0, 2)
   const feed = lines.slice(2)
+  // Try dropping oldest feed lines until the output fits (keeping the newest).
+  // Stop before dropping ALL lines — the extreme case below handles that.
   for (let drop = 1; drop < feed.length; drop++) {
     const kept = feed.slice(drop)
-    const candidate = [...fixed, `<i>✓ +${drop} earlier…</i>`, ...kept].join('\n')
+    if (kept.length === 0) break // don't return a body with no step bullet here
+    const candidate = [...fixed, ...kept].join('\n')
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
-  // Extreme: only fixed headers fit. They are pre-escaped HTML but bounded
-  // by DESC_MAX (~80 raw chars), so the joined string is well under the
-  // budget in practice. Return as-is — never slice escaped HTML.
-  return fixed.join('\n')
+  // Extreme: the newest feed line is itself oversized. Hard-truncate it to fit
+  // so at least some step content survives (a truncated step is better than none).
+  // The feed lines are already HTML-escaped; slice the escaped string and patch
+  // the closing tag so Telegram sees valid HTML.
+  const newestLine = feed[feed.length - 1] ?? ''
+  const fixedJoined = fixed.join('\n')
+  const overhead = fixedJoined.length + 1 // +1 for the \n between fixed and newest
+  const maxNewest = Math.max(0, STATUS_CARD_CHAR_BUDGET - overhead)
+  if (maxNewest > 10 && newestLine.length > 0) {
+    // Detect wrapper tags (<b>→ …</b> or <i>✓ …</i>) and re-close after truncation.
+    const isBold = newestLine.startsWith('<b>')
+    const isItalic = newestLine.startsWith('<i>')
+    const closingTag = isBold ? '</b>' : isItalic ? '</i>' : ''
+    const tagOverhead = isBold || isItalic ? (3 + closingTag.length) : 0 // <b> or <i> open tag
+    const sliceAt = maxNewest - closingTag.length - tagOverhead
+    if (sliceAt > 0) {
+      const inner = newestLine.slice(3, 3 + sliceAt) // strip opening tag
+      const truncated = (isBold ? '<b>' : isItalic ? '<i>' : '') + inner + closingTag
+      return [fixedJoined, truncated].join('\n')
+    }
+  }
+  // Absolute last resort: just the fixed headers (budget too tight even for one char).
+  return fixedJoined
 }
 
 export interface WorkerActivityFeedOpts {
@@ -320,14 +358,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     if (h.narrative[h.narrative.length - 1] === line) return
     h.narrative.push(line)
     if (statusNoTruncate()) {
-      // No-truncate mode: bound memory with a generous COUNT cap so a single
-      // oversized line can never empty the array (a char-budget splice would
-      // push then immediately splice the only line, discarding it silently).
-      // Render-time (_fitWorkerBodyToCharBudget) enforces the wire limit.
-      // 200 lines × ~100 chars ≈ 20 KB in memory — a safe ceiling.
-      const NARRATIVE_MEM_CAP = 200
-      if (h.narrative.length > NARRATIVE_MEM_CAP) {
-        h.narrative.splice(0, h.narrative.length - NARRATIVE_MEM_CAP)
+      // No-truncate mode: rolling window — keep only the last STATUS_ROLLING_LINES
+      // in memory. The render always shows exactly those lines (full content, no
+      // per-line clip). _fitWorkerBodyToCharBudget is the wire-limit backstop.
+      if (h.narrative.length > STATUS_ROLLING_LINES) {
+        h.narrative.splice(0, h.narrative.length - STATUS_ROLLING_LINES)
       }
     } else {
       // Truncate mode: hard cap to NARRATIVE_MAX_LINES (original behaviour).

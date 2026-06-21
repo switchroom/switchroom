@@ -7,6 +7,7 @@ import {
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
+import { STATUS_ROLLING_LINES } from '../status-no-truncate.js'
 
 describe('isWorkerActivityFeedEnabled (default ON)', () => {
   it('defaults to true when the env var is unset', () => {
@@ -510,28 +511,56 @@ describe('createWorkerActivityFeed — log sink', () => {
 })
 
 // ─── SWITCHROOM_STATUS_NO_TRUNCATE feature flag tests ────────────────────────
+// New contract (rolling-5-full):
+//   ON  → last STATUS_ROLLING_LINES lines rendered in FULL; no overflow header;
+//          char-budget backstop (_fitWorkerBodyToCharBudget) is the only ceiling.
+//   OFF → NARRATIVE_MAX_LINES cap + STEP_MAX per-line clip (legacy, unchanged).
 
 describe('SWITCHROOM_STATUS_NO_TRUNCATE — renderWorkerActivity', () => {
   afterEach(() => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
   })
 
-  it('no-truncate ON (default): a narrative with > NARRATIVE_MAX_LINES renders ALL lines', () => {
+  it('no-truncate ON (default): with 12 narrative lines, exactly the last STATUS_ROLLING_LINES render', () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE // default = ON
-    const narrativeLines = Array.from({ length: NARRATIVE_MAX_LINES + 4 }, (_, i) => `step ${i + 1}`)
+    // Use zero-padded numbers so "stp-001" cannot be a substring of "stp-010".
+    const narrativeLines = Array.from({ length: 12 }, (_, i) => `stp-${String(i + 1).padStart(3, '0')}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
-    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
-      expect(out).toContain(`step ${i}`)
+    // The last STATUS_ROLLING_LINES lines must appear.
+    const firstVisible = 12 - STATUS_ROLLING_LINES + 1
+    for (let i = firstVisible; i <= 12; i++) {
+      expect(out).toContain(`stp-${String(i).padStart(3, '0')}`)
     }
-    // No spurious overflow header when all steps fit in the budget.
-    expect(out).not.toContain('+4 earlier')
-    expect(out).toContain(`<b>→ step ${NARRATIVE_MAX_LINES + 4}</b>`)
+    // The first (12 - STATUS_ROLLING_LINES) lines must NOT appear.
+    for (let i = 1; i < firstVisible; i++) {
+      expect(out).not.toContain(`stp-${String(i).padStart(3, '0')}`)
+    }
+    // No overflow header in no-truncate mode.
+    expect(out).not.toContain('earlier…')
+    expect(out).toContain('<b>→ stp-012</b>')
   })
 
-  it('no-truncate OFF (=0): existing NARRATIVE_MAX_LINES cap is preserved', () => {
+  it('no-truncate ON: a 150-char line renders in FULL (no "…" mid-line truncation)', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const longLine = 'a'.repeat(75) + ' ' + 'b'.repeat(74) // 150 chars total
+    const out = renderWorkerActivity(view({ narrativeLines: [longLine] }))
+    // Must appear without "…" from per-line STEP_MAX clip.
+    expect(out).toContain(longLine)
+    expect(out).not.toContain('…')
+  })
+
+  it('no-truncate ON: no "✓ +N earlier…" overflow header', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    const narrativeLines = Array.from({ length: 20 }, (_, i) => `step ${i + 1}`)
+    const out = renderWorkerActivity(view({ narrativeLines }))
+    expect(out).not.toContain('earlier…')
+  })
+
+  it('no-truncate OFF (=0): existing NARRATIVE_MAX_LINES cap + STEP_MAX clip are preserved', () => {
     process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
     const narrativeLines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
+    // Overflow header must appear (legacy cap active).
     expect(out).toContain('<i>✓ +3 earlier…</i>')
     expect(out).not.toContain('step 1')
     expect(out).toContain('step 4')
@@ -539,16 +568,26 @@ describe('SWITCHROOM_STATUS_NO_TRUNCATE — renderWorkerActivity', () => {
     expect(out.match(/step \d/g) ?? []).toHaveLength(6)
   })
 
-  it('no-truncate ON + pathologically huge narrative (500 lines): rendered output ≤ 4096 chars', () => {
+  it('no-truncate OFF (=0): a 150-char line is clipped at STEP_MAX (regression guard)', () => {
+    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+    const longLine = 'x'.repeat(150)
+    const out = renderWorkerActivity(view({ narrativeLines: [longLine] }))
+    // Per-line clip must apply when flag is OFF.
+    expect(out).toContain('…')
+    expect(out).not.toContain(longLine)
+  })
+
+  it('no-truncate ON + pathologically oversized body: char-budget backstop fires, output ≤ 4096 chars', () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    const narrativeLines = Array.from({ length: 500 }, (_, i) => `step number ${i + 1}`)
+    // 5 huge lines × ~900 chars each → well over 4000 chars rendered.
+    const bigLine = 'z'.repeat(900)
+    const narrativeLines = Array.from({ length: 5 }, () => bigLine)
     const out = renderWorkerActivity(view({ narrativeLines }))
     // Hard invariant: must never exceed Telegram's 4096 char limit.
     expect(out.length).toBeLessThanOrEqual(4096)
-    // Oldest lines should have been clipped with a header.
-    expect(out).toContain('earlier…')
-    // The newest step must still be present.
-    expect(out).toContain('step number 500')
+    // The newest step must still be present (some portion of it).
+    const hasBullet = out.includes('→') || out.includes('✓')
+    expect(hasBullet).toBe(true)
   })
 })
 
@@ -557,26 +596,31 @@ describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative a
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
   })
 
-  it('no-truncate ON: narrative accumulates more than NARRATIVE_MAX_LINES distinct lines', async () => {
+  it('no-truncate ON: rolling window — with 12 pushes, only the last STATUS_ROLLING_LINES appear in render', async () => {
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
 
-    // Push more lines than NARRATIVE_MAX_LINES into the feed.
-    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
+    // Use zero-padded names to avoid substring collisions (ln-001 vs ln-010).
+    for (let i = 1; i <= 12; i++) {
       clock += 1000
-      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `ln-${String(i).padStart(3, '0')}` }))
     }
 
     const last = bot.edits.at(-1)!
-    // All accumulated lines should be present (not spliced to NARRATIVE_MAX_LINES).
-    for (let i = 1; i <= NARRATIVE_MAX_LINES + 4; i++) {
-      expect(last.text).toContain(`line ${i}`)
+    const firstVisible = 12 - STATUS_ROLLING_LINES + 1
+    // The last STATUS_ROLLING_LINES lines must be present.
+    for (let i = firstVisible; i <= 12; i++) {
+      expect(last.text).toContain(`ln-${String(i).padStart(3, '0')}`)
     }
-    // No overflow header for a small feed that fits in the budget.
-    expect(last.text).not.toContain('+4 earlier')
-    expect(last.text).toContain(`<b>→ line ${NARRATIVE_MAX_LINES + 4}</b>`)
+    // Earlier lines must have rolled off.
+    for (let i = 1; i < firstVisible; i++) {
+      expect(last.text).not.toContain(`ln-${String(i).padStart(3, '0')}`)
+    }
+    // No overflow header in no-truncate mode.
+    expect(last.text).not.toContain('earlier…')
+    expect(last.text).toContain('<b>→ ln-012</b>')
   })
 
   it('no-truncate OFF (=0): narrative is still spliced to NARRATIVE_MAX_LINES (original behaviour)', async () => {
@@ -599,18 +643,26 @@ describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative a
   })
 
   it('no-truncate ON: env-flip seam works (set/delete per test)', () => {
-    // Verify the seam: after setting '0', the flag reads as OFF.
+    // Verify the seam: after setting '0', the flag reads as OFF (legacy cap).
     process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
-    const lines = Array.from({ length: NARRATIVE_MAX_LINES + 2 }, (_, i) => `s ${i + 1}`)
+    // Use zero-padded names to avoid substring collisions.
+    const total = NARRATIVE_MAX_LINES + 2
+    const lines = Array.from({ length: total }, (_, i) => `sv-${String(i + 1).padStart(3, '0')}`)
     const offOut = renderWorkerActivity(view({ narrativeLines: lines }))
     expect(offOut).toContain('+2 earlier')
 
-    // After deleting, the flag reads as ON (default).
+    // After deleting, the flag reads as ON (rolling-5-full).
     delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const onOut = renderWorkerActivity(view({ narrativeLines: lines }))
-    expect(onOut).not.toContain('+2 earlier')
-    for (let i = 1; i <= NARRATIVE_MAX_LINES + 2; i++) {
-      expect(onOut).toContain(`s ${i}`)
+    // No overflow header in no-truncate mode.
+    expect(onOut).not.toContain('earlier…')
+    // Only the last STATUS_ROLLING_LINES lines should be visible.
+    const firstVisible = total - STATUS_ROLLING_LINES + 1
+    for (let i = firstVisible; i <= total; i++) {
+      expect(onOut).toContain(`sv-${String(i).padStart(3, '0')}`)
+    }
+    for (let i = 1; i < firstVisible; i++) {
+      expect(onOut).not.toContain(`sv-${String(i).padStart(3, '0')}`)
     }
   })
 })

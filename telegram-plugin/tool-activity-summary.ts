@@ -169,7 +169,7 @@ export function describeToolUse(
 // caps are lifted and the full feed is shown, bounded only by the 4096-char
 // Telegram limit via STATUS_CARD_CHAR_BUDGET.
 
-import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET } from './status-no-truncate.js'
+import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
 
 export const MIRROR_MAX_LINES = 6;
 
@@ -206,6 +206,11 @@ function escapeFeedHtml(s: string): string {
  * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
  * Callers send the result verbatim — do NOT re-escape or re-wrap it.
  *
+ * When SWITCHROOM_STATUS_NO_TRUNCATE is on (default), shows only the last
+ * STATUS_ROLLING_LINES lines in full (no per-line "…"), with NO overflow
+ * header. The only remaining ceiling is STATUS_CARD_CHAR_BUDGET (wire-limit
+ * backstop via `_fitToCharBudget`).
+ *
  * `stepCount` (optional): when `final=true` and `stepCount > 0`, appends a
  * `✓ N steps` footer line so the persisted feed record shows an accurate
  * total of surfaced (non-surface-tool) steps for the turn.
@@ -218,19 +223,18 @@ export function renderActivityFeed(
 ): string | null {
   if (lines.length === 0) return null;
   const noTruncate = statusNoTruncate();
-  // When no-truncate is ON, show all lines; when OFF, cap to MIRROR_MAX_LINES.
-  // In both modes we may need to trim oldest lines to fit the Telegram budget.
+  // No-truncate ON: rolling STATUS_ROLLING_LINES window, no overflow header.
+  // No-truncate OFF: cap to MIRROR_MAX_LINES with overflow header.
   let shown: string[];
-  let hidden: number;
+  const out: string[] = [];
   if (noTruncate) {
-    shown = lines;
-    hidden = 0;
+    shown = lines.slice(-STATUS_ROLLING_LINES);
+    // Suppress the overflow header in no-truncate mode — strictly the rolling window.
   } else {
     shown = lines.slice(-MIRROR_MAX_LINES);
-    hidden = lines.length - shown.length;
+    const hidden = lines.length - shown.length;
+    if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`);
   }
-  const out: string[] = [];
-  if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`);
   const lastIdx = shown.length - 1;
   // Newest line = in-progress step (bold, →); earlier = done (italic, ✓).
   // `final` (turn complete, feed left as a record): ALL lines render done (✓)
@@ -251,8 +255,9 @@ export function renderActivityFeed(
     out.push(`<i>✓ ${stepCount} steps</i>`);
   }
   const result = out.join("\n");
-  // No-truncate mode: enforce the Telegram char budget by trimming oldest
-  // lines first until the output fits, then prepend a "+N earlier…" header.
+  // No-truncate mode: enforce the Telegram char budget as the only ceiling.
+  // With STATUS_ROLLING_LINES=5 full lines (~750 chars) this effectively never
+  // fires, but keep it as the wire-limit safety net.
   if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
     return _fitToCharBudget(lines, final, liveSuffix, stepCount);
   }
@@ -346,16 +351,25 @@ export function renderActivityFeedWithNested(
   const noTruncate = statusNoTruncate();
   const out: string[] = [];
 
-  // Parent lines: when no-truncate is ON show all; when OFF cap to MIRROR_MAX_LINES.
-  const shownParent = noTruncate ? lines : lines.slice(-MIRROR_MAX_LINES);
-  const hiddenParent = lines.length - shownParent.length;
-  if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`);
+  // Parent lines:
+  //   no-truncate ON  → rolling STATUS_ROLLING_LINES window, no overflow header.
+  //   no-truncate OFF → cap to MIRROR_MAX_LINES with overflow header.
+  const shownParent = noTruncate ? lines.slice(-STATUS_ROLLING_LINES) : lines.slice(-MIRROR_MAX_LINES);
+  if (!noTruncate) {
+    const hiddenParent = lines.length - shownParent.length;
+    if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`);
+  }
   for (const l of shownParent) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
 
-  // Child lines: when no-truncate is ON show all; when OFF cap to NESTED_MAX_LINES.
-  const shownChild = noTruncate ? children : children.slice(-NESTED_MAX_LINES);
-  const hiddenChild = children.length - shownChild.length;
-  if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`);
+  // Child lines:
+  //   no-truncate ON  → rolling STATUS_ROLLING_LINES window, no overflow header,
+  //                     each line in FULL (no NESTED_LINE_MAX "…").
+  //   no-truncate OFF → cap to NESTED_MAX_LINES with overflow header + NESTED_LINE_MAX clip.
+  const shownChild = noTruncate ? children.slice(-STATUS_ROLLING_LINES) : children.slice(-NESTED_MAX_LINES);
+  if (!noTruncate) {
+    const hiddenChild = children.length - shownChild.length;
+    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`);
+  }
   const lastChildIdx = shownChild.length - 1;
   // `final`: the nested newest step also renders done (✓) so the left-behind
   // feed reads as completed, not stuck on a "→ in-progress" child step.
@@ -376,8 +390,9 @@ export function renderActivityFeedWithNested(
   }
   if (out.length === 0) return null;
   const result = out.join("\n");
-  // No-truncate mode: enforce the Telegram char budget by trimming oldest
-  // parent lines first, then oldest child lines, until the output fits.
+  // No-truncate mode: enforce the Telegram char budget as the only ceiling.
+  // With STATUS_ROLLING_LINES=5 full lines (~750 chars) this effectively never
+  // fires, but keep it as the wire-limit safety net.
   if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
     return _fitNestedToCharBudget(lines, children, final, liveSuffix, stepCount);
   }
