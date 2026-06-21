@@ -98,8 +98,8 @@ describe("isAccountBlocked — out_of_credits is NOT serve-blocking (demoted to 
       isAccountBlocked({ snapshot: snap(0, 0, 30_000, { reason: "out_of_credits" }), now: NOW }),
     ).toBe(false);
   });
-  it("out_of_credits at 0% util is a valid failover target (the pixsoul@gmail.com scenario)", () => {
-    // pixsoul@gmail.com: 5h=0%, 7d=2%, out_of_credits. MUST be eligible.
+  it("out_of_credits at 0% util is a valid failover target (the carol@example.com scenario)", () => {
+    // carol@example.com: 5h=0%, 7d=2%, out_of_credits. MUST be eligible.
     expect(
       isAccountBlocked({ snapshot: snap(0, 2, 30_000, { status: "rejected", reason: "out_of_credits" }), now: NOW }),
     ).toBe(false);

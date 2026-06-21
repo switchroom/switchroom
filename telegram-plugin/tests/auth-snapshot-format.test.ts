@@ -70,7 +70,7 @@ describe('classifyHealth', () => {
   });
   it('out_of_credits overage at 0% util → healthy (demoted to informational — serves fine from quota)', () => {
     // THE KEY CHANGE: out_of_credits is no longer serve-blocking. An account at
-    // 0% util with out_of_credits is a valid failover target (pixsoul scenario).
+    // 0% util with out_of_credits is a valid failover target (carol scenario).
     expect(
       classifyHealth(snap({ quota: quota({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' }) })),
     ).toBe('healthy');
@@ -741,7 +741,7 @@ describe('#2494 Bug C — blockedReason + thin probe (out_of_credits now informa
 
 describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demoted)', () => {
   it('out_of_credits at 0% util → healthy row with informational overage annotation, NOT blocked', () => {
-    // THE KEY CHANGE: pixsoul scenario — 0% util, out_of_credits → healthy group
+    // THE KEY CHANGE: carol scenario — 0% util, out_of_credits → healthy group
     // with an informational sub-line "overage off (out_of_credits) — serving from quota"
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'dead@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) })],
@@ -762,11 +762,11 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
     // A 0%-util out_of_credits account must be offerable as a switch target
     const snaps: AccountSnapshot[] = [
       snap({ label: 'a@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }), // blocked, active
-      snap({ label: 'pixsoul@gmail.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
+      snap({ label: 'carol@example.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
     ];
     const rows = buildSnapshotKeyboard(snaps);
     const allText = rows.flat().map((b) => b.text);
-    expect(allText).toContain('Switch fleet → pixsoul@gmail.com');
+    expect(allText).toContain('Switch fleet → carol@example.com');
   });
 
   it('quota-exhausted row shows a recovery countdown, not "billing disabled" or overage annotation', () => {
@@ -804,10 +804,10 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
     // is the only alternative — it must be recommended as the switch target.
     const snaps: AccountSnapshot[] = [
       snap({ label: 'main@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100 }) }), // blocked
-      snap({ label: 'pixsoul@gmail.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
+      snap({ label: 'carol@example.com', quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) }), // healthy
     ];
     const out = recommendation(snaps, NOW);
-    expect(out).toContain('switch to pixsoul@gmail.com');
+    expect(out).toContain('switch to carol@example.com');
     expect(out).not.toContain('All accounts blocked');
   });
 });

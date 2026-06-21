@@ -90,7 +90,7 @@ const OVERAGE_EXHAUSTED_REASONS = new Set<string>(['out_of_credits']);
  *
  * NOTE: `out_of_credits` (overageDisabledReason) is NOT a serve-block here.
  * The fleet runs on quota, not on overage credits. An account with `out_of_credits`
- * at low util (e.g. pixsoul@gmail.com at 5h=0%, 7d=2%) serves fine and is a
+ * at low util (e.g. carol@example.com at 5h=0%, 7d=2%) serves fine and is a
  * valid failover target. Overage fields are informational only — surfaced as an
  * annotation on healthy/throttling rows, never as a blocked verdict.
  * Failover safety against a real 429 is preserved via the mark-exhausted path.

@@ -389,8 +389,8 @@ export type FleetAllExhaustedDecision =
  * (#2478, klanker 2026-06-20). So the `entered` alert requires POSITIVE LIVE
  * CORROBORATION: an account counts toward "all exhausted" only when its
  * `exhausted` flag is backed by a FRESH live snapshot (last_quota.capturedAt
- * within `maxStaleMs`) OR a serve-blocking overage (out_of_credits at any util).
- * If ANY account's exhaustion rests solely on a stale/absent-probe mark we are
+ * within `maxStaleMs`). If ANY account's exhaustion rests solely on a
+ * stale/absent-probe mark we are
  * probe-blind and return `skip: "probe-blind"` — no false fleet alert. The
  * guarantee is "no false alarm off stale marks during a probe blackout", NOT
  * blanket probe-failure immunity. The `recovered` transition is unguarded so a
@@ -421,9 +421,9 @@ export function evaluateFleetAllExhausted(args: {
 
   if (allExhausted && !wasAlerting) {
     // Probe-blind guard (#2478): only fire `entered` if EVERY account's
-    // exhaustion is backed by live evidence — a fresh snapshot or a
-    // serve-blocking overage. An account exhausted solely on a stale/absent
-    // mark means we have no live corroboration → skip rather than false-alarm.
+    // exhaustion is backed by live evidence — a fresh snapshot. An account
+    // exhausted solely on a stale/absent mark means we have no live
+    // corroboration → skip rather than false-alarm.
     if (maxStaleMs > 0) {
       const allLiveCorroborated = accounts.every((a) =>
         exhaustionLiveCorroborated(a, now, maxStaleMs),
@@ -455,15 +455,19 @@ export function evaluateFleetAllExhausted(args: {
  *
  * True when the most-recent live probe is FRESH (`capturedAt` within
  * `maxStaleMs`) — that fresh probe is what set/upholds the broker's blocked
- * verdict — OR when the snapshot reports a serve-blocking overage
- * (`out_of_credits`), which is an exhaustion in its own right at any util.
- * False when there is no `last_quota` at all, or the snapshot is stale: the
- * `exhausted` flag then rests solely on a persisted mark with no live backing,
- * which is exactly the probe-blind condition that false-fires the fleet alert.
+ * verdict. False when there is no `last_quota` at all, or the snapshot is
+ * stale: the `exhausted` flag then rests solely on a persisted mark with no
+ * live backing, which is exactly the probe-blind condition that false-fires
+ * the fleet alert.
  *
- * Mirrors `isOverageServeBlocking` / `snapshotFresh` in
- * src/auth/broker/account-eligibility.ts (the serving-side authority); kept as
- * a local check so the decision layer carries no broker dependency.
+ * NOTE: `out_of_credits` is NOT treated as corroboration here. Per
+ * fix/out-of-credits-serve-block, out_of_credits is INFORMATIONAL — it is
+ * not exhaustion in its own right at any util. Corroboration requires a
+ * genuinely fresh quota snapshot (real 429 / util-wall path).
+ *
+ * Mirrors `snapshotFresh` in src/auth/broker/account-eligibility.ts (the
+ * serving-side authority); kept as a local check so the decision layer
+ * carries no broker dependency.
  */
 function exhaustionLiveCorroborated(
   account: {
@@ -474,7 +478,6 @@ function exhaustionLiveCorroborated(
 ): boolean {
   const lq = account.last_quota;
   if (!lq) return false;
-  if (lq.overageDisabledReason === "out_of_credits") return true;
   // Mirror `snapshotFresh`'s clock-skew guard: a future-dated `capturedAt`
   // makes `now - capturedAt` negative and would slip past the staleness gate,
   // so a skewed snapshot reads as fresh. Reject snapshots dated more than the

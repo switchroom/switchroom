@@ -135,14 +135,39 @@ describe('runFleetAutoFallback', () => {
     expect(out.announcement).toContain('Stale event?');
   });
 
-  it('out_of_credits active account ⇒ swap fires (classifyHealth=blocked, not idempotent-skip)', async () => {
-    // The active account is at 0% util but credits-dead. classifyHealth must
-    // read 'blocked' so the idempotency guard does NOT skip — the swap fires.
+  it('out_of_credits active account ⇒ NO swap (informational, not a serve-block)', async () => {
+    // NEW CONTRACT (fix/out-of-credits-serve-block): out_of_credits is
+    // INFORMATIONAL. An active account at 0% util with out_of_credits is
+    // classified HEALTHY by classifyHealth(), so the idempotency guard fires
+    // and the swap is skipped. out_of_credits must NEVER on its own cause a
+    // fleet auto-fallback swap.
     const failover = vi.fn(async () => ({ rolledTo: 'bob@example.com', rolled: ['alice@example.com'] }));
     const out = await runFleetAutoFallback({
       state: state('alice@example.com', ['alice@example.com', 'bob@example.com']),
       quotas: [
         qOk({ fiveHourUtilizationPct: 0, sevenDayUtilizationPct: 0, overageStatus: 'rejected', overageDisabledReason: 'out_of_credits' }),
+        qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
+      ],
+      failover,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+    });
+
+    // out_of_credits at 0% util → classifyHealth='healthy' → idempotency guard
+    // returns no-eligible-target WITHOUT calling failover.
+    expect(out.kind).toBe('no-eligible-target');
+    expect(failover).not.toHaveBeenCalled();
+  });
+
+  it('genuine quota wall (100% 5h util) ⇒ swap fires (failover safety preserved)', async () => {
+    // Failover on a REAL quota wall must still work. This anchors the safety
+    // contract: only out_of_credits is demoted, genuine exhaustion still swaps.
+    const failover = vi.fn(async () => ({ rolledTo: 'bob@example.com', rolled: ['alice@example.com'] }));
+    const out = await runFleetAutoFallback({
+      state: state('alice@example.com', ['alice@example.com', 'bob@example.com']),
+      quotas: [
+        qOk({ fiveHourUtilizationPct: 100, fiveHourResetAt: new Date('2026-05-15T05:50:00Z'), representativeClaim: 'five_hour' }),
         qOk({ fiveHourUtilizationPct: 8, sevenDayUtilizationPct: 20 }),
       ],
       failover,

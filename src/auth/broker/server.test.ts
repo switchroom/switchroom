@@ -2519,8 +2519,12 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     broker.stop();
   });
 
-  // ── Overage serve-blocking (2026-06-20: out_of_credits at 0% util) ─────────
-  it("(a) out_of_credits active @0% ⇒ list-state exhausted:true AND serves the healthy fallback", async () => {
+  // ── out_of_credits is INFORMATIONAL (fix/out-of-credits-serve-block) ────────
+  it("(a) out_of_credits active @0% ⇒ list-state exhausted:false AND still served (NOT a serve-block)", async () => {
+    // NEW CONTRACT: out_of_credits is demoted to informational. An account at
+    // 0% util with out_of_credits is classified HEALTHY by isAccountBlocked →
+    // exhausted:false in list-state, and get-credentials keeps serving it.
+    // Failover safety is preserved via mark-exhausted on a real 429 (not here).
     let clock = Date.UTC(2026, 5, 20, 7, 0, 0);
     const h = makeHarness();
     const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
@@ -2529,7 +2533,7 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     const broker = new AuthBroker(config, {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
       now: () => clock,
-      // default idle-but-credits-dead (0% util, out_of_credits); secondary healthy.
+      // default: 0% util + out_of_credits (informational only); secondary healthy.
       _testFetchQuota: liveQuota({
         default: { five: 0, seven: 0, overageStatus: "rejected", overageReason: "out_of_credits" },
         secondary: { five: 5, seven: 10 },
@@ -2539,12 +2543,12 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     try {
       await broker.start();
       await broker.fleetQuotaProbeTick();
-      // list-state: default reads exhausted purely from the overage reason.
+      // list-state: default is NOT exhausted — out_of_credits is informational only.
       const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
-      expect(acct?.exhausted).toBe(true);
-      // get-credentials must fail over to the healthy secondary, not serve the dead account.
+      expect(acct?.exhausted).toBe(false);
+      // get-credentials must keep serving default — no spurious failover.
       const resp = (await rpc(clerkSock, { v: 1, id: "1", op: "get-credentials" })) as { data: { account: string } };
-      expect(resp.data.account).toBe("secondary");
+      expect(resp.data.account).toBe("default");
     } finally { broker.stop(); }
   });
 
@@ -2576,13 +2580,16 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     } finally { broker.stop(); }
   });
 
-  it("(c) a pre-seeded mark survives a 0%/out_of_credits probe (NOT self-healed); contrast 0%/null clears it", async () => {
+  it("(c) a pre-seeded mark IS self-healed by a fresh 0%/out_of_credits probe (informational, not blocking); 0%/null also clears it", async () => {
+    // NEW CONTRACT (fix/out-of-credits-serve-block): out_of_credits does NOT
+    // prevent snapshotShouldClearMark from clearing a misfired mark.
+    // A genuinely healthy (0% util) probe DOES clear the mark regardless of the
+    // out_of_credits flag. Failover safety is via mark-exhausted on a real 429.
     let clock = Date.UTC(2026, 5, 20, 7, 0, 0);
     const h = makeHarness();
     const config = makeConfig(h, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
     seedAccount(h, "default"); seedAccount(h, "secondary");
     mkdirSync(join(h.agentsDir, "clerk"), { recursive: true });
-    // out_of_credits build: a fresh healthy-looking (0%) probe must NOT clear the mark.
     const broker = new AuthBroker(config, {
       home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
       now: () => clock,
@@ -2595,13 +2602,14 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     try {
       await broker.start();
       await rpc(clerkSock, { v: 1, id: "1", op: "mark-exhausted", until: clock + 3600_000 });
-      await broker.fleetQuotaProbeTick(); // 0% probe — but out_of_credits → must NOT self-heal
+      await broker.fleetQuotaProbeTick(); // 0% probe with out_of_credits → DOES self-heal
       const acct = (await new AuthBrokerClient({ socket: clerkSock }).listState()).accounts.find((a) => a.label === "default");
-      expect(acct?.exhausted).toBe(true);
-      expect(acct?.exhausted_until).toBeDefined();
+      // Mark IS cleared: out_of_credits is informational, 0% util = genuinely healthy.
+      expect(acct?.exhausted).toBe(false);
+      expect(acct?.exhausted_until).toBeUndefined();
     } finally { broker.stop(); }
 
-    // Contrast: SAME 0% util with a NULL overage reason DOES self-heal the mark.
+    // Same behavior with NULL overage reason — both clear the mark (regression anchor).
     let clock2 = Date.UTC(2026, 5, 20, 7, 0, 0);
     const h2 = makeHarness();
     const config2 = makeConfig(h2, { active: "default", fallback_order: ["default", "secondary"], agents: { clerk: {} } });
@@ -2616,7 +2624,7 @@ describe("AuthBroker — agent serving-failover (Layer 2, #2218 weekly-wall dura
     try {
       await broker2.start();
       await rpc(clerkSock2, { v: 1, id: "1", op: "mark-exhausted", until: clock2 + 3600_000 });
-      await broker2.fleetQuotaProbeTick(); // 0% + null reason → clears
+      await broker2.fleetQuotaProbeTick(); // 0% + null reason → clears (unchanged behavior)
       const acct = (await new AuthBrokerClient({ socket: clerkSock2 }).listState()).accounts.find((a) => a.label === "default");
       expect(acct?.exhausted).toBe(false);
       expect(acct?.exhausted_until).toBeUndefined();
