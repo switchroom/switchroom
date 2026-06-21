@@ -324,22 +324,58 @@ export type FleetAllExhaustedDecision =
  * cases the trigger-based interactive all-blocked card misses: a quiet period
  * (no agent happens to 429 into the wall) and the consumer/cron paths.
  *
- * Authoritative source: the broker's per-account `exhausted` flag (set by
- * mark-exhausted via failover + the consumer sensor), NOT probe-derived health
- * — so there is no probe-failure false-alarm. Requires at least one account;
- * an empty fleet never alerts.
+ * Source: the broker's per-account `exhausted` flag (set by mark-exhausted via
+ * failover + the consumer sensor). That flag is NOT purely live — `isAccountBlocked`
+ * (src/auth/broker/account-eligibility.ts) falls back to the persisted
+ * `exhausted_until` mark whenever there is no fresh live snapshot. During a
+ * broker-unreachable / probe-timeout blackout, short-lived auto-fallback marks
+ * can make `every(a.exhausted)` momentarily true with ZERO live corroboration
+ * (#2478, klanker 2026-06-20). So the `entered` alert requires POSITIVE LIVE
+ * CORROBORATION: an account counts toward "all exhausted" only when its
+ * `exhausted` flag is backed by a FRESH live snapshot (last_quota.capturedAt
+ * within `maxStaleMs`) OR a serve-blocking overage (out_of_credits at any util).
+ * If ANY account's exhaustion rests solely on a stale/absent-probe mark we are
+ * probe-blind and return `skip: "probe-blind"` — no false fleet alert. The
+ * guarantee is "no false alarm off stale marks during a probe blackout", NOT
+ * blanket probe-failure immunity. The `recovered` transition is unguarded so a
+ * legitimately-fired alert is never stranded. Requires at least one account; an
+ * empty fleet never alerts.
  */
 export function evaluateFleetAllExhausted(args: {
-  accounts: Array<{ label: string; exhausted: boolean; exhausted_until?: number }>;
+  accounts: Array<{
+    label: string;
+    exhausted: boolean;
+    exhausted_until?: number;
+    /** Most-recent live probe snapshot, used to corroborate `exhausted`. */
+    last_quota?: {
+      capturedAt: number;
+      overageDisabledReason?: string | null;
+    } | null;
+  }>;
   prev: QuotaWatchAccountState;
   now: number;
+  /** Staleness ceiling for "fresh probe"; 0 disables the gate (legacy callers/tests). */
+  tuning?: Pick<QuotaWatchTuning, "maxStaleMs">;
 }): FleetAllExhaustedDecision {
   const { accounts, prev, now } = args;
+  const maxStaleMs = args.tuning?.maxStaleMs ?? 0;
   const allExhausted = accounts.length > 0 && accounts.every((a) => a.exhausted);
   // "throttling" doubles as the "currently alerting all-exhausted" marker.
   const wasAlerting = prev.lastNotifiedHealth === "throttling";
 
   if (allExhausted && !wasAlerting) {
+    // Probe-blind guard (#2478): only fire `entered` if EVERY account's
+    // exhaustion is backed by live evidence — a fresh snapshot or a
+    // serve-blocking overage. An account exhausted solely on a stale/absent
+    // mark means we have no live corroboration → skip rather than false-alarm.
+    if (maxStaleMs > 0) {
+      const allLiveCorroborated = accounts.every((a) =>
+        exhaustionLiveCorroborated(a, now, maxStaleMs),
+      );
+      if (!allLiveCorroborated) {
+        return { kind: "skip", reason: "probe-blind" };
+      }
+    }
     return {
       kind: "notify",
       message: buildAllExhaustedMessage(accounts, now),
@@ -356,6 +392,34 @@ export function evaluateFleetAllExhausted(args: {
     };
   }
   return { kind: "skip", reason: allExhausted ? "still-all-exhausted" : "not-all-exhausted" };
+}
+
+/**
+ * Is an account's `exhausted` flag backed by live evidence (#2478)?
+ *
+ * True when the most-recent live probe is FRESH (`capturedAt` within
+ * `maxStaleMs`) — that fresh probe is what set/upholds the broker's blocked
+ * verdict — OR when the snapshot reports a serve-blocking overage
+ * (`out_of_credits`), which is an exhaustion in its own right at any util.
+ * False when there is no `last_quota` at all, or the snapshot is stale: the
+ * `exhausted` flag then rests solely on a persisted mark with no live backing,
+ * which is exactly the probe-blind condition that false-fires the fleet alert.
+ *
+ * Mirrors `isOverageServeBlocking` / `snapshotFresh` in
+ * src/auth/broker/account-eligibility.ts (the serving-side authority); kept as
+ * a local check so the decision layer carries no broker dependency.
+ */
+function exhaustionLiveCorroborated(
+  account: {
+    last_quota?: { capturedAt: number; overageDisabledReason?: string | null } | null;
+  },
+  now: number,
+  maxStaleMs: number,
+): boolean {
+  const lq = account.last_quota;
+  if (!lq) return false;
+  if (lq.overageDisabledReason === "out_of_credits") return true;
+  return now - lq.capturedAt <= maxStaleMs;
 }
 
 function buildAllExhaustedMessage(
