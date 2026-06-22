@@ -46,9 +46,9 @@ afterEach(() => {
 
 describe("SWITCHROOM_HOST_HOME set to a valid host path", () => {
   it("returns the configured value unchanged", () => {
-    process.env.SWITCHROOM_HOST_HOME = "/home/kenthompson";
+    process.env.SWITCHROOM_HOST_HOME = "/home/op";
     const result = resolveHostHomeForCompose();
-    expect(result).toBe("/home/kenthompson");
+    expect(result).toBe("/home/op");
   });
 
   it("accepts ${HOME} legacy placeholder", () => {
