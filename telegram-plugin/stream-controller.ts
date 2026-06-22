@@ -16,7 +16,7 @@
  * entire server.ts top-level initialization.
  */
 
-import { createDraftStream, type DraftStreamHandle, type StreamDraftFn } from './draft-stream.js'
+import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
 import { htmlToPlainText } from './html-sanitize.js'
 
 /**
@@ -152,30 +152,15 @@ export interface StreamControllerConfig {
    */
   log?: (msg: string) => void
   /**
-   * Optional warning logger. Used for transport fallback notices.
+   * Optional warning logger. Used for fallback notices.
    */
   warn?: (msg: string) => void
   /**
-   * Transport selector passed to createDraftStream.
-   * - "auto" (default): use draft transport for DMs only
-   * - "draft": always prefer draft (if sendMessageDraft is available)
-   * - "message": always use sendMessage/editMessageText
-   *
-   * The gateway forces "message" for forum topics (threads), since
-   * sendMessageDraft does not support threaded chats.
-   */
-  previewTransport?: 'auto' | 'message' | 'draft'
-  /**
    * True when the chat is a private DM. Passed to createDraftStream so
-   * "auto" transport knows whether to activate draft.
+   * the throttle default (400 ms for DMs vs 1000 ms for groups) is applied
+   * correctly when no explicit throttleMs is set.
    */
   isPrivateChat?: boolean
-  /**
-   * sendMessageDraft callback. When provided (and transport allows it),
-   * intermediate stream updates use the draft API. On finalize(), a real
-   * sendMessage is posted for push notification and the draft is cleared.
-   */
-  sendMessageDraft?: StreamDraftFn
   /**
    * If set, the controller is initialized as if a previous send had
    * landed with this `message_id`. The first `update()` invokes
@@ -214,9 +199,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     quoteText,
     protectContent,
     replyMarkup,
-    previewTransport,
     isPrivateChat,
-    sendMessageDraft,
     initialMessageId,
   } = cfg
 
@@ -314,9 +297,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
       ...(idleMs != null ? { idleMs } : {}),
       ...(log != null ? { log } : {}),
       ...(warn != null ? { warn } : {}),
-      ...(previewTransport != null ? { previewTransport } : {}),
       ...(isPrivateChat != null ? { isPrivateChat } : {}),
-      ...(sendMessageDraft != null ? { sendMessageDraft } : {}),
       ...(initialMessageId != null ? { initialMessageId } : {}),
       chatId,
     },

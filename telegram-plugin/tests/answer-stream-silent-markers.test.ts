@@ -1,9 +1,21 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 import {
   createAnswerStream,
-  __resetDraftIdForTests,
 } from '../answer-stream.js'
+
+// Throttle window anchored one hour ahead of "now". With lastSentAt=0 and a
+// real Date.now(), update() computes sinceLast = Date.now() - 0, which is
+// always < this anchor, so update() schedules a (cancelled-before-it-fires)
+// timer and buffers pendingText instead of sending immediately. materialize()
+// then cancels the scheduled timer and applies the silent-marker guard to the
+// buffered text. This replaces the old draft-transport path (which bypassed the
+// length gate). Anchoring to now+1h (rather than MAX_SAFE_INTEGER) keeps the
+// scheduled timer's delay within 32-bit range, so it stays runner-agnostic:
+// no vi.setSystemTime (which bun's vitest shim lacks) and no Node
+// TimeoutOverflowWarning under runners whose fake-timer shim is a no-op.
+const HOUR_MS = 60 * 60 * 1000
+let throttleAnchorMs = 0
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,13 +41,6 @@ type EditMessageTextFn = (
   },
 ) => Promise<unknown>
 
-type SendMessageDraftFn = (
-  chatId: string,
-  draftId: number,
-  text: string,
-  params?: { message_thread_id?: number },
-) => Promise<unknown>
-
 let nextMessageId = 9000
 
 function makeSendMessage(): ReturnType<typeof vi.fn> & SendMessageFn {
@@ -49,18 +54,9 @@ function makeEditMessageText(): ReturnType<typeof vi.fn> & EditMessageTextFn {
   return vi.fn(async () => {}) as unknown as ReturnType<typeof vi.fn> & EditMessageTextFn
 }
 
-function makeSendMessageDraft(): ReturnType<typeof vi.fn> & SendMessageDraftFn {
-  return vi.fn(async () => {}) as unknown as ReturnType<typeof vi.fn> & SendMessageDraftFn
-}
-
 beforeEach(() => {
-  __resetDraftIdForTests()
   nextMessageId = 9000
-  vi.useFakeTimers()
-})
-
-afterEach(() => {
-  vi.useRealTimers()
+  throttleAnchorMs = Date.now() + HOUR_MS
 })
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -70,9 +66,16 @@ afterEach(() => {
  * NO_REPLY / HEARTBEAT_OK silent markers and suppress outbound Telegram
  * messages when the whole turn body is one of those tokens.
  *
- * Root cause: in private chats (DMs), usesDraftTransport=true bypasses the
- * minInitialChars length gate in update(), so even short markers like "NO_REPLY"
- * (8 chars) reach pendingText and then materialize() sends them as real messages.
+ * Previously in DMs the draft transport bypassed the minInitialChars length
+ * gate in update(), so short markers like "NO_REPLY" (8 chars) reached
+ * pendingText; then materialize() would send them as real messages.
+ *
+ * The draft transport is permanently retired. These tests now use:
+ *   - minInitialChars: 0 — bypasses the length gate so update() sets pendingText
+ *   - throttleMs: throttleAnchorMs (now + 1h) — with lastSentAt=0 and a real
+ *     Date.now(), sinceLast is always < the throttle window, so update() schedules
+ *     a timer rather than firing sendMessage immediately. materialize() cancels that
+ *     timer and applies the silent-marker guard to pendingText before any send.
  *
  * Mirrors the sentinel suppression already present in:
  *   - server.ts (reply/stream_reply MCP tool handlers)
@@ -81,26 +84,23 @@ afterEach(() => {
  */
 describe('answer-stream — silent-marker suppression at materialize()', () => {
   it('NO_REPLY as the sole chunk — no outbound message, suppression log line emitted', async () => {
-    // Use isPrivateChat: true + sendMessageDraft to replicate the exact repro
-    // conditions from #299: DM chat bypasses the minInitialChars length gate
-    // in update(), so "NO_REPLY" (8 chars) reaches pendingText and materialize()
-    // would previously send it as a real Telegram message.
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
     const logs: string[] = []
     const stream = createAnswerStream({
       chatId: 'chat42',
-      isPrivateChat: true,
-      throttleMs: 250,
+      // minInitialChars: 0 bypasses the length gate so short markers like
+      // "NO_REPLY" (8 chars) set pendingText. Combined with vi.setSystemTime(0),
+      // the throttle keeps update() from firing sendMessage immediately, so
+      // materialize() can apply the silent-marker guard.
+      minInitialChars: 0,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
-      sendMessageDraft,
       log: (msg) => logs.push(msg),
     })
 
     // Simulate: model emits exactly NO_REPLY, no reply/stream_reply call.
-    // In a DM, update() bypasses the length gate and sets pendingText.
     stream.update('NO_REPLY')
     // materialize() is what gateway.ts calls at turn_end when no tool reply
     // was made — this is the path that was broken in #299 (msg id=8268).
@@ -115,14 +115,12 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
   it('HEARTBEAT_OK as the sole chunk — no outbound message', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
     const stream = createAnswerStream({
       chatId: 'chat43',
-      isPrivateChat: true,
-      throttleMs: 250,
+      minInitialChars: 0,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
-      sendMessageDraft,
     })
 
     stream.update('HEARTBEAT_OK')
@@ -135,15 +133,13 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
   it('NO_REPLY. (trailing period) — suppressed by trailing-punctuation tolerance', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
     const logs: string[] = []
     const stream = createAnswerStream({
       chatId: 'chat44',
-      isPrivateChat: true,
-      throttleMs: 250,
+      minInitialChars: 0,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
-      sendMessageDraft,
       log: (msg) => logs.push(msg),
     })
 
@@ -158,22 +154,19 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
   it('substring match ("the agent suggested NO_REPLY earlier") — NOT suppressed, materialises normally', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
     const stream = createAnswerStream({
       chatId: 'chat45',
-      isPrivateChat: true,
-      throttleMs: 250,
+      minInitialChars: 0,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
-      sendMessageDraft,
     })
 
     const prose = 'the agent suggested NO_REPLY earlier'
     stream.update(prose)
-    // materialize() should send a fresh message — only 1 call, from materialize
-    // itself (update() in draft mode sends a draft, not a sendMessage call).
     const msgId = await stream.materialize()
 
+    // materialize() sends a fresh message — prose is not a silent marker
     expect(sendMessage).toHaveBeenCalledTimes(1)
     expect(sendMessage).toHaveBeenCalledWith(
       'chat45',
@@ -190,15 +183,13 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     // not on any intermediate chunk.
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
     const logs: string[] = []
     const stream = createAnswerStream({
       chatId: 'chat47',
-      isPrivateChat: true,
-      throttleMs: 250,
+      minInitialChars: 0,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
-      sendMessageDraft,
       log: (msg) => logs.push(msg),
     })
 
@@ -218,8 +209,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const logs: string[] = []
     const stream = createAnswerStream({
       chatId: 'chat46',
-      isPrivateChat: false,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
       log: (msg) => logs.push(msg),

@@ -16,7 +16,7 @@
  *     wraps into an MCP content response.
  */
 
-import type { DraftStreamHandle, StreamDraftFn } from './draft-stream.js'
+import type { DraftStreamHandle } from './draft-stream.js'
 import {
   createStreamController,
   type StreamBotApi,
@@ -241,13 +241,6 @@ export interface StreamReplyDeps {
   writeError: (line: string) => void
   throttleMs?: number
   /**
-   * sendMessageDraft callback. When provided, stream_reply uses the draft
-   * API for intermediate updates (DM transport). On done=true, a real
-   * sendMessage fires for push notification, then the draft is cleared.
-   * Optional — omit to keep the existing sendMessage/editMessageText path.
-   */
-  sendMessageDraft?: StreamDraftFn
-  /**
    * Idempotency hook for the duplicate-message class (issue #626).
    *
    * On every call where the handler would CREATE a new stream (no entry
@@ -275,12 +268,12 @@ export interface StreamReplyDeps {
   }) => number | null | undefined
   /**
    * True when the current chat is a private DM. Passed to the stream
-   * controller so "auto" transport activates draft in DMs only.
+   * controller so the DM throttle default (400 ms) is applied instead of
+   * the group default (1000 ms) when no explicit throttleMs is set.
    */
   isPrivateChat?: boolean
   /**
-   * True when the current chat is a forum topic. Forum topics do not
-   * support sendMessageDraft — this forces message transport.
+   * True when the current chat is a forum topic.
    */
   isForumTopic?: boolean
   /**
@@ -464,14 +457,6 @@ export async function handleStreamReply(
       }
     }
 
-    // Resolve draft-transport options. Forum topics force message transport
-    // because sendMessageDraft does not support threads.
-    const isForumTopic = deps.isForumTopic === true
-    const resolvedTransport: 'auto' | 'message' | 'draft' =
-      isForumTopic || deps.sendMessageDraft == null
-        ? 'message'
-        : 'auto'
-
     // Idempotency hook (#626): if an external authority (e.g. the
     // gateway's pin manager) already knows the anchor message id for
     // this lane+turn, initialize the stream with it so the next update
@@ -504,8 +489,8 @@ export async function handleStreamReply(
       threadId,
       parseMode,
       disableLinkPreview: deps.disableLinkPreview,
-      // PR B: pass undefined when caller didn't override, so draft-stream's
-      // transport-aware default (300 ms draft / 1000 ms message) wins.
+      // Pass undefined when caller didn't override, so draft-stream's
+      // DM/group throttle defaults apply (400 ms DMs, 1000 ms groups).
       ...(deps.throttleMs != null ? { throttleMs: deps.throttleMs } : {}),
       retry: deps.retry,
       ...(replyToMessageId != null ? { replyToMessageId } : {}),
@@ -513,9 +498,7 @@ export async function handleStreamReply(
       ...(args.protect_content === true ? { protectContent: true } : {}),
       ...(args.disable_notification === true ? { disableNotification: true } : {}),
       ...(args.reply_markup != null ? { replyMarkup: args.reply_markup } : {}),
-      previewTransport: resolvedTransport,
       isPrivateChat: deps.isPrivateChat === true,
-      ...(deps.sendMessageDraft != null ? { sendMessageDraft: deps.sendMessageDraft } : {}),
       ...(initialMessageId != null ? { initialMessageId } : {}),
       onSend: (messageId, charCount) =>
         deps.logStreamingEvent({ kind: 'draft_send', chatId: chat_id, messageId, charCount }),
@@ -539,7 +522,6 @@ export async function handleStreamReply(
           || msg.startsWith('stream → edited')
           || msg.startsWith('stream → not modified')
           || msg.startsWith('stream finalized')
-          || msg.startsWith('stream → draft')
           || msg.startsWith('stream → materialized')
         ) return
         deps.writeError(`telegram channel: stream_reply ${msg}\n`)
