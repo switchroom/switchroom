@@ -312,12 +312,12 @@ async function copyExampleConfig(
 export async function writeDetectedTimezone(
   destFile: string,
   nonInteractive: boolean,
-  detect: () => string = detectServerTimezone,
+  detect: () => string | undefined = detectServerTimezone,
   prompt: (question: string, defaultValue?: string) => Promise<string> = ask,
 ): Promise<void> {
   const detected = detect();
 
-  if (detected !== "UTC" && isValidTimezone(detected)) {
+  if (detected !== undefined && detected !== "UTC" && isValidTimezone(detected)) {
     // A confidently-real host zone — persist it verbatim, visible/editable.
     const before = readFileSync(destFile, "utf-8");
     const after = setSwitchroomTimezone(before, detected);
@@ -328,7 +328,7 @@ export async function writeDetectedTimezone(
     return;
   }
 
-  // detected === "UTC" (or an unparseable detection we won't trust).
+  // detected === undefined or "UTC" (or an unparseable detection we won't trust).
   if (nonInteractive) {
     console.error(
       chalk.yellow(

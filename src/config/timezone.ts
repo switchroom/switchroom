@@ -18,18 +18,23 @@
  *   1. agent.timezone        (explicit per-agent override)
  *   2. profile.timezone      (inherited via `extends:`)
  *   3. switchroom.timezone   (global default)
- *   4. server detection      (/etc/timezone → /etc/localtime → "UTC")
+ *   4. host detection        (SWITCHROOM_HOST_TZ → /etc/timezone → /etc/localtime)
+ *   5. "UTC" fallback        (with loud warning — almost always a misconfiguration)
  *
  * The resolver intentionally does NOT read switchroom.defaults.timezone
  * because the full defaults-profile-agent merge has already happened
  * by the time the resolved AgentConfig arrives here — the defaults
  * value, if present, is already on agent.timezone via the cascade.
  *
- * Server detection on Linux checks /etc/timezone first (Debian / Ubuntu
- * convention). If that's missing, /etc/localtime is typically a symlink
- * into the zoneinfo database — we readlink it and extract the zone name
- * from the tail of the path (…/zoneinfo/Australia/Melbourne → the last
- * two segments). Both are best-effort and the final fallback is "UTC".
+ * Server detection on Linux checks SWITCHROOM_HOST_TZ first (baked into
+ * the hostd container environment at `switchroom hostd install` time so
+ * that in-container `switchroom apply` sees the host's real zone, not the
+ * container's Etc/UTC default). Falls back to /etc/timezone (Debian /
+ * Ubuntu convention), then /etc/localtime (a symlink into the zoneinfo
+ * database — we extract the tail after `zoneinfo/`). Container-default
+ * UTC (/etc/localtime → Etc/UTC with no /etc/timezone) is treated as
+ * "unknown / no signal" and falls through to the UTC hard-fallback, which
+ * emits a loud warning.
  */
 
 import { readFileSync, readlinkSync } from "node:fs";
@@ -47,6 +52,20 @@ export interface ResolveTimezoneOpts {
    * undefined if it isn't a symlink / doesn't exist. Exposed for tests.
    */
   readLocaltimeLink?: () => string | undefined;
+  /**
+   * Override process.env for tests (used to inject SWITCHROOM_HOST_TZ
+   * without touching the real environment).
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Called when the resolver falls all the way through to the UTC
+   * hard-fallback (no yaml entry, no SWITCHROOM_HOST_TZ, no /etc/timezone,
+   * and /etc/localtime resolves to a bare container default). This is
+   * almost always a misconfiguration — production callers wire this to
+   * console.warn so the operator sees it on apply/reconcile. Exposed for
+   * tests to capture output without polluting stdout.
+   */
+  onUtcFallback?: () => void;
 }
 
 function defaultReadEtcTimezone(): string | undefined {
@@ -88,39 +107,98 @@ export function extractZoneFromLocaltimeLink(target: string): string | undefined
 }
 
 /**
- * Probe the host for its configured timezone, returning "UTC" only as
- * the last resort. See file header for the cascade order the rest of
- * the resolver walks before falling here.
+ * The set of bare UTC-equivalent zone strings that a Debian/Ubuntu base
+ * image emits on a container with no explicit timezone configured. When
+ * `/etc/localtime` resolves to one of these AND there is no
+ * `/etc/timezone` file, we treat the result as "unknown / no signal from
+ * the container" and fall through to the UTC hard-fallback in the caller
+ * rather than silently accepting UTC as the real timezone.
+ *
+ * Rationale: a fresh Debian/Ubuntu container ships with
+ * `/etc/localtime → /usr/share/zoneinfo/Etc/UTC` and no `/etc/timezone`.
+ * That is indistinguishable from an operator who genuinely wants UTC — EXCEPT
+ * we also have `SWITCHROOM_HOST_TZ` as a signal layer above this. If that
+ * env var is absent AND the container is showing a bare UTC symlink with no
+ * `/etc/timezone`, we assume we are inside a container (or an exotic host
+ * that truly has no timezone configured) and emit the loud warning instead
+ * of silently baking UTC into every agent.
+ */
+const CONTAINER_DEFAULT_UTC_ZONES = new Set([
+  "UTC",
+  "Etc/UTC",
+  "Etc/Universal",
+  "Universal",
+]);
+
+/**
+ * Probe the host for its configured timezone.
+ *
+ * Cascade (highest to lowest priority):
+ *   1. `SWITCHROOM_HOST_TZ` env var — baked into the hostd container at
+ *      `switchroom hostd install` time from the host's real /etc/timezone
+ *      or /etc/localtime. This is the primary signal for in-container runs.
+ *   2. `/etc/timezone` — Debian/Ubuntu convention; absent in containers.
+ *   3. `/etc/localtime` symlink — present everywhere; BUT if it resolves to
+ *      a bare container-default UTC zone (Etc/UTC, UTC, …) AND there was no
+ *      `/etc/timezone`, we treat that as "no signal" and return undefined so
+ *      the caller can fall through to the UTC hard-fallback with a warning.
+ *
+ * Returns undefined (not "UTC") when no genuine signal is found, so the
+ * caller can distinguish "detected UTC" from "no signal → fallback to UTC".
  */
 export function detectServerTimezone(
   opts: ResolveTimezoneOpts = {},
-): string {
+): string | undefined {
   const readEtc = opts.readEtcTimezone ?? defaultReadEtcTimezone;
   const readLink = opts.readLocaltimeLink ?? defaultReadLocaltimeLink;
+  const env = opts.env ?? process.env;
 
+  // Layer 1: SWITCHROOM_HOST_TZ — baked in by `hostd install` on the host,
+  // where /etc/localtime correctly points at Australia/Melbourne (or wherever).
+  // This is the only reliable signal when `switchroom apply` runs inside the
+  // hostd container (whose /etc/localtime → Etc/UTC regardless of host zone).
+  const hostTzEnv = env.SWITCHROOM_HOST_TZ?.trim();
+  if (hostTzEnv && hostTzEnv.length > 0) return hostTzEnv;
+
+  // Layer 2: /etc/timezone — absent in containers, reliable on real hosts.
   const fromEtc = readEtc();
   if (fromEtc) return fromEtc;
 
+  // Layer 3: /etc/localtime symlink — present in containers but typically
+  // points at Etc/UTC (the Debian base image default). Accept it only if it
+  // resolves to a non-bare-UTC zone, so we don't silently bake UTC into an
+  // agent fleet running inside a container.
   const linkTarget = readLink();
   if (linkTarget) {
     const extracted = extractZoneFromLocaltimeLink(linkTarget);
-    if (extracted) return extracted;
+    if (extracted && !CONTAINER_DEFAULT_UTC_ZONES.has(extracted)) {
+      return extracted;
+    }
   }
 
-  return "UTC";
+  // No genuine signal found. Return undefined so the caller can emit a loud
+  // warning and fall back to "UTC" explicitly.
+  return undefined;
 }
 
 /**
  * Resolve an agent's effective timezone.
  *
- * Cascade: agent → profile-merged-in → switchroom.timezone → server
- * detection → "UTC". All but the first branch are handled implicitly:
- * by the time mergeAgentConfig + resolveAgentConfig have run on the
- * input, any profile-level or defaults-level timezone has already
- * landed on `resolvedAgent.timezone`. This function just layers the
- * global `switchroom.timezone` on top (which is NOT merged through the
- * agent cascade because it lives on the root block, not in defaults/
- * profile) and then falls back to server detection.
+ * Cascade (highest to lowest priority):
+ *   1. agent.timezone / profile.timezone / defaults.timezone  (explicit yaml override)
+ *   2. switchroom.timezone                                     (global yaml override)
+ *   3. detectServerTimezone()                                  (SWITCHROOM_HOST_TZ → /etc/timezone → /etc/localtime)
+ *   4. "UTC" hard-fallback                                     (loud warning — almost always a misconfiguration)
+ *
+ * Steps 1–2 are handled implicitly: by the time mergeAgentConfig + resolveAgentConfig
+ * have run, any profile-level or defaults-level timezone has already landed on
+ * `resolvedAgent.timezone`. This function layers the global `switchroom.timezone`
+ * on top (which is NOT merged through the agent cascade because it lives on the
+ * root block, not in defaults/profile) and then falls back to host detection.
+ *
+ * The UTC hard-fallback fires `opts.onUtcFallback` (if provided) so callers can
+ * emit a loud warning to the operator. Scaffold/reconcile wires this to
+ * console.warn; tests inject a no-op or a spy.
  */
 export function resolveTimezone(
   config: SwitchroomConfig,
@@ -133,7 +211,13 @@ export function resolveTimezone(
   // the root block. Tolerate the undefined read rather than breaking them.
   const global = config.switchroom?.timezone;
   if (global) return global;
-  return detectServerTimezone(opts);
+  const detected = detectServerTimezone(opts);
+  if (detected !== undefined) return detected;
+  // UTC hard-fallback: no explicit config, no SWITCHROOM_HOST_TZ, no
+  // /etc/timezone, and /etc/localtime looks like a bare container default.
+  // Fire the warning callback so the operator sees it on apply/reconcile.
+  opts.onUtcFallback?.();
+  return "UTC";
 }
 
 /**
