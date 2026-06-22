@@ -552,7 +552,12 @@ describe("evaluateFleetAllExhausted", () => {
     if (d.kind === "notify") expect(d.transition).toBe("entered");
   });
 
-  it("notifies (entered) on a genuine serve-blocking overage (out_of_credits) with a fresh probe", () => {
+  it("notifies (entered) when out_of_credits account has a FRESH probe (freshness drives corroboration, not the credits flag)", () => {
+    // NEW CONTRACT (fix/out-of-credits-serve-block): out_of_credits is
+    // informational — it does NOT corroborate exhaustion on its own. But a
+    // genuinely fresh probe (capturedAt within maxStaleMs) still corroborates.
+    // Result: still notifies — for the right reason (fresh snapshot), not the
+    // credits reason.
     const d = evaluateFleetAllExhausted({
       accounts: [
         {
@@ -569,8 +574,13 @@ describe("evaluateFleetAllExhausted", () => {
     if (d.kind === "notify") expect(d.transition).toBe("entered");
   });
 
-  it("out_of_credits corroborates exhaustion even when the snapshot is past the staleness ceiling", () => {
-    // A serve-blocking overage is exhaustion in its own right — age-independent.
+  it("out_of_credits does NOT corroborate exhaustion when the snapshot is past the staleness ceiling (probe-blind)", () => {
+    // NEW CONTRACT (fix/out-of-credits-serve-block): out_of_credits is
+    // informational, NOT exhaustion in its own right at any util. A stale
+    // snapshot with only out_of_credits provides no live corroboration →
+    // probe-blind → skip (no false fleet alert). Contrast with the test above:
+    // a FRESH probe with out_of_credits still notifies via freshness, not the
+    // credits flag.
     const d = evaluateFleetAllExhausted({
       accounts: [
         {
@@ -583,7 +593,8 @@ describe("evaluateFleetAllExhausted", () => {
       now: NOW,
       tuning: gate,
     });
-    expect(d.kind).toBe("notify");
+    expect(d.kind).toBe("skip");
+    if (d.kind === "skip") expect(d.reason).toBe("probe-blind");
   });
 
   it("skips (still) when all exhausted and already alerting — no re-spam", () => {

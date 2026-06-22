@@ -139,8 +139,10 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
     ).toBe("healthy");
   });
 
-  it("overageServeBlocking (out_of_credits) → out-of-credits, WINS over healthy util", () => {
-    // 0% util would otherwise classify healthy; the dead-credits signal wins.
+  it("overageServeBlocking (out_of_credits) at 0% util → healthy (informational only, DOES NOT BLOCK)", () => {
+    // THE KEY CHANGE: out_of_credits is no longer a state that beats healthy.
+    // A 0%-util account with out_of_credits serves fine. The annotation appears
+    // in formatStateCell, not as a separate classified state.
     expect(
       classifyState({
         exhausted: false,
@@ -148,10 +150,12 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
         window: win({ fiveHourPct: 0, weeklyPct: 0, overageServeBlocking: true }),
         now: NOW,
       }),
-    ).toBe("out-of-credits");
+    ).toBe("healthy"); // CHANGED: was "out-of-credits", now "healthy"
   });
 
-  it("overageServeBlocking wins over a maxed weekly window too", () => {
+  it("overageServeBlocking with maxed weekly window → weekly-walled (util wall governs, not overage)", () => {
+    // When the weekly util IS actually walled, the state is weekly-walled.
+    // overageServeBlocking is just an annotation on top of the util-driven verdict.
     expect(
       classifyState({
         exhausted: true,
@@ -159,7 +163,7 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
         window: win({ weeklyPct: 100, weeklyResetAt: WEEKLY_RESET, overageServeBlocking: true }),
         now: NOW,
       }),
-    ).toBe("out-of-credits");
+    ).toBe("weekly-walled"); // CHANGED: was "out-of-credits", now driven by util
   });
 
   it("org_level_disabled at 75% (overageServeBlocking false) → unchanged (healthy)", () => {
@@ -201,8 +205,8 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
     ).toBe("healthy");
   });
 
-  // ── #2494 Bug C — recoverable quota-exhausted vs billing-dead ──────────
-  it("Bug C: maxed 5h with a FUTURE reset → quota-exhausted (recoverable), NOT out-of-credits", () => {
+  // ── #2494 Bug C — recoverable quota-exhausted, thin probe ──────────
+  it("Bug C: maxed 5h with a FUTURE reset → quota-exhausted (recoverable)", () => {
     expect(
       classifyState({
         exhausted: false,
@@ -213,8 +217,9 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
     ).toBe("quota-exhausted");
   });
 
-  it("Bug C: out_of_credits (billing-dead) is distinct from quota-exhausted", () => {
-    // Same maxed 5h window, but a serve-blocking overage reason: billing-dead wins.
+  it("Bug C: out_of_credits with maxed 5h window → quota-exhausted (util wall governs, overage is annotation)", () => {
+    // THE KEY CHANGE: out_of_credits no longer wins over util-based classification.
+    // If the util wall fires, quota-exhausted is returned (not "out-of-credits").
     expect(
       classifyState({
         exhausted: false,
@@ -227,7 +232,7 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
         }),
         now: NOW,
       }),
-    ).toBe("out-of-credits");
+    ).toBe("quota-exhausted"); // CHANGED: was "out-of-credits", now "quota-exhausted"
   });
 
   it("Bug C: a thin/headerless probe → unprobed (renders unknown), never a confident 0%", () => {
@@ -242,7 +247,7 @@ describe("classifyState — the 5h-vs-weekly distinction", () => {
   });
 });
 
-describe("#2494 — formatStateCell quota-exhausted vs billing-dead, cells refill/thin-aware", () => {
+describe("#2494 — formatStateCell: out_of_credits informational annotation, not billing-dead state", () => {
   const baseRow = (window: WindowSnapshot, state: ScheduleRow["state"]): ScheduleRow => ({
     label: "x",
     isActive: false,
@@ -263,6 +268,28 @@ describe("#2494 — formatStateCell quota-exhausted vs billing-dead, cells refil
     );
     expect(cell).toContain("quota-exhausted");
     expect(cell).toMatch(/\d+[hm]/); // has a countdown
+  });
+
+  it("healthy with out_of_credits → shows 'healthy (overage off: out_of_credits)' annotation", () => {
+    // THE KEY CHANGE: out_of_credits is an informational annotation on a healthy row
+    const cell = formatStateCell(
+      baseRow(
+        { ...NONE, fiveHourPct: 0, weeklyPct: 0, source: "live", overageServeBlocking: true, overageReason: "out_of_credits" },
+        "healthy",
+      ),
+      NOW,
+    );
+    expect(cell).toBe("healthy (overage off: out_of_credits)");
+    expect(cell).not.toContain("billing disabled");
+    expect(cell).not.toContain("out-of-credits");
+  });
+
+  it("healthy WITHOUT out_of_credits → shows just 'healthy' with no annotation", () => {
+    const cell = formatStateCell(
+      baseRow({ ...NONE, fiveHourPct: 0, weeklyPct: 0, source: "live", overageServeBlocking: false }, "healthy"),
+      NOW,
+    );
+    expect(cell).toBe("healthy");
   });
 
   it("thin probe renders 5h/weekly cells as 'unknown', not 0%", () => {
@@ -439,9 +466,9 @@ describe("formatStateCell horizon", () => {
     expect(cell).not.toContain("27m");
   });
 
-  it("renders the out-of-credits state as billing-dead with the real reason (no timer)", () => {
-    // #2494 Bug C — billing-dead renders "billing disabled (<reason>)", NOT a
-    // countdown: it does not recover on a window roll.
+  it("out_of_credits at 0% util with healthy state → shows annotation, NOT billing-dead", () => {
+    // THE KEY CHANGE: overageServeBlocking no longer produces a "billing disabled"
+    // state. It is an informational annotation on a healthy/throttling row.
     const row: ScheduleRow = {
       label: "x",
       isActive: false,
@@ -456,11 +483,12 @@ describe("formatStateCell horizon", () => {
       },
       exhausted: false,
       exhaustedUntil: null,
-      state: "out-of-credits",
+      state: "healthy", // CHANGED: was "out-of-credits", now "healthy"
     };
     const cell = formatStateCell(row, NOW);
-    expect(cell).toBe("billing disabled (out_of_credits)");
-    expect(cell).not.toMatch(/\d+[dhm]/); // no countdown
+    expect(cell).toBe("healthy (overage off: out_of_credits)");
+    expect(cell).not.toContain("billing disabled");
+    expect(cell).not.toMatch(/^\d+[dhm]/); // no leading countdown
   });
 });
 
