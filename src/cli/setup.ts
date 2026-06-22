@@ -220,6 +220,18 @@ async function stepConfigFile(
       chalk.green(`  ${STEP_DONE} Config loaded`) +
         chalk.gray(` (${Object.keys(config.agents).length} agents)`),
     );
+    // Timezone safe-default for EXISTING configs (#2483 follow-up). A
+    // config that was written before the timezone wizard step (or by hand
+    // without a timezone entry) leaves every agent silently resolving to
+    // UTC on cloud VMs. Offer the same detect-and-prompt step here so
+    // re-running setup fixes the gap. Only runs when no explicit timezone
+    // is set at either the global or defaults level.
+    const hasExplicitTimezone =
+      config.switchroom?.timezone !== undefined ||
+      (config.defaults as Record<string, unknown> | undefined)?.timezone !== undefined;
+    if (!hasExplicitTimezone) {
+      await writeDetectedTimezone(resolve(existingConfig), nonInteractive);
+    }
     return { config, configPath: resolve(existingConfig) };
   }
 

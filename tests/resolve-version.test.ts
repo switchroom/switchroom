@@ -10,23 +10,30 @@ const pkgVersion = JSON.parse(
 ).version as string;
 
 describe("SWITCHROOM_VERSION", () => {
-  it("resolves to the authoritative package.json version", () => {
-    // resolve-version walks up from its own dir (src/cli) to the repo
-    // package.json — so the displayed version tracks package.json, not the
-    // (frequently stale, git-reverted) build-info constant.
-    expect(SWITCHROOM_VERSION).toBe(pkgVersion);
+  it("resolves to a valid semver string", () => {
+    // Must be a non-empty semver-shaped string (X.Y.Z or X.Y.Z-pre).
+    expect(SWITCHROOM_VERSION).toMatch(/^\d+\.\d+\.\d+/);
   });
 
-  it("does NOT silently report a stale build-info VERSION when they differ", () => {
-    // Regression for the v0.15.40 image reporting 0.15.39 (build-info lagged
-    // package.json). If build-info has drifted from package.json, the resolved
-    // version must follow package.json, not build-info.
-    if (BUILD_INFO_VERSION !== pkgVersion) {
+  it("prefers the build-info VERSION (tag-stamped on release builds)", () => {
+    // build-info.ts is stamped by scripts/build.mjs from the git tag via
+    // TAG_VERSION / GITHUB_REF at CI time. On release builds it is the
+    // authoritative source; on dev builds (npm run build without TAG_VERSION)
+    // it is re-stamped from package.json so they agree.
+    // Either way, SWITCHROOM_VERSION must equal BUILD_INFO_VERSION.
+    expect(SWITCHROOM_VERSION).toBe(BUILD_INFO_VERSION);
+  });
+
+  it("agrees with package.json on a fresh local build (build-info re-stamped)", () => {
+    // A local `npm run build` (no TAG_VERSION) re-stamps build-info from
+    // package.json. In a freshly-built checkout both agree; if they differ,
+    // build-info is the authoritative signal (tag build stamped correctly).
+    if (BUILD_INFO_VERSION === pkgVersion) {
+      // In sync — trivially fine.
       expect(SWITCHROOM_VERSION).toBe(pkgVersion);
-      expect(SWITCHROOM_VERSION).not.toBe(BUILD_INFO_VERSION);
-    } else {
-      // build-info happens to match (fresh build) — both agree, trivially fine.
-      expect(SWITCHROOM_VERSION).toBe(BUILD_INFO_VERSION);
     }
+    // If they differ this is a tag build; SWITCHROOM_VERSION correctly returns
+    // BUILD_INFO_VERSION (the tag-stamped value), not the stale package.json.
+    // No assertion needed here — the previous test already covers this.
   });
 });

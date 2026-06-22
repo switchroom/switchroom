@@ -25,11 +25,94 @@ function tryGit(cmd) {
   }
 }
 
-function generateBuildInfo() {
+/**
+ * Resolve the release version from the build environment.
+ *
+ * Priority order:
+ *   1. TAG_VERSION env var — set by docker-images.yml via
+ *      `TAG_VERSION="${GITHUB_REF#refs/tags/}"` when building from a tag.
+ *      This is the canonical source for release builds.
+ *   2. GITHUB_REF env var — direct tag ref from the GitHub Actions runner
+ *      environment (`refs/tags/vX.Y.Z`). Parsed here as a belt-and-suspenders
+ *      fallback for callers that set GITHUB_REF but not TAG_VERSION.
+ *   3. `git describe --tags --exact-match HEAD` — for local tag builds.
+ *      Returns null when HEAD is not exactly on a tag.
+ *   4. package.json `version` — dev/non-tag fallback only.
+ *
+ * Guard: when the resolved version came from a git tag and it doesn't match
+ * what TAG_VERSION says, we abort with a non-zero exit so the CI workflow
+ * fails loudly rather than shipping a mis-stamped image.
+ */
+function resolveVersion(inGit) {
   const pkg = JSON.parse(readFileSync(resolve(root, "package.json"), "utf-8"));
-  const version = pkg.version;
 
+  // Layer 1: explicit TAG_VERSION from the workflow (most reliable for CI).
+  const tagVersionEnv = process.env.TAG_VERSION?.trim();
+  if (tagVersionEnv) {
+    // Strip leading 'v' if present (tag is `v0.15.49`, version is `0.15.49`).
+    const v = tagVersionEnv.replace(/^v/, "");
+    if (v) {
+      console.log(`[build] version from TAG_VERSION env: ${v}`);
+      return { version: v, source: "tag-env" };
+    }
+  }
+
+  // Layer 2: GITHUB_REF — `refs/tags/vX.Y.Z`
+  const githubRef = process.env.GITHUB_REF?.trim();
+  if (githubRef && githubRef.startsWith("refs/tags/v")) {
+    const v = githubRef.replace(/^refs\/tags\/v/, "");
+    if (v) {
+      console.log(`[build] version from GITHUB_REF env: ${v}`);
+      return { version: v, source: "tag-env" };
+    }
+  }
+
+  // Layer 3: `git describe --tags --exact-match` — local tag builds.
+  if (inGit) {
+    const exactTag = tryGit("git describe --tags --exact-match HEAD");
+    if (exactTag && /^v\d+\.\d+\.\d+/.test(exactTag)) {
+      const v = exactTag.replace(/^v/, "");
+      console.log(`[build] version from git tag: ${v}`);
+      return { version: v, source: "git-tag" };
+    }
+  }
+
+  // Layer 4: package.json — dev/non-tag fallback.
+  console.log(`[build] version from package.json (dev/non-tag build): ${pkg.version}`);
+  return { version: pkg.version, source: "package-json" };
+}
+
+/**
+ * Mis-stamp guard: when we resolved a version from a tag AND TAG_VERSION is
+ * set (i.e. CI knows what the tag is), verify they agree. A mismatch means
+ * the build environment is inconsistent — abort rather than ship the wrong
+ * version string silently.
+ *
+ * This guard is intentionally STRICT on release builds (TAG_VERSION set) and
+ * silent on dev builds (no TAG_VERSION) so it never blocks local work.
+ */
+function assertVersionConsistency(resolvedVersion, source) {
+  const tagVersionEnv = process.env.TAG_VERSION?.trim();
+  if (!tagVersionEnv) return; // not a CI tag build — skip
+  const expected = tagVersionEnv.replace(/^v/, "");
+  if (resolvedVersion !== expected) {
+    console.error(
+      `[build] ERROR: version mis-stamp detected!\n` +
+      `  TAG_VERSION env says:  ${expected}\n` +
+      `  Resolved version (${source}): ${resolvedVersion}\n` +
+      `  Aborting build to prevent shipping the wrong version.`
+    );
+    process.exit(1);
+  }
+}
+
+function generateBuildInfo() {
   const inGit = tryGit("git rev-parse --is-inside-work-tree") === "true";
+
+  const { version, source: versionSource } = resolveVersion(inGit);
+
+  // Mis-stamp guard — abort on release builds if anything disagrees.
+  assertVersionConsistency(version, versionSource);
 
   const commitSha = inGit ? tryGit("git rev-parse --short HEAD") : null;
   const commitDate = inGit ? tryGit("git log -1 --format=%cI") : null;

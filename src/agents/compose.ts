@@ -575,7 +575,22 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
       // is pure modulo the server-detection probes, so two consecutive
       // calls return the same string — but consolidating to one call
       // keeps the surface obvious in tests.
-      timezone: resolveTimezone(config, resolved),
+      // onUtcFallback: fire a loud warning when no explicit timezone is
+      // set at any config layer AND server detection yielded nothing
+      // (bare cloud VM / UTC container). This is the non-wizard code
+      // path that previously silently baked UTC into every agent. The
+      // warning surfaces on `switchroom apply` / `switchroom agent
+      // reconcile` — the ops that regenerate the compose file.
+      timezone: resolveTimezone(config, resolved, {
+        onUtcFallback: () => {
+          console.warn(
+            `  ⚠ timezone: no explicit timezone set and server detection resolved to UTC ` +
+              `for agent "${name}" — cron schedules and the per-turn time hint will ` +
+              `run in UTC. Add \`switchroom.timezone: "Region/City"\` (e.g. ` +
+              `"Australia/Melbourne") to switchroom.yaml to silence this warning.`,
+          );
+        },
+      }),
     });
     void resolved;
   }
