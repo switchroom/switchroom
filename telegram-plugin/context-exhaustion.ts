@@ -14,6 +14,18 @@
 export const CONTEXT_EXHAUSTION_MARKER = 'Prompt is too long'
 export const ORPHANED_REPLY_TIMEOUT_MS = 30_000
 
+/**
+ * Maximum number of times the orphaned-reply backstop timer may re-arm
+ * itself when a tool call is in flight, before it fires a synthetic turn_end
+ * anyway (to surface a genuinely hung tool).
+ *
+ * Math: 20 re-arms × 30 s fuse = 10 min of genuine tool activity before the
+ * backstop surfaces. Chosen to cover multi-phase agent turns (write → compile
+ * → test → fix loop) while still catching a truly wedged single tool within a
+ * reasonable wall-clock bound.
+ */
+export const ORPHANED_REPLY_MAX_REARMS = 20
+
 export function isContextExhaustionText(text: string): boolean {
   return text.includes(CONTEXT_EXHAUSTION_MARKER)
 }
