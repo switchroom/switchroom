@@ -171,7 +171,7 @@ Handlebars.registerHelper("isNumber", (value: unknown) => {
 // The _shared/ directory is underscore-prefixed (like _base/) and is not
 // listed by listAvailableProfiles() — it's framework-internal.
 const SHARED_FRAGMENTS_DIR = resolve(PROFILES_ROOT, "_shared");
-const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service"] as const;
+const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service", "execution-discipline"] as const;
 for (const name of SHARED_FRAGMENTS) {
   const fragPath = join(SHARED_FRAGMENTS_DIR, `${name}.md.hbs`);
   if (existsSync(fragPath)) {
@@ -220,6 +220,32 @@ export function renderAgentSelfServiceFragment(
   profilesRoot: string = PROFILES_ROOT,
 ): string {
   const fragPath = join(resolve(profilesRoot, "_shared"), "agent-self-service.md.hbs");
+  if (!existsSync(fragPath)) return "";
+  const source = readFileSync(fragPath, "utf-8");
+  const template = Handlebars.compile(source, { noEscape: true });
+  return template(context).trimEnd();
+}
+
+/**
+ * Render the execution-discipline fragment standalone for unconditional
+ * append to every agent's CLAUDE.md. Same pattern as
+ * {@link renderVaultProtocolFragment} — the grounding / verify-before-
+ * assert posture is fleet-wide work-quality guidance (serves the
+ * "feel-like-a-colleague" job: "verifies before claiming"). It must
+ * reach EVERY agent on EVERY profile, not just the default profile's
+ * CLAUDE.md — so it rides the unconditional-append carrier rather than
+ * living in a single profile template that the coding /
+ * executive-assistant / health-coach profiles never inherit.
+ *
+ * Returns the rendered Markdown, or an empty string if the fragment
+ * file is missing (e.g. partial install).
+ */
+export function renderExecutionDisciplineFragment(
+  context: Record<string, unknown> = {},
+  /** Override the profiles root; used by tests. */
+  profilesRoot: string = PROFILES_ROOT,
+): string {
+  const fragPath = join(resolve(profilesRoot, "_shared"), "execution-discipline.md.hbs");
   if (!existsSync(fragPath)) return "";
   const source = readFileSync(fragPath, "utf-8");
   const template = Handlebars.compile(source, { noEscape: true });

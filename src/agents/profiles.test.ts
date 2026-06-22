@@ -395,3 +395,88 @@ describe("agent-self-service partial — cron/skill MCP discoverability (#1163)"
     expect(fragment.length).toBeGreaterThan(500);
   });
 });
+
+describe("execution-discipline partial — fleet-wide grounding / verify-before-assert", () => {
+  // Background: the grounding rules ("verify mutable facts before
+  // claiming them", "final answer needs evidence", "weak result isn't a
+  // conclusion") only lived in the DEFAULT profile's CLAUDE.md, so
+  // coding / executive-assistant / health-coach — and every future
+  // profile — shipped without them. Serves the "feel-like-a-colleague"
+  // job ("verifies before claiming"). This fragment is the
+  // unconditional-append carrier that puts the posture on EVERY agent on
+  // EVERY profile. These tests pin the contract.
+
+  it("tells the agent to read ground truth rather than answer from memory", async () => {
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.toLowerCase()).toContain("ground truth");
+    expect(fragment.toLowerCase()).toMatch(/read live|leads, not facts|memory/);
+  });
+
+  it("requires final answers to carry evidence", async () => {
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.toLowerCase()).toContain("evidence");
+    expect(fragment.toLowerCase()).toContain("it should work");
+  });
+
+  it("warns against asserting an untested limit (fabricated boundaries)", async () => {
+    // A confabulated "I can't do that" is as wrong as a confabulated
+    // fact and stops work that was actually possible — the fragment must
+    // tell the agent to verify a claimed limit before stating it.
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.toLowerCase()).toMatch(/limit you haven't tested|fabricated boundary/);
+  });
+
+  it("says a weak or empty result isn't a conclusion", async () => {
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.toLowerCase()).toMatch(/weak or empty/);
+  });
+
+  it("is non-empty (file present and rendered)", async () => {
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.length).toBeGreaterThan(500);
+  });
+
+  it("is appended to a scaffolded CLAUDE.md regardless of profile", async () => {
+    // The core claim: the grounding posture reaches EVERY agent on EVERY
+    // profile, not just default. We rebuild the exact compose the
+    // scaffold does (profile CLAUDE.md.hbs render + unconditional append
+    // of the three shared fragments) for two structurally different
+    // profiles and assert the execution-discipline text appears in BOTH.
+    const {
+      renderExecutionDisciplineFragment,
+      renderVaultProtocolFragment,
+      renderAgentSelfServiceFragment,
+    } = await import("./profiles.js");
+    const Handlebars = (await import("handlebars")).default;
+
+    const marker = "Grounding — check before you assert";
+
+    const composeForProfile = (profileName: string): string => {
+      const profileDir = getProfilePath(profileName);
+      const hbsPath = join(profileDir, "CLAUDE.md.hbs");
+      let rendered = Handlebars.compile(readFileSync(hbsPath, "utf-8"), {
+        noEscape: true,
+      })({});
+      // Mirror scaffold.ts append order: vault, self-service, discipline.
+      for (const frag of [
+        renderVaultProtocolFragment(),
+        renderAgentSelfServiceFragment(),
+        renderExecutionDisciplineFragment(),
+      ]) {
+        if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
+      }
+      return rendered;
+    };
+
+    const defaultClaude = composeForProfile("default");
+    const codingClaude = composeForProfile("coding");
+
+    expect(defaultClaude).toContain(marker);
+    expect(codingClaude).toContain(marker);
+  });
+});
