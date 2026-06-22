@@ -11528,11 +11528,21 @@ function handleSessionEvent(ev: SessionEvent): void {
       // 'undelivered' terminal (😐) instead; the silent-end fallback below
       // carries the apology text. system/cron turns and NO_REPLY/HEARTBEAT_OK
       // turns (which return earlier) keep 👍 — their silence is legitimate.
-      const terminalReason = decideTerminalReason({
+      let terminalReason = decideTerminalReason({
         enabled: LIVENESS_TERMINAL_HONESTY,
         role: turn.role,
         finalAnswerDelivered: turn.finalAnswerDelivered,
       })
+      // #2527 review note 1 — worker-hold carve-out: if the turn is STILL
+      // legitimately working at turn_end (a background sub-agent the parent
+      // dispatched is running on), don't prematurely paint 😐. Fall back to
+      // 'done' so the existing deferred-done path holds ✍️ until the worker
+      // completes (then 👍) — the worker-activity feed carries the progress.
+      // Only a turn that genuinely ended undelivered AND is not still working
+      // gets the honest 😐.
+      if (terminalReason === 'undelivered' && isLegitimatelyWorking(statusKey(chatId, threadId))) {
+        terminalReason = 'done'
+      }
       if (terminalReason === 'undelivered') {
         process.stderr.write(
           `telegram gateway: WARN turn_no_reply — user turn ended with an ` +
