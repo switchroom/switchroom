@@ -201,6 +201,32 @@ describe("generateCompose — refuses a /host-home prefix (2026-06-11/12 fleet o
   });
 });
 
+describe("generateCompose — refuses /state/agent/home prefix (2026-06-23 fleet outage)", () => {
+  it("throws when homeDir is /state/agent/home — the agent container HOME", () => {
+    // The 2026-06-23 outage: a deploy ran inside an agent container whose HOME
+    // was /state/agent/home. With SWITCHROOM_HOST_HOME unset the generator fell
+    // back to homedir() = /state/agent/home and baked it as the bind-mount
+    // source prefix. Docker auto-created empty root-owned dirs at those paths on
+    // the host → vault-broker couldn't open switchroom.yaml (EISDIR), grants DB
+    // became a directory (SQLite "unable to open"), fleet dead.
+    // assertPlausibleHostHome must catch /state/agent/home — the original
+    // /host-home-only guard let it sail through.
+    expect(() =>
+      generateCompose({ config: makeConfig({ klanker: {} }), homeDir: "/state/agent/home" }),
+    ).toThrow();
+  });
+  it("throws for the /state parent prefix", () => {
+    expect(() =>
+      generateCompose({ config: makeConfig({ klanker: {} }), homeDir: "/state" }),
+    ).toThrow();
+  });
+  it("throws for arbitrary /state/… sub-paths", () => {
+    expect(() =>
+      generateCompose({ config: makeConfig({ klanker: {} }), homeDir: "/state/config" }),
+    ).toThrow();
+  });
+});
+
 describe("allocateAgentUid", () => {
   it("returns UID in the reserved range", () => {
     for (const name of ["klanker", "coach", "finn", "ziggy", "alpha", "z9"]) {

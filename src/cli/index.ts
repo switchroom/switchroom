@@ -42,6 +42,7 @@ import { registerAgentConfigMcpCommand } from "./mcp-agent-config.js";
 import { registerHostdMcpCommand } from "./mcp-hostd.js";
 import { registerHostdCommand } from "./hostd.js";
 import { registerWebdCommand } from "./webd.js";
+import { registerHostCommand } from "./host-repair.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -110,3 +111,4 @@ registerAgentConfigMcpCommand(program);
 registerHostdMcpCommand(program);
 registerHostdCommand(program);
 registerWebdCommand(program);
+registerHostCommand(program);

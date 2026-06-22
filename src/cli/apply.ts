@@ -68,7 +68,7 @@ import { refreshAgentConnectionHealth } from "../agents/connection-health.js";
 import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { allocateAgentUid } from "../agents/compose.js";
-import { writeComposeFile, resolveHostSwitchroomConfigPath } from "./write-compose.js";
+import { writeComposeFile, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
 import { detectInstallType } from "./install-detect.js";
 import {
   resolveOperatorUid,
@@ -284,7 +284,11 @@ function hasVaultRefs(value: unknown): boolean {
  * commands.
  */
 async function ensureHostMountSources(config: SwitchroomConfig): Promise<void> {
-  const home = homedir();
+  // Seed bind sources under the HOST home via the same fail-closed resolver the
+  // compose generator uses — NOT bare homedir(). In a container without
+  // SWITCHROOM_HOST_HOME this THROWS instead of seeding under the container HOME
+  // (the independent autodir vector that ran before compose write, 2026-06-23).
+  const home = resolveHostHomeForCompose();
   const dirs = [
     join(home, ".switchroom", "approvals"),
     join(home, ".switchroom", "scheduler"),
@@ -1216,6 +1220,10 @@ export const SELF_ELEVATE_PRESERVED_ENV = [
   "HOME",              // ~/.switchroom resolution
   "SWITCHROOM_CONFIG", // override of the default config path
   "PATH",              // so child shell-outs find their tools
+  "SWITCHROOM_HOST_HOME", // host home baked into compose bind sources — MUST
+                          // survive the sudo boundary, else the resolver throws
+                          // (or, pre-fix, the fallback poisoned the fleet). #2026-06-23
+  "SWITCHROOM_HOSTD_CONTEXT", // marks the blessed hostd deploy path
 ] as const;
 
 /**

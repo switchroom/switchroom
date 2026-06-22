@@ -894,6 +894,35 @@ sweep on success. Reachable from any agent DM via `/upgradestatus`
 (admin-gated; uses hostd on docker hosts, falls back to a clean
 host-CLI error if hostd is unreachable).
 
+### Deploy reliability — never poison host bind-mounts
+
+**The invariant:** deploys derive the operator home from
+`SWITCHROOM_HOST_HOME`, set by the host shell (`apply`'s sudo
+preservation chain) or by hostd. They never derive it from the
+container's ambient `HOME`.
+
+**Operating rules:**
+
+- **Always deploy from the host shell or via hostd.** Both set
+  `SWITCHROOM_HOST_HOME`. Running `switchroom apply` / `update` from
+  the host shell is the default; `/update apply` in Telegram dispatches
+  through hostd.
+- **Never deploy via an ad-hoc helper container** that mounts the
+  operator home or `~/.docker` writable (e.g. `docker run <agent-image>
+  switchroom update`). The in-process guards will throw on a post-fix
+  image — but a pre-fix image silently bakes the container `HOME` as
+  bind-mount sources, causing Docker to auto-create empty root-owned dirs
+  on the host and crashing the fleet (the 2026-06-23 outage, 5 h down).
+- **If `docker compose` breaks host-wide**, check whether
+  `~/.docker/cli-plugins/docker-compose` is a directory instead of
+  the plugin binary — Docker auto-dir'd it during a poisoned deploy.
+  Remove it and reinstall the plugin.
+- **Recovery:** `switchroom host repair-mounts` removes auto-dir
+  artifacts; then `switchroom apply` from the host shell regenerates a
+  clean compose.
+
+Design record: `reference/rfcs/deploy-reliability.md`.
+
 ### Code ≠ runtime
 
 A rebuild updates `dist/`. It does **not** update running agents —

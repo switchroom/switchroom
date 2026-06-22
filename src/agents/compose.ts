@@ -11,7 +11,12 @@
  * tests/docker/compose-generator.test.ts). The host-filesystem
  * caveat covers the optional skills/credentials bind mounts (#907)
  * that we only emit when the source dirs actually exist — docker
- * compose `up` hard-fails when a `:ro` bind source is missing.
+ * compose only emits them when the source exists. NOTE: a missing `:ro`
+ * bind source does NOT make `docker compose up` hard-fail — Docker silently
+ * auto-creates the missing SOURCE as a root-owned directory (the 2026-06-23
+ * fleet outage). The real backstops are assertPlausibleHostHome (below, at
+ * generation time) and the pre-flight bind-source validator the deploy path
+ * runs before `up` (see src/cli/preflight-mounts.ts).
  *
  * Identity model:
  *   - Each agent gets a deterministic UID in 10001..10999 derived
@@ -28,6 +33,53 @@ import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "no
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { isValidTimezone } from "../config/schema.js";
+
+/**
+ * In-container filesystem roots that are NEVER a valid HOST home. The
+ * compose generator bakes `homePrefix` as the leading segment of every
+ * host-path bind source; if it resolves to one of these, Docker auto-creates
+ * empty root-owned dirs on the host and the fleet dies (start.sh missing →
+ * exec 127; broker EISDIR / SQLite "unable to open"). The 2026-06-23 outage
+ * used `/state/agent/home` (the agent container's HOME); the 2026-06-11/12
+ * outages used `/host-home` (hostd's mount point). Both — and the whole class
+ * — are caught here.
+ */
+const CONTAINER_ROOT_PREFIXES = [
+  "/host-home", // hostd's in-container mount point of the host home (2026-06-11/12)
+  "/state",     // agent/singleton container state root, incl. /state/agent/home (2026-06-23)
+  "/run",       // container runtime dir — never a host home
+  // NOTE: deliberately NOT /tmp — tests (and some tooling) legitimately use a
+  // mkdtemp dir under /tmp as a fake homeDir, and no real fleet uses /tmp as a
+  // host home. The actual poison vectors are the container-state roots above.
+];
+
+/**
+ * Refuse to bake an implausible host-home prefix into bind-mount sources.
+ * Allows the legacy literal `"${HOME}"` placeholder (resolved by docker at
+ * `up` time on the host) and any absolute path NOT under a known in-container
+ * root. Rejects the whole container-root class (generalizes the original
+ * `/host-home`-only guard that the 2026-06-23 `/state/agent/home` poison
+ * sailed through). Throws with the recovery path.
+ */
+export function assertPlausibleHostHome(homePrefix: string): void {
+  if (homePrefix === "${HOME}") return; // legacy placeholder, resolved on host at up-time
+  const bad =
+    !isAbsolute(homePrefix) ||
+    CONTAINER_ROOT_PREFIXES.some(
+      (p) => homePrefix === p || homePrefix.startsWith(p + "/"),
+    );
+  if (!bad) return;
+  throw new Error(
+    `compose: refusing to generate — the host-home prefix resolved to "${homePrefix}", ` +
+    `which is not a real host path (it looks like an in-container root). Emitting it as a ` +
+    `bind-mount source would make docker auto-create empty dirs on the host and crash the ` +
+    `fleet (start.sh missing → exec 127; broker EISDIR / SQLite "unable to open").\n\n` +
+    `Cause: a deploy ran inside a container without SWITCHROOM_HOST_HOME set to the real ` +
+    `host home (so it fell back to the container's HOME). Recovery: run \`switchroom apply\` ` +
+    `once from the HOST shell (not via an agent / a helper container), which regenerates the ` +
+    `compose with correct host paths and re-bakes a correct SWITCHROOM_HOST_HOME into the fleet.`,
+  );
+}
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import { resolveAgentConfig } from "../config/merge.js";
@@ -905,30 +957,14 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // preserves the older `${HOME}` shape for callers that haven't been
   // updated.
   const homePrefix = opts.homeDir ?? "${HOME}";
-  // Backstop (2026-06-11/12 fleet outages): `homePrefix` is the leading
-  // segment of EVERY host-path bind source, so it MUST be a host path. The
-  // one poison value is `/host-home` — the in-container mount point of the
-  // host home that hostd pins HOME to. If an in-container apply runs without
-  // SWITCHROOM_HOST_HOME set, homedir() returns /host-home and it leaks into
-  // every source: docker auto-creates empty `/host-home/...` dirs on the
-  // host, so the agent scaffold mount is empty (start.sh missing → exec
-  // fails 127) and the brokers EISDIR. Worse, that value gets baked back
-  // into the fleet as SWITCHROOM_HOST_HOME, self-perpetuating. Refuse to
-  // emit it — fail loud with the recovery path instead of generating a
-  // fleet-killing compose. (Root cause is fixed by hostd setting
-  // SWITCHROOM_HOST_HOME; this guards every other caller, forever.)
-  if (homePrefix === "/host-home" || homePrefix.startsWith("/host-home/")) {
-    throw new Error(
-      `compose: refusing to generate — the host-home prefix resolved to "${homePrefix}", ` +
-      `which is the IN-CONTAINER mount point, not a host path. Emitting it as a bind-mount ` +
-      `source would make docker create empty dirs on the host and crash the fleet (start.sh ` +
-      `missing → exec 127; broker EISDIR).\n\n` +
-      `Cause: \`apply\` ran inside a container without SWITCHROOM_HOST_HOME set to the real ` +
-      `host home. Recovery: run \`switchroom apply\` once from the HOST shell (not via an ` +
-      `agent / hostd), which regenerates the compose with correct host paths and re-bakes a ` +
-      `correct SWITCHROOM_HOST_HOME into the fleet.`,
-    );
-  }
+  // Backstop (2026-06-11/12 AND 2026-06-23 fleet outages): `homePrefix` is the
+  // leading segment of EVERY host-path bind source, so it MUST be a host path.
+  // assertPlausibleHostHome rejects the WHOLE class of in-container roots
+  // (/host-home, /state/agent/home, /state/*, /run/*, …), not just the single
+  // `/host-home` literal the original guard caught — the 2026-06-23 outage used
+  // /state/agent/home, which sailed straight through. Fail loud with the
+  // recovery path instead of generating a fleet-killing compose.
+  assertPlausibleHostHome(homePrefix);
   // Default container_name prefix matches the compose project name and
   // every operator command in the docs (`docker exec -it switchroom-
   // vault-broker ...`, `journalctl --user -u switchroom-vault-broker`).
