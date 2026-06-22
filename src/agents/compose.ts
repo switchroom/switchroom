@@ -11,7 +11,12 @@
  * tests/docker/compose-generator.test.ts). The host-filesystem
  * caveat covers the optional skills/credentials bind mounts (#907)
  * that we only emit when the source dirs actually exist — docker
- * compose `up` hard-fails when a `:ro` bind source is missing.
+ * compose only emits them when the source exists. NOTE: a missing `:ro`
+ * bind source does NOT make `docker compose up` hard-fail — Docker silently
+ * auto-creates the missing SOURCE as a root-owned directory (the 2026-06-23
+ * fleet outage). The real backstops are assertPlausibleHostHome (below, at
+ * generation time) and the pre-flight bind-source validator the deploy path
+ * runs before `up` (see src/cli/preflight-mounts.ts).
  *
  * Identity model:
  *   - Each agent gets a deterministic UID in 10001..10999 derived
@@ -28,6 +33,53 @@ import { existsSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "no
 import { join, isAbsolute, dirname, resolve } from "node:path";
 import type { SwitchroomConfig, AgentConfig, AgentBindMount } from "../config/schema.js";
 import { isValidTimezone } from "../config/schema.js";
+
+/**
+ * In-container filesystem roots that are NEVER a valid HOST home. The
+ * compose generator bakes `homePrefix` as the leading segment of every
+ * host-path bind source; if it resolves to one of these, Docker auto-creates
+ * empty root-owned dirs on the host and the fleet dies (start.sh missing →
+ * exec 127; broker EISDIR / SQLite "unable to open"). The 2026-06-23 outage
+ * used `/state/agent/home` (the agent container's HOME); the 2026-06-11/12
+ * outages used `/host-home` (hostd's mount point). Both — and the whole class
+ * — are caught here.
+ */
+const CONTAINER_ROOT_PREFIXES = [
+  "/host-home", // hostd's in-container mount point of the host home (2026-06-11/12)
+  "/state",     // agent/singleton container state root, incl. /state/agent/home (2026-06-23)
+  "/run",       // container runtime dir — never a host home
+  // NOTE: deliberately NOT /tmp — tests (and some tooling) legitimately use a
+  // mkdtemp dir under /tmp as a fake homeDir, and no real fleet uses /tmp as a
+  // host home. The actual poison vectors are the container-state roots above.
+];
+
+/**
+ * Refuse to bake an implausible host-home prefix into bind-mount sources.
+ * Allows the legacy literal `"${HOME}"` placeholder (resolved by docker at
+ * `up` time on the host) and any absolute path NOT under a known in-container
+ * root. Rejects the whole container-root class (generalizes the original
+ * `/host-home`-only guard that the 2026-06-23 `/state/agent/home` poison
+ * sailed through). Throws with the recovery path.
+ */
+export function assertPlausibleHostHome(homePrefix: string): void {
+  if (homePrefix === "${HOME}") return; // legacy placeholder, resolved on host at up-time
+  const bad =
+    !isAbsolute(homePrefix) ||
+    CONTAINER_ROOT_PREFIXES.some(
+      (p) => homePrefix === p || homePrefix.startsWith(p + "/"),
+    );
+  if (!bad) return;
+  throw new Error(
+    `compose: refusing to generate — the host-home prefix resolved to "${homePrefix}", ` +
+    `which is not a real host path (it looks like an in-container root). Emitting it as a ` +
+    `bind-mount source would make docker auto-create empty dirs on the host and crash the ` +
+    `fleet (start.sh missing → exec 127; broker EISDIR / SQLite "unable to open").\n\n` +
+    `Cause: a deploy ran inside a container without SWITCHROOM_HOST_HOME set to the real ` +
+    `host home (so it fell back to the container's HOME). Recovery: run \`switchroom apply\` ` +
+    `once from the HOST shell (not via an agent / a helper container), which regenerates the ` +
+    `compose with correct host paths and re-bakes a correct SWITCHROOM_HOST_HOME into the fleet.`,
+  );
+}
 import { scheduleNeedsCronSession } from "../scheduler/cron-routing.js";
 import { applyDefaultTier } from "../scheduler/tier-selector.js";
 import { resolveAgentConfig } from "../config/merge.js";
@@ -824,7 +876,7 @@ function readStrippedCaps(agent: AgentConfig): string[] {
 
 /**
  * Does a conditional-mount SOURCE resolve to a real host path? Used to gate
- * optional `:ro` bind mounts (docker `up` hard-fails on a missing source).
+ * optional `:ro` bind mounts (Docker auto-creates a missing source as an empty dir).
  *
  * `existsSync` (which FOLLOWS symlinks) is the common case and handles real
  * dirs + symlinks whose target resolves in this filesystem. But some
@@ -905,30 +957,14 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // preserves the older `${HOME}` shape for callers that haven't been
   // updated.
   const homePrefix = opts.homeDir ?? "${HOME}";
-  // Backstop (2026-06-11/12 fleet outages): `homePrefix` is the leading
-  // segment of EVERY host-path bind source, so it MUST be a host path. The
-  // one poison value is `/host-home` — the in-container mount point of the
-  // host home that hostd pins HOME to. If an in-container apply runs without
-  // SWITCHROOM_HOST_HOME set, homedir() returns /host-home and it leaks into
-  // every source: docker auto-creates empty `/host-home/...` dirs on the
-  // host, so the agent scaffold mount is empty (start.sh missing → exec
-  // fails 127) and the brokers EISDIR. Worse, that value gets baked back
-  // into the fleet as SWITCHROOM_HOST_HOME, self-perpetuating. Refuse to
-  // emit it — fail loud with the recovery path instead of generating a
-  // fleet-killing compose. (Root cause is fixed by hostd setting
-  // SWITCHROOM_HOST_HOME; this guards every other caller, forever.)
-  if (homePrefix === "/host-home" || homePrefix.startsWith("/host-home/")) {
-    throw new Error(
-      `compose: refusing to generate — the host-home prefix resolved to "${homePrefix}", ` +
-      `which is the IN-CONTAINER mount point, not a host path. Emitting it as a bind-mount ` +
-      `source would make docker create empty dirs on the host and crash the fleet (start.sh ` +
-      `missing → exec 127; broker EISDIR).\n\n` +
-      `Cause: \`apply\` ran inside a container without SWITCHROOM_HOST_HOME set to the real ` +
-      `host home. Recovery: run \`switchroom apply\` once from the HOST shell (not via an ` +
-      `agent / hostd), which regenerates the compose with correct host paths and re-bakes a ` +
-      `correct SWITCHROOM_HOST_HOME into the fleet.`,
-    );
-  }
+  // Backstop (2026-06-11/12 AND 2026-06-23 fleet outages): `homePrefix` is the
+  // leading segment of EVERY host-path bind source, so it MUST be a host path.
+  // assertPlausibleHostHome rejects the WHOLE class of in-container roots
+  // (/host-home, /state/agent/home, /state/*, /run/*, …), not just the single
+  // `/host-home` literal the original guard caught — the 2026-06-23 outage used
+  // /state/agent/home, which sailed straight through. Fail loud with the
+  // recovery path instead of generating a fleet-killing compose.
+  assertPlausibleHostHome(homePrefix);
   // Default container_name prefix matches the compose project name and
   // every operator command in the docs (`docker exec -it switchroom-
   // vault-broker ...`, `journalctl --user -u switchroom-vault-broker`).
@@ -1938,7 +1974,7 @@ function emitAgentService(
     //
     // Gated on `existsSync` because the audit log is created lazily
     // by the broker on the first ACL decision — fresh installs may
-    // not have it yet, and docker compose `up` hard-fails when a
+    // not have it yet, and Docker auto-creates a missing source as an empty dir when a
     // `:ro` source is missing (same pattern as the skills /
     // credentials mounts below).
     if (existsSync(`${probeHome}/.switchroom/vault-audit.log`)) {
@@ -1953,7 +1989,7 @@ function emitAgentService(
     // history. Same existsSync guard as the vault audit log — hostd
     // creates the file lazily on the first privileged-verb request, so
     // a fresh install may not have it yet and compose `up` would
-    // hard-fail on a missing :ro source.
+    // cause Docker to auto-create a missing :ro source as an empty dir.
     if (existsSync(`${probeHome}/.switchroom/host-control-audit.log`)) {
       lines.push(
         `      - ${homePrefix}/.switchroom/host-control-audit.log:/state/agent/home/.switchroom/host-control-audit.log:ro`,
@@ -1980,7 +2016,7 @@ function emitAgentService(
   // directory, not the file, so the daemon can bind the socket inside
   // it after starting. existsSync guard on the directory: if the
   // daemon hasn't run yet, the directory will be missing — compose
-  // `up` would hard-fail on a missing source. We bind read-write so
+  // Docker would auto-create a missing source as an empty dir. We bind read-write so
   // the daemon can chown the socket file from the host side; the agent
   // only connects.
   if (hostControlEnabled && existsSync(`${probeHome}/.switchroom/hostd/${a.name}`)) {
@@ -2034,7 +2070,7 @@ function emitAgentService(
   // home-assistant). Mounted at the operator's host path so absolute
   // paths in scaffolded start.sh and yaml prompts Just Work; tilde
   // resolution is fixed by start.sh.hbs's $HOME/.switchroom symlink
-  // (#910). existsSync-guarded: docker compose `up` hard-fails on a
+  // (#910). existsSync-guarded: Docker auto-creates a missing source as an empty dir on a
   // missing `:ro` source. skills/ is operator-authored, non-secret
   // content (WS6 audit: LOW info-disclosure only) so it stays
   // fleet-wide.
@@ -2084,7 +2120,7 @@ function emitAgentService(
   // the agent process runs as the unprivileged uid (Dockerfile.agent
   // `USER 10001`, compose `user: <uid>:<uid>`) on a `read_only: true`
   // rootfs with `cap_drop: ALL` + `no-new-privileges`, so `ln -sf
-  // /etc/localtime` would hard-fail. A docker-daemon bind mount is
+  // /etc/localtime` would be auto-created as an empty dir. A docker-daemon bind mount is
   // applied by the daemon (root) BEFORE the entrypoint and is exempt
   // from the read-only rootfs — the right layer for this. Source is the
   // host's zoneinfo file for the resolved zone. `a.timezone` is IANA-
@@ -2095,7 +2131,7 @@ function emitAgentService(
   // the bind source regardless of how the zone was resolved. Only
   // `/etc/localtime` is synced (not `/etc/timezone`); the Go/JVM readers
   // this targets read `/etc/localtime`, and the rest honor `TZ`.
-  // existsSync-guarded because docker compose `up` hard-fails on a missing
+  // existsSync-guarded because Docker auto-creates a missing source as an empty dir; a missing
   // bind source and an exotic host may lack tzdata — when absent we skip
   // and fall back to the env-var path (the cosmetic 95% case). Same host
   // path inside the container, so a plain absolute bind with no
@@ -2211,7 +2247,7 @@ function emitAgentService(
   // source-repo or npm-package skills/ dir — e.g.
   // `<repo>/skills/skill-creator`) resolve inside the container.
   // Guard with existsSync because the resolved path may not exist in
-  // exotic test setups and docker compose `up` hard-fails on missing
+  // exotic test setups and Docker auto-creates a missing source as an empty dir on missing
   // `:ro` sources. Skip when the pool path is already covered by the
   // operator skills mount above (no duplicate volume entries).
   // bundledSkillsPoolDir is homedir()-derived (container-real — `/host-home`

@@ -14,11 +14,12 @@
  */
 
 import { chownSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { SwitchroomConfig } from "../config/schema.js";
-import { generateCompose } from "../agents/compose.js";
+import { generateCompose, assertPlausibleHostHome } from "../agents/compose.js";
+import { isContainerContext } from "./agent-config.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { isDockerRuntime } from "../runtime-mode.js";
 import { resolveOperatorUid } from "./operator-uid.js";
@@ -100,6 +101,42 @@ export function resolveHostSwitchroomConfigPath(rawPath: string): string {
   return join(hostHome, ".switchroom", filename);
 }
 
+/**
+ * The single, fail-closed resolver for the HOST home that the compose generator
+ * (and the mount-source seeder) bake into every bind-mount source. This is the
+ * by-construction fix for the 2026-06-23 outage: NEVER silently derive the host
+ * home from the container's ambient HOME.
+ *
+ *   1. SWITCHROOM_HOST_HOME set + non-empty → validate it (assertPlausibleHostHome)
+ *      and use it. The blessed path (host shell, hostd) sets this.
+ *   2. else, inside a container → THROW (do not fall back to homedir(), which is
+ *      the container HOME like /state/agent/home — the poison).
+ *   3. else (host shell) → homedir().
+ *
+ * Replaces the old `process.env.SWITCHROOM_HOST_HOME || homedir()` at the
+ * write-compose call site AND the bare homedir() the apply mount-source seeder
+ * used — so both vectors fail loud instead of poisoning the fleet.
+ */
+export function resolveHostHomeForCompose(): string {
+  const envHome = process.env.SWITCHROOM_HOST_HOME;
+  if (envHome && envHome.trim().length > 0) {
+    assertPlausibleHostHome(envHome); // reject an explicitly-wrong value too
+    return envHome;
+  }
+  if (isContainerContext()) {
+    throw new Error(
+      `switchroom: refusing to deploy — running inside a container but SWITCHROOM_HOST_HOME ` +
+      `is not set. Deriving the HOST home from the container's HOME would bake container ` +
+      `paths (e.g. /state/agent/home) as bind-mount sources, and Docker would auto-create ` +
+      `empty dirs on the host — crashing the whole fleet (the 2026-06-23 outage).\n\n` +
+      `Recovery: run \`switchroom apply\`/\`update\` from the HOST shell, or via hostd ` +
+      `(both set SWITCHROOM_HOST_HOME). Do NOT deploy via an ad-hoc ` +
+      `\`docker run <agent-image> switchroom …\` that mounts the operator home.`,
+    );
+  }
+  return homedir();
+}
+
 /** Generate the compose content and write it (mode 0600). Always writes — same as apply. */
 export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteComposeResult> {
   const release = resolveRelease({ override: opts.releaseOverride, root: opts.config.release });
@@ -121,11 +158,12 @@ export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteCom
     imageTag,
     buildMode: opts.buildMode ?? "pull",
     buildContext: opts.buildContext,
-    // Bake the operator's HOME absolute path into volume sources (avoids
-    // `${HOME}` resolving to /root under sudo). Inside a container, homedir()
-    // returns the container user's home — so we prefer SWITCHROOM_HOST_HOME
-    // when available (it's baked in by compose.ts at apply time).
-    homeDir: process.env.SWITCHROOM_HOST_HOME || homedir(),
+    // Bake the operator's HOST HOME absolute path into volume sources (avoids
+    // `${HOME}` resolving to /root under sudo). Fail-closed resolver: uses
+    // SWITCHROOM_HOST_HOME (validated), THROWS inside a container when it's
+    // unset (never falls back to the container HOME — the 2026-06-23 poison),
+    // and uses homedir() only on a real host shell.
+    homeDir: resolveHostHomeForCompose(),
     // Home for FILESYSTEM probes (existsSync/mkdirSync gating optional mounts).
     // Unlike homeDir, this is the CONTAINER-REAL home — `homedir()` is
     // `/host-home` inside hostd (where the operator's dirs are bind-mounted)
@@ -147,7 +185,21 @@ export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteCom
   const previousImageTag = previous ? (AGENT_IMAGE_TAG_RE.exec(previous)?.[1] ?? null) : null;
 
   await mkdir(dirname(opts.composePath), { recursive: true });
-  await writeFile(opts.composePath, content, { encoding: "utf8", mode: 0o600 });
+  // Last-known-good backup + atomic write. If a deploy regenerates a bad
+  // compose, `<composePath>.bak` is the prior file the health-gated recreate
+  // (src/cli/update.ts) can roll back to. tmp+rename makes the swap atomic so a
+  // crash mid-write never leaves a truncated compose. Backup only when the
+  // prior content actually parsed as a real file (skip first-ever-write).
+  if (previous !== null) {
+    try {
+      await copyFile(opts.composePath, opts.composePath + ".bak");
+    } catch {
+      /* best-effort backup — never block the write */
+    }
+  }
+  const tmpPath = opts.composePath + ".tmp";
+  await writeFile(tmpPath, content, { encoding: "utf8", mode: 0o600 });
+  await rename(tmpPath, opts.composePath);
 
   // Keep the compose operator-owned when written under sudo. `apply` also
   // does this via its whole-tree restoreOperatorOwnership sweep, but the

@@ -540,6 +540,101 @@ export function checkUserDeclaredMcps(
 }
 
 /**
+ * Check for artifacts from the 2026-06-23 fleet outage where a container-
+ * context deploy auto-created missing bind-source paths as root-owned
+ * directories.
+ *
+ * Two checks:
+ *   (a) ~/.docker/cli-plugins/docker-compose exists as a DIRECTORY (not a
+ *       file/symlink) — this shadows the real docker-compose v2 plugin at
+ *       /usr/libexec/ and breaks `docker compose` host-wide.
+ *   (b) /state or /host-home exists at the filesystem root as a directory —
+ *       auto-dir artifact from a container-context deploy that wrote bind
+ *       sources rooted at /state/agent/home (container HOME).
+ *
+ * DETECT + INSTRUCT only — never auto-repairs. Exit-1 gate: both check
+ * results are returned as "fail" so the overall doctor exit code reflects them.
+ *
+ * Injectable deps for testing (avoids touching the real filesystem).
+ *
+ * @internal exported for testing
+ */
+export interface DeployMountsDeps {
+  /** Returns "dir" | "file-or-symlink" | "absent" for a given path */
+  pathKind: (p: string) => "dir" | "file-or-symlink" | "absent";
+}
+
+function defaultPathKind(p: string): "dir" | "file-or-symlink" | "absent" {
+  try {
+    const s = lstatSync(p);
+    return s.isDirectory() ? "dir" : "file-or-symlink";
+  } catch {
+    return "absent";
+  }
+}
+
+const DEFAULT_DEPLOY_MOUNTS_DEPS: DeployMountsDeps = { pathKind: defaultPathKind };
+
+export function checkDeployMounts(
+  opts?: {
+    home?: string;
+    deps?: DeployMountsDeps;
+  },
+): CheckResult[] {
+  const home = opts?.home ?? process.env.HOME ?? "/root";
+  const { pathKind } = opts?.deps ?? DEFAULT_DEPLOY_MOUNTS_DEPS;
+  const results: CheckResult[] = [];
+
+  // (a) Docker CLI plugins dir shadowing
+  const dockerComposePlugin = join(home, ".docker", "cli-plugins", "docker-compose");
+  const pluginKind = pathKind(dockerComposePlugin);
+  if (pluginKind === "dir") {
+    results.push({
+      name: "deploy mounts: docker-compose plugin shadow",
+      status: "fail",
+      detail:
+        `${dockerComposePlugin} is a DIRECTORY (auto-created by docker during a bad deploy). ` +
+        `This shadows the real docker-compose v2 plugin and breaks \`docker compose\` host-wide.`,
+      fix: `sudo rmdir ${dockerComposePlugin}`,
+    });
+  } else {
+    results.push({
+      name: "deploy mounts: docker-compose plugin shadow",
+      status: "ok",
+      detail: pluginKind === "absent"
+        ? `${dockerComposePlugin} absent (no shadow)`
+        : `${dockerComposePlugin} is a file/symlink (normal)`,
+    });
+  }
+
+  // (b) Bogus root-owned /state or /host-home top-level dir
+  for (const rootDir of ["/state", "/host-home"] as const) {
+    const kind = pathKind(rootDir);
+    if (kind === "dir") {
+      results.push({
+        name: `deploy mounts: bogus ${rootDir} dir`,
+        status: "fail",
+        detail:
+          `${rootDir} exists as a directory on the host root filesystem. ` +
+          `This is a docker auto-dir artifact from a container-context deploy ` +
+          `(bind source was /state/agent/home — the container HOME, not the host path).`,
+        fix: `sudo rm -rf ${rootDir}   # only if this is the bogus deploy artifact; verify first with: ls -la ${rootDir}`,
+      });
+    } else {
+      results.push({
+        name: `deploy mounts: bogus ${rootDir} dir`,
+        status: "ok",
+        detail: kind === "absent"
+          ? `${rootDir} absent (no artifact)`
+          : `${rootDir} is a file/symlink (unexpected but not the auto-dir artifact)`,
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
  * Deprecation notice (announced v0.12.0 → shims removed v0.13.0): WARN when
  * legacy `~/.clerk` state or the v0.6 host-side broker socket is present, so
  * operators migrate before the back-compat shims (src/config/paths.ts dual-
@@ -2765,6 +2860,7 @@ export function registerDoctorCommand(program: Command): void {
             title: "Config secrets (WS6-F3)",
             results: runInlinedSecretChecks(config, { configPath }),
           },
+          { title: "Deploy Mounts", results: checkDeployMounts() },
           { title: "Legacy State", results: checkLegacyState() },
           { title: "Vault", results: checkVault(config) },
           {

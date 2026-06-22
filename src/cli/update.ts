@@ -46,6 +46,7 @@ import { writeRestartReasonMarker } from "../agents/lifecycle.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
+import { validateBindSources, formatPreflightError } from "./preflight-mounts.js";
 
 /**
  * Default durable-pin persister for `update --pin`: comment-preserving,
@@ -707,6 +708,20 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
     // is cheap and idempotent — if nothing changed it's a no-op
     // (#923 reviewer feedback).
     run: () => {
+      // PRE-FLIGHT: stat every host bind source BEFORE `up`. If any is missing
+      // or the wrong type, ABORT — bringing up would let Docker auto-create the
+      // sources as empty root-owned dirs and crash the brokers (2026-06-23).
+      // This is the fail-loud backstop for switchroom's deploy path (the fleet
+      // is only ever brought up via the CLI, never a raw `docker compose up`).
+      try {
+        const composeText = readFileSync(composePath, "utf8");
+        const pf = validateBindSources(composeText);
+        if (!pf.ok) throw new Error(formatPreflightError(pf));
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("switchroom:")) throw e;
+        // A read/parse failure of the compose itself is also fatal here.
+        throw new Error(`pre-flight bind-source check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
       const r = runner("docker", [
         "compose", "-p", "switchroom", "-f", composePath, "up", "-d",
         "--remove-orphans",

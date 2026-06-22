@@ -1,5 +1,5 @@
 /**
- * Docker-mode doctor checks (Phase 1a).
+ * Docker-mode doctor checks (Phase 1a + runtime container-state).
  *
  * Runs in BOTH modes — the checks are gated on whether Docker is the
  * active runtime (env SWITCHROOM_RUNTIME === "docker") or whether a
@@ -20,9 +20,15 @@
  *      `user:` UID differs from the Dockerfile.agent baseline (the
  *      Dockerfile is identity-neutral, so this should always pass —
  *      check exists as a sanity rail against future Dockerfile drift).
+ *   5. checkContainerRuntimeHealth — RUNTIME check for the 2026-06-23
+ *      incident class: vault-broker / auth-broker / approval-kernel stuck
+ *      in "Restarting" or "Created", and agent containers stuck in "Created"
+ *      or "Restarting". Catches compose bind-source auto-dir'd as root-owned
+ *      dirs within minutes of deploy.
  */
 
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { allocateAgentUid, describeAgents } from "../agents/compose.js";
 import {
   detectSingletonDrift,
@@ -269,6 +275,181 @@ export function checkSingletonImageDrift(
 }
 
 /**
+ * A parsed row from `docker ps -a --format {{.Names}}\t{{.Status}}`.
+ * @internal exported for testing
+ */
+export interface ContainerRow {
+  name: string;
+  status: string;
+}
+
+/**
+ * Classify a container's status string into a coarse health bucket.
+ *
+ * Docker status strings look like:
+ *   "Up 3 hours (healthy)"      → running/healthy
+ *   "Up 2 minutes"               → running (no healthcheck)
+ *   "Restarting (1) 30 seconds"  → crash-looping
+ *   "Created"                    → stuck before first start
+ *   "Exited (1) 5 minutes ago"   → stopped
+ *
+ * @internal exported for testing
+ */
+export type ContainerHealth =
+  | "running-healthy"
+  | "running-no-healthcheck"
+  | "restarting"
+  | "created"
+  | "exited"
+  | "other";
+
+export function classifyContainerStatus(status: string): ContainerHealth {
+  const s = status.toLowerCase().trim();
+  if (s.startsWith("up ") && s.includes("(healthy)")) return "running-healthy";
+  if (s.startsWith("up ")) return "running-no-healthcheck";
+  if (s.startsWith("restarting")) return "restarting";
+  if (s === "created") return "created";
+  if (s.startsWith("exited")) return "exited";
+  return "other";
+}
+
+/**
+ * Injectable dep type for container-runtime checks so tests never shell out.
+ * @internal exported for testing
+ */
+export type DockerPsDeps = {
+  /**
+   * Returns rows from `docker ps -a --filter name=switchroom- --format {{.Names}}\t{{.Status}}`.
+   * Returns null if docker is unavailable / errored.
+   */
+  listContainers: () => ContainerRow[] | null;
+};
+
+/** Default (real) implementation — calls docker ps. */
+function defaultListContainers(): ContainerRow[] | null {
+  const r = spawnSync(
+    "docker",
+    [
+      "ps", "-a",
+      "--filter", "name=switchroom-",
+      "--format", "{{.Names}}\t{{.Status}}",
+    ],
+    { stdio: "pipe", timeout: 8000 },
+  );
+  if (r.error || r.status === null || r.status !== 0) return null;
+  const lines = r.stdout.toString().split("\n").filter(Boolean);
+  return lines.map((line) => {
+    const tab = line.indexOf("\t");
+    if (tab === -1) return { name: line.trim(), status: "" };
+    return { name: line.slice(0, tab).trim(), status: line.slice(tab + 1).trim() };
+  });
+}
+
+const DEFAULT_DOCKER_PS_DEPS: DockerPsDeps = { listContainers: defaultListContainers };
+
+/**
+ * Check runtime container health for the 2026-06-23 incident class.
+ *
+ * Incident: a container-context deploy auto-dir'd bind-source paths as
+ * root-owned dirs → vault-broker SQLite "unable to open database file" +
+ * auth-broker EISDIR → stuck in Restarting/Created → agents never reached
+ * "running" → fleet deaf 5h.
+ *
+ * This check surfaces the symptom (not the root cause) within seconds of
+ * deploy: singletons crash-looping or stuck-Created, and/or agent containers
+ * stuck in Created.
+ *
+ * FALSE-POSITIVE GUARD: an empty fleet (no agents at all, no agent containers)
+ * should NOT flag. Only flag when singletons are actually unhealthy OR agents
+ * are stuck. We do NOT require the singletons to be in a healthy state on a
+ * legitimately-empty fleet (the broker bind-presence healthcheck correctly
+ * reads "unhealthy" when there are no per-agent socket dirs mounted, which
+ * is normal when no agents exist).
+ *
+ * @internal exported for testing
+ */
+export function checkContainerRuntimeHealth(
+  config: SwitchroomConfig,
+  deps: DockerPsDeps = DEFAULT_DOCKER_PS_DEPS,
+): CheckResult[] {
+  const rows = deps.listContainers();
+  if (rows === null) {
+    // Docker unavailable — skip without false-alarming.
+    return [{
+      name: "container runtime health",
+      status: "skip",
+      detail: "docker ps unavailable — cannot check container runtime health",
+    }];
+  }
+
+  // Singletons we always check regardless of agent count.
+  const SINGLETON_NAMES = [
+    "switchroom-vault-broker",
+    "switchroom-auth-broker",
+    "switchroom-approval-kernel",
+  ] as const;
+
+  // Build a name→status map from the actual docker ps output.
+  const containerMap = new Map<string, ContainerHealth>();
+  for (const row of rows) {
+    containerMap.set(row.name, classifyContainerStatus(row.status));
+  }
+
+  const configuredAgents = Object.keys(config.agents ?? {});
+  const hasAgents = configuredAgents.length > 0;
+
+  // ---- Singleton health ----
+  const singletonProblems: string[] = [];
+  for (const name of SINGLETON_NAMES) {
+    const health = containerMap.get(name);
+    if (health === undefined) continue; // container not present at all — skip
+    if (health === "restarting" || health === "created") {
+      singletonProblems.push(`${name} (${health})`);
+    }
+  }
+
+  // ---- Agent stuck in Created/Restarting ----
+  // Only flag agent containers that are in the config AND stuck.
+  // An empty-fleet host (no agents configured) produces zero agent rows.
+  const agentProblems: string[] = [];
+  if (hasAgents) {
+    for (const agentName of configuredAgents) {
+      const containerName = `switchroom-${agentName}`;
+      const health = containerMap.get(containerName);
+      if (health === undefined) continue; // not yet started — skip
+      if (health === "created" || health === "restarting") {
+        agentProblems.push(`${containerName} (${health})`);
+      }
+    }
+  }
+
+  const allProblems = [...singletonProblems, ...agentProblems];
+
+  if (allProblems.length === 0) {
+    return [{
+      name: "container runtime health",
+      status: "ok",
+      detail: rows.length === 0
+        ? "no switchroom containers present"
+        : `${rows.length} container(s) checked — no stuck/crash-looping singletons or agents`,
+    }];
+  }
+
+  return [{
+    name: "container runtime health",
+    status: "fail",
+    detail:
+      `${allProblems.length} container(s) stuck/crash-looping (2026-06-23 incident signature): ` +
+      allProblems.join(", "),
+    fix:
+      "Root cause: docker auto-created missing bind-source paths as root-owned directories " +
+      "(/state/agent/home, ~/.docker/cli-plugins/docker-compose, etc.). " +
+      "Run `switchroom doctor` deploy-mounts section for specific paths. " +
+      "Fix bind sources first, then: `docker compose -p switchroom -f ~/.switchroom/compose/docker-compose.yml up -d`",
+  }];
+}
+
+/**
  * Aggregate runner — call from doctor.ts. Always returns an array so
  * the section renders consistently.
  */
@@ -277,6 +458,7 @@ export function runDockerChecks(args: {
   composeYaml?: string;
   dockerfileAgent?: string;
   active: boolean;
+  dockerPsDeps?: DockerPsDeps;
 }): CheckResult[] {
   if (!args.active) {
     return [{
@@ -302,5 +484,8 @@ export function runDockerChecks(args: {
       fix: "Run `switchroom reconcile` to generate it.",
     });
   }
+  // Runtime container health (2026-06-23 incident class) — always runs in
+  // docker mode regardless of whether we have a compose file to parse.
+  out.push(...checkContainerRuntimeHealth(args.config, args.dockerPsDeps));
   return out;
 }
