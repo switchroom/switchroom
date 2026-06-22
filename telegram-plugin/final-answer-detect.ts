@@ -3,9 +3,9 @@
  *
  * Background. An agent often ends a turn with its real answer as plain
  * assistant transcript text instead of a `reply` / `stream_reply` tool
- * call. The gateway renders that transcript as a live Telegram draft
- * (`sendMessageDraft`) and, at turn_end, retracts the draft — so the
- * answer is never finalized and the user watches it vanish (#1664).
+ * call. The gateway renders that transcript via the answer-lane stream
+ * and, at turn_end, retracts the preview — so the answer is never
+ * finalized and the user watches it vanish (#1664).
  *
  * The gateway's `replyCalled` flag flips on the FIRST reply / stream_reply
  * tool use and stays true for the rest of the turn. It cannot distinguish
@@ -23,9 +23,9 @@
  * gateway is a multi-thousand-line module that's expensive to import in a
  * test. See `telegram-plugin/tests/final-answer-detect.test.ts`.
  *
- * The fix re-prompts the model; it never materializes the draft into a
- * message (`reference/principles.md`: the model communicates, the
- * framework is the safety net). So a false "interim" classification is
+ * The fix re-prompts the model; it never silently drops the answer
+ * (`reference/principles.md`: the model communicates, the framework is
+ * the safety net). So a false "interim" classification is
  * cheap (one extra re-prompt) and a false "final" classification is the
  * dangerous one (a real answer left undelivered) — the length backstop
  * exists to make the dangerous miss rare.

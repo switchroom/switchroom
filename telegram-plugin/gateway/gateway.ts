@@ -105,7 +105,7 @@ import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
-import { parseVisibleAnswerStreamEnabled, parseDraftLaneRetiredEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
+import { parseVisibleAnswerStreamEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
 import {
   shouldSuppressToolActivity,
@@ -742,20 +742,6 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
 
-// Draft-answer-lane retirement (2026-06-05): default RETIRED so the live answer
-// lane uses a real, mtcute-observable message instead of the invisible
-// compose-box draft. Declared HERE (above the boot-probe block) because
-// `sendMessageDraftFn` below reads it — keep it above its first use to avoid a
-// temporal-dead-zone ReferenceError at boot. Kill switch
-// SWITCHROOM_DRAFT_ANSWER_LANE=0 restores the legacy draft.
-const DRAFT_ANSWER_LANE_RETIRED = parseDraftLaneRetiredEnabled(process.env.SWITCHROOM_DRAFT_ANSWER_LANE)
-
-// ─── sendMessageDraft boot probe ──────────────────────────────────────────
-// grammY 1.x exposes all Telegram Bot API methods through bot.api.raw.
-// bot.api.sendMessageDraft (the typed wrapper) takes chat_id as number, but
-// answer-stream passes chatId as string, so we bridge through raw with an
-// explicit Number() cast and positional → object param translation.
-const _rawSendMessageDraft = (bot.api.raw as unknown as Record<string, unknown>).sendMessageDraft
 const GRAMMY_VERSION: string = (() => {
   try {
     const raw = readFileSync(new URL('../../node_modules/grammy/package.json', import.meta.url), 'utf8')
@@ -764,22 +750,6 @@ const GRAMMY_VERSION: string = (() => {
     return 'unknown'
   }
 })()
-const sendMessageDraftFn: (
-  (chatId: string, draftId: number, text: string, params?: { message_thread_id?: number; parse_mode?: 'HTML' }) => Promise<unknown>
-) | undefined =
-  // When the draft lane is retired (default), force this undefined so BOTH
-  // consumers (the answer-stream config + the stream_reply handler) drop the
-  // draft transport and fall back to visible message transport — the single
-  // chokepoint for the retirement.
-  !DRAFT_ANSWER_LANE_RETIRED && typeof _rawSendMessageDraft === 'function'
-    ? (chatId, draftId, text, params) =>
-        (_rawSendMessageDraft as (args: Record<string, unknown>) => Promise<unknown>)({
-          chat_id: Number(chatId),
-          draft_id: draftId,
-          text,
-          ...(params ?? {}),
-        })
-    : undefined
 
 // ─── sendChecklist / editMessageChecklist boot probes ─────────────────────
 // grammY 1.x exposes new Telegram Bot API methods via bot.api.raw before the
@@ -5007,10 +4977,10 @@ function postLegacyBanner(
 // short-circuit to no-ops at runtime. `progressDriver` is typed `any`
 // so TS doesn't resolve `progressDriver?.X` to `never`.
 const streamMode = process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'
-// PR B: per-agent stream throttle override via channels.telegram.stream_throttle_ms.
-// When unset, draft-stream.ts applies transport-aware defaults (300 ms draft,
-// 1000 ms message). Parsed once at boot; sub-zero / NaN values fall back to
-// undefined so the per-transport default wins. See `src/agents/scaffold.ts`
+// Per-agent stream throttle override via channels.telegram.stream_throttle_ms.
+// When unset, draft-stream.ts applies DM/group defaults (400 ms DMs, 1000 ms
+// groups). Parsed once at boot; sub-zero / NaN values fall back to undefined
+// so the per-chat-type default wins. See `src/agents/scaffold.ts`
 // `channelsToEnv()` for the yaml → env wiring.
 const STREAM_THROTTLE_MS_OVERRIDE: number | undefined = (() => {
   const raw = process.env.SWITCHROOM_TG_STREAM_THROTTLE_MS
@@ -5020,74 +4990,30 @@ const STREAM_THROTTLE_MS_OVERRIDE: number | undefined = (() => {
 })()
 const TURN_FLUSH_SAFETY_ENABLED = isTurnFlushSafetyEnabled()
 
-// #869-Phase1 / openclaw-pattern. When SET, the answer-lane stream
-// (telegram-plugin/answer-stream.ts) renders the model's transcript
-// text as a USER-VISIBLE edit-in-place message instead of writing to
-// Telegram's invisible compose-box draft (which is the default and
-// supports the #1664 "retract + re-prompt" contract). With this flag
-// on:
-//   1. createAnswerStream is instantiated without `sendMessageDraft`,
-//      so it falls back to `sendMessage` + `editMessageText` for a
-//      real chat-timeline message (`answer-stream.ts:212-214`).
-//   2. minInitialChars is set to 1 — the first text chunk pushes a
-//      visible message immediately (TTFO under 5s for short turns).
-//   3. At turn_end, if the model never called reply / stream_reply
-//      AND the streamed message has substantive captured text, the
-//      gateway DOES NOT retract (which would delete a user-visible
-//      message the user has been reading live); it calls
-//      `stream.stop()` to freeze the current text as the final
-//      answer, records the message in dedup + history, and marks
-//      `turn.finalAnswerDelivered = true` so the #1664 silent-end
-//      re-prompt does not fire. Turn-flush is suppressed for this
-//      branch — its job (deliver captured text) is structurally
-//      already done by the visible stream.
-//   4. The reply-tool / stream_reply path is unchanged — when the
-//      model uses an explicit reply tool the prior streamed message
-//      is retracted (delete) and the reply takes over as before.
-// Trade-off: a stream-as-final-answer turn does NOT push a device
-// notification (Telegram does not notify on edits, and we choose
-// not to send a duplicate fresh message for the ping). For short
-// turns where the user is actively watching, this is the right
-// shape — they see the answer materialise live. For longer waits,
-// the cross-turn pending-progress system (#1445/#1669) is the
-// canonical surface and DOES ping at the appropriate boundaries.
-//
-// 2026-05-25: default flipped ON after a fleet-log audit showed a ~19%
-// framework-fallback ("still working…") rate — the visible stream gave an
-// immediate in-timeline signal that suppressed the silence-poke.
-//
-// 2026-06-03: default flipped back OFF (operator request). In practice the
-// visible stream delivered ~none of its intended benefit while imposing a
-// jarring cost:
-//   - Telegram rate-limits editMessageText to roughly once/second, so real
-//     "watch it type" streaming is impossible; and the model emits almost no
-//     interstitial assistant.text (it thinks → tool → reply), so the
-//     preliminary was a near-empty bubble (observed: 5–13 byte edits).
-//   - On every turn where the model calls the reply tool (≈always), the reply
-//     posts a SEPARATE canonical message and the stream RETRACTS (deletes) its
-//     preliminary — the user sees a raw bubble appear then vanish, replaced by
-//     the formatted reply. In supergroup topics it also mis-routed (preliminary
-//     → General, reply → topic). Net: an unformatted flash + a delete, no
-//     streaming value.
-// The anti-silence role the visible stream once filled is now covered by the
-// live ACTIVITY FEED (tool-use streaming, below), the "…typing" chat-action
-// loop, and `thinking_effort: low` (fast tool-less turns) — so off-by-default
-// no longer regresses the framework-fallback rate. With the flag off the lane
-// uses the invisible compose-box draft (the original default, #1664-compatible)
-// and the reply tool is the single canonical, formatted message.
+// When SET, the answer-lane stream (telegram-plugin/answer-stream.ts) renders
+// the model's transcript text as a USER-VISIBLE edit-in-place message. Default
+// OFF: the lane stays dormant and the reply tool is the single canonical
+// formatted message — no unformatted preliminary that flashes and gets deleted.
+// With this flag on, minInitialChars is set to 1 and the first text chunk opens
+// a visible preview immediately. At turn_end, if the model never called reply /
+// stream_reply AND the streamed message has substantive captured text, the
+// gateway materializes it as a pinged final answer (materialize()) and deletes
+// the silent preview. When the model uses an explicit reply tool the prior
+// streamed message is retracted instead.
+// The draft transport (sendMessageDraft) is permanently retired — both ON and
+// OFF use sendMessage + editMessageText; the difference is whether a visible
+// preview is opened at all.
 // Opt back IN per agent with SWITCHROOM_VISIBLE_ANSWER_STREAM=1.
 const ANSWER_STREAM_VISIBLE_ENABLED = parseVisibleAnswerStreamEnabled(
   process.env.SWITCHROOM_VISIBLE_ANSWER_STREAM,
 )
-// Single source of truth for the answer-lane behaviour (flash-decouple,
-// 2026-06-05). The visible preview gates on the visible flag ALONE; the draft
-// flag controls only the transport. Resolved here once and consulted at the
-// createAnswerStream config, the materialize-as-answer guard, and the boot log,
-// so all three can never drift back into the `visible || retired` conflation
-// that re-opened the flash. Total-enumerated in answer-stream-flag.test.ts.
+// Single source of truth for the answer-lane behaviour. The draft transport
+// (sendMessageDraft) is permanently retired — the lane is either VISIBLE
+// (opt-in) or DORMANT (the unconditional default: reply tool is the only
+// message). Resolved here once and consulted at the createAnswerStream config,
+// the materialize-as-answer guard, and the boot log.
 const ANSWER_LANE = resolveAnswerLaneConfig({
   visibleEnabled: ANSWER_STREAM_VISIBLE_ENABLED,
-  draftFnAvailable: sendMessageDraftFn != null,
 })
 
 // Whether to DELETE the activity/status feed when the final answer lands.
@@ -8366,9 +8292,8 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   }
 
   const access = loadAccess()
-  // Detect chat type for draft-transport selection.
+  // Detect chat type for throttle-default selection.
   // Private (DM) chats have positive numeric IDs; groups/channels are negative.
-  // Forum topics have a message_thread_id set — sendMessageDraft is unsupported there.
   const streamChatId = args.chat_id as string
   const streamIsPrivate = isDmChatId(streamChatId)
   const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
@@ -8458,7 +8383,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       logStreamingEvent,
       isPrivateChat: streamIsPrivate,
       isForumTopic: streamIsForumTopic,
-      ...(sendMessageDraftFn != null ? { sendMessageDraft: sendMessageDraftFn } : {}),
       // Issue #310: deliver the outbound count bump BEFORE forceCompleteTurn
       // so the terminal render sees outboundDeliveredCount > 0. The handler
       // calls this dep in that order internally.
@@ -8478,12 +8402,10 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       recordOutbound,
       ...(HISTORY_ENABLED ? { getLatestInboundMessageId } : {}),
       writeError: (line) => process.stderr.write(line),
-      // PR B: drop the legacy 600 ms compromise. When the operator sets
-      // `channels.telegram.stream_throttle_ms` in yaml, the env override
-      // wins; otherwise draft-stream's transport-aware default fires
-      // (300 ms draft / 1000 ms message). `throttleMs: undefined` is a
-      // signal — handlers downgrade to `?? undefined`, which then
-      // passes through to draft-stream where the default applies.
+      // When the operator sets `channels.telegram.stream_throttle_ms` in yaml,
+      // the env override wins; otherwise draft-stream's DM/group defaults apply
+      // (400 ms for DMs, 1000 ms for groups). `throttleMs: undefined` passes
+      // through to draft-stream where the per-chat-type default applies.
       ...(STREAM_THROTTLE_MS_OVERRIDE != null ? { throttleMs: STREAM_THROTTLE_MS_OVERRIDE } : {}),
       progressCardActive: streamMode === 'checklist',
     },
@@ -10635,52 +10557,16 @@ function handleSessionEvent(ev: SessionEvent): void {
         if (turn.answerStream == null) {
           turn.answerStream = createAnswerStream({
             chatId: turn.sessionChatId,
-            isPrivateChat: turn.isDm,
             threadId: turn.sessionThreadId,
-            // Transport selection:
-            // #869-Phase1 visible-answer-stream: omit the draft API so
-            // the lane edits a user-visible chat-timeline message
-            // (minInitialChars:1 opens it on the first chunk). The
-            // draft-mirror does NOT touch this lane — the canary proved
-            // the model emits almost no interstitial assistant.text
-            // (it thinks→tool→reply), so routing it to the draft just
-            // emptied the preview. The draft-mirror instead renders the
-            // tool_use stream (case 'tool_use' above) where the real
-            // signal lives. assistant.text keeps its visible-message
-            // home; the reply tool stays the canonical answer.
-            // Flag OFF (default): use the compose-box draft for DMs, and set
-            // minInitialChars effectively-infinite so the lane NEVER opens a
-            // visible chat message. This matters in supergroup TOPICS, where
-            // draft transport is unsupported (gateway.ts:6422) so the lane
-            // would otherwise fall to message transport and post a visible
-            // preview once interstitial text passed the default 50-char gate
-            // — which retract() then deletes (the unformatted flash, marko
-            // General). With the gate unreachable the only posted message is
-            // the canonical reply. (The gate is bypassed for DM draft
-            // transport, so DM draft streaming is unaffected.)
-            // VISIBLE preview gating decoupled from the draft-transport flag
-            // (2026-06-05 flash regression fix). The visible flag ALONE decides
-            // whether a user-visible preview opens; DRAFT_ANSWER_LANE_RETIRED
-            // controls only the TRANSPORT (whether sendMessageDraftFn exists).
-            // The earlier `|| DRAFT_ANSWER_LANE_RETIRED` here meant retiring the
-            // draft (the default since v0.14.68) silently forced minInitialChars:1
-            // → a visible preliminary opened on every streaming turn and was then
-            // retracted (deleted) when the reply tool fired — the exact "raw bubble
-            // appears, formatted reply lands, raw bubble vanishes" flash that
-            // turning the visible stream OFF (v0.14.52) was meant to remove. So
-            // v0.14.68 silently undid v0.14.52 fleet-wide. Now:
-            //   - VISIBLE on (opt-in) → minInitialChars:1, a real edit-in-place
-            //     preview (observable by UAT, silence-liveness reset on its sends).
-            //   - VISIBLE off (default) → minInitialChars:MAX so NO visible preview
-            //     ever opens; the reply tool is the single canonical formatted
-            //     message (no flash). With the draft retired (default) there is no
-            //     transport either, so the lane stays dormant; with the kill switch
-            //     DRAFT_ANSWER_LANE=0 the legacy compose-box draft transport is
-            //     restored (sendMessageDraftFn defined above, gate bypassed for DM
-            //     draft so #1664 DM draft streaming is unaffected).
-            ...(ANSWER_LANE.usesDraftTransport
-              ? { sendMessageDraft: sendMessageDraftFn, minInitialChars: ANSWER_LANE.minInitialChars }
-              : { minInitialChars: ANSWER_LANE.minInitialChars }),
+            // VISIBLE on (opt-in, SWITCHROOM_VISIBLE_ANSWER_STREAM=1) →
+            //   minInitialChars:1 opens a user-visible edit-in-place preview on the
+            //   first text chunk. At turn_end the preview is materialized as a pinged
+            //   final answer (materialize()) when the model never called reply.
+            // VISIBLE off (default) → minInitialChars:MAX so NO visible preview ever
+            //   opens; the reply tool is the single canonical formatted message
+            //   (no flash). The draft transport is permanently retired — both modes
+            //   use sendMessage + editMessageText for any message that does open.
+            minInitialChars: ANSWER_LANE.minInitialChars,
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
@@ -22607,11 +22493,9 @@ void (async () => {
 
       // Lane state (post flash-decouple): VISIBLE only when the visible flag is
       // Lane state from the single-source-of-truth resolver: 'visible' (preview
-      // on), 'draft' (compose-box transport), or 'dormant' (the default: no
-      // preview, no draft — reply tool is the only message). The old label
-      // wrongly reported 'visible(draft-retired)' for the dormant default, which
-      // masked the flash regression.
-      process.stderr.write(`telegram gateway: answer-stream lane=${ANSWER_LANE.state} draftFn=${sendMessageDraftFn != null ? 'available' : 'off'} visible=${ANSWER_STREAM_VISIBLE_ENABLED} draftRetired=${DRAFT_ANSWER_LANE_RETIRED} grammy=${GRAMMY_VERSION}\n`)
+      // Lane state: 'visible' (opt-in preview) or 'dormant' (default: reply
+      // tool is the only message). The draft transport is permanently retired.
+      process.stderr.write(`telegram gateway: answer-stream lane=${ANSWER_LANE.state} visible=${ANSWER_STREAM_VISIBLE_ENABLED} grammy=${GRAMMY_VERSION}\n`)
       process.stderr.write(`telegram gateway: starting bot polling pid=${process.pid} agent=${process.env.SWITCHROOM_AGENT_NAME ?? '-'} stateDir=${STATE_DIR} historyEnabled=${HISTORY_ENABLED} streamMode=${process.env.SWITCHROOM_TG_STREAM_MODE ?? 'checklist'}\n`)
       runnerHandle = run(bot, {
         runner: {

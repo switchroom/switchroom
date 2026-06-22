@@ -767,12 +767,12 @@ export const TelegramChannelSchema = z
       .nonnegative()
       .optional()
       .describe(
-        "Throttle window in ms between successive stream edits (or " +
-        "sendMessageDraft tics) during a turn. Lower = more responsive " +
-        "stream, higher = fewer API calls. Floored at 250 by draft-stream " +
-        "itself. Default 300 for draft transport (DMs) and 1000 for " +
-        "message transport (groups/forums). Override per-agent if a " +
-        "particular agent needs snappier or quieter streaming."
+        "Throttle window in ms between successive in-place stream edits " +
+        "during a turn. Lower = more responsive stream, higher = fewer API " +
+        "calls. Floored at 250 by draft-stream itself. Default 400 ms for DMs " +
+        "and 1000 ms for groups/forums (respects Telegram's ~1 edit/sec/message " +
+        "practical ceiling). Override per-agent if a particular agent needs " +
+        "snappier or quieter streaming."
       ),
     clear_status_on_completion: z
       .boolean()

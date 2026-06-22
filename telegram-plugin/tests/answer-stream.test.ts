@@ -1,10 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   createAnswerStream,
-  __resetDraftIdForTests,
   MIN_INITIAL_CHARS,
-  DRAFT_METHOD_UNAVAILABLE_RE,
-  DRAFT_CHAT_UNSUPPORTED_RE,
 } from '../answer-stream.js'
 import { resolveAnswerLaneConfig, ANSWER_LANE_NEVER_OPENS } from '../answer-stream-flag.js'
 
@@ -39,13 +36,6 @@ type EditMessageTextFn = (
   },
 ) => Promise<unknown>
 
-type SendMessageDraftFn = (
-  chatId: string,
-  draftId: number,
-  text: string,
-  params?: { message_thread_id?: number },
-) => Promise<unknown>
-
 let nextMessageId = 1000
 
 function makeSendMessage(): ReturnType<typeof vi.fn> & SendMessageFn {
@@ -59,14 +49,9 @@ function makeEditMessageText(): ReturnType<typeof vi.fn> & EditMessageTextFn {
   return vi.fn(async () => {}) as unknown as ReturnType<typeof vi.fn> & EditMessageTextFn
 }
 
-function makeSendMessageDraft(): ReturnType<typeof vi.fn> & SendMessageDraftFn {
-  return vi.fn(async () => {}) as unknown as ReturnType<typeof vi.fn> & SendMessageDraftFn
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
-  __resetDraftIdForTests()
   nextMessageId = 1000
   vi.useFakeTimers()
 })
@@ -81,7 +66,6 @@ describe('answer-stream — minInitialChars threshold', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 400,
       throttleMs: 250,
       sendMessage,
@@ -101,7 +85,7 @@ describe('answer-stream — minInitialChars threshold', () => {
     // End-to-end proof that the resolved default config produces no visible
     // preview → nothing to retract → no flash. Wires the ACTUAL resolver output
     // (not a hand-picked threshold) into the stream.
-    const lane = resolveAnswerLaneConfig({ visibleEnabled: false, draftFnAvailable: false })
+    const lane = resolveAnswerLaneConfig({ visibleEnabled: false })
     expect(lane.state).toBe('dormant')
     expect(lane.minInitialChars).toBe(ANSWER_LANE_NEVER_OPENS)
 
@@ -109,12 +93,10 @@ describe('answer-stream — minInitialChars threshold', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: lane.minInitialChars,
       throttleMs: 250,
       sendMessage,
       editMessageText,
-      // no sendMessageDraft — dormant lane has no transport
     })
 
     // A realistic full answer — 2000 chars, far above any normal threshold.
@@ -131,7 +113,6 @@ describe('answer-stream — minInitialChars threshold', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 400,
       throttleMs: 250,
       sendMessage,
@@ -153,120 +134,6 @@ describe('answer-stream — minInitialChars threshold', () => {
   })
 })
 
-describe('answer-stream — draft transport selection', () => {
-  it('uses sendMessageDraft for DMs (isPrivateChat: true)', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    // Draft transport bypasses minInitialChars gate — any non-empty text goes
-    stream.update('Hello from DM!')
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-    expect(sendMessageDraft).toHaveBeenCalledWith(
-      'chat1',
-      expect.any(Number),
-      'Hello from DM!',
-      undefined,
-    )
-    expect(sendMessage).not.toHaveBeenCalled()
-  })
-
-  it('uses sendMessage for non-DM chats even when sendMessageDraft is provided', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: false,
-      minInitialChars: 10,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('x'.repeat(50))
-    await flushMicrotasks()
-
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    expect(sendMessageDraft).not.toHaveBeenCalled()
-  })
-})
-
-describe('answer-stream — runtime fallback when sendMessageDraft rejects', () => {
-  it('falls back to sendMessage when sendMessageDraft throws DRAFT_METHOD_UNAVAILABLE_RE pattern', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    // The shouldFallbackFromDraftTransport helper checks for "sendMessageDraft" in the
-    // error message plus the regex pattern.
-    const sendMessageDraft = vi.fn(async () => {
-      throw new Error('sendMessageDraft: unknown method')
-    })
-
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    // First update — draft throws, falls back
-    stream.update('Hello DM!')
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-    // After fallback, sendMessage should have been called with the same text
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    expect(sendMessage).toHaveBeenCalledWith('chat1', 'Hello DM!', expect.any(Object))
-
-    // Subsequent update should use sendMessage+editMessageText, not draft
-    sendMessageDraft.mockClear()
-    sendMessage.mockClear()
-    vi.advanceTimersByTime(1000)
-    stream.update('Follow-up!')
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).not.toHaveBeenCalled()
-    expect(editMessageText).toHaveBeenCalledTimes(1)
-  })
-
-  it('falls back when sendMessageDraft throws DRAFT_CHAT_UNSUPPORTED_RE pattern', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = vi.fn(async () => {
-      throw new Error("sendMessageDraft can't be used in this chat")
-    })
-
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('Hello!')
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    expect(sendMessage).toHaveBeenCalledWith('chat1', 'Hello!', expect.any(Object))
-  })
-})
-
 describe('answer-stream — throttling', () => {
   it('three rapid updates within throttleMs result in at most two transport calls', async () => {
     const sendMessage = makeSendMessage()
@@ -274,7 +141,6 @@ describe('answer-stream — throttling', () => {
     const THROTTLE = 1000
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 10,
       throttleMs: THROTTLE,
       sendMessage,
@@ -317,7 +183,6 @@ describe('answer-stream — materialize()', () => {
     const THROTTLE = 1000
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 10,
       throttleMs: THROTTLE,
       sendMessage,
@@ -348,7 +213,6 @@ describe('answer-stream — materialize()', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 10,
       throttleMs: 250,
       sendMessage,
@@ -376,7 +240,6 @@ describe('answer-stream — forceNewMessage() supersession', () => {
     const THROTTLE = 1000
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 10,
       throttleMs: THROTTLE,
       sendMessage,
@@ -387,7 +250,6 @@ describe('answer-stream — forceNewMessage() supersession', () => {
     stream.update('x'.repeat(50))
     await flushMicrotasks()
     expect(sendMessage).toHaveBeenCalledTimes(1)
-    const firstMsgId = sendMessage.mock.calls[0]
 
     // Advance past throttle so a new update is ready to send
     vi.advanceTimersByTime(THROTTLE)
@@ -414,7 +276,6 @@ describe('answer-stream — stop() cancels pending throttled edits', () => {
     const THROTTLE = 1000
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 10,
       throttleMs: THROTTLE,
       sendMessage,
@@ -447,209 +308,12 @@ describe('answer-stream — stop() cancels pending throttled edits', () => {
   })
 })
 
-// ─── #1704 regression — clear the sendMessageDraft on every terminal path ──
-//
-// In DMs the answer-stream uses sendMessageDraft, which renders inside the
-// user's compose box. Telegram Desktop blocks the user from typing while
-// the bot's draft is live — so stop() / retract() / materialize() must
-// all clear the draft. Without these tests the bug class slips back in
-// the next time someone tweaks the lifecycle.
-
-describe('answer-stream — clears sendMessageDraft on terminal paths (#1704)', () => {
-  it('stop() clears the draft when draft transport was in use', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('mid-turn thought')
-    await flushMicrotasks()
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-
-    stream.stop()
-    // stop() is sync but the clear fires fire-and-forget — drain microtasks.
-    await flushMicrotasks()
-
-    // A second draft call must have landed with empty text, clearing the
-    // compose-box preview. The draft id matches the in-flight stream's.
-    const draftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
-    expect(sendMessageDraft).toHaveBeenCalledWith('chat1', draftId, '', undefined)
-  })
-
-  it('retract() clears the draft when draft transport was in use', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('mid-turn thought')
-    await flushMicrotasks()
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-
-    await stream.retract()
-
-    const draftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
-    expect(sendMessageDraft).toHaveBeenCalledWith('chat1', draftId, '', undefined)
-  })
-
-  it('stop() is a no-op on the draft API when message transport was in use', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: false, // forces message transport
-      minInitialChars: 0,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('mid-turn thought')
-    await flushMicrotasks()
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    expect(sendMessageDraft).not.toHaveBeenCalled()
-
-    stream.stop()
-    await flushMicrotasks()
-
-    // Never touched the draft API at all.
-    expect(sendMessageDraft).not.toHaveBeenCalled()
-  })
-
-  it('forwards message_thread_id to the draft-clear call', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      threadId: 42,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('mid-turn thought')
-    await flushMicrotasks()
-
-    await stream.retract()
-
-    const lastCall = sendMessageDraft.mock.calls[sendMessageDraft.mock.calls.length - 1] as unknown as [string, number, string, { message_thread_id?: number } | undefined]
-    expect(lastCall[2]).toBe('')
-    expect(lastCall[3]).toEqual({ message_thread_id: 42 })
-  })
-})
-
-// ─── #1792 — forceNewMessage clears the stale draftId before rotating ───
-//
-// Background: `forceNewMessage()` rotates `draftId` to a fresh allocation
-// so the stream can be re-used for a new turn (typical caller: gateway
-// rapid-steer path in `handleSessionEvent` enqueue branch — calls
-// `forceNewMessage(); stop()` on the prior turn's stream before opening
-// the new turn). Pre-#1792, the rotation orphaned the prior turn's
-// draft content in the user's compose box until Telegram's 30 s draft
-// expiry — `stop()`'s fire-and-forget clear closed over the (now-new)
-// `draftId`, so the clear targeted the unused id, not the stale one.
-//
-// Post-fix: `forceNewMessage` itself clears the stale draftId BEFORE
-// rotating. `stop()` continues to clear whatever draftId is current
-// at the time it runs (defensive, also fine: clearing an unused id
-// is a harmless no-op for the user).
-
-describe('answer-stream — forceNewMessage clears the stale draft before rotating (#1792)', () => {
-  it('clears the pre-rotation draftId when forceNewMessage rotates', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    // Open the stream — this allocates draftId N and fires sendDraft(N).
-    stream.update('first turn thought')
-    await flushMicrotasks()
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-    const staleDraftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
-    sendMessageDraft.mockClear()
-
-    // Rotate. forceNewMessage must enqueue a clear against the OLD
-    // draftId before bumping to the new allocation — pre-fix the
-    // stale content stayed in the compose box for 30 s.
-    stream.forceNewMessage()
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).toHaveBeenCalledTimes(1)
-    const clearedId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
-    const clearedText = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[2]
-    expect(clearedId).toBe(staleDraftId)
-    expect(clearedText).toBe('')
-  })
-
-  it('the gateway sequence forceNewMessage(); stop() clears the stale draftId', async () => {
-    // Mirrors the only production caller — telegram-plugin/gateway/
-    // gateway.ts:6476-6477 cleans up the prior turn's answer-stream
-    // before opening a new turn (rapid steer / queue path).
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('prior turn thought')
-    await flushMicrotasks()
-    const staleDraftId = (sendMessageDraft.mock.calls[0] as unknown as [string, number, string, unknown])[1]
-    sendMessageDraft.mockClear()
-
-    stream.forceNewMessage()
-    stream.stop()
-    await flushMicrotasks()
-
-    // The stale id must have been cleared by ONE of the two calls
-    // (forceNewMessage in this design); the new unused id may also
-    // be cleared by stop() — harmless. The load-bearing invariant
-    // is "the stale id reaches sendMessageDraft('') somewhere".
-    const clearedIds = (sendMessageDraft.mock.calls as unknown as Array<[string, number, string, unknown]>)
-      .filter(c => c[2] === '')
-      .map(c => c[1])
-    expect(clearedIds).toContain(staleDraftId)
-  })
-})
-
 describe('answer-stream — empty / whitespace-only text is a no-op', () => {
   it('update("") does not trigger any transport call', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -669,7 +333,6 @@ describe('answer-stream — empty / whitespace-only text is a no-op', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -691,7 +354,6 @@ describe('answer-stream — maxChars guard', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -705,40 +367,6 @@ describe('answer-stream — maxChars guard', () => {
 
     expect(sendMessage).not.toHaveBeenCalled()
     expect(editMessageText).not.toHaveBeenCalled()
-  })
-})
-
-describe('answer-stream — materialize() on draft transport', () => {
-  it('clears the draft and sends a fresh sendMessage on materialize', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      isPrivateChat: true,
-      minInitialChars: 0,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-    })
-
-    stream.update('hello world')
-    vi.advanceTimersByTime(500)
-    await flushMicrotasks()
-
-    expect(sendMessageDraft).toHaveBeenCalled()
-    const draftCallsBeforeMaterialize = sendMessageDraft.mock.calls.length
-
-    const finalId = await stream.materialize()
-
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    expect(sendMessage.mock.calls[0][1]).toBe('hello world')
-    expect(typeof finalId).toBe('number')
-
-    expect(sendMessageDraft.mock.calls.length).toBeGreaterThan(draftCallsBeforeMaterialize)
-    const lastDraftCall = sendMessageDraft.mock.calls[sendMessageDraft.mock.calls.length - 1]
-    expect(lastDraftCall[2]).toBe('')
   })
 })
 
@@ -757,7 +385,6 @@ describe('answer-stream — onSuperseded callback', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -793,7 +420,6 @@ describe('answer-stream — materialize() max-chars guard', () => {
     const warn = vi.fn()
     const stream = createAnswerStream({
       chatId: 'chat1',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -824,7 +450,6 @@ describe('answer-stream — retract() (#251)', () => {
     const deleteMessage = vi.fn(async () => {})
     const stream = createAnswerStream({
       chatId: 'chat251',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -858,7 +483,6 @@ describe('answer-stream — retract() (#251)', () => {
     const deleteMessage = vi.fn(async () => {})
     const stream = createAnswerStream({
       chatId: 'chat251',
-      isPrivateChat: false,
       // High threshold so the text below never triggers a send
       minInitialChars: 5000,
       throttleMs: 250,
@@ -887,7 +511,6 @@ describe('answer-stream — retract() (#251)', () => {
     const deleteMessage = vi.fn(async () => {})
     const stream = createAnswerStream({
       chatId: 'chat251',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -923,7 +546,6 @@ describe('answer-stream — retract() (#251)', () => {
     const warn = vi.fn()
     const stream = createAnswerStream({
       chatId: 'chat251',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -949,7 +571,6 @@ describe('answer-stream — retract() (#251)', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat251',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -968,13 +589,12 @@ describe('answer-stream — retract() (#251)', () => {
 
 // ─── Issue #203: onMetric callback ──────────────────────────────────────────
 describe('answer-stream — onMetric callback (#203)', () => {
-  it('fires answer_lane_update on first sendMessage (non-DM, message transport)', async () => {
+  it('fires answer_lane_update on first sendMessage (message transport)', async () => {
     const onMetric = vi.fn()
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chatX',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -1001,7 +621,6 @@ describe('answer-stream — onMetric callback (#203)', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chatX',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -1022,39 +641,12 @@ describe('answer-stream — onMetric callback (#203)', () => {
     expect(transports).toContain('edit')
   })
 
-  it('fires answer_lane_update on draft transport for DMs', async () => {
-    const onMetric = vi.fn()
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const sendMessageDraft = makeSendMessageDraft()
-    const stream = createAnswerStream({
-      chatId: 'chatX',
-      isPrivateChat: true,
-      minInitialChars: 0,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-      sendMessageDraft,
-      onMetric,
-    })
-
-    stream.update('streaming via draft')
-    vi.advanceTimersByTime(500)
-    await flushMicrotasks()
-
-    const draftEvents = onMetric.mock.calls
-      .map((c) => c[0] as { kind: string; transport?: string })
-      .filter((ev) => ev.kind === 'answer_lane_update' && ev.transport === 'draft')
-    expect(draftEvents.length).toBeGreaterThan(0)
-  })
-
   it('fires answer_lane_materialized on materialize success', async () => {
     const onMetric = vi.fn()
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chatX',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
@@ -1083,7 +675,6 @@ describe('answer-stream — onMetric callback (#203)', () => {
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chatX',
-      isPrivateChat: false,
       minInitialChars: 0,
       throttleMs: 250,
       sendMessage,

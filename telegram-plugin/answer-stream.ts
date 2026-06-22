@@ -1,11 +1,4 @@
 import { isSilentFlushMarker } from './turn-flush-safety.js'
-import {
-  DRAFT_METHOD_UNAVAILABLE_RE as _DRAFT_METHOD_UNAVAILABLE_RE,
-  DRAFT_CHAT_UNSUPPORTED_RE as _DRAFT_CHAT_UNSUPPORTED_RE,
-  shouldFallbackFromDraftTransport as _shouldFallbackFromDraftTransport,
-  allocateDraftId as _allocateDraftId,
-  __resetDraftIdForTests as _resetDraftIdForTests,
-} from './draft-transport.js'
 
 /**
  * Answer-lane incremental streaming for long Telegram replies.
@@ -19,9 +12,8 @@ import {
  *
  * Design constraints honored:
  *   1. Separate message ID from the progress card — never overwritten.
- *   2. sendMessageDraft for DMs (detected by chatType='private'); regular
- *      sendMessage+editMessageText for groups/channels. Runtime fallback
- *      when draft API rejects (DRAFT_METHOD_UNAVAILABLE_RE / DRAFT_CHAT_UNSUPPORTED_RE).
+ *   2. sendMessage+editMessageText for all chats (in-place edit-in-place engine).
+ *      The draft transport (sendMessageDraft) has been permanently retired.
  *   3. minInitialChars (~50) — don't open the answer lane until enough text
  *      has arrived. Lowered 400 → 50 in #553 PR 3 so short replies
  *      ("yes", "done", "the answer is 42") become visible on the first
@@ -38,20 +30,11 @@ import {
  *   - No finalizable-draft-lifecycle SDK — we implement the loop directly.
  *   - materialize() always sends a fresh message regardless of transport,
  *     to guarantee a push notification on turn completion.
- *
- * Draft-transport helpers (regex constants, shouldFallbackFromDraftTransport,
- * allocateDraftId) live in draft-transport.ts and are re-exported here so
- * existing callers that import from this module continue to work.
  */
 
 export const MIN_INITIAL_CHARS = 50
 export const DEFAULT_THROTTLE_MS = 1000
 const TELEGRAM_MAX_CHARS = 4096
-
-// Re-export shared constants so existing callers / tests keep working.
-export const DRAFT_METHOD_UNAVAILABLE_RE = _DRAFT_METHOD_UNAVAILABLE_RE
-export const DRAFT_CHAT_UNSUPPORTED_RE = _DRAFT_CHAT_UNSUPPORTED_RE
-export { _shouldFallbackFromDraftTransport as shouldFallbackFromDraftTransport }
 
 /** Called when a late sendMessage/edit resolves after a new turn has started. */
 export type OnSupersededCallback = (params: {
@@ -62,8 +45,6 @@ export type OnSupersededCallback = (params: {
 export interface AnswerStreamConfig {
   /** chatId for all API calls */
   chatId: string
-  /** True if this is a DM — tries sendMessageDraft first */
-  isPrivateChat: boolean
   /** Optional forum thread */
   threadId?: number
   /** Minimum chars before opening the answer lane. Default: MIN_INITIAL_CHARS */
@@ -74,16 +55,6 @@ export interface AnswerStreamConfig {
   replyToMessageId?: number
 
   // ── Transport callbacks ────────────────────────────────────────────────
-  /**
-   * sendMessageDraft(chatId, draftId, text, params?). Optional — when absent,
-   * the answer stream falls back immediately to sendMessage+editMessageText.
-   */
-  sendMessageDraft?: (
-    chatId: string,
-    draftId: number,
-    text: string,
-    params?: { message_thread_id?: number; parse_mode?: 'HTML' },
-  ) => Promise<unknown>
   sendMessage: (
     chatId: string,
     text: string,
@@ -132,7 +103,7 @@ export interface AnswerStreamConfig {
    * Acceptance #203: answer_lane_update / answer_lane_materialized events.
    */
   onMetric?: (ev:
-    | { kind: 'answer_lane_update'; chatId: string; messageId: number | undefined; charCount: number; transport: 'draft' | 'message' | 'edit' }
+    | { kind: 'answer_lane_update'; chatId: string; messageId: number | undefined; charCount: number; transport: 'message' | 'edit' }
     | { kind: 'answer_lane_materialized'; chatId: string; messageId: number | undefined; suppressed?: boolean }
   ) => void
 
@@ -199,19 +170,13 @@ export interface AnswerStreamHandle {
   retract(): Promise<void>
 }
 
-// Draft-id allocation now lives in draft-transport.ts (shared with
-// draft-stream.ts). Re-alias locally so the rest of this file is unchanged.
-const allocateDraftId = _allocateDraftId
-
 export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHandle {
   const {
     chatId,
-    isPrivateChat,
     threadId,
     minInitialChars = MIN_INITIAL_CHARS,
     throttleMs = DEFAULT_THROTTLE_MS,
     replyToMessageId,
-    sendMessageDraft: draftApi,
     sendMessage,
     editMessageText,
     onSuperseded,
@@ -224,11 +189,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
   } = config
 
   const effectiveThrottle = Math.max(250, throttleMs)
-
-  // Draft transport is only used in DMs and only when the API method is available.
-  const preferDraft = isPrivateChat && draftApi != null
-  let usesDraftTransport = preferDraft
-  let draftId = preferDraft ? allocateDraftId() : undefined
 
   // Stream state
   let streamMsgId: number | undefined
@@ -249,62 +209,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     }
   }
 
-  /**
-   * Clear the in-progress sendMessageDraft (#1704). When the answer
-   * stream was using draft transport (DMs), Telegram leaves the draft
-   * sitting in the user's compose area until something replaces or
-   * clears it. On Telegram Desktop this blocks the user from typing —
-   * the compose field is occupied by the bot's draft preview.
-   *
-   * Every terminal path on the stream (materialize / stop / retract)
-   * must clear the draft. Best-effort: a failed clear is logged but
-   * not re-thrown — the worst case is a transient stale draft that
-   * Telegram's own 30 s draft expiry eventually mops up.
-   *
-   * #1792 — accepts an explicit `targetDraftId` so `forceNewMessage`
-   * can clear the OLD id before bumping the closure's `draftId`. The
-   * default reads the live closure, which is what stop() / retract()
-   * want — clear whatever's current at the time the call lands.
-   */
-  async function clearDraftBestEffort(
-    targetDraftId: number | undefined = draftId,
-  ): Promise<void> {
-    if (!usesDraftTransport || draftApi == null || targetDraftId == null) return
-    try {
-      const params: { message_thread_id?: number } = {}
-      if (threadId != null) params.message_thread_id = threadId
-      await draftApi(
-        chatId,
-        targetDraftId,
-        '',
-        Object.keys(params).length > 0 ? params : undefined,
-      )
-    } catch {
-      // Best-effort cleanup
-    }
-  }
-
-  async function sendDraft(text: string): Promise<boolean> {
-    if (!draftApi || draftId == null) return false
-    try {
-      const params: { message_thread_id?: number } = {}
-      if (threadId != null) params.message_thread_id = threadId
-      await draftApi(chatId, draftId, text, Object.keys(params).length > 0 ? params : undefined)
-      onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: text.length, transport: 'draft' })
-      return true
-    } catch (err) {
-      if (_shouldFallbackFromDraftTransport(err)) {
-        warn?.(
-          `answer-stream: sendMessageDraft rejected — falling back to sendMessage/editMessageText (${err instanceof Error ? err.message : String(err)})`,
-        )
-        usesDraftTransport = false
-        draftId = undefined
-        return false
-      }
-      throw err
-    }
-  }
-
   async function sendOrEdit(text: string, gen: number): Promise<void> {
     if (stopped) return
     const trimmed = text.trimEnd()
@@ -315,15 +219,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     lastSentText = trimmed
 
     try {
-      if (usesDraftTransport) {
-        const ok = await sendDraft(trimmed)
-        if (!ok) {
-          // Draft failed with a permanent error → fell back to message transport
-          // Retry the same text via message transport
-          await sendOrEditViaMessage(trimmed, gen, prevText)
-        }
-        return
-      }
       await sendOrEditViaMessage(trimmed, gen, prevText)
     } catch (err) {
       // Log but don't crash — transient errors are common
@@ -419,7 +314,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       if (!trimmed) return
 
       // minInitialChars gate: don't open the lane yet
-      if (streamMsgId == null && !usesDraftTransport && trimmed.length < minInitialChars) return
+      if (streamMsgId == null && trimmed.length < minInitialChars) return
 
       pendingText = trimmed
 
@@ -459,9 +354,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       if (inFlight) {
         try { await inFlight } catch { /* ignore */ }
       }
-
-      // Clear draft so Telegram input area doesn't show stale text
-      await clearDraftBestEffort()
 
       // The text we want to materialize. Prefer pendingText (most recent
       // snapshot from the model) over lastSentText (what last reached the
@@ -527,7 +419,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
         purpose: 'materialize',
       }
       if (threadId != null) sendParams.message_thread_id = threadId
-      // Don't quote-reply on materialize — the draft stream already established
+      // Don't quote-reply on materialize — the stream already established
       // the reply context visually. A second reply_parameters would create a
       // nested quote that looks wrong.
 
@@ -563,21 +455,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       pendingText = null
       stopped = false
       materialized = false
-      if (usesDraftTransport) {
-        // #1792: clear the OLD draftId BEFORE rotating. Otherwise the
-        // stale content stays in the user's compose box until the 30 s
-        // Telegram draft expiry — the typical caller (gateway.ts mid-
-        // turn rapid-steer path: `forceNewMessage(); stop();`) cleans
-        // up the prior turn's stream, so the prior draft's content is
-        // semantically retracted. Fire-and-forget — forceNewMessage is
-        // sync; the worst-case failure mode is the same 30 s expiry
-        // we'd have had without the call.
-        const staleDraftId = draftId
-        if (staleDraftId != null) {
-          void clearDraftBestEffort(staleDraftId)
-        }
-        draftId = allocateDraftId()
-      }
       log?.(`answer-stream: forceNewMessage (gen=${generation})`)
     },
 
@@ -588,14 +465,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     stop(): void {
       stopped = true
       cancelScheduled()
-      // #1704: clear the compose-box draft. stop() is sync — fire and
-      // forget. A dropped clear falls back on Telegram's own 30 s
-      // draft expiry; the worst case is a transient stale preview.
-      // (#1792: the stale-id-after-rotation hazard is owned by
-      // forceNewMessage itself now — it clears its own draftId before
-      // rotating. stop() just clears whatever's current; clearing an
-      // already-cleared or never-used id is a harmless no-op.)
-      void clearDraftBestEffort()
     },
 
     async retract(): Promise<void> {
@@ -607,14 +476,6 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       if (inFlight) {
         try { await inFlight } catch { /* ignore */ }
       }
-      // #1704: clear the compose-box draft when this stream was using
-      // draft transport. Without this, Telegram Desktop leaves the
-      // draft sitting in the user's input area and blocks them from
-      // typing until the 30 s draft expiry. Awaited so a follow-up
-      // sendMessage on the same chat doesn't race a stale draft edit.
-      // (See #1792 note in stop() — forceNewMessage owns its own stale
-      // id cleanup; retract just clears whatever's current.)
-      await clearDraftBestEffort()
       // Delete the preliminary message if one was sent and deleteMessage
       // is wired. Best-effort: failures are logged but not re-thrown.
       const msgId = streamMsgId
@@ -632,10 +493,4 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       }
     },
   }
-}
-
-/** Reset the draft-id counter for tests. */
-/** Reset the shared draft-id counter for tests. Delegates to draft-transport.ts. */
-export function __resetDraftIdForTests(): void {
-  _resetDraftIdForTests()
 }
