@@ -141,18 +141,25 @@ export interface SilencePokeDeps {
   /** Poll interval (tests). */
   pollIntervalMs?: number
   /**
-   * Fix A — when true, the 300s framework fallback is DEFERRED while a parent
-   * tool is genuinely in flight (`inFlightTools` non-empty): the agent is
-   * demonstrably working, and since #2162 the live activity feed shows that
-   * work, so nulling `currentTurn` (which the fallback does) would darken a feed
-   * the user is actively watching. The defer is bounded by
-   * `thresholdsMs.fallbackHardCeiling` so a hung-mid-tool turn still unwedges; a
-   * turn with NO in-flight tool fires at the base threshold exactly as before.
-   * Default false (legacy behaviour) — enable per-agent to canary.
+   * Feed-survival predicate callback. When provided, the 300s framework
+   * fallback is DEFERRED while this function returns true: the agent is
+   * demonstrably working (in-flight tool, detached background process, or a
+   * human-wait tool like ask_user), and since #2162 the live activity feed
+   * shows that work, so nulling `currentTurn` would darken a feed the user is
+   * actively watching. The defer is bounded by `thresholdsMs.fallbackHardCeiling`
+   * so a hung-or-missing-work-signal turn still unwedges eventually.
    *
-   * A crashed agent is recovered independently by the bridge-disconnect sweep
-   * (`onDanglingTurnsSwept`), so deferring here does not reintroduce the #1556
-   * dangling-turn wedge for the crash case.
+   * This supersedes `deferFallbackWhileToolInFlight`. When present it is ALWAYS
+   * consulted (no extra env flag required). Set SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0
+   * in the environment to force-disable the defer even when this callback is wired.
+   */
+  isLegitimatelyWorking?: (key: string) => boolean
+  /**
+   * Legacy boolean flag — honoured when `isLegitimatelyWorking` is absent.
+   * When true, the 300s fallback is deferred while `inFlightTools` is non-empty,
+   * bounded by `thresholdsMs.fallbackHardCeiling`.
+   * @deprecated Prefer `isLegitimatelyWorking` which covers detached work and
+   * human-wait tools in addition to foreground in-flight tool calls.
    */
   deferFallbackWhileToolInFlight?: boolean
 }
@@ -424,19 +431,34 @@ function tick(now: number): void {
     if (silence < 0) continue
 
     if (!s.fallbackFired && silence >= thresholds.fallback) {
-      // Fix A: defer the unwedge while a parent tool is genuinely in flight —
-      // the agent is demonstrably working and the live activity feed is showing
-      // it, so firing here (which nulls currentTurn) would darken that feed
-      // mid-work. Bounded by the hard ceiling so a hung-mid-tool turn still
-      // unwedges. `continue` WITHOUT setting fallbackFired so the next tick
-      // re-checks — once the tool ends and the turn stays silent past the base
-      // threshold, or the ceiling is crossed, it fires normally.
-      if (
-        activeDeps.deferFallbackWhileToolInFlight === true &&
-        s.inFlightTools.size > 0 &&
-        silence < (thresholds.fallbackHardCeiling ?? Number.POSITIVE_INFINITY)
-      ) {
-        continue
+      // Feed-survival defer: hold back the unwedge while the agent is
+      // demonstrably working — an in-flight tool, a detached background process,
+      // or a human-wait tool (ask_user). Since #2162 the live activity feed
+      // renders that work, so nulling currentTurn would darken a feed the user
+      // is actively watching. Bounded by fallbackHardCeiling so a
+      // hung-or-leaked-signal turn still unwedges eventually.
+      //
+      // Two defer paths (tried in priority order):
+      //   1. `isLegitimatelyWorking(key)` — new single source of truth covering
+      //      foreground in-flight tools, detached background work, and human-wait
+      //      tools. Active by default when the callback is wired; force-disabled
+      //      by SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0.
+      //   2. Legacy `deferFallbackWhileToolInFlight` boolean — covers only
+      //      `inFlightTools.size > 0`; kept for test fixtures that set it
+      //      directly without wiring the callback.
+      //
+      // In both cases: `continue` WITHOUT setting fallbackFired so the next
+      // tick re-checks. Once the work signal clears and the turn stays silent
+      // past the base threshold, or the ceiling is crossed, the fallback fires.
+      const ceiling = thresholds.fallbackHardCeiling ?? Number.POSITIVE_INFINITY
+      const underCeiling = silence < ceiling
+      if (underCeiling) {
+        const forceDisable = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '0'
+        if (!forceDisable && activeDeps.isLegitimatelyWorking != null) {
+          if (activeDeps.isLegitimatelyWorking(key)) continue
+        } else if (!forceDisable && activeDeps.deferFallbackWhileToolInFlight === true && s.inFlightTools.size > 0) {
+          continue
+        }
       }
       s.fallbackFired = true
       const { chatId, threadId } = parseKey(key)
