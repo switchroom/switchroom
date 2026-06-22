@@ -823,6 +823,19 @@ function readStrippedCaps(agent: AgentConfig): string[] {
  * container-real home) and check THAT. The baked mount SOURCE stays the
  * host-home path, which docker resolves host-side at mount time. On the host
  * (`hostHome === probeHome`) this is identical to `existsSync`.
+ *
+ * Fallback (#2512): hostd only bind-mounts `~/.switchroom/` into its container
+ * (not `~/.switchroom-config/` or other operator dirs). A symlink like
+ * `~/.switchroom/skills -> /home/op/.switchroom-config/skills` has a
+ * `hostHome`-rooted target, and after translation the target becomes
+ * `/host-home/.switchroom-config/skills` — which still doesn't exist inside
+ * hostd because that directory isn't mounted there. The translated-existsSync
+ * path is a dead end for targets outside the hostd bind tree. If the symlink
+ * itself exists AND its target is an absolute path under `hostHome` (meaning
+ * it unambiguously refers to something on the host), that is sufficient
+ * evidence: docker resolves symlinks host-side at bind-mount time and will
+ * find the target. Trust the symlink; don't require the translated target to
+ * be probe-resolvable inside the container.
  */
 function conditionalMountPresent(
   probePath: string,
@@ -834,13 +847,23 @@ function conditionalMountPresent(
     if (!lstatSync(probePath).isSymbolicLink()) return false;
     let target = readlinkSync(probePath);
     if (!isAbsolute(target)) target = resolve(dirname(probePath), target);
-    if (
-      hostHome &&
-      probeHome &&
-      hostHome !== probeHome &&
-      target.startsWith(hostHome + "/")
-    ) {
-      target = probeHome + target.slice(hostHome.length);
+    if (hostHome && probeHome && hostHome !== probeHome) {
+      if (target.startsWith(hostHome + "/")) {
+        // The symlink target is host-rooted, so docker will resolve it on the
+        // host at bind-mount time and the mount source is valid. The generator
+        // runs inside hostd, which only mounts ~/.switchroom/ and cannot stat
+        // the symlink's real host target — so we cannot distinguish a live
+        // target from a dangling one from here. "Trust it" is the only workable
+        // choice.
+        //
+        // ACCEPTED TRADEOFF: a symlink whose host target is genuinely missing
+        // will cause `docker compose up` to hard-fail (agent can't start)
+        // rather than silently drop the mount (agent starts without skills).
+        // That's intentional — switchroom reconcile manages these symlinks, so
+        // a dangling target is not a real production state, and a loud failure
+        // is preferable to a silent capability loss.
+        return true;
+      }
     }
     return existsSync(target);
   } catch {
