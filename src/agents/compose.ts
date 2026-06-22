@@ -876,7 +876,7 @@ function readStrippedCaps(agent: AgentConfig): string[] {
 
 /**
  * Does a conditional-mount SOURCE resolve to a real host path? Used to gate
- * optional `:ro` bind mounts (docker `up` hard-fails on a missing source).
+ * optional `:ro` bind mounts (Docker auto-creates a missing source as an empty dir).
  *
  * `existsSync` (which FOLLOWS symlinks) is the common case and handles real
  * dirs + symlinks whose target resolves in this filesystem. But some
@@ -1974,7 +1974,7 @@ function emitAgentService(
     //
     // Gated on `existsSync` because the audit log is created lazily
     // by the broker on the first ACL decision — fresh installs may
-    // not have it yet, and docker compose `up` hard-fails when a
+    // not have it yet, and Docker auto-creates a missing source as an empty dir when a
     // `:ro` source is missing (same pattern as the skills /
     // credentials mounts below).
     if (existsSync(`${probeHome}/.switchroom/vault-audit.log`)) {
@@ -1989,7 +1989,7 @@ function emitAgentService(
     // history. Same existsSync guard as the vault audit log — hostd
     // creates the file lazily on the first privileged-verb request, so
     // a fresh install may not have it yet and compose `up` would
-    // hard-fail on a missing :ro source.
+    // cause Docker to auto-create a missing :ro source as an empty dir.
     if (existsSync(`${probeHome}/.switchroom/host-control-audit.log`)) {
       lines.push(
         `      - ${homePrefix}/.switchroom/host-control-audit.log:/state/agent/home/.switchroom/host-control-audit.log:ro`,
@@ -2016,7 +2016,7 @@ function emitAgentService(
   // directory, not the file, so the daemon can bind the socket inside
   // it after starting. existsSync guard on the directory: if the
   // daemon hasn't run yet, the directory will be missing — compose
-  // `up` would hard-fail on a missing source. We bind read-write so
+  // Docker would auto-create a missing source as an empty dir. We bind read-write so
   // the daemon can chown the socket file from the host side; the agent
   // only connects.
   if (hostControlEnabled && existsSync(`${probeHome}/.switchroom/hostd/${a.name}`)) {
@@ -2070,7 +2070,7 @@ function emitAgentService(
   // home-assistant). Mounted at the operator's host path so absolute
   // paths in scaffolded start.sh and yaml prompts Just Work; tilde
   // resolution is fixed by start.sh.hbs's $HOME/.switchroom symlink
-  // (#910). existsSync-guarded: docker compose `up` hard-fails on a
+  // (#910). existsSync-guarded: Docker auto-creates a missing source as an empty dir on a
   // missing `:ro` source. skills/ is operator-authored, non-secret
   // content (WS6 audit: LOW info-disclosure only) so it stays
   // fleet-wide.
@@ -2120,7 +2120,7 @@ function emitAgentService(
   // the agent process runs as the unprivileged uid (Dockerfile.agent
   // `USER 10001`, compose `user: <uid>:<uid>`) on a `read_only: true`
   // rootfs with `cap_drop: ALL` + `no-new-privileges`, so `ln -sf
-  // /etc/localtime` would hard-fail. A docker-daemon bind mount is
+  // /etc/localtime` would be auto-created as an empty dir. A docker-daemon bind mount is
   // applied by the daemon (root) BEFORE the entrypoint and is exempt
   // from the read-only rootfs — the right layer for this. Source is the
   // host's zoneinfo file for the resolved zone. `a.timezone` is IANA-
@@ -2131,7 +2131,7 @@ function emitAgentService(
   // the bind source regardless of how the zone was resolved. Only
   // `/etc/localtime` is synced (not `/etc/timezone`); the Go/JVM readers
   // this targets read `/etc/localtime`, and the rest honor `TZ`.
-  // existsSync-guarded because docker compose `up` hard-fails on a missing
+  // existsSync-guarded because Docker auto-creates a missing source as an empty dir; a missing
   // bind source and an exotic host may lack tzdata — when absent we skip
   // and fall back to the env-var path (the cosmetic 95% case). Same host
   // path inside the container, so a plain absolute bind with no
@@ -2247,7 +2247,7 @@ function emitAgentService(
   // source-repo or npm-package skills/ dir — e.g.
   // `<repo>/skills/skill-creator`) resolve inside the container.
   // Guard with existsSync because the resolved path may not exist in
-  // exotic test setups and docker compose `up` hard-fails on missing
+  // exotic test setups and Docker auto-creates a missing source as an empty dir on missing
   // `:ro` sources. Skip when the pool path is already covered by the
   // operator skills mount above (no duplicate volume entries).
   // bundledSkillsPoolDir is homedir()-derived (container-real — `/host-home`

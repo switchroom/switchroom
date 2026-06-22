@@ -135,6 +135,47 @@ describe("validateBindSources — the 2026-06-23 incident: vault-grants.db sourc
   });
 });
 
+describe("validateBindSources — operator bind_mounts must NOT false-abort (PR #2529 blocker)", () => {
+  // Type inference (file-vs-dir from the name) is only applied to switchroom-
+  // MANAGED sources (under /.switchroom/). Operator-supplied bind_mounts are
+  // arbitrary host paths whose type we can't reason about — they get
+  // existence-only, so a name that fools the heuristic can't hard-abort the
+  // whole fleet's deploy.
+  it("a DIRECTORY operator mount whose target matches a file-hint is NOT flagged", () => {
+    // /home/op/data is a real DIR; target /data.db matches the .db file-hint.
+    const yaml = `
+    volumes:
+      - /home/op/data:/data.db:rw
+`;
+    const stat = (_p: string) => ({ isDirectory: () => true, isFile: () => false });
+    const result = validateBindSources(yaml, { stat });
+    expect(result.ok).toBe(true);
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it("a FILE operator mount with a non-hinted extension is NOT flagged", () => {
+    const yaml = `
+    volumes:
+      - /home/op/notes.md:/notes.md:ro
+`;
+    const stat = (_p: string) => ({ isDirectory: () => false, isFile: () => true });
+    const result = validateBindSources(yaml, { stat });
+    expect(result.ok).toBe(true);
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it("BUT a missing operator mount IS still flagged (existence-only still applies)", () => {
+    const yaml = `
+    volumes:
+      - /home/op/gone:/data:rw
+`;
+    const stat = (_p: string) => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); };
+    const result = validateBindSources(yaml, { stat });
+    expect(result.ok).toBe(false);
+    expect(result.issues[0].problem).toBe("missing");
+  });
+});
+
 describe("validateBindSources — missing source", () => {
   it("reports missing when stat throws (source does not exist)", () => {
     const yaml = `

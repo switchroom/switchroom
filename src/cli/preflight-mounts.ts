@@ -97,16 +97,20 @@ export function validateBindSources(
       issues.push({ source, target, problem: "missing" });
       continue;
     }
-    // Only the "a KNOWN-file source exists as a DIRECTORY" direction is checked
-    // for type — that's the incident signature (Docker auto-dir'd a file source,
-    // e.g. vault-grants.db). We deliberately do NOT flag "a non-file-hinted
-    // source is a file": many legit host sources are extensionless FILES
-    // (vault-auto-unlock, bin/webkite, …) and inferring "should be a dir" from
-    // the compose alone false-positives and would block real deploys. The
-    // primary, false-positive-free check is existence ("missing" above), which
-    // catches the incident before the first bad `up` (the poison path doesn't
-    // exist on the host yet).
-    if (expectFile && st.isDirectory()) {
+    // Type check ONLY for switchroom-MANAGED sources (under `/.switchroom/`) —
+    // the ones the generator emits and whose type we actually know, and where
+    // the incident happened (vault-grants.db, switchroom.yaml auto-dir'd). For
+    // operator-supplied `bind_mounts` and system paths (arbitrary host paths we
+    // can't reason about) we do EXISTENCE-only: inferring file-vs-dir from a
+    // filename guess false-positives and would hard-abort a legit deploy for any
+    // admin agent with a bind mount whose name fools the heuristic (reviewer
+    // blocker, PR #2529). We also only flag the "known-file became a DIRECTORY"
+    // direction — never "a present file should be a dir" (extensionless managed
+    // files like vault-auto-unlock / bin/webkite are real files). The
+    // false-positive-free `missing` check above still covers EVERY source and
+    // catches the incident before the first bad `up`.
+    const managed = source.includes("/.switchroom/");
+    if (managed && expectFile && st.isDirectory()) {
       issues.push({ source, target, problem: "expected-file-got-dir" });
     }
   }
