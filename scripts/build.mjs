@@ -83,26 +83,37 @@ function resolveVersion(inGit) {
 }
 
 /**
- * Mis-stamp guard: when we resolved a version from a tag AND TAG_VERSION is
- * set (i.e. CI knows what the tag is), verify they agree. A mismatch means
- * the build environment is inconsistent — abort rather than ship the wrong
- * version string silently.
+ * Mis-stamp guard: cross-check the resolved version against every INDEPENDENT
+ * tag signal CI provides (TAG_VERSION env and GITHUB_REF). On a tag build these
+ * are set by GitHub Actions from the same ref, so they must agree with what we
+ * stamped. A mismatch means the build environment is inconsistent — abort
+ * rather than ship the wrong version string silently.
  *
- * This guard is intentionally STRICT on release builds (TAG_VERSION set) and
- * silent on dev builds (no TAG_VERSION) so it never blocks local work.
+ * Note: TAG_VERSION is also Layer 1 of resolveVersion(), so when only it is set
+ * the check is tautological. The value comes from ALSO checking GITHUB_REF: if
+ * TAG_VERSION (Layer 1) is wrong while GITHUB_REF carries the real tag, resolved
+ * matches TAG_VERSION but not GITHUB_REF, and we catch it. The guard is silent
+ * on dev builds (no tag signals) so it never blocks local work.
  */
 function assertVersionConsistency(resolvedVersion, source) {
+  const signals = [];
   const tagVersionEnv = process.env.TAG_VERSION?.trim();
-  if (!tagVersionEnv) return; // not a CI tag build — skip
-  const expected = tagVersionEnv.replace(/^v/, "");
-  if (resolvedVersion !== expected) {
-    console.error(
-      `[build] ERROR: version mis-stamp detected!\n` +
-      `  TAG_VERSION env says:  ${expected}\n` +
-      `  Resolved version (${source}): ${resolvedVersion}\n` +
-      `  Aborting build to prevent shipping the wrong version.`
-    );
-    process.exit(1);
+  if (tagVersionEnv) signals.push(["TAG_VERSION", tagVersionEnv.replace(/^v/, "")]);
+  const githubRef = process.env.GITHUB_REF?.trim();
+  if (githubRef && githubRef.startsWith("refs/tags/v")) {
+    signals.push(["GITHUB_REF", githubRef.replace(/^refs\/tags\/v/, "")]);
+  }
+  if (signals.length === 0) return; // not a CI tag build — skip
+  for (const [name, expected] of signals) {
+    if (resolvedVersion !== expected) {
+      console.error(
+        `[build] ERROR: version mis-stamp detected!\n` +
+        `  ${name} says:           ${expected}\n` +
+        `  Resolved version (${source}): ${resolvedVersion}\n` +
+        `  Aborting build to prevent shipping the wrong version.`
+      );
+      process.exit(1);
+    }
   }
 }
 

@@ -71,6 +71,11 @@ jobs:
           bun-version: latest
 
       - name: Install deps + build dist/
+        env:
+          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
+          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
+          # stays silent and dev builds fall back to package.json.
+          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: |
           bun install
           npm run build
@@ -189,6 +194,11 @@ jobs:
           bun-version: latest
 
       - name: Install deps + build dist/
+        env:
+          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
+          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
+          # stays silent and dev builds fall back to package.json.
+          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
         run: |
           bun install
           npm run build
