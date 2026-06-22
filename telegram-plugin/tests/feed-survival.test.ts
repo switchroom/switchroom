@@ -36,6 +36,7 @@ import {
 import {
   noteAsyncDispatch,
   hasPendingAsyncDispatch,
+  noteOutbound as ppNoteOutbound,
   noteTurnEnd as ppNoteTurnEnd,
   startTurn as ppStartTurn,
   clearPending,
@@ -124,6 +125,20 @@ describe('hasPendingAsyncDispatch', () => {
     ppNoteTurnEnd('chat:0')
     expect(hasPendingAsyncDispatch('chat:0')).toBe(false)
   })
+
+  it('cross-turn: dispatch + outbound anchor + turn-end → pending PERSISTS (the core feed-survival path)', () => {
+    // The critical production scenario: the agent dispatches detached
+    // background work (run_in_background Bash / Agent / Task), posts a reply
+    // (capturing an anchor), and the turn ends — but the bg work is still
+    // running. pending+anchor at turn_end activates rather than deletes, so
+    // hasPendingAsyncDispatch stays true and both teardown timers keep
+    // deferring while the detached work runs.
+    ppStartTurn('chat:0')
+    noteAsyncDispatch('chat:0')
+    ppNoteOutbound('chat:0', { messageId: 4242, text: 'kicked off the build, polling…', parseMode: 'HTML' })
+    ppNoteTurnEnd('chat:0')
+    expect(hasPendingAsyncDispatch('chat:0')).toBe(true)
+  })
 })
 
 // ─── Silence-poke: isLegitimatelyWorking callback defer ──────────────────────
@@ -170,7 +185,7 @@ describe('silence-poke — isLegitimatelyWorking callback (default-on defer)', (
     expect(f.fallbacks).toHaveLength(1) // bounded — still unwedges
   })
 
-  it('callback takes priority over legacy deferFallbackWhileToolInFlight (both set)', () => {
+  it('wired callback returns false → fallback fires even with inFlightTools non-empty (callback supersedes legacy flag)', () => {
     // When isLegitimatelyWorking is wired, it is consulted; the legacy flag
     // is not consulted for the new path. Verify by having callback=false and
     // inFlightTools non-empty — the fallback fires because the callback says "no".

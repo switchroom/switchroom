@@ -5263,7 +5263,12 @@ const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PROD
  * silencePoke / pendingProgress.
  */
 function isLegitimatelyWorking(key: string): boolean {
-  // (a) foreground in-flight tool
+  // (a) foreground in-flight tool.
+  // NOTE: toolFlightTracker is GLOBAL, not per-key. In a hypothetical
+  // multi-chat agent a tool in flight for chat A would make this return
+  // true for chat B's key. Accepted: the gateway runs one Claude session
+  // (one turn in flight at a time); true multi-chat concurrency is not
+  // currently supported. (b) and (c) below are correctly per-key.
   if (toolFlightTracker.isMidToolCall()) return true
   // (b) detached background work dispatched this turn
   if (pendingProgress.hasPendingAsyncDispatch(key)) return true
