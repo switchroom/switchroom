@@ -1,5 +1,38 @@
 # Changelog
 
+## unreleased — turn-liveness primitive: a busy-but-silent turn can't read as "done" (#2527)
+
+A user could DM an agent, see the ambient ack (👀 / typing), and then get
+nothing for minutes while the agent worked — or a 👍 over a turn that never
+delivered an answer. Two seams, both fixed by one role-keyed primitive hung off
+the loop rather than enumerated per turn-type/surface. Design:
+`reference/rfcs/turn-liveness-primitive.md` (serves `know-what-my-agent-is-doing`).
+
+- **Mid-turn liveness floor.** A `user` turn working silently past
+  `SWITCHROOM_SILENCE_FLOOR_MS` (default 45s) with no substantive answer now
+  gets ONE quiet (no-ping) "still on it" beat — honest text from the
+  longest-running in-flight tool (model-free, claude-native), routed through the
+  same send path as a model reply. The old 300s safety net *deferred* even its
+  loud fallback while "legitimately working", assuming the activity feed covered
+  it — but a foreground turn has no feed, so a 6-minute diagnose was invisible.
+  The floor inverts that: busy-silent ⇒ speak. Fire-once per turn; the 300s
+  unwedge still sits above it. Kill switch `SWITCHROOM_TG_LIVENESS_FLOOR=0`.
+- **"Status?" short-circuit.** A message arriving mid-turn fires the floor
+  immediately (DM and forum-supergroup topic alike) — the user asked, so answer.
+- **Role-aware terminal honesty.** A `user` turn that ends without a delivered
+  answer now finalizes to a gentle 😐 ('undelivered'), not 👍 — the operator's
+  "thumbs up so it feels done" report. `system`/cron turns and
+  `NO_REPLY`/`HEARTBEAT_OK` turns keep 👍 (their silence is legitimate). Kill
+  switch `SWITCHROOM_TG_TERMINAL_HONESTY=0`.
+- **One provenance discriminator.** Turns are stamped `user` | `system` once at
+  enqueue (`deriveTurnRole`), replacing scattered `chatType`/`chatId==null`/
+  `source==='cron'` predicates. New agent types are not new roles — coverage by
+  construction, not enumeration.
+- **Proof.** A fuzzed invariant test (`turn-liveness-invariant.test.ts`, 2000
+  turn shapes × both surfaces) asserts fire-once, the role gate, terminal
+  honesty, and DM-vs-topic **surface parity** (identical outcome + correct
+  thread routing) — the anti-whack-a-mole proof. Plus pure-decision unit tests.
+
 ## v0.15.48 — live activity feed never goes dark on a working turn
 
 A productive foreground turn could read as pure silence. The activity feed was

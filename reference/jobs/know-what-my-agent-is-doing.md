@@ -98,6 +98,16 @@ Named by job × surface, pointing at real scenarios in
   `silent-end-recovery-dm`. *Watch:* a fully silent wedge is broken by a
   user-visible message and the turn is unwedged. *Invariant:* a turn never
   ends or stalls in silence; the fallback fires at most once per turn.
+- **Busy-but-silent turn + false-done (DM + channel, #2527)** — the fuzzed
+  invariant `telegram-plugin/tests/turn-liveness-invariant.test.ts` (2000 turn
+  shapes × both surfaces) plus the pure decisions in `turn-liveness-floor.ts`.
+  *Watch:* a `user` turn that works silently past the floor threshold emits
+  exactly one mid-turn liveness beat; a turn that ends undelivered never paints
+  👍. *Invariant:* identical floor + terminal outcome in a DM and a forum topic
+  (surface parity by construction), keyed on loop role not chat type. Live
+  wired-host twin (follow-on): `jtbd-liveness-floor-dm` / `-channel` with
+  `SWITCHROOM_SILENCE_FLOOR_MS` lowered so the beat lands within test
+  wall-clock. Design: `reference/rfcs/turn-liveness-primitive.md`.
 - **Restart mid-conversation (DM + channel)** —
   `jtbd-message-during-restart-dm` / `-channel`,
   `jtbd-always-on-after-restart-dm`, `jtbd-interrupted-turn-resumes-dm`.

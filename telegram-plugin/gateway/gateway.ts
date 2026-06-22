@@ -104,6 +104,7 @@ import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
+import { deriveTurnRole, decideTerminalReason, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { parseVisibleAnswerStreamEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
@@ -1886,6 +1887,14 @@ type CurrentTurn = {
   sourceMessageId: number | null
   startedAt: number
   gatewayReceiveAt: number
+  // #2527 — the single turn-provenance discriminator, stamped once at
+  // enqueue from the channel envelope `source`. `user` (a human is waiting:
+  // never-silent guarantee + mid-turn floor), `system` (cron/scheduled:
+  // silence is legitimate). The gateway never builds a turn atom for a
+  // sub-agent, so `sub-agent` never appears here. Read by the mid-turn floor
+  // eligibility and the role-aware terminal reaction gate. Replaces the
+  // scattered `chatType`/`chatId==null`/`source==='cron'` predicates.
+  role: LoopRole
   replyCalled: boolean
   // #1664 — whether the model has delivered its *final answer* this turn
   // (as opposed to only an interim ack). `replyCalled` flips on the first
@@ -3357,7 +3366,7 @@ async function resolveCompactCard(
 function finalizeStatusReaction(
   chatId: string,
   threadId: number | undefined,
-  reason: 'done' | 'error' = 'done',
+  reason: 'done' | 'undelivered' | 'error' = 'done',
 ): void {
   const key = statusKey(chatId, threadId)
   const ctrl = activeStatusReactions.get(key)
@@ -5224,6 +5233,15 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
 }
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
+// #2527 — mid-turn liveness floor threshold (default 45s). The early, quiet
+// beat: a `user` turn working silently this long without a substantive answer
+// gets ONE honest "still on it" interim, so the ambient 👀 never masquerades
+// as "done". Strictly below SILENCE_FALLBACK_MS (the loud 300s unwedge).
+// Whole floor is kill-switchable via SWITCHROOM_TG_LIVENESS_FLOOR=0.
+const SILENCE_FLOOR_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FLOOR_MS', 45_000)
+// #2527 — role-aware terminal reaction honesty (the "thumbs-up false done"
+// fix). Default ON; SWITCHROOM_TG_TERMINAL_HONESTY=0 reverts to always-👍.
+const LIVENESS_TERMINAL_HONESTY = process.env.SWITCHROOM_TG_TERMINAL_HONESTY !== '0'
 // SILENCE_DEFER_INFLIGHT_TOOLS: previously an opt-in (=1). The new
 // isLegitimatelyWorking callback supersedes this — defer is now the DEFAULT
 // when the callback is wired. The legacy flag is kept so `=0` still lets
@@ -5288,12 +5306,57 @@ function parseKeyForSurvival(key: string): { chatId: string } {
 }
 
 silencePoke.startTimer({
-  thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS },
+  thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS, floor: SILENCE_FLOOR_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
   isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
+  },
+  // #2527 — the gateway-owned half of the mid-turn-floor decision: only the
+  // live turn knows its loop role + whether a substantive answer has landed.
+  // Keyed on statusKey so a DM (threadId null) and a forum topic are identical.
+  floorState: (key) => {
+    const turn = currentTurn
+    if (turn == null) return null
+    if (statusKey(turn.sessionChatId, turn.sessionThreadId) !== key) return null
+    return { role: turn.role, finalAnswerDelivered: turn.finalAnswerDelivered }
+  },
+  // #2527 — the early, quiet liveness beat. Honest text from the longest
+  // in-flight tool (model-free, claude-native), routed through the SAME send
+  // path as the 300s fallback; pings OFF (this is the gentle beat, not the
+  // loud unwedge) and the turn is NOT torn down — it keeps working.
+  onMidTurnFloor: async (ctx) => {
+    // Late-fire guard, mirroring the fallback: a clean turn-end can race the
+    // tick. If the turn is gone, stay silent.
+    if (activeTurnStartedAt.get(ctx.key) == null && currentTurn == null) return
+    const blockedOnApproval = activeStatusReactions
+      .get(statusKey(ctx.chatId, ctx.threadId))
+      ?.isAwaiting() ?? false
+    const text = silencePoke.formatFrameworkFallbackText(
+      'working',
+      ctx.silenceMs,
+      ctx.inFlightTools,
+      blockedOnApproval,
+    )
+    try {
+      await robustApiCall(
+        () => bot.api.sendMessage(ctx.chatId, text, {
+          ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
+          // The quiet beat: visible in-thread, no device buzz. (The 300s
+          // fallback pings; the floor must not train the user to mute.)
+          disable_notification: true,
+        }),
+        { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
+      )
+      // Count it as production so the silence clock resets — the user just
+      // saw a real message, so the 300s loud fallback is measured from here.
+      silencePoke.noteProduction(ctx.key, Date.now())
+    } catch (err) {
+      process.stderr.write(
+        `silence-poke mid-turn floor sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
+      )
+    }
   },
   onFrameworkFallback: async (ctx) => {
     // Late-fire short-circuit (2026-05-23 audit finding). The fallback
@@ -10283,6 +10346,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           sourceMessageId: parseSourceMessageId(ev.messageId),
           startedAt,
           gatewayReceiveAt: startedAt,
+          // #2527 — stamp the loop role once, from the enqueue envelope.
+          role: deriveTurnRole(ev.rawContent),
           replyCalled: false,
           finalAnswerDelivered: false,
           finalAnswerSubstantive: false,
@@ -11453,10 +11518,29 @@ function handleSessionEvent(ev: SessionEvent): void {
       }
 
       // #1713: turn_end is THE terminal trigger. Finalize via the
-      // single terminal path (👍). Any prior intermediate states
-      // pending in the debounce window are flushed by `finalize()`
-      // before the terminal emoji emits.
-      finalizeStatusReaction(chatId, threadId, 'done')
+      // single terminal path. Any prior intermediate states pending in
+      // the debounce window are flushed by `finalize()` before the
+      // terminal emoji emits.
+      //
+      // #2527 — role-aware terminal honesty: a USER turn that ends without
+      // a delivered answer must NOT paint 👍 (the operator's "thumbs up so
+      // it feels like you're done" report). It finalizes to the gentle
+      // 'undelivered' terminal (😐) instead; the silent-end fallback below
+      // carries the apology text. system/cron turns and NO_REPLY/HEARTBEAT_OK
+      // turns (which return earlier) keep 👍 — their silence is legitimate.
+      const terminalReason = decideTerminalReason({
+        enabled: LIVENESS_TERMINAL_HONESTY,
+        role: turn.role,
+        finalAnswerDelivered: turn.finalAnswerDelivered,
+      })
+      if (terminalReason === 'undelivered') {
+        process.stderr.write(
+          `telegram gateway: WARN turn_no_reply — user turn ended with an ` +
+          `ambient ack but no delivered answer; painting 😐 not 👍 ` +
+          `chat=${chatId} thread=${threadId ?? '-'} turnId=${turn.turnId} (#2527)\n`,
+        )
+      }
+      finalizeStatusReaction(chatId, threadId, terminalReason)
       {
         const sKey = streamKey(chatId, threadId)
         const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
@@ -11935,6 +12019,9 @@ async function handleInboundCoalesced(
   //   - msgId present (always true for `bot.on('message:*')` paths but
   //     defensive against future routers that might call this without one).
   maybeEarlyAckReaction(ctx, from)
+  // #2527 — if this lands mid-turn, the user is asking "what's happening?";
+  // fire the liveness floor immediately (DM + supergroup alike).
+  maybePokeFloorForMidTurnInbound(ctx, from)
 
   const key = inboundCoalesceKey(
     String(ctx.chat!.id),
@@ -11963,6 +12050,14 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   const msgId = ctx.message?.message_id
   if (msgId == null) return
   const chatType = ctx.chat?.type
+  // Intentionally DM-only (#2527 surface-parity note): pre-acking a GROUP
+  // message risks reacting to one the full gate (requireMention / topic
+  // scoping) would later DROP. The SUBSTANTIVE liveness parity a supergroup
+  // needs — the mid-turn floor and the role-aware terminal reaction — is
+  // surface-agnostic (keyed on statusKey + loop role, no chat-type branch),
+  // so a forum topic gets identical never-silent guarantees without this
+  // sub-second 👀 optimisation. See `maybePokeFloorForMidTurnInbound` for
+  // the surface-agnostic "Status?" short-circuit.
   if (chatType !== 'private') return
   const chatId = String(ctx.chat!.id)
   const threadId = ctx.message?.is_topic_message ? ctx.message.message_thread_id : undefined
@@ -11978,6 +12073,26 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   // and it auto-expires after ~5s if not refreshed (the answer-lane
   // first edit will land long before then under the new defaults).
   void bot.api.sendChatAction(chatId, 'typing').catch(() => {})
+}
+
+/**
+ * #2527 — "Status?" short-circuit. A message arriving DURING an active turn
+ * (the user explicitly asking what's happening) fires the mid-turn liveness
+ * floor immediately, bypassing the timer/working gates. Surface-agnostic:
+ * works identically in a DM and a forum-supergroup topic (keyed on statusKey).
+ * Idempotent per turn (the floor's fire-once latch) and kill-switch-gated.
+ */
+function maybePokeFloorForMidTurnInbound(ctx: Context, from: NonNullable<Context['from']>): void {
+  const rawChatId = ctx.chat?.id
+  if (rawChatId == null) return
+  const chatId = String(rawChatId)
+  const threadId = ctx.message?.is_topic_message ? ctx.message.message_thread_id : undefined
+  const key = statusKey(chatId, threadId)
+  // Only mid-turn: a turn must already be in flight for this (chat, thread).
+  if (!activeTurnStartedAt.has(key)) return
+  const access = loadAccess()
+  if (!access.allowFrom.includes(String(from.id))) return
+  silencePoke.pokeFloorNow(key, Date.now())
 }
 
 async function handleInbound(
