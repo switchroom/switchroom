@@ -24,7 +24,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createAnswerStream, __resetDraftIdForTests } from '../answer-stream.js'
+import { createAnswerStream } from '../answer-stream.js'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -47,7 +47,6 @@ function makeEditMessageText() {
 }
 
 beforeEach(() => {
-  __resetDraftIdForTests()
   nextMessageId = 2000
   vi.useFakeTimers()
 })

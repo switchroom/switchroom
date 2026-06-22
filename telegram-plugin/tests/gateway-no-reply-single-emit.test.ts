@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createAnswerStream, __resetDraftIdForTests } from '../answer-stream.js'
+import { createAnswerStream } from '../answer-stream.js'
 
 /**
  * #656 — gateway turn_end no-reply path.
@@ -30,7 +30,6 @@ async function flushMicrotasks(times = 10): Promise<void> {
 let nextMessageId = 5000
 
 beforeEach(() => {
-  __resetDraftIdForTests()
   nextMessageId = 5000
   vi.useFakeTimers()
 })

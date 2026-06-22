@@ -1,8 +1,21 @@
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 import {
   createAnswerStream,
 } from '../answer-stream.js'
+
+// Throttle window anchored one hour ahead of "now". With lastSentAt=0 and a
+// real Date.now(), update() computes sinceLast = Date.now() - 0, which is
+// always < this anchor, so update() schedules a (cancelled-before-it-fires)
+// timer and buffers pendingText instead of sending immediately. materialize()
+// then cancels the scheduled timer and applies the silent-marker guard to the
+// buffered text. This replaces the old draft-transport path (which bypassed the
+// length gate). Anchoring to now+1h (rather than MAX_SAFE_INTEGER) keeps the
+// scheduled timer's delay within 32-bit range, so it stays runner-agnostic:
+// no vi.setSystemTime (which bun's vitest shim lacks) and no Node
+// TimeoutOverflowWarning under runners whose fake-timer shim is a no-op.
+const HOUR_MS = 60 * 60 * 1000
+let throttleAnchorMs = 0
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -43,16 +56,7 @@ function makeEditMessageText(): ReturnType<typeof vi.fn> & EditMessageTextFn {
 
 beforeEach(() => {
   nextMessageId = 9000
-  // Set system time to 0 so Date.now() returns 0 and lastSentAt=0 is
-  // within the throttle window — update() schedules a timer rather than
-  // firing sendMessage immediately. This lets materialize() see pendingText
-  // and apply the silent-marker guard before any send goes out.
-  vi.useFakeTimers()
-  vi.setSystemTime(0)
-})
-
-afterEach(() => {
-  vi.useRealTimers()
+  throttleAnchorMs = Date.now() + HOUR_MS
 })
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -68,10 +72,10 @@ afterEach(() => {
  *
  * The draft transport is permanently retired. These tests now use:
  *   - minInitialChars: 0 — bypasses the length gate so update() sets pendingText
- *   - vi.setSystemTime(0) + throttleMs: 250 — since Date.now()=0 and lastSentAt=0,
- *     the throttle check (sinceLast >= 250) is false so update() schedules a timer
- *     rather than firing sendMessage immediately. materialize() cancels that timer
- *     and applies the silent-marker guard to pendingText before any send.
+ *   - throttleMs: throttleAnchorMs (now + 1h) — with lastSentAt=0 and a real
+ *     Date.now(), sinceLast is always < the throttle window, so update() schedules
+ *     a timer rather than firing sendMessage immediately. materialize() cancels that
+ *     timer and applies the silent-marker guard to pendingText before any send.
  *
  * Mirrors the sentinel suppression already present in:
  *   - server.ts (reply/stream_reply MCP tool handlers)
@@ -90,7 +94,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
       // the throttle keeps update() from firing sendMessage immediately, so
       // materialize() can apply the silent-marker guard.
       minInitialChars: 0,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
       log: (msg) => logs.push(msg),
@@ -114,7 +118,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const stream = createAnswerStream({
       chatId: 'chat43',
       minInitialChars: 0,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
     })
@@ -133,7 +137,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const stream = createAnswerStream({
       chatId: 'chat44',
       minInitialChars: 0,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
       log: (msg) => logs.push(msg),
@@ -153,7 +157,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const stream = createAnswerStream({
       chatId: 'chat45',
       minInitialChars: 0,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
     })
@@ -183,7 +187,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const stream = createAnswerStream({
       chatId: 'chat47',
       minInitialChars: 0,
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
       log: (msg) => logs.push(msg),
@@ -205,7 +209,7 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     const logs: string[] = []
     const stream = createAnswerStream({
       chatId: 'chat46',
-      throttleMs: 250,
+      throttleMs: throttleAnchorMs,
       sendMessage,
       editMessageText,
       log: (msg) => logs.push(msg),
