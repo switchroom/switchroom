@@ -75,7 +75,7 @@ import {
 } from './permission-timeout.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { appendActivityLabel, renderActivityFeedWithNested } from '../tool-activity-summary.js'
+import { appendActivityLabel, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -9956,6 +9956,11 @@ const FOREGROUND_SUBAGENT_ACCUM_MAX = 12
  * foreground sub-agents (rare — parallel Task dispatch) flatten in insertion
  * order; the single-sub-agent common case nests precisely under its
  * Delegating line.
+ *
+ * The header (elapsed + tool count) is now threaded into the render so the
+ * main-session card matches the worker card's two-line header style. This
+ * fixes the missing header regression where the worker card showed elapsed/
+ * tool-count metadata but the main-session card rendered step-lines only.
  */
 function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''): string | null {
   const childLines: string[] = []
@@ -9966,7 +9971,15 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
   // the persisted feed record shows a `✓ N steps` total. The live in-progress
   // feed omits it (stepCount undefined) to stay clean and minimal.
   const stepCount = final ? turn.labeledToolCount : undefined
-  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount)
+  // Build the session header so the main-session card renders the same two-line
+  // elapsed/tool-count header as the worker card.
+  const header: SessionActivityHeader = {
+    label: 'Agent',
+    elapsedMs: turn.startedAt > 0 ? Date.now() - turn.startedAt : 0,
+    toolCount: turn.labeledToolCount,
+    state: final ? 'done' : 'running',
+  }
+  return renderActivityFeedWithNested(turn.mirrorLines, childLines, final, liveSuffix, stepCount, header)
 }
 
 /**
@@ -10078,7 +10091,10 @@ function feedHeartbeatTick(): void {
     if (!FEED_LIVENESS_OPEN_ENABLED || turn.sessionChatId == null) return
     const age = Date.now() - turn.startedAt
     if (age < FEED_LIVENESS_OPEN_MS) return
-    const rendered = renderActivityFeedWithNested(['Working…'], [], false, ` · ${formatFeedElapsed(age)}`)
+    const livenessHeader: SessionActivityHeader = {
+      label: 'Agent', elapsedMs: age, toolCount: 0, state: 'running',
+    }
+    const rendered = renderActivityFeedWithNested(['Working…'], [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
     if (rendered == null) return
     turn.activityPendingRender = rendered
     if (turn.activityInFlight == null) {
@@ -10157,7 +10173,11 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
     // terminal render is null. Finalize to a done "✓ Working…" record instead
     // of leaving the message frozen on the live "→ Working…" line.
     if (finalHtml == null && turn.mirrorLines.length === 0 && turn.activityEverOpened) {
-      finalHtml = renderActivityFeedWithNested(['Working…'], [], true)
+      const livenessElapsed = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
+      const livenessHeader: SessionActivityHeader = {
+        label: 'Agent', elapsedMs: livenessElapsed, toolCount: turn.labeledToolCount, state: 'done',
+      }
+      finalHtml = renderActivityFeedWithNested(['Working…'], [], true, '', undefined, livenessHeader)
     }
     if (finalHtml == null) return
     try {

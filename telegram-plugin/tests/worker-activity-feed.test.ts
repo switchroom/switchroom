@@ -852,3 +852,94 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
     expect(isValidWorkerHtml(out)).toBe(true)
   })
 })
+
+// ─── Regression: header/status row survives char-budget trimming ─────────────
+//
+// These tests assert that the "running · elapsed · tools" status row (lines[1])
+// is always present in the rendered output, even when _fitWorkerBodyToCharBudget
+// fires and drops oldest step lines to fit the 4000-char budget.
+//
+// Root-cause history:
+//   - 68f956a9 introduced _fitWorkerBodyToCharBudget WITH a "+N earlier" counter
+//   - d7d7d140 removed "+N earlier" from the fitting loop, breaking the card's
+//     visible "header row" of dropped-step context
+//   - 5262be25 (PR #2511) added a raw-then-escape extreme fallback, but
+//     introduced a regression where rawNewestStep='' returns only fixedJoined
+//     (the two header lines alone, with no step bullet)
+//
+// The fix restores "+N earlier" in the fitting loop and falls back to recovering
+// raw text from newestLine when rawNewestStep is empty.
+
+describe('_fitWorkerBodyToCharBudget: header row and +N earlier counter regressions', () => {
+  afterEach(() => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+  })
+
+  it('status line ("running · … · N tools") survives when budget fitter drops steps', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // Build 6 narrative lines where 5 of them are very long, forcing the budget
+    // fitter to drop some but keep at least one. The fixed header (2 lines) must
+    // always survive intact.
+    const bigLine = 'a'.repeat(700)
+    const narrativeLines = Array.from({ length: 6 }, (_, i) =>
+      i < 5 ? bigLine : 'final short step',
+    )
+    const out = renderWorkerActivity(view({ narrativeLines, toolCount: 7 }))
+
+    // The worker header (line 0) must be present.
+    expect(out).toContain('🛠 <b>Worker</b>')
+    // The status line (line 1) must ALWAYS survive trimming.
+    expect(out).toContain('running · ')
+    expect(out).toContain('7 tools')
+    // Output must be within Telegram's budget.
+    expect(out.length).toBeLessThanOrEqual(4096)
+  })
+
+  it('a "+N earlier" counter appears when the budget fitter drops oldest steps', () => {
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // With no-truncate ON, appendStepFeed passes at most STATUS_ROLLING_LINES (5)
+    // lines to the body. To trigger _fitWorkerBodyToCharBudget's fitting loop, we
+    // need 5 lines that together exceed 4000 chars.
+    // Use 4 × 820-char lines + 1 short line: 4×820 = 3280 step chars plus
+    // markup overhead (~4×(5+5)=80) + headers (~80) = ~3440 chars, still under
+    // budget; but with the newest kept short, the 4 big lines dominate. To reliably
+    // overflow the budget, use lines large enough that even 2 lines exceed 4000:
+    // 5 × 800-char lines → 5×810 = 4050 step chars + headers ~80 → ~4130 > 4000.
+    const bigLine = 'b'.repeat(800)
+    const narrativeLines = Array.from({ length: 5 }, () => bigLine)
+    const out = renderWorkerActivity(view({ narrativeLines }))
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    // The "+N earlier" overflow counter must appear between the header and steps.
+    expect(out).toContain('earlier…')
+    // The worker header and status line are always in the fixed slice.
+    expect(out).toContain('🛠 <b>Worker</b>')
+    expect(out).toContain('running · ')
+  })
+
+  it('back-compat path (latestSummary only, empty narrativeLines) still shows a step bullet when budget is exceeded', () => {
+    // Regression from PR #2511: when narrativeLines is empty, rawNewestStep=''
+    // and the extreme fallback previously returned only fixedJoined (two header
+    // lines with no step bullet). The fix falls back to recovering raw text from
+    // the already-escaped newestLine when rawNewestStep=''.
+    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    // Use latestSummary only (no narrativeLines) and make it huge enough to
+    // exceed the char budget even with just the 2 header lines + this one step.
+    const hugeSummary = 'deploy service && run migrations && verify health checks '.repeat(80)
+    expect(hugeSummary.length).toBeGreaterThan(4000)
+
+    const out = renderWorkerActivity(
+      view({ narrativeLines: undefined, latestSummary: hugeSummary }),
+    )
+
+    expect(out.length).toBeLessThanOrEqual(4096)
+    // The step bullet MUST be present (regression guard: must not be only headers).
+    const hasBullet = out.includes('→') || out.includes('✓')
+    expect(hasBullet).toBe(true)
+    // Header rows must be present.
+    expect(out).toContain('🛠 <b>Worker</b>')
+    expect(out).toContain('running · ')
+    // Valid HTML.
+    expect(isValidWorkerHtml(out)).toBe(true)
+  })
+})

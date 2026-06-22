@@ -5,8 +5,11 @@ import {
   appendActivityLabel,
   renderActivityFeed,
   renderActivityFeedWithNested,
+  renderActivityHeader,
+  formatFeedElapsed,
   MIRROR_MAX_LINES,
   NESTED_MAX_LINES,
+  type SessionActivityHeader,
 } from "../tool-activity-summary.js";
 import { STATUS_ROLLING_LINES } from "../status-no-truncate.js";
 
@@ -671,5 +674,148 @@ describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)"
     expect(isValidHtml(out)).toBe(true);
     // final=true → nested line renders done (italic, no →).
     expect(out).not.toContain("→");
+  });
+});
+
+// ─── Session activity header (unified renderer — main-session card fix) ───────
+//
+// The main-session card was missing the two-line header that the worker card
+// already renders: elapsed time + tool count. These tests verify that the header
+// is now emitted when a `SessionActivityHeader` is supplied, matching the worker
+// card's style and fixing the "missing header" regression.
+
+describe("renderActivityHeader — two-line header builder", () => {
+  it("renders the running header with elapsed and tool count", () => {
+    const [h1, h2] = renderActivityHeader("🤖", "Agent", "", 15_000, 7, "running");
+    expect(h1).toBe("🤖 <b>Agent</b>");
+    expect(h2).toBe("<i>15s · 7 tools</i>");
+  });
+
+  it("renders the done header with tool count and elapsed", () => {
+    const [h1, h2] = renderActivityHeader("🤖", "Agent", "", 65_000, 3, "done");
+    expect(h1).toBe("🤖 <b>Agent</b>");
+    expect(h2).toBe("<i>done · 3 tools · 1m05s</i>");
+  });
+
+  it("includes the description in line 1 when non-empty", () => {
+    const [h1] = renderActivityHeader("🛠", "Worker", "run tests", 10_000, 2, "running");
+    expect(h1).toBe("🛠 <b>Worker</b> · <i>run tests</i>");
+  });
+
+  it("omits the description part when empty", () => {
+    const [h1] = renderActivityHeader("🤖", "Agent", "", 5_000, 1, "running");
+    expect(h1).toBe("🤖 <b>Agent</b>");
+    expect(h1).not.toContain(" · ");
+  });
+
+  it("HTML-escapes special chars in description and label", () => {
+    const [h1] = renderActivityHeader("🤖", "Agent", "run <foo> & <bar>", 5_000, 1, "running");
+    expect(h1).toContain("run &lt;foo&gt; &amp; &lt;bar&gt;");
+  });
+});
+
+describe("formatFeedElapsed — elapsed formatter", () => {
+  it("formats sub-minute durations as Ns", () => {
+    expect(formatFeedElapsed(0)).toBe("0s");
+    expect(formatFeedElapsed(999)).toBe("0s");
+    expect(formatFeedElapsed(1_000)).toBe("1s");
+    expect(formatFeedElapsed(59_000)).toBe("59s");
+  });
+
+  it("formats minute+ durations as MmSSs", () => {
+    expect(formatFeedElapsed(60_000)).toBe("1m00s");
+    expect(formatFeedElapsed(65_000)).toBe("1m05s");
+    expect(formatFeedElapsed(125_000)).toBe("2m05s");
+  });
+});
+
+describe("renderActivityFeed — header param (main-session card fix)", () => {
+  it("prepends the two-line header when header is supplied (running)", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 15_000,
+      toolCount: 7,
+      state: "running",
+    };
+    const out = renderActivityFeed(["Reading CLAUDE.md", "Searching memory"], false, "", undefined, header)!;
+    // Must start with the header lines.
+    expect(out).toContain("🤖 <b>Agent</b>");
+    expect(out).toContain("<i>15s · 7 tools</i>");
+    // Step feed follows the header.
+    expect(out).toContain("<i>✓ Reading CLAUDE.md</i>");
+    expect(out).toContain("<b>→ Searching memory</b>");
+  });
+
+  it("prepends the done header when final=true", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 65_000,
+      toolCount: 3,
+      state: "done",
+    };
+    const out = renderActivityFeed(["Reading CLAUDE.md"], true, "", undefined, header)!;
+    expect(out).toContain("🤖 <b>Agent</b>");
+    expect(out).toContain("<i>done · 3 tools · 1m05s</i>");
+    expect(out).toContain("<i>✓ Reading CLAUDE.md</i>");
+    // No in-progress arrow (final=true).
+    expect(out).not.toContain("→");
+  });
+
+  it("renders header-only (no steps) when lines is empty", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 5_000,
+      toolCount: 0,
+      state: "running",
+    };
+    // renderActivityFeed normally returns null for empty lines; with header it returns content.
+    const out = renderActivityFeed([], false, "", undefined, header);
+    expect(out).not.toBeNull();
+    expect(out).toContain("🤖 <b>Agent</b>");
+  });
+
+  it("without header, renderActivityFeed still returns null for empty lines (no regression)", () => {
+    expect(renderActivityFeed([], false, "", undefined, undefined)).toBeNull();
+  });
+
+  it("header is present in renderActivityFeedWithNested output too", () => {
+    const header: SessionActivityHeader = {
+      label: "Agent",
+      elapsedMs: 30_000,
+      toolCount: 5,
+      state: "running",
+    };
+    const out = renderActivityFeedWithNested(
+      ["Delegating: review"],
+      ["Reading schema.ts"],
+      false,
+      "",
+      undefined,
+      header,
+    )!;
+    expect(out).toContain("🤖 <b>Agent</b>");
+    expect(out).toContain("<i>30s · 5 tools</i>");
+    // Parent step is done-styled (child is the live step).
+    expect(out).toContain("<i>✓ Delegating: review</i>");
+    // Child step is the in-progress step.
+    expect(out).toContain("   ↳ <b>→ Reading schema.ts</b>");
+  });
+});
+
+describe("describeToolUse — surface-tool suppression is key-agnostic", () => {
+  it("returns null for telegram reply/stream_reply under any registration key", () => {
+    // Standard switchroom-telegram key.
+    expect(describeToolUse("mcp__switchroom-telegram__reply", {})).toBeNull();
+    expect(describeToolUse("mcp__switchroom-telegram__stream_reply", {})).toBeNull();
+    // Legacy clerk-telegram key.
+    expect(describeToolUse("mcp__clerk-telegram__reply", {})).toBeNull();
+    expect(describeToolUse("mcp__clerk-telegram__stream_reply", {})).toBeNull();
+    // Hypothetical custom fork.
+    expect(describeToolUse("mcp__my-custom-telegram__reply", {})).toBeNull();
+  });
+
+  it("returns null for telegram edit_message and react under any key", () => {
+    expect(describeToolUse("mcp__clerk-telegram__edit_message", {})).toBeNull();
+    expect(describeToolUse("mcp__clerk-telegram__react", {})).toBeNull();
   });
 });

@@ -158,24 +158,33 @@ export function computeLabel(toolName, input) {
 
   // MCP tools.
   if (typeof toolName === 'string' && toolName.startsWith('mcp__')) {
-    // Explicit labels / suppressions for the built-in servers.
+    // Telegram-plugin tools: matched by the key-agnostic regex so renames/forks work.
+    // Strip the `mcp__<server>__` prefix to get just the tool suffix.
+    const TELEGRAM_PREFIX_RE = /^mcp__[^_].*?telegram__/
+    const telegramMatch = TELEGRAM_PREFIX_RE.exec(toolName)
+    if (telegramMatch) {
+      const suffix = toolName.slice(telegramMatch[0].length)
+      // Surface tools (reply, stream_reply, edit_message, react) are the
+      // conversation itself — suppress them from the activity feed entirely.
+      // Mirrors isTelegramSurfaceTool in tool-names.ts.
+      if (
+        suffix === 'reply' ||
+        suffix === 'stream_reply' ||
+        suffix === 'edit_message' ||
+        suffix === 'react'
+      ) return null
+      if (suffix === 'get_recent_messages') return 'Reading chat history'
+      // send_typing and all other surface/control tools: suppress.
+      return null
+    }
+    // Explicit labels / suppressions for the hindsight server.
     switch (toolName) {
-      case 'mcp__switchroom-telegram__reply':
-      case 'mcp__switchroom-telegram__stream_reply':
-        return 'Replying'
-      case 'mcp__switchroom-telegram__react': {
-        const emoji = clip(asText(i.emoji), 8)
-        return emoji ? `Reacting ${emoji}` : 'Reacting'
-      }
-      case 'mcp__switchroom-telegram__get_recent_messages':
-        return 'Reading chat history'
       case 'mcp__hindsight__recall':
       case 'mcp__hindsight__reflect':
         return 'Searching memory'
       case 'mcp__hindsight__retain':
         return 'Saving memory'
       // Explicit suppressions — return null so we don't emit a sidecar line.
-      case 'mcp__switchroom-telegram__send_typing':
       case 'mcp__hindsight__sync_retain':
         return null
     }
@@ -185,13 +194,17 @@ export function computeLabel(toolName, input) {
     // entirely by MCP tools read as pure silence (only a typing dot + the
     // 👀 reaction) — the "I can't see what it's doing" report. Mirror the
     // gateway's describeToolUse: friendly per-server labels, else a
-    // model-authored field, else a humanized tool name. NEVER label
-    // switchroom-telegram surface/control tools (they ARE the conversation).
+    // model-authored field, else a humanized tool name. NEVER label any
+    // Telegram surface/control tools (they ARE the conversation). Use the
+    // same regex predicate as isTelegramSurfaceTool in tool-names.ts so
+    // this works regardless of the plugin's registration key (clerk-telegram,
+    // switchroom-telegram, custom fork, …).
+    const TELEGRAM_SURFACE_RE = /^mcp__[^_].*?telegram__/
+    if (TELEGRAM_SURFACE_RE.test(toolName)) return null
     const m = /^mcp__(.+?)__(.+)$/.exec(toolName)
     if (!m) return null
     const server = m[1].toLowerCase()
     const tool = m[2].toLowerCase()
-    if (server === 'switchroom-telegram') return null
     if (server === 'hindsight') return 'Working with memory'
     if (server === 'google-workspace' || server === 'claude_ai_google_calendar')
       return 'Checking your calendar'

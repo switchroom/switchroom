@@ -40,6 +40,7 @@ import {
   truncate,
 } from './card-format.js'
 import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
+import { renderStepFeed } from './tool-activity-summary.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -101,35 +102,13 @@ const RULE = '─────'
 export const NARRATIVE_MAX_LINES = 6
 
 /**
- * Append the accumulated step feed to `lines`, mirroring the main agent's
- * activity card (`renderActivityFeed`): prior steps render done (`✓`, italic),
- * the newest renders in-progress (`→`, bold) unless `allDone`, and an overflow
- * header (`✓ +N earlier…`) appears when the feed exceeds NARRATIVE_MAX_LINES.
- * `steps` are already cleaned + escaped HTML (but NOT per-line clipped when
- * noTruncate is true — full content is preserved).
- *
- * When `noTruncate` is true (SWITCHROOM_STATUS_NO_TRUNCATE != '0'):
- *   - Shows only the LAST STATUS_ROLLING_LINES steps (rolling window).
- *   - No `✓ +N earlier…` overflow header — strictly the rolling window.
- *   - Each line renders in FULL (no per-line "…" — clip must NOT be applied
- *     before passing steps to this function in noTruncate mode).
- * The only remaining ceiling is the char-budget backstop in the caller.
+ * Append the accumulated step feed to `lines` using the shared `renderStepFeed`
+ * from tool-activity-summary.ts. This thin wrapper preserves the worker-feed
+ * call signature (passing `allDone` + `noTruncate`) while deleting the formerly
+ * duplicated windowing logic. `steps` are already cleaned + escaped HTML.
  */
 function appendStepFeed(lines: string[], steps: string[], allDone: boolean, noTruncate = false): void {
-  if (steps.length === 0) return
-  let shown: string[]
-  if (noTruncate) {
-    // Rolling window: last STATUS_ROLLING_LINES lines, no overflow header.
-    shown = steps.slice(-STATUS_ROLLING_LINES)
-  } else {
-    shown = steps.slice(-NARRATIVE_MAX_LINES)
-    const hidden = steps.length - shown.length
-    if (hidden > 0) lines.push(`<i>✓ +${hidden} earlier…</i>`)
-  }
-  const lastIdx = shown.length - 1
-  shown.forEach((s, i) => {
-    lines.push(!allDone && i === lastIdx ? `<b>→ ${s}</b>` : `<i>✓ ${s}</i>`)
-  })
+  renderStepFeed(lines, steps, allDone, noTruncate, NARRATIVE_MAX_LINES)
 }
 
 /**
@@ -231,9 +210,12 @@ function _fitWorkerBodyToCharBudget(body: string, lines: string[], rawNewestStep
   const fixed = lines.slice(0, 2)
   const feed = lines.slice(2)
   // Try dropping oldest feed lines until the output fits (keeping the newest).
+  // Re-insert a "+N earlier" overflow counter so users know steps were dropped —
+  // this also ensures the status line (lines[1], "running · elapsed · tools")
+  // is always preserved in `fixed` and never accidentally omitted from the output.
   for (let drop = 1; drop < feed.length; drop++) {
     const kept = feed.slice(drop)
-    const candidate = [...fixed, ...kept].join('\n')
+    const candidate = [...fixed, `<i>✓ +${drop} earlier…</i>`, ...kept].join('\n')
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
   // Extreme: the newest feed line is itself oversized. Never slice the already-
@@ -250,9 +232,16 @@ function _fitWorkerBodyToCharBudget(body: string, lines: string[], rawNewestStep
   const wrapperOverhead = openTag.length + prefix.length + closeTag.length
   const overhead = fixedJoined.length + 1 // +1 for the \n joining fixed and newest
   const maxNewest = Math.max(0, STATUS_CARD_CHAR_BUDGET - overhead)
-  if (maxNewest > wrapperOverhead && rawNewestStep.length > 0) {
+  // rawNewestStep may be '' on the back-compat path (latestSummary used instead
+  // of narrativeLines). In that case fall back to recovering raw text from the
+  // already-escaped newestLine by stripping its HTML tags.
+  const rawForTruncation =
+    rawNewestStep.length > 0
+      ? rawNewestStep
+      : newestLine.replace(/<[^>]+>/g, '').replace(/^[→✓]\s*/, '')
+  if (maxNewest > wrapperOverhead && rawForTruncation.length > 0) {
     const maxRaw = maxNewest - wrapperOverhead
-    let raw = rawNewestStep.slice(0, maxRaw)
+    let raw = rawForTruncation.slice(0, maxRaw)
     let escaped = escapeHtml(raw)
     // Re-check post-escape: escaping can expand the string (& → &amp; etc.).
     while (raw.length > 0 && wrapperOverhead + escaped.length > maxNewest) {
