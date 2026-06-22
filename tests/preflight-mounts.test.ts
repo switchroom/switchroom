@@ -152,21 +152,38 @@ describe("validateBindSources — missing source", () => {
   });
 });
 
-describe("validateBindSources — expected-dir-got-file", () => {
-  it("reports expected-dir-got-file when a directory target source is a plain file", () => {
+describe("validateBindSources — no false positive on an extensionless file source", () => {
+  // The "expected-dir-got-file" direction was REMOVED: many legit host sources
+  // are extensionless FILES (vault-auto-unlock, bin/webkite) mounted at targets
+  // that look dir-ish. Flagging them as "should be a dir" false-positived and
+  // would block real deploys (caught by e2e against the live fleet compose).
+  // A present file source that ISN'T a known-file-hint must NOT be flagged.
+  it("does NOT flag a present, extensionless file source (e.g. vault-auto-unlock)", () => {
     const yaml = `
     volumes:
+      - /home/op/.switchroom/vault-auto-unlock:/state/vault-auto-unlock:ro
+      - /home/op/.switchroom/bin/webkite:/usr/local/bin/webkite:ro
       - /home/op/.switchroom/agents/klanker:/state/agent:rw
 `;
-    // Simulate the source being a file when a dir is expected
-    const stat = (_p: string) => ({
-      isDirectory: () => false,
-      isFile: () => true,
+    // Every source present; the extensionless ones are FILES, the agent dir is a dir.
+    const stat = (p: string) => ({
+      isDirectory: () => p.endsWith("/klanker"),
+      isFile: () => !p.endsWith("/klanker"),
     });
     const result = validateBindSources(yaml, { stat });
+    expect(result.ok).toBe(true);
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it("STILL flags a known-file source (vault-auto-unlock) that became a directory", () => {
+    const yaml = `
+    volumes:
+      - /home/op/.switchroom/vault-auto-unlock:/state/vault-auto-unlock:ro
+`;
+    const stat = (_p: string) => ({ isDirectory: () => true, isFile: () => false });
+    const result = validateBindSources(yaml, { stat });
     expect(result.ok).toBe(false);
-    expect(result.issues).toHaveLength(1);
-    expect(result.issues[0].problem).toBe("expected-dir-got-file");
+    expect(result.issues[0].problem).toBe("expected-file-got-dir");
   });
 });
 

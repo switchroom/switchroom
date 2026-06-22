@@ -27,7 +27,7 @@ import { statSync } from "node:fs";
 export interface BindSourceIssue {
   source: string;
   target: string;
-  problem: "missing" | "expected-file-got-dir" | "expected-dir-got-file";
+  problem: "missing" | "expected-file-got-dir";
 }
 
 export interface PreflightResult {
@@ -54,7 +54,7 @@ export function parseHostBindSources(
   composeText: string,
 ): { source: string; target: string; expectFile: boolean }[] {
   const out: { source: string; target: string; expectFile: boolean }[] = [];
-  const FILE_HINT = /\.(ya?ml|db|log|toml|json|token|id)$|\/\.vault-token$|machine-id$|localtime$/;
+  const FILE_HINT = /\.(ya?ml|db|log|toml|json|token|id)$|\/\.vault-token$|machine-id$|localtime$|vault-auto-unlock$|\/webkite$/;
   for (const raw of composeText.split("\n")) {
     const line = raw.trim();
     if (!line.startsWith("- ")) continue;
@@ -97,10 +97,17 @@ export function validateBindSources(
       issues.push({ source, target, problem: "missing" });
       continue;
     }
+    // Only the "a KNOWN-file source exists as a DIRECTORY" direction is checked
+    // for type — that's the incident signature (Docker auto-dir'd a file source,
+    // e.g. vault-grants.db). We deliberately do NOT flag "a non-file-hinted
+    // source is a file": many legit host sources are extensionless FILES
+    // (vault-auto-unlock, bin/webkite, …) and inferring "should be a dir" from
+    // the compose alone false-positives and would block real deploys. The
+    // primary, false-positive-free check is existence ("missing" above), which
+    // catches the incident before the first bad `up` (the poison path doesn't
+    // exist on the host yet).
     if (expectFile && st.isDirectory()) {
       issues.push({ source, target, problem: "expected-file-got-dir" });
-    } else if (!expectFile && st.isFile()) {
-      issues.push({ source, target, problem: "expected-dir-got-file" });
     }
   }
   return { ok: issues.length === 0, checked, issues };
