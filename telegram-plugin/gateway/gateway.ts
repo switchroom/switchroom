@@ -5224,6 +5224,11 @@ function parsePositiveMsEnv(name: string, fallbackMs: number): number {
 }
 const SILENCE_FALLBACK_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_MS', 300_000)
 const SILENCE_FALLBACK_HARD_MS = parsePositiveMsEnv('SWITCHROOM_SILENCE_FALLBACK_HARD_MS', 900_000)
+// SILENCE_DEFER_INFLIGHT_TOOLS: previously an opt-in (=1). The new
+// isLegitimatelyWorking callback supersedes this — defer is now the DEFAULT
+// when the callback is wired. The legacy flag is kept so `=0` still lets
+// operators force-disable the defer (handled inside silence-poke.ts tick()).
+// The old `=1` path is kept for back-compat but is now redundant.
 const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '1'
 // Production-liveness (2026-06-05 UAT finding). Count an activity-feed render or
 // an answer-stream draft update as liveness for the silence clock, so a long
@@ -5232,9 +5237,55 @@ const SILENCE_DEFER_INFLIGHT_TOOLS = process.env.SWITCHROOM_SILENCE_DEFER_INFLIG
 // restores the legacy "only a real reply resets the clock" behaviour.
 const SILENCE_LIVENESS_PRODUCTION = process.env.SWITCHROOM_SILENCE_LIVENESS_PRODUCTION !== '0'
 
+/**
+ * Feed-survival predicate — the single source of truth for "is this turn
+ * legitimately working?" used by BOTH teardown timers (orphaned-reply fuse
+ * and silence-poke framework fallback).
+ *
+ * Returns true if ANY of the following hold for the given chat key:
+ *
+ *   (a) A foreground tool call is in flight in the current turn
+ *       (`toolFlightTracker.isMidToolCall()`). This covers most tools
+ *       including ask_user while it blocks awaiting a tap.
+ *
+ *   (b) Detached background work was dispatched in the current turn and has
+ *       not yet resolved — `pendingProgress.hasPendingAsyncDispatch(key)`.
+ *       Covers `Bash run_in_background:true` (which returns a near-instant
+ *       handle, emptying inFlight, while the background process keeps
+ *       running) and `Agent` / `Task` dispatches.
+ *
+ *   (c) A human-wait tool (`ask_user`) is open for this chat. A pending
+ *       ask_user IS already captured by (a) while the tool_use is in flight,
+ *       but we include the explicit pendingAskUser check for defence-in-depth
+ *       (e.g. after an unlikely inFlight clear without a tool_result).
+ *
+ * The key is `statusKey(chatId, threadId)` — the same key used by
+ * silencePoke / pendingProgress.
+ */
+function isLegitimatelyWorking(key: string): boolean {
+  // (a) foreground in-flight tool
+  if (toolFlightTracker.isMidToolCall()) return true
+  // (b) detached background work dispatched this turn
+  if (pendingProgress.hasPendingAsyncDispatch(key)) return true
+  // (c) ask_user open for this chat (defence-in-depth)
+  const { chatId: keyChatId } = parseKeyForSurvival(key)
+  for (const entry of pendingAskUser.values()) {
+    if (entry.chatId === keyChatId) return true
+  }
+  return false
+}
+
+/** Parse `<chatId>:<threadIdOrEmpty>` — mirrors silence-poke's parseKey.
+ *  Local copy so we don't need to re-export from silence-poke. */
+function parseKeyForSurvival(key: string): { chatId: string } {
+  const idx = key.indexOf(':')
+  return { chatId: idx < 0 ? key : key.slice(0, idx) }
+}
+
 silencePoke.startTimer({
   thresholdsMs: { fallback: SILENCE_FALLBACK_MS, fallbackHardCeiling: SILENCE_FALLBACK_HARD_MS },
   deferFallbackWhileToolInFlight: SILENCE_DEFER_INFLIGHT_TOOLS,
+  isLegitimatelyWorking: (key) => isLegitimatelyWorking(key),
   emitMetric: (event) => {
     // Re-emit through the unified runtime-metrics fan-out (PostHog + JSONL).
     emitRuntimeMetric(event)
@@ -9842,28 +9893,44 @@ function resetOrphanedReplyTimeout(): void {
         replyCalled: t.replyCalled,
         progressCardActive: progressDriver != null,
       })) {
-        // PRIMARY FIX: if a tool call is in flight when the fuse expires,
-        // the turn is still alive — re-arm the fuse instead of tearing down
-        // the activity feed mid-work. Without this guard, a Bash/Edit that
-        // runs for >30 s after the last text block fires a synthetic turn_end
-        // that nulls currentTurn and drops every subsequent tool_label.
+        // Feed-survival guard: re-arm the fuse while the turn is
+        // legitimately working — an in-flight tool, a detached background
+        // process (Bash run_in_background), or a human-wait tool (ask_user).
+        // This extends the original "isMidToolCall" guard to cover the
+        // detached-work cases that empty inFlight prematurely.
         //
-        // Bound: after ORPHANED_REPLY_MAX_REARMS re-arms (20 × 30 s = 10 min
-        // of genuine tool activity) we stop re-arming and let the backstop
-        // fire, so a truly wedged single long-running tool still surfaces.
-        if (toolFlightTracker.isMidToolCall()) {
-          if (t.orphanedReplyRearmCount < ORPHANED_REPLY_MAX_REARMS) {
+        // Cap logic:
+        //  • Foreground tools / detached background work: bound by
+        //    ORPHANED_REPLY_MAX_REARMS (20 × 30 s = 10 min). A genuinely
+        //    hung tool still surfaces after the cap.
+        //  • Human-wait tools (ask_user): NEVER forcibly backstop while
+        //    ask_user is open for this chat — the human simply hasn't
+        //    tapped yet. We keep re-arming unconditionally until the prompt
+        //    resolves (TTL or tap) and inFlight empties.
+        const turnKey = statusKey(t.sessionChatId, t.sessionThreadId)
+        const working = isLegitimatelyWorking(turnKey)
+        const humanWaiting = (() => {
+          for (const entry of pendingAskUser.values()) {
+            if (entry.chatId === t.sessionChatId) return true
+          }
+          return false
+        })()
+        if (working || humanWaiting) {
+          const underCap = t.orphanedReplyRearmCount < ORPHANED_REPLY_MAX_REARMS
+          if (humanWaiting || underCap) {
             t.orphanedReplyRearmCount++
             process.stderr.write(
-              `telegram gateway: orphaned-reply fuse expired mid-tool-call — re-arming` +
+              `telegram gateway: orphaned-reply fuse expired — re-arming` +
               ` (rearm ${t.orphanedReplyRearmCount}/${ORPHANED_REPLY_MAX_REARMS},` +
-              ` in_flight=${toolFlightTracker.inFlightCount()})\n`,
+              ` in_flight=${toolFlightTracker.inFlightCount()},` +
+              ` human_wait=${humanWaiting},` +
+              ` bg_work=${pendingProgress.hasPendingAsyncDispatch(turnKey)})\n`,
             )
             resetOrphanedReplyTimeout()
             return
           }
           process.stderr.write(
-            `telegram gateway: orphaned-reply rearm cap reached (${ORPHANED_REPLY_MAX_REARMS}) — forcing backstop despite in-flight tools\n`,
+            `telegram gateway: orphaned-reply rearm cap reached (${ORPHANED_REPLY_MAX_REARMS}) — forcing backstop despite working state\n`,
           )
         }
         process.stderr.write(
@@ -10786,18 +10853,26 @@ function handleSessionEvent(ev: SessionEvent): void {
     }
     case 'turn_end': {
       // DEFENSIVE FIX: belt-and-braces guard against the synthetic backstop
-      // (`durationMs: -1`) racing a real tool call. durationMs >= 0 is the
+      // (`durationMs: -1`) racing live work. durationMs >= 0 is the
       // authoritative signal from system/turn_duration; -1 is ONLY ever set
       // by the orphaned-reply backstop. Reject the synthetic event here so that
       // even if the PRIMARY fix's re-arm logic is bypassed (e.g. a very fast
-      // fire before isMidToolCall() is sampled) we still don't tear down a
-      // live feed mid-tool. Never suppresses a real turn_end (durationMs >= 0).
-      if (ev.durationMs === -1 && toolFlightTracker.isMidToolCall()) {
-        process.stderr.write(
-          `telegram gateway: synthetic turn_end suppressed — tools still in flight` +
-          ` (in_flight=${toolFlightTracker.inFlightCount()})\n`,
-        )
-        return
+      // fire before isLegitimatelyWorking() is sampled) we still don't tear
+      // down a live feed mid-work. Extended from the original isMidToolCall()
+      // check to the full isLegitimatelyWorking predicate so detached background
+      // work and human-wait tools (ask_user) are also protected.
+      // INVARIANT: a REAL turn_end (durationMs >= 0) is NEVER suppressed.
+      if (ev.durationMs === -1) {
+        const turn = currentTurn
+        const key = turn != null ? statusKey(turn.sessionChatId, turn.sessionThreadId) : ''
+        if (isLegitimatelyWorking(key)) {
+          process.stderr.write(
+            `telegram gateway: synthetic turn_end suppressed — legitimately working` +
+            ` (in_flight=${toolFlightTracker.inFlightCount()},` +
+            ` bg_work=${turn != null ? pendingProgress.hasPendingAsyncDispatch(key) : false})\n`,
+          )
+          return
+        }
       }
       // Drain any still-pending tool dispatch typing entries — covers
       // transcript truncation or a Claude Code crash mid-tool.

@@ -285,6 +285,18 @@ export function noteTurnEnd(key: string): void {
 }
 
 /**
+ * True when the current turn for `key` dispatched async background work
+ * (Agent / Task / Bash run_in_background:true) but the turn has not yet ended
+ * with a cleared pending flag.  Used by the feed-survival predicate so the
+ * orphaned-reply backstop and silence-poke teardown are deferred while a
+ * detached background process is still running — even after inFlight empties
+ * when the near-instant tool_result (e.g. the Bash background handle) returns.
+ */
+export function hasPendingAsyncDispatch(key: string): boolean {
+  return stateByKey.get(key)?.pending === true
+}
+
+/**
  * Clear pending-progress for a chat — reasons:
  *   'inbound'   — user sent a new message, they're re-engaged
  *   'handback'  — switchroom injected a subagent_handback channel turn
