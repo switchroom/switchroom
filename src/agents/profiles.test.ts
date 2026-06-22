@@ -442,11 +442,12 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
   });
 
   it("is appended to a scaffolded CLAUDE.md regardless of profile", async () => {
-    // The core claim: the grounding posture reaches EVERY agent on EVERY
-    // profile, not just default. We rebuild the exact compose the
-    // scaffold does (profile CLAUDE.md.hbs render + unconditional append
-    // of the three shared fragments) for two structurally different
-    // profiles and assert the execution-discipline text appears in BOTH.
+    // The core claim: the grounding posture AND pacing discipline reach
+    // EVERY agent on EVERY profile, not just default. We rebuild the exact
+    // compose the scaffold does (profile CLAUDE.md.hbs render + unconditional
+    // append of the three shared fragments) for all four structurally
+    // different profiles and assert the execution-discipline text appears in
+    // ALL: default, coding, executive-assistant, health-coach.
     const {
       renderExecutionDisciplineFragment,
       renderVaultProtocolFragment,
@@ -454,7 +455,8 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
     } = await import("./profiles.js");
     const Handlebars = (await import("handlebars")).default;
 
-    const marker = "Grounding — check before you assert";
+    const groundingMarker = "Grounding — check before you assert";
+    const pacingMarker = "Act in-turn";
 
     const composeForProfile = (profileName: string): string => {
       const profileDir = getProfilePath(profileName);
@@ -475,8 +477,17 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
 
     const defaultClaude = composeForProfile("default");
     const codingClaude = composeForProfile("coding");
+    const execAssistantClaude = composeForProfile("executive-assistant");
+    const healthCoachClaude = composeForProfile("health-coach");
 
-    expect(defaultClaude).toContain(marker);
-    expect(codingClaude).toContain(marker);
+    for (const [name, rendered] of [
+      ["default", defaultClaude],
+      ["coding", codingClaude],
+      ["executive-assistant", execAssistantClaude],
+      ["health-coach", healthCoachClaude],
+    ] as [string, string][]) {
+      expect(rendered, `${name}: grounding marker`).toContain(groundingMarker);
+      expect(rendered, `${name}: pacing marker`).toContain(pacingMarker);
+    }
   });
 });
