@@ -1,5 +1,6 @@
 {
   "name": "switchroom",
+  "//version": "NOT the release version — source of truth is the git tag (see CLAUDE.md > Standard release process). This field is stale by design and only a fallback for scripts/build.mjs + src/cli/resolve-version.ts; do not assume it reflects the current release and do not bump it expecting a release to pick it up.",
   "version": "0.15.48",
   "description": "Run Claude Code 24/7 on your Claude Pro/Max subscription over Telegram. Open-source alternative to OpenClaw and NanoClaw — no API keys.",
   "type": "module",
