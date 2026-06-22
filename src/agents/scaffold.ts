@@ -500,6 +500,7 @@ import {
   renderProfileClaudeTemplate,
   renderVaultProtocolFragment,
   renderAgentSelfServiceFragment,
+  renderExecutionDisciplineFragment,
 } from "./profiles.js";
 import {
   getHindsightSettingsEntry,
@@ -3558,6 +3559,16 @@ export function scaffoldAgent(
             if (selfService) {
               rendered = rendered.trimEnd() + "\n\n" + selfService + "\n";
             }
+            // Execution-discipline fragment — the fleet-wide grounding /
+            // verify-before-assert posture (serves the
+            // "feel-like-a-colleague" job: "verifies before claiming").
+            // Same unconditional-append pattern as the two above so it
+            // reaches EVERY agent on EVERY profile, not just the default
+            // profile's CLAUDE.md.
+            const executionDiscipline = renderExecutionDisciplineFragment(context);
+            if (executionDiscipline) {
+              rendered = rendered.trimEnd() + "\n\n" + executionDiscipline + "\n";
+            }
           }
           if (dest === "CLAUDE.md" && agentConfig.claude_md_raw) {
             rendered = rendered.trimEnd() + "\n\n" + agentConfig.claude_md_raw + "\n";
@@ -5312,6 +5323,14 @@ export function reconcileAgent(
       const selfService = renderAgentSelfServiceFragment(claudeContext);
       if (selfService) {
         rendered = rendered.trimEnd() + "\n\n" + selfService + "\n";
+      }
+      // Execution-discipline fragment — fleet-wide grounding posture.
+      // ORDER must mirror the first-scaffold path above (vault protocol,
+      // then agent-self-service, then execution-discipline) or the
+      // diff-abort below trips on every reconcile.
+      const executionDiscipline = renderExecutionDisciplineFragment(claudeContext);
+      if (executionDiscipline) {
+        rendered = rendered.trimEnd() + "\n\n" + executionDiscipline + "\n";
       }
       let composed = composeWithSidecar(rendered, claudeCustomPath);
 
