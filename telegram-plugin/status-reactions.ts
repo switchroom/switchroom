@@ -115,6 +115,14 @@ export interface StatusReactionConfig {
   stallHardMs?: number
   /** Optional logger for debugging — receives a single string per event. */
   log?: (msg: string) => void
+  /**
+   * Optional structured callback fired on every emoji transition (after the
+   * API call succeeds). Used by the gateway to emit `status_reaction_transition`
+   * streaming-metrics events for #2527 observability. Kept out of the main
+   * `log` callback so callers that only want the human-readable log string
+   * don't need to parse it.
+   */
+  onTransition?: (emoji: string) => void
 }
 
 /**
@@ -152,6 +160,7 @@ export class StatusReactionController {
   private readonly stallSoftMs: number
   private readonly stallHardMs: number
   private readonly log?: (msg: string) => void
+  private readonly onTransition?: (emoji: string) => void
 
   constructor(
     private readonly emit: ReactionEmitter,
@@ -163,6 +172,7 @@ export class StatusReactionController {
     this.stallSoftMs = config.stallSoftMs ?? 30000
     this.stallHardMs = config.stallHardMs ?? 90000
     this.log = config.log
+    this.onTransition = config.onTransition
   }
 
   /** 👀 — message received and queued for processing. Bypasses debounce. */
@@ -348,6 +358,7 @@ export class StatusReactionController {
         this.currentEmoji = emoji
         if (this.pendingEmoji === emoji) this.pendingEmoji = null
         this.log?.(`reaction → ${emoji}`)
+        this.onTransition?.(emoji)
       } catch (err) {
         this.log?.(`reaction emit failed (${emoji}): ${(err as Error).message}`)
       }

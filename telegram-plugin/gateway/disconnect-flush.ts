@@ -157,10 +157,12 @@ export function flushOnAgentDisconnect<
   // dangling-sweep above for activeTurnStartedAt.
   if (claudeBusyKeys.size > 0) {
     const orphanCount = claudeBusyKeys.size
+    const orphanKeys = [...claudeBusyKeys]
     claudeBusyKeys.clear()
     log(
       `telegram gateway: disconnect-flush cleared ${orphanCount} orphan claudeBusyKeys ` +
-      `entr${orphanCount === 1 ? 'y' : 'ies'} (synthetic-inbound deliveries that never turn_ended)`,
+      `entr${orphanCount === 1 ? 'y' : 'ies'} (synthetic-inbound deliveries that never turn_ended)` +
+      ` keys=${orphanKeys.join(',')}`,
     )
   }
 
