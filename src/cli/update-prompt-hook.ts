@@ -26,6 +26,32 @@ import { join, dirname } from "node:path";
 
 const HOOK_FILENAME = "update-card-on-prompt.sh";
 
+/**
+ * The container-stable path for the hook command entry in settings.json.
+ *
+ * `apply` runs on the HOST and receives the host-side agentDir
+ * (e.g. `/host-home/.switchroom/agents/overlord`). We write the hook
+ * script there so it lands in the bind-mounted volume. But the `command:`
+ * value that Claude Code reads from settings.json at runtime is resolved
+ * INSIDE the agent container, where `agentDir` is always mounted at
+ * `/state/agent` regardless of the host layout.
+ *
+ * Using the host path as `command:` caused every agent to log a non-fatal
+ * "UserPromptSubmit hook error: ... not found" on every prompt because
+ * `/host-home/.switchroom/agents/<name>/...` does not exist inside the
+ * container.
+ *
+ * This constant is the container-stable path. Self-heals on the next
+ * `switchroom apply`: the idempotency check detects a stale host-path entry
+ * and replaces it with the container path.
+ */
+const CONTAINER_AGENT_DIR = "/state/agent";
+
+/** Container-stable command path written into settings.json. */
+export function containerHookCommand(): string {
+  return join(CONTAINER_AGENT_DIR, ".claude", "hooks", HOOK_FILENAME);
+}
+
 export function updatePromptHookScript(): string {
   // Bash, POSIX-portable, fail-soft. Reads ~/.switchroom/host-control-audit.log
   // (the canonical hostd log path — see audit-reader.defaultAuditLogPath),
@@ -150,26 +176,46 @@ export function installUpdatePromptHook(agentDir: string): InstallHookResult {
     ? (hooks.UserPromptSubmit as Array<Record<string, unknown>>)
     : [];
 
-  const expectedCommand = scriptPath;
-  let alreadyPresent = false;
+  // The command recorded in settings.json MUST be the container-stable path
+  // (/state/agent/.claude/hooks/...), not the host path that `agentDir`
+  // resolves to. Claude Code reads settings.json inside the agent container,
+  // where the host path doesn't exist → "hook not found" on every prompt.
+  const correctCommand = containerHookCommand();
+
+  // Migrate any existing entry that references the hook filename but uses the
+  // wrong (host-side) path. This self-heals stale pre-fix installations on
+  // the next `switchroom apply` without requiring a manual fix.
+  let alreadyCorrect = false;
+  let mutated = false;
   for (const entry of list) {
     const inner = entry.hooks;
     if (!Array.isArray(inner)) continue;
-    for (const h of inner) {
+    for (const h of inner as Array<Record<string, unknown>>) {
       if (h && typeof h === "object") {
-        const cmd = (h as Record<string, unknown>).command;
+        const cmd = h.command;
         if (typeof cmd === "string" && cmd.includes(HOOK_FILENAME)) {
-          alreadyPresent = true;
+          if (cmd === correctCommand) {
+            alreadyCorrect = true;
+          } else {
+            // Stale host path — rewrite to the container-stable path.
+            h.command = correctCommand;
+            mutated = true;
+          }
           break;
         }
       }
     }
-    if (alreadyPresent) break;
+    if (alreadyCorrect || mutated) break;
   }
 
-  if (!alreadyPresent) {
+  if (mutated) {
+    hooks.UserPromptSubmit = list;
+    parsed.hooks = hooks;
+    writeFileSync(settingsPath, JSON.stringify(parsed, null, 2) + "\n", { mode: 0o600 });
+    installed = true;
+  } else if (!alreadyCorrect) {
     list.push({
-      hooks: [{ type: "command", command: expectedCommand }],
+      hooks: [{ type: "command", command: correctCommand }],
     });
     hooks.UserPromptSubmit = list;
     parsed.hooks = hooks;
