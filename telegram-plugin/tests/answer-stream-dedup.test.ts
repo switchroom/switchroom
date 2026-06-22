@@ -69,9 +69,7 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     const onMetric = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat646',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat646',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -111,9 +109,7 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     const log = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat646',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat646',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -157,9 +153,7 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     const editMessageText = makeEditMessageText()
 
     const stream = createAnswerStream({
-      chatId: 'chat646',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat646',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -184,9 +178,7 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     const recordDedup = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat646',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat646',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage: sendMessage as never,
       editMessageText,
@@ -228,9 +220,7 @@ describe('answer-stream materialize() — dedup callbacks (#646)', () => {
     const editMessageText = makeEditMessageText()
 
     const stream = createAnswerStream({
-      chatId: 'chat646',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat646',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -275,9 +265,7 @@ describe('answer-stream materialize() — recordOutbound callback (#648)', () =>
     const recordOutbound = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat648',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat648',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -302,9 +290,7 @@ describe('answer-stream materialize() — recordOutbound callback (#648)', () =>
     const recordOutbound = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat648',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat648',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage,
       editMessageText,
@@ -330,9 +316,7 @@ describe('answer-stream materialize() — recordOutbound callback (#648)', () =>
     const recordOutbound = vi.fn()
 
     const stream = createAnswerStream({
-      chatId: 'chat648',
-      isPrivateChat: false,
-      minInitialChars: 0,
+      chatId: 'chat648',      minInitialChars: 0,
       throttleMs: 250,
       sendMessage: sendMessage as never,
       editMessageText,

@@ -45,9 +45,7 @@ describe('#656 — answer-stream retract() at turn_end emits nothing', () => {
     const deleteMessage = vi.fn(async () => {})
 
     const stream = createAnswerStream({
-      chatId: 'chat-no-reply',
-      isPrivateChat: false,
-      minInitialChars: 400,
+      chatId: 'chat-no-reply',      minInitialChars: 400,
       throttleMs: 250,
       sendMessage: sendMessage as never,
       editMessageText: editMessageText as never,
@@ -80,9 +78,7 @@ describe('#656 — answer-stream retract() at turn_end emits nothing', () => {
     const deleteMessage = vi.fn(async () => {})
 
     const stream = createAnswerStream({
-      chatId: 'supergroup-topic',
-      isPrivateChat: false, // supergroup → message transport (no draft)
-      threadId: 4,
+      chatId: 'supergroup-topic',      threadId: 4,
       minInitialChars: Number.MAX_SAFE_INTEGER,
       throttleMs: 250,
       sendMessage: sendMessage as never,
@@ -109,9 +105,7 @@ describe('#656 — answer-stream retract() at turn_end emits nothing', () => {
     const deleteMessage = vi.fn(async () => {})
 
     const stream = createAnswerStream({
-      chatId: 'chat-no-reply',
-      isPrivateChat: false,
-      minInitialChars: 10,
+      chatId: 'chat-no-reply',      minInitialChars: 10,
       throttleMs: THROTTLE,
       sendMessage: sendMessage as never,
       editMessageText: editMessageText as never,
