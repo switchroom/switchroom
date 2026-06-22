@@ -221,6 +221,7 @@ import {
   isContextExhaustionText,
   shouldArmOrphanedReplyTimeout,
   ORPHANED_REPLY_TIMEOUT_MS,
+  ORPHANED_REPLY_MAX_REARMS,
 } from '../context-exhaustion.js'
 import {
   decideTurnFlush,
@@ -1966,6 +1967,13 @@ type CurrentTurn = {
   silentAnchorText: string
   capturedText: string[]
   orphanedReplyTimeoutId: ReturnType<typeof setTimeout> | null
+  // How many times the orphaned-reply backstop timer has been re-armed
+  // mid-tool-call instead of firing a synthetic turn_end. Bounded so a
+  // genuinely wedged single long-running tool still surfaces: the cap is
+  // ORPHANED_REPLY_MAX_REARMS (20 × 30 s = 10 min of genuine tool activity).
+  // Reset to 0 on a fresh enqueue; NOT reset on text/tool_label re-arms —
+  // only a new turn resets the budget.
+  orphanedReplyRearmCount: number
   // Component 3 (turn-origin reply routing). A stable per-turn identity,
   // `${registryKey-or-chatKey}#${startedAt}`, assigned when the turn
   // starts and stamped into the inbound meta (`origin_turn_id`) so a reply
@@ -9912,6 +9920,30 @@ function resetOrphanedReplyTimeout(): void {
         replyCalled: t.replyCalled,
         progressCardActive: progressDriver != null,
       })) {
+        // PRIMARY FIX: if a tool call is in flight when the fuse expires,
+        // the turn is still alive — re-arm the fuse instead of tearing down
+        // the activity feed mid-work. Without this guard, a Bash/Edit that
+        // runs for >30 s after the last text block fires a synthetic turn_end
+        // that nulls currentTurn and drops every subsequent tool_label.
+        //
+        // Bound: after ORPHANED_REPLY_MAX_REARMS re-arms (20 × 30 s = 10 min
+        // of genuine tool activity) we stop re-arming and let the backstop
+        // fire, so a truly wedged single long-running tool still surfaces.
+        if (toolFlightTracker.isMidToolCall()) {
+          if (t.orphanedReplyRearmCount < ORPHANED_REPLY_MAX_REARMS) {
+            t.orphanedReplyRearmCount++
+            process.stderr.write(
+              `telegram gateway: orphaned-reply fuse expired mid-tool-call — re-arming` +
+              ` (rearm ${t.orphanedReplyRearmCount}/${ORPHANED_REPLY_MAX_REARMS},` +
+              ` in_flight=${toolFlightTracker.inFlightCount()})\n`,
+            )
+            resetOrphanedReplyTimeout()
+            return
+          }
+          process.stderr.write(
+            `telegram gateway: orphaned-reply rearm cap reached (${ORPHANED_REPLY_MAX_REARMS}) — forcing backstop despite in-flight tools\n`,
+          )
+        }
         process.stderr.write(
           `telegram gateway: orphaned-reply timeout (${ORPHANED_REPLY_TIMEOUT_MS}ms) — forcing backstop\n`,
         )
@@ -10265,6 +10297,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           silentAnchorText: '',
           capturedText: [],
           orphanedReplyTimeoutId: null,
+          orphanedReplyRearmCount: 0,
           turnId,
           registryKey: null,
           noReplyDrainTimer: null,
@@ -10474,6 +10507,12 @@ function handleSessionEvent(ev: SessionEvent): void {
       // where the JSONL tool_use rows arrive too late.
       const turn = currentTurn
       if (turn == null) return
+      // SECONDARY FIX: an active tool_label means the model is producing work
+      // right now — re-arm the orphaned-reply fuse so a multi-phase tool turn
+      // (write → compile → test → fix) that regularly emits labels doesn't let
+      // the 30 s timer run down between labels. Mirrors how `case 'text':` calls
+      // resetOrphanedReplyTimeout() at ~line 10786.
+      resetOrphanedReplyTimeout()
       // Surface tools (reply/stream_reply/react) are the conversation, not
       // activity — the hook labels them ("Replying"), so filter by name.
       if (isTelegramSurfaceTool(ev.toolName)) return
@@ -10860,6 +10899,20 @@ function handleSessionEvent(ev: SessionEvent): void {
       return
     }
     case 'turn_end': {
+      // DEFENSIVE FIX: belt-and-braces guard against the synthetic backstop
+      // (`durationMs: -1`) racing a real tool call. durationMs >= 0 is the
+      // authoritative signal from system/turn_duration; -1 is ONLY ever set
+      // by the orphaned-reply backstop. Reject the synthetic event here so that
+      // even if the PRIMARY fix's re-arm logic is bypassed (e.g. a very fast
+      // fire before isMidToolCall() is sampled) we still don't tear down a
+      // live feed mid-tool. Never suppresses a real turn_end (durationMs >= 0).
+      if (ev.durationMs === -1 && toolFlightTracker.isMidToolCall()) {
+        process.stderr.write(
+          `telegram gateway: synthetic turn_end suppressed — tools still in flight` +
+          ` (in_flight=${toolFlightTracker.inFlightCount()})\n`,
+        )
+        return
+      }
       // Drain any still-pending tool dispatch typing entries — covers
       // transcript truncation or a Claude Code crash mid-tool.
       typingWrapper.drainAll()
