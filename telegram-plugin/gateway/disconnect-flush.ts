@@ -27,7 +27,7 @@
  * needing to spin up the whole gateway.
  */
 
-export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' | 'error') => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
+export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' | 'undelivered' | 'error') => void }, Stream extends { isFinal: () => boolean; finalize: () => Promise<void> }> {
   /** The disconnecting client's agentName. `null` ⇒ anonymous (never registered). */
   agentName: string | null
 
@@ -67,6 +67,18 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
 
   /** Logger — receives the one-line decision trace. */
   log: (msg: string) => void
+
+  /**
+   * #2527 — role-aware terminal honesty on a bridge crash/restart. For each
+   * swept reaction key, returns the terminal reason: `'undelivered'` (😐) when
+   * that key is a USER turn that crashed without delivering an answer, else
+   * `'done'` (👍). Optional + defaults to `'done'` so a crash on a turn we
+   * can't classify (or a delivered / system / NO_REPLY turn) keeps the prior
+   * clean-terminal behaviour — a bridge death must never get STUCK on a
+   * working emoji, but a user turn it killed undelivered must not read as
+   * "answered" either (matches the main `turn_end` gate in gateway.ts).
+   */
+  resolveDisposition?: (key: string) => 'done' | 'undelivered'
 }
 
 /**
@@ -75,7 +87,7 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
  * client). The boolean is for tests + observability — callers can ignore it.
  */
 export function flushOnAgentDisconnect<
-  Ctrl extends { finalize: (reason?: 'done' | 'error') => void },
+  Ctrl extends { finalize: (reason?: 'done' | 'undelivered' | 'error') => void },
   Stream extends { isFinal: () => boolean; finalize: () => Promise<void> },
 >(deps: DisconnectFlushDeps<Ctrl, Stream>): boolean {
   const {
@@ -89,6 +101,7 @@ export function flushOnAgentDisconnect<
     clearActiveReactions,
     disposeProgressDriver,
     onDanglingTurnsSwept,
+    resolveDisposition,
     log,
   } = deps
 
@@ -100,14 +113,22 @@ export function flushOnAgentDisconnect<
   }
 
   // Real agent disconnect (e.g. the claude bridge crashed/restarted). Flush
-  // all in-flight status reactions to 👍 so user messages don't stay stuck on
-  // intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
+  // all in-flight status reactions to a TERMINAL emoji so user messages don't
+  // stay stuck on intermediate emoji (🤔, 🔥, etc.) after an agent crash/restart.
   // #1713: route through finalize() — single terminal path for the
   // status-reaction controller. Disconnect implies the agent bridge
   // died mid-turn; treat as a clean terminal so the user's emoji
   // doesn't stay stuck on an intermediate working state.
+  //
+  // #2527: but a USER turn the bridge killed WITHOUT delivering an answer must
+  // not read as 👍 ("done") — that's the false-done bug in its crash/restart
+  // variant. `resolveDisposition` paints 😐 ('undelivered') for those and 👍
+  // for everything else (delivered / system / NO_REPLY / unclassifiable). If a
+  // restart resumes the turn and it then delivers, the resume's own reply
+  // re-finalizes 👍; if it never delivers, 😐 stays honest. Default 'done'
+  // preserves the prior behaviour when the resolver isn't wired.
   for (const [key, ctrl] of activeStatusReactions.entries()) {
-    ctrl.finalize('done')
+    ctrl.finalize(resolveDisposition?.(key) ?? 'done')
     activeStatusReactions.delete(key)
     activeReactionMsgIds.delete(key)
     activeTurnStartedAt.delete(key)

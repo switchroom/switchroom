@@ -6332,6 +6332,22 @@ const ipcServer: IpcServer = createIpcServer({
           currentTurn = null
         }
       },
+      // #2527 — role-aware terminal honesty on a bridge crash, mirroring the
+      // main turn_end gate. Only the in-flight turn is classifiable here
+      // (currentTurn); a `user` turn the bridge killed undelivered paints 😐
+      // not 👍. No worker-hold carve-out — the bridge died, so nothing is
+      // still legitimately working. Unclassifiable keys default to 'done'.
+      resolveDisposition: (key) => {
+        const turn = currentTurn
+        if (turn == null || statusKey(turn.sessionChatId, turn.sessionThreadId) !== key) {
+          return 'done'
+        }
+        return decideTerminalReason({
+          enabled: LIVENESS_TERMINAL_HONESTY,
+          role: turn.role,
+          finalAnswerDelivered: turn.finalAnswerDelivered,
+        })
+      },
       log: (msg) => process.stderr.write(`${msg}\n`),
     })
   },

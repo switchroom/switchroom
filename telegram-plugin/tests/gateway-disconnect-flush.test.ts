@@ -22,7 +22,8 @@ import { flushOnAgentDisconnect } from '../gateway/disconnect-flush.js'
 interface FakeCtrl {
   // #1713: disconnect-flush now routes through finalize() — single
   // terminal path for the status-reaction controller.
-  finalize: (reason?: 'done' | 'error') => void
+  // #2527: 'undelivered' (😐) added for the role-aware crash terminal.
+  finalize: (reason?: 'done' | 'undelivered' | 'error') => void
 }
 interface FakeStream {
   isFinal: () => boolean
@@ -117,6 +118,36 @@ describe('flushOnAgentDisconnect — anonymous clients (the regression scenario)
     flushOnAgentDisconnect(deps)
     expect(spies.setDoneA).toHaveBeenCalledTimes(0)
     expect(spies.setDoneB).toHaveBeenCalledTimes(0)
+  })
+})
+
+describe('flushOnAgentDisconnect — #2527 role-aware terminal honesty on crash', () => {
+  it('defaults to finalize("done") when no resolveDisposition is wired (back-compat)', () => {
+    const { spies, deps } = makeDeps('clerk')
+    flushOnAgentDisconnect(deps)
+    expect(spies.setDoneA).toHaveBeenCalledWith('done')
+    expect(spies.setDoneB).toHaveBeenCalledWith('done')
+  })
+
+  it('paints 😐 (undelivered) for a user turn the bridge killed undelivered, 👍 for the rest', () => {
+    const { spies, deps } = makeDeps('clerk')
+    // Key A = an undelivered user turn; key B = delivered / system / NO_REPLY.
+    flushOnAgentDisconnect({
+      ...deps,
+      resolveDisposition: (key) =>
+        key === 'chat1:thr1:msg1' ? 'undelivered' : 'done',
+    })
+    expect(spies.setDoneA).toHaveBeenCalledWith('undelivered') // no false 👍
+    expect(spies.setDoneB).toHaveBeenCalledWith('done')
+    // Maps still cleared exactly as before — a crash never leaves a stuck emoji.
+    expect(deps.activeStatusReactions.size).toBe(0)
+  })
+
+  it('still finalizes every reaction (no key left stuck on a working emoji)', () => {
+    const { spies, deps } = makeDeps('clerk')
+    flushOnAgentDisconnect({ ...deps, resolveDisposition: () => 'undelivered' })
+    expect(spies.setDoneA).toHaveBeenCalledTimes(1)
+    expect(spies.setDoneB).toHaveBeenCalledTimes(1)
   })
 })
 
