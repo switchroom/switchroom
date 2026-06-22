@@ -48,6 +48,12 @@
  * pacing prompt + draft still apply; only the framework safety net is off.
  */
 
+import {
+  decideMidTurnFloor,
+  midTurnFloorEnabled,
+  type LoopRole,
+} from './turn-liveness-floor.js'
+
 /** #1292: snapshot of an in-flight tool call, surfaced in the 300s
  * framework-fallback message so the user sees the actual observable
  * ("running Grep \"foo\" for 4m") instead of the dishonest generic
@@ -73,6 +79,10 @@ export interface SilencePokeState {
   lastThinkingAt: number | null
   /** True once the 300s framework fallback has fired this turn. */
   fallbackFired: boolean
+  /** #2527: true once the mid-turn liveness floor has fired this turn.
+   *  Independent of `fallbackFired` — the floor is the early (45s) quiet
+   *  beat, the fallback the late (300s) loud unwedge. Fire-once each. */
+  floorFired: boolean
   /** #1292: in-flight tool calls keyed by toolUseId. Populated by
    * `noteToolStart` on every parent-agent `tool_use` event the gateway
    * sees and drained by `noteToolEnd` on the matching `tool_result`.
@@ -99,6 +109,14 @@ export interface ThresholdsMs {
    * defer is on; defaults to no ceiling (Infinity) when omitted.
    */
   fallbackHardCeiling?: number
+  /**
+   * #2527 — mid-turn liveness floor threshold. After this much busy-silence
+   * on a `user` turn that hasn't delivered a substantive answer, the floor
+   * fires ONE quiet (no-ping) interim so the user isn't left staring at the
+   * ambient 👀. Strictly below `fallback` (which owns the beat above it).
+   * Omitted (undefined) disables the floor entirely.
+   */
+  floor?: number
 }
 
 export const DEFAULT_THRESHOLDS: ThresholdsMs = {
@@ -127,8 +145,26 @@ export interface FrameworkFallbackContext {
   inFlightTools: ToolSnapshot[]
 }
 
+/**
+ * #2527 — context handed to the gateway when the mid-turn floor fires. The
+ * gateway formats the honest text (from `inFlightTools`) and sends it through
+ * the SAME path a model reply takes — no parallel send. Mirrors
+ * `FrameworkFallbackContext` minus the wedge semantics: the floor never
+ * unwedges the turn, it just speaks.
+ */
+export interface MidTurnFloorContext {
+  key: string
+  chatId: string
+  threadId: number | null
+  silenceMs: number
+  inFlightTools: ToolSnapshot[]
+  /** True when fired by a user "Status?" mid-turn inbound rather than the timer. */
+  forced: boolean
+}
+
 export type SilencePokeMetric =
   | { kind: 'silence_fallback_sent'; key: string; fallback_kind: 'working' | 'thinking'; silence_ms: number }
+  | { kind: 'mid_turn_floor'; key: string; silence_ms: number; forced: boolean; decision: 'fire' | string }
 
 export interface SilencePokeDeps {
   /** Called when the 300s fallback fires. Caller sends the user-visible
@@ -162,6 +198,19 @@ export interface SilencePokeDeps {
    * human-wait tools in addition to foreground in-flight tool calls.
    */
   deferFallbackWhileToolInFlight?: boolean
+  /**
+   * #2527 — called when the mid-turn liveness floor fires. The gateway sends
+   * the honest "still on it" interim through the shared reply path. Optional:
+   * when absent the floor never fires (back-compat for test harnesses).
+   */
+  onMidTurnFloor?: (ctx: MidTurnFloorContext) => Promise<void> | void
+  /**
+   * #2527 — the gateway-owned half of the floor decision: the turn's loop
+   * role and whether a substantive answer has already landed. silence-poke
+   * owns the timing/working/fire-once half; the pure `decideMidTurnFloor`
+   * combines both. Returns null when there is no live turn for `key`.
+   */
+  floorState?: (key: string) => { role: LoopRole; finalAnswerDelivered: boolean } | null
 }
 
 const state = new Map<string, SilencePokeState>()
@@ -187,6 +236,7 @@ export function startTurn(key: string, now: number): void {
     lastOutboundAt: null,
     lastThinkingAt: null,
     fallbackFired: false,
+    floorFired: false,
     inFlightTools: new Map(),
   })
 }
@@ -416,6 +466,76 @@ function truncateLabel(label: string): string {
   return label.slice(0, MAX - 1) + '…'
 }
 
+/** Snapshot in-flight tools sorted longest-running first — for the honest
+ *  floor/fallback message body. */
+function snapshotInFlight(s: SilencePokeState, now: number): ToolSnapshot[] {
+  return Array.from(s.inFlightTools.values())
+    .sort((a, b) => a.startedAt - b.startedAt)
+    .map((t) => ({ name: t.name, label: t.label, durationMs: now - t.startedAt }))
+}
+
+/**
+ * #2527 — evaluate and (if eligible) fire the mid-turn liveness floor for one
+ * turn. silence-poke owns the timing/working/fire-once half; the gateway
+ * provides the role + delivery half via `floorState`; the pure
+ * `decideMidTurnFloor` combines them so the policy lives in one tested place.
+ * `forced=true` is a user "Status?" poke (bypasses timing + working).
+ */
+function tryMidTurnFloor(key: string, s: SilencePokeState, now: number, forced: boolean): void {
+  if (activeDeps == null) return
+  const { onMidTurnFloor, floorState, isLegitimatelyWorking } = activeDeps
+  if (onMidTurnFloor == null || floorState == null) return
+  const thresholds = activeDeps.thresholdsMs ?? DEFAULT_THRESHOLDS
+  if (thresholds.floor == null) return
+  const fs = floorState(key)
+  if (fs == null) return
+  const silence = now - (s.lastOutboundAt ?? s.turnStartedAt)
+  if (silence < 0) return
+  const decision = decideMidTurnFloor({
+    enabled: midTurnFloorEnabled(),
+    role: fs.role,
+    finalAnswerDelivered: fs.finalAnswerDelivered,
+    silenceMs: silence,
+    floorThresholdMs: thresholds.floor,
+    fallbackThresholdMs: thresholds.fallback,
+    legitimatelyWorking: isLegitimatelyWorking?.(key) ?? false,
+    alreadyFired: s.floorFired,
+    force: forced,
+  })
+  if (decision.kind !== 'fire') {
+    // Per-tick skips are noise; only surface a declined FORCED poke (the
+    // user asked "Status?" and we chose not to speak — worth seeing).
+    if (forced) {
+      activeDeps.emitMetric({ kind: 'mid_turn_floor', key, silence_ms: silence, forced, decision: decision.reason })
+    }
+    return
+  }
+  s.floorFired = true
+  activeDeps.emitMetric({ kind: 'mid_turn_floor', key, silence_ms: silence, forced, decision: 'fire' })
+  const { chatId, threadId } = parseKey(key)
+  try {
+    const r = onMidTurnFloor({ key, chatId, threadId, silenceMs: silence, inFlightTools: snapshotInFlight(s, now), forced })
+    if (r != null && typeof (r as Promise<void>).catch === 'function') {
+      ;(r as Promise<void>).catch((err) => {
+        process.stderr.write(`silence-poke: mid-turn floor handler rejected: ${err}\n`)
+      })
+    }
+  } catch (err) {
+    process.stderr.write(`silence-poke: mid-turn floor handler threw: ${err}\n`)
+  }
+}
+
+/**
+ * #2527 — fire the mid-turn floor immediately for `key` (a user "Status?"
+ * mid-turn inbound landed during a silent stretch). No-op if there is no
+ * live turn for the key or the floor is ineligible/already-fired.
+ */
+export function pokeFloorNow(key: string, now: number): void {
+  const s = state.get(key)
+  if (s == null) return
+  tryMidTurnFloor(key, s, now, true)
+}
+
 /**
  * Internal tick — iterates active states and fires the 300s framework
  * fallback (which the gateway turns into a user-visible message + an
@@ -429,6 +549,10 @@ function tick(now: number): void {
     const zeroAt = s.lastOutboundAt ?? s.turnStartedAt
     const silence = now - zeroAt
     if (silence < 0) continue
+
+    // #2527 — the early, quiet mid-turn liveness beat (below the fallback
+    // window). Evaluated every tick; fires at most once per turn.
+    tryMidTurnFloor(key, s, now, false)
 
     if (!s.fallbackFired && silence >= thresholds.fallback) {
       // Feed-survival defer: hold back the unwedge while the agent is

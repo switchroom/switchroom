@@ -78,6 +78,19 @@ export type RuntimeMetricEvent =
       silence_ms: number
     }
   /**
+   * #2527 — mid-turn liveness floor decision. `decision: 'fire'` when the
+   * quiet "still on it" beat was sent; otherwise the machine-readable skip
+   * reason for a declined forced ("Status?") poke. `forced` distinguishes
+   * the timer beat from a user-asked one.
+   */
+  | {
+      kind: 'mid_turn_floor'
+      key: string
+      silence_ms: number
+      forced: boolean
+      decision: string
+    }
+  /**
    * #1445 cross-turn pending-async ambient lifecycle. `started` fires
    * when a turn ends with a captured anchor AND a pending Agent/Task/
    * Bash-background dispatch — i.e. the framework will now edit the

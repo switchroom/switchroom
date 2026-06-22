@@ -55,6 +55,7 @@ export type ReactionState =
   | 'compacting'
   | 'awaiting'
   | 'done'
+  | 'undelivered'
   | 'error'
   | 'stallSoft'
   | 'stallHard'
@@ -80,7 +81,11 @@ export const REACTION_VARIANTS: Record<ReactionState, string[]> = {
   web:       ['⚡', '🤔', '👌'],      // WORKING: lookup in motion
   compacting:['✍', '🤔', '👀'],
   awaiting:  ['🙏', '🤔', '👀'],      // BLOCKED ON HUMAN: parked on a permission card
-  done:      ['👍', '💯', '🎉'],      // FINISHED: turn_end fired
+  done:      ['👍', '💯', '🎉'],      // FINISHED: turn_end delivered an answer
+  // #2527 — FINISHED but the user turn produced NO answer. A gentle,
+  // non-celebratory terminal so the ambient signal never reads as "done"
+  // over an undelivered turn. The silent-end fallback text carries the why.
+  undelivered:['😐', '🤷', '🤔'],
   error:     ['😱', '😨', '🤯'],      // NON-TERMINAL — recovery allowed
   stallSoft: ['🥱', '😴', '🤔'],
   stallHard: ['😨', '🤯', '😱'],
@@ -103,7 +108,7 @@ export function resolveToolReactionState(toolName: string): ReactionState {
 }
 
 /** Reason passed to `finalize()` — selects the terminal emoji.  */
-export type FinalizeReason = 'done' | 'error'
+export type FinalizeReason = 'done' | 'undelivered' | 'error'
 
 /** Configuration knobs the controller respects. */
 export interface StatusReactionConfig {
@@ -222,7 +227,8 @@ export class StatusReactionController {
    * lands promptly. Subsequent calls are no-ops.
    */
   finalize(reason: FinalizeReason = 'done'): void {
-    const state: ReactionState = reason === 'error' ? 'error' : 'done'
+    const state: ReactionState =
+      reason === 'error' ? 'error' : reason === 'undelivered' ? 'undelivered' : 'done'
     this.finishWithState(state)
   }
 
