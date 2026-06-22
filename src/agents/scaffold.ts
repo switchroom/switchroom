@@ -490,7 +490,7 @@ import {
   usesSwitchroomTelegramPlugin,
   deepMergeJson,
 } from "../config/merge.js";
-import { resolveTimezone, classifyTimezoneSource } from "../config/timezone.js";
+import { resolveTimezone } from "../config/timezone.js";
 import { isContainerContext } from "../cli/agent-config.js";
 import {
   getProfilePath,
@@ -4901,22 +4901,24 @@ export function reconcileAgent(
   const agentDir = resolve(agentsDir, name);
   const changes: string[] = [];
 
-  // Timezone sanity check — warn when we fell back to server detection
-  // AND the detected zone is UTC. That combination almost always means
-  // the host is a container inheriting the platform default, not a real
-  // expression of the user's locale, and the per-turn time hint will be
-  // useless. Silent when an explicit value is present at any layer.
+  // Timezone sanity check — warn when we fell all the way through the
+  // cascade to the UTC hard-fallback. That combination almost always
+  // means the host is a container inheriting the platform default, not a
+  // real expression of the user's locale, and the per-turn time hint will
+  // be wrong. Silent when an explicit value is present at any layer. Uses
+  // the resolveTimezone onUtcFallback hook so we share the same detection
+  // logic the runtime uses rather than re-implementing it inline.
   {
-    const resolvedTz = resolveTimezone(switchroomConfig, agentConfig);
-    const source = classifyTimezoneSource(switchroomConfig, agentConfig);
-    if (source === "detected" && resolvedTz === "UTC") {
-      console.warn(
-        `  ${chalk.yellow("⚠")} Timezone auto-detected as UTC from server. This is often a container default.`,
-      );
-      console.warn(
-        `     Set \`timezone: "Region/City"\` in switchroom.yaml to silence this warning.`,
-      );
-    }
+    resolveTimezone(switchroomConfig, agentConfig, {
+      onUtcFallback: () => {
+        console.warn(
+          `  ${chalk.yellow("⚠")} Timezone auto-detected as UTC from server. This is often a container default.`,
+        );
+        console.warn(
+          `     Set \`timezone: "Region/City"\` in switchroom.yaml to silence this warning.`,
+        );
+      },
+    });
   }
 
   if (!existsSync(agentDir)) {
