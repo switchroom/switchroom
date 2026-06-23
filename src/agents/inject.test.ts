@@ -17,6 +17,7 @@ import {
   dedupeInjectQueue,
   injectSlashCommand,
   injectSlashCommandWith,
+  isTuiChromeLine,
   normalizeInjectCommand,
   validateInjectCommand,
   type TmuxRunner,
@@ -102,10 +103,10 @@ describe("INJECT_COMMANDS metadata", () => {
     );
   });
 
-  it("/clear has expectsOutput=false and no silentNote", () => {
+  it("/clear has expectsOutput=false and silentNote 'context cleared — fresh slate'", () => {
     const meta = INJECT_COMMANDS.get("/clear");
     expect(meta?.expectsOutput).toBe(false);
-    expect(meta?.silentNote).toBeUndefined();
+    expect(meta?.silentNote).toBe("context cleared — fresh slate");
   });
 });
 
@@ -188,6 +189,129 @@ some-narrative
     expect(r.output).toContain("new line C");
     expect(r.output).toContain("new line D");
     expect(r.anchored).toBe(false);
+  });
+});
+
+describe("isTuiChromeLine — chrome predicate", () => {
+  // Lines that must be filtered (chrome)
+  it("identifies box-drawing rule lines as chrome", () => {
+    expect(isTuiChromeLine("─────────────────────────────")).toBe(true);
+    expect(isTuiChromeLine("│")).toBe(true);
+    expect(isTuiChromeLine("╭──────────────────────╮")).toBe(true);
+    expect(isTuiChromeLine("╰──────────────────────╯")).toBe(true);
+    expect(isTuiChromeLine("______________________________")).toBe(true);
+    expect(isTuiChromeLine("------------------------------")).toBe(true);
+  });
+
+  it("identifies bare prompt-glyph lines as chrome", () => {
+    expect(isTuiChromeLine("❯")).toBe(true);
+    expect(isTuiChromeLine(">")).toBe(true);
+    expect(isTuiChromeLine(")")).toBe(true);
+    expect(isTuiChromeLine("  ❯  ")).toBe(true);
+    expect(isTuiChromeLine("│ ❯ │")).toBe(true);
+  });
+
+  it("identifies footer hint lines as chrome", () => {
+    expect(isTuiChromeLine("▶▶ accept edits on (shift+tab to cycle) · ← for agents")).toBe(true);
+    expect(isTuiChromeLine("shift+tab to cycle modes")).toBe(true);
+    expect(isTuiChromeLine("← for agents")).toBe(true);
+    expect(isTuiChromeLine("? for shortcuts")).toBe(true);
+    expect(isTuiChromeLine("bypassing permissions")).toBe(true);
+  });
+
+  it("identifies the copy affordance as chrome", () => {
+    expect(isTuiChromeLine("copy")).toBe(true);
+  });
+
+  // Lines that must NOT be filtered (real content)
+  it("does NOT strip real output lines", () => {
+    expect(isTuiChromeLine("Total cost: $1.23")).toBe(false);
+    expect(isTuiChromeLine("Session cost: $0.05")).toBe(false);
+    expect(isTuiChromeLine("  Model: claude-opus-4  ")).toBe(false);
+    expect(isTuiChromeLine("Context window: 3%")).toBe(false);
+    expect(isTuiChromeLine("No hooks configured")).toBe(false);
+    expect(isTuiChromeLine("  Cache creation: 1234 tokens")).toBe(false);
+  });
+});
+
+describe("diffPane — /clear post-clear TUI chrome filtering", () => {
+  // Realistic post-/clear capture: command-echo ABSENT (wiped), fresh input-box chrome visible
+  const clearBefore = `  Some earlier output line
+  Another earlier line
+❯ /clear`;
+
+  const clearAfter = `╭──────────────────────────────────────────────────────────────────────╮
+│ ❯                                                                    │
+╰──────────────────────────────────────────────────────────────────────╯
+▶▶ accept edits on (shift+tab to cycle) · ← for agents`;
+
+  it("falls back to set-diff when /clear echo is absent", () => {
+    const r = diffPane(clearBefore, clearAfter, "/clear");
+    expect(r.anchored).toBe(false);
+  });
+
+  it("strips all chrome lines in the fallback path — output is empty", () => {
+    const r = diffPane(clearBefore, clearAfter, "/clear");
+    expect(r.output).toBe("");
+  });
+
+  it("anchored /cost path is unaffected — real content passes through", () => {
+    const before = "❯ /cost\n";
+    const after = `❯ /cost
+  Total cost: $0.42
+  Session: $0.12 (3 turns)`;
+    const r = diffPane(before, after, "/cost");
+    expect(r.anchored).toBe(true);
+    expect(r.output).toContain("Total cost: $0.42");
+    expect(r.output).toContain("$0.12");
+  });
+
+  it("fallback does NOT strip real output lines that happen to appear without an anchor", () => {
+    const before = "old line\n";
+    const after = "old line\nTotal cost: $1.23\nContext window: 5%\n";
+    const r = diffPane(before, after, "/cost");
+    expect(r.anchored).toBe(false);
+    expect(r.output).toContain("Total cost: $1.23");
+    expect(r.output).toContain("Context window: 5%");
+  });
+});
+
+describe("injectSlashCommandWith — /clear produces ok_no_output (not ok with chrome)", () => {
+  it("post-clear pane with only TUI chrome → outcome=ok_no_output, output empty", async () => {
+    // Simulate what happens after /clear: pre-snapshot has content,
+    // post-capture has only fresh input-box chrome (no command-echo line).
+    const before = `  Some earlier session output
+  Another line of output
+❯ /clear`;
+    const clearChrome = `╭───────────────────────────────────────────────────────────────╮
+│ ❯                                                             │
+╰───────────────────────────────────────────────────────────────╯
+▶▶ accept edits on (shift+tab to cycle) · ← for agents`;
+
+    let callCount = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => {
+        callCount += 1;
+        // First capture (before send) returns the pre-snapshot.
+        // Subsequent captures (after send) return the post-clear chrome.
+        return callCount === 1 ? before : clearChrome;
+      },
+      send: () => {},
+    };
+
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-test",
+      session: "test",
+      command: "/clear",
+      settleMs: 50,
+      timeoutMs: 200,
+    });
+
+    expect(r.outcome).toBe("ok_no_output");
+    expect(r.output).toBe("");
+    expect(r.command).toBe("/clear");
+    expect(r.meta?.silentNote).toBe("context cleared — fresh slate");
   });
 });
 
