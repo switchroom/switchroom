@@ -34,6 +34,7 @@ import {
   renderAuthSnapshotFormat2,
   buildSnapshotKeyboard,
 } from '../auth-snapshot-format.js'
+import { maskEmail } from '../demo-mask.js'
 
 // ─── Parser ────────────────────────────────────────────────────────────────
 
@@ -295,6 +296,13 @@ export interface AuthCommandContext {
   ) => Promise<LiveQuotasResult>
   /** Operator timezone forwarded to the Format 2 renderer. */
   tz?: string
+  /**
+   * Demo mode (the `/auth demo` suffix). Forwarded to the Format 2 renderer
+   * so the fleet snapshot masks account-email labels for a screen recording.
+   * Off by default; only the default dashboard view (`show`/`list`) honors
+   * it — destructive verbs are unaffected. Scope is the email-label PII tier.
+   */
+  demo?: boolean
 }
 
 /**
@@ -402,6 +410,7 @@ export async function handleAuthCommand(
           tz: ctx.tz,
           liveProbedAtMs,
           staleCachedAtMs,
+          demo: ctx.demo,
         }),
         html: true,
         keyboard,
@@ -747,6 +756,9 @@ export interface RenderShowOpts {
    *  (probe-on-open TTL hit or failed probe). Renders "⚠ cached Nm ago" in
    *  the footer (takes precedence over liveProbedAtMs). */
   staleCachedAtMs?: number
+  /** Demo mode (the `/auth demo` suffix). Masks account-email labels in both
+   *  the Format 2 snapshot and the legacy accounts table. Off by default. */
+  demo?: boolean
 }
 
 /**
@@ -784,6 +796,7 @@ export function renderShowText(
         now: new Date(now),
         liveProbedAtMs: opts.liveProbedAtMs,
         staleCachedAtMs: opts.staleCachedAtMs,
+        demo: opts.demo,
       }),
     )
   } else {
@@ -792,7 +805,7 @@ export function renderShowText(
       lines.push('')
       lines.push('<b>Accounts</b>')
       lines.push('<pre>')
-      lines.push(formatAccountsTable(state, now))
+      lines.push(formatAccountsTable(state, now, opts.demo ?? false))
       lines.push('</pre>')
     }
   }
@@ -801,7 +814,7 @@ export function renderShowText(
   if (state.agents.length > 0) {
     lines.push('<b>Agents</b>')
     lines.push('<pre>')
-    lines.push(formatAgentsTable(state))
+    lines.push(formatAgentsTable(state, opts.demo ?? false))
     lines.push('</pre>')
   }
 
@@ -809,7 +822,7 @@ export function renderShowText(
   if (state.consumers.length > 0) {
     lines.push('<b>Consumers</b>')
     lines.push('<pre>')
-    lines.push(formatConsumersTable(state, now))
+    lines.push(formatConsumersTable(state, now, opts.demo ?? false))
     lines.push('</pre>')
   }
 
@@ -823,7 +836,7 @@ export function renderShowText(
   return lines.join('\n')
 }
 
-function formatAccountsTable(state: ListStateData, now: number): string {
+function formatAccountsTable(state: ListStateData, now: number, demo = false): string {
   const rows: string[][] = [['ACCOUNT', 'STATUS', 'EXPIRES', 'QUOTA 5h·7d', 'QUOTA-RESET']]
   for (const acc of state.accounts) {
     const isActive = acc.label === state.active
@@ -839,7 +852,7 @@ function formatAccountsTable(state: ListStateData, now: number): string {
         ? formatRelativeMs(acc.exhausted_until - now)
         : '—'
     rows.push([
-      `${marker} ${escapeHtml(acc.label)}`,
+      `${marker} ${escapeHtml(demo ? maskEmail(acc.label) : acc.label)}`,
       status,
       expires,
       formatQuotaUtilCell(acc, now),
@@ -869,7 +882,9 @@ export function formatQuotaUtilCell(
   return `${Math.round(lq.fiveHourUtilizationPct)}%·${Math.round(lq.sevenDayUtilizationPct)}% (${ageStr} ago)`
 }
 
-function formatAgentsTable(state: ListStateData): string {
+function formatAgentsTable(state: ListStateData, demo = false): string {
+  // The ACTIVE column is an account-email label (in-scope PII); the AGENT
+  // name is topology (out of scope) and is never masked.
   const rows: string[][] = [['AGENT', 'ACTIVE', 'SOURCE']]
   for (const a of state.agents) {
     const source = a.override
@@ -877,7 +892,7 @@ function formatAgentsTable(state: ListStateData): string {
       : a.account === state.active
         ? 'fleet-active'
         : 'pinned'
-    rows.push([escapeHtml(a.name), escapeHtml(a.account), source])
+    rows.push([escapeHtml(a.name), escapeHtml(demo ? maskEmail(a.account) : a.account), source])
   }
   return alignTable(rows)
 }
@@ -924,14 +939,16 @@ export function renderAgentDetail(
   return lines.join('\n')
 }
 
-function formatConsumersTable(state: ListStateData, now: number): string {
+function formatConsumersTable(state: ListStateData, now: number, demo = false): string {
+  // ACTIVE is an account-email label (in-scope PII); CONSUMER name is
+  // topology (out of scope) and is never masked.
   const rows: string[][] = [['CONSUMER', 'ACTIVE', 'STATUS']]
   for (const c of state.consumers) {
     const status =
       c.last_seen_at == null
         ? 'socket bound'
         : `socket bound (last seen ${formatRelativeMs(now - c.last_seen_at)} ago)`
-    rows.push([escapeHtml(c.name), escapeHtml(c.account), status])
+    rows.push([escapeHtml(c.name), escapeHtml(demo ? maskEmail(c.account) : c.account), status])
   }
   return alignTable(rows)
 }

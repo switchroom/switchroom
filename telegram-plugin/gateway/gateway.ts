@@ -474,6 +474,7 @@ import {
   isLiveCorroboration,
 } from '../quota-watch.js'
 import { buildSnapshotsFromState, buildSnapshotsFromCachedState } from '../auth-snapshot-format.js'
+import { maskUsername, maskVaultKey } from '../demo-mask.js'
 import {
   writeTurnActiveMarker,
   touchTurnActiveMarker,
@@ -13596,6 +13597,18 @@ function getCommandArgs(ctx: Context): string {
   return m ? m[1].trim() : ''
 }
 
+/**
+ * True when a slash command's argument string carries a trailing `demo`
+ * token — the per-command PII-mask modifier for screen recordings
+ * (`/usage demo`, `/auth demo`, `/status demo`, `/whoami demo`). Matches
+ * `demo` as the last whitespace-delimited token, case-insensitively, so
+ * `/auth show demo` and `/usage demo` both flip the flag while a label
+ * literally named `demo-foo` does not.
+ */
+function hasDemoFlag(args: string): boolean {
+  return /(?:^|\s)demo$/i.test(args.trim())
+}
+
 /** Validate that a string looks like a safe agent/resource name.
  *  Agent names should be alphanumeric with hyphens/underscores only.
  *  This prevents shell metacharacter injection even though both exec
@@ -14873,9 +14886,10 @@ bot.command('status', async ctx => {
   const { access, senderId } = gated
   const from = ctx.from!
   if (access.allowFrom.includes(senderId)) {
+    const demo = hasDemoFlag(getCommandArgs(ctx))
     const userTag = from.username ? `@${from.username}` : senderId
     const meta = await buildAgentMetadata(getMyAgentName())
-    await ctx.reply(buildStatusPairedText({ user: userTag, meta }), { parse_mode: 'HTML' })
+    await ctx.reply(buildStatusPairedText({ user: userTag, meta, demo }), { parse_mode: 'HTML' })
     return
   }
   for (const [code, p] of Object.entries(access.pending)) {
@@ -16744,7 +16758,13 @@ bot.command("auth", async ctx => {
     }
     return
   }
-  const text = ctx.message?.text ?? ""
+  const rawText = ctx.message?.text ?? ""
+  // `/auth demo` (and `/auth show demo` / `/auth list demo`) — the trailing
+  // `demo` token masks account-email labels on the default dashboard view for
+  // screen recordings. Strip it before parsing so `demo` isn't mistaken for a
+  // verb/agent argument; it's honored only on the show/list path downstream.
+  const authDemo = hasDemoFlag(getCommandArgs(ctx))
+  const text = authDemo ? rawText.replace(/(\s+)demo\s*$/i, "") : rawText
   const parsed = parseAuthCommand(text)
   if (!parsed) return
   const currentAgent = getMyAgentName()
@@ -16842,6 +16862,7 @@ bot.command("auth", async ctx => {
     isAdmin,
     client,
     chatId,
+    demo: authDemo,
     // Format 2 enricher — live quota probe via the broker (#1336).
     // Pre-broker this read `~/.switchroom/accounts/<label>/credentials.json`
     // off the agent's HOME, which post-RFC-H is never populated (broker
@@ -19228,6 +19249,7 @@ bot.command('issues', async ctx => {
 
 bot.command('usage', async ctx => {
   if (!isAuthorizedSender(ctx)) return
+  const demo = hasDemoFlag(getCommandArgs(ctx))
   // Format 2 path: enumerate every account in the broker's known set,
   // probe live quota in parallel, render the health-grouped snapshot.
   // Falls back to the legacy single-agent shape when the broker is
@@ -19261,6 +19283,7 @@ bot.command('usage', async ctx => {
         const text = renderAuthSnapshotFormat2(snapshots, {
           tz,
           now: new Date(),
+          demo,
           ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: Date.now() }),
         })
         await switchroomReply(ctx, text, { html: true })
@@ -19428,13 +19451,14 @@ bot.command('version', async ctx => {
 // see at a glance what this agent is authorized for.
 bot.command('whoami', async ctx => {
   if (!isAuthorizedSender(ctx)) return
+  const demo = hasDemoFlag(getCommandArgs(ctx))
   try {
     let raw: string
     try { raw = switchroomExecCombined(['config', 'whoami'], 10000) }
     catch (err: unknown) { raw = (err as any).stdout ?? (err as any).message ?? 'whoami failed' }
     const trimmed = stripAnsi(raw).trim()
     let card: string
-    try { card = formatWhoamiCard(JSON.parse(trimmed.split('\n').pop() ?? trimmed)) }
+    try { card = formatWhoamiCard(JSON.parse(trimmed.split('\n').pop() ?? trimmed), demo) }
     catch { card = preBlock(formatSwitchroomOutput(trimmed || 'whoami: no output')) }
     await switchroomReply(ctx, card, { html: true })
   } catch (err: unknown) {
@@ -19442,14 +19466,17 @@ bot.command('whoami', async ctx => {
   }
 })
 
-/** Compact HTML card from the `config whoami` JSON view. Names/booleans only. */
+/** Compact HTML card from the `config whoami` JSON view. Names/booleans only.
+ *  `demo` (the `/whoami demo` suffix) masks the vault key NAMES via maskVaultKey
+ *  for screen recordings — agent/MCP/model/skills topology is left untouched
+ *  (out of scope). Off by default. */
 function formatWhoamiCard(v: {
   name?: string; persona?: string | null; model?: string | null; tier?: string;
   tools?: { allow?: string[]; deny?: string[] }; mcpServers?: string[]; skills?: string[];
   vault?: { key: string; readable: boolean }[];
   powers?: { admin?: boolean; root?: boolean; configEdit?: boolean; crossAgentHostVerbs?: boolean };
   scheduleCount?: number; memoryBackend?: string | null;
-}): string {
+}, demo = false): string {
   const esc = escapeHtmlForTg
   const yn = (b?: boolean) => (b ? '✓' : '✗')
   const lines: string[] = []
@@ -19462,7 +19489,7 @@ function formatWhoamiCard(v: {
   if ((v.mcpServers ?? []).length) lines.push(`MCP: ${esc(v.mcpServers!.join(', '))}`)
   if ((v.skills ?? []).length) lines.push(`Skills: ${esc(v.skills!.join(', '))}`)
   if ((v.vault ?? []).length) {
-    lines.push(`Vault keys (names only): ${v.vault!.map(k => `${esc(k.key)} ${yn(k.readable)}`).join(', ')}`)
+    lines.push(`Vault keys (names only): ${v.vault!.map(k => `${esc(demo ? maskVaultKey(k.key) : k.key)} ${yn(k.readable)}`).join(', ')}`)
   }
   const p = v.powers ?? {}
   lines.push(`Powers: admin ${yn(p.admin)} · root ${yn(p.root)} · config-edit ${yn(p.configEdit)} · cross-agent verbs ${yn(p.crossAgentHostVerbs)}`)

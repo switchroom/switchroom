@@ -20,6 +20,7 @@
  *      auth-snapshot-format.test.ts).
  */
 import { describe, it, expect, vi } from 'vitest';
+import { __resetDemoMaskCachesForTest } from '../demo-mask.js';
 import { renderShowText, handleAuthCommand } from '../gateway/auth-command.js';
 import type { AuthBrokerClient, AuthCommandContext } from '../gateway/auth-command.js';
 import type { ListStateData } from '../../src/auth/broker/client.js';
@@ -105,6 +106,31 @@ describe('renderShowText — Format 2 vs legacy', () => {
     expect(out).not.toContain('🔋');
     expect(out).toContain('ACCOUNT');
   });
+
+  // demo mode (the `/auth demo` suffix) — masks email labels in BOTH shapes.
+  describe('demo mode masks account-email labels', () => {
+    it('WITHOUT demo, the real labels render (Format 2)', () => {
+      const out = renderShowText(FIXTURE_STATE, NOW_MS, { liveQuotas: FIXTURE_QUOTAS, tz: 'UTC' });
+      expect(out).toContain('ken@x');
+      expect(out).toContain('you@x');
+    });
+    it('WITH demo, no real label leaks (Format 2)', () => {
+      __resetDemoMaskCachesForTest();
+      const out = renderShowText(FIXTURE_STATE, NOW_MS, { liveQuotas: FIXTURE_QUOTAS, tz: 'UTC', demo: true });
+      expect(out).not.toContain('ken@x');
+      expect(out).not.toContain('me@x');
+      expect(out).not.toContain('you@x');
+      expect(out).toMatch(/@example\.com/);
+    });
+    it('WITH demo, the legacy ASCII table also masks labels', () => {
+      __resetDemoMaskCachesForTest();
+      const out = renderShowText(FIXTURE_STATE, NOW_MS, { demo: true });
+      expect(out).toContain('ACCOUNT'); // still the legacy table
+      expect(out).not.toContain('ken@x');
+      expect(out).not.toContain('you@x');
+      expect(out).toMatch(/@example\.com/);
+    });
+  });
 });
 
 describe('handleAuthCommand — keyboard attachment', () => {
@@ -177,5 +203,24 @@ describe('handleAuthCommand — keyboard attachment', () => {
     );
     expect(reply.text).toContain('Live · refreshed');
     expect(reply.text).not.toContain('⚠ cached');
+  });
+
+  it('ctx.demo masks the account labels in the dashboard reply', async () => {
+    __resetDemoMaskCachesForTest();
+    const reply = await handleAuthCommand(
+      { kind: 'show' },
+      makeCtx({ liveQuotas: async () => ({ quotas: FIXTURE_QUOTAS }), tz: 'UTC', demo: true }),
+    );
+    expect(reply.text).not.toContain('ken@x');
+    expect(reply.text).not.toContain('you@x');
+    expect(reply.text).toMatch(/@example\.com/);
+  });
+
+  it('WITHOUT ctx.demo the real labels still render in the dashboard reply', async () => {
+    const reply = await handleAuthCommand(
+      { kind: 'show' },
+      makeCtx({ liveQuotas: async () => ({ quotas: FIXTURE_QUOTAS }), tz: 'UTC' }),
+    );
+    expect(reply.text).toContain('you@x');
   });
 });

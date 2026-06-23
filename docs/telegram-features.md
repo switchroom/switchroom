@@ -198,6 +198,42 @@ headers — Switchroom does not estimate them.
 `telegram-plugin/quota-check.ts` (`formatQuotaBlock`, `parseQuotaHeaders`),
 `telegram-plugin/auth-snapshot-format.ts` (`renderAuthSnapshotFormat2`).
 
+### `demo` suffix — PII masking for screen recordings
+
+A trailing `demo` token on the four status commands masks the
+personally-identifiable values in **that command's** output, so you can
+record a screen capture or grab a screenshot without leaking your real
+identity or credential names. It is **per-command and opt-in** — without
+the suffix the commands render the real values exactly as before.
+
+| Command | Masks | Example mask |
+|---|---|---|
+| `/usage demo` | account email labels | `ada@example.com`, `grace@example.com` |
+| `/auth demo` | account email labels (the fleet snapshot, Agents/Consumers tables, and the recommendation footer) | `ada@example.com`, `grace@example.com` |
+| `/status demo` | the `Paired as @…` Telegram handle / numeric sender id | `@demo_user` |
+| `/whoami demo` | vault key **names** in the "Vault keys (names only)" line | `demo/secret-1`, `demo/secret-2` |
+
+The masking is **deterministic within a running process**: the same real
+value always maps to the same fake (so `you@example.com` reads as the
+same fake address in every row of one `/auth demo`), and distinct values
+map to distinct fakes. The fakes are realistic — emails on the reserved
+`example.com` domain, `@demo_user…` handles, `demo/secret-N` key names —
+so a recording still reads naturally.
+
+Scope is deliberately the **must-mask PII tier only**: emails, the
+operator's Telegram identity, and vault key names. It does **not** mask
+agent names, MCP server names, model ids, host paths, or fleet topology —
+those are not PII and masking them would make a demo recording
+misleading. For `/auth`, the `demo` modifier applies to the default
+dashboard view (`/auth demo`, `/auth show demo`, `/auth list demo`); the
+destructive verbs (`use`/`add`/`rm`/`refresh`) are unaffected.
+
+*Grounded in:* `telegram-plugin/demo-mask.ts` (`maskEmail`,
+`maskUsername`, `maskVaultKey`), wired at the render chokepoints in
+`telegram-plugin/auth-snapshot-format.ts`, `telegram-plugin/welcome-text.ts`,
+`telegram-plugin/gateway/auth-command.ts`, and the command handlers in
+`telegram-plugin/gateway/gateway.ts`.
+
 ### Web dashboard
 
 `switchroom web` starts a local HTTP dashboard for watching the fleet

@@ -173,6 +173,29 @@ describe("statusPairedText", () => {
     expect(out).toContain("Status: <code>running</code> · up 3h 12m");
   });
 
+  // demo mode (the `/status demo` suffix) — masks the paired-user tag only.
+  describe("demo mode", () => {
+    it("WITHOUT demo, the real handle still renders", () => {
+      expect(statusPairedText({ user: "@ken_real", meta })).toContain("Paired as @ken_real.");
+    });
+    it("WITH demo, the handle is masked to a @demo_user form", () => {
+      const out = statusPairedText({ user: "@ken_real", meta, demo: true });
+      expect(out).not.toContain("@ken_real");
+      expect(out).toMatch(/Paired as @demo_user\d*\./);
+    });
+    it("WITH demo, a numeric sender id is masked to a @handle, not a raw number", () => {
+      const out = statusPairedText({ user: "8248703757", meta, demo: true });
+      expect(out).not.toContain("8248703757");
+      expect(out).toMatch(/Paired as @demo_user\d*\./);
+    });
+    it("WITH demo, the agent/model/auth topology is NOT masked", () => {
+      const out = statusPairedText({ user: "@ken_real", meta, demo: true });
+      // Out-of-scope fields stay real.
+      expect(out).toContain("Auth: ✓ Max · expires 29 days");
+      expect(out).toContain("<code>sonnet</code>");
+    });
+  });
+
   // Issue #142 PR 3 — audit details surfaced on /status when the gateway
   // successfully loads switchroom.yaml. Pre-#142 this content lived in
   // the SessionStart greeting card; now it's pulled on demand.

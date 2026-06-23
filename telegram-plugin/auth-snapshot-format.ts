@@ -21,6 +21,7 @@
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
 import { isProbeThin, refillNormalizedUtils } from '../src/auth/quota.js';
 import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
+import { maskEmail } from './demo-mask.js';
 
 // ── shared types ─────────────────────────────────────────────────────
 
@@ -212,6 +213,23 @@ export interface SnapshotRenderOpts {
    * Takes precedence over `liveProbedAtMs`.
    */
   staleCachedAtMs?: number;
+  /**
+   * Demo mode (the `/usage demo` / `/auth demo` suffix). When true, every
+   * account label is run through `maskEmail` before rendering so a screen
+   * recording shows stable realistic fakes instead of the operator's real
+   * account emails. Off by default — normal output is unchanged. Scope is
+   * the email-label PII tier only; topology/percentages/resets are untouched.
+   */
+  demo?: boolean;
+}
+
+/**
+ * Apply demo-mode email masking to an account label when `opts.demo` is set,
+ * otherwise return the label unchanged. Single helper so the three label
+ * render sites stay in lockstep.
+ */
+function displayLabel(label: string, opts: SnapshotRenderOpts): string {
+  return opts.demo ? maskEmail(label) : label;
 }
 
 /**
@@ -260,10 +278,11 @@ function renderAccountRow(
   const tz = opts.tz ?? 'UTC';
   const lines: string[] = [];
   const marker = snap.isActive ? '● ' : '';
+  const label = displayLabel(snap.label, opts);
 
   if (!snap.quota) {
     lines.push(
-      `${marker}<code>${escapeHtml(snap.label)}</code>  <i>quota probe failed</i>`,
+      `${marker}<code>${escapeHtml(label)}</code>  <i>quota probe failed</i>`,
     );
     if (snap.quotaError) {
       lines.push(`  <i>${escapeHtml(snap.quotaError)}</i>`);
@@ -276,7 +295,7 @@ function renderAccountRow(
   // it as a data-quality gap, never a confident "0% / 0%".
   if (isProbeThin(q)) {
     lines.push(
-      `${marker}<code>${escapeHtml(snap.label)}</code>  <i>quota unknown (thin probe)</i>`,
+      `${marker}<code>${escapeHtml(label)}</code>  <i>quota unknown (thin probe)</i>`,
     );
     return lines;
   }
@@ -286,7 +305,7 @@ function renderAccountRow(
   const fiveStr = fmtPct(norm.fiveHourUtilizationPct);
   const sevenStr = fmtPct(norm.sevenDayUtilizationPct);
   lines.push(
-    `${marker}<code>${escapeHtml(snap.label)}</code>  ${fiveStr} / ${sevenStr}`,
+    `${marker}<code>${escapeHtml(label)}</code>  ${fiveStr} / ${sevenStr}`,
   );
 
   const health = classifyHealth(snap, now);
@@ -387,7 +406,7 @@ export function renderAuthSnapshotFormat2(
 
   lines.push('');
   lines.push('────────────────────────────');
-  lines.push(`<i>${recommendation(snapshots, now)}</i>`);
+  lines.push(`<i>${recommendation(snapshots, now, opts.demo ?? false)}</i>`);
   // #2495 Change 2 — a failed probe-on-open renders an explicit "cached Nm
   // ago" warning, never a false live stamp. The degraded variant takes
   // precedence over the live stamp.
@@ -412,36 +431,44 @@ export function renderAuthSnapshotFormat2(
  *   "Active <active> is BLOCKED. Switch to <healthy> now."
  *   "All accounts blocked. Earliest recovery: <label> in <eta>."
  */
-export function recommendation(snapshots: AccountSnapshot[], now: Date = new Date()): string {
+export function recommendation(
+  snapshots: AccountSnapshot[],
+  now: Date = new Date(),
+  demo = false,
+): string {
   const active = snapshots.find((s) => s.isActive);
   if (!active) return 'No active account set.';
   const activeHealth = classifyHealth(active, now);
   const others = snapshots.filter((s) => !s.isActive);
   const healthyAlt = others.find((s) => classifyHealth(s, now) === 'healthy');
+  // Demo mode masks the email labels that appear in the recommendation
+  // sentence, in lockstep with the per-account rows above.
+  const lbl = (s: AccountSnapshot) => (demo ? maskEmail(s.label) : s.label);
+  const activeLabel = lbl(active);
 
   if (activeHealth === 'healthy') {
-    return `Recommendation: stay on ${active.label}.`;
+    return `Recommendation: stay on ${activeLabel}.`;
   }
 
   if (activeHealth === 'throttling') {
     if (healthyAlt) {
-      return `Recommendation: active ${active.label} is throttling. Switch to ${healthyAlt.label} for headroom.`;
+      return `Recommendation: active ${activeLabel} is throttling. Switch to ${lbl(healthyAlt)} for headroom.`;
     }
-    return `Recommendation: active ${active.label} is throttling; no healthy alternative — wait for refill.`;
+    return `Recommendation: active ${activeLabel} is throttling; no healthy alternative — wait for refill.`;
   }
 
   if (activeHealth === 'blocked') {
     if (healthyAlt) {
-      return `Recommendation: active ${active.label} is BLOCKED — switch to ${healthyAlt.label} now.`;
+      return `Recommendation: active ${activeLabel} is BLOCKED — switch to ${lbl(healthyAlt)} now.`;
     }
     // #2494 Bug B — no healthy alternative. Do NOT collapse to "All accounts
     // blocked": that's only honest when EVERY account is truly walled with no
     // usable or imminently-refilling slot. Distinguish the buckets first.
-    return summarizeNoHealthyAlt(snapshots, now);
+    return summarizeNoHealthyAlt(snapshots, now, demo);
   }
 
   // unknown
-  return `Active ${active.label}: quota probe failed; broker last_seen unknown.`;
+  return `Active ${activeLabel}: quota probe failed; broker last_seen unknown.`;
 }
 
 /**
@@ -450,7 +477,8 @@ export function recommendation(snapshots: AccountSnapshot[], now: Date = new Dat
  * claims "all blocked" while a throttling / imminently-refilling / usable slot
  * exists. Surfaces the soonest refill ETA across the fleet.
  */
-function summarizeNoHealthyAlt(snapshots: AccountSnapshot[], now: Date): string {
+function summarizeNoHealthyAlt(snapshots: AccountSnapshot[], now: Date, demo = false): string {
+  const mask = (label: string) => (demo ? maskEmail(label) : label);
   let throttlingLabel: string | null = null;
   let allTrulyBlocked = true;
   for (const s of snapshots) {
@@ -481,22 +509,22 @@ function summarizeNoHealthyAlt(snapshots: AccountSnapshot[], now: Date): string 
   if (throttlingLabel) {
     // A usable (throttling) slot exists — recommend it, with the soonest refill.
     const eta = earliestRecovery
-      ? ` Soonest full refill: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`
+      ? ` Soonest full refill: ${mask(earliestRecovery.label)} in ${formatRelative(earliestRecovery.at, now)}.`
       : '';
-    return `No fully-healthy account; ${throttlingLabel} is throttling but still usable.${eta}`;
+    return `No fully-healthy account; ${mask(throttlingLabel)} is throttling but still usable.${eta}`;
   }
 
   if (!allTrulyBlocked) {
     // No usable slot now, but at least one account is refilling — not all dead.
     if (earliestRecovery) {
-      return `All accounts at capacity; soonest refill: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
+      return `All accounts at capacity; soonest refill: ${mask(earliestRecovery.label)} in ${formatRelative(earliestRecovery.at, now)}.`;
     }
     return `All accounts at capacity — waiting on a window refill.`;
   }
 
   // Genuinely all blocked (quota-exhausted with no upcoming reset, or no data).
   if (earliestRecovery) {
-    return `All accounts blocked. Earliest recovery: ${earliestRecovery.label} in ${formatRelative(earliestRecovery.at, now)}.`;
+    return `All accounts blocked. Earliest recovery: ${mask(earliestRecovery.label)} in ${formatRelative(earliestRecovery.at, now)}.`;
   }
   return `All accounts blocked. Run /auth add to attach another subscription.`;
 }
