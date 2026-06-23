@@ -423,7 +423,7 @@ in §6.4).
 
 ```yaml
 microsoft_accounts:
-  ken@outlook.com:
+  bob@example.com:
     enabled_for: [clerk, finn, gymbro]
   ken@work.com:
     enabled_for: [clerk, lawgpt]
@@ -446,7 +446,7 @@ Verbs:
 agents:
   clerk:
     microsoft_workspace:
-      account: ken@outlook.com
+      account: bob@example.com
   lawgpt:
     microsoft_workspace:
       account: ken@work.com

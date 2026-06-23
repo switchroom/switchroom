@@ -22,12 +22,12 @@ describe("shouldEmitMs365Mcp", () => {
   });
 
   it("returns false when microsoft_accounts is undefined", () => {
-    expect(shouldEmitMs365Mcp("clerk", "ken@outlook.com", undefined)).toBe(false);
+    expect(shouldEmitMs365Mcp("clerk", "bob@example.com", undefined)).toBe(false);
   });
 
   it("returns false when account is not in microsoft_accounts", () => {
     expect(
-      shouldEmitMs365Mcp("clerk", "ken@outlook.com", {
+      shouldEmitMs365Mcp("clerk", "bob@example.com", {
         "other@outlook.com": { enabled_for: ["clerk"] },
       }),
     ).toBe(false);
@@ -35,32 +35,32 @@ describe("shouldEmitMs365Mcp", () => {
 
   it("returns false when agent is not in enabled_for[]", () => {
     expect(
-      shouldEmitMs365Mcp("clerk", "ken@outlook.com", {
-        "ken@outlook.com": { enabled_for: ["lawgpt"] },
+      shouldEmitMs365Mcp("clerk", "bob@example.com", {
+        "bob@example.com": { enabled_for: ["lawgpt"] },
       }),
     ).toBe(false);
   });
 
   it("returns true when agent is in enabled_for[]", () => {
     expect(
-      shouldEmitMs365Mcp("clerk", "ken@outlook.com", {
-        "ken@outlook.com": { enabled_for: ["clerk", "finn"] },
+      shouldEmitMs365Mcp("clerk", "bob@example.com", {
+        "bob@example.com": { enabled_for: ["clerk", "finn"] },
       }),
     ).toBe(true);
   });
 
   it("normalizes account name (case-insensitive + trim)", () => {
     expect(
-      shouldEmitMs365Mcp("clerk", "  KEN@Outlook.COM  ", {
-        "ken@outlook.com": { enabled_for: ["clerk"] },
+      shouldEmitMs365Mcp("clerk", "  BOB@Example.COM  ", {
+        "bob@example.com": { enabled_for: ["clerk"] },
       }),
     ).toBe(true);
   });
 
   it("handles dormant accounts (empty enabled_for)", () => {
     expect(
-      shouldEmitMs365Mcp("clerk", "ken@outlook.com", {
-        "ken@outlook.com": { enabled_for: [] },
+      shouldEmitMs365Mcp("clerk", "bob@example.com", {
+        "bob@example.com": { enabled_for: [] },
       }),
     ).toBe(false);
   });
@@ -95,11 +95,11 @@ describe("isMicrosoftClientCredentialKeyForAgent", () => {
     ({
       agents: {
         clerk: {
-          microsoft_workspace: { account: "ken@outlook.com" },
+          microsoft_workspace: { account: "bob@example.com" },
         },
       },
       microsoft_accounts: {
-        "ken@outlook.com": { enabled_for: ["clerk"] },
+        "bob@example.com": { enabled_for: ["clerk"] },
       },
       microsoft_workspace: {
         microsoft_client_id: "vault:microsoft-oauth-client-id",
@@ -129,7 +129,7 @@ describe("isMicrosoftClientCredentialKeyForAgent", () => {
   it("returns false when agent is not in enabled_for", () => {
     const cfg = baseConfig({
       microsoft_accounts: {
-        "ken@outlook.com": { enabled_for: ["other-agent"] },
+        "bob@example.com": { enabled_for: ["other-agent"] },
       },
     });
     expect(

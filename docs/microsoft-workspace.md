@@ -216,11 +216,11 @@ RFC (audit + revocation semantics differ from drafts).
 After consent, the CLI shows:
 
 ```
-✓ Registered Microsoft account ken@outlook.com with auth-broker.
+✓ Registered Microsoft account bob@example.com with auth-broker.
   Account type: personal (MSA — outlook.com / hotmail.com)
 
   Next: enable on one or more agents:
-    switchroom auth microsoft enable ken@outlook.com <agent> [...]
+    switchroom auth microsoft enable bob@example.com <agent> [...]
 ```
 
 ## Granting access to agents
@@ -314,7 +314,7 @@ Agent: clerk
 Tool: ms-365__upload-file-content
 Item: Q3-Strategy.docx
 ID:   01ABCDEFG
-Account: ken@outlook.com
+Account: bob@example.com
 Size: 14.5KB → 16.2KB (+1.7KB)
 Link: https://onedrive.live.com/...
 💬 Adding the meeting notes from yesterday

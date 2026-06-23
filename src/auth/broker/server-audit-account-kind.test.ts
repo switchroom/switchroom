@@ -223,7 +223,7 @@ describe("AuthBroker — audit log accountKind field", () => {
     const h = makeHarness();
     // Use the same email string for both the Claude account and the Microsoft
     // account, to demonstrate that accountKind disambiguates them in the log.
-    const sharedEmail = "lisa_goodfellow@hotmail.com";
+    const sharedEmail = "carol@example.com";
     const config = makeConfig(h, {
       active: sharedEmail,
       agents: {

@@ -66,6 +66,14 @@ const RULES = [
     id: 'shorthand/real outlook account',
     re: new RegExp('ken' + '\\.thompson@outlook' + '|' + '\\bken' + '-outlook\\b', 'i'),
   },
+  {
+    id: 'bare outlook handle "ken' + '@outlook"',
+    re: new RegExp('\\bken' + '@outlook\\b', 'i'),
+  },
+  {
+    id: 'real personal account "lisa' + '_goodfellow"',
+    re: new RegExp('\\blisa' + '_goodfellow\\b', 'i'),
+  },
   { id: 'operator home path', re: new RegExp('/home/' + 'kenthompson') },
   { id: 'real Tailscale tailnet id', re: new RegExp('tail' + 'd78f7', 'i') },
   { id: 'real Telegram id (user)', re: new RegExp('\\b' + '82487' + '03757\\b') },

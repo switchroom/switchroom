@@ -26,7 +26,7 @@ describe("validateMs365Preview", () => {
     toolName: "mcp__ms-365__upload-file-content",
     itemId: "01ABCDEFG",
     itemDisplayName: "Q3-Strategy.docx",
-    accountEmail: "ken@outlook.com",
+    accountEmail: "bob@example.com",
   };
 
   it("accepts a minimal valid preview", () => {
@@ -93,7 +93,7 @@ describe("buildMs365CardText", () => {
     toolName: "mcp__ms-365__upload-file-content",
     itemId: "01ABCDEFG",
     itemDisplayName: "Q3-Strategy.docx",
-    accountEmail: "ken@outlook.com",
+    accountEmail: "bob@example.com",
   };
 
   it("includes agent, tool, item, account", () => {
@@ -102,7 +102,7 @@ describe("buildMs365CardText", () => {
     expect(text).toContain("ms-365__upload-file-content");
     expect(text).toContain("Q3-Strategy.docx");
     expect(text).toContain("01ABCDEFG");
-    expect(text).toContain("ken@outlook.com");
+    expect(text).toContain("bob@example.com");
   });
 
   it("omits ID line for new files", () => {
@@ -183,7 +183,7 @@ function makeMsg(overrides: Partial<RequestMs365ApprovalMessage> = {}): RequestM
       toolName: "mcp__ms-365__upload-file-content",
       itemId: "01ABC",
       itemDisplayName: "Strategy.docx",
-      accountEmail: "ken@outlook.com",
+      accountEmail: "bob@example.com",
     },
     ttlMs: 5 * 60 * 1000,
     ...overrides,
