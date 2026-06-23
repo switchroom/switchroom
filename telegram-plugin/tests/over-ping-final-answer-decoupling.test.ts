@@ -29,7 +29,7 @@ describe('#2533 — over-ping downgrade must not pollute final-answer classifica
   // The midturn-silent-dm failing sequence: an interim ack pings, then a
   // SHORT final answer the model also intended to ping.
   const ACK = { text: 'On it.', modelWantsPing: true }
-  const FINAL = { text: 'Hostname is pixsoul-ubuntu.', modelWantsPing: true } // 27 chars, <200
+  const FINAL = { text: 'Hostname is example-host.', modelWantsPing: true } // <200 chars
 
   it('reproduces the sequence: ack claims the ping slot, the short final gets over-ping-suppressed', () => {
     // Beat 1 — the ack pings; first ping of the turn claims the slot (not suppressed).
