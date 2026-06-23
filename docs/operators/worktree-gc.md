@@ -56,9 +56,10 @@ resolves under `~/.bun/bin` or `~/.nvm/.../bin`, **not** `/usr/local/bin` — an
 put that dir on the cron `PATH` (cron has a minimal default PATH).
 
 ```cron
-# crontab -e  for the operator user (HOME + PATH set so `switchroom` and `gh` resolve)
-HOME=/home/kenthompson
-PATH=/usr/bin:/bin:/home/kenthompson/.bun/bin
+# crontab -e  for the operator user (HOME + PATH set so `switchroom` and `gh`
+# resolve — substitute your own operator home / bin dir for /home/op below)
+HOME=/home/op
+PATH=/usr/bin:/bin:/home/op/.bun/bin
 # Sun 04:00 — quarantine merged/orphaned worktrees
 0 4 * * 0   switchroom worktree gc --yes >> /var/log/switchroom/worktree-gc.log 2>&1
 # Sun 04:10 — purge anything quarantined ≥14 days ago
