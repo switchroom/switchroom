@@ -530,12 +530,31 @@ git fetch upstream
 git worktree add ~/code/switchroom-<short-task-slug> \
   -b feat/<branch-name> upstream/main
 cd ~/code/switchroom-<short-task-slug>
-ln -s ~/code/switchroom-sec-1417/node_modules node_modules
+ln -s ~/code/switchroom/node_modules node_modules   # donor: any stable checkout
 ```
 
 The `node_modules` symlink lets `bun`/`vitest` resolve dependencies
 without re-installing. `bun install` in a fresh worktree on this host
 is unreliable — see `feedback_worktree_node_modules_symlink` memory.
+(Pick any long-lived checkout as the donor — e.g. `~/code/switchroom`
+or `~/switchroom`. Do **not** hard-code a per-task worktree as the
+donor; those get garbage-collected, see below.)
+
+**When the PR merges, remove the worktree** — don't leave it behind:
+
+```
+git worktree remove ~/code/switchroom-<short-task-slug>
+git branch -d feat/<branch-name>
+```
+
+Leftover worktrees are the sprawl that filled the dev host (300 dirs /
+20GB, cleaned 2026-06-23). The backstop for when this is forgotten is
+**`switchroom worktree gc`** — it quarantines orphaned worktree dirs
+(moved to `~/.switchroom/worktree-gc-trash/`, recoverable) and removes
+registered worktrees whose PR is **MERGED** and whose tree is clean. It
+is dry-run by default; `--yes` acts. A weekly host cron runs it as a
+safety net (`docs/operators/worktree-gc.md`). It never touches the main
+checkout, agent/claim worktrees, or worktrees with uncommitted work.
 
 **2. Implement, with tests.**
 
