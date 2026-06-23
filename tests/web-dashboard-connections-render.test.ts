@@ -132,7 +132,7 @@ const MOCK = {
   ],
   microsoft: [
     {
-      account: "ken@outlook.com",
+      account: "bob@example.com",
       expiresAt: 1,
       scope: "Mail.ReadWrite",
       clientId: "mid-123456789012",
@@ -166,7 +166,7 @@ describe("Connections tab renders provider cards from data (real inline renderCo
   it("renders Google + Microsoft + Linear cards with their identifiers", () => {
     const out = render(MOCK);
     expect(out).toContain("alice@example.com");
-    expect(out).toContain("ken@outlook.com");
+    expect(out).toContain("bob@example.com");
     expect(out).toContain("carrie");
     // Linear is shown as an OAuth app actor, not a personal token.
     expect(out).toContain("OAuth agent");
