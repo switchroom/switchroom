@@ -636,9 +636,25 @@ cd ~/code/switchroom-rel-<vX.Y.Z>
 rm -rf node_modules && cp -a ~/code/switchroom-sec-1417/node_modules ./node_modules
 ```
 
-**2. Bump `package.json` + CHANGELOG.**
+**2. CHANGELOG only — do NOT hand-bump `package.json`'s `version`.**
 
-- `package.json` `"version": "X.Y.Z"`.
+> **Version source of truth = the git tag, resolved by
+> `scripts/build.mjs:resolveVersion()`.** Priority order (#2526):
+> `TAG_VERSION` env (set by `docker-images.yml`) → `GITHUB_REF`
+> (`refs/tags/vX.Y.Z`) → `git describe --tags --exact-match HEAD` →
+> `package.json` `"version"` (**dev / non-tag fallback ONLY**). A
+> mis-stamp guard aborts the build if the git-derived version disagrees
+> with `TAG_VERSION`. The resolved version is stamped into
+> `src/build-info.ts` at build time; `src/cli/resolve-version.ts` reads it
+> (with a shipped-`package.json` walk-up as a secondary source).
+>
+> So the committed `package.json` `"version"` is a **stale placeholder**
+> (it has read `0.15.48` across many tagged releases, v0.15.49…v0.15.57+):
+> it is deliberately *not* bumped per release, and **editing it does
+> nothing for a release** — it's only the Layer-4 fallback for a non-tag
+> dev build. A release is just: tag a main commit and push the tag
+> (step 5); the tag flows through `resolveVersion()` automatically.
+
 - `CHANGELOG.md`: consolidate any `## unreleased — …` sections under
   a single `## vX.Y.Z — <theme>` header. For multi-PR releases,
   group entries under `### PR <letter> — <title> (#NNNN)` subsections.
