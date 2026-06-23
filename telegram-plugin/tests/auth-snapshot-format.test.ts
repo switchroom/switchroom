@@ -214,9 +214,18 @@ describe('renderAuthSnapshotFormat2', () => {
   it('puts the imminent window first on healthy/throttling rows', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
     // you: 5h reset is in 7m, 7d reset is in 2d. 5h should come first.
-    const pixRow = out.split('\n').find((l) => l.includes('5h refills') && l.includes('7d resets'));
-    expect(pixRow).toBeDefined();
-    expect(pixRow!.indexOf('5h refills')).toBeLessThan(pixRow!.indexOf('7d resets'));
+    // The two reset segments now render on SEPARATE lines (so the 7d
+    // segment doesn't wrap mid-line on a narrow phone) — the imminent 5h
+    // line must precede the 7d line, each on its own line.
+    const lines = out.split('\n');
+    const fiveLine = lines.findIndex((l) => l.includes('5h refills'));
+    const sevenLine = lines.findIndex((l) => l.includes('7d resets'));
+    expect(fiveLine).toBeGreaterThanOrEqual(0);
+    expect(sevenLine).toBeGreaterThanOrEqual(0);
+    // Distinct lines, 5h before 7d.
+    expect(fiveLine).toBeLessThan(sevenLine);
+    expect(lines[fiveLine]).not.toContain('7d resets');
+    expect(lines[sevenLine]).not.toContain('5h refills');
   });
 
   it('emits a recommendation footer that names a healthy alternative when active is throttling', () => {

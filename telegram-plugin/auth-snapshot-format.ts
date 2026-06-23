@@ -246,11 +246,13 @@ const HEALTH_TITLE: Record<AccountHealth, string> = {
  * One-line per-account summary inside its health group.
  *
  *   you@example.com  ● 8% / 20%
- *     5h refills 11:00 AM (in 6m)  ·  7d resets Sun 11:00 AM
+ *     5h refills 11:00 AM (in 6m)
+ *     7d resets Sun 11:00 AM
  *
- * Two lines actually: the label/percent line and a sub-line with the
- * reset details. The blocked variant replaces the sub-line with the
- * recovery countdown.
+ * Three lines for a healthy/throttling row: the label/percent line plus
+ * two reset sub-lines (each window on its own line so the 7d segment
+ * doesn't wrap mid-line on a narrow phone). The blocked variant replaces
+ * the sub-lines with a single recovery countdown.
  */
 function renderAccountRow(
   snap: AccountSnapshot,
@@ -303,9 +305,10 @@ function renderAccountRow(
   }
 
   // Healthy / throttling: show whichever window is closer to refresh
-  // first, then the other on the same line. Reverses the screenshot's
+  // first, then the other on the next line. Reverses the screenshot's
   // "5h then 7d" ordering when 7d is the more pressing one — the user
-  // wants the imminent number first.
+  // wants the imminent number first. Each window gets its own line so the
+  // second segment doesn't wrap mid-line on a narrow phone screen.
   const fiveResetIn = q.fiveHourResetAt ? q.fiveHourResetAt.getTime() - now.getTime() : Infinity;
   const sevenResetIn = q.sevenDayResetAt ? q.sevenDayResetAt.getTime() - now.getTime() : Infinity;
   const fiveFirst = fiveResetIn <= sevenResetIn;
@@ -315,7 +318,8 @@ function renderAccountRow(
   const sevenSeg = q.sevenDayResetAt
     ? `7d resets ${formatAbsolute(q.sevenDayResetAt, tz)} (in ${formatRelative(q.sevenDayResetAt, now)})`
     : '7d resets —';
-  lines.push(`  <i>${fiveFirst ? fiveSeg : sevenSeg}  ·  ${fiveFirst ? sevenSeg : fiveSeg}</i>`);
+  lines.push(`  <i>${fiveFirst ? fiveSeg : sevenSeg}</i>`);
+  lines.push(`  <i>${fiveFirst ? sevenSeg : fiveSeg}</i>`);
   // Informational overage annotation: if out_of_credits (no overage headroom),
   // surface it as a sub-line on a healthy/throttling row — NOT a blocked badge.
   if (q.overageDisabledReason != null && OVERAGE_EXHAUSTED_REASONS.has(q.overageDisabledReason)) {

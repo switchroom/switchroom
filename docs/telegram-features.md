@@ -169,9 +169,10 @@ When the auth-broker is reachable and the fleet has one or more
 accounts, `/usage` renders the **fleet snapshot**: every account in the
 broker's known set, live-probed in parallel, grouped by health
 (blocked-first, then throttling, then healthy). Each account row shows
-its `5h` and `7d` utilisation percentages plus a per-window reset line
-("5h refills 11:00 AM (in 6m) · 7d resets Sun 11:00 AM"). The
-fleet-active account is marked. This is the same renderer `/auth show`
+its `5h` and `7d` utilisation percentages plus two per-window reset
+lines, one per line so the second segment doesn't wrap mid-line on a
+narrow phone ("5h refills 11:00 AM (in 6m)" on one line, "7d resets Sun
+11:00 AM" on the next). The fleet-active account is marked. This is the same renderer `/auth show`
 uses, so the two commands speak one dialect.
 
 If the broker is unreachable (boot timing, broken socket), `/usage`
