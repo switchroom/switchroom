@@ -7544,6 +7544,15 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // existing call-sites and the typical "final answer" reply keep their
   // current behaviour without an explicit flag.
   let disableNotification = args.disable_notification === true
+  // #2527/#1664 — the over-ping safety net below may downgrade
+  // `disableNotification` ping→silent for ANTI-SPAM (one ping per turn). That
+  // delivery-channel decision must NOT pollute final-answer CLASSIFICATION: a
+  // final answer the model intended to ping is STILL the final answer even when
+  // the framework silences the actual ping. Classify on the model's original
+  // intent (what executeStreamReply already does), so an over-ping-silenced
+  // final answer sets finalAnswerDelivered=true — fixing both a spurious
+  // silent-end re-prompt and a false 'undelivered' (😐) terminal reaction.
+  const modelDisableNotification = args.disable_notification === true
 
   // #1675 over-ping safety net. The conversational-pacing contract
   // (`reference/rfcs/conversational-pacing.md` beat 5) says EXACTLY ONE
@@ -7786,7 +7795,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // clear; the main turn-end path also re-writes the state when
   // finalAnswerDelivered=false, so this is a belt-and-braces gate
   // for the turn_end-missing case (#1741).
-  if (isFinalAnswerReply({ text: rawText, disableNotification })) {
+  if (isFinalAnswerReply({ text: rawText, disableNotification: modelDisableNotification })) {
     clearSilentEndState(statusKey(chat_id, threadId))
   }
 
@@ -7897,7 +7906,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             turn != null
             && isFinalAnswerReply({
               text: decision.mergedText,
-              disableNotification,
+              disableNotification: modelDisableNotification,
             })
           ) {
             turn.finalAnswerDelivered = true
@@ -7905,7 +7914,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             // answer must NOT re-open the feed on post-answer housekeeping.
             turn.finalAnswerSubstantive = isSubstantiveFinalReply({
               text: decision.mergedText,
-              disableNotification,
+              disableNotification: modelDisableNotification,
             })
             if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
           }
@@ -8245,12 +8254,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     //
     // #1664 — `turn.finalAnswerDelivered = true` keeps the silent-
     // end re-prompt from spuriously firing on a delivered final.
-    if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification })) {
+    if (turn != null && isFinalAnswerReply({ text: rawText, disableNotification: modelDisableNotification })) {
       turn.finalAnswerDelivered = true
       // Feed-reopen refinement: track whether this final was substantive
       // (≥200 chars or stream-done — not a short pinging ack) so post-answer
       // housekeeping tool work does NOT re-open the feed / trip silent-end.
-      turn.finalAnswerSubstantive = isSubstantiveFinalReply({ text: rawText, disableNotification })
+      turn.finalAnswerSubstantive = isSubstantiveFinalReply({ text: rawText, disableNotification: modelDisableNotification })
       // #1728: release the buffer gate + emit terminal 👍. Mid-turn
       // acks bypass this branch and remain non-events for the
       // reaction (preserves #1713). The full turn-state teardown
