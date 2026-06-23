@@ -228,10 +228,12 @@ describe("tool-label-pretool.mjs", () => {
   });
 
   it("MCP allowlist (telegram + hindsight)", () => {
+    // NOTE (#2516): the switchroom-telegram SURFACE tools (reply, stream_reply,
+    // react, edit_message) are now suppressed key-agnostically — they ARE the
+    // conversation, so they don't get an activity-feed label. They're asserted
+    // in the "genuinely-suppressed tools" test below. Only the read-only /
+    // non-surface MCP tools get a label here.
     const cases: Array<[string, Record<string, unknown>, string]> = [
-      ["mcp__switchroom-telegram__reply", { text: "hi" }, "Replying"],
-      ["mcp__switchroom-telegram__stream_reply", { text: "hi" }, "Replying"],
-      ["mcp__switchroom-telegram__react", { emoji: "👍" }, "Reacting 👍"],
       ["mcp__switchroom-telegram__get_recent_messages", {}, "Reading chat history"],
       ["mcp__hindsight__recall", { query: "x" }, "Searching memory"],
       ["mcp__hindsight__reflect", { query: "x" }, "Searching memory"],
@@ -275,12 +277,19 @@ describe("tool-label-pretool.mjs", () => {
     });
   });
 
-  it("genuinely-suppressed tools (send_typing, sync_retain) still emit nothing", () => {
+  it("genuinely-suppressed tools (surface/control tools) still emit nothing", () => {
     // NOTE (#2111): an "exotic" mcp__ tool is NO LONGER suppressed — operator
     // MCP servers (perplexity, webkite, …) now get a generic label so research
     // turns surface in the live activity feed. Only the surface/control tools
     // below stay silent.
+    // NOTE (#2516): the switchroom-telegram surface tools (reply / stream_reply /
+    // react / edit_message) are the conversation itself and are suppressed
+    // key-agnostically — they emit no sidecar label.
     const cases: Array<[string, Record<string, unknown>]> = [
+      ["mcp__switchroom-telegram__reply", { text: "hi" }],
+      ["mcp__switchroom-telegram__stream_reply", { text: "hi" }],
+      ["mcp__switchroom-telegram__react", { emoji: "👍" }],
+      ["mcp__switchroom-telegram__edit_message", { text: "hi" }],
       ["mcp__switchroom-telegram__send_typing", {}],
       ["mcp__hindsight__sync_retain", {}],
     ];
