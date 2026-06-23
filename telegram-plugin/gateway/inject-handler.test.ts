@@ -152,12 +152,13 @@ describe('handleInjectCommand — outcome=ok_no_output', () => {
     expect(replies[0].text).toContain('empty capture')
   })
 
-  it('bare ack with accent=done when expectsOutput=false and no silentNote (/clear)', async () => {
+  it('uses silentNote for /clear (context cleared — fresh slate)', async () => {
     const inject = vi.fn().mockResolvedValue(noOutputResult('/clear'))
     const { deps, replies } = makeDeps({ getArgs: () => '/clear', inject })
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('done')
     expect(replies[0].text).toContain('<code>/clear</code>')
+    expect(replies[0].text).toContain('context cleared')
     expect(replies[0].text).not.toContain('empty capture')
     expect(replies[0].text).not.toContain('<pre>')
   })

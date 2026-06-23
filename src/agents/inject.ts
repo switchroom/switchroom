@@ -66,7 +66,11 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   // non-interactively via the `--effort` CLI flag at session start.
   [
     "/clear",
-    { description: "Clear session screen", expectsOutput: false },
+    {
+      description: "Clear session screen",
+      expectsOutput: false,
+      silentNote: "context cleared — fresh slate",
+    },
   ],
   [
     "/compact",
@@ -368,6 +372,44 @@ export interface DiffPaneResult {
  * command-echo anchor is found in the post-capture, fall back to
  * line-set diff so unusual TUI shapes still surface something.
  */
+
+/**
+ * Returns true for lines that are pure Claude Code TUI chrome — input-box
+ * borders, prompt glyphs, footer hints, and copy affordances that appear
+ * after `/clear` wipes the screen. Applied only in the FALLBACK (anchor-
+ * missing) path of `diffPane` to prevent input-box furniture from being
+ * classified as command output. Conservative by design: a real output line
+ * (e.g. "Total cost: $1.23") must never match.
+ *
+ * Patterns matched:
+ *   - box-drawing / rule lines: only border/rule glyphs, underscores, dashes, pipes
+ *   - bare prompt glyphs: trimmed content is only `>`, `)`, or `❯` (with optional box chars)
+ *   - footer hints: lines containing the known footer phrases
+ *   - copy affordance: trimmed content is exactly "copy"
+ */
+export function isTuiChromeLine(line: string): boolean {
+  const t = line.trim();
+  if (t.length === 0) return false;
+
+  // box-drawing / rule lines: only border glyphs, underscores, dashes, pipes, spaces
+  if (/^[\s\-_│─╭╮╰╯┌┐└┘|]+$/.test(t)) return true;
+
+  // bare prompt-glyph lines
+  if (/^[╭╮╰╯│\s]*[>)❯][╭╮╰╯│\s]*$/.test(t)) return true;
+
+  // footer hints
+  if (/accept edits on/i.test(t)) return true;
+  if (/shift\+tab to cycle/i.test(t)) return true;
+  if (/for agents/i.test(t)) return true;
+  if (/\? for shortcuts/i.test(t)) return true;
+  if (/bypassing permissions/i.test(t)) return true;
+
+  // copy affordance
+  if (t === "copy") return true;
+
+  return false;
+}
+
 export function diffPane(before: string, after: string, command?: string): DiffPaneResult {
   if (command) {
     const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -400,13 +442,18 @@ export function diffPane(before: string, after: string, command?: string): DiffP
       // Anchor found but tail is empty — fall through to set-diff.
     }
   }
-  // Fallback: line-set diff against pre-snapshot.
+  // Fallback: line-set diff against pre-snapshot, then strip TUI chrome.
+  // The chrome filter is applied here (fallback only) because `/clear`
+  // wipes the screen so the command-echo anchor is gone — the post-capture
+  // contains only fresh input-box furniture that isn't in the pre-snapshot
+  // and would otherwise be classified as command output.
   const beforeSet = new Set(before.split("\n").map((l) => l.trimEnd()));
   const newLines: string[] = [];
   for (const raw of after.split("\n")) {
     const line = raw.trimEnd();
     if (line.length === 0) continue;
     if (beforeSet.has(line)) continue;
+    if (isTuiChromeLine(line)) continue;
     newLines.push(line);
   }
   return { output: newLines.join("\n"), anchored: false };
