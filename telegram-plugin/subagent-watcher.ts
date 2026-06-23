@@ -43,6 +43,7 @@ import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
 import { describeToolUse } from './tool-activity-summary.js'
+import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
@@ -158,6 +159,16 @@ export interface WorkerEntry {
    *  failed handback's "what it reported before failing" slot when the
    *  worker left no narrative result of its own. */
   errorDetail?: string
+  /**
+   * Narrative-dedup gate state (JSONL-text-narrative primitive). A
+   * `sub_agent_text` block is held here for ONE lookahead step so the next
+   * `sub_agent_tool_use` / `sub_agent_turn_end` can decide draft-then-send
+   * (SUPPRESS — it duplicates the worker's reply) vs working-narration (SHOW
+   * — fire `onProgress({latestSummary})`). Null when nothing is pending. The
+   * pure decision lives in narrative-dedup.ts; this slot is the per-entry
+   * cursor. Mirrors the gateway's `turn.pendingNarrative`.
+   */
+  pendingNarrative?: { text: string; lastInMessage: boolean } | null
 }
 
 export interface SubagentWatcherConfig {
@@ -773,6 +784,48 @@ export function readSubTail(
         if (errInfo.detail) entry.errorDetail = errInfo.detail.slice(0, SUBAGENT_RESULT_TEXT_MAX)
       }
       const events = projectSubagentLine(line, entry.agentId, startState)
+      // Narrative-dedup gate (JSONL-text-narrative primitive) — fire the
+      // narrative progress cue for a SHOWN sub_agent_text block. Identical
+      // shape to the inline #1720 onProgress below; factored out so the gate
+      // (stage-on-text, resolve-on-tool/turn_end) can replay a previously
+      // pending block exactly once. `latestSummary` carries the worker's
+      // narrative result (entry.lastResultText), never tool labels.
+      const fireNarrativeProgress = (): void => {
+        if (onProgress == null || entry.state !== 'running' || entry.historical) return
+        try {
+          onProgress({
+            agentId: entry.agentId,
+            description: entry.description,
+            latestSummary: entry.lastResultText,
+            elapsedMs: now - entry.dispatchedAt,
+            prevBucketIdx: entry.lastProgressBucketIdx,
+            setBucketIdx: (b: number) => {
+              entry.lastProgressBucketIdx = b
+            },
+            lastTool: entry.lastTool,
+            toolCount: entry.toolCount,
+          })
+        } catch (cbErr) {
+          log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
+        }
+      }
+      // Resolve a pending sub-agent narrative against a lookahead event.
+      // SUPPRESS only when the lookahead is a reply/stream_reply tool whose
+      // text the pending block drafts; otherwise SHOW (fire the cue). See
+      // narrative-dedup.ts §2b.
+      const resolvePendingSubNarrative = (
+        toolName: string | null,
+        toolInput: Record<string, unknown> | undefined,
+      ): void => {
+        if (entry.pendingNarrative == null) return
+        const pending = entry.pendingNarrative
+        entry.pendingNarrative = null
+        if (toolName != null && REPLY_TOOLS.has(toolName)) {
+          const replyText = typeof toolInput?.text === 'string' ? (toolInput.text as string) : ''
+          if (isDraftOfReply(pending.text, replyText)) return // draft of the reply → SUPPRESS
+        }
+        fireNarrativeProgress()
+      }
       for (const ev of events) {
         const idleSecBeforeBump = Math.round((now - entry.lastActivityAt) / 1000)
         entry.lastActivityAt = now
@@ -813,6 +866,11 @@ export function readSubTail(
           log?.(`subagent-watcher: stall cleared for ${entry.agentId} (activity resumed after ${idleSecBeforeBump}s — re-arming detection)`)
         }
         if (ev.kind === 'sub_agent_tool_use') {
+          // Narrative-dedup gate step 2: a sub_agent_text block was pending;
+          // this tool is the lookahead that decides it (SHOW unless it drafts
+          // a reply tool's text). Runs before the tool's own progress cue so
+          // a working preamble surfaces just ahead of its tool step.
+          resolvePendingSubNarrative(ev.toolName, ev.input)
           entry.toolCount++
           // P0 of #662: surface the most recent tool name + sanitised
           // arg so the driver's fleet-state shadow can render the
@@ -871,29 +929,25 @@ export function readSubTail(
           // args or file content — consistent with the watcher's
           // "descriptions only" privacy posture.
           entry.lastResultText = ev.text.trim().slice(0, SUBAGENT_RESULT_TEXT_MAX)
-          // #1720: surface a progress cue for the gateway. Only fire
-          // while the entry is still running and not historical — a
-          // terminal entry's last narrative line is the handback
-          // payload, not a mid-flight progress nudge.
-          if (onProgress != null && entry.state === 'running' && !entry.historical) {
-            try {
-              onProgress({
-                agentId: entry.agentId,
-                description: entry.description,
-                latestSummary: entry.lastResultText,
-                elapsedMs: now - entry.dispatchedAt,
-                prevBucketIdx: entry.lastProgressBucketIdx,
-                setBucketIdx: (b: number) => {
-                  entry.lastProgressBucketIdx = b
-                },
-                lastTool: entry.lastTool,
-                toolCount: entry.toolCount,
-              })
-            } catch (cbErr) {
-              log?.(`subagent-watcher: onProgress callback error ${entry.agentId}: ${(cbErr as Error).message}`)
-            }
+          // #1720 + JSONL-text-narrative gate step 1: stage this block for
+          // one lookahead step instead of firing the progress cue
+          // immediately. A previously-pending block had nothing reply-shaped
+          // after it (pure narration) → flush it as SHOWN now; then stage
+          // THIS block. Its eventual SHOW/SUPPRESS is decided by the next
+          // sub_agent_tool_use / sub_agent_turn_end. `lastResultText` /
+          // `lastSummaryLine` above already updated unconditionally — the
+          // handback payload is independent of the progress-cue decision.
+          if (entry.pendingNarrative != null) {
+            fireNarrativeProgress() // prior pending was pure narration → SHOW
           }
+          entry.pendingNarrative = { text: ev.text, lastInMessage: ev.lastInMessage }
         } else if (ev.kind === 'sub_agent_turn_end') {
+          // Narrative-dedup gate step 3: a trailing sub_agent_text block with
+          // nothing after it. SUPPRESS only when it drafts the worker's final
+          // narrative reply; otherwise SHOW. The worker's result is carried
+          // separately via lastResultText/onFinish, so a SHOWN trailing cue
+          // here is purely the transient liveness beat.
+          resolvePendingSubNarrative(null, undefined)
           if (entry.state === 'running') {
             entry.state = 'done'
             // Bug 2 fix (#333): mark the DB row completed via watcher's turn_end

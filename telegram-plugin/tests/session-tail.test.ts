@@ -5,6 +5,7 @@ import { join } from 'path'
 import {
   projectTranscriptLine,
   projectSubagentLine,
+  projectAssistantTextBlocks,
   sanitizeCwdToProjectName,
   getProjectsDirForCwd,
   startSessionTail,
@@ -208,8 +209,65 @@ describe('projectTranscriptLine', () => {
       },
     })
     expect(projectTranscriptLine(line)).toEqual([
-      { kind: 'text', text: 'Replied with comparison' },
+      // Shared narrative contract: a lone text block (no tool_use after it)
+      // is lastInMessage:true at blockIndex 0.
+      { kind: 'text', text: 'Replied with comparison', blockIndex: 0, lastInMessage: true },
     ])
+  })
+
+  it('drops empty/whitespace-only text blocks (shared narrative contract)', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: '   \n  ' },
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } },
+        ],
+      },
+    })
+    // The empty text block is dropped; only the tool_use survives.
+    expect(projectTranscriptLine(line)).toEqual([
+      { kind: 'tool_use', toolName: 'Read', toolUseId: 'toolu_a', input: { file_path: '/a' } },
+    ])
+  })
+
+  it('text block preceding a tool_use in the same message is lastInMessage:false', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'Found both:' },
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } },
+        ],
+      },
+    })
+    const events = projectTranscriptLine(line)
+    expect(events[0]).toEqual({ kind: 'text', text: 'Found both:', blockIndex: 0, lastInMessage: false })
+  })
+
+  it('text block AFTER the last tool_use is lastInMessage:true', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: '/a' } },
+          { type: 'text', text: 'Done.' },
+        ],
+      },
+    })
+    const events = projectTranscriptLine(line)
+    const textEv = events.find((e) => e.kind === 'text')
+    expect(textEv).toEqual({ kind: 'text', text: 'Done.', blockIndex: 1, lastInMessage: true })
+  })
+
+  it('the dead sub_agent_narrative kind is never emitted', () => {
+    // The union member was removed; nothing in either projector emits it.
+    const subLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'prose' }] },
+    })
+    const events = projectSubagentLine(subLine, 'X', { hasEmittedStart: true })
+    expect(events.some((e) => (e as { kind: string }).kind === 'sub_agent_narrative')).toBe(false)
   })
 
   it('parses assistant message with multiple blocks (thinking + tool_use)', () => {
@@ -471,7 +529,8 @@ describe('projectSubagentLine', () => {
     })
     const events = projectSubagentLine(line, 'X', st)
     expect(events).toEqual([
-      { kind: 'sub_agent_text', agentId: 'X', text: 'Reading the reducer' },
+      // text precedes a tool_use in the same message → lastInMessage:false
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Reading the reducer', blockIndex: 0, lastInMessage: false },
       {
         kind: 'sub_agent_tool_use',
         agentId: 'X',
@@ -511,8 +570,9 @@ describe('projectSubagentLine', () => {
       st,
     )
     // Text first (so the final summary still renders), turn_end last.
+    // A lone trailing text block (no tool_use after it) is lastInMessage:true.
     expect(events).toEqual([
-      { kind: 'sub_agent_text', agentId: 'X', text: 'Done. Fixed the bug.' },
+      { kind: 'sub_agent_text', agentId: 'X', text: 'Done. Fixed the bug.', blockIndex: 0, lastInMessage: true },
       { kind: 'sub_agent_turn_end', agentId: 'X' },
     ])
   })
@@ -563,5 +623,89 @@ describe('idle sub-tail reap (MEM2)', () => {
     expect(src).toContain('IDLE_FSWATCH_TTL_MS')
     // Must be invoked from the rescan tick, not just declared.
     expect(src).toMatch(/rescanSubagents\(\)\s*[\s\S]*?reapIdleSubTails\(\)/)
+  })
+})
+
+describe('projectAssistantTextBlocks (shared text→narrative kernel)', () => {
+  // Direct unit coverage for the now-live projection kernel. Both
+  // projectTranscriptLine and projectSubagentLine derive their text events
+  // through this one function; these tests pin its contract independently of
+  // either caller. The `make` adapter here uses the main-agent `text` kind.
+  const makeText = (text: string, blockIndex: number, lastInMessage: boolean): SessionEvent => ({
+    kind: 'text',
+    text,
+    blockIndex,
+    lastInMessage,
+  })
+
+  it('emits one narration event per non-empty text block, keyed by source index', () => {
+    const out = projectAssistantTextBlocks(
+      [
+        { type: 'text', text: 'hello' },
+        { type: 'tool_use', name: 'Read', id: 't1' },
+        { type: 'text', text: 'world' },
+      ],
+      makeText,
+    )
+    expect(out.size).toBe(2)
+    expect(out.get(0)).toEqual({ kind: 'text', text: 'hello', blockIndex: 0, lastInMessage: false })
+    expect(out.get(2)).toEqual({ kind: 'text', text: 'world', blockIndex: 2, lastInMessage: true })
+  })
+
+  it('drops empty and whitespace-only text blocks', () => {
+    const out = projectAssistantTextBlocks(
+      [
+        { type: 'text', text: '' },
+        { type: 'text', text: '   \n\t  ' },
+        { type: 'text', text: 'kept' },
+      ],
+      makeText,
+    )
+    expect(out.size).toBe(1)
+    expect(out.has(0)).toBe(false)
+    expect(out.has(1)).toBe(false)
+    expect(out.get(2)).toEqual({ kind: 'text', text: 'kept', blockIndex: 2, lastInMessage: true })
+  })
+
+  it('lastInMessage is false when a tool_use follows the text block in the same message', () => {
+    const out = projectAssistantTextBlocks(
+      [
+        { type: 'text', text: 'preamble' },
+        { type: 'tool_use', name: 'Bash', id: 't1' },
+      ],
+      makeText,
+    )
+    expect(out.get(0)).toEqual({ kind: 'text', text: 'preamble', blockIndex: 0, lastInMessage: false })
+  })
+
+  it('lastInMessage is true for a text block after the last tool_use (trailing narration)', () => {
+    const out = projectAssistantTextBlocks(
+      [
+        { type: 'tool_use', name: 'Bash', id: 't1' },
+        { type: 'text', text: 'done' },
+      ],
+      makeText,
+    )
+    expect(out.get(1)).toEqual({ kind: 'text', text: 'done', blockIndex: 1, lastInMessage: true })
+  })
+
+  it('the make adapter controls the wire kind (sub_agent_text tier)', () => {
+    const out = projectAssistantTextBlocks(
+      [{ type: 'text', text: 'sub preamble' }],
+      (text, blockIndex, lastInMessage): SessionEvent => ({
+        kind: 'sub_agent_text',
+        agentId: 'A',
+        text,
+        blockIndex,
+        lastInMessage,
+      }),
+    )
+    expect(out.get(0)).toEqual({
+      kind: 'sub_agent_text',
+      agentId: 'A',
+      text: 'sub preamble',
+      blockIndex: 0,
+      lastInMessage: true,
+    })
   })
 })

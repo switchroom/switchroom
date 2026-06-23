@@ -212,6 +212,18 @@ export function appendActivityLine(
   return renderActivityFeed(lines);
 }
 
+/**
+ * Clip a raw narrative text block down to a single transient liveness line:
+ * first line only, trimmed, sliced to 120 chars. Shared by the main-agent
+ * gateway path and the sub-agent watcher so both render narrative identically
+ * (mirrors the watcher's historical `lastSummaryLine` clip). Returns the raw
+ * (unescaped) clipped string — callers escape via the renderStepFeed path,
+ * exactly like a tool label.
+ */
+export function clipNarrative(s: string): string {
+  return (s ?? "").split("\n")[0].trim().slice(0, 120);
+}
+
 /** Minimal HTML escape for Telegram parse_mode=HTML (matches the gateway's). */
 export function escapeFeedHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
