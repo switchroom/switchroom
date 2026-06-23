@@ -1400,6 +1400,21 @@ const activeTurnStartedAt = new Map<string, number>()
 const claudeBusyKeys = new Set<string>()
 
 /**
+ * #2527 observability: count emoji transitions per status-reaction controller
+ * so `turn_no_reply_warn` can report how many reaction changes happened while
+ * producing zero text. Keyed by statusKey(chatId, threadId); cleared in
+ * purgeReactionTracking alongside the controller itself.
+ */
+const reactionTransitionCounts = new Map<string, number>()
+
+/**
+ * #2527 observability: tracks which (chatId:threadId) keys have already emitted
+ * a `turn_reply_timing` event this turn so we only fire it on the FIRST text
+ * reply. Cleared in purgeReactionTracking at turn-end alongside the controller.
+ */
+const firstTextReplyLogged = new Set<string>()
+
+/**
  * Helper: stamp a claudeBusyKeys entry for an inbound about to be
  * handed to claude. Pulls the thread id from the top-level field if
  * present, otherwise falls back to meta.message_thread_id (cron and
@@ -2755,6 +2770,10 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // the markClaudeBusyForInbound on the delivery path. Safe no-op
   // when the key was never marked (synthetic purge from a sweep).
   claudeBusyKeys.delete(key)
+  // #2527: clear the per-key reaction-transition counter and first-reply
+  // sentinel alongside the controller so we don't leak state across turns.
+  reactionTransitionCounts.delete(key)
+  firstTextReplyLogged.delete(key)
   // Human-feel UX: stop the turn-long `typing…` indicator started in
   // the turn-start block. `purgeReactionTracking` is the canonical
   // turn-end, so this is the single owner of the stop. (If an abnormal
@@ -3380,6 +3399,17 @@ function finalizeStatusReaction(
   if (reason === 'done' && deferredDoneReactions.tryDefer(key, ctrl)) return
   deferredDoneReactions.drop(key)
   ctrl.finalize(reason)
+  // #2527: log controller dispose so the lifecycle end is observable. Use
+  // activeReactionMsgIds to reconstruct the turnId token before purge clears it.
+  const msgInfo = activeReactionMsgIds.get(key)
+  if (msgInfo != null) {
+    logStreamingEvent({
+      kind: 'status_reaction_dispose',
+      chatId,
+      turnId: `${chatId}:${msgInfo.messageId}`,
+      reason,
+    })
+  }
   purgeReactionTracking(key)
 }
 
@@ -5377,6 +5407,14 @@ silencePoke.startTimer({
         `turn ended cleanly during silence window ` +
         `chat=${ctx.chatId} thread=${ctx.threadId ?? '-'} silence_ms=${ctx.silenceMs}\n`,
       )
+      // #2527: structured skip event so the late-fire race is machine-readable.
+      logStreamingEvent({
+        kind: 'silence_poke_skip',
+        chatId: ctx.chatId,
+        threadId: ctx.threadId ?? undefined,
+        silenceMs: ctx.silenceMs,
+        skipReason: 'turn_ended_cleanly_during_window',
+      })
       // Tell silence-poke this chat-thread is finished so the next
       // arming doesn't carry stale state.
       silencePoke.endTurn(ctx.key)
@@ -5421,6 +5459,15 @@ silencePoke.startTimer({
         blockedOnApproval,
       )
     }
+    // #2527: log the actual poke fire with structured data before sending,
+    // so the event is visible even if the send fails.
+    logStreamingEvent({
+      kind: 'silence_poke_fire',
+      chatId: ctx.chatId,
+      threadId: ctx.threadId ?? undefined,
+      silenceMs: ctx.silenceMs,
+      fallbackKind: ctx.fallbackKind,
+    })
     try {
       await robustApiCall(
         () => bot.api.sendMessage(ctx.chatId, text, {
@@ -7510,6 +7557,23 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
   process.stderr.write(`telegram channel: reply: invoked chatId=${chat_id} charCount=${text.length} preview=${JSON.stringify(text.slice(0, 80))}\n`)
+  // #2527: emit time_to_first_text_reply_ms on the FIRST text reply of each
+  // turn so operators can see how long users waited for any visible output.
+  // Only fires once per turn (firstTextReplyLogged guards the repeat).
+  if (turn != null) {
+    const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+    const replyKey = statusKey(chat_id, threadId)
+    if (!firstTextReplyLogged.has(replyKey)) {
+      firstTextReplyLogged.add(replyKey)
+      logStreamingEvent({
+        kind: 'turn_reply_timing',
+        chatId: chat_id,
+        threadId,
+        turnId: turn.turnId,
+        timeToFirstTextReplyMs: Date.now() - turn.gatewayReceiveAt,
+      })
+    }
+  }
 
   // #546 dedup check: was this content just sent via turn-flush or
   // a sibling reply path? Skip the actual send and return a
@@ -8463,6 +8527,19 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       // PR3b-cutover: feed lastOutboundAt to the delivery machine (see
       // executeReply) so its TTL tick suppresses an active-turn fallback.
       shadowEmit({ kind: 'modelOutbound', key: sKey as _ChatKey, at: Date.now() })
+      // #2527: emit turn_reply_timing on the first stream_reply of the turn,
+      // mirroring the same gate in executeReply. Guards with firstTextReplyLogged
+      // so a turn that calls reply first and stream_reply second doesn't double-emit.
+      if (turn != null && !firstTextReplyLogged.has(sKey)) {
+        firstTextReplyLogged.add(sKey)
+        logStreamingEvent({
+          kind: 'turn_reply_timing',
+          chatId: streamChatId,
+          threadId: streamThreadId,
+          turnId: turn.turnId,
+          timeToFirstTextReplyMs: Date.now() - turn.gatewayReceiveAt,
+        })
+      }
       // #1741 — see executeReply for the rationale: only a plausibly-
       // final stream_reply clears the silent-end state. An interim
       // ack via stream_reply must NOT clear; the Stop hook needs
@@ -11170,6 +11247,17 @@ function handleSessionEvent(ev: SessionEvent): void {
             ` chat=${chatId} turnStartedAt=${turn.startedAt} replyCalled=false capturedText=empty` +
             ` — the progress card steps were the only thing the user saw (#45)\n`,
           )
+          // #2527: emit structured WARN so the reaction-only failure mode is
+          // machine-readable in the streaming-metrics channel.
+          const tKey = statusKey(chatId, threadId)
+          logStreamingEvent({
+            kind: 'turn_no_reply_warn',
+            chatId,
+            threadId,
+            turnId: turn.turnId,
+            turnDurationMs: turn.startedAt > 0 ? Date.now() - turn.startedAt : 0,
+            reactionCount: reactionTransitionCounts.get(tKey) ?? 0,
+          })
         }
       }
 
@@ -12086,6 +12174,9 @@ function maybeEarlyAckReaction(ctx: Context, from: NonNullable<Context['from']>)
   void bot.api.setMessageReaction(chatId, msgId, [
     { type: 'emoji', emoji: '👀' as ReactionTypeEmoji['emoji'] },
   ]).catch(() => {})
+  // #2527: log the early-ack fire so operators can see how often the
+  // fast pre-coalesce DM path triggers vs. the controller path.
+  logStreamingEvent({ kind: 'early_ack_reaction', chatId, messageId: msgId, emoji: '👀' })
   // #553 PR 3: also fire the native "typing…" indicator. Bridges the
   // visual gap between the early-ack 👀 reaction and the first real
   // model text. No fake content — Telegram clients render this natively
@@ -13019,17 +13110,42 @@ async function handleInbound(
         if (!chatAvailableReactions.has(chat_id)) {
           probeAvailableReactions(chat_id)
         }
+        // #2527: use inbound msgId as a stable per-turn reaction identifier.
+        // The controller is created before currentTurn.turnId is assigned
+        // (that happens in handleSessionEvent's enqueue branch), so we capture
+        // msgId here and use it as the reaction-session token in log events.
+        const ctrlTurnToken = `${chat_id}:${msgId}`
         const ctrl = new StatusReactionController(async (emoji) => {
           await bot.api.setMessageReaction(chat_id, msgId, [
             { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
           ])
           // #203: every status-reaction transition is a user-visible signal.
           signalTracker.noteSignal(key, Date.now())
-        }, allowedReactions)
+        }, allowedReactions, {
+          // #2527: emit a structured transition event on each emoji change so
+          // the reaction lifecycle is visible in streaming-metrics logs. Also
+          // increment the per-key counter for the turn_no_reply_warn metric.
+          onTransition: (emoji) => {
+            reactionTransitionCounts.set(key, (reactionTransitionCounts.get(key) ?? 0) + 1)
+            logStreamingEvent({
+              kind: 'status_reaction_transition',
+              chatId: chat_id,
+              turnId: ctrlTurnToken,
+              emoji,
+            })
+          },
+        })
         activeStatusReactions.set(key, ctrl)
         activeReactionMsgIds.set(key, { chatId: chat_id, messageId: msgId })
         activeTurnStartedAt.set(key, Date.now())
         progressUpdateTurnCount.set(key, 0)  // Reset turn counter
+        // #2527: log controller install so the lifecycle start is observable.
+        logStreamingEvent({
+          kind: 'status_reaction_install',
+          chatId: chat_id,
+          turnId: ctrlTurnToken,
+          messageId: msgId,
+        })
         ctrl.setQueued()
         // #203: time-to-ack metric — setQueued() triggers the initial 👀 reaction
         // asynchronously through the controller chain.
