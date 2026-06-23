@@ -6,6 +6,8 @@
  *   switchroom worktree release <id>
  *   switchroom worktree list [--json]
  *   switchroom worktree reap [--dry-run]
+ *   switchroom worktree gc [--root <dir>...] [--yes] [--json]
+ *   switchroom worktree gc --purge-trash [--older-than <days>] [--yes]
  */
 
 import type { Command } from "commander";
@@ -14,6 +16,15 @@ import { claimWorktree } from "../worktree/claim.js";
 import { releaseWorktree } from "../worktree/release.js";
 import { listWorktrees } from "../worktree/list.js";
 import { runReaper } from "../worktree/reaper.js";
+import {
+  planGc,
+  applyGc,
+  defaultRoots,
+  trashRoot,
+  listTrashEntries,
+  selectPurgeTargets,
+  purgeTrash,
+} from "../worktree/gc.js";
 
 export function registerWorktreeCommand(program: Command): void {
   const worktree = program
@@ -156,4 +167,99 @@ export function registerWorktreeCommand(program: Command): void {
         }
       }
     });
+
+  // ─── gc ─────────────────────────────────────────────────────────────────
+
+  worktree
+    .command("gc")
+    .description(
+      "Reclaim dev worktrees that outlived their PR.\n" +
+        "Dry-run by default; pass --yes to act. Quarantines orphaned worktree\n" +
+        "directories (move, not delete) and removes registered worktrees whose\n" +
+        "PR is MERGED and whose tree is clean.",
+    )
+    .option(
+      "--root <dir>",
+      "Scan root (repeatable). Default: ~/code",
+      (val: string, acc: string[]) => [...acc, val],
+      [] as string[],
+    )
+    .option("--yes", "Actually act (default is dry-run)")
+    .option("--json", "Output raw JSON")
+    .option("--purge-trash", "Hard-delete quarantined dirs older than --older-than")
+    .option("--older-than <days>", "Age threshold for --purge-trash (default 14)", "14")
+    .action(
+      (opts: {
+        root: string[];
+        yes?: boolean;
+        json?: boolean;
+        purgeTrash?: boolean;
+        olderThan: string;
+      }) => {
+        if (opts.purgeTrash) {
+          const parsed = Number(opts.olderThan);
+          const olderThan = isNaN(parsed) ? 14 : parsed;
+          const entries = listTrashEntries(Date.now());
+          const targets = selectPurgeTargets(entries, olderThan);
+          if (!opts.yes) {
+            if (opts.json) {
+              console.log(JSON.stringify({ would_purge: targets, trashRoot: trashRoot() }));
+            } else if (targets.length === 0) {
+              console.log(`No quarantined worktrees older than ${olderThan}d in ${trashRoot()}.`);
+            } else {
+              console.log(chalk.yellow(`Would purge ${targets.length} quarantined dir(s) (≥${olderThan}d):`));
+              for (const t of targets) console.log(`  ${t}`);
+              console.log(chalk.dim("\nRe-run with --yes to delete."));
+            }
+            return;
+          }
+          const r = purgeTrash(targets);
+          if (opts.json) {
+            console.log(JSON.stringify(r));
+          } else {
+            console.log(chalk.green(`Purged ${r.deleted.length} dir(s).`));
+            for (const e of r.errors) console.warn(chalk.yellow(e));
+          }
+          return;
+        }
+
+        const roots = opts.root.length > 0 ? opts.root : defaultRoots();
+        const dateStamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+        const plan = planGc(roots, { dateStamp });
+        const toRemove = plan.registered.filter((r) => r.verdict === "remove");
+
+        if (!opts.yes) {
+          if (opts.json) {
+            console.log(JSON.stringify({ dryRun: true, plan }));
+            return;
+          }
+          console.log(chalk.bold(`worktree gc — dry-run (roots: ${roots.join(", ")})\n`));
+          console.log(`Orphaned dirs to quarantine: ${chalk.bold(plan.orphans.length)}`);
+          for (const o of plan.orphans) console.log(`  ${o.dir}  ${chalk.dim("→ " + o.dest)}`);
+          console.log(`\nRegistered worktrees to remove (PR merged + clean): ${chalk.bold(toRemove.length)}`);
+          for (const r of toRemove) console.log(`  ${r.path}  ${chalk.dim("[" + r.branch + "]")}`);
+          const skips = plan.registered.filter((r) => r.verdict.startsWith("skip-") && r.verdict !== "skip-protected");
+          if (skips.length) {
+            console.log(chalk.dim(`\nKept (${skips.length}):`));
+            for (const r of skips) console.log(chalk.dim(`  ${r.verdict.replace("skip-", "")}: ${r.path} [${r.branch}] (pr=${r.prSignal})`));
+          }
+          if (plan.skipped.length) {
+            console.log(chalk.dim(`\nIgnored non-switchroom dirs: ${plan.skipped.length}`));
+          }
+          console.log(chalk.dim("\nRe-run with --yes to act. Orphans are MOVED to the trash dir, not deleted."));
+          return;
+        }
+
+        const result = applyGc(plan);
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(chalk.green(`Quarantined ${result.quarantined.length} orphan(s) → ${plan.trashDir}`));
+          console.log(chalk.green(`Removed ${result.removed.length} merged worktree(s); deleted ${result.branchesDeleted.length} branch(es).`));
+          console.log(chalk.dim(`Pruned metadata in ${result.pruned.length} repo(s).`));
+          for (const e of result.errors) console.warn(chalk.yellow(e));
+          console.log(chalk.dim(`\nQuarantined dirs are recoverable until \`switchroom worktree gc --purge-trash --yes\`.`));
+        }
+      },
+    );
 }
