@@ -313,6 +313,11 @@ function updateRow(dbPath, { id, status, resultSummary, now, asyncLaunch }, done
     setImmediate(() => {
       try {
         const db = new SnapDatabaseSync(snapDbPath)
+        // Concurrency: per-connection busy_timeout so this hook's writes
+        // wait-and-retry instead of failing with SQLITE_BUSY under concurrent
+        // sub-agent dispatch. Set on the real open so BOTH the node:sqlite
+        // (production) and bun:sqlite branches are armed (#2535 review).
+        try { db.exec('PRAGMA busy_timeout = 5000') } catch { /* best-effort */ }
         const row = db.prepare(SELECT_SQL).get(snapId)
         const isBackground = row != null && row.background === 1
         if (isBackground) {
