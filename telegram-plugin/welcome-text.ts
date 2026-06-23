@@ -338,6 +338,7 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "effort", description: "Show or switch the reasoning effort" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
+  { command: "whoami", description: "This agent's sandbox: tools, MCP, vault key-names" },
   // Vault — secrets + capability grants. /vault is a top-level command
   // dispatching subcommands (list, get, set, delete, status, unlock, lock,
   // grant, grants). Surfaced in the menu so mobile users can tap-to-pick

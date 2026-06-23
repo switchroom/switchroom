@@ -70,7 +70,7 @@ describe('maskUsername', () => {
   });
 
   it('is deterministic for a numeric id input', () => {
-    expect(maskUsername('8248703757')).toBe(maskUsername('8248703757'));
+    expect(maskUsername('12345')).toBe(maskUsername('12345'));
   });
 
   it('maps the first distinct input to @demo_user', () => {
@@ -79,7 +79,7 @@ describe('maskUsername', () => {
 
   it('maps a second distinct input to @demo_user2', () => {
     maskUsername('@ken_real');
-    expect(maskUsername('8248703757')).toBe('@demo_user2');
+    expect(maskUsername('12345')).toBe('@demo_user2');
   });
 
   it('always yields a @handle shape and never echoes the real id', () => {
@@ -89,7 +89,7 @@ describe('maskUsername', () => {
   });
 
   it('normalises a numeric id to a @handle (not a raw number)', () => {
-    expect(maskUsername('8248703757')).toMatch(/^@demo_user\d*$/);
+    expect(maskUsername('12345')).toMatch(/^@demo_user\d*$/);
   });
 });
 

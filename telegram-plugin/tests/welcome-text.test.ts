@@ -184,8 +184,8 @@ describe("statusPairedText", () => {
       expect(out).toMatch(/Paired as @demo_user\d*\./);
     });
     it("WITH demo, a numeric sender id is masked to a @handle, not a raw number", () => {
-      const out = statusPairedText({ user: "8248703757", meta, demo: true });
-      expect(out).not.toContain("8248703757");
+      const out = statusPairedText({ user: "12345", meta, demo: true });
+      expect(out).not.toContain("12345");
       expect(out).toMatch(/Paired as @demo_user\d*\./);
     });
     it("WITH demo, the agent/model/auth topology is NOT masked", () => {
@@ -462,10 +462,16 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     ).not.toMatch(/<code>\/reauth\b/);
   });
 
-  it("menu is short enough for a mobile keyboard (<= 20 entries)", () => {
+  it("menu is short enough for a mobile keyboard (<= 21 entries)", () => {
     // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
-    // without scrolling. 20 is a generous upper bound.
-    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(20);
+    // without scrolling. 21 is a generous upper bound (well under
+    // Telegram's own 100-command limit). /whoami brought it to 21.
+    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(21);
+  });
+
+  it("menu includes /whoami (sandbox introspection)", () => {
+    const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    expect(names, "missing /whoami from Telegram menu").toContain("whoami");
   });
 
   it("every menu command is documented in switchroomHelpText", () => {
