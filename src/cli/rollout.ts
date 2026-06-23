@@ -40,6 +40,7 @@ import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -256,6 +257,46 @@ export function shouldRefuseDowngrade(
 }
 
 /**
+ * `failedStep` label for a roll refused up-front because the DRIVING CLI is
+ * older than the target (#2542). Surfaced via the sentinel → hostd status row
+ * so `get_status` shows the cause structurally, not just in a stderr tail.
+ */
+export const PREFLIGHT_STALE_CLI_STEP = "preflight-stale-cli";
+
+/**
+ * Pure guard: returns true when the roll must be refused because the CLI
+ * DRIVING the rollout is OLDER than the target it's being asked to deploy.
+ *
+ * Why this is fatal, not a warning (#2542): the rollout's `apply` +
+ * per-agent-restart steps regenerate the compose file using THIS CLI's own
+ * generator code and version stamp. An older CLI cannot produce a newer
+ * target's compose correctly — even when `--pin` resolves the image tag, the
+ * compose schema/stamp is the old CLI's — so the roll boots agents on the
+ * stale version, fails the canary, and leaves compose drifted to a version
+ * older than what's running (a downgrade landmine). The only safe outcome is
+ * to refuse BEFORE the first mutation; there is no "work correctly" branch for
+ * an old CLI driving a new target.
+ *
+ * Conservative, mirroring the downgrade guard: refuses ONLY when both the CLI
+ * version and the target are clean `vX.Y.Z` semvers and the CLI is strictly
+ * older. A dev/sha/channel/unparseable version on either side is unorderable
+ * (`compareReleaseTags` → null) and never blocks.
+ *
+ * Exported for unit testing.
+ */
+export function shouldRefuseStaleCli(
+  cliVersion: string | undefined,
+  target: string,
+): boolean {
+  if (!cliVersion) return false;
+  const cmp = compareReleaseTags(
+    `v${normalizeVersion(cliVersion)}`,
+    `v${normalizeVersion(target)}`,
+  );
+  return cmp !== null && cmp < 0;
+}
+
+/**
  * True when this `switchroom rollout` was spawned by the host-control
  * daemon on behalf of an agent MCP call (#2487). hostd sets
  * `SWITCHROOM_HOSTD_CONTEXT=1` on the child env. The flag flips three
@@ -465,6 +506,47 @@ export function registerRolloutCommand(program: Command): void {
             `semver), so the target must be a tagged release like v0.15.18 — ` +
             `\`${target}\` isn't version-assertable. Pass --pin vX.Y.Z.\n`,
         );
+        process.exitCode = 2;
+        return;
+      }
+      // #2542 — stale-CLI guard: refuse up-front when the CLI DRIVING this
+      // roll is older than the target. An older CLI regenerates compose with
+      // its own stale generator + version stamp (the roll's apply +
+      // per-agent-restart steps), which boots agents on the stale version,
+      // fails the canary, and leaves compose downgraded below what's running.
+      // Refuse BEFORE the first mutation — there is no safe "work correctly"
+      // path for an old CLI driving a new target. Applies to BOTH the hostd
+      // path (the incident: source-unlinked hostd CLI behind the tag) and the
+      // host-shell path (an operator on a stale CLI). Conservative: only a
+      // clean vX.Y.Z < vX.Y.Z comparison blocks (dev/sha/channel never do).
+      if (shouldRefuseStaleCli(SWITCHROOM_VERSION, target)) {
+        const cli = normalizeVersion(SWITCHROOM_VERSION);
+        const refusal =
+          `rollout refused: the driving switchroom CLI is v${cli}, OLDER than ` +
+          `the --pin target ${target}. An older CLI regenerates the compose file ` +
+          `with its own (stale) generator and version stamp, which would boot ` +
+          `agents on v${cli}, fail the canary, and leave compose downgraded ` +
+          `below what's running. ` +
+          (hostdCtx
+            ? `Refresh hostd's CLI first — host-side: \`switchroom hostd install ` +
+              `--tag ${target}\` — then re-run the roll.`
+            : `Upgrade this CLI to >= ${target} first (e.g. \`switchroom update ` +
+              `--pin ${target}\`, or rebuild your checkout), then re-run.`) +
+          ` Nothing was changed.`;
+        process.stderr.write(refusal + "\n");
+        // Surface the cause STRUCTURALLY on the hostd path so get_status / the
+        // audit row show failed_step + got, not just a stderr tail (#2542 AC4).
+        if (hostdCtx) {
+          process.stdout.write(
+            encodeRolloutResultLine({
+              ok: false,
+              rolled: [],
+              failedStep: PREFLIGHT_STALE_CLI_STEP,
+              got: cli,
+              warnings: [refusal],
+            }) + "\n",
+          );
+        }
         process.exitCode = 2;
         return;
       }

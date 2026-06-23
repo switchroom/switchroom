@@ -19,6 +19,8 @@ import {
   encodeRolloutResultLine,
   parseRolloutResultLine,
   shouldRefuseDowngrade,
+  shouldRefuseStaleCli,
+  PREFLIGHT_STALE_CLI_STEP,
   ROLLOUT_RESULT_SENTINEL,
   type RolloutDeps,
   type RolloutResult,
@@ -392,6 +394,50 @@ describe("shouldRefuseDowngrade (#2487 PR2)", () => {
 
   it("never refuses when pin is absent (target comes from config, not --pin)", () => {
     expect(shouldRefuseDowngrade(true, undefined, CURRENT, undefined)).toBe(false);
+  });
+});
+
+// ── shouldRefuseStaleCli — driving CLI older than the target (#2542) ────────
+
+describe("shouldRefuseStaleCli (#2542)", () => {
+  it("refuses when the driving CLI is strictly older than the target", () => {
+    // The exact incident: hostd CLI 0.15.48 driving a roll to v0.15.59.
+    expect(shouldRefuseStaleCli("0.15.48", "v0.15.59")).toBe(true);
+  });
+
+  it("normalizes the v-prefix on both sides (build-info has no v, --pin does)", () => {
+    expect(shouldRefuseStaleCli("v0.15.48", "v0.15.59")).toBe(true);
+    expect(shouldRefuseStaleCli("0.15.48", "0.15.59")).toBe(true);
+  });
+
+  it("allows when the CLI is the same version as the target", () => {
+    expect(shouldRefuseStaleCli("0.15.59", "v0.15.59")).toBe(false);
+  });
+
+  it("allows when the CLI is NEWER than the target (a downgrade — other guard's job)", () => {
+    expect(shouldRefuseStaleCli("0.15.59", "v0.15.48")).toBe(false);
+  });
+
+  it("never fires when either side is unorderable (dev/sha/channel/garbage)", () => {
+    expect(shouldRefuseStaleCli("sha-abc1234", "v0.15.59")).toBe(false);
+    expect(shouldRefuseStaleCli("0.15.48", "latest")).toBe(false);
+    expect(shouldRefuseStaleCli("dev", "v0.15.59")).toBe(false);
+    expect(shouldRefuseStaleCli("not-a-version", "v0.15.59")).toBe(false);
+  });
+
+  it("never fires when the CLI version is missing", () => {
+    expect(shouldRefuseStaleCli(undefined, "v0.15.59")).toBe(false);
+    expect(shouldRefuseStaleCli("", "v0.15.59")).toBe(false);
+  });
+
+  it("compares across minor/major boundaries, not lexically", () => {
+    expect(shouldRefuseStaleCli("0.9.9", "v0.15.0")).toBe(true); // 0.9 < 0.15 (not string compare)
+    expect(shouldRefuseStaleCli("0.15.9", "v0.15.10")).toBe(true); // patch 9 < 10
+    expect(shouldRefuseStaleCli("1.0.0", "v0.15.59")).toBe(false); // major 1 > 0
+  });
+
+  it("the refusal step label is the stable structured-status value", () => {
+    expect(PREFLIGHT_STALE_CLI_STEP).toBe("preflight-stale-cli");
   });
 });
 
