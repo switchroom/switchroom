@@ -184,6 +184,14 @@ function writeRow(dbPath, { id, parentSessionId, parentTurnKey, agentType, descr
     setImmediate(() => {
       try {
         const db = new SnapDatabaseSync(snapDbPath)
+        // Concurrency: this hook writes registry.db from a separate process
+        // that contends with the gateway's subagent-watcher + the PostToolUse
+        // hook. Without a busy_timeout, the contending write fails IMMEDIATELY
+        // with SQLITE_BUSY ("database is locked") when several sub-agents
+        // dispatch at once, dropping the row → NULL jsonl_agent_id/parent_turn_key.
+        // Per-connection PRAGMA, set on the real open so BOTH the node:sqlite
+        // (production) and bun:sqlite branches are armed.
+        try { db.exec('PRAGMA busy_timeout = 5000') } catch { /* best-effort */ }
         db.exec(snapSchemaSql)
         // Migrate older DBs that pre-date jsonl_agent_id.
         const hasJsonlCol = db.prepare(snapMigrateSql).get()

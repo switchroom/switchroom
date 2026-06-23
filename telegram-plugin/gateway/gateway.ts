@@ -22628,6 +22628,16 @@ void (async () => {
                     if (turn.activityInFlight == null) {
                       turn.activityInFlight = drainActivitySummary(turn)
                     }
+                    // A foreground sub-agent's nested activity IS user-visible
+                    // production — count it so the silence-poke clock resets,
+                    // exactly like the parent activity-render path (10665). Without
+                    // this, a long tools-only foreground sub-agent (no prose) lets
+                    // the 300s framework fallback (and the #2527 mid-turn floor)
+                    // measure silence against a turn that is visibly working,
+                    // risking a premature tear-down / unwanted liveness beat.
+                    if (SILENCE_LIVENESS_PRODUCTION && currentTurn === turn) {
+                      silencePoke.noteProduction(statusKey(turn.sessionChatId, turn.sessionThreadId), Date.now())
+                    }
                   }
                   return
                 }
