@@ -133,7 +133,7 @@ export type StreamingEvent =
       kind: 'status_reaction_dispose'
       chatId: string
       turnId: string
-      reason: 'done' | 'error' | 'disconnect'
+      reason: 'done' | 'error' | 'disconnect' | 'undelivered'
     }
   /**
    * Emitted when the FIRST text reply (reply or stream_reply) of a turn is
