@@ -11,6 +11,8 @@
  * monospace inline and avoid Telegram treating them as markdown.
  */
 
+import { maskUsername } from "./demo-mask.js";
+
 export type AuthSummary = {
   authenticated: boolean;
   subscription_type: string | null;
@@ -198,10 +200,19 @@ const STATUS_DOT: Record<StatusProbeRow['status'], string> = {
 export function statusPairedText(params: {
   user: string;
   meta: AgentMetadata;
+  /**
+   * Demo mode (the `/status demo` suffix). When true the paired-user tag
+   * (`@handle` or numeric sender id) is run through `maskUsername` so a
+   * screen recording shows a stable fake `@demo_user…` handle instead of
+   * the operator's real Telegram identity. Off by default — the agent /
+   * model / health / audit topology below is NOT masked (out of scope).
+   */
+  demo?: boolean;
 }): string {
   const { user, meta } = params;
+  const shownUser = params.demo ? maskUsername(user) : user;
   const lines = [
-    `Paired as ${escapeHtml(user)}.`,
+    `Paired as ${escapeHtml(shownUser)}.`,
     ``,
     `Agent: ${formatAgentLine(meta)}`,
     `Auth: ${formatAuthLine(meta.auth)}`,
@@ -327,6 +338,7 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "effort", description: "Show or switch the reasoning effort" },
   { command: "doctor", description: "Health check (deps, services, MCP)" },
   { command: "usage", description: "Pro/Max plan quota (5h + 7d windows)" },
+  { command: "whoami", description: "This agent's sandbox: tools, MCP, vault key-names" },
   // Vault — secrets + capability grants. /vault is a top-level command
   // dispatching subcommands (list, get, set, delete, status, unlock, lock,
   // grant, grants). Surfaced in the menu so mobile users can tap-to-pick

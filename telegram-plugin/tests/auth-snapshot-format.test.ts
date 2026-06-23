@@ -4,6 +4,7 @@
  * with hand-crafted QuotaUtilization fixtures.
  */
 import { describe, it, expect } from 'vitest';
+import { __resetDemoMaskCachesForTest } from '../demo-mask.js';
 import {
   classifyHealth,
   blockedReason,
@@ -281,6 +282,45 @@ describe('renderAuthSnapshotFormat2', () => {
     });
     expect(out).toContain('⚠ cached');
     expect(out).not.toContain('Live · refreshed');
+  });
+
+  // ── demo mode (the `/usage demo` / `/auth demo` suffix) ──────────────
+  describe('demo mode masks email labels', () => {
+    it('WITHOUT demo, the real account emails still render', () => {
+      const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
+      expect(out).toContain('alice@example.com');
+      expect(out).toContain('bob@example.com');
+      expect(out).toContain('you@example.com');
+    });
+
+    it('WITH demo, no real account label leaks and rows render masked emails', () => {
+      __resetDemoMaskCachesForTest();
+      const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC', demo: true });
+      // Real labels gone.
+      expect(out).not.toContain('alice@example.com');
+      expect(out).not.toContain('bob@example.com');
+      expect(out).not.toContain('you@example.com');
+      // Masked fakes present (pool order from a clean cache: blocked-first
+      // render order means bob is masked first, then alice/you in healthy).
+      expect(out).toMatch(/<code>[^@<]+@example\.com<\/code>/);
+    });
+
+    it('WITH demo, the recommendation footer masks the active label', () => {
+      __resetDemoMaskCachesForTest();
+      const happy: AccountSnapshot[] = [
+        snap({ label: 'real-active@corp.com', isActive: true, quota: quota({ fiveHourUtilizationPct: 5 }) }),
+      ];
+      const out = renderAuthSnapshotFormat2(happy, { now: NOW, demo: true });
+      expect(out).not.toContain('real-active@corp.com');
+      expect(out).toMatch(/Recommendation: stay on [^@\s]+@example\.com\./);
+    });
+
+    it('demo masking is deterministic across two renders in the same process', () => {
+      __resetDemoMaskCachesForTest();
+      const a = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC', demo: true });
+      const b = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC', demo: true });
+      expect(a).toBe(b);
+    });
   });
 });
 

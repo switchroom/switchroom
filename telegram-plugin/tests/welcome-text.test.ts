@@ -173,6 +173,29 @@ describe("statusPairedText", () => {
     expect(out).toContain("Status: <code>running</code> · up 3h 12m");
   });
 
+  // demo mode (the `/status demo` suffix) — masks the paired-user tag only.
+  describe("demo mode", () => {
+    it("WITHOUT demo, the real handle still renders", () => {
+      expect(statusPairedText({ user: "@ken_real", meta })).toContain("Paired as @ken_real.");
+    });
+    it("WITH demo, the handle is masked to a @demo_user form", () => {
+      const out = statusPairedText({ user: "@ken_real", meta, demo: true });
+      expect(out).not.toContain("@ken_real");
+      expect(out).toMatch(/Paired as @demo_user\d*\./);
+    });
+    it("WITH demo, a numeric sender id is masked to a @handle, not a raw number", () => {
+      const out = statusPairedText({ user: "12345", meta, demo: true });
+      expect(out).not.toContain("12345");
+      expect(out).toMatch(/Paired as @demo_user\d*\./);
+    });
+    it("WITH demo, the agent/model/auth topology is NOT masked", () => {
+      const out = statusPairedText({ user: "@ken_real", meta, demo: true });
+      // Out-of-scope fields stay real.
+      expect(out).toContain("Auth: ✓ Max · expires 29 days");
+      expect(out).toContain("<code>sonnet</code>");
+    });
+  });
+
   // Issue #142 PR 3 — audit details surfaced on /status when the gateway
   // successfully loads switchroom.yaml. Pre-#142 this content lived in
   // the SessionStart greeting card; now it's pulled on demand.
@@ -439,10 +462,16 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     ).not.toMatch(/<code>\/reauth\b/);
   });
 
-  it("menu is short enough for a mobile keyboard (<= 20 entries)", () => {
+  it("menu is short enough for a mobile keyboard (<= 21 entries)", () => {
     // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
-    // without scrolling. 20 is a generous upper bound.
-    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(20);
+    // without scrolling. 21 is a generous upper bound (well under
+    // Telegram's own 100-command limit). /whoami brought it to 21.
+    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(21);
+  });
+
+  it("menu includes /whoami (sandbox introspection)", () => {
+    const names = TELEGRAM_MENU_COMMANDS.map(c => c.command);
+    expect(names, "missing /whoami from Telegram menu").toContain("whoami");
   });
 
   it("every menu command is documented in switchroomHelpText", () => {
