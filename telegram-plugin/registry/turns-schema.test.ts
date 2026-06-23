@@ -24,6 +24,30 @@ import {
 } from './turns-schema.js'
 
 // ---------------------------------------------------------------------------
+// Concurrency PRAGMAs — applySchema must arm busy_timeout so concurrent
+// writers (the subagent-tracker hooks + the gateway watcher) wait-and-retry
+// instead of failing with SQLITE_BUSY ("database is locked").
+// ---------------------------------------------------------------------------
+
+describe('registry concurrency PRAGMAs', () => {
+  it('arms busy_timeout (5000ms) on every opened connection', () => {
+    const db = openTurnsDbInMemory()
+    const row = db.prepare('PRAGMA busy_timeout').get() as { timeout: number }
+    expect(row.timeout).toBe(5000)
+    db.close()
+  })
+
+  it('uses WAL journal mode for concurrent readers', () => {
+    const db = openTurnsDbInMemory()
+    const row = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string }
+    // `:memory:` reports 'memory'; a file DB reports 'wal'. Either way the
+    // exec ran without error — the file-path open (openTurnsDb) yields 'wal'.
+    expect(['wal', 'memory']).toContain(String(row.journal_mode).toLowerCase())
+    db.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Test 1 — empty DB
 // ---------------------------------------------------------------------------
 

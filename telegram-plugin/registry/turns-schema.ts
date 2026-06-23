@@ -172,6 +172,15 @@ const PHASE2_MIGRATIONS = [
 function applySchema(db: SqliteDatabase): void {
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
+  // Concurrency: multiple writers contend on this registry (the PreToolUse
+  // subagent-tracker hook, the gateway's subagent-watcher backfill, the turns
+  // writer) — especially when several sub-agents dispatch at once. Without a
+  // busy_timeout, bun:sqlite/better-sqlite3 default to 0ms and the second
+  // contending write fails IMMEDIATELY with SQLITE_BUSY ("database is locked"),
+  // which the watcher swallows → jsonl_agent_id / parent_turn_key left NULL →
+  // worker card mis-routes to the operator DM + false silent-stall synthesis.
+  // 5s of wait-and-retry serializes the contenders instead of dropping writes.
+  db.exec('PRAGMA busy_timeout = 5000')
   db.exec(SCHEMA_SQL)
   // Run migrations. SQLite doesn't support "ADD COLUMN IF NOT EXISTS", so
   // we swallow the "duplicate column" error to stay idempotent on

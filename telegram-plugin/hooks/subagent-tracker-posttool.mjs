@@ -74,6 +74,12 @@ function resolveSyncSqlite() {
       const { Database } = require('bun:sqlite')
       return function BunDatabaseSyncAdapter(p) {
         const d = new Database(p)
+        // Concurrency: this hook writes the registry from a separate process
+        // that contends with the gateway's subagent-watcher. Without a
+        // busy_timeout the write fails immediately with SQLITE_BUSY
+        // ("database is locked") when several sub-agents dispatch at once.
+        // Wait-and-retry instead (per-connection PRAGMA).
+        try { d.exec('PRAGMA busy_timeout = 5000') } catch { /* best-effort */ }
         return {
           exec: (sql) => d.exec(sql),
           prepare: (sql) => d.prepare(sql),
