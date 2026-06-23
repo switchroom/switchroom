@@ -197,9 +197,10 @@ export function registerWorktreeCommand(program: Command): void {
         olderThan: string;
       }) => {
         if (opts.purgeTrash) {
-          const olderThan = Number(opts.olderThan);
+          const parsed = Number(opts.olderThan);
+          const olderThan = isNaN(parsed) ? 14 : parsed;
           const entries = listTrashEntries(Date.now());
-          const targets = selectPurgeTargets(entries, isNaN(olderThan) ? 14 : olderThan);
+          const targets = selectPurgeTargets(entries, olderThan);
           if (!opts.yes) {
             if (opts.json) {
               console.log(JSON.stringify({ would_purge: targets, trashRoot: trashRoot() }));

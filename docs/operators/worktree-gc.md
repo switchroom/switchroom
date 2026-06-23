@@ -51,12 +51,18 @@ worktree can be moved back out of the trash dir.
 Run GC weekly so forgotten worktrees self-clean, and purge quarantined dirs
 once they've aged out. `HOME` must be set so `gh` finds its token.
 
+Find the `switchroom` binary first (`command -v switchroom`) — on this host it
+resolves under `~/.bun/bin` or `~/.nvm/.../bin`, **not** `/usr/local/bin` — and
+put that dir on the cron `PATH` (cron has a minimal default PATH).
+
 ```cron
-# /etc/cron.d/switchroom-worktree-gc  (or `crontab -e` for the operator user)
+# crontab -e  for the operator user (HOME + PATH set so `switchroom` and `gh` resolve)
+HOME=/home/kenthompson
+PATH=/usr/bin:/bin:/home/kenthompson/.bun/bin
 # Sun 04:00 — quarantine merged/orphaned worktrees
-0 4 * * 0  kenthompson  HOME=/home/kenthompson /usr/local/bin/switchroom worktree gc --yes >> /var/log/switchroom/worktree-gc.log 2>&1
+0 4 * * 0   switchroom worktree gc --yes >> /var/log/switchroom/worktree-gc.log 2>&1
 # Sun 04:10 — purge anything quarantined ≥14 days ago
-10 4 * * 0 kenthompson  HOME=/home/kenthompson /usr/local/bin/switchroom worktree gc --purge-trash --older-than 14 --yes >> /var/log/switchroom/worktree-gc.log 2>&1
+10 4 * * 0  switchroom worktree gc --purge-trash --older-than 14 --yes >> /var/log/switchroom/worktree-gc.log 2>&1
 ```
 
 A `gh` API error mid-run is treated as "unknown ⇒ keep", so a transient
