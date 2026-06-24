@@ -166,7 +166,12 @@ export function makeHttpHindsightClient(
   const fetchImpl = opts?.fetchImpl ?? fetch
   const timeoutMs = opts?.timeoutMs ?? 10_000
 
-  async function initSession(bankId: string): Promise<string> {
+  // Returns the session-id string if the server issued one, or null for a
+  // stateless server (HINDSIGHT_DEFAULT_MCP_STATELESS=true). The MCP spec
+  // makes mcp-session-id optional — hard-failing on its absence broke the
+  // sweep against the default Hindsight deployment. Mirror the tolerant
+  // pattern at src/memory/hindsight.ts:~394-401.
+  async function initSession(bankId: string): Promise<string | null> {
     const controller = new AbortController()
     const t = setTimeout(() => controller.abort(), timeoutMs)
     try {
@@ -190,8 +195,10 @@ export function makeHttpHindsightClient(
         signal: controller.signal,
       })
       if (!resp.ok) throw new Error(`initialize HTTP ${resp.status}`)
+      // Hindsight runs stateless by default — mcp-session-id is optional per
+      // the MCP spec. Only forward the header when the server actually issues
+      // one; a missing header is not an error.
       const sid = resp.headers.get('mcp-session-id')
-      if (!sid) throw new Error('no mcp-session-id in initialize response')
       // Drain body so the connection can be reused.
       await resp.text()
       return sid
@@ -200,9 +207,11 @@ export function makeHttpHindsightClient(
     }
   }
 
-  async function callTool(bankId: string, sessionId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
+  async function callTool(bankId: string, sessionId: string | null, name: string, args: Record<string, unknown>): Promise<unknown> {
     const controller = new AbortController()
     const t = setTimeout(() => controller.abort(), timeoutMs)
+    // Only include mcp-session-id when the server issued one (stateful mode).
+    const sessionHeader: Record<string, string> = sessionId ? { 'mcp-session-id': sessionId } : {}
     try {
       const resp = await fetchImpl(apiUrl, {
         method: 'POST',
@@ -210,7 +219,7 @@ export function makeHttpHindsightClient(
           'Content-Type': 'application/json',
           Accept: 'application/json, text/event-stream',
           'X-Bank-Id': bankId,
-          'mcp-session-id': sessionId,
+          ...sessionHeader,
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
@@ -256,27 +265,18 @@ export function makeHttpHindsightClient(
       })) as { items: HindsightMemory[]; total: number }
       return { items: res.items ?? [], total: res.total ?? 0 }
     },
-    async deleteMemory(_bankId, _memoryId) {
-      // HONEST FAILURE (2026-06-07 security audit). The vault secret-scrub
-      // cannot delete a single matched memory on this hindsight server, and
-      // pretending otherwise is dangerous — it would report leaked secrets as
-      // "scrubbed" while leaving them in the bank. Proven live:
-      //   • there is NO `delete_memory` MCP tool (the original call — phantom);
-      //   • `delete_document(document_id)` IS real but a `list_memories` item's
-      //     `id` is a MEMORY-UNIT id, not a document_id: get_memory(id) → OK,
-      //     get_document(id) → "Document not found", so it deletes nothing;
-      //   • there is no by-id single-memory-unit delete on the MCP or REST
-      //     surface (REST has whole-document delete + collection-clear only).
-      // So we FAIL LOUDLY: the sweep reports matches it could not remove, and
-      // the operator redacts manually (bank UI) or clears the bank. Restoring
-      // an actual scrub needs a document-granularity rework (resolve each match
-      // to its document_id, DELETE the document, accepting clean siblings die)
-      // — tracked separately; out of scope for the context-token work.
-      throw new Error(
-        'hindsight exposes no single-memory delete API (delete_memory is not a ' +
-          'real tool; a memory id is not a document_id) — matched secrets cannot ' +
-          'be auto-scrubbed; redact manually via the bank UI',
-      )
+    async deleteMemory(bankId, memoryId) {
+      // Soft-delete the matched memory unit via the `invalidate_memory` MCP
+      // tool, which is the by-id single-memory primitive that was missing when
+      // the honest-failure stub was written. Unlike the phantom `delete_memory`
+      // or the document-granularity `delete_document`, `invalidate_memory`
+      // takes the memory-unit id directly from `list_memories` and marks it
+      // as redacted without requiring a document→memory mapping.
+      const sid = await initSession(bankId)
+      await callTool(bankId, sid, 'invalidate_memory', {
+        memory_id: memoryId,
+        reason: 'vault-sweep secret redaction',
+      })
     },
   }
 }

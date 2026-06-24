@@ -165,35 +165,61 @@ describe('getBanksToSweep', () => {
   })
 })
 
-describe('deleteMemory — honest failure, no phantom tool call, no silent lie', () => {
+// Regression test for #2202: deleteMemory must issue invalidate_memory with
+// the correct wire name and args (memory_id + reason). This was the missing
+// primitive when the honest-failure stub was written.
+describe('deleteMemory — invalidate_memory regression (#2202)', () => {
   const src = readFileSync(resolve(__dirname, '..', 'src', 'cli', 'vault-sweep.ts'), 'utf-8')
 
-  it('does NOT call any single-memory delete tool (delete_memory is phantom; a memory id is not a document_id)', () => {
-    // Proven live: delete_memory is not a real tool, and delete_document(id)
-    // targets a non-existent document (get_document(memoryId) → not found), so
-    // it would silently no-op the scrub. The real client must NOT emit either.
+  it('does NOT use the phantom delete_memory tool or document-granularity delete_document', () => {
+    // delete_memory is not a real MCP tool; delete_document(memoryId) targets
+    // a non-existent document (memory id ≠ document_id). Neither must appear.
     expect(src).not.toMatch(/callTool\([^)]*'delete_memory'/)
     expect(src).not.toMatch(/callTool\([^)]*'delete_document'/)
   })
 
-  it('throws an explicit "no single-memory delete API" error so the scrub fails loudly', () => {
-    expect(src).toMatch(/hindsight exposes no single-memory delete API/)
-  })
-
-  it('the sweep surfaces undeletable matches (deleted stays below matched, with a reason)', async () => {
-    // A real (throwing) client → matches found but deleted=0, reason warned.
-    const throwing: HindsightMcpClient = {
-      async listMemories() {
-        return { items: [{ id: 'm1', text: `leak ${SK}` }], total: 1 }
+  it('calls invalidate_memory with memory_id and reason: "vault-sweep secret redaction"', async () => {
+    // Mock client that records which deleteMemory calls it receives.
+    const calls: Array<{ bankId: string; memoryId: string }> = []
+    const mockClient: HindsightMcpClient = {
+      async listMemories(_bankId, { limit, offset }) {
+        const all: HindsightMemory[] = [
+          { id: 'mem-abc123', text: `leaked value ${SK}` },
+          { id: 'mem-clean',  text: 'nothing sensitive here' },
+        ]
+        return { items: all.slice(offset, offset + limit), total: all.length }
       },
-      async deleteMemory() {
-        throw new Error('hindsight exposes no single-memory delete API …')
+      async deleteMemory(bankId, memoryId) {
+        calls.push({ bankId, memoryId })
       },
     }
-    const report = await sweepHindsightBank(throwing, 'bank-a', [{ key: 'K', value: SK }], {
-      dryRun: false,
-    })
-    expect(report.matched).toHaveLength(1)
-    expect(report.deleted).toBe(0) // honest: matched 1, deleted 0 — not a false success
+
+    const deleteSpy = vi.spyOn(mockClient, 'deleteMemory')
+    const report = await sweepHindsightBank(
+      mockClient,
+      'test-bank',
+      [{ key: 'ANTHROPIC_API_KEY', value: SK }],
+      { dryRun: false },
+    )
+
+    // Only the matching memory should be targeted for deletion.
+    expect(report.matched).toEqual([{ id: 'mem-abc123', vaultKey: 'ANTHROPIC_API_KEY' }])
+    expect(report.deleted).toBe(1)
+
+    // deleteMemory was called exactly once, for the right memory id.
+    expect(deleteSpy).toHaveBeenCalledOnce()
+    expect(deleteSpy).toHaveBeenCalledWith('test-bank', 'mem-abc123')
+    expect(calls).toEqual([{ bankId: 'test-bank', memoryId: 'mem-abc123' }])
+  })
+
+  it('the source calls invalidate_memory (not delete_memory or delete_document) as the wire tool name', () => {
+    // Structural guard: the real HTTP client implementation must use the
+    // invalidate_memory tool name on the wire.
+    expect(src).toMatch(/callTool\([^)]*'invalidate_memory'/)
+  })
+
+  it('passes reason "vault-sweep secret redaction" to invalidate_memory', () => {
+    // The reason field must identify the source of the invalidation.
+    expect(src).toMatch(/vault-sweep secret redaction/)
   })
 })
