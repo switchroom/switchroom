@@ -174,4 +174,52 @@ describe('workflow sub-agent feed visibility', () => {
     // Exactly the three agents, no journals
     expect(watcher.getRegistry().size).toBe(3)
   })
+
+  it('skips a stray non-directory file sitting directly in workflows/', () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'switchroom-workflow-stray-test-'))
+    const agentDir = join(tmpRoot, 'agent')
+
+    const workflowsBase = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents', 'workflows')
+    mkdirSync(workflowsBase, { recursive: true })
+    // A stray regular file directly under workflows/ (e.g. an index/lock the
+    // Workflow tool might drop there). statSync succeeds on it, so without the
+    // isDirectory() guard it would be handed to watchAndScan and open a wasted
+    // fs.watch. It must be skipped — not registered — and not crash the scan.
+    writeFileSync(join(workflowsBase, 'index.json'), '{"runs":[]}')
+
+    // A real workflow agent alongside the stray file must still register
+    const wfDir = join(workflowsBase, 'wf_real')
+    mkdirSync(wfDir, { recursive: true })
+    const agentId = 'feedface00001111'
+    writeFileSync(join(wfDir, `agent-${agentId}.jsonl`), minimalAgentJsonl())
+
+    const { poll, watcher } = startWatcher(agentDir)
+    poll()
+
+    expect(watcher.getRegistry().get(agentId), 'real workflow agent should register').toBeDefined()
+    // Only the real agent — the stray file produced no entry
+    expect(watcher.getRegistry().size).toBe(1)
+  })
+
+  it('discovers a wf_* dir created AFTER the watcher starts (runtime poll)', () => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'switchroom-workflow-late-test-'))
+    const agentDir = join(tmpRoot, 'agent')
+
+    // Session + subagents dir present at boot, but no workflows/ run yet
+    const subagents = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+    mkdirSync(subagents, { recursive: true })
+
+    const { poll, watcher } = startWatcher(agentDir)
+    poll() // boot scan: nothing to register
+    expect(watcher.getRegistry().size).toBe(0)
+
+    // A workflow run begins after the watcher is already live
+    const wfDir = join(subagents, 'workflows', 'wf_late')
+    mkdirSync(wfDir, { recursive: true })
+    const agentId = 'lateb00b1234abcd'
+    writeFileSync(join(wfDir, `agent-${agentId}.jsonl`), minimalAgentJsonl())
+
+    poll() // next poll tick re-descends workflows/ and picks it up
+    expect(watcher.getRegistry().get(agentId), 'late workflow agent should be discovered on poll').toBeDefined()
+  })
 })

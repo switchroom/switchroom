@@ -1612,7 +1612,11 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
           for (const wfDir of wfDirs) {
             try {
               const wfPath = join(workflowsPath, wfDir)
-              fs.statSync(wfPath) // throws if not a directory-like entry
+              // Only descend into actual directories. statSync succeeds on
+              // regular files too (e.g. a stray journal.jsonl or lock file
+              // sitting directly in workflows/), so check isDirectory()
+              // explicitly rather than relying on a throw that never comes.
+              if (!fs.statSync(wfPath).isDirectory()) continue
               watchAndScan(wfPath)
             } catch { /* skip entries we can't stat or watch */ }
           }
