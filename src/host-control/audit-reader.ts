@@ -50,6 +50,12 @@ export interface AuditEntry {
   failed_step?: string;
   /** Agent that failed the version assert (rollout rows). */
   failed_agent?: string;
+  // ─── Prior-pin capture (#2492) ────────────────────────────────────
+  /** Semver that WAS running before this rollout completed. Only present
+   *  on completed (ok=true) rollout terminal rows. Enables
+   *  `rollout --allow-downgrade` to default its target to the last good
+   *  version without the operator having to recall the tag. */
+  prior_pin?: string;
 }
 
 export interface AuditFilters {
@@ -134,6 +140,8 @@ export function parseAuditLine(line: string): AuditEntry | null {
   }
   if (typeof o.failed_step === "string") entry.failed_step = o.failed_step;
   if (typeof o.failed_agent === "string") entry.failed_agent = o.failed_agent;
+  // Prior-pin capture (#2492) — present only on completed rollout terminal rows.
+  if (typeof o.prior_pin === "string") entry.prior_pin = o.prior_pin;
   return entry;
 }
 

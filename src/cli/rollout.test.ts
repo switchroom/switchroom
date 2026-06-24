@@ -8,6 +8,9 @@
  * injected side-effects so this runs without docker.
  */
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   normalizeVersion,
@@ -20,6 +23,7 @@ import {
   parseRolloutResultLine,
   shouldRefuseDowngrade,
   shouldRefuseStaleCli,
+  resolveRollbackTarget,
   PREFLIGHT_STALE_CLI_STEP,
   ROLLOUT_RESULT_SENTINEL,
   type RolloutDeps,
@@ -482,5 +486,85 @@ describe("executeRollout — ROLL_STEP greppable step markers (#2459)", () => {
     const { deps, logs } = harness({ versions: { clerk: "0.15.18" } });
     executeRollout(steps, TARGET, deps);
     expect(logs.some((l) => l.startsWith("ROLL_STEP persist-pin"))).toBe(true);
+  });
+});
+
+// ── #2492 prior_pin capture + resolveRollbackTarget ─────────────────────────
+
+describe("resolveRollbackTarget (#2492)", () => {
+  /** Build a minimal completed-rollout terminal audit line with a prior_pin. */
+  function completedRolloutLine(priorPin: string, requestId = "roll-1"): string {
+    return JSON.stringify({
+      ts: "2026-06-01T00:00:00.000Z",
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "operator" },
+      request_id: requestId,
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 12345,
+      prior_pin: priorPin,
+    });
+  }
+
+  /** Build a rollout terminal audit line WITHOUT prior_pin (e.g. error row). */
+  function failedRolloutLine(requestId = "roll-bad"): string {
+    return JSON.stringify({
+      ts: "2026-06-01T00:01:00.000Z",
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "operator" },
+      request_id: requestId,
+      result: "error",
+      exit_code: 1,
+      duration_ms: 3000,
+    });
+  }
+
+  it("returns the prior_pin from the most-recent completed rollout terminal row", () => {
+    const logContent =
+      completedRolloutLine("v0.15.16", "roll-1") +
+      "\n" +
+      completedRolloutLine("v0.15.17", "roll-2") +
+      "\n";
+    const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
+    const logPath = join(tmp, "audit.log");
+    writeFileSync(logPath, logContent);
+    const result = resolveRollbackTarget(logPath);
+    // Most-recent completed row is roll-2 with prior_pin v0.15.17.
+    expect(result).toBe("v0.15.17");
+  });
+
+  it("skips error rows (no prior_pin) and finds the last completed row", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
+    const logPath = join(tmp, "audit.log");
+    const logContent =
+      completedRolloutLine("v0.15.16", "roll-1") +
+      "\n" +
+      failedRolloutLine("roll-bad") +
+      "\n";
+    writeFileSync(logPath, logContent);
+    // Most-recent terminal row is a failed one (no prior_pin); should fall
+    // back to the earlier completed row.
+    const result = resolveRollbackTarget(logPath);
+    expect(result).toBe("v0.15.16");
+  });
+
+  it("returns null when no completed rollout rows exist", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
+    const logPath = join(tmp, "audit.log");
+    writeFileSync(logPath, failedRolloutLine() + "\n");
+    expect(resolveRollbackTarget(logPath)).toBeNull();
+  });
+
+  it("returns null when the audit log does not exist", () => {
+    expect(resolveRollbackTarget("/nonexistent/path/audit.log")).toBeNull();
+  });
+
+  it("returns null when the log is empty", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "prior-pin-test-"));
+    const logPath = join(tmp, "audit.log");
+    writeFileSync(logPath, "");
+    expect(resolveRollbackTarget(logPath)).toBeNull();
   });
 });

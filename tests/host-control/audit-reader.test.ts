@@ -356,3 +356,58 @@ describe("parseAuditLine — persisted tails (#22)", () => {
     expect(e!.install_context).toBeUndefined();
   });
 });
+
+describe("parseAuditLine — prior_pin capture (#2492)", () => {
+  it("round-trips prior_pin on a completed rollout terminal row", () => {
+    const row = {
+      ts: "2026-06-01T00:00:00.000Z",
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "operator" },
+      request_id: "roll-1",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 12345,
+      prior_pin: "v0.15.16",
+    };
+    const e = parseAuditLine(JSON.stringify(row));
+    expect(e).not.toBeNull();
+    expect(e!.prior_pin).toBe("v0.15.16");
+    expect(e!.phase).toBe("terminal");
+    expect(e!.result).toBe("completed");
+  });
+
+  it("silently ignores prior_pin when wrong type (non-string)", () => {
+    const row = {
+      ts: "2026-06-01T00:00:00.000Z",
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "operator" },
+      request_id: "roll-bad",
+      result: "completed",
+      exit_code: 0,
+      duration_ms: 1,
+      prior_pin: 42, // wrong type — must be silently dropped
+    };
+    const e = parseAuditLine(JSON.stringify(row));
+    expect(e).not.toBeNull();
+    expect(e!.prior_pin).toBeUndefined();
+  });
+
+  it("absent prior_pin on an error row (intentional design — strip on failure)", () => {
+    const row = {
+      ts: "2026-06-01T00:01:00.000Z",
+      op: "rollout",
+      phase: "terminal",
+      caller: { kind: "operator" },
+      request_id: "roll-err",
+      result: "error",
+      exit_code: 1,
+      duration_ms: 500,
+      // no prior_pin field
+    };
+    const e = parseAuditLine(JSON.stringify(row));
+    expect(e).not.toBeNull();
+    expect(e!.prior_pin).toBeUndefined();
+  });
+});

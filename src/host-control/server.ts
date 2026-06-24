@@ -56,7 +56,7 @@ import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
-import { parseRolloutResultLine } from "../cli/rollout.js";
+import { parseRolloutResultLine, isVersionAssertable } from "../cli/rollout.js";
 import { parseUpdateResultLine } from "../cli/update.js";
 import { parseAuditLine } from "./audit-reader.js";
 import {
@@ -207,6 +207,14 @@ interface StatusEntry {
   // SWITCHROOM_UPDATE_RESULT sentinel from the child's stdout. Absent
   // when no steps were deferred (non-hostd-context run or older driver).
   deferred?: string[];
+  // ─── Rollback prior-pin capture (#2492) ─────────────────────────────
+  // The version-assertable semver that WAS running before this rollout
+  // completed. Stamped on COMPLETED rollout terminal rows only — a failed
+  // canary roll does not change the running version, so prior_pin is
+  // intentionally absent on error rows. Enables `rollout --allow-downgrade`
+  // to default its target to "the last good one" without the operator
+  // having to remember the version string.
+  prior_pin?: string;
 }
 
 /**
@@ -1372,6 +1380,24 @@ export class HostdServer {
       this.opts.bindRoot ?? this.opts.homeDir,
     );
 
+    // Capture the version that is currently running BEFORE this roll
+    // begins. Used to stamp `prior_pin` on the completed terminal row so
+    // a subsequent `rollout --allow-downgrade` can default its target to
+    // "the last good one" without the operator having to recall the tag.
+    // Best-effort: read the durable release.pin from config (the version
+    // last pinned by a prior completed rollout). If the config has no
+    // version-assertable pin we record nothing — `prior_pin` is optional.
+    let priorPin: string | undefined;
+    try {
+      const cfg = loadConfig(this.opts.configPath);
+      const cfgPin = (cfg as { release?: { pin?: string } }).release?.pin;
+      if (cfgPin && isVersionAssertable(cfgPin)) {
+        priorPin = cfgPin.startsWith("v") ? cfgPin : `v${cfgPin}`;
+      }
+    } catch {
+      // loadConfig throws on a malformed yaml; proceed without prior_pin.
+    }
+
     const entry: StatusEntry = {
       request_id: req.request_id,
       caller,
@@ -1387,6 +1413,7 @@ export class HostdServer {
         install_type: installCtx.install_type,
         detected_at: installCtx.detected_at,
       },
+      ...(priorPin ? { prior_pin: priorPin } : {}),
     };
     this.recordStatus(entry);
     this.fleetMutationInFlight = {
@@ -2340,12 +2367,20 @@ export class HostdServer {
           // reader can tell the outcome wasn't cleanly captured.
           entry.result = res.exit_code === 0 ? "completed" : "error";
         }
+        // prior_pin is only meaningful on COMPLETED rows (#2492): a failed
+        // canary roll does NOT change the running pin, so recording a
+        // prior_pin on an error row would mislead subsequent --allow-downgrade
+        // defaulting logic into thinking the roll succeeded. Strip it on failure.
+        if (entry.result !== "completed") {
+          delete entry.prior_pin;
+        }
       })
       .catch((err) => {
         entry.result = "error";
         entry.exit_code = null;
         entry.finished_at = Date.now();
         entry.error = (err as Error).message;
+        delete entry.prior_pin;
       })
       .finally(() => {
         void this.writeTerminalAudit(entry);
@@ -2564,6 +2599,8 @@ export class HostdServer {
       ...(entry.got !== undefined ? { got: entry.got } : {}),
       // Update-apply deferral result (#2458) — only on update_apply rows.
       ...(entry.deferred ? { deferred: entry.deferred } : {}),
+      // Prior-pin capture (#2492) — only on completed rollout rows.
+      ...(entry.prior_pin ? { prior_pin: entry.prior_pin } : {}),
     });
   }
 
