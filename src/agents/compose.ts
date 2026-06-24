@@ -118,15 +118,20 @@ export interface ResourceDefaults {
 //   - cpus           CPU quota (Docker `cpus`).
 //
 // These are starting points; operators override per-agent via the
-// schema's `resources` block (PR #1190). Total host commitment under
-// the canonical 9-agent fleet (1 klanker + 8 conversational): 6 + 8×1.5
-// = 18 GB hard cap; 4 + 8×0.256 = ~6 GB protected from reclaim. Well
-// under the 60 GB host capacity, leaves plenty for Coolify co-tenants.
+// schema's `resources` block (PR #1190). memLimit is a hard cap
+// (cgroup memory.max), NOT a reservation — agents won't OOM-kill unless
+// they actually hit the ceiling. Raised 2026-06-25 after the 2026-06-24
+// incident where the 1.5g default cap OOM-killed the claude process
+// mid-turn during in-container bun+vitest builds. Worst-case total under
+// a 9-agent fleet (1 klanker + 8 conversational): 8 + 8×3 = 32 GB hard
+// cap; 4 + 8×0.256 = ~6 GB protected from reclaim. Well under the 60 GB
+// host capacity; overlord and other per-agent overrides are set separately
+// in switchroom.yaml and are not reflected here.
 const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
-  klanker: { memLimit: "6g", memReservation: "4g", pidsLimit: 2000, cpus: 2.0 },
+  klanker: { memLimit: "8g", memReservation: "4g", pidsLimit: 2000, cpus: 2.0 },
   // Conversational profiles — clerk, finn, carrie, coach, etc.
   conversational: {
-    memLimit: "1.5g",
+    memLimit: "3g",
     memReservation: "256m",
     pidsLimit: 500,
     cpus: 1.0,
@@ -140,14 +145,14 @@ const RESOURCE_BY_PROFILE: Record<string, ResourceDefaults> = {
   },
   // Coding/worker/researcher.
   coding: {
-    memLimit: "2g",
+    memLimit: "4g",
     memReservation: "512m",
     pidsLimit: 1000,
     cpus: 2.0,
   },
   // Catch-all default.
   default: {
-    memLimit: "1.5g",
+    memLimit: "3g",
     memReservation: "256m",
     pidsLimit: 500,
     cpus: 1.0,

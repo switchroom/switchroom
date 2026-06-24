@@ -92,13 +92,13 @@ describe("parseMemToMib", () => {
 describe("resolveResourceDefaults — cron-session bump", () => {
   it("no bump without cronSession (fleet default — byte-identical)", () => {
     const r = resolveResourceDefaults("clerk", "default");
-    expect(r.memLimit).toBe("1.5g");
+    expect(r.memLimit).toBe("3g");
     expect(r.pidsLimit).toBe(500);
   });
 
   it("bumps mem +512M and pids +128 for a cron-session agent on defaults", () => {
     const r = resolveResourceDefaults("clerk", "default", undefined, { cronSession: true });
-    expect(r.memLimit).toBe("2048m"); // 1536 + 512
+    expect(r.memLimit).toBe("3584m"); // 3072 + 512
     expect(r.pidsLimit).toBe(628); // 500 + 128
   });
 
