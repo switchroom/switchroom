@@ -246,7 +246,8 @@ export function clipNarrative(s: string): string {
  * `description` — italicised task description (optional)
  * `elapsedMs`   — wall-clock elapsed, rendered via `formatFeedElapsed`
  * `toolCount`   — labeled tool calls this turn
- * `state`       — 'running' | 'done' (controls the status line wording)
+ * `state`       — 'running' | 'done' | 'failed' (controls the status line wording;
+ *                 'failed' renders `failed · …` so a failed worker never reads as done)
  *
  * Returns a two-element array of ready Telegram HTML lines (no trailing newline).
  */
@@ -256,15 +257,15 @@ export function renderActivityHeader(
   description: string,
   elapsedMs: number,
   toolCount: number,
-  state: 'running' | 'done',
+  state: 'running' | 'done' | 'failed',
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
   const elapsed = formatFeedElapsed(elapsedMs)
   const descPart = description.length > 0 ? ` · <i>${escapeHtml(description)}</i>` : ''
   const line1 = `${emoji} <b>${escapeHtml(label)}</b>${descPart}`
-  const line2 = state === 'done'
-    ? `<i>done · ${toolCount} ${toolWord} · ${elapsed}</i>`
-    : `<i>${elapsed} · ${toolCount} ${toolWord}</i>`
+  const line2 = state === 'running'
+    ? `<i>${elapsed} · ${toolCount} ${toolWord}</i>`
+    : `<i>${state} · ${toolCount} ${toolWord} · ${elapsed}</i>`
   return [line1, line2]
 }
 
@@ -381,9 +382,11 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
         header.description ?? '',
         header.elapsedMs,
         header.toolCount,
-        // The header builder only distinguishes done vs running; map 'failed' → done
-        // (the result block carries the failure emoji/text).
-        header.state === 'running' ? 'running' : 'done',
+        // Thread the terminal state straight through so a failed worker reads
+        // `failed · …` on line 2 — never byte-identical to a done worker even
+        // when the result block is empty. The agent surface never passes
+        // 'failed', so only the worker card is affected.
+        header.state,
       )
     : []
 

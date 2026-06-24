@@ -120,9 +120,26 @@ describe('renderWorkerActivity', () => {
 
   it('renders a failed terminal recap', () => {
     const out = renderWorkerActivity(view({ state: 'failed', latestSummary: 'blew up' }))
-    // Failed maps to the "done" header word; the ⚠️ result carries the failure.
-    expect(out).toContain('<i>done · ')
+    // The header word reflects the failure (`failed · …`) AND the ⚠️ result
+    // block carries the detail — the two signals are complementary.
+    expect(out).toContain('<i>failed · ')
+    expect(out).not.toContain('<i>done · ')
     expect(out).toContain('⚠️ <i>blew up</i>')
+  })
+
+  it('a failed worker with EMPTY result is never byte-identical to a done worker (regression: #2553 failure-honesty)', () => {
+    // Detail-less terminal error: resultText === '' (subagent-watcher path).
+    const failed = renderWorkerActivity(view({ state: 'failed', latestSummary: '' }))
+    const done = renderWorkerActivity(view({ state: 'done', latestSummary: '' }))
+    // (a) The two renders must differ — the failure signal cannot vanish.
+    expect(failed).not.toBe(done)
+    // (b) The failed render carries a visible failure marker even with no
+    //     result block (the `failed` header word and/or the ⚠️ emoji).
+    expect(failed.includes('failed') || failed.includes('⚠️')).toBe(true)
+    expect(failed).toContain('<i>failed · ')
+    // The done render must NOT read as failed.
+    expect(done).toContain('<i>done · ')
+    expect(done).not.toContain('failed')
   })
 
   it('omits the rule + result line when the terminal result is empty', () => {
