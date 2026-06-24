@@ -168,7 +168,18 @@ export interface WorkerEntry {
    * pure decision lives in narrative-dedup.ts; this slot is the per-entry
    * cursor. Mirrors the gateway's `turn.pendingNarrative`.
    */
-  pendingNarrative?: { text: string; lastInMessage: boolean } | null
+  pendingNarrative?: { text: string } | null
+  /**
+   * NIT 3 (sub-agent turn_end symmetry). Most-recently-seen
+   * reply/stream_reply `input.text` for this sub-agent — the actual answer a
+   * FOREGROUND sub-agent delivered. `sub_agent_turn_end` resolves a trailing
+   * `sub_agent_text` block against THIS so a draft of the just-delivered
+   * answer is suppressed the same way main-agent step 3 does (conservative
+   * dedup). Undefined for background workers that never call a reply tool —
+   * their trailing narration still SHOWs, unchanged. Mirrors the gateway's
+   * `turn.lastReplyText`.
+   */
+  lastReplyText?: string
 }
 
 export interface SubagentWatcherConfig {
@@ -810,9 +821,20 @@ export function readSubTail(
         }
       }
       // Resolve a pending sub-agent narrative against a lookahead event.
-      // SUPPRESS only when the lookahead is a reply/stream_reply tool whose
-      // text the pending block drafts; otherwise SHOW (fire the cue). See
-      // narrative-dedup.ts §2b.
+      // SUPPRESS only when the pending block drafts a reply/stream_reply
+      // tool's text; otherwise SHOW (fire the cue). See narrative-dedup.ts §2b.
+      //
+      // Two lookahead shapes:
+      //   - sub_agent_tool_use: `toolName`/`toolInput` are the tool — suppress
+      //     a draft of THIS tool's reply text.
+      //   - sub_agent_turn_end: `toolName` is null. NIT 3 (turn_end symmetry):
+      //     a FOREGROUND sub-agent that called stream_reply/reply as its final
+      //     tool then emitted a trailing text block would, under the old
+      //     unconditional SHOW, surface a draft of the delivered answer. So at
+      //     turn_end we apply the SAME conservative dedup as main-agent step 3:
+      //     compare the trailing block against the worker's last reply text
+      //     (`entry.lastReplyText`) and suppress a draft. Background workers
+      //     never set lastReplyText, so their trailing narration still SHOWs.
       const resolvePendingSubNarrative = (
         toolName: string | null,
         toolInput: Record<string, unknown> | undefined,
@@ -823,6 +845,9 @@ export function readSubTail(
         if (toolName != null && REPLY_TOOLS.has(toolName)) {
           const replyText = typeof toolInput?.text === 'string' ? (toolInput.text as string) : ''
           if (isDraftOfReply(pending.text, replyText)) return // draft of the reply → SUPPRESS
+        } else if (toolName == null && entry.lastReplyText != null && entry.lastReplyText.length > 0) {
+          // turn_end path: suppress a trailing draft of the delivered answer.
+          if (isDraftOfReply(pending.text, entry.lastReplyText)) return
         }
         fireNarrativeProgress()
       }
@@ -871,6 +896,12 @@ export function readSubTail(
           // a reply tool's text). Runs before the tool's own progress cue so
           // a working preamble surfaces just ahead of its tool step.
           resolvePendingSubNarrative(ev.toolName, ev.input)
+          // NIT 3: capture a foreground sub-agent's actual reply text so the
+          // turn_end path can suppress a trailing draft of it (see
+          // resolvePendingSubNarrative). Only REPLY_TOOLS carry the answer.
+          if (REPLY_TOOLS.has(ev.toolName) && typeof ev.input?.text === 'string') {
+            entry.lastReplyText = ev.input.text as string
+          }
           entry.toolCount++
           // P0 of #662: surface the most recent tool name + sanitised
           // arg so the driver's fleet-state shadow can render the
@@ -940,13 +971,16 @@ export function readSubTail(
           if (entry.pendingNarrative != null) {
             fireNarrativeProgress() // prior pending was pure narration → SHOW
           }
-          entry.pendingNarrative = { text: ev.text, lastInMessage: ev.lastInMessage }
+          entry.pendingNarrative = { text: ev.text }
         } else if (ev.kind === 'sub_agent_turn_end') {
           // Narrative-dedup gate step 3: a trailing sub_agent_text block with
-          // nothing after it. SUPPRESS only when it drafts the worker's final
-          // narrative reply; otherwise SHOW. The worker's result is carried
-          // separately via lastResultText/onFinish, so a SHOWN trailing cue
-          // here is purely the transient liveness beat.
+          // nothing after it. SUPPRESS only when it drafts the foreground
+          // sub-agent's delivered reply (entry.lastReplyText, set above on a
+          // REPLY_TOOL tool_use) — symmetric with main-agent step 3; otherwise
+          // SHOW. Background workers never set lastReplyText, so their trailing
+          // narration still SHOWs. The worker's result is carried separately
+          // via lastResultText/onFinish, so a SHOWN trailing cue here is purely
+          // the transient liveness beat.
           resolvePendingSubNarrative(null, undefined)
           if (entry.state === 'running') {
             entry.state = 'done'

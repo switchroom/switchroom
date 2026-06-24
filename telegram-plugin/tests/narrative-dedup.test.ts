@@ -83,5 +83,36 @@ describe('narrative-dedup', () => {
       expect(normalizeNarrative(draft)).toBe(normalizeNarrative(reply))
       expect(isDraftOfReply(draft, reply)).toBe(true)
     })
+
+    it('NIT 2: the doubled-capturedText proxy mis-suppresses; the actual reply text does not', () => {
+      // The bug: flushPendingNarrativeAtTurnEnd used to compare a trailing
+      // narration against capturedText.join(''). When the model emits the same
+      // short string twice in a turn — e.g. "Done." as working narration and
+      // then "Done." as the reply — that proxy becomes the CONCATENATION
+      // "Done.Done.", whose prefix the trailing narration still matches above
+      // threshold → genuine trailing narration WRONGLY suppressed.
+      const trailing = 'Done.'
+      const doubledProxy = 'Done.' + 'Done.' // capturedText.join('') of two "Done." blocks
+      const actualReply = 'Done.'
+
+      // Old (broken) comparison: trailing vs the doubled proxy → wrongly suppresses.
+      expect(isDraftOfReply(trailing, doubledProxy)).toBe(true)
+
+      // New comparison: trailing vs the ACTUAL reply text. Here the reply text
+      // really IS "Done.", so a trailing "Done." is a genuine duplicate and is
+      // correctly suppressed — the fix preserves the common-case suppression.
+      expect(isDraftOfReply(trailing, actualReply)).toBe(true)
+    })
+
+    it('NIT 2: genuine trailing narration is preserved when the reply text differs', () => {
+      // The case the proxy hurt most: the turn's reply is a SHORT distinct
+      // string and the trailing narration is genuine liveness. Comparing
+      // against the actual reply text (not a concatenation that happens to
+      // share a prefix) keeps the trailing narration SHOWN.
+      const trailingNarration = 'Done — all green, pushing now.'
+      const actualReply = 'Here is the summary you asked for: 3 files changed.'
+      // Below threshold against the real reply → SHOW (not suppressed).
+      expect(isDraftOfReply(trailingNarration, actualReply)).toBe(false)
+    })
   })
 })

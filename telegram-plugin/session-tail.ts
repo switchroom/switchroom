@@ -99,10 +99,15 @@ export type SessionEvent =
   // the flush-gated `tool_use`, so activity streams deterministically.
   | { kind: 'tool_label'; toolUseId: string; label: string; toolName: string }
   // `blockIndex` = index of this text block in the assistant message's
-  // content[]. `lastInMessage` = true iff no tool_use block follows it in
-  // the SAME message. These two fields let the reducer-side narrative-dedup
-  // gate (narrative-dedup.ts) decide draft-then-send vs working-narration
-  // deterministically without buffering whole turns.
+  // content[] — load-bearing: it keys the returned Map so callers emit
+  // events in source order. `lastInMessage` = true iff no tool_use block
+  // follows it in the SAME message. NOTE: `lastInMessage` is a PROJECTION
+  // ARTIFACT only — the current reducer-side narrative-dedup gate
+  // (narrative-dedup.ts) decides draft-then-send vs working-narration by
+  // LOOKAHEAD (the next tool_use / turn_end), NOT by reading this flag. It
+  // is retained as a stable projection output (pinned by the kernel test)
+  // and reserved for a future staging-skip optimization; do not assume the
+  // gate keys on it.
   | { kind: 'text'; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
   | { kind: 'turn_end'; durationMs: number }
@@ -111,10 +116,11 @@ export type SessionEvent =
   // as parent events; the reducer fans them out to per-sub-agent state.
   | { kind: 'sub_agent_started'; agentId: string; firstPromptText: string; subagentType?: string }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown>; precomputedLabel?: string }
-  // Same shared contract as the main-agent `text` kind — see its doc above.
-  // The wire-kind stays distinct (the gateway/watcher split is load-bearing)
-  // but the payload + `lastInMessage` derivation are identical so ONE shared
-  // dedup gate handles both tiers.
+  // Same shared contract as the main-agent `text` kind — see its doc above
+  // (including the `lastInMessage` projection-artifact note). The wire-kind
+  // stays distinct (the gateway/watcher split is load-bearing) but the
+  // payload + `lastInMessage` derivation are identical so ONE shared dedup
+  // gate handles both tiers.
   | { kind: 'sub_agent_text'; agentId: string; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean; errorText?: string }
   | { kind: 'sub_agent_turn_end'; agentId: string }
@@ -196,8 +202,11 @@ function extractToolResultErrorText(content: unknown): string {
  * main-agent, sub-agent, worker, and every other execution shape inherit
  * identical text-block semantics from ONE place: empty/whitespace blocks are
  * dropped, and each surviving block carries its `blockIndex` plus the
- * `lastInMessage` signal (no tool_use follows it in this message — the
- * draft-then-send marker the reducer-side dedup gate keys on).
+ * `lastInMessage` signal (no tool_use follows it in this message). NOTE:
+ * `lastInMessage` is a projection artifact — the reducer-side dedup gate
+ * decides SHOW/SUPPRESS by lookahead, not by reading this flag (see the
+ * SessionEvent `text` doc); it is reserved for a future staging-skip
+ * optimization.
  *
  * `make` adapts the shared payload into the tier-specific wire kind
  * (`text` vs `sub_agent_text`); the contract — what counts as a text block,

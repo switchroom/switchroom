@@ -599,6 +599,73 @@ describe('startSubagentWatcher', () => {
       expect(narrativeCues[0]).toContain('All green')
     })
 
+    it('NIT 3: trailing narration that DRAFTS a prior stream_reply is SUPPRESSED at turn_end', () => {
+      // A FOREGROUND sub-agent calls stream_reply as its final tool, THEN
+      // emits a trailing text block that is a draft of that delivered answer,
+      // then turn_end. Before the fix, turn_end SHOWed pending narration
+      // unconditionally (toolName === null skipped dedup), double-surfacing a
+      // draft of the answer. Now it suppresses a trailing draft symmetric with
+      // main-agent step 3.
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          if (progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
+      h.poll()
+      const answer = 'The fix touches three files and adds a unit test for the double-Done case.'
+      // Final tool of the turn is stream_reply carrying the answer.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
+      }))
+      h.poll()
+      // Trailing text block (separate message) that drafts the delivered answer.
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText(answer)))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
+      h.poll()
+      // SUPPRESSED: the trailing draft of the reply is not surfaced.
+      expect(narrativeCues.length).toBe(0)
+    })
+
+    it('NIT 3: genuine trailing narration AFTER a stream_reply is still SHOWN', () => {
+      // Symmetric guard: after delivering its answer the sub-agent emits a
+      // DIFFERENT trailing line ("Done — cleaning up."). That is genuine
+      // liveness, not a draft of the answer, so it must still SHOW.
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          if (progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Summarise the diff')))
+      h.poll()
+      const answer = 'The fix touches three files and adds a unit test for the double-Done case.'
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
+      }))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText('Done — cleaning up the worktree now.')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
+      h.poll()
+      expect(narrativeCues.length).toBe(1)
+      expect(narrativeCues[0]).toContain('cleaning up')
+    })
+
     it('captures the full last narrative line into lastResultText (handback)', () => {
       // lastSummaryLine keeps only the first line, 120 chars — a progress
       // preview. lastResultText keeps the full last narrative emission:
