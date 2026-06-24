@@ -34,6 +34,7 @@
 
 import { spawnSync } from "node:child_process";
 import { readFileSync, chownSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import type { Command } from "commander";
 import { getConfig, getConfigPath } from "./helpers.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
@@ -41,6 +42,7 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
+import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -463,6 +465,40 @@ export function executeRollout(
   return { ok: true, rolled, warnings };
 }
 
+/**
+ * Resolve the default rollback target from the audit log (#2492).
+ *
+ * When `rollout --allow-downgrade` is invoked with NO `--pin`, we look for
+ * the most-recent COMPLETED rollout terminal row that carries a `prior_pin`
+ * and use that as the downgrade target. This is the "roll back to the last
+ * good one" affordance — the operator doesn't need to recall the version.
+ *
+ * Returns `null` when no such row exists (fresh fleet, no prior rollout, or
+ * all prior rollouts failed), in which case the caller should require `--pin`.
+ *
+ * Exported for unit testing.
+ */
+export function resolveRollbackTarget(auditLogPath?: string): string | null {
+  const logPath = auditLogPath ?? defaultAuditLogPath(homedir());
+  let raw: string;
+  try {
+    raw = readFileSync(logPath, "utf8");
+  } catch {
+    return null;
+  }
+  // Read all rollout terminal completed rows (most-recent at the end).
+  const entries = readAndFilter(raw, { op: "rollout" }, 1000);
+  // Walk from the most-recent backwards; the first completed terminal row
+  // with a prior_pin is our target.
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i]!;
+    if (e.phase === "terminal" && e.result === "completed" && e.prior_pin) {
+      return e.prior_pin;
+    }
+  }
+  return null;
+}
+
 export function registerRolloutCommand(program: Command): void {
   const hostdCtx = isHostdContext();
   program
@@ -490,12 +526,29 @@ export function registerRolloutCommand(program: Command): void {
     .option("--dry-run", "Print the plan and exit without changing anything.")
     .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; allowDowngrade?: boolean; dryRun?: boolean }) => {
       const config = getConfig(program);
-      const target = opts.pin ?? config.release?.pin;
+      // #2492 — when --allow-downgrade is set but no --pin was given, default
+      // the target to the last completed rollout's prior_pin (the version that
+      // was running before that roll). This is the "rollback to last good"
+      // affordance: the operator doesn't have to remember the version string.
+      let resolvedPin = opts.pin;
+      if (opts.allowDowngrade && !resolvedPin) {
+        const priorTarget = resolveRollbackTarget();
+        if (priorTarget) {
+          process.stdout.write(
+            `ℹ️  No --pin given with --allow-downgrade; defaulting to prior_pin from last completed rollout: ${priorTarget}\n`,
+          );
+          resolvedPin = priorTarget;
+        }
+      }
+      const target = resolvedPin ?? config.release?.pin;
       if (!target) {
         process.stderr.write(
-          "rollout needs a pinned version: pass --pin vX.Y.Z, or set " +
-            "`release.pin` in switchroom.yaml. (A floating channel has no " +
-            "fixed version to assert against.)\n",
+          opts.allowDowngrade
+            ? "rollout --allow-downgrade needs a target: pass --pin vX.Y.Z, or run " +
+                "a successful rollout first so prior_pin is available as the default.\n"
+            : "rollout needs a pinned version: pass --pin vX.Y.Z, or set " +
+                "`release.pin` in switchroom.yaml. (A floating channel has no " +
+                "fixed version to assert against.)\n",
         );
         process.exitCode = 2;
         return;
@@ -555,10 +608,11 @@ export function registerRolloutCommand(program: Command): void {
       // set (the operator-approved rollback path). compareReleaseTags is
       // conservative: it only refuses a clean vX.Y.Z → older-vX.Y.Z move,
       // never a channel/sha (those return null and never block).
-      if (shouldRefuseDowngrade(hostdCtx, opts.pin, config.release?.pin, opts.allowDowngrade)) {
+      // Use resolvedPin (which may have been auto-filled from prior_pin).
+      if (shouldRefuseDowngrade(hostdCtx, resolvedPin, config.release?.pin, opts.allowDowngrade)) {
         const current = config.release?.pin;
         process.stderr.write(
-          `rollout (hostd path) refuses a DOWNGRADE: ${opts.pin} is older ` +
+          `rollout (hostd path) refuses a DOWNGRADE: ${resolvedPin} is older ` +
             `than the current pin ${current}. Pass --allow-downgrade to ` +
             `authorize an operator-approved rollback to a known-good earlier ` +
             `tag. Nothing was changed.\n`,
@@ -569,7 +623,7 @@ export function registerRolloutCommand(program: Command): void {
       if (opts.allowDowngrade) {
         const current = config.release?.pin;
         process.stdout.write(
-          `⤵ DOWNGRADE authorized (operator-approved rollback): ${current ?? "<unpinned>"} → ${opts.pin ?? target}\n`,
+          `⤵ DOWNGRADE authorized (operator-approved rollback): ${current ?? "<unpinned>"} → ${target}\n`,
         );
       }
       const allAgents = Object.keys(config.agents ?? {});
@@ -588,11 +642,12 @@ export function registerRolloutCommand(program: Command): void {
         return;
       }
 
-      // Persist the pin durably only when the operator passed --pin; a
-      // target read from config.release.pin is already persisted.
+      // Persist the pin durably only when a pin was explicitly given (either
+      // via --pin or auto-resolved from prior_pin); a target read from
+      // config.release.pin is already persisted.
       const steps = planRollout(requested, {
         skipWeb: opts.skipWeb,
-        pinToPersist: opts.pin ?? undefined,
+        pinToPersist: resolvedPin ?? undefined,
         hostdContext: hostdCtx,
       });
 
@@ -700,5 +755,50 @@ export function registerRolloutCommand(program: Command): void {
         `\n✅ Rollout complete — ${result.rolled.length} agent(s) on ${target}` +
           `${result.warnings.length ? ` (with ${result.warnings.length} warning(s) above)` : ""}.\n`,
       );
+    });
+}
+
+/**
+ * Thin `rollback` alias — ergonomic shorthand for
+ * `rollout --allow-downgrade [--pin <version>]` (#2492).
+ *
+ * Registered as a separate subcommand so operators can say
+ * `switchroom rollback` instead of the longer form. Semantics:
+ *   - If `--to` is given, passes it as `--pin` to the rollout action.
+ *   - If `--to` is omitted, the rollout action auto-resolves the target
+ *     from the last completed rollout's `prior_pin`.
+ * All other rollout safety rails (canary, version-assert, stop-on-
+ * mismatch, downgrade guard relaxed exactly once by --allow-downgrade)
+ * apply unchanged.
+ */
+export function registerRollbackCommand(program: Command): void {
+  program
+    .command("rollback")
+    .description(
+      "Roll the fleet back to the previous version (operator-approved downgrade). " +
+        "Defaults to the version captured in the last completed rollout's prior_pin. " +
+        "Equivalent to `rollout --allow-downgrade [--pin <version>]`.",
+    )
+    .option(
+      "--to <version>",
+      "Explicit version to roll back to (e.g. v0.15.17). " +
+        "Omit to use the last completed rollout's prior_pin.",
+    )
+    .option(
+      "--agents <list>",
+      "Comma-separated subset of agents to roll back (default: all configured).",
+    )
+    .option("--skip-web", "Skip the web + hostd refresh step.")
+    .option("--dry-run", "Print the plan and exit without changing anything.")
+    .action(async (opts: { to?: string; agents?: string; skipWeb?: boolean; dryRun?: boolean }) => {
+      // Delegate entirely to the rollout action with --allow-downgrade.
+      // Build the args array and re-invoke via the program's rollout subcommand.
+      const rolloutArgs: string[] = ["--allow-downgrade"];
+      if (opts.to) rolloutArgs.push("--pin", opts.to);
+      if (opts.agents) rolloutArgs.push("--agents", opts.agents);
+      if (opts.skipWeb) rolloutArgs.push("--skip-web");
+      if (opts.dryRun) rolloutArgs.push("--dry-run");
+      // Parse via the program's rollout subcommand.
+      await program.parseAsync(["rollout", ...rolloutArgs], { from: "user" });
     });
 }
