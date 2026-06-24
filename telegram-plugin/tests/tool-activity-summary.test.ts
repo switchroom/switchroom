@@ -3,6 +3,7 @@ import {
   describeToolUse,
   appendActivityLine,
   appendActivityLabel,
+  clipNarrative,
   renderActivityFeed,
   renderActivityFeedWithNested,
   renderActivityHeader,
@@ -197,6 +198,34 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
     expect(appendActivityLabel(lines, "   ")).toBeNull();
     expect(appendActivityLabel(lines, undefined)).toBeNull();
     expect(lines.length).toBe(2);
+  });
+});
+
+describe("clipNarrative — narrative-step clip (JSONL-text-narrative primitive)", () => {
+  it("takes the first line only, trims, slices to 120 chars", () => {
+    expect(clipNarrative("On it. Let me find the repo…\nthen build")).toBe(
+      "On it. Let me find the repo…",
+    );
+    expect(clipNarrative("  Found both:  ")).toBe("Found both:");
+    const long = "x".repeat(200);
+    expect(clipNarrative(long).length).toBe(120);
+  });
+
+  it("a shown narrative renders identically to a tool label via the same feed path", () => {
+    // A SHOWN narrative line is pushed through appendActivityLabel exactly
+    // like a tool label, so the rendered feed string is byte-identical.
+    const narrativeLines: string[] = [];
+    const labelLines: string[] = [];
+    const text = "Important find: no main branch yet — branching off origin.";
+    const narrativeRender = appendActivityLabel(narrativeLines, clipNarrative(text));
+    const labelRender = appendActivityLabel(labelLines, clipNarrative(text));
+    expect(narrativeRender).toBe(labelRender);
+    expect(narrativeRender).toBe(`<b>→ ${text}</b>`);
+  });
+
+  it("empty string yields an empty clip (appendActivityLabel then drops it)", () => {
+    expect(clipNarrative("")).toBe("");
+    expect(appendActivityLabel([], clipNarrative("   \n  "))).toBeNull();
   });
 });
 

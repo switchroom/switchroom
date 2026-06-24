@@ -75,7 +75,8 @@ import {
 } from './permission-timeout.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
-import { appendActivityLabel, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
+import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
@@ -2049,6 +2050,17 @@ type CurrentTurn = {
   // (via `renderActivityFeed`) as a capped chronological list into the
   // in-place edited activity message and clears on reply. Reset per turn.
   mirrorLines: string[]
+  // Narrative-dedup gate state (JSONL-text-narrative primitive). A `text`
+  // block is held here for ONE lookahead step so the next event (a tool_use
+  // or turn_end) can decide draft-then-send (SUPPRESS, it duplicates the
+  // reply) vs working-narration (SHOW it as a transient mirrorLines step).
+  // Null when nothing is pending. The pure decision lives in
+  // narrative-dedup.ts; this slot is the per-turn cursor. Reset per turn.
+  // Invariant `chat-is-the-single-source-of-truth`: a SHOWN narrative is
+  // rendered through the SAME appendActivityLabel→renderStepFeed path as a
+  // tool step — a transient, clipped, rolling-window line replaced by the
+  // next event, never a persisted parallel mirror.
+  pendingNarrative: { text: string; lastInMessage: boolean } | null
   // Model A — foreground sub-agent nesting. A foreground sub-agent (Task/Agent
   // with no run_in_background) runs INSIDE this turn while the parent blocks at
   // the Task tool, so its live steps nest under the parent's activity feed
@@ -10159,6 +10171,75 @@ function composeTurnActivity(turn: CurrentTurn, final = false, liveSuffix = ''):
 }
 
 /**
+ * Render a SHOWN narrative text block as a transient liveness step — the
+ * same path a tool label takes (appendActivityLabel → renderStepFeed), so
+ * the narrative line is rolling-window-clipped and replaced by the next
+ * event exactly like a tool step. NOT a new message, NOT persisted as a
+ * parallel mirror (invariant `chat-is-the-single-source-of-truth`,
+ * reference/invariants.md). Clipped to a single 120-char line via
+ * clipNarrative so it reads as a step, not a paragraph.
+ */
+function showNarrativeStep(turn: CurrentTurn, text: string): void {
+  const rendered = appendActivityLabel(turn.mirrorLines, clipNarrative(text))
+  if (rendered == null) return
+  turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
+  if (turn.activityInFlight == null) {
+    turn.activityInFlight = drainActivitySummary(turn)
+  }
+}
+
+/**
+ * Narrative-dedup gate, step 2 (reducer-side): a tool_use just arrived while
+ * a narrative block was pending. Decide SHOW vs SUPPRESS and clear the
+ * pending slot. SUPPRESS only when the tool is reply/stream_reply AND the
+ * pending text is a draft-then-send of that reply's `input.text`. Everything
+ * else (a working tool, or a reply whose text differs — post-action
+ * narration) is SHOWN. See narrative-dedup.ts §2b.
+ */
+function resolvePendingNarrativeOnTool(
+  turn: CurrentTurn,
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+): void {
+  const pending = turn.pendingNarrative
+  if (pending == null) return
+  turn.pendingNarrative = null
+  if (REPLY_TOOLS.has(toolName)) {
+    const replyText = typeof input?.text === 'string' ? (input.text as string) : ''
+    if (isDraftOfReply(pending.text, replyText)) return // draft of the answer → SUPPRESS
+  }
+  showNarrativeStep(turn, pending.text) // working preamble / post-action narration → SHOW
+}
+
+/**
+ * Narrative-dedup gate, step 1 (reducer-side): a new narrative block
+ * arrived. A previously-pending block had nothing reply-shaped immediately
+ * after it (pure narration) → flush it as SHOWN, then stage the new one for
+ * one lookahead step. See narrative-dedup.ts §2b.
+ */
+function stagePendingNarrative(turn: CurrentTurn, text: string, lastInMessage: boolean): void {
+  if (turn.pendingNarrative != null) {
+    showNarrativeStep(turn, turn.pendingNarrative.text)
+  }
+  turn.pendingNarrative = { text, lastInMessage }
+}
+
+/**
+ * Narrative-dedup gate, step 3 (reducer-side): the turn is ending with a
+ * trailing narrative block and nothing after it. SUPPRESS only when the turn
+ * already delivered its answer via reply/stream_reply and the trailing text
+ * is a draft of that answer; otherwise SHOW (genuine trailing narration like
+ * "Done — all green."). See narrative-dedup.ts §2b.
+ */
+function flushPendingNarrativeAtTurnEnd(turn: CurrentTurn, lastReplyText: string): void {
+  const pending = turn.pendingNarrative
+  if (pending == null) return
+  turn.pendingNarrative = null
+  if (lastReplyText.length > 0 && isDraftOfReply(pending.text, lastReplyText)) return // trailing duplicate of the answer
+  showNarrativeStep(turn, pending.text)
+}
+
+/**
  * Drain the tool-activity summary's pending render queue. Single-flight
  * by construction (caller assigns the returned promise to
  * `turn.activityInFlight`; while set, new tool_uses only update
@@ -10458,6 +10539,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityEverOpened: false,
           activityDrainFailures: 0,
           mirrorLines: [],
+          pendingNarrative: null,
           foregroundSubAgents: new Map(),
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
@@ -10592,6 +10674,14 @@ function handleSessionEvent(ev: SessionEvent): void {
     case 'tool_use': {
       const turn = currentTurn
       if (turn == null) return
+      // Narrative-dedup gate step 2 (JSONL-text-narrative primitive): a
+      // narrative block was pending; this tool_use is the lookahead event
+      // that decides it. reply/stream_reply with near-identical text ⇒
+      // draft-then-send ⇒ SUPPRESS (the reply prints the canonical answer);
+      // anything else ⇒ SHOW as a transient liveness step. Runs BEFORE the
+      // normal tool handling so a working preamble surfaces just ahead of
+      // its tool step.
+      resolvePendingNarrativeOnTool(turn, ev.toolName, ev.input)
       // Phase 1 of #332: count every tool_use in the current turn.
       turn.toolCallCount++
       // #412: bump turn-active marker mtime so the watchdog sees this
@@ -10775,6 +10865,17 @@ function handleSessionEvent(ev: SessionEvent): void {
       const turn = currentTurn
       if (turn != null) {
         turn.capturedText.push(ev.text)
+        // Narrative-dedup gate step 1 (JSONL-text-narrative primitive):
+        // stage this text block for one lookahead step. If a previous block
+        // was pending with nothing reply-shaped after it, it flushes here as
+        // a SHOWN transient liveness step. The eventual SHOW/SUPPRESS of THIS
+        // block is decided by the next tool_use / turn_end. Invariant
+        // `chat-is-the-single-source-of-truth` (reference/invariants.md): a
+        // SHOWN line rides the same renderStepFeed path as a tool step —
+        // transient + clipped, never a persisted parallel mirror. This is a
+        // separate lane from the answer-stream wiring below (which owns the
+        // canonical reply), so the two never fight over the same text.
+        stagePendingNarrative(turn, ev.text, ev.lastInMessage)
         // Issue #195: feed the answer-lane stream. The stream itself
         // gates on minInitialChars and throttles edits — short replies
         // stay below the threshold and never spawn a message.
@@ -11046,6 +11147,19 @@ function handleSessionEvent(ev: SessionEvent): void {
       if (turn?.orphanedReplyTimeoutId != null) {
         clearTimeout(turn.orphanedReplyTimeoutId)
         turn.orphanedReplyTimeoutId = null
+      }
+      // Narrative-dedup gate step 3 (JSONL-text-narrative primitive): a
+      // trailing narrative block with nothing after it. When the turn
+      // delivered its answer via reply (replyCalled) the trailing text is
+      // almost always a draft of that answer — compare against the captured
+      // answer text and SUPPRESS the duplicate; otherwise SHOW genuine
+      // trailing narration ("Done — all green."). Must run BEFORE
+      // clearActivitySummary so a SHOWN line lands in the feed's final
+      // render. Always clears turn.pendingNarrative so it can't leak across
+      // turns.
+      if (turn != null) {
+        const lastReplyText = turn.replyCalled ? turn.capturedText.join('') : ''
+        flushPendingNarrativeAtTurnEnd(turn, lastReplyText)
       }
       // Clear the activity feed at the real end of the turn. This is the
       // no-reply safety net — a turn that ends without ever calling reply
@@ -22750,7 +22864,13 @@ void (async () => {
                   // feed (the foreground blindspot) — mirroring the
                   // main-turn activity feed, which surfaces both tool labels
                   // and prose.
-                  const child = (progressLine ?? latestSummary).trim().slice(0, 120)
+                  // Route through the SHARED clipNarrative so multi-line
+                  // narration first-line-collapses identically to the main
+                  // tier (the main path at showNarrativeStep already does
+                  // this). Previously this inlined `.trim().slice(0, 120)`
+                  // omitted the first-line collapse, so a multi-line
+                  // narrative rendered DIFFERENTLY here than on the main feed.
+                  const child = clipNarrative(progressLine ?? latestSummary)
                   if (child.length === 0) return
                   let narrative = turn.foregroundSubAgents.get(agentId)
                   if (narrative == null) {

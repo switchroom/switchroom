@@ -98,7 +98,12 @@ export type SessionEvent =
   // the lazily-flushed transcript. The draft-mirror drives off THIS, not
   // the flush-gated `tool_use`, so activity streams deterministically.
   | { kind: 'tool_label'; toolUseId: string; label: string; toolName: string }
-  | { kind: 'text'; text: string }
+  // `blockIndex` = index of this text block in the assistant message's
+  // content[]. `lastInMessage` = true iff no tool_use block follows it in
+  // the SAME message. These two fields let the reducer-side narrative-dedup
+  // gate (narrative-dedup.ts) decide draft-then-send vs working-narration
+  // deterministically without buffering whole turns.
+  | { kind: 'text'; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'tool_result'; toolUseId: string; toolName: string | null; isError?: boolean; errorText?: string }
   | { kind: 'turn_end'; durationMs: number }
   // Multi-agent: sub-agent-scoped events. agentId is the sub-agent JSONL
@@ -106,8 +111,11 @@ export type SessionEvent =
   // as parent events; the reducer fans them out to per-sub-agent state.
   | { kind: 'sub_agent_started'; agentId: string; firstPromptText: string; subagentType?: string }
   | { kind: 'sub_agent_tool_use'; agentId: string; toolUseId: string | null; toolName: string; input?: Record<string, unknown>; precomputedLabel?: string }
-  | { kind: 'sub_agent_text'; agentId: string; text: string }
-  | { kind: 'sub_agent_narrative'; agentId: string; text: string }
+  // Same shared contract as the main-agent `text` kind — see its doc above.
+  // The wire-kind stays distinct (the gateway/watcher split is load-bearing)
+  // but the payload + `lastInMessage` derivation are identical so ONE shared
+  // dedup gate handles both tiers.
+  | { kind: 'sub_agent_text'; agentId: string; text: string; blockIndex: number; lastInMessage: boolean }
   | { kind: 'sub_agent_tool_result'; agentId: string; toolUseId: string; isError?: boolean; errorText?: string }
   | { kind: 'sub_agent_turn_end'; agentId: string }
   | { kind: 'sub_agent_nested_spawn'; agentId: string }
@@ -183,6 +191,46 @@ function extractToolResultErrorText(content: unknown): string {
 }
 
 /**
+ * THE single text→narrative projection primitive. Both projectTranscriptLine
+ * and projectSubagentLine derive their text events through this helper so
+ * main-agent, sub-agent, worker, and every other execution shape inherit
+ * identical text-block semantics from ONE place: empty/whitespace blocks are
+ * dropped, and each surviving block carries its `blockIndex` plus the
+ * `lastInMessage` signal (no tool_use follows it in this message — the
+ * draft-then-send marker the reducer-side dedup gate keys on).
+ *
+ * `make` adapts the shared payload into the tier-specific wire kind
+ * (`text` vs `sub_agent_text`); the contract — what counts as a text block,
+ * how `lastInMessage` is computed — lives here, not in the callers.
+ *
+ * Returns a `Map<blockIndex, SessionEvent>` keyed by the text block's source
+ * index, NOT a flat list. This is the load-bearing design choice: the callers
+ * must emit thinking / tool_use / text events in SOURCE ORDER (the reducer
+ * pairs a preamble to the immediately-next tool_use), so they iterate
+ * `content` once and, at each text position, emit the precomputed event from
+ * this map. The kernel owns the contract; the caller owns only the ordering.
+ */
+export function projectAssistantTextBlocks(
+  content: Array<Record<string, unknown>>,
+  make: (text: string, blockIndex: number, lastInMessage: boolean) => SessionEvent,
+): Map<number, SessionEvent> {
+  const out = new Map<number, SessionEvent>()
+  // Precompute the index of the last tool_use so each text block knows
+  // whether a tool_use follows it in THIS message (the draft-then-send signal).
+  let lastToolUseIdx = -1
+  content.forEach((c, i) => {
+    if (c.type === 'tool_use') lastToolUseIdx = i
+  })
+  content.forEach((c, i) => {
+    if (c.type !== 'text') return
+    const text = (c.text as string | undefined) ?? ''
+    if (text.trim().length === 0) return // drop empty/whitespace-only blocks
+    out.set(i, make(text, i, i > lastToolUseIdx))
+  })
+  return out
+}
+
+/**
  * Project a single transcript line into a SessionEvent (or null if it's
  * uninteresting noise). Caller is responsible for the JSON parse — if a
  * line is not valid JSON we skip it.
@@ -218,7 +266,16 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
     const events: SessionEvent[] = []
-    for (const c of content) {
+    // Text→narrative projection comes from the ONE shared kernel
+    // (projectAssistantTextBlocks): it owns the empty-drop + blockIndex +
+    // lastInMessage contract. We emit its events at their source positions
+    // so thinking / tool_use / text stay in source order (the reducer pairs
+    // a preamble to the immediately-next tool_use).
+    const textEvents = projectAssistantTextBlocks(
+      content,
+      (text, blockIndex, lastInMessage): SessionEvent => ({ kind: 'text', text, blockIndex, lastInMessage }),
+    )
+    content.forEach((c, i) => {
       const ct = c.type as string | undefined
       if (ct === 'thinking') {
         events.push({ kind: 'thinking' })
@@ -237,10 +294,10 @@ export function projectTranscriptLine(line: string): SessionEvent[] {
           input: input && typeof input === 'object' ? input : undefined,
         })
       } else if (ct === 'text') {
-        const text = (c.text as string | undefined) ?? ''
-        events.push({ kind: 'text', text })
+        const ev = textEvents.get(i)
+        if (ev != null) events.push(ev)
       }
-    }
+    })
     return events
   }
 
@@ -357,7 +414,25 @@ export function projectSubagentLine(
     const content = message?.content as Array<Record<string, unknown>> | undefined
     if (!Array.isArray(content)) return []
     const events: SessionEvent[] = []
-    for (const c of content) {
+    // Text→narrative projection comes from the SAME shared kernel as the
+    // main agent (projectAssistantTextBlocks): one source for the empty-drop
+    // + blockIndex + lastInMessage contract. The `make` adapter only changes
+    // the wire kind to `sub_agent_text`. A nested Agent/Task tool_use still
+    // counts as a tool_use that follows a preceding text block — handled by
+    // the kernel — so a sub-agent preamble before a nested spawn is correctly
+    // NOT `lastInMessage`. We emit at source positions so text + tool_use
+    // stay in source order (the reducer pairs preamble → next tool_use).
+    const textEvents = projectAssistantTextBlocks(
+      content,
+      (text, blockIndex, lastInMessage): SessionEvent => ({
+        kind: 'sub_agent_text',
+        agentId,
+        text,
+        blockIndex,
+        lastInMessage,
+      }),
+    )
+    content.forEach((c, i) => {
       const ct = c.type as string | undefined
       if (ct === 'tool_use') {
         const name = (c.name as string | undefined) ?? ''
@@ -386,10 +461,11 @@ export function projectSubagentLine(
         // in the SAME assistant message must be emitted in source order
         // so the reducer consumes the preamble on the immediately-next
         // tool_use and sibling tool_uses fall back to filename/pattern.
-        const text = (c.text as string | undefined) ?? ''
-        events.push({ kind: 'sub_agent_text', agentId, text })
+        // The event itself comes from the shared kernel (textEvents above).
+        const ev = textEvents.get(i)
+        if (ev != null) events.push(ev)
       }
-    }
+    })
     // Authoritative early terminal: a background `Agent` worker's JSONL on
     // claude ≥2.1.156 never writes the `system/turn_duration` line below, so
     // the watcher used to only learn the worker finished via the ~5-min

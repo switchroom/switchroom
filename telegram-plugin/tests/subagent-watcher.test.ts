@@ -519,6 +519,86 @@ describe('startSubagentWatcher', () => {
       expect(toolTick?.latestSummary).toBe('')
     })
 
+    it('narrative gate: a draft-then-reply sub_agent_text is SUPPRESSED (no progress cue)', () => {
+      // The worker composes its answer as a text block, then calls
+      // stream_reply with near-identical text. The narrative cue must be
+      // suppressed so the answer is not double-surfaced.
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          // Narrative ticks carry NO progressLine (tool ticks do); record them.
+          if (progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo path')))
+      h.poll()
+      const answer = 'The repo is at /home/user/code/switchroom.'
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText(answer)))
+      h.poll()
+      // The draft is staged, not yet resolved — no cue yet.
+      // The very next event is a reply tool with matching text → SUPPRESS.
+      appendFileSync(jsonlPath, buildJSONL({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'stream_reply', id: 'r1', input: { text: answer } }] },
+      }))
+      h.poll()
+      expect(narrativeCues.length).toBe(0)
+    })
+
+    it('narrative gate: pure working narration is SHOWN (cue fires)', () => {
+      // "On it. Let me find the repo…" followed by a Bash tool — the next
+      // event is a non-reply tool, so the narration is SHOWN.
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          if (progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Find the repo')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText('On it. Let me find the repo.')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentToolUse('Bash', 'b1')))
+      h.poll()
+      // The staged narration was resolved by the non-reply Bash → SHOWN.
+      expect(narrativeCues.length).toBe(1)
+      expect(narrativeCues[0]).toContain('find the repo')
+    })
+
+    it('narrative gate: trailing narration at turn_end is SHOWN', () => {
+      const narrativeCues: string[] = []
+      const agentDir = join(tmpRoot, 'agent')
+      const subagentsDir = join(agentDir, '.claude', 'projects', 'p1', 'session-abc', 'subagents')
+      mkdirSync(subagentsDir, { recursive: true })
+      const jsonlPath = join(subagentsDir, 'agent-deadbeef.jsonl')
+      const h = startWatcherSync({
+        agentDir,
+        onProgress: ({ progressLine, latestSummary }) => {
+          if (progressLine == null) narrativeCues.push(latestSummary)
+        },
+      })
+      writeFileSync(jsonlPath, buildJSONL(subAgentUserMsg('Do the task')))
+      h.poll()
+      // A trailing narration block, then turn_end (turn_duration). The
+      // trailing block has no reply after it → SHOWN at turn_end.
+      appendFileSync(jsonlPath, buildJSONL(subAgentAssistantText('Done. All green.')))
+      h.poll()
+      appendFileSync(jsonlPath, buildJSONL(subAgentTurnDuration()))
+      h.poll()
+      expect(narrativeCues.length).toBe(1)
+      expect(narrativeCues[0]).toContain('All green')
+    })
+
     it('captures the full last narrative line into lastResultText (handback)', () => {
       // lastSummaryLine keeps only the first line, 120 chars — a progress
       // preview. lastResultText keeps the full last narrative emission:
