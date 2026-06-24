@@ -1540,25 +1540,49 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
         const subagentsPath = join(projectPath, sDir, 'subagents')
         if (!fs.existsSync(subagentsPath)) continue
 
-        // Watch the subagents dir for new files if not already watching
-        if (!dirWatchers.has(subagentsPath)) {
-          try {
-            const w = fs.watch(subagentsPath, (_event, filename) => {
-              if (!filename || !filename.toString().startsWith('agent-') || !filename.toString().endsWith('.jsonl')) return
-              const filePath = join(subagentsPath, filename.toString())
-              if (!knownFiles.has(filePath)) {
-                scanSubagentsDir(subagentsPath)
-              }
-            })
-            dirWatchers.set(subagentsPath, w)
-            log?.(`subagent-watcher: watching dir ${subagentsPath}`)
-          } catch (err) {
-            log?.(`subagent-watcher: dir watch failed ${subagentsPath}: ${(err as Error).message}`)
+        // Watch a single flat subagents dir and scan its agent-*.jsonl files.
+        // Reused for both the base subagents/ dir and each workflow sub-dir.
+        const watchAndScan = (dirPath: string): void => {
+          if (!dirWatchers.has(dirPath)) {
+            try {
+              const w = fs.watch(dirPath, (_event, filename) => {
+                if (!filename || !filename.toString().startsWith('agent-') || !filename.toString().endsWith('.jsonl')) return
+                const filePath = join(dirPath, filename.toString())
+                if (!knownFiles.has(filePath)) {
+                  scanSubagentsDir(dirPath)
+                }
+              })
+              dirWatchers.set(dirPath, w)
+              log?.(`subagent-watcher: watching dir ${dirPath}`)
+            } catch (err) {
+              log?.(`subagent-watcher: dir watch failed ${dirPath}: ${(err as Error).message}`)
+            }
           }
+          scanSubagentsDir(dirPath)
         }
 
-        // Scan existing files
-        scanSubagentsDir(subagentsPath)
+        // Register the base subagents dir
+        watchAndScan(subagentsPath)
+
+        // Workflow sub-agents (spawned by the Workflow tool) write to:
+        //   subagents/workflows/wf_<id>/agent-<id>.jsonl
+        // The flat readdir above misses these because it only sees the
+        // "workflows" directory entry (not matching agent-*.jsonl). Descend
+        // one level so each wf_*/ dir gets the same watch+scan treatment.
+        const workflowsPath = join(subagentsPath, 'workflows')
+        if (fs.existsSync(workflowsPath)) {
+          let wfDirs: string[]
+          try {
+            wfDirs = fs.readdirSync(workflowsPath) as string[]
+          } catch { continue }
+          for (const wfDir of wfDirs) {
+            try {
+              const wfPath = join(workflowsPath, wfDir)
+              fs.statSync(wfPath) // throws if not a directory-like entry
+              watchAndScan(wfPath)
+            } catch { /* skip entries we can't stat or watch */ }
+          }
+        }
       }
     }
   }
