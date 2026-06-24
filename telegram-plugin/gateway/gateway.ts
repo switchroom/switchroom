@@ -3264,6 +3264,7 @@ async function postIdleClearNotice(idleClearMs: number): Promise<void> {
       () =>
         bot.api.sendMessage(chatId, text, {
           parse_mode: 'HTML',
+          disable_notification: true,
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }),
       { chat_id: chatId, verb: 'idleAutoClear.notice' },
