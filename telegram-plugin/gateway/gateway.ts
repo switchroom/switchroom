@@ -2060,7 +2060,14 @@ type CurrentTurn = {
   // rendered through the SAME appendActivityLabel→renderStepFeed path as a
   // tool step — a transient, clipped, rolling-window line replaced by the
   // next event, never a persisted parallel mirror.
-  pendingNarrative: { text: string; lastInMessage: boolean } | null
+  pendingNarrative: { text: string } | null
+  // Most-recently-seen reply/stream_reply `input.text` for this turn — the
+  // ACTUAL delivered answer surface. Set wherever a REPLY_TOOL tool_use is
+  // handled in the reducer. `flushPendingNarrativeAtTurnEnd` compares a
+  // trailing narrative block against THIS (not capturedText.join(''), which
+  // can mis-suppress when the model emits the same short string twice in a
+  // turn). Empty string until the turn delivers a reply. Reset per turn.
+  lastReplyText: string
   // Model A — foreground sub-agent nesting. A foreground sub-agent (Task/Agent
   // with no run_in_background) runs INSIDE this turn while the parent blocks at
   // the Task tool, so its live steps nest under the parent's activity feed
@@ -10217,11 +10224,11 @@ function resolvePendingNarrativeOnTool(
  * after it (pure narration) → flush it as SHOWN, then stage the new one for
  * one lookahead step. See narrative-dedup.ts §2b.
  */
-function stagePendingNarrative(turn: CurrentTurn, text: string, lastInMessage: boolean): void {
+function stagePendingNarrative(turn: CurrentTurn, text: string): void {
   if (turn.pendingNarrative != null) {
     showNarrativeStep(turn, turn.pendingNarrative.text)
   }
-  turn.pendingNarrative = { text, lastInMessage }
+  turn.pendingNarrative = { text }
 }
 
 /**
@@ -10540,6 +10547,7 @@ function handleSessionEvent(ev: SessionEvent): void {
           activityDrainFailures: 0,
           mirrorLines: [],
           pendingNarrative: null,
+          lastReplyText: '',
           foregroundSubAgents: new Map(),
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
@@ -10704,6 +10712,15 @@ function handleSessionEvent(ev: SessionEvent): void {
       // placeholder-heartbeat label, which has been retired.
       if (isTelegramReplyTool(name)) {
         turn.replyCalled = true
+        // NIT 2 (reply-proxy precision): capture the ACTUAL delivered reply
+        // text so flushPendingNarrativeAtTurnEnd compares a trailing
+        // narrative block against the real answer surface, not
+        // capturedText.join('') (which mis-suppresses when the model emits
+        // the same short string twice in a turn). REPLY_TOOLS ('reply',
+        // 'stream_reply') carry the answer in input.text; only those count.
+        if (REPLY_TOOLS.has(name) && typeof ev.input?.text === 'string') {
+          turn.lastReplyText = ev.input.text as string
+        }
         if (turn.orphanedReplyTimeoutId != null) {
           clearTimeout(turn.orphanedReplyTimeoutId)
           turn.orphanedReplyTimeoutId = null
@@ -10875,7 +10892,7 @@ function handleSessionEvent(ev: SessionEvent): void {
         // transient + clipped, never a persisted parallel mirror. This is a
         // separate lane from the answer-stream wiring below (which owns the
         // canonical reply), so the two never fight over the same text.
-        stagePendingNarrative(turn, ev.text, ev.lastInMessage)
+        stagePendingNarrative(turn, ev.text)
         // Issue #195: feed the answer-lane stream. The stream itself
         // gates on minInitialChars and throttles edits — short replies
         // stay below the threshold and never spawn a message.
@@ -11151,15 +11168,29 @@ function handleSessionEvent(ev: SessionEvent): void {
       // Narrative-dedup gate step 3 (JSONL-text-narrative primitive): a
       // trailing narrative block with nothing after it. When the turn
       // delivered its answer via reply (replyCalled) the trailing text is
-      // almost always a draft of that answer — compare against the captured
-      // answer text and SUPPRESS the duplicate; otherwise SHOW genuine
-      // trailing narration ("Done — all green."). Must run BEFORE
+      // almost always a draft of that answer — compare against the ACTUAL
+      // delivered reply text and SUPPRESS the duplicate; otherwise SHOW
+      // genuine trailing narration ("Done — all green."). Must run BEFORE
       // clearActivitySummary so a SHOWN line lands in the feed's final
       // render. Always clears turn.pendingNarrative so it can't leak across
       // turns.
+      //
+      // NIT 2 (reply-proxy precision): use `turn.lastReplyText` (the
+      // most-recent reply/stream_reply input.text) rather than
+      // `capturedText.join('')`. The old proxy concatenated every captured
+      // text block, so a turn that emitted the same short string twice
+      // (e.g. "Done." as working narration, then "Done." as the reply) would
+      // compare the trailing narration against a doubled "DoneDone" — still
+      // a high-prefix match — and wrongly suppress genuine trailing
+      // narration. Comparing against the actual reply text is exact. When
+      // the turn delivered WITHOUT a reply tool (turn-flush emits
+      // capturedText as the answer), fall back to capturedText.join('') so
+      // that path's trailing-draft suppression is preserved.
       if (turn != null) {
-        const lastReplyText = turn.replyCalled ? turn.capturedText.join('') : ''
-        flushPendingNarrativeAtTurnEnd(turn, lastReplyText)
+        const deliveredText = turn.lastReplyText.length > 0
+          ? turn.lastReplyText
+          : (turn.replyCalled ? turn.capturedText.join('') : '')
+        flushPendingNarrativeAtTurnEnd(turn, deliveredText)
       }
       // Clear the activity feed at the real end of the turn. This is the
       // no-reply safety net — a turn that ends without ever calling reply

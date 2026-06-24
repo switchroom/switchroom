@@ -221,7 +221,10 @@ export function appendActivityLine(
  * exactly like a tool label.
  */
 export function clipNarrative(s: string): string {
-  return (s ?? "").split("\n")[0].trim().slice(0, 120);
+  // `s` is a non-nullable string at every call site (showNarrativeStep passes
+  // ev.text; the foreground-sub path passes `progressLine ?? latestSummary`,
+  // both typed string), so no null guard is needed.
+  return s.split('\n')[0].trim().slice(0, 120);
 }
 
 /** Minimal HTML escape for Telegram parse_mode=HTML (matches the gateway's). */
