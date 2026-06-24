@@ -327,17 +327,17 @@ describe("generateCompose", () => {
     expect(m).toBeLessThan(z);
   });
 
-  it("klanker gets 6g/4g reservation, 2000 PIDs, 2.0 cpus", () => {
+  it("klanker gets 8g/4g reservation, 2000 PIDs, 2.0 cpus", () => {
     const out = generateCompose({ config: makeConfig({ klanker: {} }) });
-    expect(out).toMatch(/agent-klanker:[\s\S]*?mem_limit: 6g/);
+    expect(out).toMatch(/agent-klanker:[\s\S]*?mem_limit: 8g/);
     expect(out).toMatch(/agent-klanker:[\s\S]*?mem_reservation: 4g/);
     expect(out).toMatch(/agent-klanker:[\s\S]*?pids_limit: 2000/);
     expect(out).toMatch(/agent-klanker:[\s\S]*?cpus: 2\.0/);
   });
 
-  it("conversational profile → 1.5g/256m, 500 PIDs, 1.0", () => {
+  it("conversational profile → 3g/256m, 500 PIDs, 1.0", () => {
     const out = generateCompose({ config: makeConfig({ coach: { extends: "conversational" } }) });
-    expect(out).toMatch(/agent-coach:[\s\S]*?mem_limit: 1\.5g/);
+    expect(out).toMatch(/agent-coach:[\s\S]*?mem_limit: 3g/);
     expect(out).toMatch(/agent-coach:[\s\S]*?mem_reservation: 256m/);
     expect(out).toMatch(/agent-coach:[\s\S]*?pids_limit: 500/);
     expect(out).toMatch(/agent-coach:[\s\S]*?cpus: 1\.0/);
@@ -351,17 +351,17 @@ describe("generateCompose", () => {
     expect(out).toMatch(/agent-ziggy:[\s\S]*?cpus: 0\.5/);
   });
 
-  it("coding profile → 2g/512m, 1000 PIDs, 2.0", () => {
+  it("coding profile → 4g/512m, 1000 PIDs, 2.0", () => {
     const out = generateCompose({ config: makeConfig({ worker: { extends: "coding" } }) });
-    expect(out).toMatch(/agent-worker:[\s\S]*?mem_limit: 2g/);
+    expect(out).toMatch(/agent-worker:[\s\S]*?mem_limit: 4g/);
     expect(out).toMatch(/agent-worker:[\s\S]*?mem_reservation: 512m/);
     expect(out).toMatch(/agent-worker:[\s\S]*?pids_limit: 1000/);
     expect(out).toMatch(/agent-worker:[\s\S]*?cpus: 2\.0/);
   });
 
-  it("unknown profile → default 1.5g/256m, 500 PIDs, 1.0", () => {
+  it("unknown profile → default 3g/256m, 500 PIDs, 1.0", () => {
     const out = generateCompose({ config: makeConfig({ misc: { extends: "made-up" } }) });
-    expect(out).toMatch(/agent-misc:[\s\S]*?mem_limit: 1\.5g/);
+    expect(out).toMatch(/agent-misc:[\s\S]*?mem_limit: 3g/);
     expect(out).toMatch(/agent-misc:[\s\S]*?mem_reservation: 256m/);
     expect(out).toMatch(/agent-misc:[\s\S]*?pids_limit: 500/);
     expect(out).toMatch(/agent-misc:[\s\S]*?cpus: 1\.0/);
@@ -384,7 +384,7 @@ describe("generateCompose", () => {
     });
     expect(out).toMatch(/agent-klanker:[\s\S]*?mem_reservation: 4g/);
     // and the existing mem_limit/cpus are still emitted
-    expect(out).toMatch(/agent-klanker:[\s\S]*?mem_limit: 6g/);
+    expect(out).toMatch(/agent-klanker:[\s\S]*?mem_limit: 8g/);
     expect(out).toMatch(/agent-klanker:[\s\S]*?cpus: 2\.0/);
   });
 
@@ -430,8 +430,8 @@ describe("generateCompose", () => {
     expect(out).toMatch(/agent-alice:[\s\S]*?mem_reservation: 192m/);
     expect(out).toMatch(/agent-alice:[\s\S]*?pids_limit: 300/);
     // memory still defaults — "tight" isn't in RESOURCE_BY_PROFILE so
-    // it falls through to the catch-all default 1.5g.
-    expect(out).toMatch(/agent-alice:[\s\S]*?mem_limit: 1\.5g/);
+    // it falls through to the catch-all default 3g.
+    expect(out).toMatch(/agent-alice:[\s\S]*?mem_limit: 3g/);
   });
 
   it("agent.resources.cpus overrides profile (fractional accepted)", () => {
