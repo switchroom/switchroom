@@ -88,12 +88,6 @@ export interface BotApiForWorkerFeed {
 
 /** Dispatch-time task description cap for the worker header. */
 const DESC_MAX = 80
-/**
- * Legacy narrative-line cap, kept exported for back-compat with importers.
- * The rolling window is now STATUS_ROLLING_LINES; this is no longer the active
- * cap but remains a documented constant some callers/tests still reference.
- */
-export const NARRATIVE_MAX_LINES = 6
 
 /**
  * Thin adapter over the unified `renderStatusCard` primitive (emoji 🛠, label

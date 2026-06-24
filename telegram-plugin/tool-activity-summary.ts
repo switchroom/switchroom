@@ -6,8 +6,8 @@
  * Each non-surface tool gets a human-friendly, present-tense line
  * ("Reading CLAUDE.md", "Searching memory", "Running a command"); the
  * feed renders them chronologically (oldest first, newest = the
- * in-progress step), consecutive duplicates collapsed, capped to the
- * most recent MIRROR_MAX_LINES with a "+N earlier" header.
+ * in-progress step), consecutive duplicates collapsed, windowed to the
+ * most recent STATUS_ROLLING_LINES with a "+N earlier…" overflow header.
  *
  * Two append entrypoints feed the same `lines: string[]` accumulator:
  *   - `appendActivityLabel` — for a pre-computed label from the
@@ -179,8 +179,6 @@ import {
 } from './status-no-truncate.js'
 import { escapeHtml, stripMarkdown, truncate } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
-
-export const MIRROR_MAX_LINES = 6;
 
 /**
  * Optional header for the main-session activity card, matching the worker
