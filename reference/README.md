@@ -32,6 +32,7 @@ is by folder + frontmatter, not by two separate trees.
 | [`product-spec.md`](product-spec.md) | *What does it deliver, and how does it function?* — the four outcomes + the job index |
 | Job specs ([`jobs/`](jobs/), `job:` frontmatter) | *Did it do the user's job?* — outcome-focused, UAT-verifiable, one per job |
 | RFCs ([`rfcs/`](rfcs/), `status:` / `artefact:` frontmatter) | *How do we build/ship this change?* — ship-coupled proposals + design records |
+| [`../messaging/copy-kit.md`](../messaging/copy-kit.md) | *How do we say it?* — ready-to-lift public copy (tagline, pillars, boilerplate), each block traced to a product-spec outcome |
 
 The first three are the **anchors**; `product-spec.md` is the product layer
 *beneath* them (it owns the job list); the job specs sit beneath that. The
