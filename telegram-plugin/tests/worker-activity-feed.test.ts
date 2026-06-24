@@ -1,13 +1,12 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import {
   renderWorkerActivity,
   createWorkerActivityFeed,
   isWorkerActivityFeedEnabled,
-  NARRATIVE_MAX_LINES,
   type WorkerActivityView,
   type BotApiForWorkerFeed,
 } from '../worker-activity-feed.js'
-import { STATUS_ROLLING_LINES } from '../status-no-truncate.js'
+import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from '../status-no-truncate.js'
 
 describe('isWorkerActivityFeedEnabled (default ON)', () => {
   it('defaults to true when the env var is unset', () => {
@@ -77,7 +76,8 @@ describe('renderWorkerActivity', () => {
   it('renders the native header + running status + step feed', () => {
     const out = renderWorkerActivity(view())
     expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
-    expect(out).toContain('running · ')
+    // Unified header: running shows "<elapsed> · N tools" (no "running ·" word).
+    expect(out).toContain('<i>10s · 3 tools</i>')
     expect(out).toContain('3 tools')
     // No narrativeLines → the latestSummary surfaces as the newest `→` step.
     expect(out).toContain('<b>→ scanning vendor pages</b>')
@@ -110,20 +110,24 @@ describe('renderWorkerActivity', () => {
       view({ state: 'done', toolCount: 5, latestSummary: 'PR #21 opened' }),
     )
     expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
-    expect(out).toContain('finished · completed · 5 tools · ')
+    // Unified done header: "done · N tools · <elapsed>".
+    expect(out).toContain('<i>done · 5 tools · ')
     expect(out).toContain('─────')
     expect(out).toContain('✅ <i>PR #21 opened</i>')
+    // latestSummary is the RESULT on the finished path, never also a step.
+    expect(out).not.toContain('<i>✓ PR #21 opened</i>')
   })
 
   it('renders a failed terminal recap', () => {
     const out = renderWorkerActivity(view({ state: 'failed', latestSummary: 'blew up' }))
-    expect(out).toContain('finished · failed · ')
+    // Failed maps to the "done" header word; the ⚠️ result carries the failure.
+    expect(out).toContain('<i>done · ')
     expect(out).toContain('⚠️ <i>blew up</i>')
   })
 
   it('omits the rule + result line when the terminal result is empty', () => {
     const out = renderWorkerActivity(view({ state: 'done', latestSummary: '   ' }))
-    expect(out).toContain('finished · completed · ')
+    expect(out).toContain('<i>done · ')
     expect(out).not.toContain('─────')
   })
 
@@ -155,18 +159,17 @@ describe('renderWorkerActivity', () => {
     expect(stepCount(out)).toBe(2)
   })
 
-  it('shows an overflow header when the feed exceeds the cap (no-truncate OFF)', () => {
-    // This test exercises the capping behaviour that is active when the flag is OFF.
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
-    const lines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
+  it('shows a "+N earlier…" header when the feed exceeds STATUS_ROLLING_LINES (worker surface)', () => {
+    const total = STATUS_ROLLING_LINES + 3
+    const lines = Array.from({ length: total }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines: lines }))
-    expect(out).toContain('<i>✓ +3 earlier…</i>')
-    expect(out).not.toContain('step 1')
-    expect(out).toContain('<i>✓ step 4</i>')
-    expect(out).toContain('<b>→ step 9</b>')
-    // 6 visible step lines (the overflow header is not itself a step).
-    expect(out.match(/step \d/g) ?? []).toHaveLength(6)
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    expect(out).toContain(`<i>✓ +${total - STATUS_ROLLING_LINES} earlier…</i>`)
+    expect(out).not.toContain('step 1<')
+    const firstVisible = total - STATUS_ROLLING_LINES + 1
+    expect(out).toContain(`<i>✓ step ${firstVisible}</i>`)
+    expect(out).toContain(`<b>→ step ${total}</b>`)
+    // STATUS_ROLLING_LINES visible step lines (the overflow header isn't a step).
+    expect(out.match(/step \d/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
   })
 
   it('strips Markdown markup from narrative + description + result', () => {
@@ -283,7 +286,7 @@ describe('createWorkerActivityFeed', () => {
     clock = 10_500 // well within the throttle window
     await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
     expect(bot.edits).toHaveLength(1)
-    expect(bot.edits[0].text).toContain('finished · completed · 5 tools')
+    expect(bot.edits[0].text).toContain('<i>done · 5 tools · ')
     // finish forgets the worker.
     expect(feed.has('w1')).toBe(false)
     expect(feed.size).toBe(0)
@@ -396,26 +399,22 @@ describe('createWorkerActivityFeed', () => {
     expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(1)
   })
 
-  it('caps the narrative block to the last 6 lines (no-truncate OFF)', async () => {
-    // This test exercises the capping behaviour that is active when the flag is OFF.
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+  it('rolls the narrative block to the last STATUS_ROLLING_LINES lines', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
 
-    for (let i = 1; i <= 9; i++) {
+    const total = 9
+    for (let i = 1; i <= total; i++) {
       clock += 1000
-      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
+      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `ln-${String(i).padStart(3, '0')}` }))
     }
 
     const last = bot.edits.at(-1)!
-    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(6)
-    // Oldest lines evicted; newest retained.
-    expect(last.text).not.toContain('line 1')
-    expect(last.text).not.toContain('line 3')
-    expect(last.text).toContain('line 4')
-    expect(last.text).toContain('line 9')
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
+    const firstVisible = total - STATUS_ROLLING_LINES + 1
+    for (let i = 1; i < firstVisible; i++) expect(last.text).not.toContain(`ln-${String(i).padStart(3, '0')}`)
+    for (let i = firstVisible; i <= total; i++) expect(last.text).toContain(`ln-${String(i).padStart(3, '0')}`)
   })
 
   it('grows the narrative even while throttled (line surfaces on next edit)', async () => {
@@ -510,99 +509,64 @@ describe('createWorkerActivityFeed — log sink', () => {
   })
 })
 
-// ─── SWITCHROOM_STATUS_NO_TRUNCATE feature flag tests ────────────────────────
-// New contract (rolling-5-full):
-//   ON  → last STATUS_ROLLING_LINES lines rendered in FULL; no overflow header;
-//          char-budget backstop (_fitWorkerBodyToCharBudget) is the only ceiling.
-//   OFF → NARRATIVE_MAX_LINES cap + STEP_MAX per-line clip (legacy, unchanged).
+// ─── Rolling window + STATUS_LINE_MAX (flag retired) ─────────────────────────
+// Single mode: last STATUS_ROLLING_LINES lines render in full (clipped per-line
+// at STATUS_LINE_MAX=200), overflow → `+N earlier…` header on the worker surface,
+// char-budget backstop is the only wire-limit ceiling.
 
-describe('SWITCHROOM_STATUS_NO_TRUNCATE — renderWorkerActivity', () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-  })
-
-  it('no-truncate ON (default): with 12 narrative lines, exactly the last STATUS_ROLLING_LINES render', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE // default = ON
-    // Use zero-padded numbers so "stp-001" cannot be a substring of "stp-010".
+describe('rolling window + STATUS_LINE_MAX — renderWorkerActivity', () => {
+  it('with 12 narrative lines, exactly the last STATUS_ROLLING_LINES render + a +N earlier header', () => {
     const narrativeLines = Array.from({ length: 12 }, (_, i) => `stp-${String(i + 1).padStart(3, '0')}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
-    // The last STATUS_ROLLING_LINES lines must appear.
     const firstVisible = 12 - STATUS_ROLLING_LINES + 1
     for (let i = firstVisible; i <= 12; i++) {
       expect(out).toContain(`stp-${String(i).padStart(3, '0')}`)
     }
-    // The first (12 - STATUS_ROLLING_LINES) lines must NOT appear.
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`stp-${String(i).padStart(3, '0')}`)
     }
-    // No overflow header in no-truncate mode.
-    expect(out).not.toContain('earlier…')
+    // Overflow header now appears on the worker surface too.
+    expect(out).toContain(`<i>✓ +${12 - STATUS_ROLLING_LINES} earlier…</i>`)
     expect(out).toContain('<b>→ stp-012</b>')
   })
 
-  it('no-truncate ON: a 150-char line renders in FULL (no "…" mid-line truncation)', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    const longLine = 'a'.repeat(75) + ' ' + 'b'.repeat(74) // 150 chars total
+  it('STATUS_LINE_MAX=200: a 250-char line is clipped to 200 with a trailing …', () => {
+    const longLine = 'a'.repeat(250)
     const out = renderWorkerActivity(view({ narrativeLines: [longLine] }))
-    // Must appear without "…" from per-line STEP_MAX clip.
-    expect(out).toContain(longLine)
+    expect(out).toContain('…')
+    expect(out).not.toContain(longLine)
+    expect(out).toContain('a'.repeat(STATUS_LINE_MAX - 1) + '…')
+  })
+
+  it('a line at exactly STATUS_LINE_MAX is NOT clipped', () => {
+    const exact = 'b'.repeat(STATUS_LINE_MAX)
+    const out = renderWorkerActivity(view({ narrativeLines: [exact] }))
+    expect(out).toContain(exact)
     expect(out).not.toContain('…')
   })
 
-  it('no-truncate ON: no "✓ +N earlier…" overflow header', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    const narrativeLines = Array.from({ length: 20 }, (_, i) => `step ${i + 1}`)
+  it('no "+N earlier…" overflow header when the feed fits the window', () => {
+    const narrativeLines = Array.from({ length: STATUS_ROLLING_LINES }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
     expect(out).not.toContain('earlier…')
   })
 
-  it('no-truncate OFF (=0): existing NARRATIVE_MAX_LINES cap + STEP_MAX clip are preserved', () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
-    const narrativeLines = Array.from({ length: 9 }, (_, i) => `step ${i + 1}`)
-    const out = renderWorkerActivity(view({ narrativeLines }))
-    // Overflow header must appear (legacy cap active).
-    expect(out).toContain('<i>✓ +3 earlier…</i>')
-    expect(out).not.toContain('step 1')
-    expect(out).toContain('step 4')
-    expect(out).toContain('<b>→ step 9</b>')
-    expect(out.match(/step \d/g) ?? []).toHaveLength(6)
-  })
-
-  it('no-truncate OFF (=0): a 150-char line is clipped at STEP_MAX (regression guard)', () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
-    const longLine = 'x'.repeat(150)
-    const out = renderWorkerActivity(view({ narrativeLines: [longLine] }))
-    // Per-line clip must apply when flag is OFF.
-    expect(out).toContain('…')
-    expect(out).not.toContain(longLine)
-  })
-
-  it('no-truncate ON + pathologically oversized body: char-budget backstop fires, output ≤ 4096 chars', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    // 5 huge lines × ~900 chars each → well over 4000 chars rendered.
+  it('pathologically oversized body: char-budget backstop fires, output ≤ 4096 chars', () => {
     const bigLine = 'z'.repeat(900)
-    const narrativeLines = Array.from({ length: 5 }, () => bigLine)
+    const narrativeLines = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine)
     const out = renderWorkerActivity(view({ narrativeLines }))
-    // Hard invariant: must never exceed Telegram's 4096 char limit.
     expect(out.length).toBeLessThanOrEqual(4096)
-    // The newest step must still be present (some portion of it).
     const hasBullet = out.includes('→') || out.includes('✓')
     expect(hasBullet).toBe(true)
   })
 })
 
-describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative accumulation', () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-  })
-
-  it('no-truncate ON: rolling window — with 12 pushes, only the last STATUS_ROLLING_LINES appear in render', async () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
+describe('rolling window — createWorkerActivityFeed narrative accumulation', () => {
+  it('with 12 pushes, only the last STATUS_ROLLING_LINES appear in the render', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
 
-    // Use zero-padded names to avoid substring collisions (ln-001 vs ln-010).
     for (let i = 1; i <= 12; i++) {
       clock += 1000
       await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `ln-${String(i).padStart(3, '0')}` }))
@@ -610,60 +574,137 @@ describe('SWITCHROOM_STATUS_NO_TRUNCATE — createWorkerActivityFeed narrative a
 
     const last = bot.edits.at(-1)!
     const firstVisible = 12 - STATUS_ROLLING_LINES + 1
-    // The last STATUS_ROLLING_LINES lines must be present.
     for (let i = firstVisible; i <= 12; i++) {
       expect(last.text).toContain(`ln-${String(i).padStart(3, '0')}`)
     }
-    // Earlier lines must have rolled off.
     for (let i = 1; i < firstVisible; i++) {
       expect(last.text).not.toContain(`ln-${String(i).padStart(3, '0')}`)
     }
-    // No overflow header in no-truncate mode.
+    // The manager caps the in-memory narrative at STATUS_ROLLING_LINES, so the
+    // render never sees overflow — no "+N earlier…" marker on the manager path
+    // (it surfaces only on direct renderWorkerActivity calls with >5 lines).
     expect(last.text).not.toContain('earlier…')
     expect(last.text).toContain('<b>→ ln-012</b>')
   })
+})
 
-  it('no-truncate OFF (=0): narrative is still spliced to NARRATIVE_MAX_LINES (original behaviour)', async () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
+// ─── Worker heartbeat (option a — suffix-only, never opens a new message) ─────
+
+describe('createWorkerActivityFeed — heartbeat', () => {
+  it('(i) a tick fires a re-render with a climbing · Ns suffix on a stale worker', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
-    const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 2500,
+      heartbeatTickMs: 6000,
+      // No real timer: drive ticks manually.
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000).
+    clock = 19_000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
+    expect(bot.sent).toHaveLength(1)
+    const dispatchAt = clock - 9000
 
-    for (let i = 1; i <= 9; i++) {
-      clock += 1000
-      await feed.update('w1', 'chat', view({ toolCount: i, latestSummary: `line ${i}` }))
-    }
-
-    const last = bot.edits.at(-1)!
-    expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(6)
-    expect(last.text).not.toContain('line 1')
-    expect(last.text).not.toContain('line 3')
-    expect(last.text).toContain('line 4')
-    expect(last.text).toContain('line 9')
+    // Advance past the staleness window so the heartbeat ticks.
+    clock = 26_000 // lastEditAt(19000) + 7000 ≥ heartbeatTickMs(6000) and ≥ minEditInterval
+    feed.heartbeatTick()
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
+    // Drain the chain.
+    await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
+    const edit1 = bot.edits.find((e) => /· \d+s<\/b>/.test(e.text))
+    expect(edit1).toBeDefined()
+    // The suffix reflects the LIVE elapsed (now - dispatchAt), not the stale view.
+    expect(edit1!.text).toContain(`· ${Math.floor((26_000 - dispatchAt) / 1000)}s`)
   })
 
-  it('no-truncate ON: env-flip seam works (set/delete per test)', () => {
-    // Verify the seam: after setting '0', the flag reads as OFF (legacy cap).
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = '0'
-    // Use zero-padded names to avoid substring collisions.
-    const total = NARRATIVE_MAX_LINES + 2
-    const lines = Array.from({ length: total }, (_, i) => `sv-${String(i + 1).padStart(3, '0')}`)
-    const offOut = renderWorkerActivity(view({ narrativeLines: lines }))
-    expect(offOut).toContain('+2 earlier')
+  it('(ii) respects a 429 cooldown — no edit while cooldownUntil is in the future', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      heartbeatTickMs: 6000,
+      firstPaintMinMs: 0,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    await feed.update('w1', 'chat', view({ elapsedMs: 1000, latestSummary: 'go' }))
+    expect(bot.sent).toHaveLength(1)
+    // Induce a cooldown by failing the next edit with a 429.
+    clock = 20_000
+    bot.failNextEditWith = { error_code: 429, parameters: { retry_after: 30 } }
+    await feed.update('w1', 'chat', view({ elapsedMs: 11_000, latestSummary: 'changed' }))
+    const editsAfterCooldown = bot.edits.length
+    // Tick while still inside the cooldown window → no new edit.
+    clock = 27_000
+    feed.heartbeatTick()
+    await feed.update('w1', 'chat', view({ elapsedMs: 18_000, latestSummary: 'changed' }))
+    expect(bot.edits.length).toBe(editsAfterCooldown)
+  })
 
-    // After deleting, the flag reads as ON (rolling-5-full).
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    const onOut = renderWorkerActivity(view({ narrativeLines: lines }))
-    // No overflow header in no-truncate mode.
-    expect(onOut).not.toContain('earlier…')
-    // Only the last STATUS_ROLLING_LINES lines should be visible.
-    const firstVisible = total - STATUS_ROLLING_LINES + 1
-    for (let i = firstVisible; i <= total; i++) {
-      expect(onOut).toContain(`sv-${String(i).padStart(3, '0')}`)
-    }
-    for (let i = 1; i < firstVisible; i++) {
-      expect(onOut).not.toContain(`sv-${String(i).padStart(3, '0')}`)
-    }
+  it('(iii) does not edit after the handle is removed on finish', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 0,
+      heartbeatTickMs: 6000,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    await feed.update('w1', 'chat', view({ latestSummary: 'go' }))
+    clock = 20_000
+    await feed.finish('w1', view({ state: 'done', toolCount: 2 }))
+    expect(feed.has('w1')).toBe(false)
+    const editsBefore = bot.edits.length
+    clock = 30_000
+    feed.heartbeatTick()
+    // No handle → tick is a no-op, no further edit.
+    expect(bot.edits.length).toBe(editsBefore)
+  })
+
+  it('(iv) stop() clears the interval and a tick on empty handles is a no-op (no leak)', () => {
+    let cleared = false
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      setInterval: () => 1,
+      clearInterval: () => { cleared = true },
+    })
+    // No handles yet → tick does nothing and does not throw.
+    expect(() => feed.heartbeatTick()).not.toThrow()
+    feed.stop()
+    expect(cleared).toBe(true)
+  })
+
+  it('(v) respects minEditInterval — a tick inside the throttle window does not edit', async () => {
+    const bot = makeFakeBot()
+    let clock = 10_000
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      minEditIntervalMs: 2500,
+      heartbeatTickMs: 6000,
+      firstPaintMinMs: 0,
+      setInterval: () => 1,
+      clearInterval: () => {},
+    })
+    await feed.update('w1', 'chat', view({ elapsedMs: 1000, latestSummary: 'go' }))
+    expect(bot.sent).toHaveLength(1)
+    const editsBefore = bot.edits.length
+    // Tick only 1000ms after the paint — inside minEditInterval (2500) → no edit.
+    clock = 11_000
+    feed.heartbeatTick()
+    await feed.update('w1', 'chat', view({ elapsedMs: 2000, latestSummary: 'go' })).catch(() => {})
+    expect(bot.edits.length).toBe(editsBefore)
   })
 })
 
@@ -698,12 +739,7 @@ function isValidWorkerHtml(s: string): boolean {
 }
 
 describe('extreme-edge: single oversized narrative line (no-truncate ON)', () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-  })
-
   it('no-truncate ON: one ~4100-char step is shown (truncated) not discarded, output ≤ budget and valid HTML', async () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
@@ -731,7 +767,6 @@ describe('extreme-edge: single oversized narrative line (no-truncate ON)', () =>
   })
 
   it('no-truncate ON: one ~4100-char step via renderWorkerActivity directly → ≤ budget and valid HTML', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const base = 'compile && link && package && ship: action=deploy env=<prod> flag=1 '
     const hugeStep = base.repeat(65)
     expect(hugeStep.length).toBeGreaterThan(4000)
@@ -764,10 +799,6 @@ describe('extreme-edge: single oversized narrative line (no-truncate ON)', () =>
 // identified (&am, &l). They assert the output is valid HTML and within budget.
 
 describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities', () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-  })
-
   /**
    * Build a narrative line that, after HTML-escaping, has the entity boundary
    * at a precise position so a naive `escaped.slice(3, 3 + N)` would split it.
@@ -786,7 +817,6 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   }
 
   it('& at entity boundary: output is valid HTML (no &am, &amp without ; etc.)', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     // A line that places '&' right at the slice boundary so naive cut → &am
     const line = buildEntityBoundaryLine('&', 4096)
     expect(line.length).toBeGreaterThan(100) // sanity: line is substantial
@@ -802,7 +832,6 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   })
 
   it('< at entity boundary: output is valid HTML (no &l, &lt without ; etc.)', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const line = buildEntityBoundaryLine('<', 4096)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
@@ -814,7 +843,6 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   })
 
   it('> at entity boundary: output is valid HTML (no &g, &gt without ; etc.)', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     const line = buildEntityBoundaryLine('>', 4096)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
@@ -826,7 +854,6 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   })
 
   it('entity-dense line (& < > interleaved): output ≤ budget and valid HTML', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     // Mix entity characters throughout so any slice position is dangerous.
     const chunk = '&' + 'x'.repeat(3) + '<' + 'y'.repeat(3) + '>' + 'z'.repeat(3)
     const line = chunk.repeat(500) // ~10k chars raw → well over budget after escape
@@ -841,7 +868,6 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   it('single & alone in the line: valid HTML and within budget', () => {
     // Regression: a one-char entity line is a degenerate case the while-loop
     // must handle without infinite-looping or returning empty content.
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
     // Build a huge line: filler xs then '&' then more xs
     const line = 'x'.repeat(3000) + '&' + 'x'.repeat(1000)
     expect(line.length).toBeGreaterThan(4000)
@@ -853,78 +879,44 @@ describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities
   })
 })
 
-// ─── Regression: header/status row survives char-budget trimming ─────────────
+// ─── Regression: header/status row + rolling overflow survive trimming ───────
 //
-// These tests assert that the "running · elapsed · tools" status row (lines[1])
-// is always present in the rendered output, even when _fitWorkerBodyToCharBudget
-// fires and drops oldest step lines to fit the 4000-char budget.
-//
-// Root-cause history:
-//   - 68f956a9 introduced _fitWorkerBodyToCharBudget WITH a "+N earlier" counter
-//   - d7d7d140 removed "+N earlier" from the fitting loop, breaking the card's
-//     visible "header row" of dropped-step context
-//   - 5262be25 (PR #2511) added a raw-then-escape extreme fallback, but
-//     introduced a regression where rawNewestStep='' returns only fixedJoined
-//     (the two header lines alone, with no step bullet)
-//
-// The fix restores "+N earlier" in the fitting loop and falls back to recovering
-// raw text from newestLine when rawNewestStep is empty.
+// The unified renderer clips every line to STATUS_LINE_MAX (200) BEFORE the
+// char-budget backstop, so ordinary "long step" turns fit the budget without
+// dropping any bullets. The two-line header always survives, and a rolling
+// "+N earlier…" marker appears when more than STATUS_ROLLING_LINES lines are
+// rendered directly. The char-budget backstop (fitCardToBudget) is exercised
+// only by genuinely pathological single oversized lines (covered elsewhere).
 
-describe('_fitWorkerBodyToCharBudget: header row and +N earlier counter regressions', () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-  })
-
-  it('status line ("running · … · N tools") survives when budget fitter drops steps', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    // Build 6 narrative lines where 5 of them are very long, forcing the budget
-    // fitter to drop some but keep at least one. The fixed header (2 lines) must
-    // always survive intact.
+describe('header row + rolling overflow survive in the unified worker render', () => {
+  it('the two-line header survives even with many long lines (clipped to STATUS_LINE_MAX)', () => {
     const bigLine = 'a'.repeat(700)
     const narrativeLines = Array.from({ length: 6 }, (_, i) =>
       i < 5 ? bigLine : 'final short step',
     )
     const out = renderWorkerActivity(view({ narrativeLines, toolCount: 7 }))
 
-    // The worker header (line 0) must be present.
     expect(out).toContain('🛠 <b>Worker</b>')
-    // The status line (line 1) must ALWAYS survive trimming.
-    expect(out).toContain('running · ')
+    // Unified running status line.
+    expect(out).toContain('<i>10s · 7 tools</i>')
     expect(out).toContain('7 tools')
-    // Output must be within Telegram's budget.
+    // Every rendered line was clipped to STATUS_LINE_MAX → output well within budget.
     expect(out.length).toBeLessThanOrEqual(4096)
+    // Newest bullet is the live → step.
+    expect(out).toContain('<b>→ final short step</b>')
   })
 
-  it('a "+N earlier" counter appears when the budget fitter drops oldest steps', () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    // With no-truncate ON, appendStepFeed passes at most STATUS_ROLLING_LINES (5)
-    // lines to the body. To trigger _fitWorkerBodyToCharBudget's fitting loop, we
-    // need 5 lines that together exceed 4000 chars.
-    // Use 4 × 820-char lines + 1 short line: 4×820 = 3280 step chars plus
-    // markup overhead (~4×(5+5)=80) + headers (~80) = ~3440 chars, still under
-    // budget; but with the newest kept short, the 4 big lines dominate. To reliably
-    // overflow the budget, use lines large enough that even 2 lines exceed 4000:
-    // 5 × 800-char lines → 5×810 = 4050 step chars + headers ~80 → ~4130 > 4000.
-    const bigLine = 'b'.repeat(800)
-    const narrativeLines = Array.from({ length: 5 }, () => bigLine)
+  it('a "+N earlier…" rolling marker appears when more than STATUS_ROLLING_LINES lines render', () => {
+    const narrativeLines = Array.from({ length: STATUS_ROLLING_LINES + 2 }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    // The "+N earlier" overflow counter must appear between the header and steps.
     expect(out).toContain('earlier…')
-    // The worker header and status line are always in the fixed slice.
     expect(out).toContain('🛠 <b>Worker</b>')
-    expect(out).toContain('running · ')
+    expect(out).toContain('<i>10s · ')
   })
 
-  it('back-compat path (latestSummary only, empty narrativeLines) still shows a step bullet when budget is exceeded', () => {
-    // Regression from PR #2511: when narrativeLines is empty, rawNewestStep=''
-    // and the extreme fallback previously returned only fixedJoined (two header
-    // lines with no step bullet). The fix falls back to recovering raw text from
-    // the already-escaped newestLine when rawNewestStep=''.
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE
-    // Use latestSummary only (no narrativeLines) and make it huge enough to
-    // exceed the char budget even with just the 2 header lines + this one step.
+  it('back-compat path (latestSummary only) still shows a step bullet, clipped + valid HTML', () => {
     const hugeSummary = 'deploy service && run migrations && verify health checks '.repeat(80)
     expect(hugeSummary.length).toBeGreaterThan(4000)
 
@@ -933,13 +925,10 @@ describe('_fitWorkerBodyToCharBudget: header row and +N earlier counter regressi
     )
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    // The step bullet MUST be present (regression guard: must not be only headers).
     const hasBullet = out.includes('→') || out.includes('✓')
     expect(hasBullet).toBe(true)
-    // Header rows must be present.
     expect(out).toContain('🛠 <b>Worker</b>')
-    expect(out).toContain('running · ')
-    // Valid HTML.
+    expect(out).toContain('<i>10s · ')
     expect(isValidWorkerHtml(out)).toBe(true)
   })
 })

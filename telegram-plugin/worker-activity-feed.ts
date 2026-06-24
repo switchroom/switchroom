@@ -34,13 +34,11 @@
 
 import {
   cleanWorkerResultParagraph,
-  escapeHtml,
-  formatDuration,
   stripMarkdown,
   truncate,
 } from './card-format.js'
-import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
-import { renderStepFeed } from './tool-activity-summary.js'
+import { STATUS_ROLLING_LINES } from './status-no-truncate.js'
+import { renderStatusCard, formatFeedElapsed } from './tool-activity-summary.js'
 
 /** Worker-activity feed is ON by default; an operator opts out with
  *  SWITCHROOM_WORKER_ACTIVITY_FEED=0. */
@@ -88,173 +86,88 @@ export interface BotApiForWorkerFeed {
   ): Promise<unknown>
 }
 
+/** Dispatch-time task description cap for the worker header. */
 const DESC_MAX = 80
-const STEP_MAX = 100
-const RESULT_MAX = 320
-/** Subtle horizontal rule between the running feed and the finished result. */
-const RULE = '─────'
 /**
- * How many trailing narrative lines the live feed keeps visible. The feed
- * grows like the main agent's answer but can't grow unbounded — Telegram
- * caps message length and a wall of stale lines buries the live one. Six
- * keeps recent context without dominating the chat.
+ * Legacy narrative-line cap, kept exported for back-compat with importers.
+ * The rolling window is now STATUS_ROLLING_LINES; this is no longer the active
+ * cap but remains a documented constant some callers/tests still reference.
  */
 export const NARRATIVE_MAX_LINES = 6
 
 /**
- * Append the accumulated step feed to `lines` using the shared `renderStepFeed`
- * from tool-activity-summary.ts. This thin wrapper preserves the worker-feed
- * call signature (passing `allDone` + `noTruncate`) while deleting the formerly
- * duplicated windowing logic. `steps` are already cleaned + escaped HTML.
- */
-function appendStepFeed(lines: string[], steps: string[], allDone: boolean, noTruncate = false): void {
-  renderStepFeed(lines, steps, allDone, noTruncate, NARRATIVE_MAX_LINES)
-}
-
-/**
- * Render the worker-activity message body as native Telegram HTML, matching
- * the main agent's activity card (`renderActivityFeed` in
- * tool-activity-summary.ts): a `🛠 Worker · <desc>` header, a one-line status,
- * then a `✓`/`→` step feed. Worker narration is authored as Markdown, so every
- * text fragment is run through `stripMarkdown` before escaping — without it the
- * raw `**`/`` ` ``/`---` leak through as literal characters (the "half-done"
- * look we're fixing).
+ * Thin adapter over the unified `renderStatusCard` primitive (emoji 🛠, label
+ * 'Worker'): builds the header, passes raw narrative steps (the primitive runs
+ * stripMarkdown → collapse ws → clip → escape per line), and on finish passes
+ * the cleaned result paragraph as the `result` block.
  *
  * Layout (running):
  *   🛠 <b>Worker</b> · <i>{description}</i>
- *   <i>running · {elapsed} · {n} tools</i>
+ *   <i>{elapsed} · {n} tools</i>
  *   <i>✓ {earlier step}</i>
  *   <b>→ {newest step}</b>
  *
  * Layout (finished): the feed renders all-done, then a rule + cleaned result:
  *   🛠 <b>Worker</b> · <i>{description}</i>
- *   <i>finished · completed · {n} tools · {elapsed}</i>
+ *   <i>done · {n} tools · {elapsed}</i>
  *   <i>✓ {step}</i>
  *   ─────
  *   ✅ <i>{cleaned result paragraph}</i>
  */
-export function renderWorkerActivity(v: WorkerActivityView): string {
-  const noTruncate = statusNoTruncate()
+export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): string {
   const desc = truncate(stripMarkdown(v.description).trim() || 'background task', DESC_MAX)
-  const elapsed = formatDuration(v.elapsedMs)
-  const toolWord = v.toolCount === 1 ? 'tool' : 'tools'
-  const header = `🛠 <b>Worker</b> · <i>${escapeHtml(desc)}</i>`
   const finished = v.state === 'done' || v.state === 'failed'
 
-  // Clean narrative lines (strip Markdown, collapse whitespace) but keep the
-  // raw (pre-HTML-escape) strings so the char-budget fitter can truncate raw
-  // content first and then escape, avoiding broken HTML entities at the slice
-  // boundary (e.g. &amp; → &amp or &lt; → &l after a naive escaped-string cut).
-  const rawSteps = (v.narrativeLines ?? [])
-    .map((s) => stripMarkdown(s).replace(/\s+/g, ' ').trim())
-    .filter((s) => s.length > 0)
-  // Escape + clip (clip only in legacy mode) for the rendered feed.
-  const steps = rawSteps.map((s) => escapeHtml(noTruncate ? s : truncate(s, STEP_MAX)))
-  // Newest raw step: used by _fitWorkerBodyToCharBudget's extreme fallback to
-  // truncate raw text before escaping (mirrors _fitToCharBudget in tool-activity-summary.ts).
-  const rawNewestStep = rawSteps[rawSteps.length - 1] ?? ''
+  // Raw narrative steps (unstripped/unescaped) — the unified renderer runs the
+  // full per-line pipeline (stripMarkdown → collapse ws → clip → escape).
+  const rawSteps = (v.narrativeLines ?? []).filter((s) => s != null && s.trim().length > 0)
 
-  if (finished) {
-    const verb = v.state === 'done' ? 'completed' : 'failed'
-    const lines = [header, `<i>finished · ${verb} · ${v.toolCount} ${toolWord} · ${elapsed}</i>`]
-    appendStepFeed(lines, steps, true, noTruncate)
-    // On terminal, latestSummary carries the worker's final result text
-    // (gateway onFinish), distinct from the running narrative steps.
-    const result = cleanWorkerResultParagraph(v.latestSummary)
-    if (result.length > 0) {
-      const emoji = v.state === 'done' ? '✅' : '⚠️'
-      lines.push(RULE)
-      lines.push(`${emoji} <i>${escapeHtml(truncate(result, RESULT_MAX))}</i>`)
-    }
-    const body = lines.join('\n')
-    return noTruncate ? _fitWorkerBodyToCharBudget(body, lines, rawNewestStep) : body
-  }
-
-  const lines = [header, `<i>running · ${elapsed} · ${v.toolCount} ${toolWord}</i>`]
-  if (steps.length > 0) {
-    appendStepFeed(lines, steps, false, noTruncate)
-  } else {
-    // Back-compat for direct render callers that pass only latestSummary;
-    // the manager always supplies narrativeLines.
+  // Back-compat for direct render callers that pass only latestSummary while
+  // RUNNING; the manager always supplies narrativeLines. On the FINISHED path
+  // latestSummary is the worker's RESULT (below), never a narrative step — so
+  // the fallback only applies while running.
+  let steps = rawSteps
+  if (steps.length === 0 && !finished) {
     const summary = stripMarkdown(v.latestSummary).replace(/\s+/g, ' ').trim()
-    if (summary.length > 0) {
-      // In no-truncate mode, render in full (no STEP_MAX clip); legacy mode preserves the clip.
-      lines.push(`<b>→ ${escapeHtml(noTruncate ? summary : truncate(summary, STEP_MAX))}</b>`)
-    } else {
-      lines.push('<i>starting…</i>')
-    }
+    if (summary.length > 0) steps = [v.latestSummary]
   }
-  const body = lines.join('\n')
-  return noTruncate ? _fitWorkerBodyToCharBudget(body, lines, rawNewestStep) : body
-}
 
-/**
- * Internal helper: when no-truncate mode produces a body that exceeds the
- * Telegram char budget, drop the oldest step-feed lines (the ones after the
- * two fixed header lines) until it fits. The two fixed header lines (🛠 Worker
- * header + status line) are always kept.
- *
- * If the final (newest) feed line is itself oversized, it is hard-truncated so
- * at least some step content survives — never returning a body with no step
- * bullet. `rawNewestStep` is the raw (un-HTML-escaped) text of that newest step
- * so the extreme fallback can truncate RAW content first, then escape and wrap.
- *
- * Never slice already-escaped HTML — that breaks entities (&amp; → &amp) and
- * leaves dangling tags. Truncate the RAW content first, then escape and wrap,
- * re-checking post-escape because escaping can expand (&→&amp;).
- * Mirrors the identical strategy in `_fitToCharBudget` (tool-activity-summary.ts).
- */
-function _fitWorkerBodyToCharBudget(body: string, lines: string[], rawNewestStep: string): string {
-  if (body.length <= STATUS_CARD_CHAR_BUDGET) return body
-  // lines[0] = header, lines[1] = status line, lines[2..] = step feed + optional rule/result
-  const fixed = lines.slice(0, 2)
-  const feed = lines.slice(2)
-  // Try dropping oldest feed lines until the output fits (keeping the newest).
-  // Re-insert a "+N earlier" overflow counter so users know steps were dropped —
-  // this also ensures the status line (lines[1], "running · elapsed · tools")
-  // is always preserved in `fixed` and never accidentally omitted from the output.
-  for (let drop = 1; drop < feed.length; drop++) {
-    const kept = feed.slice(drop)
-    const candidate = [...fixed, `<i>✓ +${drop} earlier…</i>`, ...kept].join('\n')
-    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
+  const header: Parameters<typeof renderStatusCard>[0]['header'] = {
+    emoji: '🛠',
+    label: 'Worker',
+    description: desc,
+    elapsedMs: v.elapsedMs,
+    toolCount: v.toolCount,
+    state: v.state,
   }
-  // Extreme: the newest feed line is itself oversized. Never slice the already-
-  // escaped HTML string — that splits entities (&amp;lt; → &amp;l, &amp;am…).
-  // Instead: truncate the RAW step content first, then escape and wrap, checking
-  // post-escape because escaping can expand the length (&→&amp;).
-  const newestLine = feed[feed.length - 1] ?? ''
-  const fixedJoined = fixed.join('\n')
-  const isBold = newestLine.startsWith('<b>')
-  const isItalic = newestLine.startsWith('<i>')
-  const openTag = isBold ? '<b>' : isItalic ? '<i>' : ''
-  const closeTag = isBold ? '</b>' : isItalic ? '</i>' : ''
-  const prefix = isBold ? '→ ' : isItalic ? '✓ ' : ''
-  const wrapperOverhead = openTag.length + prefix.length + closeTag.length
-  const overhead = fixedJoined.length + 1 // +1 for the \n joining fixed and newest
-  const maxNewest = Math.max(0, STATUS_CARD_CHAR_BUDGET - overhead)
-  // rawNewestStep may be '' on the back-compat path (latestSummary used instead
-  // of narrativeLines). In that case fall back to recovering raw text from the
-  // already-escaped newestLine by stripping its HTML tags.
-  const rawForTruncation =
-    rawNewestStep.length > 0
-      ? rawNewestStep
-      : newestLine.replace(/<[^>]+>/g, '').replace(/^[→✓]\s*/, '')
-  if (maxNewest > wrapperOverhead && rawForTruncation.length > 0) {
-    const maxRaw = maxNewest - wrapperOverhead
-    let raw = rawForTruncation.slice(0, maxRaw)
-    let escaped = escapeHtml(raw)
-    // Re-check post-escape: escaping can expand the string (& → &amp; etc.).
-    while (raw.length > 0 && wrapperOverhead + escaped.length > maxNewest) {
-      const excess = wrapperOverhead + escaped.length - maxNewest
-      raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
-      escaped = escapeHtml(raw)
-    }
-    if (escaped.length > 0) {
-      return [fixedJoined, `${openTag}${prefix}${escaped}${closeTag}`].join('\n')
-    }
+
+  // Terminal: latestSummary carries the worker's final result text (gateway
+  // onFinish), distinct from the running narrative steps. Pass it as `result`.
+  let result: { emoji: string; text: string } | undefined
+  if (finished) {
+    const text = cleanWorkerResultParagraph(v.latestSummary)
+    if (text.length > 0) result = { emoji: v.state === 'done' ? '✅' : '⚠️', text }
   }
-  // Absolute last resort: just the fixed headers (budget too tight even for one char).
-  return fixedJoined
+
+  // `renderStatusCard` always returns content when a header is supplied. When
+  // running with no steps it shows just the header — append a "starting…" line
+  // for parity with the prior behaviour.
+  const card = renderStatusCard({
+    header,
+    steps,
+    final: finished,
+    liveSuffix: finished ? '' : liveSuffix,
+    result,
+  })
+  if (card == null) {
+    // Unreachable (header always present) — defensive.
+    return `🛠 <b>Worker</b> · <i>starting…</i>`
+  }
+  if (!finished && steps.length === 0) {
+    // Header-only running render → append the starting placeholder.
+    return `${card}\n<i>starting…</i>`
+  }
+  return card
 }
 
 export interface WorkerActivityFeedOpts {
@@ -277,6 +190,19 @@ export interface WorkerActivityFeedOpts {
   firstPaintMinMs?: number
   /** stderr-style log sink. Defaults to noop. */
   log?: (msg: string) => void
+  /**
+   * Heartbeat timer factory. Injectable for tests. Defaults to the real
+   * `setInterval`, `.unref()`'d so it never keeps the process alive.
+   */
+  setInterval?: (cb: () => void, ms: number) => unknown
+  /** Heartbeat timer disposer. Injectable for tests. Defaults to `clearInterval`. */
+  clearInterval?: (handle: unknown) => void
+  /**
+   * Heartbeat tick cadence in ms. On each tick a stale, running worker is
+   * re-rendered with a climbing `· Ns` suffix so a worker that emits no new
+   * narrative still visibly advances. Default 6000ms.
+   */
+  heartbeatTickMs?: number
 }
 
 interface WorkerHandle {
@@ -290,14 +216,20 @@ interface WorkerHandle {
   cooldownUntil: number
   /**
    * Accumulated narrative lines (oldest→newest), deduped against the
-   * immediately-preceding line. In no-truncate mode capped to
-   * STATUS_ROLLING_LINES (rolling window); in legacy mode to
-   * NARRATIVE_MAX_LINES. Grows the live render so the feed reads like the
-   * main agent's answer.
+   * immediately-preceding line. Rolling-window capped to STATUS_ROLLING_LINES.
+   * Grows the live render so the feed reads like the main agent's answer.
    */
   narrative: string[]
   /** Per-worker serialization chain so ticks can't interleave sends. */
   chain: Promise<void>
+  /** Last view rendered into the message (drives the heartbeat re-render). */
+  lastView: WorkerActivityView | null
+  /**
+   * Wall-clock ms the worker was dispatched, derived from `now - view.elapsedMs`
+   * on the first update. The heartbeat computes a live elapsed from this so the
+   * `· Ns` suffix climbs even when no fresh view arrives.
+   */
+  dispatchAtMs: number | null
 }
 
 const COOLDOWN_JITTER_MS = 500
@@ -331,6 +263,10 @@ export interface WorkerActivityFeed {
   finish(agentId: string, view: WorkerActivityView): Promise<void>
   /** Forget a worker's state without editing (e.g. error path). */
   drop(agentId: string): void
+  /** Clear the heartbeat interval (gateway shutdown). Idempotent. */
+  stop(): void
+  /** Manually fire one heartbeat tick (test hook). */
+  heartbeatTick(): void
   /** Number of tracked workers (test/inspection hook). */
   readonly size: number
 }
@@ -340,7 +276,18 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const nowFn = opts.now ?? Date.now
   const minEditInterval = opts.minEditIntervalMs ?? 2500
   const firstPaintMin = opts.firstPaintMinMs ?? 8000
+  const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
+  const setIntervalFn =
+    opts.setInterval ??
+    ((cb: () => void, ms: number): unknown => {
+      const t = setInterval(cb, ms)
+      // Never keep the process alive on the heartbeat alone.
+      ;(t as { unref?: () => void }).unref?.()
+      return t
+    })
+  const clearIntervalFn = opts.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
   const handles = new Map<string, WorkerHandle>()
+  let heartbeatTimer: unknown = null
 
   function sendOptsFor(h: WorkerHandle): Record<string, unknown> {
     return {
@@ -364,27 +311,25 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     // same narrative across ticks while a tool runs; we only grow on change.
     if (h.narrative[h.narrative.length - 1] === line) return
     h.narrative.push(line)
-    if (statusNoTruncate()) {
-      // No-truncate mode: rolling window — keep only the last STATUS_ROLLING_LINES
-      // in memory. The render always shows exactly those lines (full content, no
-      // per-line clip). _fitWorkerBodyToCharBudget is the wire-limit backstop.
-      if (h.narrative.length > STATUS_ROLLING_LINES) {
-        h.narrative.splice(0, h.narrative.length - STATUS_ROLLING_LINES)
-      }
-    } else {
-      // Truncate mode: hard cap to NARRATIVE_MAX_LINES (original behaviour).
-      if (h.narrative.length > NARRATIVE_MAX_LINES) {
-        h.narrative.splice(0, h.narrative.length - NARRATIVE_MAX_LINES)
-      }
+    // Rolling window — keep only the last STATUS_ROLLING_LINES in memory. The
+    // render shows exactly those lines (clipped per-line by the unified pipeline);
+    // fitCardToBudget is the wire-limit backstop.
+    if (h.narrative.length > STATUS_ROLLING_LINES) {
+      h.narrative.splice(0, h.narrative.length - STATUS_ROLLING_LINES)
     }
   }
 
-  async function doUpdate(h: WorkerHandle, view: WorkerActivityView): Promise<void> {
+  async function doUpdate(h: WorkerHandle, view: WorkerActivityView, liveSuffix = ''): Promise<void> {
     // Accumulate before any gate so a throttled/cooled-down tick still grows
     // the narrative — the line surfaces on the next edit that does fire.
     accumulateNarrative(h, view)
+    // Stamp the dispatch wall-clock once so the heartbeat can climb a live
+    // elapsed even between fresh views. lastView feeds the heartbeat re-render.
+    const merged: WorkerActivityView = { ...view, narrativeLines: [...h.narrative] }
+    h.lastView = merged
+    if (h.dispatchAtMs == null) h.dispatchAtMs = nowFn() - view.elapsedMs
     if (nowFn() < h.cooldownUntil) return
-    const body = renderWorkerActivity({ ...view, narrativeLines: h.narrative })
+    const body = renderWorkerActivity(merged, liveSuffix)
 
     // First paint: hold off until the worker has run long enough to be
     // worth a message; trivial workers stay silent (handback covers them).
@@ -455,6 +400,44 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     }
   }
 
+  /**
+   * Heartbeat — option (a), suffix-only, NEVER opens a new message. For each
+   * handle with a posted message, enqueue a re-render through the existing
+   * chain → doUpdate path (never editMessageText directly). Skips:
+   *   - handles with no posted message (messageId == null),
+   *   - handles inside a 429 cooldown,
+   *   - handles edited within minEditInterval (no stampede),
+   *   - non-running handles (terminal/deleted).
+   * The `· Ns` liveSuffix is applied ONLY when the worker's current step is
+   * stale (now - lastEditAt >= heartbeatTickMs) so a normally-ticking worker is
+   * untouched and its body stays byte-stable for the dedup.
+   */
+  function heartbeatTick(): void {
+    const now = nowFn()
+    for (const h of handles.values()) {
+      if (h.messageId == null) continue
+      if (h.lastView == null) continue
+      if (h.lastView.state !== 'running') continue
+      if (now < h.cooldownUntil) continue
+      if (now - h.lastEditAt < minEditInterval) continue
+      const stale = now - h.lastEditAt >= heartbeatTickMs
+      if (!stale) continue
+      const liveElapsed = h.dispatchAtMs != null ? now - h.dispatchAtMs : h.lastView.elapsedMs
+      const liveSuffix = ' · ' + formatFeedElapsed(liveElapsed)
+      // Re-render THROUGH the chain + doUpdate path — never editMessageText directly.
+      const view = h.lastView
+      h.chain = h.chain
+        .then(() => doUpdate(h, view, liveSuffix))
+        .catch((err) => {
+          log(`worker-feed: heartbeat chain error ${h.agentId}: ${(err as Error).message}`)
+        })
+    }
+  }
+
+  // Arm the heartbeat once at construction. The real timer is `.unref()`'d so
+  // it never keeps the process alive; tests inject setInterval/clearInterval.
+  heartbeatTimer = setIntervalFn(heartbeatTick, heartbeatTickMs)
+
   return {
     has(agentId) {
       return handles.get(agentId)?.messageId != null
@@ -478,6 +461,8 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
           cooldownUntil: 0,
           narrative: [],
           chain: Promise.resolve(),
+          lastView: null,
+          dispatchAtMs: null,
         }
         handles.set(agentId, h)
       }
@@ -502,6 +487,13 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     },
     drop(agentId) {
       handles.delete(agentId)
+    },
+    heartbeatTick,
+    stop() {
+      if (heartbeatTimer != null) {
+        clearIntervalFn(heartbeatTimer)
+        heartbeatTimer = null
+      }
     },
   }
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   describeToolUse,
   appendActivityLine,
@@ -8,11 +8,9 @@ import {
   renderActivityFeedWithNested,
   renderActivityHeader,
   formatFeedElapsed,
-  MIRROR_MAX_LINES,
-  NESTED_MAX_LINES,
   type SessionActivityHeader,
 } from "../tool-activity-summary.js";
-import { STATUS_ROLLING_LINES } from "../status-no-truncate.js";
+import { STATUS_ROLLING_LINES, STATUS_LINE_MAX } from "../status-no-truncate.js";
 
 describe("describeToolUse — friendly per-tool rendering (draft-mirror)", () => {
   it("Bash uses the model-authored description verbatim, never the command", () => {
@@ -106,20 +104,21 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     expect(lines).toEqual([]);
   });
 
-  it("caps to the last MIRROR_MAX_LINES with a '✓ +N earlier…' header (no-truncate OFF)", () => {
-    // This test exercises the capping behaviour that is active when the flag is OFF.
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
-    const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
+  it("windows to the last STATUS_ROLLING_LINES with a '✓ +N earlier…' header on the AGENT surface", () => {
+    // The +N earlier header now appears on the AGENT surface too (flag retired).
+    const total = STATUS_ROLLING_LINES + 4;
+    const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines)!;
-    expect(out.startsWith("<i>✓ +3 earlier…</i>\n")).toBe(true);
-    // Only the last 6 actions are shown; the oldest 3 are collapsed.
-    expect(out).toContain("<i>✓ Action 4</i>");
-    expect(out).not.toContain("Action 3");
+    const hidden = total - STATUS_ROLLING_LINES;
+    expect(out.startsWith(`<i>✓ +${hidden} earlier…</i>\n`)).toBe(true);
+    // Only the last STATUS_ROLLING_LINES actions are shown; older ones collapsed.
+    const firstVisible = total - STATUS_ROLLING_LINES + 1;
+    expect(out).toContain(`<i>✓ Action ${firstVisible}</i>`);
+    expect(out).not.toContain(`Action ${firstVisible - 1}<`);
     // The newest action is the in-progress step (bold →); the rest are done (✓).
-    expect(out).toContain("<b>→ Action 9</b>");
-    expect(out).toContain("<i>✓ Action 8</i>");
-    expect(out).not.toContain("<b>→ Action 8</b>");
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
+    expect(out).toContain(`<b>→ Action ${total}</b>`);
+    expect(out).toContain(`<i>✓ Action ${total - 1}</i>`);
+    expect(out).not.toContain(`<b>→ Action ${total - 1}</b>`);
   });
 
   it("HTML-escapes &, <, > in action text (no double-escaping by callers)", () => {
@@ -266,15 +265,13 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     expect(out).toContain("<i>✓ 1 steps</i>");
   });
 
-  it("footer appears even when the feed overflows MIRROR_MAX_LINES (no-truncate OFF)", () => {
-    // This test exercises the overflow-header behaviour that is active when the flag is OFF.
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
-    const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
-    const out = renderActivityFeed(lines, true, "", 9)!;
-    expect(out).toContain("<i>✓ +3 earlier…</i>");
-    expect(out).toContain("<i>✓ 9 steps</i>");
-    expect(out.endsWith("<i>✓ 9 steps</i>")).toBe(true);
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
+  it("footer appears even when the feed overflows the rolling window", () => {
+    const total = STATUS_ROLLING_LINES + 4;
+    const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
+    const out = renderActivityFeed(lines, true, "", total)!;
+    expect(out).toContain(`<i>✓ +${total - STATUS_ROLLING_LINES} earlier…</i>`);
+    expect(out).toContain(`<i>✓ ${total} steps</i>`);
+    expect(out.endsWith(`<i>✓ ${total} steps</i>`)).toBe(true);
   });
 
   it("stepCount is surface-tool-excluded: reply/react count 0, Read+mcp count correctly", () => {
@@ -313,17 +310,15 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     expect(out).toContain("   ↳ <b>→ Looking for foreign keys</b>");
   });
 
-  it("caps the nested block to NESTED_MAX_LINES with a '↳ +N earlier…' header (no-truncate OFF)", () => {
-    // This test exercises the capping behaviour that is active when the flag is OFF.
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
-    const child = Array.from({ length: NESTED_MAX_LINES + 3 }, (_, i) => `step ${i + 1}`);
+  it("windows the nested block to STATUS_ROLLING_LINES with a '↳ +N earlier…' header", () => {
+    const total = STATUS_ROLLING_LINES + 3;
+    const child = Array.from({ length: total }, (_, i) => `step ${i + 1}`);
     const out = renderActivityFeedWithNested(["Delegating: x"], child)!;
-    expect(out).toContain("   ↳ <i>+3 earlier…</i>");
+    expect(out).toContain(`   ↳ <i>+${total - STATUS_ROLLING_LINES} earlier…</i>`);
     // newest nested line is the live → step
-    expect(out).toContain(`   ↳ <b>→ step ${NESTED_MAX_LINES + 3}</b>`);
+    expect(out).toContain(`   ↳ <b>→ step ${total}</b>`);
     // the oldest (collapsed) lines are not rendered verbatim
     expect(out).not.toContain("step 1<");
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
   });
 
   it("renders the child block even when the parent feed is empty", () => {
@@ -435,103 +430,69 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   });
 });
 
-// ─── SWITCHROOM_STATUS_NO_TRUNCATE feature flag tests ───────────────────────
-// New contract (rolling-5-full):
-//   ON  → last STATUS_ROLLING_LINES lines rendered in FULL; no overflow header;
-//          char-budget backstop is the only ceiling.
-//   OFF → MIRROR_MAX_LINES / NESTED_MAX_LINES + per-line clips (legacy, unchanged).
+// ─── Rolling-window + STATUS_LINE_MAX (flag retired) ────────────────────────
+// Contract (single mode, no flag):
+//   - last STATUS_ROLLING_LINES lines render; overflow → `+N earlier…` header
+//     on BOTH surfaces;
+//   - each line clipped to STATUS_LINE_MAX (200) chars then escaped;
+//   - char-budget backstop (fitCardToBudget) is the only wire-limit ceiling.
 
-describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeed", () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-  });
-
-  it("no-truncate ON (default): with 12 lines, exactly the last STATUS_ROLLING_LINES render", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE; // default = ON
-    // Use a prefix that makes substring matches impossible (e.g. "XAct-001" won't match "XAct-010").
+describe("rolling window + +N earlier — renderActivityFeed", () => {
+  it("with 12 lines, exactly the last STATUS_ROLLING_LINES render + a +N earlier header", () => {
     const lines = Array.from({ length: 12 }, (_, i) => `XAct-${String(i + 1).padStart(3, '0')}`);
     const out = renderActivityFeed(lines)!;
     const firstVisible = 12 - STATUS_ROLLING_LINES + 1;
-    // The last STATUS_ROLLING_LINES lines must appear.
     for (let i = firstVisible; i <= 12; i++) {
       expect(out).toContain(`XAct-${String(i).padStart(3, '0')}`);
     }
-    // Earlier lines must NOT appear.
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`XAct-${String(i).padStart(3, '0')}`);
     }
-    // No overflow header in no-truncate mode.
-    expect(out).not.toContain("earlier…");
-    // Newest is still the in-progress step.
+    // Overflow header present on the AGENT surface now.
+    expect(out).toContain(`<i>✓ +${12 - STATUS_ROLLING_LINES} earlier…</i>`);
     expect(out).toContain(`<b>→ XAct-012</b>`);
   });
 
-  it("no-truncate ON: a 150-char line renders in FULL (no '…' per-line truncation)", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    const longLine = "a".repeat(75) + " " + "b".repeat(74); // 150 chars
+  it("STATUS_LINE_MAX=200: a 250-char step is clipped to 200 with a trailing …", () => {
+    const longLine = "a".repeat(250);
     const out = renderActivityFeed([longLine])!;
-    expect(out).toContain(longLine);
+    expect(out).toContain("…");
+    // The full 250-char line must NOT survive; the clip is 200 (199 + …).
+    expect(out).not.toContain(longLine);
+    expect(out).toContain("a".repeat(STATUS_LINE_MAX - 1) + "…");
+  });
+
+  it("a line at exactly STATUS_LINE_MAX is NOT clipped", () => {
+    const exact = "b".repeat(STATUS_LINE_MAX);
+    const out = renderActivityFeed([exact])!;
+    expect(out).toContain(exact);
     expect(out).not.toContain("…");
   });
 
-  it("no-truncate ON: no '✓ +N earlier…' overflow header even with many lines", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    const lines = Array.from({ length: 20 }, (_, i) => `Action ${i + 1}`);
+  it("no spurious overflow header when the feed fits the window", () => {
+    const lines = Array.from({ length: STATUS_ROLLING_LINES }, (_, i) => `Short ${i + 1}`);
     const out = renderActivityFeed(lines)!;
-    expect(out).not.toContain("earlier…");
-  });
-
-  it("no-truncate ON: setting env to '1' (or any non-'0') is also ON", () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "1";
-    const lines = Array.from({ length: MIRROR_MAX_LINES + 2 }, (_, i) => `Step ${i + 1}`);
-    const out = renderActivityFeed(lines)!;
-    // Rolling window: last STATUS_ROLLING_LINES visible, no overflow header.
     expect(out).not.toContain("earlier");
-    expect(out).toContain(`Step ${MIRROR_MAX_LINES + 2}`);
   });
 
-  it("no-truncate OFF (=0): existing truncation behaviour preserved (cap to MIRROR_MAX_LINES)", () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
-    const lines = Array.from({ length: 9 }, (_, i) => `Action ${i + 1}`);
-    const out = renderActivityFeed(lines)!;
-    expect(out.startsWith("<i>✓ +3 earlier…</i>\n")).toBe(true);
-    expect(out).toContain("<i>✓ Action 4</i>");
-    expect(out).not.toContain("Action 3");
-    expect(out).toContain("<b>→ Action 9</b>");
-  });
-
-  it("no-truncate ON + pathologically oversized lines: char-budget backstop fires, output ≤ 4096 chars", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE; // default ON
-    // STATUS_ROLLING_LINES lines of ~900 chars each → well over 4000 chars rendered.
+  it("pathologically oversized lines: char-budget backstop fires, output ≤ 4096 chars", () => {
+    // STATUS_ROLLING_LINES lines of ~900 chars each → over budget pre-clip, but
+    // each line is clipped to 200 first, so the budget should comfortably hold.
     const bigLine = "z".repeat(900);
     const lines = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const out = renderActivityFeed(lines)!;
-    // Hard invariant: output must not exceed Telegram's 4096-char limit.
     expect(out.length).toBeLessThanOrEqual(4096);
-    // The newest line must still be present (some portion of it).
     const hasBullet = out.includes("→") || out.includes("✓");
     expect(hasBullet).toBe(true);
   });
-
-  it("no-truncate ON: no spurious overflow header when feed is small", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    const lines = Array.from({ length: 3 }, (_, i) => `Short step ${i + 1}`);
-    const out = renderActivityFeed(lines)!;
-    expect(out).not.toContain("earlier");
-  });
 });
 
-describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-  });
-
-  it("no-truncate ON: with many parent lines, only the last STATUS_ROLLING_LINES render (no overflow header)", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    const parent = Array.from({ length: MIRROR_MAX_LINES + 3 }, (_, i) => `Parent ${i + 1}`);
+describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
+  it("many parent lines → only the last STATUS_ROLLING_LINES render with a +N earlier header", () => {
+    const totalParent = STATUS_ROLLING_LINES + 3;
+    const parent = Array.from({ length: totalParent }, (_, i) => `Parent ${i + 1}`);
     const child = ["Child step A", "Child step B"];
     const out = renderActivityFeedWithNested(parent, child)!;
-    const totalParent = MIRROR_MAX_LINES + 3;
     const firstVisible = totalParent - STATUS_ROLLING_LINES + 1;
     for (let i = firstVisible; i <= totalParent; i++) {
       expect(out).toContain(`Parent ${i}`);
@@ -539,17 +500,15 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () =>
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`Parent ${i}`);
     }
-    // No overflow header in no-truncate mode.
-    expect(out).not.toContain("earlier…");
+    expect(out).toContain(`<i>✓ +${totalParent - STATUS_ROLLING_LINES} earlier…</i>`);
     expect(out).toContain("   ↳ <b>→ Child step B</b>");
   });
 
-  it("no-truncate ON: with many child lines, only the last STATUS_ROLLING_LINES child lines render", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
+  it("many child lines → only the last STATUS_ROLLING_LINES child lines render with a ↳ +N earlier header", () => {
     const parent = ["Delegating: big task"];
-    const child = Array.from({ length: NESTED_MAX_LINES + 4 }, (_, i) => `Child ${i + 1}`);
+    const totalChild = STATUS_ROLLING_LINES + 4;
+    const child = Array.from({ length: totalChild }, (_, i) => `Child ${i + 1}`);
     const out = renderActivityFeedWithNested(parent, child)!;
-    const totalChild = NESTED_MAX_LINES + 4;
     const firstVisible = totalChild - STATUS_ROLLING_LINES + 1;
     for (let i = firstVisible; i <= totalChild; i++) {
       expect(out).toContain(`Child ${i}`);
@@ -557,38 +516,24 @@ describe("SWITCHROOM_STATUS_NO_TRUNCATE — renderActivityFeedWithNested", () =>
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`Child ${i}`);
     }
-    // No overflow header in no-truncate mode.
-    expect(out).not.toContain("earlier…");
+    expect(out).toContain(`   ↳ <i>+${totalChild - STATUS_ROLLING_LINES} earlier…</i>`);
     expect(out).toContain(`   ↳ <b>→ Child ${totalChild}</b>`);
   });
 
-  it("no-truncate ON: a child line longer than NESTED_LINE_MAX renders in full (no '…' truncation)", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    const longLine = "x".repeat(120); // well over the 90-char NESTED_LINE_MAX
-    const out = renderActivityFeedWithNested(["Delegating"], [longLine])!;
-    // The full long line must appear untruncated (no '…' from NESTED_LINE_MAX).
-    expect(out).toContain(longLine);
-    expect(out).not.toContain(longLine.slice(0, 89) + "…");
-  });
-
-  it("no-truncate OFF (=0): per-line NESTED_LINE_MAX cap is still applied (regression guard)", () => {
-    process.env.SWITCHROOM_STATUS_NO_TRUNCATE = "0";
-    const longLine = "x".repeat(120);
+  it("STATUS_LINE_MAX=200: a 250-char child line is clipped to 200 (both surfaces)", () => {
+    const longLine = "x".repeat(250);
     const out = renderActivityFeedWithNested(["Delegating"], [longLine])!;
     expect(out).toContain("…");
     expect(out).not.toContain(longLine);
+    expect(out).toContain("x".repeat(STATUS_LINE_MAX - 1) + "…");
   });
 
-  it("no-truncate ON + huge nested feed: char-budget backstop fires, output ≤ 4096 chars", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-    // STATUS_ROLLING_LINES parent + STATUS_ROLLING_LINES child lines of ~900 chars each.
+  it("huge nested feed: char-budget backstop fires, output ≤ 4096 chars", () => {
     const bigLine = "w".repeat(900);
     const parent = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const child = Array.from({ length: STATUS_ROLLING_LINES }, () => bigLine);
     const out = renderActivityFeedWithNested(parent, child)!;
-    // Hard invariant: output must not exceed Telegram's 4096-char limit.
     expect(out.length).toBeLessThanOrEqual(4096);
-    // The newest child line must still be present (some portion of it).
     expect(out).toContain("   ↳ ");
   });
 });
@@ -622,13 +567,8 @@ function isValidHtml(s: string): boolean {
   return bOpen === bClose && iOpen === iClose;
 }
 
-describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)", () => {
-  afterEach(() => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
-  });
-
+describe("extreme-edge: single oversized line with &, <, >, &&", () => {
   it("renderActivityFeed: single ~4100-char line with special chars → ≤ budget and valid HTML", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     // Build a raw line >4000 chars with &, <, >, and a trailing &&.
     // The && will escape to &amp;&amp; (5 chars each), exercising the expansion guard.
     const base = "Run script with args: foo=bar && baz=<qux> & corge=1 ";
@@ -645,7 +585,6 @@ describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)"
   });
 
   it("renderActivityFeed final=true: single ~4100-char line → ≤ budget and valid HTML", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const base = "Deploy build && upload && notify && cleanup: ";
     const bigLine = base.repeat(90) + "done";
     expect(bigLine.length).toBeGreaterThan(4000);
@@ -659,7 +598,6 @@ describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)"
   });
 
   it("renderActivityFeedWithNested: single ~4100-char parent line → ≤ budget and valid HTML", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const base = "Parent action with & < > special chars && bash: ";
     const bigLine = base.repeat(85);
     expect(bigLine.length).toBeGreaterThan(4000);
@@ -671,7 +609,6 @@ describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)"
   });
 
   it("renderActivityFeedWithNested: single ~4100-char child line → ≤ budget and valid HTML", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const base = "Child step: run build && test && deploy with <args> & flags=1 ";
     const bigChild = base.repeat(65) + "&&";
     expect(bigChild.length).toBeGreaterThan(4000);
@@ -692,7 +629,6 @@ describe("extreme-edge: single oversized line with &, <, >, && (no-truncate ON)"
   });
 
   it("renderActivityFeedWithNested final=true: single ~4100-char child line → ≤ budget and valid HTML", () => {
-    delete process.env.SWITCHROOM_STATUS_NO_TRUNCATE;
     const base = "Final child: compile && link && package & ship: ";
     const bigChild = base.repeat(85);
     expect(bigChild.length).toBeGreaterThan(4000);
@@ -740,6 +676,49 @@ describe("renderActivityHeader — two-line header builder", () => {
   it("HTML-escapes special chars in description and label", () => {
     const [h1] = renderActivityHeader("🤖", "Agent", "run <foo> & <bar>", 5_000, 1, "running");
     expect(h1).toContain("run &lt;foo&gt; &amp; &lt;bar&gt;");
+  });
+});
+
+describe("agent flat path routes through the shared step-feed primitive", () => {
+  it("flat renderActivityFeed === nested-with-empty-children (same window + +N output)", () => {
+    // The flat agent path and the nested path with NO children must produce the
+    // identical render — both flow through renderStatusCard's step feed.
+    const lines = Array.from({ length: STATUS_ROLLING_LINES + 3 }, (_, i) => `Step ${i + 1}`);
+    expect(renderActivityFeed(lines)).toBe(renderActivityFeedWithNested(lines, []));
+    expect(renderActivityFeed(lines, true, "", 9)).toBe(
+      renderActivityFeedWithNested(lines, [], true, "", 9),
+    );
+    // And the +N earlier marker is present on the flat agent surface.
+    expect(renderActivityFeed(lines)!).toContain(
+      `<i>✓ +${lines.length - STATUS_ROLLING_LINES} earlier…</i>`,
+    );
+  });
+});
+
+describe("escape entity is never split mid-clip (clip raw → escape last)", () => {
+  it("a step ending in '&' clipped at STATUS_LINE_MAX stays valid HTML", () => {
+    // Build a step exactly STATUS_LINE_MAX+1 chars ending in '&' so a naive
+    // escape-then-clip would split the &amp; entity at the boundary.
+    const line = "x".repeat(STATUS_LINE_MAX) + "&";
+    const out = renderActivityFeed([line])!;
+    // The clip keeps STATUS_LINE_MAX-1 chars + '…', then escapes — no stray entity.
+    expect(out).not.toMatch(/&amp$/);
+    expect(out).not.toMatch(/&am[^p]/);
+    expect(out).toContain("…");
+    // Whatever '&' survives must be a complete &amp;.
+    const ampCount = (out.match(/&amp;/g) ?? []).length;
+    const bareAmp = (out.match(/&(?!amp;|lt;|gt;)/g) ?? []).length;
+    expect(bareAmp).toBe(0);
+    expect(ampCount).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a step ending in '<' clipped at STATUS_LINE_MAX stays valid HTML", () => {
+    const line = "y".repeat(STATUS_LINE_MAX) + "<";
+    const out = renderActivityFeed([line])!;
+    expect(out).not.toMatch(/&lt$/);
+    expect(out).not.toMatch(/&l[^t;]/);
+    const bareLt = (out.match(/&(?!amp;|lt;|gt;)/g) ?? []).length;
+    expect(bareLt).toBe(0);
   });
 });
 

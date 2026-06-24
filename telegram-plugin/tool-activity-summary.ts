@@ -163,14 +163,21 @@ export function describeToolUse(
 // Accumulates the turn's actions into a running feed — like Claude Code's
 // own UI — rendered into one Telegram message that edits in place and is
 // cleared on reply. Chronological (oldest first, newest last), consecutive
-// exact-duplicates collapsed, capped to the most recent MIRROR_MAX_LINES
-// with a "+N earlier" header so a heavy turn stays readable.
+// exact-duplicates collapsed.
 //
-// When SWITCHROOM_STATUS_NO_TRUNCATE is not '0' (the default), per-line "…"
-// clips and overflow headers are dropped; only the last STATUS_ROLLING_LINES
-// steps are shown in full, bounded by the 4096-char limit (STATUS_CARD_CHAR_BUDGET).
+// Both this surface (agent) and the worker feed render through the single
+// `renderStatusCard` primitive below: a rolling window of the last
+// STATUS_ROLLING_LINES steps, each capped at STATUS_LINE_MAX chars, with a
+// `+N earlier…` header when the feed overflows, bounded by the 4000-char
+// wire-limit backstop (STATUS_CARD_CHAR_BUDGET).
 
-import { statusNoTruncate, STATUS_CARD_CHAR_BUDGET, STATUS_ROLLING_LINES } from './status-no-truncate.js'
+import {
+  STATUS_CARD_CHAR_BUDGET,
+  STATUS_ROLLING_LINES,
+  STATUS_LINE_MAX,
+  NESTED_PREFIX,
+} from './status-no-truncate.js'
+import { escapeHtml, stripMarkdown, truncate } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
 
 export const MIRROR_MAX_LINES = 6;
@@ -227,11 +234,6 @@ export function clipNarrative(s: string): string {
   return s.split('\n')[0].trim().slice(0, 120);
 }
 
-/** Minimal HTML escape for Telegram parse_mode=HTML (matches the gateway's). */
-export function escapeFeedHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 /**
  * Render a two-line header for the activity card, matching the worker card's
  * style. Used by both the main-session card and the worker card.
@@ -258,8 +260,8 @@ export function renderActivityHeader(
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
   const elapsed = formatFeedElapsed(elapsedMs)
-  const descPart = description.length > 0 ? ` · <i>${escapeFeedHtml(description)}</i>` : ''
-  const line1 = `${emoji} <b>${escapeFeedHtml(label)}</b>${descPart}`
+  const descPart = description.length > 0 ? ` · <i>${escapeHtml(description)}</i>` : ''
+  const line1 = `${emoji} <b>${escapeHtml(label)}</b>${descPart}`
   const line2 = state === 'done'
     ? `<i>done · ${toolCount} ${toolWord} · ${elapsed}</i>`
     : `<i>${elapsed} · ${toolCount} ${toolWord}</i>`
@@ -274,66 +276,249 @@ export function formatFeedElapsed(ms: number): string {
   return `${m}m${(s % 60).toString().padStart(2, '0')}s`
 }
 
+// ─── Truncation pipeline (the single correctness-critical primitive) ────────
+//
+// Per RAW line, in this EXACT order:
+//   1. stripMarkdown(raw)
+//   2. .replace(/\s+/g, ' ').trim()
+//   3. truncate(_, STATUS_LINE_MAX)
+//   4. escapeHtml(_)   ← escape is ALWAYS the last per-line op.
+// Escaping last is load-bearing: clipping an already-escaped string can split
+// an HTML entity (&amp; → &amp), which Telegram's HTML parser rejects.
+
+/** Clean + clip + escape a single raw step line. Returns ready-to-wrap HTML. */
+function escapeStepLine(raw: string): string {
+  const cleaned = stripMarkdown(raw).replace(/\s+/g, ' ').trim()
+  return escapeHtml(truncate(cleaned, STATUS_LINE_MAX))
+}
+
 /**
- * Shared step-feed renderer used by both the main-session card and the worker
- * card. Appends `✓`/`→` bullet lines to `out` for the given pre-escaped
- * step strings.
+ * Shared step-feed emitter. Appends `✓`/`→` bullet lines to `out` for the
+ * given ALREADY-ESCAPED step strings, windowing to STATUS_ROLLING_LINES and
+ * prepending a `+N earlier…` header when the feed overflows the window (on
+ * BOTH surfaces now). The worker feed imports this directly.
  *
- * `steps`     — pre-HTML-escaped step strings (raw text NOT expected here;
- *               callers must escape before passing)
- * `allDone`   — when true ALL steps render done (✓ italic); when false the
- *               newest renders in-progress (→ bold)
- * `noTruncate`— when true: rolling STATUS_ROLLING_LINES window, no overflow
- *               header; when false: cap to MIRROR_MAX_LINES with overflow
- *               header (legacy mode)
- * `maxLines`  — cap in non-noTruncate mode (default MIRROR_MAX_LINES)
- *
- * Mutates `out` in place; returns nothing.
+ * `out`        — accumulator mutated in place
+ * `steps`      — pre-cleaned + pre-escaped HTML step strings
+ * `allDone`    — when true ALL steps render done (✓ italic); when false the
+ *                newest renders in-progress (→ bold)
+ * `liveSuffix` — appended INSIDE the newest in-progress line (heartbeat tick)
  */
 export function renderStepFeed(
   out: string[],
   steps: string[],
   allDone: boolean,
-  noTruncate: boolean,
-  maxLines = MIRROR_MAX_LINES,
   liveSuffix = '',
 ): void {
   if (steps.length === 0) return
-  let shown: string[]
-  if (noTruncate) {
-    shown = steps.slice(-STATUS_ROLLING_LINES)
-    // No overflow header in no-truncate mode — strictly the rolling window.
-  } else {
-    shown = steps.slice(-maxLines)
-    const hidden = steps.length - shown.length
-    if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`)
-  }
+  const shown = steps.slice(-STATUS_ROLLING_LINES)
+  const hidden = steps.length - shown.length
+  if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`)
   const lastIdx = shown.length - 1
   shown.forEach((s, i) => {
     out.push(!allDone && i === lastIdx ? `<b>→ ${s}${liveSuffix}</b>` : `<i>✓ ${s}</i>`)
   })
 }
 
+// ─── Unified status-card primitive ──────────────────────────────────────────
+//
+// Both status surfaces (🤖 agent + 🛠 worker) render through `renderStatusCard`.
+// It is the single place that runs the per-line truncation pipeline, windows
+// the rolling feed, prepends `+N earlier…`, wraps bullets, indents child
+// steps, and applies the total-budget backstop.
+
+/** Header block for a status card. Emoji 🤖 (agent) / 🛠 (worker). */
+export interface StatusCardHeader {
+  emoji: string
+  label: string
+  description?: string
+  elapsedMs: number
+  toolCount: number
+  state: 'running' | 'done' | 'failed'
+}
+
+/** Inputs to the unified status-card renderer. */
+export interface StatusCardOpts {
+  /** Optional two-line header. When omitted, the card is steps-only. */
+  header?: StatusCardHeader
+  /** RAW parent step strings (unstripped, unescaped). */
+  steps: string[]
+  /** RAW nested child step strings (foreground sub-agent), unstripped/unescaped. */
+  childSteps?: string[]
+  /** Terminal record render — newest line renders done (✓) and `liveSuffix` is ignored. */
+  final?: boolean
+  /** Heartbeat suffix appended INSIDE the newest in-progress line (live only). */
+  liveSuffix?: string
+  /** When `final` and > 0, appends a `✓ N steps` footer. */
+  stepCount?: number
+  /** Optional terminal result block (worker recap), already-cleaned text + emoji. */
+  result?: { emoji: string; text: string }
+}
+
+/**
+ * Render the unified status card as ready Telegram HTML, or null when there is
+ * no content to show (no header content, no steps, no children, no result).
+ *
+ * Pipeline: header → escape+clip every raw step/child → rolling-window each
+ * group with `+N earlier…` → wrap (parent done-styled when children present;
+ * newest-in-progress `→` bold else `✓` italic; NESTED_PREFIX for children) →
+ * optional `✓ N steps` footer → optional result block → fitCardToBudget.
+ */
+export function renderStatusCard(opts: StatusCardOpts): string | null {
+  const { header, final = false, liveSuffix = '', stepCount, result } = opts
+  const rawSteps = opts.steps.filter((s) => s != null)
+  const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
+  const hasChildren = rawChildren.length > 0
+
+  // Escape every line through the per-line pipeline (escape last).
+  const steps = rawSteps.map(escapeStepLine)
+  const children = rawChildren.map(escapeStepLine)
+
+  const headerLines = header != null
+    ? renderActivityHeader(
+        header.emoji,
+        header.label,
+        header.description ?? '',
+        header.elapsedMs,
+        header.toolCount,
+        // The header builder only distinguishes done vs running; map 'failed' → done
+        // (the result block carries the failure emoji/text).
+        header.state === 'running' ? 'running' : 'done',
+      )
+    : []
+
+  const out: string[] = [...headerLines]
+
+  if (hasChildren) {
+    // Parent lines all render done — the live → step lives in the nested block.
+    const shownParent = steps.slice(-STATUS_ROLLING_LINES)
+    const hiddenParent = steps.length - shownParent.length
+    if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`)
+    for (const s of shownParent) out.push(`<i>✓ ${s}</i>`)
+    // Child block.
+    const shownChild = children.slice(-STATUS_ROLLING_LINES)
+    const hiddenChild = children.length - shownChild.length
+    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`)
+    const lastChildIdx = shownChild.length - 1
+    shownChild.forEach((s, i) => {
+      out.push(
+        i === lastChildIdx && !final
+          ? `${NESTED_PREFIX}<b>→ ${s}${liveSuffix}</b>`
+          : `${NESTED_PREFIX}<i>${s}</i>`,
+      )
+    })
+  } else {
+    renderStepFeed(out, steps, final, liveSuffix)
+  }
+
+  if (final && stepCount != null && stepCount > 0) {
+    out.push(`<i>✓ ${stepCount} steps</i>`)
+  }
+
+  if (result != null && result.text.length > 0) {
+    out.push(WORKER_RESULT_RULE)
+    out.push(`${result.emoji} <i>${escapeHtml(truncate(result.text, WORKER_RESULT_MAX))}</i>`)
+  }
+
+  // out always carries the two header lines, so it is never empty — but guard
+  // against a degenerate header-less future caller.
+  if (out.length === 0) return null
+  const joined = out.join('\n')
+  if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
+  return fitCardToBudget(opts, headerLines)
+}
+
+/** Subtle horizontal rule between the running feed and the finished result. */
+const WORKER_RESULT_RULE = '─────'
+/** Hard cap on the terminal result paragraph. */
+const WORKER_RESULT_MAX = 320
+
+/**
+ * Char-budget backstop. Keeps the header / footer / result block fixed and
+ * drops the oldest body bullets one at a time, re-inserting a `+N earlier…`
+ * marker, until the card fits STATUS_CARD_CHAR_BUDGET. In the extreme case
+ * (a single newest bullet that is itself oversized) it truncates the RAW
+ * newest text, THEN escapes, THEN wraps — never slicing already-escaped HTML.
+ */
+function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
+  const { final = false, liveSuffix = '', stepCount, result } = opts
+  const rawSteps = opts.steps.filter((s) => s != null)
+  const rawChildren = (opts.childSteps ?? []).map((s) => s.trim()).filter((s) => s.length > 0)
+  const hasChildren = rawChildren.length > 0
+
+  // Fixed footer/result lines (always kept).
+  const footerLines: string[] = []
+  if (final && stepCount != null && stepCount > 0) footerLines.push(`<i>✓ ${stepCount} steps</i>`)
+  if (result != null && result.text.length > 0) {
+    footerLines.push(WORKER_RESULT_RULE)
+    footerLines.push(`${result.emoji} <i>${escapeHtml(truncate(result.text, WORKER_RESULT_MAX))}</i>`)
+  }
+  const fixedCost = [...headerLines, ...footerLines].join('\n').length
+
+  // The active "body" group whose oldest bullets we drop: children when
+  // present (parent collapses to a single "+N" marker), else parent steps.
+  const body = hasChildren ? rawChildren : rawSteps
+  const escapedBody = body.map(escapeStepLine)
+  const prefix = hasChildren ? NESTED_PREFIX : ''
+
+  const buildBullet = (esc: string, isLast: boolean): string =>
+    !final && isLast ? `${prefix}<b>→ ${esc}${liveSuffix}</b>` : `${prefix}<i>${esc}</i>`
+
+  // Parent-collapsed marker line when we are dropping children but parent steps exist.
+  const parentMarker =
+    hasChildren && rawSteps.length > 0 ? `<i>✓ +${rawSteps.length} earlier…</i>` : null
+
+  for (let drop = 1; drop < escapedBody.length; drop++) {
+    const shown = escapedBody.slice(drop)
+    const lines: string[] = [...headerLines]
+    if (parentMarker != null) lines.push(parentMarker)
+    lines.push(hasChildren ? `${NESTED_PREFIX}<i>+${drop} earlier…</i>` : `<i>✓ +${drop} earlier…</i>`)
+    const lastIdx = shown.length - 1
+    shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
+    lines.push(...footerLines)
+    const candidate = lines.join('\n')
+    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
+  }
+
+  // Extreme: the single newest bullet is itself oversized. Truncate the RAW
+  // newest text, then escape, then wrap — re-checking post-escape because
+  // escaping can expand the string (& → &amp;).
+  const rawNewest = body.length > 0 ? stripMarkdown(body[body.length - 1]).replace(/\s+/g, ' ').trim() : ''
+  const wrapperOverhead = final
+    ? (prefix + '<i>✓ </i>').length
+    : (prefix + '<b>→ </b>').length + liveSuffix.length
+  const headerFooterCost =
+    fixedCost + (fixedCost > 0 ? 1 : 0) + (parentMarker != null ? parentMarker.length + 1 : 0)
+  const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
+  let raw = rawNewest.slice(0, Math.max(0, budget))
+  let newest = escapeHtml(raw)
+  while (raw.length > 0 && wrapperOverhead + headerFooterCost + newest.length > STATUS_CARD_CHAR_BUDGET) {
+    const excess = wrapperOverhead + headerFooterCost + newest.length - STATUS_CARD_CHAR_BUDGET
+    raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
+    newest = escapeHtml(raw)
+  }
+  const newestLine = final ? `${prefix}<i>✓ ${newest}</i>` : `${prefix}<b>→ ${newest}${liveSuffix}</b>`
+  const lines: string[] = [...headerLines]
+  if (parentMarker != null) lines.push(parentMarker)
+  lines.push(newestLine)
+  lines.push(...footerLines)
+  return lines.join('\n')
+}
+
 /**
  * Render the accumulated feed as ready Telegram HTML — one action per line,
  * newest last. The current (newest) step is bold with a `→`; finished steps
- * are italic with a `✓`. Capped to the last MIRROR_MAX_LINES with a dim
+ * are italic with a `✓`. Capped to the last STATUS_ROLLING_LINES with a dim
  * `✓ +N earlier…` header when the turn ran longer. Returns null when empty.
  * Callers send the result verbatim — do NOT re-escape or re-wrap it.
  *
- * When SWITCHROOM_STATUS_NO_TRUNCATE is on (default), shows only the last
- * STATUS_ROLLING_LINES lines in full (no per-line "…"), with NO overflow
- * header. The only remaining ceiling is STATUS_CARD_CHAR_BUDGET (wire-limit
- * backstop via `_fitToCharBudget`).
+ * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent').
  *
  * `stepCount` (optional): when `final=true` and `stepCount > 0`, appends a
- * `✓ N steps` footer line so the persisted feed record shows an accurate
- * total of surfaced (non-surface-tool) steps for the turn.
+ * `✓ N steps` footer line.
  *
- * `header` (optional): when provided, prepends a two-line activity header
- * (matching the worker card's style) so the main-session card shows
- * elapsed time + tool count alongside the step feed. The gateway threads
- * `turn.startedAt` + `turn.labeledToolCount` into this.
+ * `header` (optional): when provided, the two-line activity header carries
+ * elapsed + tool count.
  */
 export function renderActivityFeed(
   lines: string[],
@@ -343,128 +528,21 @@ export function renderActivityFeed(
   header?: SessionActivityHeader,
 ): string | null {
   if (lines.length === 0 && header == null) return null;
-  const noTruncate = statusNoTruncate();
-  const out: string[] = [];
-
-  // Optional header block — mirrors the worker card's two-line header.
-  if (header != null) {
-    const [h1, h2] = renderActivityHeader(
-      '🤖',
-      header.label,
-      '',
-      header.elapsedMs,
-      header.toolCount,
-      header.state,
-    )
-    out.push(h1)
-    out.push(h2)
-  }
-
-  if (lines.length === 0) {
-    // Header-only (no steps yet) — only reachable when a header was supplied.
-    const result = out.join('\n')
-    return result.length > 0 ? result : null
-  }
-
-  // Escape all lines before passing to renderStepFeed.
-  const escaped = lines.map(escapeFeedHtml)
-
-  // No-truncate ON: rolling STATUS_ROLLING_LINES window, no overflow header.
-  // No-truncate OFF: cap to MIRROR_MAX_LINES with overflow header.
-  if (noTruncate) {
-    const shown = escaped.slice(-STATUS_ROLLING_LINES)
-    const lastIdx = shown.length - 1
-    shown.forEach((esc, i) => {
-      out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`)
-    })
-  } else {
-    const shown = escaped.slice(-MIRROR_MAX_LINES)
-    const hidden = escaped.length - shown.length
-    if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`)
-    const lastIdx = shown.length - 1
-    // Newest line = in-progress step (bold, →); earlier = done (italic, ✓).
-    // `final` (turn complete, feed left as a record): ALL lines render done (✓)
-    // so the persisted message doesn't freeze on a misleading "→ in-progress".
-    // `liveSuffix` (heartbeat): appended INSIDE the newest in-progress line only
-    // (e.g. " · 18s") so the feed visibly advances during a long single step that
-    // emits no new tool label — the feed is otherwise pull-only and freezes.
-    // Caller passes framework-generated, HTML-safe text; never final + suffix.
-    // Returns ready Telegram HTML — callers must NOT re-escape or re-wrap it.
-    shown.forEach((esc, i) => {
-      out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`)
-    })
-  }
-
-  // Final total: append a `✓ N steps` footer when the turn has a non-zero
-  // surfaced step count. Only shown on the persisted terminal render
-  // (`final=true`) so the live in-progress feed stays clean.
-  if (final && stepCount != null && stepCount > 0) {
-    out.push(`<i>✓ ${stepCount} steps</i>`);
-  }
-  const result = out.join("\n");
-  // No-truncate mode: enforce the Telegram char budget as the only ceiling.
-  // With STATUS_ROLLING_LINES=5 full lines (~750 chars) this effectively never
-  // fires, but keep it as the wire-limit safety net.
-  if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
-    return _fitToCharBudget(lines, final, liveSuffix, stepCount, header);
-  }
-  return result;
-}
-
-/**
- * Internal helper: called only in no-truncate mode when the full render
- * exceeds STATUS_CARD_CHAR_BUDGET. Drops oldest lines one at a time until
- * the rendered output fits, prepending a "+N earlier…" header to surface
- * the clip. The caller is responsible for not re-calling this recursively
- * (the budget is wide enough that a "+N" header itself never causes overflow).
- */
-function _fitToCharBudget(
-  lines: string[],
-  final: boolean,
-  liveSuffix: string,
-  stepCount?: number,
-  header?: SessionActivityHeader,
-): string | null {
-  // Pre-render the header block (if any) so we can measure its cost.
-  const headerLines: string[] = []
-  if (header != null) {
-    const [h1, h2] = renderActivityHeader('🤖', header.label, '', header.elapsedMs, header.toolCount, header.state)
-    headerLines.push(h1, h2)
-  }
-  const headerPrefix = headerLines.length > 0 ? headerLines.join('\n') + '\n' : ''
-  const headerCost = headerPrefix.length
-
-  for (let drop = 1; drop < lines.length; drop++) {
-    const shown = lines.slice(drop);
-    const out: string[] = [...headerLines, `<i>✓ +${drop} earlier…</i>`];
-    const lastIdx = shown.length - 1;
-    shown.forEach((l, i) => {
-      const esc = escapeFeedHtml(l);
-      out.push(i === lastIdx && !final ? `<b>→ ${esc}${liveSuffix}</b>` : `<i>✓ ${esc}</i>`);
-    });
-    if (final && stepCount != null && stepCount > 0) {
-      out.push(`<i>✓ ${stepCount} steps</i>`);
-    }
-    const candidate = out.join("\n");
-    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
-  }
-  // Rare but reachable with long Bash labels containing special chars (e.g. &&).
-  // Never slice already-escaped HTML — that breaks entities (&amp; → &amp) and
-  // leaves dangling tags. Instead truncate the RAW content first, then escape
-  // and wrap, re-checking post-escape because escaping can expand (&→&amp;).
-  const wrapperOverhead = final
-    ? "<i>✓ </i>".length
-    : ("<b>→ </b>".length + liveSuffix.length);
-  const maxRaw = Math.max(0, STATUS_CARD_CHAR_BUDGET - wrapperOverhead - headerCost);
-  let raw = lines[lines.length - 1].slice(0, maxRaw);
-  let newest = escapeFeedHtml(raw);
-  while (raw.length > 0 && wrapperOverhead + headerCost + newest.length > STATUS_CARD_CHAR_BUDGET) {
-    const excess = wrapperOverhead + headerCost + newest.length - STATUS_CARD_CHAR_BUDGET;
-    raw = raw.slice(0, Math.max(0, raw.length - excess - 1));
-    newest = escapeFeedHtml(raw);
-  }
-  const newestLine = final ? `<i>✓ ${newest}</i>` : `<b>→ ${newest}${liveSuffix}</b>`
-  return headerPrefix.length > 0 ? `${headerPrefix}${newestLine}` : newestLine
+  return renderStatusCard({
+    header: header != null
+      ? {
+          emoji: '🤖',
+          label: header.label,
+          elapsedMs: header.elapsedMs,
+          toolCount: header.toolCount,
+          state: header.state,
+        }
+      : undefined,
+    steps: lines,
+    final,
+    liveSuffix,
+    stepCount,
+  })
 }
 
 // ─── Foreground sub-agent nesting (Model A) ─────────────────────────────────
@@ -479,10 +557,6 @@ function _fitToCharBudget(
 
 /** Trailing nested child lines kept visible (Telegram length + readability). */
 export const NESTED_MAX_LINES = 4;
-/** Hard cap on a single nested narrative line. */
-const NESTED_LINE_MAX = 90;
-/** Indent marker for a nested sub-agent step. */
-const NESTED_PREFIX = "   ↳ ";
 
 /**
  * Render the parent activity feed with an active foreground sub-agent's steps
@@ -493,12 +567,7 @@ const NESTED_PREFIX = "   ↳ ";
  * a `↳ +N earlier…` header when it overflows. Returns ready Telegram HTML
  * (callers must NOT re-escape) or null when there is nothing to show.
  *
- * `stepCount` (optional): forwarded to `renderActivityFeed` for the `✓ N steps`
- * footer on the persisted terminal render (`final=true`).
- *
- * `header` (optional): when provided, prepends a two-line activity header
- * (elapsed + tool count) matching the worker card's style. Forwarded to
- * `renderActivityFeed` when there are no child lines.
+ * Thin adapter over `renderStatusCard` (emoji 🤖, label 'Agent', childSteps).
  */
 export function renderActivityFeedWithNested(
   lines: string[],
@@ -510,150 +579,22 @@ export function renderActivityFeedWithNested(
 ): string | null {
   const children = childLines.map((s) => s.trim()).filter((s) => s.length > 0);
   if (children.length === 0) return renderActivityFeed(lines, final, liveSuffix, stepCount, header);
-
-  const noTruncate = statusNoTruncate();
-  const out: string[] = [];
-
-  // Optional header block — same two-line style as the worker card.
-  if (header != null) {
-    const [h1, h2] = renderActivityHeader('🤖', header.label, '', header.elapsedMs, header.toolCount, header.state)
-    out.push(h1)
-    out.push(h2)
-  }
-
-  // Parent lines:
-  //   no-truncate ON  → rolling STATUS_ROLLING_LINES window, no overflow header.
-  //   no-truncate OFF → cap to MIRROR_MAX_LINES with overflow header.
-  const shownParent = noTruncate ? lines.slice(-STATUS_ROLLING_LINES) : lines.slice(-MIRROR_MAX_LINES);
-  if (!noTruncate) {
-    const hiddenParent = lines.length - shownParent.length;
-    if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`);
-  }
-  for (const l of shownParent) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
-
-  // Child lines:
-  //   no-truncate ON  → rolling STATUS_ROLLING_LINES window, no overflow header,
-  //                     each line in FULL (no NESTED_LINE_MAX "…").
-  //   no-truncate OFF → cap to NESTED_MAX_LINES with overflow header + NESTED_LINE_MAX clip.
-  const shownChild = noTruncate ? children.slice(-STATUS_ROLLING_LINES) : children.slice(-NESTED_MAX_LINES);
-  if (!noTruncate) {
-    const hiddenChild = children.length - shownChild.length;
-    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`);
-  }
-  const lastChildIdx = shownChild.length - 1;
-  // `final`: the nested newest step also renders done (✓) so the left-behind
-  // feed reads as completed, not stuck on a "→ in-progress" child step.
-  // `liveSuffix` (heartbeat): appended to the nested newest in-progress step.
-  // NESTED_LINE_MAX per-line cap: only applied when no-truncate is OFF.
-  shownChild.forEach((l, i) => {
-    const t = (!noTruncate && l.length > NESTED_LINE_MAX) ? l.slice(0, NESTED_LINE_MAX - 1) + "…" : l;
-    const esc = escapeFeedHtml(t);
-    out.push(
-      i === lastChildIdx && !final
-        ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
-        : `${NESTED_PREFIX}<i>${esc}</i>`,
-    );
-  });
-  // Final total: same `✓ N steps` footer as the flat render.
-  if (final && stepCount != null && stepCount > 0) {
-    out.push(`<i>✓ ${stepCount} steps</i>`);
-  }
-  // out.length > 0 is guaranteed if children.length > 0 (at least one child line).
-  // The `header != null` path above also ensures content, but an empty result
-  // with no header AND no parent AND no child lines can't happen (children filtered).
-  if (out.length === 0) return null;
-  const result = out.join("\n");
-  // No-truncate mode: enforce the Telegram char budget as the only ceiling.
-  // With STATUS_ROLLING_LINES=5 full lines (~750 chars) this effectively never
-  // fires, but keep it as the wire-limit safety net.
-  if (noTruncate && result.length > STATUS_CARD_CHAR_BUDGET) {
-    return _fitNestedToCharBudget(lines, children, final, liveSuffix, stepCount, header);
-  }
-  return result;
-}
-
-/**
- * Internal helper: called only in no-truncate mode when the full nested render
- * exceeds STATUS_CARD_CHAR_BUDGET. Trims oldest parent lines first, then
- * oldest child lines, until the output fits, surfacing a "+N earlier…" header
- * for each dropped group.
- */
-function _fitNestedToCharBudget(
-  lines: string[],
-  children: string[],
-  final: boolean,
-  liveSuffix: string,
-  stepCount?: number,
-  header?: SessionActivityHeader,
-): string | null {
-  // Pre-render the header block (if any) so we can include it as fixed lines.
-  const headerLines: string[] = []
-  if (header != null) {
-    const [h1, h2] = renderActivityHeader('🤖', header.label, '', header.elapsedMs, header.toolCount, header.state)
-    headerLines.push(h1, h2)
-  }
-
-  // Try dropping parent lines first (oldest first), keeping all children.
-  for (let pDrop = 1; pDrop <= lines.length; pDrop++) {
-    const shownP = lines.slice(pDrop);
-    const out: string[] = [...headerLines];
-    if (pDrop > 0) out.push(`<i>✓ +${pDrop} earlier…</i>`);
-    for (const l of shownP) out.push(`<i>✓ ${escapeFeedHtml(l)}</i>`);
-    const lastChildIdx = children.length - 1;
-    children.forEach((l, i) => {
-      const esc = escapeFeedHtml(l);
-      out.push(
-        i === lastChildIdx && !final
-          ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
-          : `${NESTED_PREFIX}<i>${esc}</i>`,
-      );
-    });
-    if (final && stepCount != null && stepCount > 0) out.push(`<i>✓ ${stepCount} steps</i>`);
-    const candidate = out.join("\n");
-    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
-  }
-  // Parent fully dropped; now also drop child lines oldest first.
-  for (let cDrop = 1; cDrop < children.length; cDrop++) {
-    const shownC = children.slice(cDrop);
-    const out: string[] = [
-      ...headerLines,
-      `<i>✓ +${lines.length} earlier…</i>`,
-      `${NESTED_PREFIX}<i>+${cDrop} earlier…</i>`,
-    ];
-    const lastChildIdx = shownC.length - 1;
-    shownC.forEach((l, i) => {
-      const esc = escapeFeedHtml(l);
-      out.push(
-        i === lastChildIdx && !final
-          ? `${NESTED_PREFIX}<b>→ ${esc}${liveSuffix}</b>`
-          : `${NESTED_PREFIX}<i>${esc}</i>`,
-      );
-    });
-    if (final && stepCount != null && stepCount > 0) out.push(`<i>✓ ${stepCount} steps</i>`);
-    const candidate = out.join("\n");
-    if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate;
-  }
-  // Rare but reachable with long Bash labels containing special chars (e.g. &&).
-  // Never slice already-escaped HTML — that breaks entities and leaves dangling tags.
-  // Truncate RAW content first, then escape and wrap, re-checking post-escape.
-  const headerCost = headerLines.length > 0 ? headerLines.join('\n').length + 1 : 0
-  const wrapperOverhead = final
-    ? (NESTED_PREFIX + "<i></i>").length
-    : (NESTED_PREFIX + "<b>→ </b>").length + liveSuffix.length;
-  const maxRaw = Math.max(0, STATUS_CARD_CHAR_BUDGET - wrapperOverhead - headerCost);
-  let raw = children[children.length - 1].slice(0, maxRaw);
-  let newest = escapeFeedHtml(raw);
-  while (raw.length > 0 && wrapperOverhead + headerCost + newest.length > STATUS_CARD_CHAR_BUDGET) {
-    const excess = wrapperOverhead + headerCost + newest.length - STATUS_CARD_CHAR_BUDGET;
-    raw = raw.slice(0, Math.max(0, raw.length - excess - 1));
-    newest = escapeFeedHtml(raw);
-  }
-  const newestLine = final
-    ? `${NESTED_PREFIX}<i>${newest}</i>`
-    : `${NESTED_PREFIX}<b>→ ${newest}${liveSuffix}</b>`
-  return headerLines.length > 0
-    ? [...headerLines, newestLine].join('\n')
-    : newestLine
+  return renderStatusCard({
+    header: header != null
+      ? {
+          emoji: '🤖',
+          label: header.label,
+          elapsedMs: header.elapsedMs,
+          toolCount: header.toolCount,
+          state: header.state,
+        }
+      : undefined,
+    steps: lines,
+    childSteps: children,
+    final,
+    liveSuffix,
+    stepCount,
+  })
 }
 
 /**

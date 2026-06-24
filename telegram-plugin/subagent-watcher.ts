@@ -42,7 +42,7 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptLine } from './session-tail.js'
 import { sanitiseToolArg } from './fleet-state.js'
-import { describeToolUse } from './tool-activity-summary.js'
+import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
 import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
 import { escapeHtml, truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
@@ -949,7 +949,7 @@ export function readSubTail(
           // set at dispatch time (from the parent Agent/Task tool_use input)
           // and must remain stable. Overwriting it with the sub-agent's first
           // narrative line caused a race-condition-dependent display (issue #352).
-          entry.lastSummaryLine = ev.text.split('\n')[0].trim().slice(0, 120)
+          entry.lastSummaryLine = clipNarrative(ev.text)
           // Retain the full text of the most recent narrative emission —
           // for a worker the final such line before turn_end IS its
           // result summary (the worker prompt asks it to "return a

@@ -5109,6 +5109,11 @@ const completeProgressCardTurn:
 // #1122 PR3: flushProgressCardsForShutdown deleted with the card. No
 // replacement needed — there are no pinned progress messages to flush.
 let subagentWatcher: SubagentWatcherHandle | null = null
+// Background-worker activity feed manager. Module-scoped so shutdown can stop()
+// its internal heartbeat interval (mirrors subagentWatcher). Recreated per
+// bridge connect; the stale handle's interval is unref'd, so a missed stop()
+// can't keep the process alive, but we stop() on shutdown for cleanliness.
+let workerActivityFeed: ReturnType<typeof createWorkerActivityFeed> | null = null
 
 // ─── IPC server ───────────────────────────────────────────────────────────
 const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
@@ -21762,6 +21767,11 @@ async function shutdown(signal: string): Promise<void> {
   subagentWatcher?.stop()
   subagentWatcher = null
 
+  // Worker-activity feed runs an internal heartbeat interval; stop it so no
+  // re-render fires during drain (mirrors subagentWatcher above).
+  workerActivityFeed?.stop()
+  workerActivityFeed = null
+
   // Issues watcher polls issues.jsonl on a setInterval (default 2s) and
   // edits the issues card on every tick. Without an explicit stop() the
   // poll keeps firing for the lifetime of the process and accumulates
@@ -22495,7 +22505,8 @@ void (async () => {
             // or the turn ended while it kept running — extended autonomous
             // work) is surfaced via the worker feed instead of vanishing.
             const orphanStatusEnabled = isOrphanSubagentStatusEnabled(process.env.SWITCHROOM_ORPHAN_SUBAGENT_STATUS)
-            const workerActivityFeed = createWorkerActivityFeed({
+            workerActivityFeed?.stop()
+            workerActivityFeed = createWorkerActivityFeed({
               bot: {
                 sendMessage: async (cid, text, sendOpts) => {
                   const sent = await robustApiCall(
@@ -22709,7 +22720,7 @@ void (async () => {
                       orphanStatusEnabled,
                     }) === 'worker-feed'
                   ) {
-                    void workerActivityFeed.finish(agentId, {
+                    void workerActivityFeed?.finish(agentId, {
                       description: dispatch.feedDescription,
                       lastTool: null,
                       toolCount,
@@ -22726,7 +22737,7 @@ void (async () => {
                 // 'orphan' is a stale boot row, not a fresh completion — map
                 // it to 'done' so an already-posted message still finalizes.
                 if (workerFeedEnabled) {
-                  void workerActivityFeed.finish(agentId, {
+                  void workerActivityFeed?.finish(agentId, {
                     description: dispatch.feedDescription,
                     lastTool: null,
                     toolCount,
@@ -22861,7 +22872,7 @@ void (async () => {
                   })
                   if (surface === 'worker-feed') {
                     const origin = resolveSubagentOriginChat(agentId)
-                    void workerActivityFeed.update(
+                    void workerActivityFeed?.update(
                       agentId,
                       origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
                       {
@@ -22948,7 +22959,7 @@ void (async () => {
                 // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
                   const origin = resolveSubagentOriginChat(agentId)
-                  void workerActivityFeed.update(
+                  void workerActivityFeed?.update(
                     agentId,
                     origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
                     {
