@@ -294,6 +294,41 @@ describe('per-topic current-turn — LEAK FENCE', () => {
     expect(map.get()).toBeNull()
   })
 
+  it('bounded leak-by-supersession: a different-key set with NO A teardown leaves A until the self-heal sweep reclaims it', async () => {
+    // The REAL bounded-leak path the design relies on (distinct from the
+    // explicit-double-teardown case above): topic A is set, then topic B is set
+    // under a DIFFERENT key with NO intervening endTurnForKey(A). The mirror
+    // flips to B, but A's byKey entry is NOT torn down at that moment — it
+    // dangles until the periodic purgeChatStale self-heal sweeps it. This proves
+    // the leak is BOUNDED (the sweep reclaims it), not unbounded.
+    const { CurrentTurnMap } = await loadMap(true)
+    const map = new CurrentTurnMap<FakeTurn>()
+    const A: FakeTurn = { id: 'A', sessionChatId: 'chatA' }
+    const B: FakeTurn = { id: 'B', sessionChatId: 'chatA' }
+
+    map.set(A, KEY_A) // chatA:_
+    map.set(B, KEY_B) // chatA:42 — different key, NO endTurnForKey(A)
+
+    // The leak: BOTH entries are present — A was never explicitly torn down, it
+    // is just no longer the mirror target.
+    expect(map.byKey.size).toBe(2)
+    expect(map.get(KEY_A)).toBe(A)
+    expect(map.get(KEY_B)).toBe(B)
+    expect(map.get()).toBe(B) // mirror moved on to the most-recent set
+
+    // The self-heal sweep for chatA, with B's topic (KEY_B) marked LIVE (not
+    // stale) and A's topic (KEY_A) stale, reclaims ONLY A's dangling entry.
+    const swept = map.purgeChatStale('chatA', (k) => k !== KEY_B)
+    expect(swept).toEqual([KEY_A])
+
+    // Leak reclaimed: A is gone, the map is bounded back to just B, and the
+    // mirror is untouched (it pointed at B, not a swept victim).
+    expect(map.get(KEY_A)).toBeNull()
+    expect(map.byKey.size).toBe(1)
+    expect(map.get(KEY_B)).toBe(B)
+    expect(map.get()).toBe(B)
+  })
+
   it('the disconnect-flush sim clears the WHOLE map + mirror (every entry is a ghost)', async () => {
     const { CurrentTurnMap } = await loadMap(true)
     const map = new CurrentTurnMap<FakeTurn>()

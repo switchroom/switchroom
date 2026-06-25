@@ -51,6 +51,8 @@
  * the per-topic isolation is driven directly in tests/per-topic-current-turn.test.ts.
  */
 
+import { chatIdOfChatKey, type ChatKey } from './chat-key.js'
+
 /**
  * Kill-switch — read ONCE at module top, `=== '1'` (default OFF), mirroring
  * `emission-authority.ts`'s `EMISSION_AUTHORITY_ENABLED`. The same flag governs
@@ -170,9 +172,11 @@ export class CurrentTurnMap<T> {
     if (!chatId) return []
     const swept: string[] = []
     for (const key of [...this.byKey.keys()]) {
-      const sep = key.indexOf(':')
-      if (sep < 0) continue
-      if (key.slice(0, sep) !== chatId) continue
+      // A bare chatId (no `:`) cannot belong to a chat+thread keyspace —
+      // chatIdOfChatKey returns the whole string in that case, which can never
+      // equal `${chatId}:...`-derived keys, so it is correctly skipped.
+      if (!key.includes(':')) continue
+      if (chatIdOfChatKey(key as ChatKey) !== chatId) continue
       if (!isStale(key)) continue // live sibling topic — leave its turn intact
       const victim = this.byKey.get(key)
       this.byKey.delete(key)
