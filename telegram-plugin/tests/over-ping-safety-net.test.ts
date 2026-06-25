@@ -38,7 +38,7 @@ describe('decideOverPing — at-most-one-ping-per-turn safety net', () => {
       firstPingAt: null,
       nowMs: 1_000,
     })
-    expect(d1).toEqual({ suppress: false, claimSlot: false, sinceFirstPingMs: null })
+    expect(d1).toEqual({ suppress: false, claimSlot: false, upgrade: false, sinceFirstPingMs: null })
 
     // Prior ping already landed — silent reply still no-op, NOT claimed
     const d2 = decideOverPing({
@@ -46,7 +46,7 @@ describe('decideOverPing — at-most-one-ping-per-turn safety net', () => {
       firstPingAt: 1_000,
       nowMs: 5_000,
     })
-    expect(d2).toEqual({ suppress: false, claimSlot: false, sinceFirstPingMs: null })
+    expect(d2).toEqual({ suppress: false, claimSlot: false, upgrade: false, sinceFirstPingMs: null })
   })
 
   it('handles the edge case where firstPingAt equals nowMs (instant double-call)', () => {

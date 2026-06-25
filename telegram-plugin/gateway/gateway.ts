@@ -1964,6 +1964,18 @@ type CurrentTurn = {
   // the framework. Null until the first ping lands. Reset on every
   // fresh-turn enqueue.
   firstPingAt: number | null
+  // Notification ownership (R8 / PR-2 — design `docs/message-emission-
+  // determinism.md` §over-ping). Whether the send that CLAIMED this turn's
+  // ping slot (`firstPingAt`) was itself a *substantive* final answer
+  // (`isSubstantiveFinalReply`) as opposed to a short interim ACK. The
+  // over-ping safety net keys on this so a substantive answer pinging AFTER
+  // an ack already pinged is UPGRADED (let through, owns the slot) rather
+  // than silenced — otherwise "the reply is last but the phone never buzzed
+  // for the answer." Set ATOMICALLY with `firstPingAt` (same synchronous
+  // block, no await between) on a claim/upgrade so a racing second reply
+  // reads a consistent pair. Init false; reset to false on every fresh-turn
+  // enqueue alongside `firstPingAt`.
+  firstPingWasSubstantive: boolean
   // #1677 silent-reply auto-edit. The first silent reply of a turn
   // captures `silentAnchorMessageId` + `silentAnchorText`; subsequent
   // silent replies in the SAME turn editMessageText that anchor
@@ -7686,9 +7698,24 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     const turn = currentTurn
     if (turn != null) {
       const now = Date.now()
+      // Notification ownership (R8 / PR-2): on the `reply` path,
+      // substantiveness is purely the ≥200-char (or `done`) backstop —
+      // `isSubstantiveFinalReply` is `done === true || text.length >= 200`
+      // and ignores the notification flag entirely. `reply` carries no
+      // `done`, so it reduces to the ≥200-char length test. We still pass
+      // `modelDisableNotification` (the MODEL's original intent, not the
+      // possibly-downgraded `disableNotification`) to mirror the #2533
+      // final-answer decoupling call shape, but that arg does NOT
+      // participate in classification here — it is inert on this path.
+      const replySubstantive = isSubstantiveFinalReply({
+        text: rawText,
+        disableNotification: modelDisableNotification,
+      })
       const decision = decideOverPing({
         modelRequestedPing: !disableNotification,
         firstPingAt: turn.firstPingAt,
+        substantive: replySubstantive,
+        firstPingWasSubstantive: turn.firstPingWasSubstantive,
         nowMs: now,
       })
       if (decision.suppress) {
@@ -7710,7 +7737,18 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         disableNotification = true
         wasOverPingSuppressed = true
       } else if (decision.claimSlot) {
+        // Claim (first ping) OR upgrade (substantive answer pinging over an
+        // ack's slot). Set firstPingAt AND firstPingWasSubstantive ATOMICALLY
+        // (no await between) so a racing second reply reads a consistent pair.
         turn.firstPingAt = now
+        turn.firstPingWasSubstantive = replySubstantive
+        if (decision.upgrade) {
+          process.stderr.write(
+            `telegram gateway: reply over-ping safety net — ` +
+            `UPGRADE: substantive answer pings over an ack's slot ` +
+            `(chat=${chat_id} thread=${args.message_thread_id ?? '-'})\n`,
+          )
+        }
       }
     }
   }
@@ -10639,6 +10677,10 @@ function handleSessionEvent(ev: SessionEvent): void {
           // Sticky latch — reset ONLY here (turn start), never by reopen.
           finalAnswerEverDelivered: false,
           firstPingAt: null,
+          // Notification ownership (R8 / PR-2): no slot claimed yet, so the
+          // "claimer was substantive" flag starts false. Set atomically with
+          // firstPingAt at the over-ping decision site.
+          firstPingWasSubstantive: false,
           silentAnchorMessageId: null,
           silentAnchorText: '',
           capturedText: [],

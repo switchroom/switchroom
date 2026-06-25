@@ -155,6 +155,32 @@ export function assertReplyIsLast(
   }
 }
 
+/**
+ * Assert NOTIFICATION OWNERSHIP (R8 / PR-2 — design
+ * `docs/message-emission-determinism.md` §over-ping): the turn's SUBSTANTIVE
+ * answer must have buzzed the device. mtcute surfaces Telegram's `silent`
+ * flag on every message (`ObservedMessage.silent`, set from the sender's
+ * `disable_notification`); a substantive answer must NOT be silent.
+ *
+ * This guards the residual the bare "first ping wins" rule left: when an
+ * interim ack pings first and claims the turn's single ping slot, the later
+ * substantive answer used to be downgraded to silent — "the reply is last
+ * but the phone never buzzed for the answer." After PR-2 the answer UPGRADES
+ * over the ack's slot and arrives non-silent.
+ *
+ * Throws (rather than returning false) so a scenario reads as a plain
+ * assertion; the message text + silent flag are in the error for triage.
+ */
+export function assertAnswerPinged(answer: ObservedMessage): void {
+  if (answer.silent) {
+    throw new Error(
+      `assertAnswerPinged: the substantive answer arrived SILENT (no device ping) ` +
+        `— an earlier ack-ping downgraded the answer (R8 / PR-2 regression). ` +
+        `answer msg=${answer.messageId} ${JSON.stringify(answer.text.slice(0, 80))}`,
+    );
+  }
+}
+
 export interface PollOptions {
   /** Hard deadline; the predicate must resolve truthy before this. */
   timeout: number;
