@@ -48,6 +48,7 @@ import {
 } from "./consumer-quota-sensor.js";
 import {
   isAccountBlocked as evalAccountBlocked,
+  accountEligibility,
   snapshotShouldClearMark,
   clampMarkExpiry,
 } from "./account-eligibility.js";
@@ -1123,6 +1124,108 @@ export class AuthBroker {
   }
 
   /**
+   * Tri-state eligibility for a failover/serving candidate — the basis of the
+   * Bug-1 fix. `'blocked'` only on POSITIVE exhaustion evidence (fresh
+   * over-wall snapshot, or an unexpired mark with no fresher contradicting
+   * snapshot). `'unknown'` when there is NO usable live snapshot and NO
+   * unexpired mark — a candidate we simply haven't measured, which must NOT be
+   * conflated with a hard block. See account-eligibility.ts.
+   */
+  private accountEligibilityOf(account: string): "blocked" | "eligible" | "unknown" {
+    return accountEligibility({
+      mark: this.quota[account],
+      snapshot: this.lastQuotaCache[account],
+      now: this.now(),
+    });
+  }
+
+  /**
+   * Force a single live quota probe of `account` and fold the result into the
+   * in-memory cache / self-heal path — the SAME caching `opProbeQuota` does on
+   * a successful probe, factored out so the failover selector can resolve an
+   * `unknown` (never-probed / transiently-failed) candidate to a real verdict
+   * before ruling it out. Bypasses the TTL gate (this is the live corroboration
+   * Bug 1 needs) but shares the single-flight wrapper, so a concurrent render
+   * probe of the same label coalesces. A failed probe is a no-op (the candidate
+   * stays `unknown`); never throws into the caller.
+   */
+  private async probeAndCacheOne(account: string): Promise<void> {
+    try {
+      const creds = readAccountCredentials(account, this.home);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (!token) return;
+      const result = await this.probeQuotaSingleFlight(account, token);
+      if (result.ok) this.cacheQuotaSnapshot(account, result);
+    } catch {
+      // Probe failures stay no-ops — the candidate remains `unknown` and is
+      // handled as a last-resort by the selector, never a hard block.
+    }
+  }
+
+  /**
+   * Failover-selection variant of {@link nextHealthyAccount} that resolves
+   * `unknown` candidates with a LIVE probe before declaring "all blocked".
+   *
+   * The Bug-1 race: the gateway probes every account into its own `quotas`
+   * array, but the broker's selector re-read only its OWN cache — which is
+   * written ONLY on a successful probe. A candidate whose probe missed/errored
+   * (or was never run) therefore had no fresh snapshot; a stale `exhausted_until`
+   * mark then made it look `blocked`, so selection returned null → the fleet
+   * wrongly broadcast "all accounts blocked" while a secondary had headroom
+   * (proven by a retry 6 min later switching to it cleanly).
+   *
+   * Fix: when the cache-only pass finds no clearly-`eligible` candidate, force a
+   * live probe of every `unknown` candidate and re-run selection. A candidate
+   * that is genuinely healthy now is picked; one that is genuinely walled stays
+   * blocked. If after probing there is STILL no eligible account, fall back to
+   * the first `unknown` candidate-of-last-resort (better to try an unmeasured
+   * account than to go dark) — but a truly all-exhausted fleet (every candidate
+   * resolves to `blocked`) still returns null → the honest all-blocked path.
+   */
+  private async nextHealthyAccountLive(
+    current: string,
+    order: readonly string[],
+  ): Promise<string | null> {
+    // Fast path: a clearly-eligible candidate from cache needs no probe.
+    const cached = this.nextHealthyAccount(current, order);
+    if (cached && this.accountEligibilityOf(cached) === "eligible") return cached;
+
+    // No cache-eligible candidate. Force-probe the `unknown` candidates (the
+    // ones with no positive evidence) so a never-probed-but-healthy secondary
+    // gets a real verdict instead of being lumped in with the truly walled.
+    // `ring` walks the fallback order starting just AFTER `current` (the same
+    // wrap order `nextHealthyAccount` uses).
+    const start = order.indexOf(current);
+    const ring: string[] =
+      start === -1
+        ? [...order]
+        : order.map((_, i) => order[(start + 1 + i) % order.length]).filter((x): x is string => !!x);
+    const unknowns = ring.filter(
+      (cand) => cand && cand !== current &&
+        accountExists(cand, this.home) &&
+        this.accountEligibilityOf(cand) === "unknown",
+    );
+    await Promise.all(unknowns.map((cand) => this.probeAndCacheOne(cand)));
+
+    // Re-run selection now that the unknowns carry live verdicts.
+    const reselected = this.nextHealthyAccount(current, order);
+    if (reselected && this.accountEligibilityOf(reselected) === "eligible") return reselected;
+
+    // Still no eligible account. Prefer the first candidate that is `unknown`
+    // even after the probe (a last-resort try beats going dark) over returning
+    // null. A candidate that probed `blocked` is never offered here.
+    for (const cand of ring) {
+      if (cand && cand !== current && accountExists(cand, this.home) &&
+          this.accountEligibilityOf(cand) === "unknown") {
+        return cand;
+      }
+    }
+    // Genuinely all-exhausted: every candidate resolved to `blocked`. Honest
+    // all-blocked — the caller surfaces the "all accounts blocked" card.
+    return null;
+  }
+
+  /**
    * `account`, unless it's within a mark-exhausted window — then the first
    * non-exhausted account in `fallback_order` that has stored credentials.
    * Falls back to `account` itself when no healthy alternative exists (better
@@ -1565,13 +1668,20 @@ export class AuthBroker {
     });
     this.quota[account] = { exhausted_until: exhaustedUntil, marked_at: now };
     this.persistQuota();
-    // Fan out next-fallback creds to every agent whose active account is `account`.
-    const rolled = this.fanoutFailoverFor(account);
-    // The account the fleet rolled TO — same selection the fanout used. Lets a
-    // non-admin caller (the agent that just 429'd, via auto-fallback) report an
-    // accurate "switched to <X>" without a follow-up admin set-active. `null`
-    // when every fallback_order entry is also exhausted (genuine all-blocked).
-    const rolledTo = this.nextHealthyAccount(account, this.config.auth?.fallback_order ?? []);
+    // Fan out next-fallback creds to every agent whose active account is
+    // `account`. Uses the LIVE selector (Bug 1): force-probe an `unknown`
+    // candidate before ruling it out so a never-probed-but-healthy secondary is
+    // actually rolled to, instead of being mistaken for blocked.
+    const rolledTo = await this.nextHealthyAccountLive(
+      account,
+      this.config.auth?.fallback_order ?? [],
+    );
+    const rolled = this.fanoutFailoverTo(account, rolledTo);
+    // `rolledTo` is the account the fleet rolled TO — same selection the fanout
+    // used. Lets a non-admin caller (the agent that just 429'd, via
+    // auto-fallback) report an accurate "switched to <X>" without a follow-up
+    // admin set-active. `null` when every fallback_order entry is genuinely
+    // exhausted (honest all-blocked).
     this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
   }
@@ -2429,11 +2539,14 @@ export class AuthBroker {
     return fanned;
   }
 
-  /** Failover: every agent on `label` rolls to the next entry in fallback_order. */
-  private fanoutFailoverFor(label: string): string[] {
+  /**
+   * Failover: mirror `next`'s creds onto every agent currently on `label`.
+   * `next` is the already-selected roll target (from `nextHealthyAccountLive`),
+   * passed in so the live-probe selection runs exactly once and the announced
+   * `rolledTo` matches what the fleet actually rolled to.
+   */
+  private fanoutFailoverTo(label: string, next: string | null): string[] {
     const auth = this.config.auth ?? {};
-    const order = auth.fallback_order ?? [];
-    const next = this.nextHealthyAccount(label, order);
     if (!next || next === label) return []; // nothing better available
     const rolled: string[] = [];
     for (const [name, agent] of Object.entries(this.config.agents ?? {})) {

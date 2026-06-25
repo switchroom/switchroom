@@ -170,20 +170,40 @@ export function snapshotClearlyHealthy(s: QuotaSnapshot): boolean {
 }
 
 /**
- * THE eligibility decision: is `account` blocked from serving / failover now?
+ * Tri-state eligibility verdict for a failover/serving candidate.
+ *
+ *  - `'blocked'`  — POSITIVE exhaustion evidence: a fresh over-wall snapshot,
+ *                   or an unexpired `exhausted_until` mark with no fresher
+ *                   contradicting snapshot. Skip this account.
+ *  - `'eligible'` — fresh live snapshot proves it healthy (below the wall).
+ *                   Prefer this account.
+ *  - `'unknown'`  — NO usable live snapshot AND no unexpired mark. We have no
+ *                   positive evidence either way. This is the case Bug 1 hinged
+ *                   on: a not-yet-probed (or transiently-failed) secondary used
+ *                   to be lumped in with `blocked`, so the fleet declared
+ *                   "all blocked" while an account that was actually fine had
+ *                   simply never been probed. It MUST NOT be treated as a hard
+ *                   block — it is a candidate-of-last-resort that the caller
+ *                   should force-probe before ruling out.
+ */
+export type AccountEligibility = "blocked" | "eligible" | "unknown";
+
+/**
+ * THE eligibility decision, tri-state. Distinguishes `unknown` (no evidence)
+ * from `blocked` (positive exhaustion evidence) — see `AccountEligibility`.
  *
  * Most-recent-signal-wins:
  *  - A fresh live snapshot (≤24h) that is NEWER than the mark is authoritative:
  *      walled → blocked (kills the live-walled-but-stale-past-mark hop);
- *      healthy → NOT blocked (kills the bogus-future-mark stranding).
- *  - Otherwise (no snapshot, snapshot >24h stale, or mark is newer than the
- *    snapshot) the persisted mark is the best signal: blocked iff unexpired.
+ *      healthy → eligible (kills the bogus-future-mark stranding).
+ *  - Otherwise the persisted mark governs: unexpired → blocked.
+ *  - With neither a usable live snapshot NOR an unexpired mark → unknown.
  */
-export function isAccountBlocked(opts: {
+export function accountEligibility(opts: {
   mark?: ExhaustionMark;
   snapshot?: QuotaSnapshot;
   now: number;
-}): boolean {
+}): AccountEligibility {
   const { mark, snapshot, now } = opts;
   if (snapshotFresh(snapshot, now)) {
     const markedAt = mark?.marked_at ?? 0;
@@ -191,11 +211,36 @@ export function isAccountBlocked(opts: {
       // Live truth is the newer signal → it decides, mark ignored. Walled on
       // util → blocked. Overage (out_of_credits) is informational only and does
       // NOT gate serving; failover safety is preserved via mark-exhausted on 429.
-      return snapshotWalled(snapshot);
+      return snapshotWalled(snapshot) ? "blocked" : "eligible";
     }
   }
-  // No usable live truth (or the mark is newer) → trust the mark.
-  return mark !== undefined && mark.exhausted_until > now;
+  // No usable live truth (or the mark is newer) → the mark is the only signal.
+  // Unexpired mark → blocked. No mark (or expired) and no fresh snapshot →
+  // unknown: we have ZERO positive evidence, so this is not a hard block.
+  if (mark !== undefined && mark.exhausted_until > now) return "blocked";
+  return "unknown";
+}
+
+/**
+ * THE eligibility decision: is `account` blocked from serving / failover now?
+ *
+ * Boolean view over {@link accountEligibility} — TRUE only on POSITIVE
+ * exhaustion evidence (`'blocked'`). `'unknown'` (no snapshot, no unexpired
+ * mark) is NOT a block here: an account we've never probed is not provably
+ * exhausted. Serving callers (`servingAccount` / `accountWithFailover`) still
+ * fail an `unknown` account over to a better-known one when one exists, and
+ * fall back to the account itself when none does — so this softening cannot
+ * strand serving.
+ *
+ * Most-recent-signal-wins semantics are unchanged from before; only the
+ * never-probed case moved from `true` to `false`.
+ */
+export function isAccountBlocked(opts: {
+  mark?: ExhaustionMark;
+  snapshot?: QuotaSnapshot;
+  now: number;
+}): boolean {
+  return accountEligibility(opts) === "blocked";
 }
 
 /**

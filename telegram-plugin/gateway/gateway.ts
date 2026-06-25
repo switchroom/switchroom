@@ -167,7 +167,7 @@ import {
   formatModelUnavailableCard,
   resolveModelUnavailableFromOperatorEvent,
 } from '../model-unavailable.js'
-import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, type FallbackFailureNoticeState } from '../auto-fallback-fleet.js'
+import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
 import { validateStringArray } from './access-validator.js'
 
@@ -16518,6 +16518,17 @@ async function fireFleetAutoFallback(triggerAgent: string, untilMs?: number): Pr
  */
 let fallbackFailureNoticeState: FallbackFailureNoticeState = { lastSentAtMs: 0 }
 
+/**
+ * Bug 2 — per-gateway cooldown for the "All accounts blocked" card. The
+ * all-blocked outcome is a no-op swap (doFireFleetAutoFallback returns false),
+ * so the fleetFallbackGate dedup window never arms for it, and the ~60s
+ * quota_wall_detected re-trigger would otherwise re-broadcast the identical card
+ * every minute for the life of the wall. This bounds it to one card per window.
+ * Reset on a successful swap so a fresh all-blocked after a recovery (a real new
+ * transition) is not stale-suppressed.
+ */
+let fallbackAllBlockedNoticeState: FallbackAllBlockedNoticeState = { lastSentAtMs: 0 }
+
 function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): void {
   if (process.env.SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE === '0') return
   // Notice-level cooldown (30 min, per gateway). The fleetFallbackGate's
@@ -16603,6 +16614,23 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
         (outcome.kind === 'switched' ? ` old=${outcome.oldLabel} new=${outcome.newLabel}` : '') +
         '\n',
     )
+    // Bug 2 — the all-blocked card is a no-op outcome, so the gate's dedup
+    // window never arms for it and the ~60s quota_wall_detected re-trigger would
+    // re-broadcast the identical card every minute. Gate it behind a per-gateway
+    // cooldown; a successful swap resets the window so a later (genuinely new)
+    // all-blocked still emits promptly.
+    if (outcome.kind === 'switched') {
+      fallbackAllBlockedNoticeState = { lastSentAtMs: 0 }
+    } else if (outcome.kind === 'all-blocked') {
+      const verdict = evaluateAllBlockedNotice(fallbackAllBlockedNoticeState, Date.now())
+      if (!verdict.send) {
+        process.stderr.write(
+          `telegram gateway: [fleet-fallback] all-blocked card suppressed (cooldown) agent=${triggerAgent}\n`,
+        )
+        return false
+      }
+      fallbackAllBlockedNoticeState = verdict.next
+    }
     // Post the announcement to every authorized chat. Mirrors the
     // operator-event broadcast pattern (line ~2290) — DM-only opts
     // (no message_thread_id) so THREAD_NOT_FOUND can't fire here;

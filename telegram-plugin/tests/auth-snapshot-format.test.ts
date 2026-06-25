@@ -423,6 +423,75 @@ describe('renderFallbackAnnouncement', () => {
     expect(out).toMatch(/ken@x recovers.*in 4h 57m/);
     expect(out).toContain('/auth add');
   });
+
+  it('Bug 3 — all-blocked card ENUMERATES every account (5h%/7d% + recovery ETA)', () => {
+    // Three walled accounts with different recovery times. The card must list
+    // ALL of them so the user can verify true fleet-wide exhaustion, not just
+    // the one triggering account.
+    const ken = quota({
+      fiveHourUtilizationPct: 100,
+      sevenDayUtilizationPct: 23,
+      fiveHourResetAt: new Date('2026-05-15T05:50:00Z'),
+      sevenDayResetAt: new Date('2026-05-18T19:00:00Z'),
+      representativeClaim: 'five_hour',
+    });
+    const you = quota({
+      fiveHourUtilizationPct: 30,
+      sevenDayUtilizationPct: 100,
+      sevenDayResetAt: new Date('2026-05-16T10:00:00Z'),
+      representativeClaim: 'seven_day',
+    });
+    const carol = quota({
+      fiveHourUtilizationPct: 100,
+      sevenDayUtilizationPct: 60,
+      fiveHourResetAt: new Date('2026-05-15T03:00:00Z'),
+      representativeClaim: 'five_hour',
+    });
+    const out = renderFallbackAnnouncement({
+      oldLabel: 'ken@x',
+      oldQuota: ken,
+      newLabel: null,
+      newQuota: null,
+      triggerAgent: 'carrie',
+      fleetSnapshots: [
+        snap({ label: 'ken@x', isActive: true, quota: ken }),
+        snap({ label: 'you@x', quota: you }),
+        snap({ label: 'carol@x', quota: carol }),
+      ],
+      now: NOW,
+      tz: 'UTC',
+    });
+    expect(out).toContain('🔴 <b>All accounts blocked');
+    // Every account is listed (not just the trigger).
+    expect(out).toContain('ken@x');
+    expect(out).toContain('you@x');
+    expect(out).toContain('carol@x');
+    // Per-account utilization rows are rendered (the renderAccountRow shape).
+    expect(out).toMatch(/100%\s*\/\s*23%/);   // ken
+    expect(out).toMatch(/30%\s*\/\s*100%/);   // you
+    expect(out).toMatch(/100%\s*\/\s*60%/);   // carol
+    // Each account's recovery countdown is surfaced.
+    expect(out).toMatch(/quota exhausted/);
+    // The earliest recovery across the fleet (carol, 5h reset at 03:00Z = ~2h)
+    // is called out explicitly.
+    expect(out).toMatch(/Earliest recovery:\s*<code>carol@x<\/code>/);
+    expect(out).toContain('/auth add');
+  });
+
+  it('Bug 3 back-compat — no fleetSnapshots falls back to the single-account shape', () => {
+    const out = renderFallbackAnnouncement({
+      oldLabel: 'ken@x',
+      oldQuota: KEN_5H_BLOWN,
+      newLabel: null,
+      newQuota: null,
+      triggerAgent: 'carrie',
+      now: NOW,
+      tz: 'UTC',
+    });
+    expect(out).toContain('🔴 <b>All accounts blocked');
+    expect(out).toMatch(/ken@x recovers.*in 4h 57m/);
+    expect(out).not.toContain('Earliest recovery:');
+  });
 });
 
 // ── buildSnapshotKeyboard ────────────────────────────────────────────

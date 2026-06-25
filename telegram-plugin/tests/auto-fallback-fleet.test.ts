@@ -112,6 +112,9 @@ describe('runFleetAutoFallback', () => {
     if (out.kind === 'all-blocked') {
       expect(out.announcement).toContain('All accounts blocked');
       expect(out.announcement).toContain('/auth add');
+      // Bug 3 — the announcement enumerates EVERY account, not just the trigger.
+      expect(out.announcement).toContain('ken@x');
+      expect(out.announcement).toContain('me@x');
     }
   });
 
@@ -307,5 +310,57 @@ describe("evaluateFallbackFailureNotice", () => {
     }
     expect(sent).toBeLessThanOrEqual(2);
     expect(sent).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ── Bug 2: the all-blocked card must not re-emit every ~60s ───────────────────
+
+import {
+  evaluateAllBlockedNotice,
+  FALLBACK_ALL_BLOCKED_NOTICE_COOLDOWN_MS,
+} from "../auto-fallback-fleet.js";
+
+describe("evaluateAllBlockedNotice", () => {
+  const T0 = 1_780_000_000_000;
+
+  it("the first all-blocked card sends and arms the cooldown", () => {
+    const r = evaluateAllBlockedNotice({ lastSentAtMs: 0 }, T0);
+    expect(r.send).toBe(true);
+    expect(r.next.lastSentAtMs).toBe(T0);
+  });
+
+  it("a second all-blocked signal within the cooldown does NOT re-emit (the Bug-2 fix)", () => {
+    const armed = { lastSentAtMs: T0 };
+    const r = evaluateAllBlockedNotice(armed, T0 + 60_000);
+    expect(r.send).toBe(false);
+    expect(r.next).toBe(armed); // window not extended by suppressed attempts
+  });
+
+  it("sends again once the cooldown elapses (still-walled, but the user re-hears once)", () => {
+    const r = evaluateAllBlockedNotice(
+      { lastSentAtMs: T0 },
+      T0 + FALLBACK_ALL_BLOCKED_NOTICE_COOLDOWN_MS,
+    );
+    expect(r.send).toBe(true);
+    expect(r.next.lastSentAtMs).toBe(T0 + FALLBACK_ALL_BLOCKED_NOTICE_COOLDOWN_MS);
+  });
+
+  it("collapses the ~60s quota_wall_detected re-fire storm to ≤2 cards/hour", () => {
+    let state = { lastSentAtMs: 0 };
+    let sent = 0;
+    for (let t = T0; t < T0 + 3_600_000; t += 60_000) {
+      const r = evaluateAllBlockedNotice(state, t);
+      if (r.send) sent++;
+      state = r.next;
+    }
+    expect(sent).toBeLessThanOrEqual(2);
+    expect(sent).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a NEW transition emits promptly: reset (lastSentAtMs=0) after a swap sends immediately", () => {
+    // The gateway resets the window on a successful swap, so a fresh all-blocked
+    // after a recovery is not stale-suppressed.
+    const r = evaluateAllBlockedNotice({ lastSentAtMs: 0 }, T0 + 5 * 60_000);
+    expect(r.send).toBe(true);
   });
 });

@@ -571,6 +571,17 @@ export interface FallbackAnnouncementInput {
   /** Agent that triggered the fallback (for context — fleet swap
    *  affects all agents but the user wants to know which one tripped). */
   triggerAgent: string;
+  /**
+   * Bug 3 — the full per-account fleet snapshot, threaded in so the all-blocked
+   * card can enumerate EVERY account (5h%/7d% + recovery ETA), not just the one
+   * triggering account. Built by `buildSnapshotsFromState` one frame up in
+   * `runFleetAutoFallback`. Optional/back-compat: when absent (or empty), the
+   * all-blocked branch falls back to the old single-account shape.
+   *
+   * ONLY consumed on the all-blocked branch. The successful-swap branch already
+   * shows the target's headroom and is unchanged.
+   */
+  fleetSnapshots?: AccountSnapshot[];
   tz?: string;
   now?: Date;
 }
@@ -598,14 +609,42 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
   const headerLimit = limitWord === 'quota' ? 'quota cap' : `${limitWord} limit`;
 
   if (!input.newLabel) {
-    // All-blocked path — no swap occurred. Tell user what's broken
-    // and when the earliest reset is.
+    // All-blocked path — no swap occurred. Tell user what's broken and, so they
+    // can VERIFY the fleet is truly exhausted, enumerate EVERY account's 5h%/7d%
+    // + recovery ETA (Bug 3) — not just the one triggering account. Reuses the
+    // same per-account row + earliest-recovery helpers the /auth table uses so
+    // the formatting stays consistent with the rest of the auth surface.
     lines.push(
       `🔴 <b>All accounts blocked · ${headerLimit} on ${escapeHtml(input.oldLabel)}</b>`,
     );
     lines.push('');
     lines.push(`Triggered by: agent <b>${escapeHtml(input.triggerAgent)}</b>`);
-    if (input.oldQuota) {
+
+    const fleet = input.fleetSnapshots ?? [];
+    if (fleet.length > 0) {
+      lines.push('');
+      const rowOpts: SnapshotRenderOpts = { now, tz };
+      // Blocked-first ordering mirrors renderAuthSnapshotFormat2 — the user
+      // scans the walled accounts (and their recovery times) at the top, with
+      // the active account floating first within its group.
+      const healthOrder: AccountHealth[] = ['blocked', 'throttling', 'healthy', 'unknown'];
+      const rank = (s: AccountSnapshot): number => healthOrder.indexOf(classifyHealth(s, now));
+      const ordered = [...fleet].sort(
+        (a, b) => rank(a) - rank(b) || Number(b.isActive) - Number(a.isActive),
+      );
+      for (const snap of ordered) {
+        for (const ln of renderAccountRow(snap, rowOpts)) lines.push(ln);
+      }
+      const earliest = pickEarliestRecovery(fleet, now);
+      if (earliest) {
+        lines.push('');
+        lines.push(
+          `Earliest recovery: <code>${escapeHtml(earliest.label)}</code> ` +
+            `${formatAbsolute(earliest.at, tz)} (in ${formatRelative(earliest.at, now)})`,
+        );
+      }
+    } else if (input.oldQuota) {
+      // Back-compat: no fleet snapshot supplied → old single-account shape.
       const recovery = recoveryAtFor(input.oldQuota);
       if (recovery) {
         lines.push(
