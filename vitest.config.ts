@@ -148,6 +148,11 @@ export default defineConfig({
       // flag-parity proof — run under bun, not vitest (vitest rejects the
       // variable dynamic import).
       "**/telegram-plugin/tests/emission-authority-card-drain-gate.test.ts",
+      // per-topic-current-turn.test.ts uses the bun-only dynamic-reimport seam
+      // (query-string module re-eval) to flip the read-once kill-switch per flag
+      // state in the PR-4e per-topic-map behavioural proof — run under bun, not
+      // vitest (vitest rejects the variable dynamic import).
+      "**/telegram-plugin/tests/per-topic-current-turn.test.ts",
       // history-reaper.test.ts uses bun:sqlite + bun:test (#1073) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/history-reaper.test.ts",
