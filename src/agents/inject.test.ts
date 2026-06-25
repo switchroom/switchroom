@@ -771,44 +771,69 @@ describe("#2566 — dialog:true commands send Escape after capture", () => {
   });
 });
 
-describe("#2566 — /model and /memory are blocklisted (not allowlisted)", () => {
-  it("/model returns failed:blocked via injectSlashCommandWith", async () => {
-    const runner = makeFakeRunner("");
-    const r = await injectSlashCommandWith(runner, {
-      socket: "test", session: "test", command: "/model",
-      settleMs: 50, timeoutMs: 200,
+describe("#2566 — /model and /memory allowlist treatment", () => {
+  /**
+   * Records every send-keys call so we can assert whether Escape fires.
+   */
+  async function driveRecording(
+    command: string,
+    paneAfter: string,
+  ): Promise<{ result: Awaited<ReturnType<typeof injectSlashCommandWith>>; sent: string[][] }> {
+    const sent: string[][] = [];
+    let captures = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => {
+        captures++;
+        return captures === 1 ? "" : paneAfter;
+      },
+      send: (_s, _n, args) => {
+        sent.push(args);
+      },
+    };
+    const result = await injectSlashCommandWith(runner, {
+      socket: "test",
+      session: "test",
+      command,
+      settleMs: 50,
+      timeoutMs: 200,
     });
-    expect(r.outcome).toBe("failed");
-    expect(r.errorCode).toBe("blocked");
-    expect(r.errorMessage).toMatch(/#2566/);
+    return { result, sent };
+  }
+
+  // /model must STAY on the allowlist — the `/model <name>` set path
+  // (telegram-plugin/gateway/model-command.ts) depends on it, enforced by
+  // model-command.test.ts "inject allowlist contract".
+  it("/model is in INJECT_COMMANDS and NOT in INJECT_BLOCKED", () => {
+    expect(INJECT_COMMANDS.has("/model")).toBe(true);
+    expect(INJECT_BLOCKED.has("/model")).toBe(false);
   });
 
-  it("/memory returns failed:blocked via injectSlashCommandWith", async () => {
-    const runner = makeFakeRunner("");
-    const r = await injectSlashCommandWith(runner, {
-      socket: "test", session: "test", command: "/memory",
-      settleMs: 50, timeoutMs: 200,
-    });
-    expect(r.outcome).toBe("failed");
-    expect(r.errorCode).toBe("blocked");
-    expect(r.errorMessage).toMatch(/#2566/);
+  it("/model has NO dialog flag (driver-managed, never opens a raw picker)", () => {
+    expect(INJECT_COMMANDS.get("/model")?.dialog).toBeFalsy();
   });
 
-  it("/model is NOT in INJECT_COMMANDS allowlist", () => {
-    expect(INJECT_COMMANDS.has("/model")).toBe(false);
+  it("/model — NO Escape is sent (not a dialog command)", async () => {
+    const { sent } = await driveRecording("/model", "❯ /model\n  some output");
+    expect(sent.some((s) => s[s.length - 1] === "Escape")).toBe(false);
   });
 
-  it("/memory is NOT in INJECT_COMMANDS allowlist", () => {
-    expect(INJECT_COMMANDS.has("/memory")).toBe(false);
+  // /memory is raw-injected (no driver); it opens a picker on v2.1.185+, so
+  // it rides the dialog:true Escape-dismiss path — kept usable, not blocked.
+  it("/memory is in INJECT_COMMANDS with dialog:true and NOT blocklisted", () => {
+    expect(INJECT_COMMANDS.has("/memory")).toBe(true);
+    expect(INJECT_COMMANDS.get("/memory")?.dialog).toBe(true);
+    expect(INJECT_BLOCKED.has("/memory")).toBe(false);
   });
 
-  it("/model IS in INJECT_BLOCKED with a reason citing #2566", () => {
-    expect(INJECT_BLOCKED.has("/model")).toBe(true);
-    expect(INJECT_BLOCKED.get("/model")?.reason).toMatch(/#2566/);
-  });
-
-  it("/memory IS in INJECT_BLOCKED with a reason citing #2566", () => {
-    expect(INJECT_BLOCKED.has("/memory")).toBe(true);
-    expect(INJECT_BLOCKED.get("/memory")?.reason).toMatch(/#2566/);
+  it("/memory — sends Escape AFTER capture to dismiss the picker", async () => {
+    const dialogOutput = `❯ /memory
+  Select a memory file to edit
+  1. ./CLAUDE.md`;
+    const { result, sent } = await driveRecording("/memory", dialogOutput);
+    expect(sent[0]).toEqual(["send-keys", "-l", "/memory"]);
+    expect(sent[1]).toEqual(["send-keys", "Enter"]);
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok");
   });
 });

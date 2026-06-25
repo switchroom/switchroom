@@ -74,6 +74,23 @@ export const INJECT_COMMANDS: ReadonlyMap<string, InjectCommandMeta> = new Map([
   ["/status", { description: "Show session status", expectsOutput: true, dialog: true }],
   ["/usage", { description: "Show plan quota", expectsOutput: true, dialog: true }],
   ["/hooks", { description: "List configured hooks", expectsOutput: true, dialog: true }],
+  // #2566 — `/memory` is raw-injected (no dedicated driver) and on Claude
+  // Code v2.1.185+ opens an interactive memory-file picker. It rides the
+  // same dialog:true Escape-dismiss path: inject types `/memory` + Enter
+  // (which OPENS the picker — it does not select a row), captures the
+  // picker content, then sends Escape to CANCEL. No row is ever selected
+  // (inject sends no arrow keys / no second Enter), so the dismiss is
+  // side-effect-free — same safety profile as the /cost & /status dialogs.
+  ["/memory", { description: "Open memory picker", expectsOutput: true, dialog: true }],
+  // #2566 — `/model` stays on the allowlist with NO dialog flag. It is
+  // NOT raw-injected from Telegram: the dedicated driver
+  // (telegram-plugin/gateway/model-command.ts) intercepts every `/model`
+  // message. Bare `/model` renders a dashboard (no inject); `/model <name>`
+  // injects `/model <alias>` WITH AN ARGUMENT — a direct set that opens no
+  // picker. The set path depends on `/model` being allowlisted (enforced by
+  // model-command.test.ts "inject allowlist contract"), so it must not move
+  // to the blocklist and needs no Escape handling.
+  ["/model", { description: "Open model picker", expectsOutput: true }],
   // #2471 — `/effort` was previously listed here as an allowlisted inject,
   // but injecting it surfaces a blocking "Change effort level? 1. Yes /
   // 2. No" confirmation modal that an agent/headless session can't answer,
@@ -135,34 +152,6 @@ export const INJECT_BLOCKED: ReadonlyMap<string, InjectBlockedMeta> = new Map([
     {
       reason:
         "leaves a blocking confirmation modal open and wedges the pane; use the /effort command (it drives the modal), not raw inject",
-    },
-  ],
-  // #2566 — `/model` opens a model-picker where selecting a row MUTATES
-  // the session's active model. The inject primitive types the command,
-  // waits for capture, then would need to send Escape to cancel. The risk
-  // is that the pane-settle window could accidentally land on a picker row
-  // and apply an unintended model switch before Escape is sent. Silent
-  // model mutation is a worse failure mode than "command not available via
-  // inject." The model is set non-interactively at session start via the
-  // `--model` CLI flag or `defaultModel` in the agent config. Operators
-  // who need to change the model mid-session should restart the agent.
-  [
-    "/model",
-    {
-      reason:
-        "opens a model-picker that can mutate the session model on row-selection; set the model via agent config (defaultModel) or the --model CLI flag and restart the agent (#2566)",
-    },
-  ],
-  // #2566 — `/memory` opens a memory-file picker. Like /model, selection
-  // mutates state (opens/edits a memory file). The picker is interactive
-  // and cannot be safely driven via the raw inject primitive without risk
-  // of an accidental selection. Memory is managed via the Hindsight MCP
-  // tools (mcp__hindsight__retain / recall) which are the proper path.
-  [
-    "/memory",
-    {
-      reason:
-        "opens an interactive memory-file picker that can mutate memory state on row-selection; use the Hindsight MCP tools (mcp__hindsight__retain / recall) for memory operations (#2566)",
     },
   ],
 ]);
