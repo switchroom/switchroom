@@ -1,3 +1,9 @@
+---
+artefact: agent-managed skills phase 0 findings
+serves: jobs/extend-without-forking.md
+status: design decisions, ready to drive PR-3 implementation
+---
+
 # Phase 0 findings — agent-managed-skills (RFC #1814)
 
 Status: design decisions, ready to drive PR-3 implementation

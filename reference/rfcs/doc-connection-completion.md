@@ -1,3 +1,9 @@
+---
+artefact: make Google Drive a real collaboration surface
+serves: jobs/act-in-my-tools-with-an-identity.md
+status: Draft v3 — implementation pivot in §4.2
+---
+
 # RFC E: Make Google Drive a real collaboration surface
 
 Status: Draft v3 (v3.1 amendment 2026-05-15 — implementation pivot in §4.2)

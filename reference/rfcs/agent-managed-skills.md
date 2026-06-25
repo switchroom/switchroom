@@ -1,3 +1,9 @@
+---
+artefact: agent-managed skills — fleet capability lifecycle
+serves: jobs/extend-without-forking.md
+status: Historical — shipped (Phase 1 + 3); Phase 2a superseded
+---
+
 # RFC: Agent-managed skills — fleet capability lifecycle
 
 Status: **Historical** — Phase 1 (personal-skill autonomy) shipped in

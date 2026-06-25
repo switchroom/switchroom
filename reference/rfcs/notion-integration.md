@@ -1,3 +1,9 @@
+---
+artefact: Notion integration
+serves: jobs/act-in-my-tools-with-an-identity.md
+status: Draft
+---
+
 # RFC: Notion integration
 
 **Status:** Draft

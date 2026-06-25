@@ -1,3 +1,9 @@
+---
+artefact: eliminate claude -p (programmatic usage) from switchroom
+serves: jobs/keep-my-subscription-honest.md
+status: accepted — shipped in #1625 and #1626
+---
+
 # RFC — Eliminate `claude -p` (programmatic usage) from switchroom
 
 > Status: accepted — 2026-05-21 (Workstream A shipped in #1625;

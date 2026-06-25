@@ -72,3 +72,6 @@ switchroom-macos-*
 switchroom-checksums.txt
 
 .test-tmp/
+
+# Synology NAS thumbnail artifacts
+@eaDir/

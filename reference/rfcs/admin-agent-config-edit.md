@@ -1,3 +1,9 @@
+---
+artefact: admin-agent config edit via approval-gated hostd verb
+serves: jobs/approve-what-my-agent-can-touch.md
+status: Draft v1
+---
+
 # RFC: Admin-agent edits to switchroom.yaml via approval-gated hostd verb
 
 Status: Draft v1

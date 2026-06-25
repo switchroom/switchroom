@@ -1,3 +1,9 @@
+---
+artefact: per-agent Telegram supergroup mode
+serves: jobs/talk-to-agents-from-anywhere.md
+status: Draft for ratification
+---
+
 # RFC: Per-agent Telegram supergroup mode
 
 **Status:** Draft for ratification

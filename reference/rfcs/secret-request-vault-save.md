@@ -1,3 +1,9 @@
+---
+artefact: agent-requested secrets — secure save-card to vault (no chat paste)
+serves: jobs/approve-what-my-agent-can-touch.md
+status: Draft
+---
+
 # RFC: Agent-requested secrets — secure save-card → vault (no chat paste)
 
 **Status:** Draft (needs operator product decision on §6)

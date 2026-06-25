@@ -1,3 +1,9 @@
+---
+artefact: Cloudflare-only edge lock for webhook ingest
+backs: no-self-escalation
+status: Draft v1
+---
+
 # RFC: Cloudflare-only edge lock for webhook ingest
 
 Status: Draft v1

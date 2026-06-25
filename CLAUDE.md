@@ -244,7 +244,7 @@ Three checks. A "no" on any one is a redesign, not a follow-up:
 
 1. **Docs test** — can someone use this without opening `docs/`?
 2. **Defaults test** — does it work on a fresh `switchroom setup` with zero config?
-3. **Consistency test** — same CLI shape, cascade, vault syntax, progress card as adjacent features?
+3. **Consistency test** — same CLI shape, cascade, vault syntax, chat-as-artifact as adjacent features?
 
 **Invariants — `reference/invariants.md`** — *are we even allowed?*
 The lines we won't cross by construction (claude-native,
@@ -257,7 +257,7 @@ The four outcomes in full, how the product functions at a high level,
 and the job index (the single source of truth for which jobs exist).
 
 **Job specs — `reference/jobs/<job>.md`** — *did it do the user's job?*
-19 outcome-focused jobs, each with `job: / outcome: / stakes: / serves:
+20 outcome-focused jobs, each with `job: / outcome: / stakes: / serves:
 / invariants:` frontmatter. Survey cheaply: `head -7 reference/jobs/*.md`.
 Read in full only the job spec(s) the change touches; the body is
 **Good / bad** (dual-audience decision aid), **Prove it** (UAT wired to
@@ -276,8 +276,9 @@ invariant it details (e.g. `access-model.md` backs `no-self-escalation`).
 ### Verdict rule
 
 A change ships when it (a) advances one of the four outcomes,
-(b) satisfies its job spec, (c) passes all three principle checks, and
-(d) crosses no invariant. Anything else is out of scope, however clever.
+(b) satisfies its job spec — proven by its outcome UAT, (c) passes all three
+principle checks, and (d) crosses no invariant. Anything else is out of
+scope, however clever.
 
 ## Repo layout
 

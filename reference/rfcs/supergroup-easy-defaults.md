@@ -1,3 +1,9 @@
+---
+artefact: supergroup easy-mode defaults (zero-config "agent owns a working room")
+serves: jobs/talk-to-agents-from-anywhere.md
+status: Phase 1 implemented
+---
+
 # RFC: Supergroup easy-mode defaults (zero-config "agent owns a working room")
 
 **Status:** Phase 1 implemented (this PR)

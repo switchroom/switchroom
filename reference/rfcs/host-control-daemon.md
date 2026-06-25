@@ -1,3 +1,9 @@
+---
+artefact: host-control daemon (switchroom-hostd)
+serves: jobs/idempotent-update-and-restart.md
+status: Draft v3 (docker-first correction)
+---
+
 # RFC C: Host-control daemon (`switchroom-hostd`)
 
 Status: Draft v3 (docker-first correction)

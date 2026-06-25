@@ -1,3 +1,9 @@
+---
+artefact: hard-boundary operator approvals (no agent self-elevation)
+backs: no-self-escalation
+status: Draft for operator review
+---
+
 # RFC: Hard-boundary operator approvals (no agent self-elevation)
 
 - Status: **Draft for operator review**

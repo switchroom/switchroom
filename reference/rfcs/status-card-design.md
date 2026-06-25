@@ -1,5 +1,6 @@
 ---
 artefact: Telegram progress card
+serves: jobs/know-what-my-agent-is-doing.md
 status: archived — superseded
 supersededBy: conversational-pacing.md
 ---

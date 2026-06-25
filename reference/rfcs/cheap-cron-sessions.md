@@ -1,3 +1,9 @@
+---
+artefact: cheap cron — deterministic polls + per-agent Sonnet cron session
+serves: jobs/crons-use-the-model-only-when-it-earns-it.md
+status: Draft, post-review (rev 2)
+---
+
 # RFC — Cheap cron: deterministic polls + a per-agent Sonnet cron session
 
 **Status:** Draft, post-review (rev 2)

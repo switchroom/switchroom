@@ -1,3 +1,9 @@
+---
+artefact: Google Workspace as a first-class agent capability
+serves: jobs/act-in-my-tools-with-an-identity.md
+status: Draft v3
+---
+
 # RFC G: Google Workspace as a first-class agent capability
 
 Status: Draft v3

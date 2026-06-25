@@ -1,3 +1,9 @@
+---
+artefact: InboundDeliveryStateMachine
+serves: jobs/survive-reboots-and-real-life.md
+status: draft v1
+---
+
 # RFC — InboundDeliveryStateMachine
 
 > Status: draft v1 — design contract for Phase 2b of the wedge-cluster remediation. Closes the architectural class of bugs that v0.12.22 (#1573) patched at the symptom level.
