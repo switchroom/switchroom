@@ -41,6 +41,10 @@ import {
   type FeedOpenGateView,
   type FeedOpenGateDeps,
 } from './feed-open-gate.js'
+import {
+  decideOverPing,
+  type OverPingDecision,
+} from '../over-ping-safety-net.js'
 
 /**
  * Kill-switch. Read ONCE at module top, `=== '1'` (default OFF), following the
@@ -71,6 +75,25 @@ export interface PingClaimInput {
   modelRequestedPing: boolean
   /** This reply is a substantive final answer (`isSubstantiveFinalReply`). */
   substantive: boolean
+}
+
+/**
+ * The live per-turn ping-slot state the over-ping decision reads (PR-4c seam).
+ *
+ * A structural subset of `CurrentTurn` threaded in EXPLICITLY so the façade can
+ * call `decideOverPing` in its enabled branch without importing gateway.ts's
+ * turn type. These are READS only — the façade decides; the call-site
+ * `applyDecision` thunk performs the atomic `firstPingAt`/`firstPingWasSubstantive`
+ * pair-set (the #2562 atomicity invariant: two adjacent assignments, no await
+ * between, so a racing second reply reads a consistent pair).
+ */
+export interface PingClaimCtx {
+  /** Wall-clock ms of the FIRST ping this turn, or null if none has landed. */
+  firstPingAt: number | null
+  /** True iff the send that CLAIMED the slot was itself a substantive answer. */
+  firstPingWasSubstantive: boolean
+  /** Deterministic clock for the decision (the call site's `Date.now()`). */
+  nowMs: number
 }
 
 /**
@@ -202,22 +225,52 @@ export class EmissionAuthority {
   }
 
   /**
-   * Claim-or-downgrade the turn's one notification ping (wraps the existing
-   * `decideOverPing` block via `apply`).
+   * Claim-or-downgrade the turn's one notification ping.
    *
-   * PR-4a: a pure pass-through. The `_input` is carried for the PR-4b seam but
-   * consulted nowhere yet; both branches run `apply`, which executes the
-   * existing over-ping block verbatim (the `decideOverPing` call, the stderr
-   * log, the metric emit, the `firstPingAt` / `firstPingWasSubstantive`
-   * mutations, and the `disableNotification` / `wasOverPingSuppressed`
-   * assignments the call site consumes). Nothing about the decision moves here.
+   * PR-4c — the over-ping DECISION relocates here, behind the kill-switch, the
+   * same structural way PR-4b moved the OPEN gate. Nothing new is extracted:
+   * `decideOverPing` is already a pure predicate in `over-ping-safety-net.ts`;
+   * PR-4c only relocates the *call* into the enabled branch and keeps the
+   * *effects* (stderr, metric, the atomic `firstPingAt`/`firstPingWasSubstantive`
+   * pair-set, the `disableNotification`/`wasOverPingSuppressed` closure writes)
+   * at the call site, parameterized by the decision the façade hands back.
+   *
+   *  - **Disabled branch (default):** unchanged from PR-4a — `disabled()` runs,
+   *    and that thunk holds its OWN literal `decideOverPing(...)` call + the full
+   *    effects block, VERBATIM from PR-4b-base. The disabled path is therefore
+   *    provably byte-identical to base: nothing about the decision moves out of
+   *    the call site when the flag is OFF.
+   *  - **Enabled branch:** compute the decision HERE via `decideOverPing` (the
+   *    SAME pure predicate, the SAME inputs threaded through `ctx` + `input`) and
+   *    hand it to `applyDecision(decision)`, which performs the identical effects
+   *    at the call site. Same pure inputs ⇒ same decision ⇒ flag-ON ≡ flag-OFF ≡
+   *    base: not one device ping differs.
+   *
+   * SYNCHRONOUS by contract — no `async`, no `await`. The
+   * `decideOverPing → applyDecision → pair-set` chain runs in one synchronous
+   * block so the #2562 atomicity invariant holds across the façade boundary: the
+   * façade decides whether to claim/upgrade; the call-site `applyDecision` thunk
+   * performs the two-adjacent-line `firstPingAt`/`firstPingWasSubstantive`
+   * pair-set with no await between.
    */
-  claimOrDowngradePing(_input: PingClaimInput, apply: () => void): void {
+  claimOrDowngradePing(
+    input: PingClaimInput,
+    ctx: PingClaimCtx,
+    applyDecision: (decision: OverPingDecision) => void,
+    disabled: () => void,
+  ): void {
     if (EMISSION_AUTHORITY_ENABLED) {
-      apply()
+      const decision = decideOverPing({
+        modelRequestedPing: input.modelRequestedPing,
+        firstPingAt: ctx.firstPingAt,
+        substantive: input.substantive,
+        firstPingWasSubstantive: ctx.firstPingWasSubstantive,
+        nowMs: ctx.nowMs,
+      })
+      applyDecision(decision)
       return
     }
-    apply()
+    disabled()
   }
 
   /**

@@ -82,12 +82,14 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
 
   // PR-4b: `openOrEditCard` is DELIBERATELY dropped from this no-op loop — its
   // enabled branch now GATES `apply()` behind the OPEN verdict (no longer an
-  // identical no-op). It gets a dedicated shape test below. The other three
-  // façade methods remain identical no-ops in both branches.
+  // identical no-op). PR-4c: `claimOrDowngradePing` is ALSO dropped — its
+  // enabled branch now COMPUTES the over-ping decision via `decideOverPing` and
+  // hands it to `applyDecision` (no longer an identical no-op). Both get
+  // dedicated shape tests below. The two remaining façade methods stay identical
+  // no-ops in both branches.
   for (const m of [
     'finalizeCard',
     'markSubstantiveFinalDelivered',
-    'claimOrDowngradePing',
   ]) {
     it(`${m} runs the SAME delegate in the enabled and disabled branch (identical no-op)`, () => {
       const body = methodBody(m)
@@ -102,14 +104,31 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
     })
   }
 
-  it('no decision token leaked into the no-op façade methods (only openOrEditCard gates in PR-4b)', () => {
-    // The three remaining no-op methods (finalize / markSubstantive / overping)
-    // move NO decision logic in. Only `openOrEditCard` consults a verdict — and
-    // it does so ONLY inside its EMISSION_AUTHORITY_ENABLED branch (asserted in
-    // the dedicated describe below). `decideOverPing` must NOT be CALLED/IMPORTED
-    // in the façade (a prose mention in a doc-comment is fine).
-    expect(facadeSrc).not.toMatch(/import .*decideOverPing/)
-    expect(facadeCode).not.toMatch(/decideOverPing\(/)
+  it('no decision token leaked into the remaining no-op façade methods (finalize / markSubstantive)', () => {
+    // The two remaining no-op methods (finalize / markSubstantive) move NO
+    // decision logic in: both kill-switch branches run the same `apply()`. Only
+    // `openOrEditCard` (PR-4b) and `claimOrDowngradePing` (PR-4c) consult a
+    // decision — each does so ONLY inside its EMISSION_AUTHORITY_ENABLED branch
+    // (asserted in the dedicated describes below).
+    function methodBody(name: string): string {
+      const after = facadeSrc.split(`${name}(`)[1] ?? ''
+      const body = after.split(/\n  [A-Za-z]+[(<]/)[0] ?? after
+      // Strip comment lines: the body can spill into the NEXT method's leading
+      // doc-comment (which legitimately names decideOverPing in prose). Only
+      // executable references count as a "leaked decision token".
+      return body
+        .split('\n')
+        .filter((l) => {
+          const t = l.trim()
+          return !(t.startsWith('*') || t.startsWith('//') || t.startsWith('/*'))
+        })
+        .join('\n')
+    }
+    for (const m of ['finalizeCard', 'markSubstantiveFinalDelivered']) {
+      const body = methodBody(m)
+      expect(body).not.toMatch(/computeFeedOpenVerdict\(/)
+      expect(body).not.toMatch(/decideOverPing\(/)
+    }
   })
 
   it('mayDrain is a PURE READ — returns activityInFlight == null, acquires no lock', () => {
@@ -169,6 +188,98 @@ describe('openOrEditCard — PR-4b OPEN-gate moves into the façade (inverts the
   })
 })
 
+// ─── PR-4c block — kept SEPARATED from (adjacent to, not interleaved with) the
+// PR-4b openOrEditCard describe above, to minimize rebase conflict with 4b's
+// edits to this same file. ────────────────────────────────────────────────────
+describe('claimOrDowngradePing — PR-4c over-ping decision moves into the façade (inverts the 4a no-op proof for this method)', () => {
+  /** Body of `claimOrDowngradePing` up to the next method declaration / class close. */
+  function pingBody(): string {
+    const after = facadeSrc.split('claimOrDowngradePing(')[1] ?? ''
+    return after.split(/\n  [A-Za-z]+[(<]/)[0] ?? after
+  }
+
+  it('the façade NOW imports + consults the over-ping decision (decideOverPing) — inverted from PR-4a', () => {
+    // PR-4a asserted NO decision token had moved in. PR-4c INVERTS that for the
+    // ping gate: the pure predicate is imported and CALLED in the façade.
+    expect(facadeSrc).toMatch(/import\s*\{[^}]*decideOverPing[^}]*\}\s*from\s*'\.\.\/over-ping-safety-net\.js'/)
+    expect(facadeCode).toMatch(/decideOverPing\(/)
+  })
+
+  it('the decision is consulted ONLY inside the EMISSION_AUTHORITY_ENABLED branch (disabled branch stays a pure pass-through)', () => {
+    const body = pingBody()
+    const flagIdx = body.indexOf('if (EMISSION_AUTHORITY_ENABLED)')
+    const decideIdx = body.indexOf('decideOverPing(')
+    expect(flagIdx).toBeGreaterThan(-1)
+    expect(decideIdx).toBeGreaterThan(-1)
+    // The decision call sits AFTER the enabled-branch guard opens.
+    expect(decideIdx).toBeGreaterThan(flagIdx)
+    // Exactly one decideOverPing call in the façade method (the enabled branch);
+    // the disabled fall-through delegates via `disabled()` with no decision.
+    const decideCalls = [...body.matchAll(/decideOverPing\(/g)]
+    expect(decideCalls).toHaveLength(1)
+  })
+
+  it('enabled branch computes-and-hands-back; disabled branch delegates via disabled() with NO decision', () => {
+    const body = pingBody()
+    // Enabled branch: compute the decision then hand it to applyDecision.
+    expect(body).toMatch(/const\s+decision\s*=\s*decideOverPing\(/)
+    expect(body).toMatch(/applyDecision\(decision\)/)
+    // Disabled branch: after the enabled branch returns, the method falls
+    // through to a bare `disabled()` then the method `}` — the disabled path
+    // never touches the façade's decision (it computes its own at the call site).
+    expect(body).toMatch(/return\s*\n\s*\}\s*\n\s*disabled\(\)\s*\n\s*\}/)
+  })
+
+  it('the façade method is SYNCHRONOUS — no async, no await in the decide→applyDecision chain (atomicity invariant)', () => {
+    const body = pingBody()
+    // The #2562 atomicity invariant: the decision + the pair-set run in one
+    // synchronous block, no await between, so a racing second reply reads a
+    // consistent pair. The façade method must therefore not be async / await.
+    expect(facadeSrc).not.toMatch(/async\s+claimOrDowngradePing/)
+    expect(body).not.toMatch(/\bawait\b/)
+  })
+
+  it('the call-site applyDecision thunk performs the atomic two-adjacent-line pair-set with NO await between', () => {
+    // The relocation must NOT split the #2562 pair across the façade boundary:
+    // the façade decides; the call-site thunk sets firstPingAt AND
+    // firstPingWasSubstantive on two adjacent lines, no await between.
+    expect(gatewaySrc).toMatch(
+      /turn\.firstPingAt = now\s*\n\s*turn\.firstPingWasSubstantive = replySubstantive/,
+    )
+    // No await anywhere in the executeReply over-ping block (the decide→apply→
+    // pair-set synchronous chain). Bound to the block, BEFORE the Telegraph
+    // block below (which legitimately awaits).
+    const blockStart = gatewaySrc.indexOf('const applyOverPingDecision')
+    const telegraphIdx = gatewaySrc.indexOf('// Telegraph publish (#579)', blockStart)
+    const block = gatewaySrc.slice(blockStart, telegraphIdx)
+    const blockCode = block
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !(t.startsWith('*') || t.startsWith('//') || t.startsWith('/*'))
+      })
+      .join('\n')
+    expect(blockCode).toMatch(/\.claimOrDowngradePing\(/)
+    expect(blockCode).not.toMatch(/\bawait\b/)
+  })
+
+  it('claimOrDowngradePing appears EXACTLY ONCE in the gateway, inside the executeReply window (stream path untouched)', () => {
+    // The over-ping net exists ONLY in executeReply. executeStreamReply has no
+    // decideOverPing / firstPingAt / wasOverPingSuppressed and never calls
+    // claimOrDowngradePing — PR-4c does not touch the stream path.
+    const calls = [...gatewaySrc.matchAll(/\.claimOrDowngradePing\(/g)]
+    expect(calls).toHaveLength(1)
+    const callIdx = gatewaySrc.indexOf('.claimOrDowngradePing(')
+    const execReplyIdx = gatewaySrc.indexOf('async function executeReply(')
+    const execStreamIdx = gatewaySrc.indexOf('async function executeStreamReply(')
+    expect(execReplyIdx).toBeGreaterThan(-1)
+    expect(execStreamIdx).toBeGreaterThan(execReplyIdx)
+    // The single call is inside executeReply (before executeStreamReply starts).
+    expect(callIdx).toBeGreaterThan(execReplyIdx)
+    expect(callIdx).toBeLessThan(execStreamIdx)
+  })
+})
+
 describe('façade delegates to the existing emission primitives (call-site literals preserved)', () => {
   it('openOrEditCard / mayDrain wrap drainActivitySummary at the call sites (not CALLED inside the façade)', () => {
     // The façade does NOT IMPORT or CALL drainActivitySummary — the delegate
@@ -190,13 +301,15 @@ describe('façade delegates to the existing emission primitives (call-site liter
     expect(gatewaySrc).toMatch(/finalizeCard\(\(\) => \{\s*\n\s*clearActivitySummary\(/)
   })
 
-  it('claimOrDowngradePing wraps the decideOverPing block at the call site (not CALLED inside the façade)', () => {
-    expect(facadeSrc).not.toMatch(/import .*decideOverPing/)
-    expect(facadeCode).not.toMatch(/decideOverPing\(/)
-    // The decideOverPing call now lives inside a claimOrDowngradePing delegate.
+  it('claimOrDowngradePing — the call-site disabled thunk STILL contains a literal decideOverPing( (disabled-path proof)', () => {
+    // PR-4c: the façade's ENABLED branch now imports + calls `decideOverPing`
+    // (asserted in the dedicated describe below). But the DISABLED branch keeps
+    // its OWN literal `decideOverPing(` call inside the call-site thunk, VERBATIM
+    // from PR-4b-base — so the disabled path is provably byte-identical (never
+    // depends on the façade for the decision).
     const pingIdx = gatewaySrc.indexOf('claimOrDowngradePing(')
     expect(pingIdx).toBeGreaterThan(-1)
-    const window = gatewaySrc.slice(pingIdx, pingIdx + 1200)
+    const window = gatewaySrc.slice(pingIdx, pingIdx + 1600)
     expect(window).toMatch(/decideOverPing\(/)
   })
 })

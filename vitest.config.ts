@@ -137,6 +137,11 @@ export default defineConfig({
       // the real cross-turn predicate in the PR-4b flag-parity proof — run under
       // bun, not vitest.
       "**/telegram-plugin/tests/emission-authority-open-gate.test.ts",
+      // emission-authority-ping-gate.test.ts uses the bun-only dynamic-reimport
+      // seam (query-string module re-eval) to flip the read-once kill-switch per
+      // flag state in the PR-4c over-ping flag-parity proof — run under bun, not
+      // vitest (vitest rejects the variable dynamic import).
+      "**/telegram-plugin/tests/emission-authority-ping-gate.test.ts",
       // history-reaper.test.ts uses bun:sqlite + bun:test (#1073) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/history-reaper.test.ts",
