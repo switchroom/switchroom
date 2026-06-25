@@ -1,4 +1,4 @@
-import type { Command } from "commander";
+import { Option, type Command } from "commander";
 import chalk from "chalk";
 import { join, resolve } from "node:path";
 import { rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,6 +11,7 @@ import type { SwitchroomConfig } from "../config/schema.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
 import { scaffoldAgent, reconcileAgent, buildSettingsHooksBlock, detectHooksDrift, SWITCHROOM_DEFAULT_MAIN_MODEL, SWITCHROOM_DEFAULT_THINKING_EFFORT } from "../agents/scaffold.js";
 import { writeComposeFile } from "./write-compose.js";
+import type { ReleaseBlockShape } from "../config/release-resolve.js";
 import { bareClonePath } from "../repos/bare-clone.js";
 import { removeAgentWorktree } from "../repos/agent-worktree.js";
 import { listAvailableProfiles } from "../agents/profiles.js";
@@ -544,6 +545,18 @@ export interface ReconcileAndRestartOpts {
   force?: boolean;
   /** Override the compose path (tests). Defaults to DEFAULT_COMPOSE_PATH. */
   composePath?: string;
+  /**
+   * One-shot image-tag override for the compose regeneration step.
+   * Passed from `agent restart --pin <vX.Y.Z>` (and from the rollout's
+   * restart-agent step on the hostd path). When set, this WINS over
+   * `release.pin` in the loaded config — required because on the hostd
+   * rollout path the durable pin is not persisted to switchroom.yaml
+   * until AFTER the canary confirms the new version. Without this, the
+   * in-restart `writeComposeFile` re-reads the stale `release.pin` and
+   * overwrites the compose file that `apply --pin` just correctly wrote,
+   * putting the agent on the old image (#2558).
+   */
+  releaseOverride?: ReleaseBlockShape;
 }
 
 /**
@@ -695,6 +708,11 @@ export async function reconcileAndRestartAgent(
       config,
       composePath: opts.composePath ?? composeFilePath(),
       switchroomConfigPath: configPath,
+      // Thread the one-shot pin through so that on the hostd rollout path
+      // (where `release.pin` in switchroom.yaml is still the OLD value until
+      // the canary passes) the compose regeneration emits the TARGET image
+      // tag and not the stale pin. Fixes #2558.
+      releaseOverride: opts.releaseOverride,
     });
     if (r.changed) {
       const tagNote =
@@ -1170,6 +1188,15 @@ export function registerAgentCommand(program: Command): void {
       "--force-locked",
       "Restart even when bot_token is a vault: reference and the vault is locked (the agent will fail to reach Telegram until the vault is unlocked)"
     )
+    .addOption(
+      new Option(
+        "--pin <p>",
+        "One-shot image-tag override for the compose regeneration step of this restart. " +
+        "Overrides `release.pin` from switchroom.yaml for THIS restart only — used by " +
+        "`switchroom rollout` on the hostd path where the durable pin has not yet been " +
+        "persisted. Format: v<semver> or sha-<hex>.",
+      ),
+    )
     .action(
       withConfigError(
         async (
@@ -1180,6 +1207,7 @@ export function registerAgentCommand(program: Command): void {
             waitTimeout?: string;
             gracefulRestart?: boolean;
             forceLocked?: boolean;
+            pin?: string;
           }
         ) => {
           const config = getConfig(program);
@@ -1392,7 +1420,14 @@ export function registerAgentCommand(program: Command): void {
                 config,
                 agentsDir,
                 getConfigPath(program),
-                { graceful: opts.gracefulRestart, force: opts.force },
+                {
+                  graceful: opts.gracefulRestart,
+                  force: opts.force,
+                  // Thread the one-shot --pin through to writeComposeFile so
+                  // the compose regeneration uses the target image tag and not
+                  // the stale release.pin in config (#2558).
+                  releaseOverride: opts.pin ? { pin: opts.pin } : undefined,
+                },
               );
 
               if (opts.gracefulRestart) {

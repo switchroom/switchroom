@@ -31,6 +31,37 @@ describe("writeComposeFile", () => {
     expect(content).toContain("switchroom-agent:v0.14.92");
   });
 
+  // Regression guard for #2558:
+  // On the hostd rollout path, `apply --pin vX` correctly wrote the compose
+  // with the target tag. But the subsequent `agent restart <canary> --wait
+  // --force` called `writeComposeFile` WITHOUT `releaseOverride`, re-reading
+  // the stale `release.pin` from config and overwriting the compose — putting
+  // the canary on the old image. The fix: thread `releaseOverride` through
+  // `ReconcileAndRestartOpts` so `reconcileAndRestartAgent` can pass it to
+  // `writeComposeFile`, and have the rollout's restart-agent step supply it
+  // on the hostd path.
+  it("releaseOverride pin wins over stale release.pin in config (#2558 regression)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wc-2558-"));
+    const composePath = join(dir, "docker-compose.yml");
+    // Config has the OLD pin (v0.15.59); the rollout target is v0.15.61.
+    const config = mkConfig("v0.15.59");
+    const r = await writeComposeFile({
+      config,
+      composePath,
+      switchroomConfigPath: undefined,
+      releaseOverride: { pin: "v0.15.61" },
+    });
+    expect(r.imageTag).toBe("v0.15.61");
+    const content = readFileSync(composePath, "utf8");
+    // Every agent image ref must use the TARGET pin, not the stale config pin.
+    expect(content).toContain("switchroom-agent:v0.15.61");
+    expect(content).not.toContain("switchroom-agent:v0.15.59");
+    // Singleton images must also use the target (belt-and-braces — singletons
+    // honor --pin via a separate reconcile path but the compose must be consistent).
+    expect(content).toContain("switchroom-broker:v0.15.61");
+    expect(content).not.toContain("switchroom-broker:v0.15.59");
+  });
+
   it("reports the previous image tag + changed=true when the pin moves", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wc-"));
     const composePath = join(dir, "docker-compose.yml");
