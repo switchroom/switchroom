@@ -10356,7 +10356,13 @@ async function drainActivitySummary(
       // stays pending so a later OPEN-eligible producer (a tool label, or
       // liveness) renders it. An EDIT (activityMessageId != null) is never
       // gated. Enforced HERE so it covers BOTH the inline producers AND the
-      // detached heartbeat setInterval drain (R7/concurrency).
+      // detached heartbeat setInterval drain (R7/concurrency). The gate guards
+      // gate EVALUATION, not an in-flight send: it is not a hard mutex — a send
+      // already PAST this check and suspended at its `await robustApiCall(
+      // sendMessage)` when a substantive final lands still completes and opens a
+      // card; that residual is reconciled by lever-2's `clearActivitySummary`
+      // chaining its finalize onto `turn.activityInFlight` (the suspended drain)
+      // and editing the card in place, not by this gate blocking it.
       if (
         turn.activityMessageId == null
         && !mayOpenActivityCard({

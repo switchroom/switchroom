@@ -43,11 +43,13 @@ export type FeedOpenProducer =
   /** Narrative SHOW (producer A): plain assistant text, no tool, no time
    *  threshold. May only EDIT, never OPEN, while the turn has 0 tool labels. */
   | 'narrative'
-  /** Tool label (producer B): the model dispatched a tool. Always OPEN-eligible.
+  /** Tool label (producer B): the model dispatched a tool. OPEN-eligible unless a
+   *  substantive final already landed (lever 1).
    *  Foreground sub-agent renders (a Task tool) are tool work too → 'tool'. */
   | 'tool'
   /** Liveness timer (producer C): a genuine ≥12s thinking-gap open, or the
-   *  labelled-feed heartbeat maintaining an open card. Always OPEN-eligible. */
+   *  labelled-feed heartbeat maintaining an open card. OPEN-eligible unless a
+   *  substantive final already landed (lever 1). */
   | 'liveness'
 
 export interface FeedOpenInput {
