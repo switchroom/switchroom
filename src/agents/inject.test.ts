@@ -31,7 +31,7 @@ describe("validateInjectCommand", () => {
   });
 
   it("accepts an allowed command with trailing args (verb-only check)", () => {
-    expect(validateInjectCommand("/model claude-opus-4")).toBe("/model");
+    expect(validateInjectCommand("/cost some-arg")).toBe("/cost");
   });
 
   it("is case-insensitive on the verb", () => {
@@ -478,9 +478,12 @@ describe("injectSlashCommandWith — outcomes", () => {
       timeoutMs: 1000,
     });
 
+    // /cost has dialog:true — the two-step command send is followed by an
+    // Escape dismiss. Three sends total.
     expect(sent).toEqual([
       ["send-keys", "-l", "/cost"],
       ["send-keys", "Enter"],
+      ["send-keys", "Escape"],
     ]);
     expect(result.outcome).toBe("ok");
     expect(result.output).toContain("Total cost: $0.42");
@@ -623,4 +626,214 @@ describe("INJECT_BLOCKED — per-entry coverage (#725)", () => {
       expect(r.errorMessage).toContain(meta.reason);
     });
   }
+});
+
+// ─── #2566 — dialog dismissal ───────────────────────────────────────────────
+
+describe("#2566 — dialog:true commands send Escape after capture", () => {
+  /**
+   * Helper that drives injectSlashCommandWith with a mock runner that
+   * records all `send-keys` args in order. Returns `{ result, sent }`.
+   */
+  async function driveWithSentLog(
+    command: string,
+    paneAfter: string,
+  ): Promise<{ result: Awaited<ReturnType<typeof injectSlashCommandWith>>; sent: string[][] }> {
+    const sent: string[][] = [];
+    let captures = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => {
+        captures++;
+        return captures === 1 ? "" : paneAfter;
+      },
+      send: (_s, _n, args) => {
+        sent.push(args);
+      },
+    };
+    const result = await injectSlashCommandWith(runner, {
+      socket: "test",
+      session: "test",
+      command,
+      settleMs: 50,
+      timeoutMs: 200,
+    });
+    return { result, sent };
+  }
+
+  it("/status (dialog:true) — sends Escape AFTER Enter, captured output is returned", async () => {
+    const dialogOutput = `❯ /status
+   Settings   Status   Config   Usage   Stats
+  Session: active
+  Model: claude-opus-4`;
+    const { result, sent } = await driveWithSentLog("/status", dialogOutput);
+
+    // The command + Enter should be the first two sends.
+    expect(sent[0]).toEqual(["send-keys", "-l", "/status"]);
+    expect(sent[1]).toEqual(["send-keys", "Enter"]);
+    // Escape must be the LAST send (dismiss the dialog after capture).
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    // Captured dialog content is still returned so Telegram gets it.
+    expect(result.outcome).toBe("ok");
+    expect(result.output).toContain("Settings   Status   Config   Usage   Stats");
+  });
+
+  it("/cost (dialog:true) — sends Escape AFTER Enter, captured output is returned", async () => {
+    const dialogOutput = `❯ /cost
+  Total cost: $1.23
+  Session: $0.12 (3 turns)`;
+    const { result, sent } = await driveWithSentLog("/cost", dialogOutput);
+
+    expect(sent[0]).toEqual(["send-keys", "-l", "/cost"]);
+    expect(sent[1]).toEqual(["send-keys", "Enter"]);
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok");
+    expect(result.output).toContain("Total cost: $1.23");
+  });
+
+  it("/usage (dialog:true) — sends Escape after capture", async () => {
+    const dialogOutput = `❯ /usage
+  Usage: 45% of plan
+  Resets: 2026-07-01`;
+    const { result, sent } = await driveWithSentLog("/usage", dialogOutput);
+
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok");
+  });
+
+  it("/hooks (dialog:true) — sends Escape after capture", async () => {
+    const dialogOutput = `❯ /hooks
+  PreToolUse: /path/to/hook.sh
+  Stop: /path/to/stop.sh`;
+    const { result, sent } = await driveWithSentLog("/hooks", dialogOutput);
+
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok");
+  });
+
+  it("/clear (not dialog:true) — NO Escape is sent", async () => {
+    // /clear has no dialog flag — the dismiss must not fire for it.
+    const { sent } = await driveWithSentLog("/clear", "");
+    const escapeSends = sent.filter((a) => a.includes("Escape"));
+    expect(escapeSends).toHaveLength(0);
+  });
+
+  it("/compact (not dialog:true) — NO Escape is sent", async () => {
+    const { sent } = await driveWithSentLog("/compact", "");
+    const escapeSends = sent.filter((a) => a.includes("Escape"));
+    expect(escapeSends).toHaveLength(0);
+  });
+
+  it("/status (dialog:true, empty capture) — Escape is still sent + ok_no_output", async () => {
+    // Even when the dialog yields no parsed output (unusual but possible),
+    // Escape must be sent so the pane isn't left wedged.
+    const { result, sent } = await driveWithSentLog("/status", "");
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok_no_output");
+  });
+
+  it("Escape send failure degrades gracefully — output still returned", async () => {
+    // Simulate a tmux glitch on the dismiss send: the captured content
+    // must still be returned even if the Escape send-keys throws.
+    const dialogOutput = `❯ /status
+   Settings   Status   Config   Usage   Stats
+  Session: active`;
+    let sendCount = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: (() => {
+        let c = 0;
+        return () => {
+          c++;
+          return c === 1 ? "" : dialogOutput;
+        };
+      })(),
+      send: (_s, _n, args) => {
+        sendCount++;
+        // The third call is the Escape dismiss — make it throw.
+        if (args[0] === "send-keys" && args[1] === "Escape") {
+          throw new Error("tmux socket gone");
+        }
+      },
+    };
+    const result = await injectSlashCommandWith(runner, {
+      socket: "test",
+      session: "test",
+      command: "/status",
+      settleMs: 50,
+      timeoutMs: 200,
+    });
+    // Output is captured despite the Escape failure.
+    expect(result.outcome).toBe("ok");
+    expect(result.output).toContain("Settings   Status   Config   Usage   Stats");
+    // Not a failed outcome — the dismiss error is swallowed gracefully.
+    expect(result.errorCode).toBeUndefined();
+  });
+});
+
+describe("#2566 — /model and /memory allowlist treatment", () => {
+  /**
+   * Records every send-keys call so we can assert whether Escape fires.
+   */
+  async function driveRecording(
+    command: string,
+    paneAfter: string,
+  ): Promise<{ result: Awaited<ReturnType<typeof injectSlashCommandWith>>; sent: string[][] }> {
+    const sent: string[][] = [];
+    let captures = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => {
+        captures++;
+        return captures === 1 ? "" : paneAfter;
+      },
+      send: (_s, _n, args) => {
+        sent.push(args);
+      },
+    };
+    const result = await injectSlashCommandWith(runner, {
+      socket: "test",
+      session: "test",
+      command,
+      settleMs: 50,
+      timeoutMs: 200,
+    });
+    return { result, sent };
+  }
+
+  // /model must STAY on the allowlist — the `/model <name>` set path
+  // (telegram-plugin/gateway/model-command.ts) depends on it, enforced by
+  // model-command.test.ts "inject allowlist contract".
+  it("/model is in INJECT_COMMANDS and NOT in INJECT_BLOCKED", () => {
+    expect(INJECT_COMMANDS.has("/model")).toBe(true);
+    expect(INJECT_BLOCKED.has("/model")).toBe(false);
+  });
+
+  it("/model has NO dialog flag (driver-managed, never opens a raw picker)", () => {
+    expect(INJECT_COMMANDS.get("/model")?.dialog).toBeFalsy();
+  });
+
+  it("/model — NO Escape is sent (not a dialog command)", async () => {
+    const { sent } = await driveRecording("/model", "❯ /model\n  some output");
+    expect(sent.some((s) => s[s.length - 1] === "Escape")).toBe(false);
+  });
+
+  // /memory is raw-injected (no driver); it opens a picker on v2.1.185+, so
+  // it rides the dialog:true Escape-dismiss path — kept usable, not blocked.
+  it("/memory is in INJECT_COMMANDS with dialog:true and NOT blocklisted", () => {
+    expect(INJECT_COMMANDS.has("/memory")).toBe(true);
+    expect(INJECT_COMMANDS.get("/memory")?.dialog).toBe(true);
+    expect(INJECT_BLOCKED.has("/memory")).toBe(false);
+  });
+
+  it("/memory — sends Escape AFTER capture to dismiss the picker", async () => {
+    const dialogOutput = `❯ /memory
+  Select a memory file to edit
+  1. ./CLAUDE.md`;
+    const { result, sent } = await driveRecording("/memory", dialogOutput);
+    expect(sent[0]).toEqual(["send-keys", "-l", "/memory"]);
+    expect(sent[1]).toEqual(["send-keys", "Enter"]);
+    expect(sent[sent.length - 1]).toEqual(["send-keys", "Escape"]);
+    expect(result.outcome).toBe("ok");
+  });
 });
