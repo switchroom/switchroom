@@ -5737,6 +5737,15 @@ silencePoke.startTimer({
     // get_status snapshot → pure formatter. Any hostd unavailability
     // degrades silently to the existing generic text (zero regression).
     let text: string | null = null
+    // Hoisted out of the generic-fallback branch below because the send site
+    // gates `disable_notification` on it: when the turn is parked on an
+    // approval card, the fallback TEXT is a user-gating re-ping ("waiting for
+    // your approval — tap Approve or Deny …"), and that must stay LOUD so the
+    // user knows the ball is in their court. The reaction controller tracks the
+    // park via setAwaiting on the permission-request.
+    const blockedOnApproval = activeStatusReactions
+      .get(statusKey(ctx.chatId, ctx.threadId))
+      ?.isAwaiting() ?? false
     const upd = inFlightUpdate
     if (upd != null) {
       try {
@@ -5758,9 +5767,6 @@ silencePoke.startTimer({
       // benign "wedge" class — claude is alive, waiting on the operator's
       // tap), say so instead of "still working…". The reaction controller
       // already tracks this (setAwaiting on the permission-request park).
-      const blockedOnApproval = activeStatusReactions
-        .get(statusKey(ctx.chatId, ctx.threadId))
-        ?.isAwaiting() ?? false
       text = silencePoke.formatFrameworkFallbackText(
         ctx.fallbackKind,
         ctx.silenceMs,
@@ -5781,10 +5787,13 @@ silencePoke.startTimer({
       await robustApiCall(
         () => bot.api.sendMessage(ctx.chatId, text, {
           ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
-          // Status notice ("still working…"), not the user's answer —
-          // silenced (BORDERLINE: was a deliberate loud liveness ping;
-          // see PR description — revert just this literal to restore it).
-          disable_notification: true,
+          // Conditional: the pure-liveness "still working…" notice is a status
+          // surface and stays SILENT. But when the turn is parked on an
+          // approval card, this same fallback carries a user-gating re-ping
+          // ("waiting for your approval — tap Approve or Deny …") — that must
+          // PING, because the user is the one being waited on. Gate on the same
+          // `blockedOnApproval` signal that selects the re-ping text above.
+          disable_notification: blockedOnApproval ? false : true,
         }),
         { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
       )
