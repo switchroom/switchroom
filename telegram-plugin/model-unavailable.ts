@@ -84,6 +84,13 @@ export function detectModelUnavailable(
     // resets 8:50am (Australia/Melbourne)".
     'hit your limit',
     'hit the limit',
+    // SESSION-cap wording: "You've hit your session limit · resets 5pm".
+    // A session cap is a quota exhaustion that frees in HOURS (its reset is a
+    // bare time-of-day, see parseResetTime's time-only branch) — recognising
+    // it here is what lets the time-only reset parse fire and keeps a
+    // session-capped account from the +7d weekly bench.
+    'session limit',
+    'session cap',
   ]
   if (quotaSignals.some(s => lower.includes(s))) {
     const resetAt = parseResetTime(sample)
@@ -192,7 +199,124 @@ function parseResetTime(text: string, parseTimeNow: Date = new Date()): Date | u
     if (!Number.isNaN(d.getTime())) return d
   }
 
+  // "resets 5pm (Australia/Melbourne)" / "resets 8:50am" / "resets 17:00 (UTC)"
+  // SESSION-cap wording: a time of day with NO month/day. This frees in
+  // HOURS, not a week — without this branch it falls through to undefined,
+  // and the 429 inference path then applies resolveExhaustUntil's +7d weekly
+  // floor, benching a session-capped account for a week. Must sit AFTER the
+  // calendar branch so "resets May 3, 11am" never matches here. The leading
+  // negative lookahead `(?!...)` rejects a month name so a date-bearing
+  // string can't fall into this time-only branch.
+  const timeOnly = text.match(
+    /resets?\s+(?:at\s+)?(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i,
+  )
+  if (timeOnly) {
+    const d = resolveNextWallClock(
+      Number(timeOnly[1]),
+      timeOnly[2] ? Number(timeOnly[2]) : 0,
+      timeOnly[3]?.toLowerCase(),
+      timeOnly[4]?.trim(),
+      parseTimeNow,
+    )
+    if (d != null) return d
+  }
+
   return undefined
+}
+
+/**
+ * Resolve a bare wall-clock time ("5pm", "8:50am", "17:00") to the NEXT
+ * occurrence of that time, tz-aware. Returns the soonest future Date (rolls
+ * to tomorrow when the time has already passed today). Null on bad input
+ * (out-of-range hour/minute or an unknown tz). When `tz` is omitted the
+ * time is interpreted in UTC (best-effort) — Anthropic's strings normally
+ * carry the IANA tz in parens, e.g. "(Australia/Melbourne)".
+ */
+function resolveNextWallClock(
+  hour12or24: number,
+  minute: number,
+  ampm: string | undefined,
+  tz: string | undefined,
+  nowDate: Date,
+): Date | undefined {
+  let hour = hour12or24
+  if (ampm === 'pm' && hour < 12) hour += 12
+  if (ampm === 'am' && hour === 12) hour = 0
+  if (!Number.isFinite(hour) || hour > 23 || hour < 0) return undefined
+  if (!Number.isFinite(minute) || minute > 59 || minute < 0) return undefined
+  const nowMs = nowDate.getTime()
+  // Walk today and the next two days (DST-safe span) and pick the first
+  // occurrence strictly in the future relative to now.
+  const base = new Date(nowMs)
+  for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
+    // Derive the y/m/d for `dayOffset` days from now IN THE TARGET TZ, so the
+    // wall-clock date we resolve is the tz's calendar date, not the container's.
+    const dateParts = tzDateParts(new Date(nowMs + dayOffset * 86_400_000), tz)
+    if (dateParts == null) return undefined
+    const epoch = wallClockToEpoch(
+      dateParts.year, dateParts.month, dateParts.day, hour, minute, tz,
+    )
+    if (epoch != null && epoch > nowMs) return new Date(epoch)
+  }
+  // Fallback: shouldn't happen, but keep the function total.
+  void base
+  return undefined
+}
+
+/** The y/m/d of `d` as seen in `tz` (UTC when tz omitted). Null on bad tz. */
+function tzDateParts(
+  d: Date,
+  tz: string | undefined,
+): { year: number; month: number; day: number } | null {
+  if (!tz) {
+    return { year: d.getUTCFullYear(), month: d.getUTCMonth(), day: d.getUTCDate() }
+  }
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    })
+    const parts = Object.fromEntries(
+      fmt.formatToParts(d).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]),
+    )
+    return {
+      year: Number(parts.year),
+      month: Number(parts.month) - 1,
+      day: Number(parts.day),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Convert a wall-clock time in an IANA tz to epoch-ms (null if the tz is
+ * unknown). Resolves the tz's offset AT that date via Intl, so it is correct
+ * across DST — NOT `new Date(localString)`, which assumes the container TZ.
+ * Mirrors wedge-watchdog.ts's helper of the same name (kept local to keep
+ * this module dependency-free / pure-testable).
+ */
+function wallClockToEpoch(
+  year: number, month: number, day: number, hour: number, minute: number, tz: string | undefined,
+): number | null {
+  const asUtc = Date.UTC(year, month, day, hour, minute, 0)
+  if (!tz) return asUtc // no tz given → best-effort UTC
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    })
+    const parts = Object.fromEntries(
+      fmt.formatToParts(new Date(asUtc)).filter((p) => p.type !== 'literal').map((p) => [p.type, p.value]),
+    )
+    const shown = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour) % 24, Number(parts.minute), Number(parts.second),
+    )
+    const offset = shown - asUtc // how far ahead the tz wall clock is of UTC
+    return asUtc - offset
+  } catch {
+    return null // unknown tz
+  }
 }
 
 function parseRelativeDuration(s: string): number | null {

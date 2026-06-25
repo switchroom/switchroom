@@ -142,26 +142,88 @@ export function parseWeeklyReset(text: string, nowMs: number = Date.now()): numb
   const m = text.match(
     /resets\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s*(?:\(([^)]+)\))?/i,
   );
-  if (!m) return null;
-  const mon = MONTHS[m[1].slice(0, 3).toLowerCase()];
-  if (mon === undefined) return null;
-  const day = Number(m[2]);
-  let hour = Number(m[3]);
-  const minute = m[4] ? Number(m[4]) : 0;
-  const ampm = m[5]?.toLowerCase();
-  if (ampm === "pm" && hour < 12) hour += 12;
-  if (ampm === "am" && hour === 12) hour = 0;
-  if (!Number.isFinite(day) || !Number.isFinite(hour) || day < 1 || day > 31 || hour > 23) {
+  if (m) {
+    const mon = MONTHS[m[1].slice(0, 3).toLowerCase()];
+    // A leading word that ISN'T a month (e.g. "resets at 5pm" would never reach
+    // here because of the \d requirement; but "resets soon 5pm" would) → fall
+    // through to the time-only branch rather than returning null.
+    if (mon !== undefined) {
+      const day = Number(m[2]);
+      let hour = Number(m[3]);
+      const minute = m[4] ? Number(m[4]) : 0;
+      const ampm = m[5]?.toLowerCase();
+      if (ampm === "pm" && hour < 12) hour += 12;
+      if (ampm === "am" && hour === 12) hour = 0;
+      if (Number.isFinite(day) && Number.isFinite(hour) && day >= 1 && day <= 31 && hour <= 23) {
+        const tz = m[6]?.trim();
+        // Resolve the year as the next occurrence (roll forward if M/D already passed).
+        const probeYear = new Date(nowMs).getUTCFullYear();
+        for (const year of [probeYear, probeYear + 1]) {
+          const epoch = wallClockToEpoch(year, mon, day, hour, minute, tz);
+          if (epoch != null && epoch > nowMs - 60_000) return epoch;
+        }
+        return null;
+      }
+    }
+  }
+
+  // SESSION-cap wording: a bare time of day with NO month/day —
+  // "resets 5pm (Australia/Melbourne)" / "resets 8:50am" / "resets 17:00".
+  // This frees in HOURS, so it MUST resolve to the next occurrence of that
+  // wall-clock time, NOT the weekly fallback. Without this branch the caller
+  // substitutes now+7d and benches a session-capped account for a full week.
+  // The negative lookahead rejects a month name so a date-bearing string can
+  // never reach here (it's handled above).
+  const tm = text.match(
+    /resets\s+(?:at\s+)?(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s*(?:\(([^)]+)\))?/i,
+  );
+  if (tm) {
+    let hour = Number(tm[1]);
+    const minute = tm[2] ? Number(tm[2]) : 0;
+    const ampm = tm[3]?.toLowerCase();
+    if (ampm === "pm" && hour < 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+    if (!Number.isFinite(hour) || hour > 23 || hour < 0 || !Number.isFinite(minute) || minute > 59) {
+      return null;
+    }
+    const tz = tm[4]?.trim();
+    // Walk today + the next two days (DST-safe) IN THE TARGET TZ and pick the
+    // first occurrence strictly in the future.
+    for (let dayOffset = 0; dayOffset <= 2; dayOffset++) {
+      const dp = tzDateParts(new Date(nowMs + dayOffset * 86_400_000), tz);
+      if (dp == null) return null;
+      const epoch = wallClockToEpoch(dp.year, dp.month, dp.day, hour, minute, tz);
+      if (epoch != null && epoch > nowMs) return epoch;
+    }
     return null;
   }
-  const tz = m[6]?.trim();
-  // Resolve the year as the next occurrence (roll forward if M/D already passed).
-  const probeYear = new Date(nowMs).getUTCFullYear();
-  for (const year of [probeYear, probeYear + 1]) {
-    const epoch = wallClockToEpoch(year, mon, day, hour, minute, tz);
-    if (epoch != null && epoch > nowMs - 60_000) return epoch;
-  }
+
   return null;
+}
+
+/** The y/m/d of `d` as seen in `tz` (UTC when tz omitted). Null on bad tz. */
+function tzDateParts(
+  d: Date,
+  tz: string | undefined,
+): { year: number; month: number; day: number } | null {
+  if (!tz) {
+    return { year: d.getUTCFullYear(), month: d.getUTCMonth(), day: d.getUTCDate() };
+  }
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    });
+    const parts = Object.fromEntries(
+      fmt.formatToParts(d).filter((p) => p.type !== "literal").map((p) => [p.type, p.value]),
+    );
+    return {
+      year: Number(parts.year),
+      month: Number(parts.month) - 1,
+      day: Number(parts.day),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**

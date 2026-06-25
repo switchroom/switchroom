@@ -134,6 +134,7 @@ import {
 } from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
+import { createFleetFallbackResumeGate } from '../fleet-fallback-resume.js'
 import { resolveExhaustUntil } from './exhaust-until.js'
 import {
   pendingAuthAddFlows,
@@ -16659,6 +16660,36 @@ const fleetFallbackGate = createFleetFallbackGate({
   brokerReachable: isAuthBrokerSocketReachable,
 })
 
+/**
+ * Resume-after-swap gate (auth-failover-stall fix). Owns the single-flight +
+ * staleness decision for re-running the turn a mid-turn 429 killed. See
+ * fleet-fallback-resume.ts. Wired into doFireFleetAutoFallback below: on a
+ * 'switched' outcome we restart so the boot-resume path replays the dead turn
+ * on the freshly-active account. 3h staleness mirrors the boot-resume
+ * RESUME_MAX_AGE_MS failsafe (gateway boot path); single-flight stops a 429
+ * storm from loop-restarting the agent.
+ */
+const fleetFallbackResumeGate = createFleetFallbackResumeGate({
+  maxAgeMs: (() => {
+    const v = Number(process.env.SWITCHROOM_RESUME_MAX_AGE_MS)
+    return Number.isFinite(v) && v > 0 ? v : 10_800_000 // 3h, matches boot-resume
+  })(),
+})
+
+/**
+ * The start time (epoch-ms) of the most-recently-started active turn — the
+ * staleness signal for the resume gate. `activeTurnStartedAt` is stamped on
+ * inbound receipt (see its declaration), so the newest entry is the turn the
+ * 429 just killed. Returns null when no turn is tracked (then the resume gate
+ * defers staleness to the boot-resume 3h failsafe). */
+function newestActiveTurnStartedAtMs(): number | null {
+  let newest: number | null = null
+  for (const ms of activeTurnStartedAt.values()) {
+    if (newest == null || ms > newest) newest = ms
+  }
+  return newest
+}
+
 function wouldFireFleetAutoFallback(): boolean {
   return fleetFallbackGate.wouldFire()
 }
@@ -16839,6 +16870,34 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
         () => bot.api.sendMessage(chat_id, outcome.announcement, opts),
         { chat_id, verb: 'fleet-fallback:notify' },
       )
+    }
+    // ── Resume the dead turn (auth-failover-stall fix) ──────────────────────
+    // A mid-turn 429 killed a turn; the swap above moved the fleet to a healthy
+    // account, but that only takes effect on the NEXT claude invocation. Re-run
+    // the dead turn via triggerSelfRestart: the boot-resume path (gateway boot,
+    // findLatestTurnIfInterrupted → buildResumeInterruptedInbound) replays the
+    // LATEST interrupted turn on the freshly-active account. We restart rather
+    // than redeliver because the failed inbound was already DELIVERED (the turn
+    // started, then the model 429'd) so it is NOT in pendingInboundBuffer —
+    // redeliverBufferedInbound would find nothing. Guards live in
+    // fleetFallbackResumeGate: single-flight (a 429 storm cannot loop-restart)
+    // + 3h staleness (an ancient interrupted turn is not resurrected). Only
+    // reached on 'switched'; all-blocked / no-op outcomes never get here, so the
+    // all-blocked cooldown path above is preserved.
+    if (outcome.kind === 'switched') {
+      const verdict = fleetFallbackResumeGate.decide(newestActiveTurnStartedAtMs())
+      if (verdict === 'resume') {
+        const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? triggerAgent
+        process.stderr.write(
+          `telegram gateway: [fleet-fallback] resuming dead turn via self-restart ` +
+          `agent=${selfAgent} (swap ${outcome.oldLabel}→${outcome.newLabel})\n`,
+        )
+        triggerSelfRestart(selfAgent, 'fleet-fallback-resume')
+      } else {
+        process.stderr.write(
+          `telegram gateway: [fleet-fallback] resume suppressed (${verdict}) agent=${triggerAgent}\n`,
+        )
+      }
     }
     return outcome.kind === 'switched'
   } catch (err) {
