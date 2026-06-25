@@ -68,6 +68,48 @@ function computeCrossTurnAnswerDelivered(opts: {
   )
 }
 
+/**
+ * Mirror the gateway's per-turn identity (`deriveTurnId`) and the
+ * `pendingCrossTurnGate` arm/consume keying. The gate is keyed on the
+ * obligation's `originTurnId` — which equals `deriveTurnId(chat, thread, msgId)`
+ * for the originating inbound, and which the represent inbound reconstructs
+ * (it reuses the original chat/thread/messageId). The consume side looks the
+ * gate up by the ENQUEUE-time turn id of whatever turn is starting, deleting
+ * on read. So a turn consumes (and thus carries) the gate iff its own
+ * derived turn id equals the armed obligation's `originTurnId` — which is true
+ * for the matching represent turn and false for any unrelated foreground turn.
+ */
+function deriveTurnIdMirror(
+  chatId: string,
+  threadId: number | null | undefined,
+  messageId: string | number | null | undefined,
+): string | null {
+  if (messageId == null || messageId === '' || String(messageId) === '0') return null
+  return `${chatId}:${threadId ?? '_'}#${messageId}`
+}
+
+/** Arm side (`obligationSweep`): key by the obligation's originTurnId. */
+function armGate(
+  gate: Map<string, { sinceMs: number }>,
+  originTurnId: string,
+  openedAt: number,
+): void {
+  gate.set(originTurnId, { sinceMs: openedAt })
+}
+
+/**
+ * Consume side (enqueue / turn ctor): look up + delete by the STARTING turn's
+ * own derived turn id. Returns whether this turn carries a cross-turn gate.
+ */
+function consumeGate(
+  gate: Map<string, { sinceMs: number }>,
+  turnId: string,
+): { sinceMs: number } | undefined {
+  const hit = gate.get(turnId)
+  if (hit != null) gate.delete(turnId)
+  return hit
+}
+
 describe('cross-turn card gate — synthetic represent turn AFTER a substantive answer', () => {
   it('does NOT open a card when a substantive answer was delivered since the obligation was raised', () => {
     const openedAt = 1_000_000 * 1000 // ms — obligation raised
@@ -194,6 +236,77 @@ describe('cross-turn card gate — synthetic represent turn AFTER a substantive 
         crossTurnAnswerDelivered,
       }),
     ).toBe(true)
+  })
+
+  it('originTurnId-keyed: an UNRELATED foreground turn does NOT consume a gate armed for another obligation — its card opens even after a substantive answer', () => {
+    const openedAt = 1_000_000 * 1000 // ms — some obligation raised
+    // A substantive answer landed in this chat since that obligation's openedAt.
+    recordOutbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_ids: [42],
+      texts: [SUBSTANTIVE],
+      ts: 1_000_001,
+    })
+
+    const gate = new Map<string, { sinceMs: number }>()
+    // obligationSweep armed the gate for obligation whose origin was message 100.
+    const armedOriginTurnId = deriveTurnIdMirror(CHAT, null, 100)!
+    armGate(gate, armedOriginTurnId, openedAt)
+
+    // The MATCHING represent turn reconstructs the same id (reuses message 100)
+    // → consumes the gate → carries it.
+    const representTurnId = deriveTurnIdMirror(CHAT, null, 100)!
+    expect(representTurnId).toBe(armedOriginTurnId)
+
+    // But FIRST an unrelated foreground turn (different message 200, same chat)
+    // enqueues. Under the old chat/thread keying its statusKey would collide with
+    // the armed gate and wrongly consume it. Under originTurnId keying its derived
+    // turn id differs → no entry → it carries NO gate.
+    const foregroundTurnId = deriveTurnIdMirror(CHAT, null, 200)!
+    expect(foregroundTurnId).not.toBe(armedOriginTurnId)
+    const foregroundConsumed = consumeGate(gate, foregroundTurnId)
+    expect(foregroundConsumed).toBeUndefined()
+
+    // → the foreground turn has no cross-turn gate → its card OPENS even though a
+    // ≥200-char answer landed since the OTHER obligation's openedAt (correct: that
+    // answer is not evidence THIS unrelated turn was already answered).
+    const fgCrossTurnAnswerDelivered = computeCrossTurnAnswerDelivered({
+      aboutToOpen: true,
+      hasCrossTurnGate: foregroundConsumed != null,
+      openedAt,
+    })
+    expect(fgCrossTurnAnswerDelivered).toBe(false)
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 1,
+        crossTurnAnswerDelivered: fgCrossTurnAnswerDelivered,
+      }),
+    ).toBe(true)
+
+    // The armed gate is still intact (the foreground turn did NOT eat it), so the
+    // matching represent turn can still consume it and suppress ITS card.
+    const representConsumed = consumeGate(gate, representTurnId)
+    expect(representConsumed).toEqual({ sinceMs: openedAt })
+    const reCrossTurnAnswerDelivered = computeCrossTurnAnswerDelivered({
+      aboutToOpen: true,
+      hasCrossTurnGate: representConsumed != null,
+      openedAt,
+    })
+    expect(reCrossTurnAnswerDelivered).toBe(true)
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 1,
+        crossTurnAnswerDelivered: reCrossTurnAnswerDelivered,
+      }),
+    ).toBe(false)
+
+    // Consume-once: the gate is now drained.
+    expect(gate.size).toBe(0)
   })
 
   it('thread-scoped: an answer in a DIFFERENT topic does not suppress a represent in this topic', () => {

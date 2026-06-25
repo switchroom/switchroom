@@ -2693,18 +2693,25 @@ function streamKey(chatId: string, threadId?: number | null): string {
 }
 
 // PR1 (cross-turn stale-card guard, design §9 lever 4 / race C/D).
-// `obligationSweep` writes one entry here, keyed on statusKey(chat, thread),
-// the instant it pushes an `obligation_represent` inbound — carrying the
-// obligation's `openedAt` (when the obligation was RAISED). The NEXT `enqueue`
-// for that chat/thread (the synthetic represent turn that the inbound spawns)
+// `obligationSweep` writes one entry here, keyed on the obligation's
+// `originTurnId`, the instant it pushes an `obligation_represent` inbound —
+// carrying the obligation's `openedAt` (when the obligation was RAISED). The
+// represent inbound reuses the obligation's chat/thread/messageId, so the
+// `enqueue` that spawns the synthetic represent turn reconstructs the SAME
+// `deriveTurnId` value as the key. That represent turn — and ONLY that turn —
 // consumes and clears it, stamping `turn.crossTurnGate = { sinceMs: openedAt }`.
 // That turn's first card-OPEN then consults `hasOutboundDeliveredSince(chat,
 // openedAt)` and is suppressed iff a SUBSTANTIVE answer already landed since the
 // obligation was raised — so a "thinking…" card never narrates beneath an answer
-// the user already received in the original turn. A normal foreground turn never
-// has an entry here, so the gate is scoped to the synthetic surface and inert
-// for the foreground turn. The map holds at most one entry per chat/thread; a
-// represent push overwrites any stale one (the latest obligation wins).
+// the user already received in the original turn. Keying on `originTurnId` (not
+// chat/thread) means an unrelated later foreground turn on the same chat/thread
+// derives a different turn id, finds no entry, and is never mis-gated — closing
+// the residual cross-contamination window where a represent that was armed but
+// never enqueued (degenerate bridge-death) left a stale chat/thread-keyed gate
+// that the next foreground turn could wrongly consume. A normal foreground turn
+// never has an entry here, so the gate stays scoped to the synthetic surface.
+// The map holds at most one entry per obligation; re-arming the same obligation
+// overwrites its own entry with the latest openedAt.
 const pendingCrossTurnGate = new Map<string, { sinceMs: number }>()
 
 /**
@@ -6064,10 +6071,19 @@ function obligationSweep(): void {
     // "was a substantive answer already delivered since the obligation was
     // raised?" and, if so, suppress the card (it would otherwise narrate beneath
     // the answer the user already received). Keyed on the obligation's
-    // chat/thread; consumed at the next matching `enqueue`. This does NOT gate
-    // the represent SEND — the represent guard above already owns suppressing an
-    // already-satisfied represent; this only governs the decorative card.
-    pendingCrossTurnGate.set(statusKey(o.chatId, o.threadId), { sinceMs: o.openedAt })
+    // `originTurnId` — the SAME id the represent inbound carries
+    // (`buildObligationRepresentInbound` reuses `o.messageId`/`o.chatId`/
+    // `o.threadId`, so the enqueue-time `deriveTurnId` reconstructs exactly
+    // `o.originTurnId`). Keying on the turn id (not chat/thread) means ONLY the
+    // exact represent turn this gate was armed for can consume it; an unrelated
+    // later foreground turn on the same chat/thread has a different originTurnId
+    // → finds no entry → its card opens normally. This closes the residual
+    // cross-contamination window where a never-enqueued represent's stale gate
+    // could suppress an unrelated turn's card (the represent/duplicate-reply
+    // family). This does NOT gate the represent SEND — the represent guard above
+    // already owns suppressing an already-satisfied represent; this only governs
+    // the decorative card.
+    pendingCrossTurnGate.set(o.originTurnId, { sinceMs: o.openedAt })
     const attempt = obligationLedger.markRepresented(o.originTurnId)
     process.stderr.write(
       `telegram gateway: obligation re-presented origin=${o.originTurnId} attempt=${attempt}/${OBLIGATION_REPRESENT_MAX}\n`,
@@ -10716,14 +10732,16 @@ function handleSessionEvent(ev: SessionEvent): void {
           deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
           ?? `${chatKey(ev.chatId, enqThreadIdNum ?? null)}#synthetic-${startedAt}`
         // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Consume any
-        // pending cross-turn gate `obligationSweep` armed for this chat/thread
-        // when it pushed an `obligation_represent` inbound. Present ⇒ THIS turn
-        // is that synthetic represent surface; carry its `sinceMs` (the
-        // obligation's openedAt) so the card-OPEN drain can suppress a card that
-        // would land beneath an answer already delivered since the obligation
-        // was raised. Consume-once: delete on read so a later unrelated
-        // foreground turn on the same chat is never mis-gated.
-        const xTurnGateKey = statusKey(ev.chatId, enqThreadIdNum)
+        // pending cross-turn gate `obligationSweep` armed for THIS exact turn
+        // when it pushed an `obligation_represent` inbound. The gate is keyed on
+        // the obligation's `originTurnId`, and the represent inbound reuses the
+        // original chat/thread/messageId, so this turn's `turnId` (derived just
+        // above) equals that key iff this turn IS the represent surface armed for.
+        // An unrelated foreground turn on the same chat/thread derives a
+        // different `turnId` → finds no entry → no gate → its card opens normally
+        // (correct). Consume-once: delete on read so the matched gate can't leak
+        // forward, and a never-matched stale gate can never suppress another turn.
+        const xTurnGateKey = turnId
         const consumedCrossTurnGate = pendingCrossTurnGate.get(xTurnGateKey)
         if (consumedCrossTurnGate != null) pendingCrossTurnGate.delete(xTurnGateKey)
         const next: CurrentTurn = {
