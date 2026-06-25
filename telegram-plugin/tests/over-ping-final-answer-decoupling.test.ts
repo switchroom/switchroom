@@ -23,7 +23,7 @@
 
 import { describe, it, expect } from 'vitest'
 import { decideOverPing } from '../over-ping-safety-net.js'
-import { isFinalAnswerReply } from '../final-answer-detect.js'
+import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
 
 describe('#2533 — over-ping downgrade must not pollute final-answer classification', () => {
   // The midturn-silent-dm failing sequence: an interim ack pings, then a
@@ -77,5 +77,118 @@ describe('#2533 — over-ping downgrade must not pollute final-answer classifica
     // the bug only ever bit SHORT over-ping-suppressed finals (the #2533 case).
     expect(isFinalAnswerReply({ text: long, disableNotification: true })).toBe(true)
     expect(isFinalAnswerReply({ text: long, disableNotification: false })).toBe(true)
+  })
+})
+
+/**
+ * Notification ownership (R8 / PR-2 — design `docs/message-emission-
+ * determinism.md` §over-ping). The substantive final answer must OWN the
+ * turn's single device ping. The residual the bare "first ping wins" rule
+ * left: an interim ack pings first and claims the slot, so the later
+ * substantive answer is downgraded to silent — "the reply is last but the
+ * phone never buzzed for the answer." `decideOverPing` is now aware of WHO
+ * holds the slot (`firstPingWasSubstantive`) and WHO is asking
+ * (`substantive`) and UPGRADES a substantive answer over an ack's slot,
+ * while still suppressing every double-ping the #1674 guard exists for.
+ *
+ * The 2×2 ownership matrix (model wants to ping, slot already held):
+ *
+ *   incoming \ slot held by │ ACK (non-substantive) │ SUBSTANTIVE
+ *   ────────────────────────┼───────────────────────┼─────────────
+ *   SUBSTANTIVE answer       │ UPGRADE (ping, claim)  │ suppress (#1674)
+ *   ACK                      │ suppress (orig)        │ suppress
+ */
+describe('R8 / PR-2 — substantive final answer OWNS the turn ping (upgrade matrix)', () => {
+  const SUBSTANTIVE = 'x'.repeat(300) // ≥200 → isSubstantiveFinalReply true
+  const ACK = 'On it.' // <200, non-done → ack
+
+  it('row 1 — substantive answer pinging over an ACK-held slot ⇒ UPGRADE (not suppressed)', () => {
+    // The ack pinged first (claimed the slot, non-substantive).
+    const ack = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: null,
+      substantive: isSubstantiveFinalReply({ text: ACK, disableNotification: false }),
+      nowMs: 1_000,
+    })
+    expect(ack.claimSlot).toBe(true)
+    expect(ack.upgrade).toBe(false)
+    // Now the substantive answer wants to ping; the slot is ack-held.
+    const answer = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: 1_000,
+      substantive: isSubstantiveFinalReply({ text: SUBSTANTIVE, disableNotification: false }),
+      firstPingWasSubstantive: false, // the ack
+      nowMs: 2_000,
+    })
+    expect(answer.suppress).toBe(false) // the ANSWER pings — phone buzzes for the answer
+    expect(answer.claimSlot).toBe(true) // slot upgraded to substantive
+    expect(answer.upgrade).toBe(true)
+  })
+
+  it('row 2 — ACK pinging over a SUBSTANTIVE-held slot ⇒ suppress (no double-ping after the answer)', () => {
+    const d = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: 1_000,
+      substantive: isSubstantiveFinalReply({ text: ACK, disableNotification: false }),
+      firstPingWasSubstantive: true, // the real answer already owned the slot
+      nowMs: 2_000,
+    })
+    expect(d.suppress).toBe(true)
+    expect(d.claimSlot).toBe(false)
+    expect(d.upgrade).toBe(false)
+  })
+
+  it('row 3 — SUBSTANTIVE over a SUBSTANTIVE-held slot ⇒ suppress (preserves the #1674 model-double-ping guard)', () => {
+    // The reproducer #1674 targeted: a substantive answer pinged, then a
+    // substantive wrap-up also wants to ping. One beep, not two.
+    const d = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: 30_000,
+      substantive: isSubstantiveFinalReply({ text: SUBSTANTIVE, disableNotification: false }),
+      firstPingWasSubstantive: true,
+      nowMs: 36_000,
+    })
+    expect(d.suppress).toBe(true)
+    expect(d.upgrade).toBe(false)
+    expect(d.sinceFirstPingMs).toBe(6_000)
+  })
+
+  it('row 4 — ACK over an ACK-held slot ⇒ suppress (original one-ping-per-turn behaviour, unchanged)', () => {
+    const d = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: 1_000,
+      substantive: isSubstantiveFinalReply({ text: ACK, disableNotification: false }),
+      firstPingWasSubstantive: false,
+      nowMs: 2_000,
+    })
+    expect(d.suppress).toBe(true)
+    expect(d.claimSlot).toBe(false)
+    expect(d.upgrade).toBe(false)
+  })
+
+  it('the upgrade fires AT MOST once: after an upgrade, a further ack does NOT re-upgrade', () => {
+    // ack pings (slot=ack) → answer upgrades (slot=substantive) → a trailing
+    // ack must now suppress, not ping a third time.
+    const trailingAck = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: 2_000, // upgraded slot timestamp
+      substantive: false,
+      firstPingWasSubstantive: true, // slot now substantive after the upgrade
+      nowMs: 3_000,
+    })
+    expect(trailingAck.suppress).toBe(true)
+    expect(trailingAck.upgrade).toBe(false)
+  })
+
+  it('a substantive FIRST ping still claims (no upgrade flag) — upgrade is strictly the second-ping case', () => {
+    const d = decideOverPing({
+      modelRequestedPing: true,
+      firstPingAt: null, // no prior ping this turn
+      substantive: true,
+      nowMs: 1_000,
+    })
+    expect(d.claimSlot).toBe(true)
+    expect(d.upgrade).toBe(false) // first ping is a claim, not an upgrade
+    expect(d.suppress).toBe(false)
   })
 })
