@@ -133,6 +133,10 @@ export default defineConfig({
       // cross-turn-card-gate.test.ts imports history.ts (bun:sqlite) to seed a
       // real outbound row — must run under bun, not vitest. (#PR1 lever 4)
       "**/telegram-plugin/tests/cross-turn-card-gate.test.ts",
+      // emission-authority-open-gate.test.ts imports history.ts (bun:sqlite) for
+      // the real cross-turn predicate in the PR-4b flag-parity proof — run under
+      // bun, not vitest.
+      "**/telegram-plugin/tests/emission-authority-open-gate.test.ts",
       // history-reaper.test.ts uses bun:sqlite + bun:test (#1073) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/history-reaper.test.ts",

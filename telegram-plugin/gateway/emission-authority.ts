@@ -36,6 +36,12 @@
  * `mayDrain` lock-free so PR-4d has a clean read to build on.
  */
 
+import {
+  computeFeedOpenVerdict,
+  type FeedOpenGateView,
+  type FeedOpenGateDeps,
+} from './feed-open-gate.js'
+
 /**
  * Kill-switch. Read ONCE at module top, `=== '1'` (default OFF), following the
  * existing flag convention (`SWITCHROOM_FEED_HEARTBEAT` etc. in gateway.ts's
@@ -84,6 +90,32 @@ export class EmissionAuthority {
    */
   constructor(private readonly chatKey: string) {}
 
+  /**
+   * PR-4b OPEN-gate wiring. The gateway centralizes it in `emissionAuthorityFor`
+   * (one place) so the 6 `openOrEditCard` call sites stay byte-identical
+   * `(producer, apply)` — the façade reads the live turn view + injected history
+   * deps from HERE, not per-call. `viewProvider` is a thunk so the verdict reads
+   * the CURRENT card/latch/tool-count at gate time (they mutate during the turn).
+   * Lazily set on every `emissionAuthorityFor`; the disabled branch never reads
+   * it, so a turn that never wires it is harmless (only `openOrEditCard`'s
+   * EMISSION_AUTHORITY_ENABLED branch consults it).
+   */
+  private feedOpenView?: () => FeedOpenGateView
+  private feedOpenDeps?: FeedOpenGateDeps
+
+  /**
+   * Wire the PR-4b OPEN-gate inputs (idempotent). Called by the gateway's
+   * `emissionAuthorityFor` accessor so every routed turn's façade can compute
+   * the open verdict in its enabled branch. No-op-equivalent under the flag OFF.
+   */
+  wireFeedOpenGate(
+    viewProvider: () => FeedOpenGateView,
+    deps: FeedOpenGateDeps,
+  ): void {
+    this.feedOpenView = viewProvider
+    this.feedOpenDeps = deps
+  }
+
   /** The chat/thread key this façade was constructed for (PR-4e seam read). */
   get key(): string {
     return this.chatKey
@@ -93,19 +125,47 @@ export class EmissionAuthority {
    * Card OPEN-or-EDIT for the foreground turn (delegates to
    * `drainActivitySummary` at the call site via `apply`).
    *
-   * PR-4a: a pure pass-through. The `producer` is carried for the PR-4b OPEN
-   * gate but consulted nowhere yet; both kill-switch branches run `apply`
-   * unchanged, so the drain happens exactly as before. The delegate keeps the
-   * `turn.activityInFlight = drainActivitySummary(turn, <producer>)` assignment
-   * AT THE CALL SITE so the source-read wiring oracles still see it.
+   * PR-4b — the OPEN-gate decision RELOCATES here, behind the kill-switch:
+   *
+   *  - **Disabled branch (default):** unchanged from PR-4a — `apply()` runs
+   *    unconditionally. The drain's own inline OPEN gate is what refuses (and
+   *    `break`s) a disallowed OPEN, exactly as on main. Byte-identical to main.
+   *  - **Enabled branch:** compute the OPEN verdict from the live turn view +
+   *    injected history deps (`computeFeedOpenVerdict`) and run `apply()` IFF
+   *    `!(isOpen && !mayOpen)` is FALSE-y in the refuse sense — concretely
+   *    `apply()` runs iff `isOpen || mayOpen`. That is EXACTLY the set of cases
+   *    main did NOT `break` (main refuses iff `activityMessageId == null &&
+   *    !mayOpenActivityCard(...)`, i.e. `!isOpen && !mayOpen`). Same pure inputs
+   *    ⇒ same verdict, so flag-ON ≡ flag-OFF ≡ main: no emitted message differs.
+   *
+   * On flag-ON the drain still re-evaluates the SAME gate (now redundant) — an
+   * intentional, safe double-check: both are pure over identical inputs, and it
+   * also covers the documented in-flight-send race (a send already PAST the
+   * drain's check). A refused OPEN never calls `apply()`, so `activityInFlight`
+   * stays null and the pending render stays unadvanced — matching main's `break`
+   * + `finally` end-state. The delegate keeps the `turn.activityInFlight =
+   * drainActivitySummary(turn, <producer>)` assignment AT THE CALL SITE so the
+   * source-read wiring oracles still see it.
    */
   openOrEditCard(
-    _producer: EmissionProducer,
+    producer: EmissionProducer,
     apply: () => void,
   ): void {
     if (EMISSION_AUTHORITY_ENABLED) {
-      // PR-4b will gate the OPEN here via `mayOpenActivityCard` using
-      // `_producer`. PR-4a: identical to the disabled branch — just delegate.
+      // The OPEN-gate inputs are wired by `emissionAuthorityFor` (centralized).
+      // If a turn somehow reaches here unwired, fall back to delegating (no
+      // behaviour change — the drain's own gate still governs the OPEN).
+      if (this.feedOpenView != null && this.feedOpenDeps != null) {
+        const { isOpen, mayOpen } = computeFeedOpenVerdict(
+          this.feedOpenView(),
+          producer,
+          this.feedOpenDeps,
+        )
+        // Refuse (skip apply) iff main would have `break`-refused the OPEN:
+        // `!isOpen && !mayOpen`. Apply otherwise (an EDIT — isOpen — is never
+        // gated; an OPEN-eligible producer — mayOpen — opens).
+        if (!isOpen && !mayOpen) return
+      }
       apply()
       return
     }
