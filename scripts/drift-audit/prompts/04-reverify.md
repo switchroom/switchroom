@@ -1,8 +1,8 @@
 # Phase 4 — Re-verify prompt
 
 Self-contained prompt for the single re-verify agent. Dispatched
-after Phase 3 PRs merge to `upstream/main` (or `origin/main` in
-direct-origin setups). Confirms the drift the audit identified is
+after Phase 3 PRs merge to `origin/main` (the canonical
+`switchroom/switchroom`). Confirms the drift the audit identified is
 actually gone and surfaces anything that came back or was missed.
 
 ---
@@ -28,7 +28,7 @@ gone.
 ### Step 1 — sync to main
 
 ```
-git fetch origin    # or `upstream` in fork-mode
+git fetch origin    # origin is the canonical switchroom/switchroom
 git log origin/main --oneline --since="{{run_date}}" \
   --grep="drift-audit" | tee /tmp/drift-audit-merged.txt
 ```

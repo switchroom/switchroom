@@ -25,7 +25,7 @@ or the vision needs to retreat.
 | 0 — Inventory | Operator (one-off per run) | Decide which units this run covers | `manifest.yaml` (pilot included) |
 | 1 — Audit | Many parallel agents | One agent per unit; lists claims, verifies against code, emits verdicts | `audit/<date>/findings/<unit-id>.yaml` |
 | 2 — Triage | One coordinator agent | Reads all findings, groups into fix-batches, escalates ambiguous cases | `audit/<date>/{summary.md, fix-batches/*.md, escalations.md}` |
-| 3 — Fix | Many parallel agents | One agent per fix-batch; applies actions, opens PR | One PR per batch (fork or direct-origin) |
+| 3 — Fix | Many parallel agents | One agent per fix-batch; applies actions, opens PR | One PR per batch (branch pushed direct to origin) |
 | 4 — Re-verify | One agent | Re-runs Phase 1 on touched units after PRs merge | `audit/<date>/regressions.md` |
 
 ## Invocation (Claude Code session, this repo)
@@ -128,10 +128,9 @@ Phase 3 agents push branches and open PRs following the standard dev
 process in `CLAUDE.md`. A reviewer agent must APPROVE before you enable
 auto-merge.
 
-In environments where `gh` isn't available or the remote is direct-
-origin (no fork), Phase 3 falls back to pushing the branch and
-reporting a pre-filled GitHub compare URL for the operator to open
-the PR via web.
+In environments where `gh` isn't available, Phase 3 falls back to
+pushing the branch to origin (`switchroom/switchroom`) and reporting a
+pre-filled GitHub compare URL for the operator to open the PR via web.
 
 ## Why this exists in-repo
 

@@ -25,26 +25,24 @@ stop.
 
 ### Step 1 — branch off main
 
-If `origin` is the canonical repo (`switchroom/switchroom`) and the
-working directory is the live checkout, branch off `origin/main`:
+`origin` is the canonical repo (`switchroom/switchroom`) — there is no
+personal fork. From the live checkout, branch off `origin/main`:
 
 ```
 git fetch origin
 git checkout -b chore/drift-{{batch_slug}} origin/main
 ```
 
-If `origin` is your fork and `upstream` is the canonical, follow the
-standard worktree flow from `CLAUDE.md` "Standard dev process":
+For an isolated worktree (recommended when sharing the host), follow the
+worktree flow from `CLAUDE.md` "Standard dev process":
 
 ```
-git fetch upstream
+git fetch origin
 git worktree add ~/code/switchroom-drift-{{batch_slug}} \
-  -b chore/drift-{{batch_slug}} upstream/main
+  -b chore/drift-{{batch_slug}} origin/main
 cd ~/code/switchroom-drift-{{batch_slug}}
 ln -s ~/code/switchroom-sec-1417/node_modules node_modules
 ```
-
-Run `git remote -v` first to detect which mode you're in.
 
 ### Step 2 — apply the findings
 
