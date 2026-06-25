@@ -341,7 +341,11 @@ import {
   type FeedOpenProducer,
   type FeedOpenGateDeps,
 } from './feed-open-gate.js'
-import { EmissionAuthority } from './emission-authority.js'
+import {
+  EmissionAuthority,
+  EMISSION_AUTHORITY_ENABLED,
+  type CardDrainGateCtx,
+} from './emission-authority.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -2190,6 +2194,60 @@ function feedOpenGateDeps(): FeedOpenGateDeps {
     historyEnabled: HISTORY_ENABLED,
     finalAnswerMinChars: FINAL_ANSWER_MIN_CHARS,
   }
+}
+
+/**
+ * The deliver-before-drain inputs the PR-4d card-drain gate threads into the
+ * façade's pure `mayDrainCardNow`. Centralized so the card-drain helper sources
+ * the SAME `turnInFlightForGate()` + kill-switch the buffer-drain gate uses.
+ *
+ * `endingTurnFinalAnswerDelivered` is FIXED to `null` for the card path (§5
+ * modeling decision): the live foreground card single-flight is governed by
+ * `turn.activityInFlight` (via `mayDrain`), NOT by an ending turn's delivery
+ * state — so `mayDrainBufferedInbound` degenerates to `!turnInFlight` and a
+ * synthetic represent turn (finalAnswerDelivered=false) can never wedge the card.
+ */
+function cardDrainGateCtx(): CardDrainGateCtx {
+  return {
+    turnInFlight: turnInFlightForGate(),
+    endingTurnFinalAnswerDelivered: null,
+    enabled: SERIALIZE_UNTIL_REPLIED_ENABLED,
+  }
+}
+
+/**
+ * PR-4d centralized card-drain gate (Option A). The 6 foreground card-drain
+ * sites pass their EXISTING single-flight-guarded block (the `mayDrain` guard +
+ * the `openOrEditCard(producer, …)` thunk that assigns `turn.activityInFlight =
+ * drainActivitySummary(…)`) in VERBATIM as `run`, so those load-bearing literals
+ * stay byte-identical (the wiring oracles still see them).
+ *
+ *  - **Flag OFF (default):** runs the guarded block directly — NO `chatLock`
+ *    wrapper, byte-equivalent to base.
+ *  - **Flag ON:** acquires `chatLock` AROUND the deliver-before-drain decision
+ *    (`mayDrainCardNow`) + the synchronous block, unifying the card path with
+ *    the #2137 serialization gate. The lock spans ONLY the gate decision + the
+ *    synchronous `openOrEditCard` kick-off inside `run` (which only ASSIGNS
+ *    `turn.activityInFlight = drainActivitySummary(...)`; the async send is NOT
+ *    awaited inside the lock). The lock is released before any drain
+ *    `await sendMessage` suspends, so a card OPEN never holds `chatLock` across
+ *    the gate's release — a synthetic represent turn can never wedge the gate,
+ *    and `mayDrain` stays callable lock-free.
+ *
+ * LOCK ORDERING (no-deadlock invariant): `chatLock` is acquired EXCLUSIVELY
+ * here, around the gate; never the reverse. `mayDrainCardNow` is a pure read.
+ */
+function cardDrainGate(turn: CurrentTurn, ea: EmissionAuthority, run: () => void): void {
+  if (EMISSION_AUTHORITY_ENABLED) {
+    void chatLock.run(
+      statusKey(turn.sessionChatId, turn.sessionThreadId),
+      async () => {
+        if (ea.mayDrainCardNow(turn, cardDrainGateCtx())) run()
+      },
+    )
+    return
+  }
+  run()
 }
 
 // Component 3 (turn-origin reply routing). Recently-ended turns retained
@@ -10469,6 +10527,9 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
   if (rendered == null) return
   turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
   const ea = emissionAuthorityFor(turn)
+  // PR-4d: route the deliver-before-drain decision through the centralized
+  // card-drain gate (chatLock-serialized under the flag; verbatim block OFF).
+  cardDrainGate(turn, ea, () => {
   if (ea.mayDrain(turn)) {
     // Producer A (narrative SHOW): may only EDIT an already-open card, never
     // OPEN one on a 0-tool turn (design §9 lever 5 base case — the
@@ -10480,6 +10541,7 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
       turn.activityInFlight = drainActivitySummary(turn, 'narrative')
     })
   }
+  })
 }
 
 /**
@@ -10723,6 +10785,8 @@ function feedHeartbeatTick(): void {
     if (rendered == null) return
     turn.activityPendingRender = rendered
     const ea = emissionAuthorityFor(turn)
+    // PR-4d: route through the centralized chatLock-serialized card-drain gate.
+    cardDrainGate(turn, ea, () => {
     if (ea.mayDrain(turn)) {
       // Producer C (liveness timer): the genuine ≥12s thinking-gap open. This
       // is the ONE producer that may OPEN a 0-tool card (design §9 lever 5
@@ -10732,6 +10796,7 @@ function feedHeartbeatTick(): void {
         turn.activityInFlight = drainActivitySummary(turn, 'liveness')
       })
     }
+    })
     return
   }
 
@@ -10744,6 +10809,8 @@ function feedHeartbeatTick(): void {
   if (rendered == null) return
   turn.activityPendingRender = rendered
   const ea = emissionAuthorityFor(turn)
+  // PR-4d: route through the centralized chatLock-serialized card-drain gate.
+  cardDrainGate(turn, ea, () => {
   if (ea.mayDrain(turn)) {
     // Maintains an already-open card (guarded above on activityMessageId !=
     // null) → only ever EDITs. 'liveness' is correct either way.
@@ -10752,6 +10819,7 @@ function feedHeartbeatTick(): void {
       turn.activityInFlight = drainActivitySummary(turn, 'liveness')
     })
   }
+  })
 }
 if (!STATIC && FEED_HEARTBEAT_ENABLED) {
   setInterval(feedHeartbeatTick, FEED_HEARTBEAT_TICK_MS).unref()
@@ -11258,6 +11326,8 @@ function handleSessionEvent(ev: SessionEvent): void {
         // == the flat render when no foreground sub-agent is active.
         turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
         const ea = emissionAuthorityFor(turn)
+        // PR-4d: route through the centralized chatLock-serialized card-drain gate.
+        cardDrainGate(turn, ea, () => {
         if (ea.mayDrain(turn)) {
           // Producer B (tool label): always OPEN-eligible (labeledToolCount was
           // incremented just above). A turn that started conversational and now
@@ -11268,6 +11338,7 @@ function handleSessionEvent(ev: SessionEvent): void {
             turn.activityInFlight = drainActivitySummary(turn, 'tool')
           })
         }
+        })
       }
       return
     }
@@ -23138,11 +23209,14 @@ void (async () => {
                         // (no-op delegate). Producer made explicit ('tool' — the
                         // drain default this foreground sub-agent render used).
                         const ea = emissionAuthorityFor(turn)
+                        // PR-4d: route through the centralized card-drain gate.
+                        cardDrainGate(turn, ea, () => {
                         if (ea.mayDrain(turn)) {
                           ea.openOrEditCard('tool', () => {
                             turn.activityInFlight = drainActivitySummary(turn, 'tool')
                           })
                         }
+                        })
                       }
                     }
                     return
@@ -23375,11 +23449,14 @@ void (async () => {
                     // delegate). Producer made explicit ('tool' — the drain
                     // default this foreground sub-agent render used).
                     const ea = emissionAuthorityFor(turn)
+                    // PR-4d: route through the centralized card-drain gate.
+                    cardDrainGate(turn, ea, () => {
                     if (ea.mayDrain(turn)) {
                       ea.openOrEditCard('tool', () => {
                         turn.activityInFlight = drainActivitySummary(turn, 'tool')
                       })
                     }
+                    })
                     // A foreground sub-agent's nested activity IS user-visible
                     // production — count it so the silence-poke clock resets,
                     // exactly like the parent activity-render path (10665). Without

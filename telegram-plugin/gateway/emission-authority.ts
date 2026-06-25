@@ -34,6 +34,32 @@
  * turn starts `finalAnswerDelivered=false` and would wedge the gate (ref
  * ~`:1646`) if a card OPEN held the lock across the gate's release. Keep
  * `mayDrain` lock-free so PR-4d has a clean read to build on.
+ *
+ * ## PR-4d ships: `mayDrainCardNow` unifies the card-drain path with the #2137
+ * deliver-before-drain gate
+ *
+ * PR-4d adds `mayDrainCardNow` — the card-path counterpart of the deliver-before-
+ * drain decision in `serialize-drain-gate.ts`. It is ALSO a pure, lock-free read:
+ *
+ *  - Flag OFF (default): returns exactly the `mayDrain` single-flight read —
+ *    byte-equivalent to base. The card single-flight gate is unchanged.
+ *  - Flag ON: returns the `mayDrain` read AND-ed with `mayDrainBufferedInbound`,
+ *    importing the PURE `mayDrainBufferedInbound` from `./serialize-drain-gate.js`
+ *    (the façade imports the pure helper, NEVER the gateway). The card path
+ *    threads `endingTurnFinalAnswerDelivered: null` so the deliver-before-drain
+ *    predicate degenerates to `!turnInFlight`: the card single-flight is governed
+ *    by `activityInFlight` (via `mayDrain`), NOT by an ending turn's delivery
+ *    state. A synthetic represent turn (finalAnswerDelivered=false) therefore can
+ *    never wedge the live foreground card path.
+ *
+ * The LOCK is acquired by the GATEWAY around the gate decision (a centralized
+ * `chatLock.run(statusKey(...), …)` helper that consults this method then kicks
+ * off `openOrEditCard`). `mayDrainCardNow` itself, like `mayDrain`, acquires NO
+ * lock — it is a pure read the gateway calls from inside the lock. The lock spans
+ * only the gate decision + the synchronous `openOrEditCard` kick-off (which only
+ * ASSIGNS `turn.activityInFlight = drainActivitySummary(...)`; the async send is
+ * NOT awaited inside the lock), so a card OPEN never holds `chatLock` across the
+ * gate's release.
  */
 
 import {
@@ -45,6 +71,7 @@ import {
   decideOverPing,
   type OverPingDecision,
 } from '../over-ping-safety-net.js'
+import { mayDrainBufferedInbound } from './serialize-drain-gate.js'
 
 /**
  * Kill-switch. Read ONCE at module top, `=== '1'` (default OFF), following the
@@ -94,6 +121,29 @@ export interface PingClaimCtx {
   firstPingWasSubstantive: boolean
   /** Deterministic clock for the decision (the call site's `Date.now()`). */
   nowMs: number
+}
+
+/**
+ * The deliver-before-drain inputs the PR-4d card-drain gate threads into the
+ * pure `mayDrainBufferedInbound` predicate. A small structural subset (mirrors
+ * the `PingClaimCtx` / `FeedOpenGateDeps` shape) so the façade never imports the
+ * gateway's turn type — the gateway sources these and passes them in.
+ *
+ * `endingTurnFinalAnswerDelivered` is fixed to `null` on the card path (§5
+ * modeling decision): the predicate degenerates to `!turnInFlight`, so the card
+ * single-flight is governed by `activityInFlight` (via `mayDrain`), not by an
+ * ending turn's delivery state — a synthetic represent turn cannot wedge it.
+ */
+export interface CardDrainGateCtx {
+  /** A turn is in flight RIGHT NOW (`turnInFlightForGate()`), evaluated at the
+   *  gate site. When true, never drain the card — claude is busy. */
+  turnInFlight: boolean
+  /** The ending turn's `finalAnswerDelivered`. Threaded `null` for the CARD
+   *  path so the deliver-before-drain predicate degenerates to `!turnInFlight`
+   *  (the card single-flight is governed by `activityInFlight`, not delivery). */
+  endingTurnFinalAnswerDelivered: boolean | null
+  /** Serialize-until-replied kill-switch state (`SERIALIZE_UNTIL_REPLIED_ENABLED`). */
+  enabled: boolean
 }
 
 /**
@@ -283,5 +333,37 @@ export class EmissionAuthority {
    */
   mayDrain(turn: EmissionTurnView): boolean {
     return turn.activityInFlight == null
+  }
+
+  /**
+   * PR-4d card-drain gate: may the card drain start RIGHT NOW, unifying the
+   * single-flight read with the #2137 deliver-before-drain serialization gate.
+   *
+   *  - **Flag OFF (default):** returns exactly `this.mayDrain(turn)` — the card
+   *    single-flight read, byte-equivalent to base. Nothing else is consulted.
+   *  - **Flag ON:** returns `this.mayDrain(turn) && mayDrainBufferedInbound(ctx)`
+   *    — the single-flight read AND the pure deliver-before-drain predicate
+   *    (imported from `./serialize-drain-gate.js`). The gateway threads
+   *    `endingTurnFinalAnswerDelivered: null` for the card path (§5 modeling
+   *    decision), so `mayDrainBufferedInbound` degenerates to `!turnInFlight`:
+   *    the card single-flight stays governed by `activityInFlight` (via
+   *    `mayDrain`), NOT by an ending turn's delivery state.
+   *
+   * PURE READ — see the PR-4d deadlock invariant in this module's header. The
+   * GATEWAY serializes this decision via the chat mutex AROUND the call; this
+   * method only reads. Routes the single-flight via the pure `this.mayDrain`.
+   */
+  mayDrainCardNow(turn: EmissionTurnView, ctx: CardDrainGateCtx): boolean {
+    if (EMISSION_AUTHORITY_ENABLED) {
+      return (
+        this.mayDrain(turn) &&
+        mayDrainBufferedInbound({
+          turnInFlight: ctx.turnInFlight,
+          endingTurnFinalAnswerDelivered: ctx.endingTurnFinalAnswerDelivered,
+          enabled: ctx.enabled,
+        })
+      )
+    }
+    return this.mayDrain(turn)
   }
 }

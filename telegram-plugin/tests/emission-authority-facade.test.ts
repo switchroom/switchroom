@@ -387,3 +387,101 @@ describe('per-turn construction — one façade per turn, explicit chat/thread k
     expect(body).toMatch(/new EmissionAuthority\(\s*\n\s*statusKey\(turn\.sessionChatId, turn\.sessionThreadId\)/)
   })
 })
+
+// ─── PR-4d block — APPENDED. The card-drain path now unifies the single-flight
+// read with the #2137 deliver-before-drain gate, behind the kill-switch. The
+// new façade method is a PURE read; the GATEWAY acquires chatLock around it.
+// ────────────────────────────────────────────────────────────────────────────
+describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds the lock)', () => {
+  /** Body of `mayDrainCardNow` up to the next method declaration / class close. */
+  function cardNowBody(): string {
+    const after = facadeSrc.split('mayDrainCardNow(')[1] ?? ''
+    return after.split(/\n  [A-Za-z]+[(<]/)[0] ?? after
+  }
+
+  it('the new card-drain gate method EXISTS on the façade', () => {
+    expect(facadeSrc).toMatch(/mayDrainCardNow\(turn: EmissionTurnView, ctx: CardDrainGateCtx\): boolean/)
+  })
+
+  it('routes the single-flight via the PURE mayDrain (this.mayDrain(turn)) in BOTH branches', () => {
+    const body = cardNowBody()
+    // OFF (default) → exactly this.mayDrain(turn). ON → this.mayDrain(turn) && …
+    const mayDrainCalls = [...body.matchAll(/this\.mayDrain\(turn\)/g)]
+    expect(mayDrainCalls.length).toBeGreaterThanOrEqual(2)
+    // Enabled branch combines the single-flight read with the deliver-before-
+    // drain predicate.
+    expect(body).toMatch(/this\.mayDrain\(turn\)\s*&&\s*\n?\s*mayDrainBufferedInbound\(/)
+  })
+
+  it('imports the PURE mayDrainBufferedInbound from serialize-drain-gate.js (façade imports the helper, never the gateway)', () => {
+    expect(facadeSrc).toMatch(
+      /import\s*\{\s*mayDrainBufferedInbound\s*\}\s*from\s*'\.\/serialize-drain-gate\.js'/,
+    )
+    expect(facadeCode).toMatch(/mayDrainBufferedInbound\(/)
+  })
+
+  it('the deliver-before-drain term is consulted ONLY inside the EMISSION_AUTHORITY_ENABLED branch; OFF is byte-equivalent to mayDrain', () => {
+    const body = cardNowBody()
+    const flagIdx = body.indexOf('if (EMISSION_AUTHORITY_ENABLED)')
+    const predIdx = body.indexOf('mayDrainBufferedInbound(')
+    expect(flagIdx).toBeGreaterThan(-1)
+    expect(predIdx).toBeGreaterThan(flagIdx)
+    // Exactly one mayDrainBufferedInbound call (the enabled branch).
+    expect([...body.matchAll(/mayDrainBufferedInbound\(/g)]).toHaveLength(1)
+    // The disabled fall-through is a bare `return this.mayDrain(turn)`.
+    expect(body).toMatch(/return this\.mayDrain\(turn\)\s*\n\s*\}/)
+  })
+
+  it('the card-gate method itself acquires NO lock — no chatLock / lock token in the body', () => {
+    const body = cardNowBody()
+    expect(body).not.toMatch(/chatLock|\.run\(|acquire|lock\(/i)
+  })
+
+  it('the gateway acquires the card-path chatLock — a SINGLE chatLock.run inside the EMISSION_AUTHORITY_ENABLED branch, NOT wrapping an await on drainActivitySummary/sendMessage', () => {
+    // The card-drain gate helper is the ONLY place the card path touches
+    // chatLock. Locate the helper and assert its shape.
+    const helperIdx = gatewaySrc.indexOf('function cardDrainGate(')
+    expect(helperIdx).toBeGreaterThan(-1)
+    const helper = gatewaySrc.slice(helperIdx, helperIdx + 700)
+    const helperCode = helper
+      .split('\n')
+      .filter((l) => {
+        const t = l.trim()
+        return !(t.startsWith('*') || t.startsWith('//') || t.startsWith('/*'))
+      })
+      .join('\n')
+    // The lock acquisition sits INSIDE the EMISSION_AUTHORITY_ENABLED branch.
+    const flagIdx = helperCode.indexOf('if (EMISSION_AUTHORITY_ENABLED)')
+    const lockIdx = helperCode.indexOf('chatLock.run(')
+    expect(flagIdx).toBeGreaterThan(-1)
+    expect(lockIdx).toBeGreaterThan(flagIdx)
+    // It consults the pure mayDrainCardNow inside the lock.
+    expect(helperCode).toMatch(/ea\.mayDrainCardNow\(turn, cardDrainGateCtx\(\)\)/)
+    // The lock body does NOT await drainActivitySummary / sendMessage — the
+    // drain assignment runs synchronously inside `run()`; the async send is NOT
+    // awaited inside the lock (so a card OPEN never holds chatLock across the
+    // gate's release).
+    expect(helperCode).not.toMatch(/await\s+drainActivitySummary/)
+    expect(helperCode).not.toMatch(/await\s+\w*[sS]endMessage/)
+    // Exactly ONE chatLock.run in the card-drain helper.
+    expect([...helperCode.matchAll(/chatLock\.run\(/g)]).toHaveLength(1)
+  })
+
+  it('the card-path gate threads endingTurnFinalAnswerDelivered: null (the §5 modeling decision)', () => {
+    // The gateway ctx builder fixes the card path to null so the deliver-before-
+    // drain predicate degenerates to !turnInFlight — the card single-flight is
+    // governed by activityInFlight, not an ending turn's delivery state.
+    const ctxIdx = gatewaySrc.indexOf('function cardDrainGateCtx(')
+    expect(ctxIdx).toBeGreaterThan(-1)
+    const ctxFn = gatewaySrc.slice(ctxIdx, ctxIdx + 400)
+    expect(ctxFn).toMatch(/endingTurnFinalAnswerDelivered:\s*null/)
+    expect(ctxFn).toMatch(/turnInFlight:\s*turnInFlightForGate\(\)/)
+  })
+
+  it('the 6 card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
+    // Option A: the 6 `if (ea.mayDrain(turn))` guards + drainActivitySummary
+    // thunks stay byte-identical, wrapped by the centralized helper.
+    const wraps = [...gatewaySrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
+    expect(wraps).toHaveLength(6)
+  })
+})
