@@ -255,7 +255,48 @@ describe("diffPane — /clear post-clear TUI chrome filtering", () => {
     expect(r.output).toBe("");
   });
 
-  it("anchored /cost path is unaffected — real content passes through", () => {
+  // Regression test for the v2.1.185 bug: after /clear, the command-echo
+  // line `❯ /clear` SURVIVES in capture-pane output, so the anchored path
+  // runs — but it was returning the trailing chrome raw. The fix adds
+  // isTuiChromeLine filtering to the anchored path as well. After filtering,
+  // the tail is empty, so the code falls through to set-diff (anchored=false)
+  // which is also empty → output="" → ok_no_output. Either way, the critical
+  // invariant is that output is empty (no chrome leaks to Telegram).
+  //
+  // This is the exact `after` pane from the live reproduction capture at
+  // /state/agent/home/workspace/clearfix-evidence/after.txt (trimmed to the
+  // relevant tail after the startup banner).
+  it("anchored path: /clear echo present + trailing chrome → output empty (v2.1.185 regression)", () => {
+    const before = `❯ /clear`;
+    const after = `❯ /clear
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+    const r = diffPane(before, after, "/clear");
+    expect(r.output, "chrome-only tail must yield empty output — no chrome leaks to Telegram").toBe("");
+  });
+
+  it("anchored /cost path with trailing chrome — real content passes, chrome is stripped", () => {
+    const before = "❯ /cost\n";
+    const after = `❯ /cost
+  Total cost: $1.23
+  Session: $0.12 (3 turns)
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+    const r = diffPane(before, after, "/cost");
+    expect(r.anchored).toBe(true);
+    expect(r.output).toContain("Total cost: $1.23");
+    expect(r.output).toContain("$0.12");
+    expect(r.output).not.toContain("────────────────────────────────────────────────────────────────────────────────");
+    expect(r.output).not.toContain("accept edits on");
+    expect(r.output).not.toMatch(/^❯\s*$/m);
+  });
+
+  it("anchored /cost path is unaffected by fix — real content passes through (no chrome present)", () => {
     const before = "❯ /cost\n";
     const after = `❯ /cost
   Total cost: $0.42
@@ -277,7 +318,7 @@ describe("diffPane — /clear post-clear TUI chrome filtering", () => {
 });
 
 describe("injectSlashCommandWith — /clear produces ok_no_output (not ok with chrome)", () => {
-  it("post-clear pane with only TUI chrome → outcome=ok_no_output, output empty", async () => {
+  it("post-clear pane with only TUI chrome (anchor absent) → outcome=ok_no_output, output empty", async () => {
     // Simulate what happens after /clear: pre-snapshot has content,
     // post-capture has only fresh input-box chrome (no command-echo line).
     const before = `  Some earlier session output
@@ -296,6 +337,46 @@ describe("injectSlashCommandWith — /clear produces ok_no_output (not ok with c
         // First capture (before send) returns the pre-snapshot.
         // Subsequent captures (after send) return the post-clear chrome.
         return callCount === 1 ? before : clearChrome;
+      },
+      send: () => {},
+    };
+
+    const r = await injectSlashCommandWith(runner, {
+      socket: "switchroom-test",
+      session: "test",
+      command: "/clear",
+      settleMs: 50,
+      timeoutMs: 200,
+    });
+
+    expect(r.outcome).toBe("ok_no_output");
+    expect(r.output).toBe("");
+    expect(r.command).toBe("/clear");
+    expect(r.meta?.silentNote).toBe("context cleared — fresh slate");
+  });
+
+  // Regression test for the v2.1.185 bug: the command-echo `❯ /clear`
+  // survives in tmux capture-pane after /clear runs, so the anchored path
+  // runs and previously returned trailing chrome verbatim. With the fix the
+  // anchored path also strips chrome, leaving an empty tail → ok_no_output.
+  it("post-clear pane with command-echo anchor + trailing chrome → outcome=ok_no_output (v2.1.185 regression)", async () => {
+    const before = `  Some earlier session output
+  Another line of output
+❯ /clear`;
+    // Exact shape from the live reproduction capture: echo survives, chrome follows.
+    const afterWithAnchor = `❯ /clear
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+
+    let callCount = 0;
+    const runner: TmuxRunner = {
+      hasSession: () => true,
+      capture: () => {
+        callCount += 1;
+        return callCount === 1 ? before : afterWithAnchor;
       },
       send: () => {},
     };

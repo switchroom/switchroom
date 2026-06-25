@@ -427,6 +427,7 @@ export function diffPane(before: string, after: string, command?: string): DiffP
       for (const raw of tail) {
         const line = raw.trimEnd();
         if (line.length === 0 && trimmed.length === 0) continue;
+        if (isTuiChromeLine(line)) continue;
         trimmed.push(line);
       }
       while (trimmed.length > 0 && trimmed[trimmed.length - 1].length === 0) {
@@ -443,10 +444,9 @@ export function diffPane(before: string, after: string, command?: string): DiffP
     }
   }
   // Fallback: line-set diff against pre-snapshot, then strip TUI chrome.
-  // The chrome filter is applied here (fallback only) because `/clear`
-  // wipes the screen so the command-echo anchor is gone — the post-capture
-  // contains only fresh input-box furniture that isn't in the pre-snapshot
-  // and would otherwise be classified as command output.
+  // Chrome is also filtered in the anchored path above; both paths strip it
+  // so that `/clear`'s input-box furniture never reaches Telegram regardless
+  // of whether the command-echo anchor is present in the post-capture.
   const beforeSet = new Set(before.split("\n").map((l) => l.trimEnd()));
   const newLines: string[] = [];
   for (const raw of after.split("\n")) {
