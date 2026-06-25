@@ -287,6 +287,11 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
     return {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
+      // Sub-agent progress card is a status surface, never the user's
+      // answer — silence the open ping. (editMessageText ignores
+      // disable_notification, so this is a no-op on the in-place edits
+      // that share these opts.)
+      disable_notification: true,
       ...(h.threadId != null ? { message_thread_id: h.threadId } : {}),
     }
   }
