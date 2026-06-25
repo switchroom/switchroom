@@ -41,7 +41,8 @@ they are **not** a durable contract tier of their own.
 
 The **verdict rule** (also in `CLAUDE.md` → "Design contract"): a change ships
 only when it (a) advances one of the four outcomes, (b) satisfies its job
-spec, (c) passes all three principle checks, and (d) crosses no invariant.
+spec — proven by its outcome UAT, (c) passes all three principle checks, and
+(d) crosses no invariant.
 
 ## The job index lives in the product spec
 

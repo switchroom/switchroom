@@ -37,6 +37,10 @@ it. The coding specialist is the same thesis, not an exception. Add a
 specialist in ten lines of YAML; you don't fork the product. Memory serves
 this outcome; it isn't the pitch.
 
+**Signal:** continuity — you rarely re-explain. The share of turns that act
+on stored context, rather than re-asking for what the agent should already
+know, trends to near-zero re-onboarding.
+
 ### `hold-the-leash` — controlled, purposeful, never roaming
 
 Agents act, but only with what you gave them. A specialist sees only the
@@ -47,11 +51,19 @@ mid-flight. Awareness and control, not a tool-call log to babysit. (The hard
 floor under this outcome is the `no-self-escalation` and `on-leash`
 invariants.)
 
+**Signal:** approval coverage — every consequential action passes an
+explicit, human-only approval, each one audited and logged, behind an ACL
+only a human can edit. Unapproved consequential actions: zero.
+
 ### `subscription-honest` — the plan is the ceiling
 
 Cost is the subscription you chose, not a meter you can't forecast. Need more
 throughput, pool accounts with automatic failover. One bill, the one you
 already pay. (The hard floor is the `claude-native` invariant.)
+
+**Signal:** zero off-plan callsites — every model call runs through the stock
+Claude CLI on your OAuth subscription. No API-meter path, no `claude -p`
+headless billing, enforced in CI.
 
 ### `always-available` — there when you want it
 
@@ -59,6 +71,10 @@ Each specialist is a long-running service. It survives reboots, network
 drops, your laptop closing. It runs its scheduled work and it's there the
 second you reach for it, anywhere your phone has signal. Available and
 punctual, not autonomous.
+
+**Signal:** always-on and reactive — no turn silently dropped, every turn
+surfaces its work in Telegram, and the agent acts only on your message or a
+cron you created. Median ack within seconds.
 
 ## How it functions, at a high level
 
