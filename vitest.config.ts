@@ -130,6 +130,9 @@ export default defineConfig({
       // PR #994.
       "**/telegram-plugin/uat/**",
       "**/telegram-plugin/tests/history.test.ts",
+      // cross-turn-card-gate.test.ts imports history.ts (bun:sqlite) to seed a
+      // real outbound row — must run under bun, not vitest. (#PR1 lever 4)
+      "**/telegram-plugin/tests/cross-turn-card-gate.test.ts",
       // history-reaper.test.ts uses bun:sqlite + bun:test (#1073) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/history-reaper.test.ts",

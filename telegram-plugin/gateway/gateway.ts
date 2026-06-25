@@ -104,8 +104,8 @@ import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
-import { isFinalAnswerReply, isSubstantiveFinalReply } from '../final-answer-detect.js'
-import { deriveTurnRole, decideTerminalReason, type LoopRole } from '../turn-liveness-floor.js'
+import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
+import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { parseVisibleAnswerStreamEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
@@ -1732,6 +1732,21 @@ const FEED_LIVENESS_OPEN_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 12_000
 })()
 
+// PR1 Item-3a (DORMANT escape hatch — see `docs/message-emission-determinism.md`
+// §10 R2 / §9 lever 1: "is silent post-substantive-answer work acceptable, or
+// does it need its own surface?"). Today post-answer work is SILENT by design:
+// lever 1's sticky latch refuses any card OPEN once a substantive final landed,
+// so a long cleanup tool after the answer produces no card. This knob is the
+// plumbing to let a per-agent "still tidying…" liveness line be enabled LATER
+// without a redesign — when/if the Item-3 decision lands on "post-answer work
+// should surface". UNSET or 0 ⇒ exactly today's behaviour (no post-answer card);
+// the guarded branch below is DEAD by default. No behavioural change ships
+// enabled. Parsed once via the pure `parsePostAnswerLivenessMs` helper (whose
+// default-off contract is unit-tested in turn-liveness-floor.test.ts).
+const POST_ANSWER_LIVENESS_MS = parsePostAnswerLivenessMs(
+  process.env.SWITCHROOM_POST_ANSWER_LIVENESS_MS,
+)
+
 /** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
 function formatFeedElapsed(ms: number): string {
   const s = Math.floor(ms / 1000)
@@ -1913,6 +1928,19 @@ type CurrentTurn = {
   // eligibility and the role-aware terminal reaction gate. Replaces the
   // scattered `chatType`/`chatId==null`/`source==='cron'` predicates.
   role: LoopRole
+  // PR1 (cross-turn stale-card guard, design `docs/message-emission-determinism.md`
+  // §9 lever 4 / race C/D). Present ONLY when this turn is a cross-turn SYNTHETIC
+  // surface whose card OPEN must be gated against an answer already delivered in
+  // an EARLIER turn — i.e. an `obligation_represent` re-delivery (and the
+  // liveness/heartbeat timer firing on it). `sinceMs` is the obligation's
+  // `openedAt` — the moment the obligation was RAISED — so the card-OPEN gate
+  // asks `hasOutboundDeliveredSince(chat, openedAt)`: did a substantive answer
+  // already land since then? Stamped at the turn ctor from a pending marker that
+  // `obligationSweep` writes when it pushes the represent inbound (see
+  // `pendingCrossTurnGate`). `undefined` for a normal foreground turn → the
+  // cross-turn lever-4 gate is inert there (the foreground turn's own card is
+  // governed only by the per-turn `finalAnswerEverDelivered` latch, lever 1).
+  crossTurnGate?: { sinceMs: number }
   replyCalled: boolean
   // #1664 — whether the model has delivered its *final answer* this turn
   // (as opposed to only an interim ack). `replyCalled` flips on the first
@@ -2663,6 +2691,21 @@ function statusKey(chatId: string, threadId?: number | null): string {
 function streamKey(chatId: string, threadId?: number | null): string {
   return chatKey(chatId, threadId)
 }
+
+// PR1 (cross-turn stale-card guard, design §9 lever 4 / race C/D).
+// `obligationSweep` writes one entry here, keyed on statusKey(chat, thread),
+// the instant it pushes an `obligation_represent` inbound — carrying the
+// obligation's `openedAt` (when the obligation was RAISED). The NEXT `enqueue`
+// for that chat/thread (the synthetic represent turn that the inbound spawns)
+// consumes and clears it, stamping `turn.crossTurnGate = { sinceMs: openedAt }`.
+// That turn's first card-OPEN then consults `hasOutboundDeliveredSince(chat,
+// openedAt)` and is suppressed iff a SUBSTANTIVE answer already landed since the
+// obligation was raised — so a "thinking…" card never narrates beneath an answer
+// the user already received in the original turn. A normal foreground turn never
+// has an entry here, so the gate is scoped to the synthetic surface and inert
+// for the foreground turn. The map holds at most one entry per chat/thread; a
+// represent push overwrites any stale one (the latest obligation wins).
+const pendingCrossTurnGate = new Map<string, { sinceMs: number }>()
 
 /**
  * Component 1 — deliver-before-drain. The single chokepoint that both
@@ -6015,6 +6058,16 @@ function obligationSweep(): void {
     // behind a dead bridge can never block the operator nudge.
     if (pendingInboundBuffer.depth(agent) > 0) return
     pendingInboundBuffer.push(agent, buildObligationRepresentInbound(o, Date.now()))
+    // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Arm the
+    // card-OPEN gate for the synthetic turn this represent inbound will spawn:
+    // carry the obligation's `openedAt` so that turn's first card-OPEN can ask
+    // "was a substantive answer already delivered since the obligation was
+    // raised?" and, if so, suppress the card (it would otherwise narrate beneath
+    // the answer the user already received). Keyed on the obligation's
+    // chat/thread; consumed at the next matching `enqueue`. This does NOT gate
+    // the represent SEND — the represent guard above already owns suppressing an
+    // already-satisfied represent; this only governs the decorative card.
+    pendingCrossTurnGate.set(statusKey(o.chatId, o.threadId), { sinceMs: o.openedAt })
     const attempt = obligationLedger.markRepresented(o.originTurnId)
     process.stderr.write(
       `telegram gateway: obligation re-presented origin=${o.originTurnId} attempt=${attempt}/${OBLIGATION_REPRESENT_MAX}\n`,
@@ -10363,12 +10416,36 @@ async function drainActivitySummary(
       // card; that residual is reconciled by lever-2's `clearActivitySummary`
       // chaining its finalize onto `turn.activityInFlight` (the suspended drain)
       // and editing the card in place, not by this gate blocking it.
+      // Lever 4 (cross-turn / race C/D): a synthetic represent/owed-reply turn
+      // (and the liveness/heartbeat timer firing on it) starts with a CLEARED
+      // per-turn `finalAnswerEverDelivered` latch even when a substantive answer
+      // already reached the user in an EARLIER turn — so without this its first
+      // drain opens a card BELOW that prior reply. Only such a turn carries
+      // `crossTurnGate`; reuse the represent guard's delivered-since check
+      // (`hasOutboundDeliveredSince`) with the obligation's `openedAt` cutoff and
+      // the SUBSTANTIVE 200-char threshold (so an ack never trips it → #2141
+      // stays green). Computed ONLY when about to OPEN (activityMessageId ==
+      // null) AND only for a turn with a cross-turn gate — no history query on
+      // the common foreground path. Scoped to the synthetic surface by the
+      // presence of `crossTurnGate`, so it can never fire on a foreground turn.
+      const crossTurnAnswerDelivered =
+        turn.activityMessageId == null
+        && turn.crossTurnGate != null
+        && turn.sessionChatId != null
+        && HISTORY_ENABLED
+        && hasOutboundDeliveredSince(
+          turn.sessionChatId,
+          turn.crossTurnGate.sinceMs,
+          turn.sessionThreadId,
+          FINAL_ANSWER_MIN_CHARS,
+        )
       if (
         turn.activityMessageId == null
         && !mayOpenActivityCard({
           producer,
           finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
           labeledToolCount: turn.labeledToolCount,
+          crossTurnAnswerDelivered,
         })
       ) {
         break
@@ -10446,7 +10523,26 @@ async function drainActivitySummary(
 function feedHeartbeatTick(): void {
   const turn = currentTurn
   if (turn == null) return
-  if (turn.finalAnswerDelivered) return // feed handed off to the answer
+  if (turn.finalAnswerDelivered) {
+    // PR1 Item-3a (DORMANT — DEAD by default). Post-answer work is silent today:
+    // once the answer landed the feed has handed off and we return here. When a
+    // future Item-3 decision opts an agent into a "still tidying…" post-answer
+    // liveness line, `SWITCHROOM_POST_ANSWER_LIVENESS_MS>0` is the escape hatch —
+    // it would, past that threshold of post-answer silence, fall through to emit
+    // a guarded liveness EDIT/line here instead of returning. UNSET/0 ⇒ this
+    // branch is never taken and behaviour is byte-identical to today. The actual
+    // surface is intentionally NOT built (no card OPEN, no message) — this is
+    // only the plumbing so enabling it later needs no redesign.
+    if (POST_ANSWER_LIVENESS_MS <= 0) return // default: silent post-answer (today)
+    // `lastToolLabelAt` (set each time a tool step renders) is the closest
+    // existing anchor for "how long has post-answer work been running"; absent
+    // any post-answer tool it stays at the pre-answer value, so the threshold is
+    // only crossed by genuine ongoing work. The Item-3 surface lands here once
+    // decided; until then we stay silent even when the flag is set.
+    const since = turn.lastToolLabelAt != null ? Date.now() - turn.lastToolLabelAt : 0
+    if (since < POST_ANSWER_LIVENESS_MS) return // not yet past the threshold
+    return
+  }
 
   // Liveness feed (open + maintain). `mirrorLines.length === 0` means no tool
   // has ever produced a label this turn — pure thinking, or only suppressed
@@ -10619,6 +10715,17 @@ function handleSessionEvent(ev: SessionEvent): void {
         const turnId =
           deriveTurnId(ev.chatId, enqThreadIdNum ?? null, ev.messageId)
           ?? `${chatKey(ev.chatId, enqThreadIdNum ?? null)}#synthetic-${startedAt}`
+        // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Consume any
+        // pending cross-turn gate `obligationSweep` armed for this chat/thread
+        // when it pushed an `obligation_represent` inbound. Present ⇒ THIS turn
+        // is that synthetic represent surface; carry its `sinceMs` (the
+        // obligation's openedAt) so the card-OPEN drain can suppress a card that
+        // would land beneath an answer already delivered since the obligation
+        // was raised. Consume-once: delete on read so a later unrelated
+        // foreground turn on the same chat is never mis-gated.
+        const xTurnGateKey = statusKey(ev.chatId, enqThreadIdNum)
+        const consumedCrossTurnGate = pendingCrossTurnGate.get(xTurnGateKey)
+        if (consumedCrossTurnGate != null) pendingCrossTurnGate.delete(xTurnGateKey)
         const next: CurrentTurn = {
           sessionChatId: ev.chatId,
           sessionThreadId: enqThreadIdNum,
@@ -10633,6 +10740,10 @@ function handleSessionEvent(ev: SessionEvent): void {
           gatewayReceiveAt: startedAt,
           // #2527 — stamp the loop role once, from the enqueue envelope.
           role: deriveTurnRole(ev.rawContent),
+          // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Only a
+          // synthetic represent/owed-reply turn carries this; a foreground turn
+          // leaves it undefined and the cross-turn card-OPEN gate is inert.
+          ...(consumedCrossTurnGate != null ? { crossTurnGate: consumedCrossTurnGate } : {}),
           replyCalled: false,
           finalAnswerDelivered: false,
           finalAnswerSubstantive: false,

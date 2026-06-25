@@ -159,3 +159,25 @@ export function midTurnFloorEnabled(): boolean {
   const t = v.trim().toLowerCase()
   return !(t === '0' || t === 'false' || t === 'off' || t === 'no')
 }
+
+/**
+ * PR1 Item-3a — parse the DORMANT post-answer liveness window
+ * (`SWITCHROOM_POST_ANSWER_LIVENESS_MS`). This is the escape-hatch plumbing for a
+ * future per-agent "still tidying…" liveness line on POST-answer work; see the
+ * Item-3 decision in `docs/message-emission-determinism.md` §10 R2. Today
+ * post-answer work is silent by design (lever 1 refuses any card OPEN once a
+ * substantive final landed), and this knob ships DORMANT:
+ *
+ *   - UNSET, empty, non-numeric, 0, or negative ⇒ **0** = today's behaviour
+ *     (no post-answer surface; the guarded branch in `feedHeartbeatTick` is dead).
+ *   - a positive integer ⇒ the threshold (ms of post-answer silence) at which a
+ *     future Item-3 surface WOULD fire. No surface ships enabled in this PR.
+ *
+ * Extracted as a pure function so the default-off contract is unit-testable
+ * (gateway.ts is not importable in isolation — top-level side effects). Mirrors
+ * `parseVisibleAnswerStreamEnabled`'s pattern.
+ */
+export function parsePostAnswerLivenessMs(raw: string | undefined): number {
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
