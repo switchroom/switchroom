@@ -335,6 +335,7 @@ import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
 import { decideFeedReopen } from './feed-reopen-gate.js'
+import { mayOpenActivityCard, type FeedOpenProducer } from './feed-open-gate.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -1940,6 +1941,18 @@ type CurrentTurn = {
   // Reset to false on every fresh-turn enqueue alongside
   // `finalAnswerDelivered`.
   finalAnswerSubstantive: boolean
+  // Sticky "a substantive final answer has been delivered this turn" latch
+  // (design `docs/message-emission-determinism.md` §9 preamble / R0). Distinct
+  // from the MUTABLE `finalAnswerDelivered`, which the ack-reopen path clears
+  // mid-turn (`feed-reopen-gate.ts:157`) so an "On it…" ack keeps a live feed
+  // (#2141). Ordering gates (the no-OPEN-after-final card gate, lever 1) MUST
+  // key on this sticky latch, not the mutable flag — keying on the mutable flag
+  // is a no-op on exactly the ack-first turn where the reorder originates. Set
+  // true ONLY at the points that set `finalAnswerDelivered = true` AND only when
+  // the reply is `isSubstantiveFinalReply`; NEVER cleared by reopen. Reset to
+  // false ONLY at turn start, mirroring `activityEverOpened`'s sticky-true
+  // contract.
+  finalAnswerEverDelivered: boolean
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -7889,6 +7902,26 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     clearSilentEndState(statusKey(chat_id, threadId))
   }
 
+  // Lever 2 (design §9 lever 2): finalize the activity card BEFORE the reply
+  // chunks send, so the card keeps its (lower) message_id and the reply is
+  // structurally last on screen. ONLY for a *substantive* final — for an ack
+  // (non-substantive) do NOTHING: finalizing an ack early would
+  // close → reopen → emit MORE messages (the #2141 ack-then-work feed, R3).
+  // `clearActivitySummary` edits the existing card in place (no new send) and
+  // nulls `activityMessageId`; combined with the sticky latch set here it
+  // prevents any post-reply re-OPEN below the answer. Idempotent with the
+  // tool_use-event clear at the first-reply handoff (the existing backstop).
+  {
+    const finalizeTurn = currentTurn
+    if (
+      finalizeTurn != null
+      && isSubstantiveFinalReply({ text: rawText, disableNotification: modelDisableNotification })
+    ) {
+      finalizeTurn.finalAnswerEverDelivered = true
+      clearActivitySummary(finalizeTurn)
+    }
+  }
+
   if (previewMessageId != null && reply_to != null && replyMode !== 'off') {
     await deleteStalePreview(previewMessageId)
     previewMessageId = null
@@ -8006,6 +8039,9 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
               text: decision.mergedText,
               disableNotification: modelDisableNotification,
             })
+            // Sticky ordering latch (lever 1): a substantive final closes the
+            // card OPEN gate for the rest of the turn. NEVER cleared by reopen.
+            if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
             if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
           }
           outboundDedup.record(
@@ -8350,6 +8386,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // (≥200 chars or stream-done — not a short pinging ack) so post-answer
       // housekeeping tool work does NOT re-open the feed / trip silent-end.
       turn.finalAnswerSubstantive = isSubstantiveFinalReply({ text: rawText, disableNotification: modelDisableNotification })
+      // Sticky ordering latch (lever 1): set once a SUBSTANTIVE final lands;
+      // never cleared by reopen. The card OPEN gate keys on this, not the
+      // mutable finalAnswerDelivered above (which reopen toggles).
+      if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
       // #1728: release the buffer gate + emit terminal 👍. Mid-turn
       // acks bypass this branch and remain non-events for the
       // reaction (preserves #1713). The full turn-state teardown
@@ -8582,6 +8622,25 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     }
   }
 
+  // Lever 2 (design §9 lever 2): finalize the activity card BEFORE the stream
+  // send so the card keeps its lower message_id and the reply is structurally
+  // last. ONLY for a *substantive* final (a stream_reply done=true or ≥200
+  // chars) — for a short pinging interim chunk do NOTHING (finalizing an ack
+  // early would close → reopen → emit more, the #2141 ack-then-work feed, R3).
+  // `clearActivitySummary` edits in place + nulls activityMessageId; the sticky
+  // latch set here blocks any post-reply re-OPEN below the answer.
+  if (
+    turn != null
+    && isSubstantiveFinalReply({
+      text: (args.text as string | undefined) ?? '',
+      disableNotification: args.disable_notification === true,
+      done: args.done === true,
+    })
+  ) {
+    turn.finalAnswerEverDelivered = true
+    clearActivitySummary(turn)
+  }
+
   const result = await handleStreamReply(
     {
       chat_id: streamChatId,
@@ -8736,6 +8795,9 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       disableNotification: args.disable_notification === true,
       done: args.done === true,
     })
+    // Sticky ordering latch (lever 1): set once a SUBSTANTIVE final lands;
+    // never cleared by reopen. The card OPEN gate keys on this sticky latch.
+    if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
     if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, streamRoutedOriginTurn)
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
@@ -10197,7 +10259,12 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
   if (rendered == null) return
   turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
   if (turn.activityInFlight == null) {
-    turn.activityInFlight = drainActivitySummary(turn)
+    // Producer A (narrative SHOW): may only EDIT an already-open card, never
+    // OPEN one on a 0-tool turn (design §9 lever 5 base case — the
+    // triplication). The OPEN gate in the drain enforces this; accumulation
+    // into mirrorLines still happens so the narration renders once a tool
+    // label or liveness opens the card.
+    turn.activityInFlight = drainActivitySummary(turn, 'narrative')
   }
 }
 
@@ -10269,11 +10336,43 @@ function flushPendingNarrativeAtTurnEnd(turn: CurrentTurn, lastReplyText: string
  * doesn't corrupt the next turn's atom — late writes land on the
  * captured `turn` (already-completed turn, harmless).
  */
-async function drainActivitySummary(turn: CurrentTurn): Promise<void> {
+async function drainActivitySummary(
+  turn: CurrentTurn,
+  // Which producer triggered this drain (design §9 levers 1 + 5). Gates the
+  // OPEN (first sendMessage) branch via `mayOpenActivityCard`; EDITs of an
+  // already-open card are never gated. Defaults to 'tool' — the historically
+  // unconditional OPEN behaviour — so any caller that does not opt into the
+  // gate is unaffected. Narrative-SHOW and liveness callers pass their producer
+  // explicitly.
+  producer: FeedOpenProducer = 'tool',
+): Promise<void> {
   try {
     while (turn.activityPendingRender !== turn.activityLastSentRender) {
       const target = turn.activityPendingRender
       if (target == null) break
+      // OPEN gate (design §9 levers 1 + 5): when this drain would OPEN a fresh
+      // card (activityMessageId == null), consult the pure gate. Refusing an
+      // OPEN must NOT advance activityLastSentRender — the accumulated render
+      // stays pending so a later OPEN-eligible producer (a tool label, or
+      // liveness) renders it. An EDIT (activityMessageId != null) is never
+      // gated. Enforced HERE so it covers BOTH the inline producers AND the
+      // detached heartbeat setInterval drain (R7/concurrency). The gate guards
+      // gate EVALUATION, not an in-flight send: it is not a hard mutex — a send
+      // already PAST this check and suspended at its `await robustApiCall(
+      // sendMessage)` when a substantive final lands still completes and opens a
+      // card; that residual is reconciled by lever-2's `clearActivitySummary`
+      // chaining its finalize onto `turn.activityInFlight` (the suspended drain)
+      // and editing the card in place, not by this gate blocking it.
+      if (
+        turn.activityMessageId == null
+        && !mayOpenActivityCard({
+          producer,
+          finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
+          labeledToolCount: turn.labeledToolCount,
+        })
+      ) {
+        break
+      }
       // `renderActivityFeed` already emitted ready Telegram HTML with per-line
       // markup (<b>→ current</b> / <i>✓ done</i>) and escaped each label's
       // <,>,& itself (#1942 class) — send verbatim, do NOT re-escape or
@@ -10368,7 +10467,10 @@ function feedHeartbeatTick(): void {
     if (rendered == null) return
     turn.activityPendingRender = rendered
     if (turn.activityInFlight == null) {
-      turn.activityInFlight = drainActivitySummary(turn)
+      // Producer C (liveness timer): the genuine ≥12s thinking-gap open. This
+      // is the ONE producer that may OPEN a 0-tool card (design §9 lever 5
+      // preserves it). The sticky-latch (lever 1) still gates it in the drain.
+      turn.activityInFlight = drainActivitySummary(turn, 'liveness')
     }
     return
   }
@@ -10382,7 +10484,9 @@ function feedHeartbeatTick(): void {
   if (rendered == null) return
   turn.activityPendingRender = rendered
   if (turn.activityInFlight == null) {
-    turn.activityInFlight = drainActivitySummary(turn)
+    // Maintains an already-open card (guarded above on activityMessageId !=
+    // null) → only ever EDITs. 'liveness' is correct either way.
+    turn.activityInFlight = drainActivitySummary(turn, 'liveness')
   }
 }
 if (!STATIC && FEED_HEARTBEAT_ENABLED) {
@@ -10532,6 +10636,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           replyCalled: false,
           finalAnswerDelivered: false,
           finalAnswerSubstantive: false,
+          // Sticky latch — reset ONLY here (turn start), never by reopen.
+          finalAnswerEverDelivered: false,
           firstPingAt: null,
           silentAnchorMessageId: null,
           silentAnchorText: '',
@@ -10860,7 +10966,11 @@ function handleSessionEvent(ev: SessionEvent): void {
         // == the flat render when no foreground sub-agent is active.
         turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
         if (turn.activityInFlight == null) {
-          turn.activityInFlight = drainActivitySummary(turn)
+          // Producer B (tool label): always OPEN-eligible (labeledToolCount was
+          // incremented just above). A turn that started conversational and now
+          // dispatches a tool opens here, rendering any narration accumulated
+          // by the suppressed narrative-SHOW drains (design §9 lever 5 / R4).
+          turn.activityInFlight = drainActivitySummary(turn, 'tool')
         }
       }
       return

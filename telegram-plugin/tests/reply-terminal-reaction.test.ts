@@ -81,7 +81,12 @@ describe('#1713 + #1728 — reply tool reaction contract', () => {
     )
     const anchor = src.indexOf("fresh sendMessage from reply tool is a user-visible")
     expect(anchor).toBeGreaterThan(-1)
-    const slice = src.slice(anchor, anchor + 3000)
+    // Window widened 3000 → 4000 (#2556): the deterministic-emission lever-1
+    // sticky-latch set + comment lives inside the post-send isFinalAnswerReply
+    // branch between this anchor and finalizeStatusReaction, growing the block
+    // past the old 3000-char window. The assertion's INTENT is unchanged —
+    // finalize present, gated by isFinalAnswerReply, and after the gate.
+    const slice = src.slice(anchor, anchor + 4000)
     // The finalize MUST appear in the post-send block.
     expect(slice).toMatch(/finalizeStatusReaction\(/)
     // It MUST be gated by isFinalAnswerReply (the classifier prevents

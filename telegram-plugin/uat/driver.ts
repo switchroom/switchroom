@@ -591,6 +591,30 @@ export class Driver {
   }
 
   /**
+   * Pull a window of chat history in SERVER SEND-ORDER (ascending message_id —
+   * the actual on-screen order). The Phase-3 helper the `observeMessages`
+   * doc-comment references: unlike the new+edit observer stream, this is a pull
+   * that sees ALL messages already in the chat, including ones that landed
+   * before the observer started — required to assert ordering across a
+   * re-prompt boundary (`jtbd-reply-is-last-dm`, design §11 cases 3 & 4).
+   *
+   * mtcute's `getHistory` returns newest-first by default (and `reverse=true`
+   * needs an offset, returning [] otherwise), so we fetch then sort ascending
+   * by message_id to recover send-order. Each entry is mapped to the same
+   * `ObservedMessage` shape the assertions/predicates consume.
+   */
+  async getHistory(
+    chatId: number,
+    limit = 100,
+  ): Promise<ObservedMessage[]> {
+    const c = this.requireClient();
+    const messages = await c.getHistory(chatId, { limit });
+    return messages
+      .map((m) => toObserved(m, false))
+      .sort((a, b) => a.messageId - b.messageId);
+  }
+
+  /**
    * Poll the current set of emoji reactions on a message by making a
    * direct `messages.getMessagesReactions` MTProto call.
    *

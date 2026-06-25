@@ -66,6 +66,95 @@ export function isActivityFeedMessage(m: ObservedMessage): boolean {
   return lines.every((l) => ACTIVITY_FEED_LINE_RE.test(l));
 }
 
+/**
+ * True when `m` is the agent's actual answer (the foreground reply) — sender is
+ * the bot (not the driver), it's an original send (not an edit), and it is
+ * neither a worker-feed nor an activity-feed surface, with non-empty text.
+ * Promoted here from the cross-surface fuzz scenario so `assertReplyIsLast` and
+ * any scenario can share one definition of "this is the answer lane".
+ */
+export function isAnswer(m: ObservedMessage, driverUserId: number): boolean {
+  return (
+    m.senderUserId !== driverUserId &&
+    !m.edited &&
+    !isWorkerFeedMessage(m) &&
+    !isActivityFeedMessage(m) &&
+    m.text.trim().length > 0
+  );
+}
+
+export interface ReplyIsLastOptions {
+  /**
+   * The answer message that must be last in its foreground turn. The turn is
+   * scoped as the half-open window `[turn.messageId, nextDriverMessageId)` —
+   * i.e. everything from the answer up to (but excluding) the NEXT message the
+   * driver sent. Activity/worker-feed surfaces inside that window belong to
+   * this turn; a legitimately later surface (a background worker card, an
+   * obligation-represent nudge, an error envelope, or the next turn's feed)
+   * sits OUTSIDE it and is correctly NOT flagged.
+   *
+   * Pass the answer ObservedMessage returned by `expectMessage` (or pulled
+   * from `getHistory`).
+   */
+  turn: ObservedMessage;
+}
+
+/**
+ * Assert the scoped "reply is last" invariant (design §6/§11): within a single
+ * foreground turn, NO activity-card / worker-feed surface opens AFTER that
+ * turn's reply. Operates on a server-send-order `history` pull
+ * (`driver.getHistory`) so it sees surfaces that may have landed before any
+ * live observer started — required to catch a post-reply card across a
+ * re-prompt boundary.
+ *
+ * Deliberately NOT a naive cross-surface "answer has the max message_id":
+ * legitimate background / represent / error surfaces land later and would
+ * false-positive. We filter to the activity + answer LANES of the SAME
+ * foreground turn (`opts.turn`), reusing `isActivityFeedMessage` /
+ * `isWorkerFeedMessage` / `isAnswer`.
+ *
+ * Throws with the offending feed message when an activity/worker-feed surface
+ * for this turn has a HIGHER message_id than the reply.
+ */
+export function assertReplyIsLast(
+  history: ObservedMessage[],
+  driverUserId: number,
+  opts: ReplyIsLastOptions,
+): void {
+  const answer = opts.turn;
+  // Turn window upper bound: the first driver (user) message strictly after the
+  // answer. Anything at/after that belongs to a later turn and is out of scope.
+  const nextDriverAfter = history
+    .filter((m) => m.senderUserId === driverUserId && m.messageId > answer.messageId)
+    .reduce<number | null>(
+      (acc, m) => (acc == null || m.messageId < acc ? m.messageId : acc),
+      null,
+    );
+
+  const inThisTurn = (m: ObservedMessage): boolean =>
+    m.messageId >= answer.messageId &&
+    (nextDriverAfter == null || m.messageId < nextDriverAfter);
+
+  // The reply must be the last ACTIVITY/ANSWER-LANE surface of its turn: no
+  // activity-card or worker-feed message in-turn may have a higher id than it.
+  const offenders = history.filter(
+    (m) =>
+      inThisTurn(m) &&
+      m.messageId > answer.messageId &&
+      (isActivityFeedMessage(m) || isWorkerFeedMessage(m)),
+  );
+
+  if (offenders.length > 0) {
+    const detail = offenders
+      .map((m) => `msg=${m.messageId} ${JSON.stringify(m.text.slice(0, 60))}`)
+      .join("; ");
+    throw new Error(
+      `assertReplyIsLast: an activity/feed surface opened AFTER the reply ` +
+        `(answer msg=${answer.messageId}) in the same foreground turn: ${detail}`,
+    );
+  }
+}
+
 export interface PollOptions {
   /** Hard deadline; the predicate must resolve truthy before this. */
   timeout: number;
