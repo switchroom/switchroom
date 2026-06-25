@@ -98,7 +98,7 @@ import {
   shutdownAnalytics,
 } from '../analytics-posthog.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
-import { decideOverPing } from '../over-ping-safety-net.js'
+import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
 import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
 import { classifyInbound } from '../inbound-classifier.js'
 import * as silencePoke from '../silence-poke.js'
@@ -7835,14 +7835,69 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         text: rawText,
         disableNotification: modelDisableNotification,
       })
-      // PR-4a: routed through the emission-authority façade (no-op delegate —
-      // the `decideOverPing` decision, the stderr logs, the metric emit, the
-      // `firstPingAt`/`firstPingWasSubstantive` mutations, and the
-      // `disableNotification`/`wasOverPingSuppressed` outer-scope writes the
-      // send path consumes all run exactly as before, inside the delegate).
+      // PR-4c: the over-ping DECISION relocates into the emission-authority
+      // façade, behind the kill-switch (default OFF), the same structural way
+      // PR-4b moved the OPEN gate. `decideOverPing` is already pure, so PR-4c
+      // extracts NOTHING new — it relocates the *call* into the façade's enabled
+      // branch and keeps the *effects* (stderr, metric, the atomic
+      // `firstPingAt`/`firstPingWasSubstantive` pair-set, the
+      // `disableNotification`/`wasOverPingSuppressed` outer-scope writes) HERE,
+      // parameterized by the decision the façade hands back via `applyDecision`.
+      //
+      //  - Disabled branch runs `disabledOverPing()` — its own LITERAL
+      //    `decideOverPing(...)` call + the full effects block, VERBATIM from
+      //    PR-4b-base (the disabled-path-is-byte-identical proof).
+      //  - Enabled branch: the façade computes the decision and hands it to
+      //    `applyOverPingDecision(decision)`, which performs the IDENTICAL
+      //    effects. Same pure inputs ⇒ same decision ⇒ flag-ON ≡ flag-OFF ≡ base.
+      //
+      // The effects block is shared between both thunks by closing over `decision`
+      // — but the disabled thunk computes it via its OWN literal `decideOverPing(`
+      // first, so the disabled path never depends on the façade for the decision.
+      const applyOverPingDecision = (decision: OverPingDecision): void => {
+        if (decision.suppress) {
+          process.stderr.write(
+            `telegram gateway: reply over-ping safety net — ` +
+            `downgrading disable_notification:false → true ` +
+            `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
+            `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${decision.sinceFirstPingMs})\n`,
+          )
+          // Observability: surface to the unified runtime-metrics
+          // fan-out so the cadence dashboard can track fleet-wide
+          // over-ping rate (leading indicator of model pacing drift).
+          emitRuntimeMetric({
+            kind: 'over_ping_suppressed',
+            key: statusKey(chat_id, args.message_thread_id != null
+              ? Number(args.message_thread_id) : undefined),
+            sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
+          })
+          disableNotification = true
+          wasOverPingSuppressed = true
+        } else if (decision.claimSlot) {
+          // Claim (first ping) OR upgrade (substantive answer pinging over an
+          // ack's slot). Set firstPingAt AND firstPingWasSubstantive ATOMICALLY
+          // (no await between) so a racing second reply reads a consistent pair.
+          turn.firstPingAt = now
+          turn.firstPingWasSubstantive = replySubstantive
+          if (decision.upgrade) {
+            process.stderr.write(
+              `telegram gateway: reply over-ping safety net — ` +
+              `UPGRADE: substantive answer pings over an ack's slot ` +
+              `(chat=${chat_id} thread=${args.message_thread_id ?? '-'})\n`,
+            )
+          }
+        }
+      }
       emissionAuthorityFor(turn).claimOrDowngradePing(
         { modelRequestedPing: !disableNotification, substantive: replySubstantive },
+        {
+          firstPingAt: turn.firstPingAt,
+          firstPingWasSubstantive: turn.firstPingWasSubstantive,
+          nowMs: now,
+        },
+        applyOverPingDecision,
         () => {
+          // Disabled-path: literal `decideOverPing(` + effects, VERBATIM base.
           const decision = decideOverPing({
             modelRequestedPing: !disableNotification,
             firstPingAt: turn.firstPingAt,
@@ -7850,38 +7905,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             firstPingWasSubstantive: turn.firstPingWasSubstantive,
             nowMs: now,
           })
-          if (decision.suppress) {
-            process.stderr.write(
-              `telegram gateway: reply over-ping safety net — ` +
-              `downgrading disable_notification:false → true ` +
-              `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
-              `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${decision.sinceFirstPingMs})\n`,
-            )
-            // Observability: surface to the unified runtime-metrics
-            // fan-out so the cadence dashboard can track fleet-wide
-            // over-ping rate (leading indicator of model pacing drift).
-            emitRuntimeMetric({
-              kind: 'over_ping_suppressed',
-              key: statusKey(chat_id, args.message_thread_id != null
-                ? Number(args.message_thread_id) : undefined),
-              sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
-            })
-            disableNotification = true
-            wasOverPingSuppressed = true
-          } else if (decision.claimSlot) {
-            // Claim (first ping) OR upgrade (substantive answer pinging over an
-            // ack's slot). Set firstPingAt AND firstPingWasSubstantive ATOMICALLY
-            // (no await between) so a racing second reply reads a consistent pair.
-            turn.firstPingAt = now
-            turn.firstPingWasSubstantive = replySubstantive
-            if (decision.upgrade) {
-              process.stderr.write(
-                `telegram gateway: reply over-ping safety net — ` +
-                `UPGRADE: substantive answer pings over an ack's slot ` +
-                `(chat=${chat_id} thread=${args.message_thread_id ?? '-'})\n`,
-              )
-            }
-          }
+          applyOverPingDecision(decision)
         },
       )
     }
