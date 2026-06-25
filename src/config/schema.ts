@@ -3127,6 +3127,23 @@ export const SwitchroomConfigSchema = z.object({
                 "Optional UID to chown the consumer socket to (defaults to 0 = root, " +
                 "suitable for sibling containers running as root).",
               ),
+            mirror_dir: z
+              .string()
+              .optional()
+              .describe(
+                "Optional host-side directory path. When set, the broker actively " +
+                "writes the consumer's effective-account `.credentials.json` mirror " +
+                "here — in addition to serving creds on demand via `get-credentials`. " +
+                "Use this to eliminate the pull-latency gap: without a mirror the " +
+                "consumer only gets failover creds at its next scheduled re-fetch " +
+                "(up to 30 min). With a mirror the broker pushes failover creds " +
+                "immediately when it detects exhaustion (consumer-quota-sensor tick, " +
+                "or a mark-exhausted RPC on the pinned account). The directory must " +
+                "be accessible to the broker container (bind-mounted from the host) " +
+                "and to the consumer container; the broker writes " +
+                "`<mirror_dir>/.credentials.json` atomically. Chown is attempted to " +
+                "`uid` (default 0) — swallowed when CAP_CHOWN is absent.",
+              ),
           }),
         )
         .optional()
