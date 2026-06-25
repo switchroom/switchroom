@@ -1530,6 +1530,11 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: live probe shows ${label} healthy (5h=${snapshot.fiveHourUtilizationPct}% 7d=${snapshot.sevenDayUtilizationPct}%) — cleared stale exhaustion mark\n`,
       );
+      // Re-mirror any consumer whose pinned account is `label` — now that the
+      // exhaustion mark is cleared the serving path reverts to the pinned
+      // account, so push the revert immediately rather than waiting for the
+      // consumer's next pull-loop tick. This is the auto-revert path.
+      this.fanoutToAffectedConsumers(label);
     }
   }
 
@@ -1609,6 +1614,13 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: consumer-quota-sensor marked ${label} exhausted until ${new Date(exhaustedUntil).toISOString()} — consumer(s) fail over\n`,
       );
+      // Push failover creds immediately to any consumer with a mirror_dir.
+      // Without this push the consumer sits on stale credentials until its
+      // next pull-loop tick (up to 30 min). This is the fix for the
+      // 2026-06-25 hindsight outage: the sensor correctly detected exhaustion
+      // but the consumer never got a push, so it stayed dead on the exhausted
+      // account until the 30-min refresh loop happened to fire.
+      this.fanoutToAffectedConsumers(label);
     }
   }
 
@@ -1638,6 +1650,10 @@ export class AuthBroker {
     };
     this.config = cfg;
     const fanned = this.fanoutToAffectedAgents(account);
+    // Push updated creds to any consumer mirror whose effective account is now
+    // `account` (e.g. a consumer whose failover just resolved to this account
+    // because its pinned account was exhausted and this is the healthy fallback).
+    this.fanoutAllConsumers();
     this.audit({ op: "set-active", identity, account, accountKind: "claude", ok: true });
     socket.write(encodeSuccess(id, { active: account, fanned }));
   }
@@ -1677,6 +1693,16 @@ export class AuthBroker {
       this.config.auth?.fallback_order ?? [],
     );
     const rolled = this.fanoutFailoverTo(account, rolledTo);
+    // Fan out to any consumer whose pinned account == `account` AND that
+    // has a `mirror_dir`. This eliminates the pull-latency gap: without
+    // this push the consumer only gets failover creds at its next
+    // scheduled get-credentials loop tick (up to 30 min). The serving
+    // path (accountWithFailover) is already failover-aware — we just need
+    // to push the resulting creds immediately rather than waiting for a
+    // pull. Attribution stays attribution-true (servingAccountForConsumer
+    // uses accountWithFailover, never the raw pinned account), so a consumer
+    // cannot poison the fallback account.
+    this.fanoutToAffectedConsumers(account);
     // `rolledTo` is the account the fleet rolled TO — same selection the fanout
     // used. Lets a non-admin caller (the agent that just 429'd, via
     // auto-fallback) report an accurate "switched to <X>" without a follow-up
@@ -2492,6 +2518,10 @@ export class AuthBroker {
         this.persistShaIndex();
         // Fan out to every agent whose effective account == this label.
         this.fanoutToAffectedAgents(label);
+        // Fan out to every consumer mirror whose effective account == this
+        // label (so a consumer on a failover account gets the refreshed creds
+        // pushed without waiting for its pull-loop tick).
+        this.fanoutToAffectedConsumers(label);
         return { kind: "refreshed", newExpiresAt };
       }
       if (outcome.kind === "failed") {
@@ -2508,11 +2538,17 @@ export class AuthBroker {
 
   /* ─── Fanout ────────────────────────────────────────────────── */
 
-  /** Walk every agent and re-mirror their effective-account credentials. */
+  /** Walk every agent and every consumer-mirror and re-mirror their effective-account credentials. */
   private fanoutAll(): string[] {
     const out: string[] = [];
     for (const name of Object.keys(this.config.agents ?? {})) {
       if (this.fanoutForAgent(name)) out.push(name);
+    }
+    // Boot fanout for consumers with mirror_dir — same "re-point after restart"
+    // guarantee agents get, so a broker restart doesn't leave a consumer stuck on
+    // pre-restart creds until its next pull-loop tick.
+    for (const consumerName of this.fanoutAllConsumers()) {
+      out.push(`consumer:${consumerName}`);
     }
     return out;
   }
@@ -2533,10 +2569,111 @@ export class AuthBroker {
         if (this.fanoutForAgent(name)) fanned.push(name);
       }
     }
-    // Also fan out to any pinned consumers — they write to a host path
-    // we don't own (their compose mounts their socket), so we only mirror
-    // account-creds-on-disk; consumers fetch via get-credentials.
     return fanned;
+  }
+
+  /**
+   * Fan out to every consumer whose effective (failover-resolved) account ==
+   * label AND that has a `mirror_dir` configured.
+   *
+   * The consumer model is pull-based by default: hindsight calls
+   * `get-credentials` on a periodic loop (default 30 min). Without a push,
+   * a consumer pinned to an account that just became exhausted keeps running
+   * on stale credentials for up to 30 min — the 2026-06-25 incident where
+   * the consumer-quota-sensor correctly marked `me@` exhausted, but hindsight
+   * didn't re-fetch until the next loop tick and stayed dead on a 429.
+   *
+   * `mirror_dir` closes the gap: the broker writes
+   * `<mirror_dir>/.credentials.json` immediately when it detects exhaustion
+   * (sensor tick or a mark-exhausted RPC on the pinned account) and on any
+   * credential refresh. The consumer container bind-mounts `mirror_dir` from
+   * a host-accessible path so both sides can reach the same file.
+   *
+   * Attribution invariant is preserved: `mirrorAccountToConsumer` uses the
+   * SERVING account (post exhaustion-failover), never the raw pinned account,
+   * so stale exhausted creds are never re-mirrored onto the consumer.
+   *
+   * Returns the list of consumer names whose mirror was successfully updated.
+   */
+  private fanoutToAffectedConsumers(label: string): string[] {
+    const fanned: string[] = [];
+    for (const consumer of this.config.auth?.consumers ?? []) {
+      if (!consumer.mirror_dir) continue;
+      // A consumer is affected when EITHER:
+      //   (a) its pinned account is `label` — the pinned account may have just
+      //       been marked exhausted; re-mirror with the failover account so the
+      //       consumer doesn't wait for its next pull tick.
+      //   (b) its EFFECTIVE (serving) account is `label` — the effective account
+      //       just had its creds refreshed; push the fresh creds immediately.
+      // In both cases we write the current serving account (post failover), never
+      // the raw pinned one, preserving the attribution invariant.
+      const isPinned = consumer.account === label;
+      const effective = this.servingAccountForConsumer(consumer.name);
+      const isEffective = effective === label;
+      if (!isPinned && !isEffective) continue;
+      const toMirror = effective ?? consumer.account;
+      if (this.mirrorAccountToConsumer(toMirror, consumer)) {
+        fanned.push(consumer.name);
+      }
+    }
+    return fanned;
+  }
+
+  /**
+   * Walk every consumer with a `mirror_dir` and re-mirror their
+   * effective-account credentials. Used at boot and after a global
+   * state change (e.g. set-active).
+   */
+  private fanoutAllConsumers(): string[] {
+    const out: string[] = [];
+    for (const consumer of this.config.auth?.consumers ?? []) {
+      if (!consumer.mirror_dir) continue;
+      const effective = this.servingAccountForConsumer(consumer.name);
+      if (!effective) continue;
+      if (this.mirrorAccountToConsumer(effective, consumer)) out.push(consumer.name);
+    }
+    return out;
+  }
+
+  /**
+   * The serving (failover-resolved) account for a named consumer. Extracted
+   * as a helper so fanoutToAffectedConsumers can call it without building a
+   * synthetic Identity object.
+   */
+  private servingAccountForConsumer(name: string): string | null {
+    const c = (this.config.auth?.consumers ?? []).find((x) => x.name === name);
+    if (!c) return null;
+    return this.accountWithFailover(c.account);
+  }
+
+  /**
+   * Write the effective-account credentials to a consumer's `mirror_dir`.
+   * Atomic (temp + rename). Chown to `consumer.uid` (default 0) — swallowed
+   * when CAP_CHOWN is absent (dev hosts, tests).
+   *
+   * Returns true on success, false on any failure (logged, never throws).
+   */
+  private mirrorAccountToConsumer(label: string, consumer: { name: string; uid?: number; mirror_dir?: string }): boolean {
+    const mirrorDir = consumer.mirror_dir;
+    if (!mirrorDir) return false;
+    const targetPath = join(mirrorDir, ".credentials.json");
+    const credsPath = accountCredentialsPath(label, this.home);
+    if (!existsSync(credsPath)) return false;
+    const mirrorContent = enrichMirrorContent(readFileSync(credsPath, "utf-8"));
+    try {
+      mkdirSync(mirrorDir, { recursive: true, mode: 0o700 });
+      atomicWriteFileSync(targetPath, mirrorContent, 0o600);
+      try {
+        const uid = consumer.uid ?? 0;
+        chownSync(targetPath, uid, uid);
+      } catch (err) {
+        this.warnCapChownMissing(err);
+      }
+      return true;
+    } catch (err) {
+      this.logErr(`consumer-mirror ${consumer.name} <- ${label}: ${(err as Error).message}`);
+      return false;
+    }
   }
 
   /**

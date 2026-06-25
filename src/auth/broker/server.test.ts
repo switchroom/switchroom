@@ -65,7 +65,7 @@ function makeConfig(h: Harness, overrides: Partial<{
    *  set on their per-agent block. Mirrors the unified admin source
    *  of truth (per-agent flag, not a top-level list). */
   admin_agents: string[];
-  consumers: Array<{ name: string; account: string; uid?: number }>;
+  consumers: Array<{ name: string; account: string; uid?: number; mirror_dir?: string }>;
   agents: Record<string, { auth?: { override?: string }; admin?: boolean }>;
   /** Phase 3b.2b — set to enable Google provider registration. */
   google_workspace: { google_client_id: string; google_client_secret: string };
@@ -2934,6 +2934,371 @@ describe("AuthBroker — claim-notification (fleet notification dedup)", () => {
     ]) as Array<{ ok: boolean; data: { granted: boolean } }>;
     const grants = [a, b].filter((r) => r.data.granted).length;
     expect(grants).toBe(1);
+    broker.stop();
+  });
+});
+
+// ─── consumer mirror_dir — the 2026-06-25 fix ───────────────────────────────
+//
+// The 2026-06-25 outage: the consumer-quota-sensor correctly marked `me@`
+// exhausted (10 min cadence), but hindsight's mounted /run/claude-creds/.credentials.json
+// was never re-pointed — it only re-fetches via get-credentials on its 30-min
+// background loop. The sensor ≤10min + loop ≤30min = up to 40min window. In
+// practice >1hr because the loop had recently run.
+//
+// Fix: consumers with a `mirror_dir` get their .credentials.json pushed
+// immediately when the broker marks exhaustion (sensor OR mark-exhausted RPC)
+// and when the effective account's creds are refreshed. Auto-revert (pinned
+// account becomes healthy again) is also pushed.
+//
+// Tests: (1) consumer mirror is re-written to fallback on sensor exhaustion
+//        (2) mirror reverts to pinned account when mark is cleared
+//        (3) attribution/mark-exhausted still targets the pinned account
+//        (4) agents' existing fanout behavior is unchanged
+//        (5) boot fanout writes consumer mirror alongside agent mirrors
+describe("AuthBroker — consumer mirror_dir (2026-06-25 push-on-exhaustion fix)", () => {
+  // ── (1) Regression: sensor marks exhausted → mirror is immediately re-written ──
+  //
+  // This is the exact incident path. Without the fix: sensor marks `me@`
+  // exhausted but the mirror file keeps pointing at the exhausted account until
+  // the 30-min pull loop fires. With the fix: broker pushes fallback creds
+  // immediately.
+  it("consumer-quota-sensor marks exhausted → mirror_dir is re-written to fallback (regression test)", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary", mirror_dir: mirrorDir }],
+      // NOTE: no agent on `secondary` — exact incident shape
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      _testFetchQuota: async ({ accessToken }) =>
+        (accessToken as string).includes("secondary")
+          ? {
+              ok: true,
+              data: {
+                fiveHourUtilizationPct: 100,
+                sevenDayUtilizationPct: 10,
+                fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+                sevenDayResetAt: null,
+                representativeClaim: "five_hour",
+                overageStatus: null,
+                overageDisabledReason: null,
+              },
+            }
+          : {
+              ok: true,
+              data: {
+                fiveHourUtilizationPct: 5,
+                sevenDayUtilizationPct: 5,
+                fiveHourResetAt: null,
+                sevenDayResetAt: null,
+                representativeClaim: null,
+                overageStatus: null,
+                overageDisabledReason: null,
+              },
+            },
+    });
+    await broker.start();
+
+    // Boot fanout already wrote the mirror with `secondary` creds (correct —
+    // secondary is not exhausted yet at boot time).
+    expect(existsSync(join(mirrorDir, ".credentials.json"))).toBe(true);
+    const mirrorAtBoot = JSON.parse(readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"));
+    expect(mirrorAtBoot.claudeAiOauth.accessToken).toBe("at-secondary");
+
+    // Drive one sensor tick — marks `secondary` exhausted AND pushes fallback creds.
+    await broker.consumerQuotaProbeTick();
+
+    // Mirror must now contain the FALLBACK account's creds (pivoted from secondary to default).
+    expect(existsSync(join(mirrorDir, ".credentials.json"))).toBe(true);
+    const mirror = JSON.parse(readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"));
+    // `default` account's access token is "at-default" (from seedAccount).
+    expect(mirror.claudeAiOauth.accessToken).toBe("at-default");
+
+    // get-credentials also returns the fallback account (existing behavior unchanged).
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("default");
+
+    broker.stop();
+  });
+
+  // ── (1b) mark-exhausted RPC path (agent on the same account reports a 429) ──
+  it("mark-exhausted on the consumer's pinned account also pushes fallback creds to mirror_dir", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary", mirror_dir: mirrorDir }],
+      agents: { marker: { auth: { override: "secondary" } } },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // An agent on `secondary` reports a 429 — should push fallback to consumer mirror.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    // Mirror must now contain `default` creds.
+    expect(existsSync(join(mirrorDir, ".credentials.json"))).toBe(true);
+    const mirror = JSON.parse(readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"));
+    expect(mirror.claudeAiOauth.accessToken).toBe("at-default");
+
+    broker.stop();
+  });
+
+  // ── (2) Auto-revert: when the exhaustion mark is cleared, mirror reverts to pinned account ──
+  it("mirror reverts to pinned account when the exhaustion mark is cleared by a healthy probe", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    // Track probe call count so we can switch from walled → healthy.
+    let probeCount = 0;
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary", mirror_dir: mirrorDir }],
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      _testFetchQuota: async ({ accessToken }) => {
+        probeCount++;
+        // First probe: `secondary` is walled. Subsequent: healthy.
+        const walled = probeCount <= 1 && (accessToken as string).includes("secondary");
+        return walled
+          ? {
+              ok: true,
+              data: {
+                fiveHourUtilizationPct: 100,
+                sevenDayUtilizationPct: 10,
+                fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+                sevenDayResetAt: null,
+                representativeClaim: "five_hour",
+                overageStatus: null,
+                overageDisabledReason: null,
+              },
+            }
+          : {
+              ok: true,
+              data: {
+                fiveHourUtilizationPct: 30,
+                sevenDayUtilizationPct: 10,
+                fiveHourResetAt: null,
+                sevenDayResetAt: null,
+                representativeClaim: null,
+                overageStatus: null,
+                overageDisabledReason: null,
+              },
+            };
+      },
+    });
+    await broker.start();
+
+    // First tick: secondary is walled → mirror writes `default` creds.
+    await broker.consumerQuotaProbeTick();
+    const mirrorAfterExhaustion = JSON.parse(
+      readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"),
+    );
+    expect(mirrorAfterExhaustion.claudeAiOauth.accessToken).toBe("at-default");
+
+    // Second tick: secondary is healthy → mark is cleared → mirror reverts to `secondary`.
+    await broker.consumerQuotaProbeTick();
+    const mirrorAfterRevert = JSON.parse(
+      readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"),
+    );
+    expect(mirrorAfterRevert.claudeAiOauth.accessToken).toBe("at-secondary");
+
+    broker.stop();
+  });
+
+  // ── (3) Attribution invariant: mark-exhausted always targets pinned account ──
+  //
+  // Even when the consumer is being SERVED a fallback account (its mirror points
+  // at `default`), a mark-exhausted from that consumer must target `secondary`
+  // (the pinned account) — never `default`. Unchanged behavior; regression guard.
+  it("attribution stays pinned: a consumer with mirror cannot poison the fallback account", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary", mirror_dir: mirrorDir }],
+      agents: { marker: { auth: { override: "secondary" } } },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Exhaust secondary (via an agent) → consumer failover active, mirror points at `default`.
+    await rpc(join(h.socketRoot, "marker", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+    expect(existsSync(join(mirrorDir, ".credentials.json"))).toBe(true);
+    const mirrorBeforeConsumerMark = JSON.parse(
+      readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"),
+    );
+    expect(mirrorBeforeConsumerMark.claudeAiOauth.accessToken).toBe("at-default");
+
+    // Consumer now calls mark-exhausted — must mark its PINNED account (secondary),
+    // never the served fallback (default).
+    await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 120_000,
+    });
+
+    // `default` must remain healthy (not exhausted by the consumer).
+    const quota = JSON.parse(readFileSync(join(h.stateDir, "quota.json"), "utf-8"));
+    expect((quota["default"]?.exhausted_until ?? 0) > Date.now()).toBe(false);
+    // `secondary` is marked.
+    expect(quota["secondary"].exhausted_until > Date.now()).toBe(true);
+
+    broker.stop();
+  });
+
+  // ── (4) Agents' existing fanout is unaffected ──
+  it("agents' existing failover fanout is unchanged when consumers also have mirror_dir", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "hindsight-acct", mirror_dir: mirrorDir }],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+    seedAccount(h, "hindsight-acct");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Agent `ziggy` is on `default` (auth.active). Exhaust `default` via ziggy
+    // — agents should roll over to `secondary`.
+    await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+    });
+
+    // Agent now gets `secondary` (unchanged).
+    const agentResp = await rpc(join(h.socketRoot, "ziggy", "sock"), {
+      v: 1, id: "2", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(agentResp.ok).toBe(true);
+    expect(agentResp.data.account).toBe("secondary");
+
+    // Consumer's pinned account (`hindsight-acct`) is unaffected — it has no
+    // relationship to the exhausted `default`. Mirror should NOT have been written
+    // (consumer wasn't affected by the agent's exhaustion event).
+    // (If mirror was spuriously written, it would contain hindsight-acct creds, which
+    //  is also acceptable — but it must NOT contain `secondary` or `default` creds.)
+    if (existsSync(join(mirrorDir, ".credentials.json"))) {
+      const mirrorContent = JSON.parse(readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"));
+      // The mirror must contain the consumer's OWN effective account creds, not an
+      // unrelated agent's account.
+      expect(mirrorContent.claudeAiOauth.accessToken).toBe("at-hindsight-acct");
+    }
+
+    broker.stop();
+  });
+
+  // ── (5) Boot fanout writes consumer mirror ──
+  it("boot fanout (fanoutAll) writes the consumer mirror alongside agent mirrors", async () => {
+    const h = makeHarness();
+    const mirrorDir = join(h.tmp, "consumer-creds");
+    const config = makeConfig(h, {
+      active: "default",
+      consumers: [{ name: "hindsight", account: "default", mirror_dir: mirrorDir }],
+      agents: { ziggy: {} },
+    });
+    seedAccount(h, "default");
+    mkdirSync(join(h.agentsDir, "ziggy"), { recursive: true });
+
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+    });
+    await broker.start();
+
+    // Boot fanout must have written the consumer mirror.
+    expect(existsSync(join(mirrorDir, ".credentials.json"))).toBe(true);
+    const mirror = JSON.parse(readFileSync(join(mirrorDir, ".credentials.json"), "utf-8"));
+    expect(mirror.claudeAiOauth.accessToken).toBe("at-default");
+
+    broker.stop();
+  });
+
+  // ── No mirror_dir → no file written (opt-in, not opt-out) ──
+  it("a consumer WITHOUT mirror_dir gets no pushed file (pull-only behavior preserved)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "default",
+      fallback_order: ["default", "secondary"],
+      consumers: [{ name: "hindsight", account: "secondary" }], // no mirror_dir
+    });
+    seedAccount(h, "default");
+    seedAccount(h, "secondary");
+
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+      _testFetchQuota: async () => ({
+        ok: true,
+        data: {
+          fiveHourUtilizationPct: 100,
+          sevenDayUtilizationPct: 10,
+          fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+          sevenDayResetAt: null,
+          representativeClaim: "five_hour",
+          overageStatus: null,
+          overageDisabledReason: null,
+        },
+      }),
+    });
+    await broker.start();
+    await broker.consumerQuotaProbeTick();
+
+    // The sensor marked secondary exhausted, BUT since there's no mirror_dir,
+    // no file should be written to the tmp dir.
+    expect(existsSync(join(h.tmp, ".credentials.json"))).toBe(false);
+
+    // get-credentials still returns the fallback (pull-path still works).
+    const resp = await rpc(join(h.socketRoot, "hindsight", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("default");
+
     broker.stop();
   });
 });
