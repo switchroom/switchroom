@@ -328,6 +328,10 @@ export function createIssuesCardHandle(
       const sendOpts: Record<string, unknown> = {
         parse_mode: "HTML",
         disable_web_page_preview: true,
+        // Status card, not the user's answer — silence the open ping.
+        // (editMessageText ignores disable_notification, so the shared
+        // edit path below is unaffected.)
+        disable_notification: true,
         ...(opts.threadId != null ? { message_thread_id: opts.threadId } : {}),
       };
 

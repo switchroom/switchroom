@@ -110,6 +110,9 @@ export async function refreshBanner(
       sent = await args.bot.api.sendMessage(args.ownerChatId, action.text, {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
+        // OAuth slot banner is a status notice — silence the open ping.
+        // (the pin below is already silent; the edit path doesn't ping.)
+        disable_notification: true,
       });
     } catch (err) {
       args.onError?.('pin', err);

@@ -2669,7 +2669,10 @@ function postQueuedStatus(chatId: string, bufferedThread: number, inFlightThread
   void (async () => {
     const sent = await swallowingApiCall(
       () =>
-        bot.api.sendMessage(chatId, text, { message_thread_id: bufferedThread }),
+        // Queued-placeholder status, not the user's answer — silence the
+        // open ping (BORDERLINE: it's a "your message is queued" notice;
+        // see PR description).
+        bot.api.sendMessage(chatId, text, { message_thread_id: bufferedThread, disable_notification: true }),
       { chat_id: chatId, verb: 'queued-status.post', threadId: bufferedThread },
     )
     const messageId = (sent as { message_id?: number } | undefined)?.message_id
@@ -5778,8 +5781,10 @@ silencePoke.startTimer({
       await robustApiCall(
         () => bot.api.sendMessage(ctx.chatId, text, {
           ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
-          // Framework fallback pings — user genuinely needs to know.
-          disable_notification: false,
+          // Status notice ("still working…"), not the user's answer —
+          // silenced (BORDERLINE: was a deliberate loud liveness ping;
+          // see PR description — revert just this literal to restore it).
+          disable_notification: true,
         }),
         { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
       )
@@ -14976,6 +14981,9 @@ function notifyDetachedFailure(
         lockedBot.api.sendMessage(chatId, text, {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
+          // Detached restart/update child-failure notice — status, not
+          // the user's answer. Silence the open ping.
+          disable_notification: true,
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }),
       {
@@ -15988,6 +15996,9 @@ bot.command('restart', async ctx => {
         (tid) =>
           lockedBot.api.sendMessage(chatId, ackText, {
             parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+            // Restart acknowledgement is a status notice — silence the
+            // open ping (the "restarted — ready" follow-up is what matters).
+            disable_notification: true,
             ...(tid != null ? { message_thread_id: tid } : {}),
           }),
         { threadId, chat_id: chatId, verb: 'restart.ack' },
@@ -16129,6 +16140,9 @@ async function handleNewCommand(ctx: Context): Promise<void> {
       (tid) =>
         lockedBot.api.sendMessage(chatId, ackText, {
           parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+          // /new /reset acknowledgement is a status notice — silence the
+          // open ping (the post-restart greeting card is what matters).
+          disable_notification: true,
           ...(tid != null ? { message_thread_id: tid } : {}),
         }),
       { threadId, chat_id: chatId, verb: 'new-or-reset.ack' },
@@ -16331,6 +16345,9 @@ bot.command('update', async ctx => {
         lockedBot.api.sendMessage(chatId, ackText, {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
+          // "update started" acknowledgement is a status notice — silence
+          // the open ping (the post-restart greeting card is what matters).
+          disable_notification: true,
           ...(tid != null ? { message_thread_id: tid } : {}),
         }),
       { threadId, chat_id: chatId, verb: 'update.ack' },
@@ -16996,7 +17013,9 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
     // wrap in swallowingApiCall anyway per the codebase rule.
     const access = loadAccess()
     if (access.allowFrom.length === 0) return outcome.kind === 'switched'
-    const opts = { parse_mode: 'HTML' as const }
+    // Account-switch / all-blocked announcement is a system status notice,
+    // not the user's answer — silence the open ping.
+    const opts = { parse_mode: 'HTML' as const, disable_notification: true }
     for (const chat_id of access.allowFrom) {
       void swallowingApiCall(
         () => bot.api.sendMessage(chat_id, outcome.announcement, opts),
@@ -17090,6 +17109,9 @@ async function runCreditWatch(): Promise<void> {
         bot.api.sendMessage(chat_id, decision.message, {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
+          // Credit/quota warning is a system status notice — silence the
+          // open ping (the user isn't waiting to tap anything).
+          disable_notification: true,
         }),
       { chat_id, verb: 'credit-watch.notify' },
     )
@@ -17229,6 +17251,8 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
             bot.api.sendMessage(chat_id, fleetDecision.message, {
               parse_mode: 'HTML',
               link_preview_options: { is_disabled: true },
+              // Quota status notice — silence the open ping.
+              disable_notification: true,
             }),
           { chat_id, verb: 'quota-watch.fleet-all-exhausted' },
         )
@@ -17450,6 +17474,8 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
           bot.api.sendMessage(chat_id, message, {
             parse_mode: 'HTML',
             link_preview_options: { is_disabled: true },
+            // Quota throttling status notice — silence the open ping.
+            disable_notification: true,
           }),
         { chat_id, verb: 'quota-watch.notify' },
       )
