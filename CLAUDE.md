@@ -497,23 +497,21 @@ should know up front (so a session doesn't have to be *told* each time):
 
 ## Repo model & dev flow
 
-Switchroom uses a **fork + canonical** model. Read this before pushing.
+Switchroom uses a **canonical-only** model. Read this before pushing.
 
-- **`switchroom/switchroom`** — canonical public repo, source of truth
+- **`switchroom/switchroom`** — the one canonical repo, source of truth
   for releases. All `npm publish` output comes from here. Tagged
-  versions (`v0.X.Y`) live here.
-- **Your fork** (e.g. `<your-username>/switchroom`) — where you work.
-  Feature branches + PRs on the fork for iteration; release-time PRs
-  from the fork's `main` → `switchroom:main`.
+  versions (`v0.X.Y`) live here. You push feature branches **directly**
+  to this repo and open PRs against its `main` — there is no personal
+  fork in the loop.
 
 **Local git remotes** should be:
-- `origin` → your fork (for push)
-- `upstream` → `switchroom/switchroom` (for pulling canonical updates)
+- `origin` → `switchroom/switchroom` (for both push and pull)
 
-Agent working on this repo: when you open a PR, **target
-`switchroom/switchroom:main`** as the base, not the fork's main. The fork
-is a staging area for your own iteration; the canonical repo is where
-review + merge + release happens.
+Agent working on this repo: push your feature branch to `origin`
+(`switchroom/switchroom`) and **target `switchroom/switchroom:main`** as
+the PR base. There is no fork staging area — review + merge + release all
+happen on this one canonical repo.
 
 ### Standard dev process
 
@@ -521,15 +519,15 @@ This is the **mandatory** path for any non-trivial change. Skip steps
 only with an explicit operator instruction (e.g. "no review", "ship
 without UAT").
 
-**1. Branch off `upstream/main`, in a fresh worktree.**
+**1. Branch off `origin/main`, in a fresh worktree.**
 
 Multiple agents share this server and can collide on the same checkout.
 Always work in a per-task worktree:
 
 ```
-git fetch upstream
+git fetch origin
 git worktree add ~/code/switchroom-<short-task-slug> \
-  -b feat/<branch-name> upstream/main
+  -b feat/<branch-name> origin/main
 cd ~/code/switchroom-<short-task-slug>
 ln -s ~/code/switchroom/node_modules node_modules   # donor: any stable checkout
 ```
@@ -592,8 +590,8 @@ locally cover the load-bearing subset.
   by concatenation (`"sk-ant-" + "fake" + "-xyz"`), never a single
   literal. Pattern: `telegram-plugin/tests/secret-detect-secretlint.test.ts`.
 
-**4. Commit with Conventional Commits, push to fork, open PR against
-`upstream/main`.**
+**4. Commit with Conventional Commits, push the branch to `origin`, open
+PR against `origin/main`.**
 
 ```
 git commit -m "feat(scope): short imperative summary
@@ -603,7 +601,7 @@ Longer body explaining the why and any non-obvious tradeoffs.
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 git push -u origin feat/<branch-name>
 gh pr create --repo switchroom/switchroom --base main \
-  --head <your-fork-user>:feat/<branch-name> --title "..." --body "..."
+  --head feat/<branch-name> --title "..." --body "..."
 ```
 
 PR title under 70 chars. Body covers: Summary, Why, Test plan
@@ -639,15 +637,15 @@ Required before fleet rollout.
 ### Standard release process
 
 Cut a release **only** after the relevant feature PRs have merged to
-`upstream/main` and you have at least one passing UAT (or an explicit
+`origin/main` and you have at least one passing UAT (or an explicit
 no-UAT directive).
 
-**1. Release worktree off `upstream/main`.**
+**1. Release worktree off `origin/main`.**
 
 ```
-git fetch upstream
+git fetch origin
 git worktree add ~/code/switchroom-rel-<vX.Y.Z> \
-  -b chore/release-v<X.Y.Z> upstream/main
+  -b chore/release-v<X.Y.Z> origin/main
 cd ~/code/switchroom-rel-<vX.Y.Z>
 # Release worktree needs a REAL node_modules, not the dev-worktree
 # symlink. `bun build` doesn't resolve through certain symlink shapes
@@ -699,7 +697,7 @@ git commit -m "chore: release vX.Y.Z"
 ```
 git push -u origin chore/release-v<X.Y.Z>
 gh pr create --repo switchroom/switchroom --base main \
-  --head <your-fork-user>:chore/release-v<X.Y.Z> \
+  --head chore/release-v<X.Y.Z> \
   --title "chore: release vX.Y.Z" --body "..."
 gh pr merge <PR#> --repo switchroom/switchroom --auto --squash
 ```
@@ -711,9 +709,9 @@ properly reviewed.
 **5. Tag the merged commit + push the tag.**
 
 ```
-git fetch upstream && git reset --hard upstream/main
+git fetch origin && git reset --hard origin/main
 git tag vX.Y.Z <merge-commit-sha>
-git push upstream vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The tag push triggers the `docker-images` workflow, which builds

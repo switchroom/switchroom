@@ -1,38 +1,31 @@
 # Contributing to Switchroom
 
 Switchroom is MIT-licensed and welcomes contributions. This guide covers the
-fork-and-PR flow, local dev loop, and what we look for in PRs.
+branch-and-PR flow, local dev loop, and what we look for in PRs.
 
 ## Repo layout
 
-- **`switchroom/switchroom`** — the canonical public repo. Source of truth for
-  releases. All `npm publish` output comes from here. Tagged versions
-  (`v0.X.Y`) live here.
-- **Your fork (e.g. `<your-username>/switchroom`)** — where you do your work.
-  Feature branches land on your fork; PRs target the canonical repo's `main`.
+- **`switchroom/switchroom`** — the one canonical public repo. Source of truth
+  for releases. All `npm publish` output comes from here. Tagged versions
+  (`v0.X.Y`) live here. You branch off `main`, push your branch directly to
+  this repo, and open PRs against its `main` — there is no separate fork.
 
-Switchroom uses the standard GitHub fork workflow. You do not need commit
-access to `switchroom/switchroom` to contribute.
+Switchroom uses a canonical-only branch-and-PR workflow: clone the repo, push
+a feature branch, open a PR against `main`.
 
 ## Getting started
 
-1. **Fork** `switchroom/switchroom` via the GitHub UI (top-right → Fork).
-   Keep the name `switchroom` under your username.
-2. **Clone** your fork locally:
+1. **Clone** `switchroom/switchroom` locally:
    ```
-   git clone https://github.com/<your-username>/switchroom.git
+   git clone https://github.com/switchroom/switchroom.git
    cd switchroom
    ```
-3. **Add upstream** so you can pull canonical changes:
-   ```
-   git remote add upstream https://github.com/switchroom/switchroom.git
-   ```
-4. **Install deps** and build:
+2. **Install deps** and build:
    ```
    bun install
    bun run build
    ```
-5. **Run the tests**:
+3. **Run the tests**:
    ```
    bun run test
    ```
@@ -73,7 +66,7 @@ When the canonical `switchroom/switchroom:main` is ready to ship:
 # 5. Publish: npm publish
 ```
 
-npm publishes come from the canonical repo only. Forks don't publish.
+npm publishes come from the canonical repo only.
 
 ### 3. Local deploy (optional)
 
@@ -83,8 +76,9 @@ your agents are on the latest code.
 
 ## Submitting a PR
 
-1. Branch off your fork's `main`:
+1. Branch off `main`:
    ```
+   git checkout main && git pull
    git checkout -b feature/my-feature
    ```
 2. Keep PRs focused. One concern per PR. If you find yourself writing
@@ -92,10 +86,11 @@ your agents are on the latest code.
 3. Add tests for new behavior. Bug fixes should include a regression test
    that would have caught the bug.
 4. Run `bun run lint` (tsc noEmit) and `bun run test` before pushing.
-5. Push to your fork and open a PR against `switchroom/switchroom:main`:
+5. Push the branch to `origin` and open a PR against `switchroom/switchroom:main`:
    ```
+   git push -u origin feature/my-feature
    gh pr create --repo switchroom/switchroom --base main \
-     --head <your-username>:feature/my-feature
+     --head feature/my-feature
    ```
    Or use the GitHub UI.
 6. PR title: conventional prefix (`feat:`, `fix:`, `chore:`, `docs:`,

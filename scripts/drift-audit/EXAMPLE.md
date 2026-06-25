@@ -166,8 +166,8 @@ mechanism is in-place reply streaming.
 ## Phase 3 — Fix agent applies the batch
 
 A Phase 3 agent receives the batch file, branches off
-`origin/main` (or `upstream/main` in fork mode), applies each `Edit`
-operation, and runs `tsc --noEmit` (clean because no `src/` edits).
+`origin/main` (the canonical `switchroom/switchroom`), applies each
+`Edit` operation, and runs `tsc --noEmit` (clean because no `src/` edits).
 It opens one PR titled "docs(drift-audit): remove pinned progress
 card references from JTBDs" with the batch findings linked in the
 body and the reviewer checkbox unchecked.
