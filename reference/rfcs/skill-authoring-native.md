@@ -1,3 +1,9 @@
+---
+artefact: native-by-default skill authoring
+serves: jobs/extend-without-forking.md
+status: Implemented (Phase 1 + 3); Phase 2a superseded
+---
+
 # RFC: Native-by-default skill authoring
 
 > **SUPERSEDED IN PART (post-implementation).** Phase 1 (native

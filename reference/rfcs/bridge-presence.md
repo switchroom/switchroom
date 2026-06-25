@@ -1,3 +1,9 @@
+---
+artefact: bridge presence — guaranteeing always-on inbound delivery
+serves: jobs/survive-reboots-and-real-life.md
+status: draft v1
+---
+
 # RFC: Bridge presence — guaranteeing always-on inbound delivery
 
 > Status: **draft v1** — design contract for the real fix to the

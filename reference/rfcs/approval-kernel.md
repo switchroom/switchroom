@@ -1,3 +1,9 @@
+---
+artefact: unified human-approval kernel
+backs: no-self-escalation
+status: Draft v4 — partially shipped; hard-boundary direction descoped for single-tenant
+---
+
 # RFC B: Unified human-approval kernel
 
 Status: Draft v4 — **partially shipped; hard-boundary direction descoped for single-tenant (2026-06-02)**

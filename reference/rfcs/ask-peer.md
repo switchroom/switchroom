@@ -1,3 +1,9 @@
+---
+artefact: ask_peer — operator-allowlisted visible cross-agent handoff
+serves: jobs/run-a-fleet-of-specialists.md
+status: Draft v1
+---
+
 # RFC: `ask_peer` — operator-allowlisted, visible cross-agent handoff
 
 Status: Draft v1

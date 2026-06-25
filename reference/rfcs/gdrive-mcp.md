@@ -1,3 +1,9 @@
+---
+artefact: Google Drive MCP integration
+serves: jobs/act-in-my-tools-with-an-identity.md
+status: Implemented in v0.6.0
+---
+
 # RFC D: Google Drive MCP integration
 
 Status: **Implemented in v0.6.0** (2026-05-06). Originally drafted as "RFC C" — renumbered to D after `host-control-daemon.md` claimed the C slot in v0.7.x. This document is retained as the design record; the implementation is the source of truth.

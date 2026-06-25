@@ -1,3 +1,9 @@
+---
+artefact: switchroom-auth-broker — single-writer OAuth credential plane
+serves: jobs/share-auth-across-the-fleet.md
+status: Draft v1
+---
+
 # RFC H: `switchroom-auth-broker` — single-writer OAuth credential plane
 
 Status: Draft v1

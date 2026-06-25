@@ -1,3 +1,9 @@
+---
+artefact: agents that improve themselves, on the leash
+serves: jobs/get-better-the-longer-they-run.md
+status: Draft
+---
+
 # RFC: Agents that improve themselves, on the leash
 
 Status: Draft

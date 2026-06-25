@@ -1,3 +1,9 @@
+---
+artefact: draft-stream mirror preview + real-time activity feed
+serves: jobs/know-what-my-agent-is-doing.md
+status: Implemented — flag retired
+---
+
 # RFC: Draft-stream mirror preview (model narration, ephemeral) + reply as commit
 
 **Status:** Implemented — flag retired

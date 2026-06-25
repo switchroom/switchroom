@@ -1,3 +1,9 @@
+---
+artefact: cold-start TTFO — minimising time to first outbound after restart
+serves: jobs/survive-reboots-and-real-life.md
+status: draft v1
+---
+
 # RFC — Cold-start TTFO
 
 > Status: draft v1 — scoping cold-start latency optimization. Companion to `reference/vision.md` (always-on specialist exec-assistants) and the wedge-cluster JTBD ("agent feels continuous across restarts").

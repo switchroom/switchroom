@@ -1,3 +1,9 @@
+---
+artefact: Microsoft 365 integration (OneDrive + Office files + Mail + Calendar)
+serves: jobs/act-in-my-tools-with-an-identity.md
+status: Draft
+---
+
 # RFC: Microsoft 365 integration (OneDrive + Office files + Mail + Calendar)
 
 **Status:** Draft

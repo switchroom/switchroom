@@ -1,3 +1,9 @@
+---
+artefact: vault-broker resilience and default auto-unlock
+serves: jobs/survive-reboots-and-real-life.md
+status: Draft v1
+---
+
 # RFC J: Vault-broker resilience & default auto-unlock
 
 Status: Draft v1

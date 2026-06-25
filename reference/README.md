@@ -86,6 +86,28 @@ There is no other class. `job:` **always** means a job spec — nothing else
 uses that key. The line, the outcome, and the how are three separate docs (an
 invariant, a job spec, a design record), never collapsed into one.
 
+## How this repo instantiates ProductOS
+
+Switchroom is the canonical worked example of the [ProductOS method](../../ProductOS/).
+The map from each reference doc to its method anchor or template:
+
+| Reference doc | ProductOS anchor / template |
+|---|---|
+| [`vision.md`](vision.md) | `anchors/product-vision.md` |
+| [`principles.md`](principles.md) | `anchors/product-principles.md` |
+| [`invariants.md`](invariants.md) | `anchors/invariants.md` — switchroom is cited as the worked example in the method guide |
+| [`product-spec.md`](product-spec.md) | `templates/product-spec.md` — owns the four outcomes, signals, and job index |
+| [`jobs/*.md`](jobs/) | `templates/job-spec.md` — one file per job, outcome-focused |
+| [`rfcs/*.md`](rfcs/) | `templates/rfc.md` — in two classes, told apart by frontmatter (see below) |
+
+### Where switchroom deliberately diverges
+
+These are considered improvements over the base method, not defects:
+
+- **RFCs are terse design docs, not job-spec hybrids.** Failure-mode thinking (the "Good / bad" section) lives in the job spec. Mechanism lives in the RFC. The two never collapse into one doc.
+- **Two RFC doc-classes, one folder.** A `serves:` key means a ship-coupled RFC delivering a specific job. A `backs:` key means a standing design record defending an invariant. Both live in `rfcs/`; frontmatter tells them apart.
+- **No STRATEGY, decisions, or job-links artefacts.** A single-operator subscription product has no accounts, renewals, or stakeholder portfolios to join across. Those templates exist in the method for multi-product organisations; they add no signal here.
+
 ## `rfcs/` holds two kinds of doc — that's intended
 
 `rfcs/` is the single home for the churny "how" layer. Most files are RFCs

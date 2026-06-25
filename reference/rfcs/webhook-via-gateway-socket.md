@@ -1,3 +1,9 @@
+---
+artefact: webhook ingest writes via the agent gateway socket
+backs: no-self-escalation
+status: Draft v1
+---
+
 # RFC: Webhook ingest writes via the agent gateway socket
 
 Status: Draft v1

@@ -1,3 +1,9 @@
+---
+artefact: complete the bot-token-to-vault migration
+serves: jobs/approve-what-my-agent-can-touch.md
+status: Draft v2 — hygiene, not a boundary
+---
+
 # RFC A: Complete the bot-token-to-vault migration
 
 Status: Draft v2 — **hygiene, not a boundary (2026-06-02)**
