@@ -297,6 +297,32 @@ async function main() {
   const markerPath = findNearestMarker(targetDir)
   if (markerPath == null) process.exit(0)
 
+  // Own-agent marker guard: suppress the agent's own CLAUDE.md / AGENTS.md /
+  // AGENT.md so it is never injected as additionalContext. The agent's own
+  // marker is already in the system prompt (baked by start.sh via
+  // --append-system-prompt); re-injecting it wastes ~30KB per session.
+  //
+  // The existing isUnderAgentWorkspace guard only blocks paths under the
+  // agent's workspace/ subdirectory. It misses the agent's start cwd
+  // (/home/.../.switchroom/agents/<name>) because that guard computes against
+  // workspace/, not agentDir itself. This marker-path check closes that gap.
+  //
+  // We do NOT add a "targetDir under startCwd" directory guard because that
+  // would wrongly suppress a legitimate worktree repo the operator has checked
+  // out inside the agent dir (e.g. agentDir/workspace/ repos) — the directory
+  // guard would catch those too. The marker-path equality check is surgical:
+  // only the exact CLAUDE.md / AGENTS.md / AGENT.md at agentDir root is blocked;
+  // any nested repo's marker injects normally.
+  if (agentName) {
+    const startCwd = normalize(
+      process.env.SWITCHROOM_AGENT_START_CWD ??
+        join(home, '.switchroom', 'agents', agentName),
+    )
+    for (const m of MARKER_FILES) {
+      if (markerPath === join(startCwd, m)) process.exit(0)
+    }
+  }
+
   const state = readSessionState(sessionId)
 
   // Already-loaded dedup — the load-once-per-repo-per-session invariant.
