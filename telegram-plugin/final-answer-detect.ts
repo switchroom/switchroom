@@ -103,12 +103,17 @@ export function isFinalAnswerReply(input: FinalAnswerReplyInput): boolean {
  * otherwise the silent-end re-prompt would spuriously fire and the agent
  * would re-deliver a duplicate / garbled answer.
  *
- * Residual: a reply that is genuinely the final answer yet is BOTH short
- * (<200 chars) AND pinging (e.g. "Done!") is indistinguishable here from
- * an ack, so post-answer housekeeping after it still re-opens the feed.
- * That is much rarer than the housekeeping-after-long-answer case this
- * predicate protects, and is kill-switchable via
- * `SWITCHROOM_FEED_REOPEN_AFTER_ACK=0`.
+ * Residual (pre-existing, predates PR-2 — a conscious accept, no regression):
+ * a reply that is genuinely the final answer yet is BOTH short (<200 chars)
+ * AND pinging (e.g. "Done!") is indistinguishable here from an ack. So when
+ * such an answer arrives AFTER an ack has already pinged this turn, it
+ * classifies as an ack and its ping is suppressed (and post-answer
+ * housekeeping after it still re-opens the feed). PR-2's slot-ownership
+ * upgrade does NOT rescue this case — the upgrade only fires for a
+ * *substantive* answer, and this answer reads as non-substantive by the
+ * ≥200-char test. That is much rarer than the housekeeping-after-long-answer
+ * case this predicate protects, and the feed-reopen half is kill-switchable
+ * via `SWITCHROOM_FEED_REOPEN_AFTER_ACK=0`.
  */
 export function isSubstantiveFinalReply(input: FinalAnswerReplyInput): boolean {
   if (input.done === true) return true

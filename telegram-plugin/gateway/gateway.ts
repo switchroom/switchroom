@@ -7698,11 +7698,15 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     const turn = currentTurn
     if (turn != null) {
       const now = Date.now()
-      // Notification ownership (R8 / PR-2): classify on the MODEL's original
-      // intent (`modelDisableNotification`), not the possibly-downgraded
-      // `disableNotification`, mirroring the #2533 final-answer decoupling.
-      // `reply` carries no `done`, so substantiveness here is the ≥200-char
-      // length backstop.
+      // Notification ownership (R8 / PR-2): on the `reply` path,
+      // substantiveness is purely the ≥200-char (or `done`) backstop —
+      // `isSubstantiveFinalReply` is `done === true || text.length >= 200`
+      // and ignores the notification flag entirely. `reply` carries no
+      // `done`, so it reduces to the ≥200-char length test. We still pass
+      // `modelDisableNotification` (the MODEL's original intent, not the
+      // possibly-downgraded `disableNotification`) to mirror the #2533
+      // final-answer decoupling call shape, but that arg does NOT
+      // participate in classification here — it is inert on this path.
       const replySubstantive = isSubstantiveFinalReply({
         text: rawText,
         disableNotification: modelDisableNotification,
