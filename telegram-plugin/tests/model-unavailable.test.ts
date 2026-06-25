@@ -197,6 +197,19 @@ describe('detectModelUnavailable — time-only session-cap reset (Fix 2)', () =>
     expectWallClock(d?.resetAt, 'Australia/Melbourne', 17, 0)
   })
 
+  it('parses the "at"-prefixed form — "resets at 5pm (Australia/Melbourne)" (parity with wedge-watchdog parseWeeklyReset)', () => {
+    // wedge-watchdog's parseWeeklyReset time-only regex accepts an optional
+    // "(?:at\s+)?" token; this parser must accept the IDENTICAL grammar or the
+    // "at"-prefixed string falls through to the +7d weekly floor — the
+    // week-long-bench bug this PR exists to kill.
+    const d = detectModelUnavailable(
+      "You've hit your session limit · resets at 5pm (Australia/Melbourne)",
+    )
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'Australia/Melbourne', 17, 0)
+  })
+
   it('parses am times — "resets 8:50am (Australia/Melbourne)"', () => {
     const d = detectModelUnavailable("You've hit your limit · resets 8:50am (Australia/Melbourne)")
     expect(d?.kind).toBe('quota_exhausted')

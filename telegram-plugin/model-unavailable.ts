@@ -208,7 +208,7 @@ function parseResetTime(text: string, parseTimeNow: Date = new Date()): Date | u
   // negative lookahead `(?!...)` rejects a month name so a date-bearing
   // string can't fall into this time-only branch.
   const timeOnly = text.match(
-    /resets?\s+(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i,
+    /resets?\s+(?:at\s+)?(?!(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i,
   )
   if (timeOnly) {
     const d = resolveNextWallClock(

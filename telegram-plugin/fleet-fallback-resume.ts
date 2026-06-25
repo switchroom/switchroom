@@ -39,6 +39,12 @@
  *      repeated quota event) within the same window does NOT re-arm. Only ONE
  *      restart fires per swap. Without this a swap-storm could loop-restart the
  *      agent.
+ *      NOTE: this latch is IN-MEMORY and does NOT survive the self-restart it
+ *      arms — so it only dedups multiple swaps within a SINGLE process
+ *      lifetime; it cannot by itself bound a cross-restart loop. Cross-restart
+ *      loops are bounded separately, broker-side, by account exhaustion:
+ *      `markExhausted` persists across restarts, so once every spare is benched
+ *      the outcome becomes all-blocked, which does NOT restart.
  *   3. Staleness failsafe — an ancient interrupted turn is NOT resurrected. If
  *      the failed turn started longer ago than `maxAgeMs` (default 3h, matching
  *      the boot-resume RESUME_MAX_AGE_MS failsafe), `decide()` returns
@@ -55,9 +61,11 @@ export interface FleetFallbackResumeOptions {
   /** Time source (overridable in tests). */
   nowFn?: () => number;
   /** Cooldown after an armed resume during which a second swap will NOT
-   *  re-arm. Defends against a 429 storm loop-restarting the agent. Default
-   *  60s — comfortably longer than a restart + boot takes, so the in-flight
-   *  restart settles before another resume can arm. */
+   *  re-arm. Dedups a 429 storm WITHIN one process lifetime (this latch is
+   *  in-memory and does not survive the restart it arms — cross-restart loops
+   *  are bounded broker-side by persisted account exhaustion, not here).
+   *  Default 60s — comfortably longer than a restart + boot takes, so the
+   *  in-flight restart settles before another resume can arm. */
   singleFlightMs?: number;
 }
 
