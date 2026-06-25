@@ -134,3 +134,123 @@ export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   if (input.producer === 'narrative' && input.labeledToolCount === 0) return false
   return true
 }
+
+/**
+ * Injected dependencies for the lever-4 cross-turn history check (PR-4b).
+ *
+ * Passed in EXPLICITLY so `feed-open-gate.ts` stays sqlite-free — it does NOT
+ * import `history.js`, so the module (and its vitest suite) never transitively
+ * pulls in `bun:sqlite`. The gateway centralizes the wiring (the real
+ * `hasOutboundDeliveredSince` predicate + `HISTORY_ENABLED` + the substantive
+ * `FINAL_ANSWER_MIN_CHARS` floor) in one place (`emissionAuthorityFor`); tests
+ * inject the real history harness (`cross-turn-card-gate.test.ts`) or a stub.
+ */
+export interface FeedOpenGateDeps {
+  /** The represent-guard's delivered-since predicate (`history.ts`). Returns
+   *  true iff a ≥`minChars` outbound landed in `chatId`/`threadId` since
+   *  `sinceMs`. Injected so this module never imports `history.js`. */
+  hasOutboundDeliveredSince: (
+    chatId: string,
+    sinceMs: number,
+    threadId: number | null | undefined,
+    minChars: number,
+  ) => boolean
+  /** Whether history is enabled (the gateway's `HISTORY_ENABLED`). When false,
+   *  the cross-turn check short-circuits to false — exactly as the drain does. */
+  historyEnabled: boolean
+  /** The substantive 200-char floor (`FINAL_ANSWER_MIN_CHARS`) — an ack never
+   *  trips lever 4 (keeps #2141 green). */
+  finalAnswerMinChars: number
+}
+
+/**
+ * The per-turn surface the OPEN verdict reads. A structural subset of
+ * `CurrentTurn` — kept SEPARATE from the façade's minimal `EmissionTurnView`
+ * (which is scoped to the single-flight `activityInFlight` read) so neither
+ * leaks the other's concern. Mirrors the exact fields the drain's inline
+ * cross-turn computation + `mayOpenActivityCard` consult.
+ */
+export interface FeedOpenGateView {
+  /** Single in-place card transport id. `null` ⇒ the next drain would OPEN a
+   *  fresh card; non-null ⇒ an EDIT (never gated). */
+  activityMessageId: number | null
+  /** Sticky lever-1 latch (per-turn). */
+  finalAnswerEverDelivered: boolean
+  /** Surfaced tool steps this turn (lever-5 base case). */
+  labeledToolCount: number
+  /** Present ONLY on a cross-turn synthetic surface (represent / owed-reply).
+   *  Carries the obligation's `openedAt` as the delivered-since cutoff. A
+   *  foreground turn omits it, so lever 4 is inert there. */
+  crossTurnGate?: { sinceMs: number }
+  /** Chat the card targets (null ⇒ no history query). */
+  sessionChatId: string | null
+  /** Forum-topic thread, if any (scopes the delivered-since check). */
+  sessionThreadId?: number | null
+}
+
+/**
+ * Lever-4 cross-turn predicate — PURE, lifted VERBATIM from the inline
+ * computation `drainActivitySummary` ran in main (the OPEN branch). True iff
+ * this drain is about to OPEN a fresh card (`activityMessageId == null`) on a
+ * cross-turn synthetic surface (`crossTurnGate != null`) whose exchange already
+ * delivered a SUBSTANTIVE reply since the obligation was raised. Identical
+ * inputs ⇒ identical result to the drain's own (now-redundant) gate, so flag-ON
+ * and flag-OFF agree by construction.
+ */
+export function computeCrossTurnAnswerDelivered(
+  view: FeedOpenGateView,
+  deps: FeedOpenGateDeps,
+): boolean {
+  return (
+    view.activityMessageId == null
+    && view.crossTurnGate != null
+    && view.sessionChatId != null
+    && deps.historyEnabled
+    && deps.hasOutboundDeliveredSince(
+      view.sessionChatId,
+      view.crossTurnGate.sinceMs,
+      view.sessionThreadId,
+      deps.finalAnswerMinChars,
+    )
+  )
+}
+
+/** The OPEN-gate verdict for a turn view + producer (PR-4b). */
+export interface FeedOpenVerdict {
+  /** A card is already open (`activityMessageId != null`) ⇒ this drain EDITs,
+   *  which is NEVER gated. The façade applies unconditionally when `isOpen`. */
+  isOpen: boolean
+  /** Whether an OPEN would be allowed — the EXACT `mayOpenActivityCard(...)`
+   *  result the drain computes (lever 1 + lever 4 + lever 5). When `!isOpen`
+   *  and `!mayOpen`, the drain `break`s (refuses the OPEN); the façade skips
+   *  `apply()`. When `isOpen`, this is consulted only by the equivalence test. */
+  mayOpen: boolean
+}
+
+/**
+ * Compute the OPEN-gate verdict for a turn view + producer (PR-4b). PURE: wraps
+ * `mayOpenActivityCard` over `computeCrossTurnAnswerDelivered`, with history
+ * deps injected. Returns BOTH `isOpen` (is a card already open → EDIT, never
+ * gated) and `mayOpen` (the raw `mayOpenActivityCard` verdict).
+ *
+ * The façade relocates main's drain decision with this: main refuses (and
+ * `break`s) iff `activityMessageId == null && !mayOpenActivityCard(...)`, i.e.
+ * `!isOpen && !mayOpen`. So the façade calls `apply()` iff `isOpen || mayOpen`
+ * — exactly the cases main did NOT `break`. Same pure inputs ⇒ same verdict on
+ * flag-ON and flag-OFF, so no emitted message differs in either flag state.
+ */
+export function computeFeedOpenVerdict(
+  view: FeedOpenGateView,
+  producer: FeedOpenProducer,
+  deps: FeedOpenGateDeps,
+): FeedOpenVerdict {
+  const isOpen = view.activityMessageId != null
+  const crossTurnAnswerDelivered = computeCrossTurnAnswerDelivered(view, deps)
+  const mayOpen = mayOpenActivityCard({
+    producer,
+    finalAnswerEverDelivered: view.finalAnswerEverDelivered,
+    labeledToolCount: view.labeledToolCount,
+    crossTurnAnswerDelivered,
+  })
+  return { isOpen, mayOpen }
+}

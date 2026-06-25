@@ -80,8 +80,11 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
     return after.split(/\n  [A-Za-z]+[(<]/)[0] ?? after
   }
 
+  // PR-4b: `openOrEditCard` is DELIBERATELY dropped from this no-op loop — its
+  // enabled branch now GATES `apply()` behind the OPEN verdict (no longer an
+  // identical no-op). It gets a dedicated shape test below. The other three
+  // façade methods remain identical no-ops in both branches.
   for (const m of [
-    'openOrEditCard',
     'finalizeCard',
     'markSubstantiveFinalDelivered',
     'claimOrDowngradePing',
@@ -91,7 +94,7 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
       // The enabled branch is gated on the flag and, in PR-4a, just runs apply()
       // exactly like the disabled fall-through. Assert BOTH an
       // `if (EMISSION_AUTHORITY_ENABLED)` branch and a bare `apply()` exist, and
-      // that NO decision token has leaked into the façade yet.
+      // that NO decision token has leaked into these façade methods.
       expect(body).toMatch(/if\s*\(EMISSION_AUTHORITY_ENABLED\)/)
       const applyCalls = [...body.matchAll(/apply\(\)/g)]
       // One in the enabled branch, one in the disabled fall-through.
@@ -99,12 +102,14 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
     })
   }
 
-  it('no PR-4b decision token (mayOpenActivityCard / a card-open verdict) has moved into the façade', () => {
-    // PR-4a moves NO decision logic in. The OPEN gate stays in the drain;
-    // `mayOpenActivityCard` must NOT be CALLED or IMPORTED in the façade yet
-    // (a prose mention in a doc-comment is fine — it documents the future seam).
-    expect(facadeSrc).not.toMatch(/import .*mayOpenActivityCard/)
-    expect(facadeCode).not.toMatch(/mayOpenActivityCard\(/)
+  it('no decision token leaked into the no-op façade methods (only openOrEditCard gates in PR-4b)', () => {
+    // The three remaining no-op methods (finalize / markSubstantive / overping)
+    // move NO decision logic in. Only `openOrEditCard` consults a verdict — and
+    // it does so ONLY inside its EMISSION_AUTHORITY_ENABLED branch (asserted in
+    // the dedicated describe below). `decideOverPing` must NOT be CALLED/IMPORTED
+    // in the façade (a prose mention in a doc-comment is fine).
+    expect(facadeSrc).not.toMatch(/import .*decideOverPing/)
+    expect(facadeCode).not.toMatch(/decideOverPing\(/)
   })
 
   it('mayDrain is a PURE READ — returns activityInFlight == null, acquires no lock', () => {
@@ -118,6 +123,49 @@ describe('façade is a no-op in PR-4a — both kill-switch branches delegate ide
   it('the PR-4d deadlock invariant is documented verbatim-ish in the module header', () => {
     expect(facadeSrc).toMatch(/mayDrain` is a (pure|PURE) read/i)
     expect(facadeSrc).toMatch(/must NOT acquire `chatLock`/)
+  })
+})
+
+describe('openOrEditCard — PR-4b OPEN-gate moves into the façade (inverts the 4a no-op proof for this method)', () => {
+  /** Body of `openOrEditCard` up to the next method declaration / class close. */
+  function openOrEditBody(): string {
+    const after = facadeSrc.split('openOrEditCard(')[1] ?? ''
+    return after.split(/\n  [A-Za-z]+[(<]/)[0] ?? after
+  }
+
+  it('the façade NOW imports + consults the open verdict (computeFeedOpenVerdict) — inverted from PR-4a', () => {
+    // PR-4a asserted NO decision token had moved in. PR-4b INVERTS that for the
+    // OPEN gate: the verdict helper is imported and CALLED in the façade.
+    expect(facadeSrc).toMatch(/import\s*\{[^}]*computeFeedOpenVerdict[^}]*\}\s*from\s*'\.\/feed-open-gate\.js'/)
+    expect(facadeCode).toMatch(/computeFeedOpenVerdict\(/)
+  })
+
+  it('the verdict is consulted ONLY inside the EMISSION_AUTHORITY_ENABLED branch (disabled branch stays a pure pass-through)', () => {
+    const body = openOrEditBody()
+    const flagIdx = body.indexOf('if (EMISSION_AUTHORITY_ENABLED)')
+    const verdictIdx = body.indexOf('computeFeedOpenVerdict(')
+    expect(flagIdx).toBeGreaterThan(-1)
+    expect(verdictIdx).toBeGreaterThan(-1)
+    // The verdict call sits AFTER the enabled-branch guard opens.
+    expect(verdictIdx).toBeGreaterThan(flagIdx)
+    // The DISABLED fall-through (after the enabled branch returns) is a bare
+    // apply() with no verdict: the LAST statement of the method is `apply()` and
+    // there is no second computeFeedOpenVerdict call outside the enabled branch.
+    const verdictCalls = [...body.matchAll(/computeFeedOpenVerdict\(/g)]
+    expect(verdictCalls).toHaveLength(1)
+  })
+
+  it('enabled branch GUARDS apply() behind the verdict; disabled branch calls apply() UNCONDITIONALLY', () => {
+    const body = openOrEditBody()
+    // Enabled branch: a refusal returns BEFORE apply() when the OPEN is refused
+    // (the relocated `break`). The guard keys on the verdict's isOpen/mayOpen.
+    expect(body).toMatch(/if\s*\(!isOpen\s*&&\s*!mayOpen\)\s*return/)
+    // Both isOpen and mayOpen come from the destructured verdict.
+    expect(body).toMatch(/const\s*\{\s*isOpen,\s*mayOpen\s*\}\s*=\s*computeFeedOpenVerdict\(/)
+    // Disabled branch: after the enabled branch returns, the method falls
+    // through to an unconditional `apply()` then the method `}` — 4a behaviour
+    // preserved when the flag is OFF (no verdict consulted on this path).
+    expect(body).toMatch(/return\s*\n\s*\}\s*\n\s*apply\(\)\s*\n\s*\}/)
   })
 })
 

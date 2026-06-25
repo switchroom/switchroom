@@ -335,7 +335,12 @@ import { purgeStaleTurnsForChat } from './turn-state-purge.js'
 import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
 import { decideFeedReopen } from './feed-reopen-gate.js'
-import { mayOpenActivityCard, type FeedOpenProducer } from './feed-open-gate.js'
+import {
+  mayOpenActivityCard,
+  computeCrossTurnAnswerDelivered,
+  type FeedOpenProducer,
+  type FeedOpenGateDeps,
+} from './feed-open-gate.js'
 import { EmissionAuthority } from './emission-authority.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
@@ -2160,7 +2165,31 @@ function emissionAuthorityFor(turn: CurrentTurn): EmissionAuthority {
       statusKey(turn.sessionChatId, turn.sessionThreadId),
     )
   }
+  // PR-4b — CENTRALIZE the OPEN-gate wiring here, the single accessor every
+  // routed call site already funnels through, so all 6 `openOrEditCard(...)`
+  // sites stay byte-identical `(producer, apply)`. The façade reads the LIVE
+  // turn view (a thunk — the card id / latch / tool-count mutate during the
+  // turn) + the injected history deps from this one place, not per-call.
+  // Idempotent; harmless under the flag OFF (the disabled branch never reads
+  // it). The turn IS a structural `FeedOpenGateView`.
+  turn.emissionAuthority.wireFeedOpenGate(() => turn, feedOpenGateDeps())
   return turn.emissionAuthority
+}
+
+/**
+ * The injected history dependencies the PR-4b OPEN gate needs (the real
+ * `hasOutboundDeliveredSince` predicate + `HISTORY_ENABLED` + the substantive
+ * `FINAL_ANSWER_MIN_CHARS` floor). Centralized so both the façade's enabled
+ * branch AND the drain's own (now-redundant) inline gate consume the SAME deps
+ * via the SAME pure helpers — flag-ON and flag-OFF cannot diverge. Keeps
+ * `feed-open-gate.ts` sqlite-free (it never imports `history.js`).
+ */
+function feedOpenGateDeps(): FeedOpenGateDeps {
+  return {
+    hasOutboundDeliveredSince,
+    historyEnabled: HISTORY_ENABLED,
+    finalAnswerMinChars: FINAL_ANSWER_MIN_CHARS,
+  }
 }
 
 // Component 3 (turn-origin reply routing). Recently-ended turns retained
@@ -10536,17 +10565,16 @@ async function drainActivitySummary(
       // null) AND only for a turn with a cross-turn gate — no history query on
       // the common foreground path. Scoped to the synthetic surface by the
       // presence of `crossTurnGate`, so it can never fire on a foreground turn.
-      const crossTurnAnswerDelivered =
-        turn.activityMessageId == null
-        && turn.crossTurnGate != null
-        && turn.sessionChatId != null
-        && HISTORY_ENABLED
-        && hasOutboundDeliveredSince(
-          turn.sessionChatId,
-          turn.crossTurnGate.sinceMs,
-          turn.sessionThreadId,
-          FINAL_ANSWER_MIN_CHARS,
-        )
+      // PR-4b: the cross-turn predicate is now the PURE, shared helper extracted
+      // into feed-open-gate.ts (body lifted verbatim) — the SAME function the
+      // emission-authority façade calls in its enabled branch, so flag-ON and
+      // flag-OFF compute an identical verdict. History deps injected (the module
+      // stays sqlite-free). The pure-gate consult + the `break` below stay
+      // LITERALLY in the drain (disabled-path byte-identity).
+      const crossTurnAnswerDelivered = computeCrossTurnAnswerDelivered(
+        turn,
+        feedOpenGateDeps(),
+      )
       if (
         turn.activityMessageId == null
         && !mayOpenActivityCard({

@@ -8,7 +8,14 @@ import {
   hasOutboundDeliveredSince,
   _resetForTests,
 } from '../history.js'
-import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
+import {
+  mayOpenActivityCard,
+  computeCrossTurnAnswerDelivered as realComputeCrossTurnAnswerDelivered,
+  computeFeedOpenVerdict,
+  type FeedOpenGateView,
+  type FeedOpenGateDeps,
+  type FeedOpenProducer,
+} from '../gateway/feed-open-gate.js'
 import { FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
 
 /**
@@ -51,9 +58,14 @@ afterEach(() => {
 })
 
 /**
- * Mirror the gateway's OPEN-branch computation for a synthetic represent turn:
- * `crossTurnGate.sinceMs` is the obligation's openedAt, the threshold is the
- * substantive 200-char floor. `aboutToOpen` models `activityMessageId == null`.
+ * PR-4b: drive the REAL extracted helper (`computeCrossTurnAnswerDelivered` in
+ * feed-open-gate.ts) — the same pure function the gateway drain AND the
+ * emission-authority façade now call — rather than a parallel local mirror.
+ * Maps this test's scenario shape onto the helper's `(view, deps)` signature:
+ * `aboutToOpen` ⇒ `activityMessageId == null`, `hasCrossTurnGate` ⇒ the
+ * `crossTurnGate` presence, `openedAt` ⇒ `crossTurnGate.sinceMs` (the
+ * obligation cutoff). Deps inject the SAME `hasOutboundDeliveredSince` predicate
+ * + the substantive 200-char floor the gateway centralizes.
  */
 function computeCrossTurnAnswerDelivered(opts: {
   aboutToOpen: boolean
@@ -61,10 +73,20 @@ function computeCrossTurnAnswerDelivered(opts: {
   openedAt: number
   threadId?: number
 }): boolean {
-  return (
-    opts.aboutToOpen
-    && opts.hasCrossTurnGate
-    && hasOutboundDeliveredSince(CHAT, opts.openedAt, opts.threadId, FINAL_ANSWER_MIN_CHARS)
+  return realComputeCrossTurnAnswerDelivered(
+    {
+      activityMessageId: opts.aboutToOpen ? null : 1,
+      finalAnswerEverDelivered: false,
+      labeledToolCount: 0,
+      crossTurnGate: opts.hasCrossTurnGate ? { sinceMs: opts.openedAt } : undefined,
+      sessionChatId: CHAT,
+      sessionThreadId: opts.threadId,
+    },
+    {
+      hasOutboundDeliveredSince,
+      historyEnabled: true,
+      finalAnswerMinChars: FINAL_ANSWER_MIN_CHARS,
+    },
   )
 }
 
@@ -327,4 +349,76 @@ describe('cross-turn card gate — synthetic represent turn AFTER a substantive 
     })
     expect(crossTurnAnswerDelivered).toBe(false)
   })
+})
+
+/**
+ * PR-4b verdict-equivalence — the CORE flag-parity proof at the pure layer.
+ *
+ * `computeFeedOpenVerdict` (the function the emission-authority façade calls in
+ * its enabled branch) MUST return exactly the same `mayOpen` a DIRECT
+ * `mayOpenActivityCard(...)` call would — over the full cross-product of every
+ * input that feeds the OPEN decision, against the REAL history DB. If these ever
+ * diverge, flag-ON would emit a different card set than flag-OFF, which is the
+ * one thing 4b must not do. `isOpen` must equal `activityMessageId != null`.
+ */
+describe('computeFeedOpenVerdict ≡ direct mayOpenActivityCard (full cross-product, real history)', () => {
+  const deps: FeedOpenGateDeps = {
+    hasOutboundDeliveredSince,
+    historyEnabled: true,
+    finalAnswerMinChars: FINAL_ANSWER_MIN_CHARS,
+  }
+  const OPENED_AT_MS = 1_000_000 * 1000
+
+  // crossTurnAnswerDelivered is driven by the DB row, not a raw boolean, so we
+  // seed each value: a substantive row (since openedAt) → true; no row → false.
+  for (const crossTurnTrue of [false, true]) {
+    for (const finalAnswerEverDelivered of [false, true]) {
+      for (const producer of ['narrative', 'tool', 'liveness'] as FeedOpenProducer[]) {
+        for (const labeledToolCount of [0, 1]) {
+          for (const activityMessageId of [null, 123] as (number | null)[]) {
+            const label =
+              `crossTurn=${crossTurnTrue} final=${finalAnswerEverDelivered} ` +
+              `producer=${producer} tools=${labeledToolCount} ` +
+              `msgId=${activityMessageId ?? 'null'}`
+            it(`matches direct mayOpenActivityCard — ${label}`, () => {
+              if (crossTurnTrue) {
+                // Seed a substantive answer AFTER the obligation openedAt so the
+                // real predicate returns true (only meaningful when about to OPEN
+                // on a gated cross-turn surface — exercised below).
+                recordOutbound({
+                  chat_id: CHAT,
+                  thread_id: null,
+                  message_ids: [42],
+                  texts: [SUBSTANTIVE],
+                  ts: 1_000_001,
+                })
+              }
+              // A cross-turn surface always carries the gate; the helper's own
+              // `activityMessageId == null` conjunct gates it to the OPEN case.
+              const view: FeedOpenGateView = {
+                activityMessageId,
+                finalAnswerEverDelivered,
+                labeledToolCount,
+                crossTurnGate: { sinceMs: OPENED_AT_MS },
+                sessionChatId: CHAT,
+                sessionThreadId: null,
+              }
+              const verdict = computeFeedOpenVerdict(view, producer, deps)
+              // Recompute the cross-turn flag the SAME way the helper does, then
+              // call mayOpenActivityCard directly — the oracle.
+              const crossTurnAnswerDelivered = realComputeCrossTurnAnswerDelivered(view, deps)
+              const direct = mayOpenActivityCard({
+                producer,
+                finalAnswerEverDelivered,
+                labeledToolCount,
+                crossTurnAnswerDelivered,
+              })
+              expect(verdict.mayOpen).toBe(direct)
+              expect(verdict.isOpen).toBe(activityMessageId != null)
+            })
+          }
+        }
+      }
+    }
+  }
 })
