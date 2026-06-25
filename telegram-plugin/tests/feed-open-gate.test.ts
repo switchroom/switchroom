@@ -106,3 +106,85 @@ describe('mayOpenActivityCard — lever 1 (no OPEN after a substantive final)', 
     ).toBe(true)
   })
 })
+
+describe('mayOpenActivityCard — lever 4 (no OPEN below an EARLIER turn answer; race C/D)', () => {
+  // The cross-turn case: a synthetic represent/owed-reply turn starts with a
+  // CLEARED per-turn `finalAnswerEverDelivered` latch even though a substantive
+  // answer already reached the user in a PRIOR turn. The caller computes
+  // `crossTurnAnswerDelivered` (via hasOutboundDeliveredSince, obligation
+  // openedAt cutoff, 200-char substantive threshold) and passes it here.
+
+  it('blocks a tool-label OPEN when a substantive answer was already delivered cross-turn', () => {
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false, // fresh synthetic turn — its own latch is clear
+        labeledToolCount: 2,
+        crossTurnAnswerDelivered: true, // but the exchange already got an answer
+      }),
+    ).toBe(false)
+  })
+
+  it('blocks a liveness/heartbeat OPEN cross-turn (the heartbeat surface on the synthetic turn)', () => {
+    expect(
+      mayOpenActivityCard({
+        producer: 'liveness',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 0,
+        crossTurnAnswerDelivered: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('blocks a narrative OPEN cross-turn', () => {
+    expect(
+      mayOpenActivityCard({
+        producer: 'narrative',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 3,
+        crossTurnAnswerDelivered: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('does NOT block when the obligation is genuinely unanswered (no substantive reply since it was raised) — represent still surfaces', () => {
+    // The inverse / no-regression: an obligation with NO delivered answer since
+    // it was raised → crossTurnAnswerDelivered false → the represent turn's card
+    // opens as normal. (The represent SEND itself is owned by the represent
+    // guard, not this gate; this asserts the gate does not over-suppress.)
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 1,
+        crossTurnAnswerDelivered: false,
+      }),
+    ).toBe(true)
+  })
+
+  it('is inert on a normal foreground turn (crossTurnAnswerDelivered omitted/false)', () => {
+    // A foreground turn never carries the cross-turn gate, so the caller passes
+    // false/undefined and lever 4 cannot affect it — the foreground card opens.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 1,
+      }),
+    ).toBe(true)
+  })
+
+  it('does NOT regress #2141: an ack-then-work cross-turn surface with no SUBSTANTIVE reply still opens', () => {
+    // crossTurnAnswerDelivered keys on SUBSTANTIVE (≥200-char) delivery. An ack
+    // ("On it…") is not substantive, so the caller computes false and the
+    // ack-then-work feed still opens.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: false,
+        labeledToolCount: 1,
+        crossTurnAnswerDelivered: false,
+      }),
+    ).toBe(true)
+  })
+})

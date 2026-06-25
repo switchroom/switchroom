@@ -19,6 +19,7 @@ import {
   decideMidTurnFloor,
   decideTerminalReason,
   midTurnFloorEnabled,
+  parsePostAnswerLivenessMs,
   DEFAULT_FLOOR_THRESHOLD_MS,
   type MidTurnFloorInput,
 } from '../turn-liveness-floor.js'
@@ -166,5 +167,30 @@ describe('midTurnFloorEnabled — default-on kill switch', () => {
       process.env[KEY] = v
       expect(midTurnFloorEnabled()).toBe(true)
     }
+  })
+})
+
+describe('parsePostAnswerLivenessMs — PR1 Item-3a DORMANT escape hatch (default OFF)', () => {
+  // The load-bearing contract: UNSET ⇒ 0 ⇒ behaviour byte-identical to today
+  // (the guarded post-answer branch in feedHeartbeatTick is dead). No surface
+  // ships enabled in this PR; this only pins that nothing changes by default.
+  it('UNSET (undefined) ⇒ 0 — exactly today’s silent post-answer behaviour', () => {
+    expect(parsePostAnswerLivenessMs(undefined)).toBe(0)
+  })
+
+  it('empty / whitespace / non-numeric ⇒ 0 (dormant)', () => {
+    expect(parsePostAnswerLivenessMs('')).toBe(0)
+    expect(parsePostAnswerLivenessMs('   ')).toBe(0)
+    expect(parsePostAnswerLivenessMs('nope')).toBe(0)
+  })
+
+  it('0 and negative ⇒ 0 (dormant — never enables a post-answer surface)', () => {
+    expect(parsePostAnswerLivenessMs('0')).toBe(0)
+    expect(parsePostAnswerLivenessMs('-5000')).toBe(0)
+  })
+
+  it('a positive integer ⇒ that threshold in ms (the opt-in future surface)', () => {
+    expect(parsePostAnswerLivenessMs('8000')).toBe(8000)
+    expect(parsePostAnswerLivenessMs('45000')).toBe(45000)
   })
 })
