@@ -346,6 +346,7 @@ import {
   EMISSION_AUTHORITY_ENABLED,
   type CardDrainGateCtx,
 } from './emission-authority.js'
+import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -2154,7 +2155,64 @@ type CurrentTurn = {
   emissionAuthority?: EmissionAuthority
 }
 
+// PR-4e — the singleton `currentTurn` is RETAINED as (a) the flag-OFF store and
+// (b) the flag-ON "most-recent-set" MIRROR. Every GLOBAL-liveness read in this
+// file (`isBusy`, the `if (currentTurn != null) return` poke guards, the
+// orphaned-reply guard, the synchronous-to-live-turn `const turn = currentTurn`
+// captures) keeps reading this variable, so under the sequential-CLI invariant
+// (the most-recently-set turn IS the live turn) those reads stay byte-identical.
+// The per-topic isolation lives in `currentTurnMap.byKey`: a LATE async event
+// captured for topic A resolves A's authority by ITS OWN key even after the live
+// turn flipped to topic B (see current-turn-map.ts). Under the flag OFF the map
+// is never written and this is exactly the old singleton.
 let currentTurn: CurrentTurn | null = null
+const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
+
+/**
+ * Set the live turn for `key`. Flag-branches in ONE place (inside the map):
+ * flag-OFF assigns the singleton only; flag-ON sets the per-topic entry AND
+ * updates the most-recent mirror. We keep the module-scope `currentTurn`
+ * variable in lock-step with the map's mirror so the 140 unchanged global reads
+ * see the same value.
+ */
+function setCurrentTurn(turn: CurrentTurn, key: string): void {
+  currentTurnMap.set(turn, key)
+  currentTurn = currentTurnMap.get() // mirror most-recent-set (== `turn`)
+}
+
+/**
+ * End (delete) the live turn for `key`, iff `key` still maps to `turn`. Routes
+ * the clear through the keyed accessor (leak-close-at-origin) and re-syncs the
+ * module-scope mirror to the map's mirror.
+ */
+function endCurrentTurnForKey(turn: CurrentTurn, key: string): boolean {
+  const ended = currentTurnMap.endTurnForKey(turn, key)
+  currentTurn = currentTurnMap.get() // re-sync mirror (null iff it pointed at turn)
+  return ended
+}
+
+/**
+ * Clear the ENTIRE per-topic store + mirror (disconnect-flush / bridge-died:
+ * every entry is a ghost).
+ */
+function clearAllCurrentTurns(): void {
+  currentTurnMap.clearAll()
+  currentTurn = null
+}
+
+/**
+ * Is `turn` still the live turn FOR ITS OWN topic? Flag-OFF: `currentTurn ===
+ * turn` (the ambient check, verbatim). Flag-ON: `byKey.get(turn'sKey) === turn`,
+ * so a B-flip never falsifies A's own liveness. The callsites keep the literal
+ * `currentTurn === turn` in source (the silence-liveness-wiring oracle) by
+ * inlining the flag-OFF branch and delegating the flag-ON branch here.
+ */
+function turnLiveForItsTopic(turn: CurrentTurn): boolean {
+  return currentTurnMap.isLiveForKey(
+    turn,
+    statusKey(turn.sessionChatId, turn.sessionThreadId),
+  )
+}
 
 /**
  * Accessor for a turn's per-foreground-turn emission-authority façade (PR-4a).
@@ -2342,7 +2400,22 @@ function deriveTurnId(
  */
 function findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null {
   if (originTurnId == null || originTurnId === '') return null
-  if (currentTurn != null && currentTurn.turnId === originTurnId) return currentTurn
+  // PR-4e — resolve the LIVE turn by ITS OWN topic key under the flag. The
+  // turnId encodes the key: `deriveTurnId` builds `${chatKey}#${messageId}`, so
+  // the substring before `#` IS the statusKey. Flag-ON does an O(1)
+  // `byKey.get(key)` and matches on turnId — so a reply whose origin turn is
+  // STILL live for topic A resolves A even after the singleton mirror flipped to
+  // B. Flag-OFF keeps the singleton check, verbatim. The recentTurnsById
+  // registry fallback is UNCHANGED in both branches.
+  if (EMISSION_AUTHORITY_ENABLED) {
+    const hashIdx = originTurnId.indexOf('#')
+    if (hashIdx > 0) {
+      const live = currentTurnMap.get(originTurnId.slice(0, hashIdx))
+      if (live != null && live.turnId === originTurnId) return live
+    }
+  } else if (currentTurn != null && currentTurn.turnId === originTurnId) {
+    return currentTurn
+  }
   return recentTurnsById.get(originTurnId) ?? null
 }
 
@@ -2769,6 +2842,16 @@ const preambleSuppressor = new PreambleSuppressor({
     // long-lived and flushes can occur outside any session-event
     // handler's scope. If the turn has been cleared, the update is
     // dropped (no chat to send to, no stream to mutate).
+    //
+    // PR-4e — the module-scope suppressor carries NO per-topic key (it is a
+    // single global instance reset/flushed per turn), so there is no key to
+    // scope by here: the correct resolution under BOTH flag states is the
+    // most-recent-set live turn — exactly the singleton mirror `currentTurn`.
+    // The per-turn `reset()` / `flushNow()` / `dropNow()` lifecycle (driven from
+    // the live turn's own handlers) keeps the suppressor aligned with whichever
+    // topic is currently live, so the mirror read is byte-identical to base and
+    // cannot leak A's answer text into B (a flush for A runs while A is still the
+    // most-recent turn; once B flips, A's stream is already force-superseded).
     const stream = currentTurn?.answerStream ?? null
     if (stream != null) stream.update(cumulative)
   },
@@ -3186,8 +3269,16 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
  * gone — handlers that already purge elsewhere are unharmed.
  */
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
-  if (currentTurn !== turn) return
-  currentTurn = null
+  // PR-4e — keyed liveness + keyed clear (leak-close-at-origin). Flag-OFF: the
+  // guard is `currentTurn === turn` and the clear nulls the singleton, verbatim.
+  // Flag-ON: the guard becomes `byKey.get(turn'sKey) === turn` (so a flip to
+  // another topic doesn't spuriously short-circuit THIS topic's teardown) and
+  // the clear does `byKey.delete(key)` + nulls the mirror iff it still points at
+  // `turn`. `endCurrentTurnForKey` returns false (no delete) when the entry no
+  // longer matches — the same early-return semantics as the old `!== turn` guard.
+  const key = statusKey(turn.sessionChatId, turn.sessionThreadId)
+  if (!turnLiveForItsTopic(turn)) return
+  endCurrentTurnForKey(turn, key) // currentTurnByKey.delete(key) + mirror clear
   // Status-surface observability: one line at every turn CLEAR (with how far
   // the turn got), plus a DEGRADED warning when the turn did tool work but the
   // live feed never opened because its sends failed (the resume-400 signature).
@@ -5821,13 +5912,31 @@ silencePoke.startTimer({
         return sib == null || sib >= silencePoke.DEFAULT_THRESHOLDS.fallback
       },
     )
+    // PR-4e self-heal backstop: drop any per-topic `currentTurnByKey` entries
+    // for fbChatId whose turn is stale-by-the-same-silence-gate the sibling
+    // sweep above used — the same precedent as `purgeStaleTurnsForChat`'s
+    // activeTurnStartedAt sweep, so a leaked map entry (a turn whose keyed
+    // delete somehow never ran) can never outlive its chat. Gated identically:
+    // the firing key is always stale; a sibling is stale iff it's silent ≥ the
+    // fallback threshold (or has no silence state). No-op under the flag OFF
+    // (the map is empty).
+    currentTurnMap.purgeChatStale(fbChatId, (siblingKey) => {
+      if (siblingKey === fbKey) return true
+      const sib = silencePoke.silenceMsForKey(siblingKey, fbNow)
+      return sib == null || sib >= silencePoke.DEFAULT_THRESHOLDS.fallback
+    })
     // Null `currentTurn` if it's still pointing at the wedged turn —
     // when claude eventually fires a late `turn_end` for this session
     // (or never does), the handler's `const turn = currentTurn` snapshot
     // returns null and the regular teardown short-circuits. Without
     // this, the late event would re-emit `turn_ended` AND clobber
     // whatever fresh turn the next inbound started.
-    if (turnMatchesFallback && currentTurn === wedgedTurn && wedgedTurn != null) {
+    // PR-4e — keyed liveness for the guard. Flag-OFF: `turnLiveForItsTopic`
+    // reduces to `currentTurn === wedgedTurn` (singleton mirror), verbatim.
+    // Flag-ON: `byKey.get(fbKey) === wedgedTurn`, so the keyed delete still
+    // fires when the LIVE mirror has already flipped to another topic B (a bare
+    // `currentTurn === wedgedTurn` would falsely skip and leak A's byKey entry).
+    if (turnMatchesFallback && wedgedTurn != null && turnLiveForItsTopic(wedgedTurn)) {
       // Status-surface observability: emit the lifecycle CLEAR for the
       // silence-poke teardown so a fallback-nulled turn has a turn-lifecycle
       // line like every other clear path (the framework-fallback line below is
@@ -5835,7 +5944,12 @@ silencePoke.startTimer({
       process.stderr.write(
         `telegram gateway: ${formatTurnLifecycle('clear', 'silence_fallback', wedgedTurn, Date.now())}\n`,
       )
-      currentTurn = null
+      // PR-4e — keyed delete for the wedged turn's OWN key (fbKey == the
+      // statusKey this fallback fired for, == the wedgedTurn's key since
+      // turnMatchesFallback gated chat+thread equality). Flag-OFF nulls the
+      // singleton, verbatim; flag-ON deletes only this topic's entry and clears
+      // the mirror iff it still points here — a live sibling topic is untouched.
+      endCurrentTurnForKey(wedgedTurn, fbKey)
     }
     // Best-effort: clear any pending silent-end marker so the Stop hook
     // doesn't double-block when claude eventually exits the wedged turn.
@@ -6609,7 +6723,10 @@ const ipcServer: IpcServer = createIpcServer({
           process.stderr.write(
             `telegram gateway: disconnect-flush nulled currentTurn (bridge died with turn in flight)\n`,
           )
-          currentTurn = null
+          // PR-4e — the bridge DIED with a turn in flight: EVERY per-topic entry
+          // is a ghost, not just the mirror's. Clear the whole map + mirror.
+          // Flag-OFF: this nulls the singleton only (the map is empty), verbatim.
+          clearAllCurrentTurns()
         }
       },
       log: (msg) => process.stderr.write(`${msg}\n`),
@@ -11024,7 +11141,11 @@ function handleSessionEvent(ev: SessionEvent): void {
             statusKey(ev.chatId, enqThreadIdNum),
           ),
         }
-        currentTurn = next
+        // PR-4e — route the turn-SET through the keyed accessor: flag-OFF assigns
+        // the singleton (byte-identical to `currentTurn = next`); flag-ON sets the
+        // per-topic `byKey[statusKey]` entry AND the most-recent mirror. The key is
+        // the SAME statusKey the ctor's façade was constructed with just above.
+        setCurrentTurn(next, statusKey(ev.chatId, enqThreadIdNum))
         markIdleActivity() // any turn start (main session) is activity — re-arm idle clear
         // Status-surface observability: one line at every turn SET so a later
         // dark card is traceable to which turn/topic key it belonged to.
@@ -11318,7 +11439,14 @@ function handleSessionEvent(ev: SessionEvent): void {
         // and would falsely reset the clock forever on a hung-mid-tool turn,
         // reintroducing the #1556 dangling-turn wedge. Only the model emitting a
         // fresh label reaches here.
-        if (SILENCE_LIVENESS_PRODUCTION && currentTurn === turn) {
+        // PR-4e — keyed liveness under the flag. Flag-OFF keeps the literal
+        // `currentTurn === turn` (a late tool-label for topic A must reset A's
+        // silence clock, not topic B's); flag-ON resolves A by ITS OWN key so a
+        // flip to B doesn't falsify A's liveness here.
+        if (
+          SILENCE_LIVENESS_PRODUCTION &&
+          (EMISSION_AUTHORITY_ENABLED ? turnLiveForItsTopic(turn) : currentTurn === turn)
+        ) {
           silencePoke.noteProduction(statusKey(turn.sessionChatId, turn.sessionThreadId), Date.now())
         }
         // Recompose so any active foreground sub-agent's nested block (Model A)
@@ -11482,7 +11610,11 @@ function handleSessionEvent(ev: SessionEvent): void {
             // skip the tick (the new turn has its own answer stream).
             onMetric: (metricEv) => {
               logStreamingEvent(metricEv)
-              if (currentTurn === turn) {
+              // PR-4e — keyed liveness under the flag. Flag-OFF keeps the literal
+              // `currentTurn === turn` (a draft-update metric for topic A's stream
+              // must tick A's signal/silence clock); flag-ON resolves A by its own
+              // key so a flip to B doesn't skip A's tick.
+              if (EMISSION_AUTHORITY_ENABLED ? turnLiveForItsTopic(turn) : currentTurn === turn) {
                 signalTracker.noteSignal(
                   statusKey(turn.sessionChatId, turn.sessionThreadId),
                   Date.now(),
@@ -23464,7 +23596,14 @@ void (async () => {
                     // the 300s framework fallback (and the #2527 mid-turn floor)
                     // measure silence against a turn that is visibly working,
                     // risking a premature tear-down / unwanted liveness beat.
-                    if (SILENCE_LIVENESS_PRODUCTION && currentTurn === turn) {
+                    // PR-4e — keyed liveness under the flag (a foreground
+                    // sub-agent's nested render for topic A is A's production).
+                    // Flag-OFF keeps the literal `currentTurn === turn`; flag-ON
+                    // resolves A by its own key.
+                    if (
+                      SILENCE_LIVENESS_PRODUCTION &&
+                      (EMISSION_AUTHORITY_ENABLED ? turnLiveForItsTopic(turn) : currentTurn === turn)
+                    ) {
                       silencePoke.noteProduction(statusKey(turn.sessionChatId, turn.sessionThreadId), Date.now())
                     }
                   }
