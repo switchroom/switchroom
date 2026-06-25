@@ -336,6 +336,7 @@ import { decideInboundDelivery } from './inbound-delivery-gate.js'
 import { mayDrainBufferedInbound, shouldArmNoReplyDrain } from './serialize-drain-gate.js'
 import { decideFeedReopen } from './feed-reopen-gate.js'
 import { mayOpenActivityCard, type FeedOpenProducer } from './feed-open-gate.js'
+import { EmissionAuthority } from './emission-authority.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
 import {
   createDeliveryQueue,
@@ -2133,9 +2134,34 @@ type CurrentTurn = {
   // gates on minInitialChars). Materialized and cleared at turn_end.
   answerStream: AnswerStreamHandle | null
   isDm: boolean
+  // PR-4a (message-emission-determinism, `emission-authority.ts`). The
+  // per-foreground-turn emission-authority façade the foreground-lane card/ping
+  // emission call sites route through. Constructed ONCE per turn in the ctor
+  // with the chat/thread key passed in explicitly (the PR-4e seam). Per-turn
+  // only — a fresh `CurrentTurn` literal gets a fresh façade, so it never
+  // persists across turns. Optional in the type so the bounded recently-ended
+  // registry's older entries (and any hand-built test turn) tolerate its
+  // absence; `emissionAuthorityFor` lazily backfills one when missing.
+  emissionAuthority?: EmissionAuthority
 }
 
 let currentTurn: CurrentTurn | null = null
+
+/**
+ * Accessor for a turn's per-foreground-turn emission-authority façade (PR-4a).
+ * Returns the façade constructed at the turn ctor; lazily backfills one (keyed
+ * on the turn's chat/thread) for any turn that predates the field or was built
+ * outside the ctor. Per-turn: the memoized instance lives on the turn object,
+ * so it is discarded with the turn and never persists across turns.
+ */
+function emissionAuthorityFor(turn: CurrentTurn): EmissionAuthority {
+  if (turn.emissionAuthority == null) {
+    turn.emissionAuthority = new EmissionAuthority(
+      statusKey(turn.sessionChatId, turn.sessionThreadId),
+    )
+  }
+  return turn.emissionAuthority
+}
 
 // Component 3 (turn-origin reply routing). Recently-ended turns retained
 // by `turnId` so a LATE reply (the Brevo answer landing ~42s after
@@ -7780,45 +7806,55 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         text: rawText,
         disableNotification: modelDisableNotification,
       })
-      const decision = decideOverPing({
-        modelRequestedPing: !disableNotification,
-        firstPingAt: turn.firstPingAt,
-        substantive: replySubstantive,
-        firstPingWasSubstantive: turn.firstPingWasSubstantive,
-        nowMs: now,
-      })
-      if (decision.suppress) {
-        process.stderr.write(
-          `telegram gateway: reply over-ping safety net — ` +
-          `downgrading disable_notification:false → true ` +
-          `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
-          `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${decision.sinceFirstPingMs})\n`,
-        )
-        // Observability: surface to the unified runtime-metrics
-        // fan-out so the cadence dashboard can track fleet-wide
-        // over-ping rate (leading indicator of model pacing drift).
-        emitRuntimeMetric({
-          kind: 'over_ping_suppressed',
-          key: statusKey(chat_id, args.message_thread_id != null
-            ? Number(args.message_thread_id) : undefined),
-          sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
-        })
-        disableNotification = true
-        wasOverPingSuppressed = true
-      } else if (decision.claimSlot) {
-        // Claim (first ping) OR upgrade (substantive answer pinging over an
-        // ack's slot). Set firstPingAt AND firstPingWasSubstantive ATOMICALLY
-        // (no await between) so a racing second reply reads a consistent pair.
-        turn.firstPingAt = now
-        turn.firstPingWasSubstantive = replySubstantive
-        if (decision.upgrade) {
-          process.stderr.write(
-            `telegram gateway: reply over-ping safety net — ` +
-            `UPGRADE: substantive answer pings over an ack's slot ` +
-            `(chat=${chat_id} thread=${args.message_thread_id ?? '-'})\n`,
-          )
-        }
-      }
+      // PR-4a: routed through the emission-authority façade (no-op delegate —
+      // the `decideOverPing` decision, the stderr logs, the metric emit, the
+      // `firstPingAt`/`firstPingWasSubstantive` mutations, and the
+      // `disableNotification`/`wasOverPingSuppressed` outer-scope writes the
+      // send path consumes all run exactly as before, inside the delegate).
+      emissionAuthorityFor(turn).claimOrDowngradePing(
+        { modelRequestedPing: !disableNotification, substantive: replySubstantive },
+        () => {
+          const decision = decideOverPing({
+            modelRequestedPing: !disableNotification,
+            firstPingAt: turn.firstPingAt,
+            substantive: replySubstantive,
+            firstPingWasSubstantive: turn.firstPingWasSubstantive,
+            nowMs: now,
+          })
+          if (decision.suppress) {
+            process.stderr.write(
+              `telegram gateway: reply over-ping safety net — ` +
+              `downgrading disable_notification:false → true ` +
+              `(chat=${chat_id} thread=${args.message_thread_id ?? '-'} ` +
+              `firstPingAt=${turn.firstPingAt} sinceFirstPing_ms=${decision.sinceFirstPingMs})\n`,
+            )
+            // Observability: surface to the unified runtime-metrics
+            // fan-out so the cadence dashboard can track fleet-wide
+            // over-ping rate (leading indicator of model pacing drift).
+            emitRuntimeMetric({
+              kind: 'over_ping_suppressed',
+              key: statusKey(chat_id, args.message_thread_id != null
+                ? Number(args.message_thread_id) : undefined),
+              sinceFirstPingMs: decision.sinceFirstPingMs ?? 0,
+            })
+            disableNotification = true
+            wasOverPingSuppressed = true
+          } else if (decision.claimSlot) {
+            // Claim (first ping) OR upgrade (substantive answer pinging over an
+            // ack's slot). Set firstPingAt AND firstPingWasSubstantive ATOMICALLY
+            // (no await between) so a racing second reply reads a consistent pair.
+            turn.firstPingAt = now
+            turn.firstPingWasSubstantive = replySubstantive
+            if (decision.upgrade) {
+              process.stderr.write(
+                `telegram gateway: reply over-ping safety net — ` +
+                `UPGRADE: substantive answer pings over an ack's slot ` +
+                `(chat=${chat_id} thread=${args.message_thread_id ?? '-'})\n`,
+              )
+            }
+          }
+        },
+      )
     }
   }
 
@@ -8024,8 +8060,15 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       finalizeTurn != null
       && isSubstantiveFinalReply({ text: rawText, disableNotification: modelDisableNotification })
     ) {
-      finalizeTurn.finalAnswerEverDelivered = true
-      clearActivitySummary(finalizeTurn)
+      // PR-4a: routed through the emission-authority façade (no-op delegates —
+      // the latch-set and the finalize run exactly as before).
+      const ea = emissionAuthorityFor(finalizeTurn)
+      ea.markSubstantiveFinalDelivered(() => {
+        finalizeTurn.finalAnswerEverDelivered = true
+      })
+      ea.finalizeCard(() => {
+        clearActivitySummary(finalizeTurn)
+      })
     }
   }
 
@@ -8744,8 +8787,15 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       done: args.done === true,
     })
   ) {
-    turn.finalAnswerEverDelivered = true
-    clearActivitySummary(turn)
+    // PR-4a: routed through the emission-authority façade (no-op delegates —
+    // the latch-set and the finalize run exactly as before).
+    const ea = emissionAuthorityFor(turn)
+    ea.markSubstantiveFinalDelivered(() => {
+      turn.finalAnswerEverDelivered = true
+    })
+    ea.finalizeCard(() => {
+      clearActivitySummary(turn)
+    })
   }
 
   const result = await handleStreamReply(
@@ -10365,13 +10415,17 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
   const rendered = appendActivityLabel(turn.mirrorLines, clipNarrative(text))
   if (rendered == null) return
   turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
-  if (turn.activityInFlight == null) {
+  const ea = emissionAuthorityFor(turn)
+  if (ea.mayDrain(turn)) {
     // Producer A (narrative SHOW): may only EDIT an already-open card, never
     // OPEN one on a 0-tool turn (design §9 lever 5 base case — the
     // triplication). The OPEN gate in the drain enforces this; accumulation
     // into mirrorLines still happens so the narration renders once a tool
     // label or liveness opens the card.
-    turn.activityInFlight = drainActivitySummary(turn, 'narrative')
+    // PR-4a: routed through the emission-authority façade (no-op delegate).
+    ea.openOrEditCard('narrative', () => {
+      turn.activityInFlight = drainActivitySummary(turn, 'narrative')
+    })
   }
 }
 
@@ -10616,11 +10670,15 @@ function feedHeartbeatTick(): void {
     const rendered = renderActivityFeedWithNested(['Working…'], [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
     if (rendered == null) return
     turn.activityPendingRender = rendered
-    if (turn.activityInFlight == null) {
+    const ea = emissionAuthorityFor(turn)
+    if (ea.mayDrain(turn)) {
       // Producer C (liveness timer): the genuine ≥12s thinking-gap open. This
       // is the ONE producer that may OPEN a 0-tool card (design §9 lever 5
       // preserves it). The sticky-latch (lever 1) still gates it in the drain.
-      turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+      // PR-4a: routed through the emission-authority façade (no-op delegate).
+      ea.openOrEditCard('liveness', () => {
+        turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+      })
     }
     return
   }
@@ -10633,10 +10691,14 @@ function feedHeartbeatTick(): void {
   const rendered = composeTurnActivity(turn, false, ` · ${formatFeedElapsed(elapsed)}`)
   if (rendered == null) return
   turn.activityPendingRender = rendered
-  if (turn.activityInFlight == null) {
+  const ea = emissionAuthorityFor(turn)
+  if (ea.mayDrain(turn)) {
     // Maintains an already-open card (guarded above on activityMessageId !=
     // null) → only ever EDITs. 'liveness' is correct either way.
-    turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+    // PR-4a: routed through the emission-authority façade (no-op delegate).
+    ea.openOrEditCard('liveness', () => {
+      turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+    })
   }
 }
 if (!STATIC && FEED_HEARTBEAT_ENABLED) {
@@ -10834,6 +10896,13 @@ function handleSessionEvent(ev: SessionEvent): void {
           foregroundSubAgents: new Map(),
           answerStream: null,
           isDm: isDmChatId(ev.chatId),
+          // PR-4a — construct ONE emission-authority façade per turn, passing
+          // the chat/thread key in EXPLICITLY (the PR-4e seam; today equal to
+          // the singleton-sourced key). Per-turn: born with this turn literal,
+          // discarded with it — never persists across turns.
+          emissionAuthority: new EmissionAuthority(
+            statusKey(ev.chatId, enqThreadIdNum),
+          ),
         }
         currentTurn = next
         markIdleActivity() // any turn start (main session) is activity — re-arm idle clear
@@ -11136,12 +11205,16 @@ function handleSessionEvent(ev: SessionEvent): void {
         // is preserved when the parent appends its own step. composeTurnActivity
         // == the flat render when no foreground sub-agent is active.
         turn.activityPendingRender = composeTurnActivity(turn) ?? rendered
-        if (turn.activityInFlight == null) {
+        const ea = emissionAuthorityFor(turn)
+        if (ea.mayDrain(turn)) {
           // Producer B (tool label): always OPEN-eligible (labeledToolCount was
           // incremented just above). A turn that started conversational and now
           // dispatches a tool opens here, rendering any narration accumulated
           // by the suppressed narrative-SHOW drains (design §9 lever 5 / R4).
-          turn.activityInFlight = drainActivitySummary(turn, 'tool')
+          // PR-4a: routed through the emission-authority façade (no-op delegate).
+          ea.openOrEditCard('tool', () => {
+            turn.activityInFlight = drainActivitySummary(turn, 'tool')
+          })
         }
       }
       return
@@ -22981,8 +23054,14 @@ void (async () => {
                       const rendered = composeTurnActivity(turn)
                       if (rendered != null) {
                         turn.activityPendingRender = rendered
-                        if (turn.activityInFlight == null) {
-                          turn.activityInFlight = drainActivitySummary(turn)
+                        // PR-4a: routed through the emission-authority façade
+                        // (no-op delegate). Producer made explicit ('tool' — the
+                        // drain default this foreground sub-agent render used).
+                        const ea = emissionAuthorityFor(turn)
+                        if (ea.mayDrain(turn)) {
+                          ea.openOrEditCard('tool', () => {
+                            turn.activityInFlight = drainActivitySummary(turn, 'tool')
+                          })
                         }
                       }
                     }
@@ -23212,8 +23291,14 @@ void (async () => {
                   const rendered = composeTurnActivity(turn)
                   if (rendered != null) {
                     turn.activityPendingRender = rendered
-                    if (turn.activityInFlight == null) {
-                      turn.activityInFlight = drainActivitySummary(turn)
+                    // PR-4a: routed through the emission-authority façade (no-op
+                    // delegate). Producer made explicit ('tool' — the drain
+                    // default this foreground sub-agent render used).
+                    const ea = emissionAuthorityFor(turn)
+                    if (ea.mayDrain(turn)) {
+                      ea.openOrEditCard('tool', () => {
+                        turn.activityInFlight = drainActivitySummary(turn, 'tool')
+                      })
                     }
                     // A foreground sub-agent's nested activity IS user-visible
                     // production — count it so the silence-poke clock resets,
