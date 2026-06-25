@@ -5,6 +5,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   runWedgeWatchdog,
+  parseWeeklyReset,
   WEDGE_FOOTER_SIGNATURE,
   CONFIRM_MODAL_SIGNATURE,
   STOP_HOOK_ERROR_SIGNATURE,
@@ -430,5 +431,89 @@ describe("#2471 runWedgeWatchdog — manifest-stall escalation", () => {
     expect(res.restartEscalations).toBe(1);
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
+  });
+});
+
+// ─── parseWeeklyReset — time-only SESSION-cap branch (auth-failover Fix 2) ─────
+//
+// The weekly-quota MENU path threads parseWeeklyReset → resolveExhaustUntil.
+// Pre-fix, a SESSION cap ("resets 5pm", time-only, no month/day) returned null,
+// forcing the caller's now+7d weekly fallback — benching a session-capped
+// account for a WEEK. The new branch resolves it to the next occurrence of that
+// wall-clock time (hours away), tz-aware, while leaving the month/day form
+// untouched.
+describe("parseWeeklyReset — time-only session-cap branch (Fix 2)", () => {
+  const HOUR = 3600_000;
+  const WEEK = 7 * 24 * HOUR;
+  // A fixed anchor: 2026-06-25T00:00:00Z (a Thursday). Deterministic so the
+  // "next occurrence" maths is reproducible regardless of when the suite runs.
+  const NOW = Date.UTC(2026, 5, 25, 0, 0, 0);
+
+  function wallClockOf(epoch: number, tz: string): { hour: number; minute: number } {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false,
+      })
+        .formatToParts(new Date(epoch))
+        .filter((p) => p.type !== "literal")
+        .map((p) => [p.type, p.value]),
+    );
+    return { hour: Number(parts.hour) % 24, minute: Number(parts.minute) };
+  }
+
+  it('resolves "resets 5pm (Australia/Melbourne)" to the next 17:00 there, hours away (NOT +7d)', () => {
+    const epoch = parseWeeklyReset("resets 5pm (Australia/Melbourne)", NOW);
+    expect(epoch).not.toBeNull();
+    const delta = (epoch as number) - NOW;
+    expect(delta).toBeGreaterThan(0);
+    expect(delta).toBeLessThanOrEqual(24 * HOUR);
+    expect(delta).toBeLessThan(WEEK - HOUR); // the whole point: not the weekly floor
+    expect(wallClockOf(epoch as number, "Australia/Melbourne")).toEqual({ hour: 17, minute: 0 });
+  });
+
+  it('resolves an am time with minutes — "resets 8:50am (Australia/Melbourne)"', () => {
+    const epoch = parseWeeklyReset("resets 8:50am (Australia/Melbourne)", NOW);
+    expect(epoch).not.toBeNull();
+    expect((epoch as number) - NOW).toBeLessThanOrEqual(24 * HOUR);
+    expect(wallClockOf(epoch as number, "Australia/Melbourne")).toEqual({ hour: 8, minute: 50 });
+  });
+
+  it('resolves a time without a tz label (best-effort UTC) — "resets 11pm"', () => {
+    const epoch = parseWeeklyReset("resets 11pm", NOW);
+    expect(epoch).not.toBeNull();
+    expect((epoch as number) - NOW).toBeLessThanOrEqual(24 * HOUR);
+    expect(wallClockOf(epoch as number, "UTC")).toEqual({ hour: 23, minute: 0 });
+  });
+
+  it('resolves a 24-hour clock time — "resets 17:00 (UTC)"', () => {
+    const epoch = parseWeeklyReset("resets 17:00 (UTC)", NOW);
+    expect(epoch).not.toBeNull();
+    expect(wallClockOf(epoch as number, "UTC")).toEqual({ hour: 17, minute: 0 });
+  });
+
+  it("STILL resolves the month/day WEEKLY form (regression guard)", () => {
+    // "resets Jun 27, 5am (UTC)" — two days ahead of NOW.
+    const epoch = parseWeeklyReset("resets Jun 27, 5am (UTC)", NOW);
+    expect(epoch).not.toBeNull();
+    const asDate = new Date(epoch as number);
+    expect(asDate.getUTCMonth()).toBe(5); // Jun
+    expect(asDate.getUTCDate()).toBe(27);
+    expect(wallClockOf(epoch as number, "UTC")).toEqual({ hour: 5, minute: 0 });
+  });
+
+  it("a month/day string never falls into the time-only branch", () => {
+    // The negative lookahead must keep "Jun 9, 5pm" on the calendar branch, so
+    // its resolved date is Jun 9 (a month away → roughly weekly-scale), NOT the
+    // next 5pm tomorrow.
+    const epoch = parseWeeklyReset("resets Jun 9, 5pm (UTC)", NOW);
+    expect(epoch).not.toBeNull();
+    const asDate = new Date(epoch as number);
+    // Jun 9 already passed in 2026 relative to NOW (Jun 25) → rolls to next year.
+    expect(asDate.getUTCMonth()).toBe(5); // Jun
+    expect(asDate.getUTCDate()).toBe(9);
+  });
+
+  it("returns null on an unparseable line", () => {
+    expect(parseWeeklyReset("nothing here", NOW)).toBeNull();
   });
 });

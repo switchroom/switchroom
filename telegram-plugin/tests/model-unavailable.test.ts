@@ -151,6 +151,111 @@ describe('detectModelUnavailable — reset-time extraction', () => {
   })
 })
 
+// ─── SESSION-cap (time-only) reset parsing — auth-failover-stall Fix 2 ─────────
+//
+// A session cap surfaces as "resets <time>" with NO month/day. Pre-fix this
+// was unparseable → resetAt undefined → the 429 inference path applied the +7d
+// weekly floor, benching the account for a WEEK. The new branch resolves it to
+// the NEXT occurrence of that wall-clock time (hours away), tz-aware.
+describe('detectModelUnavailable — time-only session-cap reset (Fix 2)', () => {
+  const HOUR = 3600_000
+  const WEEK = 7 * 24 * HOUR
+
+  // Next occurrence of a wall-clock time in a tz must be ≤24h away — and
+  // crucially NOT the +7d weekly floor.
+  function expectHoursAway(d: Date | undefined): void {
+    expect(d).toBeInstanceOf(Date)
+    const deltaMs = (d as Date).getTime() - Date.now()
+    expect(deltaMs).toBeGreaterThan(0)
+    expect(deltaMs).toBeLessThanOrEqual(24 * HOUR + 60_000)
+    // The whole point: never the weekly floor.
+    expect(deltaMs).toBeLessThan(WEEK - HOUR)
+  }
+
+  // The next wall-clock occurrence of `hour:minute` in `tz` should land on
+  // that exact minute (sanity that we resolved the time, not a fudge).
+  function expectWallClock(d: Date | undefined, tz: string, hour: number, minute = 0): void {
+    expect(d).toBeInstanceOf(Date)
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+      })
+        .formatToParts(d as Date)
+        .filter((p) => p.type !== 'literal')
+        .map((p) => [p.type, p.value]),
+    )
+    expect(Number(parts.hour) % 24).toBe(hour)
+    expect(Number(parts.minute)).toBe(minute)
+  }
+
+  it('parses "resets 5pm (Australia/Melbourne)" to the next 17:00 there, hours away (NOT +7d)', () => {
+    const d = detectModelUnavailable(
+      "You've hit your session limit · resets 5pm (Australia/Melbourne)",
+    )
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'Australia/Melbourne', 17, 0)
+  })
+
+  it('parses am times — "resets 8:50am (Australia/Melbourne)"', () => {
+    const d = detectModelUnavailable("You've hit your limit · resets 8:50am (Australia/Melbourne)")
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'Australia/Melbourne', 8, 50)
+  })
+
+  it('parses a time WITHOUT minutes — "resets 9am (UTC)"', () => {
+    const d = detectModelUnavailable('hit your limit · resets 9am (UTC)')
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'UTC', 9, 0)
+  })
+
+  it('parses a time WITHOUT a tz label (best-effort UTC) — "resets 11pm"', () => {
+    const d = detectModelUnavailable('usage limit hit · resets 11pm')
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'UTC', 23, 0)
+  })
+
+  it('parses 24-hour clock times — "resets 17:00 (UTC)"', () => {
+    const d = detectModelUnavailable('hit your limit · resets 17:00 (UTC)')
+    expect(d?.kind).toBe('quota_exhausted')
+    expectHoursAway(d?.resetAt)
+    expectWallClock(d?.resetAt, 'UTC', 17, 0)
+  })
+
+  it('STILL parses a bare ISO-8601 reset (calendar-path regression guard)', () => {
+    const d = detectModelUnavailable('quota exhausted, retry at 2026-05-03T11:00:00Z')
+    expect(d?.resetAt?.toISOString()).toBe('2026-05-03T11:00:00.000Z')
+  })
+
+  it('a month/day "resets" string is NOT hijacked into the time-only branch', () => {
+    // The negative lookahead must reject "May"/"Jun" so a date-bearing string
+    // never resolves to "tomorrow at HH:MM". (The month/day+time calendar form
+    // itself does not currently resolve to a Date — that is pre-existing
+    // behaviour; the load-bearing guard is that the time-only branch leaves it
+    // alone rather than producing a WRONG hours-away time.)
+    const may = detectModelUnavailable("You're out of extra usage · resets May 3, 11am")
+    expect(may?.kind).toBe('quota_exhausted')
+    // If the time-only branch had wrongly fired, resetAt would be ≤24h away.
+    if (may?.resetAt) {
+      const deltaMs = may.resetAt.getTime() - Date.now()
+      // A genuine May-3 resolution is many days away (or in the past); never the
+      // bare next-11am-tomorrow the time-only branch would have produced.
+      expect(Math.abs(deltaMs)).toBeGreaterThan(2 * 24 * HOUR)
+    }
+    const jun = detectModelUnavailable(
+      "hit your limit · resets Jun 9, 5am (Australia/Melbourne)",
+    )
+    expect(jun?.kind).toBe('quota_exhausted')
+    if (jun?.resetAt) {
+      const deltaMs = jun.resetAt.getTime() - Date.now()
+      expect(Math.abs(deltaMs)).toBeGreaterThan(2 * 24 * HOUR)
+    }
+  })
+})
+
 // ─── formatModelUnavailableCard ──────────────────────────────────────────────
 
 describe('formatModelUnavailableCard — actionable card', () => {
