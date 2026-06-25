@@ -101,6 +101,41 @@ export function evaluateFallbackFailureNotice(
   return { send: false, next: prev };
 }
 
+/**
+ * Cooldown for the "All accounts blocked" card (Bug 2). The all-blocked outcome
+ * is a NO-OP swap — `doFireFleetAutoFallback` returns false on it, so the
+ * fleetFallbackGate's dedup window (which arms ONLY on a successful swap) never
+ * arms. Meanwhile the card-less `quota_wall_detected` trigger re-signals every
+ * ~60s for the whole duration of a weekly wall, so the identical all-blocked
+ * card re-broadcasts every minute. This is the notice-level bound that the swap
+ * dedup window can't provide for the no-op path — same shape and rationale as
+ * the failure-notice cooldown above.
+ *
+ * Deliberately a plain per-gateway time cooldown (not keyed by trigger account /
+ * earliest-recovery): the all-blocked condition is fleet-wide, so a single
+ * window suppresses the repeat regardless of which agent's wall re-fired it.
+ * A genuinely NEW state transition is NOT suppressed by this: a later SUCCESSFUL
+ * swap arms the separate gate window and the next all-blocked (a real new
+ * exhaustion) is bounded only by this window, not silenced.
+ */
+export const FALLBACK_ALL_BLOCKED_NOTICE_COOLDOWN_MS = 30 * 60_000;
+
+export interface FallbackAllBlockedNoticeState {
+  /** Unix ms of the last all-blocked card this gateway sent. 0 = never. */
+  lastSentAtMs: number;
+}
+
+export function evaluateAllBlockedNotice(
+  prev: FallbackAllBlockedNoticeState,
+  now: number,
+  cooldownMs: number = FALLBACK_ALL_BLOCKED_NOTICE_COOLDOWN_MS,
+): { send: boolean; next: FallbackAllBlockedNoticeState } {
+  if (now - prev.lastSentAtMs >= cooldownMs) {
+    return { send: true, next: { lastSentAtMs: now } };
+  }
+  return { send: false, next: prev };
+}
+
 export type FleetFallbackOutcome =
   | {
       kind: 'switched';
@@ -224,6 +259,10 @@ export async function runFleetAutoFallback(
         newLabel: null,
         newQuota: null,
         triggerAgent: deps.triggerAgent,
+        // Bug 3 — thread the full per-account fleet snapshot so the all-blocked
+        // card enumerates EVERY account (5h%/7d% + recovery ETA), letting the
+        // user verify the fleet is truly exhausted, not just the trigger account.
+        fleetSnapshots: snapshots,
         tz,
         now,
       }),

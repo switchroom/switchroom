@@ -467,6 +467,139 @@ describe("AuthBroker — consumer failover on quota exhaustion", () => {
     broker.stop();
   });
 
+  // ── Bug 1: failover must force-probe an `unknown` candidate before declaring
+  //    "all blocked". A secondary with no fresh snapshot used to be lumped in
+  //    with the truly-walled, so mark-exhausted returned rolledTo=null even when
+  //    the secondary was actually healthy. nextHealthyAccountLive force-probes
+  //    the unknown candidate to resolve it to a real verdict.
+  describe("Bug 1 — failover force-probes unknown candidates", () => {
+    it("secondary with NO cached snapshot but healthy on live probe → rolled to (NOT all-blocked)", async () => {
+      const h = makeHarness();
+      const config = makeConfig(h, {
+        active: "default",
+        fallback_order: ["default", "secondary"],
+        agents: { marker: {} }, // agent on auth.active=default
+      });
+      seedAccount(h, "default");
+      seedAccount(h, "secondary");
+      mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+      let probedSecondary = false;
+      const broker = new AuthBroker(config, {
+        home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+        // Live probe: secondary is HEALTHY. The broker has never cached it, so
+        // pre-fix the stale-mark-less `unknown` looked blocked unless probed.
+        _testFetchQuota: async ({ accessToken }) => {
+          if (accessToken.includes("secondary")) probedSecondary = true;
+          return { ok: true, data: {
+            fiveHourUtilizationPct: 4,
+            sevenDayUtilizationPct: 12,
+            fiveHourResetAt: null,
+            sevenDayResetAt: null,
+            representativeClaim: null,
+            overageStatus: null,
+            overageDisabledReason: null,
+          } };
+        },
+      });
+      await broker.start();
+      const resp = await rpc(join(h.socketRoot, "marker", "sock"), {
+        v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+      }) as { ok: boolean; data: { account: string; rolledTo: string | null; rolled: string[] } };
+      expect(resp.ok).toBe(true);
+      expect(resp.data.account).toBe("default");
+      // The fix: the live probe ran and the healthy secondary was selected.
+      expect(probedSecondary).toBe(true);
+      expect(resp.data.rolledTo).toBe("secondary");
+      expect(resp.data.rolled).toContain("marker");
+      broker.stop();
+    });
+
+    it("secondary with a fresh OVER-WALL probe → correctly skipped (all-blocked)", async () => {
+      const h = makeHarness();
+      const config = makeConfig(h, {
+        active: "default",
+        fallback_order: ["default", "secondary"],
+        agents: { marker: {} },
+      });
+      seedAccount(h, "default");
+      seedAccount(h, "secondary");
+      mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+      const broker = new AuthBroker(config, {
+        home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+        // Live probe: secondary is WALLED (5h at 100%). Force-probing it must
+        // resolve it to blocked, NOT rescue it.
+        _testFetchQuota: async ({ accessToken }) =>
+          accessToken.includes("secondary")
+            ? { ok: true, data: {
+                fiveHourUtilizationPct: 100,
+                sevenDayUtilizationPct: 30,
+                fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+                sevenDayResetAt: null,
+                representativeClaim: "five_hour",
+                overageStatus: null,
+                overageDisabledReason: null,
+              } }
+            : { ok: true, data: {
+                fiveHourUtilizationPct: 5,
+                sevenDayUtilizationPct: 5,
+                fiveHourResetAt: null,
+                sevenDayResetAt: null,
+                representativeClaim: null,
+                overageStatus: null,
+                overageDisabledReason: null,
+              } },
+      });
+      await broker.start();
+      const resp = await rpc(join(h.socketRoot, "marker", "sock"), {
+        v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+      }) as { ok: boolean; data: { rolledTo: string | null } };
+      expect(resp.ok).toBe(true);
+      // Both default (marked) and secondary (live-walled) are exhausted → null.
+      expect(resp.data.rolledTo).toBeNull();
+      broker.stop();
+    });
+
+    it("all accounts genuinely exhausted → all-blocked still fires (rolledTo null)", async () => {
+      const h = makeHarness();
+      const config = makeConfig(h, {
+        active: "default",
+        fallback_order: ["default", "secondary"],
+        agents: {
+          marker: {},                              // on default
+          marker2: { auth: { override: "secondary" } },
+        },
+      });
+      seedAccount(h, "default");
+      seedAccount(h, "secondary");
+      mkdirSync(join(h.agentsDir, "marker"), { recursive: true });
+      mkdirSync(join(h.agentsDir, "marker2"), { recursive: true });
+      const broker = new AuthBroker(config, {
+        home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+        // No live headroom anywhere: even a probe would show the secondary walled.
+        _testFetchQuota: async () => ({ ok: true, data: {
+          fiveHourUtilizationPct: 100,
+          sevenDayUtilizationPct: 100,
+          fiveHourResetAt: new Date(Date.now() + 60 * 60 * 1000),
+          sevenDayResetAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+          representativeClaim: "seven_day",
+          overageStatus: null,
+          overageDisabledReason: null,
+        } }),
+      });
+      await broker.start();
+      // Mark secondary exhausted first (the other escape route).
+      await rpc(join(h.socketRoot, "marker2", "sock"), {
+        v: 1, id: "0", op: "mark-exhausted", until: Date.now() + 60_000,
+      });
+      const resp = await rpc(join(h.socketRoot, "marker", "sock"), {
+        v: 1, id: "1", op: "mark-exhausted", until: Date.now() + 60_000,
+      }) as { ok: boolean; data: { rolledTo: string | null } };
+      expect(resp.ok).toBe(true);
+      expect(resp.data.rolledTo).toBeNull();
+      broker.stop();
+    });
+  });
+
   it("a consumer's mark-exhausted attributes to its PINNED account, never the failover view", async () => {
     // Invariant (schema.ts): mark-exhausted from a consumer only affects ITS
     // account. Failover must NOT leak into attribution — else a consumer being

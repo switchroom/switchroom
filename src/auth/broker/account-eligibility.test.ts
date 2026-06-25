@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   isAccountBlocked,
+  accountEligibility,
   hasNoOverageHeadroom,
   isOverageServeBlocking,
   snapshotShouldClearMark,
@@ -191,6 +192,48 @@ describe("isAccountBlocked — live truth is authoritative over the mark", () =>
     const mark: ExhaustionMark = { exhausted_until: NOW + 1000, marked_at: NOW - 1000 };
     // even a healthy-looking but 25h-old snapshot must not un-block a live mark
     expect(isAccountBlocked({ mark, snapshot: snap(4, 20, SNAPSHOT_STALE_AGE_MS + 60_000), now: NOW })).toBe(true);
+  });
+});
+
+describe("accountEligibility — tri-state distinguishes unknown from blocked (Bug 1)", () => {
+  it("no snapshot AND no mark → 'unknown' (never probed — NOT a hard block)", () => {
+    // The Bug-1 case: a not-yet-probed secondary. Pre-fix it was lumped in with
+    // blocked; tri-state surfaces it as unknown so the selector force-probes it.
+    expect(accountEligibility({ now: NOW })).toBe("unknown");
+  });
+  it("expired mark, no snapshot → 'unknown' (stale evidence is no evidence)", () => {
+    expect(accountEligibility({ mark: { exhausted_until: NOW - 1000 }, now: NOW })).toBe("unknown");
+  });
+  it("unexpired mark, no fresh snapshot → 'blocked' (positive evidence)", () => {
+    expect(accountEligibility({ mark: { exhausted_until: NOW + 60_000 }, now: NOW })).toBe("blocked");
+  });
+  it("fresh healthy snapshot → 'eligible'", () => {
+    expect(accountEligibility({ snapshot: snap(4, 20, 30_000), now: NOW })).toBe("eligible");
+  });
+  it("fresh over-wall snapshot → 'blocked'", () => {
+    expect(accountEligibility({ snapshot: snap(100, 27, 30_000), now: NOW })).toBe("blocked");
+  });
+  it("fresh healthy probe overrides an unexpired bogus future mark → 'eligible'", () => {
+    const mark: ExhaustionMark = { exhausted_until: NOW + 7 * 24 * 60 * 60 * 1000, marked_at: NOW - 60_000 };
+    expect(accountEligibility({ mark, snapshot: snap(4, 20, 30_000), now: NOW })).toBe("eligible");
+  });
+  it("stale (>24h) healthy snapshot does NOT rescue from unknown when no mark", () => {
+    // The snapshot is too old to be truth, and there's no mark → unknown, not eligible.
+    expect(
+      accountEligibility({ snapshot: snap(4, 20, SNAPSHOT_STALE_AGE_MS + 60_000), now: NOW }),
+    ).toBe("unknown");
+  });
+  it("isAccountBlocked is exactly accountEligibility === 'blocked'", () => {
+    const cases = [
+      { now: NOW },
+      { mark: { exhausted_until: NOW + 1000 }, now: NOW },
+      { mark: { exhausted_until: NOW - 1000 }, now: NOW },
+      { snapshot: snap(4, 20, 0), now: NOW },
+      { snapshot: snap(100, 5, 0), now: NOW },
+    ];
+    for (const c of cases) {
+      expect(isAccountBlocked(c)).toBe(accountEligibility(c) === "blocked");
+    }
   });
 });
 
