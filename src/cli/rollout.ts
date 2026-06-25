@@ -423,7 +423,19 @@ export function executeRollout(
         deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
         // `agent restart` can exit 0 while still "polling" on boot — do
         // NOT trust its status; the version assert is the real gate.
-        deps.run(["agent", "restart", step.agent, "--wait", "--force"]);
+        //
+        // hostd path: pass --pin <target> so the compose regeneration step
+        // inside `agent restart` uses the target image tag. Without this,
+        // `reconcileAndRestartAgent` re-reads the stale `release.pin` from
+        // config and overwrites the correct compose that `apply --pin` just
+        // wrote — putting the canary/agent on the old image (#2558). On the
+        // host-shell path the pin is already persisted before `apply` runs,
+        // so bare restart reads the correct pin from config; passing --pin
+        // there is harmless but unnecessary.
+        const restartArgs = execOpts.hostdContext
+          ? ["agent", "restart", step.agent, "--wait", "--force", "--pin", target]
+          : ["agent", "restart", step.agent, "--wait", "--force"];
+        deps.run(restartArgs);
         const got = deps.probeVersion(step.agent);
         if (got === null || normalizeVersion(got) !== targetNorm) {
           deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);

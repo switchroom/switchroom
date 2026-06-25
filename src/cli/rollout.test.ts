@@ -325,6 +325,49 @@ describe("executeRollout — hostd context (#2487)", () => {
     expect(r.rolled).toEqual(["test-harness", "clerk"]);
     expect(persisted).toEqual([TARGET]); // persisted exactly once, after canary
   });
+
+  // Regression guard for #2558:
+  // The restart-agent step on the hostd path must pass --pin <target> to
+  // `agent restart` so the in-restart compose regeneration uses the TARGET
+  // image tag and not the stale release.pin still in switchroom.yaml (the
+  // durable persist-pin step runs AFTER the canary on this path).
+  it("restart-agent passes --pin <target> on the hostd path (#2558 regression)", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps, runs } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    // Every restart-agent invocation on the hostd path must carry --pin.
+    const restartRuns = runs.filter((a) => a[0] === "agent" && a[1] === "restart");
+    expect(restartRuns.length).toBeGreaterThan(0);
+    for (const run of restartRuns) {
+      expect(run).toContain("--pin");
+      expect(run).toContain(TARGET);
+    }
+  });
+
+  // Belt-and-braces: on the HOST-SHELL path the pin is persisted BEFORE
+  // apply, so bare restart reads the correct pin from config. Passing --pin
+  // there is harmless, but the contract is bare restart (no --pin flag) so
+  // the operator's PATH is unaffected.
+  it("restart-agent does NOT pass --pin on the host-shell path (pin already persisted)", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      pinToPersist: TARGET,
+      // hostdContext NOT set → host-shell path
+    });
+    const { deps, runs } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
+    });
+    executeRollout(steps, TARGET, deps);
+    const restartRuns = runs.filter((a) => a[0] === "agent" && a[1] === "restart");
+    expect(restartRuns.length).toBeGreaterThan(0);
+    for (const run of restartRuns) {
+      expect(run).not.toContain("--pin");
+    }
+  });
 });
 
 describe("rollout structured-result sentinel (#2487)", () => {
