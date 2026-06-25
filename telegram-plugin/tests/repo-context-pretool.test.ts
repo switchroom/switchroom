@@ -420,6 +420,68 @@ describe('repo-context-pretool e2e', () => {
     expect(res.stdout ?? '').toBe('')
   })
 
+  it('suppresses the agent own CLAUDE.md when SWITCHROOM_AGENT_START_CWD is set', () => {
+    // The agent's own CLAUDE.md is already in the system prompt — re-injecting
+    // it wastes ~30KB per session. The marker-path guard must exit 0 silently.
+    const agentDir = join(sb.root, '.switchroom', 'agents', 'myagent')
+    const agentWorkspace = join(agentDir, 'workspace')
+    mkdirSync(agentWorkspace, { recursive: true })
+    writeFileSync(join(agentDir, 'CLAUDE.md'), '# own agent claude md')
+    writeFileSync(join(agentWorkspace, 'note.md'), 'x')
+
+    const sid = `e2e-own-marker-${Date.now()}`
+    repoStateDir(sid)
+    const res = runHook(
+      {
+        session_id: sid,
+        cwd: agentDir,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Read',
+        tool_input: { file_path: join(agentDir, 'workspace', 'note.md') },
+      },
+      {
+        home: sb.root,
+        agent: 'myagent',
+        env: { SWITCHROOM_AGENT_START_CWD: agentDir },
+      },
+    )
+    expect(res.code).toBe(0)
+    // Own CLAUDE.md must NOT be injected
+    expect(res.stdout).toBe('')
+  })
+
+  it('still injects a worktree repo CLAUDE.md even when SWITCHROOM_AGENT_START_CWD is set', () => {
+    // A repo checked out outside the agent start dir must still inject.
+    const agentDir = join(sb.root, '.switchroom', 'agents', 'myagent')
+    mkdirSync(agentDir, { recursive: true })
+    writeFileSync(join(agentDir, 'CLAUDE.md'), '# own agent')
+    const worktree = join(sb.root, 'workspace', 'myrepo')
+    mkdirSync(worktree, { recursive: true })
+    writeFileSync(join(worktree, 'CLAUDE.md'), '# worktree repo')
+    writeFileSync(join(worktree, 'src.ts'), 'x')
+
+    const sid = `e2e-worktree-${Date.now()}`
+    repoStateDir(sid)
+    const res = runHook(
+      {
+        session_id: sid,
+        cwd: worktree,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Read',
+        tool_input: { file_path: join(worktree, 'src.ts') },
+      },
+      {
+        home: sb.root,
+        agent: 'myagent',
+        env: { SWITCHROOM_AGENT_START_CWD: agentDir },
+      },
+    )
+    expect(res.code).toBe(0)
+    expect(res.stdout.length).toBeGreaterThan(0)
+    const parsed = JSON.parse(res.stdout)
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('# worktree repo')
+  })
+
   it('no marker → no output', () => {
     // tmpdir, no CLAUDE.md anywhere up the chain
     const file = join(sb.root, 'nothing.ts')

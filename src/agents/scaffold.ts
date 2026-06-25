@@ -3421,8 +3421,11 @@ export function scaffoldAgent(
           SWITCHROOM_AGENT_NAME: name,
           SWITCHROOM_CONFIG: resolvedConfigPath,
         },
-        // Framework read-only server (4 tools) — keep loaded under tool search.
-        alwaysLoad: true,
+        // Deferred: 4-tool read-only server loads on demand via tool search.
+        // Agents invoke agent-config tools only occasionally (schedule adds,
+        // skill installs, config reads) — pinning it server-wide (~4 tools)
+        // burned always-on context budget for no first-turn benefit.
+        alwaysLoad: false,
       },
     };
 
@@ -5722,8 +5725,11 @@ export function reconcileAgent(
           SWITCHROOM_AGENT_NAME: name,
           SWITCHROOM_CONFIG: resolvedConfigPath,
         },
-        // Framework read-only server (4 tools) — keep loaded under tool search.
-        alwaysLoad: true,
+        // Deferred: 4-tool read-only server loads on demand via tool search.
+        // Agents invoke agent-config tools only occasionally (schedule adds,
+        // skill installs, config reads) — pinning it server-wide (~4 tools)
+        // burned always-on context budget for no first-turn benefit.
+        alwaysLoad: false,
       },
     };
 

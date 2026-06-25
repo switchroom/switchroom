@@ -33,10 +33,14 @@ export function getHindsightSettingsEntry(
   const collection = getCollectionForAgent(agentName, config);
   const mcpConfig = generateHindsightMcpConfig(collection, memoryConfig);
 
-  // Keep hindsight's tools loaded under tool search — recall/reflect/retain
-  // are framework memory tools the agent is told to use proactively; deferring
-  // them would add a ToolSearch round-trip to every memory write.
-  return { key: "hindsight", value: { ...mcpConfig, alwaysLoad: true } };
+  // Defer hindsight's 32 MCP tools via tool search. Auto-recall (recall.py
+  // via UserPromptSubmit hook) and auto-retain (retain.py via Stop hook) call
+  // Hindsight directly over HTTP at 127.0.0.1:18888 — they do NOT go through
+  // the MCP server. Only the agent's interactive mcp__hindsight__* calls use
+  // the MCP server, and those load on demand. Live-validated: /health → 200,
+  // bank read works, recall/retain are urllib calls over the HTTP API.
+  // Deferring reclaims ~32 tool schemas (~8k tokens) from the always-on budget.
+  return { key: "hindsight", value: { ...mcpConfig, alwaysLoad: false } };
 }
 
 /**

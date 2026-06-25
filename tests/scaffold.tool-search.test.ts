@@ -6,7 +6,10 @@
  * window every turn. Two halves must stay wired:
  *   1. the ENABLE_TOOL_SEARCH env var (default `auto`, kill-switchable);
  *   2. The LOAD-BEARING tools never defer (the orphaned-reply hazard).
- *      - hindsight + agent-config: pinned server-wide via `alwaysLoad: true`.
+ *      - hindsight + agent-config: deferred via `alwaysLoad: false`.
+ *        hindsight auto-recall/retain use HTTP directly (not MCP), so
+ *        deferring the 32 MCP tools is safe. agent-config (4 tools) is
+ *        used only occasionally — no first-turn benefit from pinning.
  *      - switchroom-telegram (P4): NO LONGER pinned server-wide
  *        (`alwaysLoad: false`); the bridge pins only the hot tools (reply /
  *        stream_reply / get_recent_messages / react / …) per-tool via
@@ -63,12 +66,17 @@ describe("tool-search wiring (source guards)", () => {
     }
   });
 
-  it("agent-config + hindsight stay pinned server-wide (alwaysLoad:true)", () => {
-    const agentConfig = scaffoldSrc.split('"agent-config": {')[1]?.slice(0, 500) ?? "";
-    expect(agentConfig).toMatch(/alwaysLoad: true/);
-    // hindsight pinned in scaffold-integration.ts.
+  it("agent-config + hindsight are deferred via tool search (alwaysLoad:false)", () => {
+    // Both agent-config blocks (scaffold + reconcile paths) must agree.
+    const blocks = scaffoldSrc.split('"agent-config": {').slice(1);
+    expect(blocks.length).toBe(2);
+    for (const b of blocks) {
+      const m = b.slice(0, 700).match(/alwaysLoad: (true|false)/);
+      expect(m?.[1]).toBe("false");
+    }
+    // hindsight deferred in scaffold-integration.ts.
     const integ = readFileSync(resolve(__dirname, "..", "src", "memory", "scaffold-integration.ts"), "utf-8");
-    expect(integ).toMatch(/key: "hindsight", value: \{ \.\.\.mcpConfig, alwaysLoad: true \}/);
+    expect(integ).toMatch(/key: "hindsight", value: \{ \.\.\.mcpConfig, alwaysLoad: false \}/);
   });
 
   it("switchroom-telegram is NO LONGER pinned server-wide (P4-B: alwaysLoad:false)", () => {
