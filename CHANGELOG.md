@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.16.3 — fix OAuth token refresh (correct Claude Code client_id)
+
+The auth-broker presented the wrong OAuth `client_id` (`9d1cd16e-…`) on the
+token-refresh exchange, so Anthropic rejected every refresh with
+`400 invalid_request: Client with id … not found`.
+
+- **Correct client_id** (#2594). Refresh now uses the real Claude Code OAuth
+  client (`9d1c250a-…`, the one the `claude` CLI's own login / setup-token flow
+  uses). The wrong value had been in place since the refresh primitive landed
+  (#621 / #1254) but the bug was **latent**: every historical account was a
+  long-lived `setup-token` (`user:inference`, ~1y expiry) that never hits the
+  refresh path. The first full Claude-Code session token (broad scopes, ~8h
+  expiry) added to the broker surfaced it — refresh 400'd every ~8h and the
+  account silently expired (real incident: `ken@autograb.com.au`). Override
+  remains available via `SWITCHROOM_OAUTH_CLIENT_ID`. New
+  `account-refresh.test.ts` pins the value, the refresh request body, and the
+  override path.
+
 ## v0.16.2 — opt-in overage, /auth add TTY fix, feed + turn liveness
 
 This release adds an operator opt-in to spend an account's Anthropic overage
