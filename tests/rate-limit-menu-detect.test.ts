@@ -266,7 +266,7 @@ describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
     const { send, calls } = recordSend();
     const signals: unknown[] = [];
     const res = await runWedgeWatchdog({
-      agentName: "pixsoul-agent",
+      agentName: "alice-agent",
       now: () => NOW, sleep: () => {}, maxPolls: 3,
       capture: captureSeq([RATE_LIMIT_SCREEN]), send,
       onRateLimitMenu: () => signals.push(1),
@@ -284,7 +284,7 @@ describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
   it("flagged + broker overage ACTIVE (async/Promise verdict) → selects usage credits", async () => {
     const { send, calls } = recordSend();
     const res = await runWedgeWatchdog({
-      agentName: "pixsoul-agent",
+      agentName: "alice-agent",
       now: () => NOW, sleep: () => {}, maxPolls: 3,
       capture: captureSeq([RATE_LIMIT_SCREEN]), send,
       onRateLimitMenu: () => {},
@@ -313,7 +313,7 @@ describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
     const { send, calls } = recordSend();
     const signals: unknown[] = [];
     const res = await runWedgeWatchdog({
-      agentName: "pixsoul-agent",
+      agentName: "alice-agent",
       now: () => NOW, sleep: () => {}, maxPolls: 3,
       capture: captureSeq([RATE_LIMIT_SCREEN]), send,
       onRateLimitMenu: () => signals.push(1),
@@ -329,7 +329,7 @@ describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
     const { send, calls } = recordSend();
     const signals: unknown[] = [];
     const res = await runWedgeWatchdog({
-      agentName: "pixsoul-agent",
+      agentName: "alice-agent",
       now: () => NOW, sleep: () => {}, maxPolls: 3,
       capture: captureSeq([RATE_LIMIT_SCREEN]), send,
       onRateLimitMenu: () => signals.push(1),
@@ -347,7 +347,7 @@ describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
     const { send, calls } = recordSend();
     const signals: unknown[] = [];
     const res = await runWedgeWatchdog({
-      agentName: "pixsoul-agent",
+      agentName: "alice-agent",
       now: () => NOW, sleep: () => {}, maxPolls: 3,
       capture: captureSeq([NO_CREDITS_MENU]), send,
       onRateLimitMenu: () => signals.push(1),

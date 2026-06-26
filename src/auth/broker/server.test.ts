@@ -1786,11 +1786,11 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
   }): Promise<{ active_overage_serving?: boolean }> {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "pixsoul",
+      active: "alice",
       agents: { ziggy: {} },
-      allow_overage_accounts: opts.allowOverage ? ["pixsoul"] : undefined,
+      allow_overage_accounts: opts.allowOverage ? ["alice"] : undefined,
     });
-    seedAccount(h, "pixsoul", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
     const origFetch = globalThis.fetch;
     globalThis.fetch = stubOverageFetch({
       overageStatus: opts.overageStatus,
@@ -1806,7 +1806,7 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
       await broker.start();
       const sock = join(h.socketRoot, "ziggy", "sock");
       // Populate the broker's snapshot cache with a fresh overage-bearing probe.
-      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["pixsoul"] });
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
       const resp = (await rpc(sock, { v: 1, id: "1", op: "list-state" })) as {
         ok: boolean;
         data: { active_overage_serving?: boolean };
@@ -1819,7 +1819,7 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
     }
   }
 
-  it("flagged + overageStatus allowed + not out_of_credits → true (the pixsoul case)", async () => {
+  it("flagged + overageStatus allowed + not out_of_credits → true (the alice case)", async () => {
     const data = await probeThenListState({ allowOverage: true, overageStatus: "allowed" });
     expect(data.active_overage_serving).toBe(true);
   });
@@ -1863,11 +1863,11 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
   it("INTEGRATION: flagged + overage allowed → broker verdict drives watchdog to select 'usage credits' (no wedge, no failover)", async () => {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "pixsoul",
+      active: "alice",
       agents: { ziggy: {} },
-      allow_overage_accounts: ["pixsoul"],
+      allow_overage_accounts: ["alice"],
     });
-    seedAccount(h, "pixsoul", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
     const origFetch = globalThis.fetch;
     globalThis.fetch = stubOverageFetch({ overageStatus: "allowed" });
     const broker = new AuthBroker(config, {
@@ -1879,7 +1879,7 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
     try {
       await broker.start();
       const sock = join(h.socketRoot, "ziggy", "sock");
-      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["pixsoul"] });
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
 
       const calls: string[][] = [];
       const signals: unknown[] = [];
@@ -1908,11 +1908,11 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
   it("INTEGRATION: NOT flagged → broker verdict drives watchdog to the DEFAULT Esc-park + failover", async () => {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "pixsoul",
+      active: "alice",
       agents: { ziggy: {} },
       // NO allow_overage_accounts → default-off.
     });
-    seedAccount(h, "pixsoul", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
     const origFetch = globalThis.fetch;
     globalThis.fetch = stubOverageFetch({ overageStatus: "allowed" });
     const broker = new AuthBroker(config, {
@@ -1924,7 +1924,7 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
     try {
       await broker.start();
       const sock = join(h.socketRoot, "ziggy", "sock");
-      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["pixsoul"] });
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
 
       const calls: string[][] = [];
       const signals: unknown[] = [];
@@ -1952,11 +1952,11 @@ describe("AuthBroker — list-state active_overage_serving signal", () => {
   it("flagged but NO snapshot yet (no probe) → false (no stale/absent authorization)", async () => {
     const h = makeHarness();
     const config = makeConfig(h, {
-      active: "pixsoul",
+      active: "alice",
       agents: { ziggy: {} },
-      allow_overage_accounts: ["pixsoul"],
+      allow_overage_accounts: ["alice"],
     });
-    seedAccount(h, "pixsoul", { expiresAt: 9_999_999_999_999 });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
     const broker = new AuthBroker(config, {
       home: h.home,
       stateDir: h.stateDir,
