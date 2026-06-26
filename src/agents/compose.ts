@@ -1077,12 +1077,12 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`    labels:`);
   lines.push(`      switchroom.role: "broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
-  lines.push(`    restart: unless-stopped`);
+  lines.push(`    restart: always`);
   // Liveness probe — bind-presence. The broker creates per-agent
   // socket directories at startup and binds `<dir>/sock` for each
   // configured agent. If at least one bind has happened, the daemon
   // is alive enough to take work; if every bind has gone away, the
-  // daemon is wedged or dead and `restart: unless-stopped` should
+  // daemon is wedged or dead and `restart: always` should
   // recycle it. This catches the silent-down failure mode where the
   // broker exits cleanly (compose then sees process-gone) AS WELL AS
   // a hung daemon that's still holding the process slot but stopped
@@ -1307,7 +1307,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`    labels:`);
   lines.push(`      switchroom.role: "kernel"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
-  lines.push(`    restart: unless-stopped`);
+  lines.push(`    restart: always`);
   // Mirror the broker's bind-presence healthcheck — same failure-mode
   // surface (kernel binds per-agent sockets at
   // /run/switchroom/kernel/<agent>/sock; silently exits or hangs the
@@ -1399,7 +1399,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`    labels:`);
   lines.push(`      switchroom.role: "auth-broker"`);
   lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
-  lines.push(`    restart: unless-stopped`);
+  lines.push(`    restart: always`);
   // Bind-presence healthcheck — same probe pattern as vault-broker /
   // approval-kernel (PR #898). Empty-fleet trade-off applies: a
   // switchroom install with zero agents and zero consumers reports
@@ -1628,7 +1628,7 @@ function emitAgentService(
   } else {
     lines.push(`    network_mode: host`);
   }
-  lines.push(`    restart: unless-stopped`);
+  lines.push(`    restart: always`);
   lines.push(`    init: false`);
   // PTY allocation — claude's interactive mode requires a TTY at stdin
   // (the alt-screen UI, autoaccept-poll keystrokes, and the `--print`

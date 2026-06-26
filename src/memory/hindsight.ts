@@ -73,7 +73,7 @@ export function generateDockerComposeSnippet(
     ...envLines,
     "  volumes:",
     "    - hindsight-data:/home/hindsight/.pg0",
-    "  restart: unless-stopped",
+    "  restart: always",
   ].join("\n");
 }
 

@@ -159,7 +159,7 @@ services:
   hostd:
     image: ghcr.io/switchroom/switchroom-hostd:${imageTag}
     container_name: switchroom-hostd
-    restart: unless-stopped
+    restart: always
     user: "0:0"
     # tini handles SIGTERM forwarding; node's main.ts shutdown handler
     # closes UDS listeners and exits cleanly. 15s grace matches the
