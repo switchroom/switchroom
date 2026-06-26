@@ -15,6 +15,7 @@
  */
 
 import type { QuotaResult } from "../quota.js";
+import { overageLiftsWall, type QuotaSnapshot } from "./account-eligibility.js";
 
 /**
  * Utilization at/above this on the binding window counts as a hard wall.
@@ -50,8 +51,17 @@ export interface ExhaustionDecision {
  * A FAILED probe is NOT exhaustion. A transient network/probe error must never
  * fail a consumer over — that was the `all-blocked`-from-stale-probe lesson.
  * Only a successful probe showing the binding window at/above the wall counts.
+ *
+ * Overage lift (opt-in): when `allowOverage` is true AND the probe's overage
+ * headers satisfy `overageLiftsWall()`, a utilization wall (≥99.5%) does NOT
+ * count as exhaustion — Anthropic will bill the overage, so the consumer
+ * should keep serving. As soon as `overageDisabledReason` becomes
+ * `out_of_credits`, the lift is removed and the account is marked exhausted.
  */
-export function quotaIndicatesExhaustion(result: QuotaResult): ExhaustionDecision {
+export function quotaIndicatesExhaustion(
+  result: QuotaResult,
+  allowOverage = false,
+): ExhaustionDecision {
   if (!result.ok) return { exhausted: false, until: null };
   const d = result.data;
   // out_of_credits is informational only (no overage headroom) — it does NOT
@@ -62,6 +72,20 @@ export function quotaIndicatesExhaustion(result: QuotaResult): ExhaustionDecisio
   const fiveBlocked = d.fiveHourUtilizationPct >= EXHAUSTION_PCT;
   const sevenBlocked = d.sevenDayUtilizationPct >= EXHAUSTION_PCT;
   if (!fiveBlocked && !sevenBlocked) return { exhausted: false, until: null };
+  // Overage lift: if the account is in the allow-overage opt-in set and
+  // Anthropic's overage is active (allowed + not out_of_credits), the util
+  // wall does not count as exhaustion for this consumer.
+  if (allowOverage) {
+    // Build a minimal QuotaSnapshot from the probe result to reuse overageLiftsWall.
+    const snap: QuotaSnapshot = {
+      fiveHourUtilizationPct: d.fiveHourUtilizationPct,
+      sevenDayUtilizationPct: d.sevenDayUtilizationPct,
+      capturedAt: Date.now(),
+      overageStatus: d.overageStatus,
+      overageDisabledReason: d.overageDisabledReason,
+    };
+    if (overageLiftsWall(snap, true)) return { exhausted: false, until: null };
+  }
   // Use the reset of the maxed window; if both are walled, the later one
   // (the account stays exhausted until the longer window clears).
   const fiveReset = fiveBlocked ? (d.fiveHourResetAt?.getTime() ?? null) : null;

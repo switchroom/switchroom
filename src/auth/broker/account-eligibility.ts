@@ -161,6 +161,26 @@ export function snapshotWalled(s: QuotaSnapshot): boolean {
   return s.fiveHourUtilizationPct >= WALL_PCT || s.sevenDayUtilizationPct >= WALL_PCT;
 }
 
+/**
+ * Is this account allowed to be served past the utilization wall via Anthropic
+ * overage billing? True when ALL of:
+ *   1. The account is in the operator's `allow_overage_accounts` opt-in list.
+ *   2. The snapshot reports `overageStatus === "allowed"` (Anthropic will
+ *      bill overage for this account).
+ *   3. `overageDisabledReason` is NOT in `OVERAGE_EXHAUSTED_REASONS`
+ *      (i.e. not "out_of_credits" — overage credit is not yet exhausted).
+ *
+ * This ONLY lifts the utilization wall. It cannot override an exhaustion mark
+ * written by a real 429 (`mark-exhausted`). PURE — no I/O.
+ */
+export function overageLiftsWall(snapshot: QuotaSnapshot, inAllowList: boolean): boolean {
+  if (!inAllowList) return false;
+  if (snapshot.overageStatus !== "allowed") return false;
+  const reason = snapshot.overageDisabledReason;
+  if (reason != null && OVERAGE_EXHAUSTED_REASONS.has(reason)) return false;
+  return true;
+}
+
 /** A live snapshot is clearly healthy on BOTH windows (safe to clear a mark). */
 export function snapshotClearlyHealthy(s: QuotaSnapshot): boolean {
   return (
@@ -198,20 +218,35 @@ export type AccountEligibility = "blocked" | "eligible" | "unknown";
  *      healthy → eligible (kills the bogus-future-mark stranding).
  *  - Otherwise the persisted mark governs: unexpired → blocked.
  *  - With neither a usable live snapshot NOR an unexpired mark → unknown.
+ *
+ * Overage lift (opt-in):
+ *  When `allowOverage` is true AND the snapshot satisfies `overageLiftsWall()`,
+ *  a utilization wall (≥99.5%) is NOT treated as a block — Anthropic will
+ *  serve the account via overage billing. The lift applies ONLY to the
+ *  snapshot-driven wall; an active exhaustion mark written by a real 429
+ *  (`mark-exhausted`) still blocks unconditionally.
  */
 export function accountEligibility(opts: {
   mark?: ExhaustionMark;
   snapshot?: QuotaSnapshot;
   now: number;
+  /** True when this account is in `auth.allow_overage_accounts`. Default false. */
+  allowOverage?: boolean;
 }): AccountEligibility {
-  const { mark, snapshot, now } = opts;
+  const { mark, snapshot, now, allowOverage = false } = opts;
   if (snapshotFresh(snapshot, now)) {
     const markedAt = mark?.marked_at ?? 0;
     if (snapshot.capturedAt >= markedAt) {
       // Live truth is the newer signal → it decides, mark ignored. Walled on
-      // util → blocked. Overage (out_of_credits) is informational only and does
-      // NOT gate serving; failover safety is preserved via mark-exhausted on 429.
-      return snapshotWalled(snapshot) ? "blocked" : "eligible";
+      // util → blocked, UNLESS overage is active for this account (opt-in).
+      if (snapshotWalled(snapshot)) {
+        if (overageLiftsWall(snapshot, allowOverage)) {
+          // The util wall fires but overage is available — account stays eligible.
+          return "eligible";
+        }
+        return "blocked";
+      }
+      return "eligible";
     }
   }
   // No usable live truth (or the mark is newer) → the mark is the only signal.
@@ -239,6 +274,8 @@ export function isAccountBlocked(opts: {
   mark?: ExhaustionMark;
   snapshot?: QuotaSnapshot;
   now: number;
+  /** True when this account is in `auth.allow_overage_accounts`. Default false. */
+  allowOverage?: boolean;
 }): boolean {
   return accountEligibility(opts) === "blocked";
 }

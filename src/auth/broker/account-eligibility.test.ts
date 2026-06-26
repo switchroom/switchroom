@@ -9,6 +9,7 @@ import {
   snapshotFresh,
   snapshotWalled,
   snapshotClearlyHealthy,
+  overageLiftsWall,
   OVERAGE_EXHAUSTED_REASONS,
   SERVE_BLOCKING_OVERAGE_REASONS,
   WALL_PCT,
@@ -335,5 +336,110 @@ describe("clampMarkExpiry — only override a long mark the live data DISPROVES"
     const proposed = NOW + 2 * 60 * 60 * 1000;
     expect(clampMarkExpiry({ proposedUntil: proposed, now: NOW, shortMs: FIVE_H })).toBe(proposed);
     expect(clampMarkExpiry({ proposedUntil: proposed, now: NOW, shortMs: FIVE_H, snapshot: snap(4, 20, 0) })).toBe(proposed);
+  });
+});
+
+// ─── allow_overage feature tests ───────────────────────────────────────────
+
+describe("overageLiftsWall — predicate for opt-in overage lift", () => {
+  it("true when flagged + overageStatus allowed + no disabling reason (the pixsoul case)", () => {
+    expect(overageLiftsWall(snap(100, 100, 0, { status: "allowed", reason: null }), true)).toBe(true);
+  });
+  it("false when NOT in allow list (opt-in; default unchanged)", () => {
+    expect(overageLiftsWall(snap(100, 100, 0, { status: "allowed", reason: null }), false)).toBe(false);
+  });
+  it("false when overageStatus is not 'allowed' (rejected)", () => {
+    expect(overageLiftsWall(snap(100, 100, 0, { status: "rejected", reason: null }), true)).toBe(false);
+  });
+  it("false when overageDisabledReason is out_of_credits (credit exhausted)", () => {
+    expect(overageLiftsWall(snap(100, 100, 0, { status: "allowed", reason: "out_of_credits" }), true)).toBe(false);
+  });
+  it("false when overageStatus is absent", () => {
+    expect(overageLiftsWall(snap(100, 100, 0), true)).toBe(false);
+  });
+});
+
+describe("accountEligibility — allow_overage matrix (the pixsoul case and safety guards)", () => {
+  it("flagged + util 100% + overageStatus allowed + reason null → ELIGIBLE (pixsoul case)", () => {
+    // pixsoul@gmail.com: 7d=100%, overageStatus:'allowed', no disabled reason
+    // With allow_overage opt-in, the util wall must NOT block.
+    expect(
+      accountEligibility({
+        snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("eligible");
+  });
+
+  it("flagged + util 100% + overageStatus allowed + reason out_of_credits → BLOCKED (credit exhausted — stop spending)", () => {
+    // Overage credit is exhausted — must block even when flagged.
+    expect(
+      accountEligibility({
+        snapshot: snap(0, 100, 30_000, { status: "allowed", reason: "out_of_credits" }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("flagged + util 100% + overageStatus rejected → BLOCKED", () => {
+    // Anthropic says overage is rejected — must block.
+    expect(
+      accountEligibility({
+        snapshot: snap(0, 100, 30_000, { status: "rejected", reason: null }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("NOT flagged + util 100% + overageStatus allowed → BLOCKED (opt-in; default unchanged)", () => {
+    // Without the flag, the util wall must behave exactly as before.
+    expect(
+      accountEligibility({
+        snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: false,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("flagged + util 50% → ELIGIBLE (normal, no overage needed)", () => {
+    // Below the wall — eligible regardless of overage flag.
+    expect(
+      accountEligibility({
+        snapshot: snap(10, 50, 30_000, { status: "rejected", reason: "org_level_disabled" }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("eligible");
+  });
+
+  it("flagged + util 100% + allowOverage + active exhaustion MARK → BLOCKED (mark overrides overage lift)", () => {
+    // An exhaustion mark written by a real 429 must still block — overage only
+    // lifts the snapshot-driven wall, not a mark.
+    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 500 };
+    // Mark is newer than snapshot (capturedAt: NOW - 30_000), so mark governs.
+    expect(
+      accountEligibility({
+        mark,
+        snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("isAccountBlocked mirrors accountEligibility === 'blocked' for the allow_overage cases", () => {
+    const cases: Array<Parameters<typeof accountEligibility>[0]> = [
+      { snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }), now: NOW, allowOverage: true },
+      { snapshot: snap(0, 100, 30_000, { status: "allowed", reason: "out_of_credits" }), now: NOW, allowOverage: true },
+      { snapshot: snap(0, 100, 30_000, { status: "rejected", reason: null }), now: NOW, allowOverage: true },
+      { snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }), now: NOW, allowOverage: false },
+    ];
+    for (const c of cases) {
+      expect(isAccountBlocked(c)).toBe(accountEligibility(c) === "blocked");
+    }
   });
 });
