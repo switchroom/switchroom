@@ -109,6 +109,43 @@ export const CONFIRM_MODAL_SIGNATURE =
   /Change\s+effort\s+level|(?=[\s\S]*\b1\.\s*Yes\b)(?=[\s\S]*\b2\.\s*No\b)/i;
 
 /**
+ * Per-tool PERMISSION-PROMPT TUI signature (config_propose_edit / hostd
+ * mutating-verb freeze).
+ *
+ * When a non-pre-approved MCP tool's permission prompt renders as Claude
+ * Code's INTERACTIVE confirmation TUI instead of emitting the channel
+ * notification that becomes a Telegram approval card, nothing arms the
+ * gateway's TTL auto-deny and the turn parks FOREVER — fleet-wide freeze
+ * (real incident: carrie froze indefinitely on a `config_propose_edit`
+ * permission prompt until a manual restart, 2026-06). The pane looks like:
+ *
+ *   Do you want to proceed?
+ *   ❯ 1. Yes
+ *     2. Yes, and don't ask again this session
+ *     3. No, and tell Claude what to do differently (esc)
+ *
+ * Critically, none of the existing signatures match this:
+ *   - WEDGE_FOOTER_SIGNATURE wants "to select"/"to navigate"/↑↓ in the
+ *     footer — this prompt has none.
+ *   - CONFIRM_MODAL_SIGNATURE wants a "1. Yes … / 2. No …" pair — here
+ *     option 2 is "Yes, and don't ask again", so `2.\s*No` never matches.
+ *
+ * Two INDEPENDENT anchors, both required, so it can never false-positive on
+ * normal model output:
+ *   (a) the "Do you want to proceed?" question Claude Code prints for every
+ *       per-tool permission prompt, AND
+ *   (b) a "don't ask again" affordance (the option-2 row unique to this
+ *       prompt family) — the load-bearing discriminator that separates a
+ *       permission prompt from any other yes/no modal.
+ *
+ * Remedy is Esc, which Claude Code treats as "decline" (== a safe DENY) —
+ * it can NEVER auto-select option 1 ("Yes") or 2 ("Yes, and don't ask
+ * again"), preserving the human-in-the-loop boundary for the hostd verbs.
+ */
+export const PERMISSION_PROMPT_SIGNATURE =
+  /(?=[\s\S]*Do you want to proceed\?)(?=[\s\S]*don['’]t ask again)/i;
+
+/**
  * #2471 — semantic NO-PROGRESS signature. A turn that is "Manifesting"
  * (or otherwise spinning under the working footer) AND has a Stop-hook
  * error visible ("Stop hook error occurred" / "running stop hooks 0/N")
@@ -272,6 +309,12 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 //     stop-hook error anyway).
 const DEFAULT_CONFIRM_MODAL_POLLS = 3;
 const DEFAULT_MANIFEST_STALL_POLLS = 60;
+// A per-tool permission prompt must be PRESENT for this many consecutive
+// polls before Esc. Same shape-persistence rationale as CONFIRM_MODAL:
+// the Ink-rendered prompt repaints so it's not byte-stable. 3 polls ≈ 15s
+// @ 5s — a wedged permission prompt never clears on its own (no human),
+// so even a short streak is conclusive while staying clear of a transient.
+const DEFAULT_PERMISSION_PROMPT_POLLS = 3;
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -341,6 +384,24 @@ export interface WedgeWatchdogOptions {
    */
   confirmModalPolls?: number;
   /**
+   * Per-tool permission-prompt TUI signature, detected by SHAPE
+   * persistence (the prompt continuously PRESENT across polls), same as
+   * the confirmation modal. Catches a non-pre-approved MCP tool's
+   * "Do you want to proceed?" permission prompt that rendered as Claude
+   * Code's interactive TUI instead of emitting the channel notification —
+   * which leaves the turn frozen forever with no TTL auto-deny (the
+   * config_propose_edit / hostd-verb freeze). On a shape-persistent match
+   * the watchdog Escs it; Esc == "decline" == a SAFE DENY (never selects
+   * option 1/2 "Yes"), so the human-in-the-loop boundary is preserved.
+   * `null` disables this branch.
+   */
+  permissionPromptSignature?: RegExp | null;
+  /**
+   * Consecutive polls a permission prompt must be PRESENT before Esc.
+   * Default `SWITCHROOM_WEDGE_PERMISSION_POLLS` or 3.
+   */
+  permissionPromptPolls?: number;
+  /**
    * #2471 — semantic no-progress: a "Manifesting" + Stop-hook-error state
    * that persists past `manifestStallPolls`. The in-pane Esc evidently
    * could not clear it (the turn never ends), so this escalates to a clean
@@ -384,6 +445,9 @@ export interface WedgeWatchdogResult {
   /** #2471 — subset of `fires` that dismissed a confirmation modal detected
    *  by SHAPE persistence (the `/effort`-class wedge). */
   confirmModalFires: number;
+  /** Subset of `fires` that dismissed a per-tool permission-prompt TUI
+   *  (the config_propose_edit / hostd-verb freeze) with a safe Esc-decline. */
+  permissionPromptFires: number;
   /** #2471 — count of manifest-stall escalations (kill + handoff restart). */
   restartEscalations: number;
   /** Total polls executed (bounded only in tests via maxPolls). */
@@ -433,6 +497,15 @@ export async function runWedgeWatchdog(
       : (opts.confirmModalSignature ?? CONFIRM_MODAL_SIGNATURE);
   const confirmModalPolls =
     opts.confirmModalPolls ?? envInt("SWITCHROOM_WEDGE_CONFIRM_POLLS", DEFAULT_CONFIRM_MODAL_POLLS);
+  // Per-tool permission-prompt TUI freeze (config_propose_edit / hostd verbs).
+  // `null` disables the branch; `undefined` → default on.
+  const permissionPromptSignature =
+    opts.permissionPromptSignature === null
+      ? null
+      : (opts.permissionPromptSignature ?? PERMISSION_PROMPT_SIGNATURE);
+  const permissionPromptPolls =
+    opts.permissionPromptPolls ??
+    envInt("SWITCHROOM_WEDGE_PERMISSION_POLLS", DEFAULT_PERMISSION_PROMPT_POLLS);
   const manifestStallSignature =
     opts.manifestStallSignature === null
       ? null
@@ -452,13 +525,16 @@ export async function runWedgeWatchdog(
   let fires = 0;
   let rateLimitFires = 0;
   let confirmModalFires = 0;
+  let permissionPromptFires = 0;
   let restartEscalations = 0;
   let polls = 0;
   // #2471 — shape-persistence counters (independent of the byte-stable
   // `stableCount`): how many CONSECUTIVE polls each shape has been PRESENT.
   let confirmModalPresent = 0;
+  let permissionPromptPresent = 0;
   let manifestStallPresent = 0;
   let confirmCooldownUntil = 0;
+  let permissionCooldownUntil = 0;
 
   while (polls < maxPolls) {
     polls++;
@@ -492,14 +568,27 @@ export async function runWedgeWatchdog(
     // wording), so there is no collision to defer for. The watchdog's
     // remedy here (Esc) is also identical to the autoaccept effort rule, so
     // even an overlap would be harmless.
+    // Per-tool permission-prompt TUI ("Do you want to proceed?" + a
+    // "don't ask again" affordance) — the config_propose_edit / hostd-verb
+    // freeze. Precedence above the confirm-modal branch: its shape
+    // ("1. Yes / 2. Yes, and don't ask again / 3. No") is a SUPERSET match
+    // risk, so we classify it first and Esc-decline it (safe DENY).
+    const isPermissionPrompt =
+      !isRateLimitMenu &&
+      !!text &&
+      permissionPromptSignature !== null &&
+      permissionPromptSignature.test(text);
+
     const isConfirmModal =
       !isRateLimitMenu &&
+      !isPermissionPrompt &&
       !!text &&
       confirmModalSignature !== null &&
       confirmModalSignature.test(text);
 
     const isBlockingModal =
       !isRateLimitMenu &&
+      !isPermissionPrompt &&
       !isConfirmModal &&
       !!text &&
       signature.test(text) &&
@@ -591,6 +680,38 @@ export async function runWedgeWatchdog(
         stableCount = 0;
         lastKey = null;
       }
+    } else if (isPermissionPrompt) {
+      // SHAPE persistence (the Ink-rendered prompt repaints, so it is not
+      // byte-stable). Count consecutive polls the prompt has been PRESENT.
+      permissionPromptPresent++;
+      // Keep the byte-stable machinery neutral so a later wedge starts fresh.
+      stableCount = 0;
+      lastKey = null;
+      if (permissionPromptPresent >= permissionPromptPolls && now() >= permissionCooldownUntil) {
+        console.error(
+          `[wedge-watchdog] ${opts.agentName}: dismissing stuck per-tool ` +
+            `permission prompt (Esc == decline == safe DENY) after ` +
+            `${permissionPromptPresent} polls present ` +
+            `(~${Math.round((permissionPromptPresent * pollIntervalMs) / 1000)}s) — ` +
+            `the prompt rendered as an interactive TUI with no TTL auto-deny, ` +
+            `freezing the turn; no human to answer it`,
+        );
+        // Esc ONLY — Claude Code treats Esc as "user declined", which is the
+        // safe DENY for a non-pre-approved verb. It can NEVER land on option
+        // 1/2 ("Yes" / "Yes, and don't ask again"), so the human-in-the-loop
+        // boundary for the hostd verbs is preserved. Never send Enter/numeric.
+        try {
+          send(opts.agentName, ["Escape"]);
+        } catch (err) {
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          );
+        }
+        fires++;
+        permissionPromptFires++;
+        permissionCooldownUntil = now() + cooldownMs;
+        permissionPromptPresent = 0;
+      }
     } else if (isConfirmModal) {
       // #2471 — SHAPE persistence, not byte-stability: count consecutive
       // polls the modal has been PRESENT. A flickering modal (timer
@@ -598,9 +719,11 @@ export async function runWedgeWatchdog(
       // branch never would.
       confirmModalPresent++;
       // Modal cleared the byte-stable streak machinery — keep it neutral so
-      // a later byte-stable wedge starts fresh.
+      // a later byte-stable wedge starts fresh. A different shape is showing,
+      // so drop any permission-prompt streak too.
       stableCount = 0;
       lastKey = null;
+      permissionPromptPresent = 0;
       if (confirmModalPresent >= confirmModalPolls && now() >= confirmCooldownUntil) {
         console.error(
           `[wedge-watchdog] ${opts.agentName}: dismissing stuck confirmation modal ` +
@@ -658,6 +781,8 @@ export async function runWedgeWatchdog(
       // #2471 — the confirmation modal is gone; reset its shape-present
       // streak so a re-armed modal must re-accumulate from scratch.
       confirmModalPresent = 0;
+      // Same for the permission-prompt streak — gone means re-accumulate.
+      permissionPromptPresent = 0;
     }
 
     await sleep(pollIntervalMs);
@@ -667,6 +792,7 @@ export async function runWedgeWatchdog(
     fires,
     rateLimitFires,
     confirmModalFires,
+    permissionPromptFires,
     restartEscalations,
     polls,
     reason: "max-polls",
