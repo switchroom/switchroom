@@ -1,6 +1,58 @@
 # Changelog
 
-## unreleased — turn-liveness primitive: a busy-but-silent turn can't read as "done" (#2527)
+## v0.16.2 — opt-in overage, /auth add TTY fix, feed + turn liveness
+
+This release adds an operator opt-in to spend an account's Anthropic overage
+past the weekly wall (default-off, subscription-honest by construction), fixes
+the `/auth add` Telegram OAuth flow, and hardens two activity-liveness surfaces
+so a busy-but-silent turn never reads as idle or "done".
+
+### Opt-in overage past the weekly wall (#2591)
+
+The auth-broker can now keep a flagged account eligible past the 7-day
+utilization wall when Anthropic reports overage is available — strictly opt-in,
+and still the unmodified `claude` CLI on the subscription (no API/SDK; the
+`claude-native` invariant is untouched).
+
+- **`auth.allow_overage_accounts`** (new config list, default absent) — only an
+  account explicitly listed is ever kept eligible past the wall, and only while
+  its fresh quota snapshot reports `overageStatus:"allowed"` and not
+  `out_of_credits`. Every unflagged account behaves exactly as before.
+- **Broker is the sole spend authority.** The in-agent wedge-watchdog consults a
+  single broker boolean (`active_overage_serving`) before, on the
+  `/rate-limit-options` menu, selecting "usage credits" instead of Escaping —
+  and only for the opted-in account. With no flag set the watchdog is
+  byte-identical to today (Escape-only); every error path fails safe to Escape.
+- **Auto-stop + most-recent-signal-wins.** A fresh probe reporting
+  `out_of_credits` removes the lift immediately; a real-429 mark blocks while it
+  is the newest signal, and a fresh post-429 `allowed` probe re-authorizes —
+  which is how overage engages at the wall. Kill switch
+  `SWITCHROOM_RATE_LIMIT_OVERAGE=0`.
+- **Docs.** `reference/vision.md` pillar 3 + the `keep-my-subscription-honest`
+  and `track-plan-quota-live` job specs amended to record the narrow opt-in
+  carve-out (same shape as the existing opt-in voice-key exception).
+
+### /auth add — setup-token under tmux so the TTY OAuth flow works (#2592, closes #2584)
+
+`claude setup-token` does TTY-direct I/O (writes the OAuth URL to `/dev/tty`,
+reads the code from the TTY), so the gateway spawning it with pipes never saw
+the URL and the code never reached it — `/auth add` timed out after 120s. It now
+runs under a tmux pane (mirroring the existing via-claude path): the URL is
+scraped with `capture-pane`, the code injected with `send-keys`, and every error
+path kills the session and wipes the scratch dir. The echoed code is never
+re-scraped.
+
+### Telegram narrative feed + post-answer background-agent liveness (#2589, supersedes #2587/#2588)
+
+- Restores the narrative feed lines and adds a post-answer liveness card so a
+  background sub-agent still surfaces activity after the answer lands.
+- The post-answer card is bounded by a default-on 30s staleness cap
+  (`SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS`) so a finished worker no longer
+  shows an ever-climbing "running" line. Decoupled post-teardown workers are
+  covered by the dedicated `workerActivityFeed`. Kill switch
+  `SWITCHROOM_FEED_HEARTBEAT=0`.
+
+### Turn-liveness primitive: a busy-but-silent turn can't read as "done" (#2527)
 
 A user could DM an agent, see the ambient ack (👀 / typing), and then get
 nothing for minutes while the agent worked — or a 👍 over a turn that never
