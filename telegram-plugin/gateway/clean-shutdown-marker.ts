@@ -181,3 +181,47 @@ export function resolveShutdownMarker(
   }
   return { ts: now, signal, reason: EXTERNAL_RESTART_FALLBACK_REASON };
 }
+
+/**
+ * Pure decision: should the boot-resume path SUPPRESS the active
+ * resume_interrupted inbound because the prior shutdown was clean?
+ *
+ * A clean marker present and fresh (<= maxAgeMs, default 60s) means the
+ * prior shutdown was operator/roll/CLI-initiated — NOT a crash. In that
+ * case auto-resuming interrupted work is wasteful: the agent was asked to
+ * stop, it stopped cleanly, and the "interrupted" turn was implicitly
+ * abandoned by that decision. Burning a full model turn to replay it on
+ * every operator restart wastes subscription quota for no user benefit.
+ *
+ * Returns true ONLY when:
+ *   - a clean marker is present, AND
+ *   - the marker is younger than maxAgeMs (default 60s), AND
+ *   - the SWITCHROOM_BOOT_RESUME_ALWAYS escape hatch is not set.
+ *
+ * Returns false when:
+ *   - no marker (crash / OOM / unexpected kill — resume normally), OR
+ *   - marker is stale (>= maxAgeMs — something stalled; treat as crash), OR
+ *   - forceAlways is true (the escape hatch is active).
+ *
+ * The forceAlways parameter maps to the env var
+ * SWITCHROOM_BOOT_RESUME_ALWAYS=1, which restores the pre-gate behaviour
+ * unconditionally. Pass it in as a parsed boolean so this function stays
+ * pure and testable without touching process.env.
+ *
+ * Keeping this pure makes the decision unit-testable in bun test without
+ * spinning up the gateway.
+ */
+export function shouldSuppressBootResume(
+  marker: CleanShutdownMarker | null,
+  now: number,
+  { maxAgeMs = DEFAULT_MAX_AGE_MS, forceAlways = false }: {
+    maxAgeMs?: number;
+    forceAlways?: boolean;
+  } = {},
+): boolean {
+  if (forceAlways) return false;
+  if (marker === null) return false;
+  const age = now - marker.ts;
+  if (age < 0) return false; // clock skew defence — treat as stale
+  return age < maxAgeMs;
+}
