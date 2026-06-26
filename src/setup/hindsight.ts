@@ -448,7 +448,7 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
   const args = [
     "run", "-d",
     "--name", "switchroom-hindsight",
-    "--restart", "unless-stopped",
+    "--restart", "always",
     // Container resource caps (memory + pids only; CPU uncapped —
     // see HINDSIGHT_DEFAULT_MEM_LIMIT constant for the v0.13.22 → v0.13.23
     // unwind rationale).
@@ -633,7 +633,7 @@ export function generateHindsightComposeSnippet(): string {
     `      - ${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,
     "    tmpfs:",
     `      - /run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
-    "    restart: unless-stopped",
+    "    restart: always",
     "",
     "volumes:",
     "  switchroom-hindsight-data:",
