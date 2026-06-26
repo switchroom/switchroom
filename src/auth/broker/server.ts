@@ -1164,7 +1164,13 @@ export class AuthBroker {
     const now = this.now();
     if (!snapshot || !snapshotFresh(snapshot, now)) return false;
     if (!overageLiftsWall(snapshot, true)) return false;
-    // A mark from a real 429 blocks unconditionally — overage never overrides it.
+    // Mark vs. snapshot is MOST-RECENT-SIGNAL-WINS (see accountEligibility): a
+    // real-429 mark blocks overage only while it is NEWER than the latest fresh
+    // probe. Once the broker re-probes after the 429 and Anthropic reports
+    // overageStatus:"allowed", that newer snapshot re-authorizes overage — which
+    // is exactly how overage engages at the weekly wall, since hitting the wall
+    // is what wrote the mark in the first place. A mark that is newer than the
+    // last probe still blocks (a fresh refusal wins).
     return (
       accountEligibility({
         mark: this.quota[account],

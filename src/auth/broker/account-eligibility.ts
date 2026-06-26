@@ -222,9 +222,13 @@ export type AccountEligibility = "blocked" | "eligible" | "unknown";
  * Overage lift (opt-in):
  *  When `allowOverage` is true AND the snapshot satisfies `overageLiftsWall()`,
  *  a utilization wall (≥99.5%) is NOT treated as a block — Anthropic will
- *  serve the account via overage billing. The lift applies ONLY to the
- *  snapshot-driven wall; an active exhaustion mark written by a real 429
- *  (`mark-exhausted`) still blocks unconditionally.
+ *  serve the account via overage billing. The lift follows the same
+ *  most-recent-signal-wins rule above: a real-429 mark still blocks while it is
+ *  the newest signal (newer than the latest fresh snapshot), but a fresh
+ *  post-429 probe reporting `overageStatus:"allowed"` re-authorizes the
+ *  account. This is intended — it is how overage resumes serving after the
+ *  weekly wall's initial 429 (the wall is what wrote the mark), and it
+ *  auto-stops the moment a probe reports `out_of_credits`.
  */
 export function accountEligibility(opts: {
   mark?: ExhaustionMark;

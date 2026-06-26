@@ -416,15 +416,46 @@ describe("accountEligibility — allow_overage matrix (the alice case and safety
     ).toBe("eligible");
   });
 
-  it("flagged + util 100% + allowOverage + active exhaustion MARK → BLOCKED (mark overrides overage lift)", () => {
-    // An exhaustion mark written by a real 429 must still block — overage only
-    // lifts the snapshot-driven wall, not a mark.
+  it("flagged + util 100% + allowOverage + NEWER exhaustion MARK → BLOCKED (fresh 429 wins)", () => {
+    // Most-recent-signal-wins: a real-429 mark NEWER than the latest probe is
+    // the freshest refusal, so it blocks even with overage allowed.
     const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 500 };
-    // Mark is newer than snapshot (capturedAt: NOW - 30_000), so mark governs.
+    // Mark (NOW - 500) is newer than snapshot (capturedAt: NOW - 30_000), so mark governs.
     expect(
       accountEligibility({
         mark,
         snapshot: snap(0, 100, 30_000, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("blocked");
+  });
+
+  it("flagged + util 100% + allowOverage + OLDER mark + fresh allowed probe → ELIGIBLE (re-probe after 429 re-authorizes overage)", () => {
+    // The intended weekly-wall flow: hitting the wall writes the 429 mark, then
+    // the broker re-probes (~10min) and Anthropic reports overageStatus:allowed.
+    // That newer snapshot re-authorizes overage — most-recent-signal-wins. This
+    // is why option A (mark blocks unconditionally) was rejected: it would make
+    // overage inert at exactly the wall it exists to serve past.
+    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 30_000 };
+    // Snapshot (capturedAt: NOW - 500) is newer than mark (NOW - 30_000), so the probe governs.
+    expect(
+      accountEligibility({
+        mark,
+        snapshot: snap(0, 100, 500, { status: "allowed", reason: null }),
+        now: NOW,
+        allowOverage: true,
+      }),
+    ).toBe("eligible");
+  });
+
+  it("flagged + OLDER mark + fresh probe shows out_of_credits → BLOCKED (overage auto-stop wins even past the mark)", () => {
+    // Even when the probe is newer than the mark, out_of_credits removes the lift.
+    const mark: ExhaustionMark = { exhausted_until: NOW + FIVE_H, marked_at: NOW - 30_000 };
+    expect(
+      accountEligibility({
+        mark,
+        snapshot: snap(0, 100, 500, { status: "allowed", reason: "out_of_credits" }),
         now: NOW,
         allowOverage: true,
       }),
