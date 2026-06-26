@@ -17857,11 +17857,12 @@ bot.command("auth", async ctx => {
       return
     }
     try {
-      const { loginUrl, scratchDir, child } = await startAccountAuthSession(parsed.label)
+      const { loginUrl, scratchDir, tmuxSocket, tmuxSession } = await startAccountAuthSession(parsed.label)
       pendingAuthAddFlows.set(authAddKey, {
         label: parsed.label,
         scratchDir,
-        child,
+        tmuxSocket,
+        tmuxSession,
         startedAt: Date.now(),
       })
       await switchroomReply(

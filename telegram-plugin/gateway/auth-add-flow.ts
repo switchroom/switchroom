@@ -7,20 +7,17 @@
  * OAuth account. This module owns that flow end-to-end:
  *
  *   1. Operator sends `/auth add <label>`.
- *   2. Gateway calls {@link startAccountAuthSession} → spawns
- *      `claude setup-token` against a scratch directory under
- *      `~/.switchroom/accounts/.in-progress/<label>-<rand>/`, captures
- *      the OAuth authorize URL, and tucks pending state into
- *      {@link pendingAuthAddFlows}.
+ *   2. Gateway calls {@link startAccountAuthSession} → launches
+ *      `claude setup-token` inside a detached tmux session, captures
+ *      the OAuth authorize URL via `capture-pane`, and tucks pending
+ *      state into {@link pendingAuthAddFlows}.
  *   3. Gateway replies to chat with the URL + paste instructions.
  *   4. Operator opens URL, logs in, copies the browser code, pastes
  *      into chat. Gateway's `pendingReauthFlows`-style intercept
  *      catches the paste and calls {@link submitAccountAuthCode}.
- *   5. Helper reads `<scratch>/.credentials.json` (the dotfile that
- *      `claude setup-token` writes on success — pinned in
- *      `src/auth/broker/server-add-account.test.ts`), builds the
- *      {@link AddAccountCredentials} payload, and the gateway calls
- *      broker `addAccount(label, credentials, replace=false)`.
+ *   5. Helper submits the code via `send-keys`, then polls only the
+ *      filesystem + tmux session liveness for success/failure — no
+ *      capture-pane after code submission (the echoed code is a secret).
  *   6. Scratch dir is wiped on every code path — success, cancel,
  *      paste-failure, TTL timeout, gateway shutdown.
  *
@@ -50,10 +47,18 @@
  * the gateway, never forwarded to the agent's bridge. If every account
  * on the fleet is rate-limited the LLM is unreachable — that's the
  * whole point of the flow existing.
+ *
+ * **tmux is required** because `claude setup-token` writes the OAuth URL
+ * and reads the browser code directly through `/dev/tty` (not
+ * stdout/stderr/stdin). Pipe-based spawning (`stdio: ['pipe','pipe','pipe']`)
+ * leaves the URL buffer permanently empty — the process writes to /dev/tty
+ * which no pipe captures. A tmux pty gives setup-token the tty it needs;
+ * we scrape the URL via `capture-pane` and inject the code via `send-keys`.
+ * This requires `SWITCHROOM_TMUX_SUPERVISOR=1` in the agent's environment.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -66,6 +71,107 @@ import type {
   AddAccountCredentials,
   AnthropicAddAccountCredentials,
 } from '../../src/auth/broker/client.js'
+
+/* ── Injectable tmux ops (mirrors makeTmuxRunner in src/agents/inject.ts) ─── */
+
+/**
+ * Injectable tmux operations for the auth-add flow.
+ *
+ * Co-located here (rather than importing from inject.ts) because:
+ *   - The gateway must not depend on the CLI src/agents/ subtree at runtime.
+ *   - The shape is narrower (capture + send + has-session + new-session +
+ *     kill-session) and carries `-L <socket>` for isolated socket routing.
+ *   - Unit tests mock this interface; the integration test uses
+ *     {@link makeAuthAddTmuxOps} against a throwaway socket.
+ */
+export interface AuthAddTmuxOps {
+  /**
+   * `tmux -L <socket> new-session -d -s <session> -e KEY=VAL ... -x 400 -y 50 <cmd>`
+   * Returns the tmux new-session stdout (usually empty).
+   */
+  newSession(socket: string, session: string, env: Record<string, string>, cmd: string): void
+  /**
+   * `tmux -L <socket> capture-pane -p -t <session> -S -200`
+   * Returns pane content or null if the session/pane is gone.
+   */
+  capture(socket: string, session: string): string | null
+  /**
+   * Two `send-keys` calls mirroring src/auth/manager.ts:866-867:
+   *   1. `send-keys -l -t <session> <text>` (literal, no key-name expansion)
+   *   2. `send-keys    -t <session> Enter`
+   * Throws on tmux error; caller is responsible for not calling this after
+   * the session has ended.
+   */
+  send(socket: string, session: string, text: string): void
+  /** `tmux -L <socket> has-session -t <session>` — returns true if alive. */
+  hasSession(socket: string, session: string): boolean
+  /** `tmux -L <socket> kill-session -t <session>` — best-effort. */
+  killSession(socket: string, session: string): void
+}
+
+/**
+ * Build the real {@link AuthAddTmuxOps} backed by the system `tmux` binary.
+ *
+ * Pass a custom `tmuxBin` to use an alternate binary path in integration
+ * tests. The socket name is always passed via `-L` so every call is routed
+ * to the correct tmux server instance.
+ */
+export function makeAuthAddTmuxOps(tmuxBin = 'tmux'): AuthAddTmuxOps {
+  return {
+    newSession(socket, session, env, cmd) {
+      const envFlags: string[] = []
+      for (const [k, v] of Object.entries(env)) {
+        envFlags.push('-e', `${k}=${v}`)
+      }
+      execFileSync(
+        tmuxBin,
+        ['-L', socket, 'new-session', '-d', '-s', session, ...envFlags, '-x', '400', '-y', '50', cmd],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      )
+    },
+    capture(socket, session) {
+      try {
+        return execFileSync(
+          tmuxBin,
+          ['-L', socket, 'capture-pane', '-p', '-t', session, '-S', '-200'],
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+        )
+      } catch {
+        return null
+      }
+    },
+    send(socket, session, text) {
+      // Mirror src/auth/manager.ts:866-867 exactly:
+      //   1. send the literal code (no key-name expansion)
+      //   2. send Enter separately
+      execFileSync(tmuxBin, ['-L', socket, 'send-keys', '-l', '-t', session, text.trim()], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      execFileSync(tmuxBin, ['-L', socket, 'send-keys', '-t', session, 'Enter'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    },
+    hasSession(socket, session) {
+      try {
+        execFileSync(tmuxBin, ['-L', socket, 'has-session', '-t', session], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+        return true
+      } catch {
+        return false
+      }
+    },
+    killSession(socket, session) {
+      try {
+        execFileSync(tmuxBin, ['-L', socket, 'kill-session', '-t', session], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+      } catch {
+        // best-effort
+      }
+    },
+  }
+}
 
 /* ── Pending-state map ────────────────────────────────────────────────── */
 
@@ -81,8 +187,10 @@ import type {
 export interface PendingAuthAddFlow {
   label: string
   scratchDir: string
-  /** PID of the spawned `claude setup-token` process, for cancel-kill. */
-  child: ChildProcess
+  /** tmux socket name (`switchroom-<agentName>`). */
+  tmuxSocket: string
+  /** tmux session name (`auth-add-<label>-<hex>`). */
+  tmuxSession: string
   startedAt: number
 }
 export const pendingAuthAddFlows = new Map<string, PendingAuthAddFlow>()
@@ -126,168 +234,261 @@ export function cleanScratchDir(scratchDir: string): void {
   }
 }
 
+/* ── Orphan cleanup ───────────────────────────────────────────────────── */
+
+/**
+ * Filename written into the scratch dir at session start so that a
+ * subsequent `startAccountAuthSession` can identify and kill orphaned
+ * tmux sessions from crashed/restarted gateways.
+ */
+const AUTH_TMUX_SESSION_FILE = '.auth-tmux-session'
+
+/**
+ * Sweep `~/.switchroom/accounts/.in-progress/` for dirs older than
+ * 10 minutes (stale from a prior gateway crash). For each, read the
+ * `.auth-tmux-session` file, best-effort kill the tmux session, then
+ * remove the dir.
+ *
+ * Called at the start of every `startAccountAuthSession` invocation.
+ */
+function sweepOrphanSessions(
+  home: string,
+  tmux: AuthAddTmuxOps,
+  nowMs: number = Date.now(),
+): void {
+  const inProgressDir = join(home, '.switchroom', 'accounts', '.in-progress')
+  if (!existsSync(inProgressDir)) return
+  let entries: string[]
+  try {
+    entries = readdirSync(inProgressDir)
+  } catch {
+    return
+  }
+  const tenMinMs = 10 * 60_000
+  for (const entry of entries) {
+    const dir = join(inProgressDir, entry)
+    // Check age via the session file's mtime (proxy for dir creation time).
+    const sessionFile = join(dir, AUTH_TMUX_SESSION_FILE)
+    if (!existsSync(sessionFile)) continue
+    let fileContents: string
+    let fileMtime: number
+    try {
+      const stat = statSync(sessionFile)
+      fileMtime = stat.mtimeMs
+      fileContents = readFileSync(sessionFile, 'utf8').trim()
+    } catch {
+      continue
+    }
+    if (nowMs - fileMtime < tenMinMs) continue
+    // Old enough — try to kill the session.
+    if (fileContents) {
+      const [socket, session] = fileContents.split('\n')
+      if (socket && session) {
+        tmux.killSession(socket.trim(), session.trim())
+      }
+    }
+    // Remove the dir.
+    cleanScratchDir(dir)
+  }
+}
+
 /* ── Subprocess lifecycle ─────────────────────────────────────────────── */
 
 export interface StartAccountAuthSessionResult {
   loginUrl: string
   scratchDir: string
-  child: ChildProcess
+  tmuxSocket: string
+  tmuxSession: string
 }
 
 /**
- * Spawn `claude setup-token` against a fresh scratch directory and
- * resolve once the authorize URL has been parsed from its stdout/stderr.
+ * Launch `claude setup-token` inside a detached tmux session and
+ * resolve once the authorize URL has been scraped from the pane.
  *
- * Why we *don't* use tmux: the `submitAuthCode` path in
- * `src/auth/manager.ts` uses tmux because that flow is interactive —
- * an operator on a host can `tmux attach` to inspect the auth prompt
- * if anything goes wrong. The chat flow has no equivalent escape
- * hatch (the operator is on their phone) and a pipe-based subprocess
- * is far easier to lifecycle-manage from a long-running gateway. We
- * write the code to the child's stdin in {@link submitAccountAuthCode}.
+ * Why tmux (not a pipe): `claude setup-token` writes the OAuth URL and
+ * reads the browser code directly through `/dev/tty`, bypassing
+ * stdout/stderr/stdin entirely. A pipe-spawned process sees an empty
+ * buffer forever. A tmux pane provides the tty; `capture-pane` scrapes
+ * what setup-token wrote there.
  *
- * The child is left running between {@link startAccountAuthSession}
- * and {@link submitAccountAuthCode} — closing stdin before the code
- * is pasted would tear down the OAuth session.
+ * **Critical env footgun:** the tmux server's environment is frozen at
+ * container boot. Ambient inheritance via `process.env` does NOT flow
+ * into a `new-session` call — every variable that must reach the child
+ * MUST be passed explicitly via `-e KEY=VAL` flags. This applies to
+ * `CLAUDE_CONFIG_DIR`, `BROWSER`, `HOME`, and `PATH`.
  *
- * Timeout default: 12 seconds to see the URL. claude setup-token
- * typically prints the URL within ~3–5s; 12s covers an unloaded VM
- * with slow startup. Caller passes the timeout via opts so tests can
- * shorten it.
+ * **Socket:** `switchroom-<SWITCHROOM_AGENT_NAME>` — the same socket
+ * the agent's gateway supervisor uses. This requires
+ * `SWITCHROOM_TMUX_SUPERVISOR=1` to be set in the gateway's environment.
+ *
+ * Credential file lands at `<scratchDir>/.credentials.json` because
+ * `CLAUDE_CONFIG_DIR=scratchDir` is passed explicitly into the session.
+ *
+ * Timeout default: 12 seconds to see the URL. `claude setup-token`
+ * typically renders the URL within ~3–5s; 12s covers an unloaded VM.
+ *
+ * @throws if `SWITCHROOM_TMUX_SUPERVISOR` is not set to '1'.
+ * @throws if the URL is not captured within `urlTimeoutMs`.
  */
 export async function startAccountAuthSession(
   label: string,
   opts: {
     home?: string
     urlTimeoutMs?: number
-    /** Override the binary name (tests). */
+    /** Override the tmux binary (integration tests). */
+    tmuxBin?: string
+    /** Override tmux ops entirely (unit tests). */
+    tmuxOps?: AuthAddTmuxOps
+    /** Override the agent name (tests). */
+    agentName?: string
+    /** Override the claude binary name (tests). */
     claudeBinary?: string
   } = {},
 ): Promise<StartAccountAuthSessionResult> {
+  if (process.env.SWITCHROOM_TMUX_SUPERVISOR !== '1' && !opts.tmuxOps) {
+    throw new Error(
+      'tmux supervisor required for /auth add: SWITCHROOM_TMUX_SUPERVISOR is not set to "1". ' +
+        'Legacy pipe-based setup-token is unsupported (setup-token writes to /dev/tty, not stdout/stderr).',
+    )
+  }
+
   const home = opts.home ?? homedir()
   const urlTimeoutMs = opts.urlTimeoutMs ?? 12_000
+  const agentName = opts.agentName ?? process.env.SWITCHROOM_AGENT_NAME ?? 'gateway'
+  const tmux = opts.tmuxOps ?? makeAuthAddTmuxOps(opts.tmuxBin)
   const binary = opts.claudeBinary ?? 'claude'
 
   const scratchDir = pickScratchDir(label, home)
   mkdirSync(scratchDir, { recursive: true, mode: 0o700 })
 
-  // BROWSER=/bin/true: same rationale as src/auth/manager.ts's
-  // startAuthSession — suppress claude setup-token's host-side browser
-  // auto-launch (would land on Claude's login page with no cookies on
-  // a headless box). The chat flow is paste-only.
-  const child = spawn(binary, ['setup-token'], {
-    env: {
-      ...process.env,
-      CLAUDE_CONFIG_DIR: scratchDir,
-      BROWSER: '/bin/true',
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
+  // Sweep orphan sessions BEFORE creating the new one so the dir count
+  // stays bounded even across repeated gateway restarts.
+  sweepOrphanSessions(home, tmux)
 
-  // Aggregate stdout+stderr; the URL can land on either channel
-  // depending on claude CLI version.
-  let buffer = ''
-  const collect = (chunk: Buffer): void => {
-    buffer += chunk.toString('utf8')
+  // Session name reuses the random hex already in the scratchDir basename.
+  const hexSuffix = scratchDir.slice(scratchDir.lastIndexOf('-') + 1)
+  const tmuxSocket = `switchroom-${agentName}`
+  const tmuxSession = `auth-add-${label}-${hexSuffix}`.slice(0, 64)
+
+  // Write the session coordinates to the scratch dir for orphan cleanup.
+  try {
+    writeFileSync(join(scratchDir, AUTH_TMUX_SESSION_FILE), `${tmuxSocket}\n${tmuxSession}`, 'utf8')
+  } catch {
+    // best-effort — orphan cleanup is non-critical
   }
-  child.stdout?.on('data', collect)
-  child.stderr?.on('data', collect)
 
-  // Race: URL detection vs timeout vs child exit before URL appeared.
+  // Build the env passed explicitly into the tmux session.
+  // CRITICAL: tmux server env is frozen at container boot; ambient
+  // inheritance does NOT carry CLAUDE_CONFIG_DIR or BROWSER into the
+  // child. Every required variable must appear as a -e flag here.
+  const sessionEnv: Record<string, string> = {
+    HOME: home,
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+    CLAUDE_CONFIG_DIR: scratchDir,
+    BROWSER: '/bin/true',
+  }
+  // Forward any extra vars the operator may have set.
+  if (process.env.CLAUDE_CONFIG_DIR) sessionEnv['CLAUDE_CONFIG_DIR'] = scratchDir // always override
+  if (process.env.XDG_CONFIG_HOME) sessionEnv['XDG_CONFIG_HOME'] = process.env.XDG_CONFIG_HOME
+
+  try {
+    tmux.newSession(tmuxSocket, tmuxSession, sessionEnv, binary + ' setup-token')
+  } catch (err) {
+    cleanScratchDir(scratchDir)
+    throw new Error(`Failed to start tmux session for claude setup-token: ${(err as Error).message}`)
+  }
+
+  // Poll capture-pane every 500ms up to the URL timeout.
   const loginUrl = await new Promise<string>((resolve, reject) => {
     const deadline = setTimeout(() => {
-      cleanup()
+      clearInterval(ticker)
+      tmux.killSession(tmuxSocket, tmuxSession)
+      cleanScratchDir(scratchDir)
       reject(new Error(`claude setup-token did not print an OAuth URL within ${urlTimeoutMs}ms`))
     }, urlTimeoutMs)
 
-    const tick = setInterval(() => {
-      const url = parseSetupTokenUrl(buffer)
+    const ticker = setInterval(() => {
+      const pane = tmux.capture(tmuxSocket, tmuxSession)
+      if (pane === null) {
+        // Session died before URL appeared.
+        clearTimeout(deadline)
+        clearInterval(ticker)
+        cleanScratchDir(scratchDir)
+        reject(new Error('claude setup-token exited before printing OAuth URL'))
+        return
+      }
+      const url = parseSetupTokenUrl(pane)
       if (url) {
-        cleanup()
+        clearTimeout(deadline)
+        clearInterval(ticker)
+        // Leave the session alive — operator has not yet pasted the code.
         resolve(url)
       }
-    }, 200)
-
-    const onExit = (code: number | null): void => {
-      cleanup()
-      reject(new Error(`claude setup-token exited (code ${code}) before printing OAuth URL`))
-    }
-    child.once('exit', onExit)
-
-    function cleanup(): void {
-      clearTimeout(deadline)
-      clearInterval(tick)
-      child.removeListener('exit', onExit)
-    }
-  }).catch((err) => {
-    // Kill the child and wipe the scratch dir before re-raising so
-    // failed-to-start sessions don't leak.
-    try { child.kill('SIGTERM') } catch { /* best-effort */ }
-    cleanScratchDir(scratchDir)
-    throw err
+    }, 500)
   })
 
-  return { loginUrl, scratchDir, child }
+  return { loginUrl, scratchDir, tmuxSocket, tmuxSession }
 }
 
 /**
- * Paste the operator's browser code into the live `claude setup-token`
- * child's stdin and wait for the success-written credentials.json.
+ * Submit the operator's browser code into the live tmux session and
+ * wait for the success-written credentials.json.
  *
- * Returns the `AddAccountCredentials` shape the broker's add-account
- * verb expects — same `claudeAiOauth: { accessToken, refreshToken,
- * expiresAt, scopes, subscriptionType, rateLimitTier }` envelope.
+ * Code is submitted via TWO `send-keys` calls (mirroring
+ * `src/auth/manager.ts:866-867`):
+ *   1. `send-keys -l -t <session> <code.trim()>` — literal, no key expansion
+ *   2. `send-keys    -t <session> Enter`
  *
- * On success: the caller is responsible for invoking
- * `cleanScratchDir(scratchDir)` after `addAccount` returns; we
- * deliberately don't wipe here because the broker call might race the
- * filesystem cleanup. On failure (invalid code, expired code, timeout)
- * the helper throws and cleans the scratch dir itself.
+ * **After code submission, capture-pane is NEVER called again.**
+ * The echoed code is a secret OAuth token; scraping the pane post-submit
+ * would risk logging it. Success is detected exclusively via:
+ *   - Filesystem: `<scratchDir>/.credentials.json` appearing.
+ *   - Session liveness: `has-session` returning false after code submit
+ *     with no cred file → invalid/expired code (clean error, not 300s hang).
  *
- * Poll interval default: 250ms — same as `submitAuthCode`'s 500ms
- * halved because there's no tmux capture-pane overhead per tick.
- * Timeout default: 120s, matching the env var in `submitAuthCode`.
+ * Code timeout raised to 300s (vs the prior 120s) to give the operator
+ * adequate time to complete the browser flow on their phone.
  */
 export async function submitAccountAuthCode(
   flow: PendingAuthAddFlow,
   code: string,
-  opts: { pollIntervalMs?: number; pollTimeoutMs?: number } = {},
+  opts: {
+    pollIntervalMs?: number
+    pollTimeoutMs?: number
+    tmuxOps?: AuthAddTmuxOps
+  } = {},
 ): Promise<AddAccountCredentials> {
   const pollIntervalMs = opts.pollIntervalMs ?? 250
-  const pollTimeoutMs = opts.pollTimeoutMs ?? 120_000
+  const pollTimeoutMs = opts.pollTimeoutMs ?? 300_000
+  const tmux = opts.tmuxOps ?? makeAuthAddTmuxOps()
 
   const credentialsPath = join(flow.scratchDir, '.credentials.json')
 
-  // Write the code + newline to stdin. claude setup-token's prompt
-  // expects line-buffered input — see the manual-paste paste at the
-  // bottom of `submitAuthCode`. We use a single write here (vs the
-  // two send-keys calls of the tmux path) because there's no
-  // terminfo-flake concern over a pipe.
-  if (!flow.child.stdin || flow.child.stdin.destroyed) {
+  // Submit the code via two send-keys calls.
+  // After this point, capture-pane is NEVER called (code is a secret).
+  try {
+    tmux.send(flow.tmuxSocket, flow.tmuxSession, code)
+  } catch (err) {
     cleanScratchDir(flow.scratchDir)
-    throw new Error('claude setup-token process stdin is not writable (child may have exited)')
+    throw new Error(
+      `Failed to submit auth code to tmux session: ${(err as Error).message}`,
+    )
   }
-  flow.child.stdin.write(code.trim() + '\n')
 
-  // Poll for the credentials file. Same two-channel design as
-  // submitAuthCode but tmux-pane-scrape and log-scrape are out (the
-  // pane scrape was a fallback for older claude CLI versions; the
-  // chat flow targets the current CLI by definition).
+  // Poll filesystem + session liveness only — no capture-pane.
   const deadline = Date.now() + pollTimeoutMs
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, pollIntervalMs))
+
     if (existsSync(credentialsPath)) {
       const token = readTokenFromCredentialsFile(credentialsPath)
       if (token) {
-        // Parse the full credentials envelope to forward to the
-        // broker. readTokenFromCredentialsFile already validated the
-        // accessToken regex, so the JSON is well-formed.
         try {
           const raw = readFileSync(credentialsPath, 'utf-8')
           const parsed = JSON.parse(raw) as { claudeAiOauth?: AnthropicAddAccountCredentials['claudeAiOauth'] }
           if (parsed.claudeAiOauth?.accessToken) {
-            // Drain the child so it exits cleanly after success.
-            try { flow.child.stdin?.end() } catch { /* best-effort */ }
+            // Kill the tmux session cleanly — it's served its purpose.
+            tmux.killSession(flow.tmuxSocket, flow.tmuxSession)
             return { claudeAiOauth: parsed.claudeAiOauth }
           }
         } catch {
@@ -295,32 +496,36 @@ export async function submitAccountAuthCode(
         }
       }
     }
-    // Detect child early exit (invalid code → claude prints + exits).
-    if (flow.child.exitCode != null) {
-      cleanScratchDir(flow.scratchDir)
-      throw new Error(
-        `claude setup-token exited (code ${flow.child.exitCode}) — code may have been invalid or expired`,
-      )
+
+    // Detect session death: if session is gone AND no cred file → invalid code.
+    if (!tmux.hasSession(flow.tmuxSocket, flow.tmuxSession)) {
+      if (!existsSync(credentialsPath)) {
+        cleanScratchDir(flow.scratchDir)
+        throw new Error(
+          'claude setup-token exited without writing credentials — the code may be invalid or expired',
+        )
+      }
     }
   }
 
-  // Timeout — kill the child + wipe scratch.
-  try { flow.child.kill('SIGTERM') } catch { /* best-effort */ }
+  // Timeout — kill session + wipe scratch.
+  tmux.killSession(flow.tmuxSocket, flow.tmuxSession)
   cleanScratchDir(flow.scratchDir)
-  throw new Error(`No credentials file appeared at ${credentialsPath} within ${Math.round(pollTimeoutMs / 1000)}s`)
+  throw new Error(
+    `No credentials file appeared at ${credentialsPath} within ${Math.round(pollTimeoutMs / 1000)}s`,
+  )
 }
 
 /**
- * Cancel an in-flight `/auth add` flow: kill the `claude setup-token`
- * child, wipe the scratch dir, and let the caller delete the
- * `pendingAuthAddFlows` entry. Idempotent — safe to call when the
- * child has already exited.
+ * Cancel an in-flight `/auth add` flow: kill the tmux session, wipe
+ * the scratch dir, and let the caller delete the `pendingAuthAddFlows`
+ * entry. Idempotent — safe to call when the session has already exited.
  */
-export function cancelAccountAuthSession(flow: PendingAuthAddFlow): void {
-  try {
-    if (flow.child.exitCode == null) flow.child.kill('SIGTERM')
-  } catch {
-    // best-effort
-  }
+export function cancelAccountAuthSession(
+  flow: PendingAuthAddFlow,
+  tmuxOps?: AuthAddTmuxOps,
+): void {
+  const tmux = tmuxOps ?? makeAuthAddTmuxOps()
+  tmux.killSession(flow.tmuxSocket, flow.tmuxSession)
   cleanScratchDir(flow.scratchDir)
 }
