@@ -106,6 +106,60 @@ describe("quotaIndicatesExhaustion", () => {
   });
 });
 
+describe("quotaIndicatesExhaustion — allow_overage matrix", () => {
+  it("flagged + util 100% + overageStatus allowed + reason null → NOT exhausted (alice case)", () => {
+    // Consumer pinned to alice (7d=100%, overageStatus:'allowed', no reason).
+    // With allowOverage=true, the util wall must NOT mark exhausted.
+    expect(
+      quotaIndicatesExhaustion(ok({
+        sevenDayUtilizationPct: 100,
+        overageStatus: "allowed",
+        overageDisabledReason: null,
+      }), true),
+    ).toEqual({ exhausted: false, until: null });
+  });
+
+  it("flagged + util 100% + overageStatus allowed + reason out_of_credits → EXHAUSTED (credit gone — stop spending)", () => {
+    // Credit is exhausted — must mark exhausted even when flagged.
+    const reset = new Date("2026-07-03T00:00:00Z");
+    const result = quotaIndicatesExhaustion(ok({
+      sevenDayUtilizationPct: 100,
+      sevenDayResetAt: reset,
+      overageStatus: "allowed",
+      overageDisabledReason: "out_of_credits",
+    }), true);
+    expect(result.exhausted).toBe(true);
+    expect(result.until).toBe(reset.getTime());
+  });
+
+  it("flagged + util 100% + overageStatus rejected → EXHAUSTED (Anthropic rejects overage)", () => {
+    expect(
+      quotaIndicatesExhaustion(ok({
+        sevenDayUtilizationPct: 100,
+        overageStatus: "rejected",
+        overageDisabledReason: null,
+      }), true),
+    ).toMatchObject({ exhausted: true });
+  });
+
+  it("NOT flagged + util 100% + overageStatus allowed → EXHAUSTED (opt-in; default behavior unchanged)", () => {
+    // allowOverage=false (the default) — util wall applies as before.
+    expect(
+      quotaIndicatesExhaustion(ok({
+        sevenDayUtilizationPct: 100,
+        overageStatus: "allowed",
+        overageDisabledReason: null,
+      }), false),
+    ).toMatchObject({ exhausted: true });
+  });
+
+  it("flagged + util 50% → NOT exhausted (normal, no overage needed)", () => {
+    expect(
+      quotaIndicatesExhaustion(ok({ sevenDayUtilizationPct: 50 }), true),
+    ).toEqual({ exhausted: false, until: null });
+  });
+});
+
 describe("resolveConsumerProbeIntervalMs", () => {
   it("defaults when unset", () => {
     expect(resolveConsumerProbeIntervalMs({})).toBe(DEFAULT_CONSUMER_PROBE_INTERVAL_MS);

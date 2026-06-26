@@ -1033,3 +1033,61 @@ describe("ScheduleEntrySchema.topic (cron topic override)", () => {
     ).toThrow();
   });
 });
+
+// ─── auth.allow_overage_accounts config field ───────────────────────────────
+
+describe("auth.allow_overage_accounts config field", () => {
+  const minimalBase = {
+    switchroom: { version: 1 },
+    agents: {},
+    telegram: { bot_token: "123:abc", forum_chat_id: "456" },
+  };
+
+  it("accepts a valid allow_overage_accounts list and threads through to AuthConfig", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...minimalBase,
+      auth: {
+        active: "alice",
+        allow_overage_accounts: ["alice@example.com", "bob@example.com"],
+      },
+    });
+    expect(cfg.auth?.allow_overage_accounts).toEqual([
+      "alice@example.com",
+      "bob@example.com",
+    ]);
+  });
+
+  it("defaults to undefined (omitted) when not set — no accounts are opt-in by default", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...minimalBase,
+      auth: { active: "alice" },
+    });
+    expect(cfg.auth?.allow_overage_accounts).toBeUndefined();
+  });
+
+  it("accepts an empty list", () => {
+    const cfg = SwitchroomConfigSchema.parse({
+      ...minimalBase,
+      auth: { active: "alice", allow_overage_accounts: [] },
+    });
+    expect(cfg.auth?.allow_overage_accounts).toEqual([]);
+  });
+
+  it("rejects entries that are empty strings", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...minimalBase,
+        auth: { allow_overage_accounts: [""] },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects non-array values for allow_overage_accounts", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...minimalBase,
+        auth: { allow_overage_accounts: "alice@example.com" },
+      }),
+    ).toThrow();
+  });
+});

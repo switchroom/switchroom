@@ -26,6 +26,7 @@ import { execFileSync } from "node:child_process";
 import { runAutoaccept } from "../agents/autoaccept.js";
 import { runWedgeWatchdog } from "../agents/wedge-watchdog.js";
 import { signalQuotaWall } from "../agents/rate-limit-signal.js";
+import { queryActiveOverageServing } from "../agents/overage-decision.js";
 
 /**
  * #2471 — manifest-stall escalation. A turn stuck "Manifesting" with a
@@ -96,10 +97,21 @@ async function main(): Promise<void> {
   // menu. Kill switch SWITCHROOM_RATE_LIMIT_DETECT=0 → detect-disabled (the
   // watchdog behaves exactly as before: generic-modal Esc only).
   const rateLimitDetect = process.env.SWITCHROOM_RATE_LIMIT_DETECT !== "0";
+  // Opt-in OVERAGE carve-out: on a weekly-quota menu, ask the BROKER whether the
+  // active account is currently overage-authorized and, if so, select "usage
+  // credits" instead of failover. Default-off is enforced by the broker (returns
+  // false unless the account is in `allow_overage_accounts` AND Anthropic
+  // currently reports overage allowed). The extra kill switch
+  // SWITCHROOM_RATE_LIMIT_OVERAGE=0 forces Esc-only even for a flagged account
+  // (an operator "stop spending now" lever). Only wired when rate-limit
+  // detection is on (the menu branch is otherwise disabled anyway).
+  const overageSelect =
+    rateLimitDetect && process.env.SWITCHROOM_RATE_LIMIT_OVERAGE !== "0";
   try {
     console.error(
       `[autoaccept-poll] ${agentName}: entering wedge-watchdog (continuous)` +
-        (rateLimitDetect ? " +rate-limit-detect" : " (rate-limit-detect OFF)"),
+        (rateLimitDetect ? " +rate-limit-detect" : " (rate-limit-detect OFF)") +
+        (overageSelect ? " +overage-carveout" : ""),
     );
     // Runs until the container stops (maxPolls defaults to Infinity).
     const res = await runWedgeWatchdog({
@@ -112,11 +124,14 @@ async function main(): Promise<void> {
             void signalQuotaWall(name, resetAt);
           }
         : undefined,
+      // The money-spending decision lives in the broker; the watchdog only asks.
+      // Soft-fail inside queryActiveOverageServing → false (Esc-park).
+      overageDecision: overageSelect ? () => queryActiveOverageServing() : undefined,
       // #2471 — wire the manifest-stall escalation (kill/interrupt + handoff).
       requestRestart: requestWedgeRestart,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} restartEscalations=${res.restartEscalations}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(

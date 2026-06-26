@@ -199,6 +199,15 @@ export interface ListStateData {
   accounts: AccountState[];
   agents: AgentState[];
   consumers: ConsumerState[];
+  /**
+   * Whether the account THIS caller is bound to may currently be served past the
+   * weekly utilization wall on Anthropic overage billing — the broker's single
+   * audited spend-authorization signal. The in-agent wedge-watchdog reads it
+   * (never config) before a `/rate-limit-options` menu may select "usage
+   * credits". Absent on pre-overage brokers (treat as false). Default-off:
+   * false whenever `auth.allow_overage_accounts` is empty/unset.
+   */
+  active_overage_serving?: boolean;
 }
 
 export interface SetActiveData {

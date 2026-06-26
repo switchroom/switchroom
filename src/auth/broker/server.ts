@@ -45,12 +45,16 @@ import { fetchQuota, type QuotaResult } from "../quota.js";
 import {
   quotaIndicatesExhaustion,
   resolveConsumerProbeIntervalMs,
+  EXHAUSTION_PCT,
 } from "./consumer-quota-sensor.js";
 import {
   isAccountBlocked as evalAccountBlocked,
   accountEligibility,
   snapshotShouldClearMark,
   clampMarkExpiry,
+  overageLiftsWall,
+  snapshotFresh,
+  WALL_PCT,
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../../util/atomic.js";
@@ -1115,12 +1119,66 @@ export class AuthBroker {
    * from stranding a live-healthy account, and a stale past mark from
    * routing onto a live-walled one. See account-eligibility.ts.
    */
+  /**
+   * True when the account is in the operator's `auth.allow_overage_accounts`
+   * opt-in list. Overage-eligible accounts may be served past the weekly util
+   * wall when Anthropic overage billing is available for them. PURE — reads
+   * only this.config.
+   */
+  private isOverageAllowed(account: string): boolean {
+    return (this.config.auth?.allow_overage_accounts ?? []).includes(account);
+  }
+
   private isAccountExhausted(account: string): boolean {
     return evalAccountBlocked({
       mark: this.quota[account],
       snapshot: this.lastQuotaCache[account],
       now: this.now(),
+      allowOverage: this.isOverageAllowed(account),
     });
+  }
+
+  /**
+   * THE single audited signal that authorizes spending Anthropic overage credit.
+   * True iff `account` may RIGHT NOW be served past the weekly utilization wall
+   * on overage billing — the in-agent rate-limit-menu handler consults this
+   * (over the broker, never config) before it may select "usage credits".
+   *
+   * True requires ALL of:
+   *   (a) the account is in `auth.allow_overage_accounts` (operator opt-in), AND
+   *   (b) a FRESH (≤24h) quota snapshot satisfies `overageLiftsWall()` — i.e.
+   *       `overageStatus === "allowed"` AND `overageDisabledReason` is not
+   *       `out_of_credits`, AND
+   *   (c) no active real-429 exhaustion mark blocks it (a mark still wins —
+   *       deferred to the shared `accountEligibility` decision, not re-checked).
+   *
+   * DEFAULT-OFF is structural: with `allow_overage_accounts` empty/unset (the
+   * default) `isOverageAllowed` is false for every account, so this returns false
+   * unconditionally — the watchdog can never select a paid option. Reuses
+   * `overageLiftsWall` + `accountEligibility`; no duplicated predicate logic.
+   */
+  private isActiveOverageServing(account: string | null): boolean {
+    if (!account) return false;
+    if (!this.isOverageAllowed(account)) return false;
+    const snapshot = this.lastQuotaCache[account];
+    const now = this.now();
+    if (!snapshot || !snapshotFresh(snapshot, now)) return false;
+    if (!overageLiftsWall(snapshot, true)) return false;
+    // Mark vs. snapshot is MOST-RECENT-SIGNAL-WINS (see accountEligibility): a
+    // real-429 mark blocks overage only while it is NEWER than the latest fresh
+    // probe. Once the broker re-probes after the 429 and Anthropic reports
+    // overageStatus:"allowed", that newer snapshot re-authorizes overage — which
+    // is exactly how overage engages at the weekly wall, since hitting the wall
+    // is what wrote the mark in the first place. A mark that is newer than the
+    // last probe still blocks (a fresh refusal wins).
+    return (
+      accountEligibility({
+        mark: this.quota[account],
+        snapshot,
+        now,
+        allowOverage: true,
+      }) === "eligible"
+    );
   }
 
   /**
@@ -1132,11 +1190,29 @@ export class AuthBroker {
    * conflated with a hard block. See account-eligibility.ts.
    */
   private accountEligibilityOf(account: string): "blocked" | "eligible" | "unknown" {
-    return accountEligibility({
+    const snapshot = this.lastQuotaCache[account];
+    const allowOverage = this.isOverageAllowed(account);
+    const verdict = accountEligibility({
       mark: this.quota[account],
-      snapshot: this.lastQuotaCache[account],
+      snapshot,
       now: this.now(),
+      allowOverage,
     });
+    // Observability: when an account is being served past the utilization wall
+    // because overage lifted it, emit a log so the operator can see that
+    // Anthropic overage billing is active and spending real money.
+    if (
+      verdict === "eligible" &&
+      allowOverage &&
+      snapshot &&
+      (snapshot.fiveHourUtilizationPct >= WALL_PCT ||
+        snapshot.sevenDayUtilizationPct >= WALL_PCT)
+    ) {
+      process.stdout.write(
+        `auth-broker: ${account} is past the utilization wall but eligible via allow_overage — Anthropic overage billing active (5h=${snapshot.fiveHourUtilizationPct.toFixed(1)}%, 7d=${snapshot.sevenDayUtilizationPct.toFixed(1)}%)\n`,
+      );
+    }
+    return verdict;
   }
 
   /**
@@ -1337,6 +1413,14 @@ export class AuthBroker {
       account: c.account,
       last_seen_at: this.consumerLastSeen[c.name] ?? null,
     }));
+    // Identity-specific overage signal: is the account THIS caller is bound to
+    // currently authorized to serve on Anthropic overage past the weekly wall?
+    // The in-agent wedge-watchdog reads this (never config) to decide whether a
+    // `/rate-limit-options` menu may select "usage credits". Default-off: false
+    // whenever `allow_overage_accounts` is empty (the default).
+    const active_overage_serving = this.isActiveOverageServing(
+      this.callerAccount(identity),
+    );
     this.audit({ op: "list-state", identity, ok: true });
     socket.write(
       encodeSuccess(id, {
@@ -1345,6 +1429,7 @@ export class AuthBroker {
         accounts,
         agents,
         consumers,
+        active_overage_serving,
       }),
     );
   }
@@ -1593,8 +1678,23 @@ export class AuthBroker {
       // below (so a genuine consumer weekly wall keeps its real reset). A
       // healthy probe here also self-heals any stale mark via cacheQuotaSnapshot.
       this.cacheQuotaSnapshot(label, result);
-      const decision = quotaIndicatesExhaustion(result);
-      if (!decision.exhausted) continue;
+      const allowOverage = this.isOverageAllowed(label);
+      const decision = quotaIndicatesExhaustion(result, allowOverage);
+      if (!decision.exhausted) {
+        // When util is walled but overage lifted it, log so the operator can
+        // see that overage spend is active for this account.
+        if (
+          result.ok &&
+          (result.data.fiveHourUtilizationPct >= EXHAUSTION_PCT ||
+            result.data.sevenDayUtilizationPct >= EXHAUSTION_PCT) &&
+          allowOverage
+        ) {
+          process.stdout.write(
+            `auth-broker: consumer-quota-sensor ${label} is wall-walled but serving via overage (allow_overage) — Anthropic overage billing is active\n`,
+          );
+        }
+        continue;
+      }
       const now = this.now();
       // This probe IS the live truth for `label`, so a long until here is
       // self-corroborated — pass the snapshot so clampMarkExpiry honors a real

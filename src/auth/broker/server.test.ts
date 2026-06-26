@@ -19,6 +19,8 @@ import * as net from "node:net";
 
 import { AuthBroker } from "./server.js";
 import { AuthBrokerClient } from "./client.js";
+import { queryActiveOverageServing } from "../../agents/overage-decision.js";
+import { runWedgeWatchdog } from "../../agents/wedge-watchdog.js";
 import type { Identity } from "./peercred.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import type { SwitchroomConfig } from "../../config/schema.js";
@@ -69,6 +71,8 @@ function makeConfig(h: Harness, overrides: Partial<{
   agents: Record<string, { auth?: { override?: string }; admin?: boolean }>;
   /** Phase 3b.2b — set to enable Google provider registration. */
   google_workspace: { google_client_id: string; google_client_secret: string };
+  /** Opt-in overage allow-list (account labels). */
+  allow_overage_accounts: string[];
 }> = {}): SwitchroomConfig {
   const agents = { ...(overrides.agents ?? {}) } as Record<
     string,
@@ -85,6 +89,7 @@ function makeConfig(h: Harness, overrides: Partial<{
       active: overrides.active,
       fallback_order: overrides.fallback_order,
       consumers: overrides.consumers,
+      allow_overage_accounts: overrides.allow_overage_accounts,
     },
     google_workspace: overrides.google_workspace,
   } as unknown) as SwitchroomConfig;
@@ -1750,6 +1755,226 @@ describe("AuthBroker — list-state", () => {
     expect(resp.data.agents.map((a) => a.name).sort()).toEqual(["clerk", "ziggy"]);
     expect(resp.data.consumers.map((c) => c.name)).toEqual(["hindsight"]);
     broker.stop();
+  });
+});
+
+describe("AuthBroker — list-state active_overage_serving signal", () => {
+  // Stub Anthropic's quota probe with the given overage headers + a walled 7d.
+  function stubOverageFetch(opts: {
+    overageStatus: string | null;
+    overageDisabledReason?: string | null;
+    util7d?: string;
+  }): typeof fetch {
+    return (async (_url: string, _init?: RequestInit): Promise<Response> => {
+      const headers: Record<string, string> = {
+        "anthropic-ratelimit-unified-5h-utilization": "0.10",
+        "anthropic-ratelimit-unified-7d-utilization": opts.util7d ?? "1.0",
+      };
+      if (opts.overageStatus != null)
+        headers["anthropic-ratelimit-unified-overage-status"] = opts.overageStatus;
+      if (opts.overageDisabledReason != null)
+        headers["anthropic-ratelimit-unified-overage-disabled-reason"] =
+          opts.overageDisabledReason;
+      return new Response("ok", { status: 200, headers });
+    }) as typeof fetch;
+  }
+
+  async function probeThenListState(opts: {
+    allowOverage: boolean;
+    overageStatus: string | null;
+    overageDisabledReason?: string | null;
+  }): Promise<{ active_overage_serving?: boolean }> {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "alice",
+      agents: { ziggy: {} },
+      allow_overage_accounts: opts.allowOverage ? ["alice"] : undefined,
+    });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = stubOverageFetch({
+      overageStatus: opts.overageStatus,
+      overageDisabledReason: opts.overageDisabledReason,
+    });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    try {
+      await broker.start();
+      const sock = join(h.socketRoot, "ziggy", "sock");
+      // Populate the broker's snapshot cache with a fresh overage-bearing probe.
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
+      const resp = (await rpc(sock, { v: 1, id: "1", op: "list-state" })) as {
+        ok: boolean;
+        data: { active_overage_serving?: boolean };
+      };
+      expect(resp.ok).toBe(true);
+      return resp.data;
+    } finally {
+      globalThis.fetch = origFetch;
+      broker.stop();
+    }
+  }
+
+  it("flagged + overageStatus allowed + not out_of_credits → true (the alice case)", async () => {
+    const data = await probeThenListState({ allowOverage: true, overageStatus: "allowed" });
+    expect(data.active_overage_serving).toBe(true);
+  });
+
+  it("NOT flagged (default — empty allow-list) → false (default-off)", async () => {
+    const data = await probeThenListState({ allowOverage: false, overageStatus: "allowed" });
+    expect(data.active_overage_serving).toBe(false);
+  });
+
+  it("flagged + overageStatus rejected → false", async () => {
+    const data = await probeThenListState({ allowOverage: true, overageStatus: "rejected" });
+    expect(data.active_overage_serving).toBe(false);
+  });
+
+  it("flagged + overageStatus allowed BUT out_of_credits → false (credit exhausted, auto-stop)", async () => {
+    const data = await probeThenListState({
+      allowOverage: true,
+      overageStatus: "allowed",
+      overageDisabledReason: "out_of_credits",
+    });
+    expect(data.active_overage_serving).toBe(false);
+  });
+
+  // The REAL weekly-quota menu pane (from finn, 2026-06-07); option 2 is the
+  // "usage credits" row.
+  const RATE_LIMIT_SCREEN =
+    "  ⎿  You've hit your weekly limit · resets Jun 9, 5am (Australia/Melbourne)\n" +
+    "\n" +
+    "  What do you want to do?\n" +
+    "\n" +
+    "  ❯ 1. Stop and wait for limit to reset\n" +
+    "    2. Switch to usage credits\n" +
+    "    3. Upgrade your plan\n" +
+    "\n" +
+    "  Enter to confirm · Esc to cancel";
+
+  // END-TO-END: the broker's verdict actually drives the in-agent watchdog
+  // action — the proof the opted-in feature does NOT wedge. We stand up a real
+  // broker, query it via the SAME client path the sidecar uses
+  // (`queryActiveOverageServing`), and feed that into the real `runWedgeWatchdog`.
+  it("INTEGRATION: flagged + overage allowed → broker verdict drives watchdog to select 'usage credits' (no wedge, no failover)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "alice",
+      agents: { ziggy: {} },
+      allow_overage_accounts: ["alice"],
+    });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = stubOverageFetch({ overageStatus: "allowed" });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    try {
+      await broker.start();
+      const sock = join(h.socketRoot, "ziggy", "sock");
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
+
+      const calls: string[][] = [];
+      const signals: unknown[] = [];
+      const res = await runWedgeWatchdog({
+        agentName: "ziggy",
+        now: () => Date.UTC(2026, 5, 7, 0, 0, 0),
+        sleep: () => {},
+        maxPolls: 3,
+        capture: () => RATE_LIMIT_SCREEN,
+        send: (_a, keys) => (calls.push([...keys]), true),
+        onRateLimitMenu: () => signals.push(1),
+        // The SAME broker query the autoaccept-poll sidecar wires.
+        overageDecision: () => queryActiveOverageServing({ socket: sock }),
+      });
+
+      expect(res.overageCreditSelections).toBe(1);
+      expect(res.rateLimitFires).toBe(0);
+      expect(calls).toEqual([["Down", "Enter"]]); // selected the usage-credits option
+      expect(signals).toHaveLength(0); // no failover — account kept on overage
+    } finally {
+      globalThis.fetch = origFetch;
+      broker.stop();
+    }
+  });
+
+  it("INTEGRATION: NOT flagged → broker verdict drives watchdog to the DEFAULT Esc-park + failover", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "alice",
+      agents: { ziggy: {} },
+      // NO allow_overage_accounts → default-off.
+    });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = stubOverageFetch({ overageStatus: "allowed" });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    try {
+      await broker.start();
+      const sock = join(h.socketRoot, "ziggy", "sock");
+      await rpc(sock, { v: 1, id: "p", op: "probe-quota", accounts: ["alice"] });
+
+      const calls: string[][] = [];
+      const signals: unknown[] = [];
+      const res = await runWedgeWatchdog({
+        agentName: "ziggy",
+        now: () => Date.UTC(2026, 5, 7, 0, 0, 0),
+        sleep: () => {},
+        maxPolls: 3,
+        capture: () => RATE_LIMIT_SCREEN,
+        send: (_a, keys) => (calls.push([...keys]), true),
+        onRateLimitMenu: () => signals.push(1),
+        overageDecision: () => queryActiveOverageServing({ socket: sock }),
+      });
+
+      expect(res.overageCreditSelections).toBe(0);
+      expect(res.rateLimitFires).toBe(1);
+      expect(calls).toEqual([["Escape"]]);
+      expect(signals).toHaveLength(1);
+    } finally {
+      globalThis.fetch = origFetch;
+      broker.stop();
+    }
+  });
+
+  it("flagged but NO snapshot yet (no probe) → false (no stale/absent authorization)", async () => {
+    const h = makeHarness();
+    const config = makeConfig(h, {
+      active: "alice",
+      agents: { ziggy: {} },
+      allow_overage_accounts: ["alice"],
+    });
+    seedAccount(h, "alice", { expiresAt: 9_999_999_999_999 });
+    const broker = new AuthBroker(config, {
+      home: h.home,
+      stateDir: h.stateDir,
+      socketRoot: h.socketRoot,
+      disableRefreshLoop: true,
+    });
+    try {
+      await broker.start();
+      const resp = (await rpc(join(h.socketRoot, "ziggy", "sock"), {
+        v: 1,
+        id: "1",
+        op: "list-state",
+      })) as { ok: boolean; data: { active_overage_serving?: boolean } };
+      expect(resp.ok).toBe(true);
+      expect(resp.data.active_overage_serving).toBe(false);
+    } finally {
+      broker.stop();
+    }
   });
 });
 

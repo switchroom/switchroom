@@ -52,7 +52,14 @@ behaviour match.
 
 **Bad looks like — never ship this**
 
-- Any silent fallback to API billing when the subscription is rate-limited.
+- Any *silent* or unintended fallback to a second billing surface when the
+  subscription is rate-limited. (The one sanctioned exception is **overage**:
+  an account the operator *explicitly* opted into `allow_overage_accounts` may
+  continue on the operator's own Anthropic overage credits when Anthropic
+  reports `overageStatus:"allowed"` — default-off, auto-stops at
+  `out_of_credits`, and still the unmodified interactive `claude` CLI on the
+  same OAuth subscription, never API/SDK. What's banned is the *silent,
+  un-opted-in* switch, not this opt-in carve-out.)
 - A headless `claude -p`, an Agent SDK call, or a raw Anthropic API call
   anywhere in a code path — both `-p` and the SDK are *programmatic* usage
   off the subscription. Route model work through the interactive session.
@@ -77,11 +84,18 @@ behaviour match.
   flags agent boot depends on still exist on the installed binary; runs for
   real in the nightly latest-claude canary. *Invariant:* agents boot on the
   unmodified `claude` CLI, no harness over it.
-- **Weekly-cap menu never selects paid credits** — `tests/rate-limit-menu-detect`,
-  `tests/wedge-watchdog`. *Watch:* on a weekly-quota wall the watchdog sends
-  only `Escape` — never a keystroke that would pick "Switch to usage
-  credits". *Invariant:* a quota wall never silently switches the user
-  off-subscription onto paid credits.
+- **Weekly-cap menu defaults to Escape; only opted-in accounts may take
+  overage** — `tests/rate-limit-menu-detect`, `tests/wedge-watchdog`,
+  `src/auth/broker/server.test.ts`. *Watch:* on a weekly-quota wall the
+  watchdog sends **only `Escape`** by default — never a keystroke that picks
+  "usage credits". The sole exception is an account the operator explicitly
+  flagged in `allow_overage_accounts`: the **broker** (the single audited
+  spend-authority) confirms `overageStatus:"allowed"` (not `out_of_credits`,
+  no active 429 mark), and only then does the watchdog select "usage credits".
+  With no account flagged, the broker signal is always false and the behaviour
+  is byte-identical to Escape-only. *Invariant:* a quota wall never *silently*
+  switches the user off-subscription; overage is opt-in, default-off, on the
+  operator's own Anthropic credits, and still the unmodified `claude` CLI.
 - **Opt-in third-party key, the honest exception (DM)** — `voice-inbound-dm`.
   *Watch:* voice transcription works via an opt-in Whisper key from the
   vault, clearly an auxiliary helper, never a Claude replacement.
@@ -110,4 +124,7 @@ subscription session, and a limit is never routed around with paid credit.
 - *Compliance:* zero headless `claude -p` / SDK / raw-API callsites,
   enforced by build-failing CI guards, not convention.
 - *Reliability:* a plan limit (5h or weekly) degrades to honest failure or
-  account failover, never to paid credit or API.
+  account failover — never to API, and never to paid credit *except* for an
+  account the operator explicitly opted into overage (default-off, auto-stops
+  at `out_of_credits`, on the operator's own Anthropic credits via the
+  unmodified `claude` CLI).

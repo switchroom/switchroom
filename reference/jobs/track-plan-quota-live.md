@@ -57,9 +57,15 @@ subscription window. Quota stays a single-signal problem.
 
 - **Weekly-cap wall is caught, on-subscription (agent)** —
   `tests/rate-limit-menu-detect.test.ts`. *Watch:* a hit weekly limit is
-  detected and parked, surfacing the reset timing. *Invariant:* recovery is
-  never "switch to usage credits" — the off-subscription path is never taken
-  (the load-bearing `claude-native` assertion).
+  detected and parked, surfacing the reset timing. *Invariant:* by default
+  recovery is never "switch to usage credits" — the off-subscription path is
+  never taken (the load-bearing `claude-native` assertion). The one carve-out
+  is an account the operator explicitly opted into overage
+  (`allow_overage_accounts`): the broker confirms `overageStatus:"allowed"`
+  and only then is "usage credits" selected — on the operator's own Anthropic
+  credits, default-off, auto-stopping at `out_of_credits`, and still the
+  unmodified interactive `claude` CLI (never API/SDK). Unflagged accounts are
+  Escape-only, unchanged.
 - **Cap signal reaches the user (agent)** —
   `tests/rate-limit-signal.test.ts`. *Watch:* the detected wall signals out
   to the surface the user sees, with reset timing attached. *Invariant:* a
@@ -91,4 +97,8 @@ must stay honest, on-subscription, and legible across the corpus.
 - *Accuracy:* shown usage agrees closely with authoritative data; staleness
   is surfaced (snapshot age), never hidden.
 - *Compliance:* a quota wall is parked on-subscription — the off-subscription
-  recovery path is never selected, by construction.
+  recovery path is never selected, by construction, **except** for an account
+  the operator explicitly opted into overage (`allow_overage_accounts`), where
+  the broker authorizes spending the operator's own Anthropic overage credits
+  while `overageStatus:"allowed"`. Default-off; auto-stops at `out_of_credits`;
+  every unflagged account is Escape-only and unchanged.

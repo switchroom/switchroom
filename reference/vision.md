@@ -54,7 +54,11 @@ functions to deliver them, and the jobs that ladder up to each live in
 
 1. **A standing team that knows you** — specialists, not one generalist.
 2. **You hold the leash** — controlled, purposeful, never roaming.
-3. **Subscription-honest and predictable** — the plan is the ceiling.
+3. **Subscription-honest and predictable** — the plan is the ceiling, unless
+   the operator explicitly opts a specific account into overage (their own
+   Anthropic-funded credits; default-off, auto-stops when the credit runs out).
+   The claude-native invariant is unaffected: overage is still the unmodified
+   interactive `claude` CLI on the same OAuth subscription — never API/SDK.
 4. **Always available, in Telegram, done properly** — there when you want it.
 
 The hard constraints under these — claude-native, no-self-escalation,

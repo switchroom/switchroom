@@ -3155,6 +3155,23 @@ export const SwitchroomConfigSchema = z.object({
           "agent (whether that agent has `admin: true` or not) is a config " +
           "error caught at schema validation.",
         ),
+      allow_overage_accounts: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          "Opt-in list of account labels (bare strings matching `auth.active` / " +
+          "`auth.fallback_order` entries) that may be served PAST the weekly " +
+          "utilization wall when Anthropic overage billing is available for the " +
+          "account (`overageStatus === 'allowed'`). Overage is REAL MONEY — " +
+          "default is empty (no account gets this). An account in this list is " +
+          "only kept eligible when its fresh quota snapshot reports " +
+          "`overageStatus: 'allowed'` AND `overageDisabledReason` is NOT " +
+          "'out_of_credits' (i.e. the overage credit has not been exhausted). " +
+          "As soon as `overageDisabledReason` becomes 'out_of_credits', the " +
+          "account is blocked immediately regardless of this flag. Overage lifts " +
+          "ONLY the utilization wall — it cannot lift an active exhaustion mark " +
+          "written by a real 429 (`mark-exhausted`).",
+        ),
     })
     .optional()
     .describe(
