@@ -4,32 +4,40 @@ import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
 
 /**
  * Feed-OPEN gate — pure decision (design `docs/message-emission-determinism.md`
- * §9 levers 1 + 5). Gates WHEN the activity card may first OPEN (fresh
+ * §9 levers 1 + 4). Gates WHEN the activity card may first OPEN (fresh
  * sendMessage). An EDIT of an already-open card is never routed through this
  * (the drain only consults it when activityMessageId == null).
  *
- * Lever 5 base case (the triplication fix): a narrative-SHOW producer alone on
- * a 0-tool turn must NOT open a card. A tool label DOES open. The liveness
- * timer (genuine ≥12s thinking-gap) still opens a 0-tool card.
+ * Lever 5 — INERT (#2588 fix): the original Lever 5 blocked narrative from
+ * opening a card on 0-tool turns to prevent a "triplication" reorder. This
+ * over-suppressed conversational turns. Lever 2 (clearActivitySummary, gateway
+ * executeReply) already guarantees reply-is-last ordering by editing the
+ * narrative card in-place before the reply sends — Lever 5 was redundant.
+ * Pre-answer narrative now DOES open a card; post-answer is blocked by Lever 1.
  *
  * Lever 1 (reply-is-last): once a SUBSTANTIVE final answer has been delivered
  * (the sticky finalAnswerEverDelivered latch), no card may open below it — for
- * ANY producer. The latch is NOT the mutable finalAnswerDelivered (reopen
- * clears that mid-turn, #2141); an ack does not set it, so the ack-then-work
- * feed still opens.
+ * ANY producer, EXCEPT when `postAnswerSubagentActivity === true && producer ===
+ * 'tool'` (Fix 2 / #2587 supersede: background-agent liveness below the reply).
+ * The latch is NOT the mutable finalAnswerDelivered (reopen clears that
+ * mid-turn, #2141); an ack does not set it, so the ack-then-work feed opens.
  */
-describe('mayOpenActivityCard — lever 5 base case (narrative-SHOW alone must not OPEN)', () => {
-  it('narrative SHOW on a 0-tool turn does NOT open a card (the triplication)', () => {
+describe('mayOpenActivityCard — Lever 5 INERT: narrative opens pre-answer (Fix 1 / #2588)', () => {
+  it('narrative SHOW on a 0-tool turn DOES open a card pre-answer (Lever 5 removed)', () => {
+    // Lever 5 was: producer === "narrative" && labeledToolCount === 0 → false.
+    // Now it is INERT: pre-answer narrative may open. Lever 2 (clearActivitySummary)
+    // guarantees the card edits in-place before the reply sends — reply-is-last
+    // is preserved without Lever 5. This is the #2588 fix.
     expect(
       mayOpenActivityCard({
         producer: 'narrative',
         finalAnswerEverDelivered: false,
         labeledToolCount: 0,
       }),
-    ).toBe(false)
+    ).toBe(true)
   })
 
-  it('a tool label DOES open a card (producer B)', () => {
+  it('a tool label DOES open a card (producer B, unchanged)', () => {
     expect(
       mayOpenActivityCard({
         producer: 'tool',
@@ -39,7 +47,7 @@ describe('mayOpenActivityCard — lever 5 base case (narrative-SHOW alone must n
     ).toBe(true)
   })
 
-  it('the liveness timer DOES open a 0-tool thinking-gap card (producer C, preserved)', () => {
+  it('the liveness timer DOES open a 0-tool thinking-gap card (producer C, unchanged)', () => {
     expect(
       mayOpenActivityCard({
         producer: 'liveness',
@@ -104,6 +112,67 @@ describe('mayOpenActivityCard — lever 1 (no OPEN after a substantive final)', 
         labeledToolCount: 1,
       }),
     ).toBe(true)
+  })
+})
+
+describe('mayOpenActivityCard — lever 1 exception: post-answer sub-agent liveness (Fix 2 / #2587 supersede)', () => {
+  // When a background sub-agent continues working after the parent's substantive
+  // reply, `postAnswerSubagentActivity=true` + `producer='tool'` lifts Lever 1
+  // so the heartbeat can open a liveness card below the reply. This signal is
+  // driven by `turn.subagentActivityAt`, written by the watcher's onProgress
+  // callback INDEPENDENTLY of the tool_label path (so the drop-guard cannot gate
+  // it). Idle producers (liveness, narrative) remain blocked — the reply-is-last
+  // invariant holds for idle post-answer gaps.
+
+  it('post-answer REAL sub-agent activity DOES open a card (tool + postAnswerSubagentActivity)', () => {
+    // The core Fix 2 assertion: a background worker is still active after the
+    // answer → a liveness card surfaces below the reply.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 3,
+        postAnswerSubagentActivity: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('post-answer idle liveness does NOT open (no postAnswerSubagentActivity)', () => {
+    // Without the signal, Lever 1 stays fully active — idle heartbeat after the
+    // answer is still suppressed. Idle-gap suppression preserved.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 3,
+        postAnswerSubagentActivity: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('post-answer liveness producer stays blocked even with the signal (not tool producer)', () => {
+    // Only 'tool' is exempted. A 'liveness' producer (wall-clock heartbeat
+    // with no new watcher step) may not open a card after the final answer.
+    expect(
+      mayOpenActivityCard({
+        producer: 'liveness',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 0,
+        postAnswerSubagentActivity: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('post-answer narrative producer stays blocked even with the signal', () => {
+    // Narrative alone after the final answer may not open — reply-is-last.
+    expect(
+      mayOpenActivityCard({
+        producer: 'narrative',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 2,
+        postAnswerSubagentActivity: true,
+      }),
+    ).toBe(false)
   })
 })
 

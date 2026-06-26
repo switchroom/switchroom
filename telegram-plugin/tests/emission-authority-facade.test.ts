@@ -314,7 +314,7 @@ describe('façade delegates to the existing emission primitives (call-site liter
   })
 })
 
-describe('the 6 drain sites route through the façade with producers preserved verbatim', () => {
+describe('the 7 drain sites route through the façade with producers preserved verbatim', () => {
   it('the narrative SHOW site routes via openOrEditCard("narrative") + the producer-"narrative" drain', () => {
     const body = fnSrc('showNarrativeStep')
     expect(body).toMatch(/openOrEditCard\('narrative'/)
@@ -350,8 +350,8 @@ describe('the 6 drain sites route through the façade with producers preserved v
 
   it('every routed drain site guards the single-flight via ea.mayDrain(turn), not a bare activityInFlight read', () => {
     const mayDrainGuards = [...gatewaySrc.matchAll(/if \(ea\.mayDrain\(turn\)\)/g)]
-    // narrative + 2 liveness + tool + 2 sub-agent = 6 routed single-flight gates.
-    expect(mayDrainGuards).toHaveLength(6)
+    // narrative + 2 liveness + tool + 2 sub-agent + 1 post-answer bg-liveness (Fix 2) = 7.
+    expect(mayDrainGuards).toHaveLength(7)
   })
 })
 
@@ -478,10 +478,11 @@ describe('mayDrainCardNow — PR-4d card-drain gate (pure read; gateway holds th
     expect(ctxFn).toMatch(/turnInFlight:\s*turnInFlightForGate\(\)/)
   })
 
-  it('the 6 card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
-    // Option A: the 6 `if (ea.mayDrain(turn))` guards + drainActivitySummary
+  it('the 7 card-drain sites each route their guarded block through cardDrainGate (single-flight gate stays byte-identical)', () => {
+    // Option A: the 7 `if (ea.mayDrain(turn))` guards + drainActivitySummary
     // thunks stay byte-identical, wrapped by the centralized helper.
+    // 6 original + 1 new post-answer background-agent liveness drain (Fix 2).
     const wraps = [...gatewaySrc.matchAll(/cardDrainGate\(turn, ea, \(\) => \{/g)]
-    expect(wraps).toHaveLength(6)
+    expect(wraps).toHaveLength(7)
   })
 })
