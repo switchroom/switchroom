@@ -107,8 +107,8 @@ describe("quotaIndicatesExhaustion", () => {
 });
 
 describe("quotaIndicatesExhaustion — allow_overage matrix", () => {
-  it("flagged + util 100% + overageStatus allowed + reason null → NOT exhausted (pixsoul case)", () => {
-    // Consumer pinned to pixsoul (7d=100%, overageStatus:'allowed', no reason).
+  it("flagged + util 100% + overageStatus allowed + reason null → NOT exhausted (alice case)", () => {
+    // Consumer pinned to alice (7d=100%, overageStatus:'allowed', no reason).
     // With allowOverage=true, the util wall must NOT mark exhausted.
     expect(
       quotaIndicatesExhaustion(ok({

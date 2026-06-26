@@ -1047,20 +1047,20 @@ describe("auth.allow_overage_accounts config field", () => {
     const cfg = SwitchroomConfigSchema.parse({
       ...minimalBase,
       auth: {
-        active: "pixsoul",
-        allow_overage_accounts: ["pixsoul@gmail.com", "backup@gmail.com"],
+        active: "alice",
+        allow_overage_accounts: ["alice@example.com", "bob@example.com"],
       },
     });
     expect(cfg.auth?.allow_overage_accounts).toEqual([
-      "pixsoul@gmail.com",
-      "backup@gmail.com",
+      "alice@example.com",
+      "bob@example.com",
     ]);
   });
 
   it("defaults to undefined (omitted) when not set — no accounts are opt-in by default", () => {
     const cfg = SwitchroomConfigSchema.parse({
       ...minimalBase,
-      auth: { active: "pixsoul" },
+      auth: { active: "alice" },
     });
     expect(cfg.auth?.allow_overage_accounts).toBeUndefined();
   });
@@ -1068,7 +1068,7 @@ describe("auth.allow_overage_accounts config field", () => {
   it("accepts an empty list", () => {
     const cfg = SwitchroomConfigSchema.parse({
       ...minimalBase,
-      auth: { active: "pixsoul", allow_overage_accounts: [] },
+      auth: { active: "alice", allow_overage_accounts: [] },
     });
     expect(cfg.auth?.allow_overage_accounts).toEqual([]);
   });
@@ -1086,7 +1086,7 @@ describe("auth.allow_overage_accounts config field", () => {
     expect(() =>
       SwitchroomConfigSchema.parse({
         ...minimalBase,
-        auth: { allow_overage_accounts: "pixsoul@gmail.com" },
+        auth: { allow_overage_accounts: "alice@example.com" },
       }),
     ).toThrow();
   });

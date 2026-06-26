@@ -342,7 +342,7 @@ describe("clampMarkExpiry — only override a long mark the live data DISPROVES"
 // ─── allow_overage feature tests ───────────────────────────────────────────
 
 describe("overageLiftsWall — predicate for opt-in overage lift", () => {
-  it("true when flagged + overageStatus allowed + no disabling reason (the pixsoul case)", () => {
+  it("true when flagged + overageStatus allowed + no disabling reason (the alice case)", () => {
     expect(overageLiftsWall(snap(100, 100, 0, { status: "allowed", reason: null }), true)).toBe(true);
   });
   it("false when NOT in allow list (opt-in; default unchanged)", () => {
@@ -359,9 +359,9 @@ describe("overageLiftsWall — predicate for opt-in overage lift", () => {
   });
 });
 
-describe("accountEligibility — allow_overage matrix (the pixsoul case and safety guards)", () => {
-  it("flagged + util 100% + overageStatus allowed + reason null → ELIGIBLE (pixsoul case)", () => {
-    // pixsoul@gmail.com: 7d=100%, overageStatus:'allowed', no disabled reason
+describe("accountEligibility — allow_overage matrix (the alice case and safety guards)", () => {
+  it("flagged + util 100% + overageStatus allowed + reason null → ELIGIBLE (alice case)", () => {
+    // alice@example.com: 7d=100%, overageStatus:'allowed', no disabled reason
     // With allow_overage opt-in, the util wall must NOT block.
     expect(
       accountEligibility({
