@@ -35,6 +35,7 @@ import {
   readCleanShutdownMarker,
   clearCleanShutdownMarker,
   shouldSuppressRecoveryBanner,
+  shouldSuppressBootResume,
   resolveShutdownMarker,
   DEFAULT_MAX_AGE_MS,
   EXTERNAL_RESTART_FALLBACK_REASON,
@@ -341,6 +342,122 @@ describe("resolveShutdownMarker (SIGTERM-handler sequencing)", () => {
     // Load-bearing constant — if the two windows drift out of sync, the
     // CLI-stamps-then-SIGTERM race gets harder to reason about. Pin it.
     expect(REASON_PRESERVE_MAX_AGE_MS).toBe(30_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot-resume gate: shouldSuppressBootResume
+// ---------------------------------------------------------------------------
+
+describe("shouldSuppressBootResume", () => {
+  // Core contract: clean shutdown (fresh marker) → suppress; crash (no marker
+  // or stale) → do not suppress; forceAlways override → never suppress.
+
+  it("returns false when no marker is present (crash/OOM — resume as before)", () => {
+    expect(shouldSuppressBootResume(null, Date.now())).toBe(false);
+  });
+
+  it("returns true for a fresh clean-shutdown marker (operator/roll restart — suppress)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 5_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+  });
+
+  it("returns true at age=0 (marker written right before boot)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+  });
+
+  it("returns false when marker age equals maxAgeMs (boundary is exclusive)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - DEFAULT_MAX_AGE_MS, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+  });
+
+  it("returns false for a stale marker (drain took >60s — treat as crash)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 90_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+  });
+
+  it("treats clock skew (future ts) as stale to avoid false suppression", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now + 10_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now)).toBe(false);
+  });
+
+  it("respects a custom maxAgeMs", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 30_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now, { maxAgeMs: 60_000 })).toBe(true);
+    expect(shouldSuppressBootResume(marker, now, { maxAgeMs: 10_000 })).toBe(false);
+  });
+
+  it("forceAlways=true disables suppression even for a fresh clean marker (escape hatch)", () => {
+    // SWITCHROOM_BOOT_RESUME_ALWAYS=1 must restore unconditional resume.
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 1_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now, { forceAlways: true })).toBe(false);
+  });
+
+  it("forceAlways=false has no effect (default behaviour is the gate)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = { ts: now - 1_000, signal: "SIGTERM" };
+    expect(shouldSuppressBootResume(marker, now, { forceAlways: false })).toBe(true);
+  });
+
+  it("works for SIGTERM and SIGINT (signal value is opaque)", () => {
+    const now = 1_700_000_000_000;
+    expect(shouldSuppressBootResume({ ts: now, signal: "SIGTERM" }, now)).toBe(true);
+    expect(shouldSuppressBootResume({ ts: now, signal: "SIGINT" }, now)).toBe(true);
+  });
+
+  it("works with a marker that carries a reason field (rollout attribution is preserved)", () => {
+    const now = 1_700_000_000_000;
+    const marker: CleanShutdownMarker = {
+      ts: now - 2_000,
+      signal: "SIGTERM",
+      reason: "operator: switchroom update",
+    };
+    expect(shouldSuppressBootResume(marker, now)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Boot-resume gate: gateway wiring (source-level)
+// ---------------------------------------------------------------------------
+
+describe("gateway.ts boot-resume clean-shutdown gate (source-level)", () => {
+  // Source-grep pins ensure the gate wiring in gateway.ts stays present
+  // after refactors. Pure unit tests on shouldSuppressBootResume cover the
+  // decision logic; these cover the wiring.
+  const gatewaySource = readFileSync(
+    join(import.meta.dir, "..", "gateway", "gateway.ts"),
+    "utf8",
+  );
+
+  it("imports shouldSuppressBootResume from clean-shutdown-marker", () => {
+    expect(gatewaySource).toContain("shouldSuppressBootResume");
+  });
+
+  it("reads the clean-shutdown marker before building the boot-resume inbound", () => {
+    expect(gatewaySource).toContain("bootResumeCleanMarker");
+    expect(gatewaySource).toContain("readCleanShutdownMarker(bootResumeMarkerPath)");
+  });
+
+  it("calls shouldSuppressBootResume with the marker, now, and forceAlways", () => {
+    expect(gatewaySource).toContain("shouldSuppressBootResume(bootResumeCleanMarker, Date.now()");
+    expect(gatewaySource).toContain("forceAlways: bootResumeForceAlways");
+  });
+
+  it("provides the SWITCHROOM_BOOT_RESUME_ALWAYS escape hatch", () => {
+    expect(gatewaySource).toContain("SWITCHROOM_BOOT_RESUME_ALWAYS");
+    expect(gatewaySource).toContain("=== '1'");
+  });
+
+  it("logs a diagnostic when boot-resume is suppressed", () => {
+    expect(gatewaySource).toContain("boot-resume suppressed (clean shutdown");
   });
 });
 
