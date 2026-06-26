@@ -361,16 +361,16 @@ export const TOOLS = [
       "to asking the operator to hand-edit the yaml.",
     inputSchema: {
       type: "object" as const,
-      required: ["unified_diff", "reason", "target_path"],
+      // Property ORDER is load-bearing: Claude Code serializes the tool input
+      // in declaration order and truncates the operator-card `input_preview`
+      // to ~200 chars. `reason` (+ `target_path`) MUST precede the big
+      // `unified_diff` blob so they survive inside the truncated prefix —
+      // otherwise the approval card renders "why: not provided" (the diff
+      // pushes the reason past the cut, and the truncated JSON is unparseable).
+      // Paired with the lenient regex fallback in telegram-plugin's
+      // `extractReasonFromRaw`; both are needed.
+      required: ["reason", "target_path", "unified_diff"],
       properties: {
-        unified_diff: {
-          type: "string",
-          minLength: 1,
-          description:
-            "Unified diff against switchroom.yaml. Any context level (a " +
-            "zero-context diff is fine); single-file, no path-traversal. " +
-            "LF-only, ≤1 MB.",
-        },
         reason: {
           type: "string",
           minLength: 1,
@@ -386,6 +386,14 @@ export const TOOLS = [
             "Must be the literal string '/state/config/switchroom.yaml'. " +
             "Future-proofs against multi-file diffs and gives the validator " +
             "a single canonical path to anchor on.",
+        },
+        unified_diff: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Unified diff against switchroom.yaml. Any context level (a " +
+            "zero-context diff is fine); single-file, no path-traversal. " +
+            "LF-only, ≤1 MB.",
         },
       },
     },

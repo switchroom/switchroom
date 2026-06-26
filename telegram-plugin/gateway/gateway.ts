@@ -7267,10 +7267,10 @@ const ipcServer: IpcServer = createIpcServer({
           ...(cfgTopic != null ? { threadId: cfgTopic } : {}),
         }
       },
-      buildKeyboard: (requestId) =>
+      buildKeyboard: (requestId, epoch) =>
         new InlineKeyboard()
-          .text('✅ Approve', `cfg:${requestId}:approve`)
-          .text('🚫 Deny', `cfg:${requestId}:deny`),
+          .text('✅ Approve', `cfg:${requestId}:${epoch}:approve`)
+          .text('🚫 Deny', `cfg:${requestId}:${epoch}:deny`),
       postCard: async (args) => {
         try {
           const sent = await robustApiCall(
@@ -7302,6 +7302,9 @@ const ipcServer: IpcServer = createIpcServer({
             () =>
               bot.api.editMessageText(args.chatId, args.messageId, args.text, {
                 parse_mode: 'HTML',
+                // Strip the inline keyboard on a terminal/interim edit so the
+                // [Approve]/[Deny] buttons stop being tappable on a resolved card.
+                ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
               }),
             { chat_id: String(args.chatId), verb: 'config-approval-edit' },
           )
@@ -7371,6 +7374,8 @@ const ipcServer: IpcServer = createIpcServer({
             () =>
               bot.api.editMessageText(args.chatId, args.messageId, args.text, {
                 parse_mode: 'HTML',
+                // Finalize is terminal — drop the keyboard so buttons are gone.
+                ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
               }),
             { chat_id: String(args.chatId), verb: 'config-approval-finalize' },
           )
@@ -20712,6 +20717,8 @@ bot.on('callback_query:data', async ctx => {
             await robustApiCall(() =>
               bot.api.editMessageText(args.chatId, args.messageId, args.text, {
                 parse_mode: 'HTML',
+                // Resolved on tap — strip the keyboard so it can't be re-tapped.
+                ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
               }),
             )
           } catch {
@@ -20721,6 +20728,9 @@ bot.on('callback_query:data', async ctx => {
         log: (m) =>
           process.stderr.write(`telegram gateway: config-approval cb — ${m}\n`),
       },
+      // Verify the per-card epoch from the callback_data against the live
+      // pending entry — a stale tap (mismatched epoch) is rejected.
+      parsed.epoch,
     )
     await ctx.answerCallbackQuery({
       text: resolved

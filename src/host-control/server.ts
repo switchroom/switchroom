@@ -1587,7 +1587,7 @@ export class HostdServer {
    * `config_propose_edit` — full apply path (#1623 / RFC §3.3-3.4).
    *
    * Deliberately OUT of scope per operator decision (single-operator
-   * single-host posture, see PR description): rate limiter,
+   * single-host posture, see PR description):
    * crash-recovery journal, Prometheus metrics, TOCTOU re-validation,
    * literal `flock` on the config file (the in-process mutex is
    * sufficient — hostd is the only writer), attachment fallback for
@@ -1697,6 +1697,65 @@ export class HostdServer {
       );
       return await pending;
     }
+    // ── Server-side rate limit (circuit-breaker) ────────────────────
+    // A looping agent that re-fires DISTINCT diffs (any whitespace/context
+    // drift defeats the byte-exact dedup above) would otherwise post a
+    // fresh operator card every time. Throttle per-caller via the existing
+    // `config_edit_rate_per_hour` config field so the operator sees at most
+    // N cards/hour from any one agent. (#config-edit-hardening)
+    const rate = this.checkConfigEditRate(callerName, Date.now());
+    if (!rate.ok) {
+      const retryAtIso = new Date(rate.retryAtMs).toISOString();
+      process.stderr.write(
+        `hostd: config_propose_edit — RATE-LIMITED ${callerName} ` +
+          `(>${rate.limit}/hour); next slot ${retryAtIso}\n`,
+      );
+      // Leave a trail so the operator can retroactively see the throttle.
+      void this.appendAuditRow({
+        ts: new Date().toISOString(),
+        op: "config_propose_edit",
+        phase: "rate_limited",
+        request_id: req.request_id,
+        caller:
+          caller.kind === "agent"
+            ? { kind: "agent", name: caller.name }
+            : { kind: "operator" },
+        result: "denied",
+        exit_code: null,
+        duration_ms: Date.now() - started,
+        error: `E_RATE_LIMITED: >${rate.limit} config_propose_edit cards/hour`,
+      });
+      return err(
+        "E_RATE_LIMITED",
+        `config_propose_edit rate limit exceeded (max ${rate.limit}/hour for this agent)`,
+      )
+        .why(`next slot opens at ${retryAtIso}`)
+        .fixRetryAfter(retryAtIso)
+        .op("config_propose_edit")
+        .caller(caller.kind === "agent" ? "agent" : "operator")
+        .agentName(caller.kind === "agent" ? caller.name : undefined)
+        .asDenied()
+        .build(req.request_id, Date.now() - started);
+    }
+    // ── Audit at card-post time (item 5) ────────────────────────────
+    // config_propose_edit otherwise writes NO audit row until the apply
+    // path (which only runs on Allow). A loop that never reaches apply —
+    // or one parked 10 min awaiting an operator tap — left no trail. Emit
+    // a `requested` row NOW so an operator can retroactively see "agent
+    // fired Nx" even for proposals that time out or get denied.
+    void this.appendAuditRow({
+      ts: new Date().toISOString(),
+      op: "config_propose_edit",
+      phase: "requested",
+      request_id: req.request_id,
+      caller:
+        caller.kind === "agent"
+          ? { kind: "agent", name: caller.name }
+          : { kind: "operator" },
+      result: "started",
+      exit_code: null,
+      duration_ms: Date.now() - started,
+    });
     const run = this.runConfigProposeApprovalAndApply(
       req,
       caller,
@@ -1715,6 +1774,50 @@ export class HostdServer {
 
   /** In-flight config_propose_edit proposals, keyed by caller+diff hash. */
   private inflightConfigProposals = new Map<string, Promise<HostdResponse>>();
+
+  /**
+   * Per-caller sliding-window of config_propose_edit CARD-POST timestamps
+   * (epoch-ms), keyed by caller name. Enforces `config_edit_rate_per_hour`
+   * so a looping agent is throttled SERVER-SIDE rather than spamming the
+   * operator with approval cards. Only counts proposals that reach the
+   * card path (a fresh, validated, non-deduped diff) — validation errors
+   * and collapsed in-flight duplicates don't consume the budget.
+   */
+  private configEditPostTimes = new Map<string, number[]>();
+
+  /** Default cards/hour cap when `hostd.config_edit_rate_per_hour` is unset.
+   *  Mirrors the schema default (RFC admin-agent-config-edit §5). */
+  private static readonly DEFAULT_CONFIG_EDIT_RATE_PER_HOUR = 3;
+
+  /**
+   * Record a card-post for `callerName` and report whether it stays within
+   * the per-hour cap. Prunes timestamps older than 1h, then admits iff the
+   * window count is below the cap. On admit the new timestamp is recorded;
+   * on reject nothing is recorded (so a throttled caller doesn't push its
+   * own reset further out by hammering).
+   */
+  private checkConfigEditRate(
+    callerName: string,
+    now: number,
+  ): { ok: true } | { ok: false; limit: number; retryAtMs: number } {
+    const limit =
+      this.opts.config.hostd?.config_edit_rate_per_hour ??
+      HostdServer.DEFAULT_CONFIG_EDIT_RATE_PER_HOUR;
+    const windowMs = 60 * 60 * 1000;
+    const cutoff = now - windowMs;
+    const prior = (this.configEditPostTimes.get(callerName) ?? []).filter(
+      (t) => t > cutoff,
+    );
+    if (prior.length >= limit) {
+      // Oldest in-window timestamp frees a slot one window after it landed.
+      const retryAtMs = prior[0]! + windowMs;
+      this.configEditPostTimes.set(callerName, prior);
+      return { ok: false, limit, retryAtMs };
+    }
+    prior.push(now);
+    this.configEditPostTimes.set(callerName, prior);
+    return { ok: true };
+  }
 
   /**
    * The approval-card + mutex-serialized apply phase of

@@ -8,6 +8,7 @@ import {
   parseWeeklyReset,
   WEDGE_FOOTER_SIGNATURE,
   CONFIRM_MODAL_SIGNATURE,
+  PERMISSION_PROMPT_SIGNATURE,
   STOP_HOOK_ERROR_SIGNATURE,
   MANIFESTING_SIGNATURE,
 } from "../src/agents/wedge-watchdog.js";
@@ -431,6 +432,124 @@ describe("#2471 runWedgeWatchdog — manifest-stall escalation", () => {
     expect(res.restartEscalations).toBe(1);
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
+  });
+});
+
+// ─── Per-tool permission-prompt TUI freeze (config_propose_edit / hostd) ──────
+//
+// A non-pre-approved MCP tool's permission prompt that renders as Claude
+// Code's interactive TUI (instead of emitting the channel notification that
+// becomes a Telegram card) arms no TTL auto-deny and parks the turn forever
+// — the carrie freeze. The watchdog must detect it by SHAPE persistence and
+// dismiss it with Esc (a SAFE decline/deny), never selecting option 1/2.
+
+// The real per-tool permission prompt, rendered TWO ways so a byte-stable
+// gate would never fire (the spinner / cursor jitter between paints).
+const PERMISSION_PROMPT_A =
+  "config_propose_edit(reason: widen tools.allow)\n" +
+  "Do you want to proceed?\n" +
+  "❯ 1. Yes\n" +
+  "  2. Yes, and don't ask again this session\n" +
+  "  3. No, and tell Claude what to do differently (esc)";
+const PERMISSION_PROMPT_B = PERMISSION_PROMPT_A + "\n ";
+
+describe("PERMISSION_PROMPT_SIGNATURE", () => {
+  it("matches the per-tool permission prompt (proceed? + don't-ask-again)", () => {
+    expect(PERMISSION_PROMPT_SIGNATURE.test(PERMISSION_PROMPT_A)).toBe(true);
+  });
+
+  it("does NOT match the /effort confirm modal or a plain yes/no", () => {
+    // The effort modal has no "Do you want to proceed?" + "don't ask again".
+    expect(PERMISSION_PROMPT_SIGNATURE.test(EFFORT_MODAL_A)).toBe(false);
+    expect(
+      PERMISSION_PROMPT_SIGNATURE.test("Do you want to proceed?\n 1. Yes\n 2. No"),
+    ).toBe(false);
+  });
+
+  it("does NOT match idle / working / plain panes", () => {
+    for (const text of [
+      "⏵⏵ accept edits on · esc to interrupt\n> ",
+      "Here is the answer. Done.",
+      "Thinking… (12s · esc to interrupt)",
+      "",
+    ]) {
+      expect(PERMISSION_PROMPT_SIGNATURE.test(text), `matched: ${text}`).toBe(
+        false,
+      );
+    }
+  });
+});
+
+describe("runWedgeWatchdog — permission-prompt freeze", () => {
+  it("dismisses a FLICKERING permission prompt with Esc (safe deny)", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      // isolate the permission-prompt branch.
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        PERMISSION_PROMPT_A,
+      ]),
+      send,
+    });
+    expect(res.permissionPromptFires).toBe(1);
+    expect(res.fires).toBe(1);
+    // ESC ONLY — never an Enter or a "1"/"2" numeric (would auto-approve).
+    expect(calls).toEqual([["Escape"]]);
+  });
+
+  it("does NOT fire before the present-streak threshold", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 2, // one short
+      capture: captureFlicker([PERMISSION_PROMPT_A, PERMISSION_PROMPT_B]),
+      send,
+    });
+    expect(res.permissionPromptFires).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("resets the streak when the prompt clears (no fire on intermittent)", async () => {
+    const idle = "⏵⏵ accept edits on · esc to interrupt\n> ";
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "carrie",
+      permissionPromptPolls: 3,
+      rateLimitSignature: null,
+      confirmModalSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 5,
+      capture: captureFlicker([
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+        idle,
+        PERMISSION_PROMPT_A,
+        PERMISSION_PROMPT_B,
+      ]),
+      send,
+    });
+    expect(res.permissionPromptFires).toBe(0);
+    expect(calls).toEqual([]);
   });
 });
 

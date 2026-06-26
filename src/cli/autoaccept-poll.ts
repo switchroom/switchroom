@@ -116,7 +116,7 @@ async function main(): Promise<void> {
       requestRestart: requestWedgeRestart,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} confirmModalFires=${res.confirmModalFires} restartEscalations=${res.restartEscalations}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(

@@ -2986,9 +2986,10 @@ export const HostdConfigSchema = z.object({
     .describe(
       "Per-requesting-agent rate cap for `config_propose_edit` cards " +
       "(RFC admin-agent-config-edit §5). Default 3 cards/hour; min 1, " +
-      "max 20. Configurable now, but the rate limiter is not yet enforced " +
-      "(no `E_RATE_LIMITED` is currently raised); the field is reserved so " +
-      "operators can pin the cap ahead of the limiter going live.",
+      "max 20. ENFORCED server-side: a caller exceeding this in a sliding " +
+      "1-hour window is rejected with `E_RATE_LIMITED` (carrying a " +
+      "`retry_after` fix) instead of posting another operator approval " +
+      "card — so a looping agent is throttled rather than spamming the chat.",
     ),
 });
 

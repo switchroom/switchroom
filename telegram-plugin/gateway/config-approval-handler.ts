@@ -2,6 +2,7 @@
 // card, resolves the verdict back to hostd over IPC, and flips the card to
 // a terminal state on finalize.
 
+import { randomBytes } from "node:crypto";
 import type { IpcClient } from "./ipc-server.js";
 import type {
   RequestConfigApprovalMessage,
@@ -12,6 +13,15 @@ import { truncateRawToFit } from "./oversize-card-body.js";
 /** Pending approval state — in-memory only (no SQLite per RFC §3.4). */
 interface PendingConfigApproval {
   requestId: string;
+  /**
+   * Per-card nonce embedded in the callback_data (`cfg:<requestId>:<epoch>:
+   * <choice>`). hostd's `approvalId` is only randomBytes(4)=32 bits and the
+   * callback_data carried no epoch, so a stale tap on a never-stripped old
+   * card could in principle resolve a same-id LIVE request. A tap whose epoch
+   * doesn't match the live pending entry is rejected as stale (see
+   * `resolvePendingConfigApproval`).
+   */
+  epoch: string;
   client: Pick<IpcClient, "send">;
   chatId: number | string;
   threadId?: number;
@@ -24,6 +34,12 @@ interface PendingConfigApproval {
 }
 
 const pending = new Map<string, PendingConfigApproval>();
+
+/** Default per-card nonce: 8 hex chars (32 bits) — enough to make a stale
+ *  tap's epoch effectively never collide with a live card's. */
+function defaultEpoch(): string {
+  return randomBytes(4).toString("hex");
+}
 
 // Injected deps — gateway.ts wires these from the existing surface.
 
@@ -43,13 +59,26 @@ export interface ConfigApprovalHandlerDeps {
     /** grammy InlineKeyboard, passed through verbatim. */
     replyMarkup: unknown;
   }) => Promise<{ messageId: number } | null>;
-  /** Build the inline keyboard with [✅ Approve] [🚫 Deny] buttons. */
-  buildKeyboard: (requestId: string) => unknown;
-  /** Edit a posted card to a new body. Best-effort — failures logged. */
+  /**
+   * Build the inline keyboard with [✅ Approve] [🚫 Deny] buttons. The
+   * `epoch` is a per-card nonce baked into the callback_data so a stale tap
+   * on an old card can never match a live request (see PendingConfigApproval).
+   */
+  buildKeyboard: (requestId: string, epoch: string) => unknown;
+  /** Mint a per-card nonce. Default: a short random hex (test seam). */
+  mintEpoch?: () => string;
+  /**
+   * Edit a posted card to a new body. Best-effort — failures logged.
+   * When `stripKeyboard` is set, the inline keyboard is removed so the
+   * [✅ Approve] [🚫 Deny] buttons stop being tappable on a card that has
+   * reached a terminal/interim state — a stale tap must never resolve a
+   * request (defense-in-depth alongside the per-card epoch in callback_data).
+   */
   editCard: (args: {
     chatId: number | string;
     messageId: number;
     text: string;
+    stripKeyboard?: boolean;
   }) => Promise<void>;
   /**
    * Send the full diff as a `.patch` document attachment when the
@@ -278,7 +307,11 @@ export async function handleRequestConfigApproval(
   // builder's structured `truncated` flag instead of substring-
   // matching the sentinel string (#1767 nit).
   const oversize = prelim !== msg.unifiedDiff || built.truncated;
-  const replyMarkup = deps.buildKeyboard(msg.requestId);
+  // Per-card nonce — baked into callback_data so a stale tap on a previously
+  // posted card (e.g. one already finalized/expired) can never match a live
+  // pending request even if hostd minted the same 32-bit requestId.
+  const epoch = (deps.mintEpoch ?? defaultEpoch)();
+  const replyMarkup = deps.buildKeyboard(msg.requestId, epoch);
 
   const posted = await deps.postCard({
     chatId: target.chatId,
@@ -296,6 +329,7 @@ export async function handleRequestConfigApproval(
 
   const entry: PendingConfigApproval = {
     requestId: msg.requestId,
+    epoch,
     client,
     chatId: target.chatId,
     ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
@@ -328,14 +362,30 @@ export async function handleRequestConfigApproval(
  *
  * Returns true if THIS call resolved the request (first call wins),
  * false if it was already resolved.
+ *
+ * `expectedEpoch` guards an OPERATOR tap: the callback_data carries the
+ * per-card nonce, which must match the live pending entry's `epoch`. A
+ * mismatch means the tap came from a STALE card (already finalized/expired,
+ * keyboard should have been stripped) — reject it as a no-op so it can never
+ * resolve a different live request that happens to share the 32-bit
+ * requestId. Internal callers (the per-request timeout timer, finalize) pass
+ * `undefined` to skip the check — they already hold the authoritative entry.
  */
 export async function resolvePendingConfigApproval(
   requestId: string,
   verdict: "approve" | "deny" | "timeout",
   deps: Pick<ConfigApprovalHandlerDeps, "editCard" | "log">,
+  expectedEpoch?: string,
 ): Promise<boolean> {
   const entry = pending.get(requestId);
   if (!entry || entry.resolved) return false;
+  if (expectedEpoch !== undefined && entry.epoch !== expectedEpoch) {
+    deps.log?.(
+      `config approval stale-tap rejected (requestId=${requestId}): ` +
+        `epoch mismatch (tap=${expectedEpoch} live=${entry.epoch})`,
+    );
+    return false;
+  }
   entry.resolved = true;
   if (entry.timer !== null) {
     clearTimeout(entry.timer);
@@ -364,10 +414,14 @@ export async function resolvePendingConfigApproval(
         ? "🚫 <b>Denied</b>"
         : "⏱ <b>Expired</b>";
   try {
+    // Strip the keyboard: once resolved (approve/deny/timeout) the buttons
+    // must not stay tappable — a stale tap could otherwise re-hit the
+    // callback path.
     await deps.editCard({
       chatId: entry.chatId,
       messageId: entry.messageId,
       text: interim,
+      stripKeyboard: true,
     });
   } catch (err) {
     deps.log?.(
@@ -425,10 +479,12 @@ export async function handleRequestConfigFinalize(
       ? `✅ <b>Applied</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}${liveNote}`
       : `⚠️ <b>Reconcile failed; rolled back</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}`;
   try {
+    // Finalize is terminal — strip the keyboard so the buttons are gone.
     await deps.editCard({
       chatId: entry.chatId,
       messageId: entry.messageId,
       text: body,
+      stripKeyboard: true,
     });
   } catch (err) {
     deps.log?.(
@@ -483,20 +539,45 @@ export function _peekPendingConfigApprovalForTest(
 }
 
 /**
- * Parse `cfg:<requestId>:<choice>` callback data. Returns null on
+ * Parse `cfg:<requestId>:<epoch>:<choice>` callback data. Returns null on
  * malformed input. The callback handler in gateway.ts uses this +
- * resolvePendingConfigApproval to drive the tap → resolve flow.
+ * resolvePendingConfigApproval (passing the parsed `epoch`) to drive the
+ * tap → resolve flow; the epoch is verified against the live pending entry
+ * so a stale tap can never resolve a same-id live request.
+ *
+ * The 3-segment legacy form `cfg:<requestId>:<choice>` (no epoch) is still
+ * parsed for back-compat with cards posted before this change — `epoch` is
+ * undefined there, so the resolver skips the epoch check (degrades to the
+ * keyboard-strip protection alone). New cards always carry an epoch.
  */
 export function parseConfigApprovalCallback(
   data: string,
-): { requestId: string; choice: "approve" | "deny" } | null {
+): { requestId: string; epoch?: string; choice: "approve" | "deny" } | null {
   if (!data.startsWith("cfg:")) return null;
   const rest = data.slice(4);
-  const colon = rest.lastIndexOf(":");
-  if (colon < 0) return null;
-  const requestId = rest.slice(0, colon);
-  const choice = rest.slice(colon + 1);
-  if (requestId.length === 0 || requestId.length > 64) return null;
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon < 0) return null;
+  const choice = rest.slice(lastColon + 1);
   if (choice !== "approve" && choice !== "deny") return null;
-  return { requestId, choice };
+  const head = rest.slice(0, lastColon);
+  // New form carries an epoch as the segment before the choice:
+  // <requestId>:<epoch>. The epoch is hex (no colon), so split on the LAST
+  // remaining colon to separate it from a requestId (which is also hex).
+  const epochColon = head.lastIndexOf(":");
+  let requestId: string;
+  let epoch: string | undefined;
+  if (epochColon >= 0) {
+    requestId = head.slice(0, epochColon);
+    epoch = head.slice(epochColon + 1);
+    if (epoch.length === 0 || epoch.length > 32 || !/^[0-9a-fA-F]+$/.test(epoch)) {
+      // Not a well-formed epoch — treat the whole head as the legacy
+      // requestId (back-compat for ids that themselves contain a colon).
+      requestId = head;
+      epoch = undefined;
+    }
+  } else {
+    requestId = head;
+  }
+  if (requestId.length === 0 || requestId.length > 64) return null;
+  return { requestId, ...(epoch !== undefined ? { epoch } : {}), choice };
 }

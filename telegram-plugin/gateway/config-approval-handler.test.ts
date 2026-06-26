@@ -44,13 +44,28 @@ function fakeDeps(overrides: Partial<Parameters<typeof handleRequestConfigApprov
     chatId: number | string;
     messageId: number;
     text: string;
+    stripKeyboard?: boolean;
   }> = [];
   const deps = {
     agentName: "klanker",
     loadTargetChat: () => ({ chatId: 42 }),
     postCard: vi.fn(async () => ({ messageId: 1001 })),
-    buildKeyboard: () => ({ inline_keyboard: [] }),
-    editCard: async (a: { chatId: number | string; messageId: number; text: string }) => {
+    // Deterministic epoch so callback_data is assertable in tests.
+    mintEpoch: () => "cafe1234",
+    buildKeyboard: (requestId: string, epoch: string) => ({
+      inline_keyboard: [
+        [
+          { text: "✅ Approve", callback_data: `cfg:${requestId}:${epoch}:approve` },
+          { text: "🚫 Deny", callback_data: `cfg:${requestId}:${epoch}:deny` },
+        ],
+      ],
+    }),
+    editCard: async (a: {
+      chatId: number | string;
+      messageId: number;
+      text: string;
+      stripKeyboard?: boolean;
+    }) => {
       editCalls.push(a);
     },
     log: () => {},
@@ -227,9 +242,11 @@ describe("resolvePendingConfigApproval — double-tap and verdict propagation", 
     const verdicts = sent.filter((s) => s.type === "config_approval_resolved");
     expect(verdicts.length).toBe(1);
     expect(verdicts[0]!.verdict).toBe("approve");
-    // Card edited once to the interim 'Applying' state.
+    // Card edited once to the interim 'Applying' state, with the keyboard
+    // stripped so the buttons stop being tappable.
     expect(editCalls.length).toBe(1);
     expect(editCalls[0]!.text).toMatch(/Applying/);
+    expect(editCalls[0]!.stripKeyboard).toBe(true);
   });
 
   it("returns false when no entry exists (unknown requestId)", async () => {
@@ -261,6 +278,8 @@ describe("timeout path", () => {
       expect(verdicts.length).toBe(1);
       expect(verdicts[0]!.verdict).toBe("timeout");
       expect(editCalls[0]!.text).toMatch(/Expired/);
+      // Expired card must also strip the keyboard (no stale tappable buttons).
+      expect(editCalls[0]!.stripKeyboard).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -437,7 +456,20 @@ describe("oversize diff → attachment fallback (#1762)", () => {
 });
 
 describe("parseConfigApprovalCallback", () => {
-  it("parses well-formed callbacks", () => {
+  it("parses the new epoch-bearing form cfg:<requestId>:<epoch>:<choice>", () => {
+    expect(parseConfigApprovalCallback("cfg:abc:cafe1234:approve")).toEqual({
+      requestId: "abc",
+      epoch: "cafe1234",
+      choice: "approve",
+    });
+    expect(parseConfigApprovalCallback("cfg:deadbeef:00ff:deny")).toEqual({
+      requestId: "deadbeef",
+      epoch: "00ff",
+      choice: "deny",
+    });
+  });
+
+  it("still parses the legacy 3-segment form (no epoch, back-compat)", () => {
     expect(parseConfigApprovalCallback("cfg:abc:approve")).toEqual({
       requestId: "abc",
       choice: "approve",
@@ -453,5 +485,60 @@ describe("parseConfigApprovalCallback", () => {
     expect(parseConfigApprovalCallback("cfg:")).toBeNull();
     expect(parseConfigApprovalCallback("cfg:abc:bogus")).toBeNull();
     expect(parseConfigApprovalCallback("cfg::approve")).toBeNull();
+  });
+});
+
+describe("stale-tap rejection via per-card epoch", () => {
+  it("bakes the minted epoch into the posted card's callback_data", async () => {
+    const { client, deps } = fakeDeps();
+    await handleRequestConfigApproval(client, baseMsg, deps);
+    const postCard = deps.postCard as ReturnType<typeof vi.fn>;
+    const kb = postCard.mock.calls[0]![0].replyMarkup as {
+      inline_keyboard: Array<Array<{ callback_data: string }>>;
+    };
+    expect(kb.inline_keyboard[0]![0]!.callback_data).toBe(
+      "cfg:req-1:cafe1234:approve",
+    );
+    expect(kb.inline_keyboard[0]![1]!.callback_data).toBe(
+      "cfg:req-1:cafe1234:deny",
+    );
+  });
+
+  it("resolves when the tap epoch matches the live card", async () => {
+    const { client, deps } = fakeDeps();
+    await handleRequestConfigApproval(client, baseMsg, deps);
+    const ok = await resolvePendingConfigApproval(
+      "req-1",
+      "approve",
+      deps,
+      "cafe1234",
+    );
+    expect(ok).toBe(true);
+  });
+
+  it("rejects a stale tap whose epoch does NOT match the live card", async () => {
+    const { client, sent, deps, editCalls } = fakeDeps();
+    await handleRequestConfigApproval(client, baseMsg, deps);
+    // A tap carrying a DIFFERENT (stale) epoch must be a no-op — no verdict
+    // crosses the wire, no card edit happens, and the request stays live.
+    const stale = await resolvePendingConfigApproval(
+      "req-1",
+      "approve",
+      deps,
+      "deadbeef",
+    );
+    expect(stale).toBe(false);
+    expect(sent.filter((s) => s.type === "config_approval_resolved")).toEqual(
+      [],
+    );
+    expect(editCalls).toEqual([]);
+    // The correct (live) epoch still resolves it.
+    const live = await resolvePendingConfigApproval(
+      "req-1",
+      "approve",
+      deps,
+      "cafe1234",
+    );
+    expect(live).toBe(true);
   });
 });

@@ -222,6 +222,50 @@ describe('formatPermissionCardBody', () => {
     expect(body).toContain('why: <i>first second paragraph</i>')
   })
 
+  // config-edit-hardening: upstream Claude Code truncates `inputPreview`
+  // to ~200 chars. For config_propose_edit the (NEW-ordered) reason lands
+  // inside the surviving prefix, but the truncated JSON is unparseable —
+  // the lenient `extractReasonFromRaw` regex fallback must still recover it
+  // so the card no longer renders "why: not provided".
+  test('recovers reason from a >200-char truncated config_propose_edit input', () => {
+    // reason FIRST (the reordered schema), then a huge unified_diff that
+    // gets cut by the 200-char truncation → invalid JSON, no closing brace.
+    const reason = 'widen klanker tools.allow for the new skill'
+    const fullDiff =
+      '--- a/switchroom.yaml\n+++ b/switchroom.yaml\n' +
+      Array.from({ length: 40 }, (_, i) => `+    - "Bash(tool-${i}:*)"`).join('\n')
+    const full = JSON.stringify({
+      reason,
+      target_path: '/state/config/switchroom.yaml',
+      unified_diff: fullDiff,
+    })
+    const truncated = full.slice(0, 200) // mirror the upstream cut
+    expect(() => JSON.parse(truncated)).toThrow() // precondition: unparseable
+    const body = formatPermissionCardBody({
+      toolName: 'config_propose_edit',
+      inputPreview: truncated,
+      description: 'Propose a unified-diff patch against switchroom.yaml.',
+      agentName: 'klanker',
+    })
+    expect(body).toContain(`why: <i>${reason}</i>`)
+    expect(body).not.toContain('not provided')
+  })
+
+  test('recovers reason even when unified_diff precedes it (legacy order)', () => {
+    // Even with the OLD key order (diff first), the regex finds reason if it
+    // survives the cut — proving the fallback is order-independent.
+    const reason = 'self-scope allow rule add'
+    const raw =
+      '{"unified_diff":"--- a/x\\n+++ b/x\\n+ small","reason":"' + reason + '"}'
+    const body = formatPermissionCardBody({
+      toolName: 'config_propose_edit',
+      inputPreview: raw,
+      description: 'desc',
+      agentName: 'klanker',
+    })
+    expect(body).toContain(`why: <i>${reason}</i>`)
+  })
+
   // #2469: hostd agent_* cards must name WHICH agent is targeted, pulled
   // from the `name` input arg — not the static curated phrase.
   test('hostd agent_restart names the target agent in the title (#2469)', () => {

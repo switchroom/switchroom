@@ -551,8 +551,43 @@ function readString(input: Record<string, unknown>, key: string): string | null 
  */
 function callerSuppliedReason(inputPreview: string | undefined): string | null {
   const input = parseInput(inputPreview);
-  if (!input) return null;
-  return readString(input, "reason") ?? readString(input, "why");
+  if (input) {
+    const fromJson = readString(input, "reason") ?? readString(input, "why");
+    if (fromJson) return fromJson;
+  }
+  // Truncation fallback (#2580 follow-up): upstream Claude Code truncates
+  // `inputPreview` to ~200 chars. For a tool whose first/largest key is a
+  // big blob (e.g. config_propose_edit's `unified_diff`), the truncated JSON
+  // is unparseable and the schema-required `reason` is lost — the card then
+  // renders "why: not provided" even though a reason WAS supplied. Mirror the
+  // `extractFilePathFromRaw` lenient-regex fallback so a `reason`/`why` value
+  // surviving in the truncated prefix is still recovered. (Reordering the
+  // schema so `reason` precedes the blob keeps it inside the 200-char prefix;
+  // this regex is what then reads it back out.)
+  if (inputPreview) {
+    const r = extractReasonFromRaw(inputPreview);
+    if (r) return r;
+  }
+  return null;
+}
+
+/**
+ * Regex-based fallback to extract a `reason` or `why` value from a raw
+ * (possibly truncated / invalid-JSON) inputPreview string. Mirrors
+ * `extractFilePathFromRaw`: JSON-unescapes the captured value so a reason
+ * with quotes/backslashes/unicode escapes is returned correctly. Returns
+ * null when neither key is present or the captured value is empty/whitespace.
+ */
+export function extractReasonFromRaw(raw: string): string | null {
+  // Match the first occurrence of "reason" or "why".
+  const m = /"(?:reason|why)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw);
+  if (!m) return null;
+  try {
+    const value = JSON.parse(`"${m[1]}"`) as string;
+    return typeof value === "string" && value.trim().length > 0 ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function skillBasenameFromPath(input: Record<string, unknown>): string | null {
