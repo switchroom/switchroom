@@ -73,7 +73,7 @@ describe("generateDockerComposeSnippet", () => {
     expect(yaml).toContain("LLM_PROVIDER=openai");
     expect(yaml).toContain("EMBEDDING_MODEL=text-embedding-3-small");
     expect(yaml).toContain("hindsight-data:/home/hindsight/.pg0");
-    expect(yaml).toContain("restart: unless-stopped");
+    expect(yaml).toContain("restart: always");
   });
 
   it("omits EMBEDDING_MODEL when model is not set", () => {
@@ -235,7 +235,7 @@ describe("generateHindsightComposeSnippet (broker-fed, #1245)", () => {
     expect(snippet).toContain("switchroom-hindsight");
     expect(snippet).toContain("image: ghcr.io/switchroom/switchroom-hindsight:latest");
     expect(snippet).toContain("switchroom-hindsight-data:/home/hindsight/.pg0");
-    expect(snippet).toContain("restart: unless-stopped");
+    expect(snippet).toContain("restart: always");
     // Upstream image is NOT used — switchroom-hindsight extends it with
     // claude-agent-sdk + the claude CLI for the claude-code provider.
     expect(snippet).not.toContain("ghcr.io/vectorize-io/hindsight:latest");
