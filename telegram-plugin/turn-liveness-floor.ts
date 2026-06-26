@@ -161,23 +161,80 @@ export function midTurnFloorEnabled(): boolean {
 }
 
 /**
- * PR1 Item-3a — parse the DORMANT post-answer liveness window
- * (`SWITCHROOM_POST_ANSWER_LIVENESS_MS`). This is the escape-hatch plumbing for a
- * future per-agent "still tidying…" liveness line on POST-answer work; see the
- * Item-3 decision in `docs/message-emission-determinism.md` §10 R2. Today
- * post-answer work is silent by design (lever 1 refuses any card OPEN once a
- * substantive final landed), and this knob ships DORMANT:
+ * Parse a positive-integer ms window from an env value, or 0 when unset / empty /
+ * non-numeric / 0 / negative.
  *
- *   - UNSET, empty, non-numeric, 0, or negative ⇒ **0** = today's behaviour
- *     (no post-answer surface; the guarded branch in `feedHeartbeatTick` is dead).
- *   - a positive integer ⇒ the threshold (ms of post-answer silence) at which a
- *     future Item-3 surface WOULD fire. No surface ships enabled in this PR.
+ * Now backs the post-answer background-agent liveness STALENESS CAP
+ * (`SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS`): the gateway reads
+ * `parsePostAnswerLivenessMs(env) || 30_000`, so 0 (unset/invalid) falls back to
+ * a default-ON 30s cap, and a positive override wins. The `feedHeartbeatTick`
+ * post-answer branch uses that cap (via `evaluatePostAnswerLiveness`) to stop
+ * re-rendering the "background agent still working" card once the worker's last
+ * advance goes stale — mirroring the pre-answer `FEED_LIVENESS_OPEN_MS` recency
+ * cap. (This helper previously parsed the dormant `SWITCHROOM_POST_ANSWER_LIVENESS_MS`
+ * Item-3 escape hatch, whose gate was removed; the parse semantics are unchanged.)
  *
- * Extracted as a pure function so the default-off contract is unit-testable
- * (gateway.ts is not importable in isolation — top-level side effects). Mirrors
+ * Extracted as a pure function so the parse contract is unit-testable (gateway.ts
+ * is not importable in isolation — top-level side effects). Mirrors
  * `parseVisibleAnswerStreamEnabled`'s pattern.
  */
 export function parsePostAnswerLivenessMs(raw: string | undefined): number {
   const n = raw ? Number(raw) : NaN
   return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/**
+ * Post-answer background-agent liveness — pure decision (Fix 2 / #2587 supersede,
+ * concern 3 staleness cap).
+ *
+ * The `feedHeartbeatTick` post-answer branch re-renders a "background agent still
+ * working" card every FEED_HEARTBEAT_TICK_MS while a sub-agent/workflow watcher
+ * keeps advancing `turn.subagentActivityAt` AFTER the substantive final answer.
+ * This function is the gate it consults each tick. It encodes BOTH guards:
+ *
+ *   - **idle-gap suppression** — when no watcher activity arrived after the
+ *     answer (`subagentActivityAt` unset, or ≤ the answer time), stay silent so
+ *     the reply-is-last invariant holds for genuinely-idle turns; and
+ *   - **staleness cap** (concern 3) — once the worker's activity has gone stale
+ *     (`now - subagentActivityAt >= staleCapMs`, i.e. its `onFinish` froze the
+ *     timestamp and no new step has arrived), STOP emitting. Without this the
+ *     post-answer card kept re-rendering `state:'running'` with an
+ *     ever-growing `elapsed` forever, long after the worker terminated. This
+ *     mirrors the pre-answer `FEED_LIVENESS_OPEN_MS` recency cap, which bounds
+ *     the open window the same way.
+ *
+ * `staleCapMs <= 0` disables the cap (idle-gap suppression still applies) — but
+ * the gateway parses a positive default, so the cap is ON by default.
+ *
+ * Extracted as a pure function so the lifecycle (emit in the post-answer /
+ * pre-teardown window, stop once stale) is unit-testable without instantiating
+ * the gateway IIFE (top-level side effects make it un-importable in isolation).
+ */
+export type PostAnswerLivenessVerdict =
+  /** No post-answer watcher activity (idle gap) — stay silent. */
+  | 'idle'
+  /** Activity has gone stale (worker finished / went quiet) — stop emitting. */
+  | 'stale'
+  /** Genuine in-flight post-answer activity — render the liveness card. */
+  | 'emit'
+
+export interface PostAnswerLivenessInput {
+  /** `turn.subagentActivityAt` — the watcher's last post-answer advance, or undefined. */
+  subagentActivityAt: number | undefined
+  /** `turn.finalAnswerDeliveredAt` — when the substantive final landed (undefined ⇒ 0). */
+  finalAnswerDeliveredAt: number | undefined
+  /** Wall-clock now (injected for tests). */
+  now: number
+  /** Staleness cap in ms; `<= 0` disables the cap. */
+  staleCapMs: number
+}
+
+export function evaluatePostAnswerLiveness(input: PostAnswerLivenessInput): PostAnswerLivenessVerdict {
+  const { subagentActivityAt, finalAnswerDeliveredAt, now, staleCapMs } = input
+  const answeredAt = finalAnswerDeliveredAt ?? 0
+  // idle-gap: nothing surfaced after the answer → silent (reply-is-last preserved).
+  if (subagentActivityAt == null || subagentActivityAt <= answeredAt) return 'idle'
+  // staleness cap: the worker's last advance is older than the cap → stop emitting.
+  if (staleCapMs > 0 && now - subagentActivityAt >= staleCapMs) return 'stale'
+  return 'emit'
 }

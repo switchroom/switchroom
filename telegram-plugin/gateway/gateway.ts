@@ -105,7 +105,7 @@ import * as silencePoke from '../silence-poke.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { writeSilentEndState, clearSilentEndState, recordUndeliveredTurnEnd } from '../silent-end.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, FINAL_ANSWER_MIN_CHARS } from '../final-answer-detect.js'
-import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, type LoopRole } from '../turn-liveness-floor.js'
+import { deriveTurnRole, decideTerminalReason, parsePostAnswerLivenessMs, evaluatePostAnswerLiveness, type LoopRole } from '../turn-liveness-floor.js'
 import { createAnswerStream, type AnswerStreamHandle } from '../answer-stream.js'
 import { parseVisibleAnswerStreamEnabled, resolveAnswerLaneConfig } from '../answer-stream-flag.js'
 import { type SessionEvent } from '../session-tail.js'
@@ -1772,20 +1772,21 @@ const FEED_LIVENESS_OPEN_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 12_000
 })()
 
-// PR1 Item-3a (DORMANT escape hatch — see `docs/message-emission-determinism.md`
-// §10 R2 / §9 lever 1: "is silent post-substantive-answer work acceptable, or
-// does it need its own surface?"). Today post-answer work is SILENT by design:
-// lever 1's sticky latch refuses any card OPEN once a substantive final landed,
-// so a long cleanup tool after the answer produces no card. This knob is the
-// plumbing to let a per-agent "still tidying…" liveness line be enabled LATER
-// without a redesign — when/if the Item-3 decision lands on "post-answer work
-// should surface". UNSET or 0 ⇒ exactly today's behaviour (no post-answer card);
-// the guarded branch below is DEAD by default. No behavioural change ships
-// enabled. Parsed once via the pure `parsePostAnswerLivenessMs` helper (whose
-// default-off contract is unit-tested in turn-liveness-floor.test.ts).
-const POST_ANSWER_LIVENESS_MS = parsePostAnswerLivenessMs(
-  process.env.SWITCHROOM_POST_ANSWER_LIVENESS_MS,
-)
+// Post-answer background-agent liveness STALENESS CAP (Fix 2 / #2587 supersede,
+// concern 3). The `feedHeartbeatTick` post-answer branch re-renders a "background
+// agent still working" card every FEED_HEARTBEAT_TICK_MS while the sub-agent
+// watcher keeps advancing `turn.subagentActivityAt`. Without a cap that card kept
+// emitting `state:'running'` with an ever-climbing `elapsed` FOREVER — even after
+// the worker's `onFinish` froze the timestamp — because (unlike the pre-answer
+// path's `FEED_LIVENESS_OPEN_MS` recency cap) the post-answer branch had no
+// staleness bound. This cap mirrors that pre-answer pattern: once the worker's
+// last advance is older than the cap, the heartbeat stops re-rendering and the
+// card freezes at its last state. Parsed via the same pure `parsePostAnswerLivenessMs`
+// helper (positive int or 0); `|| 30_000` supplies a default-ON 30s cap, so an
+// unset env keeps the cap active. Override with SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS.
+const POST_ANSWER_LIVENESS_STALE_MS = parsePostAnswerLivenessMs(
+  process.env.SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS,
+) || 30_000
 
 /** Compact mm/ss-ish elapsed for the live feed suffix: "18s", "1m05s". */
 function formatFeedElapsed(ms: number): string {
@@ -10947,12 +10948,26 @@ function feedHeartbeatTick(): void {
     // is written by the watcher's onProgress callback INDEPENDENTLY of the
     // tool_label / drop-guard path, so it correctly advances post-answer.
     //
-    // Idle-gap suppression: when no watcher activity has arrived after the answer
-    // (`subagentActivityAt` is undefined or ≤ finalAnswerDeliveredAt), we return
-    // silently — the reply-is-last invariant is fully preserved for idle turns.
+    // Idle-gap suppression + staleness cap (concern 3) — the single pure decision
+    // `evaluatePostAnswerLiveness`:
+    //   - 'idle'  → no watcher activity after the answer (`subagentActivityAt`
+    //               undefined or ≤ finalAnswerDeliveredAt). Stay silent; the
+    //               reply-is-last invariant is fully preserved for idle turns.
+    //   - 'stale' → the worker's last advance is older than POST_ANSWER_LIVENESS_STALE_MS
+    //               (its `onFinish` froze `subagentActivityAt` and no new step has
+    //               arrived). STOP re-rendering so the card doesn't climb `running`
+    //               forever — mirrors the pre-answer FEED_LIVENESS_OPEN_MS cap. The
+    //               worker's own terminal card (workerActivityFeed.finish) is the
+    //               durable record once it completes.
+    //   - 'emit'  → genuine in-flight post-answer activity; render the card below.
     const subagentAt = turn.subagentActivityAt
-    const answeredAt = turn.finalAnswerDeliveredAt ?? 0
-    if (subagentAt == null || subagentAt <= answeredAt) return // no post-answer watcher activity → stay silent
+    const livenessVerdict = evaluatePostAnswerLiveness({
+      subagentActivityAt: subagentAt,
+      finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
+      now: Date.now(),
+      staleCapMs: POST_ANSWER_LIVENESS_STALE_MS,
+    })
+    if (livenessVerdict !== 'emit' || subagentAt == null) return // idle gap or stale worker → stay silent (the `== null` also narrows subagentAt for the elapsed below)
     // A background worker is genuinely active after the answer. Open or maintain
     // a liveness card below the reply. Route through `mayOpenActivityCard` with
     // `postAnswerSubagentActivity:true` so Lever 1 is lifted for 'tool' producer
@@ -23807,6 +23822,21 @@ void (async () => {
                 // after the answer) to decide whether to open a liveness card.
                 // Only stamp when the turn is alive AND post-answer: pre-answer
                 // activity is already surfaced by the normal tool-label feed.
+                //
+                // SCOPE — this is the IN-TURN-WINDOW surface only. The
+                // `feedHeartbeatTick` post-answer card is driven off `currentTurn`,
+                // which `endCurrentTurnAtomic` nulls at `turn_end`. A genuinely
+                // DECOUPLED background worker keeps running PAST the parent
+                // turn's teardown, so `currentTurn` is null when its later
+                // onProgress ticks arrive → this stamp is inert and the
+                // heartbeat is silent for that worker. That is BY DESIGN, not a
+                // gap: a decoupled worker's ongoing activity is surfaced by the
+                // dedicated, currentTurn-independent `workerActivityFeed` (the
+                // edit-in-place worker message, driven below at `workerFeedEnabled`
+                // and bounded by its own non-running/`finish` teardown). So the
+                // currentTurn card covers the brief post-answer/pre-teardown
+                // window; the worker feed covers everything after teardown. Both
+                // are proven in telegram-activity-visibility-integration.test.ts.
                 const stampTurn = currentTurn
                 if (stampTurn != null && stampTurn.finalAnswerEverDelivered) {
                   stampTurn.subagentActivityAt = Date.now()

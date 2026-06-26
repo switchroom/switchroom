@@ -6,14 +6,20 @@
  *
  * This test exercises the REAL code paths — not injected state:
  *
- * Fix 2 (post-answer background-agent liveness):
- *   - The actual `startSubagentWatcher` with a real fs mock drives `onProgress`.
- *   - `onProgress` fires for a background worker AFTER the turn has delivered
- *     its substantive answer → verifies `turn.subagentActivityAt` is stamped.
- *   - `mayOpenActivityCard` (the real gate function) is called with the resulting
- *     signal → verifies a liveness card is allowed.
- *   - Idle companion: no watcher activity → gate blocks → no card (idle-gap
- *     suppression preserved).
+ * Fix 2 (post-answer background-agent liveness) — drives the REAL code paths:
+ *   - The actual `startSubagentWatcher` with a real fs mock drives `onProgress`,
+ *     which stamps `turn.subagentActivityAt` (the gateway's one-line stamp,
+ *     gated exactly as gateway.ts gates it on a non-null currentTurn).
+ *   - The REAL `mayOpenActivityCard` AND the REAL `evaluatePostAnswerLiveness`
+ *     (the helper feedHeartbeatTick consults each tick) decide the verdict — not
+ *     a re-implemented copy of the gate.
+ *   - Concern 2 lifecycle: the gateway's `currentTurn` gating is modelled
+ *     verbatim to prove the stamp + heartbeat EMIT in the post-answer/pre-teardown
+ *     window but are INERT once `currentTurn` nulls at turn_end — and that the
+ *     decoupled worker still surfaces (and is bounded) via the real,
+ *     currentTurn-independent `workerActivityFeed`.
+ *   - Concern 3: the staleness cap flips the verdict to 'stale' once the worker's
+ *     last advance is older than the cap, so the card stops climbing forever.
  *
  * Fix 1 (narrative as first-class feed lines):
  *   - `clipNarrative` is called on a long narrative string → verifies 200-char
@@ -31,13 +37,16 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'fs'
-import { tmpdir } from 'os'
-import { join } from 'path'
 import * as realFs from 'fs'
 import { startSubagentWatcher } from '../subagent-watcher.js'
 import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
 import { clipNarrative, appendActivityLabel } from '../tool-activity-summary.js'
+import { evaluatePostAnswerLiveness } from '../turn-liveness-floor.js'
+import {
+  createWorkerActivityFeed,
+  type WorkerActivityView,
+  type BotApiForWorkerFeed,
+} from '../worker-activity-feed.js'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -78,10 +87,16 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
     // The parent answered at time 1000; we are now at 1500 (post-answer).
     const turn = {
       finalAnswerEverDelivered: true,
+      finalAnswerDelivered: true,
       finalAnswerDeliveredAt: 1000,
       subagentActivityAt: undefined as number | undefined,
       labeledToolCount: 2,
     }
+    // Model the gateway's module-scope `currentTurn` mirror so the test can
+    // reproduce its lifecycle: non-null in the post-answer/pre-teardown window,
+    // nulled at `endCurrentTurnAtomic` (turn_end). The onProgress stamp and the
+    // heartbeat both read THIS — the crux of concern 2.
+    let currentTurn: typeof turn | null = turn
 
     // --- Wire up the REAL startSubagentWatcher with mock fs ---
     // Pattern: start with an EMPTY subagents dir so the boot scan finds nothing
@@ -162,11 +177,15 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
       fs: mockFs,
       onProgress: ({ agentId, latestSummary }) => {
         progressEvents.push({ agentId, latestSummary })
-        // This is the EXACT gateway.ts logic (Fix 2's `stampTurn.subagentActivityAt = Date.now()`):
-        // onProgress fires → if the turn has already delivered its substantive
-        // answer → stamp subagentActivityAt with the current time.
-        if (turn.finalAnswerEverDelivered) {
-          turn.subagentActivityAt = currentTime
+        // Mirror ONLY the gateway's one-line stamp (`stampTurn.subagentActivityAt
+        // = Date.now()`), gated exactly as gateway.ts gates it: `currentTurn !=
+        // null && finalAnswerEverDelivered`. The DECISION the heartbeat then
+        // makes off this signal is NOT re-implemented here — the test drives the
+        // REAL `evaluatePostAnswerLiveness` helper below (concern 1/2: drive the
+        // real code path, not a copy of the gate).
+        const stampTurn = currentTurn // gateway: `const stampTurn = currentTurn`
+        if (stampTurn != null && stampTurn.finalAnswerEverDelivered) {
+          stampTurn.subagentActivityAt = currentTime
         }
       },
       log: () => {},
@@ -218,39 +237,256 @@ describe('Fix 2: post-answer background-agent liveness (watcher → gate → liv
       // postAnswerSubagentActivity omitted → old Lever 1 block (was the bug in #2587)
     })
     expect(blockedWithoutFix).toBe(false)
+
+    // --- Drive the REAL feedHeartbeatTick decision helper (not a re-impl) ---
+    // The heartbeat reads `currentTurn`; in this post-answer/pre-teardown window
+    // it is still non-null AND just-stamped, so the REAL `evaluatePostAnswerLiveness`
+    // returns 'emit' → the liveness card renders. (Concern 2 (a): the stamp fires
+    // and the card renders while the turn is alive.)
+    expect(currentTurn).not.toBeNull()
+    const verdictInWindow = evaluatePostAnswerLiveness({
+      subagentActivityAt: currentTurn!.subagentActivityAt,
+      finalAnswerDeliveredAt: currentTurn!.finalAnswerDeliveredAt,
+      now: currentTime + 5, // a heartbeat tick moments after the stamp
+      staleCapMs: 30_000,
+    })
+    expect(verdictInWindow).toBe('emit')
   })
 
-  it('idle post-answer (no new watcher activity) → gate blocks → no liveness card (idle-gap suppression)', () => {
-    // When subagentActivityAt is undefined (no watcher activity since the answer),
-    // the heartbeat's idle-gap check catches it and the gate is never called.
-    // Verify the gate also refuses (Lever 1 with no exception).
-    const blocked = mayOpenActivityCard({
-      producer: 'tool',
-      finalAnswerEverDelivered: true,
-      labeledToolCount: 1,
-      postAnswerSubagentActivity: false, // no watcher activity
+  it('idle post-answer (no watcher activity) → evaluatePostAnswerLiveness returns "idle" → silent', () => {
+    // When subagentActivityAt is undefined (no watcher activity since the answer)
+    // the REAL heartbeat decision returns 'idle' → the post-answer branch returns
+    // early and no card opens. The reply-is-last invariant holds for idle turns.
+    const verdict = evaluatePostAnswerLiveness({
+      subagentActivityAt: undefined,
+      finalAnswerDeliveredAt: 1000,
+      now: 50_000,
+      staleCapMs: 30_000,
     })
-    expect(blocked).toBe(false)
+    expect(verdict).toBe('idle')
   })
 
-  it('subagentActivityAt before finalAnswerDeliveredAt → treated as pre-answer, gate blocks', () => {
-    // Simulate the idle-gap guard in feedHeartbeatTick:
-    // if (subagentAt == null || subagentAt <= answeredAt) return
-    // Here the signal is set but it's from before the answer (shouldn't happen
-    // in practice, but defense in depth).
-    const subagentAt = 500
-    const answeredAt = 1000
-    const isPostAnswer = subagentAt != null && subagentAt > answeredAt
-    expect(isPostAnswer).toBe(false) // guard fires → silent
+  it('subagentActivityAt at/before the answer → "idle" (pre-answer label never opens a post-answer card)', () => {
+    expect(
+      evaluatePostAnswerLiveness({
+        subagentActivityAt: 500,
+        finalAnswerDeliveredAt: 1000,
+        now: 1500,
+        staleCapMs: 30_000,
+      }),
+    ).toBe('idle')
+  })
+})
 
-    // And the gate also blocks without the explicit postAnswerSubagentActivity flag
-    const blocked = mayOpenActivityCard({
-      producer: 'tool',
-      finalAnswerEverDelivered: true,
-      labeledToolCount: 2,
-      postAnswerSubagentActivity: isPostAnswer,
+// ─── Fix 2 — concern 2: the currentTurn path is INERT after teardown ─────────
+
+describe('Fix 2 / concern 2: currentTurn nulls at turn_end → heartbeat path inert; worker feed covers it', () => {
+  /**
+   * The reviewer's concern: the post-answer liveness fix stamps + renders off
+   * `currentTurn`, which `endCurrentTurnAtomic` nulls at `turn_end`. A genuinely
+   * DECOUPLED background worker keeps ticking PAST teardown, so when its later
+   * onProgress arrives `currentTurn` is null → the stamp is inert and the
+   * heartbeat (which early-returns `if (turn == null) return`) is silent.
+   *
+   * This test reproduces that lifecycle EXACTLY (the gateway's `currentTurn`
+   * gating, which can't be imported, modelled verbatim) and proves:
+   *   (a) in the post-answer/pre-teardown window the stamp fires and the REAL
+   *       `evaluatePostAnswerLiveness` returns 'emit';
+   *   (b) after teardown (`currentTurn = null`) a later worker tick CANNOT stamp
+   *       and the heartbeat is structurally silent — i.e. the currentTurn fix IS
+   *       inert for a decoupled worker, as suspected.
+   * The follow-on `describe` then proves the decoupled worker still surfaces via
+   * the currentTurn-INDEPENDENT `workerActivityFeed` (the by-design coverage).
+   */
+
+  // The gateway's stamp, verbatim (the only line we can't import): gated on a
+  // non-null currentTurn that has delivered its substantive answer.
+  function gatewayStamp(currentTurn: { finalAnswerEverDelivered: boolean; subagentActivityAt?: number } | null, now: number): void {
+    const stampTurn = currentTurn
+    if (stampTurn != null && stampTurn.finalAnswerEverDelivered) {
+      stampTurn.subagentActivityAt = now
+    }
+  }
+
+  // The gateway's feedHeartbeatTick post-answer entry, reduced to its decision:
+  // `if (turn == null) return` (no-turn), else the REAL evaluatePostAnswerLiveness.
+  function heartbeatVerdict(
+    currentTurn: { finalAnswerDelivered: boolean; finalAnswerDeliveredAt?: number; subagentActivityAt?: number } | null,
+    now: number,
+  ): 'no-turn' | 'pre-answer' | ReturnType<typeof evaluatePostAnswerLiveness> {
+    const turn = currentTurn
+    if (turn == null) return 'no-turn' // gateway: `if (turn == null) return`
+    if (!turn.finalAnswerDelivered) return 'pre-answer'
+    return evaluatePostAnswerLiveness({
+      subagentActivityAt: turn.subagentActivityAt,
+      finalAnswerDeliveredAt: turn.finalAnswerDeliveredAt,
+      now,
+      staleCapMs: 30_000,
     })
-    expect(blocked).toBe(false)
+  }
+
+  it('(a) in-window: currentTurn alive → stamp fires and heartbeat emits', () => {
+    const turn = {
+      finalAnswerEverDelivered: true,
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: undefined as number | undefined,
+    }
+    let currentTurn: typeof turn | null = turn
+
+    // Worker ticks at t=1600, still inside the turn (pre-teardown).
+    gatewayStamp(currentTurn, 1600)
+    expect(turn.subagentActivityAt).toBe(1600)
+    expect(heartbeatVerdict(currentTurn, 1605)).toBe('emit')
+  })
+
+  it('(b) post-teardown: currentTurn nulled → later worker tick cannot stamp; heartbeat is silent (INERT)', () => {
+    const turn = {
+      finalAnswerEverDelivered: true,
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      subagentActivityAt: undefined as number | undefined,
+    }
+    let currentTurn: typeof turn | null = turn
+
+    // turn_end fires → endCurrentTurnAtomic nulls the module-scope mirror.
+    currentTurn = null
+
+    // The DECOUPLED worker keeps running and ticks much later (t=120_000).
+    gatewayStamp(currentTurn, 120_000)
+    // Nothing to stamp — the turn object is unreferenced by the live mirror.
+    expect(turn.subagentActivityAt).toBeUndefined()
+    // And the heartbeat is structurally silent: no live turn to render on.
+    expect(heartbeatVerdict(currentTurn, 120_005)).toBe('no-turn')
+  })
+
+  it('concern 3: while the turn is alive but the worker went stale, heartbeat stops ("stale")', () => {
+    const turn = {
+      finalAnswerDelivered: true,
+      finalAnswerDeliveredAt: 1000,
+      // last advance at 2000; the worker has since finished (onFinish froze it).
+      subagentActivityAt: 2000 as number | undefined,
+    }
+    const currentTurn: typeof turn | null = turn
+    // One tick just after the last advance still emits…
+    expect(heartbeatVerdict(currentTurn, 2500)).toBe('emit')
+    // …but once `now - subagentActivityAt >= 30s` the verdict flips to 'stale'
+    // and the card stops climbing `running` forever (the concern-3 bug).
+    expect(heartbeatVerdict(currentTurn, 2000 + 30_000)).toBe('stale')
+    expect(heartbeatVerdict(currentTurn, 2000 + 90_000)).toBe('stale')
+  })
+})
+
+// ─── Fix 2 — concern 2 resolution: the decoupled worker surfaces via the
+//     currentTurn-INDEPENDENT workerActivityFeed (and is bounded) ────────────
+
+describe('Fix 2 / concern 2: decoupled background-worker activity surfaces via the real workerActivityFeed', () => {
+  /**
+   * Because the currentTurn heartbeat is inert post-teardown (proven above), the
+   * decoupled worker's activity is surfaced by the dedicated `workerActivityFeed`
+   * — a regular chat message edited in place, keyed by jsonl agent id, that the
+   * watcher keeps driving AFTER the parent turn ends (NO currentTurn dependency).
+   * This drives the REAL `createWorkerActivityFeed` to prove:
+   *   - a running worker paints + edits a live message with NO turn in scope, and
+   *   - it is BOUNDED: `finish` posts the terminal edit, the handle is dropped,
+   *     and a later heartbeat tick emits nothing (no unbounded climb).
+   */
+
+  interface FakeBot extends BotApiForWorkerFeed {
+    sent: Array<{ chatId: string; text: string }>
+    edits: Array<{ messageId: number; text: string }>
+  }
+  function makeBot(): FakeBot {
+    let nextId = 5000
+    const fb: FakeBot = {
+      sent: [],
+      edits: [],
+      sendMessage: async (chatId, text) => {
+        fb.sent.push({ chatId, text })
+        return { message_id: nextId++ }
+      },
+      editMessageText: async (_chatId, messageId, text) => {
+        fb.edits.push({ messageId, text })
+        return {}
+      },
+    }
+    return fb
+  }
+  function wView(p: Partial<WorkerActivityView> = {}): WorkerActivityView {
+    return {
+      description: 'analyse the 30 changed files',
+      lastTool: { name: 'Read', sanitisedArg: 'src/auth' },
+      toolCount: 2,
+      latestSummary: 'reading the auth module',
+      elapsedMs: 10_000,
+      state: 'running',
+      ...p,
+    }
+  }
+
+  it('surfaces a running decoupled worker with NO live turn, then stops at finish (bounded)', async () => {
+    const bot = makeBot()
+    let clock = 1_000_000
+    const ticks: Array<() => void> = []
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 8000,
+      minEditIntervalMs: 0,
+      setInterval: (cb) => { ticks.push(cb); return ticks.length },
+      clearInterval: () => {},
+    })
+
+    // The parent turn has long ended (currentTurn is null) — irrelevant here:
+    // the feed is keyed by agentId and never reads currentTurn.
+    await feed.update('bg01', 'chat-77', wView({ elapsedMs: 12_000 }))
+    expect(bot.sent.length).toBe(1) // painted a live message post-teardown
+    expect(feed.has('bg01')).toBe(true)
+
+    // A later running tick edits the same message in place.
+    clock += 6000
+    await feed.update('bg01', 'chat-77', wView({ elapsedMs: 18_000, toolCount: 3, latestSummary: 'patching token parser' }))
+    expect(bot.edits.length).toBeGreaterThanOrEqual(1)
+
+    // Terminal: finish posts the recap edit and DROPS the handle.
+    clock += 3000
+    await feed.finish('bg01', wView({ state: 'done', toolCount: 4, latestSummary: 'opened PR #42' }))
+    expect(feed.has('bg01')).toBe(false)
+    const editsAfterFinish = bot.edits.length
+
+    // Bounded: a subsequent heartbeat tick must NOT keep editing a finished worker.
+    clock += 60_000
+    ticks.forEach((t) => t())
+    await Promise.resolve()
+    expect(bot.edits.length).toBe(editsAfterFinish)
+
+    feed.stop()
+  })
+
+  it('the worker-feed heartbeat only ticks RUNNING workers (terminal worker never climbs)', async () => {
+    const bot = makeBot()
+    let clock = 2_000_000
+    const ticks: Array<() => void> = []
+    const feed = createWorkerActivityFeed({
+      bot,
+      now: () => clock,
+      firstPaintMinMs: 0,
+      minEditIntervalMs: 0,
+      heartbeatTickMs: 6000,
+      setInterval: (cb) => { ticks.push(cb); return ticks.length },
+      clearInterval: () => {},
+    })
+    await feed.update('bg02', 'chat-9', wView({ elapsedMs: 1000 }))
+    expect(bot.sent.length).toBe(1)
+    await feed.finish('bg02', wView({ state: 'done', latestSummary: 'done' }))
+    const editCount = bot.edits.length
+
+    // Heartbeat after finish: the handle is gone → no further edits ever.
+    clock += 600_000
+    ticks.forEach((t) => t())
+    await Promise.resolve()
+    expect(bot.edits.length).toBe(editCount)
+    feed.stop()
   })
 })
 

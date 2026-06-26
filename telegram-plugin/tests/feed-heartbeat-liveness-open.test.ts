@@ -4,11 +4,13 @@
  * Pins load-bearing constraints of the branches inside `feedHeartbeatTick`
  * (gateway.ts):
  *
- * Post-answer branch (Fix 2 / #2587 supersede):
+ * Post-answer branch (Fix 2 / #2587 supersede, concern 3 staleness cap):
  *   - `turn.subagentActivityAt` is the signal (NOT `lastToolLabelAt`) that
  *     drives post-answer liveness — the watcher updates this independently of
  *     the tool_label / drop-guard path.
- *   - Idle-gap suppression: `subagentActivityAt <= finalAnswerDeliveredAt` → silent.
+ *   - The idle-gap suppression AND the staleness cap are a single pure decision
+ *     `evaluatePostAnswerLiveness(...)` consulted each tick, with the cap fed
+ *     from `POST_ANSWER_LIVENESS_STALE_MS`.
  *
  * Pre-answer liveness-open branch:
  *   1. The SWITCHROOM_FEED_LIVENESS_OPEN kill-switch (default ON, i.e. `!== '0'`)
@@ -94,10 +96,10 @@ describe('H-1: feedHeartbeatTick liveness-open threshold', () => {
   })
 })
 
-describe('H-2: feedHeartbeatTick post-answer background-agent liveness (Fix 2 / #2587 supersede)', () => {
+describe('H-2: feedHeartbeatTick post-answer background-agent liveness (Fix 2 / #2587 supersede, concern 3 cap)', () => {
   // Structural assertions pinning Fix 2: the post-answer branch reads
-  // `turn.subagentActivityAt` (not `lastToolLabelAt`) and guards on
-  // `subagentActivityAt <= finalAnswerDeliveredAt` for idle-gap suppression.
+  // `turn.subagentActivityAt` (not `lastToolLabelAt`) and routes the idle-gap +
+  // staleness decision through the pure `evaluatePostAnswerLiveness` helper.
 
   it('post-answer branch reads subagentActivityAt (the watcher signal)', () => {
     const body = feedHeartbeatTickSrc()
@@ -110,12 +112,26 @@ describe('H-2: feedHeartbeatTick post-answer background-agent liveness (Fix 2 / 
     expect(postAnswerBlock).toMatch(/const\s+subagentAt\s*=\s*turn\.subagentActivityAt/)
   })
 
-  it('idle-gap suppression: no post-answer card when subagentActivityAt is null/before answer', () => {
+  it('idle-gap + staleness cap routed through evaluatePostAnswerLiveness with the stale cap', () => {
     const body = feedHeartbeatTickSrc()
     const afterPostAnswer = body.split('if (turn.finalAnswerDelivered)')[1] ?? ''
     const postAnswerBlock = afterPostAnswer.split('\n  }\n')[0] ?? ''
-    // Must guard: subagentAt == null || subagentAt <= answeredAt → return (silent)
-    expect(postAnswerBlock).toMatch(/subagentAt\s*==\s*null\s*\|\|\s*subagentAt\s*<=\s*answeredAt/)
+    // The single pure decision is consulted, fed the staleness cap, and a
+    // non-'emit' verdict returns early (silent).
+    expect(postAnswerBlock).toMatch(/evaluatePostAnswerLiveness\(/)
+    expect(postAnswerBlock).toMatch(/staleCapMs:\s*POST_ANSWER_LIVENESS_STALE_MS/)
+    expect(postAnswerBlock).toMatch(/livenessVerdict\s*!==\s*'emit'/)
+  })
+
+  it('staleness cap (concern 3) is parsed default-ON (30s) from SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS', () => {
+    // The cap const must default to 30_000 when the env is unset (the `|| 30_000`
+    // fallback over the positive-or-0 parse) so the post-answer card stops
+    // climbing once the worker goes stale, even with no operator config.
+    const afterConst = gatewaySrc.split('const POST_ANSWER_LIVENESS_STALE_MS')[1] ?? ''
+    const initBlock = afterConst.split('\n')[0] + (afterConst.split('||')[1] ?? '')
+    expect(afterConst).toMatch(/SWITCHROOM_POST_ANSWER_LIVENESS_STALE_MS/)
+    expect(afterConst).toMatch(/\|\|\s*30[_]?000/)
+    expect(initBlock).toBeTruthy()
   })
 
   it('post-answer drain uses tool producer + postAnswerSubagentActivity flag', () => {
