@@ -52,6 +52,8 @@ import {
   accountEligibility,
   snapshotShouldClearMark,
   clampMarkExpiry,
+  overageLiftsWall,
+  snapshotFresh,
   WALL_PCT,
 } from "./account-eligibility.js";
 import type { AuthConfig, AuthConsumer, SwitchroomConfig } from "../../config/schema.js";
@@ -1137,6 +1139,43 @@ export class AuthBroker {
   }
 
   /**
+   * THE single audited signal that authorizes spending Anthropic overage credit.
+   * True iff `account` may RIGHT NOW be served past the weekly utilization wall
+   * on overage billing — the in-agent rate-limit-menu handler consults this
+   * (over the broker, never config) before it may select "usage credits".
+   *
+   * True requires ALL of:
+   *   (a) the account is in `auth.allow_overage_accounts` (operator opt-in), AND
+   *   (b) a FRESH (≤24h) quota snapshot satisfies `overageLiftsWall()` — i.e.
+   *       `overageStatus === "allowed"` AND `overageDisabledReason` is not
+   *       `out_of_credits`, AND
+   *   (c) no active real-429 exhaustion mark blocks it (a mark still wins —
+   *       deferred to the shared `accountEligibility` decision, not re-checked).
+   *
+   * DEFAULT-OFF is structural: with `allow_overage_accounts` empty/unset (the
+   * default) `isOverageAllowed` is false for every account, so this returns false
+   * unconditionally — the watchdog can never select a paid option. Reuses
+   * `overageLiftsWall` + `accountEligibility`; no duplicated predicate logic.
+   */
+  private isActiveOverageServing(account: string | null): boolean {
+    if (!account) return false;
+    if (!this.isOverageAllowed(account)) return false;
+    const snapshot = this.lastQuotaCache[account];
+    const now = this.now();
+    if (!snapshot || !snapshotFresh(snapshot, now)) return false;
+    if (!overageLiftsWall(snapshot, true)) return false;
+    // A mark from a real 429 blocks unconditionally — overage never overrides it.
+    return (
+      accountEligibility({
+        mark: this.quota[account],
+        snapshot,
+        now,
+        allowOverage: true,
+      }) === "eligible"
+    );
+  }
+
+  /**
    * Tri-state eligibility for a failover/serving candidate — the basis of the
    * Bug-1 fix. `'blocked'` only on POSITIVE exhaustion evidence (fresh
    * over-wall snapshot, or an unexpired mark with no fresher contradicting
@@ -1368,6 +1407,14 @@ export class AuthBroker {
       account: c.account,
       last_seen_at: this.consumerLastSeen[c.name] ?? null,
     }));
+    // Identity-specific overage signal: is the account THIS caller is bound to
+    // currently authorized to serve on Anthropic overage past the weekly wall?
+    // The in-agent wedge-watchdog reads this (never config) to decide whether a
+    // `/rate-limit-options` menu may select "usage credits". Default-off: false
+    // whenever `allow_overage_accounts` is empty (the default).
+    const active_overage_serving = this.isActiveOverageServing(
+      this.callerAccount(identity),
+    );
     this.audit({ op: "list-state", identity, ok: true });
     socket.write(
       encodeSuccess(id, {
@@ -1376,6 +1423,7 @@ export class AuthBroker {
         accounts,
         agents,
         consumers,
+        active_overage_serving,
       }),
     );
   }

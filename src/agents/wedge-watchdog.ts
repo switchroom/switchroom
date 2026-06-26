@@ -83,6 +83,42 @@ export const RATE_LIMIT_MENU_SIGNATURE =
   /(?=[\s\S]*Stop and wait for)(?=[\s\S]*(?:usage credits|Upgrade your plan|\/rate-limit-options))/;
 
 /**
+ * Compute the keystroke sequence that selects the "usage credits" option in
+ * claude's `/rate-limit-options` menu, from a captured pane. The menu shape:
+ *
+ *     ❯ 1. Stop and wait for limit to reset
+ *       2. Switch to usage credits          (or "Add funds to continue with…")
+ *       3. Upgrade your plan
+ *
+ * The cursor (❯) defaults to option 1. We locate both the currently-selected
+ * numbered row and the row whose label contains "usage credits", and return
+ * `N × Down` then `Enter`.
+ *
+ * Returns `null` when the usage-credits row cannot be UNAMBIGUOUSLY located —
+ * no numbered options parse, no row contains "usage credits", or it sits at/above
+ * the cursor (never expected). `null` is the airtight FAIL-SAFE: the caller MUST
+ * fall back to Esc-park rather than blind-navigate, so this can never accidentally
+ * land on "Stop and wait" or "Upgrade your plan". This selector is invoked ONLY
+ * after the broker has separately authorized overage for the active account.
+ */
+export function usageCreditsMenuNav(text: string): string[] | null {
+  const options: { selected: boolean; label: string }[] = [];
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$/);
+    if (!m) continue;
+    options.push({ selected: !!m[1], label: m[3] });
+  }
+  if (options.length === 0) return null;
+  const creditIdx = options.findIndex((o) => /usage credits/i.test(o.label));
+  if (creditIdx === -1) return null;
+  let selIdx = options.findIndex((o) => o.selected);
+  if (selIdx === -1) selIdx = 0; // menu default cursor is option 1
+  const down = creditIdx - selIdx;
+  if (down <= 0) return null; // credits at/above the cursor — fail safe to Esc.
+  return [...Array(down).fill("Down"), "Enter"];
+}
+
+/**
  * #2471 — generic confirmation-MODAL signature, detected by SHAPE rather
  * than by the strict model-picker footer (`WEDGE_FOOTER_SIGNATURE`). The
  * dominant case is claude's `/effort` confirmation modal:
@@ -366,6 +402,21 @@ export interface WedgeWatchdogOptions {
    * park WITHOUT signalling (e.g. tests).
    */
   onRateLimitMenu?: (agentName: string, resetAt: number | null) => void;
+  /**
+   * Opt-in OVERAGE carve-out (the ONLY path that may select a paid option).
+   * Consulted on a stability-confirmed rate-limit menu, BEFORE any keystroke.
+   * Must return whether the broker — the single audited authority for spending
+   * money — currently authorizes Anthropic overage for THIS agent's active
+   * account (in `allow_overage_accounts`, `overageStatus:"allowed"`, not
+   * `out_of_credits`, no active 429 mark). When it resolves `true`, the watchdog
+   * SELECTS the "usage credits" menu option (nav + Enter) and does NOT signal
+   * failover. When `false`, undefined, or it throws, the watchdog falls back to
+   * the DEFAULT (signal failover + Esc-park) — so default-off is airtight: with
+   * no decision seam wired (or no flagged account), behaviour is byte-identical
+   * to Esc-only. The watchdog NEVER reads config and NEVER decides to spend on
+   * its own. Soft-fail — a throw here defaults to Esc-park.
+   */
+  overageDecision?: (agentName: string) => boolean | Promise<boolean>;
   /** Test seam: clock-injected weekly-reset parser. Default: parseWeeklyReset. */
   parseReset?: (text: string, nowMs: number) => number | null;
   /**
@@ -439,9 +490,14 @@ export interface WedgeWatchdogResult {
   /** Number of times Esc was dispatched to dismiss a stuck prompt (includes
    *  rate-limit-menu parks). */
   fires: number;
-  /** Subset of `fires` that were rate-limit (weekly-quota) menu detections —
-   *  each also signalled failover. */
+  /** Subset of `fires` that were rate-limit (weekly-quota) menu detections that
+   *  Esc-parked + signalled failover (the DEFAULT path for every account). */
   rateLimitFires: number;
+  /** Subset of `fires` where the broker authorized overage for the active
+   *  account and the watchdog SELECTED "usage credits" instead of failover
+   *  (the opt-in carve-out). 0 unless an account is flagged AND overage is
+   *  currently allowed by Anthropic. */
+  overageCreditSelections: number;
   /** #2471 — subset of `fires` that dismissed a confirmation modal detected
    *  by SHAPE persistence (the `/effort`-class wedge). */
   confirmModalFires: number;
@@ -488,6 +544,9 @@ export async function runWedgeWatchdog(
   const rateLimitSignature =
     opts.rateLimitSignature === null ? null : (opts.rateLimitSignature ?? RATE_LIMIT_MENU_SIGNATURE);
   const onRateLimitMenu = opts.onRateLimitMenu;
+  // Opt-in overage carve-out. `undefined` (the default) → never select credits;
+  // the rate-limit branch behaves byte-identically to Esc-only (default-off).
+  const overageDecision = opts.overageDecision;
   const parseReset = opts.parseReset ?? parseWeeklyReset;
   // #2471 — shape-persistence confirmation modal + semantic manifest-stall.
   // `null` disables the branch; `undefined` → default on.
@@ -524,6 +583,7 @@ export async function runWedgeWatchdog(
   let cooldownUntil = 0;
   let fires = 0;
   let rateLimitFires = 0;
+  let overageCreditSelections = 0;
   let confirmModalFires = 0;
   let permissionPromptFires = 0;
   let restartEscalations = 0;
@@ -646,36 +706,88 @@ export async function runWedgeWatchdog(
       }
       if (stableCount >= stabilityThreshold && now() >= cooldownUntil) {
         const resetAt = parseReset(text, now());
-        console.error(
-          `[wedge-watchdog] ${opts.agentName}: rate-limit (weekly-quota) menu detected ` +
-            `after ${stableCount} stable polls — signalling failover` +
-            (resetAt != null ? ` (resets ${new Date(resetAt).toISOString()})` : " (reset unparsed)") +
-            ` then parking with Esc`,
-        );
-        // (a) Trigger the EXISTING gateway failover chain. Soft-fail — the
-        //     never-throw sidecar contract holds even for a custom seam.
-        if (onRateLimitMenu) {
+        // DECISION: default for EVERY account is failover + Esc-park (Esc can
+        // never select a paid option). The ONLY way to instead select "usage
+        // credits" is for the broker — the single audited authority for spending
+        // money — to confirm overage is currently active for this agent's
+        // account. The watchdog itself reads no config and decides nothing; it
+        // just obeys the broker's verdict. Soft-fail → default (Esc-park).
+        //
+        // Robustness: this code path runs ONLY when claude actually RENDERS the
+        // `/rate-limit-options` menu. If Anthropic serves overage SILENTLY (the
+        // menu never appears), this branch never runs and the flagged account
+        // simply keeps working on overage — correct either way. The menu is the
+        // only case that needs handling, and it is handled here.
+        let useCredits = false;
+        if (overageDecision) {
           try {
-            onRateLimitMenu(opts.agentName, resetAt);
+            useCredits = (await overageDecision(opts.agentName)) === true;
           } catch (err) {
             console.error(
-              `[wedge-watchdog] ${opts.agentName}: onRateLimitMenu threw: ${(err as Error).message}`,
+              `[wedge-watchdog] ${opts.agentName}: overageDecision threw: ${(err as Error).message} — defaulting to Esc-park + failover`,
             );
+            useCredits = false;
           }
         }
-        // (b) Park the menu compliantly. ESC ONLY — cancels the modal without
-        //     selecting any option, so it can NEVER land on "Switch to usage
-        //     credits" (off-subscription) or "Upgrade your plan". Never send a
-        //     Down/numeric key here.
-        try {
-          send(opts.agentName, ["Escape"]);
-        } catch (err) {
+        const nav = useCredits ? usageCreditsMenuNav(text) : null;
+        if (useCredits && nav) {
+          // Broker authorized overage for this account → SELECT "usage credits"
+          // (paid overage billed to the operator's own Anthropic credits, on the
+          // SAME interactive claude CLI + OAuth — still claude-native, never
+          // API/SDK/`claude -p`). Do NOT signal failover / markExhausted: we
+          // intend to keep using this account on overage.
           console.error(
-            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+            `[wedge-watchdog] ${opts.agentName}: rate-limit menu — broker confirms overage ACTIVE for the active account; ` +
+              `selecting "usage credits" (${nav.join(" ")}) instead of failover. Anthropic overage billing will apply.`,
           );
+          try {
+            send(opts.agentName, nav);
+          } catch (err) {
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+            );
+          }
+          fires++;
+          overageCreditSelections++;
+        } else {
+          if (useCredits && !nav) {
+            // Broker said overage is active but we could NOT locate the
+            // usage-credits row — fail SAFE to Esc-park rather than blind-nav.
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: overage authorized but the "usage credits" option could not be located in the pane — failing safe to Esc-park + failover`,
+            );
+          }
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: rate-limit (weekly-quota) menu detected ` +
+              `after ${stableCount} stable polls — signalling failover` +
+              (resetAt != null ? ` (resets ${new Date(resetAt).toISOString()})` : " (reset unparsed)") +
+              ` then parking with Esc`,
+          );
+          // (a) Trigger the EXISTING gateway failover chain. Soft-fail — the
+          //     never-throw sidecar contract holds even for a custom seam.
+          if (onRateLimitMenu) {
+            try {
+              onRateLimitMenu(opts.agentName, resetAt);
+            } catch (err) {
+              console.error(
+                `[wedge-watchdog] ${opts.agentName}: onRateLimitMenu threw: ${(err as Error).message}`,
+              );
+            }
+          }
+          // (b) Park the menu compliantly. ESC ONLY — cancels the modal without
+          //     selecting any option, so it can NEVER land on "Switch to usage
+          //     credits" (off-subscription) or "Upgrade your plan". Never send a
+          //     Down/numeric key here.
+          try {
+            send(opts.agentName, ["Escape"]);
+          } catch (err) {
+            console.error(
+              `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+            );
+          }
+          fires++;
+          rateLimitFires++;
         }
-        fires++;
-        rateLimitFires++;
         cooldownUntil = now() + cooldownMs;
         stableCount = 0;
         lastKey = null;
@@ -791,6 +903,7 @@ export async function runWedgeWatchdog(
   return {
     fires,
     rateLimitFires,
+    overageCreditSelections,
     confirmModalFires,
     permissionPromptFires,
     restartEscalations,

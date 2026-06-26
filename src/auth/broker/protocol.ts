@@ -432,6 +432,16 @@ export const ListStateDataSchema = z.object({
   accounts: z.array(AccountStateSchema),
   agents: z.array(AgentStateSchema),
   consumers: z.array(ConsumerStateSchema),
+  /**
+   * Whether the account the CALLER is bound to may currently be served past the
+   * weekly utilization wall on Anthropic overage billing (in
+   * `allow_overage_accounts`, `overageStatus:"allowed"`, not `out_of_credits`,
+   * no active 429 mark). The in-agent rate-limit-menu handler reads this — the
+   * broker's single audited spend-authorization signal — before it may select
+   * "usage credits". Optional/back-compat: absent on pre-overage brokers (read
+   * as false). Default-off: false whenever `allow_overage_accounts` is empty.
+   */
+  active_overage_serving: z.boolean().optional(),
 });
 
 export const SetActiveDataSchema = z.object({

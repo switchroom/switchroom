@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   runWedgeWatchdog,
   parseWeeklyReset,
+  usageCreditsMenuNav,
   RATE_LIMIT_MENU_SIGNATURE,
   WEDGE_FOOTER_SIGNATURE,
 } from "../src/agents/wedge-watchdog.js";
@@ -85,6 +86,42 @@ describe("RATE_LIMIT_MENU_SIGNATURE", () => {
   it("the GENERIC wedge signature does NOT match this menu (why a dedicated detector is needed)", () => {
     // The footer is 'Enter to confirm · Esc to cancel' — no 'to select/navigate/↑↓'.
     expect(WEDGE_FOOTER_SIGNATURE.test(RATE_LIMIT_SCREEN)).toBe(false);
+  });
+});
+
+// A rate-limit menu that matches the signature (via "Upgrade your plan") but has
+// NO "usage credits" row — so usageCreditsMenuNav cannot locate one and the
+// watchdog must fail SAFE to Esc-park even when the broker authorizes overage.
+const NO_CREDITS_MENU =
+  "  ⎿  You've hit your weekly limit · resets Jun 9, 5am (Australia/Melbourne)\n" +
+  "\n" +
+  "  What do you want to do?\n" +
+  "\n" +
+  "  ❯ 1. Stop and wait for limit to reset\n" +
+  "    2. Upgrade your plan\n" +
+  "\n" +
+  "  Enter to confirm · Esc to cancel";
+
+describe("usageCreditsMenuNav", () => {
+  it("locates option 2 ('Switch to usage credits') → Down,Enter (finn pane)", () => {
+    expect(usageCreditsMenuNav(RATE_LIMIT_SCREEN)).toEqual(["Down", "Enter"]);
+  });
+  it("locates 'Add funds to continue with usage credits' → Down,Enter (clerk pane)", () => {
+    expect(usageCreditsMenuNav(CLERK_RATE_LIMIT_SCREEN)).toEqual(["Down", "Enter"]);
+  });
+  it("navigates multiple rows when usage credits is option 3 → Down,Down,Enter", () => {
+    const menu =
+      "  ❯ 1. Stop and wait for limit to reset\n" +
+      "    2. Upgrade your plan\n" +
+      "    3. Switch to usage credits";
+    expect(usageCreditsMenuNav(menu)).toEqual(["Down", "Down", "Enter"]);
+  });
+  it("returns null (fail-safe) when there is no usage-credits row", () => {
+    expect(usageCreditsMenuNav(NO_CREDITS_MENU)).toBeNull();
+  });
+  it("returns null (fail-safe) on empty / no numbered options", () => {
+    expect(usageCreditsMenuNav("")).toBeNull();
+    expect(usageCreditsMenuNav("just some prose about usage credits")).toBeNull();
   });
 });
 
@@ -199,7 +236,9 @@ describe("runWedgeWatchdog — rate-limit branch", () => {
     expect(calls).toEqual([]);
   });
 
-  it("COMPLIANCE (exhaustive): over many polls, the rate-limit branch NEVER emits Down/Up/Enter/2/3", async () => {
+  it("COMPLIANCE (exhaustive, DEFAULT path — no overage carve-out wired): NEVER emits Down/Up/Enter/2/3", async () => {
+    // With no `overageDecision` seam wired (the default for every unflagged
+    // account), the ONLY keystroke the rate-limit branch ever emits is Escape.
     const { send, calls } = recordSend();
     await runWedgeWatchdog({
       agentName: "finn", now: () => 0, sleep: () => {}, maxPolls: 20,
@@ -211,5 +250,112 @@ describe("runWedgeWatchdog — rate-limit branch", () => {
       expect(keys).toEqual(["Escape"]);
       for (const k of keys) expect(banned).not.toContain(k);
     }
+  });
+});
+
+// ─── Opt-in OVERAGE carve-out — the decision matrix (Gap 1) ──────────────────
+//
+// The ONLY path that may select a paid option. Gated entirely by the broker
+// verdict surfaced through `overageDecision`. Default-off: with no
+// `overageDecision` wired, behaviour is byte-identical to Esc-only (proven by
+// the COMPLIANCE test above and the "not flagged" case here).
+describe("runWedgeWatchdog — overage carve-out decision matrix", () => {
+  const NOW = Date.UTC(2026, 5, 7, 0, 0, 0);
+
+  it("flagged + broker overage ACTIVE → selects 'usage credits' (Down,Enter), NO failover", async () => {
+    const { send, calls } = recordSend();
+    const signals: unknown[] = [];
+    const res = await runWedgeWatchdog({
+      agentName: "pixsoul-agent",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([RATE_LIMIT_SCREEN]), send,
+      onRateLimitMenu: () => signals.push(1),
+      overageDecision: () => true,
+    });
+    expect(res.overageCreditSelections).toBe(1);
+    expect(res.rateLimitFires).toBe(0); // NOT a failover park
+    expect(res.fires).toBe(1);
+    // The "usage credits" row is option 2 → navigate down once, then Enter.
+    expect(calls).toEqual([["Down", "Enter"]]);
+    // Failover is NOT signalled — we intend to keep using this account.
+    expect(signals).toHaveLength(0);
+  });
+
+  it("flagged + broker overage ACTIVE (async/Promise verdict) → selects usage credits", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "pixsoul-agent",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([RATE_LIMIT_SCREEN]), send,
+      onRateLimitMenu: () => {},
+      overageDecision: async () => true,
+    });
+    expect(res.overageCreditSelections).toBe(1);
+    expect(calls).toEqual([["Down", "Enter"]]);
+  });
+
+  it("NOT flagged (no overageDecision wired) → Escape + failover (DEFAULT, unchanged)", async () => {
+    const { send, calls } = recordSend();
+    const signals: unknown[] = [];
+    const res = await runWedgeWatchdog({
+      agentName: "finn",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([RATE_LIMIT_SCREEN]), send,
+      onRateLimitMenu: () => signals.push(1),
+    });
+    expect(res.overageCreditSelections).toBe(0);
+    expect(res.rateLimitFires).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(calls).toEqual([["Escape"]]);
+  });
+
+  it("flagged but broker says overage NOT active (rejected/out_of_credits) → Escape + failover", async () => {
+    const { send, calls } = recordSend();
+    const signals: unknown[] = [];
+    const res = await runWedgeWatchdog({
+      agentName: "pixsoul-agent",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([RATE_LIMIT_SCREEN]), send,
+      onRateLimitMenu: () => signals.push(1),
+      overageDecision: () => false,
+    });
+    expect(res.overageCreditSelections).toBe(0);
+    expect(res.rateLimitFires).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(calls).toEqual([["Escape"]]);
+  });
+
+  it("FAIL-SAFE: overageDecision throws → Escape + failover (never spends on error)", async () => {
+    const { send, calls } = recordSend();
+    const signals: unknown[] = [];
+    const res = await runWedgeWatchdog({
+      agentName: "pixsoul-agent",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([RATE_LIMIT_SCREEN]), send,
+      onRateLimitMenu: () => signals.push(1),
+      overageDecision: () => {
+        throw new Error("broker unreachable");
+      },
+    });
+    expect(res.overageCreditSelections).toBe(0);
+    expect(res.rateLimitFires).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(calls).toEqual([["Escape"]]);
+  });
+
+  it("FAIL-SAFE: broker authorizes overage but the menu has no usage-credits row → Escape + failover", async () => {
+    const { send, calls } = recordSend();
+    const signals: unknown[] = [];
+    const res = await runWedgeWatchdog({
+      agentName: "pixsoul-agent",
+      now: () => NOW, sleep: () => {}, maxPolls: 3,
+      capture: captureSeq([NO_CREDITS_MENU]), send,
+      onRateLimitMenu: () => signals.push(1),
+      overageDecision: () => true,
+    });
+    expect(res.overageCreditSelections).toBe(0);
+    expect(res.rateLimitFires).toBe(1);
+    expect(signals).toHaveLength(1);
+    expect(calls).toEqual([["Escape"]]);
   });
 });
