@@ -2138,6 +2138,22 @@ type CurrentTurn = {
   // step that emits no new label doesn't read as frozen (the feed is otherwise
   // pull-only). undefined until the first label of the turn renders.
   lastToolLabelAt?: number
+  // Fix 2 (post-answer background-agent liveness): wall-clock timestamp last
+  // updated by the sub-agent/workflow watcher's onProgress callback whenever
+  // it surfaces a NEW sub-agent step AFTER this turn's substantive answer was
+  // delivered. Written INDEPENDENTLY of the tool_label path so the drop-guard
+  // (`shouldReopenFeedAfterAck` / `finalAnswerSubstantive`) cannot gate it.
+  // `feedHeartbeatTick` reads THIS (not `lastToolLabelAt`, which is frozen by
+  // the drop-guard) to drive the post-answer liveness card — the core fix for
+  // #2587's inert state. undefined until the first post-answer watcher advance.
+  subagentActivityAt?: number
+  // Sticky wall-clock timestamp when finalAnswerEverDelivered first latched
+  // true this turn. Allows the heartbeat to distinguish "tool label arrived
+  // before the answer" (lastToolLabelAt ≤ finalAnswerDeliveredAt, inert) from
+  // "sub-agent active after the answer" (subagentActivityAt >
+  // finalAnswerDeliveredAt, liveness card warranted). undefined until the
+  // first substantive final answer of the turn.
+  finalAnswerDeliveredAt?: number
   // Accumulating friendly-action feed for this turn. Each non-surface
   // tool_label appends a line via `appendActivityLabel`; the feed renders
   // (via `renderActivityFeed`) as a capped chronological list into the
@@ -8341,6 +8357,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const ea = emissionAuthorityFor(finalizeTurn)
       ea.markSubstantiveFinalDelivered(() => {
         finalizeTurn.finalAnswerEverDelivered = true
+        finalizeTurn.finalAnswerDeliveredAt = Date.now()
       })
       ea.finalizeCard(() => {
         clearActivitySummary(finalizeTurn)
@@ -8468,6 +8485,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             // Sticky ordering latch (lever 1): a substantive final closes the
             // card OPEN gate for the rest of the turn. NEVER cleared by reopen.
             if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+            if (turn.finalAnswerSubstantive && turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
             if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
           }
           outboundDedup.record(
@@ -8816,6 +8834,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // never cleared by reopen. The card OPEN gate keys on this, not the
       // mutable finalAnswerDelivered above (which reopen toggles).
       if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+      if (turn.finalAnswerSubstantive && turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
       // #1728: release the buffer gate + emit terminal 👍. Mid-turn
       // acks bypass this branch and remain non-events for the
       // reaction (preserves #1713). The full turn-state teardown
@@ -9068,6 +9087,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const ea = emissionAuthorityFor(turn)
     ea.markSubstantiveFinalDelivered(() => {
       turn.finalAnswerEverDelivered = true
+      if (turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
     })
     ea.finalizeCard(() => {
       clearActivitySummary(turn)
@@ -9231,6 +9251,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     // Sticky ordering latch (lever 1): set once a SUBSTANTIVE final lands;
     // never cleared by reopen. The card OPEN gate keys on this sticky latch.
     if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+    if (turn.finalAnswerSubstantive && turn.finalAnswerDeliveredAt == null) turn.finalAnswerDeliveredAt = Date.now()
     if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, streamRoutedOriginTurn)
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
@@ -10786,6 +10807,8 @@ async function drainActivitySummary(
   // gate is unaffected. Narrative-SHOW and liveness callers pass their producer
   // explicitly.
   producer: FeedOpenProducer = 'tool',
+  // Optional flags forwarded to `mayOpenActivityCard`.
+  openFlags?: { postAnswerSubagentActivity?: boolean },
 ): Promise<void> {
   try {
     while (turn.activityPendingRender !== turn.activityLastSentRender) {
@@ -10833,6 +10856,7 @@ async function drainActivitySummary(
           finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
           labeledToolCount: turn.labeledToolCount,
           crossTurnAnswerDelivered,
+          postAnswerSubagentActivity: openFlags?.postAnswerSubagentActivity,
         })
       ) {
         break
@@ -10911,23 +10935,52 @@ function feedHeartbeatTick(): void {
   const turn = currentTurn
   if (turn == null) return
   if (turn.finalAnswerDelivered) {
-    // PR1 Item-3a (DORMANT — DEAD by default). Post-answer work is silent today:
-    // once the answer landed the feed has handed off and we return here. When a
-    // future Item-3 decision opts an agent into a "still tidying…" post-answer
-    // liveness line, `SWITCHROOM_POST_ANSWER_LIVENESS_MS>0` is the escape hatch —
-    // it would, past that threshold of post-answer silence, fall through to emit
-    // a guarded liveness EDIT/line here instead of returning. UNSET/0 ⇒ this
-    // branch is never taken and behaviour is byte-identical to today. The actual
-    // surface is intentionally NOT built (no card OPEN, no message) — this is
-    // only the plumbing so enabling it later needs no redesign.
-    if (POST_ANSWER_LIVENESS_MS <= 0) return // default: silent post-answer (today)
-    // `lastToolLabelAt` (set each time a tool step renders) is the closest
-    // existing anchor for "how long has post-answer work been running"; absent
-    // any post-answer tool it stays at the pre-answer value, so the threshold is
-    // only crossed by genuine ongoing work. The Item-3 surface lands here once
-    // decided; until then we stay silent even when the flag is set.
-    const since = turn.lastToolLabelAt != null ? Date.now() - turn.lastToolLabelAt : 0
-    if (since < POST_ANSWER_LIVENESS_MS) return // not yet past the threshold
+    // Fix 2: post-answer background-agent liveness. When the sub-agent/workflow
+    // watcher has surfaced a new step AFTER the substantive final answer, drive
+    // a liveness card so the operator can see "background agent still working".
+    //
+    // Gate: `turn.subagentActivityAt` must be set (watcher fired) AND it must
+    // exceed `turn.finalAnswerDeliveredAt` (the watcher advanced AFTER the answer
+    // was delivered — not just any pre-answer label). This is the key fix:
+    // #2587 read `lastToolLabelAt`, which is frozen by the drop-guard after a
+    // substantive answer and therefore never crosses the threshold. `subagentActivityAt`
+    // is written by the watcher's onProgress callback INDEPENDENTLY of the
+    // tool_label / drop-guard path, so it correctly advances post-answer.
+    //
+    // Idle-gap suppression: when no watcher activity has arrived after the answer
+    // (`subagentActivityAt` is undefined or ≤ finalAnswerDeliveredAt), we return
+    // silently — the reply-is-last invariant is fully preserved for idle turns.
+    const subagentAt = turn.subagentActivityAt
+    const answeredAt = turn.finalAnswerDeliveredAt ?? 0
+    if (subagentAt == null || subagentAt <= answeredAt) return // no post-answer watcher activity → stay silent
+    // A background worker is genuinely active after the answer. Open or maintain
+    // a liveness card below the reply. Route through `mayOpenActivityCard` with
+    // `postAnswerSubagentActivity:true` so Lever 1 is lifted for 'tool' producer
+    // (Fix 2's Lever 1 exception in feed-open-gate.ts). The card renders the
+    // turn's accumulated mirrorLines (which may be empty — in that case the drain
+    // opens a "Working…" placeholder matching the pre-answer liveness path).
+    if (turn.sessionChatId == null) return
+    const age = Date.now() - turn.startedAt
+    const livenessHeader: SessionActivityHeader = {
+      label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+    }
+    const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working in background…']
+    const elapsed = Date.now() - subagentAt
+    const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(elapsed)}`, undefined, livenessHeader)
+    if (rendered == null) return
+    turn.activityPendingRender = rendered
+    const ea = emissionAuthorityFor(turn)
+    cardDrainGate(turn, ea, () => {
+    if (ea.mayDrain(turn)) {
+      // Producer 'tool' with postAnswerSubagentActivity=true: the Lever 1
+      // exception allows this OPEN. Lever 4 (cross-turn) and idle-liveness
+      // blocks are still respected by the drain. The card surfaces BELOW the
+      // reply showing the background agent's live activity.
+      ea.openOrEditCard('tool', () => {
+        turn.activityInFlight = drainActivitySummary(turn, 'tool', { postAnswerSubagentActivity: true })
+      })
+    }
+    })
     return
   }
 
@@ -10953,9 +11006,10 @@ function feedHeartbeatTick(): void {
     // PR-4d: route through the centralized chatLock-serialized card-drain gate.
     cardDrainGate(turn, ea, () => {
     if (ea.mayDrain(turn)) {
-      // Producer C (liveness timer): the genuine ≥12s thinking-gap open. This
-      // is the ONE producer that may OPEN a 0-tool card (design §9 lever 5
-      // preserves it). The sticky-latch (lever 1) still gates it in the drain.
+      // Producer C (liveness timer): the genuine ≥12s thinking-gap open. Now
+      // that Lever 5 is inert (narrative may open pre-answer — #2588), liveness
+      // remains the natural open for 0-tool pre-answer turns that are silent.
+      // The sticky-latch (lever 1) still gates it in the drain.
       // PR-4a: routed through the emission-authority façade (no-op delegate).
       ea.openOrEditCard('liveness', () => {
         turn.activityInFlight = drainActivitySummary(turn, 'liveness')
@@ -23740,6 +23794,22 @@ void (async () => {
                     }
                   }
                   return
+                }
+
+                // Fix 2 (post-answer background-agent liveness): when the
+                // watcher surfaces a new step for a background worker, update
+                // the current turn's `subagentActivityAt` timestamp IF the turn
+                // has already delivered its substantive answer. This signal is
+                // written HERE — NOT in the tool_label path — so the drop-guard
+                // (`shouldReopenFeedAfterAck` / finalAnswerSubstantive) cannot
+                // gate it. `feedHeartbeatTick`'s post-answer branch reads
+                // `subagentActivityAt` (not `lastToolLabelAt`, which is frozen
+                // after the answer) to decide whether to open a liveness card.
+                // Only stamp when the turn is alive AND post-answer: pre-answer
+                // activity is already surfaced by the normal tool-label feed.
+                const stampTurn = currentTurn
+                if (stampTurn != null && stampTurn.finalAnswerEverDelivered) {
+                  stampTurn.subagentActivityAt = Date.now()
                 }
 
                 // #PR2 live worker-feed: when ON, the worker's live chat

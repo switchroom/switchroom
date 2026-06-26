@@ -218,18 +218,23 @@ export function appendActivityLine(
 }
 
 /**
- * Clip a raw narrative text block down to a single transient liveness line:
- * first line only, trimmed, sliced to 120 chars. Shared by the main-agent
- * gateway path and the sub-agent watcher so both render narrative identically
- * (mirrors the watcher's historical `lastSummaryLine` clip). Returns the raw
- * (unescaped) clipped string — callers escape via the renderStepFeed path,
- * exactly like a tool label.
+ * Clip a raw narrative text block down to a single durable feed line:
+ * first line only, trimmed, sliced to STATUS_LINE_MAX (200) chars.
+ *
+ * 200 chars matches the tool-label cap used by `escapeStepLine` / `renderStepFeed`
+ * so a narrative line is legible at the same length as a tool step — "Analysing
+ * the 12 changed files in /src/auth to understand the scope of…" rather than a
+ * hard-truncated 120-char fragment that drops context mid-sentence.
+ *
+ * Shared by the main-agent gateway path and the sub-agent watcher so both render
+ * narrative identically. Returns the raw (unescaped) clipped string — callers
+ * escape via the renderStepFeed path, exactly like a tool label.
  */
 export function clipNarrative(s: string): string {
   // `s` is a non-nullable string at every call site (showNarrativeStep passes
   // ev.text; the foreground-sub path passes `progressLine ?? latestSummary`,
   // both typed string), so no null guard is needed.
-  return s.split('\n')[0].trim().slice(0, 120);
+  return s.split('\n')[0].trim().slice(0, STATUS_LINE_MAX);
 }
 
 /**

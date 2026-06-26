@@ -24,18 +24,26 @@
  * (non-substantive) does NOT trip it and the #2141 ack-then-work feed still
  * opens.
  *
- * ## Lever 5 base case — narrative-SHOW alone must not OPEN (§9 lever 5, G1)
+ * ## Lever 5 — INERT (pre-answer narrative OPEN now permitted, #2588)
  *
- * The triplication: a 0-tool conversational turn opened a full card from
- * narration text alone. Rule: the narrative-SHOW producer (A) may only EDIT an
- * already-open card, never OPEN one. Only a tool label (producer B) or the
- * liveness timer (producer C, a genuine ≥12s thinking-gap) may OPEN a card.
+ * Lever 5 was added in #2557 to prevent a "triplication" reorder: a 0-tool
+ * conversational turn would open a card (message_id N), then the reply would
+ * send (message_id N+1) ABOVE the card, and then a Stop-hook re-prompt caused
+ * a second card below. The fix over-suppressed: it killed the card entirely
+ * rather than fixing the G2/G3 half of the triplication.
  *
- * So a narrative-SHOW-triggered OPEN is refused while the turn has surfaced ZERO
- * tool labels (`labeledToolCount === 0`). Once a tool label arrives
- * (`labeledToolCount > 0`) the card opens and the accumulated narration renders;
- * a turn that starts conversational then dispatches a tool DOES open (R4). The
- * liveness path (producer C) is exempt — it owns the genuine thinking-gap open.
+ * **Lever 2 (`clearActivitySummary`) already owns reply-is-last ordering:** it
+ * edits the narrative card IN-PLACE before the reply chunks send, keeping its
+ * lower message_id and guaranteeing the reply lands above it — no reorder.
+ * Lever 5's open-suppression is therefore redundant and harms visibility:
+ * a pre-answer narrative on a 0-tool turn (the agent thinking aloud before
+ * dispatching tools) is exactly the kind of step operators want to see.
+ *
+ * Lever 5 is now INERT for the pre-answer case. Post-answer is already blocked
+ * by Lever 1 (`finalAnswerEverDelivered`), so Lever 5 was unreachable there
+ * anyway. The `labeledToolCount` field remains in `FeedOpenInput` — it is still
+ * used by R4 (a turn that starts conversational then dispatches a tool opens on
+ * the first label) and by tests.
  *
  * ## Lever 4 — no card OPEN below an EARLIER turn's answer (§9 lever 4, race C/D)
  *
@@ -104,6 +112,25 @@ export interface FeedOpenInput {
    *  below the earlier reply). A normal foreground turn passes `false` (or omits
    *  it), so lever 4 is inert there. Defaults to `false`. */
   crossTurnAnswerDelivered?: boolean
+  /**
+   * Fix 2 (post-answer background-agent liveness, #2587 supersede): true when
+   * the sub-agent/workflow watcher has produced a NEW activity step AFTER the
+   * substantive final answer was delivered. This signal is updated by the watcher
+   * callback INDEPENDENTLY of the tool_label path, so the drop-guard
+   * (`shouldReopenFeedAfterAck` / `turn.finalAnswerSubstantive`) does NOT gate it.
+   *
+   * When true AND `producer === 'tool'`, Lever 1's blanket post-answer block is
+   * lifted: a liveness card surfaces below the reply to show "background agent
+   * still working". Idle producers (`liveness`, `narrative`) remain blocked after
+   * the final answer — the reply-is-last invariant is preserved for idle gaps.
+   * Only the `feedHeartbeatTick` post-answer branch sets this; it reads
+   * `turn.subagentActivityAt > (turn.finalAnswerDeliveredAt ?? 0)` (a tool-label
+   * rendered genuinely after the answer) rather than the frozen `lastToolLabelAt`.
+   *
+   * Defaults to `false` (Lever 1 stays fully active) — callers that don't pass
+   * this see no behaviour change.
+   */
+  postAnswerSubagentActivity?: boolean
 }
 
 /**
@@ -114,13 +141,16 @@ export interface FeedOpenInput {
  *  - crossTurnAnswerDelivered → false: lever 4. A cross-turn synthetic surface
  *    whose exchange already delivered a substantive answer in an EARLIER turn;
  *    no card may open below it (any producer). Checked FIRST.
- *  - finalAnswerEverDelivered → false: lever 1. A substantive final already
- *    landed THIS turn; no card may open below it (any producer).
- *  - producer 'narrative' && labeledToolCount === 0 → false: lever 5 base case.
- *    Narration alone on a 0-tool turn may not open a card (the triplication).
- *  - producer 'tool' → true (unless lever 1/4): a real tool dispatched → open.
- *  - producer 'liveness' → true (unless lever 1/4): the genuine thinking-gap open
- *    (producer C) is untouched by lever 5.
+ *  - finalAnswerEverDelivered && !postAnswerSubagentActivity → false: lever 1.
+ *    A substantive final already landed THIS turn; no card may open below it.
+ *    Exception: when `postAnswerSubagentActivity === true` AND `producer ===
+ *    'tool'`, Lever 1 is lifted so the background-agent liveness heartbeat can
+ *    surface a card below the reply showing the watcher's real new activity.
+ *    Idle producers ('liveness', 'narrative') stay blocked — no card opens from
+ *    wall-clock alone after the final answer.
+ *  - producer 'narrative': always allowed when pre-answer (lever 5 is INERT —
+ *    Lever 2 / clearActivitySummary guarantees reply-is-last ordering instead).
+ *  - producer 'tool' or 'liveness' → true (unless lever 1/4).
  */
 export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   // Lever 4 — cross-turn: nothing opens on a synthetic represent/owed-reply
@@ -128,10 +158,16 @@ export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   // turn (race C/D). Checked FIRST, above lever 1, and scoped to cross-turn
   // synthetic surfaces by the caller so it can never fire on a foreground turn.
   if (input.crossTurnAnswerDelivered) return false
-  // Lever 1 — sticky: nothing opens after a substantive final answer.
-  if (input.finalAnswerEverDelivered) return false
-  // Lever 5 base case — narrative SHOW alone on a 0-tool turn may not OPEN.
-  if (input.producer === 'narrative' && input.labeledToolCount === 0) return false
+  // Lever 1 — sticky: nothing opens after a substantive final answer, EXCEPT
+  // when genuine post-answer sub-agent/watcher activity warrants a liveness card
+  // (Fix 2 / #2587 supersede). Only 'tool' is exempted so idle liveness and
+  // narrative producers remain blocked after the final answer.
+  if (input.finalAnswerEverDelivered) {
+    if (input.postAnswerSubagentActivity && input.producer === 'tool') return true
+    return false
+  }
+  // Lever 5 — INERT (see module comment above). Pre-answer narrative may now
+  // open a card; Lever 2 (clearActivitySummary) handles reply-is-last ordering.
   return true
 }
 

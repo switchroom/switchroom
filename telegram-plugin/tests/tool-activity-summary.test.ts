@@ -201,13 +201,14 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
 });
 
 describe("clipNarrative — narrative-step clip (JSONL-text-narrative primitive)", () => {
-  it("takes the first line only, trims, slices to 120 chars", () => {
+  it("takes the first line only, trims, slices to 200 chars (Fix 1: raised from 120 to match STATUS_LINE_MAX)", () => {
     expect(clipNarrative("On it. Let me find the repo…\nthen build")).toBe(
       "On it. Let me find the repo…",
     );
     expect(clipNarrative("  Found both:  ")).toBe("Found both:");
-    const long = "x".repeat(200);
-    expect(clipNarrative(long).length).toBe(120);
+    // Fix 1: cap is now 200 chars (STATUS_LINE_MAX), not 120.
+    const long = "x".repeat(250);
+    expect(clipNarrative(long).length).toBe(200);
   });
 
   it("a shown narrative renders identically to a tool label via the same feed path", () => {

@@ -155,7 +155,9 @@ describe('lever 2 — finalize the card BEFORE a substantive reply send', () => 
     expect(clearIdx).toBeGreaterThan(-1)
     expect(sendIdx).toBeGreaterThan(-1)
     expect(clearIdx).toBeLessThan(sendIdx)
-    const window = src.slice(Math.max(0, clearIdx - 500), clearIdx)
+    // Window extended to 600 chars to account for the finalAnswerDeliveredAt stamp
+    // added inside the markSubstantiveFinalDelivered callback (Fix 2 / #2587).
+    const window = src.slice(Math.max(0, clearIdx - 600), clearIdx)
     expect(window).toMatch(/isSubstantiveFinalReply/)
   })
 
