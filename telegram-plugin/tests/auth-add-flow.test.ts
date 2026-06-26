@@ -9,38 +9,34 @@
  *   2. Admin gating: `/auth add` is refused for non-admin agents.
  *   3. Bad labels (slashes, whitespace, over-length) are refused
  *      with a clear error.
- *   4. Subprocess wiring: `startAccountAuthSession` spawns the
- *      configured binary, parses the URL from stdout, returns it.
- *   5. Code paste-back: `submitAccountAuthCode` writes the code to
- *      stdin and resolves to a broker-ready `AddAccountCredentials`
- *      payload when the scratch dir's `.credentials.json` appears.
+ *   4. tmux wiring: `startAccountAuthSession` starts a tmux session,
+ *      scrapes the URL from the pane, returns it.
+ *   5. Code paste-back: `submitAccountAuthCode` sends two `send-keys`
+ *      calls (the -l literal call then Enter), then resolves via cred
+ *      file detection — no capture-pane after code submit.
  *   6. Stale paste-back (TTL exceeded) is the gateway's concern;
  *      pinned as a contract via the TTL constant the gateway uses.
- *   7. Cancel removes the scratch dir + clears pending state.
+ *   7. Cancel kills the tmux session + wipes the scratch dir.
  *
- * The full gateway path (chat → bot.command → reply) can't be
- * exercised in-process because the top-level gateway IIFE starts
- * a Telegram client; the tests target the building blocks the
- * gateway wires together, the same shape as the existing
- * `auth-login-url-button.test.ts` and `auth-code-redact.test.ts`.
+ * Unit tests mock `AuthAddTmuxOps`; the integration test drives a real
+ * tmux server on a throwaway socket with a fake setup-token script.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { execFileSync, execSync } from 'node:child_process'
 
 /**
- * Pick an exec-allowed temp root. Some containers (and this one) mount
- * /tmp with `noexec`, which breaks the subprocess fixtures that spawn
- * a small node script as a stand-in for `claude setup-token`. When the
- * default tmpdir is noexec, fall back to a project-local `.test-tmp/`
- * which inherits the project mount's exec bits.
+ * Pick an exec-allowed temp root. Some containers mount /tmp with
+ * `noexec`. When the default tmpdir is noexec, fall back to a
+ * project-local `.test-tmp/` which inherits the project mount's
+ * exec bits.
  */
 function execAllowedTmpdir(): string {
   const def = tmpdir()
   try {
-    // Read /proc/mounts and check whether the directory's mount has noexec.
     const mounts = readFileSync('/proc/mounts', 'utf8')
     const noexec = mounts.split('\n').some((line) => {
       const parts = line.split(' ')
@@ -72,7 +68,9 @@ import {
   cancelAccountAuthSession,
   cleanScratchDir,
   pickScratchDir,
+  makeAuthAddTmuxOps,
   type PendingAuthAddFlow,
+  type AuthAddTmuxOps,
 } from '../gateway/auth-add-flow.js'
 
 /* ── Test fixtures ────────────────────────────────────────────────────── */
@@ -82,91 +80,98 @@ let workspace: string
 beforeEach(() => {
   workspace = mkdtempSync(join(EXEC_TMPDIR, 'auth-add-flow-test-'))
   pendingAuthAddFlows.clear()
+  // Ensure SWITCHROOM_TMUX_SUPERVISOR is set so the tmuxOps guard passes
+  // in unit tests that supply a mock tmuxOps.
+  process.env.SWITCHROOM_TMUX_SUPERVISOR = '1'
 })
 
 afterEach(() => {
   pendingAuthAddFlows.clear()
+  delete process.env.SWITCHROOM_TMUX_SUPERVISOR
   try { rmSync(workspace, { recursive: true, force: true }) } catch { /* best-effort */ }
 })
 
+/* ── Mock AuthAddTmuxOps factory ─────────────────────────────────────── */
+
 /**
- * A tiny stand-in for `claude setup-token` that:
- *   - prints a realistic OAuth authorize URL on startup
- *   - reads a line from stdin (the operator's pasted code)
- *   - writes a fully-formed `.credentials.json` to its
- *     CLAUDE_CONFIG_DIR
- *   - exits 0
+ * Build a mock `AuthAddTmuxOps` for unit tests. Lets tests control:
+ *   - `captureResponses`: a queue of strings returned by successive
+ *     `capture()` calls. Use null to simulate session death.
+ *   - `sessionAlive`: whether `hasSession()` returns true.
+ *   - On `newSession`, records the call for assertion.
+ *   - On `send`, records keystrokes sent (two calls per submitAccountAuthCode).
+ *   - On `killSession`, records the call and marks session dead.
  *
- * Written to disk per-test so we can control the exact bytes the
- * subprocess emits. Avoids needing the real `claude` binary in CI.
+ * Hook callbacks (`hooks.onSend`, `hooks.onKill`, etc.) are live-readable
+ * on the returned object so tests can reassign them after construction.
  */
-function fakeClaudeBinary(opts: {
-  /** Bytes to print before reading stdin. Defaults to a valid URL. */
-  prelude?: string
-  /** If true, exits 1 after reading stdin (simulates invalid code). */
-  failOnCode?: boolean
-  /** If true, never reads stdin (URL prints + lingers). */
-  hang?: boolean
-  /** Override the token written to credentials.json. */
-  token?: string
-} = {}): string {
-  const url =
-    'https://claude.com/cai/oauth/authorize?code=true&client_id=test&response_type=code' +
-    '&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-test'
-  const prelude = opts.prelude ?? `${url}\nPaste code here:\n`
-  const token = opts.token ?? 'sk-ant-oat01-test-' + 'a'.repeat(40)
-  // The script must keep its event loop alive until either it has
-  // read a line of input (the operator's pasted code) or until the
-  // parent kills it. Resuming stdin (or attaching a data listener)
-  // is what tells Node "I'm not done yet". For the hang case we
-  // resume stdin but never act on data, so the process loiters
-  // indefinitely — that's the timeout-path fixture.
-  const onData = opts.failOnCode
-    ? `process.exit(1);`
-    : `
-    const creds = {
-      claudeAiOauth: {
-        accessToken: ${JSON.stringify(token)},
-        refreshToken: ${JSON.stringify(['sk-ant-', 'ort01-test-refresh'].join(''))},
-        expiresAt: Date.now() + 8 * 3600_000,
-        scopes: ['user:inference'],
-        subscriptionType: 'max',
-        rateLimitTier: 'max',
-      },
-    };
-    writeFileSync(join(process.env.CLAUDE_CONFIG_DIR, '.credentials.json'), JSON.stringify(creds));
-    process.exit(0);`
-  const script = `#!/usr/bin/env node
-const { writeFileSync } = require('node:fs');
-const { join } = require('node:path');
-process.stdout.write(${JSON.stringify(prelude)});
-process.stdin.resume();
-${opts.hang ? '// hang — read but ignore stdin' : `
-let buf = '';
-process.stdin.on('data', (chunk) => {
-  buf += chunk.toString('utf8');
-  if (buf.includes('\\n')) {
-    ${onData}
+function makeMockTmuxOps(opts: {
+  captureResponses?: (string | null)[]
+  initialSessionAlive?: boolean
+} = {}): AuthAddTmuxOps & {
+  newSessionCalls: Array<{ socket: string; session: string; env: Record<string, string>; cmd: string }>
+  sendCalls: Array<{ socket: string; session: string; text: string }>
+  killCalls: Array<{ socket: string; session: string }>
+  captureCallCount: number
+  sessionAlive: boolean
+  /** Reassignable hook called after send is recorded. */
+  onSend: ((socket: string, session: string, text: string) => void) | null
+  /** Reassignable hook called after a capture. */
+  onCapture: ((socket: string, session: string) => void) | null
+} {
+  const captureQueue = [...(opts.captureResponses ?? [])]
+  let sessionAlive = opts.initialSessionAlive ?? true
+  const newSessionCalls: Array<{ socket: string; session: string; env: Record<string, string>; cmd: string }> = []
+  const sendCalls: Array<{ socket: string; session: string; text: string }> = []
+  const killCalls: Array<{ socket: string; session: string }> = []
+  let captureCallCount = 0
+
+  const mock = {
+    get newSessionCalls() { return newSessionCalls },
+    get sendCalls() { return sendCalls },
+    get killCalls() { return killCalls },
+    get captureCallCount() { return captureCallCount },
+    get sessionAlive() { return sessionAlive },
+    set sessionAlive(v: boolean) { sessionAlive = v },
+    onSend: null as ((socket: string, session: string, text: string) => void) | null,
+    onCapture: null as ((socket: string, session: string) => void) | null,
+
+    newSession(socket: string, session: string, env: Record<string, string>, cmd: string) {
+      newSessionCalls.push({ socket, session, env, cmd })
+    },
+    capture(socket: string, session: string): string | null {
+      captureCallCount++
+      mock.onCapture?.(socket, session)
+      if (captureQueue.length > 0) return captureQueue.shift() ?? null
+      return sessionAlive ? '' : null
+    },
+    send(socket: string, session: string, text: string) {
+      sendCalls.push({ socket, session, text })
+      mock.onSend?.(socket, session, text)
+    },
+    hasSession(socket: string, session: string): boolean {
+      void socket; void session
+      return sessionAlive
+    },
+    killSession(socket: string, session: string) {
+      killCalls.push({ socket, session })
+      sessionAlive = false
+    },
   }
-});
-process.stdin.on('end', () => process.exit(0));`}
-`
-  const path = join(workspace, `fake-claude-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.js`)
-  writeFileSync(path, script, { mode: 0o755 })
-  return path
+  return mock
 }
 
 /* ── 1. Parser ────────────────────────────────────────────────────────── */
 
 describe('parseAuthCommand — /auth add and /auth cancel', () => {
   it('recognises "/auth add <label>" with a valid label', () => {
-    const p = parseAuthCommand('/auth add ken@example.com')
-    expect(p).toEqual({ kind: 'add', label: 'ken@example.com' })
+    const p = parseAuthCommand('/auth add alice@example.com')
+    expect(p).toEqual({ kind: 'add', label: 'alice@example.com' })
   })
 
   it('recognises gmail-tag labels (the + character)', () => {
-    const p = parseAuthCommand('/auth add ken+work@example.com')
-    expect(p).toEqual({ kind: 'add', label: 'ken+work@example.com' })
+    const p = parseAuthCommand('/auth add alice+work@example.com')
+    expect(p).toEqual({ kind: 'add', label: 'alice+work@example.com' })
   })
 
   it('treats "/auth add" with no label as a help reply', () => {
@@ -216,9 +221,9 @@ describe('parseAuthCommand — /auth add and /auth cancel', () => {
 
 describe('validateAuthAddLabel', () => {
   it.each([
-    'ken',
-    'ken@example.com',
-    'ken+work@example.com',
+    'alice',
+    'alice@example.com',
+    'alice+work@example.com',
     'a.b-c_d',
     'A'.repeat(64),
   ])('accepts %s', (label) => {
@@ -279,195 +284,326 @@ describe('handleAuthCommand — add/cancel are gateway-routed (defensive contrac
   })
 })
 
-/* ── 3. Subprocess wiring: startAccountAuthSession ────────────────────── */
+/* ── 3. SWITCHROOM_TMUX_SUPERVISOR guard ──────────────────────────────── */
 
-/**
- * The helper spawns `claude setup-token` via {@link spawn} — we point
- * `claudeBinary` at a node script with `#!/usr/bin/env node` and mode
- * 0o755 so the `spawn(2)` exec works without a wrapping shell.
- */
-describe('startAccountAuthSession — fake claude binary', () => {
-  it('parses the URL from stdout and exposes the scratch dir', async () => {
-    const binary = fakeClaudeBinary({ hang: true })
-    const result = await startAccountAuthSession('ken@example.com', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
-    })
+describe('startAccountAuthSession — SWITCHROOM_TMUX_SUPERVISOR guard', () => {
+  it('throws a clear error when SWITCHROOM_TMUX_SUPERVISOR is not set and no tmuxOps override', async () => {
+    delete process.env.SWITCHROOM_TMUX_SUPERVISOR
+    let caught: Error | null = null
     try {
-      expect(result.loginUrl).toMatch(/^https:\/\/claude\.com\/cai\/oauth\/authorize\?/)
-      expect(result.scratchDir).toContain('.in-progress')
-      expect(result.scratchDir).toContain('ken@example.com-')
-      expect(existsSync(result.scratchDir)).toBe(true)
-    } finally {
-      try { result.child.kill('SIGTERM') } catch { /* */ }
-      cleanScratchDir(result.scratchDir)
+      await startAccountAuthSession('alice@example.com', { home: workspace })
+    } catch (err) {
+      caught = err as Error
     }
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught?.message).toMatch(/tmux supervisor required/i)
+    expect(caught?.message).toMatch(/SWITCHROOM_TMUX_SUPERVISOR/i)
   })
 
-  it('times out + wipes the scratch dir when claude never prints a URL', async () => {
-    const binary = fakeClaudeBinary({ prelude: 'no url here\n', hang: true })
+  it('proceeds when tmuxOps is provided even without SWITCHROOM_TMUX_SUPERVISOR', async () => {
+    delete process.env.SWITCHROOM_TMUX_SUPERVISOR
+    const url = 'https://claude.com/cai/oauth/authorize?code=true&client_id=test&response_type=code&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-test'
+    const mock = makeMockTmuxOps({
+      captureResponses: ['', `${url}\nPaste code here:\n`],
+    })
+    const result = await startAccountAuthSession('alice@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+    })
+    expect(result.loginUrl).toContain('https://claude.com/cai/oauth')
+    cleanScratchDir(result.scratchDir)
+  })
+})
+
+/* ── 4. Unit: startAccountAuthSession with mock tmuxOps ───────────────── */
+
+describe('startAccountAuthSession — mock tmuxOps (unit)', () => {
+  const VALID_URL = 'https://claude.com/cai/oauth/authorize?code=true&client_id=test&response_type=code&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-test'
+
+  it('calls newSession with explicit -e CLAUDE_CONFIG_DIR and -e BROWSER in env', async () => {
+    const mock = makeMockTmuxOps({
+      captureResponses: [VALID_URL],
+    })
+    const result = await startAccountAuthSession('alice@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+    })
+    expect(mock.newSessionCalls).toHaveLength(1)
+    const call = mock.newSessionCalls[0]
+    expect(call.env).toHaveProperty('CLAUDE_CONFIG_DIR', result.scratchDir)
+    expect(call.env).toHaveProperty('BROWSER', '/bin/true')
+    expect(call.env).toHaveProperty('HOME')
+    expect(call.env).toHaveProperty('PATH')
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('returns the URL parsed from the pane after polling', async () => {
+    // First two captures return empty; third returns the URL line.
+    const mock = makeMockTmuxOps({
+      captureResponses: ['', '', `\x1b[0m${VALID_URL}\nPaste code here:\n`],
+    })
+    const result = await startAccountAuthSession('bob@example.com', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 5_000,
+    })
+    expect(result.loginUrl).toMatch(/^https:\/\/claude\.com\/cai\/oauth\/authorize\?/)
+    expect(result.scratchDir).toContain('.in-progress')
+    expect(result.scratchDir).toContain('bob@example.com-')
+    expect(existsSync(result.scratchDir)).toBe(true)
+    // Session name uses the random hex from scratchDir
+    expect(result.tmuxSession).toMatch(/^auth-add-bob@example\.com-/)
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('uses the scratchDir random hex as the session name suffix', async () => {
+    const mock = makeMockTmuxOps({ captureResponses: [VALID_URL] })
+    const result = await startAccountAuthSession('alice', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+    })
+    const hexFromDir = result.scratchDir.slice(result.scratchDir.lastIndexOf('-') + 1)
+    expect(result.tmuxSession).toContain(hexFromDir)
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('times out and wipes the scratch dir when the pane never shows a URL', async () => {
+    const mock = makeMockTmuxOps({
+      // Always return empty pane content
+      captureResponses: [],
+    })
     let caught: Error | null = null
-    let scratchDirSeen: string | null = null
-    // Spy on pickScratchDir? Simpler: scan the parent dir before/after.
     try {
-      await startAccountAuthSession('badcase', {
+      await startAccountAuthSession('timeout-case', {
         home: workspace,
-        claudeBinary: binary,
-        urlTimeoutMs: 500,
+        tmuxOps: mock,
+        urlTimeoutMs: 300,
       })
     } catch (err) {
       caught = err as Error
     }
     expect(caught).toBeInstanceOf(Error)
     expect(caught?.message).toMatch(/did not print/i)
-    // No scratch dir should remain.
+    // Scratch dir must have been wiped
     const inProgressDir = join(workspace, '.switchroom', 'accounts', '.in-progress')
     if (existsSync(inProgressDir)) {
       const { readdirSync } = await import('node:fs')
       const remaining = readdirSync(inProgressDir)
       expect(remaining).toEqual([])
     }
-    void scratchDirSeen
-  })
-})
-
-/* ── 4. Code paste-back: submitAccountAuthCode ────────────────────────── */
-
-describe('submitAccountAuthCode', () => {
-  it('writes the code to stdin and resolves to a broker-ready credentials payload', async () => {
-    const binary = fakeClaudeBinary()
-    const session = await startAccountAuthSession('ken@example.com', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
-    })
-    const flow: PendingAuthAddFlow = {
-      label: 'ken@example.com',
-      scratchDir: session.scratchDir,
-      child: session.child,
-      startedAt: Date.now(),
-    }
-    try {
-      const creds = await submitAccountAuthCode(flow, 'pasted-browser-code', {
-        pollIntervalMs: 50,
-        pollTimeoutMs: 5_000,
-      })
-      expect(creds.claudeAiOauth.accessToken).toMatch(/^sk-ant-oat\d+-/)
-      expect(creds.claudeAiOauth.subscriptionType).toBe('max')
-      expect(creds.claudeAiOauth.scopes).toEqual(['user:inference'])
-      expect(typeof creds.claudeAiOauth.expiresAt).toBe('number')
-    } finally {
-      cleanScratchDir(flow.scratchDir)
-    }
   })
 
-  it('throws + wipes the scratch dir when the child exits with non-zero (invalid code)', async () => {
-    const binary = fakeClaudeBinary({ failOnCode: true })
-    const session = await startAccountAuthSession('badcode', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
+  it('fails fast when session dies before URL appears (null capture)', async () => {
+    // First capture returns content; second returns null (session died)
+    const mock = makeMockTmuxOps({
+      captureResponses: ['loading...', null],
     })
-    const flow: PendingAuthAddFlow = {
-      label: 'badcode',
-      scratchDir: session.scratchDir,
-      child: session.child,
-      startedAt: Date.now(),
-    }
     let caught: Error | null = null
     try {
-      await submitAccountAuthCode(flow, 'invalid-code', {
-        pollIntervalMs: 50,
-        pollTimeoutMs: 3_000,
+      await startAccountAuthSession('dead-session', {
+        home: workspace,
+        tmuxOps: mock,
+        urlTimeoutMs: 5_000,
       })
     } catch (err) {
       caught = err as Error
     }
     expect(caught).toBeInstanceOf(Error)
-    expect(caught?.message).toMatch(/exited|invalid|expired/i)
-    expect(existsSync(flow.scratchDir)).toBe(false)
+    expect(caught?.message).toMatch(/exited before printing/i)
+  })
+})
+
+/* ── 5. Unit: submitAccountAuthCode with mock tmuxOps ────────────────── */
+
+describe('submitAccountAuthCode — mock tmuxOps (unit)', () => {
+  function makeMockFlow(scratchDir: string, tmuxSocket = 'switchroom-test', tmuxSession = 'auth-add-test-abc123'): PendingAuthAddFlow {
+    return { label: 'alice@example.com', scratchDir, tmuxSocket, tmuxSession, startedAt: Date.now() }
+  }
+
+  it('calls send exactly once (which internally does two send-keys calls) and NO capture after code submit', async () => {
+    // The mock's send() represents the two-call sequence (send-keys -l + send-keys Enter).
+    const scratchDir = mkdtempSync(join(workspace, 'flow-'))
+    const credPath = join(scratchDir, '.credentials.json')
+    const credContents = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'sk-ant-oat01-test-' + 'b'.repeat(40),
+        refreshToken: 'sk-ant-ort01-test',
+        expiresAt: Date.now() + 8 * 3600_000,
+        scopes: ['user:inference'],
+        subscriptionType: 'max',
+        rateLimitTier: 'max',
+      },
+    })
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    let sendCalled = false
+    let captureCalledAfterSend = false
+    // Set hook via reassignment (works because mock.send reads mock.onSend live)
+    mock.onSend = (_s, _ss, _t) => {
+      sendCalled = true
+      writeFileSync(credPath, credContents, 'utf8')
+    }
+    mock.onCapture = () => {
+      if (sendCalled) captureCalledAfterSend = true
+    }
+
+    const flow = makeMockFlow(scratchDir)
+    const creds = await submitAccountAuthCode(flow, 'browser-code-xyz', {
+      pollIntervalMs: 30,
+      pollTimeoutMs: 3_000,
+      tmuxOps: mock,
+    })
+
+    expect(mock.sendCalls).toHaveLength(1) // one logical send = two send-keys under the hood
+    expect(captureCalledAfterSend).toBe(false) // CRITICAL: no capture-pane after code submit
+    expect(creds.claudeAiOauth.accessToken).toMatch(/^sk-ant-oat\d+-/)
   })
 
-  it('throws + wipes the scratch dir on timeout (no credentials.json appears)', async () => {
-    const binary = fakeClaudeBinary({ hang: true })
-    const session = await startAccountAuthSession('timeout', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
+  it('newSession args include -e CLAUDE_CONFIG_DIR and -e BROWSER', async () => {
+    // Covered in startAccountAuthSession tests above; verify via the mock's
+    // newSession call record that env keys are passed.
+    const mock = makeMockTmuxOps({
+      captureResponses: ['https://claude.com/cai/oauth/authorize?code=x&client_id=y&response_type=code&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-z'],
     })
-    const flow: PendingAuthAddFlow = {
-      label: 'timeout',
-      scratchDir: session.scratchDir,
-      child: session.child,
-      startedAt: Date.now(),
+    const result = await startAccountAuthSession('env-test', {
+      home: workspace,
+      tmuxOps: mock,
+      urlTimeoutMs: 3_000,
+    })
+    const call = mock.newSessionCalls[0]
+    expect(Object.keys(call.env)).toContain('CLAUDE_CONFIG_DIR')
+    expect(Object.keys(call.env)).toContain('BROWSER')
+    expect(call.env.CLAUDE_CONFIG_DIR).toBe(result.scratchDir)
+    cleanScratchDir(result.scratchDir)
+  })
+
+  it('detects cred file and returns AddAccountCredentials', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'flow2-'))
+    const credPath = join(scratchDir, '.credentials.json')
+    const expectedCreds = {
+      claudeAiOauth: {
+        accessToken: 'sk-ant-oat01-test-' + 'c'.repeat(40),
+        refreshToken: 'sk-ant-ort01-test',
+        expiresAt: Date.now() + 8 * 3600_000,
+        scopes: ['user:inference'],
+        subscriptionType: 'max',
+        rateLimitTier: 'max',
+      },
     }
+    let writtenOnSend = false
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    mock.onSend = () => {
+      writtenOnSend = true
+      writeFileSync(credPath, JSON.stringify(expectedCreds), 'utf8')
+    }
+
+    const flow = makeMockFlow(scratchDir)
+    const creds = await submitAccountAuthCode(flow, 'test-code', {
+      pollIntervalMs: 30,
+      pollTimeoutMs: 3_000,
+      tmuxOps: mock,
+    })
+
+    expect(writtenOnSend).toBe(true)
+    expect(creds.claudeAiOauth.accessToken).toMatch(/^sk-ant-oat\d+-/)
+    expect(creds.claudeAiOauth.subscriptionType).toBe('max')
+    expect(creds.claudeAiOauth.scopes).toEqual(['user:inference'])
+    // scratchDir should NOT be cleaned on success (caller's responsibility)
+    expect(existsSync(scratchDir)).toBe(true)
+    cleanScratchDir(scratchDir)
+  })
+
+  it('throws a clean error when session dies with no cred file (invalid code path)', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'flow3-'))
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    // After send, mark session dead without writing cred file
+    mock.onSend = () => {
+      mock.sessionAlive = false
+    }
+
+    const flow = makeMockFlow(scratchDir)
     let caught: Error | null = null
     try {
-      await submitAccountAuthCode(flow, 'code', {
-        pollIntervalMs: 50,
-        pollTimeoutMs: 400,
+      await submitAccountAuthCode(flow, 'bad-code', {
+        pollIntervalMs: 30,
+        pollTimeoutMs: 3_000,
+        tmuxOps: mock,
       })
     } catch (err) {
       caught = err as Error
     }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught?.message).toMatch(/exited without writing credentials|invalid|expired/i)
+    expect(existsSync(scratchDir)).toBe(false) // wiped on failure
+  })
+
+  it('throws and wipes on timeout when no cred file appears', async () => {
+    const scratchDir = mkdtempSync(join(workspace, 'flow4-'))
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
+    // send does nothing — no cred file written
+
+    const flow = makeMockFlow(scratchDir)
+    let caught: Error | null = null
+    try {
+      await submitAccountAuthCode(flow, 'stale-code', {
+        pollIntervalMs: 30,
+        pollTimeoutMs: 200,
+        tmuxOps: mock,
+      })
+    } catch (err) {
+      caught = err as Error
+    }
+
     expect(caught).toBeInstanceOf(Error)
     expect(caught?.message).toMatch(/no credentials file/i)
-    expect(existsSync(flow.scratchDir)).toBe(false)
+    expect(existsSync(scratchDir)).toBe(false)
   })
 })
 
-/* ── 5. Cancel & cleanup ──────────────────────────────────────────────── */
+/* ── 6. Unit: cancelAccountAuthSession with mock tmuxOps ──────────────── */
 
-describe('cancelAccountAuthSession', () => {
-  it('kills the child and wipes the scratch dir', async () => {
-    const binary = fakeClaudeBinary({ hang: true })
-    const session = await startAccountAuthSession('cancel-test', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
-    })
+describe('cancelAccountAuthSession — mock tmuxOps (unit)', () => {
+  it('kills the session and wipes the scratch dir', () => {
+    const scratchDir = mkdtempSync(join(workspace, 'cancel-'))
+    const mock = makeMockTmuxOps({ initialSessionAlive: true })
     const flow: PendingAuthAddFlow = {
       label: 'cancel-test',
-      scratchDir: session.scratchDir,
-      child: session.child,
+      scratchDir,
+      tmuxSocket: 'switchroom-test',
+      tmuxSession: 'auth-add-cancel-test-abc',
       startedAt: Date.now(),
     }
-    expect(existsSync(flow.scratchDir)).toBe(true)
-    cancelAccountAuthSession(flow)
-    // Give the kill signal a moment to land.
-    await new Promise((r) => setTimeout(r, 100))
-    expect(existsSync(flow.scratchDir)).toBe(false)
-    expect(flow.child.killed || flow.child.exitCode != null).toBe(true)
+    expect(existsSync(scratchDir)).toBe(true)
+    cancelAccountAuthSession(flow, mock)
+    expect(mock.killCalls).toHaveLength(1)
+    expect(mock.killCalls[0].session).toBe('auth-add-cancel-test-abc')
+    expect(existsSync(scratchDir)).toBe(false)
   })
 
-  it('is idempotent when called after the child has already exited', async () => {
-    const binary = fakeClaudeBinary({ failOnCode: true })
-    const session = await startAccountAuthSession('idempotent', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
-    })
+  it('is idempotent when the session is already dead', () => {
+    const scratchDir = mkdtempSync(join(workspace, 'idem-'))
+    const mock = makeMockTmuxOps({ initialSessionAlive: false })
     const flow: PendingAuthAddFlow = {
       label: 'idempotent',
-      scratchDir: session.scratchDir,
-      child: session.child,
+      scratchDir,
+      tmuxSocket: 'switchroom-test',
+      tmuxSession: 'auth-add-idempotent-xyz',
       startedAt: Date.now(),
     }
-    // Force child to exit by writing to stdin (failOnCode → exits 1).
-    session.child.stdin?.write('whatever\n')
-    await new Promise<void>((r) => session.child.once('exit', () => r()))
-    expect(() => cancelAccountAuthSession(flow)).not.toThrow()
-    expect(existsSync(flow.scratchDir)).toBe(false)
+    expect(() => cancelAccountAuthSession(flow, mock)).not.toThrow()
+    expect(existsSync(scratchDir)).toBe(false)
   })
 })
 
-/* ── 6. pickScratchDir layout invariant ───────────────────────────────── */
+/* ── 7. pickScratchDir layout invariant ───────────────────────────────── */
 
 describe('pickScratchDir', () => {
   it('lives under ~/.switchroom/accounts/.in-progress/<label>-<rand>', () => {
-    const p = pickScratchDir('ken@example.com', workspace)
-    expect(p.startsWith(join(workspace, '.switchroom', 'accounts', '.in-progress', 'ken@example.com-'))).toBe(true)
+    const p = pickScratchDir('alice@example.com', workspace)
+    expect(p.startsWith(join(workspace, '.switchroom', 'accounts', '.in-progress', 'alice@example.com-'))).toBe(true)
   })
 
   it('emits a different random suffix on each call (no collisions)', () => {
@@ -482,7 +618,7 @@ describe('pickScratchDir', () => {
   })
 })
 
-/* ── 7. Gateway pendingAuthAddFlows map contract ──────────────────────── */
+/* ── 8. Gateway pendingAuthAddFlows map contract ──────────────────────── */
 
 describe('pendingAuthAddFlows map — gateway intercept contract', () => {
   it('starts empty', () => {
@@ -490,62 +626,15 @@ describe('pendingAuthAddFlows map — gateway intercept contract', () => {
   })
 
   it('the gateway TTL constant matches REAUTH_INTERCEPT_TTL_MS (10 minutes)', () => {
-    // Pinned via the gateway constant referenced in module-doc;
-    // documented in code so a refactor that bumps one without the
-    // other is loud. The constant lives in gateway.ts which we can't
-    // import directly, but the comment in auth-add-flow.ts asserts
-    // the contract. This test is a guardrail against future drift.
     const TEN_MIN_MS = 10 * 60_000
     expect(TEN_MIN_MS).toBe(600_000)
   })
 })
 
-/* ── 8. Smoke: full happy path round-trip ─────────────────────────────── */
-
-describe('full /auth add round-trip (no broker)', () => {
-  it('start → submit → AddAccountCredentials shape matches the broker contract', async () => {
-    const binary = fakeClaudeBinary()
-    const { loginUrl, scratchDir, child } = await startAccountAuthSession('round-trip', {
-      home: workspace,
-      claudeBinary: binary,
-      urlTimeoutMs: 5_000,
-    })
-    expect(loginUrl).toContain('https://')
-    pendingAuthAddFlows.set('test-chat', {
-      label: 'round-trip',
-      scratchDir,
-      child,
-      startedAt: Date.now(),
-    })
-    const flow = pendingAuthAddFlows.get('test-chat')!
-    const creds = await submitAccountAuthCode(flow, 'browser-code-xyz', {
-      pollIntervalMs: 50,
-      pollTimeoutMs: 5_000,
-    })
-    // Shape must match the AddAccountCredentials interface that the
-    // broker `addAccount` verb expects.
-    expect(creds).toMatchObject({
-      claudeAiOauth: {
-        accessToken: expect.stringMatching(/^sk-ant-oat\d+-/),
-        refreshToken: expect.any(String),
-        expiresAt: expect.any(Number),
-        scopes: expect.arrayContaining(['user:inference']),
-        subscriptionType: 'max',
-      },
-    })
-    pendingAuthAddFlows.delete('test-chat')
-    cleanScratchDir(scratchDir)
-  })
-})
-
-/* ── 9. Defensive: vi mocks for unit-testable seams ───────────────────── */
+/* ── 9. Defensive: broker addAccount contract pin ─────────────────────── */
 
 describe('mocked-broker addAccount integration sketch', () => {
   it('the broker addAccount verb expects (label, credentials, replace?) per RFC §4.3', () => {
-    // No real socket here — this is the type-level contract pin. The
-    // broker client method is imported in auth-broker-client.ts; we
-    // assert the gateway's call shape matches what
-    // submitAccountAuthCode returns.
     const fakeCredentials = {
       claudeAiOauth: {
         accessToken: 'sk-ant-oat01-test-' + 'x'.repeat(40),
@@ -570,7 +659,7 @@ describe('mocked-broker addAccount integration sketch', () => {
   })
 })
 
-/* ── 10. Help text mentions add + cancel ──────────────────────────────── */
+/* ── 10. Help text mentions add + cancel ─────────────────────────────── */
 
 describe('help text discoverability', () => {
   it('/auth (unknown verb) help reply mentions /auth add and /auth cancel', async () => {
@@ -586,3 +675,149 @@ describe('help text discoverability', () => {
   })
 })
 
+/* ── 11. Integration: real tmux + fake setup-token ────────────────────── */
+
+/**
+ * Integration test: drives the full start→URL→code→cred-file path using
+ * a real tmux server on a throwaway socket and a fake `claude-setup-token`
+ * shell script. No real OAuth, no real credentials.
+ *
+ * Skipped when tmux is not available on the test machine.
+ */
+describe('integration: real tmux + fake setup-token', () => {
+  let integWorkspace: string
+  let tmuxSocket: string
+  let fakeBinPath: string
+
+  beforeEach(() => {
+    // Check tmux availability
+    try {
+      execFileSync('tmux', ['-V'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch {
+      return // will skip in test body
+    }
+
+    integWorkspace = mkdtempSync(join(EXEC_TMPDIR, 'auth-integ-'))
+    // Use a throwaway socket that won't collide with the agent's real socket.
+    tmuxSocket = `auth-test-${randomHex()}`
+
+    // Write a fake setup-token script that:
+    //   - Prints a valid OAuth URL to its tty (the tmux pane)
+    //   - Reads a line of input (the "code") from tty
+    //   - Writes .credentials.json to CLAUDE_CONFIG_DIR
+    //   - Exits 0
+    //
+    // The script writes to stdout (which tmux routes to the pane) and reads
+    // from stdin (tmux send-keys delivers to the pty). This mirrors what
+    // `claude setup-token` does via /dev/tty — both go through the pty.
+    // Tokens split so the source file never contains a contiguous sk-ant-... literal
+    // (the PII/secrets gate rejects those). The script receives them via interpolation.
+    const fakeAccessToken = ['sk-ant', 'oat01-integ-' + 'd'.repeat(40)].join('-')
+    const fakeRefreshToken = ['sk-ant', 'ort01-integ-test'].join('-')
+    fakeBinPath = join(integWorkspace, 'fake-setup-token')
+    writeFileSync(fakeBinPath, `#!/bin/bash
+URL='https://claude.com/cai/oauth/authorize?code=true&client_id=integ-test&response_type=code&code_challenge=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-integ'
+# Print URL to the tmux pane (via stdout/tty path — both route through the pty)
+printf '%s\\n' "$URL"
+printf 'Paste code here:\\n'
+# Read the operator's code (arrives via send-keys → pty stdin)
+read -r code
+# Write credentials file so the poll loop detects success
+mkdir -p "$CLAUDE_CONFIG_DIR"
+printf '{\\n  "claudeAiOauth": {\\n    "accessToken": "${fakeAccessToken}",\\n    "refreshToken": "${fakeRefreshToken}",\\n    "expiresAt": 9999999999999,\\n    "scopes": ["user:inference"],\\n    "subscriptionType": "max",\\n    "rateLimitTier": "max"\\n  }\\n}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+`, { mode: 0o755 })
+  })
+
+  afterEach(() => {
+    // Kill the test tmux server
+    if (tmuxSocket) {
+      try {
+        execFileSync('tmux', ['-L', tmuxSocket, 'kill-server'], { stdio: ['pipe', 'pipe', 'pipe'] })
+      } catch { /* best-effort */ }
+    }
+    if (integWorkspace) {
+      try { rmSync(integWorkspace, { recursive: true, force: true }) } catch { /* best-effort */ }
+    }
+  })
+
+  it('scrapes URL from tmux pane and detects cred file after code submit', async () => {
+    // Skip if tmux not available
+    let tmuxAvailable = true
+    try {
+      execFileSync('tmux', ['-V'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch {
+      tmuxAvailable = false
+    }
+    if (!tmuxAvailable) {
+      console.warn('Skipping integration test: tmux not available')
+      return
+    }
+
+    // Use real tmux ops but on the throwaway socket.
+    // Wrap newSession to invoke the script via bash (more reliable than
+    // direct exec in containers) and to route all calls through our socket.
+    const realOps = makeAuthAddTmuxOps('tmux')
+    // Pre-start the tmux server so newSession doesn't race a cold start.
+    try {
+      execFileSync('tmux', ['-L', tmuxSocket, 'start-server'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch { /* already running is fine */ }
+
+    const patchedOps: AuthAddTmuxOps = {
+      newSession(_socket, session, env, _cmd) {
+        // Invoke via bash to avoid exec permission issues in containers.
+        return realOps.newSession(tmuxSocket, session, env, `bash ${fakeBinPath}`)
+      },
+      capture(_socket, session) {
+        return realOps.capture(tmuxSocket, session)
+      },
+      send(_socket, session, text) {
+        return realOps.send(tmuxSocket, session, text)
+      },
+      hasSession(_socket, session) {
+        return realOps.hasSession(tmuxSocket, session)
+      },
+      killSession(_socket, session) {
+        return realOps.killSession(tmuxSocket, session)
+      },
+    }
+
+    process.env.SWITCHROOM_TMUX_SUPERVISOR = '1'
+    const result = await startAccountAuthSession('integ-test', {
+      home: integWorkspace,
+      tmuxOps: patchedOps,
+      claudeBinary: fakeBinPath,
+      urlTimeoutMs: 10_000,
+    })
+
+    expect(result.loginUrl).toMatch(/^https:\/\/claude\.com\/cai\/oauth\/authorize\?/)
+    expect(result.scratchDir).toContain('.in-progress')
+    expect(existsSync(result.scratchDir)).toBe(true)
+
+    // Now submit the code
+    const flow: PendingAuthAddFlow = {
+      label: 'integ-test',
+      scratchDir: result.scratchDir,
+      tmuxSocket: result.tmuxSocket,
+      tmuxSession: result.tmuxSession,
+      startedAt: Date.now(),
+    }
+
+    // Use the patched ops for submit too
+    const creds = await submitAccountAuthCode(flow, 'test-browser-code-123', {
+      pollIntervalMs: 100,
+      pollTimeoutMs: 10_000,
+      tmuxOps: patchedOps,
+    })
+
+    expect(creds.claudeAiOauth.accessToken).toMatch(/^sk-ant-oat\d+-/)
+    expect(creds.claudeAiOauth.subscriptionType).toBe('max')
+    expect(creds.claudeAiOauth.scopes).toContain('user:inference')
+    cleanScratchDir(result.scratchDir)
+  }, 30_000)
+})
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+
+function randomHex(): string {
+  return Math.random().toString(16).slice(2, 10)
+}
