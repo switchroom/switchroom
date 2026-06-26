@@ -161,23 +161,30 @@ export function midTurnFloorEnabled(): boolean {
 }
 
 /**
- * PR1 Item-3a — parse the DORMANT post-answer liveness window
- * (`SWITCHROOM_POST_ANSWER_LIVENESS_MS`). This is the escape-hatch plumbing for a
- * future per-agent "still tidying…" liveness line on POST-answer work; see the
- * Item-3 decision in `docs/message-emission-determinism.md` §10 R2. Today
- * post-answer work is silent by design (lever 1 refuses any card OPEN once a
- * substantive final landed), and this knob ships DORMANT:
+ * Parse the post-answer liveness window (`SWITCHROOM_POST_ANSWER_LIVENESS_MS`).
  *
- *   - UNSET, empty, non-numeric, 0, or negative ⇒ **0** = today's behaviour
- *     (no post-answer surface; the guarded branch in `feedHeartbeatTick` is dead).
- *   - a positive integer ⇒ the threshold (ms of post-answer silence) at which a
- *     future Item-3 surface WOULD fire. No surface ships enabled in this PR.
+ * This is the threshold (in ms) after the substantive final answer at which
+ * `feedHeartbeatTick` will surface a post-answer background-activity card when
+ * genuine new sub-agent/tool activity is detected (i.e. `lastToolLabelAt` has
+ * advanced past the answer-delivery timestamp). This restores the #2547
+ * visibility outcome under the #2564 determinism gate.
  *
- * Extracted as a pure function so the default-off contract is unit-testable
+ *   - UNSET or empty ⇒ **6 000 ms** (default on, matching the
+ *     `FEED_HEARTBEAT_MIN_STALE_MS` cadence constant in gateway.ts — after one
+ *     heartbeat interval of post-answer real-tool activity the card surfaces).
+ *   - a positive integer ⇒ that threshold in ms (operator override).
+ *   - 0 or negative ⇒ **0** = silent post-answer behaviour (opt-out).
+ *   - non-numeric or "0" ⇒ treated as 0 (silent).
+ *
+ * Extracted as a pure function so the contract is unit-testable
  * (gateway.ts is not importable in isolation — top-level side effects). Mirrors
  * `parseVisibleAnswerStreamEnabled`'s pattern.
  */
+export const POST_ANSWER_LIVENESS_DEFAULT_MS = 6_000
+
 export function parsePostAnswerLivenessMs(raw: string | undefined): number {
-  const n = raw ? Number(raw) : NaN
-  return Number.isFinite(n) && n > 0 ? n : 0
+  if (raw == null || raw === '') return POST_ANSWER_LIVENESS_DEFAULT_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return n
 }

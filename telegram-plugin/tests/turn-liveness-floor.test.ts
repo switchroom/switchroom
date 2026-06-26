@@ -20,6 +20,7 @@ import {
   decideTerminalReason,
   midTurnFloorEnabled,
   parsePostAnswerLivenessMs,
+  POST_ANSWER_LIVENESS_DEFAULT_MS,
   DEFAULT_FLOOR_THRESHOLD_MS,
   type MidTurnFloorInput,
 } from '../turn-liveness-floor.js'
@@ -170,26 +171,31 @@ describe('midTurnFloorEnabled — default-on kill switch', () => {
   })
 })
 
-describe('parsePostAnswerLivenessMs — PR1 Item-3a DORMANT escape hatch (default OFF)', () => {
-  // The load-bearing contract: UNSET ⇒ 0 ⇒ behaviour byte-identical to today
-  // (the guarded post-answer branch in feedHeartbeatTick is dead). No surface
-  // ships enabled in this PR; this only pins that nothing changes by default.
-  it('UNSET (undefined) ⇒ 0 — exactly today’s silent post-answer behaviour', () => {
-    expect(parsePostAnswerLivenessMs(undefined)).toBe(0)
+describe('parsePostAnswerLivenessMs — post-answer liveness threshold (default ON, 6000ms)', () => {
+  // The restored contract: UNSET ⇒ POST_ANSWER_LIVENESS_DEFAULT_MS (6 000 ms)
+  // so the post-answer branch in feedHeartbeatTick runs out of the box and
+  // genuine background sub-agent activity surfaces as a card below the reply
+  // (restores #2547 visibility under #2564 determinism gate). Operators who
+  // prefer silent post-answer behaviour set =0.
+  it('UNSET (undefined) ⇒ default 6 000 ms — post-answer activity card enabled by default', () => {
+    expect(parsePostAnswerLivenessMs(undefined)).toBe(POST_ANSWER_LIVENESS_DEFAULT_MS)
   })
 
-  it('empty / whitespace / non-numeric ⇒ 0 (dormant)', () => {
-    expect(parsePostAnswerLivenessMs('')).toBe(0)
+  it('empty ⇒ default 6 000 ms (same as unset)', () => {
+    expect(parsePostAnswerLivenessMs('')).toBe(POST_ANSWER_LIVENESS_DEFAULT_MS)
+  })
+
+  it('non-numeric ⇒ 0 (invalid value treated as opt-out)', () => {
     expect(parsePostAnswerLivenessMs('   ')).toBe(0)
     expect(parsePostAnswerLivenessMs('nope')).toBe(0)
   })
 
-  it('0 and negative ⇒ 0 (dormant — never enables a post-answer surface)', () => {
+  it('0 and negative ⇒ 0 (explicit operator opt-out — silent post-answer)', () => {
     expect(parsePostAnswerLivenessMs('0')).toBe(0)
     expect(parsePostAnswerLivenessMs('-5000')).toBe(0)
   })
 
-  it('a positive integer ⇒ that threshold in ms (the opt-in future surface)', () => {
+  it('a positive integer ⇒ that threshold in ms (operator override)', () => {
     expect(parsePostAnswerLivenessMs('8000')).toBe(8000)
     expect(parsePostAnswerLivenessMs('45000')).toBe(45000)
   })

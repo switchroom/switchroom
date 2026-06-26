@@ -107,6 +107,95 @@ describe('mayOpenActivityCard — lever 1 (no OPEN after a substantive final)', 
   })
 })
 
+describe('mayOpenActivityCard — post-answer real activity exception (restore #2547 visibility)', () => {
+  // Lever 1 blocks all OPENs after finalAnswerEverDelivered by default.
+  // The postAnswerRealActivity + producer='tool' exception lifts it for genuine
+  // new background sub-agent/tool work AFTER the answer, while keeping idle
+  // liveness (producer 'liveness' or no real activity) suppressed.
+
+  it('post-answer REAL sub-agent activity DOES open a card (producer tool + postAnswerRealActivity)', () => {
+    // This is the restored #2547 case: a sub-agent keeps doing tool work AFTER
+    // the substantive answer. The feed should surface as a card below the reply.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 3,
+        postAnswerRealActivity: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('post-answer IDLE liveness does NOT open after a substantive final (idle-gap suppression preserved)', () => {
+    // The idle-gap invariant: a liveness timer firing post-answer (no new
+    // lastToolLabelAt advance) must still be suppressed. Only genuine tool
+    // activity gets the exception.
+    expect(
+      mayOpenActivityCard({
+        producer: 'liveness',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 0,
+        postAnswerRealActivity: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('postAnswerRealActivity without producer=tool does NOT lift lever 1 (not a real tool dispatch)', () => {
+    // Even if postAnswerRealActivity is set, only producer='tool' unlocks the
+    // exception. Liveness/narrative stays blocked after a final answer.
+    expect(
+      mayOpenActivityCard({
+        producer: 'liveness',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 1,
+        postAnswerRealActivity: true,
+      }),
+    ).toBe(false)
+    expect(
+      mayOpenActivityCard({
+        producer: 'narrative',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 2,
+        postAnswerRealActivity: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('without postAnswerRealActivity, tool producer is still blocked after final (original lever 1 preserved)', () => {
+    // Regression guard: postAnswerRealActivity omitted/false means lever 1
+    // still blocks a tool OPEN — no accidental leak of the exception.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 3,
+      }),
+    ).toBe(false)
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 3,
+        postAnswerRealActivity: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('cross-turn lever 4 still blocks post-answer real activity on synthetic surfaces (lever 4 wins)', () => {
+    // Lever 4 is checked FIRST — even a genuine post-answer tool OPEN is
+    // blocked on a cross-turn synthetic surface that already has an answer.
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 2,
+        crossTurnAnswerDelivered: true,
+        postAnswerRealActivity: true,
+      }),
+    ).toBe(false)
+  })
+})
+
 describe('mayOpenActivityCard — lever 4 (no OPEN below an EARLIER turn answer; race C/D)', () => {
   // The cross-turn case: a synthetic represent/owed-reply turn starts with a
   // CLEARED per-turn `finalAnswerEverDelivered` latch even though a substantive

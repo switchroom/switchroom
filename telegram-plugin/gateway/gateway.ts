@@ -2021,6 +2021,14 @@ type CurrentTurn = {
   // false ONLY at turn start, mirroring `activityEverOpened`'s sticky-true
   // contract.
   finalAnswerEverDelivered: boolean
+  // Wall-clock ms at which the sticky `finalAnswerEverDelivered` latch was
+  // set (i.e. when the substantive final answer was delivered). Used by the
+  // post-answer liveness branch of `feedHeartbeatTick` to detect GENUINE
+  // new sub-agent/tool activity after the answer: if `lastToolLabelAt` has
+  // advanced past this timestamp, real new work occurred post-answer and a
+  // liveness card should surface. null until `finalAnswerEverDelivered` is
+  // first set; never cleared (mirrors the sticky-latch semantics).
+  finalAnswerDeliveredAt: number | null
   // #1675 (over-ping safety net): wall-clock ms of the first reply
   // this turn that landed with `disable_notification: false` (a real
   // device ping). The conversational-pacing contract
@@ -8341,6 +8349,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const ea = emissionAuthorityFor(finalizeTurn)
       ea.markSubstantiveFinalDelivered(() => {
         finalizeTurn.finalAnswerEverDelivered = true
+        finalizeTurn.finalAnswerDeliveredAt ??= Date.now()
       })
       ea.finalizeCard(() => {
         clearActivitySummary(finalizeTurn)
@@ -8468,6 +8477,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             // Sticky ordering latch (lever 1): a substantive final closes the
             // card OPEN gate for the rest of the turn. NEVER cleared by reopen.
             if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+            if (turn.finalAnswerSubstantive) turn.finalAnswerDeliveredAt ??= Date.now()
             if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, replyRoutedOriginTurn)
           }
           outboundDedup.record(
@@ -8816,6 +8826,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // never cleared by reopen. The card OPEN gate keys on this, not the
       // mutable finalAnswerDelivered above (which reopen toggles).
       if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+      if (turn.finalAnswerSubstantive) turn.finalAnswerDeliveredAt ??= Date.now()
       // #1728: release the buffer gate + emit terminal 👍. Mid-turn
       // acks bypass this branch and remain non-events for the
       // reaction (preserves #1713). The full turn-state teardown
@@ -9068,6 +9079,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     const ea = emissionAuthorityFor(turn)
     ea.markSubstantiveFinalDelivered(() => {
       turn.finalAnswerEverDelivered = true
+      turn.finalAnswerDeliveredAt ??= Date.now()
     })
     ea.finalizeCard(() => {
       clearActivitySummary(turn)
@@ -9231,6 +9243,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     // Sticky ordering latch (lever 1): set once a SUBSTANTIVE final lands;
     // never cleared by reopen. The card OPEN gate keys on this sticky latch.
     if (turn.finalAnswerSubstantive) turn.finalAnswerEverDelivered = true
+    if (turn.finalAnswerSubstantive) turn.finalAnswerDeliveredAt ??= Date.now()
     if (turn.finalAnswerSubstantive) closeObligationOnSubstantiveReply(args, turn, streamRoutedOriginTurn)
     // #1744 follow-up — stream_reply edge case. The first-emit gate at
     // L5178 only clears silent-end state on the FIRST emit of a stream.
@@ -10786,6 +10799,8 @@ async function drainActivitySummary(
   // gate is unaffected. Narrative-SHOW and liveness callers pass their producer
   // explicitly.
   producer: FeedOpenProducer = 'tool',
+  // Additional OPEN-gate options for callers with exceptional context.
+  opts: { postAnswerRealActivity?: boolean } = {},
 ): Promise<void> {
   try {
     while (turn.activityPendingRender !== turn.activityLastSentRender) {
@@ -10833,6 +10848,7 @@ async function drainActivitySummary(
           finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
           labeledToolCount: turn.labeledToolCount,
           crossTurnAnswerDelivered,
+          postAnswerRealActivity: opts.postAnswerRealActivity,
         })
       ) {
         break
@@ -10911,23 +10927,47 @@ function feedHeartbeatTick(): void {
   const turn = currentTurn
   if (turn == null) return
   if (turn.finalAnswerDelivered) {
-    // PR1 Item-3a (DORMANT — DEAD by default). Post-answer work is silent today:
-    // once the answer landed the feed has handed off and we return here. When a
-    // future Item-3 decision opts an agent into a "still tidying…" post-answer
-    // liveness line, `SWITCHROOM_POST_ANSWER_LIVENESS_MS>0` is the escape hatch —
-    // it would, past that threshold of post-answer silence, fall through to emit
-    // a guarded liveness EDIT/line here instead of returning. UNSET/0 ⇒ this
-    // branch is never taken and behaviour is byte-identical to today. The actual
-    // surface is intentionally NOT built (no card OPEN, no message) — this is
-    // only the plumbing so enabling it later needs no redesign.
-    if (POST_ANSWER_LIVENESS_MS <= 0) return // default: silent post-answer (today)
-    // `lastToolLabelAt` (set each time a tool step renders) is the closest
-    // existing anchor for "how long has post-answer work been running"; absent
-    // any post-answer tool it stays at the pre-answer value, so the threshold is
-    // only crossed by genuine ongoing work. The Item-3 surface lands here once
-    // decided; until then we stay silent even when the flag is set.
-    const since = turn.lastToolLabelAt != null ? Date.now() - turn.lastToolLabelAt : 0
-    if (since < POST_ANSWER_LIVENESS_MS) return // not yet past the threshold
+    // Post-answer liveness: surface a card below the reply when genuine new
+    // sub-agent/tool activity is detected AFTER the substantive final answer
+    // (restores #2547 visibility under the #2564 determinism gate). "Genuine"
+    // means `lastToolLabelAt` has advanced past `finalAnswerDeliveredAt` —
+    // deterministic state-delta signal, NOT wall-clock age alone. Idle thinking-
+    // gaps after the answer continue to be suppressed (idle-gap invariant).
+    if (POST_ANSWER_LIVENESS_MS <= 0) return // operator opt-out (=0): silent post-answer
+    if (turn.sessionChatId == null) return
+    if (turn.finalAnswerDeliveredAt == null) return
+    if (turn.lastToolLabelAt == null) return
+    // Only surface when a tool label has rendered AFTER the answer (genuine new
+    // post-answer work). If `lastToolLabelAt` is still at or before the answer
+    // timestamp, no real work occurred post-answer — skip (idle suppression).
+    if (turn.lastToolLabelAt <= turn.finalAnswerDeliveredAt) return
+    // Require the post-answer label to have been stale for at least
+    // POST_ANSWER_LIVENESS_MS (same role as FEED_HEARTBEAT_MIN_STALE_MS for the
+    // labelled-feed heartbeat): a tool that just fired should not immediately
+    // open a card; we wait until the step has been running long enough to
+    // be worth surfacing.
+    const postAnswerElapsed = Date.now() - turn.lastToolLabelAt
+    if (postAnswerElapsed < POST_ANSWER_LIVENESS_MS) return
+    // Genuine post-answer real activity confirmed. Open or maintain a card with
+    // the current tool feed. Route as producer 'tool' so Lever 1's blanket
+    // post-final block is lifted by the postAnswerRealActivity exception.
+    const rendered = composeTurnActivity(turn, false, ` · ${formatFeedElapsed(postAnswerElapsed)}`)
+    if (rendered == null) return
+    turn.activityPendingRender = rendered
+    const ea = emissionAuthorityFor(turn)
+    // PR-4d: route through the centralized chatLock-serialized card-drain gate.
+    cardDrainGate(turn, ea, () => {
+    if (ea.mayDrain(turn)) {
+      // Producer 'tool': genuine post-answer sub-agent/tool work. The
+      // postAnswerRealActivity flag allows Lever 1 to be bypassed in the
+      // drain's feed-open-gate check so the card can OPEN below the reply.
+      // An EDIT of an already-open card (activityMessageId != null) is
+      // always allowed — this only matters for the OPEN case.
+      ea.openOrEditCard('tool', () => {
+        turn.activityInFlight = drainActivitySummary(turn, 'tool', { postAnswerRealActivity: true })
+      })
+    }
+    })
     return
   }
 
@@ -11152,6 +11192,8 @@ function handleSessionEvent(ev: SessionEvent): void {
           finalAnswerSubstantive: false,
           // Sticky latch — reset ONLY here (turn start), never by reopen.
           finalAnswerEverDelivered: false,
+          // Set alongside finalAnswerEverDelivered; null until latch fires.
+          finalAnswerDeliveredAt: null,
           firstPingAt: null,
           // Notification ownership (R8 / PR-2): no slot claimed yet, so the
           // "claimer was substantive" flag starts false. Set atomically with

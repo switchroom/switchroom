@@ -104,6 +104,14 @@ export interface FeedOpenInput {
    *  below the earlier reply). A normal foreground turn passes `false` (or omits
    *  it), so lever 4 is inert there. Defaults to `false`. */
   crossTurnAnswerDelivered?: boolean
+  /** Post-answer real activity exception (restore #2547 visibility under
+   *  determinism gate). When true AND `producer === 'tool'`, lever 1's blanket
+   *  OPEN-block is lifted: genuine new sub-agent/tool activity detected AFTER
+   *  the answer (via `lastToolLabelAt > finalAnswerDeliveredAt`) is allowed to
+   *  OPEN a card below the prior reply. Idle thinking-gaps (no new
+   *  `lastToolLabelAt` advance) never set this, so the suppression of
+   *  idle-liveness-after-final is preserved. Defaults to `false`. */
+  postAnswerRealActivity?: boolean
 }
 
 /**
@@ -116,6 +124,11 @@ export interface FeedOpenInput {
  *    no card may open below it (any producer). Checked FIRST.
  *  - finalAnswerEverDelivered → false: lever 1. A substantive final already
  *    landed THIS turn; no card may open below it (any producer).
+ *    EXCEPTION: when `postAnswerRealActivity` is true AND `producer === 'tool'`,
+ *    lever 1 is lifted — genuine new sub-agent/tool work detected after the
+ *    answer is allowed to OPEN a card below the prior reply (restores #2547
+ *    visibility). Idle liveness (`producer !== 'tool'` or no `lastToolLabelAt`
+ *    advance) still cannot open after a final — idle-gap suppression preserved.
  *  - producer 'narrative' && labeledToolCount === 0 → false: lever 5 base case.
  *    Narration alone on a 0-tool turn may not open a card (the triplication).
  *  - producer 'tool' → true (unless lever 1/4): a real tool dispatched → open.
@@ -129,7 +142,15 @@ export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   // synthetic surfaces by the caller so it can never fire on a foreground turn.
   if (input.crossTurnAnswerDelivered) return false
   // Lever 1 — sticky: nothing opens after a substantive final answer.
-  if (input.finalAnswerEverDelivered) return false
+  // EXCEPTION: genuine post-answer real tool activity (sub-agent/background
+  // work that actually dispatched a new tool AFTER the answer) may open a card
+  // below the reply — restoring #2547 visibility under the #2564 gate. The
+  // caller sets `postAnswerRealActivity` only when `lastToolLabelAt` has
+  // advanced past `finalAnswerDeliveredAt`, so idle thinking-gaps after the
+  // answer continue to be suppressed (idle-gap suppression preserved).
+  if (input.finalAnswerEverDelivered) {
+    if (!(input.postAnswerRealActivity === true && input.producer === 'tool')) return false
+  }
   // Lever 5 base case — narrative SHOW alone on a 0-tool turn may not OPEN.
   if (input.producer === 'narrative' && input.labeledToolCount === 0) return false
   return true
