@@ -32,9 +32,27 @@ const DEFAULT_TOKEN_URL =
   process.env.SWITCHROOM_OAUTH_TOKEN_URL ??
   "https://console.anthropic.com/v1/oauth/token";
 
-const DEFAULT_CLIENT_ID =
+/**
+ * The Claude Code OAuth client_id — the public client the subscription
+ * OAuth tokens switchroom serves are issued under. The refresh exchange MUST
+ * present the SAME client_id the token was minted with, or Anthropic's
+ * `/v1/oauth/token` rejects it: `400 invalid_request: Client with id <id> not
+ * found`.
+ *
+ * This is the client the `claude` CLI's own login / setup-token flow uses
+ * (visible in the `client_id=` of the OAuth URL it prints). The prior value
+ * (`9d1cd16e-…`) was wrong and had been since this primitive landed
+ * (#621 / #1254) — but the bug was LATENT: every historical switchroom account
+ * was a long-lived `setup-token` (`user:inference`, ~1y expiry) that never
+ * hits the refresh path, so the dead code was never exercised. The first full
+ * Claude-Code session token (broad scopes, ~8h expiry) added to the broker
+ * surfaced it: the refresh 400'd every ~8h and the account silently expired.
+ * Empirically verified — refresh succeeds with this id. Public identifier (not
+ * a secret); override via `SWITCHROOM_OAUTH_CLIENT_ID`.
+ */
+export const DEFAULT_CLIENT_ID =
   process.env.SWITCHROOM_OAUTH_CLIENT_ID ??
-  "9d1cd16e-bcb9-40c9-a915-196412f27aa6";
+  "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 interface AnthropicRefreshResponse {
   access_token?: string;
