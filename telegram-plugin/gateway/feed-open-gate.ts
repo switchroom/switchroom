@@ -24,18 +24,32 @@
  * (non-substantive) does NOT trip it and the #2141 ack-then-work feed still
  * opens.
  *
- * ## Lever 5 base case — narrative-SHOW alone must not OPEN (§9 lever 5, G1)
+ * ## Lever 5 — narrative-SHOW OPEN on 0-tool turns (#2545 / #2557 / #2587)
  *
- * The triplication: a 0-tool conversational turn opened a full card from
- * narration text alone. Rule: the narrative-SHOW producer (A) may only EDIT an
- * already-open card, never OPEN one. Only a tool label (producer B) or the
- * liveness timer (producer C, a genuine ≥12s thinking-gap) may OPEN a card.
+ * ### Pre-answer: OPEN is allowed (restores #2545)
  *
- * So a narrative-SHOW-triggered OPEN is refused while the turn has surfaced ZERO
- * tool labels (`labeledToolCount === 0`). Once a tool label arrives
- * (`labeledToolCount > 0`) the card opens and the accumulated narration renders;
- * a turn that starts conversational then dispatches a tool DOES open (R4). The
- * liveness path (producer C) is exempt — it owns the genuine thinking-gap open.
+ * When `finalAnswerEverDelivered === false`, a narrative producer on a 0-tool
+ * conversational turn MAY open a card. Reply-is-last ordering is preserved by
+ * Lever 2 (`clearActivitySummary` in `executeReply`) — that path edits the card
+ * in-place BEFORE the reply chunks send, so the card keeps its lower message_id
+ * and the reply (higher message_id) is structurally last on screen regardless of
+ * whether there were tool labels. The "triplication" bug from #2557 was G1+G2+G3
+ * (prose leaking as a feed step + second card on the Stop-hook re-prompt), which
+ * was already a separate G2/G3 problem — not a G1 open problem. Lever 5 over-
+ * suppressed: it blocked a legitimate conversational narrative card to avoid a
+ * reorder that Lever 2 already prevents.
+ *
+ * ### Post-answer: OPEN is already blocked by Lever 1
+ *
+ * When `finalAnswerEverDelivered === true`, Lever 1 blocks all OPENs (any
+ * producer) regardless of Lever 5 — so the post-answer case is unaffected.
+ *
+ * ### Tool-turn accumulated narration: unchanged (R4 preserved)
+ *
+ * A turn that starts conversational then dispatches a tool already allowed OPEN
+ * via `labeledToolCount > 0` (R4); that path is unaffected by this change.
+ * The liveness path (producer C, genuine ≥12s thinking-gap) was never gated by
+ * Lever 5 and remains unchanged.
  *
  * ## Lever 4 — no card OPEN below an EARLIER turn's answer (§9 lever 4, race C/D)
  *
@@ -75,7 +89,8 @@
 /** Which producer triggered this drain — determines lever-5 OPEN eligibility. */
 export type FeedOpenProducer =
   /** Narrative SHOW (producer A): plain assistant text, no tool, no time
-   *  threshold. May only EDIT, never OPEN, while the turn has 0 tool labels. */
+   *  threshold. May OPEN before the final answer (Lever 5 pre-answer); may only
+   *  EDIT after the final answer (Lever 1 blocks). */
   | 'narrative'
   /** Tool label (producer B): the model dispatched a tool. OPEN-eligible unless a
    *  substantive final already landed (lever 1).
@@ -129,8 +144,13 @@ export interface FeedOpenInput {
  *    answer is allowed to OPEN a card below the prior reply (restores #2547
  *    visibility). Idle liveness (`producer !== 'tool'` or no `lastToolLabelAt`
  *    advance) still cannot open after a final — idle-gap suppression preserved.
- *  - producer 'narrative' && labeledToolCount === 0 → false: lever 5 base case.
- *    Narration alone on a 0-tool turn may not open a card (the triplication).
+ *  - producer 'narrative' && labeledToolCount === 0 && finalAnswerEverDelivered:
+ *    lever 5 post-answer guard. When the answer has already landed, this case
+ *    is already blocked by lever 1 above — lever 5 is thus inert post-answer.
+ *    Pre-answer (finalAnswerEverDelivered === false): narrative MAY OPEN a card
+ *    on a 0-tool conversational turn — the reply-is-last ordering is preserved
+ *    by Lever 2 (clearActivitySummary edits the card in-place BEFORE the reply
+ *    sends; see gateway.ts §9 lever 2). This restores #2545 visibility.
  *  - producer 'tool' → true (unless lever 1/4): a real tool dispatched → open.
  *  - producer 'liveness' → true (unless lever 1/4): the genuine thinking-gap open
  *    (producer C) is untouched by lever 5.
@@ -151,8 +171,15 @@ export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   if (input.finalAnswerEverDelivered) {
     if (!(input.postAnswerRealActivity === true && input.producer === 'tool')) return false
   }
-  // Lever 5 base case — narrative SHOW alone on a 0-tool turn may not OPEN.
-  if (input.producer === 'narrative' && input.labeledToolCount === 0) return false
+  // Lever 5 — narrative-SHOW pre-answer open (restores #2545, revisits #2557):
+  // When finalAnswerEverDelivered is false (answer not yet delivered), a
+  // narrative producer on a 0-tool conversational turn MAY open a card. Lever 2
+  // (clearActivitySummary in executeReply) edits the card in-place BEFORE the
+  // reply sends, preserving reply-is-last ordering without this gate needing to
+  // suppress the open. When finalAnswerEverDelivered is true, Lever 1 above
+  // already blocked the open — so Lever 5 is only reached pre-answer, where it
+  // must now allow the open.
+  // No suppression needed here: return true for all remaining cases.
   return true
 }
 

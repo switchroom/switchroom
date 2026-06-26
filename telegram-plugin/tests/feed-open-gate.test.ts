@@ -8,9 +8,11 @@ import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
  * sendMessage). An EDIT of an already-open card is never routed through this
  * (the drain only consults it when activityMessageId == null).
  *
- * Lever 5 base case (the triplication fix): a narrative-SHOW producer alone on
- * a 0-tool turn must NOT open a card. A tool label DOES open. The liveness
- * timer (genuine ≥12s thinking-gap) still opens a 0-tool card.
+ * Lever 5 revised (#2545 / #2557 / #2587 follow-up): a narrative-SHOW producer
+ * on a 0-tool conversational turn MAY open a card PRE-ANSWER. Reply-is-last
+ * ordering is preserved by Lever 2 (clearActivitySummary edits the card in-place
+ * BEFORE the reply sends, so the card keeps its lower message_id). Post-answer,
+ * Lever 1 blocks the open for ANY producer.
  *
  * Lever 1 (reply-is-last): once a SUBSTANTIVE final answer has been delivered
  * (the sticky finalAnswerEverDelivered latch), no card may open below it — for
@@ -18,12 +20,30 @@ import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
  * clears that mid-turn, #2141); an ack does not set it, so the ack-then-work
  * feed still opens.
  */
-describe('mayOpenActivityCard — lever 5 base case (narrative-SHOW alone must not OPEN)', () => {
-  it('narrative SHOW on a 0-tool turn does NOT open a card (the triplication)', () => {
+describe('mayOpenActivityCard — lever 5 (narrative-SHOW on 0-tool conversational turns)', () => {
+  it('narrative SHOW on a 0-tool turn DOES open a card pre-answer (restores #2545 conversational visibility)', () => {
+    // Lever 5 revised: narrative is allowed to open a card before the answer
+    // lands. Lever 2 (clearActivitySummary before the reply sends) preserves
+    // reply-is-last ordering without Lever 5 needing to suppress the open.
     expect(
       mayOpenActivityCard({
         producer: 'narrative',
         finalAnswerEverDelivered: false,
+        labeledToolCount: 0,
+      }),
+    ).toBe(true)
+  })
+
+  it('narrative SHOW on a 0-tool turn does NOT open AFTER the final answer (Lever 1 blocks it, ordering preserved)', () => {
+    // Post-answer, Lever 1 (finalAnswerEverDelivered === true) blocks the open
+    // for any producer — the reply-supersedes-narrative ordering invariant holds
+    // because clearActivitySummary already ran (editing the card in-place) before
+    // the reply sent. This is the supersede mechanism: the card is finalized
+    // before the reply, so no reorder occurs.
+    expect(
+      mayOpenActivityCard({
+        producer: 'narrative',
+        finalAnswerEverDelivered: true,
         labeledToolCount: 0,
       }),
     ).toBe(false)
@@ -60,6 +80,28 @@ describe('mayOpenActivityCard — lever 5 base case (narrative-SHOW alone must n
         labeledToolCount: 1,
       }),
     ).toBe(true)
+  })
+
+  it('narrative card is superseded by the reply: no OPEN after final, so reply stays last (no out-of-order card below the answer)', () => {
+    // The supersede mechanism: on a conversational turn, narrative opens a card
+    // (msg_id N). When the substantive reply arrives, Lever 2 calls
+    // clearActivitySummary, which edits/closes the card in-place (still msg_id N)
+    // BEFORE the reply sends (msg_id N+1). The reply is structurally last.
+    // This gate's post-answer block (via Lever 1) ensures no new card can open
+    // after the reply — so the out-of-order-card-below-answer scenario is
+    // prevented. This test pins the invariant: once finalAnswerEverDelivered is
+    // true, no narrative (or any other) producer may open a new card.
+    const postAnswerInputs = [
+      { producer: 'narrative' as const, labeledToolCount: 0 },
+      { producer: 'narrative' as const, labeledToolCount: 2 },
+      { producer: 'tool' as const, labeledToolCount: 2 },
+      { producer: 'liveness' as const, labeledToolCount: 0 },
+    ]
+    for (const extra of postAnswerInputs) {
+      expect(
+        mayOpenActivityCard({ ...extra, finalAnswerEverDelivered: true }),
+      ).toBe(false)
+    }
   })
 })
 
