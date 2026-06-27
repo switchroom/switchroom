@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.16.4 — LiteLLM gateway routing + channels durable fix + Claude Code 2.1.195
+
+### LiteLLM subscription-native gateway routing (opt-in) (#2597)
+
+Operators can now route all agent traffic through a self-hosted LiteLLM proxy
+for usage tracking and content-safety guardrails, while keeping the Max
+subscription as the funding source (OAuth forwarded unchanged — never an API
+key). Default OFF; enable per-agent or fleet-wide via `litellm.enabled: true`
+in `switchroom.yaml`.
+
+- `switchroom apply` provisions a per-agent virtual key (vault
+  `litellm/<agent>/api-key`), tagged `agent:<name>` in LiteLLM for clean cost
+  attribution. Admin key stored at `vault:litellm/master-key`.
+- **Fail-open**: if the virtual key is missing or the proxy is unreachable at
+  boot, start.sh strips the routing env and falls back to direct OAuth —
+  availability is never sacrificed to the proxy.
+- Per-agent attribution via `x-litellm-customer-id` + `x-litellm-tags` (static
+  headers, one per agent process). Per-session granularity is a future Ship C
+  (log⨝ledger correlation) — `claude` CLI sends no session id on the wire.
+- Non-Anthropic models routed through the same proxy (OpenRouter etc.) are a
+  separate, clearly-labelled off-subscription path.
+- New invariant carve-out in `reference/invariants.md` + mirror in `vision.md`
+  pillar 3 and `CLAUDE.md`: a metering+safety proxy is allowed iff OAuth
+  forwarded unchanged, no API/SDK call, content-safety guardrails only,
+  opt-in, fails open.
+
+### Durable channels fix: bake `channelsEnabled` managed-settings into image (#2598)
+
+Claude Code ≥ 2.1.185 blocks `--dangerously-load-development-channels` (the
+flag `start.sh` uses to load the telegram plugin) unless `channelsEnabled:
+true` appears in endpoint-managed settings. Without this fix, pulling any
+newer image would silently strand all agents.
+
+Bakes `/etc/claude-code/managed-settings.json` (`{"channelsEnabled":true}`)
+into the base image so all agent images inherit it — survives version bumps
+without per-agent intervention.
+
+### Claude Code pin bump: 2.1.185 → 2.1.195 (#2598)
+
+Bumps the pinned Claude Code version in `docker/Dockerfile.base` and
+`docker/Dockerfile.hindsight` (kept in lockstep). Latest release.
+
+---
+
 ## v0.16.3 — fix OAuth token refresh (correct Claude Code client_id)
 
 The auth-broker presented the wrong OAuth `client_id` (`9d1cd16e-…`) on the
