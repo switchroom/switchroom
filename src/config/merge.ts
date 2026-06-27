@@ -453,6 +453,38 @@ export function mergeAgentConfig(
     };
   }
 
+  // --- litellm: one-level deep merge, agent wins; tags per-key merge ---
+  //
+  // Mirrors the memory.recall deep-merge (above): scalar fields (enabled,
+  // base_url, admin_key, team, small_fast_model) take the override's value
+  // when set, otherwise inherit the base. The `tags` sub-object is merged
+  // per-key so an agent can add one tag without dropping the fleet defaults.
+  // Guarded so an absent block on both layers leaves merged.litellm
+  // undefined (zero behavioural change when the feature is off).
+  if (defaults.litellm || merged.litellm) {
+    const base = (defaults.litellm ?? {}) as Record<string, unknown>;
+    const override = (merged.litellm ?? {}) as Record<string, unknown>;
+    const combined: Record<string, unknown> = { ...base };
+    for (const [k, v] of Object.entries(override)) {
+      if (v === undefined) continue;
+      if (
+        k === "tags" &&
+        base.tags &&
+        typeof v === "object" &&
+        v !== null &&
+        !Array.isArray(v)
+      ) {
+        combined.tags = {
+          ...(base.tags as Record<string, unknown>),
+          ...(v as Record<string, unknown>),
+        };
+      } else {
+        combined[k] = v;
+      }
+    }
+    merged.litellm = combined as AgentConfig["litellm"];
+  }
+
   // --- subagents: per-key merge, with field-level merge on conflict ---
   //
   // When the same sub-agent name (e.g. "worker") appears in both layers,

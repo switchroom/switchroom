@@ -1349,6 +1349,82 @@ export const GoogleWorkspaceConfigSchema = z
 export const DriveConfigSchema = GoogleWorkspaceConfigSchema;
 
 /**
+ * LiteLLM routing block — opt-in per-agent virtual-key auto-provisioning.
+ *
+ * When `enabled: true` on an agent (or fleet-wide via the top-level block),
+ * `switchroom apply` provisions a per-agent LiteLLM virtual key inside a
+ * "switchroom" LiteLLM team, stores it in the vault at
+ * `litellm/<agent>/api-key`, grants the agent read-ACL (adds the key to the
+ * agent's standing `secrets[]`), and the agent container is injected with
+ * LiteLLM routing env (`ANTHROPIC_BASE_URL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+ * `SWITCHROOM_LITELLM`). start.sh then exports the key as an
+ * `ANTHROPIC_CUSTOM_HEADERS` Bearer so the unmodified `claude` CLI routes
+ * non-Anthropic models through the LiteLLM proxy. The broker OAuth path for
+ * Anthropic itself is untouched — subscription-funded Anthropic, proxy for
+ * other models.
+ *
+ * Every field is optional. Default OFF (the block's absence or `enabled`
+ * falsey = zero behavioural change). The same shape appears at three
+ * cascade levels — defaults/profiles, per-agent, and top-level (global
+ * infra: base_url/admin_key/team/small_fast_model + fleet default
+ * `enabled`).
+ */
+export const LiteLLMConfigSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        "Opt-in toggle. When true, `switchroom apply` provisions a per-agent " +
+        "LiteLLM virtual key and injects routing env into the container. " +
+        "Default OFF.",
+      ),
+    base_url: z
+      .string()
+      .optional()
+      .describe(
+        "LiteLLM proxy base URL the agent's claude CLI routes through, e.g. " +
+        "'http://127.0.0.1:4010'. Agents use network_mode:host, so loopback " +
+        "reaches a host-bound proxy. Exported as ANTHROPIC_BASE_URL.",
+      ),
+    admin_key: z
+      .string()
+      .optional()
+      .describe(
+        "LiteLLM master/admin key used at apply time to provision the team + " +
+        "virtual key. Supports a vault reference (e.g. " +
+        "'vault:litellm/master-key') — resolution happens at apply time via " +
+        "the vault-broker. Never injected into the agent container.",
+      ),
+    team: z
+      .string()
+      .optional()
+      .describe(
+        "LiteLLM team alias the per-agent key is created under. Defaults to " +
+        "'switchroom' (applied in code, not as a schema default).",
+      ),
+    small_fast_model: z
+      .string()
+      .optional()
+      .describe(
+        "Model id exported as ANTHROPIC_SMALL_FAST_MODEL for the claude CLI's " +
+        "background/fast lane, e.g. 'claude-haiku-4-5-20251001'.",
+      ),
+    tags: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        "Extra key/value metadata tags attached to the provisioned LiteLLM " +
+        "virtual key. Merged per-key across cascade layers (agent wins).",
+      ),
+  })
+  .optional()
+  .describe(
+    "LiteLLM routing config — opt-in per-agent virtual-key auto-provisioning " +
+    "+ routing env. Default OFF. See LiteLLMConfigSchema doc for the full flow.",
+  );
+
+/**
  * Top-level microsoft_workspace config block — RFC #1873 (Microsoft 365
  * integration). Centralizes Microsoft OAuth client credentials and the
  * org-mode opt-in.
@@ -1946,6 +2022,7 @@ const profileFields = {
   mcp_servers: z.record(z.string(), z.unknown()).optional(),
   hooks: AgentHooksSchema,
   env: z.record(z.string(), z.string()).optional(),
+  litellm: LiteLLMConfigSchema,
   system_prompt_append: z.string().optional(),
   skills: z.array(z.string()).optional(),
   bundled_skills: z
@@ -2326,6 +2403,13 @@ export const AgentSchema = z.object({
     .record(z.string(), z.string())
     .optional()
     .describe("Environment variables exported in start.sh before claude runs"),
+  litellm: LiteLLMConfigSchema.describe(
+    "Per-agent LiteLLM routing override. Presence with `enabled: true` opts " +
+    "this agent IN to per-agent virtual-key auto-provisioning + routing env " +
+    "(falls back to the top-level `litellm:` block for base_url/admin_key/" +
+    "team/small_fast_model). Deep-merges one level over defaults/profile; " +
+    "`tags` merge per-key, agent wins. Default OFF.",
+  ),
   system_prompt_append: z
     .string()
     .optional()
@@ -3195,6 +3279,13 @@ export const SwitchroomConfigSchema = z.object({
     "| `extended` | `complete`, default `core`). Mutually exclusive with " +
     "`drive:` at the top level (loader fails fast if both are set).",
   ),
+  litellm: LiteLLMConfigSchema.describe(
+    "Top-level LiteLLM routing infra — global base_url, admin_key (the " +
+    "LiteLLM master key, supports a `vault:` ref), team alias, and " +
+    "small_fast_model shared by every agent that opts in. Set `enabled: " +
+    "true` here to default the whole fleet on (each agent can still set " +
+    "`litellm.enabled: false` to opt out). Default OFF.",
+  ),
   microsoft_workspace: MicrosoftWorkspaceConfigSchema.describe(
     "RFC #1873 (Microsoft 365 integration). Top-level Microsoft Workspace " +
     "configuration — OAuth client credentials (Entra app), authority " +
@@ -3390,6 +3481,7 @@ export type TelegramConfig = z.infer<typeof TelegramConfigSchema>;
 export type MemoryBackendConfig = z.infer<typeof MemoryBackendConfigSchema>;
 export type VaultConfig = z.infer<typeof VaultConfigSchema>;
 export type DriveConfig = z.infer<typeof DriveConfigSchema>;
+export type LiteLLMConfig = z.infer<typeof LiteLLMConfigSchema>;
 export type AgentDriveConfig = z.infer<typeof AgentDriveConfigSchema>;
 export type VaultBrokerConfig = z.infer<typeof VaultConfigSchema>["broker"];
 export type QuotaConfig = z.infer<typeof QuotaConfigSchema>;

@@ -45,7 +45,8 @@ const EMBEDDED_EXAMPLES: Record<string, string> = {
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { isVaultReference } from "../vault/resolver.js";
+import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
+import { resolveAgentConfig } from "../config/merge.js";
 import {
   migrateVaultLayout,
   inspectVaultLayout,
@@ -181,6 +182,221 @@ export interface ApplyResult {
 export interface ScaffoldFailure {
   agent: string;
   message: string;
+}
+
+/**
+ * Resolve the effective `litellm.enabled` for an agent: per-agent cascaded
+ * value wins, then the top-level fleet default, else false. Mirrors the
+ * resolution baked into `compose.ts` so apply-time provisioning and
+ * container-env injection agree on which agents are "on".
+ */
+function effectiveLiteLLMEnabled(
+  config: SwitchroomConfig,
+  agentResolvedLitellm: { enabled?: boolean } | undefined,
+): boolean {
+  return (
+    agentResolvedLitellm?.enabled ??
+    (config as { litellm?: { enabled?: boolean } }).litellm?.enabled ??
+    false
+  );
+}
+
+/**
+ * LiteLLM per-agent virtual-key provisioning (opt-in). Extracted from
+ * `runApply` so the gate + error handling stay readable. Best-effort: each
+ * agent's failure is pushed to `failures` and the loop continues. Pure
+ * no-op for agents that aren't opted in.
+ *
+ * Idempotency lives here, not in the provision module: we read the vault
+ * (via the auto-unlocked broker) for an existing `litellm/<agent>/api-key`
+ * and skip provisioning when present.
+ */
+async function provisionLiteLLMKeys(
+  config: SwitchroomConfig,
+  agentNames: string[],
+  switchroomConfigPath: string | undefined,
+  ctx: {
+    writeOut: (s: string) => void;
+    writeErr: (s: string) => void;
+    failures: ScaffoldFailure[];
+  },
+): Promise<void> {
+  const { writeOut, failures } = ctx;
+
+  // Resolve which agents are opted in before importing anything heavy.
+  const optedIn: { name: string; litellm: NonNullable<ReturnType<typeof resolveAgentConfig>["litellm"]> }[] = [];
+  for (const name of agentNames) {
+    const agentConfig = config.agents[name];
+    if (!agentConfig) continue;
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    if (effectiveLiteLLMEnabled(config, resolved.litellm)) {
+      optedIn.push({ name, litellm: resolved.litellm ?? {} });
+    }
+  }
+  if (optedIn.length === 0) return; // zero-impact when the feature is off
+
+  // Lazy imports — only paid for when at least one agent opts in.
+  const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey }, { addAgentSecret }] =
+    await Promise.all([
+      import("../vault/broker/client.js"),
+      import("../litellm/provision.js"),
+      import("./telegram-yaml.js"),
+    ]);
+
+  const topLevel = (config as { litellm?: {
+    base_url?: string;
+    admin_key?: string;
+    team?: string;
+    small_fast_model?: string;
+  } }).litellm;
+
+  // The fleet's active OAuth account (auth-broker single-active model) — used
+  // as the `oauth_account` metadata tag. Best-effort; omitted if unset.
+  const oauthAccount = config.auth?.active;
+
+  // Track config-write-back: we batch all secrets[] grants into a single
+  // read-modify-write of the host config so we don't thrash the file.
+  let pendingConfigEdits = false;
+  let configText: string | null = null;
+  if (switchroomConfigPath && existsSync(switchroomConfigPath)) {
+    try {
+      configText = readFileSync(switchroomConfigPath, "utf-8");
+    } catch (err) {
+      ctx.writeErr(
+        chalk.yellow(
+          `  ! litellm: could not read config for ACL grants (${(err as Error).message}); ` +
+          `keys will be provisioned but agents may lack read-ACL.\n`,
+        ),
+      );
+    }
+  }
+
+  for (const { name, litellm } of optedIn) {
+    try {
+      const baseUrl = litellm.base_url ?? topLevel?.base_url;
+      const team = litellm.team ?? topLevel?.team ?? "switchroom";
+      const adminKeyRef = litellm.admin_key ?? topLevel?.admin_key;
+      if (!baseUrl || !adminKeyRef) {
+        failures.push({
+          agent: name,
+          message:
+            `litellm.enabled but base_url or admin_key is unresolved ` +
+            `(base_url=${baseUrl ? "set" : "MISSING"}, admin_key=${adminKeyRef ? "set" : "MISSING"}). ` +
+            `Set them on the top-level litellm: block or per-agent.`,
+        });
+        continue;
+      }
+
+      const vaultKey = `litellm/${name}/api-key`;
+
+      // Idempotency: skip if the vault already holds the key.
+      const existing = await getViaBrokerStructured(vaultKey);
+      if (existing.kind === "ok") {
+        writeOut(chalk.gray(`  ~ litellm/${name}: key already provisioned (skipped)\n`));
+        // Still ensure the read-ACL is granted (cheap, idempotent).
+        if (configText !== null) {
+          const after = addAgentSecret(configText, name, vaultKey);
+          if (after !== configText) {
+            configText = after;
+            pendingConfigEdits = true;
+          }
+        }
+        continue;
+      }
+      if (existing.kind === "unreachable") {
+        failures.push({
+          agent: name,
+          message: `litellm: vault-broker unreachable (${existing.msg ?? "no detail"}); cannot provision key.`,
+        });
+        continue;
+      }
+
+      // Resolve a `vault:` admin_key via the auto-unlocked broker.
+      let masterKey = adminKeyRef;
+      if (isVaultReference(adminKeyRef)) {
+        const refKey = parseVaultReference(adminKeyRef);
+        const resolved = await getViaBrokerStructured(refKey);
+        if (resolved.kind !== "ok") {
+          failures.push({
+            agent: name,
+            message:
+              `litellm: admin_key vault ref '${adminKeyRef}' did not resolve ` +
+              `(${resolved.kind}${"msg" in resolved && resolved.msg ? `: ${resolved.msg}` : ""}).`,
+          });
+          continue;
+        }
+        if (resolved.entry.kind !== "string") {
+          failures.push({
+            agent: name,
+            message: `litellm: admin_key vault ref '${adminKeyRef}' is not a string secret.`,
+          });
+          continue;
+        }
+        masterKey = resolved.entry.value;
+      }
+
+      // Provision: ensure team, then generate the per-agent key.
+      await ensureTeam(baseUrl, masterKey, team);
+      const metadata: Record<string, string> = {
+        agent: name,
+        env: "fleet",
+      };
+      if (oauthAccount) metadata.oauth_account = oauthAccount;
+      const profile = config.agents[name]?.extends;
+      if (profile) metadata.profile = profile;
+      for (const [k, v] of Object.entries(litellm.tags ?? {})) {
+        metadata[k] = v;
+      }
+
+      const { key } = await ensureKey({
+        baseUrl,
+        masterKey,
+        alias: `agent:${name}`,
+        team,
+        metadata,
+      });
+
+      // Store the key in the vault via the auto-unlocked broker (operator
+      // peercred = full write access; new key introduction allowed).
+      const put = await putViaBroker(vaultKey, { kind: "string", value: key });
+      if (put.kind !== "ok") {
+        failures.push({
+          agent: name,
+          message:
+            `litellm: provisioned key but vault write failed ` +
+            `(${put.kind}${"msg" in put && put.msg ? `: ${put.msg}` : ""}).`,
+        });
+        continue;
+      }
+
+      // Grant the agent read-ACL: add the key to its standing secrets[].
+      if (configText !== null) {
+        const after = addAgentSecret(configText, name, vaultKey);
+        if (after !== configText) {
+          configText = after;
+          pendingConfigEdits = true;
+        }
+      }
+
+      writeOut(chalk.green(`  + litellm/${name}: provisioned virtual key (team '${team}')\n`));
+    } catch (err) {
+      failures.push({ agent: name, message: `litellm: ${(err as Error).message}` });
+    }
+  }
+
+  // Flush batched config edits (ACL grants) once.
+  if (pendingConfigEdits && configText !== null && switchroomConfigPath) {
+    try {
+      writeFileSync(switchroomConfigPath, configText, "utf-8");
+      writeOut(chalk.gray(`  ~ litellm: granted read-ACL on per-agent keys (updated ${switchroomConfigPath})\n`));
+    } catch (err) {
+      ctx.writeErr(
+        chalk.yellow(
+          `  ! litellm: could not write ACL grants to config (${(err as Error).message}).\n`,
+        ),
+      );
+    }
+  }
 }
 
 /**
@@ -812,6 +1028,25 @@ export async function runApply(
         `  (--compose-only: skipped per-agent scaffold for ${agentNames.length} agent(s))\n`,
       ),
     );
+  }
+
+  // ── 1b. LiteLLM per-agent virtual-key provisioning (opt-in) ───────
+  //
+  // For each agent whose effective config has `litellm.enabled` true,
+  // provision a per-agent LiteLLM virtual key under the "switchroom" team,
+  // store it in the vault at `litellm/<agent>/api-key`, and grant the agent
+  // read-ACL by adding the key to its standing `secrets[]` (the broker mints
+  // the agent's read/rotate ACL from that list — same mechanism linear-agent
+  // uses). Idempotent: if the vault already holds the key, we skip. Failures
+  // are accumulated into `failures` (non-fatal — provisioning a key must
+  // never block the rest of apply). Entirely gated behind `litellm.enabled`,
+  // so it's zero-impact when off. See reference/rfcs (litellm) + schema.
+  if (!skipScaffold) {
+    await provisionLiteLLMKeys(config, agentNames, switchroomConfigPath, {
+      writeOut,
+      writeErr,
+      failures,
+    });
   }
 
   // ── 2. Pre-create host mount sources ──────────────────────────────

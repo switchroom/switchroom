@@ -772,6 +772,22 @@ if command -v switchroom >/dev/null 2>&1; then
   unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
 fi
 
+# LiteLLM routing key (opt-in, #litellm). When SWITCHROOM_LITELLM is set
+# (compose env, gated on litellm.enabled), fetch the per-agent virtual key
+# from the vault-broker and export it as the x-litellm-api-key Bearer header
+# so the unmodified `claude` CLI authenticates to the LiteLLM proxy named by
+# ANTHROPIC_BASE_URL. The broker enforces the per-key ACL (the agent's
+# standing secrets[] grant added by `switchroom apply`); a missing key falls
+# back to no header, which surfaces as an auth error against the proxy rather
+# than silently mis-routing. Best-effort, never fatal.
+if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
+  sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
+  if [ -n "$sr_ll_key" ]; then
+    export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key"
+  fi
+  unset sr_ll_key
+fi
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
   exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG{{#if modelQ}} --model {{{modelQ}}}{{/if}}{{#if thinkingEffort}} --effort {{thinkingEffort}}{{/if}}{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}
