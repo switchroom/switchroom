@@ -458,6 +458,16 @@ export interface ComposeGeneratorOptions {
    * path (or empty string to suppress emission).
    */
   bundledSkillsPoolDir?: string;
+  /**
+   * Set of agent names whose LiteLLM virtual key is confirmed present in the
+   * vault. Only agents in this set get LiteLLM routing env injected (gated
+   * alongside cascade-resolved `litellm.enabled`). `writeComposeFile` computes
+   * it via a broker vault probe so the env is decoupled from mere config
+   * intent — a failed/absent provision never yields a key-less proxy route.
+   * Omitted ⇒ no agent treated as confirmed (fail-safe). Passed straight to
+   * `describeAgents`.
+   */
+  litellmConfirmedAgents?: Set<string>;
 }
 
 /** Resolve the image ref for one of the four service images. */
@@ -555,16 +565,22 @@ interface AgentServiceData {
   userEnv: Record<string, string>;
   /**
    * Effective LiteLLM routing config (cascade-resolved agent block fused
-   * with the top-level fleet defaults). When `enabled` is true,
-   * `emitAgentService` injects `ANTHROPIC_BASE_URL`,
-   * `ANTHROPIC_SMALL_FAST_MODEL`, and `SWITCHROOM_LITELLM=1` as
-   * system-managed env (authoritative over userEnv). The secret key itself
-   * is NEVER injected here — start.sh fetches it from the vault at boot.
-   * Opt-in; `enabled === false` ⇒ no LiteLLM env emitted. See the
-   * LiteLLMConfigSchema doc + apply.ts provisioning.
+   * with the top-level fleet defaults). `emitAgentService` injects
+   * `ANTHROPIC_BASE_URL`, `ANTHROPIC_SMALL_FAST_MODEL`, and
+   * `SWITCHROOM_LITELLM=1` as system-managed env (authoritative over
+   * userEnv) ONLY when `enabled && keyConfirmed` — i.e. the agent opted in
+   * AND its virtual key actually exists in the vault. Routing env without a
+   * key would make every claude call hit the proxy unauthenticated (a
+   * silently-broken agent), so the key-presence gate is load-bearing, not
+   * cosmetic. `keyConfirmed` is computed by `writeComposeFile` (broker vault
+   * check) and threaded via `ComposeGeneratorOptions.litellmConfirmedAgents`;
+   * absent that set, `keyConfirmed` is false (fail-safe: no key → no routing
+   * env). The secret key itself is NEVER injected here — start.sh fetches it
+   * from the vault at boot. See LiteLLMConfigSchema doc + apply.ts.
    */
   litellm: {
     enabled: boolean;
+    keyConfirmed: boolean;
     baseUrl: string | undefined;
     smallFastModel: string;
   };
@@ -594,8 +610,20 @@ interface AgentServiceData {
   timezone: string;
 }
 
-/** Per-agent metadata exposed to doctor checks (and tests). */
-export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
+/**
+ * Per-agent metadata exposed to doctor checks (and tests).
+ *
+ * `litellmConfirmedAgents` (optional) is the set of agent names whose LiteLLM
+ * virtual key actually exists in the vault — computed by `writeComposeFile`
+ * via a broker vault probe. Only agents in this set get routing env injected
+ * (gated alongside the cascade-resolved `litellm.enabled`). Omitted ⇒ no agent
+ * is treated as key-confirmed (fail-safe: never route through the proxy
+ * without a key). Tests pass it explicitly to exercise the on-path.
+ */
+export function describeAgents(
+  config: SwitchroomConfig,
+  litellmConfirmedAgents?: Set<string>,
+): AgentServiceData[] {
   const out: AgentServiceData[] = [];
   for (const name of Object.keys(config.agents).sort()) {
     const agent = config.agents[name]!;
@@ -644,14 +672,16 @@ export function describeAgents(config: SwitchroomConfig): AgentServiceData[] {
       userEnv: { ...(resolved.env ?? {}) },
       // Effective LiteLLM routing. enabled: per-agent cascaded value wins,
       // then the top-level fleet default, else false (mirrors apply.ts
-      // `effectiveLiteLLMEnabled`). base_url + small_fast_model fall back
-      // to the top-level block; small_fast_model has a hard default so the
-      // CLI's fast lane always has a model when routing is on.
+      // `effectiveLiteLLMEnabled`). keyConfirmed: agent is in the vault-probed
+      // confirmed set (omitted set ⇒ false, fail-safe). base_url +
+      // small_fast_model fall back to the top-level block; small_fast_model
+      // has a hard default so the CLI's fast lane always has a model.
       litellm: {
         enabled:
           resolved.litellm?.enabled ??
           (config as { litellm?: { enabled?: boolean } }).litellm?.enabled ??
           false,
+        keyConfirmed: litellmConfirmedAgents?.has(name) ?? false,
         baseUrl:
           resolved.litellm?.base_url ??
           (config as { litellm?: { base_url?: string } }).litellm?.base_url,
@@ -1207,7 +1237,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     lines.push(`      SWITCHROOM_BROKER_OPERATOR_UID: "${opts.operatorUid}"`);
   }
   lines.push(`    volumes:`);
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(`      - broker-${a.name}-sock:/run/switchroom/broker/${a.name}`);
   }
   // Operator listener bind — only emitted when operatorUid is set so a
@@ -1318,7 +1348,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // post-write chownSync (server.ts mint_grant) restores agent-UID
   // ownership after every mint so the agent keeps being able to
   // read the file from its own peercred identity.
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(
       `      - ${homePrefix}/.switchroom/agents/${a.name}/.vault-token:/root/.switchroom/agents/${a.name}/.vault-token`,
     );
@@ -1394,7 +1424,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     }
   }
   lines.push(`    volumes:`);
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(`      - kernel-${a.name}-sock:/run/switchroom/kernel/${a.name}`);
   }
   if (switchroomConfigPath) {
@@ -1492,7 +1522,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   }
   lines.push(`    volumes:`);
   // Per-agent socket dir (named volume; agent side mounts the parent).
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(`      - auth-broker-${a.name}-sock:/run/switchroom/auth-broker/${a.name}`);
   }
   // Per-consumer socket dir — same shape, but the consumer container
@@ -1523,7 +1553,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(``);
 
   // ── per-agent services ─────────────────────────────────────────────
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     if (a.strippedCaps.length > 0) {
       warn(`compose: stripping cap_add ${JSON.stringify(a.strippedCaps)} from agent "${a.name}" (Docker mode forbids capability extras; see RFC §security)`);
     }
@@ -1552,7 +1582,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
 
   // ── volumes ────────────────────────────────────────────────────────
   lines.push(`volumes:`);
-  for (const a of describeAgents(config)) {
+  for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     lines.push(`  broker-${a.name}-sock:`);
     lines.push(`  kernel-${a.name}-sock:`);
     lines.push(`  auth-broker-${a.name}-sock:`);
@@ -1576,7 +1606,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // host-gateway` extra_hosts. Emitted ONLY when at least one agent
   // opted in — a default (all-host) fleet's compose is byte-identical
   // to pre-#1413 (no networks: block at all).
-  const strictAgents = describeAgents(config).filter(
+  const strictAgents = describeAgents(config, opts.litellmConfirmedAgents).filter(
     (a) => a.networkIsolation === "strict",
   );
   if (strictAgents.length > 0) {
@@ -1952,22 +1982,23 @@ function emitAgentService(
   if (operatorUid !== undefined) {
     env.SWITCHROOM_WEBHOOK_RECEIVER_UID = String(operatorUid);
   }
-  // LiteLLM routing env (opt-in, #litellm). When the agent's effective
-  // litellm.enabled is true, route the claude CLI through the LiteLLM proxy:
-  // ANTHROPIC_BASE_URL points at the proxy, ANTHROPIC_SMALL_FAST_MODEL pins
-  // the fast lane, and SWITCHROOM_LITELLM=1 tells start.sh to fetch the
-  // per-agent virtual key from the vault and export it as the
-  // x-litellm-api-key Bearer (the SECRET is NEVER emitted here — only the
-  // marker). Set BEFORE the userEnv merge below so these system-managed
-  // keys are authoritative (the merge only fills env[k] when undefined).
-  // base_url is required for routing to work; if it's somehow unset we
-  // still flip the marker + small-fast-model so the misconfig surfaces
-  // loudly at boot rather than silently disabling routing.
-  if (a.litellm.enabled) {
+  // LiteLLM routing env (opt-in, #litellm). Injected ONLY when the agent
+  // opted in (litellm.enabled) AND its virtual key actually exists in the
+  // vault (keyConfirmed). The key-presence gate is load-bearing: injecting
+  // ANTHROPIC_BASE_URL without a key makes every claude call hit the proxy
+  // unauthenticated — a silently-broken agent. So a failed/absent provision
+  // ⇒ no routing env ⇒ the agent keeps the normal broker-OAuth Anthropic
+  // path (degraded-but-working) rather than a dead proxy path. When both
+  // gates pass: ANTHROPIC_BASE_URL → proxy, ANTHROPIC_SMALL_FAST_MODEL pins
+  // the fast lane, SWITCHROOM_LITELLM=1 tells start.sh to fetch the key from
+  // the vault and export it as the x-litellm-api-key Bearer (the SECRET is
+  // NEVER emitted here — only the marker). Set BEFORE the userEnv merge so
+  // these system-managed keys are authoritative (the merge only fills env[k]
+  // when undefined). base_url is required for the marker to be useful; only
+  // emit the trio when it resolved.
+  if (a.litellm.enabled && a.litellm.keyConfirmed && a.litellm.baseUrl) {
     env.SWITCHROOM_LITELLM = "1";
-    if (a.litellm.baseUrl) {
-      env.ANTHROPIC_BASE_URL = a.litellm.baseUrl;
-    }
+    env.ANTHROPIC_BASE_URL = a.litellm.baseUrl;
     env.ANTHROPIC_SMALL_FAST_MODEL = a.litellm.smallFastModel;
   }
   // Merge operator-declared env vars from the agent's `env:` block.

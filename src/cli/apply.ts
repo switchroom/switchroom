@@ -211,7 +211,43 @@ function effectiveLiteLLMEnabled(
  * (via the auto-unlocked broker) for an existing `litellm/<agent>/api-key`
  * and skip provisioning when present.
  */
-async function provisionLiteLLMKeys(
+/**
+ * Recover the operator vault passphrase for apply-time writes WITHOUT an
+ * interactive prompt. The vault-broker's `put` op refuses to introduce a NEW
+ * key on the path-as-identity / operator-socket path (server.ts ~1657/~1692);
+ * new-key creation requires operator-passphrase attestation (or a write-grant).
+ * So a passphrase-less `putViaBroker` of `litellm/<agent>/api-key` is always
+ * denied — provisioning would silently fail.
+ *
+ * Two non-interactive sources, in order:
+ *   1. SWITCHROOM_VAULT_PASSPHRASE env (passphrase-host operators / CI).
+ *   2. The auto-unlock blob (~/.switchroom/vault-auto-unlock), decrypted with
+ *      a key derived from /etc/machine-id — the SAME mechanism the broker uses
+ *      to auto-unlock at boot. This is the path on this host (no passphrase in
+ *      the env during apply). `readAutoUnlockFile` throws if the blob is
+ *      missing/undecryptable; we swallow and return null.
+ *
+ * Returns null when neither source yields a passphrase (e.g. an interactive
+ * passphrase host with no env var) — the caller then records a clear failure
+ * rather than blocking apply on a TTY prompt.
+ */
+async function resolveOperatorVaultPassphrase(home: string): Promise<string | null> {
+  const envPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
+  if (envPass) return envPass;
+  try {
+    const { readAutoUnlockFile } = await import("../vault/auto-unlock.js");
+    const blobPath = join(home, ".switchroom", "vault-auto-unlock");
+    const pass = readAutoUnlockFile(blobPath);
+    return pass && pass.length > 0 ? pass : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @internal exported for the apply-level e2e (src/litellm/provision-apply-e2e.test.ts).
+ */
+export async function provisionLiteLLMKeys(
   config: SwitchroomConfig,
   agentNames: string[],
   switchroomConfigPath: string | undefined,
@@ -219,6 +255,8 @@ async function provisionLiteLLMKeys(
     writeOut: (s: string) => void;
     writeErr: (s: string) => void;
     failures: ScaffoldFailure[];
+    /** Home dir for the auto-unlock blob lookup (defaults to homedir()). */
+    home?: string;
   },
 ): Promise<void> {
   const { writeOut, failures } = ctx;
@@ -243,6 +281,32 @@ async function provisionLiteLLMKeys(
       import("./telegram-yaml.js"),
     ]);
 
+  // Operator-passphrase attestation is REQUIRED to write a NEW vault key via
+  // the broker (the operator socket has no new-key carve-out). Recover it
+  // non-interactively (env, else machine-id auto-unlock blob). If we can't,
+  // every provision below will fail the write — surface that loudly up front
+  // and bail rather than emitting N confusing per-agent denials.
+  const passphrase = await resolveOperatorVaultPassphrase(ctx.home ?? homedir());
+  if (passphrase === null) {
+    for (const { name } of optedIn) {
+      failures.push({
+        agent: name,
+        message:
+          `litellm: cannot write virtual key — no operator vault passphrase available ` +
+          `(set SWITCHROOM_VAULT_PASSPHRASE, or enable auto-unlock with ` +
+          `'switchroom vault broker enable-auto-unlock'). The broker refuses new keys ` +
+          `without operator attestation.`,
+      });
+    }
+    ctx.writeErr(
+      chalk.red(
+        `  x litellm: no operator vault passphrase — skipping provisioning for ` +
+        `${optedIn.length} opted-in agent(s). They will NOT get routing env until a key exists.\n`,
+      ),
+    );
+    return;
+  }
+
   const topLevel = (config as { litellm?: {
     base_url?: string;
     admin_key?: string;
@@ -256,6 +320,11 @@ async function provisionLiteLLMKeys(
 
   // Track config-write-back: we batch all secrets[] grants into a single
   // read-modify-write of the host config so we don't thrash the file.
+  // NOTE: this read-modify-write is last-writer-wins — no file lock or
+  // mtime/etag check. If something else edits switchroom.yaml between our
+  // read and write (rare during apply — the operator isn't usually editing
+  // concurrently), those edits are clobbered. Acceptable for the apply path;
+  // revisit if litellm provisioning ever runs outside the apply lifecycle.
   let pendingConfigEdits = false;
   let configText: string | null = null;
   if (switchroomConfigPath && existsSync(switchroomConfigPath)) {
@@ -308,6 +377,11 @@ async function provisionLiteLLMKeys(
           agent: name,
           message: `litellm: vault-broker unreachable (${existing.msg ?? "no detail"}); cannot provision key.`,
         });
+        ctx.writeErr(
+          chalk.red(
+            `  x litellm/${name}: vault-broker unreachable — agent will not get routing env.\n`,
+          ),
+        );
         continue;
       }
 
@@ -356,9 +430,17 @@ async function provisionLiteLLMKeys(
         metadata,
       });
 
-      // Store the key in the vault via the auto-unlocked broker (operator
-      // peercred = full write access; new key introduction allowed).
-      const put = await putViaBroker(vaultKey, { kind: "string", value: key });
+      // Store the key in the vault via the broker WITH operator-passphrase
+      // attestation. The operator socket alone does NOT authorize introducing
+      // a new key (server.ts ~1657/~1692 refuse path-as-identity new-key
+      // writes) — the passphrase is what flips `passphraseAttested` in the
+      // broker, which permits new-key creation AND updates the broker's
+      // in-memory secrets so the agent's boot-time `vault get` sees it (a
+      // direct vault.enc write would persist but stay invisible until broker
+      // reload). Note: the broker's wire `put` cannot carry a per-entry scope
+      // ACL — cross-agent isolation is enforced by the agent's standing
+      // secrets[] grant added below (the broker get-ACL gates by agent name).
+      const put = await putViaBroker(vaultKey, { kind: "string", value: key }, { passphrase });
       if (put.kind !== "ok") {
         failures.push({
           agent: name,
@@ -366,6 +448,11 @@ async function provisionLiteLLMKeys(
             `litellm: provisioned key but vault write failed ` +
             `(${put.kind}${"msg" in put && put.msg ? `: ${put.msg}` : ""}).`,
         });
+        ctx.writeErr(
+          chalk.red(
+            `  x litellm/${name}: vault write FAILED — agent will not get routing env.\n`,
+          ),
+        );
         continue;
       }
 
@@ -1046,6 +1133,7 @@ export async function runApply(
       writeOut,
       writeErr,
       failures,
+      home: homedir(),
     });
   }
 

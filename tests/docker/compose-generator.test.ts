@@ -1744,7 +1744,7 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
     return re.exec(yml)?.[1] ?? "";
   }
 
-  it("injects ANTHROPIC_BASE_URL + ANTHROPIC_SMALL_FAST_MODEL + SWITCHROOM_LITELLM when enabled per-agent", () => {
+  it("injects ANTHROPIC_BASE_URL + ANTHROPIC_SMALL_FAST_MODEL + SWITCHROOM_LITELLM when enabled AND key confirmed", () => {
     const out = generateCompose({
       config: makeConfig({
         clerk: {
@@ -1755,6 +1755,7 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
           },
         },
       }),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
@@ -1762,9 +1763,41 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
     expect(env).toMatch(/SWITCHROOM_LITELLM:\s*"1"/);
   });
 
+  it("does NOT inject when enabled but the key is NOT confirmed in the vault (blocker-2 gate)", () => {
+    // The load-bearing decoupling: opting in is not enough — a missing key
+    // must NOT yield routing env, or the agent boots a dead unauthenticated
+    // proxy route. Confirmed set is empty here.
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: { enabled: true, base_url: "http://127.0.0.1:4010" },
+        },
+      }),
+      litellmConfirmedAgents: new Set(),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+    expect(env).not.toMatch(/ANTHROPIC_BASE_URL:/);
+    expect(env).not.toMatch(/ANTHROPIC_SMALL_FAST_MODEL:/);
+  });
+
+  it("does NOT inject when the confirmed set is omitted entirely (fail-safe default)", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: { enabled: true, base_url: "http://127.0.0.1:4010" },
+        },
+      }),
+      // litellmConfirmedAgents omitted → no agent confirmed.
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+  });
+
   it("does NOT inject any LiteLLM env when the feature is off (default)", () => {
     const out = generateCompose({
       config: makeConfig({ clerk: {} }),
+      litellmConfirmedAgents: new Set(["clerk"]), // confirmed but not enabled
     });
     const env = envBlockFor(out, "clerk");
     expect(env).not.toMatch(/ANTHROPIC_BASE_URL:/);
@@ -1776,12 +1809,13 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
   it("does NOT inject when an agent explicitly disables litellm.enabled", () => {
     const out = generateCompose({
       config: makeConfig({ clerk: { litellm: { enabled: false } } }),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
   });
 
-  it("inherits the top-level fleet litellm default (enabled + base_url) for an agent", () => {
+  it("inherits the top-level fleet litellm default (enabled + base_url) for a confirmed agent", () => {
     const out = generateCompose({
       config: makeConfig(
         { clerk: {} },
@@ -1793,6 +1827,7 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
           },
         },
       ),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
@@ -1806,6 +1841,7 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
         { clerk: { litellm: { enabled: false } } },
         { litellm: { enabled: true, base_url: "http://127.0.0.1:4010" } },
       ),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
@@ -1816,6 +1852,7 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
       config: makeConfig({
         clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
       }),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
@@ -1826,10 +1863,25 @@ describe("agent service env — LiteLLM routing injection (opt-in)", () => {
       config: makeConfig({
         clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
       }),
+      litellmConfirmedAgents: new Set(["clerk"]),
     });
     const env = envBlockFor(out, "clerk");
     expect(env).not.toMatch(/ANTHROPIC_CUSTOM_HEADERS:/);
     expect(env).not.toMatch(/api-key/i);
+  });
+
+  it("describeAgents() marks keyConfirmed only for agents in the confirmed set", () => {
+    const cfg = makeConfig({
+      clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
+      bob: { litellm: { enabled: true, base_url: "http://h:1" } },
+    });
+    const agents = describeAgents(cfg, new Set(["clerk"]));
+    const clerk = agents.find((a) => a.name === "clerk");
+    const bob = agents.find((a) => a.name === "bob");
+    expect(clerk?.litellm.enabled).toBe(true);
+    expect(clerk?.litellm.keyConfirmed).toBe(true);
+    expect(bob?.litellm.enabled).toBe(true);
+    expect(bob?.litellm.keyConfirmed).toBe(false);
   });
 });
 

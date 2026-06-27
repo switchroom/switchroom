@@ -109,7 +109,7 @@ describe("ensureKey", () => {
       },
       fetchFn,
     );
-    expect(result).toEqual({ key: "sk-virtual-abc", created: true });
+    expect(result).toEqual({ key: "sk-virtual-abc" });
     expect(calls[0]!.url).toBe("http://127.0.0.1:4010/key/generate");
     const body = JSON.parse(String(calls[0]!.init?.body));
     expect(body).toEqual({

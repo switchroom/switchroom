@@ -23,6 +23,54 @@ import { isContainerContext } from "./agent-config.js";
 import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../config/release-resolve.js";
 import { isDockerRuntime } from "../runtime-mode.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import { resolveAgentConfig } from "../config/merge.js";
+
+/**
+ * Probe the vault-broker for which opted-in agents already have a LiteLLM
+ * virtual key (`litellm/<agent>/api-key`). Used to gate routing-env injection
+ * in `generateCompose`: an opted-in agent with no key in the vault gets NO
+ * routing env (it would otherwise boot routing through the proxy with no
+ * credential — a silently-broken agent). Decouples env from mere config
+ * intent and keeps apply / reconcile / docker-fleet paths consistent
+ * (provisioning runs before this probe on the apply path; the reconcile path
+ * sees whatever was already provisioned).
+ *
+ * Fail-safe: if the broker is unreachable, an agent's key is treated as NOT
+ * confirmed (returns it out of the set) so we never emit a key-less proxy
+ * route. Best-effort — never throws.
+ */
+async function resolveLiteLLMConfirmedAgents(
+  config: SwitchroomConfig,
+): Promise<Set<string>> {
+  const confirmed = new Set<string>();
+  // Determine opted-in agents (effective enabled = agent ?? top-level ?? false).
+  const topEnabled =
+    (config as { litellm?: { enabled?: boolean } }).litellm?.enabled ?? false;
+  const optedIn: string[] = [];
+  for (const name of Object.keys(config.agents ?? {})) {
+    const agent = config.agents[name];
+    if (!agent) continue;
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agent);
+    const enabled = resolved.litellm?.enabled ?? topEnabled;
+    if (enabled) optedIn.push(name);
+  }
+  if (optedIn.length === 0) return confirmed;
+
+  try {
+    const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+    for (const name of optedIn) {
+      try {
+        const r = await getViaBrokerStructured(`litellm/${name}/api-key`);
+        if (r.kind === "ok") confirmed.add(name);
+      } catch {
+        // treat as not-confirmed (fail-safe)
+      }
+    }
+  } catch {
+    // broker client import / connection failure ⇒ nothing confirmed
+  }
+  return confirmed;
+}
 
 export interface WriteComposeOpts {
   config: SwitchroomConfig;
@@ -153,9 +201,14 @@ export async function writeComposeFile(opts: WriteComposeOpts): Promise<WriteCom
     ? resolveHostSwitchroomConfigPath(opts.switchroomConfigPath)
     : undefined;
 
+  // Which opted-in agents have a LiteLLM key in the vault — gates routing-env
+  // injection so a key-less agent never boots a dead proxy route (#litellm).
+  const litellmConfirmedAgents = await resolveLiteLLMConfirmedAgents(opts.config);
+
   const content = generateCompose({
     config: opts.config,
     imageTag,
+    litellmConfirmedAgents,
     buildMode: opts.buildMode ?? "pull",
     buildContext: opts.buildContext,
     // Bake the operator's HOST HOME absolute path into volume sources (avoids
