@@ -35,6 +35,38 @@ work is the interactive session or a synthesized turn injected into it.
   subscription is what keeps switchroom inside Anthropic's third-party
   policy. It's a compliance boundary. See `keep-my-subscription-honest.md`.
 
+### Operator-controlled gateway carve-out
+
+A gateway the operator runs (e.g. self-hosted LiteLLM) MAY sit between the
+`claude` CLI and Anthropic — **iff** all four hold:
+
+1. **OAuth forwarded unchanged.** It passes the operator's Pro/Max OAuth
+   credential through untouched — the subscription stays the funding *and*
+   the identity. The gateway issues **no** `ANTHROPIC_API_KEY`, SDK, or
+   raw-API call to Anthropic on the operator's behalf.
+2. **No alteration of Claude's operation.** It must not inject, rewrite, or
+   strip anything that changes the model selected, the request parameters,
+   or Claude's behaviour. Its only permitted writes to the stream are
+   **content-safety guardrails** (PII redaction/blocking on message
+   content). Observation — token/cost metering, logging, tagging — is
+   unrestricted.
+3. **Opt-in, default OFF.** No agent routes through a gateway unless the
+   operator turns it on, and a gateway outage **fails open** to the direct
+   subscription path (availability is never sacrificed to the proxy).
+4. **Non-Anthropic is a separate path.** Other models routed through the
+   same gateway are off-subscription, separately billed, and **not** covered
+   by the subscription-native guarantee — they are a distinct,
+   clearly-labelled route.
+
+This is subscription-native by construction: it is still the unmodified CLI
+authenticating with the subscription OAuth; the gateway is operator
+infrastructure observing and safeguarding the operator's *own* traffic.
+Aligns with the [Anthropic AUP](https://www.anthropic.com/legal/aup) and
+[Claude Code acceptable-use](https://code.claude.com/docs/en/legal-and-compliance).
+The `no protocol interception` clause above bars a *harness over* the CLI
+that fakes or reshapes the model exchange — it does **not** bar an operator
+metering+safety proxy that forwards the exchange faithfully.
+
 ## `no-self-escalation`
 
 Every access decision — a secret, a tool, an MCP server, a host action —

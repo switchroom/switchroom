@@ -64,6 +64,16 @@ construction, however useful it seems.
   interactive `claude` session, or a synthesized turn injected into it
   (the cron / `inject_inbound` pattern). If you reach for the SDK or
   the API, stop — that is not switchroom.
+- **Operator-controlled gateway carve-out (opt-in, default OFF).** An agent
+  MAY be routed through the operator's own LiteLLM proxy
+  (`litellm.enabled: true`) for usage metering + content-safety guardrails.
+  This stays inside the constraint *only because* the proxy forwards the
+  Pro/Max OAuth credential unchanged (subscription is still funding +
+  identity), makes no API-key/SDK call, never alters the model or Claude's
+  operation, and **fails open** to the direct OAuth path on outage. Per-agent
+  attribution via per-agent virtual key + static tags; per-session is done by
+  log⨝ledger correlation, never by mutating the claude protocol. Full rules:
+  `reference/invariants.md` § "Operator-controlled gateway carve-out".
 
 ## v0.7+ runtime architecture (read this before touching docker/compose/broker code)
 

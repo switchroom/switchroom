@@ -772,20 +772,54 @@ if command -v switchroom >/dev/null 2>&1; then
   unset sr_wk_pair sr_wk_env sr_wk_key sr_wk_val
 fi
 
-# LiteLLM routing key (opt-in, #litellm). When SWITCHROOM_LITELLM is set
-# (compose env, gated on litellm.enabled), fetch the per-agent virtual key
-# from the vault-broker and export it as the x-litellm-api-key Bearer header
-# so the unmodified `claude` CLI authenticates to the LiteLLM proxy named by
-# ANTHROPIC_BASE_URL. The broker enforces the per-key ACL (the agent's
-# standing secrets[] grant added by `switchroom apply`); a missing key falls
-# back to no header, which surfaces as an auth error against the proxy rather
-# than silently mis-routing. Best-effort, never fatal.
+# LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
+# env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
+# CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the
+# per-agent virtual key from the vault-broker and export it as the
+# x-litellm-api-key Bearer header. The broker enforces the per-key ACL (the
+# agent's standing secrets[] grant added by `switchroom apply`).
+#
+# Subscription-native by construction: claude still sends its Pro/Max OAuth
+# `Authorization: Bearer`, which LiteLLM forwards UNCHANGED to Anthropic
+# (forward_client_headers_to_llm_api). The proxy only meters and applies
+# content-safety guardrails — it never alters the model or Claude's operation.
+# See reference/invariants.md § "Operator-controlled gateway carve-out".
+#
+# FAIL-OPEN (operator decision 2026-06-28): if the key is missing OR the proxy
+# is unreachable at boot, strip the routing env and fall back to the direct
+# broker-OAuth Anthropic path, logging the reason LOUDLY. Availability wins over
+# tracking/guardrails — a proxy outage must never take an agent dark. The
+# tradeoff is an explicit, logged guardrail lapse for that session, not a silent
+# one. Re-probed on every (re)boot, so recovery is automatic.
+#
+# Static tags (x-litellm-customer-id / x-litellm-tags) give per-AGENT
+# attribution in LiteLLM. Per-SESSION is NOT achievable here: claude sends no
+# session id on the wire and ANTHROPIC_CUSTOM_HEADERS is fixed per process — so
+# per-session cost/issue tracking is handled out-of-band by correlating
+# LiteLLM's request log against switchroom's turn ledger, never by mutating the
+# claude protocol.
 if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
   sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
-  if [ -n "$sr_ll_key" ]; then
-    export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key"
+  sr_ll_ok=""
+  if [ -z "$sr_ll_key" ]; then
+    echo "litellm: no virtual key for agent '$SWITCHROOM_AGENT_NAME' — falling back to direct OAuth (no tracking/guardrail)" >&2
+  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
+       && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
+    echo "litellm: proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+  else
+    sr_ll_ok="1"
   fi
-  unset sr_ll_key
+  if [ -n "$sr_ll_ok" ]; then
+    # Newline-separated Name: Value pairs (claude CLI ANTHROPIC_CUSTOM_HEADERS format).
+    export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
+x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
+x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME"
+  else
+    # Fail-open: drop every routing var so the claude CLI talks to Anthropic
+    # directly on its OAuth credential (subscription path), unproxied.
+    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+  fi
+  unset sr_ll_key sr_ll_ok
 fi
 
 {{#if useSwitchroomPlugin}}
