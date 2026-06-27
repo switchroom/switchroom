@@ -151,3 +151,63 @@ describe("mergeAgentConfig — secrets (operator standing grant) cascade", () =>
     expect(result.secrets).toBeUndefined();
   });
 });
+
+describe("mergeAgentConfig — litellm one-level deep merge", () => {
+  it("deep-merges scalar fields, agent overriding wins per field", () => {
+    const defaults = {
+      litellm: {
+        enabled: false,
+        base_url: "http://127.0.0.1:4010",
+        small_fast_model: "claude-haiku-4-5-20251001",
+      },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      litellm: { enabled: true },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    // enabled overridden by agent; base_url + small_fast_model inherited.
+    expect(result.litellm).toEqual({
+      enabled: true,
+      base_url: "http://127.0.0.1:4010",
+      small_fast_model: "claude-haiku-4-5-20251001",
+    });
+  });
+
+  it("merges tags per-key (agent adds without dropping defaults)", () => {
+    const defaults = {
+      litellm: { enabled: true, tags: { env: "fleet", region: "au" } },
+    } as AgentDefaults;
+    const agent = baseAgent({
+      litellm: { tags: { region: "us", team: "core" } },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    // region overridden by agent; env kept from defaults; team added.
+    expect(result.litellm?.tags).toEqual({
+      env: "fleet",
+      region: "us",
+      team: "core",
+    });
+    expect(result.litellm?.enabled).toBe(true);
+  });
+
+  it("uses agent litellm when defaults absent", () => {
+    const agent = baseAgent({
+      litellm: { enabled: true, base_url: "http://h:1" },
+    } as Partial<AgentConfig>);
+    const result = mergeAgentConfig({} as AgentDefaults, agent);
+    expect(result.litellm).toEqual({ enabled: true, base_url: "http://h:1" });
+  });
+
+  it("inherits defaults litellm when agent has none", () => {
+    const defaults = {
+      litellm: { enabled: true, base_url: "http://h:2" },
+    } as AgentDefaults;
+    const result = mergeAgentConfig(defaults, baseAgent());
+    expect(result.litellm).toEqual({ enabled: true, base_url: "http://h:2" });
+  });
+
+  it("leaves litellm undefined when neither layer sets it", () => {
+    const result = mergeAgentConfig({} as AgentDefaults, baseAgent({}));
+    expect(result.litellm).toBeUndefined();
+  });
+});

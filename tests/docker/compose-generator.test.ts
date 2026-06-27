@@ -46,11 +46,27 @@ interface MakeConfigAgent {
   resources?: { memory?: string; memory_reservation?: string; pids_limit?: number; cpus?: number };
   timezone?: string;
   network_isolation?: "host" | "strict";
+  litellm?: {
+    enabled?: boolean;
+    base_url?: string;
+    small_fast_model?: string;
+    tags?: Record<string, string>;
+  };
 }
 
 function makeConfig(
   agents: Record<string, MakeConfigAgent>,
-  topLevel?: { host_control?: { enabled?: boolean }; timezone?: string },
+  topLevel?: {
+    host_control?: { enabled?: boolean };
+    timezone?: string;
+    litellm?: {
+      enabled?: boolean;
+      base_url?: string;
+      admin_key?: string;
+      team?: string;
+      small_fast_model?: string;
+    };
+  },
 ): SwitchroomConfig {
   return {
     switchroom: {
@@ -75,6 +91,7 @@ function makeConfig(
           resources: cfg.resources,
           timezone: cfg.timezone,
           network_isolation: cfg.network_isolation,
+          litellm: cfg.litellm,
           schedule: [],
           tools: { allow: [], deny: [] },
           hooks: undefined,
@@ -84,6 +101,7 @@ function makeConfig(
     ),
     drive: undefined as unknown as SwitchroomConfig["drive"],
     host_control: topLevel?.host_control,
+    litellm: topLevel?.litellm,
   } as unknown as SwitchroomConfig;
 }
 
@@ -1715,6 +1733,155 @@ describe("agent service env (Phase 2c F2 — IPC wiring)", () => {
     );
     const clerk = agents.find((a) => a.name === "clerk");
     expect(clerk?.timezone).toBe("Australia/Melbourne");
+  });
+});
+
+describe("agent service env — LiteLLM routing injection (opt-in)", () => {
+  function envBlockFor(yml: string, agent: string): string {
+    const re = new RegExp(
+      `  agent-${agent}:[\\s\\S]*?    environment:([\\s\\S]*?)\\n    volumes:`,
+    );
+    return re.exec(yml)?.[1] ?? "";
+  }
+
+  it("injects ANTHROPIC_BASE_URL + ANTHROPIC_SMALL_FAST_MODEL + SWITCHROOM_LITELLM when enabled AND key confirmed", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: {
+            enabled: true,
+            base_url: "http://127.0.0.1:4010",
+            small_fast_model: "claude-haiku-4-5-20251001",
+          },
+        },
+      }),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
+    expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
+    expect(env).toMatch(/SWITCHROOM_LITELLM:\s*"1"/);
+  });
+
+  it("does NOT inject when enabled but the key is NOT confirmed in the vault (blocker-2 gate)", () => {
+    // The load-bearing decoupling: opting in is not enough — a missing key
+    // must NOT yield routing env, or the agent boots a dead unauthenticated
+    // proxy route. Confirmed set is empty here.
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: { enabled: true, base_url: "http://127.0.0.1:4010" },
+        },
+      }),
+      litellmConfirmedAgents: new Set(),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+    expect(env).not.toMatch(/ANTHROPIC_BASE_URL:/);
+    expect(env).not.toMatch(/ANTHROPIC_SMALL_FAST_MODEL:/);
+  });
+
+  it("does NOT inject when the confirmed set is omitted entirely (fail-safe default)", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: {
+          litellm: { enabled: true, base_url: "http://127.0.0.1:4010" },
+        },
+      }),
+      // litellmConfirmedAgents omitted → no agent confirmed.
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+  });
+
+  it("does NOT inject any LiteLLM env when the feature is off (default)", () => {
+    const out = generateCompose({
+      config: makeConfig({ clerk: {} }),
+      litellmConfirmedAgents: new Set(["clerk"]), // confirmed but not enabled
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/ANTHROPIC_BASE_URL:/);
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+    // ANTHROPIC_SMALL_FAST_MODEL must not leak in when routing is off.
+    expect(env).not.toMatch(/ANTHROPIC_SMALL_FAST_MODEL:/);
+  });
+
+  it("does NOT inject when an agent explicitly disables litellm.enabled", () => {
+    const out = generateCompose({
+      config: makeConfig({ clerk: { litellm: { enabled: false } } }),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+  });
+
+  it("inherits the top-level fleet litellm default (enabled + base_url) for a confirmed agent", () => {
+    const out = generateCompose({
+      config: makeConfig(
+        { clerk: {} },
+        {
+          litellm: {
+            enabled: true,
+            base_url: "http://127.0.0.1:4010",
+            small_fast_model: "claude-haiku-4-5-20251001",
+          },
+        },
+      ),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).toMatch(/ANTHROPIC_BASE_URL:\s*"http:\/\/127\.0\.0\.1:4010"/);
+    expect(env).toMatch(/SWITCHROOM_LITELLM:\s*"1"/);
+    expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
+  });
+
+  it("per-agent litellm.enabled=false overrides the fleet-on default", () => {
+    const out = generateCompose({
+      config: makeConfig(
+        { clerk: { litellm: { enabled: false } } },
+        { litellm: { enabled: true, base_url: "http://127.0.0.1:4010" } },
+      ),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/SWITCHROOM_LITELLM:/);
+  });
+
+  it("falls back to the default small_fast_model when none is configured", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
+      }),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).toMatch(/ANTHROPIC_SMALL_FAST_MODEL:\s*"claude-haiku-4-5-20251001"/);
+  });
+
+  it("never emits the secret key in the compose env (key is vault-fetched at boot)", () => {
+    const out = generateCompose({
+      config: makeConfig({
+        clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
+      }),
+      litellmConfirmedAgents: new Set(["clerk"]),
+    });
+    const env = envBlockFor(out, "clerk");
+    expect(env).not.toMatch(/ANTHROPIC_CUSTOM_HEADERS:/);
+    expect(env).not.toMatch(/api-key/i);
+  });
+
+  it("describeAgents() marks keyConfirmed only for agents in the confirmed set", () => {
+    const cfg = makeConfig({
+      clerk: { litellm: { enabled: true, base_url: "http://h:1" } },
+      bob: { litellm: { enabled: true, base_url: "http://h:1" } },
+    });
+    const agents = describeAgents(cfg, new Set(["clerk"]));
+    const clerk = agents.find((a) => a.name === "clerk");
+    const bob = agents.find((a) => a.name === "bob");
+    expect(clerk?.litellm.enabled).toBe(true);
+    expect(clerk?.litellm.keyConfirmed).toBe(true);
+    expect(bob?.litellm.enabled).toBe(true);
+    expect(bob?.litellm.keyConfirmed).toBe(false);
   });
 });
 

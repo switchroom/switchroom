@@ -59,6 +59,11 @@ functions to deliver them, and the jobs that ladder up to each live in
    Anthropic-funded credits; default-off, auto-stops when the credit runs out).
    The claude-native invariant is unaffected: overage is still the unmodified
    interactive `claude` CLI on the same OAuth subscription — never API/SDK.
+   An operator MAY also opt an agent into routing through their own metering
+   gateway (self-hosted LiteLLM) for usage tracking + content-safety
+   guardrails: still the unmodified CLI on the same OAuth, forwarded
+   unchanged, fail-open. See the claude-native gateway carve-out in
+   [`invariants.md`](invariants.md).
 4. **Always available, in Telegram, done properly** — there when you want it.
 
 The hard constraints under these — claude-native, no-self-escalation,
