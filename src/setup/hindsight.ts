@@ -430,8 +430,9 @@ export interface LiteLLMHindsightConfig {
  *   defaults (8888/9999) then 18888/19999.
  * @param litellm - Optional LiteLLM routing config. When provided, the
  *   container uses `--network host` so 127.0.0.1:4010 is reachable, and
- *   the claude subprocess inherits LiteLLM proxy env vars. Ports are
- *   preserved via `HINDSIGHT_API_PORT` / `HINDSIGHT_CP_PORT` env vars.
+ *   the claude subprocess inherits LiteLLM proxy env vars. The API port is
+ *   preserved via `HINDSIGHT_API_PORT` (the only port knob the upstream
+ *   config.py recognizes; the CP service has no env var override).
  */
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
