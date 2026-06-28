@@ -184,6 +184,7 @@ describe("buildObligationRepresentInbound", () => {
     expect(m.meta.origin_turn_id).toBe("-100123:3#715");
     expect(m.meta.source).toBe("obligation_represent"); // synthetic → not tracked, no new obligation
     expect(m.meta.represent_count).toBe("1");
+    expect(m.meta.chat_id).toBe("-100123"); // Bug C fix: chat_id in meta drives the <channel> tag
     expect(m.text).toContain("do the Meta report");
     expect(m.text).toMatch(/answer it now|reply tool/i);
   });

@@ -381,6 +381,7 @@ export function buildObligationRepresentInbound(o: Obligation, now: number): Inb
       source: 'obligation_represent',
       origin_turn_id: o.originTurnId,
       represent_count: String(o.representCount + 1),
+      chat_id: o.chatId,
     },
   }
 }
