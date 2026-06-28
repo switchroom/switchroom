@@ -120,19 +120,28 @@ Slack, Discord, or Teams. Auxiliary services (e.g. voice transcription) are
 opt-in helpers, not second channels.
 
 - **By-construction test:** does this add a second human-facing chat
-  channel? If yes, it is out.
+  channel **for the people the team serves** — a bridge to WhatsApp, Signal,
+  Slack, Discord, Teams, or the like? If yes, it is out. This invariant is
+  about the *principal's* channel: there is exactly one, Telegram, done
+  properly. It is **not** a ban on operator/admin tooling.
 
-### Operator-console carve-out
+### Scope: the admin console is not a channel
 
-An **operator-only** management console (e.g. a Hermes-Desktop client pointed
-at a Switchroom adapter) MAY let the operator send a turn to one of their own
-agents from outside Telegram — **iff** all four hold:
+An **operator/admin** management console (e.g. a Hermes-Desktop client pointed
+at a Switchroom adapter) is **out of this invariant's scope** — it is admin
+tooling for the person who runs the box, not a chat channel for the people the
+team serves. `telegram-only` stays strictly true: it governs *principal*
+channels, and the admin console is not one.
 
-1. **Operator audience only.** The console is authenticated, single-tenant,
-   and never reachable by a principal as their way to talk to an agent. It is
-   the operator's workshop view, not a second front door for the people the
-   team serves. (This is the same "audience is the whole line" reasoning that
-   keeps an operator surface clear of `chat-is-the-single-source-of-truth`.)
+The console MAY let the operator send a turn to one of their own agents from
+outside Telegram. To stay admin tooling (and not quietly become a second
+channel or a hidden conversation), it must hold all four:
+
+1. **Operator/admin audience only.** Authenticated, single-tenant, never
+   reachable by a principal as *their* way to talk to an agent. It is the
+   operator's workshop view, not a second front door for the people the team
+   serves. (Same "audience is the whole line" reasoning that keeps an operator
+   surface clear of `chat-is-the-single-source-of-truth`.)
 2. **One canonical record.** Every operator turn and the agent's reply
    **mirror into that agent's Telegram thread.** The console is another way
    *in*, never a separate conversation the Telegram thread can't see — so
@@ -147,11 +156,10 @@ agents from outside Telegram — **iff** all four hold:
    sole approval surface (`no-self-escalation`). A console that wires
    approvals is out.
 
-This is telegram-only by construction: there is still one channel of record
-(Telegram) and one trust anchor for consequential actions (the Telegram tap).
-The carve-out admits an operator *input surface* that feeds the one thread —
-not a second human-facing channel with its own audience and its own history.
-The detail contract is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
+The line that *would* cross `telegram-only` is a **principal-facing** bridge —
+giving the people the team serves a second way to chat (WhatsApp, Signal, a
+public web chat). That is still out. The detail contract for the admin console
+is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
 
 ## `chat-is-the-single-source-of-truth`
 

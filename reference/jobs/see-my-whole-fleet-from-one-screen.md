@@ -92,9 +92,9 @@ channel or a second approval path.
   history; the decision never happens here.
 - A **principal-facing** way in from the console, or an operator turn that
   does **not** mirror into the Telegram thread (a hidden side-channel
-  conversation). The operator-console carve-out to `telegram-only` holds only
-  while the console is operator-only and every turn surfaces in the one
-  Telegram record. A prompt box the principal uses, or an unmirrored aside,
+  conversation). The admin console stays out of `telegram-only`'s scope only
+  while it is operator-only and every turn surfaces in the one Telegram
+  record. A prompt box the principal uses, or a bridge to WhatsApp/Signal,
   crosses `telegram-only`.
 - Any secret reaching the browser, an API response, or a log
   (`credentials.json`, vault values, OAuth/bot tokens).
@@ -129,7 +129,7 @@ principal's chat jobs). Pin:
 - **Operator turn = one record** — a turn sent from the console produces a
   real turn in the target agent's Telegram thread (turn and reply observable
   there). *Invariant:* the console never opens a conversation the Telegram
-  thread can't see; the operator-console carve-out holds.
+  thread can't see; the admin console stays out of telegram-only's scope.
 - **Exposure floor** — off by default; loopback bind default; unauthenticated
   non-loopback bind is refused. *Invariant:* a network-accessible bind
   without auth never serves.
@@ -165,6 +165,7 @@ principal's chat jobs). Pin:
 > **Implementation:** `reference/rfcs/fleet-dashboard.md` (the design
 > artifact, `serves:` this job) — the Hermes-Desktop adapter served from
 > `src/web/` (`switchroom-web`), with unmodified Hermes Desktop run in remote
-> mode as the client. The `telegram-only` operator-console carve-out that
-> makes operator-chat legal lives in `reference/invariants.md`. Those churn;
-> this job outlives them.
+> mode as the client. `reference/invariants.md` records why the admin console
+> is out of `telegram-only`'s scope (it governs principal channels, not admin
+> tooling) and the conditions that keep it so. Those churn; this job outlives
+> them.
