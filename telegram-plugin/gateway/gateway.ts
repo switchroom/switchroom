@@ -3603,7 +3603,6 @@ function maybeIdleClear(): void {
   // could arrive between the gate check and the tmux send; /clear then lands in
   // claude's prompt buffer and runs at the next idle prompt (inject.ts FUTURE-GAP).
   void injectSlashCommandImpl(agentName, '/clear')
-    .then(() => { void postIdleClearNotice(idleClearMs); })
     .catch((err: unknown) => {
       process.stderr.write(
         `telegram gateway: idle /clear inject failed for ` +
@@ -3611,36 +3610,6 @@ function maybeIdleClear(): void {
       );
     })
     .finally(() => { idleClearDispatching = false; });
-}
-
-/** Subtle one-line notice so the operator knows the session was auto-cleared. */
-async function postIdleClearNotice(idleClearMs: number): Promise<void> {
-  try {
-    const chatId = loadAccess().allowFrom[0];
-    if (!chatId) return;
-    const threadId = topicForRecipient({
-      recipientChatId: chatId,
-      resolvedTopic:
-        resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
-        ?? chatThreadMap.get(chatId),
-      supergroupChatId: resolveAgentSupergroupChatId(),
-    });
-    const hrs = Math.round((idleClearMs / 3_600_000) * 10) / 10;
-    const text =
-      `🧹 <b>Cleared after ${hrs}h idle</b> — fresh slate next message; ` +
-      `long-term memory is in Hindsight.`;
-    await swallowingApiCall(
-      () =>
-        bot.api.sendMessage(chatId, text, {
-          parse_mode: 'HTML',
-          disable_notification: true,
-          ...(threadId != null ? { message_thread_id: threadId } : {}),
-        }),
-      { chat_id: chatId, verb: 'idleAutoClear.notice' },
-    );
-  } catch {
-    /* best-effort notice — the /clear itself still happened */
-  }
 }
 
 /**
