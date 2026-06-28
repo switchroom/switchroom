@@ -107,6 +107,7 @@ Each links its job spec in `jobs/`.
 - [`track-plan-quota-live.md`](jobs/track-plan-quota-live.md)
 - [`steer-or-queue-mid-flight.md`](jobs/steer-or-queue-mid-flight.md)
 - [`approve-what-my-agent-can-touch.md`](jobs/approve-what-my-agent-can-touch.md)
+- [`see-my-whole-fleet-from-one-screen.md`](jobs/see-my-whole-fleet-from-one-screen.md)
 
 ### subscription-honest
 - [`keep-my-subscription-honest.md`](jobs/keep-my-subscription-honest.md)
