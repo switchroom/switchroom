@@ -278,6 +278,8 @@ import {
   isSrToClaudeTransition,
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
+  MODEL_CALLBACK_SR,
+  srFriendlyLabel,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
@@ -20849,6 +20851,16 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
+    // sr-* inject waits for claude to respond (can take 10-30s). Edit the
+    // menu immediately to show a "working on it" state so the operator isn't
+    // left looking at a stale menu with no feedback. The final edit (✅/❌)
+    // replaces this once the inject returns.
+    if (data.startsWith(MODEL_CALLBACK_SR)) {
+      const srLabel = escapeHtmlForTg(srFriendlyLabel(data.slice(MODEL_CALLBACK_SR.length)))
+      await ctx
+        .editMessageText(`⏳ Switching session to <b>${srLabel}</b>…`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } })
+        .catch(() => {})
+    }
     try {
       const prevSessionModel = activeSessionModelOverride
       const outcome = await handleModelMenuCallback(data, modelDeps)

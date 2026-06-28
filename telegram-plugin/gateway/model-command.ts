@@ -345,7 +345,7 @@ export function expandSrAlias(arg: string): string {
   return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
 }
 
-function srFriendlyLabel(srName: string): string {
+export function srFriendlyLabel(srName: string): string {
   return SR_MODEL_LABELS[srName] ?? srName.replace(/^sr-/, '').replace(/-/g, ' ')
 }
 
