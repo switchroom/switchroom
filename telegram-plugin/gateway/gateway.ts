@@ -278,6 +278,8 @@ import {
   isSrToClaudeTransition,
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
+  MODEL_CALLBACK_SR,
+  srFriendlyLabel,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
@@ -20849,6 +20851,23 @@ bot.on('callback_query:data', async ctx => {
       return
     }
     await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
+    // sr-* inject waits for claude to respond (can take 10-30s). Edit the
+    // menu immediately to show a "working on it" state so the operator isn't
+    // left looking at a stale menu with no feedback. The final edit (✅/❌)
+    // replaces this once the inject returns.
+    // NOTE: this await yields the event loop, so a new inbound turn could
+    // start between here and handleModelMenuCallback's inner isBusy() check.
+    // We track whether we applied the interim edit so we can skip the
+    // toastOnly short-circuit if we did — a toastOnly return after the interim
+    // edit would leave the menu stuck button-less.
+    let didInterimSrEdit = false
+    if (data.startsWith(MODEL_CALLBACK_SR)) {
+      const srLabel = escapeHtmlForTg(srFriendlyLabel(data.slice(MODEL_CALLBACK_SR.length)))
+      await ctx
+        .editMessageText(`⏳ Switching session to <b>${srLabel}</b>…`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } })
+        .catch(() => {})
+      didInterimSrEdit = true
+    }
     try {
       const prevSessionModel = activeSessionModelOverride
       const outcome = await handleModelMenuCallback(data, modelDeps)
@@ -20858,9 +20877,11 @@ bot.on('callback_query:data', async ctx => {
       if (outcome.selectedModel) {
         activeSessionModelOverride = outcome.selectedModel
       }
-      // toastOnly: a no-op outcome that should not disturb the menu (defence
-      // in depth — the isBusy() short-circuit above is the live path).
-      if (outcome.toastOnly) return
+      // toastOnly: leave the menu untouched — but only if we haven't already
+      // cleared its buttons with the interim sr-* edit. If we have, fall
+      // through to the final edit so the message is recovered (busyReply or
+      // the full menu) rather than left permanently button-less.
+      if (outcome.toastOnly && !didInterimSrEdit) return
 
       // sr-* → Claude transition via the model menu: trigger a graceful restart.
       // Switching FROM an sr-* (LiteLLM/OpenRouter) model BACK to a Claude model
