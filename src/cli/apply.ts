@@ -271,9 +271,13 @@ export async function provisionLiteLLMKeys(
       optedIn.push({ name, litellm: resolved.litellm ?? {} });
     }
   }
-  if (optedIn.length === 0) return; // zero-impact when the feature is off
+  // Also check if we need to provision the hindsight service key.
+  const needsHindsight =
+    (config as { litellm?: { enabled?: boolean } }).litellm?.enabled === true &&
+    (config as { memory?: { backend?: string } }).memory?.backend === "hindsight";
+  if (optedIn.length === 0 && !needsHindsight) return; // zero-impact when the feature is off
 
-  // Lazy imports — only paid for when at least one agent opts in.
+  // Lazy imports — only paid for when at least one agent opts in or hindsight is wired.
   const [{ getViaBrokerStructured, putViaBroker }, { ensureTeam, ensureKey }, { addAgentSecret }] =
     await Promise.all([
       import("../vault/broker/client.js"),
@@ -482,6 +486,59 @@ export async function provisionLiteLLMKeys(
           `  ! litellm: could not write ACL grants to config (${(err as Error).message}).\n`,
         ),
       );
+    }
+  }
+
+  // Provision the hindsight service key when globally enabled + hindsight backend.
+  // The key is stored at litellm/hindsight/api-key, same vault path that
+  // startHindsight() reads at container launch time.
+  if (needsHindsight) {
+    // Provision a per-service virtual key for the hindsight container.
+    // Uses the same top-level base_url / admin_key / team as the agent keys.
+    const baseUrl = topLevel?.base_url;
+    const adminKeyRef = topLevel?.admin_key;
+    if (baseUrl && adminKeyRef) {
+      const hindsightVaultKey = "litellm/hindsight/api-key";
+      try {
+        const existing = await getViaBrokerStructured(hindsightVaultKey);
+        if (existing.kind === "ok") {
+          writeOut(chalk.gray(`  ~ litellm/hindsight: key already provisioned (skipped)\n`));
+        } else {
+          // Resolve admin key (may be a vault ref).
+          let masterKey = adminKeyRef;
+          if (isVaultReference(adminKeyRef)) {
+            const resolved = await getViaBrokerStructured(parseVaultReference(adminKeyRef));
+            if (resolved.kind === "ok" && resolved.entry.kind === "string") {
+              masterKey = resolved.entry.value;
+            } else {
+              throw new Error(`admin_key vault ref '${adminKeyRef}' did not resolve`);
+            }
+          }
+          const team = topLevel?.team ?? "switchroom";
+          await ensureTeam(baseUrl, masterKey, team);
+          const { key } = await ensureKey({
+            baseUrl,
+            masterKey,
+            alias: "service:hindsight",
+            team,
+            metadata: { service: "hindsight", env: "fleet", ...(oauthAccount ? { oauth_account: oauthAccount } : {}) },
+          });
+          const put = await putViaBroker(
+            hindsightVaultKey,
+            { kind: "string", value: key },
+            { passphrase: passphrase! },
+          );
+          if (put.kind === "ok") {
+            writeOut(chalk.green(`  + litellm/hindsight: provisioned virtual key (team '${team}')\n`));
+          } else {
+            throw new Error(`vault write failed (${put.kind})`);
+          }
+        }
+      } catch (err) {
+        ctx.writeErr(
+          chalk.yellow(`  ! litellm/hindsight: key provisioning failed — ${(err as Error).message}\n`),
+        );
+      }
     }
   }
 }
