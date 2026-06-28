@@ -51,6 +51,41 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
 {{/each}}
 {{/if}}
 
+  # LiteLLM virtual-key fetch for the GATEWAY process (outer-pass hoist).
+  # The INNER block below fetches this same key for the `claude` process;
+  # the gateway daemon forks HERE (in the outer pass) so it needs
+  # ANTHROPIC_CUSTOM_HEADERS exported BEFORE the gateway fork below, or
+  # discoverSrModels() returns [] and /model never shows OpenRouter entries.
+  #
+  # Mirrors the INNER block's fail-open logic exactly:
+  #   - missing key   → log + skip export (gateway talks direct OAuth)
+  #   - proxy down    → log + strip ALL routing env (fail-open)
+  #   - ANTHROPIC_CUSTOM_HEADERS already set → skip (idempotent)
+  #
+  # SWITCHROOM_AGENT_NAME is injected by compose env (compose.ts:1816)
+  # so it is available here, before the inner-pass export at line ~320.
+  if [ -n "$SWITCHROOM_LITELLM" ] && [ -z "$ANTHROPIC_CUSTOM_HEADERS" ] && command -v switchroom >/dev/null 2>&1; then
+    sr_ll_key="$(switchroom vault get "litellm/$SWITCHROOM_AGENT_NAME/api-key" 2>/dev/null || true)"
+    sr_ll_ok=""
+    if [ -z "$sr_ll_key" ]; then
+      echo "litellm(outer): no virtual key for agent '$SWITCHROOM_AGENT_NAME' — gateway will use direct OAuth (no tracking/guardrail)" >&2
+    elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
+         && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
+      echo "litellm(outer): proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+    else
+      sr_ll_ok="1"
+    fi
+    if [ -n "$sr_ll_ok" ]; then
+      export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
+x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
+x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
+      export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    else
+      unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+    fi
+    unset sr_ll_key sr_ll_ok
+  fi
+
   # Tiny in-process supervisor: runs cmd in a respawn loop with
   # exponential backoff (1→2→4…→60s cap) and NEVER permanently gives
   # up. Rationale (RFC J / install-validation 2026-05-17): the
