@@ -255,6 +255,7 @@ import {
   sessionModelFromConfirmation,
   classifyDiscoveredOptions,
   MODEL_CALLBACK_REFRESH,
+  MODEL_CALLBACK_HEADER,
   MODEL_CALLBACK_SR,
   SR_MODEL_LABELS,
   type ModelMenuDeps,
@@ -506,16 +507,35 @@ describe("buildModelMenu — with sr-* models", () => {
     expect(srButton?.callback_data).toBe(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`);
   });
 
-  it("shows 🌐 = non-Anthropic legend when sr-* models are present", async () => {
+  it("shows section header rows when both claude and sr-* models present", async () => {
     const { deps } = makeMenuDepsWithSr();
     const menu = await buildModelMenu(deps);
-    expect(menu.text).toContain("🌐 = non-Anthropic");
+    const allButtons = menu.keyboard!.flat();
+    const headers = allButtons.filter((b) => b.callback_data === MODEL_CALLBACK_HEADER);
+    expect(headers.length).toBe(2);
+    expect(headers[0].text).toContain("Claude");
+    expect(headers[1].text).toContain("OpenRouter");
+  });
+
+  it("no section headers when only claude models (no sr-*)", async () => {
+    const { deps } = makeMenuDeps();
+    const menu = await buildModelMenu(deps);
+    const allButtons = (menu.keyboard ?? []).flat();
+    const headers = allButtons.filter((b) => b.callback_data === MODEL_CALLBACK_HEADER);
+    expect(headers.length).toBe(0);
+  });
+
+  it("shows subscription/OpenRouter legend when sr-* models are present", async () => {
+    const { deps } = makeMenuDepsWithSr();
+    const menu = await buildModelMenu(deps);
+    expect(menu.text).toContain("Max/Pro subscription");
+    expect(menu.text).toContain("OpenRouter");
   });
 
   it("no legend when no sr-* models in picker", async () => {
     const { deps } = makeMenuDeps();
     const menu = await buildModelMenu(deps);
-    expect(menu.text).not.toContain("🌐 = non-Anthropic");
+    expect(menu.text).not.toContain("OpenRouter");
   });
 });
 
