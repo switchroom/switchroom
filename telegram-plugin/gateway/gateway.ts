@@ -189,6 +189,7 @@ const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
 import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace, telegramHtmlToPlainText } from '../format.js'
+import { sanitizeTelegramHtml } from '../html-sanitize.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
   validateInlineKeyboard,
@@ -11667,6 +11668,15 @@ function handleSessionEvent(ev: SessionEvent): void {
             //   (no flash). The draft transport is permanently retired — both modes
             //   use sendMessage + editMessageText for any message that does open.
             minInitialChars: ANSWER_LANE.minInitialChars,
+            // Render raw assistant transcript markdown → Telegram HTML before
+            // any parse_mode:'HTML' send/edit, matching every other outbound
+            // lane (handleStreamReply, the reply handler, the turn-flush
+            // backstop, handlePtyPartial). Without this the answer-stream lane
+            // shipped raw text — `**bold**` arrived as literal asterisks and
+            // agent narration read unformatted (the answer-stream-raw-markdown
+            // bug). Injected as a dependency (same pattern as the PTY partial
+            // handler's `renderText`) so answer-stream.ts stays format-free.
+            renderText: (text: string) => sanitizeTelegramHtml(markdownToHtml(text)),
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
