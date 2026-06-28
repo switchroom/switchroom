@@ -560,7 +560,11 @@ export async function handleModelMenuCallback(
           .find((l) => /set model|switched/i.test(l)) ?? `Switched to ${friendlyName} (session)`
       return {
         answer: confirmation,
-        reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(confirmation)}`),
+        // Use the static (no-discover) path — after a text-inject the picker
+        // is in flux and discover() reliably fails, producing a spurious
+        // "(picker unavailable)" line that reads as an error when the switch
+        // actually succeeded.
+        reply: await menuWithBannerStatic(deps, `✅ ${deps.escapeHtml(confirmation)}`),
         selectedModel: srName,
       }
     }
@@ -681,5 +685,22 @@ async function menuWithBanner(
     text: [banner, '', fresh.text].join('\n'),
     html: true,
     ...(fresh.keyboard ? { keyboard: fresh.keyboard } : {}),
+  }
+}
+
+// Static variant — skips discover() entirely and uses the v1 text path.
+// Use after a text-inject where the picker state is inherently uncertain:
+// discover() reliably fails immediately post-inject, producing a spurious
+// "(picker unavailable)" warning that reads as an error.
+async function menuWithBannerStatic(
+  deps: ModelMenuDeps & ModelCommandDeps,
+  banner: string,
+): Promise<ModelMenuReply> {
+  const v1 = await handleModelCommand({ kind: 'show' }, deps)
+  return {
+    text: [banner, '', v1.text].join('\n'),
+    html: true,
+    // No keyboard — picker state is unknown after a text-inject; operator
+    // can tap /model to get a fresh interactive menu.
   }
 }
