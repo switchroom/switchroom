@@ -7972,8 +7972,25 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // module-scope currentTurn, which a future refactor could let roll over
   // mid-call.
   const turn = currentTurn
-  const chat_id = String(args.chat_id ?? '')
-  if (!chat_id) throw new Error('reply: chat_id is required')
+  const _rawChatId = String(args.chat_id ?? '')
+  if (!_rawChatId) throw new Error('reply: chat_id is required')
+  // Non-Claude models (e.g. Gemini via LiteLLM sr-* routing) sometimes pass a
+  // chat_id that is not in the allowlist — either an int/string mismatch, or
+  // the model echoing the wrong identifier from context. When the raw value
+  // fails the allowlist check and the active turn has a validated sessionChatId,
+  // fall back to the turn's origin chat so the reply still lands correctly.
+  const chat_id = (() => {
+    const _a = loadAccess()
+    if (_a.allowFrom.includes(_rawChatId) || _rawChatId in _a.groups) return _rawChatId
+    if (turn?.sessionChatId && (_a.allowFrom.includes(turn.sessionChatId) || turn.sessionChatId in _a.groups)) {
+      process.stderr.write(
+        `telegram gateway: reply: model passed chat_id "${_rawChatId}" (not allowlisted) — ` +
+          `routing to active turn chat "${turn.sessionChatId}"\n`,
+      )
+      return turn.sessionChatId
+    }
+    return _rawChatId // let assertAllowedChat below throw the human-readable error
+  })()
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
   let text = repairEscapedWhitespace(rawText)
