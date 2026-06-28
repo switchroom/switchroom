@@ -283,6 +283,7 @@ function makeMenuDeps(overrides: Partial<ModelMenuDeps> = {}) {
     },
     isBusy: () => false,
     getQuotaBrief: async () => "29% / 5h · 33% / 7d",
+    discoverSrModels: async () => [],
     ...overrides,
   };
   return { deps, calls, injectCalls: base.calls };
@@ -475,13 +476,10 @@ describe("SR_MODEL_LABELS", () => {
 });
 
 describe("buildModelMenu — with sr-* models", () => {
+  // sr-* models now come from discoverSrModels (LiteLLM), not the claude picker.
   function makeMenuDepsWithSr(overrides: Partial<ModelMenuDeps> = {}) {
     return makeMenuDeps({
-      discover: async () => ({
-        ok: true as const,
-        options: OPTIONS_WITH_SR,
-        currentLabel: "Sonnet",
-      }),
+      discoverSrModels: async () => ["sr-gemini-2.5-pro", "sr-deepseek-r1"],
       ...overrides,
     });
   }
@@ -550,11 +548,7 @@ describe("buildModelMenu — with sr-* models", () => {
 describe("handleModelMenuCallback — sr-* selection", () => {
   function makeMenuDepsWithSr(overrides: Partial<ModelMenuDeps> = {}) {
     return makeMenuDeps({
-      discover: async () => ({
-        ok: true as const,
-        options: OPTIONS_WITH_SR,
-        currentLabel: "Sonnet",
-      }),
+      discoverSrModels: async () => ["sr-gemini-2.5-pro", "sr-deepseek-r1"],
       ...overrides,
     });
   }

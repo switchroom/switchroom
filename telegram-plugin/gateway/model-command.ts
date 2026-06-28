@@ -214,6 +214,11 @@ export interface ModelMenuDeps {
   getAgentName: () => string
   /** One-line quota summary (e.g. "29% / 5h · 33% / 7d") or null. */
   getQuotaBrief: () => Promise<string | null>
+  /**
+   * Fetch sr-* model names available via LiteLLM for this agent.
+   * Returns [] when LiteLLM is not configured or the probe fails.
+   */
+  discoverSrModels: () => Promise<string[]>
   escapeHtml: (s: string) => string
 }
 
@@ -344,9 +349,10 @@ export async function buildModelMenu(
 ): Promise<ModelMenuReply> {
   if (deps.isBusy()) return busyReply(deps)
 
-  const [discovered, quota] = await Promise.all([
+  const [discovered, quota, srNames] = await Promise.all([
     deps.discover(deps.getAgentName()),
     deps.getQuotaBrief().catch(() => null),
+    deps.discoverSrModels().catch(() => [] as string[]),
   ])
 
   if (!discovered.ok) {
@@ -364,7 +370,10 @@ export async function buildModelMenu(
   // or a prior session switch). Labelling the ✔ row "Now:" was misleading —
   // it could read "Opus 4.8" while the live session is on Fable. Call it what
   // it is, and tell the operator a switch applies to the live session.
-  const { claude: claudeOptions, sr: srOptions } = classifyDiscoveredOptions(discovered.options)
+  // sr-* models come from LiteLLM (/model/info via discoverSrModels), not the
+  // claude picker — the CLI only knows Anthropic models.
+  const { claude: claudeOptions } = classifyDiscoveredOptions(discovered.options)
+  const srOptions: ModelPickerOption[] = srNames.map((name, i) => ({ index: i, label: name, detail: '', current: false }))
   const current = claudeOptions.find((o) => o.current)
   const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
   if (discovered.dismissFailed) {
