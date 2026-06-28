@@ -3317,6 +3317,23 @@ function releaseTurnBufferGate(key: string, endingTurn?: CurrentTurn): void {
  * Idempotent: a second purge is a no-op `.delete()` on a key already
  * gone — handlers that already purge elsewhere are unharmed.
  */
+function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
+  try {
+    const rec =
+      JSON.stringify({
+        ts: Math.floor(endedAt / 1000),
+        agent: process.env.SWITCHROOM_AGENT_NAME ?? 'unknown',
+        duration_ms: turn.startedAt > 0 ? endedAt - turn.startedAt : 0,
+        tools: turn.toolCallCount ?? 0,
+        status: turn.finalAnswerDelivered ? 'complete' : 'no_reply',
+        turn_id: turn.turnId,
+      }) + '\n'
+    appendFileSync('/state/agent/turns.jsonl', rec)
+  } catch {
+    // best-effort — never let metrics emission break turn teardown
+  }
+}
+
 function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // PR-4e — keyed liveness + keyed clear (leak-close-at-origin). Flag-OFF: the
   // guard is `currentTurn === turn` and the clear nulls the singleton, verbatim.
@@ -3331,9 +3348,11 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // Status-surface observability: one line at every turn CLEAR (with how far
   // the turn got), plus a DEGRADED warning when the turn did tool work but the
   // live feed never opened because its sends failed (the resume-400 signature).
+  const turnEndedAt = Date.now()
   process.stderr.write(
-    `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, Date.now())}\n`,
+    `telegram gateway: ${formatTurnLifecycle('clear', 'turn_end', turn, turnEndedAt)}\n`,
   )
+  emitTurnRecord(turn, turnEndedAt)
   const degraded = detectStatusSurfaceDegraded(turn)
   if (degraded != null) {
     process.stderr.write(
