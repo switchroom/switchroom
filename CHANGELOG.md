@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.16.15 — fix sr-* success reply showing spurious "picker unavailable"
+
+After a successful sr-* model tap the reply now shows a clean ✅ banner
++ static model info. Previously, `buildModelMenu` called `discover()`,
+which reliably fails immediately post-inject (picker in flux), prepending
+`(picker unavailable: picker did not render…)` to a successful switch —
+making it look like an error. (#2642)
+
 ## v0.16.14 — sr-* model tap: immediate ⏳ feedback while switching
 
 When tapping an sr-* model button in `/model`, the gateway now immediately
