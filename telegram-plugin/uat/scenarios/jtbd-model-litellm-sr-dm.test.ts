@@ -42,9 +42,11 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
       const sc = await spinUp({ agent: AGENT });
       try {
         await sc.sendDM("/model");
+        // 60s — if an obligation turn is being processed when /model lands,
+        // the menu may be buffered until the turn drains (~40s max).
         const menu = await sc.expectMessage(/Default \(new sessions\):/i, {
           from: "bot",
-          timeout: 30_000,
+          timeout: 60_000,
         });
 
         // ── 1. Section headers ──────────────────────────────────────────
