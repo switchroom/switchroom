@@ -140,11 +140,11 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
       const sc = await spinUp({ agent: AGENT });
       try {
         await sc.sendDM("/model");
-        // 60s — test 2 runs after test 1's restore restart, which takes ~15s.
-        // If the restart is still finishing when /model lands, it may be queued.
+        // 90s — test 2 runs after test 1's restore restart. The model-switch
+        // restart can take 30–60s to fully boot; 90s gives comfortable margin.
         const menu = await sc.expectMessage(/Default \(new sessions\):/i, {
           from: "bot",
-          timeout: 60_000,
+          timeout: 90_000,
         });
         const kb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
         const flat = (kb ?? []).flat();
