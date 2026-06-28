@@ -36,6 +36,7 @@ describe("TOOLS export", () => {
     expect(names).toEqual([
       "audit_tail",
       "config_get",
+      "cron_doctor",          // read-only cron health report
       "cron_list",
       "peers_list",            // identity / peer-awareness
       "schedule_add",
@@ -98,6 +99,16 @@ describe("dispatchTool — happy path", () => {
       skills: ["s"],
       bundled_skills: {},
     });
+  });
+
+  it("cron_doctor shells `cron doctor` and parses the JSON report", () => {
+    const report = { agent: "a", entry_count: 0, findings: [], healthy: true };
+    okCall(JSON.stringify(report) + "\n");
+    const res = dispatchTool("cron_doctor", { agent: "a" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual(report);
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["cron", "doctor", "--agent", "a"]);
   });
 
   it("peers_list shells out with no --agent flag (caller identity is env-pinned)", () => {

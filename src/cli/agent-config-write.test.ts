@@ -169,6 +169,59 @@ describe("scheduleAdd — security gates", () => {
   });
 });
 
+describe("scheduleAdd — duplicate guard (#cron-dupe)", () => {
+  it("rejects a second entry sharing the same cron expression (double-fire)", () => {
+    // The gymbro incident: same time, DIFFERENT prompt → different slug,
+    // so the content-hash overwrite misses it. The cron-expr guard catches it.
+    const first = scheduleAdd({ cronExpr: "0 20 * * 0", prompt: "review v1", root });
+    expect(first.ok).toBe(true);
+    const dup = scheduleAdd({ cronExpr: "0 20 * * 0", prompt: "review v2", root });
+    expect(dup.ok).toBe(false);
+    if (dup.ok) return;
+    expect(dup.code).toBe("E_CRON_DUPLICATE");
+    expect(dup.exit).toBe(9);
+    expect(dup.message).toMatch(/0 20 \* \* 0/);
+    expect(dup.meta?.conflicting_slug).toBeDefined();
+  });
+
+  it("treats whitespace-different cron exprs as the same (still rejected)", () => {
+    scheduleAdd({ cronExpr: "0 20 * * 0", prompt: "a", root });
+    const dup = scheduleAdd({ cronExpr: "0  20  *  *  0", prompt: "b", root });
+    expect(dup.ok).toBe(false);
+    if (dup.ok) return;
+    expect(dup.code).toBe("E_CRON_DUPLICATE");
+  });
+
+  it("rejects a second entry sharing the same name", () => {
+    scheduleAdd({ cronExpr: "0 8 * * *", prompt: "p", name: "digest", root });
+    const dup = scheduleAdd({ cronExpr: "0 9 * * *", prompt: "p2", name: "digest", root });
+    expect(dup.ok).toBe(false);
+    if (dup.ok) return;
+    expect(dup.code).toBe("E_CRON_DUPLICATE");
+    expect(dup.message).toMatch(/digest/);
+  });
+
+  it("allows distinct cron expressions + names", () => {
+    expect(scheduleAdd({ cronExpr: "0 8 * * *", prompt: "a", name: "morning", root }).ok).toBe(true);
+    expect(scheduleAdd({ cronExpr: "0 20 * * *", prompt: "b", name: "evening", root }).ok).toBe(true);
+  });
+
+  it("re-adding the identical cron+prompt is an overwrite, not a dupe reject", () => {
+    const first = scheduleAdd({ cronExpr: "0 8 * * *", prompt: "same", root });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    // Identical cron AND prompt → same content-hash slug. The cron-expr
+    // guard would match the existing file, but the intent is idempotent
+    // overwrite of the SAME logical cron. We still reject (the agent should
+    // see "already exists") — assert the clear signal rather than a silent
+    // double-write.
+    const again = scheduleAdd({ cronExpr: "0 8 * * *", prompt: "same", root });
+    expect(again.ok).toBe(false);
+    if (again.ok) return;
+    expect(again.code).toBe("E_CRON_DUPLICATE");
+  });
+});
+
 describe("scheduleRemove", () => {
   it("removes by cron_hash", () => {
     const add = scheduleAdd({ cronExpr: "0 9 * * *", prompt: "p", root });

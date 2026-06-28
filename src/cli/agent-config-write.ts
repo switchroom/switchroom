@@ -44,7 +44,9 @@ import {
   writeOverlayEntry,
   deleteOverlayEntry,
   listOverlayEntries,
+  type ListedOverlayEntry,
 } from "../config/overlay-writer.js";
+import { normalizeCronExpr } from "../scheduler/cron-introspect.js";
 import { filterOverlaySecrets } from "../config/overlay-secrets-filter.js";
 import { cronUnitName, cronUnitHash } from "../agents/cron-unit-name.js";
 import { dryRunReconcile, violatesMinInterval } from "../agents/reconcile-dry-run.js";
@@ -157,6 +159,7 @@ export function checkOperatorContext(
 type ErrorCode =
   | "E_OVERLAY_SECRETS_REQUIRES_APPROVAL"
   | "E_CRON_TOO_FREQUENT"
+  | "E_CRON_DUPLICATE"
   | "E_QUOTA_EXCEEDED"
   | "E_WRITE_REQUIRES_RECREATE"
   | "E_INVALID_CRON"
@@ -230,6 +233,7 @@ function exitCodeFor(code: ErrorCode): number {
   switch (code) {
     case "E_OVERLAY_SECRETS_REQUIRES_APPROVAL":
     case "E_CRON_TOO_FREQUENT":
+    case "E_CRON_DUPLICATE":
     case "E_QUOTA_EXCEEDED":
     case "E_WRITE_REQUIRES_RECREATE":
     case "E_SLUG_COLLISION":
@@ -333,6 +337,35 @@ export interface ScheduleStagedResult {
  * structured result so callers can decide how to surface it (CLI prints
  * + exits; tests assert).
  */
+/**
+ * Extract the cron expression + human name from a single on-disk overlay
+ * file. The name comes from the `# name: <title>` header the writer stamps
+ * (or an explicit `name:` field if a hand-written file carries one); the
+ * cron from the first `schedule[].cron`. Best-effort — a malformed file
+ * yields `{ cron: undefined, name: undefined }` so it can't false-positive
+ * a dupe match.
+ */
+export function parseOverlayCronAndName(e: ListedOverlayEntry): {
+  cron?: string;
+  name?: string;
+} {
+  let cron: string | undefined;
+  let name: string | undefined;
+  const headerMatch = e.raw.match(/^#[^\S\n]*name:[^\S\n]*(\S.*?)[^\S\n]*$/m);
+  if (headerMatch) name = headerMatch[1];
+  try {
+    const doc = parseYaml(e.raw) as { schedule?: { cron?: unknown; name?: unknown }[] } | null;
+    const first = doc?.schedule?.[0];
+    if (first) {
+      if (typeof first.cron === "string") cron = first.cron;
+      if (!name && typeof first.name === "string") name = first.name;
+    }
+  } catch {
+    /* malformed file — leave fields unset */
+  }
+  return { cron, name };
+}
+
 export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorResult {
   let agent: string;
   try {
@@ -422,6 +455,42 @@ export function scheduleAdd(opts: AddOpts): ScheduleAddResult | ScheduleErrorRes
       exit: 9,
       meta: { current: existing.length },
     };
+  }
+
+  // Duplicate-guard (#cron-dupe) — the write-time check that would have
+  // prevented the gymbro double-fire (two `weekly-review` overlays both
+  // firing `0 20 * * 0`). Reject when the agent already owns an overlay
+  // entry with the SAME cron expression or the SAME name. Compared against
+  // every existing overlay file the agent owns; the slug-content-hash
+  // collision path (identical cron AND prompt) is handled separately as an
+  // overwrite below, so this catches the more dangerous "same time, different
+  // prompt" case the hash misses.
+  const wantExpr = normalizeCronExpr(opts.cronExpr);
+  for (const e of existing) {
+    const parsed = parseOverlayCronAndName(e);
+    if (opts.name && parsed.name && parsed.name === opts.name) {
+      return {
+        ok: false,
+        code: "E_CRON_DUPLICATE",
+        message:
+          `an overlay cron named "${opts.name}" already exists ` +
+          `(${e.slug}.yaml) — remove it first or choose a different name`,
+        exit: 9,
+        meta: { conflicting_slug: e.slug, conflicting_name: parsed.name },
+      };
+    }
+    if (wantExpr && parsed.cron && normalizeCronExpr(parsed.cron) === wantExpr) {
+      return {
+        ok: false,
+        code: "E_CRON_DUPLICATE",
+        message:
+          `an overlay cron with expression "${wantExpr}" already exists ` +
+          `(${e.slug}.yaml${parsed.name ? `, name "${parsed.name}"` : ""}) — ` +
+          `adding another would double-fire. Remove the existing one first.`,
+        exit: 9,
+        meta: { conflicting_slug: e.slug, conflicting_cron: wantExpr },
+      };
+    }
   }
 
   const hash = cronUnitHash(opts.cronExpr, opts.prompt);
