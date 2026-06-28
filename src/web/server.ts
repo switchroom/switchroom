@@ -285,6 +285,13 @@ function extractBearerToken(req: Request): string | null {
     const idx = parts.indexOf("bearer");
     if (idx >= 0 && idx + 1 < parts.length) return parts[idx + 1];
   }
+  // Hermes Desktop sends token as ?token= query param on WS upgrade and
+  // X-Hermes-Session-Token header on REST calls.
+  const url = new URL(req.url);
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) return queryToken;
+  const hermesHeader = req.headers.get("X-Hermes-Session-Token");
+  if (hermesHeader) return hermesHeader;
   return null;
 }
 
