@@ -1030,11 +1030,12 @@ function loadAccess(): Access {
   return BOOT_ACCESS ?? readAccessFile()
 }
 
-function assertAllowedChat(chat_id: string): void {
+function assertAllowedChat(chat_id: string | number): void {
+  const id = String(chat_id)
   const access = loadAccess()
-  if (access.allowFrom.includes(chat_id)) return
-  if (chat_id in access.groups) return
-  throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
+  if (access.allowFrom.includes(id)) return
+  if (id in access.groups) return
+  throw new Error(`chat ${id} is not allowlisted — add via /telegram:access`)
 }
 
 function saveAccess(a: Access): void {
@@ -7834,7 +7835,7 @@ async function executeToolCall(tool: string, args: Record<string, unknown>): Pro
 }
 
 async function executeSendChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('send_checklist: chat_id is required')
   const title = args.title as string | undefined
   if (!title) throw new Error('send_checklist: title is required')
@@ -7922,7 +7923,7 @@ async function executeLinearAgentSetup(args: Record<string, unknown>): Promise<{
 }
 
 async function executeUpdateChecklist(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('update_checklist: chat_id is required')
   const message_id = args.message_id as string | undefined
   if (!message_id) throw new Error('update_checklist: message_id is required')
@@ -7971,7 +7972,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // module-scope currentTurn, which a future refactor could let roll over
   // mid-call.
   const turn = currentTurn
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('reply: chat_id is required')
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
@@ -8997,7 +8998,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       args.text = scrub.scrubbed
       emitRuntimeMetric({
         kind: 'voice_scrub_applied',
-        chatKey: statusKey(args.chat_id as string, args.message_thread_id != null
+        chatKey: statusKey(String(args.chat_id ?? ''), args.message_thread_id != null
           ? Number(args.message_thread_id) : undefined),
         replaced: scrub.replaced,
         site: 'stream_reply',
@@ -9012,7 +9013,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // Only check on done=true (the terminal call); intermediate
   // streaming chunks are progress edits, not full sends.
   if (args.done === true) {
-    const sChatId = args.chat_id as string
+    const sChatId = String(args.chat_id ?? '')
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     const sText = args.text as string
     const dup = outboundDedup.check(sChatId, sThreadId, sText, Date.now(), currentTurn?.registryKey ?? null)
@@ -9028,7 +9029,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const access = loadAccess()
   // Detect chat type for throttle-default selection.
   // Private (DM) chats have positive numeric IDs; groups/channels are negative.
-  const streamChatId = args.chat_id as string
+  const streamChatId = String(args.chat_id ?? '')
   const streamIsPrivate = isDmChatId(streamChatId)
   const streamIsForumTopic = args.message_thread_id != null && args.message_thread_id !== ''
   // Pre-allocated draft handoff removed in #553 PR 5 — draft-stream
@@ -9192,7 +9193,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   if (result.messageId != null) {
     try {
       progressDriver?.recordOutboundDelivered(
-        args.chat_id as string,
+        String(args.chat_id ?? ''),
         args.message_thread_id as string | undefined,
       )
     } catch { /* best-effort signal */ }
@@ -9207,7 +9208,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
         ? Number(args.message_thread_id)
         : undefined
       signalTracker.noteSignal(
-        statusKey(args.chat_id as string, threadIdNum),
+        statusKey(String(args.chat_id ?? ''), threadIdNum),
         Date.now(),
       )
     } catch { /* best-effort signal */ }
@@ -9220,13 +9221,13 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     && streamButtonMeta != null
     && streamButtonMeta.size > 0
   ) {
-    rememberAgentButtonMeta(args.chat_id as string, result.messageId, streamButtonMeta)
+    rememberAgentButtonMeta(String(args.chat_id ?? ''), result.messageId, streamButtonMeta)
   }
   // #546 dedup record: capture the final stream_reply text on the
   // terminal call so a subsequent retry (different bridge, same
   // content) lands as a no-op instead of a second message.
   if (args.done === true && result.messageId != null) {
-    const sChatId = args.chat_id as string
+    const sChatId = String(args.chat_id ?? '')
     const sThreadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
     outboundDedup.record(sChatId, sThreadId, args.text as string, Date.now(), currentTurn?.registryKey ?? null)
     // #1445 cross-turn pending-async ambient. The terminal stream_reply
@@ -9306,7 +9307,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // (stream-reply-handler.ts:305) at this point — earlier failures
   // throw or return before reaching here.
   {
-    const sChat = args.chat_id as string
+    const sChat = String(args.chat_id ?? '')
     const sThread = resolveThreadId(sChat, args.message_thread_id as string | undefined)
     // Component 1: pass the turn (finalAnswerDelivered set above for a
     // final stream emit). Interim stream chunks leave it false → no
@@ -9326,7 +9327,7 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   if (!args.chat_id) throw new Error('progress_update: chat_id is required')
   if (!args.text) throw new Error('progress_update: text is required')
 
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   let text = args.text as string
   const threadId = resolveThreadId(chat_id, args.message_thread_id as string | undefined)
   const key = statusKey(chat_id, threadId)
@@ -9810,7 +9811,7 @@ function renderVaultRequestSaveCard(req: PendingVaultRequestSave, agentSlug: str
  * written to vault only on user tap. See #969 P1a.
  */
 async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('vault_request_save: chat_id is required')
   const key = args.key as string
   if (!key || typeof key !== 'string') throw new Error('vault_request_save: key is required')
@@ -9954,7 +9955,7 @@ function renderSecretRequestCard(req: PendingSecretRequest): string {
  * capture (the operator's next message after they tap [Provide securely]).
  */
 async function executeRequestSecret(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('request_secret: chat_id is required')
   const key = args.key as string
   if (!key || typeof key !== 'string') throw new Error('request_secret: key is required')
@@ -10238,7 +10239,7 @@ function renderVaultRequestAccessCard(req: PendingVaultRequestAccess): string {
  * the agent itself can only REQUEST.
  */
 async function executeVaultRequestAccess(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   if (!chat_id) throw new Error('vault_request_access: chat_id is required')
   const key = args.key as string
   if (!key || typeof key !== 'string') throw new Error('vault_request_access: key is required')
@@ -10356,8 +10357,8 @@ async function executeReact(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('react: chat_id is required')
   if (!args.message_id) throw new Error('react: message_id is required')
   if (!args.emoji) throw new Error('react: emoji is required')
-  assertAllowedChat(args.chat_id as string)
-  await lockedBot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
+  assertAllowedChat(String(args.chat_id ?? ''))
+  await lockedBot.api.setMessageReaction(String(args.chat_id ?? ''), Number(args.message_id), [
     { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
   ])
   return { content: [{ type: 'text', text: 'reacted' }] }
@@ -10401,7 +10402,7 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   if (!args.chat_id) throw new Error('edit_message: chat_id is required')
   if (!args.message_id) throw new Error('edit_message: message_id is required')
   if (args.text == null || args.text === '') throw new Error('edit_message: text is required and cannot be empty')
-  assertAllowedChat(args.chat_id as string)
+  assertAllowedChat(String(args.chat_id ?? ''))
   const editAccess = loadAccess()
   const editConfigMode = editAccess.parseMode ?? 'html'
   const editFormat = (args.format as string | undefined) ?? editConfigMode
@@ -10419,7 +10420,7 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
       editRawText = scrub.scrubbed
       emitRuntimeMetric({
         kind: 'voice_scrub_applied',
-        chatKey: statusKey(args.chat_id as string, undefined),
+        chatKey: statusKey(String(args.chat_id ?? ''), undefined),
         replaced: scrub.replaced,
         site: 'edit_message',
       })
@@ -10439,14 +10440,14 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   }
   const edited = await robustApiCall(
     () => lockedBot.api.editMessageText(
-      args.chat_id as string, Number(args.message_id), editText,
+      String(args.chat_id ?? ''), Number(args.message_id), editText,
       ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
     ),
   )
   const id = typeof edited === 'object' && edited ? (edited as any).message_id : args.message_id
   if (HISTORY_ENABLED) {
     try {
-      recordEdit({ chat_id: args.chat_id as string, message_id: Number(args.message_id), text: args.text as string })
+      recordEdit({ chat_id: String(args.chat_id ?? ''), message_id: Number(args.message_id), text: args.text as string })
     } catch (err) {
       process.stderr.write(`telegram gateway: history recordEdit failed: ${err}\n`)
     }
@@ -10456,7 +10457,7 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
 
 async function executeSendTyping(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('send_typing: chat_id is required')
-  const stChatId = args.chat_id as string
+  const stChatId = String(args.chat_id ?? '')
   assertAllowedChat(stChatId)
   // #273: granular chat actions. Default 'typing' preserves the
   // existing tool semantics; agents can opt in to upload_document,
@@ -10490,7 +10491,7 @@ async function executeSendTyping(args: Record<string, unknown>): Promise<unknown
 async function executePinMessage(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('pin_message: chat_id is required')
   if (!args.message_id) throw new Error('pin_message: message_id is required')
-  const pinChatId = args.chat_id as string
+  const pinChatId = String(args.chat_id ?? '')
   assertAllowedChat(pinChatId)
   // #1075: wrap through robustApiCall so flood-wait / transient network
   // errors are retried. THREAD_NOT_FOUND on a stale topic surfaces to the
@@ -10506,7 +10507,7 @@ async function executePinMessage(args: Record<string, unknown>): Promise<unknown
 async function executeDeleteMessage(args: Record<string, unknown>): Promise<unknown> {
   if (!args.chat_id) throw new Error('delete_message: chat_id is required')
   if (!args.message_id) throw new Error('delete_message: message_id is required')
-  const delChatId = args.chat_id as string
+  const delChatId = String(args.chat_id ?? '')
   const delMessageId = Number(args.message_id)
   assertAllowedChat(delChatId)
   await robustApiCall(() => lockedBot.api.deleteMessage(delChatId, delMessageId), { chat_id: delChatId })
@@ -10522,7 +10523,7 @@ async function executeForwardMessage(args: Record<string, unknown>): Promise<unk
   if (!args.chat_id) throw new Error('forward_message: chat_id is required')
   if (!args.from_chat_id) throw new Error('forward_message: from_chat_id is required')
   if (!args.message_id) throw new Error('forward_message: message_id is required')
-  const fwdChatId = args.chat_id as string
+  const fwdChatId = String(args.chat_id ?? '')
   const fwdFromChatId = args.from_chat_id as string
   const fwdMsgId = Number(args.message_id)
   assertAllowedChat(fwdChatId)
@@ -10556,7 +10557,7 @@ async function executeGetRecentMessages(args: Record<string, unknown>): Promise<
     }
   }
   if (!args.chat_id) throw new Error('get_recent_messages: chat_id is required')
-  const chat_id = args.chat_id as string
+  const chat_id = String(args.chat_id ?? '')
   assertAllowedChat(chat_id)
   const rawThread = args.message_thread_id as string | undefined
   let thread_id: number | null | undefined
