@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.16.7 — sr-* model discovery + cron LiteLLM key fix
+
+- `/model` menu now shows OpenRouter (`sr-*`) models by querying LiteLLM
+  `/model/info` directly — previously only Anthropic models appeared because
+  the claude CLI picker never returns `sr-*` names.
+- Cron sessions (`clerk-cron` and any other Tier-1 cron claude) now correctly
+  export `ANTHROPIC_CUSTOM_HEADERS` with the LiteLLM virtual key before the
+  tmux launch. Without this, every cron fire hit the LiteLLM proxy without a
+  key header and received 401 ("Unable to find token in LiteLLM_VerificationTokenTable").
+- New UAT scenario `jtbd-model-litellm-sr-dm` proves the sr-* section appears
+  in the `/model` menu on LiteLLM-enabled agents.
+
 ## v0.16.6 — /model menu grouped by subscription tier
 
 - `/model` inline keyboard now shows two labelled sections when both Claude and
