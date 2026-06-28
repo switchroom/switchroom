@@ -609,6 +609,20 @@ export async function handleModelMenuCallback(
 }
 
 /**
+ * True when the transition from `prevModel` to `nextModel` is a switch FROM
+ * an sr-* (LiteLLM/OpenRouter) model BACK TO a native Claude model. This
+ * signals that a session restart is required — an in-place model-picker select
+ * cannot undo the LiteLLM routing that the sr-* switch established in the live
+ * session. Null / undefined prev means no prior sr-* session — not a transition.
+ */
+export function isSrToClaudeTransition(
+  prevModel: string | null | undefined,
+  nextModel: string,
+): boolean {
+  return !!prevModel?.startsWith('sr-') && !nextModel.startsWith('sr-')
+}
+
+/**
  * Pull the model NAME out of claude's session-switch confirmation so it can
  * be shown in `/status` as the live session model. claude phrases it as
  * "Set model to <name> for this session only" (or "Switched to <name>").
