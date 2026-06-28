@@ -15981,6 +15981,27 @@ bot.command('clear', async ctx => {
 function buildModelDeps(): ModelMenuDeps & ModelCommandDeps {
   return {
     discover: (a) => discoverModels(a),
+    discoverSrModels: async () => {
+      const base = process.env.ANTHROPIC_BASE_URL
+      const headers = process.env.ANTHROPIC_CUSTOM_HEADERS
+      if (!base || !headers) return []
+      const keyMatch = headers.match(/x-litellm-api-key:\s*Bearer\s*(\S+)/)
+      if (!keyMatch) return []
+      try {
+        const res = await fetch(`${base.replace(/\/$/, '')}/model/info`, {
+          headers: { Authorization: `Bearer ${keyMatch[1]}` },
+          signal: AbortSignal.timeout(5000),
+        })
+        if (!res.ok) return []
+        const data = (await res.json()) as { data?: Array<{ model_name: string }> }
+        return (data.data ?? [])
+          .map((m) => m.model_name)
+          .filter((n) => n.startsWith('sr-'))
+          .sort()
+      } catch {
+        return []
+      }
+    },
     select: (a, label) => selectModel(a, label),
     isBusy: () => currentTurn !== null,
     getAgentName: getMyAgentName,
