@@ -3375,15 +3375,24 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // finalAnswerDelivered===false → stays open → re-presented (the intended
   // catch). close() is a no-op for synthetic turns (turnId not in the ledger).
   // No-op when the flag is off.
+  //
+  // #2624 — sr-* model short-reply cascade fix. When the model routes through
+  // LiteLLM (sr-* path), the claude CLI calls reply("OK", {disable_notification:
+  // true}) for short answers — below the 200-char backstop and notification-
+  // suppressed, so isFinalAnswerReply returns false and finalAnswerDelivered stays
+  // false. This triggers a cascade: obligation re-presents with growing 25k-token
+  // context, blocking the agent for minutes. The ack-then-ghost case that
+  // obligations are designed to catch ends via silence_fallback, NOT turn_end.
+  // At turn_end with replyCalled=true the model explicitly signalled completion
+  // AND replied, so the obligation is satisfied regardless of finalAnswerDelivered.
   if (OBLIGATION_LEDGER_ENABLED) {
-    if (turn.finalAnswerDelivered) {
+    if (turn.finalAnswerDelivered || turn.replyCalled) {
       obligationLedger.close(turn.turnId)
     } else {
-      // Turn ended WITHOUT a final answer. If this turn was handling an open
-      // obligation, stamp its grace clock so the idle sweep waits before
-      // re-presenting/escalating — a slow/worker answer may still be in flight
-      // (the over-escalation fix). No-op when turn.turnId isn't an open
-      // obligation (synthetic / already-closed turn).
+      // Turn ended WITHOUT any reply (no ack, no answer). If this turn was
+      // handling an open obligation, stamp its grace clock so the idle sweep
+      // waits before re-presenting/escalating. No-op when turn.turnId isn't
+      // in the ledger (synthetic / already-closed turn).
       obligationLedger.noteTurnEnded(turn.turnId, Date.now())
     }
   }
