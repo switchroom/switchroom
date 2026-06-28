@@ -13,7 +13,7 @@
  *      REPL verb — already on the inject allowlist) and relays the
  *      captured output, with the session-only persistence caveat.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import {
   parseModelCommand,
   handleModelCommand,
@@ -343,6 +343,60 @@ describe("inject allowlist contract", () => {
 // ---------------------------------------------------------------------------
 // Picker-driven menu (v2) — buildModelMenu + handleModelMenuCallback
 // ---------------------------------------------------------------------------
+
+describe("SR_MODEL_ALIASES / expandSrAlias", () => {
+  let expandSrAlias: (arg: string) => string;
+  let SR_MODEL_ALIASES: Record<string, string>;
+
+  beforeAll(async () => {
+    const mod = await import("../gateway/model-command.js");
+    expandSrAlias = mod.expandSrAlias;
+    SR_MODEL_ALIASES = mod.SR_MODEL_ALIASES;
+  });
+
+  it("expands known short aliases to full sr-* ids", () => {
+    expect(expandSrAlias("flash")).toBe("sr-gemini-2.5-flash");
+    expect(expandSrAlias("gemini")).toBe("sr-gemini-2.5-pro");
+    expect(expandSrAlias("deepseek")).toBe("sr-deepseek-v3");
+    expect(expandSrAlias("r1")).toBe("sr-deepseek-r1");
+    expect(expandSrAlias("glm")).toBe("sr-glm-5");
+    expect(expandSrAlias("codex")).toBe("sr-codex-5.5");
+  });
+
+  it("is case-insensitive", () => {
+    expect(expandSrAlias("Flash")).toBe("sr-gemini-2.5-flash");
+    expect(expandSrAlias("CODEX")).toBe("sr-codex-5.5");
+  });
+
+  it("passes through unknown names unchanged", () => {
+    expect(expandSrAlias("opus")).toBe("opus");
+    expect(expandSrAlias("sr-gemini-2.5-flash")).toBe("sr-gemini-2.5-flash");
+    expect(expandSrAlias("claude-opus-4-8")).toBe("claude-opus-4-8");
+  });
+
+  it("every alias target is a valid sr-* model arg", () => {
+    for (const [alias, target] of Object.entries(SR_MODEL_ALIASES)) {
+      expect(target.startsWith("sr-"), `${alias} → ${target} must start with sr-`).toBe(true);
+    }
+  });
+
+  it("handleModelCommand injects expanded sr-* id, not the short alias", async () => {
+    const { deps, calls } = makeDeps({ getActiveSessionModel: () => null });
+    await handleModelCommand({ kind: "set", model: "flash" }, deps);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe("/model sr-gemini-2.5-flash");
+  });
+
+  it("handleModelCommand with alias schedules restart when session is on sr-*", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => "sr-deepseek-v3",
+    });
+    await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(restartCalls).toHaveLength(1);
+    expect(restartCalls[0]).toContain("opus");
+  });
+});
 
 import {
   buildModelMenu,
