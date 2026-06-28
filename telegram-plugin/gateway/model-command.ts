@@ -144,12 +144,14 @@ const PERSIST_NOTE =
   '<i>Session-only — lasts until restart. To persist, set <code>model:</code> in switchroom.yaml and restart.</i>'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
+  const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `<code>${a}</code>`).join(' · ')
   const lines: string[] = []
   if (reason) lines.push(`⚠️ ${deps.escapeHtml(reason)}`)
   lines.push(
     '<b>/model</b> — show or switch the Claude model',
     '<code>/model</code> — show the configured model',
     `<code>/model &lt;name&gt;</code> — switch the live session (${MODEL_ALIASES.map(a => `<code>${a}</code>`).join(' · ')} or a full model id)`,
+    `<i>OpenRouter shortcuts:</i> ${srAliasExamples}`,
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -164,11 +166,13 @@ export async function handleModelCommand(
   if (parsed.kind === 'show') {
     const configured = deps.getConfiguredModel()
     const shown = configured && configured.length > 0 ? configured : 'default'
+    const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `<code>/model ${a}</code>`).join(' · ')
     return {
       text: [
         `<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`,
         `Configured: <code>${deps.escapeHtml(shown)}</code>`,
         `Switch the live session: ${MODEL_ALIASES.map(a => `<code>/model ${a}</code>`).join(' · ')}`,
+        `OpenRouter shortcuts: ${srAliasExamples}`,
         'or <code>/model &lt;full-model-id&gt;</code>',
         PERSIST_NOTE,
       ].join('\n'),
@@ -182,15 +186,18 @@ export async function handleModelCommand(
     return helpText(deps, `not a valid model name: ${parsed.model}`)
   }
 
+  // Expand short aliases: `flash` → `sr-gemini-2.5-flash`, `codex` → `sr-codex-5.5`, etc.
+  const model = expandSrAlias(parsed.model)
+
   // sr-* → Claude: an in-place `/model` inject would leave LiteLLM routing
   // active in the live session because the sr-* model context was set by
   // the proxy at session start, not by claude's own REPL. A graceful restart
   // is the only clean path back to the native OAuth route. This matches the
   // behaviour of the `/restart` command (same mechanism, same marker logic).
   const currentSession = deps.getActiveSessionModel()
-  if (currentSession !== null && isSrModel(currentSession) && isClaudeModel(parsed.model)) {
+  if (currentSession !== null && isSrModel(currentSession) && isClaudeModel(model)) {
     try {
-      await deps.scheduleRestart(`user: /model ${parsed.model} (sr-to-claude restart)`)
+      await deps.scheduleRestart(`user: /model ${model} (sr-to-claude restart)`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       return {
@@ -207,10 +214,10 @@ export async function handleModelCommand(
     }
   }
 
-  const verbHtml = `<code>/model ${deps.escapeHtml(parsed.model)}</code>`
+  const verbHtml = `<code>/model ${deps.escapeHtml(model)}</code>`
   let result: InjectResult
   try {
-    result = await deps.inject(deps.getAgentName(), `/model ${parsed.model}`)
+    result = await deps.inject(deps.getAgentName(), `/model ${model}`)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return {
@@ -315,6 +322,27 @@ export const SR_MODEL_LABELS: Record<string, string> = {
   'sr-deepseek-r1': 'DeepSeek R1',
   'sr-deepseek-v3': 'DeepSeek V3',
   'sr-glm-5': 'GLM-5',
+  'sr-codex-5.5': 'Codex 5.5',
+}
+
+/**
+ * Short text-command aliases for sr-* models. These let the operator type
+ * `/model flash`, `/model codex`, etc. instead of the full `sr-*` id.
+ * Expanded in handleModelCommand before injection; the full sr-* id is what
+ * reaches the agent session and LiteLLM.
+ */
+export const SR_MODEL_ALIASES: Record<string, string> = {
+  flash: 'sr-gemini-2.5-flash',
+  gemini: 'sr-gemini-2.5-pro',
+  deepseek: 'sr-deepseek-v3',
+  r1: 'sr-deepseek-r1',
+  glm: 'sr-glm-5',
+  codex: 'sr-codex-5.5',
+}
+
+/** Expand a short alias (case-insensitive) to its full sr-* id, or return the original. */
+export function expandSrAlias(arg: string): string {
+  return SR_MODEL_ALIASES[arg.toLowerCase()] ?? arg
 }
 
 function srFriendlyLabel(srName: string): string {
