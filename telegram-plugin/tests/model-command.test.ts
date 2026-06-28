@@ -713,7 +713,13 @@ describe("handleModelMenuCallback — sr-* selection", () => {
     expect(calls.select).toHaveLength(0);
     expect(out.answer).toContain("Set model to sonnet");
     expect(out.selectedModel).toBe("sr-gemini-2.5-pro");
-    expect(out.reply.keyboard).toBeDefined();
+    // No keyboard on success: static reply path skips discover() to avoid the
+    // spurious "(picker unavailable)" line that discover() reliably produces
+    // immediately after an inject. Operator taps /model for a fresh menu.
+    expect(out.reply.keyboard).toBeUndefined();
+    // Banner present and text doesn't contain picker-unavailable noise
+    expect(out.reply.text).toContain('✅');
+    expect(out.reply.text).not.toContain('picker unavailable');
   });
 
   it("sr-* tap while busy returns toast-only with no inject", async () => {
