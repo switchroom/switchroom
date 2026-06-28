@@ -33,6 +33,8 @@ import { withConfigError, getConfig } from "./helpers.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { checkAclByAgent } from "../vault/broker/acl.js";
+import { buildCronList, cronDoctor } from "../scheduler/cron-introspect.js";
+import { isCheapCronEnabled } from "../scheduler/cron-routing.js";
 
 // Per-agent audit path. We deliberately do NOT share one log file across
 // all agents — that would let any agent read every other agent's audit
@@ -471,12 +473,53 @@ export function registerAgentConfigCommands(program: Command): void {
         const cfg = getConfig(program);
         try {
           const slice = getAgentSlice(cfg, agent) as { schedule?: unknown[] };
-          const tasks = stripSecretValues(slice.schedule ?? []);
+          // Self-describing rows (#cron-dupe): source/file/tier/context +
+          // duplicate_of cross-links, computed from the overlay-merge
+          // Symbols BEFORE the secret-strip pass roundtrips them away.
+          const rows = buildCronList(slice.schedule ?? [], {
+            cheapCronEnabled: isCheapCronEnabled(),
+          });
+          const tasks = stripSecretValues(rows);
           process.stdout.write(JSON.stringify(tasks) + "\n");
           appendAudit(agent, "cron.list", { ...opts }, 0);
         } catch (err) {
           process.stderr.write(`${(err as Error).message}\n`);
           appendAudit(agent, "cron.list", { ...opts }, 1);
+          process.exit(1);
+        }
+      }),
+    );
+
+  // switchroom cron doctor — read-only health report
+  cron
+    .command("doctor")
+    .description(
+      "Report cron health: duplicate cron expressions, base-vs-overlay " +
+        "name conflicts, and entries missing a resolved tier/context. " +
+        "Read-only.",
+    )
+    .option("--agent <name>", "Target agent (defaults to $SWITCHROOM_AGENT_NAME)")
+    .action(
+      withConfigError(async (opts: { agent?: string }) => {
+        let agent: string;
+        try {
+          agent = resolveTargetAgent(opts.agent);
+        } catch (err) {
+          process.stderr.write(`${(err as Error).message}\n`);
+          appendAudit(opts.agent ?? "<unknown>", "cron.doctor", { ...opts }, 7);
+          process.exit(7);
+        }
+        const cfg = getConfig(program);
+        try {
+          const slice = getAgentSlice(cfg, agent) as { schedule?: unknown[] };
+          const report = cronDoctor(agent, slice.schedule ?? [], {
+            cheapCronEnabled: isCheapCronEnabled(),
+          });
+          process.stdout.write(JSON.stringify(report) + "\n");
+          appendAudit(agent, "cron.doctor", { ...opts }, 0);
+        } catch (err) {
+          process.stderr.write(`${(err as Error).message}\n`);
+          appendAudit(agent, "cron.doctor", { ...opts }, 1);
           process.exit(1);
         }
       }),

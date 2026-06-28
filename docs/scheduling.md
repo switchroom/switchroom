@@ -36,9 +36,14 @@ switchroom schedule remove --cron-hash 1a2b3c4d5e6f
 
 # Read the agent's resolved schedule as JSON
 switchroom cron list
+
+# Health-check the schedule (duplicate crons, name conflicts) as JSON
+switchroom cron doctor
 ```
 
 This same surface is exposed over the **agent-config MCP broker**, so an agent can manage *its own* schedule when you ask it in chat ("set up a daily 8am briefing"). Identity is pinned to `$SWITCHROOM_AGENT_NAME`; cross-agent writes are denied (exit 7). Run `switchroom schedule --help` for the full flag list.
+
+**`cron list` is self-describing.** Each entry carries, alongside its original fields: `source` (`base-config` for a `switchroom.yaml` entry, `overlay` for a `schedule.d/` one), `file` (the on-disk path), the resolved `tier`/`context` (which session a fire takes — see "Controlling per-fire cost" below), and a `duplicate_of` back-reference naming any *other* entry that shares the same cron expression. The agent can read where each cron lives and whether it owns a duplicate, instead of inferring it from prose. `cron doctor` (and the `cron_doctor` MCP tool) returns the same findings as a `{healthy, findings[]}` report — duplicate cron expressions (the double-fire hazard), base-vs-overlay name conflicts, and entries whose tier can't be resolved.
 
 Either way, a schedule change takes effect **automatically, without a restart**. The in-container scheduler **hot-reloads**: it re-reads `switchroom.yaml` + the `schedule.d` overlay on a short poll (default 30s, `SWITCHROOM_SCHEDULER_RELOAD_POLL_MS`) and, when the effective schedule changes, swaps the live cron timers in place — the tmux/agent session is untouched. So a removed entry stops firing and a new one starts within ~30s. An agent that authors its *first* cron (previously schedule-less) restarts its own scheduler sibling once to activate (a clean ~1s self-restart, no container bounce). A restart is no longer required for schedule edits to take effect.
 
@@ -70,11 +75,12 @@ Operator-authored entries in `switchroom.yaml` are trusted. Entries written thro
 | Gate | Code | Rule |
 |---|---|---|
 | Too frequent | `E_CRON_TOO_FREQUENT` (9) | minimum 5-minute interval |
+| Duplicate | `E_CRON_DUPLICATE` (9) | the agent already owns an overlay entry with the same cron expression or the same `--name` — prevents the silent double-fire |
 | Too many | `E_QUOTA_EXCEEDED` (9) | at most 20 entries per agent |
 | Secrets escalation | `E_OVERLAY_SECRETS_REQUIRES_APPROVAL` (9) | an overlay entry may **not** grant itself vault `secrets:` |
 | Bad input | `E_INVALID_CRON` / `E_INVALID_PROMPT` (1) | malformed cron or prompt |
 
-With `--stage-on-reject` (the MCP path uses this), a gated entry is staged under `.pending/` and surfaced to the operator via `switchroom schedule pending` instead of being rejected outright. Overlay entries can only *append*; they cannot override or replace operator-declared entries.
+With `--stage-on-reject` (the MCP path uses this), a *security*-gated entry (`E_OVERLAY_SECRETS_REQUIRES_APPROVAL`, `E_CRON_TOO_FREQUENT`, `E_QUOTA_EXCEEDED`) is staged under `.pending/` and surfaced to the operator via `switchroom schedule pending` instead of being rejected outright. `E_CRON_DUPLICATE` is a *fix-it* error, not an approval gate — it hard-rejects on both paths so the agent removes the conflicting entry rather than queuing a second one for approval. Overlay entries can only *append*; they cannot override or replace operator-declared entries.
 
 ## How it works
 

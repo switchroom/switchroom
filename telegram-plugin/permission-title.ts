@@ -46,6 +46,7 @@ const MCP_TOOL_DESCRIPTIONS: Record<string, string> = {
   // agent-config — every agent's self-service surface (#1163, #1215)
   "mcp__agent-config__config_get": "Read its own merged config",
   "mcp__agent-config__cron_list": "List its own scheduled tasks",
+  "mcp__agent-config__cron_doctor": "Health-check its own cron schedule",
   "mcp__agent-config__skill_list": "List its own installed skills",
   "mcp__agent-config__audit_tail": "Read its own recent tool-call audit log",
   "mcp__agent-config__peers_list": "List the other agents on this instance",

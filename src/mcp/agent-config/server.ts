@@ -132,7 +132,28 @@ export const TOOLS = [
   {
     name: "cron_list",
     description:
-      "List the agent's scheduled cron entries (schedule array) as JSON.",
+      "List the agent's scheduled cron entries (schedule array) as JSON. " +
+      "Each entry is self-describing: `source` (base-config vs overlay), " +
+      "`file` (switchroom.yaml or the schedule.d path), resolved " +
+      "`tier`/`context`, and a `duplicate_of` back-reference when another " +
+      "entry shares the same cron expression. Original entry fields are " +
+      "preserved.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "cron_doctor",
+    description:
+      "Read-only cron health report: duplicate cron expressions (the " +
+      "double-fire hazard), base-config-vs-overlay name conflicts, and " +
+      "entries missing a resolved tier/context. Returns " +
+      "{agent, entry_count, healthy, findings[]}. Call this BEFORE adding " +
+      "a cron, or when a schedule misbehaves (firing twice, removing the " +
+      "wrong entry).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -461,6 +482,10 @@ export function dispatchTool(
       break;
     case "cron_list":
       cliArgs = buildArgs(["cron", "list"], args);
+      parseMode = "json";
+      break;
+    case "cron_doctor":
+      cliArgs = buildArgs(["cron", "doctor"], args);
       parseMode = "json";
       break;
     case "skill_list":

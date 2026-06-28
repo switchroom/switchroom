@@ -279,12 +279,23 @@ describe("registered commands", () => {
     expect(stderr).toMatch(/cross-agent read denied/);
   });
 
-  it("cron list returns configured schedule", async () => {
+  it("cron list returns self-describing schedule rows", async () => {
     process.env.SWITCHROOM_AGENT_NAME = "a";
     const program = buildProgram();
     await program.parseAsync(["node", "switchroom", "cron", "list"]);
     const parsed = JSON.parse(stdout.trim());
-    expect(parsed).toEqual([{ name: "ping", at: "0 * * * *" }]);
+    // Original fields preserved (backward compat) + introspection fields
+    // ADDED. The fixture entry uses `at` (no `cron`), so it labels as
+    // base-config with no duplicate and resolves to the main tier.
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      name: "ping",
+      at: "0 * * * *",
+      source: "base-config",
+      file: "switchroom.yaml",
+      tier: "main",
+    });
+    expect(parsed[0].duplicate_of).toBeUndefined();
   });
 
   it("skill list returns skills + bundled_skills", async () => {
