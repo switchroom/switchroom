@@ -93,6 +93,24 @@ export interface AnswerStreamConfig {
   ) => Promise<unknown>
   deleteMessage?: (chatId: string, messageId: number) => Promise<unknown>
 
+  /**
+   * Render the raw assistant transcript text into the wire format used for
+   * `parse_mode: 'HTML'` sends/edits. Every OTHER outbound lane in the gateway
+   * (handleStreamReply, the reply handler, the turn-flush backstop, the PTY
+   * partial handler) converts markdown → Telegram HTML via
+   * `sanitizeTelegramHtml(markdownToHtml(...))` before sending. The
+   * answer-stream lane historically shipped the RAW transcript under
+   * `parse_mode: 'HTML'`, so `**bold**` reached the user as literal asterisks
+   * and agent narration read as unformatted text.
+   *
+   * Injected as a dependency (mirroring `renderText` on the PTY partial
+   * handler) rather than hard-importing `format`/`html-sanitize` here, so this
+   * module stays free of a grammy/format dependency and remains fully
+   * testable. When absent, text is sent verbatim — preserving the old
+   * behaviour for callers (and tests) that don't wire it.
+   */
+  renderText?: (text: string) => string
+
   /** Called when a late edit/send resolves but this stream has been superseded. */
   onSuperseded?: OnSupersededCallback
   log?: (msg: string) => void
@@ -179,6 +197,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     replyToMessageId,
     sendMessage,
     editMessageText,
+    renderText,
     onSuperseded,
     log,
     warn,
@@ -187,6 +206,13 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
     recordDedup,
     recordOutbound,
   } = config
+
+  /**
+   * Convert raw transcript text to the wire format before any
+   * `parse_mode: 'HTML'` send/edit. Falls back to the verbatim text when no
+   * renderer is injected (old behaviour / unwired tests).
+   */
+  const render = (text: string): string => (renderText != null ? renderText(text) : text)
 
   const effectiveThrottle = Math.max(250, throttleMs)
 
@@ -229,6 +255,10 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
   }
 
   async function sendOrEditViaMessage(trimmed: string, gen: number, prevText: string): Promise<void> {
+    // Convert raw transcript markdown → Telegram HTML before sending under
+    // parse_mode: 'HTML'. Without this, `**bold**` ships as literal asterisks
+    // (the answer-stream-raw-markdown bug). Mirrors every other outbound lane.
+    const rendered = render(trimmed)
     if (typeof streamMsgId === 'number') {
       // Edit existing message
       const editParams: Parameters<typeof editMessageText>[3] = {
@@ -237,7 +267,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       }
       if (threadId != null) editParams.message_thread_id = threadId
       try {
-        await editMessageText(chatId, streamMsgId, trimmed, editParams)
+        await editMessageText(chatId, streamMsgId, rendered, editParams)
         onMetric?.({ kind: 'answer_lane_update', chatId, messageId: streamMsgId, charCount: trimmed.length, transport: 'edit' })
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -266,7 +296,7 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       }
       if (threadId != null) sendParams.message_thread_id = threadId
       if (replyToMessageId != null) sendParams.reply_parameters = { message_id: replyToMessageId }
-      const sent = await sendMessage(chatId, trimmed, sendParams)
+      const sent = await sendMessage(chatId, rendered, sendParams)
       const sentId = sent?.message_id
       if (typeof sentId !== 'number' || !Number.isFinite(sentId)) {
         warn?.('answer-stream: sendMessage returned no message_id')
@@ -424,7 +454,11 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
       // nested quote that looks wrong.
 
       try {
-        const sent = await sendMessage(chatId, textToSend, sendParams)
+        // Render markdown → Telegram HTML for the wire send. The dedup /
+        // silent-marker / history checks above all run on the raw textToSend
+        // (so they match the comparisons the other lanes make on raw text);
+        // only the actual outbound payload is converted.
+        const sent = await sendMessage(chatId, render(textToSend), sendParams)
         const sentId = sent?.message_id
         if (typeof sentId === 'number' && Number.isFinite(sentId)) {
           streamMsgId = sentId

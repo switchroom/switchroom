@@ -4,6 +4,15 @@ import {
   MIN_INITIAL_CHARS,
 } from '../answer-stream.js'
 import { resolveAnswerLaneConfig, ANSWER_LANE_NEVER_OPENS } from '../answer-stream-flag.js'
+import { markdownToHtml } from '../format.js'
+import { sanitizeTelegramHtml } from '../html-sanitize.js'
+
+/**
+ * The exact renderer the gateway injects into createAnswerStream — markdown →
+ * Telegram HTML, then HTML sanitize. Mirrors gateway.ts so the test pins the
+ * real conversion, not a hand-rolled one.
+ */
+const renderText = (text: string): string => sanitizeTelegramHtml(markdownToHtml(text))
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -131,6 +140,115 @@ describe('answer-stream — minInitialChars threshold', () => {
       expect.objectContaining({ parse_mode: 'HTML' }),
     )
     expect(editMessageText).not.toHaveBeenCalled()
+  })
+})
+
+describe('answer-stream — markdown → HTML conversion (renderText)', () => {
+  // Regression for the answer-stream-raw-markdown bug: this lane historically
+  // shipped the RAW assistant transcript under parse_mode:'HTML', so `**bold**`
+  // arrived as literal asterisks while every other lane converted. The fix
+  // injects the same renderText the other lanes use; these tests assert the
+  // wire payload is converted, not raw.
+
+  it('converts **bold** to <b>bold</b> on the opening sendMessage', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      minInitialChars: 10,
+      throttleMs: 250,
+      renderText,
+      sendMessage,
+      editMessageText,
+    })
+
+    stream.update('Here is some **bold** narration text for the user.')
+    await flushMicrotasks()
+
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    const sentText = sendMessage.mock.calls[0][1] as string
+    expect(sentText).toContain('<b>bold</b>')
+    expect(sentText).not.toContain('**bold**')
+    expect(sendMessage).toHaveBeenCalledWith(
+      'chat1',
+      expect.stringContaining('<b>bold</b>'),
+      expect.objectContaining({ parse_mode: 'HTML' }),
+    )
+  })
+
+  it('converts **bold** to <b>bold</b> on a follow-up editMessageText', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      minInitialChars: 10,
+      throttleMs: 250,
+      renderText,
+      sendMessage,
+      editMessageText,
+    })
+
+    // First update opens the message.
+    stream.update('first chunk of the answer arriving')
+    await flushMicrotasks()
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+
+    // Second update (past the throttle window) edits in place with markdown.
+    vi.advanceTimersByTime(300)
+    stream.update('first chunk of the answer arriving with **bold** added')
+    vi.advanceTimersByTime(300)
+    await flushMicrotasks()
+
+    expect(editMessageText).toHaveBeenCalled()
+    const editText = editMessageText.mock.calls.at(-1)![2] as string
+    expect(editText).toContain('<b>bold</b>')
+    expect(editText).not.toContain('**bold**')
+  })
+
+  it('converts **bold** to <b>bold</b> on materialize', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      minInitialChars: 10,
+      throttleMs: 250,
+      renderText,
+      sendMessage,
+      editMessageText,
+    })
+
+    stream.update('The final answer is **definitely** forty-two.')
+    await flushMicrotasks()
+    // Opening send already converted; capture how many sends precede materialize.
+    const sendsBeforeMaterialize = sendMessage.mock.calls.length
+
+    const id = await stream.materialize()
+    expect(typeof id).toBe('number')
+    // materialize always sends a fresh message for the push notification.
+    expect(sendMessage.mock.calls.length).toBe(sendsBeforeMaterialize + 1)
+    const sentText = sendMessage.mock.calls.at(-1)![1] as string
+    expect(sentText).toContain('<b>definitely</b>')
+    expect(sentText).not.toContain('**definitely**')
+  })
+
+  it('sends raw text verbatim when no renderText is injected (back-compat)', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      minInitialChars: 10,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+    })
+
+    stream.update('Here is some **bold** narration text for the user.')
+    await flushMicrotasks()
+
+    expect(sendMessage).toHaveBeenCalledTimes(1)
+    const sentText = sendMessage.mock.calls[0][1] as string
+    // No renderer → unchanged (preserves prior behaviour for unwired callers).
+    expect(sentText).toContain('**bold**')
   })
 })
 
