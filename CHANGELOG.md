@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.16.9 — graceful restart on sr-* → Claude model switch
+
+### PR A — Graceful restart: text-command path (#2619)
+
+When an agent's live session is on an sr-* (OpenRouter) model and the
+operator types `/model claude-opus-4-5` (or any Claude model name), the
+gateway now schedules a **graceful restart** instead of injecting `/model`
+in-place. In-place inject can't restore the native Claude OAuth routing
+path once the session was started under LiteLLM — restart is the only
+clean path back.
+
+- `handleModelCommand()` detects the sr-* → Claude transition via
+  `isSrToClaudeTransition(prevModel, nextModel)` and calls
+  `deps.scheduleRestart()` (hostd-first, `triggerSelfRestart` fallback).
+- Restart marker written so the post-restart boot card edits into the
+  originating chat.
+- Claude → Claude and Claude → sr-* switches are unchanged (in-place inject).
+
+### PR B — Graceful restart: menu button-tap path (#2621)
+
+Same logic for the inline `/model` menu button press path. When an operator
+taps a Claude subscription button while the session is on sr-*, the menu
+card is replaced with a restart notice and the same graceful restart fires.
+
+- `isSrToClaudeTransition` exported from `model-command.ts` and shared
+  between text-command and button-tap paths.
+- Gateway callback handler captures `prevSessionModel` before updating
+  `activeSessionModelOverride`, detects the transition, and calls
+  `triggerSelfRestart` (same gate as `/restart`).
+
+### PR C — UAT: prefer fast sr-* model + timeout fixes (#2620)
+
+- UAT now selects `sr-gemini-2.5-flash` (or any non-reasoning sr-* model)
+  over `sr-deepseek-r1` (a reasoning model that takes 2-5 min per response).
+- Response timeout raised 60s → 120s; test-2 overall timeout raised to 120s.
+- Restore step matches any `mdl:s:` (Claude) button; restore wait raised
+  4s → 15s to cover the graceful restart path.
+
+---
+
 ## v0.16.8 — gateway LiteLLM key fix (ANTHROPIC_CUSTOM_HEADERS in outer block)
 
 - Gateway sidecar now inherits `ANTHROPIC_CUSTOM_HEADERS` at startup so
