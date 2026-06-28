@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.16.8 — gateway LiteLLM key fix (ANTHROPIC_CUSTOM_HEADERS in outer block)
+
+- Gateway sidecar now inherits `ANTHROPIC_CUSTOM_HEADERS` at startup so
+  `/model` menu correctly shows OpenRouter (`sr-*`) models. Root cause: the
+  key was fetched only in the inner tmux shell (after re-exec), never reaching
+  the outer-block sidecars (gateway, agent-scheduler). Fix: fetch once in the
+  outer block before any sidecar fork — all child processes inherit it
+  automatically. cron-session and inner-block fetches become defense-in-depth.
+- Hermes-Desktop adapter: operator console JSON-RPC 2.0 gateway (`/web/hermes`).
+
 ## v0.16.7 — sr-* model discovery + cron LiteLLM key fix
 
 - `/model` menu now shows OpenRouter (`sr-*`) models by querying LiteLLM
