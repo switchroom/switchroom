@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.16.13 — fix sr-* reply routing after silence poke (Bug D)
+
+When a slow sr-* model (e.g. Gemini 2.5 Flash in thinking mode via
+OpenRouter) takes longer than the 5-minute silence threshold to call
+`reply`, the gateway's silence poke fires and nulls `currentTurn`. The
+Bug B fallback from v0.16.12 reads `turn.sessionChatId` but `turn` is
+`null` at that point — so the fallback was inert and `assertAllowedChat`
+threw, silently dropping the reply. (#2635)
+
+Fix: introduce `lastActiveTurnChatId` (captured in `setCurrentTurn()`, NOT
+cleared by the silence poke). The `executeReply` fallback now uses
+`turn?.sessionChatId ?? lastActiveTurnChatId`, so a late reply routes
+correctly even after the poke. The tier (`active` vs `last-known`) is
+logged to stderr for operator visibility.
+
+UAT: `jtbd-model-litellm-sr-dm` timeout extended to 480 s (expectMessage) /
+660 s (overall) to accommodate Gemini 2.5 Flash thinking mode. Button
+selection now prefers `deepseek-v3` (non-thinking, <10 s) over `flash`
+(may default to thinking on OpenRouter). (#2635)
+
 ## v0.16.12 — fix sr-* reply routing: chat_id fallback + obligation meta
 
 Two remaining routing bugs that prevented Gemini (via LiteLLM sr-* models)
