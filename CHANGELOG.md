@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.16.14 — sr-* model tap: immediate ⏳ feedback while switching
+
+When tapping an sr-* model button in `/model`, the gateway now immediately
+edits the menu message to `⏳ Switching session to X…` while the
+text-inject round-trip completes (10-30s). Previously the operator saw a
+3-5s Telegram toast then silence, with no indication the tap registered.
+Once the inject returns, the final ✅/❌ edit replaces it in-place with
+the full menu + banner. (#2638)
+
+A `didInterimSrEdit` guard prevents the `toastOnly` early-return from
+leaving the menu button-less if a new inbound turn starts during the
+interim edit's await.
+
 ## v0.16.13 — fix sr-* reply routing after silence poke (Bug D)
 
 When a slow sr-* model (e.g. Gemini 2.5 Flash in thinking mode via
