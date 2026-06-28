@@ -120,7 +120,46 @@ Slack, Discord, or Teams. Auxiliary services (e.g. voice transcription) are
 opt-in helpers, not second channels.
 
 - **By-construction test:** does this add a second human-facing chat
-  channel? If yes, it is out.
+  channel **for the people the team serves** — a bridge to WhatsApp, Signal,
+  Slack, Discord, Teams, or the like? If yes, it is out. This invariant is
+  about the *principal's* channel: there is exactly one, Telegram, done
+  properly. It is **not** a ban on operator/admin tooling.
+
+### Scope: the admin console is not a channel
+
+An **operator/admin** management console (e.g. a Hermes-Desktop client pointed
+at a Switchroom adapter) is **out of this invariant's scope** — it is admin
+tooling for the person who runs the box, not a chat channel for the people the
+team serves. `telegram-only` stays strictly true: it governs *principal*
+channels, and the admin console is not one.
+
+The console MAY let the operator send a turn to one of their own agents from
+outside Telegram. To stay admin tooling (and not quietly become a second
+channel or a hidden conversation), it must hold all four:
+
+1. **Operator/admin audience only.** Authenticated, single-tenant, never
+   reachable by a principal as *their* way to talk to an agent. It is the
+   operator's workshop view, not a second front door for the people the team
+   serves. (Same "audience is the whole line" reasoning that keeps an operator
+   surface clear of `chat-is-the-single-source-of-truth`.)
+2. **One canonical record.** Every operator turn and the agent's reply
+   **mirror into that agent's Telegram thread.** The console is another way
+   *in*, never a separate conversation the Telegram thread can't see — so
+   there is still exactly one record, and `chat-is-the-single-source-of-truth`
+   holds.
+3. **Same path, not a parallel runtime.** The operator turn is injected
+   through the existing synthesized-inbound path (the cron / `inject_inbound`
+   pattern), landing as an ordinary turn in the one agent session. No second
+   agent loop, no second inference path.
+4. **Approvals stay on Telegram.** The console never gains an
+   approve/deny/grant action; the human-validated Telegram tap remains the
+   sole approval surface (`no-self-escalation`). A console that wires
+   approvals is out.
+
+The line that *would* cross `telegram-only` is a **principal-facing** bridge —
+giving the people the team serves a second way to chat (WhatsApp, Signal, a
+public web chat). That is still out. The detail contract for the admin console
+is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
 
 ## `chat-is-the-single-source-of-truth`
 

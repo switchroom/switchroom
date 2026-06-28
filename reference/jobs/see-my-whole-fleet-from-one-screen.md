@@ -1,6 +1,6 @@
 ---
 job: see and manage my whole fleet from one operator screen
-outcome: The operator can open one browser surface and see every agent's live state, health, quota, history, sessions, memory, workspace, and approval/audit trail, and run fleet ops (start/stop/restart, config edits) — without any secret reaching the browser and without the surface ever becoming the principal's source of truth or a second chat channel.
+outcome: The operator can open one management console and see every agent's live state, health, quota, history, sessions, memory, workspace, and approval/audit trail, run fleet ops (restart, config edits), and drive an agent with a turn from the console — without any secret reaching the client, without approvals ever leaving Telegram, and without the surface becoming the principal's source of truth or a separate conversation record (operator turns mirror into the agent's Telegram thread).
 stakes: An operator running a standing fleet 24/7 needs a place to glance across all of it at once — the chat is per-agent and per-topic, so a fleet-wide problem (a stuck agent, a quota wall, a drifted config, a failing memory backend) is invisible until a principal complains. Without a fleet view the operator debugs blind, one `docker exec` at a time. But a dashboard is also the easiest place to accidentally rebuild the retired progress card, leak a token, or grow a second approval path — so the screen earns its place only by staying an operator tool, never a principal one.
 serves: hold-the-leash
 invariants: [chat-is-the-single-source-of-truth, telegram-only, no-self-escalation, single-tenant, claude-native]
@@ -8,10 +8,11 @@ invariants: [chat-is-the-single-source-of-truth, telegram-only, no-self-escalati
 
 # Job Spec: see and manage my whole fleet from one operator screen
 
-> A durable Job Spec. The *how* — the `switchroom-web` service, its read
-> adapters, the auth gate, the compose wiring — lives in the design artifact
-> `reference/rfcs/fleet-dashboard.md` and the code under `src/web/`. That
-> implementation churns; this job does not.
+> A durable Job Spec. The *how* — the Hermes-Desktop adapter (REST + JSON-RPC
+> WebSocket) served from `switchroom-web`, the unmodified Hermes Desktop run
+> in remote mode, the `inject_inbound` mirror, the auth gate — lives in the
+> design artifact `reference/rfcs/fleet-dashboard.md` and the code under
+> `src/web/`. That implementation churns; this job does not.
 
 ## Who this is for — read this first
 
@@ -57,10 +58,15 @@ channel or a second approval path.
 - The approval/grant trail is visible as a **read-only audit feed** across
   the fleet, plus what's currently pending — so the operator can see the
   leash state at a glance.
-- Fleet ops the operator already does from the CLI — start / stop / restart,
-  and operator config edits — are available from the screen, routed through
-  the same operator-authored, hostd/CLI-enforced paths, never a new
-  privileged backdoor.
+- Fleet ops the operator already does from the CLI — restart, and operator
+  config edits — are available from the screen, routed through the same
+  operator-authored, hostd/CLI-enforced paths, never a new privileged
+  backdoor.
+- The operator can send a turn to one of their own agents from the console,
+  and that turn plus the agent's reply **mirror into the agent's Telegram
+  thread** — the console is another way *in*, never a separate conversation
+  the Telegram thread can't see. The turn rides the same synthesized-inbound
+  path as cron, landing in the one agent session.
 - Off by default, binds loopback by default, refuses to serve
   unauthenticated when bound to a non-loopback address; Tailscale is the
   documented remote path.
@@ -84,8 +90,12 @@ channel or a second approval path.
   human-validated Telegram tap; the trust anchor stays there
   (`no-self-escalation`). The web may *display* pending approvals and
   history; the decision never happens here.
-- A **second human-facing chat channel** — a web prompt box that talks to an
-  agent as a new conversation surface. That crosses `telegram-only`.
+- A **principal-facing** way in from the console, or an operator turn that
+  does **not** mirror into the Telegram thread (a hidden side-channel
+  conversation). The admin console stays out of `telegram-only`'s scope only
+  while it is operator-only and every turn surfaces in the one Telegram
+  record. A prompt box the principal uses, or a bridge to WhatsApp/Signal,
+  crosses `telegram-only`.
 - Any secret reaching the browser, an API response, or a log
   (`credentials.json`, vault values, OAuth/bot tokens).
 - A mutating path that lets the web grant access the operator's config
@@ -112,10 +122,14 @@ principal's chat jobs). Pin:
 - **Leash visible, never operated** — pending approvals + the grant/audit
   trail render read-only. *Invariant:* there is no approve/deny endpoint;
   the only approval action in the whole product is the Telegram tap.
-- **Fleet ops, not backdoors** — start/stop/restart and config edits route
-  through the existing hostd/CLI operator paths. *Invariant:* the web grants
-  no access the operator's config didn't already authorize; no path mutates
-  the vault or resolves an approval.
+- **Fleet ops, not backdoors** — restart and config edits route through the
+  existing hostd/CLI operator paths. *Invariant:* the console grants no access
+  the operator's config didn't already authorize; no path mutates the vault or
+  resolves an approval.
+- **Operator turn = one record** — a turn sent from the console produces a
+  real turn in the target agent's Telegram thread (turn and reply observable
+  there). *Invariant:* the console never opens a conversation the Telegram
+  thread can't see; the admin console stays out of telegram-only's scope.
 - **Exposure floor** — off by default; loopback bind default; unauthenticated
   non-loopback bind is refused. *Invariant:* a network-accessible bind
   without auth never serves.
@@ -149,5 +163,9 @@ principal's chat jobs). Pin:
 ---
 
 > **Implementation:** `reference/rfcs/fleet-dashboard.md` (the design
-> artifact, `serves:` this job) and `src/web/` (the `switchroom-web`
-> service). Those churn; this job outlives them.
+> artifact, `serves:` this job) — the Hermes-Desktop adapter served from
+> `src/web/` (`switchroom-web`), with unmodified Hermes Desktop run in remote
+> mode as the client. `reference/invariants.md` records why the admin console
+> is out of `telegram-only`'s scope (it governs principal channels, not admin
+> tooling) and the conditions that keep it so. Those churn; this job outlives
+> them.
