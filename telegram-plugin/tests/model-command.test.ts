@@ -437,15 +437,26 @@ const OPTIONS_WITH_SR = [
   { index: 4, label: "sr-deepseek-r1", detail: "", current: false },
   // internal path — should be filtered out
   { index: 5, label: "openrouter/google/gemini-2.5-pro", detail: "", current: false },
+  // bare OpenAI models from GATEWAY_MODEL_DISCOVERY — should also be filtered out
+  { index: 6, label: "gpt-4", detail: "", current: false },
+  { index: 7, label: "gpt-4o", detail: "", current: false },
+  { index: 8, label: "voyage-law-2", detail: "", current: false },
+  // full claude ID — should be in claude bucket
+  { index: 9, label: "claude-opus-4-8", detail: "", current: false },
 ];
 
 describe("classifyDiscoveredOptions", () => {
   it("puts native Claude options in claude, sr-* in sr, drops others", () => {
     const { claude, sr } = classifyDiscoveredOptions(OPTIONS_WITH_SR);
-    expect(claude.map((o) => o.label)).toEqual(["Default (recommended)", "Sonnet"]);
+    expect(claude.map((o) => o.label)).toEqual([
+      "Default (recommended)", "Sonnet", "claude-opus-4-8",
+    ]);
     expect(sr.map((o) => o.label)).toEqual(["sr-gemini-2.5-pro", "sr-deepseek-r1"]);
-    // openrouter/* not present in either
-    expect([...claude, ...sr].find((o) => o.label.includes("openrouter"))).toBeUndefined();
+    // openrouter/*, gpt-*, voyage-* not present in either bucket
+    const all = [...claude, ...sr];
+    expect(all.find((o) => o.label.includes("openrouter"))).toBeUndefined();
+    expect(all.find((o) => o.label.startsWith("gpt-"))).toBeUndefined();
+    expect(all.find((o) => o.label.startsWith("voyage-"))).toBeUndefined();
   });
 
   it("handles a list with no sr-* models", () => {

@@ -267,7 +267,16 @@ export function classifyDiscoveredOptions(options: ModelPickerOption[]): {
   sr: ModelPickerOption[]
 } {
   return {
-    claude: options.filter((o) => !o.label.startsWith('sr-') && !o.label.includes('/')),
+    // Native Claude picker labels start with an uppercase letter (e.g.
+    // "Default (recommended)", "Opus", "Sonnet") or with "claude-" for full
+    // model IDs. This excludes sr-* names, internal routing paths
+    // ("openrouter/..."), and non-Claude models exposed by GATEWAY_MODEL_DISCOVERY
+    // ("gpt-4", "gpt-4o", "voyage-law-2", etc.) — those are LiteLLM internals
+    // not meant as user-facing switching targets.
+    claude: options.filter(
+      (o) => !o.label.startsWith('sr-') && !o.label.includes('/') &&
+        (/^[A-Z]/.test(o.label) || o.label.startsWith('claude-')),
+    ),
     sr: options.filter((o) => o.label.startsWith('sr-')),
   }
 }
