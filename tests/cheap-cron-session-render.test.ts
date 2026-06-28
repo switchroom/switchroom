@@ -138,6 +138,47 @@ describe("cron-session.sh launcher — compliance + identity", () => {
   });
 });
 
+describe("cron-session.sh LiteLLM routing — mirrors start.sh boot block", () => {
+  const src = readFileSync(CRON_SH, "utf-8");
+  const out = renderTemplate(CRON_SH, baseCtx);
+
+  it("vault lookup uses the BASE name ({{name}} → marko), never the cron identity", () => {
+    // The virtual key is provisioned under litellm/marko/api-key, NOT
+    // litellm/marko-cron/api-key. The template var bakes the base name at
+    // scaffold time — no fragile runtime suffix-stripping.
+    expect(out).toContain('switchroom vault get "litellm/marko/api-key"');
+    expect(out).not.toContain("marko-cron/api-key");
+    // Template source must use {{name}}, not a hardcoded literal or runtime strip.
+    expect(src).toContain('litellm/{{name}}/api-key');
+  });
+
+  it("is gated on SWITCHROOM_LITELLM — inert when not set", () => {
+    expect(out).toContain('if [ -n "$SWITCHROOM_LITELLM" ]');
+  });
+
+  it("exports ANTHROPIC_CUSTOM_HEADERS and CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY on success", () => {
+    expect(out).toContain("x-litellm-api-key: Bearer $sr_ll_key");
+    expect(out).toContain("x-litellm-customer-id: $SWITCHROOM_AGENT_NAME");
+    expect(out).toContain("x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME");
+    expect(out).toContain("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1");
+  });
+
+  it("fail-open: unsets ALL routing vars so claude falls back to direct OAuth", () => {
+    expect(out).toContain(
+      "unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM",
+    );
+    expect(out).toContain("falling back to direct OAuth");
+  });
+
+  it("LiteLLM block appears BEFORE the tmux new-session call", () => {
+    const litellmIdx = out.indexOf("SWITCHROOM_LITELLM");
+    const tmuxIdx = out.indexOf("tmux -L");
+    expect(litellmIdx, "SWITCHROOM_LITELLM not found in rendered output").toBeGreaterThanOrEqual(0);
+    expect(tmuxIdx, "tmux -L not found in rendered output").toBeGreaterThan(0);
+    expect(litellmIdx, "LiteLLM block must precede the tmux launch").toBeLessThan(tmuxIdx);
+  });
+});
+
 describe("scheduleNeedsCronSession drives the gate", () => {
   it("no fresh entry → false (the whole fleet today)", () => {
     expect(scheduleNeedsCronSession([{ kind: "poll" }, {}], { cheapCronEnabled: true })).toBe(false);

@@ -86,6 +86,39 @@ CRON_APPEND_PROMPT="You are the cheap background cron worker for {{name}}. You r
 # (no --continue) — low context by construction. cd into the workspace so
 # claude's project key matches the pre-seeded trust state (.claude-cron).
 cd "{{agentDir}}" || exit 1
+
+# LiteLLM routing for the cron session — mirrors start.sh's boot block.
+# IMPORTANT: the vault key is provisioned under the BASE agent name ({{name}}),
+# NOT the cron identity ({{name}}-cron). Use the Handlebars template var so the
+# lookup is a compile-time literal — no fragile runtime suffix-stripping.
+# Attribution headers carry $SWITCHROOM_AGENT_NAME (= {{name}}-cron) so LiteLLM
+# can distinguish cron spend from main-session spend per agent.
+# FAIL-OPEN: missing key OR unreachable proxy → strip routing env, fall back to
+# direct OAuth. An outage must never take the cron session dark.
+if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
+  sr_ll_key="$(switchroom vault get "litellm/{{name}}/api-key" 2>/dev/null || true)"
+  sr_ll_ok=""
+  if [ -z "$sr_ll_key" ]; then
+    echo "litellm: no virtual key for cron '{{name}}' — falling back to direct OAuth (no tracking/guardrail)" >&2
+  elif command -v curl >/dev/null 2>&1 && [ -n "$ANTHROPIC_BASE_URL" ] \
+       && ! curl -fsS -m 5 -o /dev/null "${ANTHROPIC_BASE_URL%/}/health/liveliness" 2>/dev/null; then
+    echo "litellm: proxy unreachable at $ANTHROPIC_BASE_URL — falling back to direct OAuth (no tracking/guardrail this session)" >&2
+  else
+    sr_ll_ok="1"
+  fi
+  if [ -n "$sr_ll_ok" ]; then
+    export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
+x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
+x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
+    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+  else
+    # Fail-open: drop every routing var so the claude CLI talks to Anthropic
+    # directly on its OAuth credential (subscription path), unproxied.
+    unset ANTHROPIC_BASE_URL ANTHROPIC_SMALL_FAST_MODEL SWITCHROOM_LITELLM
+  fi
+  unset sr_ll_key sr_ll_ok
+fi
+
 # Create the cron tmux session DETACHED (-d), not in attach mode. This is a
 # SUPERVISED BACKGROUND sidecar (start.sh forks it with `&`) with no controlling
 # TTY — the MAIN session owns the container's foreground TTY. The attach flag
