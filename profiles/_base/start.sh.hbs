@@ -811,9 +811,18 @@ if [ -n "$SWITCHROOM_LITELLM" ] && command -v switchroom >/dev/null 2>&1; then
   fi
   if [ -n "$sr_ll_ok" ]; then
     # Newline-separated Name: Value pairs (claude CLI ANTHROPIC_CUSTOM_HEADERS format).
+    # Tags: agent:<name> for per-agent spend tracking; profile:<profile> for
+    # fleet-level cost breakdown by role. Per-turn tags (cron vs telegram) are
+    # NOT achievable here — ANTHROPIC_CUSTOM_HEADERS is fixed per process and
+    # the claude CLI sends no session id. Use scheduler.jsonl ↔ /spend/logs
+    # time-window correlation for cron attribution instead.
     export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $sr_ll_key
 x-litellm-customer-id: $SWITCHROOM_AGENT_NAME
-x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME"
+x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:-default}"
+    # Let Claude Code enumerate models from the LiteLLM gateway so non-Claude
+    # models configured in the proxy appear in the /model picker and can be
+    # selected via --model. Without this, the CLI only knows its bundled list.
+    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
   else
     # Fail-open: drop every routing var so the claude CLI talks to Anthropic
     # directly on its OAuth credential (subscription path), unproxied.

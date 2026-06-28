@@ -144,6 +144,15 @@ export interface DispatchResult {
   startedAt: number;
   finishedAt: number;
   /**
+   * Human-readable schedule name sourced from the overlay file's `# name:`
+   * comment (or a meaningful filename). Absent for base-config crons and
+   * hash-only overlay filenames. Present in audit JSONL for LiteLLM
+   * cost-correlation: join by agent + time window [startedAt, finishedAt]
+   * against LiteLLM's /spend/logs endpoint to identify which cron schedule
+   * drove a given API request.
+   */
+  scheduleName?: string;
+  /**
    * Cheap-cron observability (reference/rfcs/cheap-cron-sessions.md §5). Which
    * tier this fire took and the model it ran at, so `switchroom schedule
    * report` can show the cost breakdown. Absent on legacy audit rows and
