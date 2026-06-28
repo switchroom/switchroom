@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.16.11 — fix sr-* reply blocked by numeric chat_id type mismatch
+
+Non-Anthropic models routed via LiteLLM (e.g. `sr-gemini-2.5-flash`) send
+`chat_id` as a numeric JSON integer even though the tool schema declares
+`type: string`. `assertAllowedChat` ran `allowFrom.includes(number)` against
+a string array → `false` → threw → silently swallowed by `onToolCall`, making
+every `reply` from an sr-* session invisible.
+
+Fix: widen `assertAllowedChat` to accept `string | number` and coerce to
+string internally. Replace all `args.chat_id as string` extractions in tool
+handlers (`reply`, `stream_reply`, `send_checklist`, `update_checklist`,
+`react`, `edit_message`, `send_typing`, `pin_message`, `delete_message`,
+`forward_message`, `get_recent_messages`, `vault_request_access`) with
+`String(args.chat_id ?? '')` for defence-in-depth. (#2629)
+
 ## v0.16.10 — fix sr-* obligation cascade + Codex 5.5 model
 
 ### PR A — Fix obligation cascade on sr-* short replies (#2624)
