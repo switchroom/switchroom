@@ -59,10 +59,13 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         const openrouterHeader = flat.find(
           (b) => b.text.includes("OpenRouter") && b.callbackData === "mdl:h",
         );
-        // Prefer a fast non-reasoning model for the E2E test; reasoning models
-        // (deepseek-r1, o1, o3) take 2-5 min per response and hit the silence poke.
+        // Prefer deepseek-v3 (non-thinking, consistently fast) for the E2E test.
+        // gemini-2.5-flash may run in thinking mode via OpenRouter (5+ min latency),
+        // reasoning models (deepseek-r1, o1, o3) also take 2-5 min and hit the
+        // silence poke — both are OK now (Bug D fallback), but slow tests are painful.
         const srButton =
-          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /flash/.test(b.callbackData)) ??
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /deepseek-v3/.test(b.callbackData)) ??
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /flash/.test(b.callbackData) && !/thinking/.test(b.callbackData)) ??
           flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && !/r1|o1|o3|thinking/.test(b.callbackData)) ??
           flat.find((b) => b.callbackData?.startsWith("mdl:sr:"));
 
@@ -93,10 +96,12 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         expect((kbAfter ?? []).flat().length, "menu keeps buttons after sr-* tap").toBeGreaterThan(0);
 
         // ── 3. Send a quick message to generate a LiteLLM-routed turn ──
-        // Use 120s — fast models (gemini-flash, deepseek-v3) respond in <10s,
-        // but the request still has to go through the model switch inject + proxy.
+        // 480s budget: fast models (deepseek-v3) reply in <10s; Gemini 2.5 Flash
+        // may run thinking mode via OpenRouter and take 5+ min. The silence poke
+        // fires at 300s, which is OK — the Bug D fallback (lastActiveTurnChatId)
+        // routes the reply even when currentTurn was nulled by the poke.
         await sc.sendDM("Just reply with the word OK.");
-        await sc.expectMessage(/ok/i, { from: "bot", timeout: 120_000 });
+        await sc.expectMessage(/ok/i, { from: "bot", timeout: 480_000 });
 
         // ── 4. LiteLLM spend attribution ────────────────────────────────
         if (spendBefore >= 0) {
@@ -126,7 +131,7 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         await sc.tearDown();
       }
     },
-    210_000,
+    660_000,
   );
 
   it(

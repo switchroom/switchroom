@@ -2216,6 +2216,13 @@ type CurrentTurn = {
 // is never written and this is exactly the old singleton.
 let currentTurn: CurrentTurn | null = null
 const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
+// Captures the most-recently-started turn's sessionChatId. Unlike currentTurn,
+// this is NOT cleared by the silence poke (firePoke/clearTurnStarted). It lets
+// the Bug B fallback in executeReply route to the correct chat even when the
+// model calls reply AFTER the silence poke has nulled currentTurn (Bug D).
+// Safe in single-tenant gateways: the fallback only fires when the raw chat_id
+// fails the allowlist, and this value was itself validated at inbound receipt.
+let lastActiveTurnChatId: string | undefined
 
 /**
  * Set the live turn for `key`. Flag-branches in ONE place (inside the map):
@@ -2227,6 +2234,7 @@ const currentTurnMap = new CurrentTurnMap<CurrentTurn>()
 function setCurrentTurn(turn: CurrentTurn, key: string): void {
   currentTurnMap.set(turn, key)
   currentTurn = currentTurnMap.get() // mirror most-recent-set (== `turn`)
+  lastActiveTurnChatId = turn.sessionChatId
 }
 
 /**
@@ -7977,17 +7985,23 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // Non-Claude models (e.g. Gemini via LiteLLM sr-* routing) sometimes pass a
   // chat_id that is not in the allowlist — either an int/string mismatch, or
   // the model echoing the wrong identifier from context. When the raw value
-  // fails the allowlist check and the active turn has a validated sessionChatId,
-  // fall back to the turn's origin chat so the reply still lands correctly.
+  // fails the allowlist check, fall back to the active (or last-known) turn's
+  // validated sessionChatId so the reply still lands correctly.
+  // Tier 1: live turn (currentTurn was non-null at reply entry).
+  // Tier 2: last-known turn (survives silence poke — Bug D fix; currentTurn is
+  //   null because clearTurnStarted fired ≥5 min of model silence, but the model
+  //   finally called reply after the poke).
   const chat_id = (() => {
     const _a = loadAccess()
     if (_a.allowFrom.includes(_rawChatId) || _rawChatId in _a.groups) return _rawChatId
-    if (turn?.sessionChatId && (_a.allowFrom.includes(turn.sessionChatId) || turn.sessionChatId in _a.groups)) {
+    const fallbackChatId = turn?.sessionChatId ?? lastActiveTurnChatId
+    if (fallbackChatId && (_a.allowFrom.includes(fallbackChatId) || fallbackChatId in _a.groups)) {
+      const tier = turn == null ? 'last-known' : 'active'
       process.stderr.write(
         `telegram gateway: reply: model passed chat_id "${_rawChatId}" (not allowlisted) — ` +
-          `routing to active turn chat "${turn.sessionChatId}"\n`,
+          `routing to ${tier} turn chat "${fallbackChatId}"\n`,
       )
-      return turn.sessionChatId
+      return fallbackChatId
     }
     return _rawChatId // let assertAllowedChat below throw the human-readable error
   })()
