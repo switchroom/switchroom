@@ -194,6 +194,7 @@ export function recoverPendingEscalations(opts: {
         finishedAt: opts.now(),
         tier: esc.tier === "cheap" ? "cheap" : "main",
         ...(esc.cronModel ? { modelUsed: esc.cronModel } : {}),
+        ...(entry.name ? { scheduleName: entry.name } : {}),
       });
     } catch (e) {
       opts.log(`pending-escalation recovery failed for '${entry.poll.state_key}': ${(e as Error).message}`);
@@ -278,6 +279,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
             outputSummary: summary,
             startedAt,
             finishedAt: now(),
+            ...(entry.name ? { scheduleName: entry.name } : {}),
           });
           if (more) {
             let handle: { cancel: () => void };
@@ -314,6 +316,7 @@ export function registerAgentSchedule(opts: RegisterOptions): RegisteredTask[] {
           finishedAt: now(),
           tier: fields.tier,
           ...(fields.modelUsed ? { modelUsed: fields.modelUsed } : {}),
+          ...(entry.name ? { scheduleName: entry.name } : {}),
         });
 
       // ── Tier 0: deterministic poll, no model ──────────────────────────
@@ -750,6 +753,7 @@ export async function main(): Promise<void> {
               startedAt,
               finishedAt: Date.now(),
               tier: "action",
+              ...(m.entry.name ? { scheduleName: m.entry.name } : {}),
             });
             continue;
           }
@@ -768,6 +772,7 @@ export async function main(): Promise<void> {
               startedAt,
               finishedAt: Date.now(),
               tier: "poll",
+              ...(m.entry.name ? { scheduleName: m.entry.name } : {}),
             });
             continue;
           }
@@ -787,6 +792,7 @@ export async function main(): Promise<void> {
               : "replay attempted but gateway not connected",
             startedAt,
             finishedAt: Date.now(),
+            ...(m.entry.name ? { scheduleName: m.entry.name } : {}),
           });
         }
       }
@@ -852,6 +858,7 @@ export async function main(): Promise<void> {
                 "not executed",
               startedAt: s.expectedFireMs,
               finishedAt: s.expectedFireMs,
+              ...(s.entry.name ? { scheduleName: s.entry.name } : {}),
             });
           }
         }
