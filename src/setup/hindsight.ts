@@ -502,7 +502,9 @@ export function startHindsight(
     // Restart a wedged API: docker had no liveness signal for hindsight,
     // so an unresponsive server (or a never-booting one) stayed "up"
     // forever. python3 is always present in the image; curl/wget are not.
-    "--health-cmd", HINDSIGHT_HEALTHCHECK_CMD,
+    "--health-cmd", litellm
+      ? `python3 -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://localhost:${apiPort}/health",timeout=4).getcode()==200 else 1)'`
+      : HINDSIGHT_HEALTHCHECK_CMD,
     "--health-interval", "30s",
     "--health-timeout", "5s",
     "--health-retries", "3",
