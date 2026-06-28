@@ -39,7 +39,7 @@
 
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, isAbsolute, normalize } from "node:path";
+import { join, isAbsolute, normalize, basename } from "node:path";
 import { spawnSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -114,7 +114,13 @@ function isTargetPathHeader(headerPath: string, targetBasename: string): boolean
   if (p.includes("..")) return false;
   const norm = normalize(p);
   if (norm.includes("..") || isAbsolute(norm)) return false;
-  return norm === targetBasename;
+  // Accept an exact basename match OR a relative path whose basename matches
+  // (e.g. `state/config/switchroom.yaml` after stripping `a/`). Agents
+  // writing diffs against the full config path produce headers like
+  // `a/state/config/switchroom.yaml`; the basename check accepts those
+  // without allowing path traversal (traversal is blocked above by the
+  // `..` and `isAbsolute` guards). (#2605)
+  return norm === targetBasename || basename(norm) === targetBasename;
 }
 
 /** Stage 1 — RFC §4.1. */

@@ -212,6 +212,11 @@ export function naturalAction(
       return "update its task list";
     case "ExitPlanMode":
       return "exit plan mode";
+    // hostd config-edit verb (#2605) — not mcp__-prefixed (it's a direct
+    // wire call from the agent-config MCP server), so it falls through to
+    // the switch rather than naturalMcpAction. Give it a readable title.
+    case "config_propose_edit":
+      return "edit switchroom config";
     default:
       return `use ${toolName}`;
   }
