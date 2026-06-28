@@ -59,6 +59,13 @@ import type { CachedResult } from "./cache.js";
 import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
+import {
+  handleHermesRest,
+  onHermesOpen,
+  onHermesClose,
+  onHermesMessage,
+  type HermesWsContext,
+} from "./hermes-adapter.js";
 
 /** Live-log poll cadence (ms) for the WS stream. hostd reads `docker
  *  logs --tail` each tick — a poll, not a follow, because the dockerless
@@ -795,6 +802,23 @@ export function startWebServer(
         return undefined as unknown as Response;
       }
 
+      // Hermes Desktop JSON-RPC 2.0 WebSocket endpoint
+      if (pathname === "/api/ws") {
+        if (!checkWsAuth(req, token, server)) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        const wsProto = req.headers.get("Sec-WebSocket-Protocol");
+        const echoBearer = wsProto && wsProto.split(",").map((s) => s.trim()).includes("bearer");
+        const upgraded = server.upgrade(req as Request, {
+          headers: echoBearer ? { "Sec-WebSocket-Protocol": "bearer" } : undefined,
+          data: { hermesWs: true },
+        } as unknown as Parameters<typeof server.upgrade>[1]);
+        if (!upgraded) {
+          return new Response("WebSocket upgrade failed", { status: 400 });
+        }
+        return undefined as unknown as Response;
+      }
+
       // API routes — require auth if SWITCHROOM_WEB_TOKEN is set
       const route = parseRoute(pathname, req.method);
       if (route) {
@@ -1085,6 +1109,19 @@ export function startWebServer(
         }
       }
 
+      // Hermes Desktop REST endpoints (/api/sessions*, /api/status, /api/config)
+      if (pathname.startsWith("/api/")) {
+        const authError = checkAuth(req, token, server);
+        if (authError) return authError;
+        return (async () => {
+          const hermesResult = await handleHermesRest(req.method, pathname, config);
+          if (hermesResult !== null) {
+            return jsonResponse(hermesResult.body, hermesResult.status);
+          }
+          return new Response("Not Found", { status: 404 });
+        })();
+      }
+
       // Static files — no auth required. SPA path routing (root + known tab
       // routes → index.html shell) lives in resolveDashboardFilePath.
       const filePath = resolveDashboardFilePath(pathname);
@@ -1116,10 +1153,22 @@ export function startWebServer(
     },
 
     websocket: {
-      open(_ws) {
-        // No-op; tracking handled per-subscription
+      open(ws) {
+        if ((ws.data as any)?.hermesWs) {
+          const ctx: HermesWsContext = {
+            config,
+            send: (msg: string) => { try { ws.send(msg); } catch {} },
+          };
+          (ws as any)._hermesCtx = ctx;
+          onHermesOpen(ctx);
+        }
       },
       close(ws) {
+        if ((ws as any)._hermesCtx) {
+          onHermesClose((ws as any)._hermesCtx as HermesWsContext);
+          delete (ws as any)._hermesCtx;
+          return;
+        }
         // Stop the live-log poll loop on disconnect.
         const interval = (ws as any)._logInterval;
         if (interval) {
@@ -1128,6 +1177,10 @@ export function startWebServer(
         }
       },
       message(ws, message) {
+        if ((ws as any)._hermesCtx) {
+          void onHermesMessage((ws as any)._hermesCtx as HermesWsContext, String(message));
+          return;
+        }
         // Handle subscription requests for agent logs.
         //
         // The web container is dockerless BY DESIGN (no docker binary/
