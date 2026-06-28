@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.16.10 — fix sr-* obligation cascade + Codex 5.5 model
+
+### PR A — Fix obligation cascade on sr-* short replies (#2624)
+
+Turns via sr-* (LiteLLM/OpenRouter) models consistently ended with
+`finalAnswerDelivered=false` when the model replied with a short answer
+(e.g. "OK"). The claude CLI calls `reply("OK", {disable_notification: true})`
+for short responses — below the 200-char backstop and notification-suppressed,
+so `isFinalAnswerReply` returned false. The obligation system then re-presented
+the turn with the full 25k-token conversation context, which again produced a
+short reply, which cascaded — blocking the agent for minutes and making 4-6
+sequential 25k-token calls per sr-* turn.
+
+Fix: at `turn_end` (explicit model completion signal), close the obligation when
+`replyCalled=true`, regardless of `finalAnswerDelivered`. The ack-then-ghost case
+that obligations are designed to catch ends via `silence_fallback` (silent timeout),
+not `turn_end`. The `silence_fallback` path is unchanged.
+
+**Config: sr-codex-5.5 added to LiteLLM proxy.** `openrouter/openai/gpt-5.5-codex`
+is now exposed as `sr-codex-5.5` and appears in the `/model` OpenRouter section.
+
 ## v0.16.9 — graceful restart on sr-* → Claude model switch
 
 ### PR A — Graceful restart: text-command path (#2619)
