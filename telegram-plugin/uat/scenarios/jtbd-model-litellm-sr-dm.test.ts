@@ -57,7 +57,12 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         const openrouterHeader = flat.find(
           (b) => b.text.includes("OpenRouter") && b.callbackData === "mdl:h",
         );
-        const srButton = flat.find((b) => b.callbackData?.startsWith("mdl:sr:"));
+        // Prefer a fast non-reasoning model for the E2E test; reasoning models
+        // (deepseek-r1, o1, o3) take 2-5 min per response and hit the silence poke.
+        const srButton =
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /flash|gemini-2\.5-flash/.test(b.callbackData)) ??
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && !/r1|o1|o3|thinking/.test(b.callbackData)) ??
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:"));
 
         if (!srButton) {
           console.log("No sr-* buttons in menu — agent not LiteLLM-enabled or no sr-* models registered. Skipping.");
@@ -86,8 +91,10 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         expect((kbAfter ?? []).flat().length, "menu keeps buttons after sr-* tap").toBeGreaterThan(0);
 
         // ── 3. Send a quick message to generate a LiteLLM-routed turn ──
+        // Use 120s — fast models (gemini-flash, deepseek-v3) respond in <10s,
+        // but the request still has to go through the model switch inject + proxy.
         await sc.sendDM("Just reply with the word OK.");
-        await sc.expectMessage(/ok/i, { from: "bot", timeout: 60_000 });
+        await sc.expectMessage(/ok/i, { from: "bot", timeout: 120_000 });
 
         // ── 4. LiteLLM spend attribution ────────────────────────────────
         if (spendBefore >= 0) {
@@ -97,14 +104,19 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
           expect(spendAfter, `agent:${AGENT} log_count increased after turn`).toBeGreaterThan(spendBefore);
         }
 
-        // ── Restore: switch back to configured model ────────────────────
+        // ── Restore: switch back to a Claude subscription model ─────────
+        // Re-fetch keyboard so we have the latest state after sr-* switch.
+        // Look for any Claude model (mdl:s:) button — those are Max/Pro
+        // subscription models and don't trigger slow reasoning. If graceful
+        // restart is implemented, pressing a claude button fires a restart
+        // (not a deepseek/gemini inject), so no secondary LiteLLM calls.
         const currentKb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
-        const restoreBtn = (currentKb ?? []).flat().find(
-          (b) => b.callbackData?.startsWith("mdl:s:") && /Default|Sonnet|claude-sonnet/i.test(b.text),
-        );
+        const restoreBtn = (currentKb ?? []).flat().find((b) => b.callbackData?.startsWith("mdl:s:"));
         if (restoreBtn?.callbackData) {
           await sc.driver.pressButton(sc.botUserId, menu.messageId, restoreBtn.callbackData);
-          await new Promise((r) => setTimeout(r, 4_000));
+          // Wait for the restart to complete (graceful restart PR #2619) or for
+          // the in-place inject to propagate — 15s is sufficient for either path.
+          await new Promise((r) => setTimeout(r, 15_000));
         }
 
         console.log(`✅ sr-* model switch (${srName}) verified end-to-end through LiteLLM`);
@@ -112,7 +124,7 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         await sc.tearDown();
       }
     },
-    180_000,
+    210_000,
   );
 
   it(
@@ -121,9 +133,11 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
       const sc = await spinUp({ agent: AGENT });
       try {
         await sc.sendDM("/model");
+        // 60s — test 2 runs after test 1's restore restart, which takes ~15s.
+        // If the restart is still finishing when /model lands, it may be queued.
         const menu = await sc.expectMessage(/Default \(new sessions\):/i, {
           from: "bot",
-          timeout: 30_000,
+          timeout: 60_000,
         });
         const kb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
         const flat = (kb ?? []).flat();
