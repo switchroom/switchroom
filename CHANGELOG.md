@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.16.6 — /model menu grouped by subscription tier
+
+- `/model` inline keyboard now shows two labelled sections when both Claude and
+  OpenRouter models are available:
+  `── Claude (Max / Pro subscription) ──` and `── OpenRouter / external ──`
+- Body text updated to read "Claude models use your Max/Pro subscription.
+  🌐 models are billed separately via OpenRouter." for clarity.
+- Section header rows show an informational toast if tapped; no selection occurs.
+- Headers are suppressed for agents without LiteLLM sr-* options (clean list).
+- Hindsight Docker healthcheck now probes the correct port (18888) when running
+  in LiteLLM host-network mode instead of the hardcoded upstream default (8888).
+
 ## v0.16.5 — LiteLLM spend enrichment + hindsight routing + sr-* model switching
 
 ### PR A — Enriched LiteLLM spend tags + gateway model discovery (#2601)
