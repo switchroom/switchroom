@@ -253,7 +253,10 @@ import {
   handleModelMenuCallback,
   modelSelectCallbackData,
   sessionModelFromConfirmation,
+  classifyDiscoveredOptions,
   MODEL_CALLBACK_REFRESH,
+  MODEL_CALLBACK_SR,
+  SR_MODEL_LABELS,
   type ModelMenuDeps,
 } from "../gateway/model-command.js";
 import { labelTag } from "../../src/agents/model-picker.js";
@@ -420,5 +423,136 @@ describe("sessionModelFromConfirmation", () => {
     expect(out.answer).toBe("Refreshed");
     expect(calls.discover).toBe(1);
     expect(out.reply.keyboard).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ship D — sr-* (LiteLLM non-Anthropic) model support
+// ---------------------------------------------------------------------------
+
+const OPTIONS_WITH_SR = [
+  { index: 1, label: "Default (recommended)", detail: "Opus 4.8 with 1M context", current: false },
+  { index: 2, label: "Sonnet", detail: "Sonnet 4.6", current: true },
+  { index: 3, label: "sr-gemini-2.5-pro", detail: "", current: false },
+  { index: 4, label: "sr-deepseek-r1", detail: "", current: false },
+  // internal path — should be filtered out
+  { index: 5, label: "openrouter/google/gemini-2.5-pro", detail: "", current: false },
+  // bare OpenAI models from GATEWAY_MODEL_DISCOVERY — should also be filtered out
+  { index: 6, label: "gpt-4", detail: "", current: false },
+  { index: 7, label: "gpt-4o", detail: "", current: false },
+  { index: 8, label: "voyage-law-2", detail: "", current: false },
+  // full claude ID — should be in claude bucket
+  { index: 9, label: "claude-opus-4-8", detail: "", current: false },
+];
+
+describe("classifyDiscoveredOptions", () => {
+  it("puts native Claude options in claude, sr-* in sr, drops others", () => {
+    const { claude, sr } = classifyDiscoveredOptions(OPTIONS_WITH_SR);
+    expect(claude.map((o) => o.label)).toEqual([
+      "Default (recommended)", "Sonnet", "claude-opus-4-8",
+    ]);
+    expect(sr.map((o) => o.label)).toEqual(["sr-gemini-2.5-pro", "sr-deepseek-r1"]);
+    // openrouter/*, gpt-*, voyage-* not present in either bucket
+    const all = [...claude, ...sr];
+    expect(all.find((o) => o.label.includes("openrouter"))).toBeUndefined();
+    expect(all.find((o) => o.label.startsWith("gpt-"))).toBeUndefined();
+    expect(all.find((o) => o.label.startsWith("voyage-"))).toBeUndefined();
+  });
+
+  it("handles a list with no sr-* models", () => {
+    const { claude, sr } = classifyDiscoveredOptions(OPTIONS);
+    expect(claude).toHaveLength(3);
+    expect(sr).toHaveLength(0);
+  });
+});
+
+describe("SR_MODEL_LABELS", () => {
+  it("has friendly names for the standard sr-* models", () => {
+    expect(SR_MODEL_LABELS["sr-gemini-2.5-pro"]).toBe("Gemini 2.5 Pro");
+    expect(SR_MODEL_LABELS["sr-deepseek-r1"]).toBe("DeepSeek R1");
+  });
+});
+
+describe("buildModelMenu — with sr-* models", () => {
+  function makeMenuDepsWithSr(overrides: Partial<ModelMenuDeps> = {}) {
+    return makeMenuDeps({
+      discover: async () => ({
+        ok: true as const,
+        options: OPTIONS_WITH_SR,
+        currentLabel: "Sonnet",
+      }),
+      ...overrides,
+    });
+  }
+
+  it("shows 🌐 buttons for sr-* models, normal buttons for claude models", async () => {
+    const { deps } = makeMenuDepsWithSr();
+    const menu = await buildModelMenu(deps);
+    expect(menu.keyboard).toBeDefined();
+    const allButtons = menu.keyboard!.flat();
+    // 🌐 buttons for sr-*
+    expect(allButtons.find((b) => b.text === "🌐 Gemini 2.5 Pro")).toBeDefined();
+    expect(allButtons.find((b) => b.text === "🌐 DeepSeek R1")).toBeDefined();
+    // Regular buttons for Claude models
+    expect(allButtons.find((b) => b.text === "Default (recommended)")).toBeDefined();
+    // openrouter/* not shown at all
+    expect(allButtons.find((b) => b.text.includes("openrouter"))).toBeUndefined();
+  });
+
+  it("sr-* buttons use mdl:sr: callback prefix", async () => {
+    const { deps } = makeMenuDepsWithSr();
+    const menu = await buildModelMenu(deps);
+    const srButton = menu.keyboard!.flat().find((b) => b.text === "🌐 Gemini 2.5 Pro");
+    expect(srButton?.callback_data).toBe(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`);
+  });
+
+  it("shows 🌐 = non-Anthropic legend when sr-* models are present", async () => {
+    const { deps } = makeMenuDepsWithSr();
+    const menu = await buildModelMenu(deps);
+    expect(menu.text).toContain("🌐 = non-Anthropic");
+  });
+
+  it("no legend when no sr-* models in picker", async () => {
+    const { deps } = makeMenuDeps();
+    const menu = await buildModelMenu(deps);
+    expect(menu.text).not.toContain("🌐 = non-Anthropic");
+  });
+});
+
+describe("handleModelMenuCallback — sr-* selection", () => {
+  function makeMenuDepsWithSr(overrides: Partial<ModelMenuDeps> = {}) {
+    return makeMenuDeps({
+      discover: async () => ({
+        ok: true as const,
+        options: OPTIONS_WITH_SR,
+        currentLabel: "Sonnet",
+      }),
+      ...overrides,
+    });
+  }
+
+  it("sr-* tap uses inject path, not cursor nav", async () => {
+    const { deps, calls, injectCalls } = makeMenuDepsWithSr();
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`, deps);
+    // inject was called with the raw /model command
+    expect(injectCalls).toContainEqual({ agent: "klanker", command: "/model sr-gemini-2.5-pro" });
+    // select (cursor nav) was NOT called
+    expect(calls.select).toHaveLength(0);
+    expect(out.answer).toContain("Set model to sonnet");
+    expect(out.selectedModel).toBe("sr-gemini-2.5-pro");
+    expect(out.reply.keyboard).toBeDefined();
+  });
+
+  it("sr-* tap while busy returns toast-only with no inject", async () => {
+    const { deps, injectCalls } = makeMenuDepsWithSr({ isBusy: () => true });
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}sr-gemini-2.5-pro`, deps);
+    expect(out.toastOnly).toBe(true);
+    expect(injectCalls).toHaveLength(0);
+  });
+
+  it("rejects malformed sr-* callback data", async () => {
+    const { deps } = makeMenuDepsWithSr();
+    const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}bad name with spaces`, deps);
+    expect(out.answer).toBe("Invalid model name");
   });
 });

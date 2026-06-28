@@ -233,6 +233,53 @@ export interface ModelMenuReply {
 export const MODEL_CALLBACK_PREFIX = 'mdl:'
 const MODEL_CALLBACK_SELECT = 'mdl:s:'
 export const MODEL_CALLBACK_REFRESH = 'mdl:r'
+/** Callback prefix for sr-* (LiteLLM non-Anthropic) model selection. */
+export const MODEL_CALLBACK_SR = 'mdl:sr:'
+
+/**
+ * Friendly display names for sr-* synthetic model names. An sr-* model in
+ * LiteLLM has no entry in `model_group_settings.*.forward_client_headers_to_llm_api`
+ * so the Anthropic OAuth credential is NEVER forwarded — safe to route to
+ * OpenRouter. Names here are display-only; the raw `sr-*` id is what gets
+ * injected into the agent's session. See reference/rfcs/litellm-max-subscription-invariants.md § I6.
+ */
+export const SR_MODEL_LABELS: Record<string, string> = {
+  'sr-gemini-2.5-pro': 'Gemini 2.5 Pro',
+  'sr-gemini-2.5-flash': 'Gemini 2.5 Flash',
+  'sr-deepseek-r1': 'DeepSeek R1',
+  'sr-deepseek-v3': 'DeepSeek V3',
+  'sr-glm-5': 'GLM-5',
+}
+
+function srFriendlyLabel(srName: string): string {
+  return SR_MODEL_LABELS[srName] ?? srName.replace(/^sr-/, '').replace(/-/g, ' ')
+}
+
+/**
+ * Split picker-discovered options into native Claude options and sr-*
+ * (LiteLLM non-Anthropic) options. Options with "/" in the label or
+ * other non-native prefixes (e.g., "openrouter/...", "gpt-4") are
+ * silently dropped — they're internal LiteLLM routing paths, not
+ * user-facing switching targets.
+ */
+export function classifyDiscoveredOptions(options: ModelPickerOption[]): {
+  claude: ModelPickerOption[]
+  sr: ModelPickerOption[]
+} {
+  return {
+    // Native Claude picker labels start with an uppercase letter (e.g.
+    // "Default (recommended)", "Opus", "Sonnet") or with "claude-" for full
+    // model IDs. This excludes sr-* names, internal routing paths
+    // ("openrouter/..."), and non-Claude models exposed by GATEWAY_MODEL_DISCOVERY
+    // ("gpt-4", "gpt-4o", "voyage-law-2", etc.) — those are LiteLLM internals
+    // not meant as user-facing switching targets.
+    claude: options.filter(
+      (o) => !o.label.startsWith('sr-') && !o.label.includes('/') &&
+        (/^[A-Z]/.test(o.label) || o.label.startsWith('claude-')),
+    ),
+    sr: options.filter((o) => o.label.startsWith('sr-')),
+  }
+}
 
 export function modelSelectCallbackData(label: string): string {
   // Identity is the label's hash, not its index — a tap re-discovers
@@ -249,15 +296,29 @@ function busyReply(deps: Pick<ModelMenuDeps, 'escapeHtml'>): ModelMenuReply {
   }
 }
 
-function menuKeyboard(options: ModelPickerOption[]): ModelMenuKeyboardButton[][] {
+function menuKeyboard(
+  claudeOptions: ModelPickerOption[],
+  srOptions: ModelPickerOption[],
+): ModelMenuKeyboardButton[][] {
   // One option per row (labels + ✔ render cleanly at full width on
   // mobile), refresh on a trailing row.
-  const rows: ModelMenuKeyboardButton[][] = options.map((o) => [
+  const rows: ModelMenuKeyboardButton[][] = claudeOptions.map((o) => [
     {
       text: o.current ? `✅ ${o.label}` : o.label,
       callback_data: modelSelectCallbackData(o.label),
     },
   ])
+  // sr-* models are non-Anthropic (routed via LiteLLM → OpenRouter).
+  // Selection uses text-inject rather than cursor-nav — more reliable
+  // when the picker has many models (GATEWAY_MODEL_DISCOVERY=1).
+  for (const o of srOptions) {
+    rows.push([
+      {
+        text: `🌐 ${srFriendlyLabel(o.label)}`,
+        callback_data: `${MODEL_CALLBACK_SR}${o.label}`,
+      },
+    ])
+  }
   rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
   return rows
 }
@@ -292,7 +353,8 @@ export async function buildModelMenu(
   // or a prior session switch). Labelling the ✔ row "Now:" was misleading —
   // it could read "Opus 4.8" while the live session is on Fable. Call it what
   // it is, and tell the operator a switch applies to the live session.
-  const current = discovered.options.find((o) => o.current)
+  const { claude: claudeOptions, sr: srOptions } = classifyDiscoveredOptions(discovered.options)
+  const current = claudeOptions.find((o) => o.current)
   const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
   if (discovered.dismissFailed) {
     lines.push('⚠️ <i>The picker may still be open on the agent pane — check it before switching.</i>')
@@ -305,9 +367,10 @@ export async function buildModelMenu(
   }
   if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
   lines.push('', 'Tap a model to switch the <b>live session</b>:')
+  if (srOptions.length > 0) lines.push('🌐 = non-Anthropic via LiteLLM (session only)')
   lines.push(PERSIST_NOTE)
 
-  return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(discovered.options) }
+  return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(claudeOptions, srOptions) }
 }
 
 export interface ModelCallbackOutcome {
@@ -346,6 +409,54 @@ export async function handleModelMenuCallback(
   if (data === MODEL_CALLBACK_REFRESH) {
     return { answer: 'Refreshed', reply: await buildModelMenu(deps) }
   }
+
+  // sr-* model tap: text-inject `/model sr-<name>` rather than cursor-nav.
+  // Text-inject is more reliable when the picker has many models; sr-* names
+  // are safe (no entry in model_group_settings → no OAuth forwarding). See I6.
+  if (data.startsWith(MODEL_CALLBACK_SR)) {
+    const srName = data.slice(MODEL_CALLBACK_SR.length)
+    if (!isValidModelArg(srName)) {
+      return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
+    }
+    if (deps.isBusy()) {
+      return {
+        answer: '⏳ Agent is mid-turn — tap again when it’s idle',
+        reply: busyReply(deps),
+        toastOnly: true,
+      }
+    }
+    let srResult: InjectResult
+    try {
+      srResult = await deps.inject(deps.getAgentName(), `/model ${srName}`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return {
+        answer: 'Switch failed',
+        reply: await menuWithBanner(deps, `❌ Switch to <b>${deps.escapeHtml(srName)}</b> failed: ${deps.escapeHtml(msg)}`),
+      }
+    }
+    if (srResult.outcome === 'ok') {
+      const friendlyName = srFriendlyLabel(srName)
+      const confirmation =
+        srResult.output
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => /set model|switched/i.test(l)) ?? `Switched to ${friendlyName} (session)`
+      return {
+        answer: confirmation,
+        reply: await menuWithBanner(deps, `✅ ${deps.escapeHtml(confirmation)}`),
+        selectedModel: srName,
+      }
+    }
+    return {
+      answer: 'Switch failed',
+      reply: await menuWithBanner(
+        deps,
+        `❌ Switch to <b>${deps.escapeHtml(srFriendlyLabel(srName))}</b> failed — agent may be mid-turn`,
+      ),
+    }
+  }
+
   if (!data.startsWith(MODEL_CALLBACK_SELECT)) {
     return { answer: 'Unknown action', reply: await buildModelMenu(deps) }
   }
