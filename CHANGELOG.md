@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.16.5 — LiteLLM spend enrichment + hindsight routing + sr-* model switching
+
+### PR A — Enriched LiteLLM spend tags + gateway model discovery (#2601)
+
+- `scheduleName` tag added to agent audit JSONL so cron vs Telegram spend is
+  attributable in the LiteLLM spend log.
+- Per-turn gateway discovery of available models (via `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`)
+  enables the non-Anthropic model picker in Ship D below.
+- Static spend tags now include `profile:<name>` alongside `agent:<name>`.
+
+### PR B — Ship C: Grafana turn panels + tag exporter (#2604)
+
+- New Grafana dashboard panels for per-agent turn throughput, latency, and
+  model breakdown, driven by the Turn JSONL stream.
+- `litellm-tag-exporter` sidecar harvests per-agent virtual-key spend from
+  the LiteLLM API and writes Prometheus metrics for fleet cost attribution.
+- Turn JSONL file format documented; gateway writes one record per completed
+  turn (start/end timestamps, model, status, token estimates).
+
+### PR C — Hindsight LiteLLM routing (#2603)
+
+When `litellm.enabled: true` globally and `memory.backend: hindsight`,
+`switchroom apply` now provisions a `service:hindsight` virtual key
+(vault `litellm/hindsight/api-key`) and injects it into the hindsight
+container so its Claude Agent SDK subprocess routes through LiteLLM for
+spend tracking — same subscription, now metered.
+
+- `startHindsight()` accepts an optional `LiteLLMHindsightConfig` param.
+  When provided: `--network host` (matching agent containers so
+  `127.0.0.1:4010` is reachable), `HINDSIGHT_API_PORT`, `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_CUSTOM_HEADERS` with Bearer key + static tags.
+- Fail-open: if the key is missing or vault unreachable, hindsight starts
+  normally (direct OAuth, no tracking).
+
+### PR D — Ship D: sr-* non-Anthropic model switching in /model (#2607)
+
+The `/model` Telegram command now surfaces non-Anthropic LiteLLM models when
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` is active (automatic when
+`litellm.enabled: true`).
+
+- `classifyDiscoveredOptions()` splits picker results: native Claude models
+  (uppercase label or `claude-*` ID) go to the cursor-nav section; sr-*
+  synthetic names (e.g. `sr-gemini-2.5-pro`, `sr-deepseek-r1`) appear as
+  🌐-prefixed buttons; internal paths (`openrouter/*`, `gpt-*`, `voyage-*`)
+  are silently dropped.
+- sr-* selection uses text-inject (`/model sr-<name>`) rather than cursor
+  navigation — more reliable with a long model list.
+- `SR_MODEL_LABELS` maps sr-* API names to friendly display labels
+  ("Gemini 2.5 Pro", "DeepSeek R1", "DeepSeek V3", "GLM-5").
+- **I6 invariant**: sr-* names have no entry in
+  `model_group_settings.*.forward_client_headers_to_llm_api` — Anthropic
+  OAuth is never forwarded to OpenRouter. Documented in
+  `reference/rfcs/litellm-max-subscription-invariants.md`.
+
+---
+
 ## v0.16.4 — LiteLLM gateway routing + channels durable fix + Claude Code 2.1.195
 
 ### LiteLLM subscription-native gateway routing (opt-in) (#2597)
