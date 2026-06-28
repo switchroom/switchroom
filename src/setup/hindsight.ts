@@ -474,19 +474,13 @@ export function startHindsight(
     // agent containers work. Explicit port env vars preserve the same
     // external ports (18888/19999) the operator is used to.
     envArgs.push(
+      // HINDSIGHT_API_PORT is the only port knob the upstream config.py
+      // recognizes; the CP service has no equivalent env var override.
       "-e", `HINDSIGHT_API_PORT=${apiPort}`,
-      "-e", `HINDSIGHT_CP_PORT=${uiPort}`,
-      // Tell the CP where the API lives (port may differ from image default 8888).
-      "-e", `HINDSIGHT_CP_DATAPLANE_API_URL=http://127.0.0.1:${apiPort}`,
       // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
       // consolidation/reflect calls hit the proxy for spend tracking.
       "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl}`,
-      "-e", [
-        "ANTHROPIC_CUSTOM_HEADERS=",
-        `x-litellm-api-key: Bearer ${litellm.apiKey}`,
-        "x-litellm-customer-id: hindsight",
-        "x-litellm-tags: service:hindsight",
-      ].join("\n"),
+      "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
     );
   }
 

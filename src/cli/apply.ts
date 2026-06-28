@@ -302,10 +302,14 @@ export async function provisionLiteLLMKeys(
           `without operator attestation.`,
       });
     }
+    const targets = [
+      ...optedIn.map(({ name }) => name),
+      ...(needsHindsight ? ["hindsight (service)"] : []),
+    ];
     ctx.writeErr(
       chalk.red(
         `  x litellm: no operator vault passphrase — skipping provisioning for ` +
-        `${optedIn.length} opted-in agent(s). They will NOT get routing env until a key exists.\n`,
+        `${targets.join(", ")}. They will NOT get routing env until a key exists.\n`,
       ),
     );
     return;
