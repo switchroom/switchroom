@@ -276,6 +276,7 @@ import {
   buildModelMenu,
   handleModelMenuCallback,
   MODEL_CALLBACK_PREFIX,
+  MODEL_CALLBACK_HEADER,
   type ModelMenuDeps,
   type ModelCommandDeps,
   type ModelMenuReply,
@@ -20721,6 +20722,11 @@ bot.on('callback_query:data', async ctx => {
     // drive behind the pane lock. A callback can only be answered once, so
     // the rich result (what was set / why it failed) is conveyed by the
     // message edit — which now ALWAYS keeps the menu buttons.
+    // Header rows are section labels — informational, no model switch.
+    if (data === MODEL_CALLBACK_HEADER) {
+      await ctx.answerCallbackQuery({ text: 'Tap a model in this section to switch' }).catch(() => {})
+      return
+    }
     await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
     try {
       const outcome = await handleModelMenuCallback(data, modelDeps)

@@ -235,6 +235,8 @@ const MODEL_CALLBACK_SELECT = 'mdl:s:'
 export const MODEL_CALLBACK_REFRESH = 'mdl:r'
 /** Callback prefix for sr-* (LiteLLM non-Anthropic) model selection. */
 export const MODEL_CALLBACK_SR = 'mdl:sr:'
+/** Callback for section-header rows — shows an informational toast, no action. */
+export const MODEL_CALLBACK_HEADER = 'mdl:h'
 
 /**
  * Friendly display names for sr-* synthetic model names. An sr-* model in
@@ -296,29 +298,38 @@ function busyReply(deps: Pick<ModelMenuDeps, 'escapeHtml'>): ModelMenuReply {
   }
 }
 
+function headerRow(label: string): ModelMenuKeyboardButton[] {
+  return [{ text: label, callback_data: MODEL_CALLBACK_HEADER }]
+}
+
 function menuKeyboard(
   claudeOptions: ModelPickerOption[],
   srOptions: ModelPickerOption[],
 ): ModelMenuKeyboardButton[][] {
-  // One option per row (labels + ✔ render cleanly at full width on
-  // mobile), refresh on a trailing row.
-  const rows: ModelMenuKeyboardButton[][] = claudeOptions.map((o) => [
-    {
+  const hasBothGroups = claudeOptions.length > 0 && srOptions.length > 0
+  const rows: ModelMenuKeyboardButton[][] = []
+
+  if (hasBothGroups) rows.push(headerRow('── Claude (Max / Pro subscription) ──'))
+  for (const o of claudeOptions) {
+    rows.push([{
       text: o.current ? `✅ ${o.label}` : o.label,
       callback_data: modelSelectCallbackData(o.label),
-    },
-  ])
+    }])
+  }
+
   // sr-* models are non-Anthropic (routed via LiteLLM → OpenRouter).
   // Selection uses text-inject rather than cursor-nav — more reliable
   // when the picker has many models (GATEWAY_MODEL_DISCOVERY=1).
-  for (const o of srOptions) {
-    rows.push([
-      {
+  if (srOptions.length > 0) {
+    rows.push(headerRow('── OpenRouter / external ──'))
+    for (const o of srOptions) {
+      rows.push([{
         text: `🌐 ${srFriendlyLabel(o.label)}`,
         callback_data: `${MODEL_CALLBACK_SR}${o.label}`,
-      },
-    ])
+      }])
+    }
   }
+
   rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
   return rows
 }
@@ -367,7 +378,9 @@ export async function buildModelMenu(
   }
   if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
   lines.push('', 'Tap a model to switch the <b>live session</b>:')
-  if (srOptions.length > 0) lines.push('🌐 = non-Anthropic via LiteLLM (session only)')
+  if (srOptions.length > 0) {
+    lines.push('Claude models use your Max/Pro subscription. 🌐 models are billed separately via OpenRouter.')
+  }
   lines.push(PERSIST_NOTE)
 
   return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(claudeOptions, srOptions) }
@@ -408,6 +421,13 @@ export async function handleModelMenuCallback(
 ): Promise<ModelCallbackOutcome> {
   if (data === MODEL_CALLBACK_REFRESH) {
     return { answer: 'Refreshed', reply: await buildModelMenu(deps) }
+  }
+
+  if (data === MODEL_CALLBACK_HEADER) {
+    // Section-header row — the gateway handles this with a direct answerCallbackQuery
+    // before calling this function, so this branch is dead in practice. Guard
+    // for callers that skip gateway.ts (tests, future refactors).
+    return { answer: 'Tap a model in this section to switch', reply: { text: '', html: true }, toastOnly: true }
   }
 
   // sr-* model tap: text-inject `/model sr-<name>` rather than cursor-nav.
