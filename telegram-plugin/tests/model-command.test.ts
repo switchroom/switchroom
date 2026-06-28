@@ -354,6 +354,7 @@ import {
   MODEL_CALLBACK_HEADER,
   MODEL_CALLBACK_SR,
   SR_MODEL_LABELS,
+  isSrToClaudeTransition,
   type ModelMenuDeps,
 } from "../gateway/model-command.js";
 import { labelTag } from "../../src/agents/model-picker.js";
@@ -672,5 +673,31 @@ describe("handleModelMenuCallback — sr-* selection", () => {
     const { deps } = makeMenuDepsWithSr();
     const out = await handleModelMenuCallback(`${MODEL_CALLBACK_SR}bad name with spaces`, deps);
     expect(out.answer).toBe("Invalid model name");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isSrToClaudeTransition helper (used by gateway callback handler)
+// ---------------------------------------------------------------------------
+
+describe("isSrToClaudeTransition", () => {
+  it("true when prev is sr-* and next is not sr-*", () => {
+    expect(isSrToClaudeTransition("sr-gemini-2.5-pro", "Haiku 4.5")).toBe(true);
+    expect(isSrToClaudeTransition("sr-deepseek-r1", "Fable 5")).toBe(true);
+    expect(isSrToClaudeTransition("sr-deepseek-r1", "claude-opus-4-8")).toBe(true);
+  });
+
+  it("false when prev is not sr-* (Claude → Claude)", () => {
+    expect(isSrToClaudeTransition("Opus 4.8", "Haiku 4.5")).toBe(false);
+    expect(isSrToClaudeTransition(null, "Sonnet")).toBe(false);
+    expect(isSrToClaudeTransition(undefined, "Sonnet")).toBe(false);
+  });
+
+  it("false when prev is sr-* but next is also sr-* (sr-* → sr-*)", () => {
+    expect(isSrToClaudeTransition("sr-gemini-2.5-pro", "sr-deepseek-r1")).toBe(false);
+  });
+
+  it("false when switching to sr-* from Claude (Claude → sr-*)", () => {
+    expect(isSrToClaudeTransition("Sonnet", "sr-gemini-2.5-pro")).toBe(false);
   });
 });

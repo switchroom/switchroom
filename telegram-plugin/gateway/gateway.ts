@@ -275,6 +275,7 @@ import {
   handleModelCommand,
   buildModelMenu,
   handleModelMenuCallback,
+  isSrToClaudeTransition,
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
   type ModelMenuDeps,
@@ -20808,6 +20809,7 @@ bot.on('callback_query:data', async ctx => {
     }
     await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
     try {
+      const prevSessionModel = activeSessionModelOverride
       const outcome = await handleModelMenuCallback(data, modelDeps)
       // Record a successful session switch so /status reflects what's
       // actually running. In-memory only → clears when the gateway (and thus
@@ -20818,6 +20820,35 @@ bot.on('callback_query:data', async ctx => {
       // toastOnly: a no-op outcome that should not disturb the menu (defence
       // in depth — the isBusy() short-circuit above is the live path).
       if (outcome.toastOnly) return
+
+      // sr-* → Claude transition via the model menu: trigger a graceful restart.
+      // Switching FROM an sr-* (LiteLLM/OpenRouter) model BACK to a Claude model
+      // via the picker requires a session restart — the picker-select only changes
+      // the session model label, but the sr-* LiteLLM routing context persists
+      // until the session is torn down. Same mechanism as the /restart command.
+      if (outcome.selectedModel && isSrToClaudeTransition(prevSessionModel, outcome.selectedModel)) {
+        const agentName = getMyAgentName()
+        // Replace the menu with a restart notice (no buttons — session is ending).
+        await ctx
+          .editMessageText(
+            `🔄 Switching from <b>${escapeHtmlForTg(prevSessionModel!)}</b> back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
+            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          )
+          .catch(() => {})
+        // Write the restart marker so the post-restart boot card edits into this chat.
+        writeRestartMarker({ chat_id: cbChatId, thread_id: cbThreadId ?? null, ack_message_id: null, ts: Date.now() })
+        stampUserRestartReason('user: sr-to-claude model switch (menu)')
+        if (turnInFlightForGate()) {
+          // Defer restart until the in-flight turn completes (same gate as /restart).
+          pendingRestarts.set(agentName, Date.now())
+        } else {
+          void sweepBeforeSelfRestart().finally(() =>
+            triggerSelfRestart(agentName, 'sr-to-claude-model-switch', 1500),
+          )
+        }
+        return
+      }
+
       await ctx
         .editMessageText(outcome.reply.text, {
           parse_mode: 'HTML',
