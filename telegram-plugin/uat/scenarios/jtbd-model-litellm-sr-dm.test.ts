@@ -60,7 +60,7 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         // Prefer a fast non-reasoning model for the E2E test; reasoning models
         // (deepseek-r1, o1, o3) take 2-5 min per response and hit the silence poke.
         const srButton =
-          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /flash|gemini-2\.5-flash/.test(b.callbackData)) ??
+          flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && /flash/.test(b.callbackData)) ??
           flat.find((b) => b.callbackData?.startsWith("mdl:sr:") && !/r1|o1|o3|thinking/.test(b.callbackData)) ??
           flat.find((b) => b.callbackData?.startsWith("mdl:sr:"));
 
@@ -156,6 +156,6 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
         await sc.tearDown();
       }
     },
-    60_000,
+    120_000,
   );
 });
