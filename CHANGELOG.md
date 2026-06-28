@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.16.12 — fix sr-* reply routing: chat_id fallback + obligation meta
+
+Two remaining routing bugs that prevented Gemini (via LiteLLM sr-* models)
+from delivering replies after a model switch:
+
+**Bug B — executeReply fallback**: When a non-Claude model passes an unexpected
+`chat_id` (not in the allowlist), `executeReply` now falls back to the active
+turn's `sessionChatId`, which was already validated at inbound receipt. The
+fallback logs a `stderr` line so operators can observe model confusion without
+the reply being silently dropped. (#2632)
+
+**Bug C — obligation represent meta**: `buildObligationRepresentInbound` set
+`chatId` on the root `InboundMessage` but omitted it from `meta`. The bridge
+builds the `<channel>` XML from `meta`, so obligation re-presents had no
+`chat_id` attribute — the model had no value to pass back to `reply`. Fix:
+add `chat_id: o.chatId` to `meta`, matching the pattern in
+`resume-inbound-builder.ts`. (#2632)
+
 ## v0.16.11 — fix sr-* reply blocked by numeric chat_id type mismatch
 
 Non-Anthropic models routed via LiteLLM (e.g. `sr-gemini-2.5-flash`) send
