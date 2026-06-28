@@ -15978,7 +15978,12 @@ bot.command('clear', async ctx => {
 // text. The typed argument form rides the allowlisted inject
 // primitive unchanged. Implementation in model-command.ts so it's
 // unit-testable without booting the bot.
-function buildModelDeps(): ModelMenuDeps & ModelCommandDeps {
+interface ModelDepsRestartContext {
+  chatId: string
+  threadId: number | undefined
+}
+
+function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & ModelCommandDeps {
   return {
     discover: (a) => discoverModels(a),
     discoverSrModels: async () => {
@@ -16029,6 +16034,55 @@ function buildModelDeps(): ModelMenuDeps & ModelCommandDeps {
     },
     escapeHtml: escapeHtmlForTg,
     preBlock,
+    getActiveSessionModel: () => activeSessionModelOverride,
+    /**
+     * Graceful restart for sr-* → Claude model switch. Same mechanism as
+     * the /restart command: writes a restart marker (so the post-restart
+     * greeting lands in the originating chat), stamps the reason, and
+     * dispatches via hostd (or legacy detached spawn as fallback).
+     */
+    scheduleRestart: async (reason: string) => {
+      const name = getMyAgentName()
+      // Debounce: mirror the /restart command's 15 s guard to prevent
+      // double-dispatch on a rapid double-tap of /model <claude-alias>.
+      const existing = readRestartMarker()
+      if (existing && Date.now() - existing.ts < 15_000) return
+      if (restartCtx) {
+        writeRestartMarker({
+          chat_id: restartCtx.chatId,
+          thread_id: restartCtx.threadId ?? null,
+          ack_message_id: null,
+          ts: Date.now(),
+        })
+      }
+      stampUserRestartReason(reason)
+      await sweepBeforeSelfRestart()
+      const hostdResp = await tryHostdDispatch(name, {
+        v: 1,
+        op: 'agent_restart',
+        request_id: hostdRequestId('gw-model-restart'),
+        args: { name, force: true, reason },
+      })
+      if (hostdResp === 'not-configured') {
+        warnLegacySpawnIfHostdDisabled('agent_restart')
+        spawnSwitchroomDetached(
+          ['agent', 'restart', name, '--force'],
+          notifyDetachedFailure(
+            restartCtx?.chatId ?? '',
+            restartCtx?.threadId ?? null,
+            `restart ${name}`,
+          ),
+        )
+        return
+      }
+      // hostd is configured but returned an error/denied result.
+      if (hostdResp.result !== 'started' && hostdResp.result !== 'completed') {
+        clearRestartMarker()
+        throw new Error(
+          `hostd restart failed (result=${hostdResp.result}): ${hostdResp.error ?? '(no details)'}`,
+        )
+      }
+    },
   }
 }
 
@@ -16046,7 +16100,9 @@ bot.command('model', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   const text = ctx.message?.text ?? ctx.channelPost?.text ?? ''
   const parsed = parseModelCommand(text) ?? { kind: 'show' as const }
-  const deps = buildModelDeps()
+  const chatId = String(ctx.chat!.id)
+  const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
+  const deps = buildModelDeps({ chatId, threadId })
   if (parsed.kind === 'show' && process.env.SWITCHROOM_MODEL_MENU !== '0') {
     const menu = await buildModelMenu(deps)
     await switchroomReply(ctx, menu.text, { html: true, reply_markup: modelMenuReplyMarkup(menu) })
@@ -20726,7 +20782,9 @@ bot.on('callback_query:data', async ctx => {
         .catch(() => {})
       return
     }
-    const modelDeps = buildModelDeps()
+    const cbChatId = String(ctx.chat?.id ?? '')
+    const cbThreadId = resolveThreadId(cbChatId, ctx.callbackQuery?.message?.message_thread_id)
+    const modelDeps = buildModelDeps({ chatId: cbChatId, threadId: cbThreadId })
     // Mid-turn refusal is INSTANT (a sync isBusy() check, no picker drive),
     // so handle it before the "Working…" ack: toast WHY and leave the menu
     // message untouched (buttons intact) so the operator taps again when

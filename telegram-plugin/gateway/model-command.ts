@@ -62,6 +62,23 @@ export function isValidModelArg(arg: string): boolean {
   return MODEL_ARG_RE.test(arg)
 }
 
+/** True when `name` is an sr-* (LiteLLM/OpenRouter) model identifier. */
+export function isSrModel(name: string): boolean {
+  return name.startsWith('sr-')
+}
+
+/**
+ * True when `name` is a Claude model — either a well-known alias or a
+ * full `claude-*` id (including `[1m]` variants). This is intentionally
+ * broader than MODEL_ALIASES: any `claude-…` string from claude's own
+ * picker (e.g. `claude-opus-4-8`) qualifies.
+ */
+export function isClaudeModel(name: string): boolean {
+  const lower = name.toLowerCase()
+  if ((MODEL_ALIASES as readonly string[]).includes(lower)) return true
+  return lower.startsWith('claude-')
+}
+
 export type ParsedModelCommand =
   | { kind: 'show' }
   | { kind: 'set'; model: string }
@@ -100,6 +117,22 @@ export interface ModelCommandDeps {
   getConfiguredModel: () => string | null
   escapeHtml: (s: string) => string
   preBlock: (s: string) => string
+  /**
+   * The active session-model override set by a prior `/model` switch.
+   * Null when no session override is active (using configured/default model).
+   * Used to detect whether the current session is on an sr-* (OpenRouter)
+   * model so a switch back to Claude can trigger a graceful restart instead
+   * of an in-place inject (which would leave stale sr-* routing in place).
+   */
+  getActiveSessionModel: () => string | null
+  /**
+   * Schedule a graceful restart of this agent. Called instead of inject
+   * when switching from an sr-* model back to Claude — the restart clears
+   * the sr-* session context cleanly, whereas an in-place inject would
+   * leave LiteLLM routing active. The gateway wires this to the same
+   * mechanism as the `/restart` command (hostd-first, SIGTERM fallback).
+   */
+  scheduleRestart: (reason: string) => Promise<void>
 }
 
 export interface ModelCommandReply {
@@ -148,6 +181,32 @@ export async function handleModelCommand(
   if (!isValidModelArg(parsed.model)) {
     return helpText(deps, `not a valid model name: ${parsed.model}`)
   }
+
+  // sr-* → Claude: an in-place `/model` inject would leave LiteLLM routing
+  // active in the live session because the sr-* model context was set by
+  // the proxy at session start, not by claude's own REPL. A graceful restart
+  // is the only clean path back to the native OAuth route. This matches the
+  // behaviour of the `/restart` command (same mechanism, same marker logic).
+  const currentSession = deps.getActiveSessionModel()
+  if (currentSession !== null && isSrModel(currentSession) && isClaudeModel(parsed.model)) {
+    try {
+      await deps.scheduleRestart(`user: /model ${parsed.model} (sr-to-claude restart)`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return {
+        text: `❌ Could not schedule restart: ${deps.escapeHtml(msg)}`,
+        html: true,
+      }
+    }
+    return {
+      text: [
+        `Switching from <code>${deps.escapeHtml(currentSession)}</code> back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
+        PERSIST_NOTE,
+      ].join('\n'),
+      html: true,
+    }
+  }
+
   const verbHtml = `<code>/model ${deps.escapeHtml(parsed.model)}</code>`
   let result: InjectResult
   try {

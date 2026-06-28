@@ -18,6 +18,8 @@ import {
   parseModelCommand,
   handleModelCommand,
   isValidModelArg,
+  isSrModel,
+  isClaudeModel,
   MODEL_ALIASES,
   type ModelCommandDeps,
 } from "../gateway/model-command.js";
@@ -35,6 +37,7 @@ function okResult(output: string): InjectResult {
 
 function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
   const calls: Array<{ agent: string; command: string }> = [];
+  const restartCalls: string[] = [];
   const deps: ModelCommandDeps = {
     inject: async (agent, command) => {
       calls.push({ agent, command });
@@ -45,9 +48,11 @@ function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
     escapeHtml: (s) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
     preBlock: (s) => `<pre>${s}</pre>`,
+    getActiveSessionModel: () => null,
+    scheduleRestart: async (reason) => { restartCalls.push(reason); },
     ...overrides,
   };
-  return { deps, calls };
+  return { deps, calls, restartCalls };
 }
 
 describe("parseModelCommand", () => {
@@ -234,6 +239,97 @@ describe("handleModelCommand — set", () => {
     });
     const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
     expect(reply.text).toContain("boom");
+  });
+});
+
+describe("isSrModel / isClaudeModel helpers", () => {
+  it("isSrModel is true only for sr-* names", () => {
+    expect(isSrModel("sr-gemini-2.5-pro")).toBe(true);
+    expect(isSrModel("sr-deepseek-r1")).toBe(true);
+    expect(isSrModel("claude-sonnet-4-6")).toBe(false);
+    expect(isSrModel("sonnet")).toBe(false);
+    expect(isSrModel("")).toBe(false);
+  });
+
+  it("isClaudeModel is true for aliases and claude-* ids", () => {
+    for (const alias of MODEL_ALIASES) {
+      expect(isClaudeModel(alias), alias).toBe(true);
+    }
+    expect(isClaudeModel("claude-opus-4-8")).toBe(true);
+    expect(isClaudeModel("claude-sonnet-4-6[1m]")).toBe(true);
+    expect(isClaudeModel("sr-gemini-2.5-pro")).toBe(false);
+    expect(isClaudeModel("gpt-4")).toBe(false);
+  });
+});
+
+describe("handleModelCommand — sr-* → Claude graceful restart", () => {
+  it("schedules restart instead of injecting when session is on sr-* and target is Claude alias", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => "sr-gemini-2.5-pro",
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    // Must NOT inject
+    expect(calls).toHaveLength(0);
+    // Must schedule a restart
+    expect(restartCalls).toHaveLength(1);
+    expect(restartCalls[0]).toContain("opus");
+    expect(restartCalls[0]).toContain("sr-to-claude");
+    // Reply mentions the sr-* model and ~30s
+    expect(reply.text).toContain("sr-gemini-2.5-pro");
+    expect(reply.text).toContain("30s");
+    expect(reply.html).toBe(true);
+  });
+
+  it("schedules restart when session is on sr-* and target is a full claude-* id", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => "sr-deepseek-r1",
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "claude-opus-4-8" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(restartCalls).toHaveLength(1);
+    expect(reply.text).toContain("sr-deepseek-r1");
+    expect(reply.text).toContain("30s");
+  });
+
+  it("does NOT restart when switching between Claude models (no sr-* session)", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => "Opus 4.8",
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
+    // Normal inject path: still injects, no restart
+    expect(calls).toHaveLength(1);
+    expect(restartCalls).toHaveLength(0);
+    expect(reply.text).toContain("Set model to sonnet");
+  });
+
+  it("does NOT restart when switching from Claude to sr-* (no session override)", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => null,
+    });
+    await handleModelCommand({ kind: "set", model: "sr-gemini-2.5-pro" }, deps);
+    // sr-* is not a Claude model — no restart
+    expect(restartCalls).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("surfaces scheduleRestart failures without propagating the error", async () => {
+    const { deps, calls } = makeDeps({
+      getActiveSessionModel: () => "sr-deepseek-r1",
+      scheduleRestart: async () => { throw new Error("hostd unreachable"); },
+    });
+    const reply = await handleModelCommand({ kind: "set", model: "sonnet" }, deps);
+    expect(calls).toHaveLength(0);
+    expect(reply.text).toContain("Could not schedule restart");
+    expect(reply.text).toContain("hostd unreachable");
+  });
+
+  it("null session model (no prior override) still uses normal inject path for Claude target", async () => {
+    const { deps, calls, restartCalls } = makeDeps({
+      getActiveSessionModel: () => null,
+    });
+    await handleModelCommand({ kind: "set", model: "opus" }, deps);
+    expect(calls).toHaveLength(1);
+    expect(restartCalls).toHaveLength(0);
   });
 });
 
