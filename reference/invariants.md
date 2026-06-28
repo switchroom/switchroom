@@ -122,6 +122,37 @@ opt-in helpers, not second channels.
 - **By-construction test:** does this add a second human-facing chat
   channel? If yes, it is out.
 
+### Operator-console carve-out
+
+An **operator-only** management console (e.g. a Hermes-Desktop client pointed
+at a Switchroom adapter) MAY let the operator send a turn to one of their own
+agents from outside Telegram — **iff** all four hold:
+
+1. **Operator audience only.** The console is authenticated, single-tenant,
+   and never reachable by a principal as their way to talk to an agent. It is
+   the operator's workshop view, not a second front door for the people the
+   team serves. (This is the same "audience is the whole line" reasoning that
+   keeps an operator surface clear of `chat-is-the-single-source-of-truth`.)
+2. **One canonical record.** Every operator turn and the agent's reply
+   **mirror into that agent's Telegram thread.** The console is another way
+   *in*, never a separate conversation the Telegram thread can't see — so
+   there is still exactly one record, and `chat-is-the-single-source-of-truth`
+   holds.
+3. **Same path, not a parallel runtime.** The operator turn is injected
+   through the existing synthesized-inbound path (the cron / `inject_inbound`
+   pattern), landing as an ordinary turn in the one agent session. No second
+   agent loop, no second inference path.
+4. **Approvals stay on Telegram.** The console never gains an
+   approve/deny/grant action; the human-validated Telegram tap remains the
+   sole approval surface (`no-self-escalation`). A console that wires
+   approvals is out.
+
+This is telegram-only by construction: there is still one channel of record
+(Telegram) and one trust anchor for consequential actions (the Telegram tap).
+The carve-out admits an operator *input surface* that feeds the one thread —
+not a second human-facing channel with its own audience and its own history.
+The detail contract is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
+
 ## `chat-is-the-single-source-of-truth`
 
 Status and progress never live in a surface running *parallel* to the
