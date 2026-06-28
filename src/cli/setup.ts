@@ -34,7 +34,9 @@ import {
   stopHindsight,
   ensureHindsightConsumer,
   HINDSIGHT_CONSUMER_NAME,
+  type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
+import { getViaBrokerStructured } from "../vault/broker/client.js";
 import {
   ask,
   askYesNo,
@@ -896,6 +898,16 @@ async function stepCreateTopics(
 
 // ─── Step 6: Memory Backend ─────────────────────────────────────────────────
 
+async function resolveLiteLLMForHindsight(
+  config: SwitchroomConfig,
+): Promise<LiteLLMHindsightConfig | undefined> {
+  const topLiteLLM = (config as { litellm?: { enabled?: boolean; base_url?: string } }).litellm;
+  if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
+  const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
+  if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
+  return { baseUrl: topLiteLLM.base_url, apiKey: result.entry.value };
+}
+
 async function stepMemoryBackend(
   config: SwitchroomConfig,
   nonInteractive: boolean,
@@ -1025,7 +1037,11 @@ async function stepMemoryBackend(
   // Start the container in broker-fed mode (no API key).
   const spin = spinner("Starting Hindsight Docker container...");
   try {
-    startHindsight();
+    const litellmCfg = await resolveLiteLLMForHindsight(config);
+    startHindsight(undefined, litellmCfg);
+    if (litellmCfg) {
+      console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
+    }
 
     if (isHindsightRunning()) {
       spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));

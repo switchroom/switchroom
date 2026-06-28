@@ -21,11 +21,30 @@ import {
   pullHindsightImage,
   getRunningHindsightPorts,
   HINDSIGHT_DEFAULT_API_PORT,
+  type LiteLLMHindsightConfig,
 } from "../setup/hindsight.js";
+import { getViaBrokerStructured } from "../vault/broker/client.js";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveAgentsDir } from "../config/loader.js";
 import YAML from "yaml";
+import type { SwitchroomConfig } from "../config/schema.js";
+
+/**
+ * Resolve LiteLLM routing config for the hindsight container. Returns
+ * undefined when LiteLLM is not globally enabled or the vault key is absent.
+ * The returned config is passed to `startHindsight()` to enable host-network
+ * mode and inject the proxy env vars.
+ */
+async function resolveLiteLLMForHindsight(
+  config: SwitchroomConfig,
+): Promise<LiteLLMHindsightConfig | undefined> {
+  const topLiteLLM = (config as { litellm?: { enabled?: boolean; base_url?: string } }).litellm;
+  if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
+  const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
+  if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
+  return { baseUrl: topLiteLLM.base_url, apiKey: result.entry.value };
+}
 
 interface RecallLogEntry {
   ts: string;
@@ -356,7 +375,11 @@ export function registerMemoryCommand(program: Command): void {
 
       console.log(chalk.gray("  Starting Hindsight Docker container..."));
       try {
-        startHindsight(ports);
+        const litellmCfg = await resolveLiteLLMForHindsight(getConfig(program));
+        startHindsight(ports, litellmCfg);
+        if (litellmCfg) {
+          console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
+        }
         console.log(chalk.green(`\n  Hindsight container started (switchroom-hindsight) on port ${ports.apiPort}.\n`));
       } catch (err) {
         console.error(chalk.red(`\n  Failed to start Hindsight: ${(err as Error).message}\n`));

@@ -400,6 +400,22 @@ export function isHindsightContainerExists(): boolean {
 }
 
 /**
+ * LiteLLM routing config for the hindsight container. When provided to
+ * `startHindsight`, the container switches to `--network host` (so
+ * `127.0.0.1:4010` is directly reachable) and the Claude Agent SDK
+ * subprocess inherits `ANTHROPIC_BASE_URL` + `ANTHROPIC_CUSTOM_HEADERS`,
+ * routing consolidation/reflect LLM calls through the proxy for spend
+ * tracking and guardrails while keeping the Max subscription as the
+ * billing source.
+ */
+export interface LiteLLMHindsightConfig {
+  /** LiteLLM proxy base URL, e.g. 'http://127.0.0.1:4010'. */
+  baseUrl: string;
+  /** Per-service virtual key for spend attribution. */
+  apiKey: string;
+}
+
+/**
  * Start the Hindsight Docker container in **broker-fed** mode (RFC H §4.8).
  *
  * Hindsight uses the upstream `claude-code` LLM provider, which routes
@@ -412,8 +428,16 @@ export function isHindsightContainerExists(): boolean {
  *
  * @param ports - Optional host port mapping. If omitted, tries upstream
  *   defaults (8888/9999) then 18888/19999.
+ * @param litellm - Optional LiteLLM routing config. When provided, the
+ *   container uses `--network host` so 127.0.0.1:4010 is reachable, and
+ *   the claude subprocess inherits LiteLLM proxy env vars. The API port is
+ *   preserved via `HINDSIGHT_API_PORT` (the only port knob the upstream
+ *   config.py recognizes; the CP service has no env var override).
  */
-export function startHindsight(ports?: { apiPort: number; uiPort: number }): void {
+export function startHindsight(
+  ports?: { apiPort: number; uiPort: number },
+  litellm?: LiteLLMHindsightConfig,
+): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
 
@@ -445,6 +469,22 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "-e", `HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND=${HINDSIGHT_DEFAULT_CONSOLIDATION_MAX_MEMORIES_PER_ROUND}`,
   ];
 
+  if (litellm) {
+    // Host-network mode: the container shares the host network stack so
+    // 127.0.0.1:4010 (LiteLLM) is directly reachable, identical to how
+    // agent containers work. Explicit port env vars preserve the same
+    // external ports (18888/19999) the operator is used to.
+    envArgs.push(
+      // HINDSIGHT_API_PORT is the only port knob the upstream config.py
+      // recognizes; the CP service has no equivalent env var override.
+      "-e", `HINDSIGHT_API_PORT=${apiPort}`,
+      // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
+      // consolidation/reflect calls hit the proxy for spend tracking.
+      "-e", `ANTHROPIC_BASE_URL=${litellm.baseUrl}`,
+      "-e", `ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
+    );
+  }
+
   const args = [
     "run", "-d",
     "--name", "switchroom-hindsight",
@@ -467,8 +507,19 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "--health-timeout", "5s",
     "--health-retries", "3",
     "--health-start-period", "60s",
-    "-p", `127.0.0.1:${apiPort}:8888`,
-    "-p", `127.0.0.1:${uiPort}:9999`,
+  ];
+
+  if (litellm) {
+    // Host network: ports are published directly (no -p flags).
+    args.push("--network", "host");
+  } else {
+    args.push(
+      "-p", `127.0.0.1:${apiPort}:8888`,
+      "-p", `127.0.0.1:${uiPort}:9999`,
+    );
+  }
+
+  args.push(
     "-v", "switchroom-hindsight-data:/home/hindsight/.pg0",
     // Backups land on a SEPARATE volume from the data, so a data-volume
     // loss/corruption is recoverable. The entrypoint's maintenance loop
@@ -488,7 +539,7 @@ export function startHindsight(ports?: { apiPort: number; uiPort: number }): voi
     "--tmpfs", `/run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
     ...envArgs,
     HINDSIGHT_IMAGE,
-  ];
+  );
 
   execFileSync("docker", args, { stdio: "pipe" });
 }
