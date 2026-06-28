@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.16.16 — answer-stream lane now renders markdown; quieter idle-clear
+
+Agent narration sent through the answer-stream lane is now converted from
+markdown to Telegram HTML before going on the wire, matching every other
+outbound lane (the reply handler, the turn-flush backstop, the PTY partial
+handler). Previously this lane shipped the raw transcript under
+`parse_mode: 'HTML'`, so `**bold**` reached the user as literal asterisks and
+agent narration read as unformatted text. The renderer
+(`sanitizeTelegramHtml(markdownToHtml(...))`) is injected as a dependency, so
+dedup/comparison logic still runs on the raw text and only the outbound payload
+is converted. (#2628)
+
+The Telegram idle-clear notice is no longer posted to chat — the idle clear is
+now a stderr-only log, removing a noisy message from topics while keeping the
+event observable to operators. (#2641)
+
 ## v0.16.15 — fix sr-* success reply showing spurious "picker unavailable"
 
 After a successful sr-* model tap the reply now shows a clean ✅ banner
