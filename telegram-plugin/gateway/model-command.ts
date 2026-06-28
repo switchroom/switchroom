@@ -424,8 +424,10 @@ export async function handleModelMenuCallback(
   }
 
   if (data === MODEL_CALLBACK_HEADER) {
-    // Section-header row — informational only, no action.
-    return { answer: 'Tap a model in this section to switch', reply: await buildModelMenu(deps), toastOnly: true }
+    // Section-header row — the gateway handles this with a direct answerCallbackQuery
+    // before calling this function, so this branch is dead in practice. Guard
+    // for callers that skip gateway.ts (tests, future refactors).
+    return { answer: 'Tap a model in this section to switch', reply: { text: '', html: true }, toastOnly: true }
   }
 
   // sr-* model tap: text-inject `/model sr-<name>` rather than cursor-nav.

@@ -525,6 +525,14 @@ describe("buildModelMenu — with sr-* models", () => {
     expect(headers.length).toBe(0);
   });
 
+  it("header-row tap returns toastOnly without inject or model change", async () => {
+    const { deps, injectCalls } = makeMenuDepsWithSr();
+    const out = await handleModelMenuCallback(MODEL_CALLBACK_HEADER, deps);
+    expect(out.toastOnly).toBe(true);
+    expect(out.selectedModel).toBeUndefined();
+    expect(injectCalls).toHaveLength(0);
+  });
+
   it("shows subscription/OpenRouter legend when sr-* models are present", async () => {
     const { deps } = makeMenuDepsWithSr();
     const menu = await buildModelMenu(deps);
