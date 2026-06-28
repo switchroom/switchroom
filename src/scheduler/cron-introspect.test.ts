@@ -7,6 +7,16 @@
 import { describe, it, expect } from "vitest";
 import { buildCronList, cronDoctor, normalizeCronExpr } from "./cron-introspect.js";
 import { OVERLAY_SOURCE, OVERLAY_TITLE } from "../config/overlay-loader.js";
+import { cronUnitHash } from "../agents/cron-unit-name.js";
+
+/**
+ * The REAL on-disk overlay path the writer (`writeOverlayEntry`) produces for
+ * a (cron, prompt). The `--name`/title NEVER becomes the filename — it's a
+ * `# name:` header inside the file — so `file` must be the content-hash slug.
+ */
+function overlayFile(cron: string, prompt: string): string {
+  return `schedule.d/cron-${cronUnitHash(cron, prompt)}.yaml`;
+}
 
 /** Forge an overlay-stamped entry the way the loader does (non-enumerable Symbols). */
 function overlayEntry(
@@ -50,9 +60,24 @@ describe("buildCronList — source labelling", () => {
     });
     expect(rows[1]).toMatchObject({
       source: "overlay",
-      file: "schedule.d/weekly-review.yaml",
+      // `file` is the REAL on-disk slug, NOT `schedule.d/weekly-review.yaml`.
+      file: overlayFile("0 20 * * 0", "review"),
       name: "weekly-review",
     });
+  });
+
+  it("reports the real on-disk slug for `file`, not the human name (regression)", () => {
+    // A named overlay write produces `cron-<hash>.yaml` on disk; the `--name`
+    // is only a header inside it. `file` must point at the path that actually
+    // exists so the agent can find/remove the cron deterministically.
+    const cron = "0 20 * * 0";
+    const prompt = "review";
+    const rows = buildCronList([overlayEntry({ cron, prompt }, "weekly-review")], FLAG);
+    expect(rows[0].file).toBe(overlayFile(cron, prompt));
+    expect(rows[0].file).toMatch(/^schedule\.d\/cron-[0-9a-f]{12}\.yaml$/);
+    expect(rows[0].file).not.toContain("weekly-review");
+    // The human name is still available — just not in `file`.
+    expect(rows[0].name).toBe("weekly-review");
   });
 
   it("preserves the original entry fields (backward compat)", () => {
@@ -85,10 +110,10 @@ describe("buildCronList — duplicate cross-linking", () => {
       FLAG,
     );
     expect(rows[0].duplicate_of).toEqual([
-      { name: "weekly-review-2", file: "schedule.d/weekly-review-2.yaml" },
+      { name: "weekly-review-2", file: overlayFile("0 20 * * 0", "review v2") },
     ]);
     expect(rows[1].duplicate_of).toEqual([
-      { name: "weekly-review", file: "schedule.d/weekly-review.yaml" },
+      { name: "weekly-review", file: overlayFile("0 20 * * 0", "review v1") },
     ]);
   });
 

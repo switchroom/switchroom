@@ -21,6 +21,7 @@
 
 import { OVERLAY_SOURCE, OVERLAY_TITLE } from "../config/overlay-loader.js";
 import { resolveCronRouting, type CronTier } from "./cron-routing.js";
+import { cronUnitHash } from "../agents/cron-unit-name.js";
 
 /** Where a cron entry was defined. */
 export type CronSource = "base-config" | "overlay";
@@ -114,12 +115,16 @@ function attributeEntry(raw: unknown): RawEntry {
       typeof overlayTitle === "string" && overlayTitle.trim() !== ""
         ? overlayTitle
         : explicitName;
-    // The overlay file basename: prefer the title-derived name, else the
-    // generic content-hash slug isn't known here, so label it generically.
-    const file =
-      typeof overlayTitle === "string" && overlayTitle.trim() !== ""
-        ? `schedule.d/${overlayTitle}.yaml`
-        : "schedule.d/<overlay>.yaml";
+    // `file` MUST name the REAL on-disk path. `writeOverlayEntry` always
+    // writes `schedule.d/cron-<cronUnitHash(cron, prompt)>.yaml` — the
+    // `--name` only becomes a `# name:` header INSIDE the file, never the
+    // filename. So we recompute the same content hash the writer uses; a
+    // `<title>.yaml` path would not exist on disk and would defeat the
+    // whole point ("tell the agent deterministically where its cron lives").
+    // The human name is surfaced separately via `name`/`title`, never `file`.
+    const cron = typeof entry.cron === "string" ? entry.cron : "";
+    const prompt = typeof entry.prompt === "string" ? entry.prompt : undefined;
+    const file = `schedule.d/cron-${cronUnitHash(cron, prompt)}.yaml`;
     return { entry, source: "overlay", file, name: title };
   }
   return { entry, source: "base-config", file: "switchroom.yaml", name: explicitName };
