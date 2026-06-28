@@ -16043,6 +16043,10 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
      */
     scheduleRestart: async (reason: string) => {
       const name = getMyAgentName()
+      // Debounce: mirror the /restart command's 15 s guard to prevent
+      // double-dispatch on a rapid double-tap of /model <claude-alias>.
+      const existing = readRestartMarker()
+      if (existing && Date.now() - existing.ts < 15_000) return
       if (restartCtx) {
         writeRestartMarker({
           chat_id: restartCtx.chatId,
@@ -16068,6 +16072,14 @@ function buildModelDeps(restartCtx?: ModelDepsRestartContext): ModelMenuDeps & M
             restartCtx?.threadId ?? null,
             `restart ${name}`,
           ),
+        )
+        return
+      }
+      // hostd is configured but returned an error/denied result.
+      if (hostdResp.result !== 'started' && hostdResp.result !== 'completed') {
+        clearRestartMarker()
+        throw new Error(
+          `hostd restart failed (result=${hostdResp.result}): ${hostdResp.error ?? '(no details)'}`,
         )
       }
     },
