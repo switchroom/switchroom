@@ -240,7 +240,6 @@ export async function handleHermesRest(
   // GET /api/status — fleet overview
   if (method === "GET" && pathname === "/api/status") {
     const agents = await handleGetAgents(config);
-    const agentsDir = resolveAgentsDir(config);
     const fleet = agents.map((a) => ({
       name: a.name,
       status: agentLiveness(config, a.name),
@@ -506,7 +505,11 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
       const promptKey = `interrupt-${Date.now()}`;
-      await injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, "! interrupt", promptKey);
+      const intResult = await injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, "! ", promptKey);
+      if (!intResult.ok) {
+        sendResponse(ctx, rpcErr(id, -32603, intResult.error ?? "interrupt inject failed"));
+        break;
+      }
       sendResponse(ctx, rpcOk(id, { ok: true }));
       break;
     }
