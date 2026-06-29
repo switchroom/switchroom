@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.16.25 — Telegram deterministic message formatting
+
+Paragraph normalizer: guarantees a blank line (`\n\n`) between paragraphs and at GFM block boundaries — before tables, fenced code, blockquotes, and headings, and after a list when breakout prose follows — while keeping list internals and table rows intact. Fixes tables rendering as inline pipe text and prose being absorbed into the preceding bullet under the Bot API 10.1 rich-message (GFM) path.
+
+Character cap unified to 32768 across all Telegram send paths (status cards, silent-reply anchor, `formatSwitchroomOutput`, drive-write approval, ipc `send_outbound`), with length-error detection and automatic re-split on overflow.
+
+Telegram formatting floor card injected into every agent's system prompt at boot — concise guidance on the formatting toolkit and when and why to use each tool. (#2674)
+
 ## v0.16.24 — Hermes Desktop: supergroup forum topics as sessions + topic name resolution
 
 ### PR A — WAL file permissions + history channel filter (#2668)
