@@ -32,6 +32,11 @@ import {
   agentBridgeAlive,
   type AgentInfo,
 } from "./api.js";
+import {
+  injectSlashCommand,
+  INJECT_ALLOWLIST,
+  INJECT_BLOCKLIST,
+} from "../agents/inject.js";
 
 // ─── JSON-RPC 2.0 types ──────────────────────────────────────────────────────
 
@@ -302,6 +307,60 @@ function switchroomModelOptions() {
         authenticated: true,
         models: SWITCHROOM_MODELS,
         total_models: SWITCHROOM_MODELS.length,
+      },
+    ],
+  };
+}
+
+/** Switchroom slash commands surfaced in the Hermes Desktop slash palette.
+ *
+ * Hermes filters this list through filterDesktopCommandsCatalog — only
+ * "extension" commands (anything not in its own built-in table) and exec-surface
+ * commands appear in the popover. Switchroom commands like /memory, /vault,
+ * /schedule, /effort, /whoami, /doctor, /logs, /auth are all extensions and will
+ * show. Commands that overlap with Hermes built-ins (/new, /status, /restart,
+ * /compact, /clear) stay in the catalog for exec dispatch but are filtered from
+ * the popover by Hermes.
+ */
+function switchroomCommandsCatalog() {
+  return {
+    categories: [
+      {
+        name: "Session",
+        pairs: [
+          // /new and /restart are intentionally absent — Hermes handles them
+          // natively via its own built-in command table; and injectInbound
+          // cannot correctly dispatch them (they need the grammy bot.command
+          // handler path, which only fires on real Telegram messages).
+          ["/compact", "Compact context (summarize, keep the thread)"],
+          ["/clear", "Clear context (fresh slate; memory in Hindsight)"],
+          ["/model", "Show or switch the Claude model"],
+          ["/status", "Agent, model, auth status"],
+        ] as [string, string][],
+      },
+      {
+        name: "Memory & knowledge",
+        pairs: [
+          ["/memory", "List, search, or clear Hindsight memory"],
+        ] as [string, string][],
+      },
+      {
+        name: "Vault & auth",
+        pairs: [
+          ["/vault", "Manage vault secrets + capability grants"],
+          ["/auth", "Auth dashboard — accounts, quota, reauth, switch primary"],
+          ["/whoami", "This agent's sandbox: tools, MCP, vault key-names"],
+        ] as [string, string][],
+      },
+      {
+        name: "Diagnostics",
+        pairs: [
+          ["/doctor", "Health check (deps, services, MCP)"],
+          ["/logs", "Show recent agent logs"],
+          ["/usage", "Pro/Max plan quota (5h + 7d windows)"],
+          ["/version", "Show version + running agent health"],
+          ["/commands", "Full command list"],
+        ] as [string, string][],
       },
     ],
   };
@@ -811,6 +870,95 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         }
       }
       sendResponse(ctx, rpcOk(id, { ok: true }));
+      break;
+    }
+
+    // commands.catalog — slash palette autocomplete list
+    case "commands.catalog": {
+      sendResponse(ctx, rpcOk(id, switchroomCommandsCatalog()));
+      break;
+    }
+
+    // slash.exec — run a slash command against the agent.
+    //
+    // Two-path routing based on the inject allowlist:
+    //
+    //   REPL commands (INJECT_ALLOWLIST: /memory, /status, /usage, /clear,
+    //   /compact, /model, /hooks, /cost) — go through injectSlashCommand
+    //   (tmux send-keys). These are Claude Code REPL commands; injectInbound
+    //   would deliver them as conversation text, not execute them.
+    //
+    //   Non-REPL commands (/vault, /auth, /doctor, /whoami, /logs, /version,
+    //   /commands, etc.) — go through injectInbound as a synthesized user turn.
+    //   Claude receives the string as conversation text (not a bot.command
+    //   dispatch) and handles it via MCP tools and training knowledge.
+    //   NOTE: /restart and /new must NOT be placed in the catalog — they need
+    //   the grammy bot.command handler path (hostd + restart-marker protocol)
+    //   which only fires on real Telegram messages.
+    //
+    // Explicitly blocked REPL commands (/effort, /login, /logout, /exit, /quit)
+    // are refused with a clear error.
+    case "slash.exec": {
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
+      const bare = String(params.command ?? "").replace(/^\/+/, "");
+      const arg = params.arg != null ? String(params.arg) : "";
+
+      if (!sessionId || !config.agents?.[sessionId]) {
+        sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
+        break;
+      }
+      if (!bare) {
+        sendResponse(ctx, rpcErr(id, -32602, "command is required"));
+        break;
+      }
+
+      const fullCommand = arg ? `/${bare} ${arg}` : `/${bare}`;
+      const verb = `/${bare}` as `/${string}`;
+
+      if (INJECT_BLOCKLIST.has(verb)) {
+        sendResponse(ctx, rpcErr(id, -32602, `/${bare} cannot be executed remotely`));
+        break;
+      }
+
+      if (INJECT_ALLOWLIST.has(verb)) {
+        // REPL command — tmux send-keys path captures real output
+        let injectResult;
+        try {
+          injectResult = await injectSlashCommand(sessionId, fullCommand);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          sendResponse(ctx, rpcErr(id, -32603, msg));
+          break;
+        }
+        const output =
+          injectResult.outcome === "ok"
+            ? injectResult.output ?? ""
+            : `*(${fullCommand} sent)*`;
+        sendResponse(ctx, rpcOk(id, { ok: true, output }));
+        break;
+      }
+
+      // Non-REPL command — deliver via injectInbound as a synthesized user turn.
+      // Claude receives the command string as conversation text (not a bot.command
+      // dispatch). For commands like /vault, /auth, /doctor, /whoami Claude can
+      // handle them via its MCP tools and knowledge, producing a contextual
+      // response that arrives as a Telegram message. The response is async and
+      // not captured here. Commands that require grammy bot.command handlers
+      // (notably /restart and /new) must not be placed in the catalog.
+      const agentsDir = resolveAgentsDir(config);
+      const chat = resolveAgentChat(config, sessionId, agentsDir);
+      if (!chat) {
+        sendResponse(ctx, rpcErr(id, -32603, `Cannot resolve chat for ${sessionId}`));
+        break;
+      }
+
+      const promptKey = `slash-${bare}-${Date.now()}`;
+      const result = await injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, fullCommand, promptKey);
+      if (!result.ok) {
+        sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
+        break;
+      }
+      sendResponse(ctx, rpcOk(id, { ok: true, output: `*(${fullCommand} sent to ${sessionId})*` }));
       break;
     }
 
