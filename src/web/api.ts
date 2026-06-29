@@ -451,9 +451,13 @@ export function handleGetTurns(
   try {
     const agentsDir = resolveAgentsDir(config);
     const agentDir = resolve(agentsDir, agentName);
+    // Filter to the agent's primary channel chat_id so supergroup agents
+    // show their group conversation, not a mix of DM + group turns.
+    const chatId: string | undefined =
+      config.agents?.[agentName]?.channels?.telegram?.chat_id ?? undefined;
     const db = openTurnsDb(agentDir);
     try {
-      const turns = listTurnsForAgent(db, { limit });
+      const turns = listTurnsForAgent(db, { limit, chatId });
       return { ok: true, turns };
     } finally {
       db.close();

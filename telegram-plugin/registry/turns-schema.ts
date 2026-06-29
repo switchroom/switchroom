@@ -505,9 +505,18 @@ export function findRecentTurnsForChat(
  */
 export function listTurnsForAgent(
   db: SqliteDatabase,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; chatId?: string } = {},
 ): Turn[] {
   const limit = Math.min(Math.max(1, opts.limit ?? 20), 200)
+  if (opts.chatId) {
+    const rows = db.prepare(`
+      SELECT * FROM turns
+      WHERE chat_id = ?
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(opts.chatId, limit) as RawTurnRow[]
+    return rows.map(mapRow)
+  }
   const rows = db.prepare(`
     SELECT * FROM turns
     ORDER BY started_at DESC
