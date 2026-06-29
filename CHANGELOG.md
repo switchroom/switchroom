@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.16.17 — Hermes Desktop adapter boot fix
+
+Hermes Desktop was immediately crashing on connect with "Error: 404: Not Found" after the WebSocket handshake succeeded. The renderer calls several REST endpoints at boot (`/api/profiles/sessions`, `/api/model/info`, `/api/config/defaults`, `/api/config/schema`, `/api/logs`, and others) that the adapter did not implement. All missing endpoints now return appropriate stub or empty responses so the boot sequence completes. (#2651)
+
 ## v0.16.16 — answer-stream lane now renders markdown; quieter idle-clear
 
 Agent narration sent through the answer-stream lane is now converted from
