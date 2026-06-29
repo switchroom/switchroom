@@ -189,8 +189,8 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { markdownToHtml, splitHtmlChunks, repairEscapedWhitespace, telegramHtmlToPlainText } from '../format.js'
-import { sanitizeTelegramHtml } from '../html-sanitize.js'
+import { splitMarkdownChunks, repairEscapedWhitespace, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
   validateInlineKeyboard,
@@ -934,7 +934,8 @@ function defaultAccess(): Access {
   return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
 }
 
-const MAX_CHUNK_LIMIT = 4096
+// Rich-message wire cap (#2669): the rich path allows 32768 UTF-8 chars.
+const MAX_CHUNK_LIMIT = RICH_MESSAGE_MAX_CHARS
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 function assertSendable(f: string): void {
@@ -1922,7 +1923,6 @@ interface OutstandingCompactCard {
 let compactNotifyState: CompactNotifyState = idleCompactNotifyState()
 let outstandingCompactCard: OutstandingCompactCard | null = null
 const activeDraftStreams = new Map<string, DraftStreamHandle>()
-const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>()
 const suppressPtyPreview = new Set<string>()
 const lastPtyPreviewByChat = new Map<string, string>()
 const progressUpdateLastSent = new Map<string, number>()
@@ -3662,15 +3662,14 @@ async function postCompactCard(occ: number, cap: number): Promise<void> {
       supergroupChatId: resolveAgentSupergroupChatId(),
     });
     const text =
-      `🗜️ <b>Context compaction</b>\n` +
+      `🗜️ **Context compaction**\n` +
       `Working context hit ~${occ.toLocaleString()} tokens ` +
-      `(cap ${cap.toLocaleString()}) — running <code>/compact</code>. ` +
+      `(cap ${cap.toLocaleString()}) — running \`/compact\`. ` +
       `Older detail moves to Hindsight; I'll confirm here once the ` +
       `context has shrunk (may take a turn or two).`;
     const sent = await swallowingApiCall(
       () =>
-        bot.api.sendMessage(chatId, text, {
-          parse_mode: 'HTML',
+        bot.api.sendRichMessage(chatId, richMessage(text), {
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }),
       { chat_id: chatId, verb: 'proactiveCompact.start' },
@@ -3720,7 +3719,7 @@ async function resolveCompactCard(
   let text: string;
   if (kind === 'finished') {
     text =
-      `✅ <b>Context compacted</b>\n` +
+      `✅ **Context compacted**\n` +
       `Working context reduced` +
       (occNow != null
         ? ` (~${card.occAtStart.toLocaleString()} → ` +
@@ -3729,19 +3728,18 @@ async function resolveCompactCard(
       `. Hindsight retains the detail.`;
   } else if (kind === 'superseded') {
     text =
-      `↩️ <b>Context compaction superseded</b>\n` +
+      `↩️ **Context compaction superseded**\n` +
       `A newer compaction started before this one confirmed.`;
   } else {
     text =
-      `⚠️ <b>Compaction issued</b>\n` +
-      `<code>/compact</code> was requested but the context isn't ` +
+      `⚠️ **Compaction issued**\n` +
+      `\`/compact\` was requested but the context isn't ` +
       `confirmed reduced yet. Native compaction and Hindsight still apply.`;
   }
   try {
     await swallowingApiCall(
       () =>
-        bot.api.editMessageText(card.chatId, card.messageId, text, {
-          parse_mode: 'HTML',
+        bot.api.editMessageText(card.chatId, card.messageId, richMessage(text), {
         }),
       { chat_id: card.chatId, verb: `proactiveCompact.${kind}` },
     );
@@ -3945,8 +3943,7 @@ function postPermissionResumeMessage(opts: {
     // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send
     void swallowingApiCall(
       () =>
-        bot.api.sendMessage(chatId, text, {
-          parse_mode: 'HTML',
+        bot.api.sendRichMessage(chatId, richMessage(text), {
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }),
       { chat_id: chatId, verb: 'permission-resume', ...(threadId != null ? { threadId } : {}) },
@@ -4031,21 +4028,6 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
   }
   if (rest) out.push(rest)
   return out
-}
-
-function escapeMarkdownV2(text: string): string {
-  const specialChars = /[_*\[\]()~`>#+\-=|{}.!\\]/g
-  const parts: string[] = []
-  let last = 0
-  const codeRe = /(```[\s\S]*?```|`[^`\n]+`)/g
-  let m: RegExpExecArray | null
-  while ((m = codeRe.exec(text)) !== null) {
-    if (m.index > last) parts.push(text.slice(last, m.index).replace(specialChars, '\\$&'))
-    parts.push(m[0])
-    last = m.index + m[0].length
-  }
-  if (last < text.length) parts.push(text.slice(last).replace(specialChars, '\\$&'))
-  return parts.join('')
 }
 
 // ─── Typing indicator ─────────────────────────────────────────────────────
@@ -4193,14 +4175,17 @@ function wrapBootCardApi(
     verb: 'boot-card',
     ...(threadId != null ? { threadId } : {}),
   })
+  // #2669: card bodies are raw GFM markdown — send them via the
+  // rich-message path. The card modules pass plain `opts` (no parse_mode).
   return {
     sendMessage: async (cid, text, sendOpts) => {
       const sent = await robustApiCall(
         () =>
-          lockedBot.api.sendMessage(
+          // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+          lockedBot.api.sendRichMessage(
             cid,
-            text,
-            sendOpts as Parameters<typeof lockedBot.api.sendMessage>[2],
+            richMessage(text),
+            sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
           ),
         opts(cid),
       )
@@ -4212,7 +4197,7 @@ function wrapBootCardApi(
           lockedBot.api.editMessageText(
             cid,
             mid,
-            text,
+            richMessage(text),
             editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
           ),
         opts(cid),
@@ -4226,7 +4211,7 @@ function wrapBootCardApi(
       type EditOpts = Parameters<Api['editMessageText']>[3]
       try {
         // allow-raw-bot-api: boot-card edit-in-place probe — must detect a deleted target, which the shared retry policy swallows.
-        await lockedBot.api.editMessageText(cid, mid, text, editOpts as EditOpts)
+        await lockedBot.api.editMessageText(cid, mid, richMessage(text), editOpts as EditOpts)
         return 'edited'
       } catch (err) {
         const desc =
@@ -4256,14 +4241,16 @@ function wrapIssuesCardApi(
     verb: 'issues-card',
     ...(threadId != null ? { threadId } : {}),
   })
+  // #2669: issues-card body is raw GFM markdown — send via the rich path.
   return {
     sendMessage: async (cid, text, sendOpts) => {
       const sent = await robustApiCall(
         () =>
-          lockedBot.api.sendMessage(
+          // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+          lockedBot.api.sendRichMessage(
             cid,
-            text,
-            sendOpts as Parameters<typeof lockedBot.api.sendMessage>[2],
+            richMessage(text),
+            sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
           ),
         opts(cid),
       )
@@ -4275,7 +4262,7 @@ function wrapIssuesCardApi(
           lockedBot.api.editMessageText(
             cid,
             mid,
-            text,
+            richMessage(text),
             editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
           ),
         opts(cid),
@@ -5320,7 +5307,6 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // grammy's Other<...> opts type is generated and stricter than our
     // call shape; runtime accepts both. Cast through unknown.
     const opts = {
-      parse_mode: 'HTML' as const,
       ...(renderedKeyboard ? { reply_markup: renderedKeyboard } : {}),
       ...(opEventThread != null ? { message_thread_id: opEventThread } : {}),
     }
@@ -5328,7 +5314,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // very next line is what unlocks the raw bot.api call.
     // Opts now includes message_thread_id when supergroup mode is on.
     // allow-raw-bot-api: operator-event broadcast loop; topic-aware opts
-    void bot.api.sendMessage(chat_id, renderedText, opts as never).catch(e => {
+    void bot.api.sendRichMessage(chat_id, richMessage(renderedText), opts as never).catch(e => {
       process.stderr.write(
         `telegram gateway: operator-event send to ${chat_id} failed agent=${agent} kind=${kind}: ${e}\n`,
       )
@@ -5356,9 +5342,7 @@ function postLegacyBanner(
   retryWithThreadFallback(
     robustApiCall,
     (tid) =>
-      lockedBot.api.sendMessage(chatId, text, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
+      lockedBot.api.sendRichMessage(chatId, richMessage(text), {
         ...(tid != null ? { message_thread_id: tid } : {}),
         ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
       }),
@@ -6221,19 +6205,18 @@ _deliveryConfirmSweep.unref?.()
 // `SWITCHROOM_DISABLE_PENDING_PROGRESS=1`.
 pendingProgress.startTimer({
   editMessage: async (ctx) => {
-    // #1698: preserve the anchor's original parse_mode. Without this
-    // the edit goes out as plain text, and any <b>/<code>/<a> tag in
-    // anchorOriginalText (the model authored HTML via the reply tool,
-    // which defaults to format='html') re-renders as literal text the
-    // moment the first "still working (Nm)" tick fires.
-    const editOpts = ctx.parseMode != null ? { parse_mode: ctx.parseMode } : undefined
+    // #2669: re-edit via the SAME shape the anchor was sent with. A rich
+    // anchor (the reply tool's default) re-edits via the rich-markdown
+    // path so the body keeps rendering its markdown; a literal
+    // `format:'text'` anchor re-edits as a plain string. This is the
+    // single-rich-path successor to the #1698 parse-mode contract.
     await swallowingApiCall(
       () =>
         lockedBot.api.editMessageText(
           ctx.chatId,
           ctx.messageId,
-          ctx.newText,
-          editOpts,
+          ctx.literalText ? ctx.newText : richMessage(ctx.newText),
+          undefined,
         ),
       {
         chat_id: ctx.chatId,
@@ -6816,7 +6799,6 @@ const ipcServer: IpcServer = createIpcServer({
       activeTurnStartedAt,
       claudeBusyKeys,
       activeDraftStreams,
-      activeDraftParseModes,
       clearActiveReactions: () => {
         const ad = resolveAgentDirFromEnv()
         if (ad) clearActiveReactions(ad)
@@ -7005,8 +6987,8 @@ const ipcServer: IpcServer = createIpcServer({
     // Natural-language card body — a plain sentence ("Gymbro wants to
     // edit: supplement-log.md" + a why-line), never a raw tool id.
     // The operator sees what is being requested and why at a glance.
-    // Mirrors the `vault_request_access` card layout. Sent with
-    // parse_mode=HTML below.
+    // Mirrors the `vault_request_access` card layout. Sent via the
+    // rich-markdown path below.
     const text = formatPermissionCardBody({
       toolName,
       inputPreview,
@@ -7033,8 +7015,8 @@ const ipcServer: IpcServer = createIpcServer({
     const activeTurn = currentTurn
     const targets = resolvePermissionCardTargets()
     for (const { chatId, threadId } of targets) {
-      // parse_mode=HTML pairs with formatPermissionCardBody (#1790) so the
-      // <b>/<i> tags render. retryWithThreadFallback: if the topic was
+      // The rich-markdown path pairs with formatPermissionCardBody (#1790)
+      // so its bold/italic render. retryWithThreadFallback: if the topic was
       // deleted/recreated (stale thread id → 400 "message thread not
       // found"), re-send thread-less into the main chat so the card still
       // ARRIVES rather than vanishing → 10-min TTL auto-deny → wedge.
@@ -7042,8 +7024,7 @@ const ipcServer: IpcServer = createIpcServer({
       void retryWithThreadFallback<{ message_id: number }>(
         robustApiCall,
         (tid) =>
-          bot.api.sendMessage(chatId, text, {
-            parse_mode: 'HTML',
+          bot.api.sendRichMessage(chatId, richMessage(text), {
             reply_markup: keyboard,
             ...(tid != null ? { message_thread_id: tid } : {}),
           }),
@@ -7222,8 +7203,7 @@ const ipcServer: IpcServer = createIpcServer({
         try {
           const sent = await robustApiCall(
             () =>
-              bot.api.sendMessage(args.chatId, args.text, {
-                parse_mode: 'HTML',
+              bot.api.sendRichMessage(args.chatId, richMessage(args.text), {
                 ...(args.threadId !== undefined
                   ? { message_thread_id: args.threadId }
                   : {}),
@@ -7373,8 +7353,8 @@ const ipcServer: IpcServer = createIpcServer({
         try {
           const sent = await robustApiCall(
             () =>
-              bot.api.sendMessage(args.chatId, args.text, {
-                parse_mode: 'HTML',
+              // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+              bot.api.sendRichMessage(args.chatId, richMessage(args.text), {
                 ...(args.threadId !== undefined
                   ? { message_thread_id: args.threadId }
                   : {}),
@@ -7398,8 +7378,7 @@ const ipcServer: IpcServer = createIpcServer({
         try {
           await robustApiCall(
             () =>
-              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
-                parse_mode: 'HTML',
+              bot.api.editMessageText(args.chatId, args.messageId, richMessage(args.text), {
                 // Strip the inline keyboard on a terminal/interim edit so the
                 // [Approve]/[Deny] buttons stop being tappable on a resolved card.
                 ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
@@ -7470,8 +7449,7 @@ const ipcServer: IpcServer = createIpcServer({
         try {
           await robustApiCall(
             () =>
-              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
-                parse_mode: 'HTML',
+              bot.api.editMessageText(args.chatId, args.messageId, richMessage(args.text), {
                 // Finalize is terminal — drop the keyboard so buttons are gone.
                 ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
               }),
@@ -7568,15 +7546,18 @@ const ipcServer: IpcServer = createIpcServer({
       return
     }
     const threadId = msg.threadId
-    const parseMode = msg.parseMode === 'text' ? undefined : 'HTML'
+    // #2669: literal `text` mode → plain send; everything else → rich markdown.
+    const literalText = msg.parseMode === 'text'
+    const outOpts = {
+      ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
+    }
     // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy); thread-aware send.
     // General topic (thread 1) sends omit message_thread_id per the outbound convention.
     void swallowingApiCall(
-      () =>
-        bot.api.sendMessage(msg.chatId, msg.text, {
-          ...(parseMode ? { parse_mode: parseMode } : {}),
-          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
-        }),
+      (): Promise<{ message_id: number }> =>
+        literalText
+          ? bot.api.sendMessage(msg.chatId, msg.text, outOpts)
+          : bot.api.sendRichMessage(msg.chatId, richMessage(msg.text), outOpts),
       { chat_id: msg.chatId, verb: 'cron-action-send', ...(threadId != null ? { threadId } : {}) },
     )
     process.stderr.write(
@@ -7915,8 +7896,8 @@ function notifyLinearAuthDead(info: { agent: string; reason: LinearAuthDeadReaso
       const text = buildLinearAuthDeadMessage(info.agent, info.reason)
       await swallowingApiCall(
         () =>
-          bot.api.sendMessage(chatId, text, {
-            parse_mode: 'HTML',
+          // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+          bot.api.sendRichMessage(chatId, richMessage(text), {
             ...(threadId != null ? { message_thread_id: threadId } : {}),
           }),
         { chat_id: chatId, verb: 'linearAuthDead' },
@@ -8028,11 +8009,9 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // value, exactly like the voice scrub that follows.
   text = redactOutboundText(text, 'reply')
   // Voice scrub (#1683): replace em / en dashes with commas / periods.
-  // Runs BEFORE outboundDedup so retries see the scrubbed key, and
-  // BEFORE markdownToHtml so code-block content is correctly parked
-  // by the scrubber's own placeholder pass (otherwise the html
-  // converter would have already escaped/parked code, and the scrub
-  // would see only the parked placeholders). Kill switch:
+  // Runs BEFORE outboundDedup so retries see the scrubbed key, and on the
+  // raw markdown text (the scrubber does its own code-region parking so
+  // dashes inside fences/inline code are preserved). Kill switch:
   // `SWITCHROOM_DISABLE_VOICE_SCRUB=1`.
   {
     const scrub = scrubVoice(text)
@@ -8244,24 +8223,19 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       // Replace the local text with a one-line link. The first line
       // is the chosen title (so the user sees the topic at a glance);
       // the second line is the URL Telegram will Instant-View.
-      text = `<b>${title.replace(/[<>&]/g, (c) => c === '<' ? '&lt;' : c === '>' ? '&gt;' : '&amp;')}</b>\n${url}`
+      text = `**${escapeMarkdown(title)}**\n${url}`
     }
     // url null → fall through and chunk; the user still gets the
     // long reply, just split across messages.
   }
 
-  let parseMode: 'HTML' | 'MarkdownV2' | undefined
-  let effectiveText: string
-  if (format === 'html') {
-    parseMode = 'HTML'
-    effectiveText = markdownToHtml(text)
-  } else if (format === 'markdownv2') {
-    parseMode = 'MarkdownV2'
-    effectiveText = escapeMarkdownV2(text)
-  } else {
-    parseMode = undefined
-    effectiveText = text
-  }
+  // Single rich-markdown path (#2669). The only fork is `format:'text'`,
+  // a literal/no-markdown send: the body bypasses the rich parser entirely
+  // (plain `sendMessage`, no rich wrapper). Everything else — the default —
+  // ships the raw GFM markdown via `sendRichMessage`. `effectiveText` is the
+  // raw text either way (no HTML/MarkdownV2 rendering happens here anymore).
+  const literalText = format === 'text'
+  const effectiveText: string = text
 
   assertAllowedChat(chat_id)
 
@@ -8323,11 +8297,11 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
   }
 
-  const limit = Math.max(1, Math.min(access.textChunkLimit ?? 4000, MAX_CHUNK_LIMIT))
+  const limit = Math.max(1, Math.min(access.textChunkLimit ?? RICH_MESSAGE_MAX_CHARS, MAX_CHUNK_LIMIT))
   const replyMode = access.replyToMode ?? 'first'
-  const chunks = parseMode === 'HTML'
-    ? splitHtmlChunks(effectiveText, limit)
-    : chunk(effectiveText, limit, access.chunkMode ?? 'length')
+  const chunks = literalText
+    ? chunk(effectiveText, limit, access.chunkMode ?? 'length')
+    : splitMarkdownChunks(effectiveText, limit)
   const sentIds: number[] = []
 
   // #271: validate inline_keyboard and namespace any callback_data with
@@ -8359,7 +8333,6 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     await openStream.finalize().catch(() => {})
     previewMessageId = openStream.getMessageId()
     activeDraftStreams.delete(replySKey)
-    activeDraftParseModes.delete(replySKey)
     lastPtyPreviewByChat.delete(replySKey)
   }
 
@@ -8470,13 +8443,11 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       })
       if (decision.kind === 'edit-anchor') {
         const editParams: {
-          parse_mode?: 'HTML' | 'MarkdownV2'
           message_thread_id?: number
           link_preview_options?: { is_disabled: boolean }
         } = {
           link_preview_options: { is_disabled: disableLinkPreview },
         }
-        if (parseMode != null) editParams.parse_mode = parseMode
         if (threadId != null) editParams.message_thread_id = threadId
         try {
           await robustApiCall(
@@ -8484,7 +8455,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
               lockedBot.api.editMessageText(
                 chat_id,
                 decision.messageId,
-                decision.mergedText,
+                literalText ? decision.mergedText : richMessage(decision.mergedText),
                 editParams,
               ),
             {
@@ -8528,7 +8499,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
             messageId: decision.messageId,
             text: decision.mergedText,
-            parseMode,
+            literalText,
           })
           if (HISTORY_ENABLED) {
             try {
@@ -8615,7 +8586,6 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
               },
             }
           : {}),
-        ...(parseMode ? { parse_mode: parseMode } : {}),
         ...(threadId != null ? { message_thread_id: threadId } : {}),
         ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
         ...(replyMarkup != null && isLastChunk ? { reply_markup: replyMarkup } : {}),
@@ -8623,14 +8593,17 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         ...(disableNotification ? { disable_notification: true } : {}),
       }
 
+      // The body argument for send/edit: a rich-markdown wrapper on the
+      // default path, or the literal string for `format:'text'` (#2669).
+      const richOrPlain = (s: string) => (literalText ? s : richMessage(s))
+
       if (i === 0 && previewMessageId != null) {
         const editOpts: Record<string, unknown> = {}
-        if (parseMode) editOpts.parse_mode = parseMode
         if (disableLinkPreview) editOpts.link_preview_options = { is_disabled: true }
         if (replyMarkup != null && isLastChunk) editOpts.reply_markup = replyMarkup
         try {
           await robustApiCall(
-            () => lockedBot.api.editMessageText(chat_id, previewMessageId!, chunks[i], editOpts),
+            () => lockedBot.api.editMessageText(chat_id, previewMessageId!, richOrPlain(chunks[i]), editOpts),
             { threadId, chat_id },
           )
           sentIds.push(previewMessageId!)
@@ -8649,37 +8622,45 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         }
       }
 
-      // Last-resort: resend this chunk as plain text (parse_mode unset).
-      // Keeps thread / reply / markup params; only the formatting is
-      // sacrificed. Used when Telegram rejects our HTML — better an
-      // unformatted answer than a vanished one.
+      // Last-resort: resend this chunk as plain text (no rich wrapper, so
+      // the markdown parser never runs). Keeps thread / reply / markup
+      // params; only the formatting is sacrificed. Used when Telegram
+      // rejects our markdown — better an unformatted answer than a
+      // vanished one. The raw markdown source is itself readable prose, so
+      // we send it verbatim rather than strip anything.
       const sendChunkPlainText = async (opts: Record<string, unknown>): Promise<void> => {
-        const plainOpts = { ...opts }
-        delete (plainOpts as { parse_mode?: unknown }).parse_mode
-        // A chunk that was pure markup (no text content) strips to ''.
-        // Sending '' is a Telegram 400 "message text is empty" — i.e.
-        // the answer would still vanish, in the exact path that exists
-        // to prevent that. Substitute an honest placeholder so the
-        // user at least sees that a fragment was unrenderable.
-        const stripped = telegramHtmlToPlainText(chunks[i])
         const plain =
-          stripped.length > 0
-            ? stripped
-            : '⚠️ (a formatted fragment could not be rendered for Telegram)'
-        // allow-raw-bot-api: plaintext last-resort fallback; wrapping would re-enter the parse-mode policy that just rejected the payload
-        const sent = await lockedBot.api.sendMessage(chat_id, plain, plainOpts as never)
+          chunks[i].length > 0
+            ? chunks[i]
+            : '⚠️ (a fragment could not be rendered for Telegram)'
+        // allow-raw-bot-api: plaintext last-resort fallback; wrapping would re-enter the parse policy that just rejected the payload
+        const sent = await lockedBot.api.sendMessage(chat_id, plain, opts as never)
         sentIds.push(sent.message_id)
         logOutbound('reply', chat_id, sent.message_id, plain.length, `chunk=${i + 1}/${chunks.length} plaintext-fallback`)
         process.stderr.write(
-          `telegram gateway: HTML parse-reject — resent chunk ${i + 1}/${chunks.length} as plain text\n`,
+          `telegram gateway: markdown parse-reject — resent chunk ${i + 1}/${chunks.length} as plain text\n`,
         )
       }
 
+      // Literal `format:'text'` sends bypass the rich parser entirely
+      // (plain sendMessage, no markdown). The default path ships rich
+      // markdown via sendRichMessage. Both resolve to a Message with a
+      // message_id, which is all the caller reads.
+      const sendChunk = (opts: Record<string, unknown>): Promise<{ message_id: number }> => {
+        if (literalText) {
+          // allow-raw-bot-api: literal format:'text' send; the chunk-loop's own THREAD_NOT_FOUND + parse-reject handling wraps this
+          return lockedBot.api.sendMessage(chat_id, chunks[i], opts as never)
+        }
+        // sendRichMessage does NOT accept link_preview_options (rich messages
+        // control previews via entity detection) — drop it for the rich path.
+        const richOpts = { ...opts }
+        delete (richOpts as { link_preview_options?: unknown }).link_preview_options
+        // allow-raw-bot-api: sendRichMessage is not in the THREAD_NOT_FOUND blast pattern; thread fallback handled in the catch below
+        return lockedBot.api.sendRichMessage(chat_id, richMessage(chunks[i]), richOpts as never)
+      }
+
       try {
-        const sent = await robustApiCall(
-          () => lockedBot.api.sendMessage(chat_id, chunks[i], sendOpts as never),
-          { threadId, chat_id },
-        )
+        const sent = await robustApiCall(() => sendChunk(sendOpts), { threadId, chat_id })
         sentIds.push(sent.message_id)
         logOutbound('reply', chat_id, sent.message_id, chunks[i].length, `chunk=${i + 1}/${chunks.length}`)
       } catch (err) {
@@ -8688,11 +8669,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           const retryOpts = { ...sendOpts }
           delete (retryOpts as any).message_thread_id
           try {
-            // allow-raw-bot-api: chunk-loop THREAD_NOT_FOUND fallback; thread already dropped, wrapping would re-enter the throw
-            const sent = await lockedBot.api.sendMessage(chat_id, chunks[i], retryOpts as never)
+            const sent = await sendChunk(retryOpts)
             sentIds.push(sent.message_id)
           } catch (retryErr) {
-            // Thread dropped, but the HTML is also unparseable — go plain.
+            // Thread dropped, but the markdown is also unparseable — go plain.
             if (isHtmlParseRejectError(retryErr)) await sendChunkPlainText(retryOpts)
             else throw retryErr
           }
@@ -8740,7 +8720,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       pendingProgress.noteOutbound(statusKey(chat_id, threadId), {
         messageId: anchorMsgId,
         text: chunks[chunks.length - 1],
-        parseMode,
+        literalText,
       })
     }
   }
@@ -9185,7 +9165,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       ...(streamReplyMarkup != null ? { reply_markup: streamReplyMarkup } : {}),
       ...(args.disable_notification === true ? { disable_notification: true } : {}),
     },
-    { activeDraftStreams, activeDraftParseModes, suppressPtyPreview },
+    { activeDraftStreams, suppressPtyPreview },
     {
       // grammy's Bot<Context, Api<RawApi>> has a wider api shape than the
       // local StreamBotApi interface, but is structurally compatible at
@@ -9193,8 +9173,6 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       // bypass the structural-typing strictness.
       bot: lockedBot as unknown as { api: import('../stream-controller.js').StreamBotApi },
       retry: robustApiCall,
-      markdownToHtml,
-      escapeMarkdownV2,
       repairEscapedWhitespace,
       assertAllowedChat,
       resolveThreadId,
@@ -9281,16 +9259,11 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     // async dispatch, the framework edits THIS message in place at
     // intervals.
     //
-    // #1698 — capture the parse_mode the stream-reply-handler used so
-    // the cross-turn edit tick reuses it. Mirrors the format→parseMode
-    // logic at stream-reply-handler.ts:355-368. Without this, the first
-    // "still working (Nm)" tick edits HTML content as plain text and
-    // <b>/<code>/<a> render as literal tags.
+    // #2669 — capture whether the stream-reply-handler sent literally
+    // (format:'text') so the cross-turn edit tick re-edits with the same
+    // shape. The default rich-markdown path re-edits via the rich path.
     const streamFormat = (args.format as string | undefined) ?? (access.parseMode ?? 'html')
-    const streamParseMode: 'HTML' | 'MarkdownV2' | undefined =
-      streamFormat === 'html' ? 'HTML'
-      : streamFormat === 'markdownv2' ? 'MarkdownV2'
-      : undefined
+    const streamLiteralText = streamFormat === 'text'
     // #1760 primary fix — clear any stale prior-turn ticker before
     // re-anchoring on stream_reply done. See the matching comment at
     // the executeReply finalize site.
@@ -9298,7 +9271,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
     pendingProgress.noteOutbound(statusKey(sChatId, sThreadId), {
       messageId: result.messageId,
       text: args.text as string,
-      parseMode: streamParseMode,
+      literalText: streamLiteralText,
     })
   }
   // #1664 — mark the turn's final answer as delivered. For stream_reply a
@@ -9458,19 +9431,22 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
     // Otherwise fall through to message-send below.
   }
 
-  // Send plain message (no quote-reply)
+  // Send plain message (no quote-reply). Single rich-markdown path (#2669):
+  // `parseMode:'text'` config opts into a literal plain send; everything
+  // else ships raw GFM markdown via sendRichMessage.
   const access = loadAccess()
-  const configParseMode = access.parseMode ?? 'html'
-  const parseMode = configParseMode === 'html' ? 'HTML' : undefined
-  const effectiveText = configParseMode === 'html' ? markdownToHtml(text) : text
+  const literalText = (access.parseMode ?? 'html') === 'text'
 
   const sendOpts = {
-    ...(parseMode ? { parse_mode: parseMode } : {}),
     ...(threadId != null ? { message_thread_id: threadId } : {}),
   }
 
   const sent = await robustApiCall(
-    () => lockedBot.api.sendMessage(chat_id, effectiveText, sendOpts as never),
+    (): Promise<{ message_id: number }> =>
+      literalText
+        // allow-raw-bot-api: literal progress-update send routed through robustApiCall
+        ? lockedBot.api.sendMessage(chat_id, text, sendOpts as never)
+        : lockedBot.api.sendRichMessage(chat_id, richMessage(text), sendOpts as never),
     { verb: 'sendMessage', chat_id, threadId },
   )
 
@@ -9561,7 +9537,6 @@ async function executeAskUser(rawArgs: Record<string, unknown>): Promise<unknown
   // alive (button tap turns into "✅ <choice>" inline) rather than a
   // graveyard of unanswered questions in the chat history.
   const sendOpts: Record<string, unknown> = {
-    parse_mode: 'HTML',
     reply_markup: keyboard,
   }
   if (threadId != null) sendOpts.message_thread_id = threadId
@@ -9577,7 +9552,7 @@ async function executeAskUser(rawArgs: Record<string, unknown>): Promise<unknown
         const opts = { ...sendOpts }
         if (tid == null) delete opts.message_thread_id
         else opts.message_thread_id = tid
-        return lockedBot.api.sendMessage(args.chatId, args.question, opts)
+        return lockedBot.api.sendRichMessage(args.chatId, richMessage(args.question), opts)
       },
       { threadId, chat_id: args.chatId, verb: 'ask_user.sendMessage' },
     )
@@ -9605,8 +9580,7 @@ async function executeAskUser(rawArgs: Record<string, unknown>): Promise<unknown
           lockedBot.api.editMessageText(
             args.chatId,
             entry.messageId!,
-            `${args.question}\n\n<i>⏱ no response within ${Math.round(args.timeoutMs / 1000)}s</i>`,
-            { parse_mode: 'HTML' },
+            richMessage(`${args.question}\n\n_⏱ no response within ${Math.round(args.timeoutMs / 1000)}s_`),
           ),
         {
           chat_id: args.chatId,
@@ -9840,13 +9814,13 @@ function buildVaultRequestSaveKeyboard(stageId: string): { inline_keyboard: Arra
 
 function renderVaultRequestSaveCard(req: PendingVaultRequestSave, agentSlug: string): string {
   const lines: string[] = []
-  lines.push(`🔐 <b>${escapeHtmlForTg(agentSlug)}</b> wants to save a secret`)
-  lines.push(`key: <code>${escapeHtmlForTg(req.key)}</code>`)
+  lines.push(`🔐 **${escapeHtmlForTg(agentSlug)}** wants to save a secret`)
+  lines.push(`key: \`${req.key}\``)
   if (req.why && req.why.length > 0) {
-    lines.push(`why: <i>${escapeHtmlForTg(req.why)}</i>`)
+    lines.push(`why: _${escapeHtmlForTg(req.why)}_`)
   }
   lines.push('')
-  lines.push(`<i>Tap Save to write to the host vault, Rename to change the key name, or Discard to drop it. The value is held in this chat's gateway memory until you decide.</i>`)
+  lines.push(`_Tap Save to write to the host vault, Rename to change the key name, or Discard to drop it. The value is held in this chat's gateway memory until you decide._`)
   return lines.join('\n')
 }
 
@@ -9909,8 +9883,7 @@ async function executeVaultRequestSave(args: Record<string, unknown>): Promise<{
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
     (tid) =>
-      lockedBot.api.sendMessage(chat_id, text, {
-        parse_mode: 'HTML',
+      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
         reply_markup: buildVaultRequestSaveKeyboard(stageId),
         ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
       }),
@@ -9983,13 +9956,13 @@ function buildSecretRequestKeyboard(stageId: string): { inline_keyboard: Array<A
 
 function renderSecretRequestCard(req: PendingSecretRequest): string {
   const lines: string[] = [
-    `🔒 <b>${escapeHtmlForTg(req.agent)}</b> needs a secret:`,
-    `<code>${escapeHtmlForTg(req.key)}</code>`,
+    `🔒 **${escapeHtmlForTg(req.agent)}** needs a secret:`,
+    `\`${req.key}\``,
   ]
-  if (req.reason) lines.push(`<i>${escapeHtmlForTg(req.reason)}</i>`)
+  if (req.reason) lines.push(`_${escapeHtmlForTg(req.reason)}_`)
   lines.push(
     '',
-    'Tap <b>Provide securely</b>, then send the value as your next message. I’ll delete it instantly and store it in the vault — it is never shown in chat or to the agent.',
+    'Tap **Provide securely**, then send the value as your next message. I’ll delete it instantly and store it in the vault — it is never shown in chat or to the agent.',
   )
   return lines.join('\n')
 }
@@ -10029,8 +10002,7 @@ async function executeRequestSecret(args: Record<string, unknown>): Promise<{ co
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
     (tid) =>
-      lockedBot.api.sendMessage(chat_id, text, {
-        parse_mode: 'HTML',
+      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
         reply_markup: buildSecretRequestKeyboard(stageId),
         ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
       }),
@@ -10093,8 +10065,8 @@ async function captureProvidedSecret(
   if (!write.ok) {
     const parsed = parseVaultCliError(write.output)
     const rendered = renderVaultCliError(parsed, { verb: 'save', key: armed.key })
-    const body = rendered.suppressRaw ? rendered.html : `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>`
-    await switchroomReply(ctx, `${body}\n\n<i>The secret was NOT saved. The agent can re-request with <code>request_secret</code>.</i>`, { html: true })
+    const body = rendered.suppressRaw ? rendered.html : `⚠️ vault write failed:\n\`\`\`\n${write.output}\n\`\`\``
+    await switchroomReply(ctx, `${body}\n\n_The secret was NOT saved. The agent can re-request with \`request_secret\`._`, { html: true })
     // Wake the agent too (review #2047 finding #3): it ended its turn
     // waiting for a synthetic inbound; without this it stalls silently.
     const fts = Date.now()
@@ -10121,7 +10093,7 @@ async function captureProvidedSecret(
 
   await switchroomReply(
     ctx,
-    `✅ saved as <code>vault:${escapeHtmlForTg(armed.key)}</code> (masked: <code>${escapeHtmlForTg(maskToken(value))}</code>). The agent can now reference it.`,
+    `✅ saved as \`vault:${escapeHtmlForTg(armed.key)}\` (masked: \`${escapeHtmlForTg(maskToken(value))}\`). The agent can now reference it.`,
     { html: true },
   )
 
@@ -10190,8 +10162,8 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `🔐 Send the value for <code>${escapeHtmlForTg(pending.key)}</code> as your next message — a single message, exactly as-is (don't add other text). I’ll delete it instantly and store it in the vault.`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage(`🔐 Send the value for \`${pending.key}\` as your next message — a single message, exactly as-is (don't add other text). I’ll delete it instantly and store it in the vault.`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -10204,8 +10176,7 @@ async function handleSecretRequestCallback(ctx: Context, data: string): Promise<
     await ctx.answerCallbackQuery({ text: 'Declined.' }).catch(() => {})
     if (pending.card_message_id != null) {
       await ctx.api
-        .editMessageText(pending.chat_id, pending.card_message_id, `🚫 Declined — <code>${escapeHtmlForTg(pending.key)}</code> not provided.`, {
-          parse_mode: 'HTML',
+        .editMessageText(pending.chat_id, pending.card_message_id, richMessage(`🚫 Declined — \`${pending.key}\` not provided.`), {
           reply_markup: { inline_keyboard: [] },
         })
         .catch(() => {})
@@ -10257,9 +10228,9 @@ function renderVaultRequestAccessCard(req: PendingVaultRequestAccess): string {
   const scopeLabel = req.scope === 'write' ? 'write' : 'read'
   const days = Math.round(req.ttl_seconds / 86400)
   const durationLabel = days >= 1 ? `${days}d` : `${Math.round(req.ttl_seconds / 3600)}h`
-  lines.push(`🔐 <b>${escapeHtmlForTg(req.agent)}</b> wants vault access`)
-  lines.push(`key: <code>${escapeHtmlForTg(req.key)}</code>`)
-  lines.push(`scope: <code>${scopeLabel}</code> · duration: <code>${durationLabel}</code>`)
+  lines.push(`🔐 **${escapeHtmlForTg(req.agent)}** wants vault access`)
+  lines.push(`key: \`${req.key}\``)
+  lines.push(`scope: \`${scopeLabel}\` · duration: \`${durationLabel}\``)
   // #1790 — always render the why-line, even when the agent omitted
   // `reason`. Rendering "not provided" makes a missing rationale
   // visibly an agent-side failure (the tool description nudges the
@@ -10268,12 +10239,12 @@ function renderVaultRequestAccessCard(req: PendingVaultRequestAccess): string {
   // template choice, which the operator couldn't tell apart from a
   // legitimate "no reason needed" case.
   if (req.reason && req.reason.length > 0) {
-    lines.push(`why: <i>${escapeHtmlForTg(req.reason)}</i>`)
+    lines.push(`why: _${escapeHtmlForTg(req.reason)}_`)
   } else {
-    lines.push(`why: <i>not provided</i>`)
+    lines.push(`why: _not provided_`)
   }
   lines.push('')
-  lines.push(`<i>Tap Approve to mint a scoped grant token (same flow as <code>switchroom vault grant</code>). Tap Deny to refuse — the agent will receive a denial result.</i>`)
+  lines.push(`_Tap Approve to mint a scoped grant token (same flow as \`switchroom vault grant\`). Tap Deny to refuse — the agent will receive a denial result._`)
   return lines.join('\n')
 }
 
@@ -10379,8 +10350,7 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
   const sent = await retryWithThreadFallback<{ message_id: number }>(
     robustApiCall,
     (tid) =>
-      lockedBot.api.sendMessage(chat_id, text, {
-        parse_mode: 'HTML',
+      lockedBot.api.sendRichMessage(chat_id, richMessage(text), {
         reply_markup: buildVaultRequestAccessKeyboard(stageId),
         ...(tid != null && Number.isFinite(tid) ? { message_thread_id: tid } : {}),
       }),
@@ -10449,8 +10419,10 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   if (args.text == null || args.text === '') throw new Error('edit_message: text is required and cannot be empty')
   assertAllowedChat(String(args.chat_id ?? ''))
   const editAccess = loadAccess()
-  const editConfigMode = editAccess.parseMode ?? 'html'
-  const editFormat = (args.format as string | undefined) ?? editConfigMode
+  const editFormat = (args.format as string | undefined) ?? (editAccess.parseMode ?? 'html')
+  // Single rich-markdown path (#2669): `format:'text'` edits as a literal
+  // plain string; everything else edits via the rich-markdown path.
+  const editLiteralText = editFormat === 'text'
   let editRawText = repairEscapedWhitespace(args.text as string)
   // Outbound secret scrub (#2044): an edit must not re-introduce a raw
   // secret into a live bubble or the history row. Mask before scrub/send.
@@ -10471,22 +10443,10 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
       })
     }
   }
-  let editParseMode: 'HTML' | 'MarkdownV2' | undefined
-  let editText: string
-  if (editFormat === 'html') {
-    editParseMode = 'HTML'
-    editText = markdownToHtml(editRawText)
-  } else if (editFormat === 'markdownv2') {
-    editParseMode = 'MarkdownV2'
-    editText = escapeMarkdownV2(editRawText)
-  } else {
-    editParseMode = undefined
-    editText = editRawText
-  }
   const edited = await robustApiCall(
     () => lockedBot.api.editMessageText(
-      String(args.chat_id ?? ''), Number(args.message_id), editText,
-      ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
+      String(args.chat_id ?? ''), Number(args.message_id),
+      editLiteralText ? editRawText : richMessage(editRawText),
     ),
   )
   const id = typeof edited === 'object' && edited ? (edited as any).message_id : args.message_id
@@ -10720,7 +10680,6 @@ function closeActivityLane(chatId: string, threadId: number | undefined): void {
   const stream = activeDraftStreams.get(key)
   if (stream == null) return
   activeDraftStreams.delete(key)
-  activeDraftParseModes.delete(key)
   void stream.finalize().catch(() => {})
 }
 
@@ -10732,7 +10691,6 @@ function closeProgressLane(chatId: string, threadId: number | undefined): void {
   for (const [key, stream] of activeDraftStreams) {
     if (key.startsWith(prefix)) {
       activeDraftStreams.delete(key)
-      activeDraftParseModes.delete(key)
       void stream.finalize().catch(() => {})
     }
   }
@@ -10940,7 +10898,7 @@ async function drainActivitySummary(
         break
       }
       // `renderActivityFeed` already emitted ready Telegram HTML with per-line
-      // markup (<b>→ current</b> / <i>✓ done</i>) and escaped each label's
+      // markup (**→ current** / _✓ done_) and escaped each label's
       // <,>,& itself (#1942 class) — send verbatim, do NOT re-escape or
       // re-wrap (double-escaping would surface literal tags).
       const html = target
@@ -10956,9 +10914,9 @@ async function drainActivitySummary(
       try {
         if (turn.activityMessageId == null) {
           const sent = await robustApiCall(
-            () => bot.api.sendMessage(chat, html, {
+            // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+            () => bot.api.sendRichMessage(chat, richMessage(html), {
               ...(thread != null ? { message_thread_id: thread } : {}),
-              parse_mode: 'HTML',
               disable_notification: true,
               ...replyAnchor,
             }),
@@ -10969,7 +10927,7 @@ async function drainActivitySummary(
         } else {
           const id = turn.activityMessageId
           await robustApiCall(
-            () => bot.api.editMessageText(chat, id, html, { parse_mode: 'HTML' }),
+            () => bot.api.editMessageText(chat, id, richMessage(html), {}),
             { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.edit' },
           )
         }
@@ -11281,7 +11239,7 @@ function clearActivitySummary(turn: CurrentTurn, finalHtmlOverride?: string | nu
     if (finalHtml == null) return
     try {
       await robustApiCall(
-        () => bot.api.editMessageText(chat, id, finalHtml, { parse_mode: 'HTML' }),
+        () => bot.api.editMessageText(chat, id, richMessage(finalHtml), {}),
         { chat_id: chat, ...(thread != null ? { threadId: thread } : {}), verb: 'activity-summary.finalize' },
       )
     } catch (err) {
@@ -11805,15 +11763,10 @@ function handleSessionEvent(ev: SessionEvent): void {
             //   (no flash). The draft transport is permanently retired — both modes
             //   use sendMessage + editMessageText for any message that does open.
             minInitialChars: ANSWER_LANE.minInitialChars,
-            // Render raw assistant transcript markdown → Telegram HTML before
-            // any parse_mode:'HTML' send/edit, matching every other outbound
-            // lane (handleStreamReply, the reply handler, the turn-flush
-            // backstop, handlePtyPartial). Without this the answer-stream lane
-            // shipped raw text — `**bold**` arrived as literal asterisks and
-            // agent narration read unformatted (the answer-stream-raw-markdown
-            // bug). Injected as a dependency (same pattern as the PTY partial
-            // handler's `renderText`) so answer-stream.ts stays format-free.
-            renderText: (text: string) => sanitizeTelegramHtml(markdownToHtml(text)),
+            // #2669: the answer-stream ships the RAW transcript markdown; the
+            // sendMessage/editMessageText wrappers below send it via the
+            // rich-message path (`sendRichMessage` / `editMessageText({ markdown })`),
+            // matching every other outbound lane. No render step needed.
             // #1075: route through robustApiCall so flood-wait,
             // benign-400, and THREAD_NOT_FOUND are handled uniformly
             // instead of crashing the answer-stream loop on a deleted
@@ -11849,13 +11802,11 @@ function handleSessionEvent(ev: SessionEvent): void {
               const silent = params?.purpose !== 'materialize'
               const msg = await robustApiCall(
                 () =>
-                  bot.api.sendMessage(chatId, text, {
-                    parse_mode: params?.parse_mode,
+                  // allow-raw-bot-api: sendRichMessage is not in the THREAD_NOT_FOUND blast pattern; answer-stream tolerates failures via its own try/catch
+                  // sendRichMessage doesn't accept link_preview_options — omit it.
+                  bot.api.sendRichMessage(chatId, richMessage(text), {
                     disable_notification: silent,
                     ...(tid != null ? { message_thread_id: tid } : {}),
-                    ...(params?.link_preview_options != null
-                      ? { link_preview_options: params.link_preview_options }
-                      : {}),
                     ...(params?.reply_parameters != null
                       ? { reply_parameters: params.reply_parameters }
                       : {}),
@@ -11872,8 +11823,7 @@ function handleSessionEvent(ev: SessionEvent): void {
               const tid = params?.message_thread_id
               return robustApiCall(
                 () =>
-                  bot.api.editMessageText(chatId, messageId, text, {
-                    parse_mode: params?.parse_mode,
+                  bot.api.editMessageText(chatId, messageId, richMessage(text), {
                     ...(tid != null ? { message_thread_id: tid } : {}),
                     ...(params?.link_preview_options != null
                       ? { link_preview_options: params.link_preview_options }
@@ -11969,16 +11919,16 @@ function handleSessionEvent(ev: SessionEvent): void {
         lastContextExhaustionWarningAt = now
         process.stderr.write(`telegram gateway: context exhaustion detected — notifying user\n`)
         const warnOpts = {
-          parse_mode: 'HTML' as const,
           ...(threadId != null ? { message_thread_id: threadId } : {}),
         }
         // #1075: thread-id-bearing, fire-and-forget — swallow on
         // THREAD_NOT_FOUND so a deleted topic doesn't crash the gateway.
         void swallowingApiCall(
           () =>
-            bot.api.sendMessage(
+            // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+            bot.api.sendRichMessage(
               chatId,
-              '⚠️ <b>Context window full</b> — send <code>/restart</code> to start a fresh session.',
+              richMessage('⚠️ **Context window full** — send \`/restart\` to start a fresh session.'),
               warnOpts,
             ),
           {
@@ -12337,7 +12287,6 @@ function handleSessionEvent(ev: SessionEvent): void {
         for (const [key] of activeDraftStreams) {
           if (key.startsWith(suppressPrefix)) {
             activeDraftStreams.delete(key)
-            activeDraftParseModes.delete(key)
           }
         }
         // Unpin without editing the message so no orphaned card lingers.
@@ -12438,9 +12387,9 @@ function handleSessionEvent(ev: SessionEvent): void {
         // that fires when the model emits raw transcript text WITHOUT
         // calling reply / stream_reply. That captured text bypasses
         // PR #1683's executeReply scrub site entirely and is delivered
-        // via sendMessage / editMessageText directly. Scrub the
-        // capturedText before markdownToHtml so em-dashes never reach
-        // the wire. Kill switch: SWITCHROOM_DISABLE_VOICE_SCRUB.
+        // via the rich-message path directly. Scrub the capturedText on the
+        // raw markdown so em-dashes never reach the wire. Kill switch:
+        // SWITCHROOM_DISABLE_VOICE_SCRUB.
         {
           const scrub = scrubVoice(capturedText)
           if (scrub.replaced > 0) {
@@ -12541,13 +12490,11 @@ function handleSessionEvent(ev: SessionEvent): void {
             `(chat=${backstopChatId} cardMsgId=${backstopCardMessageId ?? 'none'})\n`,
           )
           const sendOpts = {
-            parse_mode: 'HTML' as const,
             ...(backstopThreadId != null ? { message_thread_id: backstopThreadId } : {}),
             link_preview_options: { is_disabled: true },
           }
-          const renderedText = markdownToHtml(capturedText)
-          const limit = 4000
-          const htmlChunks = splitHtmlChunks(renderedText, limit)
+          const limit = RICH_MESSAGE_MAX_CHARS
+          const htmlChunks = splitMarkdownChunks(capturedText, limit)
           const sentIds: number[] = []
           try {
             // #654 deterministic double-message fix. If the progress
@@ -12576,7 +12523,7 @@ function handleSessionEvent(ev: SessionEvent): void {
                     bot.api.editMessageText(
                       backstopChatId,
                       backstopCardMessageId,
-                      htmlChunks[0],
+                      richMessage(htmlChunks[0]),
                       sendOpts,
                     ),
                   {
@@ -12602,11 +12549,10 @@ function handleSessionEvent(ev: SessionEvent): void {
                 robustApiCall,
                 (tid) => {
                   const opts = {
-                    parse_mode: 'HTML' as const,
                     link_preview_options: { is_disabled: true },
                     ...(tid != null ? { message_thread_id: tid } : {}),
                   }
-                  return bot.api.sendMessage(backstopChatId, c, opts)
+                  return bot.api.sendRichMessage(backstopChatId, richMessage(c), opts)
                 },
                 {
                   threadId: liveThreadId,
@@ -12856,7 +12802,6 @@ function handlePtyPartial(text: string): void {
     currentSessionThreadId: turn?.sessionThreadId,
     pendingPtyPartial: pendingPtyPartial != null ? { text: pendingPtyPartial } : null,
     activeDraftStreams,
-    activeDraftParseModes,
     suppressPtyPreview,
     lastPtyPreviewByChat,
   }
@@ -12865,7 +12810,6 @@ function handlePtyPartial(text: string): void {
     // interface; runtime-compatible. Cast through never.
     bot: bot as never,
     retry: robustApiCall,
-    renderText: markdownToHtml,
     logEvent: logStreamingEvent,
     onStreamSend: (chatId, messageId, charCount) => {
       logOutbound('pty_preview', chatId, messageId, charCount, 'initial_send')
@@ -12900,13 +12844,11 @@ function handlePtyActivity(text: string): void {
       format: 'text',
       lane: 'activity',
     },
-    { activeDraftStreams, activeDraftParseModes },
+    { activeDraftStreams },
     {
       // See StreamBotApi cast comment above (line ~2522 area).
       bot: bot as never,
       retry: robustApiCall,
-      markdownToHtml,
-      escapeMarkdownV2,
       repairEscapedWhitespace,
       assertAllowedChat,
       resolveThreadId,
@@ -13597,9 +13539,9 @@ async function handleInbound(
           cleanAuthAddScratchDir(pendingAdd.scratchDir)
           await switchroomReply(
             ctx,
-            `✓ Account <code>${escapeHtmlForTg(pendingAdd.label)}</code> added.\n` +
+            `✓ Account \`${pendingAdd.label}\` added.\n` +
               `The fleet's active account hasn't changed. Send ` +
-              `<code>/auth use ${escapeHtmlForTg(pendingAdd.label)}</code> to switch to it.`,
+              `\`/auth use ${escapeHtmlForTg(pendingAdd.label)}\` to switch to it.`,
             { html: true },
           )
         } catch (brokerErr) {
@@ -13609,7 +13551,7 @@ async function handleInbound(
           cleanAuthAddScratchDir(pendingAdd.scratchDir)
           await switchroomReply(
             ctx,
-            `<b>/auth add failed at broker:</b> ${escapeHtmlForTg((brokerErr as Error)?.message ?? String(brokerErr))}`,
+            `**/auth add failed at broker:** ${escapeHtmlForTg((brokerErr as Error)?.message ?? String(brokerErr))}`,
             { html: true },
           )
         }
@@ -13618,7 +13560,7 @@ async function handleInbound(
         // failure paths (timeout, child exit, stdin broken).
         await switchroomReply(
           ctx,
-          `<b>/auth add code failed:</b> ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+          `**/auth add code failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
           { html: true },
         )
       }
@@ -13640,7 +13582,7 @@ async function handleInbound(
       pendingReauthFlows.delete(interceptKey)
       const { result, errorText } = execAuthCode(pendingReauth.agent, text.trim())
       if (errorText) {
-        await switchroomReply(ctx, `<b>auth code failed:</b>\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
+        await switchroomReply(ctx, `**auth code failed:**\n${preBlock(formatSwitchroomOutput(errorText))}`, { html: true })
       } else if (result) {
         const outcomeMsg = renderAuthCodeOutcome(result.outcome)
         if (outcomeMsg) {
@@ -13692,7 +13634,7 @@ async function handleInbound(
         if (result.ok) {
           await switchroomReply(ctx, '🔓 Vault broker unlocked.', { html: true })
         } else {
-          await switchroomReply(ctx, `<b>vault unlock failed:</b> ${escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
+          await switchroomReply(ctx, `**vault unlock failed:** ${escapeHtmlForTg(result.msg ?? 'unknown error')}`, { html: true })
         }
       } else if (pendingVault.kind === 'passphrase-for-deferred') {
         // Issue #44: passphrase entered after tapping "🔓 Unlock vault &
@@ -13741,8 +13683,8 @@ async function handleInbound(
               .editMessageText(
                 item.cardChatId,
                 item.cardMessageId,
-                `⌛ <i>Vault unlocked, but this access-request card expired or was denied before you replied. Ask the agent to re-issue if still needed.</i>`,
-                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+                richMessage(`⌛ _Vault unlocked, but this access-request card expired or was denied before you replied. Ask the agent to re-issue if still needed._`),
+                { reply_markup: { inline_keyboard: [] } },
               )
               .catch(() => {})
             continue
@@ -13756,7 +13698,7 @@ async function handleInbound(
         if (ttlSeconds === null) {
           // Re-set state so user can try again
           pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-          await switchroomReply(ctx, '⚠️ Invalid duration. Use <code>Nd</code> (days) or <code>Nh</code> (hours), e.g. <code>30d</code> or <code>12h</code>.', { html: true })
+          await switchroomReply(ctx, '⚠️ Invalid duration. Use \`Nd\` (days) or \`Nh\` (hours), e.g. \`30d\` or \`12h\`.', { html: true })
           return
         }
         const newState = { ...pendingVault, ttlSeconds, awaitingCustomDuration: false }
@@ -13783,7 +13725,7 @@ async function handleInbound(
         if (!VAULT_KEY_REGEX.test(newKey)) {
           // Re-arm the pending state so the user can try again.
           pendingVaultOps.set(chat_id, { ...pendingVault, startedAt: Date.now() })
-          await switchroomReply(ctx, `⚠️ Key must match <code>${VAULT_KEY_REGEX_LABEL}</code>. Send a different name.`, { html: true })
+          await switchroomReply(ctx, `⚠️ Key must match \`${VAULT_KEY_REGEX_LABEL}\`. Send a different name.`, { html: true })
           return
         }
         staged.key = newKey
@@ -13794,8 +13736,8 @@ async function handleInbound(
             .editMessageText(
               staged.chat_id,
               staged.card_message_id,
-              renderVaultRequestSaveCard(staged, staged.agent),
-              { parse_mode: 'HTML', reply_markup: buildVaultRequestSaveKeyboard(pendingVault.stageId) },
+              richMessage(renderVaultRequestSaveCard(staged, staged.agent)),
+              { reply_markup: buildVaultRequestSaveKeyboard(pendingVault.stageId) },
             )
             .catch(() => {})
         }
@@ -13830,7 +13772,7 @@ async function handleInbound(
       if (verb === 'stash' || verb === 'rename') {
         const cached = vaultPassphraseCache.get(chat_id)
         if (!cached || cached.expiresAt <= Date.now()) {
-          await switchroomReply(ctx, 'No vault passphrase cached. Run <code>/vault list</code> first (or any /vault command) to unlock, then re-send <code>stash NAME</code>.', { html: true })
+          await switchroomReply(ctx, 'No vault passphrase cached. Run \`/vault list\` first (or any /vault command) to unlock, then re-send \`stash NAME\`.', { html: true })
           return
         }
         const slugBase = arg && arg.length > 0 ? arg : staged.detection.suggested_slug
@@ -13848,14 +13790,14 @@ async function handleInbound(
           const rendered = renderVaultCliError(parsed, { verb: 'save', key: slug })
           const body = rendered.suppressRaw
             ? rendered.html
-            : `<b>vault write failed:</b>\n${preBlock(write.output)}`
+            : `**vault write failed:**\n${preBlock(write.output)}`
           await switchroomReply(ctx, body, { html: true })
           return
         }
         secretStaging.delete(staged.chat_id, staged.message_id)
         if (msgId != null) await deleteSensitiveMessage(chat_id, msgId, 'stash command')
         await deleteSensitiveMessage(chat_id, staged.message_id, 'detected secret')
-        await switchroomReply(ctx, `✅ stored as <code>vault:${slug}</code> (masked: <code>${maskToken(staged.detection.matched_text)}</code>)`, { html: true })
+        await switchroomReply(ctx, `✅ stored as \`vault:${slug}\` (masked: \`${maskToken(staged.detection.matched_text)}\`)`, { html: true })
         return
       }
     }
@@ -13945,11 +13887,11 @@ async function handleInbound(
           await deleteSensitiveMessage(chat_id, msgId, 'detected secret')
         }
         const lines = pipeRes.stored.map((s) =>
-          `• <code>${s.masked}</code> → <code>vault:${s.actual_slug}</code>`,
+          `• \`${s.masked}\` → \`vault:${s.actual_slug}\``,
         )
         await switchroomReply(
           ctx,
-          [`🔒 captured ${pipeRes.stored.length} secret${pipeRes.stored.length === 1 ? '' : 's'}:`, ...lines, '', 'reply <code>rename X</code> or <code>forget</code>.'].join('\n'),
+          [`🔒 captured ${pipeRes.stored.length} secret${pipeRes.stored.length === 1 ? '' : 's'}:`, ...lines, '', 'reply \`rename X\` or \`forget\`.'].join('\n'),
           { html: true },
         )
         for (const s of pipeRes.stored) {
@@ -14002,7 +13944,7 @@ async function handleInbound(
         const top = pipeRes.ambiguous[0]!
         await switchroomReply(
           ctx,
-          `👀 looks like a high-entropy string (rule: <code>${escapeHtmlForTg(top.rule_id)}</code>). reply <code>stash NAME</code> to store in vault, or <code>ignore</code>.`,
+          `👀 looks like a high-entropy string (rule: \`${top.rule_id}\`). reply \`stash NAME\` to store in vault, or \`ignore\`.`,
           { html: true },
         )
         // For ambiguous, we do NOT delete the message or rewrite — let the
@@ -14151,7 +14093,6 @@ async function handleInbound(
           // content bug. Delete from the map FIRST so any concurrent
           // reads can't see the stale stream while we await.
           activeDraftStreams.delete(sKey)
-          activeDraftParseModes.delete(sKey)
           await priorStream.finalize().catch(() => {})
         }
         suppressPtyPreview.delete(sKey)
@@ -14671,12 +14612,15 @@ function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
 }
 
+// #2669: escape GFM-markdown specials in dynamic values interpolated into
+// rich-message bodies (kept under the legacy name to avoid churn).
 function escapeHtmlForTg(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }
 
+// Wrap CLI/command output in a fenced code block (content is literal there).
 function preBlock(text: string): string {
-  return '<pre>' + escapeHtmlForTg(text) + '</pre>'
+  return '```\n' + text.replace(/```/g, '`​``') + '\n```'
 }
 
 type SwitchroomReplyMarkup =
@@ -14706,11 +14650,17 @@ async function switchroomReply(
     ? slashCommandReplyOpts(ctx, options.classification)
     : {}
   const threadId = routedOpts.message_thread_id ?? baseThreadId
-  await ctx.reply(text, {
+  const replyOpts = {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
-    ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
     ...(options.reply_markup ? { reply_markup: options.reply_markup } : {}),
-  })
+  }
+  // #2669: `options.html` now means "render `text` as GFM markdown via the
+  // rich-message path" (legacy field name kept). Plain otherwise.
+  if (options.html) {
+    await ctx.replyWithRichMessage(richMessage(text), replyOpts)
+  } else {
+    await ctx.reply(text, replyOpts)
+  }
 }
 
 /**
@@ -14749,10 +14699,11 @@ async function deleteSensitiveMessage(
     // the stderr log is the audit trail.
     await swallowingApiCall(
       () =>
-        bot.api.sendMessage(
+        // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+        bot.api.sendRichMessage(
           chatId,
-          `⚠️ <b>Could not auto-delete message containing your ${escapeHtmlForTg(reason)}.</b>\n\nPlease delete message <code>${msgId}</code> manually so the value is not retained in chat history.\n\n<i>Reason: ${escapeHtmlForTg(msg)}</i>`,
-          { parse_mode: 'HTML' },
+          richMessage(`⚠️ **Could not auto-delete message containing your ${escapeHtmlForTg(reason)}.**\n\nPlease delete message \`${msgId}\` manually so the value is not retained in chat history.\n\n_Reason: ${escapeHtmlForTg(msg)}_`),
+          {},
         ),
       { chat_id: chatId, verb: 'deleteSensitiveMessage.warning' },
     )
@@ -15257,7 +15208,7 @@ function notifyDetachedFailure(
     clearRestartMarker()
     const snippet = tail ? tail.slice(-800) : '(no output captured)'
     const text =
-      `❌ <b>${escapeHtmlForTg(label)} failed</b> (exit ${code}):\n` +
+      `❌ **${escapeHtmlForTg(label)} failed** (exit ${code}):\n` +
       preBlock(snippet)
     // Fire-and-forget — we're off the command-handler context and don't
     // have an await to block on anyway.
@@ -15266,9 +15217,7 @@ function notifyDetachedFailure(
     // failure handler.
     void swallowingApiCall(
       () =>
-        lockedBot.api.sendMessage(chatId, text, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
+        lockedBot.api.sendRichMessage(chatId, richMessage(text), {
           // Detached restart/update child-failure notice — status, not
           // the user's answer. Silence the open ping.
           disable_notification: true,
@@ -15377,8 +15326,8 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
     return true
   })
   const rendered = body.map(line => {
-    if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) return `<b>${escapeHtmlForTg(line)}</b>`
-    if (line.startsWith('Open this URL')) return `<i>${escapeHtmlForTg(line)}</i>`
+    if (line.startsWith('Started Claude auth') || line.startsWith('Auth session already running')) return `**${escapeHtmlForTg(line)}**`
+    if (line.startsWith('Open this URL')) return `_${escapeHtmlForTg(line)}_`
     return escapeHtmlForTg(line)
   })
   // Mobile-native post-script. Two paths depending on which Anthropic
@@ -15402,11 +15351,11 @@ function formatAuthOutputForTelegram(output: string): { text: string; url: strin
   // the same outcome with no API constraint. See PR #30.
   rendered.push(
     '',
-    '👇 Tap <b>🔐 Open Claude auth</b> below, then <b>reply with the browser code</b>.',
+    '👇 Tap **🔐 Open Claude auth** below, then **reply with the browser code**.',
     '',
-    '<i>Wrong Anthropic account getting authorized? Long-press the URL below and choose "Copy Link" or "Open in Browser" — lands in your main browser where the right account is signed in, bypassing Telegram\'s in-app browser cookies.</i>',
+    '_Wrong Anthropic account getting authorized? Long-press the URL below and choose "Copy Link" or "Open in Browser" — lands in your main browser where the right account is signed in, bypassing Telegram\'s in-app browser cookies._',
     '',
-    `<a href="${escapeHtmlForTg(url)}">${escapeHtmlForTg(url)}</a>`,
+    url,
   )
   return { text: rendered.join('\n'), url }
 }
@@ -15498,7 +15447,7 @@ async function runSwitchroomAuthCommand(ctx: Context, args: string[], label: str
     if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true }); return }
     if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`); return }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+    await switchroomReply(ctx, `**${escapeHtmlForTg(label)} failed:**\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
 
@@ -15545,7 +15494,7 @@ function renderVaultOpFailure(
   const verb = verbLabel === 'delete' ? 'remove' : verbLabel
   const rendered = renderVaultCliError(parsed, { verb, key })
   if (rendered.suppressRaw) return rendered.html
-  return `<b>vault ${verbLabel} failed:</b>\n${preBlock(cliOutput)}`
+  return `**vault ${verbLabel} failed:**\n${preBlock(cliOutput)}`
 }
 
 async function executeVaultOp(ctx: Context, chatId: string, op: 'list' | 'get' | 'set' | 'delete', key: string | undefined, passphrase: string, setValue: string | undefined): Promise<void> {
@@ -15554,24 +15503,24 @@ async function executeVaultOp(ctx: Context, chatId: string, op: 'list' | 'get' |
     if (!r.ok) { await switchroomReply(ctx, renderVaultOpFailure('list', r.output, undefined), { html: true }); return }
     const keys = r.output.split('\n').filter(Boolean)
     if (keys.length === 0) { await switchroomReply(ctx, 'Vault is empty.', { html: true }) }
-    else { await switchroomReply(ctx, `<b>Vault keys (${keys.length}):</b>\n${keys.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')}`, { html: true }) }
+    else { await switchroomReply(ctx, `**Vault keys (${keys.length}):**\n${keys.map(k => `• \`${k}\``).join('\n')}`, { html: true }) }
   } else if (op === 'get') {
     const r = runVaultCli(['get', key!], passphrase)
     if (!r.ok) { await switchroomReply(ctx, renderVaultOpFailure('get', r.output, key), { html: true }); return }
-    await switchroomReply(ctx, `<code>${escapeHtmlForTg(key!)}</code> =\n<code>${escapeHtmlForTg(r.output)}</code>`, { html: true })
+    await switchroomReply(ctx, `\`${key!}\` =\n\`${r.output}\``, { html: true })
   } else if (op === 'set') {
     if (setValue === undefined) {
       pendingVaultOps.set(chatId, { kind: 'value', op: 'set', key: key!, passphrase, startedAt: Date.now() })
-      await switchroomReply(ctx, `Send the value for <code>${escapeHtmlForTg(key!)}</code>.`, { html: true })
+      await switchroomReply(ctx, `Send the value for \`${key!}\`.`, { html: true })
       return
     }
     const r = runVaultCli(['set', key!], passphrase, setValue)
     if (!r.ok) { await switchroomReply(ctx, renderVaultOpFailure('set', r.output, key), { html: true }) }
-    else { await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> saved to vault.`, { html: true }) }
+    else { await switchroomReply(ctx, `✅ \`${key!}\` saved to vault.`, { html: true }) }
   } else if (op === 'delete') {
     const r = runVaultCli(['remove', key!], passphrase)
     if (!r.ok) { await switchroomReply(ctx, renderVaultOpFailure('delete', r.output, key), { html: true }) }
-    else { await switchroomReply(ctx, `✅ <code>${escapeHtmlForTg(key!)}</code> removed from vault.`, { html: true }) }
+    else { await switchroomReply(ctx, `✅ \`${key!}\` removed from vault.`, { html: true }) }
   }
 }
 
@@ -15622,8 +15571,8 @@ async function dispatchShortVerbViaHostd(
   if (hostdResp.result === 'started') {
     await switchroomReply(
       ctx,
-      `🔄 <b>${escapeHtmlForTg(label)}</b> dispatched via hostd ` +
-        `(request_id=<code>${escapeHtmlForTg(hostdResp.request_id)}</code>). ` +
+      `🔄 **${escapeHtmlForTg(label)}** dispatched via hostd ` +
+        `(request_id=\`${hostdResp.request_id}\`). ` +
         `Check audit log for completion.`,
       { html: true },
     )
@@ -15637,7 +15586,7 @@ async function dispatchShortVerbViaHostd(
     '(no error tail returned)'
   await switchroomReply(
     ctx,
-    `❌ <b>${escapeHtmlForTg(label)} failed via hostd</b> ` +
+    `❌ **${escapeHtmlForTg(label)} failed via hostd** ` +
       `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
       preBlock(stripAnsi(errBody)),
     { html: true },
@@ -15664,7 +15613,7 @@ async function runSwitchroomCommand(
     if (error.message?.includes('ENOENT')) { await switchroomReply(ctx, 'switchroom CLI not found.', { html: true, classification }); return }
     if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timed out')) { await switchroomReply(ctx, `${label}: timed out`, { classification }); return }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true, classification })
+    await switchroomReply(ctx, `**${escapeHtmlForTg(label)} failed:**\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true, classification })
   }
 }
 
@@ -15690,16 +15639,16 @@ function statusIcon(status: string): string {
 function renderAuthCodeOutcome(outcome: AuthCodeOutcome | null | undefined): string | null {
   if (!outcome || outcome.kind === 'success') return null
   const tail = outcome.paneTailText
-    ? `\n<i>${escapeHtmlForTg(outcome.paneTailText)}</i>`
+    ? `\n_${escapeHtmlForTg(outcome.paneTailText)}_`
     : ''
   switch (outcome.kind) {
     case 'invalid-code':
     case 'expired-code':
-      return `Code rejected by Claude — tap <b>Restart flow</b> for a fresh URL.${tail}`
+      return `Code rejected by Claude — tap **Restart flow** for a fresh URL.${tail}`
     case 'pane-not-ready':
-      return `Auth pane not ready — tap <b>Retry</b>.`
+      return `Auth pane not ready — tap **Retry**.`
     case 'timeout':
-      return `Still waiting after 2 min — tap <b>Retry</b> or check <code>switchroom auth list</code>.${tail}`
+      return `Still waiting after 2 min — tap **Retry** or check \`switchroom auth list\`.${tail}`
   }
 }
 
@@ -15751,7 +15700,7 @@ async function runSwitchroomCommandFormatted(ctx: Context, args: string[], label
   } catch (err: unknown) {
     const error = err as { stderr?: string; message?: string }
     const detail = stripAnsi(error.stderr?.trim() || error.message || 'unknown error')
-    await switchroomReply(ctx, `<b>${escapeHtmlForTg(label)} failed:</b>\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
+    await switchroomReply(ctx, `**${escapeHtmlForTg(label)} failed:**\n${preBlock(formatSwitchroomOutput(detail))}`, { html: true })
   }
 }
 
@@ -15786,8 +15735,8 @@ bot.use(async (ctx, next) => {
       const nameHtml = escapeHtmlForTg(myName)
       const notFlagged =
         decision.reason === 'other-agent'
-          ? `⚠️ <code>${cmdHtml}</code> targeting another agent is an admin operation — this agent (<code>${nameHtml}</code>) isn't admin-flagged. Run it from an admin agent, or set <code>admin: true</code> for this agent in switchroom.yaml. (Self-restart is allowed: send <code>/restart</code> with no arg.)`
-          : `⚠️ <code>${cmdHtml}</code> is an admin command — this agent (<code>${nameHtml}</code>) isn't admin-flagged. Run it from an admin agent, or set <code>admin: true</code> for this agent in switchroom.yaml.`
+          ? `⚠️ \`${cmdHtml}\` targeting another agent is an admin operation — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml. (Self-restart is allowed: send \`/restart\` with no arg.)`
+          : `⚠️ \`${cmdHtml}\` is an admin command — this agent (\`${nameHtml}\`) isn't admin-flagged. Run it from an admin agent, or set \`admin: true\` for this agent in switchroom.yaml.`
       if (!AGENT_ADMIN) {
         // Unchanged behaviour: a non-admin agent never executes admin
         // verbs locally and must not forward them to Claude.
@@ -15817,7 +15766,7 @@ bot.use(async (ctx, next) => {
         )
         await switchroomReply(
           ctx,
-          `⚠️ <code>${cmdHtml}</code> is a fleet-admin command — it is <b>operator-private</b>. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
+          `⚠️ \`${cmdHtml}\` is a fleet-admin command — it is **operator-private**. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
           { html: true },
         )
         return
@@ -16042,12 +15991,12 @@ bot.command('start', async ctx => {
   const gated = dmCommandGate(ctx)
   if (!gated) return
   const disabled = gated.access.dmPolicy === 'disabled'
-  await ctx.reply(buildStartText(getMyAgentName(), disabled), { parse_mode: 'HTML' })
+  await ctx.replyWithRichMessage(richMessage(buildStartText(getMyAgentName(), disabled)))
 })
 
 bot.command('help', async ctx => {
   if (!dmCommandGate(ctx)) return
-  await ctx.reply(buildHelpText(getMyAgentName()), { parse_mode: 'HTML' })
+  await ctx.replyWithRichMessage(richMessage(buildHelpText(getMyAgentName())))
 })
 
 bot.command('status', async ctx => {
@@ -16062,12 +16011,12 @@ bot.command('status', async ctx => {
     const demo = hasDemoFlag(getCommandArgs(ctx))
     const userTag = from.username ? `@${from.username}` : senderId
     const meta = await buildAgentMetadata(getMyAgentName())
-    await ctx.reply(buildStatusPairedText({ user: userTag, meta, demo }), { parse_mode: 'HTML' })
+    await ctx.replyWithRichMessage(richMessage(buildStatusPairedText({ user: userTag, meta, demo })))
     return
   }
   for (const [code, p] of Object.entries(access.pending)) {
     if (p.senderId === senderId) {
-      await ctx.reply(buildStatusPendingText(code), { parse_mode: 'HTML' })
+      await ctx.replyWithRichMessage(richMessage(buildStatusPendingText(code)))
       return
     }
   }
@@ -16080,11 +16029,11 @@ bot.command('agents', async ctx => {
     type AgentListResp = { agents: Array<{ name: string; status: string; uptime: string; template: string; topic_name: string; topic_emoji?: string }> }
     const data = switchroomExecJson<AgentListResp>(['agent', 'list'])
     if (!data) return null
-    if (data.agents.length === 0) return '<i>No agents defined</i>'
-    const lines = ['<b>Agents</b>']
+    if (data.agents.length === 0) return '_No agents defined_'
+    const lines = ['**Agents**']
     for (const a of data.agents) {
-      lines.push(`${statusIcon(a.status)} <b>${escapeHtmlForTg(a.name)}</b> · ${escapeHtmlForTg(a.status)} · ${escapeHtmlForTg(a.uptime)}`)
-      lines.push(`    <i>${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}</i>`)
+      lines.push(`${statusIcon(a.status)} **${escapeHtmlForTg(a.name)}** · ${escapeHtmlForTg(a.status)} · ${escapeHtmlForTg(a.uptime)}`)
+      lines.push(`    _${escapeHtmlForTg(a.template)} → ${escapeHtmlForTg(a.topic_name)}${a.topic_emoji ? ' ' + a.topic_emoji : ''}_`)
     }
     return lines.join('\n')
   })
@@ -16359,8 +16308,7 @@ bot.command('restart', async ctx => {
       const sent = await retryWithThreadFallback<{ message_id: number }>(
         robustApiCall,
         (tid) =>
-          lockedBot.api.sendMessage(chatId, ackText, {
-            parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+          lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
             // Restart acknowledgement is a status notice — silence the
             // open ping (the "restarted — ready" follow-up is what matters).
             disable_notification: true,
@@ -16402,7 +16350,7 @@ bot.command('restart', async ctx => {
     clearRestartMarker()
     await switchroomReply(
       ctx,
-      `❌ <b>restart ${escapeHtmlForTg(name)} failed via hostd</b> ` +
+      `❌ **restart ${escapeHtmlForTg(name)} failed via hostd** ` +
         `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
         preBlock(hostdResp.error ?? '(no error message)'),
       { html: true },
@@ -16459,7 +16407,7 @@ async function handleNewCommand(ctx: Context): Promise<void> {
     await switchroomReply(
       ctx,
       `/${kind} only supports a single agent — “all” would leave other agents with stale handoff briefings. ` +
-        `Run /${kind} from each agent’s own topic, or use <code>switchroom agent restart all</code> if you just want a plain restart without flushing sessions.`,
+        `Run /${kind} from each agent’s own topic, or use \`switchroom agent restart all\` if you just want a plain restart without flushing sessions.`,
       { html: true },
     )
     return
@@ -16470,9 +16418,9 @@ async function handleNewCommand(ctx: Context): Promise<void> {
   if (!isSelfTargetingCommand(name)) {
     await switchroomReply(
       ctx,
-      `/${kind} only supports the current agent (<b>${escapeHtmlForTg(getMyAgentName())}</b>). ` +
+      `/${kind} only supports the current agent (**${escapeHtmlForTg(getMyAgentName())}**). ` +
         `To restart another agent with a fresh session, run /${kind} from its own topic, ` +
-        `or use <code>switchroom agent restart ${escapeHtmlForTg(name)}</code>.`,
+        `or use \`switchroom agent restart ${escapeHtmlForTg(name)}\`.`,
       { html: true },
     )
     return
@@ -16484,7 +16432,7 @@ async function handleNewCommand(ctx: Context): Promise<void> {
   if (existing && Date.now() - existing.ts < 15_000) {
     await switchroomReply(
       ctx,
-      `⏳ Restart of <b>${escapeHtmlForTg(name)}</b> already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate /${kind}.`,
+      `⏳ Restart of **${escapeHtmlForTg(name)}** already in progress (${Math.round((Date.now() - existing.ts) / 1000)}s ago) — ignoring duplicate /${kind}.`,
       { html: true },
     )
     return
@@ -16503,8 +16451,7 @@ async function handleNewCommand(ctx: Context): Promise<void> {
     const sent = await retryWithThreadFallback<{ message_id: number }>(
       robustApiCall,
       (tid) =>
-        lockedBot.api.sendMessage(chatId, ackText, {
-          parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
           // /new /reset acknowledgement is a status notice — silence the
           // open ping (the post-restart greeting card is what matters).
           disable_notification: true,
@@ -16558,7 +16505,7 @@ async function handleNewCommand(ctx: Context): Promise<void> {
   clearRestartMarker()
   await switchroomReply(
     ctx,
-    `❌ <b>${escapeHtmlForTg(kind)} ${escapeHtmlForTg(name)} failed via hostd</b> ` +
+    `❌ **${escapeHtmlForTg(kind)} ${escapeHtmlForTg(name)} failed via hostd** ` +
       `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
       preBlock(hostdResp.error ?? '(no error message)'),
     { html: true },
@@ -16579,7 +16526,7 @@ bot.command('update', async ctx => {
     await runSwitchroomCommand(ctx, ['update', '--check'], 'update --check')
     await switchroomReply(
       ctx,
-      'Reply with <code>/update apply</code> to execute, or <code>/update apply --skip-images</code> to skip the image pull.',
+      'Reply with \`/update apply\` to execute, or \`/update apply --skip-images\` to skip the image pull.',
       { html: true },
     )
     return
@@ -16591,7 +16538,7 @@ bot.command('update', async ctx => {
   if (tokens[0] !== 'apply' && tokens[0] !== '--apply') {
     await switchroomReply(
       ctx,
-      'Usage: <code>/update</code> (dry-run) or <code>/update apply [--skip-images] [--rebuild]</code>',
+      'Usage: \`/update\` (dry-run) or \`/update apply [--skip-images] [--rebuild]\`',
       { html: true },
     )
     return
@@ -16605,8 +16552,8 @@ bot.command('update', async ctx => {
     if (!ALLOWED_FLAGS.has(tok)) {
       await switchroomReply(
         ctx,
-        `Refusing to pass unknown flag: <code>${escapeHtmlForTg(tok)}</code>. ` +
-        `Allowed: <code>--skip-images</code>, <code>--rebuild</code>.`,
+        `Refusing to pass unknown flag: \`${tok}\`. ` +
+        `Allowed: \`--skip-images\`, \`--rebuild\`.`,
         { html: true },
       )
       return
@@ -16639,16 +16586,16 @@ bot.command('update', async ctx => {
       // hostd hasn't been installed yet, or its daemon is down.
       await switchroomReply(
         ctx,
-        `❌ <b>/update apply</b> needs <code>hostd</code>, but its socket ` +
-        `for agent <code>${escapeHtmlForTg(myAgentName)}</code> isn't ` +
+        `❌ **/update apply** needs \`hostd\`, but its socket ` +
+        `for agent \`${myAgentName}\` isn't ` +
         `bound and in-container docker access isn't available either.\n\n` +
-        `<code>host_control.enabled</code> is on in <code>switchroom.yaml</code>, ` +
+        `\`host_control.enabled\` is on in \`switchroom.yaml\`, ` +
         `so hostd is the expected dispatch path — but no socket at ` +
-        `<code>/run/switchroom/hostd/${escapeHtmlForTg(myAgentName)}/sock</code>. ` +
+        `\`/run/switchroom/hostd/${escapeHtmlForTg(myAgentName)}/sock\`. ` +
         `On a fresh docker install this usually means hostd hasn't been ` +
         `installed yet.\n\n` +
-        `Run <code>switchroom hostd install</code> on the host to install + ` +
-        `start the daemon, then retry. Send <code>/upgradestatus</code> to ` +
+        `Run \`switchroom hostd install\` on the host to install + ` +
+        `start the daemon, then retry. Send \`/upgradestatus\` to ` +
         `re-check the daemon state from here.`,
         { html: true },
       )
@@ -16658,14 +16605,14 @@ bot.command('update', async ctx => {
       // pick one of: host CLI, or enable hostd.
       await switchroomReply(
         ctx,
-        `❌ <b>/update apply</b> needs docker access from inside the agent ` +
-        `container, but it's not available (no <code>docker</code> binary on ` +
-        `PATH, no <code>/var/run/docker.sock</code> mount) and ` +
-        `<code>host_control.enabled</code> is off.\n\n` +
-        `Either run <code>switchroom update</code> from the host shell, or ` +
-        `set <code>host_control.enabled: true</code> in ` +
-        `<code>switchroom.yaml</code> and run ` +
-        `<code>switchroom hostd install</code> on the host so this verb ` +
+        `❌ **/update apply** needs docker access from inside the agent ` +
+        `container, but it's not available (no \`docker\` binary on ` +
+        `PATH, no \`/var/run/docker.sock\` mount) and ` +
+        `\`host_control.enabled\` is off.\n\n` +
+        `Either run \`switchroom update\` from the host shell, or ` +
+        `set \`host_control.enabled: true\` in ` +
+        `\`switchroom.yaml\` and run ` +
+        `\`switchroom hostd install\` on the host so this verb ` +
         `can dispatch through the host-side daemon.`,
         { html: true },
       )
@@ -16695,9 +16642,9 @@ bot.command('update', async ctx => {
   // /restart handler (gateway.ts ~6273) so the boot-card lookup
   // (gateway.ts ~10393) finds chat_id + ack_message_id in the marker.
   const ackText =
-    `🚀 <b>update started</b> — running ${[
-      '<code>switchroom update</code>',
-      ...passthrough.map((t) => `<code>${escapeHtmlForTg(t)}</code>`),
+    `🚀 **update started** — running ${[
+      '\`switchroom update\`',
+      ...passthrough.map((t) => `\`${t}\``),
     ].join(' ')}\n` +
     `\nThe gateway will restart as part of the recreate step; watch ` +
     `for the post-restart greeting card to confirm completion.`
@@ -16707,9 +16654,7 @@ bot.command('update', async ctx => {
     const sent = await retryWithThreadFallback<{ message_id: number }>(
       robustApiCall,
       (tid) =>
-        lockedBot.api.sendMessage(chatId, ackText, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
+        lockedBot.api.sendRichMessage(chatId, richMessage(ackText), {
           // "update started" acknowledgement is a status notice — silence
           // the open ping (the post-restart greeting card is what matters).
           disable_notification: true,
@@ -16802,15 +16747,14 @@ bot.command('update', async ctx => {
         terminal.stdout_tail ??
         '(no error tail returned)'
       const editedText =
-        `🚀 <b>update started</b> — <b>FAILED</b> via hostd ` +
+        `🚀 **update started** — **FAILED** via hostd ` +
         `(result=${escapeHtmlForTg(terminal.result)}):\n` +
         preBlock(errBody)
       if (ackId != null) {
         try {
           await robustApiCall(
             () =>
-              lockedBot.api.editMessageText(chatId, ackId!, editedText, {
-                parse_mode: 'HTML',
+              lockedBot.api.editMessageText(chatId, ackId!, richMessage(editedText), {
                 link_preview_options: { is_disabled: true },
               }),
             { verb: 'update.poll.editAck' },
@@ -16838,7 +16782,7 @@ bot.command('update', async ctx => {
   clearRestartMarker()
   await switchroomReply(
     ctx,
-    `❌ <b>/update apply failed via hostd</b> ` +
+    `❌ **/update apply failed via hostd** ` +
       `(result=${escapeHtmlForTg(hostdResp.result)}):\n` +
       preBlock(hostdResp.error ?? '(no error message)'),
     { html: true },
@@ -16865,8 +16809,8 @@ bot.command('upgrade', async ctx => {
   if (!isAuthorizedSender(ctx)) return
   await switchroomReply(
     ctx,
-    'Did you mean <code>/upgradestatus</code> (no hyphen — Telegram slash-command grammar)? ' +
-    'Or <code>/update</code> to plan, <code>/update apply</code> to execute.',
+    'Did you mean \`/upgradestatus\` (no hyphen — Telegram slash-command grammar)? ' +
+    'Or \`/update\` to plan, \`/update apply\` to execute.',
     { html: true },
   )
 })
@@ -16882,7 +16826,7 @@ bot.command('audit', async ctx => {
   if (arg === '' || arg === 'help' || arg === '--help') {
     await switchroomReply(
       ctx,
-      'Usage: <code>/audit hostd [--tail N] [--agent &lt;name&gt;] [--op &lt;verb&gt;] [--error] [--verbose]</code>',
+      'Usage: \`/audit hostd [--tail N] [--agent <name>] [--op <verb>] [--error] [--verbose]\`',
       { html: true },
     )
     return
@@ -16892,8 +16836,8 @@ bot.command('audit', async ctx => {
   if (sub !== 'hostd') {
     await switchroomReply(
       ctx,
-      `Unknown audit target <code>${escapeHtmlForTg(sub ?? '')}</code>. ` +
-      `Supported: <code>hostd</code>.`,
+      `Unknown audit target \`${sub ?? ''}\`. ` +
+      `Supported: \`hostd\`.`,
       { html: true },
     )
     return
@@ -16913,22 +16857,22 @@ bot.command('audit', async ctx => {
     if (t === '--tail' || t === '--agent' || t === '--op') {
       const v = tokens[++i]
       if (v == null) {
-        await switchroomReply(ctx, `Flag <code>${t}</code> requires a value.`, { html: true })
+        await switchroomReply(ctx, `Flag \`${t}\` requires a value.`, { html: true })
         return
       }
       if (t === '--tail' && !/^[0-9]{1,4}$/.test(v)) {
-        await switchroomReply(ctx, `<code>--tail</code> must be an integer (1-9999).`, { html: true })
+        await switchroomReply(ctx, `\`--tail\` must be an integer (1-9999).`, { html: true })
         return
       }
       if (t === '--agent' && !/^[a-z][a-z0-9-]{0,62}$/i.test(v)) {
-        await switchroomReply(ctx, `<code>--agent</code> name has an invalid shape.`, { html: true })
+        await switchroomReply(ctx, `\`--agent\` name has an invalid shape.`, { html: true })
         return
       }
       if (t === '--op' && !ALLOWED_OPS.has(v)) {
         await switchroomReply(
           ctx,
-          `Unknown hostd verb <code>${escapeHtmlForTg(v)}</code>. ` +
-          `Known: ${[...ALLOWED_OPS].sort().map(o => `<code>${o}</code>`).join(', ')}.`,
+          `Unknown hostd verb \`${v}\`. ` +
+          `Known: ${[...ALLOWED_OPS].sort().map(o => `\`${o}\``).join(', ')}.`,
           { html: true },
         )
         return
@@ -16938,8 +16882,8 @@ bot.command('audit', async ctx => {
     }
     await switchroomReply(
       ctx,
-      `Unknown flag <code>${escapeHtmlForTg(t)}</code>. ` +
-      `Allowed: <code>--tail</code>, <code>--agent</code>, <code>--op</code>, <code>--error</code>, <code>--verbose</code>.`,
+      `Unknown flag \`${t}\`. ` +
+      `Allowed: \`--tail\`, \`--agent\`, \`--op\`, \`--error\`, \`--verbose\`.`,
       { html: true },
     )
     return
@@ -16988,7 +16932,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
   if (!details) {
     await switchroomReply(
       ctx,
-      `No pending permission for id <code>${escapeHtmlForTg(request_id)}</code>. It may have already been answered or timed out.`,
+      `No pending permission for id \`${request_id}\`. It may have already been answered or timed out.`,
       { html: true },
     )
     return
@@ -17007,10 +16951,10 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
   )
   const lbl = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  const suffix = details.tool_name ? ` (<code>${escapeHtmlForTg(details.tool_name)}</code>)` : ''
+  const suffix = details.tool_name ? ` (\`${details.tool_name}\`)` : ''
   await switchroomReply(
     ctx,
-    `${lbl}${suffix} via /${behavior} <code>${escapeHtmlForTg(request_id)}</code>`,
+    `${lbl}${suffix} via /${behavior} \`${request_id}\``,
     { html: true },
   )
 }
@@ -17088,9 +17032,9 @@ bot.command('pending', async ctx => {
     await switchroomReply(ctx, 'No pending permission prompts.')
     return
   }
-  const lines: string[] = ['<b>Pending permission prompts</b>']
+  const lines: string[] = ['**Pending permission prompts**']
   for (const [id, details] of pendingPermissions.entries()) {
-    lines.push(`• <code>${escapeHtmlForTg(id)}</code> — ${escapeHtmlForTg(details.tool_name)}`)
+    lines.push(`• \`${id}\` — ${escapeHtmlForTg(details.tool_name)}`)
   }
   await switchroomReply(ctx, lines.join('\n'), { html: true })
 })
@@ -17290,7 +17234,8 @@ function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): vo
   const html = renderFallbackFailureNotice(triggerAgent, reason)
   for (const chat_id of access.allowFrom) {
     void swallowingApiCall(
-      () => bot.api.sendMessage(chat_id, html, { parse_mode: 'HTML' as const }),
+      // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+      () => bot.api.sendRichMessage(chat_id, richMessage(html), {}),
       { chat_id, verb: 'fleet-fallback:failure-notify' },
     )
   }
@@ -17380,10 +17325,11 @@ async function doFireFleetAutoFallback(triggerAgent: string, untilMs?: number): 
     if (access.allowFrom.length === 0) return outcome.kind === 'switched'
     // Account-switch / all-blocked announcement is a system status notice,
     // not the user's answer — silence the open ping.
-    const opts = { parse_mode: 'HTML' as const, disable_notification: true }
+    const opts = { disable_notification: true }
     for (const chat_id of access.allowFrom) {
       void swallowingApiCall(
-        () => bot.api.sendMessage(chat_id, outcome.announcement, opts),
+        // allow-raw-bot-api: wrapped in swallowingApiCall (retry policy)
+        () => bot.api.sendRichMessage(chat_id, richMessage(outcome.announcement), opts),
         { chat_id, verb: 'fleet-fallback:notify' },
       )
     }
@@ -17471,9 +17417,7 @@ async function runCreditWatch(): Promise<void> {
     // contract enforced by scripts/check-bot-api-wrapping.sh (#1075).
     await swallowingApiCall(
       () =>
-        bot.api.sendMessage(chat_id, decision.message, {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
+        bot.api.sendRichMessage(chat_id, richMessage(decision.message), {
           // Credit/quota warning is a system status notice — silence the
           // open ping (the user isn't waiting to tap anything).
           disable_notification: true,
@@ -17613,9 +17557,7 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
         }
         await swallowingApiCall(
           () =>
-            bot.api.sendMessage(chat_id, fleetDecision.message, {
-              parse_mode: 'HTML',
-              link_preview_options: { is_disabled: true },
+            bot.api.sendRichMessage(chat_id, richMessage(fleetDecision.message), {
               // Quota status notice — silence the open ping.
               disable_notification: true,
             }),
@@ -17836,9 +17778,7 @@ async function runQuotaWatch(opts: { bootTick?: boolean } = {}): Promise<void> {
       // contract enforced by scripts/check-bot-api-wrapping.sh (#1075).
       await swallowingApiCall(
         () =>
-          bot.api.sendMessage(chat_id, message, {
-            parse_mode: 'HTML',
-            link_preview_options: { is_disabled: true },
+          bot.api.sendRichMessage(chat_id, richMessage(message), {
             // Quota throttling status notice — silence the open ping.
             disable_notification: true,
           }),
@@ -17869,8 +17809,7 @@ async function editMicrosoftConnectCard(
 ): Promise<void> {
   await robustApiCall(
     // allow-raw-bot-api: background connect-card edit by message id (no thread_id; not the reply chunk loop)
-    () => bot.api.editMessageText(chatId, messageId, html, {
-      parse_mode: 'HTML',
+    () => bot.api.editMessageText(chatId, messageId, richMessage(html), {
       link_preview_options: { is_disabled: true },
     }),
     { chat_id: String(chatId), verb: 'microsoftConnectCard' },
@@ -17898,21 +17837,21 @@ async function finalizeMicrosoftConnect(key: string): Promise<void> {
   let html: string
   if (result.kind === 'connected') {
     html =
-      `✅ <b>Connected</b> <code>${escapeHtmlForTg(result.account)}</code> ` +
+      `✅ **Connected** \`${result.account}\` ` +
       `(${result.accountType}).\n\n` +
-      `To let <b>${escapeHtmlForTg(agentName)}</b> use it, run on the host:\n` +
-      `<code>switchroom auth microsoft enable ${escapeHtmlForTg(result.account)} ${escapeHtmlForTg(agentName)}</code>\n` +
+      `To let **${escapeHtmlForTg(agentName)}** use it, run on the host:\n` +
+      `\`switchroom auth microsoft enable ${escapeHtmlForTg(result.account)} ${escapeHtmlForTg(agentName)}\`\n` +
       `then restart ${escapeHtmlForTg(agentName)}.`
   } else if (result.kind === 'no-refresh-token') {
     html =
       `⚠ Microsoft returned no refresh token (the account would expire in ~1h), ` +
-      `so it was not registered. Try <code>/connect microsoft</code> again, or ` +
+      `so it was not registered. Try \`/connect microsoft\` again, or ` +
       `connect from the host CLI.`
   } else {
     html =
-      `❌ <b>Connect failed:</b> ${escapeHtmlForTg(result.message)}\n\n` +
-      `<i>Work/school accounts can't use the phone flow at /common — connect those ` +
-      `from the host: <code>switchroom auth microsoft account add &lt;email&gt;</code>.</i>`
+      `❌ **Connect failed:** ${escapeHtmlForTg(result.message)}\n\n` +
+      `_Work/school accounts can't use the phone flow at /common — connect those ` +
+      `from the host: \`switchroom auth microsoft account add <email>\`._`
   }
   await editMicrosoftConnectCard(flow.cardChatId, flow.cardMessageId, html)
 }
@@ -17942,7 +17881,7 @@ bot.command('connect', async ctx => {
       )
       await switchroomReply(
         ctx,
-        `⚠️ <code>/connect</code> links account credentials — it is <b>operator-private</b>. ` +
+        `⚠️ \`/connect\` links account credentials — it is **operator-private**. ` +
           `Send it as a direct message to me from your operator account (a private chat where ` +
           `your Telegram ID is on the access allowlist), not in a group or forum.`,
         { html: true },
@@ -17969,8 +17908,8 @@ bot.command('connect', async ctx => {
   if (!isAuthAdmin({ isAdmin })) {
     await switchroomReply(
       ctx,
-      `<b>Not authorized.</b> <code>/connect</code> requires this agent to have ` +
-        `<code>admin: true</code> in switchroom.yaml.`,
+      `**Not authorized.** \`/connect\` requires this agent to have ` +
+        `\`admin: true\` in switchroom.yaml.`,
       { html: true },
     )
     return
@@ -17979,7 +17918,7 @@ bot.command('connect', async ctx => {
   if (arg === 'cancel') {
     const existing = pendingMicrosoftConnectFlows.get(key)
     if (!existing) {
-      await switchroomReply(ctx, '<i>No pending connect flow in this chat.</i>', { html: true })
+      await switchroomReply(ctx, '_No pending connect flow in this chat._', { html: true })
       return
     }
     existing.cancelled = true
@@ -17991,9 +17930,9 @@ bot.command('connect', async ctx => {
   if (arg !== '' && arg !== 'microsoft' && arg !== 'ms') {
     await switchroomReply(
       ctx,
-      `<b>Usage:</b> <code>/connect microsoft</code> to link a Microsoft account ` +
-        `(Outlook / Office 365), or <code>/connect cancel</code>.\n` +
-        `<i>Google accounts are connected from the host CLI.</i>`,
+      `**Usage:** \`/connect microsoft\` to link a Microsoft account ` +
+        `(Outlook / Office 365), or \`/connect cancel\`.\n` +
+        `_Google accounts are connected from the host CLI._`,
       { html: true },
     )
     return
@@ -18002,8 +17941,8 @@ bot.command('connect', async ctx => {
   if (pendingMicrosoftConnectFlows.has(key)) {
     await switchroomReply(
       ctx,
-      '<i>A Microsoft connect flow is already in progress here. Finish it on your phone, ' +
-        'or send <code>/connect cancel</code>.</i>',
+      '_A Microsoft connect flow is already in progress here. Finish it on your phone, ' +
+        'or send \`/connect cancel\`._',
       { html: true },
     )
     return
@@ -18023,9 +17962,9 @@ bot.command('connect', async ctx => {
   if (started.kind === 'byo-vault') {
     await switchroomReply(
       ctx,
-      `<b>Can't connect from chat:</b> this install uses a vaulted custom Microsoft ` +
-        `app (<code>${escapeHtmlForTg(started.ref)}</code>) only the host CLI can read. ` +
-        `Run <code>switchroom auth microsoft account add &lt;email&gt;</code> on the host.`,
+      `**Can't connect from chat:** this install uses a vaulted custom Microsoft ` +
+        `app (\`${started.ref}\`) only the host CLI can read. ` +
+        `Run \`switchroom auth microsoft account add <email>\` on the host.`,
       { html: true },
     )
     return
@@ -18033,7 +17972,7 @@ bot.command('connect', async ctx => {
   if (started.kind === 'error') {
     await switchroomReply(
       ctx,
-      `<b>/connect failed:</b> ${escapeHtmlForTg(started.message)}`,
+      `**/connect failed:** ${escapeHtmlForTg(started.message)}`,
       { html: true },
     )
     return
@@ -18041,21 +17980,21 @@ bot.command('connect', async ctx => {
 
   const appNote =
     started.source === 'default'
-      ? "<i>Using switchroom's shipped Microsoft app.</i>"
-      : '<i>Using your configured Microsoft app.</i>'
+      ? "_Using switchroom's shipped Microsoft app._"
+      : '_Using your configured Microsoft app._'
   const keyboard = new InlineKeyboard()
     .url('🔐 Sign in to Microsoft', started.device.verification_uri)
     .row()
     .text('✖ Cancel', `cn:cancel:${key}`)
-  const sent = await ctx.reply(
-    `🔗 <b>Connect a Microsoft account</b>\n\n` +
-      `1. Tap <b>Sign in to Microsoft</b> below.\n` +
-      `2. Enter this code: <code>${escapeHtmlForTg(started.device.user_code)}</code>\n` +
+  const sent = await ctx.replyWithRichMessage(
+    richMessage(
+      `🔗 **Connect a Microsoft account**\n\n` +
+      `1. Tap **Sign in to Microsoft** below.\n` +
+      `2. Enter this code: \`${started.device.user_code}\`\n` +
       `3. Approve the requested permissions (Mail, Calendar, Files).\n\n` +
       `I'll confirm here once it's connected (within ~15 min).\n${appNote}`,
+    ),
     {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
       reply_markup: keyboard,
       ...(ctx.message?.message_thread_id != null
         ? { message_thread_id: ctx.message.message_thread_id }
@@ -18106,7 +18045,7 @@ bot.command("auth", async ctx => {
       )
       await switchroomReply(
         ctx,
-        `⚠️ <code>/auth</code> manages account credentials — it is <b>operator-private</b>. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
+        `⚠️ \`/auth\` manages account credentials — it is **operator-private**. Send it as a direct message to me from your operator account (a private chat where your Telegram ID is on the access allowlist), not in a group or forum.`,
         { html: true },
       ).catch(() => {})
     }
@@ -18145,10 +18084,10 @@ bot.command("auth", async ctx => {
     if (!isAuthAdmin({ isAdmin })) {
       await switchroomReply(
         ctx,
-        `<b>Not authorized.</b> <code>/auth ${parsed.kind}</code> is admin-only.\n` +
-          `Set <code>admin: true</code> on this agent in switchroom.yaml to unlock ` +
-          `(the same flag that gates <code>/agents</code>, <code>/restart</code>, ` +
-          `<code>/update</code> etc.).`,
+        `**Not authorized.** \`/auth ${parsed.kind}\` is admin-only.\n` +
+          `Set \`admin: true\` on this agent in switchroom.yaml to unlock ` +
+          `(the same flag that gates \`/agents\`, \`/restart\`, ` +
+          `\`/update\` etc.).`,
         { html: true },
       )
       return
@@ -18161,7 +18100,7 @@ bot.command("auth", async ctx => {
     if (parsed.kind === 'cancel') {
       const existing = pendingAuthAddFlows.get(authAddKey)
       if (!existing) {
-        await switchroomReply(ctx, "<i>No pending <code>/auth add</code> flow in this chat.</i>", { html: true })
+        await switchroomReply(ctx, "_No pending \`/auth add\` flow in this chat._", { html: true })
         return
       }
       cancelAccountAuthSession(existing)
@@ -18173,8 +18112,8 @@ bot.command("auth", async ctx => {
     if (pendingAuthAddFlows.has(authAddKey)) {
       await switchroomReply(
         ctx,
-        "<i>An <code>/auth add</code> flow is already in progress for this chat. " +
-          "Finish the paste, or send <code>/auth cancel</code> to abort.</i>",
+        "_An \`/auth add\` flow is already in progress for this chat. " +
+          "Finish the paste, or send \`/auth cancel\` to abort._",
         { html: true },
       )
       return
@@ -18190,17 +18129,17 @@ bot.command("auth", async ctx => {
       })
       await switchroomReply(
         ctx,
-        `<b>Adding account</b> <code>${escapeHtmlForTg(parsed.label)}</code>\n\n` +
+        `**Adding account** \`${parsed.label}\`\n\n` +
           `1. Open this URL on your phone:\n${loginUrl}\n\n` +
           `2. Log into Anthropic, copy the code Claude shows.\n` +
           `3. Paste it back here.\n\n` +
-          `Send <code>/auth cancel</code> to abort.`,
+          `Send \`/auth cancel\` to abort.`,
         { html: true },
       )
     } catch (err) {
       await switchroomReply(
         ctx,
-        `<b>/auth add failed:</b> ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
+        `**/auth add failed:** ${escapeHtmlForTg((err as Error)?.message ?? String(err))}`,
         { html: true },
       )
     }
@@ -18209,7 +18148,7 @@ bot.command("auth", async ctx => {
 
   const client = await getAuthBrokerClient(currentAgent)
   if (!client) {
-    await switchroomReply(ctx, "<b>/auth unavailable:</b> auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
+    await switchroomReply(ctx, "**/auth unavailable:** auth-broker client is not loaded (post-RFC-H rewire in progress?).", { html: true })
     return
   }
   const reply = await handleAuthCommand(parsed, {
@@ -18461,7 +18400,7 @@ async function handleVaultRecentDenialCallback(ctx: Context, data: string): Prom
     return
   }
   if (result.kind === 'error') {
-    await switchroomReply(ctx, `<b>mint_grant failed:</b> ${escapeHtmlForTg(result.msg)}`, { html: true })
+    await switchroomReply(ctx, `**mint_grant failed:** ${escapeHtmlForTg(result.msg)}`, { html: true })
     return
   }
   // Write the token to the agent's .vault-token file — same flow as the
@@ -18475,10 +18414,10 @@ async function handleVaultRecentDenialCallback(ctx: Context, data: string): Prom
   } catch (err) {
     await switchroomReply(
       ctx,
-      `<b>Grant created (${escapeHtmlForTg(id)}) but token write failed:</b> ` +
+      `**Grant created (${escapeHtmlForTg(id)}) but token write failed:** ` +
       `${escapeHtmlForTg(String(err))}\n` +
-      `<i>Recover with: <code>switchroom vault grant ${escapeHtmlForTg(agentName)} ` +
-      `--keys ${escapeHtmlForTg(keyName)} --duration 30d</code> on the host.</i>`,
+      `_Recover with: \`switchroom vault grant ${escapeHtmlForTg(agentName)} ` +
+      `--keys ${escapeHtmlForTg(keyName)} --duration 30d\` on the host._`,
       { html: true },
     )
     return
@@ -18503,14 +18442,13 @@ async function handleVaultRecentDenialCallback(ctx: Context, data: string): Prom
     ? escapeHtmlForTg(sourceMsg.text)
     : ''
   const statusLine =
-    `\n\n✅ <b>${escapeHtmlForTg(agentName)}</b> granted read access to ` +
-    `<code>${escapeHtmlForTg(keyName)}</code> for 30 days ` +
-    `(grant <code>${escapeHtmlForTg(id)}</code>). ` +
+    `\n\n✅ **${escapeHtmlForTg(agentName)}** granted read access to ` +
+    `\`${keyName}\` for 30 days ` +
+    `(grant \`${id}\`). ` +
     `Re-run /vault audit to act on remaining denials.`
   await finalizeCallback(ctx, {
     ackText: '✅ Grant minted',
     newText: baseText ? `${baseText}${statusLine}` : statusLine,
-    parseMode: 'HTML',
     // No synthInbound — operator-only flow. The granted agent picks
     // up the token via .vault-token file on next CLI invocation; no
     // turn-wake needed.
@@ -18577,11 +18515,11 @@ async function performVaultAccessApproval(
             .editMessageText(
               pending.chat_id,
               pending.card_message_id,
-              `ℹ️ <b>${escapeHtmlForTg(pending.agent)}</b> already has standing-ACL access to ` +
-              `<code>${escapeHtmlForTg(pending.key)}</code> (schedule.secrets[]). ` +
-              `<b>No grant minted</b> — a token would shadow the standing ACL. ` +
-              `The agent can read it directly.`,
-              { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+              `ℹ️ **${escapeHtmlForTg(pending.agent)}** already has standing-ACL access to ` +
+              `\`${pending.key}\` (schedule.secrets[]). ` +
+              `**No grant minted** — a token would shadow the standing ACL. ` +
+              richMessage(`The agent can read it directly.`),
+              { reply_markup: { inline_keyboard: [] } },
             )
             .catch(() => {})
         }
@@ -18675,8 +18613,8 @@ async function performVaultAccessApproval(
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `<b>mint_grant failed:</b> ${escapeHtmlForTg(result.msg)}`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage(`**mint_grant failed:** ${escapeHtmlForTg(result.msg)}`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -18691,10 +18629,10 @@ async function performVaultAccessApproval(
   } catch (err) {
     await switchroomReply(
       ctx,
-      `<b>Grant created (${escapeHtmlForTg(id)}) but token write failed:</b> ` +
+      `**Grant created (${escapeHtmlForTg(id)}) but token write failed:** ` +
       `${escapeHtmlForTg(String(err))}\n` +
-      `<i>Recover with: <code>switchroom vault grant ${escapeHtmlForTg(pending.agent)} ` +
-      `--keys ${escapeHtmlForTg(pending.key)} --duration ${Math.round(pending.ttl_seconds / 86400)}d</code> on the host.</i>`,
+      `_Recover with: \`switchroom vault grant ${escapeHtmlForTg(pending.agent)} ` +
+      `--keys ${escapeHtmlForTg(pending.key)} --duration ${Math.round(pending.ttl_seconds / 86400)}d\` on the host._`,
       { html: true },
     )
     return
@@ -18705,16 +18643,16 @@ async function performVaultAccessApproval(
     const days = Math.round(pending.ttl_seconds / 86400)
     const footer =
       VAULT_APPROVAL_AUTH_MODE === 'telegram-id'
-        ? `\n<i>Approver verified by Telegram identity — broker auto-unlocked at startup.</i>`
+        ? `\n_Approver verified by Telegram identity — broker auto-unlocked at startup._`
         : ''
     await ctx.api
       .editMessageText(
         pending.chat_id,
         pending.card_message_id,
-        `✅ Granted <b>${escapeHtmlForTg(pending.agent)}</b> ${pending.scope} access to ` +
-        `<code>${escapeHtmlForTg(pending.key)}</code> for ${days}d. ` +
-        `(grant <code>${escapeHtmlForTg(id)}</code>)` + footer,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        `✅ Granted **${escapeHtmlForTg(pending.agent)}** ${pending.scope} access to ` +
+        `\`${pending.key}\` for ${days}d. ` +
+        richMessage(`(grant \`${id}\`)` + footer),
+        { reply_markup: { inline_keyboard: [] } },
       )
       .catch(() => {})
   }
@@ -18780,8 +18718,8 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
         .editMessageText(
           ctx.callbackQuery.message.chat.id,
           ctx.callbackQuery.message.message_id,
-          '⌛ <i>This access-request card expired before you tapped. Ask the agent to re-issue if the need still stands.</i>',
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage('⌛ _This access-request card expired before you tapped. Ask the agent to re-issue if the need still stands._'),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -18796,8 +18734,8 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `🚫 <i>Denied. <b>${escapeHtmlForTg(pending.agent)}</b> will not get access to <code>${escapeHtmlForTg(pending.key)}</code>.</i>`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage(`🚫 _Denied. **${escapeHtmlForTg(pending.agent)}** will not get access to \`${pending.key}\`._`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -18861,8 +18799,8 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
           .editMessageText(
             pending.chat_id,
             pending.card_message_id,
-            `✅ Approved by @${escapeHtmlForTg(username)} — minting…`,
-            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+            richMessage(`✅ Approved by @${escapeHtmlForTg(username)} — minting…`),
+            { reply_markup: { inline_keyboard: [] } },
           )
           .catch(() => {})
       }
@@ -18918,13 +18856,13 @@ async function handleVaultRequestAccessCallback(ctx: Context, data: string): Pro
           pending.chat_id,
           pending.card_message_id,
           joiningBatch
-            ? `🔐 <b>Queued behind an earlier card.</b> Type your passphrase as your next message — it covers <b>${items.length}</b> pending approvals in this chat (one entry mints all grants, no re-type per card).`
+            ? `🔐 **Queued behind an earlier card.** Type your passphrase as your next message — it covers **${items.length}** pending approvals in this chat (one entry mints all grants, no re-type per card).`
             : isAdminOnly
-            ? `🔒 <b>Admin-only credential.</b> <code>${escapeHtmlForTg(pending.key)}</code> requires your vault passphrase to grant — reply with it as your next message and we'll mint the grant for <b>${escapeHtmlForTg(pending.agent)}</b>, then delete the passphrase message.\n\n` +
-              `<i>The passphrase is what proves it's you: an agent can never mint this key on its own.</i>`
-            : `🔐 <b>Vault is locked.</b> Reply with your passphrase as your next message — we'll unlock, mint the grant for <b>${escapeHtmlForTg(pending.agent)}</b>, and delete the passphrase message in one step.\n\n` +
-              `<i>Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches.</i>`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+            ? `🔒 **Admin-only credential.** \`${pending.key}\` requires your vault passphrase to grant — reply with it as your next message and we'll mint the grant for **${escapeHtmlForTg(pending.agent)}**, then delete the passphrase message.\n\n` +
+              `_The passphrase is what proves it's you: an agent can never mint this key on its own._`
+            : `🔐 **Vault is locked.** Reply with your passphrase as your next message — we'll unlock, mint the grant for **${escapeHtmlForTg(pending.agent)}**, and delete the passphrase message in one step.\n\n` +
+              richMessage(`_Mint authority stays operator-only: the broker only accepts the grant when the passphrase matches._`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
       return
@@ -18961,8 +18899,8 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         .editMessageText(
           ctx.callbackQuery.message.chat.id,
           ctx.callbackQuery.message.message_id,
-          '⌛ <i>This vault-save card expired before you tapped. Ask the agent to re-issue if you still want to save.</i>',
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage('⌛ _This vault-save card expired before you tapped. Ask the agent to re-issue if you still want to save._'),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -18977,8 +18915,8 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `🚫 <i>Discarded. The secret was not written to the vault.</i>`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage(`🚫 _Discarded. The secret was not written to the vault._`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -19027,12 +18965,11 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       ? escapeHtmlForTg(sourceMsg.text)
       : ''
     const statusLine =
-      `\n\n✏️ <b>Rename mode</b> — send the new key name as your next message. ` +
-      `The current proposed key is <code>${escapeHtmlForTg(pending.key)}</code>.`
+      `\n\n✏️ **Rename mode** — send the new key name as your next message. ` +
+      `The current proposed key is \`${pending.key}\`.`
     await finalizeCallback(ctx, {
       ackText: 'Send the new key name as your next message.',
       newText: baseText ? `${baseText}${statusLine}` : statusLine,
-      parseMode: 'HTML',
     })
     return
   }
@@ -19071,8 +19008,8 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
             .editMessageText(
               pending.chat_id,
               pending.card_message_id,
-              `🔒 <b>Passphrase not cached for this chat.</b> Run <code>/vault unlock</code> (or any /vault command) to cache it, then tap Save again on the next card.`,
-              { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+              richMessage(`🔒 **Passphrase not cached for this chat.** Run \`/vault unlock\` (or any /vault command) to cache it, then tap Save again on the next card.`),
+              { reply_markup: { inline_keyboard: [] } },
             )
             .catch(() => {})
         }
@@ -19093,14 +19030,14 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
       const rendered = renderVaultCliError(parsed, { verb: 'save', key: pending.key })
       const body = rendered.suppressRaw
         ? rendered.html
-        : `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>`
+        : `⚠️ vault write failed:\n\`\`\`\n${write.output}\n\`\`\``
       if (pending.card_message_id != null) {
         await ctx.api
           .editMessageText(
             pending.chat_id,
             pending.card_message_id,
-            `${body}\n\n<i>Tap a fresh card after fixing the underlying issue.</i>`,
-            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+            richMessage(`${body}\n\n_Tap a fresh card after fixing the underlying issue._`),
+            { reply_markup: { inline_keyboard: [] } },
           )
           .catch(() => {})
       }
@@ -19138,8 +19075,8 @@ async function handleVaultRequestSaveCallback(ctx: Context, data: string): Promi
         .editMessageText(
           pending.chat_id,
           pending.card_message_id,
-          `✅ saved as <code>vault:${escapeHtmlForTg(pending.key)}</code> (masked: <code>${escapeHtmlForTg(maskToken(pending.value))}</code>)\n<i>The agent can now reference this as <code>vault:${escapeHtmlForTg(pending.key)}</code>.</i>`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+          richMessage(`✅ saved as \`vault:${escapeHtmlForTg(pending.key)}\` (masked: \`${escapeHtmlForTg(maskToken(pending.value))}\`)\n_The agent can now reference this as \`vault:${escapeHtmlForTg(pending.key)}\`._`),
+          { reply_markup: { inline_keyboard: [] } },
         )
         .catch(() => {})
     }
@@ -19262,8 +19199,8 @@ async function handleVaultDeferCallback(ctx: Context, data: string): Promise<voi
     await ctx.answerCallbackQuery({ text: 'Send your passphrase…' }).catch(() => {})
     await ctx
       .editMessageText(
-        '🔐 Send your vault passphrase as your next message — we\'ll save the held secret automatically and delete the passphrase message.',
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        richMessage('🔐 Send your vault passphrase as your next message — we\'ll save the held secret automatically and delete the passphrase message.'),
+        { reply_markup: { inline_keyboard: [] } },
       )
       .catch(() => {})
     return
@@ -19348,7 +19285,7 @@ async function startGrantWizardStep1(ctx: Context, chatId: string): Promise<void
     return
   }
   const kb = buildGrantAgentKeyboard(agents)
-  const sent = await switchroomReply(ctx, '<b>Grant capability token — Step 1/3</b>\n\nWhich agent?', { html: true, reply_markup: kb })
+  const sent = await switchroomReply(ctx, '**Grant capability token — Step 1/3**\n\nWhich agent?', { html: true, reply_markup: kb })
   const wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
   pendingVaultOps.set(chatId, {
     kind: 'grant-wizard',
@@ -19367,16 +19304,16 @@ async function grantWizardStep2(ctx: Context, chatId: string, agent: string, wiz
     return
   }
   if (keys.length === 0) {
-    await switchroomReply(ctx, '⚠️ No vault keys found. Add secrets first with <code>/vault set</code>.', { html: true })
+    await switchroomReply(ctx, '⚠️ No vault keys found. Add secrets first with \`/vault set\`.', { html: true })
     pendingVaultOps.delete(chatId)
     return
   }
   const selected = new Set<string>()
   const kb = buildGrantKeysKeyboard(keys, selected)
-  const text = `<b>Grant capability token — Step 2/3</b>\n\nWhich keys for <code>${escapeHtmlForTg(agent)}</code>?\n<i>Tap to toggle; tap Continue when done.</i>`
+  const text = `**Grant capability token — Step 2/3**\n\nWhich keys for \`${agent}\`?\n_Tap to toggle; tap Continue when done._`
   if (wizardMsgId != null) {
     // allow-raw-bot-api: vault grant wizard step 2/3; already .catch-swallows, tap-driven UI re-renders on retry
-    await ctx.api.editMessageText(chatId, wizardMsgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+    await ctx.api.editMessageText(chatId, wizardMsgId, richMessage(text), { reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
     wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
@@ -19395,12 +19332,12 @@ async function grantWizardStep2(ctx: Context, chatId: string, agent: string, wiz
 /** Advance grant wizard to step 3 (pick duration). */
 async function grantWizardStep3(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
   const kb = buildGrantDurationKeyboard()
-  const keyList = state.selectedKeys!.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')
-  const text = `<b>Grant capability token — Step 3/3</b>\n\nKeys for <code>${escapeHtmlForTg(state.agent!)}</code>:\n${keyList}\n\nHow long should this grant be valid?`
+  const keyList = state.selectedKeys!.map(k => `• \`${k}\``).join('\n')
+  const text = `**Grant capability token — Step 3/3**\n\nKeys for \`${state.agent!}\`:\n${keyList}\n\nHow long should this grant be valid?`
   const msgId = state.wizardMsgId
   if (msgId != null) {
     // allow-raw-bot-api: vault grant wizard step 3/3 (TTL select); already .catch-swallows, tap-driven UI re-renders on retry
-    await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+    await ctx.api.editMessageText(chatId, msgId, richMessage(text), { reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
     state.wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
@@ -19412,20 +19349,20 @@ async function grantWizardStep3(ctx: Context, chatId: string, state: Extract<Pen
 async function grantWizardConfirm(ctx: Context, chatId: string, state: Extract<PendingVaultOp, { kind: 'grant-wizard' }>): Promise<void> {
   const kb = buildGrantConfirmKeyboard()
   const expiresLabel = formatGrantExpiry(state.ttlSeconds!)
-  const keyList = state.selectedKeys!.map(k => `• <code>${escapeHtmlForTg(k)}</code>`).join('\n')
+  const keyList = state.selectedKeys!.map(k => `• \`${k}\``).join('\n')
   const text = [
-    '<b>Confirm grant</b>',
+    '**Confirm grant**',
     '',
-    `Agent: <code>${escapeHtmlForTg(state.agent!)}</code>`,
+    `Agent: \`${state.agent!}\``,
     `Keys:\n${keyList}`,
-    `Expires: <b>${escapeHtmlForTg(expiresLabel)}</b>`,
+    `Expires: **${escapeHtmlForTg(expiresLabel)}**`,
     '',
-    'Tap <b>Generate</b> to mint the token.',
+    'Tap **Generate** to mint the token.',
   ].join('\n')
   const msgId = state.wizardMsgId
   if (msgId != null) {
     // allow-raw-bot-api: vault grant wizard confirm step; already .catch-swallows, tap-driven UI re-renders on retry
-    await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: 'HTML', reply_markup: kb }).catch(() => {})
+    await ctx.api.editMessageText(chatId, msgId, richMessage(text), { reply_markup: kb }).catch(() => {})
   } else {
     const sent = await switchroomReply(ctx, text, { html: true, reply_markup: kb })
     state.wizardMsgId = (sent as unknown as { message_id?: number })?.message_id
@@ -19484,7 +19421,7 @@ async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<P
     return
   }
   if (result.kind === 'error') {
-    await switchroomReply(ctx, `<b>mint_grant failed:</b> ${escapeHtmlForTg(result.msg)}`, { html: true })
+    await switchroomReply(ctx, `**mint_grant failed:** ${escapeHtmlForTg(result.msg)}`, { html: true })
     return
   }
   // Write token to the agent's .vault-token file
@@ -19494,7 +19431,7 @@ async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<P
     mkdirSync(join(homedir(), '.switchroom', 'agents', state.agent!), { recursive: true })
     writeFileSync(tokenPath, token, { mode: 0o600 })
   } catch (err) {
-    await switchroomReply(ctx, `<b>Grant created but token write failed:</b> ${escapeHtmlForTg(String(err))}`, { html: true })
+    await switchroomReply(ctx, `**Grant created but token write failed:** ${escapeHtmlForTg(String(err))}`, { html: true })
     return
   }
   // Collapse wizard message to just the outcome.
@@ -19505,12 +19442,11 @@ async function executeGrantWizard(ctx: Context, chatId: string, state: Extract<P
   // Strip the keyboard atomically with the success text via the
   // finalizeCallback helper.
   const msgId = state.wizardMsgId
-  const successText = `✅ Grant <code>${escapeHtmlForTg(id)}</code> created. Written to <code>~/.switchroom/agents/${escapeHtmlForTg(state.agent!)}/.vault-token</code>`
+  const successText = `✅ Grant \`${id}\` created. Written to \`~/.switchroom/agents/${escapeHtmlForTg(state.agent!)}/.vault-token\``
   if (msgId != null) {
     await finalizeCallback(ctx, {
       ackText: '✅ Grant created',
       newText: successText,
-      parseMode: 'HTML',
       // No synthInbound — operator-only flow.
     })
   } else {
@@ -19561,15 +19497,14 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
       return
     }
     const cardText =
-      `🗑 Revoke <code>${escapeHtmlForTg(grantId)}</code>?\n` +
-      `Agent: <b>${escapeHtmlForTg(grant.agent_slug)}</b>\n` +
-      `Keys: <code>${escapeHtmlForTg(grant.key_allow.join(', '))}</code>`
+      `🗑 Revoke \`${grantId}\`?\n` +
+      `Agent: **${escapeHtmlForTg(grant.agent_slug)}**\n` +
+      `Keys: \`${escapeHtmlForTg(grant.key_allow.join(', '))}\``
     const confirmKeyboard = new InlineKeyboard()
       .text('✅ Confirm Revoke', `vg:confirm:${grantId}`)
       .text('❌ Cancel', `vg:cancel:${grantId}`)
     await ctx.answerCallbackQuery().catch(() => {})
-    await ctx.editMessageText(cardText, {
-      parse_mode: 'HTML',
+    await ctx.editMessageText(richMessage(cardText), {
       reply_markup: confirmKeyboard,
     }).catch(async () => {
       const chatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
@@ -19578,8 +19513,7 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
         // #1075: thread-id-bearing — swallow on THREAD_NOT_FOUND.
         await swallowingApiCall(
           () =>
-            bot.api.sendMessage(chatId, cardText, {
-              parse_mode: 'HTML',
+            bot.api.sendRichMessage(chatId, richMessage(cardText), {
               reply_markup: confirmKeyboard,
               ...(threadId != null ? { message_thread_id: threadId } : {}),
             }),
@@ -19608,8 +19542,8 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
     }
     await ctx.answerCallbackQuery({ text: '✅ Revoked' }).catch(() => {})
     await ctx.editMessageText(
-      `✅ Grant <code>${escapeHtmlForTg(grantId)}</code> revoked. Token file removed.`,
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      richMessage(`✅ Grant \`${grantId}\` revoked. Token file removed.`),
+      { reply_markup: { inline_keyboard: [] } },
     ).catch(() => {})
     return
   }
@@ -19724,8 +19658,8 @@ async function handleVaultGrantCallback(ctx: Context, data: string): Promise<voi
         // `.catch(() => {})` would swallow the failure silently — same
         // hazard PR #1158 caught on the operator-event card.
         await ctx.editMessageText(
-          escapeHtmlForTg(msg.text) + '\n\n<i>Send a duration like <code>30d</code> or <code>12h</code>:</i>',
-          { parse_mode: 'HTML', reply_markup: buildGrantDurationKeyboard() },
+          richMessage(escapeHtmlForTg(msg.text) + '\n\n_Send a duration like \`30d\` or \`12h\`:_'),
+          { reply_markup: buildGrantDurationKeyboard() },
         ).catch(() => {})
       }
       await ackSilently()
@@ -19827,15 +19761,14 @@ async function executeDeferredSecretSave(
     const rendered = renderVaultCliError(parsed, { verb: "save", key: slug })
     const body = rendered.suppressRaw
       ? rendered.html
-      : `⚠️ vault write failed:\n<pre>${escapeHtmlForTg(write.output)}</pre>`
+      : `⚠️ vault write failed:\n\`\`\`\n${write.output}\n\`\`\``
     if (cardMessageId != null) {
       await ctx.api
         .editMessageText(
           deferred.chat_id,
           cardMessageId,
-          `${body}\n\nRe-tap to retry.`,
+          richMessage(`${body}\n\nRe-tap to retry.`),
           {
-            parse_mode: 'HTML',
             reply_markup: buildDeferredSecretKeyboard(deferKey).inline_keyboard.length > 0
               ? buildDeferredSecretKeyboard(deferKey)
               : undefined,
@@ -19853,8 +19786,8 @@ async function executeDeferredSecretSave(
       .editMessageText(
         deferred.chat_id,
         cardMessageId,
-        `✅ stored as <code>vault:${slug}</code> (masked: <code>${masked}</code>)\n\nReply <code>rename NEW_NAME</code> to relabel.`,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        richMessage(`✅ stored as \`vault:${slug}\` (masked: \`${masked}\`)\n\nReply \`rename NEW_NAME\` to relabel.`),
+        { reply_markup: { inline_keyboard: [] } },
       )
       .catch(() => {})
   }
@@ -19931,11 +19864,10 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
     case 'dismiss': {
       // #1150 audit P1: was strip-only. Now appends a status line so
       // scrollback shows the dismissal.
-      const status = `\n\n✗ <i>Dismissed by operator.</i>`
+      const status = `\n\n✗ _Dismissed by operator._`
       await finalizeCallback(ctx, {
         ackText: 'Dismissed',
         newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
-        parseMode: 'HTML',
         // No synthInbound — dismiss is operator-only, no model in loop.
       })
       return
@@ -19946,11 +19878,10 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
         // #1150 audit P1: was reply + editMessageReplyMarkup (two
         // separate edits). Atomic via finalizeCallback now — the
         // status line is the announcement, no separate reply needed.
-        const status = `\n\n🔄 <i><b>${escapeHtmlForTg(agent)}</b> restart requested by operator.</i>`
+        const status = `\n\n🔄 _**${escapeHtmlForTg(agent)}** restart requested by operator._`
         await finalizeCallback(ctx, {
           ackText: `Restarting ${agent}…`,
           newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
-          parseMode: 'HTML',
         })
       } else {
         // Failure-path: leave the keyboard tappable so the operator
@@ -19960,11 +19891,9 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
         const isDocker = process.env.SWITCHROOM_RUNTIME === 'docker'
         const detail = isDocker
           ? `cross-agent restart is not supported under docker. ` +
-            `Restart from the host: <code>docker compose -p switchroom restart agent-${agent}</code>.`
+            `Restart from the host: \`docker compose -p switchroom restart agent-${agent}\`.`
           : 'restart trigger failed'
-        await ctx.reply(`<b>Restart failed for ${agent}:</b> ${detail}`, {
-          parse_mode: 'HTML',
-        })
+        await ctx.replyWithRichMessage(richMessage(`**Restart failed for ${agent}:** ${detail}`))
       }
       return
     }
@@ -19975,11 +19904,10 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
       // for the login URL state. Strip the keyboard and append a status
       // line; the new reauth-flow's own messages appear below the
       // collapsed card.
-      const status = `\n\n🔐 <i>Reauth started for <b>${escapeHtmlForTg(agent)}</b> — follow the login URL below.</i>`
+      const status = `\n\n🔐 _Reauth started for **${escapeHtmlForTg(agent)}** — follow the login URL below._`
       await finalizeCallback(ctx, {
         ackText: `Starting reauth for ${agent}…`,
         newText: sourceMsgText ? `${sourceMsgText}${status}` : status,
-        parseMode: 'HTML',
         synthInbound: async () => {
           await runSwitchroomAuthCommand(ctx, ['auth', 'reauth', agent], `auth reauth ${agent}`)
           // PR3 supergroup-mode: key by (chat, thread) so an OAuth code
@@ -20004,11 +19932,10 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
       // path systemd-only.
       const isDocker = process.env.SWITCHROOM_RUNTIME === 'docker'
       if (isDocker) {
-        await ctx.reply(
-          `<i>Inline log fetch is not available under docker mode (no docker.sock in agent containers). ` +
-            `Run from the host: <code>docker logs --since 30m --tail 30 switchroom-${agent}</code></i>`,
-          { parse_mode: 'HTML' },
-        )
+        await ctx.replyWithRichMessage(richMessage(
+          `_Inline log fetch is not available under docker mode (no docker.sock in agent containers). ` +
+            `Run from the host: \`docker logs --since 30m --tail 30 switchroom-${agent}\`_`,
+        ))
         return
       }
       try {
@@ -20018,17 +19945,15 @@ async function handleOperatorEventCallback(ctx: Context, data: string): Promise<
           { encoding: 'utf-8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] },
         ) as string
         const trimmed = out.trim().slice(-3500)
-        await ctx.reply(
+        await ctx.replyWithRichMessage(richMessage(
           trimmed
-            ? `<pre>${trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`
-            : `<i>No logs for ${agent}.</i>`,
-          { parse_mode: 'HTML' },
-        )
+            ? `\`\`\`\n${trimmed.replace(/```/g, '`​``')}\n\`\`\``
+            : `_No logs for ${agent}._`,
+        ))
       } catch (err) {
-        await ctx.reply(
-          `<b>logs failed:</b> ${escapeHtmlForTg((err as Error).message)}`,
-          { parse_mode: 'HTML' },
-        )
+        await ctx.replyWithRichMessage(richMessage(
+          `**logs failed:** ${escapeHtmlForTg((err as Error).message)}`,
+        ))
       }
       return
     }
@@ -20082,10 +20007,12 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
             bot.api.editMessageText(
               msg.chat.id,
               msg.message_id,
-              `<b>Active account →</b> <code>${escapeHtmlForTg(result.active)}</code>\n` +
-                `<i>Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}.</i>\n\n` +
-                `<i>Tap /auth to see updated quota for the new active account.</i>`,
-              { parse_mode: 'HTML' },
+              richMessage(
+                `**Active account →** \`${result.active}\`\n` +
+                `_Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}._\n\n` +
+                `_Tap /auth to see updated quota for the new active account._`,
+              ),
+              {},
             ),
           { chat_id: String(msg.chat.id), verb: 'auth:use:edit' },
         )
@@ -20164,8 +20091,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
       if (msg) {
         await swallowingApiCall(
           () =>
-            bot.api.editMessageText(msg.chat.id, msg.message_id, text, {
-              parse_mode: 'HTML',
+            bot.api.editMessageText(msg.chat.id, msg.message_id, richMessage(text), {
               reply_markup: { inline_keyboard },
             }),
           { chat_id: String(msg.chat.id), verb: 'auth:refresh:edit' },
@@ -20213,17 +20139,17 @@ bot.command('vault', async ctx => {
   const key = args[1]
   if (!sub || sub === 'help') {
     await switchroomReply(ctx, [
-      '<b>Vault commands</b>',
+      '**Vault commands**',
       '/vault list — list all secret keys',
-      '/vault get &lt;key&gt; — read a secret value',
-      '/vault set &lt;key&gt; — set a secret',
-      '/vault delete &lt;key&gt; — remove a secret',
+      '/vault get <key> — read a secret value',
+      '/vault set <key> — set a secret',
+      '/vault delete <key> — remove a secret',
       '/vault status — show broker state',
       '/vault unlock — unlock the broker (prompts for passphrase)',
       '/vault lock — lock the broker',
       '/vault grant — mint a capability token (inline wizard)',
       '/vault grants [agent] — list active capability grants (tap to revoke)',
-      '/vault audit &lt;agent&gt; — unified view of an agent\'s vault access',
+      '/vault audit <agent> — unified view of an agent\'s vault access',
       '',
       'Your passphrase is cached in memory for 30 min after first use.',
     ].join('\n'), { html: true })
@@ -20236,7 +20162,7 @@ bot.command('vault', async ctx => {
   if (sub === 'audit') {
     const targetAgent = args[1]
     if (!targetAgent) {
-      await switchroomReply(ctx, 'Usage: /vault audit &lt;agent&gt;', { html: true })
+      await switchroomReply(ctx, 'Usage: /vault audit <agent>', { html: true })
       return
     }
     // Sanity-check the agent name shape — same charset constraint as
@@ -20294,48 +20220,48 @@ bot.command('vault', async ctx => {
     }
 
     // 3. Compose the rendered audit view.
-    const lines: string[] = [`<b>🔐 ${escapeHtmlForTg(targetAgent)} — vault access</b>`, '']
+    const lines: string[] = [`**🔐 ${escapeHtmlForTg(targetAgent)} — vault access**`, '']
 
     if (grantsError) {
-      lines.push(`<i>Grants: ⚠️ ${escapeHtmlForTg(grantsError)}</i>`)
+      lines.push(`_Grants: ⚠️ ${escapeHtmlForTg(grantsError)}_`)
       lines.push('')
     } else {
-      lines.push('<b>Read grants:</b>')
+      lines.push('**Read grants:**')
       if (readGrants.length === 0) {
-        lines.push('  <i>none</i>')
+        lines.push('  _none_')
       } else {
         for (const g of readGrants) {
           const expiry = g.expiresAt
             ? new Date(g.expiresAt * 1000).toISOString().slice(0, 10)
             : 'no expiry'
           const keysJoined = g.keys.join(', ')
-          lines.push(`  <code>${escapeHtmlForTg(g.id)}</code> · ${escapeHtmlForTg(keysJoined)} · expires ${expiry}`)
+          lines.push(`  \`${g.id}\` · ${escapeHtmlForTg(keysJoined)} · expires ${expiry}`)
         }
       }
       lines.push('')
-      lines.push('<b>Write grants:</b>')
+      lines.push('**Write grants:**')
       if (writeGrants.length === 0) {
-        lines.push('  <i>none</i>')
+        lines.push('  _none_')
       } else {
         for (const g of writeGrants) {
           const expiry = g.expiresAt
             ? new Date(g.expiresAt * 1000).toISOString().slice(0, 10)
             : 'no expiry'
           const keysJoined = g.keys.join(', ')
-          lines.push(`  <code>${escapeHtmlForTg(g.id)}</code> · ${escapeHtmlForTg(keysJoined)} · expires ${expiry}`)
+          lines.push(`  \`${g.id}\` · ${escapeHtmlForTg(keysJoined)} · expires ${expiry}`)
         }
       }
       lines.push('')
     }
 
-    lines.push('<b>Cron-declared secrets:</b>')
+    lines.push('**Cron-declared secrets:**')
     if (configError) {
-      lines.push(`  <i>⚠️ ${escapeHtmlForTg(configError)}</i>`)
+      lines.push(`  _⚠️ ${escapeHtmlForTg(configError)}_`)
     } else if (cronEntries.length === 0) {
-      lines.push('  <i>none</i>')
+      lines.push('  _none_')
     } else {
       for (const entry of cronEntries) {
-        const cronLabel = entry.cron ? ` (<code>${escapeHtmlForTg(entry.cron)}</code>)` : ''
+        const cronLabel = entry.cron ? ` (\`${entry.cron}\`)` : ''
         const keysJoined = entry.secrets.join(', ')
         lines.push(`  schedule[${entry.index}]${cronLabel}: ${escapeHtmlForTg(keysJoined)}`)
       }
@@ -20350,11 +20276,11 @@ bot.command('vault', async ctx => {
     const denials = readRecentDenialsForAgent(targetAgent, 7 * 24 * 60 * 60 * 1000, 5)
     const denialKeyboard = new InlineKeyboard()
     if (denials.length > 0) {
-      lines.push('<b>Recent denials (last 7d):</b>')
+      lines.push('**Recent denials (last 7d):**')
       for (const d of denials) {
         const when = new Date(d.lastSeenMs).toISOString().slice(0, 16).replace('T', ' ')
         lines.push(
-          `  <code>${escapeHtmlForTg(d.key)}</code> · ${d.count}× · last ${when}`,
+          `  \`${d.key}\` · ${d.count}× · last ${when}`,
         )
         // callback_data must stay ≤ 64 bytes. Format:
         //   vrd:<agent>:<key>
@@ -20372,17 +20298,15 @@ bot.command('vault', async ctx => {
     }
 
     lines.push(
-      `<i>Summary: ${readGrants.length} read grant${readGrants.length === 1 ? '' : 's'}, ` +
+      `_Summary: ${readGrants.length} read grant${readGrants.length === 1 ? '' : 's'}, ` +
       `${writeGrants.length} write grant${writeGrants.length === 1 ? '' : 's'}, ` +
       `${cronEntries.length} cron entr${cronEntries.length === 1 ? 'y' : 'ies'}, ` +
-      `${denials.length} recent denial${denials.length === 1 ? '' : 's'}.</i>`,
+      `${denials.length} recent denial${denials.length === 1 ? '' : 's'}._`,
     )
 
     const chatIdAudit = String(ctx.chat!.id)
     const threadIdAudit = resolveThreadId(chatIdAudit, ctx.message?.message_thread_id)
-    await ctx.reply(lines.join('\n'), {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
+    await ctx.replyWithRichMessage(richMessage(lines.join('\n')), {
       ...(denials.length > 0 ? { reply_markup: denialKeyboard } : {}),
       ...(threadIdAudit != null ? { message_thread_id: threadIdAudit } : {}),
     })
@@ -20403,7 +20327,7 @@ bot.command('vault', async ctx => {
     }
     const { grants } = result
     if (grants.length === 0) {
-      const filterNote = agentFilter ? ` for <code>${escapeHtmlForTg(agentFilter)}</code>` : ''
+      const filterNote = agentFilter ? ` for \`${agentFilter}\`` : ''
       await switchroomReply(ctx, `📜 No active grants${filterNote}.`, { html: true })
       return
     }
@@ -20415,16 +20339,16 @@ bot.command('vault', async ctx => {
       byAgent.set(g.agent_slug, list)
     }
     // Build message text (grouped) + inline keyboard (one [Revoke] per grant per row)
-    const lines: string[] = ['<b>📜 Active grants</b>', '']
+    const lines: string[] = ['**📜 Active grants**', '']
     const keyboard = new InlineKeyboard()
     for (const [agentName, agentGrants] of byAgent) {
-      lines.push(`<b>${escapeHtmlForTg(agentName)}:</b>`)
+      lines.push(`**${escapeHtmlForTg(agentName)}:**`)
       for (const g of agentGrants) {
         const keys = g.key_allow.join(', ')
         const expiry = g.expires_at
           ? new Date(g.expires_at * 1000).toISOString().slice(0, 10)
           : 'no expiry'
-        lines.push(`• <code>${escapeHtmlForTg(g.id)}</code> — ${escapeHtmlForTg(keys)}, expires ${expiry}`)
+        lines.push(`• \`${g.id}\` — ${escapeHtmlForTg(keys)}, expires ${expiry}`)
         // callback_data: vg:revoke:<id> — max 64 bytes; grant IDs are "vg_" + 6 chars = 9 chars total → well within limit
         keyboard.text(`🗑 Revoke ${g.id}`, `vg:revoke:${g.id}`).row()
       }
@@ -20432,9 +20356,7 @@ bot.command('vault', async ctx => {
     }
     const chatId2 = String(ctx.chat!.id)
     const threadId2 = resolveThreadId(chatId2, ctx.message?.message_thread_id)
-    await ctx.reply(lines.join('\n'), {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
+    await ctx.replyWithRichMessage(richMessage(lines.join('\n')), {
       reply_markup: keyboard,
       ...(threadId2 != null ? { message_thread_id: threadId2 } : {}),
     })
@@ -20484,11 +20406,11 @@ bot.command('vault', async ctx => {
   }
 
   if (!['list', 'get', 'set', 'delete', 'remove'].includes(sub)) {
-    await switchroomReply(ctx, `Unknown vault subcommand: <code>${escapeHtmlForTg(sub)}</code>. Try /vault help`, { html: true })
+    await switchroomReply(ctx, `Unknown vault subcommand: \`${sub}\`. Try /vault help`, { html: true })
     return
   }
-  if ((sub === 'get' || sub === 'delete' || sub === 'remove') && !key) { await switchroomReply(ctx, `Usage: /vault ${sub} &lt;key&gt;`, { html: true }); return }
-  if (sub === 'set' && !key) { await switchroomReply(ctx, 'Usage: /vault set &lt;key&gt;', { html: true }); return }
+  if ((sub === 'get' || sub === 'delete' || sub === 'remove') && !key) { await switchroomReply(ctx, `Usage: /vault ${sub} <key>`, { html: true }); return }
+  if (sub === 'set' && !key) { await switchroomReply(ctx, 'Usage: /vault set <key>', { html: true }); return }
 
   const cached = vaultPassphraseCache.get(chatId)
   const passphrase = cached && cached.expiresAt > Date.now() ? cached.passphrase : undefined
@@ -20575,9 +20497,9 @@ bot.command('issues', async ctx => {
         await switchroomReply(
           ctx,
           [
-            `This will resolve <b>${n} ${noun}</b>. To confirm, run:`,
+            `This will resolve **${n} ${noun}**. To confirm, run:`,
             '',
-            '<code>/issues clear --confirm</code>',
+            '\`/issues clear --confirm\`',
           ].join('\n'),
           { html: true },
         )
@@ -20597,7 +20519,7 @@ bot.command('issues', async ctx => {
   }
   await switchroomReply(
     ctx,
-    'Usage: <code>/issues</code> | <code>/issues resolve &lt;fingerprint&gt;</code> | <code>/issues clear [--confirm]</code>',
+    'Usage: \`/issues\` | \`/issues resolve <fingerprint>\` | \`/issues clear [--confirm]\`',
     { html: true },
   )
 })
@@ -20657,12 +20579,12 @@ bot.command('usage', async ctx => {
   // socket bind, etc.). Same shape /usage shipped with originally.
   const agentDir = resolveAgentDirFromEnv()
   if (!agentDir) {
-    await switchroomReply(ctx, '<b>/usage:</b> cannot resolve agent dir.', { html: true })
+    await switchroomReply(ctx, '**/usage:** cannot resolve agent dir.', { html: true })
     return
   }
   const result = await fetchQuota({ claudeConfigDir: join(agentDir, '.claude') })
   if (!result.ok) {
-    await switchroomReply(ctx, `<b>/usage:</b> ${escapeHtmlForTg(result.reason)}`, { html: true })
+    await switchroomReply(ctx, `**/usage:** ${escapeHtmlForTg(result.reason)}`, { html: true })
     return
   }
   await switchroomReply(ctx, formatQuotaBlock(result.data), { html: true })
@@ -20718,7 +20640,7 @@ async function renderFleetDoctor(ctx: Context): Promise<void> {
     return
   }
   if (resp.result === 'denied') {
-    await switchroomReply(ctx, `🩺 <b>Whole-fleet doctor denied by hostd:</b>\n${preBlock(formatSwitchroomOutput(resp.error ?? 'admin required'))}`, { html: true })
+    await switchroomReply(ctx, `🩺 **Whole-fleet doctor denied by hostd:**\n${preBlock(formatSwitchroomOutput(resp.error ?? 'admin required'))}`, { html: true })
     return
   }
   // `completed` (including `switchroom doctor` exit 1 = "found
@@ -20736,7 +20658,7 @@ bot.command('doctor', async ctx => {
     // approval card — doctor is read-only). Everyone else keeps the
     // original zero-extra-tap in-container behaviour.
     if (AGENT_ADMIN && hostdWillBeUsed(getMyAgentName())) {
-      await switchroomReply(ctx, '🩺 <b>Doctor</b> — which scope?', {
+      await switchroomReply(ctx, '🩺 **Doctor** — which scope?', {
         html: true,
         reply_markup: buildDoctorScopeKeyboard(),
       })
@@ -20744,7 +20666,7 @@ bot.command('doctor', async ctx => {
     }
     await renderSelfDoctor(ctx)
   } catch (err: unknown) {
-    await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+    await switchroomReply(ctx, `**doctor failed:**\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
   }
 })
 
@@ -20794,7 +20716,7 @@ bot.command('version', async ctx => {
     if (!trimmed) { await switchroomReply(ctx, 'version: no output'); return }
     await switchroomReply(ctx, preBlock(formatSwitchroomOutput(trimmed)), { html: true })
   } catch (err: unknown) {
-    await switchroomReply(ctx, `<b>version failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+    await switchroomReply(ctx, `**version failed:**\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
   }
 })
 
@@ -20817,7 +20739,7 @@ bot.command('whoami', async ctx => {
     catch { card = preBlock(formatSwitchroomOutput(trimmed || 'whoami: no output')) }
     await switchroomReply(ctx, card, { html: true })
   } catch (err: unknown) {
-    await switchroomReply(ctx, `<b>whoami failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+    await switchroomReply(ctx, `**whoami failed:**\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
   }
 })
 
@@ -20835,7 +20757,7 @@ function formatWhoamiCard(v: {
   const esc = escapeHtmlForTg
   const yn = (b?: boolean) => (b ? '✓' : '✗')
   const lines: string[] = []
-  lines.push(`👤 <b>${esc(v.name ?? '?')}</b> · ${esc(v.tier ?? 'standard')}`)
+  lines.push(`👤 **${esc(v.name ?? '?')}** · ${esc(v.tier ?? 'standard')}`)
   if (v.persona) lines.push(esc(v.persona))
   if (v.model) lines.push(`Model: ${esc(v.model)}`)
   const allow = v.tools?.allow ?? []
@@ -20906,8 +20828,7 @@ bot.on('callback_query:data', async ctx => {
     try {
       const outcome = await handleEffortMenuCallback(data, buildEffortDeps())
       await ctx
-        .editMessageText(outcome.reply.text, {
-          parse_mode: 'HTML',
+        .editMessageText(richMessage(outcome.reply.text), {
           reply_markup: effortMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
         })
         .catch(() => {})
@@ -20932,8 +20853,7 @@ bot.on('callback_query:data', async ctx => {
     if (process.env.SWITCHROOM_MODEL_MENU === '0') {
       await ctx.answerCallbackQuery({ text: 'Model menu is disabled (SWITCHROOM_MODEL_MENU=0).' }).catch(() => {})
       await ctx
-        .editMessageText('Model menu is disabled on this agent. Use <code>/model &lt;name&gt;</code>.', {
-          parse_mode: 'HTML',
+        .editMessageText(richMessage('Model menu is disabled on this agent. Use \`/model <name>\`.'), {
           reply_markup: { inline_keyboard: [] },
         })
         .catch(() => {})
@@ -20977,7 +20897,7 @@ bot.on('callback_query:data', async ctx => {
     if (data.startsWith(MODEL_CALLBACK_SR)) {
       const srLabel = escapeHtmlForTg(srFriendlyLabel(data.slice(MODEL_CALLBACK_SR.length)))
       await ctx
-        .editMessageText(`⏳ Switching session to <b>${srLabel}</b>…`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } })
+        .editMessageText(richMessage(`⏳ Switching session to **${srLabel}**…`), { reply_markup: { inline_keyboard: [] } })
         .catch(() => {})
       didInterimSrEdit = true
     }
@@ -21006,8 +20926,8 @@ bot.on('callback_query:data', async ctx => {
         // Replace the menu with a restart notice (no buttons — session is ending).
         await ctx
           .editMessageText(
-            `🔄 Switching from <b>${escapeHtmlForTg(prevSessionModel!)}</b> back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
-            { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+            richMessage(`🔄 Switching from **${escapeHtmlForTg(prevSessionModel!)}** back to Claude — restarting session cleanly. Claude will be ready in ~30s.`),
+            { reply_markup: { inline_keyboard: [] } },
           )
           .catch(() => {})
         // Write the restart marker so the post-restart boot card edits into this chat.
@@ -21025,8 +20945,7 @@ bot.on('callback_query:data', async ctx => {
       }
 
       await ctx
-        .editMessageText(outcome.reply.text, {
-          parse_mode: 'HTML',
+        .editMessageText(richMessage(outcome.reply.text), {
           reply_markup: modelMenuReplyMarkup(outcome.reply) ?? { inline_keyboard: [] },
         })
         .catch(() => {})
@@ -21123,8 +21042,7 @@ bot.on('callback_query:data', async ctx => {
         editCard: async (args) => {
           try {
             await robustApiCall(() =>
-              bot.api.editMessageText(args.chatId, args.messageId, args.text, {
-                parse_mode: 'HTML',
+              bot.api.editMessageText(args.chatId, args.messageId, richMessage(args.text), {
                 // Resolved on tap — strip the keyboard so it can't be re-tapped.
                 ...(args.stripKeyboard ? { reply_markup: { inline_keyboard: [] } } : {}),
               }),
@@ -21209,7 +21127,7 @@ bot.on('callback_query:data', async ctx => {
       if (scope === 'fleet') await renderFleetDoctor(ctx)
       else await renderSelfDoctor(ctx)
     } catch (err: unknown) {
-      await switchroomReply(ctx, `<b>doctor failed:</b>\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
+      await switchroomReply(ctx, `**doctor failed:**\n${preBlock(formatSwitchroomOutput((err as any).message ?? 'unknown error'))}`, { html: true })
     }
     return
   }
@@ -21303,8 +21221,7 @@ bot.on('callback_query:data', async ctx => {
     if (sourceMsg && 'text' in sourceMsg && sourceMsg.text != null) {
       try {
         await ctx.editMessageText(
-          `${escapeHtmlForTg(sourceMsg.text)}\n\n✅ <b>${escapeHtmlForTg(choice)}</b>`,
-          { parse_mode: 'HTML' },
+          richMessage(`${escapeHtmlForTg(sourceMsg.text)}\n\n✅ **${escapeHtmlForTg(choice)}**`),
         )
       } catch {
         /* edit-failed is fine — the answer-callback below still acks */
@@ -21682,13 +21599,13 @@ bot.on('callback_query:data', async ctx => {
       : ''
     const editLabel = ok
       ? (legacyNote
-          ? `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking (legacy path); restart agent for full effect`
+          ? `✅ **${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}** without asking (legacy path); restart agent for full effect`
           : restartScheduled
-            ? `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking — applying now (restarting to take effect).`
-            : `✅ <b>${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}</b> without asking; restart agent for full effect`)
+            ? `✅ **${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}** without asking — applying now (restarting to take effect).`
+            : `✅ **${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}** without asking; restart agent for full effect`)
       : (editLockHint
-          ? `⚠️ <b>Allowed for now — "always" did NOT save.</b> Config edits are locked; enable <code>hostd.config_edit_enabled</code>.`
-          : `⚠️ <b>Allowed for now — "always" did NOT save.</b> It will ask again after restart. Check gateway log.`)
+          ? `⚠️ **Allowed for now — "always" did NOT save.** Config edits are locked; enable \`hostd.config_edit_enabled\`.`
+          : `⚠️ **Allowed for now — "always" did NOT save.** It will ask again after restart. Check gateway log.`)
     // #1150 audit: route through finalizeCallback so the keyboard
     // strips alongside the status-line edit. The in-flight verdict was
     // ALREADY dispatched above (independently of this host round-trip)
@@ -21697,7 +21614,6 @@ bot.on('callback_query:data', async ctx => {
     await finalizeCallback(ctx, {
       ackText: ackText.slice(0, 200),
       newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
-      parseMode: 'HTML',
     })
     return
   }
@@ -21742,10 +21658,10 @@ bot.on('callback_query:data', async ctx => {
     ? '❌ Denied'
     : (windowGranted ? `✅ Allowed (${scopedMins} min)` : '✅ Allowed once')
   const htmlLabel = behavior === 'deny'
-    ? '❌ <b>Denied</b>'
+    ? '❌ **Denied**'
     : (windowGranted
-        ? `✅ <b>Allowed — won't ask again about ${escapeHtmlForTg(timeBox!.breadth)} for ${scopedMins} min</b>`
-        : '✅ <b>Allowed once</b>')
+        ? `✅ **Allowed — won't ask again about ${escapeHtmlForTg(timeBox!.breadth)} for ${scopedMins} min**`
+        : '✅ **Allowed once**')
   // HTML-escape the source text — same hazard as the scope-commit and
   // recent-denial paths above. The permission card body
   // (formatPermissionCardBody) appends claude-supplied `description`
@@ -21766,7 +21682,6 @@ bot.on('callback_query:data', async ctx => {
   await finalizeCallback(ctx, {
     ackText: ackText.slice(0, 200),
     newText: baseText ? `${baseText}\n\n${htmlLabel}` : htmlLabel,
-    parseMode: 'HTML',
     synthInbound: () => {
       // No `rule` → the bridge does NOT cache this (truly once on the bridge);
       // any 30-min stickiness lives only in scopedGrants (recorded above).
@@ -23657,14 +23572,16 @@ void (async () => {
             const orphanStatusEnabled = isOrphanSubagentStatusEnabled(process.env.SWITCHROOM_ORPHAN_SUBAGENT_STATUS)
             workerActivityFeed?.stop()
             workerActivityFeed = createWorkerActivityFeed({
+              // #2669: worker-feed body is raw GFM markdown — send via rich.
               bot: {
                 sendMessage: async (cid, text, sendOpts) => {
                   const sent = await robustApiCall(
                     () =>
-                      lockedBot.api.sendMessage(
+                      // allow-raw-bot-api: sendRichMessage routed through robustApiCall (not in the THREAD_NOT_FOUND blast pattern)
+                      lockedBot.api.sendRichMessage(
                         cid,
-                        text,
-                        sendOpts as Parameters<typeof lockedBot.api.sendMessage>[2],
+                        richMessage(text),
+                        sendOpts as Parameters<typeof lockedBot.api.sendRichMessage>[2],
                       ),
                     { chat_id: cid, verb: 'worker-feed' },
                   )
@@ -23676,7 +23593,7 @@ void (async () => {
                       lockedBot.api.editMessageText(
                         cid,
                         mid,
-                        text,
+                        richMessage(text),
                         editOpts as Parameters<typeof lockedBot.api.editMessageText>[3],
                       ),
                     { chat_id: cid, verb: 'worker-feed' },

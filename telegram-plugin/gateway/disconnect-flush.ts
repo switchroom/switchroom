@@ -45,8 +45,6 @@ export interface DisconnectFlushDeps<Ctrl extends { finalize: (reason?: 'done' |
 
   /** Open draft-stream handles keyed by chat:thread:replyId. */
   activeDraftStreams: Map<string, Stream>
-  /** Mirror map: same keys → parse mode. */
-  activeDraftParseModes: Map<string, 'HTML' | 'MarkdownV2' | undefined>
 
   /** Persist-side reaction registry (per-agent on-disk state). */
   clearActiveReactions: () => void
@@ -85,7 +83,6 @@ export function flushOnAgentDisconnect<
     activeTurnStartedAt,
     claudeBusyKeys,
     activeDraftStreams,
-    activeDraftParseModes,
     clearActiveReactions,
     disposeProgressDriver,
     onDanglingTurnsSwept,
@@ -177,7 +174,6 @@ export function flushOnAgentDisconnect<
   for (const [key, stream] of activeDraftStreams.entries()) {
     if (!stream.isFinal()) void stream.finalize().catch(() => {})
     activeDraftStreams.delete(key)
-    activeDraftParseModes.delete(key)
   }
 
   return true

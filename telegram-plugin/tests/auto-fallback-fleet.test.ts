@@ -78,7 +78,7 @@ describe('runFleetAutoFallback', () => {
       expect(out.oldLabel).toBe('ken@x');
       expect(out.newLabel).toBe('you@x');
       expect(out.announcement).toContain('5-hour limit on ken@x');
-      expect(out.announcement).toContain('Triggered by: agent <b>carrie</b>');
+      expect(out.announcement).toContain('Triggered by: agent **carrie**');
       expect(out.announcement).toContain('plenty of headroom');
     }
   });
@@ -248,20 +248,22 @@ import { renderFallbackFailureNotice } from "../auto-fallback-fleet.js";
 
 describe("renderFallbackFailureNotice", () => {
   it("names the trigger agent, the reason, and the manual recovery verbs", () => {
-    const html = renderFallbackFailureNotice("marko", "auth-broker unreachable (no client).");
-    expect(html).toContain("Auto-failover could not run");
-    expect(html).toContain("<b>marko</b>");
-    expect(html).toContain("auth-broker unreachable");
-    expect(html).toContain("/auth use");
-    expect(html).toContain("/auth</code>");
+    const out = renderFallbackFailureNotice("marko", "auth-broker unreachable (no client).");
+    expect(out).toContain("Auto-failover could not run");
+    expect(out).toContain("**marko**");
+    expect(out).toContain("auth-broker unreachable");
+    expect(out).toContain("/auth use");
+    expect(out).toContain("`/auth`");
   });
 
-  it("escapes HTML in the error reason (broker errors can contain angle brackets)", () => {
-    const html = renderFallbackFailureNotice("a<b", 'request <probe-quota> failed & "timed out"');
-    expect(html).toContain("a&lt;b");
-    expect(html).toContain("&lt;probe-quota&gt;");
-    expect(html).toContain("&amp;");
-    expect(html).not.toMatch(/<probe-quota>/);
+  it("passes < > & literally in the error reason (markdown, #2669)", () => {
+    // Broker errors can contain angle brackets — they are literal in rich
+    // markdown and cannot inject formatting; emphasis specials are escaped.
+    const out = renderFallbackFailureNotice("a<b", 'request <probe-quota> failed & a_b');
+    expect(out).toContain("a<b");
+    expect(out).toContain("<probe-quota>");
+    expect(out).toContain("&");
+    expect(out).toContain("a\\_b");
   });
 });
 

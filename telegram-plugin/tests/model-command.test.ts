@@ -172,7 +172,7 @@ describe("handleModelCommand — show / help never inject (picker-wedge guard)",
     const { deps, calls } = makeDeps({ getConfiguredModel: () => null });
     const reply = await handleModelCommand({ kind: "show" }, deps);
     expect(calls.length).toBe(0);
-    expect(reply.text).toContain("<code>default</code>");
+    expect(reply.text).toContain("`default`");
   });
 
   it("help never injects", async () => {
@@ -445,7 +445,7 @@ describe("buildModelMenu", () => {
     const { deps, calls } = makeMenuDeps();
     const menu = await buildModelMenu(deps);
     expect(calls.discover).toBe(1);
-    expect(menu.text).toContain("<b>Sonnet</b>");
+    expect(menu.text).toContain("**Sonnet**");
     expect(menu.text).toContain("29% / 5h · 33% / 7d");
     expect(menu.keyboard).toBeDefined();
     // 3 option rows + refresh row

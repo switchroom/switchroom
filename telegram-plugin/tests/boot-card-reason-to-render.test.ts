@@ -32,6 +32,16 @@ const NOW = 1_700_000_000_000
 const VERSION = 'v0.8.0+106'
 const AGENT = 'test-harness'
 
+// The crash row's tail-logs command is runtime-aware: in-container agents
+// (SWITCHROOM_RUNTIME=docker) get `docker logs …`, everything else gets
+// `journalctl …`. The bun-native test set inherits the live container env,
+// while vitest scrubs it — so assert against whichever branch the renderer
+// actually selected rather than pinning one shape (#2669).
+const TAIL_CMD = (slug: string): string =>
+  process.env.SWITCHROOM_RUNTIME === 'docker'
+    ? `\`docker logs --tail 100 switchroom-${slug}\``
+    : `\`journalctl --user -u switchroom-${slug} -n 100\``
+
 function rec(offsetMs: number) {
   return { ts: NOW - offsetMs }
 }
@@ -57,7 +67,7 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       version: VERSION,
       restartReason: reason,
     })
-    expect(card).toMatchInlineSnapshot(`"✅ <b>test-harness</b> back up · v0.8.0+106"`)
+    expect(card).toMatchInlineSnapshot(`"✅ **test-harness** back up · v0.8.0+106"`)
     // Negative assertions on the failure surface CC-8 worries about:
     expect(card).not.toContain('crash recovery')
     expect(card).not.toContain('journalctl')
@@ -83,10 +93,10 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       restartReason: reason,
       restartAgeMs: 3_400,
     })
-    expect(card).toContain('⚠️ <b>test-harness</b> back up')
-    expect(card).toContain('⚠️ <b>Restart</b>  crash recovery · 3.4s ago')
+    expect(card).toContain('⚠️ **test-harness** back up')
+    expect(card).toContain('⚠️ **Restart**  crash recovery · 3.4s ago')
     expect(card).toContain('Tail logs:')
-    expect(card).toContain('<code>journalctl --user -u switchroom-test-harness -n 100</code>')
+    expect(card).toContain(TAIL_CMD('test-harness'))
   })
 
   // ─── canonical crash: no marker at all ─────────────────────────
@@ -104,7 +114,7 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       restartReason: reason,
       restartAgeMs: 12_000,
     })
-    expect(card).toContain('⚠️ <b>test-harness</b> back up')
+    expect(card).toContain('⚠️ **test-harness** back up')
     expect(card).toContain('crash recovery · 12.0s ago')
     expect(card).toContain('Tail logs:')
   })
@@ -143,7 +153,7 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       version: VERSION,
       restartReason: reason,
     })
-    expect(card).toMatchInlineSnapshot(`"✅ <b>test-harness</b> back up · v0.8.0+106"`)
+    expect(card).toMatchInlineSnapshot(`"✅ **test-harness** back up · v0.8.0+106"`)
     expect(card).not.toContain('crash recovery')
   })
 
@@ -161,15 +171,17 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       version: VERSION,
       restartReason: reason,
     })
-    expect(card).toMatchInlineSnapshot(`"🆕 <b>test-harness</b> back up · v0.8.0+106"`)
+    expect(card).toMatchInlineSnapshot(`"🆕 **test-harness** back up · v0.8.0+106"`)
     expect(card).not.toContain('crash recovery')
   })
 
-  // ─── slug override path: agentSlug used in journalctl, not agentName ───
-  it('crash card uses agentSlug (not agentName) in the journalctl command', () => {
-    // The journalctl row is the user's actionable next step — if the
+  // ─── slug override path: agentSlug used in tail-logs cmd, not agentName ───
+  it('crash card uses agentSlug (not agentName) in the tail-logs command', () => {
+    // The tail-logs row is the user's actionable next step — if the
     // slug ever drifts (capitalization, special chars), the copy-paste
-    // command stops working. Pin the slug pathway explicitly.
+    // command stops working. Pin the slug pathway explicitly. The command
+    // shape (docker vs journalctl) is runtime-determined; the slug must be
+    // the lowercase systemd slug regardless.
     const card = renderBootCard({
       agentName: 'Test Harness Display',
       agentSlug: 'test-harness',
@@ -177,6 +189,9 @@ describe('boot-card: reason → user-visible render (CC-8)', () => {
       restartReason: 'crash',
       restartAgeMs: 800,
     })
-    expect(card).toContain('<code>journalctl --user -u switchroom-test-harness -n 100</code>')
+    expect(card).toContain(TAIL_CMD('test-harness'))
+    // And never the display name in the unit target.
+    expect(card).not.toContain('Test Harness Display -n')
+    expect(card).not.toContain('switchroom-Test Harness Display')
   })
 })

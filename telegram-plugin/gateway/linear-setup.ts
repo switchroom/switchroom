@@ -130,7 +130,7 @@ export async function runLinearAgentSetup(
   if (action === 'authorize_url') {
     const url = buildLinearAuthorizeUrl({ clientId, redirectUri })
     return text(
-      `Open this URL in a browser to authorize <b>${agent}</b> as a Linear app actor (actor=app):\n\n${url}\n\n` +
+      `Open this URL in a browser to authorize **${agent}** as a Linear app actor (actor=app):\n\n${url}\n\n` +
         `After you approve, Linear redirects to ${redirectUri}?code=… (it may show a blank/error page — that's fine). ` +
         `Copy the code value from the URL bar, then run linear_agent_setup with action "complete", the same client_id + redirect_uri, ` +
         `your client_secret, and that code.`,

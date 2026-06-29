@@ -247,7 +247,7 @@ describe('emitLinearAgentActivity — operator alert when auth is unrecoverable 
   it('buildLinearAuthDeadMessage: no_bundle names the missing oauth key + re-auth command', () => {
     const msg = buildLinearAuthDeadMessage('clerk', 'no_bundle')
     expect(msg).toMatch(/Linear auth needs you/)
-    expect(msg).toContain('<code>linear/clerk/oauth</code>')
+    expect(msg).toContain('`linear/clerk/oauth`')
     expect(msg).toContain('switchroom linear-agent setup --agent clerk')
   })
 
@@ -257,10 +257,13 @@ describe('emitLinearAgentActivity — operator alert when auth is unrecoverable 
     expect(msg).not.toContain('/oauth</code> is missing')
   })
 
-  it('buildLinearAuthDeadMessage: HTML-escapes a hostile agent slug', () => {
-    const msg = buildLinearAuthDeadMessage('a<b>&c', 'no_bundle')
-    expect(msg).toContain('a&lt;b&gt;&amp;c')
-    expect(msg).not.toContain('a<b>&c')
+  it('buildLinearAuthDeadMessage: markdown-escapes a hostile agent slug in prose (#2669)', () => {
+    // < > & are literal in rich markdown; an emphasis special is escaped so it
+    // can't break out of the **…** bold run.
+    const msg = buildLinearAuthDeadMessage('a_b*c', 'no_bundle')
+    expect(msg).toContain('**a\\_b\\*c**')
+    // Inside the `code span`, the slug is literal (no escaping).
+    expect(msg).toContain('`linear/a_b*c/oauth`')
   })
 
   it('successful auto-refresh does NOT page the operator', async () => {

@@ -1,9 +1,9 @@
 /**
  * Tests for the inline status-accent header feature (issue #320 fallback).
  *
- * Covers both the pure `buildAccentHeader` helper and the integration paths
- * through `handleStreamReply` (stream_reply) and the server reply case
- * (exercised via the handler directly since server.ts wires it the same way).
+ * Post-#2669 the header is GFM markdown (every outbound goes through the
+ * rich-message path), and the body ships as raw markdown via
+ * `sendRichMessage` / `editMessageText({ markdown })`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { buildAccentHeader, handleStreamReply, type StreamReplyDeps, type StreamReplyState } from '../stream-reply-handler.js'
@@ -13,16 +13,16 @@ import { createMockBot, installBotResetHook, microtaskFlush } from './bot-api.ha
 // ─── buildAccentHeader unit tests ────────────────────────────────────────────
 
 describe('buildAccentHeader', () => {
-  it("'in-progress' returns the blue circle header", () => {
-    expect(buildAccentHeader('in-progress')).toBe('🔵 <i>In progress…</i>\n\n')
+  it("'in-progress' returns the blue circle markdown header", () => {
+    expect(buildAccentHeader('in-progress')).toBe('🔵 _In progress…_\n\n')
   })
 
-  it("'done' returns the checkmark header", () => {
-    expect(buildAccentHeader('done')).toBe('✅ <b>Done</b>\n\n')
+  it("'done' returns the checkmark markdown header", () => {
+    expect(buildAccentHeader('done')).toBe('✅ **Done**\n\n')
   })
 
-  it("'issue' returns the warning header", () => {
-    expect(buildAccentHeader('issue')).toBe('⚠️ <b>Issue</b>\n\n')
+  it("'issue' returns the warning markdown header", () => {
+    expect(buildAccentHeader('issue')).toBe('⚠️ **Issue**\n\n')
   })
 
   it('undefined returns empty string (no header)', () => {
@@ -41,7 +41,6 @@ describe('buildAccentHeader', () => {
 function makeState(): StreamReplyState {
   return {
     activeDraftStreams: new Map<string, DraftStreamHandle>(),
-    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
   }
 }
 
@@ -51,13 +50,11 @@ function makeDeps(
 ): StreamReplyDeps {
   return {
     bot,
-    markdownToHtml: (t) => `<b>${t}</b>`,
-    escapeMarkdownV2: (t) => `\\${t}\\`,
     repairEscapedWhitespace: (t) => t,
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
-    defaultFormat: 'html',
+    defaultFormat: 'markdown',
     logStreamingEvent: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
@@ -67,6 +64,13 @@ function makeDeps(
   }
 }
 
+function sentMarkdown(bot: ReturnType<typeof createMockBot>, i = 0): string {
+  return (bot.api.sendRichMessage.mock.calls[i][1] as { markdown: string }).markdown
+}
+function editedMarkdown(bot: ReturnType<typeof createMockBot>, i = 0): string {
+  return (bot.api.editMessageText.mock.calls[i][2] as { markdown: string }).markdown
+}
+
 describe('handleStreamReply accent integration', () => {
   const bot = createMockBot()
   installBotResetHook(bot)
@@ -74,7 +78,7 @@ describe('handleStreamReply accent integration', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
-  it("accent='in-progress' prepends the blue-circle header before the body", async () => {
+  it("accent='in-progress' prepends the blue-circle markdown header before the body", async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -86,12 +90,12 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await pending
 
-    const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toMatch(/^🔵 <i>In progress…<\/i>\n\n/)
-    expect(sent).toBe('🔵 <i>In progress…</i>\n\n<b>Still working...</b>')
+    const sent = sentMarkdown(bot)
+    expect(sent).toMatch(/^🔵 _In progress…_\n\n/)
+    expect(sent).toBe('🔵 _In progress…_\n\nStill working...')
   })
 
-  it("accent='done' prepends the checkmark header before the body", async () => {
+  it("accent='done' prepends the checkmark markdown header before the body", async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -103,11 +107,10 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await pending
 
-    const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('✅ <b>Done</b>\n\n<b>Task complete.</b>')
+    expect(sentMarkdown(bot)).toBe('✅ **Done**\n\nTask complete.')
   })
 
-  it("accent='issue' prepends the warning header before the body", async () => {
+  it("accent='issue' prepends the warning markdown header before the body", async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -119,11 +122,10 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await pending
 
-    const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('⚠️ <b>Issue</b>\n\n<b>Blocked on X.</b>')
+    expect(sentMarkdown(bot)).toBe('⚠️ **Issue**\n\nBlocked on X.')
   })
 
-  it('no accent — output is unchanged from today (regression guard)', async () => {
+  it('no accent — body ships as raw markdown unchanged (regression guard)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -135,8 +137,7 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await pending
 
-    const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('<b>Hello world</b>')
+    expect(sentMarkdown(bot)).toBe('Hello world')
   })
 
   it('invalid accent is silently ignored — output equals no-accent path', async () => {
@@ -151,15 +152,13 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await pending
 
-    const sent = bot.api.sendMessage.mock.calls[0][1] as string
-    expect(sent).toBe('<b>Hello world</b>')
+    expect(sentMarkdown(bot)).toBe('Hello world')
   })
 
   it('accent header is included on every call that passes it (full-text replace model)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
-    // First call
     const p1 = handleStreamReply(
       { chat_id: '1', text: 'Part one', accent: 'in-progress' },
       state,
@@ -168,7 +167,6 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await p1
 
-    // Second call — same turn, same accent
     vi.advanceTimersByTime(1000)
     const p2 = handleStreamReply(
       { chat_id: '1', text: 'Part one Part two', accent: 'in-progress' },
@@ -178,7 +176,6 @@ describe('handleStreamReply accent integration', () => {
     await microtaskFlush()
     await p2
 
-    const edited = bot.api.editMessageText.mock.calls[0][2] as string
-    expect(edited).toBe('🔵 <i>In progress…</i>\n\n<b>Part one Part two</b>')
+    expect(editedMarkdown(bot)).toBe('🔵 _In progress…_\n\nPart one Part two')
   })
 })

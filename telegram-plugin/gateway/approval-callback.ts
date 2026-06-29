@@ -164,7 +164,7 @@ export async function handleApprovalCallback(
   const newBody =
     `${icon} ${displayMode}` +
     (granted
-      ? ` · /approvals revoke <code>${decision_id}</code>`
+      ? ` · /approvals revoke \`${decision_id}\``
       : "");
 
   const postTapKeyboard = granted && result.scope
@@ -172,8 +172,7 @@ export async function handleApprovalCallback(
     : undefined;
 
   try {
-    await ctx.editMessageText(newBody, {
-      parse_mode: "HTML",
+    await ctx.editMessageText({ markdown: newBody }, {
       reply_markup: postTapKeyboard,
     });
   } catch {

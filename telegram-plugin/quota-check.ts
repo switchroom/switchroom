@@ -250,21 +250,21 @@ export function formatResetRelative(target: Date | null, now: Date = new Date())
  */
 export function formatQuotaBlock(q: QuotaUtilization, now: Date = new Date()): string {
   const lines: string[] = [];
-  lines.push("<b>Claude plan quota</b>");
+  lines.push("**Claude plan quota**");
   lines.push("");
   lines.push(
-    `<b>5h window</b>  ${Math.round(q.fiveHourUtilizationPct)}% · ${formatResetRelative(q.fiveHourResetAt, now)}`,
+    `**5h window**  ${Math.round(q.fiveHourUtilizationPct)}% · ${formatResetRelative(q.fiveHourResetAt, now)}`,
   );
   lines.push(
-    `<b>7d window</b>  ${Math.round(q.sevenDayUtilizationPct)}% · ${formatResetRelative(q.sevenDayResetAt, now)}`,
+    `**7d window**  ${Math.round(q.sevenDayUtilizationPct)}% · ${formatResetRelative(q.sevenDayResetAt, now)}`,
   );
   if (q.representativeClaim) {
     lines.push("");
-    lines.push(`<i>Binding window: ${q.representativeClaim.replace(/_/g, " ")}</i>`);
+    lines.push(`_Binding window: ${q.representativeClaim.replace(/_/g, " ")}_`);
   }
   if (q.overageStatus && q.overageStatus !== "allowed") {
     const reason = q.overageDisabledReason ? ` (${q.overageDisabledReason})` : "";
-    lines.push(`<i>Overage: ${q.overageStatus}${reason}</i>`);
+    lines.push(`_Overage: ${q.overageStatus}${reason}_`);
   }
   return lines.join("\n");
 }

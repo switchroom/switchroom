@@ -15,7 +15,7 @@ import { finalizeCallback, type FinalizeCallbackContext } from '../inline-keyboa
 
 interface Capture {
   acks: Array<{ text?: string; show_alert?: boolean }>
-  edits: Array<{ text: string; opts: Record<string, unknown> }>
+  edits: Array<{ text: string | { markdown: string }; opts: Record<string, unknown> }>
   ackThrows?: Error
   editThrows?: Error
 }
@@ -57,25 +57,27 @@ describe('finalizeCallback — three-invariant contract', () => {
     expect(cap.acks[0]?.show_alert).toBe(true)
   })
 
-  it('invariant 2: strips reply_markup AND edits the body in one atomic call', async () => {
+  it('invariant 2: strips reply_markup AND rich-edits the body in one atomic call', async () => {
     const cap: Capture = { acks: [], edits: [] }
     await finalizeCallback(mkCtx(cap), {
       ackText: 'Approved',
-      newText: '✓ Approved\n\nGrant minted at 22:38 UTC',
-      parseMode: 'HTML',
+      newText: '**✓ Approved**\n\nGrant minted at 22:38 UTC',
     })
     expect(cap.edits).toHaveLength(1)
-    expect(cap.edits[0]?.text).toBe('✓ Approved\n\nGrant minted at 22:38 UTC')
+    // Default (non-literal) path wraps the body in the rich-message
+    // { markdown } object — raw GFM markdown, no parse_mode (#2669).
+    expect(cap.edits[0]?.text).toEqual({ markdown: '**✓ Approved**\n\nGrant minted at 22:38 UTC' })
     expect(cap.edits[0]?.opts.reply_markup).toEqual({ inline_keyboard: [] })
-    expect(cap.edits[0]?.opts.parse_mode).toBe('HTML')
+    expect(cap.edits[0]?.opts.parse_mode).toBeUndefined()
     // link_preview_options disabled by default — keeps the edited
     // status line from rendering a stale preview card.
     expect(cap.edits[0]?.opts.link_preview_options).toEqual({ is_disabled: true })
   })
 
-  it('invariant 2: omits parse_mode when not specified (plain text)', async () => {
+  it('invariant 2: literalText edits a plain string (no rich wrapper, no parse_mode)', async () => {
     const cap: Capture = { acks: [], edits: [] }
-    await finalizeCallback(mkCtx(cap), { ackText: 'ok', newText: 'plain' })
+    await finalizeCallback(mkCtx(cap), { ackText: 'ok', newText: 'plain', literalText: true })
+    expect(cap.edits[0]?.text).toBe('plain')
     expect(cap.edits[0]?.opts.parse_mode).toBeUndefined()
   })
 
@@ -170,7 +172,7 @@ describe('finalizeCallback — three-invariant contract', () => {
       log: (l) => logs.push(l),
     })
     expect(cap.edits).toHaveLength(1)
-    expect(cap.edits[0]?.text).toBe('edited body')
+    expect(cap.edits[0]?.text).toEqual({ markdown: 'edited body' })
     expect(synthFired).toBe(true)
     // ack fire-and-forget — its catch fires asynchronously; give it a tick
     // so the log assertion is stable across runs.

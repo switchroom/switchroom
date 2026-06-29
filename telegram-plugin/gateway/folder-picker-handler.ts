@@ -302,8 +302,8 @@ async function recordGrantAndConfirm(
 
   const confirmText =
     `✅ Granted ${deps.agentName} access to folder ${parsed.folder_id}\n` +
-    `Scope: <code>${scope}</code>\n` +
-    `Revoke with: <code>/approvals revoke ${decisionId}</code>`;
+    `Scope: \`${scope}\`\n` +
+    `Revoke with: \`/approvals revoke ${decisionId}\``;
 
   // Keep an [Open in Drive] URL button on the confirmation so the
   // operator can verify which folder they granted.
@@ -312,8 +312,7 @@ async function recordGrantAndConfirm(
     `https://drive.google.com/drive/folders/${parsed.folder_id}`,
   );
   try {
-    await ctx.editMessageText(confirmText, {
-      parse_mode: "HTML",
+    await ctx.editMessageText({ markdown: confirmText }, {
       reply_markup: kb,
     });
   } catch {

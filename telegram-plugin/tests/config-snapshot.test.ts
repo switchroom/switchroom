@@ -285,7 +285,7 @@ describe('renderConfigChangeDim', () => {
     for (const field of fields) {
       const row = renderConfigChangeDim({ field, from: 'a', to: 'b' })
       expect(row).toContain('⚙️')
-      expect(row).toContain('<b>Config</b>')
+      expect(row).toContain('**Config**')
     }
   })
 })

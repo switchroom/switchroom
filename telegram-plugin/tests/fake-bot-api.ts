@@ -27,10 +27,21 @@ export interface SentMessage {
   readonly message_id: number
   readonly chat_id: string
   readonly text: string
+  /**
+   * True when the message landed via the Bot API 10.1 rich path
+   * (`sendRichMessage`) rather than plain `sendMessage` (#2669). `text`
+   * holds the raw GFM markdown body in both cases (for a rich send it is
+   * `rich_message.markdown`), so existing text assertions keep working;
+   * tests that care about the path assert on this flag.
+   */
+  readonly rich?: boolean
   readonly parse_mode?: string
   readonly reply_to_message_id?: number
+  readonly reply_parameters?: { message_id: number; quote?: { text: string; position: number } }
+  readonly reply_markup?: unknown
   readonly message_thread_id?: number
   readonly disable_notification?: boolean
+  readonly link_preview_options?: unknown
 }
 
 export interface PinnedRef {
@@ -184,6 +195,7 @@ export const errors = {
 
 export interface FakeBotApi {
   sendMessage: ReturnType<typeof vi.fn>
+  sendRichMessage: ReturnType<typeof vi.fn>
   editMessageText: ReturnType<typeof vi.fn>
   deleteMessage: ReturnType<typeof vi.fn>
   setMessageReaction: ReturnType<typeof vi.fn>
@@ -367,27 +379,69 @@ export function createFakeBotApi(opts: CreateFakeBotApiOpts = {}): FakeBot {
         text,
         parse_mode: opts?.parse_mode as string | undefined,
         reply_to_message_id: opts?.reply_to_message_id as number | undefined,
+        reply_parameters: opts?.reply_parameters as SentMessage['reply_parameters'],
+        reply_markup: opts?.reply_markup,
         message_thread_id: opts?.message_thread_id as number | undefined,
         disable_notification: opts?.disable_notification as boolean | undefined,
+        link_preview_options: opts?.link_preview_options,
       }
       sent.push(record)
       currentText.set(message_id, text)
       return { message_id, chat: { id: chat_id }, date: Math.floor(Date.now() / 1000), text }
     }),
 
+    // Bot API 10.1 rich-message send (#2669). Records the raw GFM markdown
+    // (`rich_message.markdown`) into `text` so existing text/state
+    // assertions keep working, flags the record `rich: true`, and captures
+    // reply_markup / reply_parameters / message_thread_id the same way
+    // sendMessage does. sendRichMessage does NOT accept link_preview_options
+    // on the wire — the controller strips it before calling — so it is not
+    // recorded here.
+    sendRichMessage: vi.fn(
+      async (chat_id: string, rich_message: { markdown: string }, opts?: Record<string, unknown>) => {
+        await applyEntryGates('sendRichMessage', chat_id)
+        const markdown = rich_message?.markdown ?? ''
+        const message_id = nextMessageId++
+        const record: SentMessage = {
+          message_id,
+          chat_id,
+          text: markdown,
+          rich: true,
+          reply_to_message_id: opts?.reply_to_message_id as number | undefined,
+          reply_parameters: opts?.reply_parameters as SentMessage['reply_parameters'],
+          reply_markup: opts?.reply_markup,
+          message_thread_id: opts?.message_thread_id as number | undefined,
+          disable_notification: opts?.disable_notification as boolean | undefined,
+        }
+        sent.push(record)
+        currentText.set(message_id, markdown)
+        return { message_id, chat: { id: chat_id }, date: Math.floor(Date.now() / 1000), text: markdown }
+      },
+    ),
+
     editMessageText: vi.fn(
-      async (chat_id: string, message_id: number, text: string, opts?: Record<string, unknown>) => {
+      async (
+        chat_id: string,
+        message_id: number,
+        text: string | { markdown: string },
+        opts?: Record<string, unknown>,
+      ) => {
         await applyEntryGates('editMessageText', chat_id)
-        checkParseMode('editMessageText', text, opts?.parse_mode as string | undefined)
+        // #2669: the rich path passes `{ markdown }`; the literal path
+        // passes a plain string. Normalize to the body string for the
+        // not-modified / currentText bookkeeping.
+        const isRich = typeof text === 'object' && text != null
+        const body = isRich ? (text as { markdown: string }).markdown : (text as string)
+        if (!isRich) checkParseMode('editMessageText', body, opts?.parse_mode as string | undefined)
         if (deleted.has(message_id) || !currentText.has(message_id)) {
           // Simulate Telegram's real 400 when the target is gone.
           throw errors.messageToEditNotFound()
         }
         const prev = currentText.get(message_id)
-        if (prev === text) {
+        if (prev === body) {
           throw errors.notModified()
         }
-        currentText.set(message_id, text)
+        currentText.set(message_id, body)
         return true
       },
     ),

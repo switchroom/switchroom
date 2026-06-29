@@ -194,16 +194,16 @@ describe('renderAuthSnapshotFormat2', () => {
   it('renders three health-grouped sections (BLOCKED first, then HEALTHY)', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
     // Headers present
-    expect(out).toContain('🔋 <b>Auth — fleet status</b>');
-    expect(out).toContain('🔴 <b>BLOCKED</b> (1)');
-    expect(out).toContain('🟢 <b>HEALTHY</b> (2)');
+    expect(out).toContain('🔋 **Auth — fleet status**');
+    expect(out).toContain('🔴 **BLOCKED** (1)');
+    expect(out).toContain('🟢 **HEALTHY** (2)');
     // Order: BLOCKED before HEALTHY
     expect(out.indexOf('🔴')).toBeLessThan(out.indexOf('🟢'));
   });
 
   it('marks the active account with ●', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    expect(out).toMatch(/●\s*<code>you@example\.com<\/code>/);
+    expect(out).toMatch(/●\s*`you@example\.com`/);
   });
 
   it('shows "back …" for blocked accounts with binding-window word', () => {
@@ -253,7 +253,7 @@ describe('renderAuthSnapshotFormat2', () => {
     const out = renderAuthSnapshotFormat2(errSnaps, { now: NOW });
     expect(out).toContain('quota probe failed');
     expect(out).toContain('HTTP 401');
-    expect(out).toContain('⚪ <b>UNKNOWN</b>');
+    expect(out).toContain('⚪ **UNKNOWN**');
   });
 
   it('renders refresh stamp when liveProbedAtMs given', () => {
@@ -261,7 +261,7 @@ describe('renderAuthSnapshotFormat2', () => {
       now: NOW,
       liveProbedAtMs: NOW.getTime() - 12_000,
     });
-    expect(out).toMatch(/<i>Live · refreshed \d+s ago<\/i>/);
+    expect(out).toMatch(/_Live · refreshed \d+s ago_/);
   });
 
   it('#2495 Change 2 — renders "⚠ cached Nm ago" (NOT a live stamp) on staleCachedAtMs', () => {
@@ -269,7 +269,7 @@ describe('renderAuthSnapshotFormat2', () => {
       now: NOW,
       staleCachedAtMs: NOW.getTime() - 3 * 60_000, // 3 min old cache
     });
-    expect(out).toMatch(/<i>⚠ cached 3m ago<\/i>/);
+    expect(out).toMatch(/_⚠ cached 3m ago_/);
     // Crucially: no false live stamp.
     expect(out).not.toContain('Live · refreshed');
   });
@@ -302,7 +302,7 @@ describe('renderAuthSnapshotFormat2', () => {
       expect(out).not.toContain('you@example.com');
       // Masked fakes present (pool order from a clean cache: blocked-first
       // render order means bob is masked first, then alice/you in healthy).
-      expect(out).toMatch(/<code>[^@<]+@example\.com<\/code>/);
+      expect(out).toMatch(/`[^@<]+@example\.com`/);
     });
 
     it('WITH demo, the recommendation footer masks the active label', () => {
@@ -381,7 +381,7 @@ describe('renderFallbackAnnouncement', () => {
       now: NOW,
       tz: 'UTC',
     });
-    expect(out).toContain('Triggered by: agent <b>carrie</b>');
+    expect(out).toContain('Triggered by: agent **carrie**');
     expect(out).toMatch(/ken@x.*recovers.*in 4h 57m/);
   });
 
@@ -419,7 +419,7 @@ describe('renderFallbackAnnouncement', () => {
       now: NOW,
       tz: 'UTC',
     });
-    expect(out).toContain('🔴 <b>All accounts blocked');
+    expect(out).toContain('🔴 **All accounts blocked');
     expect(out).toMatch(/ken@x recovers.*in 4h 57m/);
     expect(out).toContain('/auth add');
   });
@@ -461,7 +461,7 @@ describe('renderFallbackAnnouncement', () => {
       now: NOW,
       tz: 'UTC',
     });
-    expect(out).toContain('🔴 <b>All accounts blocked');
+    expect(out).toContain('🔴 **All accounts blocked');
     // Every account is listed (not just the trigger).
     expect(out).toContain('ken@x');
     expect(out).toContain('you@x');
@@ -474,7 +474,7 @@ describe('renderFallbackAnnouncement', () => {
     expect(out).toMatch(/quota exhausted/);
     // The earliest recovery across the fleet (carol, 5h reset at 03:00Z = ~2h)
     // is called out explicitly.
-    expect(out).toMatch(/Earliest recovery:\s*<code>carol@x<\/code>/);
+    expect(out).toMatch(/Earliest recovery:\s*`carol@x`/);
     expect(out).toContain('/auth add');
   });
 
@@ -488,7 +488,7 @@ describe('renderFallbackAnnouncement', () => {
       now: NOW,
       tz: 'UTC',
     });
-    expect(out).toContain('🔴 <b>All accounts blocked');
+    expect(out).toContain('🔴 **All accounts blocked');
     expect(out).toMatch(/ken@x recovers.*in 4h 57m/);
     expect(out).not.toContain('Earliest recovery:');
   });
@@ -866,10 +866,11 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
       { now: NOW },
     );
     // Must be in HEALTHY group, not BLOCKED
-    expect(out).toContain('🟢 <b>HEALTHY</b>');
-    expect(out).not.toContain('🔴 <b>BLOCKED</b>');
-    // Must have informational annotation
-    expect(out).toContain('overage off (out_of_credits) — serving from quota');
+    expect(out).toContain('🟢 **HEALTHY**');
+    expect(out).not.toContain('🔴 **BLOCKED**');
+    // Must have informational annotation. #2669: the reason is markdown-
+    // escaped, so the underscores in "out_of_credits" render as "out\_of\_credits".
+    expect(out).toContain('overage off (out\\_of\\_credits) — serving from quota');
     // Must NOT have old blocked framing
     expect(out).not.toContain('billing disabled');
     expect(out).not.toContain("won't recover until billing is fixed");
@@ -913,7 +914,7 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
       [snap({ label: 'org@x', isActive: false, quota: quota({ fiveHourUtilizationPct: 85, overageDisabledReason: 'org_level_disabled' }) })],
       { now: NOW },
     );
-    expect(out).toContain('🟡 <b>THROTTLING</b>');
+    expect(out).toContain('🟡 **THROTTLING**');
     expect(out).not.toContain('overage off');
   });
 

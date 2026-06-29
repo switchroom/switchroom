@@ -177,7 +177,7 @@ import {
   STATUS_LINE_MAX,
   NESTED_PREFIX,
 } from './status-no-truncate.js'
-import { escapeHtml, stripMarkdown, truncate } from './card-format.js'
+import { escapeMarkdown, stripMarkdown, truncate } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
 
 /**
@@ -264,11 +264,11 @@ export function renderActivityHeader(
 ): [string, string] {
   const toolWord = toolCount === 1 ? 'tool' : 'tools'
   const elapsed = formatFeedElapsed(elapsedMs)
-  const descPart = description.length > 0 ? ` · <i>${escapeHtml(description)}</i>` : ''
-  const line1 = `${emoji} <b>${escapeHtml(label)}</b>${descPart}`
+  const descPart = description.length > 0 ? ` · _${escapeMarkdown(description)}_` : ''
+  const line1 = `${emoji} **${escapeMarkdown(label)}**${descPart}`
   const line2 = state === 'running'
-    ? `<i>${elapsed} · ${toolCount} ${toolWord}</i>`
-    : `<i>${state} · ${toolCount} ${toolWord} · ${elapsed}</i>`
+    ? `_${elapsed} · ${toolCount} ${toolWord}_`
+    : `_${state} · ${toolCount} ${toolWord} · ${elapsed}_`
   return [line1, line2]
 }
 
@@ -286,14 +286,14 @@ export function formatFeedElapsed(ms: number): string {
 //   1. stripMarkdown(raw)
 //   2. .replace(/\s+/g, ' ').trim()
 //   3. truncate(_, STATUS_LINE_MAX)
-//   4. escapeHtml(_)   ← escape is ALWAYS the last per-line op.
+//   4. escapeMarkdown(_)   ← escape is ALWAYS the last per-line op.
 // Escaping last is load-bearing: clipping an already-escaped string can split
-// an HTML entity (&amp; → &amp), which Telegram's HTML parser rejects.
+// a markdown escape (\* → \), which renders wrong.
 
-/** Clean + clip + escape a single raw step line. Returns ready-to-wrap HTML. */
+/** Clean + clip + escape a single raw step line. Returns ready-to-wrap markdown. */
 function escapeStepLine(raw: string): string {
   const cleaned = stripMarkdown(raw).replace(/\s+/g, ' ').trim()
-  return escapeHtml(truncate(cleaned, STATUS_LINE_MAX))
+  return escapeMarkdown(truncate(cleaned, STATUS_LINE_MAX))
 }
 
 /**
@@ -317,10 +317,10 @@ export function renderStepFeed(
   if (steps.length === 0) return
   const shown = steps.slice(-STATUS_ROLLING_LINES)
   const hidden = steps.length - shown.length
-  if (hidden > 0) out.push(`<i>✓ +${hidden} earlier…</i>`)
+  if (hidden > 0) out.push(`_✓ +${hidden} earlier…_`)
   const lastIdx = shown.length - 1
   shown.forEach((s, i) => {
-    out.push(!allDone && i === lastIdx ? `<b>→ ${s}${liveSuffix}</b>` : `<i>✓ ${s}</i>`)
+    out.push(!allDone && i === lastIdx ? `**→ ${s}${liveSuffix}**` : `_✓ ${s}_`)
   })
 }
 
@@ -399,18 +399,18 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
     // Parent lines all render done — the live → step lives in the nested block.
     const shownParent = steps.slice(-STATUS_ROLLING_LINES)
     const hiddenParent = steps.length - shownParent.length
-    if (hiddenParent > 0) out.push(`<i>✓ +${hiddenParent} earlier…</i>`)
-    for (const s of shownParent) out.push(`<i>✓ ${s}</i>`)
+    if (hiddenParent > 0) out.push(`_✓ +${hiddenParent} earlier…_`)
+    for (const s of shownParent) out.push(`_✓ ${s}_`)
     // Child block.
     const shownChild = children.slice(-STATUS_ROLLING_LINES)
     const hiddenChild = children.length - shownChild.length
-    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}<i>+${hiddenChild} earlier…</i>`)
+    if (hiddenChild > 0) out.push(`${NESTED_PREFIX}_+${hiddenChild} earlier…_`)
     const lastChildIdx = shownChild.length - 1
     shownChild.forEach((s, i) => {
       out.push(
         i === lastChildIdx && !final
-          ? `${NESTED_PREFIX}<b>→ ${s}${liveSuffix}</b>`
-          : `${NESTED_PREFIX}<i>${s}</i>`,
+          ? `${NESTED_PREFIX}**→ ${s}${liveSuffix}**`
+          : `${NESTED_PREFIX}_${s}_`,
       )
     })
   } else {
@@ -418,12 +418,12 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   }
 
   if (final && stepCount != null && stepCount > 0) {
-    out.push(`<i>✓ ${stepCount} steps</i>`)
+    out.push(`_✓ ${stepCount} steps_`)
   }
 
   if (result != null && result.text.length > 0) {
     out.push(WORKER_RESULT_RULE)
-    out.push(`${result.emoji} <i>${escapeHtml(truncate(result.text, WORKER_RESULT_MAX))}</i>`)
+    out.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
   }
 
   // out always carries the two header lines, so it is never empty — but guard
@@ -444,7 +444,7 @@ const WORKER_RESULT_MAX = 320
  * drops the oldest body bullets one at a time, re-inserting a `+N earlier…`
  * marker, until the card fits STATUS_CARD_CHAR_BUDGET. In the extreme case
  * (a single newest bullet that is itself oversized) it truncates the RAW
- * newest text, THEN escapes, THEN wraps — never slicing already-escaped HTML.
+ * newest text, THEN escapes, THEN wraps — never slicing already-escaped markdown.
  */
 function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   const { final = false, liveSuffix = '', stepCount, result } = opts
@@ -454,10 +454,10 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
 
   // Fixed footer/result lines (always kept).
   const footerLines: string[] = []
-  if (final && stepCount != null && stepCount > 0) footerLines.push(`<i>✓ ${stepCount} steps</i>`)
+  if (final && stepCount != null && stepCount > 0) footerLines.push(`_✓ ${stepCount} steps_`)
   if (result != null && result.text.length > 0) {
     footerLines.push(WORKER_RESULT_RULE)
-    footerLines.push(`${result.emoji} <i>${escapeHtml(truncate(result.text, WORKER_RESULT_MAX))}</i>`)
+    footerLines.push(`${result.emoji} _${escapeMarkdown(truncate(result.text, WORKER_RESULT_MAX))}_`)
   }
   const fixedCost = [...headerLines, ...footerLines].join('\n').length
 
@@ -468,17 +468,17 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   const prefix = hasChildren ? NESTED_PREFIX : ''
 
   const buildBullet = (esc: string, isLast: boolean): string =>
-    !final && isLast ? `${prefix}<b>→ ${esc}${liveSuffix}</b>` : `${prefix}<i>${esc}</i>`
+    !final && isLast ? `${prefix}**→ ${esc}${liveSuffix}**` : `${prefix}_${esc}_`
 
   // Parent-collapsed marker line when we are dropping children but parent steps exist.
   const parentMarker =
-    hasChildren && rawSteps.length > 0 ? `<i>✓ +${rawSteps.length} earlier…</i>` : null
+    hasChildren && rawSteps.length > 0 ? `_✓ +${rawSteps.length} earlier…_` : null
 
   for (let drop = 1; drop < escapedBody.length; drop++) {
     const shown = escapedBody.slice(drop)
     const lines: string[] = [...headerLines]
     if (parentMarker != null) lines.push(parentMarker)
-    lines.push(hasChildren ? `${NESTED_PREFIX}<i>+${drop} earlier…</i>` : `<i>✓ +${drop} earlier…</i>`)
+    lines.push(hasChildren ? `${NESTED_PREFIX}_+${drop} earlier…_` : `_✓ +${drop} earlier…_`)
     const lastIdx = shown.length - 1
     shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
     lines.push(...footerLines)
@@ -491,19 +491,19 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   // escaping can expand the string (& → &amp;).
   const rawNewest = body.length > 0 ? stripMarkdown(body[body.length - 1]).replace(/\s+/g, ' ').trim() : ''
   const wrapperOverhead = final
-    ? (prefix + '<i>✓ </i>').length
-    : (prefix + '<b>→ </b>').length + liveSuffix.length
+    ? (prefix + '_✓ _').length
+    : (prefix + '**→ **').length + liveSuffix.length
   const headerFooterCost =
     fixedCost + (fixedCost > 0 ? 1 : 0) + (parentMarker != null ? parentMarker.length + 1 : 0)
   const budget = STATUS_CARD_CHAR_BUDGET - headerFooterCost - wrapperOverhead
   let raw = rawNewest.slice(0, Math.max(0, budget))
-  let newest = escapeHtml(raw)
+  let newest = escapeMarkdown(raw)
   while (raw.length > 0 && wrapperOverhead + headerFooterCost + newest.length > STATUS_CARD_CHAR_BUDGET) {
     const excess = wrapperOverhead + headerFooterCost + newest.length - STATUS_CARD_CHAR_BUDGET
     raw = raw.slice(0, Math.max(0, raw.length - excess - 1))
-    newest = escapeHtml(raw)
+    newest = escapeMarkdown(raw)
   }
-  const newestLine = final ? `${prefix}<i>✓ ${newest}</i>` : `${prefix}<b>→ ${newest}${liveSuffix}</b>`
+  const newestLine = final ? `${prefix}_✓ ${newest}_` : `${prefix}**→ ${newest}${liveSuffix}**`
   const lines: string[] = [...headerLines]
   if (parentMarker != null) lines.push(parentMarker)
   lines.push(newestLine)

@@ -126,8 +126,9 @@ describe("secret-detect — deleteSensitiveMessage helper retains its 'surface f
   it("helper posts an in-chat warning naming the leaked message id", () => {
     // The warning is the only signal a mobile-only operator gets —
     // stderr is invisible to them. Pinning the in-chat surface as
-    // the load-bearing piece.
-    expect(helperBody).toMatch(/sendMessage/);
-    expect(helperBody).toMatch(/delete message.*manually|delete it manually|manually|delete message <code>/i);
+    // the load-bearing piece. Post-#2669 the warning ships via the
+    // rich-message path (sendRichMessage).
+    expect(helperBody).toMatch(/sendRichMessage|sendMessage/);
+    expect(helperBody).toMatch(/delete message.*manually|delete it manually|manually/i);
   });
 });

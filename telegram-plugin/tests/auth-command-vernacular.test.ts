@@ -511,10 +511,11 @@ describe('handleAuthCommand — help text lists every verb', () => {
       { agentName: 'x', isAdmin: true, client },
     )
     const text = reply.text
-    // Verbs (all variants). The help is HTML; <code> wraps each verb.
+    // Verbs (all variants). The help is GFM markdown (#2669); each verb is
+    // wrapped in a `code span`, so `<agent>` renders literally — no HTML escape.
     for (const fragment of [
       '/auth show',
-      '/auth show &lt;agent&gt;',
+      '/auth show <agent>',
       '/auth list',
       '/auth use',
       '/auth rotate',

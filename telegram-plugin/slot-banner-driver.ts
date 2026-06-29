@@ -31,10 +31,15 @@ export interface BannerBotApi {
     text: string,
     opts?: Record<string, unknown>,
   ): Promise<{ message_id: number }>;
+  sendRichMessage(
+    chat_id: string | number,
+    rich_message: { markdown: string },
+    opts?: Record<string, unknown>,
+  ): Promise<{ message_id: number }>;
   editMessageText(
     chat_id: string | number,
     message_id: number,
-    text: string,
+    text: string | { markdown: string },
     opts?: Record<string, unknown>,
   ): Promise<unknown>;
   pinChatMessage(
@@ -107,9 +112,8 @@ export async function refreshBanner(
   if (action.kind === 'pin') {
     let sent: { message_id: number };
     try {
-      sent = await args.bot.api.sendMessage(args.ownerChatId, action.text, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
+      // sendRichMessage doesn't accept link_preview_options — omit it.
+      sent = await args.bot.api.sendRichMessage(args.ownerChatId, { markdown: action.text }, {
         // OAuth slot banner is a status notice — silence the open ping.
         // (the pin below is already silent; the edit path doesn't ping.)
         disable_notification: true,
@@ -135,9 +139,8 @@ export async function refreshBanner(
     await args.bot.api.editMessageText(
       args.ownerChatId,
       action.messageId,
-      action.text,
+      { markdown: action.text },
       {
-        parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
       },
     );

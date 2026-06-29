@@ -78,7 +78,7 @@ export function formatLastEventLine(
   }
 
   const kindIcon = EVENT_KIND_ICON[ev.kind] ?? '⚪'
-  return `  <i>last: ${kindIcon} ${ev.kind} (${age})</i>`
+  return `  _last: ${kindIcon} ${ev.kind} (${age})_`
 }
 
 const EVENT_KIND_ICON: Record<string, string> = {

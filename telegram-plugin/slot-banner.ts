@@ -72,15 +72,12 @@ export function formatBannerHtml(
   defaultSlot: string,
 ): string {
   return [
-    `📌 <b>${escapeHtml(agentName)}</b> is running on slot <code>${escapeHtml(currentSlot)}</code>`,
-    `<i>(failover from <code>${escapeHtml(defaultSlot)}</code>)</i>`,
+    `📌 **${escapeMarkdown(agentName)}** is running on slot \`${currentSlot}\``,
+    `_(failover from \`${defaultSlot}\`)_`,
   ].join(' ');
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+/** Local GFM-markdown escaper (keeps this module dependency-free). */
+function escapeMarkdown(text: string): string {
+  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1');
 }

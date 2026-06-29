@@ -5,13 +5,15 @@
  *   1. single-sourced (no drift between gateway mode and monolith mode)
  *   2. unit-testable without needing a grammy Context
  *
- * All functions return HTML-safe strings with <b>/<i>/<code> markup ready
- * for Telegram's parse_mode=HTML. The <code>…</code> wrapper is deliberate
- * for things like command names and agent identifiers, which render as
- * monospace inline and avoid Telegram treating them as markdown.
+ * All functions return GFM markdown strings (bold, italic, inline code)
+ * ready for the rich-message path (#2669). The code-span wrapper is
+ * deliberate for command names and agent identifiers, which render as
+ * monospace inline (and inside a code span, characters are literal so no
+ * escaping is needed).
  */
 
 import { maskUsername } from "./demo-mask.js";
+import { escapeMarkdown } from "./card-format.js";
 
 export type AuthSummary = {
   authenticated: boolean;
@@ -93,14 +95,11 @@ export type AgentMetadata = {
   live?: StatusProbeRow[];
 };
 
-// Tiny escaper — duplicates the one in gateway.ts / server.ts so this
-// module stays dependency-free and easy to test.
+// Markdown escaper for dynamic values interpolated into bold/plain card
+// text (#2669). Kept under the legacy `escapeHtml` name so existing imports
+// don't churn; it now escapes GFM-markdown specials.
 export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+  return escapeMarkdown(text);
 }
 
 /**
@@ -137,9 +136,9 @@ export function formatAgentLine(meta: AgentMetadata): string {
   // restart, when the session reverts to the configured model).
   const session =
     meta.sessionModel && meta.sessionModel.length > 0
-      ? ` · live session: <code>${escapeHtml(meta.sessionModel)}</code>`
+      ? ` · live session: \`${meta.sessionModel}\``
       : "";
-  return `<b>${escapeHtml(meta.agentName)}</b> · model: <code>${escapeHtml(m)}</code>${session}${topic}`;
+  return `**${escapeHtml(meta.agentName)}** · model: \`${m}\`${session}${topic}`;
 }
 
 /**
@@ -150,15 +149,15 @@ export function formatAgentLine(meta: AgentMetadata): string {
 export function startText(agentName: string, dmDisabled: boolean): string {
   if (dmDisabled) return "This bot isn't accepting new connections.";
   return [
-    `<b>Switchroom</b> — Telegram on your Claude Pro or Max subscription.`,
+    `**Switchroom** — Telegram on your Claude Pro or Max subscription.`,
     ``,
-    `This bot is the <b>${escapeHtml(agentName)}</b> agent. Pair first, then send messages here and they reach the agent; replies and reactions come back.`,
+    `This bot is the **${escapeHtml(agentName)}** agent. Pair first, then send messages here and they reach the agent; replies and reactions come back.`,
     ``,
-    `<b>To pair:</b>`,
+    `**To pair:**`,
     `1. DM me anything — you'll get a 6-char code`,
-    `2. In Claude Code: <code>/telegram:access pair &lt;code&gt;</code>`,
+    `2. In Claude Code: \`/telegram:access pair <code>\``,
     ``,
-    `After pairing, try <code>/status</code> or <code>/commands</code>.`,
+    `After pairing, try \`/status\` or \`/commands\`.`,
   ].join("\n");
 }
 
@@ -168,16 +167,16 @@ export function startText(agentName: string, dmDisabled: boolean): string {
  */
 export function helpText(agentName: string): string {
   return [
-    `<b>Switchroom</b> — your Pro/Max subscription, wired to Telegram.`,
+    `**Switchroom** — your Pro/Max subscription, wired to Telegram.`,
     ``,
-    `This bot is the <b>${escapeHtml(agentName)}</b> agent. Text and photos route through to it; replies, reactions and progress cards come back.`,
+    `This bot is the **${escapeHtml(agentName)}** agent. Text and photos route through to it; replies, reactions and progress cards come back.`,
     ``,
-    `Tool approvals surface as inline buttons (✅ / ❌) or via <code>/approve</code>, <code>/deny</code>, <code>/pending</code>. Start a fresh session with <code>/new</code>, or trim/clear context with <code>/compact</code> / <code>/clear</code>.`,
+    `Tool approvals surface as inline buttons (✅ / ❌) or via \`/approve\`, \`/deny\`, \`/pending\`. Start a fresh session with \`/new\`, or trim/clear context with \`/compact\` / \`/clear\`.`,
     ``,
-    `<code>/start</code> — pairing instructions`,
-    `<code>/status</code> — agent, model, auth`,
-    `<code>/vault audit &lt;agent&gt;</code> — admin: review agent's vault access + one-tap [🔓 Allow] on recent denials`,
-    `<code>/commands</code> — full command list`,
+    `\`/start\` — pairing instructions`,
+    `\`/status\` — agent, model, auth`,
+    `\`/vault audit <agent>\` — admin: review agent's vault access + one-tap [🔓 Allow] on recent denials`,
+    `\`/commands\` — full command list`,
   ].join("\n");
 }
 
@@ -217,7 +216,7 @@ export function statusPairedText(params: {
     `Agent: ${formatAgentLine(meta)}`,
     `Auth: ${formatAuthLine(meta.auth)}`,
   ];
-  if (meta.status) lines.push(`Status: <code>${escapeHtml(meta.status)}</code>${meta.uptime ? ` · up ${escapeHtml(meta.uptime)}` : ""}`);
+  if (meta.status) lines.push(`Status: \`${meta.status}\`${meta.uptime ? ` · up ${escapeHtml(meta.uptime)}` : ""}`);
 
   // Live health block — every probe (green and otherwise) so the user
   // can see at a glance what's working AND what isn't. This is the
@@ -225,10 +224,10 @@ export function statusPairedText(params: {
   // contract: the boot card is a quiet ack, /status is the dashboard.
   if (meta.live && meta.live.length > 0) {
     lines.push("");
-    lines.push("<b>Health</b>");
+    lines.push("**Health**");
     for (const row of meta.live) {
       const dot = STATUS_DOT[row.status] ?? STATUS_DOT.fail;
-      lines.push(`${dot} <b>${escapeHtml(row.label)}</b>  ${escapeHtml(row.detail)}`);
+      lines.push(`${dot} **${escapeHtml(row.label)}**  ${escapeHtml(row.detail)}`);
     }
   }
 
@@ -237,14 +236,14 @@ export function statusPairedText(params: {
     // Blank separator before the audit block so the reply reads as two
     // sections: live state up top, config audit below.
     lines.push("");
-    if (audit.version) lines.push(`<b>Version</b> ${escapeHtml(audit.version)}`);
-    if (meta.extendsProfile) lines.push(`<b>Profile</b> ${escapeHtml(meta.extendsProfile)}`);
-    if (audit.tools) lines.push(`<b>Tools</b> ${escapeHtml(audit.tools)}`);
-    if (audit.toolsDeny) lines.push(`<b>Deny</b> ${escapeHtml(audit.toolsDeny)}`);
-    if (audit.skills) lines.push(`<b>Skills</b> ${escapeHtml(audit.skills)}`);
-    if (audit.limits) lines.push(`<b>Limits</b> ${escapeHtml(audit.limits)}`);
-    if (audit.channel) lines.push(`<b>Channel</b> ${escapeHtml(audit.channel)}`);
-    if (audit.memoryBank) lines.push(`<b>Memory</b> ${escapeHtml(audit.memoryBank)}`);
+    if (audit.version) lines.push(`**Version** ${escapeHtml(audit.version)}`);
+    if (meta.extendsProfile) lines.push(`**Profile** ${escapeHtml(meta.extendsProfile)}`);
+    if (audit.tools) lines.push(`**Tools** ${escapeHtml(audit.tools)}`);
+    if (audit.toolsDeny) lines.push(`**Deny** ${escapeHtml(audit.toolsDeny)}`);
+    if (audit.skills) lines.push(`**Skills** ${escapeHtml(audit.skills)}`);
+    if (audit.limits) lines.push(`**Limits** ${escapeHtml(audit.limits)}`);
+    if (audit.channel) lines.push(`**Channel** ${escapeHtml(audit.channel)}`);
+    if (audit.memoryBank) lines.push(`**Memory** ${escapeHtml(audit.memoryBank)}`);
   }
 
   return lines.join("\n");
@@ -254,7 +253,7 @@ export function statusPairedText(params: {
  * `/status` when the sender isn't paired yet but has a pending code.
  */
 export function statusPendingText(code: string): string {
-  return `Pending pairing — run in Claude Code:\n\n<code>/telegram:access pair ${escapeHtml(code)}</code>`;
+  return `Pending pairing — run in Claude Code:\n\n\`/telegram:access pair ${code}\``;
 }
 
 /**
@@ -367,55 +366,55 @@ export const TELEGRAM_SWITCHROOM_COMMANDS = TELEGRAM_MENU_COMMANDS.slice(3);
 
 export function switchroomHelpText(agentName: string): string {
   return [
-    `<b>Switchroom bot</b> — commands for the <b>${escapeHtml(agentName)}</b> agent.`,
+    `**Switchroom bot** — commands for the **${escapeHtml(agentName)}** agent.`,
     ``,
-    `<b>Session &amp; approvals</b>`,
-    `<code>/new</code> — fresh session (flush handoff, restart)`,
-    `<code>/compact</code> — compact context (summarize, keep the thread)`,
-    `<code>/clear</code> — clear context (fresh slate; memory in Hindsight)`,
-    `<code>/approve [id]</code> — approve pending tool permission`,
-    `<code>/deny [id]</code> — deny pending tool permission`,
-    `<code>/pending</code> — list pending permission prompts`,
-    `<code>/interrupt [name]</code> — interrupt an agent turn`,
+    `**Session & approvals**`,
+    `\`/new\` — fresh session (flush handoff, restart)`,
+    `\`/compact\` — compact context (summarize, keep the thread)`,
+    `\`/clear\` — clear context (fresh slate; memory in Hindsight)`,
+    `\`/approve [id]\` — approve pending tool permission`,
+    `\`/deny [id]\` — deny pending tool permission`,
+    `\`/pending\` — list pending permission prompts`,
+    `\`/interrupt [name]\` — interrupt an agent turn`,
     ``,
-    `<b>Agents</b>`,
-    `<code>/agents</code> — list all agents`,
-    `<code>/agentstart [name]</code> — start an agent`,
-    `<code>/stop [name]</code> — stop an agent`,
-    `<code>/logs [name] [lines]</code> — show agent logs`,
-    `<code>/memory &lt;query&gt;</code> — search agent memory`,
+    `**Agents**`,
+    `\`/agents\` — list all agents`,
+    `\`/agentstart [name]\` — start an agent`,
+    `\`/stop [name]\` — stop an agent`,
+    `\`/logs [name] [lines]\` — show agent logs`,
+    `\`/memory <query>\` — search agent memory`,
     ``,
-    `<b>Fleet management</b>`,
-    `<code>/upgradestatus</code> — read-only: CLI version, image age, container age per service`,
-    `<code>/update</code> — dry-run plan; <code>/update apply</code> — actually pull images, reconcile, restart`,
-    `<code>/restart [name|all]</code> — bounce agent (drains in-flight turn by default)`,
-    `<code>/version</code> — show versions + running agent health summary`,
-    `<code>/whoami</code> — this agent's sandbox: tools, MCP, vault key-names, powers`,
+    `**Fleet management**`,
+    `\`/upgradestatus\` — read-only: CLI version, image age, container age per service`,
+    `\`/update\` — dry-run plan; \`/update apply\` — actually pull images, reconcile, restart`,
+    `\`/restart [name|all]\` — bounce agent (drains in-flight turn by default)`,
+    `\`/version\` — show versions + running agent health summary`,
+    `\`/whoami\` — this agent's sandbox: tools, MCP, vault key-names, powers`,
     ``,
-    `<b>Auth &amp; config</b>`,
-    `<code>/auth</code> — auth status or actions`,
-    `<code>/auth add [agent]</code> — add a new account slot (fallback pool)`,
-    `<code>/auth list [agent]</code> — list account slots and health`,
-    `<code>/auth use [agent] &lt;slot&gt;</code> — switch active slot and restart`,
-    `<code>/auth rm [agent] &lt;slot&gt; [--force]</code> — remove a slot`,
-    `<code>/model</code> — show the configured Claude model`,
-    `<code>/model &lt;name&gt;</code> — switch the live session's model (opus · sonnet · haiku or a full id; until restart)`,
-    `<code>/effort</code> — show or switch reasoning effort (low · medium · high · xhigh · max; until restart)`,
-    `<code>/topics</code> — topic-to-agent mappings`,
-    `<code>/permissions [agent]</code> — show agent permissions`,
-    `<code>/grant &lt;tool&gt;</code> — grant a tool permission`,
-    `<code>/dangerous [off]</code> — toggle full tool access`,
-    `<code>/vault list|get|set|delete</code> — manage encrypted secrets`,
-    `<code>/vault status</code> — show broker state (locked/unlocked, uptime, key count)`,
-    `<code>/vault unlock</code> — unlock the broker (prompts for passphrase via Telegram)`,
-    `<code>/vault lock</code> — lock the broker`,
-    `<code>/vault grants [agent]</code> — list active capability grants (tap to revoke)`,
-    `<code>/doctor</code> — health check (deps, services, MCP)`,
-    `<code>/usage</code> — Pro/Max plan quota (5h + 7d windows)`,
-    `<code>/inject &lt;slash&gt;</code> — inject a Claude Code REPL slash command (e.g. <code>/inject /cost</code>; allowlisted)`,
-    `<code>/commands</code> — this help`,
+    `**Auth & config**`,
+    `\`/auth\` — auth status or actions`,
+    `\`/auth add [agent]\` — add a new account slot (fallback pool)`,
+    `\`/auth list [agent]\` — list account slots and health`,
+    `\`/auth use [agent] <slot>\` — switch active slot and restart`,
+    `\`/auth rm [agent] <slot> [--force]\` — remove a slot`,
+    `\`/model\` — show the configured Claude model`,
+    `\`/model <name>\` — switch the live session's model (opus · sonnet · haiku or a full id; until restart)`,
+    `\`/effort\` — show or switch reasoning effort (low · medium · high · xhigh · max; until restart)`,
+    `\`/topics\` — topic-to-agent mappings`,
+    `\`/permissions [agent]\` — show agent permissions`,
+    `\`/grant <tool>\` — grant a tool permission`,
+    `\`/dangerous [off]\` — toggle full tool access`,
+    `\`/vault list|get|set|delete\` — manage encrypted secrets`,
+    `\`/vault status\` — show broker state (locked/unlocked, uptime, key count)`,
+    `\`/vault unlock\` — unlock the broker (prompts for passphrase via Telegram)`,
+    `\`/vault lock\` — lock the broker`,
+    `\`/vault grants [agent]\` — list active capability grants (tap to revoke)`,
+    `\`/doctor\` — health check (deps, services, MCP)`,
+    `\`/usage\` — Pro/Max plan quota (5h + 7d windows)`,
+    `\`/inject <slash>\` — inject a Claude Code REPL slash command (e.g. \`/inject /cost\`; allowlisted)`,
+    `\`/commands\` — this help`,
     ``,
-    `<i>Tip: <code>/update</code> shows the plan; <code>/update apply</code> executes it; <code>/restart</code> bounces a stuck agent; <code>/version</code> checks what's running.</i>`,
+    `_Tip: \`/update\` shows the plan; \`/update apply\` executes it; \`/restart\` bounces a stuck agent; \`/version\` checks what's running._`,
   ].join("\n");
 }
 
@@ -424,10 +423,10 @@ export function switchroomHelpText(agentName: string): string {
  * Centralized so gateway and monolith agree on wording.
  */
 export function restartAckText(agentName: string): string {
-  return `🔄 Restarting <b>${escapeHtml(agentName)}</b>…`;
+  return `🔄 Restarting **${escapeHtml(agentName)}**…`;
 }
 
 export function newSessionAckText(agentName: string, flushedHandoff: boolean): string {
   const tail = flushedHandoff ? " · flushed handoff" : "";
-  return `🆕 Started fresh session for <b>${escapeHtml(agentName)}</b>${tail} · restarting…`;
+  return `🆕 Started fresh session for **${escapeHtml(agentName)}**${tail} · restarting…`;
 }

@@ -32,7 +32,7 @@
 import { createHash } from 'crypto'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
 import { dirname } from 'path'
-import { escapeHtml } from '../card-format.js'
+import { escapeMarkdown } from '../card-format.js'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -189,19 +189,19 @@ export function diffSnapshots(
 export function renderConfigChangeDim(dim: ConfigChangeDim): string {
   switch (dim.field) {
     case 'model': {
-      const from = escapeHtml(dim.from ?? '(default)')
-      const to = escapeHtml(dim.to ?? '(default)')
-      return `⚙️ <b>Config</b>  model: ${from} → ${to}`
+      const from = escapeMarkdown(dim.from ?? '(default)')
+      const to = escapeMarkdown(dim.to ?? '(default)')
+      return `⚙️ **Config**  model: ${from} → ${to}`
     }
     case 'memoryBackend': {
-      const from = escapeHtml(dim.from ?? '(default)')
-      const to = escapeHtml(dim.to ?? '(default)')
-      return `⚙️ <b>Config</b>  memory backend: ${from} → ${to}`
+      const from = escapeMarkdown(dim.from ?? '(default)')
+      const to = escapeMarkdown(dim.to ?? '(default)')
+      return `⚙️ **Config**  memory backend: ${from} → ${to}`
     }
     case 'tools':
-      return `⚙️ <b>Config</b>  tools allowlist changed — run /status for details`
+      return `⚙️ **Config**  tools allowlist changed — run /status for details`
     case 'skills':
-      return `⚙️ <b>Config</b>  skills changed — run /status for details`
+      return `⚙️ **Config**  skills changed — run /status for details`
   }
 }
 

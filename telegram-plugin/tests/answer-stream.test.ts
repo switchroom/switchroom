@@ -4,15 +4,16 @@ import {
   MIN_INITIAL_CHARS,
 } from '../answer-stream.js'
 import { resolveAnswerLaneConfig, ANSWER_LANE_NEVER_OPENS } from '../answer-stream-flag.js'
-import { markdownToHtml } from '../format.js'
-import { sanitizeTelegramHtml } from '../html-sanitize.js'
 
-/**
- * The exact renderer the gateway injects into createAnswerStream — markdown →
- * Telegram HTML, then HTML sanitize. Mirrors gateway.ts so the test pins the
- * real conversion, not a hand-rolled one.
- */
-const renderText = (text: string): string => sanitizeTelegramHtml(markdownToHtml(text))
+// #2669: the answer lane no longer converts markdown → HTML. It ships the RAW
+// assistant transcript markdown through its sendMessage/editMessageText
+// closures, which the gateway wires to the rich-message path
+// (`sendRichMessage` / `editMessageText({ markdown })`). There is no
+// renderText / parse_mode anymore — the body IS the raw GFM markdown.
+
+// The rich-message wire cap the answer lane guards against (matches
+// answer-stream.ts's TELEGRAM_MAX_CHARS).
+const TELEGRAM_MAX_CHARS = 32768
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -137,27 +138,27 @@ describe('answer-stream — minInitialChars threshold', () => {
     expect(sendMessage).toHaveBeenCalledWith(
       'chat1',
       'y'.repeat(500),
-      expect.objectContaining({ parse_mode: 'HTML' }),
+      // #2669: no parse_mode — the body ships as raw markdown via the rich path.
+      expect.not.objectContaining({ parse_mode: 'HTML' }),
     )
     expect(editMessageText).not.toHaveBeenCalled()
   })
 })
 
-describe('answer-stream — markdown → HTML conversion (renderText)', () => {
-  // Regression for the answer-stream-raw-markdown bug: this lane historically
-  // shipped the RAW assistant transcript under parse_mode:'HTML', so `**bold**`
-  // arrived as literal asterisks while every other lane converted. The fix
-  // injects the same renderText the other lanes use; these tests assert the
-  // wire payload is converted, not raw.
+describe('answer-stream — raw GFM markdown passthrough (#2669)', () => {
+  // The answer lane historically shipped the RAW assistant transcript under
+  // parse_mode:'HTML', so `**bold**` arrived as literal asterisks. Post-#2669
+  // there is ONE rich-markdown path: the lane ships the raw markdown VERBATIM
+  // (the gateway wraps it in `sendRichMessage` / `editMessageText({ markdown })`),
+  // so `**bold**` reaches Telegram intact and renders as bold there.
 
-  it('converts **bold** to <b>bold</b> on the opening sendMessage', async () => {
+  it('ships raw markdown verbatim on the opening sendMessage (no HTML conversion)', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
       minInitialChars: 10,
       throttleMs: 250,
-      renderText,
       sendMessage,
       editMessageText,
     })
@@ -167,33 +168,27 @@ describe('answer-stream — markdown → HTML conversion (renderText)', () => {
 
     expect(sendMessage).toHaveBeenCalledTimes(1)
     const sentText = sendMessage.mock.calls[0][1] as string
-    expect(sentText).toContain('<b>bold</b>')
-    expect(sentText).not.toContain('**bold**')
-    expect(sendMessage).toHaveBeenCalledWith(
-      'chat1',
-      expect.stringContaining('<b>bold</b>'),
-      expect.objectContaining({ parse_mode: 'HTML' }),
-    )
+    // Raw markdown passes through unchanged — no <b> conversion.
+    expect(sentText).toContain('**bold**')
+    expect(sentText).not.toContain('<b>bold</b>')
+    expect(sendMessage.mock.calls[0][2]).not.toHaveProperty('parse_mode')
   })
 
-  it('converts **bold** to <b>bold</b> on a follow-up editMessageText', async () => {
+  it('ships raw markdown verbatim on a follow-up editMessageText', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
       minInitialChars: 10,
       throttleMs: 250,
-      renderText,
       sendMessage,
       editMessageText,
     })
 
-    // First update opens the message.
     stream.update('first chunk of the answer arriving')
     await flushMicrotasks()
     expect(sendMessage).toHaveBeenCalledTimes(1)
 
-    // Second update (past the throttle window) edits in place with markdown.
     vi.advanceTimersByTime(300)
     stream.update('first chunk of the answer arriving with **bold** added')
     vi.advanceTimersByTime(300)
@@ -201,54 +196,31 @@ describe('answer-stream — markdown → HTML conversion (renderText)', () => {
 
     expect(editMessageText).toHaveBeenCalled()
     const editText = editMessageText.mock.calls.at(-1)![2] as string
-    expect(editText).toContain('<b>bold</b>')
-    expect(editText).not.toContain('**bold**')
+    expect(editText).toContain('**bold**')
+    expect(editText).not.toContain('<b>bold</b>')
   })
 
-  it('converts **bold** to <b>bold</b> on materialize', async () => {
+  it('ships raw markdown verbatim on materialize', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
       chatId: 'chat1',
       minInitialChars: 10,
       throttleMs: 250,
-      renderText,
       sendMessage,
       editMessageText,
     })
 
     stream.update('The final answer is **definitely** forty-two.')
     await flushMicrotasks()
-    // Opening send already converted; capture how many sends precede materialize.
     const sendsBeforeMaterialize = sendMessage.mock.calls.length
 
     const id = await stream.materialize()
     expect(typeof id).toBe('number')
-    // materialize always sends a fresh message for the push notification.
     expect(sendMessage.mock.calls.length).toBe(sendsBeforeMaterialize + 1)
     const sentText = sendMessage.mock.calls.at(-1)![1] as string
-    expect(sentText).toContain('<b>definitely</b>')
-    expect(sentText).not.toContain('**definitely**')
-  })
-
-  it('sends raw text verbatim when no renderText is injected (back-compat)', async () => {
-    const sendMessage = makeSendMessage()
-    const editMessageText = makeEditMessageText()
-    const stream = createAnswerStream({
-      chatId: 'chat1',
-      minInitialChars: 10,
-      throttleMs: 250,
-      sendMessage,
-      editMessageText,
-    })
-
-    stream.update('Here is some **bold** narration text for the user.')
-    await flushMicrotasks()
-
-    expect(sendMessage).toHaveBeenCalledTimes(1)
-    const sentText = sendMessage.mock.calls[0][1] as string
-    // No renderer → unchanged (preserves prior behaviour for unwired callers).
-    expect(sentText).toContain('**bold**')
+    expect(sentText).toContain('**definitely**')
+    expect(sentText).not.toContain('<b>definitely</b>')
   })
 })
 
@@ -467,7 +439,7 @@ describe('answer-stream — empty / whitespace-only text is a no-op', () => {
 })
 
 describe('answer-stream — maxChars guard', () => {
-  it('does not send when text exceeds 4096 chars', async () => {
+  it('does not send when text exceeds the rich-message cap (#2669)', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const stream = createAnswerStream({
@@ -478,13 +450,31 @@ describe('answer-stream — maxChars guard', () => {
       editMessageText,
     })
 
-    // 4097 chars exceeds Telegram's 4096 limit
-    stream.update('z'.repeat(4097))
+    // One char over the 32768 rich-message limit.
+    stream.update('z'.repeat(TELEGRAM_MAX_CHARS + 1))
     vi.advanceTimersByTime(1000)
     await flushMicrotasks()
 
     expect(sendMessage).not.toHaveBeenCalled()
     expect(editMessageText).not.toHaveBeenCalled()
+  })
+
+  it('DOES send a body that fits under the 32768 cap (was rejected under the old 4096)', async () => {
+    const sendMessage = makeSendMessage()
+    const editMessageText = makeEditMessageText()
+    const stream = createAnswerStream({
+      chatId: 'chat1',
+      minInitialChars: 0,
+      throttleMs: 250,
+      sendMessage,
+      editMessageText,
+    })
+
+    // 8000 chars — over the legacy 4096 cap but well under the rich cap.
+    stream.update('z'.repeat(8000))
+    await flushMicrotasks()
+
+    expect(sendMessage).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -532,7 +522,7 @@ describe('answer-stream — onSuperseded callback', () => {
 })
 
 describe('answer-stream — materialize() max-chars guard', () => {
-  it('does not send when buffered text exceeds 4096 chars', async () => {
+  it('does not send when buffered text exceeds the rich-message cap (#2669)', async () => {
     const sendMessage = makeSendMessage()
     const editMessageText = makeEditMessageText()
     const warn = vi.fn()
@@ -550,13 +540,14 @@ describe('answer-stream — materialize() max-chars guard', () => {
     await flushMicrotasks()
     const sendsAfterStreaming = sendMessage.mock.calls.length
 
-    stream.update('b'.repeat(4097))
+    // One char over the 32768 rich cap.
+    stream.update('b'.repeat(TELEGRAM_MAX_CHARS + 1))
     const result = await stream.materialize()
 
     expect(result).toBeUndefined()
     expect(sendMessage.mock.calls.length).toBe(sendsAfterStreaming)
     expect(warn).toHaveBeenCalled()
-    expect(warn.mock.calls.some((c) => /4096|exceeds/i.test(String(c[0])))).toBe(true)
+    expect(warn.mock.calls.some((c) => /32768|exceeds/i.test(String(c[0])))).toBe(true)
   })
 })
 
@@ -800,7 +791,7 @@ describe('answer-stream — onMetric callback (#203)', () => {
       onMetric,
     })
 
-    stream.update('x'.repeat(4097))
+    stream.update('x'.repeat(TELEGRAM_MAX_CHARS + 1))
     onMetric.mockClear()
     const id = await stream.materialize()
 

@@ -1,639 +1,151 @@
 /**
- * Tests for Telegram formatting utilities: markdownToHtml, splitHtmlChunks,
- * file reference wrapping, and message coalescing.
+ * Tests for the post-#2669 Telegram formatting utilities.
+ *
+ * The markdown→HTML engine, the HTML sanitizer, and the MarkdownV2 escaper
+ * are gone — every outbound message ships raw GFM markdown via
+ * `sendRichMessage` / `editMessageText({ markdown })`. What survives in
+ * `format.ts` and is covered here:
+ *
+ *   - repairEscapedWhitespace — LLM-side JSON-escape repair (format-agnostic).
+ *   - escapeMarkdown — inline-special escaper for dynamic card content.
+ *   - splitMarkdownChunks — code-fence / table-row aware chunker.
+ *   - RICH_MESSAGE_MAX_CHARS — the 32768 rich-message wire cap.
  */
 import { describe, test, expect } from 'vitest'
 
 // Import from the side-effect-free format module so tests don't trigger
 // server.ts's startup (env load, token check, grammy init).
-import { markdownToHtml, splitHtmlChunks, isLikelyTelegramHtml, repairEscapedWhitespace, sanitizeForTelegram, telegramHtmlToPlainText } from '../format.js'
+import {
+  repairEscapedWhitespace,
+  escapeMarkdown,
+  splitMarkdownChunks,
+  RICH_MESSAGE_MAX_CHARS,
+} from '../format.js'
 
 // ---------------------------------------------------------------------------
-// markdownToHtml
+// escapeMarkdown — narrowed inline-special escaper (#2669)
 // ---------------------------------------------------------------------------
 
-describe('markdownToHtml', () => {
-  test('converts bold **text** to <b>text</b>', () => {
-    expect(markdownToHtml('Hello **world**')).toContain('<b>world</b>')
-  })
-
-  test('converts italic *text* to <i>text</i>', () => {
-    expect(markdownToHtml('Hello *world*')).toContain('<i>world</i>')
-  })
-
-  test('does not confuse bold and italic', () => {
-    const result = markdownToHtml('**bold** and *italic*')
-    expect(result).toContain('<b>bold</b>')
-    expect(result).toContain('<i>italic</i>')
-  })
-
-  // _..._ italic (underscore form) — 8 cases
-  test('converts _text_ to <i>text</i> (plain underscore italic)', () => {
-    expect(markdownToHtml('Hello _world_')).toContain('<i>world</i>')
-  })
-
-  test('converts emoji-leading _📥 Queued as a new task_', () => {
-    expect(markdownToHtml('_📥 Queued as a new task_')).toContain('<i>📥 Queued as a new task</i>')
-  })
-
-  test('converts emoji-trailing _steer on the prior task 🔁_', () => {
-    expect(markdownToHtml('_steer on the prior task 🔁_')).toContain('<i>steer on the prior task 🔁</i>')
-  })
-
-  test('converts both-ends emoji _🔥 hot take 🔥_', () => {
-    expect(markdownToHtml('_🔥 hot take 🔥_')).toContain('<i>🔥 hot take 🔥</i>')
-  })
-
-  test('does NOT convert snake_case to italic', () => {
-    const result = markdownToHtml('my_snake_case_var')
-    expect(result).not.toContain('<i>')
-    expect(result).toContain('my_snake_case_var')
-  })
-
-  test('does NOT convert __double__ underscore to italic', () => {
-    const result = markdownToHtml('__double__')
-    expect(result).not.toContain('<i>')
-  })
-
-  test('does NOT convert word-internal underscores', () => {
-    const result = markdownToHtml('foo_bar')
-    expect(result).not.toContain('<i>')
-    expect(result).toContain('foo_bar')
-  })
-
-  test('_..._ and *...* italics coexist correctly', () => {
-    const result = markdownToHtml('*asterisk* and _underscore_')
-    expect(result).toContain('<i>asterisk</i>')
-    expect(result).toContain('<i>underscore</i>')
-  })
-
-  test('converts inline `code` to <code>code</code>', () => {
-    expect(markdownToHtml('Use `console.log`')).toContain('<code>console.log</code>')
-  })
-
-  test('converts code blocks with language', () => {
-    const input = '```typescript\nconst x = 1\n```'
-    const result = markdownToHtml(input)
-    expect(result).toContain('<pre><code class="language-typescript">')
-    expect(result).toContain('const x = 1')
-    expect(result).toContain('</code></pre>')
-  })
-
-  test('converts code blocks without language', () => {
-    const input = '```\nplain code\n```'
-    const result = markdownToHtml(input)
-    expect(result).toContain('<pre><code>')
-    expect(result).toContain('plain code')
-  })
-
-  test('converts strikethrough ~~text~~ to <s>text</s>', () => {
-    expect(markdownToHtml('~~deleted~~')).toContain('<s>deleted</s>')
-  })
-
-  test('converts [text](url) to <a href="url">text</a>', () => {
-    const result = markdownToHtml('Click [here](https://example.com)')
-    expect(result).toContain('<a href="https://example.com">here</a>')
-  })
-
-  test('escapes HTML entities in plain text', () => {
-    const result = markdownToHtml('x < y & z > w')
-    expect(result).toContain('&lt;')
-    expect(result).toContain('&amp;')
-    expect(result).toContain('&gt;')
-  })
-
-  test('does not escape HTML inside code blocks', () => {
-    const input = '```html\n<div>test</div>\n```'
-    const result = markdownToHtml(input)
-    expect(result).toContain('&lt;div&gt;test&lt;/div&gt;')
-  })
-
-  test('does not escape HTML inside inline code', () => {
-    const result = markdownToHtml('Use `<div>` element')
-    expect(result).toContain('<code>&lt;div&gt;</code>')
-  })
-
-  test('wraps file references in code tags', () => {
-    const result = markdownToHtml('Edit server.ts and package.json')
-    expect(result).toContain('<code>server.ts</code>')
-    expect(result).toContain('<code>package.json</code>')
-  })
-
-  test('does not double-wrap file references already in code', () => {
-    const result = markdownToHtml('Edit `server.ts` now')
-    // Should have exactly one <code>server.ts</code>, not nested
-    const matches = result.match(/<code>server\.ts<\/code>/g)
-    expect(matches).not.toBeNull()
-    expect(matches!.length).toBe(1)
-    // And crucially: NO nested <code><code>...</code></code>
-    expect(result).not.toContain('<code><code>')
-    expect(result).not.toContain('</code></code>')
-  })
-
-  test('inline code containing asterisks does not get re-matched by italic regex (#415)', () => {
-    // Regression for #415: inline-code spans containing `*` (e.g. C
-    // pointer syntax) used to be restored from their placeholder BEFORE
-    // the italic pass, so the italic regex would see `<code>size_t *p</code>`
-    // and try to wrap `p</code>...` in <i>...</i>, producing invalid HTML
-    // that Telegram rejected with 400 Bad Request, sending the caller into
-    // a `format: text` fallback for the rest of the chunk.
-    const result = markdownToHtml('Use `size_t *p` to declare a pointer.')
-    expect(result).toContain('<code>size_t *p</code>')
-    // No stray <i> wrapping the asterisk — pre-fix the buggy output was
-    // `<code>size_t <i>p</code> to declare a pointer.</i>`.
-    expect(result).not.toMatch(/<i>[^<]*<\/code>/)
-    expect(result).not.toMatch(/<code>[^<]*<i>/)
-  })
-
-  test('inline code containing double-asterisks does not get re-matched by bold regex (#415)', () => {
-    const result = markdownToHtml('Pattern is `**glob**` not regex.')
-    expect(result).toContain('<code>**glob**</code>')
-    // The bold regex must not have wrapped the literal asterisks inside <code>.
-    expect(result).not.toMatch(/<b>[^<]*<\/code>/)
-    expect(result).not.toMatch(/<code>[^<]*<b>/)
-  })
-
-  test('code block containing asterisks does not get re-matched by italic regex (#415)', () => {
-    const input = '```c\nsize_t *p = NULL;\n```'
-    const result = markdownToHtml(input)
-    expect(result).toContain('size_t *p = NULL;')
-    expect(result).not.toMatch(/<i>[^<]*<\/code>/)
-    expect(result).not.toMatch(/<i>[^<]*<\/pre>/)
-  })
-
-  test('does not double-wrap when inline code sits alongside prose with file refs', () => {
-    // Regression for the user-observed bug: messages that mixed inline code
-    // spans (backticks around filenames) with prose produced
-    // `<code><code>settings.json</code></code>` in the stored history. The
-    // file-reference regex ran AFTER inline-code placeholder restoration and
-    // re-wrapped the filename inside the just-restored <code> tag because
-    // its negative lookbehind did not exclude `>`.
-    const result = markdownToHtml(
-      'I mixed raw `<a href="...">` HTML into messages whose `format` defaults ' +
-      'to `html` — but the plugin runs a markdown→HTML converter which escapes ' +
-      'literal `<` and `>`, so raw tags render as visible text in the rendered ' +
-      '`settings.json` output.'
-    )
-    expect(result).not.toContain('<code><code>')
-    expect(result).not.toContain('</code></code>')
-    // settings.json, format, html should each appear inside exactly one
-    // <code> tag — either from the backtick wrapping or the file-ref regex,
-    // but never both.
-    const settingsMatches = result.match(/<code>settings\.json<\/code>/g)
-    expect(settingsMatches).not.toBeNull()
-    expect(settingsMatches!.length).toBe(1)
-  })
-
-  test('file-reference wrap still runs on bare filenames in prose', () => {
-    // Confirm the fix doesn't break the normal case: bare filenames in
-    // plain prose still get auto-wrapped in <code> tags.
-    const result = markdownToHtml('Edit server.ts and then run tsc --noEmit')
-    expect(result).toContain('<code>server.ts</code>')
-  })
-
-  test('file-reference wrap does not match filenames adjacent to > (inside tag markup)', () => {
-    // A filename that sits right after a `>` (tag close) should not be
-    // re-wrapped — it's already inside some structured context.
-    const input = '<b>foo.ts</b>'
-    const result = markdownToHtml(input)
-    // Passes through as Telegram HTML (smart pass-through) — filename is
-    // not wrapped in <code> because it's inside a <b>.
-    expect(result).toBe(input)
-  })
-
-  test('handles nested bold and italic', () => {
-    const result = markdownToHtml('**bold *and italic* text**')
-    expect(result).toContain('<b>')
-    expect(result).toContain('</b>')
-  })
-
-  test('handles plain text with no formatting', () => {
-    const result = markdownToHtml('Just a plain message')
-    expect(result).toBe('Just a plain message')
-  })
-
-  test('handles empty string', () => {
-    expect(markdownToHtml('')).toBe('')
-  })
-
-  test('preserves multiple paragraphs', () => {
-    const result = markdownToHtml('First paragraph\n\nSecond paragraph')
-    expect(result).toContain('First paragraph')
-    expect(result).toContain('Second paragraph')
-  })
-
-  test('converts ## headings to bold (Telegram has no <h1>)', () => {
-    const result = markdownToHtml('## My Heading\n\nbody text')
-    expect(result).toContain('<b>My Heading</b>')
-    expect(result).not.toContain('## ')
-  })
-
-  test('converts # headings to bold', () => {
-    const result = markdownToHtml('# Top heading\n\nbody')
-    expect(result).toContain('<b>Top heading</b>')
-    expect(result).not.toMatch(/^# /m)
-  })
-
-  test('converts deep ### #### headings to bold without losing content', () => {
-    const result = markdownToHtml('### Section\n#### Subsection\nbody')
-    expect(result).toContain('<b>Section</b>')
-    expect(result).toContain('<b>Subsection</b>')
-    expect(result).not.toContain('###')
-    expect(result).not.toContain('####')
-  })
-
-  test('does not convert # inside code blocks', () => {
-    const input = '```bash\n# this is a comment\n```'
-    const result = markdownToHtml(input)
-    expect(result).toContain('# this is a comment')
-    expect(result).not.toContain('<b># this is a comment</b>')
-  })
-
-  // ─── HTML pass-through (the bug that made <b> tags render as text) ─────
-
-  test('passes through already-rendered Telegram HTML untouched', () => {
-    const input = '<b>Bold heading</b>\n<i>italic body</i>'
-    expect(markdownToHtml(input)).toBe(input)
-  })
-
-  test('passes through Telegram HTML with <code> blocks', () => {
-    const input = '<b>commit</b> <code>abc123</code>'
-    expect(markdownToHtml(input)).toBe(input)
-  })
-
-  test('passes through Telegram HTML with mixed tags and text', () => {
-    const input = '<b>What you should see</b>\n👀 immediately, then 🤔 after 2s'
-    expect(markdownToHtml(input)).toBe(input)
-  })
-
-  test('escapes when input has unsupported HTML tags (e.g. <div>)', () => {
-    const input = '<div>not telegram html</div>'
-    const out = markdownToHtml(input)
-    // Falls into the markdown path → escapes the angle brackets
-    expect(out).toContain('&lt;div&gt;')
-  })
-
-  test('escapes when input is plain markdown without HTML', () => {
-    const input = '**bold** text'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>bold</b>')
-  })
-})
-
-describe('isLikelyTelegramHtml', () => {
-  test('returns true for simple <b>', () => {
-    expect(isLikelyTelegramHtml('<b>hello</b>')).toBe(true)
-  })
-
-  test('returns true for <code>', () => {
-    expect(isLikelyTelegramHtml('use <code>git status</code>')).toBe(true)
-  })
-
-  test('returns true for nested supported tags', () => {
-    expect(isLikelyTelegramHtml('<b><i>bold italic</i></b>')).toBe(true)
-  })
-
-  test('returns true for <a href>', () => {
-    expect(isLikelyTelegramHtml('see <a href="https://x.com">x</a>')).toBe(true)
-  })
-
-  test('returns false when ANY tag is unsupported', () => {
-    expect(isLikelyTelegramHtml('<b>fine</b> but <div>not</div>')).toBe(false)
-  })
-
-  test('returns false for plain text with no tags', () => {
-    expect(isLikelyTelegramHtml('just words here')).toBe(false)
-  })
-
-  test('returns false for plain markdown', () => {
-    expect(isLikelyTelegramHtml('**bold** and *italic*')).toBe(false)
-  })
-
-  test('returns false for code with angle brackets', () => {
-    expect(isLikelyTelegramHtml('the operator <-> means something')).toBe(false)
-  })
-
-  // ─── The bug: HTML tags inside markdown inline code spans ─────────────
-
-  test('ignores HTML tags inside backtick inline code', () => {
-    // The model writes `<b>tag</b>` (showing literal HTML in inline code).
-    // The text is markdown, NOT raw HTML — must return false.
-    expect(isLikelyTelegramHtml('Use `<b>tag</b>` to make text bold.')).toBe(false)
-  })
-
-  test('ignores HTML tags inside fenced code blocks', () => {
-    const input = 'Example:\n```html\n<div>hi</div>\n```\nThat\'s it.'
-    expect(isLikelyTelegramHtml(input)).toBe(false)
-  })
-
-  test('returns false when text mixes markdown bold with HTML examples in code', () => {
-    // The exact bug pattern from the user-facing screenshot regression
-    const input = '**1. Raw HTML rendering** — replies showed `<b>tag</b>` text instead of bold.'
-    expect(isLikelyTelegramHtml(input)).toBe(false)
-  })
-
-  test('returns false when text has markdown links', () => {
-    expect(isLikelyTelegramHtml('See [docs](https://example.com)')).toBe(false)
-  })
-
-  test('returns false when text has markdown headings', () => {
-    expect(isLikelyTelegramHtml('## Section\n\nbody')).toBe(false)
-  })
-
-  test('still returns true for pure HTML even with code spans', () => {
-    // Code spans can coexist with real HTML — as long as there are NO
-    // markdown bold/link/heading patterns and the tags outside code are
-    // all valid Telegram HTML, trust it.
-    expect(isLikelyTelegramHtml('<b>commit</b> <code>abc123</code>')).toBe(true)
-  })
-})
-
-describe('markdownToHtml regression: mixed markdown + raw Telegram HTML', () => {
-  // The exact bug pattern from the user-facing screenshot regression: model
-  // emits markdown bold AND raw <b>/<a> tags in the same message. The
-  // markdown path used to escape every `<` to `&lt;`, so the raw tags
-  // rendered as literal text. Now the converter preserves whitelisted
-  // Telegram HTML tags through the escape pass.
-
-  test('preserves embedded <b> when text also has markdown bold', () => {
-    const input = '**Pattern worth stealing:** the <b>verification subagent</b> is a validator.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>Pattern worth stealing:</b>')
-    expect(out).toContain('<b>verification subagent</b>')
-    expect(out).not.toContain('&lt;b&gt;')
-  })
-
-  test('preserves embedded <a href> when text also has markdown bold', () => {
-    const input = '**Sources:** see <a href="https://example.com/x">Example</a> for details.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>Sources:</b>')
-    expect(out).toContain('<a href="https://example.com/x">Example</a>')
-    expect(out).not.toContain('&lt;a ')
-  })
-
-  test('preserves embedded <i> when text also has markdown bold', () => {
-    const input = '**Rule:** group work by <i>what context it needs</i>.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>Rule:</b>')
-    expect(out).toContain('<i>what context it needs</i>')
-    expect(out).not.toContain('&lt;i&gt;')
-  })
-
-  test('preserves multiple embedded tags in one message', () => {
-    const input = '**Header**\n- <b>Context</b> matters\n- <i>Speed</i> too\n- See <a href="https://x.com">x</a>'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>Header</b>')
-    expect(out).toContain('<b>Context</b>')
-    expect(out).toContain('<i>Speed</i>')
-    expect(out).toContain('<a href="https://x.com">x</a>')
-  })
-
-  test('still escapes unsupported tags even when whitelisted ones are present', () => {
-    const input = '**hi** <b>ok</b> and <div>bad</div>'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>hi</b>')
-    expect(out).toContain('<b>ok</b>')
-    // <div> is not in the whitelist → escaped
-    expect(out).toContain('&lt;div&gt;')
-  })
-
-  test('preserves embedded <code> spans alongside markdown', () => {
-    const input = '**Run:** <code>git status</code> first.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>Run:</b>')
-    expect(out).toContain('<code>git status</code>')
-  })
-
-  test('preserves <a> with query-string href containing markdown-link-like text', () => {
-    const input = 'See <a href="https://example.com/path">the docs</a>.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<a href="https://example.com/path">the docs</a>')
-  })
-})
-
-describe('markdownToHtml regression: HTML in code spans', () => {
-  test('renders **bold** correctly when text also contains `<b>` in inline code', () => {
-    const input = '**1. Raw HTML rendering** — replies showed `<b>tag</b>` text instead of bold.'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<b>1. Raw HTML rendering</b>')
-    expect(out).toContain('<code>&lt;b&gt;tag&lt;/b&gt;</code>')
-    expect(out).not.toContain('**1. Raw HTML rendering**')
-  })
-
-  test('renders fenced code blocks even when they contain HTML examples', () => {
-    const input = 'Example:\n```html\n<div>hi</div>\n```'
-    const out = markdownToHtml(input)
-    expect(out).toContain('<pre><code class="language-html">')
-    expect(out).toContain('&lt;div&gt;hi&lt;/div&gt;')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// splitHtmlChunks
-// ---------------------------------------------------------------------------
-
-describe('splitHtmlChunks', () => {
-  test('returns single chunk for short text', () => {
-    const result = splitHtmlChunks('Hello world', 4000)
-    expect(result).toEqual(['Hello world'])
-  })
-
-  test('splits long text into multiple chunks', () => {
-    const longText = 'a'.repeat(5000)
-    const chunks = splitHtmlChunks(longText, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // All chunks should be <= maxLen (plus possible closing tags)
-    for (const c of chunks) {
-      expect(c.length).toBeLessThanOrEqual(2100) // small margin for closing tags
+describe('escapeMarkdown', () => {
+  test('escapes the inline-formatting specials: \\ ` * _ ~ = [ ] |', () => {
+    expect(escapeMarkdown('\\')).toBe('\\\\')
+    expect(escapeMarkdown('`')).toBe('\\`')
+    expect(escapeMarkdown('*')).toBe('\\*')
+    expect(escapeMarkdown('_')).toBe('\\_')
+    expect(escapeMarkdown('~')).toBe('\\~')
+    expect(escapeMarkdown('=')).toBe('\\=')
+    expect(escapeMarkdown('[')).toBe('\\[')
+    expect(escapeMarkdown(']')).toBe('\\]')
+    expect(escapeMarkdown('|')).toBe('\\|')
+  })
+
+  test('does NOT escape line-start-only / structural chars: . - + # ( ) { } ! >', () => {
+    // Escaping these mid-word would litter filenames/versions/URLs with
+    // visible backslashes. They are only meaningful at line-start or in
+    // link/structure context.
+    for (const ch of ['.', '-', '+', '#', '(', ')', '{', '}', '!', '>']) {
+      expect(escapeMarkdown(ch)).toBe(ch)
     }
   })
 
-  test('preserves open tags across chunk boundaries', () => {
-    const html = '<b>' + 'x'.repeat(5000) + '</b>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // First chunk should have closing </b>
-    expect(chunks[0]).toContain('</b>')
-    // Second chunk should reopen <b>
-    expect(chunks[1]).toMatch(/^<b>/)
+  test('leaves a plain filename untouched', () => {
+    expect(escapeMarkdown('foo.ts')).toBe('foo.ts')
+    expect(escapeMarkdown('v1.2-rc')).toBe('v1.2-rc')
+    expect(escapeMarkdown('src/cli/index.ts')).toBe('src/cli/index.ts')
   })
 
-  test('prefers splitting at paragraph boundaries', () => {
-    const html = 'First paragraph content here' + '\n\n' + 'Second paragraph content here'
-    // Set maxLen so it would split somewhere in the middle
-    const chunks = splitHtmlChunks(html, 35)
-    expect(chunks.length).toBe(2)
-    expect(chunks[0]).toContain('First paragraph')
-    expect(chunks[1]).toContain('Second paragraph')
+  test('escapes emphasis markers inside dynamic text so they render literally', () => {
+    expect(escapeMarkdown('a_b_c')).toBe('a\\_b\\_c')
+    expect(escapeMarkdown('**not bold**')).toBe('\\*\\*not bold\\*\\*')
   })
 
-  test('handles nested tags', () => {
-    const html = '<b><i>' + 'x'.repeat(5000) + '</i></b>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // First chunk should close both tags
-    expect(chunks[0]).toMatch(/<\/i><\/b>$/)
-    // Second chunk should reopen both tags
-    expect(chunks[1]).toMatch(/^<b><i>/)
-  })
-
-  test('handles empty string', () => {
-    expect(splitHtmlChunks('')).toEqual([''])
-  })
-
-  test('respects custom maxLen', () => {
-    const text = 'a'.repeat(100)
-    const chunks = splitHtmlChunks(text, 30)
-    expect(chunks.length).toBeGreaterThanOrEqual(3)
-  })
-
-  test('defaults to 4000 maxLen', () => {
-    const text = 'a'.repeat(3999)
-    const chunks = splitHtmlChunks(text)
-    expect(chunks).toEqual([text])
-  })
-
-  test('does not split inside an HTML entity (&amp;)', () => {
-    // Construct text where the natural cut would land inside &amp;
-    // Position the entity so that maxLen falls between & and ;
-    const filler = 'x'.repeat(20)
-    // Cut would be at position 22, mid-entity
-    const html = filler + ' &amp; more text after the entity'
-    const chunks = splitHtmlChunks(html, 22)
-    // The entity should not be broken — we should see the full &amp; in
-    // some chunk, never &am or amp;.
-    for (const c of chunks) {
-      expect(c).not.toMatch(/&am$/)
-      expect(c).not.toMatch(/^p;/)
-      expect(c).not.toMatch(/^amp;/)
-    }
-    // Recombined text should equal original (allowing for the chunker's
-    // tag-rebalancing trim of leading newlines)
-    expect(chunks.join('')).toContain('&amp;')
-  })
-
-  test('does not split inside a numeric HTML entity (&#x1F4A9;)', () => {
-    const filler = 'a'.repeat(15)
-    const html = filler + ' &#x1F4A9; more'
-    const chunks = splitHtmlChunks(html, 20)
-    for (const c of chunks) {
-      expect(c).not.toMatch(/&#x1F$/)
-      expect(c).not.toMatch(/^4A9;/)
-    }
-  })
-
-  // ─── Regression: tag-name parsing must allow `-` so `tg-spoiler` and
-  // `tg-emoji` survive chunk boundaries instead of being truncated to `tg`.
-  test('preserves <tg-spoiler> across chunk boundaries', () => {
-    const html = '<tg-spoiler>' + 'x'.repeat(5000) + '</tg-spoiler>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // Chunk0 must close with the FULL tag name, not a truncated `</tg>`
-    expect(chunks[0]).toMatch(/<\/tg-spoiler>$/)
-    expect(chunks[0]).not.toMatch(/<\/tg>$/)
-    // Chunk1 must reopen with the full tag name
-    expect(chunks[1]).toMatch(/^<tg-spoiler>/)
-    expect(chunks[1]).not.toMatch(/^<tg>/)
-  })
-
-  test('preserves <tg-emoji> across chunk boundaries', () => {
-    const html = '<tg-emoji emoji-id="5368324170671202286">' + 'y'.repeat(5000) + '</tg-emoji>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    expect(chunks[0]).toMatch(/<\/tg-emoji>$/)
-    expect(chunks[1]).toMatch(/^<tg-emoji/)
-  })
-
-  // ─── Regression: reopening `<a href="...">` in the next chunk must
-  // preserve the href attribute. Previously the splitter emitted bare
-  // `<a>` which Telegram rejects.
-  test('preserves <a href="..."> attributes across chunk boundaries', () => {
-    const href = 'https://example.com/some/deep/path?x=1'
-    // Put a natural split point well into the link text so paragraph/space
-    // breaks don't land inside the opening tag itself.
-    const html = `<a href="${href}">` + 'word '.repeat(1000) + '</a>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // First chunk must close the anchor
-    expect(chunks[0]).toMatch(/<\/a>$/)
-    // Second chunk must reopen with the FULL href attribute, not bare `<a>`
-    expect(chunks[1]).toMatch(new RegExp(`^<a href="${href.replace(/[.?/]/g, '\\$&')}">`))
-    expect(chunks[1]).not.toMatch(/^<a>/)
-  })
-
-  test('preserves <code class="language-ts"> attributes across boundaries', () => {
-    const html = '<pre><code class="language-ts">' + 'z '.repeat(2000) + '</code></pre>'
-    const chunks = splitHtmlChunks(html, 2000)
-    expect(chunks.length).toBeGreaterThan(1)
-    // Reopened chunk should carry the class attribute
-    expect(chunks[1]).toContain('<code class="language-ts">')
-  })
-
-  // ─── Regression: splitter must not cut INSIDE an open tag. Previously,
-  // `<a href="..."` followed by a long run of non-space text made the
-  // space-fallback pick position 2 (the space inside `<a href=`) and emit
-  // a chunk consisting of just `<a`, which Telegram rejects.
-  test('does not cut inside an open tag when tag contains the only nearby space', () => {
-    const html = '<a href="https://example.com/very/long/url">' + 'y'.repeat(5000) + '</a>'
-    const chunks = splitHtmlChunks(html, 2000)
-    // No chunk should end mid-tag (e.g. `<a` or `<a href="..`)
-    for (const c of chunks) {
-      // A chunk ending with `<` or `<tagname` with no closing `>` is malformed.
-      // Quick check: count unclosed `<`s by stripping complete tags.
-      const withoutTags = c.replace(/<[^>]*>/g, '')
-      expect(withoutTags).not.toContain('<')
-    }
-  })
-
-  test('backs off when the cut lands between < and > of an opening tag', () => {
-    // Construct a case where `cut` would naturally land inside `<b attr="...">`
-    const filler = 'a '.repeat(1000) // lots of spaces so splitter has choices
-    const html = filler + '<b class="very-long-classname-that-pushes-the-tag-past-cut">' + 'x'.repeat(5000) + '</b>'
-    const chunks = splitHtmlChunks(html, 2000)
-    // None of the chunks should contain a stray `<` without a matching `>`.
-    for (const c of chunks) {
-      const withoutTags = c.replace(/<[^>]*>/g, '')
-      expect(withoutTags).not.toContain('<')
-      expect(withoutTags).not.toContain('>')
-    }
+  test('escapes the backslash first so it never double-escapes a following special', () => {
+    // `\*` in the input is backslash + star → both get escaped exactly once.
+    expect(escapeMarkdown('\\*')).toBe('\\\\\\*')
   })
 })
 
 // ---------------------------------------------------------------------------
-// File reference wrapping
+// splitMarkdownChunks — never bisects a code fence or a table row
 // ---------------------------------------------------------------------------
 
-describe('file reference wrapping', () => {
-  test('wraps .ts files', () => {
-    expect(markdownToHtml('Look at server.ts')).toContain('<code>server.ts</code>')
+describe('splitMarkdownChunks', () => {
+  test('returns a single chunk when the body fits', () => {
+    const text = 'short message'
+    expect(splitMarkdownChunks(text, 100)).toEqual([text])
   })
 
-  test('wraps .json files', () => {
-    expect(markdownToHtml('Check package.json')).toContain('<code>package.json</code>')
+  test('defaults the cap to RICH_MESSAGE_MAX_CHARS', () => {
+    const text = 'x'.repeat(RICH_MESSAGE_MAX_CHARS)
+    expect(splitMarkdownChunks(text)).toEqual([text])
+    expect(splitMarkdownChunks(text + 'y')).toHaveLength(2)
   })
 
-  test('wraps .py files', () => {
-    expect(markdownToHtml('Run main.py')).toContain('<code>main.py</code>')
+  test('every chunk fits within maxLen', () => {
+    const text = Array.from({ length: 50 }, (_, i) => `paragraph ${i} ${'word '.repeat(20)}`).join('\n\n')
+    const chunks = splitMarkdownChunks(text, 200)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(200)
   })
 
-  test('wraps complex filenames', () => {
-    expect(markdownToHtml('Edit my-component.tsx')).toContain('<code>my-component.tsx</code>')
+  test('rejoining the chunks reproduces the original content (modulo trimmed boundary newlines)', () => {
+    const text = Array.from({ length: 40 }, (_, i) => `line ${i}`).join('\n')
+    const chunks = splitMarkdownChunks(text, 50)
+    // The chunker strips leading newlines from each subsequent chunk, so
+    // join with '\n' and compare the whitespace-collapsed forms.
+    const rejoined = chunks.join('\n').replace(/\n+/g, '\n')
+    expect(rejoined).toBe(text.replace(/\n+/g, '\n'))
   })
 
-  test('does not wrap non-file extensions', () => {
-    const result = markdownToHtml('This is sentence.ending with a period')
-    // "sentence.ending" shouldn't be wrapped since "ending" is not in the ext list
-    expect(result).not.toContain('<code>sentence.ending</code>')
+  test('never leaves a chunk with an unbalanced ``` fence', () => {
+    // A long body with a fenced code block straddling the cap. The chunker
+    // must move the whole fence to a single chunk so no chunk has an odd
+    // number of fence delimiters (which would swallow the next chunk).
+    const fence = '```\n' + 'code line\n'.repeat(20) + '```'
+    const text = 'intro paragraph '.repeat(15) + '\n\n' + fence + '\n\noutro paragraph'
+    const chunks = splitMarkdownChunks(text, 180)
+    for (const c of chunks) {
+      const fences = (c.match(/^```/gm) ?? []).length
+      expect(fences % 2).toBe(0)
+    }
+  })
+
+  test('never bisects a markdown table row', () => {
+    const header = '| col a | col b | col c |\n| --- | --- | --- |\n'
+    const rows = Array.from({ length: 30 }, (_, i) => `| r${i}a | r${i}b | r${i}c |`).join('\n')
+    const text = 'preamble '.repeat(10) + '\n\n' + header + rows
+    const chunks = splitMarkdownChunks(text, 160)
+    // Every line containing a `|` must be a complete row — i.e. start and
+    // end with `|` once trimmed (the chunker cuts at line boundaries).
+    for (const c of chunks) {
+      for (const line of c.split('\n')) {
+        if (!line.includes('|')) continue
+        const t = line.trim()
+        if (t.length === 0) continue
+        expect(t.startsWith('|')).toBe(true)
+        expect(t.endsWith('|')).toBe(true)
+      }
+    }
+  })
+
+  test('emits an oversized indivisible block whole rather than looping forever', () => {
+    // A single fenced block larger than maxLen has no safe interior cut —
+    // the chunker emits it whole (a louder, debuggable Telegram reject
+    // beats an infinite loop).
+    const giant = '```\n' + 'x'.repeat(500) + '\n```'
+    const chunks = splitMarkdownChunks(giant, 100)
+    // It comes out as one (oversized) chunk, not split mid-fence.
+    expect(chunks.length).toBe(1)
+    expect(chunks[0]).toBe(giant)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Coalescing (unit-level: test the buffer/flush logic)
+// coalescing logic (pure helpers — unchanged by #2669)
 // ---------------------------------------------------------------------------
 
 describe('coalescing logic', () => {
   test('coalesceKey produces unique keys per chat+user', () => {
-    // We test the key format directly — the coalescing behavior is integration-level
     const key1 = `chat1:user1`
     const key2 = `chat1:user2`
     const key3 = `chat2:user1`
@@ -642,7 +154,6 @@ describe('coalescing logic', () => {
   })
 
   test('messages combine with newline separator', () => {
-    // Simulate what the coalescing logic does: join texts with \n
     const messages = ['Hello', 'How are you?', 'One more thing']
     const combined = messages.join('\n')
     expect(combined).toBe('Hello\nHow are you?\nOne more thing')
@@ -650,26 +161,24 @@ describe('coalescing logic', () => {
 
   test('single message passes through unchanged', () => {
     const messages = ['Hello']
-    const combined = messages.join('\n')
-    expect(combined).toBe('Hello')
+    expect(messages.join('\n')).toBe('Hello')
   })
 
   test('empty messages produce empty combined text', () => {
     const messages: string[] = []
-    const combined = messages.join('\n')
-    expect(combined).toBe('')
+    expect(messages.join('\n')).toBe('')
   })
 
   test('messages with newlines preserve internal structure', () => {
     const messages = ['Line 1\nLine 2', 'Line 3']
-    const combined = messages.join('\n')
-    expect(combined).toBe('Line 1\nLine 2\nLine 3')
+    expect(messages.join('\n')).toBe('Line 1\nLine 2\nLine 3')
   })
 })
 
 // ---------------------------------------------------------------------------
 // repairEscapedWhitespace — defends against LLM-side JSON escape bungles
 // where real newlines come through as the literal two-char sequence `\n`.
+// Format-agnostic: runs on the raw text BEFORE it reaches the rich path.
 // ---------------------------------------------------------------------------
 
 describe('repairEscapedWhitespace', () => {
@@ -683,68 +192,50 @@ describe('repairEscapedWhitespace', () => {
     expect(repairEscapedWhitespace(input)).toBe('Paragraph one.\n\nParagraph two.')
   })
 
-  test('handles the exact observed bug: html tags mixed with literal \\n', () => {
+  test('handles the exact observed bug: markdown mixed with literal \\n', () => {
     // Reproduces the actual stream_reply failure: a model produced a message
-    // with <b>/<code> tags and literal `\n` escape sequences instead of real
-    // newlines, and Telegram rendered the `\n` as visible characters.
-    const input = 'Audit done:\\n\\n<b>README.md</b>\\n• Missing <code>switchroom update</code>\\n• Missing <code>switchroom agent grant</code>'
+    // with markdown and literal `\n` escape sequences instead of real
+    // newlines, and Telegram rendered the `\n` as visible characters. The
+    // repair runs on raw markdown now (no HTML pass).
+    const input =
+      'Audit done:\\n\\n**README.md**\\n• Missing `switchroom update`\\n• Missing `switchroom agent grant`'
     const repaired = repairEscapedWhitespace(input)
-    expect(repaired).toBe('Audit done:\n\n<b>README.md</b>\n• Missing <code>switchroom update</code>\n• Missing <code>switchroom agent grant</code>')
-    // And the repaired text should still be recognized as Telegram HTML
-    // so the markdownToHtml pass-through works correctly.
-    expect(isLikelyTelegramHtml(repaired)).toBe(true)
+    expect(repaired).toBe(
+      'Audit done:\n\n**README.md**\n• Missing `switchroom update`\n• Missing `switchroom agent grant`',
+    )
   })
 
   test('unescapes literal \\n in prose even when real newlines are present (mixed-message fix, #2456)', () => {
-    // The old implementation bailed entirely when any real newline was present.
-    // The new implementation unescapes literal \\n outside code spans regardless,
-    // so a mixed message (real newlines + stray literal \\n in prose) is repaired.
     const input = 'Real newline here\nand a literal \\n escape in prose'
     const out = repairEscapedWhitespace(input)
-    // The literal \n in prose becomes a real newline; the existing real newline is preserved.
     expect(out).toBe('Real newline here\nand a literal \n escape in prose')
   })
 
   test('preserves literal \\n inside inline code span when mixed with real newlines (#2456)', () => {
-    // The structurally safe version: a \\n inside backticks must stay verbatim,
-    // even in a message that also has real newlines and literal \\n in prose.
     const input = 'First line\nUse `grep -P \\n` for newlines\nand prose \\n here'
     const out = repairEscapedWhitespace(input)
-    // Inline code span preserved verbatim (\\n inside backticks untouched).
     expect(out).toContain('`grep -P \\n`')
-    // The literal \\n in prose is unescaped to a real newline.
     expect(out).toContain('and prose \n here')
-    // The original real newlines are preserved.
     expect(out).toContain('First line\n')
   })
 
   test('preserves literal \\n inside fenced code block (#2456)', () => {
-    // A fenced code block containing a literal \\n (e.g. a regex or shell snippet)
-    // must not be unescaped.
     const input = 'Prose \\n here\n```bash\necho "line1\\nline2"\n```\nMore \\n prose'
     const out = repairEscapedWhitespace(input)
-    // The \\n inside the fenced block stays verbatim.
     expect(out).toContain('```bash\necho "line1\\nline2"\n```')
-    // The \\n in prose is unescaped.
     expect(out).toContain('Prose \n here')
     expect(out).toContain('More \n prose')
   })
 
   test('pure no-real-newline case still unescapes (backward compat)', () => {
-    // Original pre-#2456 case: message with NO real newlines and literal \\n.
     const input = 'Line one\\nLine two\\nLine three'
     expect(repairEscapedWhitespace(input)).toBe('Line one\nLine two\nLine three')
   })
 
   test('genuine escaped backslash (\\\\n) stays literal even in mixed-newline message (#2456)', () => {
-    // \\\\n in the source is the two-char sequence \\ then n — the user typed
-    // a backslash followed by the letter n, NOT a newline.  The protect-\\
-    // phase must still work inside mixed messages.
     const input = 'Windows path: C:\\\\temp\\\\file.txt\\nnext line\nreal newline too'
     const out = repairEscapedWhitespace(input)
-    // The \\n becomes a real newline.
     expect(out).toContain('C:\\temp\\file.txt\nnext line')
-    // The real newline is preserved.
     expect(out).toContain('real newline too')
   })
 
@@ -764,41 +255,27 @@ describe('repairEscapedWhitespace', () => {
   })
 
   test('preserves literal backslash sequences via \\\\', () => {
-    // `\\n` in the source is `\\` followed by `n`, which means the user
-    // literally wanted a backslash followed by the letter n, NOT a newline.
-    // Our order-aware unescape must protect `\\` before touching `\n`.
     const input = 'Windows path: C:\\\\temp\\\\file.txt\\nnext line'
     const out = repairEscapedWhitespace(input)
     expect(out).toBe('Windows path: C:\\temp\\file.txt\nnext line')
   })
 
-  test('end-to-end with markdownToHtml: repaired text renders correctly', () => {
-    // Full pipeline: broken input → repair → markdownToHtml → Telegram HTML.
+  test('end-to-end: repaired raw markdown is ready for the rich path', () => {
+    // Full pipeline now ends at raw GFM markdown — no HTML conversion.
     const broken = '**Bold line**\\n\\n- bullet one\\n- bullet two'
     const repaired = repairEscapedWhitespace(broken)
-    const html = markdownToHtml(repaired)
-    expect(html).toContain('<b>Bold line</b>')
-    // Real newlines should be present in the HTML output (Telegram renders
-    // them as actual line breaks in HTML parse mode).
-    expect(html).toContain('\n\n')
-    expect(html).toContain('- bullet one')
-    // Literal \n must not survive anywhere.
-    expect(html).not.toContain('\\n')
+    expect(repaired).toBe('**Bold line**\n\n- bullet one\n- bullet two')
+    // Real newlines present; no literal \n survives.
+    expect(repaired).toContain('\n\n')
+    expect(repaired).not.toContain('\\n')
   })
 
   // ── Sentinel-collision safety (reviewer blocker) ─────────────────────────
 
   test('does not produce "undefined" when input contains NUL-byte sequences (#2456)', () => {
-    // A per-call random nonce makes sentinel collision statistically impossible.
-    // Confirm that a message containing NUL bytes (which could match a hardcoded
-    // sentinel) is passed through safely rather than emitting literal "undefined".
-    // We craft a string that would have matched the OLD hardcoded sentinel \x00REPMASK0\x00
-    // to prove it no longer causes corruption.
     const dangerous = 'hello \x00REPMASK0\x00 world \\n end'
     const out = repairEscapedWhitespace(dangerous)
-    // Must not produce the string "undefined" in output.
     expect(out).not.toContain('undefined')
-    // The \\n in prose must be unescaped.
     expect(out).toContain(' end')
     expect(out).not.toContain('\\n')
   })
@@ -806,15 +283,9 @@ describe('repairEscapedWhitespace', () => {
   // ── Unclosed fenced block (reviewer major) ────────────────────────────────
 
   test('handles unclosed fenced block gracefully: \\n in trailing content is still unescaped', () => {
-    // An unclosed ``` is not matched by the fenced-block regex (it requires a
-    // closing ```). Content after the unmatched opening is treated as prose, so
-    // literal \\n there gets unescaped — which is the least-surprising outcome
-    // for malformed input (the alternative would be silently swallowing content).
     const input = 'Prose \\n here\n```bash\necho "line1\\nline2"\n'
     const out = repairEscapedWhitespace(input)
-    // \\n in prose before the unclosed fence is unescaped.
     expect(out).toContain('Prose \n here')
-    // The function must not throw and must return a string.
     expect(typeof out).toBe('string')
   })
 
@@ -829,443 +300,9 @@ describe('repairEscapedWhitespace', () => {
   })
 
   test('unescapes \\r in prose when real newlines are also present (#2456)', () => {
-    // A message that mixes real newlines and a literal \\r escape in prose.
     const input = 'First line\nsome \\r carriage return in prose'
     const out = repairEscapedWhitespace(input)
     expect(out).toContain('some \r carriage return in prose')
     expect(out).toContain('First line\n')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// sanitizeForTelegram — output invariants enforced pre-send
-// ---------------------------------------------------------------------------
-
-describe('sanitizeForTelegram', () => {
-  // ── Rule 1: strip ## headings ────────────────────────────────────────────
-
-  test('strips ## heading and converts to bold', () => {
-    const result = sanitizeForTelegram('## My Heading\n\nbody text')
-    expect(result).toContain('<b>My Heading</b>')
-    expect(result).not.toContain('## ')
-  })
-
-  test('strips ### heading and converts to bold', () => {
-    const result = sanitizeForTelegram('### Section\n\nbody')
-    expect(result).toContain('<b>Section</b>')
-    expect(result).not.toContain('### ')
-  })
-
-  test('strips #### heading and converts to bold', () => {
-    const result = sanitizeForTelegram('#### Sub\n\nbody')
-    expect(result).toContain('<b>Sub</b>')
-    expect(result).not.toContain('#### ')
-  })
-
-  test('strips # (h1) heading and converts to bold', () => {
-    const result = sanitizeForTelegram('# Title\n\nbody')
-    expect(result).toContain('<b>Title</b>')
-    expect(result).not.toContain('# Title')
-  })
-
-  // ── Rule 2: flatten nested bullets ──────────────────────────────────────
-
-  test('flattens 2-space-indented bullets', () => {
-    const result = sanitizeForTelegram('- top\n  - sub')
-    expect(result).toContain('· sub')
-    expect(result).not.toContain('  - sub')
-  })
-
-  test('flattens 4-space-indented bullets', () => {
-    const result = sanitizeForTelegram('- top\n    - deeply nested')
-    expect(result).toContain('· deeply nested')
-    expect(result).not.toContain('    - deeply nested')
-  })
-
-  test('flattens tab-indented bullets', () => {
-    const result = sanitizeForTelegram('- top\n\t- tabbed sub')
-    expect(result).toContain('· tabbed sub')
-    expect(result).not.toContain('\t- tabbed sub')
-  })
-
-  test('preserves unindented bullets unchanged', () => {
-    const result = sanitizeForTelegram('- item one\n- item two')
-    expect(result).toContain('- item one')
-    expect(result).toContain('- item two')
-    // No middle-dot substitution on top-level bullets
-    expect(result).not.toContain('· item one')
-  })
-
-  // ── Rule 3: collapse blank lines ────────────────────────────────────────
-
-  test('collapses 4 blank lines to 2', () => {
-    const result = sanitizeForTelegram('before\n\n\n\nafter')
-    expect(result).toBe('before\n\nafter')
-  })
-
-  test('collapses 3 blank lines to 2', () => {
-    const result = sanitizeForTelegram('a\n\n\nb')
-    expect(result).toBe('a\n\nb')
-  })
-
-  test('leaves exactly 2 blank lines alone', () => {
-    const result = sanitizeForTelegram('a\n\nb')
-    expect(result).toBe('a\n\nb')
-  })
-
-  // ── Rule 4: trailing whitespace ──────────────────────────────────────────
-
-  test('strips trailing spaces from lines', () => {
-    const result = sanitizeForTelegram('hello   \nworld  ')
-    expect(result).toBe('hello\nworld')
-  })
-
-  test('strips trailing tabs from lines', () => {
-    const result = sanitizeForTelegram('hello\t\t\nworld')
-    expect(result).toBe('hello\nworld')
-  })
-
-  // ── Rule 5: HTML escape inside code/pre ─────────────────────────────────
-
-  test('HTML-escapes bare < and > inside <code> block', () => {
-    const result = sanitizeForTelegram('<code>a < b && c > d</code>')
-    expect(result).toContain('<code>a &lt; b')
-    expect(result).toContain('&gt; d</code>')
-  })
-
-  test('HTML-escapes bare & inside <code> block', () => {
-    const result = sanitizeForTelegram('<code>foo & bar</code>')
-    expect(result).toContain('<code>foo &amp; bar</code>')
-  })
-
-  test('HTML-escapes bare < and > inside <pre> block', () => {
-    const result = sanitizeForTelegram('<pre><code>if a < b</code></pre>')
-    expect(result).toContain('&lt; b')
-  })
-
-  test('does not double-escape already-escaped &amp; in <code>', () => {
-    const result = sanitizeForTelegram('<code>a &amp; b</code>')
-    // Must remain single-escaped, not become &amp;amp;
-    expect(result).toContain('<code>a &amp; b</code>')
-    expect(result).not.toContain('&amp;amp;')
-  })
-
-  test('does not double-escape &lt; in <code>', () => {
-    const result = sanitizeForTelegram('<code>&lt;div&gt;</code>')
-    expect(result).toContain('<code>&lt;div&gt;</code>')
-    expect(result).not.toContain('&amp;lt;')
-  })
-
-  test('does not double-escape &#123; numeric entity in <code>', () => {
-    const result = sanitizeForTelegram('<code>&#123; x &#125;</code>')
-    expect(result).toContain('&#123;')
-    expect(result).not.toContain('&amp;#123;')
-  })
-
-  // ── Code block exclusion from structural rules ───────────────────────────
-
-  test('does not strip ## heading inside <code> block', () => {
-    const result = sanitizeForTelegram('<code>## not a heading</code>')
-    // The ## stays; only < > & are touched inside code
-    expect(result).toContain('## not a heading')
-  })
-
-  test('does not flatten bullets inside <code> block', () => {
-    const result = sanitizeForTelegram('<code>  - not flattened</code>')
-    // The indented bullet stays verbatim inside code
-    expect(result).toContain('  - not flattened')
-  })
-
-  test('does not strip ## heading inside <pre> block', () => {
-    const result = sanitizeForTelegram('<pre><code class="language-bash"># comment\n## heading\n</code></pre>')
-    expect(result).toContain('## heading')
-  })
-
-  // ── Idempotency ──────────────────────────────────────────────────────────
-
-  test('is idempotent for heading conversion', () => {
-    const once = sanitizeForTelegram('## Heading\n\nbody')
-    const twice = sanitizeForTelegram(once)
-    expect(twice).toBe(once)
-  })
-
-  test('is idempotent for bullet flattening', () => {
-    const once = sanitizeForTelegram('- top\n  - sub\n    - deep')
-    const twice = sanitizeForTelegram(once)
-    expect(twice).toBe(once)
-  })
-
-  test('is idempotent for blank-line collapse', () => {
-    const once = sanitizeForTelegram('a\n\n\n\nb')
-    const twice = sanitizeForTelegram(once)
-    expect(twice).toBe(once)
-  })
-
-  test('is idempotent for code-block escaping', () => {
-    const once = sanitizeForTelegram('<code>a < b & c > d</code>')
-    const twice = sanitizeForTelegram(once)
-    expect(twice).toBe(once)
-  })
-
-  test('is idempotent for a combined realistic message', () => {
-    const input = [
-      '## Status Report',
-      '',
-      '- top item',
-      '  - sub item one',
-      '  - sub item two',
-      '',
-      '',
-      '',
-      'Here is some <code>a < b</code> inline code.',
-    ].join('\n')
-    const once = sanitizeForTelegram(input)
-    const twice = sanitizeForTelegram(once)
-    expect(twice).toBe(once)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Markdown table rendering
-// ---------------------------------------------------------------------------
-
-describe('markdownToHtml — markdown table rendering', () => {
-  // 2-col 3-row → bullet list
-  test('2-col 3-row renders as bullet list', () => {
-    const input = [
-      '| Name | Value |',
-      '| --- | --- |',
-      '| Alpha | 1 |',
-      '| Beta | 2 |',
-      '| Gamma | 3 |',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    // Header line present
-    expect(result).toContain('Name / Value')
-    // Each row is a bullet with <b> first column
-    expect(result).toContain('• <b>Alpha</b>')
-    expect(result).toContain('• <b>Beta</b>')
-    expect(result).toContain('• <b>Gamma</b>')
-    // Values appended after dash
-    expect(result).toContain('— 1')
-    expect(result).toContain('— 2')
-    expect(result).toContain('— 3')
-    // Must NOT contain any raw table markdown pipes
-    expect(result).not.toContain('| --- |')
-    expect(result).not.toContain('<table>')
-  })
-
-  // 3-col 4-row → bullet list (still within ≤3 cols AND ≤6 rows)
-  test('3-col 4-row renders as bullet list', () => {
-    const input = [
-      '| Tool | Status | Notes |',
-      '| ---- | ------ | ----- |',
-      '| bun | ok | fast |',
-      '| tsc | ok | strict |',
-      '| eslint | warn | fixable |',
-      '| vitest | skip | optional |',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    expect(result).toContain('• <b>bun</b>')
-    expect(result).toContain('• <b>tsc</b>')
-    // Third column appended too
-    expect(result).toContain('fast')
-    expect(result).toContain('strict')
-    expect(result).not.toContain('| ---- |')
-  })
-
-  // 4-col 3-row → <pre> block (4 cols exceeds limit)
-  test('4-col 3-row renders as <pre> block', () => {
-    const input = [
-      '| A | B | C | D |',
-      '| - | - | - | - |',
-      '| 1 | 2 | 3 | 4 |',
-      '| 5 | 6 | 7 | 8 |',
-      '| 9 | 0 | 1 | 2 |',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    expect(result).toContain('<pre>')
-    expect(result).toContain('</pre>')
-    // Column headers should appear in the pre block
-    expect(result).toContain('A')
-    expect(result).toContain('B')
-    // Must not produce a bullet list
-    expect(result).not.toContain('• <b>')
-  })
-
-  // 3-col 8-row → <pre> block (8 rows exceeds ≤6 limit)
-  test('3-col 8-row renders as <pre> block', () => {
-    const rows = Array.from({ length: 8 }, (_, i) => `| Row${i + 1} | X${i} | Y${i} |`)
-    const input = [
-      '| Name | ColX | ColY |',
-      '| ---- | ---- | ---- |',
-      ...rows,
-    ].join('\n')
-    const result = markdownToHtml(input)
-    expect(result).toContain('<pre>')
-    expect(result).toContain('</pre>')
-    expect(result).not.toContain('• <b>')
-  })
-
-  // Pipe in plain prose is NOT a table
-  test('plain prose with a pipe is not converted to a table', () => {
-    const input = 'Run echo foo | bar to see output'
-    const result = markdownToHtml(input)
-    expect(result).toContain('echo foo | bar')
-    expect(result).not.toContain('• <b>')
-    expect(result).not.toContain('<pre>')
-  })
-
-  // Pipe in code block is not a table
-  test('pipe inside fenced code block is left verbatim', () => {
-    const input = [
-      '```bash',
-      '| Name | Value |',
-      '| --- | --- |',
-      '| foo | bar |',
-      '```',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    // Should be inside <pre><code>, not a rendered table
-    expect(result).toContain('<pre>')
-    expect(result).toContain('| Name | Value |')
-    expect(result).not.toContain('• <b>')
-  })
-
-  // Table with empty cells
-  test('table with empty cells is handled gracefully', () => {
-    const input = [
-      '| Key | Value |',
-      '| --- | ----- |',
-      '| present |  |',
-      '|  | orphan |',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    // Should produce output without crashing; empty cells rendered as empty/—
-    expect(result).toContain('• <b>present</b>')
-    // No raw markdown pipes in output
-    expect(result).not.toContain('| --- |')
-  })
-
-  // Table preceded and followed by paragraph text — only the table transforms
-  test('table inside paragraph text: only the table block transforms', () => {
-    const input = [
-      'Before paragraph.',
-      '',
-      '| Name | Score |',
-      '| ---- | ----- |',
-      '| Alice | 95 |',
-      '| Bob | 87 |',
-      '',
-      'After paragraph.',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    // Prose preserved
-    expect(result).toContain('Before paragraph.')
-    expect(result).toContain('After paragraph.')
-    // Table converted
-    expect(result).toContain('• <b>Alice</b>')
-    expect(result).toContain('• <b>Bob</b>')
-    // No raw table markdown remains
-    expect(result).not.toContain('| ---- |')
-  })
-
-  // HTML entities in cell content are properly escaped
-  test('cell content with ampersand is safely escaped', () => {
-    const input = [
-      '| Operator | Meaning |',
-      '| -------- | ------- |',
-      '| AND | a & b |',
-      '| OR | x & y |',
-    ].join('\n')
-    const result = markdownToHtml(input)
-    // & in cell content must be entity-escaped
-    expect(result).toContain('&amp;')
-    // Output is still a bullet list
-    expect(result).toContain('• <b>AND</b>')
-    expect(result).toContain('• <b>OR</b>')
-  })
-})
-
-describe('telegramHtmlToPlainText (HTML parse-reject fallback)', () => {
-  test('strips supported formatting tags, keeps the text', () => {
-    const out = telegramHtmlToPlainText('<b>Bold</b> and <i>italic</i> and <code>x=1</code>')
-    expect(out).toBe('Bold and italic and x=1')
-  })
-
-  test('anchors become "label (href)"', () => {
-    const out = telegramHtmlToPlainText('see <a href="https://example.com/x">the docs</a> now')
-    expect(out).toBe('see the docs (https://example.com/x) now')
-  })
-
-  test('anchor with label equal to href collapses to the bare url', () => {
-    const out = telegramHtmlToPlainText('<a href="https://example.com">https://example.com</a>')
-    expect(out).toBe('https://example.com')
-  })
-
-  test('anchor with empty label yields just the href', () => {
-    expect(telegramHtmlToPlainText('<a href="https://e.com"></a>')).toBe('https://e.com')
-  })
-
-  test('single-quoted and unquoted href forms are handled', () => {
-    expect(telegramHtmlToPlainText("<a href='https://a.co'>A</a>")).toBe('A (https://a.co)')
-    expect(telegramHtmlToPlainText('<a href=https://b.co>B</a>')).toBe('B (https://b.co)')
-  })
-
-  test('decodes the standard HTML entities (no double-decode of the result)', () => {
-    const out = telegramHtmlToPlainText('a &amp; b &lt;tag&gt; &quot;q&quot; &#39;s&#39; 5 &nbsp;€')
-    expect(out).toBe('a & b <tag> "q" \'s\' 5  €')
-  })
-
-  test('numeric + hex char references decode', () => {
-    expect(telegramHtmlToPlainText('&#8594; &#x2192;')).toBe('→ →')
-  })
-
-  test('out-of-range / malformed char refs are left literal', () => {
-    expect(telegramHtmlToPlainText('&#0; &#1114112; &#xZZ;')).toBe('&#0; &#1114112; &#xZZ;')
-  })
-
-  test('block/break boundaries become newlines', () => {
-    const out = telegramHtmlToPlainText('one<br>two<br/>three</p>four</blockquote>five')
-    expect(out).toBe('one\ntwo\nthree\nfour\nfive')
-  })
-
-  test('unsupported / malformed tags (the actual reject cause) are stripped, not escaped', () => {
-    // A markdown→HTML slip that emitted an unsupported tag is exactly
-    // what triggers Telegram's 400; the fallback must yield clean text.
-    const out = telegramHtmlToPlainText('<h2>Title</h2><span class=x>body </span><unknowntag>tail')
-    expect(out).toBe('Title\nbody tail')
-  })
-
-  test('result is literal (parse_mode unset) — no re-escaping of < > &', () => {
-    // We resend with parse_mode UNSET, so the output must be the raw
-    // characters, not HTML entities.
-    const out = telegramHtmlToPlainText('a &lt; b &amp;&amp; c &gt; d')
-    expect(out).toBe('a < b && c > d')
-    expect(out).not.toContain('&lt;')
-    expect(out).not.toContain('&amp;')
-  })
-
-  test('collapses 3+ blank lines and trims trailing line whitespace', () => {
-    const out = telegramHtmlToPlainText('a   \n\n\n\n\nb')
-    expect(out).toBe('a\n\nb')
-  })
-
-  test('nested formatting inside an anchor label is flattened', () => {
-    const out = telegramHtmlToPlainText('<a href="https://x.io"><b>Big</b> link</a>')
-    expect(out).toBe('Big link (https://x.io)')
-  })
-
-  test('empty / whitespace input is safe', () => {
-    expect(telegramHtmlToPlainText('')).toBe('')
-    expect(telegramHtmlToPlainText('   \n  ')).toBe('')
-  })
-
-  test('pure-markup chunk collapses to empty (gateway substitutes a placeholder)', () => {
-    // Documents the trigger for the empty-string guard in
-    // gateway.ts:sendChunkPlainText — a chunk with no text content
-    // strips to '', so the send path must substitute rather than
-    // post an empty message (Telegram 400 "message text is empty").
-    expect(telegramHtmlToPlainText('<b></b><i></i><br><span></span>')).toBe('')
   })
 })

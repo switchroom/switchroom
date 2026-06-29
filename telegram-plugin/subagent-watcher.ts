@@ -44,7 +44,7 @@ import { projectSubagentLine, sanitizeCwdToProjectName, detectErrorInTranscriptL
 import { sanitiseToolArg } from './fleet-state.js'
 import { clipNarrative, describeToolUse } from './tool-activity-summary.js'
 import { REPLY_TOOLS, isDraftOfReply } from './narrative-dedup.js'
-import { escapeHtml, truncate } from './card-format.js'
+import { truncate } from './card-format.js'
 import { bumpSubagentActivity, recordSubagentStall, recordSubagentResume, recordSubagentEnd, reapStuckRunningRows, countRunningBackgroundSubagents } from './registry/subagents-schema.js'
 import { touchTurnActiveMarker } from './gateway/turn-active-marker.js'
 
@@ -1439,7 +1439,7 @@ export function startSubagentWatcher(config: SubagentWatcherConfig): SubagentWat
       if (idleMs >= threshold) {
         entry.stallNotified = true
         entry.stalledAt = n
-        const desc = escapeHtml(truncate(entry.description, 80))
+        const desc = truncate(entry.description, 80)
         const idleSec = Math.floor(idleMs / 1000)
         log?.(`subagent-watcher: stall detected for ${entry.agentId} (idle ${idleSec}s): ${desc}`)
         // Bug 3 fix (#333): persist the stall into the registry DB.

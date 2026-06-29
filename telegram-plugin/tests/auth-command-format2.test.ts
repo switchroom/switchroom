@@ -77,7 +77,7 @@ function mockClient(over: Partial<AuthBrokerClient> = {}): AuthBrokerClient {
 describe('renderShowText — Format 2 vs legacy', () => {
   it('falls back to legacy ASCII table when no liveQuotas given', () => {
     const out = renderShowText(FIXTURE_STATE, NOW_MS);
-    expect(out).toContain('<b>Auth — fleet snapshot</b>');
+    expect(out).toContain('**Auth — fleet snapshot**');
     expect(out).toContain('ACCOUNT');
     expect(out).toContain('STATUS');
     expect(out).toContain('EXPIRES');
@@ -91,10 +91,10 @@ describe('renderShowText — Format 2 vs legacy', () => {
       tz: 'UTC',
       liveProbedAtMs: NOW_MS,
     });
-    expect(out).toContain('🔋 <b>Auth — fleet status</b>');
+    expect(out).toContain('🔋 **Auth — fleet status**');
     expect(out).toContain('Recommendation:');
-    expect(out).toContain('🔴 <b>BLOCKED</b>');
-    expect(out).toContain('🟢 <b>HEALTHY</b>');
+    expect(out).toContain('🔴 **BLOCKED**');
+    expect(out).toContain('🟢 **HEALTHY**');
     // Legacy ASCII column headers should be absent
     expect(out).not.toContain('ACCOUNT     STATUS');
   });

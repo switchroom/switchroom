@@ -44,15 +44,28 @@ describe("approval card", () => {
     expect(datas).toContain("apv:a3f1b9c2a3f1b9c2a3f1b9c2a3f1b9c2:ttl:1h");
   });
 
-  it("escapes HTML metacharacters in agent and scope", () => {
+  it("passes < > & literally in agent and scope (markdown, #2669)", () => {
     const card = buildApprovalCard({
       request_id: "deadbeefdeadbeefdeadbeefdeadbeef",
       agent: "<script>",
       scope_humanized: "a&b",
     });
-    expect(card.text).not.toContain("<script>");
-    expect(card.text).toContain("&lt;script&gt;");
-    expect(card.text).toContain("a&amp;b");
+    // < > & are literal in rich markdown. The agent is bolded (no specials
+    // here to escape) and the scope rides verbatim in a `code span`.
+    expect(card.text).toContain("**<script>**");
+    expect(card.text).toContain("`a&b`");
+  });
+
+  it("keeps a scope with underscores literal inside the code span (no \\_ leak, #2669)", () => {
+    // Regression: escaping inside the code span produced visible backslashes
+    // like `secret:OPENAI\_API\_KEY`. The scope must render verbatim.
+    const card = buildApprovalCard({
+      request_id: "deadbeefdeadbeefdeadbeefdeadbeef",
+      agent: "k",
+      scope_humanized: "secret:OPENAI_API_KEY",
+    });
+    expect(card.text).toContain("`secret:OPENAI_API_KEY`");
+    expect(card.text).not.toContain("\\_");
   });
 });
 

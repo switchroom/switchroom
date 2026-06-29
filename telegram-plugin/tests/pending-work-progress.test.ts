@@ -139,7 +139,7 @@ describe('pending-work-progress', () => {
     expect(cap.edits).toHaveLength(1)
     expect(cap.edits[0].messageId).toBe(100)
     expect(cap.edits[0].newText).toBe(
-      "Background sleep running; awaiting completion.\n\n— still working (1m) · message me anytime, I'll keep you posted",
+      "Background sleep running; awaiting completion.\n\n_still working (1m) · message me anytime, I'll keep you posted_",
     )
 
     // Tick at 3 intervals total — second edit, "3m".
@@ -148,7 +148,7 @@ describe('pending-work-progress', () => {
     await flush()
     expect(cap.edits).toHaveLength(2)
     expect(cap.edits[1].newText).toBe(
-      "Background sleep running; awaiting completion.\n\n— still working (3m) · message me anytime, I'll keep you posted",
+      "Background sleep running; awaiting completion.\n\n_still working (3m) · message me anytime, I'll keep you posted_",
     )
   })
 
@@ -168,7 +168,7 @@ describe('pending-work-progress', () => {
     await flush()
     // The new edit should be based on 'worker dispatched' alone.
     expect(cap.edits[0].newText).toBe(
-      "worker dispatched\n\n— still working (1m) · message me anytime, I'll keep you posted",
+      "worker dispatched\n\n_still working (1m) · message me anytime, I'll keep you posted_",
     )
   })
 
@@ -186,7 +186,7 @@ describe('pending-work-progress', () => {
     __tickForTests(cap.now)
     await flush()
     expect(cap.edits[0].newText).toBe(
-      "worker dispatched\n\n— still working (1m) · message me anytime, I'll keep you posted",
+      "worker dispatched\n\n_still working (1m) · message me anytime, I'll keep you posted_",
     )
   })
 
@@ -336,17 +336,17 @@ describe('pending-work-progress', () => {
     expect(cap.edits).toHaveLength(0)
   })
 
-  // ─── #1698 regression — preserve parse_mode on the cross-turn edit ───
-  it("preserves the anchor's parse_mode on every edit (#1698)", async () => {
+  // ─── #1698 successor — preserve the anchor's send shape (literalText) on
+  //     every cross-turn edit (#2669 single-rich-path contract) ───
+  it("preserves the anchor's rich shape on every edit (default literalText=false)", async () => {
     const cap = setup()
     startTurn(KEY)
     noteAsyncDispatch(KEY)
-    // Anchor was sent through the reply tool with format='html', so
-    // the captured text is already rendered Telegram HTML.
+    // Anchor was sent via the rich-markdown path (the default), so the
+    // captured text is raw GFM markdown and the edit re-sends it richly.
     noteOutbound(KEY, {
       messageId: 100,
-      text: '<b>Worker back.</b> Both blockers fixed.',
-      parseMode: 'HTML',
+      text: '**Worker back.** Both blockers fixed.',
     })
     cap.now = 0
     noteTurnEnd(KEY)
@@ -354,42 +354,41 @@ describe('pending-work-progress', () => {
     __tickForTests(cap.now)
     await flush()
     expect(cap.edits).toHaveLength(1)
-    expect(cap.edits[0].parseMode).toBe('HTML')
+    expect(cap.edits[0].literalText).toBe(false)
     expect(cap.edits[0].newText).toBe(
-      "<b>Worker back.</b> Both blockers fixed.\n\n— still working (1m) · message me anytime, I'll keep you posted",
+      "**Worker back.** Both blockers fixed.\n\n_still working (1m) · message me anytime, I'll keep you posted_",
     )
   })
 
-  it('passes undefined parseMode through when the anchor was plain text', async () => {
+  it('threads literalText=true through when the anchor was a literal format:text send', async () => {
     const cap = setup()
     startTurn(KEY)
     noteAsyncDispatch(KEY)
-    // format: 'text' path — anchor was sent without parse_mode.
+    // format: 'text' path — the anchor was a literal plain send.
     noteOutbound(KEY, {
       messageId: 100,
       text: 'plain text reply',
-      parseMode: undefined,
+      literalText: true,
     })
     noteTurnEnd(KEY)
     cap.now = EDIT_INTERVAL_MS
     __tickForTests(cap.now)
     await flush()
-    expect(cap.edits[0].parseMode).toBeUndefined()
+    expect(cap.edits[0].literalText).toBe(true)
   })
 
-  it('defaults parseMode to undefined when caller omits it (test ergonomics)', async () => {
+  it('defaults literalText to false when caller omits it (rich path, test ergonomics)', async () => {
     const cap = setup()
     startTurn(KEY)
     noteAsyncDispatch(KEY)
-    // Callsite that hasn't been updated for the new field — must not
-    // typecheck-fail nor crash. The edit goes out parse_mode-less,
-    // matching the pre-#1698 behaviour for legacy callers.
+    // Callsite that omits the field — must not typecheck-fail nor crash.
+    // The edit goes out on the rich path (literalText=false).
     noteOutbound(KEY, { messageId: 100, text: 'wd' })
     noteTurnEnd(KEY)
     cap.now = EDIT_INTERVAL_MS
     __tickForTests(cap.now)
     await flush()
-    expect(cap.edits[0].parseMode).toBeUndefined()
+    expect(cap.edits[0].literalText).toBe(false)
   })
 
   it('multiple chats — independent state', async () => {

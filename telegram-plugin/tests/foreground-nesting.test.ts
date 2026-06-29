@@ -91,7 +91,7 @@ describe('end-to-end render shape under ack-first', () => {
     )
     expect(html).not.toBeNull()
     // newest child is the live, bold current step
-    expect(html).toContain('<b>→ ranking by resolution</b>')
+    expect(html).toContain('**→ ranking by resolution**')
     // an earlier child is present as a done/italic step
     expect(html).toContain('checking license on 4 candidates')
   })

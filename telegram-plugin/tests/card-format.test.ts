@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import {
   cleanWorkerResultParagraph,
-  escapeHtml,
   formatDuration,
   stripMarkdown,
   truncate,
 } from '../card-format.js'
+import { escapeMarkdown } from '../format.js'
 
 describe('stripMarkdown', () => {
   it('strips paired bold and emphasis', () => {
@@ -85,9 +85,11 @@ describe('formatDuration', () => {
   })
 })
 
-describe('escapeHtml / truncate', () => {
-  it('escapes the three HTML-significant characters', () => {
-    expect(escapeHtml('a <b> & c')).toBe('a &lt;b&gt; &amp; c')
+describe('escapeMarkdown / truncate', () => {
+  it('escapes the inline-markdown specials, leaving < > & literal (#2669)', () => {
+    // The HTML escaper is gone; escapeMarkdown escapes \ ` * _ ~ = [ ] | only.
+    expect(escapeMarkdown('a <b> & c')).toBe('a <b> & c')
+    expect(escapeMarkdown('a *b* _c_')).toBe('a \\*b\\* \\_c\\_')
   })
   it('truncates with an ellipsis', () => {
     expect(truncate('abcdef', 4)).toBe('abc…')

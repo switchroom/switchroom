@@ -41,8 +41,10 @@ function makeDeps(overrides: Partial<InjectDeps> = {}): {
     },
     getAgentName: () => 'gymbro',
     getArgs: () => '/cost',
-    escapeHtml: (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
-    preBlock: (s) => `<pre>${s}</pre>`,
+    // #2669: production now passes the markdown escaper + fenced-block helper
+    // (matches gateway.ts's escapeHtmlForTg / preBlock).
+    escapeHtml: (s) => s.replace(/([\\`*_~=\[\]|])/g, '\\$1'),
+    preBlock: (s) => '```\n' + s + '\n```',
     ...overrides,
   }
   return { deps, replies }
@@ -112,15 +114,15 @@ describe('handleInjectCommand — outcome=ok', () => {
     expect(replies).toHaveLength(1)
     expect(replies[0].opts?.accent).toBe('done')
     expect(replies[0].text).toContain('✅')
-    expect(replies[0].text).toContain('<code>/cost</code>')
-    expect(replies[0].text).toContain('<pre>Total cost: $0.42</pre>')
+    expect(replies[0].text).toContain('`/cost`')
+    expect(replies[0].text).toContain('```\nTotal cost: $0.42\n```')
   })
 
-  it('appends <i>truncated</i> when output truncated', async () => {
+  it('appends _truncated_ when output truncated', async () => {
     const inject = vi.fn().mockResolvedValue(okResult('/cost', 'a lot of text', true))
     const { deps, replies } = makeDeps({ getArgs: () => '/cost', inject })
     await handleInjectCommand(fakeCtx(), deps)
-    expect(replies[0].text).toContain('<i>truncated</i>')
+    expect(replies[0].text).toContain('_truncated_')
     expect(replies[0].opts?.accent).toBe('done')
   })
 
@@ -138,9 +140,9 @@ describe('handleInjectCommand — outcome=ok_no_output', () => {
     const { deps, replies } = makeDeps({ getArgs: () => '/compact', inject })
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('done')
-    expect(replies[0].text).toContain('<code>/compact</code>')
+    expect(replies[0].text).toContain('`/compact`')
     expect(replies[0].text).toContain('compaction runs silently')
-    expect(replies[0].text).not.toContain('<pre>')
+    expect(replies[0].text).not.toContain('```')
   })
 
   it('warns with accent=issue when expectsOutput=true and capture empty (/cost)', async () => {
@@ -157,10 +159,10 @@ describe('handleInjectCommand — outcome=ok_no_output', () => {
     const { deps, replies } = makeDeps({ getArgs: () => '/clear', inject })
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('done')
-    expect(replies[0].text).toContain('<code>/clear</code>')
+    expect(replies[0].text).toContain('`/clear`')
     expect(replies[0].text).toContain('context cleared')
     expect(replies[0].text).not.toContain('empty capture')
-    expect(replies[0].text).not.toContain('<pre>')
+    expect(replies[0].text).not.toContain('```')
   })
 })
 
@@ -186,7 +188,7 @@ describe('handleInjectCommand — outcome=failed', () => {
     const { deps, replies } = makeDeps({ getArgs: () => '/login', inject })
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('issue')
-    expect(replies[0].text).toContain('<code>/login</code>')
+    expect(replies[0].text).toContain('`/login`')
     expect(replies[0].text).toContain('blocked: would mutate auth state')
   })
 
@@ -201,7 +203,7 @@ describe('handleInjectCommand — outcome=failed', () => {
     expect(replies[0].text).toContain('experimental.legacy_pty')
   })
 
-  it('tmux_failed: surfaces escaped error message', async () => {
+  it('tmux_failed: surfaces the error message (< > literal in markdown, #2669)', async () => {
     const inject = vi
       .fn()
       .mockResolvedValue(failedResult('/cost', 'tmux_failed', 'connection <refused>'))
@@ -209,7 +211,7 @@ describe('handleInjectCommand — outcome=failed', () => {
     await handleInjectCommand(fakeCtx(), deps)
     expect(replies[0].opts?.accent).toBe('issue')
     expect(replies[0].text).toContain('tmux send-keys failed')
-    expect(replies[0].text).toContain('connection &lt;refused&gt;')
+    expect(replies[0].text).toContain('connection <refused>')
   })
 
   it('thrown InjectError from inject() is normalized to outcome=failed', async () => {

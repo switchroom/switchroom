@@ -49,13 +49,6 @@ export interface PtyHandlerState {
   /** Active streams, keyed by `chat_id:thread_id`. */
   activeDraftStreams: Map<string, DraftStreamHandle>
   /**
-   * Parallel to activeDraftStreams: parseMode baked into each controller.
-   * Lets `handleStreamReply` detect and rotate streams whose parseMode no
-   * longer matches the caller's resolved format (bug 1). Optional for
-   * backwards compatibility.
-   */
-  activeDraftParseModes?: Map<string, 'HTML' | 'MarkdownV2' | undefined>
-  /**
    * Chats whose PTY preview is claimed by an in-flight reply handler.
    * Partials for these chats are dropped to avoid duplicates.
    */
@@ -67,8 +60,6 @@ export interface PtyHandlerState {
 export interface PtyHandlerDeps {
   bot: { api: StreamBotApi }
   retry?: RetryPolicy
-  /** Markdown → HTML renderer applied to the text before stream.update. */
-  renderText: (text: string) => string
   /** Optional structured event hook, called once per invocation. */
   logEvent?: (ev: {
     kind: 'pty_partial_received'
@@ -154,7 +145,10 @@ export function handlePtyPartialPure(
       bot: deps.bot,
       chatId,
       threadId,
-      parseMode: 'HTML',
+      // PTY-tail previews are raw terminal/TUI output, not authored
+      // markdown — send them literally so control glyphs and box-drawing
+      // characters aren't misinterpreted as markdown syntax (#2669).
+      literalText: true,
       disableLinkPreview: true,
       throttleMs: 600,
       retry: deps.retry,
@@ -177,11 +171,9 @@ export function handlePtyPartialPure(
         : {}),
     })
     state.activeDraftStreams.set(sKey, stream)
-    state.activeDraftParseModes?.set(sKey, 'HTML')
   }
 
-  const rendered = deps.renderText(text)
-  void stream.update(rendered).catch(() => { /* swallow — logged elsewhere */ })
+  void stream.update(text).catch(() => { /* swallow — logged elsewhere */ })
 
   return created ? 'update-new' : 'update-existing'
 }

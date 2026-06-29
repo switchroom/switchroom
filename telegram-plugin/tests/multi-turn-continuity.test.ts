@@ -2,9 +2,10 @@
  * Integration tests for multi-turn state isolation.
  *
  * Verifies that state carried across turns in the same chat+thread
- * (activeDraftStreams, activeDraftParseModes, suppressPtyPreview)
- * resets cleanly when a new turn starts — i.e. the previous turn's
- * stream handle is finalized/discarded before the next begins.
+ * (activeDraftStreams, suppressPtyPreview) resets cleanly when a new turn
+ * starts — i.e. the previous turn's stream handle is finalized/discarded
+ * before the next begins. (The activeDraftParseModes map was retired with
+ * parse-mode rotation — there is one rich-markdown path now, #2669.)
  *
  * This is one of the "per-chat continuity" gaps the plan called out:
  * previously tested only through the full server.ts orchestration in
@@ -14,13 +15,11 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { handleStreamReply, type StreamReplyDeps, type StreamReplyState } from '../stream-reply-handler.js'
 import type { DraftStreamHandle } from '../draft-stream.js'
-import { markdownToHtml as realMarkdownToHtml } from '../format.js'
 import { createFakeBotApi, type FakeBot } from './fake-bot-api.js'
 
 function makeState(): StreamReplyState {
   return {
     activeDraftStreams: new Map<string, DraftStreamHandle>(),
-    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
     suppressPtyPreview: new Set<string>(),
   }
 }
@@ -28,13 +27,11 @@ function makeState(): StreamReplyState {
 function makeDeps(bot: FakeBot, overrides?: Partial<StreamReplyDeps>): StreamReplyDeps {
   return {
     bot: bot as unknown as StreamReplyDeps['bot'],
-    markdownToHtml: (t) => realMarkdownToHtml(t),
-    escapeMarkdownV2: (t) => t,
     repairEscapedWhitespace: (t) => t,
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
-    defaultFormat: 'html',
+    defaultFormat: 'markdown',
     logStreamingEvent: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
@@ -51,13 +48,12 @@ describe('multi-turn continuity', () => {
     bot = createFakeBotApi({ startMessageId: 500 })
   })
 
-  it('done=true clears the stream entry and parse-mode map', async () => {
+  it('done=true clears the stream entry', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
     await handleStreamReply({ chat_id: 'c', text: 'turn-1', done: true }, state, deps)
     expect(state.activeDraftStreams.has('c:_')).toBe(false)
-    expect(state.activeDraftParseModes.has('c:_')).toBe(false)
   })
 
   it('two sequential turns on the same chat each get their own message', async () => {

@@ -217,9 +217,9 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'credentials-expired':
       return {
         text: [
-          `🔑 <b>Claude login expired</b> for <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
-          `Tap <b>Reauth now</b> to refresh credentials.`,
+          `🔑 **Claude login expired** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `Tap **Reauth now** to refresh credentials.`,
         ]
           .filter(Boolean)
           .join('\n'),
@@ -236,9 +236,9 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'credentials-invalid':
       return {
         text: [
-          `🔑 <b>Invalid Claude credentials</b> for <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
-          `Run <code>/auth reauth ${agent}</code> or tap below.`,
+          `🔑 **Invalid Claude credentials** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `Run \`/auth reauth ${agent}\` or tap below.`,
         ]
           .filter(Boolean)
           .join('\n'),
@@ -255,9 +255,9 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'credit-exhausted':
       return {
         text: [
-          `💳 <b>Credit balance too low</b> for <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
-          `Use <code>/auth use &lt;label&gt;</code> to switch account slot or <code>/auth add</code> to add one.`,
+          `💳 **Credit balance too low** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `Use \`/auth use <label>\` to switch account slot or \`/auth add\` to add one.`,
         ]
           .filter(Boolean)
           .join('\n'),
@@ -274,9 +274,9 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
       // are the historical source; this is now the single owner.
       return {
         text: [
-          `⚠️ <b>Quota exhausted</b> for <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
-          `All account slots are at the usage limit. Switchroom will auto-fallback when another slot is available. Use <code>/auth use &lt;label&gt;</code> to switch manually.`,
+          `⚠️ **Quota exhausted** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
+          `All account slots are at the usage limit. Switchroom will auto-fallback when another slot is available. Use \`/auth use <label>\` to switch manually.`,
         ]
           .filter(Boolean)
           .join('\n'),
@@ -290,8 +290,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'rate-limited':
       return {
         text: [
-          `🚦 <b>Rate limited</b> for <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
+          `🚦 **Rate limited** for **${agent}**.`,
+          detail ? `_${detail}_` : '',
           `Claude is temporarily rate-limiting requests. Will retry automatically.`,
         ]
           .filter(Boolean)
@@ -306,8 +306,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'agent-crashed':
       return {
         text: [
-          `💥 <b>Agent crashed</b>: <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
+          `💥 **Agent crashed**: **${agent}**.`,
+          detail ? `_${detail}_` : '',
         ]
           .filter(Boolean)
           .join('\n'),
@@ -324,8 +324,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'agent-restarted-unexpectedly':
       return {
         text: [
-          `🔄 <b>Agent restarted unexpectedly</b>: <b>${agent}</b>.`,
-          detail ? `<i>${detail}</i>` : '',
+          `🔄 **Agent restarted unexpectedly**: **${agent}**.`,
+          detail ? `_${detail}_` : '',
           `This may indicate a crash-loop. Check logs if it happens again.`,
         ]
           .filter(Boolean)
@@ -343,8 +343,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'unknown-4xx':
       return {
         text: [
-          `⚠️ <b>API error (4xx)</b> for <b>${agent}</b>.`,
-          detail ? `<code>${detail}</code>` : '',
+          `⚠️ **API error (4xx)** for **${agent}**.`,
+          detail ? `\`${detail}\`` : '',
         ]
           .filter(Boolean)
           .join('\n'),
@@ -361,8 +361,8 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
     case 'unknown-5xx':
       return {
         text: [
-          `🔥 <b>Server error (5xx)</b> for <b>${agent}</b>.`,
-          detail ? `<code>${detail}</code>` : '',
+          `🔥 **Server error (5xx)** for **${agent}**.`,
+          detail ? `\`${detail}\`` : '',
           `Anthropic may be experiencing issues. Will retry automatically.`,
         ]
           .filter(Boolean)
@@ -411,12 +411,8 @@ export function resetAllCooldowns(): void {
   cooldownMap.clear()
 }
 
-// ─── HTML escape ─────────────────────────────────────────────────────────────
+// ─── Markdown escape (#2669) ──────────────────────────────────────────────────
 
 function escHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }

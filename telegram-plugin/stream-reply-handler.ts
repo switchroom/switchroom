@@ -22,28 +22,28 @@ import {
   type StreamBotApi,
   type RetryPolicy,
 } from './stream-controller.js'
-import { sanitizeTelegramHtml } from './html-sanitize.js'
+import { RICH_MESSAGE_MAX_CHARS } from './format.js'
 import { chatKey, chatKeyWithSuffix } from './gateway/chat-key.js'
 
 /**
  * Builds the inline status-accent header line for `reply` / `stream_reply`.
  *
- * Returns a string to prepend to the effective (already-rendered) message
- * body, including a trailing blank line so the header is visually separated.
- * Returns an empty string when accent is undefined or unrecognised (silent
- * ignore) so calls without `accent` produce identical output to today.
+ * Returns a string to prepend to the message body, including a trailing
+ * blank line so the header is visually separated. Returns an empty string
+ * when accent is undefined or unrecognised (silent ignore) so calls without
+ * `accent` produce identical output to today.
  *
- * The header uses Telegram HTML tags. Callers must ensure parseMode is HTML
- * (or that the body has already been rendered to HTML) before prepending.
+ * The header is GFM markdown — every outbound goes through the rich-message
+ * path (#2669), so `_italic_` / `**bold**` render correctly.
  */
 export function buildAccentHeader(accent: string | undefined): string {
   switch (accent) {
     case 'in-progress':
-      return '🔵 <i>In progress…</i>\n\n'
+      return '🔵 _In progress…_\n\n'
     case 'done':
-      return '✅ <b>Done</b>\n\n'
+      return '✅ **Done**\n\n'
     case 'issue':
-      return '⚠️ <b>Issue</b>\n\n'
+      return '⚠️ **Issue**\n\n'
     default:
       return ''
   }
@@ -118,9 +118,9 @@ export interface StreamReplyArgs {
    * Optional status accent prepended as a leading header line (issue #320
    * fallback for missing Telegram quote-bar color API).
    *
-   * - `'in-progress'` → `🔵 <i>In progress…</i>\n\n`
-   * - `'done'`        → `✅ <b>Done</b>\n\n`
-   * - `'issue'`       → `⚠️ <b>Issue</b>\n\n`
+   * - `'in-progress'` → `🔵 _In progress…_\n\n`
+   * - `'done'`        → `✅ **Done**\n\n`
+   * - `'issue'`       → `⚠️ **Issue**\n\n`
    *
    * Unrecognised values are silently ignored. Omit for plain reply (default
    * behavior — identical to today's output).
@@ -130,21 +130,6 @@ export interface StreamReplyArgs {
 
 export interface StreamReplyState {
   activeDraftStreams: Map<string, DraftStreamHandle>
-  /**
-   * Tracks the parseMode each active stream was created with, keyed the
-   * same way as `activeDraftStreams`. Used by `handleStreamReply` to
-   * detect when a subsequent call's resolved parseMode differs from the
-   * one baked into the existing stream controller — in that case the
-   * stale stream is finalized + discarded and a fresh one is created
-   * with the new parseMode (see bug 1: PTY-tail creates an activity-lane
-   * stream with parseMode=undefined; a later explicit stream_reply on
-   * the same key with format:'html' would otherwise inherit undefined
-   * and send literal markdown).
-   *
-   * Optional for backwards compatibility with external callers that
-   * construct a StreamReplyState without it.
-   */
-  activeDraftParseModes?: Map<string, 'HTML' | 'MarkdownV2' | undefined>
   /**
    * Chats whose PTY preview is claimed by an in-flight reply/stream_reply
    * handler. PTY-tail partials for these keys are dropped to avoid
@@ -165,10 +150,6 @@ export interface StreamReplyState {
 export interface StreamReplyDeps {
   bot: { api: StreamBotApi }
   retry?: RetryPolicy
-  /** Markdown → HTML renderer (used when format === 'html'). */
-  markdownToHtml: (text: string) => string
-  /** MarkdownV2 escaper (used when format === 'markdownv2'). */
-  escapeMarkdownV2: (text: string) => string
   /** Whitespace repair applied to the raw caller text. */
   repairEscapedWhitespace: (text: string) => string
   /** Validates the chat id against the access list. Throws on deny. */
@@ -185,7 +166,8 @@ export interface StreamReplyDeps {
   getLatestInboundMessageId?: (chatId: string, threadId: number | null) => number | null
   /** Config: disable link previews. Default true. */
   disableLinkPreview: boolean
-  /** Config: fallback parse mode when args.format is omitted ('html' | 'markdownv2' | 'text'). */
+  /** Config: fallback format when args.format is omitted. Anything other
+   *  than the literal `'text'` is treated as the rich-markdown path (#2669). */
   defaultFormat: string
   /** Observability: per-call event. */
   logStreamingEvent: (ev: {
@@ -341,53 +323,36 @@ export async function handleStreamReply(
   // the progressive-streaming contract documented in
   // profiles/default/CLAUDE.md. See #481.
 
-  let parseMode: 'HTML' | 'MarkdownV2' | undefined
-  let effectiveText: string
-  if (format === 'html') {
-    parseMode = 'HTML'
-    // Pre-validate the rendered HTML against Telegram's tag allowlist
-    // before send. The sanitizer escapes unknown tags, drops disallowed
-    // attributes, and auto-closes unbalanced tags so we don't trip
-    // Telegram's `400 Bad Request: can't parse entities` (issue #657).
-    effectiveText = sanitizeTelegramHtml(deps.markdownToHtml(rawText))
-  } else if (format === 'markdownv2') {
-    parseMode = 'MarkdownV2'
-    effectiveText = deps.escapeMarkdownV2(rawText)
-  } else {
-    parseMode = undefined
-    effectiveText = rawText
-  }
+  // Single rich-markdown path (#2669). The only fork is the literal
+  // `format:'text'` send (plain string, no markdown parsing); everything
+  // else ships the raw GFM markdown via the rich-message path. No
+  // markdown→HTML / MarkdownV2 rendering happens here anymore — the raw
+  // text IS the wire payload.
+  const literalText = format === 'text'
+  let effectiveText: string = rawText
 
-  // Inline status-accent header (issue #320 fallback). Prepended AFTER
-  // format rendering so it leads the fully-rendered body. Since
-  // stream_reply callers pass the full text snapshot each call, the
-  // header is prepended on every call that supplies `accent` — this
-  // keeps the rendered message consistent across edits. Callers that
-  // don't want the header on a subsequent edit simply omit `accent`.
-  // Unrecognised values are silently ignored (empty string returned).
+  // Inline status-accent header (issue #320 fallback). Prepended so it
+  // leads the body. Since stream_reply callers pass the full text snapshot
+  // each call, the header is prepended on every call that supplies
+  // `accent` — keeping the rendered message consistent across edits.
+  // Callers that don't want the header on a subsequent edit simply omit
+  // `accent`. Unrecognised values are silently ignored (empty string).
   if (args.accent != null) {
     const accentHeader = buildAccentHeader(args.accent)
     if (accentHeader.length > 0) {
       effectiveText = accentHeader + effectiveText
-      // Re-sanitize after prepending the HTML header so the combined
-      // body is still guaranteed parse-mode=HTML safe.
-      if (parseMode === 'HTML') {
-        effectiveText = sanitizeTelegramHtml(effectiveText)
-      }
     }
   }
 
   // Over-limit pre-check. Throws BEFORE touching stream state so that
-  // (a) a first call over 4096 fails cleanly instead of creating a
-  // half-initialized stream, and (b) a mid-stream update over 4096
+  // (a) a first call over the cap fails cleanly instead of creating a
+  // half-initialized stream, and (b) a mid-stream update over the cap
   // fails loudly instead of setting the internal `stopped=true` flag
   // and silently dropping all subsequent text. Either way the caller
   // sees isError:true and can fall back to `reply`, which chunks.
-  // Check the rendered text (post-markdown-to-HTML) because that's
-  // what actually goes to Telegram's 4096-char wire limit.
-  if (effectiveText.length > 4096) {
+  if (effectiveText.length > RICH_MESSAGE_MAX_CHARS) {
     throw new Error(
-      `stream_reply rejected: text exceeds Telegram's 4096-char limit ` +
+      `stream_reply rejected: text exceeds Telegram's ${RICH_MESSAGE_MAX_CHARS}-char rich-message limit ` +
         `(length=${effectiveText.length}, format=${format}). stream_reply does not ` +
         `auto-chunk — split the text or use \`reply\`, which chunks.`,
     )
@@ -401,30 +366,10 @@ export async function handleStreamReply(
   // targets. Cleared on turn_end by server.ts.
   state.suppressPtyPreview?.add(streamKey(chat_id, threadId))
   let stream = state.activeDraftStreams.get(sKey)
-
-  // Bug 1 fix: parseMode is baked into the stream controller at creation
-  // time. If a prior call created the stream with a different parseMode
-  // (e.g. PTY-tail auto-stream using 'text' → undefined, followed by an
-  // explicit stream_reply with format:'html'), reusing it would send
-  // literal markdown. Finalize + discard the stale stream so the block
-  // below creates a fresh one with the correct parseMode.
-  if (stream != null && state.activeDraftParseModes != null) {
-    const existingParseMode = state.activeDraftParseModes.get(sKey)
-    if (existingParseMode !== parseMode) {
-      try {
-        await stream.finalize()
-      } catch (err) {
-        // Best-effort: the in-flight edit may 429 or race. Surface to
-        // stderr so the orphaned message id isn't invisible.
-        deps.writeError(
-          `telegram channel: stream_reply parseMode-rotation finalize failed: ${err}\n`,
-        )
-      }
-      state.activeDraftStreams.delete(sKey)
-      state.activeDraftParseModes.delete(sKey)
-      stream = undefined
-    }
-  }
+  // #2669: there is now a single rendering mode (rich markdown), so the
+  // legacy parseMode-rotation that finalized + recreated a stream whose
+  // baked parseMode no longer matched is gone — every stream renders the
+  // same way and can be reused as-is.
 
   const streamExisted = stream != null
 
@@ -487,7 +432,7 @@ export async function handleStreamReply(
       bot: deps.bot,
       chatId: chat_id,
       threadId,
-      parseMode,
+      literalText,
       disableLinkPreview: deps.disableLinkPreview,
       // Pass undefined when caller didn't override, so draft-stream's
       // DM/group throttle defaults apply (400 ms DMs, 1000 ms groups).
@@ -531,7 +476,6 @@ export async function handleStreamReply(
       },
     })
     state.activeDraftStreams.set(sKey, stream)
-    state.activeDraftParseModes?.set(sKey, parseMode)
   }
 
   await stream.update(effectiveText)
@@ -539,7 +483,6 @@ export async function handleStreamReply(
   if (done) {
     await stream.finalize()
     state.activeDraftStreams.delete(sKey)
-    state.activeDraftParseModes?.delete(sKey)
     // #1713: stream_reply done=true is a NON-EVENT for the status
     // reaction. The reaction reflects current turn activity, not
     // delivery state — only the `turn_end` IPC handler finalizes (👍).
@@ -549,15 +492,15 @@ export async function handleStreamReply(
     // the #1713 issue body for the rationale.
 
     // Hard-fail surface: if the stream finalized without ever assigning
-    // a message id, the initial send never landed (4096+ chars hits
+    // a message id, the initial send never landed (over-cap text hits
     // draft-stream's length guard and silently stops). Throw so the MCP
     // caller sees isError:true instead of a misleading "finalized
     // (id: pending)". The caller can fall back to `reply`, which chunks.
     if (stream.getMessageId() == null) {
       throw new Error(
         `stream_reply finalized without sending any message (length=${rawText.length}, ` +
-          `max=4096). Telegram's per-message limit is 4096 chars and stream_reply does not ` +
-          `auto-chunk. Split the text or use \`reply\` (which chunks).`,
+          `max=${RICH_MESSAGE_MAX_CHARS}). Telegram's rich-message limit is ${RICH_MESSAGE_MAX_CHARS} chars and ` +
+          `stream_reply does not auto-chunk. Split the text or use \`reply\` (which chunks).`,
       )
     }
 

@@ -40,7 +40,7 @@ describe("renderIssuesCard", () => {
       makeEvent({ fingerprint: "a::3", code: "3", severity: "info" }),
     ];
     const out = renderIssuesCard({ agentName: "klanker", events });
-    expect(out).toMatch(/^🚨 <b>klanker<\/b>/);
+    expect(out).toMatch(/^🚨 \*\*klanker\*\*/);
     expect(out).toContain("3 issues");
   });
 
@@ -54,7 +54,7 @@ describe("renderIssuesCard", () => {
         }),
       ];
       const out = renderIssuesCard({ agentName: "kengpt", events });
-      expect(out).toContain("→ <i>switchroom vault unlock</i>");
+      expect(out).toContain("→ _switchroom vault unlock_");
       // Summary still rendered above the remediation.
       expect(out).toContain("Morning brief skipped");
     });
@@ -66,7 +66,7 @@ describe("renderIssuesCard", () => {
         }),
       ];
       const out = renderIssuesCard({ agentName: "kengpt", events });
-      expect(out).toMatch(/→ <i>run.*auth heal/);
+      expect(out).toMatch(/→ _run.*auth heal/);
     });
 
     it("ignores multi-line detail (likely stderr tail, not remediation)", () => {
@@ -98,13 +98,12 @@ describe("renderIssuesCard", () => {
       expect((out ?? "").split("\n").every((line) => line.length < 600)).toBe(true);
     });
 
-    it("escapes HTML in remediation hints", () => {
+    it("passes < > literally in remediation hints (markdown, #2669)", () => {
       const events = [
         makeEvent({ detail: "Fix: <script>alert('xss')</script>" }),
       ];
       const out = renderIssuesCard({ agentName: "kengpt", events });
-      expect(out).not.toContain("<script>");
-      expect(out).toContain("&lt;script&gt;");
+      expect(out).toContain("<script>alert('xss')</script>");
     });
   });
 
@@ -158,7 +157,7 @@ describe("renderIssuesCard", () => {
     expect(out).toContain("+10 more not shown");
   });
 
-  it("HTML-escapes user-supplied fields", () => {
+  it("passes < > & literally in user-supplied fields (markdown, #2669)", () => {
     const events = [
       makeEvent({
         agent: "<script>",
@@ -169,10 +168,12 @@ describe("renderIssuesCard", () => {
       }),
     ];
     const out = renderIssuesCard({ agentName: "<script>", events });
-    expect(out).not.toContain("<script>");
-    expect(out).toContain("&lt;script&gt;");
-    expect(out).toContain("&lt;x&gt;::&lt;y&gt;");
-    expect(out).toContain("&lt;dangerous &amp; stuff&gt;");
+    // < > & are literal in rich markdown — no HTML entities. The fingerprint
+    // rides in a `code span` (also literal) and the summary is escaped only
+    // for emphasis specials.
+    expect(out).toContain("<script>");
+    expect(out).toContain("`<x>::<y>`");
+    expect(out).toContain("<dangerous & stuff>");
   });
 });
 
@@ -233,7 +234,9 @@ describe("createIssuesCardHandle", () => {
     });
     await handle.refresh([makeEvent({})]);
     expect(bot.sent).toHaveLength(1);
-    expect(bot.sent[0].opts?.parse_mode).toBe("HTML");
+    // #2669: the card body is raw GFM markdown sent through the rich path
+    // (the gateway wires sendMessage → sendRichMessage). No parse_mode.
+    expect(bot.sent[0].opts?.parse_mode).toBeUndefined();
     expect(handle.messageId()).toBe(1000);
   });
 

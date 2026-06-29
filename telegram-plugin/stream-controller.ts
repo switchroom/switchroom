@@ -6,10 +6,13 @@
  *   - the `stream_reply` MCP case block (model-driven streaming)
  *   - `handlePtyPartial` (PTY-tail TUI extractor → live preview)
  *
- * Both paths do the same thing: given a chat/thread/parseMode, create a
- * draft stream whose `send` closure calls `bot.api.sendMessage` and whose
- * `edit` closure calls `bot.api.editMessageText`, both wrapped in the
- * shared retry/429/not-modified policy (`robustApiCall`).
+ * Both paths do the same thing: given a chat/thread, create a draft stream
+ * whose `send` closure first calls `bot.api.sendRichMessage` and whose
+ * `edit` closure calls `bot.api.editMessageText({ markdown })`, both wrapped
+ * in the shared retry/429/not-modified policy (`robustApiCall`). Because
+ * send and edit share the same opts, the "edit-rich-if-sent-rich" invariant
+ * holds automatically (#2669). A `format:'text'` literal stream bypasses the
+ * rich parser entirely (plain `sendMessage` / plain-string `editMessageText`).
  *
  * This module exists primarily so that wiring can be exercised by
  * integration tests against a mock bot.api, without having to mock the
@@ -17,32 +20,11 @@
  */
 
 import { createDraftStream, type DraftStreamHandle } from './draft-stream.js'
-import { htmlToPlainText } from './html-sanitize.js'
-
-/**
- * Telegram returns `400 Bad Request: can't parse entities: …` when the
- * body contains malformed HTML / MarkdownV2 / nested unbalanced tags.
- * Detect that specific error class so we can fall back to plain text
- * without confusing it with other 400s (rate-limit, message-not-found,
- * thread-not-found, etc.).
- */
-function isParseEntitiesError(err: unknown): boolean {
-  const msg =
-    typeof err === 'string'
-      ? err
-      : err instanceof Error
-        ? err.message
-        : typeof err === 'object' && err != null && 'description' in err
-          ? typeof (err as { description: unknown }).description === 'string'
-            ? (err as { description: string }).description
-            : ''
-          : ''
-  return /can't parse entities|can't find end of the entity|unsupported start tag|unmatched end tag/i.test(msg)
-}
+import { richMessage, isParseEntitiesError } from './rich-send.js'
 
 /**
  * Minimal bot.api surface the controller needs. Real callers pass grammy's
- * `bot.api`; tests pass a mock with just these two methods.
+ * `bot.api`; tests pass a mock with these methods.
  */
 export interface StreamBotApi {
   sendMessage(
@@ -50,16 +32,20 @@ export interface StreamBotApi {
     text: string,
     opts: StreamSendOpts,
   ): Promise<{ message_id: number }>
+  sendRichMessage(
+    chat_id: string,
+    rich_message: { markdown: string },
+    opts: StreamSendOpts,
+  ): Promise<{ message_id: number }>
   editMessageText(
     chat_id: string,
     message_id: number,
-    text: string,
+    text: string | { markdown: string },
     opts: StreamSendOpts,
   ): Promise<unknown>
 }
 
 export interface StreamSendOpts {
-  parse_mode?: 'HTML' | 'MarkdownV2'
   message_thread_id?: number
   link_preview_options?: { is_disabled: boolean }
   /**
@@ -99,7 +85,13 @@ export interface StreamControllerConfig {
   bot: { api: StreamBotApi }
   chatId: string
   threadId?: number
-  parseMode?: 'HTML' | 'MarkdownV2'
+  /**
+   * When true, this stream is a literal `format:'text'` send: the body
+   * bypasses the rich-markdown parser entirely (plain `sendMessage` /
+   * plain-string `editMessageText`). Default (false/undefined) → the
+   * rich-markdown path via `sendRichMessage` / `editMessageText({ markdown })`.
+   */
+  literalText?: boolean
   disableLinkPreview?: boolean
   /**
    * Optional quote-reply target. When set, the initial send attaches
@@ -186,7 +178,7 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     bot,
     chatId,
     threadId,
-    parseMode,
+    literalText = false,
     disableLinkPreview = true,
     throttleMs,
     idleMs,
@@ -205,9 +197,9 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
 
   // Base opts shared by send + edit. The initial send adds reply_parameters
   // and protect_content on top (see below); edits must NOT carry those —
-  // Telegram's editMessageText rejects them.
+  // Telegram's editMessageText rejects them. Both send and edit share these
+  // opts, so a rich send is always followed by a rich edit (#2669 invariant).
   const baseOpts: StreamSendOpts = {
-    ...(parseMode ? { parse_mode: parseMode } : {}),
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(disableLinkPreview ? { link_preview_options: { is_disabled: true } } : {}),
     ...(replyMarkup != null ? { reply_markup: replyMarkup } : {}),
@@ -226,38 +218,44 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     ...(cfg.disableNotification === true ? { disable_notification: true } : {}),
   }
 
-  // Strip parse_mode from a copy of opts — used for the parse-entities
-  // fallback path. We keep thread/preview/reply markup untouched.
-  const sendOptsPlain: StreamSendOpts = { ...sendOpts }
-  delete sendOptsPlain.parse_mode
-  const baseOptsPlain: StreamSendOpts = { ...baseOpts }
-  delete baseOptsPlain.parse_mode
+  // Send the body via the rich-markdown path, unless this is a literal
+  // `format:'text'` stream (plain sendMessage, no rich wrapper).
+  // sendRichMessage does NOT accept link_preview_options (rich messages
+  // control previews via entity detection), so strip it for the rich path.
+  const doSend = (text: string, opts: StreamSendOpts) => {
+    if (literalText) return bot.api.sendMessage(chatId, text, opts)
+    const richOpts = { ...opts }
+    delete richOpts.link_preview_options
+    return bot.api.sendRichMessage(chatId, richMessage(text), richOpts)
+  }
+  const doEdit = (id: number, text: string, opts: StreamSendOpts) =>
+    bot.api.editMessageText(chatId, id, literalText ? text : richMessage(text), opts)
 
   return createDraftStream(
     async (text) => {
       try {
         const sent = await retry(
-          () => bot.api.sendMessage(chatId, text, sendOpts),
+          () => doSend(text, sendOpts),
           { threadId, chat_id: chatId },
         )
         onSend?.(sent.message_id, text.length)
         return sent.message_id
       } catch (err) {
-        if (parseMode != null && isParseEntitiesError(err)) {
-          // First send rejected for parse_mode error. There is no
-          // message_id to edit (the send 400'd before any message was
-          // created), so a single fresh send in plain-text is the
-          // correct recovery — see issue #657. Strip tags from the
-          // body so the user sees readable prose, not raw markup.
+        if (!literalText && isParseEntitiesError(err)) {
+          // First send rejected because the markdown couldn't be parsed.
+          // There is no message_id to edit (the send 400'd before any
+          // message was created), so a single fresh send as PLAIN text
+          // (no rich wrapper, so the parser never runs) is the correct
+          // recovery — see issue #657. The raw markdown source is itself
+          // readable, so we send it verbatim.
           warn?.(
-            `stream-controller: sendMessage parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
+            `stream-controller: send parse-entities rejected — retrying once as plain text (${err instanceof Error ? err.message : String(err)})`,
           )
-          const plainText = htmlToPlainText(text)
           const sent = await retry(
-            () => bot.api.sendMessage(chatId, plainText, sendOptsPlain),
+            () => bot.api.sendMessage(chatId, text, sendOpts),
             { threadId, chat_id: chatId },
           )
-          onSend?.(sent.message_id, plainText.length)
+          onSend?.(sent.message_id, text.length)
           return sent.message_id
         }
         throw err
@@ -266,27 +264,26 @@ export function createStreamController(cfg: StreamControllerConfig): DraftStream
     async (id, text) => {
       try {
         await retry(
-          () => bot.api.editMessageText(chatId, id, text, baseOpts),
+          () => doEdit(id, text, baseOpts),
           { threadId, chat_id: chatId },
         )
         onEdit?.(id, text.length)
       } catch (err) {
-        if (parseMode != null && isParseEntitiesError(err)) {
-          // Edit rejected for parse_mode error — DO NOT send a fresh
-          // message. The whole point of issue #657 is that the previous
-          // implementation sent a duplicate plain-text message every
-          // time HTML rejection fired. Retry the edit on the SAME
-          // message_id with parse_mode stripped and the body
-          // tag-stripped to plain text.
+        if (!literalText && isParseEntitiesError(err)) {
+          // Edit rejected because the markdown couldn't be parsed — DO NOT
+          // send a fresh message. The whole point of issue #657 is that the
+          // previous implementation sent a duplicate message every time a
+          // parse rejection fired. Retry the edit on the SAME message_id as
+          // PLAIN text (no rich wrapper, so the parser never runs). The raw
+          // markdown source is itself readable, so we send it verbatim.
           warn?.(
-            `stream-controller: editMessageText parse-entities rejected — retrying same id=${id} as plain text (${err instanceof Error ? err.message : String(err)})`,
+            `stream-controller: edit parse-entities rejected — retrying same id=${id} as plain text (${err instanceof Error ? err.message : String(err)})`,
           )
-          const plainText = htmlToPlainText(text)
           await retry(
-            () => bot.api.editMessageText(chatId, id, plainText, baseOptsPlain),
+            () => bot.api.editMessageText(chatId, id, text, baseOpts),
             { threadId, chat_id: chatId },
           )
-          onEdit?.(id, plainText.length)
+          onEdit?.(id, text.length)
           return
         }
         throw err

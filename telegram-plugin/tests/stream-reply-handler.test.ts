@@ -1,9 +1,12 @@
 /**
  * Integration tests for the `stream_reply` MCP tool handler.
  *
- * Exercises the extracted `handleStreamReply` against the mock bot harness
- * with realistic deps (format rendering, access check, thread resolution,
- * handoff prefix, history record).
+ * Post-#2669: there is one rendering path. The handler passes the raw GFM
+ * markdown straight to the stream controller, which sends it via
+ * `bot.api.sendRichMessage(chat, { markdown }, opts)` and edits via
+ * `bot.api.editMessageText(chat, id, { markdown }, opts)`. The only fork is
+ * `format:'text'` → the literal plain `sendMessage` path. There is no
+ * markdownToHtml / escapeMarkdownV2 dep and no activeDraftParseModes state.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
@@ -12,7 +15,7 @@ import {
   type StreamReplyState,
 } from '../stream-reply-handler.js'
 import type { DraftStreamHandle } from '../draft-stream.js'
-import { markdownToHtml as realMarkdownToHtml } from '../format.js'
+import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { createMockBot, installBotResetHook, microtaskFlush } from './bot-api.harness.js'
 import {
   handlePtyPartialPure,
@@ -22,7 +25,6 @@ import {
 function makeState(): StreamReplyState {
   return {
     activeDraftStreams: new Map<string, DraftStreamHandle>(),
-    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
   }
 }
 
@@ -32,13 +34,12 @@ function makeDeps(
 ): StreamReplyDeps {
   return {
     bot,
-    markdownToHtml: (t) => `<b>${t}</b>`,
-    escapeMarkdownV2: (t) => `\\${t}\\`,
     repairEscapedWhitespace: (t) => t,
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
-    defaultFormat: 'html',
+    // Anything other than the literal 'text' is the rich-markdown path.
+    defaultFormat: 'markdown',
     logStreamingEvent: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
@@ -48,6 +49,15 @@ function makeDeps(
   }
 }
 
+/** The raw markdown body of the i-th rich send. */
+function richSendMarkdown(bot: ReturnType<typeof createMockBot>, i = 0): string {
+  return (bot.api.sendRichMessage.mock.calls[i][1] as { markdown: string }).markdown
+}
+/** The raw markdown body of the i-th rich edit. */
+function richEditMarkdown(bot: ReturnType<typeof createMockBot>, i = 0): string {
+  return (bot.api.editMessageText.mock.calls[i][2] as { markdown: string }).markdown
+}
+
 describe('handleStreamReply', () => {
   const bot = createMockBot()
   installBotResetHook(bot)
@@ -55,7 +65,7 @@ describe('handleStreamReply', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
-  it('first call creates stream + sends with rendered HTML text', async () => {
+  it('first call creates stream + sends raw markdown via sendRichMessage', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -65,102 +75,81 @@ describe('handleStreamReply', () => {
 
     expect(result.status).toBe('updated')
     expect(result.messageId).toBe(500)
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>hi</b>')
-    expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBe('HTML')
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendMessage).not.toHaveBeenCalled()
+    expect(richSendMarkdown(bot)).toBe('hi')
     expect(state.activeDraftStreams.size).toBe(1)
   })
 
-  it('respects format=markdownv2 — uses MDv2 escaper and parse_mode', async () => {
+  it('a non-text format ships raw GFM markdown unescaped (no parse_mode)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
     const pending = handleStreamReply(
-      { chat_id: '1', text: 'hi', format: 'markdownv2' },
+      { chat_id: '1', text: '**hi** _there_', format: 'gfm' },
       state,
       deps,
     )
     await microtaskFlush()
     await pending
 
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('\\hi\\')
-    expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBe('MarkdownV2')
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(richSendMarkdown(bot)).toBe('**hi** _there_')
+    // No parse_mode on rich opts.
+    expect(bot.api.sendRichMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
   })
 
-  it('respects format=text — no parse_mode, raw text', async () => {
+  it('respects format=text — literal plain sendMessage, raw text', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
     const pending = handleStreamReply(
-      { chat_id: '1', text: 'plain', format: 'text' },
+      { chat_id: '1', text: 'plain < text >', format: 'text' },
       state,
       deps,
     )
     await microtaskFlush()
     await pending
 
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('plain')
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).not.toHaveBeenCalled()
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('plain < text >')
     expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
   })
 
-  it('throws when text exceeds 4096 (no silent id:pending)', async () => {
-    // Pins the bug found in prod: a >4096-char text would hit draft-
-    // stream's length guard, silently stop, and the handler would return
-    // status:finalized, messageId:null — the MCP response read
-    // "finalized (id: pending)" looking like success. Fixed upstream by
-    // an over-limit pre-check that throws BEFORE touching stream state,
-    // so both first-send-over-limit AND mid-stream-over-limit fail loudly
-    // instead of corrupting the stream. done=true not required.
+  it('throws when text exceeds the rich-message cap (no silent id:pending)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
-    const tooLong = 'x'.repeat(5000)
+    const tooLong = 'x'.repeat(RICH_MESSAGE_MAX_CHARS + 1)
 
     await expect(
       handleStreamReply({ chat_id: '1', text: tooLong, done: true }, state, deps),
-    ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
+    ).rejects.toThrow(new RegExp(`exceeds Telegram's ${RICH_MESSAGE_MAX_CHARS}-char`))
 
-    // Mock bot should NOT have received any sendMessage call.
+    expect(bot.api.sendRichMessage).not.toHaveBeenCalled()
     expect(bot.api.sendMessage).not.toHaveBeenCalled()
   })
 
   it('mid-stream over-limit throws without corrupting stream state', async () => {
-    // A stream that starts small but a later update() goes over 4096.
-    // Before the upfront length check, the draft-stream would set its
-    // internal stopped=true flag and silently drop all further text —
-    // including the done=true final answer. The pre-check now throws
-    // on the over-limit call, leaving the stream intact so the caller
-    // can fall back to `reply`. The previously-sent short text stays
-    // visible in Telegram; the throw is the signal to the caller.
     const state = makeState()
     const deps = makeDeps(bot)
 
-    await handleStreamReply(
-      { chat_id: '1', text: 'short' },
-      state,
-      deps,
-    )
+    await handleStreamReply({ chat_id: '1', text: 'short' }, state, deps)
     await microtaskFlush()
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
 
-    // Second call: now over limit.
     await expect(
       handleStreamReply(
-        { chat_id: '1', text: 'y'.repeat(5000), done: true },
+        { chat_id: '1', text: 'y'.repeat(RICH_MESSAGE_MAX_CHARS + 1), done: true },
         state,
         deps,
       ),
-    ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
+    ).rejects.toThrow(new RegExp(`exceeds Telegram's ${RICH_MESSAGE_MAX_CHARS}-char`))
 
-    // No additional API calls from the rejected update.
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
   })
 
   it('done=true finalizes the stream but does NOT touch the reaction (#1713)', async () => {
-    // #1713: stream_reply done=true is a NON-EVENT for the status
-    // reaction. Stream completion is "I'm done speaking", not "turn
-    // over"; the model may continue with post-stream tool work. Only
-    // the gateway's turn_end IPC handler finalizes the reaction.
-    // This is a deliberate revert of the Bug Z fix (PR #602 follow-up).
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -177,10 +166,6 @@ describe('handleStreamReply', () => {
   })
 
   it('done=true on a named lane does NOT fire terminal 👍', async () => {
-    // Named lanes (lane:'progress', lane:'thinking', lane:'activity'
-    // etc.) are internal driver emits, not user-visible answers. They
-    // must not be allowed to claim turn-completion: a progress-lane
-    // emit firing setDone would race the actual answer message.
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -194,20 +179,16 @@ describe('handleStreamReply', () => {
   })
 
   it('done=true does NOT fire 👍 if finalize never produced a messageId', async () => {
-    // The over-limit branch throws before getMessageId() is non-null.
-    // Even if it didn't throw, a null messageId means the initial send
-    // never landed, so 👍 must not fire. Pinning that the gating on
-    // `getMessageId() != null` holds.
     const state = makeState()
     const deps = makeDeps(bot)
 
     await expect(
       handleStreamReply(
-        { chat_id: '1', text: 'x'.repeat(5000), done: true },
+        { chat_id: '1', text: 'x'.repeat(RICH_MESSAGE_MAX_CHARS + 1), done: true },
         state,
         deps,
       ),
-    ).rejects.toThrow(/exceeds Telegram's 4096-char limit/)
+    ).rejects.toThrow(new RegExp(`exceeds Telegram's ${RICH_MESSAGE_MAX_CHARS}-char`))
   })
 
   it('done=true with historyEnabled records the final message row', async () => {
@@ -231,7 +212,7 @@ describe('handleStreamReply', () => {
       chat_id: '1',
       thread_id: 42,
       message_ids: [500],
-      texts: ['final text'], // raw text, NOT HTML-rendered
+      texts: ['final text'], // raw text
     })
   })
 
@@ -282,10 +263,11 @@ describe('handleStreamReply', () => {
       handleStreamReply({ chat_id: 'evil', text: 'x' }, state, deps),
     ).rejects.toThrow('chat not allowed')
 
+    expect(bot.api.sendRichMessage).not.toHaveBeenCalled()
     expect(bot.api.sendMessage).not.toHaveBeenCalled()
   })
 
-  it('subsequent calls reuse the same stream + edit in place', async () => {
+  it('subsequent calls reuse the same stream + rich-edit in place', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -298,13 +280,13 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await p2
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText.mock.calls[0][1]).toBe(500) // same id
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>step 2</b>')
+    expect(richEditMarkdown(bot)).toBe('step 2')
   })
 
-  it('passes repairEscapedWhitespace through before rendering', async () => {
+  it('passes repairEscapedWhitespace through before sending', async () => {
     const state = makeState()
     const deps = makeDeps(bot, {
       repairEscapedWhitespace: (t) => t.replace(/\\n/g, '\n'),
@@ -314,8 +296,8 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pending
 
-    // repair happens first; then markdownToHtml wraps the repaired text
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>a\nb</b>')
+    // repair happens first; the repaired raw markdown is the wire payload.
+    expect(richSendMarkdown(bot)).toBe('a\nb')
   })
 
   it('different lanes for same chat produce independent Telegram messages', async () => {
@@ -338,7 +320,7 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     const r2 = await p2
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     expect(r1.messageId).not.toBe(r2.messageId) // separate messages
     expect(state.activeDraftStreams.size).toBe(2)
     expect(state.activeDraftStreams.has('1:_')).toBe(true)
@@ -366,9 +348,9 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await p2
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>step 1 — step 2</b>')
+    expect(richEditMarkdown(bot)).toBe('step 1 — step 2')
   })
 
   it('done=true on one lane does not affect other lanes', async () => {
@@ -396,14 +378,6 @@ describe('handleStreamReply', () => {
   })
 
   // ─── Regression: concurrent turns on the same chat+thread+lane ───────
-  // Before the fix, two simultaneously active turns emitting on
-  // lane:'progress' (the progress-card driver's lane) computed the same
-  // streamKey and collapsed into one draft stream. Telegram saw a single
-  // message flapping between the two turns' narratives instead of two
-  // separate pinned cards. The fix threads a per-turn `turnKey` through
-  // `StreamReplyArgs` → `streamKey()` so each active turn gets its own
-  // slot in `activeDraftStreams` (and therefore its own Telegram message
-  // and its own pin via `progressPinnedMsgIds`).
   it('concurrent turns with different turnKeys produce separate draft streams and messages', async () => {
     const state = makeState()
     const deps = makeDeps(bot)
@@ -427,7 +401,7 @@ describe('handleStreamReply', () => {
     const rB = await pB
 
     // Two independent Telegram messages (not one edited twice).
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     expect(bot.api.editMessageText).not.toHaveBeenCalled()
     expect(rA.messageId).not.toBe(rB.messageId)
 
@@ -436,9 +410,9 @@ describe('handleStreamReply', () => {
     expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(true)
     expect(state.activeDraftStreams.has('1:_:progress:1:_:2')).toBe(true)
 
-    // Each message carried its own turn's text.
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>turn A step 1</b>')
-    expect(bot.api.sendMessage.mock.calls[1][1]).toBe('<b>turn B step 1</b>')
+    // Each message carried its own turn's raw markdown.
+    expect(richSendMarkdown(bot, 0)).toBe('turn A step 1')
+    expect(richSendMarkdown(bot, 1)).toBe('turn B step 1')
   })
 
   it('subsequent updates with same turnKey reuse the stream (edit in place)', async () => {
@@ -463,11 +437,10 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await p2
 
-    // One send (first call) + one edit (second call) on the same message.
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText.mock.calls[0][1]).toBe(500)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('<b>A first + second</b>')
+    expect(richEditMarkdown(bot)).toBe('A first + second')
     expect(state.activeDraftStreams.size).toBe(1)
     expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(true)
   })
@@ -476,7 +449,6 @@ describe('handleStreamReply', () => {
     const state = makeState()
     const deps = makeDeps(bot)
 
-    // Turn A opens
     const pa1 = handleStreamReply(
       { chat_id: '1', text: 'A step 1', lane: 'progress', turnKey: '1:_:1' },
       state, deps,
@@ -484,7 +456,6 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pa1
 
-    // Turn B opens
     const pb1 = handleStreamReply(
       { chat_id: '1', text: 'B step 1', lane: 'progress', turnKey: '1:_:2' },
       state, deps,
@@ -494,7 +465,6 @@ describe('handleStreamReply', () => {
 
     vi.advanceTimersByTime(1000)
 
-    // Turn A updates
     const pa2 = handleStreamReply(
       { chat_id: '1', text: 'A step 1 + 2', lane: 'progress', turnKey: '1:_:1' },
       state, deps,
@@ -504,7 +474,6 @@ describe('handleStreamReply', () => {
 
     vi.advanceTimersByTime(1000)
 
-    // Turn B updates
     const pb2 = handleStreamReply(
       { chat_id: '1', text: 'B step 1 + 2', lane: 'progress', turnKey: '1:_:2' },
       state, deps,
@@ -512,19 +481,17 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pb2
 
-    // Two sends (one per turn), two edits (one per turn's update).
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(2)
 
-    // The edits must target distinct message ids — one per turn's
-    // original message — not both collapse onto the same id.
     const editTargets = bot.api.editMessageText.mock.calls.map((c) => c[1])
     expect(new Set(editTargets).size).toBe(2)
 
-    // And each edit carries its own turn's text — no cross-contamination.
-    const editTexts = bot.api.editMessageText.mock.calls.map((c) => c[2])
-    expect(editTexts).toContain('<b>A step 1 + 2</b>')
-    expect(editTexts).toContain('<b>B step 1 + 2</b>')
+    const editTexts = bot.api.editMessageText.mock.calls.map(
+      (c) => (c[2] as { markdown: string }).markdown,
+    )
+    expect(editTexts).toContain('A step 1 + 2')
+    expect(editTexts).toContain('B step 1 + 2')
   })
 
   it('done=true on one turnKey does not close the other concurrent turn', async () => {
@@ -547,11 +514,8 @@ describe('handleStreamReply', () => {
 
     expect(state.activeDraftStreams.size).toBe(2)
 
-    // Advance past the throttle window so the finalize edit can flush
-    // instead of sitting on the debounce timer (fake timers).
     vi.advanceTimersByTime(1000)
 
-    // Finalize turn A
     const pAFinal = handleStreamReply(
       { chat_id: '1', text: 'A final', lane: 'progress', turnKey: '1:_:1', done: true },
       state, deps,
@@ -559,18 +523,12 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pAFinal
 
-    // Turn A's slot is gone; turn B's is still live.
     expect(state.activeDraftStreams.has('1:_:progress:1:_:1')).toBe(false)
     expect(state.activeDraftStreams.has('1:_:progress:1:_:2')).toBe(true)
     expect(state.activeDraftStreams.size).toBe(1)
   })
 
   it('turnKey omitted falls back to legacy chat+thread+lane key (no regression for non-progress callers)', async () => {
-    // Other lanes (default, thinking, activity) don't pass turnKey. They
-    // must still multiplex the legacy way: one stream per chat+thread+lane.
-    // This pins the backwards-compatible behavior of streamKey() when
-    // turnKey is undefined — a non-progress caller shouldn't suddenly
-    // create a new stream on every call.
     const state = makeState()
     const deps = makeDeps(bot)
 
@@ -582,67 +540,48 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await p2
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(state.activeDraftStreams.size).toBe(1)
     expect(state.activeDraftStreams.has('1:_')).toBe(true)
   })
 
-  it('bug 1: parseMode mismatch with existing stream rotates to fresh stream with new parseMode + rendered text', async () => {
-    // Reproduces the reported bug: PTY-tail auto-stream seeds a stream
-    // with format:'text' (parseMode undefined). A later explicit
-    // stream_reply on the same key with format:'html' + markdown text
-    // must NOT inherit the stale parseMode — it must finalize the old
-    // stream and create a fresh one with parse_mode=HTML so the markdown
-    // converts to HTML tags instead of sending literal asterisks.
+  it('single-mode reuse: a format switch on the same lane does NOT rotate the stream (#2669)', async () => {
+    // Pre-#2669 a parseMode mismatch (text→html) finalized the old stream
+    // and created a fresh one. There is now ONE mode: a non-text format on
+    // an existing rich stream reuses it (edit in place). Only a literal
+    // 'text' stream differs, and that distinction is fixed at creation.
     const state = makeState()
-    const deps = makeDeps(bot, {
-      markdownToHtml: realMarkdownToHtml,
-      defaultFormat: 'text',
-    })
+    const deps = makeDeps(bot, { defaultFormat: 'markdown' })
 
-    // First call: PTY-tail-style, format:'text'
+    // First call: rich markdown.
     const p1 = handleStreamReply(
-      { chat_id: '1', text: 'Running Bash: ls', format: 'text' },
+      { chat_id: '1', text: 'plain start', format: 'markdown' },
       state, deps,
     )
     await microtaskFlush()
     await p1
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
 
     vi.advanceTimersByTime(1000)
 
-    // Second call on the same stream key: model explicitly uses html +
-    // markdown. Must produce a new send (stream rotated), parse_mode HTML,
-    // and literal markdown converted to Telegram HTML tags.
+    // Second call on the same key with a different (still non-text) format:
+    // the stream is reused and the markdown ships raw, unescaped.
     const p2 = handleStreamReply(
-      { chat_id: '1', text: '**bold** and `code`', format: 'html' },
+      { chat_id: '1', text: '**bold** and `code`', format: 'gfm' },
       state, deps,
     )
     await microtaskFlush()
     await p2
 
-    // A fresh stream means a second sendMessage, not an edit of the old
-    // one (the old stream was finalized + discarded).
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
-    const secondSend = bot.api.sendMessage.mock.calls[1]
-    expect(secondSend[2]?.parse_mode).toBe('HTML')
-    // markdownToHtml renders `**bold**` → `<b>bold</b>` and
-    // `` `code` `` → `<code>code</code>`.
-    expect(secondSend[1]).toContain('<b>bold</b>')
-    expect(secondSend[1]).toContain('<code>code</code>')
-    expect(secondSend[1]).not.toContain('**')
-    expect(secondSend[1]).not.toMatch(/`code`/)
+    // No new send — edited in place.
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
+    // Raw markdown passed through verbatim — NOT converted to HTML.
+    expect(richEditMarkdown(bot)).toBe('**bold** and `code`')
   })
 
-  // ─── Regression: PTY-tail duplicate message. Before the fix,
-  // stream_reply did not add itself to suppressPtyPreview, so a PTY
-  // partial firing after a finalized stream (TUI capture of the same
-  // assistant text) created a duplicate message with the raw TUI text
-  // and visibly escaped HTML tags. See log sequence: msg 559 finalized,
-  // then msg 560 draft_send path=pty_preview with the same content.
-  // Now stream_reply claims the suppress slot on the first call.
+  // ─── Regression: PTY-tail duplicate message ──────────────────────────
 
   it('adds sKey (without lane) to suppressPtyPreview on first call', async () => {
     const state: StreamReplyState = {
@@ -673,18 +612,12 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pending
 
-    // The stream itself is keyed with the lane...
     expect(state.activeDraftStreams.has('42:_:thinking')).toBe(true)
-    // ...but the PTY-suppression key is lane-less so the PTY handler
-    // (which has no concept of lanes) actually sees it as suppressed.
     expect(state.suppressPtyPreview!.has('42:_')).toBe(true)
     expect(state.suppressPtyPreview!.has('42:_:thinking')).toBe(false)
   })
 
   it('suppression survives done=true so late PTY partials are still dropped', async () => {
-    // This covers the exact production sequence from telegram-plugin.log:
-    // stream_reply done=true → draft_edit final → PTY partial arrives
-    // 500ms later with the TUI capture → must NOT create a new message.
     const state: StreamReplyState = {
       ...makeState(),
       suppressPtyPreview: new Set<string>(),
@@ -699,25 +632,15 @@ describe('handleStreamReply', () => {
     await microtaskFlush()
     await pending
 
-    // After done=true the stream is gone from activeDraftStreams...
     expect(state.activeDraftStreams.has('42:_')).toBe(false)
-    // ...but the suppress slot must remain so a PTY partial landing
-    // AFTER finalize is dropped. server.ts clears this on turn_end.
     expect(state.suppressPtyPreview!.has('42:_')).toBe(true)
   })
 
   it('end-to-end: PTY partial after stream_reply finalize is suppressed (no dup message)', async () => {
-    // Reproduces the production sequence:
-    //   1. stream_reply done=true for chat 42
-    //   2. PTY-tail fires with the TUI capture of the same assistant text
-    //   3. PTY handler sees suppress flag and drops the partial
-    // Before the fix, step 2 created a duplicate Telegram message with
-    // raw TUI text and visibly-escaped HTML tags (see log msg 559 → 560).
     const activeDraftStreams = new Map<string, DraftStreamHandle>()
     const suppressPtyPreview = new Set<string>()
     const streamState: StreamReplyState = {
       activeDraftStreams,
-      activeDraftParseModes: new Map(),
       suppressPtyPreview,
     }
     const streamDeps = makeDeps(bot)
@@ -730,7 +653,8 @@ describe('handleStreamReply', () => {
     )
     await microtaskFlush()
     await pending
-    const sendsAfterStream = bot.api.sendMessage.mock.calls.length
+    const sendsAfterStream =
+      bot.api.sendMessage.mock.calls.length + bot.api.sendRichMessage.mock.calls.length
 
     // Step 2: PTY partial fires into the SHARED state — same Sets/Maps.
     const ptyState: PtyHandlerState = {
@@ -742,19 +666,20 @@ describe('handleStreamReply', () => {
       lastPtyPreviewByChat: new Map(),
     }
     const action = handlePtyPartialPure(
-      'TUI capture: <b>final answer</b>',
+      'TUI capture: final answer',
       ptyState,
       { bot, renderText: (t) => t },
     )
     await microtaskFlush()
 
-    // Step 3: partial was dropped — no extra sendMessage call.
+    // Step 3: partial was dropped — no extra send call of any kind.
     expect(action).toBe('suppressed')
-    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsAfterStream)
+    expect(
+      bot.api.sendMessage.mock.calls.length + bot.api.sendRichMessage.mock.calls.length,
+    ).toBe(sendsAfterStream)
   })
 
   it('works without suppressPtyPreview (backwards compat)', async () => {
-    // Callers that don't thread the set through must still function.
     const state = makeState() // no suppressPtyPreview
     const deps = makeDeps(bot)
 
@@ -786,13 +711,6 @@ describe('handleStreamReply', () => {
   })
 
   describe('progressCardActive coexistence', () => {
-    // The progress card and the answer message live on different lanes
-    // (progress vs default) and render different content (tool structure
-    // vs model prose), so default-lane stream_reply(done=false) is
-    // accepted in checklist mode. The card is no longer treated as the
-    // sole mid-turn surface — it shows tool structure on its own lane
-    // while the model's progressive replies stream into the answer
-    // message. See #481.
     it('accepts default-lane done=false when progress card is active (streams into answer)', async () => {
       const state: StreamReplyState = {
         ...makeState(),
@@ -808,14 +726,9 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       const result = await pending
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>working...</b>')
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+      expect(richSendMarkdown(bot)).toBe('working...')
       expect(result.status).toBe('updated')
-      // PTY-preview slot is claimed because the model is now the
-      // answer-lane surface owner — late PTY partials should defer to
-      // the model's stream rather than racing it with a parallel edit.
-      // (Same suppression pattern as before — no longer for cleanup
-      // after a rejection, but for ownership during normal streaming.)
       expect(state.suppressPtyPreview?.has('1:_')).toBe(true)
     })
 
@@ -831,8 +744,8 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       const result = await pending
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-      expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>final answer</b>')
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+      expect(richSendMarkdown(bot)).toBe('final answer')
       expect(result.status).toBe('finalized')
       expect(result.messageId).toBe(500)
     })
@@ -849,7 +762,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     })
 
     it('legacy behavior preserved when progressCardActive is false', async () => {
@@ -860,7 +773,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -877,7 +790,7 @@ describe('handleStreamReply', () => {
       await pending
 
       expect(lookup).toHaveBeenCalledWith('1', null)
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toEqual({
         message_id: 4242,
       })
     })
@@ -897,9 +810,8 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      // Lookup is skipped entirely when reply_to is explicit.
       expect(lookup).not.toHaveBeenCalled()
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toEqual({
         message_id: 777,
       })
     })
@@ -920,7 +832,7 @@ describe('handleStreamReply', () => {
       await pending
 
       expect(lookup).not.toHaveBeenCalled()
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
     })
 
     it('no reply_parameters when history lookup returns null (empty history)', async () => {
@@ -935,7 +847,7 @@ describe('handleStreamReply', () => {
       await pending
 
       expect(lookup).toHaveBeenCalledTimes(1)
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
     })
 
     it('no auto-quote when getLatestInboundMessageId dep is omitted (legacy callers)', async () => {
@@ -946,7 +858,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toBeUndefined()
     })
 
     it('passes thread id to the lookup', async () => {
@@ -974,17 +886,14 @@ describe('handleStreamReply', () => {
       )
       const deps = makeDeps(bot, { getLatestInboundMessageId: lookup })
 
-      // First call → send with reply_parameters.
       await handleStreamReply({ chat_id: '1', text: 'hi' }, state, deps)
       await microtaskFlush()
 
-      // Second call on the same stream → edit. editMessageText must NOT
-      // receive reply_parameters (Telegram rejects it on edit).
       vi.advanceTimersByTime(1000)
       await handleStreamReply({ chat_id: '1', text: 'hi there' }, state, deps)
       await microtaskFlush()
 
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_parameters).toEqual({
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_parameters).toEqual({
         message_id: 4242,
       })
       expect(bot.api.editMessageText).toHaveBeenCalled()
@@ -994,7 +903,7 @@ describe('handleStreamReply', () => {
   })
 
   describe('reply_markup persistence', () => {
-    it('reply_markup in args is included in sendMessage opts on stream creation', async () => {
+    it('reply_markup in args is included in sendRichMessage opts on stream creation', async () => {
       const state = makeState()
       const deps = makeDeps(bot)
       const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
@@ -1007,10 +916,10 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBe(keyboard)
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_markup).toBe(keyboard)
     })
 
-    it('reply_markup persists through editMessageText on subsequent updates', async () => {
+    it('reply_markup rides on both the rich send AND the rich edit', async () => {
       const state = makeState()
       const deps = makeDeps(bot)
       const keyboard = { inline_keyboard: [[{ text: 'Steer', callback_data: 'steer:1' }]] }
@@ -1032,6 +941,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await p2
 
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_markup).toBe(keyboard)
       expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
       expect(bot.api.editMessageText.mock.calls[0][3]?.reply_markup).toBe(keyboard)
     })
@@ -1070,17 +980,12 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage.mock.calls[0][2]?.reply_markup).toBeUndefined()
+      expect(bot.api.sendRichMessage.mock.calls[0][2]?.reply_markup).toBeUndefined()
     })
   })
 
   describe('lookupExistingMessageId hook (#626 — multiple status messages regression)', () => {
-    it('reuses an externally-known messageId on stream creation — first emit edits, no sendMessage', async () => {
-      // The pin manager already knows the anchor message id for this
-      // turnKey from a previous emit cycle (e.g. before done=true wiped
-      // activeDraftStreams[sKey]). The hook hands that id back; the
-      // new stream initializes with it, so the FIRST update edits in
-      // place. No fresh sendMessage = no extra "status message" lands.
+    it('reuses an externally-known messageId on stream creation — first emit edits, no send', async () => {
       const state = makeState()
       const deps = makeDeps(bot, {
         lookupExistingMessageId: ({ turnKey, lane }) => {
@@ -1097,6 +1002,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       const result = await pending
 
+      expect(bot.api.sendRichMessage).not.toHaveBeenCalled()
       expect(bot.api.sendMessage).not.toHaveBeenCalled()
       expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
       const [, id] = bot.api.editMessageText.mock.calls[0]
@@ -1104,9 +1010,7 @@ describe('handleStreamReply', () => {
       expect(result.messageId).toBe(4242)
     })
 
-    it('hook returns null → falls through to legacy sendMessage path', async () => {
-      // Back-compat sanity: a hook that returns null on every call
-      // produces identical behavior to omitting the hook entirely.
+    it('hook returns null → falls through to legacy send path', async () => {
       const state = makeState()
       const deps = makeDeps(bot, {
         lookupExistingMessageId: () => null,
@@ -1120,16 +1024,11 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       await pending
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
       expect(bot.api.editMessageText).not.toHaveBeenCalled()
     })
 
     it('hook NOT consulted when an active draft stream already exists for the lane+turn', async () => {
-      // Lifecycle invariant: the hook only fires on stream creation.
-      // If activeDraftStreams[sKey] is already populated (turn in
-      // progress, no done=true yet), the existing stream handles
-      // edits — the hook is never consulted, so it can't disturb the
-      // running stream's state.
       const state = makeState()
       let lookupCalls = 0
       const deps = makeDeps(bot, {
@@ -1139,8 +1038,6 @@ describe('handleStreamReply', () => {
         },
       })
 
-      // First emit creates the stream (lookup IS called, returns
-      // 9999 → first edit goes to 9999).
       await handleStreamReply(
         { chat_id: '1', text: 'first', lane: 'progress', turnKey: 'turn-B' },
         state,
@@ -1151,8 +1048,6 @@ describe('handleStreamReply', () => {
       expect(lookupCalls).toBe(1)
       expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
 
-      // Second emit on the same lane+turn reuses the existing stream
-      // — the lookup is NOT called again. Edits still target 9999.
       await handleStreamReply(
         { chat_id: '1', text: 'second', lane: 'progress', turnKey: 'turn-B' },
         state,
@@ -1163,10 +1058,7 @@ describe('handleStreamReply', () => {
       expect(bot.api.editMessageText).toHaveBeenCalledTimes(2)
     })
 
-    it('hook throws → error logged, handler falls through to fresh sendMessage', async () => {
-      // Defensive contract: a buggy lookup must never break the
-      // outbound path. Caller's writeError gets the diagnostic; the
-      // emit lands as a fresh send.
+    it('hook throws → error logged, handler falls through to fresh send', async () => {
       const state = makeState()
       const writeError = vi.fn()
       const deps = makeDeps(bot, {
@@ -1183,44 +1075,28 @@ describe('handleStreamReply', () => {
       )
       await microtaskFlush()
 
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
       expect(writeError).toHaveBeenCalled()
       const errLine = (writeError.mock.calls[0]?.[0] as string) ?? ''
       expect(errLine).toContain('lookupExistingMessageId failed')
     })
 
-    it('full #626 lifecycle scenario — done=true → activeDraftStreams cleared → next emit edits via hook (one anchor message total)', async () => {
-      // The end-to-end repro of #626. Sequence:
-      //   1. First progress-card emit (isFirstEmit=true) → fresh
-      //      sendMessage on the 'progress' lane for turn-A. Pin
-      //      manager records messageId=500.
-      //   2. done=true emit (e.g. the parent turn_end fires before
-      //      sub-agents finish) → handler finalizes + DELETES
-      //      activeDraftStreams[sKey].
-      //   3. A subsequent sub-agent event triggers a fresh progress-
-      //      card emit on the SAME turn-A. Without the hook, the
-      //      handler would create a new stream → fresh sendMessage →
-      //      a SECOND status message lands in the chat.
-      //   4. With the hook returning the pin-manager's messageId 500,
-      //      the new stream initializes with 500. The next update
-      //      hits editMessageText against 500. Total Telegram surface
-      //      = ONE message.
+    it('full #626 lifecycle scenario — done=true → cleared → next emit edits via hook (one anchor message total)', async () => {
       const state = makeState()
       const knownMessageId = { value: null as number | null }
       const deps = makeDeps(bot, {
         lookupExistingMessageId: () => knownMessageId.value,
       })
 
-      // 1. First emit, no known messageId yet → fresh sendMessage
+      // 1. First emit, no known messageId yet → fresh send
       await handleStreamReply(
         { chat_id: '1', text: 'tool 1...', lane: 'progress', turnKey: 'turn-A' },
         state,
         deps,
       )
       await microtaskFlush()
-      // The pin manager records id=500 (mock bot's first id).
       knownMessageId.value = 500
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
       expect(bot.api.editMessageText).not.toHaveBeenCalled()
 
       // 2. done=true → finalize + clear sKey
@@ -1233,8 +1109,7 @@ describe('handleStreamReply', () => {
       await microtaskFlush()
       expect(state.activeDraftStreams.size).toBe(0)
 
-      // 3. Subsequent sub-agent emit on the SAME turn-A — without
-      //    the hook this would land as sendMessage #2 (the bug).
+      // 3. Subsequent sub-agent emit on the SAME turn-A.
       await handleStreamReply(
         { chat_id: '1', text: 'tool 1, tool 2 ✓, sub-agent...', lane: 'progress', turnKey: 'turn-A' },
         state,
@@ -1242,10 +1117,8 @@ describe('handleStreamReply', () => {
       )
       await microtaskFlush()
 
-      // Invariant: total fresh sendMessages on this chat = 1.
-      // Anything > 1 is the #626 bug class.
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-      // The post-done emit was an edit against id 500.
+      // Invariant: total fresh rich sends on this chat = 1.
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
       expect(bot.api.editMessageText.mock.calls.some((c) => c[1] === 500)).toBe(true)
     })
   })

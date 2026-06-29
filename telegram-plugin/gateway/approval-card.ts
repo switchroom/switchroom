@@ -37,8 +37,12 @@ export interface BuiltApprovalCard {
  */
 export function buildApprovalCard(opts: ApprovalCardOptions): BuiltApprovalCard {
   const lines: string[] = [];
-  lines.push(`🔐 <b>${escapeHtml(opts.agent)}</b> wants approval`);
-  lines.push(`<code>${escapeHtml(opts.scope_humanized)}</code>`);
+  lines.push(`🔐 **${escapeHtml(opts.agent)}** wants approval`);
+  // The scope rides in a `code span` — content there is LITERAL, so it must
+  // NOT be markdown-escaped (escaping would leak visible backslashes, e.g.
+  // `secret:OPENAI\_API\_KEY`). Only an embedded backtick could break out of
+  // the span, so defuse that one char with a zero-width space (#2669).
+  lines.push(`\`${codeSpanSafe(opts.scope_humanized)}\``);
   if (opts.why && opts.why.trim().length > 0) {
     lines.push("");
     lines.push(escapeHtml(opts.why.trim()));
@@ -120,8 +124,14 @@ export function ttlMsFromToken(token: string): number | null {
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
+}
+
+/**
+ * Make a string safe to interpolate INSIDE a `code span` without escaping
+ * (content there is literal). The only character that can prematurely close
+ * the span is a backtick, so split it with a zero-width space.
+ */
+function codeSpanSafe(s: string): string {
+  return s.replace(/`/g, "`​");
 }

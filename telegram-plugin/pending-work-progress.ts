@@ -49,14 +49,13 @@
  * interval is short (5s) but edits are spaced at EDIT_INTERVAL_MS so
  * the Telegram bot.api editMessageText rate stays well under limits.
  *
- * Edits preserve the anchor's original `parse_mode` (issue #1698). The
- * anchor was sent through the reply tool, which defaults to HTML; an
- * earlier version of this module dropped parse_mode on edit, which made
- * the next "still working (Nm)" tick re-render `<b>` / `<code>` tags as
- * literal text. The suffix itself is plain text (no `<`/`>`/`&`) so it
- * is safe under any parse_mode. On subsequent edits the prior suffix is
- * stripped before re-appending so the message never accumulates duplicate
- * suffixes.
+ * Edits preserve the anchor's original send shape — rich-markdown vs the
+ * literal `format:'text'` path (#2669, successor to the #1698 parse-mode
+ * contract). The anchor was sent through the reply tool, which defaults to
+ * the rich-markdown path; the edit re-sends via the SAME path so the
+ * anchor body keeps rendering the way it first did. On subsequent edits
+ * the prior suffix is stripped before re-appending so the message never
+ * accumulates duplicate suffixes.
  *
  * Kill switch: `SWITCHROOM_DISABLE_PENDING_PROGRESS=1` disables the
  * whole subsystem. The conversational-pacing prompt is unaffected.
@@ -65,32 +64,36 @@
 export const EDIT_INTERVAL_MS = 60_000
 export const POLL_INTERVAL_MS = 5_000
 export const MAX_LIFETIME_MS = 30 * 60_000
-/** Telegram message length limit is 4096; budget headroom for the
+/** Rich-message wire cap is 32768 (#2669); budget headroom for the
  *  suffix and any escape expansion. If the anchor text plus suffix
  *  would exceed this, we skip the edit (the user still sees the
  *  original) rather than truncate the model's authored prose. */
-export const TELEGRAM_MSG_CAP = 4000
+export const TELEGRAM_MSG_CAP = 32768
 
 /**
  * Regex matching the suffix we append. Used to strip a prior suffix
  * before appending the next one. The (\d+) covers "1m" / "12m" / etc.
  * The reachability clause is optional so anchors carrying a pre-v0.14.30
- * suffix (no clause) are still stripped during a rolling upgrade.
- * Kept anchored to end-of-string so it only matches OUR suffix, not
- * something the model happened to write.
+ * suffix (no clause) are still stripped during a rolling upgrade. Both the
+ * legacy em-dash prefix (`— still working`) and the rich-markdown italic
+ * form (`_still working … _`, #2669) are matched so a rolling upgrade
+ * strips either. Kept anchored to end-of-string so it only matches OUR
+ * suffix, not something the model happened to write.
  */
 const SUFFIX_RE =
-  /\n\n— still working \(\d+m\)( · message me anytime, I'll keep you posted)?$/
+  /\n\n(?:— |_)still working \(\d+m\)( · message me anytime, I'll keep you posted)?_?$/
 
 export interface PendingProgressEditCtx {
   chatId: string
   threadId: number | null
   messageId: number
   newText: string
-  /** Telegram parse_mode the original anchor was sent with (#1698).
-   *  The edit must use the same mode or pre-rendered HTML / MarkdownV2
-   *  tags in `anchorOriginalText` re-render as literal text. */
-  parseMode: 'HTML' | 'MarkdownV2' | undefined
+  /** True when the original anchor was a literal `format:'text'` send
+   *  (plain `sendMessage`, no rich-message wrapper). The edit must match:
+   *  a rich anchor re-edits via `editMessageText({ markdown })`, a literal
+   *  anchor re-edits as a plain string (#2669 single-rich-path migration of
+   *  the #1698 parse-mode-preservation contract). */
+  literalText: boolean
 }
 
 /**
@@ -145,11 +148,11 @@ interface State {
   /** The captured anchor text — what the model wrote, *minus* any
    *  prior pending-progress suffix. Used as the base for every edit. */
   anchorOriginalText: string
-  /** parse_mode the anchor was originally sent with. Edits must
-   *  reuse this or the rendered HTML / MarkdownV2 tags in
-   *  anchorOriginalText render as literal text on the next tick
-   *  (issue #1698). */
-  anchorParseMode: 'HTML' | 'MarkdownV2' | undefined
+  /** True when the anchor was a literal `format:'text'` send. Edits must
+   *  match the original send shape (rich vs literal) or the suffix re-edit
+   *  changes how the anchor body renders (the #2669 single-rich-path
+   *  successor to the #1698 parse-mode-preservation contract). */
+  anchorLiteralText: boolean
   /** Wall-clock ms when the cross-turn ambient state was *activated*
    *  (at turn_end with pending+anchor). null before activation. */
   activatedAt: number | null
@@ -178,7 +181,7 @@ function ensure(key: string): State {
       pending: false,
       anchorMessageId: null,
       anchorOriginalText: '',
-      anchorParseMode: undefined,
+      anchorLiteralText: false,
       activatedAt: null,
       lastEditAt: null,
     }
@@ -216,7 +219,7 @@ export function startTurn(key: string): void {
   s.pending = false
   s.anchorMessageId = null
   s.anchorOriginalText = ''
-  s.anchorParseMode = undefined
+  s.anchorLiteralText = false
 }
 
 /**
@@ -241,21 +244,18 @@ export function noteOutbound(
   opts: {
     messageId: number
     text: string
-    /** parse_mode the anchor was sent with. Captured so the
-     *  cross-turn edit tick can reuse it (#1698). Undefined or
-     *  omitted means the original send had no parse_mode (plain
-     *  text). Production callers MUST pass this — every reply path
-     *  knows its own parse_mode. Defaulted to undefined only so test
-     *  fixtures don't have to thread it through where they're
-     *  asserting other behaviour. */
-    parseMode?: 'HTML' | 'MarkdownV2' | undefined
+    /** True when the anchor was a literal `format:'text'` send. Captured
+     *  so the cross-turn edit tick re-edits with the same shape (#2669
+     *  single-rich-path successor to the #1698 parse-mode contract).
+     *  Omitted ⇒ false (the rich-markdown default). */
+    literalText?: boolean
   },
 ): void {
   if (!enabled()) return
   const s = ensure(key)
   s.anchorMessageId = opts.messageId
   s.anchorOriginalText = opts.text.replace(SUFFIX_RE, '')
-  s.anchorParseMode = opts.parseMode
+  s.anchorLiteralText = opts.literalText ?? false
 }
 
 /**
@@ -399,7 +399,7 @@ function tick(now: number): void {
     // user-visible counter reads honestly (we only edit at intervals
     // ≥ EDIT_INTERVAL_MS = 60s).
     const minutes = Math.max(1, Math.round(elapsed / 60_000))
-    const suffix = `\n\n— still working (${minutes}m) · message me anytime, I'll keep you posted`
+    const suffix = `\n\n_still working (${minutes}m) · message me anytime, I'll keep you posted_`
     const newText = s.anchorOriginalText + suffix
 
     if (newText.length > TELEGRAM_MSG_CAP) {
@@ -417,7 +417,7 @@ function tick(now: number): void {
       threadId,
       messageId: s.anchorMessageId,
       newText,
-      parseMode: s.anchorParseMode,
+      literalText: s.anchorLiteralText,
     }
     // Fire-and-forget so a slow edit doesn't block the tick loop.
     // Errors are logged but never bubble (a 429 / "message not modified"

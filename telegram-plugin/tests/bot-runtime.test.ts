@@ -44,21 +44,16 @@ afterEach(() => {
 
 // ─── escapeHtmlForTg ─────────────────────────────────────────────────────
 
-describe('escapeHtmlForTg', () => {
-  it('escapes ampersands', () => {
-    expect(escapeHtmlForTg('a & b')).toBe('a &amp; b')
+describe('escapeHtmlForTg (now a markdown escaper, kept under the legacy name, #2669)', () => {
+  it('leaves & < > literal (they are not markdown specials)', () => {
+    expect(escapeHtmlForTg('a & b')).toBe('a & b')
+    expect(escapeHtmlForTg('<script>')).toBe('<script>')
+    expect(escapeHtmlForTg('a > b')).toBe('a > b')
+    expect(escapeHtmlForTg('<a & b>')).toBe('<a & b>')
   })
 
-  it('escapes less-than', () => {
-    expect(escapeHtmlForTg('<script>')).toBe('&lt;script&gt;')
-  })
-
-  it('escapes greater-than', () => {
-    expect(escapeHtmlForTg('a > b')).toBe('a &gt; b')
-  })
-
-  it('escapes all three in one string', () => {
-    expect(escapeHtmlForTg('<a & b>')).toBe('&lt;a &amp; b&gt;')
+  it('escapes the inline-markdown specials (\\ ` * _ ~ = [ ] |)', () => {
+    expect(escapeHtmlForTg('a *b* _c_')).toBe('a \\*b\\* \\_c\\_')
   })
 
   it('returns plain text unchanged', () => {
@@ -68,13 +63,23 @@ describe('escapeHtmlForTg', () => {
 
 // ─── preBlock ────────────────────────────────────────────────────────────
 
-describe('preBlock', () => {
-  it('wraps text in pre tags', () => {
-    expect(preBlock('hello')).toBe('<pre>hello</pre>')
+describe('preBlock (now a fenced code block, #2669)', () => {
+  it('wraps text in a triple-backtick fence', () => {
+    expect(preBlock('hello')).toBe('```\nhello\n```')
   })
 
-  it('escapes HTML inside the block', () => {
-    expect(preBlock('<b>bold</b>')).toBe('<pre>&lt;b&gt;bold&lt;/b&gt;</pre>')
+  it('keeps content literal inside the fence (no HTML escaping needed)', () => {
+    // Inside a fenced code block everything is verbatim; HTML/markdown is inert.
+    expect(preBlock('<b>bold</b>')).toBe('```\n<b>bold</b>\n```')
+  })
+
+  it('defuses a fence-closing ``` sequence embedded in the content', () => {
+    const out = preBlock('a ``` b')
+    // The embedded ``` is broken with a zero-width space so it cannot close
+    // the fence early.
+    expect(out.startsWith('```\n')).toBe(true)
+    expect(out.endsWith('\n```')).toBe(true)
+    expect(out).not.toContain('a ``` b')
   })
 })
 

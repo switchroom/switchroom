@@ -1,9 +1,14 @@
 /**
  * Shared formatters for Telegram status cards.
  *
+ * Since the Bot API 10.1 rich-message migration (#2669) the cards emit raw
+ * GFM markdown (sent via `sendRichMessage` / `editMessageText({ markdown })`),
+ * not HTML. `escapeMarkdown` (re-exported from `format.ts`) is the
+ * dynamic-value escaper cards use where they used to call `escapeHtml`.
+ *
  * Both the main progress card (rendered via `stream-reply-handler.ts`)
- * and the pinned worker card (`subagent-watcher.ts`) emit HTML to
- * Telegram; before issue #94 each had its own private copies with subtly
+ * and the pinned worker card (`subagent-watcher.ts`) emit to Telegram;
+ * before issue #94 each had its own private copies with subtly
  * different conventions:
  *
  *   - `formatDuration(500)` → progress-card returned `500ms`, watcher
@@ -16,14 +21,24 @@
  *     in both modules. Centralising removes one more piece of drift the
  *     reviewer has to verify.
  *
- * Keep this module dependency-free. It's imported by every card-render
- * surface and must not pull in plugin or gateway state.
+ * Keep this module nearly dependency-free. It's imported by every
+ * card-render surface and must not pull in plugin or gateway state. The
+ * single exception is the `escapeMarkdown` re-export from `format.ts`,
+ * which is itself state-free.
  */
+
+import { escapeMarkdown } from './format.js'
+
+/**
+ * Re-export so card surfaces have one import for the markdown escaper they
+ * use when interpolating dynamic values into a hand-built markdown card.
+ */
+export { escapeMarkdown }
 
 /**
  * Render a millisecond duration as `<n>ms` for sub-second values, or
- * `MM:SS` thereafter. Output is always HTML-safe (no `<` / `>` / `&`),
- * so callers can interpolate it into HTML without `escapeHtml`.
+ * `MM:SS` thereafter. Output contains no markdown-special characters, so
+ * callers can interpolate it into a markdown card without escaping.
  *
  *   formatDuration(0)      → "0ms"
  *   formatDuration(500)    → "500ms"
@@ -45,17 +60,6 @@ export function formatDuration(ms: number): string {
   return `${m.toString().padStart(2, '0')}:${r.toString().padStart(2, '0')}`;
 }
 
-/**
- * Escape `&`, `<`, `>` for safe interpolation into Telegram HTML
- * messages. Telegram's HTML parser is strict — an unescaped `<` is
- * read as a tag opener and rejects the message with
- * "can't parse entities" (see #101 for the cascade that crashed the
- * gateway into a restart loop).
- */
-export function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!);
-}
-
 /** Truncate to at most `n` characters, replacing the last char with `…`. */
 export function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
@@ -65,13 +69,12 @@ export function truncate(s: string, n: number): string {
  * Strip Markdown markup from a single line, leaving plain prose.
  *
  * Worker narration is authored as Markdown — the model writes `**bold**`,
- * `` `code` ``, `- bullets`, `# headings`. The status cards render Telegram
- * HTML, which does NOT interpret Markdown, so an unstripped `**` shows up as
- * two literal asterisks (the #94-class "half-done" look). Strip the markup
- * here so the card reads as clean prose.
+ * `` `code` ``, `- bullets`, `# headings`. The status cards have a fixed
+ * structure (steps, durations) and interleave narration as plain prose, so
+ * we strip the author's inline markup here so the narration reads as clean
+ * prose and never collides with the card's own markdown structure.
  *
- * Run this BEFORE `truncate` + `escapeHtml`: clean → measure → escape. (The
- * stripper never touches `<`/`>`/`&`, so escaping stays the last step.)
+ * Run this BEFORE `truncate` + `escapeMarkdown`: clean → measure → escape.
  */
 export function stripMarkdown(s: string): string {
   let out = s;
@@ -107,8 +110,8 @@ function isRuleLine(s: string): boolean {
  * Clean a worker's multi-line result/narration into a single plain-text
  * paragraph for a card's finished body. Drops fenced code blocks and
  * horizontal rules, strips per-line Markdown, then space-joins what's left.
- * Output is plain text — the caller still truncates + escapes before
- * interpolating into HTML.
+ * Output is plain text — the caller still truncates + escapes (escapeMarkdown)
+ * before interpolating into the card's markdown body.
  */
 export function cleanWorkerResultParagraph(s: string): string {
   const kept: string[] = [];

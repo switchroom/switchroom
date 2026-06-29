@@ -3,30 +3,28 @@
  * fake bot API (with fault injection) and the real retry policy.
  *
  * These tests exercise the full error chain (fake GrammyError → retry
- * policy → draft-stream → caller result) end to end. Before this suite,
- * those paths existed only in production.
+ * policy → draft-stream → caller result) end to end. Post-#2669 the
+ * default path is the rich-message send (`sendRichMessage`) / rich edit
+ * (`editMessageText({ markdown })`), so faults are injected on those
+ * methods and the wire body is the raw GFM markdown (no HTML render).
  *
  * NOTE on draft-stream behaviour: the current implementation SILENTLY
  * SWALLOWS any error that isn't specifically recognised (not-modified,
- * message-to-edit-not-found). A 403, thread-not-found, or exhausted 429
- * all end up logged and dropped. The handler's "finalized without
- * sending any message" check at stream-reply-handler.ts:397 is the only
- * signal a caller gets that something went wrong. These tests document
- * that contract rather than the one a strict API would have — changing
- * it is tracked separately.
+ * message-to-edit-not-found, parse-entities). A 403, thread-not-found, or
+ * exhausted 429 all end up logged and dropped. The handler's "finalized
+ * without sending any message" check is the only signal a caller gets
+ * that something went wrong.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { handleStreamReply, type StreamReplyDeps, type StreamReplyState } from '../stream-reply-handler.js'
 import type { DraftStreamHandle } from '../draft-stream.js'
-import { markdownToHtml as realMarkdownToHtml } from '../format.js'
 import { createRetryApiCall } from '../retry-api-call.js'
 import { createFakeBotApi, errors, type FakeBot } from './fake-bot-api.js'
 
 function makeState(): StreamReplyState {
   return {
     activeDraftStreams: new Map<string, DraftStreamHandle>(),
-    activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
   }
 }
 
@@ -37,13 +35,12 @@ function makeDeps(
   return {
     bot: bot as unknown as StreamReplyDeps['bot'],
     retry: createRetryApiCall(),
-    markdownToHtml: (t) => realMarkdownToHtml(t),
-    escapeMarkdownV2: (t) => t,
     repairEscapedWhitespace: (t) => t,
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
     disableLinkPreview: true,
-    defaultFormat: 'html',
+    // Anything other than the literal 'text' is the rich-markdown path.
+    defaultFormat: 'markdown',
     logStreamingEvent: () => {},
     historyEnabled: false,
     recordOutbound: () => {},
@@ -55,12 +52,7 @@ function makeDeps(
 
 /**
  * Pump vi fake timers + microtasks until all pending work settles.
- * The draft-stream's `flushLoop` has setTimeout(0) schedules that need
- * explicit advancement even at throttleMs=0, plus intermediate awaits.
- *
  * vi.advanceTimersByTimeAsync isn't implemented under bun's test runner.
- * Polyfill via the sync advance + explicit microtask flush so this file
- * runs cleanly under both vitest and `bun test`.
  */
 async function advanceFakeClock(ms: number): Promise<void> {
   const viAny = vi as { advanceTimersByTimeAsync?: (ms: number) => Promise<void> }
@@ -91,8 +83,8 @@ describe('stream-reply-handler × real retry × fake bot', () => {
   })
 
   describe('flood-wait retry', () => {
-    it('retries after retry_after and the message lands', async () => {
-      bot.faults.next('sendMessage', errors.floodWait(2))
+    it('retries after retry_after and the rich message lands', async () => {
+      bot.faults.next('sendRichMessage', errors.floodWait(2, 'sendRichMessage'))
       const state = makeState()
       const deps = makeDeps(bot)
 
@@ -109,7 +101,8 @@ describe('stream-reply-handler × real retry × fake bot', () => {
       expect(result.status).toBe('finalized')
       expect(result.messageId).toBe(500)
       expect(bot.state.sent).toHaveLength(1)
-      expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+      expect(bot.state.sent[0].rich).toBe(true)
+      expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     })
 
     it('flood-wait on editMessageText is transparent to caller', async () => {
@@ -128,16 +121,12 @@ describe('stream-reply-handler × real retry × fake bot', () => {
       const r = await pending
 
       expect(r.status).toBe('updated')
-      expect(bot.state.currentText.get(500)).toBe(realMarkdownToHtml('v2'))
+      // Raw markdown is the stored body — no HTML render.
+      expect(bot.state.currentText.get(500)).toBe('v2')
     })
   })
 
   describe('editMessageText transient failures (swallowed by retry)', () => {
-    // These tests use REAL timers because draft-stream's throttling
-    // sequence across two updates is hard to deterministically pump with
-    // fake timers (the setTimeout(0) schedule is inside a promise chain
-    // that re-enters after the first flush completes). Real timers +
-    // a tiny throttle keeps the test fast and reliable.
     beforeEach(() => vi.useRealTimers())
 
     it('retry returns undefined for "message is not modified"; stream continues', async () => {
@@ -170,17 +159,8 @@ describe('stream-reply-handler × real retry × fake bot', () => {
   })
 
   describe('non-retryable errors (current behaviour: swallowed by draft-stream)', () => {
-    // The following tests document the current swallow-all contract in
-    // draft-stream.ts. When a send fails with 403 / thread-not-found / a
-    // retry-exhausted network error, draft-stream's catch-all at line 182
-    // logs + continues. The HANDLER then sees getMessageId() == null on
-    // finalize and throws the "finalized without sending" error.
-    //
-    // If draft-stream grows a lastError hook later, these assertions
-    // should be tightened to match the real underlying error.
-
     it('403 forbidden surfaces as "finalized without sending" on done=true', async () => {
-      bot.faults.next('sendMessage', errors.forbidden())
+      bot.faults.next('sendRichMessage', errors.forbidden('sendRichMessage'))
       const state = makeState()
       const deps = makeDeps(bot)
 
@@ -190,7 +170,7 @@ describe('stream-reply-handler × real retry × fake bot', () => {
     })
 
     it('thread-not-found surfaces as "finalized without sending" on done=true', async () => {
-      bot.faults.next('sendMessage', errors.threadNotFound())
+      bot.faults.next('sendRichMessage', errors.threadNotFound('sendRichMessage'))
       const state = makeState()
       const deps = makeDeps(bot)
 
@@ -201,6 +181,31 @@ describe('stream-reply-handler × real retry × fake bot', () => {
           deps,
         ),
       ).rejects.toThrowError(/finalized without sending/)
+    })
+  })
+
+  describe('parse-entities fallback (#657) end to end', () => {
+    it('first rich send rejected for bad markdown → retries SAME turn as plain text, one message', async () => {
+      bot.faults.next(
+        'sendRichMessage',
+        errors.badRequest("can't parse entities: bad markdown", 'sendRichMessage'),
+      )
+      const state = makeState()
+      const deps = makeDeps(bot)
+
+      const pending = handleStreamReply(
+        { chat_id: 'c', text: '**broken _markdown', done: true },
+        state,
+        deps,
+      )
+      await settle(0)
+      const result = await pending
+
+      expect(result.status).toBe('finalized')
+      // Exactly one message — the plain-text recovery send.
+      expect(bot.state.sent).toHaveLength(1)
+      expect(bot.state.sent[0].rich).toBeFalsy()
+      expect(bot.state.sent[0].text).toBe('**broken _markdown')
     })
   })
 })

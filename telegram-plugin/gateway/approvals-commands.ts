@@ -14,6 +14,7 @@
  */
 
 import type { Bot, Context } from "grammy";
+import { richMessage } from "../rich-send.js";
 import {
   approvalList,
   approvalRevoke,
@@ -52,12 +53,11 @@ export function registerApprovalsCommands(
         return;
       }
       if (decisions.length === 0) {
-        await ctx.reply(
+        await ctx.replyWithRichMessage(richMessage(
           agentFilter
-            ? `No active approvals for <code>${escapeHtml(agentFilter)}</code>.`
+            ? `No active approvals for \`${agentFilter}\`.`
             : "No active approvals.",
-          { parse_mode: "HTML" },
-        );
+        ));
         return;
       }
       // Top-level summary by agent, mirroring the GitHub-style permissions UI
@@ -65,7 +65,7 @@ export function registerApprovalsCommands(
       const byAgent = new Map<string, number>();
       for (const d of decisions) byAgent.set(d.agent_unit, (byAgent.get(d.agent_unit) ?? 0) + 1);
       const summary = Array.from(byAgent.entries())
-        .map(([a, n]) => `• <b>${escapeHtml(a)}</b>: ${n}`)
+        .map(([a, n]) => `• **${escapeHtml(a)}**: ${n}`)
         .join("\n");
       const detail = decisions
         .slice(0, 20)
@@ -75,17 +75,15 @@ export function registerApprovalsCommands(
               ? "always"
               : `until ${new Date(d.ttl_expires_at).toISOString().slice(0, 16).replace("T", " ")}`;
           return (
-            `<code>${escapeHtml(d.id.slice(0, 8))}</code> ` +
+            `\`${d.id.slice(0, 8)}\` ` +
             `${escapeHtml(d.agent_unit)} → ` +
-            `<code>${escapeHtml(d.scope)}</code> ` +
+            `\`${d.scope}\` ` +
             `(${escapeHtml(d.action)}, ${ttl}) ` +
             `· /approvals revoke ${escapeHtml(d.id)}`
           );
         })
         .join("\n");
-      await ctx.reply(`<b>Active approvals</b>\n\n${summary}\n\n${detail}`, {
-        parse_mode: "HTML",
-      });
+      await ctx.replyWithRichMessage(richMessage(`**Active approvals**\n\n${summary}\n\n${detail}`));
       return;
     }
 
@@ -93,9 +91,7 @@ export function registerApprovalsCommands(
     if (sub === "revoke") {
       const id = args[1];
       if (!id) {
-        await ctx.reply("Usage: <code>/approvals revoke &lt;id&gt;</code>", {
-          parse_mode: "HTML",
-        });
+        await ctx.replyWithRichMessage(richMessage("Usage: `/approvals revoke <id>`"));
         return;
       }
       const actor = ctx.from?.id?.toString() ?? "unknown";
@@ -104,23 +100,21 @@ export function registerApprovalsCommands(
         await ctx.reply("Approval kernel unreachable.");
         return;
       }
-      await ctx.reply(
-        ok ? `Revoked <code>${escapeHtml(id)}</code>.` : `No such active decision <code>${escapeHtml(id)}</code>.`,
-        { parse_mode: "HTML" },
-      );
+      await ctx.replyWithRichMessage(richMessage(
+        ok ? `Revoked \`${id}\`.` : `No such active decision \`${id}\`.`,
+      ));
       return;
     }
 
     // /approvals add and /approvals stats — TODO Phase 1.5
-    await ctx.reply(
-      `Unknown subcommand <code>${escapeHtml(sub)}</code>. ` +
-      `Use <code>/approvals list</code> or <code>/approvals revoke &lt;id&gt;</code>. ` +
-      `(<code>add</code> and <code>stats</code> are coming in a follow-up.)`,
-      { parse_mode: "HTML" },
-    );
+    await ctx.replyWithRichMessage(richMessage(
+      `Unknown subcommand \`${sub}\`. ` +
+      `Use \`/approvals list\` or \`/approvals revoke <id>\`. ` +
+      `(\`add\` and \`stats\` are coming in a follow-up.)`,
+    ));
   });
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
