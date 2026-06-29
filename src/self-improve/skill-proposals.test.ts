@@ -1,0 +1,112 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  enqueueProposal,
+  getProposal,
+  readProposals,
+  setProposalStatus,
+  isSuppressed,
+  proposalContentWords,
+  jaccard,
+  REJECTION_TTL_MS,
+} from "./skill-proposals.js";
+
+function freshDir(): string {
+  return mkdtempSync(join(tmpdir(), "skill-proposals-"));
+}
+
+const baseInput = {
+  skill_slug: "deploy-checklist",
+  is_new: true,
+  lesson: "Always run the smoke suite before promoting a deploy",
+  draft: {
+    "SKILL.md":
+      "---\nname: deploy-checklist\ndescription: deploy steps\n---\n\n" +
+      "1. run smoke suite\n2. check dashboards\n3. promote\n",
+  },
+  evidence: "seen across 3 sessions",
+};
+
+describe("skill-proposals store", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = freshDir();
+  });
+
+  it("round-trips an enqueued proposal", () => {
+    const p = enqueueProposal(dir, baseInput);
+    expect(p.id).toBeTruthy();
+    expect(p.status).toBe("pending");
+    const fetched = getProposal(dir, p.id);
+    expect(fetched?.skill_slug).toBe("deploy-checklist");
+    expect(fetched?.draft["SKILL.md"]).toContain("smoke suite");
+  });
+
+  it("collapses to latest status per id (last-writer-wins)", () => {
+    const p = enqueueProposal(dir, baseInput);
+    setProposalStatus(dir, p.id, "approved");
+    const fetched = getProposal(dir, p.id);
+    expect(fetched?.status).toBe("approved");
+    expect(readProposals(dir)).toHaveLength(1);
+  });
+
+  it("rejecting writes a fingerprint that suppresses a re-proposal", () => {
+    const p = enqueueProposal(dir, baseInput);
+    setProposalStatus(dir, p.id, "rejected");
+    expect(
+      isSuppressed(dir, {
+        lesson: baseInput.lesson,
+        draft: baseInput.draft,
+        skill_slug: baseInput.skill_slug,
+      }),
+    ).toBe(true);
+  });
+
+  it("does NOT suppress an unrelated proposal", () => {
+    const p = enqueueProposal(dir, baseInput);
+    setProposalStatus(dir, p.id, "rejected");
+    expect(
+      isSuppressed(dir, {
+        lesson: "Compress images before uploading to the CDN",
+        draft: {
+          "SKILL.md":
+            "---\nname: cdn-upload\ndescription: x\n---\nresize then upload webp variants daily",
+        },
+        skill_slug: "cdn-upload",
+      }),
+    ).toBe(false);
+  });
+
+  it("suppression expires after the TTL", () => {
+    const t0 = Date.UTC(2026, 0, 1);
+    const p = enqueueProposal(dir, baseInput, { now: () => t0 });
+    setProposalStatus(dir, p.id, "rejected", { now: () => t0 });
+    const afterTtl = t0 + REJECTION_TTL_MS + 1;
+    expect(
+      isSuppressed(
+        dir,
+        {
+          lesson: baseInput.lesson,
+          draft: baseInput.draft,
+          skill_slug: baseInput.skill_slug,
+        },
+        { now: () => afterTtl },
+      ),
+    ).toBe(false);
+  });
+
+  it("matches reworded proposals via content-word jaccard", () => {
+    const a = proposalContentWords({
+      lesson: "always run the smoke suite before promoting a deploy",
+      draft: { "SKILL.md": "run smoke suite check dashboards promote" },
+    });
+    const b = proposalContentWords({
+      lesson: "run the smoke suite first then promote the deploy",
+      draft: { "SKILL.md": "smoke suite dashboards promote release" },
+    });
+    expect(jaccard(a, b)).toBeGreaterThanOrEqual(0.5);
+  });
+});

@@ -83,6 +83,17 @@ export interface ChangeCandidate {
   multiFile?: boolean;
   /** True iff the change creates a NEW skill (vs editing an existing one). */
   createsNewSkill?: boolean;
+  /**
+   * Provenance of the candidate. `synthesized-personal-skill` marks a
+   * proposal produced by the weekly skill-synthesis cron (#2670): a NEW
+   * *personal* skill in the agent's OWN reversible workspace. Such a
+   * proposal is carved out to T2 (one-tap) rather than T3 (explicit ask)
+   * — the operator tap still authorizes the write, so `no-self-escalation`
+   * holds; only the friction (one tap vs ask) changes. Any non-personal
+   * blast radius (cron / cross-agent / shared / irreversible) ignores this
+   * hint and stays T3 per the hard floors above.
+   */
+  proposalKind?: "synthesized-personal-skill";
   /** True iff the change creates / edits a cron schedule. */
   touchesCron?: boolean;
   /** True iff the change reaches another agent. */

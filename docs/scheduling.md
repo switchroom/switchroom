@@ -291,6 +291,32 @@ docker compose -p switchroom \
   exec --env SWITCHROOM_INLINE_SCHEDULER=0 agent-<name> sh
 ```
 
+## Weekly skill-synthesis (one-tap self-improvement, #2670)
+
+A recommended weekly schedule entry lets an agent review what it has done
+repeatedly and **propose** (never auto-create) a personal-skill improvement,
+which surfaces as a one-tap Telegram Approve/Dismiss card:
+
+```yaml
+- cron: "0 9 * * 1"        # Mondays 09:00 (agent timezone)
+  name: skill-synthesis
+  context: agent            # full live session (Tier 2)
+  prompt: |
+    <see reference/prompts/skill-synthesis-cron.md for the full prompt>
+```
+
+The prompt drafts at most one candidate and runs
+`switchroom self-improve propose-skill` to post the card. The synthesis
+prompt **forbids copying any PII/secrets** from conversation history into the
+skill body (the chosen PII approach — a prompt instruction, not a separate
+scanner). On Approve, the gateway injects a `skill_proposal_apply` turn and
+the agent writes the stored draft through the personal-skill pipeline, so the
+merged `scanBundleForSecrets` gate runs and the 20-skill cap is enforced. On
+Dismiss, a rejection fingerprint suppresses the same proposal for 90 days so
+it isn't re-proposed every week. Approval is **T2 one-tap** (a synthesized
+personal skill lives in the agent's own reversible workspace), not a T3
+explicit ask — the operator tap is still required (`no-self-escalation`).
+
 ## Comparison with Claude Code's native scheduling
 
 | | Switchroom (in-agent scheduler) | Claude Code CronCreate | Claude Code Desktop |

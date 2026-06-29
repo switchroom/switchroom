@@ -384,6 +384,18 @@ import {
   buildVaultSaveFailedInbound,
   buildVaultSaveDiscardedInbound,
 } from './vault-grant-inbound-builders.js'
+import {
+  parseSkillProposalCallback,
+  buildSkillProposalApplyInbound,
+  renderSkillProposalCard,
+  skillProposalKeyboard,
+} from './skill-proposal-card.js'
+import {
+  getProposal as getSkillProposal,
+  setProposalStatus as setSkillProposalStatus,
+  enqueueProposal as enqueueSkillProposal,
+  isSuppressed as isSkillProposalSuppressed,
+} from '../../src/self-improve/skill-proposals.js'
 import { decideSubagentHandback } from './subagent-handback-inbound-builder.js'
 import {
   decideSubagentProgress,
@@ -408,6 +420,7 @@ import type {
   InjectInboundMessage,
   SendOutboundMessage,
   QuotaWallDetectedMessage,
+  PostSkillProposalMessage,
   PermissionEvent,
 } from './ipc-protocol.js'
 import { DebounceBuffer, HourCap, buildReactionInboundMeta, buildReactionInboundText, evaluateTriggerCandidate, isGroupChat, resolveReactionsConfig, truncatePreview, type PendingReaction, type ReactionBatch, type ReactionsResolvedConfig } from './reaction-trigger.js'
@@ -7581,6 +7594,75 @@ const ipcServer: IpcServer = createIpcServer({
     )
     process.stderr.write(
       `telegram gateway: send_outbound agent=${msg.agentName} chat=${msg.chatId} thread=${threadId ?? '-'} len=${msg.text.length}\n`,
+    )
+  },
+
+  // #2670 one-tap self-improvement — persist a skill-improvement proposal and
+  // post its Approve/Dismiss card. The store transition + apply-injection on
+  // Approve are owned by handleSkillProposalCallback (so a gateway restart
+  // between post and tap still resolves correctly).
+  onPostSkillProposal(_client: IpcClient, msg: PostSkillProposalMessage) {
+    const self = process.env.SWITCHROOM_AGENT_NAME
+    if (self && msg.agentName !== self) {
+      process.stderr.write(
+        `telegram gateway: post_skill_proposal rejected — agent mismatch (${msg.agentName} != ${self})\n`,
+      )
+      return
+    }
+    try {
+      assertAllowedChat(msg.chatId)
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: post_skill_proposal rejected — ${(err as Error).message}\n`,
+      )
+      return
+    }
+    const stateDir = process.env.TELEGRAM_STATE_DIR
+    if (stateDir == null || stateDir.length === 0) {
+      process.stderr.write(`telegram gateway: post_skill_proposal: TELEGRAM_STATE_DIR unset, skipping\n`)
+      return
+    }
+    // Dedup against still-live rejection fingerprints — never re-surface a
+    // proposal the operator already dismissed.
+    if (isSkillProposalSuppressed(stateDir, {
+      lesson: msg.lesson,
+      draft: msg.draft,
+      skill_slug: msg.skillSlug,
+    })) {
+      process.stderr.write(
+        `telegram gateway: post_skill_proposal suppressed (rejected before) slug=${msg.skillSlug}\n`,
+      )
+      return
+    }
+    const proposal = enqueueSkillProposal(stateDir, {
+      skill_slug: msg.skillSlug,
+      is_new: msg.isNew,
+      lesson: msg.lesson,
+      draft: msg.draft,
+      evidence: msg.evidence,
+      chat_id: Number(msg.chatId),
+    })
+    const cardText = renderSkillProposalCard({
+      id: proposal.id,
+      skill_slug: proposal.skill_slug,
+      is_new: proposal.is_new,
+      lesson: proposal.lesson,
+      evidence: proposal.evidence,
+      skill_md: proposal.draft['SKILL.md'],
+    })
+    const threadId = msg.threadId
+    void swallowingApiCall(
+      () =>
+        bot.api.sendMessage(msg.chatId, cardText, {
+          parse_mode: 'HTML',
+          reply_markup: skillProposalKeyboard(proposal.id),
+          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
+        }),
+      { chat_id: msg.chatId, verb: 'skill-proposal-card', ...(threadId != null ? { threadId } : {}) },
+    )
+    process.stderr.write(
+      `telegram gateway: post_skill_proposal agent=${msg.agentName} chat=${msg.chatId} ` +
+      `proposal=${proposal.id} slug=${proposal.skill_slug} new=${proposal.is_new}\n`,
     )
   },
 
@@ -18758,6 +18840,97 @@ async function performVaultAccessApproval(
   )
 }
 
+/**
+ * #2670 — handle an Approve / Dismiss tap on a one-tap skill-improvement
+ * proposal card.
+ *
+ *   Approve → mark the proposal approved + inject a synthetic
+ *             `skill_proposal_apply` turn instructing the live agent to
+ *             write the stored draft through `skill_*_personal` (so the
+ *             secret-scan pipeline runs; agent never self-applies).
+ *   Dismiss → mark rejected + write a rejection fingerprint so the weekly
+ *             synthesis cron doesn't re-propose it.
+ */
+async function handleSkillProposalCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parsed = parseSkillProposalCallback(data)
+  if (parsed == null) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const stateDir = process.env.TELEGRAM_STATE_DIR
+  const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  if (stateDir == null || stateDir.length === 0) {
+    await ctx.answerCallbackQuery({ text: 'State dir unset — cannot apply.' }).catch(() => {})
+    return
+  }
+  const proposal = getSkillProposal(stateDir, parsed.id)
+  if (proposal == null) {
+    await ctx.answerCallbackQuery({ text: 'Proposal expired or already actioned.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+  if (proposal.status !== 'pending') {
+    await ctx.answerCallbackQuery({ text: `Already ${proposal.status}.` }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+
+  const cbChatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
+  const cbThreadId = resolveThreadId(cbChatId, ctx.callbackQuery?.message?.message_thread_id)
+
+  if (parsed.action === 'deny') {
+    setSkillProposalStatus(stateDir, parsed.id, 'rejected')
+    await ctx.answerCallbackQuery({ text: '🚫 Dismissed — won’t be proposed again.' }).catch(() => {})
+    if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+      await ctx
+        .editMessageText(
+          `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🚫 <i>Dismissed.</i>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Approve.
+  setSkillProposalStatus(stateDir, parsed.id, 'approved')
+  const synthetic = buildSkillProposalApplyInbound({
+    ctx: {
+      agent,
+      chat_id: cbChatId,
+      ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+    },
+    proposalId: proposal.id,
+    skillSlug: proposal.skill_slug,
+    isNew: proposal.is_new,
+    operatorId: senderId,
+  })
+  const delivered = deliverResumeSyntheticOrBuffer(agent, synthetic)
+  await ctx.answerCallbackQuery({ text: '✅ Applying the skill…' }).catch(() => {})
+  if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+    await ctx
+      .editMessageText(
+        `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n✅ <i>Approved — applying.</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  process.stderr.write(
+    `telegram gateway: skill_proposal_apply injection agent=${agent} ` +
+    `proposal=${proposal.id} slug=${proposal.skill_slug} delivered=${delivered}\n`,
+  )
+}
+
 async function handleVaultRequestAccessCallback(ctx: Context, data: string): Promise<void> {
   const senderId = String(ctx.from?.id ?? '')
   const access = loadAccess()
@@ -21245,6 +21418,16 @@ bot.on('callback_query:data', async ctx => {
   //   vsp:decline:<stageId> — drop the request, notify the agent
   if (data.startsWith('vsp:')) {
     await handleSecretRequestCallback(ctx, data)
+    return
+  }
+
+  // #2670: one-tap skill-improvement proposal card.
+  //   skprop:approve:<id> — apply the stored draft via the personal-skill
+  //                         write pipeline (inject a turn; agent writes it)
+  //   skprop:deny:<id>    — dismiss + record a rejection fingerprint so it
+  //                         isn't re-proposed
+  if (data.startsWith('skprop:')) {
+    await handleSkillProposalCallback(ctx, data)
     return
   }
 
