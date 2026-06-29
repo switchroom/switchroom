@@ -397,6 +397,26 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
         "<i>✓ Working…</i>",
       );
     });
+
+    it("early open renders ACCUMULATED narration, not a bare 'Working…' (§3 case)", () => {
+      // The early-open path (gateway `openLivenessFeedIfDue`) passes the turn's
+      // accumulated `mirrorLines` when non-empty instead of the bare "Working…"
+      // placeholder. This is the §3 case: narration emitted BEFORE the first
+      // tool was staged into mirrorLines, and the early open surfaces it on the
+      // card the instant it opens — so the pre-tool narration is visible
+      // immediately, not lost until a tool label lands.
+      const staged = [
+        "Let me check the migration history first",
+        "Now comparing against the live schema",
+      ];
+      const out = renderActivityFeedWithNested(staged, [], false, " · 1s")!;
+      // The live in-progress line carries the LAST staged narration line, and the
+      // earlier line is retained in the feed body — the accumulated narration
+      // renders, not "Working…".
+      expect(out).toContain("Now comparing against the live schema");
+      expect(out).toContain("Let me check the migration history first");
+      expect(out).not.toContain("Working…");
+    });
   });
 
   it("stepCount=0 → no footer even on final=true", () => {

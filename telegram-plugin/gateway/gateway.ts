@@ -79,6 +79,7 @@ import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type 
 import { REPLY_TOOLS, isDraftOfReply } from '../narrative-dedup.js'
 import { toolLabel } from '../tool-labels.js'
 import { createTypingWrapper } from '../typing-wrap.js'
+import { createTurnTypingLoop } from './turn-typing-loop.js'
 import { type DraftStreamHandle } from '../draft-stream.js'
 import { handlePtyPartialPure, type PtyHandlerState } from '../pty-partial-handler.js'
 import { handleStreamReply } from '../stream-reply-handler.js'
@@ -344,6 +345,7 @@ import { decideFeedReopen } from './feed-reopen-gate.js'
 import {
   mayOpenActivityCard,
   computeCrossTurnAnswerDelivered,
+  shouldEarlyOpenLiveness,
   type FeedOpenProducer,
   type FeedOpenGateDeps,
 } from './feed-open-gate.js'
@@ -1768,14 +1770,25 @@ const FEED_HEARTBEAT_MIN_STALE_MS = 6_000
 // the 300s silence-poke (the #680 dark-turn). When a turn has been alive >=
 // FEED_LIVENESS_OPEN_MS with no feed yet, open a minimal "Working…" feed so the
 // user always has a live indicator; the first real tool label edits it with
-// real content. Runs on the heartbeat interval, so the effective open lands in
-// [threshold, threshold + FEED_HEARTBEAT_TICK_MS). Kill switch:
+// real content.
+//
+// Two callers reach the SAME open path (`openLivenessFeedIfDue`):
+//   1. an enqueue-time one-shot timer (`scheduleEarlyLivenessOpen`) fires at
+//      `FEED_LIVENESS_OPEN_MS` after turn start — this is the early-open that
+//      kills the dead-air gap (narration emitted before the first tool now
+//      surfaces ~`FEED_LIVENESS_OPEN_MS` after enqueue, not after a 6 s
+//      heartbeat phase + the old 12 s threshold);
+//   2. the 6 s heartbeat tick, which maintains/climbs the card and is the
+//      backstop if the one-shot ever missed (e.g. a clock skew).
+// The threshold dropped from 12 s → ~1.2 s so the "something is happening"
+// signal lands within a second or two of the inbound, matching the JTBD
+// `know-what-my-agent-is-doing` p95 ≤ ~1 s ambient-ack bar. Kill switch:
 // SWITCHROOM_FEED_LIVENESS_OPEN=0. Default on.
 const FEED_LIVENESS_OPEN_ENABLED = process.env.SWITCHROOM_FEED_LIVENESS_OPEN !== '0'
 const FEED_LIVENESS_OPEN_MS = (() => {
   const raw = process.env.SWITCHROOM_FEED_LIVENESS_OPEN_MS
   const n = raw ? Number(raw) : NaN
-  return Number.isFinite(n) && n > 0 ? n : 12_000
+  return Number.isFinite(n) && n > 0 ? n : 1_200
 })()
 
 // Post-answer background-agent liveness STALENESS CAP (Fix 2 / #2587 supersede,
@@ -3147,6 +3160,13 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
     const threadId = threadPart === '_' || threadPart === '' ? null : Number(threadPart)
     stopTurnTypingLoop(chatId, Number.isFinite(threadId) ? threadId : null)
   }
+  // Cancel the enqueue-time early-open timer (paired with
+  // `scheduleEarlyLivenessOpen` at turn start). `key` is the same status-key the
+  // timer was registered under, so this is the single owner of the cancel. A
+  // leaked timer would otherwise fire its `openLivenessFeedIfDue` against a
+  // successor turn; the timer's own turnId match is the second guard, this is
+  // the first. Idempotent — a no-op when no timer is registered.
+  stopEarlyLivenessOpen(key as string)
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
@@ -4101,33 +4121,31 @@ function stopTypingLoop(chat_id: string, thread_id: number | null = null): void 
   if (retry) { clearTimeout(retry); typingRetryTimers.delete(key) }
 }
 
-// Turn-level `typing…` indicator. Deliberately a SEPARATE interval map
-// from `typingIntervals` (which the reply handler and the tool-use
-// typing wrapper share and freely stop). If the turn loop lived in the
-// shared map, a mid-turn reply's `finally { stopTypingLoop }` would
-// kill it and the chat would go dark for the rest of the turn — the
-// exact black-box gap this is here to close. A dedicated map makes the
-// turn loop structurally immune to those stops: only `stopTurnTypingLoop`
-// (called at the canonical turn-end) clears it. The redundant `typing`
-// pings while a reply is mid-flight are harmless — same action, and
-// sendChatAction is cheap.
-const turnTypingIntervals = new Map<string, ReturnType<typeof setInterval>>()
+// Turn-level `typing…` indicator. The lifecycle (immediate fire, 4 s refresh,
+// stop-at-turn-end, no leak) lives in the testable `turn-typing-loop.ts`
+// factory; the gateway just injects the real `sendChatAction` + `chatKey`.
+// Deliberately a SEPARATE interval map from `typingIntervals` (the reply handler
+// + tool-use typing wrapper share that one and freely stop it). If the turn loop
+// lived in the shared map, a mid-turn reply's `finally { stopTypingLoop }` would
+// kill it and the chat would go dark for the rest of the turn — the exact
+// black-box gap this closes. The dedicated map (private to the factory) makes
+// the turn loop structurally immune to those stops: only the canonical turn-end
+// stop clears it. The redundant `typing` pings while a reply is mid-flight are
+// harmless — same action, and sendChatAction is cheap.
+const turnTypingLoop = createTurnTypingLoop({
+  sendChatAction: (chat_id, thread_id) => {
+    const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
+    void bot.api.sendChatAction(chat_id, 'typing', sendOpts).catch(() => {})
+  },
+  chatKey: (chat_id, thread_id) => chatKey(chat_id, thread_id) as string,
+})
 
 function startTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
-  stopTurnTypingLoop(chat_id, thread_id)
-  const key = chatKey(chat_id, thread_id) as string
-  const sendOpts = thread_id != null ? { message_thread_id: thread_id } : undefined
-  const send = () => {
-    void bot.api.sendChatAction(chat_id, 'typing', sendOpts).catch(() => {})
-  }
-  send()
-  turnTypingIntervals.set(key, setInterval(send, 4000))
+  turnTypingLoop.start(chat_id, thread_id)
 }
 
 function stopTurnTypingLoop(chat_id: string, thread_id: number | null = null): void {
-  const key = chatKey(chat_id, thread_id) as string
-  const iv = turnTypingIntervals.get(key)
-  if (iv) { clearInterval(iv); turnTypingIntervals.delete(key) }
+  turnTypingLoop.stop(chat_id, thread_id)
 }
 
 const typingWrapper = createTypingWrapper({
@@ -10752,11 +10770,12 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
   // card-drain gate (chatLock-serialized under the flag; verbatim block OFF).
   cardDrainGate(turn, ea, () => {
   if (ea.mayDrain(turn)) {
-    // Producer A (narrative SHOW): may only EDIT an already-open card, never
-    // OPEN one on a 0-tool turn (design §9 lever 5 base case — the
-    // triplication). The OPEN gate in the drain enforces this; accumulation
-    // into mirrorLines still happens so the narration renders once a tool
-    // label or liveness opens the card.
+    // Producer A (narrative SHOW): pre-answer narrative may now OPEN a card,
+    // not just EDIT one — lever 5 is INERT (see feed-open-gate.ts), and
+    // Lever 2 / clearActivitySummary guarantees reply-is-last ordering instead.
+    // Accumulation into mirrorLines still happens, so any narration staged
+    // before the card opened renders on the first OPEN (whichever producer
+    // wins the race — narrative here, or the enqueue/liveness timer).
     // PR-4a: routed through the emission-authority façade (no-op delegate).
     ea.openOrEditCard('narrative', () => {
       turn.activityInFlight = drainActivitySummary(turn, 'narrative')
@@ -10957,6 +10976,105 @@ async function drainActivitySummary(
 }
 
 /**
+ * Open (or climb) the minimal "Working…" liveness card for a 0-label turn once
+ * it has been alive >= FEED_LIVENESS_OPEN_MS. The ONE place the liveness card
+ * may OPEN — both the enqueue-time early-open timer
+ * (`scheduleEarlyLivenessOpen`) and the 6 s heartbeat call through here, so a
+ * card opened by one caller is a clean no-op for the other:
+ *   - `drainActivitySummary` OPENs when `activityMessageId == null` and EDITs
+ *     once it is set, so a second call after an open just maintains the card;
+ *   - the `mirrorLines.length === 0` guard at the heartbeat call site (and the
+ *     drain's own gate) means once a real tool label lands this path is skipped
+ *     and the labelled-feed heartbeat takes over;
+ *   - the OPEN itself is still gated by `mayOpenActivityCard` (lever 1 / 4) via
+ *     `ea.openOrEditCard('liveness', …)`, so a card never opens below a
+ *     delivered answer or on a cross-turn synthetic surface.
+ *
+ * Renders the turn's accumulated narration when present (the §3 case: narration
+ * staged before the first tool via `mirrorLines`) so the early open is not a
+ * bare placeholder when there is real text to show; falls back to "Working…"
+ * for a genuinely silent thinking turn.
+ */
+function openLivenessFeedIfDue(turn: CurrentTurn): void {
+  const age = Date.now() - turn.startedAt
+  // The WHEN decision (pure, `feed-open-gate.ts`): feature on, target chat,
+  // past threshold, no card already open. Returns false once a card is open
+  // (the drain EDITs instead) so the two callers can never double-open.
+  if (!shouldEarlyOpenLiveness({
+    enabled: FEED_LIVENESS_OPEN_ENABLED,
+    ageMs: age,
+    thresholdMs: FEED_LIVENESS_OPEN_MS,
+    mirrorLineCount: turn.mirrorLines.length,
+    activityMessageId: turn.activityMessageId,
+    sessionChatId: turn.sessionChatId,
+  })) return
+  const lines = turn.mirrorLines.length > 0 ? turn.mirrorLines : ['Working…']
+  const livenessHeader: SessionActivityHeader = {
+    label: 'Agent', elapsedMs: age, toolCount: turn.labeledToolCount, state: 'running',
+  }
+  const rendered = renderActivityFeedWithNested(lines, [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
+  if (rendered == null) return
+  turn.activityPendingRender = rendered
+  const ea = emissionAuthorityFor(turn)
+  // PR-4d: route through the centralized chatLock-serialized card-drain gate.
+  cardDrainGate(turn, ea, () => {
+    if (ea.mayDrain(turn)) {
+      // Producer C (liveness timer): the thinking-gap / early-open. Now that
+      // Lever 5 is inert (narrative may open pre-answer — #2588), liveness
+      // remains the natural open for 0-tool pre-answer turns that are silent.
+      // The sticky-latch (lever 1) still gates it in the drain.
+      // PR-4a: routed through the emission-authority façade (no-op delegate).
+      ea.openOrEditCard('liveness', () => {
+        turn.activityInFlight = drainActivitySummary(turn, 'liveness')
+      })
+    }
+  })
+}
+
+// Enqueue-time early-open timers, keyed by status-key. One per in-flight turn;
+// cleared at turn-end (`stopEarlyLivenessOpen`) so a leaked timer can never fire
+// against a successor turn. `unref()` so it never holds the process alive.
+const earlyLivenessOpenTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/**
+ * Schedule the enqueue-time early-open of the "Working…" liveness card. Called
+ * once per fresh turn at the `enqueue` lifecycle event (the single chokepoint
+ * every real turn atom passes through — inbound, cron, subagent-handback,
+ * vault-resume, restart-marker; anonymous one-shot hook clients never emit
+ * `enqueue`, so they are excluded by construction). Fires `openLivenessFeedIfDue`
+ * once at `FEED_LIVENESS_OPEN_MS` after turn start so narration / thinking that
+ * happens BEFORE the first tool surfaces a card within ~a second — no more dead
+ * air until a tool label or the old 12 s threshold. A no-op if a tool/narrative
+ * already opened the card (the helper's own guards). The 6 s heartbeat remains
+ * the backstop + the climb.
+ */
+function scheduleEarlyLivenessOpen(turn: CurrentTurn): void {
+  if (STATIC || !FEED_HEARTBEAT_ENABLED || !FEED_LIVENESS_OPEN_ENABLED) return
+  if (turn.sessionChatId == null) return
+  const key = statusKey(turn.sessionChatId, turn.sessionThreadId)
+  stopEarlyLivenessOpen(key)
+  const t = setTimeout(() => {
+    earlyLivenessOpenTimers.delete(key)
+    // Re-resolve the live turn for this key: only open if THIS turn is still the
+    // live one for its topic (a successor turn would carry its own timer). Under
+    // flag OFF `get(key)` returns the singleton — same turn unless a successor
+    // already replaced it, which the turnId match below also guards.
+    const live = currentTurnMap.get(key)
+    if (live == null || live.turnId !== turn.turnId) return
+    openLivenessFeedIfDue(live)
+  }, FEED_LIVENESS_OPEN_MS)
+  t.unref?.()
+  earlyLivenessOpenTimers.set(key, t)
+}
+
+/** Cancel the enqueue-time early-open timer for a status-key (turn-end teardown
+ *  + re-arm guard). Idempotent. */
+function stopEarlyLivenessOpen(key: string): void {
+  const t = earlyLivenessOpenTimers.get(key)
+  if (t != null) { clearTimeout(t); earlyLivenessOpenTimers.delete(key) }
+}
+
+/**
  * Heartbeat tick (PR1): keep the live activity feed visibly advancing during a
  * long single step that emits no new tool_label. Re-renders the feed with a
  * climbing " · Ns" elapsed on the in-progress line through the SAME single-flight
@@ -11041,30 +11159,13 @@ function feedHeartbeatTick(): void {
   // over and its edit cleanly replaces the placeholder. drainActivitySummary
   // sends (opens) when activityMessageId is null and edits (maintains) once set
   // — so this one branch handles both the open and the climb.
+  //
+  // The open/climb logic lives in ONE place (`openLivenessFeedIfDue`) so the
+  // enqueue-time early-open timer (`scheduleEarlyLivenessOpen`) and this 6 s
+  // heartbeat both reach the same drain — there is exactly one path that can
+  // OPEN the liveness card, so the two callers can never double-open or race.
   if (turn.mirrorLines.length === 0) {
-    if (!FEED_LIVENESS_OPEN_ENABLED || turn.sessionChatId == null) return
-    const age = Date.now() - turn.startedAt
-    if (age < FEED_LIVENESS_OPEN_MS) return
-    const livenessHeader: SessionActivityHeader = {
-      label: 'Agent', elapsedMs: age, toolCount: 0, state: 'running',
-    }
-    const rendered = renderActivityFeedWithNested(['Working…'], [], false, ` · ${formatFeedElapsed(age)}`, undefined, livenessHeader)
-    if (rendered == null) return
-    turn.activityPendingRender = rendered
-    const ea = emissionAuthorityFor(turn)
-    // PR-4d: route through the centralized chatLock-serialized card-drain gate.
-    cardDrainGate(turn, ea, () => {
-    if (ea.mayDrain(turn)) {
-      // Producer C (liveness timer): the genuine ≥12s thinking-gap open. Now
-      // that Lever 5 is inert (narrative may open pre-answer — #2588), liveness
-      // remains the natural open for 0-tool pre-answer turns that are silent.
-      // The sticky-latch (lever 1) still gates it in the drain.
-      // PR-4a: routed through the emission-authority façade (no-op delegate).
-      ea.openOrEditCard('liveness', () => {
-        turn.activityInFlight = drainActivitySummary(turn, 'liveness')
-      })
-    }
-    })
+    openLivenessFeedIfDue(turn)
     return
   }
 
@@ -11298,6 +11399,15 @@ function handleSessionEvent(ev: SessionEvent): void {
         // the SAME statusKey the ctor's façade was constructed with just above.
         setCurrentTurn(next, statusKey(ev.chatId, enqThreadIdNum))
         markIdleActivity() // any turn start (main session) is activity — re-arm idle clear
+        // Early-open the "Working…" liveness card at turn start so narration /
+        // thinking emitted BEFORE the first tool surfaces within ~a second
+        // instead of after the old 12 s threshold (the dead-air gap). Fires the
+        // SAME `openLivenessFeedIfDue` the 6 s heartbeat uses — a no-op if a
+        // tool/narrative already opened the card, and gated by `mayOpenActivityCard`
+        // (lever 1/4) so it never opens below a delivered answer. Scoped to real
+        // turns by construction: only the `enqueue` lifecycle event reaches here,
+        // and anonymous one-shot hook clients (recall.py) never emit it.
+        scheduleEarlyLivenessOpen(next)
         // Status-surface observability: one line at every turn SET so a later
         // dark card is traceable to which turn/topic key it belonged to.
         process.stderr.write(
@@ -22798,8 +22908,9 @@ async function shutdown(signal: string): Promise<void> {
 
   for (const iv of [...typingIntervals.values()]) clearInterval(iv)
   typingIntervals.clear()
-  for (const iv of [...turnTypingIntervals.values()]) clearInterval(iv)
-  turnTypingIntervals.clear()
+  turnTypingLoop.stopAll()
+  for (const t of [...earlyLivenessOpenTimers.values()]) clearTimeout(t)
+  earlyLivenessOpenTimers.clear()
   for (const t of [...typingRetryTimers.values()]) clearTimeout(t)
   typingRetryTimers.clear()
 

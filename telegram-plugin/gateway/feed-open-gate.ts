@@ -80,10 +80,63 @@
  *     already received.
  */
 
+/**
+ * Inputs for the liveness early-open WHEN-decision (`shouldEarlyOpenLiveness`).
+ * Separate from the OPEN-gate levers above: those answer *may* a card open at
+ * all (reply-is-last / cross-turn); this answers *is it time yet* for the
+ * minimal "Working…" placeholder on a 0-label turn. Both must say yes — the
+ * caller routes the actual open through `mayOpenActivityCard` after this clears.
+ */
+export interface EarlyLivenessOpenInput {
+  /** Feature flag (`SWITCHROOM_FEED_LIVENESS_OPEN`). Off ⇒ never early-open. */
+  enabled: boolean
+  /** Turn age in ms (`now - turn.startedAt`). Must be ≥ `thresholdMs`. */
+  ageMs: number
+  /** The early-open threshold (`FEED_LIVENESS_OPEN_MS`). */
+  thresholdMs: number
+  /** Count of surfaced tool steps this turn (`turn.mirrorLines.length`). >0 ⇒ a
+   *  real label already drives the labelled-feed heartbeat; the placeholder must
+   *  not fight it, so it never opens (unless `forceNarrative` — see below). */
+  mirrorLineCount: number
+  /** Single in-place card transport id. Non-null ⇒ a card is already OPEN, so
+   *  this is a maintain/no-op, not a fresh OPEN. */
+  activityMessageId: number | null
+  /** The session chat id. `null` ⇒ no surface to open on. */
+  sessionChatId: string | null
+}
+
+/**
+ * Pure: is the minimal "Working…" liveness placeholder due to OPEN for a 0-label
+ * turn? True iff the feature is on, the turn has a target chat, it has been alive
+ * past the threshold, and NO card is already open. Once `mirrorLineCount > 0` a
+ * real tool label drives the feed, EXCEPT the edge where narration staged
+ * `mirrorLines` but no card opened yet (`activityMessageId == null`) — there the
+ * accumulated narration should still render on the early open, so it is allowed.
+ *
+ * This is the WHEN gate. The caller still routes the OPEN through
+ * `mayOpenActivityCard` (lever 1/4) so a card never opens below a delivered
+ * answer or on a cross-turn synthetic surface. Two callers consult this — the
+ * enqueue-time early-open timer and the 6 s heartbeat — and because an already-
+ * open card returns false here (and the drain EDITs rather than re-OPENs), they
+ * can never double-open.
+ */
+export function shouldEarlyOpenLiveness(input: EarlyLivenessOpenInput): boolean {
+  if (!input.enabled) return false
+  if (input.sessionChatId == null) return false
+  // A card is already open → maintain via the drain's EDIT path, not a fresh
+  // OPEN. Never double-open. (Reaching past here implies `activityMessageId ==
+  // null`, so a non-zero `mirrorLineCount` is the "narration staged but no card
+  // opened yet" edge — allowed below so the accumulated narration renders.)
+  if (input.activityMessageId != null) return false
+  if (input.ageMs < input.thresholdMs) return false
+  return true
+}
+
 /** Which producer triggered this drain — determines lever-5 OPEN eligibility. */
 export type FeedOpenProducer =
   /** Narrative SHOW (producer A): plain assistant text, no tool, no time
-   *  threshold. May only EDIT, never OPEN, while the turn has 0 tool labels. */
+   *  threshold. Pre-answer it is OPEN-eligible (lever 5 INERT); after a
+   *  substantive final answer it is blocked by lever 1. */
   | 'narrative'
   /** Tool label (producer B): the model dispatched a tool. OPEN-eligible unless a
    *  substantive final already landed (lever 1).

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
-import { mayOpenActivityCard } from '../gateway/feed-open-gate.js'
+import {
+  mayOpenActivityCard,
+  shouldEarlyOpenLiveness,
+} from '../gateway/feed-open-gate.js'
 
 /**
  * Feed-OPEN gate — pure decision (design `docs/message-emission-determinism.md`
@@ -172,6 +175,77 @@ describe('mayOpenActivityCard — lever 1 exception: post-answer sub-agent liven
         labeledToolCount: 2,
         postAnswerSubagentActivity: true,
       }),
+    ).toBe(false)
+  })
+})
+
+describe('shouldEarlyOpenLiveness — the early-open WHEN gate (enqueue + heartbeat)', () => {
+  // The minimal "Working…" placeholder is due to open for a 0-label turn once it
+  // has been alive past the threshold and NO card is open yet. Both the
+  // enqueue-time early-open timer and the 6 s heartbeat consult this, so an
+  // already-open card returns false (the drain EDITs instead) — they can never
+  // double-open. This is the fix for the 12 s dead-air gap before the card first
+  // appears on a thinking / pure-narration turn.
+
+  const base = {
+    enabled: true,
+    ageMs: 1_500,
+    thresholdMs: 1_200,
+    mirrorLineCount: 0,
+    activityMessageId: null as number | null,
+    sessionChatId: 'chat-1' as string | null,
+  }
+
+  it('opens at the liveness threshold for a 0-tool turn with no card yet', () => {
+    // The core change: a turn alive past the (now ~1.2 s) threshold with no tool
+    // label and no card opens the placeholder — narration before the first tool
+    // surfaces right away instead of after 12 s.
+    expect(shouldEarlyOpenLiveness({ ...base })).toBe(true)
+  })
+
+  it('is a NO-OP once a card is already open (never double-open / race)', () => {
+    // A tool/narrative drain already opened the card (activityMessageId set).
+    // Both callers see false here, so the second one maintains via EDIT, not a
+    // fresh OPEN.
+    expect(
+      shouldEarlyOpenLiveness({ ...base, activityMessageId: 4242 }),
+    ).toBe(false)
+  })
+
+  it('does not open before the threshold (turn still fresh)', () => {
+    expect(
+      shouldEarlyOpenLiveness({ ...base, ageMs: 300, thresholdMs: 1_200 }),
+    ).toBe(false)
+  })
+
+  it('opens exactly AT the threshold (>= boundary)', () => {
+    expect(
+      shouldEarlyOpenLiveness({ ...base, ageMs: 1_200, thresholdMs: 1_200 }),
+    ).toBe(true)
+  })
+
+  it('never opens when the feature flag is off', () => {
+    expect(shouldEarlyOpenLiveness({ ...base, enabled: false })).toBe(false)
+  })
+
+  it('never opens with no target chat (e.g. an anonymous / null-agent surface)', () => {
+    expect(shouldEarlyOpenLiveness({ ...base, sessionChatId: null })).toBe(false)
+  })
+
+  it('opens to render accumulated narration: mirrorLines staged but no card yet (§3 case)', () => {
+    // The edge the early open serves: narration was staged (mirrorLineCount > 0)
+    // but no card opened yet (activityMessageId == null). The placeholder opens
+    // and renders that accumulated narration rather than a bare "Working…".
+    expect(
+      shouldEarlyOpenLiveness({ ...base, mirrorLineCount: 3, activityMessageId: null }),
+    ).toBe(true)
+  })
+
+  it('does NOT fight the labelled feed once a card is open AND labels exist', () => {
+    // A real tool label drives the labelled-feed heartbeat (card open). The
+    // placeholder must not fight it → no fresh OPEN.
+    expect(
+      shouldEarlyOpenLiveness({ ...base, mirrorLineCount: 2, activityMessageId: 99 }),
     ).toBe(false)
   })
 })
