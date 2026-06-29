@@ -324,14 +324,29 @@ describe('the 7 drain sites route through the façade with producers preserved v
     expect(body).toMatch(/ea\.mayDrain\(turn\)/)
   })
 
-  it('both liveness sites in feedHeartbeatTick route via openOrEditCard("liveness") + producer-"liveness" drains', () => {
-    const body = fnSrc('feedHeartbeatTick')
-    const opens = [...body.matchAll(/openOrEditCard\('liveness'/g)]
+  it('both liveness sites route via openOrEditCard("liveness") + producer-"liveness" drains (one in openLivenessFeedIfDue, one in feedHeartbeatTick)', () => {
+    // The early-card-open refactor extracted the 0-tool liveness OPEN out of
+    // feedHeartbeatTick into the shared `openLivenessFeedIfDue` helper (so the
+    // 6 s heartbeat and the enqueue-time early-open timer reach ONE open path
+    // and never double-open). So the two liveness sites now live in:
+    //   - openLivenessFeedIfDue: the 0-tool early-open / climb;
+    //   - feedHeartbeatTick:     the labelled-feed stale-step maintain.
+    // Both must still route via the façade with the producer arg verbatim.
+    const earlyOpen = fnSrc('openLivenessFeedIfDue')
+    const heartbeat = fnSrc('feedHeartbeatTick')
+    const opens = [
+      ...earlyOpen.matchAll(/openOrEditCard\('liveness'/g),
+      ...heartbeat.matchAll(/openOrEditCard\('liveness'/g),
+    ]
     expect(opens).toHaveLength(2)
-    const drains = [...body.matchAll(/drainActivitySummary\(turn,\s*'liveness'\)/g)]
+    const drains = [
+      ...earlyOpen.matchAll(/drainActivitySummary\(turn,\s*'liveness'\)/g),
+      ...heartbeat.matchAll(/drainActivitySummary\(turn,\s*'liveness'\)/g),
+    ]
     expect(drains).toHaveLength(2)
-    // The literal the feed-heartbeat oracle greps must still be present.
-    expect(body).toMatch(/turn\.activityInFlight = drainActivitySummary/)
+    // The literal the feed-heartbeat oracle greps must still be present in both.
+    expect(earlyOpen).toMatch(/turn\.activityInFlight = drainActivitySummary/)
+    expect(heartbeat).toMatch(/turn\.activityInFlight = drainActivitySummary/)
   })
 
   it('the tool_label site routes via openOrEditCard("tool") + the producer-"tool" drain', () => {
