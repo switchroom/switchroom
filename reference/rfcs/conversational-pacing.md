@@ -100,13 +100,14 @@ fallbackFired, inFlightTools }`. Polled every 5s.
 
 | Threshold | Action | Wire |
 |---|---|---|
-| 300s | Framework fallback: gateway sends a user-visible *"still working… (no update from agent in N min)"* or *"still thinking…"* **and** unwedges the turn (clears `activeTurnStartedAt`, nulls `currentTurn`, drains buffered inbound). Pings once. | `silencePoke.startTimer.onFrameworkFallback` callback |
+| 300s | Framework fallback: gateway **unwedges the turn** (clears `activeTurnStartedAt`, nulls `currentTurn`, drains buffered inbound). The generic *"still working… (no update from agent in N min)"* / *"still thinking…"* stall message is **no longer sent** — it was a stop-gap from before the live-updating draft carried the progress beats natively, and is the exact cadence-based "still working" update the Anti-patterns section bans (retired in the stall-stop-gap PR). The fallback now sends a user-visible message in only two honest cases: an in-flight `update_apply` carries hostd's real phase/elapsed, or the turn is parked on an approval card (the loud *"waiting for your approval — tap Approve or Deny…"* re-ping). The `silence_poke_fire` event is still logged regardless, so observability + the wedge accounting are unchanged. | `silencePoke.startTimer.onFrameworkFallback` callback |
 
 The fallback fires purely on the silence clock — `now -
 (lastOutboundAt ?? turnStartedAt) >= 300s` — and once per turn
 (`fallbackFired`). It is **not a nudge**: it does not append a
 `<system-reminder>` hoping the model will speak; it speaks *for* the
-framework and breaks the wedge. That unwedge is the one job the
+framework (only when there's something honest to say — see the two
+cases above) and breaks the wedge. That unwedge is the one job the
 live-updating draft genuinely can't do (a turn that produced no
 output at all has no draft to watch), which is why this single beat
 survived the nudge-ladder retirement (see the blockquote under "Three
@@ -117,19 +118,19 @@ clock, so a turn that's visibly composing never trips it.
 update `lastThinkingAt`. If the framework fallback fires within 30s
 of a thinking event, wording switches to *"still thinking…"*.
 
-**Tool-aware enrichment (#1292):** the gateway tracks in-flight tools
-in `inFlightTools` (`noteToolStart` / `noteToolEnd` / `noteToolLabel`
-off the session stream). When the fallback fires, it names the
-longest-running tool — *"running Grep \"foo\" for 4m"* — instead of
-the generic string. Tool churn enriches the *text* only; it never
-moves the 300s timing.
+**Tool-aware enrichment (#1292) — retired with the stall notice.** The
+gateway still tracks in-flight tools in `inFlightTools`
+(`noteToolStart` / `noteToolEnd` / `noteToolLabel` off the session
+stream) for metrics, but the *"running Grep \"foo\" for 4m"* enrichment
+of the stall message is gone along with the stall message itself: a
+timer-fired tool-narration ping is the same banned cadence-based update.
+Tool churn never moved the 300s timing and still doesn't.
 
 **Wording is load-bearing.** Exact strings live in
-`silence-poke.ts:formatFrameworkFallbackText`. The parenthetical
-*"(no update from agent in N min)"* is honest — it distinguishes the
-framework speaking from "the agent said something", so users learn to
-trust real agent messages. N is derived from `ctx.silenceMs`, not
-hard-coded.
+`silence-poke.ts:formatFrameworkFallbackText`, which now returns `null`
+for every stall variant (the stop-gap is retired) and a string only for
+the approval-blocked re-ping. The parenthetical *"(N min)"* on that
+re-ping is honest — N is derived from `ctx.silenceMs`, not hard-coded.
 
 **Kill switch:** `SWITCHROOM_DISABLE_SILENCE_POKE=1` disables the
 whole subsystem. The conversational-pacing prompt still applies; only
