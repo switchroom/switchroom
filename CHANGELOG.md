@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.16.23 — Hermes Desktop: history crash fix + cron run labels
+
+### PR A — History crash + registry.db permissions (#2665)
+
+Hermes Desktop crashed with `TypeError: Cannot read properties of undefined (reading 'forEach')` when selecting a session. Root cause: `GET /api/sessions/:id/messages` and WS `session.messages` returned `{error: "unable to open database file"}` when the agent's `registry.db` was unreadable; Hermes iterated the response as data. Both paths now degrade gracefully to `{messages: []}` on any DB error.
+
+`openTurnsDb` now creates `registry.db` at `0644` (was `0600`) so the `switchroom-web` container (different UID, same host bind-mount) can read turn history. Existing files on disk should be widened manually: `sudo find ~/.switchroom/agents -name registry.db -exec chmod 0644 {} \;`
+
+Cron run rows now include a `name` field (formatted timestamp, e.g. `Jun 29, 07:00`) so the sidebar shows the run date instead of `—`.
+
+### PR B — Release process docs (#2664)
+
+CLAUDE.md updated with two lessons from the v0.16.22 rollout: temporary `package.json` version bump before `npm pack` (stale placeholder produces wrong tarball filename), and the manual `switchroom-web` container update procedure (separate compose project, not touched by `switchroom update`).
+
 ## v0.16.22 — Hermes Desktop: conversation history, model picker, cron panel, slash palette
 
 ### PR A — Conversation history + model picker (#2660)
