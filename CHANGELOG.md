@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.16.21 — Hermes Desktop: profiles render crash fix + settings stubs
+
+Fixes a React render crash that occurred immediately on first paint after the remote backend connected. `GET /api/profiles` was returning `{}` instead of `{ profiles: [] }` (ProfilesResponse), causing `data.profiles.length` to throw `TypeError: Cannot read properties of undefined (reading 'length')`. (#2658)
+
+Also stubs three settings-panel endpoints that were returning 404 (visible as Electron main-process log errors when opening Settings, not boot-blocking): `GET /api/env` → `{}`, `POST /api/providers/validate` → `{ok:true, model:null}`, `GET /api/auth/providers` → `{providers:[]}`. (#2658)
+
+Adds `GET /api/profiles/:name/soul` stub → `{content:"",exists:false}` for profile soul lookups.
+
 ## v0.16.20 — Hermes Desktop: green status + full session fields
 
 The Hermes Desktop status bar now shows green "Inference ready" instead of amber "needs setup." The `setup.status` and `setup.runtime_check` JSON-RPC methods were returning -32601 errors, which made the desktop think no provider was configured. Both now return `{provider_configured: true}` / `{ok: true}` — switchroom always has the subscription-funded claude CLI available.
