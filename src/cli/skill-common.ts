@@ -20,6 +20,14 @@
  */
 
 import { parse as parseYaml } from "yaml";
+// Genuine reuse of the maintained/tested detector that already backs the
+// Telegram inbound/outbound secret gate. The `telegram-plugin/` tree is
+// bun-bundled (not in tsconfig `include`), but src already imports across
+// this boundary the other direction (telegram-plugin/secret-detect/
+// vault-write.ts imports src/vault/broker/client.js), and tsc follows the
+// import edge, so this type-checks. Keep this the single detector — do not
+// fork the pattern list. See telegram-plugin/secret-detect/patterns.ts.
+import { detectSecrets } from "../../telegram-plugin/secret-detect/index.js";
 
 /** Per-agent skill cap (matches install cap). Not enforced in PR A. */
 export const MAX_SKILLS_PER_AGENT = 20;
@@ -370,4 +378,88 @@ export function validateSkillBundle(
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+/**
+ * Human-readable names for detector rule ids, used in the refusal message.
+ * Falls back to the raw rule_id for any rule not listed here (so a new
+ * detector pattern still produces a sensible error without a code change).
+ */
+const SECRET_RULE_LABELS: Record<string, string> = {
+  anthropic_api_key: "Anthropic API key (sk-ant-…)",
+  anthropic_oauth_code: "Anthropic OAuth code",
+  openai_api_key: "API key (sk-…)",
+  github_pat_classic: "GitHub personal access token (ghp_…)",
+  github_pat_fine_grained: "GitHub fine-grained PAT (github_pat_…)",
+  slack_token: "Slack token (xox…)",
+  slack_app_token: "Slack app token (xapp-…)",
+  google_api_key: "Google API key (AIza…)",
+  aws_access_key: "AWS access key (AKIA…)",
+  aws_temp_access_key: "AWS temporary access key (ASIA…)",
+  jwt: "JWT",
+  pem_private_key: "PEM private-key block",
+  env_key_value: "KEY=value secret assignment",
+  json_secret_field: "JSON secret field",
+  bearer_auth_header: "Authorization: Bearer token",
+  bearer_loose: "Bearer token",
+  cli_flag: "secret CLI flag",
+  laravel_sanctum_token: "personal access token (id|token)",
+  telegram_bot_token: "Telegram bot token",
+  telegram_bot_token_prefixed: "Telegram bot token",
+  generic_high_entropy: "high-entropy string (likely a credential)",
+};
+
+/**
+ * Describes one secret-bearing file. Carries the rule label and offset, but
+ * NEVER the matched secret bytes — callers render this and the value must
+ * not leak into logs, mirrors, or the agent's chat transcript.
+ */
+export interface SecretScanFinding {
+  /** Skill-relative file path (e.g. "SKILL.md"). */
+  file: string;
+  /** Human-readable description of what matched. */
+  pattern: string;
+  /** Detector rule id (stable identifier for the matched pattern). */
+  rule_id: string;
+  /** Byte offset of the match within the file (for the operator to locate). */
+  offset: number;
+}
+
+/**
+ * Scan the FULL content of every file in a skill bundle for embedded
+ * secrets/credentials — SKILL.md body included, not just scripts. This is
+ * the security gate on the personal-skill write path: a secret pasted into
+ * a SKILL.md body would otherwise land on disk AND mirror into the
+ * operator's git config repo. The caller MUST fail closed (refuse the
+ * write, no mirror) on any finding.
+ *
+ * Reuses the maintained `detectSecrets` engine from
+ * telegram-plugin/secret-detect — including its high-entropy fallback
+ * (generic_high_entropy) for prefix-less generic keys — so the skill path
+ * stays in lock-step with the Telegram gate's coverage.
+ *
+ * The returned findings deliberately omit the matched secret value; only
+ * the file, rule, and offset are surfaced so the error can name the
+ * offending file + pattern without echoing the credential.
+ *
+ * TODO(#2670): PII rules (email/phone/address) are intentionally NOT run
+ * here yet — they await an operator decision on aggressiveness
+ * (false-positive risk). When that lands, route the PII rule set through
+ * detectSecrets (or a sibling detector) at this same call site; the
+ * fail-closed contract below already covers it as a clean drop-in.
+ */
+export function scanBundleForSecrets(files: SkillFileMap): SecretScanFinding[] {
+  const findings: SecretScanFinding[] = [];
+  for (const [file, content] of Object.entries(files)) {
+    if (typeof content !== "string" || content.length === 0) continue;
+    for (const d of detectSecrets(content)) {
+      findings.push({
+        file,
+        pattern: SECRET_RULE_LABELS[d.rule_id] ?? d.rule_id,
+        rule_id: d.rule_id,
+        offset: d.start,
+      });
+    }
+  }
+  return findings;
 }
