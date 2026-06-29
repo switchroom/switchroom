@@ -218,7 +218,9 @@ export function openTurnsDb(agentDir: string): SqliteDatabase {
   const db = new Database(path, { create: true })
   applySchema(db)
   try {
-    chmodSync(path, 0o600)
+    // 0o644 so the switchroom-web container (different UID, same host bind-mount)
+    // can read turn history for the Hermes Desktop history panel.
+    chmodSync(path, 0o644)
   } catch {
     /* ignore — chmod not supported on some FUSE mounts */
   }
