@@ -377,17 +377,20 @@ export function silenceMsForKey(key: string, now: number): number | null {
 }
 
 /**
- * Verbatim framework-fallback text — the user-visible "still working / still
- * thinking" message the gateway sends at the 300s threshold when the model
- * hasn't broken its own silence. Wording is load-bearing (see
- * `reference/rfcs/conversational-pacing.md` § Safety net). Two principles:
+ * Framework-fallback text for the 300s silence threshold. Returns `null` for
+ * the pure-stall cases (the "still working / still thinking" / "running <Tool>
+ * for Nm" notice) — that timer-fired stall ping was a stop-gap from before the
+ * live-updating reply/draft carried the progress beats natively, and the
+ * operator has retired it (it's the exact cadence-based "still working" update
+ * the conversational-pacing RFC's Anti-patterns section bans). The 300s
+ * fallback's surviving job — unwedging a turn that produced no output at all —
+ * is the gateway's turn-teardown after this call, NOT a user-visible message,
+ * so dropping the stall send keeps the safety net's real work intact (see
+ * `reference/rfcs/conversational-pacing.md` § Silence-poke fallback).
  *
- *   1. The parenthetical `(no update from agent in N min)` is honest —
- *      distinguishes from "the agent said something" so users learn to trust
- *      real agent messages. `N` is derived from `silenceMs`, never hard-coded.
- *   2. The verb is `working` by default, `thinking` only when the session
- *      stream has emitted a `kind: 'thinking'` event in the last 30s. Picked
- *      by the caller via `fallbackKind`; this helper just formats.
+ * The ONE case that still returns a string is `blockedOnApproval`: the turn is
+ * parked on an approval card waiting for YOUR tap. That is not a stall — it
+ * tells the user the ball is in their court — so it keeps pinging.
  *
  * Extracted from the gateway's `onFrameworkFallback` callback so the wording
  * can be snapshot-tested in isolation. CC-4 in `docs/status-ask-cause-classes.md`.
@@ -397,73 +400,27 @@ export function formatFrameworkFallbackText(
   silenceMs: number,
   inFlightTools: ToolSnapshot[] = [],
   blockedOnApproval = false,
-): string {
+): string | null {
   const minutes = Math.max(1, Math.round(silenceMs / 60_000))
   // The turn isn't stalled — it's parked on an approval card waiting for YOUR
   // tap (the dominant live "wedge" class is benign approval-latency, not a
   // hang). Saying "still working…" here actively lies; name the real blocker so
   // the operator knows the ball is in their court. Takes precedence over the
-  // in-flight-tool framing (a tool awaiting approval isn't "running").
+  // in-flight-tool framing (a tool awaiting approval isn't "running"). This is
+  // the only branch that still emits a user-visible message.
   if (blockedOnApproval) {
     return `waiting for your approval — tap Approve or Deny on the card above (${minutes} min)`
   }
-  const suffix = `(no update from agent in ${minutes} min)`
-  // #1292 case (a): tools in flight. Name the longest-running one
-  // (entry[0] — caller pre-sorts by startedAt ascending). Avoid the
-  // "still working" framing #1292 explicitly calls out as dishonest:
-  // the agent IS doing work, we can see the tool. Format:
-  //   running Grep "foo" for 4m (no update from agent in 5 min)
-  //   running Grep "foo" + 2 more (4m) (no update from agent in 5 min)
-  //   running Grep (no label) for 4m (no update from agent in 5 min)
-  //
-  // Raw MCP tool names (`mcp__server__tool`) are technical identifiers
-  // and look like a leak when surfaced to a user. When the tool name
-  // matches that shape AND a human-friendly label is available, drop
-  // the raw name and lead with the label instead:
-  //   Searching memory for 4m (no update from agent in 5 min)
-  // Built-in tool names (Grep, Read, Bash) stay as-is — they ARE
-  // human-readable, and the label is supplementary detail (e.g. the
-  // search pattern) that reads naturally after the verb.
-  if (inFlightTools.length > 0) {
-    const longest = inFlightTools[0]!
-    const dur = formatDurationShort(longest.durationMs)
-    const labelTail = longest.label && longest.label.length > 0
-      ? ` ${truncateLabel(longest.label)}`
-      : ''
-    const more = inFlightTools.length > 1
-      ? ` + ${inFlightTools.length - 1} more`
-      : ''
-    const isMcpRawName = /^mcp__/.test(longest.name)
-    if (isMcpRawName && labelTail !== '') {
-      // Label-only: "Searching memory for 4m (…)". Drop the raw
-      // `mcp__server__tool` and the leading "running" because the
-      // label already reads as a gerund phrase.
-      return `${truncateLabel(longest.label!)}${more} for ${dur} ${suffix}`
-    }
-    return `running ${longest.name}${labelTail}${more} for ${dur} ${suffix}`
-  }
-  return fallbackKind === 'thinking'
-    ? `still thinking… ${suffix}`
-    : `still working… ${suffix}`
-}
-
-/** Compact m/s rendering for the fallback message. Anything under a
- *  minute reads as `${s}s`, otherwise `${m}m`. Always rounds toward the
- *  user-honest direction — "4m" for 4m 30s, "5m" for 4m 45s. */
-function formatDurationShort(ms: number): string {
-  const totalSec = Math.max(0, Math.round(ms / 1000))
-  if (totalSec < 60) return `${totalSec}s`
-  const minutes = Math.round(totalSec / 60)
-  return `${minutes}m`
-}
-
-/** Telegram lines are short on mobile. Clip the label to keep the
- *  fallback message readable. Truncation point is generous (60 chars)
- *  because tool labels are pre-truncated by `toolLabel()` already. */
-function truncateLabel(label: string): string {
-  const MAX = 60
-  if (label.length <= MAX) return label
-  return label.slice(0, MAX - 1) + '…'
+  // Stop-gap retired: the "still working… (no update from agent in N min)" /
+  // "running <Tool> for Nm" stall notice (including the #1292 tool-aware
+  // enrichment) no longer sends. The live draft + the model's own pacing beats
+  // carry progress; a timer-fired stall ping on top of that is the banned
+  // cadence-based update. `fallbackKind` and `inFlightTools` are now unused for
+  // the stall path but kept on the signature so the gateway's call sites — and
+  // the deterministic update-status / unwedge paths around them — are untouched.
+  void fallbackKind
+  void inFlightTools
+  return null
 }
 
 /** Snapshot in-flight tools sorted longest-running first — for the honest

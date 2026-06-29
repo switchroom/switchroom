@@ -5612,11 +5612,14 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
 
 // #1122: framework safety-net for "model is silent to the user for >5min."
 // Starts a single setInterval poll that walks active turns; at 300s of
-// silence the framework itself sends a user-visible "still working… /
-// still thinking…" message AND unwedges the turn. The model-targeted
-// nudge ladder (ack/soft/firm) and the 60s awareness ping were retired
-// once the live-updating reply/draft took over the pacing job — only
-// this single unwedge fallback remains. Honours
+// silence the framework unwedges the turn. The generic "still working… /
+// still thinking…" stall message it used to send was a stop-gap from
+// before the live draft carried the progress beats and has been retired
+// (the stall-stop-gap PR) — the surviving user-visible sends are the
+// deterministic update_apply phase line and the approval-blocked re-ping.
+// The model-targeted nudge ladder (ack/soft/firm) and the 60s awareness
+// ping were retired earlier once the live-updating reply/draft took over
+// the pacing job — only this single unwedge fallback remains. Honours
 // SWITCHROOM_DISABLE_SILENCE_POKE=1 kill switch (no-op if set).
 // Set when this gateway dispatches an `update_apply` to hostd that
 // returns `started`; cleared when the dispatch poll resolves (terminal
@@ -5752,6 +5755,14 @@ silencePoke.startTimer({
       ctx.inFlightTools,
       blockedOnApproval,
     )
+    // The stall-notice stop-gap is retired: `formatFrameworkFallbackText`
+    // returns null for the pure-liveness "still working / running <Tool>"
+    // beat (the only string it still emits is the approval-blocked re-ping).
+    // The early quiet floor beat existed ONLY to surface that stall notice, so
+    // with the notice gone there is nothing to send here unless the turn is
+    // parked on an approval card. Skip silently otherwise; the live draft +
+    // the model's own pacing beats carry progress.
+    if (text == null) return
     try {
       await robustApiCall(
         () => bot.api.sendMessage(ctx.chatId, text, {
@@ -5849,7 +5860,10 @@ silencePoke.startTimer({
       )
     }
     // #2527: log the actual poke fire with structured data before sending,
-    // so the event is visible even if the send fails.
+    // so the event is visible even if the send fails. The stall-notice
+    // stop-gap is retired (the user-visible send below is now gated), but the
+    // fire event is still logged so observability + the unwedge accounting are
+    // unchanged — mirrors PR #2641 (drop the chat badge, keep the log).
     logStreamingEvent({
       kind: 'silence_poke_fire',
       chatId: ctx.chatId,
@@ -5857,24 +5871,34 @@ silencePoke.startTimer({
       silenceMs: ctx.silenceMs,
       fallbackKind: ctx.fallbackKind,
     })
-    try {
-      await robustApiCall(
-        () => bot.api.sendMessage(ctx.chatId, text, {
-          ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
-          // Conditional: the pure-liveness "still working…" notice is a status
-          // surface and stays SILENT. But when the turn is parked on an
-          // approval card, this same fallback carries a user-gating re-ping
-          // ("waiting for your approval — tap Approve or Deny …") — that must
-          // PING, because the user is the one being waited on. Gate on the same
-          // `blockedOnApproval` signal that selects the re-ping text above.
-          disable_notification: blockedOnApproval ? false : true,
-        }),
-        { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
-      )
-    } catch (err) {
-      process.stderr.write(
-        `silence-poke fallback sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
-      )
+    // Send a user-visible message ONLY when there's something honest to say:
+    //   - a deterministic in-flight update_apply phase (`text` set above), or
+    //   - the approval-blocked re-ping (`formatFrameworkFallbackText` returns a
+    //     string only for that case).
+    // The generic "still working… (no update from agent in N min)" stall notice
+    // is retired — `formatFrameworkFallbackText` returns null for it, so `text`
+    // stays null and we skip the send. The turn-teardown below (the unwedge —
+    // the one job the live draft can't do, per the conversational-pacing RFC)
+    // still runs unconditionally.
+    if (text != null) {
+      try {
+        await robustApiCall(
+          () => bot.api.sendMessage(ctx.chatId, text, {
+            ...(ctx.threadId != null ? { message_thread_id: ctx.threadId } : {}),
+            // Conditional: when the turn is parked on an approval card, this
+            // fallback carries a user-gating re-ping ("waiting for your
+            // approval — tap Approve or Deny …") — that must PING, because the
+            // user is the one being waited on. The deterministic update-status
+            // line stays SILENT (a status surface). Gate on `blockedOnApproval`.
+            disable_notification: blockedOnApproval ? false : true,
+          }),
+          { chat_id: ctx.chatId, ...(ctx.threadId != null ? { threadId: ctx.threadId } : {}) },
+        )
+      } catch (err) {
+        process.stderr.write(
+          `silence-poke fallback sendMessage failed chat=${ctx.chatId} thread=${ctx.threadId}: ${err}\n`,
+        )
+      }
     }
     // #1122 follow-up: end the wedged turn AFTER the fallback fires.
     // Without this, `activeTurnStartedAt` stays set, every subsequent

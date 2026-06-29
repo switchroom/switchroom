@@ -251,80 +251,52 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     expect(ctx.inFlightTools[0]!.durationMs).toBe(305_000 - 30_000)
   })
 
-  it('formatFrameworkFallbackText names the longest-running tool with duration', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Grep', label: '"foo"', durationMs: 275_000 },
-    ])
-    expect(text).toBe(
-      'running Grep "foo" for 5m (no update from agent in 5 min)',
-    )
-  })
+  // The "no update from agent in N min" stall notice is a retired stop-gap
+  // (operator: obsolete now that the live draft + the model's own pacing beats
+  // carry progress). `formatFrameworkFallbackText` now returns null for every
+  // stall variant — the generic "still working / still thinking" notice AND the
+  // #1292 tool-aware enrichment — so the gateway sends nothing for a plain
+  // stall (it still runs the unwedge teardown). Only `blockedOnApproval`
+  // still produces a user-visible string. The tests below pin that contract.
 
-  it('multiple in-flight tools render as "+ N more"', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Grep', label: '"foo"', durationMs: 275_000 },
-      { name: 'Read', label: 'config.ts', durationMs: 120_000 },
-      { name: 'Bash', label: null, durationMs: 60_000 },
-    ])
-    expect(text).toBe(
-      'running Grep "foo" + 2 more for 5m (no update from agent in 5 min)',
-    )
-  })
-
-  it('tool with no label renders the bare name', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Bash', label: null, durationMs: 305_000 },
-    ])
-    expect(text).toBe(
-      'running Bash for 5m (no update from agent in 5 min)',
-    )
-  })
-
-  it('raw mcp__ tool name with a human label drops the technical name and leads with the label', () => {
-    // mcp__hindsight__reflect is the internal MCP identifier — looks
-    // like a leak when surfaced to a user. The label table emits
-    // "Searching memory" for it (see hooks/tool-label-pretool.mjs);
-    // the fallback message should lead with the label, not concatenate
-    // both.
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'mcp__hindsight__reflect', label: 'Searching memory', durationMs: 305_000 },
-    ])
-    expect(text).toBe(
-      'Searching memory for 5m (no update from agent in 5 min)',
-    )
-  })
-
-  it('raw mcp__ tool name with NO label falls back to the bare name (no leak-but-no-better-option)', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'mcp__some-third-party__do_thing', label: null, durationMs: 305_000 },
-    ])
-    expect(text).toBe(
-      'running mcp__some-third-party__do_thing for 5m (no update from agent in 5 min)',
-    )
-  })
-
-  it('built-in tool (Grep) with a label keeps the prior "running Name label" shape — name is already human-readable', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Grep', label: 'foo', durationMs: 305_000 },
-    ])
-    expect(text).toBe(
-      'running Grep foo for 5m (no update from agent in 5 min)',
-    )
-  })
-
-  it('empty inFlightTools falls back to the base "still working" wording', () => {
+  it('stall notice (in-flight tool) returns null — no user-visible send', () => {
     expect(
-      formatFrameworkFallbackText('working', 305_000, []),
-    ).toBe('still working… (no update from agent in 5 min)')
-    expect(
-      formatFrameworkFallbackText('thinking', 305_000, []),
-    ).toBe('still thinking… (no update from agent in 5 min)')
-    expect(
-      formatFrameworkFallbackText('working', 305_000),
-    ).toBe('still working… (no update from agent in 5 min)')
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'Grep', label: '"foo"', durationMs: 275_000 },
+      ]),
+    ).toBeNull()
   })
 
-  it('blockedOnApproval names the real blocker instead of the dishonest "still working…"', () => {
+  it('stall notice (multiple in-flight tools) returns null', () => {
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'Grep', label: '"foo"', durationMs: 275_000 },
+        { name: 'Read', label: 'config.ts', durationMs: 120_000 },
+        { name: 'Bash', label: null, durationMs: 60_000 },
+      ]),
+    ).toBeNull()
+  })
+
+  it('stall notice (raw mcp__ tool, with or without label) returns null', () => {
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'mcp__hindsight__reflect', label: 'Searching memory', durationMs: 305_000 },
+      ]),
+    ).toBeNull()
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'mcp__some-third-party__do_thing', label: null, durationMs: 305_000 },
+      ]),
+    ).toBeNull()
+  })
+
+  it('generic stall notice (empty inFlightTools, working AND thinking) returns null', () => {
+    expect(formatFrameworkFallbackText('working', 305_000, [])).toBeNull()
+    expect(formatFrameworkFallbackText('thinking', 305_000, [])).toBeNull()
+    expect(formatFrameworkFallbackText('working', 305_000)).toBeNull()
+  })
+
+  it('blockedOnApproval still names the real blocker (the one surviving user-visible send)', () => {
     expect(
       formatFrameworkFallbackText('working', 305_000, [], true),
     ).toBe('waiting for your approval — tap Approve or Deny on the card above (5 min)')
@@ -338,18 +310,10 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     ).toBe('waiting for your approval — tap Approve or Deny on the card above (5 min)')
   })
 
-  it('blockedOnApproval=false keeps the existing wording (default, back-compat)', () => {
+  it('blockedOnApproval=false is a stall → returns null (stop-gap retired)', () => {
     expect(
       formatFrameworkFallbackText('working', 305_000, [], false),
-    ).toBe('still working… (no update from agent in 5 min)')
-  })
-
-  it('tool-aware wording wins over "thinking" — the actual observable beats the inferred kind', () => {
-    const text = formatFrameworkFallbackText('thinking', 305_000, [
-      { name: 'Grep', label: '"foo"', durationMs: 305_000 },
-    ])
-    expect(text.startsWith('running Grep')).toBe(true)
-    expect(text).not.toContain('still thinking')
+    ).toBeNull()
   })
 
   it('tool completed before the fallback → empty snapshot → base wording', () => {
@@ -450,22 +414,21 @@ describe('silence-poke — #1292 tool-aware framework fallback', () => {
     expect(__getStateForTests('k')!.inFlightTools.size).toBe(0)
   })
 
-  it('formatFrameworkFallbackText sub-minute durations render as "Ns"', () => {
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Grep', label: 'foo', durationMs: 12_000 },
-    ])
-    expect(text).toBe(
-      'running Grep foo for 12s (no update from agent in 5 min)',
-    )
-  })
-
-  it('formatFrameworkFallbackText truncates very long labels', () => {
+  it('in-flight tool stall (any duration/label) returns null — stop-gap retired', () => {
+    // Previously rendered "running Grep foo for 12s (…)" / truncated long
+    // labels. The whole tool-aware stall enrichment is gone now, so the
+    // duration + label formatting paths no longer surface — they return null.
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'Grep', label: 'foo', durationMs: 12_000 },
+      ]),
+    ).toBeNull()
     const longLabel = '"' + 'x'.repeat(120) + '"'
-    const text = formatFrameworkFallbackText('working', 305_000, [
-      { name: 'Grep', label: longLabel, durationMs: 305_000 },
-    ])
-    expect(text.length).toBeLessThan(120)
-    expect(text).toContain('…')
+    expect(
+      formatFrameworkFallbackText('working', 305_000, [
+        { name: 'Grep', label: longLabel, durationMs: 305_000 },
+      ]),
+    ).toBeNull()
   })
 })
 
@@ -528,38 +491,38 @@ describe('silence-poke — fallback handler errors do not break timer', () => {
 })
 
 // CC-4 from `docs/status-ask-cause-classes.md`: wording is load-bearing
-// (`reference/rfcs/conversational-pacing.md` § Safety net). Snapshot the exact
-// strings here so a refactor that drops a key phrase fails loud at test
-// time. If you genuinely need to change the wording, update the snapshot
-// AND the design doc together.
+// (`reference/rfcs/conversational-pacing.md` § Safety net). The stall notice is
+// a retired stop-gap — its wording is gone (returns null). The ONE surviving
+// user-visible string is the approval-blocked re-ping; snapshot it here so a
+// refactor that drops the phrase fails loud. The `N min` parenthetical is still
+// derived from silenceMs (honest), so pin that too.
 describe('silence-poke — wording snapshots (CC-4)', () => {
-  it('framework fallback — working at 300s', () => {
-    expect(formatFrameworkFallbackText('working', 300_000)).toMatchInlineSnapshot(
-      `"still working… (no update from agent in 5 min)"`,
+  it('framework fallback — generic stall (working/thinking) emits no message', () => {
+    expect(formatFrameworkFallbackText('working', 300_000)).toBeNull()
+    expect(formatFrameworkFallbackText('thinking', 300_000)).toBeNull()
+  })
+
+  it('approval-blocked re-ping — exact wording', () => {
+    expect(formatFrameworkFallbackText('working', 300_000, [], true)).toMatchInlineSnapshot(
+      `"waiting for your approval — tap Approve or Deny on the card above (5 min)"`,
     )
   })
 
-  it('framework fallback — thinking at 300s', () => {
-    expect(formatFrameworkFallbackText('thinking', 300_000)).toMatchInlineSnapshot(
-      `"still thinking… (no update from agent in 5 min)"`,
+  it('approval-blocked — minutes derived from silenceMs, not hard-coded', () => {
+    expect(formatFrameworkFallbackText('working', 360_000, [], true)).toBe(
+      'waiting for your approval — tap Approve or Deny on the card above (6 min)',
+    )
+    expect(formatFrameworkFallbackText('working', 600_000, [], true)).toBe(
+      'waiting for your approval — tap Approve or Deny on the card above (10 min)',
     )
   })
 
-  it('framework fallback — minutes derived from silenceMs, not hard-coded', () => {
-    expect(formatFrameworkFallbackText('working', 360_000)).toBe(
-      'still working… (no update from agent in 6 min)',
+  it('approval-blocked — minutes floor at 1 even when silenceMs is small', () => {
+    expect(formatFrameworkFallbackText('working', 30_000, [], true)).toBe(
+      'waiting for your approval — tap Approve or Deny on the card above (1 min)',
     )
-    expect(formatFrameworkFallbackText('working', 600_000)).toBe(
-      'still working… (no update from agent in 10 min)',
-    )
-  })
-
-  it('framework fallback — minutes floor at 1 even when silenceMs is small', () => {
-    expect(formatFrameworkFallbackText('working', 30_000)).toBe(
-      'still working… (no update from agent in 1 min)',
-    )
-    expect(formatFrameworkFallbackText('working', 0)).toBe(
-      'still working… (no update from agent in 1 min)',
+    expect(formatFrameworkFallbackText('working', 0, [], true)).toBe(
+      'waiting for your approval — tap Approve or Deny on the card above (1 min)',
     )
   })
 })
