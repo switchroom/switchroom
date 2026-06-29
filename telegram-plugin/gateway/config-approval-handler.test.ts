@@ -81,39 +81,45 @@ afterEach(() => {
   _resetPendingConfigApprovalsForTest();
 });
 
+// #2669: the diff now ships inside a fenced code block (``` … ```) on the
+// rich-message path. Content inside a fence is LITERAL — `<` / `&` need no
+// escaping and cannot inject formatting. The inline-body cap is the rich
+// 32768-char wire limit (RENDERED_BODY_CAP=32000), not the old 4096.
+const RICH_LIMIT = 32768;
 describe("buildConfigApprovalCardBody", () => {
-  it("HTML-escapes the diff body so `<` / `&` can't break out of the <pre> block", () => {
+  it("ships the diff verbatim inside a fenced code block (< / & stay literal)", () => {
     const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
-      reason: "<script>",
+      reason: "a_reason",
       unifiedDiff: "a & b <c>",
     });
-    expect(body).toContain("&lt;script&gt;");
-    expect(body).toContain("a &amp; b &lt;c&gt;");
+    // The diff content is literal inside the fence — no HTML entities.
+    expect(body).toContain("```\na & b <c>\n```");
   });
 
-  it("rendered body stays under Telegram's 4096-char limit when raw diff is all `&` (worst-case 5x escape inflation)", () => {
-    // 3000 `&` chars escape to 15000 `&amp;` chars — far past 4096.
-    // The post-escape cap MUST kick in and truncate the rendered body.
-    const evilDiff = "&".repeat(3000);
+  it("rendered body stays under the rich-message limit when the raw diff is enormous", () => {
+    // A diff far larger than the 32000 cap must be truncated with the sentinel.
+    const evilDiff = "&".repeat(40000);
     const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
       unifiedDiff: evilDiff,
     });
-    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body.length).toBeLessThanOrEqual(RICH_LIMIT);
     expect(body).toContain("diff continues, see attached file");
   });
 
-  it("rendered body stays under 4096 when raw diff is all `<` (5x escape)", () => {
-    const evilDiff = "<".repeat(3000);
-    const { body } = buildConfigApprovalCardBody({
+  it("a small `<`-heavy diff fits and stays literal (no escape inflation, #2669)", () => {
+    const diff = "<".repeat(3000);
+    const { body, truncated } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
-      unifiedDiff: evilDiff,
+      unifiedDiff: diff,
     });
-    expect(body.length).toBeLessThanOrEqual(4096);
-    expect(body).toContain("&lt;");
+    // 3000 chars is well under the 32000 cap and no longer 5x-inflated.
+    expect(truncated).toBe(false);
+    expect(body.length).toBeLessThanOrEqual(RICH_LIMIT);
+    expect(body).toContain("<".repeat(3000));
   });
 
   it("clips an unbounded operator-supplied `reason` to ~500 chars with ellipsis", () => {
@@ -123,7 +129,6 @@ describe("buildConfigApprovalCardBody", () => {
       reason: longReason,
       unifiedDiff: "small",
     });
-    // The escaped reason should appear, but capped.
     const reasonLine = body
       .split("\n")
       .find((l) => l.startsWith("Reason: "))!;
@@ -139,48 +144,43 @@ describe("buildConfigApprovalCardBody", () => {
       unifiedDiff: "-a\n+b\n",
     });
     expect(truncated).toBe(false);
-    expect(body).toContain("<pre>-a\n+b\n</pre>");
+    expect(body).toContain("```\n-a\n+b\n\n```");
   });
 
   it("returns truncated:true and appends the sentinel when the body has to shrink", () => {
     const { body, truncated } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
-      unifiedDiff: "&".repeat(3000),
+      unifiedDiff: "&".repeat(40000),
     });
     expect(truncated).toBe(true);
     expect(body).toContain("diff continues, see attached file");
   });
 
   it("handles a single unbroken line (no `\\n` to snap to) by char-truncation fallback", () => {
-    // 8000 `x` chars on a single line. After HTML escape (no inflation
-    // for `x`) the diff body alone is 8000 chars + framing — way past
-    // the cap. There's no newline to snap to, so the helper must fall
-    // through to char-truncation rather than returning empty.
-    const oneLongLine = "x".repeat(8000);
+    // A single 40000-char line, way past the 32000 cap, with no newline to
+    // snap to → the helper must fall through to char-truncation.
+    const oneLongLine = "x".repeat(40000);
     const { body, truncated } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: "test",
       unifiedDiff: oneLongLine,
     });
     expect(truncated).toBe(true);
-    expect(body.length).toBeLessThanOrEqual(4096);
-    // Should still contain SOME of the line content — the helper
-    // shouldn't degenerate to "framing + sentinel only" when char-
-    // truncation is available.
+    expect(body.length).toBeLessThanOrEqual(RICH_LIMIT);
     expect(body).toMatch(/x{100,}/);
     expect(body).toContain("diff continues, see attached file");
   });
 
-  it("rendered body stays under 4096 even when reason is also adversarial", () => {
-    const evilDiff = "&".repeat(3000);
+  it("rendered body stays under the rich limit even when reason is also adversarial", () => {
+    const evilDiff = "&".repeat(40000);
     const evilReason = "&".repeat(2000);
     const { body } = buildConfigApprovalCardBody({
       agentName: "klanker",
       reason: evilReason,
       unifiedDiff: evilDiff,
     });
-    expect(body.length).toBeLessThanOrEqual(4096);
+    expect(body.length).toBeLessThanOrEqual(RICH_LIMIT);
   });
 });
 
@@ -304,8 +304,10 @@ describe("buildLiveNote", () => {
     expect(buildLiveNote([], false)).toBe("");
     expect(buildLiveNote(undefined, undefined)).toBe("");
   });
-  it("HTML-escapes agent names", () => {
-    expect(buildLiveNote(["a<b>"], false)).toContain("a&lt;b&gt;");
+  it("markdown-escapes agent names (< > stay literal, #2669)", () => {
+    // < > are literal in rich markdown; an emphasis special is escaped.
+    expect(buildLiveNote(["a<b>"], false)).toContain("a<b>");
+    expect(buildLiveNote(["a_b"], false)).toContain("a\\_b");
   });
 });
 
@@ -412,7 +414,7 @@ describe("oversize diff → attachment fallback (#1762)", () => {
     expect(deps.postCard).toHaveBeenCalledTimes(1);
     const postArgs = (deps.postCard as ReturnType<typeof vi.fn>).mock
       .calls[0]![0] as { text: string; replyMarkup: unknown };
-    expect(postArgs.text.length).toBeLessThanOrEqual(4096);
+    expect(postArgs.text.length).toBeLessThanOrEqual(32768);
     expect(postArgs.text).toMatch(/diff continues, see attached file/);
     expect(postArgs.replyMarkup).toBeDefined();
 

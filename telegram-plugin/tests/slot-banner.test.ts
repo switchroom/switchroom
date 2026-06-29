@@ -58,12 +58,15 @@ describe('decideBannerAction — non-default state', () => {
 });
 
 describe('formatBannerHtml', () => {
-  it('escapes HTML in agent and slot names', () => {
-    const text = formatBannerHtml('<bad>', '"hax"', '&def');
-    expect(text).not.toContain('<bad>');
-    expect(text).toContain('&lt;bad&gt;');
-    expect(text).toContain('&quot;hax&quot;');
-    expect(text).toContain('&amp;def');
+  it('markdown-escapes emphasis specials in the agent name (#2669)', () => {
+    // The agent name is interpolated into a **bold** run, so an emphasis
+    // special in it must be backslash-escaped or it would break the run.
+    // Slot names live in `code spans` (literal) and need no escaping.
+    const text = formatBannerHtml('a_b*c', 'slot_1', 'def_2');
+    expect(text).toContain('**a\\_b\\*c**');
+    // Slot names ride in code spans verbatim (literal inside backticks).
+    expect(text).toContain('`slot_1`');
+    expect(text).toContain('`def_2`');
   });
 
   it('mentions the failover-from default for context', () => {

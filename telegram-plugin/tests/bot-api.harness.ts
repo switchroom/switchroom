@@ -26,11 +26,29 @@ export interface MockBotApi {
       opts?: Record<string, unknown>,
     ) => Promise<{ message_id: number }>
   >
+  /**
+   * Bot API 10.1 rich-message send (#2669). Receives the
+   * `InputRichMessage` ({ markdown }) as the 2nd arg, mirroring grammy
+   * 1.44's `sendRichMessage`. Tests assert on
+   * `sendRichMessage.mock.calls[i][1].markdown` for the raw GFM body.
+   */
+  sendRichMessage: MockInstance<
+    (
+      chat_id: string,
+      rich_message: { markdown: string },
+      opts?: Record<string, unknown>,
+    ) => Promise<{ message_id: number }>
+  >
+  /**
+   * editMessageText's 3rd arg is `string | { markdown: string }` — a
+   * plain string on the literal path, an `InputRichMessage` on the rich
+   * path (#2669).
+   */
   editMessageText: MockInstance<
     (
       chat_id: string,
       message_id: number,
-      text: string,
+      text: string | { markdown: string },
       opts?: Record<string, unknown>,
     ) => Promise<unknown>
   >
@@ -65,6 +83,7 @@ export function createMockBot(startMessageId = 500): MockBot {
 
   const api: MockBotApi = {
     sendMessage: vi.fn(async () => ({ message_id: state.nextMessageId++ })),
+    sendRichMessage: vi.fn(async () => ({ message_id: state.nextMessageId++ })),
     editMessageText: vi.fn(async () => undefined),
     deleteMessage: vi.fn(async () => true as const),
     setMessageReaction: vi.fn(async () => true as const),
@@ -98,6 +117,9 @@ export function installBotResetHook(bot: MockBot): void {
     // Re-apply defaults after reset (mockReset wipes the implementation).
     bot.nextMessageId = 500
     bot.api.sendMessage.mockImplementation(async () => ({
+      message_id: bot.nextMessageId++,
+    }))
+    bot.api.sendRichMessage.mockImplementation(async () => ({
       message_id: bot.nextMessageId++,
     }))
     bot.api.editMessageText.mockImplementation(async () => undefined)

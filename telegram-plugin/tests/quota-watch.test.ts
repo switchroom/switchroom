@@ -249,17 +249,21 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     expect(d.message).toContain("30%");
   });
 
-  it("throttling message HTML-escapes account label", () => {
+  it("throttling message markdown-escapes the account label (#2669)", () => {
+    // The label is interpolated inside a code span — the renderer escapes
+    // inline-markdown specials (\ ` * _ ~ = [ ] |), not HTML entities. A label
+    // with an emphasis special (e.g. an underscore) is backslash-escaped; the
+    // literal `<` / `>` pass through (they are not markdown specials).
     const d = evaluateQuotaWatchAccount({
       agentName: "lawgpt",
-      snap: makeSnap("<evil>@example.com", makeQuota(85, 40)),
+      snap: makeSnap("ev_il@example.com", makeQuota(85, 40)),
       prev: PREV_NEVER_NOTIFIED,
       now: NOW,
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
-    expect(d.message).toContain("&lt;evil&gt;");
-    expect(d.message).not.toContain("<evil>");
+    // The underscore is escaped so it can't open an italic run inside the span.
+    expect(d.message).toContain("ev\\_il@example.com");
   });
 
   it("throttling message for active account mentions /auth use", () => {

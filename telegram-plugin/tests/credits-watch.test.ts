@@ -103,7 +103,7 @@ describe("evaluateCreditState — transition decisions (machinery, explicit fata
     if (d.kind !== "notify") return;
     expect(d.transition).toBe("entered");
     expect(d.message).toContain("out of pre-paid credits");
-    expect(d.message).toContain("<b>lawgpt</b>");
+    expect(d.message).toContain("**lawgpt**");
     expect(d.newState.lastNotifiedReason).toBe("out_of_credits");
     expect(d.newState.lastNotifiedAt).toBe(NOW);
   });
@@ -175,9 +175,9 @@ describe("evaluateCreditState — transition decisions (machinery, explicit fata
     expect(d.kind).toBe("skip");
   });
 
-  it("escapes HTML in the agent name (defensive)", () => {
+  it("markdown-escapes emphasis specials in the agent name; < > stay literal (#2669)", () => {
     const d = evaluateCreditState({
-      agentName: "<evil>",
+      agentName: "ev_il",
       currentReason: "out_of_credits",
       prev: HEALTHY,
       now: NOW,
@@ -185,8 +185,8 @@ describe("evaluateCreditState — transition decisions (machinery, explicit fata
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
-    expect(d.message).toContain("&lt;evil&gt;");
-    expect(d.message).not.toContain("<evil>");
+    // The underscore is escaped so it can't open an italic run inside **…**.
+    expect(d.message).toContain("ev\\_il");
   });
 });
 

@@ -37,7 +37,8 @@ function modelStreamReply(params: {
   text: string
   done?: boolean
   throttleMs?: number
-  parseMode?: 'HTML' | 'MarkdownV2'
+  /** Literal plain-text stream (no rich-markdown parser). Default: rich. */
+  literalText?: boolean
 }): { stream: DraftStreamHandle; settled: Promise<void> } {
   const key = streamKey(params.chatId, params.threadId)
   let stream = params.map.get(key)
@@ -46,7 +47,7 @@ function modelStreamReply(params: {
       bot: params.bot,
       chatId: params.chatId,
       threadId: params.threadId,
-      parseMode: params.parseMode,
+      literalText: params.literalText,
       throttleMs: params.throttleMs ?? 600,
     })
     params.map.set(key, stream)
@@ -79,7 +80,7 @@ describe('streaming orchestration — activeDraftStreams map', () => {
 
     expect(a).toBe(b)
     expect(map.size).toBe(1)
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
   })
 
@@ -96,7 +97,7 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     await microtaskFlush()
 
     expect(first).not.toBe(second)
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     expect(second.getMessageId()).toBe(501)
   })
 
@@ -108,8 +109,8 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     await microtaskFlush()
 
     expect(map.size).toBe(2)
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
-    const chatIds = bot.api.sendMessage.mock.calls.map(c => c[0]).sort()
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
+    const chatIds = bot.api.sendRichMessage.mock.calls.map(c => c[0]).sort()
     expect(chatIds).toEqual(['1', '2'])
   })
 
@@ -121,32 +122,32 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     await microtaskFlush()
 
     expect(map.size).toBe(2)
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
-    const threads = bot.api.sendMessage.mock.calls.map(c => c[2]?.message_thread_id).sort()
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
+    const threads = bot.api.sendRichMessage.mock.calls.map(c => c[2]?.message_thread_id).sort()
     expect(threads).toEqual([10, 20])
   })
 
   it('pty preview → stream_reply handoff: second call edits the PTY message in place', async () => {
     const map = new Map<string, DraftStreamHandle>()
 
-    const ptyStream = createStreamController({ bot, chatId: '1', parseMode: 'HTML', throttleMs: 600 })
+    const ptyStream = createStreamController({ bot, chatId: '1', throttleMs: 600 })
     map.set('1:_', ptyStream)
-    void ptyStream.update('<i>drafting…</i>')
+    void ptyStream.update('_drafting…_')
     await microtaskFlush()
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     const previewId = ptyStream.getMessageId()
     expect(previewId).toBe(500)
 
     vi.advanceTimersByTime(600)
     await microtaskFlush()
     const { settled } = modelStreamReply({
-      bot, map, chatId: '1', parseMode: 'HTML', text: 'final answer', done: true,
+      bot, map, chatId: '1', text: 'final answer', done: true,
     })
     await microtaskFlush()
     await settled
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(bot.api.editMessageText).toHaveBeenCalled()
     expect(bot.api.editMessageText.mock.calls[0][1]).toBe(previewId)
     expect(map.has('1:_')).toBe(false)
@@ -165,10 +166,10 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     }
     await microtaskFlush()
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('one')
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect((bot.api.sendRichMessage.mock.calls[0][1] as { markdown: string }).markdown).toBe('one')
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('four')
+    expect((bot.api.editMessageText.mock.calls[0][2] as { markdown: string }).markdown).toBe('four')
 
     // No further work scheduled; advancing timers should be a no-op.
     vi.advanceTimersByTime(5000)
@@ -188,7 +189,7 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     await settled
 
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1)
-    expect(bot.api.editMessageText.mock.calls[0][2]).toBe('final answer')
+    expect((bot.api.editMessageText.mock.calls[0][2] as { markdown: string }).markdown).toBe('final answer')
     expect(map.size).toBe(0)
   })
 
@@ -197,7 +198,7 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     // messageId=null. A subsequent update() triggers a fresh send on the
     // same stream object — this is what makes a momentary network blip
     // recoverable without the caller needing to evict-and-recreate.
-    bot.api.sendMessage
+    bot.api.sendRichMessage
       .mockImplementationOnce(async () => { throw new Error('network down') })
       .mockImplementationOnce(async () => ({ message_id: 777 }))
 
@@ -206,14 +207,14 @@ describe('streaming orchestration — activeDraftStreams map', () => {
     await microtaskFlush()
 
     expect(stream.getMessageId()).toBeNull()
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
 
     // Caller issues next snapshot — should retry send, not try to edit null.
     vi.advanceTimersByTime(1000)
     modelStreamReply({ bot, map, chatId: '1', text: 'second try' })
     await microtaskFlush()
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2)
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
     expect(bot.api.editMessageText).not.toHaveBeenCalled()
     expect(stream.getMessageId()).toBe(777)
   })
@@ -249,7 +250,9 @@ function modelPtyPartial(params: {
       bot: params.bot,
       chatId: params.chatId,
       threadId: params.threadId,
-      parseMode: 'HTML',
+      // PTY-tail previews ship as literal plain text (#2669) — the raw
+      // TUI capture is not markdown.
+      literalText: true,
       throttleMs: params.throttleMs ?? 600,
     })
     params.map.set(key, stream)
@@ -404,8 +407,6 @@ function makeActivityDeps(
 ): StreamReplyDeps {
   return {
     bot,
-    markdownToHtml: (t) => t,
-    escapeMarkdownV2: (t) => t,
     repairEscapedWhitespace: (t) => t,
     assertAllowedChat: () => {},
     resolveThreadId: (_, explicit) => (explicit != null ? Number(explicit) : undefined),
@@ -706,7 +707,7 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
     const deps = makeActivityDeps(bot)
 
     await handleStreamReply(
-      { chat_id: '1', text: '⚙️ Working…', lane: 'progress', format: 'html' },
+      { chat_id: '1', text: '⚙️ Working…', lane: 'progress', format: 'markdown' },
       state, deps,
     )
     await microtaskFlush()
@@ -726,12 +727,12 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
 
     // Turn 1: progress card lives at some messageId.
     await handleStreamReply(
-      { chat_id: '1', text: '⚙️ Working… (turn 1)', lane: 'progress', format: 'html' },
+      { chat_id: '1', text: '⚙️ Working… (turn 1)', lane: 'progress', format: 'markdown' },
       state, deps,
     )
     await microtaskFlush()
     const firstProgressId = state.activeDraftStreams.get('1:_:progress')!.getMessageId()
-    const sendsBefore = bot.api.sendMessage.mock.calls.length
+    const sendsBefore = bot.api.sendRichMessage.mock.calls.length
 
     // turn_end closes the progress lane.
     await modelCloseProgressLane(state, '1', undefined)
@@ -741,7 +742,7 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
     // edit the previous one — this is what prevents the shrink-flicker
     // described in the bug report.
     await handleStreamReply(
-      { chat_id: '1', text: '⚙️ Working… (turn 2)', lane: 'progress', format: 'html' },
+      { chat_id: '1', text: '⚙️ Working… (turn 2)', lane: 'progress', format: 'markdown' },
       state, deps,
     )
     await microtaskFlush()
@@ -749,6 +750,6 @@ describe('PTY activity-lane wiring (onActivity → stream_reply lane="activity")
     expect(state.activeDraftStreams.has('1:_:progress')).toBe(true)
     const secondProgressId = state.activeDraftStreams.get('1:_:progress')!.getMessageId()
     expect(secondProgressId).not.toBe(firstProgressId)
-    expect(bot.api.sendMessage.mock.calls.length).toBe(sendsBefore + 1)
+    expect(bot.api.sendRichMessage.mock.calls.length).toBe(sendsBefore + 1)
   })
 })

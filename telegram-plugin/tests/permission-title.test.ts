@@ -128,7 +128,7 @@ describe('formatPermissionCardBody', () => {
       agentName: 'gymbro',
     })
     expect(body).toBe(
-      ['🔐 <b>Gymbro</b> wants to edit: supplement-log.md', 'why: <i>logging today\'s lifts</i>'].join('\n'),
+      ['🔐 **Gymbro** wants to edit: supplement-log.md', 'why: _logging today\'s lifts_'].join('\n'),
     )
   })
 
@@ -141,7 +141,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Restart an agent via the host-control daemon. cross-agent (`name` ≠ $SWITCHROOM_AGENT_NAME) …',
       agentName: 'carrie',
     })
-    expect(body).toContain('why: <i>gateway is wedged, bouncing it</i>')
+    expect(body).toContain('why: _gateway is wedged, bouncing it_')
     expect(body).not.toContain('$SWITCHROOM_AGENT_NAME')
     expect(body).not.toContain('host-control daemon')
   })
@@ -153,7 +153,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Run a shell command.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: <i>listing temp files</i>')
+    expect(body).toContain('why: _listing temp files_')
   })
 
   test('shows "not provided" when no caller reason is present (never the description)', () => {
@@ -163,7 +163,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Run a shell command on the host.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: <i>not provided</i>')
+    expect(body).toContain('why: _not provided_')
     expect(body).not.toContain('Run a shell command')
   })
 
@@ -174,7 +174,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Run a shell command.',
       agentName: 'gymbro',
     })
-    expect(body).toContain('why: <i>not provided</i>')
+    expect(body).toContain('why: _not provided_')
   })
 
   test('drops the agent prefix when agentName is null (early-boot edge)', () => {
@@ -184,21 +184,23 @@ describe('formatPermissionCardBody', () => {
       description: 'Use a skill.',
       agentName: null,
     })
-    expect(body).toBe(['🔐 Use the mail skill', 'why: <i>do the thing</i>'].join('\n'))
+    expect(body).toBe(['🔐 Use the mail skill', 'why: _do the thing_'].join('\n'))
   })
 
-  test('HTML-escapes <, >, & in agentName / action / reason', () => {
+  test('markdown-escapes emphasis specials in agentName / action / reason; passes < > & through (#2669)', () => {
     const body = formatPermissionCardBody({
       toolName: 'Bash',
-      inputPreview: JSON.stringify({ command: 'echo "a < b && c > d"', reason: 'compare a < b & c > d' }),
+      inputPreview: JSON.stringify({ command: 'echo "a_b *c*"', reason: 'compare a_b and c < d' }),
       description: 'Run a shell command.',
-      agentName: 'agent<test>',
+      agentName: 'agent_test',
     })
-    expect(body).toContain('&lt;test&gt;')
-    expect(body).toContain('&amp;')
-    expect(body).not.toContain('<test>')
-    expect(body).toContain('<b>')
-    expect(body).toContain('<i>')
+    // < > & are literal in rich markdown; the underscore in the agent name is
+    // backslash-escaped so it can't open an italic run.
+    expect(body).toContain('Agent\\_test')
+    expect(body).toContain('c < d')
+    // The card's own wrappers (** for the name, _ for the why line) are present.
+    expect(body).toContain('**')
+    expect(body).toContain('why: _')
   })
 
   test('truncates a very long caller reason with an ellipsis', () => {
@@ -208,8 +210,8 @@ describe('formatPermissionCardBody', () => {
       description: 'Use a skill.',
       agentName: 'clerk',
     })
-    expect(body).toContain('xxxx…</i>')
-    expect(body.split('\n')[0]).toBe('🔐 <b>Clerk</b> wants to use the mail skill')
+    expect(body).toContain('xxxx…_')
+    expect(body.split('\n')[0]).toBe('🔐 **Clerk** wants to use the mail skill')
   })
 
   test('collapses internal whitespace in the caller reason', () => {
@@ -219,7 +221,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Use a skill.',
       agentName: 'clerk',
     })
-    expect(body).toContain('why: <i>first second paragraph</i>')
+    expect(body).toContain('why: _first second paragraph_')
   })
 
   // config-edit-hardening: upstream Claude Code truncates `inputPreview`
@@ -247,7 +249,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Propose a unified-diff patch against switchroom.yaml.',
       agentName: 'klanker',
     })
-    expect(body).toContain(`why: <i>${reason}</i>`)
+    expect(body).toContain(`why: _${reason}_`)
     expect(body).not.toContain('not provided')
   })
 
@@ -263,7 +265,7 @@ describe('formatPermissionCardBody', () => {
       description: 'desc',
       agentName: 'klanker',
     })
-    expect(body).toContain(`why: <i>${reason}</i>`)
+    expect(body).toContain(`why: _${reason}_`)
   })
 
   // #2469: hostd agent_* cards must name WHICH agent is targeted, pulled
@@ -275,7 +277,7 @@ describe('formatPermissionCardBody', () => {
       description: 'Restart an agent via the host-control daemon. $SWITCHROOM_AGENT_NAME …',
       agentName: 'klanker',
     })
-    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to restart agent `carrie` in the fleet')
+    expect(body.split('\n')[0]).toBe('🔐 **Klanker** wants to restart agent `carrie` in the fleet')
   })
 
   test('hostd start/stop/logs/exec each name the target agent (#2469)', () => {
@@ -286,10 +288,10 @@ describe('formatPermissionCardBody', () => {
         description: 'static schema doc',
         agentName: 'klanker',
       }).split('\n')[0]
-    expect(mk('mcp__hostd__agent_start')).toBe('🔐 <b>Klanker</b> wants to start agent `pixel` in the fleet')
-    expect(mk('mcp__hostd__agent_stop')).toBe('🔐 <b>Klanker</b> wants to stop agent `pixel` in the fleet')
-    expect(mk('mcp__hostd__agent_logs')).toBe("🔐 <b>Klanker</b> wants to read agent `pixel`'s container logs")
-    expect(mk('mcp__hostd__agent_exec')).toBe('🔐 <b>Klanker</b> wants to run a read-only inspection inside agent `pixel`')
+    expect(mk('mcp__hostd__agent_start')).toBe('🔐 **Klanker** wants to start agent `pixel` in the fleet')
+    expect(mk('mcp__hostd__agent_stop')).toBe('🔐 **Klanker** wants to stop agent `pixel` in the fleet')
+    expect(mk('mcp__hostd__agent_logs')).toBe("🔐 **Klanker** wants to read agent `pixel`'s container logs")
+    expect(mk('mcp__hostd__agent_exec')).toBe('🔐 **Klanker** wants to run a read-only inspection inside agent `pixel`')
   })
 
   test('hostd agent verb without a name arg falls back to the generic phrase (no crash) (#2469)', () => {
@@ -299,8 +301,8 @@ describe('formatPermissionCardBody', () => {
       description: 'static schema doc',
       agentName: 'klanker',
     })
-    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to restart an agent in the fleet')
-    expect(body).toContain('why: <i>bouncing the fleet</i>')
+    expect(body.split('\n')[0]).toBe('🔐 **Klanker** wants to restart an agent in the fleet')
+    expect(body).toContain('why: _bouncing the fleet_')
   })
 
   test('non-name-arg gated verb (update_apply) stays generic and does not break (#2469)', () => {
@@ -310,8 +312,8 @@ describe('formatPermissionCardBody', () => {
       description: 'static schema doc',
       agentName: 'klanker',
     })
-    expect(body.split('\n')[0]).toBe('🔐 <b>Klanker</b> wants to apply a fleet-wide update (pull + recreate)')
-    expect(body).toContain('why: <i>rolling out v0.16</i>')
+    expect(body.split('\n')[0]).toBe('🔐 **Klanker** wants to apply a fleet-wide update (pull + recreate)')
+    expect(body).toContain('why: _rolling out v0.16_')
   })
 
   // Clarity fix: the card gains a third "↳" line summarizing the REST
@@ -330,8 +332,8 @@ describe('formatPermissionCardBody', () => {
       agentName: 'marko',
     })
     const lines = body.split('\n')
-    expect(lines[0]).toBe('🔐 <b>Marko</b> wants to POST /smtp/email (Brevo)')
-    expect(lines[1]).toBe('why: <i>sending the priority-access invite</i>')
+    expect(lines[0]).toBe('🔐 **Marko** wants to POST /smtp/email (Brevo)')
+    expect(lines[1]).toBe('why: _sending the priority-access invite_')
     // Third line: scalar keys show value; the nested `to` array shows key-only.
     expect(lines[2]).toContain('↳')
     expect(lines[2]).toContain('subject: Priority access')
@@ -411,7 +413,7 @@ describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
         behavior: 'allow',
         action: 'edit: supplement-log.md',
       }),
-    ).toBe('▶️ <b>Gymbro</b> — got it, continuing: <i>edit: supplement-log.md</i>')
+    ).toBe('▶️ **Gymbro** — got it, continuing: _edit: supplement-log.md_')
   })
 
   test('deny names what it will skip, lower-cased inline', () => {
@@ -421,7 +423,7 @@ describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
         behavior: 'deny',
         action: 'Search the web',
       }),
-    ).toBe("🚫 <b>Ziggy</b> — noted, I won't search the web. Continuing without it.")
+    ).toBe("🚫 **Ziggy** — noted, I won't search the web. Continuing without it.")
   })
 
   test('TTL auto-deny variant reads as a timeout, not a tap', () => {
@@ -432,17 +434,19 @@ describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
         action: 'run: deploy.sh',
         timeoutMinutes: 5,
       }),
-    ).toBe('🚫 <b>Finn</b> — no answer in 5m, continuing without it (<i>run: deploy.sh</i>).')
+    ).toBe('🚫 **Finn** — no answer in 5m, continuing without it (_run: deploy.sh_).')
   })
 
-  test('HTML-escapes a hostile action phrase (no raw </>& injection)', () => {
+  test('markdown-escapes a hostile action phrase (no raw ** emphasis injection) (#2669)', () => {
     const out = formatPermissionResumeMessage({
       agentName: 'clerk',
       behavior: 'allow',
-      action: 'run: echo <b>&"pwned"</b>',
+      action: 'run: echo **pwned**',
     })
-    expect(out).toContain('&lt;b&gt;&amp;')
-    expect(out).not.toContain('<b>&"pwned"')
+    // The injected ** markers are backslash-escaped so they render literally
+    // and cannot hijack the card's own emphasis.
+    expect(out).toContain('\\*\\*pwned\\*\\*')
+    expect(out).not.toContain('echo **pwned**')
   })
 
   test('cap-first on the agent name', () => {
@@ -451,22 +455,22 @@ describe('formatPermissionResumeMessage — agent-voiced verdict ack', () => {
       behavior: 'allow',
       action: 'read: contract.pdf',
     })
-    expect(out).toContain('<b>Lawgpt</b>')
+    expect(out).toContain('**Lawgpt**')
   })
 
   test('empty action falls back to a generic continue (no dangling phrase)', () => {
     expect(
       formatPermissionResumeMessage({ agentName: 'carrie', behavior: 'allow', action: '' }),
-    ).toBe('▶️ <b>Carrie</b> — got it, back to work.')
+    ).toBe('▶️ **Carrie** — got it, back to work.')
     expect(
       formatPermissionResumeMessage({ agentName: 'carrie', behavior: 'deny', action: '   ' }),
-    ).toBe('🚫 <b>Carrie</b> — noted, continuing without it.')
+    ).toBe('🚫 **Carrie** — noted, continuing without it.')
   })
 
   test('null agent name degrades to a neutral "Agent" label', () => {
     expect(
       formatPermissionResumeMessage({ agentName: null, behavior: 'allow', action: 'edit: x.md' }),
-    ).toBe('▶️ <b>Agent</b> — got it, continuing: <i>edit: x.md</i>')
+    ).toBe('▶️ **Agent** — got it, continuing: _edit: x.md_')
   })
 })
 

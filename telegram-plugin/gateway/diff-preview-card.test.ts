@@ -45,8 +45,8 @@ describe("buildDiffPreviewCard — suggest mode (default)", () => {
       writeRequestId: "11223344112233441122334411223344",
     });
 
-    // Body: title bold + all preview lines.
-    expect(card.text).toContain("<b>");
+    // Body: title bold (markdown **) + all preview lines.
+    expect(card.text).toContain("**");
     expect(card.text).toContain("klanker");
     expect(card.text).toContain("Q3 Strategy Notes");
     expect(card.text).toContain("📍 after heading 'Goals' (level 2)");
@@ -152,20 +152,20 @@ describe("buildDiffPreviewCard — fragility guards", () => {
       preview,
       suggestRequestId: "aabbccddaabbccddaabbccddaabbccdd",
     });
-    expect(card.text).not.toContain("<script>");
-    expect(card.text).toContain("&lt;script&gt;");
+    // < > are literal in rich markdown — the doc name is shown verbatim and
+    // cannot inject formatting (#2669).
+    expect(card.text).toContain("<script>");
   });
 
-  it("HTML-escapes the agent-supplied summary", () => {
+  it("passes < > & literally in the agent-supplied summary; escapes emphasis specials (#2669)", () => {
     const preview = buildDiffPreview(
-      baseInput({ agentSummary: "Hi <b>bold</b> & <i>tags</i>" }),
+      baseInput({ agentSummary: "Hi <tag> & a_b" }),
     );
     const card = buildDiffPreviewCard({
       preview,
       suggestRequestId: "aabbccddaabbccddaabbccddaabbccdd",
     });
-    expect(card.text).not.toMatch(/💬.*<b>/);
-    expect(card.text).toContain("&lt;b&gt;");
+    expect(card.text).toContain("<tag> & a\\_b");
   });
 });
 

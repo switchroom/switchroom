@@ -288,13 +288,13 @@ describe('formatModelUnavailableCard — actionable card', () => {
       { now: NOW },
     )
     expect(card).toMatchInlineSnapshot(`
-      "⚠️ <b>Model unavailable</b> on agent <b>gymbro</b>
+      "⚠️ **Model unavailable** on agent **gymbro**
       Reason: quota exhausted (resets in 5h)
 
-      <b>What to try</b>
-      • <code>/auth use &lt;label&gt;</code> — switch the fleet to a healthy account
-      • <code>/auth add</code> — attach another subscription
-      • <code>/usage</code> — show quota breakdown"
+      **What to try**
+      • \`/auth use <label>\` — switch the fleet to a healthy account
+      • \`/auth add\` — attach another subscription
+      • \`/usage\` — show quota breakdown"
     `)
   })
 
@@ -330,9 +330,9 @@ describe('formatModelUnavailableCard — actionable card', () => {
 
   it('default (no autoFallback) variant includes the actionable suggestions', () => {
     const card = formatModelUnavailableCard(detection('quota_exhausted'), 'gymbro', { now: NOW })
-    expect(card).toContain('<code>/auth use')
-    expect(card).toContain('<code>/auth add</code>')
-    expect(card).toContain('<code>/usage</code>')
+    expect(card).toContain('`/auth use')
+    expect(card).toContain('`/auth add`')
+    expect(card).toContain('`/usage`')
     // Regression — `/authfallback` is no longer a verb (post-RFC-H);
     // pre-fix the card lied by suggesting it.
     expect(card).not.toContain('/authfallback')
@@ -343,17 +343,17 @@ describe('formatModelUnavailableCard — actionable card', () => {
       slot: 'pro-1',
       now: NOW,
     })
-    expect(card).toContain('slot <b>pro-1</b>')
+    expect(card).toContain('slot **pro-1**')
   })
 
-  it('escapes HTML in agent and slot names', () => {
+  it('passes < > literally in agent and slot names (markdown, #2669)', () => {
+    // < > " are literal in rich markdown; emphasis specials are escaped.
     const card = formatModelUnavailableCard(detection('overload'), '<evil>', {
       slot: '"injected"',
       now: NOW,
     })
-    expect(card).toContain('&lt;evil&gt;')
-    expect(card).toContain('&quot;injected&quot;')
-    expect(card).not.toContain('<evil>')
+    expect(card).toContain('<evil>')
+    expect(card).toContain('"injected"')
   })
 })
 

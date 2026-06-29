@@ -1,78 +1,77 @@
 /**
- * Integration tests for stream-controller HTML parse-failure fallback
- * (issue #657).
+ * Integration tests for the stream-controller parse-failure fallback
+ * (issue #657, post-#2669 rich-message path).
  *
- * Contract:
- *   - When the FIRST sendMessage with parse_mode=HTML returns
- *     `400 Bad Request: can't parse entities`, the recovery is a single
- *     fresh sendMessage with parse_mode stripped — no edit (there is no
- *     message_id to edit yet). Total outbound: ONE message_id, not two.
- *   - When a subsequent editMessageText with parse_mode=HTML returns the
- *     same 400, the recovery is editMessageText AGAIN on the same
- *     message_id (with parse_mode stripped). Never sendMessage.
+ * Contract (unchanged dup-message semantics, new rich transport):
+ *   - When the FIRST `sendRichMessage({ markdown })` returns
+ *     `400 Bad Request: can't parse entities`, recovery is a single fresh
+ *     plain `sendMessage` (the raw markdown as a literal string, no parser)
+ *     — no edit (there is no message_id to edit yet). Total outbound: ONE
+ *     message_id, not two.
+ *   - When a subsequent `editMessageText({ markdown })` returns the same
+ *     400, recovery is `editMessageText` AGAIN on the same message_id with
+ *     a PLAIN string (no rich wrapper). Never a fresh send.
  *
  * The previous behaviour (the bug #657 fixes) was a duplicate plain-text
- * sendMessage on every HTML parse rejection — visible to the user as two
- * messages, one with raw `<b>` tags and one rendered correctly.
+ * sendMessage on every parse rejection — visible to the user as two
+ * messages, one raw and one rendered correctly.
  */
 
 import { describe, it, expect, vi } from 'vitest'
 import { createStreamController } from '../stream-controller.js'
 import { createFakeBotApi, errors } from './fake-bot-api.js'
 
-describe('stream-controller HTML parse-failure fallback (#657)', () => {
-  it('first send: parse-entities 400 → ONE retry without parse_mode, same outbound count', async () => {
+describe('stream-controller parse-failure fallback (#657)', () => {
+  it('first rich send: parse-entities 400 → ONE plain-text retry, same outbound count', async () => {
     const bot = createFakeBotApi({ startMessageId: 1000 })
-    // Inject a parse-entities 400 for the first sendMessage. The
-    // controller must catch it and retry with parse_mode stripped.
+    // Inject a parse-entities 400 for the first sendRichMessage. The
+    // controller must catch it and retry as a plain sendMessage.
     bot.faults.next(
-      'sendMessage',
+      'sendRichMessage',
       errors.badRequest("can't parse entities: Unsupported start tag \"frobnicate\""),
     )
 
     const stream = createStreamController({
       bot: bot as unknown as { api: ReturnType<typeof createFakeBotApi>['api'] },
       chatId: 'c1',
-      parseMode: 'HTML',
       throttleMs: 0,
     })
 
-    await stream.update('<frobnicate>hello</frobnicate>')
+    await stream.update('**broken _markdown')
     await stream.finalize()
 
     // Exactly one message landed.
     expect(bot.state.sent).toHaveLength(1)
-    // The recovery send had no parse_mode.
-    expect(bot.state.sent[0].parse_mode).toBeUndefined()
-    // The body was rendered as plain text (tags stripped).
-    expect(bot.state.sent[0].text).toContain('hello')
-    expect(bot.state.sent[0].text).not.toContain('<frobnicate>')
+    // The recovery send was a plain sendMessage, not a rich one.
+    expect(bot.state.sent[0].rich).toBeFalsy()
+    // The raw markdown body shipped verbatim as the literal fallback.
+    expect(bot.state.sent[0].text).toBe('**broken _markdown')
     // The stream's message id matches the surviving send.
     expect(stream.getMessageId()).toBe(bot.state.sent[0].message_id)
   })
 
-  it('edit on existing message: parse-entities 400 → editMessageText retry on SAME id, never sendMessage', async () => {
+  it('edit on existing message: parse-entities 400 → plain editMessageText on SAME id, never a fresh send', async () => {
     const bot = createFakeBotApi({ startMessageId: 2000 })
 
     const stream = createStreamController({
       bot: bot as unknown as { api: ReturnType<typeof createFakeBotApi>['api'] },
       chatId: 'c1',
-      parseMode: 'HTML',
       throttleMs: 0,
     })
 
-    // First update lands cleanly as a sendMessage.
-    await stream.update('<b>v1</b>')
+    // First update lands cleanly as a rich send.
+    await stream.update('**v1**')
     expect(bot.state.sent).toHaveLength(1)
+    expect(bot.state.sent[0].rich).toBe(true)
     const firstId = bot.state.sent[0].message_id
 
     // Second update: inject a parse-entities 400 on editMessageText.
     bot.faults.next(
       'editMessageText',
-      errors.badRequest("can't parse entities: Unmatched end tag at byte offset 12"),
+      errors.badRequest("can't parse entities: Can't find end of the entity"),
     )
 
-    await stream.update('<b>v2 broken</b><i>extra')
+    await stream.update('**v2 broken _extra')
     await stream.finalize()
 
     // Critical assertion: still ONE outbound message_id total — the
@@ -86,13 +85,13 @@ describe('stream-controller HTML parse-failure fallback (#657)', () => {
     for (const call of editCalls) {
       expect(call[1]).toBe(firstId) // same message_id
     }
-    // The final edit had parse_mode stripped (key absent).
+    // The final edit passed a PLAIN string (the fallback), not { markdown }.
     const finalCall = editCalls[editCalls.length - 1]
-    expect(finalCall[3].parse_mode).toBeUndefined()
-    // The stored text reflects the plain-text fallback.
+    expect(typeof finalCall[2]).toBe('string')
+    expect(finalCall[2]).toBe('**v2 broken _extra')
+    // The stored text reflects the plain-text fallback body.
     const finalText = bot.state.currentText.get(firstId)
-    expect(finalText).toBeDefined()
-    expect(finalText).not.toContain('<b>')
+    expect(finalText).toBe('**v2 broken _extra')
   })
 
   it('non-parse 400 (e.g. message-not-found) is NOT swallowed by the fallback', async () => {
@@ -101,25 +100,24 @@ describe('stream-controller HTML parse-failure fallback (#657)', () => {
     const stream = createStreamController({
       bot: bot as unknown as { api: ReturnType<typeof createFakeBotApi>['api'] },
       chatId: 'c1',
-      parseMode: 'HTML',
       throttleMs: 0,
     })
 
-    await stream.update('<b>v1</b>')
+    await stream.update('**v1**')
     const firstId = bot.state.sent[0].message_id
 
     // Inject message-not-found on the next edit. This is NOT a parse
     // error — the existing not-found recovery in draft-stream.ts should
-    // handle it (clear messageId, re-send) and our parse-fallback
-    // wrapper must let it propagate.
+    // handle it (clear messageId, re-send) and the parse-fallback wrapper
+    // must let it propagate.
     bot.faults.next('editMessageText', errors.messageToEditNotFound())
 
-    await stream.update('<b>v2</b>')
+    await stream.update('**v2**')
     await stream.finalize()
 
     // The not-found recovery path produces a fresh send — that's the
-    // pre-existing contract. We're asserting it still fires after our
-    // changes (i.e. we didn't accidentally catch this error class too).
+    // pre-existing contract. We're asserting it still fires (i.e. the
+    // parse-fallback didn't accidentally catch this error class too).
     // After: 1 original send + 1 re-send = 2 messages.
     expect(bot.state.sent.length).toBeGreaterThanOrEqual(2)
     expect(bot.state.sent[0].message_id).toBe(firstId)

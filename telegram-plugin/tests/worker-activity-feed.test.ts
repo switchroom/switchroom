@@ -75,12 +75,12 @@ describe('renderWorkerActivity', () => {
 
   it('renders the native header + running status + step feed', () => {
     const out = renderWorkerActivity(view())
-    expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
+    expect(out).toContain('🛠 **Worker** · _research competitors_')
     // Unified header: running shows "<elapsed> · N tools" (no "running ·" word).
-    expect(out).toContain('<i>10s · 3 tools</i>')
+    expect(out).toContain('_10s · 3 tools_')
     expect(out).toContain('3 tools')
     // No narrativeLines → the latestSummary surfaces as the newest `→` step.
-    expect(out).toContain('<b>→ scanning vendor pages</b>')
+    expect(out).toContain('**→ scanning vendor pages**')
     // The old tool/arg chrome is gone.
     expect(out).not.toContain('⚡')
     expect(out).not.toContain('<code>')
@@ -88,7 +88,7 @@ describe('renderWorkerActivity', () => {
 
   it('shows a "starting…" line when no step has run yet', () => {
     const out = renderWorkerActivity(view({ lastTool: null, latestSummary: '' }))
-    expect(out).toContain('🛠 <b>Worker</b>')
+    expect(out).toContain('🛠 **Worker**')
     expect(out).toContain('starting…')
     expect(out).not.toContain('→')
   })
@@ -109,22 +109,22 @@ describe('renderWorkerActivity', () => {
     const out = renderWorkerActivity(
       view({ state: 'done', toolCount: 5, latestSummary: 'PR #21 opened' }),
     )
-    expect(out).toContain('🛠 <b>Worker</b> · <i>research competitors</i>')
+    expect(out).toContain('🛠 **Worker** · _research competitors_')
     // Unified done header: "done · N tools · <elapsed>".
-    expect(out).toContain('<i>done · 5 tools · ')
+    expect(out).toContain('_done · 5 tools · ')
     expect(out).toContain('─────')
-    expect(out).toContain('✅ <i>PR #21 opened</i>')
+    expect(out).toContain('✅ _PR #21 opened_')
     // latestSummary is the RESULT on the finished path, never also a step.
-    expect(out).not.toContain('<i>✓ PR #21 opened</i>')
+    expect(out).not.toContain('_✓ PR #21 opened_')
   })
 
   it('renders a failed terminal recap', () => {
     const out = renderWorkerActivity(view({ state: 'failed', latestSummary: 'blew up' }))
     // The header word reflects the failure (`failed · …`) AND the ⚠️ result
     // block carries the detail — the two signals are complementary.
-    expect(out).toContain('<i>failed · ')
-    expect(out).not.toContain('<i>done · ')
-    expect(out).toContain('⚠️ <i>blew up</i>')
+    expect(out).toContain('_failed · ')
+    expect(out).not.toContain('_done · ')
+    expect(out).toContain('⚠️ _blew up_')
   })
 
   it('a failed worker with EMPTY result is never byte-identical to a done worker (regression: #2553 failure-honesty)', () => {
@@ -136,15 +136,15 @@ describe('renderWorkerActivity', () => {
     // (b) The failed render carries a visible failure marker even with no
     //     result block (the `failed` header word and/or the ⚠️ emoji).
     expect(failed.includes('failed') || failed.includes('⚠️')).toBe(true)
-    expect(failed).toContain('<i>failed · ')
+    expect(failed).toContain('_failed · ')
     // The done render must NOT read as failed.
-    expect(done).toContain('<i>done · ')
+    expect(done).toContain('_done · ')
     expect(done).not.toContain('failed')
   })
 
   it('omits the rule + result line when the terminal result is empty', () => {
     const out = renderWorkerActivity(view({ state: 'done', latestSummary: '   ' }))
-    expect(out).toContain('<i>done · ')
+    expect(out).toContain('_done · ')
     expect(out).not.toContain('─────')
   })
 
@@ -155,9 +155,9 @@ describe('renderWorkerActivity', () => {
         narrativeLines: ['read the brief', 'scanned vendor A', 'scanned vendor B'],
       }),
     )
-    expect(out).toContain('<i>✓ read the brief</i>')
-    expect(out).toContain('<i>✓ scanned vendor A</i>')
-    expect(out).toContain('<b>→ scanned vendor B</b>')
+    expect(out).toContain('_✓ read the brief_')
+    expect(out).toContain('_✓ scanned vendor A_')
+    expect(out).toContain('**→ scanned vendor B**')
     // The single-line latestSummary fallback is NOT used when a block is present.
     expect(out).not.toContain('newest only')
     expect(stepCount(out)).toBe(3)
@@ -165,14 +165,14 @@ describe('renderWorkerActivity', () => {
 
   it('falls back to latestSummary when narrativeLines is empty', () => {
     const out = renderWorkerActivity(view({ narrativeLines: [], latestSummary: 'one line' }))
-    expect(out).toContain('<b>→ one line</b>')
+    expect(out).toContain('**→ one line**')
     expect(stepCount(out)).toBe(1)
   })
 
   it('drops blank narrative lines from the feed', () => {
     const out = renderWorkerActivity(view({ narrativeLines: ['kept', '   ', 'also kept'] }))
-    expect(out).toContain('<i>✓ kept</i>')
-    expect(out).toContain('<b>→ also kept</b>')
+    expect(out).toContain('_✓ kept_')
+    expect(out).toContain('**→ also kept**')
     expect(stepCount(out)).toBe(2)
   })
 
@@ -180,33 +180,39 @@ describe('renderWorkerActivity', () => {
     const total = STATUS_ROLLING_LINES + 3
     const lines = Array.from({ length: total }, (_, i) => `step ${i + 1}`)
     const out = renderWorkerActivity(view({ narrativeLines: lines }))
-    expect(out).toContain(`<i>✓ +${total - STATUS_ROLLING_LINES} earlier…</i>`)
+    expect(out).toContain(`_✓ +${total - STATUS_ROLLING_LINES} earlier…_`)
     expect(out).not.toContain('step 1<')
     const firstVisible = total - STATUS_ROLLING_LINES + 1
-    expect(out).toContain(`<i>✓ step ${firstVisible}</i>`)
-    expect(out).toContain(`<b>→ step ${total}</b>`)
+    expect(out).toContain(`_✓ step ${firstVisible}_`)
+    expect(out).toContain(`**→ step ${total}**`)
     // STATUS_ROLLING_LINES visible step lines (the overflow header isn't a step).
     expect(out.match(/step \d/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
   })
 
-  it('strips Markdown markup from narrative + description + result', () => {
+  it('strips the CONTENT Markdown markup (the card keeps its own ** / _ wrappers, #2669)', () => {
+    // Post-#2669 the card itself is rich markdown — the header is **Worker**
+    // and steps are _✓ …_ / **→ …**. The per-line pipeline still runs
+    // stripMarkdown over the user-supplied CONTENT so a model-authored
+    // `**full**` / `` `git push` `` doesn't inject extra emphasis, but the
+    // card's own wrapper markup is expected.
     const running = renderWorkerActivity(
       view({
         description: '**Build** the `sync`',
         narrativeLines: ['- ran the **full** suite', '`git push`'],
       }),
     )
-    expect(running).toContain('🛠 <b>Worker</b> · <i>Build the sync</i>')
+    expect(running).toContain('🛠 **Worker** · _Build the sync_')
     expect(running).toContain('ran the full suite')
     expect(running).toContain('git push')
-    expect(running).not.toContain('**')
+    // The CONTENT bold/code markers were stripped — no `**full**`, no backticks.
+    expect(running).not.toContain('**full**')
     expect(running).not.toContain('`')
 
     const done = renderWorkerActivity(
       view({ state: 'done', latestSummary: '## Done\n\n**PR #21** opened\n\n---\n`merged`' }),
     )
     expect(done).toContain('Done PR #21 opened merged')
-    expect(done).not.toContain('**')
+    expect(done).not.toContain('**PR #21**')
     expect(done).not.toContain('`')
     // The card's own divider is the box-drawing rule, never a raw `---`.
     expect(done).not.toMatch(/(^|\n)\s*-{3,}\s*(\n|$)/)
@@ -227,17 +233,19 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain('Done. Summary Fixed the bug where a bad password logged you out')
   })
 
-  it('escapes HTML inside narrative lines', () => {
-    const out = renderWorkerActivity(view({ narrativeLines: ['a <b>x</b> & y'] }))
-    expect(out).toContain('a &lt;b&gt;x&lt;/b&gt; &amp; y')
+  it('markdown-escapes emphasis specials inside narrative lines; passes < > & through (#2669)', () => {
+    // The per-line pipeline strips paired markdown then escapes survivors.
+    // `<`, `>`, `&` are literal in rich markdown; an intra-word `_` is escaped.
+    const out = renderWorkerActivity(view({ narrativeLines: ['a <tag> & b_c y'] }))
+    expect(out).toContain('a <tag> & b\\_c y')
   })
 
-  it('escapes HTML in description and summary', () => {
+  it('markdown-escapes specials in description; passes < > & through', () => {
     const out = renderWorkerActivity(
-      view({ description: 'a <b>bold</b> task', latestSummary: 'a > b' }),
+      view({ description: 'a <tag> task b_c', latestSummary: 'a > b' }),
     )
-    expect(out).toContain('a &lt;b&gt;bold&lt;/b&gt; task')
-    expect(out).toContain('a &gt; b')
+    expect(out).toContain('a <tag> task b\\_c')
+    expect(out).toContain('a > b')
   })
 })
 
@@ -261,7 +269,10 @@ describe('createWorkerActivityFeed', () => {
     await feed.update('w1', 'chat', view({ elapsedMs: 9000 }))
     expect(bot.sent).toHaveLength(1)
     expect(bot.sent[0].chatId).toBe('chat')
-    expect(bot.sent[0].opts?.parse_mode).toBe('HTML')
+    // #2669: the worker feed body is raw GFM markdown sent through the rich
+    // path (the gateway wires sendMessage → sendRichMessage). No parse_mode.
+    expect(bot.sent[0].opts?.parse_mode).toBeUndefined()
+    expect(bot.sent[0].text).toContain('🛠 **Worker**')
     expect(feed.has('w1')).toBe(true)
   })
 
@@ -303,7 +314,7 @@ describe('createWorkerActivityFeed', () => {
     clock = 10_500 // well within the throttle window
     await feed.finish('w1', view({ state: 'done', toolCount: 5 }))
     expect(bot.edits).toHaveLength(1)
-    expect(bot.edits[0].text).toContain('<i>done · 5 tools · ')
+    expect(bot.edits[0].text).toContain('_done · 5 tools · ')
     // finish forgets the worker.
     expect(feed.has('w1')).toBe(false)
     expect(feed.size).toBe(0)
@@ -387,7 +398,7 @@ describe('createWorkerActivityFeed', () => {
 
     await feed.update('w1', 'chat', view({ toolCount: 1, latestSummary: 'read the brief' }))
     expect(bot.sent).toHaveLength(1)
-    expect(bot.sent[0].text).toContain('<b>→ read the brief</b>')
+    expect(bot.sent[0].text).toContain('**→ read the brief**')
 
     clock = 11_000
     await feed.update('w1', 'chat', view({ toolCount: 2, latestSummary: 'scanned vendor A' }))
@@ -395,9 +406,9 @@ describe('createWorkerActivityFeed', () => {
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'scanned vendor B' }))
 
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('<i>✓ read the brief</i>')
-    expect(last.text).toContain('<i>✓ scanned vendor A</i>')
-    expect(last.text).toContain('<b>→ scanned vendor B</b>')
+    expect(last.text).toContain('_✓ read the brief_')
+    expect(last.text).toContain('_✓ scanned vendor A_')
+    expect(last.text).toContain('**→ scanned vendor B**')
     expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(3)
   })
 
@@ -451,9 +462,9 @@ describe('createWorkerActivityFeed', () => {
     clock = 13_000
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'line C' }))
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('<i>✓ line A</i>')
-    expect(last.text).toContain('<i>✓ line B</i>')
-    expect(last.text).toContain('<b>→ line C</b>')
+    expect(last.text).toContain('_✓ line A_')
+    expect(last.text).toContain('_✓ line B_')
+    expect(last.text).toContain('**→ line C**')
   })
 
   it('forwards threadId as message_thread_id on send', async () => {
@@ -543,8 +554,8 @@ describe('rolling window + STATUS_LINE_MAX — renderWorkerActivity', () => {
       expect(out).not.toContain(`stp-${String(i).padStart(3, '0')}`)
     }
     // Overflow header now appears on the worker surface too.
-    expect(out).toContain(`<i>✓ +${12 - STATUS_ROLLING_LINES} earlier…</i>`)
-    expect(out).toContain('<b>→ stp-012</b>')
+    expect(out).toContain(`_✓ +${12 - STATUS_ROLLING_LINES} earlier…_`)
+    expect(out).toContain('**→ stp-012**')
   })
 
   it('STATUS_LINE_MAX=200: a 250-char line is clipped to 200 with a trailing …', () => {
@@ -601,7 +612,7 @@ describe('rolling window — createWorkerActivityFeed narrative accumulation', (
     // render never sees overflow — no "+N earlier…" marker on the manager path
     // (it surfaces only on direct renderWorkerActivity calls with >5 lines).
     expect(last.text).not.toContain('earlier…')
-    expect(last.text).toContain('<b>→ ln-012</b>')
+    expect(last.text).toContain('**→ ln-012**')
   })
 })
 
@@ -632,7 +643,7 @@ describe('createWorkerActivityFeed — heartbeat', () => {
     await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' })).catch(() => {})
     // Drain the chain.
     await feed.update('w1', 'chat', view({ elapsedMs: 16_000, latestSummary: 'pulling data' }))
-    const edit1 = bot.edits.find((e) => /· \d+s<\/b>/.test(e.text))
+    const edit1 = bot.edits.find((e) => /· \d+s\*\*/.test(e.text))
     expect(edit1).toBeDefined()
     // The suffix reflects the LIVE elapsed (now - dispatchAt), not the stale view.
     expect(edit1!.text).toContain(`· ${Math.floor((26_000 - dispatchAt) / 1000)}s`)
@@ -731,32 +742,23 @@ describe('createWorkerActivityFeed — heartbeat', () => {
 // and the step vanish from the rendered output.
 
 /**
- * Cheap valid-HTML checker: balanced <b>/<i> tags and no dangling/partial entity.
- * Checks for partial entities (e.g. `&am`, `&l`, `&amp` without trailing `;`)
- * as produced by naive slicing of already-escaped HTML at an entity boundary.
+ * Cheap valid-rich-markdown checker (post-#2669): the `**…**` wrappers the
+ * worker renderer emits must be balanced, and no escape backslash may be left
+ * dangling at the very end (it would swallow the following close marker). This
+ * is the markdown analogue of the old "no partial HTML entity at a slice
+ * boundary" check — a naive RAW-slice that split a `\*` escape would surface
+ * here as an odd trailing-backslash count.
  */
-function isValidWorkerHtml(s: string): boolean {
-  const bOpen = (s.match(/<b>/g) ?? []).length
-  const bClose = (s.match(/<\/b>/g) ?? []).length
-  const iOpen = (s.match(/<i>/g) ?? []).length
-  const iClose = (s.match(/<\/i>/g) ?? []).length
-  if (bOpen !== bClose || iOpen !== iClose) return false
-  // Check every `&` occurrence: the run of letters after it must end with `;`.
-  // A partial entity like `&am`, `&l`, or `&amp` (no ;) would fail this.
-  // We scan every `&` manually so there's no regex backtracking ambiguity.
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] !== '&') continue
-    let j = i + 1
-    while (j < s.length && s[j] >= 'a' && s[j] <= 'z') j++
-    // j is now at the character after the letter run.
-    // If there were letters and the next char isn't ';', it's a broken entity.
-    if (j > i + 1 && (j >= s.length || s[j] !== ';')) return false
-  }
+function isValidWorkerMarkdown(s: string): boolean {
+  const bold = (s.match(/\*\*/g) ?? []).length
+  if (bold % 2 !== 0) return false
+  const trailing = /(\\*)$/.exec(s)?.[1].length ?? 0
+  if (trailing % 2 === 1) return false
   return true
 }
 
 describe('extreme-edge: single oversized narrative line (no-truncate ON)', () => {
-  it('no-truncate ON: one ~4100-char step is shown (truncated) not discarded, output ≤ budget and valid HTML', async () => {
+  it('no-truncate ON: one ~4100-char step is shown (truncated) not discarded, output ≤ budget and valid markdown', async () => {
     const bot = makeFakeBot()
     let clock = 10_000
     const feed = createWorkerActivityFeed({ bot, now: () => clock, minEditIntervalMs: 0 })
@@ -780,10 +782,10 @@ describe('extreme-edge: single oversized narrative line (no-truncate ON)', () =>
     expect(out.length).toBeLessThanOrEqual(4096)
 
     // Valid HTML: balanced tags and no partial entity.
-    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(isValidWorkerMarkdown(out)).toBe(true)
   })
 
-  it('no-truncate ON: one ~4100-char step via renderWorkerActivity directly → ≤ budget and valid HTML', () => {
+  it('no-truncate ON: one ~4100-char step via renderWorkerActivity directly → ≤ budget and valid markdown', () => {
     const base = 'compile && link && package && ship: action=deploy env=<prod> flag=1 '
     const hugeStep = base.repeat(65)
     expect(hugeStep.length).toBeGreaterThan(4000)
@@ -795,104 +797,84 @@ describe('extreme-edge: single oversized narrative line (no-truncate ON)', () =>
     expect(hasBullet).toBe(true)
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(isValidWorkerMarkdown(out)).toBe(true)
   })
 })
 
-// ─── Bug 2: _fitWorkerBodyToCharBudget must not slice already-escaped HTML ───
+// ─── Bug 2: fitCardToBudget must not slice already-escaped markdown ──────────
 //
-// Before the fix, the extreme fallback in _fitWorkerBodyToCharBudget sliced
-// directly into the already-HTML-escaped newest line string. If the slice
-// boundary landed inside an HTML entity (&amp;, &lt;, &gt;), the output
-// contained a broken entity fragment (&am, &l, &amp without ;), which
-// Telegram Bot API rejects with HTTP 400 on parse_mode:'HTML'.
-//
-// The fix mirrors _fitToCharBudget (tool-activity-summary.ts): truncate RAW
-// content first, then escape, then wrap, re-checking post-escape because
-// escaping can expand the string (&→&amp; etc.).
-//
-// These tests place entity characters (&, <, >) at positions that, under the
-// old naive slice, would produce exactly the broken fragments the issue
-// identified (&am, &l). They assert the output is valid HTML and within budget.
+// Post-#2669 the wire format is GFM markdown. The same class of bug applies:
+// the extreme budget fallback must truncate the RAW newest line first, THEN
+// escape, THEN wrap — never slice an already-escaped string. A naive slice
+// that landed right after an escape backslash (`\` from a `\*` escape) would
+// leave a dangling backslash that swallows the bold close marker, producing
+// `**→ …\**` → unbalanced. These tests place markdown specials at the slice
+// boundary and assert the output stays valid (balanced ** + no dangling \).
 
-describe('Bug 2 (#2506): _fitWorkerBodyToCharBudget does not split HTML entities', () => {
+describe('Bug 2 (#2506): fitCardToBudget does not split a markdown escape', () => {
   /**
-   * Build a narrative line that, after HTML-escaping, has the entity boundary
-   * at a precise position so a naive `escaped.slice(3, 3 + N)` would split it.
-   *
-   * Strategy: fill with 'x' characters up to a budget, then append an entity
-   * character so the entity starts right where the slice would land.
+   * Build a narrative line whose markdown-special character lands at roughly
+   * the budget boundary so a naive escaped-string slice would cut a `\*`
+   * escape in half.
    */
-  function buildEntityBoundaryLine(entityChar: string, charBudget: number): string {
-    // The fitter computes sliceAt ≈ charBudget - tagOverhead - closingTag.length.
-    // After the "→ " prefix (2 chars) and <b>…</b> wrapper (7 chars total overhead
-    // in the old code), the inner slice window is roughly charBudget - 9.
-    // Place the entity character so it lands at the very start of where the
-    // naive slice would begin — i.e., fill with (charBudget - 9) 'x's then '&'.
+  function buildEscapeBoundaryLine(special: string, charBudget: number): string {
     const fillLen = Math.max(0, charBudget - 9)
-    return 'x'.repeat(fillLen) + entityChar + 'y'.repeat(50)
+    return 'x'.repeat(fillLen) + special + 'y'.repeat(50)
   }
 
-  it('& at entity boundary: output is valid HTML (no &am, &amp without ; etc.)', () => {
-    // A line that places '&' right at the slice boundary so naive cut → &am
-    const line = buildEntityBoundaryLine('&', 4096)
-    expect(line.length).toBeGreaterThan(100) // sanity: line is substantial
+  it("'*' at the budget boundary: output is valid markdown (balanced **, no dangling \\)", () => {
+    const line = buildEscapeBoundaryLine('*', 4096)
+    expect(line.length).toBeGreaterThan(100)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
-    // No partial entity fragments that the old code produced.
-    expect(out).not.toMatch(/&amp$/)   // incomplete &amp; at end
-    expect(out).not.toMatch(/&am[^p]/) // &am followed by non-p (e.g. &amy)
-    expect(out).not.toMatch(/&[lg]t?[^;]/) // &l, &lt without semicolon
+    expect(isValidWorkerMarkdown(out)).toBe(true)
+    expect(out).not.toMatch(/\\$/) // no dangling escape backslash at the end
   })
 
-  it('< at entity boundary: output is valid HTML (no &l, &lt without ; etc.)', () => {
-    const line = buildEntityBoundaryLine('<', 4096)
+  it("'_' at the budget boundary: output is valid markdown", () => {
+    const line = buildEscapeBoundaryLine('_', 4096)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
-    expect(out).not.toMatch(/&lt$/)    // incomplete &lt; at end
-    expect(out).not.toMatch(/&l[^t;]/) // &l followed by non-t
+    expect(isValidWorkerMarkdown(out)).toBe(true)
+    expect(out).not.toMatch(/\\$/)
   })
 
-  it('> at entity boundary: output is valid HTML (no &g, &gt without ; etc.)', () => {
-    const line = buildEntityBoundaryLine('>', 4096)
+  it("'`' (code span) at the budget boundary: output is valid markdown", () => {
+    const line = buildEscapeBoundaryLine('`', 4096)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
-    expect(out).not.toMatch(/&gt$/)    // incomplete &gt; at end
-    expect(out).not.toMatch(/&g[^t;]/) // &g followed by non-t
+    expect(isValidWorkerMarkdown(out)).toBe(true)
+    expect(out).not.toMatch(/\\$/)
   })
 
-  it('entity-dense line (& < > interleaved): output ≤ budget and valid HTML', () => {
-    // Mix entity characters throughout so any slice position is dangerous.
-    const chunk = '&' + 'x'.repeat(3) + '<' + 'y'.repeat(3) + '>' + 'z'.repeat(3)
+  it('special-dense line (* _ ` ~ interleaved): output ≤ budget and valid markdown', () => {
+    // Mix markdown specials throughout so any slice position is dangerous.
+    const chunk = '*' + 'x'.repeat(3) + '_' + 'y'.repeat(3) + '`' + 'z'.repeat(3)
     const line = chunk.repeat(500) // ~10k chars raw → well over budget after escape
     expect(line.length).toBeGreaterThan(4000)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(isValidWorkerMarkdown(out)).toBe(true)
+    expect(out).not.toMatch(/\\$/)
   })
 
-  it('single & alone in the line: valid HTML and within budget', () => {
-    // Regression: a one-char entity line is a degenerate case the while-loop
-    // must handle without infinite-looping or returning empty content.
-    // Build a huge line: filler xs then '&' then more xs
-    const line = 'x'.repeat(3000) + '&' + 'x'.repeat(1000)
+  it('single special alone in a huge line: valid markdown and within budget', () => {
+    const line = 'x'.repeat(3000) + '*' + 'x'.repeat(1000)
     expect(line.length).toBeGreaterThan(4000)
 
     const out = renderWorkerActivity(view({ narrativeLines: [line] }))
 
     expect(out.length).toBeLessThanOrEqual(4096)
-    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(isValidWorkerMarkdown(out)).toBe(true)
+    expect(out).not.toMatch(/\\$/)
   })
 })
 
@@ -913,14 +895,14 @@ describe('header row + rolling overflow survive in the unified worker render', (
     )
     const out = renderWorkerActivity(view({ narrativeLines, toolCount: 7 }))
 
-    expect(out).toContain('🛠 <b>Worker</b>')
+    expect(out).toContain('🛠 **Worker**')
     // Unified running status line.
-    expect(out).toContain('<i>10s · 7 tools</i>')
+    expect(out).toContain('_10s · 7 tools_')
     expect(out).toContain('7 tools')
     // Every rendered line was clipped to STATUS_LINE_MAX → output well within budget.
     expect(out.length).toBeLessThanOrEqual(4096)
     // Newest bullet is the live → step.
-    expect(out).toContain('<b>→ final short step</b>')
+    expect(out).toContain('**→ final short step**')
   })
 
   it('a "+N earlier…" rolling marker appears when more than STATUS_ROLLING_LINES lines render', () => {
@@ -929,11 +911,11 @@ describe('header row + rolling overflow survive in the unified worker render', (
 
     expect(out.length).toBeLessThanOrEqual(4096)
     expect(out).toContain('earlier…')
-    expect(out).toContain('🛠 <b>Worker</b>')
-    expect(out).toContain('<i>10s · ')
+    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('_10s · ')
   })
 
-  it('back-compat path (latestSummary only) still shows a step bullet, clipped + valid HTML', () => {
+  it('back-compat path (latestSummary only) still shows a step bullet, clipped + valid markdown', () => {
     const hugeSummary = 'deploy service && run migrations && verify health checks '.repeat(80)
     expect(hugeSummary.length).toBeGreaterThan(4000)
 
@@ -944,8 +926,8 @@ describe('header row + rolling overflow survive in the unified worker render', (
     expect(out.length).toBeLessThanOrEqual(4096)
     const hasBullet = out.includes('→') || out.includes('✓')
     expect(hasBullet).toBe(true)
-    expect(out).toContain('🛠 <b>Worker</b>')
-    expect(out).toContain('<i>10s · ')
-    expect(isValidWorkerHtml(out)).toBe(true)
+    expect(out).toContain('🛠 **Worker**')
+    expect(out).toContain('_10s · ')
+    expect(isValidWorkerMarkdown(out)).toBe(true)
   })
 })

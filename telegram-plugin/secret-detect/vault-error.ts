@@ -131,6 +131,16 @@ function htmlEscape(s: string): string {
 }
 
 /**
+ * Make a string safe to interpolate INSIDE a `code span` without escaping —
+ * content there is literal, so markdown-escaping a key would leak visible
+ * backslashes (e.g. `my\_key`). Only a backtick can prematurely close the
+ * span, so split it with a zero-width space (#2669).
+ */
+function codeSpanSafe(s: string): string {
+  return s.replace(/`/g, "`​");
+}
+
+/**
  * Compose the user-facing Telegram HTML for a parsed vault error.
  *
  * @param err       Result from parseVaultCliError.
@@ -172,7 +182,7 @@ export function renderVaultCliError(
         html:
           `⚠️ **New vault key — operator approval required.**\n` +
           (key
-            ? `The agent tried to save \`${htmlEscape(key)}\`, but `
+            ? `The agent tried to save \`${codeSpanSafe(key)}\`, but `
             : `The agent tried to save a new key, but `) +
           `agents can only rotate existing keys via the broker; introducing ` +
           `a new key needs an operator action.\n\n` +
@@ -209,7 +219,7 @@ export function renderVaultCliError(
         html:
           `⚠️ **Vault broker refused the request.**\n` +
           (key
-            ? `The agent isn't authorized to access \`${htmlEscape(key)}\`. `
+            ? `The agent isn't authorized to access \`${codeSpanSafe(key)}\`. `
             : `The agent isn't authorized to access this key. `) +
           `Grant access in two taps:\n` +
           `• \`/vault audit <agent>\` in this chat → tap ` +
@@ -239,7 +249,7 @@ function renderSandboxContextSuggestion(
         head +
         (key
           ? `**Ask the agent** to call its \`vault_request_save\` ` +
-            `tool for \`${htmlEscape(key)}\` — an approval card ` +
+            `tool for \`${codeSpanSafe(key)}\` — an approval card ` +
             `lands here with [✅ Save once] / [🚫 Discard] / [✏️ Rename] buttons.`
           : `**Ask the agent** to call its \`vault_request_save\` ` +
             `tool — an approval card lands here with [✅ Save once] / [🚫 Discard] / [✏️ Rename] buttons.`)
@@ -247,7 +257,7 @@ function renderSandboxContextSuggestion(
     case "get":
       return (
         head +
-        `From this chat: \`/vault get${key ? ` ${htmlEscape(key)}` : " <key>"}\``
+        `From this chat: \`/vault get${key ? ` ${codeSpanSafe(key)}` : " <key>"}\``
       );
     case "list":
       return head + `From this chat: \`/vault list\``;

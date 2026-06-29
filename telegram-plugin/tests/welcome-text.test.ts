@@ -30,9 +30,12 @@ const baseMeta: AgentMetadata = {
   auth: null,
 };
 
-describe("escapeHtml", () => {
-  it("escapes &, <, >, \"", () => {
-    expect(escapeHtml('<foo bar="baz">&')).toBe("&lt;foo bar=&quot;baz&quot;&gt;&amp;");
+describe("escapeHtml (now a markdown escaper, kept under the legacy name, #2669)", () => {
+  it("escapes the inline-markdown specials (\\ ` * _ ~ = [ ] |); leaves < > & \" literal", () => {
+    // The HTML escaper is gone — this is escapeMarkdown under the old name.
+    // `< > & "` are literal in rich markdown; `* _ =` etc. are escaped.
+    expect(escapeHtml('<foo bar="baz">&')).toBe('<foo bar\\="baz">&');
+    expect(escapeHtml("a *b* _c_")).toBe("a \\*b\\* \\_c\\_");
   });
   it("leaves safe text alone", () => {
     expect(escapeHtml("hello world")).toBe("hello world");
@@ -63,19 +66,19 @@ describe("formatAuthLine", () => {
     expect(formatAuthLine({ authenticated: true, subscription_type: null, expires_in: null, auth_source: "oauth" }))
       .toBe("✓ subscription");
   });
-  it("HTML-escapes subscription type", () => {
+  it("passes < > literally (markdown, #2669) in subscription type", () => {
     expect(formatAuthLine({ authenticated: true, subscription_type: "<injected>", expires_in: null, auth_source: "oauth" }))
-      .toContain("&lt;injected&gt;");
+      .toContain("<injected>");
   });
 });
 
 describe("formatAgentLine", () => {
   it("includes model inline", () => {
-    expect(formatAgentLine(baseMeta)).toContain("<code>sonnet</code>");
+    expect(formatAgentLine(baseMeta)).toContain("`sonnet`");
   });
   it("falls back to 'default' when model is null/empty", () => {
-    expect(formatAgentLine({ ...baseMeta, model: null })).toContain("<code>default</code>");
-    expect(formatAgentLine({ ...baseMeta, model: "" })).toContain("<code>default</code>");
+    expect(formatAgentLine({ ...baseMeta, model: null })).toContain("`default`");
+    expect(formatAgentLine({ ...baseMeta, model: "" })).toContain("`default`");
   });
   it("appends topic when present", () => {
     const out = formatAgentLine({ ...baseMeta, topicName: "Planning", topicEmoji: "🗓" });
@@ -84,8 +87,8 @@ describe("formatAgentLine", () => {
   it("shows the live session model alongside the configured model when a /model switch is active", () => {
     const out = formatAgentLine({ ...baseMeta, model: "claude-fable-5[1m]", sessionModel: "Opus 4.8 (1M context)" });
     // Both surfaces present + agree: configured AND what's actually running.
-    expect(out).toContain("<code>claude-fable-5[1m]</code>");
-    expect(out).toContain("live session: <code>Opus 4.8 (1M context)</code>");
+    expect(out).toContain("`claude-fable-5[1m]`");
+    expect(out).toContain("live session: `Opus 4.8 (1M context)`");
   });
   it("omits the session line when no override is active", () => {
     expect(formatAgentLine({ ...baseMeta, sessionModel: null })).not.toContain("live session");
@@ -96,9 +99,9 @@ describe("formatAgentLine", () => {
     // topicName null → no topic chunk. Keeps the line clean.
     expect(formatAgentLine({ ...baseMeta, topicEmoji: "🗓" })).not.toContain("topic");
   });
-  it("HTML-escapes agent name", () => {
+  it("passes < > literally (markdown, #2669) in agent name", () => {
     expect(formatAgentLine({ ...baseMeta, agentName: "<script>" }))
-      .toContain("&lt;script&gt;");
+      .toContain("<script>");
   });
 });
 
@@ -108,7 +111,7 @@ describe("startText", () => {
   });
   it("names the agent, not 'Claude Code session'", () => {
     const out = startText("assistant", false);
-    expect(out).toContain("<b>assistant</b>");
+    expect(out).toContain("**assistant**");
     expect(out).not.toMatch(/Claude Code session/);
   });
   it("mentions pairing code flow", () => {
@@ -121,14 +124,14 @@ describe("startText", () => {
     expect(out).toContain("/status");
     expect(out).toContain("/commands");
   });
-  it("HTML-escapes agent name", () => {
-    expect(startText("<x>", false)).toContain("&lt;x&gt;");
+  it("passes < > literally (markdown, #2669) in agent name", () => {
+    expect(startText("<x>", false)).toContain("<x>");
   });
 });
 
 describe("helpText", () => {
   it("names the agent", () => {
-    expect(helpText("klanker")).toContain("<b>klanker</b>");
+    expect(helpText("klanker")).toContain("**klanker**");
   });
   it("mentions the new Sprint 2/3 commands", () => {
     const out = helpText("assistant");
@@ -162,7 +165,7 @@ describe("statusPairedText", () => {
     const out = statusPairedText({ user: "@ken", meta });
     expect(out).toContain("Agent:");
     expect(out).toContain("Auth: ✓ Max · expires 29 days");
-    expect(out).toContain("<code>sonnet</code>");
+    expect(out).toContain("`sonnet`");
   });
   it("omits status/uptime when absent", () => {
     expect(statusPairedText({ user: "@ken", meta })).not.toContain("Status:");
@@ -170,29 +173,32 @@ describe("statusPairedText", () => {
   it("includes status/uptime when present", () => {
     const withStatus: AgentMetadata = { ...meta, status: "running", uptime: "3h 12m" };
     const out = statusPairedText({ user: "@ken", meta: withStatus });
-    expect(out).toContain("Status: <code>running</code> · up 3h 12m");
+    expect(out).toContain("Status: `running` · up 3h 12m");
   });
 
   // demo mode (the `/status demo` suffix) — masks the paired-user tag only.
   describe("demo mode", () => {
-    it("WITHOUT demo, the real handle still renders", () => {
-      expect(statusPairedText({ user: "@ken_real", meta })).toContain("Paired as @ken_real.");
+    it("WITHOUT demo, the real handle still renders (underscore markdown-escaped, #2669)", () => {
+      // The `_` in the handle is escaped so it can't open an italic run in
+      // the rich-markdown body — the handle renders as @ken\_real verbatim.
+      expect(statusPairedText({ user: "@ken_real", meta })).toContain("Paired as @ken\\_real.");
     });
     it("WITH demo, the handle is masked to a @demo_user form", () => {
       const out = statusPairedText({ user: "@ken_real", meta, demo: true });
       expect(out).not.toContain("@ken_real");
-      expect(out).toMatch(/Paired as @demo_user\d*\./);
+      // The masked handle's underscore is markdown-escaped too.
+      expect(out).toMatch(/Paired as @demo\\_user\d*\./);
     });
     it("WITH demo, a numeric sender id is masked to a @handle, not a raw number", () => {
       const out = statusPairedText({ user: "12345", meta, demo: true });
       expect(out).not.toContain("12345");
-      expect(out).toMatch(/Paired as @demo_user\d*\./);
+      expect(out).toMatch(/Paired as @demo\\_user\d*\./);
     });
     it("WITH demo, the agent/model/auth topology is NOT masked", () => {
       const out = statusPairedText({ user: "@ken_real", meta, demo: true });
       // Out-of-scope fields stay real.
       expect(out).toContain("Auth: ✓ Max · expires 29 days");
-      expect(out).toContain("<code>sonnet</code>");
+      expect(out).toContain("`sonnet`");
     });
   });
 
@@ -220,21 +226,21 @@ describe("statusPairedText", () => {
     it("renders all audit rows when meta.audit is fully populated", () => {
       const withAudit: AgentMetadata = { ...meta, extendsProfile: "klanker", audit };
       const out = statusPairedText({ user: "@ken", meta: withAudit });
-      expect(out).toContain("<b>Version</b> v0.3.0+44 · 2h ago");
-      expect(out).toContain("<b>Profile</b> klanker");
-      expect(out).toContain("<b>Tools</b> Read, Write, Bash, Edit, Grep +12 more");
-      expect(out).toContain("<b>Deny</b> WebFetch");
-      expect(out).toContain("<b>Skills</b> git, telegram, vault, +3 more");
-      expect(out).toContain("<b>Limits</b> idle 30m, 50 turns");
-      expect(out).toContain("<b>Channel</b> switchroom (default)");
-      expect(out).toContain("<b>Memory</b> assistant");
+      expect(out).toContain("**Version** v0.3.0+44 · 2h ago");
+      expect(out).toContain("**Profile** klanker");
+      expect(out).toContain("**Tools** Read, Write, Bash, Edit, Grep +12 more");
+      expect(out).toContain("**Deny** WebFetch");
+      expect(out).toContain("**Skills** git, telegram, vault, +3 more");
+      expect(out).toContain("**Limits** idle 30m, 50 turns");
+      expect(out).toContain("**Channel** switchroom (default)");
+      expect(out).toContain("**Memory** assistant");
     });
 
     it("omits Deny row when toolsDeny is null", () => {
       const partial: AgentMetadata = { ...meta, audit: { ...audit, toolsDeny: null } };
       const out = statusPairedText({ user: "@ken", meta: partial });
       expect(out).not.toContain("Deny");
-      expect(out).toContain("<b>Tools</b>");
+      expect(out).toContain("**Tools**");
     });
 
     it("omits Skills row when skills is null (agent has no bundled skills)", () => {
@@ -252,7 +258,7 @@ describe("statusPairedText", () => {
       expect(versionIdx).toBeGreaterThan(statusIdx);
     });
 
-    it("escapes HTML in audit values", () => {
+    it("passes < > & literally (markdown, #2669) in audit values", () => {
       const hostile: AgentAuditLike = {
         version: "<script>alert(1)</script>",
         tools: "Read & <Write>",
@@ -263,18 +269,20 @@ describe("statusPairedText", () => {
         memoryBank: "bank<>name",
       };
       const out = statusPairedText({ user: "@ken", meta: { ...meta, audit: hostile } });
-      expect(out).not.toContain("<script>alert");
-      expect(out).toContain("&lt;script&gt;");
-      expect(out).toContain("Read &amp; &lt;Write&gt;");
-      expect(out).toContain("bank&lt;&gt;name");
+      // < > & are literal in rich markdown — no HTML entities. The hostile
+      // input is shown verbatim (it cannot inject formatting; only * _ ` etc.
+      // would be, and those are escaped).
+      expect(out).toContain("<script>alert(1)</script>");
+      expect(out).toContain("Read & <Write>");
+      expect(out).toContain("bank<>name");
     });
 
     it("handles empty extendsProfile (no Profile row when meta.extendsProfile is null)", () => {
       const withAudit: AgentMetadata = { ...meta, extendsProfile: null, audit };
       const out = statusPairedText({ user: "@ken", meta: withAudit });
-      expect(out).not.toContain("<b>Profile</b>");
+      expect(out).not.toContain("**Profile**");
       // But other audit rows still render.
-      expect(out).toContain("<b>Version</b>");
+      expect(out).toContain("**Version**");
     });
   });
 
@@ -284,12 +292,12 @@ describe("statusPairedText", () => {
   describe("live health block", () => {
     it("does NOT render a Health section when meta.live is undefined", () => {
       const out = statusPairedText({ user: "@ken", meta });
-      expect(out).not.toContain("<b>Health</b>");
+      expect(out).not.toContain("**Health**");
     });
 
     it("does NOT render a Health section when meta.live is empty array", () => {
       const out = statusPairedText({ user: "@ken", meta: { ...meta, live: [] } });
-      expect(out).not.toContain("<b>Health</b>");
+      expect(out).not.toContain("**Health**");
     });
 
     it("renders all probe rows including green ones", () => {
@@ -300,11 +308,11 @@ describe("statusPairedText", () => {
         { status: "fail",     label: "Scheduler", detail: "sidecar not running" },
       ];
       const out = statusPairedText({ user: "@ken", meta: { ...meta, live } });
-      expect(out).toContain("<b>Health</b>");
-      expect(out).toContain("🟢 <b>Account</b>  ken@x.com · Max · token 60d");
-      expect(out).toContain("🟢 <b>Broker</b>  reachable");
-      expect(out).toContain("🟡 <b>Skills</b>  1/5 dangling: foo");
-      expect(out).toContain("🔴 <b>Scheduler</b>  sidecar not running");
+      expect(out).toContain("**Health**");
+      expect(out).toContain("🟢 **Account**  ken@x.com · Max · token 60d");
+      expect(out).toContain("🟢 **Broker**  reachable");
+      expect(out).toContain("🟡 **Skills**  1/5 dangling: foo");
+      expect(out).toContain("🔴 **Scheduler**  sidecar not running");
     });
 
     it("renders Health section before the audit block", () => {
@@ -319,19 +327,18 @@ describe("statusPairedText", () => {
         user: "@ken",
         meta: { ...meta, live, audit },
       });
-      const healthIdx = out.indexOf("<b>Health</b>");
-      const versionIdx = out.indexOf("<b>Version</b>");
+      const healthIdx = out.indexOf("**Health**");
+      const versionIdx = out.indexOf("**Version**");
       expect(healthIdx).toBeGreaterThan(-1);
       expect(versionIdx).toBeGreaterThan(healthIdx);
     });
 
-    it("escapes HTML in probe detail strings", () => {
+    it("passes < > literally (markdown, #2669) in probe detail strings", () => {
       const live: AgentMetadata["live"] = [
         { status: "fail", label: "Skills", detail: "<script>alert(1)</script>" },
       ];
       const out = statusPairedText({ user: "@ken", meta: { ...meta, live } });
-      expect(out).not.toContain("<script>alert");
-      expect(out).toContain("&lt;script&gt;");
+      expect(out).toContain("<script>alert(1)</script>");
     });
   });
 });
@@ -348,14 +355,14 @@ describe("statusPendingText / statusUnpairedText", () => {
   it("unpaired prompts the user to DM", () => {
     expect(statusUnpairedText()).toMatch(/Send me a message/);
   });
-  it("pending escapes HTML in the code value", () => {
-    expect(statusPendingText("<x>")).toContain("&lt;x&gt;");
+  it("passes < > literally (markdown, #2669) in the pending code value", () => {
+    expect(statusPendingText("<x>")).toContain("<x>");
   });
 });
 
 describe("switchroomHelpText + switchroomHelpCommandNames", () => {
   it("agent name appears in header", () => {
-    expect(switchroomHelpText("klanker")).toContain("<b>klanker</b>");
+    expect(switchroomHelpText("klanker")).toContain("**klanker**");
   });
   it("every command in the autocomplete array is documented here", () => {
     const out = switchroomHelpText("assistant");
@@ -365,9 +372,9 @@ describe("switchroomHelpText + switchroomHelpCommandNames", () => {
   });
   it("groups commands into sections", () => {
     const out = switchroomHelpText("assistant");
-    expect(out).toContain("<b>Session &amp; approvals</b>");
-    expect(out).toContain("<b>Agents</b>");
-    expect(out).toContain("<b>Auth &amp; config</b>");
+    expect(out).toContain("**Session & approvals**");
+    expect(out).toContain("**Agents**");
+    expect(out).toContain("**Auth & config**");
   });
   it("the name array contains the Sprint 2/3 additions", () => {
     for (const needed of ["new", "compact", "clear", "approve", "deny", "pending"]) {
@@ -455,11 +462,11 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     const helpDoc = switchroomHelpText("clerk");
     // The /auth description string still mentions "reauth" as a
     // dashboard verb — that's intentional, not a registered command.
-    // Pin that there's no top-level <code>/reauth ...</code> entry.
+    // Pin that there's no top-level `/reauth ...` entry.
     expect(
       helpDoc,
       "/reauth must not appear as a top-level command in help text",
-    ).not.toMatch(/<code>\/reauth\b/);
+    ).not.toMatch(/`\/reauth\b/);
   });
 
   it("menu is short enough for a mobile keyboard (<= 21 entries)", () => {
@@ -486,18 +493,18 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
 
 describe("restart / new ack text", () => {
   it("restartAckText is consistent", () => {
-    expect(restartAckText("assistant")).toBe("🔄 Restarting <b>assistant</b>…");
+    expect(restartAckText("assistant")).toBe("🔄 Restarting **assistant**…");
   });
   it("newSessionAckText with flush", () => {
     expect(newSessionAckText("assistant", true))
-      .toBe("🆕 Started fresh session for <b>assistant</b> · flushed handoff · restarting…");
+      .toBe("🆕 Started fresh session for **assistant** · flushed handoff · restarting…");
   });
   it("newSessionAckText without flush", () => {
     expect(newSessionAckText("assistant", false))
-      .toBe("🆕 Started fresh session for <b>assistant</b> · restarting…");
+      .toBe("🆕 Started fresh session for **assistant** · restarting…");
   });
-  it("HTML-escapes agent name in both", () => {
-    expect(restartAckText("<x>")).toContain("&lt;x&gt;");
-    expect(newSessionAckText("<x>", true)).toContain("&lt;x&gt;");
+  it("passes < > literally (markdown, #2669) in agent name in both", () => {
+    expect(restartAckText("<x>")).toContain("<x>");
+    expect(newSessionAckText("<x>", true)).toContain("<x>");
   });
 });

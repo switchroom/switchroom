@@ -42,12 +42,18 @@ function fakeCtx(userId = 12345): { ctx: Context; spy: FakeCtx } {
       });
       return { message_id: 1 };
     },
-    editMessageText: async (text: string, opts?: { reply_markup?: { inline_keyboard?: unknown[][] } }) => {
+    editMessageText: async (
+      text: string | { markdown: string },
+      opts?: { reply_markup?: { inline_keyboard?: unknown[][] } },
+    ) => {
       const rows = (opts?.reply_markup?.inline_keyboard ?? []) as Array<
         Array<{ text: string }>
       >;
+      // #2669: the rich path passes `{ markdown }`; normalize to the body
+      // string so the substring assertions keep working.
+      const body = typeof text === "object" && text != null ? text.markdown : text;
       spy.edits.push({
-        text,
+        text: body,
         keyboardRows: opts?.reply_markup
           ? rows.map((r) => r.map((b) => b.text))
           : undefined,

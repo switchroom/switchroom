@@ -128,10 +128,10 @@ export function formatPermissionCardBody(opts: {
 
   if (opts.agentName && opts.agentName.length > 0) {
     lines.push(
-      `🔐 **${escapeTgHtml(capFirst(opts.agentName))}** wants to ${escapeTgHtml(action)}`,
+      `🔐 **${escapeTgHtml(capFirst(opts.agentName))}** wants to ${escapeActionMarkdown(action)}`,
     );
   } else {
-    lines.push(`🔐 ${escapeTgHtml(capFirst(action))}`);
+    lines.push(`🔐 ${escapeActionMarkdown(capFirst(action))}`);
   }
 
   // why: the caller-supplied rationale (`reason`/`why` arg), never the
@@ -449,18 +449,18 @@ export function formatPermissionResumeMessage(opts: {
 
   if (opts.behavior === "allow") {
     return hasAction
-      ? `▶️ ${who} — got it, continuing: _${escapeTgHtml(act)}_`
+      ? `▶️ ${who} — got it, continuing: _${escapeActionMarkdown(act)}_`
       : `▶️ ${who} — got it, back to work.`;
   }
 
   // deny
   if (opts.timeoutMinutes != null) {
     return hasAction
-      ? `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it (_${escapeTgHtml(act)}_).`
+      ? `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it (_${escapeActionMarkdown(act)}_).`
       : `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it.`;
   }
   return hasAction
-    ? `🚫 ${who} — noted, I won't ${escapeTgHtml(lowerFirst(act))}. Continuing without it.`
+    ? `🚫 ${who} — noted, I won't ${escapeActionMarkdown(lowerFirst(act))}. Continuing without it.`
     : `🚫 ${who} — noted, continuing without it.`;
 }
 
@@ -524,6 +524,24 @@ function capFirst(text: string): string {
 /** Markdown escape for the rich-message path (#2669). */
 function escapeTgHtml(text: string): string {
   return escapeMarkdown(text);
+}
+
+/**
+ * Escape a phrase that may itself contain DELIBERATE `` `code spans` ``
+ * (e.g. the hostd fleet-verb phrases name the target agent in a code span:
+ * "restart agent `carrie` in the fleet"). The structural backticks must NOT
+ * be escaped — that would render literal `` \`carrie\` `` to the operator
+ * (#2669 regression). Everything OUTSIDE a backtick span is still escaped so
+ * a hostile Bash command / filename can't inject emphasis. Content INSIDE a
+ * span is left verbatim — code spans render literally, so there is no
+ * injection risk there.
+ */
+function escapeActionMarkdown(text: string): string {
+  // Split on balanced single-backtick spans, keeping the delimiters.
+  return text
+    .split(/(`[^`]*`)/g)
+    .map((seg) => (seg.startsWith("`") && seg.endsWith("`") && seg.length >= 2 ? seg : escapeMarkdown(seg)))
+    .join("");
 }
 
 function parseInput(raw: string | undefined): Record<string, unknown> | null {

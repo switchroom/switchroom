@@ -18,21 +18,21 @@ import { renderBootCard, resolvePersonaName } from '../gateway/boot-card.js'
 describe('renderBootCard — quiet by default', () => {
   it('returns one-line ack with default ✅ when no probes and no restart reason', () => {
     const out = renderBootCard({ agentName: 'klanker', version: 'v0.3.0+44' })
-    expect(out).toBe('✅ <b>klanker</b> back up · v0.3.0+44')
+    expect(out).toBe('✅ **klanker** back up · v0.3.0+44')
     expect(out).not.toContain('\n')
   })
 
   it('uses ✅ for planned and graceful restart reasons (return-to-service)', () => {
     for (const reason of ['planned', 'graceful'] as const) {
       const out = renderBootCard({ agentName: 'agent', version: 'v1', restartReason: reason })
-      expect(out).toBe('✅ <b>agent</b> back up · v1')
+      expect(out).toBe('✅ **agent** back up · v1')
     }
   })
 
   it('uses 🆕 for fresh starts (no prior session marker — first boot)', () => {
     const out = renderBootCard({ agentName: 'a', version: 'v', restartReason: 'fresh' })
     expect(out.startsWith('🆕')).toBe(true)
-    expect(out).toBe('🆕 <b>a</b> back up · v')
+    expect(out).toBe('🆕 **a** back up · v')
   })
 
   it('all-ok probes produce no extra rows — same output as no probes at all', () => {
@@ -62,16 +62,16 @@ describe('renderBootCard — degraded conditions', () => {
       restartAgeMs: 2_100,
     })
     const lines = out.split('\n')
-    expect(lines[0]).toBe('⚠️ <b>lawgpt</b> back up · v0.3.0+44')
+    expect(lines[0]).toBe('⚠️ **lawgpt** back up · v0.3.0+44')
     expect(lines[1]).toBe('') // separator
-    expect(lines[2]).toContain('⚠️ <b>Restart</b>')
+    expect(lines[2]).toContain('⚠️ **Restart**')
     expect(lines[2]).toContain('crash recovery')
     expect(lines[2]).toContain('2.1s ago')
   })
 
   it('crash reason without restartAgeMs omits the "ago" suffix', () => {
     const out = renderBootCard({ agentName: 'a', version: 'v1', restartReason: 'crash' })
-    expect(out).toContain('⚠️ <b>Restart</b>  crash recovery')
+    expect(out).toContain('⚠️ **Restart**  crash recovery')
     expect(out).not.toMatch(/\d+\.\d+s ago/)
   })
 
@@ -88,13 +88,13 @@ describe('renderBootCard — degraded conditions', () => {
         crons:     { status: 'ok',       label: 'Crons',     detail: '4 timers' },
       },
     })
-    expect(out).toContain('🟡 <b>Account</b>  token expiring · 3d')
-    expect(out).toContain('🔴 <b>Quota</b>  rate limited')
+    expect(out).toContain('🟡 **Account**  token expiring · 3d')
+    expect(out).toContain('🔴 **Quota**  rate limited')
     // Healthy probes must not render.
-    expect(out).not.toContain('Agent</b>')
-    expect(out).not.toContain('Gateway</b>')
-    expect(out).not.toContain('Hindsight</b>')
-    expect(out).not.toContain('Scheduler</b>')
+    expect(out).not.toContain('Agent**')
+    expect(out).not.toContain('Gateway**')
+    expect(out).not.toContain('Hindsight**')
+    expect(out).not.toContain('Scheduler**')
   })
 
   it('orders probe rows in PROBE_KEYS canonical order regardless of object iteration', () => {
@@ -110,9 +110,9 @@ describe('renderBootCard — degraded conditions', () => {
         account:   { status: 'degraded', label: 'Account',   detail: 'expiring' },
       },
     })
-    const accountIdx = out.indexOf('Account</b>')
-    const hindsightIdx = out.indexOf('Hindsight</b>')
-    const schedulerIdx = out.indexOf('Scheduler</b>')
+    const accountIdx = out.indexOf('Account**')
+    const hindsightIdx = out.indexOf('Hindsight**')
+    const schedulerIdx = out.indexOf('Scheduler**')
     expect(accountIdx).toBeGreaterThan(-1)
     expect(hindsightIdx).toBeGreaterThan(accountIdx)
     expect(schedulerIdx).toBeGreaterThan(hindsightIdx)
@@ -131,14 +131,14 @@ describe('renderBootCard — degraded conditions', () => {
     const lines = out.split('\n')
     expect(lines[0].startsWith('⚠️')).toBe(true)
     expect(lines).toContain('') // separator after ack
-    expect(out).toContain('⚠️ <b>Restart</b>')
-    expect(out).toContain('🟡 <b>Account</b>  expiring')
+    expect(out).toContain('⚠️ **Restart**')
+    expect(out).toContain('🟡 **Account**  expiring')
   })
 
   it('renders nextStep as an indented continuation line beneath a degraded row', () => {
     // Principle 1 ("If they need the docs, we've failed"): every degraded
     // probe should surface its remediation inline. Plain backticks in the
-    // nextStep get translated to <code> spans so the command stays tap-to-
+    // nextStep get translated to ` spans so the command stays tap-to-
     // copy on mobile.
     const out = renderBootCard({
       agentName: 'lawgpt',
@@ -152,8 +152,8 @@ describe('renderBootCard — degraded conditions', () => {
         },
       },
     })
-    expect(out).toContain('🟡 <b>Skills</b>  10/10 dangling')
-    expect(out).toContain('    ↳ Run <code>switchroom agent reconcile lawgpt</code> to rebuild symlinks')
+    expect(out).toContain('🟡 **Skills**  10/10 dangling')
+    expect(out).toContain('    ↳ Run `switchroom agent reconcile lawgpt` to rebuild symlinks')
   })
 
   it('crash row carries a tail-logs next-step', () => {
@@ -163,8 +163,8 @@ describe('renderBootCard — degraded conditions', () => {
       restartReason: 'crash',
       restartAgeMs: 6_100,
     })
-    expect(out).toContain('⚠️ <b>Restart</b>  crash recovery · 6.1s ago')
-    expect(out).toContain('↳ Tail logs: <code>journalctl --user -u switchroom-lawgpt -n 100</code>')
+    expect(out).toContain('⚠️ **Restart**  crash recovery · 6.1s ago')
+    expect(out).toContain('↳ Tail logs: `journalctl --user -u switchroom-lawgpt -n 100`')
   })
 
   it('crash row uses agentSlug for the systemd unit when provided', () => {
@@ -191,8 +191,9 @@ describe('renderBootCard — degraded conditions', () => {
         },
       },
     })
-    expect(out).toContain('<code>foo &lt;bar&gt; &amp; baz</code>')
-    expect(out).not.toContain('<bar>')
+    // #2669: the backtick-delimited content stays a literal code span — no
+    // HTML entities. < > & render verbatim inside the span.
+    expect(out).toContain('`foo <bar> & baz`')
   })
 
   it('unpaired backticks in nextStep fall back to plain escaped text', () => {
@@ -208,8 +209,9 @@ describe('renderBootCard — degraded conditions', () => {
         },
       },
     })
-    expect(out).toContain('↳ Run `switchroom foo to fix')
-    expect(out).not.toContain('<code>')
+    // Unpaired backtick → the whole nextStep is markdown-escaped, so the lone
+    // backtick is rendered as a literal `\`` and never opens a real code span.
+    expect(out).toContain('↳ Run \\`switchroom foo to fix')
   })
 
   it('degraded rows without nextStep render unchanged (backwards compat)', () => {
@@ -220,7 +222,7 @@ describe('renderBootCard — degraded conditions', () => {
         quota: { status: 'fail', label: 'Quota', detail: 'rate limited' },
       },
     })
-    expect(out).toContain('🔴 <b>Quota</b>  rate limited')
+    expect(out).toContain('🔴 **Quota**  rate limited')
     expect(out).not.toContain('↳')
   })
 
@@ -234,23 +236,25 @@ describe('renderBootCard — degraded conditions', () => {
       },
     })
     expect(out).not.toContain('Account')
-    expect(out).toContain('🔴 <b>Agent</b>  service deactivating')
+    expect(out).toContain('🔴 **Agent**  service deactivating')
   })
 })
 
-describe('renderBootCard — HTML escaping', () => {
-  it('escapes special chars in agent name', () => {
+describe('renderBootCard — markdown escaping (#2669)', () => {
+  it('passes < > literally in agent name; escapes emphasis specials', () => {
+    // < > are literal in rich markdown; an underscore would be escaped.
     const out = renderBootCard({ agentName: 'foo<bar>', version: 'v1' })
-    expect(out).toContain('foo&lt;bar&gt;')
-    expect(out).not.toContain('foo<bar>')
+    expect(out).toContain('foo<bar>')
+    const out2 = renderBootCard({ agentName: 'foo_bar', version: 'v1' })
+    expect(out2).toContain('foo\\_bar')
   })
 
-  it('escapes special chars in version', () => {
+  it('passes < > literally in version', () => {
     const out = renderBootCard({ agentName: 'a', version: 'v<1>' })
-    expect(out).toContain('v&lt;1&gt;')
+    expect(out).toContain('v<1>')
   })
 
-  it('escapes special chars in probe detail', () => {
+  it('passes < > literally in probe detail', () => {
     const out = renderBootCard({
       agentName: 'a',
       version: 'v',
@@ -258,8 +262,7 @@ describe('renderBootCard — HTML escaping', () => {
         quota: { status: 'fail', label: 'Quota', detail: 'rate <limited>' },
       },
     })
-    expect(out).toContain('rate &lt;limited&gt;')
-    expect(out).not.toContain('rate <limited>')
+    expect(out).toContain('rate <limited>')
   })
 })
 
@@ -303,8 +306,8 @@ describe('resolvePersonaName — persona name over slug (#169)', () => {
     const displayName = resolvePersonaName('finn', fakeCfg)
     const out = renderBootCard({ agentName: displayName, version: 'v0.3.0+50' })
     // User sees "Finn", not the slug "finn"
-    expect(out).toBe('✅ <b>Finn</b> back up · v0.3.0+50')
-    expect(out).not.toContain('<b>finn</b>')
+    expect(out).toBe('✅ **Finn** back up · v0.3.0+50')
+    expect(out).not.toContain('**finn**')
   })
 })
 
@@ -322,8 +325,8 @@ describe('renderBootCard — resolved / snooze rendering', () => {
       },
       resolvedRows: ['hindsight'],
     })
-    expect(out).toContain('✅ <b>Hindsight</b>  resolved')
-    expect(out).toContain('🔴 <b>Broker</b>  socket missing')
+    expect(out).toContain('✅ **Hindsight**  resolved')
+    expect(out).toContain('🔴 **Broker**  socket missing')
     // Resolved appears BEFORE Broker.
     expect(out.indexOf('Hindsight')).toBeLessThan(out.indexOf('Broker'))
   })
@@ -351,7 +354,7 @@ describe('renderBootCard — resolved / snooze rendering', () => {
       },
       snoozeRows: ['broker'],
     })
-    expect(out).toBe('✅ <b>k</b> back up · v0.1')
+    expect(out).toBe('✅ **k** back up · v0.1')
   })
 
   it('resolvedRows alone (no probes degraded) renders the resolved row beneath the ack', () => {
@@ -360,8 +363,8 @@ describe('renderBootCard — resolved / snooze rendering', () => {
       version: 'v',
       resolvedRows: ['skills', 'broker'],
     })
-    expect(out).toContain('✅ <b>Skills</b>  resolved')
-    expect(out).toContain('✅ <b>Broker</b>  resolved')
+    expect(out).toContain('✅ **Skills**  resolved')
+    expect(out).toContain('✅ **Broker**  resolved')
   })
 })
 
@@ -370,13 +373,13 @@ describe('renderBootCard — resolved / snooze rendering', () => {
 describe('renderBootCard — configChanges rows', () => {
   it('silent when configChanges is absent', () => {
     const out = renderBootCard({ agentName: 'k', version: 'v' })
-    expect(out).toBe('✅ <b>k</b> back up · v')
+    expect(out).toBe('✅ **k** back up · v')
     expect(out).not.toContain('Config')
   })
 
   it('silent when configChanges is empty array', () => {
     const out = renderBootCard({ agentName: 'k', version: 'v', configChanges: [] })
-    expect(out).toBe('✅ <b>k</b> back up · v')
+    expect(out).toBe('✅ **k** back up · v')
     expect(out).not.toContain('Config')
   })
 
@@ -386,7 +389,7 @@ describe('renderBootCard — configChanges rows', () => {
       version: 'v',
       configChanges: [{ field: 'model', from: 'claude-opus-4', to: 'claude-sonnet-4-5' }],
     })
-    expect(out).toContain('⚙️ <b>Config</b>')
+    expect(out).toContain('⚙️ **Config**')
     expect(out).toContain('claude-opus-4')
     expect(out).toContain('claude-sonnet-4-5')
     expect(out).toContain('→')
@@ -454,6 +457,6 @@ describe('renderBootCard — configChanges rows', () => {
   it('bare ack still returned when configChanges fires but produces only empty rows (defensive)', () => {
     // Edge: empty configChanges array passed → should not produce rows.
     const out = renderBootCard({ agentName: 'k', version: 'v', configChanges: [] })
-    expect(out).toBe('✅ <b>k</b> back up · v')
+    expect(out).toBe('✅ **k** back up · v')
   })
 })

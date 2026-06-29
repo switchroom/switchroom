@@ -65,13 +65,14 @@ describe('refreshBanner — transitions from clean state', () => {
     expect(next).not.toBeNull();
     expect(next?.slot).toBe('personal');
     expect(next?.messageId).toBe(100);
-    // sendMessage + pinChatMessage called in that order.
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    // sendRichMessage + pinChatMessage called in that order (#2669).
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(1);
-    const sendArgs = bot.api.sendMessage.mock.calls[0];
+    const sendArgs = bot.api.sendRichMessage.mock.calls[0];
     expect(sendArgs[0]).toBe(OWNER);
-    expect(sendArgs[1]).toContain('clerk');
-    expect(sendArgs[1]).toContain('personal');
+    const md = (sendArgs[1] as { markdown: string }).markdown;
+    expect(md).toContain('clerk');
+    expect(md).toContain('personal');
     // Pin call should disable notifications so users don't get pinged.
     const pinArgs = bot.api.pinChatMessage.mock.calls[0];
     expect(pinArgs[2]).toMatchObject({ disable_notification: true });
@@ -100,6 +101,7 @@ describe('refreshBanner — transitions from pinned state', () => {
     prior = seeded;
     // Reset the spy counts so the under-test transition starts from zero.
     bot.api.sendMessage.mockClear();
+    bot.api.sendRichMessage.mockClear();
     bot.api.editMessageText.mockClear();
     bot.api.pinChatMessage.mockClear();
     bot.api.unpinChatMessage.mockClear();
@@ -132,10 +134,12 @@ describe('refreshBanner — transitions from pinned state', () => {
     expect(next).toEqual({ messageId: prior.messageId, slot: 'work' });
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
     expect(bot.api.sendMessage).not.toHaveBeenCalled();
+    expect(bot.api.sendRichMessage).not.toHaveBeenCalled();
     const editArgs = bot.api.editMessageText.mock.calls[0];
     expect(editArgs[0]).toBe(OWNER);
     expect(editArgs[1]).toBe(prior.messageId);
-    expect(editArgs[2]).toContain('work');
+    // #2669: the edit carries the rich { markdown } wrapper, not a string.
+    expect((editArgs[2] as { markdown: string }).markdown).toContain('work');
   });
 
   it('return to default slot unpins, clears state', async () => {
@@ -216,7 +220,7 @@ describe('refreshBanner — full lifecycle (sequenced)', () => {
     expect(state).toBeNull();
 
     // Final tally on the chat model.
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.editMessageText).toHaveBeenCalledTimes(1);
     expect(bot.api.unpinChatMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(1);
@@ -241,13 +245,13 @@ describe('refreshBanner — error paths', () => {
       onError,
     });
     expect(next).toBeNull(); // prior state was null, preserved
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1);
     expect(bot.api.pinChatMessage).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledWith('pin', expect.any(Error));
   });
 
-  it('sendMessage failure surfaces but does not throw', async () => {
-    bot.faults.next('sendMessage', errors.forbidden('sendMessage'));
+  it('sendRichMessage failure surfaces but does not throw', async () => {
+    bot.faults.next('sendRichMessage', errors.forbidden('sendRichMessage'));
     const onError = vi.fn();
     const next = await refreshBanner({
       bot,
@@ -311,30 +315,33 @@ describe('refreshBanner — banner content', () => {
       defaultSlot: 'default',
       prevState: null,
     });
-    const text = bot.api.sendMessage.mock.calls[0][1] as string;
+    const rich = bot.api.sendRichMessage.mock.calls[0][1] as { markdown: string };
+    const text = rich.markdown;
     expect(text).toContain('klanker');
     expect(text).toContain('backup');
     expect(text).toContain('default');
     expect(text.toLowerCase()).toMatch(/failover/);
   });
 
-  it('escapes HTML in agent and slot names (no XSS via slot rename)', async () => {
+  it('markdown-escapes emphasis specials in agent name; slot names ride in code spans (#2669)', async () => {
     await refreshBanner({
       bot,
       ownerChatId: OWNER,
-      agentName: '<bad>',
-      currentSlot: '"hax"',
-      defaultSlot: '&def',
+      agentName: 'a_b*c',
+      currentSlot: 'slot_1',
+      defaultSlot: 'def_2',
       prevState: null,
     });
-    const text = bot.api.sendMessage.mock.calls[0][1] as string;
-    expect(text).not.toContain('<bad>');
-    expect(text).toContain('&lt;bad&gt;');
-    expect(text).toContain('&quot;hax&quot;');
-    expect(text).toContain('&amp;def');
+    const rich = bot.api.sendRichMessage.mock.calls[0][1] as { markdown: string };
+    const text = rich.markdown;
+    // The agent name is bolded — its emphasis specials are escaped.
+    expect(text).toContain('**a\\_b\\*c**');
+    // Slot names ride in `code spans` — literal, never escaped.
+    expect(text).toContain('`slot_1`');
+    expect(text).toContain('`def_2`');
   });
 
-  it('uses HTML parse_mode + disables link preview', async () => {
+  it('sends via the rich path (no parse_mode, no link_preview_options) #2669', async () => {
     await refreshBanner({
       bot,
       ownerChatId: OWNER,
@@ -343,8 +350,13 @@ describe('refreshBanner — banner content', () => {
       defaultSlot: DEFAULT,
       prevState: null,
     });
-    const opts = bot.api.sendMessage.mock.calls[0][2] as Record<string, unknown>;
-    expect(opts.parse_mode).toBe('HTML');
-    expect(opts.link_preview_options).toEqual({ is_disabled: true });
+    // The banner ships raw GFM markdown via sendRichMessage — no parse_mode,
+    // and sendRichMessage doesn't accept link_preview_options (it's omitted).
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1);
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+    const opts = bot.api.sendRichMessage.mock.calls[0][2] as Record<string, unknown>;
+    expect(opts.parse_mode).toBeUndefined();
+    expect(opts.link_preview_options).toBeUndefined();
+    expect(opts.disable_notification).toBe(true);
   });
 });

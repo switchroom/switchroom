@@ -166,13 +166,16 @@ describe('answer-stream — silent-marker suppression at materialize()', () => {
     stream.update(prose)
     const msgId = await stream.materialize()
 
-    // materialize() sends a fresh message — prose is not a silent marker
+    // materialize() sends a fresh message — prose is not a silent marker.
+    // Post-#2669 the body is the RAW transcript markdown and there is no
+    // parse_mode (the gateway wrapper ships it via the rich-message path).
     expect(sendMessage).toHaveBeenCalledTimes(1)
     expect(sendMessage).toHaveBeenCalledWith(
       'chat45',
       prose,
-      expect.objectContaining({ parse_mode: 'HTML' }),
+      expect.objectContaining({ link_preview_options: { is_disabled: true } }),
     )
+    expect(sendMessage.mock.calls[0][2]).not.toHaveProperty('parse_mode')
     expect(typeof msgId).toBe('number')
   })
 

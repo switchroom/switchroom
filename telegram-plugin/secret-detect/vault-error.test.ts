@@ -80,7 +80,7 @@ describe("renderVaultCliError", () => {
     // appeared in output (so the operator knew which key triggered
     // the card). New copy keeps the key in <code>…</code> form via
     // htmlEscape — assert it.
-    expect(out.html).toContain("<code>my_key</code>");
+    expect(out.html).toContain("`my_key`");
   });
 
   it("renders sandbox_context for verb=set WITHOUT a key (defensive fallback)", () => {
@@ -92,7 +92,7 @@ describe("renderVaultCliError", () => {
       { verb: "set" },
     );
     expect(out.html).toMatch(/vault_request_save/);
-    expect(out.html).not.toContain("<code></code>");
+    expect(out.html).not.toContain("``");
   });
 
   it("renders sandbox_context for verb=get with /vault get", () => {
@@ -119,7 +119,7 @@ describe("renderVaultCliError", () => {
     );
     expect(out.suppressRaw).toBe(true);
     expect(out.html).toContain("operator approval required");
-    expect(out.html).toContain("<code>telegram_bot_token</code>");
+    expect(out.html).toContain("`telegram_bot_token`");
     expect(out.html).toMatch(/vault_request_save/);
     expect(out.html).not.toMatch(/on the way/i);
   });
@@ -175,12 +175,12 @@ describe("renderVaultCliError", () => {
     expect(out.html).toBe("");
   });
 
-  it("escapes HTML special characters in the key", () => {
+  it("keeps the key literal inside the code span (< > stay verbatim, #2669)", () => {
     const out = renderVaultCliError(
       { kind: "needs_approval", original: "x", key: "key<with>html" },
       { verb: "save" },
     );
-    expect(out.html).not.toContain("<with>");
-    expect(out.html).toContain("key&lt;with&gt;html");
+    // < > are literal in rich markdown and ride verbatim in the `code span`.
+    expect(out.html).toContain("`key<with>html`");
   });
 });

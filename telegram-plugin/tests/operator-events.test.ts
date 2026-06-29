@@ -158,7 +158,7 @@ describe('renderOperatorEvent — credentials-expired', () => {
   it('produces reauth button', () => {
     const { text, keyboard } = renderOperatorEvent(makeEvent('credentials-expired'))
     expect(text).toContain('expired')
-    expect(text).toContain('<b>gymbro</b>')
+    expect(text).toContain('**gymbro**')
     expect(keyboard.inline_keyboard.flat().some(b => b.callback_data?.includes('reauth'))).toBe(true)
   })
 
@@ -193,7 +193,7 @@ describe('renderOperatorEvent — quota-exhausted', () => {
   it('renders quota text with /auth use hint and no stub buttons (E5)', () => {
     const { text, keyboard } = renderOperatorEvent(makeEvent('quota-exhausted'))
     expect(text).toContain('Quota exhausted')
-    expect(text).toContain('<b>gymbro</b>')
+    expect(text).toContain('**gymbro**')
     expect(text).toContain('/auth use')
     const buttons = keyboard.inline_keyboard.flat()
     // swap-slot and add-slot buttons removed (E5 — they redirected to terminal)
@@ -253,17 +253,15 @@ describe('renderOperatorEvent — unknown-5xx', () => {
   })
 })
 
-describe('renderOperatorEvent — HTML escaping', () => {
-  it('escapes agent name with special chars', () => {
+describe('renderOperatorEvent — markdown escaping (#2669)', () => {
+  it('passes < > literally in agent name (markdown, #2669)', () => {
     const { text } = renderOperatorEvent(makeEvent('unknown-4xx', { agent: '<evil>' }))
-    expect(text).toContain('&lt;evil&gt;')
-    expect(text).not.toContain('<evil>')
+    expect(text).toContain('<evil>')
   })
 
-  it('escapes detail with special chars', () => {
+  it('passes < > literally in detail (markdown, #2669)', () => {
     const { text } = renderOperatorEvent(makeEvent('credentials-expired', { detail: '<script>alert(1)</script>' }))
-    expect(text).toContain('&lt;script&gt;')
-    expect(text).not.toContain('<script>')
+    expect(text).toContain('<script>alert(1)</script>')
   })
 })
 

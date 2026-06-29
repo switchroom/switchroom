@@ -72,10 +72,9 @@ function setup(opts: { progressCardActive?: boolean } = {}): Fixture {
     ? { activeDraftStreams: map, suppressPtyPreview: suppress }
     : { activeDraftStreams: map }
 
-  const pty = createPtyPartialHandler(ptyState, {
-    bot,
-    renderText: (t) => `<i>${t}</i>`, // PTY preview: italic
-  })
+  // #2669: PTY previews are raw terminal output sent LITERALLY (plain
+  // sendMessage). The handler no longer takes a renderText.
+  const pty = createPtyPartialHandler(ptyState, { bot })
 
   const callStreamReply = (args: {
     chat_id: string
@@ -85,13 +84,13 @@ function setup(opts: { progressCardActive?: boolean } = {}): Fixture {
   }) =>
     handleStreamReply(args, srState, {
       bot,
-      markdownToHtml: (t) => `<b>${t}</b>`, // stream_reply: bold
-      escapeMarkdownV2: (t) => t,
       repairEscapedWhitespace: (t) => t,
       assertAllowedChat: () => {},
       resolveThreadId: () => undefined,
       disableLinkPreview: true,
-      defaultFormat: 'html',
+      // Anything other than the literal 'text' is the rich-markdown path —
+      // stream_reply ships the RAW markdown via sendRichMessage (#2669).
+      defaultFormat: 'markdown',
       logStreamingEvent: () => {},
       historyEnabled: false,
       recordOutbound: () => {},
@@ -129,12 +128,14 @@ describe('streaming e2e smoke', () => {
     f.pty.onPartial('drafting…')
     await microtaskFlush()
 
+    // PTY preview → literal plain sendMessage with the raw terminal text.
     expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
     expect(f.bot.api.sendMessage.mock.calls[0][0]).toBe('42')
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<i>drafting…</i>')
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('drafting…')
 
-    // Model calls stream_reply with canonical text. Throttle window not
-    // open yet, so drive timers before awaiting.
+    // Model calls stream_reply with canonical text. It REUSES the PTY-created
+    // (literalText) stream for this chat+thread, so the edit also takes the
+    // literal path (plain string, not a rich { markdown } wrapper).
     vi.advanceTimersByTime(1000)
     await microtaskFlush()
     const p1 = f.fireStreamReply({ chat_id: '42', text: 'final answer' })
@@ -145,7 +146,7 @@ describe('streaming e2e smoke', () => {
     expect(r1.messageId).toBe(500)
     expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
     expect(f.bot.api.editMessageText).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.editMessageText.mock.calls[0][2]).toBe('<b>final answer</b>')
+    expect(f.bot.api.editMessageText.mock.calls[0][2]).toBe('final answer')
 
     // done=true with same text → stream.finalize() resolves immediately
     // (pendingText is null since the edit already landed).
@@ -185,7 +186,8 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
     await pdone
 
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    // No PTY partial fired → stream_reply created a fresh RICH stream.
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     const editIds = f.bot.api.editMessageText.mock.calls.map(c => c[1])
     expect(new Set(editIds).size).toBe(1)
     expect(f.map.has('1:_')).toBe(false)
@@ -203,7 +205,7 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
 
     expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<i>early text</i>')
+    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('early text')
     expect(f.ptyState.pendingPtyPartial).toBeNull()
   })
 
@@ -214,15 +216,18 @@ describe('streaming e2e smoke', () => {
     const p1 = f.fireStreamReply({ chat_id: '1', text: 'stream_reply first' })
     await microtaskFlush()
     await p1
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    // stream_reply created a fresh RICH stream (no PTY partial preceded it).
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
 
     vi.advanceTimersByTime(1000)
     await microtaskFlush()
     const action = f.pty.onPartial('stream_reply first — more')
     await microtaskFlush()
 
+    // The PTY partial reuses the existing stream → an edit, not a new send.
     expect(action).toBe('update-existing')
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendMessage).not.toHaveBeenCalled()
     expect(f.bot.api.editMessageText).toHaveBeenCalledTimes(1)
     expect(f.map.size).toBe(1)
   })
@@ -240,8 +245,8 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
     await pB
 
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(2)
-    const chats = f.bot.api.sendMessage.mock.calls.map(c => c[0]).sort()
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(2)
+    const chats = f.bot.api.sendRichMessage.mock.calls.map(c => c[0]).sort()
     expect(chats).toEqual(['A', 'B'])
 
     vi.advanceTimersByTime(1000)
@@ -278,8 +283,8 @@ describe('streaming e2e smoke', () => {
     const r = await pending
 
     expect(r.status).toBe('updated')
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>looking into this…</b>')
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage.mock.calls[0][1]).toEqual({ markdown: 'looking into this…' })
     // PTY slot is claimed because the model is now the answer-lane
     // surface owner — late PTY partials defer to the model's stream
     // rather than racing it. (Same suppression pattern as before;
@@ -296,9 +301,9 @@ describe('streaming e2e smoke', () => {
     const r = await pdone
 
     expect(r.status).toBe('finalized')
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][0]).toBe('1')
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>THE ANSWER</b>')
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage.mock.calls[0][0]).toBe('1')
+    expect(f.bot.api.sendRichMessage.mock.calls[0][1]).toEqual({ markdown: 'THE ANSWER' })
     expect(f.map.has('1:_')).toBe(false)
   })
 
@@ -310,8 +315,8 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
     await p1
 
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>thinking…</b>')
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage.mock.calls[0][1]).toEqual({ markdown: 'thinking…' })
 
     vi.advanceTimersByTime(1000)
     await microtaskFlush()
@@ -320,7 +325,7 @@ describe('streaming e2e smoke', () => {
     await pdone
 
     // First call sent the message; second call edits it (no second send).
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
     expect(f.bot.api.editMessageText).toHaveBeenCalled()
   })
 
@@ -340,8 +345,8 @@ describe('streaming e2e smoke', () => {
     const r = await p
 
     expect(r.status).toBe('updated')
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>Plan → Run → Done</b>')
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage.mock.calls[0][1]).toEqual({ markdown: 'Plan → Run → Done' })
     expect(f.map.has('1:_:progress')).toBe(true)
   })
 
@@ -353,8 +358,8 @@ describe('streaming e2e smoke', () => {
     await microtaskFlush()
     await p1
 
-    expect(f.bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(f.bot.api.sendMessage.mock.calls[0][1]).toBe('<b>chunk 1</b>')
+    expect(f.bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(f.bot.api.sendRichMessage.mock.calls[0][1]).toEqual({ markdown: 'chunk 1' })
 
     vi.advanceTimersByTime(1000)
     await microtaskFlush()
@@ -381,7 +386,7 @@ describe('streaming e2e smoke', () => {
     await pdone
 
     const lastEdit = f.bot.api.editMessageText.mock.calls.at(-1)
-    expect(lastEdit?.[2]).toBe('<b>THE ACTUAL ANSWER</b>')
+    expect(lastEdit?.[2]).toEqual({ markdown: 'THE ACTUAL ANSWER' })
     expect(f.map.has('1:_')).toBe(false)
   })
 })

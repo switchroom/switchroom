@@ -33,7 +33,6 @@ function makeDeps(
 ): PtyHandlerDeps {
   return {
     bot,
-    renderText: (t) => t, // identity for tests — easier to assert
     ...overrides,
   }
 }
@@ -93,17 +92,18 @@ describe('handlePtyPartialPure', () => {
     expect(onFirstPartial).toHaveBeenCalledWith('1', 5)
   })
 
-  it('applies renderText before pushing into the stream', async () => {
+  it('sends the raw PTY text LITERALLY (literalText path, no markdown render) (#2669)', () => {
+    // PTY-tail previews are raw terminal/TUI output — they go through the
+    // literal plain `sendMessage` path, NOT the rich-markdown parser, so
+    // control glyphs / box-drawing chars aren't misinterpreted as markdown.
     const state = makeState({ currentSessionChatId: '1' })
-    const deps = makeDeps(bot, {
-      renderText: (t) => `<b>${t}</b>`,
-    })
+    const deps = makeDeps(bot)
 
-    handlePtyPartialPure('bold', state, deps)
-    await microtaskFlush()
+    handlePtyPartialPure('│ tool: ls -la │ *not bold*', state, deps)
 
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
-    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('<b>bold</b>')
+    expect(bot.api.sendRichMessage).not.toHaveBeenCalled()
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('│ tool: ls -la │ *not bold*')
   })
 
   it('reuses an existing stream on second update', async () => {

@@ -62,10 +62,9 @@ function makeDeps(agentName: string | null) {
     ['chat1:thr1:r1', { isFinal: () => false, finalize: finalizeA }],
     ['chat2:thr2:r2', { isFinal: () => true, finalize: finalizeB }],
   ])
-  const activeDraftParseModes = new Map<string, 'HTML' | 'MarkdownV2' | undefined>([
-    ['chat1:thr1:r1', 'HTML'],
-    ['chat2:thr2:r2', undefined],
-  ])
+  // #2669: the activeDraftParseModes map was retired with parse-mode rotation
+  // (single rich-markdown path now), so the disconnect-flush deps no longer
+  // carry or clear it.
 
   return {
     spies: { setDoneA, setDoneB, finalizeA, finalizeB, clearActiveReactions, disposeProgressDriver, log },
@@ -76,7 +75,6 @@ function makeDeps(agentName: string | null) {
       activeTurnStartedAt,
       claudeBusyKeys,
       activeDraftStreams,
-      activeDraftParseModes,
       clearActiveReactions,
       disposeProgressDriver,
       log,
@@ -103,7 +101,6 @@ describe('flushOnAgentDisconnect — anonymous clients (the regression scenario)
     expect(deps.activeReactionMsgIds.size).toBe(2)
     expect(deps.activeTurnStartedAt.size).toBe(2)
     expect(deps.activeDraftStreams.size).toBe(2)
-    expect(deps.activeDraftParseModes.size).toBe(2)
 
     // But it should log so the operator can correlate the no-op decision.
     expect(spies.log).toHaveBeenCalledTimes(1)
@@ -150,7 +147,6 @@ describe('flushOnAgentDisconnect — registered agent disconnects (existing beha
     expect(spies.finalizeB).not.toHaveBeenCalled()
     // Both stream maps cleared regardless.
     expect(deps.activeDraftStreams.size).toBe(0)
-    expect(deps.activeDraftParseModes.size).toBe(0)
   })
 })
 
@@ -180,7 +176,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions,
       disposeProgressDriver,
       onDanglingTurnsSwept,
@@ -238,7 +233,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeTurnStartedAt: new Map<string, number>([['real-turn:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['real-turn:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
       onDanglingTurnsSwept,
@@ -273,7 +267,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       // handleInbound's fresh-turn branch.
       claudeBusyKeys: new Set<string>(['cron-only-key:_']),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
       onDanglingTurnsSwept,
@@ -306,7 +299,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeReactionMsgIds: new Map<string, { chatId: string; messageId: number }>(),
       activeTurnStartedAt: new Map<string, number>(),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
     }
@@ -342,7 +334,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeTurnStartedAt: new Map<string, number>(),
       claudeBusyKeys: new Set<string>(),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
       log,
@@ -362,7 +353,6 @@ describe('flushOnAgentDisconnect — dangling-turn sweep (2026-05-23 wedge fix)'
       activeTurnStartedAt: new Map<string, number>([['ghost:thr:msg', 100]]),
       claudeBusyKeys: new Set<string>(['ghost:thr:msg']),
       activeDraftStreams: new Map<string, FakeStream>(),
-      activeDraftParseModes: new Map<string, 'HTML' | 'MarkdownV2' | undefined>(),
       clearActiveReactions: vi.fn(),
       disposeProgressDriver: vi.fn(),
       // onDanglingTurnsSwept intentionally omitted.

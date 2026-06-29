@@ -81,13 +81,13 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   it("accumulates distinct actions chronologically (newest = current → bold, earlier = done ✓ italic)", () => {
     const lines: string[] = [];
     expect(appendActivityLine(lines, "Read", { file_path: "a/gateway.ts" })).toBe(
-      "<b>→ Reading gateway.ts</b>",
+      "**→ Reading gateway.ts**",
     );
     expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
-      "<i>✓ Reading gateway.ts</i>\n<b>→ Searching memory</b>",
+      "_✓ Reading gateway.ts_\n**→ Searching memory**",
     );
     expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
-      "<i>✓ Reading gateway.ts</i>\n<i>✓ Searching memory</i>\n<b>→ List workspace</b>",
+      "_✓ Reading gateway.ts_\n_✓ Searching memory_\n**→ List workspace**",
     );
   });
 
@@ -110,24 +110,28 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines)!;
     const hidden = total - STATUS_ROLLING_LINES;
-    expect(out.startsWith(`<i>✓ +${hidden} earlier…</i>\n`)).toBe(true);
+    expect(out.startsWith(`_✓ +${hidden} earlier…_\n`)).toBe(true);
     // Only the last STATUS_ROLLING_LINES actions are shown; older ones collapsed.
     const firstVisible = total - STATUS_ROLLING_LINES + 1;
-    expect(out).toContain(`<i>✓ Action ${firstVisible}</i>`);
+    expect(out).toContain(`_✓ Action ${firstVisible}_`);
     expect(out).not.toContain(`Action ${firstVisible - 1}<`);
     // The newest action is the in-progress step (bold →); the rest are done (✓).
-    expect(out).toContain(`<b>→ Action ${total}</b>`);
-    expect(out).toContain(`<i>✓ Action ${total - 1}</i>`);
-    expect(out).not.toContain(`<b>→ Action ${total - 1}</b>`);
+    expect(out).toContain(`**→ Action ${total}**`);
+    expect(out).toContain(`_✓ Action ${total - 1}_`);
+    expect(out).not.toContain(`**→ Action ${total - 1}**`);
   });
 
-  it("HTML-escapes &, <, > in action text (no double-escaping by callers)", () => {
-    const out = renderActivityFeed(["Running <foo> & <bar>"])!;
-    expect(out).toBe("<b>→ Running &lt;foo&gt; &amp; &lt;bar&gt;</b>");
+  it("markdown-escapes emphasis specials in action text; passes < > & through (#2669)", () => {
+    // The per-line pipeline strips PAIRED markdown first, then escapeMarkdown
+    // escapes the survivors: only \ ` * _ ~ = [ ] | are escaped — NOT < > &,
+    // which are literal in rich markdown. A lone `*` (3 * 4) and an
+    // intra-word `_` survive the strip and get escaped.
+    const out = renderActivityFeed(["Running <foo> & a_b 3 * 4"])!;
+    expect(out).toBe("**→ Running <foo> & a\\_b 3 \\* 4**");
   });
 
   it("renders a single line as the current (bold →) step", () => {
-    expect(renderActivityFeed(["Reading a.ts"])).toBe("<b>→ Reading a.ts</b>");
+    expect(renderActivityFeed(["Reading a.ts"])).toBe("**→ Reading a.ts**");
   });
 
   it("renderActivityFeed returns null on empty", () => {
@@ -141,17 +145,17 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = ["Reading a.ts", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true)!;
     expect(out).toBe(
-      "<i>✓ Reading a.ts</i>\n<i>✓ Searching memory</i>\n<i>✓ Running a command</i>",
+      "_✓ Reading a.ts_\n_✓ Searching memory_\n_✓ Running a command_",
     );
     expect(out).not.toContain("→"); // no in-progress arrow anywhere
   });
 
   it("final=true on a single line is also done (✓)", () => {
-    expect(renderActivityFeed(["Reading a.ts"], true)).toBe("<i>✓ Reading a.ts</i>");
+    expect(renderActivityFeed(["Reading a.ts"], true)).toBe("_✓ Reading a.ts_");
   });
 
   it("final defaults false (live render keeps the → in-progress newest line)", () => {
-    expect(renderActivityFeed(["Reading a.ts"])).toBe("<b>→ Reading a.ts</b>");
+    expect(renderActivityFeed(["Reading a.ts"])).toBe("**→ Reading a.ts**");
   });
 
   // liveSuffix (PR1 heartbeat): appended INSIDE the newest in-progress line so a
@@ -160,19 +164,19 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   describe("liveSuffix (heartbeat)", () => {
     it("appends the suffix to the newest in-progress line only", () => {
       expect(renderActivityFeed(["Reading a.ts", "Running a command"], false, " · 18s")).toBe(
-        "<i>✓ Reading a.ts</i>\n<b>→ Running a command · 18s</b>",
+        "_✓ Reading a.ts_\n**→ Running a command · 18s**",
       );
     });
     it("single live line gets the suffix", () => {
       expect(renderActivityFeed(["Pulling Meta data"], false, " · 1m05s")).toBe(
-        "<b>→ Pulling Meta data · 1m05s</b>",
+        "**→ Pulling Meta data · 1m05s**",
       );
     });
     it("final=true ignores the suffix (a finalized record never ticks)", () => {
       const out = renderActivityFeed(["Reading a.ts", "Running a command"], true, " · 18s")!;
       expect(out).not.toContain("·");
       expect(out).not.toContain("→");
-      expect(out).toBe("<i>✓ Reading a.ts</i>\n<i>✓ Running a command</i>");
+      expect(out).toBe("_✓ Reading a.ts_\n_✓ Running a command_");
     });
     it("default empty suffix is byte-identical to no suffix", () => {
       expect(renderActivityFeed(["Reading a.ts"], false, "")).toBe(
@@ -185,9 +189,9 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
 describe("appendActivityLabel — precomputed label feed (tool_label path)", () => {
   it("accumulates precomputed labels, dedups consecutive, ignores empty", () => {
     const lines: string[] = [];
-    expect(appendActivityLabel(lines, "Searching memory")).toBe("<b>→ Searching memory</b>");
+    expect(appendActivityLabel(lines, "Searching memory")).toBe("**→ Searching memory**");
     expect(appendActivityLabel(lines, "List workspace")).toBe(
-      "<i>✓ Searching memory</i>\n<b>→ List workspace</b>",
+      "_✓ Searching memory_\n**→ List workspace**",
     );
     // consecutive dup collapses
     appendActivityLabel(lines, "List workspace");
@@ -220,7 +224,7 @@ describe("clipNarrative — narrative-step clip (JSONL-text-narrative primitive)
     const narrativeRender = appendActivityLabel(narrativeLines, clipNarrative(text));
     const labelRender = appendActivityLabel(labelLines, clipNarrative(text));
     expect(narrativeRender).toBe(labelRender);
-    expect(narrativeRender).toBe(`<b>→ ${text}</b>`);
+    expect(narrativeRender).toBe(`**→ ${text}**`);
   });
 
   it("empty string yields an empty clip (appendActivityLabel then drops it)", () => {
@@ -234,16 +238,16 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     const lines = ["Reading CLAUDE.md", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true, "", 5)!;
     // All lines are done (✓) and the footer is appended.
-    expect(out).toContain("<i>✓ Running a command</i>");
-    expect(out).toContain("<i>✓ 5 steps</i>");
-    expect(out.endsWith("<i>✓ 5 steps</i>")).toBe(true);
+    expect(out).toContain("_✓ Running a command_");
+    expect(out).toContain("_✓ 5 steps_");
+    expect(out.endsWith("_✓ 5 steps_")).toBe(true);
   });
 
   it("stepCount=0 → no footer (no tools fired that were surfaced)", () => {
     const lines = ["Reading CLAUDE.md"];
     const out = renderActivityFeed(lines, true, "", 0)!;
     expect(out).not.toContain("steps");
-    expect(out).toBe("<i>✓ Reading CLAUDE.md</i>");
+    expect(out).toBe("_✓ Reading CLAUDE.md_");
   });
 
   it("stepCount undefined → no footer (live/non-final callers omit it)", () => {
@@ -257,22 +261,22 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     const out = renderActivityFeed(lines, false, "", 7)!;
     expect(out).not.toContain("steps");
     // The newest line is still the live in-progress step.
-    expect(out).toContain("<b>→ Running a command</b>");
+    expect(out).toContain("**→ Running a command**");
   });
 
   it("stepCount=1 footer reads '✓ 1 steps' (no special-casing)", () => {
     const lines = ["Reading CLAUDE.md"];
     const out = renderActivityFeed(lines, true, "", 1)!;
-    expect(out).toContain("<i>✓ 1 steps</i>");
+    expect(out).toContain("_✓ 1 steps_");
   });
 
   it("footer appears even when the feed overflows the rolling window", () => {
     const total = STATUS_ROLLING_LINES + 4;
     const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines, true, "", total)!;
-    expect(out).toContain(`<i>✓ +${total - STATUS_ROLLING_LINES} earlier…</i>`);
-    expect(out).toContain(`<i>✓ ${total} steps</i>`);
-    expect(out.endsWith(`<i>✓ ${total} steps</i>`)).toBe(true);
+    expect(out).toContain(`_✓ +${total - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain(`_✓ ${total} steps_`);
+    expect(out.endsWith(`_✓ ${total} steps_`)).toBe(true);
   });
 
   it("stepCount is surface-tool-excluded: reply/react count 0, Read+mcp count correctly", () => {
@@ -283,7 +287,7 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     const lines = ["Reading CLAUDE.md", "Searching memory"]; // 2 non-surface labels
     // stepCount=2 (Read + mcp__hindsight__recall) — reply is NOT counted.
     const out = renderActivityFeed(lines, true, "", 2)!;
-    expect(out).toContain("<i>✓ 2 steps</i>");
+    expect(out).toContain("_✓ 2 steps_");
     // stepCount=0 would mean only surface tools fired — no footer.
     const outSurfaceOnly = renderActivityFeed(["Reading CLAUDE.md"], true, "", 0)!;
     expect(outSurfaceOnly).not.toContain("steps");
@@ -303,33 +307,33 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     const child = ["Reading schema.ts", "Looking for foreign keys"];
     const out = renderActivityFeedWithNested(parent, child)!;
     // Parent is blocked at the Task tool → none of its lines is the live step.
-    expect(out).toContain("<i>✓ Searching memory</i>");
-    expect(out).toContain("<i>✓ Delegating: review the migration</i>");
-    expect(out).not.toContain("<b>→ Delegating");
+    expect(out).toContain("_✓ Searching memory_");
+    expect(out).toContain("_✓ Delegating: review the migration_");
+    expect(out).not.toContain("**→ Delegating");
     // The live → step is the newest nested child line; earlier child = italic.
-    expect(out).toContain("   ↳ <i>Reading schema.ts</i>");
-    expect(out).toContain("   ↳ <b>→ Looking for foreign keys</b>");
+    expect(out).toContain("   ↳ _Reading schema.ts_");
+    expect(out).toContain("   ↳ **→ Looking for foreign keys**");
   });
 
   it("windows the nested block to STATUS_ROLLING_LINES with a '↳ +N earlier…' header", () => {
     const total = STATUS_ROLLING_LINES + 3;
     const child = Array.from({ length: total }, (_, i) => `step ${i + 1}`);
     const out = renderActivityFeedWithNested(["Delegating: x"], child)!;
-    expect(out).toContain(`   ↳ <i>+${total - STATUS_ROLLING_LINES} earlier…</i>`);
+    expect(out).toContain(`   ↳ _+${total - STATUS_ROLLING_LINES} earlier…_`);
     // newest nested line is the live → step
-    expect(out).toContain(`   ↳ <b>→ step ${total}</b>`);
+    expect(out).toContain(`   ↳ **→ step ${total}**`);
     // the oldest (collapsed) lines are not rendered verbatim
     expect(out).not.toContain("step 1<");
   });
 
   it("renders the child block even when the parent feed is empty", () => {
     const out = renderActivityFeedWithNested([], ["Reading a.ts"]);
-    expect(out).toBe("   ↳ <b>→ Reading a.ts</b>");
+    expect(out).toBe("   ↳ **→ Reading a.ts**");
   });
 
-  it("HTML-escapes nested child text", () => {
-    const out = renderActivityFeedWithNested(["Delegating: x"], ["touch <a> & <b>"])!;
-    expect(out).toContain("   ↳ <b>→ touch &lt;a&gt; &amp; &lt;b&gt;</b>");
+  it("markdown-escapes nested child text (emphasis specials only)", () => {
+    const out = renderActivityFeedWithNested(["Delegating: x"], ["touch a_b & 2 * 3"])!;
+    expect(out).toContain("   ↳ **→ touch a\\_b & 2 \\* 3**");
   });
 
   it("final=true: the nested newest step renders done (✓), not in-progress (→)", () => {
@@ -338,13 +342,13 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       ["Reading schema.ts", "Looking for foreign keys"],
       true,
     )!;
-    expect(out).toContain("   ↳ <i>Looking for foreign keys</i>"); // newest now italic done
+    expect(out).toContain("   ↳ _Looking for foreign keys_"); // newest now italic done
     expect(out).not.toContain("→"); // no in-progress arrow in the finalized feed
   });
 
   it("final=true with no children delegates to the finalized flat render", () => {
     expect(renderActivityFeedWithNested(["Reading a.ts"], [], true)).toBe(
-      "<i>✓ Reading a.ts</i>",
+      "_✓ Reading a.ts_",
     );
   });
 
@@ -355,13 +359,13 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       false,
       " · 22s",
     )!;
-    expect(out).toContain("   ↳ <b>→ Looking for foreign keys · 22s</b>");
+    expect(out).toContain("   ↳ **→ Looking for foreign keys · 22s**");
     expect(out).not.toContain("Reading schema.ts · "); // only the newest line ticks
   });
 
   it("liveSuffix passes through to the flat render when there are no children", () => {
     expect(renderActivityFeedWithNested(["Reading a.ts"], [], false, " · 9s")).toBe(
-      "<b>→ Reading a.ts · 9s</b>",
+      "**→ Reading a.ts · 9s**",
     );
   });
 
@@ -369,15 +373,15 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     const parent = ["Delegating: review the migration"];
     const child = ["Reading schema.ts", "Looking for foreign keys"];
     const out = renderActivityFeedWithNested(parent, child, true, "", 5)!;
-    expect(out).toContain("<i>✓ 5 steps</i>");
-    expect(out.endsWith("<i>✓ 5 steps</i>")).toBe(true);
+    expect(out).toContain("_✓ 5 steps_");
+    expect(out.endsWith("_✓ 5 steps_")).toBe(true);
     expect(out).not.toContain("→");
   });
 
   it("stepCount footer appears on final=true with no children (delegates to flat render)", () => {
     const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 3)!;
-    expect(out).toContain("<i>✓ 3 steps</i>");
-    expect(out).toBe("<i>✓ Reading a.ts</i>\n<i>✓ 3 steps</i>");
+    expect(out).toContain("_✓ 3 steps_");
+    expect(out).toBe("_✓ Reading a.ts_\n_✓ 3 steps_");
   });
 
   // Liveness-driven feed open (dark-turn fix): a turn that emits no tool_label
@@ -389,12 +393,12 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     it("renders the live in-progress placeholder with climbing elapsed", () => {
       expect(
         renderActivityFeedWithNested(["Working…"], [], false, " · 12s"),
-      ).toBe("<b>→ Working… · 12s</b>");
+      ).toBe("**→ Working… · 12s**");
     });
 
     it("finalizes the placeholder to a done record (no frozen → line)", () => {
       expect(renderActivityFeedWithNested(["Working…"], [], true)).toBe(
-        "<i>✓ Working…</i>",
+        "_✓ Working…_",
       );
     });
 
@@ -470,8 +474,8 @@ describe("rolling window + +N earlier — renderActivityFeed", () => {
       expect(out).not.toContain(`XAct-${String(i).padStart(3, '0')}`);
     }
     // Overflow header present on the AGENT surface now.
-    expect(out).toContain(`<i>✓ +${12 - STATUS_ROLLING_LINES} earlier…</i>`);
-    expect(out).toContain(`<b>→ XAct-012</b>`);
+    expect(out).toContain(`_✓ +${12 - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain(`**→ XAct-012**`);
   });
 
   it("STATUS_LINE_MAX=200: a 250-char step is clipped to 200 with a trailing …", () => {
@@ -521,8 +525,8 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`Parent ${i}`);
     }
-    expect(out).toContain(`<i>✓ +${totalParent - STATUS_ROLLING_LINES} earlier…</i>`);
-    expect(out).toContain("   ↳ <b>→ Child step B</b>");
+    expect(out).toContain(`_✓ +${totalParent - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain("   ↳ **→ Child step B**");
   });
 
   it("many child lines → only the last STATUS_ROLLING_LINES child lines render with a ↳ +N earlier header", () => {
@@ -537,8 +541,8 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
     for (let i = 1; i < firstVisible; i++) {
       expect(out).not.toContain(`Child ${i}`);
     }
-    expect(out).toContain(`   ↳ <i>+${totalChild - STATUS_ROLLING_LINES} earlier…</i>`);
-    expect(out).toContain(`   ↳ <b>→ Child ${totalChild}</b>`);
+    expect(out).toContain(`   ↳ _+${totalChild - STATUS_ROLLING_LINES} earlier…_`);
+    expect(out).toContain(`   ↳ **→ Child ${totalChild}**`);
   });
 
   it("STATUS_LINE_MAX=200: a 250-char child line is clipped to 200 (both surfaces)", () => {
@@ -559,37 +563,31 @@ describe("rolling window + +N earlier — renderActivityFeedWithNested", () => {
   });
 });
 
-// ─── Extreme-edge: single oversized line with HTML-special chars ─────────────
-// These tests cover the _fitToCharBudget and _fitNestedToCharBudget fallback
-// paths that are reachable in no-truncate mode when a Bash label contains
-// special chars (e.g. && is extremely common) and is longer than the budget.
+// ─── Extreme-edge: single oversized line with markdown-special chars ─────────
+// These tests cover the fitCardToBudget fallback path that is reachable when a
+// Bash label contains special chars (e.g. && is extremely common) and is
+// longer than the budget. Post-#2669 the wire format is GFM markdown.
 
-/** Cheap valid-HTML checker: balanced tags + no partial entity. */
-function isValidHtml(s: string): boolean {
-  // No partial entity: must not end with &[a-z]* lacking semicolon.
-  if (/&[a-z]+$/.test(s)) return false;
-  if (/&[a-z]+[^;]$/.test(s)) return false;
-  // Every &...; must be complete.
-  const entityRe = /&([^;]*)/g;
-  let m: RegExpExecArray | null;
-  while ((m = entityRe.exec(s)) !== null) {
-    if (!s.slice(m.index).startsWith("&") || s[m.index + m[0].length] !== ";") {
-      // Check if this entity is actually terminated
-      const entityStart = m.index;
-      const semiIdx = s.indexOf(";", entityStart + 1);
-      if (semiIdx === -1) return false; // no closing semicolon
-    }
-  }
-  // All opening tags have a corresponding close (simple check for <b>/<i>).
-  const bOpen = (s.match(/<b>/g) ?? []).length;
-  const bClose = (s.match(/<\/b>/g) ?? []).length;
-  const iOpen = (s.match(/<i>/g) ?? []).length;
-  const iClose = (s.match(/<\/i>/g) ?? []).length;
-  return bOpen === bClose && iOpen === iClose;
+/**
+ * Cheap valid-rich-markdown checker: the emphasis wrappers the renderer
+ * emits (`**…**`, `_…_`) must be balanced, and no escape sequence may be
+ * left dangling at the end (a trailing lone backslash would consume the
+ * closing marker).
+ */
+function isValidMarkdown(s: string): boolean {
+  // No dangling escape backslash at the very end.
+  // Count trailing backslashes — an odd count means the final char escapes
+  // nothing real and would swallow the wrapper close.
+  const trailing = /(\\*)$/.exec(s)?.[1].length ?? 0;
+  if (trailing % 2 === 1) return false;
+  // Balanced ** bold wrappers (count of '**' must be even).
+  const bold = (s.match(/\*\*/g) ?? []).length;
+  if (bold % 2 !== 0) return false;
+  return true;
 }
 
-describe("extreme-edge: single oversized line with &, <, >, &&", () => {
-  it("renderActivityFeed: single ~4100-char line with special chars → ≤ budget and valid HTML", () => {
+describe("extreme-edge: single oversized line with markdown specials & && _ *", () => {
+  it("renderActivityFeed: single ~4100-char line with special chars → ≤ budget and valid markdown", () => {
     // Build a raw line >4000 chars with &, <, >, and a trailing &&.
     // The && will escape to &amp;&amp; (5 chars each), exercising the expansion guard.
     const base = "Run script with args: foo=bar && baz=<qux> & corge=1 ";
@@ -599,13 +597,13 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
     const out = renderActivityFeed([bigLine])!;
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000); // STATUS_CARD_CHAR_BUDGET
-    expect(isValidHtml(out)).toBe(true);
-    // Must be wrapped in <b>…</b> (live/non-final) — no dangling tag.
-    expect(out.startsWith("<b>→ ")).toBe(true);
-    expect(out.endsWith("</b>")).toBe(true);
+    expect(isValidMarkdown(out)).toBe(true);
+    // Must be wrapped in **…** (live/non-final) — no dangling marker.
+    expect(out.startsWith("**→ ")).toBe(true);
+    expect(out.endsWith("**")).toBe(true);
   });
 
-  it("renderActivityFeed final=true: single ~4100-char line → ≤ budget and valid HTML", () => {
+  it("renderActivityFeed final=true: single ~4100-char line → ≤ budget and valid markdown", () => {
     const base = "Deploy build && upload && notify && cleanup: ";
     const bigLine = base.repeat(90) + "done";
     expect(bigLine.length).toBeGreaterThan(4000);
@@ -613,12 +611,12 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
     const out = renderActivityFeed([bigLine], true)!;
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000);
-    expect(isValidHtml(out)).toBe(true);
-    expect(out.startsWith("<i>✓ ")).toBe(true);
-    expect(out.endsWith("</i>")).toBe(true);
+    expect(isValidMarkdown(out)).toBe(true);
+    expect(out.startsWith("_✓ ")).toBe(true);
+    expect(out.endsWith("_")).toBe(true);
   });
 
-  it("renderActivityFeedWithNested: single ~4100-char parent line → ≤ budget and valid HTML", () => {
+  it("renderActivityFeedWithNested: single ~4100-char parent line → ≤ budget and valid markdown", () => {
     const base = "Parent action with & < > special chars && bash: ";
     const bigLine = base.repeat(85);
     expect(bigLine.length).toBeGreaterThan(4000);
@@ -626,10 +624,10 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
     const out = renderActivityFeedWithNested([bigLine], [])!;
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000);
-    expect(isValidHtml(out)).toBe(true);
+    expect(isValidMarkdown(out)).toBe(true);
   });
 
-  it("renderActivityFeedWithNested: single ~4100-char child line → ≤ budget and valid HTML", () => {
+  it("renderActivityFeedWithNested: single ~4100-char child line → ≤ budget and valid markdown", () => {
     const base = "Child step: run build && test && deploy with <args> & flags=1 ";
     const bigChild = base.repeat(65) + "&&";
     expect(bigChild.length).toBeGreaterThan(4000);
@@ -637,19 +635,19 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
     const out = renderActivityFeedWithNested(["Delegating: big job"], [bigChild])!;
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000);
-    expect(isValidHtml(out)).toBe(true);
+    expect(isValidMarkdown(out)).toBe(true);
     // Must contain the nested prefix.
     expect(out).toContain("   ↳ ");
     // Regression guard: an operator-precedence bug made wrapperOverhead a string
     // (NESTED_PREFIX + n) → NaN budget → slice(0, NaN) === "" → the child content
-    // was silently discarded, leaving only "   ↳ <b>→ </b>". The empty-wrapper
+    // was silently discarded, leaving only "   ↳ **→ **". The empty-wrapper
     // output still satisfies the toContain("   ↳ ") check above, so assert that
     // real child content actually survives.
     expect(out).toContain("Child step");
     expect(out.length).toBeGreaterThan(100);
   });
 
-  it("renderActivityFeedWithNested final=true: single ~4100-char child line → ≤ budget and valid HTML", () => {
+  it("renderActivityFeedWithNested final=true: single ~4100-char child line → ≤ budget and valid markdown", () => {
     const base = "Final child: compile && link && package & ship: ";
     const bigChild = base.repeat(85);
     expect(bigChild.length).toBeGreaterThan(4000);
@@ -657,7 +655,7 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
     const out = renderActivityFeedWithNested(["Delegating: big job"], [bigChild], true)!;
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000);
-    expect(isValidHtml(out)).toBe(true);
+    expect(isValidMarkdown(out)).toBe(true);
     // final=true → nested line renders done (italic, no →).
     expect(out).not.toContain("→");
   });
@@ -673,30 +671,30 @@ describe("extreme-edge: single oversized line with &, <, >, &&", () => {
 describe("renderActivityHeader — two-line header builder", () => {
   it("renders the running header with elapsed and tool count", () => {
     const [h1, h2] = renderActivityHeader("🤖", "Agent", "", 15_000, 7, "running");
-    expect(h1).toBe("🤖 <b>Agent</b>");
-    expect(h2).toBe("<i>15s · 7 tools</i>");
+    expect(h1).toBe("🤖 **Agent**");
+    expect(h2).toBe("_15s · 7 tools_");
   });
 
   it("renders the done header with tool count and elapsed", () => {
     const [h1, h2] = renderActivityHeader("🤖", "Agent", "", 65_000, 3, "done");
-    expect(h1).toBe("🤖 <b>Agent</b>");
-    expect(h2).toBe("<i>done · 3 tools · 1m05s</i>");
+    expect(h1).toBe("🤖 **Agent**");
+    expect(h2).toBe("_done · 3 tools · 1m05s_");
   });
 
   it("includes the description in line 1 when non-empty", () => {
     const [h1] = renderActivityHeader("🛠", "Worker", "run tests", 10_000, 2, "running");
-    expect(h1).toBe("🛠 <b>Worker</b> · <i>run tests</i>");
+    expect(h1).toBe("🛠 **Worker** · _run tests_");
   });
 
   it("omits the description part when empty", () => {
     const [h1] = renderActivityHeader("🤖", "Agent", "", 5_000, 1, "running");
-    expect(h1).toBe("🤖 <b>Agent</b>");
+    expect(h1).toBe("🤖 **Agent**");
     expect(h1).not.toContain(" · ");
   });
 
-  it("HTML-escapes special chars in description and label", () => {
-    const [h1] = renderActivityHeader("🤖", "Agent", "run <foo> & <bar>", 5_000, 1, "running");
-    expect(h1).toContain("run &lt;foo&gt; &amp; &lt;bar&gt;");
+  it("markdown-escapes emphasis specials in description and label", () => {
+    const [h1] = renderActivityHeader("🤖", "Agent", "run a_b & c*d", 5_000, 1, "running");
+    expect(h1).toContain("run a\\_b & c\\*d");
   });
 });
 
@@ -711,35 +709,36 @@ describe("agent flat path routes through the shared step-feed primitive", () => 
     );
     // And the +N earlier marker is present on the flat agent surface.
     expect(renderActivityFeed(lines)!).toContain(
-      `<i>✓ +${lines.length - STATUS_ROLLING_LINES} earlier…</i>`,
+      `_✓ +${lines.length - STATUS_ROLLING_LINES} earlier…_`,
     );
   });
 });
 
-describe("escape entity is never split mid-clip (clip raw → escape last)", () => {
-  it("a step ending in '&' clipped at STATUS_LINE_MAX stays valid HTML", () => {
-    // Build a step exactly STATUS_LINE_MAX+1 chars ending in '&' so a naive
-    // escape-then-clip would split the &amp; entity at the boundary.
-    const line = "x".repeat(STATUS_LINE_MAX) + "&";
+describe("markdown escape is never split mid-clip (clip raw → escape last, #2669)", () => {
+  it("a step ending in a markdown special '*' clipped at STATUS_LINE_MAX stays valid", () => {
+    // The clip happens on the RAW string and escaping is the LAST per-line op,
+    // so the trailing '*' that survives the clip is escaped to a clean '\*'
+    // — never a dangling backslash that would eat the bold close marker.
+    const line = "x".repeat(STATUS_LINE_MAX) + "*";
     const out = renderActivityFeed([line])!;
-    // The clip keeps STATUS_LINE_MAX-1 chars + '…', then escapes — no stray entity.
-    expect(out).not.toMatch(/&amp$/);
-    expect(out).not.toMatch(/&am[^p]/);
     expect(out).toContain("…");
-    // Whatever '&' survives must be a complete &amp;.
-    const ampCount = (out.match(/&amp;/g) ?? []).length;
-    const bareAmp = (out.match(/&(?!amp;|lt;|gt;)/g) ?? []).length;
-    expect(bareAmp).toBe(0);
-    expect(ampCount).toBeGreaterThanOrEqual(0);
+    // The clip lands before the trailing '*', so the only '*' chars present are
+    // the renderer's own ** wrappers (an even count) — no stray odd escaped one.
+    const stars = (out.match(/\*/g) ?? []).length;
+    expect(stars % 2).toBe(0);
+    // No dangling escape backslash that would swallow a following marker.
+    expect(out).not.toMatch(/\\$/);
   });
 
-  it("a step ending in '<' clipped at STATUS_LINE_MAX stays valid HTML", () => {
-    const line = "y".repeat(STATUS_LINE_MAX) + "<";
+  it("a step whose clipped tail IS a markdown special escapes cleanly", () => {
+    // Place an underscore right at the clip boundary so the surviving char is a
+    // special — it must be escaped as '\_' with a balanced backslash.
+    const line = "y".repeat(STATUS_LINE_MAX - 1) + "_more";
     const out = renderActivityFeed([line])!;
-    expect(out).not.toMatch(/&lt$/);
-    expect(out).not.toMatch(/&l[^t;]/);
-    const bareLt = (out.match(/&(?!amp;|lt;|gt;)/g) ?? []).length;
-    expect(bareLt).toBe(0);
+    // Any backslash present must be paired with the special it escapes — no
+    // odd trailing backslash.
+    const trailing = /(\\*)$/.exec(out)?.[1].length ?? 0;
+    expect(trailing % 2).toBe(0);
   });
 });
 
@@ -768,11 +767,11 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     };
     const out = renderActivityFeed(["Reading CLAUDE.md", "Searching memory"], false, "", undefined, header)!;
     // Must start with the header lines.
-    expect(out).toContain("🤖 <b>Agent</b>");
-    expect(out).toContain("<i>15s · 7 tools</i>");
+    expect(out).toContain("🤖 **Agent**");
+    expect(out).toContain("_15s · 7 tools_");
     // Step feed follows the header.
-    expect(out).toContain("<i>✓ Reading CLAUDE.md</i>");
-    expect(out).toContain("<b>→ Searching memory</b>");
+    expect(out).toContain("_✓ Reading CLAUDE.md_");
+    expect(out).toContain("**→ Searching memory**");
   });
 
   it("prepends the done header when final=true", () => {
@@ -783,9 +782,9 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
       state: "done",
     };
     const out = renderActivityFeed(["Reading CLAUDE.md"], true, "", undefined, header)!;
-    expect(out).toContain("🤖 <b>Agent</b>");
-    expect(out).toContain("<i>done · 3 tools · 1m05s</i>");
-    expect(out).toContain("<i>✓ Reading CLAUDE.md</i>");
+    expect(out).toContain("🤖 **Agent**");
+    expect(out).toContain("_done · 3 tools · 1m05s_");
+    expect(out).toContain("_✓ Reading CLAUDE.md_");
     // No in-progress arrow (final=true).
     expect(out).not.toContain("→");
   });
@@ -800,7 +799,7 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     // renderActivityFeed normally returns null for empty lines; with header it returns content.
     const out = renderActivityFeed([], false, "", undefined, header);
     expect(out).not.toBeNull();
-    expect(out).toContain("🤖 <b>Agent</b>");
+    expect(out).toContain("🤖 **Agent**");
   });
 
   it("without header, renderActivityFeed still returns null for empty lines (no regression)", () => {
@@ -822,12 +821,12 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
       undefined,
       header,
     )!;
-    expect(out).toContain("🤖 <b>Agent</b>");
-    expect(out).toContain("<i>30s · 5 tools</i>");
+    expect(out).toContain("🤖 **Agent**");
+    expect(out).toContain("_30s · 5 tools_");
     // Parent step is done-styled (child is the live step).
-    expect(out).toContain("<i>✓ Delegating: review</i>");
+    expect(out).toContain("_✓ Delegating: review_");
     // Child step is the in-progress step.
-    expect(out).toContain("   ↳ <b>→ Reading schema.ts</b>");
+    expect(out).toContain("   ↳ **→ Reading schema.ts**");
   });
 });
 
