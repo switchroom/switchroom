@@ -253,15 +253,26 @@ function cronJobRuns(schedule: ScheduleDashboard, jobId: string): object[] {
   const fires: DispatchResult[] = schedule.recentByAgent[agent] ?? [];
   return fires
     .filter((f) => f.scheduleIndex === index)
-    .map((f) => ({
-      id: `${jobId}/${f.startedAt}`,
-      job_id: jobId,
-      started_at: new Date(f.startedAt).toISOString(),
-      finished_at: new Date(f.finishedAt).toISOString(),
-      exit_code: f.exitCode,
-      output: f.outputSummary,
-      status: f.exitCode === 0 ? "success" : "error",
-    }));
+    .map((f) => {
+      const d = new Date(f.startedAt);
+      const name = d.toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      return {
+        id: `${jobId}/${f.startedAt}`,
+        job_id: jobId,
+        name,
+        started_at: new Date(f.startedAt).toISOString(),
+        finished_at: new Date(f.finishedAt).toISOString(),
+        exit_code: f.exitCode,
+        output: f.outputSummary,
+        status: f.exitCode === 0 ? "success" : "error",
+      };
+    });
 }
 
 /** Map switchroom Turn records to SessionMessage[] for Hermes Desktop history. */
