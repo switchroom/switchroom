@@ -357,6 +357,21 @@ export async function handleHermesRest(
     return { status: 200, body: { cwd: null, branch: null } };
   }
 
+  // GET /api/env — API keys / env-var panel; no agent env vars to surface
+  if (method === "GET" && pathname === "/api/env") {
+    return { status: 200, body: {} };
+  }
+
+  // POST /api/providers/validate — credential check; switchroom has no API keys
+  if (method === "POST" && pathname === "/api/providers/validate") {
+    return { status: 200, body: { ok: true, model: null } };
+  }
+
+  // GET /api/auth/providers — OAuth provider listing (only needed in OAuth mode)
+  if (method === "GET" && pathname === "/api/auth/providers") {
+    return { status: 200, body: { providers: [] } };
+  }
+
   return null;
 }
 
