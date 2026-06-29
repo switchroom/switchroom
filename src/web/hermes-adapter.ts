@@ -253,15 +253,26 @@ function cronJobRuns(schedule: ScheduleDashboard, jobId: string): object[] {
   const fires: DispatchResult[] = schedule.recentByAgent[agent] ?? [];
   return fires
     .filter((f) => f.scheduleIndex === index)
-    .map((f) => ({
-      id: `${jobId}/${f.startedAt}`,
-      job_id: jobId,
-      started_at: new Date(f.startedAt).toISOString(),
-      finished_at: new Date(f.finishedAt).toISOString(),
-      exit_code: f.exitCode,
-      output: f.outputSummary,
-      status: f.exitCode === 0 ? "success" : "error",
-    }));
+    .map((f) => {
+      const d = new Date(f.startedAt);
+      const name = d.toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      return {
+        id: `${jobId}/${f.startedAt}`,
+        job_id: jobId,
+        name,
+        started_at: new Date(f.startedAt).toISOString(),
+        finished_at: new Date(f.finishedAt).toISOString(),
+        exit_code: f.exitCode,
+        output: f.outputSummary,
+        status: f.exitCode === 0 ? "success" : "error",
+      };
+    });
 }
 
 /** Map switchroom Turn records to SessionMessage[] for Hermes Desktop history. */
@@ -420,7 +431,9 @@ export async function handleHermesRest(
     const id = decodeURIComponent(messagesMatch[1]);
     if (!config.agents?.[id]) return { status: 404, body: { error: "Unknown session" } };
     const result = handleGetTurns(config, id, 100);
-    if (!result.ok) return { status: 500, body: { error: result.error } };
+    // Degrade gracefully on DB errors (e.g. registry.db not readable by web
+    // container) — return empty messages rather than an error shape that
+    // Hermes iterates as data and crashes on (TypeError: undefined.forEach).
     const messages = turnsToMessages(result.turns ?? []);
     return { status: 200, body: { session_id: id, messages } };
   }
@@ -725,10 +738,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
       }
       const limit = typeof params.limit === "number" ? params.limit : 50;
       const result = handleGetTurns(config, sessionId, Math.min(limit, 200));
-      if (!result.ok) {
-        sendResponse(ctx, rpcErr(id, -32603, result.error ?? "Failed to read history"));
-        break;
-      }
+      // Degrade gracefully on DB errors — return empty messages.
       sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: turnsToMessages(result.turns ?? []) }));
       break;
     }
