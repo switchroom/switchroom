@@ -328,10 +328,12 @@ function switchroomCommandsCatalog() {
       {
         name: "Session",
         pairs: [
-          ["/new", "Fresh session (flush handoff, restart)"],
+          // /new and /restart are intentionally absent — Hermes handles them
+          // natively via its own built-in command table; and injectInbound
+          // cannot correctly dispatch them (they need the grammy bot.command
+          // handler path, which only fires on real Telegram messages).
           ["/compact", "Compact context (summarize, keep the thread)"],
           ["/clear", "Clear context (fresh slate; memory in Hindsight)"],
-          ["/restart", "Restart the agent"],
           ["/model", "Show or switch the Claude model"],
           ["/status", "Agent, model, auth status"],
         ] as [string, string][],
@@ -933,7 +935,13 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
 
-      // Switchroom gateway command — synthesized turn through injectInbound
+      // Non-REPL command — deliver via injectInbound as a synthesized user turn.
+      // Claude receives the command string as conversation text (not a bot.command
+      // dispatch). For commands like /vault, /auth, /doctor, /whoami Claude can
+      // handle them via its MCP tools and knowledge, producing a contextual
+      // response that arrives as a Telegram message. The response is async and
+      // not captured here. Commands that require grammy bot.command handlers
+      // (notably /restart and /new) must not be placed in the catalog.
       const agentsDir = resolveAgentsDir(config);
       const chat = resolveAgentChat(config, sessionId, agentsDir);
       if (!chat) {
