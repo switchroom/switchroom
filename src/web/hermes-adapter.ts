@@ -214,7 +214,7 @@ import type { DispatchResult } from "../scheduler/dispatch.js";
 
 /** Compose a stable CronJob id from agent name + schedule index. */
 function cronJobId(agent: string, index: number): string {
-  return `${agent}/${index}`;
+  return `${agent}~${index}`;
 }
 
 /** Map a ScheduleDashboard to CronJob[] for the Hermes cron panel. */
@@ -241,10 +241,10 @@ function scheduleToCronJobs(schedule: ScheduleDashboard): Record<string, unknown
 
 /** Get run history for a single job id ("<agent>/<index>"). */
 function cronJobRuns(schedule: ScheduleDashboard, jobId: string): object[] {
-  const slash = jobId.lastIndexOf("/");
-  if (slash === -1) return [];
-  const agent = jobId.slice(0, slash);
-  const index = parseInt(jobId.slice(slash + 1), 10);
+  const tilde = jobId.lastIndexOf("~");
+  if (tilde === -1) return [];
+  const agent = jobId.slice(0, tilde);
+  const index = parseInt(jobId.slice(tilde + 1), 10);
   const fires: DispatchResult[] = schedule.recentByAgent[agent] ?? [];
   return fires
     .filter((f) => f.scheduleIndex === index)
