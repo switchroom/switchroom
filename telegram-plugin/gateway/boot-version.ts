@@ -41,8 +41,9 @@ export function formatRelativeAgo(iso: string | null): string | null {
  *
  * Sanitization: claude --version output is whitespace-collapsed before
  * embedding — a malicious or rogue `claude` on PATH must not be able to
- * smuggle newlines into the ack line. HTML escaping happens at the
- * boot-card boundary (see boot-card.ts: escapeHtml(version)).
+ * smuggle newlines into the ack line. Markdown escaping happens at the
+ * boot-card boundary (see boot-card.ts: escapeMarkdown(version)) so any
+ * GFM formatting specials in the version render literally (#2669).
  */
 export function composeBootVersionString(inputs: BootVersionInputs): string {
   const ago = formatRelativeAgo(inputs.commitDate)

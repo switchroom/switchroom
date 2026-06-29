@@ -164,7 +164,15 @@ describe('renderBootCard — degraded conditions', () => {
       restartAgeMs: 6_100,
     })
     expect(out).toContain('⚠️ **Restart**  crash recovery · 6.1s ago')
-    expect(out).toContain('↳ Tail logs: `journalctl --user -u switchroom-lawgpt -n 100`')
+    // The tail-logs command is runtime-aware: in-container (docker) vs
+    // host (journalctl). Assert against whichever branch the renderer
+    // selected so the suite is green under both bun (live container env)
+    // and vitest (env scrubbed) — see vitest.config.ts.
+    const expectedTail =
+      process.env.SWITCHROOM_RUNTIME === 'docker'
+        ? '↳ Tail logs: `docker logs --tail 100 switchroom-lawgpt`'
+        : '↳ Tail logs: `journalctl --user -u switchroom-lawgpt -n 100`'
+    expect(out).toContain(expectedTail)
   })
 
   it('crash row uses agentSlug for the systemd unit when provided', () => {
