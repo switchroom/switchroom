@@ -12,6 +12,7 @@ import {
   type DriveApprovalHandlerDeps,
   handleRequestDriveApproval,
 } from "./drive-write-approval.js";
+import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -284,17 +285,16 @@ describe("handleRequestDriveApproval — TTL clamping", () => {
 // ────────────────────────────────────────────────────────────────────────
 
 describe("handleRequestDriveApproval — oversize card body fit (#1767)", () => {
-  it("truncates the rendered text under 4096 chars before posting", async () => {
+  it("truncates the rendered text under the rich-message cap before posting", async () => {
     const spy = makeSpy();
-    // buildCard returns a body well past Telegram's 4096-char limit
-    // (simulates a docTitle / anchor / summary whose HTML-escape
-    // inflated past the limit). Handler must shrink it before postCard.
+    // buildCard returns a body well past the rich-message wire cap
+    // (RICH_MESSAGE_MAX_CHARS, 32768 post-#2669 — simulates a docTitle /
+    // anchor / summary whose escape inflated past the limit). Handler must
+    // shrink it before postCard.
     const giantText =
       "<b>Title</b>\n" +
-      Array.from({ length: 200 }, (_, i) => `line-${i}-${"x".repeat(40)}`).join(
-        "\n",
-      );
-    expect(giantText.length).toBeGreaterThan(4096);
+      "x".repeat(RICH_MESSAGE_MAX_CHARS + 4000);
+    expect(giantText.length).toBeGreaterThan(RICH_MESSAGE_MAX_CHARS);
     await handleRequestDriveApproval(
       clientFor(spy),
       msgFor(),
@@ -304,7 +304,7 @@ describe("handleRequestDriveApproval — oversize card body fit (#1767)", () => 
       }),
     );
     expect(spy.posted).toHaveLength(1);
-    expect(spy.posted[0]!.text.length).toBeLessThanOrEqual(4096);
+    expect(spy.posted[0]!.text.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS);
     expect(spy.posted[0]!.text).toContain("preview truncated");
     // Card was successfully posted → ok:true response went back.
     expect(spy.sent[0]?.ok).toBe(true);
@@ -334,7 +334,7 @@ describe("handleRequestDriveApproval — oversize card body fit (#1767)", () => 
   it("post failure after truncation surfaces a structured reason", async () => {
     const spy = makeSpy();
     const giantText =
-      "<b>Title</b>\n" + "x".repeat(8000);
+      "<b>Title</b>\n" + "x".repeat(RICH_MESSAGE_MAX_CHARS + 4000);
     await handleRequestDriveApproval(
       clientFor(spy),
       msgFor(),

@@ -8,12 +8,18 @@
  * holds the tuning constants that primitive (and its internal helpers)
  * read, so a forked renderer never re-derives them.
  *
+ * Wire cap: since the Bot API 10.1 rich-message migration (#2669) every card
+ * renders as GFM markdown via `sendRichMessage`, whose limit is
+ * `RICH_MESSAGE_MAX_CHARS` (32768), not the legacy 4096 plain-text cap.
+ *
  * The former `SWITCHROOM_STATUS_NO_TRUNCATE` feature flag was retired:
  * rolling-window-with-char-budget is now the only behaviour. The per-line
  * cap (`STATUS_LINE_MAX`) and rolling window (`STATUS_ROLLING_LINES`) apply
  * universally on BOTH surfaces; the total char budget
  * (`STATUS_CARD_CHAR_BUDGET`) is the wire-limit backstop.
  */
+
+import { RICH_MESSAGE_MAX_CHARS } from './format.js'
 
 /**
  * Number of trailing narrative/step lines shown in the rolling window.
@@ -30,15 +36,15 @@ export const STATUS_ROLLING_LINES = 5
 export const STATUS_LINE_MAX = 200
 
 /**
- * The safe char budget for a rendered Telegram status card. Telegram's hard
- * cap is 4096; we use 4000 to leave 96 chars of headroom for HTML framing,
- * emoji, and escape expansion — matching the convention in
- * pending-work-progress.ts (TELEGRAM_MSG_CAP = 4000).
+ * The safe char budget for a rendered Telegram status card. The rich-message
+ * wire cap is `RICH_MESSAGE_MAX_CHARS` (32768) post-#2669 — the legacy 4096
+ * plain-text cap no longer applies on the rich path. We use the constant
+ * directly as the backstop.
  *
  * With STATUS_ROLLING_LINES=5 lines each ≤ STATUS_LINE_MAX this backstop
  * effectively never fires in practice, but is kept as a wire-limit safety net.
  */
-export const STATUS_CARD_CHAR_BUDGET = 4000
+export const STATUS_CARD_CHAR_BUDGET = RICH_MESSAGE_MAX_CHARS
 
 /** Indent marker for a nested (foreground sub-agent) step line. */
 export const NESTED_PREFIX = '   ↳ '

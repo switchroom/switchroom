@@ -89,6 +89,7 @@ import {
   createSwallowingRetryApiCall,
   retryWithThreadFallback,
   isHtmlParseRejectError,
+  isMessageTooLongError,
 } from '../retry-api-call.js'
 import { installTgPostLogger, withTgPostTags } from '../shared/bot-runtime.js'
 import { buildAttachmentPath, assertInsideInbox } from '../attachment-path.js'
@@ -189,7 +190,7 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, repairEscapedWhitespace, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -8087,7 +8088,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   })()
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
-  let text = repairEscapedWhitespace(rawText)
+  // Repair LLM JSON-escape bungles, then promote lone prose paragraph breaks
+  // into GFM hard breaks so the rich path doesn't collapse them (lists/tables/
+  // code are left untouched — see normalizeParagraphBreaks).
+  let text = normalizeParagraphBreaks(repairEscapedWhitespace(rawText))
   // Outbound secret scrub (#2044): mask any secret the agent echoed BEFORE
   // the stderr preview below, the dedup key, the send, and the history
   // record. Mutates `text` so every downstream consumer sees the masked
@@ -8744,6 +8748,41 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
         return lockedBot.api.sendRichMessage(chat_id, richMessage(chunks[i]), richOpts as never)
       }
 
+      // Length-error recovery: a single pre-computed chunk can still exceed the
+      // wire cap when splitMarkdownChunks hit an indivisible region and emitted
+      // it whole (a giant fenced block, a no-boundary blob). Telegram answers
+      // with RICH_MESSAGE_TEXT_TOO_LONG / MESSAGE_TOO_LONG. Re-split this chunk
+      // at a harder boundary and send each piece, rather than misclassifying it
+      // as a parse-reject (which would resend the same oversized payload as
+      // plain text) or surfacing the raw 400.
+      const sendChunkResplit = async (opts: Record<string, unknown>): Promise<void> => {
+        // Re-split at the same cap; for a truly indivisible block this still
+        // yields one oversized piece, but a hard character-cut on the rendered
+        // markdown at least keeps each delivered piece under the wire cap.
+        const subPieces = splitMarkdownChunks(chunks[i], RICH_MESSAGE_MAX_CHARS)
+        const pieces =
+          subPieces.length > 1
+            ? subPieces
+            : hardSliceToCap(chunks[i], RICH_MESSAGE_MAX_CHARS)
+        for (let p = 0; p < pieces.length; p++) {
+          let sent: { message_id: number }
+          if (literalText) {
+            // allow-raw-bot-api: length-error re-split last resort (literal text); wrapping would re-enter the chunk-loop's own classification on an already-classified length failure.
+            sent = await lockedBot.api.sendMessage(chat_id, pieces[p], opts as never)
+          } else {
+            const ro = { ...opts }
+            delete (ro as { link_preview_options?: unknown }).link_preview_options
+            // allow-raw-bot-api: length-error re-split last resort (rich); wrapping would re-enter the chunk-loop's own classification on an already-classified length failure.
+            sent = await lockedBot.api.sendRichMessage(chat_id, richMessage(pieces[p]), ro as never)
+          }
+          sentIds.push(sent.message_id)
+          logOutbound('reply', chat_id, sent.message_id, pieces[p].length, `chunk=${i + 1}/${chunks.length} resplit=${p + 1}/${pieces.length}`)
+        }
+        process.stderr.write(
+          `telegram gateway: rich body too long — re-split chunk ${i + 1}/${chunks.length} into ${pieces.length} piece(s)\n`,
+        )
+      }
+
       try {
         const sent = await robustApiCall(() => sendChunk(sendOpts), { threadId, chat_id })
         sentIds.push(sent.message_id)
@@ -8757,10 +8796,14 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             const sent = await sendChunk(retryOpts)
             sentIds.push(sent.message_id)
           } catch (retryErr) {
-            // Thread dropped, but the markdown is also unparseable — go plain.
-            if (isHtmlParseRejectError(retryErr)) await sendChunkPlainText(retryOpts)
+            // Thread dropped, AND another failure: length → re-split,
+            // parse-reject → plain text, else propagate.
+            if (isMessageTooLongError(retryErr)) await sendChunkResplit(retryOpts)
+            else if (isHtmlParseRejectError(retryErr)) await sendChunkPlainText(retryOpts)
             else throw retryErr
           }
+        } else if (isMessageTooLongError(err)) {
+          await sendChunkResplit(sendOpts)
         } else if (isHtmlParseRejectError(err)) {
           await sendChunkPlainText(sendOpts)
         } else {
@@ -9259,6 +9302,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       bot: lockedBot as unknown as { api: import('../stream-controller.js').StreamBotApi },
       retry: robustApiCall,
       repairEscapedWhitespace,
+      normalizeParagraphBreaks,
       assertAllowedChat,
       resolveThreadId,
       disableLinkPreview: access.disableLinkPreview !== false,
@@ -10508,7 +10552,11 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // Single rich-markdown path (#2669): `format:'text'` edits as a literal
   // plain string; everything else edits via the rich-markdown path.
   const editLiteralText = editFormat === 'text'
+  // Match the reply path: repair JSON-escape bungles, then promote lone prose
+  // paragraph breaks for the rich path. A literal-text edit (`format:'text'`)
+  // skips paragraph normalization — it must edit byte-for-byte as given.
   let editRawText = repairEscapedWhitespace(args.text as string)
+  if (!editLiteralText) editRawText = normalizeParagraphBreaks(editRawText)
   // Outbound secret scrub (#2044): an edit must not re-introduce a raw
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')
@@ -14687,7 +14735,10 @@ function switchroomExecCombined(args: string[], timeoutMs = 15000): string {
   })
 }
 
-function formatSwitchroomOutput(output: string, maxLen = 4000): string {
+// Default truncation budget for CLI output bound for Telegram. The rich-message
+// wire cap is RICH_MESSAGE_MAX_CHARS (32768) post-#2669, not the legacy 4096
+// plain-text limit. Mirrors shared/bot-runtime.ts formatSwitchroomOutput.
+function formatSwitchroomOutput(output: string, maxLen = RICH_MESSAGE_MAX_CHARS): string {
   const trimmed = output.trim()
   if (trimmed.length <= maxLen) return trimmed
   return trimmed.slice(0, maxLen - 20) + '\n... (truncated)'

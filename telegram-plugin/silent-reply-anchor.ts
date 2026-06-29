@@ -38,8 +38,15 @@
  * the safety net off; reverts to per-reply fresh send.
  */
 
-/** Telegram caption / text limit. The accumulator stays under this. */
-export const TELEGRAM_MSG_CAP = 4000
+import { RICH_MESSAGE_MAX_CHARS } from './format.js'
+
+/**
+ * Telegram rich-message text limit. The accumulator stays under this before
+ * it rolls to a fresh anchor. Post-#2669 every reply renders as GFM markdown
+ * via `sendRichMessage`, so the cap is `RICH_MESSAGE_MAX_CHARS` (32768), not
+ * the legacy 4096 plain-text limit.
+ */
+export const TELEGRAM_MSG_CAP = RICH_MESSAGE_MAX_CHARS
 
 export interface SilentReplyAnchorDecisionInput {
   /** True when the model passed `disable_notification: true` for

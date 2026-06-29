@@ -31,6 +31,7 @@ import type {
   RequestDriveApprovalMessage,
 } from "./ipc-protocol.js";
 import { truncateRawToFit } from "./oversize-card-body.js";
+import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
 
 // ────────────────────────────────────────────────────────────────────────
 // Injected deps — caller (gateway.ts) wires these from the existing
@@ -102,15 +103,20 @@ const MAX_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MIN_TTL_MS = 30 * 1000; // 30 seconds
 
 /**
- * Telegram `sendMessage` hard limit. `buildDiffPreviewCard` HTML-
- * escapes the docTitle + every body line with no upstream length
- * cap, so an adversarial or just-unusually-long docTitle / anchor
- * displayName / agent-supplied summary can render past 4096 once
- * `&` / `<` / `>` inflate up to 5x. We rebuild a truncated body
- * keyed off the wrapper-attested fields when that happens. (#1767)
+ * Telegram rich-message hard limit. `buildDiffPreviewCard` escapes the
+ * docTitle + every body line with no upstream length cap, so an adversarial
+ * or just-unusually-long docTitle / anchor displayName / agent-supplied
+ * summary can render past the wire cap once escaping inflates it. We rebuild a
+ * truncated body keyed off the wrapper-attested fields when that happens.
+ * (#1767)
+ *
+ * Post-#2669 every card renders as GFM markdown via `sendRichMessage`, so the
+ * hard cap is `RICH_MESSAGE_MAX_CHARS` (32768), not the legacy 4096 plain-text
+ * limit. RENDERED_BODY_CAP keeps the proportional ~5% headroom under the hard
+ * cap that the original 3900-under-4096 budget carried.
  */
-const TELEGRAM_SENDMESSAGE_LIMIT = 4096;
-const RENDERED_BODY_CAP = 3900;
+const TELEGRAM_SENDMESSAGE_LIMIT = RICH_MESSAGE_MAX_CHARS;
+const RENDERED_BODY_CAP = RICH_MESSAGE_MAX_CHARS - 200;
 const OVERSIZE_SENTINEL = "\n[… preview truncated; open in Drive for full context]";
 
 /**

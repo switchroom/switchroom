@@ -16,6 +16,9 @@
  *   - splitMarkdownChunks: split a long markdown body into <=maxLen chunks
  *     at safe boundaries (never mid code-fence, never mid table row),
  *     defaulting maxLen to the rich-message cap of 32768.
+ *   - normalizeParagraphBreaks: promote a LONE prose `\n` into a GFM hard
+ *     break (`  \n`) so paragraph separation survives the rich GFM path,
+ *     while leaving lists / tables / code / `\n\n` untouched.
  *   - RICH_MESSAGE_MAX_CHARS: the rich-text wire cap (32768).
  */
 
@@ -80,36 +83,12 @@ export function repairEscapedWhitespace(text: string): string {
   // index and produce "undefined" in the Telegram output. A nonce that is unique
   // per invocation makes the sentinel statistically impossible to collide with.
   const nonce = Math.random().toString(36).slice(2)
-  const CODE_MASK_PH = `\x00RM${nonce}_`
   const BACKSLASH_PH = `\x00BK${nonce}_`
 
-  // Mask fenced code blocks (``` ... ```) and inline code spans (` ... `)
-  // so the unescape pass never touches their content.
-  //
-  // Fenced blocks are extracted first. Only CLOSED fenced blocks (with a
-  // matching closing ```) are masked — an unclosed fence is left as-is so the
-  // inline-code pass below won't misparse the two leading backticks as an empty
-  // inline span and expose the block's interior.
-  //
-  // Inline code uses `[^\`\n]+` (one or more non-backtick, non-newline chars)
-  // matching the same definition the chunker uses, so the masked regions are
-  // consistent with what the downstream pipeline treats as code.
-  const codeMasks: string[] = []
-
-  const masked = text
-    // Closed fenced code blocks only (``` ... ``` with a matching closer).
-    .replace(/```[\s\S]*?```/g, (m) => {
-      const idx = codeMasks.length
-      codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
-    })
-    // Inline code spans: at least one character between backticks, no embedded
-    // backtick or newline.
-    .replace(/`[^`\n]+`/g, (m) => {
-      const idx = codeMasks.length
-      codeMasks.push(m)
-      return `${CODE_MASK_PH}${idx}\x00`
-    })
+  // Mask fenced code blocks and inline code spans so the unescape pass never
+  // touches their content (shared masker — see maskCodeRegions for the exact
+  // closed-fence / inline-span definitions).
+  const { masked, restore } = maskCodeRegions(text, nonce)
 
   // Order matters: protect existing `\\` first so `\\n` stays as a literal
   // backslash + n and doesn't become a newline.
@@ -122,8 +101,337 @@ export function repairEscapedWhitespace(text: string): string {
     .replace(new RegExp(BACKSLASH_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '\\')
 
   // Restore masked code spans verbatim.
-  const restoreRe = new RegExp(`${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`, 'g')
-  return unescaped.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+  return restore(unescaped)
+}
+
+// ---------------------------------------------------------------------------
+// Shared code-region masking (used by repairEscapedWhitespace AND
+// normalizeParagraphBreaks). Closed fenced blocks (``` … ```) and inline
+// code spans (` … `) are replaced with unique placeholders so neither pass
+// ever rewrites their interior; `restore` puts them back verbatim.
+// ---------------------------------------------------------------------------
+
+interface MaskedCode {
+  masked: string
+  restore: (s: string) => string
+  /** The placeholder prefix injected for each masked region (fence or span). */
+  placeholder: string
+}
+
+/**
+ * Mask fenced code blocks and inline code spans with collision-resistant
+ * placeholders. `nonce` is a per-call random string the caller already holds
+ * (so two maskers in one function share one nonce namespace cleanly).
+ *
+ * Fenced blocks are extracted FIRST and only when CLOSED (matching ```), so an
+ * unclosed fence is left intact rather than misparsed by the inline pass. Inline
+ * spans use `[^\`\n]+` — the same definition the chunker treats as code.
+ */
+function maskCodeRegions(text: string, nonce: string): MaskedCode {
+  const CODE_MASK_PH = `\x00RM${nonce}_`
+  const codeMasks: string[] = []
+
+  const masked = text
+    .replace(/```[\s\S]*?```/g, (m) => {
+      const idx = codeMasks.length
+      codeMasks.push(m)
+      return `${CODE_MASK_PH}${idx}\x00`
+    })
+    .replace(/`[^`\n]+`/g, (m) => {
+      const idx = codeMasks.length
+      codeMasks.push(m)
+      return `${CODE_MASK_PH}${idx}\x00`
+    })
+
+  const restoreRe = new RegExp(
+    `${CODE_MASK_PH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)\x00`,
+    'g',
+  )
+  const restore = (s: string): string =>
+    s.replace(restoreRe, (_m, idx) => codeMasks[Number(idx)] ?? _m)
+
+  return { masked, restore, placeholder: CODE_MASK_PH }
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph-break normalizer — make lone prose newlines survive the GFM path
+// ---------------------------------------------------------------------------
+
+/**
+ * GFM (the rich-message render path) treats a LONE `\n` as a *soft* break: the
+ * two lines collapse onto the same visual line, so a model that separates its
+ * paragraphs with a single newline produces a cramped wall of text. The old
+ * markdown→HTML path rendered every `\n` as a hard break, which masked the
+ * habit; the rich path no longer does.
+ *
+ * This normalizer fixes that DETERMINISTICALLY without breaking GFM block
+ * syntax. It does exactly two things, on code-masked text:
+ *
+ *   1. Collapse runs of 3+ newlines down to exactly `\n\n` (never collapse a
+ *      genuine `\n\n` paragraph gap).
+ *   2. Promote a LONE `\n` (one not adjacent to another `\n`) into a GFM hard
+ *      break (`  \n`, two trailing spaces) — but ONLY when it is a genuine
+ *      prose paragraph break.
+ *
+ * The promotion heuristic is deliberately CONSERVATIVE — it prefers a false
+ * negative (leaving a break un-promoted, so two prose lines stay cramped) over
+ * a false positive (double-spacing a tight list or table). A break is promoted
+ * only when ALL of these hold:
+ *
+ *   - The preceding line ends in sentence-terminal punctuation: `.`, `!`, `?`,
+ *     `:`, or a closing `)` / `"` / `'` / `’` / `”` that itself follows such a
+ *     terminator (e.g. `...done.")`).
+ *   - The preceding line is NOT itself a marker line (list / table / quote /
+ *     heading).
+ *   - The NEXT line starts with a non-marker character: not a list bullet
+ *     (`-`/`*`/`+`/`\d+.`/`\d+)`, incl. indented), not a table row (`|` or
+ *     ` | `), not a blockquote (`>`), not a heading (`#`), not blank.
+ *
+ * Code fences and inline code are masked out before any of this runs, so their
+ * interior `\n`s are never touched.
+ */
+export function normalizeParagraphBreaks(text: string): string {
+  if (!text.includes('\n')) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  // Step 1: collapse 3+ newlines to exactly two. This also normalizes runs that
+  // contain interleaved spaces only between the newlines is NOT done here —
+  // we only touch pure newline runs so we never eat meaningful whitespace.
+  let out = masked.replace(/\n{3,}/g, '\n\n')
+
+  // Step 2: walk lines and promote lone prose breaks. We rebuild the string by
+  // joining lines with the right separator. A separator is "hard" (`  \n`) only
+  // when the break between this line and the next is a genuine prose paragraph
+  // break per the heuristic; otherwise it stays a plain `\n`. Blank lines (the
+  // `\n\n` gaps) are preserved as empty entries in the split, so we never
+  // promote a break that is adjacent to a blank line.
+  const lines = out.split('\n')
+  const pieces: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]
+    const isLast = i === lines.length - 1
+    const next = isLast ? '' : lines[i + 1]
+    // A blank current or next line means this is part of a `\n\n` gap — leave
+    // the separator as a plain newline (the blank entry reconstructs the gap).
+    const promote =
+      !isLast &&
+      line.trim() !== '' &&
+      next.trim() !== '' &&
+      shouldPromoteBreak(line, next, placeholder)
+    if (promote) {
+      // Strip any trailing whitespace the line already carried so we emit
+      // exactly one `  \n` hard break (never accumulate spaces on a re-run).
+      // Include `\r` so a CRLF source ("Alpha.\r\nBravo.") doesn't strand a
+      // lone carriage return before the injected `  \n`.
+      line = line.replace(/[ \t\r]+$/, '')
+    }
+    pieces.push(line)
+    if (isLast) break
+    pieces.push(promote ? '  \n' : '\n')
+  }
+  out = pieces.join('')
+
+  // Step 3: guarantee a blank line (`\n\n`) at BLOCK BOUNDARIES. The
+  // prose-promotion above keeps lists/tables tight by leaving their single
+  // `\n` separators alone — but GFM's rich renderer needs a blank line to
+  // START a new block, so a block that is glued to the previous line by a
+  // single `\n` fails to render (a table prints as literal pipe text, prose
+  // after a list is absorbed as a lazy list continuation). This pass inserts
+  // the missing blank line at those transitions only, on the same masked text,
+  // never touching code interiors, never collapsing/expanding existing `\n\n`,
+  // and never splitting a table's header/delimiter/body rows apart.
+  out = ensureBlockBoundaries(out, placeholder)
+
+  return restore(out)
+}
+
+// ---------------------------------------------------------------------------
+// Block-boundary blank-line guarantee (Step 3 of normalizeParagraphBreaks)
+// ---------------------------------------------------------------------------
+
+/** A line that begins a GFM list item (bullet or ordered), incl. leading indent. */
+function isListItemLine(line: string): boolean {
+  const t = line.trimStart()
+  return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t)
+}
+
+/** A GFM table body/header row: a line whose first non-space char is `|`. */
+function isTableRowLine(line: string): boolean {
+  return /^\s*\|/.test(line)
+}
+
+/**
+ * A GFM table delimiter row: optional leading pipe, then one or more
+ * `:?-{1,}:?` cells separated by pipes (e.g. `|---|---|`, `---|:--:`,
+ * `| :-- | --: |`). This is what turns the line ABOVE it into a table header.
+ */
+function isTableDelimiterLine(line: string): boolean {
+  return /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(line)
+}
+
+/** A fenced-code OPEN line — either a literal ``` fence or a masked block. */
+function isFenceOpenLine(line: string, placeholder?: string): boolean {
+  const t = line.trimStart()
+  if (placeholder != null && placeholder.length > 0 && t.startsWith(placeholder)) return true
+  return t.startsWith('```')
+}
+
+/** A blockquote line. */
+function isBlockquoteLine(line: string): boolean {
+  return line.trimStart().startsWith('>')
+}
+
+/** An ATX heading line. */
+function isHeadingLine(line: string): boolean {
+  return /^#{1,6}\s/.test(line.trimStart())
+}
+
+/**
+ * Insert a blank line at block boundaries that are currently separated by
+ * exactly one `\n`. Operates line-by-line on already-code-masked text.
+ *
+ * A blank line is guaranteed:
+ *   - BEFORE the first row of a GFM table (a `|`-leading line that is itself a
+ *     delimiter row, OR a `|`-containing header line immediately followed by a
+ *     delimiter row) when the previous emitted line is non-blank and not part
+ *     of a table — never between a table's own header/delimiter/body rows.
+ *   - BEFORE a fenced-code open, a blockquote, or an ATX heading when the
+ *     previous line is non-blank and of a DIFFERENT block type.
+ *   - AFTER a list block: when a list-item line is followed by a non-blank
+ *     line that is NOT itself a list item and NOT an indented continuation of
+ *     the item (4+ leading spaces / a tab), so the prose breaks out of the list.
+ *
+ * Conservative: prefers a false negative (leave glued) over corrupting a valid
+ * block. Existing blank lines (empty entries from a `\n\n` gap) are preserved
+ * and short-circuit every rule — we never double up a gap.
+ */
+function ensureBlockBoundaries(text: string, placeholder?: string): string {
+  if (!text.includes('\n')) return text
+  const lines = text.split('\n')
+  const result: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const prev = result.length > 0 ? result[result.length - 1] : null
+    const prevNonBlank = prev != null && prev.trim() !== ''
+    const curBlank = line.trim() === ''
+
+    // ---- Rule A: blank line BEFORE a block that needs one to start ----
+    if (prevNonBlank && !curBlank) {
+      const next = i + 1 < lines.length ? lines[i + 1] : ''
+
+      // Table first row: either THIS line is a delimiter row (header was the
+      // prev line — but only treat as a table start when prev itself isn't
+      // already a table row), or THIS line is a `|`-bearing header whose NEXT
+      // line is a delimiter. We anchor the blank-line insertion on the HEADER
+      // line so header+delimiter+body stay contiguous.
+      const prevIsTable = isTableRowLine(prev)
+      const startsTableHere =
+        !prevIsTable &&
+        ((line.includes('|') && isTableDelimiterLine(next)) ||
+          (isTableRowLine(line) && isTableDelimiterLine(next)))
+
+      const startsFence = isFenceOpenLine(line, placeholder) && !isFenceOpenLine(prev, placeholder)
+      const startsQuote = isBlockquoteLine(line) && !isBlockquoteLine(prev)
+      const startsHeading = isHeadingLine(line) && !isHeadingLine(prev)
+
+      if (startsTableHere || startsFence || startsQuote || startsHeading) {
+        result.push('')
+      }
+    }
+
+    // ---- Rule B: blank line AFTER a list block, before breakout prose ----
+    if (prevNonBlank && !curBlank && isListItemLine(prev) && !isListItemLine(line)) {
+      // A 4+ space (or tab) indent means `line` is a lazy continuation of the
+      // list item's paragraph, NOT breakout prose — leave it glued.
+      const isIndentedContinuation = /^(\t| {4,})\S/.test(line)
+      // A table/fence/quote/heading start is already handled by Rule A above
+      // (its blank line was just inserted); avoid inserting a second one.
+      const alreadySeparated = result.length > 0 && result[result.length - 1].trim() === ''
+      if (!isIndentedContinuation && !alreadySeparated) {
+        result.push('')
+      }
+    }
+
+    result.push(line)
+  }
+
+  return result.join('\n')
+}
+
+/** Lines that introduce GFM block structure — never reflow around these. */
+function isMarkerLine(line: string, placeholder?: string): boolean {
+  // CommonMark indented code block: 4+ leading spaces then a non-space char.
+  // Checked on the RAW (pre-trim) line — trimming would erase the very indent
+  // that makes it a code block, so we must look before `trimStart()`.
+  if (/^ {4,}\S/.test(line)) return true
+  const t = line.trimStart()
+  // A line that begins with the code-mask placeholder is a standalone masked
+  // fenced block — treat it as a block marker so we never inject a hard break
+  // immediately before/after a code block. (An INLINE code span sits mid-line,
+  // so the line won't START with the placeholder and ordinary prose rules apply.)
+  if (placeholder != null && placeholder.length > 0 && t.startsWith(placeholder)) return true
+  return (
+    // Unordered list bullet: -, *, + followed by a space.
+    /^[-*+]\s/.test(t) ||
+    // Ordered list: `1.` or `1)` followed by a space.
+    /^\d+[.)]\s/.test(t) ||
+    // Blockquote / pull-quote.
+    t.startsWith('>') ||
+    // ATX heading.
+    /^#{1,6}\s/.test(t) ||
+    // Table row (leading pipe) or table-ish line (interior ` | `).
+    t.startsWith('|') ||
+    line.includes(' | ') ||
+    // Fenced code delimiter (defensive — fences are masked, but a lone/odd
+    // fence line can survive masking).
+    t.startsWith('```') ||
+    // Thematic break / divider.
+    /^(-{3,}|\*{3,}|_{3,})\s*$/.test(t)
+  )
+}
+
+/**
+ * Decide whether the lone `\n` between `prev` and `next` is a genuine prose
+ * paragraph break worth promoting to a GFM hard break. Conservative by design
+ * (see normalizeParagraphBreaks doc) — returns false on any doubt.
+ */
+function shouldPromoteBreak(prev: string, next: string, placeholder?: string): boolean {
+  if (isMarkerLine(prev, placeholder) || isMarkerLine(next, placeholder)) return false
+  // Next line must begin with ordinary prose, not a structural marker char.
+  const nextTrimmed = next.trimStart()
+  if (nextTrimmed.length === 0) return false
+  // The preceding line must read as a finished sentence/clause: it ends in a
+  // sentence-terminal punctuation mark, optionally wrapped by a closing quote
+  // or paren that itself follows such a terminator.
+  const prevTrimmed = prev.trimEnd()
+  // Strip up to one trailing closing-bracket/quote run to look at the real
+  // terminator (e.g. `He said "go."` or `(done.)`).
+  const unwrapped = prevTrimmed.replace(/[)"'’”\]]+$/, '')
+  const terminator = unwrapped.slice(-1)
+  return terminator === '.' || terminator === '!' || terminator === '?' || terminator === ':'
+}
+
+/**
+ * Last-resort hard slicer for a body that `splitMarkdownChunks` could not break
+ * (a single indivisible region larger than the cap — e.g. a giant fenced block
+ * with no interior boundary). Cuts on raw character count so every emitted
+ * piece is guaranteed `<= cap`, accepting that a cut MAY land inside a fence
+ * (which Telegram renders imperfectly) — a degraded-but-delivered message beats
+ * a hard `RICH_MESSAGE_TEXT_TOO_LONG` reject that drops the answer entirely.
+ *
+ * Returns the input as a single-element array when it already fits.
+ */
+export function hardSliceToCap(text: string, cap = RICH_MESSAGE_MAX_CHARS): string[] {
+  if (cap <= 0) return [text]
+  if (text.length <= cap) return [text]
+  const out: string[] = []
+  for (let i = 0; i < text.length; i += cap) {
+    out.push(text.slice(i, i + cap))
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------

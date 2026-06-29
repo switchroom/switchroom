@@ -266,6 +266,10 @@ export async function retryWithThreadFallback<T>(
  */
 export function isHtmlParseRejectError(err: unknown): boolean {
   if (!(err instanceof GrammyError) || err.error_code !== 400) return false
+  // A too-long rejection is a LENGTH error (see isMessageTooLongError) — never
+  // route it through the plain-text parse-reject fallback, which would resend
+  // the same oversized body and fail again. The caller re-splits instead.
+  if (isMessageTooLongError(err)) return false
   const d = (err.description || '').toLowerCase()
   return (
     d.includes("can't parse entities") ||
@@ -280,5 +284,28 @@ export function isHtmlParseRejectError(err: unknown): boolean {
     d.includes('can’t find end of the entity') ||
     // covers both "expected end tag" and "unexpected end tag"
     d.includes('expected end tag')
+  )
+}
+
+/**
+ * True when Telegram rejected the message because the BODY WAS TOO LONG (over
+ * the rich-message wire cap), not because the markdown failed to parse.
+ *
+ * The rich path surfaces this as `RICH_MESSAGE_TEXT_TOO_LONG` (empirically the
+ * description for 32769+ chars); the legacy plain-text path used
+ * `MESSAGE_TOO_LONG` / "message is too long". A caller that hits this should
+ * re-split the body (`splitMarkdownChunks` at a smaller cap) and resend, NOT
+ * treat it as a parse-reject (which resends the same oversized payload as
+ * plain text). Mirrors rich-send.ts `isLengthError`.
+ */
+export function isMessageTooLongError(err: unknown): boolean {
+  if (!(err instanceof GrammyError) || err.error_code !== 400) return false
+  const d = (err.description || '').toLowerCase()
+  return (
+    d.includes('rich_message_text_too_long') ||
+    d.includes('message_too_long') ||
+    d.includes('text_too_long') ||
+    d.includes('message is too long') ||
+    d.includes('text is too long')
   )
 }

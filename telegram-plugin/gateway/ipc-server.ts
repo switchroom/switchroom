@@ -20,6 +20,7 @@ import type {
   ToolCallMessage,
   ToolCallResult,
 } from "./ipc-protocol.js";
+import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
 
 export interface IpcServerOptions {
   socketPath: string;
@@ -230,9 +231,11 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
     case "pty_partial":
       // Extracted reply text from PTY-tail. May be empty (the extractor
       // returns empty strings for "no text yet" snapshots — gateway
-      // handler dedups on lastPtyPreviewByChat). Capped at 8192 to
-      // give some headroom over Telegram's 4096-char wire limit while
-      // still bounding buffer growth from a runaway extractor.
+      // handler dedups on lastPtyPreviewByChat). Capped at 8192 — this is a
+      // preview-buffer bound on the PTY tail, not the outbound wire cap (which
+      // is now RICH_MESSAGE_MAX_CHARS / 32768 on the rich path post-#2669) —
+      // sized to bound buffer growth from a runaway extractor while still
+      // carrying a useful preview.
       return typeof m.text === "string"
         && (m.text as string).length <= 8192;
     case "update_placeholder":
@@ -270,10 +273,12 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (typeof m.agentName !== "string"
         || !AGENT_NAME_RE.test(m.agentName as string)) return false;
       if (typeof m.chatId !== "string" || (m.chatId as string).length === 0) return false;
-      // text non-empty and bounded — Telegram caps a message at 4096 chars;
-      // reject over-long here (defense in depth against a malformed payload).
+      // text non-empty and bounded — the send_outbound handler posts via
+      // sendRichMessage (rich path), whose wire cap is RICH_MESSAGE_MAX_CHARS
+      // (32768) post-#2669, not the legacy 4096 plain-text limit. Reject
+      // over-long here (defense in depth against a malformed payload).
       if (typeof m.text !== "string" || (m.text as string).length === 0
-        || (m.text as string).length > 4096) return false;
+        || (m.text as string).length > RICH_MESSAGE_MAX_CHARS) return false;
       if (m.threadId !== undefined
         && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
       if (m.parseMode !== undefined && m.parseMode !== "html" && m.parseMode !== "text") return false;

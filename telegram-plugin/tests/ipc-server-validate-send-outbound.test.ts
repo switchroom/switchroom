@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { validateClientMessage } from "../gateway/ipc-server.js";
+import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
 
 const base = { type: "send_outbound", agentName: "clerk", chatId: "12345", text: "Daily heartbeat" };
 
@@ -38,8 +39,11 @@ describe("validateClientMessage — send_outbound", () => {
     expect(validateClientMessage({ ...base, text: undefined })).toBe(false);
     expect(validateClientMessage({ ...base, text: "" })).toBe(false);
     expect(validateClientMessage({ ...base, text: 5 })).toBe(false);
-    expect(validateClientMessage({ ...base, text: "x".repeat(4096) })).toBe(true); // at the cap
-    expect(validateClientMessage({ ...base, text: "x".repeat(4097) })).toBe(false); // over Telegram's limit
+    // send_outbound posts via sendRichMessage (rich path), so the cap is the
+    // rich-message wire limit (RICH_MESSAGE_MAX_CHARS, 32768) post-#2669, not
+    // the legacy 4096 plain-text limit.
+    expect(validateClientMessage({ ...base, text: "x".repeat(RICH_MESSAGE_MAX_CHARS) })).toBe(true); // at the cap
+    expect(validateClientMessage({ ...base, text: "x".repeat(RICH_MESSAGE_MAX_CHARS + 1) })).toBe(false); // over the cap
   });
 
   it("rejects a non-integer threadId", () => {

@@ -137,7 +137,7 @@ const TOOL_SCHEMAS = [
   {
     name: 'stream_reply',
     description:
-      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard-stops at 4096 chars — longer text throws; fall back to `reply`, which chunks. Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface). inline_keyboard adds tappable buttons under the final message — see `reply` for shape and constraints.',
+      'Post the final answer for this turn. The plugin renders an event-driven progress card (Plan → Run → Done with live tool bullets, elapsed time, and status emoji) for free while the turn is in-flight, so you do not need to narrate intermediate progress. Call `stream_reply` exactly once per turn with done=true and the complete answer text. Hard cap is 32768 chars (the rich-message wire limit) — longer text is dropped by a defensive guard, so use `reply` for anything that long (it chunks). Calling with done=false is an error in this environment (the progress card already owns the mid-turn surface). inline_keyboard adds tappable buttons under the final message — see `reply` for shape and constraints.',
     inputSchema: {
       type: 'object',
       properties: {
