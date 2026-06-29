@@ -345,6 +345,14 @@ export async function handleHermesRest(
     if (pathname.includes("sessions")) {
       return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
     }
+    // /api/profiles — ProfilesResponse: { profiles: ProfileInfo[] }
+    if (pathname === "/api/profiles") {
+      return { status: 200, body: { profiles: [] } };
+    }
+    // /api/profiles/:name/soul — { content: string; exists: boolean }
+    if (pathname.endsWith("/soul")) {
+      return { status: 200, body: { content: "", exists: false } };
+    }
     return { status: 200, body: {} };
   }
 
