@@ -10770,11 +10770,12 @@ function showNarrativeStep(turn: CurrentTurn, text: string): void {
   // card-drain gate (chatLock-serialized under the flag; verbatim block OFF).
   cardDrainGate(turn, ea, () => {
   if (ea.mayDrain(turn)) {
-    // Producer A (narrative SHOW): may only EDIT an already-open card, never
-    // OPEN one on a 0-tool turn (design §9 lever 5 base case — the
-    // triplication). The OPEN gate in the drain enforces this; accumulation
-    // into mirrorLines still happens so the narration renders once a tool
-    // label or liveness opens the card.
+    // Producer A (narrative SHOW): pre-answer narrative may now OPEN a card,
+    // not just EDIT one — lever 5 is INERT (see feed-open-gate.ts), and
+    // Lever 2 / clearActivitySummary guarantees reply-is-last ordering instead.
+    // Accumulation into mirrorLines still happens, so any narration staged
+    // before the card opened renders on the first OPEN (whichever producer
+    // wins the race — narrative here, or the enqueue/liveness timer).
     // PR-4a: routed through the emission-authority façade (no-op delegate).
     ea.openOrEditCard('narrative', () => {
       turn.activityInFlight = drainActivitySummary(turn, 'narrative')

@@ -135,7 +135,8 @@ export function shouldEarlyOpenLiveness(input: EarlyLivenessOpenInput): boolean 
 /** Which producer triggered this drain — determines lever-5 OPEN eligibility. */
 export type FeedOpenProducer =
   /** Narrative SHOW (producer A): plain assistant text, no tool, no time
-   *  threshold. May only EDIT, never OPEN, while the turn has 0 tool labels. */
+   *  threshold. Pre-answer it is OPEN-eligible (lever 5 INERT); after a
+   *  substantive final answer it is blocked by lever 1. */
   | 'narrative'
   /** Tool label (producer B): the model dispatched a tool. OPEN-eligible unless a
    *  substantive final already landed (lever 1).
