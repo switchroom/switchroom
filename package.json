@@ -47,7 +47,7 @@
     "bcryptjs": "^3.0.3",
     "chalk": "^5.4.0",
     "commander": "^13.1.0",
-    "grammy": "^1.21.0",
+    "grammy": "^1.44",
     "handlebars": "^4.7.8",
     "posthog-node": "^5.29.2",
     "yaml": "^2.7.0",
