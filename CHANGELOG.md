@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.16.19 — Dependency maintenance
+
+CI and base-image dependency bumps, no runtime behavior change: refreshed the `node:22-trixie-slim` base image digest (#2646), bumped `actions/setup-python` 6.2.0 → 6.3.0 (#2648), and `actions/cache` 5.0.5 → 6.1.0 (#2647).
+
 ## v0.16.18 — Hermes Desktop render crash fix
 
 Fixes a React render crash (`Cannot read properties of undefined (reading 'length')`) that occurred immediately after the WebSocket connected. `GET /api/cron/jobs` was returning `{}` instead of `[]` (Hermes renders the cron-jobs list with `.length`), and `GET /api/messaging/platforms` was returning `{}` instead of `{ platforms: [] }`. Both stubs now return the correct shape. (#2653)
