@@ -306,7 +306,7 @@ export async function handleHermesRest(
   if (method === "GET" && pathname.startsWith("/api/cron")) {
     // GET /api/cron/jobs → CronJob[] (array directly, not wrapped)
     if (pathname === "/api/cron/jobs") return { status: 200, body: [] };
-    // /api/cron/jobs/:id/runs → SessionInfo[]
+    // /api/cron/jobs/:id/runs → { runs: [] }
     if (pathname.includes("/runs")) return { status: 200, body: { runs: [] } };
     // Other cron paths: sessions-like wrapper
     if (pathname.includes("sessions")) {
