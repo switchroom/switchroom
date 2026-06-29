@@ -102,7 +102,7 @@ import {
   withAuthBrokerClient,
   type AccountState,
 } from "../auth/broker/client.js";
-import { openTurnsDb, listTurnsForAgent, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
+import { openTurnsDb, listTurnsForAgent, listDistinctThreadIds, type Turn } from "../../telegram-plugin/registry/turns-schema.js";
 import { applySubagentsSchema, listSubagents, type Subagent } from "../../telegram-plugin/registry/subagents-schema.js";
 import { SwrCache } from "./cache.js";
 
@@ -443,17 +443,40 @@ export async function handleGetLogs(
   return await fetchLogs(name, lines);
 }
 
+/**
+ * Parse a Hermes session ID into agentName + optional threadId.
+ * Format: "agentName" (DM / general topic) or "agentName~threadId" (forum topic).
+ * threadId === null means explicitly the null/general thread (not "all threads").
+ */
+export function parseHermesSessionId(sessionId: string): { agentName: string; threadId?: string | null } {
+  const tilde = sessionId.indexOf('~')
+  if (tilde === -1) return { agentName: sessionId }
+  return { agentName: sessionId.slice(0, tilde), threadId: sessionId.slice(tilde + 1) || null }
+}
+
 export function handleGetTurns(
   config: SwitchroomConfig,
-  agentName: string,
+  sessionId: string,
   limit: number,
 ): { ok: boolean; turns?: Turn[]; error?: string } {
   try {
+    const parsed = parseHermesSessionId(sessionId)
+    const agentName = parsed.agentName
+    const hasThread = 'threadId' in parsed
     const agentsDir = resolveAgentsDir(config);
     const agentDir = resolve(agentsDir, agentName);
+    const chatId: string | undefined =
+      config.agents?.[agentName]?.channels?.telegram?.chat_id ?? undefined;
     const db = openTurnsDb(agentDir);
     try {
-      const turns = listTurnsForAgent(db, { limit });
+      // For threaded sessions, filter by both chatId and threadId.
+      // hasThread means the session ID had a "~" — even "~null" (general topic).
+      const opts = chatId && hasThread
+        ? { limit, chatId, threadId: parsed.threadId }
+        : chatId
+        ? { limit, chatId }
+        : { limit }
+      const turns = listTurnsForAgent(db, opts);
       return { ok: true, turns };
     } finally {
       db.close();
@@ -463,6 +486,26 @@ export function handleGetTurns(
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
+  }
+}
+
+/** List distinct forum thread_ids for a supergroup agent. Returns [] for DM agents. */
+export function handleListThreadIds(
+  config: SwitchroomConfig,
+  agentName: string,
+): (string | null)[] {
+  try {
+    const chatId = config.agents?.[agentName]?.channels?.telegram?.chat_id
+    if (!chatId) return []
+    const agentsDir = resolveAgentsDir(config)
+    const db = openTurnsDb(resolve(agentsDir, agentName))
+    try {
+      return listDistinctThreadIds(db, chatId)
+    } finally {
+      db.close()
+    }
+  } catch {
+    return []
   }
 }
 
