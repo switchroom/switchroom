@@ -61,6 +61,18 @@ export function classifyTier(
     };
   }
   if (candidate.createsNewSkill) {
+    // Carve-out (#2670): a NEW *personal* skill synthesized by the weekly
+    // cron lands in the agent's OWN reversible workspace. It is surfaced as
+    // a one-tap T2 card rather than a T3 explicit-ask. The operator tap
+    // still authorizes the write (no self-escalation); only the friction
+    // changes. Any other new-skill provenance keeps the T3 floor below.
+    if (candidate.proposalKind === "synthesized-personal-skill") {
+      return {
+        tier: "T2",
+        reason:
+          "synthesized personal skill — one-tap proposal into the agent's own reversible workspace",
+      };
+    }
     return {
       tier: "T3",
       reason: "creates a new skill — proposed, never auto-created",

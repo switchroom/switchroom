@@ -462,6 +462,37 @@ export interface SendOutboundMessage {
   parseMode?: "html" | "text";
 }
 
+/**
+ * #2670 (one-tap self-improvement) — post a skill-improvement proposal as
+ * a one-tap Approve/Dismiss card. Sent by the weekly skill-synthesis flow
+ * (`switchroom self-improve propose-skill`) after it drafts a candidate
+ * personal skill. The gateway PERSISTS the proposal (full draft bundle) to
+ * the self-improve proposal store and posts the card to the agent's own
+ * chat. The Approve tap is handled gateway-side: it injects a
+ * `skill_proposal_apply` turn so the agent writes the stored draft through
+ * the personal-skill pipeline (secret-scan runs; no self-escalation).
+ *
+ * Trust model identical to send_outbound / inject_inbound: per-agent
+ * socket, agentName validated, chat fenced to the agent's own chat.
+ */
+export interface PostSkillProposalMessage {
+  type: "post_skill_proposal";
+  agentName: string;
+  /** Agent's own chat id (fenced server-side). */
+  chatId: string;
+  threadId?: number;
+  /** Target personal-skill slug (without the `personal-` prefix). */
+  skillSlug: string;
+  /** True = new skill; false = edit an existing personal skill. */
+  isNew: boolean;
+  /** One-line lesson the skill captures. */
+  lesson: string;
+  /** Short evidence line (e.g. "seen across 3 sessions"). */
+  evidence: string;
+  /** Full drafted skill bundle (SKILL.md + optional files). */
+  draft: Record<string, string>;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -478,4 +509,5 @@ export type ClientToGateway =
   | RequestConfigApprovalMessage
   | RequestConfigFinalizeMessage
   | QuotaWallDetectedMessage
-  | SendOutboundMessage;
+  | SendOutboundMessage
+  | PostSkillProposalMessage;

@@ -58,6 +58,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
+  MAX_SKILLS_PER_AGENT,
   PY_SCRIPT_RE,
   SH_SCRIPT_RE,
   SKILL_SLUG_RE,
@@ -288,6 +289,23 @@ function personalSkillDir(
 
 function trashDir(agentsRoot: string, agent: string): string {
   return join(agentsRoot, agent, ".claude", TRASH_DIRNAME);
+}
+
+/**
+ * Count the agent's existing personal skills (directories under
+ * `.claude/skills/` carrying the `personal-` prefix). Used by
+ * `loadValidateWrite` to enforce `MAX_SKILLS_PER_AGENT` on the NEW-skill
+ * path — closing the gap flagged in skill-common.ts ("Not enforced in
+ * PR A"). Edits don't add to the count, so they remain allowed at cap.
+ */
+export function countPersonalSkills(agentsRoot: string, agent: string): number {
+  const skillsDir = join(agentsRoot, agent, ".claude", "skills");
+  if (!existsSync(skillsDir)) return 0;
+  let n = 0;
+  for (const ent of readdirSync(skillsDir, { withFileTypes: true })) {
+    if (ent.isDirectory() && ent.name.startsWith(PERSONAL_PREFIX)) n += 1;
+  }
+  return n;
 }
 
 function readStdinSync(): string {
@@ -555,6 +573,23 @@ function loadValidateWrite(
       `Use \`skill init-personal\` to create it.`,
       9,
     );
+  }
+
+  // 20-skill cap — enforced only on the NEW-skill path (init / clone).
+  // An EDIT of an existing skill never raises the count, so it is allowed
+  // even at the cap. This closes the unenforced gap noted in
+  // skill-common.ts and stops a synthesized one-tap proposal from blowing
+  // the per-agent ceiling.
+  if (ensureNew) {
+    const existingCount = countPersonalSkills(agentsRoot, agent);
+    if (existingCount >= MAX_SKILLS_PER_AGENT) {
+      fail(
+        `agent ${JSON.stringify(agent)} already has ${existingCount} personal skills ` +
+        `(cap is ${MAX_SKILLS_PER_AGENT}). Remove one with \`skill remove-personal\` ` +
+        `before adding a new skill, or edit an existing skill instead.`,
+        15,
+      );
+    }
   }
 
   const v = validateSkillBundle(name, files);

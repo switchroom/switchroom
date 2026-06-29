@@ -27,6 +27,7 @@ import {
   removePersonalAction,
   listPersonalAction,
   clonePersonalAction,
+  countPersonalSkills,
 } from "./skill-personal.js";
 
 const AGENT = "test-agent";
@@ -199,6 +200,33 @@ describe("initPersonalAction", () => {
     expectExitCode(() => {
       initPersonalAction("syntaxbad", { agent: AGENT, from: srcDir, root });
     }, 3);
+  });
+
+  it("enforces the 20-skill cap on init, but allows edits at cap (#2670)", () => {
+    // Seed the cap.
+    for (let i = 0; i < 20; i++) {
+      const f = join(root, `seed${i}.md`);
+      writeFileSync(f, validSkillMd(`seed${i}`));
+      captureStdout(() => {
+        initPersonalAction(`seed${i}`, { agent: AGENT, from: f, root });
+      });
+    }
+    expect(countPersonalSkills(root, AGENT)).toBe(20);
+
+    // A new skill at the cap is refused (exit 15).
+    const overflow = join(root, "overflow.md");
+    writeFileSync(overflow, validSkillMd("overflow"));
+    expectExitCode(() => {
+      initPersonalAction("overflow", { agent: AGENT, from: overflow, root });
+    }, 15);
+
+    // Editing an existing skill at the cap is allowed (count unchanged).
+    const editF = join(root, "edit-seed0.md");
+    writeFileSync(editF, validSkillMd("seed0"));
+    captureStdout(() => {
+      editPersonalAction("seed0", { agent: AGENT, from: editF, root });
+    });
+    expect(countPersonalSkills(root, AGENT)).toBe(20);
   });
 
   it("requires --agent when SWITCHROOM_AGENT_NAME is unset", () => {

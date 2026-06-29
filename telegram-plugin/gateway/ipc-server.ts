@@ -6,6 +6,7 @@ import type {
   InjectInboundMessage,
   SendOutboundMessage,
   QuotaWallDetectedMessage,
+  PostSkillProposalMessage,
   OperatorEventForward,
   PermissionRequestForward,
   PtyPartialForward,
@@ -63,6 +64,13 @@ export interface IpcServerOptions {
    * don't run failover simply ignore it.
    */
   onQuotaWallDetected?: (client: IpcClient, msg: QuotaWallDetectedMessage) => void;
+  /**
+   * #2670 one-tap self-improvement — persist a skill-improvement proposal
+   * and post its Approve/Dismiss card. Handler persists the draft bundle to
+   * the self-improve proposal store and posts the card to the agent's own
+   * chat. Optional; gateways that don't surface proposals ignore it.
+   */
+  onPostSkillProposal?: (client: IpcClient, msg: PostSkillProposalMessage) => void;
   /**
    * RFC E §4.2 Cut 2 — Drive-write PreToolUse hook asks the gateway
    * to register a kernel approval request + post a diff-preview
@@ -271,6 +279,22 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
       if (m.parseMode !== undefined && m.parseMode !== "html" && m.parseMode !== "text") return false;
       return true;
     }
+    case "post_skill_proposal": {
+      // #2670 one-tap self-improvement — validate the wire shape; the
+      // gateway handler fences chatId to the agent's own chat.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.chatId !== "string" || (m.chatId as string).length === 0) return false;
+      if (typeof m.skillSlug !== "string" || (m.skillSlug as string).length === 0) return false;
+      if (typeof m.isNew !== "boolean") return false;
+      if (typeof m.lesson !== "string" || (m.lesson as string).length === 0) return false;
+      if (typeof m.evidence !== "string") return false;
+      if (typeof m.draft !== "object" || m.draft === null || Array.isArray(m.draft)) return false;
+      if (typeof (m.draft as Record<string, unknown>)["SKILL.md"] !== "string") return false;
+      if (m.threadId !== undefined
+        && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
+      return true;
+    }
     case "quota_wall_detected": {
       // wedge-watchdog detected the /rate-limit-options weekly-quota menu.
       if (typeof m.agentName !== "string"
@@ -372,6 +396,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onInjectInbound,
     onSendOutbound,
     onQuotaWallDetected,
+    onPostSkillProposal,
     onRequestDriveApproval,
     onRequestMs365Approval,
     onRequestConfigApproval,
@@ -482,6 +507,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "send_outbound":
         if (onSendOutbound) onSendOutbound(client, msg as SendOutboundMessage);
+        break;
+      case "post_skill_proposal":
+        if (onPostSkillProposal) onPostSkillProposal(client, msg as PostSkillProposalMessage);
         break;
       case "quota_wall_detected":
         if (onQuotaWallDetected) onQuotaWallDetected(client, msg as QuotaWallDetectedMessage);

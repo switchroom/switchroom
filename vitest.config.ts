@@ -205,6 +205,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/turns-writer.test.ts",
       // resume-inbound-builder.test.ts uses bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/tests/resume-inbound-builder.test.ts",
+      // skill-proposal-card.test.ts uses bun:test — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/skill-proposal-card.test.ts",
       // api-registry.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/registry/api-registry.test.ts",
       // turns-schema.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
