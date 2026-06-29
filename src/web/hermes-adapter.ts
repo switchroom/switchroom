@@ -96,12 +96,24 @@ function agentLiveness(config: SwitchroomConfig, agentName: string): AgentLivene
   return "offline";
 }
 
-/** Human-readable title for a Hermes session ID (may be composite "agent~threadId"). */
-function sessionTitle(sessionId: string): string {
+/**
+ * Human-readable title for a Hermes session ID (may be composite "agent~threadId").
+ * Resolves forum thread IDs to names via channels.telegram.topic_aliases when available.
+ */
+function sessionTitle(config: SwitchroomConfig, sessionId: string): string {
   const { agentName, threadId } = parseHermesSessionId(sessionId)
-  if (threadId === undefined) return agentName          // DM agent — no topic suffix
-  if (threadId === null) return `${agentName} · General` // null thread = Telegram General topic
-  return `${agentName} · ${threadId}`                   // forum topic ID
+  if (threadId === undefined) return agentName           // DM agent — no topic suffix
+  // Build an inverted alias map: thread_id (as string) → alias name
+  const aliases = config.agents?.[agentName]?.channels?.telegram?.topic_aliases ?? {}
+  const byId = Object.fromEntries(
+    Object.entries(aliases).map(([name, id]) => [String(id), name])
+  )
+  if (threadId === null) {
+    // null thread = messages not in any topic (pre-topic or Telegram General)
+    return `${agentName} · ${byId["1"] ?? "General"}`
+  }
+  const name = byId[threadId]
+  return name ? `${agentName} · ${name}` : `${agentName} · ${threadId}`
 }
 
 /**
@@ -113,12 +125,12 @@ function isKnownSession(config: SwitchroomConfig, sessionId: string): boolean {
   return !!config.agents?.[agentName]
 }
 
-function toHermesSession(sessionId: string, agent: AgentInfo, liveness: AgentLiveness) {
+function toHermesSession(sessionId: string, agent: AgentInfo, liveness: AgentLiveness, config: SwitchroomConfig) {
   const nowSec = Math.floor(Date.now() / 1000);
   return {
     id: sessionId,
     name: sessionId,
-    title: sessionTitle(sessionId),
+    title: sessionTitle(config, sessionId),
     status: liveness,
     model: "claude",
     // Required SessionInfo fields — zero-value stubs (no token metering in switchroom)
@@ -158,15 +170,15 @@ async function buildAllSessions(
       // Falls back to a single unlabelled session if the DB has no turns yet.
       const threadIds = handleListThreadIds(config, agent.name)
       if (threadIds.length === 0) {
-        sessions.push(toHermesSession(agent.name, agent, liveness))
+        sessions.push(toHermesSession(agent.name, agent, liveness, config))
       } else {
         for (const threadId of threadIds) {
           const sessionId = threadId === null ? agent.name : `${agent.name}~${threadId}`
-          sessions.push(toHermesSession(sessionId, agent, liveness))
+          sessions.push(toHermesSession(sessionId, agent, liveness, config))
         }
       }
     } else {
-      sessions.push(toHermesSession(agent.name, agent, liveness))
+      sessions.push(toHermesSession(agent.name, agent, liveness, config))
     }
   }
   return sessions
@@ -483,7 +495,7 @@ export async function handleHermesRest(
     const agents = await handleGetAgents(config);
     const agent = agents.find((a) => a.name === agentName);
     if (!agent) return { status: 404, body: { error: "Unknown session" } };
-    return { status: 200, body: { session: toHermesSession(id, agent, agentLiveness(config, agentName)) } };
+    return { status: 200, body: { session: toHermesSession(id, agent, agentLiveness(config, agentName), config) } };
   }
 
   // GET /api/sessions/:id/messages — conversation history (SessionMessagesResponse shape)
@@ -752,7 +764,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
         break;
       }
-      sendResponse(ctx, rpcOk(id, { session: toHermesSession(sessionId, agent, agentLiveness(config, agentName)) }));
+      sendResponse(ctx, rpcOk(id, { session: toHermesSession(sessionId, agent, agentLiveness(config, agentName), config) }));
       break;
     }
 
@@ -773,7 +785,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
         break;
       }
-      const session = toHermesSession(sessionId, agent, agentLiveness(config, agentName));
+      const session = toHermesSession(sessionId, agent, agentLiveness(config, agentName), config);
       sendResponse(ctx, rpcOk(id, { session }));
       sendEvent(ctx, "session.info", sessionId, session);
       break;
