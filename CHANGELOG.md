@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.16.18 — Hermes Desktop render crash fix
+
+Fixes a React render crash (`Cannot read properties of undefined (reading 'length')`) that occurred immediately after the WebSocket connected. `GET /api/cron/jobs` was returning `{}` instead of `[]` (Hermes renders the cron-jobs list with `.length`), and `GET /api/messaging/platforms` was returning `{}` instead of `{ platforms: [] }`. Both stubs now return the correct shape. (#2653)
+
 ## v0.16.17 — Hermes Desktop adapter boot fix
 
 Hermes Desktop was immediately crashing on connect with "Error: 404: Not Found" after the WebSocket handshake succeeded. The renderer calls several REST endpoints at boot (`/api/profiles/sessions`, `/api/model/info`, `/api/config/defaults`, `/api/config/schema`, `/api/logs`, and others) that the adapter did not implement. All missing endpoints now return appropriate stub or empty responses so the boot sequence completes. (#2651)
