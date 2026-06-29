@@ -301,18 +301,34 @@ export async function handleHermesRest(
     return { status: 200, body: { file: "gateway.log", lines: [] } };
   }
 
-  // Stub empty responses for cron/messaging/profile endpoints Hermes calls at boot
-  if (
-    method === "GET" &&
-    (pathname.startsWith("/api/cron") ||
-      pathname.startsWith("/api/messaging") ||
-      pathname.startsWith("/api/profiles") ||
-      pathname === "/api/memory/providers")
-  ) {
-    // Return the most common empty-list shape Hermes expects
+  // Stub empty responses for cron/messaging/profile endpoints Hermes calls at boot.
+  // Each path must return the exact shape Hermes renders — wrong shape → render crash.
+  if (method === "GET" && pathname.startsWith("/api/cron")) {
+    // GET /api/cron/jobs → CronJob[] (array directly, not wrapped)
+    if (pathname === "/api/cron/jobs") return { status: 200, body: [] };
+    // /api/cron/jobs/:id/runs → SessionInfo[]
+    if (pathname.includes("/runs")) return { status: 200, body: { runs: [] } };
+    // Other cron paths: sessions-like wrapper
     if (pathname.includes("sessions")) {
       return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
     }
+    return { status: 200, body: {} };
+  }
+
+  if (method === "GET" && pathname.startsWith("/api/messaging")) {
+    // GET /api/messaging/platforms → { platforms: [] }
+    if (pathname === "/api/messaging/platforms") return { status: 200, body: { platforms: [] } };
+    return { status: 200, body: {} };
+  }
+
+  if (method === "GET" && pathname.startsWith("/api/profiles")) {
+    if (pathname.includes("sessions")) {
+      return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
+    }
+    return { status: 200, body: {} };
+  }
+
+  if (method === "GET" && pathname === "/api/memory/providers") {
     return { status: 200, body: {} };
   }
 
