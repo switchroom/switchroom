@@ -345,6 +345,14 @@ export async function handleHermesRest(
     if (pathname.includes("sessions")) {
       return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
     }
+    // /api/profiles — ProfilesResponse: { profiles: ProfileInfo[] }
+    if (pathname === "/api/profiles") {
+      return { status: 200, body: { profiles: [] } };
+    }
+    // /api/profiles/:name/soul — { content: string; exists: boolean }
+    if (pathname.endsWith("/soul")) {
+      return { status: 200, body: { content: "", exists: false } };
+    }
     return { status: 200, body: {} };
   }
 
@@ -355,6 +363,21 @@ export async function handleHermesRest(
   // GET /api/fs/default-cwd — remote mode cwd seeding (caught by caller)
   if (method === "GET" && pathname === "/api/fs/default-cwd") {
     return { status: 200, body: { cwd: null, branch: null } };
+  }
+
+  // GET /api/env — API keys / env-var panel; no agent env vars to surface
+  if (method === "GET" && pathname === "/api/env") {
+    return { status: 200, body: {} };
+  }
+
+  // POST /api/providers/validate — credential check; switchroom has no API keys
+  if (method === "POST" && pathname === "/api/providers/validate") {
+    return { status: 200, body: { ok: true, model: null } };
+  }
+
+  // GET /api/auth/providers — OAuth provider listing (only needed in OAuth mode)
+  if (method === "GET" && pathname === "/api/auth/providers") {
+    return { status: 200, body: { providers: [] } };
   }
 
   return null;
