@@ -208,12 +208,24 @@ export async function handleHermesRest(
   pathname: string,
   config: SwitchroomConfig,
 ): Promise<HermesRestResult | null> {
-  // GET /api/sessions — fleet session list
-  if (method === "GET" && pathname === "/api/sessions") {
+  // GET /api/sessions or /api/profiles/sessions — fleet session list
+  // Hermes Desktop calls /api/profiles/sessions for the cross-profile sidebar.
+  if (
+    method === "GET" &&
+    (pathname === "/api/sessions" || pathname === "/api/profiles/sessions")
+  ) {
     const agents = await handleGetAgents(config);
-    const agentsDir = resolveAgentsDir(config);
     const sessions = agents.map((a) => toHermesSession(a, agentLiveness(config, a.name)));
-    return { status: 200, body: { sessions } };
+    return {
+      status: 200,
+      body: {
+        sessions,
+        total: sessions.length,
+        limit: sessions.length,
+        offset: 0,
+        profile_totals: { default: sessions.length },
+      },
+    };
   }
 
   // GET /api/sessions/:id — single session status
@@ -254,17 +266,54 @@ export async function handleHermesRest(
     };
   }
 
-  // GET /api/config — read-only, secrets redacted
+  // GET /api/config — Hermes expects a HermesConfig-shaped response
   if (method === "GET" && pathname === "/api/config") {
-    const agentNames = Object.keys(config.agents ?? {});
     return {
       status: 200,
       body: {
         provider: "switchroom",
-        agents: agentNames,
-        // No token, no OAuth credential — metadata only
+        model: null,
+        context_length: null,
+        system_prompt: null,
       },
     };
+  }
+
+  // GET /api/config/defaults and /api/config/schema — stub empties
+  if (method === "GET" && (pathname === "/api/config/defaults" || pathname === "/api/config/schema")) {
+    return { status: 200, body: {} };
+  }
+
+  // GET /api/model/info — Hermes renders the active model in the header
+  if (method === "GET" && pathname === "/api/model/info") {
+    return {
+      status: 200,
+      body: {
+        model: "claude",
+        provider: "switchroom",
+        capabilities: {},
+      },
+    };
+  }
+
+  // GET /api/logs — return empty log
+  if (method === "GET" && pathname.startsWith("/api/logs")) {
+    return { status: 200, body: { file: "gateway.log", lines: [] } };
+  }
+
+  // Stub empty responses for cron/messaging/profile endpoints Hermes calls at boot
+  if (
+    method === "GET" &&
+    (pathname.startsWith("/api/cron") ||
+      pathname.startsWith("/api/messaging") ||
+      pathname.startsWith("/api/profiles") ||
+      pathname === "/api/memory/providers")
+  ) {
+    // Return the most common empty-list shape Hermes expects
+    if (pathname.includes("sessions")) {
+      return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
+    }
+    return { status: 200, body: {} };
   }
 
   return null;
