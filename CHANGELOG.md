@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.16.20 — Hermes Desktop: green status + full session fields
+
+The Hermes Desktop status bar now shows green "Inference ready" instead of amber "needs setup." The `setup.status` and `setup.runtime_check` JSON-RPC methods were returning -32601 errors, which made the desktop think no provider was configured. Both now return `{provider_configured: true}` / `{ok: true}` — switchroom always has the subscription-funded claude CLI available.
+
+Session objects in the sidebar now carry all required `SessionInfo` fields: `is_active`, `started_at`, `last_active`, `ended_at`, `input_tokens`, `output_tokens`, `message_count`, `tool_call_count`, `preview`, `source`, `title`. Missing fields were previously causing potential undefined-access issues in sidebar components.
+
+`/api/status` now returns the full `StatusResponse` shape Hermes Desktop expects (`version`, `gateway_running: true`, `gateway_state`, `gateway_platforms`, `hermes_home`, etc.) rather than a switchroom-specific shape.
+
+`prompt.submit` now emits `message.delta` + `message.complete` with `"(Prompt sent to <agent> — response will appear in Telegram)"` so the chat shows a visible acknowledgement instead of a hanging spinner after submission. (#2656)
+
 ## v0.16.19 — Dependency maintenance
 
 CI and base-image dependency bumps, no runtime behavior change: refreshed the `node:22-trixie-slim` base image digest (#2646), bumped `actions/setup-python` 6.2.0 → 6.3.0 (#2648), and `actions/cache` 5.0.5 → 6.1.0 (#2647).
