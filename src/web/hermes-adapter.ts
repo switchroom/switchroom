@@ -307,6 +307,59 @@ function switchroomModelOptions() {
   };
 }
 
+/** Switchroom slash commands surfaced in the Hermes Desktop slash palette.
+ *
+ * Hermes filters this list through filterDesktopCommandsCatalog — only
+ * "extension" commands (anything not in its own built-in table) and exec-surface
+ * commands appear in the popover. Switchroom commands like /memory, /vault,
+ * /schedule, /effort, /whoami, /doctor, /logs, /auth are all extensions and will
+ * show. Commands that overlap with Hermes built-ins (/new, /status, /restart,
+ * /compact, /clear) stay in the catalog for exec dispatch but are filtered from
+ * the popover by Hermes.
+ */
+function switchroomCommandsCatalog() {
+  return {
+    categories: [
+      {
+        name: "Session",
+        pairs: [
+          ["/new", "Fresh session (flush handoff, restart)"],
+          ["/compact", "Compact context (summarize, keep the thread)"],
+          ["/clear", "Clear context (fresh slate; memory in Hindsight)"],
+          ["/restart", "Restart the agent"],
+          ["/model", "Show or switch the Claude model"],
+          ["/effort", "Show or switch the reasoning effort (low→max)"],
+          ["/status", "Agent, model, auth status"],
+        ] as [string, string][],
+      },
+      {
+        name: "Memory & knowledge",
+        pairs: [
+          ["/memory", "List, search, or clear Hindsight memory"],
+        ] as [string, string][],
+      },
+      {
+        name: "Vault & auth",
+        pairs: [
+          ["/vault", "Manage vault secrets + capability grants"],
+          ["/auth", "Auth dashboard — accounts, quota, reauth, switch primary"],
+          ["/whoami", "This agent's sandbox: tools, MCP, vault key-names"],
+        ] as [string, string][],
+      },
+      {
+        name: "Diagnostics",
+        pairs: [
+          ["/doctor", "Health check (deps, services, MCP)"],
+          ["/logs", "Show recent agent logs"],
+          ["/usage", "Pro/Max plan quota (5h + 7d windows)"],
+          ["/version", "Show version + running agent health"],
+          ["/commands", "Full command list"],
+        ] as [string, string][],
+      },
+    ],
+  };
+}
+
 // ─── REST handler ─────────────────────────────────────────────────────────────
 
 export interface HermesRestResult {
@@ -811,6 +864,48 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         }
       }
       sendResponse(ctx, rpcOk(id, { ok: true }));
+      break;
+    }
+
+    // commands.catalog — slash palette autocomplete list
+    case "commands.catalog": {
+      sendResponse(ctx, rpcOk(id, switchroomCommandsCatalog()));
+      break;
+    }
+
+    // slash.exec — run a slash command by injecting it into the agent session.
+    // Hermes sends { session_id, command, arg? } for any command with surface: exec.
+    // The injected string is just "/<command> <arg>" through the same injectInbound
+    // path as prompt.submit — the agent handles it as a synthesized turn.
+    case "slash.exec": {
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
+      const command = String(params.command ?? "").replace(/^\/+/, "");
+      const arg = params.arg != null ? String(params.arg) : "";
+
+      if (!sessionId || !config.agents?.[sessionId]) {
+        sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
+        break;
+      }
+      if (!command) {
+        sendResponse(ctx, rpcErr(id, -32602, "command is required"));
+        break;
+      }
+
+      const agentsDir = resolveAgentsDir(config);
+      const chat = resolveAgentChat(config, sessionId, agentsDir);
+      if (!chat) {
+        sendResponse(ctx, rpcErr(id, -32603, `Cannot resolve chat for ${sessionId}`));
+        break;
+      }
+
+      const fullCommand = arg ? `/${command} ${arg}` : `/${command}`;
+      const promptKey = `slash-${command}-${Date.now()}`;
+      const result = await injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, fullCommand, promptKey);
+      if (!result.ok) {
+        sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
+        break;
+      }
+      sendResponse(ctx, rpcOk(id, { ok: true, output: `*(/${command} sent to ${sessionId})*` }));
       break;
     }
 
