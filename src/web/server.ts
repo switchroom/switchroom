@@ -1121,7 +1121,7 @@ export function startWebServer(
         const authError = checkAuth(req, token, server);
         if (authError) return authError;
         return (async () => {
-          const hermesResult = await handleHermesRest(req.method, pathname, config);
+          const hermesResult = await handleHermesRest(req.method, pathname, config, url.search);
           if (hermesResult !== null) {
             return jsonResponse(hermesResult.body, hermesResult.status);
           }

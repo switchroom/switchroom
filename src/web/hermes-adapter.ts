@@ -28,6 +28,7 @@ import { resolveChannelTarget } from "../agent-scheduler/channel-target.js";
 import {
   handleGetAgents,
   handleGetTurns,
+  handleGetSchedule,
   agentBridgeAlive,
   type AgentInfo,
 } from "./api.js";
@@ -208,6 +209,56 @@ async function injectInbound(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+import type { ScheduleDashboard } from "./api.js";
+import type { DispatchResult } from "../scheduler/dispatch.js";
+
+/** Compose a stable CronJob id from agent name + schedule index. */
+function cronJobId(agent: string, index: number): string {
+  return `${agent}/${index}`;
+}
+
+/** Map a ScheduleDashboard to CronJob[] for the Hermes cron panel. */
+function scheduleToCronJobs(schedule: ScheduleDashboard): Record<string, unknown>[] {
+  return schedule.entries.map((entry) => {
+    const id = cronJobId(entry.agent, entry.scheduleIndex);
+    // Find the most recent fire for this entry to populate last_run_at / last_error
+    const fires: DispatchResult[] = schedule.recentByAgent[entry.agent] ?? [];
+    const entryFires = fires.filter((f) => f.scheduleIndex === entry.scheduleIndex);
+    const lastFire = entryFires[entryFires.length - 1];
+    return {
+      id,
+      enabled: true,
+      name: entry.name ?? null,
+      prompt: entry.prompt ?? null,
+      schedule: { expr: entry.cron, display: entry.cron, kind: entry.kind ?? "prompt" },
+      schedule_display: entry.cron,
+      last_run_at: lastFire ? new Date(lastFire.finishedAt).toISOString() : null,
+      last_error: lastFire?.exitCode !== 0 ? (lastFire?.outputSummary ?? null) : null,
+      state: lastFire ? (lastFire.exitCode === 0 ? "success" : "error") : null,
+    };
+  });
+}
+
+/** Get run history for a single job id ("<agent>/<index>"). */
+function cronJobRuns(schedule: ScheduleDashboard, jobId: string): object[] {
+  const slash = jobId.lastIndexOf("/");
+  if (slash === -1) return [];
+  const agent = jobId.slice(0, slash);
+  const index = parseInt(jobId.slice(slash + 1), 10);
+  const fires: DispatchResult[] = schedule.recentByAgent[agent] ?? [];
+  return fires
+    .filter((f) => f.scheduleIndex === index)
+    .map((f) => ({
+      id: `${jobId}/${f.startedAt}`,
+      job_id: jobId,
+      started_at: new Date(f.startedAt).toISOString(),
+      finished_at: new Date(f.finishedAt).toISOString(),
+      exit_code: f.exitCode,
+      output: f.outputSummary,
+      status: f.exitCode === 0 ? "success" : "error",
+    }));
+}
+
 /** Map switchroom Turn records to SessionMessage[] for Hermes Desktop history. */
 function turnsToMessages(turns: Turn[]): object[] {
   const messages: object[] = [];
@@ -271,6 +322,7 @@ export async function handleHermesRest(
   method: string,
   pathname: string,
   config: SwitchroomConfig,
+  search = "",
 ): Promise<HermesRestResult | null> {
   // GET /api/sessions or /api/profiles/sessions — fleet session list
   // Hermes Desktop calls /api/profiles/sessions for the cross-profile sidebar.
@@ -373,17 +425,42 @@ export async function handleHermesRest(
     return { status: 200, body: { file: "gateway.log", lines: [] } };
   }
 
-  // Stub empty responses for cron/messaging/profile endpoints Hermes calls at boot.
-  // Each path must return the exact shape Hermes renders — wrong shape → render crash.
-  if (method === "GET" && pathname.startsWith("/api/cron")) {
-    // GET /api/cron/jobs → CronJob[] (array directly, not wrapped)
-    if (pathname === "/api/cron/jobs") return { status: 200, body: [] };
-    // /api/cron/jobs/:id/runs → { runs: [] }
-    if (pathname.includes("/runs")) return { status: 200, body: { runs: [] } };
-    // Other cron paths: sessions-like wrapper
-    if (pathname.includes("sessions")) {
-      return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
+  // Cron panel — reads from handleGetSchedule (same data as the web dashboard's
+  // Schedule tab). Job IDs are "<agent>/<index>" composites; Hermes treats them
+  // as opaque strings. Read-only: create/update/pause/resume/delete are no-ops
+  // since schedules are owned by the YAML config (operator edits the file, not
+  // the UI — the same constraint as the Telegram /schedule command).
+  if (pathname.startsWith("/api/cron")) {
+    if (method === "GET" && pathname === "/api/cron/jobs") {
+      const schedule = await handleGetSchedule(config);
+      const jobs = scheduleToCronJobs(schedule);
+      return { status: 200, body: jobs };
     }
+
+    const jobRunsMatch = pathname.match(/^\/api\/cron\/jobs\/([^/]+)\/runs$/);
+    if (method === "GET" && jobRunsMatch) {
+      const jobId = decodeURIComponent(jobRunsMatch[1]);
+      const schedule = await handleGetSchedule(config);
+      const runs = cronJobRuns(schedule, jobId);
+      const limitParam = new URLSearchParams(search).get("limit");
+      const limit = limitParam ? parseInt(limitParam, 10) : 20;
+      return { status: 200, body: { runs: runs.slice(0, limit) } };
+    }
+
+    const jobMatch = pathname.match(/^\/api\/cron\/jobs\/([^/]+)$/);
+    if (method === "GET" && jobMatch) {
+      const jobId = decodeURIComponent(jobMatch[1]);
+      const schedule = await handleGetSchedule(config);
+      const job = scheduleToCronJobs(schedule).find((j) => j.id === jobId);
+      if (!job) return { status: 404, body: { error: "Not found" } };
+      return { status: 200, body: job };
+    }
+
+    // Create/update/pause/resume/delete: schedules are config-owned, not UI-mutable.
+    if (method === "POST" || method === "PATCH" || method === "DELETE") {
+      return { status: 422, body: { error: "Schedules are managed via switchroom YAML config — edit the agent config file and apply." } };
+    }
+
     return { status: 200, body: {} };
   }
 
