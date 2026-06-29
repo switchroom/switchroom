@@ -218,9 +218,14 @@ export function openTurnsDb(agentDir: string): SqliteDatabase {
   const db = new Database(path, { create: true })
   applySchema(db)
   try {
-    // 0o644 so the switchroom-web container (different UID, same host bind-mount)
-    // can read turn history for the Hermes Desktop history panel.
+    // 0o644 on all three SQLite files so the switchroom-web container
+    // (different UID, same host bind-mount) can read turn history.
+    // WAL mode requires read access to registry.db-shm and registry.db-wal
+    // in addition to the main file — all three must be world-readable.
     chmodSync(path, 0o644)
+    for (const suffix of ['-shm', '-wal']) {
+      try { chmodSync(path + suffix, 0o644) } catch { /* doesn't exist yet */ }
+    }
   } catch {
     /* ignore — chmod not supported on some FUSE mounts */
   }
