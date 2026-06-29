@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.16.24 — Hermes Desktop: supergroup forum topics as sessions + topic name resolution
+
+### PR A — WAL file permissions + history channel filter (#2668)
+
+`registry.db-shm` and `registry.db-wal` (SQLite WAL mode sidecar files) were still `0600` after v0.16.23 widened the main DB. All three files are now chmoded to `0644` in `openTurnsDb` so the `switchroom-web` container can read WAL-mode databases. Host workaround for existing files: `sudo find ~/.switchroom/agents -name "registry.db*" -exec chmod 0644 {} \;`
+
+`handleGetTurns` now filters to the agent's configured `channels.telegram.chat_id` so supergroup agents (marko, test-harness) show their group conversation history instead of a mix of DM and group turns.
+
+### PR B — One Hermes session per forum topic (#2668)
+
+For agents with a primary channel `chat_id` configured, `/api/sessions` and all WS session handlers now enumerate distinct `thread_id` values from the turns DB and expose one session per forum topic:
+
+- `marko` → General topic (null thread_id)
+- `marko~3` → Meta Campaigns
+- `marko~635` → Social Posts (Postiz)
+- etc.
+
+Session titles resolve friendly names via `channels.telegram.topic_aliases` (e.g. `marko · meta`, `marko · crm`). Thread IDs with no alias fall back to the numeric ID. DM-only agents are unchanged.
+
+`parseHermesSessionId()` (new export) splits composite session IDs; all `injectInbound` / `injectSlashCommand` callsites use the bare agent name so socket paths remain correct.
+
 ## v0.16.23 — Hermes Desktop: history crash fix + cron run labels
 
 ### PR A — History crash + registry.db permissions (#2665)
