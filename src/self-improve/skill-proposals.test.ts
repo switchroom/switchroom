@@ -65,6 +65,24 @@ describe("skill-proposals store", () => {
     ).toBe(true);
   });
 
+  it("does NOT suppress an improved redraft of the same slug (different content)", () => {
+    const p = enqueueProposal(dir, baseInput);
+    setProposalStatus(dir, p.id, "rejected");
+    // Same slug, genuinely different procedure — a redraft must still surface
+    // rather than being swallowed by a bare slug match for 90 days.
+    expect(
+      isSuppressed(dir, {
+        lesson: "Roll back automatically when error rate spikes post-deploy",
+        draft: {
+          "SKILL.md":
+            "---\nname: deploy-checklist\ndescription: y\n---\n\n" +
+            "watch error budget canary automatic rollback alerting paging escalation incident",
+        },
+        skill_slug: "deploy-checklist",
+      }),
+    ).toBe(false);
+  });
+
   it("does NOT suppress an unrelated proposal", () => {
     const p = enqueueProposal(dir, baseInput);
     setProposalStatus(dir, p.id, "rejected");

@@ -257,9 +257,15 @@ export function recordRejection(
 
 /**
  * True iff a candidate proposal matches a still-live rejection
- * fingerprint (same slug OR high content-word overlap, within the TTL).
- * The synthesis path calls this before enqueuing so a dismissed proposal
- * is not re-fired every week.
+ * fingerprint within the TTL. A match ALWAYS requires **content
+ * similarity**: the candidate's content-word set must overlap a rejected
+ * fingerprint at the jaccard threshold. The slug is only a cheap
+ * pre-filter that RELAXES the threshold for a same-slug re-proposal (a
+ * redraft of the same skill needs less overlap to count as "the same
+ * proposal") — a bare slug match NEVER suppresses on its own. This lets a
+ * genuinely improved redraft for an already-dismissed slug still surface,
+ * instead of being silently swallowed for 90 days (the slug-exact
+ * over-suppression flagged in review).
  */
 export function isSuppressed(
   stateDir: string,
@@ -273,8 +279,13 @@ export function isSuppressed(
   for (const fp of readLines(rejectedPath(stateDir), isRejectionRecord)) {
     const age = now - new Date(fp.rejected_at).getTime();
     if (!Number.isFinite(age) || age > ttl) continue; // expired
-    if (fp.skill_slug === candidate.skill_slug) return true;
-    if (jaccard(candWords, new Set(fp.words)) >= threshold) return true;
+    const sim = jaccard(candWords, new Set(fp.words));
+    // Same-slug re-proposal clears a relaxed (but still > 0) bar; a
+    // different slug must clear the full threshold. Either way content
+    // must overlap — a bare slug match never suppresses.
+    const effectiveThreshold =
+      fp.skill_slug === candidate.skill_slug ? threshold * 0.7 : threshold;
+    if (sim >= effectiveThreshold) return true;
   }
   return false;
 }

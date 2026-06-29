@@ -7597,10 +7597,33 @@ const ipcServer: IpcServer = createIpcServer({
     )
   },
 
+  // The wedge-watchdog detected claude's /rate-limit-options weekly-quota menu
+  // (a TUI wall that never produced a 429, so the inference-path auto-fallback
+  // never fired). Trigger the SAME fleet auto-fallback the 429 path uses,
+  // threading the parsed weekly reset as markExhausted's `until` — with a
+  // weekly-scale FALLBACK when the sidecar couldn't parse it (resetAt absent):
+  // passing undefined would let markExhausted use its ~5h default, which would
+  // un-exhaust a weekly-walled account and re-wedge it within hours. The
+  // existing chain handles the rest (roll to a fallback subscription account,
+  // or the all-exhausted operator alert when none has quota). Fire-and-forget.
+  onQuotaWallDetected(_client: IpcClient, msg: QuotaWallDetectedMessage) {
+    const untilMs = resolveExhaustUntil(msg.resetAt)
+    process.stderr.write(
+      `telegram gateway: quota_wall_detected agent=${msg.agentName} ` +
+        `until=${new Date(untilMs).toISOString()}` +
+        (msg.resetAt == null ? ' (reset unparsed → +7d default)' : '') +
+        ' — triggering fleet auto-fallback\n',
+    )
+    void fireFleetAutoFallback(msg.agentName, untilMs)
+  },
+
   // #2670 one-tap self-improvement — persist a skill-improvement proposal and
   // post its Approve/Dismiss card. The store transition + apply-injection on
   // Approve are owned by handleSkillProposalCallback (so a gateway restart
-  // between post and tap still resolves correctly).
+  // between post and tap still resolves correctly). Placed AFTER
+  // onQuotaWallDetected so it doesn't fall inside the source slice that
+  // send-outbound-wiring.test.ts takes between onSendOutbound and
+  // onQuotaWallDetected.
   onPostSkillProposal(_client: IpcClient, msg: PostSkillProposalMessage) {
     const self = process.env.SWITCHROOM_AGENT_NAME
     if (self && msg.agentName !== self) {
@@ -7664,26 +7687,6 @@ const ipcServer: IpcServer = createIpcServer({
       `telegram gateway: post_skill_proposal agent=${msg.agentName} chat=${msg.chatId} ` +
       `proposal=${proposal.id} slug=${proposal.skill_slug} new=${proposal.is_new}\n`,
     )
-  },
-
-  // The wedge-watchdog detected claude's /rate-limit-options weekly-quota menu
-  // (a TUI wall that never produced a 429, so the inference-path auto-fallback
-  // never fired). Trigger the SAME fleet auto-fallback the 429 path uses,
-  // threading the parsed weekly reset as markExhausted's `until` — with a
-  // weekly-scale FALLBACK when the sidecar couldn't parse it (resetAt absent):
-  // passing undefined would let markExhausted use its ~5h default, which would
-  // un-exhaust a weekly-walled account and re-wedge it within hours. The
-  // existing chain handles the rest (roll to a fallback subscription account,
-  // or the all-exhausted operator alert when none has quota). Fire-and-forget.
-  onQuotaWallDetected(_client: IpcClient, msg: QuotaWallDetectedMessage) {
-    const untilMs = resolveExhaustUntil(msg.resetAt)
-    process.stderr.write(
-      `telegram gateway: quota_wall_detected agent=${msg.agentName} ` +
-        `until=${new Date(untilMs).toISOString()}` +
-        (msg.resetAt == null ? ' (reset unparsed → +7d default)' : '') +
-        ' — triggering fleet auto-fallback\n',
-    )
-    void fireFleetAutoFallback(msg.agentName, untilMs)
   },
 
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
