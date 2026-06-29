@@ -88,11 +88,24 @@ function agentLiveness(config: SwitchroomConfig, agentName: string): AgentLivene
 }
 
 function toHermesSession(agent: AgentInfo, liveness: AgentLiveness) {
+  const nowSec = Math.floor(Date.now() / 1000);
   return {
     id: agent.name,
     name: agent.name,
+    title: agent.name,
     status: liveness,
     model: "claude",
+    // Required SessionInfo fields — zero-value stubs (no token metering in switchroom)
+    is_active: liveness === "active",
+    started_at: nowSec,
+    last_active: nowSec,
+    ended_at: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    message_count: 0,
+    tool_call_count: 0,
+    preview: null,
+    source: "switchroom",
     created_at: null,
     updated_at: null,
     quota: agent.primaryAccount
@@ -249,19 +262,26 @@ export async function handleHermesRest(
     return { status: 200, body: { history: result.turns ?? [] } };
   }
 
-  // GET /api/status — fleet overview
+  // GET /api/status — StatusResponse shape Hermes Desktop expects
   if (method === "GET" && pathname === "/api/status") {
-    const agents = await handleGetAgents(config);
-    const fleet = agents.map((a) => ({
-      name: a.name,
-      status: agentLiveness(config, a.name),
-    }));
     return {
       status: 200,
       body: {
-        status: "ok",
-        provider: "switchroom",
-        agents: fleet,
+        version: "switchroom",
+        gateway_running: true,
+        gateway_platforms: {},
+        gateway_state: "ready",
+        config_version: 0,
+        latest_config_version: 0,
+        hermes_home: "switchroom",
+        release_date: null,
+        active_sessions: 0,
+        config_path: null,
+        env_path: null,
+        gateway_exit_reason: null,
+        gateway_health_url: null,
+        gateway_pid: null,
+        gateway_updated_at: null,
       },
     };
   }
@@ -330,6 +350,11 @@ export async function handleHermesRest(
 
   if (method === "GET" && pathname === "/api/memory/providers") {
     return { status: 200, body: {} };
+  }
+
+  // GET /api/fs/default-cwd — remote mode cwd seeding (caught by caller)
+  if (method === "GET" && pathname === "/api/fs/default-cwd") {
+    return { status: 200, body: { cwd: null, branch: null } };
   }
 
   return null;
@@ -542,13 +567,16 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
 
-      // Prompt accepted. The agent's reply arrives in Telegram (mirrored
-      // per the admin-console conditions). We emit message.complete so
-      // the desktop knows the submit was accepted; real delta streaming
-      // is a follow-up (Phase B).
-      sendEvent(ctx, "message.complete", sessionId, {
+      // Prompt accepted. The agent's reply arrives in Telegram — stream a
+      // brief acknowledgement so the desktop shows something in the chat
+      // rather than a hanging spinner. Full response streaming is Phase B.
+      sendEvent(ctx, "message.delta", sessionId, {
+        text: `*(Prompt sent to ${sessionId} — response will appear in Telegram)*`,
         prompt_key: promptKey,
-        note: "reply delivered to Telegram thread",
+      });
+      sendEvent(ctx, "message.complete", sessionId, {
+        text: `*(Prompt sent to ${sessionId} — response will appear in Telegram)*`,
+        prompt_key: promptKey,
       });
       sendResponse(ctx, rpcOk(id, { ok: true, prompt_key: promptKey }));
       break;
@@ -575,6 +603,18 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         sendResponse(ctx, rpcErr(id, -32603, intResult.error ?? "interrupt inject failed"));
         break;
       }
+      sendResponse(ctx, rpcOk(id, { ok: true }));
+      break;
+    }
+
+    case "setup.status": {
+      // Switchroom always has a provider configured (subscription-funded claude CLI).
+      sendResponse(ctx, rpcOk(id, { provider_configured: true }));
+      break;
+    }
+
+    case "setup.runtime_check": {
+      // The runtime is always ready — claude runs inside each agent container.
       sendResponse(ctx, rpcOk(id, { ok: true }));
       break;
     }
