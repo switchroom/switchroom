@@ -29,6 +29,7 @@ import { createHash } from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { clearStaleTelegramPollingState } from '../startup-reset.js'
 import { createRetryApiCall } from '../retry-api-call.js'
+import { RICH_MESSAGE_MAX_CHARS } from '../format.js'
 
 // ─── tg-post tag plumbing ─────────────────────────────────────────────────
 
@@ -179,7 +180,11 @@ export function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
 }
 
-export function formatSwitchroomOutput(output: string, maxLen = 4000): string {
+// Default truncation budget for CLI output bound for Telegram. Post-#2669 the
+// rich-message wire cap is RICH_MESSAGE_MAX_CHARS (32768), not the legacy 4096
+// plain-text limit; the preBlock fence framing (~8 chars) easily fits the
+// remaining headroom.
+export function formatSwitchroomOutput(output: string, maxLen = RICH_MESSAGE_MAX_CHARS): string {
   const trimmed = output.trim()
   if (trimmed.length <= maxLen) return trimmed
   return trimmed.slice(0, maxLen - 20) + '\n... (truncated)'

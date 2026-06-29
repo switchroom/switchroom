@@ -152,6 +152,12 @@ export interface StreamReplyDeps {
   retry?: RetryPolicy
   /** Whitespace repair applied to the raw caller text. */
   repairEscapedWhitespace: (text: string) => string
+  /**
+   * Promote lone prose paragraph breaks into GFM hard breaks so the rich
+   * path doesn't collapse them. Optional for backward compat; when omitted,
+   * the raw (repaired) text is sent unchanged.
+   */
+  normalizeParagraphBreaks?: (text: string) => string
   /** Validates the chat id against the access list. Throws on deny. */
   assertAllowedChat: (chatId: string) => void
   /** Resolves the effective thread id (explicit, last-inbound, or undefined). */
@@ -302,7 +308,9 @@ export async function handleStreamReply(
   deps: StreamReplyDeps,
 ): Promise<StreamReplyResult> {
   const chat_id = args.chat_id
-  const rawText = deps.repairEscapedWhitespace(args.text)
+  const rawText = deps.normalizeParagraphBreaks
+    ? deps.normalizeParagraphBreaks(deps.repairEscapedWhitespace(args.text))
+    : deps.repairEscapedWhitespace(args.text)
   const done = Boolean(args.done)
   const format = args.format ?? deps.defaultFormat
   if (done) {

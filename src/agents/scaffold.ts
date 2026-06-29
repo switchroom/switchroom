@@ -200,8 +200,10 @@ value back into chat.
 
 ### Formatting — make it scannable
 
-\`reply\` and \`stream_reply\` render Markdown as Telegram HTML for you, so
-\`**bold**\` becomes bold and backtick-wrapped text becomes monospace. Use it.
+\`reply\` and \`stream_reply\` render rich Markdown (Bot API 10.1) for you, so
+\`**bold**\` becomes bold and backtick-wrapped text becomes monospace. Your full
+formatting floor card — the toolkit and when to reach for each — is injected
+into your system prompt every session; this is the conversational summary.
 
 - **A one- or two-line conversational reply needs almost no markup.** Keep
   bold for the single fact that matters, never for decoration. "on it, pulling
@@ -223,11 +225,9 @@ value back into chat.
   • flag anything user-facing
 
   **Back in** ~2 min with a synthesized summary.
-- Bullets stay one level deep — Telegram flattens nested lists awkwardly. Use
-  backtick-wrapped \`inline code\` for filenames, commands, and identifiers.
-- Don't use Markdown headings (\`#\` / \`##\`) in a reply — bold the label
-  instead (\`**Blockers**\`, not \`## Blockers\`). Keep lines short; long
-  unwrapped lines are hard to read on a phone.
+- Use backtick-wrapped \`inline code\` for filenames, commands, and
+  identifiers. Keep lines short; long unwrapped lines are hard to read on a
+  phone.
 
 Every turn that answers a user message ends with a user-visible
 \`reply\` (or \`stream_reply\` done=true) — Telegram is all the user
@@ -339,6 +339,65 @@ belongs in plain config, not the vault. If a tool call is **blocked for
 containing a vaulted secret**, report that exact block message to the
 operator and stop — don't theorise about auth or tokens; it just means
 a stored value reached a tool argument.`;
+
+/**
+ * The Telegram formatting FLOOR CARD — boot-injected into EVERY agent's
+ * `claude` session via `--append-system-prompt` (model-independent, present
+ * in every session, see `systemPromptAppendShellQuoted` below). This is the
+ * deterministic floor: every bot knows the rich-Markdown toolkit and the craft
+ * of formatting for a phone screen, with no model in the loop deciding whether
+ * to load it.
+ *
+ * SINGLE SOURCE OF TRUTH. The depth reference doc
+ * `reference/telegram-formatting-guide.md` quotes this text VERBATIM in its
+ * "FLOOR CARD (boot-injected)" section (Ken approved this wording). The doc
+ * is a `reference/*.md` file NOT shipped into the agent image, so it cannot
+ * be imported at runtime — keep the two in sync by hand, and update both
+ * together. The guide's comment points back here.
+ *
+ * Keep it COMPACT — it is cached in every agent's prompt prefix.
+ */
+const TELEGRAM_FORMATTING_FLOOR_CARD = `## Formatting for Telegram
+
+You're writing for a phone screen in Telegram. Every reply renders as rich Markdown
+(Bot API 10.1). Format to make the message **scannable and easy to read**, not
+decorated. These are communication tools — use them with judgment. Most short replies
+need none of them.
+
+### Mechanical rules (always)
+- Separate paragraphs with a blank line (\`\\n\\n\`). A single newline collapses onto the
+  same line and reads as a wall of text.
+- Keep paragraphs short — 1 to 4 lines. Break before the reader has to work for it.
+- Hard cap is 32768 characters. Long before that, ask whether a wall of text is the
+  right answer at all.
+
+### The toolkit, and when to reach for each
+- **Bold** — the one key fact or the answer. Not every noun. If everything is bold,
+  nothing is.
+- *Italic* — light emphasis, asides, labels.
+- \`code spans\` — every identifier: filenames, commands, config keys, agent / account /
+  slot names, error codes. Tap-to-copy, and visually distinct from prose.
+- Code fences — multi-line output: diffs, logs, command blocks, JSON. Add a language
+  hint (\` \`\`\`diff \`, \` \`\`\`json \`) when it sharpens the render.
+- Bulleted list — 3+ parallel items the reader will scan or compare. Never for a single
+  thought or a flowing narrative.
+- Numbered list — ordered steps or ranked items.
+- Tables — 2-D data only (rows × columns): per-account usage, status fields. Overkill
+  for a flat list.
+- Headings — only in a long, multi-section answer. Clutter on a short reply.
+- Blockquotes (\`>\`) — quoted text or indented continuation. Telegram drops leading
+  spaces, so use \`>\`, never literal indentation.
+- Dividers (\`---\`) — between genuinely separate sections. Heavy; use sparingly.
+
+### The why
+Structure exists for the reader, not the writer. A two-item bullet list is worse than a
+sentence. A heading on a three-line reply is noise. Reach for structure only when it
+**reduces the reader's effort** — parallel options, scannable data, ordered steps — and
+stay in prose when the thought is connected. When in doubt: shorter and plainer wins.
+
+Every turn that answers a user message ends with a user-visible \`reply\` (or
+\`stream_reply\` done=true) — Telegram is all the user sees; your terminal output
+never reaches them.`;
 
 /**
  * Canonical rendering of the fleet invariants file written to
@@ -2492,12 +2551,20 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       // `--add-dir` flag set in start.sh.hbs. See `renderFleetInvariants()`
       // at the top of this file.
       //
-      // What remains here: the operator's per-agent
+      // EXCEPTION — the Telegram formatting FLOOR CARD is injected here, into
+      // `--append-system-prompt`, deterministically for EVERY session (it must
+      // not depend on the model choosing to load a discovered file). Single
+      // source of truth: TELEGRAM_FORMATTING_FLOOR_CARD above.
+      //
+      // What also remains here: the operator's per-agent
       // `system_prompt_append` (yaml passthrough). Reserved for genuinely
       // per-agent system-prompt extensions; fleet-wide content goes in
       // `~/.switchroom/fleet/CLAUDE.md` (lane 2, operator-owned).
       const baseAppend = agentConfig.system_prompt_append ?? '';
-      return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
+      const combined = baseAppend.length > 0
+        ? `${TELEGRAM_FORMATTING_FLOOR_CARD}\n\n${baseAppend}`
+        : TELEGRAM_FORMATTING_FLOOR_CARD;
+      return shellSingleQuote(combined);
     })(),
     extraCliArgs: (() => {
       const parts: string[] = []
@@ -5214,8 +5281,16 @@ export function reconcileAgent(
         // and reach the model via Claude Code native CLAUDE.md
         // auto-discovery (start.sh.hbs passes `--add-dir ~/.switchroom/fleet`).
         // See the matching scaffoldAgent path above and renderFleetInvariants().
+        //
+        // EXCEPTION — the Telegram formatting FLOOR CARD is injected here, into
+        // `--append-system-prompt`, deterministically for EVERY session. Must
+        // stay in lockstep with the scaffoldAgent path above. Single source of
+        // truth: TELEGRAM_FORMATTING_FLOOR_CARD.
         const baseAppend = agentConfig.system_prompt_append ?? '';
-        return baseAppend.length > 0 ? shellSingleQuote(baseAppend) : undefined;
+        const combined = baseAppend.length > 0
+          ? `${TELEGRAM_FORMATTING_FLOOR_CARD}\n\n${baseAppend}`
+          : TELEGRAM_FORMATTING_FLOOR_CARD;
+        return shellSingleQuote(combined);
       })(),
       extraCliArgs: (() => {
         const parts: string[] = []

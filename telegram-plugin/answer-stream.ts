@@ -368,12 +368,13 @@ export function createAnswerStream(config: AnswerStreamConfig): AnswerStreamHand
         return undefined
       }
 
-      // Telegram caps a single message at 4096 chars. The streaming path
-      // already guards on this in sendOrEdit; materialize must too, or
-      // long answers silently drop the final push notification (Telegram
-      // returns 400, the catch swallows). Per the JTBD anti-pattern
-      // "silent failure of any kind", warn and bail explicitly so the
-      // operator can correlate.
+      // Telegram caps a single rich message at TELEGRAM_MAX_CHARS (32768,
+      // the Bot API 10.1 rich-message wire cap post-#2669 — NOT the legacy
+      // 4096 plain-text limit). The streaming path already guards on this in
+      // sendOrEdit; materialize must too, or long answers silently drop the
+      // final push notification (Telegram returns 400, the catch swallows).
+      // Per the JTBD anti-pattern "silent failure of any kind", warn and bail
+      // explicitly so the operator can correlate.
       if (textToSend.length > TELEGRAM_MAX_CHARS) {
         warn?.(
           `answer-stream: materialize — text exceeds ${TELEGRAM_MAX_CHARS} chars (got ${textToSend.length}); skipping. ` +
