@@ -744,11 +744,19 @@ section.)
 `feedback_npm_publish_landmines`: past releases shipped without
 `dist/cli/switchroom.js`).
 
+The committed `package.json` version is a stale placeholder (see step 2).
+`npm pack` names the tarball from that stale version, so you get
+`switchroom-0.16.21.tgz` even on a v0.16.22 release. **Bump `package.json`
+temporarily before packing — do NOT commit the bump:**
+
 ```
 node scripts/build.mjs                          # rebuild — reset --hard wipes dist
-npm pack                                        # produces switchroom-X.Y.Z.tgz
+node -e "const p=require('./package.json'); p.version='X.Y.Z'; \
+  require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
+npm pack                                        # now produces switchroom-X.Y.Z.tgz
 tar tzf switchroom-X.Y.Z.tgz | grep -E "dist/cli/switchroom.js|vendor/hindsight" | head -5
 npm publish --ignore-scripts switchroom-X.Y.Z.tgz
+# Leave package.json bumped in the worktree (it's throwaway); don't commit it
 ```
 
 `--ignore-scripts` skips `prepublishOnly` so the verified tarball is
@@ -765,6 +773,26 @@ switchroom --version    # confirm X.Y.Z
 --workflow=docker-images --limit 2`, ~5 min). All 5 images (agent,
 broker, auth-broker, kernel, hindsight) must be pull-able under the
 new tag.
+
+**8a. Update the web container** — `switchroom update` and per-agent
+`agent restart` only touch agent/broker/kernel images. The
+`switchroom-web` container is a **separate compose project**
+(`~/.switchroom/web/docker-compose.yml`) and must be updated manually:
+
+```
+docker pull ghcr.io/switchroom/switchroom-web:vX.Y.Z
+sed -i 's|switchroom-web:vOLD|switchroom-web:vX.Y.Z|g' ~/.switchroom/web/docker-compose.yml
+docker compose -p switchroom-web -f ~/.switchroom/web/docker-compose.yml up -d
+docker exec switchroom-web switchroom --version   # confirm X.Y.Z
+```
+
+The auth token for the web API lives at `~/.switchroom/web-token` (plain
+text, auto-generated on first start). Use it to smoke-test endpoints:
+
+```
+TOKEN=$(cat ~/.switchroom/web-token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/sessions | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['sessions']), 'sessions')"
+```
 
 **9. Canary on test-harness BEFORE fleet rollout** — mandatory gate.
 See **Pre-rollout UAT** below.
