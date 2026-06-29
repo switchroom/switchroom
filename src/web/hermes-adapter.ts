@@ -32,6 +32,11 @@ import {
   agentBridgeAlive,
   type AgentInfo,
 } from "./api.js";
+import {
+  injectSlashCommand,
+  INJECT_ALLOWLIST,
+  INJECT_BLOCKLIST,
+} from "../agents/inject.js";
 
 // ─── JSON-RPC 2.0 types ──────────────────────────────────────────────────────
 
@@ -328,7 +333,6 @@ function switchroomCommandsCatalog() {
           ["/clear", "Clear context (fresh slate; memory in Hindsight)"],
           ["/restart", "Restart the agent"],
           ["/model", "Show or switch the Claude model"],
-          ["/effort", "Show or switch the reasoning effort (low→max)"],
           ["/status", "Agent, model, auth status"],
         ] as [string, string][],
       },
@@ -873,24 +877,63 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
       break;
     }
 
-    // slash.exec — run a slash command by injecting it into the agent session.
-    // Hermes sends { session_id, command, arg? } for any command with surface: exec.
-    // The injected string is just "/<command> <arg>" through the same injectInbound
-    // path as prompt.submit — the agent handles it as a synthesized turn.
+    // slash.exec — run a slash command against the agent.
+    //
+    // Two-path routing based on the inject allowlist:
+    //
+    //   REPL commands (INJECT_ALLOWLIST: /memory, /status, /usage, /clear,
+    //   /compact, /model, /hooks, /cost) — go through injectSlashCommand
+    //   (tmux send-keys). These are Claude Code REPL commands; injectInbound
+    //   would deliver them as conversation text, not execute them.
+    //
+    //   Switchroom gateway commands (everything else: /vault, /auth, /doctor,
+    //   /restart, /new, /whoami, /logs, /version, /commands) — go through
+    //   injectInbound as a synthesized user turn. The gateway handles these as
+    //   regular Telegram commands when it receives them in the chat stream.
+    //
+    // Explicitly blocked REPL commands (/effort, /login, /logout, /exit, /quit)
+    // are refused with a clear error.
     case "slash.exec": {
       const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
-      const command = String(params.command ?? "").replace(/^\/+/, "");
+      const bare = String(params.command ?? "").replace(/^\/+/, "");
       const arg = params.arg != null ? String(params.arg) : "";
 
       if (!sessionId || !config.agents?.[sessionId]) {
         sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
         break;
       }
-      if (!command) {
+      if (!bare) {
         sendResponse(ctx, rpcErr(id, -32602, "command is required"));
         break;
       }
 
+      const fullCommand = arg ? `/${bare} ${arg}` : `/${bare}`;
+      const verb = `/${bare}` as `/${string}`;
+
+      if (INJECT_BLOCKLIST.has(verb)) {
+        sendResponse(ctx, rpcErr(id, -32602, `/${bare} cannot be executed remotely`));
+        break;
+      }
+
+      if (INJECT_ALLOWLIST.has(verb)) {
+        // REPL command — tmux send-keys path captures real output
+        let injectResult;
+        try {
+          injectResult = await injectSlashCommand(sessionId, fullCommand);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          sendResponse(ctx, rpcErr(id, -32603, msg));
+          break;
+        }
+        const output =
+          injectResult.outcome === "ok"
+            ? injectResult.output ?? ""
+            : `*(${fullCommand} sent)*`;
+        sendResponse(ctx, rpcOk(id, { ok: true, output }));
+        break;
+      }
+
+      // Switchroom gateway command — synthesized turn through injectInbound
       const agentsDir = resolveAgentsDir(config);
       const chat = resolveAgentChat(config, sessionId, agentsDir);
       if (!chat) {
@@ -898,14 +941,13 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
 
-      const fullCommand = arg ? `/${command} ${arg}` : `/${command}`;
-      const promptKey = `slash-${command}-${Date.now()}`;
+      const promptKey = `slash-${bare}-${Date.now()}`;
       const result = await injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, fullCommand, promptKey);
       if (!result.ok) {
         sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
         break;
       }
-      sendResponse(ctx, rpcOk(id, { ok: true, output: `*(/${command} sent to ${sessionId})*` }));
+      sendResponse(ctx, rpcOk(id, { ok: true, output: `*(${fullCommand} sent to ${sessionId})*` }));
       break;
     }
 
