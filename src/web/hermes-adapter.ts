@@ -205,6 +205,58 @@ async function injectInbound(
   });
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+import type { Turn } from "../../telegram-plugin/registry/turns-schema.js";
+
+/** Map switchroom Turn records to SessionMessage[] for Hermes Desktop history. */
+function turnsToMessages(turns: Turn[]): object[] {
+  const messages: object[] = [];
+  for (const t of turns) {
+    if (t.user_prompt_preview) {
+      messages.push({
+        role: "user",
+        content: t.user_prompt_preview,
+        timestamp: Math.floor(t.started_at / 1000),
+      });
+    }
+    if (t.assistant_reply_preview) {
+      messages.push({
+        role: "assistant",
+        content: t.assistant_reply_preview,
+        timestamp: t.ended_at != null ? Math.floor(t.ended_at / 1000) : Math.floor(t.started_at / 1000),
+      });
+    }
+  }
+  return messages;
+}
+
+/** Claude models available via the switchroom subscription. */
+const SWITCHROOM_MODELS = [
+  "claude-sonnet-4-6",
+  "claude-opus-4-8",
+  "claude-haiku-4-5-20251001",
+  "claude-fable-5",
+];
+
+/** Build a ModelOptionsResponse for the Hermes Desktop model picker. */
+function switchroomModelOptions() {
+  return {
+    model: "claude-sonnet-4-6",
+    provider: "switchroom",
+    providers: [
+      {
+        slug: "switchroom",
+        name: "Switchroom (Claude)",
+        is_current: true,
+        authenticated: true,
+        models: SWITCHROOM_MODELS,
+        total_models: SWITCHROOM_MODELS.length,
+      },
+    ],
+  };
+}
+
 // ─── REST handler ─────────────────────────────────────────────────────────────
 
 export interface HermesRestResult {
@@ -252,14 +304,15 @@ export async function handleHermesRest(
     return { status: 200, body: { session: toHermesSession(agent, agentLiveness(config, id)) } };
   }
 
-  // GET /api/sessions/:id/history — conversation history
-  const historyMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/history$/);
-  if (method === "GET" && historyMatch) {
-    const id = decodeURIComponent(historyMatch[1]);
+  // GET /api/sessions/:id/messages — conversation history (SessionMessagesResponse shape)
+  const messagesMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/);
+  if (method === "GET" && messagesMatch) {
+    const id = decodeURIComponent(messagesMatch[1]);
     if (!config.agents?.[id]) return { status: 404, body: { error: "Unknown session" } };
-    const result = handleGetTurns(config, id, 50);
+    const result = handleGetTurns(config, id, 100);
     if (!result.ok) return { status: 500, body: { error: result.error } };
-    return { status: 200, body: { history: result.turns ?? [] } };
+    const messages = turnsToMessages(result.turns ?? []);
+    return { status: 200, body: { session_id: id, messages } };
   }
 
   // GET /api/status — StatusResponse shape Hermes Desktop expects
@@ -309,7 +362,7 @@ export async function handleHermesRest(
     return {
       status: 200,
       body: {
-        model: "claude",
+        model: "claude-sonnet-4-6",
         provider: "switchroom",
         capabilities: {},
       },
@@ -378,6 +431,16 @@ export async function handleHermesRest(
   // GET /api/auth/providers — OAuth provider listing (only needed in OAuth mode)
   if (method === "GET" && pathname === "/api/auth/providers") {
     return { status: 200, body: { providers: [] } };
+  }
+
+  // GET /api/model/options — model picker list (ModelOptionsResponse)
+  if (method === "GET" && pathname.startsWith("/api/model/options")) {
+    return { status: 200, body: switchroomModelOptions() };
+  }
+
+  // POST /api/model/set — model selection (accept silently; agent model is set per-session via config.set RPC)
+  if (method === "POST" && pathname === "/api/model/set") {
+    return { status: 200, body: { ok: true } };
   }
 
   return null;
@@ -531,7 +594,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         sendResponse(ctx, rpcErr(id, -32603, result.error ?? "Failed to read history"));
         break;
       }
-      sendResponse(ctx, rpcOk(id, { history: result.turns ?? [] }));
+      sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: turnsToMessages(result.turns ?? []) }));
       break;
     }
 
@@ -638,6 +701,39 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
 
     case "setup.runtime_check": {
       // The runtime is always ready — claude runs inside each agent container.
+      sendResponse(ctx, rpcOk(id, { ok: true }));
+      break;
+    }
+
+    case "model.options": {
+      sendResponse(ctx, rpcOk(id, switchroomModelOptions()));
+      break;
+    }
+
+    case "model.info": {
+      sendResponse(ctx, rpcOk(id, { model: "claude-sonnet-4-6", provider: "switchroom" }));
+      break;
+    }
+
+    // config.set — model switch from the composer model picker:
+    // value is "model --provider provider". Inject /model <model> into the agent.
+    case "config.set": {
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
+      const key = String(params.key ?? "");
+      const value = String(params.value ?? "");
+
+      if (key === "model" && sessionId && config.agents?.[sessionId]) {
+        // Extract model name from "claude-sonnet-4-6 --provider switchroom"
+        const modelName = value.replace(/\s+--provider\s+\S+$/, "").trim();
+        if (modelName) {
+          const agentsDir = resolveAgentsDir(config);
+          const chat = resolveAgentChat(config, sessionId, agentsDir);
+          if (chat) {
+            const promptKey = `model-switch-${Date.now()}`;
+            void injectInbound(agentsDir, sessionId, chat.chatId, chat.threadId, `/model ${modelName}`, promptKey);
+          }
+        }
+      }
       sendResponse(ctx, rpcOk(id, { ok: true }));
       break;
     }
