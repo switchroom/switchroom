@@ -51,7 +51,7 @@ import {
   AGENT_LIVE_WINDOW_MS,
   AGENT_LIVE_POLL_INTERVAL_MS,
 } from './boot-probes.js'
-import { escapeHtml } from '../card-format.js'
+import { escapeMarkdown } from '../card-format.js'
 import {
   loadCache as loadBootIssueCache,
   diffProbes as diffBootProbes,
@@ -348,26 +348,28 @@ export interface RenderBootCardOpts {
  * the eye; everything else stays out of the way.
  */
 /**
- * Render a probe's `nextStep` hint as Telegram HTML. The hint is
- * authored as plain text with backtick-quoted commands (one shell idiom
- * across the codebase — search "Run `switchroom"). We translate those
- * to <code> spans and escape everything else, so commands stay tap-to-
- * copy on mobile without bleeding raw HTML through.
+ * Render a probe's `nextStep` hint as GFM markdown. The hint is authored
+ * as plain text with backtick-quoted commands (one shell idiom across the
+ * codebase — search "Run `switchroom"). The backtick spans already ARE
+ * markdown code spans, so commands stay tap-to-copy on mobile; non-code
+ * text is markdown-escaped so stray syntax chars render literally.
  */
 function renderNextStep(text: string): string {
   const parts = text.split('`')
-  // Odd-count backticks means an unterminated <code> span — fall back to
-  // plain-escaped text rather than rendering the trailing tail inside a
-  // code block. Author error, not user-input, but defensive is cheap.
-  if (parts.length % 2 === 0) return escapeHtml(text)
-  return parts.map((p, i) => (i % 2 === 0 ? escapeHtml(p) : `<code>${escapeHtml(p)}</code>`)).join('')
+  // Odd-count backticks means an unterminated code span — fall back to
+  // plain-escaped text rather than emitting a half-open span. Author
+  // error, not user-input, but defensive is cheap.
+  if (parts.length % 2 === 0) return escapeMarkdown(text)
+  // Code-span content (odd indices) is literal — backtick content is not
+  // re-interpreted, so it must NOT be markdown-escaped.
+  return parts.map((p, i) => (i % 2 === 0 ? escapeMarkdown(p) : `\`${p}\``)).join('')
 }
 
 export function renderBootCard(opts: RenderBootCardOpts): string {
   const { agentName, version, probes, restartReason, restartAgeMs } = opts
   const agentSlug = opts.agentSlug ?? agentName
   const ackEmoji = restartReason ? REASON_EMOJI[restartReason] : '✅'
-  const ack = `${ackEmoji} <b>${escapeHtml(agentName)}</b> back up · ${escapeHtml(version)}`
+  const ack = `${ackEmoji} **${escapeMarkdown(agentName)}** back up · ${escapeMarkdown(version)}`
 
   const degradedRows: string[] = []
   const snoozeSet = new Set<ProbeKey>(opts.snoozeRows ?? [])
@@ -380,7 +382,7 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     for (const key of opts.resolvedRows) {
       const lbl = PROBE_LABELS[key]
       if (!lbl) continue
-      degradedRows.push(`✅ <b>${escapeHtml(lbl)}</b>  resolved`)
+      degradedRows.push(`✅ **${escapeMarkdown(lbl)}**  resolved`)
     }
   }
 
@@ -392,15 +394,15 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     const ageStr = restartAgeMs != null && restartAgeMs > 0
       ? ` · ${(restartAgeMs / 1000).toFixed(1)}s ago`
       : ''
-    degradedRows.push(`⚠️ <b>Restart</b>  ${escapeHtml(REASON_LABEL.crash)}${ageStr}`)
+    degradedRows.push(`⚠️ **Restart**  ${escapeMarkdown(REASON_LABEL.crash)}${ageStr}`)
     // Principle 1: every failure carries its next step. The crash row
     // tells the user how to inspect why. Runtime-aware: v0.7+ agents run
     // in Docker (no systemd/journalctl in-container) — the canonical
     // detection is SWITCHROOM_RUNTIME (see doctor-docker.ts).
     const tailCmd = process.env.SWITCHROOM_RUNTIME === 'docker'
-      ? `docker logs --tail 100 switchroom-${escapeHtml(agentSlug)}`
-      : `journalctl --user -u switchroom-${escapeHtml(agentSlug)} -n 100`
-    degradedRows.push(`    ↳ Tail logs: <code>${tailCmd}</code>`)
+      ? `docker logs --tail 100 switchroom-${agentSlug}`
+      : `journalctl --user -u switchroom-${agentSlug} -n 100`
+    degradedRows.push(`    ↳ Tail logs: \`${tailCmd}\``)
   }
 
   // Probe rows — only those that surfaced as degraded/fail. Healthy
@@ -427,7 +429,7 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
       // We surface the existing row format unchanged here; the
       // "Still:" / "New:" distinction is conveyed by which rows the
       // user does or doesn't see across consecutive boots.
-      degradedRows.push(`${dot} <b>${PROBE_LABELS[key]}</b>  ${escapeHtml(r.detail)}`)
+      degradedRows.push(`${dot} **${PROBE_LABELS[key]}**  ${escapeMarkdown(r.detail)}`)
       if (r.nextStep) {
         degradedRows.push(`    ↳ ${renderNextStep(r.nextStep)}`)
       }
@@ -692,7 +694,6 @@ export async function startBootCard(
   if (reuseId != null && bot.editMessageTextStrict != null) {
     try {
       const outcome = await bot.editMessageTextStrict(chatId, reuseId, ackText, {
-        parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         ...(threadId != null ? { message_thread_id: threadId } : {}),
       })
@@ -708,7 +709,6 @@ export async function startBootCard(
   if (messageId < 0) {
     try {
       const sent = await bot.sendMessage(chatId, ackText, {
-        parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         ...(threadId != null ? { message_thread_id: threadId } : {}),
         ...(ackMessageId != null ? { reply_parameters: { message_id: ackMessageId } } : {}),
@@ -858,7 +858,6 @@ export async function startBootCard(
         if (currentText !== ackText) {
           try {
             await bot.editMessageText(chatId, messageId, currentText, {
-              parse_mode: 'HTML',
               link_preview_options: { is_disabled: true },
               ...(threadId != null ? { message_thread_id: threadId } : {}),
             })
@@ -915,7 +914,6 @@ export async function startBootCard(
 
           try {
             await bot.editMessageText(chatId, messageId, updatedText, {
-              parse_mode: 'HTML',
               link_preview_options: { is_disabled: true },
               ...(threadId != null ? { message_thread_id: threadId } : {}),
             })

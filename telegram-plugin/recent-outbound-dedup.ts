@@ -15,8 +15,8 @@
  *      (raw markdown, since reply tools don't always render HTML).
  *
  * Smoking-gun evidence: klanker chat 12345, msgs 5025 + 5027,
- * 11s apart. msg=5025 had `<b>...</b>` (turn-flush + markdownToHtml).
- * msg=5027 had `**...**` (the raw markdown reply tool's payload).
+ * 11s apart. The two paths historically rendered identical content two
+ * different ways (one HTML-escaped, one raw markdown) and shipped both.
  * Same content, different formatting, two messages.
  *
  * Fix shape: maintain a small in-memory cache of "what we just sent"
@@ -188,9 +188,9 @@ function makeKey(chatId: string, threadId: number | undefined): string {
 
 /**
  * Normalise text for content equality. The bug we're defending
- * against produces the SAME content rendered two different ways:
- * one path runs `markdownToHtml` (so `**foo**` becomes `<b>foo</b>`),
- * the other doesn't. Both must hash identically.
+ * against produces the SAME content rendered two different ways
+ * (historically one HTML-rendered, the other raw markdown). Both must
+ * hash identically — so we strip both HTML tags and markdown markers.
  *
  * Steps:
  *   1. Strip HTML tags (`<b>foo</b>` → `foo`).

@@ -243,7 +243,7 @@ function displayLabel(label: string, opts: SnapshotRenderOpts): string {
 function groupHeader(health: AccountHealth, count: number): string {
   const emoji = HEALTH_EMOJI[health];
   const title = HEALTH_TITLE[health];
-  return `${emoji} <b>${title}</b> (${count})`;
+  return `${emoji} **${title}** (${count})`;
 }
 
 const HEALTH_EMOJI: Record<AccountHealth, string> = {
@@ -284,10 +284,10 @@ function renderAccountRow(
 
   if (!snap.quota) {
     lines.push(
-      `${marker}<code>${escapeHtml(label)}</code>  <i>quota probe failed</i>`,
+      `${marker}\`${escapeHtml(label)}\`  _quota probe failed_`,
     );
     if (snap.quotaError) {
-      lines.push(`  <i>${escapeHtml(snap.quotaError)}</i>`);
+      lines.push(`  _${escapeHtml(snap.quotaError)}_`);
     }
     return lines;
   }
@@ -297,7 +297,7 @@ function renderAccountRow(
   // it as a data-quality gap, never a confident "0% / 0%".
   if (isProbeThin(q)) {
     lines.push(
-      `${marker}<code>${escapeHtml(label)}</code>  <i>quota unknown (thin probe)</i>`,
+      `${marker}\`${escapeHtml(label)}\`  _quota unknown (thin probe)_`,
     );
     return lines;
   }
@@ -307,7 +307,7 @@ function renderAccountRow(
   const fiveStr = fmtPct(norm.fiveHourUtilizationPct);
   const sevenStr = fmtPct(norm.sevenDayUtilizationPct);
   lines.push(
-    `${marker}<code>${escapeHtml(label)}</code>  ${fiveStr} / ${sevenStr}`,
+    `${marker}\`${escapeHtml(label)}\`  ${fiveStr} / ${sevenStr}`,
   );
 
   const health = classifyHealth(snap, now);
@@ -318,7 +318,7 @@ function renderAccountRow(
     const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
     const winLabel = win === '5h' ? '5-hour' : '7-day';
     lines.push(
-      `  <i>quota exhausted — back ${formatAbsolute(reset, tz)} (in ${formatRelative(reset, now)}, ${winLabel} cap)</i>`,
+      `  _quota exhausted — back ${formatAbsolute(reset, tz)} (in ${formatRelative(reset, now)}, ${winLabel} cap)_`,
     );
     return lines;
   }
@@ -337,13 +337,13 @@ function renderAccountRow(
   const sevenSeg = q.sevenDayResetAt
     ? `7d resets ${formatAbsolute(q.sevenDayResetAt, tz)} (in ${formatRelative(q.sevenDayResetAt, now)})`
     : '7d resets —';
-  lines.push(`  <i>${fiveFirst ? fiveSeg : sevenSeg}</i>`);
-  lines.push(`  <i>${fiveFirst ? sevenSeg : fiveSeg}</i>`);
+  lines.push(`  _${fiveFirst ? fiveSeg : sevenSeg}_`);
+  lines.push(`  _${fiveFirst ? sevenSeg : fiveSeg}_`);
   // Informational overage annotation: if out_of_credits (no overage headroom),
   // surface it as a sub-line on a healthy/throttling row — NOT a blocked badge.
   if (q.overageDisabledReason != null && OVERAGE_EXHAUSTED_REASONS.has(q.overageDisabledReason)) {
     lines.push(
-      `  <i>overage off (${escapeHtml(q.overageDisabledReason)}) — serving from quota</i>`,
+      `  _overage off (${escapeHtml(q.overageDisabledReason)}) — serving from quota_`,
     );
   }
   return lines;
@@ -380,7 +380,7 @@ export function renderAuthSnapshotFormat2(
 ): string {
   const now = opts.now ?? new Date();
   const lines: string[] = [];
-  lines.push('🔋 <b>Auth — fleet status</b>');
+  lines.push('🔋 **Auth — fleet status**');
 
   // Group by health. Render BLOCKED first (it's the urgent action),
   // then THROTTLING (potential next problem), then HEALTHY (good
@@ -410,16 +410,16 @@ export function renderAuthSnapshotFormat2(
 
   lines.push('');
   lines.push('────────────────────────────');
-  lines.push(`<i>${recommendation(snapshots, now, opts.demo ?? false)}</i>`);
+  lines.push(`_${recommendation(snapshots, now, opts.demo ?? false)}_`);
   // #2495 Change 2 — a failed probe-on-open renders an explicit "cached Nm
   // ago" warning, never a false live stamp. The degraded variant takes
   // precedence over the live stamp.
   if (opts.staleCachedAtMs != null) {
-    lines.push(`<i>⚠ cached ${formatAgeStamp(opts.staleCachedAtMs, now)}</i>`);
+    lines.push(`_⚠ cached ${formatAgeStamp(opts.staleCachedAtMs, now)}_`);
   } else if (opts.liveProbedAtMs != null) {
-    lines.push(`<i>Live · refreshed ${formatAgeStamp(opts.liveProbedAtMs, now)}</i>`);
+    lines.push(`_Live · refreshed ${formatAgeStamp(opts.liveProbedAtMs, now)}_`);
   } else {
-    lines.push('<i>Live</i>');
+    lines.push('_Live_');
   }
   return lines.join('\n');
 }
@@ -615,10 +615,10 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
     // same per-account row + earliest-recovery helpers the /auth table uses so
     // the formatting stays consistent with the rest of the auth surface.
     lines.push(
-      `🔴 <b>All accounts blocked · ${headerLimit} on ${escapeHtml(input.oldLabel)}</b>`,
+      `🔴 **All accounts blocked · ${headerLimit} on ${escapeHtml(input.oldLabel)}**`,
     );
     lines.push('');
-    lines.push(`Triggered by: agent <b>${escapeHtml(input.triggerAgent)}</b>`);
+    lines.push(`Triggered by: agent **${escapeHtml(input.triggerAgent)}**`);
 
     const fleet = input.fleetSnapshots ?? [];
     if (fleet.length > 0) {
@@ -639,7 +639,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       if (earliest) {
         lines.push('');
         lines.push(
-          `Earliest recovery: <code>${escapeHtml(earliest.label)}</code> ` +
+          `Earliest recovery: \`${escapeHtml(earliest.label)}\` ` +
             `${formatAbsolute(earliest.at, tz)} (in ${formatRelative(earliest.at, now)})`,
         );
       }
@@ -655,28 +655,28 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
     }
     lines.push('');
     lines.push(
-      `Run <code>/auth add &lt;label&gt;</code> to attach another subscription, ` +
-        `or <code>/auth refresh</code> to re-probe.`,
+      `Run \`/auth add <label>\` to attach another subscription, ` +
+        `or \`/auth refresh\` to re-probe.`,
     );
     return lines.join('\n');
   }
 
   // Successful swap.
   lines.push(
-    `✓ <b>Switched fleet · ${headerLimit} on ${escapeHtml(input.oldLabel)}</b>`,
+    `✓ **Switched fleet · ${headerLimit} on ${escapeHtml(input.oldLabel)}**`,
   );
   lines.push('');
   lines.push(
-    `<code>${escapeHtml(input.oldLabel)}</code> → <code>${escapeHtml(input.newLabel)}</code>`,
+    `\`${escapeHtml(input.oldLabel)}\` → \`${escapeHtml(input.newLabel)}\``,
   );
-  lines.push(`Triggered by: agent <b>${escapeHtml(input.triggerAgent)}</b>`);
+  lines.push(`Triggered by: agent **${escapeHtml(input.triggerAgent)}**`);
   lines.push('');
 
   if (input.oldQuota) {
     const recovery = recoveryAtFor(input.oldQuota);
     if (recovery) {
       lines.push(
-        `<code>${escapeHtml(input.oldLabel)}</code> recovers ` +
+        `\`${escapeHtml(input.oldLabel)}\` recovers ` +
           `${formatAbsolute(recovery, tz)} (in ${formatRelative(recovery, now)})`,
       );
     }
@@ -688,13 +688,13 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
     const hasHeadroom =
       input.newQuota.fiveHourUtilizationPct < THROTTLING_THRESHOLD_PCT &&
       input.newQuota.sevenDayUtilizationPct < THROTTLING_THRESHOLD_PCT;
-    const headroomStr = hasHeadroom ? '<i>(plenty of headroom)</i>' : '<i>(near limit — watch this)</i>';
+    const headroomStr = hasHeadroom ? '_(plenty of headroom)_' : '_(near limit — watch this)_';
     lines.push(
-      `<code>${escapeHtml(input.newLabel)}</code> now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
+      `\`${escapeHtml(input.newLabel)}\` now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
     );
   } else {
     lines.push(
-      `<i>(quota probe for new account is pending — will reflect on next /auth)</i>`,
+      `_(quota probe for new account is pending — will reflect on next /auth)_`,
     );
   }
 
@@ -808,10 +808,7 @@ function switchPriority(s: AccountSnapshot, now: Date = new Date()): number {
 // ── shared HTML escape ───────────────────────────────────────────────
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1');
 }
 
 // ── snapshot assembly helper ─────────────────────────────────────────

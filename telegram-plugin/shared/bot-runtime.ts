@@ -154,14 +154,25 @@ export function createRobustApiCall() {
   })
 }
 
-// ─── HTML escape helpers ─────────────────────────────────────────────────
+// ─── Markdown escape helpers (#2669) ──────────────────────────────────────
 
+/**
+ * Escape GFM-markdown specials in a dynamic value interpolated into prose.
+ * Kept under the legacy `escapeHtmlForTg` name so callers don't churn.
+ */
 export function escapeHtmlForTg(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }
 
+/**
+ * Wrap CLI / command output in a fenced code block. Inside a fence the
+ * content is literal (no escaping), so we pass `text` through verbatim —
+ * except a fence-closing ``` sequence in the content, which we defuse so it
+ * can't terminate the block early.
+ */
 export function preBlock(text: string): string {
-  return '<pre>' + escapeHtmlForTg(text) + '</pre>'
+  const safe = text.replace(/```/g, '`​``')
+  return '```\n' + safe + '\n```'
 }
 
 export function stripAnsi(text: string): string {
@@ -278,11 +289,17 @@ export function makeSwitchroomReply(
   ): Promise<void> {
     const chatId = String(ctx.chat!.id)
     const threadId = resolveThreadId(chatId, ctx.message?.message_thread_id)
-    await ctx.reply(text, {
+    const opts = {
       ...(threadId != null ? { message_thread_id: threadId } : {}),
-      ...(options.html ? { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } } : {}),
       ...(options.reply_markup ? { reply_markup: options.reply_markup } : {}),
-    })
+    }
+    // #2669: `options.html:true` now means "render `text` as GFM markdown via
+    // the rich-message path" (legacy field name kept). Plain otherwise.
+    if (options.html) {
+      await ctx.replyWithRichMessage({ markdown: text }, opts)
+    } else {
+      await ctx.reply(text, opts)
+    }
   }
 }
 

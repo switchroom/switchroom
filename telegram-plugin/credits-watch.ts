@@ -157,7 +157,7 @@ export function evaluateCreditState(args: {
   if (!currentIsFatal && prevIsFatal) {
     return {
       kind: "notify",
-      message: `✅ <b>${escapeHtml(agentName)}</b>: credits restored — agent should resume normal operation.`,
+      message: `✅ **${escapeHtml(agentName)}**: credits restored — agent should resume normal operation.`,
       newState: { lastNotifiedReason: null, lastNotifiedAt: now },
       transition: "exited",
     };
@@ -193,12 +193,12 @@ export function evaluateCreditState(args: {
 function buildEntryMessage(agentName: string, reason: string): string {
   const desc = humanizeReason(reason);
   return [
-    `⚠️ <b>${escapeHtml(agentName)}</b>: ${desc}`,
+    `⚠️ **${escapeHtml(agentName)}**: ${desc}`,
     ``,
     `Cron tasks and inbound replies will fail until this is resolved. Check`,
-    `your subscription or pre-paid usage at <a href="https://console.anthropic.com">console.anthropic.com</a>.`,
+    `your subscription or pre-paid usage at [console.anthropic.com](https://console.anthropic.com).`,
     ``,
-    `<i>Source: Claude CLI cache (cachedExtraUsageDisabledReason=${escapeHtml(reason)})</i>`,
+    `_Source: Claude CLI cache (cachedExtraUsageDisabledReason=${escapeHtml(reason)})_`,
   ].join("\n");
 }
 
@@ -218,12 +218,7 @@ function humanizeReason(reason: string): string {
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 // ─── State persistence ───────────────────────────────────────────────────────

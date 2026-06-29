@@ -57,13 +57,13 @@ function shapeReply(
   slashCommand: string,
   deps: Pick<InjectDeps, 'escapeHtml' | 'preBlock' | 'formatOutput'>,
 ): { body: string; accent: InjectAccent } {
-  const verbHtml = `<code>${deps.escapeHtml(result.command || slashCommand)}</code>`
+  const verbHtml = `\`${deps.escapeHtml(result.command || slashCommand)}\``
 
   if (result.outcome === 'ok') {
     const formatted = deps.formatOutput ? deps.formatOutput(result.output) : result.output
     let body = `${verbHtml}\n${deps.preBlock(formatted)}`
     if (result.diagnostic === 'truncated_output' || result.truncated) {
-      body += '\n<i>truncated</i>'
+      body += '\n_truncated_'
     }
     return { body, accent: 'done' }
   }
@@ -105,13 +105,13 @@ function shapeReply(
   }
   if (code === 'session_missing') {
     return {
-      body: 'tmux session not found — agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.',
+      body: 'tmux session not found — agent must be running under the tmux supervisor (the default). Remove \`experimental.legacy_pty: true\` if set.',
       accent: 'issue',
     }
   }
   if (code === 'invalid') {
     return {
-      body: 'usage: <code>/inject /&lt;command&gt;</code>',
+      body: 'usage: \`/inject /<command>\`',
       accent: 'issue',
     }
   }
@@ -140,7 +140,7 @@ export async function handleInjectCommand(ctx: Context, deps: InjectDeps): Promi
     const allow = [...INJECT_COMMANDS.keys()].sort().join(', ')
     await deps.reply(
       ctx,
-      `Usage: <code>/inject &lt;slashCommand&gt;</code>\nAllowed: <code>${deps.escapeHtml(allow)}</code>`,
+      `Usage: \`/inject <slashCommand>\`\nAllowed: \`${deps.escapeHtml(allow)}\``,
       { html: true },
     )
     return

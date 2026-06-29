@@ -1,13 +1,12 @@
 /**
  * Shared "render-and-fit" helper for approval cards that wrap
- * user-supplied content in HTML framing. (#1762 / #1767)
+ * user-supplied content in markdown framing. (#1762 / #1767 / #2669)
  *
- * Telegram's `sendMessage` caps the body at 4096 chars and we render
- * with `parse_mode=HTML`. Worst-case escape inflates raw content up
- * to 5x (`&` → `&amp;`), so a naive raw-input cap is unsafe — the
- * post-escape body can blow past the limit and `sendMessage` then
- * returns a generic 400 that surfaces upstream as a silent
- * `E_DENIED`.
+ * Telegram's rich-message body caps at 32768 chars. Content shipped
+ * inside a fenced code block is literal (no escape inflation), but the
+ * surrounding framing still counts toward the cap — so a naive raw-input
+ * cap can blow past the limit and the send then returns a generic 400
+ * that surfaces upstream as a silent `E_DENIED`.
  *
  * This helper binary-searches the largest prefix of the RAW content
  * whose rendered body still fits under `cap`, snaps to the last

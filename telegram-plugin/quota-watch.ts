@@ -498,12 +498,12 @@ function buildAllExhaustedMessage(
     ? `Earliest reset: ${formatRelative(new Date(earliest), new Date(now))}.`
     : `Reset time unknown (no window data).`;
   return [
-    `🔴 <b>All accounts exhausted</b>`,
+    `🔴 **All accounts exhausted**`,
     ``,
     `Every Anthropic account (${accounts.length}) is quota-walled — there is no healthy account to fail over to.`,
     resetLine,
     ``,
-    `<i>This is self-healing: agents resume and deferred scheduled jobs run automatically once a window resets. Nothing is lost. Add headroom with <code>/auth add</code> if this recurs.</i>`,
+    `_This is self-healing: agents resume and deferred scheduled jobs run automatically once a window resets. Nothing is lost. Add headroom with \`/auth add\` if this recurs._`,
   ].join("\n");
 }
 
@@ -511,11 +511,11 @@ function buildFleetRecoveredMessage(
   accounts: Array<{ label: string; exhausted: boolean }>,
 ): string {
   const healthy = accounts.filter((a) => !a.exhausted).map((a) => a.label);
-  const which = healthy.length > 0 ? ` (<code>${escapeHtml(healthy[0]!)}</code>)` : "";
+  const which = healthy.length > 0 ? ` (\`${escapeHtml(healthy[0]!)}\`)` : "";
   return [
-    `🟢 <b>Fleet recovered</b> — at least one account is healthy again${which}.`,
+    `🟢 **Fleet recovered** — at least one account is healthy again${which}.`,
     ``,
-    `<i>Agents are back; any deferred scheduled jobs will run on their next occurrence.</i>`,
+    `_Agents are back; any deferred scheduled jobs will run on their next occurrence._`,
   ].join("\n");
 }
 
@@ -535,21 +535,21 @@ function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): strin
 
   const activeNote = snap.isActive
     ? ""
-    : `\nThis is a non-active account. Consider <code>/auth use ${escapeHtml(snap.label)}</code> to switch, or keep it as a fallback reserve.`;
+    : `\nThis is a non-active account. Consider \`/auth use ${escapeHtml(snap.label)}\` to switch, or keep it as a fallback reserve.`;
 
   const altNote = snap.isActive
-    ? `\nConsider <code>/auth use &lt;other-account&gt;</code> if you have a healthier account, or wait for the ${winLabel} window to refill${resetStr}.`
+    ? `\nConsider \`/auth use <other-account>\` if you have a healthier account, or wait for the ${winLabel} window to refill${resetStr}.`
     : "";
 
   return [
-    `🟡 <b>Quota approaching limit</b> — <code>${escapeHtml(snap.label)}</code>`,
+    `🟡 **Quota approaching limit** — \`${escapeHtml(snap.label)}\``,
     ``,
     `${fiveStr} of 5h  ·  ${sevenStr} of 7d`,
     `Binding window: ${winLabel}${resetStr}`,
     `${activeNote}${altNote}`,
     ``,
-    `<i>Threshold: ${THROTTLING_THRESHOLD_PCT}% on either window. Live-probe corroborated (#2495).</i>`,
-    `<i>Run /auth for full fleet status or /usage for the active account.</i>`,
+    `_Threshold: ${THROTTLING_THRESHOLD_PCT}% on either window. Live-probe corroborated (#2495)._`,
+    `_Run /auth for full fleet status or /usage for the active account._`,
   ]
     .join("\n")
     .replace(/\n\n\n+/g, "\n\n")
@@ -563,21 +563,16 @@ function buildRecoveryMessage(agentName: string, snap: AccountSnapshot): string 
     : "Current quota data unavailable.";
 
   return [
-    `🟢 <b>Quota back in healthy range</b> — <code>${escapeHtml(snap.label)}</code>`,
+    `🟢 **Quota back in healthy range** — \`${escapeHtml(snap.label)}\``,
     ``,
     utilLine,
     ``,
-    `<i>Below ${THROTTLING_THRESHOLD_PCT}% on both windows.</i>`,
+    `_Below ${THROTTLING_THRESHOLD_PCT}% on both windows._`,
   ].join("\n");
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 // ─── State persistence ────────────────────────────────────────────────────────

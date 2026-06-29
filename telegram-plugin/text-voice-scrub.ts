@@ -34,22 +34,19 @@
  * (smoking gun, delve, etc.). Substituting those mid-clause risks
  * semantic loss, so they stay with the prompt-side voice guidance.
  *
- * Pipeline integration. Apply BEFORE markdownToHtml so the scrub
- * runs on the original model text, not on rendered HTML where
- * the dash might already be tag-escaped or live inside a parked
- * code-block placeholder. Apply BEFORE outboundDedup.check so
- * dedup keys see the post-scrub content (same text from a retry
- * collapses cleanly).
+ * Pipeline integration. Apply on the original model text BEFORE it is
+ * handed to the rich-message path, so the scrub runs on the raw markdown
+ * (not on a partly-rendered body). Apply BEFORE outboundDedup.check so
+ * dedup keys see the post-scrub content (same text from a retry collapses
+ * cleanly).
  *
  * Code-region awareness. The scrubber MUST preserve dashes inside:
  *   - fenced code blocks: ```lang\n...\n```
  *   - inline code: `...`
- *   - explicit Telegram HTML code tags: <code>...</code>, <pre>...</pre>
  *   - URLs (rare to contain em-dashes, but technically valid IDN)
- * The strategy is to park each protected region with a sentinel,
- * scrub the rest, then restore. Mirrors the well-trodden
- * markdownToHtml() codeBlocks/inlineCode placeholder pattern at
- * format.ts:254-272.
+ * The strategy is to park each protected region with a sentinel, scrub the
+ * rest, then restore — the scrub is fully self-contained (it does its own
+ * code-region parking; it does not depend on any render pass).
  *
  * Kill switch. `SWITCHROOM_DISABLE_VOICE_SCRUB=1` returns the input
  * unchanged and reports zero replacements. Same shape every other

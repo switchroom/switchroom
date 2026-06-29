@@ -22,16 +22,6 @@ import type { ListStateData, AccountState } from '../../src/auth/broker/client.j
 
 export type { ListStateData, AccountState }
 
-// Local HTML-escape (mirrors the helper formerly co-located in
-// auth-dashboard.ts so we keep the same escaping discipline without
-// pulling in a heavier util).
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-}
-
 /** Format a duration in ms as a short relative string ("1h 22m", "12s"). */
 function formatRelativeMs(ms: number): string {
   if (ms <= 0) return '0s'
@@ -55,9 +45,9 @@ export function formatAuthQuotaLine(acc: AccountState, now: number = Date.now())
   if (acc.exhausted) {
     const until = acc.exhausted_until
     if (until != null && until > now) {
-      return `<i>exhausted · resets in ${formatRelativeMs(until - now)}</i>`
+      return `_exhausted · resets in ${formatRelativeMs(until - now)}_`
     }
-    return `<i>exhausted</i>`
+    return `_exhausted_`
   }
   return null
 }
@@ -110,14 +100,14 @@ export function renderAuthLine(
 
   const byLabel = new Map(state.accounts.map((a) => [a.label, a]))
   const rows: string[] = []
-  rows.push(`<b>Accounts (${state.accounts.length})</b>`)
+  rows.push(`**Accounts (${state.accounts.length})**`)
   for (const label of order) {
     const acc = byLabel.get(label)
     if (!acc) continue
     const marker = label === activeLabel ? '▶' : '↳'
-    const labelHtml = `<code>${escapeHtml(acc.label)}</code>`
+    const labelMd = `\`${acc.label}\``
     const quotaLine = formatAuthQuotaLine(acc, now)
-    rows.push(quotaLine ? `${marker} ${labelHtml}  ${quotaLine}` : `${marker} ${labelHtml}`)
+    rows.push(quotaLine ? `${marker} ${labelMd}  ${quotaLine}` : `${marker} ${labelMd}`)
   }
   return rows
 }

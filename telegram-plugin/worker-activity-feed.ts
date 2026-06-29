@@ -155,11 +155,11 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
   })
   if (card == null) {
     // Unreachable (header always present) — defensive.
-    return `🛠 <b>Worker</b> · <i>starting…</i>`
+    return `🛠 **Worker** · _starting…_`
   }
   if (!finished && steps.length === 0) {
     // Header-only running render → append the starting placeholder.
-    return `${card}\n<i>starting…</i>`
+    return `${card}\n_starting…_`
   }
   return card
 }
@@ -285,7 +285,6 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
 
   function sendOptsFor(h: WorkerHandle): Record<string, unknown> {
     return {
-      parse_mode: 'HTML',
       disable_web_page_preview: true,
       // Sub-agent progress card is a status surface, never the user's
       // answer — silence the open ping. (editMessageText ignores

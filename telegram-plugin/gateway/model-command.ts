@@ -141,17 +141,17 @@ export interface ModelCommandReply {
 }
 
 const PERSIST_NOTE =
-  '<i>Session-only — lasts until restart. To persist, set <code>model:</code> in switchroom.yaml and restart.</i>'
+  '_Session-only — lasts until restart. To persist, set \`model:\` in switchroom.yaml and restart._'
 
 function helpText(deps: ModelCommandDeps, reason?: string): ModelCommandReply {
-  const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `<code>${a}</code>`).join(' · ')
+  const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`${a}\``).join(' · ')
   const lines: string[] = []
   if (reason) lines.push(`⚠️ ${deps.escapeHtml(reason)}`)
   lines.push(
-    '<b>/model</b> — show or switch the Claude model',
-    '<code>/model</code> — show the configured model',
-    `<code>/model &lt;name&gt;</code> — switch the live session (${MODEL_ALIASES.map(a => `<code>${a}</code>`).join(' · ')} or a full model id)`,
-    `<i>OpenRouter shortcuts:</i> ${srAliasExamples}`,
+    '**/model** — show or switch the Claude model',
+    '\`/model\` — show the configured model',
+    `\`/model <name>\` — switch the live session (${MODEL_ALIASES.map(a => `\`${a}\``).join(' · ')} or a full model id)`,
+    `_OpenRouter shortcuts:_ ${srAliasExamples}`,
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -166,14 +166,14 @@ export async function handleModelCommand(
   if (parsed.kind === 'show') {
     const configured = deps.getConfiguredModel()
     const shown = configured && configured.length > 0 ? configured : 'default'
-    const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `<code>/model ${a}</code>`).join(' · ')
+    const srAliasExamples = Object.keys(SR_MODEL_ALIASES).map(a => `\`/model ${a}\``).join(' · ')
     return {
       text: [
-        `<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`,
-        `Configured: <code>${deps.escapeHtml(shown)}</code>`,
-        `Switch the live session: ${MODEL_ALIASES.map(a => `<code>/model ${a}</code>`).join(' · ')}`,
+        `**Model — ${deps.escapeHtml(deps.getAgentName())}**`,
+        `Configured: \`${deps.escapeHtml(shown)}\``,
+        `Switch the live session: ${MODEL_ALIASES.map(a => `\`/model ${a}\``).join(' · ')}`,
         `OpenRouter shortcuts: ${srAliasExamples}`,
-        'or <code>/model &lt;full-model-id&gt;</code>',
+        'or \`/model <full-model-id>\`',
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -207,14 +207,14 @@ export async function handleModelCommand(
     }
     return {
       text: [
-        `Switching from <code>${deps.escapeHtml(currentSession)}</code> back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
+        `Switching from \`${deps.escapeHtml(currentSession)}\` back to Claude — restarting session cleanly. Claude will be ready in ~30s.`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
     }
   }
 
-  const verbHtml = `<code>/model ${deps.escapeHtml(model)}</code>`
+  const verbHtml = `\`/model ${deps.escapeHtml(model)}\``
   let result: InjectResult
   try {
     result = await deps.inject(deps.getAgentName(), `/model ${model}`)
@@ -231,7 +231,7 @@ export async function handleModelCommand(
       text: [
         `${verbHtml}`,
         deps.preBlock(result.output),
-        ...(result.truncated ? ['<i>truncated</i>'] : []),
+        ...(result.truncated ? ['_truncated_'] : []),
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -241,7 +241,7 @@ export async function handleModelCommand(
   if (result.outcome === 'ok_no_output') {
     return {
       text: [
-        `${verbHtml} — sent, but no response captured. The agent may be mid-turn; check <code>/inject /status</code> to confirm the active model.`,
+        `${verbHtml} — sent, but no response captured. The agent may be mid-turn; check \`/inject /status\` to confirm the active model.`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -252,7 +252,7 @@ export async function handleModelCommand(
   if (result.errorCode === 'session_missing') {
     return {
       text:
-        '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.',
+        '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove \`experimental.legacy_pty: true\` if set.',
       html: true,
     }
   }
@@ -447,7 +447,7 @@ export async function buildModelMenu(
     // with the discovery failure surfaced.
     const v1 = await handleModelCommand({ kind: 'show' }, deps)
     return {
-      text: [`<i>(picker unavailable: ${deps.escapeHtml(discovered.reason)})</i>`, v1.text].join('\n'),
+      text: [`_(picker unavailable: ${deps.escapeHtml(discovered.reason)})_`, v1.text].join('\n'),
       html: true,
     }
   }
@@ -462,18 +462,18 @@ export async function buildModelMenu(
   const { claude: claudeOptions } = classifyDiscoveredOptions(discovered.options)
   const srOptions: ModelPickerOption[] = srNames.map((name, i) => ({ index: i, label: name, detail: '', current: false }))
   const current = claudeOptions.find((o) => o.current)
-  const lines: string[] = [`<b>Model — ${deps.escapeHtml(deps.getAgentName())}</b>`]
+  const lines: string[] = [`**Model — ${deps.escapeHtml(deps.getAgentName())}**`]
   if (discovered.dismissFailed) {
-    lines.push('⚠️ <i>The picker may still be open on the agent pane — check it before switching.</i>')
+    lines.push('⚠️ _The picker may still be open on the agent pane — check it before switching._')
   }
   if (current) {
     const detail = current.detail ? ` · ${deps.escapeHtml(current.detail)}` : ''
-    lines.push(`Default (new sessions): <b>${deps.escapeHtml(current.label)}</b>${detail}`)
+    lines.push(`Default (new sessions): **${deps.escapeHtml(current.label)}**${detail}`)
   } else {
-    lines.push('Default (new sessions): <i>unknown (no ✔ row in picker)</i>')
+    lines.push('Default (new sessions): _unknown (no ✔ row in picker)_')
   }
   if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
-  lines.push('', 'Tap a model to switch the <b>live session</b>:')
+  lines.push('', 'Tap a model to switch the **live session**:')
   if (srOptions.length > 0) {
     lines.push('Claude models use your Max/Pro subscription. 🌐 models are billed separately via OpenRouter.')
   }
@@ -548,7 +548,7 @@ export async function handleModelMenuCallback(
       const msg = err instanceof Error ? err.message : String(err)
       return {
         answer: 'Switch failed',
-        reply: await menuWithBanner(deps, `❌ Switch to <b>${deps.escapeHtml(srName)}</b> failed: ${deps.escapeHtml(msg)}`),
+        reply: await menuWithBanner(deps, `❌ Switch to **${deps.escapeHtml(srName)}** failed: ${deps.escapeHtml(msg)}`),
       }
     }
     if (srResult.outcome === 'ok') {
@@ -572,7 +572,7 @@ export async function handleModelMenuCallback(
       answer: 'Switch failed',
       reply: await menuWithBanner(
         deps,
-        `❌ Switch to <b>${deps.escapeHtml(srFriendlyLabel(srName))}</b> failed — agent may be mid-turn`,
+        `❌ Switch to **${deps.escapeHtml(srFriendlyLabel(srName))}** failed — agent may be mid-turn`,
       ),
     }
   }
@@ -628,7 +628,7 @@ export async function handleModelMenuCallback(
       answer: 'Switch failed — see the menu',
       reply: await menuWithBanner(
         deps,
-        `❌ Switch to <b>${deps.escapeHtml(target.label)}</b> failed: ${deps.escapeHtml(result.reason)}`,
+        `❌ Switch to **${deps.escapeHtml(target.label)}** failed: ${deps.escapeHtml(result.reason)}`,
       ),
     }
   }

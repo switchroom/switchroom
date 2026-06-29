@@ -17,7 +17,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { escapeHtml } from "./card-format.js";
+import { escapeMarkdown } from "./card-format.js";
 import type { IssueEvent, IssueSeverity } from "../src/issues/index.js";
 
 export interface BotApiForIssuesCard {
@@ -92,7 +92,7 @@ export function renderIssuesCard(opts: RenderIssuesCardOpts): string | null {
   const maxSeverity = sorted[0].severity;
   const headerEmoji = SEVERITY_EMOJI[maxSeverity];
   const count = sorted.length;
-  const header = `${headerEmoji} <b>${escapeHtml(opts.agentName)}</b> · ${count} ${count === 1 ? "issue" : "issues"}`;
+  const header = `${headerEmoji} **${escapeMarkdown(opts.agentName)}** · ${count} ${count === 1 ? "issue" : "issues"}`;
 
   const maxRows = opts.maxRows ?? DEFAULT_MAX_ROWS;
   const visible = sorted.slice(0, maxRows);
@@ -101,22 +101,22 @@ export function renderIssuesCard(opts: RenderIssuesCardOpts): string | null {
   const now = opts.now ?? Date.now();
   const rows = visible.map((e) => {
     const emoji = SEVERITY_EMOJI[e.severity];
-    const occ = e.occurrences > 1 ? ` <i>(×${e.occurrences})</i>` : "";
+    const occ = e.occurrences > 1 ? ` _(×${e.occurrences})_` : "";
     const ago = relTime(now - e.last_seen);
-    const head = `${emoji} <code>${escapeHtml(e.fingerprint)}</code>  ${escapeHtml(e.summary)}${occ} — <i>${ago}</i>`;
+    const head = `${emoji} \`${e.fingerprint}\`  ${escapeMarkdown(e.summary)}${occ} — _${ago}_`;
     // Render the `detail` line below the summary when present and short
     // enough to be a remediation hint (not a multi-line stderr tail).
     // Convention from the cron prompt template: agents put "Fix: <cmd>"
     // or "→ <cmd>" in detail. Long stderr details are omitted from the
     // card to keep the layout tight; users can run /issues to see them.
     const remediation = formatRemediation(e.detail);
-    return remediation == null ? head : `${head}\n  → <i>${escapeHtml(remediation)}</i>`;
+    return remediation == null ? head : `${head}\n  → _${escapeMarkdown(remediation)}_`;
   });
 
   const lines = [header, "", ...rows];
   if (overflow > 0) {
     lines.push("");
-    lines.push(`<i>+${overflow} more not shown — run <code>/issues</code></i>`);
+    lines.push(`_+${overflow} more not shown — run \`/issues\`_`);
   }
   return lines.join("\n");
 }
@@ -326,7 +326,6 @@ export function createIssuesCardHandle(
       if (body === lastBody && messageId != null) return;
 
       const sendOpts: Record<string, unknown> = {
-        parse_mode: "HTML",
         disable_web_page_preview: true,
         // Status card, not the user's answer — silence the open ping.
         // (editMessageText ignores disable_notification, so the shared

@@ -200,7 +200,10 @@ export interface FinalizeCallbackContext {
   answerCallbackQuery: (
     opts?: { text?: string; show_alert?: boolean },
   ) => Promise<unknown>
-  editMessageText: (text: string, opts?: Record<string, unknown>) => Promise<unknown>
+  editMessageText: (
+    text: string | { markdown: string },
+    opts?: Record<string, unknown>,
+  ) => Promise<unknown>
 }
 
 export interface FinalizeCallbackOptions {
@@ -225,11 +228,12 @@ export interface FinalizeCallbackOptions {
    */
   newText: string
   /**
-   * Parse mode for `newText`. Match the original message's parse mode —
-   * mixing modes mid-edit silently breaks formatting. Optional; omitted
-   * means plain text.
+   * When true, `newText` is edited as a LITERAL plain string (no markdown
+   * parsing) — match the original message's send shape. Default (false) →
+   * the rich-markdown path, so `newText` is rendered as GFM markdown
+   * (#2669, successor to the old `parseMode` option).
    */
-  parseMode?: 'HTML' | 'Markdown' | 'MarkdownV2'
+  literalText?: boolean
   /**
    * Side effect invoked AFTER `editMessageText` resolves. Use for
    * synthesizing the `<channel source="...">` inbound that wakes the
@@ -274,14 +278,16 @@ export async function finalizeCallback(
   })
   // Invariant 2 — strip keyboard + append status line, atomic edit.
   try {
-    await ctx.editMessageText(opts.newText, {
-      reply_markup: { inline_keyboard: [] },
-      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
-      // Default link_preview_options off — most finalized cards don't
-      // benefit from preview cards, and a stale preview survives the
-      // edit otherwise.
-      link_preview_options: { is_disabled: true },
-    })
+    await ctx.editMessageText(
+      opts.literalText ? opts.newText : { markdown: opts.newText },
+      {
+        reply_markup: { inline_keyboard: [] },
+        // Default link_preview_options off — most finalized cards don't
+        // benefit from preview cards, and a stale preview survives the
+        // edit otherwise.
+        link_preview_options: { is_disabled: true },
+      },
+    )
   } catch (err) {
     // MESSAGE_NOT_MODIFIED (text didn't change) and MESSAGE_TO_EDIT_NOT_FOUND
     // (operator already deleted the card) are both benign. Other failures

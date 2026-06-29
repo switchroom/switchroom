@@ -54,19 +54,14 @@ import {
  */
 export function renderFallbackFailureNotice(triggerAgent: string, reason: string): string {
   return (
-    `⚠️ <b>Auto-failover could not run</b> (trigger: <b>${escFailureHtml(triggerAgent)}</b>)\n` +
+    `⚠️ **Auto-failover could not run** (trigger: **${escFailureHtml(triggerAgent)}**)\n` +
     `${escFailureHtml(reason)}\n\n` +
-    `<i>Switch manually with <code>/auth use &lt;label&gt;</code>, or <code>/auth</code> for fleet status.</i>`
+    `_Switch manually with \`/auth use <label>\`, or \`/auth\` for fleet status._`
   );
 }
 
 function escFailureHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1');
 }
 
 /**
@@ -214,7 +209,7 @@ export async function runFleetAutoFallback(
   if (!oldSnap) {
     return {
       kind: 'no-old-active',
-      announcement: '<i>Auto-fallback skipped: no active account in broker state.</i>',
+      announcement: '_Auto-fallback skipped: no active account in broker state._',
     };
   }
 
@@ -232,8 +227,8 @@ export async function runFleetAutoFallback(
       oldLabel: oldSnap.label,
       oldQuota: oldSnap.quota,
       announcement:
-        `<i>Auto-fallback skipped: ${oldSnap.label} probed healthy ` +
-        `(${pctSummary(oldSnap.quota)}). Stale event?</i>`,
+        `_Auto-fallback skipped: ${oldSnap.label} probed healthy ` +
+        `(${pctSummary(oldSnap.quota)}). Stale event?_`,
     };
   }
 

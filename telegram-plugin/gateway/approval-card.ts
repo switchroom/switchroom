@@ -37,8 +37,8 @@ export interface BuiltApprovalCard {
  */
 export function buildApprovalCard(opts: ApprovalCardOptions): BuiltApprovalCard {
   const lines: string[] = [];
-  lines.push(`🔐 <b>${escapeHtml(opts.agent)}</b> wants approval`);
-  lines.push(`<code>${escapeHtml(opts.scope_humanized)}</code>`);
+  lines.push(`🔐 **${escapeHtml(opts.agent)}** wants approval`);
+  lines.push(`\`${escapeHtml(opts.scope_humanized)}\``);
   if (opts.why && opts.why.trim().length > 0) {
     lines.push("");
     lines.push(escapeHtml(opts.why.trim()));
@@ -120,8 +120,5 @@ export function ttlMsFromToken(token: string): number | null {
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }

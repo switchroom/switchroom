@@ -95,17 +95,17 @@ export interface EffortCommandReply {
 }
 
 const PERSIST_NOTE =
-  '<i>Session-only — reverts to the configured default on restart. To change the default, set <code>thinking_effort:</code> in switchroom.yaml and restart.</i>'
+  '_Session-only — reverts to the configured default on restart. To change the default, set \`thinking_effort:\` in switchroom.yaml and restart._'
 
-const LEVELS_INLINE = EFFORT_LEVELS.map(l => `<code>${l}</code>`).join(' · ')
+const LEVELS_INLINE = EFFORT_LEVELS.map(l => `\`${l}\``).join(' · ')
 
 function helpText(deps: EffortCommandDeps, reason?: string): EffortCommandReply {
   const lines: string[] = []
   if (reason) lines.push(`⚠️ ${deps.escapeHtml(reason)}`)
   lines.push(
-    '<b>/effort</b> — show or switch the reasoning effort (faster→smarter)',
-    '<code>/effort</code> — show the configured effort + a tap menu',
-    `<code>/effort &lt;level&gt;</code> — switch the live session (${LEVELS_INLINE})`,
+    '**/effort** — show or switch the reasoning effort (faster→smarter)',
+    '\`/effort\` — show the configured effort + a tap menu',
+    `\`/effort <level>\` — switch the live session (${LEVELS_INLINE})`,
     PERSIST_NOTE,
   )
   return { text: lines.join('\n'), html: true }
@@ -122,9 +122,9 @@ export async function handleEffortCommand(
     const shown = configured && configured.length > 0 ? configured : 'low'
     return {
       text: [
-        `<b>Effort — ${deps.escapeHtml(deps.getAgentName())}</b>`,
-        `Configured default: <code>${deps.escapeHtml(shown)}</code>`,
-        `Switch the live session: ${EFFORT_LEVELS.map(l => `<code>/effort ${l}</code>`).join(' · ')}`,
+        `**Effort — ${deps.escapeHtml(deps.getAgentName())}**`,
+        `Configured default: \`${deps.escapeHtml(shown)}\``,
+        `Switch the live session: ${EFFORT_LEVELS.map(l => `\`/effort ${l}\``).join(' · ')}`,
         PERSIST_NOTE,
       ].join('\n'),
       html: true,
@@ -136,7 +136,7 @@ export async function handleEffortCommand(
   if (!isValidEffortArg(parsed.level)) {
     return helpText(deps, `not a valid effort level: ${parsed.level}`)
   }
-  const verbHtml = `<code>/effort ${deps.escapeHtml(parsed.level)}</code>`
+  const verbHtml = `\`/effort ${deps.escapeHtml(parsed.level)}\``
   let result: EffortApplyResult
   try {
     result = await deps.applyEffort(deps.getAgentName(), parsed.level)
@@ -153,17 +153,17 @@ export async function handleEffortCommand(
  * say so honestly rather than just claiming success.
  */
 function applyResultText(level: string, result: EffortApplyResult, deps: EffortCommandDeps): string {
-  const verbHtml = `<code>/effort ${deps.escapeHtml(level)}</code>`
+  const verbHtml = `\`/effort ${deps.escapeHtml(level)}\``
   if (result.ok) {
     const lines = [`✅ ${verbHtml} — ${deps.escapeHtml(result.output)}`]
     if (result.confirmed) {
-      lines.push('<i>Switched mid-conversation — your next turn re-reads the cached history (slower, one time).</i>')
+      lines.push('_Switched mid-conversation — your next turn re-reads the cached history (slower, one time)._')
     }
     lines.push(PERSIST_NOTE)
     return lines.join('\n')
   }
   if (result.reason === 'session_missing') {
-    return '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove <code>experimental.legacy_pty: true</code> if set.'
+    return '❌ tmux session not found — the agent must be running under the tmux supervisor (the default). Remove \`experimental.legacy_pty: true\` if set.'
   }
   if (result.reason === 'confirm_failed') {
     const wedged = result.wedged
@@ -172,7 +172,7 @@ function applyResultText(level: string, result: EffortApplyResult, deps: EffortC
     return `❌ ${verbHtml} — couldn't confirm the switch.${wedged}`
   }
   // apply_unverified
-  return `❌ ${verbHtml} — sent, but couldn't confirm it applied. The agent may be mid-turn; check <code>/inject /status</code>.`
+  return `❌ ${verbHtml} — sent, but couldn't confirm it applied. The agent may be mid-turn; check \`/inject /status\`.`
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +220,8 @@ export function buildEffortMenu(deps: EffortCommandDeps, highlight?: string): Ef
   const live = highlight ?? configured
   return {
     text: [
-      `<b>Effort — ${deps.escapeHtml(deps.getAgentName())}</b>`,
-      `Default: <code>${deps.escapeHtml(configured)}</code> · faster → smarter: ${LEVELS_INLINE}`,
+      `**Effort — ${deps.escapeHtml(deps.getAgentName())}**`,
+      `Default: \`${deps.escapeHtml(configured)}\` · faster → smarter: ${LEVELS_INLINE}`,
       'Tap to switch the live session:',
       PERSIST_NOTE,
     ].join('\n'),
@@ -260,8 +260,8 @@ export async function handleEffortMenuCallback(
     const result = await deps.applyEffort(deps.getAgentName(), level)
     if (result.ok) {
       banner = result.confirmed
-        ? `✅ Effort → <code>${deps.escapeHtml(level)}</code> (mid-conversation: next turn re-reads history)`
-        : `✅ Effort → <code>${deps.escapeHtml(level)}</code> for this session`
+        ? `✅ Effort → \`${deps.escapeHtml(level)}\` (mid-conversation: next turn re-reads history)`
+        : `✅ Effort → \`${deps.escapeHtml(level)}\` for this session`
       selected = level
     } else if (result.reason === 'session_missing') {
       banner = '❌ tmux session not found — is the agent running under the supervisor?'

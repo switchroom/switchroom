@@ -127,10 +127,7 @@ export interface VaultErrorRendering {
 }
 
 function htmlEscape(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 /**
@@ -173,13 +170,13 @@ export function renderVaultCliError(
       return {
         suppressRaw: true,
         html:
-          `⚠️ <b>New vault key — operator approval required.</b>\n` +
+          `⚠️ **New vault key — operator approval required.**\n` +
           (key
-            ? `The agent tried to save <code>${htmlEscape(key)}</code>, but `
+            ? `The agent tried to save \`${htmlEscape(key)}\`, but `
             : `The agent tried to save a new key, but `) +
           `agents can only rotate existing keys via the broker; introducing ` +
           `a new key needs an operator action.\n\n` +
-          `<b>Ask the agent</b> to call its <code>vault_request_save</code> ` +
+          `**Ask the agent** to call its \`vault_request_save\` ` +
           `tool — it'll render an approval card in this chat with ` +
           `[✅ Save once] [🚫 Discard] [✏️ Rename] buttons. One tap saves the ` +
           `secret to the vault; no re-paste needed.`,
@@ -194,12 +191,12 @@ export function renderVaultCliError(
       return {
         suppressRaw: true,
         html:
-          `⚠️ <b>Vault broker isn't reachable.</b>\n` +
+          `⚠️ **Vault broker isn't reachable.**\n` +
           `From inside the agent sandbox there's no fallback path. ` +
           `Telegram-native broker recovery is tracked as a follow-up — ` +
           `for now, on the host:\n` +
-          `<pre>switchroom vault broker status</pre>\n` +
-          `<i>Or, if the broker is wedged: <code>docker compose -p switchroom restart vault-broker</code>.</i>`,
+          "```\nswitchroom vault broker status\n```\n" +
+          `_Or, if the broker is wedged: \`docker compose -p switchroom restart vault-broker\`._`,
       };
     case "broker_denied":
       // Telegram-native grant flow shipped in #969 P2b + #1012:
@@ -210,14 +207,14 @@ export function renderVaultCliError(
       return {
         suppressRaw: true,
         html:
-          `⚠️ <b>Vault broker refused the request.</b>\n` +
+          `⚠️ **Vault broker refused the request.**\n` +
           (key
-            ? `The agent isn't authorized to access <code>${htmlEscape(key)}</code>. `
+            ? `The agent isn't authorized to access \`${htmlEscape(key)}\`. `
             : `The agent isn't authorized to access this key. `) +
           `Grant access in two taps:\n` +
-          `• <code>/vault audit &lt;agent&gt;</code> in this chat → tap ` +
+          `• \`/vault audit <agent>\` in this chat → tap ` +
           `[🔓 Allow${key ? ` ${htmlEscape(key)}` : ""}] on the recent denial, OR\n` +
-          `• ask the agent to call <code>vault_request_access</code> — ` +
+          `• ask the agent to call \`vault_request_access\` — ` +
           `an approval card lands here with [✅ Approve] / [🚫 Deny].`,
       };
     case "other":
@@ -234,36 +231,36 @@ function renderSandboxContextSuggestion(
   verb: "set" | "get" | "list" | "init" | "remove" | "save",
   key: string | undefined,
 ): string {
-  const head = `⚠️ <b>Direct vault file IO isn't available from inside the agent sandbox.</b>\n`;
+  const head = `⚠️ **Direct vault file IO isn't available from inside the agent sandbox.**\n`;
   switch (verb) {
     case "set":
     case "save":
       return (
         head +
         (key
-          ? `<b>Ask the agent</b> to call its <code>vault_request_save</code> ` +
-            `tool for <code>${htmlEscape(key)}</code> — an approval card ` +
+          ? `**Ask the agent** to call its \`vault_request_save\` ` +
+            `tool for \`${htmlEscape(key)}\` — an approval card ` +
             `lands here with [✅ Save once] / [🚫 Discard] / [✏️ Rename] buttons.`
-          : `<b>Ask the agent</b> to call its <code>vault_request_save</code> ` +
+          : `**Ask the agent** to call its \`vault_request_save\` ` +
             `tool — an approval card lands here with [✅ Save once] / [🚫 Discard] / [✏️ Rename] buttons.`)
       );
     case "get":
       return (
         head +
-        `From this chat: <code>/vault get${key ? ` ${htmlEscape(key)}` : " &lt;key&gt;"}</code>`
+        `From this chat: \`/vault get${key ? ` ${htmlEscape(key)}` : " <key>"}\``
       );
     case "list":
-      return head + `From this chat: <code>/vault list</code>`;
+      return head + `From this chat: \`/vault list\``;
     case "remove":
       return (
         head +
         `Use the operator host CLI for now — Telegram-native delete is tracked as a follow-up. ` +
-        `<i>(Removing a vault key is a rare, irreversible operation; an in-chat confirmation card is on the punch list.)</i>`
+        `_(Removing a vault key is a rare, irreversible operation; an in-chat confirmation card is on the punch list.)_`
       );
     case "init":
       return (
         head +
-        `Vault bootstrap is a one-time host-shell step: <code>switchroom vault init</code>.`
+        `Vault bootstrap is a one-time host-shell step: \`switchroom vault init\`.`
       );
   }
 }

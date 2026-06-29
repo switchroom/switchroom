@@ -24,7 +24,7 @@
  * See PR fix/retire-draft-transport for the removal rationale.
  */
 
-const TELEGRAM_MAX_CHARS = 4096
+const TELEGRAM_MAX_CHARS = 32768
 
 // Throttle defaults for the in-place engine.
 //   DM chats: 400 ms — slightly more responsive than groups while staying
@@ -57,9 +57,9 @@ export interface DraftStreamConfig {
   /** Throttle window in ms. Floored at 250. Default 400 for DMs, 1000 for groups. */
   throttleMs?: number
   /**
-   * Maximum total characters before hard-stopping the stream. Default 4096
-   * (Telegram's limit). When exceeded, future updates are ignored — the
-   * caller should fall back to a fresh sendMessage.
+   * Maximum total characters before hard-stopping the stream. Default 32768
+   * (Telegram's rich-message limit, #2669). When exceeded, future updates
+   * are ignored — the caller should fall back to a fresh sendMessage.
    */
   maxChars?: number
   /**

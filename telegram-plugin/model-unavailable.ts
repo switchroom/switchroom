@@ -366,10 +366,10 @@ export function formatModelUnavailableCard(
   opts: FormatCardOptions = {},
 ): string {
   const now = opts.now ?? new Date()
-  const slotPart = opts.slot ? ` (slot <b>${escHtml(opts.slot)}</b>)` : ''
+  const slotPart = opts.slot ? ` (slot **${escHtml(opts.slot)}**)` : ''
   const reason = formatReason(detection, now)
   const lines = [
-    `⚠️ <b>Model unavailable</b> on agent <b>${escHtml(agent)}</b>${slotPart}`,
+    `⚠️ **Model unavailable** on agent **${escHtml(agent)}**${slotPart}`,
     `Reason: ${reason}`,
     '',
   ]
@@ -378,7 +378,7 @@ export function formatModelUnavailableCard(
     // swap; a follow-up announcement (causal-shape) will land within
     // ~1s. Mention it explicitly so the user knows not to react.
     lines.push(
-      '<i>Auto-failover in progress — see the announcement below.</i>',
+      '_Auto-failover in progress — see the announcement below._',
     )
   } else {
     // Default — kinds where auto-fallback can't help (network)
@@ -386,10 +386,10 @@ export function formatModelUnavailableCard(
     // a verb (post-RFC-H); `/auth use <label>` is the canonical
     // fleet-wide swap.
     lines.push(
-      '<b>What to try</b>',
-      '• <code>/auth use &lt;label&gt;</code> — switch the fleet to a healthy account',
-      '• <code>/auth add</code> — attach another subscription',
-      '• <code>/usage</code> — show quota breakdown',
+      '**What to try**',
+      '• \`/auth use <label>\` — switch the fleet to a healthy account',
+      '• \`/auth add\` — attach another subscription',
+      '• \`/usage\` — show quota breakdown',
     )
   }
   return lines.join('\n')
@@ -471,9 +471,5 @@ export function resolveModelUnavailableFromOperatorEvent(
 // ─── HTML escape (mirrors operator-events.ts) ────────────────────────────────
 
 function escHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }

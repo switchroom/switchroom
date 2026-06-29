@@ -18,6 +18,7 @@
  */
 
 import { basename } from "node:path";
+import { escapeMarkdown } from "./card-format.js";
 import { prettyMcpServer, type ScopeOption } from "./permission-rule.js";
 import { redact } from "./secret-detect/redact.js";
 
@@ -96,10 +97,10 @@ const HOSTD_AGENT_TARGET_VERBS = new Set([
 /**
  * Build the multi-line card body for an approval prompt.
  *
- *   🔐 <b>Gymbro</b> wants to edit: supplement-log.md
- *   why: <i>logging today's lifts</i>
+ *   🔐 **Gymbro** wants to edit: supplement-log.md
+ *   why: _logging today's lifts_
  *
- * Output is HTML-escaped for `parse_mode: 'HTML'`. The agent name is
+ * Output is GFM markdown for the rich-message path (#2669). The agent name is
  * capitalized for the sentence; dropped (with "wants to") when null —
  * the bridge client can be anonymous during early-boot edge cases.
  *
@@ -127,7 +128,7 @@ export function formatPermissionCardBody(opts: {
 
   if (opts.agentName && opts.agentName.length > 0) {
     lines.push(
-      `🔐 <b>${escapeTgHtml(capFirst(opts.agentName))}</b> wants to ${escapeTgHtml(action)}`,
+      `🔐 **${escapeTgHtml(capFirst(opts.agentName))}** wants to ${escapeTgHtml(action)}`,
     );
   } else {
     lines.push(`🔐 ${escapeTgHtml(capFirst(action))}`);
@@ -143,8 +144,8 @@ export function formatPermissionCardBody(opts: {
       : rawWhy;
   lines.push(
     truncatedWhy.length > 0
-      ? `why: <i>${escapeTgHtml(truncatedWhy)}</i>`
-      : `why: <i>not provided</i>`,
+      ? `why: _${escapeTgHtml(truncatedWhy)}_`
+      : `why: _not provided_`,
   );
 
   // Third line (REST-wrapper MCP writes only): a redaction-safe summary of
@@ -152,7 +153,7 @@ export function formatPermissionCardBody(opts: {
   // endpoint — e.g. "↳ to: lisa@…, subject: Priority access…".
   const argSummary = mcpArgSummary(opts.toolName, opts.inputPreview);
   if (argSummary) {
-    lines.push(`↳ <i>${escapeTgHtml(argSummary)}</i>`);
+    lines.push(`↳ _${escapeTgHtml(argSummary)}_`);
   }
 
   return lines.join("\n");
@@ -424,10 +425,10 @@ export function describeGrant(
  * the operator scrolls past — so this is the legible signal that the tap
  * landed and names the work being (re)started.
  *
- * Mirrors `formatPermissionCardBody`'s style ("🔐 <b>Gymbro</b> wants to
- * edit: log.md" → "▶️ <b>Gymbro</b> — got it, continuing: edit: log.md").
+ * Mirrors `formatPermissionCardBody`'s style ("🔐 **Gymbro** wants to
+ * edit: log.md" → "▶️ **Gymbro** — got it, continuing: edit: log.md").
  * `action` is a phrase from {@link naturalAction} (already operator-facing,
- * no tool ids). Output is HTML-escaped for `parse_mode: 'HTML'`.
+ * no tool ids). Output is GFM markdown for the rich-message path (#2669).
  *
  * `timeoutMinutes` marks the TTL auto-deny variant (no operator tapped —
  * the request aged out) so the wording reflects "no answer" rather than a
@@ -441,21 +442,21 @@ export function formatPermissionResumeMessage(opts: {
 }): string {
   const who =
     opts.agentName && opts.agentName.length > 0
-      ? `<b>${escapeTgHtml(capFirst(opts.agentName))}</b>`
-      : `<b>Agent</b>`;
+      ? `**${escapeTgHtml(capFirst(opts.agentName))}**`
+      : `**Agent**`;
   const act = (opts.action ?? "").trim();
   const hasAction = act.length > 0;
 
   if (opts.behavior === "allow") {
     return hasAction
-      ? `▶️ ${who} — got it, continuing: <i>${escapeTgHtml(act)}</i>`
+      ? `▶️ ${who} — got it, continuing: _${escapeTgHtml(act)}_`
       : `▶️ ${who} — got it, back to work.`;
   }
 
   // deny
   if (opts.timeoutMinutes != null) {
     return hasAction
-      ? `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it (<i>${escapeTgHtml(act)}</i>).`
+      ? `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it (_${escapeTgHtml(act)}_).`
       : `🚫 ${who} — no answer in ${opts.timeoutMinutes}m, continuing without it.`;
   }
   return hasAction
@@ -520,12 +521,9 @@ function capFirst(text: string): string {
   return text.length > 0 ? text.charAt(0).toUpperCase() + text.slice(1) : text;
 }
 
-/** Minimal HTML escape for Telegram `parse_mode=HTML`. */
+/** Markdown escape for the rich-message path (#2669). */
 function escapeTgHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return escapeMarkdown(text);
 }
 
 function parseInput(raw: string | undefined): Record<string, unknown> | null {

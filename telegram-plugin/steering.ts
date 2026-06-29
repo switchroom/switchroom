@@ -9,7 +9,6 @@
  * These helpers are pure so server.ts stays testable without standing up
  * grammy.
  */
-import { escapeHtml } from './format.js'
 
 /**
  * Detect and strip the `/queue ` or `/q ` prefix.
@@ -181,6 +180,3 @@ export function buildChannelMetaAttributes(opts: ChannelMetaAttributeOptions): s
   }
   return parts.length === 0 ? '' : ' ' + parts.join(' ')
 }
-
-/** Re-export so callers that want HTML-escape for body content don't need a second import. */
-export { escapeHtml }

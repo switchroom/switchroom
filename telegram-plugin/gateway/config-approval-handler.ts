@@ -161,13 +161,13 @@ export function truncateDiffForCard(
 }
 
 /**
- * Telegram `sendMessage` hard limit. We render with `parse_mode=HTML`,
- * so the limit applies to the rendered (escaped) body, NOT the raw
- * pre-escape source. Worst-case escape is `&` → `&amp;` (5x).
+ * Telegram rich-message hard limit (#2669). We render as GFM markdown and
+ * ship the diff inside a fenced code block (content is literal there, so no
+ * escape inflation).
  */
-const TELEGRAM_SENDMESSAGE_LIMIT = 4096;
+const TELEGRAM_SENDMESSAGE_LIMIT = 32768;
 /** Safety margin under the hard limit for invisible framing wobble. */
-const RENDERED_BODY_CAP = 3900;
+const RENDERED_BODY_CAP = 32000;
 /** Operator-supplied `reason` is unbounded at the wire — clip it. */
 const REASON_MAX_CHARS = 500;
 const REASON_ELLIPSIS = "…";
@@ -180,8 +180,8 @@ const REASON_ELLIPSIS = "…";
  */
 export const DIFF_SENTINEL = "\n[… diff continues, see attached file]";
 
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function escapeMd(s: string): string {
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 function clipReason(reason: string): string {
@@ -212,10 +212,10 @@ export function buildConfigApprovalCardBody(args: {
 }): { body: string; truncated: boolean } {
   const safeReason = clipReason(args.reason);
   const render = (diff: string): string =>
-    `🛠 <b>Config edit proposed</b>\n` +
-    `Agent: <code>${escapeHtml(args.agentName)}</code>\n` +
-    `Reason: ${escapeHtml(safeReason)}\n\n` +
-    `<pre>${escapeHtml(diff)}</pre>`;
+    `🛠 **Config edit proposed**\n` +
+    `Agent: \`${args.agentName}\`\n` +
+    `Reason: ${escapeMd(safeReason)}\n\n` +
+    "```\n" + diff + "\n```";
 
   return truncateRawToFit({
     raw: args.unifiedDiff,
@@ -287,10 +287,10 @@ export async function handleRequestConfigApproval(
     return;
   }
 
-  // Pre-flight oversize handling (#1762). Telegram caps sendMessage
-  // at 4096 chars and we render with parse_mode=HTML, so the limit
-  // applies to the rendered (escaped) body — worst-case `&` → `&amp;`
-  // inflates 5x. Fast-path with a cheap raw-input cap, then let
+  // Pre-flight oversize handling (#1762 / #2669). The rich-message body
+  // caps at 32768 chars; the diff ships inside a fenced code block (literal,
+  // no escape inflation) but the framing still counts. Fast-path with a
+  // cheap raw-input cap, then let
   // buildConfigApprovalCardBody enforce the post-escape rendered cap
   // (which re-truncates the diff if escaping blew past the limit). We
   // ship the full diff as a `.patch` attachment whenever truncation
@@ -409,10 +409,10 @@ export async function resolvePendingConfigApproval(
   // Edit the card to an interim/terminal state.
   const interim =
     verdict === "approve"
-      ? "👀 <b>Applying…</b>"
+      ? "👀 **Applying…**"
       : verdict === "deny"
-        ? "🚫 <b>Denied</b>"
-        : "⏱ <b>Expired</b>";
+        ? "🚫 **Denied**"
+        : "⏱ **Expired**";
   try {
     // Strip the keyboard: once resolved (approve/deny/timeout) the buttons
     // must not stay tappable — a stale tap could otherwise re-hit the
@@ -442,14 +442,14 @@ export function buildLiveNote(affectedAgents?: string[], fleetWide?: boolean): s
   if (fleetWide) {
     return (
       `\n\n⚠️ Shared config changed — affects all agents. Not live until they ` +
-      `restart: run <code>switchroom rollout</code> (or <code>/update apply</code>).`
+      `restart: run \`switchroom rollout\` (or \`/update apply\`).`
     );
   }
   const agents = (affectedAgents ?? []).filter((a) => typeof a === "string" && a.length > 0);
   if (agents.length === 0) return "";
-  const list = agents.map(escapeHtml).join(", ");
-  const cmds = agents.map((a) => `/restart ${escapeHtml(a)}`).join(" · ");
-  return `\n\n🔄 Not live until restart — affects: <b>${list}</b>\n${cmds}`;
+  const list = agents.map(escapeMd).join(", ");
+  const cmds = agents.map((a) => `/restart ${escapeMd(a)}`).join(" · ");
+  return `\n\n🔄 Not live until restart — affects: **${list}**\n${cmds}`;
 }
 
 /** IPC `request_config_finalize` handler — edits the card to the terminal outcome. */
@@ -476,8 +476,8 @@ export async function handleRequestConfigFinalize(
     msg.outcome === "applied" ? buildLiveNote(msg.affectedAgents, msg.fleetWide) : "";
   const body =
     msg.outcome === "applied"
-      ? `✅ <b>Applied</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}${liveNote}`
-      : `⚠️ <b>Reconcile failed; rolled back</b>${msg.detail ? `\n${escapeHtml(msg.detail)}` : ""}`;
+      ? `✅ **Applied**${msg.detail ? `\n${escapeMd(msg.detail)}` : ""}${liveNote}`
+      : `⚠️ **Reconcile failed; rolled back**${msg.detail ? `\n${escapeMd(msg.detail)}` : ""}`;
   try {
     // Finalize is terminal — strip the keyboard so the buttons are gone.
     await deps.editCard({

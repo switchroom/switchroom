@@ -253,13 +253,16 @@ export async function retryWithThreadFallback<T>(
 
 /**
  * True when Telegram rejected a message because it couldn't parse the
- * HTML/entities we sent — our prevention (markdownToHtml +
- * sanitizeForTelegram + splitHtmlChunks) let something malformed
- * through anyway. These 400s are deliberately NOT swallowed or retried
- * by `retryApiCall` (only not-modified / not-found / thread-not-found
- * are) — they surface to the caller, which recovers by resending the
- * chunk as plain text (parse_mode unset). Same "caller-level fallback"
- * shape as the THREAD_NOT_FOUND contract above.
+ * markdown entities we sent on the rich-message path (#2669). There is no
+ * new rich-specific error class in grammy 1.44 — a malformed-markdown
+ * failure still throws `GrammyError` with the standard
+ * `{ ok:false, error_code:400, description }` shape, the same family as the
+ * legacy "can't parse entities" 400. These 400s are deliberately NOT
+ * swallowed or retried by `retryApiCall` (only not-modified / not-found /
+ * thread-not-found are) — they surface to the caller, which recovers by
+ * resending the chunk as plain text (no rich-message wrapper, so the
+ * parser never runs). Same "caller-level fallback" shape as the
+ * THREAD_NOT_FOUND contract above.
  */
 export function isHtmlParseRejectError(err: unknown): boolean {
   if (!(err instanceof GrammyError) || err.error_code !== 400) return false
@@ -267,9 +270,14 @@ export function isHtmlParseRejectError(err: unknown): boolean {
   return (
     d.includes("can't parse entities") ||
     d.includes('can’t parse entities') ||
+    d.includes("can't parse") ||
+    d.includes('can’t parse') ||
+    d.includes('parse markdown') ||
+    d.includes('parse rich') ||
     d.includes('unsupported start tag') ||
     d.includes('unclosed start tag') ||
     d.includes("can't find end of the entity") ||
+    d.includes('can’t find end of the entity') ||
     // covers both "expected end tag" and "unexpected end tag"
     d.includes('expected end tag')
   )

@@ -88,7 +88,7 @@ export function buildDiffPreviewCard(
   // The 📍 + line-count rows are surfaced verbatim — they're
   // wrapper-attested and the agent has no input into their content.
   const bodyLines: string[] = [];
-  bodyLines.push(`<b>${escapeHtml(preview.title)}</b>`);
+  bodyLines.push(`**${escapeHtml(preview.title)}**`);
   for (const line of preview.lines) {
     bodyLines.push(escapeHtml(line.text));
   }
@@ -163,8 +163,5 @@ export function buildDiffPreviewCard(
 }
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }

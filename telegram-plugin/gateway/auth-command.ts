@@ -95,7 +95,7 @@ export function validateAuthAddLabel(label: string): string | null {
     return 'Label cannot contain path separators.'
   }
   if (!LABEL_RE.test(label)) {
-    return 'Label must match <code>[A-Za-z0-9._@+-]+</code> (letters, digits, dot, underscore, dash, @, +).'
+    return 'Label must match \`[A-Za-z0-9._@+-]+\` (letters, digits, dot, underscore, dash, @, +).'
   }
   return null
 }
@@ -158,7 +158,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (tail.length > 0) {
         return {
           kind: 'help',
-          reason: `Unknown <code>rm</code> modifier: <code>${escapeHtml(tail)}</code>. Use <code>/auth rm &lt;label&gt; confirm</code> to confirm.`,
+          reason: `Unknown \`rm\` modifier: \`${escapeHtml(tail)}\`. Use \`/auth rm <label> confirm\` to confirm.`,
         }
       }
       return { kind: 'rm-prompt', label }
@@ -180,7 +180,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (sub !== 'override') {
         return {
           kind: 'help',
-          reason: `Unknown <code>agent</code> subcommand: <code>${escapeHtml(sub || '(none)')}</code>. Try <code>/auth agent override &lt;agent&gt; &lt;label|clear&gt;</code>.`,
+          reason: `Unknown \`agent\` subcommand: \`${escapeHtml(sub || '(none)')}\`. Try \`/auth agent override <agent> <label|clear>\`.`,
         }
       }
       const agent = parts[2]
@@ -188,7 +188,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (!agent || !target) {
         return {
           kind: 'help',
-          reason: 'Usage: /auth agent override &lt;agent&gt; &lt;label|clear&gt;',
+          reason: 'Usage: /auth agent override <agent> <label|clear>',
         }
       }
       if (target.toLowerCase() === 'clear') {
@@ -201,7 +201,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
     case 'help':
       return { kind: 'help' }
     default:
-      return { kind: 'help', reason: `Unknown verb: <code>${escapeHtml(verb)}</code>` }
+      return { kind: 'help', reason: `Unknown verb: \`${escapeHtml(verb)}\`` }
   }
 }
 
@@ -351,19 +351,19 @@ export async function handleAuthCommand(
     const reason = parsed.reason ? `${parsed.reason}\n\n` : ''
     return {
       text:
-        `${reason}<b>/auth</b> — verbs (mirror of <code>switchroom auth</code>):\n` +
-        `  <code>/auth</code> — show fleet snapshot (alias of <code>show</code>)\n` +
-        `  <code>/auth show</code> — show fleet snapshot\n` +
-        `  <code>/auth show &lt;agent&gt;</code> — show one agent's effective account + mirror state\n` +
-        `  <code>/auth list</code> — alias of <code>/auth show</code>\n` +
-        `  <code>/auth use &lt;label&gt;</code> — admin: swap the fleet to &lt;label&gt;\n` +
-        `  <code>/auth rotate</code> — admin: cycle to next non-exhausted fallback\n` +
-        `  <code>/auth add &lt;label&gt;</code> — admin: OAuth-add a new account from chat\n` +
-        `  <code>/auth cancel</code> — abort an <code>/auth add</code> in progress\n` +
-        `  <code>/auth rm &lt;label&gt;</code> — admin: remove an account (two-step confirm)\n` +
-        `  <code>/auth refresh [&lt;label&gt;]</code> — admin: force a refresh tick\n` +
-        `  <code>/auth agent override &lt;agent&gt; &lt;label|clear&gt;</code> — admin: per-agent account override\n` +
-        `  <code>/auth help</code> — this list`,
+        `${reason}**/auth** — verbs (mirror of \`switchroom auth\`):\n` +
+        `  \`/auth\` — show fleet snapshot (alias of \`show\`)\n` +
+        `  \`/auth show\` — show fleet snapshot\n` +
+        `  \`/auth show <agent>\` — show one agent's effective account + mirror state\n` +
+        `  \`/auth list\` — alias of \`/auth show\`\n` +
+        `  \`/auth use <label>\` — admin: swap the fleet to <label>\n` +
+        `  \`/auth rotate\` — admin: cycle to next non-exhausted fallback\n` +
+        `  \`/auth add <label>\` — admin: OAuth-add a new account from chat\n` +
+        `  \`/auth cancel\` — abort an \`/auth add\` in progress\n` +
+        `  \`/auth rm <label>\` — admin: remove an account (two-step confirm)\n` +
+        `  \`/auth refresh [<label>]\` — admin: force a refresh tick\n` +
+        `  \`/auth agent override <agent> <label|clear>\` — admin: per-agent account override\n` +
+        `  \`/auth help\` — this list`,
       html: true,
     }
   }
@@ -417,7 +417,7 @@ export async function handleAuthCommand(
       }
     } catch (err) {
       return {
-        text: `<b>/auth show failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth show failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -432,15 +432,15 @@ export async function handleAuthCommand(
       if (!agent) {
         return {
           text:
-            `<b>/auth show:</b> no agent named <code>${escapeHtml(agentName)}</code> in broker view.\n` +
-            `Run <code>/auth show</code> for the fleet snapshot.`,
+            `**/auth show:** no agent named \`${escapeHtml(agentName)}\` in broker view.\n` +
+            `Run \`/auth show\` for the fleet snapshot.`,
           html: true,
         }
       }
       return { text: renderAgentDetail(state, agent), html: true }
     } catch (err) {
       return {
-        text: `<b>/auth show failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth show failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -450,10 +450,10 @@ export async function handleAuthCommand(
   if (!isAdmin(ctx)) {
     return {
       text:
-        `<b>Not authorized.</b> <code>/auth ${parsed.kind}</code> is admin-only.\n` +
-        `Set <code>admin: true</code> on this agent in switchroom.yaml to unlock ` +
-        `(the same flag that gates <code>/agents</code>, <code>/restart</code>, ` +
-        `<code>/update</code> etc.).`,
+        `**Not authorized.** \`/auth ${parsed.kind}\` is admin-only.\n` +
+        `Set \`admin: true\` on this agent in switchroom.yaml to unlock ` +
+        `(the same flag that gates \`/agents\`, \`/restart\`, ` +
+        `\`/update\` etc.).`,
       html: true,
     }
   }
@@ -466,7 +466,7 @@ export async function handleAuthCommand(
   if (parsed.kind === 'add' || parsed.kind === 'cancel') {
     return {
       text:
-        `<b>/auth ${parsed.kind} not routed.</b> Internal error — gateway should dispatch this verb directly. Report this.`,
+        `**/auth ${parsed.kind} not routed.** Internal error — gateway should dispatch this verb directly. Report this.`,
       html: true,
     }
   }
@@ -476,13 +476,13 @@ export async function handleAuthCommand(
       const result = await ctx.client.setActive(parsed.label)
       return {
         text:
-          `<b>Active account →</b> <code>${escapeHtml(result.active)}</code>\n` +
+          `**Active account →** \`${escapeHtml(result.active)}\`\n` +
           `Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `<b>/auth use failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth use failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -495,8 +495,8 @@ export async function handleAuthCommand(
       if (!nextLabel) {
         return {
           text:
-            `<b>/auth rotate</b> — no eligible target.\n` +
-            `Either every account in <code>fallback_order</code> is exhausted, ` +
+            `**/auth rotate** — no eligible target.\n` +
+            `Either every account in \`fallback_order\` is exhausted, ` +
             `or no fallback order is configured.`,
           html: true,
         }
@@ -504,13 +504,13 @@ export async function handleAuthCommand(
       const result = await ctx.client.setActive(nextLabel)
       return {
         text:
-          `<b>Rotated:</b> active → <code>${escapeHtml(result.active)}</code>\n` +
+          `**Rotated:** active → \`${escapeHtml(result.active)}\`\n` +
           `Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `<b>/auth rotate failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rotate failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -525,7 +525,7 @@ export async function handleAuthCommand(
       state = await ctx.client.listState()
     } catch (err) {
       return {
-        text: `<b>/auth rm failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rm failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -533,16 +533,16 @@ export async function handleAuthCommand(
     if (!exists) {
       return {
         text:
-          `<b>/auth rm:</b> no account named <code>${escapeHtml(parsed.label)}</code>. ` +
-          `Run <code>/auth show</code> for the current list.`,
+          `**/auth rm:** no account named \`${escapeHtml(parsed.label)}\`. ` +
+          `Run \`/auth show\` for the current list.`,
         html: true,
       }
     }
     if (state.active === parsed.label) {
       return {
         text:
-          `<b>/auth rm refused.</b> <code>${escapeHtml(parsed.label)}</code> is the fleet active. ` +
-          `Switch with <code>/auth use &lt;other&gt;</code> or <code>/auth rotate</code> first.`,
+          `**/auth rm refused.** \`${escapeHtml(parsed.label)}\` is the fleet active. ` +
+          `Switch with \`/auth use <other>\` or \`/auth rotate\` first.`,
         html: true,
       }
     }
@@ -560,9 +560,9 @@ export async function handleAuthCommand(
     }
     return {
       text:
-        `<b>⚠ /auth rm</b> — about to remove <code>${escapeHtml(parsed.label)}</code> from the broker.\n` +
-        `The fleet active is unchanged. Any agent override pointing at <code>${escapeHtml(parsed.label)}</code> will stop working.\n\n` +
-        `Send <code>/auth rm ${escapeHtml(parsed.label)} confirm</code> within ${Math.round(
+        `**⚠ /auth rm** — about to remove \`${escapeHtml(parsed.label)}\` from the broker.\n` +
+        `The fleet active is unchanged. Any agent override pointing at \`${escapeHtml(parsed.label)}\` will stop working.\n\n` +
+        `Send \`/auth rm ${escapeHtml(parsed.label)} confirm\` within ${Math.round(
           AUTH_RM_CONFIRM_TTL_MS / 1000,
         )}s to proceed.`,
       html: true,
@@ -578,8 +578,8 @@ export async function handleAuthCommand(
       }
       return {
         text:
-          `<b>/auth rm:</b> no pending confirm for <code>${escapeHtml(parsed.label)}</code> (expired or not started). ` +
-          `Send <code>/auth rm ${escapeHtml(parsed.label)}</code> first.`,
+          `**/auth rm:** no pending confirm for \`${escapeHtml(parsed.label)}\` (expired or not started). ` +
+          `Send \`/auth rm ${escapeHtml(parsed.label)}\` first.`,
         html: true,
       }
     }
@@ -589,12 +589,12 @@ export async function handleAuthCommand(
     try {
       const data = await ctx.client.rmAccount(parsed.label)
       return {
-        text: `<b>Removed</b> <code>${escapeHtml(data.label)}</code> from the broker.`,
+        text: `**Removed** \`${escapeHtml(data.label)}\` from the broker.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `<b>/auth rm failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rm failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -609,12 +609,12 @@ export async function handleAuthCommand(
       if (parsed.label && targets.length === 0) {
         return {
           text:
-            `<b>/auth refresh:</b> no account named <code>${escapeHtml(parsed.label)}</code>.`,
+            `**/auth refresh:** no account named \`${escapeHtml(parsed.label)}\`.`,
           html: true,
         }
       }
       if (targets.length === 0) {
-        return { text: `<b>/auth refresh:</b> no accounts to refresh.`, html: true }
+        return { text: `**/auth refresh:** no accounts to refresh.`, html: true }
       }
       const oldByLabel = new Map(state.accounts.map((a) => [a.label, a.expiresAt]))
       const rows: string[][] = [['ACCOUNT', 'OLD EXPIRY', 'NEW EXPIRY']]
@@ -635,18 +635,18 @@ export async function handleAuthCommand(
       }
       const head =
         targets.length === 1
-          ? `<b>Refreshed</b> <code>${escapeHtml(targets[0]!)}</code>`
-          : `<b>Refreshed</b> ${rows.length - 1}/${targets.length} account${targets.length === 1 ? '' : 's'}`
+          ? `**Refreshed** \`${escapeHtml(targets[0]!)}\``
+          : `**Refreshed** ${rows.length - 1}/${targets.length} account${targets.length === 1 ? '' : 's'}`
       const table = rows.length > 1
-        ? `\n<pre>${alignTable(rows)}</pre>`
+        ? "\n```\n" + alignTable(rows) + "\n```"
         : ''
       const failBlock = failures.length > 0
-        ? `\n<b>Failures:</b>\n${failures.map((f) => `  ${f}`).join('\n')}`
+        ? `\n**Failures:**\n${failures.map((f) => `  ${f}`).join('\n')}`
         : ''
       return { text: head + table + failBlock, html: true }
     } catch (err) {
       return {
-        text: `<b>/auth refresh failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth refresh failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -657,13 +657,13 @@ export async function handleAuthCommand(
       const data = await ctx.client.setOverride(parsed.agent, parsed.label)
       return {
         text:
-          `<b>Override set.</b> <code>${escapeHtml(data.agent)}</code> is now pinned to ` +
-          `<code>${escapeHtml(data.account ?? parsed.label)}</code>.`,
+          `**Override set.** \`${escapeHtml(data.agent)}\` is now pinned to ` +
+          `\`${escapeHtml(data.account ?? parsed.label)}\`.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `<b>/auth agent override failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth agent override failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -674,13 +674,13 @@ export async function handleAuthCommand(
       const data = await ctx.client.setOverride(parsed.agent, null)
       return {
         text:
-          `<b>Override cleared</b> on <code>${escapeHtml(data.agent)}</code> ` +
+          `**Override cleared** on \`${escapeHtml(data.agent)}\` ` +
           `— back to fleet active.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `<b>/auth agent override failed:</b> ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth agent override failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -690,7 +690,7 @@ export async function handleAuthCommand(
   const _exhaustive: never = parsed
   void _exhaustive
   return {
-    text: `<b>/auth:</b> unhandled verb. Report this.`,
+    text: `**/auth:** unhandled verb. Report this.`,
     html: true,
   }
 }
@@ -800,37 +800,37 @@ export function renderShowText(
       }),
     )
   } else {
-    lines.push('<b>Auth — fleet snapshot</b>')
+    lines.push('**Auth — fleet snapshot**')
     if (state.accounts.length > 0) {
       lines.push('')
-      lines.push('<b>Accounts</b>')
-      lines.push('<pre>')
+      lines.push('**Accounts**')
+      lines.push('```')
       lines.push(formatAccountsTable(state, now, opts.demo ?? false))
-      lines.push('</pre>')
+      lines.push('```')
     }
   }
 
   // Agents table
   if (state.agents.length > 0) {
-    lines.push('<b>Agents</b>')
-    lines.push('<pre>')
+    lines.push('**Agents**')
+    lines.push('```')
     lines.push(formatAgentsTable(state, opts.demo ?? false))
-    lines.push('</pre>')
+    lines.push('```')
   }
 
   // Consumers table — only when there are any (typical case: hindsight).
   if (state.consumers.length > 0) {
-    lines.push('<b>Consumers</b>')
-    lines.push('<pre>')
+    lines.push('**Consumers**')
+    lines.push('```')
     lines.push(formatConsumersTable(state, now, opts.demo ?? false))
-    lines.push('</pre>')
+    lines.push('```')
   }
 
   // Discovery hint — operators on a quota-walled fleet need to know
   // `/auth add` exists so they can add a fresh account without an
   // LLM in the loop. Keep it short; the help text has the full menu.
   lines.push(
-    '<i>Add a new Anthropic account: <code>/auth add &lt;label&gt;</code> (admin)</i>',
+    '_Add a new Anthropic account: \`/auth add <label>\` (admin)_',
   )
 
   return lines.join('\n')
@@ -909,10 +909,10 @@ export function renderAgentDetail(
   now: number = Date.now(),
 ): string {
   const lines: string[] = []
-  lines.push(`<b>${escapeHtml(agent.name)}</b>`)
+  lines.push(`**${escapeHtml(agent.name)}**`)
   const source = agent.override ? 'override' : 'fleet-active'
   lines.push(
-    `Active account: <code>${escapeHtml(agent.account)}</code> (${source})`,
+    `Active account: \`${escapeHtml(agent.account)}\` (${source})`,
   )
   const acct = state.accounts.find((a) => a.label === agent.account)
   if (acct) {
@@ -928,11 +928,11 @@ export function renderAgentDetail(
         acct.exhausted_until != null && acct.exhausted_until > now
           ? formatRelativeMs(acct.exhausted_until - now)
           : '—'
-      lines.push(`<i>Quota: exhausted · resets in ${resetRel}</i>`)
+      lines.push(`_Quota: exhausted · resets in ${resetRel}_`)
     }
     if (typeof acct.threshold_violations === 'number' && acct.threshold_violations > 0) {
       lines.push(
-        `<i>Threshold violations: ${acct.threshold_violations} — claude refreshed under the broker's feet</i>`,
+        `_Threshold violations: ${acct.threshold_violations} — claude refreshed under the broker's feet_`,
       )
     }
   }
@@ -956,7 +956,7 @@ function formatConsumersTable(state: ListStateData, now: number, demo = false): 
 // ─── Plain-text helpers ────────────────────────────────────────────────────
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1')
 }
 
 function formatRelativeMs(ms: number): string {
