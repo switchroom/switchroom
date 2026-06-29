@@ -233,7 +233,132 @@ export function normalizeParagraphBreaks(text: string): string {
   }
   out = pieces.join('')
 
+  // Step 3: guarantee a blank line (`\n\n`) at BLOCK BOUNDARIES. The
+  // prose-promotion above keeps lists/tables tight by leaving their single
+  // `\n` separators alone — but GFM's rich renderer needs a blank line to
+  // START a new block, so a block that is glued to the previous line by a
+  // single `\n` fails to render (a table prints as literal pipe text, prose
+  // after a list is absorbed as a lazy list continuation). This pass inserts
+  // the missing blank line at those transitions only, on the same masked text,
+  // never touching code interiors, never collapsing/expanding existing `\n\n`,
+  // and never splitting a table's header/delimiter/body rows apart.
+  out = ensureBlockBoundaries(out, placeholder)
+
   return restore(out)
+}
+
+// ---------------------------------------------------------------------------
+// Block-boundary blank-line guarantee (Step 3 of normalizeParagraphBreaks)
+// ---------------------------------------------------------------------------
+
+/** A line that begins a GFM list item (bullet or ordered), incl. leading indent. */
+function isListItemLine(line: string): boolean {
+  const t = line.trimStart()
+  return /^[-*+]\s/.test(t) || /^\d+[.)]\s/.test(t)
+}
+
+/** A GFM table body/header row: a line whose first non-space char is `|`. */
+function isTableRowLine(line: string): boolean {
+  return /^\s*\|/.test(line)
+}
+
+/**
+ * A GFM table delimiter row: optional leading pipe, then one or more
+ * `:?-{1,}:?` cells separated by pipes (e.g. `|---|---|`, `---|:--:`,
+ * `| :-- | --: |`). This is what turns the line ABOVE it into a table header.
+ */
+function isTableDelimiterLine(line: string): boolean {
+  return /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(line)
+}
+
+/** A fenced-code OPEN line — either a literal ``` fence or a masked block. */
+function isFenceOpenLine(line: string, placeholder?: string): boolean {
+  const t = line.trimStart()
+  if (placeholder != null && placeholder.length > 0 && t.startsWith(placeholder)) return true
+  return t.startsWith('```')
+}
+
+/** A blockquote line. */
+function isBlockquoteLine(line: string): boolean {
+  return line.trimStart().startsWith('>')
+}
+
+/** An ATX heading line. */
+function isHeadingLine(line: string): boolean {
+  return /^#{1,6}\s/.test(line.trimStart())
+}
+
+/**
+ * Insert a blank line at block boundaries that are currently separated by
+ * exactly one `\n`. Operates line-by-line on already-code-masked text.
+ *
+ * A blank line is guaranteed:
+ *   - BEFORE the first row of a GFM table (a `|`-leading line that is itself a
+ *     delimiter row, OR a `|`-containing header line immediately followed by a
+ *     delimiter row) when the previous emitted line is non-blank and not part
+ *     of a table — never between a table's own header/delimiter/body rows.
+ *   - BEFORE a fenced-code open, a blockquote, or an ATX heading when the
+ *     previous line is non-blank and of a DIFFERENT block type.
+ *   - AFTER a list block: when a list-item line is followed by a non-blank
+ *     line that is NOT itself a list item and NOT an indented continuation of
+ *     the item (4+ leading spaces / a tab), so the prose breaks out of the list.
+ *
+ * Conservative: prefers a false negative (leave glued) over corrupting a valid
+ * block. Existing blank lines (empty entries from a `\n\n` gap) are preserved
+ * and short-circuit every rule — we never double up a gap.
+ */
+function ensureBlockBoundaries(text: string, placeholder?: string): string {
+  if (!text.includes('\n')) return text
+  const lines = text.split('\n')
+  const result: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const prev = result.length > 0 ? result[result.length - 1] : null
+    const prevNonBlank = prev != null && prev.trim() !== ''
+    const curBlank = line.trim() === ''
+
+    // ---- Rule A: blank line BEFORE a block that needs one to start ----
+    if (prevNonBlank && !curBlank) {
+      const next = i + 1 < lines.length ? lines[i + 1] : ''
+
+      // Table first row: either THIS line is a delimiter row (header was the
+      // prev line — but only treat as a table start when prev itself isn't
+      // already a table row), or THIS line is a `|`-bearing header whose NEXT
+      // line is a delimiter. We anchor the blank-line insertion on the HEADER
+      // line so header+delimiter+body stay contiguous.
+      const prevIsTable = isTableRowLine(prev)
+      const startsTableHere =
+        !prevIsTable &&
+        ((line.includes('|') && isTableDelimiterLine(next)) ||
+          (isTableRowLine(line) && isTableDelimiterLine(next)))
+
+      const startsFence = isFenceOpenLine(line, placeholder) && !isFenceOpenLine(prev, placeholder)
+      const startsQuote = isBlockquoteLine(line) && !isBlockquoteLine(prev)
+      const startsHeading = isHeadingLine(line) && !isHeadingLine(prev)
+
+      if (startsTableHere || startsFence || startsQuote || startsHeading) {
+        result.push('')
+      }
+    }
+
+    // ---- Rule B: blank line AFTER a list block, before breakout prose ----
+    if (prevNonBlank && !curBlank && isListItemLine(prev) && !isListItemLine(line)) {
+      // A 4+ space (or tab) indent means `line` is a lazy continuation of the
+      // list item's paragraph, NOT breakout prose — leave it glued.
+      const isIndentedContinuation = /^(\t| {4,})\S/.test(line)
+      // A table/fence/quote/heading start is already handled by Rule A above
+      // (its blank line was just inserted); avoid inserting a second one.
+      const alreadySeparated = result.length > 0 && result[result.length - 1].trim() === ''
+      if (!isIndentedContinuation && !alreadySeparated) {
+        result.push('')
+      }
+    }
+
+    result.push(line)
+  }
+
+  return result.join('\n')
 }
 
 /** Lines that introduce GFM block structure — never reflow around these. */
