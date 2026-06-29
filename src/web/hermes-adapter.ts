@@ -888,10 +888,13 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     //   (tmux send-keys). These are Claude Code REPL commands; injectInbound
     //   would deliver them as conversation text, not execute them.
     //
-    //   Switchroom gateway commands (everything else: /vault, /auth, /doctor,
-    //   /restart, /new, /whoami, /logs, /version, /commands) — go through
-    //   injectInbound as a synthesized user turn. The gateway handles these as
-    //   regular Telegram commands when it receives them in the chat stream.
+    //   Non-REPL commands (/vault, /auth, /doctor, /whoami, /logs, /version,
+    //   /commands, etc.) — go through injectInbound as a synthesized user turn.
+    //   Claude receives the string as conversation text (not a bot.command
+    //   dispatch) and handles it via MCP tools and training knowledge.
+    //   NOTE: /restart and /new must NOT be placed in the catalog — they need
+    //   the grammy bot.command handler path (hostd + restart-marker protocol)
+    //   which only fires on real Telegram messages.
     //
     // Explicitly blocked REPL commands (/effort, /login, /logout, /exit, /quit)
     // are refused with a clear error.
