@@ -12,7 +12,7 @@ import { describe, test, expect } from 'vitest'
 import { GrammyError } from 'grammy'
 import { isLengthError, isParseEntitiesError } from '../rich-send.js'
 import { isMessageTooLongError, isHtmlParseRejectError } from '../retry-api-call.js'
-import { hardSliceToCap, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { hardSliceToCap, splitMarkdownChunks, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 
 // Build a GrammyError with a given 400 description. GrammyError's constructor
 // takes (message, payload, method, parameters) in grammy 1.44.
@@ -93,5 +93,39 @@ describe('hardSliceToCap', () => {
     expect(pieces).toHaveLength(2)
     expect(pieces[0].length).toBe(RICH_MESSAGE_MAX_CHARS)
     expect(pieces[1].length).toBe(5)
+  })
+})
+
+// The gateway length-error recovery (gateway.ts sendChunkResplit, ~8758) re-splits
+// an oversized chunk with `splitMarkdownChunks` and falls back to `hardSliceToCap`
+// when the block is indivisible. These tests pin that seam at the function level:
+// a >RICH_MESSAGE_MAX_CHARS body is ALWAYS chunked into >=2 sends (each <= cap),
+// never silently dropped or resent whole on a RICH_MESSAGE_TEXT_TOO_LONG reject.
+describe('resplit-on-reject: oversized body chunks into >=2 sends', () => {
+  test('a >cap body with prose boundaries re-splits into >=2 chunks each <= cap', () => {
+    // A paragraph-separated body twice the cap: splitMarkdownChunks finds the
+    // `\n\n` boundaries and yields multiple chunks.
+    const para = 'x'.repeat(4000)
+    const body = Array.from({ length: 20 }, () => para).join('\n\n')
+    expect(body.length).toBeGreaterThan(RICH_MESSAGE_MAX_CHARS)
+    const pieces = splitMarkdownChunks(body, RICH_MESSAGE_MAX_CHARS)
+    expect(pieces.length).toBeGreaterThanOrEqual(2)
+    for (const p of pieces) expect(p.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS)
+  })
+
+  test('an indivisible >cap blob falls back through hardSliceToCap to >=2 chunks each <= cap', () => {
+    // A single boundary-free blob larger than the cap: splitMarkdownChunks
+    // cannot break it and emits it whole (length > cap), so the recovery path
+    // hands it to hardSliceToCap — mirroring sendChunkResplit's fallback.
+    const blob = 'z'.repeat(RICH_MESSAGE_MAX_CHARS + 5000)
+    const subPieces = splitMarkdownChunks(blob, RICH_MESSAGE_MAX_CHARS)
+    const pieces =
+      subPieces.length > 1 && subPieces.every((p) => p.length <= RICH_MESSAGE_MAX_CHARS)
+        ? subPieces
+        : hardSliceToCap(blob, RICH_MESSAGE_MAX_CHARS)
+    expect(pieces.length).toBeGreaterThanOrEqual(2)
+    for (const p of pieces) expect(p.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS)
+    // Nothing is dropped — the pieces reconstitute the original body.
+    expect(pieces.join('')).toBe(blob)
   })
 })

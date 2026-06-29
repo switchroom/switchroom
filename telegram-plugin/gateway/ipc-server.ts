@@ -231,9 +231,11 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
     case "pty_partial":
       // Extracted reply text from PTY-tail. May be empty (the extractor
       // returns empty strings for "no text yet" snapshots — gateway
-      // handler dedups on lastPtyPreviewByChat). Capped at 8192 to
-      // give some headroom over Telegram's 4096-char wire limit while
-      // still bounding buffer growth from a runaway extractor.
+      // handler dedups on lastPtyPreviewByChat). Capped at 8192 — this is a
+      // preview-buffer bound on the PTY tail, not the outbound wire cap (which
+      // is now RICH_MESSAGE_MAX_CHARS / 32768 on the rich path post-#2669) —
+      // sized to bound buffer growth from a runaway extractor while still
+      // carrying a useful preview.
       return typeof m.text === "string"
         && (m.text as string).length <= 8192;
     case "update_placeholder":

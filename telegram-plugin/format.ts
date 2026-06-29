@@ -223,7 +223,9 @@ export function normalizeParagraphBreaks(text: string): string {
     if (promote) {
       // Strip any trailing whitespace the line already carried so we emit
       // exactly one `  \n` hard break (never accumulate spaces on a re-run).
-      line = line.replace(/[ \t]+$/, '')
+      // Include `\r` so a CRLF source ("Alpha.\r\nBravo.") doesn't strand a
+      // lone carriage return before the injected `  \n`.
+      line = line.replace(/[ \t\r]+$/, '')
     }
     pieces.push(line)
     if (isLast) break
@@ -236,6 +238,10 @@ export function normalizeParagraphBreaks(text: string): string {
 
 /** Lines that introduce GFM block structure — never reflow around these. */
 function isMarkerLine(line: string, placeholder?: string): boolean {
+  // CommonMark indented code block: 4+ leading spaces then a non-space char.
+  // Checked on the RAW (pre-trim) line — trimming would erase the very indent
+  // that makes it a code block, so we must look before `trimStart()`.
+  if (/^ {4,}\S/.test(line)) return true
   const t = line.trimStart()
   // A line that begins with the code-mask placeholder is a standalone masked
   // fenced block — treat it as a block marker so we never inject a hard break

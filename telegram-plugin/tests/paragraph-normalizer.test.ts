@@ -139,4 +139,20 @@ describe('normalizeParagraphBreaks', () => {
     // accumulate extra spaces beyond the single `  \n` hard break.
     expect(out).toBe('Done.  \nNext.')
   })
+
+  test('CRLF input promotes to a hard break with NO stranded `\\r`', () => {
+    // A CRLF source must not leave a lone carriage return before the injected
+    // `  \n`. The trailing-whitespace strip includes `\r` so the result is a
+    // clean `  \n` hard break, not `  \r\n` or `\r  \n`.
+    const out = normalizeParagraphBreaks('Alpha.\r\nBravo.')
+    expect(out).toBe('Alpha.  \nBravo.')
+    expect(out).not.toContain('\r')
+  })
+
+  test('does NOT promote a break adjacent to an indented code block', () => {
+    // CommonMark indented code block (4+ leading spaces then non-space) is a
+    // block marker — a break adjacent to it must NOT be promoted to a hard break.
+    const input = 'Note:\n    indented code'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
 })

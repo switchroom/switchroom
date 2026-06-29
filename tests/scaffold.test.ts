@@ -2825,6 +2825,77 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain('--append-system-prompt "$APPEND_PROMPT"');
   });
 
+  it("injects the Telegram formatting floor card into --append-system-prompt (scaffold path)", () => {
+    // The floor card (TELEGRAM_FORMATTING_FLOOR_CARD in scaffold.ts) is the
+    // model-independent formatting guidance baked into EVERY session's
+    // --append-system-prompt. It must land in start.sh's APPEND_PROMPT, and it
+    // must NOT depend on any per-agent config — a bare agent still gets it.
+    const config = makeAgentConfig({});
+    const result = scaffoldAgent(
+      "floor-card-agent",
+      config,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    // Stable distinctive substrings pulled verbatim from the floor card (none
+    // contain single quotes, so POSIX single-quote wrapping leaves them intact).
+    expect(startSh).toContain("## Formatting for Telegram");
+    expect(startSh).toContain("Hard cap is 32768 characters.");
+    expect(startSh).toContain("Every reply renders as rich Markdown");
+    // It rides the same --append-system-prompt var the operator passthrough uses.
+    expect(startSh).toContain('--append-system-prompt "$APPEND_PROMPT"');
+  });
+
+  it("prepends the floor card BEFORE the operator's system_prompt_append (not overwritten)", () => {
+    // When an operator sets system_prompt_append, the floor card must be
+    // PREPENDED — both the floor card and the operator's text must survive,
+    // proving the injection augments rather than replaces the passthrough.
+    const operatorText = "OPERATOR_PASSTHROUGH_MARKER_xyz";
+    const config = makeAgentConfig({ system_prompt_append: operatorText });
+    const result = scaffoldAgent(
+      "floor-card-plus-op-agent",
+      config,
+      tmpDir,
+      telegramConfig,
+    );
+    const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+    // Both present.
+    expect(startSh).toContain("Hard cap is 32768 characters.");
+    expect(startSh).toContain(operatorText);
+    // Order: the floor card's marker precedes the operator's marker (prepended).
+    const floorIdx = startSh.indexOf("## Formatting for Telegram");
+    const opIdx = startSh.indexOf(operatorText);
+    expect(floorIdx).toBeGreaterThanOrEqual(0);
+    expect(opIdx).toBeGreaterThan(floorIdx);
+  });
+
+  it("injects the Telegram formatting floor card on the reconcile path too", () => {
+    // The live `switchroom apply` recreates EXISTING agents via reconcileAgent,
+    // not scaffoldAgent — so the floor card must also survive the reconcile
+    // re-render of start.sh (the two paths are kept in lockstep).
+    const operatorText = "OPERATOR_RECONCILE_MARKER_xyz";
+    const config = makeAgentConfig({ system_prompt_append: operatorText });
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "floor-card-reconcile": config },
+    } as SwitchroomConfig;
+    scaffoldAgent("floor-card-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("floor-card-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    const startSh = readFileSync(
+      join(tmpDir, "floor-card-reconcile", "start.sh"),
+      "utf-8",
+    );
+    expect(startSh).toContain("## Formatting for Telegram");
+    expect(startSh).toContain("Hard cap is 32768 characters.");
+    // Operator passthrough still survives the reconcile path, prepended-after.
+    expect(startSh).toContain(operatorText);
+    const floorIdx = startSh.indexOf("## Formatting for Telegram");
+    const opIdx = startSh.indexOf(operatorText);
+    expect(opIdx).toBeGreaterThan(floorIdx);
+  });
+
   it("settings_raw deep-merges into the generated settings.json", () => {
     const agentConfig = makeAgentConfig({
       settings_raw: {
