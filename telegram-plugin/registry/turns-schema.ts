@@ -503,11 +503,37 @@ export function findRecentTurnsForChat(
  *
  * `limit` defaults to 20, max 200.
  */
+/**
+ * Return distinct thread_ids (null = general topic) for a given chat_id.
+ * Used by the Hermes adapter to enumerate forum topics as separate sessions.
+ */
+export function listDistinctThreadIds(
+  db: SqliteDatabase,
+  chatId: string,
+): (string | null)[] {
+  const rows = db.prepare(`
+    SELECT DISTINCT thread_id FROM turns
+    WHERE chat_id = ?
+    ORDER BY thread_id ASC
+  `).all(chatId) as { thread_id: string | null }[]
+  return rows.map((r) => r.thread_id)
+}
+
 export function listTurnsForAgent(
   db: SqliteDatabase,
-  opts: { limit?: number; chatId?: string } = {},
+  opts: { limit?: number; chatId?: string; threadId?: string | null } = {},
 ): Turn[] {
   const limit = Math.min(Math.max(1, opts.limit ?? 20), 200)
+  if (opts.chatId && 'threadId' in opts) {
+    // threadId may be a string ID or null (general topic)
+    const rows = db.prepare(`
+      SELECT * FROM turns
+      WHERE chat_id = ? AND thread_id IS ?
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(opts.chatId, opts.threadId ?? null, limit) as RawTurnRow[]
+    return rows.map(mapRow)
+  }
   if (opts.chatId) {
     const rows = db.prepare(`
       SELECT * FROM turns
