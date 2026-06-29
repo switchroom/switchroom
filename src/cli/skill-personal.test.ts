@@ -867,3 +867,153 @@ describe("clone-to-personal skips non-allowlisted source files (#1847)", () => {
     }, 2);
   });
 });
+
+// ─── Secret-scan gate (security fix: skill bodies were unscanned) ─────
+//
+// The personal-skill write path runs scanBundleForSecrets BEFORE writing
+// to disk and (therefore) before mirroring into the operator's config
+// repo. A secret embedded ANYWHERE in the bundle — SKILL.md body included,
+// not just scripts — must refuse the write with exit 3, name the offending
+// file + matched pattern, and never echo the secret value.
+//
+// Token fixtures are built by concatenation so this source file never
+// contains a contiguous real-looking token (GitHub Push Protection).
+describe("scanBundleForSecrets gate (init-personal)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = tmpAgentsRoot();
+  });
+
+  afterEach(() => {
+    try { rmSync(root, { recursive: true, force: true }); } catch { /**/ }
+  });
+
+  // Capture both the exit code AND stderr so we can assert the message
+  // shape (names file, never leaks the secret).
+  function runCaptureExit(fn: () => void): { code: number | undefined; stderr: string } {
+    const origExit = process.exit.bind(process);
+    let caught: number | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process as any).exit = (code?: number): never => {
+      caught = code;
+      throw new Error(`__test_exit_${code}__`);
+    };
+    let stderr = "";
+    const origErr = console.error;
+    console.error = (...args: unknown[]): void => {
+      stderr += args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ") + "\n";
+    };
+    try {
+      try {
+        fn();
+      } catch (e: unknown) {
+        const err = e as { message?: string };
+        if (!err.message?.startsWith("__test_exit_")) throw e;
+      }
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (process as any).exit = origExit;
+      console.error = origErr;
+    }
+    return { code: caught, stderr };
+  }
+
+  function skillMdWithBody(name: string, body: string): string {
+    return `---\nname: ${name}\ndescription: A test skill\n---\n# ${name}\n\n${body}\n`;
+  }
+
+  function initWithBody(name: string, body: string): { code: number | undefined; stderr: string } {
+    const skillFile = join(root, "input.md");
+    writeFileSync(skillFile, skillMdWithBody(name, body));
+    return runCaptureExit(() => {
+      initPersonalAction(name, { agent: AGENT, from: skillFile, root });
+    });
+  }
+
+  // Fixtures: assembled at runtime so no contiguous token literal exists.
+  const SK_ANT = ["sk-ant-", "Apq13yqRnPzx4MxK0TfAbY98Qw22"].join("");
+  const GHP = ["ghp_", "Abcdef1234567890Abcdef1234567890abcd"].join("");
+  const AKIA = ["AKIA", "IOSFODNN7EXAMPLE"].join("");
+  const PEM = [
+    "-----BEGIN PRIVATE KEY-----",
+    "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAUEwggE9AgEAAkEA0Zm9abcdEFGHijkl",
+    "mnopQRSTuvwx0123456789ABCDefghIJKLmnopQRSTuvwx0123456789ABCDefgh",
+    "-----END PRIVATE KEY-----",
+  ].join("\n");
+  // Prefix-less high-entropy blob: ≥28 [A-Za-z0-9], ≥18 distinct, has a
+  // digit — exercises the generic_high_entropy fallback.
+  const HIGH_ENTROPY = ["a", "Z7", "qW3", "rT9bN2", "kL5pX8mC4vH1jD6sQ0fG"].join("");
+
+  const cases: Array<[string, string, RegExp]> = [
+    ["sk-ant token", `Here is my key ${SK_ANT} keep it safe`, /Anthropic API key/],
+    ["ghp token", `token: ${GHP}`, /GitHub personal access token/],
+    ["AKIA key", `aws id ${AKIA} done`, /AWS access key/],
+    ["PEM private key block", PEM, /PEM private-key block/],
+    ["prefix-less high-entropy key", `apikey ${HIGH_ENTROPY} end`, /high-entropy/],
+  ];
+
+  for (const [label, body, patternRe] of cases) {
+    it(`refuses a ${label} embedded in the SKILL.md body`, () => {
+      const { code, stderr } = initWithBody("secretskill", body);
+      // Fail closed.
+      expect(code).toBe(3);
+      // Names the offending file.
+      expect(stderr).toContain("SKILL.md");
+      // Names the matched pattern.
+      expect(stderr).toMatch(patternRe);
+      // Never echoes the secret value.
+      const secret = body.match(/[A-Za-z0-9_+/.=-]{16,}/g) ?? [];
+      // The longest token in the body is the secret payload; ensure no
+      // run of it appears in the error output.
+      for (const tok of secret) {
+        if (tok.length >= 20) expect(stderr).not.toContain(tok);
+      }
+      // The skill must NOT have landed on disk.
+      const target = join(root, AGENT, ".claude/skills/personal-secretskill");
+      expect(existsSync(target)).toBe(false);
+    });
+  }
+
+  it("PASSES a clean, normal skill (no false positive)", () => {
+    const body = [
+      "This skill formats a daily digest. It reads recent GitHub activity",
+      "and produces a summary. Use the run_digest helper and pass the",
+      "org-name and the get_user_profile_by_org lookup. No credentials live",
+      "in this file — fetch them with `switchroom vault get github/token`.",
+    ].join("\n");
+    const out = captureStdout(() => {
+      const skillFile = join(root, "clean.md");
+      writeFileSync(skillFile, skillMdWithBody("cleanskill", body));
+      initPersonalAction("cleanskill", { agent: AGENT, from: skillFile, root });
+    });
+    const parsed = JSON.parse(out);
+    expect(parsed.ok).toBe(true);
+    const target = join(root, AGENT, ".claude/skills/personal-cleanskill/SKILL.md");
+    expect(existsSync(target)).toBe(true);
+  });
+
+  it("a secret-bearing skill never reaches the mirror (config repo)", () => {
+    // Point the mirror at a real, existing tmpdir so mirrorToConfigRepo
+    // WOULD write there if it were ever reached. Pre-create the
+    // agents/<agent>/personal-skills path so the only reason it stays
+    // empty is the scan refusing before writePersonalSkill/mirror.
+    const mirrorRoot = mkdtempSync(join(tmpdir(), "skill-mirror-"));
+    const saved = process.env.SWITCHROOM_CONFIG_DIR;
+    process.env.SWITCHROOM_CONFIG_DIR = mirrorRoot;
+    const mirrorDir = join(mirrorRoot, "agents", AGENT, "personal-skills");
+    mkdirSync(mirrorDir, { recursive: true });
+    try {
+      const { code } = initWithBody("leakyskill", `key ${SK_ANT} here`);
+      expect(code).toBe(3);
+      // Nothing mirrored.
+      expect(readdirSync(mirrorDir)).toHaveLength(0);
+      // Nothing on disk either.
+      expect(existsSync(join(root, AGENT, ".claude/skills/personal-leakyskill"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.SWITCHROOM_CONFIG_DIR;
+      else process.env.SWITCHROOM_CONFIG_DIR = saved;
+      try { rmSync(mirrorRoot, { recursive: true, force: true }); } catch { /**/ }
+    }
+  });
+});

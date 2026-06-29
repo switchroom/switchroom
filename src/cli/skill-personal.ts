@@ -22,6 +22,12 @@
  * (`validateSkillBundle` covers name regex, path allowlist, SKILL.md
  * frontmatter, bundle size caps, and the `claude -p` content scan).
  *
+ * Security gate: `scanBundleForSecrets` (skill-common.ts) runs over the
+ * FULL content of EVERY file — SKILL.md body included — BEFORE the write
+ * and the config-repo mirror, failing closed (exit 3) on any embedded
+ * secret/credential so a pasted key never lands on disk or mirrors into
+ * the operator's git config repo.
+ *
  * Behavioural validation (`bash -n`, `python -m py_compile`) runs
  * synchronously per file; failures surface as structured CLI errors
  * the MCP wrapper renders back to the calling agent.
@@ -58,6 +64,7 @@ import {
   type SkillFileMap,
   validateRelPath,
   validateSkillBundle,
+  scanBundleForSecrets,
 } from "./skill-common.js";
 import { withConfigError } from "./helpers.js";
 import { appendAudit } from "./agent-config.js";
@@ -564,6 +571,30 @@ function loadValidateWrite(
     console.error(chalk.red("Behavioural validation failed:"));
     for (const e of behavioral) {
       console.error(chalk.red(`  - ${e}`));
+    }
+    process.exit(3);
+  }
+
+  // Security gate — scan the FULL content of every file (SKILL.md body
+  // included, not just scripts) for embedded secrets/credentials. This runs
+  // BEFORE writePersonalSkill and (therefore) before mirrorToConfigRepo in
+  // every caller, so a secret-bearing skill never lands on disk and never
+  // mirrors into the operator's git config repo. Fail closed on any hit; the
+  // message names the offending file + matched pattern but NEVER echoes the
+  // secret value itself.
+  // TODO(#2670): PII rules (email/phone/address) pending operator decision —
+  // they drop in at scanBundleForSecrets (see skill-common.ts) without
+  // changing this fail-closed wiring.
+  const secretFindings = scanBundleForSecrets(files);
+  if (secretFindings.length > 0) {
+    console.error(chalk.red("Secret scan failed — refusing to write skill:"));
+    for (const f of secretFindings) {
+      console.error(
+        chalk.red(
+          `  - ${f.file}: ${f.pattern} detected (at byte offset ${f.offset}). ` +
+          `Remove the secret from the skill content and use the vault instead.`,
+        ),
+      );
     }
     process.exit(3);
   }
