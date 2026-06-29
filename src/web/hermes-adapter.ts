@@ -194,7 +194,7 @@ function resolveAgentChat(
   if (channel) {
     // If the session ID encodes a specific topic, use that thread; otherwise use config default.
     const threadId = topicId !== undefined
-      ? (topicId === null ? undefined : Number(topicId))
+      ? (topicId === null ? undefined : (parseInt(topicId, 10) || undefined))
       : channel.threadId
     return { chatId: channel.chatId, threadId }
   }

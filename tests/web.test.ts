@@ -134,6 +134,7 @@ import {
   type MemoryHealth,
   type AttentionItem,
   type SummaryPart,
+  parseHermesSessionId,
 } from "../src/web/api.js";
 import { resolveAgentsDir } from "../src/config/loader.js";
 import { getAccountInfos } from "../src/auth/account-store.js";
@@ -2565,5 +2566,39 @@ describe("dashboard CSS — .accounts-grid desktop-hide must stay scoped", () =>
     expect(html).not.toMatch(
       /(?<!#accounts )\.accounts-grid\s*\{\s*display:\s*none/,
     );
+  });
+});
+
+describe("parseHermesSessionId", () => {
+  it("plain agent name → agentName only, no threadId key", () => {
+    const r = parseHermesSessionId("marko");
+    expect(r.agentName).toBe("marko");
+    expect("threadId" in r).toBe(false);
+  });
+
+  it("agent~threadId → agentName + string threadId", () => {
+    const r = parseHermesSessionId("marko~635");
+    expect(r.agentName).toBe("marko");
+    expect(r.threadId).toBe("635");
+  });
+
+  it("agent~ (tilde, empty suffix) → agentName + null threadId", () => {
+    const r = parseHermesSessionId("marko~");
+    expect(r.agentName).toBe("marko");
+    expect(r.threadId).toBeNull();
+  });
+
+  it("empty string → agentName empty, no threadId key", () => {
+    const r = parseHermesSessionId("");
+    expect(r.agentName).toBe("");
+    expect("threadId" in r).toBe(false);
+  });
+
+  it("agent~null literal → agentName + 'null' string threadId", () => {
+    // 'null' as a string is not the same as the null threadId sentinel;
+    // callers encode general-topic as plain agentName (no tilde).
+    const r = parseHermesSessionId("marko~null");
+    expect(r.agentName).toBe("marko");
+    expect(r.threadId).toBe("null");
   });
 });
