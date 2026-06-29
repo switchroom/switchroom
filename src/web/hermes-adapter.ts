@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import type { SwitchroomConfig } from "../config/schema.js";
+import type { Turn } from "../../telegram-plugin/registry/turns-schema.js";
 import { resolveAgentsDir } from "../config/loader.js";
 import { resolveChannelTarget } from "../agent-scheduler/channel-target.js";
 import {
@@ -206,8 +207,6 @@ async function injectInbound(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-import type { Turn } from "../../telegram-plugin/registry/turns-schema.js";
 
 /** Map switchroom Turn records to SessionMessage[] for Hermes Desktop history. */
 function turnsToMessages(turns: Turn[]): object[] {
