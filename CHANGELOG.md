@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.16.22 — Hermes Desktop: conversation history, model picker, cron panel, slash palette
+
+### PR A — Conversation history + model picker (#2660)
+
+`GET /api/sessions/:id/messages` returns the agent's conversation history from the local turns database, rendered as `SessionMessage[]` with Unix-second timestamps. Hermes Desktop's History tab now shows real messages instead of an empty list.
+
+`GET /api/model/options` and `model.options` / `model.info` WS methods return the four Claude models switchroom supports. The `config.set` WS method accepts `{ key: "model", value: "<model>" }` and injects `/model <name>` into the agent session, wiring the model picker.
+
+### PR B — Cron panel (#2661)
+
+`GET /api/cron/jobs`, `GET /api/cron/jobs/:id`, `GET /api/cron/jobs/:id/runs` implement the Hermes cron panel backed by `handleGetSchedule`. Job IDs use `agent~index` (tilde separator) to avoid URL path ambiguity. Run history maps `DispatchResult` records with Unix-second timestamps. Write endpoints return 422 (switchroom manages schedules via YAML config, not the API).
+
+### PR C — Slash command palette + exec (#2662)
+
+`commands.catalog` returns four categories of switchroom extension commands (Session, Memory & knowledge, Vault & auth, Diagnostics) that populate the Hermes `/` autocomplete popover.
+
+`slash.exec` routes commands via two paths: REPL commands (`/memory`, `/status`, `/usage`, `/clear`, `/compact`, `/model`) go through `injectSlashCommand` (tmux send-keys) and return captured pane output; non-REPL gateway commands (`/vault`, `/auth`, `/doctor`, `/whoami`, `/logs`, `/version`, `/commands`) go through `injectInbound` as a synthesized turn. Blocked commands (`/effort`, `/login`, `/logout`, `/exit`, `/quit`) return a clear error. `/restart` and `/new` are excluded from the catalog — they require the grammy bot.command handler path.
+
 ## v0.16.21 — Hermes Desktop: profiles render crash fix + settings stubs
 
 Fixes a React render crash that occurred immediately on first paint after the remote backend connected. `GET /api/profiles` was returning `{}` instead of `{ profiles: [] }` (ProfilesResponse), causing `data.profiles.length` to throw `TypeError: Cannot read properties of undefined (reading 'length')`. (#2658)
