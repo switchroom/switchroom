@@ -158,8 +158,10 @@ export function renderWorkerActivity(v: WorkerActivityView, liveSuffix = ''): st
     return `🛠 **Worker** · _starting…_`
   }
   if (!finished && steps.length === 0) {
-    // Header-only running render → append the starting placeholder.
-    return `${card}\n_starting…_`
+    // Header-only running render → append the starting placeholder with a GFM
+    // hard break (`  \n`) so it stacks under the header instead of collapsing
+    // onto the header line in the rich-message renderer (matches stackCardLines).
+    return `${card}  \n_starting…_`
   }
   return card
 }

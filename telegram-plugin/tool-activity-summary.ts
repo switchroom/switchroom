@@ -177,7 +177,7 @@ import {
   STATUS_LINE_MAX,
   NESTED_PREFIX,
 } from './status-no-truncate.js'
-import { escapeMarkdown, stripMarkdown, truncate } from './card-format.js'
+import { escapeMarkdown, stripMarkdown, truncate, stackCardLines } from './card-format.js'
 import { isTelegramSurfaceTool } from './tool-names.js'
 
 /**
@@ -429,7 +429,10 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
   // out always carries the two header lines, so it is never empty — but guard
   // against a degenerate header-less future caller.
   if (out.length === 0) return null
-  const joined = out.join('\n')
+  // Stack lines with GFM hard breaks (`  \n`) so the card's styled prose lines
+  // don't collapse onto one visual line in the rich-message renderer — see
+  // stackCardLines. This is what makes a card render identically to a reply.
+  const joined = stackCardLines(out)
   if (joined.length <= STATUS_CARD_CHAR_BUDGET) return joined
   return fitCardToBudget(opts, headerLines)
 }
@@ -482,7 +485,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
     const lastIdx = shown.length - 1
     shown.forEach((esc, i) => lines.push(buildBullet(esc, i === lastIdx)))
     lines.push(...footerLines)
-    const candidate = lines.join('\n')
+    const candidate = stackCardLines(lines)
     if (candidate.length <= STATUS_CARD_CHAR_BUDGET) return candidate
   }
 
@@ -508,7 +511,7 @@ function fitCardToBudget(opts: StatusCardOpts, headerLines: string[]): string {
   if (parentMarker != null) lines.push(parentMarker)
   lines.push(newestLine)
   lines.push(...footerLines)
-  return lines.join('\n')
+  return stackCardLines(lines)
 }
 
 /**

@@ -36,6 +36,54 @@ import { escapeMarkdown } from './format.js'
 export { escapeMarkdown }
 
 /**
+ * Join a card's pre-rendered, single-line entries so they STACK in the
+ * Bot API 10.1 rich-message renderer (#2669) — the same visual result the
+ * main reply path gets after `normalizeParagraphBreaks`.
+ *
+ * Why this exists: the rich GFM renderer treats a LONE `\n` between two
+ * non-blank lines as a SOFT break and collapses them onto one visual line
+ * (this is the exact reason `normalizeParagraphBreaks` promotes prose `\n`
+ * to a hard break on the reply path). Status / worker / issues / boot
+ * cards build a list of styled prose lines (`_✓ step_`, `**→ step**`,
+ * header lines, a `─────` rule) and join them with `\n`. Sent verbatim via
+ * `richMessage`, those lines collapse into a run-on blob — the long-standing
+ * "progress-card bullets collapse into one line" bug.
+ *
+ * Each card line is a SINGLE styled line with no internal newline (steps are
+ * pre-clipped to one line, headers are emitted one-per-array-entry), so we
+ * can deterministically promote EVERY inter-line break to a GFM hard break
+ * (`  \n`, two trailing spaces) without risking a list/table/code corruption:
+ * card lines are never GFM block-structure lines (no leading `-`/`*`/`|`/```),
+ * they are inline-styled prose. A blank entry (intentional `\n\n` gap, if a
+ * caller ever inserts one) is preserved as a real paragraph break.
+ *
+ * This is the card-surface analogue of the reply path's
+ * `normalizeParagraphBreaks`: it guarantees a card authored as stacked
+ * bullet/step lines renders identically to a normal reply.
+ */
+export function stackCardLines(lines: string[]): string {
+  const pieces: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    pieces.push(line)
+    if (i === lines.length - 1) break
+    const cur = line.trim()
+    const next = lines[i + 1].trim()
+    // A blank current or next line is a genuine `\n\n` paragraph gap — leave
+    // the separator a plain newline so the blank entry reconstructs the gap.
+    if (cur === '' || next === '') {
+      pieces.push('\n')
+      continue
+    }
+    // Strip any trailing whitespace the line already carried so we emit
+    // exactly one `  \n` hard break (never accumulate spaces on a re-run).
+    pieces[pieces.length - 1] = line.replace(/[ \t\r]+$/, '')
+    pieces.push('  \n')
+  }
+  return pieces.join('')
+}
+
+/**
  * Render a millisecond duration as `<n>ms` for sub-second values, or
  * `MM:SS` thereafter. Output contains no markdown-special characters, so
  * callers can interpolate it into a markdown card without escaping.

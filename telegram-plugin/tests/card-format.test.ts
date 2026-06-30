@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   cleanWorkerResultParagraph,
   formatDuration,
+  stackCardLines,
   stripMarkdown,
   truncate,
 } from '../card-format.js'
@@ -94,5 +95,55 @@ describe('escapeMarkdown / truncate', () => {
   it('truncates with an ellipsis', () => {
     expect(truncate('abcdef', 4)).toBe('abc…')
     expect(truncate('abc', 4)).toBe('abc')
+  })
+})
+
+describe('stackCardLines — card bodies stack like the reply path', () => {
+  // The bug this fixes: the rich-message renderer (#2669) treats a LONE `\n`
+  // between two non-blank lines as a SOFT break and collapses them onto one
+  // visual line. A card built as a list of styled prose lines and joined with
+  // `\n` therefore renders as a run-on blob. stackCardLines promotes every
+  // inter-line break to a GFM hard break (`  \n`) so the lines stack — the
+  // same end-state the reply path reaches via normalizeParagraphBreaks.
+
+  it('promotes every inter-line break to a GFM hard break so bullets stack', () => {
+    const out = stackCardLines(['_✓ Reading a.ts_', '_✓ Searching memory_', '**→ List workspace**'])
+    expect(out).toBe('_✓ Reading a.ts_  \n_✓ Searching memory_  \n**→ List workspace**')
+    // No LONE `\n` survives between non-blank lines — every break is a hard break.
+    expect(out.replace(/ {2}\n/g, '')).not.toContain('\n')
+  })
+
+  it('single line is returned verbatim (no trailing hard break)', () => {
+    expect(stackCardLines(['**→ Reading a.ts**'])).toBe('**→ Reading a.ts**')
+  })
+
+  it('preserves an intentional blank-line paragraph gap', () => {
+    // A blank entry is a genuine `\n\n` gap (e.g. boot card header → rows);
+    // it must NOT become a hard-break run — the blank reconstructs the gap.
+    const out = stackCardLines(['🔔 **Header**', '', '_✓ row one_', '_✓ row two_'])
+    expect(out).toBe('🔔 **Header**\n\n_✓ row one_  \n_✓ row two_')
+  })
+
+  it('does not accumulate trailing spaces on a re-run (idempotent breaks)', () => {
+    const once = stackCardLines(['a.', 'b.', 'c.'])
+    // Feeding the stacked output back in (split on hard break) yields the same.
+    const twice = stackCardLines(once.split('  \n'))
+    expect(twice).toBe(once)
+  })
+
+  it('keeps bold, code-spans and the worker-result rule intact (only breaks change)', () => {
+    const out = stackCardLines([
+      '🛠 **Worker** · _build_',
+      '_✓ Running `git push`_',
+      '─────',
+      '✅ _Fixed the **bug** in `foo.ts`_',
+    ])
+    // Inline markup is untouched — bold, code spans, the rule line all survive.
+    expect(out).toContain('**Worker**')
+    expect(out).toContain('`git push`')
+    expect(out).toContain('Fixed the **bug** in `foo.ts`')
+    expect(out).toContain('─────')
+    // And the four lines stack (three hard breaks, no soft breaks).
+    expect(out.match(/ {2}\n/g)?.length).toBe(3)
   })
 })
