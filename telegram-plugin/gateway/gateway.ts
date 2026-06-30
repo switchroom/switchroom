@@ -141,6 +141,7 @@ import {
   runMicrosoftConnectPoll,
 } from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
+import { materializeVoiceKey } from '../../src/telegram/materialize-voice-key.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
 import { createFleetFallbackResumeGate } from '../fleet-fallback-resume.js'
 import { resolveExhaustUntil } from './exhaust-until.js'
@@ -952,12 +953,15 @@ type Access = {
   /** Voice-in transcription config (#578 spike). When `enabled` is
    *  true and provider is 'openai', inbound voice/audio messages are
    *  downloaded and transcribed via Whisper, then surface as the
-   *  user's inbound text. API key read from
-   *  ~/.switchroom/openai-api-key. Off by default. */
+   *  user's inbound text. The provider API key is a `vault:` reference
+   *  (`api_key`, default `vault:openai/api-key`) resolved through the
+   *  vault broker at use-time — never read from a plaintext file. Off by
+   *  default. */
   voice_in?: {
     enabled?: boolean
     provider?: 'openai'
     language?: string
+    api_key?: string
   }
   /** Telegraph long-reply publishing (#579). When enabled, replies
    *  above `threshold` chars publish to Telegraph and the agent's
@@ -22116,6 +22120,7 @@ bot.on('message:voice', async ctx => {
       voice.file_id,
       voice.mime_type,
       voiceIn.language,
+      voiceIn.api_key,
     )
     if (transcript != null) {
       const text = ctx.message.caption
@@ -22145,23 +22150,17 @@ async function maybeTranscribeVoice(
   fileId: string,
   mimeType: string | undefined,
   language: string | undefined,
+  apiKeyRef: string | undefined,
 ): Promise<string | null> {
-  // Read API key from the operator-managed file. Same pattern as
-  // webhook-secrets.json — simpler than vault integration for the
-  // spike. Future: resolve through vault once the abstraction
-  // matures.
-  let apiKey: string | null = null
-  try {
-    const path = require('path').join(require('os').homedir(), '.switchroom', 'openai-api-key')
-    if (existsSync(path)) {
-      apiKey = readFileSync(path, 'utf-8').trim()
-    }
-  } catch (err) {
-    process.stderr.write(`telegram gateway: voice-in: failed to read api key: ${(err as Error).message}\n`)
-    return null
-  }
+  // Resolve the STT key through the vault broker at use-time (PR-A:
+  // voice STT vault-unify). The configured `voice_in.api_key` is a
+  // `vault:<key>` reference (default `vault:openai/api-key`); the
+  // resolved value is held in memory only — never written to disk or
+  // surfaced into the agent prompt. On any failure we return null and
+  // the caller falls back to the legacy "(voice message)" envelope.
+  const apiKey = await materializeVoiceKey({ apiKeyRef })
   if (!apiKey) {
-    process.stderr.write(`telegram gateway: voice-in: enabled but no api key at ~/.switchroom/openai-api-key — falling back\n`)
+    // materializeVoiceKey already logged the specific reason.
     return null
   }
 

@@ -899,14 +899,26 @@ export const TelegramChannelSchema = z
         language: z.string().optional().describe(
           "Optional ISO-639-1 language hint (e.g. 'en', 'fr'). Skips Whisper's auto-detection.",
         ),
+        api_key: z.string().optional().describe(
+          "Transcription-provider API key, as a `vault:<key>` reference " +
+          "(e.g. 'vault:openai/api-key' — the default if omitted). The " +
+          "gateway resolves it through the vault broker at use-time and " +
+          "never writes the resolved value to disk or the agent prompt. " +
+          "`switchroom enable voice-in` vault-stores the key and writes " +
+          "this reference for you. A literal key is accepted but " +
+          "discouraged — keep secrets in the vault.",
+        ),
       })
       .optional()
       .describe(
         "Inbound voice-message transcription (#578). When enabled, voice/audio " +
         "messages from allowlisted users are downloaded, transcribed via the " +
         "configured provider, and surface to the agent as the user's text. " +
-        "API key read from ~/.switchroom/openai-api-key (mode 0600). Off by " +
-        "default — opt-in per agent. Cascades from defaults.channels.telegram.voice_in. " +
+        "The provider API key is a `vault:` reference (`api_key`, default " +
+        "`vault:openai/api-key`) resolved through the vault broker at " +
+        "use-time — opt-in third-party key, honest-exception per the " +
+        "subscription-honest outcome. Off by default — opt-in per agent. " +
+        "Cascades from defaults.channels.telegram.voice_in. " +
         "(Migrated from per-agent root in #596 — see consistency unification.)"
       ),
     telegraph: z
