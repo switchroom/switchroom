@@ -1,4 +1,4 @@
-import { renameSync, unlinkSync } from "fs";
+import { renameSync, unlinkSync, chmodSync } from "fs";
 import type {
   ClientToGateway,
   GatewayToClient,
@@ -786,6 +786,10 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     },
   });
 
+  // Allow the web container (uid=1000, operator) to inject prompts via
+  // injectInbound without needing root — the socket is inside the per-agent
+  // state directory which is already operator-accessible.
+  try { chmodSync(socketPath, 0o666); } catch { /* best-effort */ }
   log(`listening on ${socketPath}`);
 
   // ─── Heartbeat watchdog (issue #71) ─────────────────────────────────────
