@@ -25,7 +25,7 @@
  * chat exists in the DB.
  */
 
-import { chmodSync, mkdirSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { redact } from './secret-detect/redact.js'
 
@@ -121,6 +121,7 @@ const DEFAULT_LIMIT = 10
 const MAX_LIMIT = 50
 
 let db: SqliteDatabase | null = null
+let dbPath: string | null = null
 
 /**
  * Open (or create) the history DB and run migrations + retention sweep.
@@ -133,6 +134,7 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
   const Database = loadDatabaseClass()
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const path = join(stateDir, 'history.db')
+  dbPath = path
   db = new Database(path, { create: true })
   // WAL is friendlier for concurrent reads while a long transaction writes,
   // and survives crashes more cleanly than rollback journal.
@@ -171,12 +173,13 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     }
   }
 
-  // Lock the file to owner-only. Same pattern the plugin uses for .env at
-  // server.ts:52. No-op on Windows (would need ACLs).
-  try {
-    chmodSync(path, 0o600)
-  } catch {
-    /* ignore — chmod not supported, e.g. some FUSE mounts */
+  // Readable by owner and others so the web dashboard (different uid than the
+  // agent) can stream replies back to Hermes Desktop. The WAL sidecar files
+  // (-shm/-wal) are also chmod'd so SQLite readonly opens succeed for uid=1000.
+  // 0644 is safe: the per-agent state dir is already operator-accessible.
+  for (const suffix of ['', '-shm', '-wal']) {
+    const f = path + suffix
+    if (existsSync(f)) { try { chmodSync(f, 0o644) } catch { /* ignore */ } }
   }
 
   if (retentionDays > 0) {
@@ -213,6 +216,13 @@ export function checkpointWal(): boolean {
   if (db == null) return false
   try {
     db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').run()
+    // Re-apply permissions after WAL truncation (SQLite may recreate -wal/-shm)
+    if (dbPath) {
+      for (const suffix of ['-shm', '-wal']) {
+        const f = dbPath + suffix
+        if (existsSync(f)) { try { chmodSync(f, 0o644) } catch { /* ignore */ } }
+      }
+    }
     return true
   } catch {
     return false

@@ -28,13 +28,16 @@ afterEach(() => {
 })
 
 describe('initHistory', () => {
-  it('creates history.db with chmod 0600', () => {
+  it('creates history.db with chmod 0644', () => {
     initHistory(stateDir, 30)
     const dbPath = join(stateDir, 'history.db')
     expect(existsSync(dbPath)).toBe(true)
     const st = statSync(dbPath)
     // Mask off the file-type bits — only the perm bits matter.
-    expect(st.mode & 0o777).toBe(0o600)
+    // 0644: the web container (uid 1000) opens history.db read-only to
+    // stream replies back to Hermes Desktop. Content is redacted on write,
+    // so world-readable is safe (owner-approved behaviour change).
+    expect(st.mode & 0o777).toBe(0o644)
   })
 
   it('is idempotent — second call is a no-op', () => {
