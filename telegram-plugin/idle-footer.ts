@@ -58,8 +58,8 @@ export function formatIdleFooter(rows: ReadonlyArray<TurnRow>, now: number): str
   const latest = rows.reduce((best, row) => (row.startedAt > best.startedAt ? row : best));
 
   if (latest.endedAt == null) {
-    return `⚙️ working since ${formatAgo(latest.startedAt, now)}`;
+    return `⚙️ working since **${formatAgo(latest.startedAt, now)}**`;
   }
 
-  return `🟢 idle · last reply ${formatAgo(latest.endedAt, now)}`;
+  return `🟢 idle · last reply **${formatAgo(latest.endedAt, now)}**`;
 }

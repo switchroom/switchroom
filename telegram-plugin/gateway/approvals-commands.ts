@@ -13,6 +13,7 @@
  * add on top of the same client. Tracked in the migration TODO inline.
  */
 
+import { escapeMarkdown } from '../format.js';
 import type { Bot, Context } from "grammy";
 import { richMessage } from "../rich-send.js";
 import {
@@ -65,7 +66,7 @@ export function registerApprovalsCommands(
       const byAgent = new Map<string, number>();
       for (const d of decisions) byAgent.set(d.agent_unit, (byAgent.get(d.agent_unit) ?? 0) + 1);
       const summary = Array.from(byAgent.entries())
-        .map(([a, n]) => `• **${escapeHtml(a)}**: ${n}`)
+        .map(([a, n]) => `• **${escapeMarkdown(a)}**: ${n}`)
         .join("\n");
       const detail = decisions
         .slice(0, 20)
@@ -76,10 +77,10 @@ export function registerApprovalsCommands(
               : `until ${new Date(d.ttl_expires_at).toISOString().slice(0, 16).replace("T", " ")}`;
           return (
             `\`${d.id.slice(0, 8)}\` ` +
-            `${escapeHtml(d.agent_unit)} → ` +
+            `${escapeMarkdown(d.agent_unit)} → ` +
             `\`${d.scope}\` ` +
-            `(${escapeHtml(d.action)}, ${ttl}) ` +
-            `· /approvals revoke ${escapeHtml(d.id)}`
+            `(${escapeMarkdown(d.action)}, ${ttl}) ` +
+            `· /approvals revoke ${escapeMarkdown(d.id)}`
           );
         })
         .join("\n");
@@ -113,8 +114,4 @@ export function registerApprovalsCommands(
       `(\`add\` and \`stats\` are coming in a follow-up.)`,
     ));
   });
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }

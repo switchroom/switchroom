@@ -51,6 +51,7 @@ import {
   fmtPct,
 } from "./auth-snapshot-format.js";
 import type { QuotaUtilization } from "./quota-check.js";
+import { escapeMarkdown } from "./card-format.js";
 
 const STATE_FILE = "quota-watch.json";
 
@@ -511,7 +512,7 @@ function buildFleetRecoveredMessage(
   accounts: Array<{ label: string; exhausted: boolean }>,
 ): string {
   const healthy = accounts.filter((a) => !a.exhausted).map((a) => a.label);
-  const which = healthy.length > 0 ? ` (\`${escapeHtml(healthy[0]!)}\`)` : "";
+  const which = healthy.length > 0 ? ` (\`${escapeMarkdown(healthy[0]!)}\`)` : "";
   return [
     `🟢 **Fleet recovered** — at least one account is healthy again${which}.`,
     ``,
@@ -535,14 +536,14 @@ function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): strin
 
   const activeNote = snap.isActive
     ? ""
-    : `\nThis is a non-active account. Consider \`/auth use ${escapeHtml(snap.label)}\` to switch, or keep it as a fallback reserve.`;
+    : `\nThis is a non-active account. Consider \`/auth use ${escapeMarkdown(snap.label)}\` to switch, or keep it as a fallback reserve.`;
 
   const altNote = snap.isActive
     ? `\nConsider \`/auth use <other-account>\` if you have a healthier account, or wait for the ${winLabel} window to refill${resetStr}.`
     : "";
 
   return [
-    `🟡 **Quota approaching limit** — \`${escapeHtml(snap.label)}\``,
+    `🟡 **Quota approaching limit** — \`${escapeMarkdown(snap.label)}\``,
     ``,
     `${fiveStr} of 5h  ·  ${sevenStr} of 7d`,
     `Binding window: ${winLabel}${resetStr}`,
@@ -563,16 +564,12 @@ function buildRecoveryMessage(agentName: string, snap: AccountSnapshot): string 
     : "Current quota data unavailable.";
 
   return [
-    `🟢 **Quota back in healthy range** — \`${escapeHtml(snap.label)}\``,
+    `🟢 **Quota back in healthy range** — \`${escapeMarkdown(snap.label)}\``,
     ``,
     utilLine,
     ``,
     `_Below ${THROTTLING_THRESHOLD_PCT}% on both windows._`,
   ].join("\n");
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 // ─── State persistence ────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@
  *     param  = (for ttl) 1h | 24h | 7d
  */
 
+import { escapeMarkdown } from '../format.js';
 import { InlineKeyboard } from "grammy";
 
 export interface ApprovalCardOptions {
@@ -37,7 +38,7 @@ export interface BuiltApprovalCard {
  */
 export function buildApprovalCard(opts: ApprovalCardOptions): BuiltApprovalCard {
   const lines: string[] = [];
-  lines.push(`🔐 **${escapeHtml(opts.agent)}** wants approval`);
+  lines.push(`🔐 **${escapeMarkdown(opts.agent)}** wants approval`);
   // The scope rides in a `code span` — content there is LITERAL, so it must
   // NOT be markdown-escaped (escaping would leak visible backslashes, e.g.
   // `secret:OPENAI\_API\_KEY`). Only an embedded backtick could break out of
@@ -45,7 +46,7 @@ export function buildApprovalCard(opts: ApprovalCardOptions): BuiltApprovalCard 
   lines.push(`\`${codeSpanSafe(opts.scope_humanized)}\``);
   if (opts.why && opts.why.trim().length > 0) {
     lines.push("");
-    lines.push(escapeHtml(opts.why.trim()));
+    lines.push(escapeMarkdown(opts.why.trim()));
   }
   const text = lines.join("\n");
 
@@ -121,10 +122,6 @@ export function ttlMsFromToken(token: string): number | null {
   if (unit === "h") return n * 60 * 60 * 1000;
   if (unit === "d") return n * 24 * 60 * 60 * 1000;
   return null;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 /**

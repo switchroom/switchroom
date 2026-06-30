@@ -35,6 +35,7 @@
  */
 
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
+import { escapeMarkdown } from './card-format.js';
 import type { ListStateData } from '../src/auth/broker/client.js';
 import {
   renderFallbackAnnouncement,
@@ -54,14 +55,10 @@ import {
  */
 export function renderFallbackFailureNotice(triggerAgent: string, reason: string): string {
   return (
-    `⚠️ **Auto-failover could not run** (trigger: **${escFailureHtml(triggerAgent)}**)\n` +
-    `${escFailureHtml(reason)}\n\n` +
+    `⚠️ **Auto-failover could not run** (trigger: **${escapeMarkdown(triggerAgent)}**)\n` +
+    `${escapeMarkdown(reason)}\n\n` +
     `_Switch manually with \`/auth use <label>\`, or \`/auth\` for fleet status._`
   );
-}
-
-function escFailureHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1');
 }
 
 /**

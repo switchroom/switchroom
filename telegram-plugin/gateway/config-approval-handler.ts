@@ -2,6 +2,7 @@
 // card, resolves the verdict back to hostd over IPC, and flips the card to
 // a terminal state on finalize.
 
+import { escapeMarkdown } from '../format.js';
 import { randomBytes } from "node:crypto";
 import type { IpcClient } from "./ipc-server.js";
 import type {
@@ -180,10 +181,6 @@ const REASON_ELLIPSIS = "…";
  */
 export const DIFF_SENTINEL = "\n[… diff continues, see attached file]";
 
-function escapeMd(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
-}
-
 function clipReason(reason: string): string {
   if (reason.length <= REASON_MAX_CHARS) return reason;
   return reason.slice(0, REASON_MAX_CHARS - REASON_ELLIPSIS.length) +
@@ -214,7 +211,7 @@ export function buildConfigApprovalCardBody(args: {
   const render = (diff: string): string =>
     `🛠 **Config edit proposed**\n` +
     `Agent: \`${args.agentName}\`\n` +
-    `Reason: ${escapeMd(safeReason)}\n\n` +
+    `Reason: ${escapeMarkdown(safeReason)}\n\n` +
     "```\n" + diff + "\n```";
 
   return truncateRawToFit({
@@ -447,8 +444,8 @@ export function buildLiveNote(affectedAgents?: string[], fleetWide?: boolean): s
   }
   const agents = (affectedAgents ?? []).filter((a) => typeof a === "string" && a.length > 0);
   if (agents.length === 0) return "";
-  const list = agents.map(escapeMd).join(", ");
-  const cmds = agents.map((a) => `/restart ${escapeMd(a)}`).join(" · ");
+  const list = agents.map(escapeMarkdown).join(", ");
+  const cmds = agents.map((a) => `/restart ${escapeMarkdown(a)}`).join(" · ");
   return `\n\n🔄 Not live until restart — affects: **${list}**\n${cmds}`;
 }
 
@@ -476,8 +473,8 @@ export async function handleRequestConfigFinalize(
     msg.outcome === "applied" ? buildLiveNote(msg.affectedAgents, msg.fleetWide) : "";
   const body =
     msg.outcome === "applied"
-      ? `✅ **Applied**${msg.detail ? `\n${escapeMd(msg.detail)}` : ""}${liveNote}`
-      : `⚠️ **Reconcile failed; rolled back**${msg.detail ? `\n${escapeMd(msg.detail)}` : ""}`;
+      ? `✅ **Applied**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}${liveNote}`
+      : `⚠️ **Reconcile failed; rolled back**${msg.detail ? `\n${escapeMarkdown(msg.detail)}` : ""}`;
   try {
     // Finalize is terminal — strip the keyboard so the buttons are gone.
     await deps.editCard({

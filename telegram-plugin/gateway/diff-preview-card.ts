@@ -21,6 +21,7 @@
  * single-shot "do this edit now" intent.
  */
 
+import { escapeMarkdown } from '../format.js';
 import { InlineKeyboard } from "grammy";
 import type { DiffPreview } from "../../src/drive/diff-preview.js";
 
@@ -88,9 +89,9 @@ export function buildDiffPreviewCard(
   // The 📍 + line-count rows are surfaced verbatim — they're
   // wrapper-attested and the agent has no input into their content.
   const bodyLines: string[] = [];
-  bodyLines.push(`**${escapeHtml(preview.title)}**`);
+  bodyLines.push(`**${escapeMarkdown(preview.title)}**`);
   for (const line of preview.lines) {
-    bodyLines.push(escapeHtml(line.text));
+    bodyLines.push(escapeMarkdown(line.text));
   }
   const text = bodyLines.join("\n");
 
@@ -160,8 +161,4 @@ export function buildDiffPreviewCard(
   }
 
   return { text, reply_markup: kb };
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }

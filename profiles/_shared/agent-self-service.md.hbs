@@ -43,7 +43,9 @@ tools is to let you do the edit yourself.
     still shares your memory + tools but drops your accumulated conversation
     context). A **daily/weekly** cron defaults to a **full turn in your live
     session** (Tier 2: your model, your whole context). So routine frequent
-    checks are already cheap without you doing anything.
+    checks are already cheap without you doing anything. Cron-fresh sessions
+    render rich markdown too, so scheduled/digest/daily-memory output should
+    use **bold** section headers + `code` for identifiers, just like a live reply.
   - *`model: "sonnet"` / `context: "fresh"`* — force the cheap Tier-1 session
     even for a **daily/weekly** self-contained job (summarise a feed, format a
     digest) — overrides the cadence default. *`context: "agent"`* does the
@@ -53,7 +55,10 @@ tools is to let you do the edit yourself.
     ping — text fully determined, no thinking) — ask the **operator** for a
     **`kind: action`**: it runs **model-free, zero tokens** (no session at all),
     posting your fixed/templated text or firing a fixed request. The cheapest
-    tier there is.
+    tier there is. The action `text` is rendered as full GFM markdown
+    (**bold**, _italic_, `code`, ~~strikethrough~~, links) — so a literal `*`
+    or `_` in fixed text becomes formatting unless you set `parse_mode: text`,
+    which sends the string verbatim (the escape hatch).
   - *"Only act when X changes"* — don't poll with a frequent prompt cron (every
     fire is a wasted turn when nothing changed). Ask the **operator** for a
     **`kind: poll`** (model-free check, e.g. a webpage/API — only a *change*

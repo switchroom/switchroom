@@ -212,6 +212,29 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(out).toMatch(/bob@example\.com[\s\S]*back .* 7-day cap/);
   });
 
+  it('wraps the cap-line ETA in a `code` span while keeping the surrounding _italic_', () => {
+    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
+    const capLine = out.split('\n').find((l) => l.includes('quota exhausted'));
+    expect(capLine).toBeDefined();
+    // ETA backtick code-span: "(`in …`, 7-day cap)"
+    expect(capLine).toMatch(/\(`in .+?`, 7-day cap\)/);
+    // The whole sub-line stays italic-wrapped.
+    expect(capLine!.trim().startsWith('_quota exhausted')).toBe(true);
+    expect(capLine!.trim().endsWith('_')).toBe(true);
+  });
+
+  it('wraps both the 5h-refills and 7d-resets ETAs in `code` spans', () => {
+    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
+    const lines = out.split('\n');
+    const fiveLine = lines.find((l) => l.includes('5h refills') && l.includes('`in '));
+    const sevenLine = lines.find((l) => l.includes('7d resets') && l.includes('`in '));
+    expect(fiveLine).toBeDefined();
+    expect(sevenLine).toBeDefined();
+    // Each ETA value sits in a backtick code-span, inside the italic sub-line.
+    expect(fiveLine).toMatch(/5h refills .+ \(`in .+?`\)/);
+    expect(sevenLine).toMatch(/7d resets .+ \(`in .+?`\)/);
+  });
+
   it('puts the imminent window first on healthy/throttling rows', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
     // you: 5h reset is in 7m, 7d reset is in 2d. 5h should come first.
@@ -227,6 +250,9 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(fiveLine).toBeLessThan(sevenLine);
     expect(lines[fiveLine]).not.toContain('7d resets');
     expect(lines[sevenLine]).not.toContain('5h refills');
+    // The ETA value is wrapped in a `code` span so the countdown pops.
+    expect(lines[fiveLine]).toMatch(/\(`in .+?`\)/);
+    expect(lines[sevenLine]).toMatch(/\(`in .+?`\)/);
   });
 
   it('emits a recommendation footer that names a healthy alternative when active is throttling', () => {
@@ -369,6 +395,28 @@ describe('renderFallbackAnnouncement', () => {
       tz: 'UTC',
     });
     expect(out7).toContain('7-day limit on me@x');
+  });
+
+  // Boundary-escaping after the #2695 escaper de-dup: the announcement escapes
+  // dynamic labels + the trigger agent via the consolidated `escapeMarkdown`
+  // import (was a local `escapeHtml` copy). Metacharacter-laden values must come
+  // back backslash-escaped, proving the import swap preserved escaping here.
+  it('escapes metacharacter-laden labels and trigger agent in the swap announcement (#2695)', () => {
+    const out = renderFallbackAnnouncement({
+      oldLabel: 'old_a*x',
+      oldQuota: KEN_5H_BLOWN,
+      newLabel: 'new_b*y',
+      newQuota: YOU_HEALTHY,
+      triggerAgent: 'agent_z*q',
+      now: NOW,
+      tz: 'UTC',
+    });
+    expect(out).toContain('old\\_a\\*x');
+    expect(out).toContain('new\\_b\\*y');
+    expect(out).toContain('agent\\_z\\*q');
+    // And the raw (unescaped) forms must NOT leak through.
+    expect(out).not.toContain('old_a*x');
+    expect(out).not.toContain('agent_z*q');
   });
 
   it('names the triggering agent + recovery countdown for the old account', () => {

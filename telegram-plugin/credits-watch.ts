@@ -23,6 +23,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { escapeMarkdown } from "./card-format.js";
 
 const STATE_FILE = "credits-watch.json";
 
@@ -157,7 +158,7 @@ export function evaluateCreditState(args: {
   if (!currentIsFatal && prevIsFatal) {
     return {
       kind: "notify",
-      message: `✅ **${escapeHtml(agentName)}**: credits restored — agent should resume normal operation.`,
+      message: `✅ **${escapeMarkdown(agentName)}**: credits restored — agent should resume normal operation.`,
       newState: { lastNotifiedReason: null, lastNotifiedAt: now },
       transition: "exited",
     };
@@ -193,12 +194,12 @@ export function evaluateCreditState(args: {
 function buildEntryMessage(agentName: string, reason: string): string {
   const desc = humanizeReason(reason);
   return [
-    `⚠️ **${escapeHtml(agentName)}**: ${desc}`,
+    `⚠️ **${escapeMarkdown(agentName)}**: ${desc}`,
     ``,
     `Cron tasks and inbound replies will fail until this is resolved. Check`,
     `your subscription or pre-paid usage at [console.anthropic.com](https://console.anthropic.com).`,
     ``,
-    `_Source: Claude CLI cache (cachedExtraUsageDisabledReason=${escapeHtml(reason)})_`,
+    `_Source: Claude CLI cache (cachedExtraUsageDisabledReason=${escapeMarkdown(reason)})_`,
   ].join("\n");
 }
 
@@ -215,10 +216,6 @@ function humanizeReason(reason: string): string {
     default:
       return `usage disabled (${reason})`;
   }
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, "\\$1");
 }
 
 // ─── State persistence ───────────────────────────────────────────────────────

@@ -92,11 +92,18 @@ describe('formatQuotaBlock', () => {
       now,
     )
     expect(block).toContain('**Claude plan quota**')
-    expect(block).toContain('**5h window**  29% · resets in 2h 30m')
-    expect(block).toContain('**7d window**  33% · resets in 3d')
+    expect(block).toContain('**5h window**  `29%` · `resets in 2h 30m`')
+    expect(block).toContain('**7d window**  `33%` · `resets in 3d`')
     expect(block).toContain('Binding window: five hour')
     // overage=allowed should not be surfaced
     expect(block).not.toContain('Overage:')
+    // Both windows: the **bold label** stays bold AND the percentage +
+    // reset ETA are each wrapped in a `code` span. Locks the nit-fix that
+    // the value moved into backticks without dropping the label markup.
+    const fiveLine = block.split('\n').find((l) => l.includes('5h window'))!
+    const sevenLine = block.split('\n').find((l) => l.includes('7d window'))!
+    expect(fiveLine).toMatch(/^\*\*5h window\*\*\s+`\d+%` · `resets in .+?`$/)
+    expect(sevenLine).toMatch(/^\*\*7d window\*\*\s+`\d+%` · `resets in .+?`$/)
   })
 
   it('surfaces overage status when not allowed', () => {

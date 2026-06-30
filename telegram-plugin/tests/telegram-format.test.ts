@@ -65,6 +65,26 @@ describe('escapeMarkdown', () => {
     // `\*` in the input is backslash + star → both get escaped exactly once.
     expect(escapeMarkdown('\\*')).toBe('\\\\\\*')
   })
+
+  // The de-dup pass (#2695) replaced ~12 local escaper copies with this one
+  // canonical function. Every consolidated caller now depends on this exact
+  // contract: the FULL metacharacter set in a single string, each escaped.
+  test('escapes the full metacharacter set in one combined string', () => {
+    // Backslash placed last so it doesn't re-escape the chars after it.
+    expect(escapeMarkdown('`*_~=[]|\\')).toBe('\\`\\*\\_\\~\\=\\[\\]\\|\\\\')
+  })
+
+  test('already-safe text passes through unchanged', () => {
+    const safe = 'Switched fleet to alice (5h window 29% resets in 2h)'
+    expect(escapeMarkdown(safe)).toBe(safe)
+  })
+
+  // card-format.ts re-exports this same symbol; the consolidated callers
+  // import from one or the other. Lock that they are the identical function.
+  test('card-format re-exports the identical canonical escaper', async () => {
+    const cardFormat = await import('../card-format.js')
+    expect(cardFormat.escapeMarkdown).toBe(escapeMarkdown)
+  })
 })
 
 // ---------------------------------------------------------------------------

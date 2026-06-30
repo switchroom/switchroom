@@ -15,6 +15,7 @@
  * agent to `vault_request_access` for that key rather than failing opaquely.
  */
 
+import { escapeMarkdown } from '../format.js'
 import {
   getViaBrokerStructured,
   putViaBroker,
@@ -30,10 +31,6 @@ export type LinearAuthDeadReason = 'no_bundle' | 'revoked'
 /** Minimal GFM-markdown escape (#2669). Kept local so the message builder is
  *  self-contained + unit-testable without reaching into a gateway-only
  *  escaper (the bug that shipped the first cut of this alert). */
-function escapeMarkdownMin(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1')
-}
-
 /**
  * Build the operator-facing Telegram alert (GFM markdown) for an un-healable
  * Linear auth failure. Pure + self-escaping so it can be unit-tested directly.
@@ -42,7 +39,7 @@ function escapeMarkdownMin(s: string): string {
 export function buildLinearAuthDeadMessage(agent: string, reason: LinearAuthDeadReason): string {
   // Inside `code` spans the agent slug is literal (no escaping); in prose it
   // is markdown-escaped.
-  const aEsc = escapeMarkdownMin(agent)
+  const aEsc = escapeMarkdown(agent)
   const why =
     reason === 'no_bundle'
       ? `no refresh credentials are stored (\`linear/${agent}/oauth\` is missing), so its daily-expiring token can't renew`
