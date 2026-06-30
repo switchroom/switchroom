@@ -2637,6 +2637,40 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(cmd).toMatch(/plain punctuation/);
   });
 
+  it("turn-pacing directive carries the decision-first turn-end shape (#2707)", () => {
+    // #2707: turn-end replies render as wall-of-text on mobile. The fix
+    // rides the per-turn directive so it reaches EVERY agent fresh each
+    // turn: lead with the one decision, keep routine turn-ends short, one
+    // idea per message, progressive disclosure (offer detail, don't dump),
+    // reserve long structured replies for explicit go-deep asks.
+    const agentConfig = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "turnend-agent": agentConfig },
+    } as SwitchroomConfig;
+    const result = scaffoldAgent(
+      "turnend-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const cmd = (settings.hooks.UserPromptSubmit as Array<{
+      hooks: Array<{ command: string }>;
+    }>)
+      .flatMap((g) => g.hooks)
+      .find((h) => h.command.includes("turn-pacing"))!.command;
+    expect(cmd).toMatch(/TURN-END SHAPE/);
+    expect(cmd).toMatch(/LEAD WITH THE ONE DECISION OR ANSWER/);
+    expect(cmd).toMatch(/ONE IDEA PER MESSAGE/);
+    expect(cmd).toMatch(/want the detail/);
+    expect(cmd).toMatch(/EXPLICITLY asked to go deep/);
+  });
+
   it("unions defaults.hooks with per-agent hooks", () => {
     const agentConfig = makeAgentConfig({
       hooks: {
