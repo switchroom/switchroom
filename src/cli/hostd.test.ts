@@ -54,6 +54,9 @@ describe("renderHostdComposeFile", () => {
     );
     // docker.sock is a fixed host path; bind-mount is host-home-agnostic.
     expect(out).toContain("/var/run/docker.sock:/var/run/docker.sock:rw");
+    // machine-id must be mounted so resolveOperatorVaultPassphrase can
+    // decrypt the auto-unlock blob and provision LiteLLM keys during rollout.
+    expect(out).toContain("/etc/machine-id:/etc/machine-id:ro");
   });
 
   it("exports SWITCHROOM_HOST_HOME = the REAL host home (so in-container apply emits host bind sources, not /host-home)", () => {

@@ -292,24 +292,26 @@ export async function provisionLiteLLMKeys(
   // and bail rather than emitting N confusing per-agent denials.
   const passphrase = await resolveOperatorVaultPassphrase(ctx.home ?? homedir());
   if (passphrase === null) {
-    for (const { name } of optedIn) {
-      failures.push({
-        agent: name,
-        message:
-          `litellm: cannot write virtual key — no operator vault passphrase available ` +
-          `(set SWITCHROOM_VAULT_PASSPHRASE, or enable auto-unlock with ` +
-          `'switchroom vault broker enable-auto-unlock'). The broker refuses new keys ` +
-          `without operator attestation.`,
-      });
-    }
+    // Vault passphrase is unavailable (no SWITCHROOM_VAULT_PASSPHRASE env and
+    // machine-id auto-unlock blob is missing or undecryptable). This blocks
+    // writing NEW virtual keys, but agents that were already provisioned on a
+    // prior interactive apply still have their keys in the vault — a rollout
+    // doesn't need to re-provision them. Emit a warning and return without
+    // counting this as scaffold failures: making every rollout fail because the
+    // hostd container couldn't derive the auto-unlock key defeats the purpose
+    // of autonomous fleet updates. First-time provisioning requires an
+    // interactive `switchroom apply` with vault access (operator console or
+    // SWITCHROOM_VAULT_PASSPHRASE env). Note: adding /etc/machine-id:ro to the
+    // hostd compose fixes the root cause on this host (PR #NNNN).
     const targets = [
       ...optedIn.map(({ name }) => name),
       ...(needsHindsight ? ["hindsight (service)"] : []),
     ];
     ctx.writeErr(
-      chalk.red(
-        `  x litellm: no operator vault passphrase — skipping provisioning for ` +
-        `${targets.join(", ")}. They will NOT get routing env until a key exists.\n`,
+      chalk.yellow(
+        `  ⚠ litellm: vault passphrase unavailable — skipping new-key provisioning for ` +
+        `${targets.join(", ")}. Already-provisioned keys are unaffected; ` +
+        `run \`switchroom apply\` interactively to provision new agents.\n`,
       ),
     );
     return;
