@@ -838,11 +838,18 @@ export class Driver {
 }
 
 function toObserved(msg: Message, edited: boolean): ObservedMessage {
+  // Bot API 10.1 sendRichMessage stores text in a new MTProto media type.
+  // mtcute 0.27.9 decodes this as messageMediaUnsupported with empty
+  // message.message. Use a sentinel so text-based assertions still fire
+  // until mtcute is updated to support the new TL constructor.
+  const rawText = msg.text ?? "";
+  const isRichMedia = rawText === "" &&
+    msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
   return {
     chatId: msg.chat.id,
     messageId: msg.id,
     threadId: msg.replyToMessage?.threadId ?? undefined,
-    text: msg.text ?? "",
+    text: isRichMedia ? "\x01" : rawText,
     senderUserId: msg.sender.id,
     fromBot: msg.sender.type === "user" && msg.sender.isBot === true,
     date: msg.date,
