@@ -752,7 +752,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     }
 
     case "session.status": {
-      const sessionId = String(params.session_id ?? "");
+      const sessionId = String(params.session_id ?? ctx.activeSessionId ?? "");
       if (!isKnownSession(config, sessionId)) {
         sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
         break;
