@@ -48,12 +48,21 @@ need none of them.
 - Bulleted list — 3+ parallel items the reader will scan or compare. Never for a single
   thought or a flowing narrative.
 - Numbered list — ordered steps or ranked items.
-- Tables — 2-D data only (rows × columns): per-account usage, status fields. Overkill
-  for a flat list.
-- Headings — only in a long, multi-section answer. Clutter on a short reply.
+- Task lists (`- [x]` / `- [ ]`) — progress on a checklist of steps the reader is
+  tracking. Renders as real checkboxes; reserve for genuine done/not-done state.
+- Tables — 2-D data only (rows × columns): per-account usage, status fields. Render as
+  real tables (up to 20 columns). Overkill for a flat list.
+- Headings (`#`) — only in a long, multi-section answer. Clutter on a short reply.
 - Blockquotes (`>`) — quoted text or indented continuation. Telegram drops leading
   spaces, so use `>`, never literal indentation.
+- `==highlight==` — a single word or value the reader's eye must land on. Stronger
+  than bold; use at most once per message.
 - Dividers (`---`) — between genuinely separate sections. Heavy; use sparingly.
+
+Tables, headings, dividers, task lists, lists, blockquotes and `==highlight==` all
+render as rich blocks (Bot API 10.1) — reach for whichever cuts the reader's scanning
+effort. The ONE exception: sub/superscript (`H~2~O`, `x^2^`) falls back to literal
+text, so don't use it.
 
 ### The why
 Structure exists for the reader, not the writer. A two-item bullet list is worse than a
@@ -85,8 +94,8 @@ Bot API 10.1 rich messages.
 | Spoiler | `\|\|text\|\|` | Hidden until tapped — surprises, long-answer punchlines. |
 | Highlight / marked | `==text==` | The `=` is an `escapeMarkdown` special, so dynamic text won't trigger it by accident. |
 | Inline code | `` `text` `` | Identifiers, tap-to-copy. Content is literal — no escaping inside. |
-| Subscript | `~text~` (single tilde) | Math/chemistry. Distinct from `~~strike~~` (double). |
-| Superscript | `^text^` | Footnote markers, exponents. |
+| Subscript | `~text~` (single tilde) | **Falls back to literal text** in rich messages (Bot API 10.1) — the only GFM construct that doesn't render. Avoid. |
+| Superscript | `^text^` | **Falls back to literal text** in rich messages — avoid (use words, e.g. "squared"). |
 | Custom emoji | Telegram premium custom-emoji entity | Premium-only; renders as a normal emoji for non-premium viewers. Don't rely on it conveying meaning. |
 | Inline math | `$ … $` | LaTeX-style inline math (Bot API 10.1). |
 | Link | `[label](https://…)` | Standard GFM link. |
@@ -117,9 +126,10 @@ Bot API 10.1 rich messages.
   separate sections. Use sparingly.
 - **Footnotes** — GFM `[^1]` reference + `[^1]: …` definition.
 
-> Reach for the exotic spans (spoiler, sub/superscript, highlight, math, custom emoji)
-> only when they genuinely serve the reader. The floor card's "why" applies: structure
-> for the reader, not the writer.
+> Reach for the exotic spans (spoiler, highlight, math, custom emoji) only when they
+> genuinely serve the reader. The floor card's "why" applies: structure for the reader,
+> not the writer. Note sub/superscript is the one exception — it does NOT render (falls
+> back to literal text), so don't use it.
 
 ### Escaping rules
 

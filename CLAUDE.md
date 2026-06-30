@@ -325,8 +325,15 @@ telegram-plugin/        The enhanced MCP Telegram plugin (own Bun tests)
   card-format.ts        Shared status-card formatters (progress card
                         rendered via stream-reply-handler.ts + subagent-watcher.ts)
   tool-labels.ts        Tool-use label formatting
-  auth-slot-parser.ts   /auth router (add/use/list/rm)
+  rich-send.ts          Rich-message send/edit helpers (Bot API 10.1) —
+                        `richMessage(md)` → `{ markdown }`, the ONE render
+                        path through `sendRichMessage`/`editMessageText`
+  format.ts             GFM markdown normalizer + `escapeMarkdown`
   auto-fallback.ts      Quota-exhaustion auto-fallback
+  gateway/              Gateway core. `/auth` chat-command routing lives in
+                        gateway/auth-command.ts (parse + handle); the old
+                        auth-slot-parser.ts / auth-dashboard.ts were deleted
+                        (RFC H §7.3)
   tests/                Bun tests
 
 docker/                 Dockerfiles (base, agent, broker, kernel). Built via
@@ -366,7 +373,12 @@ The generated compose file lives at
 bun install              # install deps (project uses bun.lock)
 bun run dev -- <args>    # run the CLI directly from src/ via bin/switchroom.ts
 npm run build            # compile src/ + telegram-plugin/ → dist/
-npm run lint             # tsc --noEmit (type-check only, no emit)
+npm run lint             # tsc --noEmit + 8 structural guard scripts:
+                         #   plugin-references, bot-api-wrapping,
+                         #   bun-test-imports, no-pii-secrets,
+                         #   vault-test-hermeticity, no-broadcast-delivery,
+                         #   stale-tool-descriptions, web-subscription-honest
+                         # (see scripts/check-*.{mjs,sh})
 npm test                 # vitest (src/) + bun test (telegram-plugin/)
 npm run test:vitest      # src/ only
 npm run test:bun         # telegram-plugin/ only
@@ -375,6 +387,21 @@ npm run test:watch       # vitest --watch
 
 The build output (`dist/`) is what `switchroom` resolves when installed
 globally. During local work on src/, prefer `bun run dev` over rebuilding.
+
+## Telegram formatting capability — source of truth
+
+The **Telegram Bot API changelog** is the authority on what renders, not
+our recollection: <https://core.telegram.org/bots/api-changelog>. As of
+**rich messages (Bot API 10.1, June 2026)** every outbound message goes
+through `sendRichMessage` with raw GFM-style Markdown — so **tables,
+headings (`#`), thematic rules (`---`), task lists (`- [x]`), `==highlight==`,
+blockquotes, and ordered/unordered lists all render**. Documented limits:
+**32768 chars, 500 blocks, 16 nesting levels, 20 columns per table**. The
+ONE GFM construct that still falls back to literal text is **sub/superscript**
+(`H~2~O`, `x^2^`) — avoid it. The agent-facing steer is the floor card in
+`src/agents/scaffold.ts` (`TELEGRAM_FORMATTING_FLOOR_CARD`), mirrored in
+`reference/telegram-formatting-guide.md`. When the changelog moves, update
+both.
 
 ## CI
 
@@ -1049,7 +1076,9 @@ invariants, job specs — see "Design contract" above.)
   NOT source the header from `subagent-watcher.ts`. E2E gate:
   `telegram-plugin/uat/scenarios/jtbd-worker-activity-feed-dm.test.ts`.
 - **Auth** → `src/auth/accounts.ts` (slots) + `src/auth/manager.ts`
-  (OAuth). Telegram `/auth` routing: `telegram-plugin/auth-slot-parser.ts`.
+  (OAuth). Telegram `/auth` routing: `telegram-plugin/gateway/auth-command.ts`
+  (`parseAuthCommand` + `handleAuthCommand`; the old `auth-slot-parser.ts`
+  was deleted in RFC H §7.3).
 - **Runtime inspection** → `switchroom debug turn <agent>` (prompt
   layering) and `switchroom workspace render <agent>` (bootstrap block).
 - **Compose generation** → `src/agents/compose.ts:generateCompose()`,

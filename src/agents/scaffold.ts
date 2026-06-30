@@ -382,12 +382,21 @@ need none of them.
 - Bulleted list — 3+ parallel items the reader will scan or compare. Never for a single
   thought or a flowing narrative.
 - Numbered list — ordered steps or ranked items.
-- Tables — 2-D data only (rows × columns): per-account usage, status fields. Overkill
-  for a flat list.
-- Headings — only in a long, multi-section answer. Clutter on a short reply.
+- Task lists (\`- [x]\` / \`- [ ]\`) — progress on a checklist of steps the reader is
+  tracking. Renders as real checkboxes; reserve for genuine done/not-done state.
+- Tables — 2-D data only (rows × columns): per-account usage, status fields. Render as
+  real tables (up to 20 columns). Overkill for a flat list.
+- Headings (\`#\`) — only in a long, multi-section answer. Clutter on a short reply.
 - Blockquotes (\`>\`) — quoted text or indented continuation. Telegram drops leading
   spaces, so use \`>\`, never literal indentation.
+- \`==highlight==\` — a single word or value the reader's eye must land on. Stronger
+  than bold; use at most once per message.
 - Dividers (\`---\`) — between genuinely separate sections. Heavy; use sparingly.
+
+Tables, headings, dividers, task lists, lists, blockquotes and \`==highlight==\` all
+render as rich blocks (Bot API 10.1) — reach for whichever cuts the reader's scanning
+effort. The ONE exception: sub/superscript (\`H~2~O\`, \`x^2^\`) falls back to literal
+text, so don't use it.
 
 ### The why
 Structure exists for the reader, not the writer. A two-item bullet list is worse than a

@@ -288,8 +288,10 @@ export function normalizeParagraphBreaks(text: string): string {
   // Step 3: guarantee a blank line (`\n\n`) at BLOCK BOUNDARIES. The
   // prose-promotion above keeps lists/tables tight by leaving their single
   // `\n` separators alone — but GFM's rich renderer needs a blank line to
-  // START a new block, so a block that is glued to the previous line by a
-  // single `\n` fails to render (a table prints as literal pipe text, prose
+  // START a new block. A properly block-separated table DOES render as a
+  // real table (Bot API 10.1 rich messages); the failure mode this pass
+  // fixes is the *glued* case — a block joined to the previous line by a
+  // single `\n` (an un-separated table degrades to literal pipe text, prose
   // after a list is absorbed as a lazy list continuation). This pass inserts
   // the missing blank line at those transitions only, on the same masked text,
   // never touching code interiors, never collapsing/expanding existing `\n\n`,
