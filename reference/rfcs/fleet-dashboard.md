@@ -1,6 +1,7 @@
 ---
-artefact: Fleet dashboard — Hermes-Desktop adapter for the operator console
-serves: jobs/see-my-whole-fleet-from-one-screen.md
+artifact: Fleet dashboard — Hermes-Desktop adapter for the operator console
+serves: see-my-whole-fleet-from-one-screen
+advances-outcome: hold-the-leash
 status: rfc — draft. Pivoted from "build our own SPA" to "expose the
   Hermes-Desktop contract from a Switchroom adapter and run the unmodified
   desktop in remote mode." Carries the alignment review of the original
@@ -19,8 +20,8 @@ The operator wants a Hermes-class management surface. Rather than build our
 own SPA, **Switchroom exposes the Hermes-Desktop integration contract** and
 the operator runs the **unmodified, MIT-licensed Hermes Desktop** (NousResearch
 `hermes-agent/apps/desktop`) in its **remote-gateway mode**, pointed at a
-Switchroom adapter. The adapter speaks the desktop's two transports — REST
-`/api/*` and **JSON-RPC-2.0-over-WebSocket** `/api/ws` — backed by
+Switchroom adapter. The adapter speaks the desktop's two transports (REST
+`/api/*` and **JSON-RPC-2.0-over-WebSocket** `/api/ws`) backed by
 Switchroom's own artifacts and IPC.
 
 The connection is **observe + operator-chat, approvals stay on Telegram**:
@@ -30,19 +31,19 @@ The connection is **observe + operator-chat, approvals stay on Telegram**:
 - **Operator chat.** Implement `prompt.submit` by routing the operator's turn
   through Switchroom's existing **synthesized-inbound path** (`inject_inbound`
   / cron pattern). The operator's turn **and the agent's reply mirror into
-  that agent's Telegram thread** — one canonical record.
+  that agent's Telegram thread**, one canonical record.
 - **Approvals stay on Telegram.** We simply **do not implement** the approval
   methods/events; per the desktop's graceful-degradation behaviour that panel
   just stays empty. The Telegram tap remains the sole approval surface.
 
 **`telegram-only` is not crossed.** That invariant governs the *principal's*
-channel — it bars a second chat channel for the people the team serves
+channel. It bars a second chat channel for the people the team serves
 (WhatsApp, Signal, Slack). The dashboard is an **admin component** of
 switchroom, not a principal channel, so it is out of that invariant's scope.
 This change clarifies that scope in `invariants.md` and pins the conditions
 that keep the admin console from quietly becoming a second channel (operator
 audience, mirrored to the one Telegram thread, approvals on Telegram). No
-desktop fork is maintained — we track upstream by implementing its contract.
+desktop fork is maintained. We track upstream by implementing its contract.
 
 ## Decisions (owner-ratified)
 
@@ -76,7 +77,7 @@ renderer and supports a documented **remote-gateway** mode
 
 Canonical data types live in `apps/desktop/src/types/hermes.ts`. Auth is
 **token mode** by default (`X-Hermes-Session-Token` header on REST, `?token=`
-on WS) — which maps cleanly onto Switchroom's existing `switchroom-web` token
+on WS), which maps cleanly onto Switchroom's existing `switchroom-web` token
 + Tailscale setup. Per the research, **features we don't implement degrade
 that panel only; they don't block chat.**
 
@@ -99,12 +100,12 @@ that panel only; they don't block chat.**
 **NOT implemented (panels degrade empty, by design):**
 `approval.request` / `approval.respond`, `sudo.*`, `secret.*` (approvals stay
 Telegram); plus `pet.*`, `billing.*`, `moa.*`, `voice.*`, computer-use,
-messaging-platforms (Hermes's own chat gateway — irrelevant to us).
+messaging-platforms (Hermes's own chat gateway, irrelevant to us).
 
 **REST subset to implement:** `/api/sessions*`, `/api/status`,
 `/api/logs`, `/api/analytics/usage`, `/api/config` (read; secrets redacted).
 Model/provider/env endpoints return Switchroom's claude-native truth
-(single provider, OAuth-slot health as metadata) — never a token.
+(single provider, OAuth-slot health as metadata). Never a token.
 
 ### The mirror (the load-bearing bit)
 
@@ -193,7 +194,7 @@ embedded-terminal path; Hermes's own messaging-platform gateway; deprecating
   emitted event frames match the `{type,session_id,payload}` shape.
 - **Mirror test:** an operator `prompt.submit` produces a real turn in the
   target agent's Telegram thread (the turn and reply are observable there),
-  not just on the WS — the load-bearing admin-console condition.
+  not just on the WS. This is the load-bearing admin-console condition.
 - **No-approval test:** the adapter exposes no approve/deny method; an
   `approval.respond` call is rejected/absent.
 - Secret-redaction: no REST/WS payload ever carries token-shaped material.
@@ -201,10 +202,10 @@ embedded-terminal path; Hermes's own messaging-platform gateway; deprecating
 ## Deployment
 
 The adapter ships in the `switchroom-web` service (its own compose project,
-pinned GHCR image — `project_web_dashboard_local_hotfix_deploy`), reached via
+pinned GHCR image `project_web_dashboard_local_hotfix_deploy`), reached via
 `tailscale serve` → `127.0.0.1:8080`. The operator points Hermes Desktop's
 remote-gateway config at that URL with the service token. Keep the service
-rendered from config so it survives `switchroom apply` — never hand-edited
+rendered from config so it survives `switchroom apply`, never hand-edited
 into the generated compose file.
 
 ## Open questions

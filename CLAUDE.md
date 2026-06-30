@@ -325,15 +325,8 @@ telegram-plugin/        The enhanced MCP Telegram plugin (own Bun tests)
   card-format.ts        Shared status-card formatters (progress card
                         rendered via stream-reply-handler.ts + subagent-watcher.ts)
   tool-labels.ts        Tool-use label formatting
-  rich-send.ts          Rich-message send/edit helpers (Bot API 10.1) —
-                        `richMessage(md)` → `{ markdown }`, the ONE render
-                        path through `sendRichMessage`/`editMessageText`
-  format.ts             GFM markdown normalizer + `escapeMarkdown`
+  auth-slot-parser.ts   /auth router (add/use/list/rm)
   auto-fallback.ts      Quota-exhaustion auto-fallback
-  gateway/              Gateway core. `/auth` chat-command routing lives in
-                        gateway/auth-command.ts (parse + handle); the old
-                        auth-slot-parser.ts / auth-dashboard.ts were deleted
-                        (RFC H §7.3)
   tests/                Bun tests
 
 docker/                 Dockerfiles (base, agent, broker, kernel). Built via
@@ -373,12 +366,7 @@ The generated compose file lives at
 bun install              # install deps (project uses bun.lock)
 bun run dev -- <args>    # run the CLI directly from src/ via bin/switchroom.ts
 npm run build            # compile src/ + telegram-plugin/ → dist/
-npm run lint             # tsc --noEmit + 8 structural guard scripts:
-                         #   plugin-references, bot-api-wrapping,
-                         #   bun-test-imports, no-pii-secrets,
-                         #   vault-test-hermeticity, no-broadcast-delivery,
-                         #   stale-tool-descriptions, web-subscription-honest
-                         # (see scripts/check-*.{mjs,sh})
+npm run lint             # tsc --noEmit (type-check only, no emit)
 npm test                 # vitest (src/) + bun test (telegram-plugin/)
 npm run test:vitest      # src/ only
 npm run test:bun         # telegram-plugin/ only
@@ -387,21 +375,6 @@ npm run test:watch       # vitest --watch
 
 The build output (`dist/`) is what `switchroom` resolves when installed
 globally. During local work on src/, prefer `bun run dev` over rebuilding.
-
-## Telegram formatting capability — source of truth
-
-The **Telegram Bot API changelog** is the authority on what renders, not
-our recollection: <https://core.telegram.org/bots/api-changelog>. As of
-**rich messages (Bot API 10.1, June 2026)** every outbound message goes
-through `sendRichMessage` with raw GFM-style Markdown — so **tables,
-headings (`#`), thematic rules (`---`), task lists (`- [x]`), `==highlight==`,
-blockquotes, and ordered/unordered lists all render**. Documented limits:
-**32768 chars, 500 blocks, 16 nesting levels, 20 columns per table**. The
-ONE GFM construct that still falls back to literal text is **sub/superscript**
-(`H~2~O`, `x^2^`) — avoid it. The agent-facing steer is the floor card in
-`src/agents/scaffold.ts` (`TELEGRAM_FORMATTING_FLOOR_CARD`), mirrored in
-`reference/telegram-formatting-guide.md`. When the changelog moves, update
-both.
 
 ## CI
 
@@ -503,6 +476,27 @@ misbehaves, the recovery lever is still `workflow_dispatch` re-trigger
   tests), not human dev hours. "12 dev hours" is the wrong unit;
   "~25 agent minutes" is the right one. Reserve human-time estimates
   only for work that explicitly needs the user's review or input.
+
+## Doc & surface voice
+
+How switchroom talks — in docs, CLI output, errors, status surfaces, the
+setup wizard. This is the house voice; match it.
+
+- **Plain, direct, opinionated.** Reads like one person built it,
+  because one did.
+- **Lead with what the team feels like, not the machinery.** Open on the
+  experience of having the standing team; the plumbing comes after.
+- **Operator and trust details stay honest and present.** Never buried,
+  never dressed up. Say the real cost, the real boundary, the real
+  approval step.
+- **No filler. No hype. No em dashes.** Use a period, colon, comma, or
+  parens instead. (Structural long-dashes in headings, slugs, table
+  cells, and frontmatter status lines are fine.)
+- **Name what it deliberately doesn't do.** No API key, no harness, no
+  heartbeat, no second channel. The restraint is the point.
+- **Carries into every surface.** CLI output, errors, the status the
+  principal sees, the setup wizard — same voice everywhere, not just the
+  docs.
 
 ## Secrets on the dev host — `.env` + the auto-unlocked vault
 
@@ -771,19 +765,11 @@ section.)
 `feedback_npm_publish_landmines`: past releases shipped without
 `dist/cli/switchroom.js`).
 
-The committed `package.json` version is a stale placeholder (see step 2).
-`npm pack` names the tarball from that stale version, so you get
-`switchroom-0.16.21.tgz` even on a v0.16.22 release. **Bump `package.json`
-temporarily before packing — do NOT commit the bump:**
-
 ```
 node scripts/build.mjs                          # rebuild — reset --hard wipes dist
-node -e "const p=require('./package.json'); p.version='X.Y.Z'; \
-  require('fs').writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n')"
-npm pack                                        # now produces switchroom-X.Y.Z.tgz
+npm pack                                        # produces switchroom-X.Y.Z.tgz
 tar tzf switchroom-X.Y.Z.tgz | grep -E "dist/cli/switchroom.js|vendor/hindsight" | head -5
 npm publish --ignore-scripts switchroom-X.Y.Z.tgz
-# Leave package.json bumped in the worktree (it's throwaway); don't commit it
 ```
 
 `--ignore-scripts` skips `prepublishOnly` so the verified tarball is
@@ -800,26 +786,6 @@ switchroom --version    # confirm X.Y.Z
 --workflow=docker-images --limit 2`, ~5 min). All 5 images (agent,
 broker, auth-broker, kernel, hindsight) must be pull-able under the
 new tag.
-
-**8a. Update the web container** — `switchroom update` and per-agent
-`agent restart` only touch agent/broker/kernel images. The
-`switchroom-web` container is a **separate compose project**
-(`~/.switchroom/web/docker-compose.yml`) and must be updated manually:
-
-```
-docker pull ghcr.io/switchroom/switchroom-web:vX.Y.Z
-sed -i 's|switchroom-web:vOLD|switchroom-web:vX.Y.Z|g' ~/.switchroom/web/docker-compose.yml
-docker compose -p switchroom-web -f ~/.switchroom/web/docker-compose.yml up -d
-docker exec switchroom-web switchroom --version   # confirm X.Y.Z
-```
-
-The auth token for the web API lives at `~/.switchroom/web-token` (plain
-text, auto-generated on first start). Use it to smoke-test endpoints:
-
-```
-TOKEN=$(cat ~/.switchroom/web-token)
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/sessions | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['sessions']), 'sessions')"
-```
 
 **9. Canary on test-harness BEFORE fleet rollout** — mandatory gate.
 See **Pre-rollout UAT** below.
@@ -1076,9 +1042,7 @@ invariants, job specs — see "Design contract" above.)
   NOT source the header from `subagent-watcher.ts`. E2E gate:
   `telegram-plugin/uat/scenarios/jtbd-worker-activity-feed-dm.test.ts`.
 - **Auth** → `src/auth/accounts.ts` (slots) + `src/auth/manager.ts`
-  (OAuth). Telegram `/auth` routing: `telegram-plugin/gateway/auth-command.ts`
-  (`parseAuthCommand` + `handleAuthCommand`; the old `auth-slot-parser.ts`
-  was deleted in RFC H §7.3).
+  (OAuth). Telegram `/auth` routing: `telegram-plugin/auth-slot-parser.ts`.
 - **Runtime inspection** → `switchroom debug turn <agent>` (prompt
   layering) and `switchroom workspace render <agent>` (bootstrap block).
 - **Compose generation** → `src/agents/compose.ts:generateCompose()`,

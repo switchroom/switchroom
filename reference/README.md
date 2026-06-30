@@ -15,9 +15,9 @@ reference/
                                                   details the no-self-escalation invariant)
 ```
 
-The **root holds only the anchors and the product spec** — the top tier.
+The **root holds only the anchors and the product spec**, the top tier.
 **Durable** docs (anchors, product-spec, jobs) state *what the product must be
-and do*; they outlive any implementation. The **`rfcs/`** layer carries *how* —
+and do*; they outlive any implementation. The **`rfcs/`** layer carries *how*:
 ship-coupled proposals (with a `status:`) and standing design records (e.g.
 `access-model.md`, which details the `no-self-escalation` invariant). The split
 is by folder + frontmatter, not by two separate trees.
@@ -34,21 +34,21 @@ is by folder + frontmatter, not by two separate trees.
 | RFCs ([`rfcs/`](rfcs/), `status:` / `artefact:` frontmatter) | *How do we build/ship this change?* — ship-coupled proposals + design records |
 | [`../messaging/copy-kit.md`](../messaging/copy-kit.md) | *How do we say it?* — ready-to-lift public copy (tagline, pillars, boilerplate), each block traced to a product-spec outcome |
 
-The first three are the **anchors**; `product-spec.md` is the product layer
-*beneath* them (it owns the job list); the job specs sit beneath that. The
-RFCs are the ship-coupled delivery layer — each references the job it serves;
-they are **not** a durable contract tier of their own.
+The first three are the **anchors**. `product-spec.md` is the product layer
+*beneath* them (it owns the job list), and the job specs sit beneath that. The
+RFCs are the ship-coupled delivery layer, each referencing the job it serves.
+They are **not** a durable contract tier of their own.
 
 The **verdict rule** (also in `CLAUDE.md` → "Design contract"): a change ships
 only when it (a) advances one of the four outcomes, (b) satisfies its job
-spec — proven by its outcome UAT, (c) passes all three principle checks, and
+spec (proven by its outcome UAT), (c) passes all three principle checks, and
 (d) crosses no invariant.
 
 ## The job index lives in the product spec
 
 [`product-spec.md`](product-spec.md) owns the list of jobs, grouped by the
 outcome each `serves:`. That is the single source of truth for "which jobs
-does switchroom serve" — this README does not duplicate it.
+does switchroom serve". This README does not duplicate it.
 
 ## Use this directory cheaply
 
@@ -64,7 +64,7 @@ head -7 reference/jobs/*.md | grep -E '^(==>|job:|outcome:|stakes:|serves:)'
 Read a job spec in full only when your change touches it. The body is short
 by design: **Good / bad** (the dual-audience decision aid, read by humans
 *and* agents), **Prove it** (UAT wired to real scenarios + a fuzz corpus),
-and **Verdict**. The *how* is not here — it's in the RFC the job points to.
+and **Verdict**. The *how* is not here: it's in the RFC the job points to.
 
 ## Doc-class rule
 
@@ -76,13 +76,13 @@ Decide what a doc is from its frontmatter key alone:
   rewritten.
 - `status:` / `artefact:` / `serves:` / `backs:` (no `job:`) ⇒ an **RFC or
   design record** (in `rfcs/`) that carries the implementation/how. It points
-  *up* — `serves:` at the job it delivers (e.g. [`conversational-pacing.md`](rfcs/conversational-pacing.md)
+  *up*: `serves:` at the job it delivers (e.g. [`conversational-pacing.md`](rfcs/conversational-pacing.md)
   serves `know-what-my-agent-is-doing.md`), or `backs:` the invariant it
   details (e.g. [`access-model.md`](rfcs/access-model.md) backs
   `no-self-escalation`). An RFC carries a status lifecycle (Draft → Approved →
   Shipped/Archived); a design record is kept current rather than archived.
 
-There is no other class. `job:` **always** means a job spec — nothing else
+There is no other class. `job:` **always** means a job spec, nothing else
 uses that key. The line, the outcome, and the how are three separate docs (an
 invariant, a job spec, a design record), never collapsed into one.
 
@@ -115,4 +115,4 @@ These are considered improvements over the base method, not defects:
 records** kept current (e.g. `conversational-pacing.md`,
 `status-card-design.md`). Tell them apart by frontmatter, not by folder. A
 couple are historical and say so in their own status line (e.g.
-`onboarding-gap-analysis.md` — a point-in-time analysis, not a live tracker).
+`onboarding-gap-analysis.md`, a point-in-time analysis, not a live tracker).

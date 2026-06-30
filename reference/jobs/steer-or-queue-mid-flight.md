@@ -13,11 +13,11 @@ invariants: [chat-is-the-single-source-of-truth]
 The user is half-watching the agent work. Two things can happen: they realise
 it's going the wrong way and want to redirect it, or they have a new,
 unrelated thing they want done. Both are common, both urgent, both must work.
-The job is to make both distinguishable — to the user and to the agent.
+The job is to make both distinguishable, to the user and to the agent.
 Steering is amend-in-place: the current task continues with the new
 information folded in. Queuing is a new task: the current one finishes on its
 own terms, the new one picks up after, with no context bleeding between them.
-Ambiguous input must not silently pick one and hope — the product decides
+Ambiguous input must not silently pick one and hope. The product decides
 clearly and says which, or it asks. The worst outcome is the user thinking
 they steered when they actually queued, or the reverse.
 
@@ -30,25 +30,25 @@ they steered when they actually queued, or the reverse.
 **Good looks like**
 
 - A mid-flight follow-up can course-correct the current task, and the change
-  shows up in the visible progress — not pretended away, not a silent restart
+  shows up in the visible progress, not pretended away, not a silent restart
   from scratch.
 - A mid-flight follow-up can be filed as a new task that waits politely, then
   runs, with the current task untouched and no context bleeding in from it.
-- Whichever the agent picked — steer or queue — is stated by the agent in the
+- Whichever the agent picked, steer or queue, is stated by the agent in the
   chat, so the user reads it, never has to infer it.
 - When the input is genuinely ambiguous, the agent makes a reasonable call
   and says which it made, so the user can correct on the next message.
-- A burst — a forward of several messages, or a long paste Telegram split —
+- A burst (a forward of several messages, or a long paste Telegram split)
   is treated as one thought with shared context, not answered fragment by
   fragment.
 - Nothing the user said is lost: not to a race, not to ambiguity, not to a
   restart.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - Silent classification: the agent decides steer-or-queue and never says
   which, leaving the user to guess.
-- One-size-fits-both — always treating follow-ups as the same kind — which
+- One-size-fits-both, always treating follow-ups as the same kind, which
   loses one of the two jobs.
 - A steer applied at an unsafe point (mid-tool-call), or one that silently
   restarts the task when the user wanted an amendment.
@@ -91,7 +91,7 @@ be lost, across the corpus.
 
 - **Done when:** the user can steer or queue mid-flight, the agent treats
   each correctly, the user always reads which one happened, and nothing they
-  said is lost — proven by the scenarios above.
+  said is lost. Proven by the scenarios above.
 
 ## Production-readiness
 

@@ -1,12 +1,13 @@
 ---
-artefact: bridge presence — guaranteeing always-on inbound delivery
-serves: jobs/survive-reboots-and-real-life.md
+artifact: bridge presence — guaranteeing always-on inbound delivery
+serves: survive-reboots-and-real-life
+advances-outcome: always-available
 status: draft v1
 ---
 
 # RFC: Bridge presence — guaranteeing always-on inbound delivery
 
-> Status: **draft v1** — design contract for the real fix to the
+> Status: **draft v1**. Design contract for the real fix to the
 > bridge-flap / bridge-wedge class. Supersedes the two rejected fix
 > attempts catalogued in issue #1613. Implementation is gated on the
 > "Open questions" section being closed.
@@ -15,7 +16,7 @@ status: draft v1
 
 The Telegram bridge is the relay between `claude` (running the agent)
 and the long-lived gateway sidecar. Inbound Telegram messages reach
-claude only through a **registered** bridge; when none is registered
+claude only through a **registered** bridge. When none is registered
 the gateway buffers them.
 
 Two production-visible failure modes share one root:
@@ -26,16 +27,16 @@ Two production-visible failure modes share one root:
 2. **The wedge** — `global=bridge_dead` with buffered inbounds
    stranded for minutes; a turn's completion lost.
 
-Issue #1613 root-caused both and — critically — proved that **the
+Issue #1613 root-caused both and, critically, proved that **the
 flap is load-bearing *during active-state channel cycling***: while
 claude is cycling bridges (~every 7s during a turn), the flap's
 constant reconnect/re-register storm is currently the only thing
 keeping a bridge continuously registered. This is a *scoped* claim,
-not an unconditional one — see research finding #6: an *idle* agent
+not an unconditional one: see research finding #6, an *idle* agent
 holds one stable bridge with no flap at all. The flap is therefore
 not needed in general; it is only inadvertently covering the
 **active-state handover gap**. The real fix does not need a wholesale
-"replacement for the flap" — it needs to **bound that handover gap**.
+"replacement for the flap". It needs to **bound that handover gap**.
 Two structurally different fixes were built, canary-tested, and
 rejected (both removed the flap and, on a saturated host, surfaced
 the wedge):
@@ -48,10 +49,10 @@ the wedge):
   the wedge returned.
 
 Both confirm the scoped claim above: removing the flap is safe only
-if the **active-state handover gap is bounded** — otherwise an inbound
+if the **active-state handover gap is bounded**; otherwise an inbound
 that lands in the gap is delayed (until the next bridge registers, or
-until the agent settles to its idle bridge). Bounding that gap — by
-measuring it, by tolerating it, or by eliminating it structurally —
+until the agent settles to its idle bridge). Bounding that gap, by
+measuring it, by tolerating it, or by eliminating it structurally,
 is what this RFC designs.
 
 ## Background — the architecture
@@ -68,7 +69,7 @@ is what this RFC designs.
   `claude --dangerously-load-development-channels`) is an MCP server.
   **Claude spawns it as a subprocess and owns its entire lifecycle.**
 - Claude's experimental channel layer **cycles** the MCP connection
-  roughly every 7s — closing the old bridge's MCP session and
+  roughly every 7s, closing the old bridge's MCP session and
   spawning a fresh bridge process. The old process is given no
   detectable close signal (no stdin EOF, no MCP `onclose`; verified
   against bridge stderr captured in claude's MCP debug logs).
@@ -77,7 +78,7 @@ is what this RFC designs.
 
 **The gateway cannot create, keep alive, or directly control a bridge
 process.** Claude owns bridge lifecycle completely. Every viable
-design must work within this constraint — the gateway can only react
+design must work within this constraint: the gateway can only react
 to bridges that connect to its IPC socket.
 
 ## What we know (research)
@@ -89,7 +90,7 @@ instrumented canaries:
    process; the prior is orphaned without a clean signal.
 2. **A bridge process connects to the gateway exactly once** and does
    not self-reconnect within its own lifetime (confirmed by
-   nonce-tagged lifecycle instrumentation — each bridge's ipc-client
+   nonce-tagged lifecycle instrumentation: each bridge's ipc-client
    logs exactly one `doConnect`/`open`).
 3. **The flap is two+ bridge processes ping-ponging:** the gateway's
    #1585 zombie-close force-closes a prior bridge's socket → that
@@ -99,30 +100,30 @@ instrumented canaries:
 4. **The reconnect storm keeps `agentIndex` continuously populated.**
    This is the accidental bridge-presence guarantee. Remove it and,
    when claude's handover leaves a gap, `agentIndex` empties and stays
-   empty — the wedge.
+   empty: the wedge.
 5. **The gateway already buffers and drains correctly.** Inbounds
    that arrive while `bridge_dead` are held in `pendingInboundBuffer`
    and flushed by the `drainBuffer` effect on the next `bridgeUp`.
-   Buffered inbounds are **not lost** — they are delayed until a
+   Buffered inbounds are **not lost**; they are delayed until a
    bridge returns. The open question is whether a bridge always
    returns (see below).
 6. **Idle agents hold exactly one stable bridge.** A 4.5-minute
    observation of an idle clean-v0.13.2 agent (16 samples, 17s apart)
    showed `bridgeProcs=1, global=bridge_alive_idle` on *every* sample
-   — zero churn, no flap, no cycling. **The ~7s channel cycling is an
+   (zero churn, no flap, no cycling). **The ~7s channel cycling is an
    ACTIVE-state behaviour, not an idle one.** When the agent has
    nothing to do it keeps one steady bridge.
 7. **The flap and the wedge are active-state phenomena.** They occur
    only during turns / channel activity, when claude cycles bridges.
    An agent that finishes its work returns to the stable single-bridge
-   idle state — which means a backlog buffered during active churn
+   idle state, which means a backlog buffered during active churn
    *will* drain once the agent settles (`bridgeUp` on the stable
    bridge fires `drainBuffer`).
 8. **Wedge severity scales with host load.** The canary wedges that
    rejected both prior fixes ran on a host saturated by an all-night
    build+canary session. On a loaded host, claude's bridge spawn is
    slow, so the handover gap stretches from ~1-2s to tens of seconds.
-   The prior rejections are therefore **confounded** — they measured
+   The prior rejections are therefore **confounded**: they measured
    "remove the flap on a saturated host", not "remove the flap". This
    materially changes the verdict on Option 2 (below).
 
@@ -130,7 +131,7 @@ instrumented canaries:
 
 ### Option 1 — Decouple bridge lifetime from claude's MCP connection (recommended)
 
-**Make the bridge a long-lived, `start.sh`-managed process** — a
+**Make the bridge a long-lived, `start.sh`-managed process**, a
 sibling of the gateway, not a claude subprocess. Claude's channel
 connects to the already-running bridge; claude cycling its MCP
 connection no longer kills the bridge process.
@@ -145,11 +146,11 @@ connection no longer kills the bridge process.
 
 - The bridge keeps **one** persistent IPC connection to the gateway
   for the container's lifetime. `agentIndex` is populated once and
-  never churns. No flap, no wedge, no handover gap — structurally.
+  never churns. No flap, no wedge, no handover gap, structurally.
 - When claude's MCP side is down (between cycles), the bridge holds
   inbounds and flushes them when claude's MCP session reconnects.
   The bridge already knows when claude connects (a new MCP session is
-  an explicit event) — the flush trigger is clean and detectable,
+  an explicit event), so the flush trigger is clean and detectable,
   unlike the close signal.
 
 **The hard dependency:** claude must be able to connect its channel
@@ -174,12 +175,12 @@ handover gap on every active-state cycle and rely on the fact that
   new registration fires `bridgeUp` → `drainBuffer`. The buffer
   therefore drains roughly once per cycle even mid-burst.
 - When activity ends, the agent returns to the stable single-bridge
-  idle state (research finding #6) — a final guaranteed `drainBuffer`.
+  idle state (research finding #6): a final guaranteed `drainBuffer`.
 - The gateway buffer already holds inbounds indefinitely and is
   lossless across the gap; an inbound is *delayed*, never *lost*.
 
 **Re-assessment (post research findings #6-8):** Option 2 was
-*rejected* in #1613 — but on a host saturated by the build session,
+*rejected* in #1613, but on a host saturated by the build session,
 where claude's bridge spawn was pathologically slow and the handover
 gap stretched to tens of seconds. That was not a fair test. On a
 healthy host the gap should be ~1-2s, which is well inside tolerance.
@@ -190,7 +191,7 @@ If a clean-host re-test shows bounded (~1-2s) gaps, Option 2 is the
 *pragmatic* fix: it is small (already implemented on the branch),
 needs no claude-channel-transport change, and ships fast. Its
 residual cost is bounded added latency for an inbound that lands
-exactly inside a handover gap during a sustained active burst —
+exactly inside a handover gap during a sustained active burst:
 acceptable, and strictly better than the flap.
 
 ### Option 3 — Status quo: accept the flap (#1613 Option C)
@@ -198,7 +199,7 @@ acceptable, and strictly better than the flap.
 The flap is survivable: self-heals in 20-30s, occasionally costs one
 turn's `turn_end`. It is the only **currently-safe** state and is
 where the fleet sits today (v0.13.2). The cost is real but bounded.
-This RFC exists to retire Option 3, not endorse it — but it remains
+This RFC exists to retire Option 3, not endorse it, but it remains
 the fallback if Options 1 and 2 both prove infeasible.
 
 ### Option 4 — "Sticky bridge": gateway nominates one reconnecting bridge (rejected)
@@ -212,10 +213,10 @@ bridge keeps `agentIndex` populated.
 
 - The gateway's "nomination" has no force. Claude owns every bridge
   process and kills the sticky one on its normal cycle exactly like
-  any other — a gateway flag does not stop that.
+  any other; a gateway flag does not stop that.
 - Once the sticky bridge is killed, *something* must become the new
   sticky bridge, and there is a gap between "old sticky killed" and
-  "new one nominated + reconnecting" — the same handover gap, not
+  "new one nominated + reconnecting": the same handover gap, not
   removed.
 - "One bridge reconnects-on-drop" is just a single-participant flap.
   It collapses into Option 1 if "sticky" is made to mean "a
@@ -227,7 +228,7 @@ Recorded here so the design history is complete; not pursued.
 ## Recommendation
 
 The research (findings #6-8) shifts the verdict. **Option 2 is the
-recommended first move** — not because it is more elegant than
+recommended first move**, not because it is more elegant than
 Option 1, but because it is already built, needs no upstream
 dependency, and its only prior rejection is confounded by host
 saturation. Validate it cleanly; if it holds, ship it. Option 1
@@ -254,7 +255,7 @@ Option 2's clean re-test still shows unacceptable gaps.
 
 **Why not jump straight to Option 1:** it is a real rearchitecture
 (bridge process model, a new MCP transport or an upstream change, a
-buffer relocated into the bridge) — weeks of work with an unresolved
+buffer relocated into the bridge): weeks of work with an unresolved
 upstream dependency. Option 2 is a ~30-line diff that already exists.
 If the clean re-test vindicates it, shipping Option 2 retires the
 flap *now* and Option 1 becomes a deliberate, unhurried follow-up
@@ -262,7 +263,7 @@ rather than an emergency.
 
 ## Open questions
 
-The handover-gap measurement is not listed here — it is not an open
+The handover-gap measurement is not listed here. It is not an open
 *question*, it is a *test task* (step 1 of the plan). The genuine
 unknowns:
 
@@ -271,11 +272,11 @@ unknowns:
    attach-don't-spawn mode), rather than spawning a stdio subprocess?
    This determines whether Option 1 is buildable in switchroom or
    needs an upstream change.
-2. **Bridge re-spawn reliability after active churn ends — the
+2. **Bridge re-spawn reliability after active churn ends, the
    gating unknown for Option 2.** Option 2's safety rests entirely on
    the agent always returning to a registered bridge once a burst
    ends. Research finding #6 observed exactly this once (a 4.5-minute
-   idle hold) — but *not* across the specific race that matters: the
+   idle hold), but *not* across the specific race that matters: the
    moment a turn ends while claude is mid-cycle. Does claude reliably
    re-spawn and keep a bridge after every turn-end, including
    turn-end-during-cycle? If there is any path where claude ends a
@@ -298,7 +299,7 @@ A correct fix:
 - (b) keeps a bridge continuously registered (or re-registered within
   a few seconds) so no inbound is delayed more than ~5s by bridge
   absence, **and**
-- (c) preserves inbound ordering — a backlog drained after a gap is
+- (c) preserves inbound ordering: a backlog drained after a gap is
   delivered in arrival order (OQ4), **and**
 - (d) passes `bridge-flap-resilience-dm.test.ts` repeatably on an
   unloaded host (4 rapid DMs, all replied, low `bridge disconnected`

@@ -30,7 +30,7 @@ stays on your leash.
 
 The use case came from OpenClaw. Always-on assistants in a chat app,
 each with a personality and a job. Good idea. Three things stopped it
-being the one I needed, and nothing else fixed them:
+being the one I needed, and nothing else fixed them.
 
 - **On the subscription, properly.** The Claude plan I already pay for,
   the same OAuth as the desktop. Compliant. Predictable cost. Not an
@@ -58,7 +58,7 @@ functions to deliver them, and the jobs that ladder up to each live in
    the operator explicitly opts a specific account into overage (their own
    Anthropic-funded credits; default-off, auto-stops when the credit runs out).
    The claude-native invariant is unaffected: overage is still the unmodified
-   interactive `claude` CLI on the same OAuth subscription — never API/SDK.
+   interactive `claude` CLI on the same OAuth subscription, never API/SDK.
    An operator MAY also opt an agent into routing through their own metering
    gateway (self-hosted LiteLLM) for usage tracking + content-safety
    guardrails: still the unmodified CLI on the same OAuth, forwarded
@@ -66,8 +66,8 @@ functions to deliver them, and the jobs that ladder up to each live in
    [`invariants.md`](invariants.md).
 4. **Always available, in Telegram, done properly** — there when you want it.
 
-The hard constraints under these — claude-native, no-self-escalation,
-on-leash, single-tenant, telegram-only — are the lines we won't cross by
+The hard constraints under these (claude-native, no-self-escalation,
+on-leash, single-tenant, telegram-only) are the lines we won't cross by
 construction: [`invariants.md`](invariants.md).
 
 ---
@@ -102,20 +102,6 @@ hidden.
 
 ---
 
-## Voice and tone
-
-Plain, direct, opinionated. Reads like one person built it, because
-one did. Lead with what it feels like to have the team, not the
-machinery. Operator and trust details stay honest and present, never
-buried, never dressed up. No filler. No hype. No em dashes. Say what
-it deliberately doesn't do, no API key, no harness, no heartbeat, no
-second channel. The restraint is the point.
-
-Carries into every surface: CLI output, errors, the status the
-principal sees, the setup wizard.
-
----
-
 ## How vision becomes verdict
 
 The *why*. Three anchors and a product layer turn it into a verdict on a
@@ -130,6 +116,6 @@ specific PR or design:
   frontmatter) each `serves:` one outcome.
 
 A change lands when it (a) advances one of the four outcomes, (b) satisfies
-its job spec — proven by its outcome UAT, (c) passes all three principle
+its job spec (proven by its outcome UAT), (c) passes all three principle
 checks, and (d) crosses no invariant. Anything else is out of scope, however
 clever.

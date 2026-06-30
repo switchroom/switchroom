@@ -1,6 +1,7 @@
 ---
-artefact: Switchroom onboarding gap analysis (point-in-time, historical)
-serves: jobs/get-from-zero-to-a-working-fleet.md
+artifact: Switchroom onboarding gap analysis (point-in-time, historical)
+serves: get-from-zero-to-a-working-fleet
+advances-outcome: standing-team
 status: historical (last updated 2026-04-25) — not a live tracker
 ---
 
@@ -14,7 +15,7 @@ track closure and is stale. Several of the gaps below have since
 shipped fixes. It is deliberately **not** re-adjudicated gap-by-gap
 here (per-gap status would itself go stale and risks introducing
 errors). Read it as a snapshot of the onboarding pain that motivated a
-batch of fixes — not as the current state of any individual gap. For
+batch of fixes, not as the current state of any individual gap. For
 present-day onboarding behaviour, follow the docs and the CLI, not
 this list.
 
@@ -34,7 +35,7 @@ repeats the same song.
 
 Scaffolding a new agent does not create its Hindsight bank. The first
 `retain` against a missing bank blows up with a foreign-key constraint
-failure — because `get_bank_stats` returns an empty-looking response for a
+failure, because `get_bank_stats` returns an empty-looking response for a
 missing bank rather than erroring, the worker driving the ingest didn't
 realise the bank wasn't there until the first write failed. Silent-on-read,
 loud-on-write is the worst ordering for this kind of bug. The fix is two
@@ -46,7 +47,7 @@ instead of bubbling up a raw FK error.
 
 `switchroom agent restart lawgpt` returned `"Restarted lawgpt"` in under a
 second. The service log, a few seconds later, said `"1 MCP server failed ·
-/mcp"`. The CLI has no notion of readiness — it spawns the process and
+/mcp"`. The CLI has no notion of readiness. It spawns the process and
 returns. From the operator's seat this looks identical to a clean boot.
 Anything that relies on the broken MCP silently no-ops until someone
 notices. Restart needs a readiness gate with a timeout and a clear error if
@@ -75,7 +76,7 @@ list, none of them declarative per-agent:
 - **Dynamic UserPromptSubmit hook.** Injects `MEMORY.md` (plus today/yesterday
   daily notes) into context every turn. Hardcoded list.
 - **Agent self-read.** `AGENTS.md` instructs the agent to read additional
-  files (e.g. `BRIEF.md`) on session start. Nothing loads them — the agent
+  files (e.g. `BRIEF.md`) on session start. Nothing loads them. The agent
   pulls them because its own instructions say to.
 
 During `lawgpt` setup, I renamed `BRIEF.md` → `BOOTSTRAP.md` on the theory
@@ -83,7 +84,7 @@ that the rename would pull it into the system prompt. It did, but the
 agent's `AGENTS.md` already pointed at `BRIEF.md` to self-load, so the
 rename broke the self-read path. Had to rename back.
 
-The real problem isn't documentation — it's that there's no single place
+The real problem isn't documentation. It's that there's no single place
 where an agent declares "here are my context files and when they load."
 Short term, a conventions doc stops operators tripping on the incident I
 tripped on. Medium term, the three loaders should converge onto one
@@ -106,7 +107,7 @@ improvisation each time.
 only becomes knowable after the user DMs the bot `/start`. So the user has
 to: run setup, DM the bot, rerun setup to get their id captured into
 `access.json`. Two passes where one would do. The bot is already polling
-between the passes — we could just wait for the `/start` interactively
+between the passes. We could just wait for the `/start` interactively
 during setup and write `access.json` in the same session.
 
 ### 7. Empty template files pollute every turn's context
@@ -115,8 +116,8 @@ New agents ship with template `MEMORY.md`, `USER.md`, `TOOLS.md` etc.
 containing placeholder strings like `_set this_` and "Edit this file to
 describe …". Those files load into the system prompt (stable) or every
 turn (`MEMORY.md` via the dynamic hook) regardless of whether anyone
-filled them in. The result is that a fresh agent burns context — and
-occasionally model attention — on instructions to fill in blanks that
+filled them in. The result is that a fresh agent burns context, and
+occasionally model attention, on instructions to fill in blanks that
 nobody is going to fill in during the conversation. Either the loader
 should skip files whose only content is template placeholder, or the
 scaffold should ship them empty with a commented header and let them
@@ -128,14 +129,14 @@ Related to gap 4 but worth calling out: `switchroom workspace render
 --stable` has a literal list of filenames baked into the binary. Adding
 a new context file to an agent requires editing switchroom source, not
 the agent's config. That's what drove the `BRIEF.md` → `BOOTSTRAP.md`
-rename in the first place — there was no way to add `BRIEF.md` to the
+rename in the first place. There was no way to add `BRIEF.md` to the
 stable list without shipping a switchroom release. Folds into the
 convergence work proposed in gap 4.
 
 ## Phased fix plan
 
 Effort estimates are Ken-hours, not calendar time. Success criteria are
-the bar for "done" — not aspirational, the actual gate.
+the bar for "done", not aspirational, the actual gate.
 
 ### Phase A — quick wins, ship first
 
@@ -179,8 +180,8 @@ the bar for "done" — not aspirational, the actual gate.
 
 - **Effort:** ~2 hours
 - **Scope:** one page (`docs/workspace-files.md`) covering the three
-  loading mechanisms — stable system-prompt render, dynamic UserPromptSubmit
-  hook, agent self-read — what files go where, naming conventions, and
+  loading mechanisms (stable system-prompt render, dynamic UserPromptSubmit
+  hook, agent self-read): what files go where, naming conventions, and
   how an agent actually boots. Linked from `README.md` and the profile
   docs.
 - **Success criteria:** a new contributor can set up a new agent's
@@ -214,7 +215,7 @@ the bar for "done" — not aspirational, the actual gate.
 #### B3. `switchroom agent doctor <name>`
 
 - **Effort:** ~1 day
-- **Scope:** deeper than `status` — checks Hindsight bank exists and has
+- **Scope:** deeper than `status`. Checks Hindsight bank exists and has
   non-zero memories if the agent is supposed to be seeded, directives are
   loaded, stable workspace files are non-empty and aren't still the
   unedited template with `_set this_` placeholders, every file referenced
@@ -228,7 +229,7 @@ the bar for "done" — not aspirational, the actual gate.
 #### C1. Corpus bootstrap with an LLM worker template
 
 - **Effort:** ~week
-- **Scope:** the real work in onboarding a corpus isn't file copying —
+- **Scope:** the real work in onboarding a corpus isn't file copying,
   it's synthesis. Reading hundreds of files to produce a `BRIEF.md`,
   extracting directives, seeding mental models, and writing recall
   validation queries. That's LLM work, not a shell script. The scope
@@ -236,7 +237,7 @@ the bar for "done" — not aspirational, the actual gate.
   agent declaring corpus paths, directive seeds, brief-template sources,
   and recall-test queries; (b) a packaged prompt-template that
   `switchroom agent bootstrap <name>` feeds to a worker sub-agent to
-  execute the synthesis against the declared inputs. Idempotent —
+  execute the synthesis against the declared inputs. Idempotent:
   re-running skips work already done. Today's lawgpt Phase 1 onboarding
   becomes a one-liner.
 - **Success criteria:** `lawgpt`-scale corpus onboarding is reproducible

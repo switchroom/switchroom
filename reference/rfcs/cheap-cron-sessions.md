@@ -1,6 +1,7 @@
 ---
-artefact: cheap cron — deterministic polls + per-agent Sonnet cron session
-serves: jobs/crons-use-the-model-only-when-it-earns-it.md
+artifact: cheap cron — deterministic polls + per-agent Sonnet cron session
+serves: crons-use-the-model-only-when-it-earns-it
+advances-outcome: subscription-honest
 status: Draft, post-review (rev 2)
 ---
 
@@ -9,7 +10,7 @@ status: Draft, post-review (rev 2)
 **Status:** Draft, post-review (rev 2)
 **Author:** (agent-authored, operator-directed)
 **Targets:** `upstream/main` @ v0.14.91
-**Compliance pillar touched:** 3 (Claude-native, subscription-honest) — preserved by construction; see §7.
+**Compliance pillar touched:** 3 (Claude-native, subscription-honest), preserved by construction; see §7.
 
 ---
 
@@ -33,7 +34,7 @@ below.
 
 ## Build status (this branch)
 
-Behind `SWITCHROOM_CHEAP_CRON` (default **off**) — every layer below is dormant
+Behind `SWITCHROOM_CHEAP_CRON` (default **off**): every layer below is dormant
 until the flag is set, so this branch is a no-op in production until the canary.
 
 | Layer | Status | Tests |
@@ -49,13 +50,13 @@ until the flag is set, so this branch is a no-op in production until the canary.
 
 **Why the split:** L1–L3 are the algorithmic + security core (the SSRF BLOCK
 resolution, the routing proof, the cost-saving poll engine) and the full gateway
-plumbing for the cron session — self-contained and exhaustively tested. The
+plumbing for the cron session, self-contained and exhaustively tested. The
 staged items are **deploy-sensitive integration**: the live wiring touches the
-**vault broker** (strict test-isolation discipline — see CLAUDE.md + the
+**vault broker** (strict test-isolation discipline, see CLAUDE.md + the
 2026-05-22 clobber incident) and L4 launches a second `claude` process, both of
 which must be proven on the **test-harness canary**, not landed unproven in a
 long build session. With `escalate-to-main` (a poll entry with no `model`/
-`context` → Tier 2), **Tier-0 delivers its full cost saving without L4** — so the
+`context` → Tier 2), **Tier-0 delivers its full cost saving without L4**, so the
 live wiring + canary is the next, focused PR.
 
 ---
@@ -66,7 +67,7 @@ Cron fires are expensive for one structural reason: **every fire injects a
 synthesized turn into the agent's live interactive session**, so it pays the
 full standing-context cache-read tax (system prompt + ~31k-token MCP schema
 surface + the whole running conversation) *and* runs at the agent's configured
-model — even when the fire is a `*/10` poll that finds nothing to do.
+model, even when the fire is a `*/10` poll that finds nothing to do.
 
 Three tiers, cheapest-first:
 
@@ -145,12 +146,12 @@ Neither needs a model on the no-op path. **240 fires/day, ~all wasted.**
 agent-authored script (§6.2). Two built-in types cover the fleet:
 
 - `poll: http-diff` — `{ url, method, headers?, secrets:[...], diff_jsonpath,
-  state_key }`. Scheduler does a guarded `fetch()` (§6.1 — egress allowlist,
+  state_key }`. Scheduler does a guarded `fetch()` (§6.1: egress allowlist,
   no-redirect, host-pinned secret binding), extracts `diff_jsonpath`, compares to
   the last value under `state_key`. **New → escalate; unchanged → `HEARTBEAT_OK`.**
 - `poll: telegram-reactions` — `{ chat_id, emoji, lookback }`. Needs a **new
   gateway internal IPC verb** `query_recent_reactions` (today `get_recent_messages`
-  exists only as an MCP tool via the bridge — `bridge.ts:281` — there is no
+  exists only as an MCP tool via the bridge (`bridge.ts:281`); there is no
   model-free internal path; this verb is net-new, see §3.3 / Q4). **Match →
   escalate; none → `HEARTBEAT_OK`.**
 
@@ -170,14 +171,14 @@ dispatch-ack). State advance and escalation intent are one durable write.
 **First-run semantics (Q3, now resolved).** No baseline ⟹ **record baseline, do
 NOT escalate** (else every existing Brevo contact emails on day one). poll-state
 lives on the `/state/agent/` volume; reconcile writes scaffold/config only and
-**must not** touch runtime state — pinned by a new test
+**must not** touch runtime state, pinned by a new test
 `tests/agent-scheduler/tier0-poll-first-run.test.ts`.
 
 **Errors don't escalate.** Brevo 500 / vault denial / bad jsonpath → record a
 poll-error row + **one-shot** operator notice (not every fire) naming the
 next-step command; reuse the existing bounded retry ladder (`index.ts:156-230`).
 
-**Min-interval applies to polls too** (§6.3) — model-free ≠ free (each poll hits
+**Min-interval applies to polls too** (§6.3): model-free ≠ free (each poll hits
 an external API / the broker; a tight poll is a cheap DoS).
 
 ### 2.2 Tier 1 — per-agent cheap cron session
@@ -186,27 +187,27 @@ A second **interactive** `claude --model {cronModel}` (default
 `claude-sonnet-4-6`) in the agent container, addressed by gateway session label
 `cron`. Minimal-context by construction: own `CLAUDE_CONFIG_DIR=.claude-cron`
 (separate transcript), a **trimmed `.mcp.json`** (only `switchroom-telegram` +
-the task's tool — not the full hindsight/perplexity/webkite surface, cutting the
+the task's tool, not the full hindsight/perplexity/webkite surface, cutting the
 ~31k schema tax), `/clear` between fires.
 
-**Runtime shape — recommendation changed by review to B3 (lazy).** Three shapes:
+**Runtime shape, recommendation changed by review to B3 (lazy).** Three shapes:
 
 - **B1 — persistent at boot.** Warm, simplest supervision, but **doubles idle
   memory 24/7** to serve fires that Tier 0 makes rare. Needs a per-profile mem
   bump on tight (1.5g) profiles.
 - **B2 — ephemeral per-fire.** Zero idle cost, minimal context by construction,
-  no mem bump — but per-fire cold start + per-fire bridge-registration
+  no mem bump, but per-fire cold start + per-fire bridge-registration
   orchestration (the harder build).
 - **B3 — lazy with idle-timeout (RECOMMENDED).** Forked on the *first* Tier-1
   fire, kept warm, **torn down after N minutes idle** (default 30). Zero idle
   cost in steady state (Tier 0 absorbs the frequent polls), warm within a burst,
   no per-fire cold start inside a burst, no permanent mem-bump. Best fit for the
   "rare bursty Tier-1 fire behind a frequent Tier-0 poll" profile this design
-  creates. **The canary measures the Tier-0 no-op fraction first** (§5) — if it
+  creates. **The canary measures the Tier-0 no-op fraction first** (§5): if it
   is >90% as expected, B3 is clearly right; the data also sizes any mem headroom.
 
 All three are **interactive `claude` (no `-p`)** (§7). **B2/B3 must not be built
-headless** — a CI guard asserts every cron-session spawn is interactive +
+headless**: a CI guard asserts every cron-session spawn is interactive +
 `--strict-mcp-config` (extend `tests/bridge-flap-regression-guard.test.ts`).
 
 ### 2.3 Tier 2 — main session passthrough
@@ -220,7 +221,7 @@ about (§3.1).
 A second session emitting Telegram status into the same chat+topic as the main
 session collides: two sessions editing one progress card; a main-session reply
 closing a cron's obligation; competing worker-feed `editMessageText`. **v1
-stance: the cron session is status-silent** — it renders **no** progress card and
+stance: the cron session is status-silent**: it renders **no** progress card and
 **no** worker-activity feed; its only Telegram output is the final reply. And
 **obligations are session-scoped**: add `sessionLabel` to the `Obligation`
 interface (`obligation-ledger.ts:29-58`) + the close-matcher
@@ -257,12 +258,12 @@ and `collectScheduleEntries`; `dispatchAsInbound` emits `meta.model` + `meta.ses
 cross-entry/cross-layer inheritance** of the new fields; the array stays
 concat/append-only (`merge.ts:559-561`). Documented in `docs/configuration.md`.
 
-**Migration — guarantee no existing cron changes tier silently:**
+**Migration, guarantee no existing cron changes tier silently:**
 
 - `model: opus` or **unset** → `context: agent` (Tier 2 = today's behaviour).
 - **`model` = a known-cheap id (sonnet/haiku family) only** → `context: fresh`.
 - **Custom / unrecognised model id → `context: agent`** (conservative; never
-  assume a custom id is cheap) **+ a one-time warn**: "cron X has custom model Y —
+  assume a custom id is cheap) **+ a one-time warn**: "cron X has custom model Y,
   running on the main session; set `model: sonnet` + `context: fresh` to use a
   cheap cron session."
 
@@ -275,23 +276,23 @@ This closes the review's silent-tier-flip gap for every current fleet config.
 
 - **New agent-authored crons default cheap** (`sonnet`/`fresh`). The
   `schedule_add` response states it plainly so it is never silent: *"this cron
-  will run on Sonnet in a fresh cron session, not <agent>'s own model/persona —
+  will run on Sonnet in a fresh cron session, not <agent>'s own model/persona;
   pass context: agent to use the agent."*
 - **Escalation is operator-gated, and the gate is the *commit*, not an env
   check.** `context: agent`, `model: opus`, or any new `poll.secrets`/`poll.url`
   from an agent **stage** under `.pending/` (new `PendingReasonCode`s) and go live
   **only** when the operator commits (`schedule pending commit`, routed via hostd
-  Allow/Deny — memory `feedback_dashboard_loopback_header_forge`). An agent
+  Allow/Deny, memory `feedback_dashboard_loopback_header_forge`). An agent
   scrubbing `SWITCHROOM_AGENT_NAME` (the pre-existing, acknowledged host-CLI
   identity weakness, `agent-config-write.ts:119-127`) still **cannot** commit its
-  own pending entry — the operator commits. The security boundary is the
+  own pending entry; the operator commits. The security boundary is the
   operator-only commit, by design, not the forgeable agent-side identity.
 - **Cost label at staging (v1, lightweight).** The pending meta carries a coarse
   `fires_per_day × tier_weight` estimate (sonnet=1, opus=5) so the operator's tap
   sees the spend before approving. Full predictive UX deferred to v2; v1 ships the
   one-number bound rather than zero visibility.
 
-### 3.3 Gateway: session-labelled routing — the real refactor (review-corrected)
+### 3.3 Gateway: session-labelled routing, the real refactor (review-corrected)
 
 This is **more than one primitive.** Three structures are single-keyed by agent
 and a second bridge would clobber the first today:
@@ -328,13 +329,13 @@ the obligation `sessionLabel` add in §2.4.
 - **Env-order landmine:** the fork's env must be exported in the preamble before
   it (`start.sh.hbs:47`, memory `project_configurable_status_clear_v0_14_55`).
 
-## 5. Observability (review-found gap — now v1)
+## 5. Observability (review-found gap, now v1)
 
 The value prop is cost; the operator must *see* it.
 
 - `DispatchResult` (`dispatch.ts`) gains `tier: 'poll'|'cheap'|'main'` +
   `model_used`; written to `scheduler.jsonl` and the gateway fire log.
-- A report surface — extend the existing `switchroom schedule`/`auth schedule`
+- A report surface: extend the existing `switchroom schedule`/`auth schedule`
   family with `switchroom schedule report <agent> [--since]`: counts of
   poll / cheap / main fires + an estimated cost-weighted-token breakdown
   (`poll×0 + cheap×sonnet + main×opus`). This is how the canary's success is
@@ -344,7 +345,7 @@ The value prop is cost; the operator must *see* it.
 
 ### 6.1 `http-diff` egress hardening (resolves the BLOCK)
 
-A poll = URL + headers + vault secrets executed by the scheduler — an exfil/SSRF
+A poll = URL + headers + vault secrets executed by the scheduler, an exfil/SSRF
 primitive unless fenced. Mandatory before any Tier-0 poll ships:
 
 1. **Egress allowlist, operator-owned.** A poll `url`'s host must match an
@@ -353,7 +354,7 @@ primitive unless fenced. Mandatory before any Tier-0 poll ships:
    non-`https`, `file://`, `unix://`. Resolve-then-pin the IP to defeat DNS-rebind.
 2. **Host-pinned secret bindings.** A `poll.secrets` name may only be sent to the
    host it is **bound** to in operator config (`brevo_api_key → api.brevo.com`). A
-   poll requesting a secret for an unbound host is rejected at staging — the
+   poll requesting a secret for an unbound host is rejected at staging: the
    operator can't be socially-engineered into approving an exfil because the
    binding, not the agent, decides where a secret may go.
 3. **No redirects, hard timeout (5s), response size cap.** Secrets never appear in
@@ -375,10 +376,10 @@ Model-free polls are cheaper to abuse → enforce `MIN_CRON_INTERVAL`
 smallest gap for CSV/range expressions (today `0,30 * * * *` slips through);
 reject unparseable expressions for cheap-cron rather than passing them.
 
-## 7. Compliance (pillar 3) — preserved by construction
+## 7. Compliance (pillar 3): preserved by construction
 
 - **Tier 0** touches no model → outside the inference surface (a guarded poll).
-- **Tier 1 & 2** are **interactive `claude`** injected via `inject_inbound` — the
+- **Tier 1 & 2** are **interactive `claude`** injected via `inject_inbound`, the
   sanctioned synthesized-turn pattern. The cron session launches `exec claude
   --model sonnet …` (no `-p`), the exact shape of `start.sh.hbs:673`, with
   `--strict-mcp-config`. **Neither uses `claude -p`**; a CI guard enforces it for
@@ -392,7 +393,7 @@ reject unparseable expressions for cheap-cron rather than passing them.
 - **Q1 — v1 poll scope.** `http-diff` only (canary = marko, 96/day) vs **both**
   poll types (canary = marko + clerk, 240/day). Review note: clerk's reactions
   poll is ~60% of the savings, but `telegram-reactions` needs the net-new internal
-  gateway verb (§2.1/§3.3) — more build for a fuller canary.
+  gateway verb (§2.1/§3.3), more build for a fuller canary.
 - **Q2 — cron quota partitioning.** Tier-1 fires share the operator's OAuth weekly
   window. Accept (simple) vs ring-fence a dedicated `fallback_order` account for
   cron (protects live turns from a cron burst, memory

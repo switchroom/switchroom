@@ -14,7 +14,7 @@ audience: anyone designing, building, reviewing, or releasing switchroom
 > so you trade them off. An **invariant is a line we will not cross by
 > construction**, however useful a feature seems. It is the *"are we even
 > allowed / is this still switchroom"* gate in the verdict rule. A change
-> that breaks one is out of scope, full stop — not a redesign, not a
+> that breaks one is out of scope, full stop. Not a redesign, not a
 > follow-up.
 >
 > Job specs name the invariants they must never cross in their
@@ -38,24 +38,24 @@ work is the interactive session or a synthesized turn injected into it.
 ### Operator-controlled gateway carve-out
 
 A gateway the operator runs (e.g. self-hosted LiteLLM) MAY sit between the
-`claude` CLI and Anthropic — **iff** all four hold:
+`claude` CLI and Anthropic, **iff** all four hold:
 
 1. **OAuth forwarded unchanged.** It passes the operator's Pro/Max OAuth
-   credential through untouched — the subscription stays the funding *and*
+   credential through untouched: the subscription stays the funding *and*
    the identity. The gateway issues **no** `ANTHROPIC_API_KEY`, SDK, or
    raw-API call to Anthropic on the operator's behalf.
 2. **No alteration of Claude's operation.** It must not inject, rewrite, or
    strip anything that changes the model selected, the request parameters,
    or Claude's behaviour. Its only permitted writes to the stream are
    **content-safety guardrails** (PII redaction/blocking on message
-   content). Observation — token/cost metering, logging, tagging — is
+   content). Observation (token/cost metering, logging, tagging) is
    unrestricted.
 3. **Opt-in, default OFF.** No agent routes through a gateway unless the
    operator turns it on, and a gateway outage **fails open** to the direct
    subscription path (availability is never sacrificed to the proxy).
 4. **Non-Anthropic is a separate path.** Other models routed through the
    same gateway are off-subscription, separately billed, and **not** covered
-   by the subscription-native guarantee — they are a distinct,
+   by the subscription-native guarantee. They are a distinct,
    clearly-labelled route.
 
 This is subscription-native by construction: it is still the unmodified CLI
@@ -64,12 +64,12 @@ infrastructure observing and safeguarding the operator's *own* traffic.
 Aligns with the [Anthropic AUP](https://www.anthropic.com/legal/aup) and
 [Claude Code acceptable-use](https://code.claude.com/docs/en/legal-and-compliance).
 The `no protocol interception` clause above bars a *harness over* the CLI
-that fakes or reshapes the model exchange — it does **not** bar an operator
+that fakes or reshapes the model exchange. It does **not** bar an operator
 metering+safety proxy that forwards the exchange faithfully.
 
 ## `no-self-escalation`
 
-Every access decision — a secret, a tool, an MCP server, a host action —
+Every access decision (a secret, a tool, an MCP server, a host action)
 flows from operator-authored config or an operator tap, enforced where the
 agent can't rewrite it. An agent can ask for more; it can never grant itself
 more.
@@ -89,19 +89,19 @@ else.
 
 ## `single-tenant`
 
-Single **tenant** by design — one deployment on one operator's box, with
+Single **tenant** by design: one deployment on one operator's box, with
 their tokens and data. Not a multi-tenant SaaS. The deployment is the trust
 boundary.
 
 Inside that one tenant you may run **multiple trusted users**: the operator
 assigns Telegram user IDs to agents in `switchroom.yaml` (most agents serve
 one user, some serve several). Everyone the operator wires in is
-**implicitly trusted** — this is not an authorization model for mutually
+**implicitly trusted**. This is not an authorization model for mutually
 distrusting parties, and who may drive an agent is exactly that per-agent
 user assignment, nothing finer.
 
 Even within that trust, agents **should isolate memory per user and respect
-user memory privacy** — one user's memories should not bleed into another
+user memory privacy**: one user's memories should not bleed into another
 user's recall context. This is a best-effort *should*, not a hard wall, and
 it serves two ends at once: privacy among trusted users, and **token
 efficiency** (surfacing another user's irrelevant memories just wastes
@@ -110,8 +110,8 @@ isolation is *between the users they configured*, never from the operator.
 
 - **By-construction test:** does this assume more than one **tenant**
   (deployment), or expose one tenant's data to a *different* tenant? If yes,
-  it is out. Multiple trusted **users** inside one tenant — including
-  per-user memory isolation — is in scope, not a violation.
+  it is out. Multiple trusted **users** inside one tenant (including
+  per-user memory isolation) is in scope, not a violation.
 
 ## `telegram-only`
 
@@ -120,7 +120,7 @@ Slack, Discord, or Teams. Auxiliary services (e.g. voice transcription) are
 opt-in helpers, not second channels.
 
 - **By-construction test:** does this add a second human-facing chat
-  channel **for the people the team serves** — a bridge to WhatsApp, Signal,
+  channel **for the people the team serves**, a bridge to WhatsApp, Signal,
   Slack, Discord, Teams, or the like? If yes, it is out. This invariant is
   about the *principal's* channel: there is exactly one, Telegram, done
   properly. It is **not** a ban on operator/admin tooling.
@@ -128,7 +128,7 @@ opt-in helpers, not second channels.
 ### Scope: the admin console is not a channel
 
 An **operator/admin** management console (e.g. a Hermes-Desktop client pointed
-at a Switchroom adapter) is **out of this invariant's scope** — it is admin
+at a Switchroom adapter) is **out of this invariant's scope**: it is admin
 tooling for the person who runs the box, not a chat channel for the people the
 team serves. `telegram-only` stays strictly true: it governs *principal*
 channels, and the admin console is not one.
@@ -144,7 +144,7 @@ channel or a hidden conversation), it must hold all four:
    surface clear of `chat-is-the-single-source-of-truth`.)
 2. **One canonical record.** Every operator turn and the agent's reply
    **mirror into that agent's Telegram thread.** The console is another way
-   *in*, never a separate conversation the Telegram thread can't see — so
+   *in*, never a separate conversation the Telegram thread can't see, so
    there is still exactly one record, and `chat-is-the-single-source-of-truth`
    holds.
 3. **Same path, not a parallel runtime.** The operator turn is injected
@@ -156,7 +156,7 @@ channel or a hidden conversation), it must hold all four:
    sole approval surface (`no-self-escalation`). A console that wires
    approvals is out.
 
-The line that *would* cross `telegram-only` is a **principal-facing** bridge —
+The line that *would* cross `telegram-only` is a **principal-facing** bridge:
 giving the people the team serves a second way to chat (WhatsApp, Signal, a
 public web chat). That is still out. The detail contract for the admin console
 is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).

@@ -1,6 +1,7 @@
 ---
-artefact: eliminate claude -p (programmatic usage) from switchroom
-serves: jobs/keep-my-subscription-honest.md
+artifact: eliminate claude -p (programmatic usage) from switchroom
+serves: keep-my-subscription-honest
+advances-outcome: subscription-honest
 status: accepted — shipped in #1625 and #1626
 ---
 
@@ -21,14 +22,14 @@ stay reserved for *interactive* Claude Code / Cowork / chat.
 
 Switchroom's design contract (`reference/vision.md`, pillar 3) is
 **subscription-honest** — Pro/Max is the ceiling. A 9-agent always-on
-fleet cannot live inside a $200/month credit. Therefore every model
+fleet cannot live inside a $200/month credit. So every model
 call switchroom makes must be **interactive Claude Code**. Any
 `claude -p` is now a programmatic surface: a recurring cost leak and a
 classification liability.
 
 **The prize is not just cost.** Remove every `claude -p` and 100% of
-switchroom's model usage becomes the interactive `claude` session —
-cron, webhooks, everything enters as synthesized turns *into* that
+switchroom's model usage becomes the interactive `claude` session.
+Cron, webhooks, everything enters as synthesized turns *into* that
 session. There is no programmatic surface left to classify. That is
 the strongest possible position for the June 15 interactive-vs-
 programmatic line: nothing to argue about.
@@ -42,9 +43,9 @@ Exactly **two** real `claude -p` spawn sites remain:
 | `src/agents/handoff-summarizer.ts:308` | every turn (handoff Stop hook) | Haiku 4.5 |
 | `src/web/webhook-dispatch.ts:468` (`spawnAgentOneShot`) | per inbound web webhook | configurable |
 
-The main agent session is interactive `claude` — unaffected. Cron was
+The main agent session is interactive `claude`, unaffected. Cron was
 already migrated off `claude -p` in Phase 4 (fires fold into the live
-session via `inject_inbound`) — out of scope.
+session via `inject_inbound`), out of scope.
 
 ## Goal
 
@@ -130,7 +131,7 @@ The output is consumed **only at the next session start**. Per-turn
 generation of a rarely-consumed artifact is the core waste.
 
 ### What the feature provides
-Restart continuity — the "restart-and-know" JTBD (#27). After an agent
+Restart continuity, the "restart-and-know" JTBD (#27). After an agent
 process restarts, the new session is seeded with the briefing so it
 knows what it was doing, **including in-flight task state that may not
 yet be written to `MEMORY.md`**.
@@ -139,7 +140,7 @@ yet be written to `MEMORY.md`**.
 - **B1 — Native `--continue`, delete the summarizer.** Launch the
   post-restart session with claude's native `--continue` (resume the
   prior session). Large sessions are handled by claude's built-in
-  context compaction — *inside* the interactive (subscription) session.
+  context compaction, *inside* the interactive (subscription) session.
   `resume_mode` already has a `continue` value; make it the default
   and delete the handoff path. Zero `claude -p`, least code.
 - **B2 — Self-orient from a transcript tail.** Delete the summarizer;
@@ -159,7 +160,7 @@ with a bounded raw transcript tail and orients itself in-session. No
 `claude -p`; the summarization cost moves into the subscription-funded
 interactive session, and the context handed forward is bounded and
 controlled rather than whatever `--continue` happens to carry. B1
-(native `--continue`) was considered and set aside: a raw resume
+(native `--continue`) was considered and set aside. A raw resume
 carries more stale tool/turn state than a deliberate tail, and the
 restart-and-know JTBD wants a clean, bounded handoff.
 

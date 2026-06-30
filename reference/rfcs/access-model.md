@@ -1,5 +1,5 @@
 ---
-artefact: switchroom access model
+artifact: switchroom access model
 backs: no-self-escalation
 relates: jobs/approve-what-my-agent-can-touch.md
 ---
@@ -8,9 +8,9 @@ relates: jobs/approve-what-my-agent-can-touch.md
 
 This is the design record detailing **how** the
 [`no-self-escalation`](../invariants.md#no-self-escalation) invariant is
-enforced — the security contract for authorization in switchroom. It is
+enforced. It is the security contract for authorization in switchroom. It is
 deliberately small. Read it before changing anything that grants,
-checks, or prompts for access — secrets, tools, MCP servers, vault
+checks, or prompts for access: secrets, tools, MCP servers, vault
 grants, or host/fleet verbs. The operator-facing approval/secret-handling
 outcome is the job [`approve-what-my-agent-can-touch`](../jobs/approve-what-my-agent-can-touch.md);
 this doc is the agent-side mechanism beneath it.
@@ -20,7 +20,7 @@ this doc is the agent-side mechanism beneath it.
 Switchroom is a **local install on a single-tenant Linux server**: one
 operator, their own box, agents that are **eager to help, not
 adversarial** (the [`single-tenant`](../invariants.md#single-tenant)
-invariant). That reality is what lets the model be simple — so don't
+invariant). That reality is what lets the model be simple, so don't
 import a multi-tenant or hostile-network threat model and over-build for
 it.
 
@@ -30,7 +30,7 @@ it.
   *"the vault ACL is misconfiguration protection, not a security
   boundary"*). The real boundary is filesystem perms + the vault
   passphrase. Hardening against a process that already shares the
-  agent's uid is effort spent on a threat this product doesn't have —
+  agent's uid is effort spent on a threat this product doesn't have,
   and it's where the over-built proposals went (see *Closed
   directions*).
 - The threat we **do** secure is escalation by a helpful agent: it
@@ -39,11 +39,11 @@ it.
 ## The invariant this enforces
 
 The line is owned by the [`no-self-escalation`](../invariants.md#no-self-escalation)
-invariant — *an agent can request more access, but can never author its
+invariant: *an agent can request more access, but can never author its
 own authorization; every grant is written by the operator, in a place
 the agent cannot write.* This doc is the **how** beneath that line. If a
 change lets an agent widen its own access without the operator, the
-change is wrong — redesign it, don't gate it after the fact.
+change is wrong. Redesign it, don't gate it after the fact.
 
 ## The one boundary — and it's free
 
@@ -58,7 +58,7 @@ an agent must never escalate to lives behind a _different_ uid.**
   bind-mounted **read-only**. The agent's own scaffold files
   (`settings.json`, `.mcp.json`) are writable by it, but they are
   **regenerated from `switchroom.yaml` on every reconcile/restart**, so a
-  self-edit doesn't survive — and the one sanctioned self-edit path
+  self-edit doesn't survive. The one sanctioned self-edit path
   (`config_propose_edit`) is **server-validated additive-to-self behind
   an operator tap**. The agent reads its sandbox; it cannot durably
   rewrite it.
@@ -71,11 +71,11 @@ the operator (`vault.broker.approvalAuth: passphrase`, the default), so
 the agent self-mints nothing. The agent↔gateway channel only becomes
 forgeable if the operator **opts in** to single-factor posture mint for a
 named agent (`approvalAuth: telegram-id` **and** adding the agent to
-`vault.broker.postureMintAgents` — both default-off). Even then it's
+`vault.broker.postureMintAgents`, both default-off). Even then it's
 bounded: `adminOnlyKeys` claws the sensitive keys back to
 **passphrase-only**, which a same-uid agent still can't satisfy. So the
-same-uid surface is an operator opt-in gated by a factor the agent lacks
-— not an open door — which is why the model needs no cryptographic
+same-uid surface is an operator opt-in gated by a factor the agent lacks,
+not an open door. That's why the model needs no cryptographic
 proofing of the agent↔gateway channel.
 
 ## Three tiers, three minimal mechanisms
@@ -89,7 +89,7 @@ requires.
 | **Ad-hoc** | something not in the sandbox | One **honest** approval card → the operator's Telegram tap. `callback_query.from.id` is Telegram-authenticated; an agent cannot fake it. |
 | **Crown jewels** | irreversible actions, admin credentials | Operator **passphrase** — a secret the agent structurally never holds. The only tier above a tap. |
 
-The passphrase — not process-isolation tricks — is the unforgeable line,
+The passphrase, not process-isolation tricks, is the unforgeable line,
 because it's a capability the agent **lacks**, not a barrier we hope it
 won't cross. Mark genuinely-sensitive vault keys passphrase-required
 (`vault.broker.adminOnlyKeys`) so an eager agent can't posture-mint them.
@@ -97,12 +97,12 @@ won't cross. Mark genuinely-sensitive vault keys passphrase-required
 ## Honest cards
 
 An approval an agent can socially-engineer is no approval. A card must
-show the **exact scope being granted** — the vault key, the fileId, the
-verb — not a friendly label the agent chose. Keep the
+show the **exact scope being granted**: the vault key, the fileId, the
+verb, not a friendly label the agent chose. Keep the
 wrapper-attested-truth vs `💬` agent-framing split (the Drive
 diff-preview is the reference implementation) on every approval surface.
 
-- ✅ **Good:** "⚠ clerk wants to write to `Q3 Plan` (`1aBc…xyz`)" — the
+- ✅ **Good:** "⚠ clerk wants to write to `Q3 Plan` (`1aBc…xyz`)". The
   operator approves the exact file that becomes the scope.
 - ❌ **Bad:** a card whose displayed label and granted scope come from
   different sources, so the agent can show one thing and obtain another.
@@ -110,14 +110,14 @@ diff-preview is the reference implementation) on every approval surface.
 ## Dead-ends breed workarounds
 
 Half of access security here is **legibility**, because an eager agent
-that hits a confusing wall improvises — and improvisation is where the
+that hits a confusing wall improvises, and improvisation is where the
 leaks happen (an agent told the user to paste a raw token into chat
 because the vault slot was empty; agents guess vault key names and burn
 operator taps). So:
 
-- An agent should be able to **see its own sandbox** — what it's
-  authorized for — so it stops guessing and overreaching.
-- When it hits the edge, the sanctioned path ("you don't have X — here's
+- An agent should be able to **see its own sandbox**, what it's
+  authorized for, so it stops guessing and overreaching.
+- When it hits the edge, the sanctioned path ("you don't have X, here's
   the one-tap request") must be **frictionless and obvious**, so it
   never routes around the gate.
 
@@ -151,15 +151,15 @@ kernel, and the honest-card + passphrase items above.
 - Could an agent end up with access the operator never wrote down or
   tapped for? (If yes, redesign.)
 - Is the grant enforced where the agent **can't write it** (different
-  uid, or operator-owned read-only config) — not in something the agent
+  uid, or operator-owned read-only config), not in something the agent
   controls?
 - Does the approval card show the **real scope**, sourced the same way
   it's enforced?
 - For the irreversible / crown-jewel case, is it behind the
   **passphrase**, not just a tap?
 - When access is denied, does the agent get a clean one-tap path to
-  request it — so it won't improvise around the gate?
+  request it, so it won't improvise around the gate?
 
 If you're reaching for a new daemon, a second bot, or per-action crypto
-to answer these, stop: on single-tenant the uid boundary + read-only
+to answer these, stop. On single-tenant the uid boundary + read-only
 operator config + the passphrase already answer them.

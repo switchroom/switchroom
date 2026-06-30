@@ -10,12 +10,12 @@ invariants: [no-self-escalation]
 
 ## The job
 
-The user wants a new capability — a new specialist for a new domain, a new
+The user wants a new capability: a new specialist for a new domain, a new
 skill that teaches an existing agent a new trick, a new tool that connects
 to a system they care about. The product's job is to make that feel like
 configuration, not forking. Convention over configuration is the bar: the
-common 90% — lifecycle, interaction surface, memory, safety, logging,
-restart behaviour — comes for free from the scaffold. What the user writes
+common 90% (lifecycle, interaction surface, memory, safety, logging,
+restart behaviour) comes for free from the scaffold. What the user writes
 is the thing that's actually different about their agent, skill, or tool.
 If they copy a dozen files of boilerplate to add one specialist, the
 product is wrong. The extension story is first-class: documented,
@@ -40,11 +40,11 @@ them.
   automatically; the user doesn't reimplement them.
 - Upgrading the product leaves user-added agents, skills, and tools working.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - Boilerplate demanded up front: ten files to get one agent means the
   convention is missing.
-- Extension points that require editing the core — forking with extra
+- Extension points that require editing the core: forking with extra
   steps.
 - A plugin system that's really a promise, with the interesting
   capabilities hard-coded.
@@ -52,7 +52,7 @@ them.
   agents, skills, and tools.
 - Hidden coupling where a new agent silently needs five things configured in
   five other places.
-- A new tool that quietly lands on agents it wasn't meant for — capability
+- A new tool that quietly lands on agents it wasn't meant for, capability
   must follow the operator's config, never spread itself
   (`no-self-escalation`).
 - Breaking changes to the extension shape that silently orphan user
@@ -98,7 +98,7 @@ the upgrade.
 
 - **Done when:** the user adds an agent, skill, or tool by configuring it,
   the scaffold supplies the boilerplate and safety, capability reaches only
-  its intended agents, and upgrades don't orphan extensions — proven by the
+  its intended agents, and upgrades don't orphan extensions, proven by the
   scenarios above.
 
 ## Production-readiness

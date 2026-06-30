@@ -1,6 +1,7 @@
 ---
-artefact: context-headroom visibility surface
-serves: jobs/restart-and-know-what-im-running.md
+artifact: context-headroom visibility surface
+serves: restart-and-know-what-im-running
+advances-outcome: hold-the-leash
 relates: vision.md (pillar 2 on-leash / pillar 3 predictable)
 ---
 
@@ -8,13 +9,13 @@ relates: vision.md (pillar 2 on-leash / pillar 3 predictable)
 
 Make each agent's working-context occupancy and headroom-to-compaction
 visible in `switchroom status`, `switchroom doctor`, and the web
-dashboard — turning the predictability won by `ENABLE_TOOL_SEARCH=true`
+dashboard, turning the predictability won by `ENABLE_TOOL_SEARCH=true`
 (v0.15.40, ~40% baseline cut) into something the operator can see and
 trust.
 
 ## Why
 
-After v0.15.40 a fresh agent sits at ~47k of a 300k cap — predictable,
+After v0.15.40 a fresh agent sits at ~47k of a 300k cap: predictable,
 but **invisible**. The operator can't see how close an agent is to a
 `/compact`, or catch a context-bloated agent before it stalls mid-task.
 
@@ -22,12 +23,12 @@ but **invisible**. The operator can't see how close an agent is to a
   control, not a tool-call log to babysit."* At-a-glance context headroom
   is exactly that awareness.
 - **Pillar 3 (subscription-honest & predictable).** Makes "the plan is
-  the ceiling" *legible* — you see the ceiling and each agent's distance
+  the ceiling" *legible*: you see the ceiling and each agent's distance
   from it, instead of inferring it.
 - **Pillar 4 (always available).** A near-cap agent is about to compact
   (a visible stall); surfacing the band lets the operator act first.
 
-Serves `jobs/restart-and-know-what-im-running.md` — the "know what's
+Serves `jobs/restart-and-know-what-im-running.md`, the "know what's
 running" awareness job. Crosses no invariant: pure observability.
 
 ## What it surfaces (per agent)
@@ -49,7 +50,7 @@ Example: `marko  context 250k/300k (83% · tight)` · `clerk 47k/300k (16%)`.
 
 The gateway already computes occupancy at the turn-end idle gate for
 proactive-compaction. P1 writes that value (and the resolved cap) to a
-snapshot at `<agentDir>/context-occupancy.json` on every idle pass —
+snapshot at `<agentDir>/context-occupancy.json` on every idle pass,
 crucially **even when no cap is configured** (proactive-compact returns
 early without a cap; the snapshot must not). Host surfaces read the
 snapshot (via `docker exec … cat`, the same way `status` already runs
@@ -71,14 +72,14 @@ gateway already has.
 ## Principle checks
 
 - **Docs test:** `context 47k/300k (16%)` is self-explanatory. ✅
-- **Defaults test:** works on a fresh install — occupancy already exists;
+- **Defaults test:** works on a fresh install: occupancy already exists;
   cap falls back to native (shown as occupancy only). ✅
 - **Consistency test:** same row/section shape as the existing health
   surfaces + the connection-health probe. ✅
 
 ## Non-goals / risk
 
-- Does **not** change compaction behavior — pure observability.
+- Does **not** change compaction behavior; pure observability.
 - No new model calls; reads cached occupancy (no per-turn cost).
 - Read-only; crosses no invariant (claude-native / on-leash /
   single-tenant untouched). Snapshot is best-effort: a missing/stale file

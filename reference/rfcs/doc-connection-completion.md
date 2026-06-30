@@ -1,12 +1,13 @@
 ---
-artefact: make Google Drive a real collaboration surface
-serves: jobs/act-in-my-tools-with-an-identity.md
+artifact: make Google Drive a real collaboration surface
+serves: act-in-my-tools-with-an-identity
+advances-outcome: always-available
 status: Draft v3 — implementation pivot in §4.2
 ---
 
 # RFC E: Make Google Drive a real collaboration surface
 
-Status: Draft v3 (v3.1 amendment 2026-05-15 — implementation pivot in §4.2)
+Status: Draft v3 (v3.1 amendment 2026-05-15, implementation pivot in §4.2)
 Author: Ken (with Claude pair-design)
 Date: 2026-05-14
 
@@ -19,10 +20,10 @@ Date: 2026-05-14
   ship as designed. See §4.2's pivot banner for the full delta.
 
 **v3 changes** (addressing PR #1227 review):
-- §3 dropped `extend-without-forking` JTBD claim (overstated — that JTBD is about adding new agents/skills/tools, not config-surface affordances inside an existing integration).
+- §3 dropped `extend-without-forking` JTBD claim (overstated: that JTBD is about adding new agents/skills/tools, not config-surface affordances inside an existing integration).
 - §4.5 added a third anchor primitive: text-snippet anchor (`after_line_containing: "..."` resolved by wrapper). Covers the 80% of real-world meeting-notes / draft-prose docs that have no headings without forcing a "agent must add headings first" hard contract.
 - §4.2 hardened the diff-preview against intent-lies (not just size-lies): wrapper-attested anchor name appears on the primary card, agent-supplied summary appears below it. User has wrapper truth to sanity-check the agent's framing against.
-- §6.3 added explicit acknowledgment that approval cards are the existing exception to the "chat IS the artifact" sub-principle, per RFC B §8.1 — preempt the next reviewer re-litigating it.
+- §6.3 added explicit acknowledgment that approval cards are the existing exception to the "chat IS the artifact" sub-principle, per RFC B §8.1, to preempt the next reviewer re-litigating it.
 - §9 added two risks: anchor-fragmentation (covered in §4.5 expansion) + summary-lies-about-intent variant.
 
 Prerequisites — both shipped:
@@ -39,7 +40,7 @@ once the Drive collab loop is real.
 
 A user can give an agent a Google Doc, ask it to draft into the doc,
 review the agent's changes inline in Drive, and resume the
-conversation in Telegram — all without leaving the
+conversation in Telegram, all without leaving the
 phone-or-laptop-they-already-have-open. The agent is a collaborator
 on the user's docs, not a one-shot reader-and-summarizer.
 
@@ -101,7 +102,7 @@ Maps to three of the four outcomes in `reference/vision.md`:
   un-trashes mid-week doesn't leave the agent stuck.
 
 Visibility (#1) is served by the existing approval card UX from RFC
-D plus the new diff-preview surface in §4.2 — the user always sees
+D plus the new diff-preview surface in §4.2. The user always sees
 what the agent is about to do *before* it touches their doc.
 
 ## 3. JTBD alignment
@@ -109,19 +110,19 @@ what the agent is about to do *before* it touches their doc.
 - **`share-auth-across-the-fleet.md`** — Drive OAuth = once per
   Google account. Adding a second agent that needs the same Drive
   doesn't re-prompt; the cascade resolves the shared vault slot.
-  (Note: this JTBD is the load-bearing one for **RFC G** — RFC E
+  (Note: this JTBD is the load-bearing one for **RFC G**. RFC E
   inherits its OAuth posture but doesn't drive that JTBD by itself.)
 - **`talk-to-agents-from-anywhere.md`** — Folder browsing, write
   approvals with diff preview, deep-link to Drive, reconnect-on-
-  token-revocation — every step is reachable from a phone. The
+  token-revocation, every step is reachable from a phone. The
   headless OAuth tier from RFC D §3.2 covers initial connect;
   nothing else needs a desktop browser.
 - **`know-what-my-agent-is-doing.md`** — The diff-preview-before-
   write pattern is the JTBD's "see every step" applied to mutations.
   The user never finds out the agent edited a doc by re-opening it
   later. The wrapper-attested anchor name on the diff-preview card
-  (§4.2) is the load-bearing detail that makes this JTBD honest —
-  without it, "see every step" reduces to "see whatever the agent
+  (§4.2) is the load-bearing detail that makes this JTBD honest.
+  Without it, "see every step" reduces to "see whatever the agent
   chose to summarize."
 
 ## 4. Scope — five pieces, all Drive
@@ -134,7 +135,7 @@ worse than either default and explicitly punted.
 
 **Design:**
 
-- New CLI verb: `switchroom drive folders <agent>` — does *not*
+- New CLI verb: `switchroom drive folders <agent>`. Does *not*
   render in the terminal. Posts a card in the agent's Telegram
   topic.
 - Card surface: paginated folder list, top-level first, breadcrumb
@@ -144,7 +145,7 @@ worse than either default and explicitly punted.
   standard granted-card confirmation (with `· /approvals revoke
   <id>` inline per RFC B §9).
 - The same picker is reachable from inside an in-flight per-doc
-  approval card via a new `[ 📁 Allow folder instead ]` button —
+  approval card via a new `[ 📁 Allow folder instead ]` button,
   the primary mitigation for the prompt-flood path RFC D §5 warns
   about.
 - Listing source: `files.list` with
@@ -163,7 +164,7 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > **Implementation pivot — Path A Cut 2 (2026-05-15).** §4.2 as
 > originally specified assumed switchroom would ship its own MCP
 > wrapper exposing `gdrive_suggest_edit` / `gdrive_apply_edit` /
-> `gdrive_create_doc` / `gdrive_append_to_doc` — purpose-built so the
+> `gdrive_create_doc` / `gdrive_append_to_doc`, purpose-built so the
 > wrapper could default writes to Drive's Suggesting mode and pre-
 > resolve every anchor before posting the diff-preview card.
 >
@@ -176,9 +177,9 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > `create_table_with_data`, `update_doc_headers_footers`,
 > `update_paragraph_style`, `manage_doc_tab`) and **no Suggesting
 > mode** at all. Building our own wrapper to add Suggesting was
-> scoped out — the upstream MCP is already shipped, our agents
+> scoped out. The upstream MCP is already shipped, our agents
 > already use it, and forking it would mean carrying the diff
-> indefinitely.
+> forever.
 >
 > The chosen mechanism is a **Claude Code PreToolUse hook**
 > registered against `^mcp__google-workspace__` write tools. The
@@ -186,8 +187,8 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > `documents.get`), builds the wrapper-attested diff preview,
 > requests an approval through the kernel + gateway, polls until
 > the user taps Allow/Cancel, and returns `{decision:"block"}` if
-> denied. Same trust boundary as the §4.2 design — the wrapper still
-> attests the anchor + metrics — but no Suggesting affordance.
+> denied. Same trust boundary as the §4.2 design (the wrapper still
+> attests the anchor + metrics), but no Suggesting affordance.
 >
 > **What this preserves from §4.2:**
 > - Wrapper-attested anchor name on the diff-preview card (`📍`
@@ -200,13 +201,13 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 >
 > **What this does NOT preserve:**
 > - Suggesting as the default. Every gated write is a direct write
->   when applied — agents have no way to propose a non-destructive
+>   when applied. Agents have no way to propose a non-destructive
 >   suggestion. (User can still revert via Drive's version history.)
 > - Two-button "Apply as suggestion" + "Apply directly" affordance.
 >   The card shows Allow / Cancel only.
 > - `doc:gdrive:suggest:*` scope namespace. Only `doc:gdrive:write:*`
 >   is wired up. Agents already holding a `read` grant can attempt
->   writes — each one prompts.
+>   writes, each one prompts.
 > - `gdrive_apply_edit` / `gdrive_create_doc` / `gdrive_append_to_doc`
 >   as named tools. Agents use the upstream tool names directly.
 >
@@ -215,7 +216,7 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > write methods (load-bearing diff to maintain; rejected for now);
 > (b) shipping a thin switchroom wrapper MCP that re-exports the
 > upstream tools with Suggesting-by-default behavior (still
-> requires the underlying Docs API to expose Suggesting — it does
+> requires the underlying Docs API to expose Suggesting, which it does
 > via `suggestionsViewMode` on read, but for write, the API only
 > creates `Suggestions` if the requesting Drive account is not the
 > doc owner; agent-owned docs would still apply directly).
@@ -224,7 +225,7 @@ trees (>100 top-level folders) are common. Ship paginated on day 1.
 > into #1316), **#1316** (Docs API client + write-preview spec
 > builder), **#1318** (gateway IPC verb posting the diff-preview
 > card), **#1319** (PreToolUse hook + scaffold registration).
-> Card UX (no separate suggest/write modes — Allow/Cancel only) is
+> Card UX (no separate suggest/write modes, Allow/Cancel only) is
 > a v0.10.x decision, not the long-term RFC E §4.2 contract.
 
 **Today:** read-only by design. RFC D §12 stipulates writes need
@@ -233,7 +234,7 @@ a write.
 
 **Why "Suggesting" is the default, not direct write:** Drive has a
 first-class Suggesting mode (the same one human collaborators use).
-Suggestions are non-destructive — the user reviews and accepts them
+Suggestions are non-destructive: the user reviews and accepts them
 in Drive's UI just like a peer's edit. **Defaulting to Suggesting
 mode is the difference between "agent writes to my doc" (scary) and
 "agent proposes edits I review" (collaboration).** Direct writes
@@ -272,7 +273,7 @@ edits, etc.).
   - **Wrapper-attested anchor name** sits on its own line above the
     diff metrics, prefixed `📍`. The wrapper has just resolved the
     anchor (per §4.5) so it knows the actual heading / line-snippet
-    / position the edit will land at — and surfaces it independently
+    / position the edit will land at, and surfaces it independently
     of whatever the agent says in its summary. This is the
     load-bearing detail that makes the JTBD `know-what-my-agent-is-
     doing` honest for mutations: even if the agent's summary says
@@ -283,13 +284,13 @@ edits, etc.).
     wrapper computes these from the proposed edit relative to the
     current doc state. Agent cannot lie about size.
   - **Agent-supplied summary** (`💬 "..."`) is the agent's
-    explanation of *why*, not *what* — the wrapper-attested anchor
+    explanation of *why*, not *what*. The wrapper-attested anchor
     and metrics already cover *what*. Audit row stores both for
     post-hoc review of agent intent vs. wrapper truth.
-  - Primary action is **Apply as suggestion** — single tap, lands
+  - Primary action is **Apply as suggestion**: single tap, lands
     as a Drive Suggestion the user reviews in Drive's UI.
   - **Apply directly** is a secondary, badged with `⚠`. Standing
-    direct-write grants are opt-in via expand only — never on the
+    direct-write grants are opt-in via expand only, never on the
     primary card row.
   - **Open in Drive** is always present. See §4.3.
 - Audit row records `action: suggest` or `action: write` so
@@ -304,7 +305,7 @@ edits, etc.).
 
 **Today:** every reference to a doc in chat is a title; the user
 has to find the doc themselves to look at it. Breaks the collab
-loop — the user can't tap from "agent edited X" to "let me see X."
+loop. The user can't tap from "agent edited X" to "let me see X."
 
 **Design:**
 
@@ -319,7 +320,7 @@ loop — the user can't tap from "agent edited X" to "let me see X."
   `?disco=<thread_id>` on the URL when Drive's API exposes a
   discussion thread for the proposed edit, so the link lands the
   user directly on the suggestion they're reviewing.
-- No new permission needed — these are the same shareable URLs the
+- No new permission needed. These are the same shareable URLs the
   user would copy from Drive's "Share" dialog.
 
 ### 4.4 Reconciler missing→present recovery (deferred from RFC D §12) — Phase 1
@@ -333,16 +334,16 @@ week even after the user fixes it.
 **Why it's promoted from "Phase 4 cleanup" to Phase 1:** in a
 collab loop the missing→present transition is *common*. The user
 trashes their draft, asks the agent to start over, un-trashes the
-original to compare — they expect both versions to be live for the
+original to compare. They expect both versions to be live for the
 agent.
 
-**Design:** trivial extension of `src/drive/reconciler.ts` —
+**Design:** trivial extension of `src/drive/reconciler.ts`:
 
 - When a missing-state grant transitions back to Present on its
   next scheduled check, write a `recover` row to `approval_audit`
   and surface a `[ ↻ Re-enabled ]` line in the next staleness
   digest + a one-line nudge in the agent's chat:
-  *"↻ 'Q3 Strategy Notes' is back — let me know if you want me to
+  *"↻ 'Q3 Strategy Notes' is back, let me know if you want me to
   pick up where I left off."*
 - No retro-active state-management. No automatic re-trigger of the
   scheduled task. Just don't *hide* the recovery from the user.
@@ -366,7 +367,7 @@ shifts.
    ambiguous), the first match wins; agent can disambiguate by
    adding `level` or `nth_match`.
 
-2. **Text-snippet anchor** (covers unheaded docs — meeting notes,
+2. **Text-snippet anchor** (covers unheaded docs: meeting notes,
    draft prose, the long tail):
    ```
    anchor: { after_line_containing: "we agreed to ship by Q3" }
@@ -377,7 +378,7 @@ shifts.
    matching the snippet (case-insensitive substring by default;
    regex if the value is a `RegExp`-shaped object). If multiple
    matches, the agent gets `MULTIPLE_MATCHES` with the first 3
-   surrounding-context excerpts and must pick one — no "first
+   surrounding-context excerpts and must pick one. No "first
    wins" silent guess for snippets, because the user can't
    visually verify which match the agent meant.
 
@@ -401,7 +402,7 @@ shifts.
   **resolved anchor name** that gets surfaced on the diff-preview
   card per §4.2 (e.g. `'Goals' (heading)` or `line 47: "we agreed
   to ship by Q3"` or `at end of doc`). This is the
-  wrapper-attested anchor the user sees — the agent cannot
+  wrapper-attested anchor the user sees. The agent cannot
   override it.
 
 ## 5. Out of scope (this spec)
@@ -436,7 +437,7 @@ Per `reference/principles.md`, applied to this spec:
 - ✅ `switchroom drive folders klanker` posts a card with inline
   guidance. No prerequisite reading.
 - ✅ Approval card copy explains the suggestion vs direct-write
-  trade-off in one line — no glossary needed.
+  trade-off in one line, no glossary needed.
 - ✅ `[ 📖 Open in Drive ]` is self-explanatory. Tap → doc opens.
 - ✅ Anchor-resolution errors give the user a next step
   (*"Want me to suggest a heading-by-heading rewrite?"*).
@@ -459,7 +460,7 @@ Per `reference/principles.md`, applied to this spec:
 - ✅ Same `vault:gdrive:*` slot pattern (no new vault concepts).
 - ✅ Same approval card states (pristine / expanded / granted /
   denied / expired) — RFC B §8.1.
-- ✅ Same `/approvals list|revoke|add|stats` surface — adding
+- ✅ Same `/approvals list|revoke|add|stats` surface: adding
   `suggest` and `write` action types adds rows, not commands.
 - ✅ Same headed-doc model the user already lives in for any Drive
   doc; agent anchors mean what they look like they mean.
@@ -475,7 +476,7 @@ doesn't have to re-litigate:
 > Approval cards are the existing exception per RFC B §8.1. The
 > rule is "build the model to communicate; let the framework be
 > the safety net, not the headline." Approvals are the framework
-> safety net for **mutations under operator authorization** —
+> safety net for **mutations under operator authorization**:
 > they're the one place where the chat alone can't carry the
 > semantic weight (a tap is structurally different from a
 > message). The diff-preview card in §4.2 is the same primitive
@@ -485,7 +486,7 @@ doesn't have to re-litigate:
 > existing card, not a separate widget. If the user taps "Apply
 > directly" repeatedly the model can still narrate ("you've
 > approved 6 direct writes today, want me to suggest instead?")
-> in chat — the card never replaces the chat as the source of
+> in chat. The card never replaces the chat as the source of
 > truth.
 
 ## 7. Migration / rollout
@@ -502,8 +503,8 @@ Substructure for sequencing within the phase:
 3. **1c — Suggesting writes + diff preview (§4.2).** The headline
    feature. Lands on top of the anchor primitive and the
    Open-in-Drive button.
-4. **1d — Reconciler recovery (§4.4).** Lowest-effort, ships last
-   — useful but not blocking the headline collab loop.
+4. **1d — Reconciler recovery (§4.4).** Lowest-effort, ships last,
+   useful but not blocking the headline collab loop.
 
 Phase 2+ (Notion as second surface, framework extraction, broader
 doc surfaces) lives in a follow-up RFC and is explicitly out of
@@ -531,13 +532,13 @@ shippable as four PRs (1a, 1b, 1c, 1d) for incremental review.
 ## 9. Risks and open questions
 
 - **Drive's Suggestions API has gaps.** Some operations (creating
-  a doc, pure append) have no Suggesting equivalent — those stay
+  a doc, pure append) have no Suggesting equivalent. Those stay
   on the direct `write` scope. Document this clearly in the agent-
   facing tool descriptions so the agent picks the right tool.
 - **Anchor type selection by the agent.** Three anchor types in
   §4.5 (heading / snippet / position) means the agent has to pick
   the right one. Wrong pick = `*_NOT_FOUND` error and a wasted
-  tool call, not user-visible damage — but it does add a class of
+  tool call, not user-visible damage, but it does add a class of
   agent confusion. Mitigation: prompt-pack guidance + tool
   descriptions explicitly call out the priority order (try
   heading first, fall back to snippet, position only for
@@ -555,8 +556,8 @@ shippable as four PRs (1a, 1b, 1c, 1d) for incremental review.
   collab loop; not a blocker.
 - **Diff preview — size lies and intent lies, separately
   defended.** Two distinct attacks on the diff-preview card:
-  (a) *size lie* — agent claims `+5 lines` for a 47-line change;
-  (b) *intent lie* — agent's summary says "Added Hiring section"
+  (a) *size lie*: agent claims `+5 lines` for a 47-line change;
+  (b) *intent lie*: agent's summary says "Added Hiring section"
   but the edit lands in Goals. Mitigation: §4.2 surfaces both
   the wrapper-attested anchor name (`📍 after heading 'Goals'`)
   and the wrapper-attested line counts (`+47 / -0 lines`)
@@ -571,11 +572,11 @@ shippable as four PRs (1a, 1b, 1c, 1d) for incremental review.
 - **Open-in-Drive auth assumption.** The deep-link assumes the
   user is logged into Google in their browser/app on the device
   they tap from. If they're not, Drive's own login flow handles it
-  — not our problem, but the link doesn't pre-validate.
+  (not our problem), but the link doesn't pre-validate.
 - **Discoverability of Suggesting vs Write.** A user who taps
   `Apply directly` once might not realise Suggesting was the safer
   default. After 3 direct-applies in a 24h window, surface a
-  one-time tip: *"You're approving direct writes a lot — want to
+  one-time tip: *"You're approving direct writes a lot, want to
   set 'always suggest' as the default for this doc?"*
 
 ## 10. Tracking

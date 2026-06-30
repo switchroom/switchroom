@@ -14,7 +14,7 @@ Agents are long-running processes that live on real machines. Machines
 reboot, power drops, networks flap, disks fill, sessions run out of
 context. The user hires this job so they don't have to babysit the fleet
 to keep it alive. Surviving means two things: the agent comes back on its
-own after a reboot, crash, or upgrade — and it is honest about what
+own after a reboot, crash, or upgrade, and it is honest about what
 happened. If a turn was interrupted, memory was lost, context was
 compacted, or a tool call failed mid-way, the user hears about it in plain
 language, at the point it affects them. Silent recovery is worse than a
@@ -29,7 +29,7 @@ bug, not the resilience.
   has to kick anything.
 - After a crash, the agent is respawned and the user is told, with enough
   detail to know whether the in-flight work survived.
-- An interrupted turn either resumes or is explicitly named as lost — never
+- An interrupted turn either resumes or is explicitly named as lost, never
   dropped on the floor in silence.
 - Context exhaustion reads as a named event the user understands, not a
   mysterious refusal.
@@ -41,12 +41,12 @@ bug, not the resilience.
 - The user can ask "is everything healthy?" and get a real answer, not a
   green tick over a dead process.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - Silent death: a process that's gone but still appears addressable.
 - Silent resurrection: an agent that came back in a different state than it
   went down in, without saying so.
-- Endless retry loops with no surfacing — the user thinks it's working and
+- Endless retry loops with no surfacing. The user thinks it's working and
   it's actually stuck.
 - Dropping in-flight work when a process dies, with no mention of what was
   lost.
@@ -95,7 +95,7 @@ never silently, work resumed or named-as-lost.
 
 - **Done when:** after any reboot, crash, or transient failure, the agent
   comes back on its own and the user is told in plain language what
-  happened to their in-flight work — proven by the scenarios above, never
+  happened to their in-flight work. Proven by the scenarios above, never
   recovered in silence.
 
 ## Production-readiness

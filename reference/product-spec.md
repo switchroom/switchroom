@@ -22,6 +22,33 @@ A switchboard for your Pro or Max: a standing team of always-on specialists
 you text from Telegram, each running the unmodified `claude` CLI on your own
 subscription, on your box, on your leash.
 
+## North Star
+
+> One number the whole product is judged on. If it moves, we're winning. If it
+> stalls, nothing else matters. The four outcome Signals below are its drivers.
+> They decompose it, they don't compete with it.
+
+- **Metric:** Trusted Unsupervised Turn Rate (TUTR).
+- **Definition:** Of every consequential turn the fleet handles in a rolling
+  30-day window, the share that land clean on all four counts:
+  - **Unsupervised.** It finished without you babysitting it. No re-onboarding,
+    it acted on what it already knows about you.
+  - **Trusted.** It took no consequential action you didn't approve, and made
+    no off-plan model call.
+  - **Observable.** You could see what it was doing in plain words. If you had
+    to ask it for status, that turn failed.
+  - **Steerable.** You could steer it or stop it mid-flight and it listened.
+
+  A turn fails TUTR if it trips any one of the four. "Consequential" means a
+  turn that does or changes something, not a pleasantry.
+- **Now → Target:** baseline TBD (instrument first), then north of 95% once
+  there's a baseline to set the date against.
+- **Why this one:** The vision is a standing team that knows you, acts on your
+  leash, costs only the plan you pay for, and is there when you reach for it. We
+  win when work gets done that you trust, without re-explaining it or watching
+  over it. TUTR is that sentence made countable. It only climbs when all four
+  outcome Signals hold at once.
+
 ## Outcomes
 
 Every job the product serves ladders up to exactly one of these. A change
@@ -92,30 +119,30 @@ The jobs this product serves, grouped by the outcome they ladder up to.
 Each links its job spec in `jobs/`.
 
 ### standing-team
-- [`run-a-fleet-of-specialists.md`](jobs/run-a-fleet-of-specialists.md)
-- [`feel-like-a-colleague.md`](jobs/feel-like-a-colleague.md)
-- [`give-each-agent-its-own-workspace.md`](jobs/give-each-agent-its-own-workspace.md)
-- [`remember-across-sessions.md`](jobs/remember-across-sessions.md)
-- [`extend-without-forking.md`](jobs/extend-without-forking.md)
-- [`get-better-the-longer-they-run.md`](jobs/get-better-the-longer-they-run.md)
-- [`get-from-zero-to-a-working-fleet.md`](jobs/get-from-zero-to-a-working-fleet.md)
-- [`deliver-files-i-can-open.md`](jobs/deliver-files-i-can-open.md)
+- [`run-a-fleet-of-specialists.md`](jobs/run-a-fleet-of-specialists.md) — count of active specialists kept on the fleet 90+ days
+- [`feel-like-a-colleague.md`](jobs/feel-like-a-colleague.md) — share of turns answered in-persona without a re-introduction
+- [`give-each-agent-its-own-workspace.md`](jobs/give-each-agent-its-own-workspace.md) — cross-agent context/credential bleed incidents, target zero
+- [`remember-across-sessions.md`](jobs/remember-across-sessions.md) — share of turns acting on stored context vs re-asking (re-onboarding rate)
+- [`extend-without-forking.md`](jobs/extend-without-forking.md) — share of new specialists added via config only, no product fork
+- [`get-better-the-longer-they-run.md`](jobs/get-better-the-longer-they-run.md) — repeat-correction rate on the same task, trending down
+- [`get-from-zero-to-a-working-fleet.md`](jobs/get-from-zero-to-a-working-fleet.md) — time from clean box to first useful turn
+- [`deliver-files-i-can-open.md`](jobs/deliver-files-i-can-open.md) — share of file deliverables the principal opens without rework
 
 ### hold-the-leash
-- [`know-what-my-agent-is-doing.md`](jobs/know-what-my-agent-is-doing.md)
-- [`restart-and-know-what-im-running.md`](jobs/restart-and-know-what-im-running.md)
-- [`track-plan-quota-live.md`](jobs/track-plan-quota-live.md)
-- [`steer-or-queue-mid-flight.md`](jobs/steer-or-queue-mid-flight.md)
-- [`approve-what-my-agent-can-touch.md`](jobs/approve-what-my-agent-can-touch.md)
-- [`see-my-whole-fleet-from-one-screen.md`](jobs/see-my-whole-fleet-from-one-screen.md)
+- [`know-what-my-agent-is-doing.md`](jobs/know-what-my-agent-is-doing.md) — share of turns whose state reads in plain words without a log dive
+- [`restart-and-know-what-im-running.md`](jobs/restart-and-know-what-im-running.md) — share of restarts that surface an accurate running-state summary
+- [`track-plan-quota-live.md`](jobs/track-plan-quota-live.md) — quota-surprise events (hit a limit unforecast), target zero
+- [`steer-or-queue-mid-flight.md`](jobs/steer-or-queue-mid-flight.md) — share of in-flight steer/stop requests honoured before the action lands
+- [`approve-what-my-agent-can-touch.md`](jobs/approve-what-my-agent-can-touch.md) — unapproved consequential actions, target zero
+- [`see-my-whole-fleet-from-one-screen.md`](jobs/see-my-whole-fleet-from-one-screen.md) — share of fleet whose live status is visible from one view
 
 ### subscription-honest
-- [`keep-my-subscription-honest.md`](jobs/keep-my-subscription-honest.md)
-- [`share-auth-across-the-fleet.md`](jobs/share-auth-across-the-fleet.md)
-- [`crons-use-the-model-only-when-it-earns-it.md`](jobs/crons-use-the-model-only-when-it-earns-it.md)
+- [`keep-my-subscription-honest.md`](jobs/keep-my-subscription-honest.md) — off-plan callsites, target zero (CI-enforced)
+- [`share-auth-across-the-fleet.md`](jobs/share-auth-across-the-fleet.md) — auth-exhaustion turns recovered by failover, target ~100%
+- [`crons-use-the-model-only-when-it-earns-it.md`](jobs/crons-use-the-model-only-when-it-earns-it.md) — share of cron fires routed to the cheapest tier that does the job
 
 ### always-available
-- [`survive-reboots-and-real-life.md`](jobs/survive-reboots-and-real-life.md)
-- [`idempotent-update-and-restart.md`](jobs/idempotent-update-and-restart.md)
-- [`talk-to-agents-from-anywhere.md`](jobs/talk-to-agents-from-anywhere.md)
-- [`act-in-my-tools-with-an-identity.md`](jobs/act-in-my-tools-with-an-identity.md)
+- [`survive-reboots-and-real-life.md`](jobs/survive-reboots-and-real-life.md) — turns silently dropped across reboots/network drops, target zero
+- [`idempotent-update-and-restart.md`](jobs/idempotent-update-and-restart.md) — update/restart operations completing cleanly and idempotently, target ~100%
+- [`talk-to-agents-from-anywhere.md`](jobs/talk-to-agents-from-anywhere.md) — median ack latency from Telegram message to acknowledgement
+- [`act-in-my-tools-with-an-identity.md`](jobs/act-in-my-tools-with-an-identity.md) — share of external-tool actions attributable to a named agent identity

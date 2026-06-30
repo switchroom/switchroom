@@ -1,6 +1,7 @@
 ---
-artefact: ask_peer — operator-allowlisted visible cross-agent handoff
-serves: jobs/run-a-fleet-of-specialists.md
+artifact: ask_peer — operator-allowlisted visible cross-agent handoff
+serves: run-a-fleet-of-specialists
+advances-outcome: standing-team
 status: Draft v1
 ---
 
@@ -13,7 +14,7 @@ Date: 2026-06-14
 ## 1. Summary
 
 Add a way for one agent to **ask another agent a question and get the
-answer back** — without merging their memory and without either agent
+answer back**, without merging their memory and without either agent
 silently reaching into the other. A leader/EA agent (canonically
 `clerk`) calls a new MCP tool `ask_peer(agent, question)`; the question
 is delivered into the target agent's live session as a synthetic turn;
@@ -23,7 +24,7 @@ visible to the operator** the whole time.
 
 `ask_peer` is gated by an **operator-written per-pair allowlist**
 (`agents.<caller>.peers.ask_allow: [<targets>]`). An agent can never add
-itself to another's allowlist — the gate lives in config the agent
+itself to another's allowlist: the gate lives in config the agent
 cannot write (`reference/rfcs/access-model.md`: *"an agent can request more
 access, but it can never author its own authorization. Every grant is
 written by the operator, in a place the agent cannot write"*).
@@ -45,7 +46,7 @@ Anti-patterns / UAT): *"Need a thing that crosses two specialists. The
 user should be able to route it without the agents silently reaching
 into each other."* `ask_peer` turns "the user routes it" into "the user
 *pre-authorised* a route the leader can take, and still sees every
-crossing" — which is the same leash, less manual relaying.
+crossing", which is the same leash, less manual relaying.
 
 ## 3. Non-goals
 
@@ -60,7 +61,7 @@ crossing" — which is the same leash, less manual relaying.
   target's tools.
 - **Not** privilege transfer. The target runs with **its own** tools,
   vault grants, and scope. `ask_peer` never lets the caller borrow the
-  target's credentials — if gymbro can't read a key, neither can a
+  target's credentials. If gymbro can't read a key, neither can a
   question routed through it.
 
 ## 4. Design
@@ -80,14 +81,14 @@ ask_peer(agent: string, question: string, wait_seconds?: number) -> { reply: str
   executed as a command.
 - The call is **async with a bounded wait**: it returns when the target's
   reply lands or `wait_seconds` (default ~120s, capped) elapses
-  (`no_reply` — the caller can try again or tell the operator).
+  (`no_reply`; the caller can try again or tell the operator).
 
 ### 4.2 Routing (reuses existing rails)
 
 The plumbing is mostly already there:
 
 - **Out:** the gateway already routes a synthetic inbound to any agent by
-  name — `ipcServer.sendToAgent(agentName, inbound)` +
+  name: `ipcServer.sendToAgent(agentName, inbound)` +
   `dispatchAsInbound` (the cron / webhook / Linear path,
   `src/scheduler/dispatch.ts`). The `ask_peer` question is delivered the
   same way, tagged `meta.source = "peer_ask"`,
@@ -109,7 +110,7 @@ Both legs are operator-visible, not just logged:
 - The **question** posts into the **target's** topic ("🔁 clerk asks: …")
   so the operator sees clerk reached into gymbro.
 - The **reply** is what clerk synthesises back to the operator in clerk's
-  own turn ("I checked with gymbro — …"), per the
+  own turn ("I checked with gymbro, …"), per the
   `conversational-pacing.md` "hand back delegations with synthesis" beat.
 
 So a cross-agent crossing is never invisible: the operator can read it in
@@ -125,7 +126,7 @@ agents:
       ask_allow: [gymbro, ziggy]   # operator-written; clerk cannot add to this
 ```
 
-- Default: **empty** (no agent can `ask_peer` anyone — batteries-included
+- Default: **empty** (no agent can `ask_peer` anyone, batteries-included
   safe default, `reference/principles.md` defaults test).
 - The target may *also* opt out of being asked
   (`agents.<target>.peers.askable: false`) so a sensitive specialist is
@@ -140,7 +141,7 @@ agents:
    "What's Ken's current weekly mileage and any flags for a taper?")`.
 3. gymbro's topic shows "🔁 clerk asks: …"; gymbro answers from **its own**
    Garmin/coaching context.
-4. The reply routes back; clerk replies to Ken: "Checked with gymbro —
+4. The reply routes back; clerk replies to Ken: "Checked with gymbro,
    you're at ~45km/wk, HRV's been low this week, so here's a conservative
    taper…"
 
@@ -166,20 +167,20 @@ target's bank (`X-Bank-Id: <target>`, write tools denied).
 
 Rejected as the primary mechanism because:
 
-- It is the **named anti-pattern** — `run-a-fleet-of-specialists.md`:
+- It is the **named anti-pattern**, `run-a-fleet-of-specialists.md`:
   *"Shared memory across all agents. Every specialist should have its own
   view of the user."* and `remember-across-sessions.md` bans *"conflating
   … different specialists into one undifferentiated memory pool."*
-- **All-or-nothing per bank** — it can't distinguish a safe summary from a
+- **All-or-nothing per bank.** It can't distinguish a safe summary from a
   confidential detail, so the most-useful targets (lawgpt = estate case,
   finn = banking, gymbro = health) are exactly the ones it would leak.
-- **Silent** — the caller ingests another agent's memory with no operator
+- **Silent.** The caller ingests another agent's memory with no operator
   visibility (fails the leash).
-- **Lower value** — returns stale extracted facts, can't act, and can't
+- **Lower value.** Returns stale extracted facts, can't act, and can't
   give the live answer `ask_peer` does.
 
-A narrower variant — a curated **shared "team board"** bank that agents
-*publish* select facts to (the source mediates), read by the leader — is
+A narrower variant, a curated **shared "team board"** bank that agents
+*publish* select facts to (the source mediates), read by the leader, is
 contract-acceptable and complementary. It serves *passive awareness of
 standing facts* where `ask_peer` serves *live answers + delegation*. It
 is out of scope here but noted as a possible companion (the unused
@@ -187,18 +188,18 @@ is out of scope here but noted as a possible companion (the unused
 
 ## 8. Principle checks (`reference/principles.md`)
 
-- **Docs test:** the chat teaches it — "I checked with gymbro" is
+- **Docs test:** the chat teaches it. "I checked with gymbro" is
   self-explanatory; no docs needed to understand a crossing happened.
 - **Defaults test:** empty allowlist out of the box; the capability is
   dormant until the operator lists a pair. No dangerous default.
 - **Consistency test:** reuses `peers_list` (same server), the
   `inject_inbound` transport, the approval/visibility surface, and the
-  "hand back with synthesis" pacing beat — same shapes as adjacent
+  "hand back with synthesis" pacing beat, same shapes as adjacent
   features.
 
 ## 9. Phasing
 
-- **Phase 0 (shipped, this workstream):** `clerk` soul `Boundaries` —
+- **Phase 0 (shipped, this workstream):** `clerk` soul `Boundaries`,
   router-advisor behaviour using the existing `peers_list`. clerk names
   who owns a domain and offers to route, and is told never to reach into
   another agent's memory/vault/state. Zero new capability; immediate
@@ -222,7 +223,7 @@ is out of scope here but noted as a possible companion (the unused
    per-turn ask count enough, or do we need a fleet-wide rate limit?
 4. **Target persona for the answer.** Should the target know it's
    answering a peer (so it can be terse/structured) vs. answering the
-   operator? Probably yes — `meta.ask_from` lets its prompt adapt.
+   operator? Probably yes; `meta.ask_from` lets its prompt adapt.
 
 ## 11. Effort estimate (agent-minutes)
 

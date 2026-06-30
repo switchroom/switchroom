@@ -1,22 +1,23 @@
 ---
-artefact: agent-managed skills — fleet capability lifecycle
-serves: jobs/extend-without-forking.md
+artifact: agent-managed skills — fleet capability lifecycle
+serves: extend-without-forking
+advances-outcome: standing-team
 status: Historical — shipped (Phase 1 + 3); Phase 2a superseded
 ---
 
 # RFC: Agent-managed skills — fleet capability lifecycle
 
-Status: **Historical** — Phase 1 (personal-skill autonomy) shipped in
+Status: **Historical**. Phase 1 (personal-skill autonomy) shipped in
 PR #1825, Phase 3 (`skill_search` MCP) in PR #1826; agent-default
 follow-up in PR #1828; 60-day observability in PR #1829. Phase 2
 remains deferred. Original framing below preserved as institutional
 memory.
 
-Original status: Draft v3 — **rescoped to Option B + tactical CLI
+Original status: Draft v3, **rescoped to Option B + tactical CLI
 escape hatch** after four independent Opus reviewer passes (2026-05-25)
 Date: 2026-05-25
 Reviewer pass v1 → v2: 1 reviewer (general-purpose, 8 items incorporated)
-Reviewer pass v2 → v3: 4 reviewers (Opus, parallel, distinct angles —
+Reviewer pass v2 → v3: 4 reviewers (Opus, parallel, distinct angles:
 security threat model / implementation feasibility / operator UX /
 independent design alignment)
 
@@ -58,7 +59,7 @@ fleet co-manages":
    without prejudicing the larger design.
 
 2. **PR-2 (Phase 0 spike, 2-3h):** Documentation-only PR resolving the
-   load-bearing unknowns surfaced by reviewers — claude-code subdir
+   load-bearing unknowns surfaced by reviewers: claude-code subdir
    discovery semantics, `.trash/` exclusion, `skill-creator` overlap,
    upstream Anthropic personal-skills feature signals, path-conflict
    risk. Outcome: written design decision for Phase 1's on-disk
@@ -70,7 +71,7 @@ fleet co-manages":
    / `skill_remove_personal` / `skill_list_personal`. Multi-file
    bundle validator (new code per feasibility review). `O_NOFOLLOW |
    O_EXCL` writes (per security T3). Trash-dir soft-undo with
-   sweep mechanism per PR-2's decision (NOT host-side cron — switchroom
+   sweep mechanism per PR-2's decision (NOT host-side cron; switchroom
    has none post-Phase-4; likely a lazy-on-write sweep + an
    agent-scheduler-registered immutable schedule entry the agent
    can't disable). Pre-publish `claude -p` content scan in skill
@@ -82,7 +83,7 @@ fleet co-manages":
    returning SKILL.md frontmatter, no approval required.
 
 **What does NOT ship in v3:** the `skill_propose_publish` /
-`skill_propose_edit` hostd verbs (the heavy machinery — approval card
+`skill_propose_edit` hostd verbs (the heavy machinery: approval card
 UX, audit-log integration, multi-file apply primitive, `proposed_opt_ins`
 chaining, the 8 reviewer must-fixes). Tracked in
 [GH issue: deferred Phase 2 design].
@@ -92,7 +93,7 @@ independently recommended Option B. The triggering pain (two paste-
 and-relay loops during a debug session) is N=1 evidence; a 2-hour CLI
 verb solves it today. The shared-pool publish/edit machinery is
 ~17h of work resting on assumptions about an approval-card UX whose
-needs we don't yet know — personal-skill usage in PR-3 generates the
+needs we don't yet know. Personal-skill usage in PR-3 generates the
 signal that should drive that design.
 
 ## 2. Operator workflows v3 serves
@@ -145,12 +146,12 @@ there's no path to make it shared.
 After v3: still doesn't exist *automatically*. Operator can use PR-1
 to manually publish a personal skill they want to share (read it out
 of the agent's personal-skill dir, run `switchroom skill apply`).
-The full `skill_propose_publish` approval-card flow is deferred —
+The full `skill_propose_publish` approval-card flow is deferred:
 the design needs personal-skill telemetry from PR-3 first.
 
 ### Workflow 4 — "Retire skills nothing uses anymore." *(anticipated, deferred)*
 
-Not yet a felt operator pain — the fleet hasn't run long enough for
+Not yet a felt operator pain. The fleet hasn't run long enough for
 skill-rot to materialise. PR-4's `skill_search` makes the audit
 possible (list pool entries + opt-ins); the *retirement primitive*
 itself is deferred. If skill-rot is never observed in practice, the
@@ -168,15 +169,15 @@ workflow.
 
 ## 3. Outcome being optimized for
 
-Quoting `reference/vision.md` pillar 4 (*always available*) — *"there
+Quoting `reference/vision.md` pillar 4 (*always available*): *"there
 in Telegram the second you reach for it; survives reboots, runs its
 schedules."* A fleet whose toolkit can't evolve without the operator
 at a terminal does not fully meet this pillar. Tonight's debug session
 proved it: two consecutive skill patches each took a 9-step
-choreographed pasting loop. That's not always-available — that's the
+choreographed pasting loop. That's not always-available. That's the
 operator being on-call for skill maintenance.
 
-Quoting pillar 1 (*standing team of specialists*) — skills are the
+Quoting pillar 1 (*standing team of specialists*): skills are the
 toolkit each specialist carries. Letting the specialists maintain
 their own toolkit is the difference between handing someone a wrench
 and equipping them to set up the workshop.
@@ -187,9 +188,9 @@ The principle test:
   After this RFC, the agent itself authors via skill-creator (already
   bundled), no doc-reading by the operator required.
 - **Defaults test** — "does it work on a fresh `switchroom setup`?"
-  Yes — the personal-skill dir is part of scaffold, no extra config.
+  Yes. The personal-skill dir is part of scaffold, no extra config.
 - **Consistency test** — same CLI shape, cascade, vault syntax,
-  progress card as adjacent features? Yes — `skill_propose_*` mirrors
+  progress card as adjacent features? Yes. `skill_propose_*` mirrors
   `config_propose_edit` exactly; same approval-card shape; same audit
   log entries.
 
@@ -213,7 +214,7 @@ skill location anywhere today.
 
 `<agentDir>/.claude/skills/<name>` is a symlink into the pool,
 created by `scaffold.ts:syncGlobalSkills` (`src/agents/scaffold.ts:
-720-814`). Idempotent — broken symlinks are refreshed; correct ones
+720-814`). Idempotent: broken symlinks are refreshed, correct ones
 skipped; foreign files left alone.
 
 ### 4.3 Agents CAN opt themselves IN to bundled skills
@@ -226,10 +227,10 @@ The agent writes an overlay file at
 the symlink lands.
 
 **Important**: this means **half of the JTBDs above are already
-50% solved** — agents can opt in to bundled skills today, without
+50% solved**: agents can opt in to bundled skills today, without
 operator approval, and the precedent for per-agent overlay-driven
 skill management exists. What's missing is everything *upstream* of
-that — actually authoring a new skill, editing pool content,
+that: actually authoring a new skill, editing pool content,
 publishing personal → shared.
 
 ### 4.4 SKILL.md validator already exists
@@ -298,7 +299,7 @@ tier: shared           # personal | shared | bundled
 **Back-compat verified during review**: the existing validator at
 `skill-common.ts:151-226` only enforces `name` + `description`;
 unknown frontmatter keys are silently kept. So the extension is
-purely additive — no existing skill breaks, and old switchroom CLIs
+purely additive: no existing skill breaks, and old switchroom CLIs
 reading a new skill just ignore the new fields.
 
 ### 5.4 No search / discovery surface
@@ -306,12 +307,12 @@ reading a new skill just ignore the new fields.
 No `skill_search` MCP op exists. Need a read-only enumerator that
 returns: pool entries, JTBD summary, current opt-ins per skill,
 date authored, recent edits. Cheaply built on top of `readdir` +
-SKILL.md frontmatter parse — no new state.
+SKILL.md frontmatter parse. No new state.
 
 ## 6. Proposed model
 
 Same shape as `config_propose_edit` (RFC `admin-agent-config-edit.md`)
-— a tightly-scoped hostd write primitive gated by the operator's
+a tightly-scoped hostd write primitive gated by the operator's
 existing approval-card UI. Reuses every load-bearing component.
 
 ### 6.1 Two new hostd verbs
@@ -387,12 +388,12 @@ Server-side flow on both:
 The existing `installSwitchroomSkills` machinery (`scaffold.ts:838-
 944`) gates a small set of skills to `foreman`-role agents. The new
 `skill_propose_publish` does *not* automatically respect role gating
-— `proposed_opt_ins` is the proposer's recommendation, not a
+`proposed_opt_ins` is the proposer's recommendation, not a
 hard contract. On approve, the card shows any opt-in agents whose
 role is incompatible with the skill's declared tools (when SKILL.md
 declares `tools:`) so the operator can drop them before confirming.
 Worst case the skill lands and is wired up via symlink for an
-incompatible-role agent — claude-code's per-skill role enforcement
+incompatible-role agent; claude-code's per-skill role enforcement
 (if any) becomes the runtime check, same as today's pool. The RFC
 does NOT introduce role-aware refusal at write-time.
 
@@ -407,7 +408,7 @@ distinction earns its keep.
 ### 6.2 New agent-config MCP op for personal-skill scope
 
 **`skill_init_personal`** — agent creates a personal skill in its
-own workspace. No approval needed — agent's own files.
+own workspace. No approval needed, agent's own files.
 
 ```typescript
 {
@@ -464,13 +465,13 @@ extending the schema is purely additive.
 
 **Strictness stays permanent-passthrough.** An earlier draft of this
 RFC proposed flipping the validator to reject unknown keys once the
-new fields shipped — that's a rollout footgun: every operator-pool
+new fields shipped. That's a rollout footgun: every operator-pool
 skill carrying a typo'd or experimental field would break at next
 reconcile. Permanent passthrough means the new fields are
 *signals* the approval card can render when present, never gates
 that fail validation when absent. If per-skill strictness ever
 becomes useful, opt in via `strict_frontmatter: true` in the skill
-itself — never a global flip.
+itself, never a global flip.
 
 ### 6.5 Vault-key auto-grant on opt-in (stretch)
 
@@ -478,7 +479,7 @@ If a skill declares `vault_keys: [garmin/credentials]` and an agent
 opts in via `skill install bundled:garmin`, the skill's declared
 vault keys could be **proposed for grant** to that agent (separate
 approval card, mirroring the existing vault grant flow). Keeps the
-"skill is a self-contained capability" invariant — installing the
+"skill is a self-contained capability" invariant: installing the
 skill installs everything it needs.
 
 Out of scope for v1 (covered by the existing
@@ -507,7 +508,7 @@ Mapping to this RFC:
 **Soft-undo for `skill_remove_personal`** (cheap insurance, real
 recovery value): the op moves the skill dir to
 `<agentDir>/.claude/skills/.trash/<name>-<unix-ts>/` rather than
-unlinking. A sweep mechanism (per PR-2's design decision — switchroom
+unlinking. A sweep mechanism (per PR-2's design decision: switchroom
 has no host-side cron post-Phase-4, so likely a lazy-on-write sweep
 plus an immutable scaffold-baked agent-scheduler entry) deletes
 trash entries older than 24h.
@@ -516,7 +517,7 @@ cycle; benefit: the failure mode "agent removed a skill mid-use,
 context broken on next turn" gets a 24h window to undo. Same
 philosophy as the operator's standing `trash > rm` preference (per
 global CLAUDE.md). No equivalent needed for `skill_propose_remove`
-on the shared pool — operator-gated removal is already a deliberate
+on the shared pool; operator-gated removal is already a deliberate
 human-checked decision.
 
 **Deliberately out of v1**: auto-approve heuristics for small
@@ -589,7 +590,7 @@ Workflow 2 today without committing to the heavy machinery.
   pattern (mirrors `overlay-writer.ts:writeOverlayEntry` shape,
   generalised to a multi-file write).
 - Runs `bash -n` on every `scripts/*.sh` and `python -m py_compile`
-  on every `scripts/*.py` before the write — same pre-publish
+  on every `scripts/*.py` before the write: same pre-publish
   validation Phase 2 would have done.
 - Runs `switchroom apply` on success to re-sync agents.
 - `--dry-run` validates + diffs against current pool content, prints
@@ -649,7 +650,7 @@ After PR-2 resolves the layout. Implementation:
   payload contents. (Closes security review T3.)
 - **Trash-dir soft-undo** (per §7): `skill_remove_personal` moves to
   trash-dir; sweep mechanism per PR-2 (#1818) decision. **Not a
-  host-side cron** — switchroom retired host-side cron in Phase 4
+  host-side cron**: switchroom retired host-side cron in Phase 4
   (`src/agents/lifecycle.ts:841`). The most likely answer from PR-2's
   spike is a *lazy sweep* (on next `skill_remove_personal` / agent
   boot, sweep trash entries older than 24h) plus an immutable
@@ -658,7 +659,7 @@ After PR-2 resolves the layout. Implementation:
 - **Pre-publish content scan**: every `scripts/*.{sh,py}` file in the
   payload is grepped server-side for `\bclaude\s+-p\b`; reject the
   write if found. Closes the CI-guard gap that was flagged by both
-  security and feasibility reviewers — the existing
+  security and feasibility reviewers; the existing
   `tests/bridge-flap-regression-guard.test.ts` only scans TS source.
 - **Behavioral validation**: `bash -n` on shell scripts,
   `python -m py_compile` on python scripts. Surface structured
@@ -701,15 +702,15 @@ that suite before it can ship safely:
 
 1. Per-opt-in vault-grant delta on approval card (security T6)
 2. Multi-file diff attachment flow (UX) + content-quoting for `scripts/*`
-3. Personal-skill writer symlink safety (security T3) — covered in PR-3
+3. Personal-skill writer symlink safety (security T3), covered in PR-3
 4. Rationale typographic quarantine + 200-char cap (UX + security T5)
 5. Semantic lint pass for diff content (security T2)
 6. Per-agent rate-limit on propose verbs (security T8)
-7. `.trash/` claude-code-scan exclusion (security T4) — covered by PR-2
+7. `.trash/` claude-code-scan exclusion (security T4), covered by PR-2
 8. Strict line-equality patcher for diffs (security)
 
 Plus the new finding from feasibility review: the "mirrors
-`config_propose_edit`" claim is structurally wrong — the existing
+`config_propose_edit`" claim is structurally wrong: the existing
 framework is single-file-YAML-only. A real Phase 2 would need a new
 multi-file apply primitive, new approval-card multi-file payload
 shape, new audit-log entries. Net new code, not reuse.
@@ -735,7 +736,7 @@ naming collisions) or wait for upstream support.
 **Action**: gating spike (Phase 0 in §8). Resolution captured in
 writing before Phase 1 implementation begins. If subdir-blocked,
 fall back to the name-prefix convention
-(`<agentDir>/.claude/skills/personal-<name>/`) — same primitives,
+(`<agentDir>/.claude/skills/personal-<name>/`), same primitives,
 slightly different directory layout. Phase 1's MCP op shapes don't
 change; the on-disk layout does.
 
@@ -768,7 +769,7 @@ new hostd verbs.
 Today: `secrets:` on a *cron schedule entry* declares vault-key
 needs (`schema.ts:79-91`). Tomorrow: `vault_keys:` in *SKILL.md
 frontmatter* declares the same for the skill as a whole. Two
-mechanisms saying the same thing about different scopes —
+mechanisms saying the same thing about different scopes:
 acceptable, or should the schedule-entry one fold into the skill
 one (skills declare needs; schedule entries reference skills)?
 
@@ -831,19 +832,19 @@ Default: pool-resolution-order is enough. Lookup goes:
   get JTBD summaries before authoring (no duplicate-skill creation).
 - **AC-4**: Audit log shows every skill mutation tagged with proposer
   agent + outcome + sha256.
-- **AC-5**: SKILL.md frontmatter extension is back-compat — existing
+- **AC-5**: SKILL.md frontmatter extension is back-compat: existing
   skills without `jtbd:`/`vault_keys:` keep validating and working.
 - **AC-6**: Bundled skills remain source-PR only (no in-fleet edit
   path); this verb-set never writes under `skills/_bundled/`.
 - **AC-7**: Pre-publish behavioral validation runs server-side before
-  the approval card renders — `bash -n` on every `scripts/*.sh`,
+  the approval card renders: `bash -n` on every `scripts/*.sh`,
   `python -m py_compile` on every `scripts/*.py`. A skill containing
   a script with syntax errors cannot reach the approval card; the
   proposer agent gets a structured error pointing at the failing
   file:line. The static SKILL.md validator (`name`, `description`,
   size, path allowlist) keeps running first; behavioral validation
   is an additional gate on top.
-- **AC-8**: `skill_remove_personal` is recoverable — a removed skill
+- **AC-8**: `skill_remove_personal` is recoverable: a removed skill
   lands in `.trash/` for 24h before the sweep mechanism finalises
   the delete. An agent (or operator) can `mv` it back inside the
   window with no other state change.

@@ -1,6 +1,7 @@
 ---
-artefact: agent-managed skills phase 0 findings
-serves: jobs/extend-without-forking.md
+artifact: agent-managed skills phase 0 findings
+serves: extend-without-forking
+advances-outcome: standing-team
 status: design decisions, ready to drive PR-3 implementation
 ---
 
@@ -23,7 +24,7 @@ recorded here.
 
 **Evidence**:
 
-Claude Code v2.x's skill discovery is **depth-1** — the glob is
+Claude Code v2.x's skill discovery is **depth-1**: the glob is
 `<root>/<skill-name>/SKILL.md`. Nested subdirs are NOT scanned. This
 was verified two ways:
 
@@ -34,13 +35,13 @@ was verified two ways:
   `plugin:skill-name`).
 
 - Direct extraction from the Claude Code v2.1.150 binary at
-  `~/.local/share/claude/versions/2.1.150` — string
+  `~/.local/share/claude/versions/2.1.150`. String
   extract confirms the discovery glob is depth-1, hard-coded to
   `.claude/skills/` and `~/.claude/skills/`. No "personal" subdir
   keyword anywhere in the binary.
 
 **Implication**: the originally-proposed `.claude/skills/personal/<name>/`
-subdir layout (RFC v2's design) is **silently broken** — claude-code
+subdir layout (RFC v2's design) is **silently broken**: claude-code
 would never discover those skills. The `personal-` name-prefix layout
 works today with zero shim.
 
@@ -66,13 +67,13 @@ durable bonus of operational legibility (everything lives under
 
 - Claude-code's depth-1 discovery glob targets `.claude/skills/`.
   Anything under `.claude/skills-trash/` is outside the discovery
-  root — guaranteed not scanned.
+  root, guaranteed not scanned.
 - Putting trash inside `.claude/skills/.trash/` would *probably* work
   (the dotfile prefix + missing SKILL.md should silently skip), but
   the convention is implicit and fragile to future upstream changes.
   A sibling dir is explicit and absolute.
 - Switchroom's own validator code (`skill-common.ts`) has no
-  awareness of either trash location — no false-positive risk either
+  awareness of either trash location, so no false-positive risk either
   way. The sibling-dir choice is purely about clarity and
   futureproofing.
 
@@ -89,17 +90,17 @@ namespace, less clean).
 **Evidence**:
 
 The `skill-creator` skill (Anthropic-vendored, lives at
-`skills/skill-creator/`) is an *authoring workflow* — it teaches the
+`skills/skill-creator/`) is an *authoring workflow*. It teaches the
 agent end-to-end (draft → test → eval → improve → optimize
 description → package). It runs `claude -p` as a subprocess in
 three places (`scripts/improve_description.py:26,174` and
-`scripts/run_eval.py:71-78`) to power its eval framework — these are
+`scripts/run_eval.py:71-78`) to power its eval framework. These are
 bundled-skill operator-sourced invocations, not content-delivery
 calls.
 
 The skill's *output* (the skill the agent authors using it) lands at
 `$CLAUDE_CONFIG_DIR/skills/<name>/` via direct Write/Edit tool calls
-inside the agent — same path PR-3 will route through
+inside the agent, the same path PR-3 will route through
 `skill_init_personal`. So the **path collides** but the **mechanism
 differs**:
 
@@ -173,7 +174,7 @@ Comprehensive grep across `src/` confirmed:
   `.claude/skills/`.
 - The `agent-config skill install --source bundled:<name>` overlay
   path (`~/.switchroom/agents/<name>/skills.d/<slug>.yaml`) is a
-  completely different filesystem location — no conflict with
+  completely different filesystem location, no conflict with
   in-skills-dir personal skills.
 
 **Greppable receipts** (every regex match assessed):
@@ -215,7 +216,7 @@ apply sweeps), neither of which an in-agent attacker can disable.
 **Recovery window guarantee**: 24h from the `skill_remove_personal`
 call until the next sweep finalises. If the agent never invokes
 another MCP op AND the container never restarts in 24h, the trash
-entry lives indefinitely — degraded behavior, not a security
+entry lives indefinitely: degraded behavior, not a security
 problem (the operator just sees more disk usage). Acceptable.
 
 ---
@@ -247,14 +248,14 @@ unless required.
 
 ## Open questions for PR-3 (out of Phase 0 scope)
 
-- Permissions on `.claude/skills-trash/<name>-<ts>/` — mode 0700 owned
+- Permissions on `.claude/skills-trash/<name>-<ts>/`: mode 0700 owned
   by agent UID (same as parent `.claude/skills/`)? Confirm during
   implementation; should be the obvious default.
 - Race condition on lazy sweep vs concurrent `skill_remove_personal`
-  — likely handled by file-by-file unlink with `ENOENT` tolerance,
+  is likely handled by file-by-file unlink with `ENOENT` tolerance,
   but verify during implementation.
 - Whether the scaffold boot-time sweep is part of `switchroom apply`
-  or `switchroom agent restart` — both are needed for full coverage,
+  or `switchroom agent restart`: both are needed for full coverage,
   but `apply` is the more frequently-invoked operator verb.
 
 These are Phase-1-implementation-detail; they don't gate the design

@@ -1,8 +1,8 @@
 ---
-artefact: Per-speaker memory routing — recall the right user's bank by Telegram sender
-serves: jobs/remember-across-sessions.md
+artifact: Per-speaker memory routing — recall the right user's bank by Telegram sender
+serves: remember-across-sessions
+advances-outcome: standing-team
 relates: jobs/run-a-fleet-of-specialists.md, jobs/feel-like-a-colleague.md
-backs: single-tenant
 status: proposal (2026-06-19) — design + effort, gate cleared, not yet scheduled
 ---
 
@@ -17,7 +17,7 @@ it costs.
 
 Serves [`remember-across-sessions`](../jobs/remember-across-sessions.md):
 the agent brings back *the right* facts in the moment. With multiple users
-on one agent, "the right facts" is speaker-dependent — Lisa's preferences
+on one agent, "the right facts" is speaker-dependent. Lisa's preferences
 are noise in a turn with Ken, and vice-versa. Two payoffs at once:
 
 1. **Privacy / relevance** — one user's memories don't bleed into another
@@ -35,7 +35,7 @@ user memory privacy."*
 Routing data by human identity *looks* like multi-tenancy, so it has to
 pass the by-construction test. It does, because:
 
-- It stays **one tenant** — every bank is the operator's data, in the
+- It stays **one tenant**. Every bank is the operator's data, in the
   operator's hindsight instance, fully visible to the operator. A per-user
   bank is a *recall scope*, not a private silo the operator can't see.
 - It is **additive recall scoping, never authorization.** Who may drive an
@@ -44,7 +44,7 @@ pass the by-construction test. It does, because:
   the agent.
 
 If a future change tries to make per-user routing an *isolation-from-the-operator*
-or an *access-control* boundary, that change — not this one — trips the
+or an *access-control* boundary, that change (not this one) trips the
 invariant.
 
 ## How it works — the plumbing already exists
@@ -58,7 +58,7 @@ Every Telegram inbound is wrapped in a `<channel source="telegram"
 chat_id="…" user="…" …>` envelope before it reaches the `claude` session.
 The gateway emits the sender per-message:
 
-(Citations are symbol-based — line numbers in these files drift.)
+(Citations are symbol-based; line numbers in these files drift.)
 
 - `handleInbound` (`telegram-plugin/gateway/gateway.ts`) captures `ctx.from`.
 - It assembles the `InboundMessage` carrying `userId: from.id` plus
@@ -73,7 +73,7 @@ The gateway emits the sender per-message:
 
 So the speaker is **physically in the prompt text** the recall hook reads
 from stdin (`vendor/hindsight-memory/scripts/recall.py`). The hook already
-parses sibling attributes out of that same envelope head —
+parses sibling attributes out of that same envelope head:
 `extract_chat_id_from_prompt` / `extract_topic_from_prompt` in
 `vendor/hindsight-memory/scripts/lib/gateway_ipc.py`.
 
@@ -85,7 +85,7 @@ merges the results (the additional-banks loop in `recall.py`). It's
 production-hardened: the cache key includes the extra banks, each extra bank
 has an 8 s timeout with headroom inside the 12 s hook ceiling, and a failed
 extra-bank recall is non-fatal. `derive_bank_id` (`scripts/lib/bank.py`)
-even has a `user` granularity segment already — it just sources the user
+even has a `user` granularity segment already. It just sources the user
 from a *static boot-time* env (`HINDSIGHT_USER_ID`), not the per-message
 sender. That static-vs-per-message gap is the entire feature.
 
@@ -102,12 +102,12 @@ topic.
 ## The change
 
 1. **Vendor hook** (`vendor/hindsight-memory/`, as marked
-   `# Switchroom-local:` additions — the existing convention):
+   `# Switchroom-local:` additions, the existing convention):
    - Add `extract_user_from_prompt(prompt)` to `gateway_ipc.py` (a ~3-line
      sibling of the chat-id/topic extractors).
    - In `recall.py`, after deriving `bank_id`, look the sender up in a
      switchroom-provided map and **append the resolved bank to
-     `additional_banks`** (additive — the agent's own bank is still
+     `additional_banks`** (additive, the agent's own bank is still
      recalled).
    - Add the sender to `_cache_key` so two speakers in one session with the
      same prompt don't collide on the recall cache.
@@ -152,7 +152,7 @@ Recommended sequence:
   (only the hook sees the per-message sender), so it's a vendor patch with
   an upstream-sync note, landed as marked `# Switchroom-local:` additions.
 - **Username vs numeric id.** `user=` is `from.username ?? String(from.id)`
-  — username-less senders key by numeric id. The map must accept both;
+  so username-less senders key by numeric id. The map must accept both;
   normalize switchroom-side or document the key format.
 
 ## Effort

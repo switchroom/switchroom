@@ -1,6 +1,7 @@
 ---
-artefact: Hindsight primitive fit — use the synthesis layers the memory job demands
-serves: jobs/remember-across-sessions.md
+artifact: Hindsight primitive fit — use the synthesis layers the memory job demands
+serves: remember-across-sessions
+advances-outcome: standing-team
 relates: jobs/run-a-fleet-of-specialists.md, jobs/feel-like-a-colleague.md
 status: proposal (2026-06-18, rev. speed/token budget) — analysis + phased plan, not yet scheduled
 ---
@@ -8,8 +9,8 @@ status: proposal (2026-06-18, rev. speed/token budget) — analysis + phased pla
 # Hindsight synthesis layers — what we run vs. what the job asks for
 
 Switchroom runs the Hindsight memory engine but consumes only its
-weakest layer. Hindsight ships four tiers of memory — raw facts,
-**observations**, **directives**, **mental models** — and an agentic
+weakest layer. Hindsight ships four tiers of memory (raw facts,
+**observations**, **directives**, **mental models**) and an agentic
 **reflect** path built to prefer the top tiers. Switchroom uses it as a
 *raw-fact store*: retain everything → recall raw `world`/`experience`
 facts → inject them invisibly. That is close to the exact shape the
@@ -18,7 +19,7 @@ names as **bad** ("raw transcript dumping passed off as memory",
 "grab-bag", "every memory equally weighted"). The synthesis tiers are
 the job's **good** ("curated, semantic, retrieved by relevance",
 "honest legible answer about what it believes and why"), and they're
-already being generated on the subscription — just not consumed.
+already being generated on the subscription, just not consumed.
 
 This is a design record + phased proposal. It does not change a job
 spec or an invariant; it argues for using capability we already pay
@@ -33,13 +34,13 @@ for, within the lines.
   requests `types=["world","experience"]` only (vendored plugin default;
   `vendor/hindsight-memory/scripts/lib/config.py`), so the synthesized
   layer is excluded from what reaches the agent. We pay the
-  consolidation cost and drop the output.
+  consolidation cost and throw away the output.
 - **One mental model per agent.** Every agent bank has exactly the
   host-seeded `user-profile` model (`src/memory/hindsight.ts`
   `ensureUserProfileMentalModel`). Nothing creates more; the engine
   never auto-creates them (only `create_mental_model` does, an explicit
   call). The richer banks (clerk/`assistant`: 4 models; `lawgpt`: 7)
-  were curated by hand, not grown.
+  were curated by hand. They didn't grow on their own.
 - **Reflect prefers the tiers we don't feed it.** The reflect agent's
   forced tool order is `search_mental_models` → `search_observations`
   → `recall` (raw) (with `expand` available but not forced); on a
@@ -83,13 +84,13 @@ extraction, synthesis, and voice per bank.
 ## Where Hindsight would *not* help — invariant tensions
 
 The synthesis tiers help, but some of Hindsight's always-on behavior
-rubs against switchroom's lines. Name these honestly; the proposal is
+rubs against switchroom's lines. Name these honestly. The proposal is
 shaped to stay clean of them.
 
 1. **Silent background consolidation vs
    [`chat-is-the-single-source-of-truth`](../invariants.md) + `on-leash`.**
    The engine runs LLM consolidation/observation/graph-building the
-   operator never triggered and never sees — "memory silently updating
+   operator never triggered and never sees. "Memory silently updating
    on patterns the user can't see" is the anti-pattern the job names.
    Bounded and inspectable in output, but it is background model-spend
    on the subscription the operator didn't initiate (also brushes
@@ -101,11 +102,11 @@ shaped to stay clean of them.
 3. **Auto-creating mental models vs `on-leash` / `no-self-escalation`.**
    An agent enriching its own memory structure unprompted is borderline
    self-escalation. The invariant-clean shape is **operator-curated, or
-   agent-proposes → operator-confirms, surfaced in chat** — never a
+   agent-proposes → operator-confirms, surfaced in chat**, never a
    silent self-write.
 4. **No time-based decay is actually aligned.** Hindsight never forgets
    (recency is a soft ±10% weight); the job calls silent forgetting bad
-   and wants *explicit* demote/correct — which exists (the
+   and wants *explicit* demote/correct, which exists (the
    `[demote-from-recall]` tag + `invalidate_memory`). Keep it.
 
 `single-tenant` and `claude-native` are satisfied by construction
@@ -121,21 +122,21 @@ and crosses no invariant.
 Add `observation` to the auto-recall `types`. Turns 45k of paid-for,
 deduped, provenance-carrying observations from dead weight into the
 "curated, by-relevance" recall the job demands. Pure consumption change
-(retrieval + local rerank, no model call) — it adds one
+(retrieval + local rerank, no model call). It adds one
 per-fact-type retrieval arm, but the cross-encoder rerank stays bounded
-by the 300-candidate cap, so the added latency is *bounded*, not zero;
-and observations are *denser* (one synthesized statement replaces N raw
+by the 300-candidate cap, so the added latency is *bounded*, not zero.
+And observations are *denser* (one synthesized statement replaces N raw
 facts) so coverage improves inside the same 1024-token cap. **Do not**
 route the hot recall path through `reflect` (an agentic loop, ~5–10
-iterations / 10 ceiling, 300s wall-timeout) — that would blow warm TTFO
-(~1.7s) into seconds and multiply per-turn tokens; reflect stays reserved
+iterations / 10 ceiling, 300s wall-timeout): that would blow warm TTFO
+(~1.7s) into seconds and multiply per-turn tokens. Reflect stays reserved
 for explicit "what do you know about me" asks (where it belongs and is
-kept — Phase 5 builds on it).
+kept, Phase 5 builds on it).
 
 **Phase 2 — Specialize each bank.** Set a per-agent `retain_mission` /
 `reflect_mission` / `disposition` from the agent's profile (a coach
 extracts/voices differently than a lawyer). Makes specialists'
-memory *specialized*, not merely *isolated* — directly serves
+memory *specialized*, not merely *isolated*, and directly serves
 fleet-of-specialists. Operator-config-driven (no-self-escalation clean).
 
 **Phase 3 — Directives as the "corrections stick" path.** Route
@@ -146,7 +147,7 @@ respected / correction sticks" criteria.
 
 **Phase 4 — Make memory chat-legible (sparse, not per-turn).** Surface a
 terse "remembered: X" / "updated what I know about Y" line so recall and
-consolidation stop being invisible — closing tension (1) and (2). **This
+consolidation stop being invisible, closing tension (1) and (2). **This
 must be sparse and material-only**, never default-on-every-turn:
 the job lists "regurgitating old facts unprompted just to prove it
 remembered" as a top anti-pattern, so a per-turn legibility line would
@@ -158,10 +159,10 @@ side without polling.
 Operator-curated, or agent-proposes → operator-confirms in chat, for
 specialists that earn a pinned model (the gap behind "Hindsight doesn't
 create models as needed"). Deliberately *not* autonomous creation
-(tension 3). Curate **selectively** — a model set to
+(tension 3). Curate **selectively**: a model set to
 `refresh_after_consolidation` (which defaults *off*) adds
 post-consolidation refresh spend (bounded ~2048 tokens, and a reflect
-refresh can hit the 300s wall-timeout — observed historically on this
+refresh can hit the 300s wall-timeout, observed historically on this
 fleet), so more refresh-enabled models is more invisible background cost.
 Their upside is real on the *explicit* reflect path (fresh models let
 reflect short-circuit the lower tiers → faster), but they do not speed
@@ -170,32 +171,32 @@ the hot recall path.
 **Phase 6 — Two near-free hot-path levers (UX + speed + tokens).** Not
 synthesis-tier work, but the largest responsiveness/cost wins and they
 cross no invariant:
-- **Gate recall on need.** Recall fires on *every* substantive turn — a
+- **Gate recall on need.** Recall fires on *every* substantive turn. A
   trivial "what time is it" still pays a ~1–2s recall arm (budget `low`)
   + up to 1024 injected tokens it never uses. The hook already skips
   ultra-short and ack-phrase turns; this *extends* that skip to
   plausibly-stateless/trivial asks, speeding the warm-TTFO path the
   `jtbd-fast-trivial-dm` gate measures *and* saving tokens. **Caveat
-  (symmetry with 6b):** the failure mode is a false negative — gating a
+  (symmetry with 6b):** the failure mode is a false negative. Gating a
   turn that *did* need memory undercuts the job's continuity criteria,
   so this lever is likewise gated on proving no recall-quality
   regression, not shipped blind.
 - **Right-size retain cadence.** `retainEveryNTurns=1` means every turn
-  triggers background consolidation (sonnet) — the single largest
+  triggers background consolidation (sonnet), the single largest
   *invisible* subscription draw (live: on the order of ~1M consolidation
   tokens/day/agent, ~100% of an agent's LLM spend), and the engine room
   of tension (1). Firing retain every 2–3 turns instead cuts that
-  roughly in proportion — an order-of-magnitude estimate, not derived
+  roughly in proportion. This is an order-of-magnitude estimate, not derived
   math: switchroom runs `full-session` retain mode (not chunked), so
   each fire re-consolidates the accumulated transcript and the per-fire
   cost grows with session length, making the real savings curve
   non-linear. **Caveat:** the every-turn setting is deliberate (the
   restart-memory-loss UAT), so this is a real tradeoff to measure, not a
-  free win — gated on proving no memory-loss regression.
+  free win, and is gated on proving no memory-loss regression.
 
 ## Speed & token budget
 
-The fit argument above is about *correctness*; this section weighs
+The fit argument above is about *correctness*. This section weighs
 *cost*. Two latency/token surfaces matter, and they pull in opposite
 directions:
 
@@ -205,13 +206,13 @@ directions:
   timeout inside the 12s hook ceiling, injecting up to 1024 tokens of
   context. It is on the critical path for warm TTFO (~1.7s baseline,
   gated by `jtbd-fast-trivial-dm`), so anything added here is felt
-  directly — but it spends *no* model tokens. (`low` is operator-raisable
+  directly, but it spends *no* model tokens. (`low` is operator-raisable
   to `mid` ~5s, which adds an LLM rerank pass; switchroom does not.)
 - **Background (invisible).** Every retain triggers consolidation
   (sonnet, on the subscription) the operator never sees;
   `retainEveryNTurns=1` makes that per-turn. This is the largest
-  *uncounted* subscription draw — live, it is essentially **100% of an
-  agent's model spend** (order ~1M consolidation tokens/day/agent) — and
+  *uncounted* subscription draw. Live, it is essentially **100% of an
+  agent's model spend** (order ~1M consolidation tokens/day/agent), and
   the engine room of invariant tension (1). Mental-model refreshes (when
   refresh-enabled) add to it.
 
@@ -230,12 +231,12 @@ Per-phase scorecard against the three axes:
 Net read: **Phase 1(a), 2, 3, 6a** are positive-or-neutral on all three
 axes (1(a) and 6a are close to free wins). **Phase 4** is UX-positive
 only if kept sparse. **Phase 5** trades background tokens for
-explicit-reflect speed — curate selectively. **Phase 6b** is the biggest
+explicit-reflect speed, so curate selectively. **Phase 6b** is the biggest
 token lever but a measured tradeoff, not a free win.
 
 ## Verdict check (the four-part rule)
 
-- **Advances an outcome?** Yes — `standing-team`, via the core memory
+- **Advances an outcome?** Yes, `standing-team`, via the core memory
   job and the specialist job.
 - **Satisfies the job spec?** Moves recall from the job's *bad* column
   (grab-bag/raw) toward its *good* column (curated/legible/by-relevance).
@@ -243,7 +244,7 @@ token lever but a measured tradeoff, not a free win.
   config defaults, no operator assembly. Docs: behavior improves without
   new user-facing concepts. Consistency: same vault/config cascade.
   Speed/tokens: net-positive or measured (see *Speed & token budget*).
-- **Crosses an invariant?** No — each phase is shaped to avoid the
+- **Crosses an invariant?** No. Each phase is shaped to avoid the
   tensions named above (no autonomous self-writes; legibility added, not
   removed).
 
