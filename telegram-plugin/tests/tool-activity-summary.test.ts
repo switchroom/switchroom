@@ -84,10 +84,10 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       "**→ Reading gateway.ts**",
     );
     expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
-      "_✓ Reading gateway.ts_  \n**→ Searching memory**",
+      "~~_✓ Reading gateway.ts_~~  \n**→ Searching memory**",
     );
     expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
-      "_✓ Reading gateway.ts_  \n_✓ Searching memory_  \n**→ List workspace**",
+      "~~_✓ Reading gateway.ts_~~  \n~~_✓ Searching memory_~~  \n**→ List workspace**",
     );
   });
 
@@ -113,11 +113,11 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     expect(out.startsWith(`_✓ +${hidden} earlier…_  \n`)).toBe(true);
     // Only the last STATUS_ROLLING_LINES actions are shown; older ones collapsed.
     const firstVisible = total - STATUS_ROLLING_LINES + 1;
-    expect(out).toContain(`_✓ Action ${firstVisible}_`);
+    expect(out).toContain(`~~_✓ Action ${firstVisible}_~~`);
     expect(out).not.toContain(`Action ${firstVisible - 1}<`);
     // The newest action is the in-progress step (bold →); the rest are done (✓).
     expect(out).toContain(`**→ Action ${total}**`);
-    expect(out).toContain(`_✓ Action ${total - 1}_`);
+    expect(out).toContain(`~~_✓ Action ${total - 1}_~~`);
     expect(out).not.toContain(`**→ Action ${total - 1}**`);
   });
 
@@ -145,17 +145,37 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = ["Reading a.ts", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true)!;
     expect(out).toBe(
-      "_✓ Reading a.ts_  \n_✓ Searching memory_  \n_✓ Running a command_",
+      "~~_✓ Reading a.ts_~~  \n~~_✓ Searching memory_~~  \n~~_✓ Running a command_~~",
     );
     expect(out).not.toContain("→"); // no in-progress arrow anywhere
   });
 
   it("final=true on a single line is also done (✓)", () => {
-    expect(renderActivityFeed(["Reading a.ts"], true)).toBe("_✓ Reading a.ts_");
+    expect(renderActivityFeed(["Reading a.ts"], true)).toBe("~~_✓ Reading a.ts_~~");
   });
 
   it("final defaults false (live render keeps the → in-progress newest line)", () => {
     expect(renderActivityFeed(["Reading a.ts"])).toBe("**→ Reading a.ts**");
+  });
+
+  // Strikethrough contract (operator request): done (✓) step lines render with
+  // GFM strikethrough wrapping the italic so completed items visually recede,
+  // while the active (→ bold) line is never struck.
+  it("done step lines are struck (~~) AND italic; the active → line is not struck", () => {
+    const out = renderActivityFeed(["Reading a.ts", "Searching memory"])!;
+    // earlier step is done → struck italic
+    expect(out).toContain("~~_✓ Reading a.ts_~~");
+    // newest step is active → bold, NOT struck
+    expect(out).toContain("**→ Searching memory**");
+    expect(out).not.toContain("~~_✓ Searching memory_~~");
+    expect(out).not.toContain("~~**→");
+    // the meta/footer count lines stay UNSTRUCK (kept legible as meta)
+    const overflow = Array.from({ length: STATUS_ROLLING_LINES + 2 }, (_, i) => `Action ${i + 1}`);
+    const finalOut = renderActivityFeed(overflow, true, "", overflow.length)!;
+    expect(finalOut).toContain(`_✓ +${overflow.length - STATUS_ROLLING_LINES} earlier…_`);
+    expect(finalOut).toContain(`_✓ ${overflow.length} steps_`);
+    expect(finalOut).not.toContain(`~~_✓ +`);
+    expect(finalOut).not.toContain(`~~_✓ ${overflow.length} steps_~~`);
   });
 
   // liveSuffix (PR1 heartbeat): appended INSIDE the newest in-progress line so a
@@ -164,7 +184,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   describe("liveSuffix (heartbeat)", () => {
     it("appends the suffix to the newest in-progress line only", () => {
       expect(renderActivityFeed(["Reading a.ts", "Running a command"], false, " · 18s")).toBe(
-        "_✓ Reading a.ts_  \n**→ Running a command · 18s**",
+        "~~_✓ Reading a.ts_~~  \n**→ Running a command · 18s**",
       );
     });
     it("single live line gets the suffix", () => {
@@ -176,7 +196,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       const out = renderActivityFeed(["Reading a.ts", "Running a command"], true, " · 18s")!;
       expect(out).not.toContain("·");
       expect(out).not.toContain("→");
-      expect(out).toBe("_✓ Reading a.ts_  \n_✓ Running a command_");
+      expect(out).toBe("~~_✓ Reading a.ts_~~  \n~~_✓ Running a command_~~");
     });
     it("default empty suffix is byte-identical to no suffix", () => {
       expect(renderActivityFeed(["Reading a.ts"], false, "")).toBe(
@@ -191,7 +211,7 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
     const lines: string[] = [];
     expect(appendActivityLabel(lines, "Searching memory")).toBe("**→ Searching memory**");
     expect(appendActivityLabel(lines, "List workspace")).toBe(
-      "_✓ Searching memory_  \n**→ List workspace**",
+      "~~_✓ Searching memory_~~  \n**→ List workspace**",
     );
     // consecutive dup collapses
     appendActivityLabel(lines, "List workspace");
@@ -238,7 +258,7 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     const lines = ["Reading CLAUDE.md", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true, "", 5)!;
     // All lines are done (✓) and the footer is appended.
-    expect(out).toContain("_✓ Running a command_");
+    expect(out).toContain("~~_✓ Running a command_~~");
     expect(out).toContain("_✓ 5 steps_");
     expect(out.endsWith("_✓ 5 steps_")).toBe(true);
   });
@@ -247,7 +267,7 @@ describe("renderActivityFeed — ✓ N steps total (final render, issue #2461)",
     const lines = ["Reading CLAUDE.md"];
     const out = renderActivityFeed(lines, true, "", 0)!;
     expect(out).not.toContain("steps");
-    expect(out).toBe("_✓ Reading CLAUDE.md_");
+    expect(out).toBe("~~_✓ Reading CLAUDE.md_~~");
   });
 
   it("stepCount undefined → no footer (live/non-final callers omit it)", () => {
@@ -307,11 +327,11 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
     const child = ["Reading schema.ts", "Looking for foreign keys"];
     const out = renderActivityFeedWithNested(parent, child)!;
     // Parent is blocked at the Task tool → none of its lines is the live step.
-    expect(out).toContain("_✓ Searching memory_");
-    expect(out).toContain("_✓ Delegating: review the migration_");
+    expect(out).toContain("~~_✓ Searching memory_~~");
+    expect(out).toContain("~~_✓ Delegating: review the migration_~~");
     expect(out).not.toContain("**→ Delegating");
     // The live → step is the newest nested child line; earlier child = italic.
-    expect(out).toContain("   ↳ _Reading schema.ts_");
+    expect(out).toContain("   ↳ ~~_Reading schema.ts_~~");
     expect(out).toContain("   ↳ **→ Looking for foreign keys**");
   });
 
@@ -342,13 +362,13 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
       ["Reading schema.ts", "Looking for foreign keys"],
       true,
     )!;
-    expect(out).toContain("   ↳ _Looking for foreign keys_"); // newest now italic done
+    expect(out).toContain("   ↳ ~~_Looking for foreign keys_~~"); // newest now struck italic done
     expect(out).not.toContain("→"); // no in-progress arrow in the finalized feed
   });
 
   it("final=true with no children delegates to the finalized flat render", () => {
     expect(renderActivityFeedWithNested(["Reading a.ts"], [], true)).toBe(
-      "_✓ Reading a.ts_",
+      "~~_✓ Reading a.ts_~~",
     );
   });
 
@@ -381,7 +401,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   it("stepCount footer appears on final=true with no children (delegates to flat render)", () => {
     const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 3)!;
     expect(out).toContain("_✓ 3 steps_");
-    expect(out).toBe("_✓ Reading a.ts_  \n_✓ 3 steps_");
+    expect(out).toBe("~~_✓ Reading a.ts_~~  \n_✓ 3 steps_");
   });
 
   // Liveness-driven feed open (dark-turn fix): a turn that emits no tool_label
@@ -398,7 +418,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
 
     it("finalizes the placeholder to a done record (no frozen → line)", () => {
       expect(renderActivityFeedWithNested(["Working…"], [], true)).toBe(
-        "_✓ Working…_",
+        "~~_✓ Working…_~~",
       );
     });
 
@@ -612,8 +632,8 @@ describe("extreme-edge: single oversized line with markdown specials & && _ *", 
     expect(out).not.toBeNull();
     expect(out.length).toBeLessThanOrEqual(4000);
     expect(isValidMarkdown(out)).toBe(true);
-    expect(out.startsWith("_✓ ")).toBe(true);
-    expect(out.endsWith("_")).toBe(true);
+    expect(out.startsWith("~~_✓ ")).toBe(true);
+    expect(out.endsWith("_~~")).toBe(true);
   });
 
   it("renderActivityFeedWithNested: single ~4100-char parent line → ≤ budget and valid markdown", () => {
@@ -770,7 +790,7 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     expect(out).toContain("🤖 **Agent**");
     expect(out).toContain("_15s · 7 tools_");
     // Step feed follows the header.
-    expect(out).toContain("_✓ Reading CLAUDE.md_");
+    expect(out).toContain("~~_✓ Reading CLAUDE.md_~~");
     expect(out).toContain("**→ Searching memory**");
   });
 
@@ -784,7 +804,7 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     const out = renderActivityFeed(["Reading CLAUDE.md"], true, "", undefined, header)!;
     expect(out).toContain("🤖 **Agent**");
     expect(out).toContain("_done · 3 tools · 1m05s_");
-    expect(out).toContain("_✓ Reading CLAUDE.md_");
+    expect(out).toContain("~~_✓ Reading CLAUDE.md_~~");
     // No in-progress arrow (final=true).
     expect(out).not.toContain("→");
   });
@@ -824,7 +844,7 @@ describe("renderActivityFeed — header param (main-session card fix)", () => {
     expect(out).toContain("🤖 **Agent**");
     expect(out).toContain("_30s · 5 tools_");
     // Parent step is done-styled (child is the live step).
-    expect(out).toContain("_✓ Delegating: review_");
+    expect(out).toContain("~~_✓ Delegating: review_~~");
     // Child step is the in-progress step.
     expect(out).toContain("   ↳ **→ Reading schema.ts**");
   });
@@ -850,7 +870,7 @@ describe("describeToolUse — surface-tool suppression is key-agnostic", () => {
 
 describe("status-card body stacks like a reply (#2669 rich-message renderer)", () => {
   // The single most-seen surface: the operator's progress card. Its step lines
-  // are styled prose (`_✓ …_`, `**→ …**`), NOT GFM list items, so a lone `\n`
+  // are styled prose (`~~_✓ …_~~`, `**→ …**`), NOT GFM list items, so a lone `\n`
   // between them is a SOFT break the renderer collapses — bullets ran together
   // into one line. The card now joins via stackCardLines (hard breaks), so the
   // bullets stack exactly as the reply path renders them.
@@ -858,7 +878,7 @@ describe("status-card body stacks like a reply (#2669 rich-message renderer)", (
   it("multiple step bullets stack on their own lines (no soft-break collapse)", () => {
     const out = renderActivityFeed(["Reading a.ts", "Searching memory", "Running tests"], true)!;
     const lines = out.split("  \n");
-    expect(lines).toEqual(["_✓ Reading a.ts_", "_✓ Searching memory_", "_✓ Running tests_"]);
+    expect(lines).toEqual(["~~_✓ Reading a.ts_~~", "~~_✓ Searching memory_~~", "~~_✓ Running tests_~~"]);
     // Not a single lone `\n` survives to collapse two bullets.
     expect(out).not.toMatch(/(?<! {2})\n/);
   });
@@ -870,8 +890,8 @@ describe("status-card body stacks like a reply (#2669 rich-message renderer)", (
     // Every adjacent pair is separated by a hard break.
     expect(out.match(/ {2}\n/g)?.length).toBe(2);
     // The newest is the in-progress bold step; earlier are done — all visible.
-    expect(out).toContain("_✓ Editing foo.ts_");
-    expect(out).toContain("_✓ Editing bar.ts_");
+    expect(out).toContain("~~_✓ Editing foo.ts_~~");
+    expect(out).toContain("~~_✓ Editing bar.ts_~~");
     expect(out).toContain("**→ Writing baz.ts**");
   });
 
@@ -882,6 +902,6 @@ describe("status-card body stacks like a reply (#2669 rich-message renderer)", (
     // prose by escapeStepLine; the inline-markup-survives case is covered by
     // the stackCardLines unit test, which operates on pre-rendered lines.)
     const out = renderActivityFeed(["Reading a.ts", "Running tests"], false)!;
-    expect(out).toBe("_✓ Reading a.ts_  \n**→ Running tests**");
+    expect(out).toBe("~~_✓ Reading a.ts_~~  \n**→ Running tests**");
   });
 });
