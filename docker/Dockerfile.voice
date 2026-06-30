@@ -42,8 +42,21 @@ RUN apt-get update \
 
 # faster-whisper pulls in ctranslate2 (with bundled CUDA kernels). Pin so
 # the image is reproducible; Dependabot bumps it.
+#
+# `requests` is an UNDECLARED runtime dependency of faster-whisper 1.0.3:
+# faster_whisper/utils.py does `import requests` at module load (it catches
+# requests.exceptions.ConnectionError in its model-download retry path) but
+# omits it from requires_dist. Older huggingface_hub used to drag requests
+# in transitively, but huggingface_hub>=1.0 migrated off requests (httpx)
+# and no longer does — so on a clean image the model-load path dies with
+# `ModuleNotFoundError: No module named 'requests'` (bug #2706). Pin
+# `requests` explicitly. huggingface_hub is also pinned (0.25.2 still hard-
+# depends on requests) to keep the resolved download API stable; Dependabot
+# bumps all three.
 RUN pip3 install --no-cache-dir \
-        "faster-whisper==1.0.3"
+        "faster-whisper==1.0.3" \
+        "huggingface_hub==0.25.2" \
+        "requests==2.32.3"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
