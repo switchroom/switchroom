@@ -1,13 +1,14 @@
-# switchroom/voice — local GPU speech-to-text sidecar (voice feature PR-B2).
+# switchroom/voice — local GPU speech sidecar (voice feature PR-B2 + PR-C1).
 #
-# Wraps `faster-whisper` (CTranslate2) behind a tiny stdlib HTTP server
-# (docker/voice-sidecar/server.py) so the fleet can transcribe inbound
-# voice notes on a LOCAL GPU — no third-party STT key (vision #3,
-# subscription-honest) and no cloud dependency (vision #4,
-# always-available). Emitted into the compose file ONLY when the PR-B1
-# host-capabilities verdict is `engine: local` (see src/agents/compose.ts).
+# Wraps `faster-whisper` (CTranslate2, STT) and `kokoro-onnx` (Kokoro, TTS)
+# behind a tiny stdlib HTTP server (docker/voice-sidecar/server.py) so the
+# fleet can transcribe inbound voice notes AND synthesize spoken replies on
+# a LOCAL GPU — no third-party speech key (vision #3, subscription-honest)
+# and no cloud dependency (vision #4, always-available). Emitted into the
+# compose file ONLY when the PR-B1 host-capabilities verdict is
+# `engine: local` (see src/agents/compose.ts).
 #
-# Scope: STT only. TTS / Kokoro (`/tts`) lands in PR-C.
+# Two endpoints (/stt, /tts), one port (8126), one image.
 #
 # Why a CUDA *runtime* base (not devel): CTranslate2 ships prebuilt CUDA
 # kernels in its wheel, so we only need the CUDA + cuDNN runtime libs at
@@ -25,7 +26,7 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 LABEL org.opencontainers.image.title="switchroom-voice" \
-      org.opencontainers.image.description="Local GPU STT sidecar (faster-whisper)"
+      org.opencontainers.image.description="Local GPU speech sidecar (faster-whisper STT + Kokoro TTS)"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -34,7 +35,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/models/hf
 
 # ffmpeg normalizes arbitrary inbound audio (OGG/Opus from Telegram, mp3,
-# m4a, …) to 16kHz mono WAV before whisper. python3 runs the server.
+# m4a, …) to 16kHz mono WAV before whisper, AND transcodes Kokoro's 24kHz
+# PCM out to mono OGG/Opus (Telegram sendVoice requires OGG/Opus). python3
+# runs the server.
+#
+# No apt `espeak-ng`: kokoro-onnx phonemizes via `espeakng-loader`, which
+# bundles the espeak-ng shared library + data inside the wheel, so the
+# phonemizer backend finds them without a system package (keeps the apt
+# layer minimal and the espeak-ng version pinned with the pip deps).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 python3-pip ffmpeg ca-certificates \
@@ -53,10 +61,17 @@ RUN apt-get update \
 # `requests` explicitly. huggingface_hub is also pinned (0.25.2 still hard-
 # depends on requests) to keep the resolved download API stable; Dependabot
 # bumps all three.
+# kokoro-onnx is the Kokoro TTS engine on the ONNX runtime path — it avoids
+# torch entirely (pulling onnxruntime + numpy + phonemizer-fork +
+# espeakng-loader), which is materially lighter than the torch-based
+# `kokoro` package for an inference-only sidecar. Pinned for a reproducible
+# image; Dependabot bumps it. The Kokoro weights themselves are NOT baked in
+# — they're fetched on first boot into /models (see server.py:_load_tts).
 RUN pip3 install --no-cache-dir \
         "faster-whisper==1.0.3" \
         "huggingface_hub==0.25.2" \
-        "requests==2.32.3"
+        "requests==2.32.3" \
+        "kokoro-onnx==0.5.0"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
