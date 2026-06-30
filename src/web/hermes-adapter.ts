@@ -286,62 +286,6 @@ async function injectInbound(
 }
 
 /**
- * Poll history.db for the agent's reply after a prompt was injected.
- * Resolves with the assistant text when found, or null on timeout.
- *
- * history.db is owned by the agent uid but chmod'd 0644 (readable by web
- * container uid=1000). We use bun:sqlite directly because this module runs
- * inside the web Bun process.
- */
-async function waitForAssistantReply(
-  agentsDir: string,
-  agentName: string,
-  afterTsSec: number,
-  maxWaitMs = 300_000,
-  pollIntervalMs = 2_000,
-): Promise<string | null> {
-  const dbPath = resolve(agentsDir, agentName, "telegram", "history.db");
-  if (!existsSync(dbPath)) return null;
-
-  const deadline = Date.now() + maxWaitMs;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let SqliteDatabase: any;
-  try {
-    const meta = import.meta as { require?: (id: string) => unknown };
-    if (!meta.require) return null;
-    const mod = meta.require("bun:sqlite") as { Database?: unknown };
-    SqliteDatabase = mod.Database;
-  } catch {
-    return null;
-  }
-
-  while (Date.now() < deadline) {
-    try {
-      const db = new SqliteDatabase(dbPath, { readonly: true });
-      try {
-        // Don't filter by chat_id — the inject target chat may differ from
-        // the stored chat_id (DM vs forum). Any assistant message after the
-        // inject timestamp is the reply we're waiting for.
-        const row = db
-          .prepare(
-            `SELECT text FROM messages
-             WHERE role = 'assistant' AND ts > ?
-             ORDER BY ts DESC, rowid DESC LIMIT 1`,
-          )
-          .get(afterTsSec) as { text: string } | undefined | null;
-        if (row?.text) return row.text;
-      } finally {
-        db.close();
-      }
-    } catch {
-      // DB may be locked or temporarily unreadable — keep polling
-    }
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
-  }
-  return null;
-}
-
-/**
  * Read the most recent `limit` messages from history.db for an agent.
  * Returns an array of {role, content, timestamp} in chronological order,
  * or null if history.db is unavailable.
