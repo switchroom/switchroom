@@ -72,6 +72,11 @@ import {
   timeoutDenyMessage,
   duplicateDenyMessage,
   isRecentTimeoutDuplicate,
+  PERMISSION_TTL_MS,
+  ttlForTool,
+  buildTimedOutCardEdits,
+  STALE_TAP_NOTICE,
+  type PermissionCardRef,
 } from './permission-timeout.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -4313,8 +4318,10 @@ const STATUS_QUERY_RE = /^\s*status\??\s*$/i
 
 // ─── Permission handling ──────────────────────────────────────────────────
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number }>()
-const PERMISSION_TTL_MS = 10 * 60_000
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; startedAt: number; card_text: string; cards: { chatId: string; messageId: number }[] }>()
+// PERMISSION_TTL_MS / ttlForTool / the timed-out card builder now live in
+// ./permission-timeout.ts (pure + unit-testable). hostd gated verbs get a
+// 30-min window; everything else keeps the 10-min default.
 // No-repeat-on-timeout (marko Rentals-budget loop, 2026-06-17). When a card
 // auto-denies on TTL, the model is told it was a TIMEOUT (not a denial) so it
 // doesn't retry; if it retries the identical (tool, input) anyway while the
@@ -4945,7 +4952,10 @@ const pendingStateReaper = setInterval(() => {
     if (now - v.startedAt > VAULT_INPUT_TTL_MS) pendingVaultOps.delete(k)
   }
   for (const [k, v] of pendingPermissions) {
-    if (now - v.startedAt > PERMISSION_TTL_MS) {
+    // hostd gated fleet-mutation verbs get a longer (30-min) human-scale
+    // decision window than the 10-min default (Bug 2 fix #2).
+    const ttl = ttlForTool(v.tool_name)
+    if (now - v.startedAt > ttl) {
       // Don't just drop it: the claude turn is suspended INSIDE the MCP
       // permission call waiting for a verdict. A silent delete left it
       // wedged forever when the operator never tapped — permanent
@@ -4957,13 +4967,20 @@ const pendingStateReaper = setInterval(() => {
       // Carry a TIMEOUT reason to the model (claude renders it as "…the user
       // said: …") so it can tell a timeout from a real denial and not retry
       // the identical call — the duplicate-card loop this series closes.
-      const timeoutMinutes = Math.round(PERMISSION_TTL_MS / 60000)
+      const timeoutMinutes = Math.round(ttl / 60000)
       dispatchPermissionVerdict({
         type: 'permission',
         requestId: k,
         behavior: 'deny',
         message: timeoutDenyMessage(timeoutMinutes),
       })
+      // Strip the card's inline keyboard + mark it timed out (Bug 2 fix #1).
+      // Before this, the reaper deleted the pending entry but left a LIVE
+      // Approve button — a late operator tap then dispatched a verdict for an
+      // already-resolved/dead request_id, which Claude Code ignores, so the
+      // operator "approved" but work never continued. Stripping the keyboard
+      // makes the timeout legible and removes the stale tappable button.
+      void stripTimedOutPermissionCards(v.card_text, v.cards)
       // The auto-deny un-parks the suspended turn — flip 🙏 → working so
       // it doesn't sit on the awaiting glyph (or stall) after the timeout.
       resumeReactionAfterVerdict()
@@ -6566,6 +6583,32 @@ function buildPermissionActionRow(
   return kb
 }
 
+/**
+ * Strip the inline keyboard from one or more timed-out permission cards and
+ * append a "timed out — re-request to act" line (Bug 2 fix #1). Called from
+ * the pendingStateReaper, which has no grammy `ctx`, so it edits via the
+ * bot.api directly — routed through `swallowingApiCall` so a deleted card
+ * (operator removed the message) is swallowed rather than crashing the sweep.
+ *
+ * A single `editMessageText` re-renders the original card body plus a
+ * timed-out footer; omitting `reply_markup` drops the keyboard atomically
+ * with the text edit (same approach the normal tap finalizer uses, which
+ * strips the keyboard alongside its status-line edit). Best-effort: a failed
+ * edit never blocks the auto-deny that already fired.
+ */
+async function stripTimedOutPermissionCards(
+  cardText: string,
+  cards: PermissionCardRef[],
+): Promise<void> {
+  for (const edit of buildTimedOutCardEdits(cardText, cards)) {
+    await swallowingApiCall(
+      // allow-raw-bot-api: routed through swallowingApiCall (retry policy); message-id-targeted edit (no thread to lose). Passing {} as opts (no reply_markup) strips the stale Allow/Deny keyboard atomically with the text edit.
+      () => bot.api.editMessageText(edit.chatId, edit.messageId, richMessage(edit.text), {}),
+      { chat_id: edit.chatId, verb: 'permission_timeout.strip' },
+    )
+  }
+}
+
 function dispatchPermissionVerdict(ev: PermissionEvent): void {
   const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
   const delivered = ipcServer.sendToAgent(selfAgent, ev)
@@ -6997,7 +7040,6 @@ const ipcServer: IpcServer = createIpcServer({
         return
       }
     }
-    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now() })
     // Natural-language card body — a plain sentence ("Gymbro wants to
     // edit: supplement-log.md" + a why-line), never a raw tool id.
     // The operator sees what is being requested and why at a glance.
@@ -7009,6 +7051,10 @@ const ipcServer: IpcServer = createIpcServer({
       description,
       agentName: _client.agentName,
     })
+    // `card_text` is retained so the TTL reaper can re-edit the SAME body
+    // with a "timed out" footer while stripping the keyboard atomically
+    // (Bug 2 fix #1) — the reaper has no grammy ctx to read the live text.
+    pendingPermissions.set(requestId, { tool_name: toolName, description, input_preview: inputPreview, startedAt: Date.now(), card_text: text, cards: [] })
     // Compact action row: ❌ Deny · ✅ Allow · 🔁 Always… — the scope of an
     // "always" grant stays hidden until the operator taps "🔁 Always…",
     // which swaps the row for a scope choice (this file / any file ⚠️). The
@@ -7043,7 +7089,17 @@ const ipcServer: IpcServer = createIpcServer({
             ...(tid != null ? { message_thread_id: tid } : {}),
           }),
         { threadId, chat_id: chatId, verb: 'permission_request' },
-      ).catch(e => {
+      ).then(sent => {
+        // Record the live card's (chat, message) so the TTL reaper can strip
+        // its inline keyboard on auto-deny — a stale Approve button left
+        // tappable dispatches a verdict for a dead request_id (Bug 2). The
+        // entry may already be gone (operator tapped before this resolved);
+        // guard the lookup.
+        const pend = pendingPermissions.get(requestId)
+        if (pend && sent && typeof sent.message_id === 'number') {
+          pend.cards.push({ chatId, messageId: sent.message_id })
+        }
+      }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
       })
     }
@@ -21863,6 +21919,20 @@ bot.on('callback_query:data', async ctx => {
   // scopes (resolveTimeBox → null) and the disabled tier (ttl<=0) stay truly
   // once. The verdict is still dispatched WITHOUT a `rule` (below), so the
   // bridge never caches it untimed — the window lives only in scopedGrants.
+  // Stale-id tap (#2469 follow-up): the pendingStateReaper auto-DENIES a
+  // permission whose TTL expired and DELETES its pending entry — but a late
+  // operator tap on the (now keyboard-stripped, but possibly still-cached)
+  // card would otherwise dispatch a verdict for an already-resolved/dead
+  // request_id, which Claude Code silently ignores. Net: operator THINKS
+  // they approved, but the work was auto-denied and never continues. Be
+  // honest: tell the operator the request already resolved and do NOT
+  // dispatch a verdict for the dead id (no buffering, no resume message).
+  // LIVE ids fall through to the normal dispatch path below, preserving the
+  // dispatchPermissionVerdict buffering/offline-redelivery contract.
+  if (!pendingPermissions.has(request_id)) {
+    await ctx.answerCallbackQuery({ text: STALE_TAP_NOTICE }).catch(() => {})
+    return
+  }
   // Operator tapped a verdict ⇒ they are present; reset no-repeat suppression
   // so a later identical ask is shown fresh rather than silently short-circuited.
   clearPermissionTimeoutSuppression('operator answered a permission card')

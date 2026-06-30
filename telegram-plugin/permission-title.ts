@@ -63,6 +63,9 @@ const MCP_TOOL_DESCRIPTIONS: Record<string, string> = {
   "mcp__hostd__agent_exec": "Run a read-only inspection inside another agent",
   "mcp__hostd__update_check": "Check what a fleet-wide update would do",
   "mcp__hostd__update_apply": "Apply a fleet-wide update (pull + recreate)",
+  "mcp__hostd__rollout": "Roll the fleet to a pinned version",
+  "mcp__hostd__config_propose_edit": "Propose an edit to switchroom.yaml",
+  "mcp__hostd__get_status": "Read the last fleet-update status",
   // hindsight — memory
   "mcp__hindsight__recall": "Recall relevant memories",
   "mcp__hindsight__retain": "Retain a memory",

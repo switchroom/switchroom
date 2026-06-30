@@ -368,6 +368,49 @@ describe('formatPermissionCardBody', () => {
   })
 })
 
+// Bug 1: the hostd rollout verb gained an optional `reason` (which the agent
+// can now actually supply) and a curated MCP_TOOL_DESCRIPTIONS title, so the
+// card stops rendering the generic "rollout (Hostd)" with "why: not provided".
+describe('formatPermissionCardBody — hostd rollout (Bug 1)', () => {
+  test('renders the caller-supplied reason on the why: line', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__rollout',
+      inputPreview: JSON.stringify({
+        reason: 'promote canary-green v0.16.24 to the fleet',
+        pin: 'v0.16.24',
+      }),
+      description: 'SAFELY roll the fleet to a pinned SEMVER version …',
+      agentName: 'overlord',
+    })
+    expect(body).toContain('why: _promote canary-green v0.16.24 to the fleet_')
+    // #2469: never the schema description.
+    expect(body).not.toContain('SAFELY roll the fleet')
+  })
+
+  test('renders the clean MCP_TOOL_DESCRIPTIONS title, not the raw tool id', () => {
+    const body = formatPermissionCardBody({
+      toolName: 'mcp__hostd__rollout',
+      inputPreview: JSON.stringify({
+        reason: 'rollback to last-good tag',
+        pin: 'v0.16.20',
+      }),
+      description: 'desc',
+      agentName: 'overlord',
+    })
+    const firstLine = body.split('\n')[0]
+    // Curated phrase from MCP_TOOL_DESCRIPTIONS["mcp__hostd__rollout"].
+    expect(firstLine).toBe('🔐 **Overlord** wants to roll the fleet to a pinned version')
+    expect(firstLine).not.toContain('mcp__hostd__rollout')
+    expect(firstLine).not.toMatch(/rollout \(Hostd\)/i)
+  })
+
+  test('naturalAction surfaces the curated title for the rollout verb', () => {
+    expect(naturalAction('mcp__hostd__rollout', undefined)).toBe(
+      'roll the fleet to a pinned version',
+    )
+  })
+})
+
 describe('describeGrant — phrased from the chosen scope', () => {
   test('MCP server wildcard → "use any <Server> tool"', () => {
     expect(describeGrant('mcp__perplexity__search', undefined, opt('mcp__perplexity__*'))).toBe(

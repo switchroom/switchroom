@@ -68,3 +68,79 @@ export function isRecentTimeoutDuplicate(
   const at = timeouts.get(sig)
   return at != null && now - at <= windowMs
 }
+
+// ─── Bug 2 — per-tool TTL + timed-out card hygiene + stale-tap honesty ──────
+
+/** Default operator approval-card lifetime. */
+export const PERMISSION_TTL_MS = 10 * 60_000
+
+/**
+ * hostd gated fleet-mutation verbs (rollout / update_apply / agent_* /
+ * config_propose_edit) surface an OPERATOR approval card and demand a
+ * human-scale decision window — 10 min is too tight when the operator is
+ * mid-task. The `mcp__hostd__*` family gets 30 min; everything else keeps
+ * the 10-min default.
+ */
+export const HOSTD_PERMISSION_TTL_MS = 30 * 60_000
+
+/** Per-tool approval-card TTL. */
+export function ttlForTool(toolName: string | undefined): number {
+  return toolName && toolName.startsWith('mcp__hostd__')
+    ? HOSTD_PERMISSION_TTL_MS
+    : PERMISSION_TTL_MS
+}
+
+/** Suffix appended to a card body when its approval window times out. */
+export const TIMED_OUT_FOOTER = '\n\n⏱ Timed out — re-request to act'
+
+export interface PermissionCardRef {
+  chatId: string
+  messageId: number
+}
+
+export interface TimedOutCardEdit {
+  chatId: string
+  messageId: number
+  /** New body text (original card body + the timed-out footer). */
+  text: string
+  /**
+   * Always true: the edit MUST drop the inline keyboard (omit reply_markup)
+   * so the stale Allow/Deny buttons are no longer tappable — the core of
+   * Bug 2 fix #1. A stale tappable Approve dispatches a verdict for an
+   * already-resolved request_id, which Claude Code ignores → "operator
+   * approved but work never continued".
+   */
+  stripKeyboard: true
+}
+
+/**
+ * Build the (pure) list of card edits the reaper applies on TTL auto-deny:
+ * re-render each recorded card's original body with the timed-out footer and
+ * mark it for keyboard-strip. One entry per card (a permission may have been
+ * broadcast to several operator surfaces).
+ */
+export function buildTimedOutCardEdits(
+  cardText: string,
+  cards: readonly PermissionCardRef[],
+): TimedOutCardEdit[] {
+  return cards.map(({ chatId, messageId }) => ({
+    chatId,
+    messageId,
+    text: `${cardText}${TIMED_OUT_FOOTER}`,
+    stripKeyboard: true,
+  }))
+}
+
+/**
+ * A tap on a permission card is STALE when no pending entry exists for its
+ * request_id — the reaper already auto-denied + deleted it on TTL. A stale
+ * tap must NOT dispatch a verdict (the dead id is ignored by Claude Code);
+ * the operator instead gets an honest "already resolved" notice.
+ */
+export function isStaleTap(hasPending: boolean): boolean {
+  return !hasPending
+}
+
+/** Operator-facing notice shown when a stale (timed-out) card is tapped. */
+export const STALE_TAP_NOTICE =
+  'This request already resolved (timed out) — ask again to act.'

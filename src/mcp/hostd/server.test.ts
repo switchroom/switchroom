@@ -244,6 +244,58 @@ describe("dispatchTool — happy path", () => {
     expect(sent.args.allow_downgrade).toBeUndefined();
   });
 
+  // ── Bug 1: gated verbs forward an optional `reason` for the operator
+  //    approval card's `why:` line (#2469 keeps the card reading the
+  //    caller's arg, never the schema description). ──────────────────────
+  it("rollout forwards reason into the request args when provided", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("rollout", {
+      pin: "v0.15.18",
+      reason: "promote canary-green build to the fleet",
+    });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args.reason).toBe("promote canary-green build to the fleet");
+  });
+
+  it("rollout omits the reason key when absent", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("rollout", { pin: "v0.15.18" });
+    const sent = hostdRequestMock.mock.calls[0]![1];
+    expect(sent.args).not.toHaveProperty("reason");
+  });
+
+  it("update_apply forwards reason when provided and omits it when absent", async () => {
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("update_apply", {
+      pin: "v0.15.18",
+      reason: "ship the approval-card fix",
+    });
+    const withReason = hostdRequestMock.mock.calls[0]![1];
+    expect(withReason.args.reason).toBe("ship the approval-card fix");
+
+    hostdRequestMock.mockResolvedValueOnce(ok({ result: "started" }));
+    await dispatchTool("update_apply", { pin: "v0.15.18" });
+    const withoutReason = hostdRequestMock.mock.calls[1]![1];
+    expect(withoutReason.args).not.toHaveProperty("reason");
+  });
+
+  it("declares `reason` FIRST in each gated verb's inputSchema (truncation-safe)", () => {
+    for (const toolName of [
+      "rollout",
+      "update_apply",
+      "agent_start",
+      "agent_stop",
+      "agent_logs",
+      "agent_exec",
+    ]) {
+      const tool = TOOLS.find((t) => t.name === toolName);
+      expect(tool, `${toolName} should exist`).toBeTruthy();
+      const props = tool!.inputSchema.properties as Record<string, unknown>;
+      expect(props).toHaveProperty("reason");
+      expect(Object.keys(props)[0]).toBe("reason");
+    }
+  });
+
   it("agent_logs forwards tail when provided and omits it when not", async () => {
     hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
     await dispatchTool("agent_logs", { name: "scribe", tail: 250 });

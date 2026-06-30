@@ -297,10 +297,10 @@ Verb set (v1, closed):
 | Verb | Args | Effect | Trust |
 |---|---|---|---|
 | `agent_restart` | `name`, `reason`, `force?` | runs `switchroom agent restart <name> [--force]` on host | self → any agent; cross-agent → admin |
-| `agent_start` | `name` | `switchroom agent start <name>` | admin |
-| `agent_stop` | `name` | `switchroom agent stop <name>` | admin |
+| `agent_start` | `name`, `reason?` | `switchroom agent start <name>` | admin |
+| `agent_stop` | `name`, `reason?` | `switchroom agent stop <name>` | admin |
 | `update_check` | (none) | `switchroom update --check`, returns plan | admin |
-| `update_apply` | `skip_images?`, `rebuild?` | `switchroom update --apply [flags]` | admin + operator-attest (see §5.4) |
+| `update_apply` | `skip_images?`, `rebuild?`, `reason?` | `switchroom update --apply [flags]` | admin + operator-attest (see §5.4) |
 | `apply` | `non_interactive: true` (forced) | `switchroom apply --non-interactive` | admin + operator-attest |
 | `upgrade_status` | (none) | `switchroom update --status` | any |
 | `reconcile` | `agent?` | `switchroom reconcile [<agent>]` | admin |
@@ -309,6 +309,15 @@ Verb set (v1, closed):
 Anything not in this table is rejected with `result: "denied",
 error: "verb not in v1 allowlist"`. New verbs land via RFC + table
 addition.
+
+**Optional `reason` on gated verbs.** Every operator-gated verb accepts an
+optional `reason` (≤512 chars). It is NOT forwarded to the spawned CLI — it
+exists solely to populate the Telegram approval card's `why:` line so the
+operator can decide in context. The card reads the caller-supplied `reason`
+arg only, never the tool's static schema description (#2469). Agents are
+instructed (via tool description) to always pass a one-line `reason`; absent,
+the card renders `why: not provided`. Schema declares `reason` FIRST so it
+survives Claude Code's ~200-char `input_preview` truncation.
 
 **`get_status` in v1, not streamed progress.** Reviewer-flagged
 (load-bearing): the long-running verbs (`update_apply` at 20–60s,
