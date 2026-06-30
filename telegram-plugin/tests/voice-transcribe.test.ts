@@ -10,10 +10,18 @@
  */
 
 import { describe, it, expect } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import {
   transcribeViaWhisper,
   OPENAI_WHISPER_MAX_BYTES,
 } from '../voice-transcribe.js'
+import {
+  materializeVoiceKey,
+  DEFAULT_VOICE_API_KEY_REF,
+} from '../../src/telegram/materialize-voice-key.js'
+import type { resolveVaultReferencesViaBroker } from '../../src/vault/resolver.js'
+import type { SwitchroomConfig } from '../../src/config/schema.js'
 
 const SMALL_AUDIO = new Uint8Array([0x4f, 0x67, 0x67, 0x53]) // OggS magic; not real audio
 
@@ -192,5 +200,108 @@ describe('transcribeViaWhisper — error paths', () => {
       fetchImpl: fakeFetch,
     })
     expect(r).toMatchObject({ ok: false, reason: 'timeout' })
+  })
+})
+
+// ── PR-A: STT key resolves via the vault broker, not a plaintext file ──
+
+const EMPTY_CONFIG = {} as unknown as SwitchroomConfig
+
+/** A fake broker resolver that returns the value mapped to bot_token (the
+ *  key materializeVoiceKey narrows the reference onto). */
+function makeBrokerResolver(
+  resolvedRefs: Record<string, string>,
+): typeof resolveVaultReferencesViaBroker {
+  return (async (config: SwitchroomConfig) => {
+    const ref = config.telegram?.bot_token
+    if (ref && resolvedRefs[ref] !== undefined) {
+      return {
+        ok: true,
+        config: {
+          ...config,
+          telegram: { ...config.telegram, bot_token: resolvedRefs[ref] },
+        },
+      }
+    }
+    return { ok: false, reason: 'not_found' as const }
+  }) as unknown as typeof resolveVaultReferencesViaBroker
+}
+
+describe('materializeVoiceKey — vault resolution', () => {
+  it('resolves the configured vault ref via the broker', async () => {
+    const key = await materializeVoiceKey({
+      apiKeyRef: 'vault:openai/api-key',
+      config: EMPTY_CONFIG,
+      env: {},
+      resolveViaBroker: makeBrokerResolver({
+        'vault:openai/api-key': 'sk-' + 'resolved' + '-key',
+      }),
+    })
+    expect(key).toBe('sk-' + 'resolved' + '-key')
+  })
+
+  it('defaults to vault:openai/api-key when no ref is configured', async () => {
+    expect(DEFAULT_VOICE_API_KEY_REF).toBe('vault:openai/api-key')
+    const key = await materializeVoiceKey({
+      apiKeyRef: undefined,
+      config: EMPTY_CONFIG,
+      env: {},
+      resolveViaBroker: makeBrokerResolver({
+        'vault:openai/api-key': 'sk-' + 'default' + '-key',
+      }),
+    })
+    expect(key).toBe('sk-' + 'default' + '-key')
+  })
+
+  it('returns a literal (non-vault) key directly without touching the broker', async () => {
+    let brokerCalled = false
+    const key = await materializeVoiceKey({
+      apiKeyRef: 'sk-' + 'literal',
+      config: EMPTY_CONFIG,
+      env: {},
+      resolveViaBroker: (async () => {
+        brokerCalled = true
+        return { ok: false, reason: 'not_found' as const }
+      }) as unknown as typeof resolveVaultReferencesViaBroker,
+    })
+    expect(key).toBe('sk-' + 'literal')
+    expect(brokerCalled).toBe(false)
+  })
+
+  it('returns null (graceful fallback, no throw) when the key is unresolvable', async () => {
+    const key = await materializeVoiceKey(
+      {
+        apiKeyRef: 'vault:openai/api-key',
+        config: EMPTY_CONFIG,
+        env: {}, // no SWITCHROOM_VAULT_PASSPHRASE → no direct-decrypt fallback
+        resolveViaBroker: makeBrokerResolver({}), // broker resolves nothing
+      },
+      () => {}, // swallow the diagnostic log
+    )
+    expect(key).toBeNull()
+  })
+})
+
+describe('voice-in — no plaintext key file is read', () => {
+  it('the gateway never reads ~/.switchroom/openai-api-key as a path', () => {
+    const gatewayPath = fileURLToPath(
+      new URL('../gateway/gateway.ts', import.meta.url),
+    )
+    const src = readFileSync(gatewayPath, 'utf8')
+    // The plaintext file basename must not appear as a path segment in
+    // any source string (it lived in a join(..., 'openai-api-key')).
+    expect(src).not.toContain("'openai-api-key'")
+    expect(src).not.toContain('"openai-api-key"')
+  })
+
+  it('the voice-key materializer reads no openai-api-key path', () => {
+    const helperPath = fileURLToPath(
+      new URL('../../src/telegram/materialize-voice-key.ts', import.meta.url),
+    )
+    const src = readFileSync(helperPath, 'utf8')
+    // The basename appears only inside a code-comment sentence (prose),
+    // never quoted as a path literal that fs would read.
+    expect(src).not.toContain("'openai-api-key'")
+    expect(src).not.toContain('"openai-api-key"')
   })
 })
