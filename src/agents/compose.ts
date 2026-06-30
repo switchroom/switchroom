@@ -595,8 +595,12 @@ function emitVoiceSidecarService(
   // /healthz returns 200 only once the model is loaded. start_period is
   // generous (model cold-load 30-90s) so reconcile/`up` doesn't flap.
   lines.push(`    healthcheck:`);
+  // Probe via python3, NOT curl: the sidecar image is distroless-ish and
+  // ships no curl, so a curl-based test stays `starting`/`unhealthy`
+  // forever. The sidecar runtime IS python3 (docker/voice-sidecar/server.py),
+  // so urllib from the stdlib is always present.
   lines.push(
-    `      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${VOICE_SIDECAR_CONTAINER_PORT}/healthz >/dev/null || exit 1"]`,
+    `      test: ["CMD-SHELL", "python3 -c \\"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${VOICE_SIDECAR_CONTAINER_PORT}/healthz',timeout=3).status==200 else 1)\\""]`,
   );
   lines.push(`      interval: 30s`);
   lines.push(`      timeout: 5s`);
@@ -1718,6 +1722,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       bundledSkillsPoolDir,
       hostControlEnabled,
       opts.operatorUid,
+      voiceEngine,
     );
   }
 
@@ -1797,6 +1802,7 @@ function emitAgentService(
   bundledSkillsPoolDir: string,
   hostControlEnabled: boolean,
   operatorUid: number | undefined,
+  voiceEngine: VoiceEngine,
 ): void {
   lines.push(`  agent-${a.name}:`);
   emitImageOrBuild(lines, "agent", imageTag, buildMode, buildContext);
@@ -2148,6 +2154,17 @@ function emitAgentService(
     env.ANTHROPIC_BASE_URL = a.litellm.baseUrl;
     env.ANTHROPIC_SMALL_FAST_MODEL = a.litellm.smallFastModel;
   }
+  // SWITCHROOM_VOICE_ENGINE: the host's voice-transcription verdict
+  // (PR-B1 → PR-B2), resolved ONCE per generator call from
+  // host-capabilities.json and threaded down here. The gateway reads it
+  // as the FIRST source when picking the STT engine for a voice note —
+  // without this propagation the in-container gateway never sees the
+  // host verdict file (the constructed in-container `~/.switchroom` view
+  // doesn't carry it) and every agent defaults to `cloud`, so the local
+  // GPU sidecar is never called even on a GPU host. Emitted
+  // unconditionally with the resolved value (`local` or `cloud`) so the
+  // gateway honors it deterministically.
+  env.SWITCHROOM_VOICE_ENGINE = voiceEngine;
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —
   // an operator can't override the runtime contract from yaml. A
