@@ -190,11 +190,63 @@ function maskCodeRegions(text: string, nonce: string): MaskedCode {
  * Code fences and inline code are masked out before any of this runs, so their
  * interior `\n`s are never touched.
  */
+/**
+ * Split a collapsed inline bullet list onto separate lines.
+ *
+ * Agents sometimes emit an entire bullet list on ONE line using interior
+ * `•`/`·` separators, e.g.:
+ *
+ *   • Master Bath 1, clean • <b>Master Bath 2</b>, 33% loss • Cabinet, clean
+ *
+ * which renders as a single run-on line instead of stacked bullets (the GFM
+ * rich path treats `•`/`·` as ordinary text, not list syntax, so nothing
+ * stacks). This deterministically inserts a newline before each interior
+ * unicode-bullet separator so each bullet lands on its own line.
+ *
+ * Conservative by construction:
+ *  - Only a line that STARTS (after optional leading whitespace) with a bullet
+ *    marker (`•`, `·`, `-`, or `*` followed by a space) is eligible — prose
+ *    with a mid-sentence `•` is left untouched.
+ *  - Only the unicode bullets `•`/`·` are split on (an interior whitespace +
+ *    `•`/`·` + whitespace). `-`/`*` are NEVER used as interior split points —
+ *    too many false positives (hyphens, ranges, "a * b" multiplication).
+ *    They are only accepted as the LEADING marker.
+ *  - The bullet glyphs are left as-is; we only insert `\n` before each split
+ *    bullet and normalize the inter-bullet whitespace to a single space.
+ *  - Idempotent: once split, each bullet begins its own line, so the
+ *    interior-separator pattern (whitespace + bullet + whitespace) no longer
+ *    matches anywhere on those lines.
+ *
+ * Runs on already-code-masked text, so a `•` inside a code span/fence is safe.
+ */
+export function splitCollapsedInlineBullets(text: string): string {
+  if (!/[•·]/.test(text)) return text
+  // Leading marker: optional indent, then • · - or * followed by a space.
+  // Interior separator to split on: whitespace + • or · + whitespace.
+  const interiorSep = /[ \t]+([•·])[ \t]+/g
+  return text
+    .split('\n')
+    .map((line) => {
+      if (!/^[ \t]*[•·*-] /.test(line)) return line
+      if (!/[ \t][•·][ \t]/.test(line)) return line
+      return line.replace(interiorSep, '\n$1 ')
+    })
+    .join('\n')
+}
+
 export function normalizeParagraphBreaks(text: string): string {
-  if (!text.includes('\n')) return text
+  // A text with no newline still needs the inline-bullet split (a collapsed
+  // bullet list is a SINGLE line). Only bail early when there is neither a
+  // newline nor a unicode bullet to potentially split.
+  if (!text.includes('\n') && !/[•·]/.test(text)) return text
 
   const nonce = Math.random().toString(36).slice(2)
-  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+  const { masked: maskedRaw, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  // Step 0: split a collapsed inline bullet list onto separate lines. Done on
+  // the code-masked text so a `•` inside a fenced block or inline code span is
+  // never touched. See splitCollapsedInlineBullets for the exact rule.
+  const masked = splitCollapsedInlineBullets(maskedRaw)
 
   // Step 1: collapse 3+ newlines to exactly two. This also normalizes runs that
   // contain interleaved spaces only between the newlines is NOT done here —

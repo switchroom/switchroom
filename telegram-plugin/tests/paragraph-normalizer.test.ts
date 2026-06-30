@@ -9,7 +9,7 @@
  * (un-promoted break) are preferred over false positives (double-spaced list).
  */
 import { describe, test, expect } from 'vitest'
-import { normalizeParagraphBreaks } from '../format.js'
+import { normalizeParagraphBreaks, splitCollapsedInlineBullets } from '../format.js'
 
 describe('normalizeParagraphBreaks', () => {
   test('promotes a lone prose paragraph break (prev ends with `.`, next is prose)', () => {
@@ -269,5 +269,99 @@ describe('normalizeParagraphBreaks', () => {
     // of that item, not breakout prose — it must NOT gain a blank line.
     const input = '- first item\n    continued text of the first item'
     expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// splitCollapsedInlineBullets — stack an inline-collapsed bullet list
+// ---------------------------------------------------------------------------
+
+describe('splitCollapsedInlineBullets', () => {
+  test('splits the bath-bulb run-on (4 inline bullets → 4 lines)', () => {
+    const input =
+      '• Master Bath 1, clean • Master Bath 2, 33% packet loss • Master Bath 3, clean • Cabinet, clean'
+    expect(splitCollapsedInlineBullets(input)).toBe(
+      '• Master Bath 1, clean\n• Master Bath 2, 33% packet loss\n• Master Bath 3, clean\n• Cabinet, clean',
+    )
+  })
+
+  test('a bold segment inside one bullet survives the split', () => {
+    const input = '• A, clean • **Master Bath 2** (192.168.5.252), **33% loss** • C, clean'
+    expect(splitCollapsedInlineBullets(input)).toBe(
+      '• A, clean\n• **Master Bath 2** (192.168.5.252), **33% loss**\n• C, clean',
+    )
+  })
+
+  test('a <b> segment inside one bullet survives the split', () => {
+    const input = '• A, clean • <b>Master Bath 2</b>, <b>33% packet loss</b> • C, clean'
+    expect(splitCollapsedInlineBullets(input)).toBe(
+      '• A, clean\n• <b>Master Bath 2</b>, <b>33% packet loss</b>\n• C, clean',
+    )
+  })
+
+  test('splits on the middle-dot `·` separator too, and a `·`-led line', () => {
+    const input = '· one · two · three'
+    expect(splitCollapsedInlineBullets(input)).toBe('· one\n· two\n· three')
+  })
+
+  test('accepts a `-` or `*` leading marker (but only splits unicode interior bullets)', () => {
+    expect(splitCollapsedInlineBullets('- lead marker • two • three')).toBe(
+      '- lead marker\n• two\n• three',
+    )
+    expect(splitCollapsedInlineBullets('* lead marker • two')).toBe('* lead marker\n• two')
+  })
+
+  test('prose containing a mid-sentence `•` (line does not start with a bullet) is untouched', () => {
+    const input = 'The plan uses A • B notation throughout the design doc.'
+    expect(splitCollapsedInlineBullets(input)).toBe(input)
+  })
+
+  test('does NOT split on interior `-`/`*` (hyphens, ranges, multiplication)', () => {
+    const input = '• range 1-3 and a * b product stay on one bullet'
+    // No interior unicode bullet → line is returned unchanged.
+    expect(splitCollapsedInlineBullets(input)).toBe(input)
+  })
+
+  test('is idempotent on the bath-bulb input', () => {
+    const input =
+      '• Master Bath 1, clean • Master Bath 2, 33% packet loss • Master Bath 3, clean • Cabinet, clean'
+    const once = splitCollapsedInlineBullets(input)
+    const twice = splitCollapsedInlineBullets(once)
+    expect(twice).toBe(once)
+  })
+
+  test('an already-correct multi-line bullet list passes through unchanged', () => {
+    const input = '• Master Bath 1, clean\n• Master Bath 2, 33% loss\n• Cabinet, clean'
+    expect(splitCollapsedInlineBullets(input)).toBe(input)
+  })
+})
+
+describe('normalizeParagraphBreaks — inline bullet split integration', () => {
+  test('splits the bath-bulb run-on as part of the full outbound pass', () => {
+    const input =
+      '• Master Bath 1, clean • Master Bath 2, 33% packet loss • Master Bath 3, clean • Cabinet, clean'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      '• Master Bath 1, clean\n• Master Bath 2, 33% packet loss\n• Master Bath 3, clean\n• Cabinet, clean',
+    )
+  })
+
+  test('a `•` inside an inline code span is NOT split (code masked)', () => {
+    const input = '`• a • b • c` is a code span'
+    // The line does not start with a bullet marker (it starts with the masked
+    // code placeholder), and the bullets live inside masked code regardless.
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('a `•` inside a fenced code block is NOT split', () => {
+    const input = '```\n• a • b • c\n```'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('idempotent through the full pass on the bath-bulb input', () => {
+    const input =
+      '• Master Bath 1, clean • Master Bath 2, 33% packet loss • Cabinet, clean'
+    const once = normalizeParagraphBreaks(input)
+    const twice = normalizeParagraphBreaks(once)
+    expect(twice).toBe(once)
   })
 })
