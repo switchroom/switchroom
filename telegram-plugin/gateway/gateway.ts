@@ -49,6 +49,9 @@ import {
 } from '../sticker-aliases.js'
 import { transcribeViaWhisper } from '../voice-transcribe.js'
 import { transcribeViaSidecar } from '../voice-transcribe-sidecar.js'
+import { synthesizeViaSidecar } from '../voice-synthesize-sidecar.js'
+import { synthesizeViaOpenAi } from '../voice-synthesize.js'
+import { stripMarkdown } from '../card-format.js'
 import {
   createTelegraphAccount,
   createTelegraphPage,
@@ -967,6 +970,24 @@ type Access = {
     language?: string
     api_key?: string
   }
+  /** Outbound spoken replies via TTS (PR-C2). When enabled, the agent's
+   *  text reply is synthesized into an OGG/Opus voice note and sent
+   *  alongside (or instead of) the text, per `reply_mode`. The 'kokoro'
+   *  engine uses the local voice sidecar (POST /tts) and is only active
+   *  when the host voice verdict is local (SWITCHROOM_VOICE_ENGINE ===
+   *  'local'); 'openai' is an honest-exception cloud path gated on an
+   *  `api_key` vault ref. Voice is best-effort and fully non-fatal — any
+   *  TTS error falls back to the text reply. Replies longer than
+   *  `max_chars` (default 600) always fall back to text-only. Off by
+   *  default. */
+  voice_out?: {
+    enabled?: boolean
+    engine?: 'kokoro' | 'openai'
+    voice?: string
+    reply_mode?: 'voice+text' | 'voice-only'
+    max_chars?: number
+    api_key?: string
+  }
   /** Telegraph long-reply publishing (#579). When enabled, replies
    *  above `threshold` chars publish to Telegraph and the agent's
    *  reply becomes a single message linking to the Telegraph URL
@@ -1059,6 +1080,7 @@ function readAccessFile(): Access {
       // `access.telegraph`, `access.stickers`) silently see undefined.
       stickers: parsed.stickers,
       voice_in: parsed.voice_in,
+      voice_out: parsed.voice_out,
       telegraph: parsed.telegraph,
     }
   } catch (err) {
@@ -8148,6 +8170,143 @@ function redactOutboundText(text: string, site: string): string {
   return masked
 }
 
+/** Default voice-out length ceiling: replies longer than this are sent
+ *  text-only (even in voice-only mode). Mirrors the schema default. */
+const VOICE_OUT_DEFAULT_MAX_CHARS = 600
+
+type VoiceOutAccess = NonNullable<Access['voice_out']>
+
+/**
+ * Resolve whether outbound TTS is active for this reply, and how
+ * (engine + reply_mode + the plain-text TTS input). PR-C2.
+ *
+ * Mirrors the voice-IN engine-resolution precedence (message:voice
+ * handler): the compose-injected SWITCHROOM_VOICE_ENGINE verdict gates the
+ * local 'kokoro' engine, exactly like the STT sidecar. The 'openai' engine
+ * is an honest-exception cloud path gated on an api_key vault ref — it does
+ * NOT require a local verdict.
+ *
+ * Returns null when voice-out is off / not applicable; otherwise a plan the
+ * caller acts on. `ttsText` is markdown-stripped plain text (Kokoro/OpenAI
+ * read it literally). `withinLimit` is false when the reply exceeds
+ * max_chars — the caller still synthesizes nothing and always sends text.
+ */
+function resolveVoiceOutPlan(
+  voiceOut: VoiceOutAccess | undefined,
+  replyText: string,
+): {
+  engine: 'kokoro' | 'openai'
+  voice?: string
+  apiKeyRef?: string
+  replyMode: 'voice+text' | 'voice-only'
+  ttsText: string
+  withinLimit: boolean
+} | null {
+  if (voiceOut?.enabled !== true) return null
+
+  const engine = voiceOut.engine ?? 'kokoro'
+
+  // Engine gating mirrors the voice-in handler precedence: the
+  // compose-injected env wins, then the persisted host-capabilities file,
+  // then a fail-safe 'cloud'. The in-container ~/.switchroom is a read-only
+  // view that does NOT carry host-capabilities.json, so the env is
+  // load-bearing in-fleet (see message:voice). Kokoro requires 'local';
+  // openai requires a resolvable api_key.
+  if (engine === 'kokoro') {
+    const envVoiceEngine = process.env.SWITCHROOM_VOICE_ENGINE
+    const voiceEngine: VoiceEngine =
+      envVoiceEngine === 'local' || envVoiceEngine === 'cloud'
+        ? envVoiceEngine
+        : loadHostCapabilities()?.voice.engine ?? 'cloud'
+    if (voiceEngine !== 'local') return null
+  }
+
+  // Plain-text TTS input: strip markdown REGARDLESS of mode so the engine
+  // never reads out backticks / asterisks / link syntax. Collapse runs of
+  // whitespace so multi-line prose speaks cleanly.
+  const ttsText = stripMarkdown(replyText).replace(/\s+/g, ' ').trim()
+  if (ttsText.length === 0) return null
+
+  const maxChars = voiceOut.max_chars ?? VOICE_OUT_DEFAULT_MAX_CHARS
+  return {
+    engine,
+    voice: voiceOut.voice,
+    apiKeyRef: voiceOut.api_key,
+    replyMode: voiceOut.reply_mode ?? 'voice+text',
+    ttsText,
+    // Gate on the ORIGINAL reply length (not the stripped length) so the
+    // operator's max_chars maps to what the user typed/read.
+    withinLimit: replyText.length <= maxChars,
+  }
+}
+
+/**
+ * Synthesize `ttsText` into OGG/Opus bytes via the configured engine.
+ * Best-effort: returns null on ANY failure (logged to stderr), never
+ * throws. The caller treats null as "voice unavailable, fall back to
+ * text". PR-C2.
+ */
+async function synthesizeVoiceOut(plan: {
+  engine: 'kokoro' | 'openai'
+  voice?: string
+  apiKeyRef?: string
+  ttsText: string
+}): Promise<Uint8Array | null> {
+  try {
+    if (plan.engine === 'kokoro') {
+      const token = await materializeSidecarToken()
+      if (!token) return null // materializeSidecarToken already logged why.
+      const result = await synthesizeViaSidecar({
+        token,
+        text: plan.ttsText,
+        voice: plan.voice,
+      })
+      if (!result.ok) {
+        process.stderr.write(
+          `telegram gateway: voice-out: local sidecar synthesis failed reason=${result.reason}` +
+            (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+            '\n',
+        )
+        return null
+      }
+      process.stderr.write(
+        `telegram gateway: voice-out: local sidecar synthesized ${result.audio.length} bytes in ${result.durationMs}ms ` +
+          `voice=${result.voice ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${plan.ttsText.length}\n`,
+      )
+      return result.audio
+    }
+
+    // engine === 'openai' — honest-exception cloud path.
+    const apiKey = await materializeVoiceKey({ apiKeyRef: plan.apiKeyRef })
+    if (!apiKey) return null // materializeVoiceKey already logged why.
+    const result = await synthesizeViaOpenAi({
+      apiKey,
+      text: plan.ttsText,
+      voice: plan.voice,
+    })
+    if (!result.ok) {
+      process.stderr.write(
+        `telegram gateway: voice-out: openai synthesis failed reason=${result.reason}` +
+          (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+          '\n',
+      )
+      return null
+    }
+    process.stderr.write(
+      `telegram gateway: voice-out: openai synthesized ${result.audio.length} bytes in ${result.durationMs}ms ` +
+        `voice=${result.voice} chars=${plan.ttsText.length}\n`,
+    )
+    return result.audio
+  } catch (err) {
+    // Defence in depth: the synth helpers never throw, but the vault
+    // materialize calls might. Voice is best-effort — swallow + fall back.
+    process.stderr.write(
+      `telegram gateway: voice-out: synthesis threw (non-fatal): ${err instanceof Error ? err.message : String(err)}\n`,
+    )
+    return null
+  }
+}
+
 async function executeReply(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
   // #1664 — pin the turn this reply belongs to at entry. The
   // finalAnswerDelivered write near the end of this function runs after
@@ -8252,6 +8411,11 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const protectContent = args.protect_content === true
   const quoteText = args.quote_text as string | undefined
   const access = loadAccess()
+  // Outbound TTS plan (PR-C2). Resolved once here (engine gating + mode +
+  // plain-text TTS input); synthesis happens just before the send so a
+  // voice-only reply can suppress the text chunk loop on success. Voice is
+  // fully best-effort — every failure below falls back to the text reply.
+  const voiceOutPlan = resolveVoiceOutPlan(access.voice_out, text)
   const configParseMode = access.parseMode ?? 'html'
   const format = (args.format as string | undefined) ?? configParseMode
   const disableLinkPreview = args.disable_web_page_preview != null
@@ -8492,6 +8656,25 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     ? chunk(effectiveText, limit, access.chunkMode ?? 'length')
     : splitMarkdownChunks(effectiveText, limit)
   const sentIds: number[] = []
+
+  // Outbound TTS synthesis (PR-C2). Done BEFORE the text send so a
+  // voice-only reply can suppress the text chunks on success. Best-effort:
+  // any failure (or a reply over max_chars) leaves `voiceOgg` null and the
+  // text path proceeds unchanged — the user's answer is never dropped.
+  // Long replies always fall back to text-only, even in voice-only mode.
+  let voiceOgg: Uint8Array | null = null
+  if (voiceOutPlan != null && voiceOutPlan.withinLimit) {
+    voiceOgg = await synthesizeVoiceOut(voiceOutPlan)
+  } else if (voiceOutPlan != null && !voiceOutPlan.withinLimit) {
+    process.stderr.write(
+      `telegram gateway: voice-out: reply ${text.length} chars exceeds max_chars — text-only fallback\n`,
+    )
+  }
+  // Suppress the text body ONLY when voice-only AND synthesis actually
+  // produced bytes. If synthesis failed (voiceOgg == null) or the reply was
+  // too long, the text path runs as normal so the answer still lands.
+  const suppressText =
+    voiceOutPlan?.replyMode === 'voice-only' && voiceOgg != null
 
   // #271: validate inline_keyboard and namespace any callback_data with
   // the `agent:` prefix so the gateway's callback_query dispatcher can
@@ -8762,7 +8945,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   }
 
   try {
-    for (let i = 0; i < chunks.length; i++) {
+    // PR-C2: voice-only mode with a successful synthesis suppresses the
+    // text body — the spoken voice note IS the reply. The loop is skipped
+    // entirely (sentIds stays empty for text); the voice send below lands
+    // the answer. Any other mode (voice+text, or voice-only that fell back)
+    // sends the text chunks as normal.
+    for (let i = 0; !suppressText && i < chunks.length; i++) {
       const shouldReplyTo =
         reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
       const isLastChunk = i === chunks.length - 1
@@ -8916,6 +9104,62 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
   } finally {
     stopTypingLoop(chat_id, threadId ?? null)
+  }
+
+  // Outbound voice note (PR-C2). Sent AFTER the text body (voice+text) or
+  // INSTEAD of it (voice-only, where suppressText skipped the chunk loop).
+  // Best-effort and fully non-fatal: the synth already succeeded (voiceOgg
+  // is non-null), but a sendVoice failure must NEVER break the text reply
+  // path — catch + log and move on. In voice-only mode a sendVoice failure
+  // here would leave the user with NOTHING, so re-send the text as a
+  // fallback before continuing.
+  if (voiceOgg != null) {
+    const voiceOpts: Record<string, unknown> = {
+      ...(reply_to != null && replyMode !== 'off'
+        ? { reply_parameters: { message_id: reply_to } }
+        : {}),
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      ...(disableNotification ? { disable_notification: true } : {}),
+    }
+    try {
+      const sentVoice = await retryWithThreadFallback<{ message_id: number; message_thread_id?: number }>(
+        robustApiCall,
+        (tid) => {
+          const opts = { ...voiceOpts }
+          if (tid != null) opts.message_thread_id = tid
+          else delete opts.message_thread_id
+          // allow-raw-bot-api: adapter callback INSIDE retryWithThreadFallback→robustApiCall; the THREAD_NOT_FOUND fallback is handled by the wrapper.
+          return lockedBot.api.sendVoice(chat_id, new InputFile(Buffer.from(voiceOgg!)), opts as never)
+        },
+        { threadId, chat_id, verb: 'sendVoice' },
+      )
+      sentIds.push(sentVoice.message_id)
+      logOutbound('reply', chat_id, sentVoice.message_id, voiceOutPlan?.ttsText.length ?? 0, 'voice-note')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`telegram gateway: voice-out: sendVoice failed (non-fatal): ${msg}\n`)
+      // voice-only fell over with no text sent → recover by sending the
+      // text body so the answer still lands (never drop it silently).
+      if (suppressText) {
+        try {
+          const opts: Record<string, unknown> = {
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+            ...(threadId != null ? { message_thread_id: threadId } : {}),
+            ...(disableNotification ? { disable_notification: true } : {}),
+          }
+          // allow-raw-bot-api: voice-only recovery fallback — the rich path already ran/was skipped; send the source text plainly so the answer is never lost.
+          const sent = await lockedBot.api.sendMessage(chat_id, effectiveText, opts as never)
+          sentIds.push(sent.message_id)
+          logOutbound('reply', chat_id, sent.message_id, effectiveText.length, 'voice-only-text-recovery')
+        } catch (textErr) {
+          process.stderr.write(
+            `telegram gateway: voice-out: voice-only text recovery ALSO failed: ${textErr instanceof Error ? textErr.message : String(textErr)}\n`,
+          )
+        }
+      }
+    }
   }
 
   // #710: remember per-button agent meta (ack_text / single_use) keyed

@@ -49,6 +49,52 @@ describe("mergeAgentConfig — release cascade", () => {
   });
 });
 
+describe("mergeAgentConfig — voice_out cascade (PR-C2)", () => {
+  it("cascades defaults.channels.telegram.voice_out to an agent with none", () => {
+    const defaults = {
+      channels: {
+        telegram: {
+          voice_out: { enabled: true, engine: "kokoro", reply_mode: "voice+text" },
+        },
+      },
+    } as unknown as AgentDefaults;
+    const agent = baseAgent();
+    const result = mergeAgentConfig(defaults, agent);
+    expect(result.channels?.telegram?.voice_out).toEqual({
+      enabled: true,
+      engine: "kokoro",
+      reply_mode: "voice+text",
+    });
+  });
+
+  it("agent voice_out overrides the fleet default (field-merge wins)", () => {
+    const defaults = {
+      channels: {
+        telegram: {
+          voice_out: { enabled: true, engine: "kokoro", reply_mode: "voice+text" },
+        },
+      },
+    } as unknown as AgentDefaults;
+    const agent = baseAgent({
+      channels: {
+        telegram: { voice_out: { enabled: true, reply_mode: "voice-only" } },
+      },
+    } as unknown as Partial<AgentConfig>);
+    const result = mergeAgentConfig(defaults, agent);
+    // Per-channel one-level merge: agent's voice_out replaces the field.
+    expect(result.channels?.telegram?.voice_out?.reply_mode).toBe("voice-only");
+    expect(result.channels?.telegram?.voice_out?.enabled).toBe(true);
+  });
+
+  it("leaves voice_out undefined when neither layer sets it", () => {
+    const result = mergeAgentConfig(
+      { channels: { telegram: {} } } as unknown as AgentDefaults,
+      baseAgent({ channels: { telegram: {} } } as unknown as Partial<AgentConfig>),
+    );
+    expect(result.channels?.telegram?.voice_out).toBeUndefined();
+  });
+});
+
 describe("mergeAgentConfig — memory.file cascade (fleet-default hindsight-native)", () => {
   it("an agent inherits defaults.memory.file:false when it sets no memory.file", () => {
     const defaults = { memory: { file: false } } as AgentDefaults;

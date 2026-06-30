@@ -6365,6 +6365,13 @@ function buildAccessJson(
   if (tg?.voice_in) {
     access.voice_in = tg.voice_in;
   }
+  // PR-C2: project resolved voice_out (TTS) settings so the gateway can
+  // synthesize spoken replies without re-reading switchroom.yaml. Rides
+  // access.json like voice_in; the gateway gates the 'kokoro' engine on the
+  // compose-injected SWITCHROOM_VOICE_ENGINE verdict at send-time.
+  if (tg?.voice_out) {
+    access.voice_out = tg.voice_out;
+  }
   if (tg?.telegraph) {
     access.telegraph = tg.telegraph;
   }

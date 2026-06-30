@@ -921,6 +921,59 @@ export const TelegramChannelSchema = z
         "Cascades from defaults.channels.telegram.voice_in. " +
         "(Migrated from per-agent root in #596 — see consistency unification.)"
       ),
+    voice_out: z
+      .object({
+        enabled: z.boolean().optional().describe("Master switch for spoken-reply (TTS) voice notes."),
+        engine: z
+          .enum(["kokoro", "openai"])
+          .default("kokoro")
+          .describe(
+            "Synthesis engine. 'kokoro' = local voice sidecar (POST /tts, " +
+            "subscription-honest, no third-party key); 'openai' = OpenAI TTS " +
+            "cloud (honest-exception, requires an `api_key` vault ref). " +
+            "'kokoro' is only active when the host voice verdict is local " +
+            "(SWITCHROOM_VOICE_ENGINE === 'local'); otherwise voice-out is a " +
+            "no-op and replies stay text-only.",
+          ),
+        voice: z.string().optional().describe(
+          "Engine-specific voice id (e.g. a Kokoro voice name or an OpenAI " +
+          "voice like 'alloy'). Optional — the sidecar/engine has its own " +
+          "default when omitted.",
+        ),
+        reply_mode: z
+          .enum(["voice+text", "voice-only"])
+          .default("voice+text")
+          .describe(
+            "How the spoken reply accompanies the text. 'voice+text' sends " +
+            "both the normal text reply and a voice note; 'voice-only' sends " +
+            "the voice note and suppresses the text body. In either mode the " +
+            "text reply is ALWAYS still sent when synthesis fails or the reply " +
+            "exceeds max_chars — the user's answer is never dropped silently.",
+          ),
+        max_chars: z.number().int().positive().optional().describe(
+          "Reply length (chars) above which voice is skipped and a text-only " +
+          "reply is sent — even in 'voice-only' mode. Default 600. Keeps TTS " +
+          "latency/cost bounded and avoids reading out long structured replies.",
+        ),
+        api_key: z.string().optional().describe(
+          "OpenAI TTS API key as a `vault:<key>` reference (only used when " +
+          "engine='openai'; default 'vault:openai/api-key'). Resolved through " +
+          "the vault broker at use-time and never written to disk or the agent " +
+          "prompt. Ignored for engine='kokoro' (the sidecar needs no key).",
+        ),
+      })
+      .optional()
+      .describe(
+        "Outbound spoken replies via TTS (PR-C2). When enabled, the gateway " +
+        "synthesizes the agent's text reply into an OGG/Opus voice note and " +
+        "sends it alongside (or instead of) the text, per reply_mode. The " +
+        "'kokoro' engine uses the local voice sidecar (POST /tts) and is only " +
+        "active when the host voice verdict is local; the 'openai' engine is " +
+        "an honest-exception cloud path gated on an `api_key` vault ref. Voice " +
+        "is best-effort and fully non-fatal — any TTS error falls back to the " +
+        "text reply. Off by default — opt-in per agent. " +
+        "Cascades from defaults.channels.telegram.voice_out."
+      ),
     telegraph: z
       .object({
         enabled: z.boolean().optional().describe("Master switch for Telegraph Instant View publishing."),
