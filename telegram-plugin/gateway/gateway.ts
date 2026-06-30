@@ -195,7 +195,7 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -8400,7 +8400,12 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // ships the raw GFM markdown via `sendRichMessage`. `effectiveText` is the
   // raw text either way (no HTML/MarkdownV2 rendering happens here anymore).
   const literalText = format === 'text'
-  const effectiveText: string = text
+  // Paragraph-spacing fix (rich-message regression after #2669). The rich GFM
+  // renderer collapses a `\n\n` gap TIGHT, so multi-paragraph replies render
+  // jammed together — unlike the old HTML path. Inject a visible blank-line
+  // spacer into prose `\n\n` gaps on the rich path only. The literal
+  // (`format:'text'`) path must stay byte-exact, so it is left untouched.
+  const effectiveText: string = literalText ? text : addParagraphSpacers(text)
 
   assertAllowedChat(chat_id)
 
@@ -9379,6 +9384,7 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       retry: robustApiCall,
       repairEscapedWhitespace,
       normalizeParagraphBreaks,
+      addParagraphSpacers,
       assertAllowedChat,
       resolveThreadId,
       disableLinkPreview: access.disableLinkPreview !== false,
@@ -10632,7 +10638,7 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // paragraph breaks for the rich path. A literal-text edit (`format:'text'`)
   // skips paragraph normalization — it must edit byte-for-byte as given.
   let editRawText = repairEscapedWhitespace(args.text as string)
-  if (!editLiteralText) editRawText = normalizeParagraphBreaks(editRawText)
+  if (!editLiteralText) editRawText = addParagraphSpacers(normalizeParagraphBreaks(editRawText))
   // Outbound secret scrub (#2044): an edit must not re-introduce a raw
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')
