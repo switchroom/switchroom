@@ -26,6 +26,8 @@ import {
   writeAgentEnv,
   saveUserConfig,
 } from "../setup/onboarding.js";
+import { detectGpuCapabilities } from "../setup/gpu-detect.js";
+import { saveVoiceCapability } from "../setup/host-capabilities.js";
 import {
   isDockerAvailable,
   isHindsightRunning,
@@ -128,7 +130,10 @@ export function registerSetupCommand(program: Command): void {
         // ── Step 6: Memory backend ───────────────────────────────
         await stepMemoryBackend(config, nonInteractive, switchroomConfigPath);
 
-        // ── Step 7: Scaffold agents ──────────────────────────────
+        // ── Step 7: Voice engine (GPU detection + verdict) ───────
+        stepVoiceEngine();
+
+        // ── Step 8: Scaffold agents ──────────────────────────────
         await stepScaffoldAgents(
           config,
           agentBots,
@@ -137,19 +142,19 @@ export function registerSetupCommand(program: Command): void {
           switchroomConfigPath,
         );
 
-        // ── Step 8: Vault auto-unlock at boot ────────────────────
+        // ── Step 9: Vault auto-unlock at boot ────────────────────
         await stepAutoUnlock(config, switchroomConfigPath, nonInteractive);
 
-        // ── Step 9: Dangerous mode ──────────────────────────────
+        // ── Step 10: Dangerous mode ─────────────────────────────
         await stepDangerousMode(config, nonInteractive);
 
-        // ── Step 10: Agent onboarding guidance ───────────────────
+        // ── Step 11: Agent onboarding guidance ───────────────────
         await stepOnboardingGuidance(config, nonInteractive);
 
-        // ── Step 11: Optional Google Workspace connection (RFC G §4.6) ─
+        // ── Step 12: Optional Google Workspace connection (RFC G §4.6) ─
         await stepGoogleWorkspace(config, nonInteractive);
 
-        // ── Step 12: Verification ────────────────────────────────
+        // ── Step 13: Verification ────────────────────────────────
         await stepVerification(config, nonInteractive);
 
         await captureEvent("setup_completed", {
@@ -1061,7 +1066,74 @@ async function stepMemoryBackend(
   }
 }
 
-// ─── Step 7: Scaffold Agents ─────────────────────────────────────────────────
+// ─── Step 7: Voice engine (GPU detection + verdict) ──────────────────────────
+
+/**
+ * Detect the host's GPU capabilities, derive the local-vs-cloud voice-engine
+ * verdict, persist it to `~/.switchroom/host-capabilities.json`, and print
+ * the decision inline (principles.md #1 — the user learns the decision and
+ * its *why* at setup, not from docs).
+ *
+ * Switchroom runs voice on LOCAL GPU models by default WHEN a GPU is usable
+ * from a container, falling back to cloud providers otherwise. PR-B2 reads
+ * the persisted verdict to decide whether to emit the GPU voice sidecar.
+ * This step is the same in interactive and non-interactive mode — detection
+ * needs no prompt; it's a pure host probe.
+ *
+ * Detection failures must never break setup: a probe error degrades to the
+ * cloud verdict (the safe, always-available default).
+ */
+export function stepVoiceEngine(): void {
+  stepHeader(7, "Voice engine", STEP_ACTIVE);
+
+  let caps;
+  try {
+    caps = detectGpuCapabilities();
+  } catch (err) {
+    // A probe that threw (unexpected — the probes are defensive) must not
+    // sink setup. Fall back to the cloud verdict and say so.
+    console.log(
+      chalk.yellow(
+        `  Could not probe GPU (${err instanceof Error ? err.message : String(err)}) — ` +
+          "assuming no GPU; voice will use cloud providers if you enable it.",
+      ),
+    );
+    caps = {
+      gpuPresent: false,
+      containerToolkit: false,
+      engine: "cloud" as const,
+      reason:
+        "No GPU detected — voice will use cloud providers if you enable it.",
+    };
+  }
+
+  // Persist the verdict so update / doctor / compose-gen (PR-B2) re-read it
+  // without re-probing every boot. A write failure is non-fatal — re-detect
+  // is always possible.
+  try {
+    saveVoiceCapability(caps);
+  } catch (err) {
+    console.log(
+      chalk.yellow(
+        `  Detected the verdict but could not persist host-capabilities.json: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
+  }
+
+  // Inline decision messaging — the three branches from the verdict.
+  if (caps.engine === "local") {
+    console.log(chalk.green(`  ${STEP_DONE} ${caps.reason}`));
+  } else if (caps.gpuPresent) {
+    // GPU present but toolkit missing — actionable, so warn (yellow) with
+    // the install hint that `reason` already carries.
+    console.log(chalk.yellow(`  ${caps.reason}`));
+  } else {
+    console.log(chalk.gray(`  ${STEP_DONE} ${caps.reason}`));
+  }
+}
+
+// ─── Step 8: Scaffold Agents ─────────────────────────────────────────────────
 
 async function stepScaffoldAgents(
   config: SwitchroomConfig,
@@ -1075,7 +1147,7 @@ async function stepScaffoldAgents(
   // `writeAccessJson` lands a deterministic value and the still-required
   // `telegram.forum_chat_id` schema field remains honest.
   const forumChatId = "0";
-  stepHeader(7, "Scaffold agents", STEP_ACTIVE);
+  stepHeader(8, "Scaffold agents", STEP_ACTIVE);
 
   const agentsDir = resolveAgentsDir(config);
   const agentNames = Object.keys(config.agents);
@@ -1292,7 +1364,7 @@ async function stepAutoUnlock(
   switchroomConfigPath: string,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(8, "Vault auto-unlock at boot", STEP_ACTIVE);
+  stepHeader(9, "Vault auto-unlock at boot", STEP_ACTIVE);
 
   const envPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (nonInteractive && !(envPass && envPass.length > 0)) {
@@ -1460,7 +1532,7 @@ async function stepDangerousMode(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(9, "Auto-approve mode", STEP_ACTIVE);
+  stepHeader(10, "Auto-approve mode", STEP_ACTIVE);
 
   let enableDangerous = false;
 
@@ -1523,7 +1595,7 @@ async function stepOnboardingGuidance(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(10, "Agent onboarding", STEP_ACTIVE);
+  stepHeader(11, "Agent onboarding", STEP_ACTIVE);
 
   const agentsDir = resolveAgentsDir(config);
   const agentNames = Object.keys(config.agents);
@@ -1601,7 +1673,7 @@ async function stepGoogleWorkspace(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(11, "Optional: Google Workspace", STEP_ACTIVE);
+  stepHeader(12, "Optional: Google Workspace", STEP_ACTIVE);
 
   if (nonInteractive) {
     console.log(chalk.gray("  Skipping in non-interactive mode."));
@@ -1685,7 +1757,7 @@ async function stepVerification(
   config: SwitchroomConfig,
   nonInteractive: boolean,
 ): Promise<void> {
-  stepHeader(12, "Verification", STEP_ACTIVE);
+  stepHeader(13, "Verification", STEP_ACTIVE);
 
   const agentNames = Object.keys(config.agents);
   const firstName = agentNames[0];
