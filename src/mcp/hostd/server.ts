@@ -139,11 +139,25 @@ export const TOOLS = [
     name: "agent_start",
     description:
       "Start a stopped agent. Self-targeting allowed; cross-agent " +
-      "requires admin. Equivalent to `switchroom agent start <name>`.",
+      "requires admin. Equivalent to `switchroom agent start <name>`. " +
+      "This is operator-gated — every call surfaces a Telegram approval " +
+      "card. ALWAYS pass a one-line `reason` explaining why you're " +
+      "starting this agent; it renders on the card's `why:` line so the " +
+      "operator can decide in context.",
     inputSchema: {
       type: "object" as const,
       required: ["name"],
+      // `reason` is FIRST so it survives Claude Code's ~200-char
+      // input_preview truncation on the operator approval card (same
+      // property-order rationale as config_propose_edit below).
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         name: {
           type: "string",
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
@@ -155,11 +169,24 @@ export const TOOLS = [
     name: "agent_stop",
     description:
       "Stop a running agent. Self-targeting allowed; cross-agent " +
-      "requires admin. Equivalent to `switchroom agent stop <name>`.",
+      "requires admin. Equivalent to `switchroom agent stop <name>`. " +
+      "This is operator-gated — every call surfaces a Telegram approval " +
+      "card. ALWAYS pass a one-line `reason` explaining why you're " +
+      "stopping this agent; it renders on the card's `why:` line so the " +
+      "operator can decide in context.",
     inputSchema: {
       type: "object" as const,
       required: ["name"],
+      // `reason` is FIRST so it survives the ~200-char input_preview
+      // truncation on the operator approval card.
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         name: {
           type: "string",
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
@@ -185,11 +212,23 @@ export const TOOLS = [
       "always allowed; cross-agent requires admin: true on the caller. " +
       "Returns the trailing `tail` lines (default 100, max 2000) as " +
       "`stdout_tail` / `stderr_tail` (each capped at 4 KiB). Use this " +
-      "for triage when a user reports a peer agent is misbehaving.",
+      "for triage when a user reports a peer agent is misbehaving. " +
+      "This is operator-gated — every call surfaces a Telegram approval " +
+      "card. ALWAYS pass a one-line `reason` explaining what you're " +
+      "triaging; it renders on the card's `why:` line.",
     inputSchema: {
       type: "object" as const,
       required: ["name"],
+      // `reason` is FIRST so it survives the ~200-char input_preview
+      // truncation on the operator approval card.
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         name: {
           type: "string",
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
@@ -212,11 +251,23 @@ export const TOOLS = [
       "ls, ps, pwd, stat, tail, uname, uptime, wc, whoami). Anything " +
       "outside the allowlist returns `denied` with a pointer to the " +
       "deferred host_os.exec approval-kernel scope. Returns stdout/" +
-      "stderr tails capped at 4 KiB each.",
+      "stderr tails capped at 4 KiB each. This is operator-gated — every " +
+      "call surfaces a Telegram approval card. ALWAYS pass a one-line " +
+      "`reason` explaining why you're running this inspection; it renders " +
+      "on the card's `why:` line so the operator can decide in context.",
     inputSchema: {
       type: "object" as const,
       required: ["name", "argv"],
+      // `reason` is FIRST so it survives the ~200-char input_preview
+      // truncation on the operator approval card.
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         name: {
           type: "string",
           pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
@@ -240,10 +291,22 @@ export const TOOLS = [
       "scaffolds, recreate containers. Admin-only at the wire layer. " +
       "Returns `started` once dispatched — the actual work runs " +
       "async on the host and the caller's own agent container will " +
-      "be recreated as part of the cycle.",
+      "be recreated as part of the cycle. This is operator-gated — every " +
+      "call surfaces a Telegram approval card. ALWAYS pass a one-line " +
+      "`reason` explaining why you're applying this update; it renders on " +
+      "the card's `why:` line so the operator can decide in context.",
     inputSchema: {
       type: "object" as const,
+      // `reason` is FIRST so it survives the ~200-char input_preview
+      // truncation on the operator approval card.
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         skip_images: {
           type: "boolean",
           description:
@@ -294,12 +357,24 @@ export const TOOLS = [
       "(canary order, version-assert, stop-on-mismatch) apply unchanged. " +
       "Admin-only at the wire layer AND deliberately NOT pre-approved — every " +
       "call surfaces a Telegram approval card for the operator to tap. " +
+      "ALWAYS pass a one-line `reason` explaining why you're rolling the " +
+      "fleet to this pin; it renders on the card's `why:` line so the " +
+      "operator can decide in context. " +
       "Returns `started`; poll get_status for the structured outcome " +
       "(which agents rolled / where it stopped).",
     inputSchema: {
       type: "object" as const,
       required: ["pin"],
+      // `reason` is FIRST so it survives the ~200-char input_preview
+      // truncation on the operator approval card.
       properties: {
+        reason: {
+          type: "string",
+          maxLength: 512,
+          description:
+            "One-line operator-facing rationale, rendered on the " +
+            "approval card's `why:` line.",
+        },
         pin: {
           type: "string",
           pattern: "^v\\d+\\.\\d+\\.\\d+$",
@@ -476,7 +551,10 @@ export async function dispatchTool(
         v: 1,
         op: "agent_start",
         request_id: makeRequestId("mcp-start"),
-        args: { name: args.name },
+        args: {
+          name: args.name,
+          ...(args.reason ? { reason: args.reason } : {}),
+        },
       };
       break;
     }
@@ -486,7 +564,10 @@ export async function dispatchTool(
         v: 1,
         op: "agent_stop",
         request_id: makeRequestId("mcp-stop"),
-        args: { name: args.name },
+        args: {
+          name: args.name,
+          ...(args.reason ? { reason: args.reason } : {}),
+        },
       };
       break;
     }
@@ -499,6 +580,7 @@ export async function dispatchTool(
         args: {
           name: args.name,
           ...(typeof args.tail === "number" ? { tail: args.tail } : {}),
+          ...(args.reason ? { reason: args.reason } : {}),
         },
       };
       break;
@@ -512,7 +594,11 @@ export async function dispatchTool(
         v: 1,
         op: "agent_exec",
         request_id: makeRequestId("mcp-exec"),
-        args: { name: args.name, argv: args.argv },
+        args: {
+          name: args.name,
+          argv: args.argv,
+          ...(args.reason ? { reason: args.reason } : {}),
+        },
       };
       break;
     }
@@ -547,6 +633,7 @@ export async function dispatchTool(
           ...(args.rebuild ? { rebuild: true } : {}),
           ...(args.channel ? { channel: args.channel } : {}),
           ...(args.pin ? { pin: args.pin } : {}),
+          ...(args.reason ? { reason: args.reason } : {}),
         },
       };
       break;
@@ -584,6 +671,7 @@ export async function dispatchTool(
           ...(args.agents ? { agents: args.agents } : {}),
           ...(args.skip_web ? { skip_web: true } : {}),
           ...(args.allow_downgrade ? { allow_downgrade: true } : {}),
+          ...(args.reason ? { reason: args.reason } : {}),
         },
       };
       break;

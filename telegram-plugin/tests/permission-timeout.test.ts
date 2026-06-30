@@ -13,6 +13,13 @@ import {
   timeoutDenyMessage,
   duplicateDenyMessage,
   isRecentTimeoutDuplicate,
+  PERMISSION_TTL_MS,
+  HOSTD_PERMISSION_TTL_MS,
+  ttlForTool,
+  buildTimedOutCardEdits,
+  isStaleTap,
+  STALE_TAP_NOTICE,
+  TIMED_OUT_FOOTER,
 } from '../gateway/permission-timeout.js'
 
 describe('permissionSignature', () => {
@@ -83,5 +90,75 @@ describe('isRecentTimeoutDuplicate', () => {
     const m = new Map([[permissionSignature('t', 'Rentals'), NOW]])
     expect(isRecentTimeoutDuplicate(m, permissionSignature('t', 'Land'), NOW, WINDOW)).toBe(false)
     expect(isRecentTimeoutDuplicate(m, permissionSignature('t', 'Rentals'), NOW, WINDOW)).toBe(true)
+  })
+})
+
+// ─── Bug 2 — per-tool TTL, timed-out card hygiene, stale-tap honesty ────────
+
+describe('ttlForTool (Bug 2 fix #2)', () => {
+  it('gives hostd gated verbs a 30-min window', () => {
+    for (const tool of [
+      'mcp__hostd__rollout',
+      'mcp__hostd__update_apply',
+      'mcp__hostd__agent_restart',
+      'mcp__hostd__agent_exec',
+      'mcp__hostd__config_propose_edit',
+    ]) {
+      expect(ttlForTool(tool)).toBe(HOSTD_PERMISSION_TTL_MS)
+      expect(ttlForTool(tool)).toBe(30 * 60_000)
+    }
+  })
+
+  it('keeps the 10-min default for non-hostd tools', () => {
+    expect(ttlForTool('Bash')).toBe(PERMISSION_TTL_MS)
+    expect(ttlForTool('Bash')).toBe(10 * 60_000)
+    expect(ttlForTool('mcp__perplexity__search')).toBe(PERMISSION_TTL_MS)
+    expect(ttlForTool('mcp__agent-config__schedule_add')).toBe(PERMISSION_TTL_MS)
+    expect(ttlForTool(undefined)).toBe(PERMISSION_TTL_MS)
+  })
+
+  it('hostd TTL is strictly longer than the default', () => {
+    expect(HOSTD_PERMISSION_TTL_MS).toBeGreaterThan(PERMISSION_TTL_MS)
+  })
+})
+
+describe('buildTimedOutCardEdits (Bug 2 fix #1 — strip stale keyboard)', () => {
+  it('marks every recorded card for keyboard-strip and appends the footer', () => {
+    const cards = [
+      { chatId: '111', messageId: 5 },
+      { chatId: '222', messageId: 9 },
+    ]
+    const edits = buildTimedOutCardEdits('🔐 **Overlord** wants to roll the fleet', cards)
+    expect(edits).toHaveLength(2)
+    for (const [i, edit] of edits.entries()) {
+      // The keyboard MUST be stripped — a live Approve on a dead request_id is
+      // exactly the bug.
+      expect(edit.stripKeyboard).toBe(true)
+      expect(edit.chatId).toBe(cards[i]!.chatId)
+      expect(edit.messageId).toBe(cards[i]!.messageId)
+      expect(edit.text).toContain('roll the fleet')
+      expect(edit.text).toContain('Timed out — re-request to act')
+      expect(edit.text.endsWith(TIMED_OUT_FOOTER)).toBe(true)
+    }
+  })
+
+  it('returns no edits when there were no recorded cards', () => {
+    expect(buildTimedOutCardEdits('body', [])).toEqual([])
+  })
+})
+
+describe('isStaleTap (Bug 2 fix #3 — do not dispatch a verdict for a dead id)', () => {
+  it('is stale when no pending entry exists for the tapped request_id', () => {
+    // hasPending=false ⇒ the reaper already auto-denied + deleted it.
+    expect(isStaleTap(false)).toBe(true)
+  })
+
+  it('is NOT stale (live id) when a pending entry still exists', () => {
+    expect(isStaleTap(true)).toBe(false)
+  })
+
+  it('exposes an honest operator notice for the stale path', () => {
+    expect(STALE_TAP_NOTICE).toMatch(/already resolved/i)
+    expect(STALE_TAP_NOTICE).toMatch(/ask again/i)
   })
 })

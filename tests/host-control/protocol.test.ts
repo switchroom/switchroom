@@ -29,6 +29,26 @@ describe("hostd protocol — framing & schema", () => {
     expect(decoded).toEqual(req);
   });
 
+  // Bug 1: the gated verbs gained an optional `reason` (for the operator
+  // approval card's `why:` line). Assert the wire schema PERMITS it on each —
+  // a `.object()` that doesn't declare `reason` would strip it on decode and
+  // the forwarded rationale would silently vanish.
+  it("preserves an optional `reason` on each gated verb's request args", () => {
+    const cases: HostdRequest[] = [
+      { v: 1, op: "rollout", request_id: "r-1", args: { pin: "v0.16.24", reason: "promote canary" } },
+      { v: 1, op: "update_apply", request_id: "ua-1", args: { pin: "v0.16.24", reason: "ship fix" } },
+      { v: 1, op: "agent_start", request_id: "as-1", args: { name: "scribe", reason: "bring it up" } },
+      { v: 1, op: "agent_stop", request_id: "ast-1", args: { name: "scribe", reason: "drain it" } },
+      { v: 1, op: "agent_logs", request_id: "al-1", args: { name: "scribe", reason: "triage wedge" } },
+      { v: 1, op: "agent_exec", request_id: "ae-1", args: { name: "scribe", argv: ["ls"], reason: "inspect" } },
+    ];
+    for (const req of cases) {
+      const decoded = decodeRequest(encodeRequest(req).trimEnd());
+      expect(decoded).toEqual(req);
+      expect((decoded as { args?: { reason?: string } }).args?.reason).toBeTruthy();
+    }
+  });
+
   it("round-trips an upgrade_status request without args", () => {
     const req: HostdRequest = {
       v: 1,

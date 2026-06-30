@@ -133,6 +133,10 @@ export const UpdateApplyRequestSchema = z.object({
         .regex(/^(sha-[0-9a-f]{7,40}|v\d+\.\d+\.\d+)$/)
         .nullable()
         .optional(),
+      /** Optional operator-facing rationale, surfaced on the approval
+       *  card's `why:` line (#2469 contract — the card reads ONLY this
+       *  caller-supplied arg, never the schema description). */
+      reason: z.string().max(512).optional(),
     })
     .optional(),
 });
@@ -183,6 +187,9 @@ export const RolloutRequestSchema = z.object({
        * unchanged. Absent ⇒ false (downgrade rejected as before).
        */
       allow_downgrade: z.boolean().optional(),
+      /** Optional operator-facing rationale, surfaced on the approval
+       *  card's `why:` line (#2469 contract — caller-supplied only). */
+      reason: z.string().max(512).optional(),
     })
     .required({ pin: true }),
 });
@@ -192,6 +199,9 @@ export const AgentStartRequestSchema = z.object({
   op: z.literal("agent_start"),
   args: z.object({
     name: AgentNameSchema,
+    /** Optional operator-facing rationale, surfaced on the approval
+     *  card's `why:` line (#2469 contract — caller-supplied only). */
+    reason: z.string().max(512).optional(),
   }),
 });
 
@@ -207,6 +217,9 @@ export const AgentStopRequestSchema = z.object({
     // to reject the unknown option and the verb to exit non-zero. If
     // drain-skip semantics get added to the CLI later, reintroduce the
     // field here in lockstep.
+    /** Optional operator-facing rationale, surfaced on the approval
+     *  card's `why:` line (#2469 contract — caller-supplied only). */
+    reason: z.string().max(512).optional(),
   }),
 });
 
@@ -229,6 +242,9 @@ export const AgentLogsRequestSchema = z.object({
     name: AgentNameSchema,
     /** Number of trailing lines to return (default 100, max 2000). */
     tail: z.number().int().positive().max(2000).optional(),
+    /** Optional operator-facing rationale, surfaced on the approval
+     *  card's `why:` line (#2469 contract — caller-supplied only). */
+    reason: z.string().max(512).optional(),
   }),
 });
 
@@ -249,6 +265,9 @@ export const AgentExecRequestSchema = z.object({
      *  schema stays permissive-but-bounded; the security charclass is
      *  enforced at dispatch so the denial carries a clear reason. */
     argv: z.array(z.string().min(1)).min(1).max(32),
+    /** Optional operator-facing rationale, surfaced on the approval
+     *  card's `why:` line (#2469 contract — caller-supplied only). */
+    reason: z.string().max(512).optional(),
   }),
 });
 
