@@ -93,8 +93,12 @@ describe('renderShowText — Format 2 vs legacy', () => {
     });
     expect(out).toContain('🔋 **Auth — fleet status**');
     expect(out).toContain('Recommendation:');
-    expect(out).toContain('🔴 **BLOCKED**');
-    expect(out).toContain('🟢 **HEALTHY**');
+    // GFM table card (#2700): State emoji per row, not group headers.
+    expect(out).toContain('| State | Account | 5h | 7d | Status |');
+    expect(out).toContain('| 🔴 |'); // the blocked account's State cell
+    expect(out).toContain('| 🟢 |'); // a healthy account's State cell
+    expect(out).not.toContain('**BLOCKED**');
+    expect(out).not.toContain('**HEALTHY**');
     // Legacy ASCII column headers should be absent
     expect(out).not.toContain('ACCOUNT     STATUS');
   });

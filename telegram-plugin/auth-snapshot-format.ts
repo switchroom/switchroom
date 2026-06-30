@@ -191,9 +191,68 @@ export function formatAbsolute(
   });
 }
 
-/** Round-trim percentage to 1 dp (more precision is noise on a UX). */
+/**
+ * Render a future absolute time for the table's Status column, showing the
+ * DATE only when it's not "today" in the user's timezone — all in that tz so
+ * DST is handled by the tz database (never a hard-coded offset).
+ *
+ *   - same calendar day as `now` (user tz) → time only: `11:00 PM`
+ *   - a different day, but within the next 6 days → weekday + time: `Wed 1:00 AM`
+ *   - further out → weekday + day + month + time: `Wed 1 Jul 1:00 AM`
+ *
+ * `tz` is an IANA tz-database name (e.g. `Australia/Melbourne`); the caller
+ * sources it from `SWITCHROOM_TIMEZONE` / `TZ`. Returns "—" for null.
+ */
+export function formatStatusTime(
+  target: Date | null,
+  now: Date = new Date(),
+  tz: string = 'UTC',
+): string {
+  if (!target) return '—';
+  // Compare calendar dates in the user's tz using en-CA (YYYY-MM-DD) so the
+  // "is it today?" test is timezone-correct, not UTC-relative.
+  const dayFmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const timeFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const timeStr = timeFmt.format(target);
+  if (dayFmt.format(target) === dayFmt.format(now)) {
+    return timeStr;
+  }
+  // Different day — always include the weekday. Add the day-of-month + month
+  // once the target falls outside the current week (≥ 7 days away), where a
+  // bare weekday would be ambiguous.
+  const withinWeek = target.getTime() - now.getTime() < 7 * 24 * 60 * 60 * 1000;
+  const dateFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    weekday: 'short',
+    ...(withinWeek ? {} : { day: 'numeric', month: 'short' }),
+  });
+  return `${dateFmt.format(target)} ${timeStr}`;
+}
+
+/**
+ * Render a utilization percentage for display, CLAMPED to [0, 100].
+ *
+ * Anthropic's unified rate-limit headers return a decimal utilization that can
+ * exceed 1.0 (e.g. 1.01 → 101%) when an account is over its window cap. A
+ * displayed value over 100% erodes trust ("how can I be at 101%?"), so the
+ * DISPLAYED number is clamped to 100 here at the format boundary. This does NOT
+ * mutate the source quota data — `classifyHealth` / `blockedReason` still read
+ * the true (possibly >100) value, so the blocked/exhausted state still surfaces
+ * via the Status column and the health emoji. Only the rendered number is
+ * clamped.
+ */
 export function fmtPct(pct: number): string {
-  return `${Math.round(pct)}%`;
+  return `${Math.min(100, Math.round(pct))}%`;
 }
 
 // ── /auth snapshot — Format 2 ────────────────────────────────────────
@@ -233,32 +292,12 @@ function displayLabel(label: string, opts: SnapshotRenderOpts): string {
   return opts.demo ? maskEmail(label) : label;
 }
 
-/**
- * Header line shape: emoji + group title + count.
- *
- *   🟢 HEALTHY (4)
- *   🟡 ACTIVE — REFRESHING SOON (1)
- *   🔴 BLOCKED (1)
- *   ⚪ UNKNOWN (1)
- */
-function groupHeader(health: AccountHealth, count: number): string {
-  const emoji = HEALTH_EMOJI[health];
-  const title = HEALTH_TITLE[health];
-  return `${emoji} **${title}** (${count})`;
-}
-
+/** Health → State-column emoji for the snapshot table. */
 const HEALTH_EMOJI: Record<AccountHealth, string> = {
   healthy: '🟢',
   throttling: '🟡',
   blocked: '🔴',
   unknown: '⚪',
-};
-
-const HEALTH_TITLE: Record<AccountHealth, string> = {
-  healthy: 'HEALTHY',
-  throttling: 'THROTTLING',
-  blocked: 'BLOCKED',
-  unknown: 'UNKNOWN',
 };
 
 /**
@@ -377,42 +416,102 @@ function formatAgeStamp(atMs: number, now: Date = new Date()): string {
   return ageSec < 60 ? `${ageSec}s ago` : `${Math.round(ageSec / 60)}m ago`;
 }
 
+/**
+ * Health-group rank for the table's secondary sort (after active-first):
+ * problems before good news so the user scans the walled accounts at the top.
+ * blocked → throttling → unknown → healthy.
+ */
+const TABLE_HEALTH_RANK: Record<AccountHealth, number> = {
+  blocked: 0,
+  throttling: 1,
+  unknown: 2,
+  healthy: 3,
+};
+
+/** Escape a cell value for a GFM table cell: pipes break the column grid, and
+ *  newlines break the row. Emails don't normally carry either, but be safe. */
+function tableCell(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+}
+
+/** The two percent cells (5h / 7d), refill-normalized + clamped, or a
+ *  data-quality marker when the probe is missing/thin. */
+function pctCells(
+  snap: AccountSnapshot,
+  now: Date,
+): { five: string; seven: string } {
+  if (!snap.quota) return { five: '—', seven: '—' };
+  if (isProbeThin(snap.quota)) return { five: '?', seven: '?' };
+  const norm = refillNormalizedUtils(snap.quota, now);
+  return { five: fmtPct(norm.fiveHourUtilizationPct), seven: fmtPct(norm.sevenDayUtilizationPct) };
+}
+
+/**
+ * The Status cell: for a blocked account, when the binding window comes back
+ * (`back <when>`); for a healthy/throttling account, when the soonest window
+ * refills (`refills <when>`). `<when>` is the tz-aware absolute time (date shown
+ * only when not today) plus the concise relative hint in parens.
+ */
+function statusCell(snap: AccountSnapshot, now: Date, tz: string): string {
+  if (!snap.quota) {
+    return snap.quotaError ? `probe failed (${snap.quotaError})` : 'probe failed';
+  }
+  if (isProbeThin(snap.quota)) return 'quota unknown';
+  const q = snap.quota;
+  const health = classifyHealth(snap, now);
+  if (health === 'blocked') {
+    const win = bindingWindow(q);
+    const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
+    if (!reset) return 'back — (reset unknown)';
+    return `back ${formatStatusTime(reset, now, tz)} (in ${formatRelative(reset, now)})`;
+  }
+  // healthy / throttling — show the soonest refill across both windows.
+  const fiveIn = q.fiveHourResetAt ? q.fiveHourResetAt.getTime() - now.getTime() : Infinity;
+  const sevenIn = q.sevenDayResetAt ? q.sevenDayResetAt.getTime() - now.getTime() : Infinity;
+  const soonest = fiveIn <= sevenIn ? q.fiveHourResetAt : q.sevenDayResetAt;
+  if (!soonest) return 'refills —';
+  return `refills ${formatStatusTime(soonest, now, tz)} (in ${formatRelative(soonest, now)})`;
+}
+
 export function renderAuthSnapshotFormat2(
   snapshots: AccountSnapshot[],
   opts: SnapshotRenderOpts = {},
 ): string {
   const now = opts.now ?? new Date();
+  const tz = opts.tz ?? 'UTC';
   const lines: string[] = [];
   lines.push('🔋 **Auth — fleet status**');
 
-  // Group by health. Render BLOCKED first (it's the urgent action),
-  // then THROTTLING (potential next problem), then HEALTHY (good
-  // news), then UNKNOWN (data quality issue). The active account
-  // floats to the top of its group regardless.
-  const order: AccountHealth[] = ['blocked', 'throttling', 'healthy', 'unknown'];
-  const grouped = new Map<AccountHealth, AccountSnapshot[]>();
-  for (const s of snapshots) {
-    const h = classifyHealth(s, now);
-    if (!grouped.has(h)) grouped.set(h, []);
-    grouped.get(h)!.push(s);
-  }
-  // Within each group, active first.
-  for (const arr of grouped.values()) {
-    arr.sort((a, b) => Number(b.isActive) - Number(a.isActive));
-  }
+  // Single sorted table: the ACTIVE account always sorts to the top row,
+  // regardless of its health group. Remaining rows order by health so
+  // problems are visible — blocked → throttling → unknown → healthy — then
+  // stable/alpha on label for a deterministic order.
+  const ordered = [...snapshots].sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    const r = TABLE_HEALTH_RANK[classifyHealth(a, now)] - TABLE_HEALTH_RANK[classifyHealth(b, now)];
+    if (r !== 0) return r;
+    return a.label.localeCompare(b.label);
+  });
 
-  for (const h of order) {
-    const arr = grouped.get(h);
-    if (!arr || arr.length === 0) continue;
+  if (ordered.length > 0) {
     lines.push('');
-    lines.push(groupHeader(h, arr.length));
-    for (const s of arr) {
-      for (const ln of renderAccountRow(s, opts)) lines.push(ln);
+    lines.push('| State | Account | 5h | 7d | Status |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (const s of ordered) {
+      const emoji = HEALTH_EMOJI[classifyHealth(s, now)];
+      // Account cell: FULL email, never truncated; active gets a (active) suffix.
+      // The black-dot active marker is intentionally removed — the suffix reads.
+      const label = displayLabel(s.label, opts);
+      const account = s.isActive ? `${label} (active)` : label;
+      const { five, seven } = pctCells(s, now);
+      const status = statusCell(s, now, tz);
+      lines.push(
+        `| ${emoji} | ${tableCell(account)} | ${five} | ${seven} | ${tableCell(status)} |`,
+      );
     }
   }
 
   lines.push('');
-  lines.push('────────────────────────────');
   lines.push(`_${recommendation(snapshots, now, opts.demo ?? false)}_`);
   // #2495 Change 2 — a failed probe-on-open renders an explicit "cached Nm
   // ago" warning, never a false live stamp. The degraded variant takes
