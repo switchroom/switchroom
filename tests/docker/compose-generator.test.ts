@@ -3091,8 +3091,18 @@ describe("generateCompose — voice-sidecar (PR-B2)", () => {
     expect(out).toContain('capabilities: ["gpu"]');
     // Published on all interfaces (host-net + strict-isolation reachable).
     expect(out).toContain('"0.0.0.0:18900:8126"');
-    // Healthcheck on /healthz.
+    // Healthcheck on /healthz, probed via python3 stdlib — NOT curl. The
+    // sidecar image ships no curl, so a curl probe would stay unhealthy
+    // forever (PR-B3).
     expect(out).toContain("/healthz");
+    const sidecarBlock = out.slice(out.indexOf("voice-sidecar:"));
+    const healthLine = sidecarBlock
+      .split("\n")
+      .find((l) => l.includes("test: [") && l.includes("/healthz"));
+    expect(healthLine).toBeDefined();
+    expect(healthLine).not.toContain("curl");
+    expect(healthLine).toContain("python3");
+    expect(healthLine).toContain("urllib.request");
     // Token is a docker interpolation, NOT a literal secret in the YAML.
     expect(out).toContain("VOICE_SIDECAR_TOKEN: ${VOICE_SIDECAR_TOKEN}");
     // Model-cache named volume declared.
@@ -3108,6 +3118,40 @@ describe("generateCompose — voice-sidecar (PR-B2)", () => {
     expect(out).not.toContain("switchroom-voice-sidecar");
     expect(out).not.toContain("voice-model-cache");
     expect(out).not.toContain("VOICE_SIDECAR_TOKEN");
+  });
+
+  // PR-B3: the host voice verdict must reach EVERY agent container as the
+  // SWITCHROOM_VOICE_ENGINE env var. Without it the in-container gateway
+  // never sees the host verdict (the constructed in-container ~/.switchroom
+  // doesn't carry host-capabilities.json) and silently defaults to `cloud`,
+  // so the local GPU sidecar is never called even on a GPU host.
+  function envBlockFor(yml: string, agent: string): string {
+    const re = new RegExp(
+      `  agent-${agent}:[\\s\\S]*?    environment:([\\s\\S]*?)\\n    volumes:`,
+    );
+    return re.exec(yml)?.[1] ?? "";
+  }
+
+  it("propagates SWITCHROOM_VOICE_ENGINE=local to every agent on a local verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ alice: {}, bob: {} }),
+      voiceEngine: "local",
+    });
+    for (const a of ["alice", "bob"]) {
+      const env = envBlockFor(out, a);
+      expect(env).toContain('SWITCHROOM_VOICE_ENGINE: "local"');
+    }
+  });
+
+  it("propagates SWITCHROOM_VOICE_ENGINE=cloud to every agent on a cloud verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ alice: {}, bob: {} }),
+      voiceEngine: "cloud",
+    });
+    for (const a of ["alice", "bob"]) {
+      const env = envBlockFor(out, a);
+      expect(env).toContain('SWITCHROOM_VOICE_ENGINE: "cloud"');
+    }
   });
 
   it("defaults to NO sidecar when the verdict is unset (fail-safe cloud)", () => {

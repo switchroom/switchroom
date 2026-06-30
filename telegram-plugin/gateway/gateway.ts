@@ -145,6 +145,7 @@ import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { materializeVoiceKey } from '../../src/telegram/materialize-voice-key.js'
 import { materializeSidecarToken } from '../../src/telegram/materialize-sidecar-token.js'
 import { loadHostCapabilities } from '../../src/setup/host-capabilities.js'
+import type { VoiceEngine } from '../../src/setup/gpu-detect.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
 import { createFleetFallbackResumeGate } from '../fleet-fallback-resume.js'
 import { resolveExhaustUntil } from './exhaust-until.js'
@@ -22139,7 +22140,20 @@ bot.on('message:voice', async ctx => {
   // path needs no `provider === 'openai'` gate — it has no API key — so we
   // route to the sidecar whenever voice_in is enabled AND the host verdict
   // is `local`. The cloud path keeps its existing openai gate.
-  const voiceEngine = loadHostCapabilities()?.voice.engine ?? 'cloud'
+  // Source precedence: the compose-injected SWITCHROOM_VOICE_ENGINE env
+  // (set per-agent by compose-gen from the host verdict — PR-B3) wins,
+  // then the persisted host-capabilities file, then a fail-safe `cloud`.
+  // The env is load-bearing in-fleet: the in-container `~/.switchroom`
+  // is a read-only constructed view that does NOT carry the host's
+  // host-capabilities.json, so without the env the file lookup always
+  // misses and every agent silently falls back to `cloud`. Narrow the
+  // env value to the VoiceEngine union so a bogus value can't leak
+  // through — anything but 'local'/'cloud' is ignored and we fall back.
+  const envVoiceEngine = process.env.SWITCHROOM_VOICE_ENGINE
+  const voiceEngine: VoiceEngine =
+    envVoiceEngine === 'local' || envVoiceEngine === 'cloud'
+      ? envVoiceEngine
+      : loadHostCapabilities()?.voice.engine ?? 'cloud'
   const localEnabled = voiceIn?.enabled === true && voiceEngine === 'local'
   const cloudEnabled =
     voiceIn?.enabled === true && voiceEngine !== 'local' && voiceIn?.provider === 'openai'
