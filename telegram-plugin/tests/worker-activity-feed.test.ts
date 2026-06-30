@@ -115,7 +115,7 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain('─────')
     expect(out).toContain('✅ _PR #21 opened_')
     // latestSummary is the RESULT on the finished path, never also a step.
-    expect(out).not.toContain('_✓ PR #21 opened_')
+    expect(out).not.toContain('~~_✓ PR #21 opened_~~')
   })
 
   it('renders a failed terminal recap', () => {
@@ -155,8 +155,8 @@ describe('renderWorkerActivity', () => {
         narrativeLines: ['read the brief', 'scanned vendor A', 'scanned vendor B'],
       }),
     )
-    expect(out).toContain('_✓ read the brief_')
-    expect(out).toContain('_✓ scanned vendor A_')
+    expect(out).toContain('~~_✓ read the brief_~~')
+    expect(out).toContain('~~_✓ scanned vendor A_~~')
     expect(out).toContain('**→ scanned vendor B**')
     // The single-line latestSummary fallback is NOT used when a block is present.
     expect(out).not.toContain('newest only')
@@ -171,7 +171,7 @@ describe('renderWorkerActivity', () => {
 
   it('drops blank narrative lines from the feed', () => {
     const out = renderWorkerActivity(view({ narrativeLines: ['kept', '   ', 'also kept'] }))
-    expect(out).toContain('_✓ kept_')
+    expect(out).toContain('~~_✓ kept_~~')
     expect(out).toContain('**→ also kept**')
     expect(stepCount(out)).toBe(2)
   })
@@ -183,7 +183,7 @@ describe('renderWorkerActivity', () => {
     expect(out).toContain(`_✓ +${total - STATUS_ROLLING_LINES} earlier…_`)
     expect(out).not.toContain('step 1<')
     const firstVisible = total - STATUS_ROLLING_LINES + 1
-    expect(out).toContain(`_✓ step ${firstVisible}_`)
+    expect(out).toContain(`~~_✓ step ${firstVisible}_~~`)
     expect(out).toContain(`**→ step ${total}**`)
     // STATUS_ROLLING_LINES visible step lines (the overflow header isn't a step).
     expect(out.match(/step \d/g) ?? []).toHaveLength(STATUS_ROLLING_LINES)
@@ -191,7 +191,7 @@ describe('renderWorkerActivity', () => {
 
   it('strips the CONTENT Markdown markup (the card keeps its own ** / _ wrappers, #2669)', () => {
     // Post-#2669 the card itself is rich markdown — the header is **Worker**
-    // and steps are _✓ …_ / **→ …**. The per-line pipeline still runs
+    // and steps are ~~_✓ …_~~ / **→ …**. The per-line pipeline still runs
     // stripMarkdown over the user-supplied CONTENT so a model-authored
     // `**full**` / `` `git push` `` doesn't inject extra emphasis, but the
     // card's own wrapper markup is expected.
@@ -406,8 +406,8 @@ describe('createWorkerActivityFeed', () => {
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'scanned vendor B' }))
 
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('_✓ read the brief_')
-    expect(last.text).toContain('_✓ scanned vendor A_')
+    expect(last.text).toContain('~~_✓ read the brief_~~')
+    expect(last.text).toContain('~~_✓ scanned vendor A_~~')
     expect(last.text).toContain('**→ scanned vendor B**')
     expect(last.text.match(/[✓→]/g) ?? []).toHaveLength(3)
   })
@@ -462,8 +462,8 @@ describe('createWorkerActivityFeed', () => {
     clock = 13_000
     await feed.update('w1', 'chat', view({ toolCount: 3, latestSummary: 'line C' }))
     const last = bot.edits.at(-1)!
-    expect(last.text).toContain('_✓ line A_')
-    expect(last.text).toContain('_✓ line B_')
+    expect(last.text).toContain('~~_✓ line A_~~')
+    expect(last.text).toContain('~~_✓ line B_~~')
     expect(last.text).toContain('**→ line C**')
   })
 

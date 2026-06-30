@@ -304,7 +304,7 @@ function escapeStepLine(raw: string): string {
  *
  * `out`        — accumulator mutated in place
  * `steps`      — pre-cleaned + pre-escaped HTML step strings
- * `allDone`    — when true ALL steps render done (✓ italic); when false the
+ * `allDone`    — when true ALL steps render done (✓ struck italic); when false the
  *                newest renders in-progress (→ bold)
  * `liveSuffix` — appended INSIDE the newest in-progress line (heartbeat tick)
  */
@@ -320,7 +320,7 @@ export function renderStepFeed(
   if (hidden > 0) out.push(`_✓ +${hidden} earlier…_`)
   const lastIdx = shown.length - 1
   shown.forEach((s, i) => {
-    out.push(!allDone && i === lastIdx ? `**→ ${s}${liveSuffix}**` : `_✓ ${s}_`)
+    out.push(!allDone && i === lastIdx ? `**→ ${s}${liveSuffix}**` : `~~_✓ ${s}_~~`)
   })
 }
 
@@ -400,7 +400,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
     const shownParent = steps.slice(-STATUS_ROLLING_LINES)
     const hiddenParent = steps.length - shownParent.length
     if (hiddenParent > 0) out.push(`_✓ +${hiddenParent} earlier…_`)
-    for (const s of shownParent) out.push(`_✓ ${s}_`)
+    for (const s of shownParent) out.push(`~~_✓ ${s}_~~`)
     // Child block.
     const shownChild = children.slice(-STATUS_ROLLING_LINES)
     const hiddenChild = children.length - shownChild.length
@@ -410,7 +410,7 @@ export function renderStatusCard(opts: StatusCardOpts): string | null {
       out.push(
         i === lastChildIdx && !final
           ? `${NESTED_PREFIX}**→ ${s}${liveSuffix}**`
-          : `${NESTED_PREFIX}_${s}_`,
+          : `${NESTED_PREFIX}~~_${s}_~~`,
       )
     })
   } else {

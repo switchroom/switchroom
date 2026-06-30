@@ -98,13 +98,13 @@ const DESC_MAX = 80
  * Layout (running):
  *   🛠 <b>Worker</b> · <i>{description}</i>
  *   <i>{elapsed} · {n} tools</i>
- *   <i>✓ {earlier step}</i>
+ *   <s><i>✓ {earlier step}</i></s>
  *   <b>→ {newest step}</b>
  *
  * Layout (finished): the feed renders all-done, then a rule + cleaned result:
  *   🛠 <b>Worker</b> · <i>{description}</i>
  *   <i>done · {n} tools · {elapsed}</i>
- *   <i>✓ {step}</i>
+ *   <s><i>✓ {step}</i></s>
  *   ─────
  *   ✅ <i>{cleaned result paragraph}</i>
  */
