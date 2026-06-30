@@ -158,6 +158,14 @@ export interface StreamReplyDeps {
    * the raw (repaired) text is sent unchanged.
    */
   normalizeParagraphBreaks?: (text: string) => string
+  /**
+   * Insert a visible blank-line spacer into each prose `\n\n` gap so the rich
+   * GFM renderer shows a real empty line between paragraphs (the rich engine
+   * otherwise renders `\n\n` tight — the post-#2669 paragraph-spacing
+   * regression). Applied only on the rich path (never on `format:'text'`).
+   * Optional for backward compat; omitted → no spacers added.
+   */
+  addParagraphSpacers?: (text: string) => string
   /** Validates the chat id against the access list. Throws on deny. */
   assertAllowedChat: (chatId: string) => void
   /** Resolves the effective thread id (explicit, last-inbound, or undefined). */
@@ -337,7 +345,12 @@ export async function handleStreamReply(
   // markdown→HTML / MarkdownV2 rendering happens here anymore — the raw
   // text IS the wire payload.
   const literalText = format === 'text'
-  let effectiveText: string = rawText
+  // Paragraph-spacing fix (rich-message regression after #2669): inject a
+  // visible blank-line spacer into prose `\n\n` gaps on the rich path so
+  // multi-paragraph answers don't render jammed together. The literal
+  // (`format:'text'`) path must stay byte-exact, so it is left untouched.
+  let effectiveText: string =
+    !literalText && deps.addParagraphSpacers ? deps.addParagraphSpacers(rawText) : rawText
 
   // Inline status-accent header (issue #320 fallback). Prepended so it
   // leads the body. Since stream_reply callers pass the full text snapshot

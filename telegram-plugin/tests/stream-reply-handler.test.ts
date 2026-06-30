@@ -117,6 +117,45 @@ describe('handleStreamReply', () => {
     expect(bot.api.sendMessage.mock.calls[0][2]?.parse_mode).toBeUndefined()
   })
 
+  it('applies addParagraphSpacers on the rich path (multi-paragraph gap spaced)', async () => {
+    const state = makeState()
+    // Spacer dep replaces every `\n\n` gap with a visible marker so we can
+    // assert the rich path ran it (mirrors the real gateway wiring).
+    const deps = makeDeps(bot, {
+      addParagraphSpacers: (t) => t.replace(/\n\n/g, '\n\nSPACER\n\n'),
+    })
+
+    const pending = handleStreamReply(
+      { chat_id: '1', text: 'Para one.\n\nPara two.', done: true },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pending
+
+    expect(bot.api.sendRichMessage).toHaveBeenCalledTimes(1)
+    expect(richSendMarkdown(bot)).toBe('Para one.\n\nSPACER\n\nPara two.')
+  })
+
+  it('does NOT apply addParagraphSpacers on the literal format=text path', async () => {
+    const state = makeState()
+    const deps = makeDeps(bot, {
+      addParagraphSpacers: (t) => t.replace(/\n\n/g, '\n\nSPACER\n\n'),
+    })
+
+    const pending = handleStreamReply(
+      { chat_id: '1', text: 'Para one.\n\nPara two.', format: 'text', done: true },
+      state,
+      deps,
+    )
+    await microtaskFlush()
+    await pending
+
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1)
+    // Literal path is byte-exact — no spacer injected.
+    expect(bot.api.sendMessage.mock.calls[0][1]).toBe('Para one.\n\nPara two.')
+  })
+
   it('throws when text exceeds the rich-message cap (no silent id:pending)', async () => {
     const state = makeState()
     const deps = makeDeps(bot)

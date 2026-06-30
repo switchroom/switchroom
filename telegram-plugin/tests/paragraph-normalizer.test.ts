@@ -9,7 +9,12 @@
  * (un-promoted break) are preferred over false positives (double-spaced list).
  */
 import { describe, test, expect } from 'vitest'
-import { normalizeParagraphBreaks, splitCollapsedInlineBullets } from '../format.js'
+import {
+  normalizeParagraphBreaks,
+  splitCollapsedInlineBullets,
+  addParagraphSpacers,
+  PARAGRAPH_SPACER,
+} from '../format.js'
 
 describe('normalizeParagraphBreaks', () => {
   test('promotes a lone prose paragraph break (prev ends with `.`, next is prose)', () => {
@@ -333,6 +338,106 @@ describe('splitCollapsedInlineBullets', () => {
   test('an already-correct multi-line bullet list passes through unchanged', () => {
     const input = '• Master Bath 1, clean\n• Master Bath 2, 33% loss\n• Cabinet, clean'
     expect(splitCollapsedInlineBullets(input)).toBe(input)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// addParagraphSpacers — restore a VISIBLE blank line between prose paragraphs.
+//
+// The rich GFM renderer (post-#2669) collapses a `\n\n` paragraph gap TIGHT, so
+// multi-paragraph replies render jammed together — the operator-confirmed
+// regression vs the old HTML path (`parse_mode:"HTML"`, `\n\n` → real blank
+// line). addParagraphSpacers wedges a U+00A0 spacer paragraph into each prose
+// `\n\n` gap so the rich renderer shows a visible empty line. Conservative:
+// only between two prose blocks, never adjacent to list/table/code/quote/heading.
+// ---------------------------------------------------------------------------
+
+describe('addParagraphSpacers', () => {
+  const gap = `\n\n${PARAGRAPH_SPACER}\n\n`
+
+  test('the spacer is a single non-breaking space (U+00A0), not an ASCII space', () => {
+    expect(PARAGRAPH_SPACER).toBe(' ')
+  })
+
+  test('inserts a visible spacer paragraph into a prose `\\n\\n` gap', () => {
+    expect(addParagraphSpacers('Paragraph one.\n\nParagraph two.')).toBe(
+      `Paragraph one.${gap}Paragraph two.`,
+    )
+  })
+
+  test('spaces every gap in a three-paragraph body', () => {
+    expect(addParagraphSpacers('One.\n\nTwo.\n\nThree.')).toBe(
+      `One.${gap}Two.${gap}Three.`,
+    )
+  })
+
+  test('is idempotent — a spaced gap is not doubled on a second pass', () => {
+    const once = addParagraphSpacers('Alpha.\n\nBravo.')
+    expect(addParagraphSpacers(once)).toBe(once)
+  })
+
+  test('leaves a single-`\\n` separation alone (only `\\n\\n` gaps are spaced)', () => {
+    // normalizeParagraphBreaks owns lone-break promotion; this pass only adds a
+    // visible spacer where a genuine blank-line gap already exists.
+    const input = 'Line one.\nLine two.'
+    expect(addParagraphSpacers(input)).toBe(input)
+  })
+
+  test('does NOT space a gap adjacent to a list (tight list rhythm preserved)', () => {
+    const input = 'Here are the steps.\n\n- first\n- second'
+    expect(addParagraphSpacers(input)).toBe(input)
+    const input2 = '- first\n- second\n\nClosing prose after the list.'
+    expect(addParagraphSpacers(input2)).toBe(input2)
+  })
+
+  test('does NOT space a gap adjacent to a table', () => {
+    const input = 'Intro.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |'
+    expect(addParagraphSpacers(input)).toBe(input)
+  })
+
+  test('does NOT space a gap adjacent to a fenced code block', () => {
+    const input = 'Look here.\n\n```js\nconst a = 1;\n```\n\nDone.'
+    // Neither the prose→fence nor the fence→prose gap gets a spacer.
+    expect(addParagraphSpacers(input)).toBe(input)
+  })
+
+  test('does NOT space a gap adjacent to a heading or blockquote', () => {
+    expect(addParagraphSpacers('Intro prose.\n\n## Section\n\nBody prose.')).toBe(
+      'Intro prose.\n\n## Section\n\nBody prose.',
+    )
+    expect(addParagraphSpacers('Said.\n\n> a quote\n\nAfter.')).toBe(
+      'Said.\n\n> a quote\n\nAfter.',
+    )
+  })
+
+  test('never reaches inside a fenced block (interior blank line untouched)', () => {
+    const input = 'Before.\n\n```\nline 1\n\nline 2\n```\n\nAfter.'
+    const out = addParagraphSpacers(input)
+    // The fence interior — including its own blank line — is byte-for-byte intact.
+    expect(out).toContain('```\nline 1\n\nline 2\n```')
+    // And no spacer paragraph was injected anywhere (both gaps touch the fence).
+    expect(out).not.toContain(PARAGRAPH_SPACER)
+  })
+
+  test('a body with no paragraph gap is returned unchanged', () => {
+    expect(addParagraphSpacers('just one paragraph, no gap')).toBe('just one paragraph, no gap')
+  })
+
+  test('composes after normalizeParagraphBreaks: prose gap spaced, list left tight', () => {
+    const input = [
+      'Summary of the change.',
+      '',
+      'It does two things.',
+      '',
+      '- adds a normalizer',
+      '- lifts the cap',
+    ].join('\n')
+    const out = addParagraphSpacers(normalizeParagraphBreaks(input))
+    // The two prose paragraphs gain a visible spacer between them.
+    expect(out).toContain(`Summary of the change.${gap}It does two things.`)
+    // The list stays tight (no spacer wedged before it).
+    expect(out).toContain('- adds a normalizer\n- lifts the cap')
+    expect(out).not.toContain(`${PARAGRAPH_SPACER}\n\n- adds`)
   })
 })
 
