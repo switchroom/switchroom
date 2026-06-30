@@ -697,11 +697,46 @@ export function splitMarkdownChunks(text: string, maxLen = RICH_MESSAGE_MAX_CHAR
       break
     }
 
-    chunks.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
+    chunks.push(stripBoundarySpacers(rest.slice(0, cut), 'trailing'))
+    rest = stripBoundarySpacers(rest.slice(cut), 'leading')
   }
 
-  return chunks
+  return chunks.map((c) => stripBoundarySpacers(c, 'trailing'))
+}
+
+/**
+ * Strip stray paragraph-spacer / blank lines off a chunk boundary so a cut that
+ * lands inside an injected spacer gap (`\n\n${PARAGRAPH_SPACER}\n\n`, see
+ * addParagraphSpacers) never leaves a continuation chunk that OPENS with a bare
+ * U+00A0 spacer line, nor a prior chunk that ENDS with one.
+ *
+ * A "boundary blank run" is any sequence of newlines and spacer-only lines (a
+ * line whose only content is the U+00A0 spacer, optionally surrounded by ASCII
+ * spaces/tabs) in ANY interleaving — `\n \n`, ` \n\n`, `\n\n \n`, etc. The
+ * legacy behaviour (strip leading ASCII `\n+` only) is a strict subset, so a
+ * boundary with NO spacer is unaffected. Idempotent: a chunk already trimmed
+ * has nothing left to strip.
+ *
+ *  - `'leading'`  → strip the run from the START (the continuation chunk).
+ *  - `'trailing'` → strip the run from the END (the just-emitted prior chunk).
+ */
+function stripBoundarySpacers(chunk: string, side: 'leading' | 'trailing'): string {
+  // One blank-or-spacer line: optional ASCII ws, optional one U+00A0, optional
+  // ASCII ws — i.e. a line that renders empty. A run of these (joined by \n,
+  // with leading/trailing \n) is what we peel off the boundary.
+  const sp = PARAGRAPH_SPACER
+  if (side === 'leading') {
+    // Leading: one-or-more newlines, optionally with spacer-only lines mixed in.
+    return chunk.replace(
+      new RegExp(`^(?:[ \\t]*${sp}?[ \\t]*\\n+)+`),
+      '',
+    )
+  }
+  // Trailing: a newline run, optionally with spacer-only lines, at the very end.
+  return chunk.replace(
+    new RegExp(`(?:\\n+[ \\t]*${sp}?[ \\t]*)+$`),
+    '',
+  )
 }
 
 /**
