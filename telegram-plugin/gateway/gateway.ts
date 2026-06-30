@@ -8945,12 +8945,13 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   }
 
   try {
-    // PR-C2: voice-only mode with a successful synthesis suppresses the
-    // text body — the spoken voice note IS the reply. The loop is skipped
-    // entirely (sentIds stays empty for text); the voice send below lands
-    // the answer. Any other mode (voice+text, or voice-only that fell back)
-    // sends the text chunks as normal.
-    for (let i = 0; !suppressText && i < chunks.length; i++) {
+    for (let i = 0; i < chunks.length; i++) {
+      // PR-C2: voice-only mode with a successful synthesis suppresses the
+      // text body — the spoken voice note IS the reply. Bail before the
+      // first chunk send (sentIds stays empty for text); the voice send
+      // below lands the answer. Any other mode (voice+text, or voice-only
+      // that fell back) sends the text chunks as normal.
+      if (suppressText) break
       const shouldReplyTo =
         reply_to != null && replyMode !== 'off' && (replyMode === 'all' || i === 0)
       const isLastChunk = i === chunks.length - 1
