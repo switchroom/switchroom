@@ -20877,7 +20877,7 @@ bot.command('usage', async ctx => {
           }
           return hit?.result ?? { ok: false as const, reason: 'broker returned no result for account' }
         })
-        const { renderAuthSnapshotFormat2, buildSnapshotsFromState } = await import(
+        const { renderAuthSnapshotFormat2, buildSnapshotsFromState, buildSnapshotKeyboard } = await import(
           '../auth-snapshot-format.js'
         )
         const tz = process.env.SWITCHROOM_TIMEZONE ?? process.env.TZ ?? 'UTC'
@@ -20888,7 +20888,22 @@ bot.command('usage', async ctx => {
           demo,
           ...(staleCachedAtMs != null ? { staleCachedAtMs } : { liveProbedAtMs: Date.now() }),
         })
-        await switchroomReply(ctx, text, { html: true })
+        // Preserve the Switch/Refresh/usage/Add inline keyboard on the
+        // rich-message render — the table card carries the same actions the
+        // /auth snapshot does. switchroomReply routes through the rich path
+        // (replyWithRichMessage), which accepts reply_markup. Build a grammy
+        // InlineKeyboard so the markup type matches switchroomReply's contract.
+        const kbRows = buildSnapshotKeyboard(snapshots, { now: new Date() })
+        const keyboard = new InlineKeyboard()
+        kbRows.forEach((row, ri) => {
+          if (ri > 0) keyboard.row()
+          for (const b of row) {
+            if (b.callbackData) keyboard.text(b.text, b.callbackData)
+            else if (b.insertText) keyboard.switchInlineCurrent(b.text, b.insertText)
+            else keyboard.text(b.text, 'auth:noop')
+          }
+        })
+        await switchroomReply(ctx, text, { html: true, reply_markup: keyboard })
         return
       }
     }

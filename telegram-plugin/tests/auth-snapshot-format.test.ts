@@ -11,6 +11,7 @@ import {
   bindingWindow,
   formatRelative,
   formatAbsolute,
+  formatStatusTime,
   fmtPct,
   recommendation,
   renderAuthSnapshotFormat2,
@@ -133,6 +134,14 @@ describe('fmtPct', () => {
     expect(fmtPct(8.6)).toBe('9%');
     expect(fmtPct(99.6)).toBe('100%');
   });
+  it('CLAMPS the displayed value to 100% — never shows over 100 (trust)', () => {
+    // Anthropic returns a decimal that can exceed 1.0; quota-check multiplies by
+    // 100 → e.g. 1.01 → 101. The displayed number must clamp to 100%.
+    expect(fmtPct(101)).toBe('100%');
+    expect(fmtPct(100.4)).toBe('100%');
+    expect(fmtPct(250)).toBe('100%');
+    expect(fmtPct(1.01 * 100)).toBe('100%');
+  });
 });
 
 // ── formatAbsolute ───────────────────────────────────────────────────
@@ -146,6 +155,52 @@ describe('formatAbsolute', () => {
   });
   it('returns "—" for null', () => {
     expect(formatAbsolute(null, 'UTC')).toBe('—');
+  });
+});
+
+// ── formatStatusTime (date shown only when NOT today, in user tz) ─────
+describe('formatStatusTime', () => {
+  // Fixed injected now + fixed tz → fully deterministic (no wall-clock).
+  // 2026-05-15T05:00:00Z = Fri 15 May 3:00 PM in Australia/Melbourne (AEST,
+  // UTC+10). May is winter there → AEST, not AEDT — the tz database handles it.
+  const MEL = 'Australia/Melbourne';
+  const NOW_MEL = new Date('2026-05-15T05:00:00Z'); // Fri 3:00 PM Melbourne
+
+  it('shows TIME ONLY when the target is the same calendar day (user tz)', () => {
+    // 2026-05-15T13:00:00Z = Fri 11:00 PM Melbourne — same Melbourne day as now.
+    const out = formatStatusTime(new Date('2026-05-15T13:00:00Z'), NOW_MEL, MEL);
+    expect(out).toBe('11:00 PM');
+    // No weekday/date leaks on a same-day target.
+    expect(out).not.toMatch(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/);
+  });
+
+  it('includes the WEEKDAY when the target is a different day (within the week)', () => {
+    // 2026-05-15T15:00:00Z = Sat 16 May 1:00 AM Melbourne — next Melbourne day.
+    const out = formatStatusTime(new Date('2026-05-15T15:00:00Z'), NOW_MEL, MEL);
+    expect(out).toBe('Sat 1:00 AM');
+    expect(out).toMatch(/^Sat\b/);
+  });
+
+  it('includes day-of-month + month when the target is beyond the current week', () => {
+    // ~9 days out: 2026-05-24T01:00:00Z = Sun 24 May 11:00 AM Melbourne.
+    const out = formatStatusTime(new Date('2026-05-24T01:00:00Z'), NOW_MEL, MEL);
+    // Intl en-US renders the weekday+day+month as "Sun, May 24".
+    expect(out).toBe('Sun, May 24 11:00 AM');
+    expect(out).toMatch(/^Sun\b/);
+    expect(out).toContain('May 24');
+  });
+
+  it('is tz-correct — same instant renders differently in UTC vs Melbourne', () => {
+    const instant = new Date('2026-05-15T15:00:00Z');
+    // In UTC that instant is still Fri 15 May 3:00 PM → same day as NOW_MEL's UTC
+    // wall date — but NOW in UTC terms is also 2026-05-15, so time-only.
+    expect(formatStatusTime(instant, NOW_MEL, 'UTC')).toBe('3:00 PM');
+    // In Melbourne it has crossed midnight into Saturday.
+    expect(formatStatusTime(instant, NOW_MEL, MEL)).toBe('Sat 1:00 AM');
+  });
+
+  it('returns "—" for a null target', () => {
+    expect(formatStatusTime(null, NOW_MEL, MEL)).toBe('—');
   });
 });
 
@@ -191,84 +246,120 @@ describe('renderAuthSnapshotFormat2', () => {
     }),
   ];
 
-  it('renders three health-grouped sections (BLOCKED first, then HEALTHY)', () => {
+  // Helper: parse the GFM table rows (the lines between the header separator
+  // and the trailing blank line) into their cell arrays.
+  function tableRows(out: string): string[][] {
+    const lines = out.split('\n');
+    const sep = lines.findIndex((l) => /^\|\s*---/.test(l));
+    if (sep < 0) return [];
+    const rows: string[][] = [];
+    for (let i = sep + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l.startsWith('|')) break;
+      rows.push(l.split('|').slice(1, -1).map((c) => c.trim()));
+    }
+    return rows;
+  }
+
+  it('renders a GFM table with the State/Account/5h/7d/Status header', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    // Headers present
     expect(out).toContain('🔋 **Auth — fleet status**');
-    expect(out).toContain('🔴 **BLOCKED** (1)');
-    expect(out).toContain('🟢 **HEALTHY** (2)');
-    // Order: BLOCKED before HEALTHY
-    expect(out.indexOf('🔴')).toBeLessThan(out.indexOf('🟢'));
+    expect(out).toContain('| State | Account | 5h | 7d | Status |');
+    expect(out).toContain('| --- | --- | --- | --- | --- |');
+    // No legacy group headers / health-section titles remain.
+    expect(out).not.toContain('**BLOCKED**');
+    expect(out).not.toContain('**HEALTHY**');
   });
 
-  it('marks the active account with ●', () => {
+  it('sorts the ACTIVE account to the top row regardless of health group', () => {
+    const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
+    expect(rows.length).toBe(3);
+    // you@example.com is active + healthy; bob is blocked. Active still wins
+    // the top row over the blocked account.
+    expect(rows[0][1]).toContain('you@example.com');
+  });
+
+  it('labels the active account with " (active)" and NO black-dot marker', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    expect(out).toMatch(/●\s*`you@example\.com`/);
+    expect(out).toContain('you@example.com (active)');
+    // The ⚫/● active marker is removed entirely.
+    expect(out).not.toContain('⚫');
+    expect(out).not.toContain('●');
   });
 
-  it('shows "back …" for blocked accounts with binding-window word', () => {
-    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    // bob@example is blocked on 7d, recovers Sun
-    expect(out).toMatch(/bob@example\.com[\s\S]*back .* 7-day cap/);
-  });
-
-  it('wraps the cap-line ETA in a `code` span while keeping the surrounding _italic_', () => {
-    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    const capLine = out.split('\n').find((l) => l.includes('quota exhausted'));
-    expect(capLine).toBeDefined();
-    // ETA backtick code-span: "(`in …`, 7-day cap)"
-    expect(capLine).toMatch(/\(`in .+?`, 7-day cap\)/);
-    // The whole sub-line stays italic-wrapped.
-    expect(capLine!.trim().startsWith('_quota exhausted')).toBe(true);
-    expect(capLine!.trim().endsWith('_')).toBe(true);
-  });
-
-  it('drops the ETA code-span on a blocked account with no known reset time', () => {
-    // Blocked on 7d but the binding window has no reset epoch — must NOT
-    // render a `in —` code-span; falls back to plain "reset time unknown".
-    const noReset = [
-      snap({ label: 'norst@example.com', isActive: true, quota: quota({ sevenDayUtilizationPct: 100 }) }),
+  it('shows the FULL email address, never truncated', () => {
+    const longSnaps = [
+      snap({ label: 'a-very-long-account-name@really-long-domain.example.com', isActive: true, quota: quota({ fiveHourUtilizationPct: 5 }) }),
     ];
-    const out = renderAuthSnapshotFormat2(noReset, { now: NOW, tz: 'UTC' });
-    const capLine = out.split('\n').find((l) => l.includes('quota exhausted'));
-    expect(capLine).toBeDefined();
-    expect(capLine).not.toContain('`in —`');
-    expect(capLine).not.toContain('—`');
-    expect(capLine).toContain('reset time unknown');
-    expect(capLine!.trim().startsWith('_quota exhausted')).toBe(true);
-    expect(capLine!.trim().endsWith('_')).toBe(true);
+    const rows = tableRows(renderAuthSnapshotFormat2(longSnaps, { now: NOW, tz: 'UTC' }));
+    expect(rows[0][1]).toContain('a-very-long-account-name@really-long-domain.example.com');
+    expect(rows[0][1]).not.toContain('…');
+    expect(rows[0][1]).not.toContain('...');
   });
 
-  it('wraps both the 5h-refills and 7d-resets ETAs in `code` spans', () => {
-    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    const lines = out.split('\n');
-    const fiveLine = lines.find((l) => l.includes('5h refills') && l.includes('`in '));
-    const sevenLine = lines.find((l) => l.includes('7d resets') && l.includes('`in '));
-    expect(fiveLine).toBeDefined();
-    expect(sevenLine).toBeDefined();
-    // Each ETA value sits in a backtick code-span, inside the italic sub-line.
-    expect(fiveLine).toMatch(/5h refills .+ \(`in .+?`\)/);
-    expect(sevenLine).toMatch(/7d resets .+ \(`in .+?`\)/);
+  it('orders non-active rows blocked-before-healthy', () => {
+    const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
+    // After the active row (you), the blocked bob must precede the healthy alice.
+    const bob = rows.findIndex((r) => r[1].includes('bob@example.com'));
+    const alice = rows.findIndex((r) => r[1].includes('alice@example.com'));
+    expect(bob).toBeGreaterThan(0);
+    expect(bob).toBeLessThan(alice);
   });
 
-  it('puts the imminent window first on healthy/throttling rows', () => {
-    const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
-    // you: 5h reset is in 7m, 7d reset is in 2d. 5h should come first.
-    // The two reset segments now render on SEPARATE lines (so the 7d
-    // segment doesn't wrap mid-line on a narrow phone) — the imminent 5h
-    // line must precede the 7d line, each on its own line.
-    const lines = out.split('\n');
-    const fiveLine = lines.findIndex((l) => l.includes('5h refills'));
-    const sevenLine = lines.findIndex((l) => l.includes('7d resets'));
-    expect(fiveLine).toBeGreaterThanOrEqual(0);
-    expect(sevenLine).toBeGreaterThanOrEqual(0);
-    // Distinct lines, 5h before 7d.
-    expect(fiveLine).toBeLessThan(sevenLine);
-    expect(lines[fiveLine]).not.toContain('7d resets');
-    expect(lines[sevenLine]).not.toContain('5h refills');
-    // The ETA value is wrapped in a `code` span so the countdown pops.
-    expect(lines[fiveLine]).toMatch(/\(`in .+?`\)/);
-    expect(lines[sevenLine]).toMatch(/\(`in .+?`\)/);
+  it('Status column shows "back <when>" for a blocked account', () => {
+    const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
+    const bob = rows.find((r) => r[1].includes('bob@example.com'))!;
+    expect(bob[4]).toMatch(/^back .* \(in .+\)$/);
+  });
+
+  it('Status column shows "refills <when>" for a healthy account', () => {
+    const rows = tableRows(renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' }));
+    const you = rows.find((r) => r[1].includes('you@example.com'))!;
+    expect(you[4]).toMatch(/^refills .* \(in .+\)$/);
+  });
+
+  it('NEVER displays a percentage over 100% even on an over-cap account', () => {
+    // Feed 1.01 (decimal) * 100 = 101 → must clamp to 100% in the cell.
+    const overSnaps = [
+      snap({
+        label: 'over@example.com',
+        isActive: true,
+        quota: quota({ fiveHourUtilizationPct: 101, sevenDayUtilizationPct: 250 }),
+      }),
+    ];
+    const rows = tableRows(renderAuthSnapshotFormat2(overSnaps, { now: NOW, tz: 'UTC' }));
+    expect(rows[0][2]).toBe('100%'); // 5h
+    expect(rows[0][3]).toBe('100%'); // 7d
+    // And the blocked state still surfaces via the emoji (🔴) + Status.
+    expect(rows[0][0]).toBe('🔴');
+    expect(rows[0][4]).toMatch(/^back/);
+  });
+
+  it('renders dates in the Status column only when NOT today (user tz)', () => {
+    // now = Fri 3:00 PM Melbourne. A reset later the SAME Melbourne day shows
+    // time-only; a reset on the next day shows the weekday.
+    const MEL = 'Australia/Melbourne';
+    const NOW_MEL = new Date('2026-05-15T05:00:00Z'); // Fri 3:00 PM Mel
+    const sameDay = [
+      snap({ label: 'today@example.com', isActive: true, quota: quota({
+        fiveHourUtilizationPct: 5,
+        fiveHourResetAt: new Date('2026-05-15T11:00:00Z'), // Fri 9:00 PM Mel (today)
+        sevenDayResetAt: new Date('2026-05-22T11:00:00Z'),
+      }) }),
+    ];
+    const todayRows = tableRows(renderAuthSnapshotFormat2(sameDay, { now: NOW_MEL, tz: MEL }));
+    expect(todayRows[0][4]).toContain('9:00 PM');
+    expect(todayRows[0][4]).not.toMatch(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/);
+
+    const nextDay = [
+      snap({ label: 'tomorrow@example.com', isActive: true, quota: quota({
+        fiveHourUtilizationPct: 5,
+        fiveHourResetAt: new Date('2026-05-15T15:00:00Z'), // Sat 1:00 AM Mel (tomorrow)
+        sevenDayResetAt: new Date('2026-05-22T11:00:00Z'),
+      }) }),
+    ];
+    const tomorrowRows = tableRows(renderAuthSnapshotFormat2(nextDay, { now: NOW_MEL, tz: MEL }));
+    expect(tomorrowRows[0][4]).toContain('Sat 1:00 AM');
   });
 
   it('emits a recommendation footer that names a healthy alternative when active is throttling', () => {
@@ -293,9 +384,10 @@ describe('renderAuthSnapshotFormat2', () => {
       snap({ label: 'broken@x', isActive: true, quota: null, quotaError: 'HTTP 401' }),
     ];
     const out = renderAuthSnapshotFormat2(errSnaps, { now: NOW });
-    expect(out).toContain('quota probe failed');
+    // Probe-failed row: ⚪ State emoji + a "probe failed (...)" Status cell.
+    expect(out).toContain('probe failed');
     expect(out).toContain('HTTP 401');
-    expect(out).toContain('⚪ **UNKNOWN**');
+    expect(out).toContain('⚪');
   });
 
   it('renders refresh stamp when liveProbedAtMs given', () => {
@@ -342,9 +434,8 @@ describe('renderAuthSnapshotFormat2', () => {
       expect(out).not.toContain('alice@example.com');
       expect(out).not.toContain('bob@example.com');
       expect(out).not.toContain('you@example.com');
-      // Masked fakes present (pool order from a clean cache: blocked-first
-      // render order means bob is masked first, then alice/you in healthy).
-      expect(out).toMatch(/`[^@<]+@example\.com`/);
+      // Masked fakes present — plain table cells (no backtick wrap now).
+      expect(out).toMatch(/[^@\s<]+@example\.com/);
     });
 
     it('WITH demo, the recommendation footer masks the active label', () => {
@@ -922,23 +1013,20 @@ describe('#2494 Bug C — blockedReason + thin probe (out_of_credits now informa
 // ── #2494 — row rendering: out_of_credits as informational annotation ─────────
 
 describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demoted)', () => {
-  it('out_of_credits at 0% util → healthy row with informational overage annotation, NOT blocked', () => {
-    // THE KEY CHANGE: carol scenario — 0% util, out_of_credits → healthy group
-    // with an informational sub-line "overage off (out_of_credits) — serving from quota"
+  it('out_of_credits at 0% util → healthy (🟢) row, NOT blocked', () => {
+    // THE KEY CHANGE: carol scenario — 0% util, out_of_credits → healthy. In the
+    // table this surfaces as a 🟢 State emoji, not 🔴 — the row is not blocked.
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'dead@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 0, overageDisabledReason: 'out_of_credits' }) })],
       { now: NOW },
     );
-    // Must be in HEALTHY group, not BLOCKED
-    expect(out).toContain('🟢 **HEALTHY**');
-    expect(out).not.toContain('🔴 **BLOCKED**');
-    // Must have informational annotation. #2669: the reason is markdown-
-    // escaped, so the underscores in "out_of_credits" render as "out\_of\_credits".
-    expect(out).toContain('overage off (out\\_of\\_credits) — serving from quota');
-    // Must NOT have old blocked framing
+    expect(out).toContain('| 🟢 |');
+    expect(out).not.toContain('| 🔴 |');
+    // Must NOT have old blocked framing.
     expect(out).not.toContain('billing disabled');
     expect(out).not.toContain("won't recover until billing is fixed");
     expect(out).not.toContain('quota exhausted');
+    expect(out).not.toContain('back ');
   });
 
   it('out_of_credits account is a valid failover target (appears in buildSnapshotKeyboard switch buttons)', () => {
@@ -952,13 +1040,14 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
     expect(allText).toContain('Switch fleet → carol@example.com');
   });
 
-  it('quota-exhausted row shows a recovery countdown, not "billing disabled" or overage annotation', () => {
+  it('quota-exhausted row shows a 🔴 + "back <when>" Status, not "billing disabled"', () => {
     const futureReset = new Date(NOW.getTime() + 45 * 60_000);
     const out = renderAuthSnapshotFormat2(
       [snap({ label: 'ex@x', isActive: true, quota: quota({ fiveHourUtilizationPct: 100, fiveHourResetAt: futureReset }) })],
       { now: NOW },
     );
-    expect(out).toContain('quota exhausted');
+    expect(out).toContain('| 🔴 |');
+    expect(out).toMatch(/back .* \(in 45m\)/);
     expect(out).not.toContain('billing disabled');
     expect(out).not.toContain('overage off');
   });
@@ -978,7 +1067,8 @@ describe('#2494 — renderAuthSnapshotFormat2 row rendering (out_of_credits demo
       [snap({ label: 'org@x', isActive: false, quota: quota({ fiveHourUtilizationPct: 85, overageDisabledReason: 'org_level_disabled' }) })],
       { now: NOW },
     );
-    expect(out).toContain('🟡 **THROTTLING**');
+    // 85% util → throttling, surfaced as the 🟡 State emoji in the table.
+    expect(out).toContain('| 🟡 |');
     expect(out).not.toContain('overage off');
   });
 
