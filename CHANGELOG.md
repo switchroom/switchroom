@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.16.30 — Telegram deterministic formatting: reply-path bullet split + card-body normalization
+
+Deterministic Telegram formatting on two surfaces. On the reply path, collapsed inline bullet lists are now split onto separate lines (`splitCollapsedInlineBullets`) so bullets that arrived run-together render as a proper list. (#2687)
+
+Card bodies are normalized (`stackCardLines`) so the progress, worker, issues, and boot cards stack their bullets consistently — the same way a reply renders. The permission card is unchanged (zero-diff). (#2688)
+
 ## v0.16.29 — Fix Hermes Desktop session.create + pet.info for v0.17
 
 Hermes Desktop v0.17.0 calls `session.create {cols, profile}` — no `session_id` — when the user sends the first message after reconnect. The handler was falling through to `""` and returning "Unknown session: ". Fix: fall back to `ctx.activeSessionId` (set by the prior `session.resume` auto-resume), then to the most-recently-active agent by `lastTurnAt`. Also adds `pet.info / pet.info.meta / pet.gallery` stubs returning `{enabled:false}` — without these, -32601 errors triggered a retry loop that spammed the WS connection every ~5s. (#2684)
