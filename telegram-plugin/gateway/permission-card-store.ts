@@ -20,7 +20,7 @@
  * Production rate: a few cards per permission request; file stays tiny.
  */
 
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 
 export interface PersistedPermCard {
@@ -29,7 +29,6 @@ export interface PersistedPermCard {
   messageId: number
   startedAt: number
   toolName: string
-  cardText: string
 }
 
 export interface PermissionCardStore {
@@ -57,8 +56,12 @@ export function createPermissionCardStore(stateDir: string): PermissionCardStore
   }
 
   function write(entries: PersistedPermCard[]): void {
+    // Atomic write: stage to .tmp then rename so a crash mid-write never
+    // leaves a corrupt JSON file (consistent with saveAccess() pattern).
+    const tmp = filePath + '.tmp'
     try {
-      writeFileSync(filePath, JSON.stringify(entries), { encoding: 'utf-8', mode: 0o600 })
+      writeFileSync(tmp, JSON.stringify(entries), { encoding: 'utf-8', mode: 0o600 })
+      renameSync(tmp, filePath)
     } catch (err) {
       process.stderr.write(
         `telegram gateway: permission-card-store write failed: ${(err as Error).message}\n`,
@@ -100,5 +103,39 @@ export function createPermissionCardStore(stateDir: string): PermissionCardStore
         // File may not exist — that's fine
       }
     },
+  }
+}
+
+/**
+ * Sweep stale permission cards from a prior gateway session.
+ *
+ * For each entry, calls `editFn` to strip its inline keyboard and show a
+ * "gateway restarted" notice, then removes the entry from the store. Removal
+ * is per-card (not a bulk `clear()` at the end) so that fresh entries added
+ * by new permission requests arriving during the sweep are not silently wiped.
+ *
+ * Exported for unit testing — gateway.ts calls this from `didOneTimeSetup`.
+ */
+export async function sweepStalePermCards(
+  cards: PersistedPermCard[],
+  editFn: (chatId: string, messageId: number, toolName: string) => Promise<void>,
+  store: PermissionCardStore,
+  log: (msg: string) => void = () => {},
+): Promise<void> {
+  if (cards.length === 0) return
+  log(`telegram gateway: boot-sweep: stripping ${cards.length} stale permission card(s) from prior gateway session`)
+  for (const card of cards) {
+    try {
+      await editFn(card.chatId, card.messageId, card.toolName)
+    } catch (err) {
+      log(
+        `telegram gateway: boot-sweep: stale-card strip failed ` +
+        `${card.chatId}:${card.messageId}: ${(err as Error).message}`,
+      )
+    }
+    // Remove per-card: a bulk clear() after the loop would wipe entries added
+    // by new permission requests arriving during the sweep (e.g. on a
+    // gateway-only restart where Claude Code reconnects immediately).
+    store.remove(card.requestId)
   }
 }

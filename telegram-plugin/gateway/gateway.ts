@@ -78,7 +78,7 @@ import {
   STALE_TAP_NOTICE,
   type PermissionCardRef,
 } from './permission-timeout.js'
-import { createPermissionCardStore } from './permission-card-store.js'
+import { createPermissionCardStore, sweepStalePermCards } from './permission-card-store.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
@@ -7127,7 +7127,6 @@ const ipcServer: IpcServer = createIpcServer({
             messageId: sent.message_id,
             startedAt: pend.startedAt,
             toolName: pend.tool_name,
-            cardText: pend.card_text,
           })
         }
       }).catch(e => {
@@ -23584,37 +23583,21 @@ void (async () => {
 
         // Strip stale permission cards from prior gateway session. Any entry
         // still in the store was never resolved (gateway died before the
-        // operator tapped or the reaper ran). The operator might have seen
-        // those cards and tapped them — if so, they got STALE_TAP_NOTICE
-        // ("already resolved") which is misleading. Edit the messages to
-        // remove the keyboard and show a clear "restarted" notice instead.
-        void (async () => {
-          const stale = permCardStore.loadAll()
-          if (stale.length === 0) return
-          process.stderr.write(
-            `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
-          )
-          for (const card of stale) {
-            const toolLabel = card.toolName ?? 'unknown tool'
-            const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
-            try {
-              // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
-              await bot.api.editMessageText(
-                card.chatId,
-                card.messageId,
-                richMessage(notice),
-                { reply_markup: { inline_keyboard: [] } },
-              )
-            } catch (err) {
-              // Card may already be deleted, edited, or in an inaccessible chat — benign
-              process.stderr.write(
-                `telegram gateway: boot-sweep: stale-card strip failed ` +
-                `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
-              )
-            }
-          }
-          permCardStore.clear()
-        })()
+        // operator tapped or the reaper ran). Edits each message to remove
+        // its inline keyboard and show a clear "restarted" notice.
+        void sweepStalePermCards(
+          permCardStore.loadAll(),
+          async (chatId, messageId, toolName) => {
+            const notice =
+              `🔒 **${toolName}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
+            // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
+            await bot.api.editMessageText(chatId, messageId, richMessage(notice), {
+              reply_markup: { inline_keyboard: [] },
+            })
+          },
+          permCardStore,
+          msg => process.stderr.write(msg + '\n'),
+        )
 
         // Boot-time pin sweep
         try {
