@@ -140,6 +140,22 @@ describe('parseAuthCommand — new verbs', () => {
     expect((p as { reason?: string }).reason).toMatch(/confirm/i)
   })
 
+  // Boundary-escaping (#2695 escaper de-dup): the help/reason strings now
+  // escape dynamic user input via the consolidated `escapeMarkdown` import.
+  // A metacharacter-laden verb must come back backslash-escaped, proving the
+  // import swap preserved escaping at this call-site.
+  it('escapes a metacharacter-laden unknown verb in the help reason', () => {
+    const p = parseAuthCommand('/auth a_b*c')
+    expect(p?.kind).toBe('help')
+    expect((p as { reason?: string }).reason).toContain('a\\_b\\*c')
+  })
+
+  it('escapes a metacharacter-laden rm modifier in the help reason', () => {
+    const p = parseAuthCommand('/auth rm spare x_y*z')
+    expect(p?.kind).toBe('help')
+    expect((p as { reason?: string }).reason).toContain('x\\_y\\*z')
+  })
+
   it('rejects /auth rm with no label', () => {
     const p = parseAuthCommand('/auth rm')
     expect(p?.kind).toBe('help')

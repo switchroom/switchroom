@@ -55,6 +55,50 @@ describe("formatIdleFooter", () => {
     expect(formatIdleFooter([r], NOW)).toBe("🟢 idle · last reply **1d ago**");
   });
 
+  it("no-data (quiet) state carries NO ** markup", () => {
+    const out = formatIdleFooter([], NOW);
+    expect(out).toBe("🟡 quiet · no turns yet");
+    expect(out).not.toContain("**");
+  });
+
+  it("working state bolds ONLY the elapsed value, not the whole line", () => {
+    const r = row({ startedAt: NOW - 4 * 60_000 });
+    const out = formatIdleFooter([r], NOW);
+    // The bold span wraps the time and only the time.
+    const bold = out.match(/\*\*(.+?)\*\*/);
+    expect(bold).not.toBeNull();
+    expect(bold![1]).toBe("4m ago");
+    // The label "⚙️ working since " is outside the bold span.
+    expect(out).toBe("⚙️ working since **4m ago**");
+    // Exactly one bold span (two `**` delimiters).
+    expect((out.match(/\*\*/g) ?? []).length).toBe(2);
+  });
+
+  it("idle state bolds ONLY the last-reply value, not the whole line", () => {
+    const r = row({ startedAt: NOW - 6 * 60_000, endedAt: NOW - 3 * 60_000 });
+    const out = formatIdleFooter([r], NOW);
+    const bold = out.match(/\*\*(.+?)\*\*/);
+    expect(bold).not.toBeNull();
+    expect(bold![1]).toBe("3m ago");
+    expect(out).toBe("🟢 idle · last reply **3m ago**");
+    expect((out.match(/\*\*/g) ?? []).length).toBe(2);
+  });
+
+  // Table-driven across elapsed magnitudes: a future change to formatAgo that
+  // drops the bold (or widens it past the time value) is caught here.
+  it.each([
+    { label: "seconds", deltaMs: 10_000, ago: "<1m ago" },
+    { label: "minutes", deltaMs: 7 * 60_000, ago: "7m ago" },
+    { label: "hours", deltaMs: 5 * 3_600_000, ago: "5h ago" },
+    { label: "days", deltaMs: 3 * 86_400_000, ago: "3d ago" },
+  ])("idle footer bolds the $label-magnitude elapsed value", ({ deltaMs, ago }) => {
+    const r = row({ startedAt: NOW - deltaMs - 1000, endedAt: NOW - deltaMs });
+    const out = formatIdleFooter([r], NOW);
+    expect(out).toBe(`🟢 idle · last reply **${ago}**`);
+    const bold = out.match(/\*\*(.+?)\*\*/);
+    expect(bold![1]).toBe(ago);
+  });
+
   it("unsorted rows — picks max startedAt", () => {
     // rows in reverse chronological order; function must not assume sorted
     const r1 = row({ turnKey: "t1", startedAt: NOW - 20 * 60_000, endedAt: NOW - 18 * 60_000 });

@@ -188,6 +188,24 @@ describe("evaluateCreditState — transition decisions (machinery, explicit fata
     // The underscore is escaped so it can't open an italic run inside **…**.
     expect(d.message).toContain("ev\\_il");
   });
+
+  // Boundary-escaping after the #2695 escaper de-dup: the entry message escapes
+  // BOTH the agent name and the raw reason via the consolidated `escapeMarkdown`
+  // import. A metacharacter-laden value through each site proves the import swap
+  // preserved escaping at this call-site.
+  it("escapes metacharacters in both the agent name and the cached reason (#2695)", () => {
+    const d = evaluateCreditState({
+      agentName: "a_b*c",
+      currentReason: "weird_reason*x",
+      prev: HEALTHY,
+      now: NOW,
+      fatalReasons: new Set(["weird_reason*x"]),
+    });
+    expect(d.kind).toBe("notify");
+    if (d.kind !== "notify") return;
+    expect(d.message).toContain("a\\_b\\*c");
+    expect(d.message).toContain("weird\\_reason\\*x");
+  });
 });
 
 describe("evaluateCreditState — subscription-only default (the fix)", () => {
