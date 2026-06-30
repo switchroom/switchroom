@@ -785,6 +785,26 @@ const AGENT_ADMIN = process.env.SWITCHROOM_AGENT_ADMIN === 'true'
 const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
 
+// ─── getUpdates heartbeat ─────────────────────────────────────────────────
+// Tracks the last time getUpdates completed (success OR error). Used by
+// the poll health check as a secondary stall signal: if getMe succeeds but
+// getUpdates hasn't responded in a while, the grammy runner loop is frozen
+// without the network being down (2026-06-30: clerk/klanker deaf for 2h
+// after a single timeout — getMe stayed green so the getMe-only check
+// never fired). Initialized to now so the first health-check interval
+// doesn't false-positive before the runner makes its first poll.
+let lastGetUpdatesHeartbeatMs = Date.now()
+bot.api.config.use(async (prev, method, payload, signal) => {
+  try {
+    const result = await prev(method, payload, signal)
+    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
+    return result
+  } catch (err) {
+    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
+    throw err
+  }
+})
+
 const GRAMMY_VERSION: string = (() => {
   try {
     const raw = readFileSync(new URL('../../node_modules/grammy/package.json', import.meta.url), 'utf8')
@@ -23319,7 +23339,23 @@ const POLL_HEALTH_THRESHOLD = Number(
 let pollHealthCheck: PollHealthCheckHandle | null = null
 if (POLL_HEALTH_INTERVAL_MS > 0) {
   pollHealthCheck = createPollHealthCheck({
-    ping: () => bot.api.getMe(),
+    ping: async () => {
+      await bot.api.getMe()
+      // Secondary: if getMe passes but getUpdates hasn't responded in
+      // `threshold × interval` ms, the grammy runner loop is frozen without
+      // the network being down. Throw so the failure counter increments and
+      // stall recovery fires after `failureThreshold` consecutive misses.
+      // (2026-06-30 incident: one getUpdates TimeoutError → runner silently
+      // froze; getMe stayed green; fleet deaf for 2 h until manual restart.)
+      const staleMs = Date.now() - lastGetUpdatesHeartbeatMs
+      const staleThresholdMs = POLL_HEALTH_INTERVAL_MS * POLL_HEALTH_THRESHOLD
+      if (staleMs > staleThresholdMs) {
+        throw new Error(
+          `getUpdates heartbeat stale: last seen ${Math.round(staleMs / 1000)}s ago ` +
+          `(threshold ${Math.round(staleThresholdMs / 1000)}s) — runner loop frozen`,
+        )
+      }
+    },
     onStall: async () => {
       // Exit non-zero → _switchroom_supervise restarts the gateway sidecar
       // with a fresh runner. Never awaits runnerHandle.stop() (it hangs on a
