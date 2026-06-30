@@ -951,9 +951,13 @@ export const TelegramChannelSchema = z
             "exceeds max_chars — the user's answer is never dropped silently.",
           ),
         max_chars: z.number().int().positive().optional().describe(
-          "Reply length (chars) above which voice is skipped and a text-only " +
-          "reply is sent — even in 'voice-only' mode. Default 600. Keeps TTS " +
-          "latency/cost bounded and avoids reading out long structured replies.",
+          "Per-voice-note chunk size (chars). Default 600; clamped to the " +
+          "engine's hard cap (1200). A reply LONGER than this is NOT truncated " +
+          "to text — it's split on sentence/paragraph boundaries and spoken " +
+          "across several sequential voice notes, so the full answer is heard " +
+          "even when the user can't read the screen (driving / cycling). Lower " +
+          "it for snappier individual notes; raise it (up to 1200) for fewer, " +
+          "longer notes.",
         ),
         api_key: z.string().optional().describe(
           "OpenAI TTS API key as a `vault:<key>` reference (only used when " +

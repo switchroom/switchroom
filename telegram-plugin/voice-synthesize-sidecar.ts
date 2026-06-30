@@ -35,6 +35,59 @@ export const DEFAULT_SIDECAR_BASE_URL = 'http://127.0.0.1:18900'
  *  a defence-in-depth ceiling matching the sidecar's hard limit. */
 export const SIDECAR_TTS_MAX_CHARS = 1200
 
+/**
+ * Split already-stripped plain text into sequential TTS chunks, each ≤
+ * `chunkChars`, preferring sentence then word boundaries so a voice note
+ * never cuts mid-sentence. A run with no boundary that fits (e.g. one
+ * enormous URL) is hard-sliced at the cap so a chunk can't exceed the
+ * engine limit. PR-C2 (long-reply voice chunking — the full answer is
+ * spoken across several notes instead of truncated to text-only).
+ */
+export function chunkTtsText(text: string, chunkChars: number): string[] {
+  const cap = Math.max(1, chunkChars)
+  if (text.length <= cap) {
+    const t = text.trim()
+    return t.length > 0 ? [t] : []
+  }
+
+  // Sentence-ish units: keep the terminator with the sentence. Falls back
+  // to the whole string when there's no punctuation to split on.
+  const sentences = text.match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g) ?? [text]
+  const chunks: string[] = []
+  let buf = ''
+
+  const flush = (): void => {
+    const t = buf.trim()
+    if (t.length > 0) chunks.push(t)
+    buf = ''
+  }
+  const hardSlice = (s: string): void => {
+    // No boundary fits the cap — split on word boundaries, then hard-cut
+    // any single token still over the cap.
+    let rest = s
+    while (rest.length > cap) {
+      let cut = rest.lastIndexOf(' ', cap)
+      if (cut <= 0) cut = cap
+      chunks.push(rest.slice(0, cut).trim())
+      rest = rest.slice(cut).trimStart()
+    }
+    buf = rest
+  }
+
+  for (const sentence of sentences) {
+    if (sentence.length > cap) {
+      // The sentence itself overflows — flush what we have, then slice it.
+      flush()
+      hardSlice(sentence)
+      continue
+    }
+    if (buf.length + sentence.length > cap) flush()
+    buf += sentence
+  }
+  flush()
+  return chunks
+}
+
 /** A successful synthesis: the OGG/Opus voice-note bytes plus sidecar meta. */
 export interface SynthesizeResult {
   ok: true

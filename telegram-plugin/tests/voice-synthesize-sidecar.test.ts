@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'bun:test'
 import {
   synthesizeViaSidecar,
+  chunkTtsText,
   SIDECAR_TTS_MAX_CHARS,
   DEFAULT_SIDECAR_BASE_URL,
 } from '../voice-synthesize-sidecar.js'
@@ -193,5 +194,81 @@ describe('synthesizeViaSidecar — error paths', () => {
     }) as unknown as typeof fetch
     const r = await synthesizeViaSidecar({ token: 't', text: 'hi', fetchImpl: aborted })
     expect(r).toMatchObject({ ok: false, reason: 'timeout' })
+  })
+})
+
+describe('chunkTtsText — long-reply voice chunking (PR-C2)', () => {
+  it('returns a single chunk when text fits the cap', () => {
+    expect(chunkTtsText('Short answer.', 600)).toEqual(['Short answer.'])
+  })
+
+  it('returns no chunks for empty text', () => {
+    expect(chunkTtsText('', 600)).toEqual([])
+    expect(chunkTtsText('   ', 600)).toEqual([])
+  })
+
+  it('splits a long reply into multiple chunks, each under the cap', () => {
+    const sentence = 'This is a sentence that is reasonably long. '
+    const text = sentence.repeat(20).trim() // ~880 chars
+    const chunks = chunkTtsText(text, 200)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(200)
+    // No text is lost: every sentence's words survive across the chunks.
+    const rejoined = chunks.join(' ')
+    expect(rejoined).toContain('reasonably long')
+    expect(rejoined.split('reasonably long').length - 1).toBe(20)
+  })
+
+  it('prefers sentence boundaries — does not cut mid-sentence', () => {
+    const text =
+      'First sentence here. Second sentence here. Third sentence here. Fourth one too.'
+    const chunks = chunkTtsText(text, 45)
+    // Each chunk should end at a sentence terminator (no dangling fragment).
+    for (const c of chunks) expect(/[.!?]$/.test(c)).toBe(true)
+  })
+
+  it('hard-slices a single sentence longer than the cap (no boundary fits)', () => {
+    const longWord = 'a'.repeat(50)
+    const text = `${longWord} ${longWord} ${longWord}` // one boundary-less-ish run
+    const chunks = chunkTtsText(text, 60)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(60)
+  })
+
+  it('never emits a chunk over the cap even with a giant tokenless blob', () => {
+    const blob = 'x'.repeat(5000)
+    const chunks = chunkTtsText(blob, 1200)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(1200)
+  })
+})
+
+describe('synthesizeViaSidecar — multi-chunk send path (PR-C2)', () => {
+  it('synthesizes each chunk independently (one POST per chunk)', async () => {
+    const text = 'Sentence one is here. '.repeat(40).trim() // long → many chunks
+    const chunks = chunkTtsText(text, 200)
+    expect(chunks.length).toBeGreaterThan(1)
+
+    let calls = 0
+    const fakeFetch: typeof fetch = (async () => {
+      calls++
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => OGG_BYTES.buffer.slice(0),
+        text: async () => '',
+        headers: new Headers(),
+      }
+    }) as unknown as typeof fetch
+
+    // Mirror the gateway's per-chunk synthesis loop.
+    const oggs: Uint8Array[] = []
+    for (const c of chunks) {
+      const r = await synthesizeViaSidecar({ token: 't', text: c, fetchImpl: fakeFetch })
+      expect(r.ok).toBe(true)
+      if (r.ok) oggs.push(r.audio)
+    }
+    expect(calls).toBe(chunks.length)
+    expect(oggs.length).toBe(chunks.length)
   })
 })

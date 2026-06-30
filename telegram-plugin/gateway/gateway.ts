@@ -49,7 +49,7 @@ import {
 } from '../sticker-aliases.js'
 import { transcribeViaWhisper } from '../voice-transcribe.js'
 import { transcribeViaSidecar } from '../voice-transcribe-sidecar.js'
-import { synthesizeViaSidecar } from '../voice-synthesize-sidecar.js'
+import { synthesizeViaSidecar, SIDECAR_TTS_MAX_CHARS, chunkTtsText } from '../voice-synthesize-sidecar.js'
 import { synthesizeViaOpenAi } from '../voice-synthesize.js'
 import { stripMarkdown } from '../card-format.js'
 import {
@@ -8170,15 +8170,22 @@ function redactOutboundText(text: string, site: string): string {
   return masked
 }
 
-/** Default voice-out length ceiling: replies longer than this are sent
- *  text-only (even in voice-only mode). Mirrors the schema default. */
-const VOICE_OUT_DEFAULT_MAX_CHARS = 600
+/** Default per-voice-note chunk size (chars). A long reply is split into
+ *  sequential voice notes of roughly this size on sentence/paragraph
+ *  boundaries — NOT truncated. Mirrors the schema default. The Kokoro
+ *  sidecar's hard per-request cap (VOICE_TTS_MAX_CHARS, 1200) is the upper
+ *  bound; any configured value above it is clamped down. */
+const VOICE_OUT_DEFAULT_CHUNK_CHARS = 600
+
+/** Hard ceiling for a single TTS request, matching the sidecar's
+ *  VOICE_TTS_MAX_CHARS (server.py). Voice-note chunks never exceed this. */
+const VOICE_OUT_HARD_CHUNK_CAP = SIDECAR_TTS_MAX_CHARS
 
 type VoiceOutAccess = NonNullable<Access['voice_out']>
 
 /**
  * Resolve whether outbound TTS is active for this reply, and how
- * (engine + reply_mode + the plain-text TTS input). PR-C2.
+ * (engine + reply_mode + the plain-text TTS chunks). PR-C2.
  *
  * Mirrors the voice-IN engine-resolution precedence (message:voice
  * handler): the compose-injected SWITCHROOM_VOICE_ENGINE verdict gates the
@@ -8187,9 +8194,11 @@ type VoiceOutAccess = NonNullable<Access['voice_out']>
  * NOT require a local verdict.
  *
  * Returns null when voice-out is off / not applicable; otherwise a plan the
- * caller acts on. `ttsText` is markdown-stripped plain text (Kokoro/OpenAI
- * read it literally). `withinLimit` is false when the reply exceeds
- * max_chars — the caller still synthesizes nothing and always sends text.
+ * caller acts on. `ttsChunks` is markdown-stripped plain text split into
+ * sequential voice-note-sized pieces (sentence/paragraph boundaries) — a
+ * LONG reply is spoken across multiple ordered voice notes, never truncated
+ * to text-only (Ken is often on a bike/driving and can't read the screen).
+ * `max_chars` is the per-note chunk size, not a cutoff.
  */
 function resolveVoiceOutPlan(
   voiceOut: VoiceOutAccess | undefined,
@@ -8199,8 +8208,7 @@ function resolveVoiceOutPlan(
   voice?: string
   apiKeyRef?: string
   replyMode: 'voice+text' | 'voice-only'
-  ttsText: string
-  withinLimit: boolean
+  ttsChunks: string[]
 } | null {
   if (voiceOut?.enabled !== true) return null
 
@@ -8227,16 +8235,22 @@ function resolveVoiceOutPlan(
   const ttsText = stripMarkdown(replyText).replace(/\s+/g, ' ').trim()
   if (ttsText.length === 0) return null
 
-  const maxChars = voiceOut.max_chars ?? VOICE_OUT_DEFAULT_MAX_CHARS
+  // Per-voice-note chunk size, clamped to the engine's hard cap. A long
+  // reply becomes several ordered voice notes instead of a text-only
+  // fallback.
+  const chunkChars = Math.min(
+    voiceOut.max_chars ?? VOICE_OUT_DEFAULT_CHUNK_CHARS,
+    VOICE_OUT_HARD_CHUNK_CAP,
+  )
+  const ttsChunks = chunkTtsText(ttsText, chunkChars)
+  if (ttsChunks.length === 0) return null
+
   return {
     engine,
     voice: voiceOut.voice,
     apiKeyRef: voiceOut.api_key,
     replyMode: voiceOut.reply_mode ?? 'voice+text',
-    ttsText,
-    // Gate on the ORIGINAL reply length (not the stripped length) so the
-    // operator's max_chars maps to what the user typed/read.
-    withinLimit: replyText.length <= maxChars,
+    ttsChunks,
   }
 }
 
@@ -8658,23 +8672,39 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const sentIds: number[] = []
 
   // Outbound TTS synthesis (PR-C2). Done BEFORE the text send so a
-  // voice-only reply can suppress the text chunks on success. Best-effort:
-  // any failure (or a reply over max_chars) leaves `voiceOgg` null and the
-  // text path proceeds unchanged — the user's answer is never dropped.
-  // Long replies always fall back to text-only, even in voice-only mode.
-  let voiceOgg: Uint8Array | null = null
-  if (voiceOutPlan != null && voiceOutPlan.withinLimit) {
-    voiceOgg = await synthesizeVoiceOut(voiceOutPlan)
-  } else if (voiceOutPlan != null && !voiceOutPlan.withinLimit) {
-    process.stderr.write(
-      `telegram gateway: voice-out: reply ${text.length} chars exceeds max_chars — text-only fallback\n`,
-    )
+  // voice-only reply can suppress the text chunks on success. A LONG reply
+  // is synthesized into SEVERAL ordered voice notes (one per chunk) instead
+  // of falling back to text-only — Ken is often on a bike/driving and can't
+  // read the screen, so the full answer must be SPOKEN. Best-effort: each
+  // chunk that fails to synthesize is skipped; if NOTHING synthesizes the
+  // text path proceeds unchanged so the answer is never dropped.
+  const voiceOggs: Uint8Array[] = []
+  if (voiceOutPlan != null) {
+    for (const chunkText of voiceOutPlan.ttsChunks) {
+      const ogg = await synthesizeVoiceOut({
+        engine: voiceOutPlan.engine,
+        voice: voiceOutPlan.voice,
+        apiKeyRef: voiceOutPlan.apiKeyRef,
+        ttsText: chunkText,
+      })
+      // Skip a failed chunk but keep going — a partial spoken answer still
+      // beats silence; full-fail (no oggs at all) falls back to text below.
+      if (ogg != null) voiceOggs.push(ogg)
+    }
+    if (voiceOggs.length < voiceOutPlan.ttsChunks.length) {
+      process.stderr.write(
+        `telegram gateway: voice-out: synthesized ${voiceOggs.length}/${voiceOutPlan.ttsChunks.length} voice-note chunk(s)\n`,
+      )
+    }
   }
-  // Suppress the text body ONLY when voice-only AND synthesis actually
-  // produced bytes. If synthesis failed (voiceOgg == null) or the reply was
-  // too long, the text path runs as normal so the answer still lands.
+  // Suppress the text body ONLY when voice-only AND we synthesized the FULL
+  // set of chunks (every part of the answer is spoken). A partial or total
+  // synthesis failure leaves the text path running so the answer still
+  // lands in full — never drop the user's answer silently.
   const suppressText =
-    voiceOutPlan?.replyMode === 'voice-only' && voiceOgg != null
+    voiceOutPlan?.replyMode === 'voice-only' &&
+    voiceOutPlan.ttsChunks.length > 0 &&
+    voiceOggs.length === voiceOutPlan.ttsChunks.length
 
   // #271: validate inline_keyboard and namespace any callback_data with
   // the `agent:` prefix so the gateway's callback_query dispatcher can
@@ -9107,16 +9137,20 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     stopTypingLoop(chat_id, threadId ?? null)
   }
 
-  // Outbound voice note (PR-C2). Sent AFTER the text body (voice+text) or
-  // INSTEAD of it (voice-only, where suppressText skipped the chunk loop).
-  // Best-effort and fully non-fatal: the synth already succeeded (voiceOgg
-  // is non-null), but a sendVoice failure must NEVER break the text reply
-  // path — catch + log and move on. In voice-only mode a sendVoice failure
-  // here would leave the user with NOTHING, so re-send the text as a
-  // fallback before continuing.
-  if (voiceOgg != null) {
+  // Outbound voice notes (PR-C2). Sent IN ORDER, AFTER the text body
+  // (voice+text) or INSTEAD of it (voice-only, where suppressText skipped
+  // the chunk loop). A long reply produces SEVERAL notes — each spoken in
+  // sequence so the whole answer is heard, never truncated. Best-effort and
+  // fully non-fatal: a sendVoice failure must NEVER break the text reply
+  // path. In voice-only mode a failure would leave the user with an
+  // incomplete spoken answer, so on the FIRST send failure we recover by
+  // sending the full text once and stop sending further notes.
+  for (let v = 0; v < voiceOggs.length; v++) {
+    const oggBytes = voiceOggs[v]!
     const voiceOpts: Record<string, unknown> = {
-      ...(reply_to != null && replyMode !== 'off'
+      // Quote the user's message only on the FIRST voice note (mirrors the
+      // text chunk loop's first-chunk reply behaviour).
+      ...(v === 0 && reply_to != null && replyMode !== 'off'
         ? { reply_parameters: { message_id: reply_to } }
         : {}),
       ...(threadId != null ? { message_thread_id: threadId } : {}),
@@ -9130,17 +9164,26 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
           if (tid != null) opts.message_thread_id = tid
           else delete opts.message_thread_id
           // allow-raw-bot-api: adapter callback INSIDE retryWithThreadFallback→robustApiCall; the THREAD_NOT_FOUND fallback is handled by the wrapper.
-          return lockedBot.api.sendVoice(chat_id, new InputFile(Buffer.from(voiceOgg!)), opts as never)
+          return lockedBot.api.sendVoice(chat_id, new InputFile(Buffer.from(oggBytes)), opts as never)
         },
         { threadId, chat_id, verb: 'sendVoice' },
       )
       sentIds.push(sentVoice.message_id)
-      logOutbound('reply', chat_id, sentVoice.message_id, voiceOutPlan?.ttsText.length ?? 0, 'voice-note')
+      logOutbound(
+        'reply',
+        chat_id,
+        sentVoice.message_id,
+        voiceOutPlan?.ttsChunks[v]?.length ?? 0,
+        `voice-note=${v + 1}/${voiceOggs.length}`,
+      )
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(`telegram gateway: voice-out: sendVoice failed (non-fatal): ${msg}\n`)
-      // voice-only fell over with no text sent → recover by sending the
-      // text body so the answer still lands (never drop it silently).
+      process.stderr.write(
+        `telegram gateway: voice-out: sendVoice ${v + 1}/${voiceOggs.length} failed (non-fatal): ${msg}\n`,
+      )
+      // voice-only fell over mid-stream with text suppressed → recover by
+      // sending the FULL text body once so the answer still lands, then
+      // stop sending further notes (the text now carries everything).
       if (suppressText) {
         try {
           const opts: Record<string, unknown> = {
@@ -9159,6 +9202,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
             `telegram gateway: voice-out: voice-only text recovery ALSO failed: ${textErr instanceof Error ? textErr.message : String(textErr)}\n`,
           )
         }
+        break
       }
     }
   }
