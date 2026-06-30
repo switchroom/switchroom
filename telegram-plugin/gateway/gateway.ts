@@ -78,6 +78,7 @@ import {
   STALE_TAP_NOTICE,
   type PermissionCardRef,
 } from './permission-timeout.js'
+import { createPermissionCardStore } from './permission-card-store.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
 import { appendActivityLabel, clipNarrative, renderActivityFeedWithNested, type SessionActivityHeader } from '../tool-activity-summary.js'
@@ -599,6 +600,7 @@ process.on('beforeExit', () => {
 
 // ─── Env + state dir ──────────────────────────────────────────────────────
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+const permCardStore = createPermissionCardStore(STATE_DIR)
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -5024,6 +5026,7 @@ const pendingStateReaper = setInterval(() => {
         `${timeoutMinutes}m)\n`,
       )
       pendingPermissions.delete(k)
+      permCardStore.remove(k)
     }
   }
   // Drop no-repeat suppression entries past the safety-cap window (the primary
@@ -7118,6 +7121,14 @@ const ipcServer: IpcServer = createIpcServer({
         const pend = pendingPermissions.get(requestId)
         if (pend && sent && typeof sent.message_id === 'number') {
           pend.cards.push({ chatId, messageId: sent.message_id })
+          permCardStore.add({
+            requestId,
+            chatId,
+            messageId: sent.message_id,
+            startedAt: pend.startedAt,
+            toolName: pend.tool_name,
+            cardText: pend.card_text,
+          })
         }
       }).catch(e => {
         process.stderr.write(`telegram gateway: permission_request send to ${chatId} failed: ${e}\n`)
@@ -17165,6 +17176,7 @@ async function handlePermissionSlash(ctx: Context, behavior: 'allow' | 'deny'): 
     action: naturalAction(details.tool_name, details.input_preview),
   })
   pendingPermissions.delete(request_id)
+  permCardStore.remove(request_id)
   process.stderr.write(
     `[telegram gateway] slash-${behavior} request_id=${request_id} tool=${details.tool_name} by=${senderId}\n`,
   )
@@ -21747,6 +21759,7 @@ bot.on('callback_query:data', async ctx => {
     }
 
     pendingPermissions.delete(request_id)
+    permCardStore.remove(request_id)
 
     // (2) Dispatch the in-flight permission verdict IMMEDIATELY — before
     // any host round-trip — so the turn never blocks on persistence.
@@ -21970,6 +21983,7 @@ bot.on('callback_query:data', async ctx => {
     : null
   const grantAgent = selfAgentName()
   pendingPermissions.delete(request_id)
+  permCardStore.remove(request_id)
   if (timeBox && grantAgent) {
     recordScopedGrant(scopedGrants, grantAgent, timeBox.rule, Date.now(), scopedTtl)
     process.stderr.write(
@@ -23567,6 +23581,40 @@ void (async () => {
         // tool_use (e.g. dispatching the worker), so the marker
         // tracks the live turn from there.
         try { removeTurnActiveMarker(STATE_DIR) } catch { /* best-effort */ }
+
+        // Strip stale permission cards from prior gateway session. Any entry
+        // still in the store was never resolved (gateway died before the
+        // operator tapped or the reaper ran). The operator might have seen
+        // those cards and tapped them — if so, they got STALE_TAP_NOTICE
+        // ("already resolved") which is misleading. Edit the messages to
+        // remove the keyboard and show a clear "restarted" notice instead.
+        void (async () => {
+          const stale = permCardStore.loadAll()
+          if (stale.length === 0) return
+          process.stderr.write(
+            `telegram gateway: boot-sweep: stripping ${stale.length} stale permission card(s) from prior gateway session\n`,
+          )
+          for (const card of stale) {
+            const toolLabel = card.toolName ?? 'unknown tool'
+            const notice = `🔒 **${toolLabel}**\n\n⚠️ *Gateway restarted — this request is no longer active. Ask your agent to try again if needed.*`
+            try {
+              // allow-raw-bot-api: targeted by message_id; no thread needed; fire-and-forget boot sweep
+              await bot.api.editMessageText(
+                card.chatId,
+                card.messageId,
+                richMessage(notice),
+                { reply_markup: { inline_keyboard: [] } },
+              )
+            } catch (err) {
+              // Card may already be deleted, edited, or in an inaccessible chat — benign
+              process.stderr.write(
+                `telegram gateway: boot-sweep: stale-card strip failed ` +
+                `${card.chatId}:${card.messageId}: ${(err as Error).message}\n`,
+              )
+            }
+          }
+          permCardStore.clear()
+        })()
 
         // Boot-time pin sweep
         try {
