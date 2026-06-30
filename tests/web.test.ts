@@ -42,6 +42,7 @@ vi.mock("../src/vault/approvals/client.js", () => ({
 // Mock child_process
 vi.mock("node:child_process", () => ({
   execSync: vi.fn(),
+  execFile: vi.fn(),
   execFileSync: vi.fn(),
   spawnSync: vi.fn(),
   spawn: vi.fn(),
