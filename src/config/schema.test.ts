@@ -44,6 +44,58 @@ describe("TelegramChannelSchema — supergroup smart defaults", () => {
   });
 });
 
+describe("TelegramChannelSchema — voice_out (PR-C2)", () => {
+  it("applies engine/reply_mode defaults when only enabled is set", () => {
+    const r = TelegramChannelSchema.parse({ voice_out: { enabled: true } });
+    expect(r?.voice_out?.enabled).toBe(true);
+    expect(r?.voice_out?.engine).toBe("kokoro");
+    expect(r?.voice_out?.reply_mode).toBe("voice+text");
+    // max_chars has no zod default (the gateway supplies 600 at use-time).
+    expect(r?.voice_out?.max_chars).toBeUndefined();
+  });
+
+  it("preserves explicit engine / voice / reply_mode / max_chars", () => {
+    const r = TelegramChannelSchema.parse({
+      voice_out: {
+        enabled: true,
+        engine: "openai",
+        voice: "alloy",
+        reply_mode: "voice-only",
+        max_chars: 400,
+        api_key: "vault:openai/api-key",
+      },
+    });
+    expect(r?.voice_out?.engine).toBe("openai");
+    expect(r?.voice_out?.voice).toBe("alloy");
+    expect(r?.voice_out?.reply_mode).toBe("voice-only");
+    expect(r?.voice_out?.max_chars).toBe(400);
+    expect(r?.voice_out?.api_key).toBe("vault:openai/api-key");
+  });
+
+  it("rejects an unknown engine", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ voice_out: { engine: "piper" } }),
+    ).toThrow();
+  });
+
+  it("rejects an unknown reply_mode", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ voice_out: { reply_mode: "text-only" } }),
+    ).toThrow();
+  });
+
+  it("rejects a non-positive max_chars", () => {
+    expect(() =>
+      TelegramChannelSchema.parse({ voice_out: { max_chars: 0 } }),
+    ).toThrow();
+  });
+
+  it("leaves voice_out undefined when omitted", () => {
+    const r = TelegramChannelSchema.parse({ chat_id: "-100123" });
+    expect(r?.voice_out).toBeUndefined();
+  });
+});
+
 describe("TelegramChannelSchema.linear_agent (#2298)", () => {
   it("parses a valid linear_agent block", () => {
     const r = TelegramChannelSchema.parse({
