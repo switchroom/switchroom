@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.16.27 — Fix agent-initiated rollouts (hostd machine-id + litellm passphrase)
+
+Fleet rollouts triggered by agents via the hostd MCP (`/update apply`) were failing at the apply step whenever LiteLLM is enabled. Root cause: the hostd container was not mounting `/etc/machine-id`, so `resolveOperatorVaultPassphrase` could not decrypt the auto-unlock blob, returned null, and `provisionLiteLLMKeys` counted all 12 opted-in agents as scaffold failures — aborting rollout before a single agent was restarted. Keys already in the vault were untouched.
+
+Fix: add `/etc/machine-id:/etc/machine-id:ro` to the hostd compose (same mount the vault-broker already carries). Defense-in-depth: change the passphrase-null path in `provisionLiteLLMKeys` from a hard failure to a warning — already-provisioned keys are unaffected; first-time provisioning still requires an interactive `switchroom apply`. (#2679)
+
+**After upgrading:** run `switchroom hostd install` once to regenerate the hostd compose with the new mount.
+
 ## v0.16.26 — Approval-card reason + TTL determinism
 
 Gated hostd fleet verbs (`rollout`, `update_apply`, `agent_exec`, `agent_start`/`agent_stop`, `agent_logs`) now accept and display a `reason` on the operator approval card, so the operator can see *why* an action is being requested before tapping Approve or Deny.
