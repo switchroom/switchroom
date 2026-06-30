@@ -23,7 +23,17 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, statSync, copyFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  statSync,
+  lstatSync,
+  realpathSync,
+  copyFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -137,8 +147,27 @@ export function renderHostdComposeFile(opts: {
    * will fall through to the UTC fallback warning, prompting the operator.
    */
   hostTz?: string;
+  /**
+   * Resolved REAL host-side target of `~/.switchroom/skills` when that path
+   * is a symlink (e.g. into a git-tracked config repo at
+   * `~/.switchroom-config/skills`). The parent `~/.switchroom` bind mount
+   * preserves the symlink AS a symlink inside the container, so its target
+   * dangles there and `switchroom apply` (shelled out by rollout/update from
+   * inside hostd) cannot find the bundled-skills pool `<skills>/_bundled` —
+   * it logs "bundled skills pool dir not found" and SKIPS every agent's
+   * skills. Binding the resolved real target directly onto the container
+   * path forces docker to follow the symlink host-side at mount time, the
+   * same precedent as the switchroom.yaml mount above. Omitted when skills
+   * is a real dir (already covered by the parent mount) or absent (nothing
+   * to mount) → no extra volume line is emitted.
+   */
+  skillsTarget?: string;
 }): string {
-  const { hostHome, imageTag, operatorUid, hostTz } = opts;
+  const { hostHome, imageTag, operatorUid, hostTz, skillsTarget } = opts;
+  const skillsMount =
+    skillsTarget !== undefined && skillsTarget.length > 0
+      ? `\n      # ~/.switchroom/skills is a symlink on this host (typically into a\n      # separate git-tracked config repo). The parent ~/.switchroom bind\n      # above preserves it AS a symlink, so its target dangles inside the\n      # container and \`switchroom apply\` (shelled out by rollout/update from\n      # inside hostd) can't find the bundled-skills pool <skills>/_bundled —\n      # it logs "bundled skills pool dir not found" and skips every agent's\n      # skills. Binding the resolved real target directly forces docker to\n      # follow the symlink host-side at mount time. Same precedent as the\n      # switchroom.yaml mount above; rw to match the ~/.switchroom mount.\n      - ${skillsTarget}:/host-home/.switchroom/skills:rw`
+      : "";
   const operatorUidEnv =
     operatorUid !== undefined
       ? `\n      # Hostd chowns ~/.switchroom/hostd/operator/sock to this so the\n      # host operator's \\\`switchroom doctor\\\` (et al.) can connect; the\n      # rest of hostd is only reachable agent→hostd. Mirrors\n      # SWITCHROOM_BROKER_OPERATOR_UID.\n      SWITCHROOM_HOSTD_OPERATOR_UID: "${operatorUid}"`
@@ -198,7 +227,7 @@ services:
       # (E_RECONCILE_FAILED_ROLLED_BACK) — agents could never amend the yaml.
       # Agents themselves still mount it ro; only hostd, the tap-gated writer,
       # gets rw. The in-place writer preserves the file's owner/mode.
-      - ${hostHome}/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:rw
+      - ${hostHome}/.switchroom/switchroom.yaml:/state/config/switchroom.yaml:rw${skillsMount}
       # docker.sock is the whole reason hostd exists — agents shouldn't
       # have it, but hostd (auditing every shell-out via run-hook.sh's
       # pattern) is the controlled chokepoint.
@@ -287,6 +316,61 @@ export function resolveHostdHostHome(
     );
   }
   return resolved;
+}
+
+/**
+ * Resolve the REAL host-side target of `~/.switchroom/skills` for the hostd
+ * compose bind, but ONLY when it's a symlink that needs following.
+ *
+ * Many operators keep their skills pool in a separate git-tracked config repo
+ * and symlink `~/.switchroom/skills` → `~/.switchroom-config/skills`. The
+ * parent `~/.switchroom` bind mount preserves that symlink AS a symlink inside
+ * the hostd container, so its target dangles there: `switchroom apply` (shelled
+ * out by rollout/update from inside hostd) can't find the bundled-skills pool
+ * `<skills>/_bundled`, logs "bundled skills pool dir not found", and SKIPS every
+ * agent's skills — making rollout/update unsafe on such hosts. Returning the
+ * resolved real target lets the generator emit a direct bind that docker
+ * follows host-side at mount time (same precedent as the switchroom.yaml mount).
+ *
+ * - Not present / not a symlink → undefined. A real dir is already covered by
+ *   the parent `~/.switchroom` mount; a missing entry has nothing to mount.
+ * - Symlink → `realpathSync` it (handles relative + chained symlinks). If the
+ *   resolved target doesn't exist, return undefined and warn — emitting a
+ *   dangling bind source would make docker auto-create an empty dir.
+ */
+export function resolveHostdSkillsTarget(hostHome: string): string | undefined {
+  const skillsPath = join(hostHome, ".switchroom", "skills");
+  let st;
+  try {
+    st = lstatSync(skillsPath);
+  } catch {
+    // No skills entry at all — nothing to mount.
+    return undefined;
+  }
+  if (!st.isSymbolicLink()) {
+    // A real dir is already covered by the parent ~/.switchroom mount.
+    return undefined;
+  }
+  let target: string;
+  try {
+    target = realpathSync(skillsPath);
+  } catch {
+    console.warn(
+      `switchroom hostd install: ~/.switchroom/skills is a symlink whose target ` +
+        `does not resolve (dangling) — skipping the skills bind mount. Bundled ` +
+        `skills will be unavailable to rollout/update until the symlink is fixed.`,
+    );
+    return undefined;
+  }
+  if (!existsSync(target)) {
+    console.warn(
+      `switchroom hostd install: ~/.switchroom/skills resolves to "${target}", ` +
+        `which does not exist — skipping the skills bind mount. Bundled skills ` +
+        `will be unavailable to rollout/update until the symlink target exists.`,
+    );
+    return undefined;
+  }
+  return target;
 }
 
 function hostdDir(): string {
@@ -382,13 +466,20 @@ async function doInstall(opts: InstallOptions, program: Command): Promise<void> 
     );
   }
 
+  const hostHome = resolveHostdHostHome();
   const yaml = renderHostdComposeFile({
-    hostHome: resolveHostdHostHome(),
+    hostHome,
     imageTag,
     // SUDO_UID-aware (install often runs under sudo); undefined on
     // non-POSIX → operator listener simply not bound.
     operatorUid: resolveOperatorUid(),
     hostTz,
+    // When ~/.switchroom/skills is a symlink (skills kept in a separate
+    // config repo), the parent ~/.switchroom mount preserves it as a
+    // dangling symlink inside hostd; bind the resolved real target directly
+    // so the bundled-skills pool is reachable to rollout/update. Undefined
+    // (real dir / absent / dangling) → no extra mount emitted.
+    skillsTarget: resolveHostdSkillsTarget(hostHome),
   });
 
   if (opts.dryRun) {

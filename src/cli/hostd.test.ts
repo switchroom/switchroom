@@ -7,11 +7,15 @@
  * running `install` in these tests.
  */
 
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   renderHostdComposeFile,
   resolveHostdHostHome,
   resolveHostdImageTag,
+  resolveHostdSkillsTarget,
 } from "./hostd.js";
 
 describe("renderHostdComposeFile", () => {
@@ -120,10 +124,45 @@ describe("renderHostdComposeFile", () => {
     expect(withUid).toContain("SWITCHROOM_CONFIG: /state/config/switchroom.yaml");
   });
 
-  it("byte-deterministic for the same inputs", () => {
+  it("emits the skills bind mount only when skillsTarget is provided", () => {
+    // Symlinked skills pool (operator keeps skills in a sibling git-tracked
+    // repo): without this bind the symlink dangles inside hostd and
+    // `switchroom apply` skips every agent's skills. The direct bind onto the
+    // resolved real target forces docker to follow it host-side at mount time.
+    const withTarget = renderHostdComposeFile({
+      hostHome: "/home/alice",
+      imageTag: "latest",
+      skillsTarget: "/home/alice/.switchroom-config/skills",
+    });
+    expect(withTarget).toContain(
+      "/home/alice/.switchroom-config/skills:/host-home/.switchroom/skills:rw",
+    );
+    // rw to match the ~/.switchroom mount, never ro.
+    expect(withTarget).not.toContain(
+      "/home/alice/.switchroom-config/skills:/host-home/.switchroom/skills:ro",
+    );
+
+    // No skillsTarget (real dir / absent / dangling) → true no-op: no skills
+    // bind line at all, so existing operators are unaffected.
+    const without = renderHostdComposeFile({ hostHome: "/home/alice", imageTag: "latest" });
+    expect(without).not.toContain("/host-home/.switchroom/skills");
+  });
+
+  it("byte-deterministic for the same inputs (incl. skillsTarget)", () => {
     const a = renderHostdComposeFile({ hostHome: "/h", imageTag: "v1" });
     const b = renderHostdComposeFile({ hostHome: "/h", imageTag: "v1" });
     expect(a).toBe(b);
+    const c = renderHostdComposeFile({
+      hostHome: "/h",
+      imageTag: "v1",
+      skillsTarget: "/cfg/skills",
+    });
+    const d = renderHostdComposeFile({
+      hostHome: "/h",
+      imageTag: "v1",
+      skillsTarget: "/cfg/skills",
+    });
+    expect(c).toBe(d);
   });
 
   it("warns about no operator hand-edits at the top of the file", () => {
@@ -188,6 +227,40 @@ describe("resolveHostdHostHome (in-container /host-home guard, #2279 gap)", () =
   it("accepts a real host home unchanged", () => {
     expect(resolveHostdHostHome({}, "/home/operator")).toBe("/home/operator");
     expect(resolveHostdHostHome({ SWITCHROOM_HOST_HOME: "/root" }, "/home/x")).toBe("/root");
+  });
+});
+
+describe("resolveHostdSkillsTarget (symlinked skills-pool bind, this fix)", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "hostd-skills-"));
+    mkdirSync(join(tmp, ".switchroom"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("returns undefined when skills is a real dir (covered by parent mount)", () => {
+    mkdirSync(join(tmp, ".switchroom", "skills"));
+    expect(resolveHostdSkillsTarget(tmp)).toBeUndefined();
+  });
+
+  it("returns the resolved absolute target when skills is a symlink to an existing dir", () => {
+    const realPool = join(tmp, ".switchroom-config", "skills");
+    mkdirSync(realPool, { recursive: true });
+    symlinkSync(realPool, join(tmp, ".switchroom", "skills"));
+    expect(resolveHostdSkillsTarget(tmp)).toBe(realPool);
+  });
+
+  it("returns undefined (and warns) for a dangling symlink", () => {
+    symlinkSync(join(tmp, "nonexistent-pool"), join(tmp, ".switchroom", "skills"));
+    expect(resolveHostdSkillsTarget(tmp)).toBeUndefined();
+  });
+
+  it("returns undefined when there is no skills entry at all", () => {
+    expect(resolveHostdSkillsTarget(tmp)).toBeUndefined();
   });
 });
 
