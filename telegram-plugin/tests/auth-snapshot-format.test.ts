@@ -227,6 +227,9 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(fiveLine).toBeLessThan(sevenLine);
     expect(lines[fiveLine]).not.toContain('7d resets');
     expect(lines[sevenLine]).not.toContain('5h refills');
+    // The ETA value is wrapped in a `code` span so the countdown pops.
+    expect(lines[fiveLine]).toMatch(/\(`in .+?`\)/);
+    expect(lines[sevenLine]).toMatch(/\(`in .+?`\)/);
   });
 
   it('emits a recommendation footer that names a healthy alternative when active is throttling', () => {

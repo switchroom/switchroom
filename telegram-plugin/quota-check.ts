@@ -253,10 +253,10 @@ export function formatQuotaBlock(q: QuotaUtilization, now: Date = new Date()): s
   lines.push("**Claude plan quota**");
   lines.push("");
   lines.push(
-    `**5h window**  ${Math.round(q.fiveHourUtilizationPct)}% · ${formatResetRelative(q.fiveHourResetAt, now)}`,
+    `**5h window**  \`${Math.round(q.fiveHourUtilizationPct)}%\` · \`${formatResetRelative(q.fiveHourResetAt, now)}\``,
   );
   lines.push(
-    `**7d window**  ${Math.round(q.sevenDayUtilizationPct)}% · ${formatResetRelative(q.sevenDayResetAt, now)}`,
+    `**7d window**  \`${Math.round(q.sevenDayUtilizationPct)}%\` · \`${formatResetRelative(q.sevenDayResetAt, now)}\``,
   );
   if (q.representativeClaim) {
     lines.push("");

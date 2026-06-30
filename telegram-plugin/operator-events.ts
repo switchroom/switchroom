@@ -12,6 +12,8 @@
  *    including the quota-exhausted strings migrated from auto-fallback.ts.
  */
 
+import { escapeMarkdown } from './format.js'
+
 // ─── Taxonomy ────────────────────────────────────────────────────────────────
 
 export type OperatorEventKind =
@@ -210,8 +212,8 @@ export interface RenderResult {
  * `:` or other delimiter characters.
  */
 export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
-  const agent = escHtml(ev.agent)
-  const detail = escHtml(ev.detail)
+  const agent = escapeMarkdown(ev.agent)
+  const detail = escapeMarkdown(ev.detail)
 
   switch (ev.kind) {
     case 'credentials-expired':
@@ -412,7 +414,3 @@ export function resetAllCooldowns(): void {
 }
 
 // ─── Markdown escape (#2669) ──────────────────────────────────────────────────
-
-function escHtml(text: string): string {
-  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
-}

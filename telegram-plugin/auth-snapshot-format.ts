@@ -15,13 +15,14 @@
  *
  * No HTML escaping at the boundary — callers pass already-trusted
  * label strings (broker-vetted account labels). If that ever changes
- * the per-line `escapeHtml` helper below is the place to gate.
+ * the per-line `escapeMarkdown` helper (imported from card-format) is the place to gate.
  */
 
 import type { QuotaResult, QuotaUtilization } from './quota-check.js';
 import { isProbeThin, refillNormalizedUtils } from '../src/auth/quota.js';
 import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
 import { maskEmail } from './demo-mask.js';
+import { escapeMarkdown } from './card-format.js';
 
 // ── shared types ─────────────────────────────────────────────────────
 
@@ -284,10 +285,10 @@ function renderAccountRow(
 
   if (!snap.quota) {
     lines.push(
-      `${marker}\`${escapeHtml(label)}\`  _quota probe failed_`,
+      `${marker}\`${escapeMarkdown(label)}\`  _quota probe failed_`,
     );
     if (snap.quotaError) {
-      lines.push(`  _${escapeHtml(snap.quotaError)}_`);
+      lines.push(`  _${escapeMarkdown(snap.quotaError)}_`);
     }
     return lines;
   }
@@ -297,7 +298,7 @@ function renderAccountRow(
   // it as a data-quality gap, never a confident "0% / 0%".
   if (isProbeThin(q)) {
     lines.push(
-      `${marker}\`${escapeHtml(label)}\`  _quota unknown (thin probe)_`,
+      `${marker}\`${escapeMarkdown(label)}\`  _quota unknown (thin probe)_`,
     );
     return lines;
   }
@@ -307,7 +308,7 @@ function renderAccountRow(
   const fiveStr = fmtPct(norm.fiveHourUtilizationPct);
   const sevenStr = fmtPct(norm.sevenDayUtilizationPct);
   lines.push(
-    `${marker}\`${escapeHtml(label)}\`  ${fiveStr} / ${sevenStr}`,
+    `${marker}\`${escapeMarkdown(label)}\`  ${fiveStr} / ${sevenStr}`,
   );
 
   const health = classifyHealth(snap, now);
@@ -318,7 +319,7 @@ function renderAccountRow(
     const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
     const winLabel = win === '5h' ? '5-hour' : '7-day';
     lines.push(
-      `  _quota exhausted — back ${formatAbsolute(reset, tz)} (in ${formatRelative(reset, now)}, ${winLabel} cap)_`,
+      `  _quota exhausted — back ${formatAbsolute(reset, tz)} (\`in ${formatRelative(reset, now)}\`, ${winLabel} cap)_`,
     );
     return lines;
   }
@@ -332,10 +333,10 @@ function renderAccountRow(
   const sevenResetIn = q.sevenDayResetAt ? q.sevenDayResetAt.getTime() - now.getTime() : Infinity;
   const fiveFirst = fiveResetIn <= sevenResetIn;
   const fiveSeg = q.fiveHourResetAt
-    ? `5h refills ${formatAbsolute(q.fiveHourResetAt, tz)} (in ${formatRelative(q.fiveHourResetAt, now)})`
+    ? `5h refills ${formatAbsolute(q.fiveHourResetAt, tz)} (\`in ${formatRelative(q.fiveHourResetAt, now)}\`)`
     : '5h refills —';
   const sevenSeg = q.sevenDayResetAt
-    ? `7d resets ${formatAbsolute(q.sevenDayResetAt, tz)} (in ${formatRelative(q.sevenDayResetAt, now)})`
+    ? `7d resets ${formatAbsolute(q.sevenDayResetAt, tz)} (\`in ${formatRelative(q.sevenDayResetAt, now)}\`)`
     : '7d resets —';
   lines.push(`  _${fiveFirst ? fiveSeg : sevenSeg}_`);
   lines.push(`  _${fiveFirst ? sevenSeg : fiveSeg}_`);
@@ -343,7 +344,7 @@ function renderAccountRow(
   // surface it as a sub-line on a healthy/throttling row — NOT a blocked badge.
   if (q.overageDisabledReason != null && OVERAGE_EXHAUSTED_REASONS.has(q.overageDisabledReason)) {
     lines.push(
-      `  _overage off (${escapeHtml(q.overageDisabledReason)}) — serving from quota_`,
+      `  _overage off (${escapeMarkdown(q.overageDisabledReason)}) — serving from quota_`,
     );
   }
   return lines;
@@ -615,10 +616,10 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
     // same per-account row + earliest-recovery helpers the /auth table uses so
     // the formatting stays consistent with the rest of the auth surface.
     lines.push(
-      `🔴 **All accounts blocked · ${headerLimit} on ${escapeHtml(input.oldLabel)}**`,
+      `🔴 **All accounts blocked · ${headerLimit} on ${escapeMarkdown(input.oldLabel)}**`,
     );
     lines.push('');
-    lines.push(`Triggered by: agent **${escapeHtml(input.triggerAgent)}**`);
+    lines.push(`Triggered by: agent **${escapeMarkdown(input.triggerAgent)}**`);
 
     const fleet = input.fleetSnapshots ?? [];
     if (fleet.length > 0) {
@@ -639,7 +640,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       if (earliest) {
         lines.push('');
         lines.push(
-          `Earliest recovery: \`${escapeHtml(earliest.label)}\` ` +
+          `Earliest recovery: \`${escapeMarkdown(earliest.label)}\` ` +
             `${formatAbsolute(earliest.at, tz)} (in ${formatRelative(earliest.at, now)})`,
         );
       }
@@ -648,7 +649,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       const recovery = recoveryAtFor(input.oldQuota);
       if (recovery) {
         lines.push(
-          `${escapeHtml(input.oldLabel)} recovers ${formatAbsolute(recovery, tz)} ` +
+          `${escapeMarkdown(input.oldLabel)} recovers ${formatAbsolute(recovery, tz)} ` +
             `(in ${formatRelative(recovery, now)})`,
         );
       }
@@ -663,20 +664,20 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
 
   // Successful swap.
   lines.push(
-    `✓ **Switched fleet · ${headerLimit} on ${escapeHtml(input.oldLabel)}**`,
+    `✓ **Switched fleet · ${headerLimit} on ${escapeMarkdown(input.oldLabel)}**`,
   );
   lines.push('');
   lines.push(
-    `\`${escapeHtml(input.oldLabel)}\` → \`${escapeHtml(input.newLabel)}\``,
+    `\`${escapeMarkdown(input.oldLabel)}\` → \`${escapeMarkdown(input.newLabel)}\``,
   );
-  lines.push(`Triggered by: agent **${escapeHtml(input.triggerAgent)}**`);
+  lines.push(`Triggered by: agent **${escapeMarkdown(input.triggerAgent)}**`);
   lines.push('');
 
   if (input.oldQuota) {
     const recovery = recoveryAtFor(input.oldQuota);
     if (recovery) {
       lines.push(
-        `\`${escapeHtml(input.oldLabel)}\` recovers ` +
+        `\`${escapeMarkdown(input.oldLabel)}\` recovers ` +
           `${formatAbsolute(recovery, tz)} (in ${formatRelative(recovery, now)})`,
       );
     }
@@ -690,7 +691,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       input.newQuota.sevenDayUtilizationPct < THROTTLING_THRESHOLD_PCT;
     const headroomStr = hasHeadroom ? '_(plenty of headroom)_' : '_(near limit — watch this)_';
     lines.push(
-      `\`${escapeHtml(input.newLabel)}\` now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
+      `\`${escapeMarkdown(input.newLabel)}\` now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
     );
   } else {
     lines.push(
@@ -806,10 +807,6 @@ function switchPriority(s: AccountSnapshot, now: Date = new Date()): number {
 }
 
 // ── shared HTML escape ───────────────────────────────────────────────
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1');
-}
 
 // ── snapshot assembly helper ─────────────────────────────────────────
 

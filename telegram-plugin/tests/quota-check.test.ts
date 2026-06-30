@@ -92,8 +92,8 @@ describe('formatQuotaBlock', () => {
       now,
     )
     expect(block).toContain('**Claude plan quota**')
-    expect(block).toContain('**5h window**  29% · resets in 2h 30m')
-    expect(block).toContain('**7d window**  33% · resets in 3d')
+    expect(block).toContain('**5h window**  `29%` · `resets in 2h 30m`')
+    expect(block).toContain('**7d window**  `33%` · `resets in 3d`')
     expect(block).toContain('Binding window: five hour')
     // overage=allowed should not be surfaced
     expect(block).not.toContain('Overage:')

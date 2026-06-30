@@ -28,6 +28,7 @@
  * rather than throwing.
  */
 
+import { escapeMarkdown } from '../format.js'
 import type { ListStateData, AccountState } from './auth-line.js'
 import {
   buildSnapshotsFromState,
@@ -158,7 +159,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (tail.length > 0) {
         return {
           kind: 'help',
-          reason: `Unknown \`rm\` modifier: \`${escapeHtml(tail)}\`. Use \`/auth rm <label> confirm\` to confirm.`,
+          reason: `Unknown \`rm\` modifier: \`${escapeMarkdown(tail)}\`. Use \`/auth rm <label> confirm\` to confirm.`,
         }
       }
       return { kind: 'rm-prompt', label }
@@ -180,7 +181,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
       if (sub !== 'override') {
         return {
           kind: 'help',
-          reason: `Unknown \`agent\` subcommand: \`${escapeHtml(sub || '(none)')}\`. Try \`/auth agent override <agent> <label|clear>\`.`,
+          reason: `Unknown \`agent\` subcommand: \`${escapeMarkdown(sub || '(none)')}\`. Try \`/auth agent override <agent> <label|clear>\`.`,
         }
       }
       const agent = parts[2]
@@ -201,7 +202,7 @@ export function parseAuthCommand(text: string): ParsedAuthCommand | null {
     case 'help':
       return { kind: 'help' }
     default:
-      return { kind: 'help', reason: `Unknown verb: \`${escapeHtml(verb)}\`` }
+      return { kind: 'help', reason: `Unknown verb: \`${escapeMarkdown(verb)}\`` }
   }
 }
 
@@ -417,7 +418,7 @@ export async function handleAuthCommand(
       }
     } catch (err) {
       return {
-        text: `**/auth show failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth show failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -432,7 +433,7 @@ export async function handleAuthCommand(
       if (!agent) {
         return {
           text:
-            `**/auth show:** no agent named \`${escapeHtml(agentName)}\` in broker view.\n` +
+            `**/auth show:** no agent named \`${escapeMarkdown(agentName)}\` in broker view.\n` +
             `Run \`/auth show\` for the fleet snapshot.`,
           html: true,
         }
@@ -440,7 +441,7 @@ export async function handleAuthCommand(
       return { text: renderAgentDetail(state, agent), html: true }
     } catch (err) {
       return {
-        text: `**/auth show failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth show failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -476,13 +477,13 @@ export async function handleAuthCommand(
       const result = await ctx.client.setActive(parsed.label)
       return {
         text:
-          `**Active account →** \`${escapeHtml(result.active)}\`\n` +
+          `**Active account →** \`${escapeMarkdown(result.active)}\`\n` +
           `Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `**/auth use failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth use failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -504,13 +505,13 @@ export async function handleAuthCommand(
       const result = await ctx.client.setActive(nextLabel)
       return {
         text:
-          `**Rotated:** active → \`${escapeHtml(result.active)}\`\n` +
+          `**Rotated:** active → \`${escapeMarkdown(result.active)}\`\n` +
           `Re-mirrored credentials for ${result.fanned.length} agent${result.fanned.length === 1 ? '' : 's'}.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `**/auth rotate failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rotate failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -525,7 +526,7 @@ export async function handleAuthCommand(
       state = await ctx.client.listState()
     } catch (err) {
       return {
-        text: `**/auth rm failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rm failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -533,7 +534,7 @@ export async function handleAuthCommand(
     if (!exists) {
       return {
         text:
-          `**/auth rm:** no account named \`${escapeHtml(parsed.label)}\`. ` +
+          `**/auth rm:** no account named \`${escapeMarkdown(parsed.label)}\`. ` +
           `Run \`/auth show\` for the current list.`,
         html: true,
       }
@@ -541,7 +542,7 @@ export async function handleAuthCommand(
     if (state.active === parsed.label) {
       return {
         text:
-          `**/auth rm refused.** \`${escapeHtml(parsed.label)}\` is the fleet active. ` +
+          `**/auth rm refused.** \`${escapeMarkdown(parsed.label)}\` is the fleet active. ` +
           `Switch with \`/auth use <other>\` or \`/auth rotate\` first.`,
         html: true,
       }
@@ -560,9 +561,9 @@ export async function handleAuthCommand(
     }
     return {
       text:
-        `**⚠ /auth rm** — about to remove \`${escapeHtml(parsed.label)}\` from the broker.\n` +
-        `The fleet active is unchanged. Any agent override pointing at \`${escapeHtml(parsed.label)}\` will stop working.\n\n` +
-        `Send \`/auth rm ${escapeHtml(parsed.label)} confirm\` within ${Math.round(
+        `**⚠ /auth rm** — about to remove \`${escapeMarkdown(parsed.label)}\` from the broker.\n` +
+        `The fleet active is unchanged. Any agent override pointing at \`${escapeMarkdown(parsed.label)}\` will stop working.\n\n` +
+        `Send \`/auth rm ${escapeMarkdown(parsed.label)} confirm\` within ${Math.round(
           AUTH_RM_CONFIRM_TTL_MS / 1000,
         )}s to proceed.`,
       html: true,
@@ -578,8 +579,8 @@ export async function handleAuthCommand(
       }
       return {
         text:
-          `**/auth rm:** no pending confirm for \`${escapeHtml(parsed.label)}\` (expired or not started). ` +
-          `Send \`/auth rm ${escapeHtml(parsed.label)}\` first.`,
+          `**/auth rm:** no pending confirm for \`${escapeMarkdown(parsed.label)}\` (expired or not started). ` +
+          `Send \`/auth rm ${escapeMarkdown(parsed.label)}\` first.`,
         html: true,
       }
     }
@@ -589,12 +590,12 @@ export async function handleAuthCommand(
     try {
       const data = await ctx.client.rmAccount(parsed.label)
       return {
-        text: `**Removed** \`${escapeHtml(data.label)}\` from the broker.`,
+        text: `**Removed** \`${escapeMarkdown(data.label)}\` from the broker.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `**/auth rm failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth rm failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -609,7 +610,7 @@ export async function handleAuthCommand(
       if (parsed.label && targets.length === 0) {
         return {
           text:
-            `**/auth refresh:** no account named \`${escapeHtml(parsed.label)}\`.`,
+            `**/auth refresh:** no account named \`${escapeMarkdown(parsed.label)}\`.`,
           html: true,
         }
       }
@@ -629,13 +630,13 @@ export async function handleAuthCommand(
           ])
         } catch (err) {
           failures.push(
-            `${label}: ${escapeHtml((err as Error)?.message ?? String(err))}`,
+            `${label}: ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
           )
         }
       }
       const head =
         targets.length === 1
-          ? `**Refreshed** \`${escapeHtml(targets[0]!)}\``
+          ? `**Refreshed** \`${escapeMarkdown(targets[0]!)}\``
           : `**Refreshed** ${rows.length - 1}/${targets.length} account${targets.length === 1 ? '' : 's'}`
       const table = rows.length > 1
         ? "\n```\n" + alignTable(rows) + "\n```"
@@ -646,7 +647,7 @@ export async function handleAuthCommand(
       return { text: head + table + failBlock, html: true }
     } catch (err) {
       return {
-        text: `**/auth refresh failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth refresh failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -657,13 +658,13 @@ export async function handleAuthCommand(
       const data = await ctx.client.setOverride(parsed.agent, parsed.label)
       return {
         text:
-          `**Override set.** \`${escapeHtml(data.agent)}\` is now pinned to ` +
-          `\`${escapeHtml(data.account ?? parsed.label)}\`.`,
+          `**Override set.** \`${escapeMarkdown(data.agent)}\` is now pinned to ` +
+          `\`${escapeMarkdown(data.account ?? parsed.label)}\`.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `**/auth agent override failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth agent override failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -674,13 +675,13 @@ export async function handleAuthCommand(
       const data = await ctx.client.setOverride(parsed.agent, null)
       return {
         text:
-          `**Override cleared** on \`${escapeHtml(data.agent)}\` ` +
+          `**Override cleared** on \`${escapeMarkdown(data.agent)}\` ` +
           `— back to fleet active.`,
         html: true,
       }
     } catch (err) {
       return {
-        text: `**/auth agent override failed:** ${escapeHtml((err as Error)?.message ?? String(err))}`,
+        text: `**/auth agent override failed:** ${escapeMarkdown((err as Error)?.message ?? String(err))}`,
         html: true,
       }
     }
@@ -852,7 +853,7 @@ function formatAccountsTable(state: ListStateData, now: number, demo = false): s
         ? formatRelativeMs(acc.exhausted_until - now)
         : '—'
     rows.push([
-      `${marker} ${escapeHtml(demo ? maskEmail(acc.label) : acc.label)}`,
+      `${marker} ${escapeMarkdown(demo ? maskEmail(acc.label) : acc.label)}`,
       status,
       expires,
       formatQuotaUtilCell(acc, now),
@@ -892,7 +893,7 @@ function formatAgentsTable(state: ListStateData, demo = false): string {
       : a.account === state.active
         ? 'fleet-active'
         : 'pinned'
-    rows.push([escapeHtml(a.name), escapeHtml(demo ? maskEmail(a.account) : a.account), source])
+    rows.push([escapeMarkdown(a.name), escapeMarkdown(demo ? maskEmail(a.account) : a.account), source])
   }
   return alignTable(rows)
 }
@@ -909,10 +910,10 @@ export function renderAgentDetail(
   now: number = Date.now(),
 ): string {
   const lines: string[] = []
-  lines.push(`**${escapeHtml(agent.name)}**`)
+  lines.push(`**${escapeMarkdown(agent.name)}**`)
   const source = agent.override ? 'override' : 'fleet-active'
   lines.push(
-    `Active account: \`${escapeHtml(agent.account)}\` (${source})`,
+    `Active account: \`${escapeMarkdown(agent.account)}\` (${source})`,
   )
   const acct = state.accounts.find((a) => a.label === agent.account)
   if (acct) {
@@ -948,16 +949,12 @@ function formatConsumersTable(state: ListStateData, now: number, demo = false): 
       c.last_seen_at == null
         ? 'socket bound'
         : `socket bound (last seen ${formatRelativeMs(now - c.last_seen_at)} ago)`
-    rows.push([escapeHtml(c.name), escapeHtml(demo ? maskEmail(c.account) : c.account), status])
+    rows.push([escapeMarkdown(c.name), escapeMarkdown(demo ? maskEmail(c.account) : c.account), status])
   }
   return alignTable(rows)
 }
 
 // ─── Plain-text helpers ────────────────────────────────────────────────────
-
-function escapeHtml(s: string): string {
-  return s.replace(/([\\`*_~=\[\]|])/g, '\\$1')
-}
 
 function formatRelativeMs(ms: number): string {
   if (ms <= 0) return '0s'

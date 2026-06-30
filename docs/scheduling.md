@@ -267,6 +267,8 @@ schedule:
       headers: { authorization: "Bearer {{status_token}}" }
 ```
 
+The action `text` is rendered as full GFM markdown (`**bold**`, `_italic_`, `` `code` ``, `~~strikethrough~~`, links) — so a literal `*` or `_` in fixed text becomes formatting unless you set `parse_mode: text`, which sends the string verbatim (the escape hatch).
+
 `telegram-message` posts only to the agent's **own** chat (no `chat_id` field — fenced by construction) and substitutes only the deterministic `{{date}}`/`{{time}}`/`{{agent}}` placeholders — **no vault secrets in a message body, no model output**. `webhook` reuses the poll egress allowlist + host-pinned secret bindings. Anything that needs the model to *write* something (a summary, a Linear issue body) is not an action — use `kind: poll` + an escalation prompt, or `reaction_dispatch`.
 
 ## Managing the scheduler

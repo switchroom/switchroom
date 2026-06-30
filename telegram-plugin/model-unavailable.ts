@@ -27,6 +27,7 @@
  */
 
 import { formatResetRelative } from './quota-check.js'
+import { escapeMarkdown } from './card-format.js'
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -366,10 +367,10 @@ export function formatModelUnavailableCard(
   opts: FormatCardOptions = {},
 ): string {
   const now = opts.now ?? new Date()
-  const slotPart = opts.slot ? ` (slot **${escHtml(opts.slot)}**)` : ''
+  const slotPart = opts.slot ? ` (slot **${escapeMarkdown(opts.slot)}**)` : ''
   const reason = formatReason(detection, now)
   const lines = [
-    `⚠️ **Model unavailable** on agent **${escHtml(agent)}**${slotPart}`,
+    `⚠️ **Model unavailable** on agent **${escapeMarkdown(agent)}**${slotPart}`,
     `Reason: ${reason}`,
     '',
   ]
@@ -469,7 +470,3 @@ export function resolveModelUnavailableFromOperatorEvent(
 }
 
 // ─── HTML escape (mirrors operator-events.ts) ────────────────────────────────
-
-function escHtml(text: string): string {
-  return text.replace(/([\\`*_~=\[\]|])/g, '\\$1')
-}
