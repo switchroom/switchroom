@@ -43,6 +43,7 @@ import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, findConfigFile } from "../config/loader.js";
 import { writeRestartReasonMarker } from "../agents/lifecycle.js";
+import { composeEnvFileArgs } from "../agents/compose-env.js";
 import { setReleasePinInConfig } from "./release-yaml.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { writeConfigFileSync } from "../util/atomic.js";
@@ -399,7 +400,9 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         : undefined,
     run: () => {
       const r = runner("docker", [
-        "compose", "-p", "switchroom", "-f", composePath, "pull",
+        "compose", "-p", "switchroom", "-f", composePath,
+        ...composeEnvFileArgs(composePath),
+        "pull",
       ]);
       if (r.status !== 0) throw new Error("docker compose pull failed");
     },
@@ -723,7 +726,9 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         throw new Error(`pre-flight bind-source check failed: ${e instanceof Error ? e.message : String(e)}`);
       }
       const r = runner("docker", [
-        "compose", "-p", "switchroom", "-f", composePath, "up", "-d",
+        "compose", "-p", "switchroom", "-f", composePath,
+        ...composeEnvFileArgs(composePath),
+        "up", "-d",
         "--remove-orphans",
       ]);
       if (r.status !== 0) throw new Error("docker compose up failed");

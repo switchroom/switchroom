@@ -36,13 +36,16 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import chalk from "chalk";
 
+import { composeEnvPath } from "../agents/compose-env.js";
 import { loadHostCapabilities } from "../setup/host-capabilities.js";
 import { VOICE_SIDECAR_TOKEN_KEY } from "../telegram/materialize-sidecar-token.js";
+
+export { composeEnvPath };
 
 /** The compose `.env` variable name docker interpolates into the service. */
 export const VOICE_SIDECAR_TOKEN_ENV = "VOICE_SIDECAR_TOKEN";
@@ -63,11 +66,6 @@ export interface ProvisionSidecarTokenCtx {
    * Returns the token string, or null on unrecoverable failure.
    */
   resolveOrSeedToken?: () => Promise<string | null>;
-}
-
-/** Path of the compose-adjacent `.env` file for a given compose path. */
-export function composeEnvPath(composePath: string): string {
-  return dirname(composePath) + "/.env";
 }
 
 /**
@@ -180,13 +178,33 @@ export async function provisionVoiceSidecarToken(
 
   try {
     mkdirSync(dirname(envPath), { recursive: true });
-    // Write 0600 — the token is a secret. docker compose reads this `.env`
-    // from the compose file's directory automatically; the value is NOT in
-    // the YAML, only here.
-    writeFileSync(envPath, `${VOICE_SIDECAR_TOKEN_ENV}=${token}\n`, {
+    // Upsert just our key — preserve any other lines an operator placed in
+    // this `.env` (it becomes a real interpolation surface once the fleet
+    // `up` loads it via `--env-file`, see composeEnvFileArgs / #2700). Write
+    // 0600 — the token is a secret; the value lives only here, never in YAML.
+    // docker does NOT auto-read this file (it's beside the `-f` compose, not
+    // in the compose CWD), so the fleet commands pass `--env-file` explicitly.
+    let body = "";
+    try {
+      if (existsSync(envPath)) body = readFileSync(envPath, "utf-8");
+    } catch {
+      /* unreadable — fall back to a fresh write */
+    }
+    const line = `${VOICE_SIDECAR_TOKEN_ENV}=${token}`;
+    const keyRe = new RegExp(`^${VOICE_SIDECAR_TOKEN_ENV}=.*$`, "m");
+    const next = keyRe.test(body)
+      ? body.replace(keyRe, line)
+      : (body.length > 0 && !body.endsWith("\n") ? body + "\n" : body) +
+        line +
+        "\n";
+    writeFileSync(envPath, next, {
       encoding: "utf-8",
       mode: 0o600,
     });
+    // `mode` in writeFileSync only applies when CREATING the file; an
+    // upsert over an existing operator `.env` would keep its old (possibly
+    // 0644) perms and leave the token world-readable. Force 0600 always.
+    chmodSync(envPath, 0o600);
     // Keep operator-owned when written under sudo (mirrors writeComposeFile).
     if (ctx.operatorUid !== undefined && process.geteuid?.() === 0) {
       try {

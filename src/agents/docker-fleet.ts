@@ -21,6 +21,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { generateCompose } from "./compose.js";
+import { composeEnvFileArgs } from "./compose-env.js";
 import { findConfigFile } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 
@@ -153,6 +154,7 @@ export function bringUpAgentService(
         "compose",
         "-f",
         composePath,
+        ...composeEnvFileArgs(composePath),
         "up",
         "-d",
         "--no-deps",
@@ -169,6 +171,7 @@ export function bringUpAgentService(
       "compose",
       "-f",
       composePath,
+      ...composeEnvFileArgs(composePath),
       "up",
       "-d",
       "--no-deps",

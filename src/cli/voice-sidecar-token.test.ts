@@ -79,6 +79,41 @@ describe("provisionVoiceSidecarToken", () => {
     expect(readFileSync(envPath, "utf-8")).toBe("OPERATOR_THING=1\n");
   });
 
+  it("upserts only the token key, preserving operator-placed lines", async () => {
+    const composePath = join(dir, "docker-compose.yml");
+    const envPath = composeEnvPath(composePath);
+    // Operator-managed .env with an unrelated key and a stale token value.
+    writeFileSync(envPath, `OPERATOR_THING=1\n${VOICE_SIDECAR_TOKEN_ENV}=stale\nKEEP=2\n`);
+    await provisionVoiceSidecarToken(composePath, dir, {
+      writeOut: noop,
+      writeErr: noop,
+      voiceEngine: "local",
+      resolveOrSeedToken: async () => "freshtoken",
+    });
+    const body = readFileSync(envPath, "utf-8");
+    // Token line replaced in place; the operator's other lines survive.
+    expect(body).toContain(`${VOICE_SIDECAR_TOKEN_ENV}=freshtoken`);
+    expect(body).not.toContain("stale");
+    expect(body).toContain("OPERATOR_THING=1");
+    expect(body).toContain("KEEP=2");
+    expect(statSync(envPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("appends the token key when the .env exists without it", async () => {
+    const composePath = join(dir, "docker-compose.yml");
+    const envPath = composeEnvPath(composePath);
+    writeFileSync(envPath, "OPERATOR_THING=1\n");
+    await provisionVoiceSidecarToken(composePath, dir, {
+      writeOut: noop,
+      writeErr: noop,
+      voiceEngine: "local",
+      resolveOrSeedToken: async () => "freshtoken",
+    });
+    expect(readFileSync(envPath, "utf-8")).toBe(
+      `OPERATOR_THING=1\n${VOICE_SIDECAR_TOKEN_ENV}=freshtoken\n`,
+    );
+  });
+
   it("does not write (and does not throw) when the token can't be resolved", async () => {
     const composePath = join(dir, "docker-compose.yml");
     let warned = false;

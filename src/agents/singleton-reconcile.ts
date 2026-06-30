@@ -33,6 +33,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
 import { loadHostCapabilities } from "../setup/host-capabilities.js";
+import { composeEnvFileArgs } from "./compose-env.js";
 
 /**
  * Compose SERVICE names for the singletons that are ALWAYS present (note:
@@ -206,7 +207,7 @@ function defaultRecreate(
   // confirmed drift. --no-deps so we don't recursively bounce agents.
   execFileSync(
     dockerBin,
-    ["compose", "-p", project, "-f", composeFile, "up", "-d", "--no-deps", service],
+    ["compose", "-p", project, "-f", composeFile, ...composeEnvFileArgs(composeFile), "up", "-d", "--no-deps", service],
     { stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 },
   );
 }
