@@ -203,6 +203,14 @@ services:
       # have it, but hostd (auditing every shell-out via run-hook.sh's
       # pattern) is the controlled chokepoint.
       - /var/run/docker.sock:/var/run/docker.sock:rw
+      # /etc/machine-id passthrough — the vault auto-unlock blob
+      # (~/.switchroom/vault-auto-unlock) is encrypted with a key derived
+      # from the host machine-id. Without this mount, readAutoUnlockFile
+      # inside switchroom apply (called by rollout) cannot derive the
+      # decryption key, resolveOperatorVaultPassphrase returns null, LiteLLM
+      # provisioning fails for all agents, and rollout stops at apply.
+      # Same mount the vault-broker compose carries (compose.ts:1364).
+      - /etc/machine-id:/etc/machine-id:ro
     environment:
       # Hostd resolves homedir() to set the per-agent socket dir; pin
       # it inside the container to /host-home (which bind-mounts to the
