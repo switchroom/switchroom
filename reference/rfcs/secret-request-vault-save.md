@@ -1,6 +1,7 @@
 ---
-artefact: agent-requested secrets — secure save-card to vault (no chat paste)
-serves: jobs/approve-what-my-agent-can-touch.md
+artifact: agent-requested secrets — secure save-card to vault (no chat paste)
+serves: approve-what-my-agent-can-touch
+advances-outcome: hold-the-leash
 status: Draft
 ---
 
@@ -15,7 +16,7 @@ status: Draft
 
 When an agent needs a secret that isn't in the vault, it must **never ask
 the user to paste the raw value into a chat message**. Today nothing stops
-that — it's exactly what triggered the 2026-06-01 incident: Clerk asked the
+that. It's exactly what triggered the 2026-06-01 incident: Clerk asked the
 operator to paste a Coolify API token because the `vault:` entry was empty,
 the operator pasted it as freeform text, and (because the Sanctum shape was
 uncovered) it persisted in plaintext.
@@ -24,7 +25,7 @@ This RFC adds the missing primitive: an agent-facing **`request_secret`**
 tool that triggers a **secure save-card → vault** flow. The operator taps
 the card and sends the value once; the gateway deletes it instantly and
 writes it straight to the vault. The raw value is never recorded to
-history, never logged, and **never returned to the agent** — the agent only
+history, never logged, and **never returned to the agent**. The agent only
 ever sees `vault:<key>`.
 
 This is composition of primitives that already exist for the
@@ -46,7 +47,7 @@ storage path.
 
 1. Agent: "Please paste your Coolify API token here and I'll use it."
 2. Operator pastes `17|<40-char>` as a normal message.
-3. Inbound gate runs `detectSecrets` (ingest, fail-closed) — but only
+3. Inbound gate runs `detectSecrets` (ingest, fail-closed), but only
    catches it if a pattern matches. Pre-#2043 the Sanctum shape was
    uncovered → the raw token was recorded to `history.db` and forwarded to
    the agent over IPC.
@@ -75,9 +76,9 @@ request_secret(key: string, reason: string, chat_id?: string)
 ### 4.2 The save-card
 The gateway posts to the operator chat:
 
-> 🔒 *<agent>* needs a secret: `<key>` — <reason>.
+> 🔒 *<agent>* needs a secret: `<key>`, <reason>.
 > Tap **Provide securely**, then send the value. I'll delete your message
-> instantly and store it in the vault — it's never shown in chat or to the
+> instantly and store it in the vault. It's never shown in chat or to the
 > agent.
 > `[ Provide securely ]  [ Not now ]`
 
@@ -90,14 +91,14 @@ secret keyboard (`buildDeferredSecretKeyboard` / `mintDeferredSecretKernelReques
   `AUTH_CODE_CONTEXT_TTL_MS`). Edit the card → "Send the value for `<key>`
   now (auto-deletes)."
 - The **next inbound message** in that chat is intercepted **early in
-  `handleInbound`** — before `recordInbound`, before the IPC broadcast,
-  before even the normal secret-detect logging — and treated as the value:
+  `handleInbound`**, before `recordInbound`, before the IPC broadcast,
+  before even the normal secret-detect logging, and treated as the value:
   1. `deleteSensitiveMessage(chat_id, msgId, 'requested secret value')`.
   2. Write to the vault under `key` via the **existing deferred-secret
      path**: if a passphrase is cached, store directly; if not, stage with
      `suggested_slug = key` and present the existing one-tap
      unlock-and-save card (`buildDeferredSecretKeyboard`). This is the same
-     code path a detected paste already uses — we just pre-set the slug
+     code path a detected paste already uses. We just pre-set the slug
      instead of deriving it.
   3. Confirm: "✅ saved as `vault:<key>` (masked: `<maskToken>`)." Clear the
      marker.
@@ -112,7 +113,7 @@ Update the fleet behavior text (the `TELEGRAM_GUIDANCE` const →
 `renderFleetInvariants` → `switchroom-invariants.md`, per
 `reference_live_telegram_guidance_carrier`): **"Never ask the user to paste
 a secret, API key, token, or password into chat. If you need a credential
-that isn't in the vault, call `request_secret(key, reason)` — the operator
+that isn't in the vault, call `request_secret(key, reason)`. The operator
 provides it through a secure card and you reference it as `vault:<key>`."**
 This is what actually prevents the incident class; the tool + card are the
 mechanism it points at.
@@ -129,14 +130,14 @@ The gateway already ships two agent-initiated vault tools (issue #969 P1a / #101
   to an existing key (`vra:` callbacks).
 
 `request_secret` is the **missing third case**: the agent needs a value it
-does **not** have. It is `vault_request_save` *minus the `value` arg* — the
+does **not** have. It is `vault_request_save` *minus the `value` arg*: the
 value arrives from the operator via secure capture instead of from the
 agent. It reuses the same staging map shape, card/keyboard rendering, slug
 validation (`VAULT_KEY_REGEX`), and the on-tap vault write
 (`defaultVaultWritePosture` / `defaultVaultWrite`). New callback prefix
 `vsp:` (vault-secret-provide), mirroring `vrs:`.
 
-**This resolves §6.1:** the access grant is NOT new work — after the value
+**This resolves §6.1:** the access grant is NOT new work. After the value
 is saved, the requesting agent gets read access through the *existing*
 `vault_request_access` flow (or the operator's `mcp_servers[].secrets[]`).
 `request_secret` can optionally chain into it, but it doesn't reimplement
@@ -167,12 +168,12 @@ map, one callback branch, and one early interception branch in
    `switchroom.yaml`? Requesting ≠ access: the value lands in the vault
    under broker ACL regardless; the question is whether we offer a one-tap
    "also let <agent> read this" on the same card. (Recommendation: offer it
-   on the card, since the operator is already in the approve flow — but it's
+   on the card, since the operator is already in the approve flow, but it's
    a security-posture call.)
 2. **Tool name + card copy** — `request_secret` vs `need_secret` vs
    `ask_for_credential`; exact card wording. Product/voice call.
 3. **Should we also intercept a detected raw-secret paste** (the #2043
-   flow) and *steer* it: "looks like you pasted a secret — want me to save
+   flow) and *steer* it: "looks like you pasted a secret, want me to save
    it to the vault instead?" Already partly true (detected pastes are
    deleted + offered for vaulting); this would add explicit steering copy.
    In scope here or a separate ticket?
@@ -190,7 +191,7 @@ map, one callback branch, and one early interception branch in
   broadcast in `handleInbound` (mirror `gateway-secret-detect.test.ts`).
 - Guarantee: a captured value never appears in `history.db` (extend
   `history.test.ts`) and never in the IPC payload.
-- UAT (operator, mtcute): end-to-end — agent calls `request_secret`, card
+- UAT (operator, mtcute): end-to-end, agent calls `request_secret`, card
   appears, operator provides, value deletes + vaults, agent reads
   `vault:<key>`.
 

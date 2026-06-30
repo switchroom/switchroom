@@ -1,26 +1,25 @@
 ---
-artefact: Turn-liveness primitive — one role-keyed liveness/completion floor across every loop role
-serves: jobs/know-what-my-agent-is-doing.md
+artifact: Turn-liveness primitive — one role-keyed liveness/completion floor across every loop role
 backs: chat-is-the-single-source-of-truth
 status: design v1 — refines conversational-pacing.md's "Safety net" layer (does not replace the five-beat model)
 ---
 
-# Turn-liveness primitive — design contract
+# Turn-liveness primitive: design contract
 
 > Refines, does not replace, `reference/rfcs/conversational-pacing.md`.
 > The three-layer model (Ambient reaction / Conversational five-beat /
 > Safety net) stands. This RFC re-founds the **Safety-net layer** as a
 > single primitive keyed on **loop role** and hung off **CLI-native loop
 > boundaries**, so coverage is *by construction* instead of *by
-> enumeration* — and adds the missing **mid-turn text floor** the
+> enumeration*, and adds the missing **mid-turn text floor** the
 > 300s-only safety net never had.
 
 Closes the recurring failure in issue **#2527**: a user messages an
 agent, sees an ambient ack (👀 / typing), the agent works for minutes or
-ends the turn, and **no text ever arrives** — the ack reads as *done*.
+ends the turn, and **no text ever arrives**. The ack reads as *done*.
 Reproduced in both a DM and a forum supergroup, v0.15.56.
 
-## Why this kept happening — coverage by enumeration
+## Why this kept happening: coverage by enumeration
 
 The machinery already exists and is *mostly correct*. It keeps failing
 because liveness/completion is **enumerated per turn-type and per
@@ -30,7 +29,7 @@ surface** rather than derived from the loop. Verified evidence:
    *defers* its 300s fallback while `isLegitimatelyWorking(key)` is true
    (`silence-poke.ts:457`), on the rationale (`:434-438`) that *"the live
    activity feed renders that work."* But the activity feed only exists for
-   **background sub-agents** — a **foreground** turn doing 6 minutes of
+   **background sub-agents**. A **foreground** turn doing 6 minutes of
    silent `Bash`/`Read`/restart calls has no feed, so the user sees only
    the 👀. This is the documented #2527 evidence (the operator sent
    "Status?" twice into the silence).
@@ -42,20 +41,20 @@ surface** rather than derived from the loop. Verified evidence:
    (`buildSettingsHooksBlock`, `scaffold.ts:4246`, emits only `Stop`).
    Sub-agents, nested sub-agents, background/research workers (all
    `SubagentStop`) and crashes/limits (`StopFailure`) get **no** terminal
-   guarantee. *This is the literal whack-a-mole the operator described —
+   guarantee. *This is the literal whack-a-mole the operator described:
    "foreground works, then sub-agents don't, then research workers, then
    nested."*
 
 3. **The "done" emoji is painted unconditionally.** `gateway.ts:11459`
    `finalizeStatusReaction(chatId, threadId, 'done')` paints 👍 at every
    turn_end, *then* `:11510` handles the undelivered case. A user turn that
-   ended undelivered still shows 👍 — the operator's "thumbs up so it feels
+   ended undelivered still shows 👍, the operator's "thumbs up so it feels
    like you are done" report.
 
 4. **Surface forks.** `maybeEarlyAckReaction` hard-gates
    `chatType !== 'private'` (`gateway.ts:11966`): the instant ack is
    DM-only; supergroups get a different path. The fix for one surface never
-   covers the other — #2527 reproduced in both.
+   covers the other. #2527 reproduced in both.
 
 5. **The role question is answered by three different predicates.**
    "Is this turn intentionally/ system-silent?" is keyed on `chatId == null`
@@ -72,12 +71,12 @@ surface** rather than derived from the loop. Verified evidence:
 2. **One discriminator: the loop role.** Every turn is exactly one of
    `user` | `sub-agent` | `system` (cron/scheduled/wake). The role is
    stamped **once at enqueue** and read everywhere. No `chatType` branch, no
-   re-derivation. New *agent types* are not new roles — a research worker
+   re-derivation. New *agent types* are not new roles: a research worker
    and a nested sub-agent are both `sub-agent`.
 3. **Coverage by construction off CLI-native boundaries.** The primitive
    hangs off boundaries the `claude` CLI emits for *every* turn regardless
    of shape, so a turn type nobody has built yet is covered the day it
-   ships. The boundaries (from the hooks reference — cadences are *once per
+   ships. The boundaries (from the hooks reference, cadences are *once per
    session*, *once per turn*, and *every tool call in the loop*):
 
    | Need | CLI-native boundary | Fires for |
@@ -91,7 +90,7 @@ surface** rather than derived from the loop. Verified evidence:
 4. **Two-part invariant.** A turn that received a user inbound and set an
    ambient ack must (i) **surface mid-turn liveness** if it works silently
    past a short threshold, and (ii) **terminate with a visible artifact or
-   an explicit silent-marker** — never just an emoji.
+   an explicit silent-marker**, never just an emoji.
 5. **Emoji is liveness only, never a stand-in for an answer.** A user turn
    with real content always owes *text*. The only carve-out: a purely social
    turn ("thanks") may resolve on a terminal emoji alone.
@@ -100,12 +99,12 @@ surface** rather than derived from the loop. Verified evidence:
    redact → voice-scrub → markdown→HTML → chunk(4000) → outbound-dedup →
    `retryWithThreadFallback` pipeline as a model reply. A framework message
    can never be malformed, mis-escaped, double-sent, or mis-threaded.
-7. **Surface parity by construction.** The substantive guarantees — the
-   mid-turn floor and the role-aware terminal reaction — are keyed on
+7. **Surface parity by construction.** The substantive guarantees (the
+   mid-turn floor and the role-aware terminal reaction) are keyed on
    `statusKey(chatId, threadId)` + loop role (already thread-shaped, identical
    for a DM `threadId=null` and a forum topic), never on chat type. The fired
    floor beat routes to the originating thread. (The sub-second early-ack 👀
-   stays DM-only by design — see the consolidation table — because group
+   stays DM-only by design (see the consolidation table) because group
    pre-acking can react to a message the full gate would drop; the parity that
    matters rides the floor + terminal, proven by the fuzzed invariant's
    DM-vs-topic equivalence and the `-dm`/`-channel` UAT twins.)
@@ -118,7 +117,7 @@ surface** rather than derived from the loop. Verified evidence:
 | `sub-agent` | `SubagentStart`/sidechain | no (parent carries the user-facing beat) | completion **surfaces to the parent/feed** (✅/⚠️); never owes a direct Telegram reply |
 | `system` | enqueue `source` (cron/wake/handback) | no | **may stay silent**; speaks only if it called `reply`; opts out with `NO_REPLY` — never a scattered carve-out |
 
-## Mid-turn text floor — the primary #2527 fix
+## Mid-turn text floor: the primary #2527 fix
 
 A new pure decision unit (`turn-liveness-floor.ts`, mirroring
 `turn-flush-safety.ts`'s pure-function shape) drives one **code-owned,
@@ -128,7 +127,7 @@ edit-in-place** interim message when, for a `user` turn:
 - **zero substantive outbound** has landed in the thread so far
   (`finalAnswerDelivered` is the existing signal), AND
 - the turn is **legitimately working** (an in-flight tool / dispatched
-  sub-agent) — so we fire *because* it's busy-silent, not despite it. (This
+  sub-agent), so we fire *because* it's busy-silent, not despite it. (This
   is the exact inversion of the bug at `silence-poke.ts:457`, where busy =
   suppress.)
 
@@ -136,26 +135,26 @@ Properties:
 
 - **Honest, model-free, claude-native.** The text is built from the
   *longest in-flight tool label* / sub-agent task description the gateway
-  already snapshots (`silence-poke.ts:468-477`) — e.g. *"Still on it —
+  already snapshots (`silence-poke.ts:468-477`), e.g. *"Still on it,
   restarting the container (1m so far)."* No model call (no `claude -p`),
   no generic "working…".
 - **One beat, then back off.** Fires once, edits in place on later updates,
   **never re-notifies** (`disable_notification: true`). The existing 300s
   hard fallback remains the genuine-wedge unwedge above it.
 - **"Status?" short-circuit.** A user inbound *during* a silent working
-  stretch fires the floor immediately (the user is explicitly asking — the
+  stretch fires the floor immediately (the user is explicitly asking, the
   #2527 "Status?"×2 scenario).
 - **Kill-switch** `SWITCHROOM_TG_LIVENESS_FLOOR=0`; whole primitive behind
   the same flag, default-on with revert.
 
-## Terminal reaction honesty — the "thumbs-up" fix
+## Terminal reaction honesty: the "thumbs-up" fix
 
 `gateway.ts:11459` is gated on the **role + delivery**: a `user` turn ending
 with `finalAnswerDelivered === false` finalizes to a **non-`done`** terminal
 (it is a failure state, with the silent-end fallback text carrying the
 apology), so 👍 never reads over an undelivered answer. `system`/`sub-agent`
-turns and `NO_REPLY`/`HEARTBEAT_OK` turns finalize 👍 exactly as today —
-their silence is legitimate.
+turns and `NO_REPLY`/`HEARTBEAT_OK` turns finalize 👍 exactly as today.
+Their silence is legitimate.
 
 ## Consolidation plan
 
@@ -184,7 +183,7 @@ framework emits, and the **absorbed telemetry**.
 > the operator actually asked for:** user-facing liveness hangs off the
 > *main turn's* silence, and the main turn stays "legitimately working"
 > while **any** sub-agent (foreground / background / nested / research)
-> runs. So the user gets liveness for sub-agent shapes nobody enumerated —
+> runs. So the user gets liveness for sub-agent shapes nobody enumerated,
 > without any per-sub-agent wiring. New shapes are covered for free.
 
 **Staged (own canary, not blind in an autonomous pass):**
@@ -209,15 +208,15 @@ framework emits, and the **absorbed telemetry**.
   kill-switch.
 - *`isLegitimatelyWorking` is global, not per-key* (`gateway.ts:5267`). A
   multi-topic agent could defer/fire across topics. Accepted residual today;
-  flagged because the floor makes it user-visible — the floor keys its
+  flagged because the floor makes it user-visible: the floor keys its
   *emit* on the per-turn `statusKey`, only the work-signal is global.
 - *Framework-authored floor/fallback text* must carry `parse_mode`
-  consistently and not be voice-scrub/em-dash-mangled — it rides the one
+  consistently and not be voice-scrub/em-dash-mangled. It rides the one
   send path and is covered by the format tests.
-- *Reaction must always reach a terminal* on every turn_end branch — the
+- *Reaction must always reach a terminal* on every turn_end branch: the
   role-aware gate preserves "some terminal state on every exit."
 
-## Proof — fuzz the invariant, don't enumerate scenarios
+## Proof: fuzz the invariant, don't enumerate scenarios
 
 The anti-whack-a-mole proof is a **property/invariant test** over the
 turn-shape space, not a growing scenario list:
@@ -236,7 +235,7 @@ and at terminal.
 ## Verdict
 
 Done when the user always knows the agent heard them, can tell working from
-stuck, and never sees an ambient ack masquerade as a completed answer — in a
-DM and a supergroup topic alike — proven by a turn-shape-fuzzed invariant
+stuck, and never sees an ambient ack masquerade as a completed answer, in a
+DM and a supergroup topic alike, proven by a turn-shape-fuzzed invariant
 across all three loop roles, with the safety net hung off CLI-native loop
 boundaries so the next un-built agent type is covered for free.

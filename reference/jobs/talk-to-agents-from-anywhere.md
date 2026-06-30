@@ -15,11 +15,11 @@ user wants to pick something up while walking to the shops, finish thinking
 about it on the train, hand off to the agent, and get a result while
 they're making dinner. The job is to make that loop feel native on a phone,
 with one hand. The chat surface is first-class, not a bolted-on
-notification channel: everything the user needs to steer, inspect, correct,
+notification channel. Everything the user needs to steer, inspect, correct,
 or pause their agents must be reachable from where they already are. If a
 capability only exists on the desktop, the user is tethered and the product
-stops being theirs. This is not porting a CLI to mobile — it's accepting
-the phone as the primary surface and designing back from there; the desktop
+stops being theirs. This is not porting a CLI to mobile. It's accepting
+the phone as the primary surface and designing back from there. The desktop
 benefits from that discipline rather than being diminished by it.
 
 ## Good / bad
@@ -30,18 +30,18 @@ benefits from that discipline rather than being diminished by it.
   moment where they wish they were at the laptop.
 - Inbound messages feel acknowledged instantly, not "processing" for ten
   seconds before anything appears.
-- Formatting reads naturally on a phone — no wide code blocks that need
+- Formatting reads naturally on a phone. No wide code blocks that need
   horizontal scroll, no structure that collapses on a narrow screen.
 - Attachments the user sends (a photo, a file) are treated as real input,
   not stripped or ignored.
-- Notifications tell the user something they actually need to know — they
+- Notifications tell the user something they actually need to know. They
   don't fire on every edit, and they don't go silent when it mattered.
 - The user can hand off a task, lock the phone, come back an hour later, and
   pick up where the agent left off without re-explaining.
 - Multiple agents in the same app feel like one fleet, not a drawer of
   disconnected bots the user has to remember how to address.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - A mobile experience that's really a web view of the desktop UI. If the
   user has to pinch to zoom, it wasn't designed for a phone.
@@ -56,7 +56,7 @@ benefits from that discipline rather than being diminished by it.
 - Requiring the user to be in a specific view, or tap through a settings
   panel, to steer a task that's already running.
 - A second human-facing chat channel bolted on beside the one. One channel,
-  done properly — not a multi-channel bridge.
+  done properly, not a multi-channel bridge.
 
 ## Prove it
 
@@ -74,7 +74,7 @@ Named by job × surface, pointing at real scenarios.
 - **One-handed correction mid-flight (DM)** — `jtbd-rapid-followup-dm`,
   `jtbd-interrupt-marker-dm`. *Watch:* a short reply course-corrects a
   running turn. *Invariant:* steering an in-flight turn needs no view
-  switch or settings panel — just a message.
+  switch or settings panel, just a message.
 - **Attachments are real input (DM)** — `voice-inbound-dm`,
   `location-inbound-dm`, `jtbd-album-coalescing-dm`. *Watch:* a photo,
   voice note, or location the user sends is acted on, not discarded.
@@ -92,7 +92,7 @@ Named by job × surface, pointing at real scenarios.
 - **One fleet, addressable across surfaces (DM + channel)** —
   `jtbd-supergroup-reply-channel`, `fuzz-multitopic-routing-channel`.
   *Watch:* multiple agents are addressed naturally in DM and forum channel
-  alike. *Invariant:* the fleet stays one coherent surface — the single
+  alike. *Invariant:* the fleet stays one coherent surface, the single
   Telegram channel, never a second one.
 
 **Fuzz corpus:** vary input type (text × photo × voice × location × album)
@@ -105,6 +105,26 @@ walk-away, one channel only.
 ## Verdict
 
 - **Done when:** the user can run, steer, and finish real work entirely
-  from a phone — instant ack, attachments honoured, no notification storm,
-  no silent walk-away, never a punt to the desktop — proven across DM and
+  from a phone. Instant ack, attachments honoured, no notification storm,
+  no silent walk-away, never a punt to the desktop. Proven across DM and
   channel by the scenarios above.
+
+## Production-readiness
+
+- *Availability:* the chat surface is the product, so it has to be reachable
+  whenever the user is. A dead-zone or reconnect never costs the user their
+  place; the agent picks up the conversation after the gap rather than
+  starting over.
+- *Delivery integrity:* no turn is silently dropped. Every inbound is
+  acknowledged, every user-sent attachment (photo, voice, location, album)
+  is received as real input or fails loudly, and an outbound that matters
+  reaches the user's device rather than dying in a buffer.
+- *Latency:* an inbound is acknowledged within ~1s, before any answer.
+  On mobile a silent gap reads as "dead," so perceived responsiveness is a
+  hard property, not a nicety.
+- *Reliability:* a long turn never ends in silence. The user can hand off,
+  lock the phone, and return to a finished result or an honest status,
+  never to a turn that quietly stalled while they were away.
+- *Notification discipline:* alerts fire on what the user needs to know and
+  stay quiet on intermediate steps, so the channel never trains the user to
+  mute it and miss the one message that mattered.

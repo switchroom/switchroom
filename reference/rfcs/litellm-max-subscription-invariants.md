@@ -1,7 +1,6 @@
 ---
-serves: subscription-honest
-backs: subscription-honest
-artefact: litellm-max-subscription-invariants
+backs: claude-native
+artifact: litellm-max-subscription-invariants
 ---
 
 # LiteLLM Max Subscription Invariants
@@ -9,7 +8,7 @@ artefact: litellm-max-subscription-invariants
 **Context:** Switchroom routes the unmodified `claude` CLI through a self-hosted
 LiteLLM proxy (`ANTHROPIC_BASE_URL=http://127.0.0.1:4010`). The subscription
 invariant (pillar 3 of `reference/vision.md`) says Anthropic models MUST be paid
-via the operator's Claude Max OAuth credential — never via an `ANTHROPIC_API_KEY`.
+via the operator's Claude Max OAuth credential, never via an `ANTHROPIC_API_KEY`.
 LiteLLM is scaffolding around the CLI, not a billing bypass.
 
 Source: https://docs.litellm.ai/docs/tutorials/claude_code_max_subscription
@@ -20,7 +19,7 @@ Source: https://docs.litellm.ai/docs/tutorials/claude_code_max_subscription
 
 **Rule:** OAuth header forwarding MUST be set per-model in `model_group_settings`,
 not in `litellm_settings`. The `litellm_settings.forward_client_headers_to_llm_api`
-field is `Optional[bool]` — a list value (e.g. a list of model names) is coerced
+field is `Optional[bool]`. A list value (e.g. a list of model names) is coerced
 to `true` (truthy), making forwarding global. That leaks the OAuth token to
 OpenRouter, OpenAI, VoyageAI, etc.
 
@@ -93,7 +92,7 @@ token is meaningless and will result in a 401.
 
 **Rule:** `model_name` in `model_list` and entries in
 `forward_client_headers_to_llm_api` must be the literal string Claude Code
-places in the `model` field of its API requests — NOT prefixed with `anthropic/`.
+places in the `model` field of its API requests, NOT prefixed with `anthropic/`.
 
 ```yaml
 # CORRECT — Claude Code sends "claude-sonnet-4-6"
@@ -153,7 +152,7 @@ the proxy config. The critical question is whether the forwarding check runs
 against the *requested* model name (before alias resolution) or the *resolved*
 upstream target (after alias). If before, a `claude-sonnet-4-6` request aliased
 to `openrouter/google/gemini-2.5-pro` would forward the OAuth token to
-OpenRouter — a credential leak.
+OpenRouter, a credential leak.
 
 **Required pre-check before enabling Ship D model aliases in production:**
 1. Set a test alias `claude-haiku-4-5-20251001 → openrouter/google/gemini-2.5-flash`
@@ -163,7 +162,7 @@ OpenRouter — a credential leak.
    confirm the outbound call to OpenRouter does NOT carry the `Authorization`
    header with the Anthropic OAuth token.
 4. If it does forward, mitigation is to remove the aliased model from
-   `forward_client_headers_to_llm_api` dynamically — or do not use model
+   `forward_client_headers_to_llm_api` dynamically, or do not use model
    aliases for Anthropic model names; use a separate non-Claude `model_name`
    as the alias target instead (e.g. `sr-gemini` → `openrouter/google/gemini-2.5-pro`)
    so there is no entry in the forwarding list to match.
@@ -177,7 +176,7 @@ OpenRouter — a credential leak.
 - The proxy is unreachable at `$ANTHROPIC_BASE_URL`
 
 This is the current implementation (the `sr_ll_ok` gate in start.sh). Do NOT
-remove this fallback — it is the availability guarantee that prevents a proxy
+remove this fallback. It is the availability guarantee that prevents a proxy
 outage from silencing the fleet.
 
 **What the fallback loses:** spend tracking, guardrails, model alias routing,

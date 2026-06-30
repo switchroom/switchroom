@@ -50,7 +50,7 @@ close that gap so the user never has to ask.
 - Scrolling back a week later reads as a real conversation, not a deleted
   widget.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - A separate progress surface running parallel to the chat. This was the
   retired card. It duplicates the conversation or covers for a model that
@@ -129,7 +129,7 @@ visibly-progressing turn.
 ## Verdict
 
 - **Done when:** the user always knows the agent heard them, can tell
-  working from stuck, and never needs to ask "what are you doing?" — proven
+  working from stuck, and never needs to ask "what are you doing?", proven
   across DM and channel by the scenarios above.
 
 ## Production-readiness

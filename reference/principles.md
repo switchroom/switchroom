@@ -13,6 +13,17 @@ whether a feature serves the vision.
 If you can't answer **yes** to all three checks at the bottom of this
 doc, the work isn't done. Redesign, don't ship and patch later.
 
+These three principles cover one half of "built well": the UX and
+coherence bar (docs / defaults / consistency). The other half, the
+non-functional trust and safety bar, is **not** a principle you trade
+off on a gradient. It's enforced as hard lines in
+[`invariants.md`](invariants.md): claude-native, no-self-escalation,
+on-leash, single-tenant, telegram-only,
+chat-is-the-single-source-of-truth. Security, the on-leash stakes, and
+the subscription-honest stakes live there as binary pass/fail gates. A
+feature can ace all three principle checks and still be out of scope
+because it crosses an invariant. Check both.
+
 ---
 
 ## 1. "If they need the docs, we've failed"
@@ -36,7 +47,7 @@ job.
 ### Examples
 
 - ✅ **Good:** `switchroom auth add default --via-claude` prints the
-  OAuth URL inline, says *"open this in any browser — complete the sign-in
+  OAuth URL inline, says *"open this in any browser, complete the sign-in
   and the token saves automatically,"* and watches for completion.
   For refreshing an existing session: `switchroom auth reauth coach`.
 - ❌ **Bad:** `switchroom auth add` exits with `EAUTH_FAILED`
@@ -69,11 +80,11 @@ job.
 
 Ship the pre-built Lego set, not the bag of bricks.
 
-`switchroom setup` should produce a **working fleet** on the first run
-— a default agent, a working bot, the agent responding
+`switchroom setup` should produce a **working fleet** on the first run:
+a default agent, a working bot, the agent responding
 conversationally on the first message. The defaults cover 80% of
-cases. Power users will customise;
-make them **opt into complexity, never opt out of it**. Configuration
+cases. Power users will customise.
+Make them **opt into complexity, never opt out of it**. Configuration
 is work. Give them the working thing first. Let them tinker later.
 
 ### Check questions
@@ -109,7 +120,7 @@ is work. Give them the working thing first. Let them tinker later.
 
 - ✅ **Good:** The upgrade flow is one command: `switchroom update` pulls
   new images, reconciles the compose file, rolls the fleet, and runs
-  doctor — idempotent and the same on every host.
+  doctor: idempotent and the same on every host.
 - ❌ **Bad:** "Run `bun run build`, then bounce each container by hand,
   then re-render the compose file, then…"
 
@@ -128,7 +139,7 @@ The whole product should feel like one person designed it.
 No seams between layers. Consistent CLI shape, consistent Telegram UX,
 shared config cascade, unified vault and OAuth model. When you learn
 how one part works, you've learned how the rest works. This is about
-**cognitive load**, not visual design — every new interaction model
+**cognitive load**, not visual design. Every new interaction model
 asks users to re-learn the product.
 
 ### Check questions
@@ -140,14 +151,14 @@ asks users to re-learn the product.
 
 ### Examples
 
-- ✅ **Good:** Every top-level CLI verb is `switchroom <noun> <verb>`
-  — `agent start`, `vault set`, `topics sync`, `auth add`. One
+- ✅ **Good:** Every top-level CLI verb is `switchroom <noun> <verb>`:
+  `agent start`, `vault set`, `topics sync`, `auth add`. One
   shape. One file per noun in `src/cli/`.
 - ❌ **Bad:** `switchroom agent start` next to `switchroom
   restart-agent` next to `switchroom start_telegram`.
 
-- ✅ **Good:** Every long-running operation — interactive reply,
-  scheduled task, sub-agent delegation — uses the same conversational
+- ✅ **Good:** Every long-running operation (interactive reply,
+  scheduled task, sub-agent delegation) uses the same conversational
   pacing rhythm. Soft-commit, mid-turn updates at meaningful
   punctuation, final answer pings once. Sub-agent work is narrated in
   the same thread as the parent.
@@ -161,14 +172,14 @@ asks users to re-learn the product.
   the same way across `defaults`, profiles, and agents. See
   `src/config/merge.ts` and `docs/configuration.md`.
 - ❌ **Bad:** Some fields cascade, some override, some concat, with no
-  documented mode — users have to read the merge logic to predict
+  documented mode, so users have to read the merge logic to predict
   behaviour.
 
 - ✅ **Good:** Secrets are referenced uniformly as `vault:<key>`
   anywhere in `switchroom.yaml`. The vault CLI, the cascade resolver,
   and the bootstrap layer all know that prefix.
 - ❌ **Bad:** Tokens via `vault:`, API keys via `${env.FOO}`, group
-  IDs via plain literals — three idioms for "this came from somewhere
+  IDs via plain literals: three idioms for "this came from somewhere
   else."
 
 - ✅ **Good:** `switchroom agent restart` always reconciles first
@@ -178,7 +189,7 @@ asks users to re-learn the product.
 - ❌ **Bad:** `restart` only restarts the process, `reconcile` only
   rewrites config, and you have to know which one to run when.
 
-- ✅ **Good:** Same Telegram UX surface for every agent — same `/auth`
+- ✅ **Good:** Same Telegram UX surface for every agent: same `/auth`
   router, same reaction lifecycle, same conversational pacing, same
   silence-poke safety net, regardless of profile.
 - ❌ **Bad:** Custom one-off Telegram behaviours per profile that look
@@ -193,7 +204,7 @@ retired in #1122). Build the model to communicate; let the framework
 be the safety net, not the headline. Single source of truth for "what
 is the agent doing": the chat itself, paced by the model. The
 framework's job is to escalate the *reaction* (ambient) and fire a
-backstop message at 5min silence (safety net) — not to mirror state
+backstop message at 5min silence (safety net), not to mirror state
 in parallel.
 
 When you're tempted to add a new pinned card / status bar / live
@@ -220,8 +231,17 @@ Before you open a PR, ask:
 If you can't answer **yes** to all three, you're not done. Redesign,
 don't ship and patch later.
 
-These principles don't replace the existing JTBDs in `reference/` —
-they *judge* them. A feature can satisfy a JTBD outcome and still fail
+And the three principle checks aren't the whole gate. The
+non-functional trust bar (security, the on-leash stakes, the
+subscription-honest stakes) is owned as binary lines in
+[`invariants.md`](invariants.md), not as anything you weigh here:
+claude-native, no-self-escalation, on-leash, single-tenant,
+telegram-only, chat-is-the-single-source-of-truth. Before you open the
+PR, confirm the change crosses none of them. A "yes" on all three
+principle checks plus a crossed invariant is still out of scope.
+
+These principles don't replace the existing JTBDs in `reference/`.
+They *judge* them. A feature can satisfy a JTBD outcome and still fail
 all three principle checks. When that happens, the JTBD outcome is the
-goal; the principles are how we get there without making the product
+goal, and the principles are how we get there without making the product
 feel like a kit.

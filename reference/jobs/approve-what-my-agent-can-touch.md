@@ -1,16 +1,16 @@
 ---
 job: approve what my agent can touch, without ever leaking the secret
 outcome: From Telegram, the operator grants or denies an agent's request for a secret, tool, MCP server, or host action with one tap. Access is per-resource, the agent can ask for more but can never self-grant, and the raw credential never appears in the chat.
-stakes: Get this wrong two ways. Make granting hard or opaque and a helpful agent improvises around the gate — tells the user to paste a token into chat, guesses key names, burns taps. Make it loose and "helpful" silently becomes "escalated", with no one in the loop. Either failure leaks a credential or hands an agent access the operator never gave it.
+stakes: Get this wrong two ways. Make granting hard or opaque and a helpful agent improvises around the gate, tells the user to paste a token into chat, guesses key names, burns taps. Make it loose and "helpful" silently becomes "escalated", with no one in the loop. Either failure leaks a credential or hands an agent access the operator never gave it.
 serves: hold-the-leash
 invariants: [no-self-escalation, claude-native]
 ---
 
 # Job Spec: approve what my agent can touch, without ever leaking the secret
 
-> A durable Job Spec. The *how* — the broker, the approval kernel, the
+> A durable Job Spec. The *how* (the broker, the approval kernel, the
 > three auth paths, the per-key ACL, the redaction detector, the
-> posture-mint opt-in — lives in the design artifact
+> posture-mint opt-in) lives in the design artifact
 > `reference/rfcs/access-model.md`. That implementation churns; this job does
 > not. This spec is the **operator-facing** approval/secret-handling
 > outcome; the agent-side authorization mechanism is detailed in
@@ -22,7 +22,7 @@ invariants: [no-self-escalation, claude-native]
 The operator's agent hits the edge of what it was given: it needs a
 credential, a tool, an MCP server, or a host action it doesn't hold. The
 operator wants to make that call from their phone, in the same chat, with
-the full picture — *which* agent wants *what* — and decide in one tap. And
+the full picture (*which* agent wants *what*) and decide in one tap. And
 they want a hard guarantee under it: the agent can ask, but it can never
 grant itself; and whatever secret is involved is never exposed in the
 conversation. The job is to make granting access frictionless and honest
@@ -35,22 +35,22 @@ without ever turning the chat into a place a raw credential lives.
 - The agent that needs more never asks the user to paste a secret into
   chat. It requests; the operator gets a card; the value is provided once,
   securely, and is gone from history.
-- The approval card shows the **exact scope** — this agent, this key, this
-  file, this verb — sourced the same way it's enforced, not a friendly
+- The approval card shows the **exact scope** (this agent, this key, this
+  file, this verb), sourced the same way it's enforced, not a friendly
   label the agent picked.
 - One tap grants or denies. A grant is per-resource: approving one key
   doesn't hand over the next.
 - A granted request **auto-resumes the turn**. The operator taps Allow and
   the agent picks up where it left off, without a nudge.
 - If the operator pastes a secret anyway, the bot deletes the original
-  message and confirms — the plaintext leaves the chat, the value lands in
+  message and confirms. The plaintext leaves the chat, the value lands in
   the vault, the agent never receives it.
 - The agent can see its own sandbox and the denied path offers a clean
   one-tap request, so it stops guessing and never routes around the gate.
 - The irreversible / admin-credential case sits behind the operator
-  passphrase — a secret the agent structurally never holds — not just a tap.
+  passphrase, a secret the agent structurally never holds, not just a tap.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - The agent telling the user to paste a token into chat because a slot was
   empty. The improvisation *is* the leak.
@@ -61,7 +61,7 @@ without ever turning the chat into a place a raw credential lives.
 - A blanket grant: one tap silently widening the agent's access beyond the
   one resource on the card.
 - Any path where an agent ends up with access the operator never wrote down
-  or tapped for — a self-edit that survives reconcile, a wire-supplied
+  or tapped for: a self-edit that survives reconcile, a wire-supplied
   identity, a posture mint of a crown-jewel key.
 - A grant that lands but the turn dies anyway, forcing the operator to
   re-prompt the work they already approved.
@@ -87,11 +87,11 @@ Named by job × surface, pointing at real scenarios in
 - **Redaction doesn't false-positive (DM)** —
   `secret-redaction-no-false-positive-dm`. *Watch:* the operator talks
   casually about tokens/secrets and the message is left intact. *Invariant:*
-  the safety net never eats ordinary conversation — a confusing wall is
+  the safety net never eats ordinary conversation. A confusing wall is
   itself a leak risk.
 - **Request → approve → access, end to end (DM)** —
   `vault-request-access-end-to-end-dm`. *Watch:* agent requests access,
-  operator approves, the agent's read then succeeds — and only for the
+  operator approves, the agent's read then succeeds, and only for the
   approved key. *Invariant:* `no-self-escalation` — access flows from the
   operator tap, enforced where the agent can't write it.
 - **Per-resource grant under concurrency (DM)** —
@@ -128,12 +128,12 @@ per-resource, every resume a synthesized turn.
 - **Done when:** the operator can grant or deny exactly what an agent asks
   for with one honest tap, the agent can request but never self-grant, the
   raw secret never appears in chat, and a granted request resumes the turn
-  on its own — proven by the scenarios above.
+  on its own. Proven by the scenarios above.
 
 ## Production-readiness
 
 - *Confidentiality:* a raw credential never persists in chat history, logs,
-  or the agent's view — provided-once, deleted-on-paste, never returned.
+  or the agent's view: provided-once, deleted-on-paste, never returned.
   This is the load-bearing security property; a single leak is a defect, not
   a regression budget.
 - *Authorization integrity:* every grant is enforced where the agent can't
@@ -142,7 +142,7 @@ per-resource, every resume a synthesized turn.
 - *Scope fidelity:* the card's displayed scope equals the granted scope,
   sourced the same way; per-resource, never blanket.
 - *Tiering:* irreversible / admin-credential actions sit behind the operator
-  passphrase — a factor the agent structurally lacks — never a tap alone.
+  passphrase, a factor the agent structurally lacks, never a tap alone.
 - *Reliability:* an approval that lands resumes the turn; a denied or
   restart-interrupted grant never strands the agent silently.
 

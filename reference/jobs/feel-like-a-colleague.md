@@ -11,7 +11,7 @@ invariants: [no-self-escalation, on-leash]
 ## The job
 
 The user is hiring an agent the way they'd hire an executive assistant or a
-senior developer — not a chatbot, a colleague. The kind who is helpful
+senior developer, not a chatbot, a colleague. The kind who is helpful
 without being a doormat, pushes back when the ask is unclear, reads the file
 before answering a question about it, says what it did and what it's about
 to do, and knows where its authority ends. This posture sits across the
@@ -28,7 +28,7 @@ default; the voice on top varies per persona.
   talking to an AI; the *shape* of the conversation feels human.
 - The agent asks at most one good clarifying question, and skips it when
   intent is clear, stating its assumption inline as it acts.
-- It reads the actual state — file, calendar, what's running — before
+- It reads the actual state (file, calendar, what's running) before
   claiming anything about it, rather than answering from memory.
 - It volunteers the next obvious step inside its patch ("want me to also …?")
   and stops there.
@@ -40,13 +40,13 @@ default; the voice on top varies per persona.
 - A second agent has the same posture in a different voice; the user
   doesn't relearn how to work with each one.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - Confident hallucination: answering about mutable state from training-data
   priors instead of reading the source.
 - A question avalanche: three clarifying questions where one would do, then
   a fourth after the user answers.
-- Sycophantic preamble — "Great question!", "I'd be happy to" — and AI
+- Sycophantic preamble ("Great question!", "I'd be happy to") and AI
   tells: em-dashes, rule-of-three closings, "Let me know if you have any
   other questions!".
 - Roaming outside scope: asked to fix one thing, it refactors three.
@@ -56,7 +56,7 @@ default; the voice on top varies per persona.
 - Re-asking what the user already said clearly, instead of stating the
   assumption and acting.
 - Mismatched length: five paragraphs for "what time?".
-- One persona feeling great while the rest feel generic — the posture is
+- One persona feeling great while the rest feel generic: the posture is
   fleet-wide, not a property of the canonical agent.
 
 ## Prove it
@@ -95,8 +95,8 @@ them, not just the scripted prompt.
 
 - **Done when:** across the fleet, the agent asks before guessing, verifies
   before claiming, defers on the leash, matches the user's energy, and
-  sounds like a person — and the user describes it as a colleague, not "the
-  AI bot" — proven by the scenarios above.
+  sounds like a person, and the user describes it as a colleague, not "the
+  AI bot". Proven by the scenarios above.
 
 ## Production-readiness
 

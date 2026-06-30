@@ -1,6 +1,7 @@
 ---
-artefact: admin-agent config edit via approval-gated hostd verb
-serves: jobs/approve-what-my-agent-can-touch.md
+artifact: admin-agent config edit via approval-gated hostd verb
+serves: approve-what-my-agent-can-touch
+advances-outcome: hold-the-leash
 status: Draft v1
 ---
 
@@ -21,7 +22,7 @@ primary chat showing the rendered diff, the requesting agent, and the
 rationale. On Approve, the host writes the file atomically, snapshots
 the prior version to `~/.switchroom/config-backups/`, and runs
 `switchroom apply`; on Deny (or timeout) the proposal is a no-op.
-Every proposal — approved, denied, errored — is appended to the
+Every proposal, approved, denied, or errored, is appended to the
 existing hostd audit log.
 
 This collapses today's "agent pastes yaml block, asks human to copy-
@@ -46,7 +47,7 @@ Admin agents (today: `klanker`) regularly need to edit
 - "Flip `defaults.model` to opus-4-7-2."
 
 The agent's container mounts `/state/config/switchroom.yaml` read-
-only — by design; admin agents are prompt-injectable and must not be
+only, by design. Admin agents are prompt-injectable and must not be
 trusted with autonomous writes. So today the flow is:
 
 1. Agent drafts the yaml block in Telegram.
@@ -62,7 +63,7 @@ before drafting.
 ### 2.2 Why not just give the agent write access
 
 The whole point of the read-only mount is that admin agents are the
-biggest prompt-injection blast radius in the fleet — they can already
+biggest prompt-injection blast radius in the fleet. They can already
 restart peers, exec read-only commands inside peers, and trigger
 fleet upgrades. Adding silent yaml writes would mean a single
 poisoned tool-output (a doctored PR description, a malicious file in
@@ -73,7 +74,7 @@ verb is gated this way; config edits should be no different.
 ### 2.3 Why not granular per-section verbs
 
 We could ship `schedule_add`, `schedule_remove`, `skill_install`,
-`webhook_dispatch_add`, `defaults_set`, etc. — one verb per common
+`webhook_dispatch_add`, `defaults_set`, etc., one verb per common
 edit. Each would have a tight, typed surface area. Two reasons not
 to:
 
@@ -130,14 +131,14 @@ In order, all server-side, all before the operator hears a peep:
 1. **Patch shape.** Must be a unified diff with ≥3 lines context.
    The `---` and `+++` header paths must each match exactly one of
    `a/switchroom.yaml`, `b/switchroom.yaml`, or the bare filename
-   `switchroom.yaml` (git's three accepted forms). Any other path —
+   `switchroom.yaml` (git's three accepted forms). Any other path,
    including `../`, absolute paths, multi-file diffs, or symlink
-   targets — is rejected at this step as `validation-rejected`
+   targets, is rejected at this step as `validation-rejected`
    before `git apply` is invoked. Closes the
    `+++ b/../../etc/passwd` attack vector. Reject context-less
-   patches too — they're ambiguous and they defeat the operator's
+   patches too. They're ambiguous and they defeat the operator's
    ability to spot-check the diff visually. Patches MUST be LF-only
-   (no CRLF), no BOM, and capped at 1 MB raw bytes — this step is
+   (no CRLF), no BOM, and capped at 1 MB raw bytes. This step is
    the single source of truth for the 1 MB cap, §3.3's attachment
    discussion references it but does not re-decide it.
 2. **Apply check.** `git apply --check --whitespace=nowarn --recount`
@@ -152,7 +153,7 @@ In order, all server-side, all before the operator hears a peep:
    { schema: FAILSAFE_SCHEMA })` for js-yaml, or `safe_load` for
    PyYAML-shaped libs). Reject `!!`-tags (`!!js/function`,
    `!!python/object`, …) and reject merge-key anchors / aliases
-   (`&foo` / `*foo` / `<<:`) at parse time — these are code-
+   (`&foo` / `*foo` / `<<:`) at parse time. These are code-
    execution / hidden-mutation primitives the zod schema runs *after*
    and cannot defend against. If the zod parse fails, reject with the
    formatted error; the operator is not woken.
@@ -168,7 +169,7 @@ Only proposals that pass all four go to the operator.
 
 Posted to the operator's primary chat via the existing approval-card
 infra in `telegram-plugin/gateway/approval-card.ts` /
-`drive-write-approval.ts` — both are existing precedents for non-
+`drive-write-approval.ts`, both existing precedents for non-
 vault mutating actions gated by a card. Card payload:
 
 - **Header**: `<agent_name> wants to edit switchroom.yaml`
@@ -179,7 +180,7 @@ vault mutating actions gated by a card. Card payload:
   "+N more lines" footer and attach the full diff as a `.diff` file
   via Telegram's attachment surface. Hard cap the attachment at 1 MB
   (well under Telegram's 50 MB document ceiling); a patch larger than
-  that is `validation-rejected` at §3.2 step 1 — config patches of
+  that is `validation-rejected` at §3.2 step 1. Config patches of
   that size belong in a hand-edited release, not a chat approval.
 - **Buttons**: `[Approve]` / `[Deny]`.
 - **Safety delay**: for diffs over 20 lines, the Approve button
@@ -189,7 +190,7 @@ vault mutating actions gated by a card. Card payload:
   to swap in the live `[✅ Approve]` button bound to the diff_id.
   Aimed at diff fatigue (see §5).
 
-The card lives in the **operator's** chat — `operator_chat_id` from
+The card lives in the **operator's** chat: `operator_chat_id` from
 the gateway config, NOT the requesting agent's chat. The operator
 may be a different human from the agent's day-to-day user; the
 person who owns the host is the person who approves config writes.
@@ -202,7 +203,7 @@ would catch it, but failing fast at 10m is friendlier than
 mysterious post-approval `does-not-apply` errors.)
 
 `diff_id` is a 128-bit cryptographically random token (not derived
-from `patch_sha256` — identical patches collide, and content-
+from `patch_sha256`: identical patches collide, and content-
 derived ids leak deduplication signal). Each id is single-use;
 recorded as consumed in the same sqlite row that backs the rate
 limiter (§5), so the approve-callback handler atomically transitions
@@ -233,7 +234,7 @@ until the first either commits or rolls back.
    change. Closes the TOCTOU between §3.2 step 2 and the rename
    below.
 2. **Snapshot.** `cp switchroom.yaml
-   ~/.switchroom/config-backups/switchroom.yaml.bak-<ts>` — the
+   ~/.switchroom/config-backups/switchroom.yaml.bak-<ts>`: the
    snapshot is of the *just-re-checked* live file, so the rollback
    target in step 4 cannot clobber an interleaved operator edit.
    Rotate to keep the 10 most recent.
@@ -241,7 +242,7 @@ until the first either commits or rolls back.
    original; `fsync`; `rename(2)` over the original. Atomic on the
    same filesystem.
 4. **Reconcile.** Invoke `switchroom apply` (the existing host-side
-   reconcile entrypoint — see `src/agents/reconcile-dry-run.ts` and
+   reconcile entrypoint, see `src/agents/reconcile-dry-run.ts` and
    the apply path it shadows). Stdout/stderr are appended to
    `~/.switchroom/hostd-audit.jsonl` as a single
    `{op: "config_propose_edit", phase: "reconcile-output", ...}`
@@ -268,7 +269,7 @@ recoverable shapes:
 
 - **Orphan `.tmp`.** Crash between step 3 (`fsync` of `switchroom.
   yaml.tmp`) and step 4 (`rename`). On boot, hostd unlinks any
-  `switchroom.yaml.tmp` adjacent to `switchroom.yaml` — the file is
+  `switchroom.yaml.tmp` adjacent to `switchroom.yaml`. The file is
   by definition uncommitted.
 - **Orphan reconcile.** Crash between step 4 (rename complete) and
   step 5 (reconcile exit). The yaml is the new version but
@@ -302,7 +303,7 @@ Every proposal terminus appends one line to
   patch_sha256, backup_path?, reconcile_exit_code? }
 ```
 
-The full diff is NOT in the audit row — only its sha256 — to keep
+The full diff is NOT in the audit row, only its sha256, to keep
 the audit log scannable. The diff itself is preserved in
 `~/.switchroom/config-backups/proposals/<diff_id>.diff` for the
 30-day retention window the rest of hostd audit uses.
@@ -330,11 +331,11 @@ know where it goes.
   (just strings in yaml), not on the encrypted vault store. Concrete
   rules: adding a new `vault:foo/bar` reference is allowed; removing
   one is allowed; *replacing* `vault:foo/bar` with `vault:baz/qux` is
-  allowed (it's still a reference swap, not a value change — the
+  allowed (it's still a reference swap, not a value change: the
   vault store is untouched, and the operator sees both keys on the
   diff card). What the verb cannot do is set a non-`vault:` literal
   where one previously existed (e.g. replacing `vault:foo/bar` with
-  an inline plaintext secret) — that's caught by the schema-
+  an inline plaintext secret). That's caught by the schema-
   validation step in §3.2 if the field is typed as a vault ref, and
   by the operator's eyes on the diff regardless.
 - **Editing `~/.switchroom/skills/**` content.** That dir is
@@ -354,7 +355,7 @@ know where it goes.
   injected can now ask for any yaml change, not just restarts.
   Mitigation: the operator MUST read the diff. The card surfaces
   requester + rationale prominently so "klanker wants to edit gymbro's
-  `secrets:` block — why?" is visually obvious. Diffs over 20 lines
+  `secrets:` block, why?" is visually obvious. Diffs over 20 lines
   get a 5-second tap delay (see §3.3). Per-agent rate limit of 3
   cards/hour (configurable, defaults flag).
 - **Diff fatigue.** Operator approves without reading. Mitigations
@@ -365,7 +366,7 @@ know where it goes.
   hour** (default; overridable via
   `hostd.config_edit_rate_per_hour`). Implemented as a sqlite
   token-bucket in `~/.switchroom/hostd-state.db` (atomic decrement
-  inside a single transaction — naive in-memory counters race when
+  inside a single transaction; naive in-memory counters race when
   two proposals from the same agent arrive concurrently). Tripping
   the limit returns `{ outcome: "rate-limited", approved: false,
   applied: false }` immediately, audits the attempt as a terminal
@@ -391,7 +392,7 @@ know where it goes.
   fallback. Doesn't address the agent-driven workflow.
 - **Granular per-section verbs.** See §2.3.
 - **No-approval autonomous writes for admin agents.** Violates the
-  prompt-injection threat model — see §2.2. Non-starter.
+  prompt-injection threat model. See §2.2. Non-starter.
 - **Approval card to the requesting agent's chat, not the operator's.**
   Rejected: the agent's chat may be shared with a non-operator user
   (a family member, a collaborator). Config writes need the host

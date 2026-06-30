@@ -1,5 +1,5 @@
 ---
-artefact: hard-boundary operator approvals (no agent self-elevation)
+artifact: hard-boundary operator approvals (no agent self-elevation)
 backs: no-self-escalation
 status: Draft for operator review
 ---
@@ -8,7 +8,7 @@ status: Draft for operator review
 
 - Status: **Draft for operator review**
 - Author: drafted 2026-06-02
-- Tracks: vision.md outcome 2 ("you hold the leash — it can't self-elevate
+- Tracks: vision.md outcome 2 ("you hold the leash, it can't self-elevate
   or route around you"); supersedes the audit-only framing of #833 / the
   approval-kernel `src/vault/approvals/MIGRATION.md` Phase 2 for the
   *enforcement* question.
@@ -32,15 +32,15 @@ mints via `mint_grant` on the broker's **per-agent socket**. The
 posture-attested path requires only: agent on `postureMintAgents`, telegram-id
 mode, agent-self-match. **No key-ACL, no proof an operator tapped.**
 
-Completing the approval-kernel "enforcing flip" (#833) — making the broker
-require a consumed kernel `approval_decision` — does **not** fix it. The
+Completing the approval-kernel "enforcing flip" (#833), making the broker
+require a consumed kernel `approval_decision`, does **not** fix it. The
 kernel's `approval_consume` / `approval_record` are themselves on the
 **per-agent socket** and verify only *"the nonce belongs to the calling
 agent"* (`src/vault/approvals/kernel-server.ts:414-483`). The code says so:
 
 > "Without this a compromised agent could self-consume + self-record an
 > allow_always decision … no operator ever approved (approval-integrity
-> bypass)." — kernel-server.ts:472
+> bypass)." (kernel-server.ts:472)
 
 That listener-ACL blocks **cross-agent** forgery only. An agent forging a
 decision for **its own** request still works: `claude` calls
@@ -57,7 +57,7 @@ have simply never been reconciled in code.
 ## 3. The crux
 
 The only authorization `claude` cannot manufacture is the operator's **real
-Telegram tap** — a `callback_query` Telegram delivers, signed by Telegram's
+Telegram tap**: a `callback_query` Telegram delivers, signed by Telegram's
 own infrastructure, to whoever holds the bot token's update stream. To make
 approvals hard, **that tap must be received and verified by a component
 outside the agent container**, and the broker must gate the mint on a
@@ -67,7 +67,7 @@ decision recorded only through that component.
 UID** in its own compose project, brokers privileged ops, and binds an
 **operator-only socket** (`~/.switchroom/hostd/operator/sock`, mode 0600)
 that no agent container can reach. But note the trap: hostd *also* binds
-per-agent sockets that `claude` shares — so "route through hostd" is only
+per-agent sockets that `claude` shares, so "route through hostd" is only
 hard if the **operator-tap verification itself** happens host-side, not via
 a per-agent dispatch hostd would have to trust.
 
@@ -76,7 +76,7 @@ a per-agent dispatch hostd would have to trust.
 ### 4.1 Recommended: host-side approval verification
 
 Introduce a host-side **approval verifier** (in the hostd process / compose
-project, operator UID — *not* in any agent container) that:
+project, operator UID, *not* in any agent container) that:
 
 1. **Holds the credential that receives approval taps.** Two sub-options:
    - **(A) Dedicated approval bot.** A second Telegram bot token, host-only,
@@ -86,12 +86,12 @@ project, operator UID — *not* in any agent container) that:
      chat; only the sensitive-approval card lives on the approval bot.
    - **(B) Host-side callback relay for the existing bot.** Move
      `callback_query` reception for `apv:`/`vg:` cards to the host verifier
-     (the gateway stops being the sole poller for those updates). Heavier —
-     splits one bot's update stream — and Telegram delivers a bot's updates
+     (the gateway stops being the sole poller for those updates). Heavier,
+     splits one bot's update stream, and Telegram delivers a bot's updates
      to a single poller/webhook, so this effectively means the *host* polls
      and forwards non-approval updates inward. Higher blast radius.
 
-   **Recommend (A)** — a dedicated, host-only approval bot keeps the
+   **Recommend (A)**: a dedicated, host-only approval bot keeps the
    unforgeable path small and additive, and never changes the agent bots.
 
 2. **Verifies the tap** (`from.id ∈ approvers`) host-side, where `claude`
@@ -99,10 +99,10 @@ project, operator UID — *not* in any agent container) that:
 
 3. **Records the kernel decision on the kernel's OPERATOR socket**
    (host-only). The kernel already distinguishes `isOperator` connections
-   (kernel-server.ts:188, 333) — extend the operator socket to accept
+   (kernel-server.ts:188, 333): extend the operator socket to accept
    `approval_record`/`approval_consume` for the verified decision (today the
-   operator socket is read-mostly; see `feedback_kernel_operator_socket_deny_by_default`
-   — this RFC deliberately revisits that for the host-verified path only).
+   operator socket is read-mostly; see `feedback_kernel_operator_socket_deny_by_default`,
+   which this RFC deliberately revisits for the host-verified path only).
 
 ### 4.2 Broker enforcement
 
@@ -117,7 +117,7 @@ passphrase-attested and operator-socket CLI paths are unchanged.
 
 ### 4.3 Why this is hard, not soft
 
-`claude` can still self-`consume`+`record` an `origin='agent'` decision — but
+`claude` can still self-`consume`+`record` an `origin='agent'` decision, but
 the broker won't mint on it. It cannot produce an `origin='operator'`
 decision because it cannot reach the operator socket and cannot make the
 host verifier act without a real Telegram tap it cannot generate.
@@ -156,7 +156,7 @@ generalize the `origin='operator'` gate to the apv: enforcing flip.
 1. **Approval-bot (4.1-A) vs host-side relay (4.1-B)?** A is smaller/additive
    and recommended; B avoids a second bot but splits the update stream.
 2. **Ship the Phase-1 interim key-ACL constraint now** (defense-in-depth,
-   honest framing) while Phase 2 is built — or wait for the hard boundary?
+   honest framing) while Phase 2 is built, or wait for the hard boundary?
 3. **Scope of Phase 2** — vault grants only first (recommended), or bundle
    the apv: MCP-approval generalization?
 
@@ -175,20 +175,20 @@ the gateway share **one uid in one container** (`compose.ts` allocates a single
 uid per agent; `start.sh.hbs` forks the gateway and `exec claude` as that uid).
 The broker authorizes by **socket bind-path**, not connecting uid, and the
 per-agent socket is chowned to that one uid. So B requires **either a separate
-per-agent gateway container OR running agent containers as root** (uid-drop) —
+per-agent gateway container OR running agent containers as root** (uid-drop),
 both re-architect the load-bearing co-located runtime (tmux / autoaccept /
 bridge; CLAUDE.md: "the tmux layer is load-bearing").
 
-**Invasiveness ranking of the hard options:** dedicated approval bot (lightest —
-additive, host-side, no runtime change) < host-relay (moderate — Telegram I/O
-host-side) < **uid-split gateway (heaviest — separate container / root)**. The
+**Invasiveness ranking of the hard options:** dedicated approval bot (lightest:
+additive, host-side, no runtime change) < host-relay (moderate: Telegram I/O
+host-side) < **uid-split gateway (heaviest: separate container / root)**. The
 "use existing auth, no bot" framing sounds lightest but, made unbypassable,
 lands on the most invasive change.
 
 **What ships / stands:**
 - **PR ① (#2070, merged):** `approval_decisions.origin` + flag-gated broker mint
   gate, **inert** (`SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT` default off).
-  Kept — it is the ready enforcement seam if the trust model changes or the
+  Kept. It is the ready enforcement seam if the trust model changes or the
   gateway is split out for other reasons (B then comes nearly free).
 - **No** host verifier, approval bot, or gateway uid-split built.
 - **Optional belt-and-suspenders (deferred):** the broker key-ACL constraint on

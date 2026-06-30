@@ -1,6 +1,7 @@
 ---
-artefact: Google Workspace as a first-class agent capability
-serves: jobs/act-in-my-tools-with-an-identity.md
+artifact: Google Workspace as a first-class agent capability
+serves: act-in-my-tools-with-an-identity
+advances-outcome: always-available
 status: Draft v3
 ---
 
@@ -18,7 +19,7 @@ RFC H rather than the deleted `auth account ...` shape:
 
 - **CLI shape collapses to `enable | disable | list`** (Phase 3a's
   shipped surface). Drop `share`, drop `connect <agent>` wizard alias
-  — RFC H deleted the equivalent Anthropic verbs (no `auth share`,
+  since RFC H deleted the equivalent Anthropic verbs (no `auth share`,
   no `auth login`). Account *creation* moves to `auth google account
   add <email>`, which becomes a thin client over the auth-broker
   (Phase 3b). See §4.5.
@@ -32,7 +33,7 @@ RFC H rather than the deleted `auth account ...` shape:
   for *non-agent peers needing an Anthropic-account socket*
   (hindsight is the in-tree consumer), NOT for non-Anthropic OAuth
   providers. Phase 3b.1 introduces a provider abstraction RFC H
-  deliberately deferred — this is a real architectural addition,
+  deliberately deferred. This is a real architectural addition,
   not a config-flag wiring exercise. The motivation stands:
   rebuilding a parallel refresher in `src/drive/` would duplicate
   flock leases, sha-index drift detection, and audit log machinery
@@ -101,7 +102,7 @@ $ switchroom auth google share you@example.com --from-agent klanker --to-agent e
    ✅ executive now has access via you@example.com (copied from klanker).
 ```
 
-(The shape mirrors `switchroom auth account add | enable | share | list | account remove` for Anthropic accounts. Google is the second vendor under `auth`; future vendors — Notion, Slack — follow the same `auth <vendor> ...` pattern.)
+(The shape mirrors `switchroom auth account add | enable | share | list | account remove` for Anthropic accounts. Google is the second vendor under `auth`; future vendors (Notion, Slack) follow the same `auth <vendor> ...` pattern.)
 
 End-to-end flow from a Telegram thread (uses RFC E §4.3 deep links + RFC D headless OAuth):
 
@@ -120,7 +121,7 @@ What's different from today (RFC D shipped state):
   alongside Drive + Docs.
 - Operator picks the tier (`core` / `extended` / `complete`) per agent
   rather than getting a hardcoded Drive surface.
-- Agent identity stays separate at the approval layer — `klanker`
+- Agent identity stays separate at the approval layer: `klanker`
   reading `/Q3 Strategy` is a different approval row than `gymbro`
   reading the same doc, even though they share the OAuth token.
 
@@ -139,7 +140,7 @@ Maps to three of the four outcomes in `reference/vision.md`:
   storage means a single broker keeps one token fresh, not N.
 
 Visibility (#1) is served by the existing approval kernel (RFC B) +
-RFC E's diff-preview surface — no new work for that outcome here.
+RFC E's diff-preview surface. No new work for that outcome here.
 
 ## 3. JTBD alignment
 
@@ -207,10 +208,10 @@ Maps directly to the upstream MCP's `--tool-tier` flag.
   agent newly connected.
 - `extended` (~40 tools): adds Slides, Forms, Tasks, Chat.
 - `complete` (~60+ tools): adds Gmail (which has its own approval-
-  shape considerations — see §5 out of scope).
+  shape considerations, see §5 out of scope).
 
 Tier is per-agent, not per-account. Two agents on the same account
-can have different tiers — each runs its own MCP wrapper subprocess
+can have different tiers. Each runs its own MCP wrapper subprocess
 inside its own container, configured with its tier. The OAuth token
 is shared; the **MCP server process is not** (preserving RFC D's
 per-agent subprocess model and its security properties).
@@ -244,7 +245,7 @@ manifest; unknown tool names fail fast with the suggestion list.
 - **auth-broker** (RFC H) — sole OAuth refresher and credentials
   writer. As shipped by RFC H, supports Anthropic only.
   Phase 3b.1 of *this* RFC adds the provider abstraction the
-  broker needs to host Google as a second provider — RFC H
+  broker needs to host Google as a second provider. RFC H
   deliberately scoped the broker to Anthropic-only ("speaks OAuth
   and only OAuth" per RFC H §3); the multi-provider extension
   is RFC G's contribution, not RFC H's. Once 3b.1 lands the
@@ -276,7 +277,7 @@ The vault-broker's `checkAclByAgent()` routes `google:<acct>:*` keys
 through `google_accounts.<acct>.enabled_for[]` instead of the
 per-cron `schedule.secrets[]` allowlist. Fail-closed on unknown
 account, empty `enabled_for`, or agent-not-in-list. This is the
-load-bearing security boundary — without the ACL, any agent could
+load-bearing security boundary: without the ACL, any agent could
 read any Google account's token from vault.
 
 **Drift handling — loud removal, not polite mirror** (v3 change per
@@ -308,7 +309,7 @@ retrieved post-RFC-H. Wrapper startup:
    to the upstream MCP, no token persistence inside the wrapper.
 
 Refresh ticks happen entirely inside auth-broker per RFC H §4.7's
-flock-protected lease primitive — wrapper never re-fetches refresh
+flock-protected lease primitive. Wrapper never re-fetches refresh
 tokens from vault, never owns the refresh loop. Identical pattern
 to Anthropic; no Google-specific refresh code in `src/drive/`.
 
@@ -318,10 +319,10 @@ to Anthropic; no Google-specific refresh code in `src/drive/`.
 `auth ...` (the post-RFC-H Anthropic surface). Google is the second
 auth vendor; future vendors (Notion, Slack) follow the same `auth
 <vendor> ...` pattern. `switchroom workspace` already exists as a
-top-level verb (manages AGENTS.md/MEMORY.md scaffold files) — using
+top-level verb (manages AGENTS.md/MEMORY.md scaffold files), so using
 it for Google would silently break operators.
 
-**Important divergence from Anthropic post-RFC-H** — Google and
+**Important divergence from Anthropic post-RFC-H.** Google and
 Anthropic have *different* problems, so the verb shapes are allowed
 to differ:
 
@@ -374,7 +375,7 @@ switchroom auth google account list                    # bare accounts (no agent
 (device-code → OOB-paste → desktop-loopback). On a host with no
 `$DISPLAY`, the device-code flow is used by default; explicit
 `--headless` forces it. The OAuth flow itself moves into
-`src/auth/broker/google-provider.ts` (Phase 3b — see §7) — the CLI
+`src/auth/broker/google-provider.ts` (Phase 3b, see §7). The CLI
 verb is a thin client.
 
 **`account remove` refuses** while any agent is still enabled on
@@ -388,7 +389,7 @@ audit row, not three.
 **`disable` prunes when `enabled_for` empties** (v3 change per RFC
 H §10): no "dormant ACL" intermediate state. If the operator wants
 the account to stay configured but have no agents, they can leave
-`enabled_for: []` in YAML by hand — the CLI doesn't write that
+`enabled_for: []` in YAML by hand. The CLI doesn't write that
 shape.
 
 ### 4.6 Setup wizard inline prompt
@@ -408,7 +409,7 @@ Connect now? [Y/n] _
 ```
 
 Default Y. Phase 4 (already merged) prints the next-step command
-and continues — does NOT run OAuth inline (would break the linear
+and continues. Does NOT run OAuth inline (would break the linear
 wizard, same reason RFC H §4.6 doesn't auto-add an account).
 
 **Phase 4 (today)** surfaces the legacy command for back-compat:
@@ -428,7 +429,7 @@ deliberately separate verbs; the wizard surfaces both lines but
 runs neither inline.
 
 Survives the docs test (no docs reading needed) and the defaults
-test (no config-by-default for users who aren't using Workspace —
+test (no config-by-default for users who aren't using Workspace,
 opt-in but advertised).
 
 ### 4.7 `examples/personal-google-workspace-mcp/` for operator-host use
@@ -444,10 +445,10 @@ examples/
     .env.example       # OAuth client ID + signing-key placeholder
 ```
 
-**Distinct from the agent-side feature** above — the README opens
+**Distinct from the agent-side feature** above: the README opens
 with: *"This is for **operators** who want their **own** Claude Code
 on the host to have Workspace tools (alongside or instead of giving
-agents access). It does not affect switchroom agents — they get
+agents access). It does not affect switchroom agents; they get
 Workspace via `switchroom auth google account add` + `enable` (RFC G §4.5)."*
 
 Today `examples/` contains only top-level YAMLs (`minimal.yaml`,
@@ -461,7 +462,7 @@ Slack, etc.) follow the same shape under `examples/personal-*-mcp/`.
   account at a time. If an agent needs both `you@example.com` and
   `work@bigcorp.com`, that's a future spec. Ad-hoc workaround:
   spin up a second agent on the second account. **This is
-  acknowledged as the most likely follow-up RFC** — operators who
+  acknowledged as the most likely follow-up RFC.** Operators who
   run a personal+work life from one assistant agent will hit it
   fast. The fix probably looks like a list-valued `accounts:` config
   block + a runtime account-picker on tool invocation. Out of scope
@@ -500,18 +501,18 @@ Per `reference/principles.md`:
   same way for the first-run path.
 - ✅ Setup wizard prompt explains *what* and *why* in two
   sentences ("read and (with approval) write to your Drive, Docs,
-  Sheets, Calendar — tools appear as approval-gated requests").
-- ✅ `workspace list` is self-documenting — accounts × agents
+  Sheets, Calendar; tools appear as approval-gated requests").
+- ✅ `workspace list` is self-documenting: accounts × agents
   matrix tells the user the state.
 - ✅ Drift error (agent removed from ACL) tells the user the next
   command.
 
 ### 6.2 Defaults test — *"Does it work on a fresh `switchroom setup`?"*
 
-- ✅ Tier defaults to `core` — the validated 16-tool surface.
+- ✅ Tier defaults to `core`, the validated 16-tool surface.
 - ✅ Setup wizard offers Workspace by default (Y), so a fresh
   install gets it without config-file editing.
-- ✅ Per-account storage is the default once enabled — no operator
+- ✅ Per-account storage is the default once enabled: no operator
   has to opt into "share auth across the fleet"; that's just how it
   works.
 - ✅ Per-agent approval default is per-action (RFC B / RFC E
@@ -524,21 +525,21 @@ Per `reference/principles.md`:
   `auth`; sibling to RFC H's `auth add|use|rotate|rm` for
   Anthropic. Different verb shapes are honest because the
   problems differ (Anthropic = quota routing, Google = per-
-  account access ACL — see §4.5 divergence note).
+  account access ACL, see §4.5 divergence note).
 - ✅ `vault:google:<acct>:*` matches the `vault:<surface>:*` slot
   pattern.
-- ✅ Auth-broker is the single OAuth refresher per host (RFC H §4.7)
-  — Google plugs in via the provider abstraction (Phase 3b), not
+- ✅ Auth-broker is the single OAuth refresher per host (RFC H §4.7).
+  Google plugs in via the provider abstraction (Phase 3b), not
   a parallel refresher.
 - ✅ `apv:` callback shape unchanged; new tools added to existing
   approval kernel.
-- ✅ `/approvals list|revoke|add|stats` surface unchanged — adding
+- ✅ `/approvals list|revoke|add|stats` surface unchanged: adding
   Calendar/Sheets/Slides scopes adds rows, not commands.
 - ✅ Cascade rules for `google_workspace:` block follow standard
   per-key merge (`src/config/merge.ts`), documented same way as
   every other config field.
 - ✅ Setup wizard prompt is in the same style as the bot-token and
-  first-agent prompts — opinionated default, easy decline.
+  first-agent prompts: opinionated default, easy decline.
 - ✅ "Loud removal beats polite mirror" applied to ACL pruning per
   RFC H §10's decision against dormant intermediate states.
 
@@ -551,19 +552,19 @@ merged first.
 
 ### Already shipped
 
-1. **Phase 1 — Config block + tier knob (no breaking changes)** —
+1. **Phase 1 — Config block + tier knob (no breaking changes)**:
    merged #1244. `google_workspace:` block + `drive:` alias + tier
    enum. Backwards-compatible.
-2. **Phase 2 — Per-account vault slot + per-agent ACL primitive** —
+2. **Phase 2 — Per-account vault slot + per-agent ACL primitive**:
    merged #1246. New helpers in `src/drive/vault-slots.ts`, ACL
    routing in `src/vault/broker/acl.ts`, top-level `google_accounts:`
-   schema. **Currently inert** — no code consumes it yet (Phase 3b
+   schema. **Currently inert**: no code consumes it yet (Phase 3b
    wires the wrapper read).
-3. **Phase 3a — `auth google enable | disable | list` CLI verbs** —
+3. **Phase 3a — `auth google enable | disable | list` CLI verbs**:
    merged #1247. Operators can populate `google_accounts.enabled_for[]`.
-4. **Phase 4 — Setup wizard Step 11** — merged #1248. Prompt only;
+4. **Phase 4 — Setup wizard Step 11**: merged #1248. Prompt only;
    surfaces the connect command.
-5. **Phase 5 — `examples/personal-google-workspace-mcp/`** —
+5. **Phase 5 — `examples/personal-google-workspace-mcp/`**:
    merged #1245. Operator-host docker-compose pattern, fully usable.
 
 ### Phase 3b — auth-broker integration (post-RFC-H, post-#1254)
@@ -581,7 +582,7 @@ Scope:
   mapping, error mapping (provider-specific OAuth error codes →
   broker's `invalid_grant` / `network` / `quota_exceeded`).
 - Provider plugin loading at broker startup (mirrors how the
-  vault-broker loads ACL config) — providers ship as files under
+  vault-broker loads ACL config): providers ship as files under
   `src/auth/broker/<vendor>-provider.ts`.
 - Per-provider refresh tick — RFC H's existing flock-protected
   lease primitive needs to key on `(provider, account)`, not just
@@ -639,7 +640,7 @@ Identity is path-as-identity (agent name from socket path); broker
 validates `agent ∈ google_accounts.<acct>.enabled_for[]`.
 
 After 3b.4 lands, the agent containers ARE actually using
-per-account shared tokens with per-agent ACL — the load-bearing
+per-account shared tokens with per-agent ACL, the load-bearing
 RFC G goal.
 
 #### 3b.5 — Apply-time legacy-slot migration (~60 min)
@@ -656,14 +657,14 @@ slot + populates `google_accounts.<account>.enabled_for[]`, deletes
 the legacy slot.
 
 Mirrors RFC H §6 ("rewrite once, refuse second run") rather than
-the v2 "warn and continue" design — RFC H showed loud-fail is the
+the v2 "warn and continue" design. RFC H showed loud-fail is the
 honest default for installed-base migrations.
 
 #### 3b.6 — Setup wizard pivot to two-step `account add` + `enable` (~10 min)
 
 The shipped Phase 4 (`src/cli/setup.ts:1112-1200`) explicitly
 anticipates `auth google connect <agent>` as a future surfaced
-command — but v3 §4.5 deletes that verb. Phase 3b.6 rewrites the
+command, but v3 §4.5 deletes that verb. Phase 3b.6 rewrites the
 `connectCmd` constant + the surrounding comment block in
 `stepGoogleWorkspace` to surface the two-step shape per §4.6:
 
@@ -711,7 +712,7 @@ Per CLAUDE.md, in **agent minutes**.
 
 **~5.75-6.5h agent time** for Phase 3b. Total RFC G end-to-end:
 ~9.5-10.25h. (v3-initial estimate of ~4.25h was too aggressive
-per reviewer — provider abstraction is real architectural work,
+per reviewer: provider abstraction is real architectural work,
 not a config-flag wiring exercise.)
 
 ## 9. Risks and open questions
@@ -720,8 +721,8 @@ not a config-flag wiring exercise.)
   If `klanker` is enabled at `tier: core` (Drive+Docs+Sheets+Cal)
   and the operator later runs `account remove` + `account add` to
   re-consent for `gymbro` at `tier: extended` (adds Slides), the
-  shared refresh token now grants Slides scope to **klanker too**
-  — even though klanker's operator never approved that. The kernel
+  shared refresh token now grants Slides scope to **klanker too**,
+  even though klanker's operator never approved that. The kernel
   still gates writes per-agent (Slides write requires a fresh
   approval card), but reads of newly-scoped surfaces are not
   gated. Mitigation: re-consent triggered by tier-bump posts a
@@ -731,7 +732,7 @@ not a config-flag wiring exercise.)
   unwanted.
 
 - **Approval kernel drift on agent removal.** `disable <account>
-  <agents...>` orphans the agents' standing approvals — they get
+  <agents...>` orphans the agents' standing approvals; they get
   `not_authorized` from the broker on next use. Mitigation: the
   approval-kernel surfaces a single chat nudge identifying the
   removed-agent + grant + the `auth google enable` command to
@@ -743,17 +744,17 @@ not a config-flag wiring exercise.)
   connect` for multiple agents on the same Google account ends up
   with N copies of the same refresh token in N per-agent slots.
   The migration tool needs to ask the operator "which Google
-  account does each per-agent slot belong to?" — there's no
+  account does each per-agent slot belong to?". There's no
   programmatic way to know (the slot key is per-agent, not
   per-account). Mitigation: migration tool prompts interactively
   AND surfaces the legacy slot's cached scope set + last-refresh
-  timestamp in the prompt — these are the only on-disk hints
+  timestamp in the prompt. These are the only on-disk hints
   for identifying which Google account is which. Falls back to
   "skip and re-OAuth" if operator can't remember.
 
 - **Inheritance of RFC H known-blocker class.** PR #1254 (RFC H)
   was reviewed with three blockers, including: *"`auth use` does
-  not persist `auth.active` to YAML — the broker mutates
+  not persist `auth.active` to YAML, the broker mutates
   in-memory only, so on any restart it re-reads YAML and the
   swap reverts."* Phase 3b.3 (`auth google account add / remove`)
   writes `google_accounts:` to YAML and expects the broker to
@@ -766,12 +767,12 @@ not a config-flag wiring exercise.)
   mirror the same pattern in `auth google account add / remove`.
 
 - **Tier change after connect.** Going from `core` to `extended`
-  doesn't expand granted OAuth scopes — Google's consent already
+  doesn't expand granted OAuth scopes. Google's consent already
   completed. The new tier's tools that need broader scopes will
   fail at runtime. Mitigation: `apply` checks each agent's tier
   against the cached `google:<acct>:scopes` slot; warns operator
   inline if the upgrade requires re-consent: *"klanker's tier
-  bumped to extended — needs Slides scope. Run `auth google
+  bumped to extended, needs Slides scope. Run `auth google
   account remove you@example.com` + `account add` to re-consent,
   or exclude Slides tools."*
 
@@ -779,7 +780,7 @@ not a config-flag wiring exercise.)
   but recommended" prompts during setup, the user starts skipping
   by reflex. Workspace prompt sits after bot-token + first-agent
   + (potentially) Hindsight memory; that's already three Y/n
-  prompts. Mitigation: order matters — Workspace prompt comes
+  prompts. Mitigation: order matters. Workspace prompt comes
   *last* in the optional-features sequence, after the user has
   seen the agent respond once. Fewer dropouts at the end.
 
@@ -787,7 +788,7 @@ not a config-flag wiring exercise.)
   operator manually edits `~/.switchroom/google_accounts.yaml`
   (or wherever ACL lives) outside the CLI, the broker's view and
   the CLI's view of "who's enabled" can diverge. Mitigation: ACL
-  state is a derived view, not source-of-truth — `auth google
+  state is a derived view, not source-of-truth: `auth google
   list` reads the broker, `enable/disable` writes through the
   broker.
   No manual edit path documented; the file (if any) is internal.

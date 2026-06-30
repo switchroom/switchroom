@@ -1,6 +1,7 @@
 ---
-artefact: Microsoft 365 integration (OneDrive + Office files + Mail + Calendar)
-serves: jobs/act-in-my-tools-with-an-identity.md
+artifact: Microsoft 365 integration (OneDrive + Office files + Mail + Calendar)
+serves: act-in-my-tools-with-an-identity
+advances-outcome: always-available
 status: Draft
 ---
 
@@ -24,7 +25,7 @@ agents.
   `MS365_MCP_OAUTH_TOKEN` env var.
 - **Office authoring**: handled by the already-bundled Anthropic
   skills at `skills/docx`, `skills/xlsx`, `skills/pptx`. No in-house
-  Word/PPT MCP shim needed — the skills know the file formats
+  Word/PPT MCP shim needed. The skills know the file formats
   properly; softeria just shuttles bytes via OneDrive.
 - **OAuth shape**: Entra "personal accounts + any work/school
   directory" multi-tenant app at the `/common` endpoint. One operator
@@ -93,7 +94,7 @@ in `skills/docx`, `skills/xlsx`, `skills/pptx`). The agent flow:
 1. Agent calls softeria's `download-bytes` to fetch a `.docx` from
    OneDrive to its workspace
 2. Agent invokes the `docx` skill (or `xlsx`/`pptx`) to author the edit
-   — proper file-format manipulation, tracked changes, etc.
+   (proper file-format manipulation, tracked changes, etc.)
 3. Agent calls softeria's `upload-file-content` (or
    `create-upload-session` for files >4 MB) to put the result back to
    OneDrive
@@ -116,7 +117,7 @@ unlock Teams/SharePoint/admin tools. Cascade via
 
 ### 4.1 App registration (operator one-time)
 
-**Register a new Entra app for switchroom — don't reuse an existing
+**Register a new Entra app for switchroom. Don't reuse an existing
 one.** If the operator already has a Microsoft-integrated app
 (personal calendar app, side project, anything), there are two
 load-bearing reasons to register a new one rather than expand the
@@ -140,18 +141,18 @@ Weaker reasons people cite (and that won't actually bite):
 incremental consent works, scope expansion is supported, redirect
 URIs can be multi-platform on one app. So if the existing app
 *already* has `AzureADandPersonalMicrosoftAccount` audience +
-public-client flows enabled, sharing isn't catastrophic — just
+public-client flows enabled, sharing isn't catastrophic, just
 cluttered. New app is still the cleaner default.
 
-Operator runs `switchroom auth microsoft connect` — a wizard that:
+Operator runs `switchroom auth microsoft connect`, a wizard that:
 
 1. Walks the operator through registering a new app in the **Entra
    admin center** (entra.microsoft.com → App registrations → New
    registration).
 2. Required settings:
    - **Supported account types**: "Accounts in any organizational
-     directory (any Microsoft Entra ID tenant — multitenant) **and**
-     personal Microsoft accounts (e.g. Skype, Xbox)" — manifest value
+     directory (any Microsoft Entra ID tenant, multitenant) **and**
+     personal Microsoft accounts (e.g. Skype, Xbox)", manifest value
      `AzureADandPersonalMicrosoftAccount`.
    - **Redirect URI**: platform "Mobile and desktop applications" →
      `http://localhost`. (Microsoft ignores port for loopback URIs.)
@@ -174,7 +175,7 @@ microsoft_workspace:
 ### 4.2 Per-account auth (per Microsoft account)
 
 Operator runs `switchroom auth microsoft account add [--label
-personal|work|<name>]`. Two flows depending on host capability —
+personal|work|<name>]`. Two flows depending on host capability,
 same tiering as Google's RFC D §3.2:
 
 **Tier 1 — desktop loopback** (default when `$DISPLAY` is set or
@@ -182,7 +183,7 @@ same tiering as Google's RFC D §3.2:
 
 1. Spawns a local HTTP server on an ephemeral port bound to `127.0.0.1`.
 2. Constructs auth URL via MSAL-Node `getAuthCodeUrl({ scopes, state,
-   codeChallenge })` — auth code + PKCE.
+   codeChallenge })`: auth code + PKCE.
 3. Opens browser to that URL.
 4. Catches callback at `/auth/callback?code=...&state=...`, validates
    state, hands code to MSAL `acquireTokenByCode()`.
@@ -193,9 +194,9 @@ same tiering as Google's RFC D §3.2:
 1. Calls MSAL-Node `acquireTokenByDeviceCode({ scopes, deviceCodeCallback })`.
 2. Wizard prints: "Open https://microsoft.com/devicelogin and enter
    code: ABCD-1234 (expires in 15min)". Operator opens that URL on any
-   device — phone, laptop, work computer — and pastes the code.
+   device (phone, laptop, work computer) and pastes the code.
 3. Wizard polls Microsoft's `/token` endpoint until the user completes
-   auth on the other device, then receives tokens.
+   auth on the other device, then receives the tokens.
 
 Switchroom is regularly installed on headless VPSs (see
 `reference_install_validation_loop`); device-code is the right
@@ -204,7 +205,7 @@ default for those hosts.
 **Stale-doc trap worth pre-empting**: Microsoft's older device-code
 page (`learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-acquire-token-device-code-flow`)
 contains the line *"AADSTS90133: Device Code flow is not supported
-under /common or /consumers endpoint"*. This is **outdated** — MSAL.NET
+under /common or /consumers endpoint"*. This is **outdated**: MSAL.NET
 4.5+ release notes and the MSAL .NET device-code wiki confirm device-
 code works on `/common` + `/consumers` for personal MSA, and every
 community MS-MCP server I surveyed uses this path successfully. The
@@ -245,9 +246,9 @@ Both flows converge after token acquisition:
 
 ### 4.3 Scope set v1
 
-Two scope sets — chosen at consent time based on account type and
+Two scope sets, chosen at consent time based on account type and
 `org_mode`. **Not "tiering"** (which would be per-agent and create
-upgrade friction) — this is per-account-at-consent, set once.
+upgrade friction): this is per-account-at-consent, set once.
 
 **Default v1 (personal MSA + work without `org_mode`):**
 
@@ -274,16 +275,16 @@ Sites.ReadWrite.All
 Rationale for the split:
 
 - `Sites.ReadWrite.All` grants read/write to **every SharePoint site
-  the user can access** — in a large enterprise that's potentially
+  the user can access**: in a large enterprise that's potentially
   thousands of sites holding HR/finance/legal docs. The defaults
   test (`reference/principles.md` §2) says the working default for
   a personal-use solo founder is not "agent has write access to my
   employer's entire SharePoint." Opt-in via `org_mode`.
 - `Files.ReadWrite.All` is bounded to the user's OneDrive (personal
-  or business) — narrow blast radius for the personal case, the right
+  or business), a narrow blast radius for the personal case, the right
   default. **Scope-narrowing option worth considering in PR 2 spike**:
   `Files.ReadWrite` (no `.All`) is also MSA-supported and covers
-  "the signed-in user's files" — which on a personal account IS the
+  "the signed-in user's files," which on a personal account IS the
   user's OneDrive. Dropping the `.All` suffix could lower blast
   radius further with no functional loss for personal-MSA. Verify
   via UAT that softeria's tools don't require the `.All` variant.
@@ -304,7 +305,7 @@ knob, single mental model.
   but worth doctor-probing).
 - Unverified-app warning: until switchroom is publisher-verified
   (requires MPN account, $-cost), MSA users see a "Permissions
-  requested — App info" page with an "unverified" badge. The wizard
+  requested, App info" page with an "unverified" badge. The wizard
   doc explicitly tells the operator: this is expected, accept it,
   this is your own app.
 
@@ -324,14 +325,14 @@ Mode 0600 on both files. Atomic writes (write-temp-then-rename).
 Owner is the auth-broker UID.
 
 **Only the broker holds the MSAL `PublicClientApplication` instance.**
-Agents never instantiate MSAL directly — they IPC to the broker for
+Agents never instantiate MSAL directly. They IPC to the broker for
 access tokens (mirrors Google's per-call `get_credentials` pattern).
 This is load-bearing for cache integrity: two MSAL instances writing
 the same `cache.json` would race on refresh-token rotation under
 concurrent agent activity, and atomic-write only protects against
 torn writes, not last-writer-wins clobber of a newer RT.
 
-**No machine-encryption v1** (matches current Google posture — RFC G
+**No machine-encryption v1** (matches current Google posture, RFC G
 §4.4 deferred broker-side vault encryption). Cache is filesystem-
 permissioned. Defer to RFC G's eventual broker-encryption proposal
 covering both providers uniformly.
@@ -340,7 +341,7 @@ covering both providers uniformly.
 
 Microsoft refresh tokens **rotate every refresh** (every successful
 `acquireTokenSilent` returns a new RT, invalidates the old). MSAL-Node
-handles this transparently inside its cache — the broker's
+handles this transparently inside its cache. The broker's
 `afterCacheAccess` callback writes the updated cache to disk after
 each rotation.
 
@@ -350,13 +351,13 @@ recover without operator re-auth.
 
 ### 5.3 Refresh distribution to softeria (BYOT)
 
-softeria has no in-server refresh — `MS365_MCP_OAUTH_TOKEN` is read
+softeria has no in-server refresh. `MS365_MCP_OAUTH_TOKEN` is read
 once at process spawn and softeria forwards it on every Graph call
 until it 401s. Claude Code does **not** auto-respawn MCP servers on
 tool errors; MCP children persist for the agent session lifetime
 (hours, sometimes days). A 60-min token against a session that long
 is total outage every hour. The original draft of this RFC tried to
-defer the refresher to v2 — that's wrong, the math is deterministic
+defer the refresher to v2. That's wrong, the math is deterministic
 and the v1 UX would be unusable.
 
 **v1 ships a sidecar refresher.** The launcher (`m365-mcp-launcher`)
@@ -371,7 +372,7 @@ spawns two processes per agent:
    - Writes the new AT to a tmpfile + atomically renames it to a
      well-known path (e.g. `/tmp/m365-token-<agent>.json`)
    - Sends softeria child SIGHUP (which softeria docs as a
-     refresh-trigger — verify in PR 1 spike; if not honored,
+     refresh-trigger; verify in PR 1 spike; if not honored,
      restart-child semantics instead)
    - Loops
 
@@ -391,7 +392,7 @@ scope set via `MS_TODO_ACCESS_TOKEN` + `MS_TODO_REFRESH_TOKEN` env
 vars; the rotate-and-persist loop at `src/token-manager.ts:100-162`
 is a clean reference for the upstream contribution. (Not drop-in
 usable as-is because scope is hardcoded to To-Do and the client
-shape requires a secret — but the auth-code path against
+shape requires a secret, but the auth-code path against
 `/{tenant}/oauth2/v2.0/token` is the pattern softeria's contribution
 should follow.) Validates that "refresh-token-in single-user" is
 implementable; we're not inventing it, we're generalizing it.
@@ -460,8 +461,8 @@ agents:
 
 Both keys are required. Mismatch (ACL says yes, no `account:` selected)
 is silent until first MS tool call, where broker returns
-`ACCOUNT_NOT_FOUND`. **`doctor` probe catches it at config time** —
-adds `microsoft:agent-ACL-and-selector-aligned` check.
+`ACCOUNT_NOT_FOUND`. **`doctor` probe catches it at config time**: it
+adds the `microsoft:agent-ACL-and-selector-aligned` check.
 
 ### 6.3 Cascade
 
@@ -482,17 +483,17 @@ shape as `google_workspace:`):
 Google has `core / extended / complete` tiers. We chose **not to
 mirror** because:
 
-- Tiers exist because **scopes are fixed at consent** — upgrading
+- Tiers exist because **scopes are fixed at consent**: upgrading
   means re-running the loopback flow. For personal use this friction
   is real but rare.
 - Mapping to the four vision outcomes:
   - **Standing team that knows you**: right granularity is "is MS
-    enabled for this agent at all", not "which slice" — handled by
+    enabled for this agent at all", not "which slice", handled by
     `enabled_for[]`
   - **Hold the leash**: in personal use the leash you want is the
     per-write approval card (§8), not the scope set. There's no
     adversary inside your own team.
-  - **Always available**: tiers actively harm — "sorry, this agent
+  - **Always available**: tiers actively harm. "Sorry, this agent
     doesn't have OneDrive write, please re-consent" mid-task is
     exactly the friction Outcome 4 forbids.
 - The **defaults test** in `reference/principles.md`: a working
@@ -537,9 +538,9 @@ yesterday's meeting"]
 [clerk reports back: "Updated Q3-Strategy.docx with the meeting notes."]
 ```
 
-**No new authoring code is needed in switchroom** — the skills already
+**No new authoring code is needed in switchroom.** The skills already
 ship in the skills pool, the agent invokes them via Claude Code's
-native skill-invocation flow, OneDrive is just a delivery mechanism.
+native skill-invocation flow, and OneDrive is just a delivery mechanism.
 
 ## 8. Approval-kernel write cards
 
@@ -549,7 +550,7 @@ Mirror RFC E's PreToolUse-hook pattern (Path A Cut 2):
   (similar to the existing Google write-approval hook).
 - Triggers on softeria's write tool names:
   - `upload-file-content`, `create-upload-session` (OneDrive writes)
-  - `send-mail` (deferred — `Mail.Send` not in v1 scope)
+  - `send-mail` (deferred; `Mail.Send` not in v1 scope)
   - `create-event`, `update-event`, `delete-event` (calendar writes)
   - `update-message`, `delete-message` (mail edits)
 - Card metadata:
@@ -573,11 +574,11 @@ Mirror RFC E's PreToolUse-hook pattern (Path A Cut 2):
 link + agent rationale). The operator must trust the agent's
 rationale + click through to OneDrive to see the actual diff. v1.5
 ships structural diff via skills `--diff` mode and brings attestation
-to parity with Google's RFC E. Don't market v1 as full parity — it
+to parity with Google's RFC E. Don't market v1 as full parity. It
 isn't. UAT measures whether the weak-metadata UX is good enough in
 practice for personal-use; if it isn't, v1.5 follows immediately.
 
-**Reads are standing grants** (no per-call approval) — same as Google.
+**Reads are standing grants** (no per-call approval), same as Google.
 The grant is implicit in `enabled_for[]`.
 
 ## 9. Doctor probes
@@ -608,7 +609,7 @@ Add to `switchroom doctor`:
 ## 10. Implementation plan
 
 **5 PRs total**, sized to keep each reviewable. The original 3-PR
-draft was 30-50% under realistic size — Google's `drive-mcp-launcher.ts`
+draft was 30-50% under realistic size. Google's `drive-mcp-launcher.ts`
 is 919 LOC alone, `auth-google.ts` is 1,282 LOC. Sizing here is
 calibrated against shipped equivalents.
 
@@ -658,7 +659,7 @@ calibrated against shipped equivalents.
 - `profiles/_shared/hooks/microsoft-write-approval.mjs.hbs` — hook
   template intercepting softeria write tools
 - Hook → kernel IPC verb (extends existing approval card builders)
-- Weak metadata only v1 (byte delta + size + link + rationale —
+- Weak metadata only v1 (byte delta + size + link + rationale;
   §8 explicitly scopes this)
 - Tests: hook intercept; card metadata extraction; deny → block
   short-circuit
@@ -700,7 +701,7 @@ shipped LOC counts):
 - **Reviewer rounds** — assume ~30 min each PR
 
 Total: **~300 agent minutes** end-to-end (~5 hours). Roughly double
-the original 140-min estimate — sized honestly so review and UAT
+the original 140-min estimate, sized honestly so review and UAT
 have room.
 
 ## 12. Out of scope (v1)
@@ -794,7 +795,7 @@ Material consulted during this RFC:
 - MSAL-Node docs: `caching.md`, `msal-node-migration`,
   `scenario-desktop-acquire-token-interactive`
 - MS Learn: `reply-url`, `id-tokens`, `publisher-verification-overview`
-- Family-calendar app (calendar-app/) — Microsoft auth precedent
+- Family-calendar app (calendar-app/): Microsoft auth precedent
   (raw-fetch, common-tenant, encrypted token storage in Postgres)
 - Existing switchroom RFCs: gdrive-mcp.md, google-workspace-
   generalization.md, doc-connection-completion.md, auth-broker.md

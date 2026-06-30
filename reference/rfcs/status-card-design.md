@@ -1,11 +1,12 @@
 ---
-artefact: Telegram progress card
-serves: jobs/know-what-my-agent-is-doing.md
+artifact: Telegram progress card
+serves: know-what-my-agent-is-doing
+advances-outcome: hold-the-leash
 status: archived — superseded
 supersededBy: conversational-pacing.md
 ---
 
-# Status card design — archived
+# Status card design (archived)
 
 The pinned two-zone progress card was retired in #1122 (PR3,
 2026-05-12) in favour of conversational pacing + a silence-poke

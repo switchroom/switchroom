@@ -1,5 +1,5 @@
 ---
-artefact: fleet deploy reliability
+artifact: fleet deploy reliability
 backs: always-available
 relates: reference/rfcs/host-control-daemon.md
 ---
@@ -19,7 +19,7 @@ source.
 **Root cause (2026-06-23 outage, 5 h fleet-down):** a v0.15.56 upgrade
 ran inside a helper container (`HOME=/state/agent/home`,
 `SWITCHROOM_HOST_HOME` unset). The compose generator fell back to
-`homedir()` — the *container* HOME — and baked that path as the leading
+`homedir()`, the *container* HOME, and baked that path as the leading
 segment of every host bind-mount source. Docker's behaviour when a `:ro`
 bind source doesn't exist: **silently auto-creates it as a root-owned
 directory**. Consequences:
@@ -42,7 +42,7 @@ sailed through it.
 **The general class:** any deploy context that resolves the host home
 from the container's ambient `HOME` (or any other in-container
 filesystem root) and bakes it into compose bind-mount sources. Docker
-never hard-fails on a missing `:ro` source — it auto-creates, and
+never hard-fails on a missing `:ro` source. It auto-creates, and
 the auto-created artifact is always a root-owned directory, never the
 file or populated directory the container expected.
 
@@ -67,15 +67,15 @@ writable or leaves `SWITCHROOM_HOST_HOME` unset.
 
 `src/agents/compose.ts:assertPlausibleHostHome` is called at compose
 **generation time** with the `homePrefix` that will be baked into every
-bind-mount source. It maintains `CONTAINER_ROOT_PREFIXES` — a list of
+bind-mount source. It maintains `CONTAINER_ROOT_PREFIXES`, a list of
 in-container filesystem roots (`/state`, `/run`, `/proc`, `/sys`,
-`/dev`, `/tmp`, `/host-home`) — and throws on any prefix that is or
+`/dev`, `/tmp`, `/host-home`), and throws on any prefix that is or
 starts with one of those, AND on any non-absolute path. The only
 pass-through besides a real host path is the legacy `${HOME}` literal
 (resolved by Docker at `up` time on the host, never by the generator).
 
 This generalises the old `/host-home`-only guard to the whole class.
-It fires before any file is written — the fleet is never poisoned.
+It fires before any file is written, so the fleet is never poisoned.
 
 ### 2. Fail-closed resolver — `resolveHostHomeForCompose`
 
@@ -86,12 +86,12 @@ strictly fail-closed:
 1. `SWITCHROOM_HOST_HOME` set and non-empty → validate via
    `assertPlausibleHostHome`, use it. (The blessed path.)
 2. Running inside a container + `SWITCHROOM_HOST_HOME` unset → **THROW**.
-   Never falls back to `homedir()` (the container HOME — the poison).
+   Never falls back to `homedir()` (the container HOME, the poison).
 3. Running on the host shell + `SWITCHROOM_HOST_HOME` unset → `homedir()`.
    Safe because `homedir()` on the host shell IS the real operator home.
 
 The same resolver governs the mount-source seeder in `apply.ts` that
-creates any missing host-side bind-source directories — so that path
+creates any missing host-side bind-source directories, so that path
 can't silently create them under a container root either.
 
 ### 3. Sudo self-elevation env preservation
@@ -101,7 +101,7 @@ truth for env vars passed across the `sudo` boundary. It explicitly
 includes `SWITCHROOM_HOST_HOME` (and `SWITCHROOM_HOSTD_CONTEXT`).
 Without this, the blessed value set by the caller would be stripped by
 sudo's secure environment and the resolver would fall through to
-`homedir()` — which, under sudo, is `/root`, not the operator home.
+`homedir()`, which under sudo is `/root`, not the operator home.
 
 ### 4. Pre-flight bind-source validator — `preflight-mounts.ts`
 
@@ -110,7 +110,7 @@ compose file's host bind sources and `stat`s each one before `docker
 compose up` is called. A source that is:
 
 - **missing** → abort (would be auto-created by Docker)
-- **wrong type** (a file where a dir is expected, or vice versa — the
+- **wrong type** (a file where a dir is expected, or vice versa, the
   exact signature of a prior auto-dir poisoning) → abort
 
 This is the last-resort catch: even if the generation guard and
@@ -148,7 +148,7 @@ docker run --rm \
 ```
 
 bypasses all of them: the container has no `SWITCHROOM_HOST_HOME`,
-`isContainerContext()` returns true, and the CLI throws — but only if
+`isContainerContext()` returns true, and the CLI throws, but only if
 the script is using a version of switchroom that has this fix. A
 pre-fix image would silently poison the host.
 

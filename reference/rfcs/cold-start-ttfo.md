@@ -1,16 +1,17 @@
 ---
-artefact: cold-start TTFO — minimising time to first outbound after restart
-serves: jobs/survive-reboots-and-real-life.md
+artifact: cold-start TTFO — minimising time to first outbound after restart
+serves: survive-reboots-and-real-life
+advances-outcome: always-available
 status: draft v1
 ---
 
 # RFC — Cold-start TTFO
 
-> Status: draft v1 — scoping cold-start latency optimization. Companion to `reference/vision.md` (always-on specialist exec-assistants) and the wedge-cluster JTBD ("agent feels continuous across restarts").
+> Status: draft v1. Scoping cold-start latency optimization. Companion to `reference/vision.md` (always-on specialist exec-assistants) and the wedge-cluster JTBD ("agent feels continuous across restarts").
 
 ## Why this RFC
 
-The vision is **always-on specialist exec-assistants** — agents that feel continuous, present, immediate. The wedge cluster of 2026-05-18→20 closed the 5-minute *correctness* failure mode (stranded inbound, silence-poke fallback firing). It did not close the *experience* failure mode: every agent restart imposes a multi-second blank window between the user's first message after restart and the model's first reply (Time To First Outbound — TTFO).
+The vision is **always-on specialist exec-assistants**: agents that feel continuous, present, immediate. The wedge cluster of 2026-05-18→20 closed the 5-minute *correctness* failure mode (stranded inbound, silence-poke fallback firing). It did not close the *experience* failure mode: every agent restart imposes a multi-second blank window between the user's first message after restart and the model's first reply (Time To First Outbound, TTFO).
 
 ### What we measured (2026-05-21 baseline)
 
@@ -37,7 +38,7 @@ The "always-on" experience erodes most visibly during restart windows. Operators
 The cold-start TTFO has two layers:
 
 1. **Pre-claude shell work in `start.sh`** (~2s). Three serialized `timeout` calls before `exec claude`: handoff summarizer, briefing assembler, workspace render. Switchroom-controllable.
-2. **Claude-side cold prefix-cache** (~3-10s). Anthropic's prompt cache is warm only after the first turn. On a fresh session with a 14-18KB system-prompt prefix, the first turn pays full processing cost. Not directly switchroom-controllable — but indirectly addressable by changing what gets sent, when, and how.
+2. **Claude-side cold prefix-cache** (~3-10s). Anthropic's prompt cache is warm only after the first turn. On a fresh session with a 14-18KB system-prompt prefix, the first turn pays full processing cost. Not directly switchroom-controllable, but indirectly addressable by changing what gets sent, when, and how.
 
 ## Architectural options
 
@@ -45,16 +46,16 @@ Four options ranked by blast radius. Each addresses layer 2 (the dominant cost);
 
 ### Option A — Prefix-cache warmup turn (lowest blast radius)
 
-On bridge-up after restart, the gateway synthesizes a warmup `InboundMessage` (`text: "__WARMUP_PING__"`, `meta.source: "warmup"`) and delivers it to the just-registered bridge. Claude processes the warmup — paying the full cold-cache cost — and responds with `NO_REPLY` (existing sentinel; gateway already suppresses output). When the real user message arrives next, the prefix cache is warm.
+On bridge-up after restart, the gateway synthesizes a warmup `InboundMessage` (`text: "__WARMUP_PING__"`, `meta.source: "warmup"`) and delivers it to the just-registered bridge. Claude processes the warmup, paying the full cold-cache cost, and responds with `NO_REPLY` (existing sentinel; gateway already suppresses output). When the real user message arrives next, the prefix cache is warm.
 
 **Pros**
 - Single point of change (gateway `onClientRegistered`).
 - Reuses existing `NO_REPLY` suppression (gateway.ts:5900).
-- **Reuses cron's `meta.source` envelope** (`src/scheduler/dispatch.ts:174-199`). Tag the synthesized inbound with `meta.source: "warmup"` and the bridge / hindsight already know how to render and exclude non-user sources — same contract cron rides today. No new envelope field, no new bridge protocol.
+- **Reuses cron's `meta.source` envelope** (`src/scheduler/dispatch.ts:174-199`). Tag the synthesized inbound with `meta.source: "warmup"` and the bridge / hindsight already know how to render and exclude non-user sources, the same contract cron rides today. No new envelope field, no new bridge protocol.
 - Quota cost: ~1 OAuth turn per restart. Negligible (typical fleet sees < 10 restarts/day).
 - Naturally debounceable.
 
-**Cons** — confirmed by walking the codebase:
+**Cons**, confirmed by walking the codebase:
 - **Progress card UX cost**: the warmup inbound triggers `handleInbound`'s 👀 reaction emission + stream-reply-handler's progress card. The 👀 reaction lands on a synthetic message and the card briefly appears in the agent's primary chat. NO_REPLY suppression unpins the card on turn end but the flash is visible.
 - The cron-source path already handles parts of this (cron turns are rendered with `<channel source="cron">` framing). Reusing `meta.source="warmup"` collapses much of the UX-suppression work into "extend cron's handling for warmup" rather than new plumbing.
 - Hindsight memory may capture the warmup turn; tag for memory-exclusion via the same source-discriminator path cron uses.
@@ -72,7 +73,7 @@ Today every gateway restart (`/restart`, `/update apply`, container recreate) re
 **Cons**
 - Container architecture change. Today `start.sh` forks gateway + autoaccept + agent-scheduler as siblings then `exec`s into tmux/claude. Decoupling means either (a) two containers per agent (claude + gateway-sidecar), or (b) one container with a stricter PID 1 supervisor.
 - MCP reconnect semantics. Claude Code's MCP client expects stable stdio; rebinding a stdio socket on the fly isn't a documented feature.
-- Survival across `/update apply` is hard because the agent image itself changes — claude inside the old image would still need to be restarted to pick up new bundles. Decoupling buys us the gateway-only restart cases, not image-bump cases.
+- Survival across `/update apply` is hard because the agent image itself changes; claude inside the old image would still need to be restarted to pick up new bundles. Decoupling buys us the gateway-only restart cases, not image-bump cases.
 
 **Net**: 4-6 PR architectural change. Estimated TTFO win: near-100% elimination of gateway-only-restart cold-starts (probably 60-80% of operator-initiated restarts). Image bumps still pay full cost.
 
@@ -90,7 +91,7 @@ Move all stable workspace content (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOO
 - The handoff briefing (LLM-generated session summary from the Stop hook) still needs to land. Today it's appended after the workspace block in `--append-system-prompt`. If we drop that path, briefing needs a new injection point (UserPromptSubmit hook is the natural one).
 - Behavior measurement requires holding all 9 agents constant and watching for regressions in agent quality. Not pure win.
 
-**Net**: 2-PR change. TTFO win uncertain — depends on whether Claude Code caches CLAUDE.md better than we cache `--append-system-prompt`. Worth measuring first.
+**Net**: 2-PR change. TTFO win uncertain; depends on whether Claude Code caches CLAUDE.md better than we cache `--append-system-prompt`. Worth measuring first.
 
 ### Option D — Warm pool of pre-spawned claude processes
 
@@ -102,14 +103,14 @@ Maintain N hot-standby claude processes per agent slot. On restart, swap to a wa
 **Cons**
 - RAM: each claude instance is ~500MB+ resident. Doubling instances doubles fleet RAM.
 - Session slot consumption: Anthropic per-account session slots are finite. A pool that exceeds the OAuth quota fails immediately.
-- Pool warming requires its own cold-start somewhere — we're moving cost, not eliminating it. The pool member's prefix-cache is cold until used.
+- Pool warming requires its own cold-start somewhere; we're moving cost, not eliminating it. The pool member's prefix-cache is cold until used.
 - Complex lifecycle: when does a pool member retire? Recycle on schedule? On staleness?
 
 **Net**: 5+ PR architectural change with ongoing infra cost. Likely not worth it for switchroom's scale.
 
 ## Recommendations
 
-1. **Ship the measurement infrastructure**. Without per-line timestamps on `gateway-supervisor.log` (or equivalent OTel/PostHog spans), every optimization claim is unverifiable. Recommend either (a) in-gateway stderr monkey-patch that prepends `[YYYY-MM-DDTHH:MM:SS.mmm]` to every write, OR (b) an external host-side capture script that adds timestamps as it tails the per-agent log. Option (a) is more robust; (b) is faster to ship. **This can ship in parallel to an Option-A spike — it doesn't gate other work.**
+1. **Ship the measurement infrastructure**. Without per-line timestamps on `gateway-supervisor.log` (or equivalent OTel/PostHog spans), every optimization claim is unverifiable. Recommend either (a) in-gateway stderr monkey-patch that prepends `[YYYY-MM-DDTHH:MM:SS.mmm]` to every write, OR (b) an external host-side capture script that adds timestamps as it tails the per-agent log. Option (a) is more robust; (b) is faster to ship. **This can ship in parallel to an Option-A spike; it doesn't gate other work.**
 
 2. **Pursue Option A (warmup turn) as the architectural fix**. By reusing cron's `meta.source` envelope (per the Pros above), this is closer to a 1-PR change than originally scoped. The OAuth quota cost is trivial. Lowest blast radius among the four options.
 
@@ -123,7 +124,7 @@ Maintain N hot-standby claude processes per agent slot. On restart, swap to a wa
 
 These can ship without an RFC if measurement supports them:
 
-- **`hotReloadStable: true` as default**. Moves the ~12KB workspace content out of `--append-system-prompt` and into a per-turn UserPromptSubmit hook. Shrinks cold prefix. Schema's own description (`src/config/schema.ts:485`) warns of "5-10% per-turn latency/spend" — that's a steady-state cost, not a correctness risk. Ship measured-on-canary (test-harness for 24h with `runtime-metrics.jsonl` comparison) — blind fleet-wide is harsher than the risk warrants given the kill-switch is a 1-line config flip and 9 production agents would surface a regression within hours.
+- **`hotReloadStable: true` as default**. Moves the ~12KB workspace content out of `--append-system-prompt` and into a per-turn UserPromptSubmit hook. Shrinks cold prefix. Schema's own description (`src/config/schema.ts:485`) warns of "5-10% per-turn latency/spend"; that's a steady-state cost, not a correctness risk. Ship measured-on-canary (test-harness for 24h with `runtime-metrics.jsonl` comparison). Blind fleet-wide is harsher than the risk warrants given the kill-switch is a 1-line config flip and 9 production agents would surface a regression within hours.
 - **Parallelize `start.sh` handoff/briefing** with `&` and a final `wait`. Saves wall-clock if both calls fire (rare in production). ~0.5s expected win.
 - **Pre-warm `workspace render --stable` output** at scaffold time. Cache the rendered bytes to a file; `start.sh` just `cat`s. -0.9s wall-clock.
 
@@ -132,13 +133,13 @@ These can ship without an RFC if measurement supports them:
 1. Anthropic prefix-cache TTL. If it's < 60s, a warmup turn at restart-time may already be cold by the time the user messages. Need to measure or contact Anthropic for the documented value.
 2. Whether `meta.source: "warmup"` should be a first-class envelope field or piggyback on existing `meta: Record<string, string>`. Affects scheduler / autoaccept / mcp-bridge protocol contracts.
 3. Whether the warmup turn should be tagged for Hindsight exclusion (recommend yes) or written into the transcript as a system event (a la cron).
-4. Multi-bridge-reconnect debounce window — gymbro churns ~6 reconnects per UAT cycle. Without debounce, every cycle would warm. With aggressive debounce (e.g., 5 min), a real restart's warmup gets correctly emitted. Recommend cooldown anchored on the most-recent OAuth API call timestamp, not on the warmup itself.
-5. **Where does warmup dedup live?** Cron's fold-in (Phase 4, #890-#893) discovered that `meta.source`-tagged synthetic inbound interacts subtly with the per-agent scheduler's at-least-once boot replay (`SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN`). The dedup primitive there lives in `src/scheduler/dispatch.ts`'s scheduler-jsonl audit, not in the gateway. Should warmup dedup ride on the same audit log, or invent a separate cooldown store? Recommend riding the audit log — same observability, same disk format, one fewer concept to maintain.
+4. Multi-bridge-reconnect debounce window: gymbro churns ~6 reconnects per UAT cycle. Without debounce, every cycle would warm. With aggressive debounce (e.g., 5 min), a real restart's warmup gets correctly emitted. Recommend cooldown anchored on the most-recent OAuth API call timestamp, not on the warmup itself.
+5. **Where does warmup dedup live?** Cron's fold-in (Phase 4, #890-#893) discovered that `meta.source`-tagged synthetic inbound interacts subtly with the per-agent scheduler's at-least-once boot replay (`SWITCHROOM_AGENT_SCHEDULER_REPLAY_MIN`). The dedup primitive there lives in `src/scheduler/dispatch.ts`'s scheduler-jsonl audit, not in the gateway. Should warmup dedup ride on the same audit log, or invent a separate cooldown store? Recommend riding the audit log: same observability, same disk format, one fewer concept to maintain.
 
 ## Success criteria (post-implementation, future PR)
 
 - First-turn-after-restart TTFO falls from current 5-13s to **under 3s** for at least 80% of operator-initiated restarts.
-- No regression on warm-cache trivial UAT (currently 1.77s) — warmup must not slow steady-state.
+- No regression on warm-cache trivial UAT (currently 1.77s): warmup must not slow steady-state.
 - Quota burn under 1 extra turn per agent per day on the production fleet.
 - Progress-card UX: no visible flash in user chats during warmup (this is the plumbing cost).
 

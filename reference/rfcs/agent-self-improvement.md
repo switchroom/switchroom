@@ -1,6 +1,7 @@
 ---
-artefact: agents that improve themselves, on the leash
-serves: jobs/get-better-the-longer-they-run.md
+artifact: agents that improve themselves, on the leash
+serves: get-better-the-longer-they-run
+advances-outcome: standing-team
 status: Draft
 ---
 
@@ -96,10 +97,10 @@ not one:
    never again" path.
 2. **Recurring-work review — proactive, periodic, cadenced.** On a low cadence
    (not per-turn) a separate pass runs `reflect` over the agent's own Hindsight
-   experience memories — "what multi-step thing have I repeated by hand that no
+   experience memories: "what multi-step thing have I repeated by hand that no
    skill/cron covers?" A genuine, deduplicated hit (≈3–5×, checked against
    existing skills/crons, prefer-extend-over-create) becomes a **T3 proposal**
-   for a new skill or cron — never an auto-create. This is the "finds a path it
+   for a new skill or cron, never an auto-create. This is the "finds a path it
    will reuse" path.
 
 Same router and same guardrails downstream; different triggers and cadences
@@ -114,7 +115,7 @@ every turn.
     skills dir (per `skill-authoring-native`); validator hook + git =
     audit/rollback.
   - **T2 Propose, one-tap** — medium / shared-skill changes, **and any edit to
-    the agent's own guidance (`CLAUDE.md` / `SOUL.md`)** — because guidance
+    the agent's own guidance (`CLAUDE.md` / `SOUL.md`)** because guidance
     affects *every* turn, even a small guidance edit is proposed, never silent.
     Surfaced as a pending suggestion (Telegram one-tap; backing store = Linear
     issue or a small per-agent queue file).
@@ -139,7 +140,7 @@ backing.
 
 No new eval engine. Each skill carries `evals/evals.json` (a few test-case
 prompts). A **grader subagent** (`agents/grader.md`, runnable on a cheap
-model — this is the "small model call") checks assertions → pass/fail +
+model, this is the "small model call") checks assertions → pass/fail +
 evidence; `scripts/aggregate_benchmark.py` gives pass-rate + variance (mean ±
 stddev) vs baseline. **An edit lands only if its evals pass and don't
 regress baseline.** New skills ship a starter `evals.json` at creation.
@@ -170,7 +171,7 @@ Net: git + PR + the validator hook that already exists.
   case by the PR-as-gate decision already in `skill-authoring-native`.
 - Hermes (`github.com/NousResearch/hermes-agent` + `…-self-evolution`):
   forked post-turn `background_review` (restricted toolset, cadence-gated)
-  and GEPA trace-driven eval — the patterns behind the forked review and the
+  and GEPA trace-driven eval: the patterns behind the forked review and the
   per-skill eval gate.
 
 ## Bets & Risks
@@ -207,7 +208,7 @@ propose-only). Guidance, cron, and new-skill changes are never auto-applied.
       first slice.
 - [ ] Starting defaults: correction-gate threshold (2 vs 3), diff-size cap,
       max pending/auto-applies per day, **recurring-work review cadence** (every
-      ~N turns vs weekly) and its repeat bar (3 vs 5) — tuned by measuring on
+      ~N turns vs weekly) and its repeat bar (3 vs 5), tuned by measuring on
       `clerk` first.
 - [x] T2/T3 pending surface: **per-agent JSON-lines queue file** for the first
       slice (decided 2026-06-20); Telegram one-tap surfacing layered on next.

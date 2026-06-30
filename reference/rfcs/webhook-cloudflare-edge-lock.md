@@ -1,5 +1,5 @@
 ---
-artefact: Cloudflare-only edge lock for webhook ingest
+artifact: Cloudflare-only edge lock for webhook ingest
 backs: no-self-escalation
 status: Draft v1
 ---
@@ -21,16 +21,16 @@ by any other path don't carry it and are rejected `403`.
 
 This is Phase 2 of the Docker-native webhook work (Phase 1:
 `webhook-via-gateway-socket.md`). It is **defence in depth**, stacking
-on the two controls already in place — not replacing either:
+on the two controls already in place, not replacing either:
 
 1. **GitHub-IP WAF allowlist** at the Cloudflare edge (network origin).
 2. **Per-agent HMAC** (`X-Hub-Signature-256`) at the receiver (body
-   provenance — proves a secret-holder produced the body).
+   provenance: proves a secret-holder produced the body).
 
 The gap this closes: the HMAC proves *who signed the body*, not *which
 network path the request took*. If anyone learns the tunnel origin, or a
 co-located service is coerced into an SSRF against `localhost:8080`, the
-HMAC is the only thing standing — and for a public-repo webhook the
+HMAC is the only thing standing, and for a public-repo webhook the
 "secret" is only as private as GitHub's storage. The edge header proves
 "this request entered through our Cloudflare edge", which nothing else
 on the request can.
@@ -41,7 +41,7 @@ The receiver (`switchroom-web`) listens on `127.0.0.1:8080` and is
 fronted by a cloudflared tunnel. Cloudflare's WAF only admits GitHub's
 published IP ranges. But the receiver itself cannot tell a request that
 came *through* Cloudflare from one that arrived at the tunnel origin
-some other way — both look like loopback once cloudflared forwards them.
+some other way. Both look like loopback once cloudflared forwards them.
 A header that only Cloudflare can inject (because only Cloudflare's
 Transform Rule holds the secret) lets the receiver assert the network
 path.
@@ -54,7 +54,7 @@ The owner's ask, verbatim: *"Can we make it only work for cloudflare??"*
 
 A single endpoint-global value at `~/.switchroom/webhook-edge-secret`
 (mode `0600`, one line, trailing whitespace trimmed on read). It guards
-the whole receiver, not a single agent — the per-agent grain is already
+the whole receiver, not a single agent. The per-agent grain is already
 the HMAC. The same value is configured as the injected header value in
 the Cloudflare Transform Rule.
 
@@ -93,7 +93,7 @@ loads the edge secret only when required, passing `requireEdge` +
 
 If `requireEdge` is true but `edgeSecret` is `null` (file missing /
 empty / unreadable), **every** request is rejected `403`. A
-misconfigured lock must never silently fall open — the failure mode of a
+misconfigured lock must never silently fall open. The failure mode of a
 security control is "deny", not "allow".
 
 ### 3.4 Cloudflare Transform Rule
@@ -106,7 +106,7 @@ Modification rule:
 - **Set static header**: `X-Switchroom-Edge` = `<the secret>`.
 
 Cloudflare strips/overwrites any client-supplied `X-Switchroom-Edge` so
-a forged value from outside cannot survive the edge — the rule *sets*
+a forged value from outside cannot survive the edge. The rule *sets*
 (not appends) the header. The secret lives only in the Transform Rule
 config and the local file; it never appears in repo, compose, or agent
 state.
@@ -127,7 +127,7 @@ state.
 1. Write `~/.switchroom/webhook-edge-secret` (random value, `0600`).
 2. Add the Cloudflare Transform Rule with the same value.
 3. Flip `reggie`'s `webhook_require_edge: true`; `apply` (no agent
-   restart needed — receiver-side flag), restart the receiver.
+   restart needed, receiver-side flag), restart the receiver.
 4. Verify: a signed POST *through* `hooks.switchroom.ai` → `202`; a
    signed POST direct to `127.0.0.1:8080` (no edge header) → `403`.
 5. Green → leave on reggie; widen per-agent as desired.

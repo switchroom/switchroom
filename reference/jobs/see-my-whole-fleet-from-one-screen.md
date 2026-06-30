@@ -1,28 +1,29 @@
 ---
 job: see and manage my whole fleet from one operator screen
-outcome: The operator can open one management console and see every agent's live state, health, quota, history, sessions, memory, workspace, and approval/audit trail, run fleet ops (restart, config edits), and drive an agent with a turn from the console — without any secret reaching the client, without approvals ever leaving Telegram, and without the surface becoming the principal's source of truth or a separate conversation record (operator turns mirror into the agent's Telegram thread).
-stakes: An operator running a standing fleet 24/7 needs a place to glance across all of it at once — the chat is per-agent and per-topic, so a fleet-wide problem (a stuck agent, a quota wall, a drifted config, a failing memory backend) is invisible until a principal complains. Without a fleet view the operator debugs blind, one `docker exec` at a time. But a dashboard is also the easiest place to accidentally rebuild the retired progress card, leak a token, or grow a second approval path — so the screen earns its place only by staying an operator tool, never a principal one.
+outcome: The operator can open one management console and see every agent's live state, health, quota, history, sessions, memory, workspace, and approval/audit trail, run fleet ops (restart, config edits), and drive an agent with a turn from the console, without any secret reaching the client, without approvals ever leaving Telegram, and without the surface becoming the principal's source of truth or a separate conversation record (operator turns mirror into the agent's Telegram thread).
+stakes: An operator running a standing fleet 24/7 needs a place to glance across all of it at once. The chat is per-agent and per-topic, so a fleet-wide problem (a stuck agent, a quota wall, a drifted config, a failing memory backend) is invisible until a principal complains. Without a fleet view the operator debugs blind, one `docker exec` at a time. But a dashboard is also the easiest place to accidentally rebuild the retired progress card, leak a token, or grow a second approval path, so the screen earns its place only by staying an operator tool, never a principal one.
 serves: hold-the-leash
 invariants: [chat-is-the-single-source-of-truth, telegram-only, no-self-escalation, single-tenant, claude-native]
 ---
 
 # Job Spec: see and manage my whole fleet from one operator screen
 
-> A durable Job Spec. The *how* — the Hermes-Desktop adapter (REST + JSON-RPC
-> WebSocket) served from `switchroom-web`, the unmodified Hermes Desktop run
-> in remote mode, the `inject_inbound` mirror, the auth gate — lives in the
-> design artifact `reference/rfcs/fleet-dashboard.md` and the code under
-> `src/web/`. That implementation churns; this job does not.
+> A durable Job Spec. The *how* lives in the design artifact
+> `reference/rfcs/fleet-dashboard.md` and the code under `src/web/`: the
+> Hermes-Desktop adapter (REST + JSON-RPC WebSocket) served from
+> `switchroom-web`, the unmodified Hermes Desktop run in remote mode, the
+> `inject_inbound` mirror, the auth gate. That implementation churns; this
+> job does not.
 
-## Who this is for — read this first
+## Who this is for, read this first
 
 Switchroom has **two people** (`vision.md`): the **principal**, who texts an
-agent and never sees a server; and the **operator**, who stands the fleet up
+agent and never sees a server, and the **operator**, who stands the fleet up
 and keeps it running. This job belongs to the **operator only**.
 
 The principal's "what is my agent doing" job is
 [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md), and it is
-answered **in the chat**, by the model talking — never by a dashboard. The
+answered **in the chat**, by the model talking, never by a dashboard. The
 quota job is [`track-plan-quota-live`](track-plan-quota-live.md), whose title
 is literally "*without a dashboard*" because the principal should never have
 to stop and open one. This fleet screen does not, and must never, become the
@@ -38,8 +39,8 @@ Telegram topic, which is exactly right for the principal but wrong for the
 operator who needs to know, at a glance: which agents are up, which are
 working, which are wedged, who's near a quota wall, whose memory backend is
 sick, whose config drifted, what's pending approval across the whole fleet,
-and what each has been doing lately. Today that means SSH + `docker exec` +
-grepping logs, one agent at a time. The job is to give the operator one
+and what each has been doing lately. Today that means SSH plus `docker exec`
+plus grepping logs, one agent at a time. The job is to give the operator one
 screen that aggregates all of it, lets them act on the fleet (restart, edit
 config), and never leaks a secret or quietly grows into a second principal
 channel or a second approval path.
@@ -51,20 +52,20 @@ channel or a second approval path.
 - One screen lists every agent with live status (up / working / idle /
   recovering / down), and the operator can drill into any one.
 - Per-agent: auth-slot + quota health (active slot, % used, reset window,
-  expiry) as **metadata only** — never a token, never `credentials.json`.
+  expiry) as **metadata only**, never a token, never `credentials.json`.
 - Per-agent history, sessions (handoff vs continue vs cold, plus
   wake-audit/recovery state), workspace files, and memory are browsable
   read-only for debugging.
 - The approval/grant trail is visible as a **read-only audit feed** across
-  the fleet, plus what's currently pending — so the operator can see the
+  the fleet, plus what's currently pending, so the operator can see the
   leash state at a glance.
-- Fleet ops the operator already does from the CLI — restart, and operator
-  config edits — are available from the screen, routed through the same
+- Fleet ops the operator already does from the CLI (restart, and operator
+  config edits) are available from the screen, routed through the same
   operator-authored, hostd/CLI-enforced paths, never a new privileged
   backdoor.
 - The operator can send a turn to one of their own agents from the console,
   and that turn plus the agent's reply **mirror into the agent's Telegram
-  thread** — the console is another way *in*, never a separate conversation
+  thread**. The console is another way *in*, never a separate conversation
   the Telegram thread can't see. The turn rides the same synthesized-inbound
   path as cron, landing in the one agent session.
 - Off by default, binds loopback by default, refuses to serve
@@ -75,9 +76,9 @@ channel or a second approval path.
   memory) is treated as untrusted and escaped; the file browser is jailed to
   the agent workspace and traversal-safe.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
-- A live, pinned, parallel **progress mirror** of a turn — a web re-creation
+- A live, pinned, parallel **progress mirror** of a turn, a web re-creation
   of the retired #1122 card. The operator may review what an agent *did*
   from durable artifacts (history, audit, sessions); they do not get a live
   blow-by-blow surface that runs beside the conversation and substitutes for
@@ -99,7 +100,7 @@ channel or a second approval path.
 - Any secret reaching the browser, an API response, or a log
   (`credentials.json`, vault values, OAuth/bot tokens).
 - A mutating path that lets the web grant access the operator's config
-  didn't already authorize — a self-escalation backdoor around the cascade.
+  didn't already authorize, a self-escalation backdoor around the cascade.
 - A file browser that can serve arbitrary host paths, or unescaped content
   that lets untrusted message/tool/file text run as script.
 - A service that disappears on `switchroom apply` because it was hand-edited
@@ -142,28 +143,28 @@ principal's chat jobs). Pin:
 - **Done when:** the operator can see and manage the whole fleet from one
   screen, can debug any agent's history/sessions/memory/files/audit
   read-only, sees quota and leash state at a glance, runs the fleet ops they
-  already had on the CLI — and the screen leaks no secret, grows no approval
+  already had on the CLI. And the screen leaks no secret, grows no approval
   or chat path, and never becomes a principal surface or a live parallel
   progress mirror.
 
 ## Production-readiness
 
 - *Compliance:* no Anthropic API/SDK import, no token read/forward/log, no
-  inference proxying — cross-checked against `claude-native` and
+  inference proxying. Cross-checked against `claude-native` and
   `no-self-escalation` (`access-model.md`).
 - *Exposure:* loopback default; non-loopback requires auth; secrets never
   egress; untrusted content escaped; file access jailed.
 - *Boundary:* this surface stays operator-only and read-mostly. The two
-  principal-facing jobs it could cannibalise —
+  principal-facing jobs it could cannibalise,
   [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) and
-  [`track-plan-quota-live`](track-plan-quota-live.md) — remain answered in
+  [`track-plan-quota-live`](track-plan-quota-live.md), remain answered in
   the chat. If the dashboard starts being where a principal goes, this job
   has failed even if every feature works.
 
 ---
 
 > **Implementation:** `reference/rfcs/fleet-dashboard.md` (the design
-> artifact, `serves:` this job) — the Hermes-Desktop adapter served from
+> artifact, `serves:` this job): the Hermes-Desktop adapter served from
 > `src/web/` (`switchroom-web`), with unmodified Hermes Desktop run in remote
 > mode as the client. `reference/invariants.md` records why the admin console
 > is out of `telegram-only`'s scope (it governs principal channels, not admin

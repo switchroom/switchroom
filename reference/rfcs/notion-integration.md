@@ -1,6 +1,7 @@
 ---
-artefact: Notion integration
-serves: jobs/act-in-my-tools-with-an-identity.md
+artifact: Notion integration
+serves: act-in-my-tools-with-an-identity
+advances-outcome: always-available
 status: Draft
 ---
 
@@ -28,14 +29,14 @@ level.
 - **Token storage**: vault key `notion/integration-token`. The
   vault-broker mints short-lived per-agent grants the same way it does
   for any other vault secret. There is **no auth-broker MSAL
-  equivalent** — Notion tokens don't rotate.
+  equivalent**: Notion tokens don't rotate.
 - **Per-agent grant**: two-key model that *parallels* m365/gdrive but
   isn't identical because Notion has no per-account concept (one
   integration = one workspace). The two keys are: (1) operator-set
   ACL on the vault grant (which agents can fetch the token),
   (2) per-agent `notion_workspace.databases[]` YAML allowlist.
 - **Top-level config key**: `notion_workspace:` (mirrors
-  `google_workspace:` and `microsoft_workspace:` — consistency over
+  `google_workspace:` and `microsoft_workspace:`, consistency over
   novelty; no nested `integrations.*` namespace v1).
 - **Friendly names**: operator-level config maps `essays → <uuid>`
   once; per-agent grants reference the friendly name. Agents never
@@ -50,7 +51,7 @@ level.
   their API-call cost. See §7.
 
 This RFC explicitly *diverges* from the original task brief on two
-points (§13.1) — it drops the per-agent `scopes: [read, write]`
+points (§13.1): it drops the per-agent `scopes: [read, write]`
 field in favour of consistency with m365's "no scope tiering v1"
 call (§6.4), and re-frames the per-agent grant under
 `notion_workspace` rather than `integrations.notion`. Rate limiting
@@ -105,7 +106,7 @@ The launcher (`src/cli/notion-mcp-launcher.ts`) is responsible for:
 4. Heartbeat file at `/tmp/notion-launcher-<agent>.heartbeat.json` for
    the doctor probe (mirrors m365's pattern, PR #1888).
 
-Unlike m365, the launcher does **not** run a refresh loop — there is
+Unlike m365, the launcher does **not** run a refresh loop. There is
 no token expiry. The launcher process is single-purpose: vault fetch
 → env inject → exec MCP.
 
@@ -117,11 +118,11 @@ The operator creates an internal integration in Notion's settings:
 
 1. Settings → **Connections** → **Develop or manage integrations** →
    **New integration**.
-2. Name: `switchroom` (or whatever the operator wants — visible only
+2. Name: `switchroom` (or whatever the operator wants, visible only
    to the workspace owner).
 3. Type: **Internal**. Associated workspace: the operator's primary
    workspace.
-4. Capabilities — recommended starting set:
+4. Capabilities, recommended starting set:
    - Read content
    - Update content
    - Insert content
@@ -136,28 +137,28 @@ The operator creates an internal integration in Notion's settings:
 After registration, the operator goes back to each Notion page /
 database they want any switchroom agent to touch and **shares it with
 the `switchroom` integration** (top-right ⋯ → Connections → add
-`switchroom`). This is Notion's *upstream* ACL — the integration
+`switchroom`). This is Notion's *upstream* ACL: the integration
 literally cannot see pages that weren't shared with it, regardless of
 what switchroom config says.
 
-**Bootstrap order — this matters**:
+**Bootstrap order, this matters**:
 
 1. Create integration (step 1–4 above).
 2. Vault put the token (step 6).
 3. Share DBs/pages with the integration in Notion's UI.
 4. Run `switchroom notion list-dbs` to print a ready-to-paste
    YAML block of `friendly-name → uuid` mappings (PR 4). This needs
-   steps 2 + 3 done first — the CLI fetches the integration's
+   steps 2 + 3 done first: the CLI fetches the integration's
    visible-DB list from Notion's API.
 5. Paste that block into `switchroom.yaml` under `notion_workspace:
    databases:`, edit friendly names as desired.
 6. Add `notion_workspace: {}` (or a `databases: [...]` filter) to
    each agent that should get Notion access.
-7. `switchroom apply` — config validation cross-checks DB
+7. `switchroom apply`: config validation cross-checks DB
    references, vault ACL alignment (§6.3), and writes the scaffold.
 
-If the operator skips step 4 they'll be left typing UUIDs by hand —
-the CLI verb in PR 4 exists specifically to make this painless.
+If the operator skips step 4 they'll be left typing UUIDs by hand.
+The CLI verb in PR 4 exists specifically to make this painless.
 
 ### 4.2 Switchroom-side ACL (defence in depth)
 
@@ -170,10 +171,10 @@ call if the resolved DB UUID isn't in the agent's allowlist.
 
 Both boundaries matter:
 - The upstream share-list is **what the operator manages via Notion's
-  UI** — natural place for "this DB is brand new, hasn't been wired
+  UI**, natural place for "this DB is brand new, hasn't been wired
   to anything yet".
 - The switchroom allowlist is **what the operator manages via
-  `switchroom.yaml`** — natural place for "this agent's role is
+  `switchroom.yaml`**, natural place for "this agent's role is
   narrower than the integration".
 
 ### 4.3 No OAuth, no refresh
@@ -181,7 +182,7 @@ Both boundaries matter:
 Notion supports an OAuth-public-integration flow for vendors building
 multi-tenant apps. Switchroom is single-operator-per-deployment; the
 internal-integration model is materially simpler and the right
-default. Public OAuth is out of scope for v1 — flagged in §12.
+default. Public OAuth is out of scope for v1, flagged in §12.
 
 ## 5. Token storage, rotation, revocation
 
@@ -190,7 +191,7 @@ default. Public OAuth is out of scope for v1 — flagged in §12.
 - Vault key: `notion/integration-token` (plural-namespace contract:
   `<provider>/<artifact>`).
 - ACL: operator sets `--allow <agents>` (comma-separated) at `vault set` time.
-  The broker enforces this on every grant request — agents not in the
+  The broker enforces this on every grant request; agents not in the
   ACL get `E_BROKER_GRANT_DENIED`.
 - The launcher fetches via `vault_request_access` → ephemeral token →
   child env var. The token never lands on disk inside the agent
@@ -204,7 +205,7 @@ own):
 1. Notion Settings → Integrations → `switchroom` → **Refresh secret**.
 2. Copy new secret.
 3. `switchroom vault set notion/integration-token` (overwrite).
-   Re-state `--allow` to preserve the existing allowlist — `vault set`
+   Re-state `--allow` to preserve the existing allowlist, since `vault set`
    replaces the entire scope.
 4. Agents pick up the new token on their next vault grant — for the
    notion launcher specifically that means **launcher restart**.
@@ -251,7 +252,7 @@ notion_workspace:
 
 The top-level key is `notion_workspace:`, parallel to
 `google_workspace:` and `microsoft_workspace:`. No nested
-`integrations.*` namespace — consistency test wins over taxonomic
+`integrations.*` namespace, consistency test wins over taxonomic
 neatness.
 
 Validation (in `src/config/schema.ts`):
@@ -308,7 +309,7 @@ The allowlist gates Notion tool calls in three buckets:
    to remove the field entirely; explicit empty list = "no DBs at
    all" which is the same as not having Notion).
 3. Agent has `notion_workspace:` but the vault has no
-   `notion/integration-token` key — fail at `apply`, not at runtime.
+   `notion/integration-token` key, failing at `apply`, not at runtime.
 4. Agent has `notion_workspace:` but is **not in the vault ACL** for
    `notion/integration-token`. Surface the precise remediation:
    `switchroom vault set notion/integration-token --allow <full-list>` re-stating the allowlist including the missing agent. This
@@ -379,7 +380,7 @@ noisy operator-facing errors.
 **Ship the token bucket in v1**, in the launcher process:
 
 - **Where**: `src/cli/notion-mcp-launcher.ts`, inline. Not a separate
-  daemon, no shared store — one operator-bounded integration token
+  daemon, no shared store: one operator-bounded integration token
   ⇒ one launcher's bucket suffices *across agents* if the launcher
   is shared. But the launcher is per-agent (stdio bridge), so the
   bucket has to be global to the operator. Implementation: a tiny
@@ -401,8 +402,8 @@ noisy operator-facing errors.
   non-switchroom consumer.
 
 **v2 trigger** (after v1 ships): if even the global bucket isn't
-enough — e.g. operators with 5+ agents all heavily Notion-dependent
-— consider per-agent quotas inside the global bucket. Not blocking
+enough (e.g. operators with 5+ agents all heavily Notion-dependent),
+consider per-agent quotas inside the global bucket. Not blocking
 v1.
 
 **Doctor probe**: report bucket-saturation events from the last 24 h
@@ -471,7 +472,7 @@ launcher).
 
 - Cache shape: `Map<pageId|blockId, { dbId: string, expiresAt: number }>`.
 - Bounded: max 5000 entries, LRU eviction. Tunable via
-  `NOTION_LAUNCHER_CACHE_SIZE` env (not surfaced in YAML — internal).
+  `NOTION_LAUNCHER_CACHE_SIZE` env (not surfaced in YAML, internal).
 - TTL: 10 minutes. After expiry the resolver re-walks. Cheap enough
   given the bucket.
 - Cache is per-launcher-process (per-agent) — not shared across
@@ -522,7 +523,7 @@ Mitigation, **mandatory in v1**:
 
 Reads still go through Layer 1 (allowlist) but skip Layer 2
 (approval card). Consistent with gdrive/m365: read-only calls are
-below the approval bar. The allowlist still applies — a read
+below the approval bar. The allowlist still applies, and a read
 against a DB outside the allowlist is still rejected.
 
 ## 9. Doctor probes
@@ -555,7 +556,7 @@ shape):
    limit budget on every routine doctor run.
 
 Doctor must **skip** (not fail) when no agent has `notion_workspace:`
-configured — same posture as the existing gdrive/m365 probes.
+configured, same posture as the existing gdrive/m365 probes.
 
 ## 10. Implementation plan
 
@@ -584,7 +585,7 @@ its own reviewer pass; only the final PR enables auto-merge.
 
 - `src/cli/notion-mcp-launcher.ts`: vault-fetch → env-inject → spawn
   bridge. Heartbeat file. Crash-loop on vault failure (exit 1, no
-  retry — let docker restart-policy handle it). Wraps HTTP layer
+  retry, let docker restart-policy handle it). Wraps HTTP layer
   with rate-bucket client.
 - `src/vault/broker/notion-rate-bucket.ts`: token-bucket primitive
   (3 tokens, refill 3/sec, configurable via
@@ -606,7 +607,7 @@ its own reviewer pass; only the final PR enables auto-merge.
 ### PR 3 — Allowlist enforcement + approval hook + post-filter (~700 LOC)
 
 - `telegram-plugin/gateway/notion-write-approval.ts`: PreToolUse hook
-  with two layers — allowlist gate (all tools) + approval card
+  with two layers: allowlist gate (all tools) + approval card
   (writes). Uses the broker's rate-bucket for its own resolver calls.
 - `src/notion/db-resolver.ts`: per-tool DB resolution (§8.2). Tool-
   shape dispatch table; recursion-bounded ≤4 hops for block-parent
@@ -651,7 +652,7 @@ its own reviewer pass; only the final PR enables auto-merge.
   currently on clerk is **retired** in favour of this bundled skill
   (§13.2 covers the migration).
 - `telegram-plugin/uat/scenarios/jtbd-notion-readwrite-dm.test.ts`:
-  end-to-end UAT — operator DMs clerk asking to add an item to a
+  end-to-end UAT: operator DMs clerk asking to add an item to a
   DB, approval card appears, accept, DM confirmation lands.
 - `telegram-plugin/uat/scenarios/jtbd-notion-allowlist-deny-dm.test.ts`:
   carrie tries to write to a DB outside her allowlist, gets a clean
@@ -669,7 +670,7 @@ its own reviewer pass; only the final PR enables auto-merge.
 - Per-page (not per-DB) allowlist (when a page-level use case lands).
 - Public-integration OAuth flow (for multi-operator deployments).
 - Notion comment / mention threading into telegram (could be a
-  different RFC — same `inbox-zero` JTBD).
+  different RFC, same `inbox-zero` JTBD).
 
 ## 11. Effort estimate
 
@@ -692,7 +693,7 @@ Plus ~20–30 minutes total across the series for reviewer iteration.
 
 This is still materially cheaper than m365's 5-PR series (which
 clocked several hours because OAuth/MSAL is heavyweight). The
-integration-token model is still the dominant savings — but the
+integration-token model is still the dominant savings, but the
 per-DB allowlist + search post-filter are real engineering, not the
 free win the first draft suggested.
 
@@ -762,7 +763,7 @@ while agents are running?
 
 The MCP server returns 401 on the next call. The launcher process
 keeps running; only the *next* tool call fails. The agent surfaces
-the 401 to the operator naturally. No automatic recovery — operator
+the 401 to the operator naturally. No automatic recovery: the operator
 re-creates the integration, rotates the vault key, restarts the
 launchers. Documented as a v1 limitation.
 

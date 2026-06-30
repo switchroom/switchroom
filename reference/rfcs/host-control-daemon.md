@@ -27,7 +27,7 @@ on the unhappy path.
 
 This closes the long-tracked "true self-modification" gap from #1164:
 an in-container agent can stage a code change in its own worktree
-(`repos:` pattern), open a PR, get review, and then — after merge —
+(`repos:` pattern), open a PR, get review, and then (after merge)
 ask the daemon to deploy the change to the running fleet. Today step 4
 forces the operator out of Telegram and onto the host shell.
 
@@ -48,7 +48,7 @@ synchronous shell-outs** the gateway issues per session, all targeting
    `spawnSwitchroomDetached`, restart marker + sweep. The gateway
    runs *inside* the agent container in v0.7+, so the legacy
    cgroup-escape branch in `spawnSwitchroomDetached` (a v0.6 holdover)
-   never executes — the detached child is just `spawn(..., {detached:
+   never executes. The detached child is just `spawn(..., {detached:
    true}).unref()` and the agent container's restart policy
    (`--restart unless-stopped` on the compose service) cleans up if
    the parent dies. Workable today but couples agent-restart UX to
@@ -74,7 +74,7 @@ Two adjacent forces:
 
 - **The "self-restart from inside" pattern is fragile.** The gateway
   asking docker (via `switchroom agent restart`) to restart its own
-  container is a circular dependency — the parent issuing the
+  container is a circular dependency. The parent issuing the
   restart is killed by the restart it requested. Today's
   `spawnSwitchroomDetached` + restart-marker dance navigates around
   this, but it ties self-restart UX to the gateway's process tree.
@@ -149,13 +149,13 @@ distribution alongside the existing `switchroom-broker`,
 
 **Deployment shape: host-side docker container, outside the
 switchroom compose project.** Matches the v0.7+ docker-first
-ethos — every other component (broker, kernel, agent) is a docker
+ethos. Every other component (broker, kernel, agent) is a docker
 container; the daemon follows suit. The container runs with
 `network_mode: host` (so its UDS paths land on the operator's
 filesystem at `~/.switchroom/hostd/`), `--restart unless-stopped`,
 and the docker socket bind-mounted in. Operators bring it up
 either via a one-line `docker run` or a sibling
-`~/.switchroom/hostd/docker-compose.yml` file — **a separate
+`~/.switchroom/hostd/docker-compose.yml` file, **a separate
 compose project** from `switchroom` itself.
 
 **Why a separate compose project, not a sibling service in the
@@ -181,7 +181,7 @@ The daemon container declares those caps explicitly (see the
 **Same release surface as everything else.** The daemon ships
 from `ghcr.io/switchroom/switchroom-hostd:<tag>`, pulled on
 `switchroom update` like the other images. Operators don't manage
-yet-another-supervisor system — they `docker pull`, `docker run`,
+yet-another-supervisor system. They `docker pull`, `docker run`,
 `docker logs`, `docker stop`. No systemd dependency. No Linux-
 specific deployment paths. Works on macOS dev hosts the same way
 it works on production Linux. `switchroom hostd install` (Phase
@@ -228,7 +228,7 @@ Notes on the compose shape:
   absolute path.
 
 The daemon shells out to a `switchroom` CLI invocation inside its
-own container — the image bakes in the same bundle as the agent
+own container. The image bakes in the same bundle as the agent
 images (`/opt/switchroom/switchroom.js`). Mounting the docker
 socket lets the in-container CLI's `apply` / `update` paths reach
 the host's docker daemon. `--restart unless-stopped` means a daemon
@@ -311,7 +311,7 @@ error: "verb not in v1 allowlist"`. New verbs land via RFC + table
 addition.
 
 **Optional `reason` on gated verbs.** Every operator-gated verb accepts an
-optional `reason` (≤512 chars). It is NOT forwarded to the spawned CLI — it
+optional `reason` (≤512 chars). It is NOT forwarded to the spawned CLI. It
 exists solely to populate the Telegram approval card's `why:` line so the
 operator can decide in context. The card reads the caller-supplied `reason`
 arg only, never the tool's static schema description (#2469). Agents are
@@ -323,7 +323,7 @@ survives Claude Code's ~200-char `input_preview` truncation.
 (load-bearing): the long-running verbs (`update_apply` at 20–60s,
 `apply` at 5–20s) return `result: "started"` within ~50ms, then run
 detached. Without a query mechanism, the gateway can't tell whether a
-verb succeeded, failed fast, or is still running — a regression
+verb succeeded, failed fast, or is still running. That's a regression
 versus today's `notifyDetachedFailure` (`gateway.ts:7776`) which
 catches non-zero exits within ~5s. `get_status` closes the gap:
 gateway polls every ~2s for `started`-result verbs, drives the
@@ -353,7 +353,7 @@ Three layers, layered fail-closed:
      daemon's needs.
 
 For `agent_restart` self-targeting (`args.name === caller.identity.name`),
-the gate downgrades to `any` — matches the gateway's current behavior
+the gate downgrades to `any`, matching the gateway's current behavior
 (`/restart` self-targeting works without admin).
 
 The daemon never has the vault passphrase. Attestation reuses the
@@ -368,12 +368,12 @@ admin-client connection to the broker (mounted at
 path at `server.ts:1668-1695`. No new broker RPCs are added; no
 passphrase fingerprint is introduced (an earlier draft sketched a
 `status`-op fingerprint, but it would have widened the broker's
-same-UID attack surface to offline guessing — struck in favour of
+same-UID attack surface to offline guessing, struck in favour of
 plaintext-forward).
 
 **Trust-loop sanity.** A compromised in-container actor that can
 already drive the broker via the agent's vault-request flow can
-already attest if `/vault unlock` was recent — that's the existing
+already attest if `/vault unlock` was recent. That's the existing
 envelope, not new surface. The daemon does not enlarge it: it just
 exposes a *different* operation set behind the same gate. Recovery
 posture (`switchroom vault lock` from the host) is unchanged.
@@ -408,7 +408,7 @@ Tail consumable by `switchroom audit hostd` (new verb) and by the
 admin agents' `/audit hostd` Telegram command (mirrors `/vault audit`).
 
 Log rotation inherits `vault-audit.log`'s policy verbatim
-(`logrotate.d/switchroom-vault-audit` per `docs/vault-broker.md` —
+(`logrotate.d/switchroom-vault-audit` per `docs/vault-broker.md`:
 size-trigger rotation, retain N generations). The setup helper
 installs an analogous `logrotate.d/switchroom-host-control-audit`
 fragment.
@@ -447,13 +447,13 @@ sibling project (the daemon itself).
   `~/.switchroom/hostd/<name>/` (host) → `/run/switchroom/hostd/<name>/`
   (agent container). Gated on `host_control.enabled` AND the host
   directory existing (same `existsSync` guard pattern as the
-  vault-audit.log mount — docker compose `up` hard-fails on a
+  vault-audit.log mount; docker compose `up` hard-fails on a
   missing bind source).
 - Both ends of the bind are on the host filesystem; no named volume
   is needed (the daemon container also bind-mounts the same host
   path, so they share the file directly).
 - No compose service for the daemon itself in the switchroom
-  project — see §5.1 for why (would get recreated on
+  project. See §5.1 for why (would get recreated on
   `update_apply`).
 
 **New sibling project (`~/.switchroom/hostd/docker-compose.yml`):**
@@ -463,7 +463,7 @@ sibling project (the daemon itself).
   recreate cycle can never touch it.
 - The daemon's container declares `cap_add: [CHOWN, FOWNER,
   DAC_OVERRIDE]` so it can bind and chown the per-agent sockets
-  across UIDs — mirrors the broker's caps declared at
+  across UIDs, mirroring the broker's caps declared at
   `src/agents/compose.ts:549-552`.
 - Healthcheck: same socket-presence shape the broker and kernel
   use today.
@@ -480,7 +480,7 @@ sibling project (the daemon itself).
 **`switchroom setup`** grows a one-shot step that drops the sibling
 compose file at `~/.switchroom/hostd/docker-compose.yml` and prints
 the `docker compose -p switchroom-hostd up -d` command. Idempotent;
-safe to re-run. Works identically on Linux and macOS — no
+safe to re-run. Works identically on Linux and macOS. No
 host-specific install path.
 
 ## 7. Migration / cutover
@@ -495,7 +495,7 @@ Phased, behind `host_control.enabled` config flag (default
      the call returns a clean operator-visible error
      ("`switchroom-hostd` unreachable; check `docker compose -p
      switchroom-hostd ps`"). This preserves the §5.5 audit
-     guarantee — every privileged call lands in the daemon's audit
+     guarantee: every privileged call lands in the daemon's audit
      log or fails loudly, never quietly routes around it.
    - **`enabled: false`** (default) → gateway uses the existing
      `spawnSwitchroomDetached` path unchanged. The two code paths
@@ -505,8 +505,8 @@ Phased, behind `host_control.enabled` config flag (default
      posture.
 
    Reviewer-flagged (load-bearing): an earlier draft proposed
-   "prefer daemon, fall back to spawn on socket-miss." Struck —
-   silent fallback means a flaky daemon would route privileged
+   "prefer daemon, fall back to spawn on socket-miss." Struck.
+   Silent fallback means a flaky daemon would route privileged
    calls through the un-audited path that §5.5 promises is gone,
    and the audit log would have invisible gaps. Hard fail is the
    right shape.
@@ -548,8 +548,8 @@ phase 3 makes downgrade harder.
 
 1. **Daemon binary distribution.** Bundled into the existing
    switchroom CLI (one binary, multiple entrypoints) or a separate
-   `switchroom-hostd` binary? Leaning bundled — same release
-   surface, same version pin, same telemetry — but the survey
+   `switchroom-hostd` binary? Leaning bundled (same release
+   surface, same version pin, same telemetry), but the survey
    shows the broker and kernel are separate entrypoints. Match
    that pattern or break it?
 
@@ -558,16 +558,16 @@ phase 3 makes downgrade harder.
    the wire protocol grow streamed-progress frames (one per stage:
    `pulling`, `recreating`, `health-checking`, `done`) so the
    gateway can edit the progress card in real time? Probably yes,
-   but adds protocol complexity — defer to v2 unless the UX is
+   but adds protocol complexity. Defer to v2 unless the UX is
    visibly bad in v1 testing.
 
 3. **Idempotency window.** Tied to the gateway's existing
-   restart-marker debounce at `gateway.ts:7836` / `:7976` — currently
+   restart-marker debounce at `gateway.ts:7836` / `:7976`, currently
    15s. The daemon's `idempotency_key` cache uses the **same** 15s
    value so a double-tap that gets debounced at the gateway layer
    doesn't slip through to the daemon and vice versa. If the gateway
    debounce gets tuned, the daemon constant follows. (Earlier draft
-   said 60s — struck; layer-divergence was the reviewer's
+   said 60s, struck; layer-divergence was the reviewer's
    correction.)
 
 4. **Operator-attest cache.** The broker caches the operator
@@ -583,7 +583,7 @@ phase 3 makes downgrade harder.
 
 ## 10. Verdict / next steps
 
-Already landed in #1175 (Phase 1 — library + opt-in flag + per-agent
+Already landed in #1175 (Phase 1: library + opt-in flag + per-agent
 compose bind mounts):
 
 1. ✅ `src/host-control/{protocol,peercred,server,client,main}.ts`
@@ -616,7 +616,7 @@ compose bind mounts):
      always allowed; cross-agent requires admin. Synchronous.
      NOT gated by the fleet-mutation lock (per-service docker
      compose ops can safely race across agents).
-   `reconcile` was dropped from the original list — there's no
+   `reconcile` was dropped from the original list. There's no
    underlying `switchroom reconcile` CLI verb; `apply` covers the
    same intent.
 3. **Phase 2 gateway swap** (separate PR, deferred). Replace the
@@ -636,7 +636,7 @@ compose bind mounts):
    `spawnSwitchroomDetached`. Both are dead-code-inside-docker
    today (the docker branch is taken first and `systemd-run` is
    absent in containers), but they're still callable on v0.6
-   installs — removal lands when those are no longer supported.
+   installs; removal lands when those are no longer supported.
 
 Effort estimate: **~120 agent minutes** for Phase 1.5 (Dockerfile +
 image build + compose template + install verb + tests). **~180–240
@@ -680,11 +680,11 @@ opens a streaming `tail_status` (Phase 4) for live output.
 arbitrary code from the agent's worktree. Two posture constraints:
 
 1. **Path canonicalization.** `worktree` must canonicalize under
-   `~/.switchroom/agents/<agent>/home/**` — same containment check
+   `~/.switchroom/agents/<agent>/home/**`, the same containment check
    the bind_mounts primitive (#1166) uses. Refuse anything outside.
 2. **Command allowlist.** Either a fixed string like `npm test` or
    `bun run test`, or an explicit array; no shell expansion. The
-   agent can't ask hostd to run arbitrary commands — only registered
+   agent can't ask hostd to run arbitrary commands, only registered
    test entrypoints. Future verbs (`run_build`, `run_lint`) would
    sit alongside with the same shape.
 

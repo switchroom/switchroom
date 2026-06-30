@@ -1,6 +1,7 @@
 ---
-artefact: InboundDeliveryStateMachine
-serves: jobs/survive-reboots-and-real-life.md
+artifact: InboundDeliveryStateMachine
+serves: survive-reboots-and-real-life
+advances-outcome: always-available
 status: draft v1
 ---
 
@@ -15,11 +16,11 @@ Between 2026-05-18 and 2026-05-20 the gateway shipped **9 PRs** (#1536 #1537 #15
 The v0.12.22 boot-wedge (#1573) is the latest instance:
 
 - `handleInbound` ran the fresh-turn init bundle which set `activeTurnStartedAt[key]`
-- The #1556 delivery gate (next 190 lines) read `activeTurnStartedAt.size > 0` LIVE — saw the entry the same handler had just written for THIS inbound's turn
+- The #1556 delivery gate (next 190 lines) read `activeTurnStartedAt.size > 0` LIVE, saw the entry the same handler had just written for THIS inbound's turn
 - Buffered the turn-starting message; bridge never received it; claude never replied; `activeTurnStartedAt[key]` stayed set; silence-poke fallback fired 300s later
 - Symptom: every first user message after every container restart was stuck 5 minutes
 
-The fix was a 2-line snapshot of the live size at receipt-time. **It works** (validated by mtcute UAT, 19.4s → 1.77s for warm trivial). But it's a symptom fix — the underlying problem is **the gateway's delivery state is implicit and scattered**:
+The fix was a 2-line snapshot of the live size at receipt-time. **It works** (validated by mtcute UAT, 19.4s → 1.77s for warm trivial). But it's a symptom fix. The underlying problem is **the gateway's delivery state is implicit and scattered**:
 
 - `currentTurn` (singleton, module-level)
 - `activeTurnStartedAt` (`Map<ChatKey, number>`)
@@ -32,13 +33,13 @@ The fix was a 2-line snapshot of the live size at receipt-time. **It works** (va
 - One sibling-key sweep (#1564)
 - One restart-marker dance (#1546)
 
-Each piece is correct in isolation. The interactions produce the wedges. There is **no model** anywhere in the codebase that says "given these inputs, what should the gateway do" — only an accumulated pile of imperative code paths that have to be kept consistent by hand. Every new PR risks introducing a new misalignment.
+Each piece is correct in isolation. The interactions produce the wedges. There is **no model** anywhere in the codebase that says "given these inputs, what should the gateway do," only an accumulated pile of imperative code paths that have to be kept consistent by hand. Every new PR risks introducing a new misalignment.
 
 A **post-v0.12.22 mid-turn silence wedge** was discovered during the 2026-05-20 rollout: overlapping turns (turn 966 created 27.5s after turn 965 was still in flight) cause the silence-poke clock to reset to 0 on each `startTurn(key)`, with no carry-forward of the prior turn's outbound signal. User status-query messages don't reset the clock (they're inbound). At 300s the fallback fires spuriously even though the model replied 290s ago. **Same shape of bug**: a per-turn lifecycle resets state that should have been per-key-persistent.
 
 ## The proposal
 
-Extract the implicit state into a single pure module: `telegram-plugin/gateway/inbound-delivery-machine.ts`. The module **decides**; the gateway **executes effects**. No I/O, no timers, no mutation — every transition is `(state, event) → (state', effects[])`.
+Extract the implicit state into a single pure module: `telegram-plugin/gateway/inbound-delivery-machine.ts`. The module **decides**; the gateway **executes effects**. No I/O, no timers, no mutation. Every transition is `(state, event) → (state', effects[])`.
 
 The module is then property-tested against four invariants. Any state schedule that violates an invariant is a counterexample. The wedge cluster bugs are not patched one-by-one; they become **unrepresentable**.
 
@@ -82,7 +83,7 @@ type Event =
   | { kind: 'tick'; now: number }
 ```
 
-`modelOutbound` is the canonical signal for "the model produced output for this key" — replaces the scattered `signalTracker.noteOutbound` / `silencePoke.noteOutbound` calls.
+`modelOutbound` is the canonical signal for "the model produced output for this key." It replaces the scattered `signalTracker.noteOutbound` / `silencePoke.noteOutbound` calls.
 
 ### Effects
 
@@ -105,10 +106,10 @@ Effects are **returned, not performed**. The gateway dispatcher receives `(state
 
 ### Transition rules (concrete)
 
-These are exhaustive — every `(state, event)` pair has a defined transition. (Full table in the implementation PR; key cases here.)
+These are exhaustive: every `(state, event)` pair has a defined transition. (Full table in the implementation PR; key cases here.)
 
 **`bridge_alive_idle` + `inbound(key, msgId, at, isSteering=false)`:**
-- Look up `perKey[key].turnStartedAt`. If non-null: state stays `bridge_alive_idle` (wait — but turnStartedAt non-null means a turn IS in flight, so this case can't happen — that's invariant #2's content).
+- Look up `perKey[key].turnStartedAt`. If non-null: state stays `bridge_alive_idle` (wait, but turnStartedAt non-null means a turn IS in flight, so this case can't happen, that's invariant #2's content).
 - Otherwise: state → `bridge_alive_in_turn(key)`. Effects: `setTurnStarted(key, at)`, `deliverToBridge(msg)`, `logTrace(stage=fresh_turn_deliver)`.
 
 **`bridge_alive_in_turn(activeKey)` + `inbound(key, msgId, at, isSteering=false)`:**
@@ -118,7 +119,7 @@ These are exhaustive — every `(state, event)` pair has a defined transition. (
 - State → `bridge_alive_idle`. Effects: `clearTurnStarted(key)`, `drainBuffer(agentName)`, `noteOutbound(key, at)` (if outboundEmitted), `logTrace(stage=turn_complete)`.
 
 **`bridge_alive_*` + `bridgeDown(at)`:**
-- State → `bridge_dead`. Effects: `clearTurnStarted(activeKey if in_turn)` (no — actually KEEP per-key state, the bridge flap shouldn't clobber turn state; let the next bridgeUp + turnEnd handle it), `logTrace(stage=bridge_flap)`.
+- State → `bridge_dead`. Effects: `clearTurnStarted(activeKey if in_turn)` (no, actually KEEP per-key state, the bridge flap shouldn't clobber turn state; let the next bridgeUp + turnEnd handle it), `logTrace(stage=bridge_flap)`.
 
 **`bridge_dead` + `inbound(...)`:**
 - Effects: `bufferInbound(msg)`, `persistInbound(msg)`, `logTrace(stage=bridge_dead_buffer)`. State unchanged.
@@ -131,7 +132,7 @@ These are exhaustive — every `(state, event)` pair has a defined transition. (
   - **Check `lastOutboundAt` first** (this is the v0.12.22-mid-turn-silence fix). If `lastOutboundAt != null && now - lastOutboundAt < OUTBOUND_RECENT_MS` (60s), the model recently broke silence; suppress the fallback fire. Otherwise emit `firePoke(key, 'fallback')` + `clearTurnStarted(key)` + transition to `bridge_alive_idle` if this was the activeTurn.
 
 **Any state + `modelOutbound(key, at)`:**
-- Effects: `noteOutbound(key, at)` — updates `perKey[key].lastOutboundAt = at`. Does NOT change global state.
+- Effects: `noteOutbound(key, at)`, which updates `perKey[key].lastOutboundAt = at`. Does NOT change global state.
 
 ### Property-test invariants (the load-bearing contract)
 
@@ -139,7 +140,7 @@ These four invariants are property-tested with arbitrary event schedules. Any vi
 
 **Invariant #1 — Every inbound is exactly delivered OR persisted.**
 
-For every `inbound(msg)` event in the schedule, the effects emitted in response contain either `deliverToBridge(msg)` OR (`bufferInbound(msg)` AND `persistInbound(msg)`) — never both, never neither. Catches the wedge-cluster class where a buffered inbound was lost (no persist) or double-delivered (deliver + buffer).
+For every `inbound(msg)` event in the schedule, the effects emitted in response contain either `deliverToBridge(msg)` OR (`bufferInbound(msg)` AND `persistInbound(msg)`), never both, never neither. Catches the wedge-cluster class where a buffered inbound was lost (no persist) or double-delivered (deliver + buffer).
 
 **Invariant #2 — Turn lifecycle: setTurnStarted always paired with clearTurnStarted before next end-of-life event.**
 
@@ -147,7 +148,7 @@ For every `setTurnStarted(key, t)` effect: the next `turnEnd(key)` event, OR `ti
 
 **Invariant #3 — Per-chat sibling-key cleanup on turnEnd.**
 
-For any chatId, after the last `turnEnd(key)` whose key has that chatId, no entry for that chatId remains in `perKey` within one event-loop tick. Lifts PR #1564's `purgeStaleTurnsForChat` to a machine invariant. The test generates arbitrary `(chatId, threadId | null | undefined | 0)` sequences and asserts no sibling entries survive — this is the invariant that catches the #1564 sibling-key class as a property-test counterexample.
+For any chatId, after the last `turnEnd(key)` whose key has that chatId, no entry for that chatId remains in `perKey` within one event-loop tick. Lifts PR #1564's `purgeStaleTurnsForChat` to a machine invariant. The test generates arbitrary `(chatId, threadId | null | undefined | 0)` sequences and asserts no sibling entries survive. This is the invariant that catches the #1564 sibling-key class as a property-test counterexample.
 
 **Invariant #4 — Permission verdicts: delivered iff bridge alive, else persisted and re-delivered on next bridgeUp.**
 
@@ -171,7 +172,7 @@ Gate: all 5 invariants pass on 10,000 random schedules.
 
 `gateway.ts:handleInbound` constructs an Event for each input and dispatches through the state machine. The dispatcher receives the Effects array and executes them in order. Each effect maps 1:1 to an existing code path (e.g., `deliverToBridge` → `ipcServer.sendToAgent`; `bufferInbound` → `pendingInboundBuffer.push`).
 
-Gate: every existing UAT scenario still passes, including the post-restart mtcute UAT (jtbd-always-on-after-restart), the fast-trivial UAT, and every fuzz scenario. The state machine SHOULD produce the same observable behavior as the current ad-hoc code — if it doesn't, either the machine has a bug or the current code has one we're now seeing.
+Gate: every existing UAT scenario still passes, including the post-restart mtcute UAT (jtbd-always-on-after-restart), the fast-trivial UAT, and every fuzz scenario. The state machine SHOULD produce the same observable behavior as the current ad-hoc code. If it doesn't, either the machine has a bug or the current code has one we're now seeing.
 
 ### PR 3 — Delete the redundant primitives (cleanup)
 
@@ -188,7 +189,7 @@ Net: a few hundred lines removed, plus the bugs they were patching.
 The original "PR 3 = cleanup" framing turned out to be too coarse. PR
 3 (#1591) shipped the dispatcher and bit-identical effect execution
 for the **happy paths**, but the legacy `purgeReactionTracking` callsites
-were left in place — the shadow `turnEnd` event still fires from inside
+were left in place. The shadow `turnEnd` event still fires from inside
 that function, and several callsites can't see the authoritative
 `turn` object (so `outboundEmitted` falls back to module-scope
 `currentTurn` which may already be nulled).
@@ -212,7 +213,7 @@ The cleanup PR is therefore being split:
 `purgeReactionTracking(key, endingTurn?)` reads `outboundEmitted` from
 `endingTurn.replyCalled` if the caller threaded the turn, else falls
 back to `currentTurn?.replyCalled`. The canonical, threaded path is
-`endCurrentTurnAtomic(turn)` (gateway.ts:1381) — it nulls
+`endCurrentTurnAtomic(turn)` (gateway.ts:1381). It nulls
 `currentTurn`, then passes `turn` explicitly. Legacy bare-purge
 callsites can produce **wrong** `outboundEmitted` data in the shadow
 trace, which makes the shadow→live cutover (step 2) unsafe.
@@ -232,7 +233,7 @@ worktree, baseline commit a6e48b88):
 
 **Risk profile by site:**
 - 1601 / 5831 / 5989 are all **duplicate-`turnEnd`-emit bugs in the
-  same class** — shadow data correctness issues that surface as
+  same class**: shadow data correctness issues that surface as
   `turnEnd` events fired more than once per logical turn. Fixing them
   is mostly delete-the-bare-call, not refactor. Highest value, lowest
   risk.
@@ -293,13 +294,13 @@ prerequisites must land first.
 
 ## What this RFC does NOT cover
 
-- **The boot-time cost** of cold-starting claude + the gateway. The state machine doesn't help; it's pure model-side latency. Tracked separately under "cold-start optimization" (Sprint 4 of the vision-aligned roadmap — defer handoff, async boot card, pre-warm session).
+- **The boot-time cost** of cold-starting claude + the gateway. The state machine doesn't help; it's pure model-side latency. Tracked separately under "cold-start optimization" (Sprint 4 of the vision-aligned roadmap: defer handoff, async boot card, pre-warm session).
 - **Webhook vs polling.** Polling lag (0-3s typical) is upstream of the state machine. Separate decision.
-- **PostHog observability dashboards** for the runtime-metrics emitted by the new machine (`logTrace` effect). The state machine emits the trace events; the dashboards consume them — separate workstream.
+- **PostHog observability dashboards** for the runtime-metrics emitted by the new machine (`logTrace` effect). The state machine emits the trace events; the dashboards consume them. Separate workstream.
 
 ## Risks + mitigations
 
-- **PR 2 cutover risk**: behavior-equivalence is asserted by every existing UAT, but the property test ONLY asserts invariants — it doesn't prove equivalence to the prior ad-hoc code. If there was an UNDOCUMENTED behavior the prior code had that the new machine doesn't, it'd break silently. *Mitigation*: run PR 2 against the full fuzz scenario suite (already CI-gated) + a 48-hour test-harness bake before merging.
+- **PR 2 cutover risk**: behavior-equivalence is asserted by every existing UAT, but the property test ONLY asserts invariants. It doesn't prove equivalence to the prior ad-hoc code. If there was an UNDOCUMENTED behavior the prior code had that the new machine doesn't, it'd break silently. *Mitigation*: run PR 2 against the full fuzz scenario suite (already CI-gated) + a 48-hour test-harness bake before merging.
 - **State machine becomes the new monolith**: easy to keep growing. *Mitigation*: the invariants are the contract. New features must show how they satisfy or extend the invariants, not just add to the transition function.
 - **Polling vs event-driven**: the `tick(now)` event has to be driven by something. Currently the gateway has a setInterval idle-drain timer (#1549). The state machine can use the same trigger or be event-driven externally. *Mitigation*: explicit `tick` effect lets the dispatcher decide; no opinion baked into the machine.
 
@@ -312,9 +313,9 @@ prerequisites must land first.
 ## Success criteria
 
 - The post-v0.12.22 overlapping-turn silence wedge (currently firing 2x/hour on test-harness) becomes unrepresentable per Invariant #5.
-- The wedge cluster class — any variant — fails the property test before reaching the fleet.
+- The wedge cluster class, any variant, fails the property test before reaching the fleet.
 - Net code: -200 to -500 lines after PR 3.
-- Cold-start TTFO unchanged (this work is about correctness, not speed — cold-start optimization is a separate workstream).
+- Cold-start TTFO unchanged (this work is about correctness, not speed; cold-start optimization is a separate workstream).
 - mtcute UATs `jtbd-always-on-after-restart` and `jtbd-fast-trivial` continue passing.
 
 ---

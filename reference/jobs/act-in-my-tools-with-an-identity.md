@@ -1,7 +1,7 @@
 ---
 job: have my agent show up and act in the tools where my work already happens, as itself
-outcome: When something happens in a tool the user already works in — a PR opened, a Linear issue assigned, an @-mention — the right agent shows up there, under its own identity, and does the work in that tool, not only in Telegram.
-stakes: An assistant that only lives in a chat box is a side conversation. If the user has to copy work out of Linear or GitHub into Telegram and paste results back, the agent isn't on the team — it's a tool the user operates. But an agent that acts on un-gated external input is a roaming bot wearing the operator's face. Both failures are fatal, one to usefulness and one to the leash.
+outcome: When something happens in a tool the user already works in (a PR opened, a Linear issue assigned, an @-mention) the right agent shows up there, under its own identity, and does the work in that tool, not only in Telegram.
+stakes: An assistant that only lives in a chat box is a side conversation. If the user has to copy work out of Linear or GitHub into Telegram and paste results back, the agent isn't on the team, it's a tool the user operates. But an agent that acts on un-gated external input is a roaming bot wearing the operator's face. Both failures are fatal, one to usefulness and one to the leash.
 serves: always-available
 invariants: [on-leash, no-self-escalation, single-tenant]
 ---
@@ -14,19 +14,19 @@ invariants: [on-leash, no-self-escalation, single-tenant]
 > load-bearing distinction is the **gated-vs-roaming line** in Good / bad
 > below. The *how* (the edge lock, the per-agent HMAC, the gateway-socket
 > forward, the Linear app-actor OAuth) lives in the design docs linked in
-> the footer; that churns, this job does not.
+> the footer. That churns, this job does not.
 
 ## The job
 
 The user's work doesn't happen in a chat box. It happens in the PR thread, the
-Linear ticket, the issue comment — the places where they already collaborate
+Linear ticket, the issue comment, the places where they already collaborate
 with other people. They don't want to relay all of that through Telegram by
 hand: read the ticket, paste it to the agent, copy the agent's answer back into
 the ticket. They want the agent to **show up where the work is, as a named
-participant** — a reviewer on the PR, the assignee on the issue, a teammate you
-can `@`-mention — and act there directly, with its own identity and its own
+participant** (a reviewer on the PR, the assignee on the issue, a teammate you
+can `@`-mention) and act there directly, with its own identity and its own
 granted permissions. Telegram stays the place the user *steers and oversees*
-from; the tools become places the agent can *act in*.
+from. The tools become places the agent can *act in*.
 
 The hard part is that this is the one surface where something other than the
 operator can reach an agent. So the whole job hinges on the trigger being
@@ -41,15 +41,15 @@ sides.
 **Good looks like**
 
 - A PR is opened or an issue is assigned in a tool the user already uses, and
-  the right agent shows up *there* — a comment on the thread, an activity on
-  the issue timeline — without the user relaying anything through Telegram.
+  the right agent shows up *there* (a comment on the thread, an activity on
+  the issue timeline) without the user relaying anything through Telegram.
 - The agent acts under **its own identity** in that tool: a Linear app actor
   with its own avatar, `@`-mentionable and assignable; a reviewer identity on
   the PR. Other collaborators see a named teammate, not an anonymous bot.
 - The agent only wakes on a trigger the **operator configured**: a source the
   operator allowlisted, a dispatch rule the operator wrote, an OAuth grant the
   operator scoped. Nothing else gets it to act.
-- Every inbound event is **proven authentic before it can wake an agent** —
+- Every inbound event is **proven authentic before it can wake an agent**:
   signed by a secret the operator holds, arriving through the operator's
   trusted network edge. An unsigned or off-path request is rejected and the
   agent never sees it.
@@ -59,34 +59,34 @@ sides.
 - The user oversees and steers all of it from Telegram. The tool is where the
   agent *acts*; the chat is where the user stays in the loop and on the leash.
 - When the agent's standing in a tool lapses (a revoked token, an expired
-  grant), the user is told plainly — the agent doesn't silently go dark in a
+  grant), the user is told plainly. The agent doesn't silently go dark in a
   channel the user assumed was live.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
-- The agent acts on an **un-gated external trigger** — a webhook with no
+- The agent acts on an **un-gated external trigger**: a webhook with no
   signature check, a source the operator never allowlisted, an event that
   reached the receiver off the trusted edge. *This is roaming wearing the
   operator's identity, and it breaks `on-leash` by construction.* The line:
-  acting on an **operator-configured, authenticated** trigger is the job;
-  acting on **anything that can reach the endpoint** is the anti-job.
-- A misconfigured gate that **fails open** — ingest accepting events when the
+  acting on an **operator-configured, authenticated** trigger is the job.
+  Acting on **anything that can reach the endpoint** is the anti-job.
+- A misconfigured gate that **fails open**: ingest accepting events when the
   edge secret is missing, or the HMAC unverifiable. A security gate's failure
   mode is *deny*, never *allow*.
 - The agent **self-grants reach**: widening its own OAuth scope, adding a
   webhook source, or wiring a new tool identity without an operator action.
   Scope flows from operator config or an operator tap, full stop.
-- A **heartbeat or self-authored poll** dressed up as "showing up" — the agent
+- A **heartbeat or self-authored poll** dressed up as "showing up": the agent
   waking itself to go look at a tool on a loop it invented. Showing up is
   *event-driven from a gated trigger*, never a loop the agent runs.
 - The agent acting in a tool as a **generic, anonymous bot** with no distinct
-  identity — indistinguishable from the operator, or from another agent
+  identity, indistinguishable from the operator, or from another agent
   sharing one app credential. Each acting identity is its own.
-- Treating the inbound event payload as **instructions** rather than data —
+- Treating the inbound event payload as **instructions** rather than data,
   letting a PR title or issue body steer the agent past its granted scope.
-  Untrusted content is data; the leash is the operator's config.
-- The agent going **silently dead** in a tool — a lapsed token, a disabled
-  webhook — with no word to the user, who keeps assuming it's present.
+  Untrusted content is data. The leash is the operator's config.
+- The agent going **silently dead** in a tool (a lapsed token, a disabled
+  webhook) with no word to the user, who keeps assuming it's present.
 
 ## Prove it
 
@@ -137,7 +137,7 @@ sides.
 (`telegram-plugin/uat/scenarios/`) that drives a real edge-gated webhook into a
 live agent and asserts a visible action *back in the tool* under the agent's
 identity. The layers are proven in isolation; the full path is not.
-*(coverage gap: no runnable scenario yet — needs a `jtbd-act-in-tools-*` driver
+*(coverage gap: no runnable scenario yet, needs a `jtbd-act-in-tools-*` driver
 exercising edge → ingest → wake → Linear-actor activity.)*
 
 **Fuzz corpus:** vary source (github × linear × generic) × auth state (valid
@@ -155,9 +155,9 @@ identity is always surfaced.
 
 - **Done when:** an operator-configured, authenticated event arriving through
   the trusted edge makes the right agent show up *in the tool* under its own
-  identity and act there — while an un-gated, unsigned, off-path, or
+  identity and act there, while an un-gated, unsigned, off-path, or
   un-matched event never moves the agent at all, and the user can see and
-  steer the whole thing from Telegram — proven across the auth/path/identity
+  steer the whole thing from Telegram. Proven across the auth/path/identity
   corpus above (and, once built, the end-to-end driver that closes the gap).
 
 ## Production-readiness

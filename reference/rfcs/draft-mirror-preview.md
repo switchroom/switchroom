@@ -1,6 +1,7 @@
 ---
-artefact: draft-stream mirror preview + real-time activity feed
-serves: jobs/know-what-my-agent-is-doing.md
+artifact: draft-stream mirror preview + real-time activity feed
+serves: know-what-my-agent-is-doing
+advances-outcome: hold-the-leash
 status: Implemented — flag retired
 ---
 
@@ -12,7 +13,7 @@ status: Implemented — flag retired
 **Touches:** `telegram-plugin/gateway/gateway.ts`, `telegram-plugin/answer-stream.ts`, `telegram-plugin/tool-activity-summary.ts`, `telegram-plugin/session-tail.ts`
 
 > **Update (2026-05-29):** shipped as the real-time activity feed (#1982,
-> driven by the PreToolUse `tool_label` sidecar — see the PIVOT below).
+> driven by the PreToolUse `tool_label` sidecar, see the PIVOT below).
 > The feed is now the **unconditional default**: the
 > `SWITCHROOM_DRAFT_MIRROR` env flag and its kill-switch (Phasing /
 > Kill-switch sections below) have been **removed**, and the legacy
@@ -25,7 +26,7 @@ status: Implemented — flag retired
 
 ## Problem
 
-During a turn, the user wants to see what the agent is doing — in the
+During a turn, the user wants to see what the agent is doing, in the
 agent's own voice, as it happens. Today there are **two fragmented,
 loosely-coordinated preview surfaces**:
 
@@ -36,7 +37,7 @@ loosely-coordinated preview surfaces**:
    framework-authored tool counting, cleared on first reply.
 
 These can both be live at once (separate message IDs), and the
-activity-summary is framework-authored progress chrome — the model's
+activity-summary is framework-authored progress chrome: the model's
 machinery, not its voice. Extended-thinking turns also read as dead
 air at the *message* level (only the 🤔 reaction reflects them).
 
@@ -45,12 +46,12 @@ air at the *message* level (only the 🤔 reaction reflects them).
 The original design below proposed streaming the model's interstitial
 `assistant.text` prose into the draft. **The flag-on canary on
 test-harness falsified that premise.** On a normal tool turn the model
-emits *no* interstitial prose — it goes `thinking` (redacted, no text)
+emits *no* interstitial prose. It goes `thinking` (redacted, no text)
 → `tool_use` → `reply`. Routing `assistant.text` to the draft just
 produced an empty preview.
 
-The real human-friendly signal — verified against a live session JSONL
-(1360 Bash calls etc.) — lives in **`tool_use.input`, authored by the
+The real human-friendly signal, verified against a live session JSONL
+(1360 Bash calls etc.), lives in **`tool_use.input`, authored by the
 model**:
 
 | Tool | Field | Example |
@@ -67,11 +68,11 @@ This is exactly why Claude Code's own UI reads friendly: the Bash tool
 filename. There is never a raw `grep`/`jq`/`ls` to surface.
 
 **Revised design intent:** render each `tool_use` as a human-friendly,
-present-tense line via `describeToolUse` (`tool-activity-summary.ts`) —
-model-authored description, then a domain label, then a humanized name;
-never raw shell/query syntax — and stream the latest line into the
+present-tense line via `describeToolUse` (`tool-activity-summary.ts`),
+model-authored description, then a domain label, then a humanized name,
+never raw shell/query syntax. Stream the latest line into the
 **ephemeral compose-area draft**, clearing on `reply`. **Option A:
-uniform across code + non-code agents** — a health coach sees
+uniform across code + non-code agents.** A health coach sees
 "Searching memory" / "Checking your calendar"; a code agent sees
 "Editing gateway.ts" / the model's Bash description. The `reply` tool
 stays the canonical, formatted, pinged, persistent answer.
@@ -85,8 +86,8 @@ that lane.
 
 ## Original design intent (superseded by the PIVOT above)
 
-Mirror the **model's narration** — its summaries / descriptions /
-thinking-style commentary — into the **ephemeral compose-area draft**,
+Mirror the **model's narration** (its summaries / descriptions /
+thinking-style commentary) into the **ephemeral compose-area draft**,
 like Claude Code's running narration. **Not** tool-call labels. The
 draft clears when the final `reply` lands. The `reply` tool stays the
 canonical, formatted, pinged, persistent answer.
@@ -97,7 +98,7 @@ This is the next step on the same trajectory, not a walk-back. The
 arc:
 
 1. **Card era** — a persistent pinned status surface. Retired in
-   #1122: it failed three ways — redundant (user saw the answer before
+   #1122: it failed three ways. Redundant (user saw the answer before
    the card refreshed), confusing (card landed *after* the final
    answer due to send ordering), empty (it was the safety net for a
    model that wouldn't talk).
@@ -108,29 +109,29 @@ arc:
 3. **Live-narration-preview era (this RFC)** — the model's voice,
    streamed *as it forms*, in an ephemeral surface that leaves no
    residue. This couldn't exist safely until the reply-guarantee
-   (turn-pacing v4 + silent-end) was solid; now it can.
+   (turn-pacing v4 + silent-end) was solid. Now it can.
 
 The #1122 lesson is *carried forward*, not contradicted. An
 **ephemeral draft of the model's own prose** structurally avoids the
 three failure modes that killed the card:
 
-- Can't be redundant — it clears the instant `reply` lands.
-- Largely escapes the ordering trap — but not perfectly. The card's
+- Can't be redundant. It clears the instant `reply` lands.
+- Largely escapes the ordering trap, but not perfectly. The card's
   failure was a *persistent visible message* landing after the answer.
   The draft-clear is best-effort fire-and-forget
   (`answer-stream.ts:~282,598`), so a late draft-edit *can* land after
   the reply cleared it. The residue is a **stale ephemeral draft**
-  (auto-expires in 30s), not a stale visible chat message — strictly
+  (auto-expires in 30s), not a stale visible chat message, strictly
   less harmful than the card's failure, but the race exists. Mitigate
   by sequencing the clear after the reply send and accepting the 30s
   expiry as the floor.
-- Can't be empty — if the model emits no prose, no draft is shown
+- Can't be empty. If the model emits no prose, no draft is shown
   (the card was *forced* to render something).
 
 And it stays inside the contract: per
 `feedback_chat_is_artifact_ux_not_implementation`, streaming the
-model's *own words* (framework-transported, ephemeral) is sanctioned;
-only framework-authored chrome that *lingers* was ever the
+model's *own words* (framework-transported, ephemeral) is sanctioned.
+Only framework-authored chrome that *lingers* was ever the
 anti-pattern. The draft mirror is the former, never the latter.
 
 ## The three layers (target state)
@@ -146,14 +147,14 @@ anti-pattern. The draft mirror is the former, never the latter.
 1. **Route interstitial `assistant.text` to the draft, not a visible
    message.** The answer-stream's transport moves to `sendMessageDraft`
    for the live preview. v0.13.44 routed it to a *visible real message*
-   as a safety move — because at the time the ephemeral draft could
+   as a safety move, because at the time the ephemeral draft could
    strand an answer the model never committed. That safety is now
    provided structurally by the reply-guarantee + the backstop in (4),
    so the preview can return to its natural ephemeral home while the
    answer's durability is owned by `reply`. Safe *only* with (4).
 
 2. **Remove the tool-call mirror.** The activity-summary lane
-   ("Ran 5 commands") is dropped from the preview — the operator does
+   ("Ran 5 commands") is dropped from the preview. The operator does
    not want tool-call machinery mirrored. `tool-activity-summary.ts`
    and `drainActivitySummary`/`clearActivitySummary` are retired (or
    gated off by default). Tool activity still shows ambiently via the
@@ -165,7 +166,7 @@ anti-pattern. The draft mirror is the former, never the latter.
    `{ kind: 'thinking' }` and never extracts the block's text
    (`session-tail.ts:219`), and extended-thinking content is typically
    unavailable in the on-disk JSONL anyway. So we surface the *state*,
-   not the text — enough to keep extended-thinking turns from reading
+   not the text, enough to keep extended-thinking turns from reading
    as dead air at the message level, in the model's-state voice rather
    than a tool log. (If we later want real thinking text, that's a
    session-tail parser change AND depends on the content actually being
@@ -187,7 +188,7 @@ anti-pattern. The draft mirror is the former, never the latter.
    real message). If for any reason we prefer materialize() to own
    this, that is NEW code (make materialize fire when
    `streamMsgId == null`), not "keep existing." **This backstop is what
-   prevents re-opening the v0.13.44 19%-framework-fallback hole — and
+   prevents re-opening the v0.13.44 19%-framework-fallback hole, and
    it covers answer *delivery* only, not liveness *perception* (see
    Risks).** Non-negotiable.
 
@@ -215,7 +216,7 @@ The preview MAY reuse the pure render helpers (`markdownToHtml`,
   per CLAUDE.md). The on-disk JSONL is whole-message; ~1 edit/sec is
   the ceiling. Out of scope.
 - **Mirroring tool calls / results.** Explicitly excluded by the
-  operator — the model's voice, not its machinery.
+  operator. The model's voice, not its machinery.
 
 ## Phasing
 
@@ -232,7 +233,7 @@ The preview MAY reuse the pure render helpers (`markdownToHtml`,
   Risks) — operator confirms the draft is actually visible on their
   client(s), not just that delivery held.
 - **Phase 4** — retire the activity-summary tool-count lane, **only
-  after Phase 3 default-on has stuck**. Reason (design review): if
+  after Phase 3 default-on has stuck**. The reason (design review): if
   activity-summary is deleted while the mirror is still flag-gated and
   Phase 3's gate fails, the `SWITCHROOM_DRAFT_MIRROR=0` kill-switch
   could not restore it. Retire last, when there's nothing to fall back
@@ -263,13 +264,13 @@ tool-count lane is gone for good by then).
 - **Re-opening the 19% hole (delivery)** — mitigated by the turn-flush
   backstop (4) + turn-pacing v4. The framework-fallback metric gate in
   Phase 3 is the hard check. NOTE: this guarantees the *answer is
-  delivered*, not that the *liveness is perceived* — see next.
+  delivered*, not that the *liveness is perceived*. See next.
 - **Liveness invisibility (perception) — the real open risk.** v0.13.44
   moved narration to a *visible message* precisely because the
   compose-area draft wasn't surfacing on the operator's client; that
   invisibility was the perceived dead-air behind the 19%
   framework-fallback. This RFC moves narration *back* to the draft.
-  The delivery backstop does NOT cover this — if the draft is invisible
+  The delivery backstop does NOT cover this. If the draft is invisible
   on a given client, the user sees nothing until the `reply` lands,
   i.e. the same gap v0.13.44 closed, minus the lost-answer part. This
   is acceptable ONLY if (a) the reply reliably lands fast (turn-pacing
@@ -278,7 +279,7 @@ tool-count lane is gone for good by then).
   explicit perception check** (operator confirms the draft renders on
   their client[s]) separate from the delivery metric. If the draft is
   invisible in practice, this whole direction is wrong and we stay on
-  visible-answer-stream — surface that early, don't push to default-on.
+  visible-answer-stream. Surface that early, don't push to default-on.
 - **Operator-divergence during rollout** — same `apply`-regenerates-
-  settings concern as any scaffold change; ship via the normal
+  settings concern as any scaffold change. Ship via the normal
   release + fleet roll, not hot-patch, for the default flip.

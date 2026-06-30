@@ -1,7 +1,7 @@
 ---
-job: When my agent learns a better way to work, make the improvement stick reliably without me re-teaching it — and without it sprawling skills, crons, or its own guidance
+job: When my agent learns a better way to work, make the improvement stick reliably without me re-teaching it, and without it sprawling skills, crons, or its own guidance
 outcome: Agents stop repeating corrected mistakes; small fixes to their own skills happen invisibly and reversibly; anything larger arrives as a one-tap suggestion
-stakes: Get it wrong and we lose either way — nothing improves (recurring corrections, trust leaks) or it runs away (token waste, unreviewable skill/cron sprawl, unsafe changes)
+stakes: Get it wrong and we lose either way. Nothing improves (recurring corrections, trust leaks) or it runs away (token waste, unreviewable skill/cron sprawl, unsafe changes)
 serves: standing-team
 invariants: [no-self-escalation, on-leash]
 ---
@@ -34,13 +34,13 @@ reviewed PR). This job adds *when* to do it and *how far* to go alone.
 - A correction given once never has to be given again.
 - A small, safe fix to the agent's own existing skill just happens, silently
   and reversibly.
-- A bigger change — a shared skill, or an edit to the agent's own guidance
-  (`CLAUDE.md`/`SOUL.md`) that touches every turn — arrives as one one-tap
+- A bigger change (a shared skill, or an edit to the agent's own guidance
+  `CLAUDE.md`/`SOUL.md` that touches every turn) arrives as one one-tap
   suggestion.
 - A new cron or new skill is always proposed, never self-served.
 - Idle turns cost ~nothing; the operator never waits on the review.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - The same correction needed a second time.
 - Skill or cron sprawl; duplicate skills; an unreviewable pile of proposals.
@@ -69,6 +69,25 @@ just the happy path.
   tested, reversible fix to its own skill (or proposes anything larger) with
   no operator re-teaching, and never auto-creates a cron/new skill or any
   irreversible/cross-agent change.
+
+## Production-readiness
+
+- *Change safety:* the agent edits its own state, so every auto-applied fix
+  is reversible and audited. A self-improvement that can't be rolled back, or
+  that lands without a trail, is a defect, not a feature with a rough edge.
+- *Blast-radius gating:* the size of the change decides who approves it. A
+  small fix to the agent's own skill self-serves; anything that touches every
+  turn (`CLAUDE.md`/`SOUL.md`), crosses agents (a shared skill), or stands up
+  a cron is operator-gated. The agent never widens its own reach under cover
+  of "I learned something". The `no-self-escalation` and `on-leash`
+  invariants hold here, not just on the happy path.
+- *Learning integrity:* a bad lesson must not bind. A correction that turns
+  into a regression is caught and reverted rather than compounding across
+  runs, and the same correction never has to be given twice.
+- *Cost bounding:* the review is gate-first. An idle turn with no learning
+  signal incurs ~no extra tokens or latency, so the mechanism can run on
+  every turn without the operator paying for it on turns that didn't change
+  anything.
 
 ---
 

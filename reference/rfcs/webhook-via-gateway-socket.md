@@ -1,5 +1,5 @@
 ---
-artefact: webhook ingest writes via the agent gateway socket
+artifact: webhook ingest writes via the agent gateway socket
 backs: no-self-escalation
 status: Draft v1
 ---
@@ -21,8 +21,8 @@ record to the agent's gateway via a new `webhook_ingest` IPC verb;
 the gateway, running as the agent's UID, performs the append.
 
 This restores the single-writer invariant the rest of the agent's
-`telegram/` directory already follows (every other file there —
-`history.db`, `registry.db`, `gateway.log`, `issues.jsonl` — is
+`telegram/` directory already follows (every other file there,
+`history.db`, `registry.db`, `gateway.log`, `issues.jsonl`, is
 written by the gateway and only the gateway). Webhook events became
 the lone exception when ingest moved host-side in #586, and that
 exception just bit us in production.
@@ -36,7 +36,7 @@ returning HTTP 500 for ~12 days, with the receiver silently dropping
 events. Root cause: `~/.switchroom/agents/reggie/telegram/webhook-
 events.jsonl` is mode `0o600`, owner UID `10014` (reggie's container
 UID, set when the file was first created by something running as that
-UID — likely the gateway or a host process during a different
+UID, likely the gateway or a host process during a different
 deployment topology). The host's web server now runs as a different
 UID. `appendFileSync` → EACCES → caught → `jsonReply(500, "write
 failed")` → GitHub treats the hook as broken and eventually disables
@@ -53,8 +53,8 @@ The proximate fix ("`rm webhook-events.jsonl`") works because the
 receiver recreates the file under its current UID. But that fix
 papers over the actual defect: **two processes with different UIDs
 share a private state file**. Any future change to either process's
-UID — a packaging change, a systemd unit edit, a docker user-
-namespace tweak, a `docker compose` re-up under a different account —
+UID (a packaging change, a systemd unit edit, a docker user-
+namespace tweak, a `docker compose` re-up under a different account)
 silently re-breaks ingest. The webhook surface is the *only*
 untrusted-inbound surface in switchroom; silently dropping events is
 the worst failure mode.
@@ -72,7 +72,7 @@ Adjacent defensive fixes considered and rejected:
   silently fails until the operator re-runs `usermod -aG`.
 - **Run the web server as root** (or as a shared "switchroom" user
   that's a member of every agent's group). Expands the privilege
-  envelope of the only untrusted-inbound process in the system —
+  envelope of the only untrusted-inbound process in the system,
   exactly backwards.
 - **Move webhook state to a web-server-owned directory** (e.g.
   `~/.switchroom/webhooks/<agent>/events.jsonl`). Drops cross-UID
@@ -133,7 +133,7 @@ IPC. Add a `webhook_ingest` handler that:
 2. Appends `JSON.stringify(record) + "\n"` to
    `telegram/webhook-events.jsonl`. Same content as today, same
    path, but now the writer is the gateway (UID match guaranteed).
-3. Triggers any matching `webhook_dispatch` rule — today this
+3. Triggers any matching `webhook_dispatch` rule. Today this
    logic lives in the web server (`src/web/webhook-dispatch.ts`)
    and spawns `claude -p` as a sibling of the web-server process.
    In the new model the gateway is the parent of the long-running
@@ -146,7 +146,7 @@ IPC. Add a `webhook_ingest` handler that:
    wait for it to finish. Web-server-side cooldown + dedup (kept
    in place per §4) prevents dispatch storms.
 4. Returns `{ ok: true, ts }` to the web server after the append
-   syscall returns (NOT after `fsync` — see §5). The web server
+   syscall returns (NOT after `fsync`, see §5). The web server
    then returns HTTP 202 to GitHub. Records are durable to the
    OS page cache, not to disk; that matches the prior on-host
    `appendFileSync` semantics exactly (no regression, no false
@@ -157,7 +157,7 @@ IPC. Add a `webhook_ingest` handler that:
 `src/web/webhook-handler.ts` keeps its job through the verify /
 dedup / rate-limit / render steps. The terminal `appendFileSync`
 block becomes a Unix-socket POST. Socket path is the well-known
-`~/.switchroom/agents/<agent>/telegram/gateway.sock` — same path
+`~/.switchroom/agents/<agent>/telegram/gateway.sock`, the same path
 the gateway binds, same path `mkdirSync(telegramDir, ...)` in the
 current handler already implies it knows. New failure modes:
 
@@ -181,7 +181,7 @@ gateway downtime warrants them:
    a web-server-owned `~/.switchroom/webhook-spool/<agent>/...`
    directory; gateway drains on next startup. Adds a second
    writer and a second state dir, but only as a degradation
-   path — not a steady-state second writer.
+   path, not a steady-state second writer.
 2. `switchroom doctor` proactively pings agent sockets and warns
    the operator when one is down for >N minutes.
 Neither is in scope here; called out so future readers don't
@@ -206,7 +206,7 @@ Three PRs:
    legacy `appendFileSync` path and the flag. Add a
    `switchroom doctor` check that flags any
    `webhook-events.jsonl` whose owner UID doesn't match the
-   gateway's expected UID — points to either a stale file
+   gateway's expected UID. Points to either a stale file
    (delete & let recreate) or a misconfigured deploy.
 
 A `switchroom doctor --fix` mode could repair stale files in
@@ -239,7 +239,7 @@ PR 3; out of scope for this RFC.
   `src/vault/broker/scope.test.ts`.
 - **One new hard-fail mode: gateway down.** Mapped to HTTP 503,
   which trades silent 500-then-disable for noisy retry-then-give-
-  up. Net improvement, but see §3.3 "Durability caveat" — long
+  up. Net improvement, but see §3.3 "Durability caveat": long
   agent outages can still lose events if the deferred spool
   mitigation isn't built.
 - **Webhook dispatch fans out from inside the gateway.** A
@@ -261,7 +261,7 @@ state dir). Each rejected with rationale.
   peercred allowlist. Re-read on SIGHUP so a web-server restart
   under a different user (e.g. systemd unit edit) is picked up
   without a gateway restart. **Not** derived from
-  `~/.switchroom/` ownership — that's a coincidence of typical
+  `~/.switchroom/` ownership; that's a coincidence of typical
   single-user installs and would silently fail closed for
   deployments where the web server runs as e.g. `www-data`,
   which is the exact failure mode this RFC is trying to remove.

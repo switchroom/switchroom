@@ -1,22 +1,22 @@
 ---
-artefact: unified human-approval kernel
+artifact: unified human-approval kernel
 backs: no-self-escalation
 status: Draft v4 — partially shipped; hard-boundary direction descoped for single-tenant
 ---
 
 # RFC B: Unified human-approval kernel
 
-Status: Draft v4 — **partially shipped; hard-boundary direction descoped for single-tenant (2026-06-02)**
+Status: Draft v4. **Partially shipped; hard-boundary direction descoped for single-tenant (2026-06-02)**
 Author: klanker (sub-agent draft)
 Date: 2026-05-06
 
 > **Scope note (2026-06-02).** The kernel, nonce/scope binding, per-agent
 > socket ACL, and `apv:` callback flow are shipped. The "hard boundary"
-> direction this RFC anticipates — making the agent↔gateway channel
+> direction this RFC anticipates, making the agent↔gateway channel
 > unforgeable against a **same-uid** actor (a host-side operator verifier
 > setting `origin='operator'`, flipping
 > `SWITCHROOM_REQUIRE_OPERATOR_APPROVAL_MINT=1`, and the second-bot idea
-> floated alongside it) — is **descoped for the single-tenant deployment**
+> floated alongside it), is **descoped for the single-tenant deployment**
 > switchroom targets. Same-uid is out of scope by construction
 > (`docs/vault.md`), so that machinery defends a threat this product
 > doesn't have, at real cost. The authorization contract that supersedes
@@ -24,13 +24,13 @@ Date: 2026-05-06
 > the mint flag stays **off** by default. Reopen only if the deployment
 > model changes (untrusted agents / multi-operator / hostile network).
 
-Prerequisite: **RFC A — Bot token to vault** (`reference/rfcs/bot-token-to-vault.md`). Keeping the token in the vault rather than plaintext `.env` is still worthwhile hygiene (one revocation surface, no casual read); it is **not** relied on as a security boundary against a same-uid agent per the access model.
+Prerequisite: **RFC A, Bot token to vault** (`reference/rfcs/bot-token-to-vault.md`). Keeping the token in the vault rather than plaintext `.env` is still worthwhile hygiene (one revocation surface, no casual read); it is **not** relied on as a security boundary against a same-uid agent per the access model.
 
 ## 1. Summary
 
-Switchroom asks the user to approve sensitive actions through several independent code paths today: deferred-secret cards (`vd:`), vault grants, and the various per-MCP prompts that are about to multiply as Drive, Notion, Slack, and Gmail wrappers come online. This RFC proposes a single approval kernel — folded into the existing vault broker — that **secrets and MCP tool calls** plug into. One process, one socket, one SQLite file, one audit table, one Telegram card primitive, one set of `/approvals` commands.
+Switchroom asks the user to approve sensitive actions through several independent code paths today: deferred-secret cards (`vd:`), vault grants, and the various per-MCP prompts that are about to multiply as Drive, Notion, Slack, and Gmail wrappers come online. This RFC proposes a single approval kernel, folded into the existing vault broker, that **secrets and MCP tool calls** plug into. One process, one socket, one SQLite file, one audit table, one Telegram card primitive, one set of `/approvals` commands.
 
-**Scope is deliberately narrow.** The kernel covers secrets, vault grants, and MCP tool calls (Drive, Notion, Slack, Gmail, etc.). Tool/skill permissions stay on the existing `permission-rule.ts` + `settings.json` path — see §14.
+**Scope is deliberately narrow.** The kernel covers secrets, vault grants, and MCP tool calls (Drive, Notion, Slack, Gmail, etc.). Tool/skill permissions stay on the existing `permission-rule.ts` + `settings.json` path; see §14.
 
 ## 2. Motivation
 
@@ -126,7 +126,7 @@ CREATE TABLE approval_audit (
 
 UUID is the durable primary key. The 8-hex callback token (matching existing `generateAskId` at `telegram-plugin/ask-user.ts:133`) maps to the UUID for the prompt's lifetime only.
 
-The audit table splits agent-intent from kernel-verb into two columns: `action` records what the agent wanted to do (read/write/etc., same vocabulary as `approval_decisions.action`) and `event` records what the kernel did about it. Audit-by-scope queries need both. `event` is a superset of the original RFC vocabulary — it adds `consume`, `expire`, and `drift_revoke` for operational events the kernel records (nonce redemption, prompt timeout, drift-triggered auto-revocation per §5.1).
+The audit table splits agent-intent from kernel-verb into two columns: `action` records what the agent wanted to do (read/write/etc., same vocabulary as `approval_decisions.action`) and `event` records what the kernel did about it. Audit-by-scope queries need both. `event` is a superset of the original RFC vocabulary: it adds `consume`, `expire`, and `drift_revoke` for operational events the kernel records (nonce redemption, prompt timeout, drift-triggered auto-revocation per §5.1).
 
 The "same-uid attacker writes a forged grant row directly to SQLite" attack is acknowledged per §3 and not defended against in code; it's defended against by the trust model documented in `docs/vault.md`.
 
@@ -153,7 +153,7 @@ interface ScopeMatcher {
 }
 ```
 
-ScopeMatcher is **new code** — not a reuse of `checkEntryScope` in `src/vault/broker/acl.ts` (that one matches agent slugs against entry allow/deny lists; different problem). The agent-identity ACL gating IS reused; scope-string-vs-scope-string matching is built fresh.
+ScopeMatcher is **new code**, not a reuse of `checkEntryScope` in `src/vault/broker/acl.ts` (that one matches agent slugs against entry allow/deny lists; different problem). The agent-identity ACL gating IS reused; scope-string-vs-scope-string matching is built fresh.
 
 Namespaces in v1:
 
@@ -171,7 +171,7 @@ apv:<8-hex request id>:<action>[:<param>]
 ```
 
 - 8-hex request id matches `generateAskId` convention.
-- Single-use enforced by an atomic `UPDATE approval_nonces SET consumed_at = ? WHERE request_id = ? AND consumed_at IS NULL` with a rowcount check. Only on rowcount=1 does the kernel proceed to insert/update the corresponding `approval_decisions` row. A re-tap of an already-consumed callback returns a brief "this prompt expired" toast via `answerCallbackQuery`. *(PR-6: the Telegram `apv:` card path realizes this "only on rowcount=1 do we proceed to the decision row" as a single atomic `approval_consume_record` op — `consumeNonce` + `recordDecision` in one `db.transaction()` — rather than two RPC round-trips, so a broker death between consume and record can no longer burn the nonce without a decision. See `src/vault/approvals/MIGRATION.md`.)*
+- Single-use enforced by an atomic `UPDATE approval_nonces SET consumed_at = ? WHERE request_id = ? AND consumed_at IS NULL` with a rowcount check. Only on rowcount=1 does the kernel proceed to insert/update the corresponding `approval_decisions` row. A re-tap of an already-consumed callback returns a brief "this prompt expired" toast via `answerCallbackQuery`. *(PR-6: the Telegram `apv:` card path realizes this "only on rowcount=1 do we proceed to the decision row" as a single atomic `approval_consume_record` op (`consumeNonce` + `recordDecision` in one `db.transaction()`) rather than two RPC round-trips, so a broker death between consume and record can no longer burn the nonce without a decision. See `src/vault/approvals/MIGRATION.md`.)*
 - Examples: `apv:a3f1b9c2:allow`, `apv:a3f1b9c2:ttl:1h`, `apv:a3f1b9c2:deny`.
 
 Full scope and humanized title are stored server-side keyed by request id.
@@ -190,7 +190,7 @@ The card surfaces only the common subset. Full mode set is editable via `/approv
 
 ## 8. Telegram approval card UX
 
-One shape, every surface. Built on the existing `aq:` (ask_user) primitive at `telegram-plugin/gateway/gateway.ts:8321` — that path already handles topic routing, quote-reply targeting, reaction lifecycle, and `allowFrom` enforcement. The kernel registers a new `apv:` callback handler and reuses the rest.
+One shape, every surface. Built on the existing `aq:` (ask_user) primitive at `telegram-plugin/gateway/gateway.ts:8321`; that path already handles topic routing, quote-reply targeting, reaction lifecycle, and `allowFrom` enforcement. The kernel registers a new `apv:` callback handler and reuses the rest.
 
 ### 8.1 Card states
 
@@ -213,7 +213,7 @@ One shape, every surface. Built on the existing `aq:` (ask_user) primitive at `t
 
 **Denied:** `🚫 Denied`
 
-**Expired (5-minute timeout):** `⌛ Expired — agent will re-request.` A tap on an already-expired callback returns `answerCallbackQuery({ text: 'this prompt expired' })`.
+**Expired (5-minute timeout):** `⌛ Expired, agent will re-request.` A tap on an already-expired callback returns `answerCallbackQuery({ text: 'this prompt expired' })`.
 
 **Revoked-after-grant:** on the next use attempt the agent gets a denial; the kernel posts a fresh notification card identifying which standing grant fired the denial and offering one-tap reinstate.
 
@@ -244,7 +244,7 @@ The kernel calls `humanize()` before rendering but never blocks on it.
 
 ### 9.1 Staleness model with weekly digest coalescing
 
-Rather than per-row prompts (which scale badly — 40 stale rows = 40 prompts), staleness coalesces into a single weekly digest with the same threshold-trigger logic:
+Rather than per-row prompts (which scale badly: 40 stale rows = 40 prompts), staleness coalesces into a single weekly digest with the same threshold-trigger logic:
 
 - **New-grants digest** (threshold-triggered): when `count(allow_always WHERE never_seen_in_digest) >= 3`, send a digest of the new standing grants. At most one digest per 24h.
 - **Stale-grants digest** (weekly): grants that haven't fired in 30d coalesce into one digest with one inline `Revoke` button per row. **No more than one staleness digest per week** regardless of how many rows go stale.
@@ -262,7 +262,7 @@ Multi-step with real failure modes; spec the ordering.
 4. **SIGHUP gateway** — gateway re-reads token from vault.
 5. **Mark `revoke-all` complete** — audit row.
 
-`switchroom token rotate` is the recovery command — idempotent re-run of steps 1, 3, 4. Documented in killswitch help text.
+`switchroom token rotate` is the recovery command, an idempotent re-run of steps 1, 3, 4. Documented in killswitch help text.
 
 ## 10. Wait protocol — short-poll
 
@@ -273,7 +273,7 @@ The vault broker is request/response. Approvals can wait up to 5 minutes for a t
 1. Agent calls `requestApproval(...)` → `{ status: 'pending', request_id }` immediately.
 2. Agent calls `lookupDecision({ request_id })` every 2 seconds. Broker responds immediately with `{ status: 'pending' | 'granted' | 'denied' | 'expired', mode?, ttl? }`.
 3. On `granted`/`denied`/`expired`, agent stops polling.
-4. On gateway restart between polls, agent simply retries — `lookupDecision` is stateless from the agent's perspective.
+4. On gateway restart between polls, agent simply retries; `lookupDecision` is stateless from the agent's perspective.
 
 **Caps:**
 
@@ -285,8 +285,8 @@ The vault broker is request/response. Approvals can wait up to 5 minutes for a t
 - **Cross-agent grant scope is unit-scoped.** `allow_always` for `secret:OPENAI_API_KEY` granted to klanker does NOT auto-grant to gymbro. Each `agent_unit` is a separate principal, matching existing vault grants. User-scoped grants out of scope for v1.
 - **Callback delivery is best-effort.** If the gateway is down when the user taps, the tap is lost. 5-minute timeout, `timeout` audit row, agent re-issues if still wanted.
 - **OAuth tokens (Google refresh tokens) live in vault.** Kernel asks vault for the token by slot name; vault enforces its own grant on that slot; kernel never persists raw tokens.
-- **Adding a user re-confirms standing grants.** Multiple trusted users per agent is supported (`single-tenant` invariant), but standing *grants* stay conservative: drift-revocation (§5.1) makes a roster change safe-by-default — the moment `allowFrom` changes (including growing past one entry), every standing grant becomes dormant pending re-confirmation. Per-user grant *scoping* is out of scope for v1 (grants are unit-scoped, matching the invariant's "nothing finer than the per-agent user assignment").
-- **Tap-budget target and instrumentation.** Day 1 of Drive enablement: 10–30 taps expected (cold cache, no folder grants). Steady state: <5 taps/day. `/approvals stats` surfaces 7-day tap counts. Soft-alert (DM) at >10 taps/day sustained for 3 days. If exceeded, **batch coalescing** kicks in: the kernel buffers prompts for 5 seconds; if 3+ pending share a scope-prefix (e.g. `doc:gdrive:folder/Work/*`), it collapses into a single "klanker is requesting access to 4 docs in /Work — allow folder?" card.
+- **Adding a user re-confirms standing grants.** Multiple trusted users per agent is supported (`single-tenant` invariant), but standing *grants* stay conservative: drift-revocation (§5.1) makes a roster change safe-by-default: the moment `allowFrom` changes (including growing past one entry), every standing grant becomes dormant pending re-confirmation. Per-user grant *scoping* is out of scope for v1 (grants are unit-scoped, matching the invariant's "nothing finer than the per-agent user assignment").
+- **Tap-budget target and instrumentation.** Day 1 of Drive enablement: 10–30 taps expected (cold cache, no folder grants). Steady state: <5 taps/day. `/approvals stats` surfaces 7-day tap counts. Soft-alert (DM) at >10 taps/day sustained for 3 days. If exceeded, **batch coalescing** kicks in: the kernel buffers prompts for 5 seconds; if 3+ pending share a scope-prefix (e.g. `doc:gdrive:folder/Work/*`), it collapses into a single "klanker is requesting access to 4 docs in /Work, allow folder?" card.
 
 ## 12. Migration plan
 
@@ -296,7 +296,7 @@ The vault broker is request/response. Approvals can wait up to 5 minutes for a t
 
 **Phase 2 — secrets as first consumer.** Migrate the deferred-secret card path (`gateway.ts:5555`) to call the kernel. Lower-traffic, validates the abstraction. Preserve the inline-passphrase capture UX. ~0.5 day.
 
-**Phase 3 — first MCP consumer (Google Drive).** Covered separately in **RFC D — Google Drive MCP integration** (originally drafted as "RFC C", renumbered after `host-control-daemon.md` took the C slot).
+**Phase 3 — first MCP consumer (Google Drive).** Covered separately in **RFC D, Google Drive MCP integration** (originally drafted as "RFC C", renumbered after `host-control-daemon.md` took the C slot).
 
 ## 13. Estimated effort
 
@@ -306,7 +306,7 @@ Combined with RFC A (~0.5d) and RFC D (~1d): **~3.5 days total** across the thre
 
 ## 14. Out of scope
 
-- **Tool/skill permission migration: deferred indefinitely.** Tools and skills stay on the existing `permission-rule.ts` + `settings.json` path, untouched. Migrating Claude's tool-permission prompts into the kernel would conflict with switchroom's "unmodified Claude" principle (`README.md:16`) — it requires intercepting and rewriting `settings.json` from kernel state, which the kernel does NOT do. The kernel is not authoritative for tool perms.
+- **Tool/skill permission migration: deferred indefinitely.** Tools and skills stay on the existing `permission-rule.ts` + `settings.json` path, untouched. Migrating Claude's tool-permission prompts into the kernel would conflict with switchroom's "unmodified Claude" principle (`README.md:16`): it requires intercepting and rewriting `settings.json` from kernel state, which the kernel does NOT do. The kernel is not authoritative for tool perms.
 - Group / multi-user bot support.
 - Per-action MFA prompts beyond approval — Telegram 2FA is sufficient at this trust level.
 - Web dashboard approval UX (CLI + Telegram only for v1).

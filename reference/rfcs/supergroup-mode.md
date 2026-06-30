@@ -1,6 +1,7 @@
 ---
-artefact: per-agent Telegram supergroup mode
-serves: jobs/talk-to-agents-from-anywhere.md
+artifact: per-agent Telegram supergroup mode
+serves: talk-to-agents-from-anywhere
+advances-outcome: always-available
 status: Draft for ratification
 ---
 
@@ -19,11 +20,11 @@ forum topics, runs **multiple conversations in parallel across topics without
 cross-topic blocking**, and routes scheduled / automated outbounds into named
 topic lanes.
 
-## Why — and what the actual pain is
+## Why, and what the actual pain is
 
 The headline user pain is **parallel conversations**: talk to an agent in topic
 A while a long-running turn in topic B continues. Today the gateway gates
-inbound delivery on `activeTurnStartedAt.size > 0` — a **fleet-wide**
+inbound delivery on `activeTurnStartedAt.size > 0`, a **fleet-wide**
 check. If any topic has an active turn, every other topic's inbound is
 buffered until it ends. Two topics deadlock each other.
 
@@ -32,7 +33,7 @@ compact cards) interleaves with conversation in one topic. Carving lanes
 fixes the cosmetic complaint and, more importantly, makes the cron-can-target-
 a-topic case (morning digest → `#planning`) ergonomic.
 
-## What's already here — current topology
+## What's already here: current topology
 
 The original spec assumes klanker lives in a flat DM. It doesn't. The
 existing topology is:
@@ -41,7 +42,7 @@ existing topology is:
 - Each agent has `topic_name` + auto-assigned `topic_id`: its own topic in
   that shared supergroup. `topic-manager.ts` + `switchroom topics
   sync/list/cleanup` create and reconcile these.
-- `dm_only: true` (per-agent): escape hatch — own bot token, private chat.
+- `dm_only: true` (per-agent): escape hatch, own bot token, private chat.
 - `TELEGRAM_TOPIC_ID` env var filters inbound to a single topic per gateway
   instance (one gateway per agent).
 
@@ -52,7 +53,7 @@ per-its-own-supergroup is explicitly deferred.
 
 ## Schema delta
 
-No `mode:` enum. Mode is implied by config shape — additive, backward-compat.
+No `mode:` enum. Mode is implied by config shape, additive, backward-compat.
 
 ```yaml
 # Fleet-wide default supergroup (unchanged)
@@ -99,7 +100,7 @@ schedule:
 - The cascade (defaults → profile → agent) merges `topic_aliases` per-key;
   agent overrides win, defaults + profile fill in unset keys.
 
-## The structural refactor — what blocks parallel turns
+## The structural refactor: what blocks parallel turns
 
 Spec PR2 ("correctness fixes, ~2d") underestimates the surface. Trace below
 distinguishes **CRITICAL** (parallel turns impossible without it) from **HIGH**
@@ -118,9 +119,9 @@ distinguishes **CRITICAL** (parallel turns impossible without it) from **HIGH**
 | 9 | `lastPtyPreviewByChat`, `chatAvailableReactions` | `gateway.ts:1108,1156` | Shared dedup cache across topics; rare misfires. Composite-key. | LOW |
 | 10 | `chatKey()` primitive exists but `stream-reply-handler.ts:308` reinvents it inline | `chat-key.ts:44` | Adopt + delete the duplicate; consider tightening the brand. | LOW |
 
-Already-safe (composite-keyed today): `activeDraftStreams`, `activeStatusReactions`, `progressUpdateLastSent`, `pending-work-progress`, vault/permission state. Good — these are the pattern to extend.
+Already-safe (composite-keyed today): `activeDraftStreams`, `activeStatusReactions`, `progressUpdateLastSent`, `pending-work-progress`, vault/permission state. Good, these are the pattern to extend.
 
-## Outbound routing — by event class
+## Outbound routing: by event class
 
 The router decides which `message_thread_id` an autonomous (non-reply) outbound
 lands on. Per-agent topic_aliases give operator-friendly names; falls back to
@@ -149,7 +150,7 @@ notification, `admin` for action-required).
 | **Approval-button callbacks** (`apv:…`, `/approve` `/deny` `/pending`) | reply where the card was (callback-driven, no change) | — |
 
 Background/turn-initiated split requires the bridge to mark each outbound
-event with its origin class (a single enum field). Already partly there —
+event with its origin class (a single enum field). Already partly there:
 `pendingVaultRequestAccesses` knows whether it was opened from a turn handler
 or from a fire-and-forget scheduled task; just needs threading through to
 the card-sender.
@@ -157,24 +158,24 @@ the card-sender.
 Emitter callsites: `gateway/boot-card.ts` (3 sites), vault grant cards,
 hostd approval cards (already builds via approval-kernel), cron synthetic-
 inbound builder (`src/scheduler/dispatch.ts`), compact card
-(`gateway.ts:1639`). All already plumb `message_thread_id` conditionally —
+(`gateway.ts:1639`). All already plumb `message_thread_id` conditionally;
 the change is sourcing the value from `resolveOutboundTopic(agent, event,
 ctx)` instead of `null`.
 
-## General-topic Telegram quirk — wrapper
+## General-topic Telegram quirk: the wrapper
 
 Definitively answered (sources in research notes): General topic has `id=1`
 at MTProto, but the Bot API `sendMessage` **rejects** `message_thread_id: 1`
 with HTTP 400 "message thread not found." Inbound carries 1; outbound must
 omit. The strip-1 wrapper goes at the existing chokepoint
-(`chatLock.wrapBot` proxy in `chat-lock.ts:40-62`) — single layer, no
+(`chatLock.wrapBot` proxy in `chat-lock.ts:40-62`): single layer, no
 callsite changes. Apply to both `sendMessage` AND `sendChatAction` (spec said
-sendChatAction is exempt; that appears to be folklore — confirm with a 5-min
+sendChatAction is exempt; that appears to be folklore, confirm with a 5-min
 live test in UAT before locking). `editMessageText` doesn't take
-`message_thread_id` at all (inferred from `message_id`) — progress-card
+`message_thread_id` at all (inferred from `message_id`), so progress-card
 editing is unaffected.
 
-## Memory — topic-aware metadata, single bank (CPO call, ratified)
+## Memory: topic-aware metadata, single bank (CPO call, ratified)
 
 Hindsight memory stays **per-agent, one bank** (preserves the
 "one agent, one persona, one memory bank" principle from `reference/vision.md`).
@@ -186,7 +187,7 @@ the active topic into the recall preamble so the model can self-filter.
 - Pass them as fields in the `retain()` metadata bag:
   `metadata: { ..., chat_id, thread_id, topic_alias }` (topic_alias = the
   human-readable name from `topic_aliases`, if any).
-- No schema migration needed — Hindsight already accepts arbitrary metadata.
+- No schema migration needed; Hindsight already accepts arbitrary metadata.
 
 **Recall path** (`recall.py`):
 - Extract `chat_id` + `thread_id` from the prompt envelope (one regex
@@ -212,10 +213,10 @@ the bank principle, and creates a bank explosion (N topics × M agents).
 
 **Out of scope for v1:** UI for inspecting per-topic memory counts.
 `switchroom memory recall-log <agent>` will already show the topic in
-each recalled memory's metadata once tags are added — that's the inspection
+each recalled memory's metadata once tags are added. That's the inspection
 surface for now.
 
-## Two regressions to pull forward (CPO call, ratified — ship as standalone fleet PRs)
+## Two regressions to pull forward (CPO call, ratified; ship as standalone fleet PRs)
 
 Surfaced in research; both affect the **existing** shared-supergroup
 fleet, just less visibly. Ship as standalone PRs before / parallel to the
@@ -245,11 +246,11 @@ soak. Recommend skipping that and using a simpler model:
    Backward-compat: existing fleet agents keep working unchanged (no
    `channels.telegram.chat_id` set → fleet mode).
 2. Create klanker's new supergroup; populate topic_aliases.
-3. **Edit klanker's config in place** — flip from `topic_id` in the fleet
+3. **Edit klanker's config in place**: flip from `topic_id` in the fleet
    supergroup to `channels.telegram.chat_id` + `default_topic_id`. Run
    `switchroom apply` + `switchroom agent restart klanker --wait`.
-4. Hindsight memory bank is agent-scoped, not chat-scoped — survives. Vault
-   grants keyed by agent+key, not chat — survive. DM history is in
+4. Hindsight memory bank is agent-scoped, not chat-scoped, so it survives. Vault
+   grants keyed by agent+key, not chat, so they survive. DM history is in
    per-(chat,thread) SQLite; nothing is deleted on flip.
 5. **Rollback**: edit the config back, restart. The DM/fleet topic is
    never deleted; messages are preserved both sides.
@@ -307,13 +308,13 @@ sequence the supergroup work.
 | 7 | `switchroom telegram topics <chat_id>` discovery command (read SQLite buffer for distinct thread_ids) | ~0.5 day | Ergonomics; ship last |
 
 **Ship order:** PR0a + PR0b first (fleet wins, no dependency). PR1 + PR2 next
-(unblock the supergroup work + close more fleet bugs). PR3 is the gated work
-— UAT-heavy. PR4 + PR5 + PR6 + PR7 are surface polish; can ship in any order
+(unblock the supergroup work + close more fleet bugs). PR3 is the gated work,
+it is UAT-heavy. PR4 + PR5 + PR6 + PR7 are surface polish; can ship in any order
 after PR3.
 
 ## Out of scope (v1)
 
-- Multi-agent-per-supergroup (deferred — needs orchestrator routing layer)
+- Multi-agent-per-supergroup (deferred, needs orchestrator routing layer)
 - Per-topic system prompts / personas (violates "one agent, one persona")
 - Per-topic memory bank sharding (violates "one agent, one bank")
 - `forum_topic_created` / `_closed` / `_reopened` service-message handling
@@ -322,7 +323,7 @@ after PR3.
 
 ## Open questions still needing live verification
 
-- `sendChatAction` with `thread_id=1` for General — folklore says it works,
+- `sendChatAction` with `thread_id=1` for General: folklore says it works,
   research suggests strip-1 needed; **5-min UAT test before locking the
   wrapper**.
 - Behavior when the operator deletes a topic referenced in `topic_aliases`
@@ -342,7 +343,7 @@ Spec claims checked file-by-file at HEAD. Corrected:
 - `activeTurnStartedAt is global int` → it's a `Map<string, number>`
   composite-keyed; the bug is `.size > 0` being fleet-wide.
 - ScheduleEntrySchema topic field → confirmed absent today, needs adding.
-- `bot.api` wrapper exists (`chatLock.wrapBot`) — strip-1 layer slots in
+- `bot.api` wrapper exists (`chatLock.wrapBot`); strip-1 layer slots in
   there, not at 205 callsites.
-- AgentSchema has no `chat_id` today — `dm_only` is the existing per-agent
+- AgentSchema has no `chat_id` today; `dm_only` is the existing per-agent
   override; new `channels.telegram.chat_id` is the cleanest add.

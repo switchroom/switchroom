@@ -13,10 +13,10 @@ invariants: [single-tenant]
 The user said something last Tuesday that matters today. They told the agent
 months ago how they like things done. They started a thread that never got
 closed. A goldfish agent forces the user to repeat all of it, so they stop
-trying. The job is to make the agent remember in a way that helps — not in a
+trying. The job is to make the agent remember in a way that helps, not in a
 way that's creepy or noisy. Memory is not a chat log: dumping the last
 thousand messages into the prompt is neither remembering nor useful. Good
-memory is curated, semantic, and retrieved by relevance — the schedule note
+memory is curated, semantic, and retrieved by relevance: the schedule note
 surfaces when planning the week, not when writing code. Memory is also
 honest: when the agent recalls something, the user can see that it did,
 trust why, and correct it if it's wrong. Memory the user can't inspect is
@@ -38,10 +38,10 @@ memory the user won't trust.
   relationship; the agent picks up roughly where it was.
 - The user can ask what the agent believes about them and why, and get an
   honest, legible answer.
-- Each agent's memory is its own — different specialists, topics, and
+- Each agent's memory is its own: different specialists, topics, and
   distinct users are never conflated into one pool.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - Raw transcript dumping passed off as memory; that's storage, not
   remembering.
@@ -87,7 +87,7 @@ correction-stickiness, and per-bank isolation hold across all.
 
 - **Done when:** the agent brings back the right context at the right moment
   without being re-told, the user can inspect and correct what it believes,
-  and a restart never resets the relationship — proven by the scenarios
+  and a restart never resets the relationship, proven by the scenarios
   above.
 
 ## Production-readiness

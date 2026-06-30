@@ -1,7 +1,7 @@
 ---
 job: log into Anthropic once per account, not once per agent
 outcome: One `claude setup-token` per Anthropic account covers every agent, sub-agent, hook, summarizer, and cron that account is enabled on. Refresh, quota state, and fallback all live at the account level. The user manages accounts; switchroom routes them to consumers.
-stakes: When auth is per-agent, six agents on one Pro subscription means six OAuth flows, six independent refresh cycles, six places quota state can drift, and six 401-storms when the user adds a seventh agent. The user starts to feel the fleet — and asks why "one subscription" demands six logins.
+stakes: When auth is per-agent, six agents on one Pro subscription means six OAuth flows, six independent refresh cycles, six places quota state can drift, and six 401-storms when the user adds a seventh agent. The user starts to feel the fleet, and asks why "one subscription" demands six logins.
 serves: subscription-honest
 invariants: [claude-native]
 ---
@@ -16,12 +16,12 @@ invariants: [claude-native]
 
 The user pays Anthropic for a subscription. That subscription is the unit
 they care about: it has a bill, a quota, an expiry, and an account identity
-("ken@example.com"). The job is to make that *account* drive the fleet — not
+("ken@example.com"). The job is to make that *account* drive the fleet, not
 to make the user maintain one fictional copy of it per agent. Agents are
 consumers of accounts, not owners of them: one login per account, then "use
 this account on these agents" is configuration.
 
-> We used to give every agent its own private OAuth slot pool — six agents
+> We used to give every agent its own private OAuth slot pool. Six agents
 > on one subscription meant six `claude setup-token` runs, six refresh
 > cycles, and six independent rediscoveries of the same quota wall. We
 > changed the unit to the Anthropic account; the job underneath is
@@ -32,13 +32,13 @@ this account on these agents" is configuration.
 **Good looks like**
 
 - Adding a second, third, or sixth agent to an account the user already set
-  up needs no new OAuth flow — just naming the account and a restart.
+  up needs no new OAuth flow, just naming the account and a restart.
 - The user can answer "which Anthropic accounts am I logged into, and which
   agents use each?" with one command, and it fits on a screen.
 - A sub-agent, Stop hook, handoff summarizer, or cron fires against the same
-  account as its parent — no re-auth, no 401, no env-var hand-offs.
+  account as its parent: no re-auth, no 401, no env-var hand-offs.
 - When an account hits its cap, every agent on that account fails over to
-  the next account within seconds — not one inbound at a time.
+  the next account within seconds, not one inbound at a time.
 - An agent quiet for a week is still authenticated on the next ping; the
   credential was kept fresh whether or not the agent was awake.
 - Removing an account is one explicit action, refused while it is the fleet
@@ -47,9 +47,9 @@ this account on these agents" is configuration.
   recognises (their accounts), and it matches what the agent's own claude
   process reports.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
-- A per-agent OAuth flow for each agent sharing one subscription — the
+- A per-agent OAuth flow for each agent sharing one subscription, the
   per-login storm this job exists to kill.
 - Sharing one credentials file across agents via symlink, hard link, or
   bind mount: an atomic-rename writer orphans the target and other agents
@@ -57,7 +57,7 @@ this account on these agents" is configuration.
 - Per-agent OAuth refresh racing the single-use refresh endpoint, or
   per-agent quota state so each agent rediscovers the wall independently.
 - Falling through one account to another on exhaustion unless the user
-  explicitly listed both as preferences — two accounts must stay visibly
+  explicitly listed both as preferences. Two accounts must stay visibly
   separate.
 - Conflating "set up my Anthropic account" with "wire this agent to an
   existing account" into one verb, dragging the per-agent login back in.
@@ -74,7 +74,7 @@ this account on these agents" is configuration.
 - **One writer, many fresh mirrors** — `tests/auth.credentials-file-success`,
   `tests/auth.stale-token-fix`. *Watch:* a credential write is captured
   correctly and a stale token is never accepted as fresh. *Invariant:*
-  `claude-native` — every consumer reads a current subscription credential,
+  `claude-native`. Every consumer reads a current subscription credential,
   never an expired or API token.
 - **Broker health + per-agent fanout** — `tests/doctor-auth-broker`.
   *Watch:* drift, threshold violations, and active-account are surfaced;
@@ -97,13 +97,13 @@ seconds, no orphaned or stale credentials.
 
 ## Verdict
 
-- **Done when:** one login per account drives the whole fleet — every
+- **Done when:** one login per account drives the whole fleet. Every
   consumer authenticated, quota and failover account-level, no per-agent
-  OAuth storm — proven by the guards above.
+  OAuth storm. Proven by the guards above.
 
 ## Production-readiness
 
-- *Reliability:* the broker's death is degraded, not catastrophic — agents
+- *Reliability:* the broker's death is degraded, not catastrophic. Agents
   run on existing valid tokens until it returns and re-syncs from the
   account store.
 - *Concurrency:* exactly one OAuth refresher per account; no two processes

@@ -1,6 +1,7 @@
 ---
-artefact: vault-broker resilience and default auto-unlock
-serves: jobs/survive-reboots-and-real-life.md
+artifact: vault-broker resilience and default auto-unlock
+serves: survive-reboots-and-real-life
+advances-outcome: always-available
 status: Draft v1
 ---
 
@@ -16,7 +17,7 @@ The vault-broker is the single decryptor that serves secrets (bot
 tokens, OAuth creds) to agent gateways over per-agent UDS sockets.
 The 2026-05-17 install-validation re-run surfaced a class of failure
 that breaks the product's defining **always-on** outcome
-(`reference/vision.md:88` — "Each agent is a long-running service.
+(`reference/vision.md:88`, "Each agent is a long-running service.
 They survive reboots, network drops…"):
 
 > A routine `switchroom apply` (e.g. adding an agent) recreates the
@@ -24,7 +25,7 @@ They survive reboots, network drops…"):
 > **locked**. Every agent gateway whose `bot_token` is a `vault:`
 > ref then crash-loops, the supervisor **permanently gives up after
 > 10 restarts in 60 s**, and that bot goes dark until a human
-> intervenes — with **no working operator unlock path in the docker
+> intervenes, with **no working operator unlock path in the docker
 > model**, while `docker compose ps` still reports the broker
 > "healthy" and `switchroom vault broker status` reports a *phantom
 > host daemon* as `unlocked:true`.
@@ -37,7 +38,7 @@ surface that tells the truth.
 
 ## 2. Problem (code-grounded)
 
-### 2.1 The docker-native auto-unlock mechanism already works — it is just never populated
+### 2.1 The docker-native auto-unlock mechanism already works, it is just never populated
 
 The broker derives a machine-bound AES key from host-mounted
 `/etc/machine-id` (HKDF-SHA256, `src/vault/auto-unlock.ts:60-190`)
@@ -46,7 +47,7 @@ and at boot calls `_tryAutoUnlockFromMachineBoundFile`
 `SWITCHROOM_VAULT_BROKER_AUTO_UNLOCK_PATH` (compose sets it to
 `/state/vault-auto-unlock`, `src/agents/compose.ts:858`). The
 "systemd-creds" wording in `vault broker enable-auto-unlock --help`
-is **vestigial/incorrect** — the implementation uses machine-id
+is **vestigial/incorrect**. The implementation uses machine-id
 crypto (`src/cli/vault-broker.ts:404-415` → `encryptCredential` →
 `writeAutoUnlockFile`), not systemd-creds (that path is a v0.6
 fallback never hit in docker, `server.ts:2531-2550`).
@@ -82,17 +83,17 @@ the skipped optional step.
 with a hard cap: **10 restarts in 60 s → log "giving up" → `return
 1`** (`:68-70`); the sidecar dies and the agent runs with no
 Telegram connectivity until the *container* is recreated. There is
-**no backoff and no retry-forever path** — a 1 s fixed sleep
+**no backoff and no retry-forever path**, just a 1 s fixed sleep
 (`:72`), then permanent death. A transient dependency outage (broker
 recreate, host reboot ordering, momentary lock) is therefore
 *terminal*. The only non-give-up branch is `EX_CONFIG=78`
-(`:58-60`), used for genuine 401/token-config errors (#1076) — that
+(`:58-60`), used for genuine 401/token-config errors (#1076). That
 quarantine is correct and must be preserved; the bug is that
 *transient* unavailability is treated the same as permanent
 misconfig.
 
 Agents that resolved their token *before* a broker recreate keep
-working on a held long-poll — which **masks** the failure until the
+working on a held long-poll, which **masks** the failure until the
 next restart. Nothing should depend on a held long-poll surviving.
 
 ### 2.3 #32: two competing brokers; the CLI reports a phantom
@@ -114,19 +115,19 @@ Net: on the VM, `switchroom vault broker status` reported
 started/unlocked) while the *container* broker logged "staying
 locked." **The CLI actively misreports the broker the agents
 actually use.** The fix is not "make host unlock also reach the
-container" (perpetuates two paths) — it is to collapse to one.
+container" (perpetuates two paths). It is to collapse to one.
 
 ### 2.4 Dishonest observability
 
 The broker healthcheck (`src/agents/compose.ts:800`) is
-bind-presence only (`ls /run/switchroom/broker/*/sock`) — a
+bind-presence only (`ls /run/switchroom/broker/*/sock`), a
 deliberate "we don't speak the app protocol here" choice
 (`:782-799`).
 Consequence: a **locked** broker reads **healthy**. `BrokerStatus`
-already carries `unlocked` (`src/vault/broker/protocol.ts:340-346`)
-— the readiness signal exists, the healthcheck just ignores it.
+already carries `unlocked` (`src/vault/broker/protocol.ts:340-346`).
+The readiness signal exists, the healthcheck just ignores it.
 Plus stale strings: the gateway error says `Run: switchroom vault
-unlock` (`src/telegram/materialize-bot-token.ts:161`) — that
+unlock` (`src/telegram/materialize-bot-token.ts:161`), and that
 command does not exist (real: `switchroom vault broker unlock`); and
 `vault broker unlock` printed "Timeout waiting for broker" on the VM
 *while it actually succeeded*.
@@ -143,13 +144,13 @@ command does not exist (real: `switchroom vault broker unlock`); and
 
 **Non-goals**
 - Changing the at-rest crypto (machine-id HKDF is sound; unchanged).
-- Removing interactive-passphrase unlock — it remains, as the
+- Removing interactive-passphrase unlock. It remains, as the
   opt-in higher-assurance mode.
 - Multi-host / HA broker. Single-tenant always-on box is the model.
 
 ## 4. Design
 
-### Phase 1 — Auto-unlock is the unattended default (root-cause fix)
+### Phase 1: Auto-unlock is the unattended default (root-cause fix)
 
 - `encryptCredential` / `vault broker enable-auto-unlock` gain a
   non-interactive path: when stdin is not a TTY, consume
@@ -171,11 +172,11 @@ command does not exist (real: `switchroom vault broker unlock`); and
   missing/empty/malformed, surface a single actionable error
   (don't silently leave a fleet that will brick on next recreate).
 
-### Phase 2 — Supervisor resilience (the always-on backbone)
+### Phase 2: Supervisor resilience (the always-on backbone)
 
 `profiles/_base/start.sh.hbs` supervisor: classify exits.
 - `EX_CONFIG=78` (401/token misconfig): keep the immediate
-  quarantine + marker (unchanged — genuinely permanent).
+  quarantine + marker (unchanged, genuinely permanent).
 - All other non-zero exits (incl. the "vault locked" class):
   **exponential backoff (cap ~60 s) and retry indefinitely**, with
   the attempt count + next-delay surfaced to the supervisor log and
@@ -184,10 +185,10 @@ command does not exist (real: `switchroom vault broker unlock`); and
 - The gateway's "vault locked" exit becomes explicitly a *transient*
   class (it self-resolves when the broker unlocks), so an agent
   whose broker comes back (auto-unlock or operator action) recovers
-  on its own within one backoff cycle — no container recreate, no
+  on its own within one backoff cycle. No container recreate, no
   human.
 
-### Phase 3 — Collapse the broker duality (#32)
+### Phase 3: Collapse the broker duality (#32)
 
 - `switchroom vault broker {status,unlock,lock,start,stop}`
   runtime-detect docker mode (same detection used elsewhere:
@@ -205,7 +206,7 @@ command does not exist (real: `switchroom vault broker unlock`); and
   window; a single resolver decides target by runtime so the
   operator types the *same command* regardless.
 
-### Phase 4 — Honest observability
+### Phase 4: Honest observability
 
 - Broker healthcheck: probe the real readiness signal (`unlocked &&
   serving`) rather than socket bind-presence. Either an
@@ -238,12 +239,12 @@ Phase order is by leverage and independence:
    deprecation); do last, on its own, with the host-mode
    compatibility window explicit.
 
-Risks: (a) auto-unlock default is a security posture change —
+Risks: (a) auto-unlock default is a security posture change,
 mitigated by gating on explicit unattended signal + documenting the
 machine-bound threat model; (b) supervisor backoff must not mask a
-real permanent misconfig — mitigated by preserving the EX_CONFIG
+real permanent misconfig, mitigated by preserving the EX_CONFIG
 quarantine and surfacing attempt counts; (c) #32 collapse must not
-strand v0.6 installs — mitigated by runtime-detected routing with
+strand v0.6 installs, mitigated by runtime-detected routing with
 the legacy path intact for the deprecation window.
 
 ## 6. Definition of done
@@ -251,7 +252,7 @@ the legacy path intact for the deprecation window.
 Re-run the install-validation two-bot matrix on a fresh
 `--non-interactive` VM: add an agent via `switchroom apply` (which
 recreates the broker), do **nothing else**, and within one backoff
-cycle every bot — including the new one — is replying in Telegram.
+cycle every bot, including the new one, is replying in Telegram.
 `docker compose ps` shows the broker unhealthy iff it is actually
 locked. `switchroom vault broker status` reports the broker the
 agents use. No human typed a passphrase.

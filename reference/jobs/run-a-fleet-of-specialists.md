@@ -13,13 +13,13 @@ invariants: [no-self-escalation, single-tenant]
 One bot that knows everything is a demo. A fleet of agents, each shaped for
 a specific part of the user's life, is a workforce: a health coach in the
 morning, a coding assistant in the afternoon, an executive assistant for
-the inbox — each with its own voice, its own history, its own sense of
+the inbox, each with its own voice, its own history, its own sense of
 what's in-scope. The user picks the one they need and doesn't re-explain
 themselves. The product's job is to make running many agents genuinely
 easy and to make the fleet behave *as* a fleet: one lifecycle, one
 interaction surface, one safety posture. The thing that varies is the
-specialist, not the plumbing. Specialists are not personas over one model —
-each has its own memory, skills, tools, and topic. The health coach never
+specialist, not the plumbing. Specialists are not personas over one model.
+Each has its own memory, skills, tools, and topic. The health coach never
 sees the code-review history; the coding agent never second-guesses the
 sleep data. Separation is the point.
 
@@ -31,8 +31,8 @@ sleep data. Separation is the point.
   voice and by scope, without a label.
 - Each agent's memory is its own. What the user told one specialist does
   not surface in another.
-- The user never prefixes "as my coding agent" to get the right behaviour —
-  addressing the right agent does that.
+- The user never prefixes "as my coding agent" to get the right behaviour.
+  Addressing the right agent does that.
 - Tools and credentials are scoped per agent; the wrong agent never holds
   the wrong power.
 - A new agent joins as a peer: same lifecycle, same safety rules, same
@@ -42,7 +42,7 @@ sleep data. Separation is the point.
 - A cross-specialist need is routed by the user; agents don't silently
   reach into each other's state.
 
-**Bad looks like — never ship this**
+**Bad looks like: never ship this**
 
 - One agent pretending to be several by switching tone on command. A
   persona without its own memory and scope is cosplay.
@@ -91,7 +91,7 @@ scope stays enforced, and no agent acts on another's state.
 
 - **Done when:** the user runs multiple specialists that are distinct in
   voice, scope, and memory, work in parallel without interfering, and never
-  reach across into each other — proven by the scenarios above.
+  reach across into each other. Proven by the scenarios above.
 
 ## Production-readiness
 

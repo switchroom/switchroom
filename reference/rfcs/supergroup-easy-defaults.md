@@ -1,6 +1,7 @@
 ---
-artefact: supergroup easy-mode defaults (zero-config "agent owns a working room")
-serves: jobs/talk-to-agents-from-anywhere.md
+artifact: supergroup easy-mode defaults (zero-config "agent owns a working room")
+serves: talk-to-agents-from-anywhere
+advances-outcome: always-available
 status: Phase 1 implemented
 ---
 
@@ -16,9 +17,9 @@ status: Phase 1 implemented
 ## 1. Summary
 
 Make the supergroup-owned topology **zero-config easy mode**: an operator
-points an agent at a Telegram supergroup and it Just Works — responds to
+points an agent at a Telegram supergroup and it Just Works: responds to
 every message, in every topic (including ones created later), with DMs
-still served — without hand-editing `access.json` or picking a default
+still served, without hand-editing `access.json` or picking a default
 topic.
 
 This came out of enabling marko in the "Panorama Marketing" group, which
@@ -46,7 +47,7 @@ blast radius.
 
 - **P1 "If they need the docs, we've failed":** Today the bot joins a group
   and **silently drops** every message (`group_unknown`) until the operator
-  reads docs + edits JSON — this is *verbatim* the ❌ example in
+  reads docs + edits JSON. This is *verbatim* the ❌ example in
   `principles.md`. Phase 1 fixes the silent-config-gap half (config drives
   registration). Phase 2 adds the in-Telegram "enable this group?" nudge so
   the silent-drop is gone end-to-end. **Pass (P1) after phase 2; phase 1 is
@@ -61,11 +62,11 @@ blast radius.
 
 ## 4. Design
 
-### Phase 1 (this PR) — the zero-config core
+### Phase 1 (this PR): the zero-config core
 1. **Config-driven group registration.** `reconcileConfiguredGroup`
    (scaffold) idempotently merges the agent's configured supergroup
    (`channels.telegram.chat_id`, which overrides the fleet
-   `telegram.forum_chat_id`) into `access.json` on every reconcile —
+   `telegram.forum_chat_id`) into `access.json` on every reconcile,
    strictly additive: only adds the group if absent, preserves
    `allowFrom` / pairings / other groups / operator policy overrides.
    This closes the `writeIfMissing` gap that made a post-scaffold
@@ -88,7 +89,7 @@ agents:
 
 ### Phase 2 (follow-up PRs)
 3. **CLI on-ramp:** `switchroom agent add --topology supergroup --chat-id <id>`
-   and `agent set-topology <name> supergroup` (convert an existing agent) —
+   and `agent set-topology <name> supergroup` (convert an existing agent):
    writes the stanza + reconciles, so no YAML editing at all.
 4. **Kill the silent drop (P1 completion):** when a bot is in a group it
    isn't enabled for, post a one-tap "enable this group for <agent>?"
