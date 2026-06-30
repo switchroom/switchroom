@@ -36,6 +36,15 @@ const DOCKER_MATRIX_OPT_OUT: Record<string, string> = {
   // built/consumed by the UAT CI workflow, not published as a per-version
   // fleet GHCR tag, so it is intentionally outside the docker-images matrix.
   "uat-runner": "CI-only sandboxed UAT host runner (#2236); not a published fleet image",
+  // voice is the GPU STT sidecar (voice PR-B2). It extends a CUDA runtime
+  // base (nvidia/cuda), NOT switchroom-base, so it does not fit the
+  // build-dependents matrix (which threads BASE_IMAGE), and it is emitted
+  // into the fleet compose ONLY on a `local` GPU verdict — most hosts never
+  // pull it. Its CI build/publish needs a dedicated amd64-only,
+  // CUDA-aware job (like build-hindsight's standalone shape) and lands in a
+  // follow-up; opted out here until then so the matrix gate forces that
+  // choice rather than silently shipping an unbuilt image.
+  voice: "GPU STT sidecar (PR-B2); CUDA base, local-verdict-only — dedicated CI build job is a follow-up",
 };
 
 function dockerfileNames(): string[] {
