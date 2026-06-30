@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.16.26 — Approval-card reason + TTL determinism
+
+Gated hostd fleet verbs (`rollout`, `update_apply`, `agent_exec`, `agent_start`/`agent_stop`, `agent_logs`) now accept and display a `reason` on the operator approval card, so the operator can see *why* an action is being requested before tapping Approve or Deny.
+
+Approval cards for hostd fleet verbs now use a 30-minute decision window (was 10 minutes), strip their inline keyboard when they time out, and a tap on an already-expired card returns an honest "already timed out — ask again" notice instead of silently doing nothing — fixing the "approved but nothing happened" race. (#2677)
+
 ## v0.16.25 — Telegram deterministic message formatting
 
 Paragraph normalizer: guarantees a blank line (`\n\n`) between paragraphs and at GFM block boundaries — before tables, fenced code, blockquotes, and headings, and after a list when breakout prose follows — while keeping list internals and table rows intact. Fixes tables rendering as inline pipe text and prose being absorbed into the preceding bullet under the Bot API 10.1 rich-message (GFM) path.
