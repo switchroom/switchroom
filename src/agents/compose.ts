@@ -606,11 +606,15 @@ function emitVoiceSidecarService(
   lines.push(`    security_opt:`);
   lines.push(`      - "no-new-privileges:true"`);
   lines.push(`    environment:`);
-  // Shared-secret auth token — a `vault:` reference resolved by the
-  // sidecar's broker/entry at boot, mirroring the LiteLLM-key pattern:
-  // the literal secret is NEVER baked into compose. The container resolves
-  // VOICE_SIDECAR_TOKEN from the vault (voice/sidecar-token) and the
-  // gateway sends the same secret in the X-Voice-Token header.
+  // Shared-secret auth token — a docker-compose `${...}` interpolation, NOT
+  // a literal secret (the secret is NEVER baked into this YAML). At apply
+  // time, on a `local` verdict, `switchroom apply` seeds the token in the
+  // vault (voice/sidecar-token) if absent and writes it to the
+  // compose-adjacent `.env`, which docker reads to populate this var (see
+  // src/cli/voice-sidecar-token.ts). The pure-Python sidecar reads it
+  // straight from its env (docker/voice-sidecar/server.py) — it has no
+  // broker client. The gateway resolves the SAME vault key at use-time and
+  // sends it in the X-Voice-Token header.
   lines.push(`      VOICE_SIDECAR_TOKEN: \${VOICE_SIDECAR_TOKEN}`);
   lines.push(`      VOICE_STT_PORT: "${VOICE_SIDECAR_CONTAINER_PORT}"`);
   lines.push(`    volumes:`);
