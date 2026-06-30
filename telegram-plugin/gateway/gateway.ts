@@ -411,6 +411,7 @@ import {
   shouldRenderForegroundProgress,
   foregroundFinishAction,
 } from './foreground-nesting.js'
+import { createGetUpdatesHeartbeat } from './poll-heartbeat.js'
 import { createPollHealthCheck, type PollHealthCheckHandle } from './poll-health.js'
 import { recoverFromPollStall } from './poll-stall-recovery.js'
 import type {
@@ -786,24 +787,12 @@ const bot = new Bot(TOKEN)
 installTgPostLogger(bot)
 
 // ─── getUpdates heartbeat ─────────────────────────────────────────────────
-// Tracks the last time getUpdates completed (success OR error). Used by
-// the poll health check as a secondary stall signal: if getMe succeeds but
-// getUpdates hasn't responded in a while, the grammy runner loop is frozen
-// without the network being down (2026-06-30: clerk/klanker deaf for 2h
-// after a single timeout — getMe stayed green so the getMe-only check
-// never fired). Initialized to now so the first health-check interval
-// doesn't false-positive before the runner makes its first poll.
-let lastGetUpdatesHeartbeatMs = Date.now()
-bot.api.config.use(async (prev, method, payload, signal) => {
-  try {
-    const result = await prev(method, payload, signal)
-    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
-    return result
-  } catch (err) {
-    if (method === 'getUpdates') lastGetUpdatesHeartbeatMs = Date.now()
-    throw err
-  }
-})
+// Tracks the last time getUpdates completed (success OR error). Used by the
+// poll health check as a secondary stall signal: if getMe succeeds but
+// getUpdates hasn't responded recently, the grammy runner loop is frozen
+// without the network being down (2026-06-30 incident — see poll-heartbeat.ts).
+const getUpdatesHeartbeat = createGetUpdatesHeartbeat()
+bot.api.config.use(getUpdatesHeartbeat.transformer)
 
 const GRAMMY_VERSION: string = (() => {
   try {
@@ -23347,7 +23336,7 @@ if (POLL_HEALTH_INTERVAL_MS > 0) {
       // stall recovery fires after `failureThreshold` consecutive misses.
       // (2026-06-30 incident: one getUpdates TimeoutError → runner silently
       // froze; getMe stayed green; fleet deaf for 2 h until manual restart.)
-      const staleMs = Date.now() - lastGetUpdatesHeartbeatMs
+      const staleMs = Date.now() - getUpdatesHeartbeat.lastMs()
       const staleThresholdMs = POLL_HEALTH_INTERVAL_MS * POLL_HEALTH_THRESHOLD
       if (staleMs > staleThresholdMs) {
         throw new Error(
@@ -24511,7 +24500,11 @@ void (async () => {
         },
       })
       // Start the long-poll health-check now that the runner is up.
-      // Stop first in case we're re-entering the loop after a stall recovery.
+      // Stop first in case we're re-entering the loop after a 409 retry.
+      // Reset the getUpdates heartbeat so the fresh runner's first polls
+      // aren't immediately flagged as stale (the 409 backoff can be up to
+      // 15s, which is well within the stale threshold, but this is defensive).
+      getUpdatesHeartbeat.resetToNow()
       pollHealthCheck?.stop()
       pollHealthCheck?.start()
       await runnerHandle.task()
