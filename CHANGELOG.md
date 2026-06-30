@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.16.28 — Fix Hermes Desktop "Unknown session" on chat
+
+`session.status` was the only WebSocket handler missing the `ctx.activeSessionId` fallback. Hermes Desktop v0.17.0 calls `session.status` after `session.activate` without re-sending `session_id`, hitting the empty-string path and returning `Unknown session: ` — showing "Session unavailable" in the chat view. Fix: consistent with every other handler in the switch block. (#2682)
+
 ## v0.16.27 — Fix agent-initiated rollouts (hostd machine-id + litellm passphrase)
 
 Fleet rollouts triggered by agents via the hostd MCP (`/update apply`) were failing at the apply step whenever LiteLLM is enabled. Root cause: the hostd container was not mounting `/etc/machine-id`, so `resolveOperatorVaultPassphrase` could not decrypt the auto-unlock blob, returned null, and `provisionLiteLLMKeys` counted all 12 opted-in agents as scaffold failures — aborting rollout before a single agent was restarted. Keys already in the vault were untouched.
