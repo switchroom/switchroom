@@ -1,5 +1,36 @@
 # Changelog
 
+## unreleased — Voice PR-B2: local GPU STT sidecar (gateway consuming side + token injection)
+
+Wires the gateway's voice-in path to the local `voice-sidecar` GPU
+speech-to-text service when the host's PR-B1 voice verdict is `engine: local`.
+On such a host an inbound Telegram voice note is transcribed entirely
+on-box (faster-whisper) — no third-party STT key (vision #3,
+subscription-honest) and no cloud reachability dependency (vision #4,
+always-available). On a `cloud` verdict the existing OpenAI Whisper path is
+unchanged. Either way, any transcription failure falls back to the legacy
+`(voice message)` envelope — voice-in stays a non-critical UX enhancement.
+Serves `reference/jobs/talk-to-agents-from-anywhere.md`.
+
+- Gateway: new `transcribeViaSidecar` (POST audio → sidecar `/stt` with the
+  `X-Voice-Token` shared secret, mirroring `transcribeViaWhisper`'s
+  return-contract) and `maybeTranscribeVoiceLocal`. Engine selection reads
+  the persisted `loadHostCapabilities()` verdict; the local path needs no
+  `provider === 'openai'` gate (it has no API key). The Telegram download
+  is now a shared `downloadVoiceBytes` helper used by both paths.
+- Token: the sidecar's shared secret is resolved by BOTH ends from the vault
+  at `voice/sidecar-token`. The gateway resolves it at use-time via the
+  broker (`materializeSidecarToken`, mirroring `materializeVoiceKey`). At
+  `switchroom apply` (local verdict only), the token is seeded in the vault
+  if absent and written to the compose-adjacent `.env` (0600) so docker's
+  `${VOICE_SIDECAR_TOKEN}` interpolation populates the pure-Python sidecar's
+  env — the secret never lands in the generated YAML. A `cloud` verdict
+  removes any stale token `.env`.
+- Singleton reconcile + doctor now manage `voice-sidecar` as a
+  verdict-gated conditional singleton (`resolveSingletonServices`): tracked
+  for image-drift on a `local` host, never flagged missing/unhealthy on a
+  `cloud` host.
+
 ## v0.16.30 — Telegram deterministic formatting: reply-path bullet split + card-body normalization
 
 Deterministic Telegram formatting on two surfaces. On the reply path, collapsed inline bullet lists are now split onto separate lines (`splitCollapsedInlineBullets`) so bullets that arrived run-together render as a proper list. (#2687)

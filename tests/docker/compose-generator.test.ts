@@ -3073,3 +3073,59 @@ describe("conditional-mount probe home (in-hostd apply — marko meta_pages regr
     expect(yaml).not.toContain(`${pool}:${pool}:ro`);
   });
 });
+
+// ── voice-sidecar service (PR-B2) ─────────────────────────────────────
+// The local GPU STT sidecar is emitted ONLY on a `local` voice verdict.
+// Both branches are pinned here so a regression that emits the GPU service
+// on a cloud host — or drops it on a local host — fails CI.
+describe("generateCompose — voice-sidecar (PR-B2)", () => {
+  it("emits the voice-sidecar service + volume on a local verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ coach: {} }),
+      voiceEngine: "local",
+    });
+    expect(out).toContain("voice-sidecar:");
+    expect(out).toContain("container_name: switchroom-voice-sidecar");
+    // GPU reservation.
+    expect(out).toContain("driver: nvidia");
+    expect(out).toContain('capabilities: ["gpu"]');
+    // Published on all interfaces (host-net + strict-isolation reachable).
+    expect(out).toContain('"0.0.0.0:18900:8126"');
+    // Healthcheck on /healthz.
+    expect(out).toContain("/healthz");
+    // Token is a docker interpolation, NOT a literal secret in the YAML.
+    expect(out).toContain("VOICE_SIDECAR_TOKEN: ${VOICE_SIDECAR_TOKEN}");
+    // Model-cache named volume declared.
+    expect(out).toContain("voice-model-cache:");
+  });
+
+  it("emits NEITHER service NOR volume on a cloud verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ coach: {} }),
+      voiceEngine: "cloud",
+    });
+    expect(out).not.toContain("voice-sidecar:");
+    expect(out).not.toContain("switchroom-voice-sidecar");
+    expect(out).not.toContain("voice-model-cache");
+    expect(out).not.toContain("VOICE_SIDECAR_TOKEN");
+  });
+
+  it("defaults to NO sidecar when the verdict is unset (fail-safe cloud)", () => {
+    // No voiceEngine + no persisted host-capabilities file → defaults to
+    // cloud → never emits a GPU service on an unconfirmed host. Point HOME
+    // at an empty tmp dir so loadHostCapabilities() finds no verdict file
+    // (don't read the operator's real ~/.switchroom on this dev host).
+    const emptyHome = mkdtempSync(join(tmpdir(), "voice-no-verdict-"));
+    const prevHome = process.env.HOME;
+    process.env.HOME = emptyHome;
+    try {
+      const out = generateCompose({ config: makeConfig({ coach: {} }) });
+      expect(out).not.toContain("voice-sidecar:");
+      expect(out).not.toContain("voice-model-cache");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
+  });
+});

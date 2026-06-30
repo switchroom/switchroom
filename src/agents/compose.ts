@@ -86,6 +86,8 @@ import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { isReservedAgentName } from "../vault/broker/peercred.js";
 import { getBundledSkillsPoolDir } from "./reconcile-default-skills.js";
+import { loadHostCapabilities } from "../setup/host-capabilities.js";
+import type { VoiceEngine } from "../setup/gpu-detect.js";
 
 /** UID range reserved for agent containers. 999 slots — practical fleet limit. */
 export const AGENT_UID_MIN = 10001;
@@ -468,11 +470,44 @@ export interface ComposeGeneratorOptions {
    * `describeAgents`.
    */
   litellmConfirmedAgents?: Set<string>;
+  /**
+   * The persisted voice-engine verdict (PR-B1 → PR-B2). Drives whether the
+   * `voice-sidecar` STT service is emitted: `local` emits it (GPU present +
+   * container toolkit), `cloud` omits it entirely (no service).
+   *
+   * INJECTABLE so the compose-generator stays pure and the snapshot tests
+   * can exercise BOTH branches without shelling out to real hardware. When
+   * omitted, the generator reads the persisted verdict from
+   * `loadHostCapabilities()` (defaulting to `cloud` if no verdict file
+   * exists yet), so production callers Just Work without threading it.
+   */
+  voiceEngine?: VoiceEngine;
 }
 
-/** Resolve the image ref for one of the four service images. */
+/**
+ * Reserved fixed loopback/host port for the voice STT sidecar (PR-B2).
+ *
+ * Picked in the same published-port scheme the rest of the fleet uses
+ * (hindsight = 127.0.0.1:18888). 18900 is the next free slot just above
+ * the broker/hindsight range. RESERVED — a future singleton must not
+ * reuse it, or a `local`-verdict host would collide on bind. The sidecar
+ * listens on 8126 inside the container; compose maps host 18900 → 8126.
+ *
+ * Reachability (reviewer-flagged): the sidecar must be reachable by BOTH
+ * `network_mode: host` agents (via 127.0.0.1) AND strict-isolation agents
+ * (via `host.docker.internal`/host-gateway). A pure `127.0.0.1:18900`
+ * publish is NOT reachable from a strict-isolation peer's bridge network,
+ * so we publish on `0.0.0.0:18900` (the host-gateway-reachable interface)
+ * and rely on the X-Voice-Token shared secret for safety since the bind
+ * is broader than pure loopback. See emitVoiceSidecarService.
+ */
+export const VOICE_SIDECAR_HOST_PORT = 18900;
+/** The sidecar's in-container listen port (matches Dockerfile.voice EXPOSE). */
+export const VOICE_SIDECAR_CONTAINER_PORT = 8126;
+
+/** Resolve the image ref for one of the service images. */
 function resolveImageRef(
-  name: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker",
+  name: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker" | "voice",
   imageTag: string,
 ): string {
   return `ghcr.io/switchroom/switchroom-${name}:${imageTag}`;
@@ -485,7 +520,7 @@ function resolveImageRef(
  */
 function emitImageOrBuild(
   lines: string[],
-  service: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker",
+  service: "agent" | "broker" | "kernel" | "scheduler" | "auth-broker" | "voice",
   imageTag: string,
   buildMode: "pull" | "local",
   buildContext: string | undefined,
@@ -502,6 +537,87 @@ function emitImageOrBuild(
   } else {
     lines.push(`    image: ${resolveImageRef(service, imageTag)}`);
   }
+}
+
+/**
+ * Emit the `voice-sidecar` singleton service (PR-B2) — a local GPU
+ * speech-to-text server (faster-whisper) the gateway POSTs voice bytes to
+ * when the host's voice verdict is `local`. Caller gates emission on the
+ * verdict; this function unconditionally writes the stanza.
+ *
+ * Key design points (reviewed):
+ *  - GPU passthrough via `deploy.resources.reservations.devices` (nvidia,
+ *    count 1, capabilities ['gpu']) — the only GPU stanza in this file.
+ *  - Reachability: published on `0.0.0.0:<host>:<container>` so BOTH
+ *    host-network agents (127.0.0.1) AND strict-isolation agents (via
+ *    host.docker.internal/host-gateway) can reach it. A pure 127.0.0.1
+ *    publish would be invisible to a strict-isolation peer's bridge net.
+ *    The broader bind is made safe by the X-Voice-Token shared secret
+ *    (injected below from the vault; the gateway sends it on every /stt).
+ *  - Generous healthcheck start_period: the whisper model cold-loads in
+ *    30-90s on first boot (and re-loads on recreate), so a tight probe
+ *    would flap reconcile/`up`. The /healthz endpoint only 200s once the
+ *    model is fully loaded.
+ *  - Image-drift reconcile + doctor cover it via SINGLETON_SERVICES
+ *    (src/agents/singleton-reconcile.ts), which only manages it on a
+ *    `local` verdict.
+ */
+function emitVoiceSidecarService(
+  lines: string[],
+  imageTag: string,
+  buildMode: "pull" | "local",
+  buildContext: string | undefined,
+  containerNamePrefix: string,
+): void {
+  lines.push(`  voice-sidecar:`);
+  emitImageOrBuild(lines, "voice", imageTag, buildMode, buildContext);
+  lines.push(`    container_name: ${containerNamePrefix}-voice-sidecar`);
+  lines.push(`    labels:`);
+  lines.push(`      switchroom.role: "voice-sidecar"`);
+  lines.push(`      switchroom.fleet: "${containerNamePrefix}"`);
+  lines.push(`    restart: always`);
+  // GPU passthrough — requires the nvidia-container-toolkit on the host
+  // (the PR-B1 `containerToolkit` probe; a `local` verdict implies it).
+  lines.push(`    deploy:`);
+  lines.push(`      resources:`);
+  lines.push(`        reservations:`);
+  lines.push(`          devices:`);
+  lines.push(`            - driver: nvidia`);
+  lines.push(`              count: 1`);
+  lines.push(`              capabilities: ["gpu"]`);
+  // Reachable from both host-net and strict-isolation agents — see the
+  // function doc. Publish on all interfaces; the shared-secret header is
+  // the access gate, not the bind address.
+  lines.push(`    ports:`);
+  lines.push(
+    `      - "0.0.0.0:${VOICE_SIDECAR_HOST_PORT}:${VOICE_SIDECAR_CONTAINER_PORT}"`,
+  );
+  // /healthz returns 200 only once the model is loaded. start_period is
+  // generous (model cold-load 30-90s) so reconcile/`up` doesn't flap.
+  lines.push(`    healthcheck:`);
+  lines.push(
+    `      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${VOICE_SIDECAR_CONTAINER_PORT}/healthz >/dev/null || exit 1"]`,
+  );
+  lines.push(`      interval: 30s`);
+  lines.push(`      timeout: 5s`);
+  lines.push(`      retries: 3`);
+  lines.push(`      start_period: 120s`);
+  lines.push(`    stop_grace_period: 10s`);
+  lines.push(`    security_opt:`);
+  lines.push(`      - "no-new-privileges:true"`);
+  lines.push(`    environment:`);
+  // Shared-secret auth token — a `vault:` reference resolved by the
+  // sidecar's broker/entry at boot, mirroring the LiteLLM-key pattern:
+  // the literal secret is NEVER baked into compose. The container resolves
+  // VOICE_SIDECAR_TOKEN from the vault (voice/sidecar-token) and the
+  // gateway sends the same secret in the X-Voice-Token header.
+  lines.push(`      VOICE_SIDECAR_TOKEN: \${VOICE_SIDECAR_TOKEN}`);
+  lines.push(`      VOICE_STT_PORT: "${VOICE_SIDECAR_CONTAINER_PORT}"`);
+  lines.push(`    volumes:`);
+  // Fetch-once model weights persist here across recreate (never baked
+  // into the image — size + weight-redistribution licensing).
+  lines.push(`      - voice-model-cache:/models`);
+  lines.push(``);
 }
 
 interface AgentServiceData {
@@ -1080,6 +1196,13 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // calls Just Work; tests pass an explicit path (or "") to override.
   const bundledSkillsPoolDir = opts.bundledSkillsPoolDir ?? getBundledSkillsPoolDir();
 
+  // Voice-engine verdict (PR-B1 → PR-B2). Injectable for snapshot tests;
+  // production reads the persisted verdict. Default `cloud` (no sidecar)
+  // when no verdict file exists — fail-safe: never emit a GPU service on a
+  // host we haven't confirmed has a usable GPU.
+  const voiceEngine: VoiceEngine =
+    opts.voiceEngine ?? loadHostCapabilities()?.voice.engine ?? "cloud";
+
   // Resolve the host's analytics distinct ID once per generator call. The
   // CLI persists this at ~/.switchroom/analytics-id (see
   // src/analytics/posthog.ts:getDistinctId). Threading it through to the
@@ -1552,6 +1675,20 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   lines.push(`      - ${homePrefix}/.switchroom/state/auth-broker:/state/auth-broker`);
   lines.push(``);
 
+  // ── voice-sidecar (singleton, GPU STT — PR-B2) ─────────────────────
+  // Emitted ONLY on a `local` voice verdict (GPU present + container
+  // toolkit, per PR-B1). On `cloud` we emit nothing — voice-in routes
+  // through the OpenAI provider instead.
+  if (voiceEngine === "local") {
+    emitVoiceSidecarService(
+      lines,
+      imageTag,
+      buildMode,
+      buildContext,
+      containerNamePrefix,
+    );
+  }
+
   // ── per-agent services ─────────────────────────────────────────────
   for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     if (a.strippedCaps.length > 0) {
@@ -1595,6 +1732,12 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
     // compose project, so the prefix is invisible.
     lines.push(`  auth-broker-${c.name}-sock:`);
     lines.push(`    name: auth-broker-${c.name}-sock`);
+  }
+  // Named volume for the voice sidecar's fetch-once model weights —
+  // only declared when the sidecar service is emitted (local verdict).
+  // Keeps weights out of the image (size + redistribution licensing).
+  if (voiceEngine === "local") {
+    lines.push(`  voice-model-cache:`);
   }
   lines.push("");
 

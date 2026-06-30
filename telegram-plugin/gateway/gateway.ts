@@ -48,6 +48,7 @@ import {
   type GifSendArgs,
 } from '../sticker-aliases.js'
 import { transcribeViaWhisper } from '../voice-transcribe.js'
+import { transcribeViaSidecar } from '../voice-transcribe-sidecar.js'
 import {
   createTelegraphAccount,
   createTelegraphPage,
@@ -142,6 +143,8 @@ import {
 } from './microsoft-connect-flow.js'
 import { resolveAuthBrokerSocketPath } from '../../src/auth/broker/client.js'
 import { materializeVoiceKey } from '../../src/telegram/materialize-voice-key.js'
+import { materializeSidecarToken } from '../../src/telegram/materialize-sidecar-token.js'
+import { loadHostCapabilities } from '../../src/setup/host-capabilities.js'
 import { createFleetFallbackGate } from '../fleet-fallback-gate.js'
 import { createFleetFallbackResumeGate } from '../fleet-fallback-resume.js'
 import { resolveExhaustUntil } from './exhaust-until.js'
@@ -22115,13 +22118,29 @@ bot.on('message:voice', async ctx => {
   // SOMETHING — better than silent drops.
   const access = loadAccess()
   const voiceIn = access.voice_in
-  if (voiceIn?.enabled && voiceIn?.provider === 'openai') {
-    const transcript = await maybeTranscribeVoice(
-      voice.file_id,
-      voice.mime_type,
-      voiceIn.language,
-      voiceIn.api_key,
-    )
+  // Engine selection (PR-B2): the persisted host verdict decides HOW we
+  // transcribe. `local` → the in-fleet GPU sidecar (no third-party key,
+  // vision #3 + #4); anything else → the OpenAI cloud provider. The local
+  // path needs no `provider === 'openai'` gate — it has no API key — so we
+  // route to the sidecar whenever voice_in is enabled AND the host verdict
+  // is `local`. The cloud path keeps its existing openai gate.
+  const voiceEngine = loadHostCapabilities()?.voice.engine ?? 'cloud'
+  const localEnabled = voiceIn?.enabled === true && voiceEngine === 'local'
+  const cloudEnabled =
+    voiceIn?.enabled === true && voiceEngine !== 'local' && voiceIn?.provider === 'openai'
+  if (localEnabled || cloudEnabled) {
+    const transcript = localEnabled
+      ? await maybeTranscribeVoiceLocal(
+          voice.file_id,
+          voice.mime_type,
+          voiceIn?.language,
+        )
+      : await maybeTranscribeVoice(
+          voice.file_id,
+          voice.mime_type,
+          voiceIn?.language,
+          voiceIn?.api_key,
+        )
     if (transcript != null) {
       const text = ctx.message.caption
         ? `${ctx.message.caption}\n\n[voice transcript] ${transcript}`
@@ -22146,6 +22165,91 @@ bot.on('message:voice', async ctx => {
  * are logged to stderr but never thrown — voice-in is a UX
  * enhancement, not a critical path.
  */
+/**
+ * Filename hint for the multipart body. Telegram voice is OGG/Opus; agents
+ * may also attach mp3/m4a/wav which arrive as message:audio. Match the mime
+ * so the decoder (Whisper / faster-whisper) gets a usable extension.
+ */
+function voiceFilenameExt(mimeType: string | undefined): string {
+  return mimeType?.includes('mp3') ? 'mp3'
+    : mimeType?.includes('m4a') ? 'm4a'
+    : mimeType?.includes('wav') ? 'wav'
+    : 'ogg'
+}
+
+/**
+ * Download a Telegram voice attachment into memory. Shared by the cloud
+ * (Whisper) and local (sidecar) transcription paths. Returns the bytes on
+ * success, or null on any failure (caller falls back). Never throws.
+ */
+async function downloadVoiceBytes(fileId: string): Promise<Uint8Array | null> {
+  try {
+    const file = await bot.api.getFile(fileId)
+    if (!file.file_path) {
+      process.stderr.write(`telegram gateway: voice-in: getFile returned no file_path\n`)
+      return null
+    }
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+    if (!res.ok) {
+      process.stderr.write(`telegram gateway: voice-in: telegram download HTTP ${res.status}\n`)
+      return null
+    }
+    return new Uint8Array(await res.arrayBuffer())
+  } catch (err) {
+    // Sanitize: never let the bot token leak into log lines via the
+    // download URL — strip anything that looks like a token.
+    const msg = (err as Error).message.replace(/bot[\w:-]+/g, 'bot[redacted]')
+    process.stderr.write(`telegram gateway: voice-in: download failed: ${msg}\n`)
+    return null
+  }
+}
+
+/**
+ * Transcribe a Telegram voice note via the LOCAL GPU STT sidecar (PR-B2).
+ * Used when the host voice verdict is `local`. Resolves the shared-secret
+ * token from the vault (voice/sidecar-token), downloads the audio, and
+ * POSTs it to the sidecar at loopback (the gateway is network_mode: host).
+ * Returns the transcript on success, null on any failure (caller falls
+ * back to the legacy "(voice message)" envelope). Never throws.
+ */
+async function maybeTranscribeVoiceLocal(
+  fileId: string,
+  mimeType: string | undefined,
+  language: string | undefined,
+): Promise<string | null> {
+  const token = await materializeSidecarToken()
+  if (!token) {
+    // materializeSidecarToken already logged the specific reason.
+    return null
+  }
+
+  const audioBytes = await downloadVoiceBytes(fileId)
+  if (!audioBytes) return null
+
+  const result = await transcribeViaSidecar({
+    token,
+    audio: audioBytes,
+    filename: `voice.${voiceFilenameExt(mimeType)}`,
+    language,
+  })
+
+  if (!result.ok) {
+    process.stderr.write(
+      `telegram gateway: voice-in: local sidecar transcription failed reason=${result.reason}` +
+      (result.detail ? ` detail=${JSON.stringify(result.detail).slice(0, 100)}` : '') +
+      '\n',
+    )
+    return null
+  }
+
+  process.stderr.write(
+    `telegram gateway: voice-in: local sidecar transcribed ${audioBytes.length} bytes in ${result.durationMs}ms ` +
+    `lang=${result.language ?? '?'} audio_s=${result.audioSeconds ?? '?'} chars=${result.text.length}\n`,
+  )
+  return result.text
+}
+
 async function maybeTranscribeVoice(
   fileId: string,
   mimeType: string | undefined,
@@ -22164,42 +22268,13 @@ async function maybeTranscribeVoice(
     return null
   }
 
-  // Download the audio bytes from Telegram. Same shape as
-  // executeDownloadAttachment but in-memory rather than to disk.
-  let audioBytes: Uint8Array
-  try {
-    const file = await bot.api.getFile(fileId)
-    if (!file.file_path) {
-      process.stderr.write(`telegram gateway: voice-in: getFile returned no file_path\n`)
-      return null
-    }
-    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-    if (!res.ok) {
-      process.stderr.write(`telegram gateway: voice-in: telegram download HTTP ${res.status}\n`)
-      return null
-    }
-    audioBytes = new Uint8Array(await res.arrayBuffer())
-  } catch (err) {
-    // Sanitize: never let the bot token leak into log lines via the
-    // download URL — strip anything that looks like a token.
-    const msg = (err as Error).message.replace(/bot[\w:-]+/g, 'bot[redacted]')
-    process.stderr.write(`telegram gateway: voice-in: download failed: ${msg}\n`)
-    return null
-  }
-
-  // Filename hint — Telegram voice is OGG/Opus; agents may also
-  // attach mp3/m4a/etc which arrive as message:audio (handled
-  // separately). Match the mime to give Whisper a usable extension.
-  const ext = mimeType?.includes('mp3') ? 'mp3'
-    : mimeType?.includes('m4a') ? 'm4a'
-    : mimeType?.includes('wav') ? 'wav'
-    : 'ogg'
+  const audioBytes = await downloadVoiceBytes(fileId)
+  if (!audioBytes) return null
 
   const result = await transcribeViaWhisper({
     apiKey,
     audio: audioBytes,
-    filename: `voice.${ext}`,
+    filename: `voice.${voiceFilenameExt(mimeType)}`,
     language,
   })
 

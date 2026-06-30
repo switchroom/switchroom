@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  CORE_SINGLETON_SERVICES,
   SINGLETON_SERVICES,
+  VOICE_SIDECAR_SERVICE,
   detectSingletonDrift,
   readPinnedSingletonImages,
   reconcileSingletons,
+  resolveSingletonServices,
   singletonContainerName,
 } from "./singleton-reconcile.js";
 
@@ -21,18 +24,97 @@ services:
 `;
 
 describe("singleton service/container naming", () => {
-  it("covers all three singletons", () => {
-    expect([...SINGLETON_SERVICES]).toEqual([
+  it("covers the three core singletons", () => {
+    expect([...CORE_SINGLETON_SERVICES]).toEqual([
       "vault-broker",
       "approval-kernel",
       "switchroom-auth-broker",
     ]);
   });
 
+  it("the full universe also includes voice-sidecar (the conditional singleton)", () => {
+    expect([...SINGLETON_SERVICES]).toEqual([
+      "vault-broker",
+      "approval-kernel",
+      "switchroom-auth-broker",
+      "voice-sidecar",
+    ]);
+    expect(VOICE_SIDECAR_SERVICE).toBe("voice-sidecar");
+  });
+
   it("prefixes container names, leaving the already-prefixed auth-broker intact", () => {
     expect(singletonContainerName("vault-broker")).toBe("switchroom-vault-broker");
     expect(singletonContainerName("approval-kernel")).toBe("switchroom-approval-kernel");
     expect(singletonContainerName("switchroom-auth-broker")).toBe("switchroom-auth-broker");
+  });
+});
+
+const COMPOSE_LOCAL = `
+services:
+  vault-broker:
+    image: ghcr.io/switchroom/switchroom-broker:v0.14.66
+  approval-kernel:
+    image: ghcr.io/switchroom/switchroom-kernel:v0.14.66
+  switchroom-auth-broker:
+    image: ghcr.io/switchroom/switchroom-auth-broker:v0.14.66
+  voice-sidecar:
+    image: ghcr.io/switchroom/switchroom-voice:v0.14.66
+`;
+
+describe("resolveSingletonServices — voice-sidecar is verdict-gated (PR-B2)", () => {
+  it("includes voice-sidecar ONLY on a local verdict", () => {
+    expect(resolveSingletonServices("local")).toEqual([
+      "vault-broker",
+      "approval-kernel",
+      "switchroom-auth-broker",
+      "voice-sidecar",
+    ]);
+  });
+
+  it("omits voice-sidecar on a cloud verdict", () => {
+    expect(resolveSingletonServices("cloud")).toEqual([
+      "vault-broker",
+      "approval-kernel",
+      "switchroom-auth-broker",
+    ]);
+    expect(resolveSingletonServices("cloud")).not.toContain("voice-sidecar");
+  });
+});
+
+describe("detectSingletonDrift — voice-sidecar gating", () => {
+  it("manages voice-sidecar on a local verdict (flags its drift)", () => {
+    const running: Record<string, string> = {
+      "switchroom-vault-broker": "ghcr.io/switchroom/switchroom-broker:v0.14.66",
+      "switchroom-approval-kernel": "ghcr.io/switchroom/switchroom-kernel:v0.14.66",
+      "switchroom-auth-broker": "ghcr.io/switchroom/switchroom-auth-broker:v0.14.66",
+      "switchroom-voice-sidecar": "ghcr.io/switchroom/switchroom-voice:v0.14.24", // STALE
+    };
+    const drift = detectSingletonDrift({
+      composeFile: "x",
+      readCompose: () => COMPOSE_LOCAL,
+      voiceEngine: "local",
+      inspectImage: (c) => running[c] ?? null,
+    });
+    const vs = drift.find((d) => d.service === "voice-sidecar")!;
+    expect(vs).toBeDefined();
+    expect(vs.needsRecreate).toBe(true);
+    expect(vs.pinned).toContain("switchroom-voice:v0.14.66");
+  });
+
+  it("does NOT manage voice-sidecar on a cloud verdict (never flags it absent)", () => {
+    const drift = detectSingletonDrift({
+      composeFile: "x",
+      readCompose: () => COMPOSE, // no voice-sidecar service
+      voiceEngine: "cloud",
+      inspectImage: () => null, // everything absent
+    });
+    // voice-sidecar is not even considered on a cloud host.
+    expect(drift.find((d) => d.service === "voice-sidecar")).toBeUndefined();
+    expect(drift.map((d) => d.service)).toEqual([
+      "vault-broker",
+      "approval-kernel",
+      "switchroom-auth-broker",
+    ]);
   });
 });
 
@@ -73,6 +155,7 @@ describe("detectSingletonDrift", () => {
     const drift = detectSingletonDrift({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: (c) => running[c] ?? null,
     });
     const byService = Object.fromEntries(drift.map((d) => [d.service, d]));
@@ -87,6 +170,7 @@ describe("detectSingletonDrift", () => {
     const drift = detectSingletonDrift({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: () => null, // all absent / docker unreachable
     });
     for (const d of drift) {
@@ -104,6 +188,7 @@ services:
     const drift = detectSingletonDrift({
       composeFile: "x",
       readCompose: () => buildLocal,
+      voiceEngine: "cloud",
       inspectImage: () => "some-local-build:dev",
     });
     const vb = drift.find((d) => d.service === "vault-broker")!;
@@ -123,6 +208,7 @@ describe("reconcileSingletons", () => {
     const res = reconcileSingletons({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: (c) => running[c] ?? null,
       recreate: (svc) => recreated.push(svc),
       log: () => {},
@@ -137,6 +223,7 @@ describe("reconcileSingletons", () => {
     const res = reconcileSingletons({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: (c) =>
         ({
           "switchroom-vault-broker": "ghcr.io/switchroom/switchroom-broker:v0.14.66",
@@ -156,6 +243,7 @@ describe("reconcileSingletons", () => {
     const res = reconcileSingletons({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: (c) =>
         c === "switchroom-auth-broker"
           ? "ghcr.io/switchroom/switchroom-auth-broker:v0.14.24"
@@ -173,6 +261,7 @@ describe("reconcileSingletons", () => {
     const res = reconcileSingletons({
       composeFile: "x",
       readCompose: () => COMPOSE,
+      voiceEngine: "cloud",
       inspectImage: () => "ghcr.io/switchroom/switchroom-x:v0.14.24", // all stale
       recreate: (svc) => {
         if (svc === "approval-kernel") throw new Error("docker daemon down");
