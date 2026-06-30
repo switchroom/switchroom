@@ -60,6 +60,14 @@ RUN pip3 install --no-cache-dir \
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
+# Pre-create the model-cache dir owned by the runtime uid BEFORE the VOLUME
+# instruction. Docker initializes a fresh named volume from the ownership of
+# the image directory at the mount point — if /models is left root:root, the
+# non-root runtime uid (65532) cannot write the first-boot model download and
+# faster-whisper dies with `PermissionError: [Errno 13] ... '/models/...'`
+# (bug #2707). Chowning it here makes the inherited volume ownership writable.
+RUN mkdir -p /models && chown -R 65532:65532 /models
+
 # Weights land in this volume on first boot; never baked into the image.
 VOLUME ["/models"]
 
