@@ -175,6 +175,30 @@ describe("renderIssuesCard", () => {
     expect(out).toContain("`<x>::<y>`");
     expect(out).toContain("<dangerous & stuff>");
   });
+
+  it("stacks issue rows with GFM hard breaks so they don't collapse onto one line (#2669)", () => {
+    // Card-body regression: the rich-message renderer collapses lone-`\n`
+    // separated rows into a run-on blob. The issues card now routes its rows
+    // through stackCardLines, so each issue row is separated by a hard break.
+    const events = [
+      makeEvent({ fingerprint: "a::1", code: "1", severity: "critical", summary: "alpha down", detail: "Fix: restart alpha" }),
+      makeEvent({ fingerprint: "a::2", code: "2", severity: "error", summary: "beta slow" }),
+    ];
+    const out = renderIssuesCard({ agentName: "klanker", events, now: 1_700_000_000_000 })!;
+    // Header → rows is a genuine paragraph gap (blank line preserved).
+    expect(out).toContain("\n\n");
+    // Each adjacent issue row (and its remediation line) is hard-broken, not
+    // soft — so no two non-blank body lines are glued by a LONE `\n`.
+    const softBreaks = out.split("\n\n").flatMap((block) => {
+      // Within a block, every internal `\n` must be a hard break (` \n`).
+      return [...block.matchAll(/(?<! {2})\n/g)];
+    });
+    expect(softBreaks.length).toBe(0);
+    // Both rows + the remediation line all rendered, stacked.
+    expect(out).toContain("alpha down");
+    expect(out).toContain("→ _restart alpha_");
+    expect(out).toContain("beta slow");
+  });
 });
 
 // ─── createIssuesCardHandle (lifecycle) ──────────────────────────────────────

@@ -84,10 +84,10 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       "**→ Reading gateway.ts**",
     );
     expect(appendActivityLine(lines, "mcp__hindsight__reflect", { query: "x" })).toBe(
-      "_✓ Reading gateway.ts_\n**→ Searching memory**",
+      "_✓ Reading gateway.ts_  \n**→ Searching memory**",
     );
     expect(appendActivityLine(lines, "Bash", { command: "ls", description: "List workspace" })).toBe(
-      "_✓ Reading gateway.ts_\n_✓ Searching memory_\n**→ List workspace**",
+      "_✓ Reading gateway.ts_  \n_✓ Searching memory_  \n**→ List workspace**",
     );
   });
 
@@ -110,7 +110,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = Array.from({ length: total }, (_, i) => `Action ${i + 1}`);
     const out = renderActivityFeed(lines)!;
     const hidden = total - STATUS_ROLLING_LINES;
-    expect(out.startsWith(`_✓ +${hidden} earlier…_\n`)).toBe(true);
+    expect(out.startsWith(`_✓ +${hidden} earlier…_  \n`)).toBe(true);
     // Only the last STATUS_ROLLING_LINES actions are shown; older ones collapsed.
     const firstVisible = total - STATUS_ROLLING_LINES + 1;
     expect(out).toContain(`_✓ Action ${firstVisible}_`);
@@ -145,7 +145,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
     const lines = ["Reading a.ts", "Searching memory", "Running a command"];
     const out = renderActivityFeed(lines, true)!;
     expect(out).toBe(
-      "_✓ Reading a.ts_\n_✓ Searching memory_\n_✓ Running a command_",
+      "_✓ Reading a.ts_  \n_✓ Searching memory_  \n_✓ Running a command_",
     );
     expect(out).not.toContain("→"); // no in-progress arrow anywhere
   });
@@ -164,7 +164,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
   describe("liveSuffix (heartbeat)", () => {
     it("appends the suffix to the newest in-progress line only", () => {
       expect(renderActivityFeed(["Reading a.ts", "Running a command"], false, " · 18s")).toBe(
-        "_✓ Reading a.ts_\n**→ Running a command · 18s**",
+        "_✓ Reading a.ts_  \n**→ Running a command · 18s**",
       );
     });
     it("single live line gets the suffix", () => {
@@ -176,7 +176,7 @@ describe("appendActivityLine + renderActivityFeed — accumulating activity feed
       const out = renderActivityFeed(["Reading a.ts", "Running a command"], true, " · 18s")!;
       expect(out).not.toContain("·");
       expect(out).not.toContain("→");
-      expect(out).toBe("_✓ Reading a.ts_\n_✓ Running a command_");
+      expect(out).toBe("_✓ Reading a.ts_  \n_✓ Running a command_");
     });
     it("default empty suffix is byte-identical to no suffix", () => {
       expect(renderActivityFeed(["Reading a.ts"], false, "")).toBe(
@@ -191,7 +191,7 @@ describe("appendActivityLabel — precomputed label feed (tool_label path)", () 
     const lines: string[] = [];
     expect(appendActivityLabel(lines, "Searching memory")).toBe("**→ Searching memory**");
     expect(appendActivityLabel(lines, "List workspace")).toBe(
-      "_✓ Searching memory_\n**→ List workspace**",
+      "_✓ Searching memory_  \n**→ List workspace**",
     );
     // consecutive dup collapses
     appendActivityLabel(lines, "List workspace");
@@ -381,7 +381,7 @@ describe("renderActivityFeedWithNested — foreground sub-agent nesting (Model A
   it("stepCount footer appears on final=true with no children (delegates to flat render)", () => {
     const out = renderActivityFeedWithNested(["Reading a.ts"], [], true, "", 3)!;
     expect(out).toContain("_✓ 3 steps_");
-    expect(out).toBe("_✓ Reading a.ts_\n_✓ 3 steps_");
+    expect(out).toBe("_✓ Reading a.ts_  \n_✓ 3 steps_");
   });
 
   // Liveness-driven feed open (dark-turn fix): a turn that emits no tool_label
@@ -845,5 +845,43 @@ describe("describeToolUse — surface-tool suppression is key-agnostic", () => {
   it("returns null for telegram edit_message and react under any key", () => {
     expect(describeToolUse("mcp__clerk-telegram__edit_message", {})).toBeNull();
     expect(describeToolUse("mcp__clerk-telegram__react", {})).toBeNull();
+  });
+});
+
+describe("status-card body stacks like a reply (#2669 rich-message renderer)", () => {
+  // The single most-seen surface: the operator's progress card. Its step lines
+  // are styled prose (`_✓ …_`, `**→ …**`), NOT GFM list items, so a lone `\n`
+  // between them is a SOFT break the renderer collapses — bullets ran together
+  // into one line. The card now joins via stackCardLines (hard breaks), so the
+  // bullets stack exactly as the reply path renders them.
+
+  it("multiple step bullets stack on their own lines (no soft-break collapse)", () => {
+    const out = renderActivityFeed(["Reading a.ts", "Searching memory", "Running tests"], true)!;
+    const lines = out.split("  \n");
+    expect(lines).toEqual(["_✓ Reading a.ts_", "_✓ Searching memory_", "_✓ Running tests_"]);
+    // Not a single lone `\n` survives to collapse two bullets.
+    expect(out).not.toMatch(/(?<! {2})\n/);
+  });
+
+  it("the collapsed-inline-bullet case is fixed on a card body specifically", () => {
+    // Three labels that, joined by a lone `\n`, would render as a single run-on
+    // visual line in the rich renderer. After stacking, each renders distinctly.
+    const out = renderActivityFeed(["Editing foo.ts", "Editing bar.ts", "Writing baz.ts"])!;
+    // Every adjacent pair is separated by a hard break.
+    expect(out.match(/ {2}\n/g)?.length).toBe(2);
+    // The newest is the in-progress bold step; earlier are done — all visible.
+    expect(out).toContain("_✓ Editing foo.ts_");
+    expect(out).toContain("_✓ Editing bar.ts_");
+    expect(out).toContain("**→ Writing baz.ts**");
+  });
+
+  it("stacking does not corrupt the card's own italic/bold wrapper markup", () => {
+    // The status card wraps each step in `_…_` (done) or `**→ …**` (live). The
+    // stacking pass only changes the SEPARATOR between lines — the per-line
+    // wrapper markup must be byte-identical. (Step TEXT is stripped to plain
+    // prose by escapeStepLine; the inline-markup-survives case is covered by
+    // the stackCardLines unit test, which operates on pre-rendered lines.)
+    const out = renderActivityFeed(["Reading a.ts", "Running tests"], false)!;
+    expect(out).toBe("_✓ Reading a.ts_  \n**→ Running tests**");
   });
 });

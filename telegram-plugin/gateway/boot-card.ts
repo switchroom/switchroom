@@ -51,7 +51,7 @@ import {
   AGENT_LIVE_WINDOW_MS,
   AGENT_LIVE_POLL_INTERVAL_MS,
 } from './boot-probes.js'
-import { escapeMarkdown } from '../card-format.js'
+import { escapeMarkdown, stackCardLines } from '../card-format.js'
 import {
   loadCache as loadBootIssueCache,
   diffProbes as diffBootProbes,
@@ -468,7 +468,12 @@ export function renderBootCard(opts: RenderBootCardOpts): string {
     sections.push('', ...configChangeRows)
   }
   if (sections.length === 1) return ack
-  return sections.join('\n')
+  // Stack rows with GFM hard breaks so the boot card's styled prose rows don't
+  // collapse onto one visual line in the rich-message renderer (#2669). A
+  // section entry may itself carry an internal newline (a multi-line `ack`, an
+  // update-outcome blob), so flatten to single lines first — see stackCardLines.
+  const flatLines = sections.flatMap((s) => s.split('\n'))
+  return stackCardLines(flatLines)
 }
 
 /**

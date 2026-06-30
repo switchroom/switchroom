@@ -17,7 +17,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { escapeMarkdown } from "./card-format.js";
+import { escapeMarkdown, stackCardLines } from "./card-format.js";
 import type { IssueEvent, IssueSeverity } from "../src/issues/index.js";
 
 export interface BotApiForIssuesCard {
@@ -99,26 +99,31 @@ export function renderIssuesCard(opts: RenderIssuesCardOpts): string | null {
   const overflow = sorted.length - visible.length;
 
   const now = opts.now ?? Date.now();
-  const rows = visible.map((e) => {
+  // Build a flat list of SINGLE lines (a row may contribute a head line plus a
+  // remediation line) so stackCardLines can promote every inter-line break to a
+  // GFM hard break — otherwise the rows collapse onto one visual line in the
+  // rich-message renderer (the same bug stackCardLines fixes for status cards).
+  const rowLines: string[] = [];
+  for (const e of visible) {
     const emoji = SEVERITY_EMOJI[e.severity];
     const occ = e.occurrences > 1 ? ` _(×${e.occurrences})_` : "";
     const ago = relTime(now - e.last_seen);
-    const head = `${emoji} \`${e.fingerprint}\`  ${escapeMarkdown(e.summary)}${occ} — _${ago}_`;
+    rowLines.push(`${emoji} \`${e.fingerprint}\`  ${escapeMarkdown(e.summary)}${occ} — _${ago}_`);
     // Render the `detail` line below the summary when present and short
     // enough to be a remediation hint (not a multi-line stderr tail).
     // Convention from the cron prompt template: agents put "Fix: <cmd>"
     // or "→ <cmd>" in detail. Long stderr details are omitted from the
     // card to keep the layout tight; users can run /issues to see them.
     const remediation = formatRemediation(e.detail);
-    return remediation == null ? head : `${head}\n  → _${escapeMarkdown(remediation)}_`;
-  });
+    if (remediation != null) rowLines.push(`  → _${escapeMarkdown(remediation)}_`);
+  }
 
-  const lines = [header, "", ...rows];
+  const lines = [header, "", ...rowLines];
   if (overflow > 0) {
     lines.push("");
     lines.push(`_+${overflow} more not shown — run \`/issues\`_`);
   }
-  return lines.join("\n");
+  return stackCardLines(lines);
 }
 
 /**
