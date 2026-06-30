@@ -843,8 +843,8 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
   // message.message. Use a sentinel so text-based assertions still fire
   // until mtcute is updated to support the new TL constructor.
   const rawText = msg.text ?? "";
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const isRichMedia = rawText === "" && (msg.raw as any)?.media?._ === "messageMediaUnsupported";
+  const isRichMedia = rawText === "" &&
+    msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
   return {
     chatId: msg.chat.id,
     messageId: msg.id,
