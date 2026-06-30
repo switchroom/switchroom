@@ -223,6 +223,22 @@ describe('renderAuthSnapshotFormat2', () => {
     expect(capLine!.trim().endsWith('_')).toBe(true);
   });
 
+  it('drops the ETA code-span on a blocked account with no known reset time', () => {
+    // Blocked on 7d but the binding window has no reset epoch — must NOT
+    // render a `in —` code-span; falls back to plain "reset time unknown".
+    const noReset = [
+      snap({ label: 'norst@example.com', isActive: true, quota: quota({ sevenDayUtilizationPct: 100 }) }),
+    ];
+    const out = renderAuthSnapshotFormat2(noReset, { now: NOW, tz: 'UTC' });
+    const capLine = out.split('\n').find((l) => l.includes('quota exhausted'));
+    expect(capLine).toBeDefined();
+    expect(capLine).not.toContain('`in —`');
+    expect(capLine).not.toContain('—`');
+    expect(capLine).toContain('reset time unknown');
+    expect(capLine!.trim().startsWith('_quota exhausted')).toBe(true);
+    expect(capLine!.trim().endsWith('_')).toBe(true);
+  });
+
   it('wraps both the 5h-refills and 7d-resets ETAs in `code` spans', () => {
     const out = renderAuthSnapshotFormat2(fixtureSnaps, { now: NOW, tz: 'UTC' });
     const lines = out.split('\n');
