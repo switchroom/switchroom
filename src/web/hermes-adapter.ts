@@ -772,7 +772,16 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     case "session.resume":
     case "session.activate": {
       // Map to an existing agent — Switchroom agents are always live.
-      const sessionId = String(params.session_id ?? params.name ?? "");
+      // session.create from Hermes v0.17+ may omit session_id (profile-based new-chat
+      // flow); fall back to the active session on this WS connection, then the most
+      // recently active agent.
+      let sessionId = String(params.session_id ?? params.name ?? "");
+      if (!sessionId && ctx.activeSessionId) sessionId = ctx.activeSessionId;
+      if (!sessionId) {
+        const all = await handleGetAgents(config);
+        const latest = all.sort((a, b) => (b.lastTurnAt ?? 0) - (a.lastTurnAt ?? 0))[0];
+        if (latest) sessionId = latest.name;
+      }
       if (!isKnownSession(config, sessionId)) {
         sendResponse(ctx, rpcErr(id, -32602, `Unknown session: ${sessionId}`));
         break;
@@ -905,6 +914,15 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
       sendResponse(ctx, rpcOk(id, { ok: true }));
+      break;
+    }
+
+    case "pet.info":
+    case "pet.info.meta":
+    case "pet.gallery": {
+      // Hermes "pet" companion feature — not supported by Switchroom; signal disabled
+      // so Hermes stops retrying instead of looping on -32601.
+      sendResponse(ctx, rpcOk(id, { enabled: false }));
       break;
     }
 
