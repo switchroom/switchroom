@@ -302,7 +302,7 @@ export async function provisionLiteLLMKeys(
     // of autonomous fleet updates. First-time provisioning requires an
     // interactive `switchroom apply` with vault access (operator console or
     // SWITCHROOM_VAULT_PASSPHRASE env). Note: adding /etc/machine-id:ro to the
-    // hostd compose fixes the root cause on this host (PR #NNNN).
+    // hostd compose fixes the root cause on this host (PR #2679).
     const targets = [
       ...optedIn.map(({ name }) => name),
       ...(needsHindsight ? ["hindsight (service)"] : []),
