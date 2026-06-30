@@ -384,9 +384,17 @@ function startHistoryPoll(
 
         for (const row of rows) {
           cursor = row.rowid;
+          // If there's a pending prompt.submit, use that prompt_key so Hermes
+          // resolves the spinner. Otherwise synthesise a new start+complete pair
+          // (Telegram-originated reply the user didn't trigger from Hermes).
+          const promptKey = ctx.pendingPromptKey ?? `tg-${row.rowid}`;
+          if (!ctx.pendingPromptKey) {
+            sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
+          }
+          ctx.pendingPromptKey = undefined;
           sendEvent(ctx, "message.complete", sessionId, {
             text: row.text,
-            prompt_key: `poll-${row.rowid}`,
+            prompt_key: promptKey,
           });
         }
       } finally { db.close(); }
@@ -788,6 +796,12 @@ export interface HermesWsContext {
   activeSessionId?: string;
   /** Stop function for the history.db background poller — called on session change or close. */
   stopHistoryPoll?: () => void;
+  /**
+   * prompt_key from the most recent prompt.submit that hasn't yet been resolved by
+   * a message.complete. The history poller claims this key for the first new assistant
+   * message so the response resolves the correct pending spinner in Hermes.
+   */
+  pendingPromptKey?: string;
 }
 
 function sendEvent(ctx: HermesWsContext, type: string, sessionId: string | null, payload: unknown) {
@@ -998,16 +1012,19 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         .slice(0, 12);
 
       sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
+      // Record so the history poller uses this key when the agent's reply lands.
+      ctx.pendingPromptKey = promptKey;
 
       const result = await injectInbound(agentsDir, submitAgent, chat.chatId, chat.threadId, content, promptKey);
       if (!result.ok) {
+        ctx.pendingPromptKey = undefined;
         sendEvent(ctx, "error", sessionId, { message: result.error, prompt_key: promptKey });
         sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
         break;
       }
 
-      // Prompt accepted. The background history poller will emit message.complete
-      // when the agent's reply arrives in history.db (within ~2s).
+      // Prompt accepted. The history poller (started at session.activate) will emit
+      // message.complete with this prompt_key when the agent's reply appears in history.db.
       sendResponse(ctx, rpcOk(id, { ok: true, prompt_key: promptKey }));
       break;
     }
