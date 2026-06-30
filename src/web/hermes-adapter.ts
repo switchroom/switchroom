@@ -285,6 +285,125 @@ async function injectInbound(
   });
 }
 
+/**
+ * Read the most recent `limit` messages from history.db for an agent.
+ * Returns an array of {role, content, timestamp} in chronological order,
+ * or null if history.db is unavailable.
+ */
+function readHistoryDb(
+  agentsDir: string,
+  agentName: string,
+  limit: number,
+): Array<{ role: string; content: string; timestamp: number }> | null {
+  const dbPath = resolve(agentsDir, agentName, "telegram", "history.db");
+  if (!existsSync(dbPath)) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let SqliteDatabase: any;
+    const meta = import.meta as { require?: (id: string) => unknown };
+    if (!meta.require) return null;
+    const mod = meta.require("bun:sqlite") as { Database?: unknown };
+    SqliteDatabase = mod.Database;
+    if (!SqliteDatabase) return null;
+
+    const db = new SqliteDatabase(dbPath, { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          `SELECT role, text, ts FROM messages
+           ORDER BY ts DESC, rowid DESC LIMIT ?`,
+        )
+        .all(limit) as Array<{ role: string; text: string; ts: number }>;
+      return rows.reverse().map((r) => ({
+        role: r.role,
+        content: r.text,
+        timestamp: r.ts,
+      }));
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Start a 2-second background poll on history.db for a given agent.
+ * Emits `message.complete` to the WS client for every new assistant
+ * message — covering both Telegram-originated and Hermes-injected replies.
+ *
+ * The cursor is the SQLite rowid so ties / timestamp collisions can't
+ * cause missed or duplicate messages. Only assistant messages are emitted;
+ * user messages are already rendered locally by Hermes or injected via us.
+ *
+ * Returns a stop function. Call it on session change or WS close.
+ */
+function startHistoryPoll(
+  ctx: HermesWsContext,
+  agentsDir: string,
+  agentName: string,
+  sessionId: string,
+  pollIntervalMs = 2_000,
+): () => void {
+  const dbPath = resolve(agentsDir, agentName, "telegram", "history.db");
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let SqliteDatabase: any = null;
+  try {
+    const meta = import.meta as { require?: (id: string) => unknown };
+    if (meta.require) {
+      const mod = meta.require("bun:sqlite") as { Database?: unknown };
+      SqliteDatabase = mod.Database ?? null;
+    }
+  } catch { /* not Bun — skip */ }
+
+  // Initialise cursor to current max rowid so we only emit NEW messages.
+  let cursor = 0;
+  if (SqliteDatabase && existsSync(dbPath)) {
+    try {
+      const db = new SqliteDatabase(dbPath, { readonly: true });
+      try {
+        const row = db.prepare("SELECT MAX(rowid) AS r FROM messages").get() as { r: number | null } | null;
+        cursor = row?.r ?? 0;
+      } finally { db.close(); }
+    } catch { /* best-effort */ }
+  }
+
+  const timer = setInterval(() => {
+    if (!SqliteDatabase || !existsSync(dbPath)) return;
+    try {
+      const db = new SqliteDatabase(dbPath, { readonly: true });
+      try {
+        const rows = db
+          .prepare(
+            `SELECT rowid, role, text FROM messages
+             WHERE rowid > ? AND role = 'assistant'
+             ORDER BY rowid ASC`,
+          )
+          .all(cursor) as Array<{ rowid: number; role: string; text: string }>;
+
+        for (const row of rows) {
+          cursor = row.rowid;
+          // If there's a pending prompt.submit, use that prompt_key so Hermes
+          // resolves the spinner. Otherwise synthesise a new start+complete pair
+          // (Telegram-originated reply the user didn't trigger from Hermes).
+          const promptKey = ctx.pendingPromptKey ?? `tg-${row.rowid}`;
+          if (!ctx.pendingPromptKey) {
+            sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
+          }
+          ctx.pendingPromptKey = undefined;
+          sendEvent(ctx, "message.complete", sessionId, {
+            text: row.text,
+            prompt_key: promptKey,
+          });
+        }
+      } finally { db.close(); }
+    } catch { /* DB locked / temporarily unreadable — retry next tick */ }
+  }, pollIntervalMs);
+
+  return () => clearInterval(timer);
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 import type { ScheduleDashboard } from "./api.js";
@@ -675,6 +794,14 @@ export interface HermesWsContext {
   pollInterval?: ReturnType<typeof setInterval>;
   /** Currently activated session (agent name), if any. */
   activeSessionId?: string;
+  /** Stop function for the history.db background poller — called on session change or close. */
+  stopHistoryPoll?: () => void;
+  /**
+   * prompt_key from the most recent prompt.submit that hasn't yet been resolved by
+   * a message.complete. The history poller claims this key for the first new assistant
+   * message so the response resolves the correct pending spinner in Hermes.
+   */
+  pendingPromptKey?: string;
 }
 
 function sendEvent(ctx: HermesWsContext, type: string, sessionId: string | null, payload: unknown) {
@@ -711,12 +838,14 @@ export function onHermesOpen(ctx: HermesWsContext) {
   }, 5000);
 }
 
-/** Called on WS close — clears the poll timer. */
+/** Called on WS close — clears all poll timers. */
 export function onHermesClose(ctx: HermesWsContext) {
   if (ctx.pollInterval) {
     clearInterval(ctx.pollInterval);
     ctx.pollInterval = undefined;
   }
+  ctx.stopHistoryPoll?.();
+  ctx.stopHistoryPoll = undefined;
 }
 
 /** Dispatch a JSON-RPC message from the client. */
@@ -795,12 +924,20 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
       const session = toHermesSession(sessionId, agent, agentLiveness(config, agentName), config);
-      sendResponse(ctx, rpcOk(id, { session }));
+      // Hermes reads `v.session_id` (and optionally `v.stored_session_id`) directly from
+      // the response — NOT `v.session.id`. Return the flat shape; the full session object
+      // arrives via the session.info event below.
+      sendResponse(ctx, rpcOk(id, { session_id: sessionId, stored_session_id: sessionId }));
       sendEvent(ctx, "session.info", sessionId, session);
+      // Start background poll so Telegram replies appear in Hermes in real time.
+      ctx.stopHistoryPoll?.();
+      ctx.stopHistoryPoll = startHistoryPoll(ctx, resolveAgentsDir(config), agentName, sessionId);
       break;
     }
 
     case "session.close": {
+      ctx.stopHistoryPoll?.();
+      ctx.stopHistoryPoll = undefined;
       ctx.activeSessionId = undefined;
       sendResponse(ctx, rpcOk(id, { ok: true }));
       break;
@@ -813,9 +950,16 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         break;
       }
       const limit = typeof params.limit === "number" ? params.limit : 50;
-      const result = handleGetTurns(config, sessionId, Math.min(limit, 200));
-      // Degrade gracefully on DB errors — return empty messages.
-      sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: turnsToMessages(result.turns ?? []) }));
+      const { agentName: histAgent } = parseHermesSessionId(sessionId);
+      const agentsDir = resolveAgentsDir(config);
+      const histMessages = readHistoryDb(agentsDir, histAgent, limit);
+      if (histMessages !== null) {
+        sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: histMessages }));
+      } else {
+        // Fall back to turns preview if history.db is unavailable
+        const result = handleGetTurns(config, sessionId, Math.min(limit, 200));
+        sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: turnsToMessages(result.turns ?? []) }));
+      }
       break;
     }
 
@@ -868,25 +1012,19 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
         .slice(0, 12);
 
       sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
+      // Record so the history poller uses this key when the agent's reply lands.
+      ctx.pendingPromptKey = promptKey;
 
       const result = await injectInbound(agentsDir, submitAgent, chat.chatId, chat.threadId, content, promptKey);
       if (!result.ok) {
+        ctx.pendingPromptKey = undefined;
         sendEvent(ctx, "error", sessionId, { message: result.error, prompt_key: promptKey });
         sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
         break;
       }
 
-      // Prompt accepted. The agent's reply arrives in Telegram — stream a
-      // brief acknowledgement so the desktop shows something in the chat
-      // rather than a hanging spinner. Full response streaming is Phase B.
-      sendEvent(ctx, "message.delta", sessionId, {
-        text: `*(Prompt sent to ${sessionId} — response will appear in Telegram)*`,
-        prompt_key: promptKey,
-      });
-      sendEvent(ctx, "message.complete", sessionId, {
-        text: `*(Prompt sent to ${sessionId} — response will appear in Telegram)*`,
-        prompt_key: promptKey,
-      });
+      // Prompt accepted. The history poller (started at session.activate) will emit
+      // message.complete with this prompt_key when the agent's reply appears in history.db.
       sendResponse(ctx, rpcOk(id, { ok: true, prompt_key: promptKey }));
       break;
     }
