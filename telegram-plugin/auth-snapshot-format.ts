@@ -319,7 +319,9 @@ function renderAccountRow(
     const reset = win === '5h' ? q.fiveHourResetAt : q.sevenDayResetAt;
     const winLabel = win === '5h' ? '5-hour' : '7-day';
     lines.push(
-      `  _quota exhausted — back ${formatAbsolute(reset, tz)} (\`in ${formatRelative(reset, now)}\`, ${winLabel} cap)_`,
+      reset
+        ? `  _quota exhausted — back ${formatAbsolute(reset, tz)} (\`in ${formatRelative(reset, now)}\`, ${winLabel} cap)_`
+        : `  _quota exhausted — ${winLabel} cap, reset time unknown_`,
     );
     return lines;
   }
