@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.16.29 — Fix Hermes Desktop session.create + pet.info for v0.17
+
+Hermes Desktop v0.17.0 calls `session.create {cols, profile}` — no `session_id` — when the user sends the first message after reconnect. The handler was falling through to `""` and returning "Unknown session: ". Fix: fall back to `ctx.activeSessionId` (set by the prior `session.resume` auto-resume), then to the most-recently-active agent by `lastTurnAt`. Also adds `pet.info / pet.info.meta / pet.gallery` stubs returning `{enabled:false}` — without these, -32601 errors triggered a retry loop that spammed the WS connection every ~5s. (#2684)
+
 ## v0.16.28 — Fix Hermes Desktop "Unknown session" on chat
 
 `session.status` was the only WebSocket handler missing the `ctx.activeSessionId` fallback. Hermes Desktop v0.17.0 calls `session.status` after `session.activate` without re-sending `session_id`, hitting the empty-string path and returning `Unknown session: ` — showing "Session unavailable" in the chat view. Fix: consistent with every other handler in the switch block. (#2682)
