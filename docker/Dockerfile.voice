@@ -1,0 +1,63 @@
+# switchroom/voice — local GPU speech-to-text sidecar (voice feature PR-B2).
+#
+# Wraps `faster-whisper` (CTranslate2) behind a tiny stdlib HTTP server
+# (docker/voice-sidecar/server.py) so the fleet can transcribe inbound
+# voice notes on a LOCAL GPU — no third-party STT key (vision #3,
+# subscription-honest) and no cloud dependency (vision #4,
+# always-available). Emitted into the compose file ONLY when the PR-B1
+# host-capabilities verdict is `engine: local` (see src/agents/compose.ts).
+#
+# Scope: STT only. TTS / Kokoro (`/tts`) lands in PR-C.
+#
+# Why a CUDA *runtime* base (not devel): CTranslate2 ships prebuilt CUDA
+# kernels in its wheel, so we only need the CUDA + cuDNN runtime libs at
+# image time — not the full toolkit. Keeps the image far smaller.
+#
+# Model weights are NOT baked in. They are fetched once on first boot into
+# the `voice-model-cache` named volume (compose mounts it at /models) and
+# reused thereafter. Baking them would bloat the image AND raise weight-
+# redistribution licensing questions; the model id is pinned via
+# VOICE_STT_MODEL and (optionally) checksum-verified fail-closed via
+# VOICE_STT_MODEL_SHA256. See server.py:_load_model.
+#
+# sec: pinned by digest — a CUDA `:runtime` tag from nvidia is mutable.
+# Dependabot tracks bumps. (Replace the digest when bumping the tag.)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+LABEL org.opencontainers.image.title="switchroom-voice" \
+      org.opencontainers.image.description="Local GPU STT sidecar (faster-whisper)"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    VOICE_MODEL_CACHE=/models \
+    HF_HOME=/models/hf
+
+# ffmpeg normalizes arbitrary inbound audio (OGG/Opus from Telegram, mp3,
+# m4a, …) to 16kHz mono WAV before whisper. python3 runs the server.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# faster-whisper pulls in ctranslate2 (with bundled CUDA kernels). Pin so
+# the image is reproducible; Dependabot bumps it.
+RUN pip3 install --no-cache-dir \
+        "faster-whisper==1.0.3"
+
+COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
+
+# Weights land in this volume on first boot; never baked into the image.
+VOLUME ["/models"]
+
+# STT listener. compose publishes this on the host-gateway-reachable
+# interface and gates access on the X-Voice-Token shared secret.
+EXPOSE 8126
+
+# Run as a non-root uid — the sidecar needs no privilege beyond the GPU
+# device (granted via the compose deploy.resources reservation) and write
+# access to the model-cache volume (compose sets ownership / the volume is
+# created writable on first run).
+USER 65532:65532
+
+ENTRYPOINT ["python3", "/opt/voice-sidecar/server.py"]

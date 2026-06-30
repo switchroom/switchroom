@@ -8,6 +8,7 @@ import { resolveAgentConfig } from "../config/merge.js";
 import { loadConfig } from "../config/loader.js";
 import { sendAgentInterrupt } from "./tmux.js";
 import { resolveSwitchroomHome } from "./docker-fleet.js";
+import { composeEnvFileArgs } from "./compose-env.js";
 import {
   reconcileSingletons,
   type ReconcileResult,
@@ -179,7 +180,7 @@ function dockerSync(args: string[]): string {
  * Build a `docker compose -p <project> -f <file>` argv prefix.
  */
 function composeArgs(extra: string[]): string[] {
-  return ["compose", "-p", COMPOSE_PROJECT, "-f", composeFilePath(), ...extra];
+  return ["compose", "-p", COMPOSE_PROJECT, "-f", composeFilePath(), ...composeEnvFileArgs(composeFilePath()), ...extra];
 }
 
 /**

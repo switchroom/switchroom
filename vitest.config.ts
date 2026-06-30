@@ -240,6 +240,9 @@ export default defineConfig({
       // voice-transcribe.test.ts uses bun:test (#578 voice-in spike) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/voice-transcribe.test.ts",
+      // voice-transcribe-sidecar.test.ts uses bun:test (PR-B2 local STT) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/voice-transcribe-sidecar.test.ts",
       // telegraph.test.ts uses bun:test (#579 Telegraph Instant View) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/telegraph.test.ts",

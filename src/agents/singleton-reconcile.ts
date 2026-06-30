@@ -32,18 +32,56 @@ import { readFileSync } from "node:fs";
 
 import { parse as parseYaml } from "yaml";
 
+import { loadHostCapabilities } from "../setup/host-capabilities.js";
+import { composeEnvFileArgs } from "./compose-env.js";
+
 /**
- * Compose SERVICE names for the singletons (note: the auth-broker
- * service is already `switchroom-`-prefixed in the generated compose,
- * the other two are not — see `src/agents/compose.ts`).
+ * Compose SERVICE names for the singletons that are ALWAYS present (note:
+ * the auth-broker service is already `switchroom-`-prefixed in the
+ * generated compose, the other two are not — see `src/agents/compose.ts`).
  */
-export const SINGLETON_SERVICES = [
+export const CORE_SINGLETON_SERVICES = [
   "vault-broker",
   "approval-kernel",
   "switchroom-auth-broker",
 ] as const;
 
+/**
+ * The voice STT sidecar is a CONDITIONAL singleton: it's only emitted into
+ * the compose (and therefore only manageable here) on a `local` voice
+ * verdict (GPU present + container toolkit, per PR-B1). On a `cloud` host
+ * it isn't in the compose at all, so it must NOT be flagged as
+ * missing/unhealthy by drift reconcile or doctor. See `resolveSingletonServices`.
+ */
+export const VOICE_SIDECAR_SERVICE = "voice-sidecar";
+
+/**
+ * The full universe of singleton service names (for the union type). The
+ * RUNTIME set is verdict-gated — see `resolveSingletonServices`.
+ */
+export const SINGLETON_SERVICES = [
+  ...CORE_SINGLETON_SERVICES,
+  VOICE_SIDECAR_SERVICE,
+] as const;
+
 export type SingletonService = (typeof SINGLETON_SERVICES)[number];
+
+/**
+ * Resolve which singleton services to manage on THIS host. Always the three
+ * core singletons; plus `voice-sidecar` ONLY when the voice verdict is
+ * `local` (so a cloud host never reports the sidecar as drifted/absent).
+ *
+ * `voiceEngine` is injectable for tests; production reads the persisted
+ * PR-B1 verdict (defaults to `cloud` — no sidecar — when no verdict exists).
+ */
+export function resolveSingletonServices(
+  voiceEngine?: "local" | "cloud",
+): SingletonService[] {
+  const engine = voiceEngine ?? loadHostCapabilities()?.voice.engine ?? "cloud";
+  return engine === "local"
+    ? [...CORE_SINGLETON_SERVICES, VOICE_SIDECAR_SERVICE]
+    : [...CORE_SINGLETON_SERVICES];
+}
 
 /** Map a singleton service name to its container name. */
 export function singletonContainerName(svc: string): string {
@@ -78,6 +116,12 @@ export interface SingletonReconcileDeps {
   dockerBin?: string;
   /** compose project (default "switchroom"). */
   project?: string;
+  /**
+   * Voice verdict override (testing). When omitted, the persisted PR-B1
+   * verdict decides whether `voice-sidecar` is managed (local) or skipped
+   * (cloud) — see `resolveSingletonServices`.
+   */
+  voiceEngine?: "local" | "cloud";
 }
 
 /**
@@ -86,6 +130,7 @@ export interface SingletonReconcileDeps {
  */
 export function readPinnedSingletonImages(
   composeText: string,
+  services: readonly SingletonService[] = SINGLETON_SERVICES,
 ): Partial<Record<SingletonService, string>> {
   let doc: { services?: Record<string, { image?: unknown }> } | undefined;
   try {
@@ -94,7 +139,7 @@ export function readPinnedSingletonImages(
     return {};
   }
   const out: Partial<Record<SingletonService, string>> = {};
-  for (const svc of SINGLETON_SERVICES) {
+  for (const svc of services) {
     const img = doc?.services?.[svc]?.image;
     if (typeof img === "string" && img.length > 0) out[svc] = img;
   }
@@ -128,14 +173,18 @@ export function detectSingletonDrift(
   const inspectImage =
     deps.inspectImage ?? ((c) => defaultInspectImage(dockerBin, c));
 
+  // Verdict-gated service set: core singletons always, voice-sidecar only
+  // on a `local` host (so a cloud host never flags the sidecar as drifted).
+  const services = resolveSingletonServices(deps.voiceEngine);
+
   let pinned: Partial<Record<SingletonService, string>> = {};
   try {
-    pinned = readPinnedSingletonImages(readCompose(deps.composeFile));
+    pinned = readPinnedSingletonImages(readCompose(deps.composeFile), services);
   } catch {
     pinned = {};
   }
 
-  return SINGLETON_SERVICES.map((service) => {
+  return services.map((service) => {
     const container = singletonContainerName(service);
     const running = inspectImage(container);
     const pin = pinned[service] ?? null;
@@ -158,7 +207,7 @@ function defaultRecreate(
   // confirmed drift. --no-deps so we don't recursively bounce agents.
   execFileSync(
     dockerBin,
-    ["compose", "-p", project, "-f", composeFile, "up", "-d", "--no-deps", service],
+    ["compose", "-p", project, "-f", composeFile, ...composeEnvFileArgs(composeFile), "up", "-d", "--no-deps", service],
     { stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 },
   );
 }

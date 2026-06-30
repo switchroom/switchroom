@@ -231,7 +231,7 @@ function effectiveLiteLLMEnabled(
  * passphrase host with no env var) — the caller then records a clear failure
  * rather than blocking apply on a TTY prompt.
  */
-async function resolveOperatorVaultPassphrase(home: string): Promise<string | null> {
+export async function resolveOperatorVaultPassphrase(home: string): Promise<string | null> {
   const envPass = process.env.SWITCHROOM_VAULT_PASSPHRASE;
   if (envPass) return envPass;
   try {
@@ -1396,6 +1396,21 @@ export async function runApply(
     buildMode: options.buildLocal ? "local" : "pull",
     buildContext: options.buildContext,
   });
+
+  // ── 3b. Voice-sidecar token (PR-B2) ───────────────────────────────
+  // On a `local` voice verdict the compose emits a `voice-sidecar` service
+  // whose env reads `${VOICE_SIDECAR_TOKEN}`. Seed the shared secret in the
+  // vault (idempotent) and write it to the compose-adjacent `.env` (0600)
+  // so docker's interpolation populates the container env — the secret is
+  // never baked into the YAML. No-op on a cloud verdict.
+  if (!skipScaffold) {
+    const { provisionVoiceSidecarToken } = await import("./voice-sidecar-token.js");
+    await provisionVoiceSidecarToken(composePath, homedir(), {
+      writeOut,
+      writeErr,
+      operatorUid,
+    });
+  }
 
   writeOut(
     chalk.bold(`\nWrote `) +
