@@ -25,7 +25,7 @@ name: promote
 #      conflict), the job fails loudly so the promotion is treated as
 #      "did not happen" rather than "happened with a different image."
 #
-# Matrix fans out across all 7 fleet images. `fail-fast: true` so a
+# Matrix fans out across all 8 fleet images. `fail-fast: true` so a
 # single bad image stops the promotion mid-flight rather than leaving a
 # half-promoted channel.
 
@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight]
+        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0

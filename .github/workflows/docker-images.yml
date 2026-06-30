@@ -315,6 +315,77 @@ jobs:
           provenance: mode=max
           sbom: true
 
+  build-voice:
+    # Voice STT sidecar (PR-B2 follow-up). Like build-hindsight this is a
+    # standalone image: Dockerfile.voice FROMs `nvidia/cuda:…-cudnn-runtime`,
+    # NOT switchroom-base, so it has no base-job dependency and runs in
+    # parallel. It bakes no dist/ (pure-Python faster-whisper server), so
+    # there's no Node/Bun build step here.
+    #
+    # Subscription-honest local GPU STT (vision #3): transcribing inbound
+    # voice notes on the operator's own GPU, no third-party STT key, no
+    # cloud STT dependency (vision #4, always-available). The image only
+    # ships CUDA + cuDNN *runtime* libs + faster-whisper's prebuilt
+    # CTranslate2 kernels; model weights are NOT baked (fetched once into
+    # the voice-model-cache volume on first boot). See docker/Dockerfile.voice.
+    #
+    # amd64 ONLY — and deliberately so. faster-whisper rides CTranslate2's
+    # prebuilt CUDA kernels, which are published for x86_64 GPU hosts; there
+    # is no equivalently-supported aarch64 CUDA wheel, and the fleet's GPU
+    # hosts are amd64. Building an arm64 leg would emit an image that can't
+    # actually run GPU STT, so we don't (this is the one fleet image that
+    # is single-arch by design — every other image is amd64+arm64).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR (push only on main / tags)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-voice"
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/}"
+            echo "tags=${IMAGE}:${TAG_VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          elif [[ ( "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ) && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tags=${IMAGE}:latest,${IMAGE}:sha-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and push on main/tag) voice
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile.voice
+          # Single-arch: CUDA/CTranslate2 GPU runtime is x86_64-only (see
+          # job-level comment). No QEMU/arm64 leg on any event.
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
+          push: ${{ github.event_name != 'pull_request' }}
+          # GHCR registry cache, not type=gha — #1965 (see build-base). The
+          # CUDA base + faster-whisper pip layer are heavy, so the registry
+          # cache materially shortens warm builds. cache-to gated to non-PR
+          # (fork PRs have no GHCR write token; an export failure would break
+          # the required build check).
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-voice:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}/switchroom-voice:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner) || '' }}
+          # sec WS9-F3 (#1418): provenance + SBOM on the voice image too.
+          provenance: mode=max
+          sbom: true
+
   # PR C: smoke test the freshly-pushed :sha-<7> agent image — runs the
   # MCP tools/list harness inside a throwaway container with the
   # channels.telegram.enabled:false fixture (no bot-token needed at
@@ -377,13 +448,13 @@ jobs:
     # a missing `:sha-<short>` at promote time provably means
     # "build succeeded but context unchanged → buildx cache hit, nothing
     # pushed", never "build failed".
-    needs: [smoke-test, build-hindsight]
+    needs: [smoke-test, build-hindsight, build-voice]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight]
+        image: [base, agent, broker, kernel, hostd, auth-broker, hindsight, voice]
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0

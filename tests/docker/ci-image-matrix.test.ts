@@ -36,15 +36,11 @@ const DOCKER_MATRIX_OPT_OUT: Record<string, string> = {
   // built/consumed by the UAT CI workflow, not published as a per-version
   // fleet GHCR tag, so it is intentionally outside the docker-images matrix.
   "uat-runner": "CI-only sandboxed UAT host runner (#2236); not a published fleet image",
-  // voice is the GPU STT sidecar (voice PR-B2). It extends a CUDA runtime
-  // base (nvidia/cuda), NOT switchroom-base, so it does not fit the
-  // build-dependents matrix (which threads BASE_IMAGE), and it is emitted
-  // into the fleet compose ONLY on a `local` GPU verdict — most hosts never
-  // pull it. Its CI build/publish needs a dedicated amd64-only,
-  // CUDA-aware job (like build-hindsight's standalone shape) and lands in a
-  // follow-up; opted out here until then so the matrix gate forces that
-  // choice rather than silently shipping an unbuilt image.
-  voice: "GPU STT sidecar (PR-B2); CUDA base, local-verdict-only — dedicated CI build job is a follow-up",
+  // NOTE: `voice` (GPU STT sidecar, PR-B2) was previously opted out here
+  // pending a dedicated CI build job. That follow-up landed: docker-images.yml
+  // now has a standalone `build-voice` job (amd64-only, CUDA-aware, like
+  // build-hindsight's shape), so voice is covered by the matrix and the
+  // opt-out is gone. See the "voice is in the matrix" regression below.
 };
 
 function dockerfileNames(): string[] {
@@ -106,5 +102,13 @@ describe("CI image matrix coverage", () => {
 
   it("hindsight is in the matrix (regression — PR #1266 omitted it)", () => {
     expect(matrixNames().has("hindsight")).toBe(true);
+  });
+
+  it("voice is in the matrix (PR-B2 follow-up: dedicated build-voice job)", () => {
+    expect(matrixNames().has("voice")).toBe(true);
+  });
+
+  it("voice is no longer opted out (its CI build job has landed)", () => {
+    expect("voice" in DOCKER_MATRIX_OPT_OUT).toBe(false);
   });
 });
