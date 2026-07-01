@@ -280,6 +280,83 @@ describe('materializeVoiceKey — vault resolution', () => {
     )
     expect(key).toBeNull()
   })
+
+  // ── Regression: single-key isolation (voice token bug) ──
+  //
+  // The batch resolver (resolveVaultReferencesViaBroker) fails the WHOLE
+  // resolution unless EVERY vault: ref it finds resolves. Admin-only refs
+  // like litellm.admin_key / google_workspace.google_client_secret are
+  // (correctly) DENIED to a normal agent, so if the materializer passes the
+  // full config those denials sink the resolution even though openai/api-key
+  // itself is granted. The fix passes a MINIMAL config carrying only the one
+  // ref. These tests would fail against the old `...config` spread.
+
+  /** Regex of every vault: ref the resolver sees; denies if it sees any admin-only key. */
+  function collectRefs(v: unknown, out: Set<string>): void {
+    if (typeof v === 'string' && v.startsWith('vault:')) out.add(v.slice('vault:'.length).split('#')[0])
+    else if (Array.isArray(v)) for (const i of v) collectRefs(i, out)
+    else if (v !== null && typeof v === 'object') for (const val of Object.values(v as Record<string, unknown>)) collectRefs(val, out)
+  }
+
+  /**
+   * A resolver stub with the SAME batch semantics as the real one: it fails
+   * (denied) unless every ref it collects is in `granted`. Mirrors how a real
+   * broker denies admin-only keys to a normal agent.
+   */
+  function makeBatchResolver(
+    granted: Record<string, string>,
+    onCall?: (refs: Set<string>) => void,
+  ): typeof resolveVaultReferencesViaBroker {
+    return (async (config: SwitchroomConfig) => {
+      const refs = new Set<string>()
+      collectRefs(config, refs)
+      onCall?.(refs)
+      for (const r of refs) {
+        if (granted[`vault:${r}`] === undefined) {
+          return { ok: false, reason: 'denied' as const }
+        }
+      }
+      const resolvedToken = granted[config.telegram?.bot_token ?? '']
+      return {
+        ok: true,
+        config: { ...config, telegram: { ...config.telegram, bot_token: resolvedToken } },
+      }
+    }) as unknown as typeof resolveVaultReferencesViaBroker
+  }
+
+  const CONFIG_WITH_ADMIN_REFS = {
+    telegram: { bot_token: 'vault:tg/bot' },
+    litellm: { admin_key: 'vault:litellm/master-key' },
+    google_workspace: { google_client_secret: 'vault:google/client-secret' },
+    agents: { klanker: { some_key: 'vault:per-agent/secret' } },
+    vault: { path: '~/.switchroom/vault.enc' },
+  } as unknown as SwitchroomConfig
+
+  it('resolves the STT key even when the config carries admin-only vault refs the broker DENIES', async () => {
+    const key = await materializeVoiceKey({
+      apiKeyRef: 'vault:openai/api-key',
+      config: CONFIG_WITH_ADMIN_REFS,
+      env: {},
+      // ONLY openai/api-key is granted; litellm/google/per-agent all DENY.
+      resolveViaBroker: makeBatchResolver({ 'vault:openai/api-key': 'sk-granted-key' }),
+    })
+    expect(key).toBe('sk-granted-key')
+  })
+
+  it('invokes the resolver with a config containing exactly ONE vault ref (the STT key)', async () => {
+    let seen: Set<string> | null = null
+    await materializeVoiceKey({
+      apiKeyRef: 'vault:openai/api-key',
+      config: CONFIG_WITH_ADMIN_REFS,
+      env: {},
+      resolveViaBroker: makeBatchResolver(
+        { 'vault:openai/api-key': 'sk-granted-key' },
+        (refs) => { seen = refs },
+      ),
+    })
+    expect(seen).not.toBeNull()
+    expect([...seen!]).toEqual(['openai/api-key'])
+  })
 })
 
 describe('voice-in — no plaintext key file is read', () => {

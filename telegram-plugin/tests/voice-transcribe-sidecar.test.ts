@@ -260,4 +260,73 @@ describe('materializeSidecarToken — vault resolution', () => {
     )
     expect(tok).toBeNull()
   })
+
+  // ── Regression: single-key isolation (voice token bug) ──
+  //
+  // resolveVaultReferencesViaBroker fails the WHOLE batch unless EVERY vault:
+  // ref resolves. Admin-only refs (litellm/master-key,
+  // google/client-secret) are correctly DENIED to a normal agent — so if the
+  // materializer passes the full config, those denials sink the resolution
+  // even though voice/sidecar-token itself is granted. The fix passes a
+  // MINIMAL config carrying only the one ref. These tests fail against the
+  // old `...config` spread.
+
+  function collectRefs(v: unknown, out: Set<string>): void {
+    if (typeof v === 'string' && v.startsWith('vault:')) out.add(v.slice('vault:'.length).split('#')[0])
+    else if (Array.isArray(v)) for (const i of v) collectRefs(i, out)
+    else if (v !== null && typeof v === 'object') for (const val of Object.values(v as Record<string, unknown>)) collectRefs(val, out)
+  }
+
+  /** Resolver stub with the real batch semantics: denies unless every collected ref is granted. */
+  function makeBatchResolver(
+    granted: Record<string, string>,
+    onCall?: (refs: Set<string>) => void,
+  ): typeof resolveVaultReferencesViaBroker {
+    return (async (config: SwitchroomConfig) => {
+      const refs = new Set<string>()
+      collectRefs(config, refs)
+      onCall?.(refs)
+      for (const r of refs) {
+        if (granted[`vault:${r}`] === undefined) {
+          return { ok: false, reason: 'denied' as const }
+        }
+      }
+      const resolved = granted[config.telegram?.bot_token ?? '']
+      return {
+        ok: true,
+        config: { ...config, telegram: { ...config.telegram, bot_token: resolved } },
+      }
+    }) as unknown as typeof resolveVaultReferencesViaBroker
+  }
+
+  const CONFIG_WITH_ADMIN_REFS = {
+    telegram: { bot_token: 'vault:tg/bot' },
+    litellm: { admin_key: 'vault:litellm/master-key' },
+    google_workspace: { google_client_secret: 'vault:google/client-secret' },
+    agents: { klanker: { some_key: 'vault:per-agent/secret' } },
+    vault: { path: '~/.switchroom/vault.enc' },
+  } as unknown as SwitchroomConfig
+
+  it('resolves the sidecar token even when the config carries admin-only vault refs the broker DENIES', async () => {
+    const tok = await materializeSidecarToken({
+      config: CONFIG_WITH_ADMIN_REFS,
+      env: {},
+      resolveViaBroker: makeBatchResolver({ 'vault:voice/sidecar-token': 'deadbeefcafe' }),
+    })
+    expect(tok).toBe('deadbeefcafe')
+  })
+
+  it('invokes the resolver with a config containing exactly ONE vault ref (the sidecar token)', async () => {
+    let seen: Set<string> | null = null
+    await materializeSidecarToken({
+      config: CONFIG_WITH_ADMIN_REFS,
+      env: {},
+      resolveViaBroker: makeBatchResolver(
+        { 'vault:voice/sidecar-token': 'deadbeefcafe' },
+        (refs) => { seen = refs },
+      ),
+    })
+    expect(seen).not.toBeNull()
+    expect([...seen!]).toEqual(['voice/sidecar-token'])
+  })
 })

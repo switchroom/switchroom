@@ -112,16 +112,19 @@ export async function materializeVoiceKey(
 
   const resolveViaBroker = opts.resolveViaBroker ?? resolveVaultReferencesViaBroker;
 
-  // Narrow the config so the broker only fetches this one key and unrelated
-  // vault: refs elsewhere in the config can't fail this resolution.
+  // Resolve ONLY this one key. We pass a MINIMAL config — just `vault` (so the
+  // broker socket path still resolves) and the ref carried in the bot_token
+  // slot — deliberately WITHOUT spreading `...config`. Spreading the full
+  // config makes collectVaultRefs() see every top-level `vault:` ref (e.g.
+  // litellm.admin_key, google_workspace.google_client_secret), which are
+  // admin-only and DENIED to normal agents; resolveViaBroker then fails the
+  // whole batch (allResolved === false) even though the STT key itself is
+  // granted. Narrowing to a single ref is what actually isolates this
+  // resolution from unrelated denied refs elsewhere in the config.
   const brokerResult = await resolveViaBroker({
-    ...config,
-    telegram: {
-      ...config.telegram,
-      bot_token: ref,
-    } as SwitchroomConfig["telegram"],
-    agents: {} as SwitchroomConfig["agents"],
-  });
+    vault: config.vault,
+    telegram: { bot_token: ref } as SwitchroomConfig["telegram"],
+  } as SwitchroomConfig);
 
   if (brokerResult.ok) {
     const resolved = brokerResult.config.telegram?.bot_token;
