@@ -54,6 +54,14 @@ import {
   chunkTtsText,
   clampTtsSpeed,
 } from '../voice-synthesize-sidecar.js'
+import {
+  VoiceOnDemandCache,
+  mintVoiceOnDemandToken,
+  isVoiceOnDemandCallback,
+  parseVoiceOnDemandToken,
+  buildListenKeyboard,
+  mayInjectListenButton,
+} from '../voice-ondemand.js'
 
 /** Fleet default TTS speed when voice_out is enabled but speed is unset —
  *  slightly brisker than neutral (Ken's chosen default). */
@@ -8199,6 +8207,20 @@ const VOICE_OUT_DEFAULT_CHUNK_CHARS = 600
  *  no longer chunks — the sidecar owns length and returns one file.) */
 const VOICE_OUT_HARD_CHUNK_CAP = 4096
 
+/**
+ * On-demand voice-out (reply_mode='on-demand'). Instead of synthesizing at
+ * reply time, the gateway appends a single "🔊 Listen" inline button carrying
+ * a reserved `voice:<token>` callback_data; audio is synthesized + sent only
+ * when the user taps it. This keeps the voice pipeline subscription-honest and
+ * visible — zero GPU/sidecar work happens behind the user's back.
+ *
+ * We cache the (speech-normalized text, voice, speed) needed to synthesize by
+ * TOKEN, not message_id, because the message_id is not known at send time.
+ * Bounded LRU with a TTL so a stale button (tapped an hour later) degrades to
+ * a graceful "expired" toast rather than pinning reply text in memory forever.
+ */
+const voiceOnDemandCache = new VoiceOnDemandCache()
+
 type VoiceOutAccess = NonNullable<Access['voice_out']>
 
 /**
@@ -8231,7 +8253,7 @@ function resolveVoiceOutPlan(
   voice?: string
   speed: number
   apiKeyRef?: string
-  replyMode: 'voice+text' | 'voice-only'
+  replyMode: 'voice+text' | 'voice-only' | 'on-demand'
   ttsChunks: string[]
 } | null {
   if (voiceOut?.enabled !== true) return null
@@ -8724,7 +8746,9 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // synthesize is skipped; if NOTHING synthesizes the text path proceeds
   // unchanged so the answer is never dropped.
   const voiceOggs: Uint8Array[] = []
-  if (voiceOutPlan != null) {
+  // on-demand: do NOT synthesize at reply time — a '🔊 Listen' button is
+  // injected below and audio is produced only when the user taps it.
+  if (voiceOutPlan != null && voiceOutPlan.replyMode !== 'on-demand') {
     for (const chunkText of voiceOutPlan.ttsChunks) {
       const ogg = await synthesizeVoiceOut({
         engine: voiceOutPlan.engine,
@@ -8771,6 +8795,41 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
     }
     replyButtonMeta = extractAgentButtonMeta(rawKeyboard)
     replyMarkup = { inline_keyboard: wrapAgentCallbacks(rawKeyboard) }
+  }
+
+  // on-demand voice: append a single '🔊 Listen' button that synthesizes the
+  // spoken reply only when tapped. The button carries a RAW `voice:<token>`
+  // callback_data (NOT wrapped with the agent: prefix) so the dispatcher
+  // handles it internally and never routes it to the agent as an inbound.
+  //
+  // Collision gate: inject ONLY when the reply carries no agent-authored
+  // buttons. If the agent supplied its own keyboard, the callback dispatcher's
+  // single_use strip (keyboardIsSingleUse) governs that whole message; adding
+  // a foreign single_use:false button would flip that message to a mixed
+  // keyboard and defeat the agent's double-fire protection. Keep it simple —
+  // agent buttons present → skip the Listen button for this message.
+  if (
+    voiceOutPlan?.replyMode === 'on-demand' &&
+    voiceOutPlan.ttsChunks.length > 0 &&
+    voiceOutPlan.ttsChunks[0]!.length > 0
+  ) {
+    if (!mayInjectListenButton(rawKeyboard)) {
+      process.stderr.write(
+        'telegram gateway: voice-out on-demand: agent supplied inline_keyboard — skipping Listen button (single_use collision gate)\n',
+      )
+    } else {
+      const token = mintVoiceOnDemandToken()
+      voiceOnDemandCache.put(token, {
+        // ttsChunks[0] is already normalizeForSpeech(reply) (kokoro path).
+        text: voiceOutPlan.ttsChunks[0]!,
+        ...(voiceOutPlan.voice != null ? { voice: voiceOutPlan.voice } : {}),
+        speed: voiceOutPlan.speed,
+      })
+      // The keyboard stays after the tap (never stripped) so it can be
+      // replayed. The gate above guarantees this is the ONLY button on the
+      // message, so keeping it is safe (no agent buttons to protect).
+      replyMarkup = buildListenKeyboard(token)
+    }
   }
 
   const replySKey = streamKey(chat_id, threadId)
@@ -21917,6 +21976,90 @@ bot.on('callback_query:data', async ctx => {
       }
     }
     await ctx.answerCallbackQuery({ text: '✅ ' + choice.slice(0, 60) }).catch(() => {})
+    return
+  }
+
+  // on-demand voice: '🔊 Listen' buttons carry a reserved `voice:<token>`
+  // callback_data. Handle INTERNALLY here — synthesize the cached reply text
+  // and send it as a native voice note. This MUST run before the agent:
+  // routing below so a tap never reaches the agent as an inbound message.
+  if (isVoiceOnDemandCallback(data)) {
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const token = parseVoiceOnDemandToken(data)
+    const entry = token != null ? voiceOnDemandCache.get(token) : null
+    if (entry == null) {
+      await ctx
+        .answerCallbackQuery({ text: 'Voice expired — send again to hear it.' })
+        .catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery({ text: '🔊 Synthesizing…' }).catch(() => {})
+    const cbChatId = String(ctx.chat?.id ?? ctx.from.id)
+    const cbMessageId = ctx.callbackQuery?.message?.message_id
+    const cbThreadId = (() => {
+      const msg = ctx.callbackQuery?.message
+      if (msg && 'is_topic_message' in msg && msg.is_topic_message && 'message_thread_id' in msg) {
+        const tid = (msg as { message_thread_id?: number }).message_thread_id
+        return typeof tid === 'number' ? tid : undefined
+      }
+      return undefined
+    })()
+    // Local sidecar (kokoro) synthesis — same helper the immediate voice-out
+    // path uses. On-demand is a local-engine feature; the cache is only
+    // populated when resolveVoiceOutPlan gated the local verdict.
+    const sidecarToken = await materializeSidecarToken()
+    if (!sidecarToken) {
+      await ctx
+        .answerCallbackQuery({ text: 'Voice sidecar unavailable — try again later.' })
+        .catch(() => {})
+      return
+    }
+    const result = await synthesizeViaSidecar({
+      token: sidecarToken,
+      text: entry.text,
+      voice: entry.voice,
+      speed: entry.speed,
+    })
+    if (!result.ok) {
+      process.stderr.write(
+        `telegram gateway: voice-out on-demand: synthesis failed reason=${result.reason}\n`,
+      )
+      await ctx
+        .answerCallbackQuery({ text: `Voice failed: ${result.reason}` })
+        .catch(() => {})
+      return
+    }
+    try {
+      // Native voice note (NOT a document), quote-replying the button's
+      // message. Keyboard is left intact so the button stays replayable.
+      await robustApiCall(
+        () =>
+          bot.api.sendVoice(
+            cbChatId,
+            // allow-raw-bot-api: single native voice-note send for an on-demand Listen tap.
+            new InputFile(Buffer.from(result.audio)),
+            {
+              ...(cbMessageId != null ? { reply_parameters: { message_id: cbMessageId } } : {}),
+              ...(cbThreadId != null ? { message_thread_id: cbThreadId } : {}),
+            } as never,
+          ),
+        {
+          chat_id: cbChatId,
+          verb: 'voice-ondemand.sendVoice',
+          ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+        },
+      )
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(
+        `telegram gateway: voice-out on-demand: sendVoice failed (non-fatal): ${msg}\n`,
+      )
+    }
     return
   }
 
