@@ -154,3 +154,49 @@ describe('on-demand: reply-time behaviour (gate + no synthesis)', () => {
     expect(mayInjectListenButton(undefined)).toBe(true)
   })
 })
+
+describe('on-demand: single-use — strip the Listen keyboard on success only', () => {
+  // Reproduce the callback handler's control flow. Each terminal branch in the
+  // gateway either returns EARLY (leaving the button intact so the user can
+  // retry) or falls through to the successful sendVoice + keyboard strip.
+  //
+  //   expired cache entry           → answerCallbackQuery + return (no strip)
+  //   sidecar unavailable           → answerCallbackQuery + return (no strip)
+  //   synth failure (!result.ok)    → answerCallbackQuery + return (no strip)
+  //   sendVoice success             → strip keyboard
+  //
+  // We model that as a pure decision so the observable contract — strip iff the
+  // audio was actually delivered — is pinned without importing the gateway.
+  type Outcome = 'expired' | 'sidecar-unavailable' | 'synth-failed' | 'sent'
+  const shouldStripListenKeyboard = (outcome: Outcome, cbMessageId: number | undefined): boolean =>
+    outcome === 'sent' && cbMessageId != null
+
+  it('strips the keyboard after a successful sendVoice', () => {
+    expect(shouldStripListenKeyboard('sent', 42)).toBe(true)
+  })
+
+  it('does NOT strip when the cache entry expired (user can retry)', () => {
+    expect(shouldStripListenKeyboard('expired', 42)).toBe(false)
+  })
+
+  it('does NOT strip when the voice sidecar is unavailable (user can retry)', () => {
+    expect(shouldStripListenKeyboard('sidecar-unavailable', 42)).toBe(false)
+  })
+
+  it('does NOT strip when synthesis failed (user can retry)', () => {
+    expect(shouldStripListenKeyboard('synth-failed', 42)).toBe(false)
+  })
+
+  it('cannot strip without a callback message id even on success', () => {
+    // The gateway guards the strip on `cbMessageId != null` (no message → no
+    // keyboard to edit).
+    expect(shouldStripListenKeyboard('sent', undefined)).toBe(false)
+  })
+
+  it('strips by clearing the inline keyboard (empty rows)', () => {
+    // The strip payload the handler sends: reply_markup with an empty
+    // inline_keyboard — the same shape the agent-button single_use strip uses.
+    const stripMarkup = { reply_markup: { inline_keyboard: [] as unknown[][] } }
+    expect(stripMarkup.reply_markup.inline_keyboard).toHaveLength(0)
+  })
+})

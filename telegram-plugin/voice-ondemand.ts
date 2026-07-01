@@ -103,9 +103,10 @@ export function parseVoiceOnDemandToken(data: string): string | null {
   return token.length > 0 ? token : null
 }
 
-/** Build the single-row Listen keyboard for a token. single_use is N/A —
- *  the gate guarantees this is the only button, so the keyboard is never
- *  stripped and the button stays replayable. */
+/** Build the single-row Listen keyboard for a token. Effectively single-use:
+ *  the callback handler strips this keyboard after a SUCCESSFUL synth+send, so
+ *  a delivered voice note can't be re-tapped. On expiry / synth-failure /
+ *  sidecar-unavailable the button is left intact so the user can retry. */
 export function buildListenKeyboard(token: string): {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
 } {
@@ -121,10 +122,13 @@ export function buildListenKeyboard(token: string): {
  * carries no agent-authored buttons.
  *
  * Why: the callback dispatcher's single_use strip (keyboardIsSingleUse)
- * governs the WHOLE message's keyboard. A Listen button is single_use:false
- * (replayable); adding it alongside agent buttons would turn the message into
- * a mixed keyboard and defeat the agent's double-fire protection. So if the
- * agent supplied any button, we skip the Listen button for this message.
+ * governs the WHOLE message's keyboard, keyed off the agent-button metadata.
+ * The Listen button strips its own keyboard independently (on successful
+ * send, in the voice-on-demand callback handler) and carries no agent-button
+ * meta; mixing it alongside agent buttons would put two independent strip
+ * regimes on one message and could defeat the agent's double-fire protection.
+ * So if the agent supplied any button, we skip the Listen button for this
+ * message.
  */
 export function mayInjectListenButton(
   rawKeyboard: unknown[][] | undefined | null,

@@ -22290,7 +22290,7 @@ bot.on('callback_query:data', async ctx => {
     }
     try {
       // Native voice note (NOT a document), quote-replying the button's
-      // message. Keyboard is left intact so the button stays replayable.
+      // message.
       await robustApiCall(
         () =>
           bot.api.sendVoice(
@@ -22308,6 +22308,26 @@ bot.on('callback_query:data', async ctx => {
           ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
         },
       )
+      // Single-use on SUCCESS: strip the '🔊 Listen' keyboard so the button
+      // can't be re-tapped now that the audio has been delivered. Mirrors the
+      // agent-button single_use strip (keyboardIsSingleUse) house style.
+      // Best-effort + non-fatal — a failed strip only leaves a replayable
+      // button, never drops the delivered audio. Only reached on a successful
+      // sendVoice; expiry / synth-failure / sidecar-unavailable all return
+      // earlier WITHOUT stripping, so the user can retry those.
+      if (cbMessageId != null) {
+        await robustApiCall(
+          () =>
+            bot.api.editMessageReplyMarkup(cbChatId, cbMessageId, {
+              reply_markup: { inline_keyboard: [] },
+            }),
+          {
+            chat_id: cbChatId,
+            verb: 'voice-ondemand.strip-listen-keyboard',
+            ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+          },
+        ).catch(() => {})
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(
