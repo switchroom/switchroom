@@ -142,7 +142,8 @@ export type GatewayToClient =
   | ScheduleRestartResult
   | DriveApprovalPostedEvent
   | Ms365ApprovalPostedEvent
-  | ConfigApprovalResolvedEvent;
+  | ConfigApprovalResolvedEvent
+  | RolloutStatusPostedEvent;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -493,6 +494,67 @@ export interface PostSkillProposalMessage {
   draft: Record<string, string>;
 }
 
+/**
+ * #2726 Part 1 — hostd asks the caller agent's gateway to POST one ordinary
+ * operator-DM message narrating a rollout's terminal outcome. This is a NORMAL
+ * message, NOT a pinned card and NOT a bespoke widget — the framework speaking
+ * a plain progress line in the chat, which keeps it clear of
+ * `chat-is-the-single-source-of-truth` (in-chat narration, not a parallel
+ * pinned mirror).
+ *
+ * The gateway posts `text` to the operator chat (`allowFrom[0]`) and — for the
+ * Part 2 narration surface — replies with a `rollout_status_posted` event
+ * carrying the message_id so hostd can EDIT it as later phases arrive. Part 1
+ * uses only the terminal post and ignores the reply (fire-and-forget).
+ *
+ * Trust model: same as request_config_approval — the gateway socket lives in
+ * the agent container; hostd reaches it via the per-agent state-dir bind mount.
+ * `agentName` is validated server-side; the chat target is the gateway's OWN
+ * operator, never a caller-supplied chat.
+ */
+export interface RolloutStatusPostMessage {
+  type: "rollout_status_post";
+  /** hostd request_id of the roll (binds the surface to a real request). */
+  requestId: string;
+  /** The admin agent whose gateway relays the message (the rollout caller). */
+  agentName: string;
+  /** Fully-rendered message body. */
+  text: string;
+}
+
+/**
+ * #2726 Part 2 — hostd asks the gateway to EDIT the rollout status message it
+ * previously posted (identified by `messageId`, returned in the
+ * `rollout_status_posted` reply). Best-effort, fire-and-forget: an edit failure
+ * (incl. Telegram 429) is handled gateway-side and never surfaced back toward
+ * the roll.
+ */
+export interface RolloutStatusEditMessage {
+  type: "rollout_status_edit";
+  requestId: string;
+  agentName: string;
+  /** message_id of the status message to edit (from rollout_status_posted). */
+  messageId: number;
+  /** New fully-rendered body. */
+  text: string;
+}
+
+/**
+ * #2726 — gateway → hostd reply after a `rollout_status_post` was posted, so
+ * hostd learns the message_id to EDIT for subsequent phases. `ok:false` when
+ * the post failed (hostd then simply won't edit — the durable log + terminal
+ * push remain the record).
+ */
+export interface RolloutStatusPostedEvent {
+  type: "rollout_status_posted";
+  requestId: string;
+  ok: boolean;
+  /** Telegram message_id of the posted status message (present when ok). */
+  messageId?: number;
+  /** Diagnostic detail on failure. */
+  reason?: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -510,4 +572,6 @@ export type ClientToGateway =
   | RequestConfigFinalizeMessage
   | QuotaWallDetectedMessage
   | SendOutboundMessage
-  | PostSkillProposalMessage;
+  | PostSkillProposalMessage
+  | RolloutStatusPostMessage
+  | RolloutStatusEditMessage;

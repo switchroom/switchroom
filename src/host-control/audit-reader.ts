@@ -50,6 +50,13 @@ export interface AuditEntry {
   failed_step?: string;
   /** Agent that failed the version assert (rollout rows). */
   failed_agent?: string;
+  // ─── Rollout phase rows (#2726) ────────────────────────────────────
+  /** Agent named in a per-phase rollout row (agent-start/-done, canary-*). */
+  agent?: string;
+  /** Roll-order position (1-based) of the agent named in a phase row. */
+  n?: number;
+  /** Total agents this roll restarts (phase rows). */
+  m?: number;
   // ─── Prior-pin capture (#2492) ────────────────────────────────────
   /** Semver that WAS running before this rollout completed. Only present
    *  on completed (ok=true) rollout terminal rows. Enables
@@ -140,6 +147,10 @@ export function parseAuditLine(line: string): AuditEntry | null {
   }
   if (typeof o.failed_step === "string") entry.failed_step = o.failed_step;
   if (typeof o.failed_agent === "string") entry.failed_agent = o.failed_agent;
+  // Rollout phase rows (#2726) — per-phase agent/n/m context.
+  if (typeof o.agent === "string") entry.agent = o.agent;
+  if (typeof o.n === "number") entry.n = o.n;
+  if (typeof o.m === "number") entry.m = o.m;
   // Prior-pin capture (#2492) — present only on completed rollout terminal rows.
   if (typeof o.prior_pin === "string") entry.prior_pin = o.prior_pin;
   return entry;
@@ -182,6 +193,34 @@ export function readAndFilter(
   }
   const filtered = filterEntries(parsed, filters);
   return filtered.slice(-Math.max(1, limit));
+}
+
+/**
+ * #2726 — the LATEST rollout audit row for a given `request_id`, from the
+ * durable log. "Latest" = the last-written row for that request among all
+ * rollout ops (`rollout` + the synthetic `rollout_orphaned`), covering the
+ * per-phase progress rows AND the terminal row. This is what un-blinds
+ * `get_status` when the in-memory status entry is gone (hostd restarted
+ * mid-roll, or the entry aged out) — the durable log is the source of truth.
+ *
+ * Pure: caller passes the whole log contents. Returns null when no rollout row
+ * for that request_id exists. Rows are appended in order, so the last matching
+ * parsed row is the most recent phase/terminal state.
+ */
+export function latestRolloutRowForRequest(
+  raw: string,
+  requestId: string,
+): AuditEntry | null {
+  const ROLLOUT_OPS = new Set(["rollout", "rollout_orphaned"]);
+  let latest: AuditEntry | null = null;
+  for (const line of raw.split("\n")) {
+    const e = parseAuditLine(line);
+    if (e === null) continue;
+    if (e.request_id !== requestId) continue;
+    if (!ROLLOUT_OPS.has(e.op)) continue;
+    latest = e; // keep walking — the last match wins (most-recent).
+  }
+  return latest;
 }
 
 function shortCaller(caller: AuditEntry["caller"]): string {

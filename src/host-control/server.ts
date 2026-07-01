@@ -56,15 +56,22 @@ import { chainRow, seedChain, type ChainState } from "../util/audit-hashchain.js
 import { socketPathToIdentity, type SocketIdentity } from "./peercred.js";
 import { redact } from "../secret-detect/redact.js";
 import { detectInstallType, type InstallType } from "../cli/install-detect.js";
-import { parseRolloutResultLine, isVersionAssertable } from "../cli/rollout.js";
+import {
+  parseRolloutResultLine,
+  parseRolloutPhaseLine,
+  isVersionAssertable,
+  type RolloutPhase,
+} from "../cli/rollout.js";
 import { parseUpdateResultLine } from "../cli/update.js";
-import { parseAuditLine } from "./audit-reader.js";
+import { parseAuditLine, latestRolloutRowForRequest } from "./audit-reader.js";
 import {
   validateConfigEdit,
   assertSelfScopedAllowEdit,
 } from "./config-edit-validator.js";
 import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
+import type { RolloutRelay } from "./rollout-relay.js";
+import { renderRolloutStatus } from "./render-rollout-status.js";
 import { loadConfig, resolveAgentsDir } from "../config/loader.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import {
@@ -149,12 +156,50 @@ export interface ServerOptions {
   configPath?: string;
   /** RFC §3.3 / #1623 — operator-approval surface; unset → `E_NO_APPROVAL_GATEWAY`. */
   approvalGateway?: ApprovalGateway;
+  /**
+   * #2726 Part 2 — optional in-chat rollout narration renderer. When set, each
+   * rollout phase transition is fed to it so it edits ONE ordinary operator-DM
+   * message through the phases (applying → canary → agent N/M → … → ✅/❌). It
+   * PULLS from what it's fed and relays fire-and-forget edits through the
+   * gateway; it never blocks or fails the roll. Unset in Part 1 (durable
+   * observability ships alone). */
+  rolloutNarrator?: RolloutNarrator;
+  /**
+   * #2726 Part 1 — terminal-push relay. When set, hostd pushes ONE ordinary
+   * operator-DM message on the rollout terminal row (via the same gateway IPC
+   * transport as the approval card). Fire-and-forget; never blocks/fails the
+   * roll. Unset → no terminal ping (durable audit row is still written). */
+  rolloutRelay?: RolloutRelay;
   /** Test seam: override the random hex id generator. */
   generateApprovalId?: () => string;
   /** Test seam: override the `switchroom apply` subprocess invocation. */
   runReconcile?: (args: {
     requestId: string;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
+}
+
+/**
+ * #2726 Part 2 — the in-chat rollout narration renderer, as hostd sees it.
+ * hostd owns the rollout request lifecycle and the gateway relay path (the same
+ * one it uses for approval cards), so it drives the renderer by feeding it each
+ * phase. The renderer is the thing that TAILS/edits; hostd only supplies phases.
+ * Defined here (not in the renderer module) so Part 1 declares the seam and
+ * Part 2 implements it — Part 1 leaves it unset.
+ */
+export interface RolloutNarrator {
+  /**
+   * Called once per rollout phase transition, in `_seq` order (hostd feeds
+   * them as it parses the child's stdout). MUST be non-blocking and swallow all
+   * errors — hostd calls it un-awaited, and an edit failure must never surface
+   * back toward the roll. `entry.request_id` binds the surface to a
+   * hostd-attested in-flight roll.
+   */
+  onPhase(entry: StatusEntry, phase: RolloutPhase): void;
+  /**
+   * Called once when the terminal row is written (success or failure), with the
+   * final entry. Freezes the surface: no later edit may un-finalize it.
+   */
+  onTerminal(entry: StatusEntry): void;
 }
 
 /**
@@ -195,6 +240,17 @@ interface StatusEntry {
   // sentinel line (see parseRolloutResultLine in cli/rollout.ts).
   /** Agents confirmed on the target version, in order. */
   rolled?: string[];
+  // ─── Live rollout phase (#2726) ────────────────────────────────────
+  // Updated on every phase transition parsed off the child's stdout, so an
+  // in-flight `get_status` shows the CURRENT phase ("canary-start",
+  // "agent-start", …) instead of a bare "started". Set only on rollout rows.
+  current_phase?: string;
+  /** Roll-order position of the agent named in the current phase (1-based). */
+  phase_n?: number;
+  /** Total agents this roll restarts. */
+  phase_m?: number;
+  /** Agent named in the current phase (agent-start/-done, canary-*). */
+  phase_agent?: string;
   /** Step that stopped the rollout (e.g. "restart-agent", "apply"). */
   failed_step?: string;
   /** Agent that failed the version assert (when failed_step is restart). */
@@ -483,6 +539,17 @@ export class HostdServer {
         started_at: number;
       }
     | null = null;
+
+  /**
+   * #2726 Part 2 — optional in-chat narration renderer. When wired (via
+   * `ServerOptions.rolloutNarrator`), each rollout phase transition is fed to
+   * it so it edits ONE ordinary operator-DM message through the phases. Left
+   * unset in Part 1 (durable observability ships alone); a null narrator makes
+   * `onRolloutPhase` a pure audit-writer. The renderer PULLS from what it's fed
+   * and holds no lifecycle state that a gateway restart could orphan. */
+  private get rolloutNarrator(): RolloutNarrator | undefined {
+    return this.opts.rolloutNarrator;
+  }
 
   constructor(private opts: ServerOptions) {}
 
@@ -942,6 +1009,18 @@ export class HostdServer {
         // avoid information leakage across agents.
         const entry = this.statusByRequestId.get(req.args.target_request_id);
         if (!entry) {
+          // #2726 — durable-log fallback for a ROLLOUT request whose in-memory
+          // entry is gone (hostd restarted mid-roll, or the 10-min entry aged
+          // out). Rollout is admin/operator-only, so surfacing its LATEST
+          // durable row to an admin agent (or the operator socket) is not a
+          // cross-agent leak. A non-admin agent still gets the opaque
+          // not-found so it can't probe request_ids that aren't theirs.
+          if (
+            callerAdmin &&
+            this.rolloutRowExistsInLog(req.args.target_request_id)
+          ) {
+            return null;
+          }
           // No leak: return "denied: not found" the same as the
           // unauthorized case so callers can't probe for the
           // existence of request_ids that aren't theirs.
@@ -2457,7 +2536,16 @@ export class HostdServer {
    * tail. Releases the fleet-mutation lock on completion (success/fail).
    */
   private spawnRollout(args: string[], entry: StatusEntry): void {
-    this.runSwitchroom(args, { SWITCHROOM_HOSTD_CONTEXT: "1" })
+    // #2726 — tap the child's stdout line-by-line so each rollout PHASE
+    // sentinel becomes a durable, hash-chained audit row AS the roll runs
+    // (the log is the single source of truth; the narration surface in Part 2
+    // PULLS from it). hostd is the SOLE writer of the chained log — the
+    // subprocess only emits sentinels on stdout, never touches the file.
+    const onLine = (line: string): void => {
+      const phase = parseRolloutPhaseLine(line);
+      if (phase) this.onRolloutPhase(entry, phase);
+    };
+    this.runSwitchroom(args, { SWITCHROOM_HOSTD_CONTEXT: "1" }, onLine)
       .then((res) => {
         entry.exit_code = res.exit_code;
         entry.finished_at = Date.now();
@@ -2498,6 +2586,10 @@ export class HostdServer {
       })
       .finally(() => {
         void this.writeTerminalAudit(entry);
+        // #2726 — terminal effects. All fire-and-forget: a chat push / narrator
+        // finalize must NEVER block the lock release or the roll's completion.
+        this.pushRolloutTerminal(entry);
+        this.rolloutNarrator?.onTerminal(entry);
         if (
           this.fleetMutationInFlight &&
           this.fleetMutationInFlight.request_id === entry.request_id
@@ -2507,15 +2599,56 @@ export class HostdServer {
       });
   }
 
+  /**
+   * #2726 Part 1 — push ONE ordinary operator-DM message on the rollout
+   * terminal row via the gateway relay. Fire-and-forget: `postTerminal` never
+   * throws and never awaits a reply, so the roll can't stall on a slow/absent
+   * gateway. No-op when no relay is wired or the caller isn't an agent (the
+   * relay routes through the caller agent's gateway, like the approval card).
+   */
+  private pushRolloutTerminal(entry: StatusEntry): void {
+    if (!this.opts.rolloutRelay) return;
+    if (entry.caller.kind !== "agent") return;
+    try {
+      const text = renderRolloutStatus({
+        target: entry.pin ?? "",
+        rolled: entry.rolled,
+        terminal: entry.result === "completed" ? "completed" : "error",
+        ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
+        ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
+        ...(entry.got !== undefined ? { got: entry.got } : {}),
+      });
+      this.opts.rolloutRelay.postTerminal({
+        requestId: entry.request_id,
+        agentName: entry.caller.name,
+        text,
+      });
+    } catch (e) {
+      process.stderr.write(
+        `hostd: rollout terminal push failed (non-fatal): ${(e as Error).message}\n`,
+      );
+    }
+  }
+
   private handleGetStatus(
     req: Extract<HostdRequest, { op: "get_status" }>,
     _caller: SocketIdentity,
     started: number,
   ): HostdResponse {
     const entry = this.statusByRequestId.get(req.args.target_request_id);
-    // checkGate already rejected unknown / cross-agent cases above.
-    // If we got here `entry` must exist.
     if (!entry) {
+      // #2726 — the gate admitted this because a ROLLOUT row for the
+      // request_id exists in the durable log but the in-memory entry is gone
+      // (hostd restarted mid-roll / entry aged out). Rebuild the status
+      // response from the LATEST durable rollout row — the log is the source
+      // of truth. If somehow no row is found now (raced eviction), fall through
+      // to the internal-invariant error.
+      const fromLog = this.rolloutStatusFromLog(
+        req.request_id,
+        req.args.target_request_id,
+        started,
+      );
+      if (fromLog) return fromLog;
       // #1761: internal invariant violation — no fix.kind applies.
       const legacy = `get_status: internal: entry missing despite gate accept`;
       const built = err("E_INTERNAL", "entry missing despite gate accept")
@@ -2524,6 +2657,68 @@ export class HostdServer {
       return { ...built, error: legacy };
     }
     return this.statusEntryToResponse(req.request_id, entry);
+  }
+
+  /** True when the durable audit log holds at least one rollout row for
+   *  `targetRequestId` (#2726 get_status durable fallback). Best-effort:
+   *  a read error is treated as "no row". */
+  private rolloutRowExistsInLog(targetRequestId: string): boolean {
+    const path = this.auditLogPath();
+    if (!existsSync(path)) return false;
+    try {
+      const raw = readFileSync(path, "utf-8");
+      return latestRolloutRowForRequest(raw, targetRequestId) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Build a `get_status` response for a rollout from its LATEST durable audit
+   * row (#2726). Used only when the in-memory status entry is gone. Surfaces
+   * the same rollout `payload` shape as the live path (phase / n / m / agent /
+   * rolled / failedStep / failedAgent / pin / prior_pin) so a reader gets
+   * identical structure whether the entry is live or reconstructed from disk.
+   * Returns null when no rollout row exists for the request.
+   */
+  private rolloutStatusFromLog(
+    responseRequestId: string,
+    targetRequestId: string,
+    started: number,
+  ): HostdResponse | null {
+    const path = this.auditLogPath();
+    if (!existsSync(path)) return null;
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf-8");
+    } catch {
+      return null;
+    }
+    const row = latestRolloutRowForRequest(raw, targetRequestId);
+    if (!row) return null;
+    // A terminal row's `result` is completed/error; a phase row's is "started".
+    const isTerminal = row.phase === "terminal";
+    const payload = JSON.stringify({
+      rolled: row.rolled ?? [],
+      // Phase rows carry the transition name in `phase`; the terminal row's
+      // phase is the literal "terminal", which a reader shows as "done".
+      ...(row.phase && !isTerminal ? { phase: row.phase } : {}),
+      ...(row.n !== undefined ? { n: row.n } : {}),
+      ...(row.m !== undefined ? { m: row.m } : {}),
+      ...(row.agent ? { agent: row.agent } : {}),
+      ...(row.failed_step ? { failedStep: row.failed_step } : {}),
+      ...(row.failed_agent ? { failedAgent: row.failed_agent } : {}),
+      ...(row.pin ? { pin: row.pin } : {}),
+      ...(row.prior_pin ? { prior_pin: row.prior_pin } : {}),
+    });
+    return {
+      v: 1,
+      request_id: responseRequestId,
+      result: row.result as Result,
+      exit_code: row.exit_code,
+      duration_ms: Date.now() - started,
+      payload,
+    };
   }
 
   private statusEntryToResponse(
@@ -2538,14 +2733,29 @@ export class HostdServer {
       entry.op === "rollout" &&
       (entry.rolled !== undefined ||
         entry.failed_step !== undefined ||
-        entry.failed_agent !== undefined)
+        entry.failed_agent !== undefined ||
+        // #2726 point 2 — un-blind an IN-FLIGHT rollout too: a live phase (no
+        // rolled[]/failed_step yet) is enough to emit a payload so a
+        // get_status poll mid-roll shows the current phase, not a bare "started".
+        entry.current_phase !== undefined)
         ? JSON.stringify({
             rolled: entry.rolled ?? [],
+            // Current phase + roll-order (#2726) — present while in flight and
+            // on the final row (the terminal phase leaves current_phase set to
+            // the last transition seen). A reader can render "canary-start" /
+            // "agent 3/8" without scraping the durable log.
+            ...(entry.current_phase ? { phase: entry.current_phase } : {}),
+            ...(entry.phase_n !== undefined ? { n: entry.phase_n } : {}),
+            ...(entry.phase_m !== undefined ? { m: entry.phase_m } : {}),
+            ...(entry.phase_agent ? { agent: entry.phase_agent } : {}),
             ...(entry.failed_step ? { failedStep: entry.failed_step } : {}),
             ...(entry.failed_agent ? { failedAgent: entry.failed_agent } : {}),
             // BONUS (#2458 got-field gap): include `got` when present.
             ...(entry.got !== undefined ? { got: entry.got } : {}),
             ...(entry.pin ? { pin: entry.pin } : {}),
+            // Prior-pin (#2492) surfaced structurally too, so a rollback-aware
+            // reader gets it from get_status, not only the durable terminal row.
+            ...(entry.prior_pin ? { prior_pin: entry.prior_pin } : {}),
           })
         : undefined;
     // Update-apply (#2458) payload: deferred steps + channel/pin enrichment.
@@ -2718,13 +2928,91 @@ export class HostdServer {
     });
   }
 
-  /** Spawn the host switchroom CLI and capture stdout/stderr. An
+  /**
+   * #2726 — handle one rollout PHASE transition parsed off the child's
+   * stdout. Two effects, both fire-and-forget so a stall in either can NEVER
+   * block or fail the roll:
+   *   1. Persist a durable, hash-chained phase audit row (the single source of
+   *      truth for rollout progress — `get_status` + the Part 2 narration
+   *      surface both READ from here).
+   *   2. Feed the narration renderer (Part 2), if one is attached, so the
+   *      in-chat message edits through the phases. The renderer PULLS from what
+   *      it's fed; it holds no lifecycle state that a gateway restart could
+   *      orphan (recovery = re-read the log).
+   */
+  private onRolloutPhase(entry: StatusEntry, phase: RolloutPhase): void {
+    // Record the live phase on the in-memory entry so an in-flight get_status
+    // shows the current phase, not a bare "started" (#2726 point 2).
+    entry.current_phase = phase.phase;
+    entry.phase_n = phase.n;
+    entry.phase_m = phase.m;
+    entry.phase_agent = phase.agent;
+    void this.writePhaseAudit(entry, phase);
+    // Part 2 hook — attached only when a narration renderer is wired. Kept as
+    // an optional member so Part 1 is mergeable alone (no renderer → no-op).
+    this.rolloutNarrator?.onPhase(entry, phase);
+  }
+
+  /**
+   * Durable per-phase audit row for an in-flight rollout (#2726). Distinct
+   * from {@link writeTerminalAudit}: `phase` here is the transition name
+   * ("apply", "canary-start", …) rather than the literal "terminal" the
+   * hostd terminal row uses — so a phase row is lexically incapable of being
+   * mistaken for the terminal sentinel by any reader keyed on
+   * `phase === "terminal"`. Carries `request_id` + `pin` on every row per the
+   * observability contract, plus the roll-order `n`/`m` and `agent` when the
+   * phase supplies them. Best-effort: `appendAuditRow` swallows write errors,
+   * so this never throws into the stdout-tap that calls it.
+   */
+  private async writePhaseAudit(
+    entry: StatusEntry,
+    phase: RolloutPhase,
+  ): Promise<void> {
+    await this.appendAuditRow({
+      ts: new Date().toISOString(),
+      op: entry.op,
+      // The transition name — NEVER the string "terminal". Terminal-sentinel
+      // readers key on phase==="terminal"; a phase row can never collide.
+      phase: phase.phase,
+      caller:
+        entry.caller.kind === "agent"
+          ? { kind: "agent", name: entry.caller.name }
+          : { kind: "operator" },
+      request_id: entry.request_id,
+      // In-flight: no exit code / final result yet. `result: "started"` marks
+      // it as an in-progress row, disjoint from the terminal row's
+      // completed/error.
+      result: "started",
+      exit_code: null,
+      duration_ms: Date.now() - entry.started_at,
+      // Observability contract: pin on every rollout row.
+      ...(entry.pin ? { pin: entry.pin } : {}),
+      // Roll-order + agent context when the phase supplies them.
+      ...(phase.agent !== undefined ? { agent: phase.agent } : {}),
+      ...(phase.n !== undefined ? { n: phase.n } : {}),
+      ...(phase.m !== undefined ? { m: phase.m } : {}),
+    });
+  }
+
+  /**
+   * Spawn the host switchroom CLI and capture stdout/stderr. An
    *  optional `extraEnv` is merged onto the inherited env — used by the
    *  rollout path to flip the in-container `SWITCHROOM_HOSTD_CONTEXT`
    *  sentinel (#2487). */
   private runSwitchroom(
     args: string[],
     extraEnv?: Record<string, string>,
+    /**
+     * Optional line-oriented stdout tap (#2726). Invoked once per COMPLETE
+     * stdout line (newline-delimited) as the child emits it — used by
+     * `spawnRollout` to persist each rollout phase sentinel to the durable
+     * audit log AS the roll progresses, not after it exits. The full buffered
+     * stdout is still returned on close (for the terminal sentinel parse), so
+     * this tap is purely additive. Never throws into the child pipe: a callback
+     * that throws is caught and logged so a persistence hiccup can't kill the
+     * roll.
+     */
+    onStdoutLine?: (line: string) => void,
   ): Promise<{ exit_code: number; stdout: string; stderr: string }> {
     return new Promise((resolve, reject) => {
       const bin = this.opts.switchroomBin ?? "switchroom";
@@ -2734,16 +3022,51 @@ export class HostdServer {
       });
       let stdout = "";
       let stderr = "";
+      // Line-buffer for the optional stdout tap. Only maintained when a tap is
+      // wired — the common (untapped) path keeps the cheap buffer-only shape.
+      let lineBuf = "";
+      const drainLines = (flush: boolean): void => {
+        if (!onStdoutLine) return;
+        let nl: number;
+        while ((nl = lineBuf.indexOf("\n")) !== -1) {
+          const line = lineBuf.slice(0, nl);
+          lineBuf = lineBuf.slice(nl + 1);
+          try {
+            onStdoutLine(line);
+          } catch (e) {
+            process.stderr.write(
+              `hostd: rollout stdout-tap threw (non-fatal): ${(e as Error).message}\n`,
+            );
+          }
+        }
+        if (flush && lineBuf.length > 0) {
+          const line = lineBuf;
+          lineBuf = "";
+          try {
+            onStdoutLine(line);
+          } catch (e) {
+            process.stderr.write(
+              `hostd: rollout stdout-tap threw (non-fatal): ${(e as Error).message}\n`,
+            );
+          }
+        }
+      };
       child.stdout.on("data", (d: Buffer) => {
-        stdout += d.toString("utf8");
+        const s = d.toString("utf8");
+        stdout += s;
+        if (onStdoutLine) {
+          lineBuf += s;
+          drainLines(false);
+        }
       });
       child.stderr.on("data", (d: Buffer) => {
         stderr += d.toString("utf8");
       });
       child.on("error", (err) => reject(err));
-      child.on("close", (code) =>
-        resolve({ exit_code: code ?? -1, stdout, stderr }),
-      );
+      child.on("close", (code) => {
+        drainLines(true);
+        resolve({ exit_code: code ?? -1, stdout, stderr });
+      });
     });
   }
 }

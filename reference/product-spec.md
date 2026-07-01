@@ -138,6 +138,7 @@ Each links its job spec in `jobs/`.
 - [`steer-or-queue-mid-flight.md`](jobs/steer-or-queue-mid-flight.md) — share of in-flight steer/stop requests honoured before the action lands
 - [`approve-what-my-agent-can-touch.md`](jobs/approve-what-my-agent-can-touch.md) — unapproved consequential actions, target zero
 - [`see-my-whole-fleet-from-one-screen.md`](jobs/see-my-whole-fleet-from-one-screen.md) — share of fleet whose live status is visible from one view
+- [`operate-the-fleet-from-telegram.md`](jobs/operate-the-fleet-from-telegram.md) — share of fleet operations (rollout/update) whose progress + outcome are visible in-chat and durably, without host-side grep
 
 ### subscription-honest
 - [`keep-my-subscription-honest.md`](jobs/keep-my-subscription-honest.md) — off-plan callsites, target zero (CI-enforced)
