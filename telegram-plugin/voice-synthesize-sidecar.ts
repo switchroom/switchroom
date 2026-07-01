@@ -29,11 +29,16 @@
 /** Default loopback base URL for the sidecar (host-network agent). */
 export const DEFAULT_SIDECAR_BASE_URL = 'http://127.0.0.1:18900'
 
-/** The sidecar caps text at VOICE_TTS_MAX_CHARS (default 1200, server.py);
- *  reject obviously-oversized input before the round-trip. The gateway's
- *  own `voice_out.max_chars` (default 600) is the user-facing gate; this is
- *  a defence-in-depth ceiling matching the sidecar's hard limit. */
-export const SIDECAR_TTS_MAX_CHARS = 1200
+/** Defence-in-depth ceiling on a SINGLE /tts request.
+ *
+ *  The sidecar now accepts arbitrarily long text and chunks + concatenates
+ *  internally on the GPU, returning a single ogg/opus file (one voice note
+ *  per response). This client cap is therefore only a sanity ceiling against
+ *  a pathological reply, not a per-note splitter — the gateway sends the
+ *  whole normalized reply in one call. Kept comfortably above any realistic
+ *  chat reply. (Contract with docker/voice-sidecar/server.py: endpoint path,
+ *  X-Voice-Token header, and {text, voice?, format?} JSON shape UNCHANGED.) */
+export const SIDECAR_TTS_MAX_CHARS = 100_000
 
 /**
  * Split already-stripped plain text into sequential TTS chunks, each ≤

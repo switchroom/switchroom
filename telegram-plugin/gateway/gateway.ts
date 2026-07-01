@@ -49,9 +49,9 @@ import {
 } from '../sticker-aliases.js'
 import { transcribeViaWhisper } from '../voice-transcribe.js'
 import { transcribeViaSidecar } from '../voice-transcribe-sidecar.js'
-import { synthesizeViaSidecar, SIDECAR_TTS_MAX_CHARS, chunkTtsText } from '../voice-synthesize-sidecar.js'
+import { synthesizeViaSidecar, chunkTtsText } from '../voice-synthesize-sidecar.js'
+import { normalizeForSpeech } from '../voice-normalize-text.js'
 import { synthesizeViaOpenAi } from '../voice-synthesize.js'
-import { stripMarkdown } from '../card-format.js'
 import {
   createTelegraphAccount,
   createTelegraphPage,
@@ -977,14 +977,19 @@ type Access = {
    *  when the host voice verdict is local (SWITCHROOM_VOICE_ENGINE ===
    *  'local'); 'openai' is an honest-exception cloud path gated on an
    *  `api_key` vault ref. Voice is best-effort and fully non-fatal — any
-   *  TTS error falls back to the text reply. Replies longer than
-   *  `max_chars` (default 600) always fall back to text-only. Off by
-   *  default. */
+   *  TTS error falls back to the text reply. ONE voice note per response:
+   *  the reply is speech-normalized (markdown/symbols stripped) and, for the
+   *  kokoro sidecar, sent in a SINGLE /tts call that returns one concatenated
+   *  file. Off by default. */
   voice_out?: {
     enabled?: boolean
     engine?: 'kokoro' | 'openai'
     voice?: string
     reply_mode?: 'voice+text' | 'voice-only'
+    /** OpenAI-engine only: per-voice-note chunk size (default 600) used to
+     *  split a long reply across sequential notes, since OpenAI's TTS input
+     *  has a hard cap. Ignored by the kokoro path, which sends the whole
+     *  reply in one call (the sidecar owns length + concatenation). */
     max_chars?: number
     api_key?: string
   }
@@ -8172,14 +8177,15 @@ function redactOutboundText(text: string, site: string): string {
 
 /** Default per-voice-note chunk size (chars). A long reply is split into
  *  sequential voice notes of roughly this size on sentence/paragraph
- *  boundaries — NOT truncated. Mirrors the schema default. The Kokoro
- *  sidecar's hard per-request cap (VOICE_TTS_MAX_CHARS, 1200) is the upper
- *  bound; any configured value above it is clamped down. */
+ *  boundaries. Only the OpenAI (cloud) engine still uses this — the kokoro
+ *  sidecar now takes the whole reply in one call and returns a single note. */
 const VOICE_OUT_DEFAULT_CHUNK_CHARS = 600
 
-/** Hard ceiling for a single TTS request, matching the sidecar's
- *  VOICE_TTS_MAX_CHARS (server.py). Voice-note chunks never exceed this. */
-const VOICE_OUT_HARD_CHUNK_CAP = SIDECAR_TTS_MAX_CHARS
+/** Hard ceiling for a single OpenAI TTS request. OpenAI's TTS input caps at
+ *  4096 chars, so client-side chunks for that engine never exceed this; the
+ *  reply is spoken across sequential notes when it's longer. (The kokoro path
+ *  no longer chunks — the sidecar owns length and returns one file.) */
+const VOICE_OUT_HARD_CHUNK_CAP = 4096
 
 type VoiceOutAccess = NonNullable<Access['voice_out']>
 
@@ -8194,11 +8200,16 @@ type VoiceOutAccess = NonNullable<Access['voice_out']>
  * NOT require a local verdict.
  *
  * Returns null when voice-out is off / not applicable; otherwise a plan the
- * caller acts on. `ttsChunks` is markdown-stripped plain text split into
- * sequential voice-note-sized pieces (sentence/paragraph boundaries) — a
- * LONG reply is spoken across multiple ordered voice notes, never truncated
- * to text-only (Ken is often on a bike/driving and can't read the screen).
- * `max_chars` is the per-note chunk size, not a cutoff.
+ * caller acts on. `ttsChunks` is speech-normalized plain text (markdown and
+ * TTS-mispronounced symbols removed — see normalizeForSpeech).
+ *
+ * ONE voice note per response: the kokoro (local sidecar) path now sends the
+ * WHOLE normalized reply to `/tts` in a SINGLE call — the sidecar chunks +
+ * concatenates internally on the GPU and returns a single ogg/opus file — so
+ * `ttsChunks` is a single element for kokoro. `max_chars` is no longer a hard
+ * client-side splitter for kokoro; it's retired for that path (the sidecar
+ * owns length). The openai (cloud) engine keeps client-side chunking because
+ * OpenAI's TTS input has its own hard cap; each chunk is one voice note.
  */
 function resolveVoiceOutPlan(
   voiceOut: VoiceOutAccess | undefined,
@@ -8229,20 +8240,31 @@ function resolveVoiceOutPlan(
     if (voiceEngine !== 'local') return null
   }
 
-  // Plain-text TTS input: strip markdown REGARDLESS of mode so the engine
-  // never reads out backticks / asterisks / link syntax. Collapse runs of
-  // whitespace so multi-line prose speaks cleanly.
-  const ttsText = stripMarkdown(replyText).replace(/\s+/g, ' ').trim()
+  // Speech-normalized TTS input: strip markdown AND translate/drop the
+  // symbols TTS mispronounces (~, backticks, arrows, tables, code fences,
+  // link URLs) REGARDLESS of mode so the engine reads clean prose. Applied
+  // for BOTH engines — the older partial stripMarkdown pass leaked `~`,
+  // code fences and arrows.
+  const ttsText = normalizeForSpeech(replyText)
   if (ttsText.length === 0) return null
 
-  // Per-voice-note chunk size, clamped to the engine's hard cap. A long
-  // reply becomes several ordered voice notes instead of a text-only
-  // fallback.
-  const chunkChars = Math.min(
-    voiceOut.max_chars ?? VOICE_OUT_DEFAULT_CHUNK_CHARS,
-    VOICE_OUT_HARD_CHUNK_CAP,
-  )
-  const ttsChunks = chunkTtsText(ttsText, chunkChars)
+  // ONE voice note for kokoro: the sidecar accepts arbitrarily long text and
+  // returns a single concatenated ogg/opus file, so we send the whole reply
+  // in one call — no client-side splitting, no multi-sendVoice. `max_chars`
+  // is retired as a hard splitter here.
+  //
+  // OpenAI still needs client-side chunking (its TTS input has a hard cap),
+  // so for that engine we split at the engine cap; each chunk is one note.
+  let ttsChunks: string[]
+  if (engine === 'kokoro') {
+    ttsChunks = [ttsText]
+  } else {
+    const chunkChars = Math.min(
+      voiceOut.max_chars ?? VOICE_OUT_DEFAULT_CHUNK_CHARS,
+      VOICE_OUT_HARD_CHUNK_CAP,
+    )
+    ttsChunks = chunkTtsText(ttsText, chunkChars)
+  }
   if (ttsChunks.length === 0) return null
 
   return {
@@ -8672,12 +8694,14 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   const sentIds: number[] = []
 
   // Outbound TTS synthesis (PR-C2). Done BEFORE the text send so a
-  // voice-only reply can suppress the text chunks on success. A LONG reply
-  // is synthesized into SEVERAL ordered voice notes (one per chunk) instead
-  // of falling back to text-only — Ken is often on a bike/driving and can't
-  // read the screen, so the full answer must be SPOKEN. Best-effort: each
-  // chunk that fails to synthesize is skipped; if NOTHING synthesizes the
-  // text path proceeds unchanged so the answer is never dropped.
+  // voice-only reply can suppress the text chunks on success. ONE voice note
+  // per response for the kokoro path (ttsChunks is a single element — the
+  // whole normalized reply — synthesized in one /tts call). The OpenAI path
+  // may still produce several ordered notes (one per chunk) because of its
+  // input cap. Ken is often on a bike/driving and can't read the screen, so
+  // the full answer must be SPOKEN. Best-effort: a chunk that fails to
+  // synthesize is skipped; if NOTHING synthesizes the text path proceeds
+  // unchanged so the answer is never dropped.
   const voiceOggs: Uint8Array[] = []
   if (voiceOutPlan != null) {
     for (const chunkText of voiceOutPlan.ttsChunks) {

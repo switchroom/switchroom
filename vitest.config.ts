@@ -246,6 +246,11 @@ export default defineConfig({
       // voice-synthesize-sidecar.test.ts uses bun:test (PR-C2 local TTS) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/voice-synthesize-sidecar.test.ts",
+      // voice-normalize-text.test.ts + voice-out-one-send.test.ts use
+      // bun:test (voice-out speech normalization + one-send) — excluded
+      // here, run via test:bun.
+      "**/telegram-plugin/tests/voice-normalize-text.test.ts",
+      "**/telegram-plugin/tests/voice-out-one-send.test.ts",
       // telegraph.test.ts uses bun:test (#579 Telegraph Instant View) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/telegraph.test.ts",
