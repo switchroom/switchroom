@@ -373,7 +373,10 @@ import { loadObligations, persistObligations } from './obligation-store.js'
 import {
   loadStatusPins,
   persistStatusPins,
+  pinnedMessageIsOurs,
+  runStatusPinBootCleanup,
   type PersistedStatusPin,
+  type TrackedStatusPin,
 } from './status-pin-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
@@ -5652,42 +5655,38 @@ function statusPinApi(): PinBotApi {
 }
 
 /**
- * Boot-time orphan cleanup. Any pin persisted by a PRIOR session is stale by
- * definition — the turn it represented ended or the session crashed before its
- * unpin reconcile ran. So on boot we best-effort unpin each persisted entry and
- * clear the store; we do NOT re-adopt or re-pin. This must run BEFORE any new
- * pin claims are written, so the freshly-emptied store reflects only this
- * session's pins and the service-message-deletion handler's ownership check
- * (statusPinState) sees no false positives. Non-fatal: a failed unpin only
- * leaves the orphan, exactly today's behaviour.
+ * Boot-time orphan cleanup — thin gateway wrapper over the pure
+ * `runStatusPinBootCleanup` (which owns the load → best-effort-unpin →
+ * empty-store contract). Binds the live fs seam, the robust unpin api, and the
+ * gateway logger.
+ *
+ * MUST run ONLY after this gateway wins the startup mutex (the store is a
+ * shared per-agent file; a losing double-boot would unpin the live holder's
+ * legitimate pins). Runs before any new pin claim is written, so the emptied
+ * store leaves the service-message handler's ownership check with no false
+ * positives.
  */
 async function statusPinBootCleanup(): Promise<void> {
   if (!statusPinPersistEnabled) return
-  const persisted = loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
-  if (persisted.length === 0) return
   const api = statusPinApi()
-  let cleared = 0
-  for (const pin of persisted) {
-    try {
-      await api.unpinChatMessage(pin.chatId, pin.messageId)
-      cleared++
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(
-        `telegram gateway: status-pin boot cleanup: unpin failed ` +
-          `(chat=${pin.chatId} msg=${pin.messageId}): ${msg}\n`,
-      )
-    }
+  const { cleared, total } = await runStatusPinBootCleanup({
+    path: STATUS_PIN_STORE_PATH,
+    fs: statusPinStoreFs,
+    unpin: (chatId, messageId) => api.unpinChatMessage(chatId, messageId),
+  })
+  if (total > 0) {
+    process.stderr.write(
+      `telegram gateway: status-pin: cleared ${cleared}/${total} ` +
+        `orphaned pin(s) from a prior session\n`,
+    )
   }
-  // Empty the store regardless — these claims belong to a dead session; leaving
-  // them would re-attempt the same (already-tried) unpins on every future boot.
-  persistStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs, [])
-  process.stderr.write(
-    `telegram gateway: status-pin: cleared ${cleared}/${persisted.length} ` +
-      `orphaned pin(s) from a prior session\n`,
-  )
 }
-void statusPinBootCleanup()
+// NOTE: statusPinBootCleanup() is deliberately NOT invoked here at import time.
+// The status-pin store is a SHARED per-agent file, and cleanup issues real
+// unpinChatMessage calls. On a double-boot the losing gateway must NOT touch
+// that shared state — its unpins would strip pins the STILL-ALIVE holder
+// legitimately owns. So the call is gated on winning the startup mutex
+// (top-level await below); see the acquireStartupLock block.
 
 /**
  * The single entry point that mutates pin state for `pinKey`. Serialises
@@ -5918,6 +5917,12 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     process.stderr.write(
       `telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS}\n`,
     )
+    // We WON the startup mutex — this gateway is the sole live owner of the
+    // shared per-agent status-pin store, so it's now safe to clean up orphaned
+    // pins from a prior (dead) session. Gated here (not at import time) so a
+    // LOSING double-boot never unpins the live holder's legitimate pins.
+    // Fire-and-forget: cleanup is best-effort and must not block boot.
+    void statusPinBootCleanup()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -5929,6 +5934,11 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     try {
       writePidFile(GATEWAY_PID_PATH, { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS })
       process.stderr.write(`telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS} (mutex-fallback)\n`)
+      // Mutex was unavailable (link() unsupported fs); the legacy pid-file
+      // probe + 409-retry loop is still the liveness guard on this path. A
+      // successful writePidFile here means no live holder was detected, so
+      // running orphan cleanup is consistent with the pre-mutex behaviour.
+      void statusPinBootCleanup()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -23618,8 +23628,20 @@ bot.on('message:pinned_message', async ctx => {
   const chatId = String(ctx.chat.id)
   const serviceMsgId = ctx.msg.message_id
 
-  const isOurs = () =>
-    [...statusPinState.values()].some(s => s.messageId === pinnedId)
+  // Chat-scoped ownership (see pinnedMessageIsOurs): the match requires BOTH
+  // the messageId AND that the tracked entry lives in THIS chat, so a pin id
+  // colliding across chats can't delete a foreign (e.g. operator-manual) pin
+  // notice. statusPinChatIds is the companion pinKey→chatId map written on
+  // every desired-pinned reconcile.
+  const trackedPins = (): TrackedStatusPin[] => {
+    const out: TrackedStatusPin[] = []
+    for (const [pinKey, state] of statusPinState) {
+      const c = statusPinChatIds.get(pinKey)
+      if (c != null) out.push({ chatId: c, messageId: state.messageId })
+    }
+    return out
+  }
+  const isOurs = () => pinnedMessageIsOurs(trackedPins(), chatId, pinnedId)
 
   if (!isOurs()) {
     // Tolerate the reconcile-store race: wait briefly, then re-check once.

@@ -2,8 +2,11 @@ import { describe, it, expect } from "vitest";
 import {
   loadStatusPins,
   persistStatusPins,
+  pinnedMessageIsOurs,
+  runStatusPinBootCleanup,
   type PersistedStatusPin,
   type StatusPinStoreFsSeam,
+  type TrackedStatusPin,
 } from "../gateway/status-pin-store.js";
 
 /** In-memory fs seam with an atomic rename, so the store's tmp→rename
@@ -128,13 +131,45 @@ describe("status-pin-store", () => {
 });
 
 /**
- * Boot-orphan cleanup contract (modelled against the store, since the gateway's
- * `statusPinBootCleanup` isn't exported — the gateway is a 25k-line module with
- * import-time side effects). It: (1) loads the persisted set, (2) unpins each
- * entry best-effort, (3) empties the store. This reproduces that flow over the
- * store's public surface + a fake unpin so the observable contract is pinned.
+ * Chat-scoped ownership guard (BUG 1). message_ids are per-chat small integers
+ * and the gateway tracks many pins across chats/topics simultaneously — the
+ * guard MUST match on messageId AND chatId, never messageId alone.
  */
-describe("status-pin boot orphan cleanup", () => {
+describe("pinnedMessageIsOurs — chat-scoped guard", () => {
+  const tracked: TrackedStatusPin[] = [
+    { chatId: "-100AAA", messageId: 715 }, // chat A
+    { chatId: "-100BBB", messageId: 42 }, // chat B, different id
+  ];
+
+  it("matches a genuine same-chat + same-id pin", () => {
+    expect(pinnedMessageIsOurs(tracked, "-100AAA", 715)).toBe(true);
+    expect(pinnedMessageIsOurs(tracked, "-100BBB", 42)).toBe(true);
+  });
+
+  it("does NOT match when the id collides but the chat differs (the bug)", () => {
+    // Chat B receives a pinned_message update whose id (715) collides with
+    // chat A's tracked status pin. A messageId-only guard would wrongly return
+    // true and delete chat B's (possibly operator-manual) service message.
+    expect(pinnedMessageIsOurs(tracked, "-100BBB", 715)).toBe(false);
+    // Symmetric: chat A with chat B's id.
+    expect(pinnedMessageIsOurs(tracked, "-100AAA", 42)).toBe(false);
+  });
+
+  it("does NOT match an untracked id in a tracked chat", () => {
+    expect(pinnedMessageIsOurs(tracked, "-100AAA", 999)).toBe(false);
+  });
+
+  it("does NOT match against an empty tracked set", () => {
+    expect(pinnedMessageIsOurs([], "-100AAA", 715)).toBe(false);
+  });
+});
+
+/**
+ * Boot-orphan cleanup — calls the REAL `runStatusPinBootCleanup` (extracted
+ * pure over injected fs + unpin seams) so ordering / contract regressions are
+ * caught here, not just structurally.
+ */
+describe("runStatusPinBootCleanup", () => {
   it("unpins every persisted entry and empties the store", async () => {
     const { fs } = memFs();
     const orphans: PersistedStatusPin[] = [
@@ -144,51 +179,57 @@ describe("status-pin boot orphan cleanup", () => {
     persistStatusPins(PATH, fs, orphans);
 
     const unpinned: Array<[string, number]> = [];
-    const fakeUnpin = async (chatId: string, messageId: number) => {
-      unpinned.push([chatId, messageId]);
-    };
-
-    // Reproduce statusPinBootCleanup's body:
-    const persisted = loadStatusPins(PATH, fs);
-    for (const p of persisted) await fakeUnpin(p.chatId, p.messageId);
-    persistStatusPins(PATH, fs, []);
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (chatId, messageId) => {
+        unpinned.push([chatId, messageId]);
+      },
+      log: () => {},
+    });
 
     expect(unpinned).toEqual([
       ["-100123", 715],
       ["-100999", 42],
     ]);
-    // Store is empty afterwards → no re-attempt on the next boot, and the
-    // service-message handler's ownership Map sees no false positives.
+    expect(res).toEqual({ cleared: 2, total: 2 });
+    // Store empty afterwards → no re-attempt next boot.
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 
   it("a failing unpin is non-fatal and the store is still emptied", async () => {
     const { fs } = memFs();
-    persistStatusPins(PATH, fs, [pin()]);
+    persistStatusPins(PATH, fs, [
+      pin({ pinKey: "fg:c:1", chatId: "-100123", messageId: 5 }),
+      pin({ pinKey: "fg:c:2", chatId: "-100123", messageId: 6 }),
+    ]);
 
-    const fakeUnpin = async () => {
-      throw new Error("chat gone");
-    };
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (_c, messageId) => {
+        if (messageId === 5) throw new Error("chat gone");
+      },
+      log: () => {},
+    });
 
-    const persisted = loadStatusPins(PATH, fs);
-    let threw = false;
-    for (const p of persisted) {
-      try {
-        await fakeUnpin();
-        void p;
-      } catch {
-        /* non-fatal, as in the gateway */
-      }
-    }
-    // Store emptied regardless of unpin outcome.
-    persistStatusPins(PATH, fs, []);
-
-    expect(threw).toBe(false);
+    // One failed, one succeeded — still non-fatal, store still emptied.
+    expect(res).toEqual({ cleared: 1, total: 2 });
     expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 
-  it("no-op on a fresh boot with no persisted pins", () => {
+  it("no-op on a fresh boot with no persisted pins (no unpin calls)", async () => {
     const { fs } = memFs();
-    expect(loadStatusPins(PATH, fs)).toEqual([]);
+    let calls = 0;
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async () => {
+        calls++;
+      },
+      log: () => {},
+    });
+    expect(res).toEqual({ cleared: 0, total: 0 });
+    expect(calls).toBe(0);
   });
 });

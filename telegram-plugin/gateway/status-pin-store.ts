@@ -112,3 +112,78 @@ export function persistStatusPins(
     )
   }
 }
+
+/**
+ * A single tracked live pin claim, as the gateway holds it in memory
+ * (statusPinState keyed by pinKey → PinState.messageId, plus the companion
+ * statusPinChatIds pinKey → chatId map). Flattened here so the ownership guard
+ * is a pure, unit-testable function decoupled from the gateway's Maps.
+ */
+export interface TrackedStatusPin {
+  chatId: string
+  messageId: number
+}
+
+/**
+ * CHAT-SCOPED ownership guard for a `pinned_message` service update.
+ *
+ * Telegram message_ids are per-chat small integers, and the gateway tracks
+ * many simultaneous pins across different chats/topics. Matching on messageId
+ * ALONE is a real bug: a pin update in chat B whose pinned id happens to equal
+ * a status-pin id tracked in chat A would pass, and the gateway would delete
+ * chat B's service message — including an operator's MANUAL pin notice. So the
+ * match REQUIRES both the messageId AND that the tracked entry lives in the
+ * SAME chat as the incoming update.
+ */
+export function pinnedMessageIsOurs(
+  tracked: Iterable<TrackedStatusPin>,
+  chatId: string,
+  pinnedMessageId: number,
+): boolean {
+  for (const t of tracked) {
+    if (t.messageId === pinnedMessageId && t.chatId === chatId) return true
+  }
+  return false
+}
+
+/**
+ * Boot-time orphan cleanup, extracted as a pure routine over injected seams so
+ * the ordering + best-effort contract is unit-testable against the REAL code
+ * (the gateway's thin wrapper just binds the live fs / unpin api / logger).
+ *
+ * Any pin persisted by a PRIOR session is stale by definition — its turn ended
+ * or the session crashed before its unpin reconcile ran. We best-effort unpin
+ * each persisted entry (a failure is non-fatal) and then EMPTY the store
+ * regardless, so a permanently-undeliverable unpin can't re-run on every boot.
+ * We do NOT re-adopt or re-pin. Returns the counts for logging/testing.
+ *
+ * CRITICAL: the caller MUST only invoke this AFTER winning the startup mutex.
+ * The store is a shared per-agent file; on a double-boot a losing gateway
+ * running this would unpin the still-alive holder's legitimate pins.
+ */
+export async function runStatusPinBootCleanup(args: {
+  path: string
+  fs: StatusPinStoreFsSeam
+  unpin: (chatId: string, messageId: number) => Promise<unknown>
+  log?: (line: string) => void
+}): Promise<{ cleared: number; total: number }> {
+  const log = args.log ?? ((l: string) => process.stderr.write(l))
+  const persisted = loadStatusPins(args.path, args.fs)
+  if (persisted.length === 0) return { cleared: 0, total: 0 }
+  let cleared = 0
+  for (const pin of persisted) {
+    try {
+      await args.unpin(pin.chatId, pin.messageId)
+      cleared++
+    } catch (err) {
+      log(
+        `status-pin-store: boot cleanup unpin failed ` +
+          `(chat=${pin.chatId} msg=${pin.messageId}): ${(err as Error).message}\n`,
+      )
+    }
+  }
+  // Empty the store regardless — these claims belong to a dead session; leaving
+  // them would re-attempt the same (already-tried) unpins on every future boot.
+  persistStatusPins(args.path, args.fs, [], log)
+  return { cleared, total: persisted.length }
+}
