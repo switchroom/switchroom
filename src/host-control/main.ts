@@ -27,6 +27,7 @@ import { loadConfig } from "../config/loader.js";
 import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
+import { SocketRolloutRelay } from "./rollout-relay.js";
 import { ReleaseWatcher } from "./release-watcher.js";
 import {
   makeReleaseCheck,
@@ -71,12 +72,22 @@ async function main(): Promise<void> {
   const agentsDir =
     process.env.SWITCHROOM_AGENTS_DIR ??
     join(homedir(), ".switchroom", "agents");
+  const resolveGatewaySocket = (agentName: string): string | null => {
+    const sock = resolve(agentsDir, agentName, "telegram", "gateway.sock");
+    return existsSync(sock) ? sock : null;
+  };
   const approvalGateway = new SocketApprovalGateway({
-    resolveGatewaySocket: (agentName) => {
-      const sock = resolve(agentsDir, agentName, "telegram", "gateway.sock");
-      return existsSync(sock) ? sock : null;
-    },
+    resolveGatewaySocket,
     log: (m) => process.stderr.write(`hostd: approval-gateway — ${m}\n`),
+  });
+
+  // #2726 Part 1 — rollout terminal-push relay. Same transport as the approval
+  // gateway (the caller agent's gateway IPC socket), but fire-and-forget: it
+  // posts ONE ordinary operator-DM message on the rollout terminal row and
+  // never awaits a reply, so a slow/absent gateway can't stall the roll.
+  const rolloutRelay = new SocketRolloutRelay({
+    resolveGatewaySocket,
+    log: (m) => process.stderr.write(`hostd: rollout-relay — ${m}\n`),
   });
 
   const server = new HostdServer({
@@ -103,6 +114,7 @@ async function main(): Promise<void> {
         : {}),
     },
     approvalGateway,
+    rolloutRelay,
   });
   await server.start();
 

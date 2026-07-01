@@ -204,6 +204,110 @@ export function formatRolloutPlan(
   return lines.join("\n");
 }
 
+/**
+ * One rollout phase transition (#2726 durable observability). Emitted by the
+ * spawned subprocess on stdout as a `SWITCHROOM_ROLLOUT_PHASE:` sentinel line;
+ * hostd — the SOLE writer of the hash-chained host-control audit log — parses
+ * each line and persists it as a phase audit row (see the seam note at the top
+ * of this file's phase section). The subprocess NEVER writes the chained log
+ * directly: two writers to one hash chain forks it (audit-hashchain.ts § the
+ * single-writer contract), so the buildable form of "the roll emits a row per
+ * phase" is emit-on-stdout, hostd-appends.
+ *
+ * The `phase` strings are lexically DISJOINT from the terminal-result sentinel
+ * (`SWITCHROOM_ROLLOUT_RESULT:`): a phase line starts with a different prefix,
+ * and no phase string equals "terminal" (hostd owns that row). This keeps the
+ * terminal-sentinel parser (`parseRolloutResultLine`) unable to mistake a phase
+ * line for the result line, and vice versa.
+ */
+export type RolloutPhaseName =
+  | "apply"
+  | "canary-start"
+  | "canary-pass"
+  | "canary-fail"
+  | "agent-start"
+  | "agent-done"
+  | "persist-pin"
+  | "hostd-web-deferred";
+
+export interface RolloutPhase {
+  phase: RolloutPhaseName;
+  /** The rollout target version (carried on every phase for the reader). */
+  target: string;
+  /** Agent name (agent-start / agent-done / canary-* rows). */
+  agent?: string;
+  /** 1-based index of this agent in the roll order (agent-start / -done). */
+  n?: number;
+  /** Total agents being rolled (agent-start / -done). */
+  m?: number;
+}
+
+/**
+ * Sentinel prefix for a per-phase progress line the rollout subprocess writes
+ * to stdout. hostd streams the child's stdout, parses each such line, and
+ * appends a hash-chained phase audit row through its single-writer append path.
+ *
+ * MUST stay lexically disjoint from {@link ROLLOUT_RESULT_SENTINEL} so the
+ * terminal parser and the phase parser can never cross-match. (`…PHASE:` vs
+ * `…RESULT:` — neither is a prefix of the other.)
+ */
+export const ROLLOUT_PHASE_SENTINEL = "SWITCHROOM_ROLLOUT_PHASE:";
+
+/** Serialize a phase for the sentinel line hostd parses. */
+export function encodeRolloutPhaseLine(phase: RolloutPhase): string {
+  return (
+    ROLLOUT_PHASE_SENTINEL +
+    JSON.stringify({
+      phase: phase.phase,
+      target: phase.target,
+      ...(phase.agent !== undefined ? { agent: phase.agent } : {}),
+      ...(phase.n !== undefined ? { n: phase.n } : {}),
+      ...(phase.m !== undefined ? { m: phase.m } : {}),
+    })
+  );
+}
+
+/**
+ * Parse a single line as a rollout PHASE sentinel. Returns null when the line
+ * is not a phase line (including when it is the terminal RESULT sentinel — the
+ * two are anchored disjoint). Defensive against malformed JSON / unknown phase
+ * names so a torn or forged line degrades to "not a phase" rather than throwing.
+ */
+export function parseRolloutPhaseLine(line: string): RolloutPhase | null {
+  const trimmed = line.trim();
+  // Anchor: only a line that STARTS with the phase sentinel is a phase line.
+  // The result sentinel starts with a different prefix, so it can never match.
+  if (!trimmed.startsWith(ROLLOUT_PHASE_SENTINEL)) return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed.slice(ROLLOUT_PHASE_SENTINEL.length));
+  } catch {
+    return null;
+  }
+  if (typeof obj !== "object" || obj === null) return null;
+  const o = obj as Record<string, unknown>;
+  const PHASES: ReadonlySet<string> = new Set([
+    "apply",
+    "canary-start",
+    "canary-pass",
+    "canary-fail",
+    "agent-start",
+    "agent-done",
+    "persist-pin",
+    "hostd-web-deferred",
+  ]);
+  if (typeof o.phase !== "string" || !PHASES.has(o.phase)) return null;
+  if (typeof o.target !== "string") return null;
+  const out: RolloutPhase = {
+    phase: o.phase as RolloutPhaseName,
+    target: o.target,
+  };
+  if (typeof o.agent === "string") out.agent = o.agent;
+  if (typeof o.n === "number") out.n = o.n;
+  if (typeof o.m === "number") out.m = o.m;
+  return out;
+}
+
 /** Injectable side-effects so the executor unit-tests without docker. */
 export interface RolloutDeps {
   /** Run a `switchroom <args>` subcommand; returns the exit status. */
@@ -212,6 +316,13 @@ export interface RolloutDeps {
   probeVersion(agent: string): string | null;
   /** Emit a progress line. */
   log(line: string): void;
+  /**
+   * Emit a structured phase transition. Default (in production) writes an
+   * {@link encodeRolloutPhaseLine} sentinel to stdout for hostd to persist;
+   * tests inject a spy. Optional so callers that don't narrate (and older
+   * tests) can omit it.
+   */
+  emitPhase?(phase: RolloutPhase): void;
   /**
    * Durably persist `release.pin = pin` to switchroom.yaml (comment-
    * preserving, atomic, ownership-restoring). Only invoked for a
@@ -390,6 +501,13 @@ export function executeRollout(
   const targetNorm = normalizeVersion(target);
   const rolled: string[] = [];
   const warnings: string[] = [];
+  const emit = (phase: RolloutPhase): void => deps.emitPhase?.(phase);
+
+  // Roll-order accounting for the agent-start/-done phase rows: `m` is the
+  // total number of agents this plan restarts; `n` is the 1-based position of
+  // the agent being restarted. The canary (first restart-agent step) is n=1.
+  const totalAgents = steps.filter((s) => s.kind === "restart-agent").length;
+  let agentIndex = 0;
 
   for (const step of steps) {
     switch (step.kind) {
@@ -403,6 +521,7 @@ export function executeRollout(
         } else {
           warnings.push(`persist-pin requested but no persist hook wired; pin NOT durable`);
         }
+        emit({ phase: "persist-pin", target });
         break;
       }
       case "apply": {
@@ -410,6 +529,7 @@ export function executeRollout(
         // pass the one-shot --pin so compose regenerates on the target.
         // host-shell path: pin already persisted → bare apply reads it.
         deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
+        emit({ phase: "apply", target });
         const applyArgs = execOpts.hostdContext
           ? ["apply", "--pin", target]
           : ["apply"];
@@ -421,6 +541,16 @@ export function executeRollout(
       }
       case "restart-agent": {
         deps.log(`ROLL_STEP restart-agent — ${step.agent} (--wait --force)`);
+        agentIndex += 1;
+        const isCanary = agentIndex === 1;
+        // The first agent restarted is the sanctioned canary gate
+        // (stop-on-first-mismatch). Narrate its start/pass/fail distinctly so
+        // the operator sees the canary decision, not just "agent 1/N".
+        emit(
+          isCanary
+            ? { phase: "canary-start", target, agent: step.agent, n: agentIndex, m: totalAgents }
+            : { phase: "agent-start", target, agent: step.agent, n: agentIndex, m: totalAgents },
+        );
         // `agent restart` can exit 0 while still "polling" on boot — do
         // NOT trust its status; the version assert is the real gate.
         //
@@ -439,6 +569,13 @@ export function executeRollout(
         const got = deps.probeVersion(step.agent);
         if (got === null || normalizeVersion(got) !== targetNorm) {
           deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);
+          // A failed canary is the gate that stops the whole roll; a
+          // failed non-canary is a per-agent stop. Narrate both distinctly.
+          emit(
+            isCanary
+              ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+              : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+          );
           return {
             ok: false,
             rolled,
@@ -450,6 +587,11 @@ export function executeRollout(
         }
         rolled.push(step.agent);
         deps.log(`  ✓ ${step.agent} → ${got}`);
+        emit(
+          isCanary
+            ? { phase: "canary-pass", target, agent: step.agent, n: agentIndex, m: totalAgents }
+            : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+        );
         break;
       }
       case "refresh-web": {
@@ -687,6 +829,14 @@ export function registerRolloutCommand(program: Command): void {
           return (r.stdout ?? "").trim().split("\n").pop()?.trim() ?? null;
         },
         log: (line) => process.stdout.write(line + "\n"),
+        // #2726 — emit each phase transition as a stdout sentinel line hostd
+        // parses into a durable, hash-chained audit row. Harmless on the
+        // host-shell path (no hostd tailing stdout there); load-bearing on the
+        // hostd path where it drives durable observability + the narration
+        // surface. NEVER writes the audit log directly — hostd is the sole
+        // writer, preserving the single-writer hash-chain contract.
+        emitPhase: (phase) =>
+          process.stdout.write(encodeRolloutPhaseLine(phase) + "\n"),
         persistPin: (pin) => {
           const before = readFileSync(configPath, "utf8");
           const after = setReleasePinInConfig(before, pin);
@@ -740,6 +890,14 @@ export function registerRolloutCommand(program: Command): void {
           "hostd/web refresh deferred — run host-side (`switchroom webd install` " +
             "/ `switchroom hostd install`). An agent-invoked rollout cannot " +
             "recreate its own hostd container without killing itself.",
+        );
+        // #2726 — narrate the deferral as a phase so the durable log + the
+        // narration surface show "hostd/web deferred" between the last agent
+        // and the terminal row. Only meaningful on the hostd path (the only
+        // path that defers). Emitted only when the roll got far enough to
+        // matter — i.e. it wasn't refused before executeRollout ran.
+        process.stdout.write(
+          encodeRolloutPhaseLine({ phase: "hostd-web-deferred", target }) + "\n",
         );
       }
 

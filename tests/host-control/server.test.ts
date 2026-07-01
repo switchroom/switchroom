@@ -2191,3 +2191,228 @@ describe("hostd server — rollout got-field gap fix (BONUS #2458)", () => {
     expect(terminal!.failed_agent).toBe("canary");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2726 — durable rollout observability + terminal push + narration seam.
+//
+// The rollout subprocess emits SWITCHROOM_ROLLOUT_PHASE: sentinel lines on
+// stdout; hostd (the SOLE audit writer) streams them and appends a durable,
+// hash-chained phase row per transition. get_status surfaces the live phase,
+// and a fire-and-forget relay pushes ONE ordinary operator-DM message on the
+// terminal row.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("hostd server — rollout phase observability (#2726)", () => {
+  function mkAssets(): string {
+    const assets = join(tmp, `assets-phase-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(join(assets, "profiles", "default"), { recursive: true });
+    mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+    return assets;
+  }
+
+  it("persists a durable audit row per phase, then a terminal row", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-phase-"));
+    const stub = join(execTmp, "stub.sh");
+    // Emit a realistic phase sequence, then the terminal RESULT sentinel.
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"apply","target":"v0.15.18"}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"canary-start","target":"v0.15.18","agent":"klanker","n":1,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"canary-pass","target":"v0.15.18","agent":"klanker","n":1,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"agent-start","target":"v0.15.18","agent":"bob","n":2,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"agent-done","target":"v0.15.18","agent":"bob","n":2,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker","bob"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-phase.log"),
+      applyAssetsRoot: mkAssets(),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-phase-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    const rows = readFileSync(join(tmp, "audit-phase.log"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((r) => r.request_id === "ro-phase-1");
+
+    // A durable phase row exists for each transition.
+    const phases = rows.filter((r) => r.op === "rollout" && r.result === "started" && r.phase !== undefined && r.phase !== "terminal");
+    const phaseNames = phases.map((r) => r.phase);
+    expect(phaseNames).toContain("apply");
+    expect(phaseNames).toContain("canary-start");
+    expect(phaseNames).toContain("canary-pass");
+    expect(phaseNames).toContain("agent-start");
+    expect(phaseNames).toContain("agent-done");
+
+    // Phase rows carry pin + n/m + agent per the observability contract.
+    const canaryStart = phases.find((r) => r.phase === "canary-start")!;
+    expect(canaryStart.pin).toBe("v0.15.18");
+    expect(canaryStart.n).toBe(1);
+    expect(canaryStart.m).toBe(2);
+    expect(canaryStart.agent).toBe("klanker");
+
+    // The terminal row is written AND is distinct from every phase row.
+    const terminal = rows.find((r) => r.phase === "terminal");
+    expect(terminal).toBeDefined();
+    expect(terminal!.result).toBe("completed");
+    // No phase row used the literal "terminal" — a phase can't masquerade as it.
+    expect(phaseNames).not.toContain("terminal");
+
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+
+  it("get_status surfaces the CURRENT phase while the roll is in flight", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-phase-inflight-"));
+    const stub = join(execTmp, "stub.sh");
+    // Emit an early phase, then sleep so the roll is still in flight when we poll.
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"canary-start","target":"v0.15.18","agent":"klanker","n":1,"m":3}'\n` +
+        `sleep 1\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-inflight.log"),
+      applyAssetsRoot: mkAssets(),
+      allowNonLinux: true,
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-inflight-1", args: { pin: "v0.15.18" } },
+    );
+    // Poll WHILE the stub is sleeping (phase emitted, terminal not yet).
+    await new Promise((r) => setTimeout(r, 300));
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "get_status", request_id: "poll-inflight", args: { target_request_id: "ro-inflight-1" } },
+    );
+    expect(poll.result).toBe("started");
+    expect(poll.payload).toBeDefined();
+    const payload = JSON.parse(poll.payload!) as { phase: string; n: number; m: number; agent: string; pin: string };
+    expect(payload.phase).toBe("canary-start");
+    expect(payload.n).toBe(1);
+    expect(payload.m).toBe(3);
+    expect(payload.agent).toBe("klanker");
+    expect(payload.pin).toBe("v0.15.18");
+
+    await new Promise((r) => setTimeout(r, 1200)); // let it finish
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+
+  it("fires the terminal relay push exactly once, with a rendered message", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-relay-"));
+    const stub = join(execTmp, "stub.sh");
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker","bob"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    const pushes: { requestId: string; agentName: string; text: string }[] = [];
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-relay.log"),
+      applyAssetsRoot: mkAssets(),
+      allowNonLinux: true,
+      rolloutRelay: {
+        postTerminal: (n) => pushes.push(n),
+      },
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-relay-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.requestId).toBe("ro-relay-1");
+    expect(pushes[0]!.agentName).toBe("klanker"); // routed through the caller agent
+    expect(pushes[0]!.text).toContain("✅");
+    expect(pushes[0]!.text).toContain("v0.15.18");
+
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+
+  it("a relay that throws does NOT fail the roll (fire-and-forget)", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-relay-throw-"));
+    const stub = join(execTmp, "stub.sh");
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-relay-throw.log"),
+      applyAssetsRoot: mkAssets(),
+      allowNonLinux: true,
+      rolloutRelay: {
+        postTerminal: () => {
+          throw new Error("gateway down");
+        },
+      },
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-relay-throw-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    // The roll still completed (terminal row written), despite the relay throw.
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "get_status", request_id: "poll-throw", args: { target_request_id: "ro-relay-throw-1" } },
+    );
+    expect(poll.result).toBe("completed");
+
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+});

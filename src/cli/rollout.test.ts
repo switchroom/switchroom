@@ -21,12 +21,16 @@ import {
   executeRollout,
   encodeRolloutResultLine,
   parseRolloutResultLine,
+  encodeRolloutPhaseLine,
+  parseRolloutPhaseLine,
   shouldRefuseDowngrade,
   shouldRefuseStaleCli,
   resolveRollbackTarget,
   PREFLIGHT_STALE_CLI_STEP,
   ROLLOUT_RESULT_SENTINEL,
+  ROLLOUT_PHASE_SENTINEL,
   type RolloutDeps,
+  type RolloutPhase,
   type RolloutResult,
   type RolloutStep,
 } from "./rollout.js";
@@ -105,10 +109,17 @@ describe("formatRolloutPlan", () => {
 function harness(opts: {
   versions: Record<string, string | null>;
   runStatus?: (args: string[]) => number;
-}): { deps: RolloutDeps; runs: string[][]; logs: string[]; persisted: string[] } {
+}): {
+  deps: RolloutDeps;
+  runs: string[][];
+  logs: string[];
+  persisted: string[];
+  phases: RolloutPhase[];
+} {
   const runs: string[][] = [];
   const logs: string[] = [];
   const persisted: string[] = [];
+  const phases: RolloutPhase[] = [];
   const deps: RolloutDeps = {
     run: (args) => {
       runs.push(args);
@@ -116,9 +127,10 @@ function harness(opts: {
     },
     probeVersion: (agent) => opts.versions[agent] ?? null,
     log: (line) => logs.push(line),
+    emitPhase: (p) => phases.push(p),
     persistPin: (pin) => persisted.push(pin),
   };
-  return { deps, runs, logs, persisted };
+  return { deps, runs, logs, persisted, phases };
 }
 
 describe("executeRollout", () => {
@@ -609,5 +621,146 @@ describe("resolveRollbackTarget (#2492)", () => {
     const logPath = join(tmp, "audit.log");
     writeFileSync(logPath, "");
     expect(resolveRollbackTarget(logPath)).toBeNull();
+  });
+});
+
+// ── #2726 — per-phase emission + phase sentinel (durable observability) ──────
+
+describe("rollout phase sentinel", () => {
+  it("PHASE and RESULT sentinels are lexically disjoint (neither prefixes the other)", () => {
+    // The terminal parser keys on `startsWith(ROLLOUT_RESULT_SENTINEL)`; the
+    // phase parser keys on `startsWith(ROLLOUT_PHASE_SENTINEL)`. If either were
+    // a prefix of the other, a line could cross-match. Assert disjointness.
+    expect(ROLLOUT_PHASE_SENTINEL.startsWith(ROLLOUT_RESULT_SENTINEL)).toBe(false);
+    expect(ROLLOUT_RESULT_SENTINEL.startsWith(ROLLOUT_PHASE_SENTINEL)).toBe(false);
+  });
+
+  it("a phase line does NOT parse as the terminal RESULT sentinel", () => {
+    const phaseLine = encodeRolloutPhaseLine({ phase: "apply", target: "v1.2.3" });
+    // The terminal parser must return null for a phase line — a phase row can
+    // never be mistaken for the terminal sentinel.
+    expect(parseRolloutResultLine(phaseLine)).toBeNull();
+  });
+
+  it("the terminal RESULT line does NOT parse as a phase sentinel", () => {
+    const resultLine = encodeRolloutResultLine({
+      ok: true,
+      rolled: ["clerk"],
+      warnings: [],
+    });
+    expect(parseRolloutPhaseLine(resultLine)).toBeNull();
+  });
+
+  it("round-trips a phase with agent/n/m", () => {
+    const phase: RolloutPhase = {
+      phase: "agent-start",
+      target: "v1.2.3",
+      agent: "clerk",
+      n: 3,
+      m: 8,
+    };
+    const parsed = parseRolloutPhaseLine(encodeRolloutPhaseLine(phase));
+    expect(parsed).toEqual(phase);
+  });
+
+  it("rejects malformed JSON and unknown phase names", () => {
+    expect(parseRolloutPhaseLine(ROLLOUT_PHASE_SENTINEL + "{not json")).toBeNull();
+    expect(
+      parseRolloutPhaseLine(ROLLOUT_PHASE_SENTINEL + JSON.stringify({ phase: "bogus", target: "v1" })),
+    ).toBeNull();
+    // Missing target.
+    expect(
+      parseRolloutPhaseLine(ROLLOUT_PHASE_SENTINEL + JSON.stringify({ phase: "apply" })),
+    ).toBeNull();
+    // A plain (non-sentinel) line is not a phase.
+    expect(parseRolloutPhaseLine("just a log line")).toBeNull();
+  });
+
+  it("tolerates surrounding whitespace on the line", () => {
+    const line = "  " + encodeRolloutPhaseLine({ phase: "persist-pin", target: "v9.9.9" }) + "  ";
+    expect(parseRolloutPhaseLine(line)?.phase).toBe("persist-pin");
+  });
+});
+
+describe("executeRollout — phase emission", () => {
+  const TARGET = "v0.15.18";
+
+  it("emits apply → canary-start/pass → agent-start/done with n/m", () => {
+    const steps = planRollout(["test-harness", "clerk", "marko"]);
+    const { deps, phases } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18", marko: "0.15.18" },
+    });
+    executeRollout(steps, TARGET, deps);
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("apply");
+    // test-harness is the canary (first restart) → canary-start/canary-pass.
+    expect(names).toContain("canary-start");
+    expect(names).toContain("canary-pass");
+    // clerk + marko → agent-start/agent-done.
+    expect(names).toContain("agent-start");
+    expect(names).toContain("agent-done");
+    // Canary is n=1; total m = 3.
+    const canaryStart = phases.find((p) => p.phase === "canary-start");
+    expect(canaryStart).toMatchObject({ agent: "test-harness", n: 1, m: 3, target: TARGET });
+    // A later agent carries its 1-based position.
+    const lastDone = phases.filter((p) => p.phase === "agent-done").at(-1);
+    expect(lastDone).toMatchObject({ agent: "marko", n: 3, m: 3 });
+  });
+
+  it("emits canary-fail (not agent-done) when the canary mismatches and STOPS", () => {
+    const steps = planRollout(["test-harness", "clerk"]);
+    const { deps, phases } = harness({
+      // Canary comes back on the WRONG version → stop.
+      versions: { "test-harness": "0.15.17", clerk: "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("canary-start");
+    expect(names).toContain("canary-fail");
+    expect(names).not.toContain("canary-pass");
+    // Never reached clerk.
+    expect(names).not.toContain("agent-start");
+  });
+
+  it("emits agent-done (per-agent stop) when a NON-canary agent mismatches", () => {
+    const steps = planRollout(["test-harness", "clerk"]);
+    const { deps, phases } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.17" }, // clerk bad
+    });
+    const r = executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    const names = phases.map((p) => p.phase);
+    expect(names).toContain("canary-pass"); // canary was fine
+    // clerk failed → agent-done (its start + the fail-shaped done), never canary-*.
+    const clerkDone = phases.filter((p) => p.phase === "agent-done" && p.agent === "clerk");
+    expect(clerkDone.length).toBe(1);
+  });
+
+  it("emits a persist-pin phase on the hostd path", () => {
+    const steps = planRollout(["test-harness", "clerk"], {
+      hostdContext: true,
+      pinToPersist: TARGET,
+    });
+    const { deps, phases } = harness({
+      versions: { "test-harness": "0.15.18", clerk: "0.15.18" },
+    });
+    executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(phases.map((p) => p.phase)).toContain("persist-pin");
+  });
+
+  it("does not throw when emitPhase is omitted (older callers)", () => {
+    const steps = planRollout(["clerk"]);
+    const runs: string[][] = [];
+    const deps: RolloutDeps = {
+      run: (a) => {
+        runs.push(a);
+        return { status: 0 };
+      },
+      probeVersion: () => "0.15.18",
+      log: () => {},
+      // no emitPhase
+    };
+    expect(() => executeRollout(steps, TARGET, deps)).not.toThrow();
   });
 });

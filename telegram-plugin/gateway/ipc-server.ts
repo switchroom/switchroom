@@ -15,6 +15,8 @@ import type {
   RequestConfigFinalizeMessage,
   RequestDriveApprovalMessage,
   RequestMs365ApprovalMessage,
+  RolloutStatusPostMessage,
+  RolloutStatusEditMessage,
   ScheduleRestartMessage,
   SessionEventForward,
   ToolCallMessage,
@@ -113,6 +115,25 @@ export interface IpcServerOptions {
     client: IpcClient,
     msg: RequestConfigFinalizeMessage,
   ) => Promise<void>;
+  /**
+   * #2726 Part 1 — hostd asks the gateway to POST one ordinary operator-DM
+   * message narrating a rollout's terminal outcome (Part 1) or its first phase
+   * (Part 2). Handler posts to the agent's own operator chat and — for Part 2 —
+   * replies with a `rollout_status_posted` event carrying the message_id.
+   * Optional: gateways without the hostd integration ignore it.
+   */
+  onRolloutStatusPost?: (
+    client: IpcClient,
+    msg: RolloutStatusPostMessage,
+  ) => Promise<void>;
+  /**
+   * #2726 Part 2 — hostd asks the gateway to EDIT a previously-posted rollout
+   * status message as later phases arrive. Best-effort, no reply. Optional.
+   */
+  onRolloutStatusEdit?: (
+    client: IpcClient,
+    msg: RolloutStatusEditMessage,
+  ) => void;
   log?: (msg: string) => void;
   /**
    * How long (in ms) to wait without a heartbeat before force-closing the
@@ -381,6 +402,33 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
           || (m.ttlMs as number) < 0)) return false;
       return true;
     }
+    case "rollout_status_post": {
+      // #2726 Part 1 — hostd-initiated terminal ping / status post. Wire shape
+      // only; the gateway handler fences the chat to the agent's own operator.
+      if (typeof m.requestId !== "string"
+        || (m.requestId as string).length === 0
+        || (m.requestId as string).length > 64) return false;
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.text !== "string"
+        || (m.text as string).length === 0
+        || (m.text as string).length > RICH_MESSAGE_MAX_CHARS) return false;
+      return true;
+    }
+    case "rollout_status_edit": {
+      // #2726 Part 2 — hostd-initiated status-message edit.
+      if (typeof m.requestId !== "string"
+        || (m.requestId as string).length === 0
+        || (m.requestId as string).length > 64) return false;
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.messageId !== "number"
+        || !Number.isInteger(m.messageId as number)) return false;
+      if (typeof m.text !== "string"
+        || (m.text as string).length === 0
+        || (m.text as string).length > RICH_MESSAGE_MAX_CHARS) return false;
+      return true;
+    }
     default:
       return false;
   }
@@ -406,6 +454,8 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onRequestMs365Approval,
     onRequestConfigApproval,
     onRequestConfigFinalize,
+    onRolloutStatusPost,
+    onRolloutStatusEdit,
     log = () => {},
     heartbeatTimeoutMs = 30_000,
   } = options;
@@ -636,6 +686,42 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
           });
         }
         // No reply expected.
+        break;
+      case "rollout_status_post":
+        if (onRolloutStatusPost) {
+          onRolloutStatusPost(client, msg as RolloutStatusPostMessage).catch(
+            (err) => {
+              log(
+                `rollout_status_post handler threw (client=${client.id}): ${(err as Error).message}`,
+              );
+              // Best-effort failure reply so hostd's Part 2 renderer knows the
+              // post failed (it just won't edit). Part 1 ignores the reply.
+              try {
+                client.send({
+                  type: "rollout_status_posted",
+                  requestId: (msg as RolloutStatusPostMessage).requestId,
+                  ok: false,
+                  reason: `gateway handler error: ${(err as Error).message}`,
+                });
+              } catch {
+                /* best effort */
+              }
+            },
+          );
+        }
+        // No reply required when unwired — hostd falls back to the durable log.
+        break;
+      case "rollout_status_edit":
+        if (onRolloutStatusEdit) {
+          try {
+            onRolloutStatusEdit(client, msg as RolloutStatusEditMessage);
+          } catch (err) {
+            log(
+              `rollout_status_edit handler threw (client=${client.id}): ${(err as Error).message}`,
+            );
+          }
+        }
+        // Fire-and-forget; no reply.
         break;
       case "update_placeholder":
         // Legacy recall.py IPC — placeholder UX was removed in #553 PR 5.

@@ -458,6 +458,8 @@ import type {
   QuotaWallDetectedMessage,
   PostSkillProposalMessage,
   PermissionEvent,
+  RolloutStatusPostMessage,
+  RolloutStatusEditMessage,
 } from './ipc-protocol.js'
 import { DebounceBuffer, HourCap, buildReactionInboundMeta, buildReactionInboundText, evaluateTriggerCandidate, isGroupChat, resolveReactionsConfig, truncatePreview, type PendingReaction, type ReactionBatch, type ReactionsResolvedConfig } from './reaction-trigger.js'
 import { buildReactionDispatchInbound, evaluateReactionDispatch, resolveReactionDispatchConfig, type ReactionDispatchResolvedConfig } from './reaction-dispatch.js'
@@ -7773,6 +7775,81 @@ const ipcServer: IpcServer = createIpcServer({
       log: (m) =>
         process.stderr.write(`telegram gateway: config-finalize — ${m}\n`),
     })
+  },
+
+  // #2726 — hostd-initiated rollout status message. Part 1 uses this only for
+  // the terminal ping; Part 2 uses the same post as the FIRST narration
+  // message, then EDITs it (onRolloutStatusEdit) as later phases arrive. This
+  // is an ORDINARY operator-DM message, NOT a pinned card — the framework
+  // speaking a plain progress line in the chat. We reply with the message_id so
+  // hostd can edit it later; a post failure replies ok:false (hostd then just
+  // won't edit — the durable audit log remains the record).
+  async onRolloutStatusPost(client: IpcClient, msg: RolloutStatusPostMessage) {
+    const self = process.env.SWITCHROOM_AGENT_NAME
+    if (self && msg.agentName !== self) {
+      process.stderr.write(
+        `telegram gateway: rollout_status_post rejected — agent mismatch (${msg.agentName} != ${self})\n`,
+      )
+      try {
+        client.send({ type: 'rollout_status_posted', requestId: msg.requestId, ok: false, reason: 'agent mismatch' })
+      } catch { /* best effort */ }
+      return
+    }
+    const operator = loadAccess().allowFrom[0]
+    if (operator === undefined) {
+      process.stderr.write(`telegram gateway: rollout_status_post — no operator chat (allowFrom empty)\n`)
+      try {
+        client.send({ type: 'rollout_status_posted', requestId: msg.requestId, ok: false, reason: 'no operator chat' })
+      } catch { /* best effort */ }
+      return
+    }
+    try {
+      const sent = await robustApiCall(
+        () =>
+          // allow-raw-bot-api: rich progress line, routed through robustApiCall.
+          bot.api.sendRichMessage(operator, richMessage(msg.text), {}),
+        { chat_id: String(operator), verb: 'rollout-status-post' },
+      )
+      const messageId = (sent as { message_id: number }).message_id
+      process.stderr.write(
+        `telegram gateway: rollout_status_post agent=${msg.agentName} request=${msg.requestId} message_id=${messageId}\n`,
+      )
+      try {
+        client.send({ type: 'rollout_status_posted', requestId: msg.requestId, ok: true, messageId })
+      } catch { /* best effort */ }
+    } catch (err) {
+      process.stderr.write(
+        `telegram gateway: rollout_status_post send failed: ${(err as Error).message}\n`,
+      )
+      try {
+        client.send({ type: 'rollout_status_posted', requestId: msg.requestId, ok: false, reason: (err as Error).message })
+      } catch { /* best effort */ }
+    }
+  },
+
+  // #2726 Part 2 — edit the previously-posted rollout status message in place as
+  // later phases arrive. Fire-and-forget: an edit failure (incl. Telegram 429)
+  // is swallowed here and NEVER surfaced back toward the roll. hostd owns the
+  // debounce + 429 retry cadence; this handler is a thin edit relay.
+  onRolloutStatusEdit(_client: IpcClient, msg: RolloutStatusEditMessage) {
+    const self = process.env.SWITCHROOM_AGENT_NAME
+    if (self && msg.agentName !== self) {
+      process.stderr.write(
+        `telegram gateway: rollout_status_edit rejected — agent mismatch (${msg.agentName} != ${self})\n`,
+      )
+      return
+    }
+    const operator = loadAccess().allowFrom[0]
+    if (operator === undefined) {
+      process.stderr.write(`telegram gateway: rollout_status_edit — no operator chat (allowFrom empty)\n`)
+      return
+    }
+    void swallowingApiCall(
+      () =>
+        // allow-raw-bot-api: in-place edit of the ordinary status message.
+        bot.api.editMessageText(operator, msg.messageId, richMessage(msg.text), {}),
+      { chat_id: String(operator), verb: 'rollout-status-edit' },
+    )
   },
 
   onInjectInbound(_client: IpcClient, msg: InjectInboundMessage) {
