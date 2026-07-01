@@ -228,8 +228,9 @@ Before you open a PR, ask:
    cascade, the same conversational rhythm, the same vault reference
    syntax? Does it respect the "chat IS the artifact" sub-principle?
 
-If you can't answer **yes** to all three, you're not done. Redesign,
-don't ship and patch later.
+> [!IMPORTANT]
+> If you can't answer **yes** to all three, you're not done. Redesign,
+> don't ship and patch later.
 
 And the three principle checks aren't the whole gate. The
 non-functional trust bar (security, the on-leash stakes, the

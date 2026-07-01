@@ -42,6 +42,11 @@ tree" incident, because the product doesn't allow it.
 - Prompts and skills refer to a repo by name, never a hardcoded path, so an
   agent works the same on any host.
 
+> [!CAUTION]
+> Switchroom never resets a dirty tree on the agent's behalf. An agent's
+> uncommitted work is left alone and surfaced, never silently discarded or
+> stashed-and-lost.
+
 **Bad looks like: never ship this**
 
 - A shared canonical checkout with locks or branch-naming conventions; two
@@ -100,3 +105,8 @@ depth; isolation, stability, and the never-reset-dirty rule hold across all.
   not used.
 - *Durability:* a reboot or kill mid-work leaves each agent's tree intact on
   its branch; dirty trees are never reset.
+
+## Related
+
+- [extend the product without forking it](extend-without-forking.md) — declaring a repo in an agent's manifest is what provisions its tree.
+- [update once and trust the whole stack](idempotent-update-and-restart.md) — how a restart returns the agent to the tree it left, with work intact.

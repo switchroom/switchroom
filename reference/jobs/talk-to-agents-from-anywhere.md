@@ -16,9 +16,13 @@ about it on the train, hand off to the agent, and get a result while
 they're making dinner. The job is to make that loop feel native on a phone,
 with one hand. The chat surface is first-class, not a bolted-on
 notification channel. Everything the user needs to steer, inspect, correct,
-or pause their agents must be reachable from where they already are. If a
-capability only exists on the desktop, the user is tethered and the product
-stops being theirs. This is not porting a CLI to mobile. It's accepting
+or pause their agents must be reachable from where they already are.
+
+> [!IMPORTANT]
+> If a capability only exists on the desktop, the user is tethered and the
+> product stops being theirs.
+
+This is not porting a CLI to mobile. It's accepting
 the phone as the primary surface and designing back from there. The desktop
 benefits from that discipline rather than being diminished by it.
 
@@ -128,3 +132,12 @@ walk-away, one channel only.
 - *Notification discipline:* alerts fire on what the user needs to know and
   stay quiet on intermediate steps, so the channel never trains the user to
   mute it and miss the one message that mattered.
+
+## Related
+
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) — the ambient
+  in-chat liveness this surface depends on.
+- [`steer-or-queue-mid-flight`](steer-or-queue-mid-flight.md) — one-handed
+  correction of a running turn.
+- [`deliver-files-i-can-open`](deliver-files-i-can-open.md) — files and
+  attachments as first-class input and output on a phone.

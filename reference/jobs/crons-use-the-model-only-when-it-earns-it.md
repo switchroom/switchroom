@@ -43,6 +43,11 @@ subscription session, never `claude -p`, never the API.
 - A removed or changed schedule stops firing promptly: no zombie fires
   burning tokens after the user edited the schedule.
 
+> [!CAUTION]
+> Reaching for `claude -p` (or the SDK / API) to make cheap fires "efficient"
+> leaves the subscription and breaks Anthropic policy. The cheap path is the
+> interactive session or no model at all — never a headless call.
+
 **Bad looks like: never ship this**
 
 - A full reasoning turn for a mechanical chore: "fetch the feed and post

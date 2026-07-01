@@ -24,6 +24,12 @@ Because every model call is the interactive `claude` session and there is no
 programmatic surface, there is exactly *one* pool to track: the interactive
 subscription window. Quota stays a single-signal problem.
 
+> [!CAUTION]
+> The ceiling is the plan the user chose, never a second meter. Recovering
+> quota by routing off the subscription (API/PAYG/credits) is never the
+> default — the one carve-out is an operator account explicitly opted into
+> overage (`allow_overage_accounts`).
+
 ## Good / bad
 
 **Good looks like**
@@ -102,3 +108,12 @@ must stay honest, on-subscription, and legible across the corpus.
   the broker authorizes spending the operator's own Anthropic overage credits
   while `overageStatus:"allowed"`. Default-off; auto-stops at `out_of_credits`;
   every unflagged account is Escape-only and unchanged.
+
+## Related
+
+- [`share-auth-across-the-fleet`](share-auth-across-the-fleet.md) — quota and
+  failover living at the account level, not per-agent.
+- [`keep-my-subscription-honest`](keep-my-subscription-honest.md) — the
+  `claude-native` posture behind the on-subscription ceiling.
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) — the other
+  ambient, never-a-dashboard in-chat signal.

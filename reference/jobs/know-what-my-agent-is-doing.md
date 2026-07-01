@@ -23,6 +23,7 @@ doing something unexpected. Most agent products give them a black box:
 message in, eventually a message out, nothing in the middle. The job is to
 close that gap so the user never has to ask.
 
+> [!IMPORTANT]
 > We used to do this with a pinned, parallel progress card. We retired it
 > (#1122): a surface running beside the conversation always devolved into
 > redundant noise or a crutch for a model that wouldn't just talk. The job
@@ -140,6 +141,15 @@ visibly-progressing turn.
   fire per turn.
 - *Surface parity:* every signal is proven in both DM and forum channel.
   Channel-routing bugs hid for months while UAT was DM-only.
+
+## Related
+
+- [`steer-or-queue-mid-flight`](steer-or-queue-mid-flight.md) — acting on the
+  agent once you can see what it's doing.
+- [`track-plan-quota-live`](track-plan-quota-live.md) — the other
+  answered-in-the-chat, never-a-dashboard signal.
+- [`see-my-whole-fleet-from-one-screen`](see-my-whole-fleet-from-one-screen.md) —
+  the operator counterpart, and why it must never become this principal surface.
 
 ---
 

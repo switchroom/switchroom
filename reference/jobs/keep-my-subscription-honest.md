@@ -50,6 +50,12 @@ behaviour match.
   product adapts without the user unpicking secrets, and never bills around
   them.
 
+> [!CAUTION]
+> A headless `claude -p`, an Agent SDK call, or a raw Anthropic API call
+> anywhere in a code path is a `claude-native` violation. Both `-p` and the
+> SDK are *programmatic* usage off the subscription — route every model call
+> through the interactive session.
+
 **Bad looks like: never ship this**
 
 - Any *silent* or unintended fallback to a second billing surface when the
@@ -128,3 +134,8 @@ subscription session, and a limit is never routed around with paid credit.
   account the operator explicitly opted into overage (default-off, auto-stops
   at `out_of_credits`, on the operator's own Anthropic credits via the
   unmodified `claude` CLI).
+
+## Related
+
+- [scheduled work spends the model only when it earns it](crons-use-the-model-only-when-it-earns-it.md) — the cron side of the same subscription-honest boundary.
+- [update once and trust the whole stack](idempotent-update-and-restart.md) — why every restarted process boots on the unmodified interactive CLI.

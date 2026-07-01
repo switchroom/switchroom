@@ -16,9 +16,11 @@ not be the same agent it was five minutes ago. The job is to surface that up
 front, every time, so the user starts the next turn with a clear picture of
 what's running: which model, which tools, which skills, which memory backend,
 and whether auth is healthy. Enough to notice a change; little enough that it
-doesn't become wallpaper. The worst outcome is a silent respawn that comes
-back subtly different. The user ends up arguing with a stranger who looks
-like their agent.
+doesn't become wallpaper.
+
+> [!CAUTION]
+> The worst outcome is a silent respawn that comes back subtly different. The
+> user ends up arguing with a stranger who looks like their agent.
 
 ## Good / bad
 
@@ -89,3 +91,12 @@ config and land in the chat across the corpus, never a stale or cosmetic one.
   always answered, never stranded in a blank window.
 - *Honesty:* a broken-auth or tool-disabled state is surfaced, never masked
   by a "ready" message.
+
+## Related
+
+- [`survive-reboots-and-real-life`](survive-reboots-and-real-life.md) — coming
+  back at all; this job is about knowing what came back.
+- [`remember-across-sessions`](remember-across-sessions.md) — the memory
+  backend whose survival this summary reports.
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) — the
+  in-turn liveness signal, once you know what's running.
