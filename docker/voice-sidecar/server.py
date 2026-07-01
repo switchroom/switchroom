@@ -19,7 +19,8 @@ HTTP contract
               header:    X-Voice-Token: <shared secret>
               → 200 { ok: true,  text, language?, durationMs, audioSeconds }
               → 4xx/5xx { ok: false, reason, detail }
-  POST /tts   json: { text: str (ANY length), voice?: str, format?: "ogg" }
+  POST /tts   json: { text: str (ANY length), voice?: str, speed?: float, format?: "ogg" }
+              speed is clamped to 0.5–2.0; absent/invalid → 1.0 (today's default).
               header:    X-Voice-Token: <shared secret>
               → 200 audio/ogg  (ONE continuous OGG/Opus stream, mono — ready
                 for Telegram sendVoice, which REQUIRES OGG/Opus). Text of any
@@ -453,7 +454,25 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return [p for p in pieces if p]
 
 
-def _run_synthesis(text: str, voice: str) -> tuple[bytes, dict]:
+TTS_SPEED_MIN = 0.5
+TTS_SPEED_MAX = 2.0
+TTS_SPEED_DEFAULT = 1.0
+
+
+def _clamp_speed(value: object) -> float:
+    """Coerce an incoming speed to a float in [TTS_SPEED_MIN, TTS_SPEED_MAX].
+
+    Absent / non-numeric / NaN → TTS_SPEED_DEFAULT (1.0), i.e. today's
+    behavior. Out-of-range numbers are clamped to the nearest bound."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return TTS_SPEED_DEFAULT
+    speed = float(value)
+    if speed != speed:  # NaN
+        return TTS_SPEED_DEFAULT
+    return max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, speed))
+
+
+def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> tuple[bytes, dict]:
     """The TTS-serialized synthesis. Acquires the TTS semaphore so only
     TTS_CONCURRENCY synths run at once — a separate lane from STT.
 
@@ -478,7 +497,7 @@ def _run_synthesis(text: str, voice: str) -> tuple[bytes, dict]:
         sample_rate = TTS_SAMPLE_RATE
         for i, piece in enumerate(pieces):
             samples, sample_rate = _tts.create(  # type: ignore[union-attr]
-                piece, voice=voice, speed=1.0, lang=TTS_LANG
+                piece, voice=voice, speed=speed, lang=TTS_LANG
             )
             arr = np.asarray(samples, dtype=np.float32)
             if i > 0:
@@ -496,6 +515,7 @@ def _run_synthesis(text: str, voice: str) -> tuple[bytes, dict]:
             "audioSeconds": audio_seconds,
             "durationMs": elapsed_ms,
             "voice": voice,
+            "speed": speed,
             "pieces": len(pieces),
             "chars": len(text),
         }
@@ -695,9 +715,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         voice = (voice or TTS_VOICE).strip() or TTS_VOICE
 
+        # Optional playback speed. Clamp to [0.5, 2.0]; absent/invalid → 1.0
+        # (exactly today's behavior).
+        speed = _clamp_speed(payload.get("speed"))
+
         # Run synthesis with a hard server-side timeout so a wedged synth
         # can't pin the worker forever (its own TTS pool/lane).
-        future = _tts_pool.submit(_run_synthesis, text, voice)
+        future = _tts_pool.submit(_run_synthesis, text, voice, speed)
         try:
             ogg, meta = future.result(timeout=TTS_REQUEST_TIMEOUT_S)
         except FutureTimeout:

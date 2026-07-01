@@ -13,6 +13,7 @@ import { describe, it, expect } from 'bun:test'
 import {
   synthesizeViaSidecar,
   chunkTtsText,
+  clampTtsSpeed,
   SIDECAR_TTS_MAX_CHARS,
   DEFAULT_SIDECAR_BASE_URL,
 } from '../voice-synthesize-sidecar.js'
@@ -135,6 +136,83 @@ describe('synthesizeViaSidecar — happy path', () => {
     await synthesizeViaSidecar({ token: 't', text: 'hi', fetchImpl: fakeFetch })
     const parsed = JSON.parse(receivedBody!)
     expect('voice' in parsed).toBe(false)
+  })
+
+  it('omits the speed field when none is supplied (sidecar defaults to 1.0)', async () => {
+    let receivedBody: string | null = null
+    const fakeFetch: typeof fetch = (async (_url: string, init?: RequestInit) => {
+      receivedBody = init?.body as string
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => OGG_BYTES.buffer.slice(0),
+        text: async () => '',
+        headers: new Headers(),
+      }
+    }) as unknown as typeof fetch
+    await synthesizeViaSidecar({ token: 't', text: 'hi', fetchImpl: fakeFetch })
+    const parsed = JSON.parse(receivedBody!)
+    expect('speed' in parsed).toBe(false)
+  })
+
+  it('includes speed in the /tts body when supplied', async () => {
+    let receivedBody: string | null = null
+    const fakeFetch: typeof fetch = (async (_url: string, init?: RequestInit) => {
+      receivedBody = init?.body as string
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => OGG_BYTES.buffer.slice(0),
+        text: async () => '',
+        headers: new Headers(),
+      }
+    }) as unknown as typeof fetch
+    await synthesizeViaSidecar({ token: 't', text: 'hi', speed: 1.1, fetchImpl: fakeFetch })
+    const parsed = JSON.parse(receivedBody!)
+    expect(parsed.speed).toBe(1.1)
+  })
+
+  it('clamps an out-of-range speed before putting it on the wire', async () => {
+    const cap = async (speed: number): Promise<number> => {
+      let receivedBody: string | null = null
+      const fakeFetch: typeof fetch = (async (_url: string, init?: RequestInit) => {
+        receivedBody = init?.body as string
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => OGG_BYTES.buffer.slice(0),
+          text: async () => '',
+          headers: new Headers(),
+        }
+      }) as unknown as typeof fetch
+      await synthesizeViaSidecar({ token: 't', text: 'hi', speed, fetchImpl: fakeFetch })
+      return JSON.parse(receivedBody!).speed
+    }
+    expect(await cap(5.0)).toBe(2.0) // above max → 2.0
+    expect(await cap(0.1)).toBe(0.5) // below min → 0.5
+  })
+})
+
+describe('clampTtsSpeed', () => {
+  it('passes in-range values through', () => {
+    for (const v of [0.5, 0.75, 1.0, 1.1, 1.5, 2.0]) {
+      expect(clampTtsSpeed(v)).toBe(v)
+    }
+  })
+
+  it('clamps out-of-range numbers to the nearest bound', () => {
+    expect(clampTtsSpeed(0.1)).toBe(0.5)
+    expect(clampTtsSpeed(-3)).toBe(0.5)
+    expect(clampTtsSpeed(2.5)).toBe(2.0)
+    expect(clampTtsSpeed(100)).toBe(2.0)
+  })
+
+  it('falls back to the default for non-finite / non-numeric input', () => {
+    expect(clampTtsSpeed(undefined)).toBe(1.0)
+    expect(clampTtsSpeed(null)).toBe(1.0)
+    expect(clampTtsSpeed(NaN)).toBe(1.0)
+    expect(clampTtsSpeed('fast')).toBe(1.0)
+    expect(clampTtsSpeed(undefined, 1.1)).toBe(1.1) // custom fallback
   })
 
   it('falls back to wall-clock durationMs when headers are absent', async () => {

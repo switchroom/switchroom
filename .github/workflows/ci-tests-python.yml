@@ -42,6 +42,7 @@ jobs:
           filters: |
             relevant:
               - 'vendor/hindsight-memory/scripts/**'
+              - 'docker/voice-sidecar/**'
               - '.github/workflows/ci-tests-python.yml'
 
   unittest:
@@ -56,3 +57,9 @@ jobs:
       - name: Run unittest discover
         working-directory: vendor/hindsight-memory/scripts
         run: python3 -m unittest discover tests/
+
+      # Voice sidecar's stdlib-only tests (TTS speed clamp). server.py imports
+      # kokoro lazily, so no ONNX runtime / model is needed here.
+      - name: Run voice-sidecar unittests
+        working-directory: docker/voice-sidecar
+        run: python3 -m unittest discover -s . -p 'test_*.py'

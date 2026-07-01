@@ -49,7 +49,15 @@ import {
 } from '../sticker-aliases.js'
 import { transcribeViaWhisper } from '../voice-transcribe.js'
 import { transcribeViaSidecar } from '../voice-transcribe-sidecar.js'
-import { synthesizeViaSidecar, chunkTtsText } from '../voice-synthesize-sidecar.js'
+import {
+  synthesizeViaSidecar,
+  chunkTtsText,
+  clampTtsSpeed,
+} from '../voice-synthesize-sidecar.js'
+
+/** Fleet default TTS speed when voice_out is enabled but speed is unset —
+ *  slightly brisker than neutral (Ken's chosen default). */
+const VOICE_OUT_DEFAULT_SPEED = 1.1
 import { normalizeForSpeech } from '../voice-normalize-text.js'
 import { synthesizeViaOpenAi } from '../voice-synthesize.js'
 import {
@@ -986,6 +994,10 @@ type Access = {
     engine?: 'kokoro' | 'openai'
     voice?: string
     reply_mode?: 'voice+text' | 'voice-only'
+    /** Kokoro-engine playback speed. Clamped to 0.5–2.0; defaults to 1.1
+     *  when voice_out is enabled but speed is unset (the fleet default —
+     *  slightly brisker than neutral). Ignored by the OpenAI path. */
+    speed?: number
     /** OpenAI-engine only: per-voice-note chunk size (default 600) used to
      *  split a long reply across sequential notes, since OpenAI's TTS input
      *  has a hard cap. Ignored by the kokoro path, which sends the whole
@@ -8217,6 +8229,7 @@ function resolveVoiceOutPlan(
 ): {
   engine: 'kokoro' | 'openai'
   voice?: string
+  speed: number
   apiKeyRef?: string
   replyMode: 'voice+text' | 'voice-only'
   ttsChunks: string[]
@@ -8267,9 +8280,15 @@ function resolveVoiceOutPlan(
   }
   if (ttsChunks.length === 0) return null
 
+  // Kokoro playback speed: default 1.1 (fleet default) when unset, clamped to
+  // 0.5–2.0. Threaded into the /tts body by synthesizeVoiceOut. The OpenAI
+  // path ignores it.
+  const speed = clampTtsSpeed(voiceOut.speed, VOICE_OUT_DEFAULT_SPEED)
+
   return {
     engine,
     voice: voiceOut.voice,
+    speed,
     apiKeyRef: voiceOut.api_key,
     replyMode: voiceOut.reply_mode ?? 'voice+text',
     ttsChunks,
@@ -8285,6 +8304,7 @@ function resolveVoiceOutPlan(
 async function synthesizeVoiceOut(plan: {
   engine: 'kokoro' | 'openai'
   voice?: string
+  speed?: number
   apiKeyRef?: string
   ttsText: string
 }): Promise<Uint8Array | null> {
@@ -8296,6 +8316,7 @@ async function synthesizeVoiceOut(plan: {
         token,
         text: plan.ttsText,
         voice: plan.voice,
+        speed: plan.speed,
       })
       if (!result.ok) {
         process.stderr.write(
@@ -8708,6 +8729,7 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
       const ogg = await synthesizeVoiceOut({
         engine: voiceOutPlan.engine,
         voice: voiceOutPlan.voice,
+        speed: voiceOutPlan.speed,
         apiKeyRef: voiceOutPlan.apiKeyRef,
         ttsText: chunkText,
       })

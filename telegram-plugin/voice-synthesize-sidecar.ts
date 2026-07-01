@@ -40,6 +40,25 @@ export const DEFAULT_SIDECAR_BASE_URL = 'http://127.0.0.1:18900'
  *  X-Voice-Token header, and {text, voice?, format?} JSON shape UNCHANGED.) */
 export const SIDECAR_TTS_MAX_CHARS = 100_000
 
+/** TTS playback-speed bounds (mirrors the sidecar clamp in server.py). */
+export const SIDECAR_TTS_SPEED_MIN = 0.5
+export const SIDECAR_TTS_SPEED_MAX = 2.0
+
+/**
+ * Coerce an incoming speed to a float in [SIDECAR_TTS_SPEED_MIN,
+ * SIDECAR_TTS_SPEED_MAX]. Non-finite / non-numeric input falls back to
+ * `fallback` (default 1.0). Out-of-range numbers are clamped to the nearest
+ * bound. Mirrors the sidecar's `_clamp_speed` so the wire value is already
+ * valid before it leaves the gateway.
+ */
+export function clampTtsSpeed(value: unknown, fallback = 1.0): number {
+  // Only a real, finite number is a speed. null/undefined/boolean/string all
+  // fall back (Number(null) is 0 and Number('') is 0 — both would otherwise
+  // masquerade as a valid slow speed).
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.max(SIDECAR_TTS_SPEED_MIN, Math.min(SIDECAR_TTS_SPEED_MAX, value))
+}
+
 /**
  * Split already-stripped plain text into sequential TTS chunks, each ≤
  * `chunkChars`, preferring sentence then word boundaries so a voice note
@@ -121,6 +140,9 @@ export interface SidecarSynthesizeArgs {
   text: string
   /** Optional engine-specific voice id; the sidecar has its own default. */
   voice?: string
+  /** Optional playback speed. Clamped to [0.5, 2.0] before send; when unset
+   *  the sidecar applies its own 1.0 default. */
+  speed?: number
   /** Base URL for the sidecar. Defaults to DEFAULT_SIDECAR_BASE_URL. */
   baseUrl?: string
   /** Per-call timeout in ms. Default 60s — Kokoro on CPU can run a few
@@ -167,12 +189,14 @@ export async function synthesizeViaSidecar(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
 
-  // JSON body: server.py reads `text` (str) + optional `voice` + `format`.
-  const body: { text: string; voice?: string; format: 'ogg' } = {
+  // JSON body: server.py reads `text` (str) + optional `voice` + `speed` +
+  // `format`.
+  const body: { text: string; voice?: string; speed?: number; format: 'ogg' } = {
     text,
     format: 'ogg',
   }
   if (args.voice) body.voice = args.voice
+  if (args.speed !== undefined) body.speed = clampTtsSpeed(args.speed)
 
   const startedAt = Date.now()
   let res: Response
