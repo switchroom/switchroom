@@ -13,7 +13,7 @@
  * add on top of the same client. Tracked in the migration TODO inline.
  */
 
-import { escapeMarkdown } from '../format.js';
+import { escapeMarkdown, codeSpanSafe } from '../format.js';
 import type { Bot, Context } from "grammy";
 import { richMessage } from "../rich-send.js";
 import {
@@ -78,7 +78,7 @@ export function registerApprovalsCommands(
           return (
             `\`${d.id.slice(0, 8)}\` ` +
             `${escapeMarkdown(d.agent_unit)} → ` +
-            `\`${d.scope}\` ` +
+            `\`${codeSpanSafe(d.scope)}\` ` +
             `(${escapeMarkdown(d.action)}, ${ttl}) ` +
             `· /approvals revoke ${escapeMarkdown(d.id)}`
           );

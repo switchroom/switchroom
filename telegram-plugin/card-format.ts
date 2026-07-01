@@ -27,13 +27,15 @@
  * which is itself state-free.
  */
 
-import { escapeMarkdown } from './format.js'
+import { escapeMarkdown, codeSpanSafe } from './format.js'
 
 /**
  * Re-export so card surfaces have one import for the markdown escaper they
  * use when interpolating dynamic values into a hand-built markdown card.
+ * `codeSpanSafe` is the code-span (backtick) counterpart: use it for values
+ * interpolated INSIDE `` `…` `` (where backslash escaping is wrong).
  */
-export { escapeMarkdown }
+export { escapeMarkdown, codeSpanSafe }
 
 /**
  * Join a card's pre-rendered, single-line entries so they STACK in the

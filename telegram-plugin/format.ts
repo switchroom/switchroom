@@ -54,6 +54,24 @@ export function escapeMarkdown(text: string): string {
 }
 
 /**
+ * Make a string safe to interpolate INSIDE a `code span`.
+ *
+ * Inside a GFM code span the content is LITERAL — backslash escaping does
+ * NOT apply, so `escapeMarkdown` is exactly wrong there: it emits visible
+ * backslashes (e.g. `openai\_key` for an identifier containing `_`). The
+ * only character that can prematurely CLOSE the span is a backtick, so the
+ * sole transform needed is to defuse embedded backticks. We insert a
+ * zero-width space after each backtick so the raw ``` ` ``` can no longer
+ * terminate the surrounding span while remaining visually identical.
+ *
+ * This is the canonical home for the helper (#2695 regression fix); other
+ * modules re-export from here so there's one implementation.
+ */
+export function codeSpanSafe(s: string): string {
+  return s.replace(/`/g, '`​')
+}
+
+/**
  * Repair LLM-side JSON escape bungles.
  *
  * Some MCP clients (and some LLM tool-call generators) occasionally emit a

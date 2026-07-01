@@ -14,8 +14,12 @@
  *     param  = (for ttl) 1h | 24h | 7d
  */
 
-import { escapeMarkdown } from '../format.js';
+import { escapeMarkdown, codeSpanSafe } from '../format.js';
 import { InlineKeyboard } from "grammy";
+
+// Re-export so existing importers (e.g. vault-request-access-card.ts) keep
+// resolving `codeSpanSafe` from here; the canonical impl lives in format.ts.
+export { codeSpanSafe };
 
 export interface ApprovalCardOptions {
   request_id: string;       // 8-hex from kernel.requestApproval
@@ -124,11 +128,3 @@ export function ttlMsFromToken(token: string): number | null {
   return null;
 }
 
-/**
- * Make a string safe to interpolate INSIDE a `code span` without escaping
- * (content there is literal). The only character that can prematurely close
- * the span is a backtick, so split it with a zero-width space.
- */
-export function codeSpanSafe(s: string): string {
-  return s.replace(/`/g, "`​");
-}
