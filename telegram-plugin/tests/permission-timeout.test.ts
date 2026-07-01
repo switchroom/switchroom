@@ -13,7 +13,9 @@ import {
   timeoutDenyMessage,
   duplicateDenyMessage,
   isRecentTimeoutDuplicate,
+  approvalTtlMs,
   PERMISSION_TTL_MS,
+  PERMISSION_TTL_DEFAULT_MS,
   HOSTD_PERMISSION_TTL_MS,
   ttlForTool,
   buildTimedOutCardEdits,
@@ -21,6 +23,35 @@ import {
   STALE_TAP_NOTICE,
   TIMED_OUT_FOOTER,
 } from '../gateway/permission-timeout.js'
+
+describe('approvalTtlMs (config-driven approval-card lifetime)', () => {
+  it('defaults to 60 minutes when unset', () => {
+    expect(approvalTtlMs({})).toBe(60 * 60_000)
+    expect(PERMISSION_TTL_DEFAULT_MS).toBe(60 * 60_000)
+  })
+
+  it('honours a configured value (threaded as SWITCHROOM_TG_APPROVAL_TIMEOUT_MS ms)', () => {
+    expect(approvalTtlMs({ SWITCHROOM_TG_APPROVAL_TIMEOUT_MS: '1800000' })).toBe(1_800_000)
+  })
+
+  it('falls back to the 60-min default on blank / garbage / non-positive', () => {
+    const d = 60 * 60_000
+    expect(approvalTtlMs({ SWITCHROOM_TG_APPROVAL_TIMEOUT_MS: '' })).toBe(d)
+    expect(approvalTtlMs({ SWITCHROOM_TG_APPROVAL_TIMEOUT_MS: 'abc' })).toBe(d)
+    expect(approvalTtlMs({ SWITCHROOM_TG_APPROVAL_TIMEOUT_MS: '0' })).toBe(d)
+    expect(approvalTtlMs({ SWITCHROOM_TG_APPROVAL_TIMEOUT_MS: '-5' })).toBe(d)
+  })
+
+  it('the default permission-card lifetime is at least 60 min', () => {
+    // With no env override at module load, PERMISSION_TTL_MS is the default.
+    expect(PERMISSION_TTL_MS).toBeGreaterThanOrEqual(60 * 60_000)
+  })
+
+  it('hostd verbs never get a shorter window than the default card', () => {
+    expect(HOSTD_PERMISSION_TTL_MS).toBeGreaterThanOrEqual(PERMISSION_TTL_MS)
+    expect(HOSTD_PERMISSION_TTL_MS).toBeGreaterThanOrEqual(30 * 60_000)
+  })
+})
 
 describe('permissionSignature', () => {
   it('is stable for the same tool + input', () => {
@@ -96,7 +127,7 @@ describe('isRecentTimeoutDuplicate', () => {
 // ─── Bug 2 — per-tool TTL, timed-out card hygiene, stale-tap honesty ────────
 
 describe('ttlForTool (Bug 2 fix #2)', () => {
-  it('gives hostd gated verbs a 30-min window', () => {
+  it('gives hostd gated verbs at least a 30-min window (>= the default card)', () => {
     for (const tool of [
       'mcp__hostd__rollout',
       'mcp__hostd__update_apply',
@@ -105,20 +136,20 @@ describe('ttlForTool (Bug 2 fix #2)', () => {
       'mcp__hostd__config_propose_edit',
     ]) {
       expect(ttlForTool(tool)).toBe(HOSTD_PERMISSION_TTL_MS)
-      expect(ttlForTool(tool)).toBe(30 * 60_000)
+      expect(ttlForTool(tool)).toBeGreaterThanOrEqual(30 * 60_000)
     }
   })
 
-  it('keeps the 10-min default for non-hostd tools', () => {
+  it('applies the config-driven default (60 min) to non-hostd tools', () => {
     expect(ttlForTool('Bash')).toBe(PERMISSION_TTL_MS)
-    expect(ttlForTool('Bash')).toBe(10 * 60_000)
+    expect(ttlForTool('Bash')).toBe(60 * 60_000)
     expect(ttlForTool('mcp__perplexity__search')).toBe(PERMISSION_TTL_MS)
     expect(ttlForTool('mcp__agent-config__schedule_add')).toBe(PERMISSION_TTL_MS)
     expect(ttlForTool(undefined)).toBe(PERMISSION_TTL_MS)
   })
 
-  it('hostd TTL is strictly longer than the default', () => {
-    expect(HOSTD_PERMISSION_TTL_MS).toBeGreaterThan(PERMISSION_TTL_MS)
+  it('hostd TTL is never shorter than the default (the 60-min raise subsumes the old 30-min floor)', () => {
+    expect(HOSTD_PERMISSION_TTL_MS).toBeGreaterThanOrEqual(PERMISSION_TTL_MS)
   })
 })
 

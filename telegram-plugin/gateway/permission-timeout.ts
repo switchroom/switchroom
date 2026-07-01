@@ -71,17 +71,36 @@ export function isRecentTimeoutDuplicate(
 
 // ─── Bug 2 — per-tool TTL + timed-out card hygiene + stale-tap honesty ──────
 
-/** Default operator approval-card lifetime. */
-export const PERMISSION_TTL_MS = 10 * 60_000
+/** Fallback operator approval-card lifetime when nothing is configured. */
+export const PERMISSION_TTL_DEFAULT_MS = 60 * 60_000
+
+/**
+ * Resolve the operator approval-card lifetime (ms) from the environment.
+ * Threaded from config as `channels.telegram.approval_timeout_minutes` →
+ * `SWITCHROOM_TG_APPROVAL_TIMEOUT_MS` (see scaffold.ts `channelsToEnv`). A
+ * blank/garbage value falls back to the 60-min default; `0` (or negative) is
+ * clamped to the default so a card can never be born already-expired.
+ */
+export function approvalTtlMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.SWITCHROOM_TG_APPROVAL_TIMEOUT_MS
+  if (raw === undefined || raw.trim() === '') return PERMISSION_TTL_DEFAULT_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return PERMISSION_TTL_DEFAULT_MS
+  return Math.floor(n)
+}
+
+/** Default operator approval-card lifetime (config-driven, 60 min default). */
+export const PERMISSION_TTL_MS = approvalTtlMs()
 
 /**
  * hostd gated fleet-mutation verbs (rollout / update_apply / agent_* /
  * config_propose_edit) surface an OPERATOR approval card and demand a
- * human-scale decision window — 10 min is too tight when the operator is
- * mid-task. The `mcp__hostd__*` family gets 30 min; everything else keeps
- * the 10-min default.
+ * human-scale decision window. The `mcp__hostd__*` family gets at least
+ * 30 min; if the configured approval window is longer, it wins.
  */
-export const HOSTD_PERMISSION_TTL_MS = 30 * 60_000
+export const HOSTD_PERMISSION_TTL_MS = Math.max(30 * 60_000, PERMISSION_TTL_MS)
 
 /** Per-tool approval-card TTL. */
 export function ttlForTool(toolName: string | undefined): number {

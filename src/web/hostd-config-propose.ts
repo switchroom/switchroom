@@ -22,8 +22,8 @@ import { join } from "node:path";
 import { hostdRequest } from "../host-control/client.js";
 import type { HostdRequest } from "../host-control/protocol.js";
 
-/** Slightly above hostd's 10-min CONFIG_APPROVAL_TIMEOUT_MS. */
-export const PROPOSE_TIMEOUT_MS = 11 * 60 * 1000;
+/** Slightly above hostd's 60-min CONFIG_APPROVAL_TIMEOUT_MS. */
+export const PROPOSE_TIMEOUT_MS = 61 * 60 * 1000;
 
 export type ProposeOutcome =
   | { state: "applied" }

@@ -58,7 +58,7 @@ function makeRequestId(prefix: string): string {
 // (`started`/`completed` within a tick), so a snappy 10s wire keeps the
 // agent responsive. `config_propose_edit` is the exception: the daemon
 // BLOCKS server-side awaiting the operator's approval tap (up to
-// CONFIG_APPROVAL_TIMEOUT_MS = 10 min in host-control/server.ts) before
+// CONFIG_APPROVAL_TIMEOUT_MS = 60 min in host-control/server.ts) before
 // it applies and returns. A 10s wire on that op times out by
 // construction — a human cannot tap in 10s — and the agent misreads the
 // timeout as a wire failure, then re-fires, stacking phantom approval
@@ -67,7 +67,7 @@ function makeRequestId(prefix: string): string {
 // web dashboard's PROPOSE_TIMEOUT_MS (src/web/hostd-config-propose.ts).
 const DEFAULT_WIRE_TIMEOUT_MS = 10_000;
 const WIRE_TIMEOUT_MS_BY_OP: Partial<Record<HostdRequest["op"], number>> = {
-  config_propose_edit: 11 * 60 * 1000,
+  config_propose_edit: 61 * 60 * 1000,
 };
 
 export function wireTimeoutForOp(op: HostdRequest["op"]): number {

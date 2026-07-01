@@ -318,8 +318,19 @@ export function readCachedInstallType(bindRoot: string): {
   return payload;
 }
 
-/** RFC §3.3 — operator approval card lifespan. */
-const CONFIG_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * RFC §3.3 — operator approval card lifespan for a config-propose card.
+ *
+ * Bumped to 60 min alongside the fleet-wide approval-card timeout raise (the
+ * tool-use card + vault grant wait are now config-driven at 60-min default).
+ * This surface stays a fixed default rather than config-driven: hostd runs in
+ * its own daemon process and this window is coupled to the MCP client's wire
+ * timeout (`WIRE_TIMEOUT_MS_BY_OP.config_propose_edit` in
+ * `src/mcp/hostd/server.ts`) by the hard invariant `wire > window` — threading
+ * a channel-config value into two separate processes while preserving that
+ * coupling was out of scope for this change.
+ */
+const CONFIG_APPROVAL_TIMEOUT_MS = 60 * 60 * 1000;
 
 /** 8-hex random id for an in-flight config_propose_edit approval. */
 function defaultApprovalId(): string {

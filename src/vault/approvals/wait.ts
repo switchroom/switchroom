@@ -41,7 +41,11 @@ export interface WaitForApprovalOpts {
   why?: string;
   /** TTL on the request_id nonce. Defaults to broker default. */
   request_ttl_ms?: number;
-  /** Total time to wait for a decision. Default 600_000 (10 min). */
+  /**
+   * Total time to wait for a decision. Defaults to the configured operator
+   * approval-card lifetime (`channels.telegram.approval_timeout_minutes` →
+   * `SWITCHROOM_TG_APPROVAL_TIMEOUT_MS`), falling back to 3_600_000 (60 min).
+   */
   timeout_ms?: number;
   /** External cancellation. Resolves to `{ kind: "aborted" }`. */
   signal?: AbortSignal;
@@ -75,7 +79,25 @@ export type WaitForApprovalResult =
   | { kind: "aborted"; request_id?: string }
   | { kind: "error"; reason: "broker_unreachable" | "missing_decision" };
 
-const DEFAULT_TIMEOUT_MS = 600_000;
+/** Fallback wait when neither `timeout_ms` nor config is set: 60 min. */
+const FALLBACK_TIMEOUT_MS = 60 * 60_000;
+
+/**
+ * Resolve the default decision-wait from config (threaded as
+ * `SWITCHROOM_TG_APPROVAL_TIMEOUT_MS` — see scaffold.ts `channelsToEnv`), so
+ * the vault grant wait tracks the same operator approval-card lifetime as the
+ * tool-use card. A blank/garbage/non-positive value falls back to 60 min.
+ */
+function resolveDefaultTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.SWITCHROOM_TG_APPROVAL_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return FALLBACK_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK_TIMEOUT_MS;
+  return Math.floor(n);
+}
+
 const DEFAULT_INITIAL_POLL_MS = 2_000;
 const DEFAULT_MAX_POLL_MS = 30_000;
 const DEFAULT_BACKOFF = 1.5;
@@ -127,7 +149,7 @@ export async function waitForApproval(
   const lookup = opts._lookup ?? approvalLookup;
   const sleep = opts._sleep ?? defaultSleep;
 
-  const timeoutMs = opts.timeout_ms ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeout_ms ?? resolveDefaultTimeoutMs();
   const initialPoll = opts.initial_poll_ms ?? DEFAULT_INITIAL_POLL_MS;
   const maxPoll = opts.max_poll_ms ?? DEFAULT_MAX_POLL_MS;
   const backoff = opts.backoff ?? DEFAULT_BACKOFF;
