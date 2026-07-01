@@ -9,7 +9,7 @@
  * must render literally inside the span (no visible `\_`).
  */
 
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect } from 'vitest'
 import { renderVaultRequestAccessCard } from '../gateway/vault-request-access-card.js'
 
 // Zero-width space codeSpanSafe inserts after a backtick to defuse it.
