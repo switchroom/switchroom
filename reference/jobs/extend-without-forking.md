@@ -40,6 +40,11 @@ them.
   automatically; the user doesn't reimplement them.
 - Upgrading the product leaves user-added agents, skills, and tools working.
 
+> [!CAUTION]
+> Capability must follow the operator's config and never spread itself. A new
+> tool that quietly lands on agents it wasn't meant for breaks
+> `no-self-escalation`.
+
 **Bad looks like: never ship this**
 
 - Boilerplate demanded up front: ten files to get one agent means the
@@ -107,3 +112,9 @@ the upgrade.
   user extensions keep working.
 - *Containment:* a new tool or skill reaches only the agents the operator
   declared, never others.
+
+## Related
+
+- [give each agent its own workspace](give-each-agent-its-own-workspace.md) — the isolated working tree a new agent gets.
+- [get from zero to a working fleet](get-from-zero-to-a-working-fleet.md) — the scaffold that stands up a new agent from config.
+- [update once and trust the whole stack](idempotent-update-and-restart.md) — why an upgrade never orphans a user extension.

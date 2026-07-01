@@ -13,12 +13,14 @@ audience: anyone designing, building, reviewing, or releasing switchroom
 > standard you check a change against, and two principles can be in tension
 > so you trade them off. An **invariant is a line we will not cross by
 > construction**, however useful a feature seems. It is the *"are we even
-> allowed / is this still switchroom"* gate in the verdict rule. A change
-> that breaks one is out of scope, full stop. Not a redesign, not a
-> follow-up.
+> allowed / is this still switchroom"* gate in the verdict rule.
 >
 > Job specs name the invariants they must never cross in their
 > `invariants:` frontmatter, by the slugs below.
+
+> [!CAUTION]
+> A change that breaks one of these invariants is out of scope, full stop.
+> Not a redesign, not a follow-up.
 
 ## `claude-native`
 

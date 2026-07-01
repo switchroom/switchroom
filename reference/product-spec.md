@@ -35,9 +35,12 @@ subscription, on your box, on your leash.
     it acted on what it already knows about you.
   - **Trusted.** It took no consequential action you didn't approve, and made
     no off-plan model call.
-  - **Observable.** You could see what it was doing in plain words. If you had
-    to ask it for status, that turn failed.
+  - **Observable.** You could see what it was doing in plain words.
   - **Steerable.** You could steer it or stop it mid-flight and it listened.
+
+> [!IMPORTANT]
+> On the Observable count: if you had to ask the agent for status, that turn
+> failed.
 
   A turn fails TUTR if it trips any one of the four. "Consequential" means a
   turn that does or changes something, not a pleasantry.

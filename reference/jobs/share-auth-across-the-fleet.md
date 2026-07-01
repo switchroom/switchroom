@@ -21,6 +21,7 @@ to make the user maintain one fictional copy of it per agent. Agents are
 consumers of accounts, not owners of them: one login per account, then "use
 this account on these agents" is configuration.
 
+> [!IMPORTANT]
 > We used to give every agent its own private OAuth slot pool. Six agents
 > on one subscription meant six `claude setup-token` runs, six refresh
 > cycles, and six independent rediscoveries of the same quota wall. We
@@ -108,3 +109,12 @@ seconds, no orphaned or stale credentials.
   account store.
 - *Concurrency:* exactly one OAuth refresher per account; no two processes
   race the single-use refresh endpoint.
+
+## Related
+
+- [`keep-my-subscription-honest`](keep-my-subscription-honest.md) — the
+  `claude-native`/`subscription-honest` posture this auth model upholds.
+- [`track-plan-quota-live`](track-plan-quota-live.md) — account-level quota and
+  failover, the other half of account-as-unit.
+- [`run-a-fleet-of-specialists`](run-a-fleet-of-specialists.md) — the fleet of
+  consumers one account fans out to.

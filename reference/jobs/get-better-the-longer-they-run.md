@@ -40,6 +40,12 @@ reviewed PR). This job adds *when* to do it and *how far* to go alone.
 - A new cron or new skill is always proposed, never self-served.
 - Idle turns cost ~nothing; the operator never waits on the review.
 
+> [!CAUTION]
+> A new cron or new skill is always proposed, never self-served. An agent
+> silently standing up a cron or editing a shared skill widens its own reach
+> under cover of "I learned something" — that breaks `no-self-escalation` and
+> `on-leash`.
+
 **Bad looks like: never ship this**
 
 - The same correction needed a second time.

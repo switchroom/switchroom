@@ -40,6 +40,12 @@ default; the voice on top varies per persona.
 - A second agent has the same posture in a different voice; the user
   doesn't relearn how to work with each one.
 
+> [!CAUTION]
+> Route-around-the-leash energy — "I can't access that, but I'll try this
+> instead" when the substitute is the same restricted action — is never
+> acceptable. Either ask for approval or stop. Never self-elevate
+> (`no-self-escalation`).
+
 **Bad looks like: never ship this**
 
 - Confident hallucination: answering about mutable state from training-data
@@ -104,3 +110,8 @@ them, not just the scripted prompt.
   like a colleague; no config required to reach the baseline posture.
 - *Consistency:* every agent ships the same posture floor; only the voice
   on top varies, and it's release-controlled.
+
+## Related
+
+- [approve what my agent can touch](approve-what-my-agent-can-touch.md) — the approval card the agent asks through instead of self-elevating.
+- [agents get better the longer they run](get-better-the-longer-they-run.md) — how a correction binds so it never has to be given twice.

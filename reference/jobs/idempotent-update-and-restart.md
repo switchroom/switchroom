@@ -44,6 +44,12 @@ layer, not a side effect of any underlying session happening to survive.
 - Drift between declared and installed versions is surfaced loudly before
   it causes a confusing bug.
 
+> [!CAUTION]
+> A restart that "succeeds" (the container reports running) while the process
+> inside never exited leaves the user talking to last week's agent. The
+> version the CLI reports must be provably the version loaded into every
+> running process.
+
 **Bad looks like: never ship this**
 
 - The CLI reports a new version but the agent behaves like the old one:
@@ -117,3 +123,8 @@ process, intact context, no dropped turn.
   state with no accumulating side effects.
 - *Integrity:* the version the CLI reports is provably the version loaded
   into every running process; drift is detected, not assumed-away.
+
+## Related
+
+- [get from zero to a working fleet](get-from-zero-to-a-working-fleet.md) — the same readiness gate ("ready" means can-answer) that update relies on.
+- [keep my subscription honest](keep-my-subscription-honest.md) — why every restarted process comes back on the unmodified interactive CLI.

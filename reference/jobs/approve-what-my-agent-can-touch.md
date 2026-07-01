@@ -50,6 +50,11 @@ without ever turning the chat into a place a raw credential lives.
 - The irreversible / admin-credential case sits behind the operator
   passphrase, a secret the agent structurally never holds, not just a tap.
 
+> [!CAUTION]
+> A raw credential surviving in chat history, logs, or being returned to the
+> agent is a leak, not a regression — a single occurrence is a defect. The
+> agent can request access but can never self-grant.
+
 **Bad looks like: never ship this**
 
 - The agent telling the user to paste a token into chat because a slot was

@@ -62,6 +62,12 @@ sides.
   grant), the user is told plainly. The agent doesn't silently go dark in a
   channel the user assumed was live.
 
+> [!CAUTION]
+> This is the one surface where a non-operator input can reach an agent. An
+> agent acting on an un-gated, unsigned, or off-path trigger is roaming
+> wearing the operator's identity — it breaks `on-leash` by construction.
+> Never ship it.
+
 **Bad looks like: never ship this**
 
 - The agent acts on an **un-gated external trigger**: a webhook with no

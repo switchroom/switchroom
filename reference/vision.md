@@ -115,7 +115,8 @@ specific PR or design:
   job index. The per-job **job specs** (`reference/*.md` with `job:`
   frontmatter) each `serves:` one outcome.
 
-A change lands when it (a) advances one of the four outcomes, (b) satisfies
-its job spec (proven by its outcome UAT), (c) passes all three principle
-checks, and (d) crosses no invariant. Anything else is out of scope, however
-clever.
+> [!IMPORTANT]
+> A change lands when it (a) advances one of the four outcomes, (b) satisfies
+> its job spec (proven by its outcome UAT), (c) passes all three principle
+> checks, and (d) crosses no invariant. Anything else is out of scope, however
+> clever.

@@ -158,8 +158,11 @@ principal's chat jobs). Pin:
   principal-facing jobs it could cannibalise,
   [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) and
   [`track-plan-quota-live`](track-plan-quota-live.md), remain answered in
-  the chat. If the dashboard starts being where a principal goes, this job
-  has failed even if every feature works.
+  the chat.
+
+> [!CAUTION]
+> If the dashboard starts being where a principal goes, this job has failed
+> even if every feature works.
 
 ---
 

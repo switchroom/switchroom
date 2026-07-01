@@ -21,7 +21,10 @@ interaction surface, one safety posture. The thing that varies is the
 specialist, not the plumbing. Specialists are not personas over one model.
 Each has its own memory, skills, tools, and topic. The health coach never
 sees the code-review history; the coding agent never second-guesses the
-sleep data. Separation is the point.
+sleep data.
+
+> [!IMPORTANT]
+> Specialists are not personas over one model. Separation is the point.
 
 ## Good / bad
 
@@ -99,3 +102,12 @@ scope stays enforced, and no agent acts on another's state.
   by construction; cross-agent access requires an explicit operator action.
 - *Reliability:* concurrent agents do not degrade each other's turn under
   load.
+
+## Related
+
+- [`remember-across-sessions`](remember-across-sessions.md) — the per-agent
+  memory bank that keeps specialists from bleeding into each other.
+- [`share-auth-across-the-fleet`](share-auth-across-the-fleet.md) — one login
+  fanned out to many specialists.
+- [`see-my-whole-fleet-from-one-screen`](see-my-whole-fleet-from-one-screen.md) —
+  the operator's view of the whole fleet at once.

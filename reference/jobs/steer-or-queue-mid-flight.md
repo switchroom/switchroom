@@ -18,8 +18,11 @@ Steering is amend-in-place: the current task continues with the new
 information folded in. Queuing is a new task: the current one finishes on its
 own terms, the new one picks up after, with no context bleeding between them.
 Ambiguous input must not silently pick one and hope. The product decides
-clearly and says which, or it asks. The worst outcome is the user thinking
-they steered when they actually queued, or the reverse.
+clearly and says which, or it asks.
+
+> [!CAUTION]
+> The worst outcome is the user thinking they steered when they actually
+> queued, or the reverse.
 
 > The default for an unmarked mid-turn follow-up was once *steer*; it is now
 > *queue*. The job underneath is unchanged: both operations must work and the
@@ -99,3 +102,12 @@ be lost, across the corpus.
   a queued or interrupted task survives a bounce.
 - *Safety:* a steer or interrupt takes effect at a safe boundary, never
   corrupting an in-flight tool call.
+
+## Related
+
+- [`know-what-my-agent-is-doing`](know-what-my-agent-is-doing.md) — seeing the
+  in-flight work you're steering or queuing against.
+- [`talk-to-agents-from-anywhere`](talk-to-agents-from-anywhere.md) —
+  one-handed mid-flight correction from a phone.
+- [`survive-reboots-and-real-life`](survive-reboots-and-real-life.md) — how a
+  queued or interrupted task survives a restart.

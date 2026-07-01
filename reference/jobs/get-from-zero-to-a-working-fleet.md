@@ -62,6 +62,12 @@ bot is silently dead.
 - A cheerful "Restarted" / "Setup complete" while an MCP failed to boot, the
   bank doesn't exist, or the gateway isn't polling. Silent success on a
   broken state is the cardinal sin of this job.
+
+> [!CAUTION]
+> Silent success on a broken state is the cardinal sin of this job. Setup and
+> restart report success only when the agent can actually take a message; a
+> failed component fails loud and early, naming the broken thing and the next
+> command to run.
 - A failure whose only signal is a line in a service log the operator
   doesn't know exists. If they have to tail a log to learn setup failed, the
   product failed.

@@ -49,6 +49,11 @@ reach.
   user's existing documents and never prompts a per-file approval to land
   its own output.
 
+> [!CAUTION]
+> A local container path (`/state/agent/...`, `/tmp/...`) is never delivery.
+> The user is not on the box; the path leads nowhere. When nothing can be
+> delivered, say so plainly and offer the fix — never fall back to a path.
+
 **Bad looks like: never ship this**
 
 - Replying with a local container path (`/state/agent/report.csv`,

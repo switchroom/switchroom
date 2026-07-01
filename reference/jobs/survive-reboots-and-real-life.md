@@ -17,9 +17,11 @@ to keep it alive. Surviving means two things: the agent comes back on its
 own after a reboot, crash, or upgrade, and it is honest about what
 happened. If a turn was interrupted, memory was lost, context was
 compacted, or a tool call failed mid-way, the user hears about it in plain
-language, at the point it affects them. Silent recovery is worse than a
-visible failure: coming back in a different state without saying so is the
-bug, not the resilience.
+language, at the point it affects them.
+
+> [!CAUTION]
+> Silent recovery is worse than a visible failure: coming back in a different
+> state without saying so is the bug, not the resilience.
 
 ## Good / bad
 
@@ -108,3 +110,12 @@ never silently, work resumed or named-as-lost.
   or skipped, never silently dropped.
 - *Honesty:* every persistent named failure (credentials, quota, crash) is
   surfaced to the user, not just logged to stderr.
+
+## Related
+
+- [`restart-and-know-what-im-running`](restart-and-know-what-im-running.md) —
+  knowing what config came back after a restart.
+- [`remember-across-sessions`](remember-across-sessions.md) — memory surviving
+  the reboots this job handles.
+- [`steer-or-queue-mid-flight`](steer-or-queue-mid-flight.md) — how an
+  in-flight task is resumed or named-as-lost after a bounce.

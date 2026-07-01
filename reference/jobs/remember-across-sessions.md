@@ -19,8 +19,10 @@ thousand messages into the prompt is neither remembering nor useful. Good
 memory is curated, semantic, and retrieved by relevance: the schedule note
 surfaces when planning the week, not when writing code. Memory is also
 honest: when the agent recalls something, the user can see that it did,
-trust why, and correct it if it's wrong. Memory the user can't inspect is
-memory the user won't trust.
+trust why, and correct it if it's wrong.
+
+> [!IMPORTANT]
+> Memory the user can't inspect is memory the user won't trust.
 
 ## Good / bad
 
@@ -96,3 +98,12 @@ correction-stickiness, and per-bank isolation hold across all.
   windows.
 - *Inspectability:* every recall is attributable; the user can see, correct,
   and demote what the agent stores.
+
+## Related
+
+- [`run-a-fleet-of-specialists`](run-a-fleet-of-specialists.md) — why each
+  agent's memory bank is its own and never pooled.
+- [`survive-reboots-and-real-life`](survive-reboots-and-real-life.md) — memory
+  surviving a restart, compaction, or crash.
+- [`get-better-the-longer-they-run`](get-better-the-longer-they-run.md) — how
+  remembered context compounds over time.
