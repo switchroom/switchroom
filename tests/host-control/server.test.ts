@@ -2416,3 +2416,116 @@ describe("hostd server — rollout phase observability (#2726)", () => {
     rmSync(execTmp, { recursive: true, force: true });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2726 Part 2 — the narration renderer is FED each phase + the terminal by
+// hostd (the tail-and-render seam lives in hostd). Wire a fake narrator and
+// assert it receives the phases in order and the terminal, without blocking.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("hostd server — rollout narrator feed (#2726 Part 2)", () => {
+  it("feeds the narrator every phase, in order, then the terminal", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-narrator-"));
+    const stub = join(execTmp, "stub.sh");
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"apply","target":"v0.15.18"}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"canary-start","target":"v0.15.18","agent":"klanker","n":1,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"canary-pass","target":"v0.15.18","agent":"klanker","n":1,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"agent-done","target":"v0.15.18","agent":"bob","n":2,"m":2}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker","bob"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    const assets = join(tmp, `assets-narrator-${Date.now()}`);
+    mkdirSync(join(assets, "profiles", "default"), { recursive: true });
+    mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+
+    const seenPhases: string[] = [];
+    let terminalResult: string | null = null;
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-narrator.log"),
+      applyAssetsRoot: assets,
+      allowNonLinux: true,
+      rolloutNarrator: {
+        onPhase: (_e, p) => seenPhases.push(p.phase),
+        onTerminal: (e) => {
+          terminalResult = e.result;
+        },
+      },
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-narr-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(seenPhases).toEqual(["apply", "canary-start", "canary-pass", "agent-done"]);
+    expect(terminalResult).toBe("completed");
+
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+
+  it("a narrator that throws in onPhase does NOT fail the roll", async () => {
+    const execTmp = mkdtempSync(join("/var/tmp", "hostd-narrator-throw-"));
+    const stub = join(execTmp, "stub.sh");
+    writeFileSync(
+      stub,
+      `#!/bin/sh\n` +
+        `echo 'SWITCHROOM_ROLLOUT_PHASE:{"phase":"apply","target":"v0.15.18"}'\n` +
+        `echo 'SWITCHROOM_ROLLOUT_RESULT:{"ok":true,"rolled":["klanker"],"warnings":[]}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stub, 0o755);
+
+    const assets = join(tmp, `assets-narrator-throw-${Date.now()}`);
+    mkdirSync(join(assets, "profiles", "default"), { recursive: true });
+    mkdirSync(join(assets, "vendor", "hindsight-memory"), { recursive: true });
+
+    if (server) await server.stop();
+    server = new HostdServer({
+      homeDir: tmp,
+      agentUids: { klanker: 10001, bob: 10002 },
+      config: { agents: { klanker: { admin: true }, bob: {} } },
+      switchroomBin: stub,
+      auditLogPath: join(tmp, "audit-narrator-throw.log"),
+      applyAssetsRoot: assets,
+      allowNonLinux: true,
+      rolloutNarrator: {
+        onPhase: () => {
+          throw new Error("narrator boom");
+        },
+        onTerminal: () => {
+          throw new Error("narrator terminal boom");
+        },
+      },
+    });
+    await server.start();
+    const sock = server.getBoundPaths().find((p) => p.endsWith("/klanker/sock"))!;
+
+    await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "rollout", request_id: "ro-narr-throw-1", args: { pin: "v0.15.18" } },
+    );
+    await new Promise((r) => setTimeout(r, 400));
+
+    const poll = await hostdRequest(
+      { socketPath: sock },
+      { v: 1, op: "get_status", request_id: "poll-nt", args: { target_request_id: "ro-narr-throw-1" } },
+    );
+    // The roll completed despite the narrator throwing on every callback.
+    expect(poll.result).toBe("completed");
+
+    rmSync(execTmp, { recursive: true, force: true });
+  });
+});
