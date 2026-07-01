@@ -23654,8 +23654,18 @@ bot.on('message:pinned_message', async ctx => {
       () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
       { chat_id: chatId, verb: 'status-pin.delete-service-message' },
     )
-  } catch {
-    // Best-effort: a failure to delete the service message is cosmetic only.
+  } catch (err) {
+    // Best-effort: a failure to delete the service message is cosmetic only —
+    // the "pinned a message" line just stays. The most likely cause in a
+    // supergroup/forum is the bot lacking can_delete_messages admin right, so
+    // surface a concise one-liner (robustApiCall rethrows this case without
+    // logging a reason) rather than swallowing silently — an operator sees WHY.
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `telegram gateway: status-pin: could not delete pin service message ` +
+        `(chat=${chatId} msg=${serviceMsgId}) — likely missing can_delete_messages ` +
+        `admin right in this chat: ${msg}\n`,
+    )
   }
 })
 

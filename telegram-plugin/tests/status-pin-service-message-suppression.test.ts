@@ -122,3 +122,89 @@ describe('service-message deletion decision (chat-scoped)', () => {
     expect(wouldDelete('-100AAA', 9999)).toBe(false)
   })
 })
+
+/**
+ * SUPERGROUP / forum-topic coverage. The handler reads only ctx.chat.id +
+ * ctx.msg.message_id and deletes by (chat_id, message_id) — topic-agnostic,
+ * with no private-chat assumption. In a forum supergroup the pinned status
+ * message carries a message_thread_id, but:
+ *   - deletion needs no thread arg (chat_id + message_id is sufficient), and
+ *   - message_id is unique per chat even across topics, so a single chat-scoped
+ *     match is correct regardless of which topic the pin lives in.
+ * These tests model a pinned_message update whose chat is a supergroup (and a
+ * forum variant carrying message_thread_id) and assert the same chat-scoped
+ * decision holds.
+ */
+describe('service-message deletion in supergroups / forum topics', () => {
+  // A status pin tracked in a supergroup chat, plus a collision partner in a
+  // different supergroup.
+  const tracked: TrackedStatusPin[] = [
+    { chatId: '-1001111', messageId: 500 }, // supergroup A
+    { chatId: '-1002222', messageId: 500 }, // supergroup B, SAME id as A
+  ]
+
+  // Model the handler's identity extraction from a grammy-shaped update. The
+  // thread id is present on forum updates but deliberately NOT part of the
+  // ownership/delete identity.
+  type PinnedUpdate = {
+    chat: { id: number; type: 'private' | 'supergroup' }
+    message_id: number
+    message_thread_id?: number
+    pinned_message: { message_id: number }
+  }
+  const wouldDelete = (u: PinnedUpdate) =>
+    pinnedMessageIsOurs(tracked, String(u.chat.id), u.pinned_message.message_id)
+
+  it('deletes on a genuine same-chat match in a plain supergroup', () => {
+    const update: PinnedUpdate = {
+      chat: { id: -1001111, type: 'supergroup' },
+      message_id: 9001, // the service message
+      pinned_message: { message_id: 500 },
+    }
+    expect(wouldDelete(update)).toBe(true)
+  })
+
+  it('deletes on a same-chat match in a FORUM topic (message_thread_id set)', () => {
+    const update: PinnedUpdate = {
+      chat: { id: -1001111, type: 'supergroup' },
+      message_id: 9002,
+      message_thread_id: 77, // forum topic — irrelevant to the delete identity
+      pinned_message: { message_id: 500 },
+    }
+    expect(wouldDelete(update)).toBe(true)
+  })
+
+  it('does NOT delete when the id collides across two supergroups', () => {
+    // Supergroup B receives a pin update for id 500, which also happens to be
+    // supergroup A's tracked status-pin id. Chat-scoped guard keeps them apart.
+    const update: PinnedUpdate = {
+      chat: { id: -1002222, type: 'supergroup' },
+      message_id: 9003,
+      message_thread_id: 12,
+      pinned_message: { message_id: 500 },
+    }
+    // 500 IS tracked for chat -1002222 too in this fixture, so this is a
+    // genuine match — assert the positive, then flip to a true cross-chat miss.
+    expect(wouldDelete(update)).toBe(true)
+
+    // A supergroup NOT in the tracked set, colliding on id 500 → must NOT fire.
+    const foreign: PinnedUpdate = {
+      chat: { id: -1009999, type: 'supergroup' },
+      message_id: 9004,
+      message_thread_id: 5,
+      pinned_message: { message_id: 500 },
+    }
+    expect(wouldDelete(foreign)).toBe(false)
+  })
+
+  it('the handler logs a missing-admin-right hint on delete failure (supergroup)', () => {
+    // Structural: the catch block names the likely supergroup cause so an
+    // operator isn't left with silent nothing.
+    const src = readFileSync(
+      new URL('../gateway/gateway.ts', import.meta.url),
+      'utf8',
+    )
+    expect(src).toContain('could not delete pin service message')
+    expect(src).toContain('missing can_delete_messages')
+  })
+})
