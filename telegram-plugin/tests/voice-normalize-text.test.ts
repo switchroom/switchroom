@@ -95,8 +95,8 @@ describe('normalizeForSpeech — additional structures', () => {
 
   it('expands a minimal, safe set of abbreviations', () => {
     expect(normalizeForSpeech('use it, e.g. here')).toBe('use it, for example, here')
-    expect(normalizeForSpeech('the API, i.e. the interface')).toBe(
-      'the API, that is, the interface',
+    expect(normalizeForSpeech('the tool, i.e. the interface')).toBe(
+      'the tool, that is, the interface',
     )
     expect(normalizeForSpeech('cats, dogs, etc.')).toBe('cats, dogs, and so on')
   })
@@ -107,10 +107,140 @@ describe('normalizeForSpeech — additional structures', () => {
   })
 })
 
+describe('normalizeForSpeech — emoji & pictographs', () => {
+  it('strips emoji and collapses the resulting whitespace', () => {
+    expect(normalizeForSpeech('done 🚀 shipping')).toBe('done shipping')
+    expect(normalizeForSpeech('great 👍🏽 job')).toBe('great job')
+    expect(normalizeForSpeech('🎉')).toBe('')
+  })
+
+  it('drops :shortcode: emoji forms', () => {
+    expect(normalizeForSpeech('nice :rocket: work')).toBe('nice work')
+  })
+
+  it('leaves ordinary colon usage alone', () => {
+    expect(normalizeForSpeech('note: this is fine')).toBe('note: this is fine')
+  })
+})
+
+describe('normalizeForSpeech — numbers, units & symbols', () => {
+  it('speaks percent', () => {
+    expect(normalizeForSpeech('up 20% today')).toBe('up 20 percent today')
+  })
+
+  it('speaks currency amounts', () => {
+    expect(normalizeForSpeech('costs $5')).toBe('costs five dollars')
+    expect(normalizeForSpeech('costs $5.50')).toBe('costs five dollars fifty')
+    expect(normalizeForSpeech('just $1')).toBe('just one dollar')
+  })
+
+  it('speaks standalone & as "and"', () => {
+    expect(normalizeForSpeech('cats & dogs')).toBe('cats and dogs')
+    expect(normalizeForSpeech('R&D team')).toBe('R and D team')
+  })
+
+  it('speaks + between words as "plus" and = as "equals"', () => {
+    expect(normalizeForSpeech('speed + power')).toBe('speed plus power')
+    expect(normalizeForSpeech('x = y')).toBe('x equals y')
+  })
+
+  it('speaks × / x multipliers as "times"', () => {
+    expect(normalizeForSpeech('12× faster')).toBe('twelve times faster')
+    expect(normalizeForSpeech('a 12x speedup')).toBe('a twelve times speedup')
+  })
+
+  it('speaks temperature degrees', () => {
+    expect(normalizeForSpeech('it is 30°C outside')).toBe(
+      'it is 30 degrees outside',
+    )
+    expect(normalizeForSpeech('72°F')).toBe('72 degrees')
+  })
+
+  it('expands number + time/size unit suffixes', () => {
+    expect(normalizeForSpeech('waited 2s')).toBe('waited two seconds')
+    expect(normalizeForSpeech('took 500ms')).toBe('took five hundred milliseconds')
+    expect(normalizeForSpeech('run 5m')).toBe('run five minutes')
+    expect(normalizeForSpeech('run 5min')).toBe('run five minutes')
+    expect(normalizeForSpeech('wait 2h')).toBe('wait two hours')
+    expect(normalizeForSpeech('wait 2hr')).toBe('wait two hours')
+    expect(normalizeForSpeech('in 3d')).toBe('in three days')
+    expect(normalizeForSpeech('10kb file')).toBe('ten kilobytes file')
+    expect(normalizeForSpeech('10KB file')).toBe('ten kilobytes file')
+    expect(normalizeForSpeech('a 5MB image')).toBe('a five megabytes image')
+    expect(normalizeForSpeech('a 2GB dump')).toBe('a two gigabytes dump')
+    expect(normalizeForSpeech('1s ping')).toBe('one second ping')
+  })
+
+  it('expands the "k" thousands shorthand', () => {
+    expect(normalizeForSpeech('100k users')).toBe('one hundred thousand users')
+  })
+
+  it('leaves number-glued-to-word identifiers alone', () => {
+    expect(normalizeForSpeech('my5thing works')).toBe('my5thing works')
+    expect(normalizeForSpeech('class5 room')).toBe('class5 room')
+  })
+})
+
+describe('normalizeForSpeech — abbreviations (phase 2)', () => {
+  it('expands vs / approx / w/', () => {
+    expect(normalizeForSpeech('cats vs dogs')).toBe('cats versus dogs')
+    expect(normalizeForSpeech('cats vs. dogs')).toBe('cats versus dogs')
+    expect(normalizeForSpeech('approx 10 items')).toBe('approximately 10 items')
+    expect(normalizeForSpeech('tea w/ milk')).toBe('tea with milk')
+  })
+})
+
+describe('normalizeForSpeech — acronyms', () => {
+  it('spells curated initialisms letter-by-letter', () => {
+    expect(normalizeForSpeech('the CI passed')).toBe('the C I passed')
+    expect(normalizeForSpeech('open a PR')).toBe('open a P R')
+    expect(normalizeForSpeech('call the API via HTTP')).toBe(
+      'call the A P I via H T T P',
+    )
+    expect(normalizeForSpeech('GPU and CPU load')).toBe('G P U and C P U load')
+    expect(normalizeForSpeech('parse the JSON')).toBe('parse the J S O N')
+  })
+
+  it('leaves word-style acronyms and unknown caps alone', () => {
+    expect(normalizeForSpeech('NASA launch')).toBe('NASA launch')
+    expect(normalizeForSpeech('the FBI report')).toBe('the FBI report')
+  })
+
+  it('does not touch caps inside a larger word', () => {
+    expect(normalizeForSpeech('myAPIkey stays')).toBe('myAPIkey stays')
+  })
+})
+
+describe('normalizeForSpeech — times & dates', () => {
+  it('speaks clock times', () => {
+    expect(normalizeForSpeech('meet at 12:45')).toBe('meet at twelve forty-five')
+    expect(normalizeForSpeech('at 09:05')).toBe('at nine oh five')
+    expect(normalizeForSpeech('at 14:00')).toBe("at fourteen o'clock")
+  })
+
+  it('speaks ISO dates', () => {
+    expect(normalizeForSpeech('on 2026-07-01 we ship')).toBe(
+      'on July first two thousand twenty-six we ship',
+    )
+    expect(normalizeForSpeech('2026-12-25')).toBe(
+      'December twenty-fifth two thousand twenty-six',
+    )
+  })
+})
+
 describe('normalizeForSpeech — conservative, does not mangle real words', () => {
   it('leaves plain prose untouched', () => {
     expect(normalizeForSpeech('The quick brown fox jumps.')).toBe(
       'The quick brown fox jumps.',
+    )
+  })
+
+  it('leaves lowercase day/word tokens and a symbol-free sentence alone', () => {
+    expect(normalizeForSpeech('see you wednesday afternoon')).toBe(
+      'see you wednesday afternoon',
+    )
+    expect(normalizeForSpeech('The report covers three main areas.')).toBe(
+      'The report covers three main areas.',
     )
   })
 
