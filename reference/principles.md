@@ -211,6 +211,16 @@ When you're tempted to add a new pinned card / status bar / live
 widget, ask: would the model sending a real `reply` cover this? If
 yes, change the prompt instead.
 
+One sanctioned exception carries here from `invariants.md`: the framework
+MAY silently pin a status message **already rendered in the chat** (the
+per-turn status message, the `🛠 Worker` background-worker message) and
+auto-unpin it on completion. The reason the #1122 removal no longer fully
+holds: fast answers, more background workers, and much longer turns mean the
+conversation moves on quickly and in-flight work scrolls out of the visible
+feed. Pinning a message the feed already owns keeps it in view; it renders no
+new content, so it is not a parallel surface. Rendering a fresh card/widget
+solely to pin it, or a notification-generating pin, is still the retired line.
+
 ---
 
 ## Applying the principles

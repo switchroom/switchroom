@@ -50,12 +50,24 @@ close that gap so the user never has to ask.
   told what happened and what resumes.
 - Scrolling back a week later reads as a real conversation, not a deleted
   widget.
+- When work outlives the visible feed — fast turns scroll it away, background
+  workers stack up, a long turn runs past the fold — the framework silently pins
+  the status message that is *already* in the chat (the per-turn status message,
+  the `🛠 Worker` background-worker message) so in-flight work stays in view, and
+  auto-unpins it when that work completes. The pin is silent (no device buzz) and
+  carries no new content: it re-surfaces a message the conversation already owns.
+  This is the one sanctioned pin (see `invariants.md`
+  § `chat-is-the-single-source-of-truth`).
 
 **Bad looks like: never ship this**
 
 - A separate progress surface running parallel to the chat. This was the
   retired card. It duplicates the conversation or covers for a model that
-  won't talk. Make the model talk.
+  won't talk. Make the model talk. (Silently pinning a status message *already
+  rendered in the feed* is the sanctioned exception above — the line is
+  rendering a new parallel surface, not pinning one the chat already holds.)
+- A bespoke card/widget rendered solely to be pinned, or a pin that buzzes the
+  device. That is the retired card wearing a pin, not the sanctioned exception.
 - Narrating every tool call as its own message. Tool churn isn't something
   the user can act on. Silence during tool-calling is fine; the ambient
   signal carries "alive".

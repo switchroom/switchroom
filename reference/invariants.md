@@ -171,8 +171,32 @@ agent is doing; framework UI (a reaction, a fallback message) is a safety
 net, never a second state mirror. We crossed this line once (the pinned
 progress card) and retired it (#1122); it is now a line, not a tradeoff.
 
-- **By-construction test:** does this add a card, pinned widget, or status
-  surface that mirrors conversation state in parallel? If yes, change the
-  prompt so the model communicates instead. See the "chat IS the artifact"
-  sub-principle in `principles.md` and `know-my-agent-is-doing`'s design
+**One sanctioned exception — the silent pin of an already-rendered status
+message.** The #1122 removal assumed the status message stays visible in the
+live conversation window. That assumption no longer holds: the speed of modern
+answers, more background workers, and much longer-running turns mean the
+conversation moves on quickly in the feed and the user loses sight of in-flight
+work. Work now routinely outlives the visible feed — fast turns scroll it away,
+concurrent background workers stack up, long-running turns run past the fold. To
+keep in-flight work in view when that happens, the framework MAY pin a status
+message **that is already rendered in the chat** — specifically the existing
+per-turn status message and the existing `🛠 Worker` background-worker message —
+and auto-unpin it when that work completes. The pin MUST be silent
+(`disable_notification: true`). This carries no new content: it re-surfaces a
+message the conversation already owns.
+
+This is the ONE exception, and it is narrow by construction. It does **not**
+reopen bespoke cards. It does NOT permit: a new card/widget/status surface
+rendered solely to be pinned; a notification-generating pin; or any pinned
+surface that renders content not already present in the chat. Pinning a message
+the feed already holds is fine; rendering a second, parallel surface is still the
+retired line.
+
+- **By-construction test:** does this pin a message the conversation *already*
+  rendered (per-turn status / `🛠 Worker`), silently, and auto-unpin it on
+  completion? That is the sanctioned exception. Does it instead add a card,
+  pinned widget, or status surface that mirrors conversation state in *parallel*,
+  or render new content solely to pin it? If yes, that is still the retired line
+  — change the prompt so the model communicates instead. See the "chat IS the
+  artifact" sub-principle in `principles.md` and `know-my-agent-is-doing`'s design
   artifact `rfcs/conversational-pacing.md`.
