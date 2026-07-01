@@ -1967,6 +1967,14 @@ function emitAgentService(
     // this is at worst a no-op — never a regression.
     CLAUDE_CODE_ATTRIBUTION_HEADER: "0",
     SWITCHROOM_AGENT_NAME: a.name,
+    // The agent's profile (its `extends:` value, defaulting to
+    // "default"). Read by the LiteLLM `x-litellm-tags` header emitted
+    // from start.sh.hbs / cron-session.sh.hbs as `profile:<value>` —
+    // without this write the `${SWITCHROOM_AGENT_PROFILE:-default}`
+    // expansion always collapsed to "default" (3 reads, 0 writes), so
+    // the per-profile spend tag was dead. Must match `profile` resolved
+    // in `collectAgentServices` (`agent.extends ?? "default"`).
+    SWITCHROOM_AGENT_PROFILE: a.profile ?? "default",
     // Belt-and-braces in-container marker for the agent-config CLI's
     // isContainerContext() probe (the primary signal is /.dockerenv,
     // but a second independent check is the point of writing `||`).

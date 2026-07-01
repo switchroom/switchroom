@@ -385,6 +385,19 @@ describe("generateCompose", () => {
     expect(out).toMatch(/agent-misc:[\s\S]*?cpus: 1\.0/);
   });
 
+  it("SWITCHROOM_AGENT_PROFILE env = the agent's profile (LiteLLM profile: spend tag)", () => {
+    // Regression: start.sh.hbs / cron-session.sh.hbs emit
+    // `profile:${SWITCHROOM_AGENT_PROFILE:-default}` but the env var was
+    // never written, so the per-profile spend tag was always "default".
+    const out = generateCompose({ config: makeConfig({ worker: { extends: "coding" } }) });
+    expect(out).toMatch(/agent-worker:[\s\S]*?SWITCHROOM_AGENT_PROFILE: "coding"/);
+  });
+
+  it("SWITCHROOM_AGENT_PROFILE defaults to 'default' when no extends set", () => {
+    const out = generateCompose({ config: makeConfig({ misc: {} }) });
+    expect(out).toMatch(/agent-misc:[\s\S]*?SWITCHROOM_AGENT_PROFILE: "default"/);
+  });
+
   it("agent.resources.memory overrides the profile default", () => {
     const out = generateCompose({
       config: makeConfig({ tiny: { extends: "conversational", resources: { memory: "512m" } } }),
