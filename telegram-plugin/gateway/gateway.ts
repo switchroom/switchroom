@@ -8745,10 +8745,24 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // the full answer must be SPOKEN. Best-effort: a chunk that fails to
   // synthesize is skipped; if NOTHING synthesizes the text path proceeds
   // unchanged so the answer is never dropped.
+  // on-demand is a LOCAL-engine (kokoro) feature only: the tap handler
+  // synthesizes via the local sidecar, so a Listen button is only meaningful
+  // when the resolved engine is kokoro. resolveVoiceOutPlan already gated the
+  // local host verdict for kokoro, so engine==='kokoro' here implies the
+  // sidecar is available. For engine==='openai' + reply_mode='on-demand' we do
+  // NOT inject a button (its taps would dead-end on the local sidecar) — we
+  // fall through to the normal immediate-synth path so the openai reply behaves
+  // exactly like a normal openai voice reply.
+  const useOnDemandButton =
+    voiceOutPlan != null &&
+    voiceOutPlan.replyMode === 'on-demand' &&
+    voiceOutPlan.engine === 'kokoro'
+
   const voiceOggs: Uint8Array[] = []
-  // on-demand: do NOT synthesize at reply time — a '🔊 Listen' button is
-  // injected below and audio is produced only when the user taps it.
-  if (voiceOutPlan != null && voiceOutPlan.replyMode !== 'on-demand') {
+  // Skip reply-time synthesis ONLY when we're actually deferring to a Listen
+  // button (kokoro on-demand). An openai on-demand config still synthesizes
+  // immediately below.
+  if (voiceOutPlan != null && !useOnDemandButton) {
     for (const chunkText of voiceOutPlan.ttsChunks) {
       const ogg = await synthesizeVoiceOut({
         engine: voiceOutPlan.engine,
@@ -8808,16 +8822,25 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // a foreign single_use:false button would flip that message to a mixed
   // keyboard and defeat the agent's double-fire protection. Keep it simple —
   // agent buttons present → skip the Listen button for this message.
+  //
+  // useOnDemandButton already gates on engine==='kokoro': an openai on-demand
+  // config never reaches here (it synthesized immediately above), so a Listen
+  // button is never minted for an engine whose taps would dead-end on the
+  // local sidecar.
   if (
-    voiceOutPlan?.replyMode === 'on-demand' &&
-    voiceOutPlan.ttsChunks.length > 0 &&
-    voiceOutPlan.ttsChunks[0]!.length > 0
+    useOnDemandButton &&
+    voiceOutPlan!.ttsChunks.length > 0 &&
+    voiceOutPlan!.ttsChunks[0]!.length > 0
   ) {
     if (!mayInjectListenButton(rawKeyboard)) {
       process.stderr.write(
         'telegram gateway: voice-out on-demand: agent supplied inline_keyboard — skipping Listen button (single_use collision gate)\n',
       )
     } else {
+      // Token is intentionally GLOBAL (not chat-keyed): under the single-tenant
+      // invariant the operator is the only authorized sender across all chats,
+      // and the tap handler re-checks access.allowFrom before synthesizing, so
+      // a token needs no per-chat scoping to be safe.
       const token = mintVoiceOnDemandToken()
       voiceOnDemandCache.put(token, {
         // ttsChunks[0] is already normalizeForSpeech(reply) (kokoro path).

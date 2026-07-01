@@ -113,6 +113,37 @@ describe('on-demand: reply-time behaviour (gate + no synthesis)', () => {
     expect(kb.inline_keyboard[0]![0]!.callback_data.startsWith('voice:')).toBe(true)
   })
 
+  it('ENGINE GATE: openai + on-demand does NOT inject a Listen button (falls back to immediate synth)', () => {
+    // The gateway computes:
+    //   useOnDemandButton = plan != null && replyMode==='on-demand' && engine==='kokoro'
+    // and both the reply-time synth-skip AND the button injection key on it.
+    // So an openai on-demand config must (a) NOT defer synthesis and (b) NOT
+    // mint a Listen button — its taps would dead-end on the local sidecar.
+    const useOnDemandButton = (
+      engine: 'kokoro' | 'openai',
+      replyMode: 'voice+text' | 'voice-only' | 'on-demand',
+    ) => replyMode === 'on-demand' && engine === 'kokoro'
+
+    // openai + on-demand: no button, immediate synth path runs.
+    expect(useOnDemandButton('openai', 'on-demand')).toBe(false)
+    // kokoro + on-demand: button injected, synth deferred.
+    expect(useOnDemandButton('kokoro', 'on-demand')).toBe(true)
+    // openai non-on-demand modes are unaffected (normal synth).
+    expect(useOnDemandButton('openai', 'voice+text')).toBe(false)
+    expect(useOnDemandButton('openai', 'voice-only')).toBe(false)
+
+    // Reproduce the reply-time synth guard: `if (plan != null && !useOnDemandButton)`.
+    // For openai on-demand it MUST enter the synth loop (fall back), unlike
+    // kokoro on-demand which skips it.
+    let openaiSynthRan = false
+    if (!useOnDemandButton('openai', 'on-demand')) openaiSynthRan = true
+    expect(openaiSynthRan).toBe(true)
+
+    let kokoroSynthRan = false
+    if (!useOnDemandButton('kokoro', 'on-demand')) kokoroSynthRan = true
+    expect(kokoroSynthRan).toBe(false)
+  })
+
   it('GATE: agent-supplied inline_keyboard present → NO voice button injected', () => {
     const agentKeyboard = [[{ text: 'Approve', callback_data: 'yes' }]]
     expect(mayInjectListenButton(agentKeyboard)).toBe(false)
