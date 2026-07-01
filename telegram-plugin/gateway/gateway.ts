@@ -85,6 +85,8 @@ import {
 import { StatusReactionController } from '../status-reactions.js'
 import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
+import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
+import type { PinState, DesiredPin } from '../status-pin.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
 import {
@@ -3263,6 +3265,19 @@ function purgeReactionTracking(key: string, endingTurn?: CurrentTurn): void {
   // successor turn; the timer's own turnId match is the second guard, this is
   // the first. Idempotent — a no-op when no timer is registered.
   stopEarlyLivenessOpen(key as string)
+  // Status-pin: turn end is the canonical unpin point for the foreground
+  // pin. `purgeReactionTracking` is the single turn-end owner (all normal /
+  // abnormal exit branches funnel here), so this is the one place the
+  // foreground status pin is dropped. Idempotent: a no-op when nothing was
+  // pinned (trivial turn that never opened a status message). The
+  // drop-on-unpin contract in reconcilePin guarantees state clears even if
+  // the unpin API throws — a stuck pin can never outlive its turn.
+  {
+    const pinChatId = endingTurn != null
+      ? endingTurn.sessionChatId
+      : chatIdOfChatKey(key as _ChatKey)
+    void reconcileStatusPin(`fg:${key}`, pinChatId, { pinned: false })
+  }
   if (msgInfo) {
     const agentDir = resolveAgentDirFromEnv()
     if (agentDir != null) removeActiveReaction(agentDir, msgInfo.chatId, msgInfo.messageId)
@@ -5538,6 +5553,136 @@ const CLEAR_STATUS_ON_COMPLETION = (() => {
   const v = raw.trim().toLowerCase()
   return v === '1' || v === 'true' || v === 'on' || v === 'yes'
 })()
+
+// Whether to SILENTLY pin the already-rendered status message while its work
+// is in-flight (auto-unpinned on completion). Default ON (silent + low-risk):
+// keeps in-flight work in view when the conversation scrolls past it. This is
+// the ONE sanctioned pin under `chat-is-the-single-source-of-truth` — it pins
+// a message the chat ALREADY rendered (the per-turn activity/status message,
+// the `🛠 Worker` message), never a new parallel surface, never with a device
+// buzz. Opt OUT per agent via channels.telegram.pin_status_while_working: false
+// (→ this env). See status-pin.ts / status-pin-driver.ts and
+// `reference/invariants.md` § chat-is-the-single-source-of-truth.
+const PIN_STATUS_WHILE_WORKING = (() => {
+  const raw = process.env.SWITCHROOM_TG_PIN_STATUS_WHILE_WORKING
+  if (raw == null) return true // default ON
+  const v = raw.trim().toLowerCase()
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no')
+})()
+
+// ─── Status-pin: single-owner state + reconcile ────────────────────────────
+// EXACTLY ONE owner of pin state. Every desired-state change for a key routes
+// through `reconcileStatusPin`, which computes ONE action (pin|unpin|noop) via
+// the pure `decidePinAction` and executes it through `reconcilePin` (which
+// drops the claim on unpin even if the API throws — so pin state can never get
+// stuck). Two desired-state sources feed distinct keys:
+//   - foreground: `fg:<statusKey>` — pinned while the per-turn activity message
+//     is in-flight; unpinned at the canonical turn-end (purgeReactionTracking).
+//   - background: `wk:<agentId>`   — pinned while the `🛠 Worker` message runs;
+//     unpinned on that worker's completion (worker-feed finish).
+// It does NOT touch the reply / stream_reply send handlers (the v1 bug was send
+// handlers unconditionally unpinning on every send) and runs NO polling
+// watchdog / getChat().pinned_message reconciler.
+const statusPinState = new Map<string, PinState>()
+// Companion registry: pinKey → chatId, so the pre-restart sweep can unpin
+// owned pins without threading the chat id through every call site. Written on
+// every desired-pinned reconcile, cleared alongside the state on unpin.
+const statusPinChatIds = new Map<string, string>()
+
+// The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
+// lazily so this helper can be declared alongside the state it owns.
+function statusPinApi(): PinBotApi {
+  return {
+    pinChatMessage: (chat_id, message_id, opts) =>
+      robustApiCall(
+        () => lockedBot.api.pinChatMessage(chat_id, message_id, opts),
+        { chat_id: String(chat_id), verb: 'status-pin.pin' },
+      ),
+    unpinChatMessage: (chat_id, message_id) =>
+      robustApiCall(
+        () => lockedBot.api.unpinChatMessage(chat_id, message_id),
+        { chat_id: String(chat_id), verb: 'status-pin.unpin' },
+      ),
+  }
+}
+
+/**
+ * The single entry point that mutates pin state for `pinKey`. Serialises
+ * nothing itself — callers fire-and-forget; the pure decision + drop-on-unpin
+ * contract keep state consistent. No-op when the feature is disabled.
+ */
+async function reconcileStatusPin(
+  pinKey: string,
+  chatId: string,
+  desired: DesiredPin,
+): Promise<void> {
+  if (!PIN_STATUS_WHILE_WORKING) return
+  if (chatId.length === 0) return
+  const prev = statusPinState.get(pinKey) ?? null
+  const next = await reconcilePin({
+    api: statusPinApi(),
+    chatId,
+    prevState: prev,
+    desired,
+    onError: (phase, err) => {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(
+        `telegram gateway: status-pin ${phase} failed (key=${pinKey} chat=${chatId}): ${msg}\n`,
+      )
+    },
+  })
+  if (next == null) {
+    statusPinState.delete(pinKey)
+    statusPinChatIds.delete(pinKey)
+  } else {
+    statusPinState.set(pinKey, next)
+    statusPinChatIds.set(pinKey, chatId)
+  }
+}
+
+/**
+ * Background-worker desired-pin, driven off the live `🛠 Worker` message.
+ * Reads the worker feed's current message_id (the EXISTING message — we pin
+ * what the feed already rendered, never a new send) and reconciles a silent
+ * pin while it's running / an unpin on completion. No-op until the feed has
+ * actually painted a message for this worker (trivial sub-second workers stay
+ * silent and are never pinned). Keyed `wk:<agentId>`.
+ */
+function reconcileWorkerPin(
+  agentId: string,
+  chatId: string | null,
+  running: boolean,
+): void {
+  if (!PIN_STATUS_WHILE_WORKING) return
+  const key = `wk:${agentId}`
+  if (!running) {
+    // Unpin: recover the chat we pinned in (caller may not have it at
+    // completion). No-op when nothing was pinned for this worker.
+    const unpinChat = chatId ?? statusPinChatIds.get(key)
+    if (unpinChat == null) return
+    void reconcileStatusPin(key, unpinChat, { pinned: false })
+    return
+  }
+  if (chatId == null) return
+  const messageId = workerActivityFeed?.messageIdOf(agentId) ?? null
+  if (messageId == null) return // no message painted yet — nothing to pin
+  void reconcileStatusPin(key, chatId, { pinned: true, messageId })
+}
+
+/** Unpin every owned status pin — used by the pre-restart sweep so a
+ *  crash / interrupt never leaves a permanent pin behind. Best-effort;
+ *  clears the claim regardless of the unpin outcome (drop-on-unpin). */
+async function unpinAllStatusPins(): Promise<void> {
+  const keys = [...statusPinState.keys()]
+  for (const key of keys) {
+    const st = statusPinState.get(key)
+    if (st == null) continue
+    // Recover the chat id from the state map's companion key registry.
+    const chatId = statusPinChatIds.get(key)
+    if (chatId == null) { statusPinState.delete(key); continue }
+    await reconcileStatusPin(key, chatId, { pinned: false })
+  }
+}
 
 // Activity feed. The gateway streams a live "what it's doing" tool-activity
 // feed for every turn. The PreToolUse sidecar emits a `tool_label` per tool
@@ -11575,6 +11720,16 @@ async function drainActivitySummary(
           )
           turn.activityMessageId = sent.message_id
           turn.activityEverOpened = true
+          // Status-pin: the per-turn status message just opened — it's the
+          // in-flight "what it's doing" surface. Silently pin it so the turn
+          // stays in view when the feed scrolls past. Keyed to the same
+          // status-key the canonical turn-end (purgeReactionTracking) unpins.
+          // Fire-and-forget; the single-owner reconcile keeps state consistent.
+          void reconcileStatusPin(
+            `fg:${statusKey(chat, thread)}`,
+            chat,
+            { pinned: true, messageId: sent.message_id },
+          )
         } else {
           const id = turn.activityMessageId
           await robustApiCall(
@@ -15890,6 +16045,15 @@ async function sweepBeforeSelfRestart(): Promise<void> {
   const agentDir = resolveAgentDirFromEnv()
   if (agentDir == null) return
   // #1122 PR3: pre-restart progress-card pin sweep removed with the card.
+  // Status-pin: unpin every status pin we own before we hand control to the
+  // restart, so a crash / interrupt / config-bounce never leaves a permanent
+  // pin stuck at the top of the chat. Best-effort; the drop-on-unpin contract
+  // clears the claim even if the API throws.
+  try {
+    await unpinAllStatusPins()
+  } catch (err) {
+    process.stderr.write(`telegram gateway: pre-restart status-pin sweep threw: ${(err as Error).message}\n`)
+  }
   try {
     await sweepActiveReactions(
       agentDir,
@@ -24805,6 +24969,8 @@ void (async () => {
                       elapsedMs: durationMs,
                       state: outcome === 'failed' ? 'failed' : 'done',
                     })
+                    // Status-pin: worker done — drop its pin.
+                    reconcileWorkerPin(agentId, null, false)
                   }
                   return
                 }
@@ -24822,6 +24988,8 @@ void (async () => {
                     elapsedMs: durationMs,
                     state: outcome === 'failed' ? 'failed' : 'done',
                   })
+                  // Status-pin: worker done — drop its pin.
+                  reconcileWorkerPin(agentId, null, false)
                 }
 
                 const handbackOrigin = resolveSubagentOriginChat(agentId)
@@ -24949,9 +25117,10 @@ void (async () => {
                   })
                   if (surface === 'worker-feed') {
                     const origin = resolveSubagentOriginChat(agentId)
+                    const wkChat = origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? '')
                     void workerActivityFeed?.update(
                       agentId,
-                      origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
+                      wkChat,
                       {
                         description: dispatch.feedDescription,
                         lastTool,
@@ -24961,7 +25130,7 @@ void (async () => {
                         state: 'running',
                       },
                       origin?.threadId,
-                    )
+                    )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
                     return
                   }
                   if (surface !== 'nest') return // 'skip' — orphan-status off
@@ -25083,9 +25252,10 @@ void (async () => {
                 // is gone — see resolveSubagentOriginChat).
                 if (workerFeedEnabled) {
                   const origin = resolveSubagentOriginChat(agentId)
+                  const wkChat = origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? '')
                   void workerActivityFeed?.update(
                     agentId,
-                    origin?.chatId || fleetChatId || (loadAccess().allowFrom[0] ?? ''),
+                    wkChat,
                     {
                       description: dispatch.feedDescription,
                       lastTool,
@@ -25095,7 +25265,7 @@ void (async () => {
                       state: 'running',
                     },
                     origin?.threadId,
-                  )
+                  )?.then(() => reconcileWorkerPin(agentId, wkChat, true))
                   return
                 }
 

@@ -248,6 +248,10 @@ function extractRetryAfterSecs(err: unknown): number | null {
 export interface WorkerActivityFeed {
   /** True if a message is currently posted for this worker. */
   has(agentId: string): boolean
+  /** The Telegram message_id currently posted for this worker, or null if
+   *  none is posted (never painted, or dropped after a stale-edit re-post).
+   *  Lets the gateway pin the EXISTING `🛠 Worker` message (status-pin). */
+  messageIdOf(agentId: string): number | null
   /** Push a running-state cue. Returns the serialized op for tests. */
   update(
     agentId: string,
@@ -441,6 +445,9 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   return {
     has(agentId) {
       return handles.get(agentId)?.messageId != null
+    },
+    messageIdOf(agentId) {
+      return handles.get(agentId)?.messageId ?? null
     },
     get size() {
       return handles.size

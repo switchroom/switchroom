@@ -160,6 +160,21 @@ describe("TelegramChannelSchema.clear_status_on_completion", () => {
   });
 });
 
+describe("TelegramChannelSchema.pin_status_while_working", () => {
+  it("accepts true / false and round-trips the boolean", () => {
+    expect(TelegramChannelSchema.parse({ pin_status_while_working: true })?.pin_status_while_working).toBe(true);
+    expect(TelegramChannelSchema.parse({ pin_status_while_working: false })?.pin_status_while_working).toBe(false);
+  });
+
+  it("is optional — unset stays undefined (gateway default-on owns it)", () => {
+    expect(TelegramChannelSchema.parse({ bot_token: "vault:x" })?.pin_status_while_working).toBeUndefined();
+  });
+
+  it("rejects a non-boolean", () => {
+    expect(() => TelegramChannelSchema.parse({ pin_status_while_working: "yes" })).toThrow();
+  });
+});
+
 describe("ScheduleEntrySchema.secrets", () => {
   it("accepts a list of valid vault key names", () => {
     const result = ScheduleEntrySchema.parse({
