@@ -78,6 +78,18 @@ describe("TelegramChannelSchema — voice_out (PR-C2)", () => {
     ).toThrow();
   });
 
+  it("accepts the on-demand reply_mode (Listen button)", () => {
+    const r = TelegramChannelSchema.parse({
+      voice_out: { enabled: true, reply_mode: "on-demand" },
+    });
+    expect(r?.voice_out?.reply_mode).toBe("on-demand");
+  });
+
+  it("keeps voice+text as the reply_mode default", () => {
+    const r = TelegramChannelSchema.parse({ voice_out: { enabled: true } });
+    expect(r?.voice_out?.reply_mode).toBe("voice+text");
+  });
+
   it("rejects an unknown reply_mode", () => {
     expect(() =>
       TelegramChannelSchema.parse({ voice_out: { reply_mode: "text-only" } }),
