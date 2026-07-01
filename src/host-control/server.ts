@@ -206,8 +206,11 @@ export interface RolloutNarrator {
  * Per-request status snapshot retained for `get_status` lookups.
  * Capped at the most recent N requests per daemon process; entries
  * older than the cap age get evicted lazily.
+ *
+ * Exported (#2726) so the RolloutNarrator can read the terminal fields when
+ * finalizing the in-chat narration surface.
  */
-interface StatusEntry {
+export interface StatusEntry {
   request_id: string;
   caller: SocketIdentity;
   op: string;
@@ -2586,10 +2589,18 @@ export class HostdServer {
       })
       .finally(() => {
         void this.writeTerminalAudit(entry);
-        // #2726 — terminal effects. All fire-and-forget: a chat push / narrator
-        // finalize must NEVER block the lock release or the roll's completion.
+        // #2726 — terminal effects. All fire-and-forget and defensively
+        // wrapped: a chat push / narrator finalize must NEVER block the lock
+        // release or the roll's completion (a throwing narrator/relay can't
+        // strand the fleet-mutation lock).
         this.pushRolloutTerminal(entry);
-        this.rolloutNarrator?.onTerminal(entry);
+        try {
+          this.rolloutNarrator?.onTerminal(entry);
+        } catch (e) {
+          process.stderr.write(
+            `hostd: rollout narrator onTerminal threw (non-fatal): ${(e as Error).message}\n`,
+          );
+        }
         if (
           this.fleetMutationInFlight &&
           this.fleetMutationInFlight.request_id === entry.request_id
@@ -2950,7 +2961,15 @@ export class HostdServer {
     void this.writePhaseAudit(entry, phase);
     // Part 2 hook — attached only when a narration renderer is wired. Kept as
     // an optional member so Part 1 is mergeable alone (no renderer → no-op).
-    this.rolloutNarrator?.onPhase(entry, phase);
+    // Defensively wrapped: a throwing narrator must not break the stdout tap
+    // (and thus lose subsequent durable phase rows).
+    try {
+      this.rolloutNarrator?.onPhase(entry, phase);
+    } catch (e) {
+      process.stderr.write(
+        `hostd: rollout narrator onPhase threw (non-fatal): ${(e as Error).message}\n`,
+      );
+    }
   }
 
   /**

@@ -28,6 +28,8 @@ import { allocateAgentUid } from "../agents/compose.js";
 import { HostdServer } from "./server.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
 import { SocketRolloutRelay } from "./rollout-relay.js";
+import { SocketRolloutNarrationRelay } from "./rollout-narration-relay.js";
+import { LogTailRolloutNarrator } from "./rollout-narrator.js";
 import { ReleaseWatcher } from "./release-watcher.js";
 import {
   makeReleaseCheck,
@@ -90,6 +92,20 @@ async function main(): Promise<void> {
     log: (m) => process.stderr.write(`hostd: rollout-relay — ${m}\n`),
   });
 
+  // #2726 Part 2 — the log-tailed in-chat narration surface. hostd tails its
+  // OWN durable rollout rows (it is fed each phase as it parses the child's
+  // stdout) and edits ONE ordinary operator-DM message through the phases —
+  // NOT pinned, NOT a bespoke card. The narrator holds no lifecycle state a
+  // gateway restart could orphan; edits are fire-and-forget, monotonic,
+  // debounced, frozen-on-terminal, and 429-handled gateway-side.
+  const rolloutNarrator = new LogTailRolloutNarrator(
+    new SocketRolloutNarrationRelay({
+      resolveGatewaySocket,
+      log: (m) => process.stderr.write(`hostd: rollout-narration — ${m}\n`),
+    }),
+    { log: (m) => process.stderr.write(`hostd: rollout-narration — ${m}\n`) },
+  );
+
   const server = new HostdServer({
     homeDir: homedir(),
     agentUids,
@@ -115,6 +131,7 @@ async function main(): Promise<void> {
     },
     approvalGateway,
     rolloutRelay,
+    rolloutNarrator,
   });
   await server.start();
 
