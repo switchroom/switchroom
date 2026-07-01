@@ -370,6 +370,14 @@ import {
   obligationEscalationText,
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
+import {
+  loadStatusPins,
+  persistStatusPins,
+  pinnedMessageIsOurs,
+  runStatusPinBootCleanup,
+  type PersistedStatusPin,
+  type TrackedStatusPin,
+} from './status-pin-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { createInboundSpool } from './inbound-spool.js'
@@ -1008,7 +1016,7 @@ type Access = {
     enabled?: boolean
     engine?: 'kokoro' | 'openai'
     voice?: string
-    reply_mode?: 'voice+text' | 'voice-only'
+    reply_mode?: 'voice+text' | 'voice-only' | 'on-demand'
     /** Kokoro-engine playback speed. Clamped to 0.5–2.0; defaults to 1.1
      *  when voice_out is enabled but speed is unset (the fleet default —
      *  slightly brisker than neutral). Ignored by the OpenAI path. */
@@ -5599,6 +5607,36 @@ const statusPinState = new Map<string, PinState>()
 // every desired-pinned reconcile, cleared alongside the state on unpin.
 const statusPinChatIds = new Map<string, string>()
 
+// Durable snapshot of the pin claim set on the persistent per-agent volume
+// (STATE_DIR = /state/agent/telegram in prod). Closes the crash hole: the
+// in-memory Maps alone empty on restart, so a status pin left dangling by a
+// crashed session is never unpinned and the service-message-deletion handler
+// can't recognise it as ours. Every reconcile persists the current claim set;
+// boot cleanup (statusPinBootCleanup, wired after lockedBot is defined) unpins
+// each persisted entry and clears the store. STATIC mode and feature-off skip
+// disk. Mirrors obligation-store.ts.
+const STATUS_PIN_STORE_PATH = join(STATE_DIR, 'status-pins.json')
+const statusPinStoreFs = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
+}
+const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
+
+// Snapshot the live claim set and write it through. Called on every reconcile
+// (pin/unpin) so the on-disk set always mirrors the in-memory Maps.
+function persistStatusPinSnapshot(): void {
+  if (!statusPinPersistEnabled) return
+  const snapshot: PersistedStatusPin[] = []
+  for (const [pinKey, state] of statusPinState) {
+    const chatId = statusPinChatIds.get(pinKey)
+    if (chatId == null) continue
+    snapshot.push({ pinKey, chatId, messageId: state.messageId })
+  }
+  persistStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs, snapshot)
+}
+
 // The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
 // lazily so this helper can be declared alongside the state it owns.
 function statusPinApi(): PinBotApi {
@@ -5615,6 +5653,40 @@ function statusPinApi(): PinBotApi {
       ),
   }
 }
+
+/**
+ * Boot-time orphan cleanup — thin gateway wrapper over the pure
+ * `runStatusPinBootCleanup` (which owns the load → best-effort-unpin →
+ * empty-store contract). Binds the live fs seam, the robust unpin api, and the
+ * gateway logger.
+ *
+ * MUST run ONLY after this gateway wins the startup mutex (the store is a
+ * shared per-agent file; a losing double-boot would unpin the live holder's
+ * legitimate pins). Runs before any new pin claim is written, so the emptied
+ * store leaves the service-message handler's ownership check with no false
+ * positives.
+ */
+async function statusPinBootCleanup(): Promise<void> {
+  if (!statusPinPersistEnabled) return
+  const api = statusPinApi()
+  const { cleared, total } = await runStatusPinBootCleanup({
+    path: STATUS_PIN_STORE_PATH,
+    fs: statusPinStoreFs,
+    unpin: (chatId, messageId) => api.unpinChatMessage(chatId, messageId),
+  })
+  if (total > 0) {
+    process.stderr.write(
+      `telegram gateway: status-pin: cleared ${cleared}/${total} ` +
+        `orphaned pin(s) from a prior session\n`,
+    )
+  }
+}
+// NOTE: statusPinBootCleanup() is deliberately NOT invoked here at import time.
+// The status-pin store is a SHARED per-agent file, and cleanup issues real
+// unpinChatMessage calls. On a double-boot the losing gateway must NOT touch
+// that shared state — its unpins would strip pins the STILL-ALIVE holder
+// legitimately owns. So the call is gated on winning the startup mutex
+// (top-level await below); see the acquireStartupLock block.
 
 /**
  * The single entry point that mutates pin state for `pinKey`. Serialises
@@ -5648,6 +5720,10 @@ async function reconcileStatusPin(
     statusPinState.set(pinKey, next)
     statusPinChatIds.set(pinKey, chatId)
   }
+  // Mirror the mutation to disk (pin → present, unpin → removed) so a crash
+  // before the next unpin can't strand the pin — boot cleanup unpins whatever
+  // survives here. Wired exactly like obligationStore's onChange.
+  persistStatusPinSnapshot()
 }
 
 /**
@@ -5841,6 +5917,12 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     process.stderr.write(
       `telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS}\n`,
     )
+    // We WON the startup mutex — this gateway is the sole live owner of the
+    // shared per-agent status-pin store, so it's now safe to clean up orphaned
+    // pins from a prior (dead) session. Gated here (not at import time) so a
+    // LOSING double-boot never unpins the live holder's legitimate pins.
+    // Fire-and-forget: cleanup is best-effort and must not block boot.
+    void statusPinBootCleanup()
   } catch (err) {
     process.stderr.write(
       `telegram gateway: boot.lock_acquire_failed err=${(err as Error).message} agent=${SWITCHROOM_AGENT_NAME}\n`,
@@ -5852,6 +5934,11 @@ function ensureIssuesCard(chatId: string, threadId: number | undefined): void {
     try {
       writePidFile(GATEWAY_PID_PATH, { pid: process.pid, startedAtMs: GATEWAY_STARTED_AT_MS })
       process.stderr.write(`telegram gateway: wrote PID file ${GATEWAY_PID_PATH} pid=${process.pid} startedAt=${GATEWAY_STARTED_AT_MS} (mutex-fallback)\n`)
+      // Mutex was unavailable (link() unsupported fs); the legacy pid-file
+      // probe + 409-retry loop is still the liveness guard on this path. A
+      // successful writePidFile here means no live holder was detected, so
+      // running orphan cleanup is consistent with the pre-mutex behaviour.
+      void statusPinBootCleanup()
     } catch (writeErr) {
       process.stderr.write(`telegram gateway: writePidFile failed: ${writeErr}\n`)
     }
@@ -22290,7 +22377,7 @@ bot.on('callback_query:data', async ctx => {
     }
     try {
       // Native voice note (NOT a document), quote-replying the button's
-      // message. Keyboard is left intact so the button stays replayable.
+      // message.
       await robustApiCall(
         () =>
           bot.api.sendVoice(
@@ -22308,6 +22395,26 @@ bot.on('callback_query:data', async ctx => {
           ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
         },
       )
+      // Single-use on SUCCESS: strip the '🔊 Listen' keyboard so the button
+      // can't be re-tapped now that the audio has been delivered. Mirrors the
+      // agent-button single_use strip (keyboardIsSingleUse) house style.
+      // Best-effort + non-fatal — a failed strip only leaves a replayable
+      // button, never drops the delivered audio. Only reached on a successful
+      // sendVoice; expiry / synth-failure / sidecar-unavailable all return
+      // earlier WITHOUT stripping, so the user can retry those.
+      if (cbMessageId != null) {
+        await robustApiCall(
+          () =>
+            bot.api.editMessageReplyMarkup(cbChatId, cbMessageId, {
+              reply_markup: { inline_keyboard: [] },
+            }),
+          {
+            chat_id: cbChatId,
+            verb: 'voice-ondemand.strip-listen-keyboard',
+            ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+          },
+        ).catch(() => {})
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(
@@ -23500,6 +23607,66 @@ bot.on('message:checklist_tasks_done' as Parameters<typeof bot.on>[0], (ctx) => 
 
 bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) => {
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
+})
+
+// Suppress the "pinned a message" service message Telegram inserts when OUR
+// silent status-pin fires. The pin call passes `disable_notification: true`,
+// which kills the PUSH notification but NOT the in-chat service message — so
+// delete that service message as it lands, but ONLY for pins we own (tracked
+// in `statusPinState`). Manual/operator pins are never silent and are never
+// touched. Only silent status pins reach here as an OUR-pin match, so the
+// ownership check is the guard.
+//
+// Race tolerance: the service update can arrive before `reconcileStatusPin`
+// has stored the new PinState (the pin API call resolves, Telegram emits the
+// service message, and only then does the reconcile write the Map). A single
+// short retry covers that window; if it's still not one of ours, we leave the
+// service message alone.
+bot.on('message:pinned_message', async ctx => {
+  const pinnedId = ctx.msg.pinned_message?.message_id
+  if (pinnedId == null) return
+  const chatId = String(ctx.chat.id)
+  const serviceMsgId = ctx.msg.message_id
+
+  // Chat-scoped ownership (see pinnedMessageIsOurs): the match requires BOTH
+  // the messageId AND that the tracked entry lives in THIS chat, so a pin id
+  // colliding across chats can't delete a foreign (e.g. operator-manual) pin
+  // notice. statusPinChatIds is the companion pinKey→chatId map written on
+  // every desired-pinned reconcile.
+  const trackedPins = (): TrackedStatusPin[] => {
+    const out: TrackedStatusPin[] = []
+    for (const [pinKey, state] of statusPinState) {
+      const c = statusPinChatIds.get(pinKey)
+      if (c != null) out.push({ chatId: c, messageId: state.messageId })
+    }
+    return out
+  }
+  const isOurs = () => pinnedMessageIsOurs(trackedPins(), chatId, pinnedId)
+
+  if (!isOurs()) {
+    // Tolerate the reconcile-store race: wait briefly, then re-check once.
+    await new Promise(resolve => setTimeout(resolve, 250))
+    if (!isOurs()) return
+  }
+
+  try {
+    await robustApiCall(
+      () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
+      { chat_id: chatId, verb: 'status-pin.delete-service-message' },
+    )
+  } catch (err) {
+    // Best-effort: a failure to delete the service message is cosmetic only —
+    // the "pinned a message" line just stays. The most likely cause in a
+    // supergroup/forum is the bot lacking can_delete_messages admin right, so
+    // surface a concise one-liner (robustApiCall rethrows this case without
+    // logging a reason) rather than swallowing silently — an operator sees WHY.
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `telegram gateway: status-pin: could not delete pin service message ` +
+        `(chat=${chatId} msg=${serviceMsgId}) — likely missing can_delete_messages ` +
+        `admin right in this chat: ${msg}\n`,
+    )
+  }
 })
 
 // ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
