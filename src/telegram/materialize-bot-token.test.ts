@@ -164,6 +164,41 @@ describe("materializeBotToken (issue #758)", () => {
     expect(brokerStub.fn).not.toHaveBeenCalled();
   });
 
+  // ── Regression: single-key isolation (voice token bug class) ──
+  //
+  // resolveVaultReferencesViaBroker fails the WHOLE batch unless EVERY vault:
+  // ref resolves. If the materializer passes the full config, admin-only refs
+  // elsewhere (litellm/master-key, google/client-secret) — correctly DENIED to
+  // a normal agent — would sink the resolution even though the bot_token key is
+  // granted. The fix passes a MINIMAL config carrying only the one ref. This
+  // asserts the broker sees exactly ONE vault ref, regardless of other refs in
+  // the config.
+  it("passes the broker a config containing exactly one vault ref (isolated from admin-only refs)", async () => {
+    let seenRefs: string[] = [];
+    brokerStub.fn.mockImplementationOnce(async (cfg: SwitchroomConfig) => {
+      const refs = new Set<string>();
+      const walk = (v: unknown): void => {
+        if (typeof v === "string" && v.startsWith("vault:")) refs.add(v.slice("vault:".length).split("#")[0]);
+        else if (Array.isArray(v)) v.forEach(walk);
+        else if (v !== null && typeof v === "object") Object.values(v as Record<string, unknown>).forEach(walk);
+      };
+      walk(cfg);
+      seenRefs = [...refs];
+      return { ok: true, config: makeConfig("123456:RESOLVED") };
+    });
+
+    const config = {
+      ...makeConfig("vault:tg/bot"),
+      litellm: { admin_key: "vault:litellm/master-key" },
+      google_workspace: { google_client_secret: "vault:google/client-secret" },
+      agents: { klanker: { some_key: "vault:per-agent/secret" } },
+    } as unknown as SwitchroomConfig;
+
+    const token = await materializeBotToken({ config, env: {} });
+    expect(token).toBe("123456:RESOLVED");
+    expect(seenRefs).toEqual(["tg/bot"]);
+  });
+
   it("BotTokenMaterializeError exports for instanceof checks", () => {
     const e = new BotTokenMaterializeError("x", "locked");
     expect(e).toBeInstanceOf(Error);
