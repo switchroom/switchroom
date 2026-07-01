@@ -370,6 +370,11 @@ import {
   obligationEscalationText,
 } from './obligation-ledger.js'
 import { loadObligations, persistObligations } from './obligation-store.js'
+import {
+  loadStatusPins,
+  persistStatusPins,
+  type PersistedStatusPin,
+} from './status-pin-store.js'
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { createInboundSpool } from './inbound-spool.js'
@@ -5599,6 +5604,36 @@ const statusPinState = new Map<string, PinState>()
 // every desired-pinned reconcile, cleared alongside the state on unpin.
 const statusPinChatIds = new Map<string, string>()
 
+// Durable snapshot of the pin claim set on the persistent per-agent volume
+// (STATE_DIR = /state/agent/telegram in prod). Closes the crash hole: the
+// in-memory Maps alone empty on restart, so a status pin left dangling by a
+// crashed session is never unpinned and the service-message-deletion handler
+// can't recognise it as ours. Every reconcile persists the current claim set;
+// boot cleanup (statusPinBootCleanup, wired after lockedBot is defined) unpins
+// each persisted entry and clears the store. STATIC mode and feature-off skip
+// disk. Mirrors obligation-store.ts.
+const STATUS_PIN_STORE_PATH = join(STATE_DIR, 'status-pins.json')
+const statusPinStoreFs = {
+  readFileSync: (p: string) => readFileSync(p, 'utf8'),
+  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  renameSync: (a: string, b: string) => renameSync(a, b),
+  existsSync: (p: string) => existsSync(p),
+}
+const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
+
+// Snapshot the live claim set and write it through. Called on every reconcile
+// (pin/unpin) so the on-disk set always mirrors the in-memory Maps.
+function persistStatusPinSnapshot(): void {
+  if (!statusPinPersistEnabled) return
+  const snapshot: PersistedStatusPin[] = []
+  for (const [pinKey, state] of statusPinState) {
+    const chatId = statusPinChatIds.get(pinKey)
+    if (chatId == null) continue
+    snapshot.push({ pinKey, chatId, messageId: state.messageId })
+  }
+  persistStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs, snapshot)
+}
+
 // The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
 // lazily so this helper can be declared alongside the state it owns.
 function statusPinApi(): PinBotApi {
@@ -5615,6 +5650,44 @@ function statusPinApi(): PinBotApi {
       ),
   }
 }
+
+/**
+ * Boot-time orphan cleanup. Any pin persisted by a PRIOR session is stale by
+ * definition — the turn it represented ended or the session crashed before its
+ * unpin reconcile ran. So on boot we best-effort unpin each persisted entry and
+ * clear the store; we do NOT re-adopt or re-pin. This must run BEFORE any new
+ * pin claims are written, so the freshly-emptied store reflects only this
+ * session's pins and the service-message-deletion handler's ownership check
+ * (statusPinState) sees no false positives. Non-fatal: a failed unpin only
+ * leaves the orphan, exactly today's behaviour.
+ */
+async function statusPinBootCleanup(): Promise<void> {
+  if (!statusPinPersistEnabled) return
+  const persisted = loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
+  if (persisted.length === 0) return
+  const api = statusPinApi()
+  let cleared = 0
+  for (const pin of persisted) {
+    try {
+      await api.unpinChatMessage(pin.chatId, pin.messageId)
+      cleared++
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(
+        `telegram gateway: status-pin boot cleanup: unpin failed ` +
+          `(chat=${pin.chatId} msg=${pin.messageId}): ${msg}\n`,
+      )
+    }
+  }
+  // Empty the store regardless — these claims belong to a dead session; leaving
+  // them would re-attempt the same (already-tried) unpins on every future boot.
+  persistStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs, [])
+  process.stderr.write(
+    `telegram gateway: status-pin: cleared ${cleared}/${persisted.length} ` +
+      `orphaned pin(s) from a prior session\n`,
+  )
+}
+void statusPinBootCleanup()
 
 /**
  * The single entry point that mutates pin state for `pinKey`. Serialises
@@ -5648,6 +5721,10 @@ async function reconcileStatusPin(
     statusPinState.set(pinKey, next)
     statusPinChatIds.set(pinKey, chatId)
   }
+  // Mirror the mutation to disk (pin → present, unpin → removed) so a crash
+  // before the next unpin can't strand the pin — boot cleanup unpins whatever
+  // survives here. Wired exactly like obligationStore's onChange.
+  persistStatusPinSnapshot()
 }
 
 /**
