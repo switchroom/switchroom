@@ -1008,7 +1008,7 @@ type Access = {
     enabled?: boolean
     engine?: 'kokoro' | 'openai'
     voice?: string
-    reply_mode?: 'voice+text' | 'voice-only'
+    reply_mode?: 'voice+text' | 'voice-only' | 'on-demand'
     /** Kokoro-engine playback speed. Clamped to 0.5–2.0; defaults to 1.1
      *  when voice_out is enabled but speed is unset (the fleet default —
      *  slightly brisker than neutral). Ignored by the OpenAI path. */
