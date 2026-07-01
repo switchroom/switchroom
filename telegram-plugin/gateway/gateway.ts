@@ -23502,6 +23502,44 @@ bot.on('message:checklist_tasks_added' as Parameters<typeof bot.on>[0], (ctx) =>
   handleChecklistUpdate(ctx as unknown as Context, 'checklist_tasks_added')
 })
 
+// Suppress the "pinned a message" service message Telegram inserts when OUR
+// silent status-pin fires. The pin call passes `disable_notification: true`,
+// which kills the PUSH notification but NOT the in-chat service message — so
+// delete that service message as it lands, but ONLY for pins we own (tracked
+// in `statusPinState`). Manual/operator pins are never silent and are never
+// touched. Only silent status pins reach here as an OUR-pin match, so the
+// ownership check is the guard.
+//
+// Race tolerance: the service update can arrive before `reconcileStatusPin`
+// has stored the new PinState (the pin API call resolves, Telegram emits the
+// service message, and only then does the reconcile write the Map). A single
+// short retry covers that window; if it's still not one of ours, we leave the
+// service message alone.
+bot.on('message:pinned_message', async ctx => {
+  const pinnedId = ctx.msg.pinned_message?.message_id
+  if (pinnedId == null) return
+  const chatId = String(ctx.chat.id)
+  const serviceMsgId = ctx.msg.message_id
+
+  const isOurs = () =>
+    [...statusPinState.values()].some(s => s.messageId === pinnedId)
+
+  if (!isOurs()) {
+    // Tolerate the reconcile-store race: wait briefly, then re-check once.
+    await new Promise(resolve => setTimeout(resolve, 250))
+    if (!isOurs()) return
+  }
+
+  try {
+    await robustApiCall(
+      () => lockedBot.api.deleteMessage(chatId, serviceMsgId),
+      { chat_id: chatId, verb: 'status-pin.delete-service-message' },
+    )
+  } catch {
+    // Best-effort: a failure to delete the service message is cosmetic only.
+  }
+})
+
 // ─── Reaction-trigger runtime state (#1074) ──────────────────────────────
 //
 // Bot-message reactions in the configured allowlist trigger a synthetic
