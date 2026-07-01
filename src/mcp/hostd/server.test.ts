@@ -512,9 +512,10 @@ describe("dispatchTool — config_propose_edit", () => {
   it("uses a long wire timeout (outlasting the operator approval window)", async () => {
     // Root cause of the 2026-06-15 klanker debacle: the MCP wire used a
     // flat 10s for every op, but config_propose_edit BLOCKS server-side
-    // until the operator taps (up to ~10 min). A 10s wire times out by
-    // construction → the agent re-fires → phantom stacked cards. The
-    // wire must outlast the approval window.
+    // until the operator taps (up to ~60 min after the approval-card
+    // timeout raise). A 10s wire times out by construction → the agent
+    // re-fires → phantom stacked cards. The wire must outlast the
+    // approval window.
     hostdRequestMock.mockResolvedValueOnce(ok({ result: "completed" }));
     await dispatchTool("config_propose_edit", {
       unified_diff: VALID_DIFF,
@@ -522,9 +523,9 @@ describe("dispatchTool — config_propose_edit", () => {
       target_path: "/state/config/switchroom.yaml",
     });
     const wireOpts = hostdRequestMock.mock.calls[0]![0] as { timeoutMs: number };
-    expect(wireOpts.timeoutMs).toBe(11 * 60 * 1000);
-    // And it must comfortably exceed the daemon's 10-min approval window.
-    expect(wireOpts.timeoutMs).toBeGreaterThan(10 * 60 * 1000);
+    expect(wireOpts.timeoutMs).toBe(61 * 60 * 1000);
+    // And it must comfortably exceed the daemon's 60-min approval window.
+    expect(wireOpts.timeoutMs).toBeGreaterThan(60 * 60 * 1000);
   });
 
   it("leaves the snappy default wire timeout on prompt-returning ops", async () => {

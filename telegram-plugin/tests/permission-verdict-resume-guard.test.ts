@@ -65,11 +65,30 @@ const dispatchCallsites = LINES.flatMap((line, i) =>
 const isSilentNoCardVerdict = (idx: number): boolean =>
   LINES.slice(Math.max(0, idx - 3), idx + 1).some((l) => /no-card-verdict/.test(l))
 
+// A CARD-FOLDED-RESUME path (the "Allow once" tap, card-ux fix 3) does NOT
+// post a separate `postPermissionResumeMessage()` — the agent-voiced "got it,
+// continuing: <work>" line is folded INTO the same card edit (below the ✅
+// label) via `finalizeCallback`, collapsing the old split second message. The
+// turn still resumes (`dispatchPermissionVerdict` + `resumeReactionAfterVerdict`
+// both fire) and the operator still sees the continuation — it just rides the
+// tapped card instead of fanning out to every card target. Such callsites carry
+// the `card-folded-resume` sentinel within the RESUME_WINDOW below the dispatch
+// and are exempt ONLY from the post-message pairing (still required to flip the
+// glyph). The invariant the guard protects (a verdict that un-parks a card must
+// visibly resume it) still holds — the resume is in the card body.
+const isCardFoldedResume = (idx: number): boolean =>
+  LINES.slice(idx, idx + POST_WINDOW + 1).some((l) => /card-folded-resume/.test(l))
+
 // How far below the dispatch the resume call is allowed to live. The
 // widest real gap today is ~9 lines (the slash-command path); 15 gives
 // refactor headroom without letting an unrelated resume "cover" a
 // dispatch from a different block.
 const RESUME_WINDOW = 15
+
+// postPermissionResumeMessage rides ~1–2 lines after resumeReactionAfterVerdict
+// on every path, so it can sit a touch further from the dispatch than the
+// resume call — give it a little more headroom.
+const POST_WINDOW = 20
 
 describe('permission verdict → resume reaction wiring', () => {
   it('there is at least one verdict-dispatch path to guard', () => {
@@ -102,15 +121,13 @@ describe('permission verdict → resume reaction wiring', () => {
     )
   })
 
-  // postPermissionResumeMessage rides ~1–2 lines after resumeReactionAfterVerdict
-  // on every path, so it can sit a touch further from the dispatch than the
-  // resume call — give it a little more headroom.
-  const POST_WINDOW = 20
-
-  it('every dispatchPermissionVerdict() callsite posts the agent-voiced resume message via postPermissionResumeMessage()', () => {
+  it('every dispatchPermissionVerdict() callsite posts the agent-voiced resume message via postPermissionResumeMessage() or folds it into the card', () => {
     const unpaired: number[] = []
     for (const idx of dispatchCallsites) {
       if (isSilentNoCardVerdict(idx)) continue
+      // Exempt: card-ux fix 3 folds the resume line into the card edit
+      // instead of a separate message (still visibly resumes the operator).
+      if (isCardFoldedResume(idx)) continue
       const window = LINES.slice(idx, idx + POST_WINDOW + 1).join('\n')
       if (!/\bpostPermissionResumeMessage\s*\(/.test(window)) {
         unpaired.push(idx + 1)

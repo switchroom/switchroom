@@ -95,11 +95,13 @@ import {
   duplicateDenyMessage,
   isRecentTimeoutDuplicate,
   PERMISSION_TTL_MS,
+  approvalTtlMs,
   ttlForTool,
   buildTimedOutCardEdits,
   STALE_TAP_NOTICE,
   type PermissionCardRef,
 } from './permission-timeout.js'
+import { renderVaultRequestAccessCard } from './vault-request-access-card.js'
 import { createPermissionCardStore } from './permission-card-store.js'
 import { pickRecoveredPermissionOrigin } from './permission-card-origin.js'
 import { isTelegramReplyTool, isTelegramSurfaceTool } from '../tool-names.js'
@@ -4744,7 +4746,10 @@ interface PendingVaultRequestSave {
   staged_at: number
 }
 const pendingVaultRequestSaves = new Map<string, PendingVaultRequestSave>()
-const VAULT_REQUEST_SAVE_TTL_MS = 10 * 60 * 1000
+// Gateway-side reap window for a staged vault-save card. Tracks the operator
+// approval-card lifetime (config-driven, 60-min default) so the reap never
+// races ahead of the card the operator is still looking at.
+const VAULT_REQUEST_SAVE_TTL_MS = approvalTtlMs()
 function sweepPendingVaultRequestSaves(): void {
   const cutoff = Date.now() - VAULT_REQUEST_SAVE_TTL_MS
   for (const [k, v] of pendingVaultRequestSaves) {
@@ -4789,7 +4794,9 @@ interface PendingVaultRequestAccess {
   staged_at: number
 }
 const pendingVaultRequestAccesses = new Map<string, PendingVaultRequestAccess>()
-const VAULT_REQUEST_ACCESS_TTL_MS = 10 * 60 * 1000
+// Gateway-side reap window for a staged vault-access card. Tracks the operator
+// approval-card lifetime (config-driven, 60-min default) — see approvalTtlMs.
+const VAULT_REQUEST_ACCESS_TTL_MS = approvalTtlMs()
 function sweepPendingVaultRequestAccesses(): void {
   const cutoff = Date.now() - VAULT_REQUEST_ACCESS_TTL_MS
   for (const [k, v] of pendingVaultRequestAccesses) {
@@ -11014,31 +11021,6 @@ function buildVaultRequestAccessKeyboard(stageId: string): { inline_keyboard: Ar
       ],
     ],
   }
-}
-
-function renderVaultRequestAccessCard(req: PendingVaultRequestAccess): string {
-  const lines: string[] = []
-  const scopeLabel = req.scope === 'write' ? 'write' : 'read'
-  const days = Math.round(req.ttl_seconds / 86400)
-  const durationLabel = days >= 1 ? `${days}d` : `${Math.round(req.ttl_seconds / 3600)}h`
-  lines.push(`🔐 **${escapeHtmlForTg(req.agent)}** wants vault access`)
-  lines.push(`key: \`${req.key}\``)
-  lines.push(`scope: \`${scopeLabel}\` · duration: \`${durationLabel}\``)
-  // #1790 — always render the why-line, even when the agent omitted
-  // `reason`. Rendering "not provided" makes a missing rationale
-  // visibly an agent-side failure (the tool description nudges the
-  // model to supply one — see executeVaultRequestAccess); skipping
-  // the line silently used to make the omission look like a card-
-  // template choice, which the operator couldn't tell apart from a
-  // legitimate "no reason needed" case.
-  if (req.reason && req.reason.length > 0) {
-    lines.push(`why: _${escapeHtmlForTg(req.reason)}_`)
-  } else {
-    lines.push(`why: _not provided_`)
-  }
-  lines.push('')
-  lines.push(`_Tap Approve to mint a scoped grant token (same flow as \`switchroom vault grant\`). Tap Deny to refuse — the agent will receive a denial result._`)
-  return lines.join('\n')
 }
 
 /**
@@ -22717,6 +22699,25 @@ bot.on('callback_query:data', async ctx => {
   const baseText = msg && 'text' in msg && msg.text
     ? escapeHtmlForTg(msg.text)
     : ''
+  // NO SPLIT (#card-ux): the agent-voiced "got it, continuing: <action>"
+  // continuation folds into THIS card edit — below the verdict label — instead
+  // of spawning a separate message. formatPermissionResumeMessage returns the
+  // same GFM markdown the standalone message used, so the wording is
+  // unchanged; it just rides in the card the operator already tapped. The
+  // separate message went to EVERY resolvePermissionCardTargets() surface; the
+  // in-place edit deliberately touches only the tapped card (a single, legible
+  // card, no fan-out). The turn-resume trigger (dispatchPermissionVerdict) is
+  // untouched below — only the USER-VISIBLE second message collapses. Honours
+  // the SWITCHROOM_RESUME_MSG=0 kill-switch (suppresses the continuation line,
+  // as it suppressed the separate message before).
+  const resumeLine = process.env.SWITCHROOM_RESUME_MSG === '0'
+    ? ''
+    : formatPermissionResumeMessage({
+        agentName: process.env.SWITCHROOM_AGENT_NAME ?? null,
+        behavior: behavior as 'allow' | 'deny',
+        action: resumeAction,
+      })
+  const labelWithResume = resumeLine ? `${htmlLabel}\n\n${resumeLine}` : htmlLabel
   // #1150 audit: P0 fix — was `editMessageText` WITHOUT reply_markup
   // strip, leaving the [Allow][Deny][Always] keyboard live after the
   // decision. Operator could re-tap and flip Deny → Allow after the
@@ -22724,7 +22725,7 @@ bot.on('callback_query:data', async ctx => {
   // strips the keyboard atomically with the status-line edit.
   await finalizeCallback(ctx, {
     ackText: ackText.slice(0, 200),
-    newText: baseText ? `${baseText}\n\n${htmlLabel}` : htmlLabel,
+    newText: baseText ? `${baseText}\n\n${labelWithResume}` : labelWithResume,
     synthInbound: () => {
       // No `rule` → the bridge does NOT cache this (truly once on the bridge);
       // any 30-min stickiness lives only in scopedGrants (recorded above).
@@ -22736,10 +22737,11 @@ bot.on('callback_query:data', async ctx => {
       // Un-park the status reaction: 🙏 → working, re-arming the stall
       // watchdog that setAwaiting() suspended.
       resumeReactionAfterVerdict()
-      postPermissionResumeMessage({
-        behavior: behavior as 'allow' | 'deny',
-        action: resumeAction,
-      })
+      // card-folded-resume: the visible "continuing…" line is folded into the
+      // card edit above (labelWithResume), so we deliberately do NOT
+      // postPermissionResumeMessage here — that would re-introduce the split
+      // second message this fix (card-ux fix 3) removes. The turn still resumes
+      // via dispatchPermissionVerdict + resumeReactionAfterVerdict above.
     },
   })
 })

@@ -1680,6 +1680,12 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.deferred_completion_timeout_ms !== undefined) {
     out.SWITCHROOM_TG_DEFERRED_COMPLETION_TIMEOUT_MS = String(tg.deferred_completion_timeout_ms);
   }
+  // Operator approval-card lifetime (minutes) → ms for the plugin's
+  // PERMISSION_TTL_MS / vault-request reaps. Only emit when explicitly set so
+  // the plugin's built-in 60-min default owns the unset case.
+  if (tg.approval_timeout_minutes !== undefined) {
+    out.SWITCHROOM_TG_APPROVAL_TIMEOUT_MS = String(tg.approval_timeout_minutes * 60_000);
+  }
   if (tg.sub_agent_tick_interval_ms !== undefined) {
     out.SWITCHROOM_TG_SUB_AGENT_TICK_INTERVAL_MS = String(tg.sub_agent_tick_interval_ms);
   }

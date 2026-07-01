@@ -129,6 +129,6 @@ export function ttlMsFromToken(token: string): number | null {
  * (content there is literal). The only character that can prematurely close
  * the span is a backtick, so split it with a zero-width space.
  */
-function codeSpanSafe(s: string): string {
+export function codeSpanSafe(s: string): string {
   return s.replace(/`/g, "`​");
 }

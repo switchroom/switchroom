@@ -861,6 +861,19 @@ export const TelegramChannelSchema = z
         "card is force-closed after this many ms even if sub-agents never " +
         "finish. Watcher-disconnect safety net. Default 180000 (3 min)."
       ),
+    approval_timeout_minutes: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Operator approval-card lifetime (minutes) for the tool-use 'Allow " +
+        "once' card and the vault grant decision wait. After this long with " +
+        "no operator tap, the card auto-denies (a TIMEOUT, not a denial — the " +
+        "agent is told not to retry). Default 60. hostd-gated verbs " +
+        "(mcp__hostd__*) keep their own longer window; the hostd " +
+        "config-propose card is not governed by this key."
+      ),
     sub_agent_tick_interval_ms: z
       .number()
       .int()
