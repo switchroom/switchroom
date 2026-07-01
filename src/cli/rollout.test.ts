@@ -651,6 +651,34 @@ describe("rollout phase sentinel", () => {
     expect(parseRolloutPhaseLine(resultLine)).toBeNull();
   });
 
+  it("adversarial embed: a phase field value carrying a newline + RESULT sentinel does NOT corrupt the terminal parse", () => {
+    // The no-terminal-parse-corruption property is safe TODAY because
+    // RolloutPhase has no free-text field. This test LOCKS it: if a future
+    // field ever carried attacker/free-text and someone embedded the terminal
+    // sentinel in it, the encoded phase line must STILL never parse as the
+    // terminal RESULT sentinel. encodeRolloutPhaseLine JSON-encodes the value,
+    // so a literal newline becomes `\n` and the embedded `RESULT:{...}` stays
+    // inside the JSON string on the single phase line — the line still starts
+    // with the PHASE sentinel, and parseRolloutResultLine anchors on
+    // startsWith(RESULT_SENTINEL), so it returns null.
+    const evil = "\n" + ROLLOUT_RESULT_SENTINEL + '{"ok":true,"rolled":["pwned"],"warnings":[]}';
+    const line = encodeRolloutPhaseLine({ phase: "apply", target: evil });
+    // The phase line is a SINGLE line (the newline was escaped, not literal).
+    expect(line.includes("\n")).toBe(false);
+    // The terminal parser must not be fooled — it returns null.
+    expect(parseRolloutResultLine(line)).toBeNull();
+    // And the phase parser round-trips the (escaped) value faithfully.
+    expect(parseRolloutPhaseLine(line)?.phase).toBe("apply");
+
+    // Belt-and-braces: even if such a line were split on newlines (as a reader
+    // tailing stdout would), no resulting fragment starts with the RESULT
+    // sentinel as a standalone parseable line — the sentinel sits mid-JSON,
+    // prefixed by the phase sentinel + JSON quoting, never at line-start.
+    for (const frag of line.split("\n")) {
+      expect(parseRolloutResultLine(frag)).toBeNull();
+    }
+  });
+
   it("round-trips a phase with agent/n/m", () => {
     const phase: RolloutPhase = {
       phase: "agent-start",

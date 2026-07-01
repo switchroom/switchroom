@@ -75,6 +75,16 @@ export interface RolloutNarrationRelay {
  *  that the operator still sees live progress. */
 const DEFAULT_DEBOUNCE_MS = 1500;
 
+/**
+ * HARD ceiling on post() calls per request — the anti-re-post-storm cap. Two
+ * attempts is enough: the initial first-contact post, plus one reserved retry
+ * on the terminal phase for a genuinely-missed initial post (so the operator
+ * still gets a final ✅/❌). Anything beyond that would be duplicate operator
+ * DMs on a roll where the relay gateway is flaky/being-recreated — worse than
+ * silence, and the durable audit log is the record either way.
+ */
+const MAX_POST_ATTEMPTS = 2;
+
 /** Per-request narration state. */
 interface NarrationState {
   agentName: string;
@@ -82,8 +92,24 @@ interface NarrationState {
   lastAppliedSeq: number;
   /** The message_id once the first post lands; null until then. */
   messageId: number | null;
-  /** True once the first post has been dispatched (so we don't double-post). */
+  /** True while a post() is in flight (so we don't double-post). */
   posting: boolean;
+  /**
+   * Total post() calls dispatched for this request — the HARD ceiling against
+   * a re-post storm. A post() that resolves null (gateway restarted mid-roll,
+   * or the rollout_status_posted reply timed out at 5s while the send actually
+   * reached Telegram) leaves messageId null; without this cap every subsequent
+   * phase would re-enter the post branch → ~one duplicate DM per agent. Capped
+   * at MAX_POST_ATTEMPTS.
+   */
+  postAttempts: number;
+  /**
+   * True once a post() resolved null. We then STOP re-posting on every phase
+   * (edits are impossible without a messageId anyway) and back off, reserving
+   * at most one final post attempt on the terminal phase so a genuinely-missed
+   * post still yields a final ✅/❌ message.
+   */
+  postFailed: boolean;
   /** The latest render state (rebuilt as phases arrive). */
   render: RolloutRenderState;
   /** Frozen once the terminal row is applied — no later edit may un-finalize. */
@@ -153,9 +179,15 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
 
       // Monotonic gate. seqFor already folds the roll-order index `n` into the
       // timeline, so a strictly-earlier phase (stale / out-of-order) drops.
-      // `<=` would drop the -done of a phase whose -start shares the window on
-      // the persist-pin/canary co-timing edge, so use strict `<` to let an
-      // equal-seq transition through (it only ever refines the same window).
+      //
+      // The comparison is strict `<` ON PURPOSE — do NOT "fix" it to `<=`.
+      // Equal-seq is REFINE-ONLY: two phases can share a seq window and the
+      // later one refines the earlier (canary-pass refines canary-start at
+      // seq=3; persist-pin co-times with canary-done). Letting an equal-seq
+      // phase through applies that refinement. This relies on hostd feeding
+      // phases in stdout order (the roll emits them in order), so an equal-seq
+      // pair always arrives newest-last; `<=` would wrongly DROP the refining
+      // phase and freeze the surface on the coarser one.
       const seq = LogTailRolloutNarrator.seqFor(phase);
       if (seq < st.lastAppliedSeq) return; // stale — drop.
       st.lastAppliedSeq = seq;
@@ -215,6 +247,8 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         lastAppliedSeq: -1,
         messageId: null,
         posting: false,
+        postAttempts: 0,
+        postFailed: false,
         render: { target: entry.pin ?? "" },
         frozen: false,
         timer: null,
@@ -231,36 +265,74 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
     if (!st) return;
     if (st.agentName.length === 0) return; // operator-initiated / unknown — no relay target.
 
-    // First contact: POST the message (async), capture the message_id.
-    if (st.messageId === null && !st.posting) {
-      st.posting = true;
-      const text = renderRolloutStatus(st.render);
-      void this.relay
-        .post({ requestId, agentName: st.agentName, text })
-        .then((mid) => {
-          st.messageId = mid;
-          st.posting = false;
-          // If phases arrived while we were posting, apply the latest now.
-          if (st.pendingEditAfterPost) {
-            st.pendingEditAfterPost = false;
-            this.flush(requestId, /* immediate */ false);
-          }
-        })
-        .catch((e) => {
-          st.posting = false;
-          this.opts.log?.(`rollout narration post failed (non-fatal): ${(e as Error).message}`);
-        });
+    // Have a message_id → debounce a trailing-edge edit. This is the steady
+    // state for every phase after the first successful post.
+    if (st.messageId !== null) {
+      this.scheduleDebouncedEdit(requestId);
       return;
     }
 
-    // Post in flight — remember to apply the newest render once it lands.
-    if (st.messageId === null && st.posting) {
+    // Post in flight → remember to apply the newest render once it lands.
+    if (st.posting) {
       st.pendingEditAfterPost = true;
       return;
     }
 
-    // We have a message_id: debounce a trailing-edge edit.
-    this.scheduleDebouncedEdit(requestId);
+    // messageId is null and no post in flight. First contact posts once. A
+    // LATER phase does NOT re-post here — tryPost's cap + postFailed back-off
+    // suppress the re-post storm (a null-returning relay would otherwise fire
+    // one post per phase). A genuinely-missed post is re-attempted only on the
+    // terminal phase (see flush(immediate) → tryPost with terminal=true).
+    if (st.postFailed) return; // backed off — wait for the terminal retry.
+    this.tryPost(requestId, /* terminal */ false);
+  }
+
+  /**
+   * Dispatch a single post() under the anti-storm cap. Fire-and-forget: the
+   * post promise is never awaited by the roll. Honors:
+   *   - MAX_POST_ATTEMPTS: a hard ceiling on total post() calls per request.
+   *   - postFailed: a null resolution sets it so phase-driven re-posts stop;
+   *     `terminal` callers may still spend one reserved attempt.
+   * Returns true when a post was actually dispatched.
+   */
+  private tryPost(requestId: string, terminal: boolean): boolean {
+    const st = this.states.get(requestId);
+    if (!st) return false;
+    if (st.messageId !== null || st.posting) return false;
+    if (st.postAttempts >= MAX_POST_ATTEMPTS) return false;
+    // After a failed post, only the terminal flush is allowed to re-attempt —
+    // an in-flight phase must not keep re-posting.
+    if (st.postFailed && !terminal) return false;
+    st.posting = true;
+    st.postAttempts += 1;
+    const text = renderRolloutStatus(st.render);
+    void this.relay
+      .post({ requestId, agentName: st.agentName, text })
+      .then((mid) => {
+        st.posting = false;
+        if (mid === null) {
+          // Post failed (or the reply timed out). Back off phase-driven
+          // re-posts; the durable audit log remains the record.
+          st.postFailed = true;
+          this.opts.log?.(
+            `rollout narration post returned no message_id (requestId=${requestId}); backing off re-posts`,
+          );
+          return;
+        }
+        st.messageId = mid;
+        st.postFailed = false;
+        // If phases arrived while we were posting, apply the latest now.
+        if (st.pendingEditAfterPost) {
+          st.pendingEditAfterPost = false;
+          this.flush(requestId, /* immediate */ false);
+        }
+      })
+      .catch((e) => {
+        st.posting = false;
+        st.postFailed = true;
+        this.opts.log?.(`rollout narration post failed (non-fatal): ${(e as Error).message}`);
+      });
+    return true;
   }
 
   private scheduleDebouncedEdit(requestId: string): void {
@@ -284,28 +356,21 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
       this.scheduleDebouncedEdit(requestId);
       return;
     }
-    const text = renderRolloutStatus(st.render);
     if (st.messageId === null) {
-      // No message yet (terminal fired before the first phase posted, or the
-      // post is still in flight). Post now if we're not mid-post.
-      if (!st.posting) {
-        st.posting = true;
-        void this.relay
-          .post({ requestId, agentName: st.agentName, text })
-          .then((mid) => {
-            st.messageId = mid;
-            st.posting = false;
-          })
-          .catch((e) => {
-            st.posting = false;
-            this.opts.log?.(`rollout narration terminal-post failed (non-fatal): ${(e as Error).message}`);
-          });
-      } else {
+      // No message yet (terminal fired before the first phase posted, the post
+      // is still in flight, or an earlier post failed). An immediate flush is
+      // the terminal path — spend one reserved post attempt (tryPost enforces
+      // MAX_POST_ATTEMPTS and the postFailed back-off). If a post is in flight,
+      // remember to apply the newest render once it lands.
+      if (st.posting) {
         st.pendingEditAfterPost = true;
+        return;
       }
+      this.tryPost(requestId, /* terminal */ true);
       return;
     }
     // Edit in place (fire-and-forget; relay swallows failures incl. 429).
+    const text = renderRolloutStatus(st.render);
     this.relay.edit({
       requestId,
       agentName: st.agentName,

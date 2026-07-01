@@ -196,11 +196,67 @@ describe("LogTailRolloutNarrator", () => {
     n.onPhase(entry, phase("apply"));
     await vi.runAllTimersAsync();
     expect(relay.posts).toHaveLength(1);
-    // A later phase can't edit (no message_id) — it re-attempts a post instead,
-    // never throws.
+    // A later phase can't edit (no message_id) and, because the first post
+    // FAILED, it does NOT immediately re-post — it backs off (see the bounded-
+    // storm test). No edit is dispatched (nothing to edit).
     n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 2 }));
     await vi.advanceTimersByTimeAsync(500);
     expect(relay.edits).toHaveLength(0);
+    expect(relay.posts).toHaveLength(1); // still bounded — no re-post storm.
+  });
+
+  it("BOUNDS post() calls across a 12-agent roll when every post resolves null (no re-post storm)", async () => {
+    // Realistic during a fleet roll: the relay gateway is being recreated, so
+    // post() keeps resolving null (or the rollout_status_posted reply times out
+    // while the send actually landed). messageId stays null. A naive impl
+    // re-enters the post branch on EVERY phase → ~one duplicate DM per agent.
+    const relay = makeRelay(null);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 200 });
+    const entry = makeEntry();
+
+    // apply + canary(start/pass) + 11 more agents (start/done each) = a busy roll.
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+    n.onPhase(entry, phase("canary-start", { agent: "a1", n: 1, m: 12 }));
+    n.onPhase(entry, phase("canary-pass", { agent: "a1", n: 1, m: 12 }));
+    await vi.runAllTimersAsync();
+    for (let i = 2; i <= 12; i++) {
+      n.onPhase(entry, phase("agent-start", { agent: `a${i}`, n: i, m: 12 }));
+      n.onPhase(entry, phase("agent-done", { agent: `a${i}`, n: i, m: 12 }));
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    // Then the terminal — one reserved retry is allowed.
+    n.onTerminal(makeEntry({ result: "completed", rolled: [] }));
+    await vi.runAllTimersAsync();
+
+    // BOUNDED: at most MAX_POST_ATTEMPTS (2) posts total across the whole roll,
+    // NOT one-per-phase (~14). No duplicate-DM storm.
+    expect(relay.posts.length).toBeLessThanOrEqual(2);
+    // No edits either (never got a message_id to edit).
+    expect(relay.edits).toHaveLength(0);
+  });
+
+  it("succeeds on a delayed post: first post null, edits skipped, terminal re-post lands", async () => {
+    // A relay that fails the FIRST post but succeeds the reserved terminal one.
+    const relay = makeRelay(null);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 200 });
+    const entry = makeEntry();
+    n.onPhase(entry, phase("apply"));
+    await vi.runAllTimersAsync();
+    expect(relay.posts).toHaveLength(1); // failed
+
+    // Several phases: no re-post (backed off).
+    n.onPhase(entry, phase("agent-start", { agent: "a", n: 1, m: 3 }));
+    n.onPhase(entry, phase("agent-done", { agent: "a", n: 1, m: 3 }));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(relay.posts).toHaveLength(1); // still just the one failed attempt
+
+    // Terminal: relay now succeeds → exactly one reserved retry lands the final.
+    relay.nextMessageId = 500;
+    n.onTerminal(makeEntry({ result: "completed", rolled: ["a", "b", "c"] }));
+    await vi.runAllTimersAsync();
+    expect(relay.posts).toHaveLength(2); // initial (failed) + terminal (ok)
+    expect(relay.posts.at(-1)!.text).toContain("✅");
   });
 
   it("does nothing for an operator-initiated roll (no agent gateway target)", async () => {
