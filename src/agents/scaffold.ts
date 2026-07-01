@@ -1692,6 +1692,13 @@ function channelsToEnv(agent: AgentConfig): Record<string, string> {
   if (tg.clear_status_on_completion !== undefined) {
     out.SWITCHROOM_TG_CLEAR_STATUS_ON_COMPLETION = tg.clear_status_on_completion ? "1" : "0";
   }
+  // Whether to SILENTLY pin the already-rendered status message while its
+  // work is in-flight (and auto-unpin on completion). Default ON in the
+  // gateway; only emit the env when explicitly set so the gateway's
+  // default-on parse owns the unset case. See status-pin.ts.
+  if (tg.pin_status_while_working !== undefined) {
+    out.SWITCHROOM_TG_PIN_STATUS_WHILE_WORKING = tg.pin_status_while_working ? "1" : "0";
+  }
   // Linear capture default team (#2312) — only needed for multi-team
   // workspaces, where the create tool can't auto-resolve. Single-team
   // workspaces leave this unset and the tool resolves the only team.

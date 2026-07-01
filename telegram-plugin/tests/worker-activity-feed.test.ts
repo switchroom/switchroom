@@ -276,6 +276,24 @@ describe('createWorkerActivityFeed', () => {
     expect(feed.has('w1')).toBe(true)
   })
 
+  it('messageIdOf exposes the posted message id (for status-pin) and is null before paint / after finish', async () => {
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, firstPaintMinMs: 8000 })
+    // Before paint: no message, no id to pin.
+    clock = 5000
+    await feed.update('w1', 'chat', view({ elapsedMs: 5000 }))
+    expect(feed.messageIdOf('w1')).toBeNull()
+    // After paint: id is the posted message the gateway pins.
+    clock = 9000
+    await feed.update('w1', 'chat', view({ elapsedMs: 9000 }))
+    // The fake mints message ids starting at 1000; first paint → 1000.
+    expect(feed.messageIdOf('w1')).toBe(1000)
+    // After finish: handle is dropped → null (gateway unpins independently).
+    await feed.finish('w1', view({ state: 'done' }))
+    expect(feed.messageIdOf('w1')).toBeNull()
+  })
+
   it('dedups an identical body (no edit)', async () => {
     const bot = makeFakeBot()
     let clock = 10_000

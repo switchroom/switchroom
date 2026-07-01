@@ -30,7 +30,9 @@
  * - Robust error handling: 429 retry, thread-not-found fallback, network retry
  * - SQLite history buffer (history.ts) for cross-restart recovery
  * - Vault-grant inline-keyboard wizard
- * - Pinned progress card with sub-agent visibility
+ * - Live in-conversation status feed with sub-agent visibility (the pinned
+ *   progress card was retired in #1122; the status message is now a regular
+ *   in-chat message, silently pinned while in-flight — status-pin.ts)
  *
  * State (access.json / pairing / allowlists) lives at
  * ~/.claude/channels/telegram/ — managed by the /telegram:access skill.

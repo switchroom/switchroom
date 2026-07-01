@@ -13,9 +13,12 @@
  * does not yet exist (Phase 2 Pre hook hasn't fired), the update is a no-op
  * and the event is logged — no INSERT here, identity belongs to Phase 2.
  *
- * Sub-agent state is surfaced to the user via the progress card's
- * [Sub-agents · N running] block (progress-card.ts), not a separate pinned
- * card. See issue #142.
+ * Sub-agent state is surfaced to the user in the conversation itself — a
+ * background worker via its in-chat `🛠 Worker` message (worker-activity-feed.ts),
+ * a foreground sub-agent nested in the parent turn's activity message. The
+ * pinned progress card was retired in #1122; the `🛠 Worker` message is now
+ * silently pinned while the worker runs (status-pin.ts), not a bespoke card.
+ * See issue #142.
  *
  * Architecture notes:
  *   - Option B from the spec: filesystem-driven, no IPC contract.

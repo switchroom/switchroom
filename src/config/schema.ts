@@ -785,6 +785,21 @@ export const TelegramChannelSchema = z
         "(its last step marked done) — no post-then-delete. Per-agent " +
         "override; cascades defaults → profile → agent (per-key)."
       ),
+    pin_status_while_working: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true (default), the framework SILENTLY pins the already-" +
+        "rendered status message while its work is in-flight and auto-unpins " +
+        "it on completion — the per-turn activity/status message (foreground) " +
+        "and the '🛠 Worker' background-worker message. Keeps in-flight work " +
+        "in view when the conversation scrolls past it (fast turns, stacked " +
+        "background workers, long turns). No new surface is rendered; it pins " +
+        "a message the chat already owns. The pin never buzzes the device. " +
+        "The ONE sanctioned pin under chat-is-the-single-source-of-truth. " +
+        "Set false to disable. Per-agent override; cascades defaults → " +
+        "profile → agent (per-key)."
+      ),
     hotReloadStable: z
       .boolean()
       .optional()
