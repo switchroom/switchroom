@@ -251,6 +251,9 @@ export default defineConfig({
       // here, run via test:bun.
       "**/telegram-plugin/tests/voice-normalize-text.test.ts",
       "**/telegram-plugin/tests/voice-out-one-send.test.ts",
+      // voice-ondemand.test.ts uses bun:test (on-demand 🔊 Listen button) —
+      // excluded here, run via test:bun.
+      "**/telegram-plugin/tests/voice-ondemand.test.ts",
       // telegraph.test.ts uses bun:test (#579 Telegraph Instant View) —
       // excluded here, run via test:bun.
       "**/telegram-plugin/tests/telegraph.test.ts",

@@ -941,14 +941,22 @@ export const TelegramChannelSchema = z
           "default when omitted.",
         ),
         reply_mode: z
-          .enum(["voice+text", "voice-only"])
+          .enum(["voice+text", "voice-only", "on-demand"])
           .default("voice+text")
           .describe(
             "How the spoken reply accompanies the text. 'voice+text' sends " +
             "both the normal text reply and a voice note; 'voice-only' sends " +
-            "the voice note and suppresses the text body. In either mode the " +
-            "text reply is ALWAYS still sent when synthesis fails or the reply " +
-            "exceeds max_chars — the user's answer is never dropped silently.",
+            "the voice note and suppresses the text body. 'on-demand' sends " +
+            "the text reply with a single '🔊 Listen' inline button and " +
+            "synthesizes NO audio until the user taps it — zero GPU/sidecar " +
+            "work unless requested, which keeps the voice pipeline " +
+            "subscription-honest and visible (nothing is generated behind the " +
+            "user's back). The Listen button is injected ONLY when the reply " +
+            "carries no agent-authored buttons, to avoid colliding with the " +
+            "single_use keyboard-strip that protects agent buttons from " +
+            "double-fire. In every mode the text reply is ALWAYS still sent " +
+            "when synthesis fails or the reply exceeds max_chars — the user's " +
+            "answer is never dropped silently.",
           ),
         max_chars: z.number().int().positive().optional().describe(
           "Per-voice-note chunk size (chars). Default 600; clamped to the " +
