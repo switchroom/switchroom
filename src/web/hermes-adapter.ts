@@ -384,14 +384,12 @@ function startHistoryPoll(
 
         for (const row of rows) {
           cursor = row.rowid;
-          // If there's a pending prompt.submit, use that prompt_key so Hermes
-          // resolves the spinner. Otherwise synthesise a new start+complete pair
-          // (Telegram-originated reply the user didn't trigger from Hermes).
-          const promptKey = ctx.pendingPromptKey ?? `tg-${row.rowid}`;
-          if (!ctx.pendingPromptKey) {
+          // Claim the pending prompt.submit key FOR THIS SESSION if present, else
+          // synthesise a fresh start+complete pair for a Telegram-originated reply.
+          const { promptKey, needsStart } = claimPromptKey(ctx, sessionId, row.rowid);
+          if (needsStart) {
             sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
           }
-          ctx.pendingPromptKey = undefined;
           sendEvent(ctx, "message.complete", sessionId, {
             text: row.text,
             prompt_key: promptKey,
@@ -797,11 +795,45 @@ export interface HermesWsContext {
   /** Stop function for the history.db background poller — called on session change or close. */
   stopHistoryPoll?: () => void;
   /**
-   * prompt_key from the most recent prompt.submit that hasn't yet been resolved by
-   * a message.complete. The history poller claims this key for the first new assistant
-   * message so the response resolves the correct pending spinner in Hermes.
+   * Pending prompt_keys, keyed by session_id. Each entry is the prompt_key from
+   * the most recent prompt.submit for that session that hasn't yet been resolved
+   * by a message.complete. The per-session history poller claims only its own
+   * session's key for the first new assistant message, so a submit to a
+   * non-activated session — or two rapid submits to different sessions — can't
+   * cross-claim each other's spinner in Hermes. Lazily initialised.
    */
-  pendingPromptKey?: string;
+  pendingPromptKeys?: Map<string, string>;
+}
+
+/** Get-or-create the per-session pending-prompt-key map on a WS context. */
+export function pendingPromptKeys(ctx: HermesWsContext): Map<string, string> {
+  return (ctx.pendingPromptKeys ??= new Map<string, string>());
+}
+
+/**
+ * Resolve the prompt_key for a freshly-observed assistant reply on `sessionId`.
+ * If that session has a pending prompt.submit, claim (and consume) its key so
+ * Hermes resolves the correct spinner; the caller must NOT emit a message.start
+ * in that case (Hermes already showed one at submit time). Otherwise synthesise
+ * a fresh `tg-<rowid>` key for a Telegram-originated reply and signal that a
+ * message.start is needed.
+ *
+ * Keying by sessionId is the isolation guarantee: a pending submit on session B
+ * never gets claimed by session A's reply, and two rapid submits to different
+ * sessions can't cross-claim. Exported for unit testing.
+ */
+export function claimPromptKey(
+  ctx: HermesWsContext,
+  sessionId: string,
+  rowid: number,
+): { promptKey: string; needsStart: boolean } {
+  const keys = pendingPromptKeys(ctx);
+  const pending = keys.get(sessionId);
+  if (pending !== undefined) {
+    keys.delete(sessionId);
+    return { promptKey: pending, needsStart: false };
+  }
+  return { promptKey: `tg-${rowid}`, needsStart: true };
 }
 
 function sendEvent(ctx: HermesWsContext, type: string, sessionId: string | null, payload: unknown) {
@@ -1013,11 +1045,12 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
 
       sendEvent(ctx, "message.start", sessionId, { prompt_key: promptKey });
       // Record so the history poller uses this key when the agent's reply lands.
-      ctx.pendingPromptKey = promptKey;
+      // Keyed by sessionId so a submit to another session can't cross-claim it.
+      pendingPromptKeys(ctx).set(sessionId, promptKey);
 
       const result = await injectInbound(agentsDir, submitAgent, chat.chatId, chat.threadId, content, promptKey);
       if (!result.ok) {
-        ctx.pendingPromptKey = undefined;
+        pendingPromptKeys(ctx).delete(sessionId);
         sendEvent(ctx, "error", sessionId, { message: result.error, prompt_key: promptKey });
         sendResponse(ctx, rpcErr(id, -32603, result.error ?? "inject failed"));
         break;
