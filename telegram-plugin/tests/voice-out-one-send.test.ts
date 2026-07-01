@@ -16,7 +16,17 @@
 
 import { describe, it, expect } from 'bun:test'
 import { normalizeForSpeech } from '../voice-normalize-text.js'
-import { synthesizeViaSidecar } from '../voice-synthesize-sidecar.js'
+import { synthesizeViaSidecar, clampTtsSpeed } from '../voice-synthesize-sidecar.js'
+
+/** The fleet default speed the gateway applies when voice_out is enabled but
+ *  speed is unset (mirrors VOICE_OUT_DEFAULT_SPEED in gateway.ts). */
+const VOICE_OUT_DEFAULT_SPEED = 1.1
+
+/** Reproduce resolveVoiceOutPlan's speed resolution: default to 1.1 when
+ *  unset, clamp to 0.5–2.0. */
+function resolveSpeed(speed: number | undefined): number {
+  return clampTtsSpeed(speed, VOICE_OUT_DEFAULT_SPEED)
+}
 
 const OGG_BYTES = new Uint8Array([0x4f, 0x67, 0x67, 0x53]) // OggS magic
 
@@ -101,5 +111,43 @@ describe('voice-out kokoro path — ONE synth call, ONE sendVoice', () => {
       sendVoiceCalls++ // gateway: one sendVoice per ogg
     }
     expect(sendVoiceCalls).toBe(1)
+  })
+})
+
+describe('voice-out kokoro path — speed resolution (gateway default 1.1)', () => {
+  it('defaults to 1.1 when voice_out.speed is unset', () => {
+    expect(resolveSpeed(undefined)).toBe(1.1)
+  })
+
+  it('honours an explicit in-range speed', () => {
+    expect(resolveSpeed(0.9)).toBe(0.9)
+    expect(resolveSpeed(1.5)).toBe(1.5)
+  })
+
+  it('clamps an out-of-range configured speed to 0.5–2.0', () => {
+    expect(resolveSpeed(3.0)).toBe(2.0)
+    expect(resolveSpeed(0.1)).toBe(0.5)
+  })
+
+  it('threads the resolved speed into the single /tts body', async () => {
+    let sentSpeed: number | undefined
+    const capturingFetch = (async (_url: string, init: RequestInit) => {
+      sentSpeed = (JSON.parse(init.body as string) as { speed?: number }).speed
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => OGG_BYTES.buffer.slice(0),
+        text: async () => '',
+        headers: new Headers(),
+      }
+    }) as unknown as typeof fetch
+
+    await synthesizeViaSidecar({
+      token: 't',
+      text: 'hello there',
+      speed: resolveSpeed(undefined), // gateway default path
+      fetchImpl: capturingFetch,
+    })
+    expect(sentSpeed).toBe(1.1)
   })
 })
