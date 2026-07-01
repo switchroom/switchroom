@@ -67,11 +67,25 @@ RUN apt-get update \
 # `kokoro` package for an inference-only sidecar. Pinned for a reproducible
 # image; Dependabot bumps it. The Kokoro weights themselves are NOT baked in
 # — they're fetched on first boot into /models (see server.py:_load_tts).
+# GPU TTS: kokoro-onnx depends on plain `onnxruntime` (CPU-only) by default,
+# which pins Kokoro to the CPU (providers = [CPUExecutionProvider]) even on a
+# CUDA host — the confirmed root cause of slow synth. We uninstall that CPU
+# wheel and install `onnxruntime-gpu` instead so the ONNX/TTS path can use
+# CUDAExecutionProvider (server.py builds the InferenceSession with an
+# explicit CUDA->CPU provider list + graceful fallback). onnxruntime-gpu 1.20.x
+# is built for CUDA 12.x + cuDNN 9, matching this image's
+# nvidia/cuda:12.4.1-cudnn-runtime base — no extra CUDA libs are needed
+# (STT/CTranslate2 already proves CUDA 12 + cuDNN 9 runtime are present).
+# Installing onnxruntime-gpu AFTER kokoro-onnx replaces the transitively-pulled
+# CPU onnxruntime with the GPU build (same import name, so kokoro-onnx picks it
+# up unchanged). Dependabot bumps all four pins.
 RUN pip3 install --no-cache-dir \
         "faster-whisper==1.0.3" \
         "huggingface_hub==0.25.2" \
         "requests==2.32.3" \
-        "kokoro-onnx==0.5.0"
+        "kokoro-onnx==0.5.0" \
+    && pip3 uninstall -y onnxruntime \
+    && pip3 install --no-cache-dir "onnxruntime-gpu==1.20.1"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
