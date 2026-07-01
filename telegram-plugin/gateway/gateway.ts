@@ -412,6 +412,7 @@ import { dispatchEffects, isDispatchEnabled } from './inbound-delivery-machine-d
 import { maybeFireWarmup } from './prefix-warmup.js'
 import {
   buildVaultGrantApprovedInbound,
+  buildVaultGrantApprovedCardText,
   buildVaultGrantDeniedInbound,
   buildVaultSaveCompletedInbound,
   buildVaultSaveFailedInbound,
@@ -19468,9 +19469,16 @@ async function performVaultAccessApproval(
       .editMessageText(
         pending.chat_id,
         pending.card_message_id,
-        `✅ Granted **${escapeHtmlForTg(pending.agent)}** ${pending.scope} access to ` +
-        `\`${pending.key}\` for ${days}d. ` +
-        richMessage(`(grant \`${id}\`)` + footer),
+        richMessage(
+          buildVaultGrantApprovedCardText({
+            agentEscaped: escapeHtmlForTg(pending.agent),
+            scope: pending.scope,
+            key: pending.key,
+            days,
+            grantId: id,
+            footer,
+          }),
+        ),
         { reply_markup: { inline_keyboard: [] } },
       )
       .catch(() => {})

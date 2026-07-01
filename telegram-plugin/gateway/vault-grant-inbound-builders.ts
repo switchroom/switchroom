@@ -132,6 +132,41 @@ export function buildVaultGrantDeniedInbound(opts: {
   }
 }
 
+/**
+ * Build the raw GFM markdown for the "grant approved" confirmation the
+ * gateway edits the approval card into after the operator taps Approve.
+ *
+ * This is ONE markdown string, wrapped ONCE in `richMessage(...)` at the
+ * callsite. The bug this guards (the whole reason this helper exists):
+ * `richMessage(text)` returns an OBJECT `{ markdown }`, so concatenating a
+ * bare string in front of it — `"prefix " + richMessage("suffix")` —
+ * coerces the object via `toString()` and renders a literal
+ * `[object Object]` in the card. Keep the full message inside this builder
+ * and pass the whole thing to a single `richMessage()` call.
+ *
+ * @param agentEscaped  Agent name already run through `escapeHtmlForTg`.
+ * @param scope         'read' | 'write'.
+ * @param key           Vault key (rendered inline-code).
+ * @param days          Grant TTL in whole days.
+ * @param grantId       Broker-returned grant id.
+ * @param footer        Optional trailing footer (e.g. the telegram-id
+ *                      auth-mode note). Empty string when absent.
+ */
+export function buildVaultGrantApprovedCardText(opts: {
+  agentEscaped: string
+  scope: 'read' | 'write'
+  key: string
+  days: number
+  grantId: string
+  footer?: string
+}): string {
+  return (
+    `✅ Granted **${opts.agentEscaped}** ${opts.scope} access to ` +
+    `\`${opts.key}\` for ${opts.days}d. ` +
+    `(grant \`${opts.grantId}\`)` + (opts.footer ?? '')
+  )
+}
+
 /** Subset of PendingVaultRequestSave the save-outcome builders need.
  *  The `vault_request_save` flow has no scope/ttl (it stores a value,
  *  it doesn't mint a scoped grant). */

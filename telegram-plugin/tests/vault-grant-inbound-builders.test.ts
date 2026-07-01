@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   buildVaultGrantApprovedInbound,
+  buildVaultGrantApprovedCardText,
   buildVaultGrantDeniedInbound,
   buildVaultSaveCompletedInbound,
   buildVaultSaveFailedInbound,
@@ -22,6 +23,7 @@ import {
   type VaultGrantInboundContext,
   type VaultSaveInboundContext,
 } from '../gateway/vault-grant-inbound-builders.js'
+import { richMessage } from '../rich-send.js'
 
 const FIXED_NOW = 1_700_000_000_000
 
@@ -39,6 +41,58 @@ const CTX_WRITE: VaultGrantInboundContext = {
   scope: 'write',
   ttl_seconds: 7 * 86400,
 }
+
+describe('buildVaultGrantApprovedCardText — the [object Object] regression guard', () => {
+  const BASE = {
+    agentEscaped: 'gymbro',
+    scope: 'read' as const,
+    key: 'fatsecret/credentials',
+    days: 30,
+    grantId: 'vg_a1b2c3',
+  }
+
+  it('renders the full confirmation as ONE markdown string wrapped once — no [object Object]', () => {
+    // This is the whole point of the helper: the card text is built as a
+    // single string and passed to a single richMessage(...) call. The bug
+    // (fixed here) was `"prefix " + richMessage("suffix")`, which coerces
+    // the {markdown} object and prints "[object Object]".
+    const text = buildVaultGrantApprovedCardText(BASE)
+    const rich = richMessage(text)
+    expect(rich.markdown).toBe(text)
+    expect(rich.markdown).not.toContain('[object Object]')
+    expect(rich.markdown).toContain('vg_a1b2c3') // grant id present
+  })
+
+  it('includes agent, scope, key, days, and the grant id', () => {
+    const text = buildVaultGrantApprovedCardText(BASE)
+    expect(text).toContain('**gymbro**')
+    expect(text).toContain('read access')
+    expect(text).toContain('`fatsecret/credentials`')
+    expect(text).toContain('for 30d')
+    expect(text).toContain('(grant `vg_a1b2c3`)')
+  })
+
+  it('appends the footer when provided, omits it otherwise', () => {
+    const withFooter = buildVaultGrantApprovedCardText({
+      ...BASE,
+      footer: '\n_Approver verified by Telegram identity._',
+    })
+    expect(withFooter).toContain('_Approver verified by Telegram identity._')
+    // still one clean string
+    expect(withFooter).not.toContain('[object Object]')
+
+    const noFooter = buildVaultGrantApprovedCardText(BASE)
+    expect(noFooter.endsWith('(grant `vg_a1b2c3`)')).toBe(true)
+  })
+
+  it('DOCUMENTS the original bug: bare-string + richMessage() coerces to [object Object]', () => {
+    // Demonstrates why the fix matters — if a future edit reintroduces the
+    // "concatenate a string onto the richMessage object" pattern, the result
+    // contains the literal "[object Object]". The helper above avoids it.
+    const buggy = '✅ Granted access. ' + (richMessage('(grant `vg_x`)') as unknown as string)
+    expect(buggy).toContain('[object Object]')
+  })
+})
 
 describe('buildVaultGrantApprovedInbound', () => {
   it('emits the canonical envelope (type, chat_id, user, userId, ts, messageId)', () => {
