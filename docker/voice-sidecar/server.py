@@ -120,6 +120,66 @@ TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
 TTS_MAX_BODY_BYTES = int(os.environ.get("VOICE_TTS_MAX_BODY_BYTES", str(256 * 1024)))
 TTS_SAMPLE_RATE = 24000  # Kokoro always emits 24kHz mono float PCM.
 
+# ── wedge watchdog (recover from a hung native GPU call) ────────────────
+# A per-request FutureTimeout ABANDONS the future but the worker thread keeps
+# running the native call — and keeps holding _gpu_sem / _tts_sem. With
+# CONCURRENCY=1 a single hung native call permanently holds the only permit,
+# so every later request 503s ("timeout") forever while /healthz still says
+# "ready" — a silent wedge. Python can't cancel the native call, so the only
+# real recovery is to restart the process and let Docker (`restart: always`)
+# bring it back with a fresh GPU context.
+#
+# Mechanism: count CONSECUTIVE per-request timeouts across BOTH lanes. Any
+# successful inference/synthesis resets the count (a lane that still completes
+# work is not wedged). Once the count reaches VOICE_WATCHDOG_MAX_TIMEOUTS we
+# flip a sticky "wedged" flag; /healthz then returns 503, the compose
+# healthcheck goes unhealthy, and Docker restarts the container. We flip
+# /healthz (rather than os._exit immediately) so an in-flight, still-healthy
+# request isn't torn down mid-response — the restart happens on the next
+# healthcheck interval, which is the gentlest correct lever.
+VOICE_WATCHDOG_MAX_TIMEOUTS = max(
+    1, int(os.environ.get("VOICE_WATCHDOG_MAX_TIMEOUTS", "3"))
+)
+_watchdog_lock = threading.Lock()
+_consecutive_timeouts = 0
+_wedged = False
+
+
+def _note_timeout() -> None:
+    """Record a per-request GPU timeout. After VOICE_WATCHDOG_MAX_TIMEOUTS
+    consecutive timeouts (across both lanes) flip the sticky wedged flag so
+    /healthz reports unhealthy and Docker restarts us."""
+    global _consecutive_timeouts, _wedged
+    with _watchdog_lock:
+        _consecutive_timeouts += 1
+        _log(
+            f"watchdog: timeout #{_consecutive_timeouts} "
+            f"(threshold={VOICE_WATCHDOG_MAX_TIMEOUTS})"
+        )
+        if _consecutive_timeouts >= VOICE_WATCHDOG_MAX_TIMEOUTS and not _wedged:
+            _wedged = True
+            _log(
+                "watchdog: WEDGED — a GPU call likely holds a permit that will "
+                "never be released; flipping /healthz to unhealthy so Docker "
+                "restarts the container"
+            )
+
+
+def _note_success() -> None:
+    """Record a completed inference/synthesis — resets the consecutive-timeout
+    counter (a lane that still finishes work is not wedged). Does NOT clear a
+    sticky wedge: once we've decided to restart, we let the restart happen."""
+    global _consecutive_timeouts
+    with _watchdog_lock:
+        if _consecutive_timeouts:
+            _consecutive_timeouts = 0
+
+
+def _is_wedged() -> bool:
+    with _watchdog_lock:
+        return _wedged
+
+
 # ── model state (loaded once, in a background thread at boot) ───────────
 _model = None
 _model_lock = threading.Lock()
@@ -562,7 +622,21 @@ class Handler(BaseHTTPRequestHandler):
             stt_ready = _model is not None
         with _tts_lock:
             tts_ready = _tts is not None
-        if stt_ready and tts_ready:
+        # A sticky wedge (too many consecutive GPU timeouts — see the watchdog
+        # above) reports unhealthy even when both models loaded, so the compose
+        # healthcheck restarts the container to release the stuck permit.
+        if _is_wedged():
+            self._send_json(
+                503,
+                {
+                    "ok": False,
+                    "reason": "wedged",
+                    "stt": stt_ready,
+                    "tts": tts_ready,
+                    "detail": "consecutive GPU timeouts — restarting to recover",
+                },
+            )
+        elif stt_ready and tts_ready:
             self._send_json(
                 200, {"ok": True, "status": "ready", "stt": True, "tts": True}
             )
@@ -640,6 +714,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = future.result(timeout=REQUEST_TIMEOUT_S)
         except FutureTimeout:
+            # The worker keeps running (and holding _gpu_sem) — feed the
+            # watchdog so repeated wedges trigger a restart-to-recover.
+            _note_timeout()
             self._send_json(503, {"ok": False, "reason": "timeout"})
             return
         except Exception as exc:  # noqa: BLE001
@@ -648,6 +725,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        _note_success()
         self._send_json(200, {"ok": True, **result})
 
     def _handle_tts(self) -> None:
@@ -725,6 +803,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             ogg, meta = future.result(timeout=TTS_REQUEST_TIMEOUT_S)
         except FutureTimeout:
+            # The worker keeps running (and holding _tts_sem) — feed the
+            # watchdog so repeated wedges trigger a restart-to-recover.
+            _note_timeout()
             self._send_json(503, {"ok": False, "reason": "timeout"})
             return
         except AssertionError as exc:  # kokoro rejects unknown voice / bad speed
@@ -741,6 +822,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        _note_success()
         # Telegram sendVoice consumes these bytes directly: OGG/Opus, mono.
         self.send_response(200)
         self.send_header("Content-Type", "audio/ogg")
