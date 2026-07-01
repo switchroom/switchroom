@@ -19,10 +19,12 @@ HTTP contract
               header:    X-Voice-Token: <shared secret>
               → 200 { ok: true,  text, language?, durationMs, audioSeconds }
               → 4xx/5xx { ok: false, reason, detail }
-  POST /tts   json: { text: str, voice?: str, format?: "ogg" }
+  POST /tts   json: { text: str (ANY length), voice?: str, format?: "ogg" }
               header:    X-Voice-Token: <shared secret>
-              → 200 audio/ogg  (OGG/Opus, mono — ready for Telegram
-                sendVoice, which REQUIRES OGG/Opus)
+              → 200 audio/ogg  (ONE continuous OGG/Opus stream, mono — ready
+                for Telegram sendVoice, which REQUIRES OGG/Opus). Text of any
+                length is chunked to VOICE_TTS_MAX_CHARS pieces internally,
+                each synthesized on the GPU, and re-joined into a SINGLE file.
               → 4xx/5xx { ok: false, reason, detail }
   GET  /healthz
               → 200 { ok: true, status: "ready", stt: true, tts: true }
@@ -112,6 +114,9 @@ TTS_FORMAT = os.environ.get("VOICE_TTS_FORMAT", "ogg").lower()
 TTS_CONCURRENCY = max(1, int(os.environ.get("VOICE_TTS_CONCURRENCY", "1")))
 TTS_REQUEST_TIMEOUT_S = float(os.environ.get("VOICE_TTS_REQUEST_TIMEOUT_S", "60"))
 TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
+# Defence-in-depth ceiling on the raw JSON body (text is otherwise unbounded,
+# chunked internally). 256KB ≈ ~40k chars of UTF-8 — far above any real reply.
+TTS_MAX_BODY_BYTES = int(os.environ.get("VOICE_TTS_MAX_BODY_BYTES", str(256 * 1024)))
 TTS_SAMPLE_RATE = 24000  # Kokoro always emits 24kHz mono float PCM.
 
 # ── model state (loaded once, in a background thread at boot) ───────────
@@ -285,6 +290,47 @@ def _fetch_weight(url: str, dest: str, expect_sha: str) -> None:
     os.replace(tmp, dest)
 
 
+def _build_tts_session(model_path: str):
+    """Build the Kokoro onnxruntime InferenceSession, preferring the GPU.
+
+    kokoro-onnx 0.5.0's own provider selection defaults to CPU (its
+    `find_spec("onnxruntime-gpu")` probe uses the dashed dist name, which is
+    never importable, so it silently stays on CPUExecutionProvider even when
+    onnxruntime-gpu IS installed). We therefore build the session ourselves
+    with an explicit CUDA->CPU provider preference list and hand it to
+    `Kokoro.from_session`, so the TTS path actually lands on the GPU.
+
+    Graceful fallback: if CUDA init raises (missing driver, cuDNN mismatch,
+    no --gpus), we retry CPU-only rather than failing the whole sidecar. The
+    active providers are logged so it's unambiguous which lane won.
+    """
+    import onnxruntime as rt  # heavy import, deferred
+
+    available = rt.get_available_providers()
+    _log(f"onnxruntime {rt.__version__} available providers: {available}")
+
+    want = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+            if p in available]
+    if "CUDAExecutionProvider" in want:
+        try:
+            sess = rt.InferenceSession(model_path, providers=want)
+            active = sess.get_providers()
+            if "CUDAExecutionProvider" in active:
+                _log(f"TTS onnxruntime session ACTIVE on GPU (providers={active})")
+                return sess
+            _log(
+                "TTS CUDAExecutionProvider requested but not active "
+                f"(providers={active}); falling back to CPU"
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to CPU, don't die
+            _log(f"TTS CUDA session init FAILED ({type(exc).__name__}: {exc}); "
+                 "falling back to CPU")
+
+    sess = rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    _log(f"TTS onnxruntime session ACTIVE on CPU (providers={sess.get_providers()})")
+    return sess
+
+
 def _load_tts() -> None:
     """Fetch-once + load the Kokoro ONNX model. Runs in a background thread
     (like _load_model) so /healthz reports 'not ready' during the cold load
@@ -300,7 +346,10 @@ def _load_tts() -> None:
         from kokoro_onnx import Kokoro  # heavy import, deferred
 
         _log(f"loading TTS model {TTS_MODEL} (voice={TTS_VOICE}) …")
-        kokoro = Kokoro(model_path, voices_path)
+        session = _build_tts_session(model_path)
+        # from_session lets us drive the provider selection (GPU-first) rather
+        # than kokoro-onnx's CPU-defaulting constructor.
+        kokoro = Kokoro.from_session(session, voices_path)
         with _tts_lock:
             _tts = kokoro
         _log("TTS model ready")
@@ -352,21 +401,108 @@ def _wav_to_ogg_opus(wav: bytes) -> bytes:
                 pass
 
 
+_SENTENCE_RE = None
+
+
+def _split_text(text: str, max_chars: int) -> list[str]:
+    """Split arbitrarily-long text into pieces ≤ max_chars, preferring
+    paragraph then sentence then whitespace boundaries so a synthesized chunk
+    never cuts mid-word (which would click / mispronounce). Each returned piece
+    is non-empty and ≤ max_chars (a single token longer than max_chars is
+    emitted whole rather than sliced mid-character)."""
+    import re
+
+    global _SENTENCE_RE
+    if _SENTENCE_RE is None:
+        # Split AFTER sentence-final punctuation (kept) or on a blank line.
+        _SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+|\n{2,}")
+
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    units = [u.strip() for u in _SENTENCE_RE.split(text) if u.strip()]
+    pieces: list[str] = []
+    cur = ""
+    for unit in units:
+        # A single unit longer than max_chars must itself be broken on
+        # whitespace so no piece exceeds the cap.
+        if len(unit) > max_chars:
+            if cur:
+                pieces.append(cur)
+                cur = ""
+            sub = ""
+            for w in unit.split(" "):
+                cand = (sub + " " + w).strip()
+                if len(cand) > max_chars and sub:
+                    pieces.append(sub)
+                    sub = w
+                else:
+                    sub = cand
+            if sub:
+                cur = sub
+            continue
+        cand = (cur + " " + unit).strip()
+        if len(cand) > max_chars and cur:
+            pieces.append(cur)
+            cur = unit
+        else:
+            cur = cand
+    if cur:
+        pieces.append(cur)
+    return [p for p in pieces if p]
+
+
 def _run_synthesis(text: str, voice: str) -> tuple[bytes, dict]:
     """The TTS-serialized synthesis. Acquires the TTS semaphore so only
-    TTS_CONCURRENCY synths run at once — a separate lane from STT."""
+    TTS_CONCURRENCY synths run at once — a separate lane from STT.
+
+    Accepts text of ANY length: it is split into pieces ≤ TTS_MAX_CHARS on
+    sentence/paragraph boundaries, each synthesized on the GPU, and the raw
+    24kHz PCM concatenated into ONE stream (with a short inter-piece pad so
+    joins sound natural and never click) before a SINGLE opus encode. The
+    caller therefore always gets one valid, continuous Ogg/Opus file."""
+    import numpy as np  # local — only TTS needs numpy
+
     with _tts_sem:
         started = time.time()
-        samples, sample_rate = _tts.create(  # type: ignore[union-attr]
-            text, voice=voice, speed=1.0, lang=TTS_LANG
+        pieces = _split_text(text, TTS_MAX_CHARS)
+        if not pieces:
+            pieces = [text]
+
+        # ~120ms of silence between pieces at 24kHz mono — keeps the cadence
+        # natural across a sentence join without a jarring click.
+        pad = np.zeros(int(TTS_SAMPLE_RATE * 0.12), dtype=np.float32)
+
+        chunks: list[np.ndarray] = []
+        sample_rate = TTS_SAMPLE_RATE
+        for i, piece in enumerate(pieces):
+            samples, sample_rate = _tts.create(  # type: ignore[union-attr]
+                piece, voice=voice, speed=1.0, lang=TTS_LANG
+            )
+            arr = np.asarray(samples, dtype=np.float32)
+            if i > 0:
+                chunks.append(pad)
+            chunks.append(arr)
+
+        all_samples = (
+            np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
         )
-        wav = _pcm_to_wav_bytes(samples, sample_rate)
+        wav = _pcm_to_wav_bytes(all_samples, sample_rate)
         ogg = _wav_to_ogg_opus(wav)
+        elapsed_ms = int((time.time() - started) * 1000)
+        audio_seconds = round(len(all_samples) / float(sample_rate), 3)
         meta = {
-            "audioSeconds": round(len(samples) / float(sample_rate), 3),
-            "durationMs": int((time.time() - started) * 1000),
+            "audioSeconds": audio_seconds,
+            "durationMs": elapsed_ms,
             "voice": voice,
+            "pieces": len(pieces),
+            "chars": len(text),
         }
+        _log(
+            f"synth: {len(text)} chars -> {len(pieces)} piece(s) -> "
+            f"{audio_seconds:.2f}s audio in {elapsed_ms}ms"
+        )
         return ogg, meta
 
 
@@ -519,8 +655,10 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             self._send_json(400, {"ok": False, "reason": "empty-body"})
             return
-        # Generous JSON cap: TTS_MAX_CHARS chars + envelope slack.
-        if length > TTS_MAX_CHARS * 4 + 4096:
+        # /tts accepts text of ANY length (chunked internally to TTS_MAX_CHARS
+        # and re-joined into one file), but a hard byte ceiling still guards
+        # against an abusive multi-MB body.
+        if length > TTS_MAX_BODY_BYTES:
             self._send_json(413, {"ok": False, "reason": "body-too-large"})
             return
 
@@ -538,17 +676,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             self._send_json(400, {"ok": False, "reason": "empty-text"})
             return
+        # No length cap here: text of ANY length is accepted and chunked
+        # internally to TTS_MAX_CHARS-sized pieces, then re-joined into ONE
+        # ogg/opus stream (see _run_synthesis). The byte-length guard above is
+        # the only ceiling.
         text = text.strip()
-        if len(text) > TTS_MAX_CHARS:
-            self._send_json(
-                413,
-                {
-                    "ok": False,
-                    "reason": "text-too-long",
-                    "detail": f"{len(text)} > {TTS_MAX_CHARS}",
-                },
-            )
-            return
 
         fmt = payload.get("format", TTS_FORMAT)
         if fmt not in (None, "ogg"):
