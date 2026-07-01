@@ -123,6 +123,45 @@ function isTargetPathHeader(headerPath: string, targetBasename: string): boolean
   return norm === targetBasename || basename(norm) === targetBasename;
 }
 
+/**
+ * Rewrite the `---`/`+++` file-path headers of a single-file unified diff so
+ * they point at a bare `<targetBasename>` (or `a/`/`b/`-prefixed basename),
+ * dropping any deeper directory components. This keeps the `-p1` apply against
+ * a bare-basename scratch file working no matter how deep the original header
+ * was (e.g. `a/state/config/switchroom.yaml` → `a/switchroom.yaml`). Only the
+ * file-path portion is touched — trailing `\t<timestamp>` metadata (if any)
+ * and the `/dev/null` sentinel are preserved. Hunk bodies are never modified.
+ */
+function normalizeDiffHeadersToBasename(
+  unifiedDiff: string,
+  targetBasename: string,
+): string {
+  const rewriteHeaderLine = (line: string, marker: "--- " | "+++ "): string => {
+    const rest = line.slice(marker.length);
+    // Split off optional trailing tab-metadata (git/diff timestamp column).
+    const tabIdx = rest.indexOf("\t");
+    const pathPart = (tabIdx === -1 ? rest : rest.slice(0, tabIdx)).trim();
+    const tail = tabIdx === -1 ? "" : rest.slice(tabIdx);
+    if (pathPart === "/dev/null") return line; // preserve add/delete sentinel
+    let prefix = "";
+    let p = pathPart;
+    if (p.startsWith("a/") || p.startsWith("b/")) {
+      prefix = p.slice(0, 2);
+      p = p.slice(2);
+    }
+    const newPath = `${prefix}${targetBasename}`;
+    return `${marker}${newPath}${tail}`;
+  };
+  return unifiedDiff
+    .split("\n")
+    .map((ln) => {
+      if (ln.startsWith("--- ")) return rewriteHeaderLine(ln, "--- ");
+      if (ln.startsWith("+++ ")) return rewriteHeaderLine(ln, "+++ ");
+      return ln;
+    })
+    .join("\n");
+}
+
 /** Stage 1 — RFC §4.1. */
 function validateShape(
   unifiedDiff: string,
@@ -203,11 +242,21 @@ function applyPatch(
   const liveContent = readFileSync(configPath, "utf8");
   const scratchDir = mkdtempSync(join(tmpdir(), "config-propose-edit-"));
   try {
-    const basename = configPath.split("/").pop() ?? "switchroom.yaml";
-    const scratchFile = join(scratchDir, basename);
+    const targetBasename = configPath.split("/").pop() ?? "switchroom.yaml";
+    const scratchFile = join(scratchDir, targetBasename);
     writeFileSync(scratchFile, liveContent);
+    // Stage 1 (`isTargetPathHeader`) accepts BOTH an exact-basename header
+    // (`a/switchroom.yaml`) AND a deep-path header whose basename matches
+    // (`a/state/config/switchroom.yaml`, #2605). But the scratch file is a
+    // bare basename, so a deep-path header with `-p1` strips only the leading
+    // `a/`, leaving `state/config/switchroom.yaml` — which doesn't exist in
+    // scratchDir, so `git apply` fails with a confusing E_PATCH_APPLY_FAILED.
+    // Normalize the `---`/`+++` header paths down to the target basename so an
+    // accepted header always applies against the scratch file, regardless of
+    // its original depth.
+    const normalizedDiff = normalizeDiffHeadersToBasename(unifiedDiff, targetBasename);
     const patchFile = join(scratchDir, "proposal.patch");
-    writeFileSync(patchFile, unifiedDiff);
+    writeFileSync(patchFile, normalizedDiff);
 
     const bin = gitBin ?? "git";
     const baseArgs = [

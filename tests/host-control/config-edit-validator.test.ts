@@ -166,3 +166,49 @@ describe("assertSelfScopedAllowEdit — non-admin always-allow boundary", () => 
     expect(r.ok).toBe(false);
   });
 });
+
+describe("validateConfigEdit — deep-path header actually APPLIES (#2605 regression)", () => {
+  // Regression guard for the stage inconsistency between isTargetPathHeader
+  // (accepts a full-path header like `a/state/config/switchroom.yaml` by a
+  // basename match) and applyPatch (applies against a bare-basename scratch
+  // file). Before the header-normalization fix, a deep-path header was ADMITTED
+  // by stage 1 but then failed stage 2 with a confusing E_PATCH_APPLY_FAILED,
+  // because `git apply -p1` stripped only `a/` and looked for
+  // `state/config/switchroom.yaml`, which doesn't exist in the scratch dir.
+  it("applies a diff whose headers carry the full config path", () => {
+    const deepPathDiff =
+      "--- a/state/config/switchroom.yaml\n" +
+      "+++ b/state/config/switchroom.yaml\n" +
+      "@@ -4 +4 @@\n" +
+      '-  bot_token: "x"\n' +
+      '+  bot_token: "y"\n';
+    const result = validateConfigEdit({
+      configPath,
+      targetPath: "/state/config/switchroom.yaml",
+      unifiedDiff: deepPathDiff,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.postApplyContent).toContain('bot_token: "y"');
+      expect(result.postApplyContent).not.toContain('bot_token: "x"');
+    }
+  });
+
+  it("still applies a bare-basename header (no regression for the simple case)", () => {
+    const bareDiff =
+      "--- a/switchroom.yaml\n" +
+      "+++ b/switchroom.yaml\n" +
+      "@@ -4 +4 @@\n" +
+      '-  bot_token: "x"\n' +
+      '+  bot_token: "z"\n';
+    const result = validateConfigEdit({
+      configPath,
+      targetPath: "/state/config/switchroom.yaml",
+      unifiedDiff: bareDiff,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.postApplyContent).toContain('bot_token: "z"');
+    }
+  });
+});

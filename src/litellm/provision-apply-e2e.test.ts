@@ -191,6 +191,57 @@ describe("provisionLiteLLMKeys — real broker e2e (blocker-1 seam)", () => {
     expect(r.kind).not.toBe("ok");
   });
 
+  it("null passphrase + unprovisioned NEW agent is SURFACED, not silently skipped", async () => {
+    // Regression guard for the fail-open bug: when the vault passphrase is
+    // unavailable, provisionLiteLLMKeys used to warn + `return` above the
+    // per-agent loop, so a brand-new litellm-opted agent with NO vault key was
+    // silently skipped and the rollout reported success. It must instead probe
+    // the broker, find no key for the new agent, and push a scaffold FAILURE
+    // the operator can see.
+    const config = makeConfig(tmpDir);
+
+    // Force the null-passphrase branch: no env passphrase, and `home` points at
+    // an isolated tmp dir with no machine-id auto-unlock blob.
+    delete process.env.SWITCHROOM_VAULT_PASSPHRASE;
+
+    // Pre-check: clerk has NO key in the vault (genuinely new).
+    expect(getStringSecret(TEST_PASSPHRASE, vaultPath, "litellm/clerk/api-key")).toBeNull();
+
+    const failures: { agent: string; message: string }[] = [];
+    const out: string[] = [];
+    const err: string[] = [];
+    await provisionLiteLLMKeys(config, ["clerk"], undefined, {
+      writeOut: (s) => out.push(s),
+      writeErr: (s) => err.push(s),
+      failures,
+      home: tmpDir, // no auto-unlock blob here → passphrase resolves null
+    });
+
+    // The genuinely-new agent is surfaced as a failure (LOUD), not skipped.
+    expect(failures.some((f) => f.agent === "clerk")).toBe(true);
+    expect(failures.find((f) => f.agent === "clerk")!.message).toMatch(
+      /passphrase|provision/i,
+    );
+    // And the operator sees a red warning line, not silence.
+    expect(err.join("")).toMatch(/passphrase unavailable/i);
+    // No key was written (can't, without the passphrase).
+    expect(getStringSecret(TEST_PASSPHRASE, vaultPath, "litellm/clerk/api-key")).toBeNull();
+  });
+
+  // NOTE: the "already-provisioned agent continues quietly" half of the
+  // null-passphrase split can't be exercised through this harness. The apply
+  // path connects to the broker's OPERATOR socket (reads bypass ACL) in
+  // production, but an in-process test on a tmp socket connects as a non-cron
+  // peer, so `getViaBrokerStructured` returns `denied` for ANY key regardless
+  // of presence (peer-identity ACL, not a key lookup) — same limitation the
+  // file-header note calls out for operator-mode reads. The null-passphrase
+  // branch deliberately treats a non-`ok` probe (not_found / denied /
+  // unreachable) as "not known-good → surface it", which is the conservative,
+  // LOUD behavior the fix requires. The unit-level split (ok → quiet,
+  // else → surfaced) is asserted where the broker read is stubbable; here we
+  // pin the load-bearing half: a genuinely-new agent is surfaced, not skipped
+  // (the test above).
+
   it("is idempotent — a second run with the key present does not fail", async () => {
     const config = makeConfig(tmpDir);
     const run = async () => {

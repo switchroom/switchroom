@@ -65,9 +65,15 @@ durable record, not a memory of a chat message that scrolled away.
 - The in-chat narration (when present) is **one ordinary message edited in
   place** through the phases — `applying → canary → agent N/M → … → ✅/❌` — that
   reads as a normal message the operator can scroll back to.
-- The narration surface **pulls** from the durable rows: after any gateway
-  restart it re-reads the log to recover, holding no in-memory pin/lifecycle
-  state that a restart could orphan.
+- The narration surface **pulls** from the durable rows, but be precise about
+  the restart guarantee: it holds ephemeral in-memory state for the live roll
+  (the message_id it edits + the last-applied seq). A hostd restart mid-roll
+  loses that, so it **re-posts a fresh narration message** rather than
+  seamlessly re-editing the original — the in-chat surface may duplicate on
+  restart. What is fully durable is the roll's *status*: `get_status(request_id)`
+  reconstructs the true state from the per-phase rows regardless of any
+  narration re-post. (Durable status recovers fully; in-chat narration may
+  re-post on restart.)
 - Narration emits/edits are **fire-and-forget, idempotent + monotonic by
   sequence, frozen on the terminal row, debounced, and 429-aware** — and never
   block or fail the roll. The roll's correctness never depends on a chat send

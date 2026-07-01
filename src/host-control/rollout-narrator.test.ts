@@ -13,6 +13,11 @@ import {
 } from "./rollout-narrator.js";
 import type { StatusEntry } from "./server.js";
 import type { RolloutPhase } from "../cli/rollout.js";
+import {
+  planRollout,
+  executeRollout,
+  type RolloutDeps,
+} from "../cli/rollout.js";
 
 function makeEntry(over: Partial<StatusEntry> = {}): StatusEntry {
   return {
@@ -269,5 +274,66 @@ describe("LogTailRolloutNarrator", () => {
     await vi.runAllTimersAsync();
     expect(relay.posts).toHaveLength(0);
     expect(relay.edits).toHaveLength(0);
+  });
+
+  // ── End-to-end: canary-failure abort is the riskiest rollout path ──────────
+  // Covers the whole chain in ONE test: the executor aborts on a failed canary,
+  // BOTH (a) the narration reaches the terminal ❌ (not left mid-roll), AND
+  // (b) the durable persist-pin NEVER runs (a failed canary must never leave a
+  // pin persisted — the executor returns before the post-canary persist-pin
+  // step). Previously these were only covered piecewise.
+  it("canary-failure abort: terminal ❌ narrated AND persist-pin never runs", async () => {
+    const TARGET = "v1.2.3";
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 500 });
+
+    // hostd-order plan: apply → canary (test-harness) → persist-pin → rest.
+    // The persist-pin step sits AFTER the canary, so a failed canary must
+    // return before it is ever reached.
+    const steps = planRollout(["clerk", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    expect(steps.some((s) => s.kind === "persist-pin")).toBe(true);
+
+    const persisted: string[] = [];
+    const entry = makeEntry();
+    const deps: RolloutDeps = {
+      run: () => ({ status: 0 }),
+      // Canary comes back on the WRONG (stale) version → abort.
+      probeVersion: () => "1.2.2",
+      log: () => {},
+      // Bridge the executor's phase emissions into the real narrator.
+      emitPhase: (p) => n.onPhase(entry, p),
+      persistPin: (pin) => persisted.push(pin),
+    };
+
+    const result = executeRollout(steps, TARGET, deps, { hostdContext: true });
+
+    // Executor aborted at the canary, before rolling anyone or persisting.
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("restart-agent");
+    expect(result.failedAgent).toBe("test-harness");
+    expect(result.rolled).toEqual([]);
+    // (b) persist-pin NEVER ran — a failed canary leaves no durable pin.
+    expect(persisted).toEqual([]);
+
+    // Feed the terminal error the way hostd would after the executor returns.
+    n.onTerminal(
+      makeEntry({
+        result: "error",
+        rolled: [],
+        failed_step: result.failedStep,
+        failed_agent: result.failedAgent,
+        got: result.got ?? null,
+      }),
+    );
+    await vi.runAllTimersAsync();
+
+    // (a) narration reached a terminal ❌ naming the failed canary.
+    const finalText =
+      relay.edits.at(-1)?.text ?? relay.posts.at(-1)?.text ?? "";
+    expect(finalText).toContain("❌");
+    expect(finalText).toContain("test-harness");
   });
 });
