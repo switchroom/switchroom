@@ -84,6 +84,18 @@ describe('classifyRejection — benign Telegram 400s', () => {
     const err = grammyError(400, 'Bad Request: MESSAGE IS NOT MODIFIED: blah')
     expect(classifyRejection(err)).toBe('log_only')
   })
+
+  it('returns "log_only" for pin-rights 400 "not enough rights to manage pinned messages" (marko 2026-07-01)', () => {
+    // The bot is not an admin in a supergroup, so the auto status-pin
+    // driver's pinChatMessage returns this 400. It was crashing the whole
+    // gateway via a leaked fire-and-forget rejection. Auto-pin is cosmetic —
+    // a missing pin right must never be fatal.
+    const err = grammyError(
+      400,
+      'Bad Request: not enough rights to manage pinned messages in the chat',
+    )
+    expect(classifyRejection(err)).toBe('log_only')
+  })
 })
 
 describe('classifyRejection — genuine errors still crash', () => {

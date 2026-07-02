@@ -115,7 +115,18 @@ export function classifyRejection(
     // same family so a single bad chat id can't restart-loop the
     // process. The visible boot-probe-failed log is the primary
     // diagnostic; this is the can't-restart-loop guarantee.
-    desc.includes('chat not found')
+    desc.includes('chat not found') ||
+    // Pin-rights failure in a supergroup where the bot is not an admin (or
+    // lacks the "pin messages" right). Telegram returns this as a 400, not a
+    // 403: "not enough rights to manage pinned messages in the chat". The
+    // auto status-pin driver is best-effort and cosmetic — a bot that can't
+    // pin should skip the pin, never crash-loop the gateway. This was the
+    // exact 400 that took marko's gateway down (2026-07-01): the fire-and-
+    // forget `void reconcileStatusPin(...)` leaked the rejection and this
+    // handler shut the process down. reconcileStatusPin now absorbs its own
+    // errors (primary fix); this entry is defense-in-depth so ANY leaked
+    // pin-rights 400 from any path is log-only, not fatal.
+    desc.includes('not enough rights')
   ) {
     return 'log_only'
   }
