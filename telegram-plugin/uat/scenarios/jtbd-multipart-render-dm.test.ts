@@ -27,11 +27,27 @@
  *      (bold) — formatting survived across the split into chunk 2.
  *   4. Neither part decoded as the `\x01` unsupported-media sentinel.
  *
+ * ## Status: ARMED, not yet wired into the uat-gate
+ *
+ * A first live attempt on the uat-host (PR #2745) timed out at the HEAD-marker
+ * poll: coaxing a model turn to emit ~40k chars of verbatim padding is not
+ * reliable — the agent summarizes/truncates or blows the turn budget, so no
+ * >32768-char reply is produced and the gateway never chunks. The chunker
+ * itself (`splitMarkdownChunks`) is unit-tested deterministically in
+ * `telegram-plugin/tests/`; what this scenario needs to prove live is the
+ * end-to-end SEND of an already-oversized reply, which a prompt can't force.
+ *
+ * So this scenario is deliberately NOT in the `uat-gate` step list — it would
+ * red the gate on the model's refusal to pad, not on a real render regression.
+ * It self-skips green in ordinary CI (no driver creds) and is kept as the
+ * armed harness for a future deterministic oversized-send hook (e.g. a driver
+ * that posts a pre-composed >32k body directly, bypassing the model turn).
+ *
  * ## Self-skip
  *
  * Same gating as every scenario here: needs the driver session
  * (`TELEGRAM_UAT_DRIVER_SESSION`, gated to the CI uat-host). Self-skips green
- * when creds are absent; the `uat-gate` sentinel owns the real run.
+ * when creds are absent.
  */
 
 import { describe, it, expect } from "vitest";
