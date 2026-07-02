@@ -528,14 +528,40 @@ export function executeRollout(
         // hostd path: pin not yet persisted (it follows the canary), so
         // pass the one-shot --pin so compose regenerates on the target.
         // host-shell path: pin already persisted → bare apply reads it.
+        //
+        // On the hostd path we ALSO pass `--compose-only --non-interactive`.
+        // A version roll only needs the compose regenerated with the new
+        // image tags plus compose-level env (SWITCHROOM_VOICE_ENGINE) and the
+        // sidecar healthcheck — all emitted by generateCompose(), which
+        // `--compose-only` still runs. What `--compose-only` skips is the
+        // per-agent SCAFFOLD loop (start.sh / .mcp.json / settings.json).
+        // Under docker mode (v0.7+) per-agent state dirs are mode 0700 owned
+        // by per-agent UIDs; hostd runs unprivileged and cannot write into
+        // them, so a FULL apply fails scaffold for every agent, returns
+        // non-zero, and aborts the whole roll having rolled nothing (every
+        // historical hostd rollout in the audit log: failedStep "apply",
+        // rolled []). Skipping scaffold lets the roll actually complete.
         deps.log(`ROLL_STEP apply — regenerating compose for ${target}`);
         emit({ phase: "apply", target });
         const applyArgs = execOpts.hostdContext
-          ? ["apply", "--pin", target]
+          ? ["apply", "--pin", target, "--compose-only", "--non-interactive"]
           : ["apply"];
         const r = deps.run(applyArgs);
         if (r.status !== 0) {
           return { ok: false, rolled, failedStep: "apply", warnings };
+        }
+        if (execOpts.hostdContext) {
+          // TRADEOFF (surfaced, not hidden): --compose-only skipped the
+          // per-agent template refresh. If this release changed the
+          // start.sh / .mcp.json / settings.json templates, agents keep
+          // their stale wrappers until a host-side privileged apply runs.
+          warnings.push(
+            `apply ran --compose-only (hostd is unprivileged and cannot ` +
+              `write per-agent state dirs). Compose + compose-level env/` +
+              `healthcheck are up to date, but per-agent template changes ` +
+              `(start.sh / .mcp.json / settings.json) are NOT applied — run ` +
+              `a host-side \`sudo switchroom apply\` if this release changed them.`,
+          );
         }
         break;
       }
