@@ -399,6 +399,9 @@ import {
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
+import { resolveChatIdFallback } from './chat-id-fallback.js'
+import { decideObligationTurnEnd } from './obligation-turn-end.js'
+import { maybeRotate } from './turns-jsonl-rotate.js'
 import {
   createDeliveryQueue,
   trackDelivery,
@@ -3486,7 +3489,20 @@ function emitTurnRecord(turn: CurrentTurn, endedAt: number): void {
         status: turn.finalAnswerDelivered ? 'complete' : 'no_reply',
         turn_id: turn.turnId,
       }) + '\n'
-    appendFileSync('/state/agent/turns.jsonl', rec)
+    const turnsPath = '/state/agent/turns.jsonl'
+    // Size-cap rotation: keep at most one rotated generation so the file can't
+    // grow unbounded on a long-lived agent. Best-effort (never throws).
+    maybeRotate(turnsPath, {
+      statSize: (p) => {
+        try {
+          return statSync(p).size
+        } catch {
+          return undefined
+        }
+      },
+      rename: (from, to) => renameSync(from, to),
+    })
+    appendFileSync(turnsPath, rec)
   } catch {
     // best-effort — never let metrics emission break turn teardown
   }
@@ -3542,7 +3558,7 @@ function endCurrentTurnAtomic(turn: CurrentTurn): void {
   // At turn_end with replyCalled=true the model explicitly signalled completion
   // AND replied, so the obligation is satisfied regardless of finalAnswerDelivered.
   if (OBLIGATION_LEDGER_ENABLED) {
-    if (turn.finalAnswerDelivered || turn.replyCalled) {
+    if (decideObligationTurnEnd(turn.finalAnswerDelivered, turn.replyCalled) === 'close') {
       obligationLedger.close(turn.turnId)
     } else {
       // Turn ended WITHOUT any reply (no ack, no answer). If this turn was
@@ -8723,18 +8739,20 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   //   null because clearTurnStarted fired ≥5 min of model silence, but the model
   //   finally called reply after the poke).
   const chat_id = (() => {
-    const _a = loadAccess()
-    if (_a.allowFrom.includes(_rawChatId) || _rawChatId in _a.groups) return _rawChatId
-    const fallbackChatId = turn?.sessionChatId ?? lastActiveTurnChatId
-    if (fallbackChatId && (_a.allowFrom.includes(fallbackChatId) || fallbackChatId in _a.groups)) {
-      const tier = turn == null ? 'last-known' : 'active'
+    const resolved = resolveChatIdFallback(
+      _rawChatId,
+      loadAccess(),
+      turn?.sessionChatId,
+      lastActiveTurnChatId,
+      turn != null,
+    )
+    if (resolved.tier !== 'raw') {
       process.stderr.write(
         `telegram gateway: reply: model passed chat_id "${_rawChatId}" (not allowlisted) — ` +
-          `routing to ${tier} turn chat "${fallbackChatId}"\n`,
+          `routing to ${resolved.tier} turn chat "${resolved.chatId}"\n`,
       )
-      return fallbackChatId
     }
-    return _rawChatId // let assertAllowedChat below throw the human-readable error
+    return resolved.chatId // raw tier → let assertAllowedChat throw the human-readable error
   })()
   const rawText = args.text as string | undefined
   if (rawText == null || rawText === '') throw new Error('reply: text is required and cannot be empty')
@@ -9912,6 +9930,31 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   const turn = currentTurn
   if (!args.chat_id) throw new Error('stream_reply: chat_id is required')
   if (args.text == null || args.text === '') throw new Error('stream_reply: text is required and cannot be empty')
+  // chat_id allowlist fallback — mirrors executeReply (~8725). stream_reply is
+  // the primary final-answer path, so a wrong/late chat_id (int/string mismatch,
+  // or the model echoing the wrong identifier after a silence poke flipped
+  // currentTurn to null) would otherwise fail assertAllowedChat in the stream
+  // controller → an invisible reply. Rewrite args.chat_id in place so every
+  // downstream consumer (origin resolution, dedup key, the send) sees the
+  // corrected value. Tier 1: live turn's sessionChatId. Tier 2: last-known
+  // turn's chat (survives silence poke — Bug D fix; currentTurn is null).
+  {
+    const _rawChatId = String(args.chat_id ?? '')
+    const resolved = resolveChatIdFallback(
+      _rawChatId,
+      loadAccess(),
+      turn?.sessionChatId,
+      lastActiveTurnChatId,
+      turn != null,
+    )
+    if (resolved.tier !== 'raw') {
+      process.stderr.write(
+        `telegram gateway: stream_reply: model passed chat_id "${_rawChatId}" (not allowlisted) — ` +
+          `routing to ${resolved.tier} turn chat "${resolved.chatId}"\n`,
+      )
+      args.chat_id = resolved.chatId
+    }
+  }
   // Thread precedence (matches executeReply; component 3 — turn-origin
   // routing): when the model passes no explicit message_thread_id, inject
   // the ORIGIN turn's thread (matched by origin_turn_id) — authoritative
