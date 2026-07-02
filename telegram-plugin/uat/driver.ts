@@ -329,18 +329,30 @@ export class Driver {
       else queue.push(m);
     };
 
-    const onNew = (msg: Message): void => {
-      const observed = toObserved(msg, false);
+    // Defensive wrapper: a throw inside the listener propagates out of
+    // mtcute's `onNewMessage`/`onEditMessage` emitter (it does not catch
+    // listener errors) and drops the update entirely, so `observeMessages`
+    // would silently never yield it. `toObserved` is already hardened against
+    // the known `PeersIndex` throw, but any future getter that throws must
+    // NOT be allowed to swallow an observation — log and move on instead.
+    const dispatchObserved = (msg: Message, edited: boolean): void => {
+      let observed: ObservedMessage;
+      try {
+        observed = toObserved(msg, edited);
+      } catch (err) {
+        // eslint-disable-next-line no-console -- harness diagnostic
+        console.warn(
+          `[uat/driver] observeMessages: dropping unobservable message ` +
+          `(id=${msg.id}): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
       if (observed.chatId !== chatId) return;
       if (targetThread !== undefined && observed.threadId !== targetThread) return;
       dispatch(observed);
     };
-    const onEdit = (msg: Message): void => {
-      const observed = toObserved(msg, true);
-      if (observed.chatId !== chatId) return;
-      if (targetThread !== undefined && observed.threadId !== targetThread) return;
-      dispatch(observed);
-    };
+    const onNew = (msg: Message): void => dispatchObserved(msg, false);
+    const onEdit = (msg: Message): void => dispatchObserved(msg, true);
 
     c.onNewMessage.add(onNew);
     c.onEditMessage.add(onEdit);
@@ -889,13 +901,31 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
   const rawText = msg.text ?? "";
   const isRichMedia = rawText === "" &&
     msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
+  // Resolve chat/sender ids from the RAW TL peer, not the `msg.chat` /
+  // `msg.sender` getters. Those getters look the peer up in the update's
+  // `PeersIndex` and THROW `MtArgumentError` ("peer not available in this
+  // index") when it's absent — which happens for the driver because it runs
+  // on `MemoryStorage` (empty peer cache each connect), so an incoming bot
+  // reply can arrive before that peer has been cached. An unguarded throw
+  // here propagates out of the mtcute `onNewMessage`/`onEditMessage` emitter
+  // (that emitter does not catch listener errors), so the WHOLE update is
+  // dropped and `observeMessages` never yields it — the exact "bot replied
+  // fast but `expectMessage` timed out" failure. `getMarkedPeerId` reads the
+  // raw TL peer directly and never touches the index, so it can't throw.
+  const chatId = getMarkedPeerId(msg.raw.peerId);
+  const rawFrom = msg.raw._ === "message" || msg.raw._ === "messageService"
+    ? msg.raw.fromId
+    : undefined;
+  const senderUserId = rawFrom
+    ? getMarkedPeerId(rawFrom)
+    : chatId; // no explicit sender ⇒ the DM peer is the sender (bot reply in a DM)
   return {
-    chatId: msg.chat.id,
+    chatId,
     messageId: msg.id,
     threadId: msg.replyToMessage?.threadId ?? undefined,
     text: isRichMedia ? "\x01" : rawText,
-    senderUserId: msg.sender.id,
-    fromBot: msg.sender.type === "user" && msg.sender.isBot === true,
+    senderUserId,
+    fromBot: safeIsFromBot(msg),
     date: msg.date,
     edited,
     silent: msg.isSilent,
@@ -941,5 +971,24 @@ function safeMessageLink(msg: Message): string | undefined {
     return msg.link;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Whether the message was sent by a bot. Reads `msg.sender`, which resolves
+ * the peer via the update's `PeersIndex` and THROWS `MtArgumentError` when
+ * that peer isn't cached (the driver's `MemoryStorage` starts empty, so an
+ * incoming reply can arrive before its sender is cached). We only need
+ * `fromBot` for coarse classification, and `expectMessage`'s `from: "bot"`
+ * filter keys off `senderUserId` (resolved from the raw peer above), not this
+ * flag — so a swallowed lookup degrades to `false` rather than dropping the
+ * whole observation. Group/DM messages with a cached sender still classify
+ * correctly.
+ */
+function safeIsFromBot(msg: Message): boolean {
+  try {
+    return msg.sender.type === "user" && msg.sender.isBot === true;
+  } catch {
+    return false;
   }
 }
