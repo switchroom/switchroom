@@ -249,11 +249,11 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     expect(d.message).toContain("30%");
   });
 
-  it("throttling message markdown-escapes the account label (#2669)", () => {
-    // The label is interpolated inside a code span — the renderer escapes
-    // inline-markdown specials (\ ` * _ ~ = [ ] |), not HTML entities. A label
-    // with an emphasis special (e.g. an underscore) is backslash-escaped; the
-    // literal `<` / `>` pass through (they are not markdown specials).
+  it("throttling message renders the account label literally in a code span (#2695)", () => {
+    // The label is interpolated INSIDE a `code span`, where content is literal
+    // and backslash escaping is WRONG (#2695 regression: escapeMarkdown here
+    // emitted a visible `ev\_il@…`). The correct rendering is via codeSpanSafe,
+    // so an underscore label appears verbatim with no stray backslash.
     const d = evaluateQuotaWatchAccount({
       agentName: "lawgpt",
       snap: makeSnap("ev_il@example.com", makeQuota(85, 40)),
@@ -262,8 +262,8 @@ describe("evaluateQuotaWatchAccount — message content", () => {
     });
     expect(d.kind).toBe("notify");
     if (d.kind !== "notify") return;
-    // The underscore is escaped so it can't open an italic run inside the span.
-    expect(d.message).toContain("ev\\_il@example.com");
+    expect(d.message).toContain("`ev_il@example.com`");
+    expect(d.message).not.toContain("ev\\_il@example.com");
   });
 
   it("throttling message for active account mentions /auth use", () => {

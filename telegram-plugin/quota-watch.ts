@@ -51,7 +51,7 @@ import {
   fmtPct,
 } from "./auth-snapshot-format.js";
 import type { QuotaUtilization } from "./quota-check.js";
-import { escapeMarkdown } from "./card-format.js";
+import { escapeMarkdown, codeSpanSafe } from "./card-format.js";
 
 const STATE_FILE = "quota-watch.json";
 
@@ -512,7 +512,7 @@ function buildFleetRecoveredMessage(
   accounts: Array<{ label: string; exhausted: boolean }>,
 ): string {
   const healthy = accounts.filter((a) => !a.exhausted).map((a) => a.label);
-  const which = healthy.length > 0 ? ` (\`${escapeMarkdown(healthy[0]!)}\`)` : "";
+  const which = healthy.length > 0 ? ` (\`${codeSpanSafe(healthy[0]!)}\`)` : "";
   return [
     `🟢 **Fleet recovered** — at least one account is healthy again${which}.`,
     ``,
@@ -522,7 +522,7 @@ function buildFleetRecoveredMessage(
 
 // ─── Message builders ─────────────────────────────────────────────────────────
 
-function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): string {
+export function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): string {
   const q = snap.quota!; // classifyHealth returned throttling, so quota is non-null
   const fiveStr = fmtPct(q.fiveHourUtilizationPct);
   const sevenStr = fmtPct(q.sevenDayUtilizationPct);
@@ -536,14 +536,14 @@ function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): strin
 
   const activeNote = snap.isActive
     ? ""
-    : `\nThis is a non-active account. Consider \`/auth use ${escapeMarkdown(snap.label)}\` to switch, or keep it as a fallback reserve.`;
+    : `\nThis is a non-active account. Consider \`/auth use ${codeSpanSafe(snap.label)}\` to switch, or keep it as a fallback reserve.`;
 
   const altNote = snap.isActive
     ? `\nConsider \`/auth use <other-account>\` if you have a healthier account, or wait for the ${winLabel} window to refill${resetStr}.`
     : "";
 
   return [
-    `🟡 **Quota approaching limit** — \`${escapeMarkdown(snap.label)}\``,
+    `🟡 **Quota approaching limit** — \`${codeSpanSafe(snap.label)}\``,
     ``,
     `${fiveStr} of 5h  ·  ${sevenStr} of 7d`,
     `Binding window: ${winLabel}${resetStr}`,
@@ -557,14 +557,14 @@ function buildThrottlingMessage(agentName: string, snap: AccountSnapshot): strin
     .trim();
 }
 
-function buildRecoveryMessage(agentName: string, snap: AccountSnapshot): string {
+export function buildRecoveryMessage(agentName: string, snap: AccountSnapshot): string {
   const q = snap.quota;
   const utilLine = q
     ? `Current: ${fmtPct(q.fiveHourUtilizationPct)} of 5h  ·  ${fmtPct(q.sevenDayUtilizationPct)} of 7d`
     : "Current quota data unavailable.";
 
   return [
-    `🟢 **Quota back in healthy range** — \`${escapeMarkdown(snap.label)}\``,
+    `🟢 **Quota back in healthy range** — \`${codeSpanSafe(snap.label)}\``,
     ``,
     utilLine,
     ``,

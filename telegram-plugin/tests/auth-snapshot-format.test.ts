@@ -504,11 +504,14 @@ describe('renderFallbackAnnouncement', () => {
     expect(out7).toContain('7-day limit on me@x');
   });
 
-  // Boundary-escaping after the #2695 escaper de-dup: the announcement escapes
-  // dynamic labels + the trigger agent via the consolidated `escapeMarkdown`
-  // import (was a local `escapeHtml` copy). Metacharacter-laden values must come
-  // back backslash-escaped, proving the import swap preserved escaping here.
-  it('escapes metacharacter-laden labels and trigger agent in the swap announcement (#2695)', () => {
+  // Context-correct escaping (#2695 fix): the swap announcement renders each
+  // label in TWO contexts, and each demands a different treatment —
+  //  • **bold** header / trigger-agent → escapeMarkdown (backslash-escaped, so
+  //    an underscore can't open an emphasis run), and
+  //  • `code span` (the old→new line, recovery line) → codeSpanSafe (LITERAL,
+  //    because backslash escaping is inert inside a code span and would show a
+  //    visible `old\_a\*x`).
+  it('escapes labels in the bold header but renders them literally in code spans (#2695)', () => {
     const out = renderFallbackAnnouncement({
       oldLabel: 'old_a*x',
       oldQuota: KEN_5H_BLOWN,
@@ -518,12 +521,14 @@ describe('renderFallbackAnnouncement', () => {
       now: NOW,
       tz: 'UTC',
     });
-    expect(out).toContain('old\\_a\\*x');
-    expect(out).toContain('new\\_b\\*y');
-    expect(out).toContain('agent\\_z\\*q');
-    // And the raw (unescaped) forms must NOT leak through.
-    expect(out).not.toContain('old_a*x');
-    expect(out).not.toContain('agent_z*q');
+    // Emphasis contexts: backslash-escaped.
+    expect(out).toContain('old\\_a\\*x'); // bold header "· … on old_a*x"
+    expect(out).toContain('agent\\_z\\*q'); // "Triggered by: agent **…**"
+    // Code-span contexts: literal, no stray backslash.
+    expect(out).toContain('`old_a*x`');
+    expect(out).toContain('`new_b*y`');
+    expect(out).not.toContain('`old\\_a\\*x`');
+    expect(out).not.toContain('`new\\_b\\*y`');
   });
 
   it('names the triggering agent + recovery countdown for the old account', () => {

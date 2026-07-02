@@ -22,7 +22,7 @@ import type { QuotaResult, QuotaUtilization } from './quota-check.js';
 import { isProbeThin, refillNormalizedUtils } from '../src/auth/quota.js';
 import type { AccountState, LastQuotaSnapshot, ListStateData } from '../src/auth/broker/client.js';
 import { maskEmail } from './demo-mask.js';
-import { escapeMarkdown } from './card-format.js';
+import { escapeMarkdown, codeSpanSafe } from './card-format.js';
 
 // ── shared types ─────────────────────────────────────────────────────
 
@@ -324,7 +324,7 @@ function renderAccountRow(
 
   if (!snap.quota) {
     lines.push(
-      `${marker}\`${escapeMarkdown(label)}\`  _quota probe failed_`,
+      `${marker}\`${codeSpanSafe(label)}\`  _quota probe failed_`,
     );
     if (snap.quotaError) {
       lines.push(`  _${escapeMarkdown(snap.quotaError)}_`);
@@ -337,7 +337,7 @@ function renderAccountRow(
   // it as a data-quality gap, never a confident "0% / 0%".
   if (isProbeThin(q)) {
     lines.push(
-      `${marker}\`${escapeMarkdown(label)}\`  _quota unknown (thin probe)_`,
+      `${marker}\`${codeSpanSafe(label)}\`  _quota unknown (thin probe)_`,
     );
     return lines;
   }
@@ -347,7 +347,7 @@ function renderAccountRow(
   const fiveStr = fmtPct(norm.fiveHourUtilizationPct);
   const sevenStr = fmtPct(norm.sevenDayUtilizationPct);
   lines.push(
-    `${marker}\`${escapeMarkdown(label)}\`  ${fiveStr} / ${sevenStr}`,
+    `${marker}\`${codeSpanSafe(label)}\`  ${fiveStr} / ${sevenStr}`,
   );
 
   const health = classifyHealth(snap, now);
@@ -502,11 +502,19 @@ export function renderAuthSnapshotFormat2(
       // Account cell: FULL email, never truncated; active gets a (active) suffix.
       // The black-dot active marker is intentionally removed — the suffix reads.
       const label = displayLabel(s.label, opts);
-      const account = s.isActive ? `${label} (active)` : label;
+      // #2701 — the account label is an identifier (email / slug) that can
+      // contain markdown-active chars (`_ * ~` etc.). `tableCell` only guards
+      // the table grid (`\ | \n`), NOT inline formatting, so a raw label like
+      // `ken_max` was parsed as emphasis and corrupted the row. Render it in a
+      // code span (backtick content is literal) exactly like renderAccountRow
+      // does, defusing embedded backticks via codeSpanSafe. The wrapping
+      // backticks still need pipe/newline guarding for the grid, hence the
+      // tableCell wrap around the finished span.
+      const accountCell = `\`${codeSpanSafe(s.isActive ? `${label} (active)` : label)}\``;
       const { five, seven } = pctCells(s, now);
       const status = statusCell(s, now, tz);
       lines.push(
-        `| ${emoji} | ${tableCell(account)} | ${five} | ${seven} | ${tableCell(status)} |`,
+        `| ${emoji} | ${tableCell(accountCell)} | ${five} | ${seven} | ${tableCell(status)} |`,
       );
     }
   }
@@ -741,7 +749,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       if (earliest) {
         lines.push('');
         lines.push(
-          `Earliest recovery: \`${escapeMarkdown(earliest.label)}\` ` +
+          `Earliest recovery: \`${codeSpanSafe(earliest.label)}\` ` +
             `${formatAbsolute(earliest.at, tz)} (in ${formatRelative(earliest.at, now)})`,
         );
       }
@@ -769,7 +777,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
   );
   lines.push('');
   lines.push(
-    `\`${escapeMarkdown(input.oldLabel)}\` → \`${escapeMarkdown(input.newLabel)}\``,
+    `\`${codeSpanSafe(input.oldLabel)}\` → \`${codeSpanSafe(input.newLabel)}\``,
   );
   lines.push(`Triggered by: agent **${escapeMarkdown(input.triggerAgent)}**`);
   lines.push('');
@@ -778,7 +786,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
     const recovery = recoveryAtFor(input.oldQuota);
     if (recovery) {
       lines.push(
-        `\`${escapeMarkdown(input.oldLabel)}\` recovers ` +
+        `\`${codeSpanSafe(input.oldLabel)}\` recovers ` +
           `${formatAbsolute(recovery, tz)} (in ${formatRelative(recovery, now)})`,
       );
     }
@@ -792,7 +800,7 @@ export function renderFallbackAnnouncement(input: FallbackAnnouncementInput): st
       input.newQuota.sevenDayUtilizationPct < THROTTLING_THRESHOLD_PCT;
     const headroomStr = hasHeadroom ? '_(plenty of headroom)_' : '_(near limit — watch this)_';
     lines.push(
-      `\`${escapeMarkdown(input.newLabel)}\` now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
+      `\`${codeSpanSafe(input.newLabel)}\` now: ${fiveStr} of 5h · ${sevenStr} of 7d ${headroomStr}`,
     );
   } else {
     lines.push(
