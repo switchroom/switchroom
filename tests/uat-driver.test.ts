@@ -37,9 +37,22 @@ class MockEmitter<T> {
   }
 }
 
+// A minimal RawUser stand-in `getMe().raw` returns. `connect()` passes this to
+// `notifyLoggedIn` to mark the imported session authorized before starting the
+// updates loop (mirrors what mtcute's `start()` does internally). The driver
+// only needs `getMe()` to resolve and `notifyLoggedIn()` to accept it — the
+// exact RawUser shape is opaque to the driver, so a tagged object suffices.
+const mockSelfRaw = { _: "user", id: 777, bot: false, self: true };
+
 const mockClient = {
   importSession: vi.fn(async () => undefined),
   connect: vi.fn(async () => undefined),
+  // `connect()` resolves self from the imported session and calls
+  // `notifyLoggedIn(me.raw)` before `startUpdatesLoop()`. Without these two
+  // stubs, `connect()` rejects and every test that connects cascades to fail
+  // (the mtcute 0.30 dispatch fix, #2744).
+  getMe: vi.fn(async () => ({ id: 777, raw: mockSelfRaw })),
+  notifyLoggedIn: vi.fn(async () => undefined),
   startUpdatesLoop: vi.fn(async () => undefined),
   destroy: vi.fn(async () => undefined),
   sendText: vi.fn(async () => ({ id: 999 })),
@@ -75,6 +88,28 @@ function getMarkedPeerIdImpl(peer: { _: string; userId?: number; chatId?: number
     default:
       throw new Error(`Invalid peer: ${peer._}`);
   }
+}
+
+// Build the `raw` slice a Message double needs so `toObserved` can read the
+// chat/sender ids off the RAW TL peer (index-free). Mirrors mtcute's marked-id
+// convention: positive ⇒ user (peerUser), -100…-prefixed ⇒ channel, other
+// negative ⇒ basic chat. `fromId` defaults to the same peer as the chat (a bot
+// reply in a DM has no explicit fromId; the peer IS the sender).
+function rawWithPeer(
+  markedChatId: number,
+  markedFromId?: number,
+): { _: "message"; peerId: unknown; fromId?: unknown; media: undefined } {
+  const toRawPeer = (id: number): unknown => {
+    if (id > 0) return { _: "peerUser", userId: id };
+    if (id <= -1e12) return { _: "peerChannel", channelId: -1e12 - id };
+    return { _: "peerChat", chatId: -id };
+  };
+  return {
+    _: "message",
+    peerId: toRawPeer(markedChatId),
+    fromId: markedFromId !== undefined ? toRawPeer(markedFromId) : undefined,
+    media: undefined,
+  };
 }
 
 vi.mock("@mtcute/node", () => ({
@@ -213,6 +248,11 @@ describe("Driver.observeMessages", () => {
       date: new Date(),
       chat: { id: opts.chatId },
       sender: { type: "user", isBot: opts.fromBot === true },
+      // `toObserved` reads the RAW TL peer for chat/sender ids (index-free,
+      // never-throws). A real mtcute Message always carries `raw.peerId`; a
+      // marked chat id maps back to a raw peer (negative-100… ⇒ channel,
+      // negative ⇒ chat, positive ⇒ user).
+      raw: rawWithPeer(opts.chatId),
       replyToMessage: opts.threadId !== undefined
         ? { threadId: opts.threadId }
         : undefined,
@@ -239,6 +279,57 @@ describe("Driver.observeMessages", () => {
     expect(m.text).toBe("match");
     expect(m.threadId).toBe(7);
     expect(m.edited).toBe(false);
+
+    await iter.return?.();
+  });
+
+  it("observes a bot DM reply whose peer is NOT in the update's index (regression: #2742 mtcute 0.30 silent-drop)", async () => {
+    // Root cause: the driver runs on MemoryStorage (empty peer cache each
+    // connect), so a bot's reply can arrive before its peer is cached. When
+    // `toObserved` read `msg.chat.id` / `msg.sender.id`, those getters look
+    // the peer up in the update's PeersIndex and THROW MtArgumentError when
+    // it's absent. That throw propagated out of mtcute's onNewMessage emitter
+    // (which does not catch listener errors), dropping the whole update — so
+    // `observeMessages` never yielded it and `expectMessage(/\S/, {from:"bot"})`
+    // timed out even though the bot had replied fast. The fix reads chat/sender
+    // ids off the RAW TL peer (index-free), so this must now be observed.
+    //
+    // This double reproduces the throw: `chat` and `sender` are getters that
+    // throw the exact mtcute error, while `raw.peerId` / `raw.fromId` carry
+    // the bot user id — the id the DM chat is keyed on.
+    const BOT = 12345;
+    const throwingMsg = {
+      id: 555,
+      text: "4",
+      date: new Date(),
+      replyToMessage: undefined,
+      isSilent: false,
+      entities: [],
+      raw: rawWithPeer(BOT, BOT),
+      get chat(): never {
+        throw new Error("Given peer is not available in this index.");
+      },
+      get sender(): never {
+        throw new Error("Given peer is not available in this index.");
+      },
+    };
+
+    const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
+    await driver.connect();
+    const iter = driver.observeMessages(BOT)[Symbol.asyncIterator]();
+
+    mockClient.onNewMessage.emit(throwingMsg);
+
+    const first = await iter.next();
+    expect(first.done).toBe(false);
+    const m = first.value as ObservedMessage;
+    expect(m.messageId).toBe(555);
+    expect(m.chatId).toBe(BOT);
+    expect(m.senderUserId).toBe(BOT);
+    expect(m.text).toBe("4");
+    // sender getter threw, so fromBot degrades to false — but senderUserId
+    // (what `from: "bot"` filters on) is correct, which is what matters.
+    expect(m.fromBot).toBe(false);
 
     await iter.return?.();
   });
@@ -671,6 +762,7 @@ describe("Driver.getMessage", () => {
         date: new Date("2026-05-11T04:30:00Z"),
         chat: { id: 67890 },
         sender: { id: 67890, type: "user", isBot: true },
+        raw: rawWithPeer(67890),
         replyToMessage: undefined,
       } as never,
     ]);
@@ -707,7 +799,12 @@ describe("toObserved — rich formatting surface (issue #2739)", () => {
       chat: { id: 111 },
       sender: { id: 222, type: "user", isBot: true },
       replyToMessage: undefined,
-      raw: { _: "message", media: undefined },
+      raw: {
+        _: "message",
+        peerId: { _: "peerUser", userId: 111 },
+        fromId: { _: "peerUser", userId: 222 },
+        media: undefined,
+      },
       isSilent: false,
       entities: [],
       ...overrides,
@@ -756,13 +853,101 @@ describe("toObserved — rich formatting surface (issue #2739)", () => {
     expect(msg?.link).toBe("https://t.me/c/111/7");
   });
 
+  it("decodes a Bot API 10.1 richMessage (empty .message + page-block tree) into text + entities", async () => {
+    // Direct coverage of `decodeRichMessage` (#2744): sendRichMessage replies
+    // land with the legacy `message` string EMPTY and the visible text in the
+    // new TL field `message.richMessage` (an Instant-View page tree). This is
+    // the exact wire shape captured from the uat-host runner — a paragraph of
+    // styled inline text plus a fenced (preformatted) code block. mtcute 0.30
+    // doesn't map the field, so without the decode `msg.text` is "" and the
+    // observation looks textless. Assert the flattened text + every expected
+    // entity kind (bold/italic/code/text_link/pre) with the right url/language.
+    const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
+    await driver.connect();
+    mockClient.getMessages.mockResolvedValueOnce([
+      mockMsg({
+        text: "",
+        entities: [],
+        raw: {
+          _: "message",
+          peerId: { _: "peerUser", userId: 111 },
+          fromId: { _: "peerUser", userId: 222 },
+          media: undefined,
+          message: "",
+          richMessage: {
+            _: "richMessage",
+            rtl: false,
+            part: false,
+            blocks: [
+              {
+                _: "pageBlockParagraph",
+                text: {
+                  _: "textConcat",
+                  texts: [
+                    { _: "textPlain", text: "here is " },
+                    { _: "textBold", text: { _: "textPlain", text: "a bold phrase" } },
+                    { _: "textPlain", text: ", " },
+                    { _: "textItalic", text: { _: "textPlain", text: "italic words" } },
+                    { _: "textPlain", text: ", " },
+                    { _: "textFixed", text: { _: "textPlain", text: "code_token" } },
+                    { _: "textPlain", text: ", and " },
+                    {
+                      _: "textUrl",
+                      text: { _: "textPlain", text: "the repo" },
+                      url: "https://github.com/switchroom/switchroom",
+                      webpageId: 0,
+                    },
+                    { _: "textPlain", text: "." },
+                  ],
+                },
+              },
+              {
+                _: "pageBlockPreformatted",
+                language: "bash",
+                text: { _: "textPlain", text: 'echo "hello from the torture set"' },
+              },
+            ],
+            photos: [],
+            documents: [],
+          },
+        },
+      } as never),
+    ]);
+    const msg = await driver.getMessage(111, 7);
+    expect(msg?.text).not.toBe("\x01");
+    // Blocks joined by a newline; inline text flattened in send order.
+    expect(msg?.text).toBe(
+      "here is a bold phrase, italic words, code_token, and the repo.\n" +
+        'echo "hello from the torture set"',
+    );
+    const kinds = msg?.entities.map((e) => e.kind) ?? [];
+    for (const k of ["bold", "italic", "code", "text_link", "pre"]) {
+      expect(kinds).toContain(k);
+    }
+    // Each entity's `text` is the exact inner substring it spans (UTF-16 offsets).
+    expect(msg?.entities.find((e) => e.kind === "bold")?.text).toBe("a bold phrase");
+    expect(msg?.entities.find((e) => e.kind === "italic")?.text).toBe("italic words");
+    expect(msg?.entities.find((e) => e.kind === "code")?.text).toBe("code_token");
+    const link = msg?.entities.find((e) => e.kind === "text_link");
+    expect(link?.text).toBe("the repo");
+    expect(link?.url).toBe("https://github.com/switchroom/switchroom");
+    const pre = msg?.entities.find((e) => e.kind === "pre");
+    expect(pre?.text).toBe('echo "hello from the torture set"');
+    expect(pre?.language).toBe("bash");
+  });
+
   it("keeps the \\x01 sentinel and empty entities for undecoded rich media", async () => {
     const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
     await driver.connect();
     mockClient.getMessages.mockResolvedValueOnce([
       mockMsg({
         text: "",
-        raw: { _: "message", media: { _: "messageMediaUnsupported" } },
+        raw: {
+          _: "message",
+          peerId: { _: "peerUser", userId: 111 },
+          fromId: { _: "peerUser", userId: 222 },
+          media: { _: "messageMediaUnsupported" },
+        },
         entities: [],
       } as never),
     ]);

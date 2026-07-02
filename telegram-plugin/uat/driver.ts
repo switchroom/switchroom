@@ -181,11 +181,21 @@ export class Driver {
     await this.client.connect();
     // `connect()` opens the transport but does NOT start the updates
     // dispatch loop — that's `start()`'s job. For a returning session
-    // (no interactive login) we have to call `startUpdatesLoop()`
-    // ourselves, otherwise `onNewMessage` / `onEditMessage` never
-    // fire and `observeMessages` silently waits forever. Symptom:
-    // `expectMessage` timing out even though the bot's reply has
-    // arrived in the chat (visible in Telegram).
+    // (no interactive login) we have to drive that lifecycle ourselves,
+    // otherwise `onNewMessage` / `onEditMessage` never fire and
+    // `observeMessages` silently waits forever. Symptom: `expectMessage`
+    // timing out even though the bot's reply has arrived in the chat
+    // (visible in Telegram).
+    //
+    // `notifyLoggedIn` is the lifecycle call `start()` makes from its
+    // login callback but a manually-imported session skips — it tells the
+    // updates manager the client is authorized (and seeds self into the
+    // peer cache). mtcute 0.30's own docs recommend calling it, or
+    // otherwise ensuring the user is logged in, before `startUpdatesLoop`.
+    // Resolve self from the imported session and notify BEFORE starting
+    // the loop, matching what `start()` does internally.
+    const me = await this.client.getMe();
+    await this.client.notifyLoggedIn(me.raw);
     await this.client.startUpdatesLoop();
   }
 
@@ -329,18 +339,30 @@ export class Driver {
       else queue.push(m);
     };
 
-    const onNew = (msg: Message): void => {
-      const observed = toObserved(msg, false);
+    // Defensive wrapper: a throw inside the listener propagates out of
+    // mtcute's `onNewMessage`/`onEditMessage` emitter (it does not catch
+    // listener errors) and drops the update entirely, so `observeMessages`
+    // would silently never yield it. `toObserved` is already hardened against
+    // the known `PeersIndex` throw, but any future getter that throws must
+    // NOT be allowed to swallow an observation — log and move on instead.
+    const dispatchObserved = (msg: Message, edited: boolean): void => {
+      let observed: ObservedMessage;
+      try {
+        observed = toObserved(msg, edited);
+      } catch (err) {
+        // eslint-disable-next-line no-console -- harness diagnostic
+        console.warn(
+          `[uat/driver] observeMessages: dropping unobservable message ` +
+          `(id=${msg.id}): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
       if (observed.chatId !== chatId) return;
       if (targetThread !== undefined && observed.threadId !== targetThread) return;
       dispatch(observed);
     };
-    const onEdit = (msg: Message): void => {
-      const observed = toObserved(msg, true);
-      if (observed.chatId !== chatId) return;
-      if (targetThread !== undefined && observed.threadId !== targetThread) return;
-      dispatch(observed);
-    };
+    const onNew = (msg: Message): void => dispatchObserved(msg, false);
+    const onEdit = (msg: Message): void => dispatchObserved(msg, true);
 
     c.onNewMessage.add(onNew);
     c.onEditMessage.add(onEdit);
@@ -887,19 +909,52 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
   // formatting scenario will flag the empty-entities case loudly rather than
   // silently pass). It is no longer expected to trigger on the happy path.
   const rawText = msg.text ?? "";
-  const isRichMedia = rawText === "" &&
+  // Bot API 10.1 rich messages (`sendRichMessage({ markdown })`) arrive on the
+  // wire in a NEW TL field — `message.richMessage` — with the legacy `message`
+  // string left EMPTY and NO `entities`. mtcute 0.30 does not yet map that
+  // field onto `Message.text`/`Message.entities`, so `msg.text` is "" and the
+  // observation looks textless. This is the sibling case to the
+  // `messageMediaUnsupported` sentinel below: the visible text is on the wire,
+  // just in a shape the getter doesn't decode. Flatten the `richMessage`
+  // page-block/RichText tree ourselves into plain text + entities. (Confirmed
+  // via a raw-TL dump on the uat-host runner, #2744.)
+  const richDecoded =
+    rawText === "" && msg.raw._ === "message"
+      ? decodeRichMessage((msg.raw as { richMessage?: unknown }).richMessage)
+      : null;
+  const isRichMedia = rawText === "" && !richDecoded &&
     msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
+  // Resolve chat/sender ids from the RAW TL peer, not the `msg.chat` /
+  // `msg.sender` getters. Those getters look the peer up in the update's
+  // `PeersIndex` and THROW `MtArgumentError` ("peer not available in this
+  // index") when it's absent — which happens for the driver because it runs
+  // on `MemoryStorage` (empty peer cache each connect), so an incoming bot
+  // reply can arrive before that peer has been cached. An unguarded throw
+  // here propagates out of the mtcute `onNewMessage`/`onEditMessage` emitter
+  // (that emitter does not catch listener errors), so the WHOLE update is
+  // dropped and `observeMessages` never yields it — the exact "bot replied
+  // fast but `expectMessage` timed out" failure. `getMarkedPeerId` reads the
+  // raw TL peer directly and never touches the index, so it can't throw.
+  const chatId = getMarkedPeerId(msg.raw.peerId);
+  const rawFrom = msg.raw._ === "message" || msg.raw._ === "messageService"
+    ? msg.raw.fromId
+    : undefined;
+  const senderUserId = rawFrom
+    ? getMarkedPeerId(rawFrom)
+    : chatId; // no explicit sender ⇒ the DM peer is the sender (bot reply in a DM)
   return {
-    chatId: msg.chat.id,
+    chatId,
     messageId: msg.id,
     threadId: msg.replyToMessage?.threadId ?? undefined,
-    text: isRichMedia ? "\x01" : rawText,
-    senderUserId: msg.sender.id,
-    fromBot: msg.sender.type === "user" && msg.sender.isBot === true,
+    text: isRichMedia ? "\x01" : (richDecoded ? richDecoded.text : rawText),
+    senderUserId,
+    fromBot: safeIsFromBot(msg),
     date: msg.date,
     edited,
     silent: msg.isSilent,
-    entities: isRichMedia ? [] : toObservedEntities(msg),
+    entities: isRichMedia
+      ? []
+      : (richDecoded ? richDecoded.entities : toObservedEntities(msg)),
     link: safeMessageLink(msg),
   };
 }
@@ -930,6 +985,157 @@ function toObservedEntities(msg: Message): ObservedEntity[] {
 }
 
 /**
+ * Decode a Bot API 10.1 rich message (`message.richMessage`) into flat
+ * `{ text, entities }`, mirroring what `Message.text` + `Message.entities`
+ * would carry if mtcute mapped the field. Returns `null` when the value isn't
+ * a `richMessage` (so callers fall back to the legacy `message` string).
+ *
+ * On the wire a `richMessage` is Telegram's Instant-View page tree: a list of
+ * `pageBlock`s, each carrying a `RichText` node. We walk the two block kinds
+ * the gateway actually emits — `pageBlockParagraph` (styled inline text) and
+ * `pageBlockPreformatted` (a fenced code block → a `pre` entity spanning the
+ * whole block) — joining blocks with a newline. The RichText tree is a
+ * discriminated union: leaf `textPlain` carries a string; `textConcat` holds a
+ * `texts[]` sequence; the styled wrappers (`textBold`/`textItalic`/`textFixed`/
+ * `textUrl`/…) nest another RichText in `.text`. We flatten depth-first,
+ * tracking UTF-16 code-unit offsets (JS string `.length` is already UTF-16, the
+ * same units Telegram uses on the wire) and emit an `ObservedEntity` for each
+ * styled span so the render-fidelity assertions see the same entity structure
+ * the legacy `entities` path produces.
+ */
+function decodeRichMessage(
+  rich: unknown,
+): { text: string; entities: ObservedEntity[] } | null {
+  const rm = rich as
+    | { _?: string; blocks?: Array<{ _?: string; text?: unknown; language?: string }> }
+    | undefined;
+  if (!rm || rm._ !== "richMessage" || !Array.isArray(rm.blocks)) return null;
+
+  let text = "";
+  const entities: ObservedEntity[] = [];
+
+  const emit = (
+    kind: string,
+    start: number,
+    extra?: { url?: string; language?: string },
+  ): void => {
+    const length = text.length - start;
+    if (length <= 0) return;
+    entities.push({
+      kind,
+      offset: start,
+      length,
+      text: text.slice(start, start + length),
+      url: extra?.url,
+      language: extra?.language,
+    });
+  };
+
+  // Depth-first walk of a RichText node, appending plain text to `text` and
+  // pushing an entity for each styled wrapper (mapping TL kinds to mtcute's).
+  const walk = (node: unknown): void => {
+    const n = node as {
+      _?: string;
+      text?: unknown;
+      texts?: unknown[];
+      url?: string;
+    };
+    if (!n || typeof n._ !== "string") return;
+    switch (n._) {
+      case "textEmpty":
+        return;
+      case "textPlain":
+        if (typeof n.text === "string") text += n.text;
+        return;
+      case "textConcat":
+        for (const t of n.texts ?? []) walk(t);
+        return;
+      case "textBold": {
+        const s = text.length;
+        walk(n.text);
+        emit("bold", s);
+        return;
+      }
+      case "textItalic": {
+        const s = text.length;
+        walk(n.text);
+        emit("italic", s);
+        return;
+      }
+      case "textUnderline": {
+        const s = text.length;
+        walk(n.text);
+        emit("underline", s);
+        return;
+      }
+      case "textStrike": {
+        const s = text.length;
+        walk(n.text);
+        emit("strikethrough", s);
+        return;
+      }
+      case "textFixed": {
+        // Inline fixed-width (`code_token`) → Bot API `code` entity.
+        const s = text.length;
+        walk(n.text);
+        emit("code", s);
+        return;
+      }
+      case "textSpoiler": {
+        const s = text.length;
+        walk(n.text);
+        emit("spoiler", s);
+        return;
+      }
+      case "textUrl": {
+        const s = text.length;
+        walk(n.text);
+        emit("text_link", s, { url: n.url });
+        return;
+      }
+      case "textEmail": {
+        const s = text.length;
+        walk(n.text);
+        emit("email", s);
+        return;
+      }
+      default:
+        // Any other wrapper (marked/sub/superscript/phone/anchor/…) — keep its
+        // visible text but don't classify the span; the render assertions only
+        // key off the kinds the gateway emits.
+        if (n.text !== undefined) walk(n.text);
+        return;
+    }
+  };
+
+  for (const block of rm.blocks) {
+    if (text.length > 0) text += "\n"; // join blocks in send order
+    if (block._ === "pageBlockPreformatted") {
+      // Fenced code block → one `pre` entity spanning the whole block, with
+      // the language string mtcute exposes for `pre` fences.
+      const s = text.length;
+      walk(block.text);
+      const length = text.length - s;
+      if (length > 0) {
+        entities.push({
+          kind: "pre",
+          offset: s,
+          length,
+          text: text.slice(s, s + length),
+          url: undefined,
+          language: block.language || undefined,
+        });
+      }
+    } else {
+      // pageBlockParagraph (and any other text-bearing block) — inline walk.
+      walk(block.text);
+    }
+  }
+
+  return { text, entities };
+}
+
+/**
  * `Message.link` throws (`MtArgumentError`) for chats that don't support
  * message permalinks — notably private DMs, which is exactly where most
  * UAT scenarios run. Swallow that and leave the field unset rather than
@@ -941,5 +1147,24 @@ function safeMessageLink(msg: Message): string | undefined {
     return msg.link;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Whether the message was sent by a bot. Reads `msg.sender`, which resolves
+ * the peer via the update's `PeersIndex` and THROWS `MtArgumentError` when
+ * that peer isn't cached (the driver's `MemoryStorage` starts empty, so an
+ * incoming reply can arrive before its sender is cached). We only need
+ * `fromBot` for coarse classification, and `expectMessage`'s `from: "bot"`
+ * filter keys off `senderUserId` (resolved from the raw peer above), not this
+ * flag — so a swallowed lookup degrades to `false` rather than dropping the
+ * whole observation. Group/DM messages with a cached sender still classify
+ * correctly.
+ */
+function safeIsFromBot(msg: Message): boolean {
+  try {
+    return msg.sender.type === "user" && msg.sender.isBot === true;
+  } catch {
+    return false;
   }
 }
