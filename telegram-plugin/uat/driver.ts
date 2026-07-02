@@ -187,15 +187,13 @@ export class Driver {
     // timing out even though the bot's reply has arrived in the chat
     // (visible in Telegram).
     //
-    // Crucially, `startUpdatesLoop()` alone is NOT enough. In mtcute 0.30
-    // the updates manager will not DISPATCH new-message updates unless it
-    // has been told the client is logged in — `start()` does this via
-    // `notifyLoggedIn` in its login callback, but a manually-imported
-    // session skips `start()` entirely. Without it the manager starts the
-    // loop while still considering the user logged-out, the incoming
-    // update is fetched but never routed to `onNewMessage`, and the
-    // observer waits forever. So: resolve self from the imported session
-    // and notify the manager BEFORE starting the loop.
+    // `notifyLoggedIn` is the lifecycle call `start()` makes from its
+    // login callback but a manually-imported session skips — it tells the
+    // updates manager the client is authorized (and seeds self into the
+    // peer cache). mtcute 0.30's own docs recommend calling it, or
+    // otherwise ensuring the user is logged in, before `startUpdatesLoop`.
+    // Resolve self from the imported session and notify BEFORE starting
+    // the loop, matching what `start()` does internally.
     const me = await this.client.getMe();
     await this.client.notifyLoggedIn(me.raw);
     await this.client.startUpdatesLoop();
@@ -359,11 +357,6 @@ export class Driver {
         );
         return;
       }
-      // TEMP DIAGNOSTIC (remove once matching confirmed): why does an
-      // observed message fail to match expectMessage? Log the target vs
-      // observed chatId, the resolved sender, edited flag, and text
-      // length (NOT the body — hygiene). Reveals chatId-mismatch vs
-      // sender-filter vs empty-text as the reason expectMessage times out.
       if (observed.chatId !== chatId) return;
       if (targetThread !== undefined && observed.threadId !== targetThread) return;
       dispatch(observed);
