@@ -199,6 +199,24 @@ export class Driver {
     const me = await this.client.getMe();
     await this.client.notifyLoggedIn(me.raw);
     await this.client.startUpdatesLoop();
+
+    // TEMP DIAGNOSTIC (remove once dispatch confirmed): distinguish
+    // "no updates arrive at all" from "raw updates arrive but new_message
+    // is never dispatched to onNewMessage". Logs the raw TL `_` type of
+    // every update the manager dispatches, and separately whether the
+    // parsed new/edit-message emitters ever fire. No message bodies or
+    // peer ids are logged (session-secret hygiene) — only update kinds.
+    /* eslint-disable no-console -- harness diagnostic */
+    this.client.onRawUpdate.add((info: { update?: { _?: string } }) => {
+      console.warn(`[uat/driver][diag] onRawUpdate: ${info?.update?._ ?? "?"}`);
+    });
+    this.client.onNewMessage.add(() => {
+      console.warn(`[uat/driver][diag] onNewMessage FIRED`);
+    });
+    this.client.onEditMessage.add(() => {
+      console.warn(`[uat/driver][diag] onEditMessage FIRED`);
+    });
+    /* eslint-enable no-console */
   }
 
   async disconnect(): Promise<void> {
