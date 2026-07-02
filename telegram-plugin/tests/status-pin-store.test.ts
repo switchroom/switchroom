@@ -3,6 +3,7 @@ import {
   loadStatusPins,
   persistStatusPins,
   pinnedMessageIsOurs,
+  reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
   type PersistedStatusPin,
   type StatusPinStoreFsSeam,
@@ -86,7 +87,8 @@ describe("status-pin-store", () => {
   });
 
   it("fail-open: wrong envelope version / shape loads as []", () => {
-    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 2, pins: [pin()] }) });
+    // v3 is an unknown FUTURE version (v1 + v2 are the supported set).
+    const { fs: f1 } = memFs({ [PATH]: JSON.stringify({ v: 3, pins: [pin()] }) });
     expect(loadStatusPins(PATH, f1)).toEqual([]);
     const { fs: f2 } = memFs({ [PATH]: JSON.stringify({ v: 1, pins: "nope" }) });
     expect(loadStatusPins(PATH, f2)).toEqual([]);
@@ -231,5 +233,218 @@ describe("runStatusPinBootCleanup", () => {
     });
     expect(res).toEqual({ cleared: 0, total: 0 });
     expect(calls).toBe(0);
+  });
+
+  it("unpins a PENDING record too (crash in the persist-after-pin window)", async () => {
+    // Fix 1: a pin that landed in Telegram but whose confirming rewrite never
+    // ran leaves a `pending` record. Boot cleanup must treat it like a confirmed
+    // pin and unpin it — otherwise the orphan lingers forever.
+    const { fs } = memFs();
+    persistStatusPins(PATH, fs, [
+      pin({ pinKey: "fg:c:9", chatId: "-100777", messageId: 314, pending: true }),
+    ]);
+    const unpinned: Array<[string, number]> = [];
+    const res = await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (chatId, messageId) => {
+        unpinned.push([chatId, messageId]);
+      },
+      log: () => {},
+    });
+    expect(unpinned).toEqual([["-100777", 314]]);
+    expect(res).toEqual({ cleared: 1, total: 1 });
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+});
+
+/**
+ * Envelope versioning — a v1 snapshot (no `pending` field) must still load
+ * fail-open as a confirmed pin, and v2 must round-trip the `pending` flag.
+ */
+describe("status-pin-store — envelope version compat", () => {
+  it("loads a legacy v1 snapshot (no pending field) as confirmed pins", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 1,
+        pins: [{ pinKey: "fg:c:3", chatId: "-100123", messageId: 715 }],
+      }),
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].pending).toBeUndefined();
+    expect(loaded[0].messageId).toBe(715);
+  });
+
+  it("round-trips a v2 pending flag and writes v2 envelopes", () => {
+    const { fs, files } = memFs();
+    persistStatusPins(PATH, fs, [pin({ pending: true })]);
+    expect(JSON.parse(files.get(PATH)!).v).toBe(2);
+    expect(loadStatusPins(PATH, fs)[0].pending).toBe(true);
+  });
+
+  it("rejects an unknown future envelope version (fail-open [])", () => {
+    const { fs } = memFs({ [PATH]: JSON.stringify({ v: 3, pins: [pin()] }) });
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  it("drops a row with a non-boolean pending field", () => {
+    const { fs } = memFs({
+      [PATH]: JSON.stringify({
+        v: 2,
+        pins: [
+          pin({ messageId: 715 }),
+          { pinKey: "k", chatId: "c", messageId: 1, pending: "yes" },
+        ],
+      }),
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0].messageId).toBe(715);
+  });
+});
+
+/**
+ * reconcileAndPersistStatusPin — the persist-BEFORE-pin ordering that closes the
+ * leak window (Fix 1). These exercise the REAL wrapper the gateway calls, with
+ * an fs seam that can crash at a chosen write so we can prove the leak is
+ * recovered (red→green against the pre-fix persist-after ordering).
+ */
+describe("reconcileAndPersistStatusPin — persist-before-pin ordering", () => {
+  it("writes a PENDING record BEFORE the pin API call", async () => {
+    const { fs } = memFs();
+    const order: string[] = [];
+    // Record what's on disk at the moment the pin API is invoked.
+    let onDiskAtPin: PersistedStatusPin[] = [];
+    const next = await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      snapshotOthers: () => [],
+      applyPin: async () => {
+        order.push("pin-api");
+        onDiskAtPin = loadStatusPins(PATH, fs);
+        return { messageId: 715 };
+      },
+      log: () => {},
+    });
+    // At the moment the pin API ran, a pending record was already on disk.
+    expect(onDiskAtPin).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
+    ]);
+    // After success it's confirmed (pending cleared).
+    expect(next).toEqual({ messageId: 715 });
+    expect(loadStatusPins(PATH, fs)).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
+    ]);
+  });
+
+  it("RED→GREEN: a crash between pin-lands and confirm leaves a recoverable pending record", async () => {
+    // Simulate SIGKILL: the pin API lands in Telegram, then the process dies
+    // before the confirming rewrite. We model the crash by throwing out of
+    // applyPin AFTER it 'pinned' — the pending record must survive on disk.
+    const { fs } = memFs();
+    let pinnedInTelegram: number | null = null;
+    await expect(
+      reconcileAndPersistStatusPin({
+        path: PATH,
+        fs,
+        pinKey: "fg:c:3",
+        chatId: "-100123",
+        op: { kind: "pin", messageId: 715 },
+        snapshotOthers: () => [],
+        applyPin: async () => {
+          pinnedInTelegram = 715; // the pin landed in Telegram
+          throw new Error("SIGKILL — process died before confirm rewrite");
+        },
+        log: () => {},
+      }),
+    ).rejects.toThrow("SIGKILL");
+
+    // The pin is live in Telegram...
+    expect(pinnedInTelegram).toBe(715);
+    // ...AND a pending record survived on disk (this is what the pre-fix
+    // persist-AFTER-pin ordering FAILED to do — the store would have been empty
+    // and boot cleanup blind to the orphan).
+    const persisted = loadStatusPins(PATH, fs);
+    expect(persisted).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715, pending: true },
+    ]);
+
+    // Next boot: cleanup unpins the orphan using the pending record.
+    const unpinned: Array<[string, number]> = [];
+    await runStatusPinBootCleanup({
+      path: PATH,
+      fs,
+      unpin: async (c, m) => {
+        unpinned.push([c, m]);
+      },
+      log: () => {},
+    });
+    expect(unpinned).toEqual([["-100123", 715]]);
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  it("clears the pending record when the pin API fails (no phantom claim)", async () => {
+    const { fs } = memFs();
+    const next = await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      snapshotOthers: () => [],
+      // reconcilePin returns null (prevState) when the pin API throws.
+      applyPin: async () => null,
+      log: () => {},
+    });
+    expect(next).toBeNull();
+    // Pending record dropped — nothing to leak, nothing was pinned.
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
+  });
+
+  it("preserves OTHER live claims while flipping one key pending→confirmed", async () => {
+    const { fs } = memFs();
+    const other: PersistedStatusPin = {
+      pinKey: "wk:agent-x",
+      chatId: "-100999",
+      messageId: 42,
+    };
+    await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "pin", messageId: 715 },
+      snapshotOthers: () => [other],
+      applyPin: async () => ({ messageId: 715 }),
+      log: () => {},
+    });
+    const loaded = loadStatusPins(PATH, fs);
+    expect(loaded).toContainEqual(other);
+    expect(loaded).toContainEqual({
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      messageId: 715,
+    });
+  });
+
+  it("clear op: unpins then drops the record (post-pin ordering is safe)", async () => {
+    const { fs } = memFs();
+    persistStatusPins(PATH, fs, [pin({ pinKey: "fg:c:3", messageId: 715 })]);
+    const next = await reconcileAndPersistStatusPin({
+      path: PATH,
+      fs,
+      pinKey: "fg:c:3",
+      chatId: "-100123",
+      op: { kind: "clear" },
+      snapshotOthers: () => [],
+      applyPin: async () => null,
+      log: () => {},
+    });
+    expect(next).toBeNull();
+    expect(loadStatusPins(PATH, fs)).toEqual([]);
   });
 });

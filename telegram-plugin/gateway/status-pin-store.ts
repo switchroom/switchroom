@@ -35,15 +35,33 @@ export interface StatusPinStoreFsSeam {
 }
 
 /** One persisted pin claim: the pinKey, the chat it lives in, and the pinned
- *  message id (so boot cleanup can unpin exactly that message). */
+ *  message id (so boot cleanup can unpin exactly that message).
+ *
+ *  Concurrency note: there is NO turn/worker-id dimension on the ownership guard
+ *  because the single-gateway startup mutex (acquireStartupLock) guarantees
+ *  exactly one live gateway per agent owns this shared file at a time — so a
+ *  pinKey (`fg:`/`wk:`) is unambiguous within the one owning process, and boot
+ *  cleanup only ever runs after winning that mutex.
+ *
+ *  `pending` marks a record written BEFORE the pin API call landed (persist-
+ *  intent-first). A crash in the window between the pin API call and the
+ *  confirming rewrite leaves a pending record on disk; next-boot cleanup unpins
+ *  pending records too, closing the persist-after-pin leak. Absent/false means
+ *  the pin was confirmed applied. Optional so a v1 snapshot (no field) still
+ *  loads fail-open as a confirmed pin. */
 export interface PersistedStatusPin {
   pinKey: string
   chatId: string
   messageId: number
+  /** True while the pin API call is in-flight / unconfirmed (see above). */
+  pending?: boolean
 }
 
+/** Envelope version. v1 had no `pending` field; a v1 row loads as a confirmed
+ *  pin (pending undefined). v2 adds the optional `pending` flag. Both load
+ *  fail-open — an unknown/newer version yields []. */
 interface SnapshotEnvelope {
-  v: 1
+  v: 1 | 2
   pins: PersistedStatusPin[]
 }
 
@@ -55,7 +73,8 @@ function isPinRow(x: unknown): x is PersistedStatusPin {
     o.pinKey.length > 0 &&
     typeof o.chatId === 'string' &&
     o.chatId.length > 0 &&
-    typeof o.messageId === 'number'
+    typeof o.messageId === 'number' &&
+    (o.pending === undefined || typeof o.pending === 'boolean')
   )
 }
 
@@ -84,7 +103,7 @@ export function loadStatusPins(
   }
   if (parsed == null || typeof parsed !== 'object') return []
   const env = parsed as Record<string, unknown>
-  if (env.v !== 1 || !Array.isArray(env.pins)) return []
+  if ((env.v !== 1 && env.v !== 2) || !Array.isArray(env.pins)) return []
   return env.pins.filter(isPinRow)
 }
 
@@ -100,7 +119,7 @@ export function persistStatusPins(
   snapshot: readonly PersistedStatusPin[],
   log: (line: string) => void = (l) => process.stderr.write(l),
 ): void {
-  const env: SnapshotEnvelope = { v: 1, pins: [...snapshot] }
+  const env: SnapshotEnvelope = { v: 2, pins: [...snapshot] }
   const tmp = path + '.tmp'
   try {
     fs.writeFileSync(tmp, JSON.stringify(env))
@@ -152,10 +171,15 @@ export function pinnedMessageIsOurs(
  * (the gateway's thin wrapper just binds the live fs / unpin api / logger).
  *
  * Any pin persisted by a PRIOR session is stale by definition — its turn ended
- * or the session crashed before its unpin reconcile ran. We best-effort unpin
- * each persisted entry (a failure is non-fatal) and then EMPTY the store
- * regardless, so a permanently-undeliverable unpin can't re-run on every boot.
- * We do NOT re-adopt or re-pin. Returns the counts for logging/testing.
+ * or the session crashed before its unpin reconcile ran. This includes records
+ * left `pending` (the persist-intent-first write from `reconcileAndPersist-
+ * StatusPin`): a crash between the pin API call and its confirming rewrite
+ * leaves a pending record whose pin MAY have landed in Telegram, so we must
+ * treat it exactly like a confirmed one and unpin it. We therefore best-effort
+ * unpin EVERY persisted entry (confirmed and pending alike — a failure is
+ * non-fatal) and then EMPTY the store regardless, so a permanently-
+ * undeliverable unpin can't re-run on every boot. We do NOT re-adopt or re-pin.
+ * Returns the counts for logging/testing.
  *
  * CRITICAL: the caller MUST only invoke this AFTER winning the startup mutex.
  * The store is a shared per-agent file; on a double-boot a losing gateway
@@ -186,4 +210,93 @@ export async function runStatusPinBootCleanup(args: {
   // them would re-attempt the same (already-tried) unpins on every future boot.
   persistStatusPins(args.path, args.fs, [], log)
   return { cleared, total: persisted.length }
+}
+
+/**
+ * The pin action the gateway wants to take for one key, distilled from
+ * `decidePinAction`. `pin` carries the target message id; `clear` covers both
+ * unpin and no-longer-pinned. The gateway's reconcile computes this and hands
+ * it here so the persist-BEFORE-pin ordering lives in one testable place.
+ */
+export type StatusPinPersistOp =
+  | { kind: 'pin'; messageId: number }
+  | { kind: 'clear' }
+
+/**
+ * Persist-ordering wrapper closing the persist-AFTER-pin leak window.
+ *
+ * THE BUG this fixes: previously the gateway pinned the Telegram message FIRST,
+ * then snapshotted the claim set to disk. A SIGKILL landing between the pin API
+ * call succeeding and the snapshot rename left a pin live in Telegram with NO
+ * on-disk record — so next-boot cleanup couldn't see it and the pin lingered
+ * forever.
+ *
+ * THE FIX: for a `pin`, write a `pending` record to disk BEFORE issuing the pin
+ * API call, then rewrite it as confirmed (pending cleared) once the pin lands
+ * — or drop it if the pin failed. Now a crash anywhere in the window leaves a
+ * pending record on disk, and boot cleanup unpins pending records too (see
+ * runStatusPinBootCleanup), so the orphan is recovered next boot.
+ *
+ * `snapshotOthers` returns the OTHER live claims (every key except `pinKey`) so
+ * the whole set is rewritten atomically each step — mirrors how the gateway
+ * snapshots its Map. `applyPin` performs the real Telegram pin/unpin (the
+ * gateway binds `reconcilePin`) and returns the next in-memory state so the
+ * caller can update its Map. Never throws — persistence is best-effort/fail-open
+ * and pin errors are already swallowed by `applyPin` (reconcilePin).
+ */
+export async function reconcileAndPersistStatusPin(args: {
+  path: string
+  fs: StatusPinStoreFsSeam
+  pinKey: string
+  chatId: string
+  op: StatusPinPersistOp
+  /** Live claims for every OTHER key (rewritten alongside on each step). */
+  snapshotOthers: () => PersistedStatusPin[]
+  /** Execute the real pin/unpin; returns the confirmed message id (pin) or
+   *  null (cleared). Must never throw — API errors are swallowed inside. */
+  applyPin: () => Promise<{ messageId: number } | null>
+  log?: (line: string) => void
+}): Promise<{ messageId: number } | null> {
+  const { path, fs, pinKey, chatId, op } = args
+  const log = args.log ?? ((l: string) => process.stderr.write(l))
+
+  if (op.kind === 'pin') {
+    // Persist INTENT first, marked pending — BEFORE the pin API call. If we
+    // crash after the pin lands but before the confirm rewrite, this pending
+    // record is what boot cleanup uses to unpin the orphan.
+    persistStatusPins(
+      path,
+      fs,
+      [
+        ...args.snapshotOthers(),
+        { pinKey, chatId, messageId: op.messageId, pending: true },
+      ],
+      log,
+    )
+    const next = await args.applyPin()
+    if (next == null) {
+      // Pin failed (claim NOT taken by reconcilePin). Clear the pending record
+      // so we don't leave a phantom claim for a pin that never landed.
+      persistStatusPins(path, fs, args.snapshotOthers(), log)
+      return null
+    }
+    // Pin confirmed — rewrite the record without the pending flag.
+    persistStatusPins(
+      path,
+      fs,
+      [
+        ...args.snapshotOthers(),
+        { pinKey, chatId, messageId: next.messageId },
+      ],
+      log,
+    )
+    return next
+  }
+
+  // clear: unpin (best-effort) THEN drop the record. Ordering is safe here —
+  // if we crash after the unpin but before the rewrite, the stale record just
+  // gets unpinned again next boot (idempotent), never a lingering pin.
+  const next = await args.applyPin()
+  persistStatusPins(path, fs, args.snapshotOthers(), log)
+  return next
 }
