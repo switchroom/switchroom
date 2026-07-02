@@ -909,6 +909,19 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
   // formatting scenario will flag the empty-entities case loudly rather than
   // silently pass). It is no longer expected to trigger on the happy path.
   const rawText = msg.text ?? "";
+  // TEMP DIAGNOSTIC (#2744): dump the COMPLETE raw TL object for any decoded-
+  // empty message so we can see exactly where sendRichMessage puts the visible
+  // text. BigInt-safe replacer. Remove before final commit.
+  if (rawText === "" && msg.raw._ === "message") {
+    // eslint-disable-next-line no-console -- temp harness diagnostic
+    console.warn(
+      "[uat/driver][TEMP-RAWDUMP] empty-text message id=" + msg.id + " raw=" +
+        JSON.stringify(
+          msg.raw,
+          (_k, v) => (typeof v === "bigint" ? v.toString() + "n" : v),
+        ),
+    );
+  }
   const isRichMedia = rawText === "" &&
     msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
   // Resolve chat/sender ids from the RAW TL peer, not the `msg.chat` /
