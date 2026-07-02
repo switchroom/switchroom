@@ -266,6 +266,28 @@ function replaceDashes(text: string): { out: string; replaced: number } {
  * checked per call so an operator can flip it via env var without a
  * restart of an in-process test.
  */
+/**
+ * Dash-only normalization — the em/en-dash substitution from `scrubVoice`
+ * WITHOUT the opener-strip or the metric/result-object side effects.
+ *
+ * Exists so non-reply surfaces (progress cards, worker narration, PTY
+ * previews via card-format.ts) can close the em-dash leak on model-authored
+ * prose without pulling in the opener strip (which those paths must not do)
+ * and without duplicating the dash regexes. Reuses the exact same
+ * `park`/`replaceDashes`/`restore` mechanism as `scrubVoice`, so code spans
+ * and fenced blocks are masked identically and dashes inside them survive.
+ *
+ * Honors the same `SWITCHROOM_DISABLE_VOICE_SCRUB` kill switch. Returns the
+ * input unchanged when disabled, empty, or nothing changed.
+ */
+export function normalizeDashes(text: string): string {
+  if (!enabled() || text.length === 0) return text
+  const { parked, parts } = park(text)
+  const { out, replaced } = replaceDashes(parked)
+  if (replaced === 0) return text
+  return restore(out, parts)
+}
+
 export function scrubVoice(text: string): VoiceScrubResult {
   if (!enabled() || text.length === 0) {
     return { scrubbed: text, replaced: 0, openersStripped: 0 }

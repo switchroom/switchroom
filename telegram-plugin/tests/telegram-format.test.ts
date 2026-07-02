@@ -123,7 +123,10 @@ describe('splitMarkdownChunks', () => {
     // A long body with a fenced code block straddling the cap. The chunker
     // must move the whole fence to a single chunk so no chunk has an odd
     // number of fence delimiters (which would swallow the next chunk).
-    const fence = '```\n' + 'code line\n'.repeat(20) + '```'
+    // The fence FITS within the cap, so the chunker can move it whole to a
+    // single chunk and keep every chunk's fence count balanced. (An oversized
+    // fence that cannot fit is hard-sliced instead — see the F7 tests below.)
+    const fence = '```\n' + 'code line\n'.repeat(8) + '```'
     const text = 'intro paragraph '.repeat(15) + '\n\n' + fence + '\n\noutro paragraph'
     const chunks = splitMarkdownChunks(text, 180)
     for (const c of chunks) {
@@ -150,15 +153,37 @@ describe('splitMarkdownChunks', () => {
     }
   })
 
-  test('emits an oversized indivisible block whole rather than looping forever', () => {
-    // A single fenced block larger than maxLen has no safe interior cut —
-    // the chunker emits it whole (a louder, debuggable Telegram reject
-    // beats an infinite loop).
+  test('hard-slices an indivisible block that exceeds the cap (F7 — no oversized chunk)', () => {
+    // A single fenced block larger than maxLen has no safe interior cut. The
+    // OLD behaviour emitted it whole, which Telegram rejects with
+    // RICH_MESSAGE_TEXT_TOO_LONG and drops the entire answer. F7 delegates to
+    // hardSliceToCap so the region comes out as multiple <= cap character
+    // slices instead — degraded-but-delivered beats a hard reject.
     const giant = '```\n' + 'x'.repeat(500) + '\n```'
     const chunks = splitMarkdownChunks(giant, 100)
-    // It comes out as one (oversized) chunk, not split mid-fence.
-    expect(chunks.length).toBe(1)
-    expect(chunks[0]).toBe(giant)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(100)
+    // No content is dropped — the slices concatenate back to the original.
+    expect(chunks.join('')).toBe(giant)
+  })
+
+  test('hard-slices a single unbreakable >maxLen token run into <= cap chunks (F7)', () => {
+    // One giant pipe-bearing line with no space/newline boundary below the
+    // cap: neither the blank-line, newline, nor space heuristic can find a
+    // cut, and the table-row back-off cannot help either. This is the exact
+    // "cut <= 0" path — it must hard-slice, not emit an oversized chunk.
+    const runaway = 'a|b|'.repeat(200) // 800 chars, no spaces/newlines
+    const chunks = splitMarkdownChunks(runaway, 100)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(100)
+    expect(chunks.join('')).toBe(runaway)
+  })
+
+  test('an indivisible region larger than the real 32768 cap still slices to <= cap (F7)', () => {
+    const giant = 'z'.repeat(RICH_MESSAGE_MAX_CHARS + 5000)
+    const chunks = splitMarkdownChunks(giant) // default cap = RICH_MESSAGE_MAX_CHARS
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(RICH_MESSAGE_MAX_CHARS)
   })
 
   // -------------------------------------------------------------------------

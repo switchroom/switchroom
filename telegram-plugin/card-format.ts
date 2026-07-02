@@ -28,6 +28,7 @@
  */
 
 import { escapeMarkdown, codeSpanSafe } from './format.js'
+import { normalizeDashes } from './text-voice-scrub.js'
 
 /**
  * Re-export so card surfaces have one import for the markdown escaper they
@@ -127,7 +128,12 @@ export function truncate(s: string, n: number): string {
  * Run this BEFORE `truncate` + `escapeMarkdown`: clean → measure → escape.
  */
 export function stripMarkdown(s: string): string {
-  let out = s;
+  // Close the em-dash leak on this model-authored-prose surface using the
+  // SAME dash logic as the reply-path voice scrub (no duplicated regex). Run
+  // it FIRST, while code spans (`` `…` ``) still have their backticks intact,
+  // so `normalizeDashes`'s own code-region masking preserves a dash inside a
+  // code span before the backtick-stripping below erases the fences.
+  let out = normalizeDashes(s);
   // Inline + leftover code spans → bare text.
   out = out.replace(/`+/g, '');
   // Links / images: [text](url) and ![alt](url) → the label.
