@@ -72,6 +72,45 @@ export interface ObservedMessage {
    * must be silent, only the final answer should ping.
    */
   silent: boolean;
+  /**
+   * The rich-formatting entities Telegram actually attached to the
+   * rendered message (bold / italic / code / pre / text_link / …),
+   * normalized from mtcute's `Message.entities`. This is what the
+   * highest-fidelity UAT layer asserts on: not the markdown we SENT, but
+   * the entity structure Telegram PARSED and will render. Empty array for
+   * a plain-text message with no formatting.
+   *
+   * Empty (never undefined) when the message body could not be decoded to
+   * real text+entities (see `text === "\x01"` sentinel below).
+   */
+  entities: ObservedEntity[];
+  /**
+   * The `t.me/c/<internal_chat>/<msgid>` (or `t.me/<username>/<msgid>`)
+   * permalink to this message, for human eyeball reference in UAT output.
+   * `undefined` for chats that don't support message links (private DMs) —
+   * mtcute's `Message.link` getter throws there, so we swallow and leave it
+   * unset rather than fail the observation.
+   */
+  link?: string;
+}
+
+/**
+ * One rich-formatting entity as Telegram parsed it, flattened from
+ * mtcute's `MessageEntity` into the fields a UAT assertion cares about.
+ * `kind` is mtcute's entity kind (`bold`, `italic`, `code`, `pre`,
+ * `text_link`, `blockquote`, …); `text` is the exact inner substring the
+ * entity spans; `offset`/`length` are UTF-16 code-unit coordinates (the
+ * same units Telegram uses on the wire).
+ */
+export interface ObservedEntity {
+  kind: string;
+  offset: number;
+  length: number;
+  text: string;
+  /** Destination for `text_link` entities; undefined otherwise. */
+  url?: string;
+  /** Language info string for `pre` fenced blocks; undefined otherwise. */
+  language?: string;
 }
 
 export interface ObservedButton {
@@ -838,10 +877,15 @@ export class Driver {
 }
 
 function toObserved(msg: Message, edited: boolean): ObservedMessage {
-  // Bot API 10.1 sendRichMessage stores text in a new MTProto media type.
-  // mtcute 0.27.9 decodes this as messageMediaUnsupported with empty
-  // message.message. Use a sentinel so text-based assertions still fire
-  // until mtcute is updated to support the new TL constructor.
+  // Bot API 10.1 rich messages (`sendMessage` with `{ markdown }`) used to
+  // arrive as `messageMediaUnsupported` with an empty `message.message` on
+  // the pinned mtcute (0.27.x). With mtcute >=0.30 the message decodes to
+  // real text + entities, so we surface those directly. The
+  // `messageMediaUnsupported` sentinel path is KEPT as a defensive fallback:
+  // if a future Bot API / TL-layer change ever regresses the decode, the
+  // `\x01` sentinel still lets text-presence assertions fire (and the
+  // formatting scenario will flag the empty-entities case loudly rather than
+  // silently pass). It is no longer expected to trigger on the happy path.
   const rawText = msg.text ?? "";
   const isRichMedia = rawText === "" &&
     msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
@@ -855,5 +899,47 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
     date: msg.date,
     edited,
     silent: msg.isSilent,
+    entities: isRichMedia ? [] : toObservedEntities(msg),
+    link: safeMessageLink(msg),
   };
+}
+
+/**
+ * Flatten mtcute's `Message.entities` into the `ObservedEntity[]` the UAT
+ * assertions consume. Pulls the entity `url` (text_link) and `language`
+ * (pre) out of the discriminated `params` union so scenarios can assert on
+ * link destinations and fenced-block languages, not just the span kind.
+ */
+function toObservedEntities(msg: Message): ObservedEntity[] {
+  // Real mtcute always populates `.entities` (empty array for unformatted
+  // text). Guard against a message shape that lacks it (e.g. a hand-rolled
+  // test double) so the observation degrades to "no entities" rather than
+  // throwing and taking down the whole scenario.
+  const entities = msg.entities ?? [];
+  return entities.map((e): ObservedEntity => {
+    const params = e.params;
+    return {
+      kind: e.kind,
+      offset: e.offset,
+      length: e.length,
+      text: e.text,
+      url: params.kind === "text_link" ? params.url : undefined,
+      language: params.kind === "pre" ? params.language : undefined,
+    };
+  });
+}
+
+/**
+ * `Message.link` throws (`MtArgumentError`) for chats that don't support
+ * message permalinks — notably private DMs, which is exactly where most
+ * UAT scenarios run. Swallow that and leave the field unset rather than
+ * blow up the whole observation; group/channel messages still get a real
+ * `t.me/c/<chat>/<msgid>` link for human eyeball reference.
+ */
+function safeMessageLink(msg: Message): string | undefined {
+  try {
+    return msg.link;
+  } catch {
+    return undefined;
+  }
 }

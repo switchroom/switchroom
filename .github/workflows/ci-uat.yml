@@ -156,6 +156,17 @@ jobs:
         # deterministic, fast.
         working-directory: telegram-plugin
         run: bun run test:uat inbound-no-drop
+      - name: Render fidelity — rich formatting entities + permalink
+        if: steps.secrets.outputs.ok == 'true'
+        # Real-render regression gate (#2739): drives a real agent turn that
+        # replies with rich formatting, then reads back — via the mtcute
+        # driver — the entity structure Telegram ACTUALLY parsed. Proves the
+        # rich message decodes to real text + entities (not the pre-upgrade
+        # \x01 unsupported-media sentinel) and that bold/italic/code/pre/link
+        # survive the render round-trip. The higher-fidelity companion to the
+        # Phase 1 parse-level suite.
+        working-directory: telegram-plugin
+        run: bun run test:uat jtbd-rich-formatting-render-dm
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context. ALWAYS runs (ubuntu-latest, no
