@@ -991,10 +991,43 @@ function toObservedEntities(msg: Message): ObservedEntity[] {
  * a `richMessage` (so callers fall back to the legacy `message` string).
  *
  * On the wire a `richMessage` is Telegram's Instant-View page tree: a list of
- * `pageBlock`s, each carrying a `RichText` node. We walk the two block kinds
- * the gateway actually emits — `pageBlockParagraph` (styled inline text) and
- * `pageBlockPreformatted` (a fenced code block → a `pre` entity spanning the
- * whole block) — joining blocks with a newline. The RichText tree is a
+ * `pageBlock`s, each carrying a `RichText` node (or, for tables/lists,
+ * structured children). We model the block kinds Telegram's GFM parser
+ * actually emits for a chat rich message, all shapes grounded against
+ * `@mtcute/tl@223.0.0` (the TL layer mtcute 0.30 ships):
+ *
+ *   - `pageBlockParagraph`      — styled inline text (`.text: RichText`).
+ *   - `pageBlockPreformatted`   — fenced code → one `pre` entity spanning the
+ *                                 whole block, carrying `.language`.
+ *   - `pageBlockHeader` /       — a markdown heading (`# …` / `## …`) →
+ *     `pageBlockSubheader`        rendered as a `bold` entity over the line
+ *                                 (Telegram has no first-class heading entity;
+ *                                 GFM headings surface as bold on a phone).
+ *   - `pageBlockBlockquote` /   — `> …` quote → a `blockquote` entity over the
+ *     `pageBlockPullquote`        quote body (`.text`; `.caption` follows on a
+ *                                 newline, unstyled).
+ *   - `pageBlockList`           — unordered list; `.items: PageListItem[]`
+ *                                 (`pageListItemText.text: RichText` or
+ *                                 `pageListItemBlocks.blocks: PageBlock[]`),
+ *                                 each item rendered `• ` + inline content.
+ *   - `pageBlockOrderedList`    — ordered list; `.items: PageListOrderedItem[]`
+ *                                 (`…Text` / `…Blocks`) each carrying a `.num`
+ *                                 label rendered `<num>. ` + content.
+ *   - `pageBlockTable`          — `.title: RichText`, `.rows: PageTableRow[]`,
+ *                                 each `.cells: PageTableCell[]` with an
+ *                                 optional `.text: RichText` (+ `.header`).
+ *                                 Cells join with " | ", rows with newlines;
+ *                                 header cells emit a `bold` entity.
+ *   - `pageBlockDivider`        — a horizontal rule (`---`) → a literal "———"
+ *                                 line, no entity.
+ *
+ * NOTE (grounding): TL layer 223 has NO `textSpoiler` RichText kind. GFM
+ * spoiler syntax (`||…||`) surfaces on the IV wire as `textMarked`
+ * ("highlighted text") — so `textMarked` maps to the Bot API `spoiler`
+ * entity. `textStrike`/`textUnderline` ARE first-class RichText kinds and
+ * map to `strikethrough`/`underline` directly.
+ *
+ * Blocks are joined with a newline. The RichText tree is a
  * discriminated union: leaf `textPlain` carries a string; `textConcat` holds a
  * `texts[]` sequence; the styled wrappers (`textBold`/`textItalic`/`textFixed`/
  * `textUrl`/…) nest another RichText in `.text`. We flatten depth-first,
@@ -1003,11 +1036,11 @@ function toObservedEntities(msg: Message): ObservedEntity[] {
  * styled span so the render-fidelity assertions see the same entity structure
  * the legacy `entities` path produces.
  */
-function decodeRichMessage(
+export function decodeRichMessage(
   rich: unknown,
 ): { text: string; entities: ObservedEntity[] } | null {
   const rm = rich as
-    | { _?: string; blocks?: Array<{ _?: string; text?: unknown; language?: string }> }
+    | { _?: string; blocks?: Array<Record<string, unknown>> }
     | undefined;
   if (!rm || rm._ !== "richMessage" || !Array.isArray(rm.blocks)) return null;
 
@@ -1081,7 +1114,9 @@ function decodeRichMessage(
         emit("code", s);
         return;
       }
-      case "textSpoiler": {
+      case "textMarked": {
+        // TL layer 223 has no `textSpoiler`; GFM `||spoiler||` rides the
+        // IV "highlighted text" node (`textMarked`) → Bot API `spoiler`.
         const s = text.length;
         walk(n.text);
         emit("spoiler", s);
@@ -1108,28 +1143,132 @@ function decodeRichMessage(
     }
   };
 
+  // Emit a span that Telegram has no first-class entity for (heading, table
+  // header) but which renders styled on a phone — we pick the closest Bot API
+  // entity so the render-fidelity assertions can key off it.
+  const emitOver = (kind: string, start: number): void => emit(kind, start);
+
+  // Walk one IV page-block, appending its text to `text` and pushing entities.
+  // Recursive: lists/tables nest paragraph-like children.
+  const walkBlock = (block: Record<string, unknown> | undefined): void => {
+    if (!block || typeof block._ !== "string") return;
+    switch (block._) {
+      case "pageBlockPreformatted": {
+        // Fenced code block → one `pre` entity spanning the whole block, with
+        // the language string Telegram tagged the fence with.
+        const s = text.length;
+        walk(block.text);
+        const length = text.length - s;
+        if (length > 0) {
+          entities.push({
+            kind: "pre",
+            offset: s,
+            length,
+            text: text.slice(s, s + length),
+            url: undefined,
+            language: (block.language as string) || undefined,
+          });
+        }
+        return;
+      }
+      case "pageBlockHeader":
+      case "pageBlockSubheader": {
+        // GFM heading (`#`/`##`) → no first-class Telegram heading entity;
+        // it renders bold on a phone, so we model it as a `bold` span.
+        const s = text.length;
+        walk(block.text);
+        emitOver("bold", s);
+        return;
+      }
+      case "pageBlockBlockquote":
+      case "pageBlockPullquote": {
+        // `> …` quote → `blockquote` entity over the quote body. `.caption`
+        // (if any) follows on its own line, unstyled.
+        const s = text.length;
+        walk(block.text);
+        emitOver("blockquote", s);
+        const caption = block.caption as Record<string, unknown> | undefined;
+        if (caption && caption._ && caption._ !== "textEmpty") {
+          text += "\n";
+          walk(caption);
+        }
+        return;
+      }
+      case "pageBlockList": {
+        // Unordered list. Items are pageListItemText (RichText) or
+        // pageListItemBlocks (nested page blocks); each gets a "• " bullet.
+        const items = (block.items as Array<Record<string, unknown>>) ?? [];
+        items.forEach((item, i) => {
+          if (i > 0) text += "\n";
+          text += "• ";
+          if (item._ === "pageListItemText") {
+            walk(item.text);
+          } else if (item._ === "pageListItemBlocks") {
+            const blocks = (item.blocks as Array<Record<string, unknown>>) ?? [];
+            blocks.forEach((b, j) => {
+              if (j > 0) text += "\n";
+              walkBlock(b);
+            });
+          }
+        });
+        return;
+      }
+      case "pageBlockOrderedList": {
+        // Ordered list. Items carry a `.num` label ("1", "2", …).
+        const items = (block.items as Array<Record<string, unknown>>) ?? [];
+        items.forEach((item, i) => {
+          if (i > 0) text += "\n";
+          text += `${(item.num as string) || String(i + 1)}. `;
+          if (item._ === "pageListOrderedItemText") {
+            walk(item.text);
+          } else if (item._ === "pageListOrderedItemBlocks") {
+            const blocks = (item.blocks as Array<Record<string, unknown>>) ?? [];
+            blocks.forEach((b, j) => {
+              if (j > 0) text += "\n";
+              walkBlock(b);
+            });
+          }
+        });
+        return;
+      }
+      case "pageBlockTable": {
+        // `.title` (optional) on its own line, then rows joined by newline,
+        // cells within a row joined by " | ". Header cells emit a `bold` span.
+        const title = block.title as Record<string, unknown> | undefined;
+        let wroteTitle = false;
+        if (title && title._ && title._ !== "textEmpty") {
+          walk(title);
+          wroteTitle = true;
+        }
+        const rows = (block.rows as Array<Record<string, unknown>>) ?? [];
+        rows.forEach((row, ri) => {
+          if (ri > 0 || wroteTitle) text += "\n";
+          const cells = (row.cells as Array<Record<string, unknown>>) ?? [];
+          cells.forEach((cell, ci) => {
+            if (ci > 0) text += " | ";
+            const s = text.length;
+            if (cell.text !== undefined) walk(cell.text);
+            if (cell.header) emitOver("bold", s);
+          });
+        });
+        return;
+      }
+      case "pageBlockDivider": {
+        // Horizontal rule (`---`). No entity; a literal rule line.
+        text += "———";
+        return;
+      }
+      default:
+        // pageBlockParagraph, footer, kicker, title, subtitle, and any other
+        // text-bearing block — inline walk of `.text`.
+        walk(block.text);
+        return;
+    }
+  };
+
   for (const block of rm.blocks) {
     if (text.length > 0) text += "\n"; // join blocks in send order
-    if (block._ === "pageBlockPreformatted") {
-      // Fenced code block → one `pre` entity spanning the whole block, with
-      // the language string mtcute exposes for `pre` fences.
-      const s = text.length;
-      walk(block.text);
-      const length = text.length - s;
-      if (length > 0) {
-        entities.push({
-          kind: "pre",
-          offset: s,
-          length,
-          text: text.slice(s, s + length),
-          url: undefined,
-          language: block.language || undefined,
-        });
-      }
-    } else {
-      // pageBlockParagraph (and any other text-bearing block) — inline walk.
-      walk(block.text);
-    }
+    walkBlock(block);
   }
 
   return { text, entities };

@@ -79,7 +79,18 @@ const LINK_URL = "https://github.com/switchroom/switchroom";
 const SAMPLE_LINES = [
   `Reply with EXACTLY this, including the marker ${MARKER} verbatim, and NOTHING else:`,
   "",
-  `${MARKER}: here is **a bold phrase**, some *italic words*, an inline \`code_token\`, and a link to [the repo](${LINK_URL}).`,
+  `${MARKER}: here is **a bold phrase**, some *italic words*, an inline \`code_token\`, ` +
+    `some ~~struck text~~, a ||hidden spoiler||, and a link to [the repo](${LINK_URL}).`,
+  "",
+  "## A heading line",
+  "",
+  "> a blockquoted line",
+  "",
+  "- first bullet",
+  "- second bullet",
+  "",
+  "1. ordered one",
+  "2. ordered two",
   "",
   "Then, on new lines, a fenced code block:",
   "```bash",
@@ -87,8 +98,36 @@ const SAMPLE_LINES = [
   "```",
 ].join("\n");
 
-/** mtcute entity kinds we expect Telegram to have parsed from the sample. */
-const EXPECTED_KINDS = ["bold", "italic", "code", "pre", "text_link"] as const;
+/**
+ * mtcute entity kinds we HARD-ASSERT Telegram parsed from the sample. Phase 2
+ * extends the original bold/italic/code/pre/text_link set with strikethrough
+ * and blockquote — both confirmed to survive the live send→IV→decode round
+ * trip on the uat-host (PR #2745 first live run: present set was
+ * `bold, italic, code, strikethrough, text_link, blockquote, pre`).
+ *
+ * `spoiler` is deliberately NOT hard-asserted: on the live wire the `||…||`
+ * span did NOT surface as a `spoiler`/`textMarked` entity (the model either
+ * dropped the syntax or Telegram's chat-message GFM parser doesn't map it the
+ * way the IV table-of-contents `textMarked` node does). Rather than red the
+ * whole render gate on a construct the round trip doesn't reliably produce, we
+ * observe spoiler softly (logged below). The decoder's `textMarked → spoiler`
+ * mapping is still pinned deterministically by the hosted unit suite.
+ *
+ * Lists and dividers carry no first-class Bot API entity (they render as
+ * bulleted/numbered/rule TEXT), so they are asserted on `reply.text` below.
+ */
+const EXPECTED_KINDS = [
+  "bold",
+  "italic",
+  "code",
+  "pre",
+  "text_link",
+  "strikethrough",
+  "blockquote",
+] as const;
+
+/** Soft-observed only (see note above) — logged, never fails the gate. */
+const SOFT_KINDS = ["spoiler"] as const;
 
 function kindsPresent(msg: ObservedMessage): Set<string> {
   return new Set(msg.entities.map((e) => e.kind));
@@ -145,10 +184,36 @@ function kindsPresent(msg: ObservedMessage): Set<string> {
               `(present: ${[...present].join(", ")})`,
           ).toEqual([]);
 
+          // Soft-observed constructs (e.g. spoiler) — logged, never fail the
+          // gate. See EXPECTED_KINDS note for why spoiler is soft.
+          for (const k of SOFT_KINDS) {
+            console.info(
+              `[uat] soft-observed construct '${k}': ` +
+                (present.has(k) ? "PRESENT on the wire" : "absent (expected — not gated)"),
+            );
+          }
+
           // (4) The link entity must carry the right destination.
           const link = reply.entities.find((e) => e.kind === "text_link");
           expect(link, "no text_link entity found in the reply").toBeDefined();
           expect(link?.url).toBe(LINK_URL);
+
+          // (5) Lists and dividers have NO first-class Bot API entity — the
+          // decoder renders them into TEXT (bulleted "• ", numbered "N. ").
+          // Assert the decoded body carries a bullet and an ordinal marker so
+          // a regression that drops list structure (back to bare inline text)
+          // reds here. Model replies aren't byte-deterministic, so we check
+          // for the STRUCTURE markers, not exact list wording.
+          expect(
+            reply.text,
+            "decoded reply carried no bullet marker — pageBlockList decode " +
+              "regressed to flat text",
+          ).toContain("• ");
+          expect(
+            reply.text,
+            "decoded reply carried no ordinal marker — pageBlockOrderedList " +
+              "decode regressed to flat text",
+          ).toMatch(/\b1\.\s/);
 
           // Permalink capture — best-effort human-eyeball reference. Private
           // DMs don't support message links (mtcute's .link getter throws
