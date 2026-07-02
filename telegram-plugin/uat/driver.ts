@@ -181,11 +181,23 @@ export class Driver {
     await this.client.connect();
     // `connect()` opens the transport but does NOT start the updates
     // dispatch loop — that's `start()`'s job. For a returning session
-    // (no interactive login) we have to call `startUpdatesLoop()`
-    // ourselves, otherwise `onNewMessage` / `onEditMessage` never
-    // fire and `observeMessages` silently waits forever. Symptom:
-    // `expectMessage` timing out even though the bot's reply has
-    // arrived in the chat (visible in Telegram).
+    // (no interactive login) we have to drive that lifecycle ourselves,
+    // otherwise `onNewMessage` / `onEditMessage` never fire and
+    // `observeMessages` silently waits forever. Symptom: `expectMessage`
+    // timing out even though the bot's reply has arrived in the chat
+    // (visible in Telegram).
+    //
+    // Crucially, `startUpdatesLoop()` alone is NOT enough. In mtcute 0.30
+    // the updates manager will not DISPATCH new-message updates unless it
+    // has been told the client is logged in — `start()` does this via
+    // `notifyLoggedIn` in its login callback, but a manually-imported
+    // session skips `start()` entirely. Without it the manager starts the
+    // loop while still considering the user logged-out, the incoming
+    // update is fetched but never routed to `onNewMessage`, and the
+    // observer waits forever. So: resolve self from the imported session
+    // and notify the manager BEFORE starting the loop.
+    const me = await this.client.getMe();
+    await this.client.notifyLoggedIn(me.raw);
     await this.client.startUpdatesLoop();
   }
 
