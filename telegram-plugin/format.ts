@@ -564,6 +564,26 @@ function ensureBlockBoundaries(text: string, placeholder?: string): string {
       }
     }
 
+    // ---- Rule A2: blank line AFTER a closed code fence, before prose ----
+    // Prose glued directly onto a fence's close (single `\n`) can be swallowed
+    // or mis-parsed; a blank line after a closed fence is always CommonMark-safe.
+    // Masked blocks collapse to a single placeholder-leading line, so a fence
+    // "close" is a prev line that opens a fence (masked placeholder or literal
+    // ``` fence). Only fire when the current line is non-blank prose that is NOT
+    // itself a new block start (those are handled by Rule A above).
+    if (prevNonBlank && !curBlank && isFenceOpenLine(prev, placeholder)) {
+      const alreadySeparated = result.length > 0 && result[result.length - 1].trim() === ''
+      const curIsBlockStart =
+        isFenceOpenLine(line, placeholder) ||
+        isBlockquoteLine(line) ||
+        isHeadingLine(line) ||
+        isTableRowLine(line) ||
+        isTableDelimiterLine(line)
+      if (!alreadySeparated && !curIsBlockStart) {
+        result.push('')
+      }
+    }
+
     // ---- Rule B: blank line AFTER a list block, before breakout prose ----
     if (prevNonBlank && !curBlank && isListItemLine(prev) && !isListItemLine(line)) {
       // A 4+ space (or tab) indent means `line` is a lazy continuation of the
@@ -604,9 +624,13 @@ function isMarkerLine(line: string, placeholder?: string): boolean {
     t.startsWith('>') ||
     // ATX heading.
     /^#{1,6}\s/.test(t) ||
-    // Table row (leading pipe) or table-ish line (interior ` | `).
-    t.startsWith('|') ||
-    line.includes(' | ') ||
+    // Table row (leading pipe) or a table delimiter row. A loose interior
+    // ` | ` substring misclassifies prose like `choose A | B` as a table row
+    // and suppresses paragraph spacing — require a real GFM table row/delimiter
+    // instead. (A header row lacking a leading pipe is still recognised as
+    // structural when its delimiter row follows, via ensureBlockBoundaries.)
+    isTableRowLine(line) ||
+    isTableDelimiterLine(line) ||
     // Fenced code delimiter (defensive — fences are masked, but a lone/odd
     // fence line can survive masking).
     t.startsWith('```') ||
@@ -711,10 +735,17 @@ export function splitMarkdownChunks(text: string, maxLen = RICH_MESSAGE_MAX_CHAR
 
     if (cut <= 0) {
       // Could not find a safe boundary below maxLen — the region is one
-      // indivisible block (e.g. a single huge fenced block). Emit the
-      // whole remainder rather than loop forever.
-      chunks.push(rest)
-      break
+      // indivisible block (e.g. a single huge fenced block or an unbreakable
+      // token run). Emitting the oversized remainder whole makes Telegram
+      // reject it (RICH_MESSAGE_TEXT_TOO_LONG) and drops the whole answer, so
+      // fall back to a raw character slice: every piece is guaranteed <= maxLen
+      // (a degraded-but-delivered message beats a hard reject). hardSliceToCap
+      // returns the head chunk plus the rest; keep looping on the remainder so
+      // any trailing splittable region still gets normal boundary treatment.
+      const sliced = hardSliceToCap(rest, maxLen)
+      chunks.push(stripBoundarySpacers(sliced[0], 'trailing'))
+      rest = stripBoundarySpacers(sliced.slice(1).join(''), 'leading')
+      continue
     }
 
     chunks.push(stripBoundarySpacers(rest.slice(0, cut), 'trailing'))

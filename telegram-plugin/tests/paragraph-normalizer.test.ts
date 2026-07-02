@@ -275,6 +275,37 @@ describe('normalizeParagraphBreaks', () => {
     const input = '- first item\n    continued text of the first item'
     expect(normalizeParagraphBreaks(input)).toBe(input)
   })
+
+  test('F2: prose with an interior ` | ` gets normal paragraph-break treatment (not table)', () => {
+    // `isMarkerLine` used to treat any line containing ` | ` as a table row and
+    // suppress the paragraph-break promotion. A sentence like "choose A | B" is
+    // prose, not a table — the lone `\n` after a terminated prose line must
+    // still be promoted to a GFM hard break.
+    const input = 'Pick one option, choose A | B here.\nThen continue below.'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Pick one option, choose A | B here.  \nThen continue below.',
+    )
+  })
+
+  test('F2: a genuine table (header + delimiter) is still detected as structural', () => {
+    // The tightened check must still recognise a real GFM table: a blank line
+    // is inserted before the header and the rows stay contiguous.
+    const input = 'Here is data.\n| a | b |\n| --- | --- |\n| 1 | 2 |'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Here is data.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |',
+    )
+  })
+
+  test('F4: blank line inserted after a closed code fence before glued prose', () => {
+    // Prose glued directly onto a fence close (single `\n`) can be swallowed /
+    // mis-parsed. A blank line after a closed fence is always CommonMark-safe.
+    const input = 'Intro.\n\n```\nconst x = 1\n```\nThen the prose continues.'
+    const out = normalizeParagraphBreaks(input)
+    // The fence interior is untouched...
+    expect(out).toContain('```\nconst x = 1\n```')
+    // ...and a blank line now separates the fence close from the following prose.
+    expect(out).toContain('```\n\nThen the prose continues.')
+  })
 })
 
 // ---------------------------------------------------------------------------

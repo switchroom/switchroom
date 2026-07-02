@@ -56,6 +56,20 @@ describe('stripMarkdown', () => {
   it('does not touch HTML-significant characters (escaping stays separate)', () => {
     expect(stripMarkdown('a < b & c > d')).toBe('a < b & c > d')
   })
+
+  it('F1: normalizes an em-dash on this card/narration prose surface', () => {
+    // The reply path scrubs em-dashes but cards/narration/PTY previews did not,
+    // so em-dashes leaked there. stripMarkdown now runs the same dash logic.
+    // Lowercase follower → comma (mid-clause); uppercase follower → period.
+    expect(stripMarkdown('build done — shipping now')).toBe('build done, shipping now')
+    expect(stripMarkdown('build done — Shipping now')).toBe('build done. Shipping now')
+  })
+
+  it('F1: preserves an em-dash inside an inline code span', () => {
+    // The dash normalizer masks code spans, and it runs BEFORE the backticks
+    // are stripped, so a dash inside `` `…` `` survives verbatim.
+    expect(stripMarkdown('see `a — b` token')).toBe('see a — b token')
+  })
 })
 
 describe('cleanWorkerResultParagraph', () => {
@@ -75,6 +89,19 @@ describe('cleanWorkerResultParagraph', () => {
 
   it('returns empty for whitespace/markup-only input', () => {
     expect(cleanWorkerResultParagraph('   \n---\n')).toBe('')
+  })
+
+  it('F1: normalizes em-dashes in worker narration prose', () => {
+    const input = '## Result\n\nTests pass — ready to merge'
+    expect(cleanWorkerResultParagraph(input)).toBe('Result Tests pass, ready to merge')
+  })
+
+  it('F1: an em-dash inside a fenced block is preserved (the block is dropped, never normalized)', () => {
+    // Fenced blocks are excised whole, so a dash inside one is preserved by
+    // removal — it never reaches (nor is mutated by) the dash normalizer, and
+    // the surrounding prose dash IS normalized.
+    const input = 'before — after\n```\nlet a = b — c\n```\ntail'
+    expect(cleanWorkerResultParagraph(input)).toBe('before, after tail')
   })
 })
 
