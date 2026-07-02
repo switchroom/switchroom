@@ -12,11 +12,19 @@
  * single source of truth), and it already owns the gateway relay path it uses
  * for approval cards. So hostd tails ITS OWN rows (it is fed each phase as it
  * parses the child's stdout — the same event that appends the durable row) and
- * relays edit ops to the caller agent's live gateway. There is NO in-memory
- * pin/lifecycle state that a gateway restart could orphan: the narrator holds
- * only the message_id + last-applied seq for the current request, and recovery
- * after a gateway restart is a re-post/re-edit driven by the durable rows hostd
- * keeps reading. We do NOT rely on a "recreate overlord last" assumption (it's
+ * relays edit ops to the caller agent's live gateway.
+ *
+ * State + restart guarantee (be precise — this is NOT stateless): the narrator
+ * DOES hold in-memory state for the current request — the message_id it is
+ * editing and the last-applied seq. That state is ephemeral: a hostd restart
+ * mid-roll loses it, so the post-restart narrator can't re-edit the original
+ * message and instead RE-POSTS a fresh narration message (the in-chat surface
+ * may duplicate on restart). What IS durable is the rollout status the
+ * operator can query: the per-phase rows hostd writes are the single source of
+ * truth, so `get_status(request_id)` recovers the roll's true state fully
+ * regardless of any narration re-post. Summary: durable get_status recovers
+ * fully; in-chat narration may re-post (not seamlessly re-edit) on a hostd
+ * restart. We do NOT rely on a "recreate overlord last" assumption (it's
  * false) — the narrator lives in hostd, not overlord.
  *
  * Discipline (locked by the IPC review), all enforced here:

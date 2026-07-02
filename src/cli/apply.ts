@@ -294,24 +294,79 @@ export async function provisionLiteLLMKeys(
   if (passphrase === null) {
     // Vault passphrase is unavailable (no SWITCHROOM_VAULT_PASSPHRASE env and
     // machine-id auto-unlock blob is missing or undecryptable). This blocks
-    // writing NEW virtual keys, but agents that were already provisioned on a
-    // prior interactive apply still have their keys in the vault — a rollout
-    // doesn't need to re-provision them. Emit a warning and return without
-    // counting this as scaffold failures: making every rollout fail because the
-    // hostd container couldn't derive the auto-unlock key defeats the purpose
-    // of autonomous fleet updates. First-time provisioning requires an
-    // interactive `switchroom apply` with vault access (operator console or
-    // SWITCHROOM_VAULT_PASSPHRASE env). Note: adding /etc/machine-id:ro to the
-    // hostd compose fixes the root cause on this host (PR #2679).
-    const targets = [
-      ...optedIn.map(({ name }) => name),
-      ...(needsHindsight ? ["hindsight (service)"] : []),
+    // writing NEW virtual keys. Agents that were already provisioned on a prior
+    // interactive apply still have their keys in the vault — a rollout doesn't
+    // need to re-provision them, so those are fine to continue past. But an
+    // agent that OPTED IN and has NO vault key yet is silently broken: it will
+    // never get its routing env. We must NOT report success for those — the old
+    // behaviour of a single warning + blanket return hid genuinely-new agents
+    // and let the rollout claim success while skipping them (the fail-open bug).
+    //
+    // So probe each opted-in agent against the broker (a read; no passphrase
+    // needed) and split into "already provisioned" (continue quietly) vs.
+    // "new, unprovisioned" (surface as a failure the operator can see). First-
+    // time provisioning requires an interactive `switchroom apply` with vault
+    // access (operator console or SWITCHROOM_VAULT_PASSPHRASE env). Note: adding
+    // /etc/machine-id:ro to the hostd compose fixes the root cause (PR #2679).
+    const { getViaBrokerStructured } = await import("../vault/broker/client.js");
+
+    const alreadyProvisioned: string[] = [];
+    const unprovisionedNew: string[] = [];
+    for (const { name } of optedIn) {
+      const vaultKey = `litellm/${name}/api-key`;
+      const existing = await getViaBrokerStructured(vaultKey);
+      if (existing.kind === "ok") {
+        alreadyProvisioned.push(name);
+      } else {
+        // kind === "not_found" (genuinely new) or "unreachable" (can't confirm
+        // it's provisioned) — either way, this agent is not known-good and must
+        // be surfaced, not silently skipped.
+        unprovisionedNew.push(name);
+      }
+    }
+    // The hindsight service key can't be probed the same idempotent way here;
+    // treat it as needing provisioning (surfaced) when the feature wants it.
+    const hindsightPending = needsHindsight;
+
+    if (alreadyProvisioned.length > 0) {
+      writeOut(
+        chalk.gray(
+          `  ~ litellm: ${alreadyProvisioned.length} agent(s) already provisioned ` +
+          `(${alreadyProvisioned.join(", ")}) — unaffected by missing passphrase.\n`,
+        ),
+      );
+    }
+
+    if (unprovisionedNew.length === 0 && !hindsightPending) {
+      // Nothing genuinely new — the rollout is honestly clean.
+      return;
+    }
+
+    // Genuinely-new agents (or the hindsight key) need a NEW key we can't write
+    // without the passphrase. Surface each as a scaffold failure so the rollout
+    // does NOT silently report success (matches the old failures[] behaviour
+    // for genuinely-new agents).
+    const pendingTargets = [
+      ...unprovisionedNew,
+      ...(hindsightPending ? ["hindsight (service)"] : []),
     ];
+    for (const target of pendingTargets) {
+      failures.push({
+        agent: target,
+        message:
+          `litellm.enabled but no vault key exists and the vault passphrase is ` +
+          `unavailable (no SWITCHROOM_VAULT_PASSPHRASE env and machine-id ` +
+          `auto-unlock blob missing/undecryptable) — cannot provision a new ` +
+          `virtual key. Run \`switchroom apply\` interactively (operator console ` +
+          `or SWITCHROOM_VAULT_PASSPHRASE env) to provision this agent.`,
+      });
+    }
     ctx.writeErr(
-      chalk.yellow(
-        `  ⚠ litellm: vault passphrase unavailable — skipping new-key provisioning for ` +
-        `${targets.join(", ")}. Already-provisioned keys are unaffected; ` +
-        `run \`switchroom apply\` interactively to provision new agents.\n`,
+      chalk.red(
+        `  x litellm: vault passphrase unavailable — ${pendingTargets.length} ` +
+        `agent(s)/service(s) need a NEW key and were NOT provisioned: ` +
+        `${pendingTargets.join(", ")}. These will lack routing env until an ` +
+        `interactive apply provisions them.\n`,
       ),
     );
     return;
