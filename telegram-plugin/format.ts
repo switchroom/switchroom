@@ -266,10 +266,35 @@ export function normalizeParagraphBreaks(text: string): string {
   // never touched. See splitCollapsedInlineBullets for the exact rule.
   const masked = splitCollapsedInlineBullets(maskedRaw)
 
-  // Step 1: collapse 3+ newlines to exactly two. This also normalizes runs that
-  // contain interleaved spaces only between the newlines is NOT done here —
-  // we only touch pure newline runs so we never eat meaningful whitespace.
-  let out = masked.replace(/\n{3,}/g, '\n\n')
+  // Step 1: collapse blank-line runs to exactly ONE clean blank line (`\n\n`),
+  // never leaving a whitespace-only line between two paragraphs.
+  //
+  //   (a) Pure newline runs of 3+ → `\n\n`.
+  //   (b) A blank-line run whose interior lines are ASCII-whitespace-only
+  //       (spaces / tabs / CR) → `\n\n`. A model (or an upstream transform)
+  //       that authors `A\n\n \n\nB` leaves a lone-space line between the
+  //       paragraphs; CommonMark discards it (so it buys no gap) but it reads
+  //       as an oversized / ragged gap in the raw text and in some clients, and
+  //       it was the "stray blank line" seen in real replies. Collapse it.
+  //
+  // Deliberately ASCII-only: a line whose only content is U+00A0 is the
+  // INTENTIONAL, non-collapsible paragraph spacer added later by
+  // addParagraphSpacers (#2692) to force a visible gap on the rich-message
+  // path. This step runs BEFORE that spacer pass and must never eat a U+00A0
+  // line, so the `[ \t\r]` character class here excludes U+00A0 by
+  // construction. Runs on code-masked text, so a blank-ish line inside a
+  // fenced block is parked and never touched.
+  let out = masked
+    // Collapse any run of newlines interleaved with ASCII whitespace-only
+    // interior lines down to a single clean `\n\n`. Requires at least one
+    // whitespace char between the first two newlines OR 3+ newlines, so it
+    // fires on both `A\n \nB` (one space-only blank line) and `A\n\n \n\nB`
+    // (a space-only line inside a multi-blank run) but never rewrites a clean
+    // `A\n\nB` (no interior whitespace) — that already-correct gap is left to
+    // the `\n{3,}` pass below, which collapses any surviving run of 3+
+    // newlines (including pure `A\n\n\n\nB`) down to a single `\n\n`.
+    .replace(/\n[ \t\r]+\n(?:[ \t\r]*\n)*/g, '\n\n')
+    .replace(/\n{3,}/g, '\n\n')
 
   // Step 2: walk lines and promote lone prose breaks. We rebuild the string by
   // joining lines with the right separator. A separator is "hard" (`  \n`) only

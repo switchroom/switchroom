@@ -501,3 +501,86 @@ describe('normalizeParagraphBreaks — inline bullet split integration', () => {
     expect(twice).toBe(once)
   })
 })
+
+/**
+ * Regression guard for the stray whitespace-only blank line between paragraphs
+ * (the "\n\n \n\n" seen in a real reply). A model (or an upstream transform)
+ * that authors a blank line whose only content is ASCII whitespace leaves a
+ * ragged / oversized gap: CommonMark discards it so it buys no visible space,
+ * but it reads as noise in the raw text. Step 1 of normalizeParagraphBreaks now
+ * collapses any run of blank lines — including whitespace-only interior lines —
+ * to exactly one clean `\n\n`, WITHOUT ever eating the deliberate U+00A0
+ * paragraph spacer that addParagraphSpacers (#2692) adds later for a visible
+ * gap on the rich-message path.
+ */
+describe('normalizeParagraphBreaks — whitespace-only blank-line collapse (Bug 2)', () => {
+  const NBSP = ' '
+
+  test('a lone-space blank line between paragraphs collapses to a clean `\\n\\n` (real string)', () => {
+    const input =
+      "Here's what was fixed and how it validates.\n\n \n\n" +
+      'One loose end: a stray thing.'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      "Here's what was fixed and how it validates.\n\n" +
+        'One loose end: a stray thing.',
+    )
+  })
+
+  test('a single whitespace-only blank line (`A\\n \\nB`) collapses to `\\n\\n`', () => {
+    expect(normalizeParagraphBreaks('Alpha para.\n \nBravo para.')).toBe(
+      'Alpha para.\n\nBravo para.',
+    )
+    expect(normalizeParagraphBreaks('Alpha para.\n\t\nBravo para.')).toBe(
+      'Alpha para.\n\nBravo para.',
+    )
+  })
+
+  test('multiple stray whitespace-only lines in one gap collapse to a single `\\n\\n`', () => {
+    expect(normalizeParagraphBreaks('A.\n\n \n\n \n\nB.')).toBe('A.\n\nB.')
+  })
+
+  test('a legitimate single `\\n\\n` paragraph break is preserved exactly', () => {
+    expect(normalizeParagraphBreaks('Alpha para.\n\nBravo para.')).toBe(
+      'Alpha para.\n\nBravo para.',
+    )
+  })
+
+  test('never EMITS a whitespace-only line between two prose paragraphs', () => {
+    const out = normalizeParagraphBreaks('First.\n\n  \n\nSecond.')
+    for (const line of out.split('\n')) {
+      // Every line is either empty or has real (non-ASCII-whitespace) content.
+      expect(line === '' || /\S/.test(line) || line.includes(NBSP)).toBe(true)
+    }
+    expect(out).toBe('First.\n\nSecond.')
+  })
+
+  test('a blank line inside a fenced code block (masked) is NOT collapsed', () => {
+    const input = '```\ncode line 1\n \ncode line 2\n```'
+    // The whitespace-only line lives inside a masked fence and must survive.
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('trailing hard-break spaces on a CONTENT line are not eaten', () => {
+    // "line.  \n\nNext." — the two trailing spaces are a GFM hard break on a
+    // content line, not a blank line; they must survive.
+    const input = 'Trailing spaces on line.  \n\nNext.'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('the deliberate U+00A0 spacer from addParagraphSpacers is preserved (no #2692 regression)', () => {
+    const normalized = normalizeParagraphBreaks('Alpha para.\n\nBravo para.')
+    const spaced = addParagraphSpacers(normalized)
+    // addParagraphSpacers wedges a U+00A0-only line to force a visible gap.
+    expect(spaced).toContain('\n\n' + PARAGRAPH_SPACER + '\n\n')
+    expect(spaced.split('\n')).toContain(NBSP)
+    // And re-running the normalizer must NOT eat that intentional spacer.
+    expect(normalizeParagraphBreaks(spaced)).toBe(spaced)
+  })
+
+  test('idempotent: collapsing a stray gap twice is stable', () => {
+    const once = normalizeParagraphBreaks('A.\n\n \n\nB.')
+    const twice = normalizeParagraphBreaks(once)
+    expect(twice).toBe(once)
+    expect(once).toBe('A.\n\nB.')
+  })
+})
