@@ -292,7 +292,7 @@ describe("planRollout — hostd context (#2487)", () => {
 describe("executeRollout — hostd context (#2487)", () => {
   const TARGET = "v0.15.18";
 
-  it("apply uses one-shot --pin (pin not yet persisted before canary)", () => {
+  it("apply uses one-shot --pin + --compose-only --non-interactive (pin not yet persisted; scaffold unwritable under hostd)", () => {
     const steps = planRollout(["clerk", "test-harness"], {
       pinToPersist: TARGET,
       hostdContext: true,
@@ -302,7 +302,38 @@ describe("executeRollout — hostd context (#2487)", () => {
     });
     const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
     expect(r.ok).toBe(true);
-    expect(runs[0]).toEqual(["apply", "--pin", TARGET]);
+    // #2745: a version roll only regenerates compose (image tags +
+    // compose-level env + healthcheck). It must NOT run the per-agent
+    // scaffold loop, which fails under hostd (state dirs mode 0700, owned
+    // by per-agent UIDs, unwritable by the unprivileged hostd process) and
+    // hard-aborts the whole roll with rolled:[].
+    expect(runs[0]).toEqual(["apply", "--pin", TARGET, "--compose-only", "--non-interactive"]);
+  });
+
+  it("surfaces a WARNING that per-agent template changes need a host-side apply (compose-only tradeoff)", () => {
+    const steps = planRollout(["clerk", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+    });
+    const { deps } = harness({
+      versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, { hostdContext: true });
+    expect(r.ok).toBe(true);
+    expect(r.warnings.some((w) => /compose-only/.test(w) && /host-side/.test(w))).toBe(true);
+  });
+
+  it("host-shell path keeps the bare apply — no --compose-only, no tradeoff warning", () => {
+    const steps = planRollout(["clerk", "test-harness"], { pinToPersist: TARGET });
+    const { deps, runs } = harness({
+      versions: { clerk: "0.15.18", "test-harness": "0.15.18" },
+    });
+    const r = executeRollout(steps, TARGET, deps, {});
+    expect(r.ok).toBe(true);
+    // bare apply reads the already-persisted pin; a privileged host shell
+    // CAN scaffold, so no compose-only downgrade and no tradeoff warning.
+    expect(runs).toContainEqual(["apply"]);
+    expect(r.warnings.some((w) => /compose-only/.test(w))).toBe(false);
   });
 
   it("does NOT persist the pin when the canary FAILS its version assert", () => {
