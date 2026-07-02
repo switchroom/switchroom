@@ -283,8 +283,8 @@ describe("Driver.observeMessages", () => {
     //
     // This double reproduces the throw: `chat` and `sender` are getters that
     // throw the exact mtcute error, while `raw.peerId` / `raw.fromId` carry
-    // the real bot user id (8288144562) — the id the DM chat is keyed on.
-    const BOT = 8288144562;
+    // the bot user id — the id the DM chat is keyed on.
+    const BOT = 12345;
     const throwingMsg = {
       id: 555,
       text: "4",
