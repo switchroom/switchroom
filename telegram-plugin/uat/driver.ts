@@ -909,20 +909,20 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
   // formatting scenario will flag the empty-entities case loudly rather than
   // silently pass). It is no longer expected to trigger on the happy path.
   const rawText = msg.text ?? "";
-  // TEMP DIAGNOSTIC (#2744): dump the COMPLETE raw TL object for any decoded-
-  // empty message so we can see exactly where sendRichMessage puts the visible
-  // text. BigInt-safe replacer. Remove before final commit.
-  if (rawText === "" && msg.raw._ === "message") {
-    // eslint-disable-next-line no-console -- temp harness diagnostic
-    console.warn(
-      "[uat/driver][TEMP-RAWDUMP] empty-text message id=" + msg.id + " raw=" +
-        JSON.stringify(
-          msg.raw,
-          (_k, v) => (typeof v === "bigint" ? v.toString() + "n" : v),
-        ),
-    );
-  }
-  const isRichMedia = rawText === "" &&
+  // Bot API 10.1 rich messages (`sendRichMessage({ markdown })`) arrive on the
+  // wire in a NEW TL field — `message.richMessage` — with the legacy `message`
+  // string left EMPTY and NO `entities`. mtcute 0.30 does not yet map that
+  // field onto `Message.text`/`Message.entities`, so `msg.text` is "" and the
+  // observation looks textless. This is the sibling case to the
+  // `messageMediaUnsupported` sentinel below: the visible text is on the wire,
+  // just in a shape the getter doesn't decode. Flatten the `richMessage`
+  // page-block/RichText tree ourselves into plain text + entities. (Confirmed
+  // via a raw-TL dump on the uat-host runner, #2744.)
+  const richDecoded =
+    rawText === "" && msg.raw._ === "message"
+      ? decodeRichMessage((msg.raw as { richMessage?: unknown }).richMessage)
+      : null;
+  const isRichMedia = rawText === "" && !richDecoded &&
     msg.raw._ === "message" && msg.raw.media?._ === "messageMediaUnsupported";
   // Resolve chat/sender ids from the RAW TL peer, not the `msg.chat` /
   // `msg.sender` getters. Those getters look the peer up in the update's
@@ -946,13 +946,15 @@ function toObserved(msg: Message, edited: boolean): ObservedMessage {
     chatId,
     messageId: msg.id,
     threadId: msg.replyToMessage?.threadId ?? undefined,
-    text: isRichMedia ? "\x01" : rawText,
+    text: isRichMedia ? "\x01" : (richDecoded ? richDecoded.text : rawText),
     senderUserId,
     fromBot: safeIsFromBot(msg),
     date: msg.date,
     edited,
     silent: msg.isSilent,
-    entities: isRichMedia ? [] : toObservedEntities(msg),
+    entities: isRichMedia
+      ? []
+      : (richDecoded ? richDecoded.entities : toObservedEntities(msg)),
     link: safeMessageLink(msg),
   };
 }
@@ -980,6 +982,157 @@ function toObservedEntities(msg: Message): ObservedEntity[] {
       language: params.kind === "pre" ? params.language : undefined,
     };
   });
+}
+
+/**
+ * Decode a Bot API 10.1 rich message (`message.richMessage`) into flat
+ * `{ text, entities }`, mirroring what `Message.text` + `Message.entities`
+ * would carry if mtcute mapped the field. Returns `null` when the value isn't
+ * a `richMessage` (so callers fall back to the legacy `message` string).
+ *
+ * On the wire a `richMessage` is Telegram's Instant-View page tree: a list of
+ * `pageBlock`s, each carrying a `RichText` node. We walk the two block kinds
+ * the gateway actually emits — `pageBlockParagraph` (styled inline text) and
+ * `pageBlockPreformatted` (a fenced code block → a `pre` entity spanning the
+ * whole block) — joining blocks with a newline. The RichText tree is a
+ * discriminated union: leaf `textPlain` carries a string; `textConcat` holds a
+ * `texts[]` sequence; the styled wrappers (`textBold`/`textItalic`/`textFixed`/
+ * `textUrl`/…) nest another RichText in `.text`. We flatten depth-first,
+ * tracking UTF-16 code-unit offsets (JS string `.length` is already UTF-16, the
+ * same units Telegram uses on the wire) and emit an `ObservedEntity` for each
+ * styled span so the render-fidelity assertions see the same entity structure
+ * the legacy `entities` path produces.
+ */
+function decodeRichMessage(
+  rich: unknown,
+): { text: string; entities: ObservedEntity[] } | null {
+  const rm = rich as
+    | { _?: string; blocks?: Array<{ _?: string; text?: unknown; language?: string }> }
+    | undefined;
+  if (!rm || rm._ !== "richMessage" || !Array.isArray(rm.blocks)) return null;
+
+  let text = "";
+  const entities: ObservedEntity[] = [];
+
+  const emit = (
+    kind: string,
+    start: number,
+    extra?: { url?: string; language?: string },
+  ): void => {
+    const length = text.length - start;
+    if (length <= 0) return;
+    entities.push({
+      kind,
+      offset: start,
+      length,
+      text: text.slice(start, start + length),
+      url: extra?.url,
+      language: extra?.language,
+    });
+  };
+
+  // Depth-first walk of a RichText node, appending plain text to `text` and
+  // pushing an entity for each styled wrapper (mapping TL kinds to mtcute's).
+  const walk = (node: unknown): void => {
+    const n = node as {
+      _?: string;
+      text?: unknown;
+      texts?: unknown[];
+      url?: string;
+    };
+    if (!n || typeof n._ !== "string") return;
+    switch (n._) {
+      case "textEmpty":
+        return;
+      case "textPlain":
+        if (typeof n.text === "string") text += n.text;
+        return;
+      case "textConcat":
+        for (const t of n.texts ?? []) walk(t);
+        return;
+      case "textBold": {
+        const s = text.length;
+        walk(n.text);
+        emit("bold", s);
+        return;
+      }
+      case "textItalic": {
+        const s = text.length;
+        walk(n.text);
+        emit("italic", s);
+        return;
+      }
+      case "textUnderline": {
+        const s = text.length;
+        walk(n.text);
+        emit("underline", s);
+        return;
+      }
+      case "textStrike": {
+        const s = text.length;
+        walk(n.text);
+        emit("strikethrough", s);
+        return;
+      }
+      case "textFixed": {
+        // Inline fixed-width (`code_token`) → Bot API `code` entity.
+        const s = text.length;
+        walk(n.text);
+        emit("code", s);
+        return;
+      }
+      case "textSpoiler": {
+        const s = text.length;
+        walk(n.text);
+        emit("spoiler", s);
+        return;
+      }
+      case "textUrl": {
+        const s = text.length;
+        walk(n.text);
+        emit("text_link", s, { url: n.url });
+        return;
+      }
+      case "textEmail": {
+        const s = text.length;
+        walk(n.text);
+        emit("email", s);
+        return;
+      }
+      default:
+        // Any other wrapper (marked/sub/superscript/phone/anchor/…) — keep its
+        // visible text but don't classify the span; the render assertions only
+        // key off the kinds the gateway emits.
+        if (n.text !== undefined) walk(n.text);
+        return;
+    }
+  };
+
+  for (const block of rm.blocks) {
+    if (text.length > 0) text += "\n"; // join blocks in send order
+    if (block._ === "pageBlockPreformatted") {
+      // Fenced code block → one `pre` entity spanning the whole block, with
+      // the language string mtcute exposes for `pre` fences.
+      const s = text.length;
+      walk(block.text);
+      const length = text.length - s;
+      if (length > 0) {
+        entities.push({
+          kind: "pre",
+          offset: s,
+          length,
+          text: text.slice(s, s + length),
+          url: undefined,
+          language: block.language || undefined,
+        });
+      }
+    } else {
+      // pageBlockParagraph (and any other text-bearing block) — inline walk.
+      walk(block.text);
+    }
+  }
+
+  return { text, entities };
 }
 
 /**
