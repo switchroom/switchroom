@@ -588,6 +588,19 @@ function emitVoiceSidecarService(
   // Reachable from both host-net and strict-isolation agents — see the
   // function doc. Publish on all interfaces; the shared-secret header is
   // the access gate, not the bind address.
+  //
+  // SECURITY NOTE: `0.0.0.0` is a DELIBERATE reachability trade-off — a pure
+  // `127.0.0.1` publish is invisible to a strict-isolation peer's bridge
+  // network (which reaches host services via host.docker.internal /
+  // host-gateway, NOT loopback), so the sidecar would be unreachable for those
+  // agents. We therefore bind all interfaces and gate access with the
+  // X-Voice-Token shared secret (constant-time compared, fail-closed when
+  // unset — see server.py `_authed`). /healthz is intentionally
+  // unauthenticated but leaks nothing beyond load state. On a host with a
+  // public interface this port IS LAN/WAN-reachable, so operators SHOULD add a
+  // host firewall rule restricting :18900 to the docker bridge + loopback
+  // (e.g. `iptables -A INPUT -p tcp --dport 18900 ! -s 172.16.0.0/12 -j DROP`,
+  // adjusted to the actual docker subnet). Tracked in the PR description.
   lines.push(`    ports:`);
   lines.push(
     `      - "0.0.0.0:${VOICE_SIDECAR_HOST_PORT}:${VOICE_SIDECAR_CONTAINER_PORT}"`,
