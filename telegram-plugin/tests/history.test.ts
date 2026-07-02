@@ -44,6 +44,39 @@ describe('initHistory', () => {
     initHistory(stateDir, 30)
     expect(() => initHistory(stateDir, 30)).not.toThrow()
   })
+
+  // Regression for HERMES #2689 review defect #1: the web process (a different
+  // uid than the agent) opens history.db READ-ONLY to stream Telegram replies
+  // back to Hermes Desktop. If the db/WAL sidecars were left 0600, that open
+  // fails and the real-time sync poller silently no-ops. Assert both the perm
+  // bits AND that a readonly open + the poller's exact SELECT succeed.
+  it('history.db is world-readable and the Hermes poller can open it read-only', async () => {
+    initHistory(stateDir, 30)
+    recordInbound({ chat_id: '1', thread_id: null, message_id: 1, user: 'a', user_id: '1', ts: 100, text: 'hi' })
+    recordOutbound({ chat_id: '1', thread_id: null, message_ids: [2], texts: ['hello'], ts: 200 })
+
+    const dbPath = join(stateDir, 'history.db')
+    // Force a WAL sidecar to exist so we exercise the -wal/-shm perm path too.
+    for (const suffix of ['', '-shm', '-wal']) {
+      const f = dbPath + suffix
+      if (existsSync(f)) expect(statSync(f).mode & 0o777).toBe(0o644)
+    }
+
+    // Reproduce the poller's open (src/web/hermes-adapter.ts startHistoryPoll):
+    // readonly connection + MAX(rowid) + assistant-row SELECT.
+    const { Database } = await import('bun:sqlite')
+    const rdb = new Database(dbPath, { readonly: true })
+    try {
+      const max = rdb.prepare('SELECT MAX(rowid) AS r FROM messages').get() as { r: number | null }
+      expect(max.r).toBeGreaterThan(0)
+      const rows = rdb
+        .prepare("SELECT rowid, role, text FROM messages WHERE rowid > ? AND role = 'assistant' ORDER BY rowid ASC")
+        .all(0) as Array<{ role: string; text: string }>
+      expect(rows.some((r) => r.text === 'hello')).toBe(true)
+    } finally {
+      rdb.close()
+    }
+  })
 })
 
 describe('recordInbound + query', () => {
