@@ -167,6 +167,17 @@ jobs:
         # Phase 1 parse-level suite.
         working-directory: telegram-plugin
         run: bun run test:uat jtbd-rich-formatting-render-dm
+      - name: Render fidelity — multi-part (chunked long reply) render
+        if: steps.secrets.outputs.ok == 'true'
+        # Multi-part render gate: drives a reply that exceeds the 32768-char
+        # rich-message wire cap so the gateway chunks it (splitMarkdownChunks),
+        # then reads BOTH chunks back via the mtcute driver and asserts each
+        # decodes to real text with formatting intact across the split
+        # boundary. Companion to the single-message render gate above; guards
+        # the chunk-boundary path (a split that bisects a construct renders
+        # wrong). NOT a streaming test — switchroom has no streaming-edit path.
+        working-directory: telegram-plugin
+        run: bun run test:uat jtbd-multipart-render-dm
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context. ALWAYS runs (ubuntu-latest, no
