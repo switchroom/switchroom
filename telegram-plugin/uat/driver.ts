@@ -374,11 +374,14 @@ export class Driver {
       // observed chatId, the resolved sender, edited flag, and text
       // length (NOT the body — hygiene). Reveals chatId-mismatch vs
       // sender-filter vs empty-text as the reason expectMessage times out.
+      const rawM = msg.raw as { _?: string; media?: { _?: string }; message?: string };
       // eslint-disable-next-line no-console -- harness diagnostic
       console.warn(
         `[uat/driver][diag] observed target=${chatId} chatId=${observed.chatId} ` +
         `sender=${observed.senderUserId} edited=${observed.edited} ` +
-        `fromBot=${observed.fromBot} textLen=${observed.text.length}`,
+        `fromBot=${observed.fromBot} textLen=${observed.text.length} ` +
+        `raw_=${rawM._ ?? "?"} media=${rawM.media?._ ?? "none"} ` +
+        `rawMsgLen=${rawM.message?.length ?? -1}`,
       );
       if (observed.chatId !== chatId) return;
       if (targetThread !== undefined && observed.threadId !== targetThread) return;
