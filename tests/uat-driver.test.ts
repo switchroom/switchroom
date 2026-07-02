@@ -695,6 +695,98 @@ describe("Driver.getMessage", () => {
   });
 });
 
+describe("toObserved — rich formatting surface (issue #2739)", () => {
+  // Minimal mtcute-Message-shaped double carrying the getters toObserved
+  // reads. `entities` mirrors mtcute's flattened MessageEntity (kind +
+  // offset/length/text + discriminated params).
+  function mockMsg(overrides: Record<string, unknown>): unknown {
+    return {
+      id: 7,
+      text: "",
+      date: new Date("2026-07-02T00:00:00Z"),
+      chat: { id: 111 },
+      sender: { id: 222, type: "user", isBot: true },
+      replyToMessage: undefined,
+      raw: { _: "message", media: undefined },
+      isSilent: false,
+      entities: [],
+      ...overrides,
+    };
+  }
+
+  it("surfaces entities (kind/text/url/language) from a decoded rich message", async () => {
+    const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
+    await driver.connect();
+    mockClient.getMessages.mockResolvedValueOnce([
+      mockMsg({
+        text: "a bold phrase and a code_token and the repo",
+        entities: [
+          { kind: "bold", offset: 2, length: 11, text: "bold phrase", params: { kind: "bold" } },
+          { kind: "code", offset: 25, length: 10, text: "code_token", params: { kind: "code" } },
+          {
+            kind: "text_link",
+            offset: 44,
+            length: 4,
+            text: "repo",
+            params: { kind: "text_link", url: "https://example.com/r" },
+          },
+          {
+            kind: "pre",
+            offset: 0,
+            length: 5,
+            text: "x=1\n",
+            params: { kind: "pre", language: "bash" },
+          },
+        ],
+        link: "https://t.me/c/111/7",
+      } as never),
+    ]);
+    const msg = await driver.getMessage(111, 7);
+    expect(msg?.text).not.toBe("\x01");
+    expect(msg?.entities.map((e) => e.kind)).toEqual([
+      "bold",
+      "code",
+      "text_link",
+      "pre",
+    ]);
+    const link = msg?.entities.find((e) => e.kind === "text_link");
+    expect(link?.url).toBe("https://example.com/r");
+    const pre = msg?.entities.find((e) => e.kind === "pre");
+    expect(pre?.language).toBe("bash");
+    expect(msg?.link).toBe("https://t.me/c/111/7");
+  });
+
+  it("keeps the \\x01 sentinel and empty entities for undecoded rich media", async () => {
+    const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
+    await driver.connect();
+    mockClient.getMessages.mockResolvedValueOnce([
+      mockMsg({
+        text: "",
+        raw: { _: "message", media: { _: "messageMediaUnsupported" } },
+        entities: [],
+      } as never),
+    ]);
+    const msg = await driver.getMessage(111, 7);
+    expect(msg?.text).toBe("\x01");
+    expect(msg?.entities).toEqual([]);
+  });
+
+  it("leaves link undefined when the .link getter throws (private DM)", async () => {
+    const driver = new Driver({ apiId: 1, apiHash: "h", session: "S" });
+    await driver.connect();
+    const thrower = mockMsg({ text: "hi" }) as Record<string, unknown>;
+    Object.defineProperty(thrower, "link", {
+      get() {
+        throw new Error("chat does not support message links");
+      },
+    });
+    mockClient.getMessages.mockResolvedValueOnce([thrower as never]);
+    const msg = await driver.getMessage(111, 7);
+    expect(msg?.text).toBe("hi");
+    expect(msg?.link).toBeUndefined();
+  });
+});
+
 describe("Driver.sendVoice", () => {
   it("wraps sendMedia with an InputMedia.voice carrying the file path", async () => {
     // fails when: a refactor switches to sending the OGG as a
