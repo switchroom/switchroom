@@ -60,8 +60,9 @@ describe('stripMarkdown', () => {
   it('F1: normalizes an em-dash on this card/narration prose surface', () => {
     // The reply path scrubs em-dashes but cards/narration/PTY previews did not,
     // so em-dashes leaked there. stripMarkdown now runs the same dash logic.
-    // Lowercase follower → comma (mid-clause); uppercase follower → period.
-    expect(stripMarkdown('build done — shipping now')).toBe('build done, shipping now')
+    // A clause-joining dash becomes a full stop (never a comma — that produces
+    // a comma splice), with the following word recapitalized into a sentence.
+    expect(stripMarkdown('build done — shipping now')).toBe('build done. Shipping now')
     expect(stripMarkdown('build done — Shipping now')).toBe('build done. Shipping now')
   })
 
@@ -93,7 +94,7 @@ describe('cleanWorkerResultParagraph', () => {
 
   it('F1: normalizes em-dashes in worker narration prose', () => {
     const input = '## Result\n\nTests pass — ready to merge'
-    expect(cleanWorkerResultParagraph(input)).toBe('Result Tests pass, ready to merge')
+    expect(cleanWorkerResultParagraph(input)).toBe('Result Tests pass. Ready to merge')
   })
 
   it('F1: an em-dash inside a fenced block is preserved (the block is dropped, never normalized)', () => {
@@ -101,7 +102,7 @@ describe('cleanWorkerResultParagraph', () => {
     // removal — it never reaches (nor is mutated by) the dash normalizer, and
     // the surrounding prose dash IS normalized.
     const input = 'before — after\n```\nlet a = b — c\n```\ntail'
-    expect(cleanWorkerResultParagraph(input)).toBe('before, after tail')
+    expect(cleanWorkerResultParagraph(input)).toBe('before. After tail')
   })
 })
 

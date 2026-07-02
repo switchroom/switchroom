@@ -203,15 +203,27 @@ function restore(
  * Replace em / en dashes with context-appropriate punctuation.
  *
  * Rules, applied in order:
- *   1. ` — ` / ` – ` (flanked by single space) → `, ` if followed by a
- *      lowercase or open-paren character; otherwise `. ` if followed by
- *      an uppercase or end-of-string. Heuristic: lowercase = mid-clause
- *      continuation (comma reads naturally); uppercase = new sentence
- *      (period reads naturally).
+ *   1. ` — ` / ` – ` (flanked by single space) → `. ` + the following
+ *      word recapitalized, in the common case. A spaced em-dash in prose
+ *      almost always joins two INDEPENDENT clauses ("voice came back —
+ *      three PRs stacked"); degrading that to a comma produces a comma
+ *      splice ("voice came back, three PRs stacked"), which reads as
+ *      broken grammar. A period (full stop) is the substitution that
+ *      never corrupts meaning: two independent clauses become two
+ *      sentences. The genuine appositive/parenthetical use of a dash
+ *      ("the lead — a tall man — spoke") is the minority case and still
+ *      reads acceptably as two short sentences, so we default to the
+ *      period rather than risk a splice. A dash already followed by a
+ *      lowercased conjunction/pronoun that only makes sense mid-sentence
+ *      is the rare exception the heuristic can't recover; a clean period
+ *      beats a comma splice there too. Original PR #1683 used a comma for
+ *      lowercase continuations; that was the #2737-era source of splices
+ *      in real replies (fixed here).
  *   2. End-of-line dash (` —\n` / ` –\n`) → `.\n` — treat as full stop.
  *   3. Bare dash with no flanking spaces between word chars
- *      (e.g. "word—word") → `, ` — the missing-space form is rarer but
- *      semantically the same as #1.
+ *      (e.g. "word—word") → `. ` + recapitalized following word — the
+ *      missing-space form is rarer but semantically the same as #1, so it
+ *      gets the same splice-free full-stop treatment.
  *   4. Surviving dash (uncommon, e.g. at sentence start "— note") → `-`
  *      so the message still renders without the AI tell.
  */
@@ -219,14 +231,19 @@ function replaceDashes(text: string): { out: string; replaced: number } {
   let replaced = 0
   let out = text
 
-  // #1: spaced em-dash mid-prose. Decide between ", " and ". " on
-  // the leading character of the following token.
+  // Recapitalize the first ASCII-lowercase letter of `after` so the new
+  // sentence that a full-stop substitution creates reads correctly. A
+  // non-letter start (digit, `(`, quote) is left as-is.
+  const capFirst = (after: string): string =>
+    after.replace(/^([a-z])/, (_m, ch: string) => ch.toUpperCase())
+
+  // #1: spaced em-dash mid-prose. A spaced dash joins two independent
+  // clauses far more often than it sets off an appositive, so degrade it
+  // to a full stop (never a comma — that produces a comma splice) and
+  // recapitalize the following word into a new sentence.
   out = out.replace(/(\S) [—–] (\S)/g, (_m, before: string, after: string) => {
     replaced++
-    // If `after` is uppercase ASCII or one of a known sentence-starter
-    // set, treat as new sentence; otherwise a parenthetical comma.
-    const sentenceStart = /[A-Z]/.test(after)
-    return sentenceStart ? `${before}. ${after}` : `${before}, ${after}`
+    return `${before}. ${capFirst(after)}`
   })
 
   // #2: dash at end of line. Treat as full stop.
@@ -235,11 +252,11 @@ function replaceDashes(text: string): { out: string; replaced: number } {
     return `.${ws}`
   })
 
-  // #3: bare dash between word chars (no flanking spaces). Treat as
-  // missing-space form of #1; comma is the safe fallback.
+  // #3: bare dash between word chars (no flanking spaces). Missing-space
+  // form of #1 — same full-stop treatment so it can't create a splice.
   out = out.replace(/(\w)[—–](\w)/g, (_m, before: string, after: string) => {
     replaced++
-    return `${before}, ${after}`
+    return `${before}. ${capFirst(after)}`
   })
 
   // #4: anything still standing — convert to ASCII hyphen so no
