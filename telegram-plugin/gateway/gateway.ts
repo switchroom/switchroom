@@ -87,6 +87,7 @@ import { DeferredDoneReactions } from '../reaction-defer.js'
 import { createWorkerActivityFeed, isWorkerActivityFeedEnabled } from '../worker-activity-feed.js'
 import { reconcilePin, type PinBotApi } from '../status-pin-driver.js'
 import type { PinState, DesiredPin } from '../status-pin.js'
+import { decidePinAction } from '../status-pin.js'
 import { formatTurnLifecycle, detectStatusSurfaceDegraded } from './status-surface-log.js'
 import { parseSourceMessageId } from './source-message-id.js'
 import {
@@ -372,10 +373,11 @@ import {
 import { loadObligations, persistObligations } from './obligation-store.js'
 import {
   loadStatusPins,
-  persistStatusPins,
   pinnedMessageIsOurs,
+  reconcileAndPersistStatusPin,
   runStatusPinBootCleanup,
   type PersistedStatusPin,
+  type StatusPinPersistOp,
   type TrackedStatusPin,
 } from './status-pin-store.js'
 import { driveEscalation } from './escalation-drive.js'
@@ -5640,17 +5642,22 @@ const statusPinStoreFs = {
 }
 const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
 
-// Snapshot the live claim set and write it through. Called on every reconcile
-// (pin/unpin) so the on-disk set always mirrors the in-memory Maps.
-function persistStatusPinSnapshot(): void {
-  if (!statusPinPersistEnabled) return
+// The full live claim set as persisted rows (confirmed pins), from the Maps.
+function snapshotStatusPins(): PersistedStatusPin[] {
   const snapshot: PersistedStatusPin[] = []
   for (const [pinKey, state] of statusPinState) {
     const chatId = statusPinChatIds.get(pinKey)
     if (chatId == null) continue
     snapshot.push({ pinKey, chatId, messageId: state.messageId })
   }
-  persistStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs, snapshot)
+  return snapshot
+}
+
+// The live claim set EXCLUDING one key — used by reconcileAndPersistStatusPin so
+// it can rewrite the whole set atomically while it flips that one key's record
+// between pending / confirmed / absent.
+function snapshotStatusPinsExcept(exceptKey: string): PersistedStatusPin[] {
+  return snapshotStatusPins().filter((p) => p.pinKey !== exceptKey)
 }
 
 // The Bot API surface the pin driver needs. `lockedBot` is defined later; wrap
@@ -5717,17 +5724,57 @@ async function reconcileStatusPin(
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
   const prev = statusPinState.get(pinKey) ?? null
-  const next = await reconcilePin({
-    api: statusPinApi(),
+
+  const runReconcile = () =>
+    reconcilePin({
+      api: statusPinApi(),
+      chatId,
+      prevState: prev,
+      desired,
+      onError: (phase, err) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        process.stderr.write(
+          `telegram gateway: status-pin ${phase} failed (key=${pinKey} chat=${chatId}): ${msg}\n`,
+        )
+      },
+    })
+
+  // Classify the action so we persist INTENT before the pin API call. Only a
+  // fresh `pin` of a message that isn't already our claim opens the leak window
+  // (the API call actually pins something new); everything else (unpin, noop,
+  // re-pin of the same id) clears / leaves the record and is safe to persist
+  // after. See reconcileAndPersistStatusPin for the ordering rationale.
+  const action = decidePinAction(prev, desired)
+  const op: StatusPinPersistOp =
+    action.kind === 'pin'
+      ? { kind: 'pin', messageId: action.messageId }
+      : { kind: 'clear' }
+
+  if (!statusPinPersistEnabled) {
+    // Persistence off (STATIC / feature-off): just reconcile + update Maps.
+    const next = await runReconcile()
+    if (next == null) {
+      statusPinState.delete(pinKey)
+      statusPinChatIds.delete(pinKey)
+    } else {
+      statusPinState.set(pinKey, next)
+      statusPinChatIds.set(pinKey, chatId)
+    }
+    return
+  }
+
+  // Persist-BEFORE-pin ordering lives in reconcileAndPersistStatusPin: for a
+  // pin it writes a `pending` record first, then confirms it after the API call
+  // lands (or drops it on failure). A crash in the window leaves a pending
+  // record boot cleanup will unpin. In-memory Maps are updated from the result.
+  const next = await reconcileAndPersistStatusPin({
+    path: STATUS_PIN_STORE_PATH,
+    fs: statusPinStoreFs,
+    pinKey,
     chatId,
-    prevState: prev,
-    desired,
-    onError: (phase, err) => {
-      const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(
-        `telegram gateway: status-pin ${phase} failed (key=${pinKey} chat=${chatId}): ${msg}\n`,
-      )
-    },
+    op,
+    snapshotOthers: () => snapshotStatusPinsExcept(pinKey),
+    applyPin: runReconcile,
   })
   if (next == null) {
     statusPinState.delete(pinKey)
@@ -5736,10 +5783,6 @@ async function reconcileStatusPin(
     statusPinState.set(pinKey, next)
     statusPinChatIds.set(pinKey, chatId)
   }
-  // Mirror the mutation to disk (pin → present, unpin → removed) so a crash
-  // before the next unpin can't strand the pin — boot cleanup unpins whatever
-  // survives here. Wired exactly like obligationStore's onChange.
-  persistStatusPinSnapshot()
 }
 
 /**
