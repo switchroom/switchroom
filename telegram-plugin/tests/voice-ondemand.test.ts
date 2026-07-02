@@ -9,6 +9,9 @@
  */
 
 import { describe, it, expect } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import {
   VoiceOnDemandCache,
   VOICE_ONDEMAND_CALLBACK_PREFIX,
@@ -71,7 +74,7 @@ describe('on-demand: bounded TTL LRU cache', () => {
 
   it('expires entries past the TTL (miss → graceful null)', () => {
     let now = 1_000
-    const cache = new VoiceOnDemandCache(100 /* ttl */, 500, () => now)
+    const cache = new VoiceOnDemandCache({ ttlMs: 100, maxEntries: 500, now: () => now })
     cache.put('tok', { text: 'x', speed: 1 })
     now = 1_050
     expect(cache.get('tok')).not.toBeNull() // still fresh
@@ -80,7 +83,7 @@ describe('on-demand: bounded TTL LRU cache', () => {
   })
 
   it('evicts the oldest entry past the size cap (LRU)', () => {
-    const cache = new VoiceOnDemandCache(60_000, 2 /* cap */)
+    const cache = new VoiceOnDemandCache({ ttlMs: 60_000, maxEntries: 2 })
     cache.put('a', { text: 'a', speed: 1 })
     cache.put('b', { text: 'b', speed: 1 })
     cache.put('c', { text: 'c', speed: 1 }) // evicts 'a'
@@ -88,6 +91,100 @@ describe('on-demand: bounded TTL LRU cache', () => {
     expect(cache.get('a')).toBeNull()
     expect(cache.get('b')).not.toBeNull()
     expect(cache.get('c')).not.toBeNull()
+  })
+})
+
+describe('on-demand: cache survives a restart (persistPath)', () => {
+  it('reloads tokens from disk so a Listen tap after restart still resolves', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'voice-ondemand-persist-'))
+    const persistPath = join(dir, 'voice-ondemand.json')
+    try {
+      // First "process": mint + store a token, then drop the instance
+      // (simulating a gateway restart wiping the in-memory Map).
+      const before = new VoiceOnDemandCache({ persistPath })
+      before.put('tok', { text: 'hello after restart', voice: 'af_bella', speed: 1.1 })
+      expect(existsSync(persistPath)).toBe(true)
+
+      // Second "process": a fresh instance backed by the same file must see it.
+      const after = new VoiceOnDemandCache({ persistPath })
+      expect(after.get('tok')).toEqual({
+        text: 'hello after restart',
+        voice: 'af_bella',
+        speed: 1.1,
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('drops entries that expired while the gateway was down', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'voice-ondemand-expire-'))
+    const persistPath = join(dir, 'voice-ondemand.json')
+    try {
+      let now = 1_000
+      const before = new VoiceOnDemandCache({ ttlMs: 100, persistPath, now: () => now })
+      before.put('tok', { text: 'x', speed: 1 })
+      // Restart happens "later" — past the TTL.
+      now = 5_000
+      const after = new VoiceOnDemandCache({ ttlMs: 100, persistPath, now: () => now })
+      expect(after.get('tok')).toBeNull()
+      expect(after.size).toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves LRU insertion order + cap across a reload', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'voice-ondemand-lru-'))
+    const persistPath = join(dir, 'voice-ondemand.json')
+    try {
+      const before = new VoiceOnDemandCache({ maxEntries: 3, persistPath })
+      before.put('a', { text: 'a', speed: 1 })
+      before.put('b', { text: 'b', speed: 1 })
+      before.put('c', { text: 'c', speed: 1 })
+
+      // Reload with a SMALLER cap — the oldest ('a') must be dropped.
+      const after = new VoiceOnDemandCache({ maxEntries: 2, persistPath })
+      expect(after.size).toBe(2)
+      expect(after.get('a')).toBeNull()
+      expect(after.get('b')).not.toBeNull()
+      expect(after.get('c')).not.toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a corrupt persistence file degrades to an empty cache (no throw)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'voice-ondemand-corrupt-'))
+    const persistPath = join(dir, 'voice-ondemand.json')
+    try {
+      writeFileSync(persistPath, '{ this is not valid json', 'utf8')
+      let cache: VoiceOnDemandCache | undefined
+      expect(() => {
+        cache = new VoiceOnDemandCache({ persistPath })
+      }).not.toThrow()
+      expect(cache!.size).toBe(0)
+      // Still usable — a fresh put + get round-trips and rewrites the file clean.
+      cache!.put('tok', { text: 'ok', speed: 1 })
+      expect(cache!.get('tok')).toEqual({ text: 'ok', speed: 1 })
+      // File is now valid JSON again.
+      expect(() => JSON.parse(readFileSync(persistPath, 'utf8'))).not.toThrow()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('an in-memory cache (no persistPath) writes no file — unchanged behaviour', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'voice-ondemand-mem-'))
+    try {
+      const cache = new VoiceOnDemandCache()
+      cache.put('tok', { text: 'x', speed: 1 })
+      // Nothing under the tmp dir was written.
+      expect(existsSync(join(dir, 'voice-ondemand.json'))).toBe(false)
+      expect(cache.get('tok')).not.toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

@@ -8623,7 +8623,14 @@ const VOICE_OUT_HARD_CHUNK_CAP = 4096
  * Bounded LRU with a TTL so a stale button (tapped an hour later) degrades to
  * a graceful "expired" toast rather than pinning reply text in memory forever.
  */
-const voiceOnDemandCache = new VoiceOnDemandCache()
+// Persist the Listen-token cache under STATE_DIR (= /state/agent/telegram in
+// prod, a volume that survives container recreation). Without this the Map was
+// wiped on every gateway restart, so a 🔊 Listen button tapped on a message
+// sent before the restart degraded to "Voice expired". The same TTL + LRU cap
+// still applies; expired entries are dropped on load.
+const voiceOnDemandCache = new VoiceOnDemandCache({
+  persistPath: join(STATE_DIR, 'voice-ondemand.json'),
+})
 
 type VoiceOutAccess = NonNullable<Access['voice_out']>
 
