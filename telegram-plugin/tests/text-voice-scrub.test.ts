@@ -159,6 +159,32 @@ describe('scrubVoice — em / en dash replacement', () => {
       expect(r.scrubbed).toBe('- note: ship it')
       expect(r.replaced).toBe(1)
     })
+
+    it('does not recapitalize a mixed-case brand token after a dash', () => {
+      // capFirst must leave a lowercase-initial mixed-case token (iOS, eBay,
+      // iPhone, macOS) alone — recapitalizing "iOS" to "IOS" corrupts the
+      // brand. A normal lowercase word still gets recapitalized.
+      const r = scrubVoice('foo—iOS build')
+      expect(r.scrubbed).toBe('foo. iOS build')
+      expect(r.replaced).toBe(1)
+
+      const spaced = scrubVoice('shipped — iPhone ready')
+      expect(spaced.scrubbed).toBe('shipped. iPhone ready')
+
+      const normal = scrubVoice('foo—done here')
+      expect(normal.scrubbed).toBe('foo. Done here')
+    })
+
+    it('preserves numeric ranges as ASCII hyphens, not full stops', () => {
+      // A digit-flanked dash is a range, not a clause break. It falls through
+      // to the catch-all rule and becomes an ASCII hyphen.
+      const unspaced = scrubVoice('10–20')
+      expect(unspaced.scrubbed).toBe('10-20')
+      expect(unspaced.replaced).toBe(1)
+
+      const tight = scrubVoice('scored 3–2')
+      expect(tight.scrubbed).toBe('scored 3-2')
+    })
   })
 
   describe('protected regions are left alone', () => {

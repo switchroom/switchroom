@@ -244,8 +244,8 @@ describe("clipNarrative — narrative-step clip (JSONL-text-narrative primitive)
     // F1: the feed renders through renderStatusCard → stripMarkdown, which now
     // normalizes em/en-dashes on this card surface. A narrative and a label go
     // through the exact same path, so the render is still byte-identical — the
-    // dash is scrubbed to a comma in BOTH.
-    const scrubbed = "Important find: no main branch yet, branching off origin.";
+    // dash is scrubbed to a full stop (new sentence, recapitalized) in BOTH.
+    const scrubbed = "Important find: no main branch yet. Branching off origin.";
     const narrativeRender = appendActivityLabel(narrativeLines, clipNarrative(text));
     const labelRender = appendActivityLabel(labelLines, clipNarrative(text));
     expect(narrativeRender).toBe(labelRender);

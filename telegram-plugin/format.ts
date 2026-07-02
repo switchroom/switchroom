@@ -291,9 +291,9 @@ export function normalizeParagraphBreaks(text: string): string {
     // fires on both `A\n \nB` (one space-only blank line) and `A\n\n \n\nB`
     // (a space-only line inside a multi-blank run) but never rewrites a clean
     // `A\n\nB` (no interior whitespace) — that already-correct gap is left to
-    // the `\n{3,}` pass, which is a no-op on it.
+    // the `\n{3,}` pass below, which collapses any surviving run of 3+
+    // newlines (including pure `A\n\n\n\nB`) down to a single `\n\n`.
     .replace(/\n[ \t\r]+\n(?:[ \t\r]*\n)*/g, '\n\n')
-    .replace(/\n[ \t\r]*(?:\n[ \t\r]*)+\n/g, '\n\n')
     .replace(/\n{3,}/g, '\n\n')
 
   // Step 2: walk lines and promote lone prose breaks. We rebuild the string by

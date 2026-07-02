@@ -233,17 +233,25 @@ function replaceDashes(text: string): { out: string; replaced: number } {
 
   // Recapitalize the first ASCII-lowercase letter of `after` so the new
   // sentence that a full-stop substitution creates reads correctly. A
-  // non-letter start (digit, `(`, quote) is left as-is.
-  const capFirst = (after: string): string =>
-    after.replace(/^([a-z])/, (_m, ch: string) => ch.toUpperCase())
+  // non-letter start (digit, `(`, quote) is left as-is. A lowercase-initial
+  // mixed-case brand token (iOS, eBay, iPhone, macOS — second char is
+  // uppercase) is ALSO left as-is: recapitalizing it to "IOS" corrupts the
+  // brand, and the token's own capitalization already reads as intentional.
+  const capFirst = (after: string): string => {
+    if (/^[a-z][A-Z]/.test(after)) return after
+    return after.replace(/^([a-z])/, (_m, ch: string) => ch.toUpperCase())
+  }
 
   // #1: spaced em-dash mid-prose. A spaced dash joins two independent
   // clauses far more often than it sets off an appositive, so degrade it
   // to a full stop (never a comma — that produces a comma splice) and
-  // recapitalize the following word into a new sentence.
-  out = out.replace(/(\S) [—–] (\S)/g, (_m, before: string, after: string) => {
+  // recapitalize the following word into a new sentence. A digit-flanked
+  // dash is a numeric range (10–20), not a clause break, so it's excluded
+  // here and falls through to rule #4 (→ ASCII hyphen, "10-20").
+  out = out.replace(/(\S) [—–] (\S)(\S?)/g, (m, before: string, after: string, peek: string) => {
+    if (/\d/.test(before) && /\d/.test(after)) return m
     replaced++
-    return `${before}. ${capFirst(after)}`
+    return `${before}. ${capFirst(after + peek)}`
   })
 
   // #2: dash at end of line. Treat as full stop.
@@ -253,10 +261,13 @@ function replaceDashes(text: string): { out: string; replaced: number } {
   })
 
   // #3: bare dash between word chars (no flanking spaces). Missing-space
-  // form of #1 — same full-stop treatment so it can't create a splice.
-  out = out.replace(/(\w)[—–](\w)/g, (_m, before: string, after: string) => {
+  // form of #1 — same full-stop treatment so it can't create a splice. A
+  // digit-flanked dash (3–2) is a numeric range, not a clause break, so it's
+  // excluded and falls through to rule #4 (→ ASCII hyphen, "3-2").
+  out = out.replace(/(\w)[—–](\w)(\w?)/g, (m, before: string, after: string, peek: string) => {
+    if (/\d/.test(before) && /\d/.test(after)) return m
     replaced++
-    return `${before}. ${capFirst(after)}`
+    return `${before}. ${capFirst(after + peek)}`
   })
 
   // #4: anything still standing — convert to ASCII hyphen so no
