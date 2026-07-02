@@ -5721,6 +5721,34 @@ async function reconcileStatusPin(
   chatId: string,
   desired: DesiredPin,
 ): Promise<void> {
+  // Fire-and-forget hard boundary. Most callers invoke this as
+  // `void reconcileStatusPin(...)` (auto status-pin is best-effort — it must
+  // never affect turn flow). reconcilePin already swallows pin/unpin API
+  // errors via onError, but the surrounding persistence + Map bookkeeping
+  // (and any future edge) could still reject the returned promise. A rejected
+  // fire-and-forget promise becomes a process-level `unhandledRejection` which
+  // the gateway's handler crashes on — that is exactly how a benign
+  // "not enough rights to manage pinned messages" 400 in a supergroup took the
+  // whole gateway down (marko, 2026-07-01). Auto status-pin is cosmetic; it
+  // must NEVER be able to crash the gateway. Any throw here is logged and
+  // absorbed. (The `pin_message` MCP tool still surfaces failures to the agent
+  // as a normal tool-error — that path is `executePinMessage`, not this one.)
+  try {
+    await reconcileStatusPinInner(pinKey, chatId, desired)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `telegram gateway: status-pin reconcile absorbed error ` +
+        `(key=${pinKey} chat=${chatId}): ${msg}\n`,
+    )
+  }
+}
+
+async function reconcileStatusPinInner(
+  pinKey: string,
+  chatId: string,
+  desired: DesiredPin,
+): Promise<void> {
   if (!PIN_STATUS_WHILE_WORKING) return
   if (chatId.length === 0) return
   const prev = statusPinState.get(pinKey) ?? null
