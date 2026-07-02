@@ -79,7 +79,18 @@ const LINK_URL = "https://github.com/switchroom/switchroom";
 const SAMPLE_LINES = [
   `Reply with EXACTLY this, including the marker ${MARKER} verbatim, and NOTHING else:`,
   "",
-  `${MARKER}: here is **a bold phrase**, some *italic words*, an inline \`code_token\`, and a link to [the repo](${LINK_URL}).`,
+  `${MARKER}: here is **a bold phrase**, some *italic words*, an inline \`code_token\`, ` +
+    `some ~~struck text~~, a ||hidden spoiler||, and a link to [the repo](${LINK_URL}).`,
+  "",
+  "## A heading line",
+  "",
+  "> a blockquoted line",
+  "",
+  "- first bullet",
+  "- second bullet",
+  "",
+  "1. ordered one",
+  "2. ordered two",
   "",
   "Then, on new lines, a fenced code block:",
   "```bash",
@@ -87,8 +98,24 @@ const SAMPLE_LINES = [
   "```",
 ].join("\n");
 
-/** mtcute entity kinds we expect Telegram to have parsed from the sample. */
-const EXPECTED_KINDS = ["bold", "italic", "code", "pre", "text_link"] as const;
+/**
+ * mtcute entity kinds we expect Telegram to have parsed from the sample.
+ * Phase 2 extends the original bold/italic/code/pre/text_link set with the
+ * newly-modeled formatting constructs: strikethrough, spoiler, blockquote,
+ * and the bold-rendered heading. Lists and dividers carry no first-class
+ * Bot API entity (they render as bulleted/numbered/rule TEXT), so they are
+ * asserted on `reply.text` below, not here.
+ */
+const EXPECTED_KINDS = [
+  "bold",
+  "italic",
+  "code",
+  "pre",
+  "text_link",
+  "strikethrough",
+  "spoiler",
+  "blockquote",
+] as const;
 
 function kindsPresent(msg: ObservedMessage): Set<string> {
   return new Set(msg.entities.map((e) => e.kind));
@@ -149,6 +176,23 @@ function kindsPresent(msg: ObservedMessage): Set<string> {
           const link = reply.entities.find((e) => e.kind === "text_link");
           expect(link, "no text_link entity found in the reply").toBeDefined();
           expect(link?.url).toBe(LINK_URL);
+
+          // (5) Lists and dividers have NO first-class Bot API entity — the
+          // decoder renders them into TEXT (bulleted "• ", numbered "N. ").
+          // Assert the decoded body carries a bullet and an ordinal marker so
+          // a regression that drops list structure (back to bare inline text)
+          // reds here. Model replies aren't byte-deterministic, so we check
+          // for the STRUCTURE markers, not exact list wording.
+          expect(
+            reply.text,
+            "decoded reply carried no bullet marker — pageBlockList decode " +
+              "regressed to flat text",
+          ).toContain("• ");
+          expect(
+            reply.text,
+            "decoded reply carried no ordinal marker — pageBlockOrderedList " +
+              "decode regressed to flat text",
+          ).toMatch(/\b1\.\s/);
 
           // Permalink capture — best-effort human-eyeball reference. Private
           // DMs don't support message links (mtcute's .link getter throws
