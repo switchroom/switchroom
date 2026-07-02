@@ -17,6 +17,8 @@
  */
 
 import { randomBytes } from 'crypto'
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'fs'
+import { dirname } from 'path'
 
 /** Reserved callback_data prefix for on-demand Listen buttons. Handled
  *  INTERNALLY by the gateway's callback dispatcher (never routed to the agent
@@ -41,19 +43,59 @@ export type VoiceOnDemandPayload = {
 
 type StoredEntry = VoiceOnDemandPayload & { expiresAt: number }
 
+/** On-disk shape of the persisted cache: a versioned envelope around the
+ *  token→entry map. Versioned so a future schema change can be detected and
+ *  discarded rather than mis-parsed. */
+type PersistedCache = {
+  version: 1
+  entries: Record<string, StoredEntry>
+}
+
+/**
+ * Options for {@link VoiceOnDemandCache}. `persistPath`, when set, backs the
+ * cache with a JSON file so Listen tokens survive a gateway restart — a button
+ * tapped after a restart still synthesizes instead of degrading to "Voice
+ * expired". Omit it (the default) for a pure in-memory cache.
+ */
+export type VoiceOnDemandCacheOptions = {
+  ttlMs?: number
+  maxEntries?: number
+  now?: () => number
+  /** Absolute path to the JSON persistence file (e.g. under TELEGRAM_STATE_DIR,
+   *  which lives on a volume that survives container recreation). When set, the
+   *  cache loads existing (non-expired) entries on construction and rewrites the
+   *  file on every mutation. */
+  persistPath?: string
+}
+
 /**
  * Bounded, TTL'd LRU cache from Listen token → synthesis payload. Keyed by
  * token (not message_id) because the message_id isn't known when the button
  * is sent. A Map preserves insertion order, so the first key is the oldest.
+ *
+ * Optionally durable: pass `persistPath` to back the store with a JSON file so
+ * tokens survive a gateway restart. Persistence uses a synchronous
+ * write-to-temp + atomic rename on each mutation — the store is small (≤
+ * maxEntries) and writes are infrequent (one per reply that offers a Listen
+ * button), so the cost is negligible and the module stays dependency-free.
+ * Any load/write error is swallowed (logged to stderr): a broken persistence
+ * file must never take the gateway down — the cache simply degrades to the old
+ * in-memory behaviour.
  */
 export class VoiceOnDemandCache {
   private readonly store = new Map<string, StoredEntry>()
+  private readonly ttlMs: number
+  private readonly maxEntries: number
+  private readonly now: () => number
+  private readonly persistPath: string | undefined
 
-  constructor(
-    private readonly ttlMs: number = VOICE_ONDEMAND_TTL_MS,
-    private readonly maxEntries: number = VOICE_ONDEMAND_MAX_ENTRIES,
-    private readonly now: () => number = Date.now,
-  ) {}
+  constructor(options: VoiceOnDemandCacheOptions = {}) {
+    this.ttlMs = options.ttlMs ?? VOICE_ONDEMAND_TTL_MS
+    this.maxEntries = options.maxEntries ?? VOICE_ONDEMAND_MAX_ENTRIES
+    this.now = options.now ?? Date.now
+    this.persistPath = options.persistPath
+    if (this.persistPath !== undefined) this.load()
+  }
 
   /** Store a payload under `token`, evicting the oldest entries past the cap. */
   put(token: string, payload: VoiceOnDemandPayload): void {
@@ -65,6 +107,7 @@ export class VoiceOnDemandCache {
       if (oldest === undefined) break
       this.store.delete(oldest)
     }
+    this.flush()
   }
 
   /** Look up a payload; returns null on miss or expiry (and evicts expired). */
@@ -73,6 +116,7 @@ export class VoiceOnDemandCache {
     if (entry == null) return null
     if (entry.expiresAt <= this.now()) {
       this.store.delete(token)
+      this.flush()
       return null
     }
     const { text, voice, speed } = entry
@@ -82,6 +126,67 @@ export class VoiceOnDemandCache {
   /** Current entry count (test/introspection aid). */
   get size(): number {
     return this.store.size
+  }
+
+  /** Load persisted entries, dropping any already expired. Best-effort: a
+   *  missing or corrupt file leaves the cache empty (fresh-start). */
+  private load(): void {
+    if (this.persistPath === undefined) return
+    let raw: string
+    try {
+      raw = readFileSync(this.persistPath, 'utf8')
+    } catch {
+      // No file yet (first boot) — nothing to load.
+      return
+    }
+    try {
+      const parsed = JSON.parse(raw) as PersistedCache
+      if (parsed == null || parsed.version !== 1 || typeof parsed.entries !== 'object') return
+      const nowMs = this.now()
+      // Object.entries preserves insertion order for string keys, which is the
+      // insertion order we wrote — so LRU ordering survives the round-trip.
+      for (const [token, entry] of Object.entries(parsed.entries)) {
+        if (
+          entry == null ||
+          typeof entry.expiresAt !== 'number' ||
+          typeof entry.text !== 'string' ||
+          typeof entry.speed !== 'number'
+        ) {
+          continue
+        }
+        if (entry.expiresAt <= nowMs) continue // already expired — drop
+        this.store.set(token, entry)
+      }
+      // Honour the cap in case the file predates a smaller maxEntries.
+      while (this.store.size > this.maxEntries) {
+        const oldest = this.store.keys().next().value
+        if (oldest === undefined) break
+        this.store.delete(oldest)
+      }
+    } catch (err) {
+      process.stderr.write(
+        `voice-ondemand: failed to parse persisted cache ${this.persistPath}: ${String(err)}\n`,
+      )
+    }
+  }
+
+  /** Write the current store to disk atomically. No-op when not persisting. */
+  private flush(): void {
+    if (this.persistPath === undefined) return
+    const doc: PersistedCache = {
+      version: 1,
+      entries: Object.fromEntries(this.store),
+    }
+    const tmp = `${this.persistPath}.tmp`
+    try {
+      mkdirSync(dirname(this.persistPath), { recursive: true })
+      writeFileSync(tmp, JSON.stringify(doc), 'utf8')
+      renameSync(tmp, this.persistPath)
+    } catch (err) {
+      process.stderr.write(
+        `voice-ondemand: failed to persist cache ${this.persistPath}: ${String(err)}\n`,
+      )
+    }
   }
 }
 
