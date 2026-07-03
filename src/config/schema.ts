@@ -3136,6 +3136,34 @@ export const WebServiceConfigSchema = z.object({
 });
 
 /**
+ * Fleet Health — the operator-facing, job-spec-anchored issue tracker
+ * (`reference/rfcs/fleet-health.md`; serves `fleet-stays-healthy`). The
+ * owner agent runs the nightly model-free sensor + weekly budgeted deep-dive
+ * that populate `~/.switchroom/fleet-health/ledger.json`, which the admin
+ * "Fleet Health" page reads. Top-level + operator-owned (never
+ * agent-writable): the operator assigns WHICH agent owns the work so every
+ * scan and deep-dive is attributable and on-leash.
+ */
+export const FleetHealthConfigSchema = z.object({
+  owner_agent: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]{0,50}$/, {
+      message: "owner_agent must match the standard agent-name pattern",
+    })
+    .optional()
+    .describe(
+      "The admin agent that runs the Fleet Health sensor + deep-dive crons " +
+      "(RFC fleet-health.md). Default unset → the feature is inert: no crons " +
+      "are scheduled and the admin page renders its empty state. The named " +
+      "agent must be admin: true. A dedicated owner (not any admin) keeps " +
+      "the fleet-health work attributable, its memory scoped, and its token " +
+      "spend accountable. The detection runs ONLY as operator-set schedules " +
+      "on this agent — never a self-authored loop (on-leash, " +
+      "no-self-escalation).",
+    ),
+});
+
+/**
  * hostd verb-level knobs (separate from `host_control:` which gates
  * the daemon itself).
  *
@@ -3421,6 +3449,12 @@ export const SwitchroomConfigSchema = z.object({
     "from `host_control:` which governs whether the daemon runs at " +
     "all. Scopes the opt-in flag and rate cap for the " +
     "`config_propose_edit` verb (disabled by default).",
+  ),
+  fleet_health: FleetHealthConfigSchema.default({}).describe(
+    "Fleet Health — job-spec-anchored, operator-facing issue tracker (RFC " +
+    "fleet-health.md, serves fleet-stays-healthy). Assigns the owner agent " +
+    "that runs the nightly model-free sensor + weekly deep-dive. Default " +
+    "unset owner_agent → inert; the admin page renders an empty state.",
   ),
   web_service: WebServiceConfigSchema.default({}).describe(
     "Web-service container (dashboard + GitHub-webhook receiver) config. " +

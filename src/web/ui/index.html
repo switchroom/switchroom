@@ -570,6 +570,7 @@
     <button id="tab-connections" onclick="switchTab('connections')">Connections</button>
     <button id="tab-schedule" onclick="switchTab('schedule')">Schedule</button>
     <button id="tab-approvals" onclick="switchTab('approvals')">Approvals</button>
+    <button id="tab-fleet-health" onclick="switchTab('fleet-health')">Fleet Health</button>
   </nav>
   <main>
     <div id="error"></div>
@@ -581,6 +582,7 @@
     <div id="connections" style="display:none"></div>
     <div id="schedule" style="display:none"></div>
     <div id="approvals" style="display:none"></div>
+    <div id="fleet-health" style="display:none"></div>
   </main>
 
   <script>
@@ -1257,10 +1259,77 @@
       }
     }
 
+    async function fetchFleetHealth() {
+      try {
+        const res = await fetch(`${API}/api/fleet-health`, { headers: authHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        renderFleetHealth(await res.json());
+        clearError();
+      } catch (err) {
+        showError(`Failed to fetch fleet health: ${err.message}`);
+      }
+    }
+
+    // Fleet Health — the 22 job specs ranked worst-first by priority_score
+    // (severity × frequency × reach × recency). Each spec drills down to its
+    // distinct issues; each issue links to its occurrences (turn_ids + log
+    // pointers) and its GitHub issue. Empty state when no owner agent is
+    // assigned yet (feature inert). Design: reference/rfcs/fleet-health.md.
+    function renderFleetHealth(data) {
+      const container = document.getElementById('fleet-health');
+      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
+      const heading = '<h3 style="margin:0 0 0.5rem;font-size:0.95rem">Fleet Health</h3>';
+      if (!data || data.empty) {
+        container.innerHTML = heading +
+          `<div class="loading" style="color:var(--text-dim)">${escapeHtml((data && data.reason) || 'No fleet-health ledger yet.')}</div>`;
+        return;
+      }
+      const meta = [
+        data.owner_agent ? `owner <span class="chip">${escapeHtml(data.owner_agent)}</span>` : dim('no owner agent'),
+        data.generated_at ? `scanned ${escapeHtml(data.generated_at)}` : dim('never scanned'),
+      ].join(' · ');
+      const summary = data.summary
+        ? `<div class="problem" style="margin:.4rem 0">${escapeHtml(data.summary)}</div>` : '';
+      const ghLink = (n) => n != null
+        ? `<a href="https://github.com/switchroom/switchroom/issues/${encodeURIComponent(n)}" target="_blank" rel="noreferrer">#${escapeHtml(String(n))}</a>`
+        : dim('no issue');
+      const issueRows = (issues) => (issues || []).map(i => {
+        const occ = (i.occurrences || []).map(o =>
+          `<span class="chip" title="${escapeHtml(o.log_pointer || '')}">${escapeHtml(o.turn_id)}</span>`).join(' ') || dim('—');
+        return `<tr>
+          <td>${escapeHtml(i.failure_mode || '—')}</td>
+          <td>sev ${escapeHtml(String(i.severity ?? '—'))}</td>
+          <td>${escapeHtml(String(i.frequency ?? 0))}×</td>
+          <td>${escapeHtml((i.reach || []).join(', ') || '—')}</td>
+          <td>${escapeHtml(i.recency || '—')}</td>
+          <td>${occ}</td>
+          <td>${ghLink(i.gh_issue)}</td>
+        </tr>`;
+      }).join('');
+      const specRows = (data.records || []).map(r => `
+        <tr>
+          <td><strong>${escapeHtml(r.job_spec)}</strong></td>
+          <td>${escapeHtml(typeof r.priority_score === "number" ? r.priority_score.toFixed(1) : '—')}</td>
+          <td>${escapeHtml(String(r.open_issue_count ?? 0))}</td>
+          <td>${escapeHtml(r.last_scanned || '—')}</td>
+          <td>${escapeHtml(r.last_deep_dive || '—')}</td>
+        </tr>
+        ${(r.issues && r.issues.length) ? `<tr><td colspan="5" style="padding:0">
+          <table style="width:100%"><thead><tr>
+            <th>mode</th><th>severity</th><th>freq</th><th>reach</th><th>recency</th><th>occurrences</th><th>github</th>
+          </tr></thead><tbody>${issueRows(r.issues)}</tbody></table>
+        </td></tr>` : ''}`).join('');
+      container.innerHTML = heading +
+        `<div style="margin-bottom:.5rem">${meta}</div>` + summary +
+        `<table style="width:100%"><thead><tr>
+          <th>job spec</th><th>priority</th><th>open issues</th><th>last scanned</th><th>last deep-dive</th>
+        </tr></thead><tbody>${specRows}</tbody></table>`;
+    }
+
     // Canonical tab list — kept in sync with the nav buttons above and with
     // SPA_TAB_ROUTES in src/web/server.ts (the server serves the SPA shell for
     // these paths so a reload/deep-link doesn't 404).
-    const TAB_NAMES = ['summary', 'agents', 'accounts', 'system', 'memory', 'connections', 'schedule', 'approvals'];
+    const TAB_NAMES = ['summary', 'agents', 'accounts', 'system', 'memory', 'connections', 'schedule', 'approvals', 'fleet-health'];
 
     // Derive the active tab from the URL path (`/connections` → 'connections',
     // '/' → 'summary'). Unknown paths fall back to summary.
@@ -1291,6 +1360,7 @@
       if (tab === 'connections') fetchConnections();
       if (tab === 'schedule') fetchSchedule();
       if (tab === 'approvals') fetchApprovals();
+      if (tab === 'fleet-health') fetchFleetHealth();
     }
 
     // Back/forward: restore the tab from the history entry (or the path).

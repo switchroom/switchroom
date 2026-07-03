@@ -824,6 +824,34 @@ surfaces this at config-edit time.
 Setup walkthrough:
 [`docs/notion-integration.md`](notion-integration.md).
 
+## Fleet Health (`fleet_health:`)
+
+Fleet Health is the operator-facing, job-spec-anchored issue tracker: the
+fleet watches itself against the jobs in `reference/jobs/`, ranks its own
+recurring failures by impact, and surfaces them on the admin **Fleet Health**
+page (design: [`reference/rfcs/fleet-health.md`](../reference/rfcs/fleet-health.md),
+serves the job spec `fleet-stays-healthy`).
+
+It is **top-level and operator-owned** — not part of the per-agent
+`defaults → profiles → agents` cascade. The one field assigns WHICH agent
+owns the detection work, so every scan and deep-dive is attributable and
+on-leash.
+
+| Field | Cascade | Description |
+|-------|---------|-------------|
+| `fleet_health.owner_agent` | override (top-level only) | The admin agent that runs the nightly model-free sensor + weekly budgeted deep-dive that populate `~/.switchroom/fleet-health/ledger.json`. Default **unset** → the feature is inert: no crons scheduled, the admin page renders its empty state. The named agent must be `admin: true`. A dedicated owner (not any admin) keeps the fleet-health memory scoped and the token spend accountable. The detection runs **only** as operator-set schedules on this agent — never a self-authored loop. |
+
+The ledger at `~/.switchroom/fleet-health/ledger.json` is per-deployment state
+written by the owner agent; it is **never committed to the repo** (same rule
+as agent scaffolds and the scheduler ledger). The admin page reads it
+read-only and ranks the 22 job records worst-first by `priority_score`
+(`severity × frequency × reach × recency`).
+
+```yaml
+fleet_health:
+  owner_agent: klanker   # admin: true; runs the sensor + deep-dive crons
+```
+
 ## Minimal Example
 
 ```yaml

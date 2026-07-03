@@ -1,0 +1,409 @@
+---
+artifact: Fleet Health — operator-facing, job-spec-anchored fleet issue tracking
+serves: fleet-stays-healthy
+advances-outcome: always-available
+status: Draft
+---
+
+# RFC: Fleet Health — the fleet surfaces its own recurring failures
+
+Status: Draft
+Author: Ken (CPO) via klanker pair-design
+Date: 2026-07-03
+Serves: [`fleet-stays-healthy.md`](../jobs/fleet-stays-healthy.md) → outcome `always-available`
+Kill-clause: `chat-is-the-single-source-of-truth`, `no-self-escalation`, `on-leash`, `single-tenant`
+Builds on: `see-my-whole-fleet-from-one-screen.md` (fleet dashboard), `crons-use-the-model-only-when-it-earns-it.md` (tiered crons), `agent-self-improvement.md` (evidence tiers, failure-mode taxonomy)
+
+> A ship-coupled RFC against the Job Spec. The Job Spec is the durable home
+> of the job; this is one effort against it. Solution shape, not solution.
+
+## TL;DR
+
+1. **The job:** the fleet watches itself against the 22 job specs, ranks its
+   own recurring failures by impact, and puts the worst ones in front of the
+   operator with evidence and a GitHub issue tracking the fix.
+2. **Success:** a recurring failure is detected from the fleet's own logs
+   (not a principal complaint), ranked by `severity × frequency × reach ×
+   recency`, tracked in a GitHub issue, and closed on a verified count-drop.
+3. **Biggest constraint:** the nightly sensor that touches all 22 jobs is
+   **model-free (zero tokens)**; the model spend is gated behind it and
+   budgeted to the top 1-2 issues; everything runs as operator-set schedules
+   on one operator-assigned owner agent.
+
+## The Job
+
+> **When** an agent quietly fails at one of the jobs it is supposed to do
+> (a silent no-op, a late delivery, a duplicate send, a missed trigger),
+> **the operator wants** the fleet to surface that failure ranked by impact
+> with the evidence attached, **so they can** spend their attention on the
+> worst-affecting issues instead of auditing every turn by hand.
+
+Durable home: [Job Spec](../jobs/fleet-stays-healthy.md). Serves
+`always-available`; governed by `chat-is-the-single-source-of-truth`,
+`no-self-escalation`, `on-leash`, `single-tenant`.
+
+## Validation (this is real, not hypothetical)
+
+Validated end-to-end on live fleet data the week of 2026-07:
+
+- The 4-layer funnel below detected that **clerk** and **marko** were writing
+  answers as plain text and never calling the reply tool (clerk 200/201
+  turns, marko 282/282). That tripped the gateway's `represent` safety net —
+  answers delivered 2-4 min late plus a wasted represent turn each time.
+- Root-caused by reading the transcripts (an L2 deep-dive), fixed, and the
+  represent-duplicate-send count dropped toward ~2.
+- **carrie**, a clean control, had only ~2 escalations — the sensor did not
+  false-positive on it.
+
+The failure was invisible to the operator until the sensor found it: no
+error was ever raised, the answers *did* eventually arrive. This is exactly
+the silent-failure class the job exists to catch.
+
+## The health ledger
+
+One persistent record **per job spec** (22 records). It is the standing,
+ranked state the admin page reads and the sensor updates.
+
+**Where it lives:** `~/.switchroom/fleet-health/ledger.json` — per-agent /
+per-deployment state under `~/.switchroom`, **never committed to the repo**
+(same rule as agent scaffolds and the scheduler ledger). The owner agent
+writes it in-container at `/state/fleet-health/ledger.json`, host-mounted to
+`~/.switchroom/fleet-health/`. The web container reads it read-only.
+
+**Record shape** (per job spec):
+
+```jsonc
+{
+  "job_spec": "fleet-stays-healthy",        // the jobs/<slug>.md id — join key
+  "open_issue_count": 3,                     // distinct open problems for this job
+  "last_scanned": "2026-07-03T02:00:00Z",    // last nightly sensor pass
+  "priority_score": 42.7,                    // severity × frequency × reach × recency
+  "gh_issues": [1841, 1842],                 // linked GitHub issue numbers
+  "last_deep_dive": "2026-06-30T02:14:00Z",  // last L2 Opus pass (null if never)
+  "issues": [                                // the distinct problems, with evidence
+    {
+      "dedup_key": "represent-duplicate-send:reply-tool-not-called",
+      "failure_mode": "silent-no-op",        // from the taxonomy below
+      "severity": 3,                         // 1-3
+      "frequency": 282,                      // occurrences in the scan window
+      "reach": ["clerk", "marko"],           // agents exhibiting it
+      "recency": "2026-07-02T21:03:00Z",     // newest occurrence
+      "occurrences": [                       // hard-artifact evidence
+        { "agent": "clerk", "turn_id": "12345:_#12673",
+          "log_pointer": "logs/clerk/gateway-supervisor.log:represent duplicate-send" }
+      ],
+      "gh_issue": 1841,
+      "status": "open"                       // open | resolved-pending-verify | closed
+    }
+  ]
+}
+```
+
+The `job_spec` id and the per-issue `turn_id` are the two **join keys**:
+`job_spec` joins a record to `reference/jobs/<slug>.md` and to its GitHub
+label; `turn_id` (origin_turn_id, e.g. `12345:_#12673`) joins an
+occurrence across `turns.jsonl`, the gateway log, and the transcript.
+
+## Priority score
+
+`priority_score = severity × frequency × reach × recency`. Ranking by real
+impact, not raw event count — a rare-but-severe issue must outrank a
+frequent-but-cosmetic one.
+
+- **severity** ∈ {1,2,3} — from the failure-mode taxonomy. Silent no-op /
+  constraint-violation = 3 (the fleet did the wrong thing or nothing while
+  reporting success); partial / duplicate / late-delivery = 2; drift /
+  ux-friction = 1. Assigned by the sensor from the signature that matched.
+- **frequency** — count of occurrences of this `dedup_key` in the scan
+  window (default 30 days), normalized as `log10(1 + count)` so 282 vs 20
+  is a meaningful gap but doesn't swamp the other three factors.
+- **reach** — number of distinct agents exhibiting the issue (`|reach|`). A
+  failure across the whole fleet outweighs a one-agent quirk. A single
+  systemic issue (2 agents) already ranks above a noisy one-agent issue.
+- **recency** — decay on the newest occurrence: `1.0` if within 24h,
+  linearly decaying to `0.1` at the window edge. A failure fixed a month ago
+  sinks; a fresh one floats. This is what closes the loop after a fix: as
+  occurrences stop, recency decays the score toward zero.
+
+All four are computed **from the model-free sensor's output** (below) — no
+model judgment enters the score. The web page ranks the 22 records by
+`priority_score` descending.
+
+## The 4-layer detection funnel
+
+Cheap filters gate expensive reasoning. Each layer only escalates what the
+one below flagged.
+
+### L0 — model-free sensor (nightly, zero tokens)
+
+Reads `turns.jsonl` + the gateway log per agent. **No model call, no `claude
+-p`** (claude-native + subscription-honest hold trivially — L0 spends no
+tokens at all). Emits a structured signal digest; only flagged turns
+escalate. This is the canonical sensor — inlined here so the owner agent runs
+it verbatim:
+
+```python
+#!/usr/bin/env python3
+"""Layer-0 spec-conformance detector (read-only, zero-token).
+
+Validated sources only:
+  turns.jsonl   -> per-turn status/tools/duration/turn_id  (structured oracle)
+  gateway log   -> precise failure signatures + delivery artifacts
+
+Emits a structured signal digest; only flagged turns escalate to a paid pass.
+"""
+import json, sys, subprocess
+from collections import Counter, defaultdict
+
+agent = sys.argv[1] if len(sys.argv) > 1 else "overlord"
+HANG_MS = 360_000           # tuned: >6min (data p99=303s) AND low-progress
+HANG_MAXTOOLS = 2           # long+productive = deep work; long+stalled = hang
+TURNS = f"/host-home/.switchroom/agents/{agent}/turns.jsonl"
+GW    = f"/host-home/.switchroom/logs/{agent}/gateway-supervisor.log"
+
+turns = []
+for line in open(TURNS):
+    line = line.strip()
+    if line:
+        try: turns.append(json.loads(line))
+        except: pass
+
+flags = defaultdict(list)   # failure_mode -> [evidence]
+for t in turns:
+    tid = t.get("turn_id", "?"); st = t.get("status"); tl = t.get("tools", 0)
+    dur = t.get("duration_ms", 0)
+    synthetic = "synthetic-" in tid          # gateway-injected, not a real job
+    if st not in ("complete", "no_reply"):
+        flags["killed/incomplete turn"].append(f"{tid} status={st}")
+    # tuned hang: long AND stalled (few tools) — long+productive is deep work
+    if dur > HANG_MS and tl <= HANG_MAXTOOLS:
+        flags["hang (long+stalled)"].append(f"{tid} {dur//1000}s tools={tl}")
+    # silent no-op: completed, zero tools, real (non-synthetic, non-no_reply)
+    if st == "complete" and tl == 0 and not synthetic:
+        flags["silent no-op candidate"].append(f"{tid} tools=0")
+
+def gcount(pat):
+    try:
+        out = subprocess.run(["grep", "-cE", pat, GW], capture_output=True, text=True)
+        return int(out.stdout.strip() or 0)
+    except: return 0
+
+# precise gateway signatures (precision-filtered — getUpdates blips excluded)
+sig = {
+  "duplicate delivery (represent duplicate-send)": "represent duplicate-send",
+  "represent escalation":                          "obligation escalation",
+  "reply delivery failure":                        r"tg-post method=sendRichMessage[^\n]*status=err",
+}
+gw_hits = {name: gcount(pat) for name, pat in sig.items()}
+
+esc = bool(flags.get("killed/incomplete turn") or flags.get("hang (long+stalled)")
+           or flags.get("silent no-op candidate")
+           or gw_hits["duplicate delivery (represent duplicate-send)"]
+           or gw_hits["reply delivery failure"])
+print(json.dumps({
+    "agent": agent, "turns": len(turns),
+    "status_mix": dict(Counter(t.get("status") for t in turns)),
+    "flags": {k: v for k, v in flags.items()}, "gw_hits": gw_hits,
+    "escalate": esc,
+}))
+```
+
+**Tuned constants (load-bearing — do not casually change):** `HANG_MS =
+360000` (>6 min, data p99 = 303 s), `HANG_MAXTOOLS = 2` (long+productive is
+deep work, long+stalled is a hang), exclude `synthetic-` turn ids
+(gateway-injected, not real jobs), and precise gateway signatures
+(`represent duplicate-send`, `tg-post method=sendRichMessage ... status=err`)
+so a `getUpdates` network blip never counts as a delivery failure.
+
+L0 runs nightly across **all** agents and updates the ledger counts for
+**all 22** job records cheaply. It never spends a token.
+
+### L1 — cheap reflect confirm (nightly, only on L0 hits)
+
+For each L0-flagged issue, a cheap `reflect` (Sonnet, run as an ordinary
+synthesized turn on the owner agent — never `claude -p`) confirms the signal
+is a real failure vs a benign explanation, and assigns the failure-mode
+class + severity. Confirmed issues update the ledger and get/refresh a
+GitHub issue. Idle nights (no L0 hit) never reach L1 → zero model cost.
+
+### L2 — Opus deep root-cause (weekly, BUDGETED, top 1-2 only)
+
+Weekly, the owner agent takes the **top one or two** ledger records by
+`priority_score` and runs an Opus deep-dive: read the flagged turns'
+transcripts (joined by `turn_id`), root-cause, and write the finding into the
+GitHub issue. **Budgeted** — never more than 2 deep-dives per week — so the
+expensive layer is bounded regardless of how many issues exist. This is the
+layer that read the clerk/marko transcripts and root-caused the reply-tool
+gap.
+
+### L3 — weekly synthesis
+
+A weekly `reflect` over the ledger + closed issues: what got fixed, what's
+trending, which jobs are chronically fragile. Written into the ledger's
+top-level summary and surfaced on the page header. Cheap (one reflect over a
+small ledger), not per-turn.
+
+**Self-verifying via count-drop.** After a fix, the nightly L0 sensor's count
+for the `dedup_key` falls (e.g. 282 → ~2). When it stays below a
+resolved-threshold for the verify window, the issue flips
+`resolved-pending-verify` → `closed` and its GitHub issue closes — proof from
+the fleet's own numbers, not a self-report.
+
+## GitHub issue lifecycle (the identify + resolve system-of-record)
+
+GitHub issues are where the *work* lives — both identification and
+resolution. The owner agent (via `gh`, authenticated through a vault-held
+token, `no-self-escalation`-clean):
+
+- **Opens** one issue per distinct problem, keyed by `dedup_key` (e.g.
+  `represent-duplicate-send:reply-tool-not-called`). The dedup key prevents a
+  fresh duplicate issue every night — an existing open issue for the key is
+  **updated**, not re-created.
+- **Labels** it `fleet-health`, a severity label (`severity:1|2|3`), and the
+  job-spec label (`job:fleet-stays-healthy`). The labels are what the admin
+  page and any operator `gh` query filter on.
+- **Links occurrences** into the issue body: the turn ids and log pointers
+  from the ledger's `occurrences`, so the operator can jump straight to the
+  evidence.
+- **Closes** on verified count-drop (above). The close is triggered by the
+  sensor's numbers, so the tracker can't fill with stale "fixed" issues.
+
+The ledger stores the issue **numbers**; the admin page optionally reads the
+GitHub API for live open/closed status. GitHub is the durable
+system-of-record for the work; the ledger is the fast, rankable index.
+
+## Owner agent (attribution + on-leash)
+
+A **dedicated, operator-assigned admin agent** runs the sensor + deep-dive
+crons, so every scan and deep-dive is attributable to a named agent (not an
+anonymous host cron, and not some arbitrary agent that happened to have a
+schedule slot).
+
+- **Assignment:** a top-level config field `fleet_health.owner_agent:
+  <name>` (cascade mode **override**; documented in
+  `docs/configuration.md`). Default unset → the feature is inert (no crons
+  scheduled, page renders the empty state). The named agent must be
+  `admin: true`.
+- **Why a dedicated agent, not any admin:** the detection reads every agent's
+  `turns.jsonl` + logs and opens GitHub issues on the fleet's behalf. That is
+  a distinct standing responsibility with its own memory (what's been
+  triaged, what's chronic) and its own attributable audit trail. Folding it
+  into an arbitrary admin agent muddies attribution and mixes the
+  fleet-health memory into an unrelated persona's context. One owner keeps
+  the work legible and the token spend accountable.
+- **On-leash:** the sensor and deep-dive run only as **operator-set
+  schedules** (nightly L0/L1, weekly L2/L3) on that agent — never a
+  self-authored loop. The owner agent proposes nothing autonomously; the
+  operator commits the crons and the owner assignment.
+
+## Admin page data contract
+
+A new **Fleet Health** page on the operator dashboard (`src/web/`). It reads:
+
+- **The ledger** (`~/.switchroom/fleet-health/ledger.json`) — the 22 records,
+  ranked by `priority_score`. This is the primary, always-available source.
+- **Optionally the GitHub API** — live open/closed status per linked issue
+  number, when a token is available; degrades to the ledger's own `status`
+  when not.
+
+It shows:
+
+- The 22 job specs **ranked worst-first** by `priority_score`, each row:
+  score, open-issue count, severity of the worst open issue, frequency/trend,
+  last-scanned, last-deep-dive.
+- **Per-spec drill-down** to its distinct issues: count, frequency/trend,
+  severity, failure-mode class.
+- **Per-issue** links: to occurrences (turn ids + log pointers) and to the
+  GitHub issue.
+
+It is an **operator surface** — same posture as the fleet dashboard
+(`see-my-whole-fleet-from-one-screen`): authenticated, single-tenant, never a
+principal channel, and it renders no parallel status mirror into a Telegram
+thread. `telegram-only` and `chat-is-the-single-source-of-truth` hold.
+
+## Evidence tiers + failure-mode taxonomy (the sensor's classification)
+
+**Evidence tiers** (highest trust first) — an issue's confidence is capped by
+its best evidence:
+
+1. **Hard artifact** — a structured record in `turns.jsonl` or a precise
+   gateway log signature. What L0 emits. Independently verifiable.
+2. **Process trace** — a transcript read (L2 deep-dive) showing the causal
+   path. Verifiable but interpretive.
+3. **Self-report** — a model's assertion with no backing artifact. Lowest
+   trust; never sufficient to open a severity-3 issue on its own.
+
+The count-drop close is a **hard-artifact** verification — never a
+self-report.
+
+**Failure-mode taxonomy** — the classes the sensor + L1 assign, which drive
+severity:
+
+- **silent no-op** — completed, zero tools, real turn (reported success,
+  did nothing). severity 3.
+- **success theater** — reported done but the artifact/effect is absent.
+  severity 3.
+- **partial** — did some of the job, silently dropped the rest. severity 2.
+- **wrong-but-plausible** — produced a confident, incorrect result.
+  severity 3.
+- **missed trigger** — a schedule/reaction/inbound that should have woken the
+  agent didn't. severity 2.
+- **constraint violation** — crossed a stated boundary (e.g. an off-plan
+  callsite, an ungated action). severity 3.
+- **duplicate** — the same effect delivered twice (the represent
+  duplicate-send). severity 2.
+- **drift** — behaviour slowly diverging from spec over time. severity 1.
+- **spec-side failure** — the job spec itself is wrong/stale and the agent is
+  correctly following a bad contract. severity 2; routes to a spec edit, not
+  an agent fix.
+
+## Bets & Risks
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| L2 Opus runs too often → cost tax | Med | High | L0/L1 model-free gate; L2 budgeted to top 1-2/week |
+| Duplicate GitHub issues every night | Med | Med | `dedup_key` — update existing issue, never re-create |
+| Ranking buries a severe-rare issue | Med | High | severity × reach factors, not raw count; fuzz corpus |
+| Stale "fixed" issues pile up | Low | Med | close on verified count-drop, not self-report |
+| Owner agent becomes a self-authored loop | Low | High | operator-set schedules only; owner assignment operator-committed |
+
+## Rollout
+
+**Opt-in, off by default.** No `fleet_health.owner_agent` → inert (no crons,
+empty page). The operator assigns the owner and commits the L0/L1 (nightly)
+and L2/L3 (weekly) schedules. Conservatism comes from the model-free gate and
+the deep-dive budget, not a staged audience.
+
+**This RFC's slice:** the job spec, this design, and a working+tested admin
+**page skeleton** that renders the ledger (typed reader + clearly-marked
+empty state). The owner-agent crons + the GitHub write path are the operator's
+to wire on the assigned agent — specified here, not code in this PR.
+
+## Verdict
+
+Per `reference/vision.md`'s verdict rule, this ships when it:
+
+- **Advances a vision outcome** — `always-available` (a fleet that stays *up
+  and correct*, not just alive).
+- **Satisfies the new job spec** — [`fleet-stays-healthy.md`](../jobs/fleet-stays-healthy.md),
+  proven by its detect/rank/close UATs.
+- **Passes the three principle checks** — *docs:* the page + CLI explain
+  themselves, no `docs/` required; *defaults:* inert until the operator
+  assigns an owner (opt-in complexity); *consistency:* same operator-page
+  shape as the fleet dashboard, same config cascade, same tiered-cron model.
+- **Crosses no invariant** — `chat-is-the-single-source-of-truth` (operator
+  surface, no parallel mirror), `no-self-escalation` (operator-committed owner
+  + schedules), `on-leash` (no self-authored loop), `single-tenant` (reads
+  this one deployment), `claude-native` (L0 model-free; L1-L3 are ordinary
+  synthesized turns, never `claude -p`).
+
+## Related
+
+- [Job Spec](../jobs/fleet-stays-healthy.md)
+- [`see-my-whole-fleet-from-one-screen.md`](../jobs/see-my-whole-fleet-from-one-screen.md) — the sibling operator fleet view
+- [`crons-use-the-model-only-when-it-earns-it.md`](../jobs/crons-use-the-model-only-when-it-earns-it.md) — the tiered-cron discipline the funnel follows
+- [`agent-self-improvement.md`](./agent-self-improvement.md) — the evidence tiers + failure-mode taxonomy origin (agent-facing sibling)
+- [product-spec.md](../product-spec.md) — outcome `always-available`
+- [principles.md](../principles.md), [invariants.md](../invariants.md)
+
+**Last Updated:** 2026-07-03
