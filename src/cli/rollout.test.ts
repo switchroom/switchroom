@@ -70,7 +70,7 @@ describe("orderAgentsCanaryFirst", () => {
 });
 
 describe("planRollout", () => {
-  it("orders apply → restarts (canary-first) → web → hostd → sweep", () => {
+  it("orders apply → restarts (canary-first) → web → hostd → hindsight → sweep", () => {
     const steps = planRollout(["clerk", "test-harness"]);
     expect(steps.map((s) => (s.kind === "restart-agent" ? `r:${s.agent}` : s.kind))).toEqual([
       "apply",
@@ -78,13 +78,21 @@ describe("planRollout", () => {
       "r:clerk",
       "refresh-web",
       "refresh-hostd",
+      "refresh-hindsight",
       "sweep",
     ]);
   });
 
-  it("drops web + hostd when skipWeb is set", () => {
+  it("places refresh-hindsight immediately after refresh-hostd", () => {
+    const kinds = planRollout(["clerk"]).map((s) => s.kind);
+    expect(kinds).toContain("refresh-hindsight");
+    expect(kinds.indexOf("refresh-hindsight")).toBe(kinds.indexOf("refresh-hostd") + 1);
+  });
+
+  it("drops web + hostd + hindsight when skipWeb is set", () => {
     const kinds = planRollout(["clerk"], { skipWeb: true }).map((s) => s.kind);
     expect(kinds).toEqual(["apply", "restart-agent", "sweep"]);
+    expect(kinds).not.toContain("refresh-hindsight");
   });
 
   it("does NOT emit a singleton step (first restart self-heals them, #2170)", () => {

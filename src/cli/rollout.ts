@@ -15,7 +15,9 @@
  *      STOP on the first mismatch (report what rolled, what didn't).
  *   3. Refresh `switchroom-web` + `switchroom-hostd` (separate compose
  *      projects that do NOT self-heal on a pin bump) via `webd/hostd
- *      install --tag`.
+ *      install --tag`, then refresh `switchroom-hindsight` (a standalone
+ *      `docker run` on the mutable `:latest` tag — also not compose, also
+ *      no self-heal) via `memory setup --recreate` (pull + recreate).
  *   4. Final sweep — print a per-agent version table.
  *
  * Footguns this closes (each a real past incident, see CLAUDE.md / memory):
@@ -25,6 +27,10 @@
  *     self-heal on the first `agent restart` (#2170) — no separate step.
  *   - web + hostd are separate compose projects, stale every release —
  *     step 3.
+ *   - hindsight is a standalone `docker run` on the mutable `:latest` tag
+ *     (not a compose service), so a roll never re-pulls it and it drifts
+ *     stale — observed stuck on claude 2.1.197 while the fleet moved to
+ *     2.1.199. The `:latest` re-pull + recreate in step 3 closes it.
  *   - the `:latest` pull-race / wrong-version-served — the per-agent
  *     `--version` assert in step 2.
  *
@@ -43,6 +49,7 @@ import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import { readAndFilter, defaultAuditLogPath } from "../host-control/audit-reader.js";
+import { isHindsightContainerExists } from "../setup/hindsight.js";
 
 /** One ordered step of a rollout plan. Pure data so it unit-tests. */
 export type RolloutStep =
@@ -51,6 +58,7 @@ export type RolloutStep =
   | { kind: "restart-agent"; agent: string }
   | { kind: "refresh-web" }
   | { kind: "refresh-hostd" }
+  | { kind: "refresh-hindsight" }
   | { kind: "sweep" };
 
 export interface RolloutPlanOpts {
@@ -164,6 +172,7 @@ export function planRollout(
   if (!opts.skipWeb) {
     steps.push({ kind: "refresh-web" });
     steps.push({ kind: "refresh-hostd" });
+    steps.push({ kind: "refresh-hindsight" });
   }
   steps.push({ kind: "sweep" });
   return steps;
@@ -193,6 +202,9 @@ export function formatRolloutPlan(
         break;
       case "refresh-hostd":
         lines.push(`  ${n}. hostd install --tag ${target} (separate compose project)`);
+        break;
+      case "refresh-hindsight":
+        lines.push(`  ${n}. refresh hindsight — pull :latest + recreate (standalone docker run, not compose)`);
         break;
       case "sweep":
         lines.push(`  ${n}. sweep — print per-agent version table`);
@@ -630,6 +642,26 @@ export function executeRollout(
         deps.log(`ROLL_STEP refresh-hostd — hostd install --tag ${target}`);
         const r = deps.run(["hostd", "install", "--tag", target]);
         if (r.status !== 0) warnings.push(`hostd refresh failed (non-fatal); agents already rolled`);
+        break;
+      }
+      case "refresh-hindsight": {
+        // hindsight is a STANDALONE `docker run` on the mutable `:latest`
+        // tag — it is NOT a compose service and does NOT self-heal on a pin
+        // bump, so a roll leaves it pinned to whatever `:latest` resolved to
+        // when it was last recreated (observed: hindsight stuck on claude
+        // 2.1.197 while the fleet moved to 2.1.199). `memory setup --recreate`
+        // pulls the latest hindsight image then recreates the container
+        // (pull → stop → start), reusing the running host ports so
+        // memory.config.url never drifts under the fleet. No-op cleanly when
+        // hindsight isn't installed on this host (guard below also returns
+        // false when docker is unavailable).
+        if (!isHindsightContainerExists()) {
+          deps.log(`ROLL_STEP refresh-hindsight — no hindsight container on this host; skipping`);
+          break;
+        }
+        deps.log(`ROLL_STEP refresh-hindsight — memory setup --recreate (pull :latest + recreate)`);
+        const r = deps.run(["memory", "setup", "--recreate"]);
+        if (r.status !== 0) warnings.push(`hindsight refresh failed (non-fatal); agents already rolled`);
         break;
       }
       case "sweep": {
