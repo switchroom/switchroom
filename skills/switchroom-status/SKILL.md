@@ -82,7 +82,7 @@ End with a one-line summary: "X of Y agents running."
 
 ```
 assistant — running (2h 14m)
-  model: claude-sonnet-4-6  collection: general
+  model: claude-sonnet-5  collection: general
 
 dev — running (45m)
   model: claude-opus-4-8  collection: coding

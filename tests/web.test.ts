@@ -668,7 +668,7 @@ describe("handleGetSystemHealth", () => {
       status: 0,
       stdout: JSON.stringify([
         "PATH=/usr/bin",
-        "HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-6",
+        "HINDSIGHT_API_LLM_MODEL=claude-sonnet-5",
         "HINDSIGHT_API_LLM_PROVIDER=claude-code",
         "HINDSIGHT_API_MCP_STATELESS=true",
       ]),
@@ -678,7 +678,7 @@ describe("handleGetSystemHealth", () => {
     const h = await handleGetSystemHealth(undefined, home);
     expect(h.hindsight.running).toBe(true); // from the HTTP probe, not docker
     expect(h.hindsight.containerStatus).toBe("Up 3 hours");
-    expect(h.hindsight.model).toBe("claude-sonnet-4-6");
+    expect(h.hindsight.model).toBe("claude-sonnet-5");
     expect(h.hindsight.provider).toBe("claude-code");
     expect(h.hindsight.mcpStateless).toBe(true);
   });

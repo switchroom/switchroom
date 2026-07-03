@@ -251,7 +251,7 @@ describe("generateHindsightComposeSnippet (broker-fed, #1245)", () => {
 
   it("pins HINDSIGHT_API_LLM_MODEL to the switchroom-default sonnet", () => {
     const snippet = generateHindsightComposeSnippet();
-    expect(snippet).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-6");
+    expect(snippet).toContain("HINDSIGHT_API_LLM_MODEL=claude-sonnet-5");
   });
 
   it("sets HINDSIGHT_API_MCP_STATELESS=true (immune to hindsight bounces)", () => {

@@ -62,7 +62,7 @@ keeps the "Agent not defined in switchroom.yaml" error, now with a
 hint to use `--profile`.
 
 Model aliases: the bare names `opus`, `sonnet`, `haiku` are accepted
-alongside the full IDs (`claude-opus-4-8`, `claude-sonnet-4-6`,
+alongside the full IDs (`claude-opus-4-8`, `claude-sonnet-5`,
 `claude-haiku-4-5`). Use whichever reads cleaner in your config.
 
 ## Authentication (one OAuth, many agents)

@@ -435,7 +435,7 @@ describe("AgentSchema.permission_mode", () => {
 
 describe("AgentSchema.fallback_model", () => {
   it("accepts valid model names", () => {
-    for (const model of ["sonnet", "haiku", "claude-sonnet-4-6", "claude-haiku-4-5"]) {
+    for (const model of ["sonnet", "haiku", "claude-sonnet-5", "claude-haiku-4-5"]) {
       const result = AgentSchema.parse(baseAgentInput({ fallback_model: model }));
       expect(result.fallback_model).toBe(model);
     }

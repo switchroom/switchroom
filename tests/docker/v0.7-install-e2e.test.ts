@@ -150,7 +150,7 @@ function fixtureYaml(switchroomHome: string): string {
     "  bot_token: placeholder-not-used-no-gateway",
     '  forum_chat_id: "-1001234567890"',
     "defaults:",
-    "  model: claude-sonnet-4-6",
+    "  model: claude-sonnet-5",
     "  channels:",
     "    telegram:",
     "      format: html",

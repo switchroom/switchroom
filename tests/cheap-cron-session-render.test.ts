@@ -21,8 +21,8 @@ const baseCtx = {
   agentDir: "/state/agent",
   securityPluginDir: "/opt/switchroom/security-plugin",
   useSwitchroomPlugin: true,
-  modelQ: "'claude-sonnet-4-6'",
-  cronModelQ: "'claude-sonnet-4-6'",
+  modelQ: "'claude-sonnet-5'",
+  cronModelQ: "'claude-sonnet-5'",
 };
 
 // Structural assertion on the template SOURCE (start.sh.hbs uses custom
@@ -97,7 +97,7 @@ describe("cron-session.sh launcher — compliance + identity", () => {
   });
 
   it("runs at the cheap cron model with the cron mcp config", () => {
-    expect(out).toContain("--model 'claude-sonnet-4-6'");
+    expect(out).toContain("--model 'claude-sonnet-5'");
     expect(out).toContain("--strict-mcp-config");
     // points at the cron config (full set, tool-search-deferred), with a
     // fallback to the main config for older scaffolds.

@@ -11348,7 +11348,12 @@ async function executeVaultRequestAccess(args: Record<string, unknown>): Promise
   if (scopeRaw !== 'read' && scopeRaw !== 'write') {
     throw new Error('vault_request_access: scope must be "read" or "write"')
   }
-  const reason = typeof args.reason === 'string' ? args.reason : undefined
+  // Accept `why` as an alias for `reason`: the sibling tool
+  // vault_request_save uses `why`, and agents cross-contaminate the two
+  // schemas — without the alias the rationale silently drops off the
+  // approval card and the operator sees "why: not provided".
+  const reason =
+    typeof args.reason === 'string' ? args.reason : typeof args.why === 'string' ? args.why : undefined
   // Duration: accept a "30d" / "12h" string from the agent OR default
   // to 30 days. Cap at 90 days — beyond that the operator should use
   // the host CLI and pick the lifetime explicitly. Refuse "never"
@@ -22796,9 +22801,48 @@ bot.on('callback_query:data', async ctx => {
       action: naturalAction(details.tool_name, details.input_preview),
     })
 
-    // (3) Decide the persistence path. tryHostdDispatch returns
-    // "not-configured" when host_control is disabled or the per-agent
-    // socket is absent → legacy fallback.
+    // (3) Ack the tap IMMEDIATELY with an honest interim status. The
+    // durable persist below goes through hostd `config_propose_edit`
+    // (validate→approve→apply→reconcile), which can take 5-10 minutes on
+    // a busy host — the old code awaited only 60s and then reported
+    // "did NOT save" even when the edit later landed. Instead: ack now,
+    // run the persistence in a background continuation with a 12-min
+    // dispatch window, then edit the card with the REAL outcome.
+    // HTML-escape baseText — `ctx.callbackQuery.message.text` returns
+    // entities-stripped plain UTF-8, so raw `<`/`>`/`&` in the
+    // expanded permission card's `description` or `input_preview`
+    // (claude-generated tool descriptions routinely carry these)
+    // would break the HTML re-parse. PR #1158 review caught the same
+    // issue on the operator-event card.
+    const sourceMsg = ctx.callbackQuery?.message
+    const baseText = sourceMsg && 'text' in sourceMsg && sourceMsg.text
+      ? escapeHtmlForTg(sourceMsg.text)
+      : ''
+    const interimLabel =
+      `⏳ **Rule applied for this session** — ${escapeHtmlForTg(agentName)} can ${escapeHtmlForTg(grantPhrase)} ` +
+      `without asking for now; saving durably in background…`
+    // #1150 audit: route through finalizeCallback so the keyboard
+    // strips alongside the status-line edit. The in-flight verdict was
+    // ALREADY dispatched above (independently of this host round-trip)
+    // so the turn never blocked — finalizeCallback here only edits the
+    // card; no synthInbound (would double-fire the verdict).
+    await finalizeCallback(ctx, {
+      ackText: 'Rule applied for this session; saving durably in background…'.slice(0, 200),
+      newText: baseText ? `${baseText}\n\n${interimLabel}` : interimLabel,
+    })
+
+    // Background continuation: decide the persistence path.
+    // tryHostdDispatch returns "not-configured" when host_control is
+    // disabled or the per-agent socket is absent → legacy fallback.
+    // The whole body is wrapped in try/catch: a throw inside a void
+    // IIFE (scheduleGrantRestart's sync fs writes, richMessage, etc.)
+    // would surface as an unhandledRejection — which this gateway
+    // routes through shutdown(). Pre-background, those throws were
+    // contained by grammY's handler wrapper; keep that containment.
+    // Known accepted gap: if the gateway restarts mid-persist, the
+    // interim "saving durably in background…" card stays stale.
+    void (async () => {
+    try {
     let durable = false
     let legacy = false
     let failReason = ''
@@ -22840,8 +22884,10 @@ bot.on('callback_query:data', async ctx => {
           },
         }
         // config_propose_edit blocks on validate→approve→apply→reconcile,
-        // so allow ~60s (well past the default 5s).
-        const resp = await tryHostdDispatch(agentName, req, 60_000)
+        // which can legitimately take 5-10 minutes — allow 12 min. Safe
+        // to wait this long because we're in a background continuation:
+        // the tap was already acked and the verdict already dispatched.
+        const resp = await tryHostdDispatch(agentName, req, 720_000)
         if (resp === 'not-configured') {
           warnLegacySpawnIfHostdDisabled('always-allow')
           legacy = true
@@ -22925,23 +22971,6 @@ bot.on('callback_query:data', async ctx => {
         `always-allow: ${grantPhrase}`,
       ) !== "disabled"
     const liveSuffix = restartScheduled ? " — applying now (restarting to take effect)" : ""
-    const ackText = ok
-      ? (legacyNote
-          ? `✅ Saved. ${agentName} can now ${grantPhrase} without asking (legacy path).`
-          : `✅ Saved. ${agentName} can now ${grantPhrase} without asking.${liveSuffix}`)
-      : (editLockHint
-          ? `⚠️ Allowed for now — config edits are locked. Enable hostd.config_edit_enabled.`
-          : `⚠️ Allowed for now, but "always" did NOT save — it will ask again after restart. Check gateway log.`)
-    // HTML-escape baseText — `ctx.callbackQuery.message.text` returns
-    // entities-stripped plain UTF-8, so raw `<`/`>`/`&` in the
-    // expanded permission card's `description` or `input_preview`
-    // (claude-generated tool descriptions routinely carry these)
-    // would break the HTML re-parse. PR #1158 review caught the same
-    // issue on the operator-event card.
-    const sourceMsg = ctx.callbackQuery?.message
-    const baseText = sourceMsg && 'text' in sourceMsg && sourceMsg.text
-      ? escapeHtmlForTg(sourceMsg.text)
-      : ''
     const editLabel = ok
       ? (legacyNote
           ? `✅ **${escapeHtmlForTg(agentName)} can now ${escapeHtmlForTg(grantPhrase)}** without asking (legacy path); restart agent for full effect`
@@ -22951,15 +22980,30 @@ bot.on('callback_query:data', async ctx => {
       : (editLockHint
           ? `⚠️ **Allowed for now — "always" did NOT save.** Config edits are locked; enable \`hostd.config_edit_enabled\`.`
           : `⚠️ **Allowed for now — "always" did NOT save.** It will ask again after restart. Check gateway log.`)
-    // #1150 audit: route through finalizeCallback so the keyboard
-    // strips alongside the status-line edit. The in-flight verdict was
-    // ALREADY dispatched above (independently of this host round-trip)
-    // so the turn never blocked — finalizeCallback here only edits the
-    // card; no synthInbound (would double-fire the verdict).
-    await finalizeCallback(ctx, {
-      ackText: ackText.slice(0, 200),
-      newText: baseText ? `${baseText}\n\n${editLabel}` : editLabel,
+    // Edit the card with the REAL outcome. The keyboard was already
+    // stripped by the interim finalizeCallback ack above, and the
+    // callback query was already answered — this is a plain edit
+    // replacing the "saving durably in background…" interim line.
+    await ctx.editMessageText(
+      richMessage(baseText ? `${baseText}\n\n${editLabel}` : editLabel),
+      {
+        reply_markup: { inline_keyboard: [] },
+        link_preview_options: { is_disabled: true },
+      },
+    ).catch((err: unknown) => {
+      process.stderr.write(
+        `telegram gateway: always-allow outcome card edit failed: ${(err as Error).message} (request_id=${request_id})\n`,
+      )
     })
+    } catch (err) {
+      // Never let the background persist take the gateway down — an
+      // unhandledRejection here becomes shutdown(). Log and move on;
+      // the in-session rule was already applied at tap time.
+      process.stderr.write(
+        `telegram gateway: always-allow background persist threw: ${(err as Error).message} (request_id=${request_id})\n`,
+      )
+    }
+    })()
     return
   }
 

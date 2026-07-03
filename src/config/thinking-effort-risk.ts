@@ -25,7 +25,7 @@
  * model is flagged.
  *
  * Scope note: this guard intentionally only flags the Opus 4.x family.
- * Sonnet 4.6 also has adaptive thinking, but the fleet runs Sonnet
+ * Sonnet 5 also has adaptive thinking, but the fleet runs Sonnet
  * sub-agents at higher effort without hitting this, so flagging it would
  * be a false alarm. Revisit if the failure is observed on Sonnet.
  *

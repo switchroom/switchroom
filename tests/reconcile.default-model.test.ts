@@ -3,7 +3,7 @@
  *
  * #470 changed the semantics of `reconcileAgent` for agents whose
  * switchroom.yaml has no `model:` field: the new behavior WRITES the
- * switchroom default (`claude-sonnet-4-6`) into `.claude/settings.json`,
+ * switchroom default (`claude-sonnet-5`) into `.claude/settings.json`,
  * rather than DELETING the field as the old code did. The change is
  * load-bearing — without it, agents fall back to whichever model claude
  * picks on its own, which on the day of #470 was a model that broke the
@@ -82,7 +82,7 @@ describe("reconcileAgent — default model (#472 #16)", () => {
 
     const settings = readSettings(agentDir);
     expect(settings.model).toBe(SWITCHROOM_DEFAULT_MAIN_MODEL);
-    expect(settings.model).toBe("claude-sonnet-4-6");
+    expect(settings.model).toBe("claude-sonnet-5");
   });
 
   it("preserves an explicit model from agentConfig", () => {

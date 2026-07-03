@@ -58,7 +58,7 @@ vault:
 # Every agent inherits this. Per-agent fields win on conflict.
 # tools/skills/schedule are unioned; scalars are overridden.
 defaults:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   # The switchroom-telegram fork is the default. Uncomment to fall back to
   # the upstream marketplace plugin: channels.telegram.plugin: official
   channels:

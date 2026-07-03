@@ -12,7 +12,7 @@ const rows: ScheduleReportRow[] = [
   { tier: "poll", exitCode: -3, startedAt: 250 }, // poll error
   { tier: "action", exitCode: 0, startedAt: 260 }, // model-free action (cost 0)
   { tier: "action", exitCode: -4, startedAt: 270 }, // action error
-  { tier: "cheap", exitCode: 0, modelUsed: "claude-sonnet-4-6", startedAt: 300 },
+  { tier: "cheap", exitCode: 0, modelUsed: "claude-sonnet-5", startedAt: 300 },
   { tier: "main", exitCode: 0, startedAt: 400 },
   { tier: "main", exitCode: -2, startedAt: 450 }, // deferred
   { exitCode: 0, startedAt: 500 }, // legacy untiered → main
@@ -31,7 +31,7 @@ describe("summarizeScheduleReport", () => {
       deferred: 1,
       costWeight: 0 * 3 + 0 * 2 + 1 * 1 + 5 * 3, // actions are free = 16
     });
-    expect(s.byModel).toEqual({ "claude-sonnet-4-6": 1 });
+    expect(s.byModel).toEqual({ "claude-sonnet-5": 1 });
   });
 
   it("respects --since", () => {

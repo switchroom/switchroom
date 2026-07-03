@@ -163,3 +163,27 @@ describe('Fix B: vault_request_access standing-ACL-aware (#1487 follow-up)', () 
     expect(approveBlock).toMatch(/try\s*{[\s\S]*?listViaBroker\([\s\S]*?}\s*catch/)
   })
 })
+
+describe('vault_request_access — `why` alias for `reason`', () => {
+  // The sibling tool vault_request_save uses `why`; agents cross-
+  // contaminate the two schemas. Without the alias the rationale
+  // silently drops off the approval card ("why: not provided") and
+  // operators tend to Deny.
+  it('gateway accepts args.why as a fallback when args.reason is absent', () => {
+    expect(gatewaySrc).toMatch(
+      /const reason =\s*\n?\s*typeof args\.reason === 'string' \? args\.reason : typeof args\.why === 'string' \? args\.why : undefined/,
+    )
+  })
+
+  it('bridge schema documents the alias on both fields', () => {
+    const block = bridgeSrc.split("name: 'vault_request_access'")[1]?.split("name: '")[0] ?? ''
+    expect(block).toMatch(/why:\s*{\s*type:\s*'string'/)
+    expect(block).toContain('Alias for `reason`')
+    expect(block).toContain('`why` is accepted as an alias')
+  })
+
+  it('reason wins when both are supplied (ordering: reason checked first)', () => {
+    const idx = gatewaySrc.indexOf("typeof args.reason === 'string' ? args.reason : typeof args.why === 'string'")
+    expect(idx).toBeGreaterThan(-1)
+  })
+})

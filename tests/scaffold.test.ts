@@ -275,11 +275,11 @@ describe("scaffoldAgent", () => {
     expect(startSh).not.toContain("--effort low");
   });
 
-  it("start.sh defaults --model to claude-sonnet-4-6 when model is not set in yaml", () => {
+  it("start.sh defaults --model to claude-sonnet-5 when model is not set in yaml", () => {
     const config = makeAgentConfig();
     const result = scaffoldAgent("no-model-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    expect(startSh).toContain("--model 'claude-sonnet-4-6'");
+    expect(startSh).toContain("--model 'claude-sonnet-5'");
   });
 
   it("start.sh respects an explicit model override", () => {
@@ -287,7 +287,7 @@ describe("scaffoldAgent", () => {
     const result = scaffoldAgent("opus-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     expect(startSh).toContain("--model 'claude-opus-4-7'");
-    expect(startSh).not.toContain("claude-sonnet-4-6");
+    expect(startSh).not.toContain("claude-sonnet-5");
   });
 
   it("start.sh includes --permission-mode flag when permission_mode is set", () => {
@@ -3224,7 +3224,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
 
     // Update agent config in-place (a real user would edit switchroom.yaml)
     const updatedAgent = makeAgentConfig({
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       hooks: { Stop: [{ command: "/new/hook.sh", async: true }] },
       env: { NEW_VAR: "hello" },
     });
@@ -3237,12 +3237,12 @@ describe("scaffoldAgent with global defaults cascade", () => {
     const settings = JSON.parse(
       readFileSync(join(tmpDir, "rec-phase2", ".claude", "settings.json"), "utf-8"),
     );
-    expect(settings.model).toBe("claude-sonnet-4-6");
+    expect(settings.model).toBe("claude-sonnet-5");
     expect(settings.hooks.Stop).toBeDefined();
 
     const startSh = readFileSync(join(tmpDir, "rec-phase2", "start.sh"), "utf-8");
     expect(startSh).toContain("export NEW_VAR='hello'");
-    expect(startSh).toContain("--model 'claude-sonnet-4-6'");
+    expect(startSh).toContain("--model 'claude-sonnet-5'");
   });
 
   it("is a no-op when switchroom.yaml has no defaults block (backcompat)", () => {
@@ -3588,7 +3588,7 @@ describe("phase-6b bug fixes", () => {
     const agentConfig = makeAgentConfig({
       hooks: { PreToolUse: [{ command: "/opt/audit.sh", timeout: 5 }] },
       env: { FOO: "bar" },
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       settings_raw: { effort: "high" },
     });
     const switchroomConfig: SwitchroomConfig = {
@@ -4232,7 +4232,7 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
       telegram: telegramConfig,
       defaults: {
         tools: { allow: ["Read"] },
-        model: "claude-sonnet-4-6",
+        model: "claude-sonnet-5",
       },
       profiles: {
         coder: {
@@ -4259,7 +4259,7 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
     expect(settings.permissions.allow).toContain("Bash");
     expect(settings.permissions.allow).toContain("Edit");
     // Model from defaults flows through profile (which doesn't set it)
-    expect(settings.model).toBe("claude-sonnet-4-6");
+    expect(settings.model).toBe("claude-sonnet-5");
 
     // system_prompt_append from the profile landed in start.sh
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
@@ -4275,7 +4275,7 @@ describe("scaffoldAgent with inline profiles (extends cascade)", () => {
       switchroom: { version: 1, agents_dir: tmpDir },
       telegram: telegramConfig,
       profiles: {
-        coder: { model: "claude-sonnet-4-6" },
+        coder: { model: "claude-sonnet-5" },
       },
       agents: { "override-agent": agentConfig },
     } as SwitchroomConfig;
