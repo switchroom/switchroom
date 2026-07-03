@@ -48,6 +48,61 @@ describe('normalizeParagraphBreaks', () => {
     expect(normalizeParagraphBreaks(input)).toBe(input)
   })
 
+  test('promotes every interior break in a vertical stat card (#2750)', () => {
+    // The gymbro food-log card: lines end in digits/letters (no terminator),
+    // but each is a standalone `label: value` stat line, so every interior
+    // break must become a GFM hard break instead of collapsing to one wall.
+    const input = 'Calories: 1800\nProtein: 120g\nCarbs: 200g'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Calories: 1800  \nProtein: 120g  \nCarbs: 200g',
+    )
+  })
+
+  test('promotes a key-value line followed by prose (#2750)', () => {
+    const input = 'Status: active\nEverything is running smoothly.'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Status: active  \nEverything is running smoothly.',
+    )
+  })
+
+  test('promotes bold-label stat cards — colon inside AND outside the emphasis (#2750)', () => {
+    // The fleet HOUSE style uses markdown-bold labels. Both `**Calories:** 1800`
+    // (colon inside the bold) and `**Calories**: 1800` (colon outside) must have
+    // every interior break promoted.
+    const inside = '**Calories:** 1800\n**Protein:** 120g\n**Carbs:** 200g'
+    expect(normalizeParagraphBreaks(inside)).toBe(
+      '**Calories:** 1800  \n**Protein:** 120g  \n**Carbs:** 200g',
+    )
+    const outside = '**Calories**: 1800\n**Protein**: 120g'
+    expect(normalizeParagraphBreaks(outside)).toBe('**Calories**: 1800  \n**Protein**: 120g')
+  })
+
+  test('regression guard: a mid-sentence colon soft-wrap still does NOT promote (#2750)', () => {
+    // A wrapped sentence that happens to contain a colon must NOT be mistaken
+    // for a stat line: the next line continues the sentence in lowercase.
+    const input = 'He made one point: the plan was sound and\nthe timing was right too'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('regression guard: a long colon-clause with a CAPITAL continuation does NOT promote (#2750)', () => {
+    // The lowercase-continuation guard alone would miss this: the wrapped clause
+    // continues with a capitalised proper noun. The label before the colon is a
+    // long multi-word run (not a short stat label), so the word/length cap keeps
+    // it from being mistaken for a stat line.
+    const input = 'The deal has one catch: the buyer wants it and\nToronto lawyers must sign off'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
+  test('lowercase-label stat cards are an ACCEPTED false-negative (not promoted) (#2750)', () => {
+    // `calories: 1800\nprotein: 120g` — the lowercase-started next line is
+    // indistinguishable from a mid-sentence soft-wrap continuation, so the
+    // conservative guard leaves it alone. Documented, not fixed: models are
+    // steered toward capitalised / bold labels, and a false-negative (un-promoted
+    // break) is the module's preferred failure mode over a false-positive.
+    const input = 'calories: 1800\nprotein: 120g'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
   test('does NOT promote when the next line is a list item (tight list stays tight)', () => {
     const input = 'Here are the steps.\n- first\n- second\n- third'
     expect(normalizeParagraphBreaks(input)).toBe(input)
