@@ -555,16 +555,20 @@ export function normalizePunctuation(text: string): string {
   const { masked, restore } = maskCodeRegions(text, nonce)
 
   let out = masked
-    // 1. Space-flanked em/en dash. Numeric range keeps a hyphen.
-    .replace(/(\S)[ \t][—–][ \t](\S)/g, (_m, a: string, b: string) =>
-      /\d/.test(a) && /\d/.test(b) ? `${a}-${b}` : `${a}, ${b}`,
+    // 1. Space-flanked em/en dash. Numeric range keeps a hyphen. The right
+    //    flank is a LOOKAHEAD (captured, not consumed) so consecutive spaced
+    //    dashes ("a — b — c") all normalize in one pass — a consumed \S would
+    //    swallow the char that anchors the next match.
+    .replace(/(\S)[ \t][—–][ \t](?=(\S))/g, (_m, a: string, b: string) =>
+      /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
     )
     // 2. Bare em-dash between word chars. Numeric range keeps a hyphen.
-    .replace(/(\w)—(\w)/g, (_m, a: string, b: string) =>
-      /\d/.test(a) && /\d/.test(b) ? `${a}-${b}` : `${a}, ${b}`,
+    //    Right flank is a lookahead for the same consecutive-match reason.
+    .replace(/(\w)—(?=(\w))/g, (_m, a: string, b: string) =>
+      /\d/.test(a) && /\d/.test(b) ? `${a}-` : `${a}, `,
     )
     // 3. Bare en-dash between word chars → hyphen (ranges: 2019–2024).
-    .replace(/(\w)–(\w)/g, '$1-$2')
+    .replace(/(\w)–(?=\w)/g, '$1-')
 
   // 4. Leading unicode bullet markers → GFM `- ` (per line, indent kept).
   out = out

@@ -135,6 +135,27 @@ describe('normalizePunctuation', () => {
     const once = normalizePunctuation('a — b\n• c\nd—e\n1–2')
     expect(normalizePunctuation(once)).toBe(once)
   })
+
+  test('consecutive spaced dashes all normalize in ONE pass (#2755 finding 2)', () => {
+    expect(normalizePunctuation('a — b — c')).toBe('a, b, c')
+    expect(normalizePunctuation('one — two — three — four')).toBe('one, two, three, four')
+    expect(normalizePunctuation('x—y—z')).toBe('x, y, z')
+    expect(normalizePunctuation('1–2–3')).toBe('1-2-3')
+  })
+
+  test('cross-path ordering: normalizePunctuation before scrubVoice yields the comma treatment', async () => {
+    // The stream path runs normalizePunctuation BEFORE scrubVoice, same as
+    // reply/edit — so a spaced em-dash gets the comma substitution on every
+    // path, and scrubVoice (period substitution) finds no dash left. Pins
+    // the #2755 finding-1 ordering contract.
+    const { scrubVoice } = await import('../text-voice-scrub.js')
+    const input = 'voice came back — three PRs stacked'
+    const normalized = normalizePunctuation(input)
+    const scrub = scrubVoice(normalized)
+    expect(normalized).toBe('voice came back, three PRs stacked')
+    expect(scrub.replaced).toBe(0)
+    expect(scrub.scrubbed).toBe(normalized)
+  })
 })
 
 describe('stripExcessBold', () => {
