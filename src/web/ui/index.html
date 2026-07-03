@@ -22,6 +22,8 @@
       --yellow: #fbbf24;
       --blue: #60a5fa;
       --radius: 10px;
+      /* Names the mono stack already used inline throughout this file. */
+      --mono: "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace;
     }
 
     body {
@@ -554,6 +556,438 @@
     .mm-attn { border-left: 3px solid var(--red); padding: .4rem .6rem; margin: .15rem 0 .35rem; background: rgba(248,113,113,.07); border-radius: 0 6px 6px 0; font-size: .86em; }
     .mm-attn.warn { border-left-color: var(--yellow); background: rgba(251,191,36,.06); }
     .mm-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+
+    /* ==================================================================
+       Fleet Health redesign — worst-first triage (.fh-* + related).
+       Namespaced; ported from the design handoff mock. Reuses the
+       dashboard's existing tokens (+ the new --mono var).
+    ================================================================== */
+    /* ---------- Page header: owner + scan + L3 summary ---------- */
+    .fh-top {
+      display: flex; flex-wrap: wrap; align-items: flex-start;
+      gap: 1rem 1.5rem; margin-bottom: 1.25rem;
+    }
+    .fh-summary { flex: 1 1 380px; min-width: 300px; }
+    .fh-summary .fh-lede {
+      font-size: 1.05rem; color: var(--text); line-height: 1.45; text-wrap: pretty;
+    }
+    .fh-summary .fh-lede b { color: var(--text); font-weight: 600; }
+    .fh-attribution {
+      margin-top: 0.55rem; font-size: 0.8rem; color: var(--text-dim);
+      font-family: var(--mono); display: flex; flex-wrap: wrap; gap: 0.15rem 0.9rem;
+    }
+    .fh-attribution .k { opacity: 0.7; }
+    .fh-attribution .v { color: var(--text); }
+    .fh-attribution .sep { color: var(--border); }
+
+    /* fleet posture: how many jobs are rotting vs clean, at a glance */
+    .fh-posture {
+      flex: 0 0 auto; display: flex; gap: 0.6rem;
+    }
+    .fh-stat {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 0.6rem 0.9rem; min-width: 76px;
+    }
+    .fh-stat .n { font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    .fh-stat .l { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-top: 0.15rem; }
+    .fh-stat.attn { border-color: rgba(248,113,113,0.35); }
+    .fh-stat.attn .n { color: var(--red); }
+    .fh-stat.clean .n { color: var(--green); }
+
+    /* ---------- Score explainer (collapsible) ---------- */
+    .fh-explain {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); margin-bottom: 1.25rem; overflow: hidden;
+    }
+    .fh-explain > summary {
+      list-style: none; cursor: pointer; user-select: none;
+      padding: 0.7rem 1rem; display: flex; align-items: center; gap: 0.5rem;
+      font-size: 0.85rem;
+    }
+    .fh-explain > summary::-webkit-details-marker { display: none; }
+    .fh-explain > summary .caret { color: var(--text-dim); font-size: 0.7rem; transition: transform 0.15s; }
+    .fh-explain[open] > summary .caret { transform: rotate(90deg); }
+    .fh-explain > summary .formula {
+      margin-left: auto; font-family: var(--mono); font-size: 0.76rem; color: var(--text-dim);
+    }
+    .fh-explain > summary .formula em { color: var(--blue); font-style: normal; }
+    .fh-explain-body { padding: 0 1rem 0.9rem; }
+    .fh-factors { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.6rem; }
+    .fh-factor {
+      background: var(--surface-hover); border-radius: 8px; padding: 0.6rem 0.7rem;
+      border-top: 2px solid var(--fc, var(--border));
+    }
+    .fh-factor .fn { font-weight: 600; font-size: 0.85rem; }
+    .fh-factor .fd { color: var(--text-dim); font-size: 0.76rem; margin-top: 0.2rem; line-height: 1.4; }
+    .fh-factor.sev { --fc: var(--red); }
+    .fh-factor.freq { --fc: var(--yellow); }
+    .fh-factor.reach { --fc: var(--blue); }
+    .fh-factor.rec { --fc: var(--green); }
+
+    /* ---------- Section headings ---------- */
+    .fh-band {
+      display: flex; align-items: baseline; gap: 0.5rem;
+      margin: 0 0 0.7rem; font-size: 0.72rem; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-dim);
+    }
+    .fh-band .n { color: var(--text); opacity: 0.55; font-variant-numeric: tabular-nums; }
+    .fh-band + .fh-band { margin-top: 0; }
+    .fh-attention-list { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 1.75rem; }
+
+    /* ---------- Triage row (one job spec record) ---------- */
+    .fh-rec {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden; transition: border-color 0.15s;
+    }
+    .fh-rec:hover { border-color: #3a3e4e; }
+    .fh-rec.worst { border-color: rgba(248,113,113,0.4); }
+    .fh-rec.worst .fh-rec-head::before {
+      content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--red);
+    }
+
+    .fh-rec-head {
+      position: relative; display: grid;
+      grid-template-columns: 3.2rem 1fr auto; align-items: center;
+      gap: 0.9rem; padding: 0.85rem 1.1rem 0.85rem 1.25rem; cursor: pointer; user-select: none;
+    }
+    /* rank + score cluster */
+    .fh-rank { text-align: center; }
+    .fh-rank .score {
+      font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums;
+      line-height: 1; letter-spacing: -0.02em;
+    }
+    .fh-rank .rk { font-family: var(--mono); font-size: 0.62rem; color: var(--text-dim); letter-spacing: 0.1em; margin-top: 0.15rem; }
+
+    .fh-rec-main { min-width: 0; }
+    .fh-rec-title { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .fh-job {
+      font-family: var(--mono); font-size: 0.95rem; font-weight: 600; color: var(--text);
+      letter-spacing: -0.01em;
+    }
+    .fh-rec-sub {
+      margin-top: 0.28rem; font-size: 0.78rem; color: var(--text-dim);
+      display: flex; flex-wrap: wrap; gap: 0.1rem 0.8rem; font-family: var(--mono);
+    }
+    /* one-line intent: what this job spec promises the operator */
+    .fh-desc {
+      margin-top: 0.3rem; font-size: 0.82rem; color: var(--text-dim);
+      line-height: 1.4; max-width: 62ch; text-wrap: pretty;
+    }
+    .fh-rec-sub .v { color: var(--text); }
+    .fh-rec-sub .sep { color: var(--border); }
+
+    /* score-composition strip — the "why it ranks here" microviz */
+    .fh-compose { display: flex; align-items: center; gap: 0.55rem; margin-top: 0.5rem; flex-wrap: wrap; }
+    .fh-fpill {
+      display: inline-flex; align-items: baseline; gap: 0.28rem;
+      font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim);
+      background: var(--surface-hover); border: 1px solid var(--border);
+      border-radius: 6px; padding: 0.12rem 0.42rem; white-space: nowrap;
+    }
+    .fh-fpill b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .fh-fpill .lab { opacity: 0.7; }
+    .fh-fpill.sev b { color: var(--red); }
+    .fh-fpill.freq b { color: var(--yellow); }
+    .fh-fpill.reach b { color: var(--blue); }
+    .fh-fpill.rec b { color: var(--green); }
+    .fh-times { color: var(--border); font-size: 0.7rem; }
+
+    .fh-rec-right { display: flex; align-items: center; gap: 0.75rem; }
+    .fh-caret { color: var(--text-dim); font-size: 0.8rem; transition: transform 0.15s; }
+    .fh-rec.open .fh-caret { transform: rotate(90deg); }
+
+    /* severity badge */
+    .sev-badge {
+      display: inline-flex; align-items: center; gap: 0.32rem;
+      padding: 0.15rem 0.55rem; border-radius: 999px;
+      font-size: 0.72rem; font-weight: 500; white-space: nowrap;
+    }
+    .sev-badge .dot { width: 7px; height: 7px; border-radius: 50%; }
+    .sev-badge.s3 { color: var(--red); background: rgba(248,113,113,0.12); }
+    .sev-badge.s3 .dot { background: var(--red); box-shadow: 0 0 6px var(--red); }
+    .sev-badge.s2 { color: var(--yellow); background: rgba(251,191,36,0.12); }
+    .sev-badge.s2 .dot { background: var(--yellow); }
+    .sev-badge.s1 { color: var(--blue); background: rgba(96,165,250,0.12); }
+    .sev-badge.s1 .dot { background: var(--blue); }
+
+    .issue-count {
+      font-size: 0.78rem; color: var(--text-dim); font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .issue-count b { color: var(--text); font-weight: 600; }
+
+    /* ---------- Drill-down: distinct issues ---------- */
+    .fh-issues { display: none; border-top: 1px solid var(--border); padding: 0.4rem 1.1rem 0.9rem 1.25rem; }
+    .fh-rec.open .fh-issues { display: block; }
+
+    .fh-issue { padding: 0.8rem 0; border-bottom: 1px solid var(--border); }
+    .fh-issue:last-child { border-bottom: none; }
+    .fh-issue-top { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+
+    /* failure-mode taxonomy chip */
+    .mode-chip {
+      font-family: var(--mono); font-size: 0.72rem; padding: 0.1rem 0.45rem;
+      border-radius: 5px; border: 1px solid var(--border); color: var(--text);
+      background: var(--surface-hover); white-space: nowrap;
+    }
+    .mode-chip.s3 { border-color: rgba(248,113,113,0.4); color: var(--red); }
+    .mode-chip.s2 { border-color: rgba(251,191,36,0.4); color: var(--yellow); }
+    .mode-chip.s1 { border-color: rgba(96,165,250,0.4); color: var(--blue); }
+
+    .status-tag {
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em;
+      padding: 0.1rem 0.45rem; border-radius: 999px; font-weight: 500;
+    }
+    .status-tag.open { color: var(--text-dim); border: 1px solid var(--border); }
+    .status-tag.verify { color: var(--yellow); background: rgba(251,191,36,0.1); }
+    .status-tag.closed { color: var(--green); background: rgba(52,211,153,0.1); }
+
+    .gh-link {
+      margin-left: auto; font-family: var(--mono); font-size: 0.74rem;
+      color: var(--blue); text-decoration: none; display: inline-flex; align-items: center; gap: 0.25rem;
+      padding: 0.1rem 0.4rem; border-radius: 5px;
+    }
+    .gh-link:hover { background: var(--surface-hover); }
+
+    .fh-issue-meta {
+      margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.35rem 1.1rem;
+      font-size: 0.78rem; color: var(--text-dim); font-family: var(--mono);
+      align-items: center;
+    }
+    .fh-issue-meta .v { color: var(--text); }
+    /* frequency trend: count + a self-verifying count-drop when resolving */
+    .fh-trend { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .fh-trend .from { color: var(--text-dim); text-decoration: line-through; opacity: 0.7; }
+    .fh-trend .arrow { color: var(--green); }
+    .fh-trend .to { color: var(--green); font-weight: 600; }
+    .reach-agents { display: inline-flex; gap: 0.25rem; flex-wrap: wrap; }
+    .reach-agents .ag {
+      background: rgba(96,165,250,0.1); color: var(--blue); border-radius: 999px;
+      padding: 0.05rem 0.45rem; font-size: 0.72rem;
+    }
+
+    /* why it failed: the model-free root-cause read, above the raw artifacts */
+    .fh-why {
+      font-size: 0.82rem; color: var(--text); line-height: 1.5; text-wrap: pretty;
+      background: rgba(248,113,113,0.06); border-left: 2px solid rgba(248,113,113,0.5);
+      border-radius: 0 6px 6px 0; padding: 0.5rem 0.7rem; margin-bottom: 0.55rem;
+    }
+    .fh-why-lab {
+      display: block; font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--red); opacity: 0.85; margin-bottom: 0.25rem;
+    }
+
+    /* evidence: the hard artifacts (turn_id join-key + log pointer) */
+    .fh-evidence { margin-top: 0.55rem; }
+    .fh-evidence-h {
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-dim); margin-bottom: 0.35rem; display: flex; align-items: center; gap: 0.4rem;
+    }
+    .fh-evidence-h .tier {
+      color: var(--green); border: 1px solid rgba(52,211,153,0.3);
+      border-radius: 4px; padding: 0 0.3rem; font-size: 0.62rem; letter-spacing: 0.04em; white-space: nowrap;
+    }
+    .occ {
+      display: grid; grid-template-columns: auto 1fr; gap: 0.5rem 0.75rem; align-items: center;
+      background: rgba(0,0,0,0.22); border: 1px solid var(--border); border-radius: 6px;
+      padding: 0.4rem 0.6rem; font-family: var(--mono); font-size: 0.73rem;
+    }
+    .occ + .occ { margin-top: 0.3rem; }
+    .occ .occ-agent { color: var(--text); font-weight: 600; }
+    .occ .occ-body { min-width: 0; display: flex; flex-wrap: wrap; gap: 0.15rem 0.7rem; align-items: center; }
+    .occ .tid { color: var(--yellow); }
+    .occ .ptr { color: var(--text-dim); word-break: break-all; }
+    .occ .ptr .g { color: var(--text); }
+    .occ .more { color: var(--text-dim); font-family: var(--mono); font-size: 0.73rem; padding-left: 0.6rem; }
+
+    /* ---------- Healthy jobs: the quiet majority ---------- */
+    .fh-healthy-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 0.4rem;
+    }
+    .fh-hc {
+      display: flex; align-items: center; gap: 0.55rem;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: 0.55rem 0.7rem; font-size: 0.8rem;
+    }
+    .fh-hc .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex-shrink: 0; align-self: flex-start; margin-top: 0.35rem; }
+    .fh-hc-text { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 0.1rem; }
+    .fh-hc .job { font-family: var(--mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .fh-hc .hd { font-size: 0.72rem; color: var(--text-dim); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .fh-hc .when { margin-left: auto; color: var(--text-dim); font-size: 0.7rem; white-space: nowrap; align-self: flex-start; margin-top: 0.1rem; }
+
+    @media (max-width: 640px) {
+      .fh-factors { grid-template-columns: repeat(2, 1fr); }
+      .fh-rec-head { grid-template-columns: 2.8rem 1fr; }
+      .fh-rec-right { grid-column: 1 / -1; justify-content: flex-start; padding-left: 3.7rem; }
+      .fh-explain > summary .formula { display: none; }
+    }
+
+    /* ==================================================================
+       Summary cockpit redesign (.sm-*). Namespaced; ported from mock.
+    ================================================================== */
+    /* ---------- cockpit header: posture verdict + freshness ---------- */
+    .sm-verdict {
+      display: flex; align-items: center; gap: 0.85rem; margin-bottom: 0.35rem;
+    }
+    .sm-verdict .pulse { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+    .sm-verdict.attn .pulse { background: var(--red); box-shadow: 0 0 10px var(--red); }
+    .sm-verdict.ok .pulse { background: var(--green); box-shadow: 0 0 10px var(--green); }
+    .sm-verdict h2 { font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
+    .sm-verdict h2 b { color: var(--red); }
+    .sm-asof { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 1.1rem; font-family: var(--mono); }
+
+    .sm-band { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin: 0 0 0.6rem; display: flex; align-items: baseline; gap: 0.45rem; }
+    .sm-band .n { color: var(--text); opacity: 0.55; }
+
+    /* ---------- attention hero: what needs you, worst-first ---------- */
+    .sm-attn-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.6rem; }
+    .sm-attn {
+      display: flex; align-items: flex-start; gap: 0.7rem; text-align: left;
+      width: 100%; background: var(--surface); border: 1px solid var(--border);
+      border-left-width: 3px; border-radius: var(--radius); padding: 0.75rem 0.95rem;
+      cursor: pointer; transition: background 0.12s, border-color 0.12s; color: inherit; font: inherit;
+    }
+    .sm-attn:hover { background: var(--surface-hover); }
+    .sm-attn.critical { border-left-color: var(--red); }
+    .sm-attn.warn { border-left-color: var(--yellow); }
+    .sm-attn.info { border-left-color: var(--blue); }
+    .sm-attn .sev {
+      font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+      padding: 0.15rem 0.45rem; border-radius: 5px; margin-top: 0.1rem; white-space: nowrap; font-family: var(--mono);
+    }
+    .sm-attn.critical .sev { color: var(--red); background: rgba(248,113,113,0.12); }
+    .sm-attn.warn .sev { color: var(--yellow); background: rgba(251,191,36,0.12); }
+    .sm-attn.info .sev { color: var(--blue); background: rgba(96,165,250,0.12); }
+    .sm-attn-body { min-width: 0; flex: 1; }
+    .sm-attn-title { font-weight: 600; font-size: 0.9rem; }
+    .sm-attn-detail { color: var(--text-dim); font-size: 0.82rem; margin-top: 0.15rem; text-wrap: pretty; }
+    .sm-attn-go { color: var(--text-dim); font-size: 0.75rem; margin-top: 0.2rem; align-self: center; white-space: nowrap; font-family: var(--mono); }
+    .sm-attn:hover .sm-attn-go { color: var(--blue); }
+    .sm-attn.calm { border-left-color: var(--green); cursor: default; }
+    .sm-attn.calm:hover { background: var(--surface); }
+
+    /* ---------- vitals: the things that actually bite ---------- */
+    .sm-vitals { display: grid; grid-template-columns: 1.4fr 1fr; gap: 0.75rem; margin-bottom: 1.6rem; }
+    .sm-vcard { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.95rem 1.1rem; }
+    .sm-vcard .vh { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 0.6rem; display: flex; align-items: center; gap: 0.4rem; }
+    .sm-vcard .vh a { margin-left: auto; color: var(--text-dim); font-size: 0.72rem; text-decoration: none; cursor: pointer; }
+    .sm-vcard .vh a:hover { color: var(--blue); }
+
+    /* agents posture */
+    .sm-agents-n { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1; }
+    .sm-agents-n .of { font-size: 1rem; color: var(--text-dim); font-weight: 400; }
+    .sm-agents-sub { color: var(--text-dim); font-size: 0.82rem; margin-top: 0.25rem; }
+    .sm-dotrow { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 0.7rem; }
+    .sm-dotrow .d { width: 12px; height: 12px; border-radius: 3px; }
+    .sm-dotrow .d.up { background: var(--green); }
+    .sm-dotrow .d.down { background: var(--red); }
+    .sm-dotrow .d.warn { background: var(--yellow); }
+
+    /* quota gauges (shared with Accounts tab) */
+    .sm-quota-acct { font-size: 0.82rem; color: var(--text-dim); margin-bottom: 0.55rem; }
+    .sm-quota-acct b { color: var(--text); font-family: var(--mono); }
+    .gauge { margin-bottom: 0.55rem; }
+    .gauge:last-child { margin-bottom: 0; }
+    .gauge-top { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.78rem; margin-bottom: 0.22rem; }
+    .gauge-top .lab { color: var(--text-dim); }
+    .gauge-top .val { font-variant-numeric: tabular-nums; font-weight: 600; font-family: var(--mono); }
+    .gauge-track { height: 7px; border-radius: 4px; background: rgba(255,255,255,0.08); overflow: hidden; }
+    .gauge-fill { height: 100%; border-radius: 4px; }
+    .val.lo, .gauge-fill.lo { color: var(--green); }
+    .gauge-fill.lo { background: var(--green); }
+    .val.mid { color: var(--yellow); }
+    .gauge-fill.mid { background: var(--yellow); }
+    .val.hi { color: var(--red); }
+    .gauge-fill.hi { background: var(--red); }
+    .val.na { color: var(--text-dim); }
+    .gauge-reset { font-size: 0.7rem; color: var(--text-dim); margin-left: 0.4rem; font-weight: 400; }
+    .gauge.stale .val, .gauge.stale .gauge-fill { opacity: 0.5; }
+
+    /* ---------- services rail: quiet infra, compact ---------- */
+    .sm-services { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.5rem; }
+    .sm-svc { display: flex; align-items: center; gap: 0.6rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.8rem; }
+    .sm-svc .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .sm-svc .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .sm-svc .dot.bad { background: var(--red); }
+    .sm-svc .dot.idle { background: var(--text-dim); }
+    .sm-svc-text { min-width: 0; }
+    .sm-svc-name { font-size: 0.85rem; font-weight: 600; }
+    .sm-svc-meta { font-size: 0.72rem; color: var(--text-dim); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    @media (max-width: 640px) {
+      .sm-vitals { grid-template-columns: 1fr; }
+    }
+
+    /* ==================================================================
+       Accounts quota-triage redesign (.ac-* / .acct-*). Namespaced;
+       ported from mock. Reuses the shared .gauge-* rules above.
+    ================================================================== */
+    /* ---------- top control bar ---------- */
+    .ac-bar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+    .ac-bar .hint { font-size: 0.78rem; color: var(--text-dim); }
+    .ac-posture { display: flex; gap: 0.6rem; margin-left: auto; }
+    .ac-stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.5rem 0.85rem; text-align: center; min-width: 70px; }
+    .ac-stat .n { font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    .ac-stat .l { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+    .ac-stat.attn { border-color: rgba(248,113,113,0.35); }
+    .ac-stat.attn .n { color: var(--red); }
+    .ac-stat.clean .n { color: var(--green); }
+
+    .ac-band { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); margin: 0 0 0.7rem; display: flex; align-items: baseline; gap: 0.45rem; }
+    .ac-band .n { color: var(--text); opacity: 0.55; }
+    .ac-list { display: flex; flex-direction: column; gap: 0.7rem; margin-bottom: 1.75rem; }
+
+    /* ---------- account row ---------- */
+    .acct {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1rem 1.15rem; position: relative; overflow: hidden; transition: border-color 0.15s;
+    }
+    .acct:hover { border-color: #3a3e4e; }
+    .acct.worst { border-color: rgba(248,113,113,0.4); }
+    .acct.worst::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--red); }
+
+    .acct-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+    .acct-label { font-family: var(--mono); font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+    .acct-fleet { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--blue); border: 1px solid rgba(96,165,250,0.4); border-radius: 5px; padding: 0.08rem 0.4rem; }
+    /* health-badge: additive to the existing base rule — the redesign
+       gives the badge a leading dot, so switch to inline-flex + gap and
+       add the .missing / .exhausted variants the mock uses. */
+    .health-badge { display: inline-flex; align-items: center; gap: 0.3rem; }
+    .health-badge .dot { width: 7px; height: 7px; border-radius: 50%; }
+    .health-badge.healthy .dot { background: var(--green); }
+    .health-badge.expired, .health-badge.missing { color: var(--red); background: rgba(248,113,113,0.12); }
+    .health-badge.expired .dot, .health-badge.missing .dot { background: var(--red); }
+    .health-badge.exhausted { color: var(--yellow); background: rgba(251,191,36,0.12); }
+    .health-badge.exhausted .dot { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+    .acct-actions { margin-left: auto; display: flex; gap: 0.4rem; }
+
+    /* exhaustion / expiry callout */
+    .acct-alert {
+      margin-top: 0.7rem; font-size: 0.82rem; line-height: 1.45;
+      border-radius: 0 6px 6px 0; padding: 0.5rem 0.7rem;
+    }
+    .acct-alert .lab { display: block; font-family: var(--mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.2rem; }
+    .acct-alert.crit { background: rgba(248,113,113,0.07); border-left: 2px solid var(--red); }
+    .acct-alert.crit .lab { color: var(--red); }
+    .acct-alert.warn { background: rgba(251,191,36,0.06); border-left: 2px solid var(--yellow); }
+    .acct-alert.warn .lab { color: var(--yellow); }
+
+    /* quota gauges */
+    .acct-quota { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem 1.4rem; margin-top: 0.8rem; }
+
+    /* footer meta: blast radius + secondary facts */
+    .acct-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 1.3rem; margin-top: 0.85rem; padding-top: 0.7rem; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--text-dim); }
+    .acct-foot .k { opacity: 0.7; font-family: var(--mono); font-size: 0.72rem; }
+    .used-by { display: inline-flex; gap: 0.25rem; flex-wrap: wrap; }
+    .used-by .ag { background: rgba(96,165,250,0.1); color: var(--blue); border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.74rem; }
+    .used-by .none { color: var(--text-dim); font-style: italic; }
+    .acct-foot .probed { font-family: var(--mono); }
+    .acct-foot .probed .src { opacity: 0.7; }
+
+    @media (max-width: 640px) {
+      .acct-quota { grid-template-columns: 1fr; }
+      .ac-posture { margin-left: 0; }
+    }
   </style>
 </head>
 <body>
@@ -593,6 +1027,10 @@
     let openDetails = new Set();
     let agentDetails = {};
     let accounts = [];
+    // The broker's current fleet-active account label, stashed by fetchSummary
+    // (there's no fleet-active flag on /api/accounts). Drives the Accounts tab's
+    // "fleet-active" pill; null until Summary has loaded at least once.
+    let fleetActiveLabel = null;
     let ws = null;
 
     function authHeaders() {
@@ -1276,54 +1714,205 @@
     // pointers) and its GitHub issue. Empty state when no owner agent is
     // assigned yet (feature inert). Design: reference/rfcs/fleet-health.md.
     function renderFleetHealth(data) {
-      const container = document.getElementById('fleet-health');
-      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
-      const heading = '<h3 style="margin:0 0 0.5rem;font-size:0.95rem">Fleet Health</h3>';
+      const el = document.getElementById('fleet-health');
+
       if (!data || data.empty) {
-        container.innerHTML = heading +
+        el.innerHTML =
           `<div class="loading" style="color:var(--text-dim)">${escapeHtml((data && data.reason) || 'No fleet-health ledger yet.')}</div>`;
         return;
       }
-      const meta = [
-        data.owner_agent ? `owner <span class="chip">${escapeHtml(data.owner_agent)}</span>` : dim('no owner agent'),
-        data.generated_at ? `scanned ${escapeHtml(data.generated_at)}` : dim('never scanned'),
-      ].join(' · ');
-      const summary = data.summary
-        ? `<div class="problem" style="margin:.4rem 0">${escapeHtml(data.summary)}</div>` : '';
-      const ghLink = (n) => n != null
-        ? `<a href="https://github.com/switchroom/switchroom/issues/${encodeURIComponent(n)}" target="_blank" rel="noreferrer">#${escapeHtml(String(n))}</a>`
-        : dim('no issue');
-      const issueRows = (issues) => (issues || []).map(i => {
-        const occ = (i.occurrences || []).map(o =>
-          `<span class="chip" title="${escapeHtml(o.log_pointer || '')}">${escapeHtml(o.turn_id)}</span>`).join(' ') || dim('—');
-        return `<tr>
-          <td>${escapeHtml(i.failure_mode || '—')}</td>
-          <td>sev ${escapeHtml(String(i.severity ?? '—'))}</td>
-          <td>${escapeHtml(String(i.frequency ?? 0))}×</td>
-          <td>${escapeHtml((i.reach || []).join(', ') || '—')}</td>
-          <td>${escapeHtml(i.recency || '—')}</td>
-          <td>${occ}</td>
-          <td>${ghLink(i.gh_issue)}</td>
-        </tr>`;
+
+      // Fleet-health timestamps are ISO strings on the wire; formatTimestamp
+      // wants epoch ms, so parse first. Date.parse(null/undefined) → NaN →
+      // formatTimestamp returns "—", preserving the mock's "no value" behaviour.
+      const rel = (iso) => formatTimestamp(Date.parse(iso));
+      const SEV_LABEL = { 3: 'severe', 2: 'moderate', 1: 'minor', 0: 'clear' };
+      const scoreColor = (s) => s >= 15 ? 'var(--red)' : s >= 8 ? 'var(--yellow)' : s > 0 ? 'var(--blue)' : 'var(--text-dim)';
+      // `factors` mirrors the read-model scoring inputs but isn't always on the
+      // wire; derive per the RFC when absent (see reference/rfcs/fleet-health.md).
+      const factorsFor = (iss) => {
+        if (iss.factors) return iss.factors;
+        const ms = Date.parse(iss.recency);
+        let rec = 0.1;
+        if (!isNaN(ms)) {
+          const ageDays = (Date.now() - ms) / 86400000;
+          rec = ageDays <= 1 ? 1.0 : Math.max(0.1, 1.0 - (ageDays / 30) * 0.9);
+        }
+        return {
+          freq: Math.log10(1 + (iss.frequency || 0)),
+          reach: (iss.reach || []).length,
+          rec,
+        };
+      };
+
+      // `last_deep_dive` is a PER-RECORD field, not a top-level payload field —
+      // derive the fleet's most-recent deep-dive as the max across records.
+      const lastDeepDiveMs = data.records.reduce((acc, r) => {
+        const t = Date.parse(r.last_deep_dive);
+        return isNaN(t) ? acc : Math.max(acc, t);
+      }, NaN);
+
+      const attention = data.records.filter((r) => r.open_issue_count > 0);
+      const healthy = data.records.filter((r) => r.open_issue_count === 0);
+      // `issues` is not coerced server-side (only `priority_score` is), so a
+      // record with open_issue_count > 0 but missing/undefined `issues` would
+      // throw on deref and blank the whole tab — guard to [] at every read.
+      const issuesOf = (r) => Array.isArray(r.issues) ? r.issues : [];
+      const worstSev = (r) => Math.max(0, ...issuesOf(r).filter(i => i.status !== 'closed').map(i => i.severity));
+
+      // ---- page header: L3 summary + attribution + posture stats ----
+      const top = `
+        <div class="fh-top">
+          <div class="fh-summary">
+            <div class="fh-lede">${data.summary ? escapeHtml(data.summary) : 'No synthesis yet.'}</div>
+            <div class="fh-attribution">
+              <span><span class="k">owner</span> <span class="v">@${escapeHtml(data.owner_agent || 'unassigned')}</span></span>
+              <span class="sep">·</span>
+              <span><span class="k">last scan</span> <span class="v">${rel(data.generated_at)}</span></span>
+              <span class="sep">·</span>
+              <span><span class="k">last deep-dive</span> <span class="v">${formatTimestamp(lastDeepDiveMs)}</span></span>
+              <span class="sep">·</span>
+              <span><span class="k">jobs tracked</span> <span class="v">${data.records.length}</span></span>
+            </div>
+          </div>
+          <div class="fh-posture">
+            <div class="fh-stat attn"><div class="n">${attention.length}</div><div class="l">need attention</div></div>
+            <div class="fh-stat clean"><div class="n">${healthy.length}</div><div class="l">clean</div></div>
+          </div>
+        </div>`;
+
+      // ---- score explainer (why the ranking is trustworthy) ----
+      const explain = `
+        <details class="fh-explain">
+          <summary>
+            <span class="caret">▶</span>
+            <span>How the ranking works — impact, not raw event count</span>
+            <span class="formula">priority = <em>severity</em> × <em>frequency</em> × <em>reach</em> × <em>recency</em></span>
+          </summary>
+          <div class="fh-explain-body">
+            <div class="fh-factors">
+              <div class="fh-factor sev"><div class="fn">Severity <span style="color:var(--text-dim);font-weight:400">1–3</span></div><div class="fd">Did the wrong thing or nothing while reporting success = 3. From the failure-mode taxonomy, not a guess.</div></div>
+              <div class="fh-factor freq"><div class="fn">Frequency</div><div class="fd">log₁₀(1 + count) over the 30-day window — 282 vs 20 is a real gap without swamping the rest.</div></div>
+              <div class="fh-factor reach"><div class="fn">Reach</div><div class="fd">Distinct agents hit. A fleet-wide failure outranks a one-agent quirk.</div></div>
+              <div class="fh-factor rec"><div class="fn">Recency</div><div class="fd">1.0 within 24h, decaying to 0.1 at the window edge. A fixed issue sinks; this is what closes the loop.</div></div>
+            </div>
+            <div style="margin-top:0.7rem;font-size:0.78rem;color:var(--text-dim)">Every factor comes from the model-free nightly sensor — no model judgment enters the score. Evidence is <span style="color:var(--green)">hard-artifact</span> (a structured turns.jsonl record or a precise gateway signature), independently verifiable by the turn id.</div>
+          </div>
+        </details>`;
+
+      // ---- attention list ----
+      const rows = attention.map((r, idx) => {
+        const recIssues = issuesOf(r);
+        const sev = worstSev(r);
+        const worst = idx === 0 ? ' worst' : '';
+        // drive the composition strip off the worst OPEN issue
+        const lead = recIssues.filter(i => i.status !== 'closed')
+          .sort((a, b) => b.severity - a.severity || b.frequency - a.frequency)[0] || recIssues[0];
+        // `lead` can be undefined when open_issue_count > 0 but the issues
+        // array is empty/absent — skip the composition strip rather than throw.
+        const f = lead ? factorsFor(lead) : null;
+        const compose = lead && f ? `
+          <div class="fh-compose" title="priority = severity × frequency × reach × recency">
+            <span class="fh-fpill sev"><b>${Number(lead.severity)}</b><span class="lab">sev</span></span>
+            <span class="fh-times">×</span>
+            <span class="fh-fpill freq"><b>${f.freq.toFixed(2)}</b><span class="lab">freq · ${Number(lead.frequency)}</span></span>
+            <span class="fh-times">×</span>
+            <span class="fh-fpill reach"><b>${f.reach}</b><span class="lab">reach</span></span>
+            <span class="fh-times">×</span>
+            <span class="fh-fpill rec"><b>${f.rec.toFixed(1)}</b><span class="lab">recency</span></span>
+          </div>` : '';
+
+        const issues = recIssues.map((iss) => {
+          // Ledger numerics are not coerced server-side; normalize before
+          // interpolating so a non-numeric value can't leak into markup.
+          const occTotal = Number(iss.occ_total ?? iss.frequency ?? (iss.occurrences || []).length) || 0;
+          const freqFrom = iss.freq_from != null ? Number(iss.freq_from) : null;
+          const trend = freqFrom != null
+            ? `<span class="fh-trend"><span class="from">${freqFrom}</span><span class="arrow">→</span><span class="to">${occTotal}</span></span> <span style="opacity:.6">since fix</span>`
+            : `<span class="v">${occTotal}</span> in window`;
+          const occ = (iss.occurrences || []).map((o) => `
+            <div class="occ">
+              <span class="occ-agent">${escapeHtml(o.agent)}</span>
+              <div class="occ-body">
+                <span class="tid">${escapeHtml(o.turn_id)}</span>
+                <span class="ptr">${escapeHtml(o.log_pointer || '').replace(/^([^:]+):/, '<span class="g">$1</span>:')}</span>
+              </div>
+            </div>`).join('');
+          const remaining = occTotal - (iss.occurrences || []).length;
+          const more = remaining > 0 ? `<div class="more">+${remaining} more occurrence${remaining === 1 ? '' : 's'} joined by turn id</div>` : '';
+          const statusCls = iss.status === 'resolved-pending-verify' ? 'verify' : iss.status === 'closed' ? 'closed' : 'open';
+          const statusTxt = iss.status === 'resolved-pending-verify' ? 'verifying' : (iss.status || 'open');
+          const ghLink = iss.gh_issue != null
+            ? `<a class="gh-link" href="https://github.com/switchroom/switchroom/issues/${encodeURIComponent(iss.gh_issue)}" target="_blank" rel="noopener">#${escapeHtml(String(iss.gh_issue))} ↗</a>`
+            : '';
+          return `
+            <div class="fh-issue">
+              <div class="fh-issue-top">
+                <span class="mode-chip s${Number(iss.severity) || 0}">${escapeHtml(iss.failure_mode)}</span>
+                <span class="status-tag ${statusCls}">${escapeHtml(statusTxt)}</span>
+                ${ghLink}
+              </div>
+              <div class="fh-issue-meta">
+                <span><span class="k" style="opacity:.7">freq</span> ${trend}</span>
+                <span><span class="k" style="opacity:.7">reach</span> <span class="reach-agents">${(iss.reach || []).map(a => `<span class="ag">${escapeHtml(a)}</span>`).join('')}</span></span>
+                <span><span class="k" style="opacity:.7">latest</span> <span class="v">${rel(iss.recency)}</span></span>
+              </div>
+              <div class="fh-evidence">
+                <div class="fh-evidence-h">evidence <span class="tier">hard-artifact</span></div>
+                ${iss.detail ? `<div class="fh-why"><span class="fh-why-lab">why it failed</span>${escapeHtml(iss.detail)}</div>` : ''}
+                ${occ}${more}
+              </div>
+            </div>`;
+        }).join('');
+
+        return `
+          <div class="fh-rec${worst}" data-open="0">
+            <div class="fh-rec-head" onclick="this.parentNode.classList.toggle('open')">
+              <div class="fh-rank">
+                <div class="score" style="color:${scoreColor(r.priority_score)}">${r.priority_score.toFixed(1)}</div>
+                <div class="rk">#${String(idx + 1).padStart(2, '0')}</div>
+              </div>
+              <div class="fh-rec-main">
+                <div class="fh-rec-title">
+                  <span class="fh-job">${escapeHtml(r.job_spec)}</span>
+                </div>
+                <div class="fh-rec-sub">
+                  <span><span class="k" style="opacity:.7">scanned</span> <span class="v">${rel(r.last_scanned)}</span></span>
+                  <span class="sep">·</span>
+                  <span><span class="k" style="opacity:.7">deep-dive</span> <span class="v">${rel(r.last_deep_dive)}</span></span>
+                </div>
+                ${compose}
+              </div>
+              <div class="fh-rec-right">
+                <span class="sev-badge s${sev}"><span class="dot"></span>${SEV_LABEL[sev]}</span>
+                <span class="issue-count"><b>${r.open_issue_count}</b> open</span>
+                <span class="fh-caret">▶</span>
+              </div>
+            </div>
+            <div class="fh-issues">${issues}</div>
+          </div>`;
       }).join('');
-      const specRows = (data.records || []).map(r => `
-        <tr>
-          <td><strong>${escapeHtml(r.job_spec)}</strong></td>
-          <td>${escapeHtml(typeof r.priority_score === "number" ? r.priority_score.toFixed(1) : '—')}</td>
-          <td>${escapeHtml(String(r.open_issue_count ?? 0))}</td>
-          <td>${escapeHtml(r.last_scanned || '—')}</td>
-          <td>${escapeHtml(r.last_deep_dive || '—')}</td>
-        </tr>
-        ${(r.issues && r.issues.length) ? `<tr><td colspan="5" style="padding:0">
-          <table style="width:100%"><thead><tr>
-            <th>mode</th><th>severity</th><th>freq</th><th>reach</th><th>recency</th><th>occurrences</th><th>github</th>
-          </tr></thead><tbody>${issueRows(r.issues)}</tbody></table>
-        </td></tr>` : ''}`).join('');
-      container.innerHTML = heading +
-        `<div style="margin-bottom:.5rem">${meta}</div>` + summary +
-        `<table style="width:100%"><thead><tr>
-          <th>job spec</th><th>priority</th><th>open issues</th><th>last scanned</th><th>last deep-dive</th>
-        </tr></thead><tbody>${specRows}</tbody></table>`;
+
+      // ---- healthy strip ----
+      const healthyCards = healthy.map((r) => `
+        <div class="fh-hc" title="${escapeHtml(r.job_spec)}">
+          <span class="dot"></span>
+          <div class="fh-hc-text">
+            <span class="job">${escapeHtml(r.job_spec)}</span>
+          </div>
+          <span class="when">${rel(r.last_scanned)}</span>
+        </div>`).join('');
+
+      el.innerHTML = `
+        ${top}
+        ${explain}
+        <div class="fh-band">Needs attention <span class="n">${attention.length}</span> · ranked worst-first</div>
+        <div class="fh-attention-list">${rows}</div>
+        <div class="fh-band">Clean <span class="n">${healthy.length}</span> · scanned, no open issues</div>
+        <div class="fh-healthy-grid">${healthyCards}</div>`;
+
+      // Open the worst offender by default so the operator lands on the evidence.
+      el.querySelector('.fh-rec.worst')?.classList.add('open');
     }
 
     // Canonical tab list — kept in sync with the nav buttons above and with
@@ -1392,87 +1981,106 @@
             appr = summary.approvals, sched = summary.schedule,
             accts = summary.accounts;
       clearError();
-      const tile = (title, body, ok) => `
-        <div class="agent-card" style="min-width:220px">
-          <div class="card-header" style="cursor:default">
-            <span class="status-dot ${ok === null ? '' : ok ? 'active' : 'inactive'}" style="display:inline-block;vertical-align:middle"></span>
-            <span class="agent-name">${escapeHtml(title)}</span>
-          </div>
-          <div style="padding:0 1.25rem 1rem;font-size:0.9rem">${body}</div>
-        </div>`;
-      const dim = (s) => `<span style="color:var(--text-dim)">${escapeHtml(s)}</span>`;
-
-      // Agents up/total
-      let agentsTile;
-      if (Array.isArray(ag)) {
-        const up = ag.filter(x => x.active === 'active').length;
-        agentsTile = tile('Agents', `<strong>${up}/${ag.length}</strong> active`, up === ag.length);
-      } else agentsTile = tile('Agents', dim('unavailable'), null);
-
-      // Broker / hindsight / hostd from system-health
-      let brokerTile, hsTile, hostdTile;
-      if (sys && sys.broker) {
-        brokerTile = tile('Auth-broker',
-          sys.broker.reachable
-            ? `reachable · active <strong>${escapeHtml(sys.broker.active || '—')}</strong><br>${sys.broker.accounts ?? '?'} accts · ${sys.broker.agents ?? '?'} agents`
-            : `<span style="color:var(--red)">unreachable</span>`,
-          !!sys.broker.reachable);
-      } else brokerTile = tile('Auth-broker', dim('unavailable'), null);
-      if (sys && sys.hindsight) {
-        hsTile = tile('Hindsight',
-          sys.hindsight.running
-            ? `running<br>${escapeHtml(sys.hindsight.model || '?')} · ${sys.hindsight.mcpStateless == null ? '?' : sys.hindsight.mcpStateless ? 'stateless' : 'stateful'}`
-            : `<span style="color:var(--red)">not running</span>`,
-          !!sys.hindsight.running);
-      } else hsTile = tile('Hindsight', dim('unavailable'), null);
-      if (sys && sys.hostd) {
-        hostdTile = tile('Hostd',
-          sys.hostd.auditLogPresent
-            ? `audit present · ${(sys.hostd.recent || []).length} recent`
-            : dim('no audit log yet'),
-          sys.hostd.auditLogPresent ? true : null);
-      } else hostdTile = tile('Hostd', dim('unavailable'), null);
-
-      // Approvals
-      let apprTile;
-      if (appr && appr.reachable !== false) {
-        const d = appr.decisions || [];
-        const active = d.filter(x => !x.revoked_at && !(x.ttl_expires_at && x.ttl_expires_at < Date.now())).length;
-        apprTile = tile('Approvals', `<strong>${active}</strong> active · ${d.length} total`, true);
-      } else apprTile = tile('Approvals', dim((appr && appr.error) ? 'kernel unreachable' : 'unavailable'), null);
-
-      // Schedule
-      let schedTile;
-      if (sched && Array.isArray(sched.entries)) {
-        const agents = new Set(sched.entries.map(e => e.agent));
-        schedTile = tile('Schedule', `<strong>${sched.entries.length}</strong> cron entr${sched.entries.length === 1 ? 'y' : 'ies'} · ${agents.size} agent(s)`, true);
-      } else schedTile = tile('Schedule', dim('unavailable'), null);
-
-      // Quota headroom — worst cached 5h/7d across accounts (no probe;
-      // shows "—" until someone refreshes on the Accounts tab).
-      let quotaTile;
-      if (Array.isArray(accts) && accts.length) {
-        const used = accts.filter(a => a.quotaUsage);
-        if (used.length === 0) {
-          quotaTile = tile('Quota', dim('not probed yet — see Accounts tab'), null);
-        } else {
-          const worst5 = Math.max(...used.map(a => a.quotaUsage.fiveHourPct));
-          const worst7 = Math.max(...used.map(a => a.quotaUsage.sevenDayPct));
-          const anyStale = accts.some(a => a.quotaStale);
-          quotaTile = tile('Quota (worst acct)',
-            `5h <strong>${Math.round(worst5)}%</strong> · 7d <strong>${Math.round(worst7)}%</strong>${anyStale ? '<br>' + dim('some stale') : ''}`,
-            worst5 < 90 && worst7 < 90);
-        }
-      } else quotaTile = tile('Quota', dim('unavailable'), null);
-
       el.classList.remove('loading');
-      // "data as of" — the summary's freshness is its OLDEST part (server
-      // sends the min dataAsOf). A tiny muted line; refreshed on every
-      // tab-open. `formatTimestamp` renders it as "Ns/Nm ago".
-      const asOf = (typeof summary.dataAsOf === 'number' && summary.dataAsOf > 0)
-        ? `<div style="color:var(--text-dim);font-size:.75rem;margin:.25rem 0 .5rem">data as of ${escapeHtml(formatTimestamp(summary.dataAsOf))}</div>`
-        : '';
-      el.innerHTML = `${renderAttention(summary.attention)}${asOf}<div class="agents-grid">${agentsTile}${brokerTile}${hsTile}${hostdTile}${apprTile}${schedTile}${quotaTile}</div>`;
+
+      // Stash the broker's fleet-active account label so the Accounts tab can
+      // flag it (there's no fleet-active flag on /api/accounts itself).
+      if (sys && sys.broker && sys.broker.active) fleetActiveLabel = sys.broker.active;
+
+      const agList = Array.isArray(ag) ? ag : [];
+      const up = agList.filter(a => a.active === 'active').length;
+      const attnItems = Array.isArray(summary.attention) ? summary.attention : [];
+      const crit = attnItems.filter(a => a.severity === 'critical').length;
+      const warn = attnItems.filter(a => a.severity === 'warn').length;
+      const attnCount = attnItems.length;
+
+      // ---- posture verdict ----
+      const verdict = attnCount === 0
+        ? `<div class="sm-verdict ok"><span class="pulse"></span><h2>Fleet is healthy</h2></div>`
+        : `<div class="sm-verdict attn"><span class="pulse"></span><h2><b>${crit || attnCount}</b> ${crit ? 'critical' : 'item' + (attnCount === 1 ? '' : 's')}${crit && warn ? ` · ${warn} warning${warn === 1 ? '' : 's'}` : ''} need${(crit || attnCount) === 1 ? 's' : ''} you</h2></div>`;
+      const acctCount = (sys && sys.broker && sys.broker.accounts != null) ? sys.broker.accounts : '—';
+      const asOfVal = (typeof summary.dataAsOf === 'number' && summary.dataAsOf > 0)
+        ? formatTimestamp(summary.dataAsOf) : '—';
+      const asOf = `<div class="sm-asof">data as of ${escapeHtml(asOfVal)} · ${agList.length} agents · ${escapeHtml(String(acctCount))} accounts</div>`;
+
+      // ---- attention hero (renderAttention builds the worst-first list) ----
+      const attnHtml = renderAttention(attnItems);
+
+      // ---- vitals: agents + quota ----
+      const dots = agList.map(a => `<span class="d ${a.active === 'active' ? 'up' : 'down'}" title="${escapeHtml(a.name)} — ${escapeHtml(a.active)}"></span>`).join('');
+      const down = agList.length - up;
+      const agentsCard = `
+        <div class="sm-vcard">
+          <div class="vh">Agents <a onclick="switchTab('agents')">agents →</a></div>
+          <div class="sm-agents-n">${up}<span class="of"> / ${agList.length}</span> <span class="of">active</span></div>
+          <div class="sm-agents-sub">${down === 0 ? 'all running' : `${down} down — ${agList.filter(a => a.active !== 'active').map(a => escapeHtml(a.name)).join(', ')}`}</div>
+          <div class="sm-dotrow">${dots}</div>
+        </div>`;
+
+      // Quota — worst probed account, computed client-side from the accounts
+      // payload (same Math.max(5h,7d) worst-across-accounts as the old tile).
+      const qband = (p) => p >= 90 ? 'hi' : p >= 70 ? 'mid' : 'lo';
+      const accts2 = Array.isArray(accts) ? accts : [];
+      const usedAccts = accts2.filter(a => a.quotaUsage);
+      let quotaCard;
+      if (accts2.length === 0) {
+        quotaCard = `<div class="sm-vcard"><div class="vh">Quota headroom <a onclick="switchTab('accounts')">accounts →</a></div><div class="sm-quota-acct">unavailable</div></div>`;
+      } else if (usedAccts.length === 0) {
+        quotaCard = `<div class="sm-vcard"><div class="vh">Quota headroom <a onclick="switchTab('accounts')">accounts →</a></div><div class="sm-quota-acct">not probed yet — see accounts tab</div></div>`;
+      } else {
+        const pk = (a) => a.quota && a.quota.exhausted ? 1000 : Math.max(a.quotaUsage.fiveHourPct, a.quotaUsage.sevenDayPct);
+        const worst = usedAccts.slice().sort((a, b) => pk(b) - pk(a))[0];
+        const q = {
+          label: worst.label,
+          fiveHourPct: worst.quotaUsage.fiveHourPct,
+          sevenDayPct: worst.quotaUsage.sevenDayPct,
+          exhausted: !!(worst.quota && worst.quota.exhausted),
+          exhaustedUntil: (worst.quota && worst.quota.exhausted_until) || null,
+        };
+        const gauge = (lab, pct, reset) => {
+          const b = qband(pct);
+          return `<div class="gauge">
+            <div class="gauge-top"><span class="lab">${lab}${reset ? `<span class="gauge-reset">resets ${escapeHtml(formatTimestamp(reset))}</span>` : ''}</span><span class="val ${b}">${Math.round(pct)}%</span></div>
+            <div class="gauge-track"><span class="gauge-fill ${b}" style="width:${Math.min(100, pct)}%"></span></div>
+          </div>`;
+        };
+        quotaCard = `
+          <div class="sm-vcard">
+            <div class="vh">Quota headroom <a onclick="switchTab('accounts')">accounts →</a></div>
+            <div class="sm-quota-acct">worst account · <b>${escapeHtml(q.label || '—')}</b>${q.exhausted ? ` · <span style="color:var(--red)">exhausted</span>` : ''}</div>
+            ${gauge('5-hour window', q.fiveHourPct ?? 0, q.exhausted ? q.exhaustedUntil : null)}
+            ${gauge('7-day window', q.sevenDayPct ?? 0, null)}
+          </div>`;
+      }
+
+      // ---- services rail ----
+      const svc = (name, ok, meta, idle) => `
+        <div class="sm-svc"><span class="dot ${idle ? 'idle' : ok ? 'ok' : 'bad'}"></span>
+          <div class="sm-svc-text"><div class="sm-svc-name">${escapeHtml(name)}</div><div class="sm-svc-meta">${meta}</div></div></div>`;
+      const b = (sys && sys.broker) || {}, hs = (sys && sys.hindsight) || {}, hd = (sys && sys.hostd) || {};
+      // Approvals active grants — same non-revoked/non-expired count the old
+      // tile used (the payload carries `decisions`, not a pre-derived count).
+      const apprReachable = !!(appr && appr.reachable !== false);
+      const apprDecisions = (appr && appr.decisions) || [];
+      const activeGrants = apprDecisions.filter(x => !x.revoked_at && !(x.ttl_expires_at && x.ttl_expires_at < Date.now())).length;
+      const schedEntries = (sched && Array.isArray(sched.entries)) ? sched.entries : [];
+      const schedAgents = new Set(schedEntries.map(e => e.agent)).size;
+      const services = [
+        svc('auth-broker', !!b.reachable, b.reachable ? `active ${escapeHtml(b.active || '—')} · ${b.accounts ?? '?'} accts` : 'unreachable'),
+        svc('hindsight', !!hs.running, hs.running ? `${escapeHtml(hs.model || '?')} · ${hs.mcpStateless ? 'stateless' : 'stateful'}` : 'not running'),
+        svc('hostd', !!hd.auditLogPresent, hd.auditLogPresent ? `${(hd.recent || []).length} recent verbs` : 'no audit log'),
+        svc('schedule', schedEntries.length > 0, `${schedEntries.length} crons · ${schedAgents} agents`),
+        svc('approvals', apprReachable, apprReachable ? `${activeGrants} active grants` : 'unreachable'),
+      ].join('');
+
+      el.innerHTML = `
+        ${verdict}${asOf}
+        <div class="sm-band">Needs attention <span class="n">${attnCount}</span> · worst-first</div>
+        <div class="sm-attn-list">${attnHtml}</div>
+        <div class="sm-band">Fleet vitals</div>
+        <div class="sm-vitals">${agentsCard}${quotaCard}</div>
+        <div class="sm-band">Services <span class="n">all nominal</span></div>
+        <div class="sm-services">${services}</div>`;
     }
 
     // "Needs attention" triage strip — the FIRST block on the Summary tab.
@@ -1483,20 +2091,24 @@
     // "nothing needs attention" line. Every interpolated value is escaped.
     function renderAttention(items) {
       if (!Array.isArray(items) || items.length === 0) {
-        return `<div class="problem muted" style="margin-bottom:.75rem"><div class="problem-title">✓ Nothing needs attention</div></div>`;
+        return `<button class="sm-attn calm"><span class="sev" style="color:var(--green);background:rgba(52,211,153,.12)">clear</span><div class="sm-attn-body"><div class="sm-attn-title">Nothing needs attention</div><div class="sm-attn-detail">Every job spec, account, and service is within tolerance.</div></div></button>`;
       }
-      const rows = items.map((it) => {
+      const rank = { critical: 0, warn: 1, info: 2 };
+      const sorted = items.slice().sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9));
+      return sorted.map((it) => {
         const sev = (it && it.severity) || 'info';
-        const muted = sev === 'info' ? ' muted' : '';
         const tab = String((it && it.tab) || 'summary');
-        const title = `<div class="problem-title">${escapeHtml((it && it.title) || 'Attention')}</div>`;
-        const detail = it && it.detail
-          ? `<div class="problem-detail">${escapeHtml(it.detail)}</div>`
-          : '';
         // Whole row clickable → jump to the tab to act on it.
-        return `<div class="problem${muted}" role="button" tabindex="0" style="cursor:pointer;margin-bottom:.4rem" onclick="switchTab('${escapeHtml(tab)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('${escapeHtml(tab)}')}">${title}${detail}</div>`;
+        return `
+          <button class="sm-attn ${escapeHtml(sev)}" onclick="switchTab('${escapeHtml(tab)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('${escapeHtml(tab)}')}">
+            <span class="sev">${escapeHtml(sev)}</span>
+            <div class="sm-attn-body">
+              <div class="sm-attn-title">${escapeHtml((it && it.title) || 'Attention')}</div>
+              ${it && it.detail ? `<div class="sm-attn-detail">${escapeHtml(it.detail)}</div>` : ''}
+            </div>
+            <span class="sm-attn-go">${escapeHtml(tab)} →</span>
+          </button>`;
       }).join('');
-      return `<div style="margin-bottom:.75rem">${rows}</div>`;
     }
 
     function showError(msg) {
@@ -1898,124 +2510,121 @@
     }
 
     function renderAccounts() {
-      const container = document.getElementById('accounts');
+      const el = document.getElementById('accounts');
       if (!accounts || accounts.length === 0) {
-        container.innerHTML = '<div class="loading">No accounts. Run <code>switchroom auth account add &lt;label&gt;</code>.</div>';
+        el.innerHTML = '<div class="loading">No accounts. Run <code>switchroom auth account add &lt;label&gt;</code>.</div>';
         return;
       }
-      // RFC-H shape: the API returns `usedBy` (agents bound via the
-      // fleet-active account or a per-agent override) and a broker
-      // `quota` AccountState ({exhausted, exhausted_until,
-      // threshold_violations, last_refreshed_at}). The pre-RFC-H
-      // primaryFor/fallbackFor lists and quota.fiveHourPct utilization
-      // fields no longer exist on the wire.
-      // usage % cell: live 5h/7d utilization from the last cached
-      // probe (cost-gated — see refreshQuota). null → "—" + a per-
-      // account ↻ that force-probes. quotaStale → value shown muted
-      // with ↻ to refresh. When `resetAt` is provided we append a
-      // muted "resets in Xh" line so the operator can see WHEN the
-      // window rolls over without hovering for a tooltip — matches
-      // anthropic-ratelimit-unified-{5h,7d}-reset headers exposed by
-      // the broker probe (src/auth/quota.ts:97-98).
-      const pctCell = (pct, label, stale, resetAt) => {
-        if (pct == null) return '<span style="color:var(--text-dim)">—</span>';
-        let cls = 'quota-pct';
-        if (pct >= 90) cls += ' high';
-        else if (pct >= 70) cls += ' mid';
-        const v = `${Math.round(pct)}%`;
-        const reset = resetAt
-          ? `<div style="font-size:.72rem;color:var(--text-dim);font-weight:normal;margin-top:.1rem">resets ${formatTimestamp(resetAt)}</div>`
-          : '';
-        const pctSpan = stale
-          ? `<span class="${cls}" title="stale — click ↻" style="opacity:.55">${v}</span>`
-          : `<span class="${cls}">${v}</span>`;
-        return reset ? `<div>${pctSpan}${reset}</div>` : pctSpan;
+      // Worst-first quota triage. RFC-H shape: the API returns `usedBy`
+      // (agents bound via the fleet-active account or a per-agent override),
+      // a broker `quota` AccountState ({exhausted, exhausted_until,
+      // threshold_violations}), `quotaUsage` (5h/7d + reset/capturedAt ms),
+      // `quotaUsageSource`, `quotaStale`, `health`, and `expiresAt` (ms).
+      // Timestamps are already epoch-ms on the wire, so formatTimestamp
+      // takes them directly (the mock's relTime maps to formatTimestamp).
+      const qband = (p) => p == null ? 'na' : p >= 90 ? 'hi' : p >= 70 ? 'mid' : 'lo';
+      // health → badge bucket (exhausted always wins). Server sends
+      // "missing-credentials"/"missing-refresh-token" → collapse to "missing".
+      const healthBucket = (a) => {
+        if (a.quota && a.quota.exhausted) return 'exhausted';
+        const h = a.health || '';
+        if (h === 'expired') return 'expired';
+        if (h.indexOf('missing') === 0) return 'missing';
+        return 'healthy';
       };
-      const enriched = accounts.map(a => {
-        const q = a.quota || null;
-        const u = a.quotaUsage || null;
-        const exhausted = q ? !!q.exhausted : null;
-        return {
-          a,
-          usedBy: a.usedBy || [],
-          fiveH: pctCell(u ? u.fiveHourPct : null, '5h', a.quotaStale, u ? u.fiveHourResetAt : null),
-          sevenD: pctCell(u ? u.sevenDayPct : null, '7d', a.quotaStale, u ? u.sevenDayResetAt : null),
-          captured: u && u.capturedAt
-            ? `${formatTimestamp(u.capturedAt)}${a.quotaUsageSource === 'broker-cache' ? '<div style="font-size:.7rem;color:var(--text-dim)">broker cache (free)</div>' : ''}`
-            : '<span style="color:var(--text-dim)">never</span>',
-          exhaustedCell: q == null
-            ? '<span style="color:var(--text-dim)">broker offline</span>'
-            : exhausted
-              ? `<span class="quota-pct high">exhausted${q.exhausted_until ? ' → ' + formatTimestamp(q.exhausted_until) : ''}</span>`
-              : '<span class="quota-pct">ok</span>',
-          violations: q && q.threshold_violations
-            ? `<span class="quota-pct mid">${q.threshold_violations}</span>`
-            : '<span style="color:var(--text-dim)">0</span>',
-          expires: formatTimestamp(a.expiresAt),
-        };
-      });
-      const refreshBtn = (label) =>
-        `<button class="btn" title="Probe live quota now (billed Anthropic call)" onclick="refreshQuota('${escapeHtml(label)}', true)">↻</button>`;
-      const rows = enriched.map(e => {
-        const { a, usedBy, fiveH, sevenD, captured, exhaustedCell, violations, expires } = e;
+      const isExpiredish = (a) => a.health === 'expired' || (a.health || '').indexOf('missing') === 0;
+      // higher = more urgent → sorts to top
+      const pressure = (a) => {
+        if (a.quota && a.quota.exhausted) return 100 + ((a.quotaUsage && a.quotaUsage.fiveHourPct) || 0);
+        // expired-but-unused isn't more urgent than a near-limit account that's
+        // actively serving agents — rank it below live quota pressure.
+        if (isExpiredish(a)) return (a.usedBy && a.usedBy.length ? 95 : 80);
+        const u = a.quotaUsage;
+        return u ? Math.max(u.fiveHourPct, u.sevenDayPct) : -1;
+      };
+      const needsAttention = (a) => (a.quota && a.quota.exhausted) || isExpiredish(a)
+        || (a.quotaUsage && Math.max(a.quotaUsage.fiveHourPct, a.quotaUsage.sevenDayPct) >= 85);
+
+      const gauge = (lab, pct, reset, stale) => {
+        const b = qband(pct);
+        const val = pct == null ? '—' : Math.round(pct) + '%';
+        return `<div class="gauge ${stale ? 'stale' : ''}">
+          <div class="gauge-top"><span class="lab">${lab}${reset && pct != null ? `<span class="gauge-reset">resets ${escapeHtml(formatTimestamp(reset))}</span>` : ''}</span><span class="val ${b}">${val}${stale ? ' ·stale' : ''}</span></div>
+          <div class="gauge-track"><span class="gauge-fill ${b}" style="width:${pct == null ? 0 : Math.min(100, pct)}%"></span></div>
+        </div>`;
+      };
+
+      const sorted = accounts.slice().sort((a, b) => pressure(b) - pressure(a));
+      const attention = sorted.filter(needsAttention);
+      const clean = sorted.filter(a => !needsAttention(a));
+
+      const card = (a, worst) => {
+        const hb = healthBucket(a);
+        const hlabel = (a.quota && a.quota.exhausted) ? 'quota-exhausted' : (a.health || 'healthy');
+        const fleetActive = fleetActiveLabel != null && a.label === fleetActiveLabel;
+        const usedBy = a.usedBy || [];
+        // alert callout
+        let alert = '';
+        if (a.quota && a.quota.exhausted) {
+          alert = `<div class="acct-alert crit"><span class="lab">quota exhausted</span>5-hour window is spent — bound agents' next turns will fail until it resets <b>${escapeHtml(formatTimestamp(a.quota.exhausted_until))}</b> (${escapeHtml(usedBy.join(', ')) || 'no agents bound'}).</div>`;
+        } else if (isExpiredish(a)) {
+          alert = `<div class="acct-alert crit"><span class="lab">token expired</span>Re-auth needed — <code>switchroom auth account refresh ${escapeHtml(a.label)}</code>.${usedBy.length ? '' : ' No agents are currently bound, so nothing is failing yet.'}</div>`;
+        } else if (a.quotaUsage && Math.max(a.quotaUsage.fiveHourPct, a.quotaUsage.sevenDayPct) >= 85) {
+          alert = `<div class="acct-alert warn"><span class="lab">approaching limit</span>7-day window at ${Math.round(a.quotaUsage.sevenDayPct)}% — expect throttling for ${escapeHtml(usedBy.join(', ')) || 'bound agents'} soon.</div>`;
+        }
+
+        const u = a.quotaUsage;
+        const quota = u
+          ? `<div class="acct-quota">
+               ${gauge('5-hour', u.fiveHourPct, u.fiveHourResetAt, a.quotaStale)}
+               ${gauge('7-day', u.sevenDayPct, u.sevenDayResetAt, a.quotaStale)}
+             </div>`
+          : `<div class="acct-quota"><div style="grid-column:1/-1;font-size:.8rem;color:var(--text-dim)">Quota not probed${isExpiredish(a) ? ' — token expired' : ''}. <span style="color:var(--blue);cursor:pointer" onclick="refreshQuota('${escapeHtml(a.label)}', true)">↻ probe now</span></div></div>`;
+
+        const usedByHtml = usedBy.length
+          ? `<span class="used-by">${usedBy.map(n => `<span class="ag">${escapeHtml(n)}</span>`).join('')}</span>`
+          : `<span class="used-by"><span class="none">unused</span></span>`;
+        const probed = (u && u.capturedAt)
+          ? `<span class="probed">${escapeHtml(formatTimestamp(u.capturedAt))} <span class="src">${a.quotaUsageSource === 'broker-cache' ? '(cache, free)' : '(live probe)'}</span></span>`
+          : `<span class="probed">never</span>`;
+        const viol = (a.quota && a.quota.threshold_violations)
+          ? `<span style="color:var(--yellow)">${a.quota.threshold_violations}</span>` : '0';
+
         return `
-        <tr>
-          <td>${escapeHtml(a.label)}</td>
-          <td><span class="health-badge ${escapeHtml(a.health)}">${escapeHtml(a.health)}</span></td>
-          <td>${renderUsedByCell(usedBy)}</td>
-          <td>${fiveH}</td>
-          <td>${sevenD}</td>
-          <td title="quota probed at">${captured}</td>
-          <td>${exhaustedCell}</td>
-          <td>${violations}</td>
-          <td>${expires}</td>
-          <td>${refreshBtn(a.label)} <button class="btn" onclick="openPromoteModal('${escapeHtml(a.label)}')">Make fleet-active…</button></td>
-        </tr>
-      `;
-      }).join('');
-      const cards = enriched.map(e => {
-        const { a, usedBy, fiveH, sevenD, captured, exhaustedCell, violations, expires } = e;
-        return `
-        <div class="account-card">
-          <div class="account-card-header">
-            <div class="account-label">${escapeHtml(a.label)}</div>
-            <span class="health-badge ${escapeHtml(a.health)}" style="margin-left:auto">${escapeHtml(a.health)}</span>
-          </div>
-          <div class="account-usage">${renderUsedByCell(usedBy)}</div>
-          <div class="card-meta" style="padding:0">
-            <div class="meta-item"><label>5h usage </label><span>${fiveH}</span></div>
-            <div class="meta-item"><label>7d usage </label><span>${sevenD}</span></div>
-            <div class="meta-item"><label>Probed </label><span>${captured}</span></div>
-            <div class="meta-item"><label>Quota </label><span>${exhaustedCell}</span></div>
-            <div class="meta-item"><label>Threshold viols </label><span>${violations}</span></div>
-            <div class="meta-item"><label>Expires </label><span>${expires}</span></div>
-          </div>
-          <div style="margin-top:0.75rem">
-            ${refreshBtn(a.label)}
-            <button class="btn" onclick="openPromoteModal('${escapeHtml(a.label)}')">Make fleet-active…</button>
-          </div>
-        </div>
-      `;
-      }).join('');
-      container.innerHTML = `
-        <div style="margin-bottom:0.6rem;display:flex;align-items:center;gap:0.75rem">
+          <div class="acct ${worst ? 'worst' : ''}">
+            <div class="acct-head">
+              <span class="acct-label">${escapeHtml(a.label)}</span>
+              ${fleetActive ? `<span class="acct-fleet">fleet-active</span>` : ''}
+              <span class="health-badge ${hb}"><span class="dot"></span>${escapeHtml(hlabel)}</span>
+              <span class="acct-actions">
+                <button class="btn" title="Probe live quota now (billed Anthropic call)" onclick="refreshQuota('${escapeHtml(a.label)}', true)">↻ Probe</button>
+                ${fleetActive ? '' : `<button class="btn" onclick="openPromoteModal('${escapeHtml(a.label)}')">Make fleet-active…</button>`}
+              </span>
+            </div>
+            ${alert}
+            ${quota}
+            <div class="acct-foot">
+              <span><span class="k">used by</span> ${usedByHtml}</span>
+              <span><span class="k">probed</span> ${probed}</span>
+              <span><span class="k">threshold viols</span> ${viol}</span>
+              <span><span class="k">token expires</span> ${escapeHtml(formatTimestamp(a.expiresAt))}</span>
+            </div>
+          </div>`;
+      };
+
+      el.innerHTML = `
+        <div class="ac-bar">
           <button class="btn" onclick="refreshQuota(null, true)">↻ Refresh all quota</button>
-          <span style="font-size:0.78rem;color:var(--text-dim)">
-            5h/7d usage is cached (≤10 min); ↻ forces a live probe (one billed Anthropic call per account).
+          <span class="hint">5h/7d usage is cached (≤10 min); ↻ forces a live probe — one billed call per account.</span>
+          <span class="ac-posture">
+            <span class="ac-stat attn"><span class="n">${attention.length}</span><span class="l">need attention</span></span>
+            <span class="ac-stat clean"><span class="n">${clean.length}</span><span class="l">healthy</span></span>
           </span>
         </div>
-        <div class="accounts-table-wrap">
-          <table class="accounts-table">
-            <thead><tr>
-              <th>Label</th><th>Health</th><th>Used by</th>
-              <th>5h&nbsp;%</th><th>7d&nbsp;%</th><th>Probed</th>
-              <th>Quota</th><th>Threshold viols</th><th>Expires</th><th></th>
-            </tr></thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
-        <div class="accounts-grid">${cards}</div>
-      `;
+        ${attention.length ? `<div class="ac-band">Needs attention <span class="n">${attention.length}</span> · worst-first</div>
+          <div class="ac-list">${attention.map((a, i) => card(a, i === 0)).join('')}</div>` : ''}
+        <div class="ac-band">Healthy <span class="n">${clean.length}</span> · within tolerance</div>
+        <div class="ac-list">${clean.map(a => card(a, false)).join('') || '<div style="color:var(--text-dim);font-size:.85rem">No healthy accounts.</div>'}</div>`;
     }
 
     // Refresh cached quota. label=null → all accounts. force=true →
@@ -2038,22 +2647,6 @@
       } catch (err) {
         showToast(`Quota probe failed: ${err.message}`, false);
       }
-    }
-
-    function renderUsedByCell(usedBy) {
-      // RFC-H: a single fleet-active account plus optional per-agent
-      // overrides. `usedBy` is the flat list of agents currently bound
-      // to this account (either via fleet-active or an override). No
-      // more primary/fallback split — binding is singular post-RFC-H.
-      if (!usedBy || usedBy.length === 0) {
-        return '<span style="color:var(--text-dim)">unused</span>';
-      }
-      const MAX_INLINE = 4;
-      const title = `bound: ${usedBy.join(', ')}`;
-      const shown = usedBy.length <= MAX_INLINE
-        ? usedBy.map(escapeHtml).join(', ')
-        : `${usedBy.slice(0, MAX_INLINE).map(escapeHtml).join(', ')} +${usedBy.length - MAX_INLINE}`;
-      return `<span class="usage-pill primary" title="${escapeHtml(title)}">${shown}</span>`;
     }
 
     function renderSystemHealth(h) {
