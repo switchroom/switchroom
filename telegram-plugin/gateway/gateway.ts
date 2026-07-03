@@ -317,6 +317,8 @@ import {
   MODEL_CALLBACK_PREFIX,
   MODEL_CALLBACK_HEADER,
   MODEL_CALLBACK_SR,
+  MODEL_CALLBACK_PAGE_EXTERNAL,
+  MODEL_CALLBACK_PAGE_MAIN,
   srFriendlyLabel,
   type ModelMenuDeps,
   type ModelCommandDeps,
@@ -22083,7 +22085,11 @@ bot.on('callback_query:data', async ctx => {
       await ctx.answerCallbackQuery({ text: 'Tap a model in this section to switch' }).catch(() => {})
       return
     }
-    await ctx.answerCallbackQuery({ text: 'Switching…' }).catch(() => {})
+    // Page navigation (External ▸ / ◂ Back) just re-renders the menu with the
+    // other keyboard page — it never drives the picker, so ack "Loading…"
+    // rather than the switch-oriented "Switching…".
+    const isPageNav = data === MODEL_CALLBACK_PAGE_EXTERNAL || data === MODEL_CALLBACK_PAGE_MAIN
+    await ctx.answerCallbackQuery({ text: isPageNav ? 'Loading…' : 'Switching…' }).catch(() => {})
     // sr-* inject waits for claude to respond (can take 10-30s). Edit the
     // menu immediately to show a "working on it" state so the operator isn't
     // left looking at a stale menu with no feedback. The final edit (✅/❌)

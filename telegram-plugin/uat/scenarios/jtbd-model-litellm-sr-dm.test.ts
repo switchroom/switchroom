@@ -49,16 +49,28 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
           timeout: 60_000,
         });
 
-        // ── 1. Section headers ──────────────────────────────────────────
+        // ── 1. Main page → External page navigation ────────────────────
+        // Nested-page design: the main page carries the Claude buttons + a
+        // "🌐 External models ▸" button; sr-* models and the billed-separately
+        // header live on the second page, reached by pressing mdl:page:ext.
+        const mainKb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
+        const mainFlat = (mainKb ?? []).flat().filter((b) => b.callbackData);
+        const extOpen = mainFlat.find((b) => b.callbackData === "mdl:page:ext");
+        expect(extOpen, "🌐 External models ▸ open button on the main page").toBeDefined();
+        expect(menu.text).toContain("Max/Pro subscription");
+
+        // Open the external page and re-read the keyboard.
+        await sc.driver.pressButton(sc.botUserId, menu.messageId, "mdl:page:ext");
+        await new Promise((r) => setTimeout(r, 2_000));
+        const extMsg = await sc.driver.getMessage(sc.botUserId, menu.messageId);
+        expect(extMsg?.text ?? "", "external page body").toContain("billed separately");
         const kb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
         const flat = (kb ?? []).flat().filter((b) => b.callbackData);
 
-        const claudeHeader = flat.find(
-          (b) => b.text.includes("Claude") && b.text.includes("subscription") && b.callbackData === "mdl:h",
+        const externalHeader = flat.find(
+          (b) => b.text.includes("External") && b.callbackData === "mdl:h",
         );
-        const openrouterHeader = flat.find(
-          (b) => b.text.includes("OpenRouter") && b.callbackData === "mdl:h",
-        );
+        const backButton = flat.find((b) => b.callbackData === "mdl:page:main");
         // Prefer deepseek-v3 (non-thinking, consistently fast) for the E2E test.
         // gemini-2.5-flash may run in thinking mode via OpenRouter (5+ min latency),
         // reasoning models (deepseek-r1, o1, o3) also take 2-5 min and hit the
@@ -70,14 +82,12 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
           flat.find((b) => b.callbackData?.startsWith("mdl:sr:"));
 
         if (!srButton) {
-          console.log("No sr-* buttons in menu — agent not LiteLLM-enabled or no sr-* models registered. Skipping.");
+          console.log("No sr-* buttons on the external page — agent not LiteLLM-enabled or no sr-* models registered. Skipping.");
           return;
         }
 
-        expect(claudeHeader, "Claude (Max / Pro subscription) header row").toBeDefined();
-        expect(openrouterHeader, "OpenRouter / external header row").toBeDefined();
-        expect(menu.text).toContain("Max/Pro subscription");
-        expect(menu.text).toContain("OpenRouter");
+        expect(externalHeader, "External (billed separately) header row").toBeDefined();
+        expect(backButton, "◂ Back button on the external page").toBeDefined();
 
         // ── 2. sr-* switch ─────────────────────────────────────────────
         const spendBefore = await getLiteLLMSpendForAgent(AGENT);
@@ -146,15 +156,25 @@ describe("uat: /model sr-* LiteLLM routing — section headers + session switch 
           from: "bot",
           timeout: 90_000,
         });
+        // The header row now lives on the external page — navigate there first.
+        const mainKb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
+        const extOpen = (mainKb ?? []).flat().find((b) => b.callbackData === "mdl:page:ext");
+        if (!extOpen) {
+          console.log("No External page — agent not LiteLLM-enabled. Skipping.");
+          return;
+        }
+        await sc.driver.pressButton(sc.botUserId, menu.messageId, "mdl:page:ext");
+        await new Promise((r) => setTimeout(r, 2_000));
+        const extMsg = await sc.driver.getMessage(sc.botUserId, menu.messageId);
         const kb = await sc.driver.getKeyboard(sc.botUserId, menu.messageId);
         const flat = (kb ?? []).flat();
         const headerBtn = flat.find((b) => b.callbackData === "mdl:h");
         if (!headerBtn) {
-          console.log("No header row — agent not LiteLLM-enabled. Skipping.");
+          console.log("No header row on external page — agent not LiteLLM-enabled. Skipping.");
           return;
         }
-        // Pressing the header should NOT change the menu text
-        const textBefore = menu.text;
+        // Pressing the header should NOT change the (external-page) menu text
+        const textBefore = extMsg?.text ?? "";
         await sc.driver.pressButton(sc.botUserId, menu.messageId, "mdl:h");
         await new Promise((r) => setTimeout(r, 3_000));
         const after = await sc.driver.getMessage(sc.botUserId, menu.messageId);
