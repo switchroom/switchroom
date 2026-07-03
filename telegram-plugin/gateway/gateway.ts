@@ -225,7 +225,7 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -8843,8 +8843,16 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // Outbound secret scrub (#2044): mask any secret the agent echoed BEFORE
   // the stderr preview below, the dedup key, the send, and the history
   // record. Mutates `text` so every downstream consumer sees the masked
-  // value, exactly like the voice scrub that follows.
+  // value, exactly like the voice scrub that follows. Runs BEFORE the
+  // punctuation/bold normalizers so a secret containing an em-dash or `**`
+  // is matched literally by the redactor before any mutation.
   text = redactOutboundText(text, 'reply')
+  // Fleet-wide consistent formatting: normalize dashes/bullets and trip the
+  // over-bold guard deterministically, on code-masked text (same contract on
+  // reply / edit / stream paths). Runs before scrubVoice below so dashes get
+  // the comma treatment on every path; scrubVoice's dash telemetry
+  // (voice_scrub_applied) drops to ~zero here as a result — deliberate.
+  text = stripExcessBold(normalizePunctuation(text))
   // Voice scrub (#1683): replace em / en dashes with commas / periods.
   // Runs BEFORE outboundDedup so retries see the scrubbed key, and on the
   // raw markdown text (the scrubber does its own code-region parking so
@@ -10103,6 +10111,16 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
   // controller, dedup record, history record) see the scrubbed
   // version. Kill switch: SWITCHROOM_DISABLE_VOICE_SCRUB.
   {
+    // Cross-path consistency (#2755): normalizePunctuation runs BEFORE
+    // scrubVoice here, matching the reply/edit paths, so a spaced em-dash
+    // gets the same comma treatment on every outbound path (scrubVoice
+    // would otherwise see the raw dash first on this path only and apply
+    // its period substitution). handleStreamReply's own deps run
+    // normalizePunctuation again downstream — it is idempotent, so the
+    // second pass is a no-op. Side effect: scrubVoice's dash telemetry
+    // (voice_scrub_applied) drops to ~zero on this path since the dashes
+    // are consumed here first — deliberate.
+    args.text = normalizePunctuation(args.text as string)
     const scrub = scrubVoice(args.text as string)
     if (scrub.replaced > 0) {
       args.text = scrub.scrubbed
@@ -10260,6 +10278,8 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       retry: robustApiCall,
       repairEscapedWhitespace,
       normalizeParagraphBreaks,
+      normalizePunctuation,
+      stripExcessBold,
       addParagraphSpacers,
       assertAllowedChat,
       resolveThreadId,
@@ -11489,10 +11509,14 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // paragraph breaks for the rich path. A literal-text edit (`format:'text'`)
   // skips paragraph normalization — it must edit byte-for-byte as given.
   let editRawText = repairEscapedWhitespace(args.text as string)
-  if (!editLiteralText) editRawText = addParagraphSpacers(normalizeParagraphBreaks(editRawText))
+  if (!editLiteralText) editRawText = normalizeParagraphBreaks(editRawText)
   // Outbound secret scrub (#2044): an edit must not re-introduce a raw
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')
+  // Fleet-wide consistent formatting (same order as the reply path: redact
+  // first so secrets are matched literally, then normalize, then spacers on
+  // the rich path only).
+  if (!editLiteralText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(editRawText)))
   // Voice scrub (#1683): same em-dash scrub as the reply path. Edits
   // are how silent-anchor and progress-update mutate already-sent
   // bubbles, so without this an edit can re-introduce dashes the

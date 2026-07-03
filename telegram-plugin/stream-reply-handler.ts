@@ -159,6 +159,19 @@ export interface StreamReplyDeps {
    */
   normalizeParagraphBreaks?: (text: string) => string
   /**
+   * Punctuation/bullet normalization (fleet-wide consistent formatting):
+   * em/en dashes → comma/hyphen, leading unicode bullets → `- `. Applied on
+   * code-masked text right after normalizeParagraphBreaks. Optional for
+   * backward compat; omitted → no normalization.
+   */
+  normalizePunctuation?: (text: string) => string
+  /**
+   * Over-bold tripwire: strips `**bold**` markers when a message is clearly
+   * over-bolded (>30% bold, or whole paragraphs/lists fully bolded). Applied
+   * after normalizePunctuation. Optional for backward compat.
+   */
+  stripExcessBold?: (text: string) => string
+  /**
    * Insert a visible blank-line spacer into each prose `\n\n` gap so the rich
    * GFM renderer shows a real empty line between paragraphs (the rich engine
    * otherwise renders `\n\n` tight — the post-#2669 paragraph-spacing
@@ -316,9 +329,14 @@ export async function handleStreamReply(
   deps: StreamReplyDeps,
 ): Promise<StreamReplyResult> {
   const chat_id = args.chat_id
-  const rawText = deps.normalizeParagraphBreaks
+  let rawText = deps.normalizeParagraphBreaks
     ? deps.normalizeParagraphBreaks(deps.repairEscapedWhitespace(args.text))
     : deps.repairEscapedWhitespace(args.text)
+  // Fleet-wide consistent formatting: dash/bullet normalization + over-bold
+  // tripwire, same order as the reply/edit paths (after paragraph
+  // normalization, before spacers). Both run on code-masked text internally.
+  if (deps.normalizePunctuation) rawText = deps.normalizePunctuation(rawText)
+  if (deps.stripExcessBold) rawText = deps.stripExcessBold(rawText)
   const done = Boolean(args.done)
   const format = args.format ?? deps.defaultFormat
   if (done) {

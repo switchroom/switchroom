@@ -103,9 +103,14 @@ describe('normalizeParagraphBreaks', () => {
     expect(normalizeParagraphBreaks(input)).toBe(input)
   })
 
-  test('does NOT promote when the next line is a list item (tight list stays tight)', () => {
+  test('list glued to prose gains a block-boundary blank line; interior stays tight', () => {
+    // Uniform-block-spacing: a list start glued to prose by a single `\n`
+    // gets a blank line (so the spacer pass can see the transition); the
+    // list's own single-`\n` interior is never touched.
     const input = 'Here are the steps.\n- first\n- second\n- third'
-    expect(normalizeParagraphBreaks(input)).toBe(input)
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Here are the steps.\n\n- first\n- second\n- third',
+    )
   })
 
   test('does NOT promote between list items (ordered or unordered)', () => {
@@ -469,31 +474,41 @@ describe('addParagraphSpacers', () => {
     expect(addParagraphSpacers(input)).toBe(input)
   })
 
-  test('does NOT space a gap adjacent to a list (tight list rhythm preserved)', () => {
-    const input = 'Here are the steps.\n\n- first\n- second'
-    expect(addParagraphSpacers(input)).toBe(input)
-    const input2 = '- first\n- second\n\nClosing prose after the list.'
-    expect(addParagraphSpacers(input2)).toBe(input2)
+  test('spaces prose↔list transitions (uniform block spacing), list interior tight', () => {
+    expect(addParagraphSpacers('Here are the steps.\n\n- first\n- second')).toBe(
+      `Here are the steps.${gap}- first\n- second`,
+    )
+    expect(addParagraphSpacers('- first\n- second\n\nClosing prose after the list.')).toBe(
+      `- first\n- second${gap}Closing prose after the list.`,
+    )
   })
 
-  test('does NOT space a gap adjacent to a table', () => {
-    const input = 'Intro.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |'
-    expect(addParagraphSpacers(input)).toBe(input)
+  test('spaces a prose→table boundary; table rows stay contiguous', () => {
+    const table = '| a | b |\n| --- | --- |\n| 1 | 2 |'
+    expect(addParagraphSpacers(`Intro.\n\n${table}`)).toBe(`Intro.${gap}${table}`)
   })
 
-  test('does NOT space a gap adjacent to a fenced code block', () => {
+  test('spaces prose↔fence boundaries; fence interior untouched', () => {
     const input = 'Look here.\n\n```js\nconst a = 1;\n```\n\nDone.'
-    // Neither the prose→fence nor the fence→prose gap gets a spacer.
-    expect(addParagraphSpacers(input)).toBe(input)
+    expect(addParagraphSpacers(input)).toBe(
+      `Look here.${gap}\`\`\`js\nconst a = 1;\n\`\`\`${gap}Done.`,
+    )
   })
 
-  test('does NOT space a gap adjacent to a heading or blockquote', () => {
+  test('spaces heading→anything and blockquote boundaries', () => {
     expect(addParagraphSpacers('Intro prose.\n\n## Section\n\nBody prose.')).toBe(
-      'Intro prose.\n\n## Section\n\nBody prose.',
+      `Intro prose.${gap}## Section${gap}Body prose.`,
     )
     expect(addParagraphSpacers('Said.\n\n> a quote\n\nAfter.')).toBe(
-      'Said.\n\n> a quote\n\nAfter.',
+      `Said.${gap}> a quote${gap}After.`,
     )
+  })
+
+  test('does NOT space between items of the same loose list / same-kind blocks', () => {
+    const looseList = '- first\n\n- second\n\n- third'
+    expect(addParagraphSpacers(looseList)).toBe(looseList)
+    const quotes = '> one\n\n> two'
+    expect(addParagraphSpacers(quotes)).toBe(quotes)
   })
 
   test('never reaches inside a fenced block (interior blank line untouched)', () => {
@@ -501,8 +516,6 @@ describe('addParagraphSpacers', () => {
     const out = addParagraphSpacers(input)
     // The fence interior — including its own blank line — is byte-for-byte intact.
     expect(out).toContain('```\nline 1\n\nline 2\n```')
-    // And no spacer paragraph was injected anywhere (both gaps touch the fence).
-    expect(out).not.toContain(PARAGRAPH_SPACER)
   })
 
   test('a body with no paragraph gap is returned unchanged', () => {
@@ -521,9 +534,9 @@ describe('addParagraphSpacers', () => {
     const out = addParagraphSpacers(normalizeParagraphBreaks(input))
     // The two prose paragraphs gain a visible spacer between them.
     expect(out).toContain(`Summary of the change.${gap}It does two things.`)
-    // The list stays tight (no spacer wedged before it).
-    expect(out).toContain('- adds a normalizer\n- lifts the cap')
-    expect(out).not.toContain(`${PARAGRAPH_SPACER}\n\n- adds`)
+    // The prose→list transition gains a spacer too (uniform block spacing),
+    // but the list INTERIOR stays tight.
+    expect(out).toContain(`It does two things.${gap}- adds a normalizer\n- lifts the cap`)
   })
 })
 
