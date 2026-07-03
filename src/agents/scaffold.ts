@@ -441,6 +441,34 @@ never reaches them.`;
  * Header is a literal string the operator sees first when they open
  * the file — it MUST teach the file's nature without requiring docs.
  */
+/**
+ * Prepend the reply-discipline fragment near the TOP of a rendered
+ * CLAUDE.md — right after the leading `# Agent: <name>` title line, so
+ * the "your plain text is invisible, only the `reply` tool reaches
+ * Telegram" contract is one of the first things the model reads. Unlike
+ * the vault / self-service / execution-discipline fragments (which ride
+ * the tail), this contract is turn-critical and must be prominent.
+ *
+ * Applied identically on BOTH the first-scaffold and reconcile paths so
+ * the two produce byte-identical CLAUDE.md (the reconcile diff-abort
+ * trips otherwise). No-op if the fragment source file is absent.
+ */
+function prependReplyDiscipline(
+  rendered: string,
+  context: Record<string, unknown>,
+): string {
+  const replyDiscipline = renderReplyDisciplineFragment(context);
+  if (!replyDiscipline) return rendered;
+  const newlineIdx = rendered.indexOf("\n");
+  if (newlineIdx === -1) {
+    // Degenerate single-line template — put the title first, then block.
+    return rendered.trimEnd() + "\n\n" + replyDiscipline + "\n";
+  }
+  const title = rendered.slice(0, newlineIdx);
+  const body = rendered.slice(newlineIdx + 1).replace(/^\n+/, "");
+  return title + "\n\n" + replyDiscipline + "\n\n" + body;
+}
+
 export function renderFleetInvariants(): string {
   return [
     "<!--",
@@ -592,6 +620,7 @@ import {
   renderVaultProtocolFragment,
   renderAgentSelfServiceFragment,
   renderExecutionDisciplineFragment,
+  renderReplyDisciplineFragment,
 } from "./profiles.js";
 import {
   getHindsightSettingsEntry,
@@ -3656,6 +3685,11 @@ export function scaffoldAgent(
         () => {
           let rendered = renderTemplate(srcPath, context);
           if (dest === "CLAUDE.md") {
+            // Reply-discipline rides at the TOP (prepended after the
+            // title), unlike the tail fragments below — the "reply tool
+            // or it's invisible" contract must be one of the first things
+            // the model reads. Every profile gets it.
+            rendered = prependReplyDiscipline(rendered, context);
             const vaultProtocol = renderVaultProtocolFragment(context);
             if (vaultProtocol) {
               rendered = rendered.trimEnd() + "\n\n" + vaultProtocol + "\n";
@@ -5456,6 +5490,11 @@ export function reconcileAgent(
       // the other path applied. Both fragments are no-ops if their
       // source file is absent.
       let rendered = renderTemplate(claudeMdSrc, claudeContext);
+      // Reply-discipline rides at the TOP (prepended after the title).
+      // MUST mirror the first-scaffold path (via the shared
+      // prependReplyDiscipline helper) or the diff-abort below trips on
+      // every reconcile.
+      rendered = prependReplyDiscipline(rendered, claudeContext);
       const vaultProtocol = renderVaultProtocolFragment(claudeContext);
       if (vaultProtocol) {
         rendered = rendered.trimEnd() + "\n\n" + vaultProtocol + "\n";

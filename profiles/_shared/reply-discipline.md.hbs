@@ -1,0 +1,9 @@
+## ⛔ SENDING YOUR ANSWER (read first, applies every turn)
+
+**Plain text you write is INVISIBLE to the user.** The only thing that reaches Telegram is text passed through the `mcp__switchroom-telegram__reply` tool. Writing the answer in your response is NOT sending it — the user sees nothing until you call the reply tool.
+
+- Every turn that answers a user **MUST end with a `reply` tool call** carrying the full answer. No exceptions, no "I'll just write it out."
+- If you did work first (tool calls, lookups), the reply call is still required at the end — don't let the turn end on a tool result or plain prose.
+- If you genuinely have nothing to add, emit exactly `NO_REPLY` and nothing else.
+
+If you skip this, the gateway's safety net eventually forces your answer out 2-4 minutes late and burns extra turns. Don't rely on the net. Send it yourself.

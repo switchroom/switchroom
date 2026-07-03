@@ -171,7 +171,7 @@ Handlebars.registerHelper("isNumber", (value: unknown) => {
 // The _shared/ directory is underscore-prefixed (like _base/) and is not
 // listed by listAvailableProfiles() — it's framework-internal.
 const SHARED_FRAGMENTS_DIR = resolve(PROFILES_ROOT, "_shared");
-const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service", "execution-discipline"] as const;
+const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service", "execution-discipline", "reply-discipline"] as const;
 for (const name of SHARED_FRAGMENTS) {
   const fragPath = join(SHARED_FRAGMENTS_DIR, `${name}.md.hbs`);
   if (existsSync(fragPath)) {
@@ -246,6 +246,39 @@ export function renderExecutionDisciplineFragment(
   profilesRoot: string = PROFILES_ROOT,
 ): string {
   const fragPath = join(resolve(profilesRoot, "_shared"), "execution-discipline.md.hbs");
+  if (!existsSync(fragPath)) return "";
+  const source = readFileSync(fragPath, "utf-8");
+  const template = Handlebars.compile(source, { noEscape: true });
+  return template(context).trimEnd();
+}
+
+/**
+ * Render the reply-discipline fragment standalone for unconditional
+ * PREPEND (near the top) of every agent's CLAUDE.md. Same
+ * unconditional-carrier pattern as {@link renderVaultProtocolFragment}
+ * and {@link renderExecutionDisciplineFragment}, but this one rides at
+ * the TOP rather than the tail: the "your plain text is invisible —
+ * only the `reply` tool reaches Telegram" contract is turn-critical, so
+ * it must be one of the first things the model reads, and it must reach
+ * EVERY agent on EVERY profile (default / coding / health-coach /
+ * executive-assistant), not just the default profile's CLAUDE.md.
+ *
+ * Root cause it closes: this contract previously lived ONLY in the
+ * telegram MCP runtime instruction blob, which the model deprioritizes —
+ * agents ended turns writing the finished answer as plain assistant text
+ * that never reached Telegram, so the owed-reply safety net force-flushed
+ * it 2-4 min late, burning extra turns. Baking it into the base CLAUDE.md
+ * template makes the discipline durable + fleet-wide.
+ *
+ * Returns the rendered Markdown, or an empty string if the fragment
+ * file is missing (e.g. partial install).
+ */
+export function renderReplyDisciplineFragment(
+  context: Record<string, unknown> = {},
+  /** Override the profiles root; used by tests. */
+  profilesRoot: string = PROFILES_ROOT,
+): string {
+  const fragPath = join(resolve(profilesRoot, "_shared"), "reply-discipline.md.hbs");
   if (!existsSync(fragPath)) return "";
   const source = readFileSync(fragPath, "utf-8");
   const template = Handlebars.compile(source, { noEscape: true });
