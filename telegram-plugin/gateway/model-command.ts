@@ -308,6 +308,32 @@ export const MODEL_CALLBACK_REFRESH = 'mdl:r'
 export const MODEL_CALLBACK_SR = 'mdl:sr:'
 /** Callback for section-header rows — shows an informational toast, no action. */
 export const MODEL_CALLBACK_HEADER = 'mdl:h'
+/**
+ * Callback prefix for Claude aliases that the CLI picker doesn't render but
+ * the CLI resolves natively (e.g. `fable`). Carries the alias verbatim; its
+ * handler INJECTS `/model <alias>` — the same mechanism MODEL_CALLBACK_SR
+ * uses — because the cursor-nav select path can only pick rows claude's own
+ * picker actually renders.
+ */
+export const MODEL_CALLBACK_ALIAS = 'mdl:alias:'
+/** Callback: open the nested "External models" keyboard page. */
+export const MODEL_CALLBACK_PAGE_EXTERNAL = 'mdl:page:ext'
+/** Callback: return from the External page to the main keyboard page. */
+export const MODEL_CALLBACK_PAGE_MAIN = 'mdl:page:main'
+
+/** Which keyboard page the model menu is currently rendering. */
+export type ModelMenuPage = 'main' | 'external'
+
+/**
+ * Static Claude aliases appended to the scraped Claude group. The claude CLI's
+ * own `/model` picker (deps.discover) does NOT list `fable`, but the CLI
+ * resolves the alias natively, so we render it as an extra button that selects
+ * by injecting `/model fable` (MODEL_CALLBACK_ALIAS). Extend this list to
+ * surface further CLI-resolvable aliases the picker omits.
+ */
+export const EXTRA_CLAUDE_ALIASES: ReadonlyArray<{ alias: string; label: string }> = [
+  { alias: 'fable', label: 'Fable' },
+]
 
 /**
  * Friendly display names for sr-* synthetic model names. An sr-* model in
@@ -394,14 +420,42 @@ function headerRow(label: string): ModelMenuKeyboardButton[] {
   return [{ text: label, callback_data: MODEL_CALLBACK_HEADER }]
 }
 
-function menuKeyboard(
+/**
+ * The external (🌐 non-Anthropic) model list, sourced from the static
+ * SR_MODEL_ALIASES values UNION-ed with any live discoverSrModels() results,
+ * deduped and sorted.
+ *
+ * Why the static union: discoverSrModels() reads LiteLLM's /model/info, which
+ * requires ANTHROPIC_CUSTOM_HEADERS (a litellm key) to be set on the gateway
+ * process. switchroom never sets that env on the gateway, so in production
+ * discoverSrModels() always returns [] and the external group was silently
+ * empty. The six SR_MODEL_ALIASES targets are the sr-* names the litellm
+ * config actually exposes, so seeding from them makes the group reliable
+ * without the missing env — while still merging any live results on hosts
+ * that do configure discovery.
+ *
+ * Subscription-honest: ONLY the curated sr-* aliases surface as buttons. Raw
+ * gpt-4o / openrouter/* dupes / voyage-* embeddings never do.
+ */
+export function externalModelNames(discovered: string[]): string[] {
+  const set = new Set<string>(Object.values(SR_MODEL_ALIASES))
+  for (const n of discovered) {
+    if (isSrModel(n)) set.add(n)
+  }
+  return [...set].sort()
+}
+
+/**
+ * Main keyboard page: scraped Claude buttons + static Fable alias, then (only
+ * when the external list is non-empty) a single "🌐 External models ▸" row that
+ * opens the nested page, then Refresh.
+ */
+function mainPageKeyboard(
   claudeOptions: ModelPickerOption[],
-  srOptions: ModelPickerOption[],
+  hasExternal: boolean,
 ): ModelMenuKeyboardButton[][] {
-  const hasBothGroups = claudeOptions.length > 0 && srOptions.length > 0
   const rows: ModelMenuKeyboardButton[][] = []
 
-  if (hasBothGroups) rows.push(headerRow('── Claude (Max / Pro subscription) ──'))
   for (const o of claudeOptions) {
     rows.push([{
       text: o.current ? `✅ ${o.label}` : o.label,
@@ -409,19 +463,40 @@ function menuKeyboard(
     }])
   }
 
-  // sr-* models are non-Anthropic (routed via LiteLLM → OpenRouter).
-  // Selection uses text-inject rather than cursor-nav — more reliable
-  // when the picker has many models (GATEWAY_MODEL_DISCOVERY=1).
-  if (srOptions.length > 0) {
-    rows.push(headerRow('── OpenRouter / external ──'))
-    for (const o of srOptions) {
-      rows.push([{
-        text: `🌐 ${srFriendlyLabel(o.label)}`,
-        callback_data: `${MODEL_CALLBACK_SR}${o.label}`,
-      }])
-    }
+  // Static Claude aliases the CLI picker omits (e.g. Fable). Deduped: if the
+  // scraped Claude options already include a matching row, don't render the
+  // static one too.
+  for (const { alias, label } of EXTRA_CLAUDE_ALIASES) {
+    const already = claudeOptions.some(
+      (o) => o.label.toLowerCase() === label.toLowerCase() ||
+        o.label.toLowerCase() === alias.toLowerCase(),
+    )
+    if (already) continue
+    rows.push([{ text: label, callback_data: `${MODEL_CALLBACK_ALIAS}${alias}` }])
   }
 
+  if (hasExternal) {
+    rows.push([{ text: '🌐 External models ▸', callback_data: MODEL_CALLBACK_PAGE_EXTERNAL }])
+  }
+
+  rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
+  return rows
+}
+
+/**
+ * External keyboard page: a labelled header, one 🌐 button per external model
+ * (reusing the existing MODEL_CALLBACK_SR select handler), then Back + Refresh.
+ */
+function externalPageKeyboard(externalNames: string[]): ModelMenuKeyboardButton[][] {
+  const rows: ModelMenuKeyboardButton[][] = []
+  rows.push(headerRow('── External (billed separately) ──'))
+  for (const name of externalNames) {
+    rows.push([{
+      text: `🌐 ${srFriendlyLabel(name)}`,
+      callback_data: `${MODEL_CALLBACK_SR}${name}`,
+    }])
+  }
+  rows.push([{ text: '◂ Back', callback_data: MODEL_CALLBACK_PAGE_MAIN }])
   rows.push([{ text: '🔄 Refresh', callback_data: MODEL_CALLBACK_REFRESH }])
   return rows
 }
@@ -433,6 +508,7 @@ function menuKeyboard(
  */
 export async function buildModelMenu(
   deps: ModelMenuDeps & ModelCommandDeps,
+  page: ModelMenuPage = 'main',
 ): Promise<ModelMenuReply> {
   if (deps.isBusy()) return busyReply(deps)
 
@@ -460,7 +536,26 @@ export async function buildModelMenu(
   // sr-* models come from LiteLLM (/model/info via discoverSrModels), not the
   // claude picker — the CLI only knows Anthropic models.
   const { claude: claudeOptions } = classifyDiscoveredOptions(discovered.options)
-  const srOptions: ModelPickerOption[] = srNames.map((name, i) => ({ index: i, label: name, detail: '', current: false }))
+  const externalNames = externalModelNames(srNames)
+
+  // External page: a focused list of the 🌐 (billed-separately) models with a
+  // Back button. It never switches the model itself — the page callbacks just
+  // re-render with the other page's keyboard.
+  if (page === 'external') {
+    const lines: string[] = [`**Model — ${deps.escapeHtml(deps.getAgentName())}** · 🌐 External`]
+    lines.push(
+      '',
+      'These models are **billed separately** via OpenRouter — they do NOT use your Claude Max/Pro subscription. Tap one to switch the **live session**:',
+      PERSIST_NOTE,
+    )
+    return { text: lines.join('\n'), html: true, keyboard: externalPageKeyboard(externalNames) }
+  }
+
+  // claude's ✔ marks the DEFAULT FOR NEW SESSIONS, which is a different axis
+  // from the model the agent is running right now (set via --model at launch
+  // or a prior session switch). Labelling the ✔ row "Now:" was misleading —
+  // it could read "Opus 4.8" while the live session is on Fable. Call it what
+  // it is, and tell the operator a switch applies to the live session.
   const current = claudeOptions.find((o) => o.current)
   const lines: string[] = [`**Model — ${deps.escapeHtml(deps.getAgentName())}**`]
   if (discovered.dismissFailed) {
@@ -474,12 +569,16 @@ export async function buildModelMenu(
   }
   if (quota) lines.push(`Quota: ${deps.escapeHtml(quota)}`)
   lines.push('', 'Tap a model to switch the **live session**:')
-  if (srOptions.length > 0) {
-    lines.push('Claude models use your Max/Pro subscription. 🌐 models are billed separately via OpenRouter.')
+  if (externalNames.length > 0) {
+    lines.push('Claude models use your Max/Pro subscription. Tap 🌐 External models for models billed separately via OpenRouter.')
   }
   lines.push(PERSIST_NOTE)
 
-  return { text: lines.join('\n'), html: true, keyboard: menuKeyboard(claudeOptions, srOptions) }
+  return {
+    text: lines.join('\n'),
+    html: true,
+    keyboard: mainPageKeyboard(claudeOptions, externalNames.length > 0),
+  }
 }
 
 export interface ModelCallbackOutcome {
@@ -517,6 +616,61 @@ export async function handleModelMenuCallback(
 ): Promise<ModelCallbackOutcome> {
   if (data === MODEL_CALLBACK_REFRESH) {
     return { answer: 'Refreshed', reply: await buildModelMenu(deps) }
+  }
+
+  // Page navigation — these DO NOT switch the model. They just re-render the
+  // menu with the other page's keyboard + body text (mirrors the REFRESH shape).
+  if (data === MODEL_CALLBACK_PAGE_EXTERNAL) {
+    return { answer: 'External models', reply: await buildModelMenu(deps, 'external') }
+  }
+  if (data === MODEL_CALLBACK_PAGE_MAIN) {
+    return { answer: 'Back', reply: await buildModelMenu(deps, 'main') }
+  }
+
+  // Claude-alias tap (e.g. Fable): the CLI resolves the alias but its picker
+  // doesn't render it, so select by injecting `/model <alias>` — same path as
+  // the sr-* handler below, no cursor-nav.
+  if (data.startsWith(MODEL_CALLBACK_ALIAS)) {
+    const alias = data.slice(MODEL_CALLBACK_ALIAS.length)
+    if (!isValidModelArg(alias)) {
+      return { answer: 'Invalid model name', reply: await buildModelMenu(deps) }
+    }
+    if (deps.isBusy()) {
+      return {
+        answer: '⏳ Agent is mid-turn — tap again when it’s idle',
+        reply: busyReply(deps),
+        toastOnly: true,
+      }
+    }
+    let aliasResult: InjectResult
+    try {
+      aliasResult = await deps.inject(deps.getAgentName(), `/model ${alias}`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return {
+        answer: 'Switch failed',
+        reply: await menuWithBanner(deps, `❌ Switch to **${deps.escapeHtml(alias)}** failed: ${deps.escapeHtml(msg)}`),
+      }
+    }
+    if (aliasResult.outcome === 'ok') {
+      const confirmation =
+        aliasResult.output
+          .split('\n')
+          .map((l) => l.trim())
+          .find((l) => /set model|switched/i.test(l)) ?? `Switched to ${alias} (session)`
+      return {
+        answer: confirmation,
+        reply: await menuWithBannerStatic(deps, `✅ ${deps.escapeHtml(confirmation)}`),
+        selectedModel: sessionModelFromConfirmation(confirmation) ?? alias,
+      }
+    }
+    return {
+      answer: 'Switch failed',
+      reply: await menuWithBanner(
+        deps,
+        `❌ Switch to **${deps.escapeHtml(alias)}** failed — agent may be mid-turn`,
+      ),
+    }
   }
 
   if (data === MODEL_CALLBACK_HEADER) {
