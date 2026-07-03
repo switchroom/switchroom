@@ -141,6 +141,33 @@ describe("readFleetHealth (job-spec-anchored issue tracker)", () => {
     expect(dash.records).toEqual([]);
   });
 
+  it("normalizes a missing / non-number priority_score to 0", () => {
+    writeLedger({
+      owner_agent: "klanker",
+      records: [
+        // missing priority_score entirely
+        { job_spec: "no-score", open_issue_count: 0, issues: [] },
+        // non-number priority_score (malformed ledger)
+        {
+          job_spec: "bad-score",
+          open_issue_count: 0,
+          priority_score: "oops",
+          issues: [],
+        },
+        { job_spec: "good-score", open_issue_count: 0, priority_score: 5, issues: [] },
+      ],
+    } as unknown as FleetHealthLedger);
+    const dash = readFleetHealth(ledgerPath);
+    expect(dash.empty).toBe(false);
+    // every record now carries a finite number score (never undefined/NaN/string)
+    for (const r of dash.records) {
+      expect(typeof r.priority_score).toBe("number");
+      expect(Number.isFinite(r.priority_score)).toBe(true);
+    }
+    // the real score still ranks first; normalized-to-0 records follow
+    expect(dash.records[0].job_spec).toBe("good-score");
+  });
+
   it("resolves the default ledger path under ~/.switchroom/fleet-health", () => {
     const home = mkdtempSync(join(tmpdir(), "sr-home-"));
     mkdirSync(join(home, ".switchroom", "fleet-health"), { recursive: true });

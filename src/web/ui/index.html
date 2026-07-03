@@ -1309,7 +1309,7 @@
       const specRows = (data.records || []).map(r => `
         <tr>
           <td><strong>${escapeHtml(r.job_spec)}</strong></td>
-          <td>${escapeHtml((r.priority_score ?? 0).toFixed ? r.priority_score.toFixed(1) : String(r.priority_score))}</td>
+          <td>${escapeHtml(typeof r.priority_score === "number" ? r.priority_score.toFixed(1) : '—')}</td>
           <td>${escapeHtml(String(r.open_issue_count ?? 0))}</td>
           <td>${escapeHtml(r.last_scanned || '—')}</td>
           <td>${escapeHtml(r.last_deep_dive || '—')}</td>

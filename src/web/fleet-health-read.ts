@@ -147,10 +147,17 @@ export function readFleetHealth(path: string): FleetHealthDashboard {
     };
   }
 
-  const records = Array.isArray(ledger.records) ? ledger.records : [];
-  // Rank worst-first. `??` guards a malformed record missing the score.
+  const rawRecords = Array.isArray(ledger.records) ? ledger.records : [];
+  // Normalize `priority_score` to a finite number so a malformed ledger
+  // (missing / string / NaN / Infinity score) never emits a non-number,
+  // which would crash the render side.
+  const records = rawRecords.map((r) => {
+    const n = Number(r?.priority_score);
+    return { ...r, priority_score: Number.isFinite(n) ? n : 0 };
+  });
+  // Rank worst-first.
   const ranked = [...records].sort(
-    (a, b) => (b.priority_score ?? 0) - (a.priority_score ?? 0),
+    (a, b) => b.priority_score - a.priority_score,
   );
 
   return {
