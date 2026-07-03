@@ -240,6 +240,34 @@ export function projectAssistantTextBlocks(
 }
 
 /**
+ * True iff this assistant message's `content` carries the "answer surface"
+ * — a `text` block, or a real (non-`Agent`/`Task`) `tool_use`. Used to gate
+ * the `stop_reason === 'end_turn'` sub-agent terminal so it never fires on a
+ * split-off thinking-only line (see the terminal comment in
+ * projectSubagentLine). A thinking-only or empty line returns false; the real
+ * terminal rides the following content line, which also carries `end_turn`.
+ */
+export function assistantLineCarriesAnswerSurface(
+  content: Array<Record<string, unknown>> | undefined,
+): boolean {
+  if (!Array.isArray(content)) return false
+  for (const c of content) {
+    const ct = (c?.type as string | undefined) ?? ''
+    if (ct === 'text') {
+      // A non-empty text block is the answer surface.
+      const t = c.text as string | undefined
+      if (typeof t === 'string' && t.trim().length > 0) return true
+    } else if (ct === 'tool_use') {
+      // A real tool_use is content too. (An end_turn message rarely contains a
+      // tool_use, but if it does it is content-final, not a bare thinking split.)
+      const name = (c.name as string | undefined) ?? ''
+      if (name !== 'Agent' && name !== 'Task') return true
+    }
+  }
+  return false
+}
+
+/**
  * Project a single transcript line into a SessionEvent (or null if it's
  * uninteresting noise). Caller is responsible for the JSON parse — if a
  * line is not valid JSON we skip it.
@@ -486,8 +514,26 @@ export function projectSubagentLine(
     // events so the final text/preamble still renders; the watcher's turn_end
     // handler is guarded on `state === 'running'`, so a later real
     // turn_duration line is a no-op.
+    //
+    // UPSTREAM-SHAPE HARDENING (Claude Code ≥2.1.x): one logical assistant
+    // message is now persisted as MULTIPLE JSONL lines sharing one
+    // `message.id`, one content-block per line, and the terminal `stop_reason`
+    // (`end_turn`) is stamped on EVERY split line — including the leading
+    // `[thinking]` line that precedes the `[text: final answer]` line. Firing
+    // the terminal on the thinking-only line marks the sub-agent `done` and
+    // hands back stale/empty text BEFORE the real handback `[text]` line is
+    // projected (the watcher's onProgress is `state==='running'`-gated, so the
+    // late text is dropped). Guard: only treat `end_turn` as terminal on a line
+    // that actually carries the message's answer surface (a `text` block, or a
+    // non-`Agent`/`Task` tool_use). A thinking-only `end_turn` line is a split
+    // preamble; its terminal + handback ride the following content line, which
+    // still carries `end_turn` and fires correctly AFTER the text event. The
+    // old single-line `[thinking, text](end_turn)` shape has a `text` block, so
+    // it fires exactly as before — graceful degradation on both shapes. A
+    // genuine thinking-only end with no answer still terminates via the
+    // `turn_duration` / capped-reaper / watcher stall nets.
     const stopReason = message?.stop_reason as string | undefined
-    if (stopReason === 'end_turn') {
+    if (stopReason === 'end_turn' && assistantLineCarriesAnswerSurface(content)) {
       events.push({ kind: 'sub_agent_turn_end', agentId })
     }
     return events
