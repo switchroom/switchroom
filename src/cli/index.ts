@@ -44,6 +44,7 @@ import { registerHostdMcpCommand } from "./mcp-hostd.js";
 import { registerHostdCommand } from "./hostd.js";
 import { registerWebdCommand } from "./webd.js";
 import { registerHostCommand } from "./host-repair.js";
+import { registerFleetHealthCommand } from "./fleet-health.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -115,3 +116,4 @@ registerHostdMcpCommand(program);
 registerHostdCommand(program);
 registerWebdCommand(program);
 registerHostCommand(program);
+registerFleetHealthCommand(program);

@@ -1,0 +1,125 @@
+import { describe, it, expect } from "vitest";
+import {
+  scanAgent,
+  parseTurns,
+  detectTurnFindings,
+  detectGatewayFindings,
+  HANG_MS,
+} from "./detect.js";
+
+/**
+ * Pins the model-free L0 detector port (from the validated `spec_audit_l0.py`):
+ * the tuned hang threshold, the `synthetic-` exclusion, and the precise gateway
+ * signatures. All fixtures use SYNTHETIC turn ids — never a real Telegram id.
+ */
+
+// Synthetic origin_turn_ids: `<synthetic-chat>:_#<seq>`.
+const CHAT = "77770001";
+
+function turn(seq: number, over: Record<string, unknown>): string {
+  return JSON.stringify({
+    ts: 1_782_600_000 + seq,
+    agent: "alpha",
+    turn_id: `${CHAT}:_#${seq}`,
+    status: "complete",
+    tools: 5,
+    duration_ms: 40_000,
+    ...over,
+  });
+}
+
+describe("parseTurns", () => {
+  it("skips malformed lines without throwing", () => {
+    const text = [turn(1, {}), "{not json", "", turn(2, {})].join("\n");
+    expect(parseTurns(text)).toHaveLength(2);
+  });
+});
+
+describe("detectTurnFindings", () => {
+  it("flags a silent no-op (complete, zero tools, real turn)", () => {
+    const turns = parseTurns(turn(10, { tools: 0 }));
+    const f = detectTurnFindings("alpha", turns);
+    expect(f.map((x) => x.signal)).toContain("silent-no-op-candidate");
+  });
+
+  it("does NOT flag a synthetic zero-tool turn as a silent no-op", () => {
+    const turns = parseTurns(
+      JSON.stringify({
+        turn_id: `${CHAT}:_#synthetic-boot`,
+        status: "complete",
+        tools: 0,
+        duration_ms: 1000,
+      }),
+    );
+    const f = detectTurnFindings("alpha", turns);
+    expect(f.map((x) => x.signal)).not.toContain("silent-no-op-candidate");
+  });
+
+  it("flags a killed/incomplete turn", () => {
+    const turns = parseTurns(turn(11, { status: "killed", tools: 3 }));
+    const f = detectTurnFindings("alpha", turns);
+    expect(f.map((x) => x.signal)).toContain("killed-incomplete-turn");
+  });
+
+  it("does not flag no_reply as incomplete", () => {
+    const turns = parseTurns(turn(12, { status: "no_reply", tools: 1 }));
+    const f = detectTurnFindings("alpha", turns);
+    expect(f.map((x) => x.signal)).not.toContain("killed-incomplete-turn");
+  });
+
+  it("flags a hang only when long AND stalled (few tools)", () => {
+    const stalled = parseTurns(turn(13, { duration_ms: HANG_MS + 1, tools: 1 }));
+    const productive = parseTurns(turn(14, { duration_ms: HANG_MS + 1, tools: 9 }));
+    expect(detectTurnFindings("alpha", stalled).map((x) => x.signal)).toContain(
+      "hang-long-stalled",
+    );
+    expect(
+      detectTurnFindings("alpha", productive).map((x) => x.signal),
+    ).not.toContain("hang-long-stalled");
+  });
+});
+
+describe("detectGatewayFindings", () => {
+  const log = [
+    `2026-07-02T21:03:00Z gateway: represent duplicate-send tid=${CHAT}:_#42`,
+    `2026-07-02T21:04:00Z gateway: tg-post method=getUpdates status=err timeout`,
+    `2026-07-02T21:05:00Z gateway: tg-post method=sendRichMessage tid=${CHAT}:_#43 status=err`,
+    `2026-07-02T21:06:00Z gateway: obligation escalation tid=${CHAT}:_#44`,
+  ].join("\n");
+
+  it("counts represent-duplicate and reply-delivery-failure, ignores getUpdates blip", () => {
+    const { gw_hits } = detectGatewayFindings("alpha", log);
+    expect(gw_hits["duplicate-delivery-represent"]).toBe(1);
+    expect(gw_hits["reply-delivery-failure"]).toBe(1);
+    expect(gw_hits["represent-escalation"]).toBe(1);
+  });
+
+  it("extracts turn_id + ts into the finding", () => {
+    const { findings } = detectGatewayFindings("alpha", log);
+    const dup = findings.find((f) => f.signal === "duplicate-delivery-represent");
+    expect(dup?.turn_id).toBe(`${CHAT}:_#42`);
+    expect(dup?.ts).toBe("2026-07-02T21:03:00Z");
+  });
+});
+
+describe("scanAgent escalation decision", () => {
+  it("escalates on a duplicate-send hit", () => {
+    const res = scanAgent(
+      "alpha",
+      turn(1, {}),
+      "gateway: represent duplicate-send tid=x",
+    );
+    expect(res.escalate).toBe(true);
+  });
+
+  it("does NOT escalate on a represent-escalation alone", () => {
+    const res = scanAgent("alpha", turn(1, {}), "gateway: obligation escalation");
+    expect(res.escalate).toBe(false);
+  });
+
+  it("stays clean on a healthy agent", () => {
+    const res = scanAgent("alpha", turn(1, {}) + "\n" + turn(2, {}), "");
+    expect(res.escalate).toBe(false);
+    expect(res.findings).toHaveLength(0);
+  });
+});
