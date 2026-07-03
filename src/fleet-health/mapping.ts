@@ -4,7 +4,7 @@
  *
  * This is the model-free classification layer: it takes the L0 detector's
  * signals (hard artifacts) and (a) classifies each into the RFC's 9-class
- * failure-mode taxonomy, (b) maps it to one of the 22 job specs, and (c)
+ * failure-mode taxonomy, (b) maps it to one of the 23 job specs, and (c)
  * computes `priority_score = severity × frequency × reach × recency`.
  *
  * No model judgment enters any of this — the mapping table is explicit and the
@@ -86,8 +86,8 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
   },
 };
 
-/** The full set of 22 job-spec slugs the ledger carries a record for. Kept
- *  here so the writer can seed all 22 records (empty ones score 0). */
+/** The full set of 23 job-spec slugs the ledger carries a record for. Kept
+ *  here so the writer can seed all 23 records (empty ones score 0). */
 export const ALL_JOB_SPECS: readonly string[] = [
   "act-in-my-tools-with-an-identity",
   "approve-what-my-agent-can-touch",

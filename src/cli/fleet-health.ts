@@ -22,7 +22,7 @@ import { SIGNAL_MAP } from "../fleet-health/mapping.js";
  * Subcommands:
  * - `scan` — the nightly model-free (zero-token) sensor. Reads every agent's
  *   `turns.jsonl` + gateway log, runs the L0 detectors, classifies into the
- *   9-class taxonomy, maps to the 22 job specs, scores by
+ *   9-class taxonomy, maps to the 23 job specs, scores by
  *   `severity × frequency × reach × recency`, and writes the ledger the admin
  *   page reads. `--sync-issues` opens/updates/closes the GitHub issues.
  * - `deep-dive-targets` — prints the top-N ledger records as a structured brief

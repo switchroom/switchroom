@@ -19,13 +19,13 @@ Builds on: `see-my-whole-fleet-from-one-screen.md` (fleet dashboard), `crons-use
 
 ## TL;DR
 
-1. **The job:** the fleet watches itself against the 22 job specs, ranks its
+1. **The job:** the fleet watches itself against the 23 job specs, ranks its
    own recurring failures by impact, and puts the worst ones in front of the
    operator with evidence and a GitHub issue tracking the fix.
 2. **Success:** a recurring failure is detected from the fleet's own logs
    (not a principal complaint), ranked by `severity × frequency × reach ×
    recency`, tracked in a GitHub issue, and closed on a verified count-drop.
-3. **Biggest constraint:** the nightly sensor that touches all 22 jobs is
+3. **Biggest constraint:** the nightly sensor that touches all 23 jobs is
    **model-free (zero tokens)**; the model spend is gated behind it and
    budgeted to the top 1-2 issues; everything runs as operator-set schedules
    on one operator-assigned owner agent.
@@ -61,7 +61,7 @@ the silent-failure class the job exists to catch.
 
 ## The health ledger
 
-One persistent record **per job spec** (22 records). It is the standing,
+One persistent record **per job spec** (23 records). It is the standing,
 ranked state the admin page reads and the sensor updates.
 
 **Where it lives:** `~/.switchroom/fleet-health/ledger.json` — per-agent /
@@ -126,7 +126,7 @@ frequent-but-cosmetic one.
   occurrences stop, recency decays the score toward zero.
 
 All four are computed **from the model-free sensor's output** (below) — no
-model judgment enters the score. The web page ranks the 22 records by
+model judgment enters the score. The web page ranks the 23 records by
 `priority_score` descending.
 
 ## The 4-layer detection funnel
@@ -216,7 +216,7 @@ deep work, long+stalled is a hang), exclude `synthetic-` turn ids
 so a `getUpdates` network blip never counts as a delivery failure.
 
 L0 runs nightly across **all** agents and updates the ledger counts for
-**all 22** job records cheaply. It never spends a token.
+**all 23** job records cheaply. It never spends a token.
 
 ### L1 — cheap reflect confirm (nightly, only on L0 hits)
 
@@ -300,7 +300,7 @@ schedule slot).
 
 A new **Fleet Health** page on the operator dashboard (`src/web/`). It reads:
 
-- **The ledger** (`~/.switchroom/fleet-health/ledger.json`) — the 22 records,
+- **The ledger** (`~/.switchroom/fleet-health/ledger.json`) — the 23 records,
   ranked by `priority_score`. This is the primary, always-available source.
 - **Optionally the GitHub API** — live open/closed status per linked issue
   number, when a token is available; degrades to the ledger's own `status`
@@ -308,7 +308,7 @@ A new **Fleet Health** page on the operator dashboard (`src/web/`). It reads:
 
 It shows:
 
-- The 22 job specs **ranked worst-first** by `priority_score`, each row:
+- The 23 job specs **ranked worst-first** by `priority_score`, each row:
   score, open-issue count, severity of the worst open issue, frequency/trend,
   last-scanned, last-deep-dive.
 - **Per-spec drill-down** to its distinct issues: count, frequency/trend,
@@ -394,7 +394,7 @@ or the owner agent via `schedule_add` after merge — never a self-authored loop
 
 `src/fleet-health/mapping.ts` `SIGNAL_MAP` is the source of truth. Each L0
 signal is a hard artifact, pinned to the best-fit job spec (derived by reading
-the 22 `reference/jobs/*.md`) and a taxonomy class + severity:
+the 23 `reference/jobs/*.md`) and a taxonomy class + severity:
 
 | L0 signal | Failure mode | Severity | Job spec | Rationale |
 |---|---|---|---|---|
@@ -404,6 +404,11 @@ the 22 `reference/jobs/*.md`) and a taxonomy class + severity:
 | `hang-long-stalled` | partial | 2 | `steer-or-queue-mid-flight` | a turn stalled mid-flight (>6 min, ≤2 tools) — an in-flight-control failure |
 | `killed-incomplete-turn` | missed-trigger | 3 | `steer-or-queue-mid-flight` | the turn was abandoned incomplete while in progress |
 | `represent-escalation` | drift | 1 | `feel-like-a-colleague` | the gateway had to nudge on the agent's behalf — UX-friction, informational (does not alone open a sev-3 issue) |
+
+Note: `represent-escalation` (`/obligation escalation/`) is an added sev-1
+*informational* signal beyond the two precise delivery signatures — it flags
+UX-friction, not a delivery failure, and does not alone open a sev-3 issue, so
+it is not scope creep on the delivery-signature detection.
 
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 

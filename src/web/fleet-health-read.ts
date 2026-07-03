@@ -66,7 +66,7 @@ export interface FleetHealthIssue {
   status: FleetHealthIssueStatus;
 }
 
-/** One persistent record per job spec (22 of them). */
+/** One persistent record per job spec (23 of them). */
 export interface FleetHealthRecord {
   /** The `reference/jobs/<slug>.md` id — join key to the spec + GH label. */
   job_spec: string;

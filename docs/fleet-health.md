@@ -1,7 +1,7 @@
 # Fleet Health — operator guide (live detection pipeline)
 
 Fleet Health is the operator-facing, job-spec-anchored issue tracker: the fleet
-watches itself against the 22 jobs in `reference/jobs/`, ranks its own recurring
+watches itself against the 23 job specs in `reference/jobs/`, ranks its own recurring
 failures by impact, tracks each in a GitHub issue, and closes it on a verified
 count-drop.
 
@@ -94,7 +94,7 @@ implemented in `src/fleet-health/mapping.ts`):
   occurrences stop.
 
 A record's `priority_score` is the max over its open issues (the worst open
-problem drives the ranking). The admin page ranks the 22 records worst-first.
+problem drives the ranking). The admin page ranks the 23 records worst-first.
 
 ## Signal → job-spec mapping
 

@@ -22,14 +22,14 @@ function dupFinding(agent: string, seq: number): Finding {
 describe("buildLedger", () => {
   const now = new Date("2026-07-03T00:00:00Z");
 
-  it("seeds all 22 records and aggregates by dedup_key across agents", () => {
+  it("seeds all 23 records and aggregates by dedup_key across agents", () => {
     const findings = [
       dupFinding("clerk", 1),
       dupFinding("clerk", 2),
       dupFinding("marko", 3),
     ];
     const led = buildLedger(findings, { ownerAgent: "klanker", now });
-    expect(led.records).toHaveLength(23); // 22 job specs (delivery seeded once)
+    expect(led.records).toHaveLength(23); // 23 job specs (delivery seeded once)
     const delivery = led.records.find(
       (r) => r.job_spec === "talk-to-agents-from-anywhere",
     )!;
