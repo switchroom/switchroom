@@ -51,11 +51,41 @@ export const HINDSIGHT_CONSUMER_NAME = "hindsight";
 export const HINDSIGHT_DEFAULT_UID = 11000;
 
 /**
+ * GHCR repository (no tag) for switchroom's hindsight image. The image is
+ * published per-version as `:vX.Y.Z` on a release tag AND as `:latest` on
+ * every main build (see `.github/workflows/docker-images.yml`). Standalone
+ * paths (`memory setup`) default to `:latest`; a version-pinned rollout
+ * threads the target tag through so the recreate pulls the SAME pinned
+ * image the rest of the fleet moved to (not floating `:latest`).
+ */
+export const HINDSIGHT_IMAGE_REPO = "ghcr.io/switchroom/switchroom-hindsight";
+
+/**
  * Docker image for switchroom's hindsight (extends upstream with the
  * `claude-code` LLM provider's runtime deps). Pulled from GHCR at apply
  * time; built from `docker/Dockerfile.hindsight` when `--build-local`.
+ * The default floating `:latest` tag — used by the standalone `memory
+ * setup` path. A pinned rollout overrides the tag via {@link hindsightImageRef}.
  */
-export const HINDSIGHT_IMAGE = "ghcr.io/switchroom/switchroom-hindsight:latest";
+export const HINDSIGHT_IMAGE = `${HINDSIGHT_IMAGE_REPO}:latest`;
+
+/**
+ * Resolve the hindsight image reference for a given target tag.
+ *
+ * The release workflow publishes the hindsight image with the `v`-prefixed
+ * git tag (`TAG_VERSION="${GITHUB_REF#refs/tags/}"` → `:v0.15.18`), so a
+ * rollout target like `v0.15.18` or `0.15.18` maps to `…hindsight:v0.15.18`.
+ * When `tag` is undefined/empty, returns the floating `:latest` image
+ * ({@link HINDSIGHT_IMAGE}) — preserving the standalone `memory setup`
+ * behavior. Normalizes so a bare `0.15.18` and a `v0.15.18` both resolve to
+ * the `:v0.15.18` tag the workflow actually publishes.
+ */
+export function hindsightImageRef(tag?: string): string {
+  const t = tag?.trim();
+  if (!t) return HINDSIGHT_IMAGE;
+  const v = t.replace(/^v/, "");
+  return `${HINDSIGHT_IMAGE_REPO}:v${v}`;
+}
 
 /**
  * Default Claude model for hindsight's LLM operations (retain / reflect /
@@ -437,6 +467,7 @@ export interface LiteLLMHindsightConfig {
 export function startHindsight(
   ports?: { apiPort: number; uiPort: number },
   litellm?: LiteLLMHindsightConfig,
+  imageTag?: string,
 ): void {
   const apiPort = ports?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT;
   const uiPort = ports?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
@@ -540,7 +571,9 @@ export function startHindsight(
     // entrypoint's `chmod 0700` fails EACCES → restart-loop.
     "--tmpfs", `/run/claude-creds:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
     ...envArgs,
-    HINDSIGHT_IMAGE,
+    // Pinned tag when a rollout target is threaded through; floating
+    // `:latest` for the standalone `memory setup` path (imageTag undefined).
+    hindsightImageRef(imageTag),
   );
 
   execFileSync("docker", args, { stdio: "pipe" });
@@ -559,13 +592,15 @@ export function stopHindsight(): void {
 }
 
 /**
- * Pull the latest Hindsight image. `startHindsight` runs `docker run`
- * against whatever image is locally present — it never pulls — so a
- * recreate that wants the newest `:latest` must pull first. Inherits
- * stdio so the operator sees pull progress during `switchroom update`.
+ * Pull the Hindsight image. `startHindsight` runs `docker run` against
+ * whatever image is locally present — it never pulls — so a recreate that
+ * wants the newest bits must pull first. Pulls `:latest` when `imageTag`
+ * is omitted (standalone `memory setup`); pulls the pinned `:vX.Y.Z` when
+ * a rollout threads its target through. Inherits stdio so the operator
+ * sees pull progress during `switchroom update` / `rollout`.
  */
-export function pullHindsightImage(): void {
-  execFileSync("docker", ["pull", HINDSIGHT_IMAGE], { stdio: "inherit" });
+export function pullHindsightImage(imageTag?: string): void {
+  execFileSync("docker", ["pull", hindsightImageRef(imageTag)], { stdio: "inherit" });
 }
 
 /**

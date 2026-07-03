@@ -263,8 +263,15 @@ export function registerMemoryCommand(program: Command): void {
       "--recreate",
       "Pull the latest image and recreate the container (reusing its current port). Used by `switchroom update` to keep the hindsight singleton current.",
     )
+    .option(
+      "--tag <version>",
+      "Pin the hindsight image tag to pull + run (e.g. v0.15.18), overriding the " +
+        "default floating `:latest`. Threaded through by `switchroom rollout` so a " +
+        "version-pinned roll recreates hindsight on the SAME tag as the rest of the " +
+        "fleet. Omit for `:latest` (the standalone default).",
+    )
     .option("--provider <provider>", "LLM provider (ollama, openai, anthropic)")
-    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; provider?: string }) => {
+    .action(async (opts: { stop?: boolean; status?: boolean; recreate?: boolean; tag?: string; provider?: string }) => {
       if (opts.status) {
         if (!isDockerAvailable()) {
           console.log(chalk.red("  Docker is not available."));
@@ -320,9 +327,13 @@ export function registerMemoryCommand(program: Command): void {
       }
 
       if (recreate) {
-        console.log(chalk.gray("  Pulling latest Hindsight image..."));
+        console.log(
+          chalk.gray(
+            `  Pulling ${opts.tag ? `Hindsight image ${opts.tag}` : "latest Hindsight image"}...`,
+          ),
+        );
         try {
-          pullHindsightImage();
+          pullHindsightImage(opts.tag);
         } catch (err) {
           console.error(chalk.red(`\n  Failed to pull Hindsight image: ${(err as Error).message}\n`));
           process.exit(1);
@@ -376,7 +387,7 @@ export function registerMemoryCommand(program: Command): void {
       console.log(chalk.gray("  Starting Hindsight Docker container..."));
       try {
         const litellmCfg = await resolveLiteLLMForHindsight(getConfig(program));
-        startHindsight(ports, litellmCfg);
+        startHindsight(ports, litellmCfg, opts.tag);
         if (litellmCfg) {
           console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
         }
