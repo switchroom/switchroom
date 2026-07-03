@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.16.42 — Fleet Health: operator-facing fleet issue tracker + admin page
+
+Operator-facing Fleet Health admin page — a job-spec-anchored issue tracker
+that reads the owner agent's health ledger
+(`~/.switchroom/fleet-health/ledger.json`), ranks job records worst-first by
+`priority_score`, and degrades to a clearly-marked empty state when no owner
+agent is assigned or the ledger is unreadable, so the dashboard always
+renders. (#2748)
+
+- Render side (`src/web/ui/index.html`): the priority-score cell now guards on
+  the actual value type (`typeof … === "number"`) and shows `—` for a missing
+  score, instead of calling `.toFixed` on `(undefined ?? 0)` — which was
+  truthy and threw a `TypeError` that broke the whole page.
+- Read side (`src/web/fleet-health-read.ts`): `priority_score` is normalized
+  to a finite number (default `0`) when building each record, so a malformed
+  ledger never emits a non-number score. Existing degrade-to-empty behaviour
+  is preserved.
+
 ## unreleased — Voice PR-B2: local GPU STT sidecar (gateway consuming side + token injection)
 
 Wires the gateway's voice-in path to the local `voice-sidecar` GPU
