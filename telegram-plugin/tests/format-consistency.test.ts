@@ -1,0 +1,202 @@
+/**
+ * Tests for the fleet-wide consistent-formatting bundle:
+ *
+ *   1. addParagraphSpacers extension — a visible U+00A0 spacer line at EVERY
+ *      block transition (paragraph→list, list→paragraph, heading→anything,
+ *      blockquote/table boundaries), never inside a list/table interior.
+ *   2. normalizePunctuation — em/en dashes → comma/hyphen, leading `•`/`·`
+ *      list markers → `- `, on code-masked text, idempotent.
+ *   3. stripExcessBold — over-bold tripwire: >30% bold or fully-bolded
+ *      paragraphs/lists lose their bold markers; short messages exempt.
+ */
+import { describe, test, expect } from 'vitest'
+import {
+  addParagraphSpacers,
+  normalizeParagraphBreaks,
+  normalizePunctuation,
+  stripExcessBold,
+  splitMarkdownChunks,
+  PARAGRAPH_SPACER,
+} from '../format.js'
+
+const SP = PARAGRAPH_SPACER // U+00A0
+
+describe('addParagraphSpacers — uniform block spacing', () => {
+  test('still spaces prose→prose (existing behaviour)', () => {
+    const out = addParagraphSpacers('Alpha.\n\nBravo.')
+    expect(out).toBe(`Alpha.\n\n${SP}\n\nBravo.`)
+  })
+
+  test('spaces paragraph→list transition', () => {
+    const out = addParagraphSpacers('Intro.\n\n- one\n- two')
+    expect(out).toBe(`Intro.\n\n${SP}\n\n- one\n- two`)
+  })
+
+  test('spaces list→paragraph transition', () => {
+    const out = addParagraphSpacers('- one\n- two\n\nOutro.')
+    expect(out).toBe(`- one\n- two\n\n${SP}\n\nOutro.`)
+  })
+
+  test('spaces heading→anything', () => {
+    expect(addParagraphSpacers('# Title\n\nBody.')).toBe(`# Title\n\n${SP}\n\nBody.`)
+    expect(addParagraphSpacers('# Title\n\n- a\n- b')).toBe(`# Title\n\n${SP}\n\n- a\n- b`)
+  })
+
+  test('spaces blockquote and table boundaries', () => {
+    expect(addParagraphSpacers('> quoted\n\nProse.')).toBe(`> quoted\n\n${SP}\n\nProse.`)
+    const table = '| a | b |\n| --- | --- |\n| 1 | 2 |'
+    expect(addParagraphSpacers(`Prose.\n\n${table}`)).toBe(`Prose.\n\n${SP}\n\n${table}`)
+    expect(addParagraphSpacers(`${table}\n\nProse.`)).toBe(`${table}\n\n${SP}\n\nProse.`)
+  })
+
+  test('does NOT space between items of the same loose list', () => {
+    const input = '- one\n\n- two\n\n- three'
+    expect(addParagraphSpacers(input)).toBe(input)
+  })
+
+  test('does NOT space inside a tight list or table interior (single \\n)', () => {
+    const list = 'Intro.\n\n- a\n- b\n- c'
+    expect(addParagraphSpacers(list)).toBe(`Intro.\n\n${SP}\n\n- a\n- b\n- c`)
+    const table = '| a |\n| --- |\n| 1 |\n| 2 |'
+    expect(addParagraphSpacers(table)).toBe(table)
+  })
+
+  test('idempotent across every transition kind', () => {
+    const input = '# H\n\nProse one.\n\n- a\n- b\n\nProse two.\n\n> quote'
+    const once = addParagraphSpacers(input)
+    expect(addParagraphSpacers(once)).toBe(once)
+  })
+
+  test('never touches code fences', () => {
+    const input = '```\nA\n\nB\n```\n\n```\nC\n```'
+    expect(addParagraphSpacers(input)).toBe(input)
+  })
+
+  test('full pipeline: mixed prose+list+heading message gets uniform gaps', () => {
+    const raw = 'Summary line.\n- item one\n- item two\nClosing prose.'
+    const out = addParagraphSpacers(normalizeParagraphBreaks(raw))
+    // Every block transition carries exactly one visible spacer line.
+    expect(out).toBe(
+      `Summary line.\n\n${SP}\n\n- item one\n- item two\n\n${SP}\n\nClosing prose.`,
+    )
+  })
+
+  test('chunk-boundary interaction: a cut in a spacer gap strips the spacer', () => {
+    const a = 'A'.repeat(60)
+    const b = 'B'.repeat(60)
+    const text = `${a}\n\n${SP}\n\n${b}`
+    const chunks = splitMarkdownChunks(text, 80)
+    expect(chunks.length).toBe(2)
+    expect(chunks[0]).toBe(a)
+    expect(chunks[1]).toBe(b)
+  })
+})
+
+describe('normalizePunctuation', () => {
+  test('spaced em-dash → comma', () => {
+    expect(normalizePunctuation('voice came back — three PRs stacked')).toBe(
+      'voice came back, three PRs stacked',
+    )
+  })
+
+  test('spaced en-dash → comma', () => {
+    expect(normalizePunctuation('one thing – another thing')).toBe('one thing, another thing')
+  })
+
+  test('bare em-dash between words → comma', () => {
+    expect(normalizePunctuation('word—word')).toBe('word, word')
+  })
+
+  test('bare en-dash between words → hyphen (ranges survive as ASCII)', () => {
+    expect(normalizePunctuation('2019–2024')).toBe('2019-2024')
+    expect(normalizePunctuation('pre–war')).toBe('pre-war')
+  })
+
+  test('digit-flanked spaced dash → hyphen range, not comma', () => {
+    expect(normalizePunctuation('3 – 5 days')).toBe('3-5 days')
+    expect(normalizePunctuation('10 — 20')).toBe('10-20')
+  })
+
+  test('leading • and · bullets → `- ` (indent preserved)', () => {
+    expect(normalizePunctuation('• one\n• two')).toBe('- one\n- two')
+    expect(normalizePunctuation('  · indented')).toBe('  - indented')
+  })
+
+  test('mid-line bullet glyph untouched', () => {
+    expect(normalizePunctuation('rated 4.5 • 120 reviews')).toBe('rated 4.5 • 120 reviews')
+  })
+
+  test('never touches code spans or fences', () => {
+    const input = 'run `a — b` now\n\n```\nx — y\n• bullet\n```'
+    expect(normalizePunctuation(input)).toBe(input)
+  })
+
+  test('idempotent', () => {
+    const once = normalizePunctuation('a — b\n• c\nd—e\n1–2')
+    expect(normalizePunctuation(once)).toBe(once)
+  })
+})
+
+describe('stripExcessBold', () => {
+  const filler =
+    'This is an ordinary paragraph of connected prose that provides enough plain ' +
+    'characters to clear the one-hundred character exemption comfortably.'
+
+  test('short messages (<100 chars) exempt even when fully bold', () => {
+    const input = '**Everything here is bold.**'
+    expect(stripExcessBold(input)).toBe(input)
+  })
+
+  test('strips all bold when >30% of non-code chars are bold', () => {
+    const bold = '**' + 'B'.repeat(80) + '**'
+    const input = `${bold} plus a little plain text tail here.`
+    const out = stripExcessBold(input)
+    expect(out).not.toContain('**')
+    expect(out).toContain('B'.repeat(80))
+  })
+
+  test('keeps bold when clearly under threshold', () => {
+    const input = `${filler} The key fact is **42**.`
+    expect(stripExcessBold(input)).toBe(input)
+  })
+
+  test('strips a fully-bolded multi-line paragraph, leaves others', () => {
+    const input = `${filler}\n\n**This whole paragraph is bold.**\n**Every single line of it.**`
+    const out = stripExcessBold(input)
+    expect(out).toContain('This whole paragraph is bold.')
+    expect(out).not.toContain('**This whole paragraph is bold.**')
+    expect(out.startsWith(filler)).toBe(true)
+  })
+
+  test('single short fully-bolded line (pseudo-heading) survives', () => {
+    const input = `**Summary**\n\n${filler}`
+    expect(stripExcessBold(input)).toBe(input)
+  })
+
+  test('strips a list whose EVERY item is fully bolded', () => {
+    const input = `${filler}\n\n- **alpha item**\n- **bravo item**\n- **charlie item**`
+    const out = stripExcessBold(input)
+    expect(out).toContain('- alpha item')
+    expect(out).not.toContain('**alpha item**')
+  })
+
+  test('leaves a list where only some items are bolded', () => {
+    const input = `${filler}\n\n- **alpha item**\n- plain bravo\n- plain charlie`
+    expect(stripExcessBold(input)).toBe(input)
+  })
+
+  test('code regions neither counted nor modified', () => {
+    const fence = '```\n**not really bold**\n' + 'x'.repeat(400) + '\n```'
+    const input = `${filler} Key: **fact**.\n\n${fence}`
+    const out = stripExcessBold(input)
+    expect(out).toContain('**not really bold**')
+    expect(out).toContain('**fact**')
+  })
+
+  test('idempotent', () => {
+    const bold = '**' + 'B'.repeat(80) + '**'
+    const input = `${bold} plus a little plain text tail.`
+    const once = stripExcessBold(input)
+    expect(stripExcessBold(once)).toBe(once)
+  })
+})

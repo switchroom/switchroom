@@ -225,7 +225,7 @@ const REPLY_TO_TEXT_MAX = 200
 const SILENT_END_FALLBACK_TEXT =
   '⚠️ The agent finished working but didn’t send a reply — your last ' +
   'message may not have been answered. Please try asking again.'
-import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
+import { splitMarkdownChunks, hardSliceToCap, repairEscapedWhitespace, normalizeParagraphBreaks, addParagraphSpacers, normalizePunctuation, stripExcessBold, escapeMarkdown, RICH_MESSAGE_MAX_CHARS } from '../format.js'
 import { richMessage } from '../rich-send.js'
 import { scrubVoice } from '../text-voice-scrub.js'
 import {
@@ -8840,6 +8840,10 @@ async function executeReply(args: Record<string, unknown>): Promise<{ content: A
   // into GFM hard breaks so the rich path doesn't collapse them (lists/tables/
   // code are left untouched — see normalizeParagraphBreaks).
   let text = normalizeParagraphBreaks(repairEscapedWhitespace(rawText))
+  // Fleet-wide consistent formatting: normalize dashes/bullets and trip the
+  // over-bold guard deterministically, on code-masked text, right after
+  // paragraph normalization (same contract on reply / edit / stream paths).
+  text = stripExcessBold(normalizePunctuation(text))
   // Outbound secret scrub (#2044): mask any secret the agent echoed BEFORE
   // the stderr preview below, the dedup key, the send, and the history
   // record. Mutates `text` so every downstream consumer sees the masked
@@ -10260,6 +10264,8 @@ async function executeStreamReply(args: Record<string, unknown>): Promise<unknow
       retry: robustApiCall,
       repairEscapedWhitespace,
       normalizeParagraphBreaks,
+      normalizePunctuation,
+      stripExcessBold,
       addParagraphSpacers,
       assertAllowedChat,
       resolveThreadId,
@@ -11489,7 +11495,7 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
   // paragraph breaks for the rich path. A literal-text edit (`format:'text'`)
   // skips paragraph normalization — it must edit byte-for-byte as given.
   let editRawText = repairEscapedWhitespace(args.text as string)
-  if (!editLiteralText) editRawText = addParagraphSpacers(normalizeParagraphBreaks(editRawText))
+  if (!editLiteralText) editRawText = addParagraphSpacers(stripExcessBold(normalizePunctuation(normalizeParagraphBreaks(editRawText))))
   // Outbound secret scrub (#2044): an edit must not re-introduce a raw
   // secret into a live bubble or the history row. Mask before scrub/send.
   editRawText = redactOutboundText(editRawText, 'edit_message')

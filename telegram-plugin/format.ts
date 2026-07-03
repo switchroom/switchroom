@@ -373,13 +373,14 @@ export const PARAGRAPH_SPACER = ' '
  * the pre-#2669 HTML behaviour). See PARAGRAPH_SPACER for why a U+00A0 line is
  * the reliable trick.
  *
- * Conservative by construction — a spacer is inserted into a `\n\n` gap ONLY
- * when BOTH the block ENDING above the gap and the block STARTING below it are
- * ordinary prose. A gap adjacent to a structural block (list item, table row,
- * fenced code, blockquote, heading, indented code) is left exactly as it was:
- * those blocks already carry their own vertical rhythm, and a spacer paragraph
- * wedged against a tight list / table would either re-introduce the cramped
- * look from the other side or break the block's contiguity.
+ * Uniform-block-spacing contract: a spacer is inserted into EVERY `\n\n` gap
+ * that separates two DISTINCT blocks — prose→prose, paragraph→list,
+ * list→paragraph, heading→anything, blockquote/table/fence boundaries — so a
+ * mixed message renders with one identical visible blank line between blocks.
+ * The one exception is a gap INSIDE a block of the same structural kind (two
+ * items of a loose list, consecutive table rows/quotes/fences): those stay
+ * tight so the block's contiguity survives. Interiors joined by a single `\n`
+ * are never gaps at all and are untouched by construction.
  *
  * Runs on code-masked text (so a blank line inside a fenced block is never
  * touched) and is idempotent — a gap that already contains a U+00A0 spacer
@@ -410,15 +411,45 @@ export function addParagraphSpacers(text: string): string {
   // Trim ASCII-only (preserve U+00A0) so the spacer line is recognisable.
   const asciiTrim = (line: string): string => line.replace(/^[ \t\r\f\v]+|[ \t\r\f\v]+$/g, '')
 
-  // A line is "prose" for spacing purposes when it is non-blank, not a
-  // structural block marker, not the spacer line itself. Only a gap with prose
-  // on BOTH sides earns a visible spacer.
-  const isProseLine = (line: string): boolean => {
-    if (isBlankLine(line)) return false
-    if (asciiTrim(line) === spacerLine) return false
-    if (isMarkerLine(line, placeholder)) return false
-    // A standalone masked fenced block line is structural.
-    if (isFenceOpenLine(line, placeholder)) return false
+  // Classify the block kind of a facing line so the spacer decision can be
+  // made per BLOCK TRANSITION (#uniform-block-spacing). A spacer is inserted
+  // at every `\n\n` gap between two DIFFERENT block kinds (paragraph→list,
+  // list→paragraph, heading→anything, blockquote/table boundaries) and
+  // between two prose paragraphs — but NEVER inside a single block's interior
+  // (between two items of the same loose list, two rows of a table, two
+  // quote lines, two fenced blocks). One visible blank line between distinct
+  // blocks, identical everywhere; list/table interiors stay tight.
+  type BlockKind = 'spacer' | 'list' | 'table' | 'quote' | 'heading' | 'fence' | 'divider' | 'prose'
+  const blockKind = (line: string): BlockKind => {
+    if (asciiTrim(line) === spacerLine) return 'spacer'
+    if (isFenceOpenLine(line, placeholder)) return 'fence'
+    if (isListItemLine(line)) return 'list'
+    if (isTableRowLine(line) || isTableDelimiterLine(line)) return 'table'
+    if (isBlockquoteLine(line)) return 'quote'
+    if (isHeadingLine(line)) return 'heading'
+    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trimStart())) return 'divider'
+    return 'prose'
+  }
+
+  // Same-kind structural pairs whose `\n\n` gap is a block INTERIOR (a loose
+  // list's item gap, consecutive tables/quotes/fences) — no spacer there.
+  const SAME_KIND_TIGHT: ReadonlySet<BlockKind> = new Set([
+    'list',
+    'table',
+    'quote',
+    'fence',
+    'divider',
+  ])
+
+  const shouldSpaceGap = (above: string, below: string): boolean => {
+    const a = blockKind(above)
+    const b = blockKind(below)
+    // A facing spacer line means the gap is already spaced (idempotency —
+    // also guarded by alreadySpaced at the call site).
+    if (a === 'spacer' || b === 'spacer') return false
+    if (a === b && SAME_KIND_TIGHT.has(a)) return false
+    // Everything else is a genuine block transition (incl. prose→prose,
+    // heading→anything, list↔paragraph, table/quote boundaries) — space it.
     return true
   }
 
@@ -451,8 +482,7 @@ export function addParagraphSpacers(text: string): string {
           !alreadySpaced &&
           above != null &&
           below != null &&
-          isProseLine(above) &&
-          isProseLine(below)
+          shouldSpaceGap(above, below)
         ) {
           // Emit: blank, spacer paragraph, blank — a U+00A0 paragraph wedged
           // between two real blank lines so CommonMark renders it as a visible
@@ -492,6 +522,150 @@ function nextNonBlank(
     if (!isBlank(lines[i])) return lines[i]
   }
   return null
+}
+
+// ---------------------------------------------------------------------------
+// Punctuation / bullet normalization — fleet-wide consistent typography
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic punctuation + bullet normalization for outbound messages
+ * (fleet-wide consistent Telegram formatting). Runs in the send path AFTER
+ * normalizeParagraphBreaks, on code-masked text (reuses maskCodeRegions), so
+ * code spans and fenced blocks are never touched.
+ *
+ * Transforms:
+ *   1. Space-flanked em/en dash (` — ` / ` – `) → `, ` — except a
+ *      digit-flanked spaced dash (a numeric range `3 – 5`), which becomes a
+ *      plain hyphen range (`3-5`).
+ *   2. Bare em-dash between word characters (`word—word`) → `, `; a
+ *      digit-flanked one (`3—5`) → hyphen.
+ *   3. Bare en-dash between word characters → ASCII hyphen (`2019–2024` →
+ *      `2019-2024`).
+ *   4. Leading unicode bullets (`•` / `·`) as list markers → `- ` so every
+ *      list renders as a real GFM list (indent preserved).
+ *
+ * Idempotent: the output contains no em/en dashes or leading unicode bullets
+ * outside code regions, so a second pass is a no-op.
+ */
+export function normalizePunctuation(text: string): string {
+  if (!/[—–•·]/.test(text)) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore } = maskCodeRegions(text, nonce)
+
+  let out = masked
+    // 1. Space-flanked em/en dash. Numeric range keeps a hyphen.
+    .replace(/(\S)[ \t][—–][ \t](\S)/g, (_m, a: string, b: string) =>
+      /\d/.test(a) && /\d/.test(b) ? `${a}-${b}` : `${a}, ${b}`,
+    )
+    // 2. Bare em-dash between word chars. Numeric range keeps a hyphen.
+    .replace(/(\w)—(\w)/g, (_m, a: string, b: string) =>
+      /\d/.test(a) && /\d/.test(b) ? `${a}-${b}` : `${a}, ${b}`,
+    )
+    // 3. Bare en-dash between word chars → hyphen (ranges: 2019–2024).
+    .replace(/(\w)–(\w)/g, '$1-$2')
+
+  // 4. Leading unicode bullet markers → GFM `- ` (per line, indent kept).
+  out = out
+    .split('\n')
+    .map((line) => line.replace(/^([ \t]*)[•·][ \t]+/, '$1- '))
+    .join('\n')
+
+  return restore(out)
+}
+
+// ---------------------------------------------------------------------------
+// Over-bold tripwire — strip bold when a message is clearly over-bolded
+// ---------------------------------------------------------------------------
+
+/** A line's content once a leading list marker (`- ` / `1. `) is removed. */
+function listItemContent(line: string): string {
+  return line.trimStart().replace(/^(?:[-*+]|\d+[.)])\s+/, '')
+}
+
+/** True when a text fragment is one single fully-bolded span (`**…**`). */
+function isFullyBolded(fragment: string): boolean {
+  return /^\*\*[^*]+\*\*[.,:;!?]?$/.test(fragment.trim())
+}
+
+/** Strip `**bold**` markers from a fragment, keeping the text. */
+function unbold(fragment: string): string {
+  return fragment.replace(/\*\*([^*]+)\*\*/g, '$1')
+}
+
+/**
+ * Over-bold tripwire (fleet-wide consistent Telegram formatting). If a
+ * message is clearly over-bolded, strip the `**` markers and keep the text:
+ *
+ *   - GLOBAL: when >30% of the message's non-code characters sit inside
+ *     `**bold**` spans, ALL bold markers are stripped.
+ *   - PER-BLOCK: an entire multi-line paragraph fully bolded, or a list whose
+ *     EVERY item is fully bolded, has that block's bold stripped.
+ *
+ * Deliberately conservative:
+ *   - Messages under 100 non-code characters are exempt (a short reply whose
+ *     one key fact is bolded is exactly the house style).
+ *   - A single-line fully-bolded paragraph of ≤48 chars is treated as a
+ *     pseudo-heading (the "**Section**" label the fleet style encourages) and
+ *     is NOT stripped by the per-block rule (it still counts toward the
+ *     global ratio).
+ *   - A list with any non-fully-bolded item is left alone.
+ *
+ * Code spans/fences are masked (maskCodeRegions) and never counted or
+ * modified. Idempotent: stripped output has no `**` spans left to trip on.
+ */
+export function stripExcessBold(text: string): string {
+  if (!text.includes('**')) return text
+
+  const nonce = Math.random().toString(36).slice(2)
+  const { masked, restore, placeholder } = maskCodeRegions(text, nonce)
+
+  // Non-code character budget: masked text with the placeholders removed.
+  const placeholderRe = new RegExp(
+    `${placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\d+\x00`,
+    'g',
+  )
+  const visible = masked.replace(placeholderRe, '')
+  if (visible.length < 100) return restore(masked)
+
+  let boldChars = 0
+  for (const m of visible.matchAll(/\*\*([^*]+)\*\*/g)) boldChars += m[1].length
+
+  if (boldChars / visible.length > 0.3) {
+    // Clearly over-bolded — strip every bold span, keep the text.
+    return restore(unbold(masked))
+  }
+
+  // Per-block check on blank-line-delimited blocks of the masked text.
+  const blocks = masked.split(/\n{2,}/)
+  const rebuilt = blocks.map((block) => {
+    const lines = block.split('\n').filter((l) => l.trim() !== '')
+    if (lines.length === 0 || !block.includes('**')) return block
+
+    const listLines = lines.filter((l) => isListItemLine(l))
+    if (listLines.length >= 2 && listLines.length === lines.length) {
+      // A list block: strip only when EVERY item is fully bolded.
+      if (lines.every((l) => isFullyBolded(listItemContent(l)))) return unbold(block)
+      return block
+    }
+
+    // A prose paragraph (no structural marker lines): strip when every line
+    // is one fully-bolded span — except the single-short-line pseudo-heading.
+    const isProseBlock = lines.every((l) => !isMarkerLine(l, placeholder))
+    if (!isProseBlock) return block
+    if (!lines.every((l) => isFullyBolded(l))) return block
+    if (lines.length === 1 && lines[0].trim().length <= 48) return block
+    return unbold(block)
+  })
+
+  // Rejoin with the original gap shapes: split() lost them, so re-split the
+  // masked text capturing the separators and interleave.
+  const seps = masked.match(/\n{2,}/g) ?? []
+  let out = rebuilt[0] ?? ''
+  for (let i = 1; i < rebuilt.length; i++) out += (seps[i - 1] ?? '\n\n') + rebuilt[i]
+
+  return restore(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,8 +757,14 @@ function ensureBlockBoundaries(text: string, placeholder?: string): string {
       const startsFence = isFenceOpenLine(line, placeholder) && !isFenceOpenLine(prev, placeholder)
       const startsQuote = isBlockquoteLine(line) && !isBlockquoteLine(prev)
       const startsHeading = isHeadingLine(line) && !isHeadingLine(prev)
+      // List start glued to prose above by a single `\n` (uniform-block-
+      // spacing): a `- ` line already interrupts a paragraph in CommonMark,
+      // so the blank line is render-safe — it only lets the spacer pass see
+      // the transition. Never fires between two list items (prev is a list
+      // item) so list interiors stay tight.
+      const startsList = isListItemLine(line) && !isListItemLine(prev)
 
-      if (startsTableHere || startsFence || startsQuote || startsHeading) {
+      if (startsTableHere || startsFence || startsQuote || startsHeading || startsList) {
         result.push('')
       }
     }
