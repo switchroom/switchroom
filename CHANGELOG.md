@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.16.42 — Fleet Health: operator-facing fleet issue tracker + admin page
+
+Ships the first slice of Fleet Health (RFC `reference/rfcs/fleet-health.md`,
+serving `reference/jobs/fleet-stays-healthy.md`, outcome `always-available`):
+the job-spec-anchored issue tracker's read side. A new admin **Fleet Health**
+page renders the health ledger (`~/.switchroom/fleet-health/ledger.json`) —
+the 22 job records ranked worst-first by `priority_score` — degrading to a
+clearly-marked empty state when no owner agent is assigned. Adds the typed
+read-only ledger reader (`src/web/fleet-health-read.ts`) and the top-level
+`fleet_health.owner_agent` config field (override cascade; the admin agent
+that will run the detection crons). Feature is inert until an owner is
+assigned.
+
+## unreleased — Fleet Health live detection pipeline (model-free sensor, priority ledger, GH-issue lifecycle)
+
+The machinery that populates the ledger the admin page reads (RFC
+`reference/rfcs/fleet-health.md`; serves `fleet-stays-healthy`). A new
+`switchroom fleet-health` CLI verb with three subcommands:
+
+- `scan` — the nightly **model-free (zero-token)** sensor. Iterates every
+  agent under `~/.switchroom/agents/*`, reads each agent's `turns.jsonl` +
+  `logs/<agent>/gateway-supervisor.log`, runs the L0 detectors (ported verbatim
+  from the validated reference detector: `HANG_MS=360000`, `HANG_MAXTOOLS=2`,
+  `synthetic-` exclusion, precise gateway signatures, `turn_id` join key),
+  classifies each finding into the 9-class failure-mode taxonomy, maps it to
+  one of the 22 job specs, scores it `severity × frequency × reach × recency`,
+  and writes the ledger in the exact shape the read side consumes. `--dry-run`
+  / `--json` supported. Defensive: a malformed/missing `turns.jsonl` is skipped
+  with a warning, never crashes the scan.
+- `scan --sync-issues` — the GitHub issue lifecycle (default-off, network-
+  guarded so CI/tests never hit it): opens one issue per distinct problem
+  (`dedup_key`), updates its occurrence list + count on re-scan, and closes it
+  on a verified count-drop. Labels `fleet-health`, `severity:1|2|3`,
+  `job:<slug>`. No-ops with a clear log line if `gh` is unavailable.
+- `deep-dive-targets` — prints the top-N ledger records as a structured brief
+  the owner agent's weekly Opus deep-dive cron consumes (the model spend stays
+  in the agent's own budgeted session; the CLI calls no model — claude-native).
+
+Documents the two owner-agent crons (nightly sensor, weekly deep-dive) and the
+mapping/scoring in the RFC + a new `docs/fleet-health.md`. Per-agent cron config
+and per-agent ledger state are never committed.
+
 ## unreleased — Voice PR-B2: local GPU STT sidecar (gateway consuming side + token injection)
 
 Wires the gateway's voice-in path to the local `voice-sidecar` GPU

@@ -852,6 +852,10 @@ fleet_health:
   owner_agent: klanker   # admin: true; runs the sensor + deep-dive crons
 ```
 
+The live detection pipeline (the `switchroom fleet-health` CLI, the scoring, the
+GitHub issue lifecycle, and the two owner-agent crons) is documented in
+[`fleet-health.md`](./fleet-health.md).
+
 ## Minimal Example
 
 ```yaml

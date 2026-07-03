@@ -374,10 +374,68 @@ empty page). The operator assigns the owner and commits the L0/L1 (nightly)
 and L2/L3 (weekly) schedules. Conservatism comes from the model-free gate and
 the deep-dive budget, not a staged audience.
 
-**This RFC's slice:** the job spec, this design, and a working+tested admin
-**page skeleton** that renders the ledger (typed reader + clearly-marked
-empty state). The owner-agent crons + the GitHub write path are the operator's
-to wire on the assigned agent — specified here, not code in this PR.
+**Slice 1 (merged, #2748):** the job spec, this design, and a working+tested
+admin **page skeleton** that renders the ledger (typed reader + clearly-marked
+empty state), plus the `fleet_health.owner_agent` config field.
+
+**Slice 2 (this PR):** the live detection pipeline — the model-free sensor, the
+priority ledger writer, and the GitHub issue lifecycle, all behind the
+`switchroom fleet-health` CLI. See "Implementation" below. The owner-agent crons
+are documented (this section + `docs/fleet-health.md`) and wired by the operator
+or the owner agent via `schedule_add` after merge — never a self-authored loop.
+
+## Implementation (as shipped in slice 2)
+
+**Code:** `src/fleet-health/{detect,mapping,ledger,gh-sync,scan}.ts` +
+`src/cli/fleet-health.ts` (verb `switchroom fleet-health`, subcommands `scan`,
+`deep-dive-targets`, `mapping`). Operator how-to: `docs/fleet-health.md`.
+
+### Signal → job-spec mapping (the model-free classification table)
+
+`src/fleet-health/mapping.ts` `SIGNAL_MAP` is the source of truth. Each L0
+signal is a hard artifact, pinned to the best-fit job spec (derived by reading
+the 22 `reference/jobs/*.md`) and a taxonomy class + severity:
+
+| L0 signal | Failure mode | Severity | Job spec | Rationale |
+|---|---|---|---|---|
+| `silent-no-op-candidate` | silent-no-op | 3 | `know-what-my-agent-is-doing` | completed with 0 tools while reporting success — the operator can't tell it did nothing |
+| `duplicate-delivery-represent` | duplicate | 2 | `talk-to-agents-from-anywhere` | the represent-duplicate-send (the validated clerk/marko case) — delivery to the principal happened twice |
+| `reply-delivery-failure` | success-theater | 3 | `talk-to-agents-from-anywhere` | `sendRichMessage … status=err` — the answer never reached the principal |
+| `hang-long-stalled` | partial | 2 | `steer-or-queue-mid-flight` | a turn stalled mid-flight (>6 min, ≤2 tools) — an in-flight-control failure |
+| `killed-incomplete-turn` | missed-trigger | 3 | `steer-or-queue-mid-flight` | the turn was abandoned incomplete while in progress |
+| `represent-escalation` | drift | 1 | `feel-like-a-colleague` | the gateway had to nudge on the agent's behalf — UX-friction, informational (does not alone open a sev-3 issue) |
+
+The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
+
+### Priority score (as implemented)
+
+`priority_score = severity × frequency × reach × recency`, computed in
+`mapping.ts`:
+
+- **severity** — from the table above.
+- **frequency** — `log10(1 + count)` over the scan window (default 30 days).
+- **reach** — distinct-agent count, floored at 1.
+- **recency** — `1.0` within 24h, linear decay to `0.1` at the window edge,
+  `0` if there are no occurrences.
+
+A record's score is the **max** over its open issues (the worst open problem
+drives the ranking). The `resolved-pending-verify → closed` count-drop
+transition fires when a previously-noisy `dedup_key` falls to ≤3 occurrences.
+
+### Owner-agent crons (documented, not committed)
+
+Two operator-set (or owner-agent-self-scheduled) crons on the owner agent —
+no per-agent cron config or per-agent state is committed to the repo:
+
+| Cadence | Cron | Command | Tier |
+|---|---|---|---|
+| Nightly 02:00 | `0 2 * * *` | `switchroom fleet-health scan --sync-issues` | model-free (zero tokens) |
+| Weekly Mon 02:30 | `30 2 * * 1` | `fleet-health deep-dive-targets` → Opus deep-dive | budgeted, top 1-2 only |
+
+The weekly deep-dive is Opus reasoning run **inside the owner agent's own
+budgeted session** (claude-native; no `claude -p`). The CLI only produces the
+structured brief; the model spend stays in the agent's cron session. Full cron
+prompt + cadence: `docs/fleet-health.md`.
 
 ## Verdict
 
