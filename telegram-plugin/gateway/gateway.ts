@@ -22834,7 +22834,15 @@ bot.on('callback_query:data', async ctx => {
     // Background continuation: decide the persistence path.
     // tryHostdDispatch returns "not-configured" when host_control is
     // disabled or the per-agent socket is absent → legacy fallback.
+    // The whole body is wrapped in try/catch: a throw inside a void
+    // IIFE (scheduleGrantRestart's sync fs writes, richMessage, etc.)
+    // would surface as an unhandledRejection — which this gateway
+    // routes through shutdown(). Pre-background, those throws were
+    // contained by grammY's handler wrapper; keep that containment.
+    // Known accepted gap: if the gateway restarts mid-persist, the
+    // interim "saving durably in background…" card stays stale.
     void (async () => {
+    try {
     let durable = false
     let legacy = false
     let failReason = ''
@@ -22987,6 +22995,14 @@ bot.on('callback_query:data', async ctx => {
         `telegram gateway: always-allow outcome card edit failed: ${(err as Error).message} (request_id=${request_id})\n`,
       )
     })
+    } catch (err) {
+      // Never let the background persist take the gateway down — an
+      // unhandledRejection here becomes shutdown(). Log and move on;
+      // the in-session rule was already applied at tap time.
+      process.stderr.write(
+        `telegram gateway: always-allow background persist threw: ${(err as Error).message} (request_id=${request_id})\n`,
+      )
+    }
     })()
     return
   }

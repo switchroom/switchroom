@@ -138,6 +138,17 @@ describe('scope-commit — durable hostd persistence', () => {
     expect(bgIdx).toBeLessThan(hostdAwaitIdx)
   })
 
+  it('background continuation body is wrapped in try/catch (a throw must not become an unhandledRejection → shutdown)', () => {
+    const bgIdx = commitBlock.indexOf('void (async () => {')
+    const tryIdx = commitBlock.indexOf('try {', bgIdx)
+    const hostdAwaitIdx = commitBlock.indexOf('await tryHostdDispatch(')
+    expect(tryIdx).toBeGreaterThan(bgIdx)
+    // The top-level try opens before any work (including the hostd await
+    // and scheduleGrantRestart's sync fs writes) runs inside the IIFE.
+    expect(tryIdx).toBeLessThan(hostdAwaitIdx)
+    expect(commitBlock).toContain('always-allow background persist threw')
+  })
+
   it('edits the card with the real outcome after the background persist', () => {
     const bgIdx = commitBlock.indexOf('void (async () => {')
     const outcomeEditIdx = commitBlock.indexOf('await ctx.editMessageText(', bgIdx)
