@@ -78,7 +78,7 @@ describe("readFleetHealth (job-spec-anchored issue tracker)", () => {
             occurrences: [
               {
                 agent: "clerk",
-                turn_id: "8248703757:_#12673",
+                turn_id: "12345:_#12673",
                 log_pointer: "logs/clerk/gateway-supervisor.log:represent duplicate-send",
               },
             ],
@@ -113,7 +113,7 @@ describe("readFleetHealth (job-spec-anchored issue tracker)", () => {
     const dash = readFleetHealth(ledgerPath);
     const rec = dash.records.find((r) => r.job_spec === "fleet-stays-healthy");
     const occ = rec?.issues[0].occurrences[0];
-    expect(occ?.turn_id).toBe("8248703757:_#12673");
+    expect(occ?.turn_id).toBe("12345:_#12673");
     expect(occ?.log_pointer).toContain("represent duplicate-send");
     expect(rec?.issues[0].gh_issue).toBe(1841);
   });

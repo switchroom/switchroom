@@ -24,7 +24,7 @@ import { homedir } from "node:os";
  *  verify. `failure_mode` is from the RFC's taxonomy; `severity` 1-3. */
 export interface FleetHealthOccurrence {
   agent: string;
-  /** origin_turn_id, e.g. `8248703757:_#12673` — the join key across
+  /** origin_turn_id, e.g. `12345:_#12673` — the join key across
    *  turns.jsonl, the gateway log, and the transcript. */
   turn_id: string;
   /** A pointer into the gateway/turns log the operator can grep. */

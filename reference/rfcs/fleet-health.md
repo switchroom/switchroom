@@ -89,7 +89,7 @@ writes it in-container at `/state/fleet-health/ledger.json`, host-mounted to
       "reach": ["clerk", "marko"],           // agents exhibiting it
       "recency": "2026-07-02T21:03:00Z",     // newest occurrence
       "occurrences": [                       // hard-artifact evidence
-        { "agent": "clerk", "turn_id": "8248703757:_#12673",
+        { "agent": "clerk", "turn_id": "12345:_#12673",
           "log_pointer": "logs/clerk/gateway-supervisor.log:represent duplicate-send" }
       ],
       "gh_issue": 1841,
@@ -101,7 +101,7 @@ writes it in-container at `/state/fleet-health/ledger.json`, host-mounted to
 
 The `job_spec` id and the per-issue `turn_id` are the two **join keys**:
 `job_spec` joins a record to `reference/jobs/<slug>.md` and to its GitHub
-label; `turn_id` (origin_turn_id, e.g. `8248703757:_#12673`) joins an
+label; `turn_id` (origin_turn_id, e.g. `12345:_#12673`) joins an
 occurrence across `turns.jsonl`, the gateway log, and the transcript.
 
 ## Priority score
