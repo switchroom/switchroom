@@ -20,7 +20,7 @@
  *
  *       1. Default (recommended)  Opus 4.8 with 1M context · Best for
  *                                 everyday, complex tasks
- *     ❯ 2. Sonnet ✔               Sonnet 4.6 · Efficient for routine tasks
+ *     ❯ 2. Sonnet ✔               Sonnet 5 · Efficient for routine tasks
  *       3. Haiku                  Haiku 4.5 · Fastest for quick answers
  *
  *     ○ Low effort ←/→ to adjust

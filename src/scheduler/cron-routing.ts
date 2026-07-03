@@ -43,7 +43,7 @@ export interface CronRouting {
 }
 
 /** v1 cheap cron-session model. A live session's model is fixed at launch, so this only governs Tier 1. */
-export const DEFAULT_CRON_MODEL = "claude-sonnet-4-6";
+export const DEFAULT_CRON_MODEL = "claude-sonnet-5";
 
 // Known-cheap model matcher: the Sonnet/Haiku family, by full id or short
 // alias. Opus and anything unrecognised are NOT cheap → Tier 2 (conservative).

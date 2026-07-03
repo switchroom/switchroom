@@ -14,7 +14,7 @@ describe("isAdaptiveThinkingOpus", () => {
 
   it("does not match sonnet/haiku or unset", () => {
     expect(isAdaptiveThinkingOpus("sonnet")).toBe(false);
-    expect(isAdaptiveThinkingOpus("claude-sonnet-4-6")).toBe(false);
+    expect(isAdaptiveThinkingOpus("claude-sonnet-5")).toBe(false);
     expect(isAdaptiveThinkingOpus("haiku")).toBe(false);
     expect(isAdaptiveThinkingOpus(undefined)).toBe(false);
     expect(isAdaptiveThinkingOpus("")).toBe(false);
@@ -38,7 +38,7 @@ describe("assessThinkingEffortRisk", () => {
   });
 
   it("is safe for non-Opus models even at high effort", () => {
-    expect(assessThinkingEffortRisk("claude-sonnet-4-6", "high").risky).toBe(false);
+    expect(assessThinkingEffortRisk("claude-sonnet-5", "high").risky).toBe(false);
     expect(assessThinkingEffortRisk("sonnet", "max").risky).toBe(false);
     expect(assessThinkingEffortRisk("haiku", "medium").risky).toBe(false);
   });

@@ -103,7 +103,7 @@ export function hindsightImageRef(tag?: string): string {
  * via `docker run -e HINDSIGHT_API_LLM_MODEL=...` or by editing the
  * generated compose snippet.
  */
-export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-4-6";
+export const HINDSIGHT_DEFAULT_MODEL = "claude-sonnet-5";
 
 /**
  * Run hindsight's MCP server in stateless HTTP mode.

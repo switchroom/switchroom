@@ -2467,7 +2467,7 @@ export const AgentSchema = z.object({
       "Model name must be alphanumeric with ._-/[]: only (no spaces or shell specials)",
     )
     .optional()
-    .describe("Claude model override (e.g., 'claude-sonnet-4-6')"),
+    .describe("Claude model override (e.g., 'claude-sonnet-5')"),
   thinking_effort: z
     .enum(["low", "medium", "high", "xhigh", "max"])
     .optional()

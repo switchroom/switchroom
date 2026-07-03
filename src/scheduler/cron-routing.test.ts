@@ -13,7 +13,7 @@ import {
 // decision by walking EVERY input, not a random sample.
 const KINDS: Array<CronRoutingInput["kind"]> = ["poll", "prompt", "action", undefined];
 const MODELS: Array<{ label: string; value: string | undefined }> = [
-  { label: "cheap-sonnet", value: "claude-sonnet-4-6" },
+  { label: "cheap-sonnet", value: "claude-sonnet-5" },
   { label: "cheap-haiku", value: "haiku" },
   { label: "opus", value: "claude-opus-4-8" },
   { label: "custom", value: "research-v1" },
@@ -100,8 +100,8 @@ describe("resolveCronRouting — the load-bearing cases", () => {
   });
 
   it("cheap model + no context → Tier 1 fresh", () => {
-    const r = resolveCronRouting({ model: "claude-sonnet-4-6" }, on);
-    expect(r).toMatchObject({ tier: "cheap", session: "cron", cronModel: "claude-sonnet-4-6" });
+    const r = resolveCronRouting({ model: "claude-sonnet-5" }, on);
+    expect(r).toMatchObject({ tier: "cheap", session: "cron", cronModel: "claude-sonnet-5" });
   });
 
   it("opus / custom / unset model + no context → Tier 2 agent (preserves pre-v0.8)", () => {
@@ -133,7 +133,7 @@ describe("resolveCronRouting — the load-bearing cases", () => {
 
 describe("isKnownCheapModel", () => {
   it.each([
-    ["claude-sonnet-4-6", true],
+    ["claude-sonnet-5", true],
     ["sonnet", true],
     ["claude-haiku-4-5", true],
     ["haiku", true],

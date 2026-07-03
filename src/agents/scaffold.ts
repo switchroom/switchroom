@@ -1157,13 +1157,13 @@ function webkiteDenyForAgent(agentConfig: AgentConfig): string[] {
 /**
  * Switchroom-shipped default model + thinking effort for main agents.
  *
- * Sonnet 4.6 + effort=low is the right starting point for the
+ * Sonnet 5 + effort=low is the right starting point for the
  * conversational main-agent role:
  *   - Time-to-first-token is ~3–5s vs Opus's 15–30s on chat replies.
  *     Forensics on a real klanker turn (2026-04-30 11:59:30Z) showed
  *     19s of Opus extended-thinking dominating a 25s turn — most of
  *     that thinking is wasted on chat-mode answers.
- *   - Sonnet 4.6 input cost is ~5x lower; effort=low cuts hidden
+ *   - Sonnet 5 input cost is ~5x lower; effort=low cuts hidden
  *     thinking tokens to near-zero.
  *   - Accuracy on chat / lookup / structured replies is ~95% of Opus.
  *     The accuracy gap opens up on hard reasoning, code, research
@@ -1176,11 +1176,11 @@ function webkiteDenyForAgent(agentConfig: AgentConfig): string[] {
  *
  * Sub-agents are NOT affected by these constants — sub-agent models are
  * resolved separately from `SubagentSchema.model` (default falls back to
- * "claude-sonnet-4-6" when a sub-agent doesn't specify, see line ~1778
+ * "claude-sonnet-5" when a sub-agent doesn't specify, see line ~1778
  * in this file). Sub-agents that want Opus reasoning should set
  * `model: opus` explicitly.
  */
-export const SWITCHROOM_DEFAULT_MAIN_MODEL = "claude-sonnet-4-6";
+export const SWITCHROOM_DEFAULT_MAIN_MODEL = "claude-sonnet-5";
 export const SWITCHROOM_DEFAULT_THINKING_EFFORT = "low";
 
 /**
@@ -1897,6 +1897,103 @@ function copyDirRecursive(src: string, dest: string): void {
 }
 
 /**
+ * Write `content` to `filePath` only when the on-disk bytes differ.
+ * Returns true when a write happened, false when skipped.
+ *
+ * Why this exists (idempotent apply): per-agent state dirs are mode
+ * 0700 owned by per-agent UIDs (v0.7+ docker model). An `apply` that
+ * rewrites byte-identical files needs write access to EVERY agent's
+ * dir even when nothing changed — which is exactly what made hostd's
+ * in-container reconcile fail fleet-wide ("Scaffolded 0/12 agents …
+ * cannot write without privilege escalation") after a single-agent
+ * config edit. Skipping identical content makes an idempotent apply
+ * a true no-op for untouched agents: no write syscall, no write
+ * permission needed.
+ */
+export function writeFileSyncIfChanged(
+  filePath: string,
+  content: string,
+  mode?: number,
+): boolean {
+  if (existsSync(filePath)) {
+    try {
+      if (readFileSync(filePath, "utf-8") === content) return false;
+    } catch {
+      // Unreadable existing file — fall through and attempt the write;
+      // the write's own error (if any) is the actionable one.
+    }
+  }
+  writeFileSync(
+    filePath,
+    content,
+    mode !== undefined ? { encoding: "utf-8" as const, mode } : "utf-8",
+  );
+  return true;
+}
+
+/**
+ * Deep-compare two directories: true when `dest` contains exactly the
+ * same file tree as `src` with byte-identical contents (and a matching
+ * executable bit on files). Used to skip the rm+recopy of the vendored
+ * hindsight plugin when nothing changed — see writeFileSyncIfChanged
+ * for why unchanged content must not be rewritten.
+ *
+ * `topLevelOverrides` maps a top-level file name to the content the
+ * DEST copy is expected to hold instead of the src bytes — used for
+ * files switchroom rewrites after copy (the hindsight plugin's
+ * settings.json gets switchroom overrides applied on top of the
+ * vendor defaults, so the deployed file legitimately differs).
+ */
+export function dirContentEquals(
+  src: string,
+  dest: string,
+  topLevelOverrides?: Record<string, string>,
+): boolean {
+  if (!existsSync(src) || !existsSync(dest)) return false;
+  let srcEntries: string[];
+  let destEntries: string[];
+  try {
+    srcEntries = readdirSync(src).sort();
+    destEntries = readdirSync(dest).sort();
+  } catch {
+    return false;
+  }
+  if (srcEntries.length !== destEntries.length) return false;
+  for (let i = 0; i < srcEntries.length; i++) {
+    if (srcEntries[i] !== destEntries[i]) return false;
+  }
+  for (const entry of srcEntries) {
+    const s = join(src, entry);
+    const d = join(dest, entry);
+    let sStat;
+    let dStat;
+    try {
+      sStat = statSync(s);
+      dStat = statSync(d);
+    } catch {
+      return false;
+    }
+    if (sStat.isDirectory() !== dStat.isDirectory()) return false;
+    if (sStat.isDirectory()) {
+      if (!dirContentEquals(s, d)) return false;
+    } else {
+      if ((sStat.mode & 0o100) !== (dStat.mode & 0o100)) return false;
+      try {
+        const expected = topLevelOverrides?.[entry];
+        if (expected !== undefined) {
+          if (readFileSync(d, "utf-8") !== expected) return false;
+        } else if (!readFileSync(s).equals(readFileSync(d))) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
  * Seed the agent's `workspace/` directory from the profile's `workspace/`
  * subdirectory (if any). `.hbs` files are rendered with the handlebars
  * context; everything else is copied verbatim. Existing files are preserved
@@ -2252,12 +2349,38 @@ export function installHindsightPlugin(
 
   // Copy the vendored plugin into the agent's .claude/plugins dir.
   // Force overwrite on every reconcile so plugin updates from
-  // `switchroom update` propagate.
+  // `switchroom update` propagate — but skip the rm+recopy entirely
+  // when the deployed tree is already byte-identical to the vendor
+  // source (idempotent apply must not need write access into an
+  // untouched agent's 0700 per-UID state dir; see writeFileSyncIfChanged).
+  // The deployed settings.json legitimately differs from the vendor's
+  // (switchroom overrides applied post-copy below), so the comparison
+  // uses the EXPECTED post-override rendering for that one file.
   const destPath = join(agentDir, ".claude", "plugins", "hindsight-memory");
-  if (existsSync(destPath)) {
-    rmSync(destPath, { recursive: true, force: true });
+  const additionalBanks = resolveUsers(switchroomConfig, agentName).additionalBanks;
+  let expectedSettings: string | null = null;
+  try {
+    const vendorSettingsPath = join(sourcePath, "settings.json");
+    if (existsSync(vendorSettingsPath)) {
+      expectedSettings = renderHindsightSettingsOverrides(
+        readFileSync(vendorSettingsPath, "utf-8"),
+        additionalBanks,
+      );
+    }
+  } catch {
+    // Comparison aid only — a read failure just means we recopy.
   }
-  copyDirRecursive(sourcePath, destPath);
+  const upToDate = dirContentEquals(
+    sourcePath,
+    destPath,
+    expectedSettings != null ? { "settings.json": expectedSettings } : undefined,
+  );
+  if (!upToDate) {
+    if (existsSync(destPath)) {
+      rmSync(destPath, { recursive: true, force: true });
+    }
+    copyDirRecursive(sourcePath, destPath);
+  }
 
   // Apply switchroom-specific overrides on top of the vendored plugin's
   // default settings.json. Vendor stays untouched; overrides are applied
@@ -2284,7 +2407,6 @@ export function installHindsightPlugin(
   // per-agent value. Now also folds in the `knows`-assigned user/bank profiles
   // (user concept, RFC reference/rfcs/user-concept.md); resolveUsers() handles
   // the cascade + union (defaults ∪ agent, generated ∪ explicit) itself.
-  const additionalBanks = resolveUsers(switchroomConfig, agentName).additionalBanks;
   applyHindsightSettingsOverrides(destPath, additionalBanks);
 
   // Resolve the agent's bank/collection name and the Hindsight REST URL.
@@ -2325,11 +2447,28 @@ function applyHindsightSettingsOverrides(
   } catch {
     return;
   }
+  const next = renderHindsightSettingsOverrides(raw, additionalBanks);
+  if (next == null) return; // malformed settings; don't make it worse
+  writeFileSyncIfChanged(settingsPath, next);
+}
+
+/**
+ * Pure half of applyHindsightSettingsOverrides: given the raw
+ * settings.json text, return the post-override serialization (or null
+ * when the input isn't valid JSON). Split out so installHindsightPlugin
+ * can compute the EXPECTED deployed settings.json from the vendor
+ * source and feed it to dirContentEquals' topLevelOverrides — that's
+ * what lets an unchanged plugin tree skip the rm+recopy entirely.
+ */
+function renderHindsightSettingsOverrides(
+  raw: string,
+  additionalBanks: readonly string[],
+): string | null {
   let settings: Record<string, unknown>;
   try {
     settings = JSON.parse(raw);
   } catch {
-    return; // vendor's settings.json malformed; don't make it worse
+    return null; // vendor's settings.json malformed; don't make it worse
   }
   // Override: every turn retains (no throttle). See the rationale in
   // installHindsightPlugin() above.
@@ -2377,7 +2516,7 @@ function applyHindsightSettingsOverrides(
   if (additionalBanks.length > 0) {
     settings.recallAdditionalBanks = [...additionalBanks];
   }
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+  return JSON.stringify(settings, null, 2) + "\n";
 }
 
 /**
@@ -3433,7 +3572,7 @@ export function scaffoldAgent(
         configPath: switchroomConfigPath,
       });
       // Model: explicit override from yaml wins; otherwise apply the
-      // switchroom default (sonnet 4.6, see SWITCHROOM_DEFAULT_MAIN_MODEL
+      // switchroom default (sonnet 5, see SWITCHROOM_DEFAULT_MAIN_MODEL
       // for rationale). Always written to settings.model so the user
       // doesn't have to pass --model on every invocation, and so the
       // doctor / debug surfaces show the resolved choice.
@@ -3455,7 +3594,7 @@ export function scaffoldAgent(
         mergedSettings._switchroomManagedRawKeys = Object.keys(agentConfig.settings_raw);
       }
 
-      writeFileSync(settingsPath, JSON.stringify(mergedSettings, null, 2) + "\n", "utf-8");
+      writeFileSyncIfChanged(settingsPath, JSON.stringify(mergedSettings, null, 2) + "\n");
     }
   }
 
@@ -3989,7 +4128,7 @@ export function scaffoldAgent(
         defaultChatId: userId,
       });
       const content = `---\n${fmLines}\n---\n\n${body}\n`;
-      writeFileSync(mdPath, content, "utf-8");
+      writeFileSyncIfChanged(mdPath, content);
     }
   }
 
@@ -5737,7 +5876,7 @@ export function reconcileAgent(
 
     // Model resolution mirrors scaffoldAgent's path so reconcile + create
     // produce the same settings.model byte-for-byte. Apply the switchroom
-    // default (Sonnet 4.6) when the operator hasn't set an explicit
+    // default (Sonnet 5) when the operator hasn't set an explicit
     // override in switchroom.yaml.
     settings.model = resolveMainModel(agentConfig.model);
 

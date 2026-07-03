@@ -121,8 +121,29 @@ describe('scope-commit — durable hostd persistence', () => {
     expect(commitBlock).toContain('readFileSync(')
   })
 
-  it('passes a long timeout to tryHostdDispatch (apply+reconcile blocks)', () => {
-    expect(commitBlock).toContain('await tryHostdDispatch(agentName, req, 60_000)')
+  it('passes a 12-min timeout to tryHostdDispatch (apply+reconcile can take 5-10 min)', () => {
+    expect(commitBlock).toContain('await tryHostdDispatch(agentName, req, 720_000)')
+  })
+
+  it('acks the tap BEFORE the hostd await (interim status, background persist)', () => {
+    const interimAckIdx = commitBlock.indexOf('saving durably in background')
+    const bgIdx = commitBlock.indexOf('void (async () => {')
+    const hostdAwaitIdx = commitBlock.indexOf('await tryHostdDispatch(')
+    expect(interimAckIdx).toBeGreaterThan(-1)
+    expect(bgIdx).toBeGreaterThan(-1)
+    expect(hostdAwaitIdx).toBeGreaterThan(-1)
+    // interim ack fires before the background continuation opens, and the
+    // slow hostd await lives INSIDE the background continuation.
+    expect(interimAckIdx).toBeLessThan(bgIdx)
+    expect(bgIdx).toBeLessThan(hostdAwaitIdx)
+  })
+
+  it('edits the card with the real outcome after the background persist', () => {
+    const bgIdx = commitBlock.indexOf('void (async () => {')
+    const outcomeEditIdx = commitBlock.indexOf('await ctx.editMessageText(', bgIdx)
+    expect(outcomeEditIdx).toBeGreaterThan(bgIdx)
+    // Outcome edit failure is logged, never thrown into the void continuation.
+    expect(commitBlock).toContain('always-allow outcome card edit failed')
   })
 
   it('registers + cleans up the single-tap correlation entry', () => {

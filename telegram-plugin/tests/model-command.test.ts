@@ -44,7 +44,7 @@ function makeDeps(overrides: Partial<ModelCommandDeps> = {}) {
       return okResult("⏺ Set model to sonnet");
     },
     getAgentName: () => "klanker",
-    getConfiguredModel: () => "claude-sonnet-4-6",
+    getConfiguredModel: () => "claude-sonnet-5",
     escapeHtml: (s) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
     preBlock: (s) => `<pre>${s}</pre>`,
@@ -75,9 +75,9 @@ describe("parseModelCommand", () => {
       model: "claude-opus-4-8",
     });
     // 1m-context variant ids carry brackets
-    expect(parseModelCommand("/model claude-sonnet-4-6[1m]")).toEqual({
+    expect(parseModelCommand("/model claude-sonnet-5[1m]")).toEqual({
       kind: "set",
-      model: "claude-sonnet-4-6[1m]",
+      model: "claude-sonnet-5[1m]",
     });
   });
 
@@ -107,7 +107,7 @@ describe("parseModelCommand", () => {
 
 describe("isValidModelArg", () => {
   it("accepts aliases and full ids", () => {
-    for (const good of [...MODEL_ALIASES, "claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-sonnet-4-6[1m]"]) {
+    for (const good of [...MODEL_ALIASES, "claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-sonnet-5[1m]"]) {
       expect(isValidModelArg(good), good).toBe(true);
     }
   });
@@ -163,7 +163,7 @@ describe("handleModelCommand — show / help never inject (picker-wedge guard)",
     const { deps, calls } = makeDeps();
     const reply = await handleModelCommand({ kind: "show" }, deps);
     expect(calls.length).toBe(0);
-    expect(reply.text).toContain("claude-sonnet-4-6");
+    expect(reply.text).toContain("claude-sonnet-5");
     expect(reply.text).toContain("/model opus");
     expect(reply.text).toContain("switchroom.yaml");
   });
@@ -246,7 +246,7 @@ describe("isSrModel / isClaudeModel helpers", () => {
   it("isSrModel is true only for sr-* names", () => {
     expect(isSrModel("sr-gemini-2.5-pro")).toBe(true);
     expect(isSrModel("sr-deepseek-r1")).toBe(true);
-    expect(isSrModel("claude-sonnet-4-6")).toBe(false);
+    expect(isSrModel("claude-sonnet-5")).toBe(false);
     expect(isSrModel("sonnet")).toBe(false);
     expect(isSrModel("")).toBe(false);
   });
@@ -256,7 +256,7 @@ describe("isSrModel / isClaudeModel helpers", () => {
       expect(isClaudeModel(alias), alias).toBe(true);
     }
     expect(isClaudeModel("claude-opus-4-8")).toBe(true);
-    expect(isClaudeModel("claude-sonnet-4-6[1m]")).toBe(true);
+    expect(isClaudeModel("claude-sonnet-5[1m]")).toBe(true);
     expect(isClaudeModel("sr-gemini-2.5-pro")).toBe(false);
     expect(isClaudeModel("gpt-4")).toBe(false);
   });
@@ -421,7 +421,7 @@ import { labelTag } from "../../src/agents/model-picker.js";
 
 const OPTIONS = [
   { index: 1, label: "Default (recommended)", detail: "Opus 4.8 with 1M context", current: false },
-  { index: 2, label: "Sonnet", detail: "Sonnet 4.6 · Efficient", current: true },
+  { index: 2, label: "Sonnet", detail: "Sonnet 5 · Efficient", current: true },
   { index: 3, label: "Haiku", detail: "Haiku 4.5 · Fastest", current: false },
 ];
 
@@ -596,7 +596,7 @@ describe("sessionModelFromConfirmation", () => {
 
 const OPTIONS_WITH_SR = [
   { index: 1, label: "Default (recommended)", detail: "Opus 4.8 with 1M context", current: false },
-  { index: 2, label: "Sonnet", detail: "Sonnet 4.6", current: true },
+  { index: 2, label: "Sonnet", detail: "Sonnet 5", current: true },
   { index: 3, label: "sr-gemini-2.5-pro", detail: "", current: false },
   { index: 4, label: "sr-deepseek-r1", detail: "", current: false },
   // internal path — should be filtered out

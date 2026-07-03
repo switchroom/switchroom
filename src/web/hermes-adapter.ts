@@ -489,7 +489,7 @@ function turnsToMessages(turns: Turn[]): object[] {
 
 /** Claude models available via the switchroom subscription. */
 const SWITCHROOM_MODELS = [
-  "claude-sonnet-4-6",
+  "claude-sonnet-5",
   "claude-opus-4-8",
   "claude-haiku-4-5-20251001",
   "claude-fable-5",
@@ -498,7 +498,7 @@ const SWITCHROOM_MODELS = [
 /** Build a ModelOptionsResponse for the Hermes Desktop model picker. */
 function switchroomModelOptions() {
   return {
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     provider: "switchroom",
     providers: [
       {
@@ -673,7 +673,7 @@ export async function handleHermesRest(
     return {
       status: 200,
       body: {
-        model: "claude-sonnet-4-6",
+        model: "claude-sonnet-5",
         provider: "switchroom",
         capabilities: {},
       },
@@ -1115,7 +1115,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     }
 
     case "model.info": {
-      sendResponse(ctx, rpcOk(id, { model: "claude-sonnet-4-6", provider: "switchroom" }));
+      sendResponse(ctx, rpcOk(id, { model: "claude-sonnet-5", provider: "switchroom" }));
       break;
     }
 
@@ -1127,7 +1127,7 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
       const value = String(params.value ?? "");
 
       if (key === "model" && sessionId && isKnownSession(config, sessionId)) {
-        // Extract model name from "claude-sonnet-4-6 --provider switchroom"
+        // Extract model name from "claude-sonnet-5 --provider switchroom"
         const modelName = value.replace(/\s+--provider\s+\S+$/, "").trim();
         if (modelName) {
           const agentsDir = resolveAgentsDir(config);
