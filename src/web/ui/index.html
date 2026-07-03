@@ -1745,9 +1745,20 @@
         };
       };
 
+      // `last_deep_dive` is a PER-RECORD field, not a top-level payload field —
+      // derive the fleet's most-recent deep-dive as the max across records.
+      const lastDeepDiveMs = data.records.reduce((acc, r) => {
+        const t = Date.parse(r.last_deep_dive);
+        return isNaN(t) ? acc : Math.max(acc, t);
+      }, NaN);
+
       const attention = data.records.filter((r) => r.open_issue_count > 0);
       const healthy = data.records.filter((r) => r.open_issue_count === 0);
-      const worstSev = (r) => Math.max(0, ...r.issues.filter(i => i.status !== 'closed').map(i => i.severity));
+      // `issues` is not coerced server-side (only `priority_score` is), so a
+      // record with open_issue_count > 0 but missing/undefined `issues` would
+      // throw on deref and blank the whole tab — guard to [] at every read.
+      const issuesOf = (r) => Array.isArray(r.issues) ? r.issues : [];
+      const worstSev = (r) => Math.max(0, ...issuesOf(r).filter(i => i.status !== 'closed').map(i => i.severity));
 
       // ---- page header: L3 summary + attribution + posture stats ----
       const top = `
@@ -1759,7 +1770,7 @@
               <span class="sep">·</span>
               <span><span class="k">last scan</span> <span class="v">${rel(data.generated_at)}</span></span>
               <span class="sep">·</span>
-              <span><span class="k">last deep-dive</span> <span class="v">${rel(data.last_deep_dive)}</span></span>
+              <span><span class="k">last deep-dive</span> <span class="v">${formatTimestamp(lastDeepDiveMs)}</span></span>
               <span class="sep">·</span>
               <span><span class="k">jobs tracked</span> <span class="v">${data.records.length}</span></span>
             </div>
@@ -1791,27 +1802,33 @@
 
       // ---- attention list ----
       const rows = attention.map((r, idx) => {
+        const recIssues = issuesOf(r);
         const sev = worstSev(r);
         const worst = idx === 0 ? ' worst' : '';
         // drive the composition strip off the worst OPEN issue
-        const lead = r.issues.filter(i => i.status !== 'closed')
-          .sort((a, b) => b.severity - a.severity || b.frequency - a.frequency)[0] || r.issues[0];
-        const f = factorsFor(lead);
-        const compose = `
+        const lead = recIssues.filter(i => i.status !== 'closed')
+          .sort((a, b) => b.severity - a.severity || b.frequency - a.frequency)[0] || recIssues[0];
+        // `lead` can be undefined when open_issue_count > 0 but the issues
+        // array is empty/absent — skip the composition strip rather than throw.
+        const f = lead ? factorsFor(lead) : null;
+        const compose = lead && f ? `
           <div class="fh-compose" title="priority = severity × frequency × reach × recency">
-            <span class="fh-fpill sev"><b>${lead.severity}</b><span class="lab">sev</span></span>
+            <span class="fh-fpill sev"><b>${Number(lead.severity)}</b><span class="lab">sev</span></span>
             <span class="fh-times">×</span>
-            <span class="fh-fpill freq"><b>${f.freq.toFixed(2)}</b><span class="lab">freq · ${lead.frequency}</span></span>
+            <span class="fh-fpill freq"><b>${f.freq.toFixed(2)}</b><span class="lab">freq · ${Number(lead.frequency)}</span></span>
             <span class="fh-times">×</span>
             <span class="fh-fpill reach"><b>${f.reach}</b><span class="lab">reach</span></span>
             <span class="fh-times">×</span>
             <span class="fh-fpill rec"><b>${f.rec.toFixed(1)}</b><span class="lab">recency</span></span>
-          </div>`;
+          </div>` : '';
 
-        const issues = r.issues.map((iss) => {
-          const occTotal = iss.occ_total ?? iss.frequency ?? (iss.occurrences || []).length;
-          const trend = iss.freq_from
-            ? `<span class="fh-trend"><span class="from">${iss.freq_from}</span><span class="arrow">→</span><span class="to">${occTotal}</span></span> <span style="opacity:.6">since fix</span>`
+        const issues = recIssues.map((iss) => {
+          // Ledger numerics are not coerced server-side; normalize before
+          // interpolating so a non-numeric value can't leak into markup.
+          const occTotal = Number(iss.occ_total ?? iss.frequency ?? (iss.occurrences || []).length) || 0;
+          const freqFrom = iss.freq_from != null ? Number(iss.freq_from) : null;
+          const trend = freqFrom != null
+            ? `<span class="fh-trend"><span class="from">${freqFrom}</span><span class="arrow">→</span><span class="to">${occTotal}</span></span> <span style="opacity:.6">since fix</span>`
             : `<span class="v">${occTotal}</span> in window`;
           const occ = (iss.occurrences || []).map((o) => `
             <div class="occ">
@@ -1831,7 +1848,7 @@
           return `
             <div class="fh-issue">
               <div class="fh-issue-top">
-                <span class="mode-chip s${iss.severity}">${escapeHtml(iss.failure_mode)}</span>
+                <span class="mode-chip s${Number(iss.severity) || 0}">${escapeHtml(iss.failure_mode)}</span>
                 <span class="status-tag ${statusCls}">${escapeHtml(statusTxt)}</span>
                 ${ghLink}
               </div>
@@ -1859,7 +1876,6 @@
                 <div class="fh-rec-title">
                   <span class="fh-job">${escapeHtml(r.job_spec)}</span>
                 </div>
-                ${r.desc ? `<div class="fh-desc">${escapeHtml(r.desc)}</div>` : ''}
                 <div class="fh-rec-sub">
                   <span><span class="k" style="opacity:.7">scanned</span> <span class="v">${rel(r.last_scanned)}</span></span>
                   <span class="sep">·</span>
@@ -1879,11 +1895,10 @@
 
       // ---- healthy strip ----
       const healthyCards = healthy.map((r) => `
-        <div class="fh-hc" title="${escapeHtml(r.desc || r.job_spec)}">
+        <div class="fh-hc" title="${escapeHtml(r.job_spec)}">
           <span class="dot"></span>
           <div class="fh-hc-text">
             <span class="job">${escapeHtml(r.job_spec)}</span>
-            ${r.desc ? `<span class="hd">${escapeHtml(r.desc)}</span>` : ''}
           </div>
           <span class="when">${rel(r.last_scanned)}</span>
         </div>`).join('');
