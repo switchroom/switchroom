@@ -686,19 +686,35 @@ function shouldPromoteBreak(prev: string, next: string, placeholder?: string): b
     return true
   }
   // Stat-card / key-value promotion (#2750). A vertical card like
-  // `Calories: 1800 / Protein: 120g / Carbs: 200g` has lines ending in
-  // digits/letters, so the terminator rule above never fires and the whole
-  // card collapses into one wall of text. Promote a lone `\n` when the prev
-  // line reads as a standalone `label: value` stat line — a leading label,
-  // then a colon, then a space, then a value — AND the next line is NOT a
-  // lowercase-started mid-sentence continuation. The next-line guard is what
-  // keeps the deliberately-conservative soft-wrap protection intact: a genuine
-  // wrapped sentence continues in lowercase (`... went on\nto continue`),
-  // whereas a stat/label line is followed by another label or capitalised
-  // prose. A prev with no colon (a plain soft-wrapped sentence) never matches.
-  const isStatLine = /^\s*\S[^\n]*?:[ \t]+\S/.test(prevTrimmed)
-  if (isStatLine && !/^[a-z]/.test(nextTrimmed)) {
-    return true
+  // `Calories: 1800 / Protein: 120g / Carbs: 200g` (or the fleet's HOUSE style
+  // `**Calories:** 1800 / **Protein:** 120g`) has lines ending in digits/
+  // letters, so the terminator rule above never fires and the whole card
+  // collapses into one wall of text. Promote a lone `\n` when the prev line
+  // reads as a standalone `label: value` stat line.
+  //
+  // The discriminator that separates a stat line from a mid-sentence soft wrap
+  // that merely contains a colon (`The deal has one catch: the buyer wants it
+  // and\nToronto lawyers sign off`) is two-fold:
+  //   1. The LABEL (text before the colon) is SHORT — a stat label is a term
+  //      of a few words, a wrapped prose clause is a long run of words. We cap
+  //      the label at 3 words / 24 chars.
+  //   2. The next line is NOT a lowercase-started mid-sentence continuation.
+  //      A genuine wrapped sentence continues in lowercase; a stat/label line
+  //      is followed by another label or capitalised prose.
+  // Markdown emphasis (`*` `_` `` ` ``) is stripped first so bold labels like
+  // `**Calories:**` are recognised. A prev with no colon never matches, so a
+  // plain soft-wrapped sentence is untouched.
+  const statStripped = prevTrimmed.replace(/[*_`]/g, '')
+  const colonIdx = statStripped.indexOf(':')
+  if (colonIdx > 0) {
+    const label = statStripped.slice(0, colonIdx).trim()
+    const value = statStripped.slice(colonIdx + 1)
+    const labelWords = label.length === 0 ? 0 : label.split(/\s+/).length
+    const isStatLine =
+      /^[ \t]+\S/.test(value) && labelWords >= 1 && labelWords <= 3 && label.length <= 24
+    if (isStatLine && !/^[a-z]/.test(nextTrimmed)) {
+      return true
+    }
   }
   return false
 }
