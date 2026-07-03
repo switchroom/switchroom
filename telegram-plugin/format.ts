@@ -682,7 +682,25 @@ function shouldPromoteBreak(prev: string, next: string, placeholder?: string): b
   // terminator (e.g. `He said "go."` or `(done.)`).
   const unwrapped = prevTrimmed.replace(/[)"'’”\]]+$/, '')
   const terminator = unwrapped.slice(-1)
-  return terminator === '.' || terminator === '!' || terminator === '?' || terminator === ':'
+  if (terminator === '.' || terminator === '!' || terminator === '?' || terminator === ':') {
+    return true
+  }
+  // Stat-card / key-value promotion (#2750). A vertical card like
+  // `Calories: 1800 / Protein: 120g / Carbs: 200g` has lines ending in
+  // digits/letters, so the terminator rule above never fires and the whole
+  // card collapses into one wall of text. Promote a lone `\n` when the prev
+  // line reads as a standalone `label: value` stat line — a leading label,
+  // then a colon, then a space, then a value — AND the next line is NOT a
+  // lowercase-started mid-sentence continuation. The next-line guard is what
+  // keeps the deliberately-conservative soft-wrap protection intact: a genuine
+  // wrapped sentence continues in lowercase (`... went on\nto continue`),
+  // whereas a stat/label line is followed by another label or capitalised
+  // prose. A prev with no colon (a plain soft-wrapped sentence) never matches.
+  const isStatLine = /^\s*\S[^\n]*?:[ \t]+\S/.test(prevTrimmed)
+  if (isStatLine && !/^[a-z]/.test(nextTrimmed)) {
+    return true
+  }
+  return false
 }
 
 /**

@@ -48,6 +48,30 @@ describe('normalizeParagraphBreaks', () => {
     expect(normalizeParagraphBreaks(input)).toBe(input)
   })
 
+  test('promotes every interior break in a vertical stat card (#2750)', () => {
+    // The gymbro food-log card: lines end in digits/letters (no terminator),
+    // but each is a standalone `label: value` stat line, so every interior
+    // break must become a GFM hard break instead of collapsing to one wall.
+    const input = 'Calories: 1800\nProtein: 120g\nCarbs: 200g'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Calories: 1800  \nProtein: 120g  \nCarbs: 200g',
+    )
+  })
+
+  test('promotes a key-value line followed by prose (#2750)', () => {
+    const input = 'Status: active\nEverything is running smoothly.'
+    expect(normalizeParagraphBreaks(input)).toBe(
+      'Status: active  \nEverything is running smoothly.',
+    )
+  })
+
+  test('regression guard: a mid-sentence colon soft-wrap still does NOT promote (#2750)', () => {
+    // A wrapped sentence that happens to contain a colon must NOT be mistaken
+    // for a stat line: the next line continues the sentence in lowercase.
+    const input = 'He made one point: the plan was sound and\nthe timing was right too'
+    expect(normalizeParagraphBreaks(input)).toBe(input)
+  })
+
   test('does NOT promote when the next line is a list item (tight list stays tight)', () => {
     const input = 'Here are the steps.\n- first\n- second\n- third'
     expect(normalizeParagraphBreaks(input)).toBe(input)
