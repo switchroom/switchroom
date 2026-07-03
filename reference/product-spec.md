@@ -150,3 +150,4 @@ Each links its job spec in `jobs/`.
 - [`idempotent-update-and-restart.md`](jobs/idempotent-update-and-restart.md) — update/restart operations completing cleanly and idempotently, target ~100%
 - [`talk-to-agents-from-anywhere.md`](jobs/talk-to-agents-from-anywhere.md) — median ack latency from Telegram message to acknowledgement
 - [`act-in-my-tools-with-an-identity.md`](jobs/act-in-my-tools-with-an-identity.md) — share of external-tool actions attributable to a named agent identity
+- [`fleet-stays-healthy.md`](jobs/fleet-stays-healthy.md) — share of recurring per-job failures the fleet surfaces and tracks itself vs found by a principal complaining

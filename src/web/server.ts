@@ -56,6 +56,7 @@ import {
   type AccountDashboardInfo,
 } from "./api.js";
 import type { CachedResult } from "./cache.js";
+import { handleGetFleetHealth } from "./fleet-health-read.js";
 import { fetchAgentLogsViaHostd } from "./hostd-read-client.js";
 import { handleWebhookIngest } from "./webhook-handler.js";
 import { loadEdgeSecret } from "./webhook-edge.js";
@@ -100,6 +101,7 @@ const SPA_TAB_ROUTES = new Set([
   "connections",
   "schedule",
   "approvals",
+  "fleet-health",
 ]);
 
 /**
@@ -590,6 +592,14 @@ function parseRoute(
     return { handler: "getApprovals", params: {} };
   }
 
+  // GET /api/fleet-health — job-spec-anchored issue tracker (RFC
+  // fleet-health.md). Reads the owner agent's health ledger, ranked
+  // worst-first by priority_score. Read-only; degrades to an empty state
+  // when no owner agent is assigned yet.
+  if (method === "GET" && pathname === "/api/fleet-health") {
+    return { handler: "getFleetHealth", params: {} };
+  }
+
   // GET /api/grants — standing capability grants from the vault-broker
   // grants DB (the operator's REAL grants; the kernel decision ledger
   // above is honestly empty on most installs).
@@ -952,6 +962,12 @@ export function startWebServer(
           case "getApprovals":
             return (async () =>
               jsonResponse(withStamp(await cachedApprovals())))();
+
+          case "getFleetHealth":
+            // Local, always-available read of the health ledger. Not routed
+            // through dashboardCache: it's a single small JSON file read,
+            // not a host round-trip, so a per-tick re-read is cheap.
+            return jsonResponse(handleGetFleetHealth());
 
           case "getGrants":
             return (async () =>
